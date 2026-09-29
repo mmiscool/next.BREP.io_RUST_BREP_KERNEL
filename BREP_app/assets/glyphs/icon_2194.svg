@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:brep="https://brep.io/icons"
+     viewBox="0 0 1000 1000" width="1000" height="1000" brep:glyph-name="pmi_linear" brep:unicode="2194">
+  <path d="M220.0 545.0 L780.0 545.0 L780.0 455.0 L220.0 455.0Z" fill="#111" fill-rule="evenodd"/>
+  <path d="M120.0 500.0 L290.0 406.5 L290.0 593.5Z" fill="#111" fill-rule="evenodd"/>
+  <path d="M880.0 500.0 L710.0 593.5 L710.0 406.5Z" fill="#111" fill-rule="evenodd"/>
+</svg>

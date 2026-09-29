@@ -1,0 +1,120 @@
+[package]
+name = "BREP_plm"
+version = "0.1.1"
+edition = "2021"
+# The floor the rest of the family builds on, and the compiler
+# rust-toolchain.toml pins. Nothing here needs more.
+rust-version = "1.92"
+license-file = "LICENSE.md"
+repository = "https://github.com/mmiscool/next.BREP.io_RUST_BREP_KERNEL"
+homepage = "https://v2.brep.io"
+description = "The BREP PLM server: parts, revisions, lifecycle, checkout, BOMs and change orders over an embedded SQLite store, with a browser UI and the document API the BREP CAD app stores through."
+readme = "README.md"
+keywords = ["plm", "cad", "bom", "engineering", "server"]
+categories = ["web-programming::http-server", "database", "command-line-utilities"]
+# The three web files are compiled in with `include_str!` (src/api/mod.rs).
+# The long operator guide (GUIDE.md) stays in the repository.
+include = [
+    "src/**/*.rs",
+    "/web/index.html",
+    "/web/app.js",
+    "/web/style.css",
+    "/Cargo.toml",
+    "/README.md",
+    "/LICENSE.md",
+    # Test code never ships, whatever else a pattern above matches.
+    "!src/**/tests/**",
+    "!**/tests.rs",
+    "!**/*_tests.rs",
+    "!**/test_support.rs",
+    "!**/testdata/**",
+]
+
+[lib]
+name = "brep_plm"
+path = "src/lib.rs"
+
+[[bin]]
+name = "brep-plm"
+path = "src/main.rs"
+
+# Standalone crate (NOT a workspace member) — the family convention: every
+# crate keeps its own build profile and lockfile.
+
+[dependencies]
+# The HTTP surface. 0.7 is what the registry already holds for this repo, and
+# nothing here needs 0.8's extractor changes.
+axum = "0.7"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "fs", "io-util", "time"] }
+# Streaming attachment uploads (`Body::into_data_stream`) and downloads.
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+serde = { version = "1", features = ["derive"] }
+# preserve_order so a CAD document written back through the store API keeps its
+# key order — the kernel hashes documents, and a reordered map is a new hash.
+serde_json = { version = "1", features = ["preserve_order"] }
+# Password hashing (PBKDF2-HMAC-SHA256) and the content hash the store reports.
+sha2 = "0.10"
+pbkdf2 = "0.12"
+hmac = "0.12"
+# Constant-time comparison for the password verify — a byte-by-byte `==` on a
+# hash is a timing oracle.
+subtle = "2"
+# Salts and session tokens.
+rand = "0.8"
+base64 = "0.22"
+# Part types in Pattern mode check a typed number against an admin regex.
+regex = "1"
+# Rust, so the same interpreter can later build for wasm in the CAD app.
+# Default features off: they add Temporal and its time-zone data, which no
+# hook needs and which triple the build.
+boa_engine = { version = "0.22", default-features = false }
+# The interpreter core (call / describe / console), split out so the CAD app
+# builds the same one. host.rs still names Boa's types through the line above;
+# both resolve to the one boa_engine in this lockfile.
+brep-script-core = { package = "BREP_script_core", version = "0.1.1", path = "../BREP_script_core" }
+# Scripts' synchronous `http.request`. Sync on purpose: a Boa host function
+# cannot await, and every call carries its own timeout.
+ureq = "2"
+# Optional native TLS (`--tls-cert` / `--tls-key`). rustls and ring are
+# already in the tree through ureq; ring, not aws-lc, so no cmake. Plain
+# HTTP/1.1 over the TLS stream, through hyper directly, because axum 0.7's
+# `serve` only takes a TCP listener.
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio", "server", "http1", "service"] }
+# embedded SQLite). `bundled` compiles SQLite itself — no system library, the
+# same SQLite on every machine, and FTS5 with the trigram tokenizer the part
+# search needs.
+rusqlite = { version = "0.40", features = ["bundled"] }
+# Backups (`brep-plm backup` / `restore`): one gzipped tar holding the
+# SQLite snapshot, the documents, the attachment blobs and the scripts. Both
+# pure Rust (flate2's default backend is miniz_oxide), and flate2 was already
+# in the tree through ureq.
+tar = "0.4"
+flate2 = "1"
+# `ServiceExt::map_request` in the TLS loop, and the in-process router in
+# tests/http.rs.
+tower = { version = "0.5", features = ["util"] }
+
+# PBKDF2 is deliberately expensive, and in an unoptimized debug build it is
+# ten times more so: every sign-in in the test suites paid for it. The hashing
+# crates are optimized below, but that is not enough on its own:
+# `pbkdf2::<Hmac<Sha256>>` is generic, so it is compiled inside THIS crate,
+# at this crate's level. At opt-level 0 a hash took about 1 s, against 0.1 s
+# in release; every `Db::open` seeds an admin and every fixture adds users,
+# so the suites spent most of their CPU there. Optimizing this crate in debug
+# costs about 5 s per rebuild. Debug assertions and overflow checks stay on.
+# The iteration count is untouched (`auth::DEFAULT_ITERATIONS`, pinned by a
+# test).
+[profile.dev.package.BREP_plm]
+opt-level = 3
+[profile.dev.package.pbkdf2]
+opt-level = 3
+[profile.dev.package.sha2]
+opt-level = 3
+[profile.dev.package.hmac]
+opt-level = 3
+[profile.dev.package.digest]
+opt-level = 3
+[profile.dev.package.block-buffer]
+opt-level = 3

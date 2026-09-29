@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:brep="https://brep.io/icons"
+     viewBox="0 0 24 24" width="24" height="24" brep:glyph-name="icon_ecad_wire_bend" brep:unicode="E084">
+  <g fill="#111" stroke="#111" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M5 19 V5 H19" style="fill:none"/>
+    <path d="M5 19 H19 V5" stroke-dasharray="1.6 3" style="fill:none"/>
+    <circle cx="5" cy="19" r="2.2" stroke="none"/>
+    <circle cx="19" cy="5" r="2.2" stroke="none"/>
+  </g>
+</svg>

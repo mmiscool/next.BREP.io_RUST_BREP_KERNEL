@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:brep="https://brep.io/icons"
+     viewBox="0 0 1000 1000" width="1000" height="1000" brep:glyph-name="gdt_total_runout" brep:unicode="2330">
+  <path d="M140.0 865.0 L860.0 865.0 L860.0 775.0 L140.0 775.0Z" fill="#111" fill-rule="evenodd"/>
+  <path d="M216.5 806.3 L576.5 306.3 L503.5 253.7 L143.5 753.7Z" fill="#111" fill-rule="evenodd"/>
+  <path d="M620.0 170.0 L592.8 362.1 L443.2 249.9Z" fill="#111" fill-rule="evenodd"/>
+  <path d="M496.5 806.3 L856.5 306.3 L783.5 253.7 L423.5 753.7Z" fill="#111" fill-rule="evenodd"/>
+  <path d="M900.0 170.0 L872.8 362.1 L723.2 249.9Z" fill="#111" fill-rule="evenodd"/>
+</svg>

@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:brep="https://brep.io/icons"
+     viewBox="0 0 24 24" width="24" height="24" brep:glyph-name="icon_ecad_route_via" brep:unicode="E086">
+  <g fill="#111" stroke="#111" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+    <circle cx="12" cy="12" r="5.6" style="fill:none"/>
+    <circle cx="12" cy="12" r="2" style="fill:none"/>
+    <path d="M2.4 12 H6.4" style="fill:none"/>
+    <path d="M17.6 12 H21.6" stroke-dasharray="1.2 2.4" style="fill:none"/>
+  </g>
+</svg>

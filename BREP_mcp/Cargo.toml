@@ -1,0 +1,51 @@
+[package]
+name = "BREP_mcp"
+version = "0.3.0"
+edition = "2021"
+rust-version = "1.92"
+license-file = "LICENSE.md"
+repository = "https://github.com/mmiscool/next.BREP.io_RUST_BREP_KERNEL"
+homepage = "https://v2.brep.io"
+readme = "README.md"
+keywords = ["mcp", "cad", "automation", "headless", "agent"]
+categories = ["command-line-utilities", "development-tools::testing", "graphics"]
+description = "The BREP MCP automation server: hosts the BREP CAD app headlessly under egui_kittest and serves the BREP_mcp_core Model Context Protocol surface over stdio or streamable HTTP, so an agent can drive the CAD app with no display attached. The same server the app embeds behind `brep-app --mcp`."
+# The server's sources only: tests/ (the test-mcp scripts, fixtures,
+# baselines and videos) is test material and never ships.
+include = [
+    "src/**/*.rs",
+    "/Cargo.toml",
+    "/README.md",
+    "/LICENSE.md",
+    # Test code never ships, whatever else a pattern above matches.
+    "!src/**/tests/**",
+    "!**/tests.rs",
+    "!**/*_tests.rs",
+    "!**/test_support.rs",
+    "!**/testdata/**",
+]
+
+[lib]
+name = "brep_mcp"
+path = "src/lib.rs"
+
+[[bin]]
+name = "brep-mcp"
+path = "src/main.rs"
+
+[dependencies]
+# The server: tools, sessions, transports. Host-agnostic, so the app can embed it too.
+brep-mcp-core = { package = "BREP_mcp_core", version = "0.5.0", path = "../BREP_mcp_core" }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "net"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+clap = { version = "4", features = ["derive"] }
+# The app with its automation layer, for the headless host. Default features
+# off: the app's own embedded server (`mcp`) is not needed under the harness.
+brep-app = { package = "BREP_app", version = "0.6.0", path = "../BREP_app", default-features = false, features = ["automation"] }
+egui = "0.35"
+egui_kittest = { version = "0.35", features = ["wgpu", "eframe"] }
+# The harness's app state is an `eframe::App` — `crate::annotate::Annotated`,
+# `BrepApp` with the documentation overlay painted over it — so the trait has to
+# be nameable here. Default features off and the same set BREP_app pins, so the
+# resolver unifies on ONE eframe rather than compiling a second configuration.
+eframe = { version = "0.35", default-features = false, features = ["wgpu", "default_fonts", "x11", "wayland"] }

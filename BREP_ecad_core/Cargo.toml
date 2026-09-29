@@ -1,0 +1,39 @@
+[package]
+name = "BREP_ecad_core"
+version = "0.2.0"
+edition = "2024"
+rust-version = "1.92"
+license-file = "LICENSE.md"
+description = "Schematic, wiring diagram, and board documents, symbol import, and connectivity, with no UI."
+repository = "https://github.com/mmiscool/next.BREP.io_RUST_BREP_KERNEL"
+homepage = "https://v2.brep.io"
+readme = "README.md"
+keywords = ["ecad", "schematic", "pcb", "kicad", "netlist"]
+categories = ["science", "data-structures", "parser-implementations"]
+# Only production sources and package metadata are published.
+include = [
+    "src/**/*.rs",
+    "/Cargo.toml",
+    "/README.md",
+    "/LICENSE.md",
+    "/THIRD-PARTY-NOTICES.md",
+    # Test code never ships, whatever else a pattern above matches.
+    "!src/**/tests/**",
+    "!**/tests.rs",
+    "!**/*_tests.rs",
+    "!**/test_support.rs",
+    "!**/testdata/**",
+]
+
+[lib]
+# Published package is BREP_ecad_core; the lib name is the idiomatic lowercase
+# `brep_ecad_core`, the symbol every `use brep_ecad_core::` keys off.
+name = "brep_ecad_core"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+
+[profile.dev.package.BREP_ecad_core]
+opt-level = 2

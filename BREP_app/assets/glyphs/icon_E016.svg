@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:brep="https://brep.io/icons"
+     viewBox="0 0 24 24" width="24" height="24" brep:glyph-name="icon_E016" brep:unicode="E016">
+  <g fill="#3d86c4" stroke="#3d86c4" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+    <g>
+    <path d="M9 4 3 10 9 16 M3 10H14Q21 10 21 17V20" style="fill:none"/>
+    </g>
+  </g>
+</svg>

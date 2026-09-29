@@ -1,0 +1,33 @@
+[package]
+name = "BREP_STL2STEP"
+version = "0.2.3"
+edition = "2021"
+license-file = "LICENSE.md"
+repository = "https://github.com/mmiscool/next.BREP.io_RUST_BREP_KERNEL"
+homepage = "https://v2.brep.io"
+readme = "README.md"
+keywords = ["cad", "stl", "step", "brep", "mesh"]
+categories = ["algorithms", "graphics"]
+description = "BREP-family STL-to-STEP reconstruction command"
+# The `!` entries are a backstop: test code never ships. The publish snapshot
+# `cargo package` of this manifest from shipping test files.
+include = [
+    "src/**",
+    "Cargo.toml",
+    "README.md",
+    "LICENSE.md",
+    "!src/**/tests/**",
+    "!**/tests.rs",
+    "!**/*_tests.rs",
+    "!**/test_support.rs",
+    "!**/testdata/**",
+]
+
+[[bin]]
+name = "stl2step"
+path = "src/main.rs"
+
+[dependencies]
+BREP_reconstruction = { version = "0.4.0", path = "../BREP_reconstruction" }
+serde_json = "1"
+

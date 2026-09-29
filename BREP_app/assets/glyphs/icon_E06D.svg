@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:brep="https://brep.io/icons"
+     viewBox="0 0 24 24" width="24" height="24" brep:glyph-name="icon_sheet_dim_diameter" brep:unicode="E06D">
+  <g fill="#111" stroke="#111" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+    <circle cx="12" cy="12" r="7.2" style="fill:none"/>
+    <path d="M9.8 12 H14.2" style="fill:none"/>
+    <path d="M4.8 12 L9.8 10 L9.8 14Z" stroke="none"/>
+    <path d="M19.2 12 L14.2 10 L14.2 14Z" stroke="none"/>
+  </g>
+</svg>

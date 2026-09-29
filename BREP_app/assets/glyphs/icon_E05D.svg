@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:brep="https://brep.io/icons"
+     viewBox="0 0 1233 2384" width="1233" height="2384" brep:glyph-name="icon_feat_transform_face" brep:unicode="E05D">
+  <path d="M216 1551L1016 1551L1016 1660L216 1660Z" fill="#ffd977"/>
+  <path d="M216 1597L1016 1597L1016 1505L216 1505Z" fill="#7a4d10"/>
+  <g transform="rotate(-22 616 1505)">
+    <path d="M216 1505L1016 1505L1016 1413L216 1413Z" fill="#d4901f"/>
+  </g>
+  <path d="M616 851A300 300 0 0 1 916 1151L824 1151A208 208 0 0 0 616 943Z" fill="#3d86c4"/>
+  <path d="M616 851A300 300 0 0 0 316 1151L408 1151A208 208 0 0 1 616 943Z" fill="#3d86c4"/>
+  <path d="M916 1043L1006 1197L826 1197Z" fill="#3d86c4"/>
+  <g transform="rotate(40 616 1165)">
+    <path d="M588 1110L644 1110L644 1330L588 1330Z" fill="#3d86c4"/>
+    <path d="M616 1000L676 1110L556 1110Z" fill="#3d86c4"/>
+  </g>
+</svg>

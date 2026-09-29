@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:brep="https://brep.io/icons"
+     viewBox="0 0 1233 2384" width="1233" height="2384" brep:glyph-name="icon_feat_thicken" brep:unicode="E045">
+  <path d="M216 1513C486 983 746 983 1016 1513L1016 1621C746 1091 486 1091 216 1621Z" fill="#a5e8c4"/>
+  <path d="M216 1421C486 891 746 891 1016 1421L1016 1513C746 983 486 983 216 1513Z" fill="#7a4d10"/>
+  <path d="M216 1621C486 1091 746 1091 1016 1621L1016 1690C746 1160 486 1160 216 1690Z" fill="#2fa469"/>
+</svg>

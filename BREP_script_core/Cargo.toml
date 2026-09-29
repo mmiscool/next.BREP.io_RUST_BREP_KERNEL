@@ -1,0 +1,50 @@
+[package]
+name = "BREP_script_core"
+version = "0.1.1"
+edition = "2021"
+license-file = "LICENSE.md"
+repository = "https://github.com/mmiscool/next.BREP.io_RUST_BREP_KERNEL"
+homepage = "https://v2.brep.io"
+rust-version = "1.92"
+description = "The BREP script interpreter core: evaluate one JavaScript file on Boa, call one global function with one JSON argument, and return its JSON result or its refusal. Shared by the PLM server's hooks and the CAD app, native and wasm."
+readme = "README.md"
+keywords = ["javascript", "scripting", "boa", "json", "wasm"]
+categories = ["development-tools", "wasm"]
+include = [
+    "src/**/*.rs",
+    "/Cargo.toml",
+    "/README.md",
+    "/LICENSE.md",
+    # Test code never ships, whatever else a pattern above matches.
+    "!src/**/tests/**",
+    "!**/tests.rs",
+    "!**/*_tests.rs",
+    "!**/test_support.rs",
+    "!**/testdata/**",
+]
+
+# The library keeps a brep_script_core symbol; the package publishes as
+# BREP_script_core, like BREP_mcp_core. It depends on Boa and serde_json and
+# NOTHING else — no file system, no network, no store. Every binding that
+# reaches outside the interpreter is installed by the host (the PLM's
+# scripting::host, the CAD app's scripting module).
+[lib]
+name = "brep_script_core"
+path = "src/lib.rs"
+
+# Standalone crate (NOT a workspace member) — the family convention.
+
+[dependencies]
+# Default features off: they add Temporal and its time-zone data, which no
+# hook needs and which triple the build.
+boa_engine = { version = "0.22", default-features = false }
+serde_json = { version = "1", features = ["preserve_order"] }
+
+# On wasm32-unknown-unknown Boa needs its `js` feature, and only there: it
+# turns on getrandom's `wasm_js` backend (Boa's rand 0.10 pulls getrandom
+# 0.4, which is a compile_error! on this target without one) and moves Boa's
+# clock to web-time, since std::time::Instant panics in a browser. Declared
+# here so a host never has to know Boa's features; the native PLM build never
+# sees it.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+boa_engine = { version = "0.22", default-features = false, features = ["js"] }

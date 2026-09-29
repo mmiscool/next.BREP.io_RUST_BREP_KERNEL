@@ -1,0 +1,35 @@
+[package]
+name = "BREP_reconstruction"
+version = "0.4.0"
+edition = "2021"
+license-file = "LICENSE.md"
+repository = "https://github.com/mmiscool/next.BREP.io_RUST_BREP_KERNEL"
+homepage = "https://v2.brep.io"
+description = "Kernel integration for neutral BREP_RANSAC recognition results"
+readme = "README.md"
+keywords = ["cad", "brep", "reconstruction", "mesh", "step"]
+categories = ["algorithms", "graphics", "mathematics"]
+# The `!` entries are a backstop: test code never ships. The publish snapshot
+# `cargo package` of this manifest from shipping test files.
+include = [
+    "src/**",
+    "Cargo.toml",
+    "README.md",
+    "LICENSE.md",
+    "!src/**/tests/**",
+    "!**/tests.rs",
+    "!**/*_tests.rs",
+    "!**/test_support.rs",
+    "!**/testdata/**",
+]
+
+[lib]
+name = "brep_reconstruction"
+
+[dependencies]
+# Monotonic timing on native targets and in browser workers.
+web-time = "1"
+BREP_RANSAC = { version = "0.1.4", path = "../BREP_RANSAC" }
+BREP_kernel = { version = "=0.7.0", path = "../BREP_kernel" }
+serde = { version = "1", features = ["derive"] }
+

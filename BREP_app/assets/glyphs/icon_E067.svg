@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:brep="https://brep.io/icons"
+     viewBox="0 0 24 24" width="24" height="24" brep:glyph-name="icon_auto_constraints" brep:unicode="E067">
+  <!-- Auto Constraints: the Concentric mate's own ring-in-ring, with the
+       sparkle that means "worked out for you". Built from the constraint the
+       tool infers most, so the button reads as constraints rather than as a
+       generic wand; the sparkle sits in the corner the ring leaves free. -->
+  <g stroke="#111" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+    <circle cx="10" cy="14.2" r="7.1" style="fill:none"/>
+    <circle cx="10" cy="14.2" r="2.7" style="fill:none"/>
+  </g>
+  <path d="M19 1.4 20.35 4.35 23.3 5.7 20.35 7.05 19 10 17.65 7.05 14.7 5.7 17.65 4.35Z" fill="#111"/>
+</svg>

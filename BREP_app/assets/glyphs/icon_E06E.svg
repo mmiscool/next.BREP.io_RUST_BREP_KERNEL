@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:brep="https://brep.io/icons"
+     viewBox="0 0 24 24" width="24" height="24" brep:glyph-name="icon_sketch_line" brep:unicode="E06E">
+  <g fill="#111" stroke="#111" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M5.6 18.4 L18.4 5.6" style="fill:none"/>
+    <circle cx="5.6" cy="18.4" r="2.4" stroke="none"/>
+    <circle cx="18.4" cy="5.6" r="2.4" stroke="none"/>
+  </g>
+</svg>

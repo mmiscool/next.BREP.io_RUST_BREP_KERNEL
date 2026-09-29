@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:brep="https://brep.io/icons"
+     viewBox="0 0 24 24" width="24" height="24" brep:glyph-name="icon_E028" brep:unicode="E028">
+  <!-- Show faces: the same cube the wireframe icon draws, with its three
+       visible faces SHADED. One family, three states: filled / edges / points. -->
+  <g fill="#111" stroke="#111" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M12 2.5 21 7.5 12 12.5 3 7.5Z" opacity="0.85"/>
+    <path d="M21 7.5V16.5L12 21.5V12.5Z" opacity="0.5"/>
+    <path d="M3 7.5V16.5L12 21.5V12.5Z" opacity="0.28"/>
+    <path d="M12 2.5 21 7.5V16.5L12 21.5 3 16.5V7.5Z" style="fill:none"/>
+  </g>
+</svg>

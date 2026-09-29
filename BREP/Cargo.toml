@@ -1,0 +1,54 @@
+[package]
+name = "BREP"
+version = "0.7.0"
+edition = "2021"
+license-file = "LICENSE.md"
+description = "BREP — umbrella crate for the BREP CAD kernel family: re-exports the geometry kernel (always) plus the gizmos, wgpu render engine, and eframe application behind feature flags."
+repository = "https://github.com/mmiscool/next.BREP.io_RUST_BREP_KERNEL"
+homepage = "https://v2.brep.io"
+readme = "README.md"
+keywords = ["cad", "brep", "geometry", "nurbs", "kernel"]
+categories = ["mathematics", "graphics", "algorithms"]
+# The `!` entries are a backstop: test code never ships. The publish snapshot
+# `cargo package` of this manifest from shipping test files.
+include = [
+    "src/**/*.rs",
+    "/Cargo.toml",
+    "/README.md",
+    "/LICENSE.md",
+    "!src/**/tests/**",
+    "!**/tests.rs",
+    "!**/*_tests.rs",
+    "!**/test_support.rs",
+    "!**/testdata/**",
+]
+
+[lib]
+# The crates.io package is the branded `BREP`; the lib name is the idiomatic
+# lowercase `brep` so consumers write `use brep::kernel::…` without tripping the
+# non_snake_case lint. Same package≠lib split every crate in the family uses.
+name = "brep"
+
+[dependencies]
+# The geometry kernel is re-exported unconditionally as `brep::kernel`. Default
+# (serial) features; a consumer who wants rayon tessellation flips the
+# `parallel` feature below, which forwards to the kernel.
+brep_kernel = { package = "BREP_kernel", version = "0.7.0", path = "../BREP_kernel" }
+# Higher layers are optional so a headless kernel consumer never compiles
+# gizmos / wgpu / eframe.
+brep_gizmos = { package = "BREP_gizmos", version = "0.2.4", path = "../BREP_gizmos", optional = true }
+brep_render = { package = "BREP_render", version = "0.6.0", path = "../BREP_render", optional = true }
+brep_app    = { package = "BREP_app",    version = "0.6.0", path = "../BREP_app",    optional = true }
+# Recognition-to-kernel integration stays opt-in so the default facade remains
+# the same minimal, headless, WASM-clean kernel graph.
+brep_reconstruction = { package = "BREP_reconstruction", version = "0.4.0", path = "../BREP_reconstruction", optional = true }
+
+[features]
+default = []                              # kernel only (headless geometry)
+gizmos  = ["dep:brep_gizmos"]
+render  = ["dep:brep_render", "gizmos"]   # the render engine consumes gizmo overlays
+app     = ["dep:brep_app", "render"]      # the app hosts the render engine
+reconstruction = ["dep:brep_reconstruction"]
+full    = ["app"]
+# Pass-through to the kernel's rayon-parallel tessellation.
+parallel = ["brep_kernel/parallel"]

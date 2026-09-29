@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:brep="https://brep.io/icons"
+     viewBox="0 0 1000 1000" width="1000" height="1000" brep:glyph-name="pmi_counterbore" brep:unicode="2334">
+  <path d="M175.0 300.0 L175.0 760.0 L265.0 760.0 L265.0 300.0Z" fill="#111" fill-rule="evenodd"/>
+  <path d="M180.0 785.0 L820.0 785.0 L820.0 695.0 L180.0 695.0Z" fill="#111" fill-rule="evenodd"/>
+  <path d="M735.0 300.0 L735.0 760.0 L825.0 760.0 L825.0 300.0Z" fill="#111" fill-rule="evenodd"/>
+</svg>

@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:brep="https://brep.io/icons"
+     viewBox="0 0 24 24" width="24" height="24" brep:glyph-name="icon_part_properties" brep:unicode="E066">
+  <!-- Part Properties: the part TAG — the record of WHAT the part is (number,
+       revision, material, mass), which is what the toolbar button opens. A
+       silhouette nothing else in the set uses, so it reads at button size. -->
+  <g stroke="#111" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+    <g transform="rotate(-45 12 12)">
+      <rect x="3.4" y="7.2" width="17.2" height="9.6" rx="2.2" style="fill:none"/>
+      <circle cx="7.6" cy="12" r="1.5" fill="#111"/>
+    </g>
+  </g>
+</svg>

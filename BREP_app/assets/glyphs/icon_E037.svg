@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:brep="https://brep.io/icons"
+     viewBox="0 0 1233 2384" width="1233" height="2384" brep:glyph-name="icon_feat_pyramid" brep:unicode="E037">
+  <path d="M616 805L1016 1451L216 1451Z" fill="#ffd977"/>
+  <path d="M616 805L216 1451L496 1551Z" fill="#f0b840"/>
+  <path d="M616 805L496 1551L1016 1451Z" fill="#d4901f"/>
+  <path d="M577.2 845.7L977.2 1475.7L1054.8 1426.3L654.8 796.3ZM577.2 796.3L177.2 1426.3L254.8 1475.7L654.8 845.7ZM216 1497L1016 1497L1016 1405L216 1405ZM570.6 813.5L450.6 1543.5L541.4 1558.5L661.4 828.5ZM200.5 1494.3L480.5 1594.3L511.5 1507.7L231.5 1407.7ZM1007.3 1405.8L487.3 1505.8L504.7 1596.2L1024.7 1496.2Z" fill="#7a4d10"/>
+</svg>

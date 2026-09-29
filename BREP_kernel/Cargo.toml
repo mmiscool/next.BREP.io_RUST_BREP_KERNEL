@@ -1,0 +1,65 @@
+[package]
+name = "BREP_kernel"
+version = "0.7.0"
+edition = "2021"
+license-file = "LICENSE.md"
+description = "A boundary representation (BREP) geometry kernel for building CAD applications."
+repository = "https://github.com/mmiscool/next.BREP.io_RUST_BREP_KERNEL"
+homepage = "https://v2.brep.io"
+readme = "README.md"
+keywords = ["cad", "brep", "geometry", "nurbs", "kernel"]
+categories = ["mathematics", "graphics", "algorithms"]
+# Only production sources and package metadata are published.
+# The `!` entries are a backstop: test code never ships. The publish snapshot
+# `cargo package` of this manifest from shipping test files.
+include = [
+    "src/**/*.rs",
+    "/build.rs",
+    "/Cargo.toml",
+    "/README.md",
+    "/LICENSE.md",
+    "!src/**/tests/**",
+    "!**/tests.rs",
+    "!**/*_tests.rs",
+    "!**/test_support.rs",
+    "!**/testdata/**",
+]
+
+[lib]
+# Published package is BREP_kernel; the lib name is the idiomatic lowercase
+# `brep_kernel` — the symbol every `use brep_kernel::` (BREP_render, benches,
+# examples) and the wasm-pack artifact names key off.
+name = "brep_kernel"
+crate-type = ["cdylib", "rlib"]
+
+[profile.release]
+opt-level = 3           # aggressive opts: loop unrolling + vectorization
+lto = "fat"             # full cross-crate Link-Time Optimization
+codegen-units = 1       # single codegen unit lets LLVM optimize globally
+panic = "abort"         # drop unwinding code (wasm can't unwind anyway) — smaller/faster
+overflow-checks = false # no arithmetic overflow checks in hot paths
+
+[dependencies]
+# Robust single-region surface fitting for the Refit Faces edit (the same
+# RANSAC + least-squares pass the mesh import runs). A geometry leaf: no cycle.
+BREP_RANSAC = { version = "0.1.4", path = "../BREP_RANSAC" }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+slotmap = "1"
+rustc-hash = "2"
+wasm-bindgen = "0.2"
+web-time = "1"
+spade = "=2.15.1"
+rayon = { version = "1", optional = true }
+wasm-bindgen-rayon = { version = "1", optional = true }
+
+[features]
+# `parallel` turns the per-face tessellation loop into a rayon par_iter. It
+# works on native (rayon's own pool) and on wasm built with atomics. The
+# DEFAULT build enables neither feature, so the shipped wasm is byte-identical
+# to before. `wasm-threads` additionally pulls in wasm-bindgen-rayon so the
+# browser can spin up a shared-memory thread pool (requires an atomics build +
+# COOP/COEP headers — see build:rust-kernel:threads).
+parallel = ["dep:rayon"]
+wasm-threads = ["parallel", "dep:wasm-bindgen-rayon"]
+

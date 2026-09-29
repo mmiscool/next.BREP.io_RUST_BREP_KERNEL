@@ -1,0 +1,3 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:brep="https://brep.io/icons" viewBox="0 0 24 24" brep:glyph-name="icon_workbench_diagram" brep:unicode="E079">
+  <g fill="none" stroke-width="2" stroke-linejoin="round"><path d="M10 6.5H18V14" stroke="#fbbf24"/><path d="M6 10V17.5H14" stroke="#34d399"/></g><rect x="2" y="3" width="8" height="7" rx="1.5" fill="#60a5fa"/><rect x="14" y="14" width="8" height="7" rx="1.5" fill="#c084fc"/>
+</svg>

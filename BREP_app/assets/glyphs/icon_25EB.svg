@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:brep="https://brep.io/icons"
+     viewBox="0 0 24 24" width="24" height="24" brep:glyph-name="icon_25EB" brep:unicode="25EB">
+  <!-- Center (assembly constraint): the two width walls, the mid-plane between
+       them as a dashed line, and the tab centred on it as a filled diamond. -->
+  <path d="M3 3h2v18H3zM19 3h2v18h-2z" fill="#111"/>
+  <path d="M11.1 3h1.8v2.4h-1.8zM11.1 7.2h1.8v2.4h-1.8zM11.1 14.4h1.8v2.4h-1.8zM11.1 18.6h1.8V21h-1.8z" fill="#111"/>
+  <path d="M12 8.6 15.4 12 12 15.4 8.6 12z" fill="#111"/>
+</svg>

@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:brep="https://brep.io/icons"
+     viewBox="0 0 24 24" width="24" height="24" brep:glyph-name="icon_ecad_board_fill_zones" brep:unicode="E0B1">
+  <g fill="#111" stroke="#111" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+    <path fill-rule="evenodd" d="M3 4 H17 L21 10 V20 H3 Z M11.5 9.2 A3.3 3.3 0 1 0 11.5 15.8 A3.3 3.3 0 1 0 11.5 9.2 Z" stroke-width="1.2"/>
+    <circle cx="11.5" cy="12.5" r="1.5" style="fill:none" stroke-width="1.4"/>
+  </g>
+</svg>

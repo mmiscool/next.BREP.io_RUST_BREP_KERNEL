@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:brep="https://brep.io/icons"
+     viewBox="0 0 24 24" width="24" height="24" brep:glyph-name="icon_ecad_sheet_junction" brep:unicode="E080">
+  <g fill="#111" stroke="#111" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M3 10 H21 M12 10 V20.6" style="fill:none"/>
+    <circle cx="12" cy="10" r="3.4" stroke="none"/>
+  </g>
+</svg>

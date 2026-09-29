@@ -1,0 +1,1398 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>BREP PLM</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+
+<div id="signin" class="signin" hidden>
+  <form class="card" id="login-form">
+    <h1>BREP PLM</h1>
+    <label>Username <input id="login-user" autocomplete="username" required></label>
+    <label>Password <input id="login-pass" type="password" autocomplete="current-password" required></label>
+    <button type="submit">Sign in</button>
+    <p class="error" id="login-error"></p>
+  </form>
+</div>
+
+<div id="shell" hidden>
+  <header>
+    <strong>BREP PLM</strong>
+    <nav>
+      <a href="#/parts">Parts</a>
+      <a href="#/workspace">Workspace</a>
+      <a href="#/reviews">Reviews <span id="inbox-badge" class="count" hidden></span></a>
+      <a href="#/ecos">Changes</a>
+      <a href="#/catalog">Catalog</a>
+      <a href="#/sourcing">Sourcing</a>
+      <a href="#/bake">Bake queue</a>
+      <a href="#/types" class="admin-only">Part types</a>
+      <a href="#/users" class="admin-only">Users</a>
+      <a href="#/scripts" class="admin-only">Scripts</a>
+      <a href="#/settings" class="admin-only">Settings</a>
+      <a href="#/security" class="admin-only">Security</a>
+      <a href="#/audit" class="admin-only">Audit</a>
+      <a href="#/backups" class="admin-only">Backups</a>
+      <a href="#/account">Account</a>
+    </nav>
+    <span class="spacer"></span>
+    <span id="whoami" class="who"></span>
+    <button id="signout" class="ghost">Sign out</button>
+  </header>
+
+  <p class="error" id="banner" hidden></p>
+
+  <!-- Parts list -->
+  <main id="view-parts" class="view" hidden>
+    <div class="toolbar">
+      <input id="search" type="search" placeholder="Search number, name, category, tag or value" aria-label="Search parts">
+      <select id="filter-category" class="narrow" aria-label="Category"></select>
+      <input id="filter-tag" class="short" placeholder="Tag" aria-label="Tag">
+      <select id="filter-company" class="narrow" aria-label="Manufacturer or supplier"></select>
+      <span class="spacer"></span>
+      <button id="new-part" class="author-only">New part</button>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th aria-label="Picture"></th><th>Number</th><th>Name</th><th>Type</th><th>Class</th><th>Category</th><th>MPN</th><th>Rev</th><th>State</th><th></th></tr>
+        </thead>
+        <tbody id="parts-rows"></tbody>
+      </table>
+    </div>
+    <p id="parts-empty" class="empty" hidden>No parts yet.</p>
+    <p class="more"><button type="button" id="parts-more" class="ghost" hidden>Load more</button></p>
+  </main>
+
+  <!-- One part -->
+  <!-- A user's workspace: folders of links and files (D12). The CAD app's File > Open shows
+       the same thing. -->
+  <main id="view-workspace" class="view" hidden>
+    <h1>Workspace</h1>
+    <div class="toolbar">
+      <label class="inline-select">Whose <select id="ws-owner"></select></label>
+      <span id="ws-readonly" class="muted" hidden>read-only — this is another user's workspace</span>
+      <span id="ws-private" class="muted" hidden>other workspaces are private on this server</span>
+      <span class="spacer"></span>
+      <button id="ws-reload" class="ghost">Reload</button>
+    </div>
+    <p id="ws-crumbs" class="crumbs"></p>
+    <p id="ws-cut" class="note" hidden><span id="ws-cut-name"></span> is cut.
+      <button id="ws-paste" class="link">Move it here</button>
+      <button id="ws-cut-cancel" class="link">Cancel</button></p>
+    <div id="ws-drop" class="drop" tabindex="0">
+      <p id="ws-empty" class="muted" hidden>This folder is empty.</p>
+      <div class="table-wrap" id="ws-wrap">
+        <table>
+          <thead><tr><th aria-label="Picture"></th><th>Name</th><th>What</th><th>Changed</th><th></th></tr></thead>
+          <tbody id="ws-rows"></tbody>
+        </table>
+      </div>
+      <p class="ws-write">Drop files here, or <label class="file-pick">choose files<input type="file" id="ws-file" multiple></label>.
+        A file with a name already in this folder becomes its next version; the one before is kept.
+        <span id="ws-status" class="muted"></span></p>
+    </div>
+    <div class="toolbar ws-write ws-make">
+      <input id="ws-folder-name" placeholder="folder name">
+      <button id="ws-new-folder" class="ghost">New folder</button>
+      <span class="spacer"></span>
+      <input id="ws-link-part" placeholder="part number">
+      <input id="ws-link-rev" placeholder="revision (empty: newest)" size="12">
+      <button id="ws-link" class="ghost">Link a part here</button>
+    </div>
+    <section id="ws-versions" hidden>
+      <h2>Versions of <span id="ws-versions-name" class="mono"></span></h2>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Version</th><th>Size</th><th>By</th><th>When</th><th></th></tr></thead>
+          <tbody id="ws-version-rows"></tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+
+  <main id="view-part" class="view" hidden>
+    <a href="#/parts" class="back">&larr; All parts</a>
+    <div class="part-head">
+      <span id="part-thumb"></span>
+      <h1><span id="part-number"></span> <span id="part-name" class="muted"></span></h1>
+    </div>
+    <p id="part-meta" class="muted"></p>
+    <div class="toolbar"><button id="part-add-ws" class="ghost">Add to workspace…</button>
+      <span id="part-ws-status" class="muted"></span></div>
+
+    <section class="details">
+      <div class="toolbar">
+        <h2>Catalog</h2>
+        <span class="spacer"></span>
+        <button id="edit-part" class="ghost author-only">Edit details</button>
+      </div>
+      <p id="part-locked" class="note" hidden>This part is released, and the administrator has
+        locked released catalog values. Start a new revision to change its category or attributes.</p>
+      <p id="part-category" class="muted"></p>
+      <p id="part-tags"></p>
+      <dl id="part-attrs" class="attrs"></dl>
+    </section>
+
+    <section class="sourcing">
+      <div class="toolbar">
+        <h2>Sourcing</h2>
+        <span class="spacer"></span>
+        <button id="add-mp" class="ghost author-only">Add manufacturer part</button>
+      </div>
+      <p id="sourcing-empty" class="muted">No manufacturer parts yet.</p>
+      <div id="sourcing-list"></div>
+    </section>
+
+    <!-- A family seed: its table and members -->
+    <section id="family-panel" class="details" hidden>
+      <div class="toolbar">
+        <h2>Family members</h2>
+        <span class="spacer"></span>
+        <label class="inline-select">Table from revision <select id="fam-revision"></select></label>
+      </div>
+      <p class="muted">The table lives in the family's document, so each family revision has its
+        own. Each row writes one member: the part and the revision the row names. A row fails
+        only when its revision exists and cannot be written. Removing a row never deletes a
+        member.</p>
+      <div class="toolbar">
+        <label class="inline-select">New members are
+          <select id="fam-member-type"></select></label>
+        <span id="fam-member-note" class="muted"></span>
+        <span class="spacer"></span>
+        <button id="fam-import" class="ghost author-only">Import CSV…</button>
+        <button id="fam-generate" class="author-only">Generate</button>
+      </div>
+      <p id="fam-nodoc" class="warn" hidden>This family revision has no document yet. Save the
+        family's model from the CAD app, or open the revision's document below and paste or load
+        the <span class="mono">.fbrep</span> file.</p>
+      <div id="fam-report" class="report" hidden></div>
+      <div class="table-wrap">
+        <table id="fam-table">
+          <thead id="fam-head"></thead>
+          <tbody id="fam-rows"></tbody>
+        </table>
+      </div>
+      <p id="fam-empty" class="muted" hidden>The table has no rows.</p>
+      <div id="fam-orphans" hidden>
+        <h3>Orphans</h3>
+        <p class="muted">Members this family generated whose row is gone from this table. They stay,
+          so nothing that uses them breaks.</p>
+        <ul id="fam-orphan-list" class="plain"></ul>
+      </div>
+      <p class="muted">Generate here builds each member from the family's model and marks it
+        <strong>waiting for a bake</strong>: a headless CAD worker checks its expressions, rebuilds it,
+        and writes it back. A member cannot release until then. Members generated from the CAD app
+        arrive already baked.</p>
+    </section>
+
+    <!-- A template: its inputs and the parts spun out of it -->
+    <section id="template-panel" class="details" hidden>
+      <div class="toolbar">
+        <h2>Template</h2>
+        <span class="spacer"></span>
+        <span id="tpl-revision" class="muted"></span>
+      </div>
+      <p id="tpl-nodoc" class="warn" hidden>This template has no document yet. Save it from the CAD
+        app, or paste or load the <span class="mono">.tbrep</span> file into the revision's document below.</p>
+      <form id="spin-form" class="author-only spin-form">
+        <p class="muted">Spinning out makes a new normal part from this template, with your values in
+          its expressions. The template is never placed itself.</p>
+        <div class="row2">
+          <label>New part name <input id="spin-name" required></label>
+          <label>Number <input id="spin-number" class="mono" autocomplete="off"></label>
+        </div>
+        <p class="muted" id="spin-number-note"></p>
+        <label class="inline-select">Part type <select id="spin-type"></select></label>
+        <div id="spin-inputs" class="attr-form"></div>
+        <p id="spin-none" class="muted" hidden>This template marks no inputs: a spin-out is a plain copy.</p>
+        <div class="toolbar"><button type="submit" id="spin-go">Spin out</button></div>
+      </form>
+      <h3>Parts made from this template</h3>
+      <p id="tpl-copies-none" class="muted">None yet.</p>
+      <ul id="tpl-copies" class="plain"></ul>
+    </section>
+
+    <h2>Revisions</h2>
+    <form class="toolbar author-only" id="new-rev-form">
+      <input id="new-rev-label" class="short" aria-label="Label for the new revision" placeholder="Label">
+      <button id="new-rev" type="submit">New revision</button>
+      <span class="muted" id="new-rev-note">Labels are free text. Leave it empty to use the suggestion.</span>
+    </form>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>Rev</th><th>State</th><th>Review</th><th>Source</th><th>Checked out</th><th>Size</th><th>Hash</th><th>Actions</th></tr>
+        </thead>
+        <tbody id="rev-rows"></tbody>
+      </table>
+    </div>
+
+    <!-- Review and discussion of one revision -->
+    <section id="review-panel" class="details">
+      <div class="toolbar">
+        <h2>Review</h2>
+        <span class="spacer"></span>
+        <label class="inline-select">Revision <select id="rv-revision"></select></label>
+      </div>
+      <div id="rv-current"></div>
+      <p id="rv-none" class="muted" hidden></p>
+      <details id="rv-history" hidden>
+        <summary>Earlier rounds</summary>
+        <div id="rv-history-list"></div>
+      </details>
+      <h3>Discussion</h3>
+      <div id="rv-comments" class="thread"></div>
+      <p id="rv-comments-empty" class="muted">No comments yet.</p>
+      <form id="rv-comment-form" class="comment-form">
+        <p id="rv-reply-to" class="muted" hidden></p>
+        <textarea id="rv-comment" rows="3" placeholder="Add a comment" aria-label="Comment"></textarea>
+        <div class="toolbar">
+          <button type="submit">Post comment</button>
+          <button type="button" id="rv-reply-cancel" class="ghost" hidden>Cancel reply</button>
+        </div>
+      </form>
+    </section>
+
+    <!-- Assembly structure: the uses list, the BOM built from it, and the
+         diff between two revisions' lists -->
+    <section id="bom-panel" class="details">
+      <div class="toolbar">
+        <h2>Structure</h2>
+        <span class="spacer"></span>
+        <label class="inline-select">Revision <select id="bom-revision"></select></label>
+      </div>
+      <div class="tabs" role="tablist" aria-label="Structure views">
+        <button type="button" role="tab" class="tab" data-tab="bom" aria-selected="true">BOM</button>
+        <button type="button" role="tab" class="tab" data-tab="uses" aria-selected="false">Uses list</button>
+        <button type="button" role="tab" class="tab" data-tab="diff" aria-selected="false">Compare revisions</button>
+      </div>
+
+      <div id="tab-bom" role="tabpanel">
+        <div class="toolbar">
+          <label class="inline-select">View
+            <select id="bom-view">
+              <option value="indented">Indented</option>
+              <option value="flat">Flat: totals per part</option>
+            </select></label>
+          <label class="inline-select" id="bom-levels-label">Levels
+            <select id="bom-levels">
+              <option value="1">1</option>
+              <option value="2">2</option>
+              <option value="3">3</option>
+              <option value="0" selected>All</option>
+            </select></label>
+          <span class="spacer"></span>
+          <a id="bom-csv" class="button-link" href="#" download>Download CSV</a>
+        </div>
+        <div id="bom-warnings" class="warn" hidden></div>
+        <p id="bom-empty" class="muted" hidden>This revision uses nothing, so it has no BOM. To make it an
+          assembly, add the parts it is built from on the <strong>Uses list</strong> tab.</p>
+        <div class="table-wrap" id="bom-wrap">
+          <table class="bom">
+            <thead id="bom-head"></thead>
+            <tbody id="bom-rows"></tbody>
+          </table>
+        </div>
+        <p id="bom-totals" class="bom-totals"></p>
+        <p class="muted">Each line is priced from the part's preferred manufacturer part and that
+          part's cheapest supplier offer, at the quantity bought. Totals count the parts that are
+          bought, not the assemblies they go into, and are never added across currencies.</p>
+      </div>
+
+      <div id="tab-uses" role="tabpanel" hidden>
+        <p class="muted">The parts this revision is built from. The CAD app will publish this list
+          each time it saves the assembly. Until then, or for an assembly that is only bought
+          parts, edit it here. Leave <strong>Rev</strong> empty to follow the part's current
+          release; type a label to pin that revision.</p>
+        <p id="uses-locked" class="note" hidden></p>
+        <div class="table-wrap">
+          <table class="uses-editor">
+            <thead><tr><th>Part</th><th>Rev</th><th>Qty</th><th>Unit</th><th>Find</th><th>Reference</th><th></th></tr></thead>
+            <tbody id="uses-rows"></tbody>
+          </table>
+        </div>
+        <p id="uses-empty" class="muted">Uses nothing yet.</p>
+        <div id="uses-add" class="uses-add">
+          <input id="uses-search" type="search" placeholder="Find a part to add: number, name or MPN" aria-label="Find a part to add">
+          <ul id="uses-results" class="plain results"></ul>
+        </div>
+        <div class="toolbar">
+          <button type="button" id="uses-save">Save uses list</button>
+          <button type="button" id="uses-revert" class="ghost">Revert</button>
+          <span class="muted" id="uses-status"></span>
+        </div>
+      </div>
+
+      <div id="tab-diff" role="tabpanel" hidden>
+        <div class="toolbar">
+          <label class="inline-select">From <select id="diff-from"></select></label>
+          <label class="inline-select">To <select id="diff-to"></select></label>
+        </div>
+        <div class="table-wrap" id="diff-wrap">
+          <table>
+            <thead><tr><th>Number</th><th>Name</th><th>Change</th><th>What</th></tr></thead>
+            <tbody id="diff-rows"></tbody>
+          </table>
+        </div>
+        <p id="diff-summary" class="muted"></p>
+      </div>
+    </section>
+
+    <section id="attach-panel" class="details">
+      <div class="toolbar">
+        <h2>Attachments</h2>
+        <span class="spacer"></span>
+        <label class="inline-select">Revision <select id="att-revision"></select></label>
+      </div>
+      <p class="muted">Part files (datasheets, supplier drawings) follow the part. Revision files are
+        frozen when the revision is released, and a new revision starts with the same files.</p>
+      <div id="att-drop" class="drop author-only" tabindex="0">
+        <p>Drop files here, or <label class="file-pick">choose files<input type="file" id="att-file" multiple></label></p>
+        <div class="drop-options">
+          <label class="inline-select">Attach to <select id="att-target">
+            <option value="part">the part</option>
+            <option value="revision">this revision</option>
+          </select></label>
+          <label class="inline-select">Kind <select id="att-kind">
+            <option value="">automatic</option>
+            <option value="datasheet">datasheet</option>
+            <option value="drawing">drawing</option>
+            <option value="spec">spec</option>
+            <option value="image">image</option>
+            <option value="other">other</option>
+          </select></label>
+        </div>
+        <p id="att-status" class="muted"></p>
+      </div>
+      <div class="table-wrap" id="att-wrap">
+        <table>
+          <thead><tr><th>File</th><th>On</th><th>Kind</th><th>Size</th><th>Added</th><th><span class="visually-hidden">Actions</span></th></tr></thead>
+          <tbody id="att-rows"></tbody>
+        </table>
+      </div>
+      <p id="att-empty" class="muted" hidden>No files yet.</p>
+      <div id="att-preview" class="att-preview" hidden></div>
+    </section>
+
+    <section id="where-panel" class="details">
+      <div class="toolbar">
+        <h2>Where used</h2>
+        <span class="spacer"></span>
+        <label class="inline-select">Of revision <select id="wu-revision"></select></label>
+        <button type="button" id="replace-open" class="author-only">Replace everywhere…</button>
+        <label class="inline-select">Levels
+          <select id="wu-levels">
+            <option value="1">1</option>
+            <option value="0" selected>Up to the top</option>
+          </select></label>
+      </div>
+      <div class="table-wrap" id="wu-wrap">
+        <table>
+          <thead><tr><th>Used by</th><th>Rev</th><th>State</th><th>Uses rev</th><th>Qty</th><th>Find</th></tr></thead>
+          <tbody id="wu-rows"></tbody>
+        </table>
+      </div>
+      <p id="wu-empty" class="muted" hidden>Nothing uses this part.</p>
+    </section>
+
+    <section id="history-panel" class="details">
+      <div class="toolbar">
+        <h2>History</h2>
+        <span class="spacer"></span>
+        <a id="history-csv" class="button-link" href="#">Download CSV</a>
+      </div>
+      <p class="muted">Every change to this part and its revisions: who, when, and what changed.</p>
+      <div class="table-wrap">
+        <table class="audit">
+          <thead><tr><th>When</th><th>Who</th><th>What</th><th>On</th><th>Changes</th></tr></thead>
+          <tbody id="history-rows"></tbody>
+        </table>
+      </div>
+      <p id="history-empty" class="muted" hidden>No history yet.</p>
+      <div class="toolbar"><button id="history-more" class="ghost" hidden>Older</button></div>
+    </section>
+
+    <section id="editor" hidden>
+      <h2>Document <span id="editor-key" class="muted mono"></span></h2>
+      <p class="muted" id="editor-note"></p>
+      <textarea id="editor-body" spellcheck="false"></textarea>
+      <div class="toolbar">
+        <button id="editor-save">Save document</button>
+        <label id="editor-load" class="button-like ghost">Load file…
+          <input type="file" id="editor-file" accept=".nbrep,.fbrep,.tbrep,.json,application/json" hidden></label>
+        <button id="editor-close" class="ghost">Close</button>
+        <span class="spacer"></span>
+        <span id="editor-status" class="muted"></span>
+      </div>
+    </section>
+  </main>
+
+  <!-- Catalog -->
+  <main id="view-catalog" class="view" hidden>
+    <h1>Catalog</h1>
+    <p class="muted">Every part sits in one category. A category's attributes apply to
+      every category beneath it, and a sub-category can add its own but cannot
+      redefine one it inherits. Values are checked when they are saved; required
+      values are needed only when a revision is released.</p>
+    <div class="catalog">
+      <aside>
+        <ul id="category-tree" class="tree"></ul>
+        <form id="category-new" class="card admin-only">
+          <h2>Add a category</h2>
+          <label>Id <input id="cn-id" class="mono" placeholder="screws" required></label>
+          <label>Name <input id="cn-name" placeholder="Screws" required></label>
+          <label>Parent <select id="cn-parent"></select></label>
+          <button type="submit">Create category</button>
+        </form>
+      </aside>
+      <section id="category-panel" class="category-panel">
+        <p class="empty" id="category-none">Choose a category.</p>
+        <div id="category-body" hidden>
+          <div class="toolbar">
+            <h2 id="cat-title"></h2>
+            <span class="spacer"></span>
+            <a id="cat-parts" class="button-link" href="#/parts">Show parts</a>
+          </div>
+          <p class="muted" id="cat-meta"></p>
+
+          <h3>Inherited attributes</h3>
+          <p class="muted" id="cat-inherited-none">None. This is a top-level category.</p>
+          <div class="table-wrap">
+            <table id="cat-inherited-table">
+              <thead><tr><th>Key</th><th>Name</th><th>Type</th><th>Required</th><th>From</th></tr></thead>
+              <tbody id="cat-inherited"></tbody>
+            </table>
+          </div>
+
+          <h3>This category's attributes</h3>
+          <form id="cat-form">
+            <div class="admin-only cat-fields">
+              <label>Name <input id="cat-name" required></label>
+              <label>Parent <select id="cat-parent"></select></label>
+            </div>
+            <div class="table-wrap">
+              <table class="attr-editor">
+                <thead><tr><th>Key</th><th>Name</th><th>Type</th><th>Unit or values</th><th>Required</th><th></th></tr></thead>
+                <tbody id="cat-own"></tbody>
+              </table>
+            </div>
+            <p class="muted" id="cat-own-none">No attributes of its own.</p>
+            <div class="toolbar admin-only">
+              <button type="button" id="cat-add-attr" class="ghost">Add attribute</button>
+              <span class="spacer"></span>
+              <button type="button" id="cat-delete" class="ghost">Delete category</button>
+              <button type="submit" id="cat-save">Save</button>
+            </div>
+            <p class="muted admin-only">Changing or removing an attribute never rewrites parts.
+              A value that no longer fits is reported when that part is next released, and a
+              value whose attribute is gone is kept but has no effect.</p>
+          </form>
+        </div>
+      </section>
+    </div>
+  </main>
+
+  <!-- Part types -->
+  <!-- A person's reviews: what waits on them, what they submitted -->
+  <main id="view-reviews" class="view" hidden>
+    <h1>Reviews</h1>
+    <h2>Waiting on you</h2>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>What</th><th>Name</th><th>Submitted by</th><th>Submitted</th><th>Due</th><th>Approvals</th><th>Status</th></tr></thead>
+        <tbody id="inbox-waiting"></tbody>
+      </table>
+    </div>
+    <p id="inbox-waiting-empty" class="muted" hidden>Nothing is waiting on you.</p>
+    <h2>Submitted by you</h2>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>What</th><th>Name</th><th>Submitted by</th><th>Submitted</th><th>Due</th><th>Approvals</th><th>Status</th></tr></thead>
+        <tbody id="inbox-submitted"></tbody>
+      </table>
+    </div>
+    <p id="inbox-submitted-empty" class="muted" hidden>You have nothing in review.</p>
+  </main>
+
+  <!-- Change orders -->
+  <main id="view-ecos" class="view" hidden>
+    <div class="toolbar">
+      <h1>Change orders</h1>
+      <span class="spacer"></span>
+      <label class="inline-select">Show
+        <select id="eco-filter">
+          <option value="open">Open</option>
+          <option value="">All</option>
+          <option value="draft">Draft</option>
+          <option value="inreview">In review</option>
+          <option value="approved">Approved</option>
+          <option value="released">Released</option>
+          <option value="cancelled">Cancelled</option>
+        </select></label>
+      <button id="eco-new" class="author-only">New change order</button>
+    </div>
+    <p class="muted">A change order releases a set of revisions — and obsoletes others — together,
+      after one review: every item or none.</p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Number</th><th>Title</th><th>State</th><th>Priority</th><th>Items</th><th>Review</th><th>Created</th></tr></thead>
+        <tbody id="eco-rows"></tbody>
+      </table>
+    </div>
+    <p id="eco-empty" class="muted" hidden>No change orders.</p>
+  </main>
+
+  <main id="view-eco" class="view" hidden>
+    <a href="#/ecos" class="back">&larr; All change orders</a>
+    <h1><span id="eco-number" class="mono"></span> <span id="eco-title" class="muted"></span></h1>
+    <p id="eco-meta" class="muted"></p>
+    <div class="toolbar">
+      <button id="eco-submit" hidden>Submit for review</button>
+      <button id="eco-release" hidden>Release</button>
+      <button id="eco-withdraw" class="ghost" hidden>Withdraw</button>
+      <button id="eco-edit" class="ghost" hidden>Edit</button>
+      <button id="eco-cancel" class="ghost danger-text" hidden>Cancel change order</button>
+    </div>
+    <section class="details">
+      <h2>Why</h2>
+      <p id="eco-reason" class="comment-body"></p>
+      <h3>Description</h3>
+      <p id="eco-description" class="comment-body"></p>
+    </section>
+    <div id="eco-problems" class="warn" hidden></div>
+    <section class="details">
+      <h2>What it changes</h2>
+      <div class="table-wrap">
+        <table class="eco-items">
+          <thead><tr><th>Action</th><th>Part</th><th>Rev</th><th>Replaces</th><th>Changes</th><th></th></tr></thead>
+          <tbody id="eco-items"></tbody>
+        </table>
+      </div>
+      <p id="eco-items-empty" class="muted" hidden>Nothing yet. Add the revisions it releases or obsoletes.</p>
+      <form id="eco-add" class="eco-add" hidden>
+        <input id="eco-add-search" type="search" placeholder="Find a part: number, name or MPN" aria-label="Find a part">
+        <ul id="eco-add-results" class="plain results"></ul>
+        <div class="toolbar" id="eco-add-pick" hidden>
+          <strong id="eco-add-part"></strong>
+          <label class="inline-select">Revision <select id="eco-add-rev"></select></label>
+          <label class="inline-select">Action <select id="eco-add-action">
+            <option value="release">Release</option><option value="obsolete">Obsolete</option></select></label>
+          <input id="eco-add-note" placeholder="Note" aria-label="Note" class="short">
+          <button type="submit">Add</button>
+        </div>
+      </form>
+    </section>
+    <section class="details">
+      <h2>Review</h2>
+      <div id="eco-round"></div>
+      <p id="eco-round-none" class="muted" hidden></p>
+      <details id="eco-history" hidden>
+        <summary>Earlier rounds</summary>
+        <div id="eco-history-list"></div>
+      </details>
+      <h3>Discussion</h3>
+      <div id="eco-comments" class="thread"></div>
+      <p id="eco-comments-empty" class="muted">No comments yet.</p>
+      <form id="eco-comment-form" class="comment-form">
+        <p id="eco-reply-to" class="muted" hidden></p>
+        <textarea id="eco-comment" rows="3" placeholder="Add a comment" aria-label="Comment"></textarea>
+        <div class="toolbar">
+          <button type="submit">Post comment</button>
+          <button type="button" id="eco-reply-cancel" class="ghost" hidden>Cancel reply</button>
+        </div>
+      </form>
+    </section>
+  </main>
+
+  <main id="view-types" class="view" hidden>
+    <h1>Part types</h1>
+    <p class="muted">Each type has its own numbering. A <strong>counter</strong> type
+      adds a prefix to a zero-padded number that counts up. A <strong>free text</strong>
+      type takes any number the user types, such as an ERP purchasing number. A
+      <strong>pattern</strong> type takes a typed number that must match a regular
+      expression. A <strong>script</strong> type asks one of the administrator's
+      scripts. In every mode, a part number is unique across all parts.</p>
+    <table>
+      <thead><tr><th>Id</th><th>Name</th><th>Numbering</th><th>Next number</th><th></th></tr></thead>
+      <tbody id="type-rows"></tbody>
+    </table>
+    <form id="type-form" class="card admin-only">
+      <h2>Add a type</h2>
+      <label>Id <input id="type-id" placeholder="assembly" required></label>
+      <label>Name <input id="type-name" placeholder="Assembly" required></label>
+      <label>Numbering
+        <select id="type-mode">
+          <option value="counter">Counter: prefix + digits, counted up</option>
+          <option value="free">Free text: any number the user types</option>
+          <option value="pattern">Pattern: a typed number matching a regex</option>
+          <option value="script">Script: an admin script decides</option>
+        </select>
+      </label>
+      <div class="mode-fields" data-mode="counter">
+        <label>Prefix <input id="type-prefix" placeholder="ASSY"></label>
+        <label>Digits <input id="type-digits" type="number" min="1" max="18" value="9"></label>
+        <label>Start at <input id="type-start" type="number" min="1" value="1"></label>
+        <p class="muted">Preview: <span id="type-preview" class="mono"></span></p>
+      </div>
+      <div class="mode-fields" data-mode="pattern" hidden>
+        <label>Pattern <input id="type-regex" class="mono" placeholder="\d{3}-\d{5}"></label>
+        <p class="muted">The whole number must match. You don't need <code>^</code> or <code>$</code>.</p>
+      </div>
+      <div class="mode-fields" data-mode="script" hidden>
+        <label>Script file <input id="type-script" class="mono" placeholder="part-number.js"></label>
+        <p class="muted">A file in the scripts directory that defines <code>partNumber(input)</code>.</p>
+      </div>
+      <button type="submit">Create part type</button>
+    </form>
+  </main>
+
+  <!-- Users -->
+  <main id="view-users" class="view" hidden>
+    <h1>Users</h1>
+    <table>
+      <thead><tr><th>Username</th><th>Name</th><th>Email</th><th>Groups</th><th>Active</th><th>Actions</th></tr></thead>
+      <tbody id="user-rows"></tbody>
+    </table>
+    <form id="user-form" class="card">
+      <h2>Add a user</h2>
+      <label>Username <input id="user-name" required></label>
+      <label>Display name <input id="user-display"></label>
+      <label>Email <input id="user-email" type="email"></label>
+      <label>Password <input id="user-pass" type="password" minlength="8" required></label>
+      <fieldset>
+        <legend>Groups</legend>
+        <label class="inline"><input type="checkbox" value="viewer" checked> viewer</label>
+        <label class="inline"><input type="checkbox" value="author"> author</label>
+        <label class="inline"><input type="checkbox" value="checkin"> checkin</label>
+        <label class="inline"><input type="checkbox" value="admin"> admin</label>
+        <label class="inline"><input type="checkbox" value="worker"> worker</label>
+      </fieldset>
+      <button type="submit">Create user</button>
+    </form>
+  </main>
+
+  <!-- The bake queue -->
+  <main id="view-bake" class="view" hidden>
+    <h1>Bake queue</h1>
+    <p class="muted">The server never runs the CAD kernel. A member or a spin-out the server
+      assembled waits here until a headless CAD worker (a user in the <strong>worker</strong> group)
+      claims it, checks and rebuilds it, and writes it back. A claim lapses after 15 minutes, so a
+      worker that stops never strands a job. A failed job waits for a person: fix the row or the
+      template, then retry it. Saving the part from the CAD app also answers its bake.</p>
+    <div class="toolbar">
+      <select id="bake-filter" class="narrow" aria-label="Which jobs">
+        <option value="">Waiting (pending, claimed, failed)</option>
+        <option value="pending">Pending</option>
+        <option value="claimed">Claimed</option>
+        <option value="failed">Failed</option>
+        <option value="done">Done</option>
+        <option value="all">All</option>
+      </select>
+      <span class="spacer"></span>
+      <button id="bake-refresh" class="ghost">Refresh</button>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Part</th><th>Rev</th><th>Status</th><th>Why</th><th>Requested</th><th>Worker</th><th>Tries</th><th></th></tr></thead>
+        <tbody id="bake-rows"></tbody>
+      </table>
+    </div>
+    <p id="bake-empty" class="empty" hidden>Nothing waiting.</p>
+  </main>
+
+  <!-- Sourcing: manufacturers and suppliers -->
+  <main id="view-sourcing" class="view" hidden>
+    <h1>Sourcing</h1>
+    <p class="muted">Manufacturers make parts and suppliers sell them. On a part, each
+      manufacturer part (MPN) lists the suppliers that offer it, with their prices.
+      A company that both makes and sells appears in both lists.</p>
+    <div class="companies">
+      <section>
+        <h2>Manufacturers</h2>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Name</th><th>Website</th><th>Parts</th><th>Actions</th></tr></thead>
+            <tbody id="manufacturer-rows"></tbody>
+          </table>
+        </div>
+        <p class="empty" id="manufacturers-empty" hidden>No manufacturers yet.</p>
+        <form class="toolbar author-only company-add" data-list="manufacturers">
+          <input name="name" placeholder="New manufacturer" aria-label="New manufacturer name" required>
+          <button type="submit">Add</button>
+        </form>
+      </section>
+      <section>
+        <h2>Suppliers</h2>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Name</th><th>Website</th><th>Parts</th><th>Actions</th></tr></thead>
+            <tbody id="supplier-rows"></tbody>
+          </table>
+        </div>
+        <p class="empty" id="suppliers-empty" hidden>No suppliers yet.</p>
+        <form class="toolbar author-only company-add" data-list="suppliers">
+          <input name="name" placeholder="New supplier" aria-label="New supplier name" required>
+          <button type="submit">Add</button>
+        </form>
+      </section>
+    </div>
+  </main>
+
+  <!-- Settings -->
+  <main id="view-settings" class="view" hidden>
+    <h1>Settings</h1>
+    <p class="muted">How this server works for everyone. Each setting starts at the
+      permissive choice. A change takes effect at once.</p>
+    <form id="settings-form" class="card settings">
+      <label class="check">
+        <input type="checkbox" id="set-multiple-drafts">
+        <span><strong>Allow more than one revision in work per part</strong><br>
+          <span class="muted">On: a part can have several Draft or In-review revisions at
+          once, each checked out on its own, and a family row can create the revision it
+          names while another is open. Off: a new revision waits until the open one is
+          released or deleted. Either way, the most recent release is the current one.</span></span>
+      </label>
+      <label class="check">
+        <input type="checkbox" id="set-lock-attributes">
+        <span><strong>Lock a released part's category and attributes</strong><br>
+          <span class="muted">On: once a part has been released, its category and attribute
+          values change only while a new revision is in work. Name, description and tags stay
+          editable, and so does sourcing. Values belong to the part, not to one revision, so a
+          change made during the new revision also shows on the released one.</span></span>
+      </label>
+      <label class="check">
+        <input type="checkbox" id="set-released-children">
+        <span><strong>Release an assembly only when everything it uses is released</strong><br>
+          <span class="muted">On: a release is refused while any part in the revision's uses
+          list is a draft, in review, superseded or obsolete, or has never been released, and
+          the refusal names them. Off: the release goes ahead and warns which parts are
+          unreleased. The BOM flags them either way.</span></span>
+      </label>
+      <h2>Review</h2>
+      <p class="muted">What a revision needs before it can release. With 0 approvals a
+        draft releases directly, as before reviews existed. The rule is copied into a review
+        when it opens, so a change here applies to the next submission.</p>
+      <div class="row2">
+        <label>Approvals needed
+          <input type="number" id="set-rv-required" min="0" max="50" step="1" required></label>
+        <label>Due after this many days (0 = no due date)
+          <input type="number" id="set-rv-due" min="0" step="1" required></label>
+      </div>
+      <label>Reviewers
+        <input id="set-rv-reviewers" placeholder="user:grace, group:quality — empty: the check-in group"></label>
+      <label class="check">
+        <input type="checkbox" id="set-rv-self">
+        <span><strong>The submitter's own approval counts</strong><br>
+          <span class="muted">Off: someone other than the person who submitted must approve.</span></span>
+      </label>
+      <h3>Overrides</h3>
+      <p class="muted">A rule for one part type, or for a category and everything under it.
+        The nearest category wins, then the part type, then the rule above.</p>
+      <div class="table-wrap">
+        <table class="overrides">
+          <thead><tr><th>For</th><th>Which</th><th>Approvals</th><th>Due days</th><th>Reviewers</th><th>Own counts</th><th></th></tr></thead>
+          <tbody id="set-rv-overrides"></tbody>
+        </table>
+      </div>
+      <p><button type="button" id="set-rv-add" class="ghost">Add override</button></p>
+      <h2>Change orders</h2>
+      <div class="row2">
+        <label>Approvals a change order needs
+          <input type="number" id="set-eco-required" min="0" max="50" step="1" required></label>
+        <label>Due after this many days (0 = no due date)
+          <input type="number" id="set-eco-due" min="0" step="1" required></label>
+      </div>
+      <label>Reviewers
+        <input id="set-eco-reviewers" placeholder="user:grace, group:quality — empty: the check-in group"></label>
+      <label class="check">
+        <input type="checkbox" id="set-eco-self">
+        <span><strong>The submitter's own approval counts</strong></span>
+      </label>
+      <label class="check">
+        <input type="checkbox" id="set-eco-holds">
+        <span><strong>A revision in an open change order releases only through it</strong><br>
+          <span class="muted">On: releasing or obsoleting it alone is refused, naming the change
+          order. Off: it goes ahead with a warning, and the change order then cannot release
+          until that item is taken out.</span></span>
+      </label>
+      <h3>Numbering</h3>
+      <div class="row2">
+        <label>Numbers
+          <select id="set-eco-mode">
+            <option value="counter">Counter</option>
+            <option value="free">Typed, any text</option>
+            <option value="pattern">Typed, matching a pattern</option>
+            <option value="script">A script decides</option>
+          </select></label>
+        <label id="set-eco-regex-label" hidden>Pattern <input id="set-eco-regex" placeholder="ECO-\d{5}"></label>
+        <label id="set-eco-script-label" hidden>Script <input id="set-eco-script" placeholder="eco-number.js"></label>
+      </div>
+      <div class="row2" id="set-eco-counter">
+        <label>Prefix <input id="set-eco-prefix"></label>
+        <label>Digits <input type="number" id="set-eco-digits" min="1" max="18" step="1"></label>
+        <label>Next <input type="number" id="set-eco-next" min="1" step="1"></label>
+      </div>
+      <p class="muted">Next number: <span id="set-eco-preview" class="mono"></span></p>
+      <h2>Sessions</h2>
+      <div class="row2">
+        <label>Sign out after this many idle minutes
+          <input type="number" id="set-idle" min="5" step="1" required></label>
+        <label>Sign out this many hours after sign-in (0 = never)
+          <input type="number" id="set-max-hours" min="0" step="1" required></label>
+      </div>
+      <p class="muted">Applies to browsers only. API tokens last until they expire or
+        are revoked. The defaults, 20160 minutes (14 days) and 720 hours (30 days),
+        are what sessions lasted before these settings existed.</p>
+      <h2>Workspaces</h2>
+      <label class="check">
+        <input type="checkbox" id="set-workspaces-browsable">
+        <span><strong>Let users browse each other's workspaces</strong><br>
+          <span class="muted">A workspace is a user's own folders of links to parts and of
+          files (the CAD app's file browser when it is connected to this server). On: anyone
+          signed in may look through, but never change, another user's workspace. Off: each
+          workspace is its owner's alone, and administrators can still read any.</span></span>
+      </label>
+      <h2>Scripts</h2>
+      <label class="check">
+        <input type="checkbox" id="set-script-editor">
+        <span><strong>Allow editing and test-running scripts in the browser</strong><br>
+          <span class="muted">Scripts are fully trusted: they can run programs and read
+          any file on the server. With this on, anyone who signs in as an administrator can
+          run code on the server. Off: the Scripts page is read-only, and scripts still run
+          from the scripts directory, which you edit on the host.</span>
+          <span class="warn" id="set-script-locked" hidden>The server was started with
+          <code>--lock-script-editor</code>, so the editor stays off whatever this says.</span></span>
+      </label>
+      <div class="toolbar">
+        <button type="submit" id="settings-save">Save settings</button>
+        <span class="muted" id="settings-status"></span>
+      </div>
+    </form>
+  </main>
+
+  <!-- Scripts -->
+  <main id="view-scripts" class="view" hidden>
+    <h1>Scripts</h1>
+    <p class="muted">Scripts are JavaScript files in a folder on the server:
+      <code id="scripts-dir"></code>. That folder is the source of truth. You can
+      keep it in git, and the server picks up a changed file on its next call,
+      with no restart. This editor reads and writes the same files.</p>
+    <p class="warn" id="scripts-readonly" hidden></p>
+    <table class="hooks">
+      <thead><tr><th>File</th><th>Function</th><th>When it runs</th></tr></thead>
+      <tbody id="hook-rows"></tbody>
+    </table>
+    <p class="muted">A hook that throws refuses its operation, and the user sees
+      the thrown message. The one exception is <code>afterRelease</code>: it runs
+      after the release is committed, so a throw is shown as a warning and the
+      release stands. Scripts are fully trusted. They can use <code>http</code>,
+      <code>fs</code>, <code>process</code> and <code>plm</code>.</p>
+
+    <div class="scripts">
+      <aside>
+        <ul id="script-list" class="file-list"></ul>
+        <form id="script-new" class="toolbar">
+          <input id="script-new-path" class="mono" placeholder="before-release.js" aria-label="New script path">
+          <button type="submit" class="ghost">New</button>
+        </form>
+      </aside>
+      <section class="script-editor">
+        <div class="toolbar">
+          <strong id="script-path" class="mono">No file open</strong>
+          <span id="script-dirty" class="muted"></span>
+          <span class="spacer"></span>
+          <button id="script-save" disabled>Save</button>
+          <button id="script-delete" class="ghost" disabled>Delete</button>
+        </div>
+        <textarea id="script-text" spellcheck="false" disabled placeholder="Open or create a script"></textarea>
+
+        <h2>Test run</h2>
+        <div class="run-grid">
+          <label>Function
+            <select id="run-function">
+              <option>partNumber</option>
+              <option>revisionLabel</option>
+              <option>beforeRelease</option>
+              <option>afterRelease</option>
+            </select>
+          </label>
+          <label>Input (JSON)
+            <textarea id="run-input" class="short-area" spellcheck="false"></textarea>
+          </label>
+        </div>
+        <p class="warn">A test run is a real run. It uses the text in the editor, even
+          if unsaved, with your account and the full host API. If the script posts to
+          your ERP, writes a file or updates a part, that really happens.</p>
+        <div class="toolbar">
+          <button id="run-go" disabled>Run</button>
+          <span id="run-status" class="muted"></span>
+        </div>
+        <pre id="run-output" class="output" hidden></pre>
+      </section>
+    </div>
+  </main>
+
+  <!-- The audit log (admin) -->
+  <main id="view-audit" class="view" hidden>
+    <h1>Audit log</h1>
+    <p class="muted">Every change anyone made, and every sign-in. Nothing is ever deleted from
+      it. Secrets (passwords, tokens) are shown only as <code>(secret)</code>.</p>
+    <form id="audit-filter" class="audit-filter">
+      <label>User <input id="af-user" placeholder="username"></label>
+      <label>Action
+        <select id="af-action">
+          <option value="">Any</option>
+          <option>create</option><option>update</option><option>delete</option>
+          <option>release</option><option>submit</option><option>supersede</option><option>obsolete</option>
+          <option>return-to-draft</option><option>checkout</option><option>checkin</option>
+          <option>break-lock</option><option>document</option><option>uses</option><option>bake</option>
+          <option>sourcing</option><option>password</option><option>groups</option>
+          <option>enable</option><option>disable</option><option>revoke</option>
+          <option>sign-in</option><option>sign-in-failed</option><option>session-ended</option>
+          <option>script-write</option><option>script-delete</option><option>script-run</option>
+        </select></label>
+      <label>On
+        <select id="af-kind">
+          <option value="">Anything</option>
+          <option value="part">Parts</option><option value="revision">Revisions</option>
+          <option value="user">Users</option><option value="token">API tokens</option>
+          <option value="part-type">Part types</option><option value="category">Categories</option>
+          <option value="manufacturer">Manufacturers</option><option value="supplier">Suppliers</option>
+          <option value="settings">Settings</option><option value="script">Scripts</option>
+        </select></label>
+      <label>From <input id="af-since" type="date"></label>
+      <label>To <input id="af-until" type="date"></label>
+      <div class="toolbar">
+        <button type="submit">Show</button>
+        <button type="button" id="af-clear" class="ghost">Clear</button>
+        <a id="audit-csv" class="button-link" href="#">Download CSV</a>
+      </div>
+    </form>
+    <div class="table-wrap">
+      <table class="audit">
+        <thead><tr><th>When</th><th>Who</th><th>What</th><th>On</th><th>Changes</th></tr></thead>
+        <tbody id="audit-rows"></tbody>
+      </table>
+    </div>
+    <p id="audit-empty" class="muted" hidden>Nothing matches.</p>
+    <div class="toolbar"><button id="audit-more" class="ghost" hidden>Older</button></div>
+  </main>
+
+  <!-- Your account -->
+  <main id="view-account" class="view" hidden>
+    <h1>Your account</h1>
+    <p class="muted" id="account-who"></p>
+    <div class="account">
+      <form id="password-form" class="card">
+        <h2>Change password</h2>
+        <label>Current password <input type="password" id="pw-current" autocomplete="current-password" required></label>
+        <label>New password <input type="password" id="pw-new" minlength="8" autocomplete="new-password" required></label>
+        <label>New password again <input type="password" id="pw-again" minlength="8" autocomplete="new-password" required></label>
+        <p class="muted">Every other browser signed in as you is signed out. This one stays
+          signed in. Your API tokens keep working; revoke them below if you need to.</p>
+        <div class="toolbar">
+          <button type="submit">Change password</button>
+          <span class="muted" id="pw-status"></span>
+        </div>
+      </form>
+      <section class="card">
+        <h2>Sign out everywhere</h2>
+        <p class="muted">Ends every session of your account, on every computer, including
+          this one. Use it if you signed in somewhere you should not have stayed signed in.</p>
+        <button id="logout-all" class="danger">Sign out everywhere</button>
+      </section>
+    </div>
+
+    <h2>API tokens</h2>
+    <p class="muted">A token lets something that is not a browser sign in as you: the CAD
+      app, a bake worker, or your own scripts. It sends
+      <code>Authorization: Bearer plm_…</code>. A token can do what you can do, narrowed
+      by its scope, but it can never make tokens or change your password.</p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Name</th><th>Scope</th><th>Starts with</th><th>Created</th><th>Last used</th><th>Expires</th><th></th></tr></thead>
+        <tbody id="token-rows"></tbody>
+      </table>
+    </div>
+    <p class="empty" id="tokens-empty" hidden>No tokens.</p>
+    <form id="token-form" class="card token-form">
+      <h2>New token</h2>
+      <label>Name <input id="tk-name" placeholder="CAD on my laptop" required></label>
+      <label>Scope
+        <select id="tk-scope">
+          <option value="full">Full: everything you may do</option>
+          <option value="read">Read only</option>
+          <option value="worker">Worker: read, the bake queue and documents</option>
+        </select>
+      </label>
+      <label>Expires after (days) <input id="tk-days" type="number" min="0" step="1" placeholder="never"></label>
+      <label class="admin-only">For user <select id="tk-user"></select></label>
+      <div class="toolbar"><button type="submit">Create token</button></div>
+    </form>
+    <div class="card secret" id="token-secret" hidden>
+      <strong>Copy this token now. It is not shown again.</strong>
+      <code id="token-secret-text" class="mono"></code>
+      <div class="toolbar">
+        <button type="button" id="token-copy" class="ghost">Copy</button>
+        <button type="button" id="token-done" class="ghost">Done</button>
+      </div>
+    </div>
+  </main>
+
+  <!-- Security (admin) -->
+  <main id="view-backups" class="view" hidden>
+    <h1>Backups</h1>
+    <p class="muted">A backup is one <code>.tar.gz</code>: a snapshot of the database, every
+      revision's document, every attachment and the scripts directory, with a manifest of
+      their hashes. The server holds writes off for the few milliseconds the snapshot takes,
+      so a backup is consistent while people work. Restore one with
+      <code>brep-plm restore --from &lt;file&gt; --data &lt;new directory&gt;</code>.</p>
+    <p id="bk-config"></p>
+    <div class="toolbar">
+      <button id="bk-now">Back up now</button>
+      <a id="bk-download" class="button-link" href="/api/admin/backup">Download a backup</a>
+      <span id="bk-status" class="muted"></span>
+    </div>
+    <h2>Last backup</h2>
+    <p id="bk-last" class="muted">None since the server started.</p>
+    <h2>Saved backups</h2>
+    <div class="table-wrap" id="bk-wrap">
+      <table>
+        <thead><tr><th>File</th><th>Size</th><th>Saved</th></tr></thead>
+        <tbody id="bk-rows"></tbody>
+      </table>
+    </div>
+    <p id="bk-empty" class="muted" hidden>No saved backups.</p>
+    <h2>Export</h2>
+    <p class="muted">The metadata, for moving to another system: parts, revisions, uses lists,
+      catalog, sourcing, change orders and users (never passwords or tokens). Documents and
+      attachments are not in it; they are in a backup.</p>
+    <div class="toolbar">
+      <a class="button-link" href="/api/admin/export?format=json">Everything (JSON)</a>
+      <a class="button-link" href="/api/admin/export?format=parts-csv">Parts (CSV)</a>
+      <a class="button-link" href="/api/admin/export?format=structure-csv">Structure (CSV)</a>
+    </div>
+  </main>
+
+  <main id="view-security" class="view" hidden>
+    <h1>Security</h1>
+    <h2>Sign-in lockouts</h2>
+    <p class="muted">After 5 failed sign-ins for one username, or 20 from one address, that
+      username or address is refused for 30 seconds. Each further failure doubles the wait,
+      up to 15 minutes. A success clears the username's count. The counts are kept in
+      memory, so a restart clears them too.</p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Kind</th><th>Username or address</th><th>Failures</th><th>Last failure</th><th>Locked until</th><th></th></tr></thead>
+        <tbody id="lockout-rows"></tbody>
+      </table>
+    </div>
+    <p class="empty" id="lockouts-empty" hidden>No failed sign-ins in the last hour.</p>
+    <div class="toolbar"><button id="lockouts-clear" class="ghost">Clear all</button></div>
+
+    <h2>Every API token</h2>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>User</th><th>Name</th><th>Scope</th><th>Starts with</th><th>Created</th><th>Last used</th><th>Expires</th><th></th></tr></thead>
+        <tbody id="all-token-rows"></tbody>
+      </table>
+    </div>
+    <p class="empty" id="all-tokens-empty" hidden>No tokens.</p>
+    <p class="muted">To make a token for another user, such as a worker account that never
+      signs in with a password, use <a href="#/account">Account</a> and choose the user.</p>
+  </main>
+</div>
+
+<dialog id="ws-pick-dialog">
+  <form method="dialog" id="ws-pick-form">
+    <h2 id="ws-pick-title">Choose a folder</h2>
+    <p id="ws-pick-crumbs" class="crumbs"></p>
+    <ul id="ws-pick-list" class="plain-list"></ul>
+    <label id="ws-pick-rev-label">Revision <select id="ws-pick-rev"></select></label>
+    <label>Name <input id="ws-pick-name" placeholder="empty: the part number"></label>
+    <menu>
+      <button value="cancel" class="ghost">Cancel</button>
+      <button value="choose" id="ws-pick-go">Here</button>
+    </menu>
+  </form>
+</dialog>
+
+<dialog id="ws-promote-dialog">
+  <form method="dialog" id="ws-promote-form">
+    <h2>Promote <span id="ws-promote-name" class="mono"></span> to an attachment</h2>
+    <label>Part <input id="ws-promote-part" placeholder="part number" required></label>
+    <label>Revision <input id="ws-promote-rev" placeholder="empty: the part itself"></label>
+    <label>Kind <select id="ws-promote-kind">
+      <option value="">automatic</option>
+      <option value="drawing">drawing</option>
+      <option value="datasheet">datasheet</option>
+      <option value="spec">spec</option>
+      <option value="image">image</option>
+      <option value="other">other</option>
+    </select></label>
+    <menu>
+      <button value="cancel" class="ghost">Cancel</button>
+      <button value="promote">Promote</button>
+    </menu>
+  </form>
+</dialog>
+
+<dialog id="submit-dialog">
+  <form method="dialog" id="submit-form">
+    <h2>Submit <span id="sb-title" class="mono muted"></span> for review</h2>
+    <p id="sb-rule" class="muted"></p>
+    <label>More reviewers <input id="sb-reviewers" placeholder="user:grace, group:quality"></label>
+    <label>Due <input id="sb-due" type="date"></label>
+    <label>Note to the reviewers <textarea id="sb-note" rows="3" class="short-area"></textarea></label>
+    <menu>
+      <button value="cancel" class="ghost">Cancel</button>
+      <button value="submit">Submit for review</button>
+    </menu>
+  </form>
+</dialog>
+
+<dialog id="round-dialog">
+  <form method="dialog" id="round-form">
+    <h2>Change this review</h2>
+    <label>Reviewers <input id="rd-reviewers" placeholder="user:grace, group:quality — empty: the check-in group"></label>
+    <label>Due <input id="rd-due" type="date"></label>
+    <label id="rd-required-label">Approvals needed <input id="rd-required" type="number" min="0" max="50" step="1"></label>
+    <menu>
+      <button value="cancel" class="ghost">Cancel</button>
+      <button value="save">Save</button>
+    </menu>
+  </form>
+</dialog>
+
+<dialog id="eco-dialog">
+  <form method="dialog" id="eco-form">
+    <h2 id="eco-dialog-title">New change order</h2>
+    <label id="ed-number-label">Number <input id="ed-number"></label>
+    <label>Title <input id="ed-title" required maxlength="200"></label>
+    <label>Why <textarea id="ed-reason" rows="3" class="short-area"></textarea></label>
+    <label>Description <textarea id="ed-description" rows="4" class="short-area"></textarea></label>
+    <label>Priority <select id="ed-priority">
+      <option value="low">Low</option><option value="normal" selected>Normal</option>
+      <option value="high">High</option><option value="critical">Critical</option></select></label>
+    <menu>
+      <button value="cancel" class="ghost">Cancel</button>
+      <button value="save">Save</button>
+    </menu>
+  </form>
+</dialog>
+
+<dialog id="eco-submit-dialog">
+  <form method="dialog" id="eco-submit-form">
+    <h2>Submit <span id="es-title" class="mono muted"></span> for review</h2>
+    <p id="es-rule" class="muted"></p>
+    <label>More reviewers <input id="es-reviewers" placeholder="user:grace, group:quality"></label>
+    <label>Note to the reviewers <textarea id="es-note" rows="3" class="short-area"></textarea></label>
+    <menu>
+      <button value="cancel" class="ghost">Cancel</button>
+      <button value="submit">Submit for review</button>
+    </menu>
+  </form>
+</dialog>
+
+<dialog id="replace-dialog" class="wide">
+  <form method="dialog" id="replace-form">
+    <h2>Replace <span id="rp-title" class="mono muted"></span> everywhere</h2>
+    <p class="muted">Every assembly that uses it directly gets the replacement: a revision in work is
+      edited in place, a released one gets a new revision. Preview first; nothing is written until Apply.</p>
+    <label>Which revision of it <select id="rp-from"></select></label>
+    <label>Replace with
+      <input id="rp-search" type="search" placeholder="Find the replacement: number, name or MPN" aria-label="Find the replacement part"></label>
+    <ul id="rp-results" class="plain results"></ul>
+    <p id="rp-chosen" class="muted"></p>
+    <label>Its revision <select id="rp-to-rev"></select></label>
+    <label>Change order <select id="rp-eco"></select></label>
+    <label id="rp-eco-new-label">Title of the new change order <input id="rp-eco-title" maxlength="200"></label>
+    <div class="table-wrap" id="rp-wrap" hidden>
+      <table>
+        <thead><tr><th><span class="visually-hidden">Include</span></th><th>Assembly</th><th>Rev</th><th>Writes</th><th>Changes</th><th>Result</th></tr></thead>
+        <tbody id="rp-rows"></tbody>
+      </table>
+    </div>
+    <p id="rp-summary" class="muted"></p>
+    <menu>
+      <button value="cancel" class="ghost">Close</button>
+      <button type="button" id="rp-preview" class="ghost">Preview</button>
+      <button type="button" id="rp-apply" disabled>Apply</button>
+    </menu>
+  </form>
+</dialog>
+
+<dialog id="add-to-eco-dialog">
+  <form method="dialog" id="add-to-eco-form">
+    <h2>Add <span id="ae-title" class="mono muted"></span> to a change order</h2>
+    <label>Change order <select id="ae-eco"></select></label>
+    <label id="ae-new-label">Title of the new change order <input id="ae-new-title" maxlength="200"></label>
+    <label>Action <select id="ae-action">
+      <option value="release">Release it</option><option value="obsolete">Obsolete it</option></select></label>
+    <menu>
+      <button value="cancel" class="ghost">Cancel</button>
+      <button value="save">Add</button>
+    </menu>
+  </form>
+</dialog>
+
+<dialog id="new-part-dialog">
+  <form method="dialog" id="new-part-form">
+    <h2>New part</h2>
+    <label>Type <select id="np-type"></select></label>
+    <label>Number <input id="np-number" class="mono" autocomplete="off"></label>
+    <p class="muted" id="np-number-note"></p>
+    <label>Name <input id="np-name" required></label>
+    <label>Document class
+      <select id="np-class">
+        <option value="normal">Normal part (.nBREP)</option>
+        <option value="family">Family seed (.fBREP)</option>
+        <option value="template">Template (.tBREP)</option>
+      </select>
+    </label>
+    <p class="muted">The class is fixed once the part is created. To turn a normal part into a family, create a new part.</p>
+    <label>Category <select id="np-category"></select></label>
+    <div id="np-attrs" class="attr-form"></div>
+    <label>Tags <input id="np-tags" placeholder="metric, stock"></label>
+    <label>Description <textarea id="np-description" rows="3" class="short-area"></textarea></label>
+    <label>First revision label <input id="np-label" placeholder="A"></label>
+    <menu>
+      <button value="cancel" class="ghost">Cancel</button>
+      <button value="create" id="np-create">Create</button>
+    </menu>
+  </form>
+</dialog>
+
+<dialog id="import-dialog">
+  <form method="dialog" id="import-form">
+    <h2>Import family rows</h2>
+    <p class="muted" id="import-target"></p>
+    <p class="muted">The first line names the columns: <span class="mono">part number</span>, and
+      optionally <span class="mono">revision</span> and <span class="mono">description</span>; every other
+      column is an expression the rows set, such as <span class="mono">length</span>. A row whose part
+      number is already in the table is updated; others are added. A paste from a spreadsheet
+      (tab-separated) works too.</p>
+    <label>Rows <textarea id="import-csv" class="short-area mono" rows="8" spellcheck="false"
+      placeholder="part number,revision,description,length&#10;M6x20,A,Hex bolt M6 x 20,20&#10;M6x30,A,Hex bolt M6 x 30,30"></textarea></label>
+    <label class="button-like ghost">Load a .csv file…
+      <input type="file" id="import-file" accept=".csv,.tsv,.txt,text/csv" hidden></label>
+    <label class="check"><input type="checkbox" id="import-generate" checked>
+      <span>Generate the members right after the import</span></label>
+    <menu>
+      <button value="cancel" class="ghost">Cancel</button>
+      <button value="import">Import</button>
+    </menu>
+  </form>
+</dialog>
+
+<dialog id="type-dialog">
+  <form method="dialog" id="type-edit-form">
+    <h2>Edit part type <span id="te-id" class="mono muted"></span></h2>
+    <label>Name <input id="te-name" required></label>
+    <label>Numbering
+      <select id="te-mode">
+        <option value="counter">Counter</option>
+        <option value="free">Free text</option>
+        <option value="pattern">Pattern</option>
+        <option value="script">Script</option>
+      </select>
+    </label>
+    <label class="te-field" data-mode="pattern">Pattern <input id="te-regex" class="mono"></label>
+    <label class="te-field" data-mode="script">Script file <input id="te-script" class="mono"></label>
+    <p class="muted">Parts that already exist keep their numbers. The change applies to the next part created.</p>
+    <menu>
+      <button value="cancel" class="ghost">Cancel</button>
+      <button value="save">Save</button>
+    </menu>
+  </form>
+</dialog>
+
+<dialog id="part-dialog">
+  <form method="dialog" id="part-edit-form">
+    <h2>Edit <span id="pe-number" class="mono muted"></span></h2>
+    <label>Name <input id="pe-name" required></label>
+    <label>Description <textarea id="pe-description" rows="3" class="short-area"></textarea></label>
+    <label>Category <select id="pe-category"></select></label>
+    <div id="pe-attrs" class="attr-form"></div>
+    <div id="pe-inert" class="inert" hidden></div>
+    <label>Tags <input id="pe-tags" placeholder="metric, stock"></label>
+    <p class="muted">These are the part's details, shared by all its revisions. No checkout is needed.</p>
+    <menu>
+      <button value="cancel" class="ghost">Cancel</button>
+      <button value="save">Save</button>
+    </menu>
+  </form>
+</dialog>
+
+<dialog id="company-dialog">
+  <form method="dialog" id="company-form">
+    <h2 id="co-title">Edit</h2>
+    <label>Name <input id="co-name" required></label>
+    <label>Website <input id="co-website" type="url" placeholder="https://"></label>
+    <label>Notes <textarea id="co-notes" rows="3" class="short-area"></textarea></label>
+    <menu>
+      <button value="cancel" class="ghost">Cancel</button>
+      <button value="save">Save</button>
+    </menu>
+  </form>
+</dialog>
+
+<dialog id="mp-dialog">
+  <form method="dialog" id="mp-form">
+    <h2 id="mp-title">Manufacturer part</h2>
+    <label>Manufacturer <select id="mp-manufacturer" required></select></label>
+    <p class="muted" id="mp-no-makers" hidden>Add a manufacturer on the <a href="#/sourcing">Sourcing</a> page first.</p>
+    <label>MPN <input id="mp-mpn" class="mono" required></label>
+    <label>Status
+      <select id="mp-status">
+        <option value="active">Active</option>
+        <option value="nrnd">NRND: not recommended for new designs</option>
+        <option value="obsolete">Obsolete</option>
+      </select>
+    </label>
+    <label class="check"><input type="checkbox" id="mp-preferred"><span>Preferred: buy this one first</span></label>
+    <label>Datasheet <input id="mp-datasheet" type="url" placeholder="https://"></label>
+    <label>Notes <textarea id="mp-notes" rows="2" class="short-area"></textarea></label>
+    <menu>
+      <button value="cancel" class="ghost">Cancel</button>
+      <button value="save">Save</button>
+    </menu>
+  </form>
+</dialog>
+
+<dialog id="offer-dialog">
+  <form method="dialog" id="offer-form">
+    <h2 id="of-title">Supplier offer</h2>
+    <label>Supplier <select id="of-supplier" required></select></label>
+    <p class="muted" id="of-no-suppliers" hidden>Add a supplier on the <a href="#/sourcing">Sourcing</a> page first.</p>
+    <label>Supplier part number (SPN) <input id="of-spn" class="mono"></label>
+    <label>Product page <input id="of-url" type="url" placeholder="https://"></label>
+    <fieldset>
+      <legend>Price breaks</legend>
+      <div id="of-breaks" class="breaks"></div>
+      <div class="toolbar">
+        <button type="button" class="ghost" id="of-add-break">Add break</button>
+        <span class="spacer"></span>
+        <label class="inline">Currency <input id="of-currency" class="tiny mono" placeholder="USD" maxlength="8"></label>
+      </div>
+    </fieldset>
+    <div class="row3">
+      <label>Lead time (days) <input id="of-lead" type="number" min="0" step="1"></label>
+      <label>MOQ <input id="of-moq" type="number" min="0" step="1"></label>
+      <label>Stock <input id="of-stock" type="number" min="0" step="1"></label>
+    </div>
+    <label>Notes <textarea id="of-notes" rows="2" class="short-area"></textarea></label>
+    <menu>
+      <button value="cancel" class="ghost">Cancel</button>
+      <button value="save">Save</button>
+    </menu>
+  </form>
+</dialog>
+
+<script src="/app.js"></script>
+</body>
+</html>

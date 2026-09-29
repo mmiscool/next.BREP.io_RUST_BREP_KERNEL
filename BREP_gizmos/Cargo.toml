@@ -1,0 +1,49 @@
+[package]
+name = "BREP_gizmos"
+version = "0.2.4"
+edition = "2021"
+license-file = "LICENSE.md"
+repository = "https://github.com/mmiscool/next.BREP.io_RUST_BREP_KERNEL"
+homepage = "https://v2.brep.io"
+readme = "README.md"
+keywords = ["cad", "brep", "gizmo", "viewcube", "overlay"]
+categories = ["graphics", "gui", "visualization"]
+# The `!` entries are a backstop: test code never ships. The publish snapshot
+# `cargo package` of this manifest from shipping test files.
+include = [
+    "src/**",
+    "/Cargo.toml",
+    "/LICENSE.md",
+    "/README.md",
+    "!src/**/tests/**",
+    "!**/tests.rs",
+    "!**/*_tests.rs",
+    "!**/test_support.rs",
+    "!**/testdata/**",
+]
+description = "BREP in-scene gizmos and overlay widgets (transform gizmo, ViewCube, datum/axis visuals, dimension leaders). Pure geometry + hit-testing, no kernel or GPU dependency — the render engine consumes the emitted overlay geometry. A CPU rasterizer is provided for headless demo/verification."
+
+# The package publishes as BREP_gizmos; the library keeps the historical
+# brep_gizmos symbol so every existing `use brep_gizmos::` keeps compiling.
+[lib]
+name = "brep_gizmos"
+
+[dependencies]
+# 0.18 to match BREP_render / BREP_app — one png build across the family.
+png = "0.18"
+
+[[bin]]
+name = "gizmo-demo"
+path = "src/bin/demo.rs"
+
+[[bin]]
+name = "datum-demo"
+path = "src/bin/datum_demo.rs"
+
+[[bin]]
+name = "dimension-demo"
+path = "src/bin/dimension_demo.rs"
+
+[[bin]]
+name = "viewcube-demo"
+path = "src/bin/viewcube_demo.rs"

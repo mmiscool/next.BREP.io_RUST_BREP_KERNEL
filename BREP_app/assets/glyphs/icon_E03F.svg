@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:brep="https://brep.io/icons"
+     viewBox="0 0 1233 2384" width="1233" height="2384" brep:glyph-name="icon_feat_fillet" brep:unicode="E03F">
+  <path d="M262 821L262 1281C262 1575 556 1575 1016 1575L1016 821Z" fill="#ffd977"/>
+  <path d="M262 1281C262 1575 556 1575 1016 1575L1016 1465C556 1465 372 1465 372 1281Z" fill="#a8d4f7"/>
+  <path d="M170 821L170 1281L262 1281L262 821ZM170 1281C170 1667 556 1667 1016 1667L1016 1575C556 1575 262 1575 262 1281Z" fill="#7a4d10"/>
+</svg>

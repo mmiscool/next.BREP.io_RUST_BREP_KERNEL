@@ -1,0 +1,51 @@
+[package]
+name = "BREP_mcp_core"
+version = "0.5.0"
+edition = "2021"
+license-file = "LICENSE.md"
+repository = "https://github.com/mmiscool/next.BREP.io_RUST_BREP_KERNEL"
+homepage = "https://v2.brep.io"
+readme = "README.md"
+rust-version = "1.92"
+description = "The BREP MCP server core: the Model Context Protocol surface generated from the CAD app's own registries, its sessions, script runner and transports (stdio and streamable HTTP). Embedded in the app behind `brep-app --mcp`; hosted headlessly by BREP_mcp."
+# The `!` entries are a backstop: test code never ships. The publish snapshot
+# `cargo package` of this manifest from shipping test files.
+include = [
+    "src/**",
+    "examples/**",
+    "/Cargo.toml",
+    "/LICENSE.md",
+    "/README.md",
+    "!src/**/tests/**",
+    "!**/tests.rs",
+    "!**/*_tests.rs",
+    "!**/test_support.rs",
+    "!**/testdata/**",
+]
+
+# The library keeps a brep_mcp_core symbol; the package publishes as
+# BREP_mcp_core, like BREP_app / brep_app. It carries NO dependency on the
+# app: hosts (the app's own window, BREP_mcp's headless harness) talk to it
+# through the host protocol in `host.rs`, so the app can embed the server
+# without a dependency cycle.
+[lib]
+name = "brep_mcp_core"
+path = "src/lib.rs"
+
+[dependencies]
+rmcp = { version = "3.2", default-features = false, features = ["server", "transport-io", "transport-streamable-http-server"] }
+schemars = "1.2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std", "io-util", "sync", "time", "net"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+image = { version = "0.25", default-features = false, features = ["png", "gif"] }
+base64 = "0.22"
+# The feature catalogue (schema.rs) is read straight from the engine.
+brep-render = { package = "BREP_render", version = "0.6.0", path = "../BREP_render" }
+# The streamable-HTTP transport is a tower service; hyper serves it on a
+# loopback listener (http.rs). hyper-util's `service` bridges tower to hyper.
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio", "service"] }
+# The PLM fixture (plm_fixture.rs) talks to a loopback `brep-plm serve`: plain
+# HTTP, so no TLS stack. ureq is already in BREP_mcp's tree through the app.
+ureq = { version = "2", default-features = false }

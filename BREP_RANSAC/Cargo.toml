@@ -1,0 +1,36 @@
+[package]
+name = "BREP_RANSAC"
+version = "0.1.4"
+edition = "2021"
+license-file = "LICENSE.md"
+repository = "https://github.com/mmiscool/next.BREP.io_RUST_BREP_KERNEL"
+description = "Topology-aware analytic surface recognition for CAD triangle meshes"
+readme = "README.md"
+keywords = ["cad", "ransac", "mesh", "recognition", "geometry"]
+categories = ["algorithms", "graphics", "mathematics"]
+# The `!` entries are a backstop: test code never ships. The publish snapshot
+# `cargo package` of this manifest from shipping test files.
+include = [
+    "src/**",
+    "Cargo.toml",
+    "README.md",
+    "LICENSE.md",
+    "!src/**/tests/**",
+    "!**/tests.rs",
+    "!**/*_tests.rs",
+    "!**/test_support.rs",
+    "!**/testdata/**",
+]
+
+[lib]
+name = "brep_ransac"
+
+[dependencies]
+# Monotonic timing on native targets and in browser workers.
+web-time = "1"
+serde = { version = "1", features = ["derive"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

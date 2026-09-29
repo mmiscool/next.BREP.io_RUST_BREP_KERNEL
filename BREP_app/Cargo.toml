@@ -1,0 +1,249 @@
+[package]
+name = "BREP_app"
+version = "0.6.0"
+edition = "2021"
+license-file = "LICENSE.md"
+repository = "https://github.com/mmiscool/next.BREP.io_RUST_BREP_KERNEL"
+homepage = "https://v2.brep.io"
+readme = "README.md"
+keywords = ["cad", "brep", "egui", "wasm", "parametric"]
+categories = ["graphics", "gui", "wasm"]
+# eframe/egui/egui_tiles/egui_extras 0.35 each declare rust-version = "1.92",
+# so 1.92 is this crate's real floor, not a guess — and it is the exact
+# compiler rust-toolchain.toml pins, so it is also the only one it is built on.
+rust-version = "1.92"
+# assets/ ships because build.rs compiles assets/glyphs/*.svg into the
+# inline-icon catalog (src/icons.rs) — which is why build.rs ships too. This
+# repo ships NO font file: eframe's `default_fonts` compiles in four faces and
+# UI text uses the OS monospace font. See THIRD-PARTY-NOTICES.md for the
+# notice obligations those four carry.
+# The `!` entries are a backstop: test code never ships. The publish snapshot
+# `cargo package` of this manifest from shipping test files.
+include = [
+    "src/**",
+    "assets/glyphs/*.svg",
+    "/build.rs",
+    "/Cargo.toml",
+    "/LICENSE.md",
+    "/THIRD-PARTY-NOTICES.md",
+    "/README.md",
+    "!src/**/tests/**",
+    "!**/tests.rs",
+    "!**/*_tests.rs",
+    "!**/test_support.rs",
+    "!**/testdata/**",
+]
+description = "The BREP CAD application: an eframe (egui + wgpu) host that draws the brep-render 3D engine into an egui frame — native + wasm from one codebase."
+
+# cdylib for the wasm (wasm-bindgen) browser build; rlib so the native binary
+# links the crate directly. Mirrors brep-render's crate-type. The package
+# publishes as BREP_app; the library keeps the historical brep_app symbol so
+# the wasm-pack artifact names (pkg/brep_app.js) stay stable.
+[lib]
+name = "brep_app"
+crate-type = ["cdylib", "rlib"]
+
+# Standalone crate (NOT a workspace member) — the same reasoning as BREP_render:
+# the kernel's Cargo profile settings must not be overridden by a workspace root.
+# Plain path deps link the engine rlibs.
+
+[build-dependencies]
+# Use the SVG loader's parser to measure artwork without font-era canvas padding.
+usvg = { version = "0.45.1", default-features = false }
+
+[features]
+# The automation layer's command registry, queue and virtual pointer (the
+# state registry is always compiled). What a host — the embedded server below,
+# or BREP_mcp's headless harness — drives the app through.
+automation = ["dep:schemars"]
+# The embedded MCP server behind `brep-app --mcp` (src/mcp.rs): the window
+# becomes a session an agent drives over loopback HTTP. Native only — the
+# server crates are non-wasm dependencies, so the web build takes `automation`
+# from this feature and nothing else. On by default so the plain
+# `cargo build --release` the release lane runs ships the flag.
+mcp = ["automation", "dep:brep-mcp-core", "dep:tokio"]
+default = ["mcp", "scripting"]
+# Scripts in the CAD app (src/scripting.rs): the Boa interpreter the PLM's
+# hooks run on, from BREP_script_core, with the CAD-side host bindings.
+# Native and wasm alike. On by default so `./build.sh app` compiles Boa for
+# wasm32 on every build: with no caller the linker drops it (+32,005 bytes on
+# the 38.5 MB bundle, 2026-09-25); a wasm-exported caller costs +7,397,843
+scripting = ["dep:brep-script-core"]
+
+[dependencies]
+# The windowing-agnostic viewer brain + wgpu-29 render core we are hosting.
+brep-render = { package = "BREP_render", version = "0.6.0", path = "../BREP_render" }
+# wgpu named directly so we can spell the types the render core hands back /
+# takes (TextureView, Device, ...). Resolves to the SAME wgpu 29.x as
+# brep-render and eframe's egui-wgpu (all constrain ^29), so the handle types
+# are one and the same crate instance.
+wgpu = { version = "29", features = ["webgl"] }
+# eframe 0.35 → egui 0.35 → egui-wgpu 0.35 → wgpu ^29.0. This is the ONLY eframe
+# line whose egui-wgpu is on wgpu 29 (0.34.x is also 29; 0.36 jumps to wgpu 30).
+# `wgpu` renderer (NOT glow) so the paint callback shares eframe's wgpu device
+# with the render core. default_fonts for a usable UI; x11/wayland for the
+# native window backend. eframe re-exports egui / egui_wgpu / wgpu.
+eframe = { version = "0.35", default-features = false, features = [
+    "wgpu",
+    "default_fonts",
+    "x11",
+    "wayland",
+] }
+egui = "0.35"
+# Tiling / docking layout engine (drag-and-drop, resizable, tabbed) for the
+# side panels. 0.16.0 is the line that targets egui ^0.35 (0.17.x jumps to
+# egui 0.36 → wgpu 30, which would ripple through brep-render — deliberately
+# NOT taken). `serde` so the user's dock layout persists via the Store seam.
+egui_tiles = { version = "0.16", features = ["serde"] }
+# egui's BUILT-IN syntax highlighting for the expressions code editor, plus the
+# SVG image loader. `svg` adds the resvg-backed loader, which is how the
+# inline-icon catalog (src/icons.rs) gets drawn — see src/icon_text.rs.
+# resvg/usvg are `Apache-2.0 OR MIT` since 0.45, so this keeps the "zero
+# copyleft-only" finding in THIRD-PARTY-NOTICES.md intact; egui_extras already
+# pins resvg with default-features off, so no system-font machinery is pulled
+# in for wasm.
+#
+# We deliberately do NOT take `syntect`. egui_extras ships a fallback
+# highlighter behind `#[cfg(not(feature = "syntect"))]` with the SAME
+# `highlight()` / `CodeTheme` API — comments, strings, keywords, literals,
+# punctuation — which is everything the `name = expr;` expressions sheet has.
+# `syntect` costs 16 crates natively and 20 on wasm (syntect, fancy-regex,
+# plist, quick-xml, yaml-rust, bincode, walkdir, time, …) for one `layouter`
+# closure. See panels/expressions.rs for the language string the fallback needs.
+egui_extras = { version = "0.35", default-features = false, features = [
+    "svg",
+] }
+serde = { version = "1", features = ["derive"] }   # PaneKind (de)serialize for dock-layout persistence
+serde_json = "1"
+# SHA-256 of a document's bytes: the PLM's `content_hash`, which the KiCad
+# import (plm::kicad) compares to skip an unchanged part without downloading it.
+sha2 = "0.10"
+schemars = { version = "1.2", optional = true }   # derived JSON Schemas for the automation registries
+log = "0.4"
+# The per-frame timing record (src/perf.rs). `std::time::Instant` PANICS on
+# wasm; web-time is the same API over `performance.now()` there and the
+# monotonic clock natively, so both shells time the same quantity. No new
+# dependency: eframe/egui-wgpu/egui-winit and BREP_kernel already pull it.
+web-time = "1"
+# HTTP for the step.parts online model library (Assembly workbench) AND the
+# in-app "Submit Bug" report POST. ONE crate, both targets: native spawns a
+# background request thread; wasm uses the browser `fetch` (pulling its own
+# web-sys fetch features), so no manual Request/Response wiring. Results marshal
+# into the egui frame via std::sync::mpsc + request_repaint. NOTE: we DON'T enable
+# ehttp's `multipart` feature — it pulls `rand`→`getrandom 0.2`, which needs the
+# `js` feature to compile for wasm; the bug report builds its small multipart body
+# by hand instead (bug_report.rs) with zero new deps.
+ehttp = "0.5"
+# PNG decode for the library's result thumbnails (decoded on the UI thread, then
+# uploaded with ctx.load_texture). PNG-only + default-features off keeps it lean
+# and pure-Rust (wasm-safe) — the step.parts thumbnails are all PNG.
+image = { version = "0.25", default-features = false, features = ["png"] }
+# The electronics documents (schematic, wiring diagram, board, symbol, pads) and
+# their embeddable egui editors, moved in from eCAD as sibling crates. Their
+# manifests stand alone, like every crate here; see the profile section below.
+BREP_ecad_core = { version = "0.2.0", path = "../BREP_ecad_core" }
+BREP_ecad_egui = { version = "0.2.0", path = "../BREP_ecad_egui" }
+# The script interpreter core shared with the PLM server (feature `scripting`).
+# It turns on Boa's wasm backend itself, so nothing about Boa is spelled here.
+brep-script-core = { package = "BREP_script_core", version = "0.1.1", path = "../BREP_script_core", optional = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+# BREP_ecad_core makes v4 uuids, and uuid refuses to compile for wasm32-unknown-unknown
+# without a randomness source (a compile_error! naming `js`, `rng-getrandom` or
+# `rng-rand`). `js` is the browser's crypto.getRandomValues; BREP_ecad_core leaves the
+# choice to its host.
+uuid = { version = "1", features = ["js"] }
+wasm-bindgen = "0.2"
+# The #[wasm_bindgen] macro on the async start fn (lib.rs) expands to code that
+# names this crate, AND store.rs `spawn_local`s the model store's write-behind
+# pushes onto the browser microtask queue.
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+web-sys = { version = "0.3", features = [
+    "HtmlCanvasElement",
+    "Window",
+    "Document",
+    # The browser model store (store.rs `web_model`): IndexedDB, which replaced
+    # localStorage because its ~5-10 MB origin quota cannot hold ONE native BREP
+    # payload (a measured STEP import: ~35 MB). `DomException` is how a failed
+    # request/transaction reports WHY, which the app surfaces to the user.
+    "IdbFactory",
+    "IdbOpenDbRequest",
+    "IdbDatabase",
+    "IdbTransaction",
+    "IdbTransactionMode",
+    "IdbObjectStore",
+    "IdbRequest",
+    "DomException",
+    # IndexedDB tells a tab NOTHING when another tab writes it, so each tab's
+    # hydrated mirror would stay at its boot contents until reloaded. Every tab
+    # posts the key it committed on one BroadcastChannel and re-reads the keys it
+    # hears about (store.rs `web_model::CHANNEL_NAME`) — which is what makes a part
+    # saved in one tab insertable in another without a refresh.
+    "BroadcastChannel",
+    # "Launch model in CAD app" button) opens the app with a specific model.
+    "Location",
+    "UrlSearchParams",
+    # Model file interchange (download blob + file-input upload) — the browser
+    # half of the model-store seam (see store.rs `web_model`).
+    "Element",
+    "Node",
+    "HtmlElement",
+    "HtmlAnchorElement",
+    "HtmlInputElement",
+    "Blob",
+    "BlobPropertyBag",
+    "Url",
+    "File",
+    "FileList",
+    "FileReader",
+    "Event",
+    # Off-main-thread history runner (M3b): a dedicated MODULE web worker so a
+    # history run never freezes the single-threaded wasm UI. `Worker` +
+    # `WorkerOptions`/`WorkerType` spawn it; `DedicatedWorkerGlobalScope` is the
+    # worker-side global (`worker_entry`); `MessageEvent` carries the JSON payloads.
+    "Worker",
+    "WorkerOptions",
+    "WorkerType",
+    "DedicatedWorkerGlobalScope",
+    "MessageEvent",
+] }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+# The MCP server core (feature `mcp`): the same server `brep-mcp` hosts
+# headlessly, embedded here over the app's own automation queue.
+brep-mcp-core = { package = "BREP_mcp_core", version = "0.5.0", path = "../BREP_mcp_core", optional = true }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "net", "time"], optional = true }
+
+[[bin]]
+name = "brep-app"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3
+
+# BREP_ecad_core's autorouter and design checks are compute-heavy, so they stay fast in
+# debug builds too. Repeated, not inherited: there is no workspace, and Cargo reads
+# profiles only from the manifest it is run on, so BREP_ecad_core's own copy of this
+# line is ignored when the app builds it.
+[profile.dev.package.BREP_ecad_core]
+opt-level = 2
+
+# The PLM client's tests (src/plm/client.rs) run the real PLM in-process, and
+# every sign-in there hashes a password with PBKDF2 (120,000 rounds, generic, so
+# compiled inside BREP_plm). These are BREP_plm's own debug overrides, repeated
+# for the same reason as the line above. Measured on the twelve client tests
+# (on tmpfs): 19.6-20.6 s without them, 0.85-0.87 s with them. Only test builds
+# link BREP_plm.
+[profile.dev.package.BREP_plm]
+opt-level = 3
+[profile.dev.package.pbkdf2]
+opt-level = 3
+[profile.dev.package.sha2]
+opt-level = 3
+[profile.dev.package.hmac]
+opt-level = 3
+[profile.dev.package.digest]
+opt-level = 3
+[profile.dev.package.block-buffer]
+opt-level = 3

@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:brep="https://brep.io/icons"
+     viewBox="0 0 24 24" width="24" height="24" brep:glyph-name="icon_sheet_dim_horizontal" brep:unicode="E069">
+  <g fill="#111" stroke="#111" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M5 5.5 V19" style="fill:none"/>
+    <path d="M19 5.5 V19" style="fill:none"/>
+    <path d="M9.6 14 H14.4" style="fill:none"/>
+    <path d="M4.6 14 L9.6 12 L9.6 16Z" stroke="none"/>
+    <path d="M19.4 14 L14.4 12 L14.4 16Z" stroke="none"/>
+  </g>
+</svg>

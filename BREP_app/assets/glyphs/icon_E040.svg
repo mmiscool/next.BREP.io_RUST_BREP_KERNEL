@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:brep="https://brep.io/icons"
+     viewBox="0 0 1233 2384" width="1233" height="2384" brep:glyph-name="icon_feat_chamfer" brep:unicode="E040">
+  <path d="M262 821L1016 821L1016 1575L655 1575L262 1182Z" fill="#ffd977"/>
+  <path d="M262 1182L655 1575L740 1490L347 1097Z" fill="#a8d4f7"/>
+  <path d="M170 821L170 1201L262 1201L262 821ZM183.5 1233.5L603.5 1653.5L668.5 1588.5L248.5 1168.5ZM636 1667L1016 1667L1016 1575L636 1575Z" fill="#7a4d10"/>
+</svg>
