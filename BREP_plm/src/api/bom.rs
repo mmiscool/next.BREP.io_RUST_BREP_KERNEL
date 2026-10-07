@@ -80,6 +80,8 @@ pub struct BomQuery {
     /// Add an `Attachments` column to the CSV.
     #[serde(default)]
     pub attachments: bool,
+    #[serde(default)]
+    pub occurrences: bool,
 }
 
 pub async fn get_bom(
@@ -88,11 +90,13 @@ pub async fn get_bom(
     Path((id, rev)): Path<(String, String)>,
     Query(query): Query<BomQuery>,
 ) -> Result<Response, Error> {
-    require_user(&db, &headers)?;
+    let user = require_user(&db, &headers)?;
     let depth = levels(&query.levels)?;
     let result = db.read(|state| {
         let (part, revision) = locate(state, &id, &rev)?;
-        Ok::<_, Error>(bom::bom(state, part, revision, depth, query.flat))
+        let mut result = bom::bom(state, part, revision, depth, if query.occurrences {false} else {query.flat});
+        if query.occurrences { result.comparison_lines=Some(result.lines.clone()); crate::bom_config::expand_bom(state, &mut result, query.flat); }
+        Ok::<_, Error>(result)
     })?;
     if query.format.eq_ignore_ascii_case("csv") {
         let name = format!(
@@ -107,7 +111,10 @@ pub async fn get_bom(
                 (header::CONTENT_TYPE, "text/csv; charset=utf-8".to_string()),
                 (header::CONTENT_DISPOSITION, format!("attachment; filename=\"{name}\"")),
             ],
-            bom::bom_csv_with(&result, query.attachments),
+            db.read(|state| {
+                let layout=state.bom_configuration.selections.get(&user.id).and_then(|id|state.bom_configuration.layouts.iter().find(|l|l.id==*id&&(l.owner.is_none()||l.owner.as_deref()==Some(&user.id))));
+                layout.filter(|_|query.occurrences).map(|layout|crate::bom_config::layout_csv(&result,layout,&crate::bom_config::fields(state))).unwrap_or_else(||bom::bom_csv_with(&result,query.attachments))
+            }),
         )
             .into_response());
     }

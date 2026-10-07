@@ -38,6 +38,7 @@ pub struct PmiViewPatch {
     pub text_size_pt: Option<f64>,
     pub wireframe: Option<bool>,
     pub hidden: Option<Vec<String>>,
+    pub section: Option<Option<brep_kernel::feature_pipeline::pmi::PmiSection>>,
 }
 
 /// The **PMI view** dialog's schema — what a view's own form edits: its name,
@@ -54,6 +55,10 @@ pub fn pmi_view_schema() -> serde_json::Value {
             "name": { "type": "string", "label": "Name", "default_value": "View 1" },
             "textSizePt": { "type": "number", "label": "Text size (pt)", "default_value": brep_kernel::PmiDisplay::default().text_size_pt },
             "wireframe": { "type": "boolean", "label": "Wireframe", "default_value": false },
+            "sectionEnabled": { "type": "boolean", "label": "Section view", "default_value": false },
+            "sectionAxis": { "type": "options", "label": "Section normal", "options": ["View", "X", "Y", "Z"], "default_value": "View" },
+            "sectionOffset": { "type": "number", "label": "Section offset (mm)", "default_value": 0.0 },
+            "sectionFlip": { "type": "boolean", "label": "Reverse section", "default_value": false },
             "updateCamera": { "type": "button", "label": "Update camera from the viewport" },
             "updateVisibility": { "type": "button", "label": "Update visibility from the scene" }
         }
@@ -66,6 +71,10 @@ pub fn pmi_view_params(view: &brep_kernel::PmiView) -> serde_json::Value {
         "name": view.name,
         "textSizePt": view.display.text_size_pt,
         "wireframe": view.display.wireframe,
+        "sectionEnabled": view.display.section.is_some(),
+        "sectionAxis": view.display.section.as_ref().map(|s| s.axis.as_str()).unwrap_or("View"),
+        "sectionOffset": view.display.section.as_ref().map(|s| s.offset).unwrap_or(0.),
+        "sectionFlip": view.display.section.as_ref().is_some_and(|s| s.flip),
     })
 }
 
@@ -247,6 +256,7 @@ impl EngineState {
                 text_size_pt: 12.0,
                 wireframe: self.settings.wireframe,
                 hidden: self.hidden_solid_names(),
+                section: None,
             },
             annotations: Vec::new(),
         });
@@ -335,10 +345,19 @@ impl EngineState {
             .get("wireframe")
             .and_then(serde_json::Value::as_bool)
             .filter(|on| *on != view.display.wireframe);
-        if name.is_none() && text_size_pt.is_none() && wireframe.is_none() {
+        let section = if params.get("sectionEnabled").is_some() {
+            let section = if params["sectionEnabled"].as_bool().unwrap_or(false) {
+                let axis = params["sectionAxis"].as_str().unwrap_or("View");
+                let offset = params["sectionOffset"].as_f64().unwrap_or(0.);
+                if !["View", "X", "Y", "Z"].contains(&axis) || !offset.is_finite() { return Err("invalid section plane".into()); }
+                Some(brep_kernel::feature_pipeline::pmi::PmiSection { axis: axis.into(), offset, flip: params["sectionFlip"].as_bool().unwrap_or(false) })
+            } else { None };
+            (section != view.display.section).then_some(section)
+        } else { None };
+        if name.is_none() && text_size_pt.is_none() && wireframe.is_none() && section.is_none() {
             return Ok(());
         }
-        let patch = PmiViewPatch { name, text_size_pt, wireframe, hidden: None };
+        let patch = PmiViewPatch { name, text_size_pt, wireframe, hidden: None, section };
         self.patch_pmi_view(id, &patch, Some(&format!("pmi:view:{id}")))
     }
 
@@ -380,6 +399,7 @@ impl EngineState {
         if let Some(hidden) = &patch.hidden {
             view.display.hidden = hidden.clone();
         }
+        if let Some(section) = &patch.section { view.display.section = section.clone(); }
         let display = view.display.clone();
         let block = if state.is_empty() { None } else { serde_json::to_value(&state).ok() };
         self.history.set_pmi_block(block, coalesce_key);
@@ -484,6 +504,7 @@ impl EngineState {
         if self.pmi_active_view.take().is_none() {
             return;
         }
+        if self.pmi_state().find_annotation(&self.transform_armed_feature()).is_some() { self.disarm_transform(); }
         self.pmi_restore_explode();
         if let Some(snapshot) = self.pmi_modeling.clone() {
             let names: Vec<String> = self.scene.solids().iter().map(|s| s.name.clone()).collect();
@@ -548,6 +569,13 @@ impl EngineState {
                 }
             }
         }
+        if let Some((point, normal)) = self.pmi_state().find_view(&active).and_then(|v| v.section_plane()) {
+            let names: Vec<String> = self.scene.solids().iter().map(|s| s.name.clone()).collect();
+            for name in names {
+                if let Some(display) = self.scene.solid(&name) { self.pmi_explode_originals.entry(name.clone()).or_insert_with(|| display.clone()); }
+                if let Some(display) = self.scene.solid_mut(&name) { super::pmi_section::clip_display(display, point, normal); }
+            }
+        }
         if !self.pmi_explode_originals.is_empty() {
             self.dirty = true;
         }
@@ -567,6 +595,8 @@ impl EngineState {
     /// Post-apply tail (`finish_apply`): the displays are fresh, so re-pose
     /// the active view's explode targets and re-bake the overlay.
     pub(crate) fn pmi_after_apply(&mut self) {
+        // The fresh report resolved every balloon's head from its stored bubble.
+        self.pmi_balloon_stale = None;
         // Normally already un-posed by `apply_run_output` (before the scene
         // reconcile); the parse-error branch of a rerun reaches here with the
         // poses still applied, so restore rather than forget them.
@@ -645,6 +675,8 @@ impl EngineState {
         }
         let view = state.find_view_mut(&view_id).ok_or_else(|| format!("no PMI view '{view_id}'"))?;
         view.annotations.push(PmiAnnotation {
+            plugin_replay: None,
+            persistent_data: serde_json::Value::Null,
             kind: type_id.to_string(),
             enabled: true,
             params,
@@ -657,6 +689,10 @@ impl EngineState {
 
     /// Replace an annotation's params (a form edit). Re-runs.
     pub fn pmi_update_annotation(&mut self, id: &str, params_json: &str) -> Result<(), String> {
+        if self.pmi_state().find_annotation(id).is_some_and(|(_, a)| a.kind.contains('/')) {
+            let params = serde_json::from_str(params_json).map_err(|e| format!("annotation params: {e}"))?;
+            return self.plugin_update_annotation(id, params).map(|_| ());
+        }
         self.pmi_update_annotation_no_rerun(id, params_json)?;
         self.rerun_history();
         Ok(())
@@ -668,6 +704,9 @@ impl EngineState {
     pub(crate) fn pmi_update_annotation_no_rerun(&mut self, id: &str, params_json: &str) -> Result<(), String> {
         let mut state = self.pmi_state();
         let annotation = state.find_annotation_mut(id).ok_or_else(|| format!("no PMI annotation '{id}'"))?;
+        if annotation.kind.contains('/') {
+            return Err("plugin annotation edits require the worker transaction path".into());
+        }
         let mut params: serde_json::Value =
             serde_json::from_str(params_json).map_err(|error| format!("annotation params: {error}"))?;
         if let Some(object) = params.as_object_mut() {
@@ -680,6 +719,9 @@ impl EngineState {
     }
 
     pub fn pmi_remove_annotation(&mut self, id: &str) -> Result<(), String> {
+        if self.pmi_state().find_annotation(id).is_some_and(|(_, a)| a.kind.contains('/')) {
+            return self.plugin_delete_annotation(id).map(|_| ());
+        }
         let mut state = self.pmi_state();
         let Some((view_index, index)) = state.locate_annotation(id) else {
             return Err(format!("no PMI annotation '{id}'"));
@@ -693,6 +735,9 @@ impl EngineState {
     }
 
     pub fn pmi_set_annotation_enabled(&mut self, id: &str, enabled: bool) -> Result<(), String> {
+        if self.pmi_state().find_annotation(id).is_some_and(|(_, a)| a.kind.contains('/')) {
+            return self.plugin_set_annotation_enabled(id, enabled).map(|_| ());
+        }
         let mut state = self.pmi_state();
         let annotation = state.find_annotation_mut(id).ok_or_else(|| format!("no PMI annotation '{id}'"))?;
         if annotation.enabled == enabled {
@@ -750,7 +795,10 @@ impl EngineState {
                     self.open_pmi_annotation(id.to_string());
                 }
             }
-            None => self.pmi_open_annotation = None,
+            None => {
+                if self.pmi_open_annotation.as_deref() == Some(self.transform_armed_feature().as_str()) { self.disarm_transform(); }
+                self.pmi_open_annotation = None;
+            },
         }
         self.refresh_pmi_overlay();
     }
@@ -759,7 +807,8 @@ impl EngineState {
 
     /// Move an annotation's label (world). Coalesced per annotation into ONE
     /// undo step, and NEVER a re-run: the cached report is patched in place
-    /// and the overlay re-baked.
+    /// and the overlay re-baked. A balloon's arrow head is re-derived from
+    /// the moved bubble ([`Self::pmi_reproject_balloon_head`]).
     pub fn pmi_set_label_world(&mut self, id: &str, world: [f64; 3]) -> Result<(), String> {
         let mut state = self.pmi_state();
         let annotation = state.find_annotation_mut(id).ok_or_else(|| format!("no PMI annotation '{id}'"))?;
@@ -774,8 +823,69 @@ impl EngineState {
                 }
             }
         }
+        self.pmi_reproject_balloon_head(id);
         self.refresh_pmi_overlay();
         Ok(())
+    }
+
+    /// Re-derive a balloon's arrow head from its row's bubble through the
+    /// recipe the kernel put on its leader (the same projection the resolver
+    /// ran, on the exact-solid clones the scene holds), and patch the cached
+    /// report. The head is derived, never stored, so no document edit and no
+    /// run: the next run resolves the same head from the stored bubble. A
+    /// solid the scene does not hold yet is asked of the runner; the head is
+    /// re-derived when the reply lands ([`Self::pmi_refresh_stale_balloon`]),
+    /// which for the Inline runner is before this returns. Any other
+    /// annotation is left alone.
+    pub(crate) fn pmi_reproject_balloon_head(&mut self, id: &str) {
+        if let Some(missing) = self.pmi_balloon_head_now(id) {
+            self.pmi_balloon_stale = Some(id.to_string());
+            self.request_exact_solids(missing.iter().map(String::as_str));
+            self.pmi_refresh_stale_balloon();
+        }
+    }
+
+    /// Retry the balloon whose re-projection waited on a topology reply.
+    pub(crate) fn pmi_refresh_stale_balloon(&mut self) {
+        let Some(id) = self.pmi_balloon_stale.take() else {
+            return;
+        };
+        if self.pmi_balloon_head_now(&id).is_some() {
+            // Still waiting (a background runner's reply is on its way).
+            self.pmi_balloon_stale = Some(id);
+        } else {
+            self.refresh_pmi_overlay();
+        }
+    }
+
+    /// One re-projection attempt: `None` when done (or not a balloon), else
+    /// the occurrence solids the scene does not hold.
+    fn pmi_balloon_head_now(&mut self, id: &str) -> Option<Vec<String>> {
+        let (anchor, bubble) = self
+            .pmi_report
+            .as_ref()
+            .and_then(|report| report.annotation(id))
+            .and_then(|row| match &row.geometry {
+                PmiGeometry::Leader { balloon: true, anchor: Some(anchor), .. } => Some((anchor.clone(), row.label_world)),
+                _ => None,
+            })?;
+        let mut missing = Vec::new();
+        let head = brep_kernel::pmi_balloon_head(&anchor, bubble, |name| self.scene.exact_solid(name), &mut missing);
+        if !missing.is_empty() {
+            return Some(missing);
+        }
+        // A fixed (vertex) anchor answers `None`: the head never moves. A
+        // projection error keeps the kernel's head rather than a wrong one.
+        if let Ok(Some(head)) = head {
+            if let Some(row) = self.pmi_report.as_mut().and_then(|report| report.annotation_mut(id)) {
+                if let PmiGeometry::Leader { targets, .. } = &mut row.geometry {
+                    if let Some(first) = targets.first_mut() {
+                        *first = head;
+                    }
+                }
+            }
+        }
+        None
     }
 
     /// Drag an annotation's label to the pointer: the new position is where
@@ -956,6 +1066,10 @@ impl EngineState {
         if let Err(error) = self.pmi_update_annotation_no_rerun(id, &params.to_string()) {
             self.push_notice(format!("PMI update failed: {error}"));
         }
+        // A pick is a discrete change (it ends with Finish): the next edit of
+        // the same annotation's params is its own undo step, so picking an
+        // anchor and then clearing it in the form undo one at a time.
+        self.history.break_coalescing();
     }
 
     // --- import -------------------------------------------------------------------
@@ -992,13 +1106,14 @@ impl EngineState {
 
 /// Pose a display in place: `p' = R((p − c) ∘ s) + c + t` on the mesh, the
 /// edge polylines and the vertices; normals rotate; the bbox is rebuilt.
-fn transform_display(
+pub(super) fn transform_display(
     display: &mut crate::scene::SolidDisplay,
     center: [f64; 3],
     translate: [f64; 3],
     rotate_deg: [f64; 3],
     scale: [f64; 3],
 ) {
+    display.revision = crate::scene::next_revision();
     let rotate = |v: [f64; 3]| super::rotate_euler_xyz_f64(v, rotate_deg);
     let pose = |p: [f64; 3]| -> [f64; 3] {
         let local = [(p[0] - center[0]) * scale[0], (p[1] - center[1]) * scale[1], (p[2] - center[2]) * scale[2]];
@@ -1012,8 +1127,9 @@ fn transform_display(
         bbox.expand(posed);
     }
     for normal in &mut display.mesh.normals {
-        let rotated = rotate([normal[0] as f64, normal[1] as f64, normal[2] as f64]);
-        *normal = [rotated[0] as f32, rotated[1] as f32, rotated[2] as f32];
+        let rotated = rotate(std::array::from_fn(|i| normal[i] as f64 / scale[i]));
+        let length = rotated.iter().map(|v| v * v).sum::<f64>().sqrt().max(1e-20);
+        *normal = rotated.map(|v| (v / length) as f32);
     }
     for edge in &mut display.edges {
         for point in &mut edge.polyline {

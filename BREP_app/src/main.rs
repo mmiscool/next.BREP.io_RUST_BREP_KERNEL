@@ -296,20 +296,20 @@ fn main() -> eframe::Result<()> {
     #[cfg(feature = "mcp")]
     let mcp = if launch.mcp {
         // Bind first: a port in use is a launch error, not a window without
-        // its server. The instructions print from the address actually bound.
+        // its server. ONE port — the one asked for — where the Info window's
+        // button walks a range: a script wants the address it named. The
+        // instructions print from the address actually bound; `launch` is the
+        // same sequence the button runs later.
         let port = launch.mcp_port.unwrap_or(brep_app::mcp::DEFAULT_PORT);
-        let listener = match brep_app::mcp::bind(port) {
+        let mcp = match brep_app::mcp::launch([port], launch.session_root.clone()) {
             Ok(l) => l,
             Err(e) => {
                 eprintln!("brep-app: {e}");
                 std::process::exit(1);
             }
         };
-        let session_root = launch.session_root.clone().unwrap_or_else(brep_app::mcp::default_session_root);
-        println!("{}", brep_app::mcp::agent_instructions(&brep_app::mcp::url(&listener), &session_root));
-        // The state registry publishes only for a host; this window has one.
-        brep_app::automation::registry::set_enabled(true);
-        Some(brep_app::mcp::Launch { listener, session_root })
+        println!("{}", mcp.instructions());
+        Some(mcp)
     } else {
         None
     };

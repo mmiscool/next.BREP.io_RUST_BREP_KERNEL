@@ -128,6 +128,8 @@ pub fn schema() -> serde_json::Value {
     "type": "F",
     "shortName": "F",
     "longName": "Fillet",
+    "ribbonPath": "Home/Blend/Fillet",
+    "commandSize": "Compact",
     "displayBuilder": false,
     "inputParamsSchema": {
         "id": {

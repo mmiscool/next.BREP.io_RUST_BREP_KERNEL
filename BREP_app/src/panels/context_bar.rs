@@ -78,6 +78,7 @@ pub struct ContextOutcome {
     /// engine-mutating component actions (Move / Fix-Unfix / Delete) already
     /// applied inside the bar.
     pub component: Option<ComponentActionRequest>,
+    pub plugin_action: Option<String>,
 }
 
 /// The context bar's transient UI state (the model lives in the engine).
@@ -164,7 +165,7 @@ impl ContextBarPanel {
         let offers = if comp.suppress_features() {
             Vec::new()
         } else {
-            feature_offers(&probe, &sel, &state.settings.workbench)
+            feature_offers_scoped(&probe, &sel, &state.settings.workbench, Some(state))
         };
         let constraint_types =
             constraint_offers(&probe, &state.settings.workbench, &crate::workbench::ButtonState::of(state));
@@ -278,6 +279,11 @@ impl ContextBarPanel {
             (Some(cid), false) => format!("Selected: constraint {cid}"),
             _ => sel.summary(),
         };
+        for action in crate::workbench::plugin_actions(state, &state.settings.workbench) {
+            if let Some(id) = action["id"].as_str() {
+                items.push(ActionItem::new(format!("plugin:{id}"), action["ribbonPath"].as_str().and_then(|p| p.rsplit('/').next()).or(action["label"].as_str()).unwrap_or(id), "Open plugin action form"));
+            }
+        }
         let clicked = egui::Frame::popup(ui.style())
             .show(ui, |ui| {
                 action_rail(
@@ -293,6 +299,7 @@ impl ContextBarPanel {
         // --- apply the intent (one engine mutation per frame) -----------------
         let mut outcome = ContextOutcome::default();
         match clicked.as_deref() {
+            Some(key) if key.starts_with("plugin:") => { outcome.plugin_action = Some(key[7..].to_owned()); }
             Some("action:clear") => {
                 // Also drops a label-selected constraint (clear_selection folds
                 // the constraint selection in).
@@ -734,12 +741,13 @@ fn all_on_sheet_metal(sel: &Selection, state: &EngineState) -> bool {
 /// `References`-group `reference_selection` field whose `selectionFilter`
 /// intersects a selected kind (schema order), and the create consumes the
 /// selection into them ([`prefill_references`]).
-fn feature_offers(probe: &SelectionProbe, sel: &Selection, workbench: &str) -> Vec<Offer> {
+
+fn feature_offers_scoped(probe: &SelectionProbe, sel: &Selection, workbench: &str, engine: Option<&EngineState>) -> Vec<Offer> {
     let kinds = sel.kinds_present();
     if kinds.is_empty() {
         return Vec::new();
     }
-    let catalogue = features::feature_catalogue();
+    let catalogue = engine.map_or_else(features::feature_catalogue, |e| e.feature_catalogue());
     let mut out = Vec::new();
     if let Some(list) = catalogue.get("features").and_then(Value::as_array) {
         for feature in list {
@@ -751,44 +759,78 @@ fn feature_offers(probe: &SelectionProbe, sel: &Selection, workbench: &str) -> V
             }
             // Workbench UI filter: skip features this workbench does not include
             // (classified off the type code).
-            if !crate::workbench::includes_feature(workbench, ty) {
+            if !engine.map_or_else(|| crate::workbench::includes_feature(workbench, ty), |e| crate::workbench::includes_feature_scoped(e, workbench, ty)) {
                 continue;
             }
             // The feature's own answer to "does this selection make me
             // meaningful?" — nuance (Revolve wants profile AND axis) lives in
             // the kernel predicate, not here.
-            if !brep_kernel::feature_context_applicable(ty, probe) {
+            if !ty.contains('/') && !brep_kernel::feature_context_applicable(ty, probe) {
                 continue;
             }
             // The pre-fill targets: every `References`-group reference field
             // accepting a selected kind. Primitives only carry the boolean-op
             // `targets` Reference (group `Boolean`), so they never collect any
             // (their predicates return false anyway).
-            let fields: Vec<OfferField> = features::feature_form_fields(ty)
-                .iter()
-                .filter(|field| field.group == "References")
-                .filter_map(|field| {
-                    let FieldKind::Reference { filter, multiple } = &field.kind else {
-                        return None;
-                    };
-                    filter
-                        .iter()
-                        .any(|f| kinds.iter().any(|k| *k == f.as_str()))
-                        .then(|| OfferField {
-                            path: field.path.clone(),
-                            filter: filter.clone(),
-                            multiple: *multiple,
-                        })
-                })
-                .collect();
+            let fields = offer_fields(engine, ty, &kinds);
+            if ty.contains('/') && fields.is_empty() { continue; }
             out.push(Offer {
                 type_code: ty.to_string(),
-                label: features::feature_long_name(ty),
+                label: crate::workbench::feature_command_label(feature),
                 fields,
             });
         }
     }
     out
+}
+
+/// Every `References`-group reference field of feature `ty` whose
+/// `selectionFilter` accepts one of the selected `kinds`, in schema order:
+/// the pre-fill targets [`prefill_references`] consumes the selection into.
+fn offer_fields(engine: Option<&EngineState>, ty: &str, kinds: &[&str]) -> Vec<OfferField> {
+    engine
+        .map_or_else(|| features::feature_form_fields(ty), |e| e.feature_form_fields(ty))
+        .iter()
+        .filter(|field| field.group == "References")
+        .filter_map(|field| {
+            let FieldKind::Reference { filter, multiple } = &field.kind else {
+                return None;
+            };
+            filter
+                .iter()
+                .any(|f| kinds.iter().any(|k| *k == f.as_str()))
+                .then(|| OfferField {
+                    path: field.path.clone(),
+                    filter: filter.clone(),
+                    multiple: *multiple,
+                })
+        })
+        .collect()
+}
+
+/// Seed a NEW feature's reference fields from the current selection, exactly
+/// as the context bar's feature buttons do: the toolbar icons (Classic strip
+/// and Ribbon Home) and the Add-feature palette create through
+/// [`crate::panels::history::HistoryPanel::add_feature_of_type`], which calls
+/// this on the fresh `inputParams` before appending. The same consumed-set
+/// pre-fill ([`prefill_references`]) and the same component fence apply: a
+/// selection made entirely of component geometry seeds nothing (the kernel
+/// rejects component references). Returns the number of fields seeded.
+pub(crate) fn prefill_from_selection(state: &EngineState, type_code: &str, params: &mut Value) -> usize {
+    if state.sketch_mode() || state.ref_select_active() {
+        return 0;
+    }
+    let sel = Selection::read(state);
+    let kinds = sel.kinds_present();
+    if kinds.is_empty() || component_selection(&sel, state).suppress_features() {
+        return 0;
+    }
+    let writes = prefill_references(&offer_fields(Some(state), type_code, &kinds), &sel);
+    let count = writes.len();
+    for (path, value) in writes {
+        form::set_at(params, &path, value);
+    }
+    count
 }
 
 /// The single component the context bar's COMPONENT action set targets, or
@@ -986,8 +1028,9 @@ fn create_feature_from_selection(
     offer: &Offer,
     sel: &Selection,
 ) -> Option<String> {
-    let id = state.next_feature_id(&features::feature_short_name(&offer.type_code));
-    let mut params = features::feature_default_params(&offer.type_code);
+    let short = state.feature_schema(&offer.type_code).and_then(|s| s["shortName"].as_str().filter(|s| !s.is_empty()).map(str::to_owned)).unwrap_or_else(|| features::feature_short_name(&offer.type_code));
+    let id = state.next_feature_id(&short);
+    let mut params = state.feature_default_params(&offer.type_code);
     if let Value::Object(map) = &mut params {
         map.insert("id".into(), Value::String(id.clone()));
     }
@@ -1016,6 +1059,7 @@ fn feature_index(state: &EngineState, id: &str) -> Option<usize> {
 
 /// The hit keys this panel publishes (see `automation::hit_keys`).
 pub static HIT_KEYS: &[HitKeyDoc] = &[
+    HitKeyDoc { panel: "context", prefix: "plugin:", meaning: "open a plugin action form for current selection", command: Some("plugin_action") },
     // The generic actions were published from the day the bar was built and
     // documented by nobody, so `hit_keys_check` reported four undocumented keys
     // the moment a script left something selected while the bar was up — which

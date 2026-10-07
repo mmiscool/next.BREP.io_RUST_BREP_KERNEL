@@ -182,6 +182,8 @@ pub fn schema() -> serde_json::Value {
     "type": "M",
     "shortName": "M",
     "longName": "Mirror",
+    "ribbonPath": "Home/Pattern/Mirror",
+    "commandSize": "Compact",
     "displayBuilder": false,
     "inputParamsSchema": {
         "id": {

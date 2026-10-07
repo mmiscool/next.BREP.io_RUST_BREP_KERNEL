@@ -17,7 +17,6 @@
 //! Both are PLM-only: constructed with a signed-in client, never in a file
 //! session.
 
-use crate::automation::hit_keys::HitKeyDoc;
 use crate::panels::plm_parts::Pending;
 use crate::plm::adoption::{
     plan_adoption, run_import, walk_tree, AdoptionPlan, ImportLedgers, ImportNumbering, ImportReport, Ledger,
@@ -31,15 +30,6 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::task::Waker;
-
-/// Hit keys this panel publishes, registered when the app draws it.
-pub const HIT_KEYS: &[HitKeyDoc] = &[
-    HitKeyDoc { panel: "plm_import", prefix: "plm_import:folder", meaning: "the folder to import", command: None },
-    HitKeyDoc { panel: "plm_import", prefix: "plm_import:plan", meaning: "read the folder and show what the import will do", command: None },
-    HitKeyDoc { panel: "plm_import", prefix: "plm_import:run", meaning: "run (or resume) the import", command: None },
-    HitKeyDoc { panel: "plm_import", prefix: "plm_import:stop", meaning: "stop after the step in flight", command: None },
-    HitKeyDoc { panel: "plm_import", prefix: "plm_import:repoint", meaning: "the re-point prompt's two answers", command: None },
-];
 
 /// What the folder holds and what the import will do with it.
 pub struct Planned {

@@ -69,6 +69,37 @@ struct Stripe<'a> {
     name: Option<String>,
     /// Which ends, start then finish, run out into a pole (`pole_end`).
     poles: [bool; 2],
+    /// What the stripe's ladder measured and what step 7 reads again on the
+    /// shipped windows.
+    measure: StripeMeasure,
+}
+
+/// One rung of a stripe's ladder: its rows, parameters, stations, the exact
+/// dense centres (a fillet's wall verdict), and its vertex-window reading.
+struct StripeRung {
+    rows: FittedRows,
+    parameters: Vec<f64>,
+    stations: Vec<Station>,
+    dense: OpenDenseCentres,
+    reading: OpenRungReading,
+}
+
+/// A stripe's measurement: the shipped rung's parameters, stations and dense
+/// centres (for the shipped-window reading), whether its ladder ACCEPTED it on
+/// the vertex window (else the top rung shipped unaccepted), its vertex-window
+/// reading, why its construction request stopped, the request rungs
+/// attempted, whether the edge is stationary at a vertex (a missing rail is
+/// then unread), and whether the wall is judged at all (a fillet).
+struct StripeMeasure {
+    parameters: Vec<f64>,
+    stations: Vec<Station>,
+    dense: OpenDenseCentres,
+    ladder_accepted: bool,
+    ladder_reading: OpenRungReading,
+    unmet: Option<crate::BudgetReason>,
+    request_rungs: usize,
+    stationary_end: bool,
+    wall_check: bool,
 }
 
 impl Stripe<'_> {
@@ -138,13 +169,11 @@ enum VertexKind<'a> {
     /// vertex's normal plane: `join` is the ball seated on the seam
     /// ([`solve_flush_seam_ball`]), and the seam is trimmed at its contact.
     Flush { join: Option<FlushJoin> },
-    /// A re-entrant corner: two selected CONVEX edges on a cap, meeting where
-    /// the cap's perimeter turns inward (their third edge concave).  The two
-    /// blends never meet in a seam — the ball rolls round the concave edge
-    /// instead, touching it at one point, and sweeps a HORN TORUS (major
-    /// radius = minor radius = r) whose pole is that point.  Each stripe stops
-    /// where its wall rail reaches the concave edge; the sector between their
-    /// end sections is the closure.
+    /// Two equal-radius fillets wrap the unselected sharp edge instead of
+    /// intersecting in a seam: convex cap fillets around a concave notch,
+    /// or concave boss-base fillets around a convex edge. Each stripe stops
+    /// where its wall rail reaches the sharp edge; revolving that section
+    /// between the two stops produces a horn-torus sector sharing their pole.
     Reentrant {
         cap: &'a FaceRecord,
         sharp: &'a EdgeRecord,
@@ -159,7 +188,7 @@ enum VertexKind<'a> {
 pub(super) const OVERSHOOTS: [f64; 4] = [0.08, 0.16, 0.28, 0.45];
 
 /// Unit tangent of `edge` at `vertex`, pointing AWAY from it.
-fn tangent_away_from(edge: &EdgeRecord, vertex: u64) -> Result<Vec3, KernelRefusal> {
+pub(super) fn tangent_away_from(edge: &EdgeRecord, vertex: u64) -> Result<Vec3, KernelRefusal> {
     let (t, sign) = if edge.start_vertex_id == vertex {
         (edge.t0, 1.0)
     } else {
@@ -255,6 +284,7 @@ fn stripes_by_vertex(mates: &[(&EdgeRecord, BlendMate, BlendMate)]) -> Vec<(u64,
 /// it, one blend cutting material away from that face while the other adds
 /// material against it.  `convex` and `concave` are indices into the selection.
 pub(crate) struct MixedCorner {
+    pub(crate) vertex: u64,
     pub(crate) point: Vec3,
     pub(crate) convex: Vec<usize>,
     pub(crate) concave: Vec<usize>,
@@ -285,7 +315,21 @@ pub(crate) fn mixed_convexity_corner(
     edge_ids: &[u64],
     radius: f64,
 ) -> Option<MixedCorner> {
-    let mates = stripe_mates(solid, edge_ids, radius).ok()?;
+    mixed_convexity_corners(solid, edge_ids, radius).into_iter().next()
+}
+
+/// Every mixed-convexity corner of the selection, in vertex order — the
+/// runout composition (`runout.rs`) needs BOTH ends of each convex edge,
+/// where [`mixed_convexity_corner`] reports the first for the refusal.
+pub(crate) fn mixed_convexity_corners(
+    solid: &BrepSolid,
+    edge_ids: &[u64],
+    radius: f64,
+) -> Vec<MixedCorner> {
+    let mut found = Vec::new();
+    let Ok(mates) = stripe_mates(solid, edge_ids, radius) else {
+        return found;
+    };
     for (vertex_id, stripe_indices) in stripes_by_vertex(&mates) {
         if stripe_indices.len() < 2 {
             continue;
@@ -328,13 +372,24 @@ pub(crate) fn mixed_convexity_corner(
         if concave.len() < 2 || convex.is_empty() {
             continue;
         }
-        return Some(MixedCorner {
+        found.push(MixedCorner {
+            vertex: vertex_id,
             point,
             convex,
             concave,
         });
     }
-    None
+    found
+}
+
+/// Whether each selected edge is CONVEX (its ball inside the material), in
+/// selection order; `None` when the selection's mates cannot be read.
+pub(crate) fn selection_convexity(solid: &BrepSolid, edge_ids: &[u64], radius: f64) -> Option<Vec<bool>> {
+    let mates = stripe_mates(solid, edge_ids, radius).ok()?;
+    mates
+        .iter()
+        .map(|(edge, first, second)| edge_is_convex(edge, first, second).ok())
+        .collect()
 }
 
 /// A selected edge with NO blend strip left on it: the corner balls seated at
@@ -485,9 +540,23 @@ pub(crate) fn blend_star_network(
     edge_names: &[Option<String>],
     corner_name: &dyn Fn(&[usize]) -> Option<String>,
 ) -> Result<BrepSolid, KernelRefusal> {
+    blend_star_network_with_corner_policy(solid, edge_ids, radius, chamfer, edge_names, corner_name, true)
+}
+
+/// A runout's intermediate ring needs miter seams as carrier-switch witnesses.
+/// Those seams are consumed by its final walls, rather than shipped as corners.
+pub(crate) fn blend_star_network_with_corner_policy(
+    solid: &BrepSolid,
+    edge_ids: &[u64],
+    radius: f64,
+    chamfer: bool,
+    edge_names: &[Option<String>],
+    corner_name: &dyn Fn(&[usize]) -> Option<String>,
+    wrap_concave: bool,
+) -> Result<BrepSolid, KernelRefusal> {
     // A network that refuses takes back the notes its stripes recorded.
     let mark = super::blend_notes_mark();
-    let result = blend_star_network_building(solid, edge_ids, radius, chamfer, edge_names, corner_name);
+    let result = blend_star_network_building(solid, edge_ids, radius, chamfer, edge_names, corner_name, wrap_concave);
     if result.is_err() {
         super::blend_notes_truncate(mark);
     }
@@ -501,6 +570,7 @@ fn blend_star_network_building(
     chamfer: bool,
     edge_names: &[Option<String>],
     corner_name: &dyn Fn(&[usize]) -> Option<String>,
+    wrap_concave: bool,
 ) -> Result<BrepSolid, KernelRefusal> {
     if edge_ids.is_empty() {
         return Err(KernelRefusal::input(KernelStage::Collect, "empty_selection", "blend network: no edges selected"));
@@ -615,28 +685,42 @@ fn blend_star_network_building(
             if sharp.start_vertex_id == sharp.end_vertex_id {
                 return Err(KernelRefusal::unsupported(KernelStage::Classify, "closed_sharp_edge", "blend network: the sharp edge at a miter is closed"));
             }
-            // The sharp edge's own convexity decides the closure.  A CONVEX
-            // sharp edge leaves the two blends meeting in a seam (the miter);
-            // a CONCAVE one — the cap's perimeter turning inward — puts the
-            // seam nowhere: the ball rolls round that edge and the closure is
-            // the horn-torus sector, with no ball to seat on the three faces.
-            if !sharp_edge_is_convex(solid, sharp, other_a, other_b, radius)? {
-                let selected_convex = [a, b].iter().all(|&index| {
-                    let (edge, first, second) = &mates[index];
-                    edge_is_convex(edge, first, second).unwrap_or(false)
-                });
-                if !selected_convex {
-                    return Err(KernelRefusal::unsupported(KernelStage::Classify, "reentrant_concave", format!(
-                        "blend network: vertex {vertex_id} is re-entrant with concave selected \
-                         edges — the mirror of the horn-torus closure is not in this lane"
-                    )));
-                }
+            // Opposite convexities wrap the sharp edge rather than seating
+            // a three-plane ball whose two cylinders meet in a sharp seam.
+            // Oblique concave corners retain their asymmetric miter lane.
+            let sharp_convex = sharp_edge_is_convex(solid, sharp, other_a, other_b, radius)?;
+            let selected_convex = [a, b].iter().all(|&index| {
+                let (edge, first, second) = &mates[index];
+                edge_is_convex(edge, first, second).unwrap_or(false)
+            });
+            let selected_concave = [a, b].iter().all(|&index| {
+                let (edge, first, second) = &mates[index];
+                edge_is_convex(edge, first, second).is_ok_and(|convex| !convex)
+            });
+            // A ball outside the material wraps a convex boss corner just
+            // as a ball inside wraps a concave notch. Both are horn sectors;
+            // intersecting the two concave stripes instead makes a sharp seam.
+            let plane_normal = |face: &FaceRecord| match face.surface.analytic() {
+                Some(crate::AnalyticSurface::Plane { u_dir, v_dir, .. }) => u_dir.cross(*v_dir).normalized().ok(),
+                _ => None,
+            };
+            let perpendicular_cap = plane_normal(shared).zip(plane_normal(other_a))
+                .zip(plane_normal(other_b))
+                .is_some_and(|((cap, a), b)| cap.dot(a).abs() < 1e-6 && cap.dot(b).abs() < 1e-6);
+            if (!sharp_convex && selected_convex)
+                || (wrap_concave && !chamfer && sharp_convex && selected_concave && perpendicular_cap) {
                 corners.push((
                     *vertex_id,
                     stripe_indices.clone(),
                     VertexKind::Reentrant { cap: shared, sharp },
                 ));
                 continue;
+            }
+            if !sharp_convex {
+                return Err(KernelRefusal::unsupported(KernelStage::Classify, "reentrant_concave", format!(
+                    "blend network: vertex {vertex_id} is re-entrant with concave selected \
+                     edges — the mirror of the horn-torus closure is not in this lane"
+                )));
             }
             miter = Some((shared, sharp));
         }
@@ -876,17 +960,67 @@ fn blend_star_network_building(
                 })
         });
         let rail_bar = 0.5 * crate::KernelTolerances::for_solid(solid, 1e-7).intersection_fit;
-        let mut chosen: Option<(FittedRows, Vec<f64>, StationRefinement)> = None;
+        // The ladder this stripe climbs: the shared rungs, and past them the
+        // rungs a CONCAVE corner at either end asks for.  The shared rungs
+        // are fractions of the edge's own span, and a concave corner's ball
+        // sits a fixed distance past the vertex — about a radius, more
+        // between oblique walls — so an edge shorter than about two radii
+        // can never carry its rail to that ball on them, and the network
+        // refused the whole selection ("contact rail ... misses the corner
+        // ball's tangency point") before the cutter capped the corner.  The
+        // rungs added here are read off the corner ball already seated
+        // (`concave_corner_reach`); nothing changes for a stripe the shared
+        // rungs settle, because the climb stops at the first rung that does.
+        let ladder = concave_corner_ladder(edge, &corners);
+        // The rung's MEASUREMENT, as the open edge's (C3): rails positive and
+        // finite inside the rail bar on samples of both rails, and -- a FILLET
+        // only (the network's one scalar radius is constant by construction;
+        // a chamfer is not judged) -- the wall against the rolling ball's
+        // exact centres at `intersection_fit`, then the construction request
+        // toward `model` on this same ladder (STATIONS doubling to
+        // MAX_OPEN_STATIONS). The ladder can read only the VERTEX window: the
+        // shipped windows are fixed by the end plans, and are read again there
+        // (step 7) before any claim is made about what ships.
+        let wall_check = !chamfer && super::station_refinement_on();
+        let wall_bar = crate::KernelTolerances::for_solid(solid, 1e-7).intersection_fit;
+        let model = crate::KernelTolerances::for_solid(solid, 1e-7).model;
+        let accepts = |reading: &OpenRungReading| {
+            reading.rails_read()
+                && reading.rails <= rail_bar
+                && (!wall_check || reading.worst_wall().is_some_and(|wall| wall <= wall_bar))
+        };
+        let meets_model = |reading: &OpenRungReading| reading.worst_wall().is_some_and(|wall| wall <= model);
+        let mut chosen: Option<(FittedRows, Vec<f64>, StationRefinement, Vec<Station>, [usize; 2], OpenDenseCentres)> = None;
         let mut last_error: Option<KernelRefusal> = None;
         let mut station_count = super::stations::STATIONS;
-        let rows = loop {
+        let mut accepted: Option<StripeRung> = None;
+        let mut unaccepted: Option<StripeRung> = None;
+        let mut request_rungs = 0usize;
+        let mut unmet: Option<crate::BudgetReason> = None;
+        // On an edge STATIONARY at a vertex (its derivative vanishes there) the
+        // carrier projection stalls near that end: zero_tangent_sites'
+        // stationary start read 3.02e-2 for a rail that sits exactly on its
+        // plane y = 0 (worst point (0.030, 0, 4.5)); a pcurve-seeded Newton
+        // read 3.6e-4 there, and the rail-to-pcurve distance 1.2e-3. There a
+        // rail that misses is reported UNREAD, never as that distance.
+        let stationary_end = [edge.t0, edge.t1].into_iter().any(|t| {
+            edge.curve
+                .derivatives(t, 1)
+                .map_or(false, |derivatives| derivatives[1].normalized().is_err())
+        });
+        loop {
+        // A rung climbed to after acceptance is a request rung ATTEMPTED.
+        if accepted.is_some() {
+            request_rungs += 1;
+        }
         chosen = None;
-        for &overshoot in &OVERSHOOTS {
-            match march_open_stations_ending(
+        for &overshoot in &ladder {
+            match march_open_stations_core(
                 edge, first, second, &radius_at, overshoot, ends, station_count, poles, bounded_ends,
                 super::station_refinement_on().then_some(rail_bar),
+                if wall_check { OPEN_WALL_CENTRES } else { 0 },
             ) {
-                Ok((stations, vertex_indices, refinement)) => {
+                Ok((stations, vertex_indices, refinement, dense)) => {
                     let parameters = station_parameters(&stations);
                     let at_vertices = vertex_stations(&parameters, vertex_indices);
                     let extrusion = extrusion_direction(edge, first, second);
@@ -924,7 +1058,7 @@ fn blend_star_network_building(
                                 .all(|slot| !bounded_ends[slot] || settled_ends[slot]);
                             if (chosen.is_none() || settled) && bounded_reached
                             {
-                                chosen = Some((rows, parameters.clone(), refinement));
+                                chosen = Some((rows, parameters.clone(), refinement, stations, vertex_indices, dense));
                             }
                             if settled {
                                 break;
@@ -936,7 +1070,12 @@ fn blend_star_network_building(
                 Err(error) => last_error = Some(error),
             }
         }
-        let Some((rows, parameters, refinement)) = chosen.take() else {
+        let Some((rows, parameters, refinement, stations, vertex_indices, dense)) = chosen.take() else {
+            // A request rung that cannot be built: the accepted rung stands.
+            if accepted.is_some() {
+                unmet = Some(crate::BudgetReason::Incoherent);
+                break;
+            }
             // The final successful coarse station may still precede the
             // end-face crossing. A denser march can reach it without ever
             // evaluating the singular pole beyond it.
@@ -954,72 +1093,129 @@ fn blend_star_network_building(
                 )
             }));
         };
-        let off = rails_off_carriers(
-            &rows,
-            &parameters,
-            [&first.face.surface, &second.face.surface],
-        )?;
+        // The VERTEX window, both rails and the wall over it (the ladder's
+        // scope; the shipped windows are read at step 7).
+        let window = {
+            let (low, high) = (vertex_indices[0].min(vertex_indices[1]), vertex_indices[0].max(vertex_indices[1]));
+            shipped_window(&parameters, parameters[low], parameters[high])
+        };
+        let (rails, rail_samples) =
+            rails_on_shipped_windows(&rows, &parameters, &stations, [&first.face.surface, &second.face.surface], [window, window]);
+        let walls_why = match (wall_check, window) {
+            (true, Some(window)) => open_wall_readings_why(&rows, &parameters, &stations, window, &dense, radius),
+            _ => Vec::new(),
+        };
+        let first_unread = walls_why.iter().find_map(|wall| wall.as_ref().err().cloned());
+        let walls: Vec<Option<f64>> = walls_why.into_iter().map(|wall| wall.ok()).collect();
+        let mut reading = OpenRungReading {
+            station_count,
+            stations: parameters.len(),
+            rails,
+            rail_samples,
+            walls,
+            first_unread,
+            refine_exit: refinement.exit,
+            inserted: refinement.inserted,
+        };
+        // A stationary edge's rail that misses is UNREAD (above), before
+        // anything reads the verdict, so the trace and the report agree.
+        if stationary_end && !(reading.rails_read() && reading.rails <= rail_bar) {
+            reading.rails = f64::NAN;
+        }
         if std::env::var("BREP_DEBUG_NETWORK").is_ok() {
+            // Beside it, the lane's former instrument (clamped carrier
+            // projection between the vertex stations), for comparison only.
+            let clamped = rails_off_carriers(&rows, &parameters, [&first.face.surface, &second.face.surface]);
             eprintln!(
                 "open march: edge {} at {station_count} stations (+{} refined, {:?}; {} in all), \
-                 rails {off:.3e} off their carriers (bar {rail_bar:.3e})",
+                 rails {:.3e} off their carriers' extension (clamped projection {:?}; bar {rail_bar:.3e}), \
+                 wall {:?} (bar {wall_bar:.3e}){}",
                 edge.id,
                 refinement.inserted,
                 refinement.exit,
-                parameters.len()
+                parameters.len(),
+                reading.rails,
+                clamped.map_err(|error| error.message),
+                reading.worst_wall(),
+                if accepted.is_some() { ", a request rung" } else { "" }
             );
         }
-        if !(off > rail_bar) {
-            break rows;
-        }
-        if station_count >= super::stations::MAX_OPEN_STATIONS {
-            // The ladder is spent and the rails still miss: the wall ships (a
-            // body that built before is never turned into a refusal here), and
-            // says so by name on its feature, except where the reading cannot
-            // be trusted. On an edge STATIONARY at a vertex (its derivative
-            // vanishes there) the carrier projection stalls near that end:
-            // zero_tangent_sites' stationary start read 3.02e-2 for a rail that
-            // sits exactly on its plane y = 0 (worst point (0.030, 0, 4.5)).
-            // A pcurve-seeded Newton read 3.6e-4 there, and the rail-to-pcurve
-            // distance read 1.2e-3. There the reading goes to the debug trace,
-            // never onto the feature.
-            let stationary_end = [edge.t0, edge.t1].into_iter().any(|t| {
-                edge.curve
-                    .derivatives(t, 1)
-                    .map_or(false, |derivatives| derivatives[1].normalized().is_err())
-            });
-            if stationary_end {
-                if std::env::var("BREP_DEBUG_NETWORK").is_ok() {
-                    eprintln!(
-                        "open march: edge {} is stationary at a vertex; its rails' {off:.3e} is \
-                         not claimed on the feature",
-                        edge.id
-                    );
+        let accepted_now = accepts(&reading);
+        let rung = StripeRung { rows, parameters, stations, dense, reading };
+        if accepted.is_none() {
+            if accepted_now {
+                let met = !wall_check || meets_model(&rung.reading);
+                accepted = Some(rung);
+                if met {
+                    break;
                 }
-                break rows;
-            }
-            // A refinement that converged left no mid-span miss to name.
-            let worst = if refinement.worst_miss > 0.0 {
-                format!(
-                    ", worst mid-span miss {:.2e} at edge parameter {:.6}",
-                    refinement.worst_miss, refinement.worst_t
-                )
+            } else if station_count < super::stations::MAX_OPEN_STATIONS {
+                station_count *= 2;
+                continue;
             } else {
-                String::new()
-            };
-            super::record_blend_note(format!(
-                "blend: edge {}'s rails stand {off:.2e} off their carriers after {} stations \
-                 (bar {rail_bar:.1e}; local refinement {:?}, {} stations inserted{worst}); the \
-                 wall ships as marched",
-                edge.id,
-                parameters.len(),
-                refinement.exit,
-                refinement.inserted,
-            ));
-            break rows;
+                // The ladder is spent and the rung is still not accepted: the
+                // wall ships (a body that built before is never turned into a
+                // refusal here), UNACCEPTED, and step 7 reports it typed.
+                if stationary_end {
+                    if std::env::var("BREP_DEBUG_NETWORK").is_ok() {
+                        eprintln!(
+                            "open march: edge {} is stationary at a vertex; its rails' reading is \
+                             reported unread, never as a distance",
+                            edge.id
+                        );
+                    }
+                } else {
+                    // A refinement that converged left no mid-span miss to name.
+                    let worst = if refinement.worst_miss > 0.0 {
+                        format!(
+                            ", worst mid-span miss {:.2e} at edge parameter {:.6}",
+                            refinement.worst_miss, refinement.worst_t
+                        )
+                    } else {
+                        String::new()
+                    };
+                    super::record_blend_note(format!(
+                        "blend: edge {}'s rails stand {:.2e} off their carriers after {} stations \
+                         (bar {rail_bar:.1e}; local refinement {:?}, {} stations inserted{worst}); the \
+                         wall ships as marched",
+                        edge.id,
+                        rung.reading.rails,
+                        rung.parameters.len(),
+                        refinement.exit,
+                        refinement.inserted,
+                    ));
+                }
+                unaccepted = Some(rung);
+                break;
+            }
+        } else {
+            if !accepted_now {
+                unmet = Some(crate::BudgetReason::Rejected);
+                break;
+            }
+            let met = meets_model(&rung.reading);
+            accepted = Some(rung);
+            if met {
+                unmet = None;
+                break;
+            }
         }
-        station_count *= 2;
+        // Accepted, short of `model`: one more rung if the budget allows.
+        if station_count < super::stations::MAX_OPEN_STATIONS {
+            station_count *= 2;
+        } else {
+            unmet = Some(crate::BudgetReason::StationCeiling);
+            break;
+        }
+        }
+        let (ladder_accepted, rung) = match (accepted, unaccepted) {
+            (Some(rung), _) => (true, rung),
+            (None, Some(rung)) => (false, rung),
+            (None, None) => {
+                return Err(KernelRefusal::internal(KernelStage::Refine, "network_ladder", "blend network: the stripe ladder ended without a rung"));
+            }
         };
+        let StripeRung { rows, parameters, stations, dense, reading } = rung;
         stripes.push(Stripe {
             edge,
             first: BlendMate {
@@ -1037,6 +1233,17 @@ fn blend_star_network_building(
             rows,
             name: edge_names.get(index).cloned().flatten(),
             poles,
+            measure: StripeMeasure {
+                parameters,
+                stations,
+                dense,
+                ladder_accepted,
+                ladder_reading: reading,
+                unmet,
+                request_rungs,
+                stationary_end,
+                wall_check,
+            },
         });
     }
 
@@ -1222,6 +1429,7 @@ fn blend_star_network_building(
                     sharp,
                     scale,
                     fit_tolerance,
+                    consumed_band(solid),
                 )?;
                 if std::env::var("BREP_DEBUG_NETWORK").is_ok() {
                     let seam = match &closure {
@@ -1979,6 +2187,9 @@ fn blend_star_network_building(
     // ---- 7. Sew: every stripe, then the corner patches and the miter
     //         trims, then one prune. ----
     let mut sewn: Vec<SewnStripe> = Vec::with_capacity(stripes.len());
+    // Each FILLET stripe's shipped wall, read on what ships and owed typed
+    // where it does not meet its bars: bound to its sewn face at the end.
+    let mut owed: Vec<OwedWallReport> = Vec::new();
     for (index, stripe) in stripes.iter().enumerate() {
         let [start_plan, finish_plan] = std::mem::replace(&mut end_plans[index], [None, None]);
         let (Some(start_plan), Some(finish_plan)) = (start_plan, finish_plan) else {
@@ -2049,6 +2260,15 @@ fn blend_star_network_building(
             exact_extrusion: stripe.rows.exact_extrusion,
             vertex_stations: stripe.rows.vertex_stations,
         };
+        // The SHIPPED windows: each rail between the parameters its two end
+        // plans trim it to (corner station, pole, flush join, miter, cap or
+        // free-end crossing), retained overshoot included; the wall over
+        // their envelope.
+        let spans = [
+            shipped_span(&stripe.measure.parameters, &stripe.rows.cr, start_plan.cr_parameter(), finish_plan.cr_parameter(), band),
+            shipped_span(&stripe.measure.parameters, &stripe.rows.cs, start_plan.cs_parameter(), finish_plan.cs_parameter(), band),
+        ];
+        let report = shipped_wall_report(stripe, spans, radius, solid);
         sewn.push(build_open_surgery(
             solid,
             &mut result,
@@ -2060,6 +2280,29 @@ fn blend_star_network_building(
             [start_plan, finish_plan],
             stripe.name.as_deref(),
         )?);
+        if let Some((reason, bar, measured, detail)) = report {
+            let face_id = sewn[sewn.len() - 1].blend_face_id;
+            // The wall AS SEWN (an exact extrusion is transposed at sewing). A
+            // surgery that returned a face it did not sew is incoherent: it
+            // refuses, as the open edge's lane does, rather than drop what the
+            // wall owes.
+            let face = result.shells.iter().flat_map(|shell| &shell.faces).find(|face| face.id == face_id).ok_or_else(|| {
+                KernelRefusal::internal(
+                    KernelStage::Sew,
+                    "network_blend_face",
+                    format!("blend network: edge {}'s sewn blend face {face_id} is not in the body it was sewn into", stripe.edge.id),
+                )
+            })?;
+            owed.push(OwedWallReport {
+                edge: stripe.edge.id,
+                name: stripe.name.clone(),
+                surface: face.surface.clone(),
+                reason,
+                bar,
+                measured,
+                detail,
+            });
+        }
     }
     for patch in patches {
         let face = if chamfer {
@@ -2101,24 +2344,32 @@ fn blend_star_network_building(
                 edge.start_vertex_id == miter.sharp_vertex || edge.end_vertex_id == miter.sharp_vertex
             });
         if consumed_whole {
-            if miter.connector.is_some() {
-                return Err(KernelRefusal::unsupported(KernelStage::Refine, crate::blend::edge::RAIL_COLLAPSE_WHAT, format!(
-                    "{RAIL_COLLAPSE_UNSUPPORTED} the asymmetric miter at vertex {} closes on its \
-                     sharp edge's far vertex, which leaves its connector nothing to meet",
-                    miter.vertex
-                )));
-            }
+            // An ASYMMETRIC miter whose connector ends on the far vertex is
+            // the full-width case of the connector's face: the follower's
+            // rail on its other mate lands on that vertex (a boss whose side
+            // face is exactly one radius wide, the reported star rib whose
+            // inner vertices sit one radius off the plate), the sharp edge is
+            // consumed whole, and the connector takes its place on the
+            // leader's other face — between the leader's rail and whatever
+            // edge followed the sharp edge at the far vertex (spliced by
+            // vertex adjacency below, since there is no sharp edge left to
+            // be adjacent to).  Measured 2026-10-01 on that rib at r = 1:
+            // refused here by name, the group fell to the cutter's capped
+            // corners.
             consume_sharp_edge(&mut result, miter.sharp_edge);
             consumed_sharp_edge = true;
-            continue;
+            if miter.connector.is_none() {
+                continue;
+            }
+        } else {
+            trim_edge_at(
+                &mut result,
+                miter.sharp_edge,
+                miter.sharp_parameter,
+                miter.vertex,
+                miter.sharp_vertex,
+            )?;
         }
-        trim_edge_at(
-            &mut result,
-            miter.sharp_edge,
-            miter.sharp_parameter,
-            miter.vertex,
-            miter.sharp_vertex,
-        )?;
         let Some((leader_index, face_id, connector_id, on_face)) = miter.connector else {
             continue;
         };
@@ -2138,6 +2389,23 @@ fn blend_star_network_building(
                 miter.vertex
             )
         }).or_refuse(KernelStage::Refine, "ok_or_else")?;
+        // The rail's two ends and the connector's start (the seam's exit),
+        // read before the face is borrowed: with the sharp edge consumed
+        // whole the connector is placed by this adjacency instead.
+        let vertices_of = |result: &BrepSolid, id: u64| {
+            result
+                .edges
+                .iter()
+                .find(|edge| edge.id == id)
+                .map(|edge| (edge.start_vertex_id, edge.end_vertex_id))
+                .ok_or(KernelRefusal::internal(
+                    KernelStage::Sew,
+                    "connector_edges",
+                    "blend network: a miter edge vanished before the connector was spliced",
+                ))
+        };
+        let (rail_start, rail_end) = vertices_of(&result, rail_id)?;
+        let (connector_start, _) = vertices_of(&result, connector_id)?;
         let coedge_id = take_id();
         let face = result
             .shells
@@ -2155,24 +2423,48 @@ fn blend_star_network_building(
             else {
                 continue;
             };
-            let Some(sharp_at) = loop_record
-                .coedges
-                .iter()
-                .position(|coedge| coedge.edge_id == miter.sharp_edge)
-            else {
-                continue;
-            };
-            let (insert_at, forward, pcurve) = if (rail_at + 1) % count == sharp_at {
-                // rail -> connector -> sharp: the walk runs from the rail's
-                // end (the seam's exit) to the sharp edge, the stored sense.
-                (rail_at + 1, true, on_face.clone())
-            } else if (sharp_at + 1) % count == rail_at {
-                (sharp_at + 1, false, on_face.reversed().or_refuse(KernelStage::Refine, "reversed")?)
+            let (insert_at, forward, pcurve) = if consumed_whole {
+                // No sharp edge to be adjacent to: the connector follows the
+                // rail when the rail's walk ends at the seam's exit, and
+                // precedes it (reversed) when the walk starts there.
+                let rail = &loop_record.coedges[rail_at];
+                let (walk_start, walk_end) = if rail.forward {
+                    (rail_start, rail_end)
+                } else {
+                    (rail_end, rail_start)
+                };
+                if walk_end == connector_start {
+                    (rail_at + 1, true, on_face.clone())
+                } else if walk_start == connector_start {
+                    (rail_at, false, on_face.reversed().or_refuse(KernelStage::Refine, "reversed")?)
+                } else {
+                    return Err(KernelRefusal::internal(
+                        KernelStage::Sew,
+                        "connector_adjacency",
+                        "blend network: the leader's rail does not end at the seam's exit on \
+                         the connector's face",
+                    ));
+                }
             } else {
-                return Err(
-                    KernelRefusal::internal(KernelStage::Sew, "connector_adjacency", "blend network: the leader's rail and the sharp edge are not adjacent on \
-                     the connector's face"),
-                );
+                let Some(sharp_at) = loop_record
+                    .coedges
+                    .iter()
+                    .position(|coedge| coedge.edge_id == miter.sharp_edge)
+                else {
+                    continue;
+                };
+                if (rail_at + 1) % count == sharp_at {
+                    // rail -> connector -> sharp: the walk runs from the rail's
+                    // end (the seam's exit) to the sharp edge, the stored sense.
+                    (rail_at + 1, true, on_face.clone())
+                } else if (sharp_at + 1) % count == rail_at {
+                    (sharp_at + 1, false, on_face.reversed().or_refuse(KernelStage::Refine, "reversed")?)
+                } else {
+                    return Err(
+                        KernelRefusal::internal(KernelStage::Sew, "connector_adjacency", "blend network: the leader's rail and the sharp edge are not adjacent on \
+                         the connector's face"),
+                    );
+                }
             };
             loop_record.coedges.insert(
                 insert_at,
@@ -2420,16 +2712,19 @@ fn blend_star_network_building(
                 },
             ]
         };
-        // Convex: the sector's normal points away from the ball centre under
-        // each point (the centre circle, one radius from the pole).
-        let mid = surface.evaluate(0.5, 0.5).or_refuse(KernelStage::Refine, "evaluate")?;
-        let mid_center = horn.pole.add(
-            radial_a
-                .scale((sweep * 0.5).cos())
-                .add(revolve_axis.cross(radial_a).scale((sweep * 0.5).sin())),
-        );
-        let surface_normal = surface.normal(0.5, 0.5).or_refuse(KernelStage::Refine, "normal")?;
-        let same_sense = surface_normal.dot(mid.sub(mid_center)) > 0.0;
+        // Orient at the tangency with the common cap. This works for both
+        // material sides of the rolling ball and for every radius.
+        let contact = surface.evaluate(0.5, 1.0).or_refuse(KernelStage::Refine, "evaluate")?;
+        let cap = solid.shells.iter().flat_map(|shell| &shell.faces)
+            .find(|face| face.id == horn.cap_face)
+            .ok_or(KernelRefusal::internal(KernelStage::Refine, "cap_face", "blend network: missing horn cap"))?;
+        let projection = crate::project_point_to_surface(&cap.surface, contact)
+            .or_refuse(KernelStage::Refine, "project")?;
+        let cap_normal = cap.surface.normal(projection.u, projection.v)
+            .or_refuse(KernelStage::Refine, "normal")?;
+        let outward = if cap.same_sense { cap_normal } else { cap_normal.scale(-1.0) };
+        let surface_normal = surface.normal(0.5, 1.0).or_refuse(KernelStage::Refine, "normal")?;
+        let same_sense = surface_normal.dot(outward) > 0.0;
         let loop_id = take_id();
         let face = FaceRecord {
             id: take_id(),
@@ -2532,7 +2827,7 @@ fn blend_star_network_building(
             }
         }
     }
-    let rail_edges: Vec<u64> = rail_faces.iter().map(|(_, rail)| *rail).collect();
+    let mut rail_edges: Vec<u64> = rail_faces.iter().map(|(_, rail)| *rail).collect();
     let mut seam_faces: Vec<u64> = rail_faces.iter().map(|(face, _)| *face).collect();
     seam_faces.sort_unstable();
     seam_faces.dedup();
@@ -2543,7 +2838,13 @@ fn blend_star_network_building(
             let Some(plan) = plan_carrier_seam_split(&result, &rail_edges, face_id)? else {
                 break;
             };
-            apply_carrier_seam_split(&mut result, &mut take_id, plan)?;
+            let original_rail = plan.rail_edge;
+            let pieces = apply_carrier_seam_split(&mut result, &mut take_id, plan)?;
+            // Both descendants retain this operation's constructed-rail
+            // provenance. A second retained meridian can cross one piece of
+            // the very rail the first seam split replaced.
+            rail_edges.retain(|&edge| edge != original_rail);
+            rail_edges.extend(pieces);
         }
     }
     // Restrict every stripe against the THIRD faces it crosses. ---- The
@@ -2604,8 +2905,198 @@ fn blend_star_network_building(
     if collapse.changed() {
         check_collapse_closure(solid, &result)?;
     }
-    crossings.gate(result)
+    let built = crossings.gate(result)?;
+    // Only a network that BUILT owes its reports. Each binds to its wall on
+    // the built body by exact name and exact surface (the consumer's own
+    // rule); a wall a later step replaced (absorbed, rebuilt) cannot carry a
+    // typed report, so its deficit is named in a note instead -- never
+    // dropped, never claimed met.
+    for report in owed {
+        let carried = built.shells.iter().flat_map(|shell| &shell.faces).any(|face| {
+            face.name == report.name && super::same_surface(&face.surface, &report.surface)
+        });
+        if carried {
+            super::record_wall_model_report(super::WallModelReport {
+                name: report.name,
+                surface: report.surface,
+                request: report.bar,
+                residual: report.measured,
+                detail: Some(report.detail),
+                budget: report.reason,
+            });
+        } else {
+            super::record_blend_note(format!(
+                "blend network: edge {}'s shipped wall owes a {:?} report ({:.3e} against {:.3e}; {}), but a \
+                 later network step replaced its face, so it is named here instead",
+                report.edge, report.reason.reason, report.measured, report.bar, report.detail
+            ));
+        }
+    }
+    Ok(built)
 }
+
+/// A FILLET stripe's shipped-wall report, owed until its face is bound.
+struct OwedWallReport {
+    edge: u64,
+    name: Option<String>,
+    surface: crate::NurbsSurface,
+    reason: crate::ApproximationBudget,
+    bar: f64,
+    measured: f64,
+    detail: String,
+}
+
+/// What one rail of a stripe SHIPS between its two end plans' parameters.
+#[derive(Clone, Copy, Debug)]
+enum ShippedSpan {
+    /// A window `[start, finish]` of the rows' parameters.
+    Window([f64; 2]),
+    /// A VALIDATED full-width collapse: the stops meet or cross, and the rail
+    /// between them is within `consumed_band` (the same rule, read the same
+    /// way, as the sewing loop's pinch check, which refuses anything wider).
+    Collapsed,
+    /// Neither: a stop that is not finite, lies outside the marched rows, or
+    /// a strip that cannot be read. Never taken for a collapse.
+    Unread,
+}
+
+fn shipped_span(parameters: &[f64], row: &NurbsCurve, start: f64, finish: f64, band: f64) -> ShippedSpan {
+    let (Some(&first), Some(&last)) = (parameters.first(), parameters.last()) else {
+        return ShippedSpan::Unread;
+    };
+    let inside = |t: f64| t.is_finite() && t >= first && t <= last;
+    if !(inside(start) && inside(finish)) {
+        return ShippedSpan::Unread;
+    }
+    if finish > start {
+        return ShippedSpan::Window([start, finish]);
+    }
+    let strip = row.evaluate(finish).ok().zip(row.evaluate(start).ok()).map(|(a, b)| a.sub(b).length());
+    match strip {
+        Some(strip) if strip.is_finite() && strip <= band => ShippedSpan::Collapsed,
+        _ => ShippedSpan::Unread,
+    }
+}
+
+/// What a stripe's SHIPPED wall owes, read on the spans its end plans trim
+/// it to: `None` when nothing ships (BOTH rails a validated collapse:
+/// [`ShippedSpan::Collapsed`]) or when it meets its bars (and, a fillet,
+/// `model`). An unread span is never a collapse: it is an unread rail.
+/// Otherwise the
+/// typed budget, the bar and the measured value, and the detail text:
+/// - rails or wall over their acceptance bars, or unreadable, on the SHIPPED
+///   windows -- whether or not the ladder accepted the vertex window -- is an
+///   acceptance deficit (`Unaccepted` / `Unread`, `blend.wall_acceptance`);
+/// - an accepted shipped wall short of `model` is the construction request's
+///   (`blend.wall_model`), with the reason its ladder stopped.
+/// A chamfer's wall is not judged (rails only). On an edge stationary at a
+/// vertex a rail over its bar is reported UNREAD.
+fn shipped_wall_report(
+    stripe: &Stripe,
+    spans: [ShippedSpan; 2],
+    radius: f64,
+    solid: &BrepSolid,
+) -> Option<(crate::ApproximationBudget, f64, f64, String)> {
+    if spans.iter().all(|span| matches!(span, ShippedSpan::Collapsed)) {
+        return None;
+    }
+    let windows = spans.map(|span| match span {
+        ShippedSpan::Window(window) => Some(window),
+        ShippedSpan::Collapsed | ShippedSpan::Unread => None,
+    });
+    let measure = &stripe.measure;
+    let tolerances = crate::KernelTolerances::for_solid(solid, 1e-7);
+    let rail_bar = 0.5 * tolerances.intersection_fit;
+    let (wall_bar, model) = (tolerances.intersection_fit, tolerances.model);
+    let (rails, rail_samples) = rails_on_shipped_windows(
+        &stripe.rows,
+        &measure.parameters,
+        &measure.stations,
+        [&stripe.first.face.surface, &stripe.second.face.surface],
+        windows,
+    );
+    // The wall over the envelope of what ships (a collapsed rail ships no
+    // span of its own); with an unread rail, or nothing to envelope, no wall
+    // interval is read and the wall is unread.
+    let envelope = windows.iter().flatten().fold(None, |envelope: Option<[f64; 2]>, window| {
+        Some(envelope.map_or(*window, |known| [known[0].min(window[0]), known[1].max(window[1])]))
+    });
+    let any_unread = spans.iter().any(|span| matches!(span, ShippedSpan::Unread));
+    let walls_why = match (measure.wall_check, envelope, any_unread) {
+        (true, Some(envelope), false) => {
+            open_wall_readings_why(&stripe.rows, &measure.parameters, &measure.stations, envelope, &measure.dense, radius)
+        }
+        _ => Vec::new(),
+    };
+    let first_unread = walls_why.iter().find_map(|wall| wall.as_ref().err().cloned());
+    let walls: Vec<Option<f64>> = walls_why.into_iter().map(|wall| wall.ok()).collect();
+    let ladder = &measure.ladder_reading;
+    let mut shipped = OpenRungReading {
+        station_count: ladder.station_count,
+        stations: ladder.stations,
+        rails,
+        rail_samples,
+        walls,
+        first_unread,
+        refine_exit: ladder.refine_exit,
+        inserted: ladder.inserted,
+    };
+    // Rails READ: a finite, nonnegative reading, every shipped window
+    // sampled, a validated collapsed rail counting as read with nothing to
+    // sample, an unread span never.
+    let rails_read = |reading: &OpenRungReading| {
+        reading.rails.is_finite()
+            && reading.rails >= 0.0
+            && spans.iter().zip(reading.rail_samples).all(|(span, samples)| match span {
+                ShippedSpan::Window(_) => samples > 0,
+                ShippedSpan::Collapsed => true,
+                ShippedSpan::Unread => false,
+            })
+    };
+    if measure.stationary_end && !(rails_read(&shipped) && shipped.rails <= rail_bar) {
+        shipped.rails = f64::NAN;
+    }
+    let read = rails_read(&shipped);
+    let accepted = read
+        && shipped.rails <= rail_bar
+        && (!measure.wall_check || shipped.worst_wall().is_some_and(|wall| wall <= wall_bar));
+    let rungs_past_first = (ladder.station_count / STATIONS).trailing_zeros() as usize;
+    let scope = format!(
+        "read on the shipped spans {spans:?}; the ladder {} the vertex window at {} stations a rung (rails {:.3e}, wall {:?}); \
+         the shipped rung's local rail refinement ended {:?} with {} stations inserted",
+        if measure.ladder_accepted { "accepted" } else { "never accepted" },
+        ladder.station_count,
+        ladder.rails,
+        ladder.worst_wall(),
+        ladder.refine_exit,
+        ladder.inserted
+    );
+    let budget = |reason: crate::BudgetReason, rounds_used: usize| crate::ApproximationBudget {
+        reason,
+        rounds_used,
+        rounds_limit: OPEN_REQUEST_RUNGS,
+        stations: ladder.stations,
+        station_limit: REFINE_STATION_FACTOR * (MAX_OPEN_STATIONS + 1),
+        mechanism: crate::BudgetMechanism::StationRungs,
+        measured_component: crate::MeasuredComponent::Wall,
+        unread: 0,
+    };
+    if !accepted {
+        let (reason, bar, measured, deficit) =
+            acceptance_deficit(&shipped, rail_bar, wall_bar, measure.wall_check, read, "the shipped windows fail acceptance");
+        let rounds = if measure.ladder_accepted { measure.request_rungs } else { rungs_past_first };
+        return Some((budget(reason, rounds), bar, measured, format!("{deficit}; {scope}")));
+    }
+    if measure.wall_check {
+        let declared = shipped.worst_wall()?;
+        if !(declared <= model) {
+            let reason = measure.unmet.unwrap_or(crate::BudgetReason::StationCeiling);
+            return Some((budget(reason, measure.request_rungs), model, declared, scope));
+        }
+    }
+    None
+}
+
 
 /// Where a collapse merged the rails of two blends that ride ONE carrier —
 /// the front and back rounds of a full-width channel are the two halves of one
@@ -3037,6 +3528,76 @@ fn rail_station(row: &NurbsCurve, point: Vec3, bar: f64) -> Result<f64, RailMiss
     Ok(projection.u)
 }
 
+/// The overshoot, as a fraction of `edge`'s parameter span, that carries a
+/// stripe's rails to the ball of the CONCAVE corner at `vertex` — or `None`
+/// where that end asks nothing of the ladder: no corner there, a convex one
+/// (its ball sits inside the span), a flush join or a re-entrant closure
+/// (their own lanes place the stop), a ball that does not sit past the
+/// vertex, or a stationary end (no speed to read the parameter off).
+///
+/// The march reads the edge past its ends as the straight continuation in
+/// the end derivative (`derivatives_extended`), so the station whose section
+/// plane holds the ball's centre lies exactly `beyond / |C'(vertex)|` past
+/// the vertex in parameter, where `beyond` is the centre's distance past the
+/// vertex along the edge's outward tangent.  Every tangency point of the ball
+/// is in that section plane, so a rail that reaches it reaches them all.
+fn concave_corner_reach(
+    edge: &EdgeRecord,
+    corners: &[(u64, Vec<usize>, VertexKind<'_>)],
+    vertex: u64,
+    at_start: bool,
+) -> Option<f64> {
+    let (_, _, kind) = corners.iter().find(|(id, _, _)| *id == vertex)?;
+    let corner = match kind {
+        VertexKind::Star { corner } | VertexKind::Miter { corner, .. } => corner,
+        VertexKind::Flush { .. } | VertexKind::Reentrant { .. } => return None,
+    };
+    if corner.outward {
+        return None;
+    }
+    let t = if at_start { edge.t0 } else { edge.t1 };
+    let derivatives = edge.curve.derivatives(t, 1).ok()?;
+    let speed = derivatives[1].length();
+    let tangent = derivatives[1].normalized().ok()?;
+    // Outward: against the parameter direction at the start of a span that
+    // runs up in t, along it at the end — and the reverse on a span that
+    // runs down.
+    let runs_up = edge.t1 >= edge.t0;
+    let away = if at_start == runs_up { tangent.scale(-1.0) } else { tangent };
+    let beyond = corner.center.sub(derivatives[0]).dot(away);
+    let span = (edge.t1 - edge.t0).abs();
+    if !(beyond > 0.0) || !(speed > 0.0) || !(span > 0.0) {
+        return None;
+    }
+    Some(beyond / speed / span)
+}
+
+/// The overshoot ladder for one stripe of the network: [`OVERSHOOTS`], and
+/// past its last rung the rungs a concave corner at either end needs
+/// ([`concave_corner_reach`]).  `rail_station` wants the tangency point
+/// inside the fitted row by `RIM_MARGIN`, so the needed fraction itself would
+/// land it on the row's rim: the rungs stand a quarter and then a whole of
+/// the need beyond it.  Two rungs, no more — each is a full march, paid again
+/// on every retry of the group's subset search.
+fn concave_corner_ladder(
+    edge: &EdgeRecord,
+    corners: &[(u64, Vec<usize>, VertexKind<'_>)],
+) -> Vec<f64> {
+    let mut ladder = OVERSHOOTS.to_vec();
+    let needed = [(edge.start_vertex_id, true), (edge.end_vertex_id, false)]
+        .into_iter()
+        .filter_map(|(vertex, at_start)| concave_corner_reach(edge, corners, vertex, at_start))
+        .fold(0.0f64, f64::max);
+    let top = *OVERSHOOTS.last().unwrap_or(&0.0);
+    for factor in [1.25, 2.0] {
+        let rung = needed * factor;
+        if rung > top {
+            ladder.push(rung);
+        }
+    }
+    ladder
+}
+
 /// Whether `rows` — a stripe marched at one rung of the overshoot ladder —
 /// already reaches the tangency points the corner at one of its ends was
 /// solved on, which is what the surgery will ask of it (`station_on`).
@@ -3123,7 +3684,7 @@ fn sharp_edge_is_convex(
 
 /// Whether a selected edge is convex: its ball (offset by the signed radii
 /// the march uses) sits inside the material on both mates.
-fn edge_is_convex(edge: &EdgeRecord, first: &BlendMate, second: &BlendMate) -> Result<bool, KernelRefusal> {
+pub(super) fn edge_is_convex(edge: &EdgeRecord, first: &BlendMate, second: &BlendMate) -> Result<bool, KernelRefusal> {
     let t = (edge.t0 + edge.t1) * 0.5;
     let mut inside = true;
     for mate in [first, second] {
@@ -3690,11 +4251,15 @@ const SEAM_BISECTIONS: usize = 64;
 fn pcurve_u_crossing(pcurve: &NurbsCurve, level: f64) -> Result<Option<f64>, KernelRefusal> {
     let [q0, q1] = pcurve.domain().or_refuse(KernelStage::Refine, "domain")?;
     let at = |q: f64| -> Result<f64, KernelRefusal> { Ok(pcurve.evaluate(q).or_refuse(KernelStage::Refine, "evaluate")?.x - level) };
+    // An already split rail ends on this meridian. Its endpoint is not a
+    // new seam split; keep searching for an interior crossing. Use the same
+    // normalized interior guard as apply_carrier_seam_split.
+    let interior = |q: f64| (1e-9..=1.0 - 1e-9).contains(&((q - q0) / (q1 - q0)));
     let mut previous = (q0, at(q0)?);
     for index in 1..=SEAM_SAMPLES {
         let q = q0 + (q1 - q0) * index as f64 / SEAM_SAMPLES as f64;
         let value = at(q)?;
-        if previous.1 == 0.0 {
+        if previous.1 == 0.0 && interior(previous.0) {
             return Ok(Some(previous.0));
         }
         if (previous.1 < 0.0) != (value < 0.0) {
@@ -3708,12 +4273,16 @@ fn pcurve_u_crossing(pcurve: &NurbsCurve, level: f64) -> Result<Option<f64>, Ker
                     low = (mid, value);
                 }
             }
-            return Ok(Some(0.5 * (low.0 + high.0)));
+            let crossing = 0.5 * (low.0 + high.0);
+            if interior(crossing) {
+                return Ok(Some(crossing));
+            }
         }
         previous = (q, value);
     }
     Ok(None)
 }
+
 
 /// Plan the seam split for one mate face, or `None` when its loops close.
 ///
@@ -3735,11 +4304,23 @@ pub(in crate::blend) fn plan_carrier_seam_split(
         .iter()
         .flat_map(|shell| &shell.faces)
         .find(|face| face.id == face_id)
-        .ok_or(KernelRefusal::internal(KernelStage::Sew, "mate_face", "blend network: mate face lost before the seam split"))?;
-    if !face.surface.closed_directions().or_refuse(KernelStage::Refine, "closed_directions")?.0 {
+        .ok_or(KernelRefusal::internal(
+            KernelStage::Sew,
+            "mate_face",
+            "blend network: mate face lost before the seam split",
+        ))?;
+    if !face
+        .surface
+        .closed_directions()
+        .or_refuse(KernelStage::Refine, "closed_directions")?
+        .0
+    {
         return Ok(None);
     }
-    let [u0, u1] = face.surface.domain_u().or_refuse(KernelStage::Refine, "domain_u")?;
+    let [u0, u1] = face
+        .surface
+        .domain_u()
+        .or_refuse(KernelStage::Refine, "domain_u")?;
     let period = u1 - u0;
     if !(period > 0.0) {
         return Ok(None);
@@ -3756,10 +4337,10 @@ pub(in crate::blend) fn plan_carrier_seam_split(
         let breaks: Vec<usize> = (0..count)
             .filter(|&index| walks[index].1 != walks[(index + 1) % count].0)
             .collect();
-        // Exactly two breaks, both at the same edge used twice: the seam pair
-        // left behind at the eaten vertex.  Anything else is not this defect,
-        // and `validate` reports it rather than this pass guessing.
-        if breaks.len() != 2 {
+        // Each eaten seam end leaves two breaks. A split carrier can have
+        // more than one such end in this loop; require every break to belong
+        // to exactly one identifiable, double-used seam before repairing any.
+        if breaks.len() < 2 || breaks.len() % 2 != 0 {
             continue;
         }
         // One break follows the seam coedge ARRIVING at the eaten vertex, the
@@ -3780,65 +4361,98 @@ pub(in crate::blend) fn plan_carrier_seam_split(
                 && walks[seam_in_position].1 == walks[seam_out_position].0;
             paired.then_some((seam_in_position, seam_out_position, seam_edge))
         };
-        let Some((seam_in_position, seam_out_position, seam_edge)) =
-            read(breaks[0], breaks[1]).or_else(|| read(breaks[1], breaks[0]))
-        else {
-            continue;
-        };
-        let dangling_vertex = walks[seam_in_position].1;
-        // The u level each seam coedge rides, read at the eaten end.
-        let level_at = |position: usize| -> Result<f64, KernelRefusal> {
-            let coedge = &loop_record.coedges[position];
-            let [q0, q1] = coedge.pcurve.domain().or_refuse(KernelStage::Refine, "domain")?;
-            // The end that meets the eaten vertex: the walk's END for the
-            // arriving coedge, its START for the leaving one.  A coedge's walk
-            // runs its pcurve domain low -> high only when it is forward.
-            let at_walk_end = position == seam_in_position;
-            Ok(coedge
-                .pcurve
-                .evaluate(if at_walk_end == coedge.forward { q1 } else { q0 }).or_refuse(KernelStage::Refine, "evaluate")?
-                .x)
-        };
-        let level_in = level_at(seam_in_position)?;
-        let level_out = level_at(seam_out_position)?;
-        // The rail that crosses one of those meridians, strictly inside its
-        // own u range.  Only a rail this operation just built is eligible:
-        // pre-existing trims are never re-cut here.
-        let band = 1e-9 * period;
-        for (position, coedge) in loop_record.coedges.iter().enumerate() {
-            if !rail_edges.contains(&coedge.edge_id) {
-                continue;
+        let mut pairs = Vec::new();
+        for &arriving in &breaks {
+            for &leaving in &breaks {
+                if arriving != leaving {
+                    if let Some(pair) = read(arriving, leaving) {
+                        pairs.push(pair);
+                    }
+                }
             }
-            let (low, high) = pcurve_u_range(&coedge.pcurve)?;
-            for level in [level_in, level_out] {
-                if low >= level - band || high <= level + band {
+        }
+        if breaks.iter().any(|&index| {
+            pairs
+                .iter()
+                .filter(|&&(incoming, outgoing, _)| {
+                    incoming == index || (outgoing + count - 1) % count == index
+                })
+                .count()
+                != 1
+        }) {
+            continue;
+        }
+        for (seam_in_position, seam_out_position, seam_edge) in pairs {
+            let dangling_vertex = walks[seam_in_position].1;
+            // The u level each seam coedge rides, read at the eaten end.
+            let level_at = |position: usize| -> Result<f64, KernelRefusal> {
+                let coedge = &loop_record.coedges[position];
+                let [q0, q1] = coedge
+                    .pcurve
+                    .domain()
+                    .or_refuse(KernelStage::Refine, "domain")?;
+                // The end that meets the eaten vertex: the walk's END for the
+                // arriving coedge, its START for the leaving one.  A coedge's walk
+                // runs its pcurve domain low -> high only when it is forward.
+                let at_walk_end = position == seam_in_position;
+                Ok(coedge
+                    .pcurve
+                    .evaluate(if at_walk_end == coedge.forward {
+                        q1
+                    } else {
+                        q0
+                    })
+                    .or_refuse(KernelStage::Refine, "evaluate")?
+                    .x)
+            };
+            let level_in = level_at(seam_in_position)?;
+            let level_out = level_at(seam_out_position)?;
+            // The rail that crosses one of those meridians, strictly inside its
+            // own u range.  Only a rail this operation just built is eligible:
+            // pre-existing trims are never re-cut here.
+            let band = 1e-9 * period;
+            for (position, coedge) in loop_record.coedges.iter().enumerate() {
+                if !rail_edges.contains(&coedge.edge_id) {
                     continue;
                 }
-                let Some(q) = pcurve_u_crossing(&coedge.pcurve, level)? else {
-                    continue;
-                };
-                let edge = result
-                    .edges
-                    .iter()
-                    .find(|edge| edge.id == coedge.edge_id)
-                    .ok_or(KernelRefusal::internal(KernelStage::Sew, "crossing_rail", "blend network: the crossing rail vanished"))?;
-                let [q0, q1] = coedge.pcurve.domain().or_refuse(KernelStage::Refine, "domain")?;
-                let walked = (q - q0) / (q1 - q0);
-                let along = if coedge.forward { walked } else { 1.0 - walked };
-                return Ok(Some(CarrierSeamSplit {
-                    face_id,
-                    loop_index,
-                    crossing_position: position,
-                    seam_in_position,
-                    seam_out_position,
-                    seam_edge,
-                    dangling_vertex,
-                    level_in,
-                    level_out,
-                    period,
-                    rail_edge: edge.id,
-                    rail_parameter: edge.t0 + (edge.t1 - edge.t0) * along,
-                }));
+                let (low, high) = pcurve_u_range(&coedge.pcurve)?;
+                for level in [level_in, level_out] {
+                    if low >= level - band || high <= level + band {
+                        continue;
+                    }
+                    let Some(q) = pcurve_u_crossing(&coedge.pcurve, level)? else {
+                        continue;
+                    };
+                    let edge = result
+                        .edges
+                        .iter()
+                        .find(|edge| edge.id == coedge.edge_id)
+                        .ok_or(KernelRefusal::internal(
+                            KernelStage::Sew,
+                            "crossing_rail",
+                            "blend network: the crossing rail vanished",
+                        ))?;
+                    let [q0, q1] = coedge
+                        .pcurve
+                        .domain()
+                        .or_refuse(KernelStage::Refine, "domain")?;
+                    let walked = (q - q0) / (q1 - q0);
+                    let along = if coedge.forward { walked } else { 1.0 - walked };
+                    return Ok(Some(CarrierSeamSplit {
+                        face_id,
+                        loop_index,
+                        crossing_position: position,
+                        seam_in_position,
+                        seam_out_position,
+                        seam_edge,
+                        dangling_vertex,
+                        level_in,
+                        level_out,
+                        period,
+                        rail_edge: edge.id,
+                        rail_parameter: edge.t0 + (edge.t1 - edge.t0) * along,
+                    }));
+                }
             }
         }
     }
@@ -3887,7 +4501,7 @@ pub(in crate::blend) fn apply_carrier_seam_split(
     result: &mut BrepSolid,
     take_id: &mut dyn FnMut() -> u64,
     plan: CarrierSeamSplit,
-) -> Result<(), KernelRefusal> {
+) -> Result<[u64; 2], KernelRefusal> {
     let rail = result
         .edges
         .iter()
@@ -4103,7 +4717,7 @@ pub(in crate::blend) fn apply_carrier_seam_split(
         crossing_vertex,
     )?;
     result.edges.retain(|edge| edge.id != plan.rail_edge);
-    Ok(())
+    Ok([low_edge, high_edge])
 }
 
 /// Refine a seam crossing seeded from the row's uv fit onto the 3D meeting of

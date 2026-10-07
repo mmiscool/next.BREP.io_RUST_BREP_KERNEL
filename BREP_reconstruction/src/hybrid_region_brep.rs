@@ -13,7 +13,7 @@
 use brep_kernel::{
     make_sphere_surface_framed,
     build_pcurve_on_surface_range, circle_angle_to_parameter, intersect_analytic_pair, make_arc,
-    make_line, make_revolution, mesh_to_faceted_brep, project_point_to_curve, segment_mesh_faces,
+    make_line, make_revolution, project_point_to_curve, segment_mesh_faces,
     solid_signed_volume, ArenaCoedge, ArenaEdge, ArenaFace, ArenaLoop, ArenaShell, ArenaVertex,
     BrepSolid, EdgeId, FaceId, MeshRegion, MeshSegmentation, NurbsCurve, NurbsSurface, RegionCarrier,
     SegmentOptions,
@@ -167,6 +167,8 @@ struct LocalRegions {
 }
 
 enum HybridBuildFailure {
+    /// No single parameter seam avoids all trims of this cylindrical wall.
+    Periodic { original: u32 },
     Region { original: u32, message: String },
     /// The assembled shell failed a whole-body check after regions were
     /// built on a lane whose edges carry fitted pcurves on a sphere or
@@ -282,21 +284,23 @@ fn hybrid_plane_cylinder_brep_retry(
             &owned_indices
         }
     };
-    let segmentation = segment_mesh_faces(positions, index_buffer, options)?;
-    // A faceted seed gives us a public, type-safe TopologyArena without
-    // depending directly on SlotMap.  The seed is also an independent closed-
-    // manifold precondition.  Its topology is cleared before reconstruction;
-    // built once, it is cloned per attempt.
-    let seed = mesh_to_faceted_brep(positions, Some(index_buffer), options.weld_tolerance)?;
-    let mut blank = TopologyArena::from_brep(&seed)?;
-    blank.vertices.clear();
-    blank.edges.clear();
-    blank.coedges.clear();
-    blank.loops.clear();
-    blank.faces.clear();
-    blank.shells.clear();
-    blank.wire_solid_id = 1;
-    blank.genus = 0;
+    let mut segmentation = segment_mesh_faces(positions, index_buffer, options)?;
+    crate::hybrid_recovery::recover(positions, index_buffer, options, &mut segmentation);
+    let mut split_attempted = BTreeSet::new();
+    // Start with empty topology. Building, validating and tessellating a full
+    // faceted solid only to clear it costs work proportional to every source
+    // triangle and leaves large slot-map storage to clone on each retry.
+    // The builder below checks welded vertex identity, triangle bounds and
+    // closed, oppositely oriented edge incidence directly. Final topology and
+    // geometry still pass the ordinary reconstruction validation.
+    let blank = TopologyArena::from_brep(&BrepSolid {
+        mass_properties_cache: Default::default(),
+        id: 1,
+        genus: 0,
+        vertices: Vec::new(),
+        edges: Vec::new(),
+        shells: Vec::new(),
+    })?;
     let mut forced_demotions = BTreeSet::new();
     loop {
         let attempt = if let Some(original) = injected_failure.take() {
@@ -316,6 +320,17 @@ fn hybrid_plane_cylinder_brep_retry(
         };
         match attempt {
             Ok(output) => return Ok(output),
+            Err(HybridBuildFailure::Periodic { original }) => {
+                if split_attempted.len() < HYBRID_RETRY_LIMIT
+                    && split_attempted.insert(original)
+                    && split_periodic_cylinder(&mut segmentation, original, positions, index_buffer)
+                {
+                    continue;
+                }
+                if !forced_demotions.insert(original) || forced_demotions.len() > HYBRID_RETRY_LIMIT {
+                    return Err(format!("hybrid BREP: no safe periodic split for region {original}"));
+                }
+            }
             Err(HybridBuildFailure::Region { original, message }) => {
                 if std::env::var("BREP_DEBUG_HYBRID").is_ok() {
                     eprintln!("[hybrid] retry: region {original} failed: {message}");
@@ -349,6 +364,93 @@ fn hybrid_plane_cylinder_brep_retry(
             Err(HybridBuildFailure::Global(message)) => return Err(message),
         }
     }
+}
+
+/// Split a periodic wall only along existing axial mesh edges. No triangle
+/// is cut or omitted, and both patches keep the same fitted carrier.
+fn split_periodic_cylinder(
+    segmentation: &mut MeshSegmentation,
+    original: u32,
+    positions: &[f64],
+    indices: &[u32],
+) -> bool {
+    let template = segmentation.regions[original as usize].clone();
+    let RegionCarrier::Cylinder {
+        axis_point,
+        axis_dir,
+        radius,
+        ..
+    } = template.carrier
+    else {
+        return false;
+    };
+    let point = |i: u32| {
+        Vec3::new(
+            positions[i as usize * 3],
+            positions[i as usize * 3 + 1],
+            positions[i as usize * 3 + 2],
+        )
+    };
+    let radial = |p: Vec3| {
+        let d = p.sub(axis_point);
+        d.sub(axis_dir.scale(d.dot(axis_dir)))
+    };
+    let triangles = segmentation
+        .triangle_region_ids
+        .iter()
+        .enumerate()
+        .filter_map(|(t, &r)| (r == original).then_some(t))
+        .collect::<Vec<_>>();
+    let Some(&first) = triangles.first() else {
+        return false;
+    };
+    let Ok(x) = radial(point(indices[first * 3])).normalized() else {
+        return false;
+    };
+    let y = axis_dir.cross(x);
+    let sides = triangles
+        .iter()
+        .map(|&t| {
+            let center = (0..3)
+                .map(|c| point(indices[t * 3 + c]))
+                .fold(Vec3::new(0.0, 0.0, 0.0), Vec3::add)
+                .scale(1.0 / 3.0);
+            radial(center).dot(y) > 0.0
+        })
+        .collect::<Vec<_>>();
+    if sides.iter().all(|&s| s == sides[0]) {
+        return false;
+    }
+    // Check every triangle stays on one side except vertices on the dividing
+    // meridians. This refuses a split through a facet or an oblique mesh edge.
+    let bar = (radius * 1.0e-7).max(template.max_deviation * 2.0);
+    if triangles.iter().zip(&sides).any(|(&t, &side)| {
+        (0..3).any(|c| {
+            let d = radial(point(indices[t * 3 + c])).dot(y);
+            if side {
+                d < -bar
+            } else {
+                d > bar
+            }
+        })
+    }) {
+        return false;
+    }
+    let next = segmentation.regions.len() as u32;
+    let mut second = template.clone();
+    second.id = next;
+    second.triangle_count = sides.iter().filter(|&&s| s).count();
+    second.area *= second.triangle_count as f64 / template.triangle_count as f64;
+    let first = &mut segmentation.regions[original as usize];
+    first.triangle_count -= second.triangle_count;
+    first.area -= second.area;
+    for (&t, &side) in triangles.iter().zip(&sides) {
+        if side {
+            segmentation.triangle_region_ids[t] = next;
+        }
+    }
+    segmentation.regions.push(second);
+    true
 }
 
 fn hybrid_plane_cylinder_brep_once(
@@ -398,9 +500,7 @@ fn hybrid_plane_cylinder_brep_once(
         .min(2.0e-6 * diagonal)
         .max(1.0e-10);
     let incidence = edge_incidence(&triangles)?;
-    if incidence.values().any(|incident| incident.len() != 2) {
-        return Err("hybrid BREP: input is not a closed two-manifold".into());
-    }
+    validate_closed_incidence(&triangles, &incidence)?;
     let local = local_regions(
         &segmentation.regions,
         &segmentation.triangle_region_ids,
@@ -510,9 +610,9 @@ fn hybrid_plane_cylinder_brep_once(
     }
     stage_trace("axes snapped");
     let cylinders = build_cylinder_surfaces(&cylinder_carriers, &chains, &vertices, tolerance)
-        .map_err(|(region, message)| HybridBuildFailure::Region {
-            original: local_to_original[&region],
-            message,
+        .map_err(|(region, message)| match message {
+            Some(message) => HybridBuildFailure::Region { original: local_to_original[&region], message },
+            None => HybridBuildFailure::Periodic { original: local_to_original[&region] },
         })?;
     let cones = build_cone_surfaces(
         &cone_carriers,
@@ -889,6 +989,24 @@ fn edge_incidence(triangles: &[[usize; 3]]) -> Result<BTreeMap<EdgeKey, Vec<usiz
         }
     }
     Ok(incidence)
+}
+
+fn validate_closed_incidence(
+    triangles: &[[usize; 3]],
+    incidence: &BTreeMap<EdgeKey, Vec<usize>>,
+) -> Result<(), String> {
+    for (&(a, b), uses) in incidence {
+        if uses.len() != 2 {
+            return Err("hybrid BREP: input is not a closed two-manifold".into());
+        }
+        let forward = |t: usize| {
+            (0..3).any(|i| triangles[t][i] == a && triangles[t][(i + 1) % 3] == b)
+        };
+        if forward(uses[0]) == forward(uses[1]) {
+            return Err("hybrid BREP: adjacent triangles have inconsistent winding".into());
+        }
+    }
+    Ok(())
 }
 
 fn carrier_cylinder(region: &MeshRegion) -> Result<Option<CylinderCarrier>, String> {
@@ -1337,6 +1455,24 @@ fn cylinder_cone_edge_supported(
         && point_on_cone(cone, b, tolerance * 4.0)
 }
 
+/// Two coaxial cones can share an exact perpendicular circle, including
+/// opposing tapers. Reject skew axes and non-ring intersections.
+fn cone_cone_edge_supported(
+    first: ConeCarrier,
+    second: ConeCarrier,
+    a: Vec3,
+    b: Vec3,
+    tolerance: f64,
+) -> bool {
+    first.axis.cross(second.axis).length() <= 1.0e-8
+        && cone_radial(first, second.apex).length() <= tolerance * 4.0
+        && [first, second].iter().all(|&cone| {
+            (cone_station(cone, a) - cone_station(cone, b)).abs() <= tolerance * 4.0
+                && point_on_cone(cone, a, tolerance * 4.0)
+                && point_on_cone(cone, b, tolerance * 4.0)
+        })
+}
+
 /// Diagnostic stage trace, enabled by `BREP_DEBUG_HYBRID`.
 fn stage_trace(stage: &str) {
     if std::env::var("BREP_DEBUG_HYBRID").is_ok() {
@@ -1569,7 +1705,10 @@ fn local_regions(
                             torus_ring_with(torus, other, vertices[a], vertices[b]),
                             "torus edge is not a coaxial ring",
                         ),
-                        // Cone/cone intersections are not yet proven exact.
+                        (Revolve::Cone(first), Some(Revolve::Cone(second))) => (
+                            cone_cone_edge_supported(first, second, vertices[a], vertices[b], tolerance),
+                            "cone/cone edge is not a coaxial ring",
+                        ),
                         _ => (false, "same-kind revolve adjacency"),
                     };
                     if !supported {
@@ -2353,12 +2492,14 @@ fn radial(carrier: CylinderCarrier, point: Vec3) -> Vec3 {
     delta.sub(carrier.axis.scale(delta.dot(carrier.axis)))
 }
 
+// An absent error message requests a periodic split rather than a carrier
+// demotion; an ordinary construction error retains its diagnostic.
 fn build_cylinder_surfaces(
     carriers: &HashMap<u32, CylinderCarrier>,
     chains: &[Chain],
     vertices: &[Vec3],
     tolerance: f64,
-) -> Result<HashMap<u32, CylinderInfo>, (u32, String)> {
+) -> Result<HashMap<u32, CylinderInfo>, (u32, Option<String>)> {
     let mut result = HashMap::new();
     for (&region, &carrier) in carriers {
         let relevant = chains
@@ -2377,7 +2518,9 @@ fn build_cylinder_surfaces(
         if !low.is_finite() || high - low <= tolerance {
             return Err((
                 region,
-                format!("hybrid BREP: cylinder {region} has no finite axial span"),
+                Some(format!(
+                    "hybrid BREP: cylinder {region} has no finite axial span"
+                )),
             ));
         }
         let mut seam = None;
@@ -2391,7 +2534,7 @@ fn build_cylinder_surfaces(
             let r0 = radial(carrier, points[0]);
             let r1 = radial(carrier, *points.last().unwrap());
             if (s1 - s0).abs() > tolerance && r0.cross(r1).length() <= tolerance * carrier.radius {
-                seam = Some(r0.normalized().map_err(|error| (region, error))?);
+                seam = Some(r0.normalized().map_err(|error| (region, Some(error)))?);
                 break;
             }
         }
@@ -2414,33 +2557,64 @@ fn build_cylinder_surfaces(
                     seam = Some(
                         radial(carrier, points[0])
                             .normalized()
-                            .map_err(|error| (region, error))?,
+                            .map_err(|error| (region, Some(error)))?,
                     );
                     break;
                 }
             }
         }
-        let x_axis = match seam {
+        let initial = match seam {
             Some(axis) => axis,
             None => carrier
                 .axis
                 .perpendicular()
-                .map_err(|error| (region, error))?,
+                .map_err(|error| (region, Some(error)))?,
         };
+        // An arbitrary frame can split an open trim across the periodic
+        // seam. Choose a boundary endpoint whose meridian avoids every
+        // open trim, keeping each pcurve in one surface period.
+        let seam_bar = (tolerance / (TAU * carrier.radius)).max(1.0e-8);
+        let candidates = std::iter::once(initial).chain(
+            relevant
+                .iter()
+                .filter(|chain| !chain.closed)
+                .flat_map(|chain| [chain.vertices[0], *chain.vertices.last().unwrap()])
+                .filter_map(|vertex| radial(carrier, vertices[vertex]).normalized().ok()),
+        );
+        let x_axis = candidates
+            .into_iter()
+            .find(|&x| {
+                let y = carrier.axis.cross(x);
+                relevant.iter().filter(|chain| !chain.closed).all(|chain| {
+                    let mut angles = chain_points(chain, vertices)
+                        .iter()
+                        .map(|&point| {
+                            let r = radial(carrier, point);
+                            r.dot(y).atan2(r.dot(x)) / TAU
+                        })
+                        .collect::<Vec<_>>();
+                    unwrap(&mut angles);
+                    let low = angles.iter().copied().fold(f64::INFINITY, f64::min);
+                    let high = angles.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                    let shift = (-low - seam_bar).ceil();
+                    low + shift >= -seam_bar && high + shift <= 1.0 + seam_bar
+                })
+            })
+            .ok_or((region, None))?;
         let y_axis = carrier
             .axis
             .cross(x_axis)
             .normalized()
-            .map_err(|error| (region, error))?;
+            .map_err(|error| (region, Some(error)))?;
         let base = carrier.origin.add(carrier.axis.scale(low));
         let profile = make_line(
             base.add(x_axis.scale(carrier.radius)),
             base.add(carrier.axis.scale(high - low))
                 .add(x_axis.scale(carrier.radius)),
         )
-        .map_err(|error| (region, error))?;
-        let surface =
-            make_revolution(base, carrier.axis, &profile, TAU).map_err(|error| (region, error))?;
+        .map_err(|error| (region, Some(error)))?;
+        let surface = make_revolution(base, carrier.axis, &profile, TAU)
+            .map_err(|error| (region, Some(error)))?;
         result.insert(
             region,
             CylinderInfo {

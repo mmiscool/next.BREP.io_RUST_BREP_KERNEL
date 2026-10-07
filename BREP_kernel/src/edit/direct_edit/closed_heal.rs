@@ -1271,14 +1271,9 @@ pub(super) fn heal_closed_transition(
     }
     let strip_edges: HashSet<u64> = boundary.iter().map(|(edge_id, _)| *edge_id).collect();
     let mut extended_edges: HashMap<u64, (bool, bool)> = HashMap::default();
-    // Extended edges whose pcurves must be REFIT against their faces' carriers
-    // rather than repaired by sliding one control point's v. Two kinds reach
-    // it. A CURVED meridian widened along itself: a rational arc is not linear
-    // in the surface's v, so the straight two-point pcurve that serves a line
-    // meridian would cut the chord in parameter space. And a straight meridian
-    // that had to be REBUILT because it was stored with more than two control
-    // points: its pcurve carries the same redundant control, so the two-point
-    // repair below does not apply to it either.
+    // Curved meridians widened along their curves, and straight meridians
+    // rebuilt from redundant controls, require a range refit. Independently
+    // fitted pcurves are added to this set below after inspecting the trims.
     let mut refit_edges: HashSet<u64> = HashSet::default();
     for edge in &mut solid.edges {
         if strip_edges.contains(&edge.id) || edge.id == new_edge_id {
@@ -1358,9 +1353,26 @@ pub(super) fn heal_closed_transition(
         }
         extended_edges.insert(edge.id, (start_hit, end_hit));
     }
+    // A pcurve's representation is independent of its 3D edge's: STEP
+    // imports can fit a cubic trim for a two-control straight meridian.
+    // Inspect the referencing trims themselves before choosing the endpoint
+    // shortcut, rather than assuming their degree/control count matches.
+    for face in solid.shells.iter().flat_map(|shell| &shell.faces) {
+        for coedge in face
+            .loops
+            .iter()
+            .flat_map(|loop_record| &loop_record.coedges)
+        {
+            if extended_edges.contains_key(&coedge.edge_id)
+                && (coedge.pcurve.degree != 1 || coedge.pcurve.control_points.len() != 2)
+            {
+                refit_edges.insert(coedge.edge_id);
+            }
+        }
+    }
     // Refit every pcurve of those edges over its new range, on whatever
-    // carrier each referencing face has. Same mechanism the open chain's
-    // `refit_touched_pcurves` uses, and for the same reason.
+    // carrier each referencing face has. Use the open chain's range fitter,
+    // retaining each closed face's periodic branch at its unmoved endpoint.
     if !refit_edges.is_empty() {
         let edges_by_id: HashMap<u64, EdgeRecord> = solid
             .edges
@@ -1369,7 +1381,82 @@ pub(super) fn heal_closed_transition(
             .collect();
         for shell in &mut solid.shells {
             for face in &mut shell.faces {
-                refit_touched_pcurves(face, &edges_by_id, &refit_edges, false, tolerance, op)?;
+                if !face
+                    .loops
+                    .iter()
+                    .flat_map(|loop_record| &loop_record.coedges)
+                    .any(|coedge| refit_edges.contains(&coedge.edge_id))
+                {
+                    continue;
+                }
+                let (closed_u, closed_v) = face
+                    .surface
+                    .closed_directions()
+                    .or_refuse(KernelStage::Sew, "closed_directions")?;
+                let [u0, u1] = face
+                    .surface
+                    .domain_u()
+                    .or_refuse(KernelStage::Sew, "domain_u")?;
+                let [v0, v1] = face
+                    .surface
+                    .domain_v()
+                    .or_refuse(KernelStage::Sew, "domain_v")?;
+                for coedge in face
+                    .loops
+                    .iter_mut()
+                    .flat_map(|loop_record| &mut loop_record.coedges)
+                {
+                    if !refit_edges.contains(&coedge.edge_id) {
+                        continue;
+                    }
+                    let edge = &edges_by_id[&coedge.edge_id];
+                    let (start_moved, end_moved) = extended_edges[&coedge.edge_id];
+                    // Anchor to the UNMOVED endpoint, whose surface location
+                    // is unchanged by extension. Global projection can choose
+                    // either side of a periodic seam; retain this coedge's
+                    // original branch with an exact whole-period translation.
+                    let traversal_start_moved = if coedge.forward {
+                        start_moved
+                    } else {
+                        end_moved
+                    };
+                    let [q0, q1] = coedge
+                        .pcurve
+                        .domain()
+                        .or_refuse(KernelStage::Sew, "domain")?;
+                    let anchor = coedge
+                        .pcurve
+                        .evaluate(if traversal_start_moved { q1 } else { q0 })
+                        .or_refuse(KernelStage::Sew, "evaluate")?;
+                    let mut pcurve = build_pcurve_on_surface_range(
+                        &face.surface,
+                        &edge.curve,
+                        edge.t0,
+                        edge.t1,
+                        coedge.forward,
+                        tolerance,
+                    )
+                    .or_refuse(KernelStage::Sew, "pcurve_fit")?;
+                    let [q0, q1] = pcurve.domain().or_refuse(KernelStage::Sew, "domain")?;
+                    let fitted = pcurve
+                        .evaluate(if traversal_start_moved { q1 } else { q0 })
+                        .or_refuse(KernelStage::Sew, "evaluate")?;
+                    let du = if closed_u {
+                        ((anchor.x - fitted.x) / (u1 - u0)).round() * (u1 - u0)
+                    } else {
+                        0.0
+                    };
+                    let dv = if closed_v {
+                        ((anchor.y - fitted.y) / (v1 - v0)).round() * (v1 - v0)
+                    } else {
+                        0.0
+                    };
+                    for control in &mut pcurve.control_points {
+                        control.x += du * control.w;
+                        control.y += dv * control.w;
+                    }
+                    coedge.pcurve = pcurve;
+                }
             }
         }
     }

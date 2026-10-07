@@ -26,6 +26,9 @@ pub fn round_convex_corner(
     radius: f64,
     name: Option<&str>,
 ) -> Result<BrepSolid, KernelRefusal> {
+    // One blend operation: the reports of an earlier one, never consumed, are
+    // dropped as it starts (nested calls keep this operation's).
+    let _operation = crate::blend::BlendOperation::enter();
     use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
     if !(radius > 0.0) {
         return Err(KernelRefusal::input(

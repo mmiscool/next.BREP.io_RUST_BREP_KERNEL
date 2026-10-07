@@ -95,7 +95,7 @@ pub static BUTTONS: &[WorkbenchButton] = &[
     WorkbenchButton {
         id: "sketch.tool.select",
         glyph: "\u{1F446}",
-        tooltip: "Select / drag entities",
+        ribbon_path: "Home/Sketch/Select   drag entities", size: crate::workbench::CommandSize::Compact, tooltip: "Select / drag entities",
         when: Some(sketch_is_open),
         pressed: Some(|state| tool_armed(state, "sketch.tool.select")),
         disabled: None,
@@ -105,7 +105,7 @@ pub static BUTTONS: &[WorkbenchButton] = &[
     WorkbenchButton {
         id: "sketch.tool.point",
         glyph: "\u{2316}",
-        tooltip: "Place a point",
+        ribbon_path: "Home/Sketch/Place a point", size: crate::workbench::CommandSize::Compact, tooltip: "Place a point",
         when: Some(sketch_is_open),
         pressed: Some(|state| tool_armed(state, "sketch.tool.point")),
         disabled: None,
@@ -115,7 +115,7 @@ pub static BUTTONS: &[WorkbenchButton] = &[
     WorkbenchButton {
         id: "sketch.tool.line",
         glyph: "\u{E06E}",
-        tooltip: "Draw connected line segments (Esc ends)",
+        ribbon_path: "Home/Sketch/Draw connected line segments", size: crate::workbench::CommandSize::Compact, tooltip: "Draw connected line segments (Esc ends)",
         when: Some(sketch_is_open),
         pressed: Some(|state| tool_armed(state, "sketch.tool.line")),
         disabled: None,
@@ -125,7 +125,7 @@ pub static BUTTONS: &[WorkbenchButton] = &[
     WorkbenchButton {
         id: "sketch.tool.rect",
         glyph: "\u{2610}",
-        tooltip: "Draw a rectangle (two opposite corners)",
+        ribbon_path: "Home/Sketch/Draw a rectangle", size: crate::workbench::CommandSize::Compact, tooltip: "Draw a rectangle (two opposite corners)",
         when: Some(sketch_is_open),
         pressed: Some(|state| tool_armed(state, "sketch.tool.rect")),
         disabled: None,
@@ -135,7 +135,7 @@ pub static BUTTONS: &[WorkbenchButton] = &[
     WorkbenchButton {
         id: "sketch.tool.circle",
         glyph: "\u{25EF}",
-        tooltip: "Draw a circle (center, then radius)",
+        ribbon_path: "Home/Sketch/Draw a circle", size: crate::workbench::CommandSize::Compact, tooltip: "Draw a circle (center, then radius)",
         when: Some(sketch_is_open),
         pressed: Some(|state| tool_armed(state, "sketch.tool.circle")),
         disabled: None,
@@ -145,7 +145,7 @@ pub static BUTTONS: &[WorkbenchButton] = &[
     WorkbenchButton {
         id: "sketch.tool.arc",
         glyph: "\u{25E0}",
-        tooltip: "Draw an arc (center, start, end)",
+        ribbon_path: "Home/Sketch/Draw an arc", size: crate::workbench::CommandSize::Compact, tooltip: "Draw an arc (center, start, end)",
         when: Some(sketch_is_open),
         pressed: Some(|state| tool_armed(state, "sketch.tool.arc")),
         disabled: None,
@@ -155,7 +155,7 @@ pub static BUTTONS: &[WorkbenchButton] = &[
     WorkbenchButton {
         id: "sketch.tool.bezier",
         glyph: "\u{223F}",
-        tooltip: "Bezier \u{2014} end, ctrl, ctrl, end; click a spline to add a point",
+        ribbon_path: "Home/Sketch/Bezier", size: crate::workbench::CommandSize::Compact, tooltip: "Bezier \u{2014} end, ctrl, ctrl, end; click a spline to add a point",
         when: Some(sketch_is_open),
         pressed: Some(|state| tool_armed(state, "sketch.tool.bezier")),
         disabled: None,
@@ -165,7 +165,7 @@ pub static BUTTONS: &[WorkbenchButton] = &[
     WorkbenchButton {
         id: "sketch.tool.handdraw",
         glyph: "\u{270D}",
-        tooltip: "Freehand (auto line/circle/arc)",
+        ribbon_path: "Home/Sketch/Freehand", size: crate::workbench::CommandSize::Compact, tooltip: "Freehand (auto line/circle/arc)",
         when: Some(sketch_is_open),
         pressed: Some(|state| tool_armed(state, "sketch.tool.handdraw")),
         disabled: None,
@@ -175,7 +175,7 @@ pub static BUTTONS: &[WorkbenchButton] = &[
     WorkbenchButton {
         id: "sketch.tool.trim",
         glyph: "\u{2702}",
-        tooltip: "Trim curve",
+        ribbon_path: "Home/Sketch/Trim curve", size: crate::workbench::CommandSize::Compact, tooltip: "Trim curve",
         when: Some(sketch_is_open),
         pressed: Some(|state| tool_armed(state, "sketch.tool.trim")),
         disabled: None,
@@ -185,7 +185,7 @@ pub static BUTTONS: &[WorkbenchButton] = &[
     WorkbenchButton {
         id: "sketch.tool.pickEdges",
         glyph: "\u{26D3}",
-        tooltip: "Link external edge",
+        ribbon_path: "Home/Sketch/Link external edge", size: crate::workbench::CommandSize::Compact, tooltip: "Link external edge",
         when: Some(sketch_is_open),
         pressed: Some(|state| tool_armed(state, "sketch.tool.pickEdges")),
         disabled: None,
@@ -196,7 +196,7 @@ pub static BUTTONS: &[WorkbenchButton] = &[
         id: AUTOCONSTRAIN_BUTTON_ID,
         // 🤖 (U+1F916) — "auto / do it for me", the glyph the strip used.
         glyph: "\u{1F916}",
-        tooltip: "Auto-constrain: infer coincident + horizontal/vertical from the geometry",
+        ribbon_path: "Home/Sketch/Auto-constrain: infer coincident + horizontal vertical from the geometry", size: crate::workbench::CommandSize::Compact, tooltip: "Auto-constrain: infer coincident + horizontal/vertical from the geometry",
         when: Some(sketch_is_open),
         pressed: None,
         disabled: None,

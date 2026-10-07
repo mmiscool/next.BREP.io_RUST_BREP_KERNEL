@@ -1069,13 +1069,47 @@ fn offset_surface_constructed(
                 let (_, trim_v) = trim_domain_fractions(face, knot_u.domain(), knot_v.domain())?;
                 let (back_world, forward_world) =
                     domain_end_moves(extension.v_min, extension.v_max, trim_v);
-                let back = (back_world / min_ruling).min(back_allowance);
-                let forward = (forward_world / min_ruling).min(forward_allowance);
+                let (requested_back, requested_forward) = (back_world / min_ruling, forward_world / min_ruling);
+                // APEX END: the 0.9 above keeps a growth from folding through an
+                // apex it might not have located exactly. When the source is an
+                // analytic cone the offset apex IS located exactly, and a reach
+                // that would pass it ends AT it: the far row becomes the pole the
+                // cavity really ends in. Stopping at 0.9 left a ring there (radius
+                // 2.99e-3 on the d = 1 inward cone) that the carrier's rim
+                // collapse then named a point, so the shipped edge was a point on
+                // a trim that is a ring, and the shell was open over its disk —
+                // 2.69e-5 of volume, all of it. Only while the SOURCE's own apex
+                // lies beyond (its clamped allowance covers the reach), so the
+                // extended source never folds; otherwise the clamp above stands.
+                let apex_end = analytic_offset_apex(source, &samples, offset_fit_contract(source)).and_then(
+                    |(at, apex)| {
+                        if at > 1.0 && at - 1.0 <= requested_forward && at - 1.0 <= source_forward {
+                            Some((false, at - 1.0, apex))
+                        } else if at < 0.0 && -at <= requested_back && -at <= source_back {
+                            Some((true, -at, apex))
+                        } else {
+                            None
+                        }
+                    },
+                );
+                let back = match apex_end {
+                    Some((true, reach, _)) => reach,
+                    _ => requested_back.min(back_allowance),
+                };
+                let forward = match apex_end {
+                    Some((false, reach, _)) => reach,
+                    _ => requested_forward.min(forward_allowance),
+                };
                 let stretched = samples
                     .iter()
                     .map(|row| {
                         let ruling = row[1].sub(row[0]);
-                        vec![row[0].sub(ruling.scale(back)), row[1].add(ruling.scale(forward))]
+                        let (near, far) = (row[0].sub(ruling.scale(back)), row[1].add(ruling.scale(forward)));
+                        match apex_end {
+                            Some((true, _, apex)) => vec![apex, far],
+                            Some((false, _, apex)) => vec![near, apex],
+                            None => vec![near, far],
+                        }
                     })
                     .collect::<Vec<_>>();
                 let extended = extend_along_rulings(source, back, forward)?;
@@ -1166,6 +1200,49 @@ fn offset_surface_constructed(
         OffsetSurfaceLane::Fit,
         extended_source,
     ))
+}
+
+
+/// Where the sampled OFFSET rulings of an analytic cone or frustum meet its
+/// axis: the ruling fraction (past 1 beyond the far row, below 0 before the near
+/// row) and the point. The radial ratio above already gives the fraction (both
+/// rows and their centroids scale about the apex); what it does not give is the
+/// POINT the far row must become, so each ruling is met with the recognized axis
+/// here and the crossings are checked to be one point. `None` unless the source
+/// is a `RuledRevolution` and every ruling meets the axis within `contract`,
+/// within `contract` of one point.
+fn analytic_offset_apex(source: &NurbsSurface, samples: &[Vec<Vec3>], contract: f64) -> Option<(f64, Vec3)> {
+    let Some(crate::AnalyticSurface::RuledRevolution { frame, .. }) = crate::analytic_surface::recognize(source) else {
+        return None;
+    };
+    let radial = |point: Vec3| {
+        let offset = point.sub(frame.origin);
+        offset.sub(frame.axis.scale(offset.dot(frame.axis)))
+    };
+    let mut crossings = Vec::with_capacity(samples.len());
+    for row in samples {
+        let (near, far) = (radial(row[0]), radial(row[1]));
+        let step = far.sub(near);
+        let at = -near.dot(step) / step.dot(step);
+        if !at.is_finite() {
+            return None;
+        }
+        crossings.push((at, row[0].add(row[1].sub(row[0]).scale(at))));
+    }
+    // Averaged as offsets from the first crossing, so a part far from the world
+    // origin sums small differences, not large coordinates.
+    let count = crossings.len() as f64;
+    let at = crossings.iter().map(|(at, _)| at).sum::<f64>() / count;
+    let first = crossings.first()?.1;
+    let spread = crossings.iter().fold(Vec3::default(), |sum, (_, point)| sum.add(point.sub(first)));
+    let centre = first.add(spread.scale(1.0 / count));
+    let apex = frame.origin.add(frame.axis.scale(centre.sub(frame.origin).dot(frame.axis)));
+    // On the axis, and one point: a cylinder's near-parallel rulings give a
+    // finite `at` from rounding, and only these two readings refuse it.
+    crossings
+        .iter()
+        .all(|(_, point)| radial(*point).length() <= contract && point.sub(apex).length() <= contract)
+        .then_some((at, apex))
 }
 
 /// A linear-v surface continued along its own rulings by `back` and `forward`

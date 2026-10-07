@@ -85,6 +85,8 @@ pub fn schema() -> serde_json::Value {
     "type": "P.CO",
     "shortName": "P.CO",
     "longName": "Primitive Cone",
+    "ribbonPath": "Home/Primitives/Cone",
+    "commandSize": "Compact",
     "displayBuilder": false,
     "inputParamsSchema": {
         "id": {

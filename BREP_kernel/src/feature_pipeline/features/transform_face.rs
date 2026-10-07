@@ -449,7 +449,19 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, FeatureRefusal> {
     let moved = match crate::accept_sound(moved, "transformFace") {
         Ok(body) => body,
         Err(refusal) => {
-            match crate::recut_moved_planes_rigid(&solid, &face_ids, turn, translation) {
+            match crate::recut_moved_planes_rigid(&solid, &face_ids, turn, translation)
+                // The re-cut body passes the SAME acceptance the primitives'
+                // body did: a boolean's output is sound by construction, so
+                // this is a check and not a repair, and a body it refuses is
+                // refused here by name rather than returned.
+                .and_then(|body| {
+                    crate::accept_sound(body, "transformFace").map_err(|reason| {
+                        reason.with_message(|reason| {
+                            format!("the re-cut built a body the acceptance refused — {reason}")
+                        })
+                    })
+                })
+            {
                 Ok(body) => {
                     result.notes.push(format!(
                         "transformFace: the moved carriers could not be re-solved onto the body \
@@ -501,6 +513,8 @@ pub fn schema() -> serde_json::Value {
     "type": "TF",
     "shortName": "TF",
     "longName": "Transform Face",
+    "ribbonPath": "Home/Synchronous Modeling/Transform Face",
+    "commandSize": "Compact",
     "displayBuilder": false,
     "inputParamsSchema": {
         "id": {

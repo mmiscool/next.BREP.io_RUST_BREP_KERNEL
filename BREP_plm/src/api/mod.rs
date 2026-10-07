@@ -17,7 +17,10 @@ pub mod accounts;
 pub mod attachments;
 pub mod audit_log;
 pub mod backups;
+pub mod bake_worker;
 pub mod bom;
+mod bom_config;
+mod frontend;
 pub mod cad;
 pub mod catalog;
 pub mod family;
@@ -28,10 +31,13 @@ pub mod scripts;
 pub mod credentials;
 pub mod eco;
 pub mod settings;
+pub mod setup;
+pub mod workflow;
 pub mod thumbnails;
 pub mod sourcing;
 pub mod store;
 pub mod workspace;
+pub mod native_import;
 
 use std::sync::Arc;
 
@@ -40,7 +46,7 @@ use std::net::SocketAddr;
 use axum::extract::{ConnectInfo, Request, State};
 use axum::http::{header, HeaderMap, Method, StatusCode};
 use axum::middleware::Next;
-use axum::response::{Html, IntoResponse, Response};
+use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, patch, post, put};
 use axum::Router;
 
@@ -64,9 +70,8 @@ pub type Shared = Arc<Db>;
 pub fn router(db: Shared) -> Router {
     Router::new()
         // -- the page ------------------------------------------------------
-        .route("/", get(index))
-        .route("/app.js", get(script))
-        .route("/style.css", get(stylesheet))
+        .route("/", get(frontend::index))
+        .route("/*path", get(frontend::file))
         // -- the hosted CAD app and the server describing itself -----------
         .route("/cad", get(cad::entry))
         .route("/cad/", get(cad::entry))
@@ -74,6 +79,15 @@ pub fn router(db: Shared) -> Router {
         .route("/cad/app/", get(cad::entry))
         .route("/cad/app/*path", get(cad::file))
         .route("/cad/config", get(cad::config))
+        .route("/api/setup/import", post(setup::import))
+        .route("/api/setup/kicad-libraries", get(setup::kicad_libraries))
+        .route("/api/setup/kicad-part-type", post(setup::kicad_part_type))
+        .route("/api/setup/kicad-taxonomy", post(setup::kicad_taxonomy))
+        .route("/api/workflows", get(workflow::definitions).post(workflow::save))
+        .route("/api/workflow-runs", get(workflow::runs).post(workflow::start))
+        .route("/api/workflow-runs/:id", get(workflow::detail))
+        .route("/api/workflow-runs/:id/actions", post(workflow::act))
+        .route("/api/workflow-runs/:id/control", post(workflow::control))
         // -- accounts ------------------------------------------------------
         .route("/api/login", post(accounts::login))
         .route("/api/logout", post(accounts::logout))
@@ -100,6 +114,14 @@ pub fn router(db: Shared) -> Router {
             get(accounts::list_part_types).post(accounts::create_part_type),
         )
         .route("/api/part-types/:id", patch(accounts::update_part_type))
+        .route("/api/part-types/:id/fields", get(bom_config::type_fields).put(bom_config::set_type_fields))
+        .route("/api/bom/configuration", get(bom_config::configuration))
+        .route("/api/bom/occurrence-fields", axum::routing::put(bom_config::set_occurrence_fields))
+        .route("/api/bom/layouts", post(bom_config::save_layout))
+        .route("/api/bom/layouts/:id", delete(bom_config::delete_layout))
+        .route("/api/bom/selection", axum::routing::put(bom_config::select_layout))
+        .route("/api/parts/:id/revisions/:rev/attributes", get(bom_config::revision_attributes).patch(bom_config::patch_revision_attributes))
+        .route("/api/parts/:id/revisions/:rev/occurrences", patch(bom_config::patch_occurrences))
         // -- parts and revisions -------------------------------------------
         .route("/api/parts", get(parts::list_parts).post(parts::create_part))
         .route("/api/parts/:id", get(parts::get_part).patch(parts::update_part))
@@ -136,6 +158,8 @@ pub fn router(db: Shared) -> Router {
             get(bom::get_uses).put(bom::put_uses),
         )
         .route("/api/parts/:id/revisions/:rev/bom", get(bom::get_bom))
+        .route("/api/parts/:id/revisions/:rev/import", put(native_import::write))
+        .route("/api/import/validate", post(native_import::validate))
         .route("/api/parts/:id/bom/diff", get(bom::diff))
         .route("/api/parts/:id/where-used", get(bom::where_used))
         .route("/api/parts/:id/replace", post(bom::replace))
@@ -153,8 +177,9 @@ pub fn router(db: Shared) -> Router {
         .route("/api/parts/:id/thumbnail", get(thumbnails::get_part))
         .route(
             "/api/attachments/:id",
-            get(attachments::download).delete(attachments::remove),
+            get(attachments::download).put(attachments::replace).delete(attachments::remove),
         )
+        .route("/api/attachments/:id/info", get(attachments::info))
         // -- backups and exports (administrators) ---------------------------
         .route("/api/admin/backups", get(backups::status).post(backups::run))
         .route("/api/admin/backups/file/:name", get(backups::saved_file))
@@ -167,6 +192,11 @@ pub fn router(db: Shared) -> Router {
         .route("/api/parts/:id/template", get(family::template))
         .route("/api/parts/:id/spin-out", post(family::spin_out))
         .route("/api/bake/jobs", get(family::jobs))
+        .route("/api/bake/jobs/progress", post(family::progress))
+        .route("/api/bake/worker", get(bake_worker::status))
+        .route("/api/bake/worker/start", post(bake_worker::start))
+        .route("/api/bake/worker/stop", post(bake_worker::stop))
+        .route("/api/bake/resave", post(family::resave))
         .route("/api/bake/next", post(family::next))
         .route("/api/bake/jobs/:id/claim", post(family::claim))
         .route("/api/bake/jobs/:id/renew", post(family::renew))
@@ -241,30 +271,6 @@ pub fn router(db: Shared) -> Router {
         .route("/api/workspace/entries/:id/promote", post(workspace::promote))
         .layer(axum::middleware::from_fn_with_state(Arc::clone(&db), guard))
         .with_state(db)
-}
-
-// ===========================================================================
-// The page
-// ===========================================================================
-
-async fn index() -> Html<&'static str> {
-    Html(include_str!("../../web/index.html"))
-}
-
-async fn script() -> Response {
-    (
-        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
-        include_str!("../../web/app.js"),
-    )
-        .into_response()
-}
-
-async fn stylesheet() -> Response {
-    (
-        [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
-        include_str!("../../web/style.css"),
-    )
-        .into_response()
 }
 
 // ===========================================================================
@@ -426,7 +432,15 @@ pub async fn guard(State(db): State<Shared>, request: Request, next: Next) -> Re
     } else {
         None
     };
+    let inline_document = response.status().is_success()
+        && (path.starts_with("/api/attachments/") || path.starts_with("/api/workspace/entries/"))
+        && response.headers().get(header::CONTENT_DISPOSITION).and_then(|v| v.to_str().ok()).is_some_and(|v| v.starts_with("inline;"))
+        && response.headers().get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).is_some_and(|mime| mime == "application/pdf");
     security::security_headers(response.headers_mut(), secure, api);
+    if inline_document {
+        response.headers_mut().insert(header::CONTENT_SECURITY_POLICY, axum::http::HeaderValue::from_static("default-src 'none'; frame-ancestors 'self'; base-uri 'none'"));
+        response.headers_mut().insert("x-frame-options", axum::http::HeaderValue::from_static("SAMEORIGIN"));
+    }
     if let Some(policy) = own_policy {
         response.headers_mut().insert(header::CONTENT_SECURITY_POLICY, policy);
     }

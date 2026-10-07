@@ -58,6 +58,8 @@ pub fn schema() -> serde_json::Value {
     "type": "P.CU",
     "shortName": "P.CU",
     "longName": "Primitive Cube",
+    "ribbonPath": "Home/Primitives/Cube",
+    "commandSize": "Compact",
     "displayBuilder": false,
     "inputParamsSchema": {
         "id": {

@@ -30,6 +30,8 @@ pub fn schema() -> serde_json::Value {
     "type": "SM.HEM",
     "shortName": "SM.HEM",
     "longName": "SM Hem",
+    "ribbonPath": "Home/Sheet Metal/Hem",
+    "commandSize": "Compact",
     "displayBuilder": false,
     "inputParamsSchema": {
         "id": {

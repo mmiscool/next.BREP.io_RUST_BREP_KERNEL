@@ -140,6 +140,8 @@ pub fn schema() -> serde_json::Value {
     "type": "XFORM",
     "shortName": "XFORM",
     "longName": "Transform",
+    "ribbonPath": "Home/Synchronous Modeling/Transform",
+    "commandSize": "Compact",
     "displayBuilder": false,
     "inputParamsSchema": {
         "id": {

@@ -8,7 +8,7 @@
 //!
 //! CPU ray/screen-space testing over the scene's display buffers: exact,
 //! deterministic, identical on native and wasm, and cheap at CAD face counts
-//! (per-face triangle ranges give a bbox reject before any triangle test).
+//! (dense meshes use cached kernel BVHs before exact triangle tests).
 
 use crate::geometry2d::point_segment_distance;
 
@@ -107,11 +107,24 @@ pub fn pick(
     let persp = matches!(camera.projection, Projection::Perspective { .. });
 
     let mut hits: Vec<PickCandidate> = Vec::new();
+    let mut triangles = Vec::new();
     for solid in scene.solids() {
         if !solid.visible {
             continue;
         }
-        pick_faces(solid, camera, &ray, forward, options, &mut hits);
+        if ray_hits_aabb(&ray, &solid.bbox) {
+            // Small component meshes cost less to scan than to index. Dense
+            // copper/silkscreen displays dominate UNO hover time without this
+            // broad phase, even though they contain only a handful of faces.
+            let candidates = if solid.mesh.indices.len() / 3 > 128 {
+                triangles.clear();
+                scene.pick_triangles(solid, &ray, &mut triangles);
+                Some(triangles.as_slice())
+            } else {
+                None
+            };
+            pick_faces(solid, camera, &ray, forward, options, candidates, &mut hits);
+        }
         pick_edges(solid, camera, x, y, forward, persp, options, &mut hits);
         pick_vertices(solid, camera, x, y, forward, persp, options, &mut hits);
     }
@@ -170,12 +183,14 @@ fn view_depth(camera: &ViewCamera, forward: [f64; 3], point: [f64; 3]) -> f64 {
     dot3(sub3(point, camera.eye), forward)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn pick_faces(
     solid: &SolidDisplay,
     camera: &ViewCamera,
     ray: &Ray,
     forward: [f64; 3],
     options: &PickOptions,
+    candidates: Option<&[usize]>,
     out: &mut Vec<PickCandidate>,
 ) {
     if solid.mesh.indices.is_empty() {
@@ -198,7 +213,8 @@ fn pick_faces(
         let mut best: Option<(f64, [f64; 3])> = None;
         let start = face.tri_start as usize;
         let end = start + face.tri_count as usize;
-        for tri in start..end.min(indices.len() / 3) {
+        let end = end.min(indices.len() / 3);
+        let mut test_triangle = |tri: usize| {
             let i0 = indices[tri * 3] as usize;
             let i1 = indices[tri * 3 + 1] as usize;
             let i2 = indices[tri * 3 + 2] as usize;
@@ -209,6 +225,20 @@ fn pick_faces(
                 let point = add3(ray.origin, scale3(ray.dir, t));
                 if best.map(|(bt, _)| t < bt).unwrap_or(true) {
                     best = Some((t, point));
+                }
+            }
+        };
+        match candidates {
+            Some(triangles) => {
+                let first = triangles.partition_point(|&tri| tri < start);
+                let last = triangles.partition_point(|&tri| tri < end);
+                for &tri in &triangles[first..last] {
+                    test_triangle(tri);
+                }
+            }
+            None => {
+                for tri in start..end {
+                    test_triangle(tri);
                 }
             }
         }

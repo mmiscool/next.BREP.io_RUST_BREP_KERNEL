@@ -1,4 +1,5 @@
 use super::*;
+use crate::{KernelStage, OrRefuse};
 
 /// A midpoint alone cannot distinguish a straight surface ruling from a curved
 /// profile that happens to cross its endpoint chord at half-span.  Sample each
@@ -27,7 +28,9 @@ pub(in crate::step_import) fn build_solid(resolver: &Resolver, manifold_ref: usi
     if debug {
         eprintln!("SOLID #{manifold_ref} BEGIN");
     }
-    let result = build_solid_inner(resolver, manifold_ref, false).map(|(solid, _, _)| solid);
+    let result = build_solid_inner(resolver, manifold_ref, false)
+        .map(|(solid, _, _)| solid)
+        .map_err(|error| error.to_string());
     if let Some(started) = started {
         eprintln!(
             "SOLID #{manifold_ref} END {:?} ok={}",
@@ -117,7 +120,28 @@ fn brep_with_voids_volume_tolerance(solid: &BrepSolid) -> f64 {
     256.0 * f64::EPSILON * face_count * coordinate_scale.max(extent) * extent * extent
 }
 
-fn certify_brep_with_voids_topology(solid: &BrepSolid) -> Result<(), String> {
+/// The slug every `BREP_WITH_VOIDS` certification refuses under: the file's
+/// shells are not the disjoint closed shells the entity promises
+/// (`RefusalClass::InvalidInput`). Classified at the origin since
+/// 2026-10-03; every message is the text it always was.
+const BREP_WITH_VOIDS_INPUT: &str = "brep_with_voids";
+
+fn brep_with_voids_input(message: String) -> KernelRefusal {
+    KernelRefusal::input(KernelStage::Validate, BREP_WITH_VOIDS_INPUT, message)
+}
+
+/// `validate()`'s verdict on a reconstructed body, typed as the boolean types
+/// its own (`RefusalClass::InvalidResultTopology`); the message is the text
+/// the importer always produced.
+fn validation_refusal(issues: usize, message: String) -> KernelRefusal {
+    KernelRefusal::new(
+        crate::RefusalClass::InvalidResultTopology { issues: issues as u32 },
+        KernelStage::Validate,
+        message,
+    )
+}
+
+fn certify_brep_with_voids_topology(solid: &BrepSolid) -> Result<(), KernelRefusal> {
     let edges: HashMap<u64, &EdgeRecord> = solid.edges.iter().map(|edge| (edge.id, edge)).collect();
     let mut claimed_edges = HashSet::default();
     let mut claimed_vertices = HashSet::default();
@@ -135,19 +159,19 @@ fn certify_brep_with_voids_topology(solid: &BrepSolid) -> Result<(), String> {
             .iter()
             .any(|edge_id| claimed_edges.contains(edge_id))
         {
-            return Err(format!(
+            return Err(brep_with_voids_input(format!(
                 "step_import: BREP_WITH_VOIDS shell {shell_index} shares an edge reference with another shell"
-            ));
+            )));
         }
         let mut shell_vertices = HashSet::default();
         for (edge_id, senses) in &uses {
             let edge = edges.get(edge_id).ok_or_else(|| {
-                format!("step_import: BREP_WITH_VOIDS shell references missing edge {edge_id}")
+                brep_with_voids_input(format!("step_import: BREP_WITH_VOIDS shell references missing edge {edge_id}"))
             })?;
             if !edge.degenerate && (senses.len() != 2 || senses[0] == senses[1]) {
-                return Err(format!(
+                return Err(brep_with_voids_input(format!(
                     "step_import: BREP_WITH_VOIDS shell {shell_index} edge {edge_id} has incidence {senses:?}"
-                ));
+                )));
             }
             shell_vertices.insert(edge.start_vertex_id);
             shell_vertices.insert(edge.end_vertex_id);
@@ -156,9 +180,9 @@ fn certify_brep_with_voids_topology(solid: &BrepSolid) -> Result<(), String> {
             .iter()
             .any(|vertex_id| claimed_vertices.contains(vertex_id))
         {
-            return Err(format!(
+            return Err(brep_with_voids_input(format!(
                 "step_import: BREP_WITH_VOIDS shell {shell_index} shares a vertex reference with another shell"
-            ));
+            )));
         }
         claimed_edges.extend(shell_edges);
         claimed_vertices.extend(shell_vertices);
@@ -166,7 +190,7 @@ fn certify_brep_with_voids_topology(solid: &BrepSolid) -> Result<(), String> {
     Ok(())
 }
 
-pub(in crate::step_import) fn certify_brep_with_voids_containment(solid: &BrepSolid) -> Result<(), String> {
+pub(in crate::step_import) fn certify_brep_with_voids_containment(solid: &BrepSolid) -> Result<(), KernelRefusal> {
     let edge_map: HashMap<u64, &EdgeRecord> =
         solid.edges.iter().map(|edge| (edge.id, edge)).collect();
     let vertex_map: HashMap<u64, Vec3> = solid
@@ -207,8 +231,8 @@ pub(in crate::step_import) fn certify_brep_with_voids_containment(solid: &BrepSo
         Ok((lo, hi))
     };
 
-    let outer_ids = shell_vertex_ids(&solid.shells[0])?;
-    let (outer_lo, outer_hi) = bounds(&outer_ids)?;
+    let outer_ids = shell_vertex_ids(&solid.shells[0]).map_err(brep_with_voids_input)?;
+    let (outer_lo, outer_hi) = bounds(&outer_ids).map_err(brep_with_voids_input)?;
     let extent = outer_hi.sub(outer_lo).length();
     let tolerance = (extent * 1e-9).max(1e-12);
     // Pick the containment-certification lane. A straight-edged polyhedron admits
@@ -245,17 +269,17 @@ pub(in crate::step_import) fn certify_brep_with_voids_containment(solid: &BrepSo
             else {
                 unreachable!("all faces planar in the polyhedral lane");
             };
-            let mut outward = u_dir.cross(*v_dir).normalized()?;
+            let mut outward = u_dir.cross(*v_dir).normalized().or_refuse(KernelStage::Validate, "brep_with_voids_normal")?;
             if !face.same_sense {
                 outward = outward.scale(-1.0);
             }
             for vertex_id in &outer_ids {
                 let signed_distance = vertex_map[vertex_id].sub(*origin).dot(outward);
                 if signed_distance > tolerance {
-                    return Err(format!(
+                    return Err(brep_with_voids_input(format!(
                         "step_import: BREP_WITH_VOIDS outer shell is not convex at face {} vertex {vertex_id} (outside halfspace by {signed_distance})",
                         face.id
-                    ));
+                    )));
                 }
             }
         }
@@ -272,11 +296,11 @@ pub(in crate::step_import) fn certify_brep_with_voids_containment(solid: &BrepSo
     // vertex/edge sample. `classify_point` rebuilds this per call, which for a
     // curved void (many samples) is O(samples x outer-faces) and can blow the
     // import timeout; a single build gives byte-identical results far faster.
-    let outer_classifier = crate::SolidClassifier::new(&outer, tolerance)?;
+    let outer_classifier = crate::SolidClassifier::new(&outer, tolerance).or_refuse(KernelStage::Validate, "brep_with_voids_classifier")?;
     let mut void_bounds = Vec::new();
     for (shell_index, shell) in solid.shells.iter().enumerate().skip(1) {
-        let ids = shell_vertex_ids(shell)?;
-        let (lo, hi) = bounds(&ids)?;
+        let ids = shell_vertex_ids(shell).map_err(brep_with_voids_input)?;
+        let (lo, hi) = bounds(&ids).map_err(brep_with_voids_input)?;
         let bbox_clearances = [
             lo.x - outer_lo.x,
             outer_hi.x - hi.x,
@@ -297,14 +321,14 @@ pub(in crate::step_import) fn certify_brep_with_voids_containment(solid: &BrepSo
                 && hi.y < outer_hi.y - tolerance
                 && hi.z < outer_hi.z - tolerance;
             if !strictly_inside_box {
-                return Err(format!(
+                return Err(brep_with_voids_input(format!(
                     "step_import: BREP_WITH_VOIDS void {shell_index} is not strictly inside the outer bounds"
-                ));
+                )));
             }
         }
         for vertex_id in &ids {
             let point = vertex_map[vertex_id];
-            let class = outer_classifier.classify(point)?.class;
+            let class = outer_classifier.classify(point).or_refuse(KernelStage::Validate, "brep_with_voids_classify")?.class;
             if class != crate::PointClass::In {
                 let projection_distance = outer.shells[0]
                     .faces
@@ -315,9 +339,9 @@ pub(in crate::step_import) fn certify_brep_with_voids_containment(solid: &BrepSo
                             .map(|projection| projection.distance)
                     })
                     .fold(f64::INFINITY, f64::min);
-                return Err(format!(
+                return Err(brep_with_voids_input(format!(
                     "step_import: BREP_WITH_VOIDS void {shell_index} vertex {vertex_id} at {point:?} is {class:?} relative to outer shell (classifier tolerance {tolerance}, nearest carrier projection {projection_distance}, bbox clearances {bbox_clearances:?})"
-                ));
+                )));
             }
         }
         // Curved lane only: a curved void edge can bow through the outer boundary
@@ -342,11 +366,11 @@ pub(in crate::step_import) fn certify_brep_with_voids_containment(solid: &BrepSo
                             let Ok(point) = edge.curve.evaluate(t) else {
                                 continue;
                             };
-                            if outer_classifier.classify(point)?.class == crate::PointClass::Out {
-                                return Err(format!(
+                            if outer_classifier.classify(point).or_refuse(KernelStage::Validate, "brep_with_voids_classify")?.class == crate::PointClass::Out {
+                                return Err(brep_with_voids_input(format!(
                                     "step_import: BREP_WITH_VOIDS void {shell_index} edge {} bows outside the outer shell",
                                     coedge.edge_id
-                                ));
+                                )));
                             }
                         }
                     }
@@ -371,11 +395,11 @@ pub(in crate::step_import) fn certify_brep_with_voids_containment(solid: &BrepSo
                     || a_hi.z + tolerance < b_lo.z
                     || b_hi.z + tolerance < a_lo.z;
                 if !separated {
-                    return Err(format!(
+                    return Err(brep_with_voids_input(format!(
                         "step_import: BREP_WITH_VOIDS void bounds {} and {} overlap",
                         first + 1,
                         second + 1
-                    ));
+                    )));
                 }
             }
         }
@@ -384,7 +408,9 @@ pub(in crate::step_import) fn certify_brep_with_voids_containment(solid: &BrepSo
 }
 
 pub(in crate::step_import) fn build_brep_with_voids(resolver: &Resolver, body_ref: usize) -> Result<BrepSolid, String> {
-    build_brep_with_voids_captured(resolver, body_ref, false).map(|(solid, _, _)| solid)
+    build_brep_with_voids_captured(resolver, body_ref, false)
+        .map(|(solid, _, _)| solid)
+        .map_err(|error| error.to_string())
 }
 
 /// [`build_brep_with_voids`], optionally carrying the per-edge capture.
@@ -392,7 +418,7 @@ pub(in crate::step_import) fn build_brep_with_voids_captured(
     resolver: &Resolver,
     body_ref: usize,
     capture: bool,
-) -> Result<(BrepSolid, Option<readings::TrimCapture>, Vec<readings::BoundedTrim>), String> {
+) -> Result<(BrepSolid, Option<readings::TrimCapture>, readings::BodyReadings), StepBodyError> {
     let args = resolver
         .get(body_ref)?
         .find("BREP_WITH_VOIDS")
@@ -406,7 +432,7 @@ pub(in crate::step_import) fn build_brep_with_voids_captured(
         .ok_or("step_import: BREP_WITH_VOIDS missing void shell list")?
         .as_list()?;
     if void_values.is_empty() {
-        return Err("step_import: BREP_WITH_VOIDS has no void shells".into());
+        return Err(brep_with_voids_input("step_import: BREP_WITH_VOIDS has no void shells".into()).into());
     }
 
     let mut shell_specs = vec![(outer_ref, true)];
@@ -432,12 +458,12 @@ pub(in crate::step_import) fn build_brep_with_voids_captured(
         } else if orientation.enum_is("F") {
             false
         } else {
-            return Err("step_import: ORIENTED_CLOSED_SHELL orientation is not .T./.F.".into());
+            return Err(brep_with_voids_input("step_import: ORIENTED_CLOSED_SHELL orientation is not .T./.F.".into()).into());
         };
         if !shell_refs.insert(base_ref) {
-            return Err(format!(
+            return Err(brep_with_voids_input(format!(
                 "step_import: BREP_WITH_VOIDS repeats CLOSED_SHELL #{base_ref}"
-            ));
+            )).into());
         }
         shell_specs.push((base_ref, same_sense));
     }
@@ -449,9 +475,9 @@ pub(in crate::step_import) fn build_brep_with_voids_captured(
         for face in &faces {
             let face_ref = face.as_ref_id()?;
             if !all_face_refs.insert(face_ref) {
-                return Err(format!(
+                return Err(brep_with_voids_input(format!(
                     "step_import: BREP_WITH_VOIDS face #{face_ref} belongs to multiple shells"
-                ));
+                )).into());
             }
         }
         face_lists.push(faces);
@@ -471,6 +497,8 @@ pub(in crate::step_import) fn build_brep_with_voids_captured(
         supplied_report: SuppliedReport::default(),
         bounded: Vec::new(),
         readings: capture.then(readings::TrimCapture::default),
+        face_refs: HashMap::default(),
+        reconciled_edges: HashSet::default(),
     };
     let mut shells = Vec::with_capacity(face_lists.len());
     for ((_, same_sense), faces) in shell_specs.iter().zip(&face_lists) {
@@ -487,6 +515,7 @@ pub(in crate::step_import) fn build_brep_with_voids_captured(
     let solid_id = builder.fresh();
     let captured = builder.readings.take();
     let bounded = std::mem::take(&mut builder.bounded);
+    let closure_context = builder.closure_context();
     let mut solid = BrepSolid {
         mass_properties_cache: Default::default(),
         id: solid_id,
@@ -501,9 +530,11 @@ pub(in crate::step_import) fn build_brep_with_voids_captured(
     let issues = solid.validate();
     if !issues.is_empty() {
         dump_invalid_solid_for_triage(&solid);
-        return Err(format!(
-            "step_import: reconstructed BREP_WITH_VOIDS failed validation: {issues:?}"
-        ));
+        return Err(validation_refusal(
+            issues.len(),
+            format!("step_import: reconstructed BREP_WITH_VOIDS failed validation: {issues:?}"),
+        )
+        .into());
     }
     let tolerance = brep_with_voids_volume_tolerance(&solid);
     let _caller = crate::mass_caller("step_import.brep_with_voids");
@@ -516,9 +547,9 @@ pub(in crate::step_import) fn build_brep_with_voids_captured(
         .iter()
         .any(|volume| !volume.is_finite() || volume.abs() <= tolerance)
     {
-        return Err(format!(
+        return Err(brep_with_voids_input(format!(
             "step_import: BREP_WITH_VOIDS shell volume is below tolerance {tolerance}: {shell_volumes:?}"
-        ));
+        )).into());
     }
     let authored_roles = shell_volumes[0] > tolerance
         && shell_volumes
@@ -536,27 +567,32 @@ pub(in crate::step_import) fn build_brep_with_voids_captured(
             *volume = -*volume;
         }
     } else if !authored_roles {
-        return Err(format!(
+        return Err(brep_with_voids_input(format!(
             "step_import: BREP_WITH_VOIDS has mixed outer/void orientations {shell_volumes:?}"
-        ));
+        )).into());
     }
     certify_brep_with_voids_containment(&solid)?;
     let outer_volume = shell_volumes[0];
     let net_volume = shell_volumes.iter().sum::<f64>();
     if outer_volume <= tolerance || !net_volume.is_finite() || net_volume <= tolerance {
-        return Err(format!(
+        return Err(brep_with_voids_input(format!(
             "step_import: BREP_WITH_VOIDS invalid outer/net volume {outer_volume}/{net_volume} (tolerance {tolerance})"
-        ));
+        )).into());
     }
     solid.genus = euler_genus(&solid);
-    Ok((solid, captured, bounded))
+    // The closure gate, after every other acceptance check: a body whose
+    // shells' trims do not enclose zero vector area is refused, typed
+    // (`builder/closure.rs`); the capture lane holds the refusal and keeps the
+    // body so the residual can be attributed.
+    let closure = closure_context.certify_shell_closure(&solid, outer_ref, capture)?;
+    Ok((solid, captured, readings::BodyReadings { bounded, closure }))
 }
 
 pub(in crate::step_import) fn build_solid_inner(
     resolver: &Resolver,
     manifold_ref: usize,
     capture: bool,
-) -> Result<(BrepSolid, Option<readings::TrimCapture>, Vec<readings::BoundedTrim>), String> {
+) -> Result<(BrepSolid, Option<readings::TrimCapture>, readings::BodyReadings), StepBodyError> {
     let entity = resolver.get(manifold_ref)?;
     // MANIFOLD_SOLID_BREP(name, #shell) and FACETED_BREP(name, #shell) share the
     // same shape: a single CLOSED_SHELL as the second argument.
@@ -575,7 +611,9 @@ pub(in crate::step_import) fn build_solid_inner(
 /// reaches the same validation gate and is rejected there, so this stays safe to
 /// call on any shell reference.
 pub(in crate::step_import) fn build_solid_from_shell(resolver: &Resolver, shell_ref: usize) -> Result<BrepSolid, String> {
-    build_solid_from_shell_captured(resolver, shell_ref, false).map(|(solid, _, _)| solid)
+    build_solid_from_shell_captured(resolver, shell_ref, false)
+        .map(|(solid, _, _)| solid)
+        .map_err(|error| error.to_string())
 }
 
 /// [`build_solid_from_shell`], optionally carrying what the importer did to
@@ -584,7 +622,7 @@ pub(in crate::step_import) fn build_solid_from_shell_captured(
     resolver: &Resolver,
     shell_ref: usize,
     capture: bool,
-) -> Result<(BrepSolid, Option<readings::TrimCapture>, Vec<readings::BoundedTrim>), String> {
+) -> Result<(BrepSolid, Option<readings::TrimCapture>, readings::BodyReadings), StepBodyError> {
     let shell_entity = resolver.get(shell_ref)?;
     let face_refs = shell_entity
         .find("CLOSED_SHELL")
@@ -608,6 +646,8 @@ pub(in crate::step_import) fn build_solid_from_shell_captured(
         supplied_report: SuppliedReport::default(),
         bounded: Vec::new(),
         readings: capture.then(readings::TrimCapture::default),
+        face_refs: HashMap::default(),
+        reconciled_edges: HashSet::default(),
     };
 
     // Phase 1: resolve every face's surface + coedge bounds (this also builds
@@ -665,6 +705,7 @@ pub(in crate::step_import) fn build_solid_from_shell_captured(
     let solid_id = builder.fresh();
     let captured = builder.readings.take();
     let bounded = std::mem::take(&mut builder.bounded);
+    let closure_context = builder.closure_context();
     let mut solid = BrepSolid {
         mass_properties_cache: Default::default(),
         id: solid_id,
@@ -691,10 +732,11 @@ pub(in crate::step_import) fn build_solid_from_shell_captured(
         // are now REPAIRED structurally (coincident parallel edges credited
         // in the Euler count; pinched vertices split into their fans), so
         // any residual issue is a genuine import defect.
-        return Err(format!(
-            "step_import: reconstructed solid failed validation: {:?}",
-            issues
-        ));
+        return Err(validation_refusal(
+            issues.len(),
+            format!("step_import: reconstructed solid failed validation: {:?}", issues),
+        )
+        .into());
     }
     // Vendor face senses can leave the whole shell pointing inward; a closed
     // shell's material side is defined by its signed volume, so restore the
@@ -706,11 +748,17 @@ pub(in crate::step_import) fn build_solid_from_shell_captured(
         }
     }
     lap("signed_volume", &mut lap_started, &mut laps);
+    // The closure gate, after validation and the orientation flip: a body
+    // whose shell's trims do not enclose zero vector area is refused, typed
+    // (`builder/closure.rs`); the capture lane holds the refusal and keeps the
+    // body so the residual can be attributed edge by edge.
+    let closure = closure_context.certify_shell_closure(&solid, shell_ref, capture)?;
+    lap("closure", &mut lap_started, &mut laps);
     if profile {
         let line: Vec<String> = laps.iter().map(|(name, ms)| format!("{name}={ms:.2}")).collect();
         eprintln!("step_import.profile shell=#{shell_ref} faces={} {}", face_refs.len(), line.join(" "));
     }
-    Ok((solid, captured, bounded))
+    Ok((solid, captured, readings::BodyReadings { bounded, closure }))
 }
 
 /// Debug escape hatch shared by BOTH validation gates: dump the invalid solid
@@ -753,7 +801,10 @@ fn dump_invalid_solid_for_triage(solid: &BrepSolid) {
 /// pinch repair folded in: the duplicate-vertex weld can join two umbrella
 /// fans at one point (an odd Euler characteristic no local check sees);
 /// splitting the fans restores the manifold before judging the solid.
-fn finalize_imported_solid(mut solid: BrepSolid) -> Result<BrepSolid, String> {
+fn finalize_imported_solid(mut solid: BrepSolid) -> Result<BrepSolid, StepBodyError> {
+    // The split's refusal is a `KernelRefusal`; until 2026-10-03 the `?` here
+    // lost its class to `String`. It rides typed now, and the body lanes
+    // count it as a failed body exactly as they counted its text.
     if crate::split_pinched_vertices(&mut solid)? > 0 {
         solid.genus = euler_genus(&solid);
     }

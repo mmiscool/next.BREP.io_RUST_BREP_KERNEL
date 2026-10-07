@@ -2561,6 +2561,7 @@ fn offset_shell_impl(
             None => error,
         }
     })?;
+    crate::offset_retrim::reconstruct_analytic_shell(&mut solid)?;
     if rim_bands + pair_rims > 0 || !inward_extended_walls.is_empty() {
         // Rim welds and extended reflex walls join independently-oriented skins;
         // put the whole finalized manifold on one normal convention so the

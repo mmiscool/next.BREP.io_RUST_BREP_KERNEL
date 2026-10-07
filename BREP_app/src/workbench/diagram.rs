@@ -13,8 +13,8 @@ use super::ecad::{ecad_button, no_features};
 use super::{Workbench, WorkbenchButton};
 
 static BUTTONS: &[WorkbenchButton] = &[
-    ecad_button!("diagram.sheet.tool.select", "\u{1F446}", "Select", toggle),
-    ecad_button!("diagram.sheet.place.rotate", "\u{E083}", "Rotate 90°", command),
+    ecad_button!("diagram.sheet.tool.select", "\u{1F446}", "Select", "Home/Diagram/Select", toggle),
+    ecad_button!("diagram.sheet.place.rotate", "\u{E083}", "Rotate 90°", "Home/Diagram/Rotate 90°", command),
 ];
 
 pub static DIAGRAM: Workbench = Workbench {

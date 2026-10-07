@@ -26,6 +26,7 @@ fn assemble_fragments_impl(
         edge_use_counts: HashMap::default(),
         edge_first_forward: HashMap::default(),
         edge_boundary_key: HashMap::default(),
+            imprint_edges: Default::default(),
         next_vertex_id: 1,
         next_edge_id: 1,
         next_coedge_id: 1,
@@ -209,14 +210,34 @@ fn assemble_fragments_impl(
         );
     }
     if allow_open {
-        return Ok(BrepSolid {
+        let mut solid = BrepSolid {
             mass_properties_cache: Default::default(),
             id: 1,
             vertices: assembler.vertices,
             edges: assembler.edges,
             shells,
             genus: 0,
-        });
+        };
+        // EDGE RECONSTRUCTION on the open path (`edges.rs`): the offset
+        // shell's welded edges stand off their carriers from here on
+        // (2026-09-30 record §8: arc 40 3.2e-6 off the offset ball while its
+        // trims sit on it). Vertices and trims are untouched, so no mass
+        // property moves; an open sheet has no validate() gate to re-run and
+        // the pass's own bounds decide each edge.
+        let stage_started = Instant::now();
+        let settled = settle_vertices_onto_carriers(&mut solid, tolerance, &assembler.imprint_edges)?;
+        let rebuilt = reconstruct_edges_from_carriers(&mut solid, tolerance)?;
+        let trims = close_trim_loop_joints(&mut solid, tolerance)?;
+        if profile {
+            eprintln!(
+                "assemble.edges_ms={:.2} settled={} rebuilt={} trims={}",
+                stage_started.elapsed().as_secs_f64() * 1_000.0,
+                settled.len(),
+                rebuilt.len(),
+                trims.len()
+            );
+        }
+        return Ok(solid);
     }
     let face_count: i64 = shells.iter().map(|shell| shell.faces.len() as i64).sum();
     let hole_count: i64 = shells
@@ -463,7 +484,7 @@ fn assemble_fragments_impl(
         genus: numerator / 2,
     };
     let stage_started = Instant::now();
-    let mut solid = merge_curve_continuation_edges(&solid, tolerance).or_refuse(KernelStage::Sew, "merge_curve_continuation_edges")?;
+    let mut solid = merge_curve_continuation_edges(&solid, tolerance)?;
     if profile {
         eprintln!(
             "assemble.continuation_ms={:.2}",
@@ -577,6 +598,47 @@ fn assemble_fragments_impl(
                     issues.len()
                 );
             }
+        }
+    }
+    if issues.is_empty() {
+        // EDGE RECONSTRUCTION (repair-not-refuse; `edges.rs`): a two-use edge
+        // that stands off one of its carriers is replaced by the exact image
+        // of a planar use's trim with its ends pinned to the vertices.
+        // validate() holds edges to a 4e-3 contract and never sees these
+        // standoffs, so this runs on the validated result; a set the
+        // validator then disagrees with is put back whole.
+        let stage_started = Instant::now();
+        let settled = settle_vertices_onto_carriers(&mut solid, tolerance, &assembler.imprint_edges)?;
+        let rebuilt = reconstruct_edges_from_carriers(&mut solid, tolerance)?;
+        let trims = close_trim_loop_joints(&mut solid, tolerance)?;
+        // The DERIVED inherited-trim challenger (`inherited.rs`): output uses
+        // of operand edges only, restored first if the stage goes back.
+        let inherited = super::inherited::challenge_inherited_trims(&mut solid, tolerance, &assembler.edge_boundary_key, &assembler.imprint_edges)?;
+        if !rebuilt.is_empty() || !settled.is_empty() || !trims.is_empty() || !inherited.is_empty() {
+            let after = solid.validate();
+            let count = rebuilt.len();
+            if after.is_empty() {
+                if std::env::var("BREP_DEBUG_BOOL").is_ok() {
+                    eprintln!("boolean assembly settled {} vertices and reconstructed {count} edges from their planar trims; {} inherited trims refit", settled.len(), inherited.len());
+                }
+            } else {
+                restore_trims(&mut solid, inherited);
+                restore_trims(&mut solid, trims);
+                restore_edges(&mut solid, rebuilt);
+                restore_vertices(&mut solid, settled);
+                if std::env::var("BREP_DEBUG_BOOL").is_ok() {
+                    eprintln!(
+                        "boolean assembly restored {count} reconstructed edges: validate() reported {} issues on them",
+                        after.len()
+                    );
+                }
+            }
+        }
+        if profile {
+            eprintln!(
+                "assemble.edges_ms={:.2}",
+                stage_started.elapsed().as_secs_f64() * 1_000.0
+            );
         }
     }
     if !issues.is_empty() {

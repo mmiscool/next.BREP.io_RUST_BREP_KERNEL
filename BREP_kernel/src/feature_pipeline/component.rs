@@ -312,6 +312,7 @@ pub fn update_component_transform(
         .get_mut(id)
         .expect("record fetched above")
         .transform = new_transform;
+    super::mark_component_cache_posed(id);
 
     // The component's ports (and their published entities) follow the members,
     // so a solve that moves a part moves the harness network it carries.

@@ -290,12 +290,16 @@ pub fn engine_family_source(engine: &brep_render::engine_state::EngineState) -> 
 /// The top-level keys that are NOT the family's model: the table itself (a
 /// row edit must not regenerate every member), the class, the view state the
 /// file reopens in, and stamps.
-const NOT_THE_MODEL: [&str; 5] = [
+const NOT_THE_MODEL: [&str; 6] = [
     FAMILY_TABLE_KEY,
     crate::document_class::DOCUMENT_CLASS_KEY,
     "workbench",
     FAMILY_SOURCE_KEY,
     crate::template::TEMPLATE_SOURCE_KEY,
+    // The embedded preview `history_request_json` carries since the model
+    // thumbnails landed: derived from the model, rendered anew on every save,
+    // and absent from the copy the server hashes.
+    "thumbnail",
 ];
 
 /// A content hash of the family's model: the whole document less the keys in

@@ -227,7 +227,7 @@ impl EngineState {
                 Err(_) => return, // unparseable mid-edit document — retry next frame
             };
         let mut _trace = crate::run_trace::span("assembly_session");
-        let result = brep_kernel::execute_history(&request);
+        let result = self.execute_plugin_history(&request);
         if let Some(trace) = _trace.as_mut() {
             trace.result(&result);
         }

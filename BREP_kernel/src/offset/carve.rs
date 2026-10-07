@@ -65,7 +65,8 @@
 use crate::{KernelRefusal, KernelStage, OrRefuse};
 use crate::offset_fold_locus::{fit_locus_pcurve, trace_fold_locus, FoldCurve};
 use crate::offset_regularity::{
-    fold_sample_at, region_grid, scan_offset_regularity, RegionGrid, ScanBudget, TrimRegion,
+    fold_sample_at, region_grid, scan_offset_regularity, RegionGrid, RegularityScan, ScanBudget,
+    TrimRegion,
 };
 use crate::curve::KNOT_IDENTITY_TOL;
 use crate::{NurbsCurve, NurbsSurface, Vec3};
@@ -203,6 +204,30 @@ pub(crate) fn carve_folded_trim(
     collapse_factor: f64,
     budget: ScanBudget,
 ) -> Result<Option<CarvedTrim>, KernelRefusal> {
+    carve_folded_trim_scanned(surface, loops, displacements, collapse_factor, budget)
+        .map(|outcome| outcome.carved)
+}
+
+/// [`carve_folded_trim`]'s answer together with the SCAN it was decided on.
+///
+/// A caller that gets `None` back still has a decision to make — build the
+/// trim whole, or refuse because the scan could not certify it regular — and
+/// that is the scan's [`RegularityScan::certainty`] reading, which it should
+/// take from this scan rather than sweep the region a second time for it.
+pub(crate) struct CarveOutcome {
+    pub(crate) carved: Option<CarvedTrim>,
+    pub(crate) scan: RegularityScan,
+    /// The region the scan was taken over, which the certainty step needs.
+    pub(crate) region: TrimRegion,
+}
+
+pub(crate) fn carve_folded_trim_scanned(
+    surface: &NurbsSurface,
+    loops: &[Vec<NurbsCurve>],
+    displacements: &[f64],
+    collapse_factor: f64,
+    budget: ScanBudget,
+) -> Result<CarveOutcome, KernelRefusal> {
     let region = TrimRegion::from_pcurve_loops(surface, loops)?;
     let scan = scan_offset_regularity(surface, &region, displacements, collapse_factor, budget)?;
     // Nothing to carve: no sample folds, not even between the nodes; or every
@@ -211,9 +236,25 @@ pub(crate) fn carve_folded_trim(
         || (scan.collapsed == 0 && scan.between_collapsed == 0)
         || (scan.collapsed == scan.sampled && scan.between_regular == 0)
     {
-        return Ok(None);
+        return Ok(CarveOutcome { carved: None, scan, region });
     }
-    let locus = trace_fold_locus(surface, &region, displacements, collapse_factor, budget)?;
+    let carved = carve_scanned_trim(surface, loops, &region, &scan, displacements, collapse_factor, budget)?;
+    Ok(CarveOutcome { carved: Some(carved), scan, region })
+}
+
+/// The division itself, once the scan has said the trim folds over PART of
+/// its region.
+#[allow(clippy::too_many_arguments)]
+fn carve_scanned_trim(
+    surface: &NurbsSurface,
+    loops: &[Vec<NurbsCurve>],
+    region: &TrimRegion,
+    scan: &RegularityScan,
+    displacements: &[f64],
+    collapse_factor: f64,
+    budget: ScanBudget,
+) -> Result<CarvedTrim, KernelRefusal> {
+    let locus = trace_fold_locus(surface, region, displacements, collapse_factor, budget)?;
     // The boundary is read BEFORE the branches are judged, because a locus
     // TANGENT to the trim boundary leaves nothing for either to bracket — no
     // grid edge changes sign, so the trace finds no branch, and no pcurve
@@ -250,7 +291,7 @@ pub(crate) fn carve_folded_trim(
     let branches = locus
         .curves
         .iter()
-        .filter(|curve| curve.meets(&region))
+        .filter(|curve| curve.meets(region))
         .collect::<Vec<_>>();
     if branches.is_empty() {
         return Err(KernelRefusal::unsupported(KernelStage::Classify, "carve_touch", touching("no fold locus branch lies inside it")));
@@ -286,7 +327,7 @@ pub(crate) fn carve_folded_trim(
 
     let (target, ordered, chords) = chords_from_branches(
         surface,
-        &region,
+        region,
         &branches,
         &crossings,
         &touching,
@@ -452,11 +493,11 @@ pub(crate) fn carve_folded_trim(
         .map(|piece| parameter_area(piece))
         .sum::<f64>();
     let total = kept_area + dropped_area;
-    Ok(Some(CarvedTrim {
+    Ok(CarvedTrim {
         kept,
         dropped,
         kept_fraction: if total > 0.0 { kept_area / total } else { 0.0 },
-    }))
+    })
 }
 
 /// Every zero of the fold factor along the trim's own pcurves.

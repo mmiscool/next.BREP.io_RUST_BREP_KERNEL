@@ -9,6 +9,11 @@ pub(in crate::boolean) struct SourceEdge {
     pub(in crate::boolean) end: Vec3,
     pub(in crate::boolean) degenerate: bool,
     pub(in crate::boolean) name: Option<String>,
+    /// A CONSTRUCTED section: the source is an imprint piece the Boolean
+    /// marched on two carriers, not a boundary edge of an operand (vendor
+    /// geometry) nor a derived sub-span of one. Only such an edge's trims may
+    /// be refreshed from the edge after vertex settling (`vertices.rs`).
+    pub(in crate::boolean) constructed: bool,
     // Identity of the ORIGINAL boundary edge this source came from
     // `(operand, edge_id)`, for uncut faces passed through the arrangement.
     // `None` for imprint / derived (section) edges, which have no pre-boolean
@@ -131,6 +136,7 @@ fn boundary_source_edge(
         end: vertex_in_solid(index, operand, edge.end_vertex_id)?,
         degenerate: edge.degenerate,
         name: edge.name.clone(),
+        constructed: false,
         boundary_key: Some((operand, edge_id)),
     })
 }
@@ -161,6 +167,7 @@ pub(super) fn source_edge(source: &FragmentEdgeSource, index: &AssembleIndex) ->
                 end: point(piece.end_vertex_id)?,
                 degenerate: false,
                 name: imprint_edge_name(index, &piece.support_faces),
+                constructed: true,
                 boundary_key: None,
             })
         }
@@ -178,6 +185,7 @@ pub(super) fn source_edge(source: &FragmentEdgeSource, index: &AssembleIndex) ->
             end: *end,
             degenerate: start.sub(*end).length() <= 1e-8,
             name: None,
+            constructed: false,
             boundary_key: None,
         }),
     }
@@ -206,6 +214,10 @@ pub(in crate::boolean) struct Assembler {
     // candidate whose incoming source shares the operand but not the edge id
     // is a distinct 1-cell of the input and is refused — see `SourceEdge`.
     pub(in crate::boolean) edge_boundary_key: HashMap<u64, (u8, u64)>,
+    // Edges created from an imprint piece (a constructed section). A weld of a
+    // later source onto one of these keeps the edge; a weld of an imprint
+    // source onto a boundary edge leaves the boundary edge unmarked.
+    pub(in crate::boolean) imprint_edges: HashSet<u64>,
     pub(in crate::boolean) next_vertex_id: u64,
     pub(in crate::boolean) next_edge_id: u64,
     pub(in crate::boolean) next_coedge_id: u64,
@@ -240,7 +252,8 @@ pub(super) fn snap_edge_curve_endpoints(
     let last = controls.len() - 1;
     let last_weight = controls[last].w;
     controls[last] = crate::Vec4::from_point(end, last_weight);
-    crate::NurbsCurve::new(curve.degree, curve.knots.clone(), controls).or_refuse(KernelStage::Sew, "NurbsCurve::new")
+    let snapped = crate::NurbsCurve::new(curve.degree, curve.knots.clone(), controls).or_refuse(KernelStage::Sew, "NurbsCurve::new")?;
+    Ok(snapped)
 }
 
 impl Assembler {
@@ -706,6 +719,9 @@ impl Assembler {
         self.edge_first_forward.insert(id, incoming_forward);
         if let Some(key) = source.boundary_key {
             self.edge_boundary_key.insert(id, key);
+        }
+        if source.constructed {
+            self.imprint_edges.insert(id);
         }
         Ok((id, false))
     }

@@ -2,7 +2,7 @@
 //! in the mutate phase, completed by the matching `Event::Screenshot` in a later
 //! frame's input phase (§5). The headless host renders directly instead and
 //! answers this command itself; the window and dial-in hosts go through here.
-use crate::automation::command::{parse_args, schema_of, Annotations, CommandSpec, Ctx, Handler, Outcome, Phase};
+use crate::automation::command::{parse_args, schema_of, Annotations, CommandSpec, Ctx, Empty, Handler, Outcome, Phase};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -78,7 +78,33 @@ fn screenshot(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
     Ok(Outcome::AwaitScreenshot { token, region: a.region })
 }
 
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct IllustrationArgs {
+    /// begin | view | end. Normally orchestrated by illustration_capture_many.
+    pub action: String,
+    pub document_id: Option<u64>,
+    pub view: Option<Value>,
+}
+
+fn illustration_presentation(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
+    let a: IllustrationArgs = parse_args(args)?;
+    if let Some(id) = a.document_id {
+        let index = ctx.app.docs.iter().position(|d| d.id() == id).ok_or("illustration document is no longer open")?;
+        ctx.app.docs.activate(index);
+    }
+    let id = ctx.app.docs.active_id();
+    let engine = ctx.app.docs.engine_mut();
+    match a.action.as_str() {
+        "begin" => { engine.illustration_begin()?; Ok(Outcome::Done(json!({"document_id":id}))) },
+        "view" => engine.illustration_apply(&a.view.unwrap_or(json!({}))).map(Outcome::Done),
+        "end" => { engine.illustration_end()?; Ok(Outcome::Done(json!({"restored":true,"document_id":id}))) },
+        _ => Err("action must be begin, view or end".into()),
+    }
+}
+
 pub static COMMANDS: &[CommandSpec] = &[
+    CommandSpec { name: "illustration_presentation", group: "capture", doc: "Internal presentation loan for illustration_capture_many: preserves camera, full selection, display settings, saved-view state and display transforms without editing history or creating documents.", phase: Phase::Mutate, annotations: Annotations::MUTATE_NOWAIT, args_schema: schema_of::<IllustrationArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(illustration_presentation) },
     CommandSpec { name: "screenshot", group: "capture", doc: "Capture the composited frame (egui chrome and the 3D view) as PNG: region `full` (default), `viewport`, or `{x,y,w,h}` in egui points. The PNG rides beside the JSON reply.", phase: Phase::Mutate, annotations: Annotations::READ, args_schema: schema_of::<ScreenshotArgs>, result_schema: schema_of::<ScreenshotInfo>, handler: Handler::App(screenshot) },
 ];
 

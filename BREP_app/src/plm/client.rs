@@ -434,7 +434,7 @@ impl PlmClient {
     /// `GET /api/store/index?keys=…`: only those revisions' rows (a key that
     /// names no revision any more is absent from the answer).
     pub async fn index_rows(&self, keys: &[String]) -> Result<StoreIndex, PlmError> {
-        self.call_json("GET", &format!("/api/store/index?keys={}", keys.join(",")), None).await
+        self.call_json("GET", &format!("/api/store/index?keys={}", keys.iter().map(|k| crate::plm::identity::segment(k)).collect::<Vec<_>>().join(",")), None).await
     }
 
     /// `GET /api/store/doc/<key>`: the bytes, or `None` when the revision has
@@ -598,7 +598,7 @@ fn preference_path(name: &str) -> String {
 }
 
 fn doc_path(key: &str) -> String {
-    format!("/api/store/doc/{}", key.trim_start_matches('/'))
+    format!("/api/store/doc/{}", key.trim_start_matches('/').replace('%', "%25"))
 }
 
 fn session_cookie(credential: &Credential) -> Option<String> {

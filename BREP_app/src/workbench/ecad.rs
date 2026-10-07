@@ -353,7 +353,7 @@ pub fn layer_menu_caption(state: &ButtonState) -> String {
     let on = super::pcb::LAYERS
         .iter()
         .find(|entry| entry.offered(state) && entry.is_pressed(state))
-        .map(|entry| entry.label(state));
+        .map(|entry| entry.detail(state));
     match on {
         Some(layer) => format!("Copper layer: {layer}"),
         None => "Copper layer".to_string(),
@@ -392,11 +392,13 @@ fn dispatch_in(registry: &[&'static super::Workbench], editors: &mut Editors, id
 /// eCAD reports a pressed state for (a tool, a view, a layer); `command` one it
 /// does not. The tooltip is eCAD's label, word for word — the tests hold it.
 macro_rules! ecad_button {
-    ($id:literal, $glyph:literal, $tooltip:literal, toggle) => {
+    ($id:literal, $glyph:literal, $tooltip:literal, $path:literal, toggle) => {
         $crate::workbench::WorkbenchButton {
             id: $id,
             glyph: $glyph,
             tooltip: $tooltip,
+            ribbon_path: $path,
+            size: $crate::workbench::CommandSize::Compact,
             when: Some(|s| $crate::workbench::ecad::offered(s, $id)),
             pressed: Some(|s| $crate::workbench::ecad::pressed(s, $id)),
             disabled: Some(|s| $crate::workbench::ecad::disabled(s, $id)),
@@ -404,11 +406,13 @@ macro_rules! ecad_button {
             menu: &[],
         }
     };
-    ($id:literal, $glyph:literal, $tooltip:literal, command) => {
+    ($id:literal, $glyph:literal, $tooltip:literal, $path:literal, command) => {
         $crate::workbench::WorkbenchButton {
             id: $id,
             glyph: $glyph,
             tooltip: $tooltip,
+            ribbon_path: $path,
+            size: $crate::workbench::CommandSize::Compact,
             when: Some(|s| $crate::workbench::ecad::offered(s, $id)),
             pressed: None,
             disabled: Some(|s| $crate::workbench::ecad::disabled(s, $id)),

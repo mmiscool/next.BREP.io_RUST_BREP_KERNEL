@@ -25,6 +25,7 @@
 //! from inside [`Db::mutate`].
 
 use std::io::Write;
+use base64::Engine;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::Duration;
@@ -71,6 +72,7 @@ impl Host {
 
         let files = ObjectInitializer::new(context)
             .function(self.function(fs_read), js_string!("readFile"), 1)
+            .function(self.function(fs_read_base64), js_string!("readBase64"), 1)
             .function(self.function(fs_write), js_string!("writeFile"), 2)
             .function(self.function(fs_exists), js_string!("exists"), 1)
             .function(self.function(fs_list), js_string!("listDir"), 1)
@@ -166,7 +168,12 @@ fn http_request(_: &Host, args: &[JsValue], context: &mut Context) -> JsResult<J
             request = request.set(name, &value);
         }
     }
-    let result = match &options["body"] {
+    let result = if let Some(encoded) = options.get("body_base64") {
+        if !options["body"].is_null() { return Err(throw("choose body or body_base64, not both")); }
+        let bytes = base64::engine::general_purpose::STANDARD.decode(encoded.as_str().ok_or_else(||throw("body_base64 must be a string"))?)
+            .map_err(|_|throw("body_base64 is not valid base64"))?;
+        request.send_bytes(&bytes)
+    } else { match &options["body"] {
         Value::Null => request.call(),
         Value::String(text) => request.send_string(text),
         other => {
@@ -175,6 +182,7 @@ fn http_request(_: &Host, args: &[JsValue], context: &mut Context) -> JsResult<J
             }
             request.send_string(&other.to_string())
         }
+    }
     };
     let response = match result {
         Ok(response) => response,
@@ -198,6 +206,12 @@ fn http_request(_: &Host, args: &[JsValue], context: &mut Context) -> JsResult<J
 }
 
 // -------------------------------------------------------------------- fs
+
+fn fs_read_base64(host: &Host, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
+    let path = host.path(&arg_string(args, 0, "fs.readBase64: path", context)?);
+    let bytes = std::fs::read(&path).map_err(|e| throw(format!("fs.readBase64 {}: {e}", path.display())))?;
+    Ok(JsValue::from(js_string!(base64::engine::general_purpose::STANDARD.encode(bytes))))
+}
 
 fn fs_read(host: &Host, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
     let path = host.path(&arg_string(args, 0, "fs.readFile: path", context)?);

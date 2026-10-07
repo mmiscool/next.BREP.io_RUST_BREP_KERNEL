@@ -199,6 +199,167 @@ pub enum SoundnessDefect {
     Crossing,
     /// A hole loop is no longer contained by the face that carries it.
     HoleBreach,
+    /// A CLOSED shell's trims enclose a vector area no pcurve fit at the
+    /// refinement floor accounts for (`shell_vector_areas`): two faces that
+    /// share an edge are trimmed at different curves, and the sliver between
+    /// them leaves the body's volume dependent on the integration reference.
+    /// Drawn by the STEP import's closure gate (`io/step_import/builder/closure.rs`).
+    VectorArea,
+}
+
+/// A MEASURED approximation a SUCCESSFUL result carries: the result stands,
+/// and this says by how much, and why, it is not exact. Distinct from a
+/// refusal (the result does not stand) and from a fulfilment (what was done of
+/// what was asked) — the typed-refusal plan's third kind of report.
+///
+/// The one producer today is the STEP import's shell-closure gate
+/// (`io/step_import/builder/closure.rs`): a body whose closed shell's trims
+/// enclose more vector area than the pcurve fit floor accounts for, but less
+/// than the size-relative cap that refuses it, is imported and carries this.
+/// `volume_bound` is what the measurement implies for the body's volume: an
+/// open shell's divergence integral reads `V − R·A/3` about a reference `R`,
+/// so two references inside the body disagree by up to `|A| × diagonal / 3`,
+/// which is the band inside which no oracle can say the volume is wrong.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Approximation {
+    /// Stable code, e.g. `import.shell_closure`.
+    pub code: String,
+    /// The body it is about, by the name the consumer knows it under: the
+    /// import's file-order index until the feature names it, then the scene
+    /// name.
+    pub body: String,
+    /// The measured quantity (for `import.shell_closure`, the shell's vector
+    /// area residual, mm²) and the bar it is read against.
+    pub measured: f64,
+    pub bar: f64,
+    /// The bound the measurement puts on the body's VOLUME, mm³ — the
+    /// reference-lever term above. `None` when the code does not imply one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub volume_bound: Option<f64>,
+    /// The edges that carry the approximation, worst first, with their origin.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub edges: Vec<OffCarrierEdge>,
+    /// Why a construction REQUEST went unmet (`blend.wall_model`), or why a
+    /// blend wall shipped from a rung that never met its acceptance bars
+    /// (`blend.wall_acceptance`), and the budget it spent. `None` for every
+    /// other code.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget: Option<ApproximationBudget>,
+    /// The human text, verbatim.
+    pub message: String,
+}
+
+/// The spent budget of an unmet construction request, typed: why refinement
+/// stopped, and the rounds and stations it used against their limits.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ApproximationBudget {
+    pub reason: BudgetReason,
+    /// The budget steps ATTEMPTED, of the kind `mechanism` names: local
+    /// refinement rounds (acceptance and request share them), or an open
+    /// edge's global station rungs (past the accepted rung for a request,
+    /// past the first rung for an unaccepted one). On `Rejected` this counts
+    /// the refused attempt, one past the rung that ships.
+    pub rounds_used: usize,
+    pub rounds_limit: usize,
+    /// The stations of the rung that SHIPS (a closed chain: the largest count
+    /// of any one segment), against the ceiling — never the refused attempt's.
+    pub stations: usize,
+    pub station_limit: usize,
+    /// What `rounds_used` / `rounds_limit` count.
+    #[serde(default)]
+    pub mechanism: BudgetMechanism,
+    /// What the approximation's `measured` value is the reading OF: the wall
+    /// between the rails (the default, what every report meant before), or
+    /// the support rails, when they are the worse part of a request that
+    /// covers both.
+    #[serde(default)]
+    pub measured_component: MeasuredComponent,
+    /// Intervals the request could NOT read. When non-zero the true worst
+    /// reading is UNKNOWN and `measured` is only the largest readable value;
+    /// no consumer may read it as the worst.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub unread: usize,
+}
+
+fn is_zero(count: &usize) -> bool {
+    *count == 0
+}
+
+/// What a request report's `measured` value is the reading of.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MeasuredComponent {
+    /// The fillet wall between its rails, against the rolling ball's sweep.
+    #[default]
+    Wall,
+    /// The support rails (the shipped support curves), against their exact
+    /// construction: their carriers or the exact ball contacts.
+    Rails,
+}
+
+/// The budget mechanism an [`ApproximationBudget`] counts.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BudgetMechanism {
+    /// Local refinement rounds inside one rung (a chain's or closed edge's
+    /// wall request).
+    #[default]
+    LocalRounds,
+    /// Whole-march station rungs (an open edge's ladder: the uniform station
+    /// count doubling, each rung with its own local rail refinement, which
+    /// these counts do not include).
+    StationRungs,
+}
+
+/// Why a construction request stopped short of what it asked.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BudgetReason {
+    /// Every refinement round was spent.
+    RoundsSpent,
+    /// Another round would pass the per-segment station ceiling.
+    StationCeiling,
+    /// A refining station could not be placed coherently (it did not reach
+    /// its retained neighbour's branch, or its continuation did not converge),
+    /// so the last accepted rung stands.
+    Incoherent,
+    /// The refined rung was built and then failed its own acceptance or
+    /// refused, so the last accepted rung stands.
+    Rejected,
+    /// No rung met its acceptance bars; the top rung ships as built
+    /// (`blend.wall_acceptance`, its worst reading against its bar).
+    Unaccepted,
+    /// No rung was accepted and a reading acceptance needs could not be taken
+    /// (non-finite, or no shipped coverage); the top rung ships as built.
+    Unread,
+}
+
+/// One edge whose built curve stands off one of its carriers, as an
+/// [`Approximation`] names it.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct OffCarrierEdge {
+    /// The built edge's id in the body.
+    pub edge_id: u64,
+    /// The file's `EDGE_CURVE.edge_geometry` entity, when the edge has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub curve_ref: Option<usize>,
+    /// The `ADVANCED_FACE` and surface entities of the carrier it stands off.
+    pub face_ref: usize,
+    pub surface_ref: usize,
+    /// How far, mm, over the gate's stations (an upper bound: the projector's
+    /// distance never under-reads).
+    pub off_carrier_mm: f64,
+    /// Whose curve stands off: the FILE's, as written, or one an importer
+    /// pass moved (`reconciled`: `reconcile_edges_onto_surfaces` replaced it
+    /// with its projection onto a different carrier).
+    pub origin: EdgeOrigin,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EdgeOrigin {
+    File,
+    Reconciled,
 }
 
 impl RefusalClass {

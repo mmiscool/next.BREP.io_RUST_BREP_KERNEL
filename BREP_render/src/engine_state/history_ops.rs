@@ -13,16 +13,19 @@ impl EngineState {
     pub fn run_history_json(&mut self, request_json: &str) -> Result<String, String> {
         let request: HistoryRequest = serde_json::from_str(request_json)
             .map_err(|error| format!("history request parse: {error}"))?;
-        let report = crate::pipeline::update_scene_from_history(&mut self.scene, &request)?;
+        let report = self.run_plugin_scene(&request)?;
         self.dirty = true;
-        Ok(with_refusals(
-            serde_json::json!({
-                "featureErrors": report.feature_errors,
-                "featureNotes": report.feature_notes,
-                "featureFulfilment": fulfilment_map(&report),
-                "unresolved": report.unresolved,
-                "displayErrors": report.display_errors,
-            }),
+        Ok(with_approximations(
+            with_refusals(
+                serde_json::json!({
+                    "featureErrors": report.feature_errors,
+                    "featureNotes": report.feature_notes,
+                    "featureFulfilment": fulfilment_map(&report),
+                    "unresolved": report.unresolved,
+                    "displayErrors": report.display_errors,
+                }),
+                &report,
+            ),
             &report,
         )
         .to_string())
@@ -32,6 +35,11 @@ impl EngineState {
     /// SAME kernel pipeline and reconcile the display scene. Stores + returns the
     /// build report JSON.
     pub(super) fn rerun_history(&mut self) -> String {
+        self.rerun_history_forcing(None)
+    }
+
+    pub(super) fn rerun_history_forcing(&mut self, feature_id: Option<&str>) -> String {
+        if self.defer_plugin_run() { return self.history_report.clone(); }
         // This run publishes whatever a symbol edit did to the PORT features,
         // so `pump` need not run again for it.
         self.history.take_ports_followed();
@@ -46,6 +54,9 @@ impl EngineState {
         let request_value = self.run_request_value();
         match serde_json::from_value::<HistoryRequest>(request_value) {
             Ok(mut request) => {
+                if let Some(id) = feature_id {
+                    request.force_rebuild.push(id.to_string());
+                }
                 // Carry the live display LOD to the runner (the request is the run
                 // boundary the thread/worker receives). The runner re-tessellates
                 // every resident mesh when this differs from its last run's lod.
@@ -65,6 +76,7 @@ impl EngineState {
                     brep_kernel::parts_library_revision(),
                     &mut brep_kernel::parts_library_map,
                 );
+                self.sync_plugin_runner();
                 self.runner.submit_run(request, self.run_generation);
             }
             // A parse failure runs nothing: clear the surfaced frames/profiles (so
@@ -99,6 +111,7 @@ impl EngineState {
     /// [`applied_generation`](Self::applied_generation) (a newer run that finished
     /// first) is dropped.
     pub fn pump(&mut self) {
+        self.pump_plugin_installations();
         // The runner REFUSED a run because its resident parts library could not
         // serve it (see `Reply::NeedPartsLibrary`). It has already forgotten
         // its copy, so re-running re-installs the library and re-submits. This
@@ -184,11 +197,21 @@ impl EngineState {
                 self.run_progress = Some(progress);
             }
         }
+        self.pump_plugin_callbacks();
         while let Some(reply) = self.runner.poll_run() {
             self.runs_replied += 1;
-            if reply.generation >= self.applied_generation {
+            if reply.generation >= self.run_generation && self.accept_plugin_run(&reply) {
                 self.applied_generation = reply.generation;
                 self.apply_run_output(reply.output);
+            } else {
+                // Superseded — but the runner's baseline has moved past every
+                // display in it, so a later keep can name one of them. Hold
+                // them for that keep (see `superseded_displays`).
+                for (name, _handle, maybe) in reply.output.snapshot {
+                    if let Some(display) = maybe {
+                        self.superseded_displays.insert(name, display);
+                    }
+                }
             }
         }
         if !self.run_pending() {
@@ -214,8 +237,10 @@ impl EngineState {
     /// that the scene does not hold for their current handle and that have not
     /// been asked for since the last applied run, then drain whatever has
     /// already answered (all of it, for the synchronous Inline runner). The
-    /// drawing sheet's door: nothing else needs topology on this side, so a
-    /// document with no sheet never asks.
+    /// drawing sheet's door, and the balloon bubble drag's (which re-projects
+    /// the arrow head on the exact solid, `pmi_reproject_balloon_head`):
+    /// nothing else needs topology on this side, so a document with neither a
+    /// sheet nor a dragged balloon never asks.
     pub fn request_exact_solids<'a>(&mut self, names: impl IntoIterator<Item = &'a str>) {
         let mut wanted: Vec<(String, u32)> = Vec::new();
         for name in names {
@@ -241,6 +266,7 @@ impl EngineState {
     /// display that has moved on to another handle is dropped; the next
     /// projection asks for the new one.
     pub fn pump_topology(&mut self) {
+        let mut landed = false;
         while let Some(reply) = self.runner.poll_topology() {
             if !self.pending_topology.remove(&reply.id) {
                 continue; // cancelled, or a document switch
@@ -248,6 +274,10 @@ impl EngineState {
             for (name, handle, solid) in reply.solids {
                 self.scene.set_exact_solid(&name, handle, solid);
             }
+            landed = true;
+        }
+        if landed {
+            self.pmi_refresh_stale_balloon();
         }
     }
 
@@ -276,7 +306,7 @@ impl EngineState {
     /// (submit → immediate `pump` keeps the two in lockstep); a background runner
     /// uses it to keep the frame loop alive until its reply lands.
     pub fn run_pending(&self) -> bool {
-        self.run_generation != self.applied_generation
+        self.run_generation != self.applied_generation || self.plugin_work_pending()
     }
 
     /// The generation of the last APPLIED run — bumps once per applied history
@@ -316,6 +346,12 @@ impl EngineState {
     /// `false` when nothing was running, or the runner cannot abandon (the
     /// synchronous Inline runner, whose runs are over before anyone can ask).
     pub fn cancel_run(&mut self) -> bool {
+        self.cancel_run_with_notice(true)
+    }
+
+    pub(super) fn cancel_run_with_notice(&mut self, notify: bool) -> bool {
+        if self.plugin_installation_pending() { return false; }
+        if self.cancel_plugin_action() { return true; }
         if !self.run_pending() || !self.runner.cancel() {
             return false;
         }
@@ -332,6 +368,9 @@ impl EngineState {
         self.topology_asked.clear();
         self.scene.clear_exact_solids();
         self.sheet_lines.forget();
+        // The old runner's held displays name ITS handles; the new one's
+        // first run emits every display afresh.
+        self.superseded_displays.clear();
         let dropped_imports = self.pending_mesh_imports.len();
         self.pending_mesh_imports.clear();
         let dropped_probes = self.pending_step_probes.len();
@@ -339,15 +378,17 @@ impl EngineState {
         self.pending_fit = false;
         self.library_resync = false;
         self.cancelled_run = Some(stalled_on.clone().unwrap_or_default());
-        self.push_notice(match stalled_on {
-            Some(id) if !id.is_empty() => format!(
-                "Run cancelled while executing {id}. The model shows the last completed \
-                 result; edit or delete the feature to rebuild."
-            ),
-            _ => "Run cancelled. The model shows the last completed result; the next edit \
-                  rebuilds it."
-                .to_string(),
-        });
+        if notify {
+            self.push_notice(match stalled_on {
+                Some(id) if !id.is_empty() => format!(
+                    "Run cancelled while executing {id}. The model shows the last completed \
+                     result; edit or delete the feature to rebuild."
+                ),
+                _ => "Run cancelled. The model shows the last completed result; the next edit \
+                      rebuilds it."
+                    .to_string(),
+            });
+        }
         if dropped_imports > 0 {
             self.push_notice(format!(
                 "cancelled {dropped_imports} pending mesh import{}",
@@ -380,7 +421,9 @@ impl EngineState {
     /// through the installed runner.
     pub fn set_runner(&mut self, runner: Box<dyn crate::runner::HistoryRunner>) {
         self.runner = runner;
+        self.plugin_runner_replaced();
         self.runner.reset();
+        self.superseded_displays.clear();
         self.pending_mesh_imports.clear();
         self.mesh_preview_results.clear();
         self.pending_topology.clear();
@@ -408,10 +451,10 @@ impl EngineState {
     /// [`finish_apply`](Self::finish_apply) — the shared dirty/gizmo/overlay tail
     /// that the parse-error branch in [`rerun_history`](Self::rerun_history) also
     /// calls, so both paths share the continuation verbatim.
-    fn apply_run_output(&mut self, output: crate::pipeline::RunOutput) {
+    pub(super) fn apply_run_output(&mut self, output: crate::pipeline::RunOutput) {
         let crate::pipeline::RunOutput {
             snapshot,
-            report,
+            mut report,
             provenance,
             entity_origin,
             assembly_poses,
@@ -421,6 +464,9 @@ impl EngineState {
             consumed,
             assembly,
         } = output;
+        for (id, data) in &report.plugin_persistent_data {
+            self.history.fold_plugin_persistent_data(id, data.clone());
+        }
         // The runner already forced fresh displays for the solver-moved solids
         // (their snapshot entries arrive `Some`); nothing extra to do main-side.
         let _ = moved_solids;
@@ -468,7 +514,9 @@ impl EngineState {
         // run's request simply carries the solved pose (a no-motion solve emits
         // no updates, so fingerprints never churn).
         for (id, pose) in assembly_poses {
-            self.history.fold_param_no_undo(&id, "transform", pose);
+            let expression_driven = self.history.index_of(&id).and_then(|i| self.history.feature_params(i))
+                .is_some_and(|p| super::batch::contains_expression(&p["transform"]));
+            if !expression_driven { self.history.fold_param_no_undo(&id, "transform", pose); }
         }
         for (id, fixed) in assembly_fixed {
             self.history
@@ -504,12 +552,38 @@ impl EngineState {
             .into_iter()
             .map(|solid| (solid.name.clone(), solid))
             .collect();
-        for (name, _handle, maybe) in snapshot {
+        for (name, handle, maybe) in snapshot {
             match maybe {
-                Some(display) => self.scene.insert_solid(display),
-                None => self
-                    .scene
-                    .insert_solid(kept.remove(&name).expect("keep target present")),
+                Some(display) => {
+                    self.superseded_displays.remove(&name);
+                    self.scene.insert_solid(display);
+                }
+                // "Unchanged": the runner last emitted `handle` for this name.
+                // That emit is the scene's display when its reply was applied,
+                // and a held superseded display when it was dropped — the
+                // handle says which, since handles are monotonic and never
+                // recycled within one runner. Neither holding it is a protocol
+                // breach (a reply lost between the runner and `pump`), and the
+                // app is not the place to crash on one, in any build: the
+                // solid is left out of this frame and the report names it.
+                None => {
+                    let kept_display = kept.remove(&name);
+                    let display = match kept_display {
+                        Some(display) if display.source_handle == handle => Some(display),
+                        _ => self
+                            .superseded_displays
+                            .remove(&name)
+                            .filter(|display| display.source_handle == handle),
+                    };
+                    match display {
+                        Some(display) => self.scene.insert_solid(display),
+                        None => {
+                            report.display_errors.push(format!(
+                                "{name}: the run kept resident handle {handle}, which no reply has displayed"
+                            ));
+                        }
+                    }
+                }
             }
         }
         // Topology is kept only for a display whose handle survived the run,
@@ -542,6 +616,7 @@ impl EngineState {
         self.ports_report = report.ports.clone();
         // ...and the PMI report (every view's resolved annotations).
         self.pmi_report = report.pmi.clone();
+        self.fold_plugin_annotation_data();
         // Fold the per-feature timing / output-name pairs into id-keyed maps so the
         // history-tree UI can look them up by feature id.
         let timings: serde_json::Map<String, serde_json::Value> = report
@@ -554,16 +629,19 @@ impl EngineState {
             .iter()
             .map(|(id, names)| (id.clone(), serde_json::json!(names)))
             .collect();
-        let report_json = with_refusals(
-            serde_json::json!({
-                "featureErrors": report.feature_errors,
-                "featureNotes": report.feature_notes,
-                "featureFulfilment": fulfilment_map(&report),
-                "unresolved": report.unresolved,
-                "displayErrors": report.display_errors,
-                "featureTimings": timings,
-                "featureOutputs": outputs,
-            }),
+        let report_json = with_approximations(
+            with_refusals(
+                serde_json::json!({
+                    "featureErrors": report.feature_errors,
+                    "featureNotes": report.feature_notes,
+                    "featureFulfilment": fulfilment_map(&report),
+                    "unresolved": report.unresolved,
+                    "displayErrors": report.display_errors,
+                    "featureTimings": timings,
+                    "featureOutputs": outputs,
+                }),
+                &report,
+            ),
             &report,
         )
         .to_string();
@@ -678,6 +756,7 @@ impl EngineState {
         // Reset the delta runner's baseline in lockstep with the cache clear so the
         // new document is a FULL rebuild (no reuse against the prior model's names).
         self.runner.reset();
+        self.superseded_displays.clear();
         self.pending_mesh_imports.clear();
         self.mesh_preview_results.clear();
         self.pending_topology.clear();
@@ -706,6 +785,8 @@ impl EngineState {
         self.expression_preview = None;
         let mut document: serde_json::Value = serde_json::from_str(request_json)
             .map_err(|error| format!("history parse: {error}"))?;
+        let thumbnail = document.as_object_mut().and_then(|o| o.remove("thumbnail"));
+        self.thumbnail_cache.replace(None);
         // Pull `metadata` out of the document so the engine holds the single copy
         // (kept off the History recipe the kernel executes).
         let metadata_value = document
@@ -749,6 +830,7 @@ impl EngineState {
             .unwrap_or_default();
         brep_kernel::install_parts_library(&library);
         self.history = History::from_request_json(&document.to_string())?;
+        self.document_thumbnail.replace(thumbnail.map(|image| (self.history.edit_serial(), image)));
         Ok(self.rerun_history())
     }
 
@@ -776,12 +858,53 @@ impl EngineState {
             if !self.metadata.is_empty() {
                 object.insert("metadata".into(), self.metadata.to_json());
             }
+            object.insert("thumbnail".into(), self.model_thumbnail());
             object.insert(
                 "workbench".into(),
                 serde_json::Value::String(self.settings.workbench.clone()),
             );
         }
         document.to_string()
+    }
+
+    /// Cache the small portable PNG by scene content, not by camera position.
+    /// The picture is the DOCUMENT's, so it is rendered only while the scene is
+    /// the document's model as built. A run the scene has not caught up with
+    /// (an edit whose rebuild is still to come) gets an explicitly pending,
+    /// empty image rather than a picture of the previous geometry; plugin work
+    /// in flight is not that, since a candidate keeps its own scene until it
+    /// commits. A transient presentation — an expression preview (a family
+    /// member shown in the document's place) or an illustration — gets the
+    /// document's own last picture (the one it was opened with, or the one its
+    /// last save rendered) rather than what is on screen. A just-opened file
+    /// keeps its embedded image while its unchanged recipe is being rebuilt.
+    /// The document's picture is keyed by the history's edit serial, which
+    /// moves on user edits, undo and redo only (a run's write-back ticks the
+    /// revision). The same built model renders the same bytes every time.
+    fn model_thumbnail(&self) -> serde_json::Value {
+        let pending = self.run_generation != self.applied_generation();
+        let transient = self.expression_preview.is_some() || self.illustration_snapshot.is_some();
+        let mut key = vec![self.history.revision(), self.applied_generation(),
+            self.scene.visibility_revision(), self.settings_generation, pending as u64, transient as u64];
+        key.extend(self.scene.solids().iter().map(|s| s.revision));
+        if let Some((old, image)) = self.thumbnail_cache.borrow().as_ref() {
+            if *old == key { return image.clone(); }
+        }
+        let image = if pending || transient {
+            self.document_thumbnail.borrow().as_ref().filter(|(serial, _)| *serial == self.history.edit_serial())
+                .map(|(_, image)| image.clone())
+                .unwrap_or_else(|| crate::thumbnail::empty_embedded("pending"))
+        } else {
+            let capture = crate::thumbnail::capture(&self.scene);
+            let image = match crate::thumbnail::render_png(&capture, crate::thumbnail::SIZE) {
+                Some(png) => crate::thumbnail::embedded_png(&png, crate::thumbnail::SIZE, "ready"),
+                None => crate::thumbnail::empty_embedded("empty"),
+            };
+            self.document_thumbnail.replace(Some((self.history.edit_serial(), image.clone())));
+            image
+        };
+        self.thumbnail_cache.replace(Some((key, image.clone())));
+        image
     }
 
     /// The tree listing `{ step, features:[{index,type,id}] }` for the UI panel.
@@ -921,7 +1044,9 @@ impl EngineState {
     pub fn add_feature(&mut self, feature_json: &str) -> Result<String, String> {
         let feature: serde_json::Value =
             serde_json::from_str(feature_json).map_err(|e| format!("feature parse: {e}"))?;
-        self.history.push_feature(feature);
+        if !self.append_plugin_features(std::slice::from_ref(&feature))? {
+            self.history.push_feature(feature);
+        }
         let last = self.history.len().saturating_sub(1);
         self.history.set_rollback(last);
         Ok(self.rerun_history())
@@ -946,7 +1071,11 @@ impl EngineState {
         if features.is_empty() {
             return self.history_report.clone();
         }
-        self.history.push_features(features.to_vec());
+        match self.append_plugin_features(features) {
+            Ok(true) => {},
+            Ok(false) => self.history.push_features(features.to_vec()),
+            Err(error) => return serde_json::json!({"error":error}).to_string(),
+        }
         let last = self.history.len().saturating_sub(1);
         self.history.set_rollback(last);
         self.rerun_history()
@@ -1186,6 +1315,73 @@ fn with_refusals(
         object.insert("featureRefusals".into(), serde_json::Value::Object(refusals));
     }
     value
+}
+
+/// The run report's `featureApproximations` object, added only when a feature
+/// SUCCEEDED carrying a MEASURED approximation: feature id → the kernel's
+/// approximations as they serialize (`code`, `body`, `measured`, `bar`,
+/// `volume_bound`, `edges[{edge_id, curve_ref, face_ref, surface_ref,
+/// off_carrier_mm, origin}]`, `message`), each plus a one-line `summary` the
+/// history tree shows as the feature's leaf. Absent otherwise, so a report with
+/// no approximation is byte-for-byte what it was before this key existed — the
+/// same contract as `featureRefusals`. Distinct from `featureRefusals` (the
+/// result does not stand) and `featureFulfilment` (what was done of what was
+/// asked): an approximation's result stands, and this says by how much it is
+/// not exact.
+fn with_approximations(
+    mut value: serde_json::Value,
+    report: &crate::pipeline::SceneBuildReport,
+) -> serde_json::Value {
+    if report.feature_approximations.is_empty() {
+        return value;
+    }
+    let approximations: serde_json::Map<String, serde_json::Value> = report
+        .feature_approximations
+        .iter()
+        .map(|(id, approximations)| {
+            let entries: Vec<serde_json::Value> = approximations
+                .iter()
+                .map(|approximation| {
+                    let mut value =
+                        serde_json::to_value(approximation).unwrap_or(serde_json::Value::Null);
+                    if let serde_json::Value::Object(object) = &mut value {
+                        object.insert(
+                            "summary".into(),
+                            serde_json::Value::String(approximation_summary(approximation)),
+                        );
+                    }
+                    value
+                })
+                .collect();
+            (id.clone(), serde_json::Value::Array(entries))
+        })
+        .collect();
+    if let serde_json::Value::Object(object) = &mut value {
+        object.insert("featureApproximations".into(), serde_json::Value::Object(approximations));
+    }
+    value
+}
+
+/// One line for an approximation, for the history tree's leaf: the marker
+/// word, the code, the body, the measurement against its bar and the volume
+/// bound when the code implies one. Code-agnostic on purpose — the units of
+/// `measured` are the code's (mm² for `import.shell_closure`), so only the
+/// volume bound, which every code states in mm³, carries a unit here; the
+/// kernel's `message` has the full text with units, faces and edges.
+pub fn approximation_summary(approximation: &brep_kernel::Approximation) -> String {
+    let ratio = if approximation.bar > 0.0 {
+        format!(" ({:.1}x)", approximation.measured / approximation.bar)
+    } else {
+        String::new()
+    };
+    let bound = approximation
+        .volume_bound
+        .map(|bound| format!("; volume determined to ±{bound:.3e} mm³"))
+        .unwrap_or_default();
+    format!(
+        "approximate ({}): {} measured {:.3e} against a bar of {:.3e}{ratio}{bound}",
+        approximation.code, approximation.body, approximation.measured, approximation.bar
+    )
 }
 
 /// The run report's `featureFulfilment` object: feature id → the typed

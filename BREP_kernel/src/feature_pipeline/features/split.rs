@@ -286,6 +286,8 @@ pub fn schema() -> serde_json::Value {
     "type": "SPL",
     "shortName": "SPL",
     "longName": "Split",
+    "ribbonPath": "Home/Modeling/Split",
+    "commandSize": "Compact",
     "displayBuilder": false,
     "inputParamsSchema": {
         "id": {

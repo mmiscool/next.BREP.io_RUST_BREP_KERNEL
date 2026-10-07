@@ -155,7 +155,7 @@ impl EngineState {
             .filter_map(|overlay| {
                 let world = overlay.label_anchor(wpp)?;
                 let color = status_color(&overlay.status);
-                Some(serde_json::json!({
+                let mut row = serde_json::json!({
                     "id": overlay.id,
                     "type": overlay.constraint_type,
                     "icon": overlay.icon,
@@ -166,7 +166,18 @@ impl EngineState {
                     "world": world,
                     "draggable": overlay.draggable,
                     "selected": self.selected_constraint.as_deref() == Some(overlay.id.as_str()),
-                }))
+                });
+                // The angle gizmo's own geometry — the arc VERTEX (which must
+                // sit on the hinge of the two measured elements) and the
+                // rotation axis — so an automation client can measure the
+                // gizmo's placement, not just where its chip landed.
+                if let (ConstraintOverlayKind::Angle, Some(annotation)) =
+                    (overlay.kind, overlay.annotation.as_ref())
+                {
+                    row["center"] = serde_json::json!(annotation.center);
+                    row["axis"] = serde_json::json!(annotation.axis);
+                }
+                Some(row)
             })
             .collect();
         serde_json::Value::Array(rows).to_string()
@@ -441,7 +452,7 @@ impl EngineState {
     /// Drag a grabbed constraint handle to screen `(x, y)`: map the pointer to a
     /// new value (distance: signed offset along the base-face normal for
     /// plane-based rows, magnitude along the leader otherwise; angle: the
-    /// shared arc nearest-projection search, folded to the interior 0–180°),
+    /// shared arc nearest-projection search, preserving signed sweeps through 360°),
     /// update the PREVIEW (annotation + label track live), and re-bake. No
     /// kernel call — the commit happens on [`Self::constraint_drag_release`].
     pub fn constraint_drag_to(&mut self, x: f64, y: f64) {
@@ -510,7 +521,7 @@ impl EngineState {
                 let Some(degrees) = self.angular_drag_degrees(&annotation, x, y) else {
                     return;
                 };
-                interior_degrees(degrees)
+                constraint_degrees(degrees)
             }
             ConstraintOverlayKind::Leader => return,
         };
@@ -746,17 +757,12 @@ fn live_constraint_exists(id: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Fold an arc sweep (the shared angular drag search's [-360°, 360°] output)
-/// onto the INTERIOR angle domain the constraint mate targets (0–180°,
-/// unsigned — `angle_between_deg` symmetry), snapping the sub-0.5° residue of
-/// the search's zero-floor to an exact 0 (parallel is a legitimate target).
-fn interior_degrees(degrees: f64) -> f64 {
-    let folded = degrees.abs() % 360.0;
-    let interior = if folded > 180.0 { 360.0 - folded } else { folded };
-    if interior < 0.5 {
+/// Keep signed/full-circle sweeps; remove only the shared torus drag's zero floor.
+fn constraint_degrees(degrees: f64) -> f64 {
+    if degrees.abs() < 0.5 {
         0.0
     } else {
-        interior
+        degrees
     }
 }
 

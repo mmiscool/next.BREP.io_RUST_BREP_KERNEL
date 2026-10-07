@@ -31,6 +31,10 @@ pub struct StepBodyTrimReadings {
     pub body_ref: usize,
     /// The body as the importer built it, or why it refused.
     pub solid: Result<BrepSolid, String>,
+    /// The shell-closure refusal the ordinary import lane draws on this body
+    /// (`builder/closure.rs`), which THIS lane holds so the body can be read:
+    /// a `Some` here is a body `import_step` refuses.
+    pub closure_refusal: Option<String>,
     pub edges: Vec<StepEdgeReading>,
     pub faces: Vec<StepFaceReading>,
 }
@@ -91,9 +95,16 @@ pub fn import_step_trim_readings(text: &str) -> Result<StepTrimReadings, String>
             StepBody::SolidBrep(entity_ref) | StepBody::BrepWithVoids(entity_ref) => entity_ref,
             StepBody::SurfaceModelShell { shell_ref, .. } => shell_ref,
         };
-        let (solid, capture) = match build_step_body_captured(&resolver, body) {
-            Ok((solid, capture, _bounded)) => (Ok(solid), capture.unwrap_or_default()),
-            Err(error) => (Err(error), Default::default()),
+        // The capture lane HOLDS a closure refusal (`builder/closure.rs`): the
+        // body is built and read so the residual can be attributed edge by
+        // edge, and the refusal it would have drawn rides beside it.
+        let (solid, capture, closure_refusal) = match build_step_body_captured(&resolver, body) {
+            Ok((solid, capture, readings)) => (
+                Ok(solid),
+                capture.unwrap_or_default(),
+                readings.closure.overridden().map(|refusal| refusal.message.clone()),
+            ),
+            Err(error) => (Err(error.to_string()), Default::default(), None),
         };
         let mut edges: Vec<StepEdgeReading> = Vec::new();
         let mut faces: Vec<StepFaceReading> = Vec::new();
@@ -164,6 +175,7 @@ pub fn import_step_trim_readings(text: &str) -> Result<StepTrimReadings, String>
         bodies.push(StepBodyTrimReadings {
             body_ref,
             solid,
+            closure_refusal,
             edges,
             faces,
         });

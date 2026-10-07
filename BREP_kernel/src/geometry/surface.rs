@@ -361,7 +361,7 @@ impl NurbsSurface {
         }
         let anchor_u = uu - du_out;
         let anchor_v = vv - dv_out;
-        let base = self.derivatives(anchor_u, anchor_v, derivative_count.max(1))?;
+        let base = self.derivatives(anchor_u, anchor_v, derivative_count.max(2))?;
         let order = derivative_count + 1;
         let mut result = vec![vec![Vec3::default(); order]; order];
         // Bilinear extension: S = A00 + du·A10 + dv·A01 + du·dv·A11
@@ -810,10 +810,10 @@ impl NurbsSurface {
         }
         let anchor_u = uu - du_out;
         let anchor_v = vv - dv_out;
-        let base = self.derivatives_small(anchor_u, anchor_v, 1)?;
+        let base = self.derivatives_small(anchor_u, anchor_v, 2)?;
         // Bilinear extension: S = A00 + du·A10 + dv·A01 + du·dv·A11.
-        // With count == 1, `base[1][1]` is `Vec3::default()`, exactly as the
-        // Vec path's `base` (derivatives(..., 1)) leaves it.
+        // The mixed anchor derivative has total order two, even when
+        // the caller requests only the value or first partials.
         let s = base[0][0]
             .add(base[1][0].scale(du_out))
             .add(base[0][1].scale(dv_out))
@@ -1499,4 +1499,5 @@ fn normalized(parameters: &[f64]) -> Vec<f64> {
         .map(|p| (p - first) / (last - first))
         .collect()
 }
+
 

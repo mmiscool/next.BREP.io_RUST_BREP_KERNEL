@@ -301,6 +301,8 @@ pub fn schema() -> serde_json::Value {
     "type": "R",
     "shortName": "R",
     "longName": "Revolve",
+    "ribbonPath": "Home/Sweep/Revolve",
+    "commandSize": "Large",
     "displayBuilder": false,
     "inputParamsSchema": {
         "id": {

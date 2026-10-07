@@ -1,0 +1,20 @@
+{
+  "toast_ui_editor": {
+    "version": "3.2.2",
+    "source": "https://github.com/nhn/tui.editor",
+    "license": "MIT",
+    "license_file": "TOAST-UI-LICENSE",
+    "note": "Pinned self-hosted bundle; replaceable through the MIME adapter registry. Usage statistics are disabled."
+  },
+  "dompurify": {
+    "version": "3.4.16",
+    "source": "https://github.com/cure53/DOMPurify",
+    "license": "Apache-2.0 OR MPL-2.0",
+    "license_file": "DOMPurify-LICENSE"
+  },
+  "sha256": {
+    "toastui-editor.js": "f50e1b7c0fc4e5d9a1ccd0d8be78cb3a950ccb3bf676fbf1627810c76aeaedd8",
+    "toastui-editor.css": "c0ceb967b8c97038dccaa2a35c2222ec35b53a0022febbb6a22715c23ead9211",
+    "purify.min.js": "2c90a9b46d6463f26038a29b686e82bc91de01fdac9d5229e7cfe3b360134ea2"
+  }
+}

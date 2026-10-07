@@ -2,6 +2,7 @@
 //! Rendering, picking, and feature-reference display share this scene map.
 
 use crate::camera::Aabb;
+use std::cell::RefCell;
 use std::collections::HashMap;
 
 /// The kind of a display face (surface classification rides along when known —
@@ -122,7 +123,7 @@ pub struct SolidDisplay {
 }
 
 /// Source of monotonic [`SolidDisplay::revision`] values.
-fn next_revision() -> u64 {
+pub(crate) fn next_revision() -> u64 {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(1);
     COUNTER.fetch_add(1, Ordering::Relaxed)
@@ -134,6 +135,9 @@ fn next_revision() -> u64 {
 pub struct RenderScene {
     solids: Vec<SolidDisplay>,
     index: HashMap<String, usize>,
+    /// Triangle BVHs for dense displays, built once on first pick. Scene
+    /// mutations invalidate these independently of camera and visibility.
+    pick_trees: RefCell<HashMap<String, brep_kernel::Bvh>>,
     /// The B-rep of the kernel displays a drawing sheet has ASKED for, keyed by
     /// solid name with the resident handle it came from: `name -> (handle,
     /// fingerprint, solid)`. Only a sheet reads topology, and the runner sends
@@ -161,6 +165,7 @@ impl RenderScene {
     /// Insert or replace a solid by name (replacement keeps insertion order —
     /// a boolean result reusing its target's name stays in place).
     pub fn insert_solid(&mut self, solid: SolidDisplay) {
+        self.pick_trees.get_mut().remove(&solid.name);
         match self.index.get(&solid.name) {
             Some(&slot) => self.solids[slot] = solid,
             None => {
@@ -172,6 +177,7 @@ impl RenderScene {
 
     /// Drop every solid (the scene rebuild path clears then repopulates).
     pub fn clear(&mut self) {
+        self.pick_trees.get_mut().clear();
         self.solids.clear();
         self.index.clear();
     }
@@ -182,6 +188,7 @@ impl RenderScene {
     /// meshes — a scene-free [`crate::pipeline::SceneRunner`] delta is applied by
     /// draining then reinserting in snapshot order.
     pub fn drain(&mut self) -> Vec<SolidDisplay> {
+        self.pick_trees.get_mut().clear();
         self.index.clear();
         std::mem::take(&mut self.solids)
     }
@@ -307,6 +314,7 @@ impl RenderScene {
             return false;
         };
         self.solids.remove(slot);
+        self.pick_trees.get_mut().remove(name);
         for value in self.index.values_mut() {
             if *value > slot {
                 *value -= 1;
@@ -387,7 +395,29 @@ impl RenderScene {
 
     pub fn solid_mut(&mut self, name: &str) -> Option<&mut SolidDisplay> {
         let slot = *self.index.get(name)?;
+        // A caller can edit positions, indices or face ranges through this
+        // reference without changing the display revision.
+        self.pick_trees.get_mut().remove(name);
         Some(&mut self.solids[slot])
+    }
+
+    pub(crate) fn pick_triangles(&self, solid: &SolidDisplay, ray: &crate::view::Ray, out: &mut Vec<usize>) {
+        let mut trees = self.pick_trees.borrow_mut();
+        let tree = trees.entry(solid.name.clone()).or_insert_with(|| {
+            let boxes: Vec<_> = solid.mesh.indices.chunks_exact(3).map(|indices| {
+                let mut bounds = brep_kernel::Aabb::empty();
+                for &index in indices {
+                    let p = solid.mesh.positions[index as usize];
+                    bounds.include_point(brep_kernel::Vec3::new(p[0] as f64, p[1] as f64, p[2] as f64));
+                }
+                bounds
+            }).collect();
+            brep_kernel::Bvh::build(&boxes)
+        });
+        let v = |p: [f64; 3]| brep_kernel::Vec3::new(p[0], p[1], p[2]);
+        tree.intersecting_ray(v(ray.origin), v(ray.dir), 1e-9, out);
+        // Preserve face/triangle traversal order, including tied hits.
+        out.sort_unstable();
     }
 
     /// Insertion-ordered iteration (deterministic — drives draw order).

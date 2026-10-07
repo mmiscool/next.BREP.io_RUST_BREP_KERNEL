@@ -39,6 +39,13 @@ struct SolidBuilder<'a> {
     /// Per-edge provenance for [`crate::import_step_trim_readings`]; `None` on
     /// every ordinary import.
     readings: Option<readings::TrimCapture>,
+    /// Built face id -> `(ADVANCED_FACE ref, surface ref)`, always on: the
+    /// closure gate names a refused body's faces by their file entities.
+    face_refs: HashMap<u64, (usize, usize)>,
+    /// Edges whose curve `reconcile_edges_onto_surfaces` REPLACED with its
+    /// projection onto one carrier: their standoff from another carrier is
+    /// the pass's, not the file's, and the closure gate says which.
+    reconciled_edges: HashSet<u64>,
 }
 
 /// Per-body tally of the supplied-pcurve lane. A supplied pcurve is an
@@ -91,6 +98,7 @@ struct PendingFace {
     bounds: Vec<(Vec<(u64, bool)>, bool)>,
 }
 
+mod closure;
 mod collect;
 pub(in crate::step_import) mod readings;
 mod supplied_fit;
@@ -101,3 +109,4 @@ pub(in crate::step_import) mod loops;
 mod solids;
 
 pub(super) use solids::*;
+pub(in crate::step_import) use closure::{ClosureNote, SHELL_CLOSURE};

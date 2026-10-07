@@ -23,6 +23,7 @@ mod triangulate;
 mod periodic;
 mod edge_sampling;
 mod face_tess;
+mod cone;
 mod orient;
 mod sphere_atlas;
 mod stride_encode;
@@ -32,6 +33,7 @@ use triangulate::*;
 use periodic::*;
 use edge_sampling::*;
 use face_tess::*;
+use cone::tessellate_pointed_cone_fan;
 use sphere_atlas::*;
 
 pub use face_tess::triangulate_planar_region;

@@ -130,10 +130,38 @@ impl ArcballControls {
         was
     }
 
+    /// Direct two-finger navigation in viewport pixels. Zoom about the previous
+    /// midpoint, then carry that point to the new midpoint. Unlike wheel input,
+    /// the distance ratio is applied exactly, without notch sensitivity.
+    pub fn touch_navigation(
+        &mut self,
+        camera: &mut ViewCamera,
+        from: [f64; 2],
+        to: [f64; 2],
+        scale: f64,
+    ) -> bool {
+        if !self.enabled
+            || !scale.is_finite()
+            || scale <= 0.0
+            || !from.into_iter().chain(to).all(f64::is_finite)
+            || (from == to && scale == 1.0)
+        {
+            return false;
+        }
+        zoom_toward(camera, scale.recip(), from[0], from[1]);
+        pan(camera, to[0] - from[0], to[1] - from[1]);
+        true
+    }
+
     /// Wheel zoom about the target. `delta_y` is in egui POINTS (see
     /// [`ZOOM_PER_NOTCH`]); negative = zoom in. Returns true when the camera
     /// changed.
-    pub fn wheel(&mut self, camera: &mut ViewCamera, delta_y: f64, cursor: Option<[f64; 2]>) -> bool {
+    pub fn wheel(
+        &mut self,
+        camera: &mut ViewCamera,
+        delta_y: f64,
+        cursor: Option<[f64; 2]>,
+    ) -> bool {
         if !self.enabled || delta_y == 0.0 {
             return false;
         }
@@ -158,7 +186,7 @@ pub fn zoom_toward(camera: &mut ViewCamera, factor: f64, cx: f64, cy: f64) {
     let (right, up, _) = camera.basis();
     let sx = cx - camera.width * 0.5;
     let sy = -(cy - camera.height * 0.5); // screen-y-down → world-up
-    // World offset from the target to the cursor point on the focus plane.
+                                          // World offset from the target to the cursor point on the focus plane.
     let off = add3(scale3(right, sx * wpp), scale3(up, sy * wpp));
     match &mut camera.projection {
         Projection::Orthographic { half_height } => {
@@ -173,7 +201,10 @@ pub fn zoom_toward(camera: &mut ViewCamera, factor: f64, cx: f64, cy: f64) {
             // Scale eye + target about the cursor world point (keeps the view
             // direction; the cursor point stays put → zoom toward the mouse).
             let cursor_world = add3(camera.target, off);
-            let nt = add3(cursor_world, scale3(sub3(camera.target, cursor_world), factor));
+            let nt = add3(
+                cursor_world,
+                scale3(sub3(camera.target, cursor_world), factor),
+            );
             let ne = add3(cursor_world, scale3(sub3(camera.eye, cursor_world), factor));
             let dir = sub3(ne, nt);
             let dist = len3(dir).max(MIN_PERSP_DISTANCE);

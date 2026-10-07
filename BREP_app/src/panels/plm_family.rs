@@ -316,8 +316,8 @@ impl PlmFamily {
 /// and its category's schema (`GET /api/categories/:id/schema`).
 async fn load_info(client: &PlmClient, key: &str) -> Result<Info, String> {
     let (part, _) = family::key_ids(key).ok_or_else(|| format!("`{key}` is not a PLM revision"))?;
-    let head = family::part_head(client, part).await.map_err(|e| e.to_string())?;
-    let view = family::family_view(client, part).await.map_err(|e| e.to_string())?;
+    let head = family::part_head(client, &part).await.map_err(|e| e.to_string())?;
+    let view = family::family_view(client, &part).await.map_err(|e| e.to_string())?;
     let schema = if head.category.is_empty() {
         Vec::new()
     } else {

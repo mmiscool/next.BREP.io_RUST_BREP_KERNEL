@@ -106,6 +106,13 @@
 //!   neither a network edge nor a moved one — the standing cap — is not
 //!   re-trimmed.
 //!
+//! When two capped strips meet along a cap leg, a cap can border another cap
+//! on the same carrier as its strip's wall. Ownership then follows both the
+//! fragment name and the carrier. Removing one strip keeps the other cap's
+//! leg and its endpoints, and transfers its second coedge to the recovered
+//! wall. That existing leg closes the gap between the sharp edge and the kept
+//! strip; collapsing it would erase the kept strip's end arc.
+//!
 //! ## Scope
 //!
 //! One selection whose faces are joined through their junctions, planar
@@ -119,7 +126,7 @@
 //! beside it that is not a kept strip of that shape (a sphere, a strip whose cap
 //! is oblique to its axis) or that touches it anywhere but a fixed apex, is
 //! refused by name: one face at a time has no better answer for a network. A
-//! junction holding both a held and a standing apex, or a kept strip and an
+//! junction holding distinct held and standing apexes, or a kept strip and an
 //! apex, is refused by name. A single corner blend never gets here: the corner
 //! lane takes it first, byte for byte as it always has.
 
@@ -157,6 +164,7 @@ pub(super) struct KeptStrip {
 pub(super) struct NetworkCap {
     face_id: u64,
     plane: Plane,
+    walls: [u64; 2],
     /// Where the two legs meet: the sharp vertex the strip was cut back from.
     apex: u64,
     /// Whether an edge outside the network still ends on the apex — the
@@ -191,6 +199,9 @@ pub(super) struct BlendNetwork {
     pub(super) caps: Vec<NetworkCap>,
     /// Every cap left beside the network with its own strip, by face id.
     standing_caps: HashMap<u64, StandingCap>,
+    /// Legs shared by a removed cap and a standing cap, transferred to the
+    /// coplanar wall of the removed strip. Both endpoints stay where they are.
+    retained_legs: Vec<(u64, [u64; 2])>,
 }
 
 /// What the network gate made of a selection.
@@ -404,7 +415,7 @@ fn read_cap(
         let other = across_face(owners, coedge.edge_id, face.id)?;
         let (shell, position) = find_face(solid, other)?;
         let other_name = solid.shells[shell].faces[position].name.as_deref();
-        if other_name.is_some_and(|name| name == strip_name || without_index(name) == strip_name) {
+        if other_name.is_some_and(|name| cap_strip_name_matches(name, strip_name)) {
             arcs.push((coedge.edge_id, other));
         } else {
             legs.push((coedge.edge_id, other));
@@ -440,14 +451,66 @@ fn read_cap(
         .flat_map(|loop_record| &loop_record.coedges)
         .filter_map(|coedge| across_face(owners, coedge.edge_id, *strip))
         .collect();
-    (wall_a != wall_b && strip_walls.contains(wall_a) && strip_walls.contains(wall_b)).then_some(
-        CapRead {
-            strip: *strip,
-            plane,
-            apex,
-            walls: [*wall_a, *wall_b],
-        },
-    )
+    // A neighbouring strip's cap can stand in for a wall at a shared leg.
+    // Compare carriers as well as ids: these two planar faces are distinct
+    // pieces of the same sharp wall, and the standing cap must survive.
+    let wall_for = |other: u64| -> Option<u64> {
+        if strip_walls.contains(&other) {
+            return Some(other);
+        }
+        let (shell, position) = find_face(solid, other)?;
+        let other_face = &solid.shells[shell].faces[position];
+        without_index(other_face.name.as_deref()?).strip_suffix(":CAP")?;
+        let other_plane =
+            plane_of_surface(&other_face.surface, plane_tolerance, "blend cap").ok()?;
+        let mut matches = strip_walls.iter().copied().filter(|wall| {
+            let Some((shell, position)) = find_face(solid, *wall) else {
+                return false;
+            };
+            plane_of_surface(
+                &solid.shells[shell].faces[position].surface,
+                plane_tolerance,
+                "blend cap",
+            )
+            .is_ok_and(|candidate| {
+                candidate.normal.cross(other_plane.normal).length() <= 1e-7
+                    && candidate
+                        .origin
+                        .sub(other_plane.origin)
+                        .dot(other_plane.normal)
+                        .abs()
+                        <= plane_tolerance
+            })
+        });
+        let wall = matches.next()?;
+        matches.next().is_none().then_some(wall)
+    };
+    let walls = [wall_for(*wall_a)?, wall_for(*wall_b)?];
+    (walls[0] != walls[1]).then_some(CapRead {
+        strip: *strip,
+        plane,
+        apex,
+        walls,
+    })
+}
+
+/// A cap retains its source strip's name when a boolean splits that strip.
+/// The assembler uses `_n` for fragments; the feature registry uses `[n]`.
+/// Names only identify candidates: `read_cap` also requires the shared arc,
+/// two straight legs, and the same two walls on the adjacent strip.
+fn cap_strip_name_matches(name: &str, source: &str) -> bool {
+    // A trailing index can belong to the source edge reference itself,
+    // e.g. `F2:BLEND:Box_NX|Box_NZ[0]`, rather than name disambiguation.
+    if name == source {
+        return true;
+    }
+    let name = without_index(name);
+    name == source
+        || name.strip_prefix(source).is_some_and(|suffix| {
+            suffix.strip_prefix('_').is_some_and(|index| {
+                !index.is_empty() && index.bytes().all(|byte| byte.is_ascii_digit())
+            })
+        })
 }
 
 /// `name` without one trailing `[n]` uniqueness index.
@@ -608,9 +671,10 @@ fn read_network(solid: &BrepSolid, face_ids: &[u64], op: &str) -> Option<Network
     let caps: Vec<NetworkCap> = scan
         .owned
         .into_iter()
-        .map(|(face_id, CapRead { plane, apex, .. })| NetworkCap {
+        .map(|(face_id, CapRead { plane, apex, walls, .. })| NetworkCap {
             face_id,
             plane,
+            walls,
             apex,
             held: solid.edges.iter().any(|edge| {
                 !network_edges.contains(&edge.id)
@@ -618,6 +682,51 @@ fn read_network(solid: &BrepSolid, face_ids: &[u64], op: &str) -> Option<Network
             }),
         })
         .collect();
+    let mut retained_legs = Vec::new();
+    for cap in &caps {
+        let (shell, position) = find_face(solid, cap.face_id)?;
+        for coedge in solid.shells[shell].faces[position]
+            .loops
+            .iter()
+            .flat_map(|l| &l.coedges)
+        {
+            let other = across_face(&owners, coedge.edge_id, cap.face_id)?;
+            let Some(standing) = standing_caps.get(&other) else {
+                continue;
+            };
+            let edge = edge_records[&coedge.edge_id];
+            if cap.apex != standing.apex
+                || ![edge.start_vertex_id, edge.end_vertex_id].contains(&cap.apex)
+                || edge.curve.straight_segment(plane_tolerance).is_none()
+            {
+                continue;
+            }
+            let (shell, position) = find_face(solid, other)?;
+            let plane = plane_of_surface(
+                &solid.shells[shell].faces[position].surface,
+                plane_tolerance,
+                op,
+            )
+            .ok()?;
+            let wall = cap.walls.iter().copied().find(|wall| {
+                let Some((shell, position)) = find_face(solid, *wall) else {
+                    return false;
+                };
+                plane_of_surface(
+                    &solid.shells[shell].faces[position].surface,
+                    plane_tolerance,
+                    op,
+                )
+                .is_ok_and(|candidate| {
+                    candidate.normal.cross(plane.normal).length() <= angular
+                        && candidate.origin.sub(plane.origin).dot(plane.normal).abs()
+                            <= plane_tolerance
+                })
+            })?;
+            retained_legs.push((edge.id, [other, wall]));
+        }
+    }
+    retained_legs.sort_unstable_by_key(|(edge, _)| *edge);
     // One face is a network only with the caps it takes or the caps standing at
     // its ends: a lone strip with neither is the one-face chain's question.
     if faces.len() < 2 && !standing_caps.values().any(|cap| vertex_set.contains(&cap.apex)) {
@@ -630,6 +739,10 @@ fn read_network(solid: &BrepSolid, face_ids: &[u64], op: &str) -> Option<Network
         .filter(|cap| cap.held)
         .map(|cap| cap.apex)
         .chain(standing_caps.values().map(|cap| cap.apex))
+        .chain(retained_legs.iter().flat_map(|(id, _)| {
+            let edge = edge_records[id];
+            [edge.start_vertex_id, edge.end_vertex_id]
+        }))
         .filter(|apex| vertex_set.contains(apex))
         .collect();
 
@@ -919,6 +1032,7 @@ fn read_network(solid: &BrepSolid, face_ids: &[u64], op: &str) -> Option<Network
         kept_at,
         caps,
         standing_caps,
+        retained_legs,
     }))
 }
 
@@ -1034,7 +1148,11 @@ pub(super) fn heal_blend_network(
     let mut arcs: Vec<EdgeRecord> = Vec::new();
     // Straight edges from a standing cap's apex to its junction's vertex, each
     // with the two walls it lies on.
-    let mut spokes: Vec<(EdgeRecord, [u64; 2])> = Vec::new();
+    let mut spokes: Vec<(EdgeRecord, [u64; 2])> = network
+        .retained_legs
+        .iter()
+        .map(|(id, walls)| (edge_records[id].clone(), *walls))
+        .collect();
     for (junction_index, junction) in network.junctions.iter().enumerate() {
         let members: HashSet<u64> = junction.iter().copied().collect();
         let mut incident: Vec<u64> = network
@@ -1071,17 +1189,19 @@ pub(super) fn heal_blend_network(
             .map(|(face_id, cap)| (*face_id, cap))
             .collect();
         standing.sort_unstable_by_key(|(face_id, _)| *face_id);
-        if let (Some(cap), Some((standing_id, _))) = (held.first(), standing.first()) {
-            return Err(KernelRefusal::unsupported(
-                KernelStage::Classify,
-                "held_and_standing",
-                format!(
-                    "{op}: the blend junction near ({:.6}, {:.6}, {:.6}) holds the apex of blend cap \
-                 face {} and the apex of blend cap face {standing_id}, which stays — reading \
-                 both in one junction is not supported",
-                    near.x, near.y, near.z, cap.face_id
-                ),
-            ));
+        if let Some(cap) = held.first() {
+            if let Some((standing_id, _)) = standing.iter().find(|(_, other)| other.apex != cap.apex) {
+                return Err(KernelRefusal::unsupported(
+                    KernelStage::Classify,
+                    "held_and_standing",
+                    format!(
+                        "{op}: the blend junction near ({:.6}, {:.6}, {:.6}) holds the apex of blend cap \
+                     face {} and the apex of blend cap face {standing_id}, which stays — reading \
+                     both in one junction is not supported",
+                        near.x, near.y, near.z, cap.face_id
+                    ),
+                ));
+            }
         }
 
         if let Some(kept_id) = network.kept_at.get(&junction_index) {
@@ -1405,6 +1525,17 @@ pub(super) fn heal_blend_network(
                         .all(|at| at.sub(plane.origin).dot(plane.normal).abs() <= plane_tolerance)
                 })
             });
+            // Shared caps already have the same sharp apex; their existing
+            // leg supplies the connection, so there is no zero-length spoke.
+            if apex.sub(point).length() <= tolerance
+                && held.iter().any(|owned| owned.apex == cap.apex)
+                && network
+                    .retained_legs
+                    .iter()
+                    .any(|(_, walls)| walls.contains(cap_id))
+            {
+                continue;
+            }
             if !on_walls || apex.sub(point).length() <= tolerance {
                 return Err(KernelRefusal::ill_posed(
                     KernelStage::Classify,
@@ -1506,6 +1637,10 @@ pub(super) fn heal_blend_network(
         .filter(|cap| cap.held)
         .map(|cap| cap.apex)
         .chain(spokes.iter().map(|(spoke, _)| spoke.start_vertex_id))
+        .chain(network.retained_legs.iter().flat_map(|(id, _)| {
+            let edge = &edge_records[id];
+            [edge.start_vertex_id, edge.end_vertex_id]
+        }))
         .collect();
     let mut pending: Vec<(usize, Option<(u64, Vec3)>, Option<(u64, Vec3)>)> = Vec::new();
     for (index, edge) in solid.edges.iter().enumerate() {
@@ -1581,7 +1716,26 @@ pub(super) fn heal_blend_network(
     moved_edges_lie_on_their_faces(&unmoved, &solid, &relocated, &network.planes, plane_tolerance, op)?;
 
     // --- Survivors: rims become sharp edges, end edges go ---------------------
+    let retained: HashSet<u64> = network.retained_legs.iter().map(|(id, _)| *id).collect();
     let mut orientation: HashMap<u64, Vec<bool>> = HashMap::default();
+    for face in solid
+        .shells
+        .iter()
+        .flat_map(|shell| &shell.faces)
+        .filter(|face| !network.faces.contains(&face.id))
+    {
+        for coedge in face
+            .loops
+            .iter()
+            .flat_map(|l| &l.coedges)
+            .filter(|c| retained.contains(&c.edge_id))
+        {
+            orientation
+                .entry(coedge.edge_id)
+                .or_default()
+                .push(coedge.forward);
+        }
+    }
     let mut touched_faces: Vec<u64> = Vec::new();
     for shell in &mut solid.shells {
         for face in &mut shell.faces {
@@ -1592,7 +1746,9 @@ pub(super) fn heal_blend_network(
                 .loops
                 .iter()
                 .flat_map(|loop_record| &loop_record.coedges)
-                .any(|coedge| network.edges.contains(&coedge.edge_id));
+                .any(|coedge| {
+                    network.edges.contains(&coedge.edge_id) && !retained.contains(&coedge.edge_id)
+                });
             if !uses_network {
                 continue;
             }
@@ -1600,7 +1756,9 @@ pub(super) fn heal_blend_network(
             for loop_record in &mut face.loops {
                 let mut rebuilt: Vec<CoedgeRecord> = Vec::with_capacity(loop_record.coedges.len());
                 for coedge in &loop_record.coedges {
-                    if !network.edges.contains(&coedge.edge_id) {
+                    if !network.edges.contains(&coedge.edge_id)
+                        || retained.contains(&coedge.edge_id)
+                    {
                         rebuilt.push(coedge.clone());
                         continue;
                     }

@@ -114,8 +114,10 @@ impl Upload {
     }
 
     /// The file is complete: flush it and hand it on.
-    pub fn finish(mut self) -> Result<Staged, Error> {
-        if self.size == 0 {
+    pub fn finish(self) -> Result<Staged, Error> { self.finish_with_empty(false) }
+
+    pub(crate) fn finish_with_empty(mut self, allow_empty: bool) -> Result<Staged, Error> {
+        if self.size == 0 && !allow_empty {
             return Err(Error::bad_request("the file is empty"));
         }
         self.file.sync_all().map_err(Error::internal)?;
@@ -223,6 +225,25 @@ pub fn locate(state: &State, id: &str) -> Option<Located> {
         }
     }
     None
+}
+
+/// Resolve a file in a particular part/revision; carried attachments can share ids.
+pub fn locate_scoped(state: &State, id: &str, part_key: &str, revision_key: &str) -> Option<Located> {
+    if part_key.is_empty() { return locate(state, id); }
+    let part = state.part_by_id_or_number(part_key)?;
+    let revision = if revision_key.is_empty() { None } else { Some(crate::bom::find_revision(part, revision_key)?) };
+    let files = revision.map(|r| &r.attachments).unwrap_or(&part.attachments);
+    let attachment = files.iter().find(|a| a.id == id)?.clone();
+    Some(Located { attachment, part_id: part.id.clone(), number: part.number.clone(),
+        revision_id: revision.map(|r| r.id.clone()).unwrap_or_default(),
+        revision_label: revision.map(|r| r.label.clone()).unwrap_or_default() })
+}
+
+pub fn attachment_writable(state: &State, user: &User, found: &Located) -> Result<(), Error> {
+    if !user.can_author() { return Err(Error::forbidden("editing an attachment needs the author group")); }
+    let part = state.part(&found.part_id).ok_or_else(|| Error::not_found("part"))?;
+    if !found.revision_id.is_empty() { revision_writable(state, user, part, &found.revision_id)?; }
+    Ok(())
 }
 
 /// Every blob the store references: attachments, revision thumbnails
@@ -388,6 +409,32 @@ impl Db {
                 }
             }
             Ok(attachment)
+        })
+    }
+
+    /// Replace exactly one attachment reference atomically. A fresh id protects
+    /// copies carried into other revisions; their original bytes remain intact.
+    pub fn replace_attachment(&self, user: &User, id: &str, part: &str, revision: &str,
+        expected_hash: &str, staged: Staged) -> Result<Located, Error> {
+        let root = self.root().to_path_buf();
+        self.mutate(|state| {
+            let found = locate_scoped(state, id, part, revision).ok_or_else(|| Error::not_found("attachment"))?;
+            attachment_writable(state, user, &found)?;
+            if found.attachment.sha256 != expected_hash { return Err(Error::conflict("This file changed since you opened it. Reopen it before saving.")); }
+            let mut changed = found.clone();
+            changed.attachment.id = crate::auth::new_id();
+            changed.attachment.sha256 = staged.sha256.clone();changed.attachment.size = staged.size;
+            changed.attachment.uploaded_by = user.id.clone();changed.attachment.uploaded_at = now();
+            place(&root, &staged)?;
+            let part = state.parts.get_mut(&found.part_id).ok_or_else(|| Error::not_found("part"))?;
+            let files = if found.revision_id.is_empty() { &mut part.attachments } else {
+                let r = part.revision_mut(&found.revision_id).ok_or_else(|| Error::not_found("revision"))?;
+                r.modified_at = now();&mut r.attachments
+            };
+            let file = files.iter_mut().find(|a| a.id == id).ok_or_else(|| Error::not_found("attachment"))?;
+            *file = changed.attachment.clone();
+            remove_if_unreferenced(state, &root, &found.attachment.sha256)?;
+            Ok(changed)
         })
     }
 

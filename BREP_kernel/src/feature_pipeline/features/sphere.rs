@@ -44,6 +44,8 @@ pub fn schema() -> serde_json::Value {
     "type": "P.S",
     "shortName": "P.S",
     "longName": "Primitive Sphere",
+    "ribbonPath": "Home/Primitives/Sphere",
+    "commandSize": "Compact",
     "displayBuilder": false,
     "inputParamsSchema": {
         "id": {

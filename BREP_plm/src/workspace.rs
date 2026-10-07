@@ -587,6 +587,10 @@ impl Db {
 
     /// Replace a file's bytes. The version before stays in its list.
     pub fn replace_file(&self, user: &User, id: &str, media_type: &str, staged: Staged) -> Result<EntryView, Error> {
+        self.replace_file_checked(user, id, media_type, staged, None)
+    }
+
+    pub fn replace_file_checked(&self, user: &User, id: &str, media_type: &str, staged: Staged, expected: Option<String>) -> Result<EntryView, Error> {
         let media_type = attach::clean_media_type(media_type);
         let (user, id) = (user.clone(), id.to_string());
         let root = self.root().to_path_buf();
@@ -594,6 +598,11 @@ impl Db {
             let e = owned(state, &user, &id)?;
             if e.kind != WorkspaceKind::File {
                 return Err(Error::bad_request(format!("'{}' is a {}, not a file", e.name, e.kind.as_str())));
+            }
+            if let Some(expected) = &expected {
+                if e.versions.last().map(|v| &v.sha256) != Some(expected) {
+                    return Err(Error::conflict("This file changed since you opened it. Reopen it before saving."));
+                }
             }
             attach::place(&root, &staged)?;
             let at = now();

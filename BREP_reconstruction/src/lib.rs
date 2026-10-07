@@ -9,3 +9,5 @@ pub mod brep;
 pub mod step_validation;
 pub mod stl;
 pub mod stl_conversion;
+
+mod hybrid_recovery;

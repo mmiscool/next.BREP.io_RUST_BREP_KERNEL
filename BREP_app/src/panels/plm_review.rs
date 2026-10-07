@@ -31,7 +31,6 @@
 //! with a waker that repaints, as S7's panel does. Nothing here is constructed
 //! without a server.
 
-use crate::automation::hit_keys::HitKeyDoc;
 use crate::panels::plm_parts::Pending;
 use crate::plm::PlmFuture;
 use eframe::egui;
@@ -42,17 +41,6 @@ use std::task::Waker;
 /// makes shows within this; the badge also asks after every action of the
 /// user's own.
 pub const INBOX_POLL_SECS: f64 = 60.0;
-
-/// Hit keys the review section publishes, in the PLM pane's blob
-/// (`__brepPlmHit`, panel `plm`) under its section id `review:`
-/// (`crate::panels::plm_host`).
-pub const HIT_KEYS: &[HitKeyDoc] = &[
-    HitKeyDoc { panel: "plm", prefix: "review:submit:", meaning: "Submit for review: reviewers, due (days), note, go", command: None },
-    HitKeyDoc { panel: "plm", prefix: "review:decide:", meaning: "a decision on the open round: comment, approve, reject", command: None },
-    HitKeyDoc { panel: "plm", prefix: "review:comment:", meaning: "the new comment's body and its Post button", command: None },
-    HitKeyDoc { panel: "plm", prefix: "review:eco:", meaning: "a change order: note, submit, release, and an item row by revision id (item:<id>; double click opens its review)", command: None },
-    HitKeyDoc { panel: "plm", prefix: "review:close", meaning: "close the review or change order shown", command: None },
-];
 
 // --- the wire ------------------------------------------------------------------
 //
@@ -864,7 +852,7 @@ impl ReviewPanel {
                         text.push_str(&format!(" — {}", item.problem));
                     }
                     let row = ui.selectable_label(false, text);
-                    self.hits.insert(format!("eco:item:{}", item.revision_id), row.rect);
+                    self.hits.insert(format!("eco:item:{}", crate::plm::identity::document_key(&item.part_id, &item.revision_id)), row.rect);
                     if row.double_clicked() {
                         events.push(PlmReviewEvent::OpenReview { part: item.part_id.clone(), revision: item.revision_id.clone() });
                     }
@@ -1051,7 +1039,8 @@ impl ReviewSection {
         }
     }
 
-    /// `__brepPlmReview`: what is open and what it says, for scripts.
+    /// What is open and what it says, for tests (no state blob: nothing draws
+    /// the section since the pane split moved review management to the web app).
     pub fn state_json(&self) -> serde_json::Value {
         let Some(panel) = &self.panel else { return serde_json::Value::Null };
         let subject = match &panel.subject {
@@ -1146,11 +1135,11 @@ impl InboxBadge {
         &self.hits
     }
 
-    /// `__brepPlmInbox`: the badge's count and rows, for scripts; null until
-    /// the first answer.
+    /// The badge's count and rows, for tests; null until the first answer (no
+    /// state blob: the toolbar links to the web inbox and never draws the badge).
     pub fn state_json(&self) -> String {
         let Some(inbox) = &self.inbox else { return "null".into() };
-        let rows = |items: &[InboxItem]| items.iter().map(|i| serde_json::json!({ "kind": i.kind, "title": i.title, "target": i.target, "revision": i.revision_id, "key": format!("plm:inbox:row:{}{}", i.target, i.revision_id) })).collect::<Vec<_>>();
+        let rows = |items: &[InboxItem]| items.iter().map(|i| serde_json::json!({ "kind": i.kind, "title": i.title, "target": i.target, "revision": i.revision_id, "key": format!("plm:inbox:row:{}:{}", crate::plm::identity::segment(&i.target), crate::plm::identity::segment(&i.revision_id)) })).collect::<Vec<_>>();
         serde_json::json!({ "count": inbox.count, "open": self.open, "waitingOnMe": rows(&inbox.waiting_on_me), "submitted": rows(&inbox.submitted), "problem": self.problem }).to_string()
     }
 
@@ -1219,7 +1208,7 @@ impl InboxBadge {
                     }
                     for item in items {
                         let row = ui.selectable_label(false, item.describe());
-                        self.hits.insert(format!("plm:inbox:row:{}{}", item.target, item.revision_id), row.rect);
+                        self.hits.insert(format!("plm:inbox:row:{}:{}", crate::plm::identity::segment(&item.target), crate::plm::identity::segment(&item.revision_id)), row.rect);
                         if row.clicked() {
                             events.extend(item.event());
                         }

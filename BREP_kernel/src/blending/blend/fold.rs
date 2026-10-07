@@ -25,6 +25,43 @@
 //! finite difference of the true centre curve rather than a chord of the
 //! march's own sampling.
 //!
+//! ## A tapered ball
+//!
+//! When the radius varies along the edge the wall is no longer a canal
+//! surface, and the picture of the envelope of spheres — its characteristic
+//! circle tilting out of the normal plane by `asin(−dρ/ds)` — describes a
+//! surface the kernel does not build. What the march builds is the loft of
+//! PLANAR circular sections: at every station a circle of the LOCAL radius
+//! centred on the ball, in the plane of the ball's centre and its two contacts
+//! (`apex_point` takes exactly that plane). For that surface,
+//! `x(t, ψ) = c(t) + ρ(t) û(t, ψ)` with `û` in the section plane of unit normal
+//! `m(t)`, the out-of-plane rate is
+//!
+//! ```text
+//! x_t · m = c' · m − ρ (û · m')          (û · m ≡ 0, so û' · m = −û · m')
+//! ```
+//!
+//! and the Pappus sign change — two parameters on one point — is where that
+//! vanishes on the section: `ρ (û · k_s) ≥ 1` with the SECTION TURN `k_s = m'
+//! / (c' · m)`. `ρ'` has no term of its own; it enters only through the
+//! sections themselves — as the ball grows its contacts slide, and the plane
+//! through the centre and the contacts turns with them, which is a part of
+//! `m'` the probes measure directly. On planar mates that part is zero, so a
+//! taper along a straight box edge sits in distinct parallel planes and cannot
+//! fold however the radius law bends; on the 2026-09-02 collar, whose tube the
+//! plane grazes, it is the dominant part (a symmetric taper peaking at 2.2
+//! over the bend reads 4.7 where the constant r = 2 reads 1.33). When the
+//! section plane is normal to the centre curve, `m = T` and `k_s` is the
+//! centre curve's curvature vector, so the constant-radius factor above is
+//! this one's special case (the two read 1.3341001 and 1.3340625 at the
+//! constant collar's peak station). The tapered verdict reads `m` and `c` off
+//! the same re-solved probes, differenced centrally at an interior station and
+//! one-sidedly at the two end stations, because the open lane's radius law is
+//! CLAMPED past the edge's ends: a probe straddling that kink through a
+//! circumcircle read a radius of curvature 0.024230 against ρ = 2 on the
+//! tapered box edge (factor 82), which was the clamp's slope discontinuity and
+//! not the wall.
+//!
 //! ## The section, not the ball
 //!
 //! `ρ κ > 1` alone is not the condition. The wall spans only the arc between
@@ -107,9 +144,11 @@ const REFINE_SAMPLES: usize = 8;
 #[derive(Clone, Copy)]
 pub(super) struct FoldSample {
     /// `ρ · max over the section arc of (curvature vector · direction)`. One
-    /// or more is a fold.
+    /// or more is a fold. The vector is the centre curve's curvature for a
+    /// constant radius and the section turn `m' / (c' · m)` for a tapered one.
     pub(super) factor: f64,
-    /// The centre curve's radius of curvature here.
+    /// The centre curve's radius of curvature here (constant radius), or the
+    /// sections' radius of turn `1 / |k_s|` (tapered).
     pub(super) curvature_radius: f64,
     pub(super) t: f64,
     pub(super) centre: Vec3,
@@ -230,20 +269,100 @@ fn sample(radius: f64, t: f64, probe: &Probe) -> Option<FoldSample> {
     })
 }
 
+/// Which finite difference a tapered station's section turn is read from.
+/// The end stations of an open march sit ON the radius law's clamp, so a
+/// difference straddling them would average the wall's rate with the clamped
+/// overshoot's; they are read one-sidedly, from the wall's own side.
+#[derive(Clone, Copy, PartialEq)]
+enum Difference {
+    Central,
+    Forward,
+    Backward,
+}
+
+/// The unit normal of the planar section through `centre` and both contacts —
+/// the plane `apex_point` puts the built arc in.
+fn section_normal(contacts: [Vec3; 2], centre: Vec3) -> Option<Vec3> {
+    contacts[0]
+        .sub(centre)
+        .cross(contacts[1].sub(centre))
+        .normalized()
+        .ok()
+}
+
+/// Measure the TAPERED fold factor at one edge parameter: the section turn
+/// `k_s = m' / (c' · m)` from the probe's section normals and ball centres,
+/// then the same maximisation over the arc the constant case does.
+fn sample_section(radius: f64, t: f64, probe: &Probe, difference: Difference) -> Option<FoldSample> {
+    let m = section_normal(probe.contacts, probe.centre)?;
+    let oriented = |contacts: [Vec3; 2], centre: Vec3| -> Option<Vec3> {
+        let normal = section_normal(contacts, centre)?;
+        Some(if normal.dot(m) < 0.0 { normal.scale(-1.0) } else { normal })
+    };
+    let (m_low, c_low, m_high, c_high) = match difference {
+        Difference::Central => (
+            oriented(probe.before.0, probe.before.1)?,
+            probe.before.1,
+            oriented(probe.after.0, probe.after.1)?,
+            probe.after.1,
+        ),
+        Difference::Forward => (m, probe.centre, oriented(probe.after.0, probe.after.1)?, probe.after.1),
+        Difference::Backward => (oriented(probe.before.0, probe.before.1)?, probe.before.1, m, probe.centre),
+    };
+    // `c' · m`, the rate at which the section plane advances along its own
+    // normal; a plane the centre does not cross is no section at all.
+    let advance = c_high.sub(c_low).dot(m);
+    if !(advance.abs() > 0.0) || !advance.is_finite() {
+        return None;
+    }
+    let turn = m_high.sub(m_low).scale(1.0 / advance);
+    let [p1, p2] = probe.contacts;
+    let factor = factor_of(radius, turn, probe.centre, p1, p2)?;
+    let magnitude = turn.length();
+    Some(FoldSample {
+        factor,
+        curvature_radius: if magnitude > 0.0 { 1.0 / magnitude } else { f64::INFINITY },
+        t,
+        centre: probe.centre,
+    })
+}
+
 /// The worst fold factor over a marched edge, refined around its peak.
 ///
 /// `stations` are the parameters the march already solved, each with its
 /// converged unknowns as the probe's seed. `visit` sees every station's probe
-/// first, in march order, and an error from it ends the scan there.
+/// first, in march order, and an error from it ends the scan there. A
+/// `tapered` march is measured by [`sample_section`], a constant one by
+/// [`sample`]; the station trace prints both readings so a station where they
+/// part can be read.
 fn worst_fold(
     radius_at: &dyn Fn(f64) -> f64,
     span: f64,
     stations: &[(f64, [f64; 4])],
     solve: SolveCentre<'_>,
+    tapered: bool,
     visit: &mut dyn FnMut(f64, &Probe) -> Result<(), KernelRefusal>,
 ) -> Result<Option<FoldSample>, KernelRefusal> {
     let mut worst: Option<(usize, FoldSample)> = None;
     let mut unmeasured = 0usize;
+    let t_low = stations.iter().map(|(t, _)| *t).fold(f64::INFINITY, f64::min);
+    let t_high = stations.iter().map(|(t, _)| *t).fold(f64::NEG_INFINITY, f64::max);
+    let trace = std::env::var("BREP_BLEND_STATION_TRACE").ok().as_deref() == Some("1");
+    let measure = |radius: f64, t: f64, probed: &Probe, difference: Difference| -> Option<FoldSample> {
+        let measured = if tapered {
+            sample_section(radius, t, probed, difference)
+        } else {
+            sample(radius, t, probed)
+        };
+        if trace {
+            let circumcircle = sample(radius, t, probed).map(|s| s.factor);
+            let section = sample_section(radius, t, probed, difference).map(|s| s.factor);
+            fold_trace(format_args!(
+                "  fold probe at t {t:.9}: radius {radius:.9} factor circumcircle {circumcircle:?} section {section:?}"
+            ));
+        }
+        measured
+    };
     for (index, (t, seed)) in stations.iter().enumerate() {
         let radius = radius_at(*t);
         let Some(probed) = probe(radius, span, *t, *seed, solve) else {
@@ -251,7 +370,14 @@ fn worst_fold(
             continue;
         };
         visit(radius, &probed)?;
-        let Some(measured) = sample(radius, *t, &probed) else {
+        let difference = if *t <= t_low {
+            Difference::Forward
+        } else if *t >= t_high {
+            Difference::Backward
+        } else {
+            Difference::Central
+        };
+        let Some(measured) = measure(radius, *t, &probed, difference) else {
             unmeasured += 1;
             continue;
         };
@@ -277,7 +403,7 @@ fn worst_fold(
             let t = t0 + (t1 - t0) * step as f64 / REFINE_SAMPLES as f64;
             let radius = radius_at(t);
             let measured = probe(radius, span, t, stations[index].1, solve)
-                .and_then(|probed| sample(radius, t, &probed));
+                .and_then(|probed| measure(radius, t, &probed, Difference::Central));
             if let Some(measured) = measured {
                 if measured.factor > best.factor {
                     best = measured;
@@ -408,26 +534,21 @@ pub(super) fn check_wall_fold(
     mates: [&crate::topology::FaceRecord; 2],
     scale: f64,
 ) -> Result<(), KernelRefusal> {
-    // A TAPERED ball is not measured, and that is a limitation rather than an
-    // oversight.  `ρκ > 1` is the fold condition for a CONSTANT-radius canal
-    // surface, where the characteristic circle lies in the centre curve's
-    // normal plane.  When ρ varies the circle tilts out of that plane by
-    // `asin(−dρ/ds)` and the condition is a different expression, which this
-    // module does not implement.
-    //
-    // Measured, not assumed: applied to the open-edge march the constant-radius
-    // form reads a curvature radius of 0.024230 against ρ = 2 — a factor of
-    // 82.102189 — at (8, 8, 10) on `fillet_edges_variable_tapers_a_box_edge`, a
-    // tapered box edge whose centre curve is very nearly straight and whose
-    // result matches its closed form.  Three sibling tests on the same lane
-    // with CONSTANT stops read clean.  So the discriminator is the taper, and
-    // refusing on it would refuse walls that build.
-    if !radius_is_constant(radius_at, stations) {
+    // A TAPERED ball is measured by the section turn, not the centre curve's
+    // circumcircle (module doc, "A tapered ball"). The circumcircle read 82 at
+    // (8, 8, 10) on `fillet_edges_variable_tapers_a_box_edge` — the END station
+    // of a straight edge, where the probe straddles the radius law's clamp and
+    // the centre curve kinks — and until 2026-09-30 that reading was taken for
+    // a property of tapers and the check abstained on every tapered span, so a
+    // tapered wall that folded was built and shipped. The section turn on that
+    // same edge is exactly zero at every station: its sections are circles in
+    // parallel planes.
+    let tapered = !radius_is_constant(radius_at, stations);
+    if tapered {
         fold_trace(format_args!(
-            "fold probe: the radius varies over these {} station(s) — not measured",
+            "fold probe: the radius varies over these {} station(s) — measuring the section turn",
             stations.len()
         ));
-        return Ok(());
     }
     let mut rail = |radius: f64, probed: &Probe| -> Result<(), KernelRefusal> {
         for side in 0..2 {
@@ -480,13 +601,33 @@ pub(super) fn check_wall_fold(
         }
         Ok(())
     };
-    let Some(worst) = worst_fold(radius_at, span, stations, solve, &mut rail)? else {
+    let Some(worst) = worst_fold(radius_at, span, stations, solve, tapered, &mut rail)? else {
         return Ok(());
     };
     if worst.factor <= 1.0 {
         return Ok(());
     }
     let radius = radius_at(worst.t);
+    if tapered {
+        let (low, high) = stations.iter().map(|(t, _)| radius_at(*t)).fold(
+            (f64::INFINITY, f64::NEG_INFINITY),
+            |(low, high), r| (low.min(r), high.max(r)),
+        );
+        return Err(wall_fold_refusal(
+            vec![mates[0].id, mates[1].id],
+            format!(
+            "{WALL_FOLDS} {radius} fits this edge where the taper reaches it: the tapered wall's \
+             sections turn tighter than the local ball at ({:.6}, {:.6}, {:.6}) — radius of turn \
+             {:.6} against a blend radius of {radius} there, so the section sweeps back through \
+             its neighbours (fold factor {:.6}; the radius runs from {low} to {high} along the edge)",
+            worst.centre.x,
+            worst.centre.y,
+            worst.centre.z,
+            worst.curvature_radius,
+            worst.factor,
+        ),
+        ));
+    }
     Err(wall_fold_refusal(
         vec![mates[0].id, mates[1].id],
         format!(

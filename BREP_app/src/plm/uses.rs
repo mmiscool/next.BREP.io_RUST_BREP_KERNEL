@@ -192,9 +192,9 @@ pub fn uses_lines(
         };
         let (part, revision) = match resolve(key) {
             DocumentIdentity::Revision { part, revision } => (part, revision),
-            DocumentIdentity::Path(path) => {
+            DocumentIdentity::Path(_) => {
                 list.refusals.push(refuse(format!(
-                    "'{}' was inserted from the file '{path}', not a PLM revision — import it first",
+                    "'{}' is a local component without a PLM revision — import it into PLM first",
                     occurrence.part_name
                 )));
                 continue;
@@ -428,11 +428,16 @@ pub async fn publish_uses(
 ) -> Result<UsesList, String> {
     let (part, revision) = revision_of(key)?;
     let list = uses_lines(&occurrences(document), &plm_identity);
-    let body = list.body()?;
+    let mut body = list.body()?;
+    let placements: Vec<Value> = list.lines.iter().flat_map(|placed| placed.occurrences.iter().map(|id| {
+        let attributes = document["features"].as_array().and_then(|features|features.iter().find(|f|f["inputParams"]["id"].as_str()==Some(id))).map(|f|f["inputParams"]["bom"].clone()).filter(Value::is_object).unwrap_or_else(||serde_json::json!({}));
+        serde_json::json!({"id":id,"part":placed.line.part,"revision":placed.line.revision,"attributes":attributes})
+    })).collect();
+    body["occurrences"] = serde_json::json!(placements);
     client
         .call(
             "PUT",
-            &format!("/api/parts/{part}/revisions/{revision}/uses"),
+            &format!("{}/uses", crate::plm::identity::revision_path(&part, &revision)),
             Some(serde_json::to_vec(&body).unwrap_or_default()),
         )
         .await
@@ -491,7 +496,7 @@ pub async fn release(
     client
         .call(
             "POST",
-            &format!("/api/parts/{part}/revisions/{revision}/checkin"),
+            &format!("{}/checkin", crate::plm::identity::revision_path(&part, &revision)),
             Some(b"{}".to_vec()),
         )
         .await
@@ -499,7 +504,7 @@ pub async fn release(
     let response = client
         .call(
             "POST",
-            &format!("/api/parts/{part}/revisions/{revision}/state"),
+            &format!("{}/state", crate::plm::identity::revision_path(&part, &revision)),
             Some(serde_json::to_vec(&serde_json::json!({ "to": "released" })).unwrap_or_default()),
         )
         .await
@@ -522,7 +527,7 @@ pub async fn release(
 pub async fn listed_uses(client: &crate::plm::client::PlmClient, key: &str) -> Result<Vec<ListedUse>, String> {
     let (part, revision) = revision_of(key)?;
     let response = client
-        .call("GET", &format!("/api/parts/{part}/revisions/{revision}/uses"), None)
+        .call("GET", &format!("{}/uses", crate::plm::identity::revision_path(&part, &revision)), None)
         .await
         .map_err(|error| error.to_string())?;
     let answer: Value = serde_json::from_slice(&response.body).map_err(|error| error.to_string())?;

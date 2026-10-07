@@ -70,6 +70,8 @@ fn resolve(annotation: &PmiAnnotation, context: &PmiContext<'_>) -> Result<Resol
         references: targets,
         geometry: PmiGeometry::Leader {
             targets: points.iter().map(|p| a3(*p)).collect(),
+            balloon: false,
+            anchor: None,
             dot: annotation.text("endStyle").eq_ignore_ascii_case("dot"),
         },
         default_label: a3(default_label),

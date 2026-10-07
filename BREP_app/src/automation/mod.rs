@@ -86,3 +86,6 @@ impl Default for AppOptions {
         Self { store: None, seed: true }
     }
 }
+
+#[cfg(feature = "automation")]
+mod cmd_plugins;

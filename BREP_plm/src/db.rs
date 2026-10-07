@@ -85,6 +85,12 @@ pub struct Change {
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct State {
     #[serde(default)]
+    pub workflows: Vec<crate::workflow::Definition>,
+    #[serde(default)]
+    pub workflow_runs: Vec<crate::workflow::Run>,
+    #[serde(default)]
+    pub bom_configuration: crate::bom_config::Configuration,
+    #[serde(default)]
     pub seq: u64,
     #[serde(default)]
     pub users: Vec<User>,
@@ -225,6 +231,7 @@ pub struct Db {
     _lock: Arc<crate::dirlock::DirLock>,
     /// The last backup this process took, and whether one is running.
     backups: Arc<crate::backup::Status>,
+    pub(crate) bake_worker: Arc<crate::bake_worker::Controller>,
 }
 
 /// Whole seconds since the epoch.
@@ -268,7 +275,7 @@ impl Db {
         // servers on one directory would each hold their own copy of the
         // metadata and overwrite each other's changes.
         let lock = crate::dirlock::DirLock::acquire(&root)?;
-        fs::create_dir_all(root.join("docs"))?;
+        fs::create_dir_all(root.join("models"))?;
         let scripts = Scripts::new(scripts.unwrap_or_else(|| root.join("scripts")))?;
         if let Some(report) = migrate_files(&root, false)? {
             eprintln!("brep-plm: {report}");
@@ -277,6 +284,10 @@ impl Db {
         let loaded = sql.load().map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         let fresh = loaded.is_none();
         let mut state = loaded.unwrap_or_default();
+        if state.parts.iter().any(|p| p.id != p.number || p.revisions.iter().any(|r| r.id != r.label)) {
+            return Err(io::Error::new(io::ErrorKind::InvalidData,
+                "legacy opaque model IDs are no longer supported; stop the server and reset its data directory"));
+        }
         let before = sql::small_value(&mut state);
 
         let mut seeded = None;
@@ -330,6 +341,7 @@ impl Db {
             sql: Arc::new(sql),
             _lock: Arc::new(lock),
             backups: Arc::new(crate::backup::Status::default()),
+            bake_worker: Arc::new(crate::bake_worker::Controller::default()),
         };
         // What a crash between an upload's move and its commit can leave:
         // nothing else is running yet, and the directory is ours alone.
@@ -338,13 +350,44 @@ impl Db {
             Ok(n) => eprintln!("brep-plm: removed {n} unreferenced attachment file(s)"),
             Err(error) => eprintln!("brep-plm: could not sweep attachment files: {error}"),
         }
+        db.initialize_geometry().map_err(io::Error::other)?;
+        db.initialize_bom_occurrences().map_err(io::Error::other)?;
+        db.recover_workflows().map_err(io::Error::other)?;
         Ok((db, seeded))
+    }
+
+    /// Backfill derived metadata once per document hash, including released
+    /// history, without changing document bytes, lifecycle or checkout.
+    fn initialize_geometry(&self) -> Result<(), Error> {
+        let pending = self.read(|state| state.parts.iter().flat_map(|p| p.revisions.iter()
+            .filter(|r| !r.content_hash.is_empty() && r.geometry_content_hash != r.content_hash)
+            .map(|r| (p.id.clone(), r.id.clone(), r.content_hash.clone(), r.document_key(&p.id))))
+            .collect::<Vec<_>>());
+        if pending.is_empty() { return Ok(()); }
+        let mut updates = Vec::new();
+        for (part, revision, hash, key) in pending {
+            let body = self.read_document(&key)?.unwrap_or_default();
+            updates.push((part, revision, hash, crate::geometry::contains_geometry(&body)));
+        }
+        self.mutate(|state| {
+            for (part, revision, hash, geometry) in updates {
+                let r = find_revision_mut(state, &part, &revision)?.1;
+                if r.content_hash == hash { r.has_geometry = geometry; r.geometry_content_hash = hash; }
+                state.touch(crate::identity::document_key(&part, &revision));
+            }
+            Ok(())
+        })
     }
 
     /// The administrator's scripts directory.
     /// The data directory.
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// Stop only the child owned by this server, including on shutdown.
+    pub fn stop_bake_worker(&self) -> Result<crate::bake_worker::Status, Error> {
+        self.bake_worker.stop(self.security.config.bake_worker.as_ref())
     }
 
     pub fn scripts(&self) -> &Scripts {
@@ -544,22 +587,9 @@ impl Db {
     // -- documents ---------------------------------------------------------
 
     pub(crate) fn document_path(&self, key: &str) -> Result<PathBuf, Error> {
-        let mut path = self.root.join("docs");
-        for segment in key.split('/') {
-            if segment.is_empty()
-                || segment == "."
-                || segment == ".."
-                || !segment
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-            {
-                return Err(Error::bad_request(format!(
-                    "'{key}' is not a usable document key"
-                )));
-            }
-            path.push(segment);
-        }
-        Ok(path.with_extension("json"))
+        let (part, revision) = crate::identity::split_key(key)
+            .ok_or_else(|| Error::bad_request(format!("'{key}' is not a usable document key")))?;
+        Ok(self.root.join(crate::identity::model_path(&part, &revision)))
     }
 
     /// One document's text, or `None` when it has never been written.
@@ -586,11 +616,61 @@ impl Db {
     /// the two leaves a document whose hash is not yet recorded, rather than a
     /// recorded hash for bytes that do not exist.
     pub fn write_document(&self, part_id: &str, revision_id: &str, body: &str) -> Result<u64, Error> {
-        let key = format!("part/{part_id}/rev/{revision_id}");
+        self.write_document_inner(part_id, revision_id, body, None)
+    }
+
+    /// Import a reviewed document and its structure together. The expected
+    /// hash and checkout are checked under the write lock, so another save or
+    /// a broken checkout cannot silently replace the document reviewed by the user.
+    pub fn write_import_document(&self, user: &User, part_id: &str, revision_id: &str, expected_hash: &str, body: &str, uses: &Value) -> Result<u64, Error> {
+        self.write_document_inner(part_id, revision_id, body, Some((user, expected_hash, uses)))
+    }
+
+    fn write_document_inner(&self, part_id: &str, revision_id: &str, body: &str, import: Option<(&User, &str, &Value)>) -> Result<u64, Error> {
+        let key = crate::identity::document_key(part_id, revision_id);
         let path = self.document_path(&key)?;
         let hash = auth::content_hash(body);
-        let size = body.len() as u64;
+        let embedded = crate::thumbnail::embedded(self.root(), body)?;
+        let has_geometry = crate::geometry::contains_geometry(body);
         self.mutate(move |state| {
+            let imported_uses = if let Some((user, expected, uses)) = import {
+                check_writable(state, user, part_id, revision_id)?;
+                let revision = state.part(part_id).and_then(|p| p.revision(revision_id))
+                    .ok_or_else(|| Error::not_found("revision"))?;
+                if revision.content_hash != expected {
+                    return Err(Error::conflict("the document changed since the import was reviewed; review it again"));
+                }
+                Some(bom::check_uses(state, part_id, uses)?)
+            } else { None };
+            let current = state.part(part_id).ok_or_else(|| Error::not_found("part"))?;
+            let defs = state.bom_configuration.part_fields.get(&current.part_type).cloned().unwrap_or_default();
+            let mut canonical = current.revision(revision_id).ok_or_else(|| Error::not_found("revision"))?.clone();
+            if let Ok(document) = serde_json::from_str::<Value>(body) {
+                if let Some(occurrences) = crate::bom_config::document_occurrences(&document) {
+                    if let Some(occurrences) = crate::bom_config::capture_occurrences(state, part_id, revision_id, &json!({"occurrences":occurrences}))? {
+                        canonical.occurrences = occurrences;
+                    }
+                }
+            }
+            let normalized = if !defs.is_empty() || !canonical.occurrences.is_empty() {
+                let mut document: Value = serde_json::from_str(body).map_err(|_| Error::bad_request("A CAD document must be JSON"))?;
+                let original = document.clone();
+                if !canonical.attributes_initialized && !defs.is_empty() {
+                    for def in &defs {
+                        if let Some(value) = document["partAttributes"].as_object().and_then(|attrs|attrs.iter().find(|(key,_)|key.to_ascii_lowercase()==def.key).map(|(_,value)|value)) {
+                            if let Some(value) = catalog::check_value(def, value).map_err(Error::bad_request)? {
+                                canonical.attributes.insert(def.key.clone(), value);
+                            }
+                        }
+                    }
+                    canonical.attributes_initialized = true;
+                }
+                crate::bom_config::overlay(&canonical, &defs, &mut document);
+                if document != original {Some(serde_json::to_string(&document).map_err(Error::internal)?)} else {None}
+            } else { None };
+            let body = normalized.as_deref().unwrap_or(body);
+            let hash = if normalized.is_some() { auth::content_hash(body) } else { hash };
+            let size = body.len() as u64;
             let part = state.parts.get_mut(&part_id)
                 .ok_or_else(|| Error::not_found("part"))?;
             let number = part.number.clone();
@@ -607,7 +687,23 @@ impl Db {
             if let Some(parent) = path.parent() {
                 fs::create_dir_all(parent).map_err(Error::internal)?;
             }
+            let old_thumbnail = revision.thumbnail.as_ref().map(|t| t.sha256.clone());
+            let thumbnail = embedded.as_ref().map(|image| {
+                let user = import.map(|(user, _, _)| user.id.as_str())
+                    .or_else(|| revision.lock.as_ref().map(|lock| lock.user_id.as_str()))
+                    .unwrap_or(&revision.created_by);
+                image.place(self.root(), &hash, user)
+            }).transpose()?;
+            revision.attributes = canonical.attributes;
+            revision.attributes_initialized = canonical.attributes_initialized;
+            revision.occurrences = canonical.occurrences;
             write_atomic(&path, body).map_err(Error::internal)?;
+            if let Some(thumbnail) = thumbnail { revision.thumbnail = Some(thumbnail); }
+            if let Some(uses) = imported_uses {
+                revision.uses = uses;
+            }
+            revision.has_geometry = has_geometry;
+            revision.geometry_content_hash = hash.clone();
             revision.content_hash = hash;
             revision.size = size;
             revision.modified_at = now();
@@ -625,6 +721,9 @@ impl Db {
             // Approvals given on the document before this save go stale (D8).
             crate::review::document_changed(state, part_id, revision_id);
             state.touch(key);
+            if embedded.is_some() {
+                if let Some(old) = old_thumbnail { crate::attach::remove_if_unreferenced(state, self.root(), &old)?; }
+            }
             Ok(state.seq)
         })
     }
@@ -970,6 +1069,12 @@ impl Db {
         let document_class = spec.document_class;
         let description = spec.description.trim().to_string();
         let requested_category = spec.category.trim().to_string();
+        if spec.attributes.keys().any(|key| key.trim().eq_ignore_ascii_case("has_geometry")) {
+            return Err(Error::bad_request("has_geometry is derived from the saved model and cannot be edited"));
+        }
+        if spec.attributes.keys().any(|key| key.trim().eq_ignore_ascii_case("has_thumbnail")) {
+            return Err(Error::bad_request("has_thumbnail is derived from current thumbnails and cannot be edited"));
+        }
         let requested_values = spec.attributes.clone();
         let workspace = spec.workspace.clone();
         self.mutate(move |state| {
@@ -1021,10 +1126,10 @@ impl Db {
 
             external_ref_clash(state, &kind.id, &external_ref, "")?;
             let stamp = now();
-            let mut revision = Revision::draft(auth::new_id(), label, author_id.clone(), stamp);
+            let mut revision = Revision::draft(label.clone(), label, author_id.clone(), stamp);
             revision.origin = origin;
             let part = Part {
-                id: auth::new_id(),
+                id: number.clone(),
                 number,
                 part_type: kind.id.clone(),
                 sequence,
@@ -1187,8 +1292,14 @@ impl Db {
                 )));
             }
             let stamp = now();
-            let mut revision = Revision::draft(auth::new_id(), label, author_id, stamp);
+            let mut revision = Revision::draft(label.clone(), label, author_id, stamp);
             revision.origin = origin;
+            if let Some(previous) = carried_revision.as_deref().and_then(|id| part.revision(id)) {
+                revision.has_geometry = previous.has_geometry;
+                revision.attributes = previous.attributes.clone();
+                revision.attributes_initialized = previous.attributes_initialized;
+                revision.occurrences = previous.occurrences.clone();
+            }
             // The uses list travels with the document it describes.
             revision.uses = carried_revision
                 .as_deref()
@@ -1376,6 +1487,7 @@ impl Db {
             // checked against the store as it is at the write.
             let mut settings = settings;
             crate::review::check_settings(state, &mut settings)?;
+            crate::lifecycle::check_options(&settings.status_options)?;
             state.settings = settings.clone();
             Ok(settings)
         })
@@ -1426,6 +1538,12 @@ fn apply_part_fields(
         let changes = value
             .as_object()
             .ok_or_else(|| Error::bad_request("attributes must be an object of key: value"))?;
+        if changes.keys().any(|key| key.trim().eq_ignore_ascii_case("has_geometry")) {
+            return Err(Error::bad_request("has_geometry is derived from the saved model and cannot be edited"));
+        }
+        if changes.keys().any(|key| key.trim().eq_ignore_ascii_case("has_thumbnail")) {
+            return Err(Error::bad_request("has_thumbnail is derived from current thumbnails and cannot be edited"));
+        }
         catalog::apply_values(categories, &part.category, &mut part.attributes, changes)?;
     }
     Ok(part.clone())
@@ -1538,7 +1656,12 @@ pub struct AttributeMatcher {
 
 impl AttributeMatcher {
     fn matches(&self, part: &Part) -> bool {
-        let Some(have) = part.attributes.get(&self.key).filter(|v| !v.is_null()) else { return false };
+        let geometry = Value::Bool(part.latest().is_some_and(|r| r.has_geometry));
+        let thumbnail = Value::Bool(crate::thumbnail::of_part(part).is_some());
+        let have = if self.key == "has_geometry" { &geometry } else if self.key == "has_thumbnail" { &thumbnail } else {
+            let Some(value) = part.attributes.get(&self.key).filter(|v| !v.is_null()) else { return false };
+            value
+        };
         let number = have.as_f64();
         let equal = |want: &Value| match (want, have) {
             (Value::Number(w), Value::Number(h)) => w.as_f64() == h.as_f64(),
@@ -1566,6 +1689,17 @@ pub fn attribute_matchers(state: &State, filter: &PartFilter) -> Result<Vec<Attr
     let mut out = Vec::new();
     for condition in &filter.attributes {
         let key = condition.key.as_str();
+        if matches!(key, "has_geometry" | "has_thumbnail") {
+            if condition.min.is_some() || condition.max.is_some() {
+                return Err(Error::bad_request(format!("{key} is a boolean and has no range")));
+            }
+            let any_of = condition.values.iter().map(|v| match v.as_str() {
+                "true" => Ok(Value::Bool(true)), "false" => Ok(Value::Bool(false)),
+                _ => Err(Error::bad_request(format!("attr.{key} must be true or false"))),
+            }).collect::<Result<Vec<_>, _>>()?;
+            out.push(AttributeMatcher { key: key.into(), any_of, min: None, max: None });
+            continue;
+        }
         let defs: Vec<(String, AttributeDef)> = match &category {
             Some(id) => catalog::schema(&state.categories, id)?
                 .into_iter()
@@ -1951,6 +2085,24 @@ impl Db {
         revision_id: &str,
         to: Lifecycle,
     ) -> Result<Vec<String>, Error> {
+        self.transition_checked(user, part_id, revision_id, to, None, None)
+    }
+
+    pub fn transition_reviewed(&self, user: &User, part_id: &str, revision_id: &str, to: Lifecycle, expected_hash: &str) -> Result<Vec<String>, Error> {
+        self.transition_checked(user, part_id, revision_id, to, Some(expected_hash), None)
+    }
+
+    pub(crate) fn transition_workflow(&self, user: &User, part_id: &str, revision_id: &str, to: Lifecycle, expected_hash: &str, run_id: &str) -> Result<Vec<String>, Error> {
+        self.transition_checked(user, part_id, revision_id, to, Some(expected_hash), Some(run_id))
+    }
+
+    fn transition_checked(&self, user: &User, part_id: &str, revision_id: &str, to: Lifecycle, expected_hash: Option<&str>, workflow_run: Option<&str>) -> Result<Vec<String>, Error> {
+        if let Some(expected) = expected_hash {
+            let (_, revision) = self.snapshot(part_id, revision_id)?;
+            if revision.content_hash != expected { return Err(Error::conflict("workflow model changed after review")); }
+        }
+        lifecycle::check_enabled(&self.settings(), to)?;
+        if to == Lifecycle::Released { self.read(|s|crate::workflow::release_gate(s,part_id,revision_id,workflow_run))?; }
         if to == Lifecycle::Superseded {
             return Err(Error::bad_request(
                 "superseded is applied automatically when a newer revision releases",
@@ -1971,7 +2123,7 @@ impl Db {
         // A revision an open change order names is released (or obsoleted)
         // through it — refused alone when the administrator says so.
         if matches!(to, Lifecycle::Released | Lifecycle::Obsolete) {
-            self.read(|state| eco_hold_gate(state, revision_id, to))?;
+            self.read(|state| eco_hold_gate(state, part_id, revision_id, to))?;
         }
 
         // The before-release gate, on a snapshot. Refusals the locked write
@@ -2007,17 +2159,25 @@ impl Db {
 
         let user_id = user.id.clone();
         self.mutate(move |state| {
+            lifecycle::check_enabled(&state.settings, to)?;
+            if to == Lifecycle::Released { crate::workflow::release_gate(state,part_id,revision_id,workflow_run)?; }
+            if let Some(expected) = expected_hash {
+                let revision = state.part(part_id).and_then(|p|p.revision(revision_id)).ok_or_else(||Error::not_found("revision"))?;
+                if revision.content_hash != expected { return Err(Error::conflict("workflow model changed after review")); }
+            }
             if to == Lifecycle::Released {
                 // Again INSIDE the lock: the part's values or its category's
                 // schema may have changed while the hook ran.
                 let part = state.part(part_id).ok_or_else(|| Error::not_found("part"))?;
                 catalog_gate(&state.categories, part)?;
                 let revision = part.revision(revision_id).ok_or_else(|| Error::not_found("revision"))?;
+                let field_problems = crate::bom_config::release_problems(state, part, revision);
+                if !field_problems.is_empty() { return Err(Error::conflict(field_problems.join("; "))); }
                 children_gate(state, part, revision)?;
                 review_gate(state, part, revision)?;
             }
             if matches!(to, Lifecycle::Released | Lifecycle::Obsolete) {
-                eco_hold_gate(state, revision_id, to)?;
+                eco_hold_gate(state, part_id, revision_id, to)?;
             }
             let (_, revision) = find_revision_mut(state, part_id, revision_id)?;
             lifecycle::check_transition(revision.lifecycle, to).map_err(Error::conflict)?;
@@ -2070,7 +2230,7 @@ impl Db {
 
         let mut warnings = Vec::new();
         if matches!(to, Lifecycle::Released | Lifecycle::Obsolete) {
-            if let Some(number) = self.read(|state| crate::eco::standalone_holder(state, revision_id).map(|e| e.number.clone())) {
+            if let Some(number) = self.read(|state| crate::eco::standalone_holder(state, part_id, revision_id).map(|e| e.number.clone())) {
                 warnings.push(format!(
                     "{} outside {number}, which names this revision — that change order will not release until the item is removed",
                     if to == Lifecycle::Released { "released" } else { "obsoleted" }
@@ -2122,7 +2282,7 @@ impl Db {
     pub fn delete_draft(&self, user: &User, part_id: &str, revision_id: &str) -> Result<(), Error> {
         let user_id = user.id.clone();
         let may_break = user.can_checkin();
-        let key = format!("part/{part_id}/rev/{revision_id}");
+        let key = crate::identity::document_key(part_id, revision_id);
         let root = self.root().to_path_buf();
         self.mutate(|state| {
             let (_, revision) = find_revision_mut(state, part_id, revision_id)?;
@@ -2342,11 +2502,11 @@ fn catalog_gate(categories: &[Category], part: &Part) -> Result<(), Error> {
 /// [`Settings::require_released_children`] on. Every child is named at once.
 /// With [`Settings::eco_holds_revisions`] on, a revision an open change
 /// order names is released and obsoleted only through it.
-fn eco_hold_gate(state: &State, revision_id: &str, to: Lifecycle) -> Result<(), Error> {
+fn eco_hold_gate(state: &State, part_id: &str, revision_id: &str, to: Lifecycle) -> Result<(), Error> {
     if !state.settings.eco_holds_revisions {
         return Ok(());
     }
-    match crate::eco::standalone_holder(state, revision_id) {
+    match crate::eco::standalone_holder(state, part_id, revision_id) {
         Some(eco) => Err(Error::conflict(format!(
             "this revision is in {} ({}) — {} it through the change order, or take it out of there first",
             eco.number,
@@ -2440,9 +2600,13 @@ impl Db {
         self.mutate(move |state| {
             check_writable(state, &user, part_id, revision_id)?;
             let uses = bom::check_uses(state, part_id, &body)?;
+            let occurrences = crate::bom_config::capture_occurrences(state, part_id, revision_id, &body)?;
             let (_, revision) = find_revision_mut(state, part_id, revision_id)?;
             revision.uses = uses.clone();
+            if let Some(occurrences) = occurrences { revision.occurrences = occurrences; }
+            crate::bom_config::synchronize_uses(revision);
             revision.modified_at = now();
+            state.touch(crate::identity::document_key(part_id, revision_id));
             Ok(uses)
         })
     }

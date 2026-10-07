@@ -339,6 +339,30 @@ impl EngineState {
             return self.port_point_pose(&address);
         }
         let id = self.transform_gizmo.feature_id.as_deref()?;
+        if let Some(row) = self.pmi_report.as_ref().and_then(|r| r.annotation(id)) {
+            if self.pmi_active_view.as_deref()
+                != self
+                    .pmi_state()
+                    .find_annotation(id)
+                    .map(|(v, _)| v.id.as_str())
+            {
+                return None;
+            }
+            if let brep_kernel::PmiGeometry::Explode {
+                center,
+                translate,
+                rotate_deg,
+                scale,
+                ..
+            } = &row.geometry
+            {
+                return Some(TransformPose {
+                    position: std::array::from_fn(|i| center[i] + translate[i]),
+                    rotation_deg: *rotate_deg,
+                    scale: *scale,
+                });
+            }
+        }
         let index = self.history.index_of(id)?;
         if let Some(anchor) = self.transform_gizmo.anchor {
             // A spline anchor: its position + the intrinsic-XYZ Euler of its
@@ -354,8 +378,8 @@ impl EngineState {
         let transform = params.get("transform");
         // Build the history's expression environment ONCE for the vectors: a
         // transform or pivot component may be an expression string.
-        let env = brep_kernel::Env::build(&self.history.expressions(), &self.history.configurator())
-            .ok();
+        let env =
+            brep_kernel::Env::build(&self.history.expressions(), &self.history.configurator()).ok();
         let env = env.as_ref();
         let pivot = if self.is_xform_feature(index) {
             self.xform_pivot(index, &params)
@@ -433,7 +457,7 @@ impl EngineState {
         let request: HistoryRequest =
             serde_json::from_value(self.history.request_before(index)?).ok()?;
         let _trace = crate::run_trace::span("face_transform_pivot");
-        let result = brep_kernel::execute_history(&request);
+        let result = self.execute_plugin_history(&request);
         brep_kernel::face_transform_pivot(&result.results, &names)
     }
 
@@ -484,7 +508,7 @@ impl EngineState {
             return [0.0; 3];
         };
         let _trace = crate::run_trace::span("xform_pivot");
-        let result = brep_kernel::execute_history(&request);
+        let result = self.execute_plugin_history(&request);
         let mut handles = HashMap::new();
         for feature in result.results.iter().take(index) {
             for name in &feature.removed {
@@ -540,7 +564,7 @@ impl EngineState {
         self.history
             .index_of(feature_id)
             .and_then(|i| self.history.feature_type(i))
-            .and_then(|ty| crate::features::feature_schema(&ty))
+            .and_then(|ty| self.feature_schema(&ty))
             .is_some_and(|schema| schema["inputParamsSchema"]["transform"]["type"] == "transform")
     }
 
@@ -758,6 +782,25 @@ impl EngineState {
         let Some(id) = self.transform_gizmo.feature_id.clone() else {
             return;
         };
+        let pmi = self.pmi_state();
+        if let Some((_, annotation)) = pmi.find_annotation(&id) {
+            if annotation.kind == "explode" {
+                let center = self
+                    .pmi_report
+                    .as_ref()
+                    .and_then(|r| r.annotation(&id))
+                    .and_then(|r| match &r.geometry {
+                        brep_kernel::PmiGeometry::Explode { center, .. } => Some(*center),
+                        _ => None,
+                    });
+                if let Some(center) = center {
+                    let mut params = annotation.params.clone();
+                    params["transform"] = serde_json::json!({ "position": std::array::from_fn::<_, 3, _>(|i| pose.position[i] - center[i]), "rotationEuler": pose.rotation_deg, "scale": pose.scale });
+                    let _ = self.pmi_update_annotation(&id, &params.to_string());
+                }
+                return;
+            }
+        }
         let Some(index) = self.history.index_of(&id) else {
             return;
         };
@@ -773,7 +816,8 @@ impl EngineState {
             self.xform_pivot(index, &params)
         } else if self.is_face_transform_feature(index) {
             let env =
-                brep_kernel::Env::build(&self.history.expressions(), &self.history.configurator()).ok();
+                brep_kernel::Env::build(&self.history.expressions(), &self.history.configurator())
+                    .ok();
             let Some(pivot) = self.face_transform_pivot(index, &params, env.as_ref()) else {
                 return;
             };

@@ -31,7 +31,7 @@
 //!   same-origin. Three app features reach other origins — the KiCad remote
 //!   library (`https://gitlab.com`), STEP parts search (`https://api.step.parts`
 //!   and the media hosts its results name) and the bug report
-//!   (`https://v2.brep.io`) — and are refused by the browser until the
+//!   (`https://next.brep.io`) — and are refused by the browser until the
 //!   administrator names them. An air-gapped PLM leaves them out.
 //!
 //! Every file under the prefix carries the policy, not only the page: a

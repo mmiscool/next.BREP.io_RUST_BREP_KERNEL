@@ -503,6 +503,8 @@ pub fn schema_fillet() -> serde_json::Value {
         "type": "SM.FILLET",
         "shortName": "SM.CFIL",
         "longName": "SM Corner Fillet",
+    "ribbonPath": "Home/Sheet Metal/Corner Fillet",
+    "commandSize": "Compact",
         "displayBuilder": false,
         "inputParamsSchema": {
             "id": { "type": "string", "default_value": null, "hint": "Unique identifier for the corner fillet" },
@@ -523,6 +525,8 @@ pub fn schema_chamfer() -> serde_json::Value {
         "type": "SM.CHAMFER",
         "shortName": "SM.CCHM",
         "longName": "SM Corner Chamfer",
+    "ribbonPath": "Home/Sheet Metal/Corner Chamfer",
+    "commandSize": "Compact",
         "displayBuilder": false,
         "inputParamsSchema": {
             "id": { "type": "string", "default_value": null, "hint": "Unique identifier for the corner chamfer" },

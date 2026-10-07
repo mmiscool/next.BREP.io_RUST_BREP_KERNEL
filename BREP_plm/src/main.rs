@@ -16,7 +16,7 @@
 //! The hardening flags are described in `brep_plm::security` and GUIDE.md.
 //!
 //! The data directory holds `plm.sqlite` (the metadata and the audit log) and
-//! a `docs/` tree; both are created on first run. The first run also seeds one
+//! a `models/` tree; both are created on first run. The first run also seeds one
 //! administrator and prints its generated password ONCE. No build of this
 //! server ships a known password, which is why it cannot be recovered — make
 //! another admin before you lose it.
@@ -54,7 +54,7 @@ fn usage() -> ! {
              brep-plm export  [--data <dir>] --out <file> [--format json|parts-csv|structure-csv]\n\
          \n\
          OPTIONS:\n    \
-             --data <dir>             where plm.sqlite and docs/ live [default: {DEFAULT_DATA}]\n    \
+             --data <dir>             where plm.sqlite and models/ live [default: {DEFAULT_DATA}]\n    \
              --bind <addr>            the listen address              [default: {DEFAULT_BIND}]\n    \
              --scripts <dir>          the admin's hook scripts        [default: <data>/scripts]\n    \
              --secure-cookies <mode>  off | on | auto                 [default: off; on with --tls-cert]\n    \
@@ -68,6 +68,10 @@ fn usage() -> ! {
              --backup-dir <dir>       where \"Back up now\" and scheduled backups are saved\n    \
              --backup-every <min>     take a backup every <min> minutes    [needs --backup-dir]\n    \
              --backup-keep <n>        how many saved backups to keep       [default: 7]\n    \
+             --web-dir <dir>          live frontend overrides (missing files use embedded assets)\n    \
+             --bake-worker-executable <file>  native brep-app for admin Start/Stop\n    \
+             --bake-worker-token-file <file>  worker API token file (never the token itself)\n    \
+             --bake-worker-url <url>   address the worker uses to reach this server\n    \
              --cad-app <dir>          the hosted CAD app's web/ and pkg/   [default: <data>/cad-app]\n    \
              --cad-connect-src <url>  an origin the hosted app may call (repeatable)\n"
     );
@@ -102,6 +106,9 @@ async fn main() {
     let mut data = DEFAULT_DATA.to_string();
     let mut scripts: Option<std::path::PathBuf> = None;
     let mut config = ServerConfig::default();
+    let mut worker_executable: Option<std::path::PathBuf> = None;
+    let mut worker_token: Option<std::path::PathBuf> = None;
+    let mut worker_url: Option<String> = None;
     let mut secure_cookies: Option<CookieSecurity> = None;
     let mut tls_cert: Option<std::path::PathBuf> = None;
     let mut tls_key: Option<std::path::PathBuf> = None;
@@ -136,6 +143,10 @@ async fn main() {
                     usage()
                 });
             }
+            "--web-dir" => config.web_dir = Some(args.next().unwrap_or_else(|| usage()).into()),
+            "--bake-worker-executable" => worker_executable = Some(args.next().unwrap_or_else(|| usage()).into()),
+            "--bake-worker-token-file" => worker_token = Some(args.next().unwrap_or_else(|| usage()).into()),
+            "--bake-worker-url" => worker_url = Some(args.next().unwrap_or_else(|| usage())),
             "--cad-app" => config.cad_app_dir = Some(args.next().unwrap_or_else(|| usage()).into()),
             "--cad-connect-src" => {
                 let origin = args.next().unwrap_or_else(|| usage());
@@ -203,6 +214,23 @@ async fn main() {
     // Serving HTTPS itself, the server knows every request is secure.
     config.secure_cookies = secure_cookies.unwrap_or(if config.tls { CookieSecurity::On } else { CookieSecurity::Off });
 
+    if let Some(dir) = config.web_dir.take() {
+        match dir.canonicalize() {
+            Ok(path) if path.is_dir() => config.web_dir = Some(path),
+            _ => {
+                eprintln!("brep-plm: --web-dir must name an existing directory: {}", dir.display());
+                std::process::exit(1);
+            }
+        }
+    }
+
+    if worker_executable.is_some() || worker_token.is_some() || worker_url.is_some() {
+        let (Some(executable), Some(token_file), Some(server_url)) = (worker_executable, worker_token, worker_url) else {
+            eprintln!("brep-plm: configure all three --bake-worker-executable, --bake-worker-token-file and --bake-worker-url options");
+            usage();
+        };
+        config.bake_worker = Some(brep_plm::bake_worker::Config { executable, token_file, server_url });
+    }
     let (db, seeded) = match Db::open_with_scripts(&data, scripts) {
         Ok(opened) => opened,
         Err(error) => {
@@ -227,6 +255,9 @@ async fn main() {
     if let Some(dir) = &config.cad_app_dir {
         let state = if dir.join("web/index.html").is_file() { "" } else { " (no web/index.html there yet)" };
         println!("brep-plm: CAD app from {}{state}", dir.display());
+    }
+    if let Some(dir) = &config.web_dir {
+        println!("brep-plm: live frontend overrides from {} (embedded fallback)", dir.display());
     }
     let db = db.with_config(config);
     println!("brep-plm: scripts in {}", db.scripts().dir().display());
@@ -255,6 +286,7 @@ async fn main() {
             }
         });
     }
+    let worker_db = db.clone();
     let app = api::router(db);
     let listener = match tokio::net::TcpListener::bind(&bind).await {
         Ok(listener) => listener,
@@ -263,8 +295,17 @@ async fn main() {
             std::process::exit(1);
         }
     };
-    let shutdown = async {
+    let shutdown = async move {
+        #[cfg(unix)]
+        {
+            let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).expect("SIGTERM handler");
+            tokio::select! { _ = tokio::signal::ctrl_c() => {}, _ = terminate.recv() => {} }
+        }
+        #[cfg(not(unix))]
         let _ = tokio::signal::ctrl_c().await;
+        if let Err(error) = worker_db.stop_bake_worker() {
+            eprintln!("brep-plm: stopping bake worker: {error}");
+        }
         println!("\nbrep-plm: shutting down");
     };
     // One line naming the address actually bound, so a runner that asked

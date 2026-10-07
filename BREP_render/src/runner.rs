@@ -210,12 +210,56 @@ pub struct MeshImportReply {
     pub result: Result<StlConversionOutput, String>,
 }
 
+/// Validate explicitly installed packages away from the UI thread.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct PluginInstallRequest {
+    pub id: u64,
+    pub packages: serde_json::Value,
+}
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct PluginInstallReply {
+    pub id: u64,
+    pub result: Result<brep_plugins::Registry, String>,
+}
+fn validate_plugins(request: PluginInstallRequest) -> PluginInstallReply {
+    let result = serde_json::from_value(request.packages)
+        .map_err(|e| format!("plugin packages: {e}"))
+        .and_then(brep_plugins::Runtime::new)
+        .map(|runtime| runtime.registry().clone());
+    PluginInstallReply { id: request.id, result }
+}
+
+/// A callback request against an immutable document/selection snapshot.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct PluginActionRequest {
+    pub id: u64,
+    pub pins: Vec<brep_plugins::PluginPin>,
+    pub action: String,
+    pub input: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub script: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct PluginActionReply {
+    pub id: u64,
+    pub result: Result<brep_plugins::ActionPlan, String>,
+}
+
 /// The history-run seam: SUBMIT a run, POLL for its completed reply, RESET the
 /// delta baseline, plus a QUERY channel for per-object measurements (routed to the
 /// runner so the warm registry answers them, never the cold main-side one). The
 /// Inline impl runs everything synchronously; a later thread/worker impl defers
 /// the work and surfaces the replies through the same poll idiom.
 pub trait HistoryRunner {
+    fn submit_plugin_install(&mut self, _request: PluginInstallRequest) -> bool { false }
+    fn poll_plugin_install(&mut self) -> Option<PluginInstallReply> { None }
+    /// Trusted installed content, separate from saved document dependency pins.
+    fn sync_plugins(&mut self, _revision: u64, _fetch: &mut dyn FnMut() -> serde_json::Value) {}
+    /// False explicitly reports a runner without action support.
+    fn submit_plugin_action(&mut self, _request: PluginActionRequest) -> bool { false }
+    fn poll_plugin_action(&mut self) -> Option<PluginActionReply> { None }
+
     /// Submit a history run tagged with a monotonic generation. The runner executes
     /// it (immediately for Inline; on a background thread later) and makes the reply
     /// available via [`poll_run`](Self::poll_run).
@@ -379,6 +423,8 @@ pub struct InlineRunner {
     step_probe_pending: std::collections::VecDeque<StepProbeReply>,
     topology_pending: std::collections::VecDeque<TopologyReply>,
     sheet_lines_pending: std::collections::VecDeque<SheetLinesReply>,
+    plugin_action_pending: std::collections::VecDeque<PluginActionReply>,
+    plugin_install_pending: std::collections::VecDeque<PluginInstallReply>,
 }
 
 impl InlineRunner {
@@ -391,11 +437,33 @@ impl InlineRunner {
             step_probe_pending: std::collections::VecDeque::new(),
             topology_pending: std::collections::VecDeque::new(),
             sheet_lines_pending: std::collections::VecDeque::new(),
+            plugin_action_pending: std::collections::VecDeque::new(),
+            plugin_install_pending: std::collections::VecDeque::new(),
         }
     }
 }
 
 impl HistoryRunner for InlineRunner {
+    fn submit_plugin_install(&mut self, request: PluginInstallRequest) -> bool {
+        self.plugin_install_pending.push_back(validate_plugins(request));
+        true
+    }
+    fn poll_plugin_install(&mut self) -> Option<PluginInstallReply> {
+        self.plugin_install_pending.pop_front()
+    }
+    fn sync_plugins(&mut self, revision: u64, fetch: &mut dyn FnMut() -> serde_json::Value) {
+        if self.runner.plugin_revision != Some(revision) {
+            self.runner.set_plugins(revision, fetch());
+        }
+    }
+    fn submit_plugin_action(&mut self, request: PluginActionRequest) -> bool {
+        self.plugin_action_pending.push_back(self.runner.plugin_action(request));
+        true
+    }
+    fn poll_plugin_action(&mut self) -> Option<PluginActionReply> {
+        self.plugin_action_pending.pop_front()
+    }
+
     fn submit_run(&mut self, request: brep_kernel::HistoryRequest, generation: u64) {
         let output = self.runner.run(&request);
         self.pending.push_back(RunReply { generation, output });
@@ -487,6 +555,9 @@ impl Default for InlineRunner {
 /// backlog (the thread in `thread_main`, the worker's main side in `WorkerRunner`).
 #[derive(serde::Serialize, serde::Deserialize)]
 pub enum Command {
+    ValidatePlugins(PluginInstallRequest),
+    SetPlugins { revision: u64, packages: serde_json::Value },
+    PluginAction(PluginActionRequest),
     Run {
         request: brep_kernel::HistoryRequest,
         generation: u64,
@@ -522,6 +593,8 @@ pub enum Command {
 /// A reply sent runner → main; the main side demuxes it into per-kind buffers.
 #[derive(serde::Serialize, serde::Deserialize)]
 pub enum Reply {
+    ValidatedPlugins(PluginInstallReply),
+    PluginAction(PluginActionReply),
     Run(RunReply),
     Query(MeasureReply),
     MeshImport(MeshImportReply),
@@ -733,6 +806,12 @@ pub fn process_command(
     progress: &mut dyn FnMut(RunProgress) -> bool,
 ) -> Option<Reply> {
     match command {
+        Command::ValidatePlugins(request) => Some(Reply::ValidatedPlugins(validate_plugins(request))),
+        Command::SetPlugins { revision, packages } => {
+            runner.set_plugins(revision, packages);
+            None
+        }
+        Command::PluginAction(request) => Some(Reply::PluginAction(runner.plugin_action(request))),
         Command::Run {
             request,
             generation,
@@ -838,6 +917,9 @@ pub struct ThreadRunner {
     step_probe_buf: std::collections::VecDeque<StepProbeReply>,
     topology_buf: std::collections::VecDeque<TopologyReply>,
     sheet_lines_buf: std::collections::VecDeque<SheetLinesReply>,
+    plugin_action_buf: std::collections::VecDeque<PluginActionReply>,
+    plugin_install_buf: std::collections::VecDeque<PluginInstallReply>,
+    sent_plugin_revision: Option<u64>,
     /// Progress reports of the in-flight run, oldest first (`poll_progress`
     /// keeps the newest).
     progress_buf: std::collections::VecDeque<RunProgress>,
@@ -875,6 +957,9 @@ impl ThreadRunner {
             step_probe_buf: std::collections::VecDeque::new(),
             topology_buf: std::collections::VecDeque::new(),
             sheet_lines_buf: std::collections::VecDeque::new(),
+            plugin_action_buf: std::collections::VecDeque::new(),
+            plugin_install_buf: std::collections::VecDeque::new(),
+            sent_plugin_revision: None,
             progress_buf: std::collections::VecDeque::new(),
             sent_library_revision: None,
             library_requested: false,
@@ -887,6 +972,8 @@ impl ThreadRunner {
     fn drain(&mut self) {
         while let Ok(reply) = self.rx.try_recv() {
             match reply {
+                Reply::ValidatedPlugins(reply) => self.plugin_install_buf.push_back(reply),
+                Reply::PluginAction(reply) => self.plugin_action_buf.push_back(reply),
                 Reply::Run(run) => self.run_buf.push_back(run),
                 Reply::Query(query) => self.query_buf.push_back(query),
                 Reply::MeshImport(reply) => self.mesh_import_buf.push_back(reply),
@@ -982,6 +1069,30 @@ fn thread_main(
 
 #[cfg(not(target_arch = "wasm32"))]
 impl HistoryRunner for ThreadRunner {
+    fn submit_plugin_install(&mut self, request: PluginInstallRequest) -> bool {
+        self.tx.as_ref().is_some_and(|tx| tx.send(Command::ValidatePlugins(request)).is_ok())
+    }
+    fn poll_plugin_install(&mut self) -> Option<PluginInstallReply> {
+        self.drain();
+        self.plugin_install_buf.pop_front()
+    }
+    fn sync_plugins(&mut self, revision: u64, fetch: &mut dyn FnMut() -> serde_json::Value) {
+        if self.sent_plugin_revision != Some(revision) {
+            if let Some(tx) = &self.tx {
+                if tx.send(Command::SetPlugins { revision, packages: fetch() }).is_ok() {
+                    self.sent_plugin_revision = Some(revision);
+                }
+            }
+        }
+    }
+    fn submit_plugin_action(&mut self, request: PluginActionRequest) -> bool {
+        self.tx.as_ref().is_some_and(|tx| tx.send(Command::PluginAction(request)).is_ok())
+    }
+    fn poll_plugin_action(&mut self) -> Option<PluginActionReply> {
+        self.drain();
+        self.plugin_action_buf.pop_front()
+    }
+
     fn submit_run(&mut self, request: brep_kernel::HistoryRequest, generation: u64) {
         if let Some(tx) = &self.tx {
             let _ = tx.send(Command::Run {
@@ -1096,6 +1207,8 @@ impl HistoryRunner for ThreadRunner {
     }
 
     fn reset(&mut self) {
+        self.sent_plugin_revision = None;
+        self.plugin_action_buf.clear();
         if let Some(tx) = &self.tx {
             let _ = tx.send(Command::Reset);
         }

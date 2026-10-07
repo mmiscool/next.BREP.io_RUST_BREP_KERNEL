@@ -80,6 +80,8 @@ pub fn schema() -> serde_json::Value {
     "type": "P.CY",
     "shortName": "P.CY",
     "longName": "Primitive Cylinder",
+    "ribbonPath": "Home/Primitives/Cylinder",
+    "commandSize": "Compact",
     "displayBuilder": false,
     "inputParamsSchema": {
         "id": {

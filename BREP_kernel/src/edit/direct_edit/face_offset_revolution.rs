@@ -350,6 +350,7 @@ fn offset_general_revolution_face(
 
     let floor = crate::pcurve::PCURVE_REFINEMENT_TOLERANCE;
     let mut new_curves: HashMap<u64, NurbsCurve> = HashMap::default();
+    let mut native_iso_pcurves: HashMap<u64, NurbsCurve> = HashMap::default();
     let mut new_vertices: HashMap<u64, Vec3> = HashMap::default();
     let mut planar_neighbours: HashSet<u64> = HashSet::default();
     for (loop_record, loop_pcurves) in face.loops.iter().zip(&pcurves) {
@@ -511,6 +512,7 @@ fn offset_general_revolution_face(
                     ));
                 }
             }
+            let mut reversed_curve = false;
             if !general_image {
                 let [c0, c1] = curve.domain().or_refuse(KernelStage::Refine, "domain")?;
                 let old_start = edge.curve.evaluate(edge.t0).or_refuse(KernelStage::Refine, "evaluate")?;
@@ -518,7 +520,32 @@ fn offset_general_revolution_face(
                     > curve.evaluate(c1).or_refuse(KernelStage::Refine, "evaluate")?.sub(old_start).length()
                 {
                     curve = curve.reversed().or_refuse(KernelStage::Refine, "reversed")?;
+                    reversed_curve = true;
                 }
+            }
+            let native = match iso_kind(&coedge.pcurve, uv_tolerance)? {
+                Some(IsoKind::ConstantU(u)) => {
+                    let [v0, v1] = offset.domain_v().or_refuse(KernelStage::Refine, "domain_v")?;
+                    Some(crate::sweep_topology::parameter_line(u, v0, u, v1)
+                        .or_refuse(KernelStage::Refine, "parameter_line")?)
+                }
+                Some(IsoKind::ConstantV) => {
+                    // Rebuilt rims use the revolution's native rational arc,
+                    // rather than the Boolean's former non-affine u(t) fit.
+                    let [q0, _] = pcurve.domain().or_refuse(KernelStage::Refine, "domain")?;
+                    let w = pcurve.evaluate(q0).or_refuse(KernelStage::Refine, "evaluate")?.y;
+                    let [v0, v1] = offset.domain_v().or_refuse(KernelStage::Refine, "domain_v")?;
+                    let v = if w.abs() <= uv_tolerance { v0 } else { v1 };
+                    let [u0, u1] = offset.domain_u().or_refuse(KernelStage::Refine, "domain_u")?;
+                    Some(crate::sweep_topology::parameter_line(u0, v, u1, v)
+                        .or_refuse(KernelStage::Refine, "parameter_line")?)
+                }
+                None => None,
+            };
+            if let Some(native) = native {
+                native_iso_pcurves.insert(edge.id, if reversed_curve {
+                    native.reversed().or_refuse(KernelStage::Refine, "reversed")?
+                } else { native });
             }
             // A corner is rebuilt by each boundary edge that ends on it, and
             // those must agree: a rim and a meridian meeting at one vertex, or
@@ -552,11 +579,12 @@ fn offset_general_revolution_face(
 
     let mut result = solid.clone();
     let pushed = &mut result.shells[shell_index].faces[face_index];
-    if span.old != [0.0, 1.0] || span.new != [0.0, 1.0] {
-        for (loop_record, loop_pcurves) in pushed.loops.iter_mut().zip(pcurves) {
-            for (coedge, pcurve) in loop_record.coedges.iter_mut().zip(loop_pcurves) {
-                coedge.pcurve = pcurve;
-            }
+    for (loop_record, loop_pcurves) in pushed.loops.iter_mut().zip(pcurves) {
+        for (coedge, pcurve) in loop_record.coedges.iter_mut().zip(loop_pcurves) {
+            coedge.pcurve = if let Some(native) = native_iso_pcurves.get(&coedge.edge_id) {
+                if coedge.forward { native.clone() }
+                else { native.reversed().or_refuse(KernelStage::Refine, "reversed")? }
+            } else { pcurve };
         }
     }
     pushed.surface = offset;

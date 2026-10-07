@@ -469,7 +469,7 @@ async fn with_checkout(
     let Some(DocumentIdentity::Revision { part, revision }) = DocumentIdentity::parse_revision_key(key) else {
         return Err(format!("'{key}' is not a PLM revision"));
     };
-    let base = format!("/api/parts/{part}/revisions/{revision}");
+    let base = crate::plm::identity::revision_path(&part, &revision);
     let body = |value: Value| Some(serde_json::to_vec(&value).unwrap_or_default());
     // Checking out a revision this user already holds succeeds, so a run
     // killed between checkout and check-in resumes cleanly.
@@ -576,7 +576,7 @@ pub async fn run_import(
                     else {
                         return report;
                     };
-                    let path = format!("/api/parts/{part}/revisions/{revision}/uses");
+                    let path = format!("{}/uses", crate::plm::identity::revision_path(&part, &revision));
                     let bytes = serde_json::to_vec(body).unwrap_or_default();
                     let written = with_checkout(client, key, async {
                         client.call("PUT", &path, Some(bytes)).await.map(|_| ()).map_err(|e| e.to_string())

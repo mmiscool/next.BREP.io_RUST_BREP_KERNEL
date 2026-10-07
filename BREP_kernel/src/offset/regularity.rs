@@ -98,7 +98,7 @@ impl FoldSample {
 }
 
 /// What a scan found over a region.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub(crate) struct RegularityScan {
     /// Census population: grid and trim-boundary samples inside the region at
     /// which the curvature could be read at all.
@@ -118,6 +118,155 @@ pub(crate) struct RegularityScan {
     pub(crate) between_evaluations: usize,
     /// Cells still risky at the finest spacing the refinement reaches.
     pub(crate) between_unresolved: usize,
+    /// Dips the between-node refinement DESCENDED: local minima of the node
+    /// grid on the regular side, followed to their minimum (see
+    /// [`descend_dips`]). A collapsed sample a descent reaches counts in
+    /// `between_collapsed`.
+    pub(crate) descents: usize,
+    pub(crate) descent_evaluations: usize,
+    /// The descent budget ran out with prominent dips still undescended.
+    pub(crate) descent_capped: bool,
+    /// The cells behind `between_unresolved`, kept so the certainty step can
+    /// refine them further on demand ([`RegularityScan::certify`]) instead of
+    /// every scan paying for that.
+    pub(crate) unresolved_cells: Vec<RiskyCell>,
+    /// What the certainty step spent, and whether its budget ran out.
+    pub(crate) certify_evaluations: usize,
+    pub(crate) certify_capped: bool,
+}
+
+/// How much deeper than [`REFINE_DEPTH`] the certainty step may halve a cell
+/// still risky at the scan's finest spacing: `2⁻¹⁴` of the node spacing.
+const CERTIFY_DEPTH: usize = 14;
+/// Samples the certainty step may spend on those cells, riskiest first. The
+/// cell count can quadruple per level, so this is what makes the step
+/// bounded; a region that runs out is reported undecided, not regular.
+const CERTIFY_EVALUATIONS: usize = 200_000;
+
+/// What a scan can say about a region it found nothing collapsed in — the
+/// CERTAINTY step. "Nothing collapsed" is a census reading; whether the census
+/// could have seen a fold is a separate question, and a caller that builds on
+/// the first without asking the second ships a folded carrier that validates.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Certainty {
+    /// Every risky cell was cleared or refined to a sample of the other sign,
+    /// and every prominent dip was descended to a minimum above the level.
+    /// As far as sampling can say, the region is regular.
+    Regular,
+    /// A sample at or below the level: on the grid, on the rim, between the
+    /// nodes, or at the bottom of a dip.
+    Folded(FoldSample),
+    /// The scan could not decide: cells still risky at its finest spacing (the
+    /// factor sits within a hair of the level over an area), or the descent
+    /// budget ran out with dips still undescended.
+    Uncertain {
+        /// Cells still risky after the certainty step's own refinement.
+        unresolved: usize,
+        /// A budget ran out first: the dip descent's, or the certainty step's.
+        budget_exhausted: bool,
+        /// The least factor seen, refinement and descents included.
+        least: Option<FoldSample>,
+    },
+}
+
+impl RegularityScan {
+    /// The CERTAINTY step: what this scan's reading at `level` can be trusted
+    /// to mean, refining the cells it left unresolved (bounded by
+    /// [`CERTIFY_DEPTH`] and [`CERTIFY_EVALUATIONS`]) before answering.
+    ///
+    /// `surface`, `region` and `displacements` must be the ones the scan was
+    /// taken over. A second call refines nothing more and repeats the answer.
+    pub(crate) fn certify(
+        &mut self,
+        surface: &NurbsSurface,
+        region: &TrimRegion,
+        displacements: &[f64],
+        level: f64,
+    ) -> Certainty {
+        if let Some(worst) = self.worst.filter(|worst| worst.factor <= level) {
+            return Certainty::Folded(worst);
+        }
+        if !self.unresolved_cells.is_empty() && !self.certify_capped {
+            // The scan's own refinement judges a cell by the slope its 3 × 3
+            // NEIGHBOURHOOD shows and never lets a child fall below its parent,
+            // which is what catches a feature between nodes — and what leaves a
+            // cell beside a smooth minimum a hair above the level risky at every
+            // depth: a torus grown to 0.999 of its fold onset reads 1e-3 along
+            // its inner equator, its nodes a spacing away read 0.13 and 0.37,
+            // and that inherited slope (4.5 per unit of v) covers 2.9e-3 across
+            // a cell already 2⁻⁷ of the spacing wide, a hundred times what the
+            // cell's own corners vary by. Every dip those nodes show has by now
+            // been descended, so the certainty step judges each unresolved cell
+            // by its OWN corners — the slope across the cell at the finest
+            // spacing the scan reached — and halves, under the same local rule,
+            // only the ones that still do not clear.
+            let work = std::mem::take(&mut self.unresolved_cells)
+                .into_iter()
+                .filter_map(|mut cell| {
+                    cell.slopes = own_slopes(&cell);
+                    cell.risk = cell_risk(
+                        &cell.corners,
+                        cell.u[1] - cell.u[0],
+                        cell.v[1] - cell.v[0],
+                        cell.slopes,
+                    )?;
+                    Some(cell)
+                })
+                .collect::<std::collections::BinaryHeap<RiskyCell>>();
+            let mut found = BetweenNodes::default();
+            refine_cells(
+                surface,
+                region,
+                displacements,
+                level,
+                work,
+                CERTIFY_DEPTH,
+                Some(CERTIFY_EVALUATIONS),
+                &mut found,
+            );
+            self.between_collapsed += found.collapsed;
+            self.between_regular += found.regular;
+            self.certify_evaluations += found.evaluations;
+            self.certify_capped = found.capped;
+            self.between_unresolved = found.unresolved_cells.len();
+            if let Some(worst) = found.worst {
+                self.keep_worst(worst);
+            }
+            if debug_enabled() {
+                eprintln!(
+                    "regularity: the certainty step refined {} more sample(s) — {} collapsed and {} \
+                     regular sample(s) found, {} cell(s) still risky{}",
+                    found.evaluations,
+                    found.collapsed,
+                    found.regular,
+                    found.unresolved_cells.len(),
+                    if found.capped { " (budget ran out)" } else { "" }
+                );
+            }
+            self.unresolved_cells = found.unresolved_cells;
+            if let Some(worst) = self.worst.filter(|worst| worst.factor <= level) {
+                return Certainty::Folded(worst);
+            }
+        }
+        if self.between_unresolved > 0 || self.descent_capped || self.certify_capped {
+            return Certainty::Uncertain {
+                unresolved: self.between_unresolved,
+                budget_exhausted: self.descent_capped || self.certify_capped,
+                least: self.worst,
+            };
+        }
+        Certainty::Regular
+    }
+}
+
+/// The largest slope a cell's own corners show, per direction.
+fn own_slopes(cell: &RiskyCell) -> (f64, f64) {
+    let [c00, c10, c01, c11] = cell.corners;
+    let (du, dv) = (cell.u[1] - cell.u[0], cell.v[1] - cell.v[0]);
+    (
+        (c10 - c00).abs().max((c11 - c01).abs()) / du,
+        (c01 - c00).abs().max((c11 - c10).abs()) / dv,
+    )
 }
 
 /// How hard a caller wants its region swept.
@@ -582,20 +731,27 @@ pub(crate) fn scan_offset_regularity(
     scan.between_collapsed = between.collapsed;
     scan.between_regular = between.regular;
     scan.between_evaluations = between.evaluations;
-    scan.between_unresolved = between.unresolved;
+    scan.between_unresolved = between.unresolved();
+    scan.unresolved_cells = between.unresolved_cells;
+    scan.descents = between.descents;
+    scan.descent_evaluations = between.descent_evaluations;
+    scan.descent_capped = between.descent_capped;
     if let Some(worst) = between.worst {
         scan.keep_worst(worst);
     }
-    if debug_enabled() && between.evaluations > 0 {
+    if debug_enabled() && (between.evaluations > 0 || between.descents > 0) {
         eprintln!(
             "regularity: between-node refinement read {} sample(s) in {} risky cell(s) — {} \
              collapsed and {} regular sample(s) the census's own nodes did not show, {} cell(s) \
-             still risky at the finest spacing",
+             still risky at the finest spacing; {} dip(s) descended in {} sample(s){}",
             between.evaluations,
             between.cells,
             between.collapsed,
             between.regular,
-            between.unresolved
+            scan.between_unresolved,
+            between.descents,
+            between.descent_evaluations,
+            if between.descent_capped { " (budget ran out)" } else { "" }
         );
     }
 
@@ -614,7 +770,9 @@ pub(crate) fn scan_offset_regularity(
 /// (see [`LeastFoldFactor::bound`]).
 // Built for the outward-shell guard (`outward_fold_the_carve_missed`), which
 // sweeps the same field on a grid of its own; it moves onto this entry point as
-// a separate change, and until then only the tests call it.
+// a separate change, and until then only the tests call it. The callers that
+// already hold a scan read the same certainty off it directly
+// ([`RegularityScan::certify`]) rather than scanning the face twice.
 #[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct LeastFoldFactor {
@@ -626,9 +784,11 @@ pub(crate) struct LeastFoldFactor {
     /// `node_spacing / 2^REFINE_DEPTH`.
     pub(crate) finest_spacing: [f64; 2],
     /// Every cell whose nodes agreed was either cleared by its neighbourhood's
-    /// slope bound or refined to a sample of the other sign. `false` when a cell
-    /// was still risky at the finest spacing — near a fold locus that is the
-    /// normal case, and the least factor is then the least SEEN at that spacing.
+    /// slope bound or refined to a sample of the other sign, and every
+    /// prominent dip was descended. `false` when a cell was still risky at the
+    /// finest spacing — near a fold locus that is the normal case, and the
+    /// least factor is then the least SEEN at that spacing — or the descent
+    /// budget ran out. The same reading as [`RegularityScan::certify`].
     pub(crate) bound: bool,
     pub(crate) evaluations: usize,
 }
@@ -655,14 +815,15 @@ pub(crate) fn least_fold_factor(
             .fold(0.0f64, f64::max)
     };
     let node_spacing = [spacing(&grid.samples_u), spacing(&grid.samples_v)];
-    let scan = scan_offset_regularity(&face.surface, &region, displacements, level, budget)?;
+    let mut scan = scan_offset_regularity(&face.surface, &region, displacements, level, budget)?;
+    let certainty = scan.certify(&face.surface, &region, displacements, level);
     let finest = (1u64 << REFINE_DEPTH) as f64;
     Ok(LeastFoldFactor {
         least: scan.worst,
         node_spacing,
         finest_spacing: [node_spacing[0] / finest, node_spacing[1] / finest],
-        bound: scan.between_unresolved == 0,
-        evaluations: scan.between_evaluations,
+        bound: !matches!(certainty, Certainty::Uncertain { .. }),
+        evaluations: scan.between_evaluations + scan.descent_evaluations + scan.certify_evaluations,
     })
 }
 
@@ -693,9 +854,215 @@ pub(crate) struct BetweenNodes {
     pub(crate) worst: Option<FoldSample>,
     pub(crate) cells: usize,
     pub(crate) evaluations: usize,
-    /// Cells still risky at [`REFINE_DEPTH`]: the bound was not cleared there,
-    /// and nothing of the other sign was found either.
-    pub(crate) unresolved: usize,
+    /// Cells still risky at the depth limit: the bound was not cleared there,
+    /// and nothing of the other sign was found either. Kept, not just counted,
+    /// so the certainty step can take them further.
+    pub(crate) unresolved_cells: Vec<RiskyCell>,
+    /// An evaluation cap stopped the refinement with risky cells unprocessed
+    /// (those are in `unresolved_cells` too). Never set by the scan's own
+    /// refinement, which has no cap; only by the certainty step.
+    pub(crate) capped: bool,
+    /// Dips descended, what they cost, and whether the budget ran out first
+    /// (see [`descend_dips`]).
+    pub(crate) descents: usize,
+    pub(crate) descent_evaluations: usize,
+    pub(crate) descent_capped: bool,
+}
+
+impl BetweenNodes {
+    /// Cells still risky at the depth limit.
+    pub(crate) fn unresolved(&self) -> usize {
+        self.unresolved_cells.len()
+    }
+}
+
+/// A grid cell, or a piece of one, whose four corners agree in sign but which
+/// the slope bound could not clear — the unit the between-node refinement and
+/// the certainty step work on.
+#[derive(Clone, Debug)]
+pub(crate) struct RiskyCell {
+    pub(crate) u: [f64; 2],
+    pub(crate) v: [f64; 2],
+    /// Corner values in the order (u0,v0), (u1,v0), (u0,v1), (u1,v1).
+    pub(crate) corners: [f64; 4],
+    pub(crate) slopes: (f64, f64),
+    pub(crate) depth: usize,
+    pub(crate) risk: f64,
+}
+// Ordered so the heap pops the SMALLEST risk ratio — the riskiest cell — first.
+impl PartialEq for RiskyCell {
+    fn eq(&self, other: &Self) -> bool {
+        self.risk.total_cmp(&other.risk).is_eq()
+    }
+}
+impl Eq for RiskyCell {}
+impl PartialOrd for RiskyCell {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for RiskyCell {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        other.risk.total_cmp(&self.risk)
+    }
+}
+
+/// The risk of a cell with these corner values, spans and slopes: the ratio
+/// of its smallest `|f|` to the margin the slopes could cover over half the
+/// cell, or `None` when the bound clears.
+fn cell_risk(corners: &[f64; 4], du: f64, dv: f64, (lu, lv): (f64, f64)) -> Option<f64> {
+    let margin = REFINE_SAFETY * (lu * du + lv * dv) / 2.0;
+    let smallest = corners.iter().fold(f64::INFINITY, |m, c| m.min(c.abs()));
+    (margin > 0.0 && smallest < margin).then(|| smallest / margin)
+}
+
+/// A local minimum of the node grid on the regular side is worth following
+/// when its highest neighbour sits at least this far above it. The
+/// spikes the slope bound cannot see (2026-09-30 sweep, SHELL_FACE budget:
+/// 185 of 375 family members missed, every one with the bound cleared) move
+/// their nearest node by 0.05 to 0.5; a fitted carrier's interpolation noise
+/// moves nodes by 1e-6 and less, and a dip that shallow hides nothing a
+/// descent could find.
+const DESCENT_PROMINENCE: f64 = 1e-3;
+/// Levels of the windowed descent: the window starts one node spacing wide and
+/// halves each level, so the last one is `2⁻⁹` of the spacing — below the cell
+/// refinement's own floor.
+const DESCENT_LEVELS: usize = 9;
+/// Probes either side of the centre per direction per level: a 9 × 9 window.
+const DESCENT_PROBES: usize = 4;
+/// Samples one scan may spend descending, most prominent dips first. At
+/// 80 samples a level, 9 levels, that is about 200 descents; a region with more
+/// prominent dips than that is reported capped, not regular.
+const DESCENT_EVALUATIONS: usize = 150_000;
+
+/// Follow every prominent DIP of the node grid to its minimum.
+///
+/// The cell refinement above judges a cell by the slope its neighbourhood
+/// shows, and a spike narrower than the node spacing shows almost none: the
+/// nodes round the family's missed islands read 0.49 to 0.91 with the level at
+/// 1e-6, so no cell is risky and the island is missed with the bound cleared.
+/// What those nodes DO show is a dip — a strict local minimum of the sampled
+/// field, its nearest node reading lower than every neighbour — and the fold at
+/// a spike's tip is the bottom of that dip. So every local minimum on the
+/// regular side (ties allowed: a spike on a knot reads the same at the nodes
+/// either side of it), with a neighbour at least [`DESCENT_PROMINENCE`] above
+/// it, is descended: a window one node spacing wide is probed on a 9 × 9 lattice, the
+/// centre moves to the least sample inside the region, and the window halves,
+/// [`DESCENT_LEVELS`] times or until a sample at or below the level turns up.
+/// A collapsed sample found this way counts as `collapsed` and brackets against
+/// the node it descended from, so the fold trace seeds on it like any other.
+///
+/// Bounded: [`DESCENT_EVALUATIONS`] per scan, most prominent dips first; when
+/// it runs out `descent_capped` is set and the caller's certainty step reads
+/// the region as undecided rather than regular. Measured, not proved: a spike
+/// so far between nodes that it moves none of them by the prominence floor is
+/// still invisible, and the family sweep in this module's tests says where the
+/// floor sits.
+#[allow(clippy::too_many_arguments)]
+fn descend_dips(
+    surface: &NurbsSurface,
+    region: &TrimRegion,
+    samples_u: &[f64],
+    samples_v: &[f64],
+    values: &[Vec<Option<f64>>],
+    displacements: &[f64],
+    level: f64,
+    found: &mut BetweenNodes,
+) {
+    let (nu, nv) = (samples_u.len(), samples_v.len());
+    if nu < 2 || nv < 2 {
+        return;
+    }
+    // Local minima on the regular side — no neighbour reads lower; ties are
+    // allowed, because a spike sitting on a knot exactly halfway between nodes
+    // reads the SAME at the two or four nodes round it — with their prominence,
+    // how far the highest neighbour sits above them.
+    let mut dips: Vec<(f64, usize, usize)> = Vec::new();
+    for iu in 0..nu {
+        for iv in 0..nv {
+            let Some(own) = values[iu][iv] else { continue };
+            if own <= 0.0 || !region.contains(samples_u[iu], samples_v[iv]) {
+                continue;
+            }
+            let mut highest_neighbour = f64::NEG_INFINITY;
+            let mut minimum = true;
+            for du in -1i64..=1 {
+                for dv in -1i64..=1 {
+                    if du == 0 && dv == 0 {
+                        continue;
+                    }
+                    let (ju, jv) = (iu as i64 + du, iv as i64 + dv);
+                    if ju < 0 || jv < 0 || ju >= nu as i64 || jv >= nv as i64 {
+                        continue;
+                    }
+                    if let Some(other) = values[ju as usize][jv as usize] {
+                        if other < own {
+                            minimum = false;
+                        }
+                        highest_neighbour = highest_neighbour.max(other);
+                    }
+                }
+            }
+            if minimum && highest_neighbour.is_finite() && highest_neighbour - own >= DESCENT_PROMINENCE {
+                dips.push((highest_neighbour - own, iu, iv));
+            }
+        }
+    }
+    dips.sort_by(|a, b| b.0.total_cmp(&a.0));
+    let spacing = |samples: &[f64], index: usize| -> f64 {
+        let before = if index > 0 { samples[index] - samples[index - 1] } else { 0.0 };
+        let after = if index + 1 < samples.len() { samples[index + 1] - samples[index] } else { 0.0 };
+        before.max(after)
+    };
+    for (_, iu, iv) in dips {
+        if found.descent_evaluations + (2 * DESCENT_PROBES + 1).pow(2) > DESCENT_EVALUATIONS {
+            found.descent_capped = true;
+            break;
+        }
+        found.descents += 1;
+        let node = [samples_u[iu], samples_v[iv]];
+        let (mut centre_u, mut centre_v) = (node[0], node[1]);
+        let (mut radius_u, mut radius_v) = (spacing(samples_u, iu), spacing(samples_v, iv));
+        let mut least = values[iu][iv].unwrap_or(f64::INFINITY);
+        'levels: for _ in 0..DESCENT_LEVELS {
+            let mut best: Option<FoldSample> = None;
+            for pu in 0..=2 * DESCENT_PROBES {
+                let u = centre_u + radius_u * (pu as f64 / DESCENT_PROBES as f64 - 1.0);
+                for pv in 0..=2 * DESCENT_PROBES {
+                    let v = centre_v + radius_v * (pv as f64 / DESCENT_PROBES as f64 - 1.0);
+                    if (pu == DESCENT_PROBES && pv == DESCENT_PROBES) || !region.contains(u, v) {
+                        continue;
+                    }
+                    found.descent_evaluations += 1;
+                    let Some(sample) = fold_sample_at(surface, u, v, displacements) else {
+                        continue;
+                    };
+                    if found.worst.is_none_or(|worst| sample.factor < worst.factor) {
+                        found.worst = Some(sample);
+                    }
+                    let f = sample.factor - level;
+                    if f <= 0.0 {
+                        // The bottom of the dip is below the level: a fold the
+                        // census's nodes did not show, bracketed against the
+                        // node the descent started from.
+                        found.collapsed += 1;
+                        found.brackets.push(([u, v], node));
+                        break 'levels;
+                    }
+                    if best.is_none_or(|current| sample.factor < current.factor) {
+                        best = Some(sample);
+                    }
+                }
+            }
+            if let Some(sample) = best.filter(|sample| sample.factor - level < least) {
+                least = sample.factor - level;
+                centre_u = sample.u;
+                centre_v = sample.v;
+            }
+            radius_u *= 0.5;
+            radius_v *= 0.5;
+        }
+    }
 }
 
 /// Look BETWEEN the scan's nodes for a sign change the nodes cannot show.
@@ -758,38 +1125,7 @@ pub(crate) fn refine_between_nodes(
         (lu, lv)
     };
 
-    struct Cell {
-        u: [f64; 2],
-        v: [f64; 2],
-        /// Corner values in the order (u0,v0), (u1,v0), (u0,v1), (u1,v1).
-        corners: [f64; 4],
-        slopes: (f64, f64),
-        depth: usize,
-        risk: f64,
-    }
-    // Ordered so the heap pops the SMALLEST risk ratio — the riskiest cell — first.
-    impl PartialEq for Cell {
-        fn eq(&self, other: &Self) -> bool {
-            self.risk.total_cmp(&other.risk).is_eq()
-        }
-    }
-    impl Eq for Cell {}
-    impl PartialOrd for Cell {
-        fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-            Some(self.cmp(other))
-        }
-    }
-    impl Ord for Cell {
-        fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-            other.risk.total_cmp(&self.risk)
-        }
-    }
-    let risk_of = |corners: &[f64; 4], du: f64, dv: f64, (lu, lv): (f64, f64)| -> Option<f64> {
-        let margin = REFINE_SAFETY * (lu * du + lv * dv) / 2.0;
-        let smallest = corners.iter().fold(f64::INFINITY, |m, c| m.min(c.abs()));
-        (margin > 0.0 && smallest < margin).then(|| smallest / margin)
-    };
-    let mut work = std::collections::BinaryHeap::<Cell>::new();
+    let mut work = std::collections::BinaryHeap::<RiskyCell>::new();
     for iu in 0..nu - 1 {
         for iv in 0..nv - 1 {
             let (Some(a), Some(b), Some(c), Some(d)) =
@@ -813,8 +1149,8 @@ pub(crate) fn refine_between_nodes(
                 continue;
             }
             let cell_slopes = slopes(iu, iv);
-            if let Some(risk) = risk_of(&corners, u1 - u0, v1 - v0, cell_slopes) {
-                work.push(Cell {
+            if let Some(risk) = cell_risk(&corners, u1 - u0, v1 - v0, cell_slopes) {
+                work.push(RiskyCell {
                     u: [u0, u1],
                     v: [v0, v1],
                     corners,
@@ -826,11 +1162,39 @@ pub(crate) fn refine_between_nodes(
         }
     }
     found.cells = work.len();
-    // No evaluation budget: the quadtree below one risky cell has at most
-    // (4^REFINE_DEPTH − 1)/3 cells to process at five samples each, so the
-    // refinement always finishes, and a cap could only ever stop it early —
-    // which is the island escape again with a different trigger.
+    refine_cells(surface, region, displacements, level, work, REFINE_DEPTH, None, &mut found);
+    descend_dips(surface, region, samples_u, samples_v, values, displacements, level, &mut found);
+    found
+}
+
+/// Halve `work`'s cells, riskiest first, until each clears its bound, holds a
+/// sample of the other sign, or reaches `max_depth`; with `cap`, stop once
+/// that many samples have been read and leave the rest in `unresolved_cells`
+/// with `capped` set. Everything found goes into `found`.
+#[allow(clippy::too_many_arguments)]
+fn refine_cells(
+    surface: &NurbsSurface,
+    region: &TrimRegion,
+    displacements: &[f64],
+    level: f64,
+    mut work: std::collections::BinaryHeap<RiskyCell>,
+    max_depth: usize,
+    cap: Option<usize>,
+    found: &mut BetweenNodes,
+) {
+    // The scan's own refinement runs with no evaluation budget: the quadtree
+    // below one risky cell has at most (4^REFINE_DEPTH − 1)/3 cells to process
+    // at five samples each, so it always finishes, and a cap could only ever
+    // stop it early — which is the island escape again with a different
+    // trigger. The certainty step's second pass over what that left is the one
+    // with a cap, and running out is reported, never read as regular.
     while let Some(cell) = work.pop() {
+        if cap.is_some_and(|cap| found.evaluations + 5 > cap) {
+            found.capped = true;
+            found.unresolved_cells.push(cell);
+            found.unresolved_cells.extend(work.into_iter());
+            break;
+        }
         let collapsed_side = cell.corners[0] <= 0.0;
         let (um, vm) = (0.5 * (cell.u[0] + cell.u[1]), 0.5 * (cell.v[0] + cell.v[1]));
         let points = [
@@ -902,23 +1266,23 @@ pub(crate) fn refine_between_nodes(
                 ((corners[2] - corners[0]).abs().max((corners[3] - corners[1]).abs())) / dv,
             );
             let child_slopes = (cell.slopes.0.max(own.0), cell.slopes.1.max(own.1));
-            if let Some(risk) = risk_of(&corners, du, dv, child_slopes) {
-                if cell.depth + 1 >= REFINE_DEPTH {
-                    found.unresolved += 1;
-                    continue;
-                }
-                work.push(Cell {
+            if let Some(risk) = cell_risk(&corners, du, dv, child_slopes) {
+                let child = RiskyCell {
                     u,
                     v,
                     corners,
                     slopes: child_slopes,
                     depth: cell.depth + 1,
                     risk,
-                });
+                };
+                if child.depth >= max_depth {
+                    found.unresolved_cells.push(child);
+                    continue;
+                }
+                work.push(child);
             }
         }
     }
-    found
 }
 
 /// Bisect toward the worst node so the refusal names where the fold IS, not the

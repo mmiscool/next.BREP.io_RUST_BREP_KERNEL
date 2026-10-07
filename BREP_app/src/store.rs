@@ -37,6 +37,12 @@ pub const KICAD_LIBRARY_KEY: &str = "@kicad_library";
 /// never leaves the machine — it records THIS machine's runs against a
 /// server, and the source tree it describes is on this machine.
 pub const PLM_IMPORT_KEY: &str = "@plm_import";
+/// Explicitly installed executable packages stay on this machine, including in PLM mode.
+pub const PLUGINS_KEY: &str = "@plugins";
+/// Explicitly saved JavaScript editor source, local even in PLM mode.
+pub const JAVASCRIPT_DRAFT_KEY: &str = "@javascript_draft";
+/// Recent document identities, shared through the user preference store.
+pub const RECENT_DOCUMENTS_KEY: &str = "@recent_documents";
 
 /// The reserved names that are a user's PREFERENCES (plm-cad-integration-todo
 /// D1): state that follows the user, not the machine. A file backend keeps them
@@ -51,6 +57,7 @@ pub const PREFERENCE_KEYS: &[&str] = &[
     PINNED_KEY,
     FEATURE_PALETTE_DISPLAY_KEY,
     KICAD_LIBRARY_KEY,
+    RECENT_DOCUMENTS_KEY,
 ];
 
 /// The reserved names that never have to leave the machine to be safe: the
@@ -58,7 +65,7 @@ pub const PREFERENCE_KEYS: &[&str] = &[
 /// after the local write (D1, S1's composition); the local copy is what a
 /// network drop cannot take away — and `@plm_import`, which is never
 /// mirrored.
-pub const LOCAL_KEYS: &[&str] = &[RECOVERY_KEY, PLM_IMPORT_KEY];
+pub const LOCAL_KEYS: &[&str] = &[RECOVERY_KEY, PLM_IMPORT_KEY, PLUGINS_KEY, JAVASCRIPT_DRAFT_KEY];
 
 /// Which of the three key spaces a store name belongs to (D1, the round 10
 /// answer). Every name is exactly one of them:
@@ -372,6 +379,12 @@ pub trait ModelStore {
     /// no-op on every file store.
     fn refresh_plm_index(&self, keys: &[String], stale: bool) {
         let _ = (keys, stale);
+    }
+
+    /// Remember a document that has already been durably written through a PLM
+    /// request. Update the session mirror without issuing a second write.
+    fn remember_saved_document(&self, name: &str, contents: &str) {
+        let _ = (name, contents);
     }
 
     /// This machine's own files, browsable, for the file chooser (any file,
@@ -775,13 +788,13 @@ mod native_boot {
         let local: Rc<dyn StoreBackend> = Rc::new(NativeFileBackend::rooted_at(root.to_path_buf()));
         let backend = block_on_for(connect(config, local), timeout).ok_or_else(late)??;
         // The index, not the documents: a catalog of thousands of parts must
-        // not load in front of the first frame. `prefetch` streams them after.
+        // not load at boot or stream into memory behind the first frame.
+        // Document bodies remain OnDisk until read on demand.
         let entries = block_on_for(backend.load_index(), timeout)
             .ok_or_else(late)?
             .map_err(|e| format!("the store index would not load ({e})"))?;
         let wake: Rc<dyn Fn()> = Rc::new(crate::plm::native::request_wake);
         let core = MirrorStore::from_index(backend, entries, Some(wake));
-        core.prefetch();
         Ok(NativeMirrorStore { core, files: FileModelStore::rooted_at(root.to_path_buf()) })
     }
 
@@ -807,6 +820,9 @@ mod native_boot {
         }
         fn refresh_plm_index(&self, keys: &[String], stale: bool) {
             self.core.refresh_plm_index(keys, stale)
+        }
+        fn remember_saved_document(&self, name: &str, contents: &str) {
+            self.core.remember_saved_document(name, contents)
         }
         fn list(&self) -> Vec<String> {
             self.core.list()
@@ -944,8 +960,8 @@ mod native_boot {
 // NOT identities, though the plan's first draft listed them:
 //  * `@pinned` holds explorer FOLDER locations, never documents — in PLM mode
 //    it pins workspace folders (S14) and stays a Preferences key.
-//  * There is no recent-files list in the app (no `recent`, `mru` or
-//    `last_open` anywhere in `BREP_app/src`).
+// `@recent_documents` holds document identities in most-recent-first order;
+// it is a user preference and opens through the same file-dialog door.
 //
 // The seam: `ModelStore::identity`, `ModelStore::display_name` and
 // `ModelStore::sibling_of`, whose defaults are exactly the path rules below,
@@ -971,8 +987,8 @@ impl DocumentIdentity {
         match key.split('/').collect::<Vec<_>>().as_slice() {
             ["part", part, "rev", revision] if !part.is_empty() && !revision.is_empty() => {
                 Some(DocumentIdentity::Revision {
-                    part: part.to_string(),
-                    revision: revision.to_string(),
+                    part: crate::plm::identity::unsegment(part)?,
+                    revision: crate::plm::identity::unsegment(revision)?,
                 })
             }
             _ => None,
@@ -983,7 +999,7 @@ impl DocumentIdentity {
     pub fn key(&self) -> String {
         match self {
             DocumentIdentity::Path(path) => path.clone(),
-            DocumentIdentity::Revision { part, revision } => format!("part/{part}/rev/{revision}"),
+            DocumentIdentity::Revision { part, revision } => crate::plm::identity::document_key(part, revision),
         }
     }
 }
@@ -1163,7 +1179,10 @@ mod native_model {
                 PINNED_KEY => return self.app_dir.join("pinned.json"),
                 RECOVERY_KEY => return self.app_dir.join("recovery.json"),
                 KICAD_LIBRARY_KEY => return self.app_dir.join("kicad_library.json"),
+                super::RECENT_DOCUMENTS_KEY => return self.app_dir.join("recent_documents.json"),
                 PLM_IMPORT_KEY => return self.app_dir.join("plm_import.json"),
+                super::PLUGINS_KEY => return self.app_dir.join("plugins.json"),
+                super::JAVASCRIPT_DRAFT_KEY => return self.app_dir.join("javascript_draft.js"),
                 _ => {}
             }
             if name.contains('/') || name.contains('\\') {
@@ -1545,6 +1564,15 @@ pub(crate) mod mirror_store {
         OnDisk { bytes: u64 },
     }
 
+    /// One row of a PLM index answer: the mirror key, its size and the hash
+    /// of the document the server holds (sha256, hex — what
+    /// [`crate::plm::kicad::content_hash`] computes of the same bytes).
+    pub(crate) struct IndexRow {
+        pub(crate) key: String,
+        pub(crate) bytes: u64,
+        pub(crate) content_hash: String,
+    }
+
     impl Entry {
         /// The value's size in bytes, whether or not it is loaded.
         pub(crate) fn len(&self) -> u64 {
@@ -1632,6 +1660,22 @@ pub(crate) mod mirror_store {
         /// See [`ModelStore::refresh_plm_index`].
         fn refresh_plm_index(&self, keys: &[String], stale: bool) {
             let _ = (keys, stale);
+        }
+
+        /// The index rows of `keys` (store keys, `part/<p>/rev/<r>`), as the
+        /// LAZY entries the mirror reconciles on a feed move: `(mirror key,
+        /// [`Entry::OnDisk`], content hash)`. A key the server no longer
+        /// lists is absent from the answer. `Err` from a backend that keeps no
+        /// index: the mirror then leaves its entries alone.
+        fn index_rows(&self, keys: &[String]) -> BackendFuture<Vec<IndexRow>> {
+            let _ = keys;
+            Box::pin(async { Err("this store keeps no index".to_string()) })
+        }
+
+        /// The whole index as [`Self::index_rows`] answers it, for a stale
+        /// feed (a resync): every document the server lists.
+        fn index_all(&self) -> BackendFuture<Vec<IndexRow>> {
+            Box::pin(async { Err("this store keeps no index".to_string()) })
         }
 
         /// Pull the entire key space, values included.
@@ -1747,6 +1791,12 @@ pub(crate) mod mirror_store {
 
         fn refresh_plm_index(&self, keys: &[String], stale: bool) {
             self.documents.refresh_plm_index(keys, stale)
+        }
+        fn index_rows(&self, keys: &[String]) -> BackendFuture<Vec<IndexRow>> {
+            self.documents.index_rows(keys)
+        }
+        fn index_all(&self) -> BackendFuture<Vec<IndexRow>> {
+            self.documents.index_all()
         }
 
         fn load_all(&self) -> BackendFuture<Vec<(String, String)>> {
@@ -1985,6 +2035,16 @@ pub(crate) mod mirror_store {
         /// for each key with a write in flight, the writes made after it, not
         /// yet issued. A key is present exactly while its drain task runs.
         queues: Rc<RefCell<BTreeMap<String, VecDeque<QueuedWrite>>>>,
+        /// A monotonic clock of authority: every local mutation of a key and
+        /// every index request issued takes the next tick.
+        clock: Rc<Cell<u64>>,
+        /// Per key, the tick of the authority that last set it here — a local
+        /// write, delete, remembered save, loaded body, or the ISSUE tick of
+        /// the index answer applied to it. An index answer applies to a key
+        /// only if it was issued after that tick (see [`Self::reconcile`]).
+        freshness: Rc<RefCell<BTreeMap<String, u64>>>,
+        /// A whole-index answer also speaks for keys never seen locally.
+        full_index_authority: Rc<Cell<u64>>,
     }
 
     /// A write the per-key queue holds back: the document name its failure is
@@ -2030,7 +2090,22 @@ pub(crate) mod mirror_store {
                 wake,
                 loading: Rc::new(RefCell::new(BTreeSet::new())),
                 queues: Rc::new(RefCell::new(BTreeMap::new())),
+                clock: Rc::new(Cell::new(0)),
+                freshness: Rc::new(RefCell::new(BTreeMap::new())),
+                full_index_authority: Rc::new(Cell::new(0)),
             }
+        }
+        /// The next tick of the authority clock.
+        fn tick(&self) -> u64 {
+            let next = self.clock.get() + 1;
+            self.clock.set(next);
+            next
+        }
+        /// A local authority over `key` now: later index answers that were
+        /// issued before this cannot touch it.
+        fn stamp_local(&self, key: &str) {
+            let tick = self.tick();
+            self.freshness.borrow_mut().insert(key.to_string(), tick);
         }
 
         /// The persisted key for a document/reserved name. UNCHANGED from the
@@ -2048,7 +2123,10 @@ pub(crate) mod mirror_store {
                 // document arm would key as `brep-app:model:@kicad_library` and
                 // LIST as a document the day anything wrote it here.
                 KICAD_LIBRARY_KEY => "brep-app:kicad_library".into(),
+                super::RECENT_DOCUMENTS_KEY => "brep-app:recent_documents".into(),
                 PLM_IMPORT_KEY => "brep-app:plm_import".into(),
+                super::PLUGINS_KEY => "brep-app:plugins".into(),
+                super::JAVASCRIPT_DRAFT_KEY => "brep-app:javascript_draft".into(),
                 _ => format!("{PREFIX}{}", Self::model_relative(name)),
             }
         }
@@ -2181,8 +2259,85 @@ pub(crate) mod mirror_store {
         /// what relights the outdated-components badge on an assembly whose part
         /// was just re-saved in another tab.
         // The browser's other-tab channel today; natively, the PLM change feed (S1).
+        /// Fold an index answer into the entries. `asked`: the mirror keys a
+        /// feed move named (a key missing from the answer was deleted on the
+        /// server); `None`: the answer is the WHOLE index (a stale-feed
+        /// resync), so every model key it does not list was deleted.
+        ///
+        /// The ordering policy, per key: an answer applies only if it was
+        /// ISSUED (`issued`, the clock tick taken before the request left)
+        /// after the authority that last set the key here — a local write or
+        /// delete, a remembered save, a loaded body, or a newer answer. So an
+        /// answer that left before a save and lands after it cannot evict the
+        /// saved copy or delete the saved key, even with nothing in flight
+        /// any more; and two answers landing out of order leave the newer
+        /// one's result standing. A key with a write in flight or queued is
+        /// skipped as well. A resident entry whose bytes hash to the row's
+        /// content hash is left alone (the server holds what this app holds).
+        /// Everything else becomes the server's row, lazily: a resident copy
+        /// the server has moved on from is re-read on its next `read` (no
+        /// body is fetched here), and an open document's unsaved edits live in
+        /// its tab, not here. Returns whether anything changed.
+        pub(crate) fn reconcile(&self, asked: Option<&[String]>, rows: Vec<IndexRow>, issued: u64) -> bool {
+            let busy = |key: &str| {
+                self.in_flight.borrow().contains_key(key)
+                    || self.queues.borrow().contains_key(key)
+                    || self.full_index_authority.get() >= issued
+                    || self.freshness.borrow().get(key).is_some_and(|&tick| tick >= issued)
+            };
+            let listed: BTreeSet<&str> = rows.iter().map(|row| row.key.as_str()).collect();
+            let mut changed = false;
+            {
+                let mut entries = self.entries.borrow_mut();
+                let gone: Vec<String> = match asked {
+                    Some(asked) => asked.iter().filter(|key| !listed.contains(key.as_str())).cloned().collect(),
+                    None => entries
+                        .keys()
+                        .filter(|key| key.starts_with(PREFIX) && !listed.contains(key.as_str()))
+                        .cloned()
+                        .collect(),
+                };
+                for key in gone {
+                    if busy(&key) {
+                        continue;
+                    }
+                    self.freshness.borrow_mut().insert(key.clone(), issued);
+                    changed |= entries.remove(&key).is_some();
+                }
+                for row in rows {
+                    if busy(&row.key) {
+                        continue;
+                    }
+                    self.freshness.borrow_mut().insert(row.key.clone(), issued);
+                    let same = match entries.get(&row.key) {
+                        Some(Entry::Resident(held)) => {
+                            crate::plm::kicad::content_hash(held.as_bytes()) == row.content_hash
+                        }
+                        Some(Entry::OnDisk { bytes }) => *bytes == row.bytes,
+                        None => false,
+                    };
+                    if same {
+                        continue;
+                    }
+                    entries.insert(row.key, Entry::OnDisk { bytes: row.bytes });
+                    changed = true;
+                }
+            }
+            if asked.is_none() {
+                self.full_index_authority.set(self.full_index_authority.get().max(issued));
+            }
+            if changed {
+                self.mutations.set(self.mutations.get().wrapping_add(1));
+                if let Some(wake) = &self.wake {
+                    wake();
+                }
+            }
+            changed
+        }
+
         #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
         pub(crate) fn apply_external(&self, key: &str, value: Option<String>) {
+            self.stamp_local(key);
             let changed = {
                 let mut entries = self.entries.borrow_mut();
                 match value {
@@ -2278,11 +2433,12 @@ pub(crate) mod mirror_store {
             }
             let store = self.clone();
             let key = key.to_string();
+            let issued = self.tick();
             let request = self.backend.get(&key);
             spawn(async move {
                 let outcome = request.await;
                 store.loading.borrow_mut().remove(&key);
-                store.resolve(&key, outcome);
+                store.resolve(&key, outcome, issued);
             });
         }
 
@@ -2293,15 +2449,24 @@ pub(crate) mod mirror_store {
         /// A failed load leaves the entry `OnDisk`, so the next `read` asks
         /// again. Like a failed refresh it does not toast: nothing of the
         /// user's was lost (S1 owns how a transport failure is shown).
-        fn resolve(&self, key: &str, outcome: Result<Option<String>, String>) {
+        fn resolve(&self, key: &str, outcome: Result<Option<String>, String>, issued: u64) {
             let Ok(value) = outcome else {
                 return;
             };
+            // An index answered after this body request may name a newer
+            // document while leaving the entry OnDisk (even at the same size).
+            // Its authority also outranks this response; discard it so a next
+            // demand read can fetch the current body.
+            if self.full_index_authority.get() > issued
+                || self.freshness.borrow().get(key).is_some_and(|&tick| tick > issued) {
+                return;
+            }
             {
                 let mut entries = self.entries.borrow_mut();
                 if !matches!(entries.get(key), Some(Entry::OnDisk { .. })) {
                     return;
                 }
+                self.stamp_local(key);
                 match value {
                     Some(value) => entries.insert(key.to_string(), Entry::Resident(value)),
                     // Listed, then gone before we read it: the backend is
@@ -2338,9 +2503,10 @@ pub(crate) mod mirror_store {
                     if !wanted || !store.loading.borrow_mut().insert(key.clone()) {
                         continue;
                     }
+                    let issued = store.tick();
                     let outcome = store.backend.get(&key).await;
                     store.loading.borrow_mut().remove(&key);
-                    store.resolve(&key, outcome);
+                    store.resolve(&key, outcome, issued);
                 }
             });
         }
@@ -2359,8 +2525,44 @@ pub(crate) mod mirror_store {
             self.backend.plm_revision(key)
         }
 
+        /// A feed move: what the server now lists for `keys` — or, `stale`,
+        /// for everything — is folded into the entries as LAZY `OnDisk`
+        /// rows, so a document another client, the web app or Generate made
+        /// after this app booted is listed and opens without a reload (bodies
+        /// load on demand, as at boot). See [`Self::reconcile`] for what is
+        /// never touched.
         fn refresh_plm_index(&self, keys: &[String], stale: bool) {
-            self.backend.refresh_plm_index(keys, stale)
+            // A backend that keeps no index answers `Err` and nothing moves.
+            if !stale && keys.is_empty() {
+                return;
+            }
+            let store = self.clone();
+            // The answer speaks for the server AS OF NOW: ticked before the
+            // request leaves, so anything local that happens while it is on
+            // the wire outranks it.
+            let issued = self.tick();
+            if stale {
+                let request = self.backend.index_all();
+                spawn(async move {
+                    if let Ok(rows) = request.await {
+                        store.reconcile(None, rows, issued);
+                    }
+                });
+            } else {
+                let asked: Vec<String> = keys.iter().map(|key| format!("{PREFIX}{key}")).collect();
+                let request = self.backend.index_rows(keys);
+                spawn(async move {
+                    if let Ok(rows) = request.await {
+                        store.reconcile(Some(&asked), rows, issued);
+                    }
+                });
+            }
+        }
+        fn remember_saved_document(&self, name: &str, contents: &str) {
+            let key = Self::key(name);
+            self.stamp_local(&key);
+            self.entries.borrow_mut().insert(key, Entry::Resident(contents.into()));
+            self.mutations.set(self.mutations.get().wrapping_add(1));
         }
 
         fn list(&self) -> Vec<String> {
@@ -2409,6 +2611,7 @@ pub(crate) mod mirror_store {
 
         fn write(&self, name: &str, contents: &str) -> Result<(), String> {
             let key = Self::key(name);
+            self.stamp_local(&key);
             self.entries
                 .borrow_mut()
                 .insert(key.clone(), Entry::Resident(contents.to_string()));
@@ -2424,6 +2627,7 @@ pub(crate) mod mirror_store {
 
         fn remove(&self, name: &str) -> Result<(), String> {
             let key = Self::key(name);
+            self.stamp_local(&key);
             // The backend delete is pushed either way (the mirror may be
             // ahead of it), but only a delete that found something COUNTS —
             // the same rule `FileModelStore::remove` keeps.
@@ -3118,12 +3322,11 @@ mod web_model {
                 }
                 // `load_index`'s default IS `load_all` with every value
                 // resident, so a browser origin still hydrates whole; the
-                // prefetch below then has nothing to do. An index-only backend
-                // (the PLM) goes through this same door.
+                // index-only PLM keeps document bodies unloaded until an actual
+                // read. Never prefetch the catalog: its bodies can exceed WASM memory.
                 match backend.load_index().await {
                     Ok(entries) => {
                         let core = MirrorStore::from_index(backend, entries, Some(wake));
-                        core.prefetch();
                         // Hydration is the LAST all-at-once read. From here the
                         // mirror keeps up with the other tabs one key at a time,
                         // so a part saved next door is insertable here without a
@@ -3433,6 +3636,9 @@ mod web_model {
         }
         fn refresh_plm_index(&self, keys: &[String], stale: bool) {
             self.core.refresh_plm_index(keys, stale)
+        }
+        fn remember_saved_document(&self, name: &str, contents: &str) {
+            self.core.remember_saved_document(name, contents)
         }
         fn list(&self) -> Vec<String> {
             self.core.list()

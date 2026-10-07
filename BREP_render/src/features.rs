@@ -209,6 +209,25 @@ pub fn feature_form_fields(feature_type: &str) -> Vec<FormField> {
     form_fields_from_schema(&schema)
 }
 
+/// Plugin numeric bounds are enforced when the user commits a scalar edit.
+/// Keep built-in expression fields on their existing scalar path; neither
+/// kind quantizes an authored value just because its form is displayed.
+pub fn plugin_form_fields_from_schema(schema: &Value) -> Vec<FormField> {
+    let mut fields = form_fields_from_schema(schema);
+    for field in &mut fields {
+        let Some(name) = field.path.first() else { continue };
+        let spec = &schema["inputParamsSchema"][name];
+        if spec["type"] == "number" && (spec.get("min").is_some() || spec.get("max").is_some()) {
+            field.kind = FieldKind::BoundedScalar {
+                min: spec["min"].as_f64().unwrap_or(-f64::MAX),
+                max: spec["max"].as_f64().unwrap_or(f64::MAX),
+                step: spec["step"].as_f64().unwrap_or(0.5),
+            };
+        }
+    }
+    fields
+}
+
 /// Map ANY schema entry carrying an `inputParamsSchema` object into form fields
 /// — the shared engine behind [`feature_form_fields`] AND the assembly
 /// constraint dialogs (whose schemas come from the kernel's

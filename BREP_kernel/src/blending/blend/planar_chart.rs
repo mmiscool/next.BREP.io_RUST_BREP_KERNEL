@@ -103,6 +103,40 @@ struct Widening {
     excursion: f64,
 }
 
+/// How far the curve `at` over `[t0, t1]` runs outside the chart of a PLANE
+/// carrier, in the chart's own frame — the excursion
+/// [`fit_planar_charts_to_trims`] reads off a face's trims — or `None` when
+/// `surface` is not a plane (a general carrier has no extension to widen onto).
+/// A support trim whose rail overruns its plane's chart by more than the
+/// consumed band is rebuilt from its edge on the widened chart, and verified
+/// there at the refinement floor, by that pass; any pcurve fitted or read
+/// against the unwidened chart before it is clamped onto the chart's
+/// boundary and means nothing.
+pub(crate) fn planar_chart_overrun(
+    surface: &crate::NurbsSurface,
+    at: &dyn Fn(f64) -> Result<Vec3, String>,
+    t0: f64,
+    t1: f64,
+) -> Result<Option<f64>, KernelRefusal> {
+    if !matches!(surface.analytic(), Some(AnalyticSurface::Plane { .. })) {
+        return Ok(None);
+    }
+    let [u0, u1] = surface.domain_u().or_refuse(KernelStage::Refine, "domain_u")?;
+    let [v0, v1] = surface.domain_v().or_refuse(KernelStage::Refine, "domain_v")?;
+    let origin = surface.evaluate(u0, v0).or_refuse(KernelStage::Refine, "evaluate")?;
+    let du = surface.evaluate(u1, v0).or_refuse(KernelStage::Refine, "evaluate")?.sub(origin);
+    let dv = surface.evaluate(u0, v1).or_refuse(KernelStage::Refine, "evaluate")?.sub(origin);
+    let (length_u, length_v) = (du.length(), dv.length());
+    let (eu, ev) = (du.normalized().or_refuse(KernelStage::Refine, "normalized")?, dv.normalized().or_refuse(KernelStage::Refine, "normalized")?);
+    let mut excursion = 0.0_f64;
+    for step in 0..=CHART_SAMPLES {
+        let point = at(t0 + (t1 - t0) * step as f64 / CHART_SAMPLES as f64).or_refuse(KernelStage::Refine, "evaluate")?.sub(origin);
+        let (u, v) = (point.dot(eu), point.dot(ev));
+        excursion = excursion.max(-u).max(u - length_u).max(-v).max(v - length_v);
+    }
+    Ok(Some(excursion))
+}
+
 /// Widen every planar carrier in `result` whose own trims leave its chart, and
 /// rebuild those faces' pcurves.  Returns how many carriers moved.
 ///
@@ -115,7 +149,12 @@ pub(crate) fn fit_planar_charts_to_trims(
     input: &BrepSolid,
     result: &mut BrepSolid,
 ) -> Result<usize, KernelRefusal> {
-    let band = crate::blend::consumed_band(result);
+    // The SMALLER of the input's and the result's bands: a support trim the
+    // surgery deferred to this pass (`planar_chart_overrun` over
+    // `consumed_band` of the solid it sewed into, which every caller passes
+    // here as `input`) is always widened and rebuilt here, whichever way the
+    // operation moved the body's size.
+    let band = crate::blend::consumed_band(input).min(crate::blend::consumed_band(result));
     let existing: HashSet<u64> = input.edges.iter().map(|edge| edge.id).collect();
     let curves: HashMap<u64, (&NurbsCurve, f64, f64)> = result
         .edges

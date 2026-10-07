@@ -392,7 +392,10 @@ impl<'a> SolidBuilder<'a> {
         // points into the excluded hemisphere; seating the periodic seam there
         // makes the authored half one ordinary in-domain trim for tessellation,
         // mass properties, and point classification alike.
-        let sphere_seam = self.equal_gap_sphere_seam(surface_ref, &bounds, face_same_sense)?;
+        let sphere_seam = match self.authored_sphere_seam(surface_ref, &bounds)? {
+            Some(seam) => Some(seam),
+            None => self.equal_gap_sphere_seam(surface_ref, &bounds, face_same_sense)?,
+        };
         let surface = self
             .resolver
             .surface_for_face(surface_ref, &samples, sphere_seam)?;
@@ -419,6 +422,69 @@ impl<'a> SolidBuilder<'a> {
             same_sense: face_same_sense,
             bounds,
         })
+    }
+
+    /// A supplied spherical SEAM_CURVE fixes the periodic cut. Moving that
+    /// cut into a geometry-only largest angular gap turns its two coedges
+    /// into an interior doubled meridian: the outer domain then has zero UV
+    /// area and a sphere-minus-hole imports as the hole's complementary cap.
+    /// Preserve the placement only when an opposed pair and both supplied
+    /// branches name this sphere and the 3D edge actually rides its seam.
+    fn authored_sphere_seam(
+        &self,
+        surface_ref: usize,
+        bounds: &[(Vec<(u64, bool)>, bool)],
+    ) -> Result<Option<Vec3>, String> {
+        let entity = self.resolver.get(surface_ref)?;
+        let Some(args) = entity.find("SPHERICAL_SURFACE") else {
+            return Ok(None);
+        };
+        let frame = self.resolver.placement(args[1].as_ref_id()?)?;
+        let radius = self.resolver.length(args[2].as_real()?.abs());
+        let bar = (radius * 1e-7).max(1e-12);
+        for (specs, _) in bounds {
+            for &(edge_id, forward) in specs {
+                if !specs.iter().any(|&(id, sense)| id == edge_id && sense != forward) {
+                    continue;
+                }
+                let Some(&curve_ref) = self.curve_ref_of_edge.get(&edge_id) else {
+                    continue;
+                };
+                if self.resolver.get(curve_ref)?.find("SEAM_CURVE").is_none()
+                    || self
+                        .resolver
+                        .supplied_pcurves(curve_ref)
+                        .iter()
+                        .filter(|p| p.basis_ref == surface_ref)
+                        .count()
+                        != 2
+                {
+                    continue;
+                }
+                let edge = self.edge_record(edge_id);
+                if edge.degenerate {
+                    continue;
+                }
+                let mut on_seam = true;
+                for i in 0..=16 {
+                    let p = edge
+                        .curve
+                        .evaluate(edge.t0 + (edge.t1 - edge.t0) * i as f64 / 16.)?
+                        .sub(frame.origin);
+                    if p.dot(frame.y).abs() > bar
+                        || p.dot(frame.x) < -bar
+                        || (p.length() - radius).abs() > bar
+                    {
+                        on_seam = false;
+                        break;
+                    }
+                }
+                if on_seam {
+                    return Ok(Some(frame.x));
+                }
+            }
+        }
+        Ok(None)
     }
 
     /// Preferred periodic seam for the sole ambiguous spherical trim: one
@@ -489,6 +555,7 @@ impl<'a> SolidBuilder<'a> {
 
         let id = self.fresh();
         self.capture_face(id, face_ref, surface_ref);
+        self.face_refs.insert(id, (face_ref, surface_ref));
         let mut face = FaceRecord {
             id,
             surface,

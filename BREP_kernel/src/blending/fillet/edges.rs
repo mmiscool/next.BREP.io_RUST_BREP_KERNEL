@@ -8,6 +8,9 @@ pub fn fillet_edge(
     radius: f64,
     name: Option<&str>,
 ) -> Result<BrepSolid, KernelRefusal> {
+    // One blend operation: the reports of an earlier one, never consumed, are
+    // dropped as it starts (nested calls keep this operation's).
+    let _operation = crate::blend::BlendOperation::enter();
     check_mixed_concavity(solid, edge_id, "fillet_edge")?;
     check_support_extent(solid, edge_id, radius, "fillet_edge")?;
     fillet_or_chamfer(solid, edge_id, radius, false, name, ToolEnds::default(), Lane::GeneralFirst)
@@ -38,6 +41,9 @@ pub fn chamfer_edge(
     distance: f64,
     name: Option<&str>,
 ) -> Result<BrepSolid, KernelRefusal> {
+    // One blend operation: the reports of an earlier one, never consumed, are
+    // dropped as it starts (nested calls keep this operation's).
+    let _operation = crate::blend::BlendOperation::enter();
     check_mixed_concavity(solid, edge_id, "chamfer_edge")?;
     check_support_extent(solid, edge_id, distance, "chamfer_edge")?;
     fillet_or_chamfer(solid, edge_id, distance, true, name, ToolEnds::default(), Lane::GeneralFirst)
@@ -95,6 +101,9 @@ pub fn chamfer_edge_asymmetric(
     d2: f64,
     name: Option<&str>,
 ) -> Result<BrepSolid, KernelRefusal> {
+    // One blend operation: the reports of an earlier one, never consumed, are
+    // dropped as it starts (nested calls keep this operation's).
+    let _operation = crate::blend::BlendOperation::enter();
     if !(d1 > 0.0) || !(d2 > 0.0) || !d1.is_finite() || !d2.is_finite() {
         return Err(KernelRefusal::input(
             KernelStage::Collect,
@@ -121,6 +130,9 @@ pub fn chamfer_edge_angle(
     angle_rad: f64,
     name: Option<&str>,
 ) -> Result<BrepSolid, KernelRefusal> {
+    // One blend operation: the reports of an earlier one, never consumed, are
+    // dropped as it starts (nested calls keep this operation's).
+    let _operation = crate::blend::BlendOperation::enter();
     if !(d1 > 0.0) || !d1.is_finite() {
         return Err(KernelRefusal::input(
             KernelStage::Collect,
@@ -203,6 +215,9 @@ pub fn fillet_edges(
     chamfer: bool,
     name: Option<&str>,
 ) -> Result<BrepSolid, KernelRefusal> {
+    // One blend operation: the reports of an earlier one, never consumed, are
+    // dropped as it starts (nested calls keep this operation's).
+    let _operation = crate::blend::BlendOperation::enter();
     let entry = if chamfer { "chamfer_edges" } else { "fillet_edges" };
     let (result, selection) =
         fillet_edges_reported(solid, edge_points, edge_names, radius, chamfer, name)?;
@@ -290,6 +305,9 @@ pub fn fillet_edges_reported(
     chamfer: bool,
     name: Option<&str>,
 ) -> Result<(BrepSolid, BlendSelection), KernelRefusal> {
+    // One blend operation: the reports of an earlier one, never consumed, are
+    // dropped as it starts (nested calls keep this operation's).
+    let _operation = crate::blend::BlendOperation::enter();
     if !(radius > 0.0) || !radius.is_finite() {
         return Err(KernelRefusal::input(
             KernelStage::Collect,
@@ -358,7 +376,48 @@ pub fn fillet_edges_reported(
     // to a point. Two carrier switches and a degenerate terminus, not a march
     // with a stop.
     if !chamfer {
-        check_mixed_corner_convexity(solid, &selected_ids, edge_points, edge_names, radius, name)?;
+        // The class is BUILT where the runout composition applies — the ring
+        // first, then one wall per spine from pole to pole (`blend/runout.rs`,
+        // the 2026-09-30 record §5) — and refused by name, with the
+        // composition's own reason appended, where it does not.
+        let corners = crate::blend::mixed_convexity_corners(solid, &selected_ids, radius);
+        if !corners.is_empty() {
+            let composed = rounded_boss_composition(
+                solid, &selected_ids, edge_points, edge_names, radius, name, &corners,
+            ).or_else(|_| runout_composition(
+                solid, &selected_ids, edge_points, edge_names, radius, name, &corners, entry,
+            ));
+            match composed {
+                Ok(result) => {
+                    let missing = walls_missing(
+                        solid, &result, edge_points, &(0..edge_points.len()).collect::<Vec<_>>(), radius, chamfer, entry,
+                    )?;
+                    if !missing.is_empty() {
+                        return Err(KernelRefusal::internal(
+                            KernelStage::Validate,
+                            "runout_walls_missing",
+                            format!(
+                                "{entry}: the runout composition built a solid with no wall on {}",
+                                missing.iter().map(|index| selection_label(*index, edge_points, edge_names, name)).collect::<Vec<_>>().join(", ")
+                            ),
+                        ));
+                    }
+                    let n = edge_points.len();
+                    return Ok((
+                        result,
+                        BlendSelection { requested: n, applied: (0..n).collect(), rejected: Vec::new(), reason: None },
+                    ));
+                }
+                Err(error) => {
+                    if std::env::var("BREP_DEBUG_NETWORK").is_ok() {
+                        eprintln!("runout composition refused: {error}");
+                    }
+                    check_mixed_corner_convexity(
+                        solid, &selected_ids, edge_points, edge_names, radius, name, Some(&error),
+                    )?;
+                }
+            }
+        }
         // A selection whose corner setbacks consume a whole edge — the exact
         // degenerate radius, every face shrunk to a point — has no strip for
         // the network to build and nothing the cutter or the subset search
@@ -430,7 +489,9 @@ pub fn fillet_edges_reported(
     // the ONE that does not fold, and return a solid whose volume is a blend
     // short — the same silent partial `both_collars_add_independently` exists
     // to catch.  Reported by name instead (`blend/fold.rs`).
-    if crate::blend::is_wall_fold(&group_err) {
+    // A miter past the sharp edge's far vertex needs support-face switching,
+    // not a smaller selection. Do not let the subset search mask the limit.
+    if crate::blend::is_wall_fold(&group_err) || crate::blend::is_miter_support_overrun(&group_err) {
         return Err(group_err);
     }
     // Fewer than two edges: nothing to drop, so the group error is final.
@@ -646,7 +707,181 @@ fn corner_face_name(
     }
 }
 
-/// **A corner with two concave edges cannot also take a convex one.**
+/// Round an isolated convex boss edge first, then blend the concave rim
+/// including its new circular bridge across the convex wall. Omitting that
+/// bridge leaves the two rim stripes disconnected at the mixed corner.
+#[allow(clippy::too_many_arguments)]
+fn rounded_boss_composition(
+    solid: &BrepSolid,
+    selected_ids: &[u64],
+    edge_points: &[Vec3],
+    edge_names: Option<&[String]>,
+    radius: f64,
+    name: Option<&str>,
+    corners: &[crate::blend::MixedCorner],
+) -> Result<BrepSolid, KernelRefusal> {
+    let decline = || {
+        KernelRefusal::unsupported(KernelStage::Classify, "rounded_boss_selection",
+        "the rounded boss composition requires one isolated convex edge and one orthogonal mixed corner")
+    };
+    if std::env::var("BREP_NO_NETWORK").is_ok() || corners.len() != 1 {
+        return Err(decline());
+    }
+    let corner = &corners[0];
+    if corner.convex.len() != 1 || corner.concave.len() != 2 {
+        return Err(decline());
+    }
+    let convexity =
+        crate::blend::selection_convexity(solid, selected_ids, radius).ok_or_else(decline)?;
+    if convexity.iter().filter(|convex| **convex).count() != 1 {
+        return Err(decline());
+    }
+    let spine_index = corner.convex[0];
+    let spine = solid
+        .edges
+        .iter()
+        .find(|edge| edge.id == selected_ids[spine_index])
+        .ok_or_else(decline)?;
+    let far = if spine.start_vertex_id == corner.vertex {
+        spine.end_vertex_id
+    } else {
+        spine.start_vertex_id
+    };
+    if solid.edges.iter().any(|edge| {
+        edge.id != spine.id
+            && selected_ids.contains(&edge.id)
+            && (edge.start_vertex_id == far || edge.end_vertex_id == far)
+    }) {
+        return Err(decline());
+    }
+    let uses = |face: &FaceRecord, edge: u64| {
+        face.loops
+            .iter()
+            .flat_map(|rim| &rim.coedges)
+            .any(|coedge| coedge.edge_id == edge)
+    };
+    let cap = solid
+        .shells
+        .iter()
+        .flat_map(|shell| &shell.faces)
+        .find(|face| {
+            corner
+                .concave
+                .iter()
+                .all(|index| uses(face, selected_ids[*index]))
+        })
+        .ok_or_else(decline)?;
+    let faces: Vec<&FaceRecord> = solid
+        .shells
+        .iter()
+        .flat_map(|shell| &shell.faces)
+        .filter(|face| face.id == cap.id || uses(face, spine.id))
+        .collect();
+    let normals: Option<Vec<Vec3>> = faces
+        .iter()
+        .map(|face| match face.surface.analytic() {
+            Some(crate::AnalyticSurface::Plane { u_dir, v_dir, .. }) => {
+                u_dir.cross(*v_dir).normalized().ok()
+            }
+            _ => None,
+        })
+        .collect();
+    let normals = normals.ok_or_else(decline)?;
+    if normals.len() != 3
+        || (0..3).any(|a| (a + 1..3).any(|b| normals[a].dot(normals[b]).abs() > 1e-6))
+    {
+        return Err(decline());
+    }
+    // Name the wall even for unnamed callers so the bridge is identified
+    // from its carriers rather than its distance to the old vertex.
+    let spine_name = per_edge_name(edge_names, name, spine_index)
+        .unwrap_or("FILLET:ROUNDED_BOSS_SPINE")
+        .to_owned();
+    let rounded = fillet_edges_group_in(
+        solid,
+        &[edge_points[spine_index]],
+        Some(&[spine_name.clone()]),
+        radius,
+        false,
+        name,
+        None,
+    )?;
+    let bridges: Vec<&EdgeRecord> = rounded
+        .edges
+        .iter()
+        .filter(|edge| {
+            let faces: Vec<&FaceRecord> = rounded
+                .shells
+                .iter()
+                .flat_map(|shell| &shell.faces)
+                .filter(|face| uses(face, edge.id))
+                .collect();
+            faces.iter().any(|face| face.id == cap.id)
+                && faces
+                    .iter()
+                    .any(|face| face.name.as_deref() == Some(&spine_name))
+        })
+        .collect();
+    if bridges.len() != 1 {
+        return Err(decline());
+    }
+    let bridge = bridges[0];
+    let rim_ids: Vec<u64> = selected_ids
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| *index != spine_index)
+        .map(|(_, id)| *id)
+        .collect();
+    // Both ends must join requested rim edges: never extend a selection
+    // into an unselected perimeter.
+    if ![bridge.start_vertex_id, bridge.end_vertex_id]
+        .iter()
+        .all(|vertex| {
+            rounded.edges.iter().any(|edge| {
+                rim_ids.contains(&edge.id)
+                    && (edge.start_vertex_id == *vertex || edge.end_vertex_id == *vertex)
+            })
+        })
+    {
+        return Err(decline());
+    }
+    let mut points = Vec::new();
+    let mut names = Vec::new();
+    for (index, id) in selected_ids.iter().enumerate() {
+        if index == spine_index {
+            continue;
+        }
+        let edge = rounded
+            .edges
+            .iter()
+            .find(|edge| edge.id == *id)
+            .ok_or_else(decline)?;
+        points.push(
+            edge.curve
+                .evaluate(0.5 * (edge.t0 + edge.t1))
+                .or_refuse(KernelStage::Collect, "rim_midpoint")?,
+        );
+        names.push(
+            per_edge_name(edge_names, name, index)
+                .unwrap_or("FILLET:RIM")
+                .to_owned(),
+        );
+    }
+    points.push(
+        bridge
+            .curve
+            .evaluate(0.5 * (bridge.t0 + bridge.t1))
+            .or_refuse(KernelStage::Collect, "bridge_midpoint")?,
+    );
+    let mut adjacent = corner.concave.clone();
+    adjacent.push(spine_index);
+    names.push(
+        corner_face_name(edge_names, name, &adjacent).unwrap_or("FILLET:BOSS_CORNER".to_owned()),
+    );
+    fillet_edges_group_in(&rounded, &points, Some(&names), radius, false, name, None)
+}
+
+/// A corner with two concave edges and a convex one requires composition.
 ///
 /// Where selected edges meet, the rolling ball has to touch every face around
 /// the vertex from ONE side. A convex edge running into the concave edges it
@@ -662,11 +897,93 @@ fn corner_face_name(
 /// close it with the horn-torus sector.  Only its mirror is refused.
 ///
 /// This is TERMINAL — deliberately not a fall-through to the cutter
-/// composition.  The cutter answers this shape with a watertight but shredded
+/// composition. The cutter answers this shape with a watertight but shredded
 /// solid: a sliver end cap at each unclosed corner and the carrier face split
 /// so the original name lands on a fragment, which breaks every downstream
-/// reference to it.  A named refusal that says which edges to separate is
-/// worth more than that solid.
+/// reference to it. A named refusal that says which edges to separate is
+/// worth more than that solid. The runout composition (the 2026-09-30 record
+/// §5): a selection whose convex edges die into concave ones at
+/// mixed-convexity corners is built in two stages — the CONCAVE edges first,
+/// through the ordinary group path (exactly the ring the user gets selecting
+/// them alone), then one runout wall per convex spine on that ring result,
+/// marched from pole to pole with its carriers switching onto the ring's own
+/// pads. Accepted under the network's own checks.
+///
+/// The class built here: every convex edge of the selection ends on a mixed
+/// corner at BOTH ends and shares no vertex with another convex edge, and
+/// every other selected edge is concave.  Anything else keeps the named
+/// refusal.
+#[allow(clippy::too_many_arguments)]
+fn runout_composition(
+    solid: &BrepSolid,
+    selected_ids: &[u64],
+    edge_points: &[Vec3],
+    edge_names: Option<&[String]>,
+    radius: f64,
+    name: Option<&str>,
+    corners: &[crate::blend::MixedCorner],
+    entry: &str,
+) -> Result<BrepSolid, KernelRefusal> {
+    if std::env::var("BREP_NO_NETWORK").is_ok() {
+        return Err(KernelRefusal::unsupported(KernelStage::Classify, "runout_no_network", "the runout composition is a network construction and BREP_NO_NETWORK is set"));
+    }
+    let convexity = crate::blend::selection_convexity(solid, selected_ids, radius)
+        .ok_or(KernelRefusal::unsupported(KernelStage::Classify, "runout_convexity", "the selection's convexity could not be read edge by edge"))?;
+    let mut spine_ends = vec![0usize; selected_ids.len()];
+    for corner in corners {
+        if corner.convex.len() != 1 {
+            return Err(KernelRefusal::unsupported(KernelStage::Classify, "runout_corner_shape", format!(
+                "the corner at ({:.3}, {:.3}, {:.3}) has {} convex edges; the runout is built for one convex edge dying into concave ones",
+                corner.point.x, corner.point.y, corner.point.z, corner.convex.len()
+            )));
+        }
+        spine_ends[corner.convex[0]] += 1;
+    }
+    let mut spines: Vec<usize> = Vec::new();
+    let mut concave: Vec<usize> = Vec::new();
+    for (index, ends) in spine_ends.iter().enumerate() {
+        match (*ends, convexity[index]) {
+            (2, true) => spines.push(index),
+            (0, false) => concave.push(index),
+            (ends, convex) => {
+                return Err(KernelRefusal::unsupported(KernelStage::Classify, "runout_selection_shape", format!(
+                    "{} is {} and meets a mixed corner at {ends} of its ends; the runout is built for a convex edge running out at both ends among concave edges",
+                    selection_label(index, edge_points, edge_names, name),
+                    if convex { "convex" } else { "concave" },
+                )));
+            }
+        }
+    }
+    if concave.is_empty() {
+        return Err(KernelRefusal::unsupported(KernelStage::Classify, "runout_selection_shape", "no concave edges to build the ring from"));
+    }
+    // Stage 1: the ring, exactly as the concave edges build on their own.
+    let ring_points: Vec<Vec3> = concave.iter().map(|index| edge_points[*index]).collect();
+    let ring_names: Option<Vec<String>> = edge_names.map(|names| concave.iter().map(|index| names[*index].clone()).collect());
+    let ring = fillet_edges_group_with_corner_policy(solid, &ring_points, ring_names.as_deref(), radius, false, name, None, false)
+        .map_err(|error| error.with_message(|error| format!("the concave ring did not build: {error}")))?;
+    // Stage 2: the runout walls on it.
+    let spine_walls: Vec<(u64, Option<String>)> = spines
+        .iter()
+        .map(|index| (selected_ids[*index], per_edge_name(edge_names, name, *index).map(str::to_string)))
+        .collect();
+    let spine_ids: Vec<u64> = spine_walls.iter().map(|(id, _)| *id).collect();
+    let mut result = crate::blend::build_runout_walls(&ring, &spine_walls, radius)?;
+    heal_edge_vertex_gaps(&mut result, radius)?;
+    crate::blend::fit_planar_charts_to_trims(&ring, &mut result)?;
+    let issues = result.validate();
+    if !issues.is_empty() {
+        return Err(KernelRefusal::new(
+            RefusalClass::InvalidResultTopology { issues: issues.len() as u32 },
+            KernelStage::Validate,
+            format!("the runout walls do not validate: {issues:?}"),
+        ));
+    }
+    check_blend_interference(&ring, &result, &spine_ids, entry)?;
+    check_loop_self_crossings(&result, entry)?;
+    crate::accept_sound(result, entry)
+}
+
 fn check_mixed_corner_convexity(
     solid: &BrepSolid,
     edge_ids: &[u64],
@@ -674,6 +991,7 @@ fn check_mixed_corner_convexity(
     edge_names: Option<&[String]>,
     radius: f64,
     name: Option<&str>,
+    composition_error: Option<&KernelRefusal>,
 ) -> Result<(), KernelRefusal> {
     match crate::blend::mixed_convexity_corner(solid, edge_ids, radius) {
         Some(corner) => {
@@ -691,17 +1009,22 @@ fn check_mixed_corner_convexity(
                     None
                 }
             };
-            // "this kernel does not build that runout yet": a named deferral.
+            // "this kernel does not build that runout here": a named deferral,
+            // carrying why the composition declined this selection.
+            let mut message = mixed_corner_message(
+                &corner,
+                edge_points,
+                edge_names,
+                name,
+                measured.as_ref(),
+            );
+            if let Some(error) = composition_error {
+                message.push_str(&format!(" The runout composition was tried on this selection and refused: {error}"));
+            }
             Err(KernelRefusal::unsupported(
                 KernelStage::Classify,
                 "mixed_corner_convexity",
-                mixed_corner_message(
-                    &corner,
-                    edge_points,
-                    edge_names,
-                    name,
-                    measured.as_ref(),
-                ),
+                message,
             ))
         }
         None => Ok(()),
@@ -961,10 +1284,23 @@ fn fillet_edges_group_in(
     name: Option<&str>,
     memo: Option<&mut ComponentMemo>,
 ) -> Result<BrepSolid, KernelRefusal> {
+    fillet_edges_group_with_corner_policy(solid, edge_points, edge_names, radius, chamfer, name, memo, true)
+}
+
+fn fillet_edges_group_with_corner_policy(
+    solid: &BrepSolid,
+    edge_points: &[Vec3],
+    edge_names: Option<&[String]>,
+    radius: f64,
+    chamfer: bool,
+    name: Option<&str>,
+    memo: Option<&mut ComponentMemo>,
+    wrap_concave: bool,
+) -> Result<BrepSolid, KernelRefusal> {
     GROUP_BUILDS.with(|count| count.set(count.get() + 1));
     let entry = if chamfer { "chamfer_edges" } else { "fillet_edges" };
     let result =
-        fillet_edges_group_unchecked(solid, edge_points, edge_names, radius, chamfer, name, memo)?;
+        fillet_edges_group_unchecked(solid, edge_points, edge_names, radius, chamfer, name, memo, wrap_concave)?;
     check_loop_self_crossings(&result, entry)?;
     // The BODY's own soundness, beside the loop's. A blend wall is a FITTED
     // surface and a fit can carry two parameters of one wall to one point in
@@ -985,6 +1321,7 @@ fn fillet_edges_group_unchecked(
     chamfer: bool,
     name: Option<&str>,
     mut memo: Option<&mut ComponentMemo>,
+    wrap_concave: bool,
 ) -> Result<BrepSolid, KernelRefusal> {
     use rustc_hash::FxHashSet as HashSet;
 
@@ -1130,13 +1467,15 @@ fn fillet_edges_group_unchecked(
                     .collect::<Vec<_>>()
             });
             let Some(memo) = memo.as_deref_mut() else {
-                separated = fillet_edges_group(
+                separated = fillet_edges_group_with_corner_policy(
                     &separated,
                     &points,
                     names.as_deref(),
                     radius,
                     chamfer,
                     name,
+                    None,
+                    wrap_concave,
                 )?;
                 continue;
             };
@@ -1145,13 +1484,15 @@ fn fillet_edges_group_unchecked(
             let built = match memo.built.get(&chain) {
                 Some(built) => built.clone(),
                 None => {
-                    let built = fillet_edges_group(
+                    let built = fillet_edges_group_with_corner_policy(
                         &separated,
                         &points,
                         names.as_deref(),
                         radius,
                         chamfer,
                         name,
+                        None,
+                        wrap_concave,
                     );
                     memo.built.insert(chain.clone(), built.clone());
                     built
@@ -1240,13 +1581,14 @@ fn fillet_edges_group_unchecked(
             .collect();
         let network_corner_name =
             |adjacent: &[usize]| corner_face_name(edge_names, name, adjacent);
-        match crate::blend::blend_star_network(
+        match crate::blend::blend_star_network_with_corner_policy(
             solid,
             &selected_edge_ids,
             radius,
             chamfer,
             &network_names,
             &network_corner_name,
+            wrap_concave,
         ) {
             Ok(mut network) => {
                 // Fail-safe like the rest of the ladder: a heal or validation
@@ -1326,6 +1668,7 @@ fn fillet_edges_group_unchecked(
                     || crate::blend::is_rail_collapse(&refusal)
                     || crate::blend::is_full_width_collapse(&refusal)
                     || crate::blend::is_planar_chart_refusal(&refusal)
+                    || crate::blend::is_miter_support_overrun(&refusal)
                 {
                     return Err(refusal);
                 }
@@ -1608,6 +1951,9 @@ pub fn fillet_edges_variable(
     chamfer: bool,
     name: Option<&str>,
 ) -> Result<BrepSolid, KernelRefusal> {
+    // One blend operation: the reports of an earlier one, never consumed, are
+    // dropped as it starts (nested calls keep this operation's).
+    let _operation = crate::blend::BlendOperation::enter();
     if edge_points.is_empty() {
         return Err(KernelRefusal::input(
             KernelStage::Collect,
@@ -2235,6 +2581,9 @@ pub fn fillet_edges_variable_law(
     chamfer: bool,
     name: Option<&str>,
 ) -> Result<BrepSolid, KernelRefusal> {
+    // One blend operation: the reports of an earlier one, never consumed, are
+    // dropped as it starts (nested calls keep this operation's).
+    let _operation = crate::blend::BlendOperation::enter();
     const ENTRY: &str = "fillet_edges_variable_law";
     if edge_points.is_empty() {
         return Err(KernelRefusal::input(
@@ -2271,6 +2620,9 @@ pub fn fillet_edges_variable_vertex_radii(
     chamfer: bool,
     name: Option<&str>,
 ) -> Result<BrepSolid, KernelRefusal> {
+    // One blend operation: the reports of an earlier one, never consumed, are
+    // dropped as it starts (nested calls keep this operation's).
+    let _operation = crate::blend::BlendOperation::enter();
     const ENTRY: &str = "fillet_edges_variable_vertex_radii";
     if edge_points.is_empty() {
         return Err(KernelRefusal::input(
@@ -2342,6 +2694,9 @@ pub fn chamfer_edges_asymmetric(
     d2: f64,
     name: Option<&str>,
 ) -> Result<BrepSolid, KernelRefusal> {
+    // One blend operation: the reports of an earlier one, never consumed, are
+    // dropped as it starts (nested calls keep this operation's).
+    let _operation = crate::blend::BlendOperation::enter();
     if edge_points.is_empty() {
         return Err(KernelRefusal::input(
             KernelStage::Collect,
@@ -2372,6 +2727,9 @@ pub fn chamfer_edges_angle(
     angle_rad: f64,
     name: Option<&str>,
 ) -> Result<BrepSolid, KernelRefusal> {
+    // One blend operation: the reports of an earlier one, never consumed, are
+    // dropped as it starts (nested calls keep this operation's).
+    let _operation = crate::blend::BlendOperation::enter();
     if edge_points.is_empty() {
         return Err(KernelRefusal::input(
             KernelStage::Collect,

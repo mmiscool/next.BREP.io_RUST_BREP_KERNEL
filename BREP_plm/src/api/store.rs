@@ -148,15 +148,9 @@ pub async fn changes(
 
 /// `part/<part id>/rev/<revision id>` split back into its halves.
 fn split_key(key: &str) -> Result<(String, String), Error> {
-    let parts: Vec<&str> = key.split('/').collect();
-    match parts.as_slice() {
-        ["part", part_id, "rev", revision_id] if !part_id.is_empty() && !revision_id.is_empty() => {
-            Ok((part_id.to_string(), revision_id.to_string()))
-        }
-        _ => Err(Error::bad_request(format!(
-            "'{key}' is not a document key — expected part/<part>/rev/<revision>"
-        ))),
-    }
+    crate::identity::split_key(key).ok_or_else(|| Error::bad_request(format!(
+        "'{key}' is not a document key — expected part/<part>/rev/<revision>"
+    )))
 }
 
 /// Read one document. This is the LIVE read: it goes to the file every time,
@@ -222,7 +216,7 @@ pub async fn write_doc(
     Ok(Json(serde_json::json!({
         "ok": true,
         "seq": seq,
-        "content_hash": crate::auth::content_hash(&body),
+        "content_hash": db.read(|state|state.part(&part_id).and_then(|p|p.revision(&revision_id)).map(|r|r.content_hash.clone()).unwrap_or_default()),
         "size": body.len(),
     }))
     .into_response())

@@ -603,6 +603,9 @@ pub(super) fn tessellate_face_watertight(
     if vertices.len() < 3 {
         return Ok(());
     }
+    if tessellate_pointed_cone_fan(face, &vertices, [u0, u1, v0, v1], chord_tolerance, face_id, mesh)? {
+        return Ok(());
+    }
     // Intrinsic uv scale, computed HERE (before triangulation) so the CDT path
     // can metric-scale its Delaunay too: maximum first-derivative magnitude per
     // direction, so flips, margins, and CDT quality act in (approximately)

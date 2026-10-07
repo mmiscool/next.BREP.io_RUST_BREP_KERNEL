@@ -112,7 +112,7 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, String> {
     let stale = !entry.dirty
         && parts_library::kernel_source_stamp().is_some_and(|stamp| entry.snapshot_producer != stamp);
     let mut note: Option<String> = None;
-    let (restored, ports): (RestoredSnapshot, BTreeMap<String, PortRecord>) = if entry.dirty {
+    let (restored, ports): (RestoredSnapshot, BTreeMap<String, PortRecord>) = if entry.dirty || crate::feature_pipeline::extension::document_uses_extensions(&entry.document) {
         heal(&part_name, &entry.document)?
     } else if stale {
         rebuild_stale(&part_name, &entry, &mut note)?
@@ -280,6 +280,8 @@ pub fn schema() -> serde_json::Value {
         "type": "ACOMP",
         "shortName": "ACOMP",
         "longName": "Assembly Component",
+    "ribbonPath": "Home/Assembly/Assembly Component",
+    "commandSize": "Compact",
         "displayBuilder": false,
         "inputParamsSchema": {
             "id": {

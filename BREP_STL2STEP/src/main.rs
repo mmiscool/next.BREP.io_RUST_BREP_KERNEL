@@ -36,7 +36,8 @@ whenever their shared boundaries can be reconstructed safely. Arbitrary closed,
 repairable remainder is preserved using a faceted BREP.
 
 The RANSAC options below apply only when the kernel segmentation reads the
-mesh as a whole primitive (every triangle on at most three analytic regions);
+mesh as a whole primitive, including fragmented regions whose triangles fit
+one curved carrier and its possible end caps;
 every other mesh skips RANSAC and is rebuilt from the segmentation alone.
 
 Options:
@@ -653,6 +654,7 @@ fn backend_name(backend: ConversionBackend) -> &'static str {
         ConversionBackend::RansacCappedCylinder => "RANSAC exact capped cylinder",
         ConversionBackend::RansacCappedCone => "RANSAC exact capped cone",
         ConversionBackend::KernelAnalyticRebuild => "analytic multi-region rebuild",
+        ConversionBackend::KernelSphericalUnion => "analytic spherical union rebuild",
         ConversionBackend::HybridAnalyticRebuild => "mixed analytic plane/cylinder/cone/sphere rebuild",
         ConversionBackend::FacetedRepair => "faceted repair fallback",
         ConversionBackend::FacetedRepairCoplanarMerged => {

@@ -3,12 +3,11 @@
 //!
 //! # What it decides
 //!
-//! - **A document opens read-only** (D2) and stays so until the user presses
-//!   Check out. [`access_for`] turns a revision's server view into the
-//!   document's [`Access`]: editable only while it is a draft or in review AND
-//!   this user holds its lock. Anything else — released, superseded, obsolete,
-//!   checked out by someone else, or simply not checked out — is read-only with
-//!   a sentence saying which.
+//! - **Session editing is always allowed.** [`access_for`] turns a revision's
+//!   server view into save permissions: saving to that revision requires a
+//!   draft or in-review revision checked out by this user. Released revisions,
+//!   another user's checkout, and pending permissions only restrict saving.
+//!   The session copy stays editable and can be saved to another destination.
 //! - **The verbs** a revision offers ([`verbs`]): Check out on an editable
 //!   revision nobody holds; Check in on one this user holds; Break lock only to
 //!   the check-in group, on one someone else holds; Release on an editable one to
@@ -215,7 +214,7 @@ pub fn newest(part: &PartDetail) -> Option<&RevisionView> {
         .map(|(_, r)| r)
 }
 
-/// Whether a document showing `revision` may be edited, and if not, why.
+/// Whether the session copy may be saved to `revision`, and if not, why.
 pub fn access_for(revision: &RevisionView) -> Access {
     let label = &revision.label;
     if !revision.editable {
@@ -225,12 +224,12 @@ pub fn access_for(revision: &RevisionView) -> Access {
             "obsolete" => "obsolete",
             other => other,
         };
-        return Access::read_only(format!("revision {label} is {state} and cannot change"));
+        return Access::read_only(format!("revision {label} is {state} and cannot be saved to"));
     }
     match (&revision.locked_by, revision.locked_by_me) {
         (Some(_), true) => Access::Editable,
         (Some(who), false) => Access::read_only(format!("revision {label} is checked out by {who}")),
-        (None, _) => Access::read_only(format!("revision {label} is not checked out — press Check out to edit it")),
+        (None, _) => Access::read_only(format!("revision {label} is not checked out — saving requires checkout")),
     }
 }
 
@@ -390,7 +389,7 @@ enum Work {
 /// What happened this frame that the shell acts on.
 #[derive(Debug, Clone, PartialEq)]
 pub enum PanelEvent {
-    /// The shown revision's access changed: lock or unlock the document.
+    /// The shown revision's permission to save changed.
     Access(Access),
     /// The user chose another revision to open (its store key).
     Open(String),
@@ -452,6 +451,10 @@ impl PlmPanel {
         panel
     }
 
+    pub(crate) fn matches_document(&self, part: &str, revision: &str) -> bool {
+        self.part_id == part && self.revision_id == revision
+    }
+
     pub fn part(&self) -> Option<&PartDetail> {
         self.part.as_ref()
     }
@@ -468,11 +471,15 @@ impl PlmPanel {
         self.work.is_some()
     }
 
-    /// The verbs the shown revision offers now, empty while a request is in
-    /// flight so nothing is pressed twice.
+    fn refreshing(&self) -> bool {
+        self.part.is_some() && matches!(self.work, Some(Work::Part(_)))
+    }
+
+    /// Keep the revision's actions mounted during read-only background refreshes.
+    /// Mutating requests still suppress duplicate actions.
     pub fn offered(&self) -> Vec<Verb> {
         match (&self.part, self.revision()) {
-            (Some(part), Some(revision)) if self.work.is_none() => {
+            (Some(part), Some(revision)) if self.work.is_none() || self.refreshing() => {
                 let mut offered = verbs(part, revision, self.rights);
                 if self.release_refused && revision.eco.is_some() {
                     offered.push(Verb::OpenChangeOrder);
@@ -489,6 +496,7 @@ impl PlmPanel {
         if !self.offered().contains(&verb) {
             return;
         }
+        if self.refreshing() { self.work = None; }
         let (part, rev) = (self.part_id.clone(), self.revision_id.clone());
         // The review pane and the change order pane are S4's: these open them.
         match verb {
@@ -532,6 +540,7 @@ impl PlmPanel {
 
     /// Ask for the part's history.
     pub fn load_history(&mut self, server: &dyn PlmLifecycle) {
+        if self.refreshing() { self.work = None; }
         if self.work.is_none() {
             self.work = Some(Work::History(Pending::new(server.history(&self.part_id))));
         }
@@ -729,12 +738,12 @@ impl PlmPanel {
             self.confirm_new = false;
         }
         ui.horizontal(|ui| {
-            let refresh = ui.add_enabled(!self.busy(), egui::Button::new("Refresh"));
+            let refresh = ui.add_enabled(!self.busy() || self.refreshing(), egui::Button::new("Refresh"));
             hits.put("refresh", refresh.rect);
             if refresh.clicked() {
                 self.refresh(server);
             }
-            if self.busy() {
+            if self.busy() && !self.refreshing() {
                 ui.spinner();
             }
         });
@@ -789,18 +798,18 @@ impl PlmLifecycle for std::rc::Rc<crate::plm::client::PlmClient> {
     }
 
     fn part(&self, part: &str) -> PlmFuture<PartDetail> {
-        let (client, path) = (self.clone(), format!("/api/parts/{part}"));
+        let (client, path) = (self.clone(), crate::plm::identity::part_path(&part));
         Box::pin(async move { json(client.call("GET", &path, None).await) })
     }
 
     fn checkout(&self, part: &str, revision: &str) -> PlmFuture<()> {
-        let (client, path) = (self.clone(), format!("/api/parts/{part}/revisions/{revision}/checkout"));
+        let (client, path) = (self.clone(), format!("{}/checkout", crate::plm::identity::revision_path(&part, &revision)));
         let body = serde_json::json!({ "client_id": CLIENT_ID }).to_string().into_bytes();
         Box::pin(async move { unit(client.call("POST", &path, Some(body)).await) })
     }
 
     fn checkin(&self, part: &str, revision: &str, force: bool) -> PlmFuture<()> {
-        let (client, path) = (self.clone(), format!("/api/parts/{part}/revisions/{revision}/checkin"));
+        let (client, path) = (self.clone(), format!("{}/checkin", crate::plm::identity::revision_path(&part, &revision)));
         let body = serde_json::json!({ "force": force }).to_string().into_bytes();
         Box::pin(async move { unit(client.call("POST", &path, Some(body)).await) })
     }
@@ -811,19 +820,19 @@ impl PlmLifecycle for std::rc::Rc<crate::plm::client::PlmClient> {
         struct Answer {
             warnings: Vec<String>,
         }
-        let (client, path) = (self.clone(), format!("/api/parts/{part}/revisions/{revision}/state"));
+        let (client, path) = (self.clone(), format!("{}/state", crate::plm::identity::revision_path(&part, &revision)));
         let body = serde_json::json!({ "to": to }).to_string().into_bytes();
         Box::pin(async move { json::<Answer>(client.call("POST", &path, Some(body)).await).map(|a| a.warnings) })
     }
 
     fn create_revision(&self, part: &str, label: &str) -> PlmFuture<NewRevision> {
-        let (client, path) = (self.clone(), format!("/api/parts/{part}/revisions"));
+        let (client, path) = (self.clone(), format!("{}/revisions", crate::plm::identity::part_path(&part)));
         let body = serde_json::json!({ "label": label }).to_string().into_bytes();
         Box::pin(async move { json(client.call("POST", &path, Some(body)).await) })
     }
 
     fn history(&self, part: &str) -> PlmFuture<Vec<HistoryEvent>> {
-        let (client, path) = (self.clone(), format!("/api/parts/{part}/history"));
+        let (client, path) = (self.clone(), format!("{}/history", crate::plm::identity::part_path(&part)));
         Box::pin(async move { json(client.call("GET", &path, None).await) })
     }
 }

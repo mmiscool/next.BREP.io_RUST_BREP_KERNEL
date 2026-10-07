@@ -1,6 +1,6 @@
 [package]
 name = "BREP_reconstruction"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 license-file = "LICENSE.md"
 repository = "https://github.com/mmiscool/next.BREP.io_RUST_BREP_KERNEL"
@@ -30,6 +30,6 @@ name = "brep_reconstruction"
 # Monotonic timing on native targets and in browser workers.
 web-time = "1"
 BREP_RANSAC = { version = "0.1.4", path = "../BREP_RANSAC" }
-BREP_kernel = { version = "=0.7.0", path = "../BREP_kernel" }
+BREP_kernel = { version = "=0.8.0", path = "../BREP_kernel" }
 serde = { version = "1", features = ["derive"] }
 

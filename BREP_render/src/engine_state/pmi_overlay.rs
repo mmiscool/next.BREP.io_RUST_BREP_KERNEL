@@ -21,6 +21,9 @@ const PMI_RGB: [f32; 3] = [0.98, 0.78, 0.22];
 const ERROR_RGB: [f32; 3] = [0.97, 0.32, 0.29];
 /// A disabled annotation's chip colour.
 const DISABLED_RGB: [f32; 3] = [0.55, 0.55, 0.55];
+/// The error a balloon shows while its target is hidden in the viewport and
+/// the view's hidden list has not caught up (no run has happened).
+pub(crate) const LIVE_HIDDEN_MESSAGE: &str = "target hidden in the viewport: show it, or update the view's visibility";
 
 impl EngineState {
     /// Re-bake the overlay from the cached report (empty without an active
@@ -57,7 +60,7 @@ impl EngineState {
         let mut tris: Vec<f32> = Vec::new();
         let mut tri_colors: Vec<f32> = Vec::new();
         for row in &view.annotations {
-            if !row.enabled || row.status != PmiStatus::Ok {
+            if !row.enabled || row.status != PmiStatus::Ok || self.balloon_target_hidden_live(row) {
                 continue;
             }
             // A picked annotation plane lays the row out in that plane.
@@ -99,6 +102,24 @@ impl EngineState {
         let _ = self.set_overlay_json(&serde_json::json!({ "groups": [group] }).to_string());
         self.pmi_overlay_key = Some((if wpp > 0.0 { wpp } else { f64::MIN_POSITIVE }, view_dir));
         self.dirty = true;
+    }
+
+    /// Whether a balloon row's target is hidden in the LIVE scene: every
+    /// solid its recipe projects onto is invisible now. The kernel resolves
+    /// against the view's stored hidden list; a hide made in the viewport
+    /// after the run is only known here, so the leader is withheld and the
+    /// chip reads as an error until the view's visibility is updated.
+    pub(crate) fn balloon_target_hidden_live(&self, row: &brep_kernel::PmiAnnotationReport) -> bool {
+        match &row.geometry {
+            brep_kernel::PmiGeometry::Leader { balloon: true, anchor: Some(anchor), .. } => {
+                !anchor.solids.is_empty()
+                    && anchor
+                        .solids
+                        .iter()
+                        .all(|name| self.scene.solid(name).is_none_or(|solid| !solid.visible))
+            }
+            _ => false,
+        }
     }
 
     fn clear_pmi_overlay(&mut self) {
@@ -152,7 +173,16 @@ impl EngineState {
             .annotations
             .iter()
             .map(|row| {
-                let color = if row.status == PmiStatus::Error {
+                // A balloon whose target was hidden in the viewport AFTER
+                // the run (the view's hidden list not yet updated) is an
+                // error chip with no leader: the kernel's head is on a body
+                // nobody sees.
+                let (status, message) = if row.status == PmiStatus::Ok && self.balloon_target_hidden_live(row) {
+                    (PmiStatus::Error, LIVE_HIDDEN_MESSAGE.to_string())
+                } else {
+                    (row.status, row.message.clone())
+                };
+                let color = if status == PmiStatus::Error {
                     ERROR_RGB
                 } else if !row.enabled {
                     DISABLED_RGB
@@ -160,7 +190,7 @@ impl EngineState {
                     PMI_RGB
                 };
                 let icon = pmi_type(&row.kind).map(|def| def.icon).unwrap_or("");
-                let text = if row.status == PmiStatus::Error {
+                let text = if status == PmiStatus::Error {
                     format!("{} {}", icon, row.id)
                 } else if row.text.is_empty() {
                     format!("{} {}", icon, row.id)
@@ -172,8 +202,8 @@ impl EngineState {
                     "type": row.kind,
                     "icon": icon,
                     "text": text,
-                    "status": match row.status { PmiStatus::Ok => "ok", PmiStatus::Error => "error" },
-                    "message": row.message,
+                    "status": match status { PmiStatus::Ok => "ok", PmiStatus::Error => "error" },
+                    "message": message,
                     "color": [color[0], color[1], color[2]],
                     "world": row.label_world,
                     "enabled": row.enabled,

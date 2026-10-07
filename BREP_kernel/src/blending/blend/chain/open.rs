@@ -32,9 +32,72 @@ pub(super) fn blend_open_smooth_chain(
     chamfer: bool,
     name: Option<&str>,
 ) -> Result<BrepSolid, KernelRefusal> {
+    // The open chain climbs the closed chain's ladder, from the same first
+    // rung to the same top: a rung is MEASURED before it is built (its rails
+    // against the rolling ball's exact contacts on a dense stencil, a fillet's
+    // wall between them against the ball's own sweep, both at the unchanged
+    // `intersection_fit`), refined locally within the existing rounds and
+    // ceiling, and climbed when it cannot pass. It used to build its one rung
+    // unmeasured: on the 20-degree crossing's notched exit arc that wall
+    // stood 2.12e-6 off the exact sweep (4.43e-6 with the fat seam turned
+    // 295), read input-free on 871581076 + the section-fit fix.
+    let bar = crate::KernelTolerances::for_solid(solid, 1e-7).intersection_fit;
+    let mut per_segment = CHAIN_PER_SEGMENT;
+    loop {
+        let samples = march_chain(&chain.segments, radius, true, per_segment, FoldPolicy::Refuse)?;
+        let deepest = std::cell::Cell::new(0);
+        match open_chain_rung(solid, chain, radius, chamfer, name, per_segment, bar, samples, 0, &deepest)? {
+            OpenRung::Built(built) => return Ok(built),
+            OpenRung::TooCoarse { deviation } => {
+                crate::blend::carve::carve_trace(format_args!(
+                    "blend open chain: {per_segment} stations per segment leaves the blend {deviation:.6e} \
+                     from the rolling ball, against {bar:.3e}"
+                ));
+                if per_segment * 2 > CHAIN_CARVE_MAX_PER_SEGMENT {
+                    return Err(KernelRefusal::non_convergence(KernelStage::Refine, "open_chain_ladder_top", format!(
+                        "blend: at {per_segment} stations per segment — the top of the chain's ladder — \
+                         this open chain's rails or wall still stand {deviation:.6e} from the rolling ball \
+                         against a bar of {bar:.3e}, so there is no blend accurate enough to build"
+                    )));
+                }
+                per_segment *= 2;
+            }
+        }
+    }
+}
+
+/// One open-chain rung's outcome.
+enum OpenRung {
+    Built(BrepSolid),
+    TooCoarse { deviation: f64 },
+}
+
+/// Fit, measure and build one open-chain rung from its stations (local round
+/// `round`): the rails on a dense stencil of exact contacts, a fillet's wall
+/// between them, both against `bar`; failing intervals take one continuation
+/// station each, for up to `REFINE_ROUNDS` rounds within the per-segment
+/// ceiling, else the rung is too coarse. An accepted plain fillet is then
+/// refined toward `KernelTolerances::model` in the intervals whose declared
+/// wall reading is over it, as the closed chain's is, and ships with a typed
+/// `blend.wall_model` report when it cannot get there.
+#[allow(clippy::too_many_arguments)]
+fn open_chain_rung(
+    solid: &BrepSolid,
+    chain: &SmoothChain<'_>,
+    radius: f64,
+    chamfer: bool,
+    name: Option<&str>,
+    per_segment: usize,
+    bar: f64,
+    mut samples: Vec<ChainSample>,
+    round: usize,
+    deepest: &std::cell::Cell<usize>,
+) -> Result<OpenRung, KernelRefusal> {
+    // The deepest local round any rung of this ladder step attempted: a
+    // rejected refinement reports the rounds it actually spent.
+    deepest.set(deepest.get().max(round));
     let segments = &chain.segments;
     let last_seg = segments.len() - 1;
-    let samples = march_chain(segments, radius, true, CHAIN_PER_SEGMENT, FoldPolicy::Refuse)?;
 
     // Global 3D rows: segment 0's low overshoot + every in-segment station +
     // the last segment's high overshoot.  Interior overshoot is dropped (it
@@ -43,10 +106,10 @@ pub(super) fn blend_open_smooth_chain(
     for sample in &samples {
         let keep = if sample.segment == 0 && sample.position < 0 {
             true
-        } else if sample.segment == last_seg && sample.position >= CHAIN_PER_SEGMENT as isize {
+        } else if sample.segment == last_seg && sample.position >= per_segment as isize {
             true
         } else {
-            (0..CHAIN_PER_SEGMENT as isize).contains(&sample.position)
+            (0..per_segment as isize).contains(&sample.position)
         };
         if keep {
             global.push((sample.parameter, &sample.station));
@@ -90,6 +153,112 @@ pub(super) fn blend_open_smooth_chain(
     };
     let u_domain = cr.domain().or_refuse(KernelStage::Refine, "domain")?;
     let surface = crate::blend::rows::surface_from_rows(degree, &cr, &cs, mid.as_ref(), false)?;
+
+    // ---- the rung's measurement (before anything is built on it) -------
+    let segment_count = |samples: &[ChainSample], segment: usize| {
+        samples
+            .iter()
+            .filter(|sample| sample.segment == segment && (0..per_segment as isize).contains(&sample.position))
+            .count()
+    };
+    let in_segment_count = |samples: &[ChainSample]| (0..segments.len()).map(|segment| segment_count(samples, segment)).max().unwrap_or(0);
+    // The closed chain's ceiling accounting: each segment's own stations
+    // plus the stations its own failing intervals would add.
+    let within_ceiling = |samples: &[ChainSample], adding: &[usize]| {
+        (0..segments.len()).all(|segment| {
+            segment_count(samples, segment) + adding.iter().filter(|&&index| samples[index].segment == segment).count()
+                <= CHAIN_CARVE_MAX_PER_SEGMENT
+        })
+    };
+    let contacts = super::chain_dense_contacts(segments, radius, per_segment, &samples, super::closed::LOCAL_RAIL_STENCIL)?;
+    let (dense, unreadable) = super::closed::dense_rail_misses(&contacts, &samples, &cr, &cs, global_low, global_range, false)?;
+    let failed_to_read: Vec<usize> = contacts.unsolved_at.iter().chain(&unreadable).copied().collect();
+    let (mut deviation, mut failing) = super::closed::combine_rail_verdict((0.0, Vec::new()), &dense, &failed_to_read, bar);
+    let mut wall_readings: Vec<(usize, f64, f64, f64)> = Vec::new();
+    if !chamfer && super::closed::wall_verdict_on() {
+        let wall_contacts = super::chain_dense_contacts(segments, radius, per_segment, &samples, 2 * super::closed::LOCAL_RAIL_STENCIL)?;
+        let (wall, unreadable) = super::closed::wall_interior_misses(
+            &wall_contacts, &samples, &surface, global_low, global_range, radius,
+            2 * super::closed::LOCAL_RAIL_STENCIL, super::closed::WALL_SECTION_PROBES, false,
+        );
+        for &(left, declared, _, _) in &wall {
+            if !(declared <= bar) {
+                failing.push(left);
+            }
+            deviation = deviation.max(declared);
+        }
+        failing.extend_from_slice(&unreadable);
+        failing.sort_unstable();
+        failing.dedup();
+        crate::blend::carve::carve_trace(format_args!(
+            "blend open chain wall: rung {per_segment} round {round}: wall worst {:.9e} over {} interval(s), {} unreadable, bar {bar:.3e}",
+            wall.iter().map(|reading| reading.1).fold(0.0_f64, f64::max),
+            wall.len(),
+            unreadable.len()
+        ));
+        wall_readings = wall;
+    }
+    if deviation > bar || !failing.is_empty() {
+        if round >= REFINE_ROUNDS || !within_ceiling(&samples, &failing) {
+            return Ok(OpenRung::TooCoarse { deviation });
+        }
+        // The insertion is the next round's attempt, whatever it returns.
+        deepest.set(deepest.get().max(round + 1));
+        return match insert_chain_stations(segments, radius, per_segment, &mut samples, &failing) {
+            Ok(()) => {
+                assign_chain_parameters(&mut samples, segments.len(), per_segment, true);
+                open_chain_rung(solid, chain, radius, chamfer, name, per_segment, bar, samples, round + 1, deepest)
+            }
+            // A station that cannot be placed coherently: this rung is as
+            // coarse as it measured, and the ladder decides.
+            Err(ChainMarchError::Station(_)) | Err(ChainMarchError::Incoherent(_)) => Ok(OpenRung::TooCoarse { deviation }),
+            Err(ChainMarchError::Other(error)) => Err(error),
+        };
+    }
+    // ACCEPTED. The construction request, plain fillets only, as on the
+    // closed chain: the intervals whose declared wall reading is over
+    // `model` take a station each, within the same rounds and ceiling; a
+    // refined rung must pass acceptance again, and when it cannot, THIS rung
+    // ships and says so, typed.
+    let model = crate::KernelTolerances::for_solid(solid, 1e-7).model;
+    let mut unmet: Option<(f64, crate::BudgetReason)> = None;
+    if !chamfer && super::closed::model_request_on() {
+        let missing = super::closed::wall_model_missing(&wall_readings, model);
+        if !missing.is_empty() {
+            let short = wall_readings
+                .iter()
+                .filter(|reading| missing.contains(&reading.0))
+                .map(|&(_, declared, _, _)| declared)
+                .fold(0.0_f64, f64::max);
+            unmet = if round >= super::closed::model_rounds_limit() {
+                Some((short, crate::BudgetReason::RoundsSpent))
+            } else if !within_ceiling(&samples, &missing) {
+                Some((short, crate::BudgetReason::StationCeiling))
+            } else {
+                let mut refined = samples.clone();
+                // The insertion is the next round's attempt, whatever it returns.
+                deepest.set(deepest.get().max(round + 1));
+                match insert_chain_stations(segments, radius, per_segment, &mut refined, &missing) {
+                    Ok(()) => {
+                        assign_chain_parameters(&mut refined, segments.len(), per_segment, true);
+                        match open_chain_rung(solid, chain, radius, chamfer, name, per_segment, bar, refined, round + 1, deepest) {
+                            Ok(OpenRung::Built(built)) => return Ok(OpenRung::Built(built)),
+                            _ => Some((short, crate::BudgetReason::Rejected)),
+                        }
+                    }
+                    Err(_) => {
+                        // The insertion itself was the attempt.
+                        deepest.set(deepest.get().max(round + 1));
+                        Some((short, crate::BudgetReason::Incoherent))
+                    }
+                }
+            };
+        }
+    }
+    let stations_now = in_segment_count(&samples);
+    // The wall reading of THIS rung (the one that ships if surgery succeeds).
+    let shipped_wall = wall_readings.iter().map(|reading| reading.1).fold(0.0_f64, f64::max);
+    let wall_surface = unmet.map(|_| surface.clone());
 
     // Per-segment mate pcurves (uv1/uv2) over each segment's full window in
     // GLOBAL parameters — identical to the closed path.
@@ -230,7 +399,7 @@ pub(super) fn blend_open_smooth_chain(
     let FittedRows {
         surface, cr, cs, ..
     } = rows;
-    open_chain_surgery(
+    let built = open_chain_surgery(
         solid,
         segments,
         OpenChainRows {
@@ -244,7 +413,94 @@ pub(super) fn blend_open_smooth_chain(
             finish_end,
         },
         name,
-    )
+    )?;
+    let _ = shipped_wall;
+    if let (Some((residual, reason)), Some(surface)) = (unmet, wall_surface) {
+        crate::blend::record_wall_model_report(crate::blend::WallModelReport {
+            name: name.map(str::to_string),
+            surface,
+            request: model,
+            residual,
+            detail: None,
+            budget: crate::ApproximationBudget {
+                reason,
+                // Rounds ATTEMPTED (the deepest any refinement of this rung
+                // reached); the stations and residual are this shipped rung's.
+                rounds_used: deepest.get().max(round),
+                rounds_limit: super::closed::model_rounds_limit(),
+                stations: stations_now,
+                station_limit: CHAIN_CARVE_MAX_PER_SEGMENT,
+                mechanism: crate::BudgetMechanism::LocalRounds,
+                measured_component: crate::MeasuredComponent::Wall,
+                unread: 0,
+            },
+        });
+    }
+    Ok(OpenRung::Built(built))
+}
+
+
+/// An open chain support piece's pcurve on its mate `surface`: the piece's
+/// own 3D edge projected and fitted at the pcurve floor
+/// (`project_piece_pcurve`, the closed chain's support-piece fitter, which
+/// refuses a fit off that floor; an open piece ends on a free end or a spoke,
+/// never on a carrier seam, so no end is pinned), moved by whole carrier
+/// periods to the period of the interpolated pcurve `old` it replaces, then
+/// read again AS SHIPPED at the edge's parameter (`read_shipped_pcurve`) and
+/// refused off the floor.
+fn refit_open_piece_pcurve(
+    result: &BrepSolid,
+    edge_id: u64,
+    surface: &NurbsSurface,
+    old: &NurbsCurve,
+) -> Result<NurbsCurve, KernelRefusal> {
+    let edge = result
+        .edges
+        .iter()
+        .find(|edge| edge.id == edge_id)
+        .ok_or(KernelRefusal::internal(KernelStage::Sew, "support_piece_edge", "blend: open support piece edge lost"))?;
+    let (t0, t1) = (edge.t0, edge.t1);
+    let [c0, c1] = edge.curve.domain().or_refuse(KernelStage::Refine, "domain")?;
+    // The piece as its edge uses it: [t0, t1] of its curve.
+    let piece = if (c0 - t0).abs() <= 1e-12 && (c1 - t1).abs() <= 1e-12 {
+        edge.curve.clone()
+    } else {
+        let head = if t0 > c0 { edge.curve.split(t0).or_refuse(KernelStage::Refine, "split")?.1 } else { edge.curve.clone() };
+        if t1 < c1 { head.split(t1).or_refuse(KernelStage::Refine, "split")?.0 } else { head }
+    };
+    // Every foot sought from the interpolated pcurve `old` at the same
+    // fraction, on the branch it runs on (`pcurve_guide`).
+    let guide = super::closed::pcurve_guide(old, surface)?;
+    let mut fitted = super::closed::project_piece_pcurve_from(&piece, surface, false, false, Some(&guide))?;
+    let (closed_u, closed_v) = surface.closed_directions().or_refuse(KernelStage::Refine, "closed_directions")?;
+    let [u0, u1] = surface.domain_u().or_refuse(KernelStage::Refine, "domain_u")?;
+    let [v0, v1] = surface.domain_v().or_refuse(KernelStage::Refine, "domain_v")?;
+    let [o0, _] = old.domain().or_refuse(KernelStage::Refine, "domain")?;
+    let [f0, f1] = fitted.domain().or_refuse(KernelStage::Refine, "domain")?;
+    let old_start = old.evaluate(o0).or_refuse(KernelStage::Refine, "evaluate")?;
+    let new_start = fitted.evaluate(f0).or_refuse(KernelStage::Refine, "evaluate")?;
+    let shift = |closed: bool, from: f64, to: f64, period: f64| if closed { ((to - from) / period).round() * period } else { 0.0 };
+    let (shift_u, shift_v) = (shift(closed_u, new_start.x, old_start.x, u1 - u0), shift(closed_v, new_start.y, old_start.y, v1 - v0));
+    for point in fitted.control_points.iter_mut() {
+        point.x += shift_u * point.w;
+        point.y += shift_v * point.w;
+    }
+    // Read as shipped: the fitter's parameter runs over the piece in its own
+    // fraction, the edge at t0 + fraction (t1 - t0).
+    let rail = |t: f64| piece.evaluate(t0 + (t - f0) / (f1 - f0) * (t1 - t0));
+    let (miss, standoff, samples, worst) = crate::blend::track_fit::read_shipped_pcurve(surface, &rail, &fitted, f0, f1)?;
+    if std::env::var_os("BREP_DEBUG_TRACK_FIT").is_some() {
+        eprintln!("TRACK_FIT open-chain support: shipped pcurve miss {miss:.3e} at fraction {worst:.9} ({samples} samples); rail standoff from its carrier {standoff:.3e}");
+    }
+    if !(miss <= crate::pcurve::PCURVE_REFINEMENT_TOLERANCE) {
+        return Err(KernelRefusal::non_convergence(KernelStage::Refine, "open_support_pcurve_floor", format!(
+            "{} an open chain's support pcurve, as shipped, misses its rail's track by {miss:.3e} at {samples} samples, \
+             against a floor of {:.1e}",
+            crate::blend::PCURVE_OFF_FLOOR,
+            crate::pcurve::PCURVE_REFINEMENT_TOLERANCE
+        )));
+    }
+    Ok(fitted)
 }
 
 fn open_chain_surgery(
@@ -652,6 +908,21 @@ fn open_chain_surgery(
                         .unwrap();
                     pcurve_portion(nearest, piece.window[0], piece.window[1])?
                 };
+                // The pcurve above interpolates the stations' (u, v) and is
+                // read nowhere between them: on the 20-degree crossing's open
+                // exit arc it stood 2.85e-5 (thin) and 4.4e-7 (fat) off the
+                // rail it trims, 2.37e-5 / 2.4e-6 with the seam turned 295
+                // (dumps of 871581076 + the section-fit fix, read input-free).
+                // Each piece is refitted to its own rail's projected track at
+                // the pcurve floor, as the closed chain's pieces are.
+                let mate_surface = &segments
+                    .iter()
+                    .find(|segment| face_info(segment).0 == face_id)
+                    .expect("the piece's mate face")
+                    .mate(side)
+                    .face
+                    .surface;
+                let pcurve = refit_open_piece_pcurve(&result, piece.edge_id, mate_surface, &pcurve)?;
                 replacements.push(CoedgeRecord {
                     id: take_id(),
                     edge_id: piece.edge_id,

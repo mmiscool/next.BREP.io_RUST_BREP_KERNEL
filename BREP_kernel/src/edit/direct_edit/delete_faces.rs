@@ -719,8 +719,26 @@ fn splice_fragments(
             // The pcurve fit interpolates whatever it is handed and reports no
             // error for a curve that MISSES the carrier, so this is where a
             // bridge laid on the wrong line is caught — before it becomes a
-            // face whose boundary is not on its own surface.
-            if !loops_ride_carrier(&candidate.surface, &candidate.loops, &edges, scale) {
+            // face whose new boundary is not on its own surface.
+            let source_carriers: HashMap<u64, &NurbsSurface> = faces
+                .iter()
+                .flat_map(|position| {
+                    let face = &solid.shells[shell_index].faces[*position];
+                    face.loops.iter().flat_map(move |loop_record| {
+                        loop_record
+                            .coedges
+                            .iter()
+                            .map(move |coedge| (coedge.id, &face.surface))
+                    })
+                })
+                .collect();
+            if !loops_ride_carrier(
+                &candidate.surface,
+                &candidate.loops,
+                &edges,
+                &source_carriers,
+                scale,
+            ) {
                 return None;
             }
             loops = candidate.loops;
@@ -771,17 +789,23 @@ struct Corner {
     spine: u64,
 }
 
-/// Whether every coedge of `loops` really lies ON `surface`.
+/// Whether every new coedge lies on `surface`, and each retained coedge is
+/// at least as close to it as to its original carrier.
 ///
 /// The rejoin's whole claim is that one grown carrier holds everything the
 /// group now carries: its twin's loops, and the bridges between them. Nothing
 /// upstream tests that claim — `faces_are_cosurface` matches carriers, not the
 /// EXTENT a patch was grown to, and the pcurve fit interpolates a curve that
-/// misses the surface as readily as one that lies on it.
+/// misses the surface as readily as one that lies on it. Imported trims can
+/// already stand off their carrier. Rejoining preserves those edges verbatim;
+/// require their pointwise residual not to increase rather than rejecting a
+/// valid bridge because of an unrelated, inherited trim discrepancy. New
+/// bridge coedges have no source carrier and must meet the absolute tolerance.
 fn loops_ride_carrier(
     surface: &NurbsSurface,
     loops: &[LoopRecord],
     edges: &HashMap<u64, EdgeRecord>,
+    source_carriers: &HashMap<u64, &NurbsSurface>,
     scale: f64,
 ) -> bool {
     let tolerance = (scale * 1e-7).max(1e-9);
@@ -797,8 +821,17 @@ fn loops_ride_carrier(
             let Ok(point) = edge.curve.evaluate(t) else {
                 return false;
             };
-            match crate::project_point_to_surface(surface, point) {
-                Ok(projection) if projection.distance <= tolerance => {}
+            let Ok(projection) = crate::project_point_to_surface(surface, point) else {
+                return false;
+            };
+            if projection.distance <= tolerance {
+                continue;
+            }
+            let Some(source) = source_carriers.get(&coedge.id) else {
+                return false;
+            };
+            match crate::project_point_to_surface(source, point) {
+                Ok(previous) if projection.distance <= previous.distance + tolerance => {}
                 _ => return false,
             }
         }

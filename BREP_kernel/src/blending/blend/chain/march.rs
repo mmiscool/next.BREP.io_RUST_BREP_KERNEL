@@ -31,18 +31,73 @@ const CHAIN_OVERSHOOT: usize = 3;
 
 /// One marched chain station, tagged with its segment and its position
 /// (which may overshoot the segment for pcurve fitting).
+#[derive(Clone)]
 pub(in crate::blend) struct ChainSample {
     pub(in crate::blend) segment: usize,
     /// Station position within the segment: 0..CHAIN_PER_SEGMENT are
     /// in-segment; negatives and > CHAIN_PER_SEGMENT are overshoot.
     pub(in crate::blend) position: isize,
+    /// Where between `position` and the next grid station a station inserted
+    /// by local refinement sits, in (0, 1); 0 for every marched grid station.
+    pub(in crate::blend) offset: f64,
+    /// The edge parameter the station's section plane was taken at.
+    pub(in crate::blend) t: f64,
     pub(in crate::blend) station: Station,
     /// Global chord parameter (filled after the march).
-    pub(super) parameter: f64,
+    pub(in crate::blend) parameter: f64,
     /// The rolling ball's EXACT contacts halfway to the next position — solved,
     /// not interpolated — so a fitted row can be measured where an interpolant
     /// is worst. Only a march for a carve pays for them.
-    pub(super) midpoint: Option<[Vec3; 2]>,
+    pub(in crate::blend) midpoint: Option<[Vec3; 2]>,
+}
+
+/// A chain station whose CONTINUATION solve did not converge: the tangency
+/// Newton, seeded from its solved neighbour (after the branch guard's halving
+/// retries), found no root at this budget.  A finer rung is a nearer seed, so
+/// the closed ladder may climb on it; the refusal itself is kept verbatim and
+/// is what a caller receives at the ladder's top or outside the ladder.
+pub(in crate::blend) struct ChainStationFailure {
+    pub(in crate::blend) segment: usize,
+    pub(in crate::blend) position: isize,
+    pub(in crate::blend) t: f64,
+    pub(in crate::blend) from_position: isize,
+    pub(in crate::blend) from_t: f64,
+    pub(in crate::blend) seed_uv: [f64; 4],
+    pub(in crate::blend) error: KernelRefusal,
+}
+
+/// How a chain march stops: a typed station-continuation failure, or any
+/// other refusal, which passes through untouched.
+pub(in crate::blend) enum ChainMarchError {
+    Station(ChainStationFailure),
+    /// Local refinement only: an inserted station, continued from its left
+    /// neighbour, is not on the branch of the RETAINED right station (the
+    /// existing `branch_hop` reading, carried as `error`). The rung cannot be
+    /// refined coherently; the caller's ladder decides, as for a coarse rung.
+    Incoherent(ChainStationFailure),
+    Other(KernelRefusal),
+}
+
+impl ChainMarchError {
+    /// The refusal exactly as the march produced it.
+    pub(in crate::blend) fn into_refusal(self) -> KernelRefusal {
+        match self {
+            ChainMarchError::Station(failure) | ChainMarchError::Incoherent(failure) => failure.error,
+            ChainMarchError::Other(error) => error,
+        }
+    }
+}
+
+impl From<KernelRefusal> for ChainMarchError {
+    fn from(error: KernelRefusal) -> Self {
+        ChainMarchError::Other(error)
+    }
+}
+
+/// The tangency Newton's own non-convergence, by its typed slug
+/// (`stations::solve_station_centered`); nothing else is a station failure.
+fn is_tangency_newton(error: &KernelRefusal) -> bool {
+    matches!(&error.class, crate::RefusalClass::NonConvergence { what } if what == "tangency_newton")
 }
 
 pub(in crate::blend) fn march_chain(
@@ -52,6 +107,18 @@ pub(in crate::blend) fn march_chain(
     per_segment: usize,
     fold: FoldPolicy,
 ) -> Result<Vec<ChainSample>, KernelRefusal> {
+    march_chain_typed(segments, radius, open, per_segment, fold).map_err(ChainMarchError::into_refusal)
+}
+
+/// [`march_chain`] with a station-continuation non-convergence kept typed, so
+/// the closed ladder can tell it from every other refusal.
+pub(in crate::blend) fn march_chain_typed(
+    segments: &[ChainSegment<'_>],
+    radius: f64,
+    open: bool,
+    per_segment: usize,
+    fold: FoldPolicy,
+) -> Result<Vec<ChainSample>, ChainMarchError> {
     let mut samples = Vec::new();
     for (index, segment) in segments.iter().enumerate() {
         // Signs from this segment's own cross-section seed.
@@ -138,7 +205,7 @@ pub(in crate::blend) fn march_chain(
                                  centers: &mut [Vec3],
                                  position: isize,
                                  from: isize|
-         -> Result<(), KernelRefusal> {
+         -> Result<(), ChainMarchError> {
             let left = Continued {
                 t: chain_t(from),
                 uv: solutions[index_of(from)],
@@ -152,7 +219,19 @@ pub(in crate::blend) fn march_chain(
                             chain_t(position)
                         );
                     }
-                    error
+                    if is_tangency_newton(&error) {
+                        ChainMarchError::Station(ChainStationFailure {
+                            segment: index,
+                            position,
+                            t: chain_t(position),
+                            from_position: from,
+                            from_t: left.t,
+                            seed_uv: left.uv,
+                            error,
+                        })
+                    } else {
+                        ChainMarchError::Other(error)
+                    }
                 })?;
             solutions[index_of(position)] = node.uv;
             centers[index_of(position)] = node.center.expect("a solved station has a centre");
@@ -236,7 +315,36 @@ pub(in crate::blend) fn march_chain(
                 } else {
                     edge.t1 - span * fraction
                 };
-                let uv = solve_at(t, solutions[index_of(position)])?;
+                // The halfway contact is the CONTINUATION of its left station
+                // under the same branch guard every station takes: its first
+                // attempt is the plain solve from the left seed it always was,
+                // so a contact that converges on the left station's branch is
+                // unchanged to the bit. Where that plain solve does not converge
+                // (the 20° seam-split crotch, t 0.208 -> 0.25, needs two seed
+                // halvings) the failure is a typed station failure, so the
+                // closed ladder can climb on it like any station's.
+                let left = Continued {
+                    t: chain_t(position),
+                    uv: solutions[index_of(position)],
+                    center: Some(centers[index_of(position)]),
+                };
+                let uv = continue_station(&solve_centered, &hop, &left, t, 0)
+                    .map_err(|error| {
+                        if is_tangency_newton(&error) {
+                            ChainMarchError::Station(ChainStationFailure {
+                                segment: index,
+                                position,
+                                t,
+                                from_position: position,
+                                from_t: left.t,
+                                seed_uv: left.uv,
+                                error,
+                            })
+                        } else {
+                            ChainMarchError::Other(error)
+                        }
+                    })?
+                    .uv;
                 let (section_point, tangent) = section_at(t)?;
                 let tangent = if segment.forward {
                     tangent
@@ -264,12 +372,14 @@ pub(in crate::blend) fn march_chain(
             let cos_alpha = rho1.signum() * rho2.signum() * n1.dot(n2);
             let weight = ((1.0 + cos_alpha) * 0.5).max(0.0).sqrt();
             if weight <= 1e-6 {
-                return Err(KernelRefusal::unsupported(KernelStage::Refine, "tangent_faces", "blend: faces are tangent at a chain station"));
+                return Err(KernelRefusal::unsupported(KernelStage::Refine, "tangent_faces", "blend: faces are tangent at a chain station").into());
             }
             let apex = apex_point(p1, n1, p2, n2, center)?;
             samples.push(ChainSample {
                 segment: index,
                 position,
+                offset: 0.0,
+                t,
                 station: Station {
                     uv1: [uv[0], uv[1]],
                     uv2: [uv[2], uv[3]],
@@ -284,32 +394,335 @@ pub(in crate::blend) fn march_chain(
             });
         }
     }
+    assign_chain_parameters(&mut samples, segments.len(), per_segment, open);
+    Ok(samples)
+}
+
+/// LOCAL REFINEMENT of a closed chain's march (`chain/closed.rs`): one station
+/// at the halfway edge parameter of every failing in-segment interval, each
+/// named by its left sample. The station is the CONTINUATION of that left
+/// station under the march's own branch guard (`stations::continue_station`),
+/// its halfway contacts and the left station's (now over a half interval) are
+/// re-solved as the march solves them, and the new stations are probed for a
+/// fold exactly as the march probes its own. Grid stations — the junctions
+/// with them — are never moved or re-solved. Chord parameters are NOT
+/// re-assigned here (`assign_chain_parameters`).
+pub(in crate::blend) fn insert_chain_stations(
+    segments: &[ChainSegment<'_>],
+    radius: f64,
+    per_segment: usize,
+    samples: &mut Vec<ChainSample>,
+    failing: &[usize],
+) -> Result<(), ChainMarchError> {
+    let mut touched: Vec<usize> = failing.iter().map(|&index| samples[index].segment).collect();
+    touched.sort_unstable();
+    touched.dedup();
+    let lefts: Vec<(usize, isize, f64)> = failing
+        .iter()
+        .map(|&index| (samples[index].segment, samples[index].position, samples[index].offset))
+        .collect();
+    for index in touched {
+        let segment = &segments[index];
+        let (rho1, rho2) = signed_radii(
+            segment.edge,
+            segment.first.face,
+            segment.first.coedge,
+            segment.second.face,
+            segment.second.coedge,
+            radius,
+        )?;
+        let rho = [rho1, rho2];
+        let surface1 = &segment.first.face.surface;
+        let surface2 = &segment.second.face.surface;
+        let edge = segment.edge;
+        let span = edge.t1 - edge.t0;
+        let scale = march_model_scale(&edge.curve, edge.t0, edge.t1, radius)?;
+        let station_step = span.abs() / per_segment as f64;
+        let section_at = |t: f64| -> Result<(Vec3, Vec3), KernelRefusal> {
+            let (section_point, tangent) = march_section(edge, t, station_step, "blend chain march")?;
+            Ok((section_point, if segment.forward { tangent } else { tangent.scale(-1.0) }))
+        };
+        let solve_centered = |t: f64, seed: [f64; 4]| -> Result<([f64; 4], Vec3), KernelRefusal> {
+            let (section_point, tangent) = section_at(t)?;
+            solve_station_centered(surface1, surface2, rho, seed, section_point, tangent, scale)
+        };
+        let hop = |left: &Continued, right: &Continued| {
+            branch_hop([surface1, surface2], edge, &|_| rho, left, right)
+        };
+        let contacts_at = |t: f64, seed: [f64; 4]| -> Result<([f64; 4], Vec3, Vec3, Vec3), KernelRefusal> {
+            let (uv, _) = solve_centered(t, seed)?;
+            let (section_point, tangent) = section_at(t)?;
+            let (_, p1, p2, center) = tangency_residual(surface1, surface2, rho, uv, section_point, tangent)?;
+            Ok((uv, p1, p2, center))
+        };
+        // A halfway contact continued from `from` under the branch guard, as
+        // the march solves its own; a non-converging Newton is a typed station
+        // failure at the halfway parameter.
+        let halfway = |from: &Continued, position: isize, t: f64| -> Result<(Vec3, Vec3), ChainMarchError> {
+            let node = continue_station(&solve_centered, &hop, from, t, 0).map_err(|error| {
+                if is_tangency_newton(&error) {
+                    ChainMarchError::Station(ChainStationFailure {
+                        segment: index,
+                        position,
+                        t,
+                        from_position: position,
+                        from_t: from.t,
+                        seed_uv: from.uv,
+                        error,
+                    })
+                } else {
+                    ChainMarchError::Other(error)
+                }
+            })?;
+            let (section_point, tangent) = section_at(t)?;
+            let (_, p1, p2, _) = tangency_residual(surface1, surface2, rho, node.uv, section_point, tangent)?;
+            Ok((p1, p2))
+        };
+        for &(_, position, offset) in lefts.iter().filter(|left| left.0 == index) {
+            let left_index = samples
+                .iter()
+                .position(|sample| sample.segment == index && sample.position == position && sample.offset == offset)
+                .expect("refined interval's left station");
+            // The next station along the segment: a grid station, the
+            // segment's own end station (position `per_segment`), or one
+            // inserted earlier in this round.
+            let right_index = (0..samples.len())
+                .filter(|&other| {
+                    samples[other].segment == index
+                        && samples[other].position <= per_segment as isize
+                        && chain_order(&samples[other], &samples[left_index]) == std::cmp::Ordering::Greater
+                })
+                .min_by(|&a, &b| chain_order(&samples[a], &samples[b]))
+                .expect("refined interval's right station");
+            let left = &samples[left_index];
+            let right = &samples[right_index];
+            let key = 0.5 * ((left.position as f64 + left.offset) + (right.position as f64 + right.offset));
+            let new_position = key.floor() as isize;
+            let new_offset = key - new_position as f64;
+            let (t_left, t_right) = (left.t, right.t);
+            let left_uv = [left.station.uv1[0], left.station.uv1[1], left.station.uv2[0], left.station.uv2[1]];
+            let retained = Continued {
+                t: t_right,
+                uv: [right.station.uv1[0], right.station.uv1[1], right.station.uv2[0], right.station.uv2[1]],
+                center: Some(right.station.center),
+            };
+            let from = Continued { t: t_left, uv: left_uv, center: Some(left.station.center) };
+            let t = 0.5 * (t_left + t_right);
+            let node = continue_station(&solve_centered, &hop, &from, t, 0).map_err(|error| {
+                if is_tangency_newton(&error) {
+                    ChainMarchError::Station(ChainStationFailure {
+                        segment: index,
+                        position: new_position,
+                        t,
+                        from_position: left.position,
+                        from_t: t_left,
+                        seed_uv: left_uv,
+                        error,
+                    })
+                } else {
+                    ChainMarchError::Other(error)
+                }
+            })?;
+            // The inserted station must also continue INTO its retained right
+            // neighbour (a grid station, or the junction's own end station):
+            // a cached right that a refined left no longer reaches is the
+            // defect `MarchFrame::march_interval` re-seeds; here the right is
+            // fixed, so the incoherence is reported, never waived.
+            if let Some(reason) = hop(&node, &retained) {
+                return Err(ChainMarchError::Incoherent(ChainStationFailure {
+                    segment: index,
+                    position: new_position,
+                    t,
+                    from_position: new_position,
+                    from_t: t,
+                    seed_uv: node.uv,
+                    error: reason,
+                }));
+            }
+            let (section_point, tangent) = section_at(t)?;
+            let (_, p1, p2, center) = tangency_residual(surface1, surface2, rho, node.uv, section_point, tangent)?;
+            let n1 = raw_normal(surface1, node.uv[0], node.uv[1])?;
+            let n2 = raw_normal(surface2, node.uv[2], node.uv[3])?;
+            let cos_alpha = rho1.signum() * rho2.signum() * n1.dot(n2);
+            let weight = ((1.0 + cos_alpha) * 0.5).max(0.0).sqrt();
+            if weight <= 1e-6 {
+                return Err(KernelRefusal::unsupported(KernelStage::Refine, "tangent_faces", "blend: faces are tangent at a chain station").into());
+            }
+            let apex = apex_point(p1, n1, p2, n2, center)?;
+            let (left_p1, left_p2) = halfway(&from, new_position, 0.5 * (t_left + t))?;
+            let (mid_p1, mid_p2) = halfway(&node, new_position, 0.5 * (t + t_right))?;
+            samples[left_index].midpoint = Some([left_p1, left_p2]);
+            samples.push(ChainSample {
+                segment: index,
+                position: new_position,
+                offset: new_offset,
+                t,
+                station: Station {
+                    uv1: [node.uv[0], node.uv[1]],
+                    uv2: [node.uv[2], node.uv[3]],
+                    p1,
+                    p2,
+                    center,
+                    weight,
+                    apex,
+                },
+                parameter: 0.0,
+                midpoint: Some([mid_p1, mid_p2]),
+            });
+        }
+        // The refined segment is probed for a fold exactly as the march probes
+        // its own stations: all of them in order along the segment, through its
+        // end station, so the end differences and the peak refinement read
+        // neighbours as the march's do — now with the inserted stations among them.
+        let mut ordered: Vec<&ChainSample> = samples
+            .iter()
+            .filter(|sample| sample.segment == index && (0..=per_segment as isize).contains(&sample.position))
+            .filter(|sample| sample.position < per_segment as isize || sample.offset == 0.0)
+            .collect();
+        ordered.sort_by(|a, b| chain_order(a, b));
+        let probed: Vec<(f64, [f64; 4])> = ordered
+            .iter()
+            .map(|sample| (sample.t, [sample.station.uv1[0], sample.station.uv1[1], sample.station.uv2[0], sample.station.uv2[1]]))
+            .collect();
+        let probe = |t: f64, seed: [f64; 4]| -> Result<([f64; 4], Vec3, Vec3, Vec3), KernelRefusal> {
+            contacts_at(t, seed)
+        };
+        let radius_at = |_: f64| radius.abs();
+        check_wall_fold(
+            &radius_at,
+            span,
+            &probed,
+            &probe,
+            segment.edge,
+            [segment.first.face, segment.second.face],
+            scale,
+        )?;
+    }
+    Ok(())
+}
+
+/// Exact contacts at interior fractions of every in-segment interval — the
+/// closed chain's local-path rail verdict and the `BREP_DEBUG_CHAIN_DENSE_RAILS`
+/// diagnostic: each solved as the
+/// continuation of the interval's left station under the branch guard, as the
+/// march solves its own. A contact that does not solve is counted and its
+/// interval named (`unsolved_at`), never read as a distance.
+pub(in crate::blend) struct DenseContacts {
+    /// (left sample, next sample, fraction of the interval, contact 1, contact 2).
+    pub(in crate::blend) solved: Vec<(usize, usize, f64, Vec3, Vec3)>,
+    /// The solved ball's centre for each entry of `solved`, in the same order
+    /// (`None` when the continuation returned no centre).
+    pub(in crate::blend) centers: Vec<Option<Vec3>>,
+    pub(in crate::blend) unsolved: usize,
+    /// The left sample of every interval with a contact that did not solve.
+    pub(in crate::blend) unsolved_at: Vec<usize>,
+}
+
+pub(in crate::blend) fn chain_dense_contacts(
+    segments: &[ChainSegment<'_>],
+    radius: f64,
+    per_segment: usize,
+    samples: &[ChainSample],
+    subdivisions: usize,
+) -> Result<DenseContacts, KernelRefusal> {
+    let mut out = DenseContacts { solved: Vec::new(), centers: Vec::new(), unsolved: 0, unsolved_at: Vec::new() };
+    for (index, segment) in segments.iter().enumerate() {
+        let (rho1, rho2) = signed_radii(
+            segment.edge,
+            segment.first.face,
+            segment.first.coedge,
+            segment.second.face,
+            segment.second.coedge,
+            radius,
+        )?;
+        let rho = [rho1, rho2];
+        let surface1 = &segment.first.face.surface;
+        let surface2 = &segment.second.face.surface;
+        let edge = segment.edge;
+        let span = edge.t1 - edge.t0;
+        let scale = march_model_scale(&edge.curve, edge.t0, edge.t1, radius)?;
+        let station_step = span.abs() / per_segment as f64;
+        let section_at = |t: f64| -> Result<(Vec3, Vec3), KernelRefusal> {
+            let (section_point, tangent) = march_section(edge, t, station_step, "blend chain march")?;
+            Ok((section_point, if segment.forward { tangent } else { tangent.scale(-1.0) }))
+        };
+        let solve_centered = |t: f64, seed: [f64; 4]| -> Result<([f64; 4], Vec3), KernelRefusal> {
+            let (section_point, tangent) = section_at(t)?;
+            solve_station_centered(surface1, surface2, rho, seed, section_point, tangent, scale)
+        };
+        let hop = |left: &Continued, right: &Continued| {
+            branch_hop([surface1, surface2], edge, &|_| rho, left, right)
+        };
+        let mut order: Vec<usize> = (0..samples.len())
+            .filter(|&other| samples[other].segment == index && (0..=per_segment as isize).contains(&samples[other].position))
+            .filter(|&other| samples[other].position < per_segment as isize || samples[other].offset == 0.0)
+            .collect();
+        order.sort_by(|&a, &b| chain_order(&samples[a], &samples[b]));
+        for pair in order.windows(2) {
+            let (left, next) = (&samples[pair[0]], &samples[pair[1]]);
+            let from = Continued {
+                t: left.t,
+                uv: [left.station.uv1[0], left.station.uv1[1], left.station.uv2[0], left.station.uv2[1]],
+                center: Some(left.station.center),
+            };
+            for step in 1..subdivisions {
+                let fraction = step as f64 / subdivisions as f64;
+                let t = left.t + fraction * (next.t - left.t);
+                let Ok(node) = continue_station(&solve_centered, &hop, &from, t, 0) else {
+                    out.unsolved += 1;
+                    out.unsolved_at.push(pair[0]);
+                    continue;
+                };
+                let (section_point, tangent) = section_at(t)?;
+                let (_, p1, p2, _) = tangency_residual(surface1, surface2, rho, node.uv, section_point, tangent)?;
+                out.solved.push((pair[0], pair[1], fraction, p1, p2));
+                out.centers.push(node.center);
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// The order stations take along a segment: grid position, then a refined
+/// station's offset inside its interval.
+fn chain_order(a: &ChainSample, b: &ChainSample) -> std::cmp::Ordering {
+    a.segment
+        .cmp(&b.segment)
+        .then(a.position.cmp(&b.position))
+        .then(a.offset.total_cmp(&b.offset))
+}
+
+/// Global chord parameters for every sample of a marched chain (the march's
+/// own assignment, also re-run after local refinement inserts stations).
+/// With no inserted station the chords are summed in the same order as the
+/// march always summed them.
+pub(in crate::blend) fn assign_chain_parameters(
+    samples: &mut [ChainSample],
+    segment_count: usize,
+    per_segment: usize,
+    open: bool,
+) {
     // Global chord parameters over the IN-SEGMENT stations (position
-    // 0..CHAIN_PER_SEGMENT-1 per segment, in chain order), then assign
-    // overshoot samples by extrapolating with their own chords.
+    // 0..CHAIN_PER_SEGMENT-1 per segment, with any inserted station in its
+    // interval, in chain order), then assign overshoot samples by
+    // extrapolating with their own chords.
+    let mut order: Vec<usize> = (0..samples.len())
+        .filter(|&index| (0..per_segment as isize).contains(&samples[index].position))
+        .collect();
+    order.sort_by(|&a, &b| chain_order(&samples[a], &samples[b]));
     let mut accumulated = 0.0;
     let mut previous: Option<Vec3> = None;
-    let mut junction_params = vec![0.0; segments.len() + 1];
-    for segment in 0..segments.len() {
-        for position in 0..per_segment as isize {
-            let sample_index = samples
-                .iter()
-                .position(|sample| sample.segment == segment && sample.position == position)
-                .expect("chain sample present");
-            let midpoint = samples[sample_index]
-                .station
-                .p1
-                .add(samples[sample_index].station.p2)
-                .scale(0.5);
-            if let Some(previous_point) = previous {
-                accumulated += midpoint.sub(previous_point).length();
-            }
-            if position == 0 {
-                junction_params[segment] = accumulated;
-            }
-            samples[sample_index].parameter = accumulated;
-            previous = Some(midpoint);
+    for &sample_index in &order {
+        let midpoint = samples[sample_index]
+            .station
+            .p1
+            .add(samples[sample_index].station.p2)
+            .scale(0.5);
+        if let Some(previous_point) = previous {
+            accumulated += midpoint.sub(previous_point).length();
         }
+        samples[sample_index].parameter = accumulated;
+        previous = Some(midpoint);
     }
     // Wrap chord back to the chain start (CLOSED chains only; an OPEN chain
     // parameterises its in-segment stations onto [0, 1] with no wrap term so
@@ -318,30 +731,25 @@ pub(in crate::blend) fn march_chain(
         let first_midpoint = {
             let sample = samples
                 .iter()
-                .find(|sample| sample.segment == 0 && sample.position == 0)
+                .find(|sample| sample.segment == 0 && sample.position == 0 && sample.offset == 0.0)
                 .expect("chain start sample");
             sample.station.p1.add(sample.station.p2).scale(0.5)
         };
         accumulated += first_midpoint.sub(previous.unwrap()).length();
     }
-    junction_params[segments.len()] = accumulated;
     let total = accumulated.max(1e-12);
     for sample in samples.iter_mut() {
         sample.parameter /= total;
     }
-    let junction_params: Vec<f64> = junction_params
-        .into_iter()
-        .map(|value| value / total)
-        .collect();
     // Overshoot samples: REAL chord distances from the boundary
     // in-segment stations (linear extrapolation misparameterises them
     // when the neighbouring segment's station spacing differs, and the
     // support pieces' crossing region lies exactly there).
-    for segment in 0..segments.len() {
+    for segment in 0..segment_count {
         let sample_at = |samples: &[ChainSample], position: isize| -> usize {
             samples
                 .iter()
-                .position(|sample| sample.segment == segment && sample.position == position)
+                .position(|sample| sample.segment == segment && sample.position == position && sample.offset == 0.0)
                 .expect("chain sample present")
         };
         let midpoint = |samples: &[ChainSample], index: usize| -> Vec3 {
@@ -352,31 +760,35 @@ pub(in crate::blend) fn march_chain(
                 .scale(0.5)
         };
         // Below position 0.
-        let anchor = sample_at(&samples, 0);
+        let anchor = sample_at(samples, 0);
         let mut accumulated = samples[anchor].parameter;
-        let mut previous_point = midpoint(&samples, anchor);
+        let mut previous_point = midpoint(samples, anchor);
         for position in (-(CHAIN_OVERSHOOT as isize)..0).rev() {
-            let index = sample_at(&samples, position);
-            let point = midpoint(&samples, index);
+            let index = sample_at(samples, position);
+            let point = midpoint(samples, index);
             accumulated -= point.sub(previous_point).length() / total;
             samples[index].parameter = accumulated;
             previous_point = point;
         }
-        // Above the last in-segment position.
-        let anchor = sample_at(&samples, per_segment as isize - 1);
+        // Above the last in-segment station: the grid's last position, or a
+        // station refinement inserted after it.
+        let anchor = *order
+            .iter()
+            .filter(|&&index| samples[index].segment == segment)
+            .last()
+            .expect("chain sample present");
         let mut accumulated = samples[anchor].parameter;
-        let mut previous_point = midpoint(&samples, anchor);
+        let mut previous_point = midpoint(samples, anchor);
         for position in per_segment as isize..=(per_segment + CHAIN_OVERSHOOT) as isize
         {
-            let index = sample_at(&samples, position);
-            let point = midpoint(&samples, index);
+            let index = sample_at(samples, position);
+            let point = midpoint(samples, index);
             accumulated += point.sub(previous_point).length() / total;
             samples[index].parameter = accumulated;
             previous_point = point;
         }
     }
-    let _ = junction_params;
-    station_trace(&samples, per_segment);
+    station_trace(samples, per_segment);
     // Re-origin the global parameter at segment 0's MIDDLE station so the
     // blend seam falls far from every junction (a seam ON a junction
     // collides with that junction's spoke crossing).  Kept UNWRAPPED so
@@ -387,14 +799,13 @@ pub(in crate::blend) fn march_chain(
     if !open {
         let p_mid = samples
             .iter()
-            .find(|sample| sample.segment == 0 && sample.position == per_segment as isize / 2)
+            .find(|sample| sample.segment == 0 && sample.position == per_segment as isize / 2 && sample.offset == 0.0)
             .map(|sample| sample.parameter)
             .expect("chain mid sample");
         for sample in samples.iter_mut() {
             sample.parameter -= p_mid;
         }
     }
-    Ok(samples)
 }
 
 /// `BREP_BLEND_STATION_TRACE=1` prints every marched chain station once the
@@ -415,11 +826,7 @@ fn station_trace(samples: &[ChainSample], per_segment: usize) {
         per_segment - 1
     );
     let mut ordered: Vec<&ChainSample> = samples.iter().collect();
-    ordered.sort_by(|a, b| {
-        a.segment
-            .cmp(&b.segment)
-            .then(a.position.cmp(&b.position))
-    });
+    ordered.sort_by(|a, b| chain_order(a, b));
     let mut previous: Option<Vec3> = None;
     for sample in ordered {
         let station = &sample.station;

@@ -71,6 +71,14 @@ const NOTE_AMBER: egui::Color32 = egui::Color32::from_rgb(0xe8, 0xa3, 0x3d);
 /// which the user has to see without opening the feature.
 const PARTIAL_ORANGE: egui::Color32 = egui::Color32::from_rgb(0xf2, 0x8c, 0x3c);
 
+/// The blue of a feature's APPROXIMATION node — the result STANDS, and this says
+/// by how much, and why, it is not exact (an imported body whose shell does not
+/// quite close, so its volume is known only to a stated bound). Blue, away from
+/// the red / orange / amber of a failure, a partial and a repair: an
+/// approximation is none of those, and a feature can carry one beside a repair
+/// or a partial, so the three leaves have to read apart at a glance.
+const APPROX_BLUE: egui::Color32 = egui::Color32::from_rgb(0x5f, 0xb3, 0xe8);
+
 /// The height of the ROLLBACK BAR row — the horizontal rule painted after the
 /// rolled-to feature ("the model is executed up to HERE"). Tall enough to read as
 /// a break between the executed block above and the dimmed, not-yet-executed rows
@@ -165,6 +173,38 @@ fn feature_fulfilment_message(report: &serde_json::Value, id: &str) -> Option<St
         .get("summary")?
         .as_str()
         .map(str::to_string)
+}
+
+/// The feature's MEASURED APPROXIMATIONS, when the run report carries any
+/// (`featureApproximations[id]`): one `(summary, full text)` per approximation
+/// — the summary the tree leaf shows (`approximate (import.shell_closure):
+/// IMPORT3D1_SOLID_03 measured … against a bar of … (2110.0x); volume
+/// determined to ±… mm³`) and the kernel's text, which names the faces and
+/// edges (with their STEP entity ids) that carry it, for the form. Empty when
+/// the feature's result is exact, which is nearly always. Read from the
+/// structured report only: a missing `summary` on some future producer falls
+/// back to the message, never to a guess from wording.
+fn feature_approximations(report: &serde_json::Value, id: &str) -> Vec<(String, String)> {
+    report
+        .get("featureApproximations")
+        .and_then(|m| m.get(id))
+        .and_then(Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .map(|entry| {
+                    let message = entry.get("message").and_then(Value::as_str).unwrap_or("");
+                    let summary = entry
+                        .get("summary")
+                        .and_then(Value::as_str)
+                        .unwrap_or(message)
+                        .to_string();
+                    let code = entry.get("code").and_then(Value::as_str).unwrap_or("?");
+                    (summary, format!("{code}: {message}"))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn feature_note_message(report: &serde_json::Value, id: &str) -> Option<String> {
@@ -398,8 +438,8 @@ impl HistoryPanel {
         // no icon font there is nothing else to draw a private-use character
         // with. The id and name identify the form; the tree row behind it shows
         // the icon.
-        let title = format!("{id}  {}", features::feature_plain_name(&ty));
-        let fields = features::feature_form_fields(&ty);
+        let title = format!("{id}  {}", crate::plugins::feature_label(state, &ty));
+        let fields = state.feature_form_fields(&ty);
         let mut params: Value =
             serde_json::from_str(&state.feature_params_json(index)).unwrap_or(Value::Null);
         // The schema-driven field-visibility hook: which params this feature's
@@ -413,21 +453,41 @@ impl HistoryPanel {
         let error = feature_error_for_user(report, state, id);
         // One banner slot, by priority: the error when there is one (a failed
         // feature neither fulfilled nor repaired anything), else the partial
-        // fulfilment (a different answer from the one asked), else the repair.
+        // fulfilment (a different answer from the one asked), else the repair,
+        // else the approximation (the answer asked for, to a stated bound).
+        // The approximations' full text — code, bound, the faces and edges
+        // that carry it — is the read-only `Approximations` section below the
+        // fields, so a feature that also repaired something loses nothing.
         let partial = feature_fulfilment_message(report, id);
         let note = feature_note_message(report, id);
+        let approximations = feature_approximations(report, id);
+        let approximation_summaries = approximations
+            .iter()
+            .map(|(summary, _)| summary.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
         let banner = error
             .as_deref()
             .map(|message| (message, ERROR_RED))
             .or_else(|| partial.as_deref().map(|message| (message, PARTIAL_ORANGE)))
-            .or_else(|| note.as_deref().map(|message| (message, NOTE_AMBER)));
+            .or_else(|| note.as_deref().map(|message| (message, NOTE_AMBER)))
+            .or_else(|| {
+                (!approximation_summaries.is_empty())
+                    .then_some((approximation_summaries.as_str(), APPROX_BLUE))
+            });
         let outputs: Vec<String> = report
             .get("featureOutputs")
             .and_then(|m| m.get(id))
             .and_then(Value::as_array)
             .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
             .unwrap_or_default();
-        let trailing = [("Outputs", outputs)];
+        let mut trailing = vec![("Outputs", outputs)];
+        if !approximations.is_empty() {
+            trailing.push((
+                "Approximations",
+                approximations.iter().map(|(_, text)| text.clone()).collect(),
+            ));
+        }
 
         // A SPLINE's editing surface is its anchor list — the schema cannot
         // express it, so it is the form's consumer section. Intent-out: the
@@ -456,7 +516,7 @@ impl HistoryPanel {
             fields: &fields,
             hidden: Some(&hidden),
             banner,
-            trailing: Some(&trailing),
+            trailing: Some(trailing.as_slice()),
             exit_label: "Return to tree",
             extra: is_spline.then_some(("Anchors", &draw_anchors as &dyn Fn(&mut egui::Ui))),
             // A feature LIVES in the rolled history, so leaving its form rolls to
@@ -635,7 +695,7 @@ impl HistoryPanel {
             // one-colour font character (see `tree::node`). `feature_plain_name`
             // is `feature_long_name` without the glyph it would prepend.
             let glyph = features::feature_icon(&ty).map(String::from);
-            let label = format!("{id}  {}", features::feature_plain_name(&ty));
+            let label = format!("{id}  {}", crate::plugins::feature_label(state, &ty));
 
             // Features AFTER the rollback point have NOT been executed: dim the
             // WHOLE row — header, timing, edit + delete buttons and the connector
@@ -766,6 +826,16 @@ impl HistoryPanel {
                         let g = tree::child_guides(&[], is_last_feature);
                         tree::message_leaf(ui, &g, true, &message, NOTE_AMBER);
                     }
+                    // --- approximation node: the feature SUCCEEDED with the
+                    // answer asked for, to a stated bound (an imported shell
+                    // that does not quite close). One blue leaf per
+                    // approximation, beside a partial's or a repair's — a
+                    // third thing, not a weaker error — so an approximate body
+                    // is visible while scanning the tree.
+                    for (summary, _) in feature_approximations(report, &id) {
+                        let g = tree::child_guides(&[], is_last_feature);
+                        tree::message_leaf(ui, &g, true, &summary, APPROX_BLUE);
+                    }
                 }
             });
 
@@ -844,7 +914,7 @@ impl HistoryPanel {
         if add.clicked() {
             // The active workbench TRIMS the creation palette (a UI filter only —
             // the history/execution surface is untouched).
-            let items = feature_palette_items(&state.settings.workbench);
+            let items = feature_palette_items_scoped(&state.settings.workbench, Some(state));
             self.palette.open(items, "Add feature", "Search features…");
         }
 
@@ -1000,11 +1070,16 @@ impl HistoryPanel {
             self.pending_insert_component = true;
             return;
         }
-        let id = state.next_feature_id(&features::feature_short_name(type_code));
-        let mut params = features::feature_default_params(type_code);
+        let short = state.feature_schema(type_code).and_then(|s| s["shortName"].as_str().filter(|s| !s.is_empty()).map(str::to_owned)).unwrap_or_else(|| features::feature_short_name(type_code));
+        let id = state.next_feature_id(&short);
+        let mut params = state.feature_default_params(type_code);
         if let Value::Object(map) = &mut params {
             map.insert("id".into(), Value::String(id.clone()));
         }
+        // A toolbar icon or a palette pick seeds the new feature's reference
+        // fields from the current selection, the way the context bar's
+        // feature buttons do (one pipeline, `context_bar::prefill_from_selection`).
+        crate::panels::context_bar::prefill_from_selection(state, type_code, &mut params);
         let feature = serde_json::json!({
             "type": type_code, "inputParams": params, "persistentData": {}
         });
@@ -1050,8 +1125,9 @@ fn rollback_bar(ui: &mut egui::Ui) -> egui::Rect {
 /// pure UI filter over CREATION — it does not touch the existing history, so a
 /// document with sheet-metal features still shows and edits them in Modeling; only
 /// the "Add new feature" list is trimmed.
-fn feature_palette_items(workbench: &str) -> Vec<PaletteItem> {
-    let catalogue = features::feature_catalogue();
+
+fn feature_palette_items_scoped(workbench: &str, engine: Option<&EngineState>) -> Vec<PaletteItem> {
+    let catalogue = engine.map_or_else(features::feature_catalogue, |e| e.feature_catalogue());
     let mut items = Vec::new();
     if let Some(list) = catalogue.get("features").and_then(Value::as_array) {
         for feature in list {
@@ -1059,12 +1135,12 @@ fn feature_palette_items(workbench: &str) -> Vec<PaletteItem> {
             if ty.is_empty() {
                 continue;
             }
-            if !crate::workbench::includes_feature(workbench, ty) {
+            if !engine.map_or_else(|| crate::workbench::includes_feature(workbench, ty), |e| crate::workbench::includes_feature_scoped(e, workbench, ty)) {
                 continue;
             }
             // `feature_long_name` prepends the glyph; the palette sorts/searches
             // on a glyph-stripped key so it stays alphabetical.
-            let long = features::feature_long_name(ty);
+            let long = crate::workbench::feature_command_label(feature);
             let short = feature.get("shortName").and_then(Value::as_str).unwrap_or(ty);
             let mut keywords = vec![ty.to_string()];
             if short != ty {

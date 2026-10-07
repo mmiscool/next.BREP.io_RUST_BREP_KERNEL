@@ -17,7 +17,7 @@ fn version(url: &str) -> Option<&str> {
         return None;
     }
     let segments: Vec<_> = path.split('/').collect();
-    let id = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_".contains(&b));
+    let id = |s: &str| !s.is_empty() && super::identity::unsegment(s).is_some_and(|raw| super::identity::segment(&raw) == s);
     match segments.as_slice() {
         ["", "api", "parts", part, "thumbnail"] if id(part) => Some(hash),
         ["", "api", "parts", part, "revisions", revision, "thumbnail"] if id(part) && id(revision) => Some(hash),

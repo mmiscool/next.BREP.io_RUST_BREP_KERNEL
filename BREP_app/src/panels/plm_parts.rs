@@ -28,7 +28,6 @@
 //! Nothing here is constructed without a server: the file-based app never
 //! reaches this panel.
 
-use crate::automation::hit_keys::HitKeyDoc;
 use crate::document_class::DocumentClass;
 use crate::plm::PlmFuture;
 use eframe::egui;
@@ -37,22 +36,6 @@ use std::task::{Context, Poll, Waker};
 
 /// Parts per catalog page. The server clamps to its own maximum.
 pub const PAGE: usize = 100;
-
-/// Hit keys this panel publishes. Registered in `automation::hit_keys` when
-/// the panel is drawn by the app (S1's wiring). Until then no session
-/// publishes them.
-pub const HIT_KEYS: &[HitKeyDoc] = &[
-    HitKeyDoc { panel: "plm_parts", prefix: "plm_parts:tab:", meaning: "the Catalog / New part tabs", command: None },
-    HitKeyDoc { panel: "plm_parts", prefix: "plm_parts:category:", meaning: "a category row, by category id (empty id: all parts)", command: None },
-    HitKeyDoc { panel: "plm_parts", prefix: "plm_parts:search", meaning: "the catalog's text search", command: None },
-    HitKeyDoc { panel: "plm_parts", prefix: "plm_parts:part:", meaning: "a catalog row, by part id; double click inserts it", command: None },
-    HitKeyDoc { panel: "plm_parts", prefix: "plm_parts:more", meaning: "Load more (the next page)", command: None },
-    HitKeyDoc { panel: "plm_parts", prefix: "plm_parts:refresh", meaning: "Refresh the catalog and its previews", command: None },
-    HitKeyDoc { panel: "plm_parts", prefix: "plm_parts:link", meaning: "Link the selected catalog part into the Workspace section's folder", command: None },
-    HitKeyDoc { panel: "plm_parts", prefix: "plm_parts:filter:", meaning: "an attribute filter field, by key (.min / .max for a number)", command: None },
-    HitKeyDoc { panel: "plm_parts", prefix: "plm_parts:saveas:", meaning: "Save As on a PLM store: a new part, or a new revision of this part", command: None },
-    HitKeyDoc { panel: "plm_parts", prefix: "plm_parts:new:", meaning: "a New part field (type, number, name, class, category, create)", command: None },
-];
 
 // --- the wire ------------------------------------------------------------------
 //
@@ -316,6 +299,10 @@ pub trait PartCatalog {
     fn categories(&self) -> PlmFuture<Vec<Category>>;
     fn schema(&self, category: &str) -> PlmFuture<Schema>;
     fn parts_page(&self, query: &PartsQuery) -> PlmFuture<PartsPage>;
+    /// Refresh the visible extent of the catalog without dropping its rows.
+    fn refresh_pages(&self, query: &PartsQuery, _minimum_rows: usize) -> PlmFuture<PartsPage> {
+        self.parts_page(query)
+    }
     fn create_part(&self, request: &NewPartRequest) -> PlmFuture<CreatedPart>;
     /// `POST /api/parts/:id/revisions` — Save As's "new revision of this part".
     fn create_revision(&self, part: &str, label: &str) -> PlmFuture<CreatedRevision>;
@@ -377,6 +364,25 @@ impl PartCatalog for PlmPartCatalog {
     fn parts_page(&self, query: &PartsQuery) -> PlmFuture<PartsPage> {
         self.json("GET", format!("/api/parts?{}", query.to_query()), None)
     }
+    fn refresh_pages(&self, query: &PartsQuery, minimum_rows: usize) -> PlmFuture<PartsPage> {
+        let client = self.client.clone();
+        let mut query = query.clone();
+        query.after = None;
+        Box::pin(async move {
+            let mut result = PartsPage::default();
+            loop {
+                let response = client.call("GET", &format!("/api/parts?{}", query.to_query()), None)
+                    .await.map_err(|e| e.to_string())?;
+                let page: PartsPage = serde_json::from_slice(&response.body).map_err(|e| e.to_string())?;
+                result.parts.extend(page.parts);
+                result.next = page.next;
+                if result.parts.len() >= minimum_rows || result.next.is_none() { break; }
+                if result.next == query.after { return Err("PLM catalog pagination did not advance".into()); }
+                query.after = result.next.clone();
+            }
+            Ok(result)
+        })
+    }
     fn create_part(&self, request: &NewPartRequest) -> PlmFuture<CreatedPart> {
         self.json("POST", "/api/parts".into(), serde_json::to_vec(request).ok())
     }
@@ -415,7 +421,7 @@ pub async fn save_as_new_revision(
         .call("POST", &format!("{base}/checkout"), body(serde_json::json!({ "client_id": "brep-app" })))
         .await
         .map_err(|error| error.to_string())?;
-    let key = format!("part/{part}/rev/{}", revision.id);
+    let key = crate::plm::identity::document_key(part, &revision.id);
     client
         .call("PUT", &format!("/api/store/doc/{key}"), Some(document.as_bytes().to_vec()))
         .await
@@ -565,6 +571,7 @@ pub struct CatalogBrowser {
     /// The query the open page request belongs to, so an answer to a query
     /// the user has since changed is dropped instead of shown.
     asked: Option<PartsQuery>,
+    refresh: Option<(PartsQuery, Pending<PartsPage>)>,
 }
 
 impl CatalogBrowser {
@@ -574,9 +581,16 @@ impl CatalogBrowser {
         self.search(catalog);
     }
 
+    /// Keep rows, selection, pagination and versioned textures visible while following changes.
+    pub fn refresh(&mut self, catalog: &dyn PartCatalog) {
+        if self.loading() || self.refresh.is_some() { return; }
+        self.tree = Some(Pending::new(catalog.categories()));
+        self.refresh = Some((self.query.clone(), Pending::new(catalog.refresh_pages(&self.query, self.rows.len().max(PAGE)))));
+    }
+
     /// The first page of the current query; the rows so far are dropped.
     pub fn search(&mut self, catalog: &dyn PartCatalog) {
-        self.thumbnails.clear();
+        self.refresh = None;
         self.rows.clear();
         self.next = None;
         self.error = None;
@@ -586,7 +600,7 @@ impl CatalogBrowser {
 
     /// The next page, appended. Nothing when there is none or one is out.
     pub fn load_more(&mut self, catalog: &dyn PartCatalog) {
-        if self.loading() || self.next.is_none() {
+        if self.loading() || self.refresh.is_some() || self.next.is_none() {
             return;
         }
         self.query.after = self.next.clone();
@@ -606,6 +620,24 @@ impl CatalogBrowser {
     pub fn poll(&mut self, waker: &Waker) -> bool {
         self.thumbnails.poll(waker);
         let mut changed = false;
+        if let Some((query, pending)) = &mut self.refresh {
+            if let Some(answer) = pending.poll(waker) {
+                let mut expected = query.clone(); expected.after = None;
+                let mut current = self.query.clone(); current.after = None;
+                if expected.to_query() == current.to_query() {
+                    match answer {
+                        Ok(page) => {
+                            if self.rows != page.parts { self.rows = page.parts; changed = true; }
+                            self.next = page.next;
+                            if self.selected.as_ref().is_some_and(|id| !self.rows.iter().any(|row| &row.id == id)) { self.selected = None; }
+                            self.error = None;
+                        }
+                        Err(error) => self.error = Some(error),
+                    }
+                }
+                self.refresh = None;
+            }
+        }
         if let Some(outcome) = self.tree.as_mut().and_then(|p| p.poll(waker)) {
             self.tree = None;
             changed = true;
@@ -733,7 +765,7 @@ impl PlmPartsPanel {
 
     pub fn refresh_catalog(&mut self, catalog: &dyn PartCatalog) {
         if self.started {
-            self.browser.reload(catalog);
+            self.browser.refresh(catalog);
         }
     }
 
@@ -796,6 +828,7 @@ impl PlmPartsPanel {
     /// Whether a request this panel made is still out.
     pub fn busy(&self) -> bool {
         self.browser.loading()
+            || self.browser.refresh.is_some()
             || self.browser.thumbnails.busy()
             || self.types_pending.as_ref().is_some_and(Pending::is_open)
             || self.schema_pending.as_ref().is_some_and(Pending::is_open)
@@ -874,7 +907,7 @@ impl PlmPartsPanel {
                 ui.weak("Loading…");
             } else if self.browser.next.is_some() {
                 ui.weak(format!("{} parts shown", self.browser.rows.len()));
-                let more = ui.button("Load more");
+                let more = ui.add_enabled(self.browser.refresh.is_none(), egui::Button::new("Load more"));
                 self.hits.insert("plm_parts:more".into(), more.rect);
                 if more.clicked() {
                     self.browser.load_more(catalog);
@@ -919,6 +952,7 @@ impl PlmPartsPanel {
             // area of the list's own: a nested one would take the wheel meant
             // for the pane.
             for part in &self.browser.rows {
+                ui.push_id(&part.id, |ui| {
                 let text = format!(
                     "{}  {}  ({} {})",
                     part.number, part.name, part.latest_label, part.latest_state
@@ -938,6 +972,7 @@ impl PlmPartsPanel {
                 if row.double_clicked() {
                     outcome.insert = Some(part.clone());
                 }
+                });
             }
         });
         if let Some(id) = chosen {

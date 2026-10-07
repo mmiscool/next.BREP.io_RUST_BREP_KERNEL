@@ -18,14 +18,10 @@
 //!
 //! # What the lifecycle section does to a document
 //!
-//! A document opened from the PLM (its name carries a `part/<p>/rev/<r>` key,
-//! and only while the store IS a PLM) gets a [`PlmPanel`] the frame it
-//! appears. Until the server has answered, the document is read-only ("reading
-//! the revision from the PLM"): nothing is editable before the server says it
-//! may be. From then on the panel's access is the document's
-//! ([`crate::document::Document::set_access`]). When access turns editable (a
-//! checkout), the document is re-read from the store: someone may have saved
-//! since it was opened, and the lock is now this user's.
+//! PLM permissions govern saving to the revision. The session copy stays
+//! editable while permissions load, without checkout, and after release.
+//! Checkout refreshes a clean copy from the store; unsaved session edits
+//! are preserved through every permission change.
 
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -37,6 +33,22 @@ use crate::panels::plm::{access_for, PanelEvent, PlmLifecycle, PlmPanel, Rights}
 use crate::plm::client::PlmClient;
 use crate::plm::PlmFuture;
 use crate::store::ModelStore;
+
+mod save;
+
+/// A link to the configured PLM web app, for management outside CAD.
+pub fn web_url(store: &dyn ModelStore, route: &str) -> Option<String> {
+    let session = store.plm_session()?;
+    let url = match session.status {
+        crate::plm::connection::Status::Connected { url, .. }
+        | crate::plm::connection::Status::NotConnected { url, .. } => url,
+    };
+    Some(format!("{}/{route}", url.trim_end_matches('/')))
+}
+
+pub fn web_link(ui: &mut egui::Ui, label: &str, url: String) -> egui::Response {
+    ui.add(egui::Hyperlink::from_label_and_url(label, url).open_in_new_tab(true))
+}
 
 thread_local! {
     /// Whether the session is on a PLM, as of the last [`PlmHost::sync`] — what
@@ -61,14 +73,11 @@ pub fn pending_access() -> Access {
 pub fn revision_of(name: &str) -> Option<(String, String)> {
     let start = name.find("part/")?;
     let key = &name[start..];
-    let parts: Vec<&str> = key.split('/').collect();
-    match parts.as_slice() {
-        ["part", part, "rev", revision] if !part.is_empty() && !revision.is_empty() => {
-            let revision = revision.split('.').next().unwrap_or(revision);
-            (!revision.is_empty()).then(|| (part.to_string(), revision.to_string()))
-        }
-        _ => None,
-    }
+    let key = key.strip_suffix(".nbrep").or_else(|| key.strip_suffix(".fbrep"))
+        .or_else(|| key.strip_suffix(".tbrep")).unwrap_or(key);
+    let crate::store::DocumentIdentity::Revision { part: part_id, revision: revision_id } =
+        crate::store::DocumentIdentity::parse_revision_key(key)? else { return None };
+    Some((part_id, revision_id))
 }
 
 /// The name to open another revision of the same part under: `name` with its
@@ -77,6 +86,8 @@ pub fn sibling_revision(name: &str, key: &str) -> Option<String> {
     let start = name.find("part/")?;
     let (_, new_revision) = revision_of(key)?;
     let (_, old_revision) = revision_of(name)?;
+    let old_revision = crate::plm::identity::segment(&old_revision);
+    let new_revision = crate::plm::identity::segment(&new_revision);
     let tail = &name[start..];
     let at = tail.rfind(&old_revision)?;
     Some(format!("{}{}{}{}", &name[..start], &tail[..at], new_revision, &tail[at + old_revision.len()..]))
@@ -89,30 +100,14 @@ pub fn sibling_revision(name: &str, key: &str) -> Option<String> {
 /// under the section's id, and every section's header. One family per section, so a
 /// section that grows a widget stays documented.
 pub static HIT_KEYS: &[crate::automation::hit_keys::HitKeyDoc] = &[
-    crate::automation::hit_keys::HitKeyDoc { panel: "plm", prefix: "panel:clip", meaning: "the visible region of the PLM pane (click_widget scrolls the pane until a widget is inside it)", command: None },
-    crate::automation::hit_keys::HitKeyDoc { panel: "plm", prefix: "section:", meaning: "a section's header, by id: section:lifecycle, section:where-used, section:uses, section:attachments, section:workspace, section:parts, section:import", command: None },
-    crate::automation::hit_keys::HitKeyDoc { panel: "plm", prefix: "lifecycle:", meaning: "the revision section (S3): lifecycle:revision:<label>, lifecycle:verb:<check-out|check-in|break-lock|release|new-revision|submit|review|open-change-order>, lifecycle:new-label, lifecycle:new-revision:where-used:<key>, lifecycle:history:load", command: None },
-    crate::automation::hit_keys::HitKeyDoc { panel: "plm", prefix: "where-used:", meaning: "the where-used section: its rows and controls", command: None },
-    crate::automation::hit_keys::HitKeyDoc { panel: "plm", prefix: "uses:", meaning: "the parts-list section (S5): re-point the occurrences a Replace everywhere moved", command: None },
-    crate::automation::hit_keys::HitKeyDoc { panel: "plm", prefix: "attachments:", meaning: "the files section (S8): its rows, download, attach", command: None },
-    crate::automation::hit_keys::HitKeyDoc { panel: "plm", prefix: "workspace:", meaning: "the workspace section (S14), the workspace browser's keys under workspace:ws:… (entry:<name>, crumb:<i>, open-part / open-revision / open-go, new-folder, link-*, sel:*, version:<n>:*, pin-folder, pinned:<i>, paste, reload, owner)", command: None },
-    crate::automation::hit_keys::HitKeyDoc { panel: "plm", prefix: "review:", meaning: "the review section (S4): the round, decisions, discussion, and the change order's", command: None },
-    crate::automation::hit_keys::HitKeyDoc { panel: "plm", prefix: "parts:", meaning: "the parts section (S7): the catalog browser, Insert and New part", command: None },
-    crate::automation::hit_keys::HitKeyDoc { panel: "plm", prefix: "import:", meaning: "the import section (S13): import a folder of files", command: None },
+    crate::automation::hit_keys::HitKeyDoc { panel: "plm", prefix: "panel:clip", meaning: "the visible PLM pane region", command: None },
+    crate::automation::hit_keys::HitKeyDoc { panel: "plm", prefix: "section:", meaning: "section:lifecycle, the revision browser and checkout", command: None },
+    crate::automation::hit_keys::HitKeyDoc { panel: "plm", prefix: "lifecycle:", meaning: "lifecycle:revision:<label> opens a revision; lifecycle:verb:check-out acquires its lock", command: None },
+    crate::automation::hit_keys::HitKeyDoc { panel: "plm", prefix: "save:", meaning: "checkout-on-save consent: save:yes, save:no, save:remember", command: None },
+    crate::automation::hit_keys::HitKeyDoc { panel: "plm", prefix: "web:", meaning: "management links opening the PLM web app in another tab: summary, revisions, attachments, structure, history, parts, workspace, reviews, ecos", command: None },
 ];
 
-pub const SECTIONS: &[(&str, &str)] = &[
-    (LIFECYCLE, "Revision"),
-    (WHERE_USED, "Where used"),
-    (USES, "Parts list"),
-    (REVIEW, "Review"),
-    (ATTACHMENTS, "Files"),
-    (WORKSPACE, "Workspace"),
-    (IMPORT, "Import a folder"),
-    // LAST: the catalog grows with every page loaded (200 rows is thousands of
-    // points), and a section drawn under it would be buried.
-    (PARTS, "Parts"),
-];
+pub const SECTIONS: &[(&str, &str)] = &[(LIFECYCLE, "Revision")];
 
 /// The uses-list section (S5): shown only while the active assembly's parts
 /// list on the PLM disagrees with its document (Replace everywhere), with the
@@ -197,6 +192,8 @@ pub const PICK_ATTACHMENTS: &str = "plm:attachments:";
 /// Every PLM panel, and the one client they share.
 #[derive(Default)]
 pub struct PlmHost {
+    save: save::SaveCheckout,
+    web_base: String,
     client: Option<Rc<PlmClient>>,
     rights: Option<Rights>,
     rights_pending: Option<PlmFuture<Rights>>,
@@ -268,6 +265,7 @@ impl PlmHost {
     /// revision in review warns (D8, S4's `plm_review::save_warning`) — it is
     /// never refused.
     pub fn sync(&mut self, store: &dyn ModelStore, docs: &mut Documents, saves: u64) -> HostActions {
+        self.web_base = web_url(store, "").unwrap_or_default();
         let client = store.plm_client();
         IN_SESSION.with(|flag| flag.set(client.is_some()));
         let Some(client) = client else {
@@ -321,7 +319,8 @@ impl PlmHost {
         self.review_asked.push(event);
     }
 
-    /// `__brepPlmReview`: the review section's state, for scripts.
+    /// The review section's state, for tests (nothing draws the section since
+    /// the pane split: review management is the web app's; no state blob).
     pub fn review_json(&self) -> String {
         self.review.state_json().to_string()
     }
@@ -409,16 +408,23 @@ impl PlmHost {
                 self.apply(event, active, &name, store, docs, &mut actions);
             }
         }
-        self.lifecycle.retain(|id, _| open.iter().any(|(open_id, _)| open_id == id));
+        self.lifecycle.retain(|id, panel| open.iter().any(|(open_id, name)| {
+            open_id == id && revision_of(name).is_some_and(|(part, revision)| panel.matches_document(&part, &revision))
+        }));
         for (id, name) in &open {
             let Some((part, revision)) = revision_of(name) else { continue };
             if !self.lifecycle.contains_key(id) {
                 let Some(rights) = self.rights else {
-                    // Until the rights are known the document stays read-only.
+                    // Pending rights restrict saving, never session editing.
                     set_access(docs, *id, pending_access());
                     continue;
                 };
-                set_access(docs, *id, pending_access());
+                // A successful Save As already knows its destination is checked out.
+                // Keep that permission while fetching metadata, so stale cached bytes
+                // cannot replace the session copy as though this were a new checkout.
+                if !docs.iter().find(|d| d.id() == *id).is_some_and(crate::document::Document::has_plm_save_access) {
+                    set_access(docs, *id, pending_access());
+                }
                 self.lifecycle.insert(*id, PlmPanel::new(server, &part, &revision, rights));
             }
             let Some(panel) = self.lifecycle.get_mut(id) else { continue };
@@ -473,7 +479,7 @@ impl PlmHost {
                 self.workspace.link(&plm, &row.id, "");
             }
             if let Some(row) = outcome.insert {
-                let key = format!("part/{}/rev/{}", row.id, row.latest_revision_id);
+                let key = crate::plm::identity::document_key(&row.id, &row.latest_revision_id);
                 self.inserting.push((crate::panels::plm_workspace::document_name(store, &key), row.number));
             }
             if let Some(created) = outcome.created {
@@ -542,9 +548,10 @@ impl PlmHost {
     ) {
         match event {
             PanelEvent::Access(access) => {
-                let was_editable = docs.iter().find(|d| d.id() == id).is_some_and(|d| d.access().is_editable());
+                let was_editable = docs.iter().find(|d| d.id() == id).is_some_and(|d| d.save_access().is_editable());
                 set_access(docs, id, access.clone());
-                if access.is_editable() && !was_editable {
+                let unsaved_edits = docs.iter().find(|d| d.id() == id).is_some_and(|doc| doc.is_dirty());
+                if access.is_editable() && !was_editable && !unsaved_edits {
                     reload(docs, id, name, store);
                 }
             }
@@ -624,124 +631,55 @@ impl PlmHost {
             ui.label("Not connected to a PLM.");
             return;
         };
-        let active = docs.active().id();
-        let (lifecycle, hits, picked, where_used) = (&mut self.lifecycle, &mut self.hits, &mut self.picked, &mut self.where_used);
-        let part = lifecycle.get(&active).and_then(|p| p.part()).map(|p| p.id.clone());
-        let mut confirm_hits = Hits::new();
-        section(ui, hits, LIFECYCLE, |ui, hits| match lifecycle.get_mut(&active) {
-            // Drawn, not polled: `sync` polls every panel, so what a request
-            // answers is applied there, once. New revision confirms first,
-            // showing where the part is used.
-            Some(panel) => {
-                let mut before = |ui: &mut egui::Ui| {
-                    if let Some(part) = &part {
-                        let mut put = |key: &str, rect: egui::Rect| {
-                            confirm_hits.insert(format!("{LIFECYCLE}:new-revision:where-used:{key}"), rect);
-                        };
-                        where_used.draw(ui, &client, part, &mut put);
+        let active = docs.active_id();
+        let mut target = None;
+        section(ui, &mut self.hits, LIFECYCLE, |ui, hits| {
+            let Some(panel) = self.lifecycle.get_mut(&active) else {
+                ui.label("Open a PLM part using File → Open.");
+                return;
+            };
+            if let Some(part) = panel.part().cloned() {
+                ui.heading(format!("{} · {}", part.number, part.name));
+                if let Some(revision) = panel.revision() {
+                    target = Some((part.id.clone(), revision.id.clone()));
+                    match access_for(revision) {
+                        Access::Editable => { ui.label("Checked out by you"); }
+                        Access::ReadOnly { reason } => { ui.colored_label(ui.visuals().warn_fg_color, format!("Session edits allowed; saving unavailable: {reason}")); }
                     }
-                };
-                picked.extend(panel.draw_with(ui, &client, hits, &mut before));
-            }
-            None => {
-                ui.label("This document is not from the PLM.");
-            }
-        });
-        hits.extend(confirm_hits);
-        if let Some(part) = &part {
-            section(ui, hits, WHERE_USED, |ui, hits| {
-                where_used.draw(ui, &client, part, &mut |key, rect| hits.put(key, rect));
-            });
-        }
-        self.uses_section(ui, active);
-        let (review, hits) = (&mut self.review, &mut self.hits);
-        section(ui, hits, REVIEW, |ui, hits| {
-            let reviews = crate::panels::plm_review::PlmReviewClient { client: client.clone() };
-            review.ui(ui, &reviews);
-            for (key, rect) in review.hits() {
-                hits.put(key, *rect);
-            }
-        });
-        let target = docs.active().name().and_then(revision_of);
-        // Exports are attached as `<part number>-<revision label>`, once the
-        // lifecycle section has read them.
-        let stem = self
-            .lifecycle
-            .get(&active)
-            .and_then(|p| Some(format!("{}-{}", p.part()?.number, p.revision()?.label)))
-            .unwrap_or_else(|| "document".into());
-        let plm = crate::panels::plm_attachments::PlmAttachments { client: client.clone() };
-        let (attachments, hits) = (&mut self.attachments, &mut self.hits);
-        section(ui, hits, ATTACHMENTS, |ui, hits| {
-            let doc = target.as_ref().map(|(part, revision)| crate::panels::plm_attachments::SectionDoc {
-                id: active,
-                part,
-                revision,
-                stem: stem.clone(),
-            });
-            attachments.ui(ui, doc, &plm, &mut |key, rect| hits.put(key, rect));
-        });
-        let (workspace, asked) = (&mut self.workspace, &mut self.workspace_asked);
-        section(ui, &mut self.hits, WORKSPACE, |ui, hits| {
-            let plm = crate::panels::plm_workspace::PlmWorkspaces { client: client.clone() };
-            // A file dropped while the pointer is over this pane goes into the folder shown.
-            if ui.rect_contains_pointer(ui.max_rect()) {
-                for (name, bytes) in crate::panels::plm_workspace::dropped(ui.ctx()) {
-                    workspace.add_file(&plm, &name, bytes);
+                }
+                ui.label("Open revision");
+                for revision in &part.revision_views {
+                    let selected = panel.revision().is_some_and(|r| r.id == revision.id);
+                    let button = ui.selectable_label(selected, &revision.label);
+                    hits.put(&format!("revision:{}", revision.label), button.rect);
+                    if button.clicked() && !selected {
+                        self.picked.push(PanelEvent::Open(revision.document_key.clone()));
+                    }
+                }
+                if panel.offered().contains(&crate::panels::plm::Verb::CheckOut) {
+                    let button = ui.button("Check out");
+                    hits.put("verb:check-out", button.rect);
+                    if button.clicked() { panel.press(&client, crate::panels::plm::Verb::CheckOut); }
                 }
             }
-            let outcome = workspace.show(ui, &plm, "");
-            for (key, rect) in &workspace.hits {
-                hits.put(key, *rect);
-            }
-            if outcome != crate::panels::plm_workspace::WorkspaceOutcome::default() {
-                asked.push(outcome);
-            }
+            if panel.busy() { ui.spinner(); ui.ctx().request_repaint(); }
+            if let Some(message) = panel.message() { ui.label(message); }
         });
-        let import = &mut self.import;
-        section(ui, &mut self.hits, IMPORT, |ui, hits| {
-            import.draw(ui, true);
-            for (key, rect) in &import.hits {
-                hits.put(key.strip_prefix("plm_import:").unwrap_or(key), *rect);
+        ui.separator();
+        ui.label("Manage in PLM");
+        if let Some((part, revision)) = target {
+            let route = format!("#/part/{}/{}", crate::plm::identity::segment(&part), crate::plm::identity::segment(&revision));
+            for (label, tab) in [("Part details, check-in and release", "summary"), ("Revisions", "revisions"), ("Attachments", "attachments"), ("BOM and where used", "structure"), ("History", "history")] {
+                let link = web_link(ui, label, format!("{}{route}/{tab}", self.web_base));
+                self.hits.insert(format!("web:{tab}"), link.rect);
             }
-        });
-        // Another user's workspace is read-only: a new part goes to the top of the user's own.
-        self.parts.workspace_folder =
-            if self.workspace.read_only() { String::new() } else { self.workspace.current_folder().to_string() };
-        let (parts, parts_asked) = (&mut self.parts, &mut self.parts_asked);
-        section(ui, &mut self.hits, PARTS, |ui, hits| {
-            ui.weak("Double-click a part to insert its newest revision here. New part makes this document its first revision.");
-            let outcome = parts.show(ui, &crate::panels::plm_parts::PlmPartCatalog::new(client.clone()));
-            for (key, rect) in &parts.hits {
-                hits.put(key.strip_prefix("plm_parts:").unwrap_or(key), *rect);
-            }
-            if outcome != crate::panels::plm_parts::PlmPartsOutcome::default() {
-                parts_asked.push(outcome);
-            }
-        });
+        }
+        for (label, route) in [("Parts and new parts", "parts"), ("Workspace", "workspace"), ("Reviews and approvals", "reviews"), ("Change orders", "ecos")] {
+            let link = web_link(ui, label, format!("{}#/{route}", self.web_base));
+            self.hits.insert(format!("web:{route}"), link.rect);
+        }
     }
 
-    /// Draw the parts-list section when the active document has a
-    /// disagreement to answer (drawn first, under the revision, because the
-    /// next save would undo the swap).
-    fn uses_section(&mut self, ui: &mut egui::Ui, active: u64) {
-        let Some(found) = self.repoint.disagreement(active).cloned() else {
-            return;
-        };
-        let asked = &mut self.repoint_asked;
-        section(ui, &mut self.hits, USES, |ui, hits| {
-            let mut local = HashMap::new();
-            let names = |id: &str| id.to_string();
-            if let Some(choice) = crate::panels::plm_import::RepointPrompt::show(ui, &found, &names, &mut local) {
-                asked.push((active, choice));
-            }
-            for (key, rect) in &local {
-                hits.put(key.strip_prefix("plm_import:").unwrap_or(key), *rect);
-            }
-        });
-    }
-
-    /// The tags a pick of this host's may be waiting under.
     pub fn pick_tags(&self) -> Vec<String> {
         let mut tags = vec![PICK_WORKSPACE.to_string()];
         tags.extend(self.attachments.panel_ids().into_iter().map(|id| format!("{PICK_ATTACHMENTS}{id}")));
@@ -772,9 +710,9 @@ impl PlmHost {
             return "null".into();
         }
         let doc = docs.active();
-        let access = match doc.access() {
-            Access::Editable => serde_json::json!({ "editable": true }),
-            Access::ReadOnly { reason } => serde_json::json!({ "editable": false, "reason": reason }),
+        let access = match doc.save_access() {
+            Access::Editable => serde_json::json!({ "editable": doc.access().is_editable(), "canSave": true }),
+            Access::ReadOnly { reason } => serde_json::json!({ "editable": doc.access().is_editable(), "canSave": false, "reason": reason }),
         };
         let panel = self.lifecycle.get(&doc.id());
         let revision = panel.and_then(|p| p.revision()).map(|r| {
@@ -789,7 +727,7 @@ impl PlmHost {
             "revision": revision,
             "busy": panel.is_some_and(|p| p.busy()),
             "message": panel.and_then(|p| p.message()),
-            "offered": panel.map(|p| p.offered().iter().map(|v| v.key()).collect::<Vec<_>>()).unwrap_or_default(),
+            "offered": panel.map(|p| p.offered().iter().filter(|v| **v == crate::panels::plm::Verb::CheckOut).map(|v| v.key()).collect::<Vec<_>>()).unwrap_or_default(),
             // The Files section (S8): what is staged, listed, refused.
             "files": self.attachments.state_json(doc.id()),
             // The Parts list (S5): whether this document disagrees with its
@@ -813,8 +751,8 @@ impl PlmHost {
 
 fn set_access(docs: &mut Documents, id: u64, access: Access) {
     if let Some(doc) = docs.iter_mut().find(|d| d.id() == id) {
-        if doc.access() != access {
-            doc.set_access(access);
+        if doc.save_access() != access || !doc.access().is_editable() {
+            doc.set_plm_save_access(access);
         }
     }
 }

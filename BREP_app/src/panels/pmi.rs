@@ -7,7 +7,7 @@
 //! # Tree mode
 //!
 //! Header: **Capture view** (snapshot the camera + visibility into a new,
-//! active view), **+ Add annotation** (the nine types, enabled while a view
+//! active view), **+ Add annotation** (the ten types, enabled while a view
 //! is active — creation is gated on an active view), the active view's
 //! **Text size** (points) and a summary.
 //!
@@ -214,7 +214,17 @@ pub(crate) fn delete_annotation(state: &mut EngineState, id: &str) -> Result<(),
 }
 
 /// The panel's transient UI state.
+struct PluginAnnotationForm {
+    id: Option<String>,
+    kind: String,
+    view: String,
+    pending: Option<u64>,
+    params: Value,
+    error: Option<String>,
+}
+
 pub struct PmiPanel {
+    plugin_form: Option<PluginAnnotationForm>,
     hits: HashMap<String, egui::Rect>,
     layout: ColumnLayout,
     columns: Vec<ColumnSpec>,
@@ -237,6 +247,7 @@ impl Default for PmiPanel {
 impl PmiPanel {
     pub fn new() -> Self {
         Self {
+            plugin_form: None,
             hits: HashMap::new(),
             layout: ColumnLayout::default(),
             columns: vec![
@@ -260,6 +271,26 @@ impl PmiPanel {
         self.hits.clear();
         self.hits.insert("pmi:panel:clip".into(), ui.clip_rect());
         let pmi = state.pmi_state();
+        let stale_form = self.plugin_form.as_ref().is_some_and(|form| {
+            if let Some(id) = &form.id {
+                state.pmi_open_annotation() != Some(id.as_str()) || pmi.find_annotation(id).is_none()
+            } else {
+                state.pmi_open_annotation().is_some() || state.pmi_open_view().is_some()
+                    || state.pmi_active_view() != Some(form.view.as_str()) || pmi.find_view(&form.view).is_none()
+            }
+        });
+        if stale_form {
+            if self.plugin_form.as_ref().is_some_and(|f| f.pending.is_some()) { state.cancel_plugin_action(); }
+            self.plugin_form = None;
+        }
+        if self.plugin_form.is_some() {
+            self.hovered = None;
+            self.pending_hover = None;
+            state.pmi_hover_end();
+            state.dialog_hover_end(DIALOG_HOVER_OWNER);
+            self.show_plugin_form(ui, state);
+            return;
+        }
         let report = state.pmi_report().cloned().unwrap_or_default();
         let active = state.pmi_active_view().map(String::from);
         let open = state.pmi_open_annotation().map(String::from);
@@ -275,9 +306,14 @@ impl PmiPanel {
         let open_annotation = open.as_deref().and_then(|id| pmi.find_annotation(id).map(|(_, annotation)| annotation.clone()));
         let open_view = open_view.as_deref().and_then(|id| pmi.find_view(id).cloned());
         match (open_annotation, open_view) {
+            (Some(annotation), _) if annotation.kind.contains('/') => {
+                let view = pmi.find_annotation(annotation.id()).map(|(view, _)| view.id.clone()).unwrap_or_default();
+                self.plugin_form = Some(PluginAnnotationForm { id: Some(annotation.id().to_owned()), kind: annotation.kind.clone(), view, pending: None, params: annotation.params.clone(), error: None });
+                self.show_plugin_form(ui, state);
+            }
             (Some(annotation), _) => self.show_form(ui, &annotation, &report, &mut action, &mut close, &mut hover),
             (None, Some(view)) => self.show_view_form(ui, &view, &mut action, &mut close),
-            (None, None) => self.show_tree(ui, &pmi, &report, active.as_deref(), selected.as_deref(), &mut action),
+            (None, None) => self.show_tree(ui, &pmi, &report, active.as_deref(), selected.as_deref(), &mut action, &state.plugin_annotation_catalogue()),
         }
 
         let result = action.map_or(Ok(()), |action| apply(state, action));
@@ -288,6 +324,13 @@ impl PmiPanel {
             // The pane shows one dialog, so whichever is up is the one closing.
             state.pmi_set_annotation_open(None);
             state.pmi_set_view_open(None);
+        }
+        let open_explode = state.pmi_open_annotation().and_then(|id| state.pmi_state().find_annotation(id).filter(|(_, a)| a.kind == "explode").map(|_| id.to_owned()));
+        if let Some(id) = open_explode {
+            if !state.transform_armed_for(&id) { state.arm_transform(&id); }
+            state.sync_transform_gizmo();
+        } else if pmi.find_annotation(&state.transform_armed_feature()).is_some() {
+            state.disarm_transform();
         }
         if let Some(hover) = self.pending_hover.take() {
             match hover {
@@ -309,6 +352,53 @@ impl PmiPanel {
         }
     }
 
+    fn show_plugin_form(&mut self, ui: &mut egui::Ui, state: &mut EngineState) {
+        let Some(form) = self.plugin_form.as_mut() else { return };
+        let status = state.plugin_action_status();
+        if let Some(id) = form.pending {
+            if status["state"] != "pending" {
+                form.pending = None;
+                if status["state"] == "complete" && status["result"]["id"] == id { self.plugin_form = None; state.pmi_set_annotation_open(None); return; }
+                form.error = Some(status["error"].as_str().unwrap_or("Annotation transaction cancelled").to_owned());
+            }
+        }
+        let catalogue = state.plugin_annotation_catalogue();
+        let schema = catalogue.as_array().into_iter().flatten().find(|s| s["type"] == form.kind);
+        ui.heading(schema.and_then(|s| s["label"].as_str()).unwrap_or(&form.kind));
+        let pending = state.plugin_action_status()["state"] == "pending";
+        let mut close = false;
+        if let Some(schema) = schema {
+            ui.add_enabled_ui(!pending && self.locked.is_none(), |ui| {
+                crate::plugins::schema_fields(ui, state, &schema["inputParamsSchema"], &mut form.params);
+                let apply = ui.button(if form.id.is_some() { "Apply annotation" } else { "Create annotation" });
+                self.hits.insert("pmi:plugin:apply".into(), apply.rect);
+                if apply.clicked() {
+                    let result = if let Some(id) = &form.id { state.plugin_update_annotation(id, form.params.clone()) }
+                        else { state.plugin_add_annotation(&form.view, &form.kind, form.params.clone()) };
+                    match result { Ok(id) => { form.pending = Some(id); form.error = None; }, Err(e) => form.error = Some(e) }
+                }
+            });
+        } else {
+            ui.label("Annotation provider unavailable. Saved parameters are preserved.");
+            ui.monospace(serde_json::to_string_pretty(&form.params).unwrap_or_default());
+        }
+        if let Some(id) = &form.id {
+            let delete = ui.add_enabled(!pending && self.locked.is_none(), egui::Button::new("Delete annotation"));
+            self.hits.insert("pmi:plugin:delete".into(), delete.rect);
+            if delete.clicked() {
+                match state.plugin_delete_annotation(id) { Ok(id) => { form.pending = Some(id); form.error = None; }, Err(e) => form.error = Some(e) }
+            }
+        }
+        if let Some(error) = &form.error { ui.colored_label(egui::Color32::LIGHT_RED, error); }
+        let status = state.plugin_action_status();
+        if let Some(error) = status["error"].as_str() { ui.colored_label(egui::Color32::LIGHT_RED, error); }
+        if pending { ui.spinner(); ui.ctx().request_repaint_after(std::time::Duration::from_millis(30)); }
+        let back = ui.button("Return to tree");
+        self.hits.insert("pmi:plugin:return".into(), back.rect);
+        if back.clicked() { if form.pending.is_some() { state.cancel_plugin_action(); } close = true; }
+        if close { self.plugin_form = None; state.pmi_set_annotation_open(None); }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn show_tree(
         &mut self,
@@ -318,6 +408,7 @@ impl PmiPanel {
         active: Option<&str>,
         selected: Option<&str>,
         action: &mut Option<Action>,
+        plugins: &Value,
     ) {
         // --- header -------------------------------------------------------------
         ui.horizontal_wrapped(|ui| {
@@ -339,6 +430,14 @@ impl PmiPanel {
                             self.hits.insert(format!("pmi:add:{}", def.type_id), item.rect);
                             if item.clicked() {
                                 add_type = Some(def.type_id.to_string());
+                            }
+                        }
+                        for schema in plugins.as_array().into_iter().flatten() {
+                            let id = schema["type"].as_str().unwrap_or("");
+                            let item = ui.selectable_label(false, schema["label"].as_str().unwrap_or(id));
+                            self.hits.insert(format!("pmi:add:{id}"), item.rect);
+                            if item.clicked() {
+                                self.plugin_form = Some(PluginAnnotationForm { id: None, kind: id.into(), view: active.unwrap_or("").into(), pending: None, params: crate::plugins::schema_defaults(&schema["inputParamsSchema"]), error: None });
                             }
                         }
                     });

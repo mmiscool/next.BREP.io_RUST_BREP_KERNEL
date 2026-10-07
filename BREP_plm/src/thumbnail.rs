@@ -65,13 +65,13 @@ pub fn of_part(part: &Part) -> Option<(&Revision, &Thumbnail)> {
 /// The URL a page shows a part's thumbnail from, versioned by the blob so a
 /// browser may cache it for good; empty when the part has none.
 pub fn part_url(part: &Part) -> String {
-    of_part(part).map(|(_, t)| format!("/api/parts/{}/thumbnail?v={}", part.id, t.sha256)).unwrap_or_default()
+    of_part(part).map(|(_, t)| format!("/api/parts/{}/thumbnail?v={}", crate::identity::segment(&part.id), t.sha256)).unwrap_or_default()
 }
 
 /// The same for one revision.
 pub fn revision_url(part_id: &str, revision: &Revision) -> String {
     current(revision)
-        .map(|t| format!("/api/parts/{part_id}/revisions/{}/thumbnail?v={}", revision.id, t.sha256))
+        .map(|t| format!("/api/parts/{}/revisions/{}/thumbnail?v={}", crate::identity::segment(part_id), crate::identity::segment(&revision.id), t.sha256))
         .unwrap_or_default()
 }
 
@@ -81,6 +81,49 @@ pub struct Claim {
     /// The document's `content_hash` the picture was made from.
     pub content_hash: String,
     pub renderer: String,
+}
+
+/// A portable model preview staged before the document transaction. Import and
+/// ordinary saves use the same path, so an image never needs a second upload.
+pub(crate) struct Embedded {
+    staged: attach::Staged,
+    width: u32,
+    height: u32,
+    renderer: String,
+}
+
+impl Embedded {
+    pub(crate) fn place(&self, root: &std::path::Path, content_hash: &str, user: &str) -> Result<Thumbnail, Error> {
+        attach::place(root, &self.staged)?;
+        Ok(Thumbnail {
+            sha256: self.staged.sha256.clone(), size: self.staged.size,
+            width: self.width, height: self.height, content_hash: content_hash.into(),
+            renderer: self.renderer.clone(), uploaded_by: user.into(), uploaded_at: now(),
+        })
+    }
+}
+
+pub(crate) fn embedded(root: &std::path::Path, body: &str) -> Result<Option<Embedded>, Error> {
+    use base64::Engine;
+    let Ok(document) = serde_json::from_str::<serde_json::Value>(body) else { return Ok(None) };
+    let Some(image) = document.get("thumbnail").filter(|v| !v.is_null()) else { return Ok(None) };
+    if image.get("mimeType").and_then(|v| v.as_str()) != Some(MEDIA_TYPE) {
+        return Err(Error::bad_request("the embedded thumbnail must have mimeType image/png"));
+    }
+    let data = image.get("data").and_then(|v| v.as_str())
+        .ok_or_else(|| Error::bad_request("the embedded thumbnail needs base64 PNG data"))?;
+    if data.len() as u64 > MAX_BYTES.div_ceil(3) * 4 {
+        return Err(Error::bad_request("the embedded thumbnail exceeds 1 MiB"));
+    }
+    let bytes = base64::engine::general_purpose::STANDARD.decode(data)
+        .map_err(|_| Error::bad_request("the embedded thumbnail is not valid base64"))?;
+    if bytes.len() as u64 > MAX_BYTES { return Err(Error::bad_request("the embedded thumbnail exceeds 1 MiB")); }
+    let (width, height) = png_size(&bytes)?;
+    let renderer = image.get("renderer").and_then(|v| v.as_str()).unwrap_or("embedded-png").trim();
+    if renderer.is_empty() || renderer.len() > 64 { return Err(Error::bad_request("invalid embedded thumbnail renderer")); }
+    let mut upload = attach::Upload::start(root, MAX_BYTES).map_err(Error::internal)?;
+    upload.write(&bytes)?;
+    Ok(Some(Embedded { staged: upload.finish()?, width, height, renderer: renderer.into() }))
 }
 
 impl Db {
@@ -139,7 +182,9 @@ impl Db {
             if let Some(old) = old.filter(|o| o.sha256 != thumbnail.sha256) {
                 attach::remove_if_unreferenced(state, &root, &old.sha256)?;
             }
-            // No change-feed entry: nothing the store index shows moved.
+            // A separate CAD thumbnail upload can land after the document
+            // save. Readers must hear about both while checkout stays held.
+            state.touch(crate::identity::document_key(&part_id, &revision_id));
             Ok(thumbnail)
         })
     }

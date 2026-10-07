@@ -20,7 +20,7 @@
 use super::client::{PlmClient, PlmError};
 #[cfg(not(target_arch = "wasm32"))]
 use super::PlmFuture;
-use crate::store::mirror_store::{BackendFuture, Entry, KeySpaceRouter, MirrorStore, StoreBackend, DIR_PREFIX, PREFIX};
+use crate::store::mirror_store::{BackendFuture, Entry, IndexRow, KeySpaceRouter, MirrorStore, StoreBackend, DIR_PREFIX, PREFIX};
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::rc::Rc;
@@ -181,7 +181,7 @@ pub(crate) struct DocumentsBackend {
     /// What the store index said of each revision key, as last read: the
     /// BOM's part number, revision and lifecycle for a component, with no
     /// request per row ([`crate::store::ModelStore::plm_revision`]).
-    index: Rc<RefCell<BTreeMap<String, super::client::IndexEntry>>>,
+    index: Rc<RefCell<OrderedIndex>>,
 }
 
 impl DocumentsBackend {
@@ -190,9 +190,38 @@ impl DocumentsBackend {
     }
 }
 
-/// Keep an index's rows by key.
-fn remember(into: &RefCell<BTreeMap<String, super::client::IndexEntry>>, index: &super::client::StoreIndex) {
-    *into.borrow_mut() = index.entries.iter().map(|e| (e.key.clone(), e.clone())).collect();
+/// Metadata has its own response ordering, before the mirror sees an answer.
+/// A full answer establishes absence even for keys never observed before.
+#[derive(Default)]
+struct OrderedIndex {
+    rows: BTreeMap<String, super::client::IndexEntry>,
+    clock: u64,
+    freshness: BTreeMap<String, u64>,
+    full_authority: u64,
+}
+impl OrderedIndex {
+    fn issue(&mut self) -> u64 {
+        self.clock += 1;
+        self.clock
+    }
+    fn reconcile(&mut self, asked: Option<&[String]>, answer: &super::client::StoreIndex, issued: u64) {
+        let listed: std::collections::BTreeSet<&str> = answer.entries.iter().map(|e| e.key.as_str()).collect();
+        let gone: Vec<String> = match asked {
+            Some(keys) => keys.iter().filter(|key| !listed.contains(key.as_str())).cloned().collect(),
+            None => self.rows.keys().filter(|key| !listed.contains(key.as_str())).cloned().collect(),
+        };
+        for key in gone {
+            if self.full_authority >= issued || self.freshness.get(&key).is_some_and(|&tick| tick >= issued) { continue; }
+            self.freshness.insert(key.clone(), issued);
+            self.rows.remove(&key);
+        }
+        for row in &answer.entries {
+            if self.full_authority >= issued || self.freshness.get(&row.key).is_some_and(|&tick| tick >= issued) { continue; }
+            self.freshness.insert(row.key.clone(), issued);
+            self.rows.insert(row.key.clone(), row.clone());
+        }
+        if asked.is_none() { self.full_authority = self.full_authority.max(issued); }
+    }
 }
 
 /// How many keys one delta read asks for (a URL stays short).
@@ -208,7 +237,7 @@ impl StoreBackend for DocumentsBackend {
     }
 
     fn plm_revision(&self, key: &str) -> Option<super::client::IndexEntry> {
-        self.index.borrow().get(key).cloned()
+        self.index.borrow().rows.get(key).cloned()
     }
 
     /// The change feed moved: re-read exactly the rows it named (a revision's
@@ -219,24 +248,19 @@ impl StoreBackend for DocumentsBackend {
         if !stale && keys.is_empty() {
             return;
         }
+        let issued = self.index.borrow_mut().issue();
         let (client, index) = (self.client.clone(), self.index.clone());
         let keys = keys.to_vec();
         detach(async move {
             if stale {
                 if let Ok(fresh) = client.index().await {
-                    remember(&index, &fresh);
+                    index.borrow_mut().reconcile(None, &fresh, issued);
                 }
                 return;
             }
             for chunk in keys.chunks(INDEX_ROWS_PER_READ) {
                 let Ok(rows) = client.index_rows(chunk).await else { return };
-                let mut held = index.borrow_mut();
-                for key in chunk {
-                    held.remove(key);
-                }
-                for row in rows.entries {
-                    held.insert(row.key.clone(), row);
-                }
+                index.borrow_mut().reconcile(Some(chunk), &rows, issued);
             }
         });
     }
@@ -258,10 +282,11 @@ impl StoreBackend for DocumentsBackend {
     }
 
     fn load_index(&self) -> BackendFuture<Vec<(String, Entry)>> {
+        let issued = self.index.borrow_mut().issue();
         let (client, keep) = (self.client.clone(), self.index.clone());
         Box::pin(async move {
             let index = client.index().await.map_err(|e| e.to_string())?;
-            remember(&keep, &index);
+            keep.borrow_mut().reconcile(None, &index, issued);
             Ok(index
                 .entries
                 .into_iter()
@@ -277,6 +302,46 @@ impl StoreBackend for DocumentsBackend {
         false
     }
 
+    /// The rows a feed move names, read in chunks; this backend's own index
+    /// map (what `plm_revision` answers) is brought up to date on the way —
+    /// the asked keys the server no longer lists leave it.
+    fn index_rows(&self, keys: &[String]) -> BackendFuture<Vec<IndexRow>> {
+        let issued = self.index.borrow_mut().issue();
+        let (client, index) = (self.client.clone(), self.index.clone());
+        let keys = keys.to_vec();
+        Box::pin(async move {
+            let mut rows = Vec::new();
+            for chunk in keys.chunks(INDEX_ROWS_PER_READ) {
+                let answer = client.index_rows(chunk).await.map_err(|e| e.to_string())?;
+                index.borrow_mut().reconcile(Some(chunk), &answer, issued);
+                for entry in answer.entries {
+                    if !entry.content_hash.is_empty() {
+                        rows.push(IndexRow {
+                            key: format!("{PREFIX}{}", entry.key),
+                            bytes: entry.size,
+                            content_hash: entry.content_hash,
+                        });
+                    }
+                }
+            }
+            Ok(rows)
+        })
+    }
+    /// The whole index, for a stale feed; this backend's own map is replaced by it.
+    fn index_all(&self) -> BackendFuture<Vec<IndexRow>> {
+        let issued = self.index.borrow_mut().issue();
+        let (client, keep) = (self.client.clone(), self.index.clone());
+        Box::pin(async move {
+            let index = client.index().await.map_err(|e| e.to_string())?;
+            keep.borrow_mut().reconcile(None, &index, issued);
+            Ok(index
+                .entries
+                .into_iter()
+                .filter(|e| !e.content_hash.is_empty())
+                .map(|e| IndexRow { key: format!("{PREFIX}{}", e.key), bytes: e.size, content_hash: e.content_hash })
+                .collect())
+        })
+    }
     fn get(&self, key: &str) -> BackendFuture<Option<String>> {
         let now = (self.now)();
         if let Some(why) = self.backoff.borrow().holding(key, now) {

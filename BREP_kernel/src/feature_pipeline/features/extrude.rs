@@ -477,6 +477,8 @@ pub fn schema() -> serde_json::Value {
     "type": "E",
     "shortName": "E",
     "longName": "Extrude",
+    "ribbonPath": "Home/Sweep/Extrude",
+    "commandSize": "Large",
     "displayBuilder": false,
     "inputParamsSchema": {
         "id": {

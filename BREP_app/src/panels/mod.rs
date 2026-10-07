@@ -16,6 +16,7 @@ pub mod assembly_constraints;
 pub mod bom;
 pub mod bom_plm;
 pub mod bom_columns;
+pub mod bom_configuration;
 pub mod bug_report;
 pub mod busy;
 pub mod component_actions;
@@ -73,3 +74,5 @@ pub mod workbench_toolbar;
 pub mod tree;
 pub mod update_components;
 pub mod wire_harness;
+
+pub mod ribbon;

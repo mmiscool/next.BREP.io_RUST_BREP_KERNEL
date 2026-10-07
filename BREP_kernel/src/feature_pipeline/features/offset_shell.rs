@@ -260,6 +260,8 @@ pub fn schema() -> serde_json::Value {
     "type": "O.S",
     "shortName": "O.S",
     "longName": "Offset Shell",
+    "ribbonPath": "Home/Modeling/Offset Shell",
+    "commandSize": "Compact",
     "displayBuilder": false,
     "inputParamsSchema": {
         "id": {

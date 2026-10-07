@@ -147,6 +147,23 @@ pub enum FaceColorMode {
 
 /// The viewer's material palette + display toggles. Defaults are the
 /// `CADmaterials` values.
+/// Global toolbar appearance. Missing saved values migrate to Ribbon.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ToolbarStyle {
+    #[default]
+    Ribbon,
+    Classic,
+}
+
+impl ToolbarStyle {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ribbon => "Ribbon",
+            Self::Classic => "Classic",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct RenderSettings {
     /// GUI chrome theme (egui panels/windows/toolbar/text). Defaults to `Auto`,
@@ -156,6 +173,9 @@ pub struct RenderSettings {
     /// [`egui::Context::set_zoom_factor`]. 1.0 = native size; composes with the
     /// device pixel ratio. Clamped to `[0.5, 3.0]`.
     pub ui_scale: f32,
+    /// Skip the startup recovery offer without restoring documents automatically.
+    /// Autosaving remains enabled for the current session.
+    pub disable_recovery_prompt: bool,
     /// Size multiplier for the floating TEXT LABELS the app overlays on the 3D
     /// model — the dimension-gizmo value chips (sketch + feature dimensions), the
     /// assembly-constraint chips, and the transform gizmo's axis letters. 1.0 = the
@@ -197,6 +217,7 @@ pub struct RenderSettings {
     /// only: it never changes what the palette or context bar offer. The app
     /// hides the strip while a sketch is being edited regardless of this flag.
     pub show_workbench_toolbar: bool,
+    pub toolbar_style: ToolbarStyle,
     pub face_color: Rgba,
     pub face_selected_color: Rgba,
     pub hover_color: Rgba,
@@ -316,6 +337,7 @@ impl Default for RenderSettings {
             theme: ThemeMode::Auto,
             // 1.0 = native UI size (no zoom); scales the whole egui chrome.
             ui_scale: 1.0,
+            disable_recovery_prompt: false,
             // 1.0 = the labels' native monospace size (no scaling).
             label_scale: 1.0,
             // Debug grab-handle outlines are off by default (a diagnostic aid).
@@ -345,6 +367,7 @@ impl Default for RenderSettings {
             show_vertices: true,
             override_model_colors: false,
             show_workbench_toolbar: true,
+            toolbar_style: ToolbarStyle::Ribbon,
             axis_length_px: 46.0,
             // The corner ViewCube's current on-screen size — the single source of
             // the literal is `ViewCube::DEFAULT_SIZE_PX`, so the settings default and
@@ -467,6 +490,9 @@ impl RenderSettings {
         if let Some(v) = value.get("uiScale").and_then(|v| v.as_f64()) {
             self.ui_scale = (v as f32).clamp(0.5, 3.0);
         }
+        if let Some(v) = value.get("disableRecoveryPrompt").and_then(|v| v.as_bool()) {
+            self.disable_recovery_prompt = v;
+        }
         // Model-overlay label size. Clamped to the SAME [0.25, 3.0] domain the
         // settings slider offers, so a persisted value never silently re-clamps on
         // reload (the `viewcubeSizePx` rule).
@@ -493,6 +519,13 @@ impl RenderSettings {
         }
         if let Some(v) = value.get("overrideModelColors").and_then(|v| v.as_bool()) {
             self.override_model_colors = v;
+        }
+        if let Some(v) = value.get("toolbarStyle").and_then(|v| v.as_str()) {
+            self.toolbar_style = match v {
+                "Ribbon" => ToolbarStyle::Ribbon,
+                "Classic" => ToolbarStyle::Classic,
+                _ => return Err(format!("unknown toolbar style: {v}")),
+            };
         }
         if let Some(v) = value.get("showWorkbenchToolbar").and_then(|v| v.as_bool()) {
             self.show_workbench_toolbar = v;
@@ -563,6 +596,7 @@ impl RenderSettings {
                 ThemeMode::Dark => "dark",
             },
             "uiScale": self.ui_scale as f64,
+            "disableRecoveryPrompt": self.disable_recovery_prompt,
             "labelScale": self.label_scale as f64,
             "debugGrabHandles": self.debug_grab_handles,
             "background": rgb_to_css_hex(self.background),
@@ -588,6 +622,7 @@ impl RenderSettings {
             "showVertices": self.show_vertices,
             "overrideModelColors": self.override_model_colors,
             "showWorkbenchToolbar": self.show_workbench_toolbar,
+            "toolbarStyle": self.toolbar_style.as_str(),
             "axisLengthPx": self.axis_length_px as f64,
             "viewcubeSizePx": self.viewcube_size_px as f64,
             "pickDoubleSided": self.pick_double_sided,
@@ -662,6 +697,9 @@ impl RenderSettings {
                     FieldKind::Scalar { step } => {
                         serde_json::json!({ "type": "scalar", "step": step })
                     }
+                    FieldKind::BoundedScalar { min, max, step } => serde_json::json!({
+                        "type": "scalar", "min": min, "max": max, "step": step
+                    }),
                     FieldKind::Text { read_only } => {
                         serde_json::json!({ "type": "text", "readOnly": read_only })
                     }
@@ -724,6 +762,9 @@ pub enum FieldKind {
     // --- extra kinds the FEATURE dialogs need (settings never use these) -------
     /// An UNBOUNDED number (feature params carry no min/max) → a drag value.
     Scalar { step: f64 },
+    /// A scalar text field whose numeric edits are bounded on commit. Drawing
+    /// the field never clamps or quantizes its existing value.
+    BoundedScalar { min: f64, max: f64, step: f64 },
     /// A single-line text edit. `read_only` protects identity fields whose
     /// renaming must also update references.
     Text { read_only: bool },
@@ -869,6 +910,15 @@ pub fn settings_schema() -> Vec<SettingsField> {
             "showWorkbenchToolbar",
             "Show workbench actions toolbar",
             "Appearance",
+            FieldKind::Bool,
+        ),
+        f("toolbarStyle", "Toolbar style", "Appearance",
+          FieldKind::Enum { variants: ["Ribbon", "Classic"].iter().map(|s| s.to_string()).collect() }),
+        // --- Startup -------------------------------------------------------
+        f(
+            "disableRecoveryPrompt",
+            "Disable recovery dialog on startup",
+            "Startup",
             FieldKind::Bool,
         ),
         // --- Scene ---------------------------------------------------------
@@ -1078,7 +1128,7 @@ impl<'a> IntoIterator for &'a OrderedNames {
 /// The emphasis state (selection + hover), name-keyed like `SelectionFilter`.
 /// Solid-level emphasis cascades to that solid's faces/edges (the
 /// `SelectionState._applyToSolid` behavior).
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct Emphasis {
     pub selected_solids: OrderedNames,
     pub selected_faces: OrderedNames,
@@ -1227,4 +1277,5 @@ impl Emphasis {
         }
     }
 }
+
 

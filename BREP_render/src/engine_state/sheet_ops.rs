@@ -355,7 +355,7 @@ impl EngineState {
                 answer
             };
             let model = Model { scene: &self.scene, unposed: &self.pmi_explode_originals, env: &env };
-            let drawing = project_sheet_with(
+            let mut drawing = project_sheet_with(
                 &model,
                 &sheet,
                 &pmi.views,
@@ -363,6 +363,7 @@ impl EngineState {
                 &context,
                 &mut LinesMode::Defer(&mut defer),
             );
+            self.draw_sheet_bom(&sheet, &mut drawing);
             let drawing_json = serde_json::to_string(&drawing).unwrap_or_else(|_| "null".into());
             // An answer that landed DURING the projection moved the key. The
             // drawing is stored under the key it ends on, so this frame's
@@ -465,6 +466,7 @@ impl EngineState {
 
     /// Sheet `id` as SVG — one of the sheet export's two output contracts.
     pub fn export_sheet_svg(&mut self, id: &str) -> Result<String, String> {
+        self.plugin_export_ready()?;
         let id = self.resolve_sheet(id)?;
         let drawing = self
             .sheet_drawing_exact(&id)
@@ -486,7 +488,7 @@ impl EngineState {
             let pmi = self.pmi_state();
             let env = self.sheet_env();
             let model = Model { scene: &self.scene, unposed: &self.pmi_explode_originals, env: &env };
-            let drawing = project_sheet_with(
+            let mut drawing = project_sheet_with(
                 &model,
                 sheet,
                 &pmi.views,
@@ -494,6 +496,7 @@ impl EngineState {
                 &self.sheet_frame_context(),
                 &mut LinesMode::Compute,
             );
+            self.draw_sheet_bom(&sheet, &mut drawing);
             let drawing_json = serde_json::to_string(&drawing).unwrap_or_else(|_| "null".into());
             if let Some(cache) = self.sheet_cache.as_mut() {
                 cache.drawing = drawing;
@@ -559,6 +562,7 @@ impl EngineState {
     /// file is [`crate::sheets::pdf::write_pdf`]'s, byte for byte, whatever
     /// the placements say.
     pub fn export_sheets_pdf_with(&mut self, ids: &[String], title: &str, three_d: bool) -> Result<Vec<u8>, String> {
+        self.plugin_export_ready()?;
         let state = self.sheet_state();
         for id in ids {
             if let Some(sheet) = state.find_sheet(id) {
@@ -573,14 +577,14 @@ impl EngineState {
             let complete = self.sheet_cache.as_ref().is_some_and(|cache| cache.complete);
             let drawing = match self.sheet_drawing_cached(id).filter(|_| complete) {
                 Some(cached) => cached.clone(),
-                None => project_sheet_with(
-                    &Model { scene: &self.scene, unposed: &self.pmi_explode_originals, env: &self.sheet_env() },
-                    sheet,
-                    &pmi.views,
-                    self.pmi_report.as_ref(),
-                    &context,
-                    &mut LinesMode::Compute,
-                ),
+                None => {
+                    let mut drawing = project_sheet_with(
+                        &Model { scene: &self.scene, unposed: &self.pmi_explode_originals, env: &self.sheet_env() },
+                        sheet, &pmi.views, self.pmi_report.as_ref(), &context, &mut LinesMode::Compute,
+                    );
+                    self.draw_sheet_bom(sheet, &mut drawing);
+                    drawing
+                },
             };
             drawings.push(drawing);
         }
@@ -783,10 +787,190 @@ impl EngineState {
             dimensions: Vec::new(),
             ordinates: Vec::new(),
             revisions: Vec::new(),
+            bom_table: None,
         });
         self.write_sheet_state(state, None);
         self.set_open_sheet(Some(id.clone()));
         id
+    }
+
+    /// Insert a live BOM table on the open sheet and open its settings.
+    pub fn sheet_insert_bom(&mut self) -> Result<(), String> {
+        let id = self
+            .sheet_open()
+            .ok_or("open a drawing sheet first")?
+            .to_owned();
+        if self
+            .sheet_state()
+            .find_sheet(&id)
+            .and_then(|s| s.bom_table.as_ref())
+            .is_none()
+        {
+            self.sheet_update(
+                &id,
+                &serde_json::json!({ "bomTable": crate::sheets::BomTable::default() }).to_string(),
+            )?;
+        }
+        self.sheet_set_object_open(Some(&id));
+        Ok(())
+    }
+
+    /// Available built-in and custom attributes, in stable order.
+    pub fn sheet_bom_columns(&self) -> Vec<String> {
+        let mut columns = std::collections::BTreeSet::from([
+            "partName".to_owned(),
+            "occurrence.Quantity".to_owned(),
+            "occurrence.Find_Number".to_owned(),
+            "part.Part_Number".to_owned(),
+            "part.Description".to_owned(),
+            "part.Material".to_owned(),
+        ]);
+        for component in &self.assembly_components {
+            for (scope, attrs) in [
+                ("part", self.part_attributes(&component.part_name)),
+                ("occurrence", self.occurrence_attributes(&component.id)),
+            ] {
+                if let Some(attrs) = attrs.as_object() {
+                    columns.extend(attrs.keys().map(|key| format!("{scope}.{key}")));
+                }
+            }
+        }
+        columns.into_iter().collect()
+    }
+
+    fn draw_sheet_bom(&self, sheet: &Sheet, drawing: &mut SheetDrawing) {
+        let Some(table) = &sheet.bom_table else {
+            return;
+        };
+        let mut rows: std::collections::BTreeMap<Vec<String>, usize> =
+            std::collections::BTreeMap::new();
+        let occurrences = self.occurrence_attributes_all();
+        let mut parts = std::collections::HashMap::new();
+        for component in &self.assembly_components {
+            let part = parts
+                .entry(component.part_name.clone())
+                .or_insert_with(|| self.part_attributes(&component.part_name));
+            let occurrence = occurrences.get(&component.id).unwrap_or(&Value::Null);
+            let cells: Vec<String> = table
+                .columns
+                .iter()
+                .map(|column| {
+                    if column == "partName" {
+                        return component.part_name.clone();
+                    }
+                    if column == "quantity" || column == "occurrence.Quantity" {
+                        return String::new();
+                    }
+                    let (scope, key) = column.split_once('.').unwrap_or(("part", column));
+                    if column == "part.PMI" {
+                        return self.part_pmi_count(&component.part_name).to_string();
+                    }
+                    let value = if scope == "occurrence" {
+                        &occurrence[key]
+                    } else {
+                        &part[key]
+                    };
+                    match value {
+                        Value::Null => String::new(),
+                        Value::String(s) => s.clone(),
+                        v => v.to_string(),
+                    }
+                })
+                .collect();
+            // Include the part identity even when its name column is hidden.
+            let mut key = cells;
+            key.push(component.part_name.clone());
+            *rows.entry(key).or_default() += 1;
+        }
+        for wire in self.wire_bom_lines() {
+            let mut cells: Vec<String> = table
+                .columns
+                .iter()
+                .map(|column| match column.as_str() {
+                    "partName" | "part.Part_Number" => wire.stock_part_number.clone(),
+                    "occurrence.MF_QTY" => wire
+                        .mf_qty
+                        .map(|q| crate::formatting::compact_decimal(q, 3))
+                        .unwrap_or_else(|| wire.state.as_str().to_owned()),
+                    "occurrence.Reference_Designator" => wire.connection_id.clone(),
+                    _ => String::new(),
+                })
+                .collect();
+            cells.push(format!("wire:{}", wire.connection_id));
+            rows.insert(cells, 1);
+        }
+        let frame = drawing
+            .frame
+            .get_or_insert_with(|| crate::sheets::frame::FrameDrawing {
+                lines: Vec::new(),
+                texts: Vec::new(),
+                revision_table: None,
+            });
+        let [x, y] = table.position;
+        let width = table.column_width_mm;
+        let height = 7.;
+        let count = rows.len() + 1;
+        for row in 0..=count {
+            frame.lines.push(vec![
+                [x, y + row as f64 * height],
+                [
+                    x + table.columns.len() as f64 * width,
+                    y + row as f64 * height,
+                ],
+            ]);
+        }
+        for col in 0..=table.columns.len() {
+            frame.lines.push(vec![
+                [x + col as f64 * width, y],
+                [x + col as f64 * width, y + count as f64 * height],
+            ]);
+        }
+        let headers: Vec<String> = table
+            .columns
+            .iter()
+            .map(|c| match c.as_str() {
+                "partName" => "Part name".into(),
+                "quantity" => "Quantity".into(),
+                _ => c
+                    .split_once('.')
+                    .map_or(c.as_str(), |(_, key)| key)
+                    .replace('_', " "),
+            })
+            .collect();
+        let mut all = vec![headers];
+        for (mut cells, quantity) in rows {
+            cells.pop();
+            for (i, column) in table.columns.iter().enumerate() {
+                if column == "quantity" || column == "occurrence.Quantity" {
+                    cells[i] = quantity.to_string();
+                }
+            }
+            all.push(cells);
+        }
+        for (row, cells) in all.iter().enumerate() {
+            for (col, cell) in cells.iter().enumerate() {
+                let available = ((width - 2.) / (2.5 * 0.65)).floor() as usize;
+                let text = if cell.chars().count() > available {
+                    format!(
+                        "{}…",
+                        cell.chars()
+                            .take(available.saturating_sub(1))
+                            .collect::<String>()
+                    )
+                } else {
+                    cell.clone()
+                };
+                frame.texts.push(crate::sheets::project::SheetText::new(
+                    text,
+                    [
+                        x + (col as f64 + 0.5) * width,
+                        y + (row as f64 + 0.5) * height,
+                    ],
+                    [2.5, 0.],
+                    [0., -2.5],
+                ));
+            }
+        }
     }
 
     /// Apply an edited **Sheet** form.

@@ -31,10 +31,10 @@ pub struct HitKeyDoc {
 /// registration covers, so a forgotten line is caught by the gate.
 pub fn hit_key_docs() -> Vec<&'static HitKeyDoc> {
     let sets: &[&[HitKeyDoc]] = &[
+        crate::plugins::HIT_KEYS,
         crate::panels::history::HIT_KEYS,
         crate::palette::HIT_KEYS,
         crate::panels::toolbar::HIT_KEYS,
-        crate::panels::plm_review::HIT_KEYS,
         crate::panels::workbench_toolbar::HIT_KEYS,
         crate::panels::file::HIT_KEYS,
         crate::panels::file_explorer::HIT_KEYS,
@@ -54,6 +54,7 @@ pub fn hit_key_docs() -> Vec<&'static HitKeyDoc> {
         crate::panels::step_parts::HIT_KEYS,
         crate::panels::wire_harness::HIT_KEYS,
         crate::panels::bug_report::HIT_KEYS,
+        crate::javascript::HIT_KEYS,
         crate::panels::pmi::HIT_KEYS,
         crate::panels::qualify::HIT_KEYS,
         crate::panels::family_table_editor::HIT_KEYS,

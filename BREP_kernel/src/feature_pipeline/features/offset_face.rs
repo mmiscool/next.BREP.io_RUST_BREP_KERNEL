@@ -73,6 +73,8 @@ pub fn schema() -> serde_json::Value {
     "type": "O.F",
     "shortName": "O.F",
     "longName": "Offset Face",
+    "ribbonPath": "Home/Modeling/Offset Face",
+    "commandSize": "Compact",
     "displayBuilder": false,
     "inputParamsSchema": {
         "id": {

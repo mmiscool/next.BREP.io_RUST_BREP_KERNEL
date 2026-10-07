@@ -52,6 +52,10 @@ pub struct EngineState {
     /// index) — the SINGLE source of truth for the model. The UI never keeps its
     /// own copy; it mutates/reads this through the `history_*` / feature methods.
     pub history: History,
+    interference_sessions: std::collections::BTreeMap<String, interference::InterferenceCursor>,
+    interference_sequence: u64,
+    illustration_snapshot: Option<illustration::IllustrationSnapshot>,
+    geometry_diagnostics: std::collections::BTreeMap<String, serde_json::Value>,
     /// The build report (`{featureErrors, unresolved, displayErrors}`) of the
     /// last history run, so the UI can show it without re-running.
     history_report: String,
@@ -61,6 +65,11 @@ pub struct EngineState {
     /// model (a top-level `metadata` field in the history document); see the
     /// [`crate::metadata`] module for the store + the object-info/measurement API.
     pub metadata: crate::metadata::MetadataStore,
+    /// Derived preview data stays outside the recipe and undo history: the
+    /// document's own picture at a history edit serial (opened with it, or the
+    /// last one a save rendered), and the last picture a save produced by key.
+    document_thumbnail: std::cell::RefCell<Option<(u64, serde_json::Value)>>,
+    thumbnail_cache: std::cell::RefCell<Option<(Vec<u64>, serde_json::Value)>>,
     /// Bumped whenever settings change so the renderer re-derives per-solid
     /// base styles (a cheap key, not a per-frame diff).
     pub settings_generation: u64,
@@ -233,6 +242,10 @@ pub struct EngineState {
     /// The un-exploded displays of the solids the active view's explode
     /// annotations posed, for an exact restore.
     pub(crate) pmi_explode_originals: std::collections::HashMap<String, crate::scene::SolidDisplay>,
+    /// A balloon whose dragged bubble could not be re-projected yet because
+    /// the scene did not hold its occurrence's exact solids: re-derived when
+    /// the topology reply lands (`pmi_refresh_stale_balloon`).
+    pub(crate) pmi_balloon_stale: Option<String>,
     /// `(world_per_pixel, view direction)` the PMI overlay was last baked at.
     pub(crate) pmi_overlay_key: Option<(f64, [f64; 3])>,
     pub(crate) pmi_hovered: Option<String>,
@@ -299,6 +312,7 @@ pub struct EngineState {
     /// same trait in M2b/M3. Reset on a document switch
     /// ([`set_history_json`](Self::set_history_json)) so a new model rebuilds fully.
     pub(crate) runner: Box<dyn crate::runner::HistoryRunner>,
+    plugins: plugins::Plugins,
     /// Monotonic run counter: bumped each time [`rerun_history`](Self::rerun_history)
     /// SUBMITS a run, and stamped onto the reply so a stale reply (a newer run that
     /// finished first) can be dropped. `run_generation != applied_generation` means
@@ -324,6 +338,17 @@ pub struct EngineState {
     /// stale). A run the runner coalesced away never replies, so this counts
     /// the runs actually EXECUTED.
     runs_replied: u64,
+    /// Displays shipped by replies [`pump`](Self::pump) DROPPED as superseded,
+    /// by solid name, latest wins. A background runner executes every run it
+    /// is handed and its delta baseline (`name → last-emitted handle`) advances
+    /// on each, so a later reply can say "unchanged, keep yours" about a
+    /// display that only ever travelled in a dropped reply (the reporter's
+    /// arrow-head drag: the frame that built the new radius was superseded by
+    /// the still-pointer frames that replayed its handle). The keep is served
+    /// from here when the scene's display is not the handle it names. Cleared
+    /// with the runner's baseline (document switch, cancel) and whenever a
+    /// fresh display for the name is applied.
+    superseded_displays: HashMap<String, crate::scene::SolidDisplay>,
     /// A pending one-shot "frame the scene once the in-flight run lands" request.
     /// Import / Open SUBMIT an async run (native [`ThreadRunner`], wasm worker) and
     /// want to `zoom_to_fit` the RESULT — but the scene is still empty when they
@@ -593,6 +618,8 @@ impl Default for EngineState {
             history: History::default(),
             history_report: String::new(),
             metadata: crate::metadata::MetadataStore::new(),
+            document_thumbnail: std::cell::RefCell::new(None),
+            thumbnail_cache: std::cell::RefCell::new(None),
             settings_generation: 1,
             dirty: true,
             ref_select: None,
@@ -634,6 +661,7 @@ impl Default for EngineState {
             pmi_dialog_opens: 0,
             pmi_modeling: None,
             pmi_explode_originals: std::collections::HashMap::new(),
+            pmi_balloon_stale: None,
             pmi_overlay_key: None,
             pmi_hovered: None,
             pmi_label_hover_active: false,
@@ -644,12 +672,18 @@ impl Default for EngineState {
             hidden_datums: std::collections::HashSet::new(),
             shown_datum_names: Vec::new(),
             runner: Box::new(crate::runner::InlineRunner::new()),
+            plugins: plugins::Plugins::default(),
+            interference_sessions: Default::default(),
+            interference_sequence: 0,
+            illustration_snapshot: None,
+            geometry_diagnostics: Default::default(),
             run_generation: 0,
             applied_generation: 0,
             run_progress: None,
             cancelled_run: None,
             expression_preview: None,
             runs_replied: 0,
+            superseded_displays: HashMap::new(),
             pending_fit: false,
             provenance: std::collections::HashMap::new(),
             entity_origin: std::collections::HashMap::new(),
@@ -776,6 +810,9 @@ mod feature_dims;
 /// non-destructive INTERSECT sweep over component instances
 /// (`interference_check`), its report types, and the pure pair planner.
 mod interference;
+mod batch;
+mod plugins;
+mod illustration;
 /// History runs & the feature CRUD surface: `run_history_json`, the
 /// runner/pump/apply seam, history JSON accessors, roll/update/add/delete/
 /// reorder, engine undo/redo, `load_model_and_fit`,
@@ -833,6 +870,7 @@ pub use ports_ops::PortRefField;
 // the last applied run cannot give one.
 mod wire_bom;
 mod pmi_ops;
+mod pmi_section;
 pub use pmi_ops::{pmi_view_params, pmi_view_schema, world_vertex_ref, PmiModelingSnapshot, PmiViewPatch};
 // Drawing sheets: the `sheets` block, the open sheet and the projection cache.
 mod sheet_ops;
@@ -864,6 +902,7 @@ pub use wire_bom::{WireBomLine, WireLengthState};
 pub use spline_edit::SplineAnchorRow;
 pub use transform_gizmo::{GizmoMode, TransformArm};
 pub(crate) use transform_gizmo::rotate_euler_xyz_f64;
+
 
 
 

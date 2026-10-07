@@ -145,6 +145,10 @@ impl EngineState {
             // that copy or it lasts only until the next feature edit.
             self.remember_board_visibility(name, visible);
             self.dirty = true;
+            // A balloon on this body loses or regains its leader at once.
+            if self.pmi_active_view.is_some() {
+                self.refresh_pmi_overlay();
+            }
         }
         ok
     }
@@ -645,7 +649,7 @@ impl EngineState {
             Err(_) => return HashMap::new(),
         };
         let _trace = crate::run_trace::span("resident_solid_handles");
-        let result = brep_kernel::execute_history(&request);
+        let result = self.execute_plugin_history(&request);
         let mut handles: HashMap<String, u32> = HashMap::new();
         for feature in &result.results {
             for removed in &feature.removed {

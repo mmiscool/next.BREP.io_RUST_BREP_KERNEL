@@ -43,6 +43,18 @@ located and read at runtime via fontconfig — it is not bundled or redistribute
 On wasm, or on a native machine without fontconfig, the `epaint_default_fonts`
 faces above are the fallback that is actually rendered.
 
+## PLM frontend vendor bundles
+
+The PLM server embeds self-hosted TOAST UI Editor 3.2.2 JavaScript/CSS and
+DOMPurify 3.4.16 JavaScript. TOAST UI Editor is distributed under the MIT licence;
+DOMPurify offers Apache-2.0 OR MPL-2.0, and this distribution uses Apache-2.0.
+The TOAST UI browser bundle also retains its embedded third-party copyright and
+licence notices, including its DOMPurify 2.3.3 dependency.
+
+Full licence texts are shipped at `BREP_plm/web/vendor/TOAST-UI-LICENSE` and
+`BREP_plm/web/vendor/DOMPurify-LICENSE`; `versions.json` records pinned versions
+and SHA-256 hashes. The production frontend modules are project-owned source.
+
 ## Rust crate dependencies
 
 Verified with `cargo metadata --format-version 1` on 2026-09-09 against the
@@ -105,5 +117,5 @@ credential and neither is contacted unless the user acts:
 
 - `https://api.step.parts/v1` — the step.parts model library, queried when the
   user opens the Assembly workbench's library panel (`src/panels/step_parts.rs`).
-- `https://v2.brep.io/api/report` — the reports endpoint, POSTed to only when the
+- `https://next.brep.io/api/report` — the reports endpoint, POSTed to only when the
   user submits the in-app "Submit Bug" form (`src/panels/bug_report.rs`).

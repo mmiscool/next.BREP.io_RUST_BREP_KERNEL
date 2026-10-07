@@ -261,10 +261,18 @@ pub fn present(geometry: &PmiGeometry, label: [f64; 3], text: &str, style: &Layo
             out.arrows.push(arrowhead(start, tangent_start.scale(-1.0), style));
             out.arrows.push(arrowhead(end, tangent_end, style));
         }
-        PmiGeometry::Leader { targets, dot: use_dot } => {
+        PmiGeometry::Leader { targets, dot: use_dot, balloon, .. } => {
+            let radius = style.text_height * (text.chars().count() as f64 * font::ADVANCE * 0.5 + 0.7).max(1.0);
+            if *balloon {
+                out.frames.push((0..=48).map(|i| {
+                    let angle = std::f64::consts::TAU * i as f64 / 48.0;
+                    a3(label.add(right.scale(radius * angle.cos())).add(up.scale(radius * angle.sin())))
+                }).collect());
+            }
             for target in targets {
                 let target = v3(*target);
-                out.polylines.push(vec![a3(label), a3(target)]);
+                let start = if *balloon { label.add(unit_or(target.sub(label), right).scale(radius)) } else { label };
+                out.polylines.push(vec![a3(start), a3(target)]);
                 if *use_dot {
                     out.polylines.push(dot(target, style));
                 } else {

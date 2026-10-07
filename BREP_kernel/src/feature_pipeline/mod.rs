@@ -12,6 +12,8 @@
 //! Features call Rust operations directly, preserving names on resident solids.
 //! Removed scene solids and consumed intermediates must release their handles.
 
+pub mod extension;
+
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use wasm_bindgen::prelude::*;
@@ -122,12 +124,19 @@ pub struct FeatureDescriptor {
 /// parses as a request (extra top-level fields ignored).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HistoryRequest {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub plugins: Vec<extension::PluginPin>,
     #[serde(default, deserialize_with = "de_string_lenient")]
     pub expressions: String,
     #[serde(default)]
     pub configurator: serde_json::Value,
     #[serde(default)]
     pub features: Vec<FeatureDescriptor>,
+    /// One-shot execution directive: rebuild these features even if their inputs
+    /// match the cache (for example, when a dimension drag is finalized). Their
+    /// consumers follow the usual dirty wavefront. Not part of the saved model.
+    #[serde(default, rename = "forceRebuild", skip_serializing_if = "Vec::is_empty")]
+    pub force_rebuild: Vec<String>,
     /// Stop AFTER executing the feature with this id (the editor's "stop at the
     /// expanded feature"). The features past the stop stay in the request so the
     /// incremental cache RETAINS their entries — expanding/collapsing a panel
@@ -272,6 +281,8 @@ impl ScenePoint {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct FeatureResult {
+    #[serde(default, rename = "persistentData", skip_serializing_if = "Option::is_none")]
+    pub persistent_data: Option<serde_json::Value>,
     pub id: String,
     pub feature_type: String,
     pub added: Vec<AddedSolid>,
@@ -319,6 +330,17 @@ pub struct FeatureResult {
     /// is nearly all of them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub notes: Vec<String>,
+    /// MEASURED approximations a SUCCESSFUL result carries
+    /// ([`crate::Approximation`]): the result stands, and each entry says by
+    /// how much and why it is not exact — today, an imported body whose shell
+    /// closes over the pcurve fit bar (`import.shell_closure`), with the bound
+    /// that puts on its volume. Distinct from `notes` (a REPAIR changed the
+    /// answer), from `fulfilment` (what was done of what was asked) and from
+    /// `refusal` (the result does not stand). The case runner records them per
+    /// feature and will not read a volume oracle as `correct` inside the bound.
+    /// Empty on nearly every feature.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub approximations: Vec<crate::Approximation>,
     /// True when this result was REPLAYED from the incremental history cache (the
     /// feature and everything it references are unchanged since the last run).
     /// The handles are the same resident solids — the caller can skip re-tessellation.
@@ -385,6 +407,7 @@ impl FeatureResult {
     /// pass-through feature returns.
     pub fn empty(id: impl Into<String>, feature_type: impl Into<String>) -> Self {
         Self {
+            persistent_data: None,
             id: id.into(),
             feature_type: feature_type.into(),
             added: Vec::new(),
@@ -395,6 +418,7 @@ impl FeatureResult {
             refused_step: None,
             unresolved: Vec::new(),
             notes: Vec::new(),
+            approximations: Vec::new(),
             reused: false,
             profiles: Vec::new(),
             frames: Vec::new(),
@@ -1474,6 +1498,8 @@ pub fn execute_feature(
         "SP" | "SPLINE" => features::spline::execute(&ctx),
         "WP" | "WAYPOINT" => features::waypoint::execute(&ctx),
         "HX" | "HELIX" => features::helix::execute(&ctx),
+        // --- Scoped extensions cannot replace built-ins. ---
+        _ if feature_type.contains('/') => extension::execute(&ctx),
         // --- Genuinely unknown type string ---
         _ => FeatureResult::error(id, feature_type.clone(), format!("unknown feature type '{feature_type}'")),
     }
@@ -1501,6 +1527,10 @@ pub fn execute_feature(
 
 /// One cached feature execution.
 struct CachedFeature {
+    /// A component's resident members were re-posed after feature execution.
+    /// Its cached pre-solve component record must not replay against those
+    /// mutated handles, even when authored expressions evaluate identically.
+    posed_externally: bool,
     /// Hash of `type` + `inputParams` + `persistentData` + the env fingerprint.
     fingerprint: u64,
     /// The successful result (errored results are NEVER cached — an errored
@@ -1528,6 +1558,16 @@ thread_local! {
     /// calls (same thread = same wasm instance).
     static HISTORY_CACHE: std::cell::RefCell<HashMap<String, CachedFeature>> =
         std::cell::RefCell::new(HashMap::new());
+}
+
+/// In-place component motion invalidates the cached producer, but must not
+/// free its handles until the next rebuild (the current scene still uses them).
+fn mark_component_cache_posed(id: &str) {
+    HISTORY_CACHE.with(|cache| {
+        if let Some(entry) = cache.borrow_mut().get_mut(id) {
+            entry.posed_externally = true;
+        }
+    });
 }
 
 /// Free a dead entry's owned resources: each produced handle and its
@@ -1579,6 +1619,7 @@ fn descriptor_fingerprint(descriptor: &FeatureDescriptor, env: &Env) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     descriptor.feature_type.hash(&mut hasher);
+    extension::identity(&descriptor.feature_type).hash(&mut hasher);
     // Both param sources: `persistent_data` (e.g. sketch coordinates) can hold
     // expression strings too, so it must be evaluated or an expression-driven
     // sketch coord would go stale on a sheet edit.
@@ -1817,6 +1858,7 @@ pub fn execute_history_observed(
     request: &HistoryRequest,
     observe: &mut dyn FnMut(HistoryProgress<'_>) -> bool,
 ) -> HistoryResult {
+    let _plugin_scope = extension::enter(&request.plugins);
     let env = Env::build(&request.expressions, &request.configurator)
         .unwrap_or_else(Env::poisoned);
 
@@ -1901,9 +1943,11 @@ pub fn execute_history_observed(
 
         let clean = cacheable
             && !library_dirty
+            && !request.force_rebuild.iter().any(|forced| forced == &id)
             && HISTORY_CACHE.with(|cache| {
                 cache.borrow().get(&id).is_some_and(|entry| {
-                    entry.fingerprint == fingerprint
+                    !entry.posed_externally
+                        && entry.fingerprint == fingerprint
                         && entry.consumed == consumed
                         && consumed.iter().all(|name| !changed.contains_key(name))
                         // The cross-run clause: reuse only if the effective input
@@ -1958,6 +2002,10 @@ pub fn execute_history_observed(
         // feature about to run: drop it rather than attribute it wrongly.
         let _ = crate::take_crossing_repairs();
         let _ = crate::take_blend_notes();
+        let _ = crate::take_blend_approximations(&[]);
+        // The feature is ONE blend operation however many blend calls it
+        // makes: none of them drops another's reports before the consume below.
+        let blend_operation = crate::blend::BlendOperation::enter();
         let feat_start = web_time::Instant::now();
         let mut result = execute_feature(descriptor, &env, &scene);
         timings.push((id.clone(), feat_start.elapsed().as_secs_f64() * 1000.0));
@@ -1974,6 +2022,23 @@ pub fn execute_history_observed(
         // that ran out with its rails still off their carriers), by the same
         // route.
         result.notes.extend(crate::take_blend_notes());
+        // A fillet wall that shipped short of its construction request says so
+        // TYPED, on the body that carries it: ONE snapshot of the ledger read
+        // against EVERY body this feature returned. A report whose wall no
+        // returned body carries (a lane that refused, a body a later step
+        // discarded) is dropped; a refused feature returns no body, so it
+        // carries none. Attached before the result is cached, so a replay
+        // carries the same typed reports.
+        if crate::blend::blend_approximations_pending() {
+            let solids: Vec<(String, crate::BrepSolid)> = result
+                .added
+                .iter()
+                .filter_map(|added| crate::registered_solid_clone(added.handle).ok().map(|solid| (added.name.clone(), solid)))
+                .collect();
+            let bodies: Vec<(&str, &crate::BrepSolid)> = solids.iter().map(|(name, solid)| (name.as_str(), solid)).collect();
+            result.approximations.extend(crate::take_blend_approximations(&bodies));
+        }
+        drop(blend_operation);
         // `halt` reflects the feature's OWN error only — a naming collision flags
         // the feature but does NOT truncate the history (the model still renders).
         let halt = result.error.is_some();
@@ -2042,6 +2107,7 @@ pub fn execute_history_observed(
                 cache.borrow_mut().insert(
                     id.clone(),
                     CachedFeature {
+                        posed_externally: false,
                         fingerprint,
                         result: result.clone(),
                         consumed,

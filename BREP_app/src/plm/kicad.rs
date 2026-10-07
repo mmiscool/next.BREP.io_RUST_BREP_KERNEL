@@ -141,9 +141,9 @@ pub async fn find(client: &PlmClient, part_type: &str, library_id: &str) -> Resu
 /// Write `document` into a revision and release it: checkout, write, check
 /// in, release — the server's order.
 async fn write_and_release(client: &PlmClient, part: &str, revision: &str, document: &[u8]) -> Result<(), String> {
-    let base = format!("/api/parts/{part}/revisions/{revision}");
+    let base = crate::plm::identity::revision_path(&part, &revision);
     call(client, "POST", &format!("{base}/checkout"), body(serde_json::json!({ "client_id": "brep-app kicad" }))).await?;
-    let written = call(client, "PUT", &format!("/api/store/doc/part/{part}/rev/{revision}"), Some(document.to_vec())).await;
+    let written = call(client, "PUT", &format!("/api/store/doc/{}", super::identity::document_key(part, revision).replace("%", "%25")), Some(document.to_vec())).await;
     call(client, "POST", &format!("{base}/checkin"), body(serde_json::json!({}))).await?;
     written?;
     call(client, "POST", &format!("{base}/state"), body(serde_json::json!({ "to": "released" }))).await?;
@@ -174,7 +174,7 @@ pub async fn publish_part(
                 let revision = call(
                     client,
                     "POST",
-                    &format!("/api/parts/{part}/revisions"),
+                    &format!("{}/revisions", crate::plm::identity::part_path(&part)),
                     body(serde_json::json!({ "origin": "imported" })),
                 )
                 .await?;

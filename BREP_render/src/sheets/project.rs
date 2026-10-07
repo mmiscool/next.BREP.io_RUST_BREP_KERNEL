@@ -622,6 +622,13 @@ pub fn project_view_through(
         return out;
     }
 
+    let saved_section = derived.is_none() && view.display.section.is_some();
+    let derived = derived.or_else(|| view.section_plane().map(|(point, normal)| {
+        let original = ViewFrame::of(camera);
+        let seed = if dot(original.up, normal).abs() < 0.99 { original.up } else if normal[0].abs() < 0.9 { [1., 0., 0.] } else { [0., 1., 0.] };
+        let right = norm(cross(normal, seed));
+        Derived::Section(SectionSetup { frame: ViewFrame { target: point, right, up: cross(right, normal), forward: normal }, plane: ClipPlane { point, normal }, label: view.name.clone() })
+    }));
     let frame = match &derived {
         Some(Derived::Section(setup)) => setup.frame,
         Some(Derived::Detail(setup)) => setup.frame,
@@ -696,6 +703,10 @@ pub fn project_view_through(
                 });
             }
         },
+    }
+    if saved_section {
+        out.annotations = annotations(report, view, &frame, placed);
+        out.tolerances = tolerance_sources(report, view, &frame, placed, model.env);
     }
     out.anchors = anchor_points(scene, unposed, view, report, &frame, placed);
     // A detail offers the anchors INSIDE its circle and no others. The anchor

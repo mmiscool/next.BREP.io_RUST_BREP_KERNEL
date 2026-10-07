@@ -7,10 +7,13 @@
 //! identically under Modeling. The ONLY things a workbench touches are the palette
 //! (see [`includes_feature`]) and the context offers.
 //!
-//! EXTENSIBILITY is the whole point: a new workbench = one new file here + one
+//! Built-in workbenches are extended with one new file here + one
 //! entry in [`WORKBENCHES`]. No enums to edit. Each file exposes a single
 //! `'static` [`Workbench`] that OWNS its own inclusion decision (`includes`), its
 //! extra toolbar buttons (data only), and the ids of existing panels it claims.
+//!
+//! Plugin workbenches use the document-scoped [`OwnedWorkbench`] overlay;
+//! their owned strings and schemas never enter the static built-in registry.
 //!
 //! `"All"` is special: it accepts every feature and its buttons are the DERIVED
 //! union of every other workbench's buttons ([`workbench_buttons`]) — never
@@ -28,6 +31,8 @@
 //! the tools.
 
 use brep_render::engine_state::EngineState;
+mod commands;
+pub use commands::*;
 
 pub mod all;
 pub mod assembly;
@@ -95,13 +100,17 @@ impl<'a> ButtonState<'a> {
 ///
 /// Three more readings came with the eCAD editors, whose actions carry them:
 /// an offered button can be DISABLED with a reason ([`Self::disabled`]), its
-/// label can be LIVE ([`Self::caption`]), and it can be a MENU of other buttons
+/// tooltip can have LIVE detail ([`Self::caption`]), and it can be a MENU of other buttons
 /// ([`Self::menu`]).
 pub struct WorkbenchButton {
     /// Stable id the shell matches on when the button is clicked.
     pub id: &'static str,
     /// The single unicode glyph shown on the square button.
     pub glyph: &'static str,
+    /// Required tab/group/canonical-label path, validated with the registry.
+    pub ribbon_path: &'static str,
+    /// Ribbon sizing; Classic always uses the compact presentation.
+    pub size: CommandSize,
     /// Hover tooltip / human label.
     pub tooltip: &'static str,
     /// When this button is OFFERED at all. `None` = always.
@@ -119,12 +128,12 @@ pub struct WorkbenchButton {
     /// it: Finish wire is on the row whenever the wire tool is, and greyed
     /// until there is a wire to finish, rather than blinking in and out.
     pub disabled: Option<fn(&ButtonState) -> Option<&'static str>>,
-    /// A LIVE label that replaces [`Self::tooltip`] where one is drawn, for a
+    /// Supplementary live tooltip detail for a
     /// button whose words describe state (`Bend: vertical first`) or depend on
     /// the document (a copper layer's name). `None` = the tooltip.
     pub caption: Option<fn(&ButtonState) -> String>,
     /// A MENU button's entries: clicking it opens a menu of these, each with
-    /// its live caption and pressed state, instead of surfacing its own id.
+    /// its canonical label, live tooltip detail and pressed state, instead of surfacing its own id.
     /// The entries are buttons in every other respect — ids the lookup finds
     /// and the `workbench_button` command presses. A menu is offered while any
     /// entry is. Empty = an ordinary button.
@@ -151,12 +160,17 @@ impl WorkbenchButton {
         self.disabled.and_then(|disabled| disabled(state))
     }
 
-    /// The words this button shows in `state`: its live caption, or its tooltip.
-    pub fn label(&self, state: &ButtonState) -> String {
-        match self.caption {
-            Some(caption) => caption(state),
-            None => self.tooltip.to_string(),
-        }
+    /// Canonical command label; state-specific wording remains in `detail`.
+    pub fn label(&self, _state: &ButtonState) -> String {
+        self.presentation().label().to_owned()
+    }
+
+    pub fn presentation(&self) -> CommandPresentation<'static> {
+        CommandPresentation { id: self.id, glyph: self.glyph, ribbon_path: self.ribbon_path, size: self.size }
+    }
+
+    pub fn detail(&self, state: &ButtonState) -> String {
+        self.caption.map_or_else(|| self.tooltip.to_owned(), |caption| caption(state))
     }
 }
 
@@ -301,6 +315,9 @@ pub fn workbench_buttons(id: &str) -> Vec<&'static WorkbenchButton> {
 /// draws and what `describe_workbenches` reports as active, so the two can never
 /// disagree about which buttons exist right now.
 pub fn offered_buttons(id: &str, state: &ButtonState) -> Vec<&'static WorkbenchButton> {
+    if owned_workbenches(state.engine).iter().any(|w| w.id == id) {
+        return shared_buttons().iter().filter(|b| b.offered(state)).collect();
+    }
     workbench_buttons(id).into_iter().filter(|button| button.offered(state)).collect()
 }
 
@@ -550,7 +567,13 @@ pub fn panel_visible(active_id: &str, panel_id: &str, state: &ButtonState) -> bo
     {
         return false;
     }
-    let claimed = WORKBENCHES.iter().any(|w| w.panels.contains(&panel_id));
+    let dynamic = owned_workbenches(state.engine);
+    let plugin = dynamic.iter().find(|w| w.id == active_id);
+    let claimed = WORKBENCHES.iter().any(|w| w.panels.contains(&panel_id))
+        || dynamic.iter().any(|w| w.panels.iter().any(|p| p == panel_id));
+    if let Some(wb) = plugin {
+        return !claimed || wb.panels.iter().any(|p| p == panel_id);
+    }
     if !claimed {
         return true;
     }
@@ -577,3 +600,58 @@ pub fn workbench_state_json(current_stored: &str) -> String {
     .to_string()
 }
 
+
+/// Document-scoped, owned overlay. Static built-ins retain their predicates and callbacks.
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OwnedWorkbench {
+    pub id: String,
+    pub label: String,
+    #[serde(default)] pub feature_types: Vec<String>,
+    #[serde(default)] pub actions: Vec<String>,
+    #[serde(default)] pub panels: Vec<String>,
+}
+
+pub fn owned_workbenches(engine: &EngineState) -> Vec<OwnedWorkbench> {
+    serde_json::from_value(engine.plugin_workbenches()).unwrap_or_default()
+}
+
+pub fn resolved_id(engine: &EngineState, id: &str) -> String {
+    if workbench_by_id(id).is_some() || owned_workbenches(engine).iter().any(|w| w.id == id) {
+        id.to_owned()
+    } else { DEFAULT_WORKBENCH_ID.to_owned() }
+}
+
+pub fn includes_feature_scoped(engine: &EngineState, active: &str, ty: &str) -> bool {
+    if let Some(wb) = owned_workbenches(engine).iter().find(|w| w.id == active) {
+        wb.feature_types.iter().any(|f| f == ty)
+    } else { includes_feature(active, ty) }
+}
+
+pub fn plugin_actions(engine: &EngineState, active: &str) -> Vec<serde_json::Value> {
+    let workbenches = owned_workbenches(engine);
+    let ids = workbenches.iter().find(|w| w.id == active).map(|w| &w.actions);
+    engine.plugin_catalogue()["actions"].as_array().into_iter().flatten()
+        .filter(|a| active == "all" || ids.is_some_and(|ids| a["id"].as_str().is_some_and(|id| ids.iter().any(|i| i == id))))
+        .cloned().collect()
+}
+
+
+pub fn workbench_state_scoped(engine: &EngineState) -> serde_json::Value {
+    let mut state: serde_json::Value = serde_json::from_str(&workbench_state_json(&engine.settings.workbench)).unwrap();
+    state["saved"] = serde_json::json!(engine.settings.workbench);
+    state["current"] = serde_json::json!(resolved_id(engine, &engine.settings.workbench));
+    if let Some(available) = state["available"].as_array_mut() {
+        available.extend(owned_workbenches(engine).iter().map(|w| serde_json::json!({"id":w.id,"label":w.label})));
+    }
+    state
+}
+
+/// Declarative panels claimed by the active document's workbench.
+pub fn plugin_panels(engine: &EngineState, active: &str) -> Vec<serde_json::Value> {
+    let workbenches = owned_workbenches(engine);
+    let ids = workbenches.iter().find(|w| w.id == active).map(|w| &w.panels);
+    engine.plugin_catalogue()["panels"].as_array().into_iter().flatten()
+        .filter(|p| active == "all" || ids.is_some_and(|ids| p["id"].as_str().is_some_and(|id| ids.iter().any(|i| i == id))))
+        .cloned().collect()
+}

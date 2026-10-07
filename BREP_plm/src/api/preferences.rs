@@ -89,6 +89,7 @@ pub const KEYS: &[&str] = &[
     "@pinned",
     "@feature_palette_display",
     "@kicad_library",
+    "@recent_documents",
     RECOVERY,
 ];
 

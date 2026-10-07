@@ -1308,6 +1308,9 @@ pub fn boolean_operation_nary(
     let mut healed = operands.to_vec();
     for operand in &mut healed {
         crate::heal::heal_operands(operand, &policy)?;
+        // Then refit any inherited trim off the pcurve construction contract
+        // whose edge lies on every carrier (a no-op without one).
+        crate::heal::refit_inherited_trims(operand, &policy)?;
         // Same operand normalization as the binary path: seam edges for
         // seamless full-period band faces.
         normalize_operand_band_seams(operand)?;
@@ -1346,7 +1349,7 @@ pub fn boolean_operation_nary(
             tolerance,
             &options.keep_unmerged_name_substrs,
         )?;
-        merge_curve_continuation_edges(&merged, tolerance).or_refuse(KernelStage::Validate, "merge_curve_continuation_edges")?
+        merge_curve_continuation_edges(&merged, tolerance).map_err(|refusal| KernelRefusal { stage: KernelStage::Validate, ..refusal })?
     } else {
         solid
     };
@@ -1518,6 +1521,11 @@ fn prepared_operands(
     let mut second_owned = second.clone();
     crate::heal::heal_operands(&mut first_owned, policy)?;
     crate::heal::heal_operands(&mut second_owned, policy)?;
+    // Then refit, on each operand's own carriers, any inherited trim off the
+    // pcurve construction contract whose edge lies on every incident carrier
+    // (`heal::refit_inherited_trims`; a byte-identical no-op without one).
+    crate::heal::refit_inherited_trims(&mut first_owned, policy)?;
+    crate::heal::refit_inherited_trims(&mut second_owned, policy)?;
     profile_stage("heal_ms", stage_started.elapsed().as_secs_f64() * 1_000.0);
     // Seamless full-period band faces (STEP import) break the seam-aware
     // imprint/arrangement machinery; normalize them to the seam-carrying
@@ -1835,7 +1843,7 @@ fn boolean_pipeline(
         // segments incident to the same pair of faces. Run continuation
         // cleanup again, matching the post-merge normalization performed by
         // the former assembly pipeline.
-        merge_curve_continuation_edges(&merged, tolerance).or_refuse(KernelStage::Validate, "merge_curve_continuation_edges")?
+        merge_curve_continuation_edges(&merged, tolerance).map_err(|refusal| KernelRefusal { stage: KernelStage::Validate, ..refusal })?
     } else {
         solid
     };

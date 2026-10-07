@@ -145,6 +145,30 @@ pub struct Sheet {
     /// before they existed has none, and a sheet with none draws no table.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub revisions: Vec<Revision>,
+    #[serde(default, rename = "bomTable", skip_serializing_if = "Option::is_none")]
+    pub bom_table: Option<BomTable>,
+}
+
+/// A live assembly parts list placed in paper millimetres.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BomTable {
+    pub position: [f64; 2],
+    pub column_width_mm: f64,
+    pub columns: Vec<String>,
+}
+impl Default for BomTable {
+    fn default() -> Self {
+        Self {
+            position: [20., 20.],
+            column_width_mm: 32.,
+            columns: vec![
+                "occurrence.Find_Number".into(),
+                "partName".into(),
+                "occurrence.Quantity".into(),
+            ],
+        }
+    }
 }
 
 /// One row of a sheet's revision table: the revision's letter, its date and
@@ -651,6 +675,7 @@ impl Sheet {
             "titleBlock": self.title_block,
             "notes": self.notes,
             "revisions": self.revisions,
+            "bomTable": self.bom_table,
         })
     }
 
@@ -715,6 +740,14 @@ impl Sheet {
         // sheet whose blank value is a value.
         if let Some(notes) = params.get("notes").and_then(Value::as_str) {
             self.notes = notes.to_string();
+        }
+        if let Some(value) = params.get("bomTable") {
+            self.bom_table = if value.is_null() { None } else {
+                let table: BomTable = serde_json::from_value(value.clone()).map_err(|e| format!("BOM table: {e}"))?;
+                if table.columns.is_empty() || table.columns.len() > 32 { return Err("choose between 1 and 32 BOM columns".into()); }
+                if !table.position.iter().all(|v| v.is_finite()) || !table.column_width_mm.is_finite() || table.column_width_mm < 8. { return Err("BOM position must be finite and column width at least 8 mm".into()); }
+                Some(table)
+            };
         }
         // The revision list is replaced WHOLE and in the order given — the
         // order IS the table's — and a row the list cannot mean refuses the

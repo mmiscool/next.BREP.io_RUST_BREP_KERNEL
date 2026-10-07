@@ -3,29 +3,30 @@ use crate::topology::{adaptive_coedge_error, BrepSolid, CoedgeRecord, EdgeRecord
 use crate::{
     build_pcurve_on_surface, interpolate_curve, KernelTolerances, NurbsCurve, NurbsSurface, Vec3,
 };
+use crate::{KernelRefusal, KernelStage, OrRefuse};
 use rustc_hash::FxHashMap as HashMap;
 
-fn trimmed_curve(curve: &NurbsCurve, t0: f64, t1: f64) -> Result<NurbsCurve, String> {
-    let [start, end] = curve.domain()?;
+fn trimmed_curve(curve: &NurbsCurve, t0: f64, t1: f64) -> Result<NurbsCurve, KernelRefusal> {
+    let [start, end] = curve.domain().or_refuse(KernelStage::Sew, "domain")?;
     // NurbsCurve::split refuses parameters within its ABSOLUTE knot
     // tolerance (1e-9) of the domain ends; the skip epsilon must cover that
     // or a near-edge trim parameter slips past the guard and errors.
     let epsilon = (1e-9 * (end - start)).max(2e-9);
     let mut result = curve.clone();
     if t0 > start + epsilon && t0 < end - epsilon {
-        result = result.split(t0)?.1;
+        result = result.split(t0).or_refuse(KernelStage::Sew, "split")?.1;
     }
-    let domain = result.domain()?;
+    let domain = result.domain().or_refuse(KernelStage::Sew, "domain")?;
     if t1 < domain[1] - epsilon && t1 > domain[0] + epsilon {
-        result = result.split(t1)?.0;
+        result = result.split(t1).or_refuse(KernelStage::Sew, "split")?.0;
     } else if std::env::var("BREP_DEBUG_SUBRANGE").is_ok() && t1 < domain[1] - epsilon {
         eprintln!("abnormal subrange skip in coalesce trimmed_curve");
     }
     Ok(result)
 }
 
-fn curvature_at(curve: &NurbsCurve, parameter: f64) -> Result<f64, String> {
-    let derivatives = curve.derivatives(parameter, 2)?;
+fn curvature_at(curve: &NurbsCurve, parameter: f64) -> Result<f64, KernelRefusal> {
+    let derivatives = curve.derivatives(parameter, 2).or_refuse(KernelStage::Sew, "derivatives")?;
     let speed = derivatives[1].length();
     if speed <= 1e-12 {
         return Ok(0.0);
@@ -45,8 +46,8 @@ fn constrain_curve_endpoints(
     mut curve: NurbsCurve,
     start: Vec3,
     end: Vec3,
-) -> Result<NurbsCurve, String> {
-    let [domain_start, domain_end] = curve.domain()?;
+) -> Result<NurbsCurve, KernelRefusal> {
+    let [domain_start, domain_end] = curve.domain().or_refuse(KernelStage::Sew, "domain")?;
     // Over-clamped vectors have inactive controls beyond their endpoint
     // multiplicities. Anchor the controls that actually evaluate there.
     let first = crate::curve::knot_find_span(&curve.knots, curve.degree, domain_start)
@@ -55,7 +56,7 @@ fn constrain_curve_endpoints(
     let first_weight = curve.control_points[first].w;
     let last_weight = curve.control_points[last].w;
     if first_weight.abs() <= 1e-15 || last_weight.abs() <= 1e-15 {
-        return Err("cannot constrain a curve endpoint with zero weight".into());
+        return Err(KernelRefusal::internal(KernelStage::Sew, "constrain_zero_weight", "cannot constrain a curve endpoint with zero weight"));
     }
     curve.control_points[first].x = start.x * first_weight;
     curve.control_points[first].y = start.y * first_weight;
@@ -64,10 +65,10 @@ fn constrain_curve_endpoints(
     curve.control_points[last].y = end.y * last_weight;
     curve.control_points[last].z = end.z * last_weight;
     let endpoint_epsilon = 1e-10;
-    if curve.evaluate(domain_start)?.sub(start).length() > endpoint_epsilon
-        || curve.evaluate(domain_end)?.sub(end).length() > endpoint_epsilon
+    if curve.evaluate(domain_start).or_refuse(KernelStage::Sew, "evaluate")?.sub(start).length() > endpoint_epsilon
+        || curve.evaluate(domain_end).or_refuse(KernelStage::Sew, "evaluate")?.sub(end).length() > endpoint_epsilon
     {
-        return Err("continuation curve is not clamped at its topology endpoints".into());
+        return Err(KernelRefusal::non_convergence(KernelStage::Sew, "continuation_endpoint_clamp", "continuation curve is not clamped at its topology endpoints"));
     }
     Ok(curve)
 }
@@ -80,27 +81,27 @@ fn concatenate_sampled_pieces(
     second: &NurbsCurve,
     split: f64,
     tolerance: f64,
-) -> Result<Option<NurbsCurve>, String> {
-    let first_domain = first.domain()?;
-    let second_domain = second.domain()?;
+) -> Result<Option<NurbsCurve>, KernelRefusal> {
+    let first_domain = first.domain().or_refuse(KernelStage::Sew, "domain")?;
+    let second_domain = second.domain().or_refuse(KernelStage::Sew, "domain")?;
     let samples_per_piece = 48;
     let mut points = Vec::<Vec3>::with_capacity(samples_per_piece * 2 + 1);
     let mut parameters = Vec::with_capacity(samples_per_piece * 2 + 1);
     for index in 0..=samples_per_piece {
         let fraction = index as f64 / samples_per_piece as f64;
         points.push(
-            first.evaluate(first_domain[0] + (first_domain[1] - first_domain[0]) * fraction)?,
+            first.evaluate(first_domain[0] + (first_domain[1] - first_domain[0]) * fraction).or_refuse(KernelStage::Sew, "evaluate")?,
         );
         parameters.push(split * fraction);
     }
     for index in 1..=samples_per_piece {
         let fraction = index as f64 / samples_per_piece as f64;
         points.push(
-            second.evaluate(second_domain[0] + (second_domain[1] - second_domain[0]) * fraction)?,
+            second.evaluate(second_domain[0] + (second_domain[1] - second_domain[0]) * fraction).or_refuse(KernelStage::Sew, "evaluate")?,
         );
         parameters.push(split + (1.0 - split) * fraction);
     }
-    let joined = interpolate_curve(&points, first.degree.min(second.degree), &parameters)?;
+    let joined = interpolate_curve(&points, first.degree.min(second.degree), &parameters).or_refuse(KernelStage::Sew, "interpolate_curve")?;
     for index in 0..=64 {
         let fraction = index as f64 / 64.0;
         let expected = if fraction <= split {
@@ -109,12 +110,12 @@ fn concatenate_sampled_pieces(
             } else {
                 fraction / split
             };
-            first.evaluate(first_domain[0] + (first_domain[1] - first_domain[0]) * local)?
+            first.evaluate(first_domain[0] + (first_domain[1] - first_domain[0]) * local).or_refuse(KernelStage::Sew, "evaluate")?
         } else {
             let local = (fraction - split) / (1.0 - split);
-            second.evaluate(second_domain[0] + (second_domain[1] - second_domain[0]) * local)?
+            second.evaluate(second_domain[0] + (second_domain[1] - second_domain[0]) * local).or_refuse(KernelStage::Sew, "evaluate")?
         };
-        if joined.evaluate(fraction)?.sub(expected).length() > tolerance {
+        if joined.evaluate(fraction).or_refuse(KernelStage::Sew, "evaluate")?.sub(expected).length() > tolerance {
             return Ok(None);
         }
     }
@@ -126,9 +127,9 @@ fn concatenate_compatible_fitted_pieces(
     second: &NurbsCurve,
     split: f64,
     tolerance: f64,
-) -> Result<Option<NurbsCurve>, String> {
-    let first_domain = first.domain()?;
-    let second_domain = second.domain()?;
+) -> Result<Option<NurbsCurve>, KernelRefusal> {
+    let first_domain = first.domain().or_refuse(KernelStage::Sew, "domain")?;
+    let second_domain = second.domain().or_refuse(KernelStage::Sew, "domain")?;
     let first_curvature = curvature_at(first, first_domain[1])?;
     let second_curvature = curvature_at(second, second_domain[0])?;
     let curvature_scale = first_curvature.abs().max(second_curvature.abs()).max(1.0);
@@ -148,13 +149,13 @@ pub fn concatenate_exact_curve_pieces(
     second: &NurbsCurve,
     split: f64,
     tolerance: f64,
-) -> Result<Option<NurbsCurve>, String> {
+) -> Result<Option<NurbsCurve>, KernelRefusal> {
     if first.degree != second.degree || split <= 1e-9 || split >= 1.0 - 1e-9 {
         return Ok(None);
     }
     let degree = first.degree;
-    let [first_start, first_end] = first.domain()?;
-    let [second_start, second_end] = second.domain()?;
+    let [first_start, first_end] = first.domain().or_refuse(KernelStage::Sew, "domain")?;
+    let [second_start, second_end] = second.domain().or_refuse(KernelStage::Sew, "domain")?;
     let first_span = first_end - first_start;
     let second_span = second_end - second_start;
     if first_span <= 1e-9 || second_span <= 1e-9 {
@@ -198,16 +199,16 @@ pub fn concatenate_exact_curve_pieces(
     knots.extend_from_slice(&second_knots[degree + 1..]);
     let mut controls = first.control_points.clone();
     controls.extend_from_slice(&scaled_second[1..]);
-    let joined = NurbsCurve::new(degree, knots, controls)?;
+    let joined = NurbsCurve::new(degree, knots, controls).or_refuse(KernelStage::Sew, "NurbsCurve::new")?;
     for fraction in [0.0, 0.23, 0.61, 1.0] {
         if joined
-            .evaluate(split * fraction)?
-            .sub(first.evaluate(first_start + first_span * fraction)?)
+            .evaluate(split * fraction).or_refuse(KernelStage::Sew, "evaluate")?
+            .sub(first.evaluate(first_start + first_span * fraction).or_refuse(KernelStage::Sew, "evaluate")?)
             .length()
             > tolerance
             || joined
-                .evaluate(split + (1.0 - split) * fraction)?
-                .sub(second.evaluate(second_start + second_span * fraction)?)
+                .evaluate(split + (1.0 - split) * fraction).or_refuse(KernelStage::Sew, "evaluate")?
+                .sub(second.evaluate(second_start + second_span * fraction).or_refuse(KernelStage::Sew, "evaluate")?)
                 .length()
                 > tolerance
         {
@@ -223,20 +224,20 @@ fn pcurve_matches_edge(
     curve: &NurbsCurve,
     reversed: bool,
     tolerance: f64,
-) -> Result<bool, String> {
-    let [p0, p1] = pcurve.domain()?;
-    let [c0, c1] = curve.domain()?;
+) -> Result<bool, KernelRefusal> {
+    let [p0, p1] = pcurve.domain().or_refuse(KernelStage::Sew, "domain")?;
+    let [c0, c1] = curve.domain().or_refuse(KernelStage::Sew, "domain")?;
     // Topology validation rejects pcurve-vs-edge deviations above 4e-3.
     // Guard merges below that threshold with a 25% margin so a concatenation
     // with drifted parameterization is rebuilt or skipped before validation.
     let geometry_tolerance = (tolerance * 1.5).max(1e-4).min(3e-3);
     for index in 0..=32 {
         let fraction = index as f64 / 32.0;
-        let uv = pcurve.evaluate(p0 + (p1 - p0) * fraction)?;
+        let uv = pcurve.evaluate(p0 + (p1 - p0) * fraction).or_refuse(KernelStage::Sew, "evaluate")?;
         let curve_fraction = if reversed { 1.0 - fraction } else { fraction };
         if surface
-            .evaluate(uv.x, uv.y)?
-            .sub(curve.evaluate(c0 + (c1 - c0) * curve_fraction)?)
+            .evaluate(uv.x, uv.y).or_refuse(KernelStage::Sew, "evaluate")?
+            .sub(curve.evaluate(c0 + (c1 - c0) * curve_fraction).or_refuse(KernelStage::Sew, "evaluate")?)
             .length()
             > geometry_tolerance
         {
@@ -333,7 +334,7 @@ const EXACT_CLOSING_TURN: f64 = 1.4142135623730951e-5;
 pub fn merge_curve_continuation_edges(
     solid: &BrepSolid,
     tolerance: f64,
-) -> Result<BrepSolid, String> {
+) -> Result<BrepSolid, KernelRefusal> {
     merge_curve_continuation_edges_impl(solid, tolerance, None)
 }
 
@@ -344,7 +345,7 @@ pub(crate) fn merge_curve_continuation_edges_at(
     solid: &BrepSolid,
     tolerance: f64,
     at: &rustc_hash::FxHashSet<u64>,
-) -> Result<BrepSolid, String> {
+) -> Result<BrepSolid, KernelRefusal> {
     merge_curve_continuation_edges_impl(solid, tolerance, Some(at))
 }
 
@@ -352,7 +353,7 @@ fn merge_curve_continuation_edges_impl(
     solid: &BrepSolid,
     tolerance: f64,
     at: Option<&rustc_hash::FxHashSet<u64>>,
-) -> Result<BrepSolid, String> {
+) -> Result<BrepSolid, KernelRefusal> {
     let mut result = solid.clone();
     let mut rejected = rustc_hash::FxHashSet::<(u64, u64)>::default();
     loop {
@@ -478,16 +479,16 @@ fn merge_curve_continuation_edges_impl(
                     } else {
                         second_edge.t1
                     };
-                    let mut first_tangent = first_edge.curve.derivatives(first_parameter, 1)?[1];
-                    let mut second_tangent = second_edge.curve.derivatives(second_parameter, 1)?[1];
+                    let mut first_tangent = first_edge.curve.derivatives(first_parameter, 1).or_refuse(KernelStage::Sew, "derivatives")?[1];
+                    let mut second_tangent = second_edge.curve.derivatives(second_parameter, 1).or_refuse(KernelStage::Sew, "derivatives")?[1];
                     if !first.forward {
                         first_tangent = first_tangent.scale(-1.0);
                     }
                     if !second.forward {
                         second_tangent = second_tangent.scale(-1.0);
                     }
-                    let first_tangent = first_tangent.normalized()?;
-                    let second_tangent = second_tangent.normalized()?;
+                    let first_tangent = first_tangent.normalized().or_refuse(KernelStage::Sew, "normalized")?;
+                    let second_tangent = second_tangent.normalized().or_refuse(KernelStage::Sew, "normalized")?;
                     // Measure the turn as an ANGLE, not as `1 - dot`: the dot
                     // of two near-parallel unit vectors loses most of its
                     // digits to cancellation exactly where this test lives.
@@ -534,17 +535,17 @@ fn merge_curve_continuation_edges_impl(
                     let mut second_curve =
                         trimmed_curve(&second_edge.curve, second_edge.t0, second_edge.t1)?;
                     if !first.forward {
-                        first_curve = first_curve.reversed()?;
+                        first_curve = first_curve.reversed().or_refuse(KernelStage::Sew, "reversed")?;
                     }
                     if !second.forward {
-                        second_curve = second_curve.reversed()?;
+                        second_curve = second_curve.reversed().or_refuse(KernelStage::Sew, "reversed")?;
                     }
                     let first_span = {
-                        let domain = first_curve.domain()?;
+                        let domain = first_curve.domain().or_refuse(KernelStage::Sew, "domain")?;
                         domain[1] - domain[0]
                     };
                     let second_span = {
-                        let domain = second_curve.domain()?;
+                        let domain = second_curve.domain().or_refuse(KernelStage::Sew, "domain")?;
                         domain[1] - domain[0]
                     };
                     let split = first_span / (first_span + second_span);
@@ -583,7 +584,7 @@ fn merge_curve_continuation_edges_impl(
                         )? {
                         (pcurve, false)
                     } else {
-                        (build_pcurve_on_surface(&face.surface, &curve)?, true)
+                        (build_pcurve_on_surface(&face.surface, &curve).or_refuse(KernelStage::Sew, "build_pcurve_on_surface")?, true)
                     };
                     let mate_loop = &faces[first_mate.face].loops[first_mate.loop_index];
                     let second_mate_coedge = &mate_loop.coedges[second_mate.coedge];
@@ -600,8 +601,8 @@ fn merge_curve_continuation_edges_impl(
                         (
                             build_pcurve_on_surface(
                                 &faces[first_mate.face].surface,
-                                &curve.reversed()?,
-                            )?,
+                                &curve.reversed().or_refuse(KernelStage::Sew, "reversed")?,
+                            ).or_refuse(KernelStage::Sew, "build_pcurve_on_surface")?,
                             true,
                         )
                     };
@@ -614,7 +615,7 @@ fn merge_curve_continuation_edges_impl(
                             split,
                             tolerance * 10.0,
                         )?
-                        .unwrap_or(build_pcurve_on_surface(&face.surface, &curve)?);
+                        .unwrap_or(build_pcurve_on_surface(&face.surface, &curve).or_refuse(KernelStage::Sew, "build_pcurve_on_surface")?);
                         pcurve_rebuilt = true;
                     }
                     if !pcurve_matches_edge(
@@ -632,8 +633,8 @@ fn merge_curve_continuation_edges_impl(
                         )?
                         .unwrap_or(build_pcurve_on_surface(
                             &faces[first_mate.face].surface,
-                            &curve.reversed()?,
-                        )?);
+                            &curve.reversed().or_refuse(KernelStage::Sew, "reversed")?,
+                        ).or_refuse(KernelStage::Sew, "build_pcurve_on_surface")?);
                         pcurve_rebuilt = true;
                     }
                     if !pcurve_matches_edge(&face.surface, &face_pcurve, &curve, false, tolerance)?
@@ -650,11 +651,11 @@ fn merge_curve_continuation_edges_impl(
                         // uniformly) cannot both track the curve linearly.
                         // Re-derive BOTH pcurves from the merged curve so all
                         // three share one parameterization by construction.
-                        face_pcurve = build_pcurve_on_surface(&face.surface, &curve)?;
+                        face_pcurve = build_pcurve_on_surface(&face.surface, &curve).or_refuse(KernelStage::Sew, "build_pcurve_on_surface")?;
                         mate_pcurve = build_pcurve_on_surface(
                             &faces[first_mate.face].surface,
-                            &curve.reversed()?,
-                        )?;
+                            &curve.reversed().or_refuse(KernelStage::Sew, "reversed")?,
+                        ).or_refuse(KernelStage::Sew, "build_pcurve_on_surface")?;
                         pcurve_rebuilt = true;
                         // Both p-curves now come from the merged curve, so
                         // there is no third construction left to fall back to
@@ -673,7 +674,7 @@ fn merge_curve_continuation_edges_impl(
                     // Before committing topology, enforce the same adaptive
                     // contract as final validation so a narrow fitted-curve
                     // error cannot be introduced by coalescing.
-                    let [candidate_t0, candidate_t1] = curve.domain()?;
+                    let [candidate_t0, candidate_t1] = curve.domain().or_refuse(KernelStage::Sew, "domain")?;
                     let candidate_edge = EdgeRecord {
                         id: first.edge_id,
                         curve: curve.clone(),
@@ -695,7 +696,7 @@ fn merge_curve_continuation_edges_impl(
                         &candidate_edge,
                         true,
                         pcurve_contract,
-                    )? > pcurve_contract
+                    ).or_refuse(KernelStage::Sew, "adaptive_coedge_error")? > pcurve_contract
                         || adaptive_coedge_error(
                             &faces[first_mate.face].surface,
                             &mate_pcurve,
@@ -703,7 +704,7 @@ fn merge_curve_continuation_edges_impl(
                             &candidate_edge,
                             false,
                             pcurve_contract,
-                        )? > pcurve_contract
+                        ).or_refuse(KernelStage::Sew, "adaptive_coedge_error")? > pcurve_contract
                     {
                         rejected.insert(pair_key);
                         continue;
@@ -745,8 +746,8 @@ fn merge_curve_continuation_edges_impl(
         else {
             break;
         };
-        let before_face = parameter_space_area(faces[face_index])?;
-        let before_mate = parameter_space_area(faces[first_mate.face])?;
+        let before_face = parameter_space_area(faces[face_index]).or_refuse(KernelStage::Sew, "parameter_space_area")?;
+        let before_mate = parameter_space_area(faces[first_mate.face]).or_refuse(KernelStage::Sew, "parameter_space_area")?;
         drop(faces);
         drop(edges);
         let mut candidate = result.clone();
@@ -757,7 +758,7 @@ fn merge_curve_continuation_edges_impl(
             .max()
             .unwrap_or(0)
             + 1;
-        let domain = curve.domain()?;
+        let domain = curve.domain().or_refuse(KernelStage::Sew, "domain")?;
         let merged_name = candidate
             .edges
             .iter()
@@ -841,10 +842,10 @@ fn merge_curve_continuation_edges_impl(
         };
         if !preserves_area(
             before_face,
-            parameter_space_area(candidate_faces[face_index])?,
+            parameter_space_area(candidate_faces[face_index]).or_refuse(KernelStage::Sew, "parameter_space_area")?,
         ) || !preserves_area(
             before_mate,
-            parameter_space_area(candidate_faces[first_mate.face])?,
+            parameter_space_area(candidate_faces[first_mate.face]).or_refuse(KernelStage::Sew, "parameter_space_area")?,
         ) {
             // This exact pair crosses a periodic p-curve branch. Leave it
             // split and continue searching for other safe candidates.

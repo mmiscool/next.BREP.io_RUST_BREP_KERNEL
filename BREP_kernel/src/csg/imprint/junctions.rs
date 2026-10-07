@@ -136,11 +136,18 @@ pub(super) fn canonicalize_imprint_junctions(
             }
         }
     }
+    // Freeze an intrinsic reference before any vertex is polished. A world
+    // origin gives identical junctions different acceptance budgets after a
+    // rigid placement. Relative coordinates also avoid summing large offsets.
+    let reference = junction_reference(result.vertices.iter().map(|vertex| vertex.point));
+    if std::env::var("BREP_DEBUG_CANONICAL_JUNCTIONS").is_ok() {
+        eprintln!("JUNCTION-REFERENCE point={reference:?} vertices={}", result.vertices.len());
+    }
     let mut canonical_vertices = result
         .vertices
         .iter()
         .filter(|vertex| {
-            let limit = tolerance * 10.0 * (1.0 + vertex.point.length());
+            let limit = tolerance * 10.0 * (1.0 + vertex.point.sub(reference).length());
             incident_points.get(&vertex.id).is_some_and(|points| {
                 points
                     .iter()
@@ -150,6 +157,20 @@ pub(super) fn canonicalize_imprint_junctions(
         .map(|vertex| vertex.id)
         .collect::<HashSet<_>>();
     
+    if std::env::var("BREP_DEBUG_CANONICAL_JUNCTIONS").is_ok() {
+        for vertex in &result.vertices {
+            let limit = tolerance * 10.0 * (1.0 + vertex.point.sub(reference).length());
+            let gap = incident_points.get(&vertex.id).map(|points| points.iter()
+                .map(|p| p.sub(vertex.point).length()).fold(0.0_f64, f64::max));
+            let old_limit = tolerance * 10.0 * (1.0 + vertex.point.length());
+            let old_member = gap.is_some_and(|gap| gap <= old_limit);
+            let member = canonical_vertices.contains(&vertex.id);
+            eprintln!("JUNCTION-MEMBERSHIP vertex={} point={:?} tolerance={tolerance:.17e} incident_gap={gap:?} limit={limit:.17e} canonical={member} old_limit={old_limit:.17e} old_canonical={old_member} flip={}", vertex.id, vertex.point, member != old_member);
+            if member != old_member {
+                eprintln!("JUNCTION-FLIP vertex={} faces={:?} pieces={:?}", vertex.id, incident_faces.get(&vertex.id), result.pieces.iter().filter(|piece| piece.start_vertex_id == vertex.id || piece.end_vertex_id == vertex.id).map(|piece| piece.id).collect::<Vec<_>>());
+            }
+        }
+    }
     for vertex in &mut result.vertices {
         if !canonical_vertices.contains(&vertex.id) {
             continue;
@@ -197,7 +218,13 @@ pub(super) fn canonicalize_imprint_junctions(
         }
         // Do not degrade an already-exact analytic intersection just to make
         // an over-constrained average marginally different.
-        let maximum_move = tolerance * 100.0 * (1.0 + vertex.point.length());
+        let maximum_move = tolerance * 100.0 * (1.0 + vertex.point.sub(reference).length());
+        if std::env::var("BREP_DEBUG_CANONICAL_JUNCTIONS").is_ok() {
+            eprintln!("JUNCTION-POLISH vertex={} point={:?} candidate={best:?} tolerance={tolerance:.17e} movement={:.17e} maximum_move={maximum_move:.17e} before_residual={:.17e} best_residual={best_residual:.17e} inside_movement={}", vertex.id, vertex.point, best.sub(vertex.point).length(), residual(vertex.point)?, best.sub(vertex.point).length() <= maximum_move);
+            let old_maximum = tolerance * 100.0 * (1.0 + vertex.point.length());
+            let movement = best.sub(vertex.point).length();
+            eprintln!("JUNCTION-OLD-MOVE vertex={} old_maximum={old_maximum:.17e} old_inside={} flip={} faces={keys:?}", vertex.id, movement <= old_maximum, (movement <= old_maximum) != (movement <= maximum_move));
+        }
         if best.sub(vertex.point).length() <= maximum_move
             && best_residual <= residual(vertex.point)?
         {
@@ -252,6 +279,16 @@ pub(super) fn canonicalize_imprint_junctions(
 /// floors at 1.0). The residual-merge bands must reflect the part's ACTUAL size:
 /// flooring at 1.0 would give a sub-unit part a merge radius the size of a whole
 /// unit, collapsing genuinely-distinct near-tangent junctions.
+fn junction_reference(mut points: impl Iterator<Item = Vec3>) -> Vec3 {
+    let Some(anchor) = points.next() else {
+        return Vec3::default();
+    };
+    let (sum, count) = points.fold((Vec3::default(), 1usize), |(sum, count), point| {
+        (sum.add(point.sub(anchor)), count + 1)
+    });
+    anchor.add(sum.scale(1.0 / count as f64))
+}
+
 pub(super) fn raw_solid_extent(solid: &BrepSolid) -> f64 {
     if solid.vertices.is_empty() {
         return 0.0;
@@ -563,3 +600,4 @@ pub(super) fn merge_residual_coincident_vertices(
     }
     Ok(true)
 }
+

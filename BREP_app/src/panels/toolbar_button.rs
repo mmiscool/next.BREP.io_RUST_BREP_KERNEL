@@ -27,6 +27,9 @@ use crate::icons::artwork;
 /// Square edge length of a single-glyph toolbar button (min-width == height).
 pub const TOOLBAR_BTN: f32 = 28.0;
 
+/// Height of a Ribbon Large button; the row height every ribbon group reserves.
+pub const LARGE_BTN: f32 = 64.0;
+
 /// Shared flow layout for toolbar controls in every workbench. Individual
 /// controls wrap at the available width; nested non-wrapping groups would hide
 /// their buttons on narrow windows. The parent panel grows to contain each row.
@@ -74,6 +77,56 @@ pub fn button(ui: &mut egui::Ui, glyph: &str, tooltip: &str) -> egui::Response {
     ui.add(button).on_hover_text(tooltip)
 }
 
+/// Ribbon's Large presentation: catalogue artwork above the canonical label.
+pub fn large_button(ui: &mut egui::Ui, glyph: &str, label: &str, selected: bool, toggle: bool, enabled: bool) -> egui::Response {
+    let font = egui::TextStyle::Button.resolve(ui.style());
+    let text =
+        ui.fonts_mut(|f| f.layout_no_wrap(label.to_owned(), font.clone(), egui::Color32::WHITE));
+    let width = text.size().x.max(32.0) + 2.0 * ui.spacing().button_padding.x;
+    let button = egui::Button::new("").min_size(egui::vec2(width, LARGE_BTN));
+    let response = ui.add_enabled(enabled, if toggle { button.selected(selected) } else { button });
+    let color = ui
+        .style()
+        .interact_selectable(&response, selected)
+        .text_color();
+    let image_rect = egui::Rect::from_center_size(
+        egui::pos2(response.rect.center().x, response.rect.top() + 22.0),
+        egui::vec2(28.0, 28.0),
+    );
+    if let Some(icon) = artwork(glyph) {
+        egui_extras::install_image_loaders(ui.ctx());
+        let tint = if icon.mono {
+            color
+        } else if enabled && ui.is_enabled() {
+            egui::Color32::WHITE
+        } else {
+            egui::Color32::WHITE.gamma_multiply(0.4)
+        };
+        egui::Image::new(egui::ImageSource::Bytes {
+            uri: format!("bytes://brep-toolbar/{}.svg", icon.name).into(),
+            bytes: egui::load::Bytes::Static(icon.artwork_svg.as_bytes()),
+        })
+        .fit_to_exact_size(image_rect.size())
+        .tint(tint)
+        .paint_at(ui, image_rect);
+    } else {
+        ui.painter().text(
+            image_rect.center(),
+            egui::Align2::CENTER_CENTER,
+            glyph,
+            font.clone(),
+            color,
+        );
+    }
+    ui.painter().text(
+        egui::pos2(response.rect.center().x, response.rect.bottom() - 6.0),
+        egui::Align2::CENTER_BOTTOM,
+        label,
+        font,
+        color,
+    );
+    response
+}
 /// A toolbar button enabled only when `enabled` (undo/redo, selection actions).
 pub fn button_enabled(
     ui: &mut egui::Ui,
@@ -89,6 +142,11 @@ pub fn button_enabled(
 pub fn toggle(ui: &mut egui::Ui, selected: bool, glyph: &str, tooltip: &str) -> egui::Response {
     let button = glyph_button(ui, glyph).selected(selected);
     ui.add(button).on_hover_text(tooltip)
+}
+
+/// Disable a toggle as one atomic widget, preserving the wrapping row's layout.
+pub fn toggle_enabled(ui: &mut egui::Ui, enabled: bool, selected: bool, glyph: &str, tooltip: &str) -> egui::Response {
+    ui.add_enabled(enabled, glyph_button(ui, glyph).selected(selected)).on_hover_text(tooltip)
 }
 
 /// The outcome of a toolbar [`select`] combo for one frame.
@@ -268,8 +326,8 @@ pub fn select(
 /// No marker slot, unlike [`switcher_row`]: a menu of toolbar buttons has no
 /// "which one is active" tick to reserve room for — several can be pressed at
 /// once (the three display toggles), and the pressed FILL says so.
-fn menu_row_button(glyph: &str, label: &str) -> egui::Button<'static> {
-    let icon = artwork(glyph).expect("a toolbar button's glyph must be catalogued");
+pub(crate) fn menu_row_button(glyph: &str, label: &str) -> egui::Button<'static> {
+    let Some(icon) = artwork(glyph) else { return egui::Button::new(format!("{glyph} {label}")).wrap_mode(egui::TextWrapMode::Extend); };
     // The CROPPED artwork at the strip's own painted size and URI, exactly as
     // [`glyph_button`] draws it — not the switcher's padded `svg`, which paints
     // the same glyph visibly smaller. Menu and toolbar artwork share a size.

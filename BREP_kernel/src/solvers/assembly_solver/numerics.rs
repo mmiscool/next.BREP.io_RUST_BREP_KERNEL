@@ -82,6 +82,14 @@ pub(super) fn finite_diff_jacobian(
     let mut poses: Vec<Pose> = Vec::with_capacity(base.len());
     let mut rp: Vec<f64> = Vec::with_capacity(m);
     let mut rm: Vec<f64> = Vec::with_capacity(m);
+    let mut angular_rows = vec![false; m];
+    let mut row = 0;
+    for atom in atoms {
+        if matches!(atom, Atom::DirAngle(..)) {
+            angular_rows[row] = true;
+        }
+        row += atom.rows();
+    }
     for col in 0..n {
         let h = col_step[col];
         delta[col] = h;
@@ -91,7 +99,16 @@ pub(super) fn finite_diff_jacobian(
         delta[col] = 0.0;
         let inv = 1.0 / (2.0 * h);
         for i in 0..m {
-            jac[i][col] = (rp[i] - rm[i]) * inv;
+            let difference = rp[i] - rm[i];
+            // A central difference can straddle the angular residual's ±π
+            // cut. Unwrap that difference, otherwise a half-turn edit gets
+            // a spurious enormous derivative and cannot leave its old pose.
+            let difference = if angular_rows[i] {
+                difference.sin().atan2(difference.cos())
+            } else {
+                difference
+            };
+            jac[i][col] = difference * inv;
         }
     }
     jac
@@ -375,7 +392,7 @@ pub(super) fn prepare(
                 track(a.p);
                 track(b.p);
             }
-            Atom::DirMatch(..) | Atom::DirCross(..) | Atom::DirDot(..) => {}
+            Atom::DirMatch(..) | Atom::DirCross(..) | Atom::DirDot(..) | Atom::DirAngle(..) => {}
         }
     }
     let tight = options.tolerance * scale;

@@ -188,6 +188,16 @@ pub enum MateKind {
         direction_b: [f64; 3],
         angle_deg: f64,
     },
+    /// Signed angle from A to B about `axis_a` (in body A's local frame).
+    /// Measures B's projection into the plane perpendicular to the axis.
+    /// The wrapped angular residual removes one DOF and retains the rotation
+    /// sense at negative/reflex targets and through parallel configurations.
+    DirectedAngle {
+        direction_a: [f64; 3],
+        direction_b: [f64; 3],
+        axis_a: [f64; 3],
+        angle_deg: f64,
+    },
     /// Directions parallel (2 DOF removed).
     Parallel {
         direction_a: [f64; 3],

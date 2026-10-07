@@ -137,6 +137,7 @@ fn owning_component_of_ref(element: &str) -> Option<&str> {
 /// visibility (every member visible), selection (any member selected), the
 /// constraint-status rollup, and the nested chain grouping.
 pub(crate) fn snapshot(state: &mut EngineState, updates: &UpdateComponents) -> Vec<ComponentRow> {
+    let occurrence_attributes = state.occurrence_attributes_all();
     // Worst-status rollup per component, from the constraint state's element
     // refs (each ref's outermost prefix names its component).
     let mut rollup: HashMap<String, String> = HashMap::new();
@@ -195,7 +196,7 @@ pub(crate) fn snapshot(state: &mut EngineState, updates: &UpdateComponents) -> V
                 .map(|name| name.strip_prefix(&prefix).unwrap_or(name))
                 .collect();
             ComponentRow {
-                label: format!("{} ({})", record.part_name, record.id),
+                label: format!("{} ({})", occurrence_attributes.get(&record.id).and_then(|a| a.get("Name")).and_then(serde_json::Value::as_str).unwrap_or(&record.part_name), record.id),
                 part_name: record.part_name.clone(),
                 fixed: record.fixed,
                 outdated: updates.is_outdated(&record.part_name),

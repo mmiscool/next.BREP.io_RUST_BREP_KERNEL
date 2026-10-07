@@ -1008,6 +1008,8 @@ pub fn schema() -> serde_json::Value {
     "type": "SM.CUTOUT",
     "shortName": "SM.CUTOUT",
     "longName": "SM Cutout",
+    "ribbonPath": "Home/Sheet Metal/Cutout",
+    "commandSize": "Compact",
     "displayBuilder": false,
     "inputParamsSchema": {
         "id": {

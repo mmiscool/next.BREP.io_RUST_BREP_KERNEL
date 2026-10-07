@@ -443,6 +443,65 @@ impl<'a> ImprintBuilder<'a> {
                             }
                         }
                     }
+                    // TANGENT HIT AT AN EDGE VERTEX (slab + end cylinder,
+                    // hosted report 2026-10-03): a section tangent to an edge
+                    // is located only to about sqrt(gap/κ) along it — the gap
+                    // grows as s²/2R, so the finder's 1e-12 floor is 1.3e-5 of
+                    // travel at R = 90 — and may stop just past the endpoint
+                    // guard's weld band when the true contact IS the edge's own
+                    // vertex (the cap circle touching the slab's height edges at
+                    // their corners). Splitting there mints a sliver edge and a
+                    // second vertex the arc's two copies then end on
+                    // differently (open loops on both caps, eight one-use
+                    // edges). An endpoint that lies on the section, with the
+                    // edge hugging the section the whole way from the hit, is
+                    // the junction the hit was reaching for: re-point the hit
+                    // at it, and `push_edge_split`'s endpoint guard declines the
+                    // split while the curve split lands on the vertex. The
+                    // band is the imprint's own overlap floor, below which no
+                    // distinct topology can survive; no weld band moved.
+                    if hit.tangential {
+                        // Edge side first: the edge's own vertex is the
+                        // junction (the slab corner the cap circle touches).
+                        // Then the section side: the section ends ON the edge
+                        // (the slab's height edge copied onto the cylinder,
+                        // touching the cap ring at the copy's own end) — the
+                        // end-guard below then withholds the sliver curve split
+                        // and the edge split lands where the real end projects.
+                        if let Some((snapped_t, snapped_u)) = tangent_hit_endpoint(
+                            &edge.curve,
+                            edge.t0,
+                            edge.t1,
+                            edge_parameter,
+                            &curve,
+                            whole_start,
+                            whole_end,
+                            overlap_limit,
+                        )? {
+                            edge_parameter = snapped_t;
+                            curve_parameter = snapped_u;
+                            fuzzy_junction = None;
+                        } else if let Some((snapped_s, snapped_t)) = tangent_hit_endpoint(
+                            &curve,
+                            whole_start,
+                            whole_end,
+                            curve_parameter,
+                            &edge.curve,
+                            edge.t0,
+                            edge.t1,
+                            overlap_limit,
+                        )? {
+                            curve_parameter = snapped_s;
+                            edge_parameter = snapped_t;
+                            fuzzy_junction = None;
+                        }
+                        if std::env::var("BREP_DEBUG_TANGENT_HIT").is_ok() {
+                            eprintln!(
+                                "tangent hit edge=({},{}) hit.t={:.9} hit.s={:.9} -> t={:.9} s={:.9}",
+                                face.operand, edge.id, hit.t, hit.s, edge_parameter, curve_parameter
+                            );
+                        }
+                    }
                     let [start, end] = curve.domain().or_refuse(KernelStage::Intersect, "domain")?;
                     let interior = curve_parameter > start + 1e-7
                         && curve_parameter < end - 1e-7

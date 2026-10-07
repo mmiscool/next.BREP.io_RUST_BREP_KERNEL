@@ -345,6 +345,21 @@ pub struct Lock {
 /// thing a CAD document hangs off.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Revision {
+    /// Whether the saved document produces BREP faces. Derived, never user editable.
+    #[serde(default)]
+    pub has_geometry: bool,
+    /// Hash of the document used to derive geometry metadata.
+    #[serde(default)]
+    pub geometry_content_hash: String,
+    /// Values defined by this part's numbered PLM type, owned by this revision.
+    #[serde(default)]
+    pub attributes: BTreeMap<String, serde_json::Value>,
+    #[serde(default)]
+    pub attributes_initialized: bool,
+    /// Individual placements, identified by their CAD feature ids.
+    #[serde(default)]
+    pub occurrences: Vec<crate::bom_config::Occurrence>,
+    /// The revision label itself; its database key is (part_id, id).
     pub id: String,
     /// What people call it. FREE TEXT: whoever creates the revision may type it,
     /// and the store enforces only that it is unique within its part. `A, B, C`
@@ -503,6 +518,11 @@ impl Revision {
     /// A new, empty draft.
     pub fn draft(id: String, label: String, created_by: String, stamp: Timestamp) -> Self {
         Revision {
+            has_geometry: false,
+            geometry_content_hash: String::new(),
+            attributes: BTreeMap::new(),
+            attributes_initialized: false,
+            occurrences: Vec::new(),
             id,
             label,
             lifecycle: Lifecycle::Draft,
@@ -547,13 +567,14 @@ impl Revision {
     /// The store key this revision's document lives at — the key the CAD app's
     /// `sourceKey` becomes. `part/<part id>/rev/<revision id>`.
     pub fn document_key(&self, part_id: &str) -> String {
-        format!("part/{part_id}/rev/{}", self.id)
+        crate::identity::document_key(part_id, &self.id)
     }
 }
 
 /// A part: permanent identity, the number, and its revisions oldest-first.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Part {
+    /// The part number itself, stored directly as the database primary key.
     pub id: String,
     /// The number (`CPART000000001`, or whatever the type's mode accepted).
     /// Unique across the server, compared without regard to ASCII case.
@@ -730,6 +751,10 @@ impl BakeStatus {
 /// at most one.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Bake {
+    /// A Force resave job rebuilds this exact saved document. Older generated
+    /// jobs have no snapshot hash and retain their existing bake behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resave_hash: Option<String>,
     pub status: BakeStatus,
     /// Why it was queued ("generated from family CPART000000012 row M6x20").
     #[serde(default)]
@@ -1280,8 +1305,8 @@ pub struct ChangeOrder {
 
 impl ChangeOrder {
     /// The item acting on `revision_id`, if any.
-    pub fn item(&self, revision_id: &str) -> Option<&EcoItem> {
-        self.items.iter().find(|i| i.revision_id == revision_id)
+    pub fn item(&self, part_id: &str, revision_id: &str) -> Option<&EcoItem> {
+        self.items.iter().find(|i| i.part_id == part_id && i.revision_id == revision_id)
     }
 }
 
@@ -1322,12 +1347,29 @@ pub fn default_eco_numbering() -> PartType {
 // Server settings — the administrator's policy choices
 // ===========================================================================
 
+/// Configurable names and availability of workflow status options.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StatusOption {
+    pub state: Lifecycle,
+    pub name: String,
+    pub enabled: bool,
+}
+
+pub fn default_status_options() -> Vec<StatusOption> {
+    [(Lifecycle::Draft, "none"), (Lifecycle::InReview, "review"),
+     (Lifecycle::Released, "released"), (Lifecycle::Obsolete, "obsolete"),
+     (Lifecycle::Superseded, "superseded")].into_iter()
+        .map(|(state, name)| StatusOption { state, name: name.into(), enabled: true }).collect()
+}
+
 /// Policy the administrator decides, not code (round 7). Each defaults
 /// to the PERMISSIVE choice, and a file written before settings existed
 /// loads with those defaults.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
+    pub setup_completed: bool,
+    pub status_options: Vec<StatusOption>,
     /// Refuse changes to a part's category and attribute values while the
     /// part has no revision in work and at least one released one — so a
     /// released part's catalog values change only by starting a new revision.
@@ -1378,6 +1420,8 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
+            setup_completed: false,
+            status_options: default_status_options(),
             lock_released_attributes: false,
             allow_multiple_open_drafts: true,
             require_released_children: false,

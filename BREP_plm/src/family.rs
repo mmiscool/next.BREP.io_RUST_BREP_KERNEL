@@ -261,9 +261,10 @@ pub struct CopyView {
     pub bake: Option<&'static str>,
 }
 
-/// One job in the bake queue. Its id is the revision's id.
+/// One job in the bake queue. Its id is the readable part/revision document key.
 #[derive(Debug, Clone, Serialize)]
 pub struct BakeJob {
+    pub expected_hash: Option<String>,
     pub id: String,
     pub part_id: String,
     pub number: String,
@@ -282,11 +283,30 @@ pub struct BakeJob {
     pub error: String,
     pub finished_at: Option<u64>,
     pub document_key: String,
-    /// `family`, `template`, or empty.
+    /// `family`, `template`, `resave`, or empty.
     pub source: &'static str,
-    /// Who has the revision checked out. A checked-out revision is not
-    /// handed to a worker until it is checked in.
+    /// Who has the revision checked out. A resave may refresh the requester's
+    /// own checkout; another user's checkout waits for check-in.
     pub locked_by: Option<String>,
+    pub waiting_on_checkout: bool,
+}
+
+#[derive(Debug, Default, Serialize)]
+pub struct BakeCounts {
+    pub pending: usize,
+    pub claimed: usize,
+    pub done: usize,
+    pub failed: usize,
+    pub waiting: usize,
+}
+
+#[derive(Debug, Serialize)]
+pub struct BakePage {
+    pub jobs: Vec<BakeJob>,
+    pub total: usize,
+    pub offset: usize,
+    pub next: Option<usize>,
+    pub counts: BakeCounts,
 }
 
 // ===========================================================================
@@ -411,6 +431,7 @@ fn bake_name(revision: &Revision) -> Option<&'static str> {
 
 fn new_bake(user: &User, reason: String) -> Bake {
     Bake {
+        resave_hash: None,
         status: BakeStatus::Pending,
         reason,
         requested_by: user.id.clone(),
@@ -859,7 +880,7 @@ impl Db {
         values: &serde_json::Map<String, Value>,
     ) -> Result<(), Error> {
         let values = values.clone();
-        let key = format!("part/{part_id}/rev/{revision_id}");
+        let key = crate::identity::document_key(part_id, revision_id);
         let path = self.document_path(&key)?;
         let hash = auth::content_hash(body);
         let size = body.len() as u64;
@@ -884,6 +905,8 @@ impl Db {
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent).map_err(Error::internal)?;
             }
+            revision.has_geometry = crate::geometry::contains_geometry(body);
+            revision.geometry_content_hash = hash.clone();
             write_atomic(&path, body).map_err(Error::internal)?;
             revision.content_hash = hash.clone();
             revision.size = size;
@@ -1038,7 +1061,7 @@ impl Db {
     /// Write a seed's own document (its table changed), re-checking inside
     /// the lock that `user` may write the revision.
     fn write_seed(&self, user: &User, part_id: &str, revision_id: &str, body: &str) -> Result<(), Error> {
-        let key = format!("part/{part_id}/rev/{revision_id}");
+        let key = crate::identity::document_key(part_id, revision_id);
         let path = self.document_path(&key)?;
         let hash = auth::content_hash(body);
         let size = body.len() as u64;
@@ -1053,6 +1076,8 @@ impl Db {
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent).map_err(Error::internal)?;
             }
+            revision.has_geometry = crate::geometry::contains_geometry(body);
+            revision.geometry_content_hash = hash.clone();
             write_atomic(&path, body).map_err(Error::internal)?;
             revision.content_hash = hash;
             revision.size = size;
@@ -1181,29 +1206,118 @@ impl Db {
 // The bake queue
 // ===========================================================================
 
+#[derive(Debug, Serialize)]
+pub struct ResaveReport {
+    pub jobs: Vec<BakeJob>,
+    pub failures: Vec<ResaveFailure>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ResaveFailure {
+    pub part_id: String,
+    pub error: String,
+}
+
 impl Db {
+    /// Queue the latest revision of each selected part in the existing bake
+    /// queue. The snapshot and all accepted jobs persist in one transaction.
+    pub fn queue_resaves(&self, user: &User, parts: &[String]) -> Result<ResaveReport, Error> {
+        if !user.can_author() { return Err(Error::forbidden("Force resave requires author permission")); }
+        self.mutate(|state| {
+            let mut report = ResaveReport { jobs: Vec::new(), failures: Vec::new() };
+            let mut seen = std::collections::BTreeSet::new();
+            for part_key in parts {
+                if !seen.insert(part_key) { continue; }
+                let queued = (|| {
+                    let part = state.part_by_id_or_number(part_key).ok_or_else(|| Error::not_found("part"))?;
+                    let revision = part.revisions.last().ok_or_else(|| Error::not_found("revision"))?;
+                    if !revision.lifecycle.is_editable() {
+                        return Err(Error::conflict(format!("Revision {} is {}", revision.label, revision.lifecycle.as_str())));
+                    }
+                    if revision.content_hash.is_empty() { return Err(Error::conflict("No saved model")); }
+                    if let Some(bake) = revision.bake.as_ref().filter(|b| b.status != BakeStatus::Done) {
+                        if bake.resave_hash.is_none() { return Err(Error::conflict("a generated bake is already queued; complete or retry it first")); }
+                        if matches!(bake.status, BakeStatus::Pending | BakeStatus::Claimed) {
+                            return Ok(job_view(state, part, revision, bake));
+                        }
+                    }
+                    let (part_id, revision_id, hash) = (part.id.clone(), revision.id.clone(), revision.content_hash.clone());
+                    let revision = crate::db::find_revision_mut(state, &part_id, &revision_id)?.1;
+                    let attempts = revision.bake.as_ref().map(|b| b.attempts).unwrap_or_default();
+                    let mut bake = new_bake(user, "Force resave model and thumbnail".into());
+                    bake.resave_hash = Some(hash);
+                    bake.attempts = attempts;
+                    revision.bake = Some(bake);
+                    state.touch(format!("part/{part_id}/rev/{revision_id}"));
+                    let part = state.part(&part_id).expect("found above");
+                    let revision = part.revision(&revision_id).expect("found above");
+                    Ok(job_view(state, part, revision, revision.bake.as_ref().expect("just queued")))
+                })();
+                match queued {
+                    Ok(job) => report.jobs.push(job),
+                    Err(error) => report.failures.push(ResaveFailure {part_id:part_key.clone(),error:error.message}),
+                }
+            }
+            Ok(report)
+        })
+    }
+
     /// The bake jobs, oldest first. `status` narrows to one status; `all`
     /// includes finished jobs, which are otherwise left out.
     pub fn bake_jobs(&self, status: &str) -> Vec<BakeJob> {
+        self.bake_jobs_page(status, 0, None, None).jobs
+    }
+
+    /// Count matching jobs, but build detailed views only for the requested page.
+    /// `ids` restricts progress to one user's batch, including jobs on other pages.
+    pub fn bake_jobs_page(&self, status: &str, offset: usize, limit: Option<usize>, ids: Option<&[String]>) -> BakePage {
         let status = status.trim().to_ascii_lowercase();
-        let mut jobs: Vec<BakeJob> = self.read(|state| {
-            state
+        let limit = limit.map(|size| size.max(1));
+        let ids = ids.map(|ids| ids.iter().map(String::as_str).collect::<std::collections::HashSet<_>>());
+        self.read(|state| {
+            let mut entries: Vec<_> = state
                 .parts
                 .iter()
                 .flat_map(|part| part.revisions.iter().map(move |r| (part, r)))
                 .filter_map(|(part, revision)| {
                     let bake = revision.bake.as_ref()?;
+                    if ids.as_ref().is_some_and(|ids| !ids.contains(revision.document_key(&part.id).as_str())) {
+                        return None;
+                    }
                     let keep = match status.as_str() {
                         "" => bake.status != BakeStatus::Done,
                         "all" => true,
                         wanted => bake.status.as_str() == wanted,
                     };
-                    keep.then(|| job_view(state, part, revision, bake))
+                    keep.then_some((part, revision, bake))
                 })
-                .collect()
-        });
-        jobs.sort_by(|a, b| a.requested_at.cmp(&b.requested_at).then_with(|| a.number.cmp(&b.number)));
-        jobs
+                .collect();
+            entries.sort_by(|(a, ar, ab), (b, br, bb)| {
+                ab.requested_at.cmp(&bb.requested_at).then_with(|| a.number.cmp(&b.number)).then_with(|| ar.id.cmp(&br.id))
+            });
+            let total = entries.len();
+            let mut counts = BakeCounts::default();
+            for (_, revision, bake) in &entries {
+                match bake.status {
+                    BakeStatus::Pending => {
+                        counts.pending += 1;
+                        if !bake_can_write_checkout(revision, bake.claimed_by.as_deref().unwrap_or("")) { counts.waiting += 1; }
+                    }
+                    BakeStatus::Claimed => counts.claimed += 1,
+                    BakeStatus::Done => counts.done += 1,
+                    BakeStatus::Failed => counts.failed += 1,
+                }
+            }
+            // If a status filter shrank during polling, return its last page.
+            let offset = match limit {
+                Some(size) if offset >= total => total.saturating_sub(1) / size * size,
+                _ => offset,
+            };
+            let jobs: Vec<_> = entries.iter().skip(offset).take(limit.unwrap_or(total))
+                .map(|(part, revision, bake)| job_view(state, part, revision, bake)).collect();
+            let next = (offset.saturating_add(jobs.len()) < total).then_some(offset.saturating_add(jobs.len()));
+            BakePage { jobs, total, offset, next, counts }
+        })
     }
 
     /// Take a bake job: `id`, or else the oldest one free. A job is free when
@@ -1214,9 +1328,9 @@ impl Db {
         let id = id.map(str::to_string);
         self.mutate(move |state| {
             let stamp = now();
-            // A revision someone has checked out waits: a draft is written
-            // only by its lock holder, and a worker is not one.
-            let unlocked = |revision: &Revision| revision.lock.as_ref().is_none_or(|l| l.user_id == worker_id);
+            // Generated bakes wait for checkout. A resave can refresh the
+            // requester's checkout while preserving checkout ownership.
+            let unlocked = |revision: &Revision| bake_can_write_checkout(revision, &worker_id);
             let free = |revision: &Revision| {
                 unlocked(revision)
                     && revision.bake.as_ref().is_some_and(|b| match b.status {
@@ -1309,15 +1423,15 @@ impl Db {
         }
         let hash = auth::content_hash(body);
         let size = body.len() as u64;
+        let embedded = crate::thumbnail::embedded(self.root(), body)?;
         let worker_id = worker.id.clone();
         let id = id.to_string();
-        let path_of = |part_id: &str| self.document_path(&format!("part/{part_id}/rev/{id}"));
-        let part_id = self.read(|state| locate(state, &id).map(|(p, _)| p.id.clone()))?;
-        let path = path_of(&part_id)?;
+        let (part_id, revision_id) = self.read(|state| locate(state, &id).map(|(p, r)| (p.id.clone(), r.id.clone())))?;
+        let path = self.document_path(&id)?;
         self.mutate(move |state| {
             let (part, revision) = locate(state, &id)?;
             held_by(state, part, revision, &worker_id)?;
-            if let Some(lock) = revision.lock.as_ref().filter(|l| l.user_id != worker_id) {
+            if let Some(lock) = revision.lock.as_ref().filter(|_| !bake_can_write_checkout(revision, &worker_id)) {
                 return Err(Error::conflict(format!(
                     "{} revision {} was checked out by {} after the bake was claimed — report the bake failed, or wait and retry",
                     part.number,
@@ -1333,25 +1447,41 @@ impl Db {
                     revision.lifecycle.as_str()
                 )));
             }
+            let resave_hash = revision.bake.as_ref().and_then(|b| b.resave_hash.clone());
+            if let Some(expected) = &resave_hash {
+                if revision.content_hash != *expected {
+                    return Err(Error::conflict("the model changed after Force resave was queued; retry it"));
+                }
+            }
             let key = revision.document_key(&part.id);
-            let revision = crate::db::find_revision_mut(state, &part_id, &id)?.1;
+            let revision = crate::db::find_revision_mut(state, &part_id, &revision_id)?.1;
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent).map_err(Error::internal)?;
             }
+            let old_thumbnail = revision.thumbnail.as_ref().map(|t| t.sha256.clone());
+            let thumbnail = embedded.as_ref().map(|image| image.place(self.root(), &hash, &worker_id)).transpose()?;
+            revision.has_geometry = crate::geometry::contains_geometry(body);
+            revision.geometry_content_hash = hash.clone();
             write_atomic(&path, body).map_err(Error::internal)?;
+            if let Some(thumbnail) = thumbnail { revision.thumbnail = Some(thumbnail); }
             revision.content_hash = hash.clone();
             revision.size = size;
             revision.modified_at = now();
             if let Some(stamp) = revision.family.as_mut() {
-                stamp.generated_hash = hash;
+                if resave_hash.as_ref().is_none_or(|expected| stamp.generated_hash == *expected) {
+                    stamp.generated_hash = hash;
+                }
             }
             let bake = revision.bake.as_mut().expect("held_by checked it");
             bake.status = BakeStatus::Done;
             bake.error.clear();
             bake.finished_by = Some(worker_id);
             bake.finished_at = Some(now());
-            crate::review::document_changed(state, &part_id, &id);
+            crate::review::document_changed(state, &part_id, &revision_id);
             state.touch(key);
+            if embedded.is_some() {
+                if let Some(old) = old_thumbnail { crate::attach::remove_if_unreferenced(state, self.root(), &old)?; }
+            }
             Ok(())
         })
     }
@@ -1369,8 +1499,8 @@ impl Db {
         self.mutate(move |state| {
             let (part, revision) = locate(state, &id)?;
             held_by(state, part, revision, &worker_id)?;
-            let part_id = part.id.clone();
-            let revision = crate::db::find_revision_mut(state, &part_id, &id)?.1;
+            let (part_id, revision_id) = (part.id.clone(), revision.id.clone());
+            let revision = crate::db::find_revision_mut(state, &part_id, &revision_id)?.1;
             let bake = revision.bake.as_mut().expect("held_by checked it");
             bake.status = BakeStatus::Failed;
             bake.error = error;
@@ -1387,8 +1517,8 @@ impl Db {
         self.mutate(move |state| {
             let (part, revision) = locate(state, &id)?;
             let (number, label) = (part.number.clone(), revision.label.clone());
-            let part_id = part.id.clone();
-            let revision = crate::db::find_revision_mut(state, &part_id, &id)?.1;
+            let (part_id, revision_id) = (part.id.clone(), revision.id.clone());
+            let revision = crate::db::find_revision_mut(state, &part_id, &revision_id)?.1;
             if !revision.lifecycle.is_editable() {
                 return Err(Error::conflict(format!("{number} revision {label} is no longer in work")));
             }
@@ -1400,6 +1530,7 @@ impl Db {
                 )));
             }
             bake.status = BakeStatus::Pending;
+            if bake.resave_hash.is_some() { bake.resave_hash = Some(revision.content_hash.clone()); }
             bake.claimed_by = None;
             bake.claimed_at = None;
             Ok(())
@@ -1407,14 +1538,14 @@ impl Db {
     }
 }
 
-/// The part and revision a bake job id (a revision id) names.
+/// Resolve the readable part/revision pair carried by a bake job.
 fn locate<'a>(state: &'a State, id: &str) -> Result<(&'a Part, &'a Revision), Error> {
-    state
-        .parts
-        .iter()
-        .find_map(|p| p.revision(id).map(|r| (p, r)))
-        .filter(|(_, r)| r.bake.is_some())
-        .ok_or_else(|| Error::not_found("bake job"))
+    let (part_id, revision_id) = crate::identity::split_key(id)
+        .ok_or_else(|| Error::bad_request("a bake job needs its part/revision document key"))?;
+    let part = state.part(&part_id).ok_or_else(|| Error::not_found("bake job"))?;
+    let revision = part.revision(&revision_id).filter(|r| r.bake.is_some())
+        .ok_or_else(|| Error::not_found("bake job"))?;
+    Ok((part, revision))
 }
 
 /// Refuse unless `worker` holds the job's claim.
@@ -1442,7 +1573,8 @@ fn held_by(state: &State, part: &Part, revision: &Revision, worker_id: &str) -> 
 
 fn job_view(state: &State, part: &Part, revision: &Revision, bake: &Bake) -> BakeJob {
     BakeJob {
-        id: revision.id.clone(),
+        expected_hash: bake.resave_hash.clone(),
+        id: revision.document_key(&part.id),
         part_id: part.id.clone(),
         number: part.number.clone(),
         name: part.name.clone(),
@@ -1461,7 +1593,9 @@ fn job_view(state: &State, part: &Part, revision: &Revision, bake: &Bake) -> Bak
         error: bake.error.clone(),
         finished_at: bake.finished_at,
         document_key: revision.document_key(&part.id),
-        source: if revision.family.is_some() {
+        source: if bake.resave_hash.is_some() {
+            "resave"
+        } else if revision.family.is_some() {
             "family"
         } else if revision.template.is_some() {
             "template"
@@ -1469,5 +1603,13 @@ fn job_view(state: &State, part: &Part, revision: &Revision, bake: &Bake) -> Bak
             ""
         },
         locked_by: revision.lock.as_ref().map(|l| user_name(state, &l.user_id)),
+        waiting_on_checkout: !bake_can_write_checkout(revision, bake.claimed_by.as_deref().unwrap_or("")),
     }
+}
+
+fn bake_can_write_checkout(revision: &Revision, worker_id: &str) -> bool {
+    revision.lock.as_ref().is_none_or(|lock| {
+        lock.user_id == worker_id || revision.bake.as_ref()
+            .is_some_and(|bake| bake.resave_hash.is_some() && lock.user_id == bake.requested_by)
+    })
 }

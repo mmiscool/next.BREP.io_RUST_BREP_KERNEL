@@ -82,7 +82,7 @@ pub struct BrepApp {
     pub(crate) viewport: Viewport,
     /// The single persistence seam for settings, layout, and model documents
     /// (native filesystem / wasm IndexedDB + download/upload).
-    model_store: Box<dyn ModelStore>,
+    pub(crate) model_store: Box<dyn ModelStore>,
 
     // --- one small state value per panel --------------------------------------
     /// Top toolbar: undo/redo, wireframe toggle, zoom-to-fit + standard views,
@@ -116,6 +116,8 @@ pub struct BrepApp {
     /// (movable + resizable, toggled from the toolbar gear button), no longer a
     /// left-panel section.
     settings: SettingsPanel,
+    pub(crate) plugins: crate::plugins::PluginsPanel,
+    pub(crate) javascript: crate::javascript::JavaScriptEditor,
     /// The active document's OWN BOM attributes (Part Number, Material, Mass,
     /// …) as a floating window, toggled from the toolbar's Properties button.
     /// Document-level, not selection-level: entity inspection is the context
@@ -347,8 +349,12 @@ impl BrepApp {
     /// document's identity belongs to the store it came from, and a dirty one's
     /// work has nowhere to go in a new store.
     pub(crate) fn reconnect_blocker(&self) -> Option<String> {
+        self.reconnect_blocker_with(crate::document::Document::is_dirty)
+    }
+
+    fn reconnect_blocker_with(&self, is_dirty: impl Fn(&crate::document::Document) -> bool) -> Option<String> {
         let named = self.docs.iter().filter(|d| d.name().is_some()).count();
-        let dirty = self.docs.iter().filter(|d| d.is_dirty()).count();
+        let dirty = self.docs.iter().filter(|d| is_dirty(d)).count();
         match (named, dirty) {
             (0, 0) => None,
             (_, 0) => Some(format!("{named} document(s) from this store are open: close them, then Connect now (or restart)")),
@@ -394,7 +400,10 @@ impl BrepApp {
         }
         self.docs.wrap_engine_factory(fresh);
         self.dock = DockState::new(self.model_store.as_ref());
-        self.recovery.arm(crate::recovery::read_entries(self.model_store.as_ref()));
+        self.recovery.arm_from_store(
+            self.model_store.as_ref(),
+            self.docs.engine().settings.disable_recovery_prompt,
+        );
         self.file = FileDialog::new();
         self.update_components = UpdateComponents::new();
         Ok(format!("connected to {url} as {username}"))
@@ -445,6 +454,12 @@ impl BrepApp {
     /// Build the app with host-supplied options: an isolated store (a host
     /// MUST pass one) and whether to start on the seed model.
     pub fn new_with(cc: &eframe::CreationContext<'_>, opts: crate::automation::AppOptions) -> Result<Self, String> {
+        // Keep overflow discoverable without hovering or scrolling first, in
+        // both themes and every child UI (including eCAD and plugin panels).
+        // ScrollArea's default VisibleWhenNeeded still hides bars that aren't needed.
+        cc.egui_ctx.all_styles_mut(|style| {
+            style.spacing.scroll = egui::style::ScrollStyle::solid();
+        });
         let crate::automation::AppOptions { store: opt_store, seed } = opts;
         let render_state = cc
             .wgpu_render_state
@@ -476,6 +491,9 @@ impl BrepApp {
         // a runner owns the resident kernel state of the document it executes,
         // so one shared between documents would apply a background run against
         // the wrong registry. See `crate::document`.
+        let plugins = crate::plugins::PluginsPanel::new(model_store.as_ref());
+        let javascript = crate::javascript::JavaScriptEditor::new(model_store.as_ref());
+        let plugin_packages = plugins.packages.clone();
         let engine_factory: EngineFactory = Box::new(move || {
             let mut state = EngineState::new();
             // Native: run the whole history — and per-object measurement queries — on a
@@ -488,6 +506,11 @@ impl BrepApp {
             // (which never hit this wasm path) keep the default synchronous InlineRunner.
             #[cfg(target_arch = "wasm32")]
             state.set_runner(Box::new(crate::worker::WorkerRunner::new()));
+            if !plugin_packages.borrow().is_empty() {
+                if let Err(error) = crate::plugins::restore(&mut state, &plugin_packages.borrow()) {
+                    log::error!("Plugin restore failed: {error}");
+                }
+            }
             state.set_viewcube_enabled(true);
             // Partial-override apply: unknown/absent keys keep their defaults.
             if let Some(saved) = &saved_settings {
@@ -510,7 +533,7 @@ impl BrepApp {
         // The autosave blob from a session that ended with unsaved work: offer
         // it back (a prompt, never an automatic restore — see `crate::recovery`).
         let mut recovery = crate::recovery::RecoveryPanel::new();
-        recovery.arm(crate::recovery::read_entries(model_store.as_ref()));
+        recovery.arm_from_store(model_store.as_ref(), docs.engine().settings.disable_recovery_prompt);
 
         // The settings panel seeds its working JSON from the (post-load) engine
         // settings so the widgets reflect the persisted state on first paint.
@@ -559,6 +582,8 @@ impl BrepApp {
             info: crate::panels::info::InfoPanel::new(),
             diagnostics,
             settings,
+            plugins,
+            javascript,
             part_properties,
             history: HistoryPanel::new(),
             scene: ScenePanel::new(),
@@ -703,6 +728,9 @@ impl BrepApp {
             Some(_) => !popup_open && brep_ecad_egui::keys_reach_editor(ctx),
             None => !popup_open,
         };
+        if crate::javascript::JavaScriptEditor::editing_source(ctx) {
+            return;
+        }
         let (redo, undo, esc) = ctx.input_mut(|i| {
             let redo = i.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::Z)
                 || i.consume_key(Modifiers::COMMAND, Key::Y);
@@ -828,37 +856,14 @@ impl BrepApp {
         }
     }
 
-    /// EDIT PART (assemblies §8.5): open the component's SOURCE document in its
-    /// own tab — or focus the tab already holding it. Editing a component IS
-    /// opening its part now; the assembly picks the change up through the
-    /// outdated badge / Update Components once the part is saved, so there is no
-    /// session to finish and nothing to stash.
-    ///
-    /// A part with no store document under its `sourceKey` (an embedded-only
-    /// part — a headless STEP import, or one whose write failed) has no file to
-    /// open, and says so rather than doing nothing.
+    /// Open the component source, offering to recover a missing file from the
+    /// assembly's embedded part definition.
     fn edit_part(&mut self, component_id: &str) {
-        let source =
-            crate::panels::component_actions::part_source_key(self.docs.engine(), component_id);
-        let now = source.as_deref().map(|key| crate::store::read_now(self.model_store.as_ref(), key));
-        match source {
-            Some(key) if matches!(now, Some(crate::store::ReadNow::Ready(_))) => {
-                self.file
-                    .open_document(&mut self.docs, self.model_store.as_ref(), &key);
-            }
-            Some(key) if now == Some(crate::store::ReadNow::Loading) => {
-                self.docs.engine_mut().push_notice(format!(
-                    "This part's source document '{key}' is still loading — Edit Part again in a moment"
-                ))
-            }
-            Some(key) => self.docs.engine_mut().push_notice(format!(
-                "This part's source document '{key}' is no longer in storage — nothing to open"
-            )),
-            None => self.docs.engine_mut().push_notice(
-                "This part is embedded in the assembly — it has no source document to open"
-                    .to_string(),
-            ),
-        }
+        self.file.edit_component_part(
+            &mut self.docs,
+            self.model_store.as_ref(),
+            component_id,
+        );
     }
 
     /// Draw an isolated preview while the destination document remains untouched.
@@ -1055,7 +1060,12 @@ impl BrepApp {
         self.bug_report.request(ctx, self.docs.engine(), &self.diagnostics);
     }
 
-    /// Bring a dock pane to the front (`show_pane`).
+    /// Activate an available declarative panel using its stable package ID.
+    pub(crate) fn show_plugin_panel(&mut self, id: &str) -> Result<(), String> {
+        self.dock.show_plugin_panel(self.docs.engine(), id)
+    }
+
+    /// Bring a built-in dock pane to the front (`show_pane`).
     pub fn show_pane(&mut self, kind: PaneKind) {
         self.dock.show_pane(kind);
     }
@@ -1127,6 +1137,11 @@ impl BrepApp {
             if let Err(error) = engine.sheet_add_ordinate(None, axis, None, Vec::new()) {
                 engine.push_notice(format!("Ordinate set: {error}"));
             }
+            return true;
+        }
+        if id == crate::workbench::drawing::BOM_BUTTON_ID {
+            let engine = self.docs.engine_mut();
+            if let Err(error) = engine.sheet_insert_bom() { engine.push_notice(format!("BOM table: {error}")); }
             return true;
         }
         if id == crate::workbench::drawing::SECTION_BUTTON_ID {
@@ -1285,6 +1300,11 @@ impl eframe::App for BrepApp {
         // `&mut self` call).
         let ctx = ui.ctx().clone();
 
+        self.plugins.finish_installations(&mut self.docs, self.model_store.as_ref());
+        self.plugins.sync_documents(&mut self.docs);
+        self.javascript.poll(&ctx, &mut self.docs, self.model_store.as_ref());
+        self.plugins.poll(&ctx, self.docs.engine_mut(), self.model_store.as_ref());
+
         // Phase 2 of the automation frame (§4.4): mutations run before any
         // panel draws, so this frame shows their effect.
         #[cfg(feature = "automation")]
@@ -1309,6 +1329,10 @@ impl eframe::App for BrepApp {
         // in some earlier frame (a tab click, a close, an Open), and every
         // shared panel is still holding the previous document's transient state.
         if self.active_document != self.docs.active_id() {
+            if !self.javascript.running_in(self.active_document) {
+                for doc in self.docs.iter_mut() { if doc.id() == self.active_document { doc.engine.cancel_plugin_action(); } }
+            }
+            self.plugins.close_action();
             self.active_document = self.docs.active_id();
             self.reset_document_scoped_state();
         }
@@ -1532,6 +1556,7 @@ impl eframe::App for BrepApp {
         // --- top toolbar: primary actions, drawn FIRST so its top strip is
         // reserved above the left panel + central viewport. A clicked File button
         // returns an action the file dialog acts on (open its modal / save / new).
+        self.toolbar.read_only = !self.docs.active().access().is_editable();
         let doc = self.docs.active_mut();
         let toolbar_outcome = self.toolbar.show(
             ui,
@@ -1542,9 +1567,21 @@ impl eframe::App for BrepApp {
             &mut self.part_properties.open,
             &mut self.info.open,
         );
+        if toolbar_outcome.plugins { self.plugins.open = !self.plugins.open; }
+        if toolbar_outcome.javascript { self.javascript.open = !self.javascript.open; }
+        if let Some(id) = toolbar_outcome.plugin_action {
+            if let Err(error) = self.plugins.open_action(self.docs.engine(), &id) { self.plugins.error = Some(error); }
+        }
+        self.plugins.active_document = self.docs.active_id();
+        self.plugins.show(&ctx, self.docs.engine_mut(), self.model_store.as_ref());
+        self.javascript.show(&ctx, &mut self.docs, self.model_store.as_ref());
         // An inbox row opens its review or change order in the PLM pane.
         for event in toolbar_outcome.plm_review {
             self.plm.open_review(event);
+        }
+        if let Some(name) = toolbar_outcome.recent_document {
+            self.file
+                .open_document(&mut self.docs, self.model_store.as_ref(), &name);
         }
         if let Some(action) = toolbar_outcome.file {
             self.file
@@ -1580,7 +1617,15 @@ impl eframe::App for BrepApp {
         // A read-only document (a PLM revision not checked out, or released)
         // draws the strip disabled: every button on it creates something.
         self.workbench_toolbar.read_only = !self.docs.active().access().is_editable();
-        let actions = self.workbench_toolbar.show(ui, self.docs.engine());
+        let actions = if self.docs.engine().settings.toolbar_style
+            == brep_render::style::ToolbarStyle::Classic
+        {
+            self.workbench_toolbar.show(ui, self.docs.engine())
+        } else {
+            self.workbench_toolbar
+                .set_ribbon_hits(self.toolbar.home_hits());
+            toolbar_outcome.creation
+        };
         if let Some(type_code) = actions.feature {
             self.history
                 .add_feature_of_type(self.docs.engine_mut(), &type_code);
@@ -1770,6 +1815,7 @@ impl eframe::App for BrepApp {
             self.viewport.show(ui, self.docs.engine_mut());
             DockState::retract_all(DockContext {
                 docs: &mut self.docs,
+                plugins: &mut self.plugins,
                 viewport: &mut self.viewport,
                 history: &mut self.history,
                 bom: &mut self.bom,
@@ -1794,6 +1840,7 @@ impl eframe::App for BrepApp {
                 ui,
                 DockContext {
                     docs: &mut self.docs,
+                    plugins: &mut self.plugins,
                     viewport: &mut self.viewport,
                     history: &mut self.history,
                     bom: &mut self.bom,
@@ -1856,6 +1903,7 @@ impl eframe::App for BrepApp {
         // closed; also polls for a completed async import each frame.
         self.file
             .show(&ctx, &mut self.docs, self.model_store.as_ref());
+        self.plm.save_prompt(&ctx, &mut self.docs, &mut self.file, self.model_store.as_ref());
 
         // --- crash recovery: the boot prompt, then the debounced autosave -----
         // Drawn with the same ctx-level modal treatment as the file dialog. The
@@ -1892,14 +1940,32 @@ impl eframe::App for BrepApp {
         // this dialog.
         self.bug_report.show(&ctx, self.docs.engine_mut());
 
-        // --- Info: the licences + this session's diagnostics, a floating window
-        // toggled from the toolbar's info button. Idempotent when closed.
-        self.info.show(&ctx, &self.diagnostics);
+        // --- Info: the licences + this session's diagnostics + the MCP start
+        // button, a floating window toggled from the toolbar's info button.
+        // Idempotent when closed. The server's state is read here, each frame
+        // the window is open, and a click is answered here: the shell owns the
+        // queue the server attaches to and the adapter line its session names.
+        #[cfg(all(not(target_arch = "wasm32"), feature = "mcp"))]
+        let mcp_view = if self.info.open { crate::mcp::info_view() } else { crate::panels::info::McpView::Unavailable };
+        #[cfg(not(all(not(target_arch = "wasm32"), feature = "mcp")))]
+        let mcp_view = crate::panels::info::McpView::Unavailable;
+        self.info.show(&ctx, &self.diagnostics, &mcp_view);
+        #[cfg(all(not(target_arch = "wasm32"), feature = "mcp"))]
+        if self.info.take_mcp_start() {
+            // The failure is already in `mcp::status()`, which the window
+            // shows next frame, and on stderr in the same words.
+            let _ = crate::mcp::start_from_window(self.automation.clone(), self.diagnostics.adapter_line());
+        }
 
         // --- Settings: a floating (movable + resizable) window, toggled from the
         // toolbar gear button, drawn at ctx level like Properties so it floats
         // over the shell. Idempotent when closed. Replaces the old sidebar section.
-        self.settings.reconnect_blocker = self.reconnect_blocker();
+        // This preview runs every frame, including when Settings is closed.
+        // Exact dirty checks serialize the whole assembly; use the tab's cached
+        // marker here. reconnect_plm still checks the exact saved bytes before
+        // switching stores, including metadata edits the marker may not see.
+        self.settings.reconnect_blocker =
+            self.reconnect_blocker_with(crate::document::Document::dirty_marker);
         self.settings
             .show(&ctx, self.docs.engine_mut(), self.model_store.as_ref());
         // The PLM tab's Connect now: switch this session to the PLM live.
@@ -1915,6 +1981,7 @@ impl eframe::App for BrepApp {
         // must be able to see WHICH part they are annotating.
         let part_title = self.docs.active().title();
         let part_document = self.docs.active().id();
+        self.part_properties.configure_plm(self.model_store.plm_client(), self.docs.active().name());
         self.part_properties
             .show(&ctx, self.docs.engine_mut(), &part_title, part_document);
 
@@ -1928,6 +1995,7 @@ impl eframe::App for BrepApp {
         {
             let mut focus: Option<String> = None;
             let mut info_targets: Vec<String> = Vec::new();
+            let mut plugin_action = None;
             let mut component_request: Option<ComponentActionRequest> = None;
             // Anchor the overlay to the RIGHT edge of the 3D VIEW (the viewport
             // tile), not the window — so it stays glued to the viewport wherever
@@ -1956,6 +2024,7 @@ impl eframe::App for BrepApp {
                         let outcome = self.context_bar.card(ui, self.docs.engine_mut());
                         focus = outcome.focus;
                         info_targets = outcome.info_targets;
+                        plugin_action = outcome.plugin_action;
                         component_request = outcome.component;
                     }
                 });
@@ -1964,6 +2033,9 @@ impl eframe::App for BrepApp {
             }
             // The Info action returns one target per selected entity — open (or, on
             // dedup, keep) a pinned Info window for each. Drawn below.
+            if let Some(id) = plugin_action {
+                if let Err(e) = self.plugins.open_action(self.docs.engine(), &id) { self.plugins.error = Some(e); }
+            }
             if !info_targets.is_empty() {
                 self.info_windows.open_for(&info_targets, self.viewport.last_rect());
             }
@@ -2065,7 +2137,7 @@ impl eframe::App for BrepApp {
             );
             crate::automation::registry::publish("__brepFileHit", "file dialog widget rects", &self.file.hits_json());
             crate::automation::registry::publish("__brepModel", "model signature: solid count, triangle count, per-solid bounds (change detection)", &self.model_signature_json());
-            crate::automation::registry::publish("__brepReport", "last run report {featureErrors, featureNotes, featureFulfilment, featureRefusals (only when a feature failed with a typed refusal), unresolved, displayErrors, featureTimings, featureOutputs}", &self.docs.engine().history_report_json());
+            crate::automation::registry::publish("__brepReport", "last run report {featureErrors, featureNotes, featureFulfilment, featureRefusals (only when a feature failed with a typed refusal), featureApproximations (only when a successful feature carries a measured approximation: feature id → [{code, body, measured, bar, volume_bound, edges, message, summary}]), unresolved, displayErrors, featureTimings, featureOutputs}", &self.docs.engine().history_report_json());
             // The in-flight run: whether one is pending, the feature the runner
             // says it is executing, and the feature a cancelled run was stuck on.
             crate::automation::registry::publish("__brepRun", "in-flight run {pending, progress:{generation,index,total,featureId,featureType}|null, cancelled}",
@@ -2101,17 +2173,15 @@ impl eframe::App for BrepApp {
                 })
                 .to_string(),
             );
-            crate::automation::registry::publish("__brepToolbar", "primary toolbar rects: file:* undo redo fit projection wireframe show:* properties settings help info bug workbench workbench:item:<id> workbench:btn:<id> (all toolbar controls wrap to the available width; explicit menu entries publish workbench:btn: while open)", &self.toolbar.hits_json());
+            crate::automation::registry::publish("__brepToolbar", "toolbar rects: shared File menu file:* and workbench:item:<id>; Ribbon tabs/overflow ribbon:* and Home creation wbtb:*; command keys undo redo fit projection wireframe show:* help info bug workbench:btn:<id>. Classic wraps its controls; Ribbon compacts Large commands before whole-group overflow. Keys appear when their widgets are rendered; menu entries appear while open", &self.toolbar.hits_json());
             // The workbench actions strip's button rects (`wbtb:feature:<type>` /
             // `wbtb:constraint:<type>` / `wbtb:annotation:<type>`); an empty map
             // while the strip is hidden.
-            crate::automation::registry::publish("__brepWorkbenchToolbar", "workbench actions strip rects: wbtb:* feature:type constraint:type annotation:type (empty while hidden)", &self.workbench_toolbar.hits_json());
+            crate::automation::registry::publish("__brepWorkbenchToolbar", "creation rects: wbtb:* feature:type constraint:type annotation:type, from the Classic workbench strip or Ribbon Home; empty while hidden or another Ribbon tab is selected", &self.workbench_toolbar.hits_json());
             // The PLM pane (a PLM session only): its sections' widget rects,
             // `plm/section:<id>` and `plm/<section>:<widget>`, and the active
             // document's access and revision.
-            crate::automation::registry::publish("__brepPlmHit", "PLM pane rects: section:<id>, lifecycle:revision:<label>, lifecycle:verb:<check-out|check-in|break-lock|release|new-revision|submit|review|open-change-order>, lifecycle:new-label, lifecycle:history:load, review:<submit:<reviewers|due|note|go>|decide:<comment|approve|reject>|comment:<body|post>|eco:<note|submit|release|item:<rev id>>|close>, attachments:<export:pdf|export:step|reload|file:<id>|download:<id>|staged:<kind|part|revision|note|attach|cancel>>", &self.plm.hits_json());
-            crate::automation::registry::publish("__brepPlmInbox", "the toolbar's review inbox badge: {count, open, waitingOnMe:[{kind,title,target,revision,key}], submitted:[…], problem}; null until the first answer (and outside a PLM session)", &self.toolbar.inbox().state_json());
-            crate::automation::registry::publish("__brepPlmReview", "the PLM pane's review section: {subject:{kind:revision,part,revision}|{kind:eco,eco}, state, round:{status,approvals,stale,required,met,live,canDecide}, comments, message:{refused}|{warned}, busy}; null when nothing is open", &self.plm.review_json());
+            crate::automation::registry::publish("__brepPlmHit", "PLM pane rects: section:lifecycle, lifecycle:revision:<label>, lifecycle:verb:check-out, save:<yes|no|remember>, web:<summary|revisions|attachments|structure|history|parts|workspace|reviews|ecos>", &self.plm.hits_json());
             crate::automation::registry::publish("__brepPlmDoc", "the active document on the PLM: {access:{editable, reason}, plmDocument, revision:{id,label,lifecycle,lockedBy,lockedByMe}, busy, message, offered:[verb key], files:{staged:{name,mediaType,kind,size,target}, revision:[name], part:[name], problem, notice, status, busy}}; null with no PLM session", &self.plm.state_json(&self.docs));
             // The queued toast texts — the only trace of a refusal the app shows
             // as a transient card (e.g. a constraint the strip could not add).
@@ -2125,6 +2195,11 @@ impl eframe::App for BrepApp {
             // same split the Info window's Performance rows show.
             crate::automation::registry::publish("__brepPerf", "rolling per-frame timings in ms {frames, window, dt, ui, publish, sync, fit, overlays, draw} each {avg,p95,max}", &crate::perf::json());
             crate::automation::registry::publish("__brepBugHit", "bug report panel widget rects", &self.bug_report.hits_json());
+            // The JavaScript editor window: its outer rect against the surface
+            // it may fill, and its widget rects (`javascript/panel:clip`,
+            // `javascript/source`, `javascript/output`, the buttons).
+            crate::automation::registry::publish("__brepJavascript", "JavaScript editor window {open, rect:[x,y,w,h] or null while closed, surface:[w,h], running, output}", &self.javascript.state_json());
+            crate::automation::registry::publish("__brepJavascriptHit", "JavaScript editor window widget rects (panel:clip, run, cancel, save, open, export, help, example, source, output); empty while the window is closed", &self.javascript.hits_json());
             // The wire harness: the document's connections + the last run's
             // routing report (engine truth), and the panel's widget rects.
             crate::automation::registry::publish("__brepWireHarness", "wire harness connections and the last routing report", &self.docs.engine().wire_harness_state_json());
@@ -2144,6 +2219,7 @@ impl eframe::App for BrepApp {
             // `pmi:row:<id>`, `pmi:cell:<id>:<column>`, `pmi:menu:<id>`, the
             // form's `pmi:` keys).
             crate::automation::registry::publish("__brepPmi", "PMI block, report, active view, open annotation or view dialog, and the selected annotation or view", &self.docs.engine().pmi_state_json());
+            crate::automation::registry::publish("__brepPluginsHit", "Declarative plugin panel action controls", &self.plugins.panel_hits_json());
             crate::automation::registry::publish("__brepPmiHit", "PMI panel widget rects (pmi:*)", &self.pmi.hits_json());
             // The `sheets` block, which sheet the viewport draws, and the OPEN
             // sheet's whole projection — the paper, the visible edge runs and
@@ -2156,7 +2232,7 @@ impl eframe::App for BrepApp {
             // the verifier can drive the dropdown and confirm the active workbench.
             // Hit-rects for the dropdown ride in `__brepToolbar` (self.toolbar.hits).
             crate::automation::registry::publish("__brepWorkbench", "active workbench id and the available ids",
-                &crate::workbench::workbench_state_json(&self.docs.engine().settings.workbench),
+                &crate::workbench::workbench_state_scoped(self.docs.engine()).to_string(),
             );
             crate::automation::registry::publish("__brepSelection", "selection {solids, faces, edges, datums, vertices}; the name arrays are in pick order, oldest first", &self.docs.engine().selection_json());
             crate::automation::registry::publish("__brepInfoWindows", "open info windows (mass properties, topology, metadata)",

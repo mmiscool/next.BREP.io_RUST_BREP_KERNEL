@@ -210,6 +210,14 @@ impl<'a> SolidBuilder<'a> {
                         record.curve = replacement;
                         [record.t0, record.t1] = [parameters[0], parameters[SAMPLES]];
                         replaced += 1;
+                        // Named by the closure gate: a standoff this edge now has
+                        // from another carrier is this pass's, not the file's
+                        // (`builder/closure.rs`, `EdgeOrigin::Reconciled`). Three
+                        // bounded rules for declining a replacement that leaves
+                        // another carrier were measured on 2026-09-30 and none
+                        // landed: every one raised the shell residual of at least
+                        // two corpus bodies.
+                        self.reconciled_edges.insert(edge_id);
                     }
                     self.capture_stage(edge_id, || {
                         format!(
@@ -290,6 +298,12 @@ impl<'a> SolidBuilder<'a> {
         let [right_t0, right_t1] = right.domain()?;
         let left_id = self.fresh();
         let right_id = self.fresh();
+        // The pieces are the same file curve over their own spans: the
+        // closure gate names them by it.
+        if let Some(curve_ref) = self.curve_ref_of_edge.get(&edge_id).copied() {
+            self.curve_ref_of_edge.insert(left_id, curve_ref);
+            self.curve_ref_of_edge.insert(right_id, curve_ref);
+        }
         self.edges[index] = EdgeRecord {
             id: left_id,
             curve: left,

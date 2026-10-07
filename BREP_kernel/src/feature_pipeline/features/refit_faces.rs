@@ -125,6 +125,8 @@ pub fn schema() -> serde_json::Value {
     "type": "RFS",
     "shortName": "RFS",
     "longName": "Refit Faces",
+    "ribbonPath": "Home/Modeling/Refit Faces",
+    "commandSize": "Compact",
     "displayBuilder": false,
     "inputParamsSchema": {
         "id": {

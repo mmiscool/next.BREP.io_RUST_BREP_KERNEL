@@ -97,6 +97,8 @@ pub fn schema() -> serde_json::Value {
     "type": "P.PY",
     "shortName": "P.PY",
     "longName": "Primitive Pyramid",
+    "ribbonPath": "Home/Primitives/Pyramid",
+    "commandSize": "Compact",
     "displayBuilder": false,
     "inputParamsSchema": {
         "id": {

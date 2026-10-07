@@ -859,11 +859,36 @@ pub fn solid_self_intersections(
                 report.undecided += 1;
                 continue;
             };
+            // The mesh crossing's midpoint must be a point BOTH faces own: a
+            // crossing between two meshes whose witness lies outside either
+            // trim is a crossing of the tessellation, not of the body
+            // (2026-10-03, `anotherBooleanFail` ∩ sphere: four vendor
+            // cone–cone junctions convicted at 1.395e-2 from interior mesh
+            // nodes planted 0.26° past their own trims on a chart where the
+            // junction pcurve bows 2.8e-3 in u). The witness is a chord point,
+            // so only its carrier FOOT is asked of each trim (no reach test:
+            // the oblique bore-mouth control's genuine crossing sits a chord
+            // sagitta off the bore). A witness that cannot be classified
+            // leaves the pair undecided, never clear.
+            let witness = start.add(end).scale(0.5);
+            match (footprint_material(face_a, witness), footprint_material(face_b, witness)) {
+                (Some(true), Some(true)) => {}
+                (in_a, in_b) => {
+                    pierce_trace!(
+                        "pair faces {}|{} triangles {first}|{second}: crossing witness ({:.6}, {:.6}, {:.6}) in face {}: {in_a:?}, in face {}: {in_b:?} — not a point both faces own; undecided",
+                        face_a.id, face_b.id, witness.x, witness.y, witness.z, face_a.id, face_b.id
+                    );
+                    report.undecided += 1;
+                    continue;
+                }
+            }
             // TWO confirmations, asked in order, and the first one is
-            // unchanged: a triangle's OWN CORNERS must straddle the other
-            // carrier, in both directions.
-            let forward = straddle(&face_b.surface, &corners[first], options.straddle_band);
-            let backward = straddle(&face_a.surface, &corners[second], options.straddle_band);
+            // unchanged in what it asks: a triangle's OWN CORNERS must straddle
+            // the other carrier, in both directions — read over the corners
+            // the face OWNS (a tessellation node outside its own trim is not
+            // the face's material and its side counts for nothing).
+            let forward = straddle_material(face_a, &face_b.surface, &corners[first], options.straddle_band);
+            let backward = straddle_material(face_b, &face_a.surface, &corners[second], options.straddle_band);
             let corner_margin = match (forward, backward) {
                 (Some(forward), Some(backward))
                     if forward > options.straddle_band && backward > options.straddle_band =>
@@ -1474,6 +1499,129 @@ fn straddle(surface: &NurbsSurface, triangle: &[Vec3; 3], band: f64) -> Option<f
     Some(above.min(below))
 }
 
+/// `BREP_SCAN_NODE_MEMBERSHIP=0` restores the pre-2026-10-03 verdict, where a
+/// tessellation node's side of the other carrier counted whether or not the
+/// node lay inside its own face's trim. Diagnostic A/B hatch, not a policy.
+fn node_membership_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("BREP_SCAN_NODE_MEMBERSHIP").as_deref() != Ok("0"))
+}
+
+/// Is `point` a point `face` OWNS: on the face's carrier, inside (or on) its
+/// trim? `Some(false)` when the carrier foot classifies OUTSIDE the trim;
+/// `None` when the projection or the classification could not be evaluated
+/// — never a verdict, exactly as [`across_crossing`] treats its samples. A
+/// foot ON the trim counts as the face's material. The band is
+/// [`TRIM_SAMPLE_TOLERANCE`], the same the across-samples are asked with.
+///
+/// Why this question exists: a watertight tessellation's interior node is an
+/// exact point of the carrier but need not be a point of the FACE — on a
+/// highly curved chart the trim boundary between two boundary samples bows
+/// away from the UV chord, and nodes land past the trim. Their signed
+/// distances to another carrier then read a straddle the body does not have.
+fn node_material(face: &FaceRecord, point: Vec3, band: f64) -> Option<bool> {
+    if !node_membership_enabled() {
+        return Some(true);
+    }
+    let projection = project_point_to_surface(&face.surface, point).ok()?;
+    // A finite carrier clamps a point past its domain onto its boundary, and
+    // the trim then reads that boundary foot as the face's: a point the
+    // carrier does not reach within `band` is not the face's material.
+    if projection.distance > band {
+        return Some(false);
+    }
+    match parameter_point_in_face(face, Vec2 { x: projection.u, y: projection.v }, TRIM_SAMPLE_TOLERANCE) {
+        Ok(PolygonClass::Outside) => Some(false),
+        Ok(_) => Some(true),
+        Err(_) => None,
+    }
+}
+
+/// Does `face`'s trim OWN the spot under `point`: the carrier FOOT of the
+/// point classifies inside or on the trim? No reach test — a mesh crossing's
+/// midpoint is a point of two chords, off a curved carrier by the chord's
+/// sagitta even at a genuine crossing (the oblique bore-mouth control read 0
+/// confirmed with a reach test here, 2026-10-03), so the question for a
+/// witness is only whether the faces' trims cover where it lands. `None` when
+/// the projection or the classification cannot be evaluated.
+fn footprint_material(face: &FaceRecord, point: Vec3) -> Option<bool> {
+    if !node_membership_enabled() {
+        return Some(true);
+    }
+    let projection = project_point_to_surface(&face.surface, point).ok()?;
+    let (closed_u, closed_v) = face.surface.closed_directions().ok()?;
+    let domains = [face.surface.domain_u().ok()?, face.surface.domain_v().ok()?];
+    let parameters = [projection.u, projection.v];
+    let closed = [closed_u, closed_v];
+    // A closest point constrained to a finite chart boundary is not an
+    // unconstrained carrier foot when the residual has a tangential component.
+    // Keep that witness undecided. Pure normal displacement (chord sagitta)
+    // does not disqualify a foot, including a legitimate foot on the boundary.
+    // The only spatial floor here is the existing trim-sample tolerance.
+    for axis in 0..2 {
+        if closed[axis] {
+            continue;
+        }
+        let [first, last] = domains[axis];
+        let roundoff = 32.0 * f64::EPSILON * first.abs().max(last.abs()).max(last - first);
+        if parameters[axis] > first + roundoff && parameters[axis] < last - roundoff {
+            continue;
+        }
+        let derivatives = face.surface.derivatives(projection.u, projection.v, 1).ok()?;
+        let tangent = if axis == 0 { derivatives[1][0] } else { derivatives[0][1] };
+        let tangent = tangent.normalized().ok()?;
+        let tangential_residual = point.sub(projection.point).dot(tangent);
+        if !tangential_residual.is_finite() || tangential_residual.abs() > TRIM_SAMPLE_TOLERANCE {
+            return None;
+        }
+    }
+    match parameter_point_in_face(face, Vec2 { x: projection.u, y: projection.v }, TRIM_SAMPLE_TOLERANCE) {
+        Ok(PolygonClass::Outside) => Some(false),
+        Ok(_) => Some(true),
+        Err(_) => None,
+    }
+}
+
+/// [`straddle`] over the corners `own_face` OWNS: a corner outside its own
+/// trim ([`node_material`] `Some(false)`) contributes no side; a corner whose
+/// membership cannot be evaluated makes the whole reading `None`. With every
+/// corner a member this is exactly [`straddle`].
+fn straddle_material(
+    own_face: &FaceRecord,
+    other: &NurbsSurface,
+    triangle: &[Vec3; 3],
+    band: f64,
+) -> Option<f64> {
+    let mut above = 0.0f64;
+    let mut below = 0.0f64;
+    for corner in triangle {
+        match node_material(own_face, *corner, band) {
+            Some(true) => {}
+            Some(false) => {
+                pierce_trace!(
+                    "    corner ({:.6}, {:.6}, {:.6}) of face {} lies OUTSIDE its own trim; its side is not read",
+                    corner.x, corner.y, corner.z, own_face.id
+                );
+                continue;
+            }
+            None => return None,
+        }
+        let projection = project_point_to_surface(other, *corner).ok()?;
+        if projection.distance <= band {
+            continue;
+        }
+        let normal = other.normal(projection.u, projection.v).ok()?;
+        let normal = normal.normalized().ok()?;
+        let signed = corner.sub(projection.point).dot(normal);
+        if signed > 0.0 {
+            above = above.max(signed);
+        } else {
+            below = below.max(-signed);
+        }
+    }
+    Some(above.min(below))
+}
+
 /// Which confirmation convicted a [`FaceCrossing`].
 ///
 /// Recorded so a sweep can attribute every hit to the question that caught it.
@@ -1605,6 +1753,22 @@ fn pierce_direction(
             signed_distance(surface_pierced, p0),
             signed_distance(surface_pierced, p1)
         );
+        // The bracket is read from two tessellation nodes of the piercing
+        // face; a node outside that face's own trim is not the face's
+        // material, so its side says nothing about the body (2026-10-03). The
+        // pair is then UNEVALUATED along this edge — never rejected, the same
+        // rule the across-samples keep — and the trace records the readings.
+        match (node_material(face_piercing, p0, band), node_material(face_piercing, p1, band)) {
+            (Some(true), Some(true)) => {}
+            (in_p0, in_p1) => {
+                pierce_trace!(
+                    "  edge {index}: bracket endpoints in their own face {}: {in_p0:?} {in_p1:?} — not read",
+                    face_piercing.id
+                );
+                undecided = true;
+                continue;
+            }
+        }
         let bracket = match bracket_straddle(surface_pierced, p0, p1, band) {
             Margin::Cleared(value) => value,
             Margin::Failed => continue,
@@ -2871,7 +3035,7 @@ const VECTOR_AREA_QUADRATURE_DEPTH: usize = 8;
 ///
 /// The value is read off the case corpus rather than chosen: see the record's
 /// §6.3. `BREP_VECTOR_AREA_SPANS` overrides it.
-const VECTOR_AREA_SPAN_BUDGET: usize = 400_000;
+pub(crate) const VECTOR_AREA_SPAN_BUDGET: usize = 400_000;
 //                                        ^ read off the case corpus, not chosen.
 // Over its 317 shells the span count runs median 168, p90 8,278, p99 301,826,
 // max 1,842,688 — and the distribution has a GAP exactly where a budget wants
@@ -3534,6 +3698,24 @@ where
 /// nothing about an open shell, where the residual is the boundary's own
 /// vector area and not a defect.
 pub fn shell_vector_areas(solid: &BrepSolid) -> VectorAreaReport {
+    shell_vector_areas_scan(solid, vector_area_span_budget(), "raise BREP_VECTOR_AREA_SPANS to read it")
+}
+
+/// [`shell_vector_areas`] with an explicit span budget instead of the
+/// default ([`VECTOR_AREA_SPAN_BUDGET`], or `BREP_VECTOR_AREA_SPANS`). Every
+/// quadrature target, bar and reading is the same; only where the scan gives
+/// up moves. For a caller that must judge a body the default cannot afford
+/// and has a stated bound of its own (the inherited-trim refit's gate reads
+/// at most two default budgets); the public entry and its default are
+/// unchanged.
+pub(crate) fn shell_vector_areas_with_budget(solid: &BrepSolid, span_budget: usize) -> VectorAreaReport {
+    shell_vector_areas_scan(solid, span_budget, "raise the caller's span budget to read it")
+}
+
+/// The scan behind both entries; `advice` ends an over-budget row and says
+/// which budget the reader can raise (the environment's for the public
+/// entry, the caller's for an explicit one).
+fn shell_vector_areas_scan(solid: &BrepSolid, span_budget: usize, advice: &str) -> VectorAreaReport {
     let mut report = VectorAreaReport {
         shells: Vec::new(),
         unreadable: Vec::new(),
@@ -3844,15 +4026,15 @@ pub fn shell_vector_areas(solid: &BrepSolid) -> VectorAreaReport {
             // The budget, checked per face so a shell gives up on a face
             // boundary rather than part-way through a loop. `over_budget`
             // makes the shell unreadable below; it is never a residual.
-            if spans > vector_area_span_budget() {
+            if spans > span_budget {
                 over_budget = true;
                 report.unreadable.push(format!(
-                    "shell {}: gave up after {} spans on {} of {} faces (budget {}); UNJUDGED rather than clean — raise BREP_VECTOR_AREA_SPANS to read it",
+                    "shell {}: gave up after {} spans on {} of {} faces (budget {}); UNJUDGED rather than clean — {advice}",
                     shell.id,
                     spans,
                     face_areas.len() + 1,
                     shell.faces.len(),
-                    vector_area_span_budget()
+                    span_budget
                 ));
                 break;
             }

@@ -513,6 +513,8 @@ pub fn schema() -> serde_json::Value {
     "type": "S",
     "shortName": "S",
     "longName": "Sketch",
+    "ribbonPath": "Home/Reference/Sketch",
+    "commandSize": "Large",
     "displayBuilder": true,
     "inputParamsSchema": {
         "id": {

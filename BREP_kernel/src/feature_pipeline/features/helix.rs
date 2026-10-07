@@ -243,6 +243,8 @@ pub fn schema() -> serde_json::Value {
     "type": "HX",
     "shortName": "HX",
     "longName": "Helix",
+    "ribbonPath": "Home/Reference/Helix",
+    "commandSize": "Compact",
     "displayBuilder": true,
     "inputParamsSchema": {
         "id": {

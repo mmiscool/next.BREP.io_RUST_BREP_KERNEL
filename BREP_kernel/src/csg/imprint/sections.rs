@@ -154,6 +154,18 @@ pub(super) fn insert_seed_points_into_branch(points: &[Vec3], seeds: &[Vec3], to
         if near_end {
             continue;
         }
+        // One pierce point, one station. Operands already split at the
+        // section's ends (the idempotence corpus's split siblings) carry the
+        // pierce as the shared vertex of two half-edges, and both halves report
+        // the hit, so the same point arrives here twice. Inserted twice it is a
+        // zero-length chord beside the clip end, which the sliver-end evening
+        // then re-solves in place for every round it has instead of merging
+        // the sliver into its neighbour: `28_march_swap_rescue_t217` intersect
+        // kept a fit 5.9e-5 off the cylinder on the split operands where the
+        // raw operands' evening reached 4.9e-9 (2026-10-03).
+        if insertions[index].iter().any(|(_, queued)| queued.sub(*seed).length() <= tolerance) {
+            continue;
+        }
         insertions[index].push((fraction, *seed));
     }
     if insertions.iter().all(Vec::is_empty) {
@@ -1511,7 +1523,7 @@ fn join_section_pieces(
         split,
         weld,
     )
-    .or_refuse(KernelStage::Intersect, "concatenate_exact_curve_pieces")?
+    .map_err(|refusal| KernelRefusal { stage: KernelStage::Intersect, ..refusal })?
     else {
         return Ok(false);
     };
@@ -1700,7 +1712,7 @@ fn join_trims(
     }
     let span = (u1 - u0).abs().max((v1 - v0).abs()).max(1.0);
     let Some(joined) = crate::concatenate_exact_curve_pieces(first, &moved, split, 1e-9 * span)
-        .or_refuse(KernelStage::Intersect, "concatenate_exact_curve_pieces")?
+        .map_err(|refusal| KernelRefusal { stage: KernelStage::Intersect, ..refusal })?
     else {
         return Ok(None);
     };

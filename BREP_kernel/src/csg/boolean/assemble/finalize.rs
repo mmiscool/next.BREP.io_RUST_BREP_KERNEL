@@ -549,7 +549,7 @@ pub(crate) fn finalize_assembled_solid(
                 .collect::<Vec<_>>(),
         );
     }
-    let solid = merge_curve_continuation_edges(&solid, tolerance).or_refuse(KernelStage::Validate, "merge_curve_continuation_edges")?;
+    let solid = merge_curve_continuation_edges(&solid, tolerance).map_err(|refusal| KernelRefusal { stage: KernelStage::Validate, ..refusal })?;
     let issues = solid.validate();
     if !issues.is_empty() {
         let edge_by_id = solid

@@ -1,6 +1,6 @@
 [package]
 name = "BREP"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2021"
 license-file = "LICENSE.md"
 description = "BREP — umbrella crate for the BREP CAD kernel family: re-exports the geometry kernel (always) plus the gizmos, wgpu render engine, and eframe application behind feature flags."
@@ -33,15 +33,15 @@ name = "brep"
 # The geometry kernel is re-exported unconditionally as `brep::kernel`. Default
 # (serial) features; a consumer who wants rayon tessellation flips the
 # `parallel` feature below, which forwards to the kernel.
-brep_kernel = { package = "BREP_kernel", version = "0.7.0", path = "../BREP_kernel" }
+brep_kernel = { package = "BREP_kernel", version = "0.8.0", path = "../BREP_kernel" }
 # Higher layers are optional so a headless kernel consumer never compiles
 # gizmos / wgpu / eframe.
 brep_gizmos = { package = "BREP_gizmos", version = "0.2.4", path = "../BREP_gizmos", optional = true }
-brep_render = { package = "BREP_render", version = "0.6.0", path = "../BREP_render", optional = true }
-brep_app    = { package = "BREP_app",    version = "0.6.0", path = "../BREP_app",    optional = true }
+brep_render = { package = "BREP_render", version = "0.7.0", path = "../BREP_render", optional = true }
+brep_app    = { package = "BREP_app",    version = "0.7.0", path = "../BREP_app",    optional = true }
 # Recognition-to-kernel integration stays opt-in so the default facade remains
 # the same minimal, headless, WASM-clean kernel graph.
-brep_reconstruction = { package = "BREP_reconstruction", version = "0.4.0", path = "../BREP_reconstruction", optional = true }
+brep_reconstruction = { package = "BREP_reconstruction", version = "0.5.0", path = "../BREP_reconstruction", optional = true }
 
 [features]
 default = []                              # kernel only (headless geometry)

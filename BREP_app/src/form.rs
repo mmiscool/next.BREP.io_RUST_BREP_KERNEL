@@ -17,6 +17,8 @@
 //!     numbers): the user types a plain number OR a variable name / inline
 //!     equation (`width * 2`) that the kernel evaluates against the history's
 //!     `expressions` sheet; while focused, the mouse wheel steps a pure number.
+//!   * `BoundedScalar` → the same field, bounding numeric literals only when
+//!     an edit commits; the plugin runtime remains the authoritative validator.
 //!   * `Text`    → single-line edit (disabled for a read-only `id`)
 //!   * `Vec3`    → three drag values (transform position/rotation/scale)
 //!   * `Button`  → an action button; a click is surfaced to the caller by the
@@ -163,7 +165,7 @@ pub fn field_input(
             }
             (r.changed(), r.rect)
         }
-        FieldKind::Scalar { step } => {
+        FieldKind::Scalar { step } | FieldKind::BoundedScalar { step, .. } => {
             // An EXPRESSION-CAPABLE numeric field — see [`scalar_widget`], which
             // owns the whole behaviour so a `Vec3` component gets exactly the same
             // field.
@@ -175,7 +177,13 @@ pub fn field_input(
                 input_width(ui, 72.0),
             );
             let changed = committed.is_some();
-            if let Some(value) = committed {
+            if let Some(mut value) = committed {
+                if let (FieldKind::BoundedScalar { min, max, .. }, Some(number)) = (&field.kind, value.as_f64()) {
+                    let bounded = number.clamp(*min, *max);
+                    if bounded != number {
+                        value = serde_json::json!(bounded);
+                    }
+                }
                 set_at(current, path, value);
             }
             (changed, rect)

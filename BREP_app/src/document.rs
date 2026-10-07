@@ -21,9 +21,8 @@ pub mod ecad;
 pub type EngineFactory = Box<dyn Fn() -> EngineState>;
 
 /// Whether a document may be edited. Every file-based document is
-/// [`Access::Editable`]; a document opened from a PLM is [`Access::ReadOnly`]
-/// until its revision is checked out by this user (plan S3, D2), and a released
-/// revision always is.
+/// [`Access::Editable`]. PLM permissions apply to [`Document::save_access`],
+/// independently of editing the session copy.
 ///
 /// Held by the engine's history ([`brep_render::history::History::lock`]),
 /// which refuses every change to the saved document while it is read-only —
@@ -31,8 +30,7 @@ pub type EngineFactory = Box<dyn Fn() -> EngineState>;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Access {
     Editable,
-    /// `reason` is the sentence the user reads: "revision B is released and
-    /// cannot change".
+    /// `reason` explains the edit or save restriction to the user.
     ReadOnly { reason: String },
 }
 
@@ -59,6 +57,8 @@ pub struct Document {
     /// identity, not the display name — a native dialog hands back a full path
     /// and a plain Save must write back to it.
     name: Option<String>,
+    /// PLM write permission is independent of editing the session copy.
+    plm_save_access: Option<Access>,
     /// The model request JSON as of the last New / Open / Save — the baseline
     /// the dirty flag compares the live history against.
     saved_signature: Option<String>,
@@ -110,7 +110,7 @@ pub struct Document {
 }
 
 /// What the dirty flag compares: the saved document ([`EngineState::history_request_json`])
-/// WITHOUT its `workbench`.
+/// WITHOUT its `workbench` and derived `thumbnail`.
 ///
 /// The workbench is saved, so a file reopens where it was left, but it is view state
 /// and not work. Counting it made Close ask to discard documents nobody had edited:
@@ -124,9 +124,19 @@ pub struct Document {
 /// edit, and a second parse of a megabyte assembly doubles it. A test holds the two
 /// together (`the_signature_is_the_saved_document_less_its_workbench`).
 fn signature(engine: &EngineState) -> String {
+    signature_without(engine, None)
+}
+
+/// The saved-content signature with one document block left out — the
+/// baseline of a copy saved WITHOUT that block (a family member saved as a new
+/// part drops `familySource` on the copy), in the same canonical form.
+fn signature_without(engine: &EngineState, without: Option<&str>) -> String {
     let mut document: serde_json::Value =
         serde_json::from_str(&engine.history.request_json()).unwrap_or_else(|_| serde_json::json!({}));
     if let Some(object) = document.as_object_mut() {
+        if let Some(key) = without {
+            object.remove(key);
+        }
         if !engine.metadata.is_empty() {
             object.insert("metadata".into(), engine.metadata.to_json());
         }
@@ -149,6 +159,7 @@ impl Document {
         Self {
             engine,
             name: None,
+            plm_save_access: None,
             saved_signature,
             dirty_marker: false,
             marker_key: None,
@@ -174,6 +185,7 @@ impl Document {
         Self {
             engine,
             name,
+            plm_save_access: None,
             saved_signature: None,
             dirty_marker: true,
             marker_key: None,
@@ -207,6 +219,19 @@ impl Document {
         }
     }
 
+    /// Saving to the current PLM revision may be restricted while session
+    /// editing remains available. A local Save As clears this restriction.
+    pub fn save_access(&self) -> Access {
+        self.plm_save_access.clone().unwrap_or_else(|| self.access())
+    }
+
+    pub(crate) fn has_plm_save_access(&self) -> bool { self.plm_save_access.is_some() }
+
+    pub fn set_plm_save_access(&mut self, access: Access) {
+        self.plm_save_access = Some(access);
+        self.engine.history.unlock();
+    }
+
     /// The sentence to show when an edit was refused since the last call —
     /// `None` when nothing was. Called once a frame by the shell, which toasts it.
     pub fn take_refused(&mut self) -> Option<String> {
@@ -225,13 +250,16 @@ impl Document {
     }
 
     pub fn set_name(&mut self, name: Option<String>) {
+        if self.name != name { self.plm_save_access = None; }
         self.name = name;
     }
 
-    /// The tab label: the bare display name, or `untitled`.
+    /// The tab label: PLM part/revision, the bare file name, or `untitled`.
     pub fn title(&self) -> String {
         match &self.name {
-            Some(name) => crate::store::model_display_name(name),
+            Some(name) => crate::panels::plm_host::revision_of(name)
+                .map(|(part, revision)| format!("{part}/{revision}"))
+                .unwrap_or_else(|| crate::store::model_display_name(name)),
             None => "untitled".to_string(),
         }
     }
@@ -242,6 +270,20 @@ impl Document {
         self.saved_signature = Some(signature(&self.engine));
         self.dirty_marker = false;
         self.marker_key = Some(self.edit_key());
+    }
+
+    pub(crate) fn save_signature(&self) -> String { signature(&self.engine) }
+
+    /// [`Self::save_signature`] of the document with one block left out: what a
+    /// copy saved without that block has as its clean baseline.
+    pub(crate) fn save_signature_without(&self, block: &str) -> String {
+        signature_without(&self.engine, Some(block))
+    }
+
+    pub(crate) fn mark_saved_signature(&mut self, saved: String) {
+        self.saved_signature = Some(saved);
+        self.marker_key = None;
+        self.refresh_dirty_marker();
     }
 
     /// Dirty = the live model differs from the last saved/opened baseline.

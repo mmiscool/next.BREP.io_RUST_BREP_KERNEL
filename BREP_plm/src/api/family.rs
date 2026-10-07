@@ -12,6 +12,7 @@
 //! * `/api/bake/...` — the queue a headless CAD worker (the `worker` group)
 //!   takes jobs from.
 
+use axum::body::Body;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -19,7 +20,7 @@ use axum::Json;
 use serde::Deserialize;
 
 use super::{blocking, require_author, require_user, Shared};
-use crate::family::{BakeJob, FamilyView, GenerateReport, GenerateRequest, ImportReport, SpinOutRequest, TemplateView};
+use crate::family::{FamilyView, GenerateReport, GenerateRequest, ImportReport, SpinOutRequest, TemplateView};
 use crate::model::User;
 use crate::Error;
 
@@ -117,6 +118,23 @@ pub async fn spin_out(
 // The bake queue
 // ===========================================================================
 
+#[derive(Debug, Deserialize)]
+pub struct ResaveRequest {
+    pub parts: Vec<String>,
+}
+
+pub async fn resave(
+    State(db): State<Shared>,
+    headers: HeaderMap,
+    Json(body): Json<ResaveRequest>,
+) -> Result<Json<crate::family::ResaveReport>, Error> {
+    let user = require_author(&db, &headers)?;
+    if body.parts.is_empty() {
+        return Err(Error::bad_request("select parts to resave"));
+    }
+    Ok(Json(blocking(move || db.queue_resaves(&user, &body.parts)).await?))
+}
+
 /// A signed-in user in the `worker` group (or an admin).
 fn require_worker(db: &crate::db::Db, headers: &HeaderMap) -> Result<User, Error> {
     let user = require_user(db, headers)?;
@@ -130,6 +148,9 @@ fn require_worker(db: &crate::db::Db, headers: &HeaderMap) -> Result<User, Error
 pub struct Status {
     #[serde(default)]
     pub status: String,
+    pub limit: Option<usize>,
+    #[serde(default)]
+    pub offset: usize,
 }
 
 /// The queue. Anyone signed in may look; `status` narrows it, `all` includes
@@ -138,9 +159,27 @@ pub async fn jobs(
     State(db): State<Shared>,
     headers: HeaderMap,
     Query(status): Query<Status>,
-) -> Result<Json<Vec<BakeJob>>, Error> {
+) -> Result<Json<crate::family::BakePage>, Error> {
     require_user(&db, &headers)?;
-    Ok(Json(db.bake_jobs(&status.status)))
+    let limit = status.limit.unwrap_or(50).clamp(1, super::parts::MAX_PAGE);
+    Ok(Json(db.bake_jobs_page(&status.status, status.offset, Some(limit), None)))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct Progress {
+    pub ids: Vec<String>,
+    pub limit: Option<usize>,
+    #[serde(default)]
+    pub offset: usize,
+}
+
+/// Batch counts cover all selected jobs; details are bounded to one page.
+pub async fn progress(
+    State(db): State<Shared>, headers: HeaderMap, Json(body): Json<Progress>,
+) -> Result<Json<crate::family::BakePage>, Error> {
+    require_user(&db, &headers)?;
+    let limit = body.limit.unwrap_or(50).clamp(1, super::parts::MAX_PAGE);
+    Ok(Json(db.bake_jobs_page("all", body.offset, Some(limit), Some(&body.ids))))
 }
 
 /// Claim the oldest free job; `204 No Content` when there is none.
@@ -179,9 +218,14 @@ pub async fn result(
     State(db): State<Shared>,
     headers: HeaderMap,
     Path(id): Path<String>,
-    body: String,
+    body: Body,
 ) -> Result<Response, Error> {
     let worker = require_worker(&db, &headers)?;
+    let limit = db.security().config.document_limit();
+    let body = super::store::read_bounded(&headers, body, limit, || {
+        format!("the document is over the {} document limit", super::store::megabytes(limit))
+    })
+    .await?;
     db.finish_bake(&worker, &id, &body)?;
     Ok(super::ok_seq(&db))
 }

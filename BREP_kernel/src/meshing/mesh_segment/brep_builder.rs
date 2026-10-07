@@ -362,7 +362,8 @@ pub fn mesh_regions_to_brep(
             -1.0
         };
         let index_arg = (!indices.is_empty()).then_some(indices);
-        return mesh_to_faceted_brep(positions, index_arg, weld);
+        // The lossy exit for this stringly lane: the class is dropped, the text kept.
+        return mesh_to_faceted_brep(positions, index_arg, weld).map_err(|refusal| refusal.message);
     }
     if let Some(region) = seg
         .regions

@@ -122,6 +122,10 @@ pub struct PlmCall {
     /// A raw text body, sent as-is (instead of `body`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub raw: Option<String>,
+    /// The `Content-Type` a `raw` body is sent under (an upload's media type,
+    /// e.g. `application/pdf`); without it a raw body carries none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_type: Option<String>,
     /// Whose token signs the call: `admin` (default), a created user, or
     /// `anonymous` for none.
     #[serde(default, rename = "as", skip_serializing_if = "Option::is_none")]

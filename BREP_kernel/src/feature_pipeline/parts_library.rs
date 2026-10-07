@@ -482,7 +482,7 @@ pub(crate) fn mix_descriptor_fingerprint(
             entry.source_key.hash(&mut hasher);
             entry.source_signature.hash(&mut hasher);
             entry.doc_hash.hash(&mut hasher);
-            force_dirty = entry.dirty;
+            force_dirty = entry.dirty || super::extension::document_uses_extensions(&entry.document);
         }
         None => 0u8.hash(&mut hasher),
     }
@@ -577,6 +577,7 @@ fn run_isolated_features(
     electronics_part: bool,
     boundary: bool,
 ) -> Result<IsolatedRun, String> {
+    let _plugin_scope = super::extension::enter(&request.plugins);
     let env = Env::build(&request.expressions, &request.configurator).unwrap_or_else(Env::poisoned);
     let mut scene = SceneMap::default();
     // The same pre-walk seed `execute_history` does (see `ports.rs`): a part's
@@ -630,10 +631,19 @@ fn run_isolated_features(
     }
     // The document's own PMI, resolved while its solids are still RESIDENT —
     // every reference resolves through the registry, so the tail has to run
-    // before the free loop below. Only an exporter asks for it
-    // ([`document_pmi`]); a snapshot rebuild passes `None` and pays nothing.
-    if let Some(out) = pmi {
-        *out = crate::feature_pipeline::pmi::finish_history_run(request, &scene, &env);
+    // before the free loop below. Plugin annotations must also resolve during
+    // snapshot rebuild: unavailable providers cannot silently pass as fresh parts.
+    let has_plugin_annotations = request.pmi.as_ref().is_some_and(|state|
+        state.views.iter().flat_map(|v| &v.annotations).any(|a| a.enabled && a.kind.contains('/')));
+    if pmi.is_some() || has_plugin_annotations {
+        let report = crate::feature_pipeline::pmi::finish_history_run(request, &scene, &env);
+        if let Some(row) = report.as_ref().into_iter().flat_map(|r| &r.views)
+            .flat_map(|v| &v.annotations)
+            .find(|a| a.enabled && a.kind.contains('/') && a.status == crate::feature_pipeline::pmi::PmiStatus::Error)
+        {
+            if error.is_none() { error = Some(format!("annotation '{}': {}", row.id, row.message)); }
+        }
+        if let Some(out) = pmi { *out = report; }
     }
     // The document's own declared ports, resolved here for the same reason the
     // PMI is: a point may reference the part's geometry, and the geometry is

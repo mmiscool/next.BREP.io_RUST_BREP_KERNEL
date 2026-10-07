@@ -278,6 +278,13 @@ pub fn resolved_uses(state: &State, revision: &Revision) -> Value {
 /// unit) added up.
 #[derive(Debug, Clone, Serialize)]
 pub struct BomLine {
+    pub part_type: String,
+    pub part_values: BTreeMap<String, Value>,
+    pub occurrence_values: Vec<crate::bom_config::Occurrence>,
+    pub owner_part: String,
+    pub owner_revision: String,
+    pub occurrence_ids: Vec<String>,
+    pub occurrence_attributes: BTreeMap<String, Value>,
     /// Depth below the top: 1 for what the top uses directly. 0 in the flat
     /// view.
     pub level: usize,
@@ -342,6 +349,8 @@ pub struct CurrencyTotal {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Bom {
+    #[serde(skip_serializing_if="Option::is_none")]
+    pub comparison_lines: Option<Vec<BomLine>>,
     pub part_id: String,
     pub number: String,
     pub name: String,
@@ -363,6 +372,8 @@ pub struct Bom {
 
 /// How a walk reached a line.
 struct Walked<'a> {
+    parent_revision: &'a Revision,
+    parent_part: String,
     level: usize,
     position: String,
     line: &'a Use,
@@ -406,7 +417,9 @@ fn descend<'a>(
             stop = Some(format!("deeper than {MAX_DEPTH} levels — not expanded"));
         }
         let expand = stop.is_none();
-        out.push(Walked { level, position: position.clone(), line, child, revision: resolved, total, stop });
+        out.push(Walked {
+            parent_revision: revision,
+            parent_part: path.last().cloned().unwrap_or_default(), level, position: position.clone(), line, child, revision: resolved, total, stop });
         if expand {
             if let (Some(child), Some(rev)) = (child, resolved) {
                 if !rev.uses.is_empty() {
@@ -613,6 +626,7 @@ pub fn bom(state: &State, top: &Part, revision: &Revision, levels: usize, flat: 
         lines.retain(|line| line.level <= levels);
     }
     Bom {
+        comparison_lines: None,
         part_id: top.id.clone(),
         number: top.number.clone(),
         name: top.name.clone(),
@@ -640,6 +654,13 @@ fn make_line(state: &State, w: &Walked) -> BomLine {
     let flags = found.iter().map(|(flag, _)| flag.to_string()).collect();
     let warnings = found.into_iter().map(|(_, text)| text).collect();
     BomLine {
+        part_type: child.map(|p|p.part_type.clone()).unwrap_or_default(),
+        part_values: w.revision.map(|r|r.attributes.clone()).unwrap_or_default(),
+        occurrence_values: w.parent_revision.occurrences.iter().filter(|o|o.part==w.line.part && (w.line.revision.is_empty() || o.revision==w.line.revision)).cloned().collect(),
+        owner_part: w.parent_part.clone(),
+        owner_revision: w.parent_revision.id.clone(),
+        occurrence_ids: Vec::new(),
+        occurrence_attributes: BTreeMap::new(),
         level: w.level,
         position: w.position.clone(),
         find_number: w.line.find_number.clone(),
@@ -678,7 +699,7 @@ fn make_line(state: &State, w: &Walked) -> BomLine {
 }
 
 /// Fill a line's sourcing and price at its `total`.
-fn reprice(state: &State, line: &mut BomLine) {
+pub(crate) fn reprice(state: &State, line: &mut BomLine) {
     let Some(part) = state.part(&line.part_id) else { return };
     let Some((mpn, manufacturer, supplier, spn, currency, unit)) = price(state, part, line.total) else {
         return;
@@ -1049,3 +1070,37 @@ pub fn bom_csv_with(bom: &Bom, attachments: bool) -> String {
     out
 }
 
+
+/// Walk the placements themselves, including one subtree for every repeated
+/// subassembly instance. Each row still edits the occurrence's actual owner.
+pub(crate) fn occurrence_lines(state:&State,top:&Part,revision:&Revision)->Vec<BomLine>{
+    fn descend_values(state:&State,parent:&Part,revision:&Revision,prefix:&str,level:usize,multiplier:f64,path:&mut Vec<String>,out:&mut Vec<BomLine>){
+        let mut ordinal=0;
+        for line in &revision.uses{
+            let child=state.part(&line.part);let resolved=child.and_then(|p|resolve(p,line));
+            let occurrences:Vec<&crate::bom_config::Occurrence>=revision.occurrences.iter().filter(|o|o.part==line.part&&(line.revision.is_empty()||o.revision==line.revision)).collect();
+            let placements:Vec<Option<&crate::bom_config::Occurrence>>=if occurrences.is_empty(){vec![None]}else{occurrences.iter().map(|o|Some(*o)).collect()};
+            let quantity=line.quantity/placements.len() as f64;
+            for occurrence in placements{
+                ordinal+=1;let position=if prefix.is_empty(){ordinal.to_string()}else{format!("{prefix}.{ordinal}")};
+                let cycle=child.is_some_and(|p|path.contains(&p.id));
+                let stop=if cycle{Some("cycle: this part is already above it — not expanded".into())}else if level>=MAX_DEPTH{Some(format!("deeper than {MAX_DEPTH} levels — not expanded"))}else{None};
+                let mut row=make_line(state,&Walked{parent_revision:revision,parent_part:parent.id.clone(),level,position:position.clone(),line,child,revision:resolved,total:multiplier*quantity,stop});
+                row.quantity=quantity;row.occurrence_values.clear();
+                if let Some(occurrence)=occurrence{
+                    row.occurrence_ids=vec![occurrence.id.clone()];row.occurrence_attributes=occurrence.attributes.clone();
+                    row.find_number=occurrence.attributes.get("Find_Number").and_then(Value::as_str).unwrap_or("").into();
+                    row.reference=occurrence.attributes.get("Reference_Designator").and_then(Value::as_str).unwrap_or(&occurrence.id).into();
+                    row.notes=occurrence.attributes.get("Notes").and_then(Value::as_str).unwrap_or("").into();
+                }
+                out.push(row);
+                if !cycle&&level<MAX_DEPTH{
+                    if let (Some(child),Some(revision))=(child,resolved){
+                        path.push(child.id.clone());descend_values(state,child,revision,&position,level+1,multiplier*quantity,path,out);path.pop();
+                    }
+                }
+            }
+        }
+    }
+    let mut lines=Vec::new();descend_values(state,top,revision,"",1,1.0,&mut vec![top.id.clone()],&mut lines);lines
+}

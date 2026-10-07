@@ -321,3 +321,20 @@ fn encode_png(rgba: &[u8], width: u32, height: u32) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
+/// Portable preview carried by native CAD JSON. The image has no external URL.
+pub fn embedded_png(png: &[u8], size: u32, status: &str) -> serde_json::Value {
+    use base64::Engine;
+    serde_json::json!({
+        "mimeType": "image/png", "data": base64::engine::general_purpose::STANDARD.encode(png),
+        "width": size, "height": size, "renderer": RENDERER, "status": status,
+    })
+}
+
+/// Empty documents and edits still rebuilding have an honest empty preview.
+pub fn empty_embedded(status: &str) -> serde_json::Value {
+    static EMPTY: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+    let png = EMPTY.get_or_init(|| encode_png(&vec![0; (SIZE * SIZE * 4) as usize], SIZE, SIZE)
+        .expect("a fixed-size in-memory PNG can be encoded"));
+    embedded_png(png, SIZE, status)
+}
+

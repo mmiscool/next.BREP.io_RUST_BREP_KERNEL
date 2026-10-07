@@ -1,6 +1,6 @@
 [package]
 name = "BREP_render"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2021"
 license-file = "LICENSE.md"
 repository = "https://github.com/mmiscool/next.BREP.io_RUST_BREP_KERNEL"
@@ -37,15 +37,16 @@ crate-type = ["cdylib", "rlib"]
 # path dependency links the kernel rlib without touching its build.
 
 [dependencies]
+brep_plugins = { package = "BREP_plugins", version = "0.1.0", path = "../BREP_plugins" }
 # BOM reference edits validate electronics snapshots with their owning schema.
-BREP_ecad_core = { version = "0.2.0", path = "../BREP_ecad_core" }
+BREP_ecad_core = { version = "0.2.1", path = "../BREP_ecad_core" }
 # Base kernel link WITHOUT `parallel` — the wasm build must not pull rayon
 # (the shipped kernel wasm enables neither feature). `parallel` is added back
 # for native only, below.
-brep_kernel = { package = "BREP_kernel", version = "0.7.0", path = "../BREP_kernel", default-features = false }
+brep_kernel = { package = "BREP_kernel", version = "0.8.0", path = "../BREP_kernel", default-features = false }
 # Mesh imports pass through the topology-aware RANSAC reconstruction stack
 # before they enter the ordinary IMPORT3D history lane.
-brep-reconstruction = { package = "BREP_reconstruction", version = "0.4.0", path = "../BREP_reconstruction" }
+brep-reconstruction = { package = "BREP_reconstruction", version = "0.5.0", path = "../BREP_reconstruction" }
 # The in-scene gizmos / overlay widgets (transform gizmo, ViewCube, datum/axis
 # visuals, dimension leaders, curve display). Pure geometry + hit-testing, no
 # GPU/kernel dep — the engine converts its emitted `Overlay` into overlay GPU
@@ -58,6 +59,7 @@ brep-gizmos = { package = "BREP_gizmos", version = "0.2.4", path = "../BREP_gizm
 wgpu = { version = "29", features = ["webgl"] }
 bytemuck = { version = "1", features = ["derive"] }
 png = "0.18"
+base64 = "0.22"
 # The sketch data model (`sketch::SketchDoc`) mirrors the kernel solver's JSON via
 # serde derive. serde is wasm32-clean (the kernel already links it).
 serde = { version = "1", features = ["derive"] }
@@ -67,7 +69,7 @@ serde_json = "1"
 # renderer core never touches these — they belong to the thin shells (headless
 # readback, winit window).
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-brep_kernel = { package = "BREP_kernel", version = "0.7.0", path = "../BREP_kernel", features = ["parallel"] }
+brep_kernel = { package = "BREP_kernel", version = "0.8.0", path = "../BREP_kernel", features = ["parallel"] }
 pollster = "0.4"
 winit = { version = "0.30", optional = true }
 

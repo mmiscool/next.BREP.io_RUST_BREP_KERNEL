@@ -47,6 +47,8 @@ pub mod store;
 pub mod template;
 pub mod viewport;
 pub mod workbench;
+pub mod plugins;
+pub mod javascript;
 
 
 // The wasm history runner: a dedicated web worker so a history run stays OFF the

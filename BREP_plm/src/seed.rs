@@ -270,12 +270,15 @@ pub fn stable_json_hash(value: &Value) -> u64 {
 
 /// The keys that are not the family's MODEL: the table (a row edit must not
 /// regenerate every member), the class, the view state, and stamps.
-const NOT_THE_MODEL: [&str; 5] = [
+const NOT_THE_MODEL: [&str; 6] = [
     FAMILY_TABLE_KEY,
     DOCUMENT_CLASS_KEY,
     "workbench",
     FAMILY_SOURCE_KEY,
     TEMPLATE_SOURCE_KEY,
+    // The embedded preview a CAD save writes into the document: derived from
+    // the model, and the CAD app's copy of this list excludes it too.
+    "thumbnail",
 ];
 
 /// A content hash of the family's model: the whole document less the table,

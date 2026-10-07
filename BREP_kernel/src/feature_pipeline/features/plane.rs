@@ -84,6 +84,8 @@ pub fn schema() -> serde_json::Value {
     "type": "P",
     "shortName": "P",
     "longName": "Plane",
+    "ribbonPath": "Home/Reference/Plane",
+    "commandSize": "Large",
     "displayBuilder": true,
     "inputParamsSchema": {
         "id": {

@@ -831,6 +831,13 @@ pub struct StepExportReport {
 }
 
 /// Serialize exact NURBS BREP topology as an AP242 STEP Part 21 document.
+///
+/// `unit` LABELS the caller's coordinates (`SI_UNIT($,.METRE.)`, `.MILLI.`,
+/// inch and foot conversion factors): the writer does not scale them. A
+/// kernel body is in millimetres, so a metre-unit file wants the body
+/// pre-scaled by 1e-3 (`transform_brep` with a uniform scale) first; a
+/// millimetre body written under `"meter"` re-imports at 1e9 × its volume
+/// (measured 2026-10-03).
 pub fn export_step(
     solids: &[BrepSolid],
     name: &str,
@@ -874,9 +881,9 @@ pub(crate) struct StepItemOwner {
 /// under several occurrence paths, and each path registers its own alias.
 #[derive(Default)]
 pub(crate) struct ProductGeometry {
-    /// Body name -> its `MANIFOLD_SOLID_BREP`, in emission order — one entry per
-    /// SHELL the body wrote, so a body with voids appears once per shell. The
-    /// name rides along because a coloured body is styled on this entity
+    /// Body name -> its STEP solid entity, in emission order. Inward shells
+    /// belong to one `BREP_WITH_VOIDS`; independent outward shells each emit a
+    /// `MANIFOLD_SOLID_BREP`. A coloured body is styled on this entity
     /// (`step/styles.rs`), and the representation's item list is the ids alone.
     pub solids: Vec<(String, usize)>,
     /// Face name -> its `ADVANCED_FACE`.
@@ -1073,6 +1080,7 @@ pub(crate) fn write_product_geometry(
         let mut vertex_ids = HashMap::<u64, usize>::default();
         let mut edge_ids = HashMap::<u64, usize>::default();
         let mut surfaces = HashMap::<usize, (usize, bool, EmittedSurface)>::default();
+        let mut emitted_shells = Vec::new();
         for shell in &solid.shells {
             // Pass 1 — SURFACES. A pcurve references the surface entity it
             // parameterizes, so every surface id has to exist before the first
@@ -1309,11 +1317,32 @@ pub(crate) fn write_product_geometry(
                 face_ids.push(face_step_id);
             }
             let closed_shell = writer.add(format!("CLOSED_SHELL('',{})", id_list(&face_ids)));
+            let inward = if solid.shells.len() > 1 {
+                crate::mass_properties::shell_signed_volume(shell)? < 0.0
+            } else {
+                false
+            };
+            emitted_shells.push((closed_shell, inward));
+        }
+        if emitted_shells.iter().any(|&(_, inward)| inward) {
+            let outer = emitted_shells.iter().filter(|&&(_, inward)| !inward).collect::<Vec<_>>();
+            if outer.len() != 1 {
+                return Err("export_step: a solid with voids must have exactly one outward shell".into());
+            }
+            let voids = emitted_shells.iter().filter(|&&(_, inward)| inward)
+                .map(|&(shell, _)| writer.add(format!("ORIENTED_CLOSED_SHELL('',*,#{shell},.T.)")))
+                .collect::<Vec<_>>();
             let body_id = writer.add(format!(
-                "MANIFOLD_SOLID_BREP('{}',#{closed_shell})",
-                step_string(solid_name)
+                "BREP_WITH_VOIDS('{}',#{},{})", step_string(solid_name), outer[0].0, id_list(&voids)
             ));
             written.solids.push((solid_name.to_string(), body_id));
+        } else {
+            for (closed_shell, _) in emitted_shells {
+                let body_id = writer.add(format!(
+                    "MANIFOLD_SOLID_BREP('{}',#{closed_shell})", step_string(solid_name)
+                ));
+                written.solids.push((solid_name.to_string(), body_id));
+            }
         }
         // The vertices this solid wrote, for `{solid}@x,y,z` PMI references.
         let mut points: Vec<(Vec3, usize)> = Vec::with_capacity(vertex_ids.len());

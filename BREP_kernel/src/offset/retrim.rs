@@ -353,3 +353,7 @@ where
     )
 }
 
+
+#[path = "retrim/analytic.rs"]
+mod analytic;
+pub(crate) use analytic::reconstruct_analytic_shell;

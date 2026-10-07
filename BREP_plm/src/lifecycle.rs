@@ -95,3 +95,31 @@ pub fn next_revision_label(previous: Option<&str>) -> String {
     String::from_utf8(chars).expect("ASCII uppercase stays UTF-8")
 }
 
+
+/// Check administrator availability without changing workflow semantics.
+pub fn check_enabled(settings: &crate::model::Settings, to: Lifecycle) -> Result<(), crate::Error> {
+    if settings.status_options.iter().any(|s| s.state == to && s.enabled) {
+        Ok(())
+    } else {
+        Err(crate::Error::conflict("this lifecycle status is disabled in server settings"))
+    }
+}
+
+pub fn check_options(options: &[crate::model::StatusOption]) -> Result<(), crate::Error> {
+    let mut names = std::collections::BTreeSet::new();
+    for state in [Lifecycle::Draft, Lifecycle::InReview, Lifecycle::Released, Lifecycle::Obsolete, Lifecycle::Superseded] {
+        if options.iter().filter(|s| s.state == state).count() != 1 {
+            return Err(crate::Error::bad_request("configure each workflow state exactly once"));
+        }
+    }
+    for option in options {
+        let name = option.name.trim();
+        if name.is_empty() || name.len() > 80 || !names.insert(name.to_lowercase()) {
+            return Err(crate::Error::bad_request("status names must be unique, nonempty and at most 80 bytes"));
+        }
+        if matches!(option.state, Lifecycle::Draft | Lifecycle::Superseded) && !option.enabled {
+            return Err(crate::Error::bad_request("the initial and automatic superseded states must stay enabled"));
+        }
+    }
+    Ok(())
+}

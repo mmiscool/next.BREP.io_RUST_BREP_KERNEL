@@ -44,14 +44,25 @@
 //! ρ-axis, so their radical line is VERTICAL and the lens splits into one
 //! segment of each disc at `ρ*` — no quadrature anywhere in the form.
 //!
+//! ## A PARTIAL revolution (2026-10-03)
+//!
+//! Revolved at most half a turn, the reflected band lands at azimuths the
+//! sheet never covers, so the thicken is TWO bodies touching only along the
+//! axis chord: the sector truncated at the axis over the sheet's own sweep,
+//! and the band's far side over the azimuths half a turn away
+//! ([`PartialBand`], `build_partial`). The band may also run out of the
+//! meridian range at either end there (the far side is then a partial lemon
+//! cut by the range's end ray). The closed form is Pappus on the sector with
+//! `|ρ|`, `V = α·∫∫_S |ρ| dA`, each body its own term.
+//!
 //! ## What it refuses, by name
 //!
-//! A PARTIAL revolution above all: there the reflected band lands at azimuths
-//! the sheet does not cover, the union is a second BODY rather than a revolve,
-//! and there is no planar form to take Pappus on. Also a generatrix that is not
-//! a circle, a trim that is not the whole face, a fold that is not a BAND
-//! strictly inside the meridian range, and a reflected lemon that reaches
-//! material the trim never swept — each with the measurement that decided it.
+//! A partial revolution of MORE than half a turn: the far side then overlaps
+//! the sheet's own sweep over `[π, α]`, where the union is neither a revolve
+//! nor two bodies. Also a generatrix that is not a circle, a trim that is not
+//! the whole face, a fold that is not a BAND strictly inside the meridian
+//! range (on a full turn), and a reflected lemon that reaches material the
+//! trim never swept — each with the measurement that decided it.
 
 use crate::{KernelRefusal, KernelStage, OrRefuse};
 use super::*;
@@ -218,12 +229,114 @@ fn cap_area(cut: f64, radius: f64) -> f64 {
 /// leaves every other sheet exactly the builder it had. `Err` is a refusal BY
 /// NAME: the configuration IS a folded revolution and this construction does not
 /// cover it.
+/// What [`recognize`] hands back: the FULL-revolution union (one body) or the
+/// PARTIAL-revolution pair (two bodies, `build_partial`).
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Recognized {
+    Full(RevolvedBand),
+    Partial(PartialBand),
+}
+
+/// A fold band on a PARTIAL revolution of at most half a turn (2026-10-03).
+///
+/// The segments in the band cross the axis and come out at the azimuth half a
+/// turn away, which the sheet's own sweep `[θ0, θ0 + α]` never covers when
+/// `α ≤ π`: the material is TWO bodies, touching only along the axis chord —
+/// the sector truncated at the axis, revolved over the sheet's sweep, and the
+/// band's far side revolved over `[θ0 + π, θ0 + π + α]`. Unlike the full
+/// turn, the band may also run OUT of the meridian range at either end
+/// (`touches_start` / `touches_end`): the far side is then cut by the range's
+/// end ray and the reflected region is a partial lemon.
+///
+/// The closed form is Pappus on the sector with `|ρ|`: no two normal segments
+/// meet (the normals of a circle are its radii; for `s ∈ [s_lo, s_hi]` every
+/// point of the half-plane at distance `s_lo..s_hi` from the tube centre lies
+/// on exactly one of them) and the two bodies have DISJOINT INTERIORS: for
+/// `α < π` they occupy disjoint azimuths and touch only along the axis chord;
+/// at `α = π` exactly the near body's end caps (the half-planes at `θ0` and
+/// `θ0 + π`) and the far body's caps are the SAME two half-planes, so the
+/// solids also touch face to face across the overlap of their cap regions —
+/// sound as two solids, measured by the half-turn fixture; for `α > π` the
+/// azimuths overlap and the lane refuses. The thickness runs OUTWARD from the
+/// tube centre (that is the offset that can reach the axis; an inward offset
+/// never does and takes the unchanged lanes). So
+/// `V = α · ∫∫_S |ρ| dA = α · (I(S) − 2·C)`, with `I(S)` the sector's signed
+/// moment and `C = ∫∫_{S ∩ ρ<0} ρ dA` the (negative) far-side moment over the
+/// band's part inside the range:
+///
+/// ```text
+///     C(φa, φb) = [ R s_hi² φ / 2 + s_hi³ sin φ / 3 − R³ tan φ / 6 ]_{φa}^{φb}
+/// ```
+///
+/// (the inner integral `∫_{s*}^{s_hi} (R + s cos φ) s ds` with
+/// `s* = −R / cos φ` the axis crossing). Body 1 measures `α (I(S) − C)` and
+/// body 2 `−α C`.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PartialBand {
+    pub(crate) band: RevolvedBand,
+    /// The sheet's own sweep, `0 < sweep ≤ π`.
+    pub(crate) sweep: f64,
+    /// The band's part INSIDE the meridian range: `[band_low, band_high]`,
+    /// clamped to `[start, end]`.
+    pub(crate) band_low: f64,
+    pub(crate) band_high: f64,
+    pub(crate) touches_start: bool,
+    pub(crate) touches_end: bool,
+}
+
+impl PartialBand {
+    /// `C(band_low, band_high)` — the far-side moment, negative.
+    pub(crate) fn far_moment(&self) -> f64 {
+        let (major, high) = (self.band.major, self.band.high);
+        let term = |phi: f64| major * high * high * phi / 2.0 + high * high * high * phi.sin() / 3.0 - major.powi(3) * phi.tan() / 6.0;
+        term(self.band_high) - term(self.band_low)
+    }
+
+    /// The sector's SIGNED moment over the whole meridian range.
+    pub(crate) fn sector_moment(&self) -> f64 {
+        let (low, high, major) = (self.band.low, self.band.high, self.band.major);
+        let span = self.band.end - self.band.start;
+        span * major * (high * high - low * low) / 2.0
+            + (high * high * high - low * low * low) / 3.0 * (self.band.end.sin() - self.band.start.sin())
+    }
+
+    /// The two bodies' closed-form volumes: the near body and the far body.
+    pub(crate) fn volumes(&self) -> (f64, f64) {
+        let far = self.far_moment();
+        (self.sweep * (self.sector_moment() - far), -self.sweep * far)
+    }
+
+    /// The thicken's whole volume, `sweep · ∫∫_S |ρ| dA`.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn volume(&self) -> f64 {
+        let (near, far) = self.volumes();
+        near + far
+    }
+
+    /// The axis crossing on the ray at meridian angle `phi`, measured from
+    /// the tube centre: `s* = −R / cos φ`.
+    fn axis_crossing(&self, phi: f64) -> f64 {
+        -self.band.major / phi.cos()
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn report(&self) -> String {
+        let (near, far) = self.volumes();
+        format!(
+            "R = {:.6}, s ∈ [{:.6}, {:.6}], meridian [{:.6}, {:.6}] rad, sweep {:.6} rad, band inside the range \
+             [{:.6}, {:.6}] rad (touches start {}, end {}), near body {:.12}, far body {:.12}, V = {:.12}",
+            self.band.major, self.band.low, self.band.high, self.band.start, self.band.end, self.sweep,
+            self.band_low, self.band_high, self.touches_start, self.touches_end, near, far, near + far
+        )
+    }
+}
+
 pub(crate) fn recognize(
     surface: &NurbsSurface,
     loops: &[Vec<NurbsCurve>],
     distance_bottom: f64,
     distance_top: f64,
-) -> Result<Option<RevolvedBand>, KernelRefusal> {
+) -> Result<Option<Recognized>, KernelRefusal> {
     let Some(crate::AnalyticSurface::Revolution {
         frame,
         sweep,
@@ -300,10 +413,14 @@ pub(crate) fn recognize(
         end,
         residual,
     };
+    let fold = band.fold_angle();
+    let full_turn = (*sweep - std::f64::consts::TAU).abs() <= 1e-9;
+    if !full_turn {
+        return recognize_partial(band, *sweep, fold, loops, [u0, u1], [v0, v1]);
+    }
     // Is the fold a BAND, strictly inside the meridian range? A fold that only
     // touches one end is the single-parallel carve's, which is a different
     // construction and already has one.
-    let fold = band.fold_angle();
     let Some(band_low) = wrap_into(fold, start, end) else {
         return Ok(None);
     };
@@ -321,23 +438,64 @@ pub(crate) fn recognize(
     }
     // From here the configuration IS a folded revolution over a whole face, and
     // every exit is a refusal by name.
-    let full_turn = (*sweep - std::f64::consts::TAU).abs() <= 1e-9;
-    if !full_turn {
-        return Err(KernelRefusal::unsupported(KernelStage::Refine, "thicken_band_partial_revolution", format!(
-            "thickenSheet: this sheet's offset folds in a BAND and the sheet is revolved only \
-             {:.6} rad. The segments in the band cross the axis and come out at the azimuth half \
-             a turn away, so for a FULL revolution the union is again a solid of revolution — the \
-             half-plane union of the normal segments, which this lane builds — but a PARTIAL one \
-             sweeps that reflected band over azimuths the sheet never covers. The answer there is \
-             a SECOND body, not a revolve, and it has no planar form to take Pappus on: refused \
-             rather than approximated. Revolve the sheet a full turn, or thicken it thin enough \
-             that the offset (now {:.6} from the tube centre, against a major radius of {:.6}) \
+    reflected_band_is_covered(&band)?;
+    Ok(Some(Recognized::Full(band)))
+}
+
+/// The PARTIAL-revolution half of [`recognize`]: the band's part inside the
+/// meridian range (strictly inside, or running out of either end), the whole
+/// face, and a sweep of at most half a turn.
+fn recognize_partial(
+    band: RevolvedBand,
+    sweep: f64,
+    fold: f64,
+    loops: &[Vec<NurbsCurve>],
+    u_domain: [f64; 2],
+    v_domain: [f64; 2],
+) -> Result<Option<Recognized>, KernelRefusal> {
+    let (start, end) = (band.start, band.end);
+    let band_width = 2.0 * (std::f64::consts::PI - fold);
+    let low_inside = wrap_into(fold, start, end);
+    let high_inside = wrap_into(std::f64::consts::TAU - fold, start, end);
+    let (band_low, band_high, touches_start, touches_end) = match (low_inside, high_inside) {
+        (Some(low), Some(high)) if (high - low - band_width).abs() <= 1e-9 => (low, high, false, false),
+        // Two separate pieces of the band inside one range (the range wraps
+        // past a turn), or the fold parallels inside but not as one band:
+        // not this lane's.
+        (Some(_), Some(_)) => return Ok(None),
+        (Some(low), None) => (low, end, false, true),
+        (None, Some(high)) => (start, high, true, false),
+        // No fold parallel inside the range: either the whole range is in the
+        // band (no near body at all) or the offset never folds inside it.
+        (None, None) => return Ok(None),
+    };
+    if !whole_face(loops, u_domain, v_domain)? {
+        return Ok(None);
+    }
+    // From here the configuration IS a folded partial revolution over a whole
+    // face, and every exit is a refusal by name.
+    if sweep > std::f64::consts::PI + 1e-9 {
+        return Err(KernelRefusal::unsupported(KernelStage::Refine, "thicken_band_partial_overlap", format!(
+            "thickenSheet: this sheet's offset folds in a BAND and the sheet is revolved {:.6} rad, \
+             more than half a turn. The segments in the band cross the axis and come out at the \
+             azimuth half a turn away; at most half a turn that far side lands on azimuths the \
+             sheet never covers and the thicken is two bodies, and a full turn covers it itself and \
+             the thicken is one revolve — but between the two the far side OVERLAPS the sheet's own \
+             sweep over the azimuths [π, {:.6}] rad, where the union is neither: refused rather than \
+             approximated. Revolve the sheet at most half a turn or a full turn, or thicken it thin \
+             enough that the offset (now {:.6} from the tube centre, against a major radius of {:.6}) \
              does not reach the axis",
-            sweep, band.high, band.major
+            sweep, sweep, band.high, band.major
         )));
     }
-    reflected_band_is_covered(&band)?;
-    Ok(Some(band))
+    Ok(Some(Recognized::Partial(PartialBand {
+        band,
+        sweep,
+        band_low,
+        band_high,
+        touches_start,
+        touches_end,
+    })))
 }
 
 /// The direction the sheet's own normal has to be compared against: OUTWARD
@@ -729,6 +887,75 @@ pub(crate) fn build(band: &RevolvedBand) -> Result<BrepSolid, KernelRefusal> {
         )
     })?;
     crate::accept_sound(solid, "thickenSheet")
+}
+
+/// Build the PARTIAL revolution's two bodies: the sector truncated at the axis
+/// revolved over the sheet's own sweep, and the band's far side revolved from
+/// the half-plane half a turn away. Both profiles are drawn in the meridian
+/// plane of the generatrix; the far side's points have `ρ < 0` in that plane,
+/// which IS the half-plane at the azimuth half a turn away, and the revolve
+/// reads its half-plane off the profile itself.
+pub(crate) fn build_partial(partial: &PartialBand) -> Result<Vec<BrepSolid>, KernelRefusal> {
+    let band = &partial.band;
+    let (radial, axis) = (band.radial, band.axis);
+    let centre = band.tube_centre();
+    let (start, end) = (band.start, band.end);
+    let (band_low, band_high) = (partial.band_low, partial.band_high);
+    let point = |s: f64, phi: f64| band.meridian_point(s, phi);
+    let arc = |radius: f64, from: f64, to: f64| make_arc(centre, radial, axis, radius, from, to).or_refuse(KernelStage::Refine, "make_arc");
+    let line = |from: Vec3, to: Vec3| make_line(from, to).or_refuse(KernelStage::Refine, "make_line");
+    let reversed = |curve: NurbsCurve| curve.reversed().or_refuse(KernelStage::Refine, "reversed");
+    // Where the near body's boundary meets the axis at each end of the band's
+    // part inside the range: on the outer arc where the band starts or ends
+    // inside, on the range's end ray where it runs out.
+    let near_start_s = if partial.touches_start { partial.axis_crossing(start) } else { band.high };
+    let near_end_s = if partial.touches_end { partial.axis_crossing(end) } else { band.high };
+
+    // --- The NEAR body: the sector truncated at the axis -------------------
+    let mut near: Vec<NurbsCurve> = Vec::with_capacity(6);
+    // The start ray, sheet to offset (or to the axis crossing).
+    near.push(line(point(band.low, start), point(near_start_s, start))?);
+    // The offset arc up to the band, where it meets the axis.
+    if !partial.touches_start {
+        near.push(arc(band.high, start, band_low)?);
+    }
+    // The axis chord, which revolves to nothing but closes the profile.
+    near.push(line(point(near_start_s, band_low), point(near_end_s, band_high))?);
+    // The offset arc from the band back out to the trim's end.
+    if !partial.touches_end {
+        near.push(arc(band.high, band_high, end)?);
+    }
+    // The end ray, offset (or axis crossing) back to the sheet.
+    near.push(line(point(near_end_s, end), point(band.low, end))?);
+    // The sheet itself, end back to start.
+    near.push(reversed(arc(band.low, start, end)?)?);
+
+    // --- The FAR body: the band's far side ---------------------------------
+    // Its points have ρ < 0 in the generatrix's meridian plane: the offset arc
+    // over the band's part inside the range, the range's end rays in to the
+    // axis where the band runs out, and the axis chord.
+    let mut far: Vec<NurbsCurve> = Vec::with_capacity(4);
+    far.push(arc(band.high, band_low, band_high)?);
+    if partial.touches_end {
+        far.push(line(point(band.high, band_high), point(near_end_s, band_high))?);
+    }
+    far.push(line(point(near_end_s, band_high), point(near_start_s, band_low))?);
+    if partial.touches_start {
+        far.push(line(point(near_start_s, band_low), point(band.high, band_low))?);
+    }
+
+    let mut bodies = Vec::with_capacity(2);
+    for (label, profile) in [("near", near), ("far", far)] {
+        let solid = crate::revolve_profile_brep(&profile, band.origin, axis, partial.sweep).map_err(|error| {
+            KernelRefusal::internal(
+                KernelStage::Refine,
+                "revolve_profile_brep",
+                format!("thickenSheet: the fold band's {label} body could not be revolved: {error}"),
+            )
+        })?;
+        bodies.push(crate::accept_sound(solid, "thickenSheet")?);
+    }
+    Ok(bodies)
 }
 
 #[cfg_attr(not(test), allow(dead_code))]

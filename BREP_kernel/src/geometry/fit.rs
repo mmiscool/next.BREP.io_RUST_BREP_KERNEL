@@ -894,6 +894,13 @@ pub struct PolylineFit {
 /// The decimation to a point BUDGET is deliberately not here
 /// ([`decimate_stations`]): the ladder lifts the budget and never the pool, so
 /// this runs once per fit however many rungs it takes.
+/// The station pool a full refit of `points` would interpolate from: the
+/// existing [`station_pool`], exposed unchanged for the section refiner's
+/// debug trace, which compares it against the seeded refit's forced seeds.
+pub(crate) fn polyline_station_pool(points: &[Vec3], tolerance: f64) -> Vec<usize> {
+    station_pool(points, tolerance)
+}
+
 fn station_pool(points: &[Vec3], tolerance: f64) -> Vec<usize> {
     let simplified = simplify_polyline_indices(points, tolerance);
     if simplified.len() > 2 {
@@ -1373,6 +1380,522 @@ fn fit_polyline_adaptive(
     }
     unreachable!("the bounded refinement returns on its last round")
 }
+
+/// The section refiner's refit (`csg/imprint/driver.rs`): every SEED station is
+/// kept, and the set grows only where the fit is measured to miss.
+///
+/// The refiner inserts true intersection points into a run whose standing fit
+/// kept only some of the run's stations. Refitting the whole run from its own
+/// count interpolates every march station the standing fit had dropped as well;
+/// on the skew-cylinder loop that took 160 kept stations to 519 (consistent with
+/// ~122 inserts if the old refit kept every run point; the inserts themselves were
+/// not counted). Here `seeds` (indices into `points`, any order) are the stations
+/// the standing fit kept plus every inserted point, the bend witnesses, and the
+/// run's two ends are added. AN ACCEPTED seeded fit interpolates every one of
+/// them; the fallback below is the original full refit with its own pool and its
+/// own conditioning, which may not. The set then grows exactly as
+/// [`fit_polyline_adaptive`] grows its stations: the worst eligible pool station
+/// of each span measured over the floor, at most 16 a round, at most 9 rounds.
+/// It never passes the ceiling [`fit_polyline_inner`] derives for `full_budget`,
+/// and it stands only when its deviation, measured over every input point,
+/// meets the same floor (the tolerance, or the input's dropped band where
+/// coarser).
+///
+/// Otherwise the result is EXACTLY `fit_polyline_of_degree(points, tolerance,
+/// full_budget, local_interpolation, degree)`, the full-run refit the refiner
+/// made before, both recovery lanes included. That covers every seeded
+/// measurement that errs or reads non-finite (deviation, floor or a span's
+/// error). So a seeded fit can stand only where it meets the same floor, and
+/// every other section keeps the old curve, to the bit, or the old call's own
+/// error.
+/// How [`fit_polyline_seeded_with_path`] produced its fit: the seeded set
+/// accepted at the floor, or the original full refit, and why. Returned on
+/// every call (not a trace switch), so callers and controls can rely on it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SeededPath {
+    /// The seeded set met the floor after `rounds` fits.
+    Accepted { rounds: usize },
+    /// The result IS `fit_polyline_of_degree` at the full budget.
+    Fallback(SeededFallback),
+}
+
+/// Why a seeded refit fell back to the original full refit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SeededFallback {
+    NonFiniteInput,
+    Degenerate,
+    RefineDisabled,
+    PoolTooSmall,
+    NonFiniteBandOrArc,
+    NonFiniteFloor,
+    SeedsOverCeiling,
+    /// A forced station is not in the pool `station_pool` builds for the full
+    /// refit (simplified or conditioned away): the seeded set cannot respect
+    /// the pool contract, so the attempt is declined.
+    SeedsOutsideStationPool,
+    StationSetFailed,
+    NonFiniteFitReading,
+    SpanUnreadable,
+    CeilingReached,
+    RoundsSpent,
+    NothingToAdd,
+    /// The accepted candidate's curve could not be evaluated, finite, at its
+    /// own domain ends: the endpoint readings do not exist, so it is declined.
+    EndpointUnreadable,
+    /// A tight witness that is ALREADY a station reads over its tight
+    /// tolerance at its own interpolation parameter: no station can be added
+    /// to fix it, so the candidate is declined.
+    TightStationOverTolerance,
+}
+
+/// What one representative candidate call spent, for cost accounting apart
+/// from the fallback's own report (whose bits must stay the full refit's).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct RepresentativeCost {
+    /// Pool representatives the candidate STARTED from (previous kept
+    /// stations that are pool members, plus both run ends); every other point
+    /// of the run, raw inserts included, is a witness, never forced.
+    pub(crate) representatives: usize,
+    /// Witnesses: every point of the run.
+    pub(crate) witnesses: usize,
+    /// `fit_station_set` interpolations the candidate made (at most 9).
+    pub(crate) candidate_fits: usize,
+    /// Whether the original full refit was then called (a fallback).
+    pub(crate) full_refit: bool,
+    /// MEASURED, not an acceptance condition (2026-10-04 clarification): on an
+    /// accepted candidate, the distance of its curve evaluated at its own
+    /// domain start and end from the run's first and last points. The
+    /// existing constructors do not guarantee raw bit equality there (a
+    /// periodic solve interpolates the distinct stations and reaches the seam
+    /// by knot insertion), so no bit condition is imposed; the endpoint
+    /// stations keep their indices and order, and both ends are witnesses of
+    /// the all-run deviation like every other point. NaN when not accepted.
+    pub(crate) start_offset: f64,
+    pub(crate) end_offset: f64,
+}
+
+/// TRACE ONLY: the near-duplicate floor `station_pool` conditions its pool
+/// with, max(1% of the tolerance, 1e-4 of the simplified run's length), or 1%
+/// of the tolerance for a run that simplifies to two points. It MIRRORS
+/// `station_pool`'s expression (which is not edited); private controls pin it
+/// against `station_pool`'s own conditioning. Production decisions use
+/// `station_pool` membership itself, never this mirror.
+pub(crate) fn polyline_station_pool_floor(points: &[Vec3], tolerance: f64) -> f64 {
+    let simplified = simplify_polyline_indices(points, tolerance);
+    if simplified.len() > 2 {
+        let total: f64 = simplified.windows(2).map(|pair| points[pair[1]].sub(points[pair[0]]).length()).sum();
+        (tolerance * 0.01).max(total * 1e-4)
+    } else {
+        tolerance * 0.01
+    }
+}
+
+pub(crate) fn fit_polyline_seeded_with_path(
+    points: &[Vec3],
+    seeds: &[usize],
+    tolerance: f64,
+    full_budget: usize,
+    local_interpolation: bool,
+    degree: usize,
+) -> Result<(PolylineFit, SeededPath), String> {
+    let full_refit = |reason: SeededFallback| {
+        fit_polyline_of_degree(points, tolerance, full_budget, local_interpolation, degree)
+            .map(|fit| (fit, SeededPath::Fallback(reason)))
+    };
+    // Inspect unreadable inputs before max/reductions can hide a NaN.
+    if !tolerance.is_finite() || points.iter().any(|p| !p.x.is_finite() || !p.y.is_finite() || !p.z.is_finite()) {
+        return full_refit(SeededFallback::NonFiniteInput);
+    }
+    if points.len() < 3 {
+        return full_refit(SeededFallback::Degenerate);
+    }
+    if std::env::var("BREP_POLYLINE_FIT_REFINE").as_deref() == Ok("0") {
+        return full_refit(SeededFallback::RefineDisabled);
+    }
+    let pool = station_pool(points, tolerance);
+    if pool.len() < 2 {
+        return full_refit(SeededFallback::PoolTooSmall);
+    }
+    let arc = cumulative_chord(points);
+    let band = dropped_band(points, &pool);
+    if !band.is_finite() || arc.iter().any(|value| !value.is_finite()) {
+        return full_refit(SeededFallback::NonFiniteBandOrArc);
+    }
+    let floor = tolerance.max(band);
+    if !floor.is_finite() {
+        return full_refit(SeededFallback::NonFiniteFloor);
+    }
+    // The ceiling `fit_polyline_inner` derives for the same budget: the seeded
+    // set may grow to it and never past it.
+    let budget = full_budget.max(2);
+    let ceiling = pool
+        .len()
+        .min(MAX_FIT_STATIONS)
+        .min(budget.saturating_mul(LADDER_BUDGET_FACTOR))
+        .max(budget);
+    let mut stations = seeds
+        .iter()
+        .copied()
+        .filter(|&index| index < points.len())
+        .chain([0, points.len() - 1])
+        .collect::<Vec<_>>();
+    stations.sort_unstable();
+    stations.dedup();
+    if stations.len() > ceiling {
+        return full_refit(SeededFallback::SeedsOverCeiling);
+    }
+    // ELIGIBILITY: THE ORIGINAL STATION-POOL CONTRACT. The full refit
+    // interpolates `pool`, i.e. `station_pool`'s own simplification and
+    // near-duplicate conditioning of this run. Every forced station must be
+    // a member of that pool. If one is not (simplified or conditioned away),
+    // the seeded set cannot respect the contract, and the attempt is DECLINED
+    // to the identical full refit. Seeds are never dropped or moved, and no
+    // new threshold is read: membership is `station_pool`'s own answer.
+    // Measured on the helmet's 2036x3009 section (2026-10-04, 42f031ae6): an
+    // accepted seeded fit with one seed outside the pool met its polyline
+    // floor at 6.373e-8 while its carrier mid-span rang to 1.945e-4. That
+    // seed is an insert SIMPLIFIED away (traced on c47bedc2a: insert
+    // simplified 1, conditioned 0), not conditioned. The round's closest
+    // seed pair (station-insert, 8.585e-8, same 59 seeds) sits under the
+    // 4.881e-7 near-duplicate floor, but no seed was conditioned out; which
+    // seeds that pair joins is not traced. On the bend control the declined
+    // insert is the other case, conditioned out against a non-seed run point.
+    // Membership covers both.
+    if stations.iter().any(|index| pool.binary_search(index).is_err()) {
+        return full_refit(SeededFallback::SeedsOutsideStationPool);
+    }
+    for round in 0..=8 {
+        let Ok((curve, current, parameters, deviation, rms, between)) =
+            fit_station_set(points, stations, &arc, local_interpolation, degree)
+        else {
+            return full_refit(SeededFallback::StationSetFailed);
+        };
+        stations = current;
+        if !deviation.is_finite() || !rms.is_finite() || !between.is_finite() {
+            return full_refit(SeededFallback::NonFiniteFitReading);
+        }
+        if deviation <= floor {
+            let report = PolylineFitReport {
+                deviation,
+                rms,
+                between_stations: between,
+                tolerance,
+                floor,
+                stations: stations.len(),
+                controls: curve.control_points.len(),
+                input_points: points.len(),
+                pool_points: pool.len(),
+                dropped_band: band,
+                rungs: round + 1,
+                local_lane: local_interpolation,
+                lane_switched: false,
+                exit: PolylineFitExit::Converged,
+            };
+            record_polyline_fit(&report);
+            let kept = stations.iter().map(|&index| points[index]).collect();
+            return Ok((PolylineFit { curve, parameters, kept, report }, SeededPath::Accepted { rounds: round + 1 }));
+        }
+        if stations.len() >= ceiling {
+            return full_refit(SeededFallback::CeilingReached);
+        }
+        if round == 8 {
+            return full_refit(SeededFallback::RoundsSpent);
+        }
+        let mut candidates = Vec::new();
+        for span in 0..stations.len() - 1 {
+            let (from, to) = (stations[span], stations[span + 1]);
+            let (t0, t1) = (parameters[span], parameters[span + 1]);
+            let lower = parameters[span.saturating_sub(1)];
+            let upper = parameters[(span + 2).min(stations.len() - 1)];
+            let mut candidate: Option<(usize, f64)> = None;
+            for &index in pool.iter().filter(|&&i| i > from && i < to) {
+                let length = arc[to] - arc[from];
+                let seed = if length > 0.0 { t0 + (t1 - t0) * (arc[index] - arc[from]) / length } else { t0 };
+                // A span this entry cannot read sends the section to the
+                // original refit; the shared measurement itself is unchanged.
+                let Ok(error) = distance_to_curve_near(&curve, points[index], seed, lower, upper) else {
+                    return full_refit(SeededFallback::SpanUnreadable);
+                };
+                if !error.is_finite() {
+                    return full_refit(SeededFallback::SpanUnreadable);
+                }
+                if candidate.is_none_or(|(_, previous)| error > previous) {
+                    candidate = Some((index, error));
+                }
+            }
+            if let Some((index, error)) = candidate {
+                if error > floor {
+                    candidates.push((index, error));
+                }
+            }
+        }
+        candidates.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        let added = candidates.len().min(16).min(ceiling - stations.len());
+        if added == 0 {
+            return full_refit(SeededFallback::NothingToAdd);
+        }
+        stations.extend(candidates.iter().take(added).map(|&(index, _)| index));
+        stations.sort_unstable();
+    }
+    // Every pass of the loop above returns; this is the same fallback, named.
+    full_refit(SeededFallback::RoundsSpent)
+}
+
+/// REFINER-SPECIFIC candidate (2026-10-04, design review of 8f8c17368): the
+/// seeded refit's contract with forced membership replaced by REPRESENTATIVES.
+/// `seeds` (the previous fit's kept stations) that are members of
+/// `station_pool(points, tolerance)` start the set, with both ends; seeds the
+/// pool does not keep, and every refiner insert, are NOT forced as stations.
+/// Instead EVERY point of `points` is a fidelity witness: the candidate is
+/// accepted only when the interpolant's deviation over all of them (the same
+/// `measure_polyline_fit` reading the full refit takes) is within `tolerance`
+/// itself, NOT within max(tolerance, dropped_band). The chord band a
+/// simplified or conditioned pool leaves is a property of the polyline
+/// through the pool, not inherited uncertainty of points that lie on the
+/// carriers; it is reported as `dropped_band` and never used as the bar here.
+/// Growth is the existing rule: per span, the pool member farthest from the
+/// curve, if over `tolerance`, at most 16 per round, 9 rounds, the same
+/// ceiling. The caller enables this only for a run whose every ORIGINAL
+/// point lies on both carriers. Anything that fails (unreadable, ceiling,
+/// rounds, nothing a pool member can add while a witness is still over)
+/// returns the identical `fit_polyline_of_degree(points, tolerance,
+/// full_budget, local_interpolation, degree)`.
+pub(crate) fn fit_polyline_representatives_with_path(
+    points: &[Vec3],
+    seeds: &[usize],
+    tolerance: f64,
+    full_budget: usize,
+    local_interpolation: bool,
+    degree: usize,
+) -> Result<(PolylineFit, SeededPath, RepresentativeCost), String> {
+    fit_polyline_representatives_with_witnesses(points, seeds, &[], tolerance, tolerance, full_budget, local_interpolation, degree)
+}
+
+/// [`fit_polyline_representatives_with_path`] with TIGHT witnesses (root
+/// ruling, 2026-10-04): `tight` indices of `points` (the refiner's own
+/// inserted true-carrier points) must lie within `tight_tolerance` of the
+/// curve (the refiner's existing carrier floor), while every other point is
+/// held to `tolerance` as before. Measured on e90c30c94's bend: round 2's
+/// inserts were already within 1e-7 of round 1's 63-station curve, so the
+/// candidate added nothing, the carrier worst stayed 1.762e-8 against the
+/// 1e-8 floor, and the bounded retry ended on the full refit. A tight
+/// witness over its tolerance is REPRESENTED: the pool member nearest it (by
+/// arc) inside its span becomes a station; if its span has none to add, the
+/// candidate declines to the identical full refit (NothingToAdd). Inserts are
+/// never forced as stations and no original point is held tighter. With
+/// `tight` empty this is exactly the original candidate.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn fit_polyline_representatives_with_witnesses(
+    points: &[Vec3],
+    seeds: &[usize],
+    tight: &[usize],
+    tight_tolerance: f64,
+    tolerance: f64,
+    full_budget: usize,
+    local_interpolation: bool,
+    degree: usize,
+) -> Result<(PolylineFit, SeededPath, RepresentativeCost), String> {
+    let mut cost = RepresentativeCost { witnesses: points.len(), start_offset: f64::NAN, end_offset: f64::NAN, ..RepresentativeCost::default() };
+    let full_refit = |reason: SeededFallback, mut cost: RepresentativeCost| {
+        cost.full_refit = true;
+        fit_polyline_of_degree(points, tolerance, full_budget, local_interpolation, degree)
+            .map(|fit| (fit, SeededPath::Fallback(reason), cost))
+    };
+    if !tolerance.is_finite()
+        || !tight_tolerance.is_finite()
+        || points.iter().any(|p| !p.x.is_finite() || !p.y.is_finite() || !p.z.is_finite())
+    {
+        return full_refit(SeededFallback::NonFiniteInput, cost);
+    }
+    if points.len() < 3 {
+        return full_refit(SeededFallback::Degenerate, cost);
+    }
+    if std::env::var("BREP_POLYLINE_FIT_REFINE").as_deref() == Ok("0") {
+        return full_refit(SeededFallback::RefineDisabled, cost);
+    }
+    let mut tight: Vec<usize> = tight.iter().copied().filter(|&index| index < points.len()).collect();
+    tight.sort_unstable();
+    tight.dedup();
+    let pool = station_pool(points, tolerance);
+    if pool.len() < 2 || pool[0] != 0 || pool[pool.len() - 1] != points.len() - 1 {
+        return full_refit(SeededFallback::PoolTooSmall, cost);
+    }
+    let arc = cumulative_chord(points);
+    let band = dropped_band(points, &pool);
+    if !band.is_finite() || arc.iter().any(|value| !value.is_finite()) {
+        return full_refit(SeededFallback::NonFiniteBandOrArc, cost);
+    }
+    let budget = full_budget.max(2);
+    let ceiling = pool
+        .len()
+        .min(MAX_FIT_STATIONS)
+        .min(budget.saturating_mul(LADDER_BUDGET_FACTOR))
+        .max(budget);
+    let mut stations = seeds
+        .iter()
+        .copied()
+        .filter(|index| pool.binary_search(index).is_ok())
+        .chain([0, points.len() - 1])
+        .collect::<Vec<_>>();
+    stations.sort_unstable();
+    stations.dedup();
+    cost.representatives = stations.len();
+    if stations.len() > ceiling {
+        return full_refit(SeededFallback::SeedsOverCeiling, cost);
+    }
+    for round in 0..=8 {
+        cost.candidate_fits += 1;
+        let Ok((curve, current, parameters, deviation, rms, between)) =
+            fit_station_set(points, stations, &arc, local_interpolation, degree)
+        else {
+            return full_refit(SeededFallback::StationSetFailed, cost);
+        };
+        stations = current;
+        if !deviation.is_finite() || !rms.is_finite() || !between.is_finite() {
+            return full_refit(SeededFallback::NonFiniteFitReading, cost);
+        }
+        // Every tight witness against the curve, near its own span (the same
+        // bracketed reader the growth below uses). Any unreadable read declines.
+        let mut tight_over: Vec<usize> = Vec::new();
+        for &index in &tight {
+            let span = match stations.binary_search(&index) {
+                Ok(position) => {
+                    // A station is interpolated, but finite precision is not a
+                    // proof: read it at its own interpolation parameter.
+                    let distance = curve.evaluate(parameters[position]).map(|p| p.sub(points[index]).length());
+                    match distance {
+                        Ok(distance) if distance.is_finite() => {
+                            if distance > tight_tolerance {
+                                return full_refit(SeededFallback::TightStationOverTolerance, cost);
+                            }
+                        }
+                        _ => return full_refit(SeededFallback::SpanUnreadable, cost),
+                    }
+                    continue;
+                }
+                // Both run ends are always stations; an index outside the
+                // stations' range cannot occur, and is read as unreadable.
+                Err(at) if at == 0 || at >= stations.len() => return full_refit(SeededFallback::SpanUnreadable, cost),
+                Err(at) => at - 1,
+            };
+            let (from, to) = (stations[span], stations[span + 1]);
+            let (t0, t1) = (parameters[span], parameters[span + 1]);
+            let length = arc[to] - arc[from];
+            let seed = if length > 0.0 { t0 + (t1 - t0) * (arc[index] - arc[from]) / length } else { t0 };
+            let lower = parameters[span.saturating_sub(1)];
+            let upper = parameters[(span + 2).min(stations.len() - 1)];
+            let Ok(error) = distance_to_curve_near(&curve, points[index], seed, lower, upper) else {
+                return full_refit(SeededFallback::SpanUnreadable, cost);
+            };
+            if !error.is_finite() {
+                return full_refit(SeededFallback::SpanUnreadable, cost);
+            }
+            if error > tight_tolerance {
+                tight_over.push(index);
+            }
+        }
+        if deviation <= tolerance && tight_over.is_empty() {
+            // The curve at its own domain ends, read and recorded against the
+            // run's first and last points (the same reading the controls take
+            // on the full refit). Unreadable ends decline; the offsets are
+            // reported, not judged by a new bit condition.
+            let ends = curve
+                .domain()
+                .and_then(|[t0, t1]| Ok((curve.evaluate(t0)?, curve.evaluate(t1)?)));
+            let Ok((start, end)) = ends else {
+                return full_refit(SeededFallback::EndpointUnreadable, cost);
+            };
+            cost.start_offset = start.sub(points[0]).length();
+            cost.end_offset = end.sub(points[points.len() - 1]).length();
+            if !(cost.start_offset.is_finite() && cost.end_offset.is_finite()) {
+                cost.start_offset = f64::NAN;
+                cost.end_offset = f64::NAN;
+                return full_refit(SeededFallback::EndpointUnreadable, cost);
+            }
+            let report = PolylineFitReport {
+                deviation,
+                rms,
+                between_stations: between,
+                tolerance,
+                floor: tolerance,
+                stations: stations.len(),
+                controls: curve.control_points.len(),
+                input_points: points.len(),
+                pool_points: pool.len(),
+                dropped_band: band,
+                rungs: round + 1,
+                local_lane: local_interpolation,
+                lane_switched: false,
+                exit: PolylineFitExit::Converged,
+            };
+            record_polyline_fit(&report);
+            let kept = stations.iter().map(|&index| points[index]).collect();
+            return Ok((PolylineFit { curve, parameters, kept, report }, SeededPath::Accepted { rounds: round + 1 }, cost));
+        }
+        if stations.len() >= ceiling {
+            return full_refit(SeededFallback::CeilingReached, cost);
+        }
+        if round == 8 {
+            return full_refit(SeededFallback::RoundsSpent, cost);
+        }
+        let mut candidates = Vec::new();
+        for span in 0..stations.len() - 1 {
+            let (from, to) = (stations[span], stations[span + 1]);
+            let (t0, t1) = (parameters[span], parameters[span + 1]);
+            let lower = parameters[span.saturating_sub(1)];
+            let upper = parameters[(span + 2).min(stations.len() - 1)];
+            let mut candidate: Option<(usize, f64)> = None;
+            for &index in pool.iter().filter(|&&i| i > from && i < to) {
+                let length = arc[to] - arc[from];
+                let seed = if length > 0.0 { t0 + (t1 - t0) * (arc[index] - arc[from]) / length } else { t0 };
+                let Ok(error) = distance_to_curve_near(&curve, points[index], seed, lower, upper) else {
+                    return full_refit(SeededFallback::SpanUnreadable, cost);
+                };
+                if !error.is_finite() {
+                    return full_refit(SeededFallback::SpanUnreadable, cost);
+                }
+                if candidate.is_none_or(|(_, previous)| error > previous) {
+                    candidate = Some((index, error));
+                }
+            }
+            if let Some((index, error)) = candidate {
+                if error > tolerance {
+                    candidates.push((index, error));
+                }
+            }
+        }
+        // A tight witness over its tolerance is represented by the pool member
+        // nearest it by arc inside its span (not already chosen), if any.
+        for &index in &tight_over {
+            let at = stations.binary_search(&index).unwrap_err();
+            let (from, to) = (stations[at - 1], stations[at]);
+            let nearest = pool
+                .iter()
+                .copied()
+                .filter(|&member| member > from && member < to)
+                .min_by(|&a, &b| (arc[a] - arc[index]).abs().total_cmp(&(arc[b] - arc[index]).abs()).then_with(|| a.cmp(&b)));
+            if let Some(member) = nearest {
+                // Already an ordinary candidate: raise it to the tight priority
+                // so the first 16 cannot pass it over.
+                match candidates.iter_mut().find(|(chosen, _)| *chosen == member) {
+                    Some(entry) => entry.1 = f64::INFINITY,
+                    None => candidates.push((member, f64::INFINITY)),
+                }
+            }
+        }
+        candidates.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        let added = candidates.len().min(16).min(ceiling - stations.len());
+        if added == 0 {
+            // A witness is still over its tolerance and no pool member in any
+            // span can represent it: decline, never force the raw point.
+            return full_refit(SeededFallback::NothingToAdd, cost);
+        }
+        stations.extend(candidates.iter().take(added).map(|&(index, _)| index));
+        stations.sort_unstable();
+    }
+    full_refit(SeededFallback::RoundsSpent, cost)
+}
+
 
 fn fit_polyline_inner(
     points: &[Vec3],

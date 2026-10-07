@@ -71,6 +71,44 @@ pub(in crate::blend) fn march_open_stations_ending(
     bounded_ends: [bool; 2],
     refine_bar: Option<f64>,
 ) -> Result<(Vec<Station>, [usize; 2], StationRefinement), KernelRefusal> {
+    march_open_stations_core(
+        edge, first, second, radius_at, overshoot_fraction, ends, station_count, poles, bounded_ends, refine_bar, 0,
+    )
+    .map(|(stations, vertex_indices, refinement, _)| (stations, vertex_indices, refinement))
+}
+
+/// The exact ball centres BETWEEN an open march's final stations: for every
+/// interval, at fractions `step / subdivisions` of its edge parameter
+/// (`step = 1 .. subdivisions - 1`), each the continuation of the interval's
+/// LEFT station under the march's own branch guard (`None` where it did not
+/// solve, or at a pole). Empty when not asked for.
+#[derive(Clone, Debug, Default)]
+pub(in crate::blend) struct OpenDenseCentres {
+    pub(in crate::blend) subdivisions: usize,
+    pub(in crate::blend) centres: Vec<Vec<Option<Vec3>>>,
+    /// The final stations' NATIVE edge parameters: interval `i`'s centre `j`
+    /// was solved at `t_i + (t_{i+1} - t_i) · j / subdivisions` (never the
+    /// wall's chord parameters).
+    pub(in crate::blend) station_ts: Vec<f64>,
+}
+
+/// [`march_open_stations_ending`], also solving each final interval's
+/// [`OpenDenseCentres`] at `dense` subdivisions (0: none) — the exact centres
+/// a wall verdict reads the fitted wall against.
+#[allow(clippy::too_many_arguments)]
+pub(in crate::blend) fn march_open_stations_core(
+    edge: &EdgeRecord,
+    first: &BlendMate,
+    second: &BlendMate,
+    radius_at: &dyn Fn(f64) -> f64,
+    overshoot_fraction: f64,
+    ends: [f64; 2],
+    station_count: usize,
+    poles: [bool; 2],
+    bounded_ends: [bool; 2],
+    refine_bar: Option<f64>,
+    dense: usize,
+) -> Result<(Vec<Station>, [usize; 2], StationRefinement, OpenDenseCentres), KernelRefusal> {
     let span = edge.t1 - edge.t0;
     let overshoot = span * overshoot_fraction;
     let [overshoot_before, overshoot_after] =
@@ -188,7 +226,15 @@ pub(in crate::blend) fn march_open_stations_ending(
         solutions[mid_index] = uv;
         centers[mid_index] = center;
     } else {
-        let (uv, center) = solve_centered(station_t(mid_index), mid_seed)?;
+        let context = crate::blend::stations::NewtonContext {
+            phase: "open-initial",
+            stage: "initial",
+            index: Some(mid_index),
+            t: Some(station_t(mid_index)),
+            native: Some([edge.t0, edge.t1]),
+            ..Default::default()
+        };
+        let (uv, center) = crate::blend::stations::with_newton_context(context, || solve_centered(station_t(mid_index), mid_seed))?;
         solutions[mid_index] = uv;
         centers[mid_index] = Some(center);
     }
@@ -213,7 +259,13 @@ pub(in crate::blend) fn march_open_stations_ending(
             return Ok(());
         }
         let left = Continued { t: station_t(from), uv: solutions[from], center: centers[from] };
-        let node = continue_station(&solve_centered, &hop, &left, station_t(index), 0)?;
+        let context = crate::blend::stations::NewtonContext {
+            phase: "open-march",
+            index: Some(index),
+            native: Some([edge.t0, edge.t1]),
+            ..Default::default()
+        };
+        let node = crate::blend::stations::with_newton_context(context, || continue_station(&solve_centered, &hop, &left, station_t(index), 0))?;
         solutions[index] = node.uv;
         centers[index] = node.center;
         Ok(())
@@ -260,7 +312,7 @@ pub(in crate::blend) fn march_open_stations_ending(
     // and the two halves are checked next round. Stations only where the wall
     // needs them: every downstream scan samples per knot.
     let mut refinement = StationRefinement::default();
-    let (station_ts, vertex_indices, solutions, _centers) = match refine_bar {
+    let (station_ts, vertex_indices, solutions, final_centers) = match refine_bar {
         None => (station_ts, vertex_indices, solutions, centers),
         Some(bar) => {
             let contacts = |t: f64, uv: [f64; 4]| -> Result<(Vec3, Vec3), KernelRefusal> {
@@ -316,7 +368,13 @@ pub(in crate::blend) fn march_open_stations_ending(
                     let left = Continued { t: a, uv: sols[interval], center: cens[interval] };
                     // A mid-span station that will not solve is left out: the
                     // refinement may only add stations, never a refusal.
-                    let Ok(node) = continue_station(&solve_centered, &hop, &left, middle, 0) else {
+                    let context = crate::blend::stations::NewtonContext {
+                        phase: "open-refine",
+                        index: Some(interval),
+                        native: Some([edge.t0, edge.t1]),
+                        ..Default::default()
+                    };
+                    let Ok(node) = crate::blend::stations::with_newton_context(context, || continue_station(&solve_centered, &hop, &left, middle, 0)) else {
                         continue;
                     };
                     let Ok(exact) = contacts(middle, node.uv) else {
@@ -432,6 +490,31 @@ pub(in crate::blend) fn march_open_stations_ending(
             scale,
         )?;
     }
+    // The exact centres between the final stations, when a wall verdict asks.
+    let mut dense_centres = OpenDenseCentres { subdivisions: dense, centres: Vec::new(), station_ts: station_ts.clone() };
+    if dense > 1 {
+        for interval in 0..station_ts.len().saturating_sub(1) {
+            if pole_index(interval) || pole_index(interval + 1) {
+                dense_centres.centres.push(vec![None; dense - 1]);
+                continue;
+            }
+            let (a, b) = (station_ts[interval], station_ts[interval + 1]);
+            let left = Continued { t: a, uv: solutions[interval], center: final_centers[interval] };
+            let row = (1..dense)
+                .map(|step| {
+                    let t = a + (b - a) * step as f64 / dense as f64;
+                    let context = crate::blend::stations::NewtonContext {
+                        phase: "open-dense",
+                        index: Some(interval),
+                        native: Some([edge.t0, edge.t1]),
+                        ..Default::default()
+                    };
+                    crate::blend::stations::with_newton_context(context, || continue_station(&solve_centered, &hop, &left, t, 0)).ok().and_then(|node| node.center)
+                })
+                .collect();
+            dense_centres.centres.push(row);
+        }
+    }
     let mut stations = Vec::with_capacity(station_count + 1);
     for (index, uv) in solutions.iter().enumerate() {
         let t = station_t(index);
@@ -473,7 +556,7 @@ pub(in crate::blend) fn march_open_stations_ending(
             apex,
         });
     }
-    Ok((stations, vertex_indices, refinement))
+    Ok((stations, vertex_indices, refinement, dense_centres))
 }
 
 fn ts_first(ts: &[f64]) -> f64 {
@@ -809,6 +892,103 @@ pub(in crate::blend) fn fit_open_rows(
         exact_extrusion: false,
         vertex_stations: None,
     })
+}
+
+/// Fit the rows of a march whose stations are broken at EVERY index in
+/// `breaks` — the runout wall (`runout.rs`), whose carriers switch at the
+/// tri-tangent stations: the contact rail is G1 there by the mirror identity
+/// but its curvature jumps from a plane's to a pad cylinder's, the same jump
+/// [`fit_open_rows`] breaks at the vertex stations for.  No exact-extrusion
+/// shortcut (the carriers change along the wall) and no mate pcurves: a
+/// station at a switch has one uv on EACH carrier, so the mate pcurves are
+/// fitted per stretch by the caller ([`interpolate_piece`]).  Every piece
+/// between breaks must carry `FIT_DEGREE` samples or the fit refuses.
+pub(in crate::blend) fn fit_rows_breaking(
+    stations: &[Station],
+    parameters: &[f64],
+    breaks: &[usize],
+) -> Result<FittedRows, KernelRefusal> {
+    let mut bounds = vec![0usize];
+    bounds.extend(breaks.iter().copied());
+    bounds.push(stations.len().saturating_sub(1));
+    if bounds.windows(2).any(|pair| pair[1] < pair[0] + FIT_DEGREE) {
+        return Err(KernelRefusal::internal(
+            KernelStage::Refine,
+            "row_piece_short",
+            format!("blend: a row piece between breaks {breaks:?} is too short for the fit degree ({} stations)", stations.len()),
+        ));
+    }
+    let mut samples_cr = Vec::new();
+    let mut samples_mid = Vec::new();
+    let mut samples_cs = Vec::new();
+    let mut samples_center = Vec::new();
+    for station in stations {
+        samples_cr.push(Vec4::from_point(station.p1, 1.0));
+        samples_cs.push(Vec4::from_point(station.p2, 1.0));
+        samples_center.push(Vec4::from_point(station.center, 1.0));
+        samples_mid.push(Vec4 {
+            x: station.apex.x * station.weight,
+            y: station.apex.y * station.weight,
+            z: station.apex.z * station.weight,
+            w: station.weight,
+        });
+    }
+    let interpolate = |samples: &[Vec4]| interpolate_in_pieces(samples, parameters, breaks);
+    let cr = interpolate(&samples_cr)?;
+    let cs = interpolate(&samples_cs)?;
+    let mid = interpolate(&samples_mid)?;
+    let center = interpolate(&samples_center)?;
+    let u_domain = cr.domain().or_refuse(KernelStage::Refine, "domain")?;
+    let surface = crate::blend::rows::surface_from_rows(FIT_DEGREE, &cr, &cs, Some(&mid), false)?;
+    // The mate pcurves are the caller's (one per carrier stretch); these two
+    // only keep the record well formed and are never read.
+    let placeholder = fit::interpolate_homogeneous(
+        &[Vec4::from_point(Vec3::default(), 1.0), Vec4::from_point(Vec3::new(1.0, 0.0, 0.0), 1.0)],
+        1,
+        &[0.0, 1.0],
+    ).or_refuse(KernelStage::Refine, "interpolate_homogeneous")?;
+    Ok(FittedRows {
+        surface,
+        cr,
+        cs,
+        cr_pcurve: placeholder.clone(),
+        cs_pcurve: placeholder,
+        u_domain,
+        center: Some(center),
+        exact_extrusion: false,
+        vertex_stations: None,
+    })
+}
+
+/// A cubic (or cubics broken at the LOCAL sample indices in `breaks`) through
+/// `samples` at `parameters` — any increasing parameters, not only `[0, 1]`
+/// — parameterised over exactly `[parameters[0], parameters[last]]`, the way
+/// the pieces of [`interpolate_in_pieces`] are: a mate pcurve for a rail edge
+/// that spans a sub-range of its row.
+pub(in crate::blend) fn interpolate_piece(
+    samples: &[Vec4],
+    parameters: &[f64],
+    breaks: &[usize],
+) -> Result<NurbsCurve, KernelRefusal> {
+    if samples.len() < 2 || samples.len() != parameters.len() {
+        return Err(KernelRefusal::internal(KernelStage::Refine, "interpolate_piece", "blend: a pcurve piece needs matching samples and parameters"));
+    }
+    // With breaks inside the piece the row fit is several cubics joined C0,
+    // and the pcurve has to be the SAME cubics (on a plane it is their affine
+    // image; one cubic over the whole piece stood 7.5e-4 off the rail between
+    // stations): `interpolate_in_pieces` maps every piece onto its own
+    // parameter range already.
+    if !breaks.is_empty() {
+        return interpolate_in_pieces(samples, parameters, breaks);
+    }
+    let (low, high) = (parameters[0], parameters[parameters.len() - 1]);
+    if !(high > low) {
+        return Err(KernelRefusal::internal(KernelStage::Refine, "interpolate_piece", "blend: a pcurve piece has no parameter span"));
+    }
+    let local: Vec<f64> = parameters.iter().map(|parameter| (parameter - low) / (high - low)).collect();
+    let fitted = fit::interpolate_homogeneous(samples, FIT_DEGREE, &local).or_refuse(KernelStage::Refine, "interpolate_homogeneous")?;
+    let knots: Vec<f64> = fitted.knots.iter().map(|knot| low + knot * (high - low)).collect();
+    NurbsCurve::new(fitted.degree, knots, fitted.control_points).or_refuse(KernelStage::Refine, "new")
 }
 
 /// The interior sample indices the rows break at — the vertex stations that
@@ -2742,9 +2922,100 @@ fn unwrap_seam_branch(surface: &NurbsSurface, samples: &mut [[f64; 2]]) -> Resul
     Ok(())
 }
 
+/// Locate a trim's physical point on its own carrier. Reconstructed boundary
+/// curves may use a native carrier parameter while the inherited pcurve keeps
+/// its original parameterization; equal traversal fractions are then seeds,
+/// not a correspondence. Restrict the stored pcurve, without refitting it.
+pub(in crate::blend) fn trim_parameter_at_point(
+    surface: &crate::NurbsSurface,
+    pcurve: &NurbsCurve,
+    seed: f64,
+    target: Vec3,
+    band: f64,
+) -> Result<f64, KernelRefusal> {
+    let [lo, hi] = pcurve.domain().or_refuse(KernelStage::Refine, "domain")?;
+    let at = |q: f64| -> Result<(Vec3, Vec3), KernelRefusal> {
+        let d = pcurve.derivatives(q, 1).or_refuse(KernelStage::Refine, "derivatives")?;
+        let (point, su, sv) = surface.deriv1_extended(d[0].x, d[0].y)
+            .or_refuse(KernelStage::Refine, "deriv1_extended")?;
+        Ok((point, su.scale(d[1].x).add(sv.scale(d[1].y))))
+    };
+    if !band.is_finite() || band <= 0.0 || !seed.is_finite() {
+        return Err(KernelRefusal::unsupported(KernelStage::Sew, "trim_pcurve_crossing",
+            "blend: boundary trim requires a finite seed and positive finite consistency bar"));
+    }
+    // Scale stopping precision by local travel, never by the world origin.
+    // Every success still passes the existing acceptance bar below.
+    let (_, initial_tangent) = at(seed)?;
+    let precision = (1e-11 * (1.0 + initial_tangent.length() * (hi - lo))).min(band * 0.01);
+    let mut seeds = vec![seed];
+    let mut breaks = vec![lo, hi];
+    breaks.extend(pcurve.knots.iter().copied().filter(|q| *q > lo && *q < hi));
+    breaks.sort_by(f64::total_cmp);
+    breaks.dedup();
+    for span in breaks.windows(2) {
+        for i in 0..=4 { seeds.push(span[0] + (span[1] - span[0]) * i as f64 / 4.0); }
+    }
+    let mut best = (f64::INFINITY, seed);
+    let mut visits = Vec::new();
+    for (index, mut q) in seeds.into_iter().enumerate() {
+        let mut local_best = (f64::INFINITY, q);
+        for _ in 0..32 {
+            let (point, tangent) = at(q)?;
+            let difference = point.sub(target);
+            let error = difference.length();
+            if error < local_best.0 { local_best = (error, q); }
+            if error <= precision { break; }
+            let speed2 = tangent.dot(tangent);
+            if speed2 <= 1e-300 { break; }
+            let step = difference.dot(tangent) / speed2;
+            let mut next = q;
+            for j in 0..16 {
+                let probe = (q - step * 0.5_f64.powi(j)).clamp(lo, hi);
+                if at(probe)?.0.sub(target).length() < error { next = probe; break; }
+            }
+            if next == q { break; }
+            q = next;
+        }
+        // Only the traversal-seeded solve can select the split parameter.
+        // Other seeds discover ambiguity; they never substitute another visit.
+        if index == 0 { best = local_best; }
+        if local_best.0.is_finite() && local_best.0 <= band {
+            visits.push(local_best.1);
+        }
+    }
+    // No global fallback may replace a failed traversal-seeded crossing.
+    if !best.0.is_finite() || best.0 > band {
+        return Err(KernelRefusal::unsupported(KernelStage::Sew, "trim_pcurve_crossing",
+            format!("blend: boundary trim cannot reach its new vertex on its carrier (miss {:.3e}, bar {band:.3e})", best.0)));
+    }
+    // A lower residual cannot choose between separate visits to the same
+    // physical point. Reject discovered overlap instead of cutting a different
+    // traversal interval. Nearby iterates of one crossing stay inside the bar.
+    for q in visits {
+        let a = q.min(best.1);
+        let b = q.max(best.1);
+        let mut intervals = vec![a];
+        intervals.extend(breaks.iter().copied().filter(|t| *t > a && *t < b));
+        intervals.push(b);
+        for span in intervals.windows(2) {
+            for i in 1..4 {
+                let between = span[0] + (span[1] - span[0]) * i as f64 / 4.0;
+                let miss = at(between)?.0.sub(target).length();
+                if !miss.is_finite() || miss > band {
+                    return Err(KernelRefusal::unsupported(KernelStage::Sew, "trim_pcurve_ambiguous",
+                        "blend: boundary trim has separate physical crossing visits; traversal correspondence is ambiguous"));
+                }
+            }
+        }
+    }
+    Ok(best.1)
+}
+
 /// Trim `edge_id` at `parameter`, moving the `old_vertex` endpoint to
 /// `new_vertex`, and split every referencing coedge pcurve to the
-/// matching fraction (the pcurve domain maps affinely onto [t0, t1]).
+/// same physical point on its carrier. The affine traversal fraction is
+/// only a seed when reconstruction has changed the edge parameterization.
 pub(in crate::blend) fn trim_edge_at(
     solid: &mut BrepSolid,
     edge_id: u64,
@@ -2766,6 +3037,9 @@ pub(in crate::blend) fn trim_edge_at(
             })?;
         (edge.t0, edge.t1, edge.start_vertex_id == old_vertex)
     };
+    let target = solid.vertices.iter().find(|vertex| vertex.id == new_vertex)
+        .ok_or_else(|| KernelRefusal::internal(KernelStage::Sew, "trim_vertex", "blend: new trim vertex is missing"))?.point;
+    let pcurve_band = crate::KernelTolerances::for_solid(solid, 1e-7).pcurve_consistency;
     let fraction = (parameter - old_t0) / (old_t1 - old_t0);
     let interior = (1e-9..=1.0 - 1e-9).contains(&fraction);
     let extends = if trims_start {
@@ -2781,7 +3055,11 @@ pub(in crate::blend) fn trim_edge_at(
         ));
     }
     if extends {
-        let curved = solid
+        let edge = solid.edges.iter().find(|edge| edge.id == edge_id).unwrap();
+        let linear = edge.curve.degree == 1
+            && edge.curve.control_points.len() == 2
+            && (edge.curve.control_points[0].w - edge.curve.control_points[1].w).abs() <= 1e-12;
+        let curved = !linear || solid
             .shells
             .iter()
             .flat_map(|shell| &shell.faces)
@@ -2809,6 +3087,7 @@ pub(in crate::blend) fn trim_edge_at(
                         q1 - (q1 - q0) * fraction
                     };
                     if interior {
+                        let split_q = trim_parameter_at_point(&face.surface, &coedge.pcurve, split_q, target, pcurve_band)?;
                         let keep_upper = trims_start == coedge.forward;
                         let (low, high) = coedge.pcurve.split(split_q).or_refuse(KernelStage::Refine, "split")?;
                         coedge.pcurve = if keep_upper { high } else { low };
@@ -2848,6 +3127,18 @@ pub(in crate::blend) fn trim_edge_at(
         .ok_or_else(|| {
             KernelRefusal::internal(KernelStage::Sew, "trim_edge", "blend: edge to trim is missing")
         })?;
+    if extends {
+        // Updating the trim alone cannot extend a bounded NURBS line:
+        // ordinary evaluation clamps at its original domain. Rebuild the
+        // line over the new range, preserving the affine edge parameter.
+        let t0 = if trims_start { parameter } else { old_t0 };
+        let t1 = if trims_start { old_t1 } else { parameter };
+        let a = edge.curve.evaluate_extended(t0).or_refuse(KernelStage::Refine, "extend_line")?;
+        let b = edge.curve.evaluate_extended(t1).or_refuse(KernelStage::Refine, "extend_line")?;
+        edge.curve = NurbsCurve::new(1, vec![t0, t0, t1, t1],
+            vec![Vec4::from_point(a, 1.0), Vec4::from_point(b, 1.0)])
+            .or_refuse(KernelStage::Refine, "extend_line")?;
+    }
     if trims_start {
         edge.t0 = parameter;
         edge.start_vertex_id = new_vertex;
@@ -2877,8 +3168,9 @@ const EXTENSION_SAMPLES: usize = 8;
 /// point held in a plane across the chord, and the pcurves take the solved
 /// parameters; the original span is resampled from the edge as it stands.
 ///
-/// Only a boundary whose pcurves are not straight lines comes here: a straight
-/// one extends exactly by moving its end control point, as before.
+/// A curved 3D boundary or curved pcurve comes here. An affine line with
+/// affine pcurves extends exactly by rebuilding the line's domain and moving
+/// the pcurve end controls.
 fn extend_edge_on_carriers(
     solid: &mut BrepSolid,
     edge_id: u64,
@@ -3144,3 +3436,5 @@ fn extend_edge_on_carriers(
     }
     Ok(())
 }
+
+

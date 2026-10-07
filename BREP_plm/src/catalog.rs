@@ -149,6 +149,9 @@ pub fn check_definitions(defs: Vec<AttributeDef>) -> Result<Vec<AttributeDef>, E
     let mut out: Vec<AttributeDef> = Vec::with_capacity(defs.len());
     for mut def in defs {
         def.key = def.key.trim().to_ascii_lowercase();
+        if matches!(def.key.as_str(), "has_geometry" | "has_thumbnail") {
+            return Err(Error::bad_request(format!("{} is a built-in read-only attribute", def.key)));
+        }
         if !usable_key(&def.key) {
             return Err(Error::bad_request(format!(
                 "'{}' is not a usable attribute key — start with a letter; then letters, digits, '_' and '-'",

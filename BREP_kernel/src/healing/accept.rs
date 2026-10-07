@@ -675,10 +675,68 @@ impl<'a> BoundaryBands<'a> {
         }
         false
     }
+
+    /// The point of the loop nearest to `(u, v)` in the parameter plane, and
+    /// how far it is.
+    ///
+    /// Searched outward from the point's own band a ring at a time, stopping
+    /// when the next ring's `v` alone is further than the best found: every
+    /// segment in band `b` has every point of it within that band's `v`
+    /// range, so a band `r` away from the query's cannot hold a closer point
+    /// than `(r - 1)` band heights. A query beyond the loop's `v` extent
+    /// clamps to an end band and the same bound holds, larger. Called only
+    /// for a station that has already FAILED parity and the parameter band,
+    /// so its cost is paid once per conviction, not once per station.
+    fn nearest(&self, point: (f64, f64)) -> ((f64, f64), f64) {
+        let (u, v) = point;
+        let bands = self.band_count();
+        let centre = self.band_of(v);
+        let band_height = if self.bands_per_v > 0.0 { 1.0 / self.bands_per_v } else { f64::INFINITY };
+        let mut best = f64::INFINITY;
+        let mut best_point = self.points[0];
+        let search = |band: usize, best: &mut f64, best_point: &mut (f64, f64)| {
+            for &index in &self.segments[self.starts[band] as usize..self.starts[band + 1] as usize] {
+                let ((x0, y0), (x1, y1)) = self.segment(index);
+                let (dx, dy) = (x1 - x0, y1 - y0);
+                let length_squared = dx * dx + dy * dy;
+                let t = if length_squared > 0.0 {
+                    (((u - x0) * dx + (v - y0) * dy) / length_squared).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+                let candidate = (x0 + t * dx, y0 + t * dy);
+                let distance = ((u - candidate.0).powi(2) + (v - candidate.1).powi(2)).sqrt();
+                if distance < *best {
+                    *best = distance;
+                    *best_point = candidate;
+                }
+            }
+        };
+        for ring in 0..bands {
+            if ring > 1 && (ring - 1) as f64 * band_height > best {
+                break;
+            }
+            let below = centre.checked_sub(ring);
+            let above = if centre + ring < bands { Some(centre + ring) } else { None };
+            if below.is_none() && above.is_none() {
+                break;
+            }
+            if let Some(band) = below {
+                search(band, &mut best, &mut best_point);
+            }
+            if let Some(band) = above {
+                if ring > 0 {
+                    search(band, &mut best, &mut best_point);
+                }
+            }
+        }
+        (best_point, best)
+    }
 }
 
-/// THE HOLE-CONTAINMENT FLOOR: a PLANAR face whose hole loop has left that
-/// face's own outer loop is refused, naming the hole.
+/// THE HOLE-CONTAINMENT FLOOR: a face whose hole loop has left that face's
+/// own outer loop is refused, naming the hole — on EVERY carrier, planar or
+/// not.
 ///
 /// A hole is a hole IN something. Carry a bore's mouth off the flat it opens
 /// through — a direct edit dragging the wall clear of the body — and what the
@@ -692,13 +750,43 @@ impl<'a> BoundaryBands<'a> {
 /// result needs the hole to break through a neighbouring face — a topology
 /// change the direct edits do not make — so this refuses instead of shipping it.
 ///
-/// Decided in the face's own parameter plane, which is affine to 3D for a
-/// plane, by parity against the outer loop (the one enclosing the largest
-/// parameter area). A point that fails parity but sits within `tolerance` of
-/// the outer loop is treated as ON it, so a mouth tangent to its face's own
-/// boundary is not convicted by sampling noise. The predicate is only as fine
-/// as the sampling: a curved hole poking out by less than its sampled chord sag
-/// can still pass.
+/// Decided in the face's own parameter plane by parity against the outer loop
+/// (the one enclosing the largest parameter area). A point that fails parity
+/// but sits within `tolerance` of the outer loop is treated as ON it, so a
+/// mouth tangent to its face's own boundary is not convicted by sampling
+/// noise. The predicate is only as fine as the sampling: a curved hole poking
+/// out by less than its sampled chord sag can still pass.
+///
+/// On a PLANE the parameter plane is affine to space and the pcurves are exact
+/// images, so the band is the parameter band alone. On every other carrier the
+/// pcurves are FITTED, to [`crate::PCURVE_REFINEMENT_TOLERANCE`] in space, and
+/// a fit's noise can put a station of a legitimately tangent mouth a few
+/// parameter ulps outside its face. So a station that fails both tests on a
+/// non-affine face is convicted only if it is also further than
+/// [`CURVED_BREACH_ACQUITTAL`] IN SPACE from the nearest point of the outer
+/// loop — the same trace read back through the surface. That distance is the
+/// smallest curved breach the floor can see; it is a floor on the fit, not on
+/// the sampling. Until 2026-09-30 every non-planar face was skipped outright,
+/// so a mouth carried off a cylinder wall or a torus by a motion that pierced
+/// nothing the scan could resolve shipped as a wrong body.
+///
+/// A closed carrier is read in two shapes. Where NO loop winds the period
+/// (the nested case — a bored post's wall, whose outer loop holds the seam
+/// twice), the outer loop is the one enclosing the largest parameter area and
+/// the holes must lie inside it; a hole station is folded by whole periods
+/// into the outer loop's window only where that loop carries no seam coedge,
+/// so a hole traced across a seam that IS an edge of the outer loop (a hole
+/// with an edge of its own face running through it — the builders split the
+/// seam where a mouth reaches it) is a wrong body and is convicted. Where some
+/// loop DOES wind (the banded case — a refitted full cylinder is bounded by
+/// two rings and no seam, a dome cut off a sphere by one), the face has no
+/// outer loop and a hole must lie on every ring's material side, decided
+/// along the open direction with the ring's winding sign and the face's own
+/// orientation convention ([`banded_hole_breach`]). A band whose rings wind a
+/// carrier closed BOTH ways selects its intended region by the same orientation
+/// convention, using the next transverse boundary modulo that period. A loop
+/// winding both ways remains outside this arm. A breach the banded arm convicts is refused, not
+/// broken out: the breakout route reads a nested outer loop.
 ///
 /// Both questions go through [`BoundaryBands`], which is an INDEX over the
 /// outer loop and not a coarser reading of it: the answers are the ones a walk
@@ -726,10 +814,14 @@ struct HoleBreach {
     loop_index: usize,
     loop_id: u64,
     at: (f64, f64),
+    /// Convicted by the banded arm — the face has rings and no outer loop, so
+    /// the breakout route, which reads a nested outer loop, has nothing to
+    /// read and declines by name.
+    banded: bool,
 }
 
-/// THE FLOOR'S PREDICATE, verbatim — the first hole loop on a planar face that
-/// has left that face's own outer loop, or `None`.
+/// THE FLOOR'S PREDICATE, verbatim — the first hole loop on any face that has
+/// left that face's own outer loop, or `None`.
 ///
 /// This is the whole of the decision [`refuse_holes_leaving_their_faces`] used
 /// to make inline; the refusal is now written by [`hole_breach_refusal`] off
@@ -741,12 +833,19 @@ fn first_hole_breach(solid: &BrepSolid) -> Option<HoleBreach> {
             if face.loops.len() < 2 {
                 continue;
             }
-            if !matches!(
-                face.surface.analytic(),
-                Some(crate::AnalyticSurface::Plane { .. })
-            ) {
-                continue;
-            }
+            // Exact pcurves on an affine carrier; fitted ones everywhere else,
+            // which earn the acquittal in space.
+            let fitted = !face.surface.is_affine().unwrap_or(false);
+            let closed = face.surface.closed_directions().unwrap_or((false, false));
+            let period = (
+                face.surface.domain_u().map(|[a, b]| b - a).unwrap_or(0.0),
+                face.surface.domain_v().map(|[a, b]| b - a).unwrap_or(0.0),
+            );
+            let windings: Vec<(i32, i32)> = face
+                .loops
+                .iter()
+                .map(|record| loop_winding(record, closed, period))
+                .collect();
             let polylines = face
                 .loops
                 .iter()
@@ -758,41 +857,587 @@ fn first_hole_breach(solid: &BrepSolid) -> Option<HoleBreach> {
             if polylines.len() != face.loops.len() || polylines.iter().any(Vec::is_empty) {
                 continue;
             }
-            let outer_index = (0..polylines.len())
-                .max_by(|&a, &b| {
-                    polyline_area(&polylines[a])
-                        .abs()
-                        .total_cmp(&polyline_area(&polylines[b]).abs())
-                })
-                .unwrap_or(0);
-            let outer = &polylines[outer_index];
-            // Every hole point is asked the same two questions against this
-            // one loop, so the loop is indexed ONCE and each question then
-            // reads the band it falls in rather than the whole polyline. The
-            // answers are the ones the whole-polyline walk gives; see
-            // [`BoundaryBands`].
-            let bands = BoundaryBands::build(outer);
-            let tolerance = boundary_tolerance(outer);
-            for (index, hole) in polylines.iter().enumerate() {
-                if index == outer_index {
+            let breach = if windings.iter().all(|&winding| winding == (0, 0)) {
+                let spherical = matches!(face.surface.analytic(), Some(crate::AnalyticSurface::Sphere { .. }));
+                if spherical && !sphere_has_parameter_outer(solid, face, &polylines) {
+                    spherical_hole_breach(solid, face)
+                } else {
+                    nested_hole_breach(face, &polylines, fitted, closed, period)
+                }
+            } else {
+                banded_hole_breach(face, &polylines, &windings, fitted, closed, period)
+            };
+            if breach.is_some() {
+                return breach;
+            }
+        }
+    }
+    None
+}
+
+/// A bounded spherical patch can use the existing indexed nested floor.
+/// Its largest UV loop must be a real, correctly oriented material outer
+/// boundary, with the other real loops oriented as holes. A full-domain
+/// rectangle made only of seams and collapsed poles is not such a boundary.
+fn sphere_has_parameter_outer(
+    solid: &BrepSolid,
+    face: &crate::FaceRecord,
+    polylines: &[Vec<(f64, f64)>],
+) -> bool {
+    let areas: Vec<_> = polylines.iter().map(|points| polyline_area(points)).collect();
+    let Some(outer) = (0..areas.len()).max_by(|&a, &b| areas[a].abs().total_cmp(&areas[b].abs())) else {
+        return false;
+    };
+    let orientation = if face.same_sense { 1.0 } else { -1.0 };
+    if areas[outer] * orientation <= 0.0 { return false; }
+    let real = |index: usize| face.loops[index].coedges.iter().any(|coedge| {
+        face.loops.iter().flat_map(|rim| &rim.coedges)
+            .filter(|other| other.edge_id == coedge.edge_id).count() == 1
+            && !solid.edges.iter().any(|edge| edge.id == coedge.edge_id && edge.degenerate)
+    });
+    real(outer) && (0..areas.len()).all(|i| i == outer || !real(i) || areas[i] * orientation <= 0.0)
+}
+
+/// A sphere has no distinguished outer boundary: two disjoint negatively
+/// oriented trims can both be holes in the remaining sphere. Choosing the
+/// largest UV polygon as an outer loop falsely rejects that topology, and
+/// even mistakes an imported retraced pole cut for a runaway hole. Ask the
+/// same spherical material-side classifier used by containment and meshing:
+/// each real boundary must lie in the region left by the other loops.
+fn spherical_hole_breach(solid: &BrepSolid, face: &crate::FaceRecord) -> Option<HoleBreach> {
+    let mut uses = std::collections::HashMap::new();
+    for coedge in face.loops.iter().flat_map(|rim| &rim.coedges) {
+        *uses.entry(coedge.edge_id).or_insert(0usize) += 1;
+    }
+    for (index, rim) in face.loops.iter().enumerate() {
+        let mut other = face.clone();
+        other.loops.remove(index);
+        // A loop containing only domain seams and collapsed poles carries
+        // no material boundary. Keep mixed loops intact: the sampler reads
+        // each coedge's endpoint from the next coedge's start. Removing a
+        // paired seam joining two rims would bridge those rims with fake
+        // chords; the spherical classifier cancels the seam itself.
+        other.loops.retain(|boundary| {
+            boundary.coedges.iter().any(|coedge| {
+                uses[&coedge.edge_id] == 1
+                    && !solid.edges.iter().any(|edge| {
+                        edge.id == coedge.edge_id && edge.degenerate
+                    })
+            })
+        });
+        if other.loops.is_empty() {
+            continue;
+        }
+        let [u0, u1] = face.surface.domain_u().ok()?;
+        for coedge in &rim.coedges {
+            // A seam traversed twice and a collapsed pole have no spherical
+            // area. Their UV trace is not a boundary of the retained region.
+            if uses[&coedge.edge_id] > 1
+                || solid
+                    .edges
+                    .iter()
+                    .any(|edge| edge.id == coedge.edge_id && edge.degenerate)
+            {
+                continue;
+            }
+            let boundary = LoopRecord {
+                id: rim.id,
+                coedges: vec![coedge.clone()],
+            };
+            let Ok(mut points) = loop_parameter_polyline(&boundary) else {
+                continue;
+            };
+            // Straight UV edges contribute only their start in the ordinary
+            // polygon sampler. Include an interior witness here: two holes
+            // can share horizontal boundary levels while their vertical sides
+            // run through the other hole's interior.
+            if coedge.pcurve.degree == 1 && coedge.pcurve.control_points.len() == 2 {
+                let [a, b] = coedge.pcurve.domain().ok()?;
+                let midpoint = coedge.pcurve.evaluate((a + b) * 0.5).ok()?;
+                points.push((midpoint.x, midpoint.y));
+            }
+            for (u, v) in points {
+                if crate::parameter_point_in_face(
+                    &other,
+                    crate::Vec2 {
+                        x: u0 + (u - u0).rem_euclid(u1 - u0),
+                        y: v,
+                    },
+                    1e-6,
+                )
+                .ok()
+                    != Some(crate::PolygonClass::Outside)
+                {
                     continue;
                 }
-                let Some(&at) = hole
-                    .iter()
-                    .find(|&&point| !bands.contains(point) && !bands.within(point, tolerance))
-                else {
-                    continue;
-                };
                 return Some(HoleBreach {
                     face: face.id,
                     loop_index: index,
-                    loop_id: face.loops[index].id,
-                    at,
+                    loop_id: rim.id,
+                    at: (u, v),
+                    banded: true,
                 });
             }
         }
     }
     None
+}
+
+/// How many times a loop goes round each CLOSED direction of its carrier, read
+/// off its coedges' pcurve ENDPOINTS rather than its traced stations: a ring
+/// the refit writes as one straight pcurve across the whole period traces to a
+/// single station, and the trace cannot see it go round. An open direction
+/// winds nothing.
+fn loop_winding(loop_record: &LoopRecord, closed: (bool, bool), period: (f64, f64)) -> (i32, i32) {
+    let (mut du, mut dv) = (0.0, 0.0);
+    for coedge in &loop_record.coedges {
+        let Ok([d0, d1]) = coedge.pcurve.domain() else { return (0, 0) };
+        let (Ok(start), Ok(end)) = (coedge.pcurve.evaluate(d0), coedge.pcurve.evaluate(d1)) else {
+            return (0, 0);
+        };
+        du += end.x - start.x;
+        dv += end.y - start.y;
+    }
+    let wind = |closed: bool, net: f64, period: f64| {
+        if closed && period > 0.0 && net.is_finite() {
+            (net / period).round() as i32
+        } else {
+            0
+        }
+    };
+    (wind(closed.0, du, period.0), wind(closed.1, dv, period.1))
+}
+
+/// Does this loop hold the same edge twice — a SEAM of a closed carrier, both
+/// sides of it on this one face?
+fn has_seam_pair(loop_record: &LoopRecord) -> bool {
+    loop_record.coedges.iter().enumerate().any(|(index, coedge)| {
+        loop_record.coedges[index + 1..]
+            .iter()
+            .any(|other| other.edge_id == coedge.edge_id)
+    })
+}
+
+/// THE NESTED CASE: no loop winds the carrier, so the loop enclosing the
+/// largest parameter area is the face's outer boundary and every other loop is
+/// a hole that must lie inside it. This is the floor exactly as the planar arm
+/// always ran it, with two additions for a closed carrier: a hole station is
+/// FOLDED by whole periods into the outer loop's own window where the outer
+/// loop carries no seam coedge (a fitted pcurve unwraps across the seam on its
+/// own terms, and a partial patch's outer loop and its hole need not have
+/// unwrapped the same way), and never folded where it does — then the seam is
+/// an edge of the outer loop and a hole across it is a wrong body.
+fn nested_hole_breach(
+    face: &crate::FaceRecord,
+    polylines: &[Vec<(f64, f64)>],
+    fitted: bool,
+    closed: (bool, bool),
+    period: (f64, f64),
+) -> Option<HoleBreach> {
+    let outer_index = (0..polylines.len())
+        .max_by(|&a, &b| {
+            polyline_area(&polylines[a])
+                .abs()
+                .total_cmp(&polyline_area(&polylines[b]).abs())
+        })
+        .unwrap_or(0);
+    let outer = &polylines[outer_index];
+    // Every hole point is asked the same two questions against this one
+    // loop, so the loop is indexed ONCE and each question then reads the band
+    // it falls in rather than the whole polyline. The answers are the ones
+    // the whole-polyline walk gives; see [`BoundaryBands`].
+    let bands = BoundaryBands::build(outer);
+    let tolerance = boundary_tolerance(outer);
+    let seamed = has_seam_pair(&face.loops[outer_index]);
+    let (mut lo, mut hi) = ((f64::MAX, f64::MAX), (f64::MIN, f64::MIN));
+    for &(u, v) in outer {
+        lo = (lo.0.min(u), lo.1.min(v));
+        hi = (hi.0.max(u), hi.1.max(v));
+    }
+    let centre = (0.5 * (lo.0 + hi.0), 0.5 * (lo.1 + hi.1));
+    let fold_u = closed.0 && !seamed && period.0 > 0.0;
+    let fold_v = closed.1 && !seamed && period.1 > 0.0;
+    let fold = |(u, v): (f64, f64)| {
+        (
+            if fold_u { u + period.0 * ((centre.0 - u) / period.0).round() } else { u },
+            if fold_v { v + period.1 * ((centre.1 - v) / period.1).round() } else { v },
+        )
+    };
+    for (index, hole) in polylines.iter().enumerate() {
+        if index == outer_index {
+            continue;
+        }
+        let Some(at) = hole.iter().map(|&point| fold(point)).find(|&point| {
+            !bands.contains(point)
+                && !bands.within(point, tolerance)
+                && !(fitted && acquitted_in_space(&face.surface, point, bands.nearest(point).0))
+        }) else {
+            continue;
+        };
+        return Some(HoleBreach {
+            face: face.id,
+            loop_index: index,
+            loop_id: face.loops[index].id,
+            at,
+            banded: false,
+        });
+    }
+    None
+}
+
+/// A ring's segments in the parameter plane, one coedge after another with
+/// every end point included, closed by the whole periods the ring winds — so
+/// the segment that closes it is the short one back to the start's image, not
+/// a jump across the domain.
+struct Ring {
+    segments: Vec<((f64, f64), (f64, f64))>,
+    /// Is the face's material on the ring's POSITIVE side along the transverse
+    /// direction?
+    material_positive: bool,
+    positive_winding: bool,
+}
+
+/// THE BANDED CASE: some loop winds the carrier's closed direction, so the
+/// face has no outer loop in the parameter plane — it is a band between RINGS
+/// (a refitted full cylinder is bounded by two, a dome cut off a sphere by
+/// one), and its holes are the loops that do not wind. A hole is in the face
+/// when it is on every ring's MATERIAL side, decided by a ray along the open
+/// direction: the ring's winding sign says which side its material is on once
+/// the face's own orientation convention is read off a hole (a hole loop runs
+/// with the material on its left when its parameter area is negative — the
+/// mirror of the outer loop it is a hole in — and on its right otherwise).
+/// Stations and rings are compared modulo the period, so a ring or a hole
+/// unwrapped across the seam reads the same as one that was not.
+///
+/// Every winding loop must go round exactly once along the same closed axis.
+/// If the transverse direction is also closed, oriented crossings select the
+/// material region (including the complementary band); ring windings must
+/// cancel. Loops winding both axes remain outside this arm.
+fn banded_hole_breach(
+    face: &crate::FaceRecord,
+    polylines: &[Vec<(f64, f64)>],
+    windings: &[(i32, i32)],
+    fitted: bool,
+    closed: (bool, bool),
+    period: (f64, f64),
+) -> Option<HoleBreach> {
+    let rings_wind = |axis: usize| {
+        windings
+            .iter()
+            .filter(|&&winding| winding != (0, 0))
+            .all(|&(u, v)| {
+                if axis == 0 {
+                    u.abs() == 1 && v == 0
+                } else {
+                    v.abs() == 1 && u == 0
+                }
+            })
+    };
+    // `along` is the closed direction the rings wind; `open` names the
+    // transverse axis (which can itself be periodic).
+    let along = if rings_wind(0) && closed.0 && period.0 > 0.0 {
+        0
+    } else if rings_wind(1) && closed.1 && period.1 > 0.0 {
+        1
+    } else {
+        return None;
+    };
+    let open = 1 - along;
+    let axis = |point: (f64, f64), which: usize| if which == 0 { point.0 } else { point.1 };
+    let period_along = axis(period, along);
+    let transverse_period = if if open == 0 { closed.0 } else { closed.1 } {
+        let p = axis(period, open);
+        // Boundaries of a region on a torus must cancel in homology. A
+        // nonseparating single ring does not define a material band.
+        if p <= 0.0
+            || windings
+                .iter()
+                .map(|&w| if along == 0 { w.0 } else { w.1 })
+                .sum::<i32>()
+                != 0
+        {
+            return None;
+        }
+        Some(p)
+    } else {
+        None
+    };
+    let domain_start = if along == 0 {
+        face.surface.domain_u().ok()?[0]
+    } else {
+        face.surface.domain_v().ok()?[0]
+    };
+
+    // The orientation convention, read off the first hole with an area.
+    let left = polylines
+        .iter()
+        .zip(windings)
+        .filter(|(_, &winding)| winding == (0, 0))
+        .map(|(hole, _)| {
+            // Area is translation invariant. Subtract a local origin before
+            // multiplying: period translations must not cancel a small
+            // hole's area to zero or invert its orientation convention.
+            let origin = hole[0];
+            let local: Vec<_> = hole.iter()
+                .map(|&(u, v)| (u - origin.0, v - origin.1))
+                .collect();
+            polyline_area(&local)
+        })
+        .find(|area| *area != 0.0)?
+        < 0.0;
+
+    let mut rings: Vec<Ring> = Vec::new();
+    let mut extent = 0.0f64;
+    for (index, record) in face.loops.iter().enumerate() {
+        let winding = windings[index];
+        if winding == (0, 0) {
+            continue;
+        }
+        let mut points: Vec<(f64, f64)> = Vec::new();
+        for coedge in &record.coedges {
+            points.extend(coedge_parameter_polyline(coedge).ok()?);
+        }
+        let first = *points.first()?;
+        points.push((
+            first.0 + winding.0 as f64 * period.0,
+            first.1 + winding.1 as f64 * period.1,
+        ));
+        for window in points.windows(2) {
+            extent = extent
+                .max(axis(window[0], open) - axis(window[1], open))
+                .max(axis(window[1], open) - axis(window[0], open));
+        }
+        let segments = points
+            .windows(2)
+            .map(|window| (window[0], window[1]))
+            .collect();
+        // Material on the LEFT of a ring winding +u lies at +v; on the left of
+        // one winding +v it lies at −u.
+        let positive_winding = axis((winding.0 as f64, winding.1 as f64), along) > 0.0;
+        let material_positive = if along == 0 {
+            positive_winding == left
+        } else {
+            positive_winding != left
+        };
+        rings.push(Ring {
+            segments,
+            material_positive,
+            positive_winding,
+        });
+    }
+    let tolerance = (extent.max(period_along) * 1e-9).max(1e-12);
+
+    for (index, hole) in polylines.iter().enumerate() {
+        if windings[index] != (0, 0) {
+            continue;
+        }
+        for &station in hole {
+            // Reduced into one period along the rings.
+            let station = {
+                let s = axis(station, along);
+                let reduced = domain_start + (s - domain_start).rem_euclid(period_along);
+                if along == 0 {
+                    (reduced, station.1)
+                } else {
+                    (station.0, reduced)
+                }
+            };
+            let held = if let Some(transverse) = transverse_period {
+                periodic_band_holds(&rings, station, along, period_along, transverse)?
+            } else {
+                rings
+                    .iter()
+                    .all(|ring| ring_holds(ring, station, along, period_along))
+            };
+            if held {
+                continue;
+            }
+            let (nearest, distance) =
+                rings_nearest(&rings, station, along, period_along, transverse_period);
+            if distance <= tolerance {
+                continue;
+            }
+            if fitted && acquitted_in_space(&face.surface, station, nearest) {
+                continue;
+            }
+            return Some(HoleBreach {
+                face: face.id,
+                loop_index: index,
+                loop_id: face.loops[index].id,
+                at: station,
+                banded: true,
+            });
+        }
+    }
+    None
+}
+
+/// Images relative to the segment midpoint nearest the query, rather than
+/// the domain origin. Ordinary traced ring segments span at most a period
+/// and a bit; two images either way cover those even after arbitrary whole
+/// period translations. This is not a bound for multiply traversed segments.
+const RING_IMAGES: [i32; 5] = [-2, -1, 0, 1, 2];
+
+/// Is `station` on this ring's material side? A ray from the station along
+/// the OPEN direction, positive way, crosses the ring an odd number of times
+/// exactly when the ring lies on the positive side of the station — and then
+/// the station is on the ring's NEGATIVE side, which is the material side
+/// exactly when the ring's material is not on its positive side.
+fn ring_holds(ring: &Ring, station: (f64, f64), along: usize, period: f64) -> bool {
+    let (s_along, s_open) = if along == 0 {
+        (station.0, station.1)
+    } else {
+        (station.1, station.0)
+    };
+    let mut crossings = 0usize;
+    for &(a, b) in &ring.segments {
+        let (a_along, a_open) = if along == 0 { (a.0, a.1) } else { (a.1, a.0) };
+        let (b_along, b_open) = if along == 0 { (b.0, b.1) } else { (b.1, b.0) };
+        for image in RING_IMAGES {
+            let shift =
+                (((s_along - 0.5 * (a_along + b_along)) / period).round() + image as f64) * period;
+            let (a_s, b_s) = (a_along + shift, b_along + shift);
+            if (a_s > s_along) != (b_s > s_along) {
+                let at = a_open + (s_along - a_s) * (b_open - a_open) / (b_s - a_s);
+                if at > s_open {
+                    crossings += 1;
+                }
+            }
+        }
+    }
+    let ring_is_positive = crossings % 2 == 1;
+    ring_is_positive != ring.material_positive
+}
+
+/// On a doubly periodic chart there is no outside at infinity. The first
+/// transverse boundary ahead of a station decides its material side. Its
+/// orientation comes from the same hole-area convention as the open band;
+/// reversing all loops therefore preserves the region, while reversing just
+/// the rings chooses its complement. Signed events cancel tangent contacts.
+fn periodic_band_holds(
+    rings: &[Ring],
+    station: (f64, f64),
+    along: usize,
+    period: f64,
+    transverse: f64,
+) -> Option<bool> {
+    let (s, t) = if along == 0 {
+        station
+    } else {
+        (station.1, station.0)
+    };
+    let mut events = Vec::new();
+    for ring in rings {
+        for &(a, b) in &ring.segments {
+            let (a_s, a_t) = if along == 0 { a } else { (a.1, a.0) };
+            let (b_s, b_t) = if along == 0 { b } else { (b.1, b.0) };
+            let centre = ((s - 0.5 * (a_s + b_s)) / period).round();
+            for image in RING_IMAGES {
+                let shift = (centre + image as f64) * period;
+                let (a_image, b_image) = (a_s + shift, b_s + shift);
+                if (a_image > s) != (b_image > s) {
+                    // Both segments incident to a tangent vertex must emit
+                    // the stored vertex value. Re-interpolating an endpoint
+                    // can move one event by ulps, splitting an exact signed
+                    // cancellation and falsely rejecting a remote station.
+                    // Compare in the same shifted chart as the crossing test;
+                    // no event-distance tolerance or physical band changes.
+                    let at = if s == a_image {
+                        a_t
+                    } else if s == b_image {
+                        b_t
+                    } else {
+                        a_t + (s - a_s - shift) * (b_t - a_t) / (b_s - a_s)
+                    };
+                    let positive = if (b_s > a_s) == ring.positive_winding {
+                        ring.material_positive
+                    } else {
+                        !ring.material_positive
+                    };
+                    events.push((
+                        (at - t).rem_euclid(transverse),
+                        if positive { 1i32 } else { -1 },
+                    ));
+                }
+            }
+        }
+    }
+    events.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let mut i = 0;
+    while i < events.len() {
+        let distance = events[i].0;
+        let mut sign = 0;
+        while i < events.len() && events[i].0 == distance {
+            sign += events[i].1;
+            i += 1;
+        }
+        if sign != 0 {
+            return Some(sign < 0);
+        }
+    }
+    None
+}
+
+/// The nearest point of any ring to `station`, over the rings' period images,
+/// and its distance in the parameter plane.
+fn rings_nearest(
+    rings: &[Ring],
+    station: (f64, f64),
+    along: usize,
+    period: f64,
+    transverse: Option<f64>,
+) -> ((f64, f64), f64) {
+    let (u, v) = station;
+    let mut best = (station, f64::INFINITY);
+    for ring in rings {
+        for &(a, b) in &ring.segments {
+            for image in RING_IMAGES {
+                let midpoint = (0.5 * (a.0 + b.0), 0.5 * (a.1 + b.1));
+                let (s, m) = if along == 0 {
+                    (u, midpoint.0)
+                } else {
+                    (v, midpoint.1)
+                };
+                let along_shift = (((s - m) / period).round() + image as f64) * period;
+                for across_image in if transverse.is_some() {
+                    &RING_IMAGES[..]
+                } else {
+                    &RING_IMAGES[2..3]
+                } {
+                    let across_shift = transverse
+                        .map(|p| {
+                            let (s, m) = if along == 0 {
+                                (v, midpoint.1)
+                            } else {
+                                (u, midpoint.0)
+                            };
+                            (((s - m) / p).round() + *across_image as f64) * p
+                        })
+                        .unwrap_or(0.0);
+                    let shift = if along == 0 {
+                        (along_shift, across_shift)
+                    } else {
+                        (across_shift, along_shift)
+                    };
+                    let (x0, y0) = (a.0 + shift.0, a.1 + shift.1);
+                    let (x1, y1) = (b.0 + shift.0, b.1 + shift.1);
+                    let (dx, dy) = (x1 - x0, y1 - y0);
+                    let length_squared = dx * dx + dy * dy;
+                    let t = if length_squared > 0.0 {
+                        (((u - x0) * dx + (v - y0) * dy) / length_squared).clamp(0.0, 1.0)
+                    } else {
+                        0.0
+                    };
+                    let candidate = (x0 + t * dx, y0 + t * dy);
+                    let distance = ((u - candidate.0).powi(2) + (v - candidate.1).powi(2)).sqrt();
+                    if distance < best.1 {
+                        best = (candidate, distance);
+                    }
+                }
+            }
+        }
+    }
+    best
 }
 
 /// The "on the boundary" band, measured against the outer loop's own parameter
@@ -805,6 +1450,37 @@ fn boundary_tolerance(outer: &[(f64, f64)]) -> f64 {
     }
     let extent = (hi.0 - lo.0).max(hi.1 - lo.1);
     (extent * 1e-9).max(1e-12)
+}
+
+/// How far IN SPACE a station of a fitted hole loop may sit outside its face's
+/// outer loop and still be read as ON it: ten times the floor the pcurve fit
+/// refines to ([`crate::PCURVE_REFINEMENT_TOLERANCE`], 1e-7). A tangent mouth's
+/// fit noise is under the floor; a breach the floor is for is a mouth carried
+/// out by a motion, orders above it.
+const CURVED_BREACH_ACQUITTAL: f64 = 10.0 * crate::PCURVE_REFINEMENT_TOLERANCE;
+
+/// Is a station that failed parity and the parameter band still within
+/// [`CURVED_BREACH_ACQUITTAL`] of the face's boundary IN SPACE? Read through
+/// the face's own surface at the station and at the boundary's nearest
+/// parameter point (`nearest`), so a fitted pcurve's parameter noise is
+/// judged by what it amounts to on the carrier. A surface that cannot be
+/// evaluated acquits nothing.
+fn acquitted_in_space(
+    surface: &crate::NurbsSurface,
+    point: (f64, f64),
+    nearest: (f64, f64),
+) -> bool {
+    // EXTENDED, not clamped: a station past the end of an open direction is
+    // read where the carrier's own ruled extension puts it, and one past a
+    // seam where the period wraps it. `evaluate` clamps a parameter into the
+    // domain, which would put every overshoot back ON the rim and acquit it.
+    match (
+        surface.evaluate_extended(point.0, point.1),
+        surface.evaluate_extended(nearest.0, nearest.1),
+    ) {
+        (Ok(here), Ok(there)) => here.sub(there).length() <= CURVED_BREACH_ACQUITTAL,
+        _ => false,
+    }
 }
 
 /// The floor's refusal, written off the breach it convicted.
@@ -820,7 +1496,7 @@ fn hole_breach_refusal(solid: &BrepSolid, breach: &HoleBreach, entry: &str) -> K
     };
     let (u, v) = breach.at;
     let where_in_space = face
-        .and_then(|face| face.surface.evaluate(u, v).ok())
+        .and_then(|face| face.surface.evaluate_extended(u, v).ok())
         .map(|point| format!(" — ({:.4}, {:.4}, {:.4}) in space", point.x, point.y, point.z))
         .unwrap_or_default();
     KernelRefusal::unsound(
@@ -1104,8 +1780,8 @@ fn segments_cross(a: (f64, f64), b: (f64, f64), c: (f64, f64), d: (f64, f64)) ->
 
 /// THE BREAKOUT, reached from the containment floor instead of from the scan.
 ///
-/// The floor convicts a hole loop that has left the planar face it is recorded
-/// on. Where that hole has left ONTO a named neighbour — the case the operator
+/// The floor convicts a hole loop that has left the face it is recorded on,
+/// planar or curved. Where that hole has left ONTO a named neighbour — the case the operator
 /// reported, an exit hole dragged across the edge between two faces — the right
 /// body is the one the self-crossing repair already builds for a bore carried
 /// out through a side wall: the moved carrier and the neighbour split along
@@ -1130,6 +1806,18 @@ fn repair_hole_breakout(solid: &BrepSolid, breach: &HoleBreach) -> Result<BrepSo
         face: breach.face,
         loop_id: breach.loop_id,
     };
+    if breach.banded {
+        return Err(KernelRefusal::unsupported(
+            KernelStage::Validate,
+            "breakout.band_face",
+            format!(
+                "face {} is a band bounded by rings that wind its carrier's period, with no outer \
+                 loop in its parameter plane; this route re-trims a hole against the outer loop \
+                 it straddles and does not re-trim a band",
+                breach.face,
+            ),
+        ));
+    }
     // THE STRADDLE: part of the mouth still inside the face it was recorded on,
     // part outside. Which neighbour is read off the crossing, exactly.
     match breakout_pair(solid, breach) {

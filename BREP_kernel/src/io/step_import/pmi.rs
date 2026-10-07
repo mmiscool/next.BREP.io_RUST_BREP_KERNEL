@@ -957,6 +957,8 @@ pub(super) fn lift_pmi(
         semantics.push(Semantic {
             entity: *id,
             annotation: PmiAnnotation {
+                plugin_replay: None,
+                persistent_data: serde_json::Value::Null,
                 kind: "datum".into(),
                 enabled: true,
                 params: serde_json::Value::Object(params(vec![
@@ -1030,6 +1032,8 @@ pub(super) fn lift_pmi(
             semantics.push(Semantic {
                 entity: *id,
                 annotation: PmiAnnotation {
+                    plugin_replay: None,
+                    persistent_data: serde_json::Value::Null,
                     kind: kind.into(),
                     enabled: true,
                     params: serde_json::Value::Object(map),
@@ -1114,6 +1118,8 @@ pub(super) fn lift_pmi(
         semantics.push(Semantic {
             entity: *id,
             annotation: PmiAnnotation {
+                plugin_replay: None,
+                persistent_data: serde_json::Value::Null,
                 kind: "fcf".into(),
                 enabled: true,
                 params: serde_json::Value::Object(map),
@@ -1182,6 +1188,8 @@ pub(super) fn lift_pmi(
         }
         let annotation_id = state.next_id("NOTE");
         let mut annotation = PmiAnnotation {
+            plugin_replay: None,
+            persistent_data: serde_json::Value::Null,
             kind: "note".into(),
             enabled: true,
             params: serde_json::Value::Object(params(vec![("id", annotation_id.into()), ("text", text.into())])),

@@ -26,7 +26,7 @@ static BUTTONS: &[WorkbenchButton] = &[WorkbenchButton {
     // ▤ (U+25A4, square with horizontal fill) — a flat sheet with fold lines;
     // renders in the bundled DejaVu font (no tofu).
     glyph: "\u{25A4}",
-    tooltip: "Export flat pattern (DXF / SVG)",
+    ribbon_path: "Home/Sheet Metal/Export flat pattern", size: crate::workbench::CommandSize::Compact, tooltip: "Export flat pattern (DXF / SVG)",
     when: None,
     pressed: None,
     disabled: None,

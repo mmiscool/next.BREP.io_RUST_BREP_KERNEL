@@ -341,6 +341,8 @@ pub fn schema() -> serde_json::Value {
     "type": "LOFT",
     "shortName": "LOFT",
     "longName": "Loft",
+    "ribbonPath": "Home/Modeling/Loft",
+    "commandSize": "Compact",
     "displayBuilder": false,
     "inputParamsSchema": {
         "id": {

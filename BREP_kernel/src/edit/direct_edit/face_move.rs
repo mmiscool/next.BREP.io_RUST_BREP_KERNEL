@@ -730,6 +730,21 @@ fn verify_chord_on_carrier(
 /// from `face_offset::retrim_offset_ruled_face` in exactly that second growth
 /// call — the partial-sweep `Revolution` prolongation, which the offset push has
 /// never run.
+///
+/// **The growth covers the rim's axial extremes, not only the five stations
+/// per coedge `boundary_samples` pins (2026-10-03).** A rim re-intersected on a
+/// tilted wall is an ellipse whose axial extremes fall BETWEEN those stations:
+/// on the 2026-09-21 runaway-bore document the rotated `Pin_S` was grown to
+/// `[0, 53.0875]` along its axis while its mouth ellipses truly ran
+/// `[-2.5436, 17.1686]` and `[35.9189, 55.6311]`, so each left the chart by
+/// 2.5436 mm and the pcurve fitted against the bounded chart stood 0.3722 /
+/// 0.4222 mm off its edge (`validate()` read exactly that; the acceptance's
+/// crossing repair happened to rebuild them later). The growth now reads each
+/// rim edge's axial extent with [`rim_axial_extent`] — every local extremum of
+/// the sampled axial coordinate refined, and a CERTIFIED bound from the control
+/// polygons of the pieces between stations — and grows the carrier to the
+/// certified bound, so the rim is inside the chart by construction; a carrier
+/// the five stations already grew far enough is left exactly as it was.
 pub(super) fn retrim_ruled_face(
     solid: &mut BrepSolid,
     face_id: u64,
@@ -750,15 +765,250 @@ pub(super) fn retrim_ruled_face(
         face_pos,
         final_edges,
         |solid, points| {
+            let mut points = points.to_vec();
+            points.extend(rim_axial_growth_points(
+                &solid.shells[shell].faces[face_pos],
+                final_edges,
+                op,
+            )?);
             // The carrier helpers are typed; this retrim's closure is still
             // the stringly shape its callee asks for (lossy exit).
-            extend_ruled_neighbour_over(solid, face_id, points, tolerance)?;
-            Ok(extend_revolution_carrier_over(solid, face_id, points, tolerance)?)
+            extend_ruled_neighbour_over(solid, face_id, &points, tolerance)?;
+            Ok(extend_revolution_carrier_over(solid, face_id, &points, tolerance)?)
         },
         tolerance,
         op,
     )
     
+}
+
+/// The points where each rim edge of `face` reaches its lowest and highest
+/// axial coordinate on the face's ruled or partial-sweep revolution carrier —
+/// the two points per coedge the carrier must be grown to cover, read from
+/// the caller's UPDATED edge table like `boundary_samples`. A face on any other
+/// carrier contributes nothing (the growth helpers no-op there anyway).
+///
+/// Each edge's axial coordinate `a(t) = (c(t) − origin) · axis` is swept at 64
+/// stations over `[t0, t1]`; the extreme station's two neighbours bracket the
+/// true extreme, and golden-section refinement closes that bracket to 1e-13 of
+/// the span. A grid alone would leave the chart short by the sampling
+/// shortfall (`A·(π/n)²/2`, 5e-5 mm on this document's 10 mm amplitude at
+/// n = 1024), and the fitter would read that shortfall back as a pcurve
+/// deviation.
+/// The two readings of [`rim_axial_extent`].
+#[derive(Clone, Copy, Debug)]
+pub(super) struct RimAxialExtent {
+    pub(super) refined_low: f64,
+    pub(super) refined_high: f64,
+    pub(super) certified_low: f64,
+    pub(super) certified_high: f64,
+}
+
+/// A rim's axial extent on a ruled or partial-sweep revolution carrier: the
+/// lowest and highest axial coordinate any point of the face's rim edges
+/// reaches, read from the caller's UPDATED edge table like `boundary_samples`.
+///
+/// Two readings, and the growth uses the second:
+///
+/// * `refined_low` / `refined_high` — the axial coordinate
+///   `a(t) = (c(t) − origin) · axis` is sampled at 16 stations per native knot
+///   span of each edge (plus the span and trim ends); EVERY sampled local
+///   extremum is then refined by golden section inside its two neighbouring
+///   stations to 1e-13 of the trim's span. This is where the extremum IS to
+///   the parameter's resolution when it lies in a sampled bracket; it is not a
+///   proof that no narrower extremum hides between two stations.
+/// * `certified_low` / `certified_high` — the control polygons of the curve
+///   pieces between consecutive stations (the curve split there): a rational
+///   B-spline with positive weights lies in the convex hull of its control
+///   points, so the union of the pieces' hulls CONTAINS THE WHOLE RIM. That
+///   is the one guarantee: `[certified_low, certified_high]` contains the true
+///   extent. The refined reading is a separate, unguaranteed one (a sampled
+///   extremum can sit INSIDE the true one), and the certified extent is only
+///   widened to contain it. The excess over the true extreme is the hull's,
+///   `O(h²)` in the station spacing (read on the fixtures in the record); a
+///   chart grown to it covers the rim with certainty and is never short by a
+///   sampling miss. A station closer than the curve's own split tolerance
+///   (`KNOT_IDENTITY_TOL`, absolute) or 1e-9 of the domain to a piece's end
+///   is not split at: the unsplit piece's hull still contains its whole
+///   interval, so coverage holds, only looser.
+///
+/// A rim edge with a non-positive control weight has no hull bound; the
+/// reading refuses by name rather than certify what it cannot. A face on any
+/// other carrier reads `None` (the growth helpers no-op there anyway).
+pub(super) fn rim_axial_extent(
+    face: &FaceRecord,
+    edges: &HashMap<u64, EdgeRecord>,
+    op: &str,
+) -> Result<Option<RimAxialExtent>, KernelRefusal> {
+    let frame = match face.surface.analytic() {
+        Some(AnalyticSurface::RuledRevolution { frame, .. })
+        | Some(AnalyticSurface::Revolution { frame, .. }) => frame.clone(),
+        _ => return Ok(None),
+    };
+    const STATIONS_PER_SPAN: usize = 16;
+    let mut extent = RimAxialExtent {
+        refined_low: f64::INFINITY,
+        refined_high: f64::NEG_INFINITY,
+        certified_low: f64::INFINITY,
+        certified_high: f64::NEG_INFINITY,
+    };
+    let mut read_any = false;
+    for loop_record in &face.loops {
+        for coedge in &loop_record.coedges {
+            let edge = edges
+                .get(&coedge.edge_id)
+                .ok_or_else(|| format!("{op}: missing edge {}", coedge.edge_id))
+                .or_refuse(KernelStage::Refine, "retrim_missing_edge")?;
+            if edge.degenerate {
+                continue;
+            }
+            let curve = &edge.curve;
+            let axial_of = |point: Vec3| point.sub(frame.origin).dot(frame.axis);
+            let axial = |t: f64| -> Result<f64, KernelRefusal> {
+                Ok(axial_of(curve.evaluate(t).or_refuse(KernelStage::Refine, "evaluate")?))
+            };
+            let (lo, hi) = (edge.t0.min(edge.t1), edge.t0.max(edge.t1));
+            let span = hi - lo;
+            if !(span > 0.0) {
+                continue;
+            }
+            // Stations: the trim ends, every native knot inside the trim, and
+            // 16 per knot span between them.
+            let mut stations: Vec<f64> = vec![lo];
+            let mut knots: Vec<f64> = curve.knots.iter().copied().filter(|&k| k > lo && k < hi).collect();
+            knots.dedup_by(|a, b| (*a - *b).abs() <= 1e-12 * span);
+            let mut previous = lo;
+            for knot in knots.into_iter().chain(std::iter::once(hi)) {
+                if knot - previous <= 1e-12 * span {
+                    continue;
+                }
+                for step in 1..=STATIONS_PER_SPAN {
+                    stations.push(previous + (knot - previous) * step as f64 / STATIONS_PER_SPAN as f64);
+                }
+                previous = knot;
+            }
+            let readings: Vec<f64> = stations.iter().map(|&t| axial(t)).collect::<Result<_, _>>()?;
+            let last = readings.len() - 1;
+            // Every sampled local extremum, refined inside its bracket.
+            for sign in [1.0f64, -1.0] {
+                for index in 0..=last {
+                    let value = sign * readings[index];
+                    let left_ok = index == 0 || value >= sign * readings[index - 1];
+                    let right_ok = index == last || value >= sign * readings[index + 1];
+                    if !(left_ok && right_ok) {
+                        continue;
+                    }
+                    let (mut a, mut b) = (stations[index.saturating_sub(1)], stations[(index + 1).min(last)]);
+                    let f = |t: f64| -> Result<f64, KernelRefusal> { Ok(-sign * axial(t)?) };
+                    let phi = 0.618_033_988_749_894_9_f64;
+                    let mut c = b - phi * (b - a);
+                    let mut d = a + phi * (b - a);
+                    let (mut fc, mut fd) = (f(c)?, f(d)?);
+                    for _ in 0..200 {
+                        if (b - a).abs() <= 1e-13 * span {
+                            break;
+                        }
+                        if fc < fd {
+                            b = d;
+                            d = c;
+                            fd = fc;
+                            c = b - phi * (b - a);
+                            fc = f(c)?;
+                        } else {
+                            a = c;
+                            c = d;
+                            fc = fd;
+                            d = a + phi * (b - a);
+                            fd = f(d)?;
+                        }
+                    }
+                    let best = (-fc).max(-fd).max(value) * sign;
+                    if sign > 0.0 {
+                        extent.refined_high = extent.refined_high.max(best);
+                    } else {
+                        extent.refined_low = extent.refined_low.min(best);
+                    }
+                }
+            }
+            // The certified bound: the control polygon of every piece between
+            // consecutive stations, the curve split there.
+            let mut rest = curve.clone();
+            let [d0, d1] = rest.domain().or_refuse(KernelStage::Refine, "domain")?;
+            // `NurbsCurve::split` refuses a parameter within the ABSOLUTE
+            // `KNOT_IDENTITY_TOL` of a domain end; the guard is that floor or
+            // 1e-9 of the domain, whichever is larger, and a station inside
+            // it is skipped (the unsplit piece's hull still covers it).
+            let guard = (1e-9 * (d1 - d0)).max(crate::KNOT_IDENTITY_TOL);
+            let mut pieces: Vec<NurbsCurve> = Vec::with_capacity(stations.len());
+            if lo > d0 + guard {
+                rest = rest.split(lo).or_refuse(KernelStage::Refine, "split")?.1;
+            }
+            for &t in &stations[1..last] {
+                let [r0, r1] = rest.domain().or_refuse(KernelStage::Refine, "domain")?;
+                if t <= r0 + guard || t >= r1 - guard {
+                    continue;
+                }
+                let (left, right) = rest.split(t).or_refuse(KernelStage::Refine, "split")?;
+                pieces.push(left);
+                rest = right;
+            }
+            if hi < d1 - guard {
+                let [r0, r1] = rest.domain().or_refuse(KernelStage::Refine, "domain")?;
+                if hi > r0 + guard && hi < r1 - guard {
+                    rest = rest.split(hi).or_refuse(KernelStage::Refine, "split")?.0;
+                }
+            }
+            pieces.push(rest);
+            for piece in &pieces {
+                for control in &piece.control_points {
+                    if !(control.w > 0.0) {
+                        return Err(KernelRefusal::unsupported(
+                            KernelStage::Refine,
+                            "rim_axial_extent_weights",
+                            format!(
+                                "{op}: rim edge {} carries a control weight {} that is not positive, so its \
+                                 axial extent has no convex-hull bound to certify the carrier's growth against",
+                                edge.id, control.w
+                            ),
+                        ));
+                    }
+                    let a = axial_of(control.point().or_refuse(KernelStage::Refine, "control_point")?);
+                    extent.certified_low = extent.certified_low.min(a);
+                    extent.certified_high = extent.certified_high.max(a);
+                }
+            }
+            read_any = true;
+        }
+    }
+    if !read_any {
+        return Ok(None);
+    }
+    // The hull contains the curve, so it contains the refined readings too;
+    // taking the union guards the bound against a rounding hair.
+    extent.certified_low = extent.certified_low.min(extent.refined_low);
+    extent.certified_high = extent.certified_high.max(extent.refined_high);
+    Ok(Some(extent))
+}
+
+/// The points `retrim_ruled_face` grows a carrier over beyond the five pinned
+/// stations: the rim's CERTIFIED axial bound, as two points on the axis.
+pub(super) fn rim_axial_growth_points(
+    face: &FaceRecord,
+    edges: &HashMap<u64, EdgeRecord>,
+    op: &str,
+) -> Result<Vec<Vec3>, KernelRefusal> {
+    let Some(extent) = rim_axial_extent(face, edges, op)? else {
+        return Ok(Vec::new());
+    };
+    let frame = match face.surface.analytic() {
+        Some(AnalyticSurface::RuledRevolution { frame, .. })
+        | Some(AnalyticSurface::Revolution { frame, .. }) => frame.clone(),
+        _ => return Ok(Vec::new()),
+    };
+    Ok(vec![
+        frame.origin.add(frame.axis.scale(extent.certified_low)),
+        frame.origin.add(frame.axis.scale(extent.certified_high)),
+    ])
 }
 
 /// The EXACT corner where a fixed PLANE, a fixed RULED carrier and the

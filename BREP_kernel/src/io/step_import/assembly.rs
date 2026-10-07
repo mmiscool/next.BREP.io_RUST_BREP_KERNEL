@@ -243,7 +243,7 @@ pub fn read_step_assembly(text: &str) -> Result<Option<StepAssembly>, String> {
         for body in pd_step_bodies(&entities, &resolver, pd) {
             let built = solid_cache.entry((body, scale_key)).or_insert_with(|| {
                 build_step_body(&resolver, body)
-                    .map(|(solid, _bounded)| {
+                    .map(|(solid, _readings)| {
                         let appearance = step_body_appearance(&resolver, &styles, body, &solid);
                         (solid, appearance)
                     })

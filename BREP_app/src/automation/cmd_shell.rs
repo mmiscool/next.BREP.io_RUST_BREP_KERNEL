@@ -141,7 +141,7 @@ fn describe_workbenches(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, Strin
         .into_iter()
         .flat_map(|b| std::iter::once(b).chain(b.menu.iter().filter(|e| e.offered(&state))))
         .collect();
-    let workbenches: Vec<Value> = crate::workbench::WORKBENCHES
+    let mut workbenches: Vec<Value> = crate::workbench::WORKBENCHES
         .iter()
         .map(|w| {
             json!({
@@ -157,8 +157,13 @@ fn describe_workbenches(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, Strin
             })
         })
         .collect();
+    workbenches.extend(crate::workbench::owned_workbenches(&doc.engine).into_iter().map(|w| serde_json::to_value(w).unwrap()));
     Ok(Outcome::Done(json!({
-        "active": crate::workbench::resolve(&active).id,
+        "active": crate::workbench::resolved_id(&doc.engine, &active),
+        "saved": active,
+        "pluginActions": crate::workbench::plugin_actions(&doc.engine, &active),
+        "pluginPanels": crate::workbench::plugin_panels(&doc.engine, &active),
+        "pluginAnnotations": doc.engine.plugin_annotation_catalogue(),
         "workbenches": workbenches,
         // The buttons EVERY workbench's row carries whatever is active — the
         // sketch tools. Declared by no workbench, so they are listed here and

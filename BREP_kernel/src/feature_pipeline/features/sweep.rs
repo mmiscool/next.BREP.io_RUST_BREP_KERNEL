@@ -503,6 +503,10 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, FeatureRefusal> {
     // path and would otherwise re-centre every one of them. SWP still needs it.)
 
     let mut region_solids = Vec::with_capacity(profile.regions.len());
+
+    // The station lane's measured bounds, one per swept loop (`sweep.stations`).
+
+    let mut approximations: Vec<crate::Approximation> = Vec::new();
     // Which regions the swept ENVELOPE lane built. Past `ρκ = 1` the sections
     // cross and the kernel answers with a REVOLVE — the section disc truncated
     // at the path's own axis — whose face set is nothing like the skinned tube's:
@@ -542,7 +546,10 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, FeatureRefusal> {
             }
             // ONE tube for the whole run, every loop carried by the PATH'S OWN
             // rigid motion from where it was drawn (`SectionPlacement::Rigid`).
-            let mut solid = crate::sweep_profile_along_chain(
+            // The station lane's MEASURED BOUND rides into the result's
+            // `approximations` (`sweep.stations`); the mitre and envelope lanes
+            // are exact and report none.
+            let swept = crate::sweep_profile_along_chain_reported(
                 &outer.curves,
                 &path,
                 0.0,
@@ -550,8 +557,13 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, FeatureRefusal> {
                 None,
                 crate::SectionPlacement::Rigid,
                 "A corner between two STRAIGHT segments is MITRED under `pathAlign` (both sweeps trimmed to the joint's bisector plane, sharing one loop there), and `orientationMode: translate` slides the profile along each straight segment's chord without rotating it — but neither builds a corner at a CURVED segment, because a curve has no single direction for a bisector plane to bisect. Split the path at that corner and sweep each run separately, or round the corner so the joint is tangent-continuous.",
+                None,
             )
             .map_err(|error| format!("sweep: {error}"))?;
+            let mut solid = swept.solid;
+            if let Some(report) = swept.report {
+                approximations.push(report.approximation(sweep_body_name(&ctx.id)));
+            }
 
             // NAMES. One tube means exactly ONE wall per profile edge, so a wall
             // takes the CONTAINER spelling — the un-keyed `{tag}{profileEdge}_SW`
@@ -660,7 +672,7 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, FeatureRefusal> {
                     &ctx.id,
                     None,
                     &mut |loop_index, _depth| {
-                        crate::sweep_profile_along_chain(
+                        crate::sweep_profile_along_chain_reported(
                             &region[loop_index].curves,
                             &path,
                             0.0,
@@ -668,7 +680,17 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, FeatureRefusal> {
                             None,
                             crate::SectionPlacement::Rigid,
                             "A corner between two STRAIGHT segments is MITRED under `pathAlign` (both sweeps trimmed to the joint's bisector plane, sharing one loop there), and `orientationMode: translate` slides the profile along each straight segment's chord without rotating it — but neither builds a corner at a CURVED segment, because a curve has no single direction for a bisector plane to bisect. Split the path at that corner and sweep each run separately, or round the corner so the joint is tangent-continuous.",
+                            None,
                         )
+                        .map(|swept| {
+                            if let Some(report) = swept.report {
+                                approximations.push(report.approximation(format!(
+                                    "{} hole {loop_index}",
+                                    sweep_body_name(&ctx.id)
+                                )));
+                            }
+                            swept.solid
+                        })
                     },
                 )?;
             }
@@ -807,17 +829,27 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, FeatureRefusal> {
     common::stamp_sweep_roles_multi(&solid, "_SW", &start_names, &end_names);
 
     // Solid name: `featureID || sweeps[0].name` → `${id}` or "Sweep".
-    let base_name = if ctx.id.is_empty() { "Sweep" } else { &ctx.id };
+    let base_name = sweep_body_name(&ctx.id);
     let mut result = common::finalize_solid_grouped(ctx, solid, base_name, &containers);
     if result.error.is_some() {
         return Ok(result);
     }
+    result.approximations.extend(approximations);
     // Consume the referenced profile sketch (default true). A FACE profile has
     // no sketch to consume — the source solid stays resident.
     if !from_face {
         common::consume_sketch(ctx, &profile_name, &mut result);
     }
     Ok(result)
+}
+
+/// Solid name: `featureID || sweeps[0].name` → `${id}` or "Sweep".
+fn sweep_body_name(id: &str) -> &str {
+    if id.is_empty() {
+        "Sweep"
+    } else {
+        id
+    }
 }
 
 /// Feature tag: trim; empty → `""`; already `:`-ended →
@@ -880,6 +912,8 @@ pub fn schema() -> serde_json::Value {
     "type": "SW",
     "shortName": "SW",
     "longName": "Sweep",
+    "ribbonPath": "Home/Sweep/Sweep",
+    "commandSize": "Compact",
     "displayBuilder": false,
     "inputParamsSchema": {
         "id": {

@@ -262,6 +262,8 @@ pub fn schema() -> serde_json::Value {
     "type": "PF",
     "shortName": "PF",
     "longName": "Push Face",
+    "ribbonPath": "Home/Synchronous Modeling/Push Face",
+    "commandSize": "Compact",
     "displayBuilder": false,
     "inputParamsSchema": {
         "id": {

@@ -18,7 +18,7 @@ use brep_mcp_core::server::BrepServer;
 use serde_json::{json, Value};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 /// The port `--mcp` listens on unless `--mcp-port` says otherwise.
@@ -29,16 +29,149 @@ pub const DEFAULT_PORT: u16 = 8765;
 /// within a frame or two; this bounds a hung or minimised app.
 const REPLY_TIMEOUT: Duration = Duration::from_secs(120);
 
-/// What main.rs hands to [`start`] once the app exists.
+/// The ports the Info window's **Start MCP server** button tries, in order:
+/// the default, then the next few above it. The flag tries ONE port (the
+/// default or `--mcp-port`) and exits when it is taken, because a scripted
+/// launch wants the address it asked for; a person clicking a button wants a
+/// server, and is told which port it got.
+pub const WINDOW_PORTS: std::ops::RangeInclusive<u16> = DEFAULT_PORT..=DEFAULT_PORT + 9;
+
+/// A bound listener and where its sessions go: what [`start`] serves. Built by
+/// [`launch`] — the ONE place the sequence "bind, choose the session root,
+/// word the instructions" lives, for the flag and the button alike.
+#[derive(Debug)]
 pub struct Launch {
     pub listener: TcpListener,
     pub session_root: PathBuf,
+    /// Set when the first port asked for was taken and a later one answered:
+    /// the sentence that says so, shown above the instructions.
+    pub note: Option<String>,
+}
+
+impl Launch {
+    pub fn url(&self) -> String {
+        url(&self.listener)
+    }
+
+    /// The text the console prints and the Info window shows: one function,
+    /// so what a user copies from the window is what a terminal would show.
+    pub fn instructions(&self) -> String {
+        agent_instructions(&self.url(), &self.session_root)
+    }
 }
 
 /// Bind the loopback listener. Done before the window opens so a port in use
 /// is a launch error, never a window silently running without its server.
 pub fn bind(port: u16) -> Result<TcpListener, String> {
     TcpListener::bind(("127.0.0.1", port)).map_err(|e| format!("cannot listen on 127.0.0.1:{port}: {e}"))
+}
+
+/// Bind the first free port of `ports` and settle the session root: the
+/// start sequence shared by `--mcp` (one port) and the window's button (the
+/// [`WINDOW_PORTS`] range). `Ok` carries a [`Launch`] whose `note` names the
+/// fallback when one happened; `Err` is the bind error of the first port,
+/// with the count of the others tried, in the console's own words.
+pub fn launch(ports: impl IntoIterator<Item = u16>, session_root: Option<PathBuf>) -> Result<Launch, String> {
+    let mut failures: Vec<(u16, String)> = Vec::new();
+    for port in ports {
+        match bind(port) {
+            Ok(listener) => {
+                // The port actually bound, not the one asked for: `0` asks
+                // the OS for any free port, and a note must name a real one.
+                let bound = listener.local_addr().map(|a| a.port()).unwrap_or(port);
+                let note = failures
+                    .first()
+                    .map(|(first, _)| format!("port {first} was in use; listening on {bound} instead"));
+                let session_root = session_root.unwrap_or_else(default_session_root);
+                return Ok(Launch { listener, session_root, note });
+            }
+            Err(e) => failures.push((port, e)),
+        }
+    }
+    match failures.as_slice() {
+        [] => Err("no port to listen on".to_string()),
+        [(_, only)] => Err(only.clone()),
+        [(_, first), .., (last, _)] => Err(format!("{first} (and every port up to {last} is in use too)")),
+    }
+}
+
+/// Whether the server is up, for the Info window: written by [`start`] and by
+/// the server thread when it stops, read each frame the window is open.
+/// Process-global like the registry it serves: one app per process is the
+/// only configuration that exists, and `start` runs at most once in it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Status {
+    /// Never started, or stopped: `error` is the line the console printed when
+    /// something went wrong (`None` for a plain "not started").
+    Stopped { error: Option<String> },
+    /// Serving on `url`; `note` is [`Launch::note`].
+    Running { url: String, session_root: PathBuf, note: Option<String> },
+}
+
+static STATUS: Mutex<Status> = Mutex::new(Status::Stopped { error: None });
+
+pub fn status() -> Status {
+    STATUS.lock().unwrap_or_else(|p| p.into_inner()).clone()
+}
+
+fn set_status(status: Status) {
+    *STATUS.lock().unwrap_or_else(|p| p.into_inner()) = status;
+}
+
+/// Report a failure the way the console always has — `brep-app --mcp: …` on
+/// stderr — AND record the same line for the window, so the panel and the
+/// terminal cannot word it differently.
+fn fail(text: impl std::fmt::Display) -> String {
+    let line = format!("brep-app --mcp: {text}");
+    eprintln!("{line}");
+    set_status(Status::Stopped { error: Some(line.clone()) });
+    line
+}
+
+/// What the Info window's "Connect an agent" section draws, from [`status`].
+pub fn info_view() -> crate::panels::info::McpView {
+    use crate::panels::info::McpView;
+    match status() {
+        Status::Stopped { error } => McpView::Stopped { error },
+        Status::Running { url, session_root, note } => McpView::Running {
+            instructions: agent_instructions(&url, &session_root),
+            url,
+            note,
+        },
+    }
+}
+
+/// The button's path: [`launch`] over [`WINDOW_PORTS`] with the default
+/// session root, then [`start`] — the flag's sequence, at runtime. The
+/// instructions still go to the console too, for a window launched from a
+/// terminal. A failure is recorded in [`status`] (the window shows it) and
+/// returned.
+pub fn start_from_window(queue: Arc<AutomationQueue>, adapter: String) -> Result<(), String> {
+    start_over(queue, adapter, WINDOW_PORTS)
+}
+
+fn start_over(queue: Arc<AutomationQueue>, adapter: String, ports: impl IntoIterator<Item = u16>) -> Result<(), String> {
+    // A refusal is not a failure: it must not touch the status (the button
+    // is disabled while the server runs, so this is belt and braces), and it
+    // must not bind a port it would only drop.
+    if let Status::Running { url, .. } = status() {
+        return Err(format!("the MCP server is already running on {url}"));
+    }
+    let launch = match launch(ports, None) {
+        Ok(launch) => launch,
+        // main.rs's wording for the same failure, which also goes to stderr.
+        Err(e) => {
+            let line = format!("brep-app: {e}");
+            eprintln!("{line}");
+            set_status(Status::Stopped { error: Some(line.clone()) });
+            return Err(line);
+        }
+    };
+    if let Some(note) = &launch.note {
+        println!("brep-app --mcp: {note}");
+    }
+    println!("{}", launch.instructions());
+    start(queue, adapter, launch).map_err(|e| fail(e))
 }
 
 pub fn url(listener: &TcpListener) -> String {
@@ -116,16 +249,34 @@ async fn capture(queue: &Arc<AutomationQueue>, region: Value) -> Result<(Value, 
 }
 
 /// Start the server thread over the app's queue. Called from the eframe
-/// creation closure, once the app (and its queue) exists; returns as soon as
-/// the thread is spawned. `adapter` names the GPU for the session info.
+/// creation closure, once the app (and its queue) exists — or from the Info
+/// window's button, any time later; returns as soon as the thread is spawned.
+/// `adapter` names the GPU for the session info. At most ONCE per process: a
+/// second call while the server runs is refused with its address, so neither
+/// path can stack a second server on the first.
 pub fn start(queue: Arc<AutomationQueue>, adapter: String, launch: Launch) -> Result<(), String> {
+    {
+        let mut status = STATUS.lock().unwrap_or_else(|p| p.into_inner());
+        if let Status::Running { url, .. } = &*status {
+            return Err(format!("the MCP server is already running on {url}"));
+        }
+        *status = Status::Running { url: launch.url(), session_root: launch.session_root.clone(), note: launch.note.clone() };
+    }
+    // The state registry publishes only for a host; this window has one now.
+    // Part of the start sequence, not of either caller, so an agent connected
+    // through the button sees `hit_rects` and `state_get` like one connected
+    // at launch.
+    crate::automation::registry::set_enabled(true);
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .thread_name("brep-mcp-worker")
         .enable_all()
         .build()
-        .map_err(|e| format!("tokio runtime: {e}"))?;
-    let url = url(&launch.listener);
+        .map_err(|e| {
+            set_status(Status::Stopped { error: None });
+            format!("tokio runtime: {e}")
+        })?;
+    let url = launch.url();
     std::thread::Builder::new()
         .name("brep-mcp".into())
         .spawn(move || {
@@ -177,23 +328,26 @@ pub fn start(queue: Arc<AutomationQueue>, adapter: String, launch: Launch) -> Re
                 match server.attach(true).await {
                     Ok(info) => log::info!("brep-app --mcp: attached session {} ({}x{} @ {})", info.id, info.host.width, info.host.height, info.host.ppp),
                     Err(e) => {
-                        eprintln!("brep-app --mcp: cannot attach the server to the app: {e}");
+                        fail(format!("cannot attach the server to the app: {e}"));
                         return;
                     }
                 }
                 let listener = match launch.listener.set_nonblocking(true).and_then(|_| tokio::net::TcpListener::from_std(launch.listener)) {
                     Ok(l) => l,
                     Err(e) => {
-                        eprintln!("brep-app --mcp: listener: {e}");
+                        fail(format!("listener: {e}"));
                         return;
                     }
                 };
                 if let Err(e) = brep_mcp_core::http::serve_http(server, listener).await {
-                    eprintln!("brep-app --mcp: server on {url} stopped: {e}");
+                    fail(format!("server on {url} stopped: {e}"));
                 }
             });
         })
-        .map_err(|e| format!("spawn the MCP server thread: {e}"))?;
+        .map_err(|e| {
+            set_status(Status::Stopped { error: None });
+            format!("spawn the MCP server thread: {e}")
+        })?;
     Ok(())
 }
 

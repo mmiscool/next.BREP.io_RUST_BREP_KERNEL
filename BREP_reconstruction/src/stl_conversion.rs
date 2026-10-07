@@ -4,6 +4,9 @@
 //! reads the mesh as a whole primitive — every triangle on one of at most
 //! three analytic regions — RANSAC recognition runs and its fitted
 //! parameters build an exact sphere, torus, capped cylinder or capped cone.
+//! If tessellation features fragmented the segmentation, recognition is also
+//! eligible when every triangle lies on one segmented curved carrier or its
+//! possible end caps. This eligibility check never substitutes for recognition.
 //! Otherwise RANSAC is skipped: every consumer of its result needs that
 //! whole-primitive shape, and on an eleven-thousand-facet part it cost 75 s
 //! for a result nothing read. Safe plane, cylinder, cone, and sphere regions
@@ -19,8 +22,14 @@
 //! weld/prune/cap the faceted importer applies) and the analytic lanes run on
 //! the repaired mesh, so a defect costs a body only the facets it touches
 //! instead of every curved surface in it. A body whose repair still does not
-//! close keeps the refusal it has always had, and a closed file is never
-//! repaired: its output is unchanged.
+//! close keeps the refusal it has always had. Closed shells retain their mesh
+//! geometry; inward shells are oriented outward for reconstruction and restored
+//! as cavities when an enclosing component is present.
+
+mod cavities;
+mod degenerate_coverage;
+mod feature_fragments;
+mod primitive_gate;
 
 use crate::{
     recognize_surfaces_with_unresolved, reconstruct_surface, AnalyticSurface, Mesh,
@@ -126,6 +135,9 @@ pub enum ConversionBackend {
     /// The kernel segmentation proved full plane/cylinder/cone coverage and
     /// the kernel region rebuilder built the shell from it.
     KernelAnalyticRebuild,
+    /// A mesh boolean cut spherical facets; precise carriers and bidirectional
+    /// mesh coverage proved a primitive union rebuilt with analytic CSG trims.
+    KernelSphericalUnion,
     /// A conservative local topology builder reconstructed a complete shell
     /// with exact plane/cylinder/cone/sphere regions and faceted unsupported regions.
     #[serde(alias = "hybrid_plane_cylinder_rebuild")]
@@ -427,17 +439,10 @@ pub fn binary_stl_coordinate_precision_tolerance(mesh: &Mesh) -> f64 {
 
 /// Recognize a parsed STL mesh and serialize a validated AP242 STEP document.
 ///
-/// The triangle soup is SPLIT FIRST. Every vertex-connected component of the
-/// mesh is a body: the whole chain below — segmentation, recognition, the
-/// analytic and hybrid rebuilds, faceted repair and the coplanar merge — runs
-/// on one component at a time, and the resulting solids are written into ONE
-/// STEP document. That is what lets a multi-body STL, OBJ or 3MF import as N
-/// solids: the shell validator sums V-E+F over a solid against 2, so three
-/// disjoint closed shells in one solid read 6 and are refused.
-///
-/// A mesh that holds ONE component — the overwhelming case, and every
-/// single-body fixture — takes the caller's own buffers through untouched, so
-/// its document is byte-for-byte what this converter has always produced.
+/// Each vertex-connected shell is reconstructed independently. Closed inward
+/// shells contained by an outward component are restored as cavities of that
+/// body; other components remain independent solids. STEP round-trip validation
+/// certifies the assembled cavity topology and containment.
 ///
 /// `source_positions` and `source_indices` must describe the same triangles
 /// represented by `mesh`. They are kept separately because an STL reader may
@@ -471,12 +476,14 @@ pub fn convert_stl_mesh_to_step(
     }
 
     let mut solids = Vec::with_capacity(count);
+    let mut component_ids = Vec::with_capacity(count);
     let mut details = Vec::with_capacity(count);
     let mut first_refusal = None;
     for (index, triangles) in components.iter().enumerate() {
         if count == 1 {
             let built = convert_component(mesh, source_positions, source_indices, options)?;
             solids.push(built.0);
+            component_ids.push(index);
             details.push(built.1);
             continue;
         }
@@ -489,6 +496,7 @@ pub fn convert_stl_mesh_to_step(
         ) {
             Ok(built) => {
                 solids.push(built.0);
+                component_ids.push(index);
                 details.push(built.1);
             }
             // One body that no lane can build — faceted repair included —
@@ -517,6 +525,7 @@ pub fn convert_stl_mesh_to_step(
         }));
     }
 
+    let (solids, cavity_messages) = cavities::assemble(mesh, &components, solids, &component_ids)?;
     let export_started = Instant::now();
     let step_text = export_step(&solids, part_name, unit, timestamp)
         .map_err(|error| StlConversionError(format!("STEP export failed: {error}")))?;
@@ -552,6 +561,7 @@ pub fn convert_stl_mesh_to_step(
     let step_validation_seconds = validation_started.elapsed().as_secs_f64();
 
     let mut report = aggregate_report(&components, details, count, options);
+    report.messages.extend(cavity_messages);
     report.messages.push(format!(
         "STEP manifold audit and round-trip import passed for {} solid(s)",
         imported.len()
@@ -639,6 +649,13 @@ fn convert_component(
     source_indices: Option<&[u32]>,
     options: &StlConversionOptions,
 ) -> Result<(brep_kernel::BrepSolid, ComponentDetail), StlConversionError> {
+    // Reconstruct each closed shell outward; assembly restores inward shells
+    // as cavities after their analytic topology has been validated.
+    let outward = cavities::outward_component(mesh, source_positions, source_indices);
+    let (mesh, source_positions, source_indices) = match &outward {
+        Some(part) => (&part.mesh, part.positions.as_slice(), part.indices.as_deref()),
+        None => (mesh, source_positions, source_indices),
+    };
     let mut recognition_options = options.recognition.clone();
     recognition_options.collect_phase_timings = true;
     let requested_distance_tolerance = recognition_options.distance_tolerance;
@@ -682,7 +699,17 @@ fn convert_component(
         Err("the source mesh is not a closed two-manifold".to_owned())
     };
     let segmentation_seconds = segmentation_started.elapsed().as_secs_f64();
-    let recognition_gate = recognition_gate(&segmentation);
+    let initial_recognition_gate = recognition_gate(&segmentation);
+    let geometric_gate_rescue = initial_recognition_gate.is_err()
+        && closed_for_analytics
+        && segmentation.as_ref().is_ok_and(|segmentation| {
+            primitive_gate::has_whole_primitive_candidate(mesh, segmentation, &recognition_options)
+        });
+    let recognition_gate = if geometric_gate_rescue {
+        Ok(())
+    } else {
+        initial_recognition_gate
+    };
     // The encoding floor above bounds only what storing a coordinate cost.
     // An exporter can snap vertices far more coarsely than that — OpenSCAD's
     // spheres, cylinders AND flat caps sit ~6e-5 off their carriers where
@@ -705,18 +732,27 @@ fn convert_component(
     let effective_distance_tolerance = recognition_options.distance_tolerance;
 
     let recognition_started = Instant::now();
-    let (recognition, completed_plane_regions) = if recognition_gate.is_ok() {
+    let (recognition, completed_plane_regions, completed_degenerate_triangles) = if recognition_gate.is_ok() {
         let mut recognition = recognize_surfaces_with_unresolved(mesh, &recognition_options)
             .map_err(|error| {
                 StlConversionError(format!("surface recognition failed: {error}"))
             })?;
+        feature_fragments::complete(
+            mesh,
+            &recognition_options,
+            &mut recognition.regions,
+            &mut recognition.unresolved_triangles,
+        )?;
         let completed_plane_regions = complete_small_planar_regions(
             mesh,
             &recognition_options,
             &mut recognition.regions,
             &mut recognition.unresolved_triangles,
         )?;
-        (recognition, completed_plane_regions)
+        let completed_degenerate_triangles = degenerate_coverage::complete(
+            mesh, &recognition_options, &mut recognition.regions,
+        )?;
+        (recognition, completed_plane_regions, completed_degenerate_triangles)
     } else {
         (
             crate::RecognitionResult {
@@ -724,6 +760,7 @@ fn convert_component(
                 unresolved_triangles: Vec::new(),
                 unresolved_diagnostics: Vec::new(),
             },
+            0,
             0,
         )
     };
@@ -753,6 +790,18 @@ fn convert_component(
     let analytic_coverage = recognition.unresolved_triangles.is_empty()
         && recognized_triangles == mesh.triangles.len()
         && disjoint_complete_partition(&recognition.regions, mesh.triangles.len());
+    let spherical_union = if closed_for_analytics && options.try_kernel_analytic_rebuild {
+        segmentation.as_ref().ok().and_then(|seg| {
+            brep_kernel::reconstruct_spherical_mesh_union(
+                source_positions,
+                source_indices.unwrap_or(&[]),
+                seg,
+                &segmentation_options(options),
+            )
+        })
+    } else {
+        None
+    };
     let primitive = if analytic_coverage && closed_for_analytics {
         direct_analytic_solid(mesh, &recognition.regions, &recognition_options)
     } else {
@@ -768,6 +817,12 @@ fn convert_component(
         ),
         Err(reason) => format!("RANSAC recognition skipped: {reason}"),
     }];
+    if geometric_gate_rescue {
+        messages.push("whole-primitive recognition enabled by triangle coverage on a segmented curved carrier and its possible end caps".to_owned());
+    }
+    if outward.is_some() {
+        messages.push("inward source shell reconstructed outward before cavity assembly".into());
+    }
     if let Some(repaired) = &repaired {
         messages.push(repaired.message.clone());
     }
@@ -779,6 +834,11 @@ fn convert_component(
     if effective_distance_tolerance > encoding_distance_tolerance {
         messages.push(format!(
             "the segmentation's measured vertex deviation raised the absolute recognition distance from {encoding_distance_tolerance:.6e} to {effective_distance_tolerance:.6e}"
+        ));
+    }
+    if completed_degenerate_triangles > 0 {
+        messages.push(format!(
+            "attached {completed_degenerate_triangles} numerically degenerate triangle(s) to their surrounding fitted carrier; excluded from fit support metrics"
         ));
     }
     if completed_plane_regions > 0 {
@@ -801,6 +861,16 @@ fn convert_component(
             primitive.backend,
             primitive.reason,
             primitive.topology_refit,
+            None,
+            None,
+            None,
+        )
+    } else if let Some(solid) = spherical_union {
+        (
+            solid,
+            ConversionBackend::KernelSphericalUnion,
+            "precise sphere carriers and bidirectional mesh coverage verified a primitive union; rebuilt exact analytic intersections across the mesh boolean cut strips".to_owned(),
+            None,
             None,
             None,
             None,
@@ -1006,7 +1076,7 @@ fn aggregate_report(
     let mut messages = Vec::new();
     if count > 1 {
         messages.push(format!(
-            "the triangle soup holds {count} vertex-connected components; each was reconstructed as its own body"
+            "the triangle soup holds {count} vertex-connected components; each shell was reconstructed independently before cavity assembly"
         ));
     }
     let refused = details
@@ -1052,12 +1122,12 @@ fn aggregate_report(
         .all(|detail| detail.backend == first.backend)
     {
         format!(
-            "{count} bodies were reconstructed separately; each: {}",
+            "{count} components were reconstructed separately; each: {}",
             first.backend_reason
         )
     } else {
         format!(
-            "{count} bodies were reconstructed separately: {}",
+            "{count} components were reconstructed separately: {}",
             details
                 .iter()
                 .enumerate()
@@ -1647,8 +1717,12 @@ fn repaired_closed_mesh(
 }
 
 fn closed_manifold(mesh: &Mesh) -> bool {
+    closed_triangles(mesh.triangles.iter().copied())
+}
+
+fn closed_triangles(triangles: impl Iterator<Item = [u32; 3]>) -> bool {
     let mut uses = BTreeMap::<(u32, u32), (usize, i32)>::new();
-    for triangle in &mesh.triangles {
+    for triangle in triangles {
         if triangle[0] == triangle[1] || triangle[1] == triangle[2] || triangle[2] == triangle[0] {
             return false;
         }
@@ -1979,8 +2053,9 @@ fn segmentation_is_complete(segmentation: &MeshSegmentation) -> bool {
 /// Its only consumers are the exact sphere / torus / capped cylinder /
 /// capped cone lanes, which need a closed mesh whose every triangle lies on
 /// one of at most [`MAX_WHOLE_PRIMITIVE_REGIONS`] analytic regions. The
-/// kernel segmentation decides that in a fraction of RANSAC's time, so
-/// RANSAC runs only when it can pay. `Err` carries the reason it cannot.
+/// kernel segmentation provides the initial eligibility test. A separate
+/// geometric check can rescue a fragmented whole primitive. `Err` here records
+/// why the region-count test alone did not establish eligibility.
 fn recognition_gate(segmentation: &Result<MeshSegmentation, String>) -> Result<(), String> {
     let segmentation = segmentation.as_ref().map_err(Clone::clone)?;
     let unassigned = segmentation

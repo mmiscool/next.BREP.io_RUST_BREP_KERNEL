@@ -86,6 +86,7 @@ pub fn verdict(number: &str, revision: &str, bake: &Bake) -> Result<(), String> 
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(default)]
 pub struct BakeJob {
+    pub expected_hash: Option<String>,
     /// The revision's id: the job is the revision.
     pub id: String,
     pub number: String,
@@ -170,6 +171,9 @@ pub async fn run_pass_with(client: &PlmClient, max_jobs: usize, renewal: Option<
 /// One claimed job, start to report.
 async fn bake_job(client: &PlmClient, job: BakeJob) -> Result<JobOutcome, PlmError> {
     let refusal = match client.get_document(&job.document_key).await {
+        Ok(Some(bytes)) if job.expected_hash.as_ref().is_some_and(|hash| *hash != super::thumbnail::content_hash(&String::from_utf8_lossy(&bytes))) => {
+            "the model changed after Force resave was queued; retry it".into()
+        }
         Ok(Some(bytes)) => match std::str::from_utf8(&bytes).map_err(|e| e.to_string()).and_then(bake_document) {
             Ok(bake) => match verdict(&job.number, &job.revision_label, &bake) {
                 Ok(()) => return keep(client, job, bytes, bake.thumbnail).await,
@@ -190,7 +194,14 @@ async fn bake_job(client: &PlmClient, job: BakeJob) -> Result<JobOutcome, PlmErr
 /// `PUT …/result` with the document as the server sent it, then its
 /// thumbnail. A refused thumbnail does not fail the job: the member built.
 async fn keep(client: &PlmClient, job: BakeJob, bytes: Vec<u8>, thumbnail: Option<Vec<u8>>) -> Result<JobOutcome, PlmError> {
-    let path = format!("/api/bake/jobs/{}/result", job.id);
+    let mut document: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|e| PlmError::Malformed(e.to_string()))?;
+    document["thumbnail"] = match &thumbnail {
+        Some(png) => brep_render::thumbnail::embedded_png(png, brep_render::thumbnail::SIZE, "ready"),
+        None => brep_render::thumbnail::empty_embedded("empty"),
+    };
+    let bytes = serde_json::to_vec(&document).map_err(|e| PlmError::Malformed(e.to_string()))?;
+    let path = format!("/api/bake/jobs/{}/result", super::identity::segment(&job.id));
     let hash = super::thumbnail::content_hash(&String::from_utf8_lossy(&bytes));
     match client.call("PUT", &path, Some(bytes)).await {
         Ok(_) => {
@@ -207,13 +218,14 @@ async fn keep(client: &PlmClient, job: BakeJob, bytes: Vec<u8>, thumbnail: Optio
             report_failed(client, job, sentence).await
         }
         Err(error @ (PlmError::Unreachable(_) | PlmError::SignIn(_) | PlmError::Forbidden(_))) => Err(error),
+        Err(PlmError::Conflict(sentence)) if job.source == "resave" => report_failed(client, job, sentence).await,
         Err(error) => Ok(JobOutcome::Dropped { job, why: error.to_string() }),
     }
 }
 
 /// `POST …/fail` with a sentence a person can act on.
 async fn report_failed(client: &PlmClient, job: BakeJob, error: String) -> Result<JobOutcome, PlmError> {
-    let path = format!("/api/bake/jobs/{}/fail", job.id);
+    let path = format!("/api/bake/jobs/{}/fail", super::identity::segment(&job.id));
     let body = serde_json::to_vec(&json!({ "error": error })).unwrap_or_default();
     match client.call("POST", &path, Some(body)).await {
         Ok(_) => Ok(JobOutcome::Failed { job, error }),
@@ -281,7 +293,7 @@ impl Renewal {
     /// claim was just taken.
     pub fn start(&self, job: &str) -> Renewing {
         let (stop, stopped) = std::sync::mpsc::channel::<()>();
-        let (url, token, every) = (format!("{}/api/bake/jobs/{job}/renew", self.url), self.token.clone(), self.every);
+        let (url, token, every) = (format!("{}/api/bake/jobs/{}/renew", self.url, super::identity::segment(job)), self.token.clone(), self.every);
         let job = job.to_string();
         let handle = std::thread::spawn(move || {
             let mut log = RenewLog::default();

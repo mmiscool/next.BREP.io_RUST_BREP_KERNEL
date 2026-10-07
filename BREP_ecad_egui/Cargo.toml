@@ -1,6 +1,6 @@
 [package]
 name = "BREP_ecad_egui"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 rust-version = "1.92"
 license-file = "LICENSE.md"
@@ -29,7 +29,7 @@ include = [
 name = "brep_ecad_egui"
 
 [dependencies]
-BREP_ecad_core = { version = "0.2.0", path = "../BREP_ecad_core" }
+BREP_ecad_core = { version = "0.2.1", path = "../BREP_ecad_core" }
 egui = "0.35"
 
 [profile.dev.package.BREP_ecad_core]

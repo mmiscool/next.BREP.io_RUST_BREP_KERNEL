@@ -9,7 +9,7 @@
 //!   * the session's **diagnostics** — which renderer is actually in use and
 //!     what it is running on, appended to the description (see
 //!     [`compose_description`] for why they travel inside that field),
-//! then POSTs them to the public reports endpoint (`v2.brep.io/api/report`).
+//! then POSTs them to the public reports endpoint (`next.brep.io/api/report`).
 //! ONE code path runs on both native and wasm.
 //!
 //! ## Screenshot-before-dialog
@@ -26,6 +26,9 @@
 //!      it through `ehttp`; the reply marshals back over an mpsc channel +
 //!      `request_repaint`, exactly like [`crate::panels::step_parts`].
 
+#[path = "bug_report_markup.rs"]
+mod markup;
+
 use crate::automation::hit_keys::HitKeyDoc;
 use crate::diagnostics::Diagnostics;
 use std::sync::mpsc::Receiver;
@@ -35,9 +38,9 @@ use crate::icon_text::IconTextUi as _;
 use eframe::egui;
 
 /// The public reports endpoint the button posts to (fronted
-/// by v2.brep.io). Accepts the multipart fields
+/// by next.brep.io). Accepts the multipart fields
 /// `description`,`email`,`model`,`screenshot`.
-const REPORT_URL: &str = "https://v2.brep.io/api/report";
+const REPORT_URL: &str = "https://next.brep.io/api/report";
 
 /// The feature name [`crate::offsite`]'s refusal sentence starts with.
 const FEATURE: &str = "Bug report";
@@ -56,8 +59,9 @@ const MAX_DESC: usize = 20_000;
 /// lands within a few frames.
 const CAPTURE_TIMEOUT_FRAMES: u32 = 60;
 
-/// The dialog's width in points, on a window wide enough for it.
-const DIALOG_WIDTH: f32 = 560.0;
+/// The report and markup views occupy this fraction of the application window.
+const DIALOG_WIDTH_FRACTION: f32 = 0.90;
+const DIALOG_HEIGHT_FRACTION: f32 = 0.95;
 
 /// How many rows of text the description shows before it scrolls instead of
 /// growing.
@@ -66,12 +70,6 @@ const DESCRIPTION_ROWS: usize = 12;
 /// The description field's own text margin (egui's default, named so the
 /// field's cap can count it).
 const DESCRIPTION_MARGIN: egui::Margin = egui::Margin::symmetric(4, 2);
-
-/// The height of the dialog's scrolling body on a window with room for it. The
-/// body is exactly this tall — never taller, never shorter — so the dialog is
-/// ONE size for as long as it is open, whatever is typed into it; on a window
-/// too short for it, the body takes what the window has left instead.
-const BODY_HEIGHT: f32 = 460.0;
 
 /// The gap above the button row, and between it and the status line.
 const FOOTER_GAP: f32 = 10.0;
@@ -94,6 +92,8 @@ enum Phase {
     Capturing { frames: u32 },
     /// Screenshot in hand; dialog open, collecting description + email.
     Editing,
+    /// Dedicated screenshot editor, with the report form hidden.
+    Marking,
     /// POST in flight.
     Sending,
 }
@@ -106,10 +106,12 @@ pub struct BugReportPanel {
     email: String,
     /// A short status / error line under the buttons.
     status: String,
-    /// PNG bytes of the pre-dialog screenshot (UI + 3D), if captured.
+    /// PNG bytes of the pre-dialog screenshot (UI + 3D), including markup.
     screenshot_png: Option<Vec<u8>>,
     /// A preview texture of the screenshot shown in the dialog.
     thumb: Option<egui::TextureHandle>,
+    /// Original capture and editable annotations.
+    markup: Option<markup::Markup>,
     /// The model (`.nbrep`) snapshotted at button-press time.
     model_json: String,
     /// The session diagnostics block, taken from the app's ONE
@@ -147,6 +149,7 @@ impl BugReportPanel {
             status: String::new(),
             screenshot_png: None,
             thumb: None,
+            markup: None,
             model_json: String::new(),
             diagnostics: String::new(),
             response_rx: None,
@@ -171,6 +174,7 @@ impl BugReportPanel {
         self.status.clear();
         self.screenshot_png = None;
         self.thumb = None;
+        self.markup = None;
         self.response_rx = None;
         // The model can't change while the modal is open, but snapshot it now so
         // the report reflects exactly the state the user was looking at.
@@ -189,95 +193,117 @@ impl BugReportPanel {
         self.poll_capture(ctx);
         self.drain_response(state);
 
-        if !matches!(self.phase, Phase::Editing | Phase::Sending) {
+        if !matches!(self.phase, Phase::Editing | Phase::Marking | Phase::Sending) {
             return;
         }
 
         let sending = self.phase == Phase::Sending;
         let mut submit = false;
         let mut cancel = false;
-        let modal = egui::Modal::new(egui::Id::new("brep-bug-report")).show(ctx, |ui| {
-            let window = ctx.content_rect();
-            ui.set_width(DIALOG_WIDTH.min((window.width() - 40.0).max(240.0)));
-            // Scroll bars that SHOW whenever there is more to scroll. egui's
-            // default floating bars stay invisible until the pointer is over the
-            // field, so a report longer than the field read as text that had run
-            // out of room, with nothing to say there was more.
-            ui.spacing_mut().scroll = egui::style::ScrollStyle::thin();
-            // `icon_label`, not `heading`: U+1F41E is a catalogued COLOUR icon, so
-            // this draws the real artwork inline with the title instead of the
-            // font's monochrome outline.
-            ui.icon_label(
-                egui::RichText::new("\u{1F41E}  Submit a bug report").heading(),
-            );
-            ui.add_space(4.0);
-            ui.label(
-                "Describe what went wrong. Your current model and a screenshot of \
+        let marking = self.phase == Phase::Marking;
+        let mut finish = false;
+        let window = ctx.content_rect();
+        let frame = egui::Frame::popup(&ctx.global_style());
+        let content_size = egui::vec2(
+            window.width() * DIALOG_WIDTH_FRACTION,
+            window.height() * DIALOG_HEIGHT_FRACTION,
+        ) - frame.total_margin().sum();
+        let modal = egui::Modal::new(egui::Id::new("brep-bug-report"))
+            .frame(frame)
+            .show(ctx, |ui| {
+                ui.set_width(content_size.x);
+                let content_rect = egui::Rect::from_min_size(ui.min_rect().min, content_size);
+                if marking {
+                    let finish_btn = ui.button("Finish");
+                    self.hit("markup:finish", &finish_btn);
+                    finish = finish_btn.clicked();
+                    ui.separator();
+                    let height =
+                        (content_size.y - ui.min_rect().height() - ui.spacing().item_spacing.y)
+                            .max(0.0);
+                    let budget = egui::Rect::from_min_size(
+                        ui.cursor().min,
+                        egui::vec2(content_size.x, height),
+                    );
+                    ui.scope_builder(egui::UiBuilder::new().max_rect(budget), |ui| {
+                        if let (Some(markup), Some(tex)) = (&mut self.markup, &self.thumb) {
+                            if let Some(image) = markup.show(ui, tex, &mut self.hits) {
+                                self.screenshot_png = encode_png(&image);
+                                self.thumb
+                                    .as_mut()
+                                    .unwrap()
+                                    .set(image, egui::TextureOptions::LINEAR);
+                            }
+                        }
+                    });
+                    ui.expand_to_include_rect(content_rect);
+                    return;
+                }
+                // `icon_label`, not `heading`: U+1F41E is a catalogued COLOUR icon, so
+                // this draws the real artwork inline with the title instead of the
+                // font's monochrome outline.
+                ui.icon_label(egui::RichText::new("\u{1F41E}  Submit a bug report").heading());
+                ui.add_space(4.0);
+                ui.label(
+                    "Describe what went wrong. Your current model and a screenshot of \
                  the app (UI + 3D view) are attached automatically.",
-            );
-            ui.add_space(2.0);
-            ui.weak("Your report and its screenshot may be shown publicly on the bug list.");
-            ui.add_space(8.0);
+                );
+                ui.add_space(2.0);
+                ui.weak("Your report and its screenshot may be shown publicly on the bug list.");
+                ui.add_space(8.0);
 
-            // Everything between the heading and the buttons is ONE scrolling
-            // body, capped to what the window has left once the heading above
-            // and the footer below are counted. However long the description,
-            // and with the screenshot and the diagnostics expanded, the dialog
-            // stays on screen and Submit stays in it — a dialog that grew with
-            // its contents put the button below the bottom of the window.
-            //
-            // The heading is measured from `min_rect`, which does not depend on
-            // where the centred modal lands, so there is no size/position
-            // feedback. A modal's ui is only as tall as the modal was LAST frame,
-            // so the body gets a child ui whose max rect IS the budget (the
-            // same construction as the command palette's list).
-            //
-            // The body is a FIXED height, not a cap. A capped body still grew
-            // with its text up to the cap, and a modal is re-centred from its
-            // PREVIOUS frame's size: every frame the text grew a row, the dialog
-            // got taller downward before it was moved up, so while the user typed
-            // its bottom edge ran off the window (889.5 on an 800-tall window,
-            // 250 characters in). A body that is one height from the first frame
-            // gives the modal one size, so there is nothing to re-centre and
-            // nothing to overflow; the text scrolls inside it instead.
-            let chrome = ui.min_rect().height();
-            let room = (window.height() - chrome - self.footer_height(ui) - 48.0).max(120.0);
-            let body_height = room.min(BODY_HEIGHT);
-            let budget = egui::Rect::from_min_size(
-                ui.cursor().min,
-                egui::vec2(ui.available_width(), body_height),
-            );
-            ui.scope_builder(egui::UiBuilder::new().max_rect(budget), |ui| {
-                egui::ScrollArea::vertical()
-                    .id_salt("brep-bug-body")
-                    .min_scrolled_height(body_height)
-                    .max_height(body_height)
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| self.body(ui));
+                // Keep the body at a fixed height within the proportional modal,
+                // leaving the footer visible even when the report body scrolls.
+                let chrome = ui.min_rect().height();
+                let body_height = (content_size.y - chrome - self.footer_height(ui)).max(0.0);
+                let budget = egui::Rect::from_min_size(
+                    ui.cursor().min,
+                    egui::vec2(ui.available_width(), body_height),
+                );
+                ui.scope_builder(egui::UiBuilder::new().max_rect(budget), |ui| {
+                    egui::ScrollArea::vertical()
+                        .id_salt("brep-bug-body")
+                        .min_scrolled_height(body_height)
+                        .max_height(body_height)
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| self.body(ui));
+                });
+
+                ui.add_space(FOOTER_GAP);
+                ui.horizontal(|ui| {
+                    let can_submit = !self.description.trim().is_empty() && !sending;
+                    let label = if sending {
+                        "Sending\u{2026}"
+                    } else {
+                        "Submit report"
+                    };
+                    let submit_btn = ui.add_enabled(can_submit, egui::Button::new(label));
+                    self.hit("submit", &submit_btn);
+                    if submit_btn.clicked() {
+                        submit = true;
+                    }
+                    let cancel_btn = ui.add_enabled(!sending, egui::Button::new("Cancel"));
+                    self.hit("cancel", &cancel_btn);
+                    if cancel_btn.clicked() {
+                        cancel = true;
+                    }
+                });
+                // The status line's row is always there, empty or not, so a status
+                // appearing ("Submitting…") does not change the dialog's size either.
+                ui.add_space(STATUS_GAP);
+                ui.weak(if self.status.is_empty() {
+                    " "
+                } else {
+                    self.status.as_str()
+                });
+                ui.expand_to_include_rect(content_rect);
             });
 
-            ui.add_space(FOOTER_GAP);
-            ui.horizontal(|ui| {
-                let can_submit = !self.description.trim().is_empty() && !sending;
-                let label = if sending { "Sending\u{2026}" } else { "Submit report" };
-                let submit_btn = ui.add_enabled(can_submit, egui::Button::new(label));
-                self.hit("submit", &submit_btn);
-                if submit_btn.clicked() {
-                    submit = true;
-                }
-                let cancel_btn = ui.add_enabled(!sending, egui::Button::new("Cancel"));
-                self.hit("cancel", &cancel_btn);
-                if cancel_btn.clicked() {
-                    cancel = true;
-                }
-            });
-            // The status line's row is always there, empty or not, so a status
-            // appearing ("Submitting…") does not change the dialog's size either.
-            ui.add_space(STATUS_GAP);
-            ui.weak(if self.status.is_empty() { " " } else { self.status.as_str() });
-        });
-
-        if submit {
+        if marking {
+            if finish || modal.should_close() {
+                self.phase = Phase::Editing;
+            }
+        } else if submit {
             self.send(ctx);
         } else if cancel || (modal.should_close() && !sending) {
             self.reset();
@@ -290,11 +316,13 @@ impl BugReportPanel {
     /// first frame.
     fn footer_height(&self, ui: &egui::Ui) -> f32 {
         let spacing = ui.spacing();
-        let buttons = spacing.interact_size.y.max(
-            ui.text_style_height(&egui::TextStyle::Button) + 2.0 * spacing.button_padding.y,
-        );
-        let status =
-            STATUS_GAP + ui.text_style_height(&egui::TextStyle::Body) + 2.0 * spacing.item_spacing.y;
+        let buttons = spacing
+            .interact_size
+            .y
+            .max(ui.text_style_height(&egui::TextStyle::Button) + 2.0 * spacing.button_padding.y);
+        let status = STATUS_GAP
+            + ui.text_style_height(&egui::TextStyle::Body)
+            + 2.0 * spacing.item_spacing.y;
         FOOTER_GAP + buttons + 2.0 * spacing.item_spacing.y + status
     }
 
@@ -317,14 +345,20 @@ impl BugReportPanel {
         if let Some(tex) = &self.thumb {
             ui.label("Attached screenshot:");
             ui.add_space(2.0);
-            // Fit the preview to the dialog width, keeping aspect.
+            if self.markup.is_some() {
+                let button = ui.add_enabled(
+                    self.phase != Phase::Sending,
+                    egui::Button::new("Mark up screenshot"),
+                );
+                self.hits
+                    .insert("markup:toggle".into(), button.interact_rect);
+                if button.clicked() {
+                    self.phase = Phase::Marking;
+                }
+            }
             let size = tex.size_vec2();
-            let scale = ((DIALOG_WIDTH - 40.0).min(ui.available_width()) / size.x).min(1.0);
-            ui.add(
-                egui::Image::new((tex.id(), size * scale))
-                    .corner_radius(4.0)
-                    .bg_fill(egui::Color32::from_gray(20)),
-            );
+            let scale = (ui.available_width() / size.x).min(240.0 / size.y).min(1.0);
+            ui.add(egui::Image::new((tex.id(), size * scale)));
         } else {
             ui.weak("(screenshot unavailable — the model + description will still be sent)");
         }
@@ -338,13 +372,14 @@ impl BugReportPanel {
             .id_salt("brep-bug-diagnostics")
             .show(ui, |ui| {
                 ui.add(
-                    egui::Label::new(
-                        egui::RichText::new(&self.diagnostics).monospace().small(),
-                    )
-                    .wrap(),
+                    egui::Label::new(egui::RichText::new(&self.diagnostics).monospace().small())
+                        .wrap(),
                 );
             });
-        self.hits.insert("diagnostics".to_string(), diag.header_response.interact_rect);
+        self.hits.insert(
+            "diagnostics".to_string(),
+            diag.header_response.interact_rect,
+        );
     }
 
     /// The description. It grows with its text up to [`DESCRIPTION_ROWS`] rows
@@ -428,6 +463,7 @@ impl BugReportPanel {
         });
         if let Some(img) = shot {
             self.screenshot_png = encode_png(&img);
+            self.markup = Some(markup::Markup::new((*img).clone()));
             self.thumb = Some(ctx.load_texture(
                 "brep-bug-shot",
                 (*img).clone(),
@@ -507,6 +543,7 @@ impl BugReportPanel {
         self.diagnostics.clear();
         self.screenshot_png = None;
         self.thumb = None;
+        self.markup = None;
         self.response_rx = None;
         self.description_scroll = DescriptionScroll::default();
     }
@@ -525,11 +562,13 @@ impl BugReportPanel {
             Phase::Idle => "idle",
             Phase::Capturing { .. } => "capturing",
             Phase::Editing => "editing",
+            Phase::Marking => "marking",
             Phase::Sending => "sending",
         };
         serde_json::json!({
             "phase": phase,
             "hasScreenshot": self.screenshot_png.is_some(),
+            "annotationCount": self.markup.as_ref().map_or(0, markup::Markup::count),
             "diagnostics": self.diagnostics,
             "status": self.status,
             "descriptionScroll": {
@@ -581,7 +620,7 @@ fn encode_png(color: &egui::ColorImage) -> Option<Vec<u8>> {
 /// diagnostics block.
 ///
 /// **Why inside `description` and not its own part.** The endpoint
-/// (`v2.brep.io/api/report`) parses multipart into a fixed four-field record
+/// (`next.brep.io/api/report`) parses multipart into a fixed four-field record
 /// and its match ends `_ => {}` — an unknown part is accepted and silently
 /// DROPPED, never rejected. A `diagnostics` part would therefore submit cleanly
 /// and arrive nowhere, which is the worst of both: a client that looks like it
@@ -672,6 +711,7 @@ fn push_file_field(
 
 /// The hit keys this panel publishes (see `automation::hit_keys`).
 pub static HIT_KEYS: &[HitKeyDoc] = &[
+    HitKeyDoc { panel: "bug", prefix: "markup:", meaning: "screenshot markup toggle, pen/arrow/rectangle tools, image drawing area, undo and clear", command: None },
     HitKeyDoc { panel: "bug", prefix: "field:description", meaning: "the description field (its visible part; right-click opens its Cut / Copy / Paste menu)", command: None },
     HitKeyDoc { panel: "bug", prefix: "menu:cut", meaning: "cut the description's selection, from its right-click menu (native; disabled in the browser)", command: None },
     HitKeyDoc { panel: "bug", prefix: "menu:copy", meaning: "copy the description's selection, from its right-click menu (native; disabled in the browser)", command: None },

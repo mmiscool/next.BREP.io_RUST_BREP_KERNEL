@@ -287,6 +287,10 @@ pub struct ImprintResultRecord {
     pub cosurface_pairs: Vec<(FaceKey, FaceKey)>,
 }
 
+#[path = "imprint/ruled_torus.rs"]
+mod ruled_torus;
+pub(crate) use ruled_torus::{circular_revolution_profile, construct_ruled_torus, RuledTorusBoundary};
+
 #[path = "imprint/support.rs"]
 mod support;
 #[path = "imprint/builder.rs"]
@@ -301,6 +305,7 @@ mod sections;
 mod tangent_contact;
 #[path = "imprint/driver.rs"]
 mod driver;
+
 #[path = "imprint/gate_census.rs"]
 mod gate_census;
 
@@ -308,6 +313,21 @@ use builder::*;
 use junctions::*;
 use sections::*;
 use support::*;
+
+#[path = "imprint/section_graph.rs"]
+mod section_graph;
+pub(crate) use section_graph::{plane_section_graph, plane_section_graph_range, plane_section_graph_range_bounded};
+
+/// Reuse imprint's exact ruled-carrier section at the assembly repair boundary.
+/// This exposes the construction, not its arrangement or acceptance policy.
+pub(crate) fn planar_carrier_section(
+    first: &NurbsSurface,
+    second: &NurbsSurface,
+    tolerance: f64,
+) -> Result<Option<NurbsCurve>, crate::KernelRefusal> {
+    support::planar_iso_intersection(first,second,tolerance)
+}
+
 use tangent_contact::classify_tangent_contact;
 
 pub use driver::build_imprints;

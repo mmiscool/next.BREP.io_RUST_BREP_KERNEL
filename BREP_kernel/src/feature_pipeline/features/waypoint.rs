@@ -136,6 +136,8 @@ pub fn schema() -> serde_json::Value {
     "type": "WP",
     "shortName": "WP",
     "longName": "Waypoint",
+    "ribbonPath": "Home/Reference/Waypoint",
+    "commandSize": "Compact",
     "displayBuilder": true,
     "inputParamsSchema": {
         "id": {

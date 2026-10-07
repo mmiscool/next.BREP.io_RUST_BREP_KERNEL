@@ -48,10 +48,11 @@ pub const UNSAVED_FAMILY: &str = "the family has unsaved changes, and the server
 revision: save it first, or use Save and generate";
 
 /// The part and revision ids of a PLM store key, `part/<part>/rev/<revision>`.
-pub fn key_ids(key: &str) -> Option<(&str, &str)> {
-    let rest = key.strip_prefix("part/")?;
-    let (part, revision) = rest.split_once("/rev/")?;
-    (!part.is_empty() && !revision.is_empty() && !revision.contains('/')).then_some((part, revision))
+pub fn key_ids(key: &str) -> Option<(String, String)> {
+    match crate::store::DocumentIdentity::parse_revision_key(key)? {
+        crate::store::DocumentIdentity::Revision { part, revision } => Some((part, revision)),
+        _ => None,
+    }
 }
 
 /// The revision key a document name means on a PLM store: the key itself
@@ -109,7 +110,7 @@ pub struct ServerStamp {
 
 /// `GET /api/parts/:id`, the fields above.
 pub async fn part_head(client: &PlmClient, part: &str) -> Result<PartHead, PlmError> {
-    let response = client.call("GET", &format!("/api/parts/{part}"), None).await?;
+    let response = client.call("GET", &crate::plm::identity::part_path(&part), None).await?;
     serde_json::from_slice(&response.body).map_err(|e| PlmError::Malformed(format!("/api/parts/{part}: {e}")))
 }
 
@@ -138,7 +139,7 @@ pub async fn generate(client: &PlmClient, key: &str, family_json: &str) -> Resul
         key_ids(key).ok_or_else(|| PlmError::Malformed(format!("`{key}` is not a PLM revision")))?;
     let family: Value = serde_json::from_str(family_json)
         .map_err(|e| PlmError::Malformed(format!("the family document does not parse: {e}")))?;
-    let head = part_head(client, family_part).await?;
+    let head = part_head(client, &family_part).await?;
     let family_file = family_file_name(&head.number);
     let table = read_table(family_json);
 
@@ -146,7 +147,7 @@ pub async fn generate(client: &PlmClient, key: &str, family_json: &str) -> Resul
     if !sent.is_empty() {
         let body = json!({ "family_revision": family_revision, "rows": sent });
         let response = client
-            .call("POST", &format!("/api/parts/{family_part}/generate"), serde_json::to_vec(&body).ok())
+            .call("POST", &format!("{}/generate", crate::plm::identity::part_path(&family_part)), serde_json::to_vec(&body).ok())
             .await?;
         let report: ServerReport = serde_json::from_slice(&response.body)
             .map_err(|e| PlmError::Malformed(format!("generate: {e}")))?;
@@ -268,7 +269,7 @@ impl Member {
     /// revision does not exist yet.
     pub fn key(&self) -> Option<String> {
         (!self.part_id.is_empty() && !self.revision_id.is_empty())
-            .then(|| format!("part/{}/rev/{}", self.part_id, self.revision_id))
+            .then(|| super::identity::document_key(&self.part_id, &self.revision_id))
     }
 
     /// Why this member cannot be placed, or `None` when it can.
@@ -314,14 +315,14 @@ impl FamilyView {
 
 /// `GET /api/parts/:family/family`.
 pub async fn family_view(client: &PlmClient, family_part: &str) -> Result<FamilyView, PlmError> {
-    let response = client.call("GET", &format!("/api/parts/{family_part}/family"), None).await?;
+    let response = client.call("GET", &format!("{}/family", crate::plm::identity::part_path(&family_part)), None).await?;
     serde_json::from_slice(&response.body).map_err(|e| PlmError::Malformed(format!("family view: {e}")))
 }
 
 /// Set the part type new members are created in (`PATCH /api/parts/:id`).
 pub async fn set_member_part_type(client: &PlmClient, family_part: &str, part_type: &str) -> Result<(), PlmError> {
     let body = serde_json::to_vec(&json!({ "member_part_type": part_type.trim() })).ok();
-    client.call("PATCH", &format!("/api/parts/{family_part}"), body).await.map(|_| ())
+    client.call("PATCH", &crate::plm::identity::part_path(&family_part), body).await.map(|_| ())
 }
 
 /// A template spin-out as the server made it: the new part and the store key
@@ -345,11 +346,11 @@ pub async fn spin_out(
     values: &BTreeMap<String, String>,
 ) -> Result<SpunOut, PlmError> {
     let body = serde_json::to_vec(&json!({ "name": name, "number": number, "values": values })).ok();
-    let response = client.call("POST", &format!("/api/parts/{template_part}/spin-out"), body).await?;
+    let response = client.call("POST", &format!("{}/spin-out", crate::plm::identity::part_path(&template_part)), body).await?;
     let part: PartHead =
         serde_json::from_slice(&response.body).map_err(|e| PlmError::Malformed(format!("spin-out: {e}")))?;
     let revision = part.revisions.first().ok_or_else(|| PlmError::Malformed("spin-out: the part has no revision".into()))?;
-    Ok(SpunOut { key: format!("part/{}/rev/{}", part.id, revision.id), part_id: part.id, number: part.number })
+    Ok(SpunOut { key: super::identity::document_key(&part.id, &revision.id), part_id: part.id, number: part.number })
 }
 
 // ---------------------------------------------------------------------------

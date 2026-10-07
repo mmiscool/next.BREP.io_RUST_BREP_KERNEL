@@ -459,12 +459,13 @@ pub fn column_tree(
                 &mut pending,
                 &mut bounds,
             );
-            if rest > viewport {
+            if rest > viewport && ui.spacing().scroll.floating {
                 // A GUTTER for the horizontal scrollbar. egui's bars float over
                 // the content, and this one lands on the LAST ROW — where it
                 // silently eats every click on the bottom half of that row's
                 // cells (found by the headed verifier: the action trigger opened
-                // from its top edge and not from its centre).
+                // from its top edge and not from its centre). Solid bars already
+                // reserve their own space outside the content.
                 let scroll = ui.spacing().scroll;
                 ui.add_space(scroll.bar_width + scroll.bar_inner_margin + scroll.bar_outer_margin);
             }

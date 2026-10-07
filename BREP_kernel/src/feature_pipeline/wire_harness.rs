@@ -1251,8 +1251,12 @@ fn build_bundles(
         if state.build_bundles {
             let name = format!("{BUNDLE_SOLID_PREFIX}{segment_id}");
             match sweep_bundle(segment, diameter * 0.5, &name) {
-                Ok(solid) => {
-                    result.added.push(common::register_added(solid, &name));
+                Ok(swept) => {
+                    // The station lane's measured bound (`sweep.stations`).
+                    if let Some(report) = swept.report {
+                        result.approximations.push(report.approximation(name.clone()));
+                    }
+                    result.added.push(common::register_added(swept.solid, &name));
                     bundle.solid_name = name;
                     bundle.status = BundleStatus::Built;
                 }
@@ -1282,7 +1286,7 @@ fn sweep_bundle(
     segment: &Segment,
     radius: f64,
     name: &str,
-) -> Result<crate::BrepSolid, crate::KernelRefusal> {
+) -> Result<crate::SweptChain, crate::KernelRefusal> {
     use crate::{KernelRefusal, KernelStage, OrRefuse};
     let start = segment.chain[0]
         .domain()
@@ -1308,11 +1312,12 @@ fn sweep_bundle(
     // construction, and the classification is what lets the builder SAY so when a
     // zero-length anchor extension leaves a corner in it anyway.
     let path = crate::SweepPath::new(segment.chain.clone(), names)?;
-    let mut solid = crate::sweep_profile_along_chain_with_stations(
+    let crate::SweptChain { mut solid, report } = crate::sweep_profile_along_chain_with_stations_reported(
         &profile,
         &path,
         stations,
         "a harness segment must be tangent-continuous (a spline always is; a zero extension at an anchor can leave a corner)",
+        None,
     )?;
     // Face names: the two walls (profile-curve order), then START and END.
     let faces = &mut solid
@@ -1331,6 +1336,6 @@ fn sweep_bundle(
     for (face, suffix) in faces.iter_mut().zip(expected) {
         face.name = Some(format!("{name}:{suffix}"));
     }
-    Ok(solid)
+    Ok(crate::SweptChain { solid, report })
 }
 

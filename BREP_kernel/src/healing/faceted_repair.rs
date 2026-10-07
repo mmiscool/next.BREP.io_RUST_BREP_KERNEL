@@ -3,6 +3,7 @@ use crate::topology::{
     BrepSolid, CoedgeRecord, EdgeRecord, FaceRecord, LoopRecord, ShellRecord, VertexRecord,
 };
 use crate::{make_line, make_plane, tessellate_face, Mesh, TessellationOptions, Vec3};
+use crate::{KernelRefusal, KernelStage, OrRefuse};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 /// Convert an open exact assembly to a closed, welded triangular BREP.
@@ -13,7 +14,7 @@ use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 pub(crate) fn close_as_faceted_brep(
     solid: &BrepSolid,
     tolerance: f64,
-) -> Result<BrepSolid, String> {
+) -> Result<BrepSolid, KernelRefusal> {
     let options = TessellationOptions {
         slabs_per_span_u: 12,
         steps_per_span_v: 12,
@@ -32,7 +33,7 @@ pub(crate) fn close_as_faceted_brep(
         face_id += 1;
     }
     if mesh.indices.is_empty() {
-        return Err("faceted shell repair could not tessellate any faces".into());
+        return Err(KernelRefusal::internal(KernelStage::Refine, "faceted_tessellation", "faceted shell repair could not tessellate any faces"));
     }
     triangle_soup_to_faceted_brep(&mesh.positions, Some(&mesh.indices), tolerance.max(2e-3))
 }
@@ -49,9 +50,9 @@ pub fn mesh_to_faceted_brep(
     positions: &[f64],
     indices: Option<&[u32]>,
     tolerance: f64,
-) -> Result<BrepSolid, String> {
+) -> Result<BrepSolid, KernelRefusal> {
     if positions.is_empty() || positions.len() % 3 != 0 {
-        return Err("mesh_to_faceted_brep: positions must be xyz triples".into());
+        return Err(KernelRefusal::input(KernelStage::Collect, "positions", "mesh_to_faceted_brep: positions must be xyz triples"));
     }
     let weld_tolerance = derived_weld_tolerance(positions, tolerance);
     triangle_soup_to_faceted_brep(positions, indices, weld_tolerance)
@@ -132,9 +133,9 @@ pub fn repair_triangle_soup(
     positions: &[f64],
     indices: Option<&[u32]>,
     weld_tolerance: f64,
-) -> Result<(Vec<f64>, Vec<u32>, MeshRepairReport), String> {
+) -> Result<(Vec<f64>, Vec<u32>, MeshRepairReport), KernelRefusal> {
     if positions.is_empty() || !positions.len().is_multiple_of(3) {
-        return Err("repair_triangle_soup: positions must be xyz triples".into());
+        return Err(KernelRefusal::input(KernelStage::Collect, "positions", "repair_triangle_soup: positions must be xyz triples"));
     }
     let weld_tolerance = derived_weld_tolerance(positions, weld_tolerance);
     let (points, triangles, report) = repair_soup(positions, indices, weld_tolerance)?;
@@ -157,7 +158,7 @@ fn triangle_soup_to_faceted_brep(
     positions: &[f64],
     indices: Option<&[u32]>,
     weld_tolerance: f64,
-) -> Result<BrepSolid, String> {
+) -> Result<BrepSolid, KernelRefusal> {
     let (points, triangles, _) = repair_soup(positions, indices, weld_tolerance)?;
     build_faceted_brep(&points, &triangles)
 }
@@ -168,7 +169,7 @@ fn repair_soup(
     positions: &[f64],
     indices: Option<&[u32]>,
     weld_tolerance: f64,
-) -> Result<(Vec<Vec3>, Vec<[usize; 3]>, MeshRepairReport), String> {
+) -> Result<(Vec<Vec3>, Vec<[usize; 3]>, MeshRepairReport), KernelRefusal> {
     let mut report = MeshRepairReport::default();
     let mut points = Vec::<Vec3>::new();
     let mut buckets = HashMap::<[i64; 3], Vec<usize>>::default();
@@ -196,7 +197,7 @@ fn repair_soup(
             .iter()
             .any(|index| *index as usize >= mesh_to_welded.len())
         {
-            return Err("mesh_to_faceted_brep: triangle index outside positions".into());
+            return Err(KernelRefusal::input(KernelStage::Collect, "indices", "mesh_to_faceted_brep: triangle index outside positions"));
         }
         let value = [
             mesh_to_welded[triangle[0] as usize],
@@ -216,7 +217,7 @@ fn repair_soup(
         }
     }
     if triangles.is_empty() {
-        return Err("mesh_to_faceted_brep: no non-degenerate triangles".into());
+        return Err(KernelRefusal::input(KernelStage::Collect, "triangles", "mesh_to_faceted_brep: no non-degenerate triangles"));
     }
 
     // Remove surplus coincident sheets at non-manifold triangle edges,
@@ -341,7 +342,7 @@ fn repair_soup(
 /// A patch whose walk meets itself with the opposite parity (a Möbius band,
 /// or a shell glued to itself) has no consistent winding; it is refused by
 /// name rather than guessed.
-fn orient_consistently(points: &[Vec3], triangles: &mut [[usize; 3]]) -> Result<usize, String> {
+fn orient_consistently(points: &[Vec3], triangles: &mut [[usize; 3]]) -> Result<usize, KernelRefusal> {
     let mut edge_uses = HashMap::<(usize, usize), Vec<usize>>::default();
     for (triangle_index, triangle) in triangles.iter().enumerate() {
         for side in 0..3 {
@@ -385,12 +386,12 @@ fn orient_consistently(points: &[Vec3], triangles: &mut [[usize; 3]]) -> Result<
                         queue.push_back(neighbour);
                     }
                     Some(assigned) if assigned != wanted => {
-                        return Err(format!(
+                        return Err(KernelRefusal::unsupported(KernelStage::Sew, "non_orientable_shell", format!(
                             "mesh_to_faceted_brep: the shell through triangle {seed} cannot be \
                              consistently oriented (non-orientable at the edge ({}, {}, {})–({}, {}, {}))",
                             points[first].x, points[first].y, points[first].z,
                             points[second].x, points[second].y, points[second].z
-                        ));
+                        )));
                     }
                     Some(_) => {}
                 }
@@ -429,7 +430,7 @@ fn orient_consistently(points: &[Vec3], triangles: &mut [[usize; 3]]) -> Result<
 }
 
 /// One planar face per repaired triangle, validated.
-fn build_faceted_brep(points: &[Vec3], triangles: &[[usize; 3]]) -> Result<BrepSolid, String> {
+fn build_faceted_brep(points: &[Vec3], triangles: &[[usize; 3]]) -> Result<BrepSolid, KernelRefusal> {
     let vertices = points
         .iter()
         .enumerate()
@@ -472,7 +473,7 @@ fn build_faceted_brep(points: &[Vec3], triangles: &[[usize; 3]]) -> Result<BrepS
             v_direction,
             u_high - u_low,
             v_length,
-        )?;
+        ).or_refuse(KernelStage::Sew, "make_plane")?;
         let uv = [
             Vec3::new(-u_low, 0.0, 0.0),
             Vec3::new(u_length - u_low, 0.0, 0.0),
@@ -490,7 +491,7 @@ fn build_faceted_brep(points: &[Vec3], triangles: &[[usize; 3]]) -> Result<BrepS
                 next_id += 1;
                 edges.push(EdgeRecord {
                     id,
-                    curve: make_line(points[key.0], points[key.1])?,
+                    curve: make_line(points[key.0], points[key.1]).or_refuse(KernelStage::Sew, "make_line")?,
                     t0: 0.0,
                     t1: 1.0,
                     start_vertex_id: key.0 as u64 + 1,
@@ -505,7 +506,7 @@ fn build_faceted_brep(points: &[Vec3], triangles: &[[usize; 3]]) -> Result<BrepS
                 id: next_id,
                 edge_id,
                 forward: first < second,
-                pcurve: make_line(uv[side], uv[(side + 1) % 3])?,
+                pcurve: make_line(uv[side], uv[(side + 1) % 3]).or_refuse(KernelStage::Sew, "make_line")?,
             });
             next_id += 1;
         }
@@ -540,13 +541,13 @@ fn build_faceted_brep(points: &[Vec3], triangles: &[[usize; 3]]) -> Result<BrepS
     }
     let issues = result.validate();
     if !issues.is_empty() {
-        return Err(format!(
+        return Err(KernelRefusal::internal(KernelStage::Validate, "faceted_validate", format!(
             "faceted shell repair produced invalid topology: {issues:?}"
-        ));
+        )));
     }
     for (index, face) in result.shells[0].faces.iter().enumerate() {
         tessellate_face(face, TessellationOptions::default(), index as u32)
-            .map_err(|error| format!("faceted face {index} cannot be tessellated: {error}"))?;
+            .map_err(|error| KernelRefusal::internal(KernelStage::Validate, "faceted_tessellate", format!("faceted face {index} cannot be tessellated: {error}")))?;
     }
     Ok(result)
 }

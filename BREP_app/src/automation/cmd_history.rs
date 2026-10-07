@@ -18,6 +18,14 @@ pub struct FeatureAddArgs {
 #[serde(deny_unknown_fields)]
 pub struct FeatureAddManyArgs {
     pub features: Vec<Value>,
+    pub parts: Option<Vec<Value>>,
+    pub constraints: Option<Vec<Value>>,
+    pub expressions: Option<String>,
+    pub metadata: Option<Value>,
+    #[serde(default)]
+    pub rollback_on_error: bool,
+    #[serde(default)]
+    pub structured: bool,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -93,7 +101,10 @@ pub struct Report {
     /// feature id → the kernel's typed refusal `{class, …payload, stage, message}`, plus
     /// `step` (`rotation` / `translation`) when the feature records which motion
     /// refused, for every feature that failed with one, the key absent when none did —,
-    /// `unresolved`, `displayErrors`, timings…).
+    /// `featureApproximations` — a feature id → `[{code, body, measured, bar, volume_bound,
+    /// edges, message, summary}]` array for every SUCCESSFUL feature that carries a measured
+    /// approximation (the STEP import's `import.shell_closure`), the key absent when none
+    /// does —, `unresolved`, `displayErrors`, timings…).
     pub report: Value,
     pub step: usize,
     pub history_len: usize,
@@ -125,9 +136,25 @@ fn feature_add(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
 }
 
 fn feature_add_many(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
-    let a: FeatureAddManyArgs = parse_args(args)?;
+    let a: FeatureAddManyArgs = parse_args(args.clone())?;
+    if a.structured || a.rollback_on_error || a.parts.is_some() || a.constraints.is_some() || a.expressions.is_some() || a.metadata.is_some() {
+        return match ctx.app.docs.engine_mut().author_batch(&args) {
+            Ok(result) => Ok(Outcome::Done(result)),
+            Err(error) => {
+                let position = error.strip_prefix("features[").and_then(|s| s.split_once(']')).and_then(|(i,_)| i.parse::<usize>().ok());
+                let path = error.split(": ").next().unwrap_or("batch");
+                let items: Vec<Value> = a.features.iter().enumerate().map(|(i,f)| json!({"position":i,"alias":f["alias"],"id":f.get("id").or_else(|| f.get("inputParams").and_then(|p| p.get("id"))),"status":if position == Some(i) {"failed"} else {"not_evaluated"},"committed":false})).collect();
+                Ok(Outcome::Done(json!({"success":false,"status":"rejected","modelChanged":false,"errors":[{"path":path,"message":error}],"items":items})))
+            }
+        };
+    }
     let r = ctx.app.docs.engine_mut().add_features(&a.features);
     report(ctx, &r)
+}
+
+fn geometry_diagnostics(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
+    let a: IdArgs = parse_args(args)?;
+    ctx.app.docs.engine().geometry_diagnostics(&a.id).map(Outcome::Done).ok_or_else(|| format!("no geometry diagnostics for {}", a.id))
 }
 
 fn feature_params(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
@@ -259,8 +286,9 @@ fn expressions_set(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
 }
 
 pub static COMMANDS: &[CommandSpec] = &[
+    CommandSpec { name: "geometry_diagnostics", group: "history", doc: "Full kernel diagnostics by detailId from structured batches or interference checks (retained after rollback). Use __report__ for the last batch rebuild report. A new batch replaces the diagnostic store.", phase: Phase::Read, annotations: Annotations::READ, args_schema: schema_of::<IdArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(geometry_diagnostics) },
     CommandSpec { name: "feature_add", group: "history", doc: "Append a feature to the history and run it; the rollback moves to the new feature. Returns its index and id with the run report.", phase: Phase::Mutate, annotations: Annotations::MUTATE, args_schema: schema_of::<FeatureAddArgs>, result_schema: schema_of::<Report>, handler: Handler::App(feature_add) },
-    CommandSpec { name: "feature_add_many", group: "history", doc: "Append several features with one run.", phase: Phase::Mutate, annotations: Annotations::MUTATE, args_schema: schema_of::<FeatureAddManyArgs>, result_schema: schema_of::<Report>, handler: Handler::App(feature_add_many) },
+    CommandSpec { name: "feature_add_many", group: "history", doc: "Append a feature batch. The legacy path uses one rebuild; structured batches support native parts, aliases, constraints, evaluated per-item results and optional geometry rollback.", phase: Phase::Mutate, annotations: Annotations::MUTATE, args_schema: schema_of::<FeatureAddManyArgs>, result_schema: schema_of::<Report>, handler: Handler::App(feature_add_many) },
     CommandSpec { name: "feature_params", group: "history", doc: "A feature's type, index, inputParams and persistentData by id.", phase: Phase::Read, annotations: Annotations::READ, args_schema: schema_of::<IdArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(feature_params) },
     CommandSpec { name: "feature_set_params", group: "history", doc: "Replace a feature's inputParams and rerun from it.", phase: Phase::Mutate, annotations: Annotations::MUTATE, args_schema: schema_of::<SetParamsArgs>, result_schema: schema_of::<Report>, handler: Handler::App(feature_set_params) },
     CommandSpec { name: "feature_set_persistent", group: "history", doc: "Replace one key of a feature's persistentData (e.g. a sketch's `sketch` block) and rerun.", phase: Phase::Mutate, annotations: Annotations::MUTATE, args_schema: schema_of::<SetPersistentArgs>, result_schema: schema_of::<Report>, handler: Handler::App(feature_set_persistent) },

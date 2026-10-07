@@ -39,7 +39,7 @@ static BUTTONS: [WorkbenchButton; 4] = [
         // ⊕ (U+2295, circled plus) — ADD a part instance; renders in the
         // bundled DejaVu font (no tofu).
         glyph: "\u{2295}",
-        tooltip: "Add component (insert a part from the library or a saved model)",
+        ribbon_path: "Home/Assembly/Add component", size: crate::workbench::CommandSize::Compact, tooltip: "Add component (insert a part from the library or a saved model)",
         when: None,
         pressed: None,
         disabled: None,
@@ -52,7 +52,7 @@ static BUTTONS: [WorkbenchButton; 4] = [
         // step.parts library. `toolbar_button` auto-renders it as a layered
         // colour icon straight from the SVG catalog.
         glyph: "\u{1F4DA}",
-        tooltip: "step.parts library — browse & import an online STEP part as a component",
+        ribbon_path: "Home/Assembly/step.parts library", size: crate::workbench::CommandSize::Compact, tooltip: "step.parts library — browse & import an online STEP part as a component",
         when: None,
         pressed: None,
         disabled: None,
@@ -64,7 +64,7 @@ static BUTTONS: [WorkbenchButton; 4] = [
         // Our own artwork (U+E067): two parts closing on a shared axis with the
         // inference spark. Catalogued SVG, like every picture the app draws.
         glyph: "\u{E067}",
-        tooltip: "Auto constraints \u{2014} infer mates (concentric, touch align, coincident) from where the components already sit",
+        ribbon_path: "Home/Assembly/Auto constraints", size: crate::workbench::CommandSize::Compact, tooltip: "Auto constraints \u{2014} infer mates (concentric, touch align, coincident) from where the components already sit",
         when: None,
         pressed: None,
         disabled: None,
@@ -76,7 +76,7 @@ static BUTTONS: [WorkbenchButton; 4] = [
         // ∩ (U+2229, intersection) — the pairwise-INTERSECT tool; renders in the
         // bundled DejaVu font (no tofu).
         glyph: "\u{2229}",
-        tooltip: "Interference check (pairwise intersect)",
+        ribbon_path: "Home/Assembly/Interference check", size: crate::workbench::CommandSize::Compact, tooltip: "Interference check (pairwise intersect)",
         when: None,
         pressed: None,
         disabled: None,

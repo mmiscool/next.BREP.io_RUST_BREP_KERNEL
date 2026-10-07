@@ -202,3 +202,5 @@ fn install_console(context: &mut Context, logs: &Logs) -> JsResult<()> {
     context.register_global_property(js_string!("console"), console, Attribute::all())
 }
 
+
+pub mod modules;

@@ -68,9 +68,10 @@ const CIRCLE_VERIFY_SAMPLES: usize = 16;
 #[derive(Clone, Copy, Debug, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SelectionGeometry {
-    /// Planar face: origin on the plane (face boundary AABB center projected
-    /// onto it — the `face_frame` convention) + OUTWARD unit normal (face
-    /// sense respected, per the one plane-z direction convention).
+    /// Planar face: origin on the plane (the centre of the face boundary's
+    /// bounding box in the face's own in-plane basis — a fixed point of the
+    /// body, see `planar_face`) + OUTWARD unit normal (face sense respected,
+    /// per the one plane-z direction convention).
     Plane { origin: Vec3, normal: Vec3 },
     /// Axis-bearing face (cylinder / cone / torus / general revolution):
     /// a point on the axis + unit direction.
@@ -238,7 +239,7 @@ fn triple(vector: Vec3) -> [f64; 3] {
 }
 
 /// The linear (rotation/scale) part of the transform applied to a vector.
-fn linear(transform: &AffineTransform, vector: Vec3) -> Vec3 {
+pub(crate) fn linear(transform: &AffineTransform, vector: Vec3) -> Vec3 {
     let m = transform.elements;
     Vec3::new(
         m[0] * vector.x + m[1] * vector.y + m[2] * vector.z,
@@ -539,7 +540,22 @@ fn revolution_cylinder_radius(
 
 /// Planar-face resolution: sampled-constant-normal acceptance (the established
 /// `face_frame` planarity test, densified to a 3×3 grid), OUTWARD normal via
-/// the face sense, origin = boundary AABB center projected onto the plane.
+/// the face sense, origin = the centre of the face boundary's bounding box
+/// taken in the face's OWN in-plane basis, projected onto the plane.
+///
+/// The basis is the surface's u-tangent at the patch midpoint (its normal
+/// component removed) and the normal's cross with it. A component pose moves
+/// the control net rigidly and that basis with it, so the box of the same
+/// boundary samples is the same box and the anchor is a FIXED point of the
+/// body. A world-axis box is not: on a face with no centre of symmetry (a
+/// triangle, an L) its centre slides over the face as the body turns — and the
+/// assembly angle gizmo, hinged on the two face anchors, slid with it on
+/// every edit (`planar_face_anchor_is_a_fixed_body_point_on_an_asymmetric_face`).
+/// For a centrally symmetric face (rectangle, disc) both rules name the same
+/// point. The tangent test is scale-free (a stretched knot domain shrinks the
+/// partials without moving the plane); the v-partial is the body-fixed
+/// fallback, and a face whose partials both vanish at the midpoint cannot
+/// reach this code — its normal would have failed above.
 fn planar_face(solid: &BrepSolid, record: &FaceRecord) -> Result<SelectionGeometry, ResolveError> {
     let geometry = (|| -> Result<Option<SelectionGeometry>, String> {
         let [u0, u1] = record.surface.domain_u()?;
@@ -560,10 +576,35 @@ fn planar_face(solid: &BrepSolid, record: &FaceRecord) -> Result<SelectionGeomet
         }
         .normalized()?;
 
-        // Boundary AABB center from the face loops' non-degenerate edges,
-        // falling back to the patch midpoint for loop-less faces.
-        let mut low = Vec3::new(f64::INFINITY, f64::INFINITY, f64::INFINITY);
-        let mut high = Vec3::new(f64::NEG_INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY);
+        // The face's own in-plane basis (body-fixed, see the doc above). The
+        // test is SCALE-FREE — the in-plane part must carry the derivative's
+        // own magnitude, whatever that magnitude is — because a knot domain
+        // can be stretched arbitrarily without moving a point of the plane,
+        // and an absolute floor would send such a face to a pose-dependent
+        // rule (`planar_anchor_is_body_fixed_whatever_the_parameter_scale`).
+        // Both partials are tried; both are body-fixed. Neither can fail for
+        // a face that got here: `normal(um, vm)` above succeeded, so
+        // |∂u × ∂v| > 1e-12 at the midpoint — both partials are non-zero —
+        // and the accepted constant normal is their cross, so each lies in
+        // the plane. The error is the unreachable branch, not a world axis.
+        let plane_point = record.surface.evaluate(um, vm)?;
+        let partials = record.surface.derivatives(um, vm, 1)?;
+        let in_plane = |partial: Vec3| -> Option<Vec3> {
+            let tangent = partial.sub(normal.scale(partial.dot(normal)));
+            let length = tangent.length();
+            (length.is_finite() && length > 1e-6 * partial.length() && length > 0.0)
+                .then(|| tangent.scale(1.0 / length))
+        };
+        let e1 = in_plane(partials[1][0])
+            .or_else(|| in_plane(partials[0][1]))
+            .ok_or_else(|| {
+                "planar face: both surface partials degenerate at the patch midpoint".to_string()
+            })?;
+        let e2 = normal.cross(e1).normalized()?;
+        // Boundary bounding box in that basis, from the face loops'
+        // non-degenerate edges; the patch midpoint for loop-less faces.
+        let mut low = [f64::INFINITY; 2];
+        let mut high = [f64::NEG_INFINITY; 2];
         let mut any = false;
         for loop_record in &record.loops {
             for coedge in &loop_record.coedges {
@@ -575,20 +616,23 @@ fn planar_face(solid: &BrepSolid, record: &FaceRecord) -> Result<SelectionGeomet
                 }
                 for step in 0..=4 {
                     let t = edge.t0 + (edge.t1 - edge.t0) * (step as f64 / 4.0);
-                    let point = edge.curve.evaluate(t)?;
-                    low = Vec3::new(low.x.min(point.x), low.y.min(point.y), low.z.min(point.z));
-                    high = Vec3::new(high.x.max(point.x), high.y.max(point.y), high.z.max(point.z));
+                    let offset = edge.curve.evaluate(t)?.sub(plane_point);
+                    let (a, b) = (offset.dot(e1), offset.dot(e2));
+                    low = [low[0].min(a), low[1].min(b)];
+                    high = [high[0].max(a), high[1].max(b)];
                     any = true;
                 }
             }
         }
-        let plane_point = record.surface.evaluate(um, vm)?;
         let center = if any {
-            low.add(high).scale(0.5)
+            plane_point
+                .add(e1.scale((low[0] + high[0]) * 0.5))
+                .add(e2.scale((low[1] + high[1]) * 0.5))
         } else {
             plane_point
         };
-        // Project onto the plane so the origin lies exactly on it.
+        // Project onto the plane so the origin lies exactly on it (the basis
+        // is in-plane; this clears rounding).
         let signed = center.sub(plane_point).dot(normal);
         let origin = center.sub(normal.scale(signed));
         Ok(Some(SelectionGeometry::Plane { origin, normal }))

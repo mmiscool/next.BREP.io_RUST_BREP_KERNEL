@@ -1,6 +1,6 @@
 [package]
 name = "BREP_mcp_core"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2021"
 license-file = "LICENSE.md"
 repository = "https://github.com/mmiscool/next.BREP.io_RUST_BREP_KERNEL"
@@ -41,7 +41,7 @@ serde_json = { version = "1", features = ["preserve_order"] }
 image = { version = "0.25", default-features = false, features = ["png", "gif"] }
 base64 = "0.22"
 # The feature catalogue (schema.rs) is read straight from the engine.
-brep-render = { package = "BREP_render", version = "0.6.0", path = "../BREP_render" }
+brep-render = { package = "BREP_render", version = "0.7.0", path = "../BREP_render" }
 # The streamable-HTTP transport is a tower service; hyper serves it on a
 # loopback listener (http.rs). hyper-util's `service` bridges tower to hyper.
 hyper = { version = "1", features = ["server", "http1"] }

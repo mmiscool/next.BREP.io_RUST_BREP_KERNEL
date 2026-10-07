@@ -463,6 +463,40 @@ impl Viewport {
     ) {
         let local = |p: egui::Pos2| ((p.x - rect.min.x) as f64, (p.y - rect.min.y) as f64);
 
+        let (events, focused, any_touches) =
+            ui.ctx().input(|i| (i.events.clone(), i.focused, i.any_touches()));
+        let touch = self.touch.update_for_frame(
+            ui.ctx().cumulative_frame_nr(),
+            &events,
+            focused,
+            any_touches,
+            |pos| {
+                ui.is_enabled()
+                    && rect.contains(pos)
+                    && ui.ctx().layer_id_at(pos) == Some(response.layer_id)
+            },
+        );
+        self.touch_suppressed = touch.suppress_pointer;
+        if touch.started {
+            // Finish the existing single-finger interaction at its last valid
+            // position before multitouch takes over, or when touch is cancelled.
+            self.finish_pointer_drag(state);
+            self.hover_lit_since = None;
+            state.clear_hover();
+            state.sketch_clear_hover();
+            state.viewcube_clear_hover();
+        }
+        if touch.suppress_pointer {
+            if let Some((from, to, scale)) = touch.motion {
+                let (fx, fy) = local(from);
+                let (tx, ty) = local(to);
+                state.touch_navigation([fx, fy], [tx, ty], scale);
+            }
+            // Includes release/cancel frames: egui synthesizes mouse events for
+            // touch, which must not also select, orbit, or drive a sketch tool.
+            return;
+        }
+
         // Sketch mode (S2) owns the pointer: hover/select/point-drag in plane space,
         // never the modeling select/candidate/transform/ref-select branches. Routed
         // BEFORE the modeling path, which stays byte-for-byte for `!sketch_mode()`.
@@ -557,31 +591,14 @@ impl Viewport {
             }
         }
         if response.drag_stopped() {
-            if self.gizmo_dragging {
-                state.transform_release();
-                self.gizmo_dragging = false;
+            if let (Some(field), Some(pos)) =
+                (self.dim_dragging.as_ref(), response.interact_pointer_pos())
+            {
+                let (lx, ly) = local(pos);
+                let feature = state.dimension_armed_feature();
+                state.feature_dimension_drag(&feature, field, lx, ly);
             }
-            if self.component_gizmo_dragging {
-                // COMMIT: compose the drag delta onto the ACOMP transform, one
-                // param write + rerun (the constraint tail re-solves — by design).
-                state.component_release();
-                self.component_gizmo_dragging = false;
-            }
-            if self.dim_dragging.take().is_some() {
-                // The overlay is already glued to the final value from the last drag
-                // frame; just drop the flag so hover/select resume.
-            }
-            if self.constraint_dragging {
-                // COMMIT the previewed constraint value: updates the constraint
-                // (auto-solves), re-tessellates the re-posed components, folds the
-                // solved poses into the history document, refreshes the overlay.
-                state.constraint_drag_release();
-                self.constraint_dragging = false;
-            }
-            if self.dragging {
-                state.pointer_up();
-                self.dragging = false;
-            }
+            self.finish_pointer_drag(state);
         }
 
         // A plain click (press+release, no drag — egui only reports `clicked()`
@@ -854,6 +871,38 @@ impl Viewport {
                 // negative delta_y as zoom-in (see desktop.rs), so negate.
                 state.wheel(-(scroll_y as f64), cursor);
             }
+        }
+    }
+
+    /// Close captures before handing a single pointer to multitouch navigation.
+    fn finish_pointer_drag(&mut self, state: &mut EngineState) {
+        if self.gizmo_dragging {
+            state.transform_release();
+            self.gizmo_dragging = false;
+        }
+        if self.component_gizmo_dragging {
+            state.component_release();
+            self.component_gizmo_dragging = false;
+        }
+        if self.dim_dragging.take().is_some() {
+            let feature = state.dimension_armed_feature();
+            state.feature_dimension_release(&feature);
+        }
+        if self.constraint_dragging {
+            state.constraint_drag_release();
+            self.constraint_dragging = false;
+        }
+        if self.sketch_handdrawing {
+            state.sketch_handdraw_end();
+            self.sketch_handdrawing = false;
+        }
+        if self.sketch_dragging {
+            state.sketch_drag_end();
+            self.sketch_dragging = false;
+        }
+        if self.dragging {
+            state.pointer_up();
+            self.dragging = false;
         }
     }
 

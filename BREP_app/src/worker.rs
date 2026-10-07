@@ -20,7 +20,7 @@ use brep_render::brep_kernel::HistoryRequest;
 use brep_render::runner::{
     Command, HistoryRunner, MeasureQuery, MeasureReply, MeshImportReply, MeshImportRequest, Reply,
     RunProgress, RunReply, SheetLinesReply, SheetLinesRequest, StepProbeReply, StepProbeRequest,
-    TopologyReply, TopologyRequest,
+    TopologyReply, TopologyRequest, PluginActionRequest, PluginActionReply, PluginInstallRequest, PluginInstallReply,
 };
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
@@ -69,6 +69,10 @@ pub struct WorkerRunner {
     /// The worker refused a run for want of its library (drained by
     /// [`HistoryRunner::poll_library_request`]).
     library_requested: bool,
+    sent_plugin_revision: Option<u64>,
+    plugin_action_buf: VecDeque<PluginActionReply>,
+    plugin_install_buf: VecDeque<PluginInstallReply>,
+    pending_install: Option<PluginInstallRequest>,
 }
 
 impl WorkerRunner {
@@ -106,6 +110,10 @@ impl WorkerRunner {
             pending_run: None,
             sent_library_revision: None,
             library_requested: false,
+            sent_plugin_revision: None,
+            plugin_action_buf: VecDeque::new(),
+            plugin_install_buf: VecDeque::new(),
+            pending_install: None,
         }
     }
 
@@ -138,6 +146,11 @@ impl WorkerRunner {
             let next = self.inbox.borrow_mut().pop_front();
             let Some(reply) = next else { break };
             match reply {
+                Reply::PluginAction(reply) => self.plugin_action_buf.push_back(reply),
+                Reply::ValidatedPlugins(reply) => {
+                    if self.pending_install.as_ref().is_some_and(|p| p.id == reply.id) { self.pending_install = None; }
+                    self.plugin_install_buf.push_back(reply);
+                }
                 Reply::Run(run) => {
                     self.run_buf.push_back(run);
                     self.in_flight = false;
@@ -201,6 +214,34 @@ impl Drop for WorkerRunner {
 }
 
 impl HistoryRunner for WorkerRunner {
+    fn submit_plugin_install(&mut self, request: PluginInstallRequest) -> bool {
+        if self.post(&Command::ValidatePlugins(request.clone())).is_err() { return false; }
+        self.pending_install = Some(request);
+        true
+    }
+
+    fn poll_plugin_install(&mut self) -> Option<PluginInstallReply> {
+        self.drain();
+        self.plugin_install_buf.pop_front()
+    }
+
+    fn sync_plugins(&mut self, revision: u64, fetch: &mut dyn FnMut() -> serde_json::Value) {
+        if self.sent_plugin_revision != Some(revision) {
+            self.post(&Command::SetPlugins { revision, packages: fetch() })
+                .unwrap_or_else(|e| panic!("Failed to provision plugin worker: {e:?}"));
+            self.sent_plugin_revision = Some(revision);
+        }
+    }
+
+    fn submit_plugin_action(&mut self, request: PluginActionRequest) -> bool {
+        self.post(&Command::PluginAction(request)).is_ok()
+    }
+
+    fn poll_plugin_action(&mut self) -> Option<PluginActionReply> {
+        self.drain();
+        self.plugin_action_buf.pop_front()
+    }
+
     fn submit_run(&mut self, request: HistoryRequest, generation: u64) {
         // Stamp the revision NOW: `sync_parts_library` ran immediately before
         // this call, so this is the library the worker is known to hold for
@@ -338,6 +379,15 @@ impl HistoryRunner for WorkerRunner {
         self.in_flight = false;
         self.sent_library_revision = None;
         self.library_requested = false;
+        self.sent_plugin_revision = None;
+        self.plugin_action_buf.clear();
+        // Validation belongs to the installed library, not the cancelled document run.
+        if let Some(request) = self.pending_install.clone() {
+            if self.post(&Command::ValidatePlugins(request.clone())).is_err() {
+                self.pending_install = None;
+                self.plugin_install_buf.push_back(PluginInstallReply { id: request.id, result: Err("Worker restart could not resume plugin validation".into()) });
+            }
+        }
         true
     }
 
@@ -358,6 +408,8 @@ impl HistoryRunner for WorkerRunner {
         // `Command::Reset` clears the worker's kernel store, library included.
         self.sent_library_revision = None;
         self.library_requested = false;
+        self.sent_plugin_revision = None;
+        self.plugin_action_buf.clear();
     }
 }
 

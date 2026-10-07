@@ -26,6 +26,8 @@
 //! backend lists localStorage models and can Upload; desktop lists the app's
 //! models directory. No OS-native file dialog is used.
 
+mod plm_save_as;
+
 use crate::automation::hit_keys::HitKeyDoc;
 use crate::document::{Document, Documents, EMPTY_DOCUMENT};
 use crate::document_class::{self, DocumentClass};
@@ -79,6 +81,8 @@ pub enum FileAction {
 /// Which modal (if any) the dialog is currently showing.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Mode {
+    /// Confirm recovery of a missing component source from its embedded part.
+    CreateComponentPart,
     /// Open a saved model through the common explorer.
     Open,
     /// Prompt for a name and save under it.
@@ -162,7 +166,9 @@ impl Mode {
     /// The folder this modal browses, for the modals that browse one.
     fn purpose(self) -> Option<Purpose> {
         match self {
-            Mode::Open | Mode::SaveAs | Mode::InsertComponent => Some(Purpose::Models),
+            Mode::Open | Mode::SaveAs | Mode::InsertComponent | Mode::CreateComponentPart => {
+                Some(Purpose::Models)
+            }
             Mode::Import => Some(Purpose::Imports),
             Mode::Kicad => Some(Purpose::Kicad),
             Mode::ConfirmClose
@@ -545,9 +551,17 @@ fn is_3mf_name(name: &str) -> bool {
     name.to_ascii_lowercase().ends_with(".3mf")
 }
 
+mod component_part;
+
 /// The reusable file dialog — transient UI buffers + the current document
 /// identity; the model itself lives in `EngineState`'s history.
 pub struct FileDialog {
+    /// Demand-loaded open, scoped to the requesting tab. A newer open or
+    /// navigation cancels it so a delayed response cannot steal focus.
+    pending_open: Option<(String, u64)>,
+    /// A cold component read belongs to the assembly tab that requested it.
+    pending_insert: Option<(String, u64)>,
+    component_part: Option<component_part::Recovery>,
     /// Reusable browser body shared by Open, Save As, and ACOMP selection.
     explorer: FileExplorer,
     /// In a PLM session the Open modal is the workspace browser instead (S14, D12). It
@@ -584,6 +598,12 @@ pub struct FileDialog {
     /// Save-As) — one half of the update-components staleness key (saving a
     /// part's source must re-check the outdated badges without a reload).
     save_generation: u64,
+    plm_save_request: Option<u64>,
+    plm_save_as: Option<plm_save_as::SaveAs>,
+    /// The hand-edit prompt chose "Save as a new part" on a PLM: the Save As
+    /// it opens starts on the NEW PART destination (never on overwriting the
+    /// generated member or its revision). Consumed when that Save As opens.
+    member_new_part: bool,
     /// Per-frame widget hit-rects for the headed verifier (wasm only).
     hits: HashMap<String, egui::Rect>,
     /// The KiCad import's stages after its file.
@@ -599,8 +619,6 @@ pub struct FileDialog {
     /// Save As → "A new part" in a PLM session: the shell opens the PLM pane's New part
     /// form (S7), which writes this document into the new part's first revision.
     plm_new_part: bool,
-    /// Save As → "A new revision of this part": the write in flight.
-    plm_new_revision: Option<crate::panels::plm_parts::Pending<String>>,
     /// The class Save As writes (its class chooser).
     save_class: DocumentClass,
     /// The armed member picker ([`Mode::PickMember`]).
@@ -622,6 +640,9 @@ impl FileDialog {
     /// baseline) lives on [`Document`], so there is nothing to seed here.
     pub fn new() -> Self {
         Self {
+            pending_open: None,
+            pending_insert: None,
+            component_part: None,
             explorer: FileExplorer::new(),
             workspace: crate::panels::plm_workspace::WorkspaceBrowser::new(),
             name_buf: String::new(),
@@ -635,6 +656,9 @@ impl FileDialog {
             pending_step_probe: None,
             pending_stl_import: None,
             save_generation: 0,
+            plm_save_request: None,
+            plm_save_as: None,
+            member_new_part: false,
             hits: HashMap::new(),
             kicad: KicadImport::new(),
             folders: HashMap::new(),
@@ -642,7 +666,6 @@ impl FileDialog {
             pick_folder: None,
             picked: None,
             plm_new_part: false,
-            plm_new_revision: None,
             save_class: DocumentClass::Normal,
             pick_member: None,
             plm_work: None,
@@ -675,6 +698,10 @@ impl FileDialog {
     /// there is nothing to discard); all browsing flows use the same in-app
     /// modal on both platforms.
     pub fn dispatch(&mut self, action: FileAction, docs: &mut Documents, store: &dyn ModelStore) {
+        if matches!(action, FileAction::New | FileAction::NewOfClass(_) | FileAction::Open | FileAction::Import) {
+            self.pending_open = None;
+            self.pending_insert = None;
+        }
         match action {
             FileAction::New => self.new_document(docs, DocumentClass::Normal),
             FileAction::NewOfClass(class) => self.new_document(docs, class),
@@ -686,6 +713,9 @@ impl FileDialog {
                 // A family member is not saved over by hand: the prompt says
                 // why and offers the two ways that are.
                 Some(name) if self.arm_member_prompt(docs, &name, true) => {}
+                Some(name) if store.plm_client().is_some() && crate::panels::plm_host::revision_of(&name).is_some() => {
+                    self.plm_save_request = Some(docs.active_id());
+                }
                 // A named document saves straight to its name.
                 Some(name) => {
                     let _ = self.save_to(docs, store, name);
@@ -850,6 +880,7 @@ impl FileDialog {
         // Every opening is a new choice: the explorer is shared by every mode,
         // so a highlight left by the last one (Import's `Timer.kicad_sym`) would
         // otherwise be this one's confirm target (Insert component's).
+        self.pending_insert = None;
         self.explorer.clear_selection();
         self.mode = mode;
         self.open = true;
@@ -863,6 +894,9 @@ impl FileDialog {
     /// like the command palette).
     pub fn show(&mut self, ctx: &egui::Context, docs: &mut Documents, store: &dyn ModelStore) {
         self.hits.clear();
+        self.poll_pending_open(ctx, docs, store);
+        self.poll_pending_insert(ctx, docs, store);
+        self.poll_plm_save_as(ctx, docs, store);
         self.poll_plm_work(ctx, docs, store);
         self.poll_open_workspace_pick(store);
         // The browser's file chooser answered a pick.
@@ -926,7 +960,7 @@ impl FileDialog {
                 }
             } else {
                 match String::from_utf8(bytes) {
-                    Ok(contents) => self.load_document(docs, &name, &contents, store.plm_client().is_some()),
+                    Ok(contents) => self.load_document(docs, &name, &contents, store),
                     Err(_) => self.status = format!("open failed: {name} is not UTF-8 text"),
                 }
             }
@@ -935,6 +969,10 @@ impl FileDialog {
 
         // A family member the user has just started to change raises the
         // hand-edit prompt (unless they already chose "Save as a new part").
+        // On every store (integrator ruling 2026-10-03): on a PLM the
+        // prompt's "Save as a new part" hands off to the PLM Save As with a
+        // NEW PART preselected, so the generated member is never written
+        // over by hand.
         if !self.open {
             self.watch_member_edit(docs);
         }
@@ -945,6 +983,7 @@ impl FileDialog {
         self.remember_folder(store);
 
         match self.mode {
+            Mode::CreateComponentPart => self.show_create_component_part(ctx, docs, store),
             Mode::ConfirmClose => self.show_confirm_close(ctx, docs),
             Mode::SaveAs => self.show_save_as(ctx, docs, store),
             Mode::Open => self.show_open(ctx, docs, store),
@@ -1320,95 +1359,6 @@ impl FileDialog {
     /// Once: true the frame after it was chosen.
     pub fn take_plm_new_part(&mut self) -> bool {
         std::mem::take(&mut self.plm_new_part)
-    }
-
-    /// **Save As** in a PLM session (D9): there are no file names on the PLM, so the
-    /// question is a new part, or a new revision of this part (S7's [`SaveAsChooser`]).
-    /// A new revision holds this document as it is now, current edits included, and
-    /// opens checked out to this user.
-    ///
-    /// [`SaveAsChooser`]: crate::panels::plm_parts::SaveAsChooser
-    fn show_save_as_plm(
-        &mut self,
-        ctx: &egui::Context,
-        docs: &mut Documents,
-        store: &dyn ModelStore,
-        client: std::rc::Rc<crate::plm::client::PlmClient>,
-    ) {
-        use crate::panels::plm_parts::{save_as_new_revision, Pending, SaveAsChooser, SaveAsDecision};
-        let identity = docs
-            .active()
-            .name()
-            .and_then(crate::plm::uses::revision_key_in)
-            .and_then(|key| crate::store::DocumentIdentity::parse_revision_key(&key));
-        let choices = SaveAsChooser::choices(identity.as_ref());
-        let saving = self.plm_new_revision.is_some();
-        let mut chosen = None;
-        let mut cancel = false;
-        let mut choice_hits = HashMap::new();
-        let modal = egui::Modal::new(egui::Id::new("brep-file-saveas")).show(ctx, |ui| {
-            ui.heading("Save as");
-            ui.add_space(4.0);
-            if saving {
-                ui.label("Saving a new revision…");
-            } else {
-                chosen = SaveAsChooser::show(ui, &choices, &mut choice_hits);
-            }
-            if !self.status.is_empty() {
-                ui.weak(&self.status);
-            }
-            let button = ui.add_enabled(!saving, egui::Button::new("Cancel"));
-            self.hits.insert("saveas:cancel".into(), button.rect);
-            cancel = button.clicked();
-        });
-        // S7's keys are `plm_parts:saveas:…`: in this dialog they are the file panel's
-        // `saveas:` family.
-        for (key, rect) in choice_hits {
-            self.hits.insert(key.strip_prefix("plm_parts:").unwrap_or(&key).to_string(), rect);
-        }
-        match chosen {
-            Some(SaveAsDecision::NewPart) => {
-                self.plm_new_part = true;
-                self.status = "fill in the new part in the PLM pane".into();
-                self.open = false;
-            }
-            Some(SaveAsDecision::NewRevision { part }) => {
-                let document = docs.engine().history_request_json();
-                let future: crate::plm::PlmFuture<String> =
-                    Box::pin(async move { save_as_new_revision(&client, &part, "", &document).await });
-                self.status.clear();
-                self.plm_new_revision = Some(Pending::new(future));
-            }
-            None => {}
-        }
-        if let Some(pending) = self.plm_new_revision.as_mut() {
-            let waker = {
-                struct Repaint(egui::Context);
-                impl std::task::Wake for Repaint {
-                    fn wake(self: std::sync::Arc<Self>) {
-                        self.0.request_repaint();
-                    }
-                }
-                std::task::Waker::from(std::sync::Arc::new(Repaint(ctx.clone())))
-            };
-            if let Some(answer) = pending.poll(&waker) {
-                self.plm_new_revision = None;
-                match answer {
-                    Ok(key) => {
-                        let name = store.canonical_identity(&key);
-                        self.open_document(docs, store, &name);
-                        self.status = format!("saved as a new revision: {name}");
-                        self.open = false;
-                    }
-                    Err(problem) => self.status = problem,
-                }
-            } else {
-                ctx.request_repaint();
-            }
-        }
-        if (cancel || modal.should_close()) && self.plm_new_revision.is_none() {
-            self.open = false;
-        }
     }
 
     /// The **Save As** name prompt.
@@ -1822,8 +1772,8 @@ impl FileDialog {
 
     /// The **Open** browser in a PLM session: the workspace (S14) — folders of links and
     /// files, other users' workspaces read-only, and Open by number. A link opens its
-    /// part's document; a file dropped on the modal is added to the folder shown; a
-    /// downloaded file goes out through the store's export lane.
+    /// part's document. Workspace changes are linked to the web app; downloads
+    /// go out through the store's export lane.
     fn show_open_workspace(
         &mut self,
         ctx: &egui::Context,
@@ -1831,18 +1781,19 @@ impl FileDialog {
         store: &dyn ModelStore,
         client: std::rc::Rc<crate::plm::client::PlmClient>,
     ) {
-        use crate::panels::plm_workspace::{document_name, dropped, load_pins, save_pins, PlmWorkspaces};
+        use crate::panels::plm_workspace::{document_name, load_pins, save_pins, PlmWorkspaces};
         let plm = PlmWorkspaces { client };
         if self.workspace.pins.is_none() {
             self.workspace.pins = Some(load_pins(store));
         }
-        for (name, bytes) in dropped(ctx) {
-            self.workspace.add_file(&plm, &name, bytes);
-        }
+        self.workspace.browse_only = true;
         let mut cancel = false;
         let modal = egui::Modal::new(egui::Id::new("brep-file-open")).show(ctx, |ui| {
             file_explorer::dialog_body(ui, |ui| {
                 ui.heading("Open from the PLM");
+                if let Some(url) = crate::panels::plm_host::web_url(store, "#/workspace") {
+                    crate::panels::plm_host::web_link(ui, "Manage workspace in PLM", url);
+                }
                 ui.add_space(4.0);
                 file_explorer::dialog_footer(ui, "open", |ui| {
                     if !self.status.is_empty() {
@@ -1910,9 +1861,7 @@ impl FileDialog {
         docs: &mut Documents,
         store: &dyn ModelStore,
     ) {
-        let assembly = docs.active().name().map(str::to_string);
-        let state = docs.engine_mut();
-        let library = state.parts_library_names();
+        let library = docs.engine_mut().parts_library_names();
         let modal = egui::Modal::new(egui::Id::new("brep-file-insert-component")).show(ctx, |ui| {
             file_explorer::dialog_body(ui, |ui| {
                 ui.heading("Insert component");
@@ -1961,7 +1910,7 @@ impl FileDialog {
         let (chosen_library, output) = modal.inner;
         if let Some(part_name) = chosen_library {
             // An already-inserted library part: skip the store read entirely.
-            match state.insert_component(ComponentInsert::Existing { part_name: &part_name }) {
+            match docs.engine_mut().insert_component(ComponentInsert::Existing { part_name: &part_name }) {
                 Ok(id) => {
                     self.status = format!("inserted {part_name} ({id})");
                     self.open = false;
@@ -1983,15 +1932,9 @@ impl FileDialog {
             }
             listed
         }) {
-            match store.read(&name) {
-                // A family or a template is never placed itself: it opens
-                // the prompt that leads to the part that is.
-                Some(contents) if self.begin_class_insert(store, &name, &contents, assembly) => {}
-                Some(contents) => {
-                    self.insert_component_document(state, &name, &contents);
-                    self.open = false;
-                }
-                None => self.status = format!("insert failed: '{name}' not found"),
+            self.request_component_document(docs, store, &name);
+            if self.pending_insert.is_some() {
+                ctx.request_repaint_after(std::time::Duration::from_millis(100));
             }
         } else if output.import {
             match store.begin_import() {
@@ -2005,6 +1948,41 @@ impl FileDialog {
             }
         } else if output.cancel || should_close {
             self.open = false;
+        }
+    }
+
+    fn request_component_document(&mut self, docs: &mut Documents, store: &dyn ModelStore, name: &str) {
+        self.pending_insert = None;
+        match crate::store::read_now(store, name) {
+            crate::store::ReadNow::Ready(contents) => self.finish_component_document(docs, store, name, &contents),
+            crate::store::ReadNow::Loading => {
+                self.pending_insert = Some((name.to_owned(), docs.active_id()));
+                self.status = format!("'{name}' is still loading");
+            }
+            crate::store::ReadNow::Absent => self.status = format!("insert failed: '{name}' not found"),
+        }
+    }
+
+    fn finish_component_document(&mut self, docs: &mut Documents, store: &dyn ModelStore, name: &str, contents: &str) {
+        let assembly = docs.active().name().map(str::to_string);
+        if !self.begin_class_insert(store, name, contents, assembly) {
+            self.insert_component_document(docs.engine_mut(), name, contents);
+            self.open = false;
+        }
+    }
+
+    fn poll_pending_insert(&mut self, ctx: &egui::Context, docs: &mut Documents, store: &dyn ModelStore) {
+        let Some((name, requester)) = self.pending_insert.take() else { return };
+        if !self.open || self.mode != Mode::InsertComponent || docs.active_id() != requester {
+            return;
+        }
+        match crate::store::read_now(store, &name) {
+            crate::store::ReadNow::Ready(contents) => self.finish_component_document(docs, store, &name, &contents),
+            crate::store::ReadNow::Loading => {
+                self.pending_insert = Some((name, requester));
+                ctx.request_repaint_after(std::time::Duration::from_millis(100));
+            }
+            crate::store::ReadNow::Absent => self.status = format!("insert failed: '{name}' not found"),
         }
     }
 
@@ -2075,22 +2053,32 @@ impl FileDialog {
     /// "focus the tab holding this document" has no answer then, and the second
     /// save would silently overwrite the first tab's file. `true` = go ahead.
     ///
-    /// Compared by DISPLAY name, not raw identity: on desktop an open document
+    /// PLM documents compare their full part/revision key in either spelling.
+    /// Local documents compare DISPLAY names: on desktop an open document
     /// carries the full path it was loaded from while the Save As field holds a
     /// bare name, so an identity compare would never match and the clobber would
     /// happen before anything noticed. Two same-stemmed files in different
     /// folders are refused too — stricter than strictly necessary, and the side
     /// to err on when the alternative is overwriting another tab's file.
-    fn name_is_free(&mut self, docs: &Documents, name: &str) -> bool {
+    fn name_is_free(&mut self, docs: &mut Documents, name: &str) -> bool {
         let display = model_display_name(name);
+        let target_revision = crate::plm::uses::revision_key_in(name);
         let taken = docs.iter().enumerate().any(|(index, doc)| {
             index != docs.active_index()
                 && doc
                     .name()
-                    .is_some_and(|open| model_display_name(open) == display)
+                    .is_some_and(|open| {
+                        match (&target_revision, crate::plm::uses::revision_key_in(open)) {
+                            (Some(target), Some(other)) => *target == other,
+                            (None, None) => model_display_name(open) == display,
+                            _ => false,
+                        }
+                    })
         });
         if taken {
-            self.status = format!("'{display}' is already open in another tab");
+            let identity = target_revision.as_deref().unwrap_or(&display);
+            self.status = format!("Save refused: '{identity}' is already open in another tab");
+            docs.engine_mut().push_notice(&self.status);
         }
         !taken
     }
@@ -2117,13 +2105,25 @@ impl FileDialog {
                 doc.set_name(Some(name.clone()));
                 doc.mark_clean();
                 self.save_generation += 1;
+                remember_document(store, &name);
                 self.status = format!("saved {name}");
                 true
             }
             Err(e) => {
                 self.status = format!("save failed: {e}");
+                docs.engine_mut().push_notice(&self.status);
                 false
             }
+        }
+    }
+
+    pub(crate) fn take_plm_save_request(&mut self) -> Option<u64> {
+        self.plm_save_request.take()
+    }
+
+    pub(crate) fn finish_plm_save(&mut self, docs: &mut Documents, store: &dyn ModelStore) {
+        if let Some(name) = docs.active().name().map(str::to_string) {
+            self.save_to(docs, store, name);
         }
     }
 
@@ -2163,6 +2163,7 @@ impl FileDialog {
                 doc.set_name(Some(identity.clone()));
                 doc.mark_clean();
                 self.save_generation += 1;
+                remember_document(store, &identity);
                 self.status = format!("saved {identity}");
                 true
             }
@@ -2177,18 +2178,46 @@ impl FileDialog {
     /// already holding it). The one door every open lane uses: File>Open, the
     /// Edit-Part flow, and the session restore's siblings.
     pub fn open_document(&mut self, docs: &mut Documents, store: &dyn ModelStore, name: &str) {
+        self.pending_open = None;
         if docs.focus_named(name) {
+            remember_document(store, name);
             self.status = format!("{name} is already open");
             return;
         }
         match crate::store::read_now(store, name) {
-            crate::store::ReadNow::Ready(contents) => self.load_document(docs, name, &contents, store.plm_client().is_some()),
+            crate::store::ReadNow::Ready(contents) => self.load_document(docs, name, &contents, store),
             // An index-hydrated PLM store lists what it has not loaded yet;
             // the read above asked for it.
             crate::store::ReadNow::Loading => {
-                self.status = format!("'{name}' is still loading — open it again in a moment")
+                self.pending_open = Some((name.to_owned(), docs.active_id()));
+                self.status = format!("'{name}' is still loading");
             }
             crate::store::ReadNow::Absent => self.status = format!("open failed: '{name}' not found"),
+        }
+    }
+
+    /// Complete the common File>Open / Edit-Part demand read on a later frame.
+    /// Store reads are already deduplicated while a request is in flight.
+    fn poll_pending_open(&mut self, ctx: &egui::Context, docs: &mut Documents, store: &dyn ModelStore) {
+        let Some((name, requester)) = self.pending_open.take() else { return };
+        if docs.active_id() != requester {
+            return;
+        }
+        if docs.focus_named(&name) {
+            self.status = format!("{name} is already open");
+            return;
+        }
+        match crate::store::read_now(store, &name) {
+            crate::store::ReadNow::Ready(contents) => {
+                self.load_document(docs, &name, &contents, store);
+            }
+            crate::store::ReadNow::Loading => {
+                self.pending_open = Some((name, requester));
+                ctx.request_repaint_after(std::time::Duration::from_millis(100));
+            }
+            crate::store::ReadNow::Absent => {
+                self.status = format!("open failed: '{name}' not found");
+            }
         }
     }
 
@@ -2712,7 +2741,8 @@ impl FileDialog {
     /// feature + zoom-to-fit), clean from the start. A document that fails to
     /// load leaves no tab behind — the engine it was loading into is dropped
     /// with its runner.
-    fn load_document(&mut self, docs: &mut Documents, name: &str, contents: &str, plm: bool) {
+    fn load_document(&mut self, docs: &mut Documents, name: &str, contents: &str, store: &dyn ModelStore) {
+        let plm = store.plm_client().is_some();
         let mut engine = docs.spawn_engine();
         match engine.load_model_and_fit(contents) {
             Ok(_) => {
@@ -2733,6 +2763,7 @@ impl FileDialog {
                 docs.open_document(doc);
                 self.name_buf = model_display_name(name);
                 self.status = format!("opened {name}");
+                remember_document(store, name);
             }
             Err(e) => self.status = format!("open failed: {e}"),
         }
@@ -3126,7 +3157,19 @@ impl FileDialog {
     }
 
     /// Arm the hand-edit prompt when the active tab is a family member. `true`
-    /// when it was armed (the caller does not go on to write).
+    /// when it was armed (the caller does not go on to write). Raise the
+    /// hand-edit prompt the frame a family member first shows an unsaved
+    /// change — the moment the user "starts to change it".
+    fn watch_member_edit(&mut self, docs: &Documents) {
+        let doc = docs.active();
+        if !doc.dirty_marker() || self.member_ack.contains(&doc.id()) {
+            return;
+        }
+        if let Some(name) = doc.name().map(str::to_string) {
+            self.arm_member_prompt(docs, &name, false);
+        }
+    }
+
     fn arm_member_prompt(&mut self, docs: &Documents, name: &str, from_save: bool) -> bool {
         let Some(source) = family_table::engine_family_source(docs.engine()) else {
             return false;
@@ -3140,18 +3183,6 @@ impl FileDialog {
         self.status.clear();
         self.open_modal(Mode::MemberEdit);
         true
-    }
-
-    /// Raise the hand-edit prompt the frame a family member first shows an
-    /// unsaved change — the moment the user "starts to change it".
-    fn watch_member_edit(&mut self, docs: &Documents) {
-        let doc = docs.active();
-        if !doc.dirty_marker() || self.member_ack.contains(&doc.id()) {
-            return;
-        }
-        if let Some(name) = doc.name().map(str::to_string) {
-            self.arm_member_prompt(docs, &name, false);
-        }
     }
 
     /// Undo the active tab back to its saved state (bounded), so a member the
@@ -3226,8 +3257,10 @@ impl FileDialog {
         match choice {
             Some("saveas") => {
                 // The tab may keep changing; Save As strips the stamp from
-                // the copy it writes. Plain Save still asks.
+                // the copy it writes. Plain Save still asks. On a PLM the
+                // Save As opens on "A new part".
                 self.member_ack.insert(prompt.doc_id);
+                self.member_new_part = store.plm_client().is_some();
                 self.status.clear();
                 self.dispatch(FileAction::SaveAs, docs, store);
             }
@@ -3240,7 +3273,7 @@ impl FileDialog {
                     let head = crate::plm::family::part_head(&client, &number).await.map_err(|e| e.to_string())?;
                     // The newest revision, drafts included (D13).
                     let newest = head.revisions.last().ok_or_else(|| format!("the family {number} has no revision"))?;
-                    Ok(format!("part/{}/rev/{}", head.id, newest.id))
+                    Ok(crate::plm::identity::document_key(&head.id, &newest.id))
                 }))));
                 self.open = false;
             }
@@ -3377,6 +3410,7 @@ impl FileDialog {
             "status": self.status,
             "open": self.open,
             "mode": match self.mode {
+                Mode::CreateComponentPart => "createcomponentpart",
                 Mode::Open => "open",
                 Mode::SaveAs => "saveas",
                 Mode::ConfirmClose => "confirmclose",
@@ -3399,6 +3433,7 @@ impl FileDialog {
             // field) and, for a family member, its stamp.
             "class": document_class::document_class(docs.engine()).slug(),
             "saveClass": self.save_class.slug(),
+            "plmSaveAs": self.plm_save_as.as_ref().map(|state| state.state_json()),
             "familySource": family_table::engine_family_source(docs.engine()).map(|source| serde_json::json!({
                 "family": source.family,
                 "partNumber": source.part_number,
@@ -3505,6 +3540,7 @@ pub static HIT_KEYS: &[HitKeyDoc] = &[
     HitKeyDoc { panel: "file", prefix: "stepassembly:", meaning: "a STEP-with-structure import choice (assembly, bodies, flatten, cancel)", command: None },
     HitKeyDoc { panel: "file", prefix: "insert:lib:", meaning: "insert a parts-library entry (insert:lib:name)", command: None },
     HitKeyDoc { panel: "file", prefix: "filesystem:", meaning: "an entry of the file explorer", command: None },
+    HitKeyDoc { panel: "file", prefix: "saveas:", meaning: "PLM Save As destinations (new-revision, new-part, existing), destination fields (part, revision, name, number), save and cancel", command: None },
     HitKeyDoc { panel: "file", prefix: "saveas:class:", meaning: "Save As's class chooser: saveas:class:normal (.nbrep), saveas:class:family (.fbrep), saveas:class:template (.tbrep)", command: None },
     HitKeyDoc { panel: "file", prefix: "member:", meaning: "the member picker Insert component raises for a family: member:<part number> places that member (disabled until Generate has written it), member:cancel", command: None },
     HitKeyDoc { panel: "file", prefix: "spinout:", meaning: "the template spin-out prompt: spinout:name, spinout:input:<name> (a value field), spinout:choice:<name>:<value> (a fixed-list input), spinout:create, spinout:cancel", command: None },
@@ -3527,3 +3563,207 @@ fn fetch_document(
         Ok((key, text, number))
     }))
 }
+
+/// Recent documents are global store identities, never document content.
+use crate::store::RECENT_DOCUMENTS_KEY;
+pub fn recent_documents(store: &dyn ModelStore) -> Vec<String> {
+    store
+        .read(RECENT_DOCUMENTS_KEY)
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+fn remember_document(store: &dyn ModelStore, name: &str) {
+    let mut recent = recent_documents(store);
+    recent.retain(|item| item != name);
+    recent.insert(0, name.into());
+    recent.truncate(20);
+    let _ = store.write(
+        RECENT_DOCUMENTS_KEY,
+        &serde_json::to_string(&recent).unwrap(),
+    );
+}
+
+#[derive(Default)]
+pub struct FileMenuOutcome {
+    pub action: Option<FileAction>,
+    pub recent: Option<String>,
+    /// The Plugins row under Settings was clicked: open the plugin manager.
+    pub plugins: bool,
+    /// The JavaScript row under Settings was clicked: open the editor.
+    pub javascript: bool,
+}
+
+/// Shared File menu for both appearances; workbench selection uses apply + store.
+pub fn file_menu(
+    ui: &mut egui::Ui,
+    state: &mut EngineState,
+    store: &dyn ModelStore,
+    settings_open: &mut bool,
+    properties_open: &mut bool,
+    hits: &mut HashMap<String, egui::Rect>,
+) -> FileMenuOutcome {
+    use crate::panels::toolbar_button;
+    let mut outcome = FileMenuOutcome::default();
+    let presentation = crate::workbench::file_presentation;
+    egui_extras::install_image_loaders(ui.ctx());
+    let menu = ui.menu_button("File", |ui| {
+        let rows: Vec<_> = crate::workbench::FILE_COMMANDS
+            .iter()
+            .map(|p| (p.glyph, p.label()))
+            .collect();
+        // A fixed measured width avoids feeding the popup's previous width back
+        // through full-width rows while egui settles its area.
+        ui.set_width(toolbar_button::menu_width(ui, &rows));
+        let max_height = ui.ctx().content_rect().height() * 0.8;
+        ui.set_max_height(max_height);
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, true])
+            .max_height(max_height)
+            .show(ui, |ui| {
+                for (class, p) in DocumentClass::ALL
+                    .into_iter()
+                    .zip(crate::workbench::NEW_DOCUMENT_COMMANDS)
+                {
+                    let row = toolbar_button::menu_row(
+                        ui,
+                        p.glyph,
+                        p.label(),
+                        false,
+                        ui.available_width(),
+                    );
+                    hits.insert(p.id.into(), row.rect);
+                    if class == DocumentClass::Normal {
+                        hits.insert("file:new".into(), row.rect);
+                        hits.insert("file:newmenu".into(), row.rect);
+                    }
+                    if row.clicked() {
+                        outcome.action = Some(FileAction::NewOfClass(class));
+                        ui.close();
+                    }
+                }
+                let open = toolbar_button::menu_row(
+                    ui,
+                    presentation("file:open").glyph,
+                    presentation("file:open").label(),
+                    false,
+                    ui.available_width(),
+                );
+                hits.insert("file:open".into(), open.rect);
+                if open.clicked() {
+                    outcome.action = Some(FileAction::Open);
+                    ui.close();
+                }
+                let recent = recent_documents(store);
+                if !recent.is_empty() {
+                    let caption = ui.weak("Recent Documents");
+                    hits.insert("file:recent".into(), caption.rect);
+                    for name in &recent {
+                        let row = ui
+                            .add(
+                                egui::Button::new(model_display_name(name))
+                                    .wrap_mode(egui::TextWrapMode::Truncate),
+                            )
+                            .on_hover_text(name);
+                        hits.insert(format!("file:recent:{name}"), row.rect);
+                        if row.clicked() {
+                            outcome.recent = Some(name.clone());
+                            ui.close();
+                        }
+                    }
+                }
+
+                for (id, action) in [
+                    ("file:save", FileAction::Save),
+                    ("file:saveas", FileAction::SaveAs),
+                    ("file:import", FileAction::Import),
+                    ("file:export", FileAction::Export),
+                ] {
+                    let p = presentation(id);
+                    let row = toolbar_button::menu_row(
+                        ui,
+                        p.glyph,
+                        p.label(),
+                        false,
+                        ui.available_width(),
+                    );
+                    hits.insert(id.into(), row.rect);
+                    if row.clicked() {
+                        outcome.action = Some(action);
+                        ui.close();
+                    }
+                }
+                let properties = toolbar_button::menu_row(
+                    ui,
+                    presentation("properties").glyph,
+                    presentation("properties").label(),
+                    *properties_open,
+                    ui.available_width(),
+                );
+                hits.insert("properties".into(), properties.rect);
+                if properties.clicked() {
+                    *properties_open = !*properties_open;
+                    ui.close();
+                }
+                let settings = toolbar_button::menu_row(
+                    ui,
+                    presentation("settings").glyph,
+                    presentation("settings").label(),
+                    *settings_open,
+                    ui.available_width(),
+                );
+                hits.insert("settings".into(), settings.rect);
+                if settings.clicked() {
+                    *settings_open = !*settings_open;
+                    ui.close();
+                }
+                // Plugin management sits under Settings: the plugin manager
+                // and the JavaScript editor, the same rows in both styles.
+                for (id, flag) in [
+                    ("workbench:manage:plugins", &mut outcome.plugins),
+                    ("workbench:manage:javascript", &mut outcome.javascript),
+                ] {
+                    let row = toolbar_button::menu_row(
+                        ui,
+                        presentation(id).glyph,
+                        presentation(id).label(),
+                        false,
+                        ui.available_width(),
+                    );
+                    hits.insert(id.into(), row.rect);
+                    if row.clicked() {
+                        *flag = true;
+                        ui.close();
+                    }
+                }
+                ui.separator();
+                ui.weak("Workbench");
+                let current = crate::workbench::resolved_id(state, &state.settings.workbench);
+                if current != state.settings.workbench {
+                    ui.weak(format!(
+                        "Unavailable workbench: {}; using Modeling",
+                        state.settings.workbench
+                    ));
+                }
+                let dynamic = crate::workbench::owned_workbenches(state);
+                let options = crate::workbench::WORKBENCHES
+                    .iter()
+                    .map(|w| (w.id, w.label))
+                    .chain(dynamic.iter().map(|w| (w.id.as_str(), w.label.as_str())));
+                for (id, label) in options {
+                    let row = ui.radio(current == id, label);
+                    hits.insert(format!("workbench:item:{id}"), row.rect);
+                    if row.clicked() {
+                        let _ = state
+                            .apply_settings_json(&serde_json::json!({"workbench": id}).to_string());
+                        let _ = store.write(crate::store::SETTINGS_KEY, &state.settings_json());
+                        ui.close();
+                    }
+                }
+            });
+    });
+    hits.insert("file:menu".into(), menu.response.rect);
+    // Retain the historic menu-opener key for coordinate automation.
+    hits.insert("workbench".into(), menu.response.rect);
+    outcome
+}
+

@@ -28,8 +28,8 @@
 //! well over the sheet actually being thickened.
 
 use crate::{KernelRefusal, KernelStage, OrRefuse};
-use crate::offset_carve::{carve_folded_trim, dropped_sweep as carve_dropped_sweep};
-use crate::offset_regularity::{scan_offset_regularity, ScanBudget, TrimRegion};
+use crate::offset_carve::{carve_folded_trim_scanned, dropped_sweep as carve_dropped_sweep, CarveOutcome};
+use crate::offset_regularity::{scan_offset_regularity, Certainty, RegularityScan, ScanBudget, TrimRegion};
 use crate::sweep_topology::parameter_line;
 use crate::topology::{
     BrepSolid, CoedgeRecord, EdgeRecord, FaceRecord, LoopRecord, ShellRecord, VertexRecord,
@@ -68,11 +68,76 @@ fn ensure_offsets_regular(
 ) -> Result<(), KernelRefusal> {
     let region = TrimRegion::from_pcurve_loops(surface, loops)
         .map_err(|error| error.with_message(|error| format!("thickenSheet: {error}")))?;
-    let scan = scan_offset_regularity(surface, &region, distances, FOLD_FACTOR, ScanBudget::SHEET)
+    let mut scan = scan_offset_regularity(surface, &region, distances, FOLD_FACTOR, ScanBudget::SHEET)
         .map_err(|error| error.with_message(|error| format!("thickenSheet: {error}")))?;
-    let Some(worst) = scan.worst.filter(|worst| worst.factor <= FOLD_FACTOR) else {
-        return Ok(());
+    ensure_scan_regular(surface, &region, distances, &mut scan)
+}
+
+/// The gate's verdict on a scan already taken: the fold refusal on a collapsed
+/// sample, the certainty refusal where the scan could not decide, `Ok` where
+/// it certified the region regular.
+fn ensure_scan_regular(
+    surface: &NurbsSurface,
+    region: &TrimRegion,
+    distances: &[f64],
+    scan: &mut RegularityScan,
+) -> Result<(), KernelRefusal> {
+    match scan.certify(surface, region, distances, FOLD_FACTOR) {
+        Certainty::Regular => Ok(()),
+        Certainty::Folded(worst) => Err(fold_refusal(surface, worst)),
+        Certainty::Uncertain {
+            unresolved,
+            budget_exhausted,
+            least,
+        } => Err(uncertain_refusal(scan, unresolved, budget_exhausted, least)),
+    }
+}
+
+/// The scan found nothing collapsed but could not certify the region regular:
+/// cells still risky at its finest spacing, or the dip descent out of budget.
+/// Refused by name rather than built, because a sheet that folds between the
+/// samples thickens to a body that validates.
+fn uncertain_refusal(
+    scan: &RegularityScan,
+    unresolved: usize,
+    budget_exhausted: bool,
+    least: Option<crate::offset_regularity::FoldSample>,
+) -> KernelRefusal {
+    let because = match (unresolved, budget_exhausted) {
+        (0, _) => "the refinement budget ran out with prominent dips of the fold factor still \
+                   unexplored"
+            .to_string(),
+        (cells, false) => format!(
+            "{cells} cell(s) were still risky at the scan's finest spacing — the fold factor \
+             sits within a hair of the level over an area no sampling can decide"
+        ),
+        (cells, true) => format!(
+            "{cells} cell(s) were still risky at the scan's finest spacing and the refinement \
+             budget ran out"
+        ),
     };
+    let least = least
+        .map(|least| {
+            format!(
+                "; the least fold factor seen is {:.3e} at (u={:.6}, v={:.6}), concave curvature \
+                 radius {:.6} against the offset distance {:.6}",
+                least.factor,
+                least.u,
+                least.v,
+                least.radius(),
+                least.displacement.abs()
+            )
+        })
+        .unwrap_or_default();
+    KernelRefusal::unsupported(KernelStage::Refine, "thicken_regularity_uncertain", format!(
+        "thickenSheet: the offset cannot be certified regular over the selected trim — none of \
+         {} samples collapsed, but {because}{least}",
+        scan.sampled
+    ))
+}
+
+/// The fold refusal: the sample at which the equidistant sheet has collapsed.
+fn fold_refusal(surface: &NurbsSurface, worst: crate::offset_regularity::FoldSample) -> KernelRefusal {
     let where_3d = match surface.evaluate(worst.u, worst.v) {
         Ok(point) => format!(
             " — 3D ({:.6}, {:.6}, {:.6})",
@@ -80,7 +145,7 @@ fn ensure_offsets_regular(
         ),
         Err(_) => String::new(),
     };
-    Err(KernelRefusal::unsupported(KernelStage::Refine, "thicken_fold_inside_trim", format!(
+    KernelRefusal::unsupported(KernelStage::Refine, "thicken_fold_inside_trim", format!(
         "thickenSheet: offset by {:.6} self-intersects — inside the selected trim the sheet's \
          concave curvature radius {:.6} at (u={:.6}, v={:.6}){} is not larger than the offset \
          distance (fold factor {:.3e})",
@@ -90,7 +155,7 @@ fn ensure_offsets_regular(
         worst.v,
         where_3d,
         worst.factor
-    )))
+    ))
 }
 
 /// Parameter-space validation of the trim loops: closure, degeneracy, pinches
@@ -496,8 +561,12 @@ pub fn thicken_trimmed_sheet(
     //     `None` is "not this lane" and changes nothing for any other sheet: the
     //     recognition wants a revolution with a circular generatrix whose offset
     //     really does reach the axis, in a BAND strictly inside the trim.
-    if let Some(recognized) = band::recognize(surface, loops, distance_bottom, distance_top)? {
-        return Ok(vec![band::build(&recognized)?]);
+    match band::recognize(surface, loops, distance_bottom, distance_top)? {
+        Some(band::Recognized::Full(recognized)) => return Ok(vec![band::build(&recognized)?]),
+        // A PARTIAL revolution of at most half a turn: the same union is two
+        // bodies, the far side of the band landing half a turn away.
+        Some(band::Recognized::Partial(partial)) => return Ok(band::build_partial(&partial)?),
+        None => {}
     }
     let (closed_u, closed_v) = surface.closed_directions().or_refuse(KernelStage::Refine, "closed_directions")?;
     if closed_u || closed_v {
@@ -519,14 +588,14 @@ pub fn thicken_trimmed_sheet(
     // same scan, judged a band off the level so the new boundary itself does
     // not vote.  A region that folds EVERYWHERE, or one whose fold only the
     // refinement pass found, is not a carve; the gate keeps its refusal.
-    let carved = match carve_folded_trim(
+    let (carved, carve_scan) = match carve_folded_trim_scanned(
         surface,
         loops,
         &[distance_bottom, distance_top],
         FOLD_FACTOR,
         ScanBudget::SHEET,
     ) {
-        Ok(carved) => carved,
+        Ok(CarveOutcome { carved, scan, region }) => (carved, Some((scan, region))),
         Err(why) => {
             // A carve that cannot be made does NOT become this feature's
             // refusal.  The sheet still folds inside its trim, and the message
@@ -558,7 +627,16 @@ pub fn thicken_trimmed_sheet(
             regions
         }
         None => {
-            ensure_offsets_regular(surface, loops, &[distance_bottom, distance_top])?;
+            // The gate reads the carve's own scan: nothing collapsed is the
+            // census; whether the census could have seen a fold — every risky
+            // cell cleared, every prominent dip descended — is its CERTAINTY,
+            // and only a certified scan builds the trim whole.
+            match carve_scan {
+                Some((mut scan, region)) => {
+                    ensure_scan_regular(surface, &region, &[distance_bottom, distance_top], &mut scan)?
+                }
+                None => ensure_offsets_regular(surface, loops, &[distance_bottom, distance_top])?,
+            }
             vec![loops.to_vec()]
         }
     };

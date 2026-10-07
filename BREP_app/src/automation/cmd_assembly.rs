@@ -205,6 +205,8 @@ fn assembly_state(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
     let engine = ctx.app.docs.engine_mut();
     Ok(Outcome::Done(json!({
         "hasAssembly": engine.history_has_assembly(),
+        "modelRevision": engine.applied_generation(),
+        "evaluationStatus": if engine.run_pending() { "pending" } else { "evaluated" },
         "state": engine.assembly_state_value(),
         "statuses": engine.assembly_statuses_value(),
         "dof": engine.assembly_dof_value(),
@@ -285,13 +287,30 @@ fn component_info(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
         .engine()
         .component_info(&a.id)
         .ok_or_else(|| format!("no component feature '{}'", a.id))?;
+    let engine = ctx.app.docs.engine();
+    let snapshot = (!engine.run_pending()).then(|| engine.assembly_components().iter().find(|c| c.id == a.id)).flatten();
+    let pose = snapshot.map(|c| brep_render::brep_kernel::transform_to_pose_params(&c.affine()));
+    let report: Value = serde_json::from_str(&engine.history_report_json()).unwrap_or_default();
+    let authored = engine.history.index_of(&a.id).and_then(|i| engine.history.feature_params(i)).map(|p| p["transform"].clone());
     Ok(Outcome::Done(json!({
         "id": info.id,
         "partName": info.part_name,
-        "translate": info.translate,
-        "rotateEulerDeg": info.rotate_deg,
+        "translate": pose.as_ref().map(|p| &p["translate"]),
+        "rotateEulerDeg": pose.as_ref().map(|p| &p["rotateEulerDeg"]),
+        "placement": {
+            "status": if engine.run_pending() { "pending" } else if snapshot.is_some() { "evaluated" } else { "not_evaluated" },
+            "modelRevision":engine.applied_generation(),
+            "authored": snapshot.map(|c| c.authored_transform.clone()).or(authored),
+            "requestedMatrix": snapshot.and_then(|c| c.requested_transform),
+            "evaluatedMatrix": snapshot.map(|c| c.transform),
+            "solverAdjusted": snapshot.and_then(|c| c.requested_transform.map(|r| r.iter().zip(c.transform).any(|(a,b)| (a-b).abs() > 1e-10))),
+            "frame": "assembly", "lengthUnit": "mm", "angleUnit": "degree", "matrixLayout": "row_major",
+            "errors": report["featureErrors"].as_array().into_iter().flatten().filter(|e| e.as_str().is_some_and(|e| e.starts_with(&format!("{}:", a.id)))).collect::<Vec<_>>(),
+        },
         "fixed": info.fixed,
         "members": info.members,
+        "attributes": engine.occurrence_attributes(&a.id),
+        "displayName": engine.occurrence_attributes(&a.id).get("Name").cloned().unwrap_or(json!(info.part_name)),
     })))
 }
 
@@ -307,21 +326,18 @@ fn component_select(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
     Ok(Outcome::Done(json!({ "selected": a.ids })))
 }
 
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct InterferenceArgs {
+    pub components: Option<Vec<String>>,
+    /// Maximum component pairs per page, from 1 to 4096 (default 64).
+    pub budget: Option<usize>,
+    pub continuation_token: Option<String>,
+}
+
 fn interference_check(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
-    let _: NoArgs = parse_args(args)?;
-    let report = ctx.app.docs.engine_mut().interference_check();
-    Ok(Outcome::Done(json!({
-        "componentCount": report.component_count,
-        "pairTotal": report.pair_total,
-        "booleansRun": report.booleans_run,
-        "pairs": report
-            .pairs
-            .iter()
-            .map(|p| json!({ "a": p.a, "b": p.b, "volume": p.volume, "aHidden": p.a_hidden, "bHidden": p.b_hidden }))
-            .collect::<Vec<_>>(),
-        "skipped": report.skipped,
-        "unverified": report.unverified,
-    })))
+    let a: InterferenceArgs = parse_args(args)?;
+    ctx.app.docs.engine_mut().interference_page(a.components, a.budget.unwrap_or(64), a.continuation_token).map(Outcome::Done)
 }
 
 fn assembly_inferable_types(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
@@ -387,10 +403,10 @@ pub static COMMANDS: &[CommandSpec] = &[
     CommandSpec { name: "assembly_solve", group: "assembly", doc: "Run the constraint solver now (the manual Solve the panel offers when auto-solve is off) and return the statuses and remaining DOF.", phase: Phase::Mutate, annotations: Annotations::MUTATE, args_schema: schema_of::<NoArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(assembly_solve) },
     CommandSpec { name: "assembly_parts_library", group: "assembly", doc: "The document's parts-library entry names — what `component_insert` places.", phase: Phase::Read, annotations: Annotations::READ, args_schema: schema_of::<NoArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(assembly_parts_library) },
     CommandSpec { name: "component_insert", group: "assembly", doc: "Place another instance of a parts-library entry: appends an ACOMP feature with an identity transform and runs it. The document's FIRST component is grounded. Returns the feature id; move it with `feature_set_params` on its `transform`.", phase: Phase::Mutate, annotations: Annotations::MUTATE, args_schema: schema_of::<ComponentInsertArgs>, result_schema: schema_of::<ComponentAdded>, handler: Handler::App(component_insert) },
-    CommandSpec { name: "component_info", group: "assembly", doc: "One component instance: its part, placement transform, whether it is grounded, and its member solid names.", phase: Phase::Read, annotations: Annotations::READ, args_schema: schema_of::<ComponentIdArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(component_info) },
+    CommandSpec { name: "component_info", group: "assembly", doc: "One component instance with authored expressions, requested and solver-adjusted evaluated placement matrices, frame/units, evaluation status, attributes and member names. Numeric legacy fields describe evaluated geometry; failed or pending placement is null.", phase: Phase::Read, annotations: Annotations::READ, args_schema: schema_of::<ComponentIdArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(component_info) },
     CommandSpec { name: "component_set_fixed", group: "assembly", doc: "Ground or unground a component (its ACOMP `isFixed`) and re-run.", phase: Phase::Mutate, annotations: Annotations::MUTATE, args_schema: schema_of::<ComponentFixedArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(component_set_fixed) },
     CommandSpec { name: "component_select", group: "assembly", doc: "Select exactly these component instances (their member solids) — the selection a constraint's reference pick reads.", phase: Phase::Mutate, annotations: Annotations::MUTATE_NOWAIT, args_schema: schema_of::<ComponentSelectArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(component_select) },
-    CommandSpec { name: "interference_check", group: "assembly", doc: "Check every component pair for solid interference: the interfering pairs by intersection volume, plus what was skipped or refused. Empty pairs with nothing skipped is the all-clear.", phase: Phase::Read, annotations: Annotations::READ, args_schema: schema_of::<NoArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(interference_check) },
+    CommandSpec { name: "interference_check", group: "assembly", doc: "Check component pairs with an explicit pair budget and revision-bound continuation. Only allClear=true establishes complete clearance; zero-volume contact candidates remain unverified without a distance witness.", phase: Phase::Read, annotations: Annotations::READ, args_schema: schema_of::<InterferenceArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(interference_check) },
     CommandSpec { name: "assembly_inferable_types", group: "assembly", doc: "The constraint types automatic inference can produce, each with what placement it reads as that constraint — the rows the Auto Constraints dialog lists.", phase: Phase::Read, annotations: Annotations::READ, args_schema: schema_of::<NoArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(assembly_inferable_types) },
     CommandSpec { name: "assembly_infer_constraints", group: "assembly", doc: "Read the components' current placement as constraints WITHOUT creating any: the candidates (type, elements, the measurement each was read from) plus what was skipped. The look-before-you-leap half of Auto Constraints — an imported STEP assembly is fully posed and completely unconstrained, and this says what would hold it there.", phase: Phase::Read, annotations: Annotations::READ, args_schema: schema_of::<InferConstraintsArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(assembly_infer_constraints) },
     CommandSpec { name: "assembly_apply_inferred_constraints", group: "assembly", doc: "Create every constraint `assembly_infer_constraints` accepts and solve the batch as ONE undo step. Pairs that already carry a constraint are left alone, so running it twice creates nothing the second time.", phase: Phase::Mutate, annotations: Annotations::MUTATE, args_schema: schema_of::<InferConstraintsArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(assembly_apply_inferred_constraints) },

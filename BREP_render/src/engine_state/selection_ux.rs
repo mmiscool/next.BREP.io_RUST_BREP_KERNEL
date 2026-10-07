@@ -416,6 +416,24 @@ impl EngineState {
         self.sync_ref_select_emphasis();
     }
 
+    /// Feed a picked NAME into the running list — what [`Self::ref_select_click`]
+    /// does after its pick (single fields replace; multiple fields append,
+    /// de-duplicated), for a caller that already holds the name (a test, an
+    /// automation driver). No-op while no selection is running.
+    pub fn ref_select_add_name(&mut self, name: String) {
+        let Some(state) = self.ref_select.as_mut() else {
+            return;
+        };
+        if state.multiple {
+            if !state.names.iter().any(|n| n == &name) {
+                state.names.push(name);
+            }
+        } else {
+            state.names = vec![name];
+        }
+        self.sync_ref_select_emphasis();
+    }
+
     /// Remove the name at `index` from the running list (the modal's per-line X).
     pub fn ref_select_remove(&mut self, index: usize) {
         if let Some(state) = self.ref_select.as_mut() {
@@ -450,6 +468,23 @@ impl EngineState {
         // history feature is involved); the shared tail restores + re-runs,
         // which resolves the annotation against the fresh scene.
         if state.target == RefSelectTarget::Pmi {
+            if let Some((_, annotation)) = self.pmi_state().find_annotation(&state.feature_id) {
+                if annotation.kind.contains('/') {
+                    let mut params = annotation.params.clone();
+                    let value = if state.multiple { serde_json::json!(state.names) }
+                        else { serde_json::json!(state.names.first().cloned().unwrap_or_default()) };
+                    set_json_at(&mut params, &state.path, value);
+                    // Clear picking state before the transaction captures selection/revision.
+                    // PMI never rolled the history; a second rerun would invalidate the worker reply.
+                    let _ = self.emphasis.apply_json("{}");
+                    self.selection_filter = SelectionFilter::default();
+                    if let Err(error) = self.plugin_update_annotation(&state.feature_id, params) {
+                        self.push_notice(format!("PMI update failed: {error}"));
+                    }
+                    self.dirty = true;
+                    return;
+                }
+            }
             self.pmi_commit_refs(&state.feature_id, &state.path, &state.names, state.multiple);
             self.end_ref_select(state.restore_index);
             return;

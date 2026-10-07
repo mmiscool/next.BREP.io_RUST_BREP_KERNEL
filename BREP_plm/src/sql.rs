@@ -26,7 +26,7 @@
 //! | `meta` | the sequence, the settings, and any state field with no table | `key` |
 //! | `parts_fts` | part (FTS5, trigram, contentless) | number, name, description, category, tags, attribute values, MPNs, SPNs |
 //!
-//! Documents are NOT here: they stay one file each under `docs/`, as the CAD
+//! Documents are NOT here: they stay one file each under `models/`, as the CAD
 //! app writes them.
 //!
 //! # Reads
@@ -199,6 +199,54 @@ const MIGRATIONS: &[&str] = &[
     CREATE INDEX IF NOT EXISTS workspace_folder ON workspace(owner, parent);
     CREATE INDEX IF NOT EXISTS workspace_ord ON workspace(ord);
     "#,
+    // 5: readable part primary keys and revisions scoped to their owning part.
+    r#"
+    CREATE TABLE parts_new (
+        id TEXT PRIMARY KEY NOT NULL,
+        ord INTEGER NOT NULL UNIQUE,
+        number TEXT NOT NULL,
+        number_lc TEXT NOT NULL UNIQUE,
+        part_type TEXT NOT NULL,
+        category_lc TEXT NOT NULL,
+        document_class TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        body TEXT NOT NULL
+    );
+    INSERT INTO parts_new SELECT id, ord, number, number_lc, part_type, category_lc, document_class, created_at, body FROM parts;
+    CREATE TABLE revisions_new (
+        id TEXT NOT NULL,
+        part_id TEXT NOT NULL REFERENCES parts(id) ON DELETE CASCADE,
+        ord INTEGER NOT NULL,
+        label_lc TEXT NOT NULL,
+        lifecycle TEXT NOT NULL,
+        body TEXT NOT NULL,
+        PRIMARY KEY(part_id, id),
+        UNIQUE(part_id, label_lc)
+    );
+    INSERT INTO revisions_new SELECT * FROM revisions;
+    CREATE TABLE uses_new (
+        part_id TEXT NOT NULL,
+        revision_id TEXT NOT NULL,
+        ord INTEGER NOT NULL,
+        child_part TEXT NOT NULL,
+        child_revision TEXT NOT NULL,
+        quantity REAL NOT NULL,
+        body TEXT NOT NULL,
+        PRIMARY KEY(part_id, revision_id, ord),
+        FOREIGN KEY(part_id, revision_id) REFERENCES revisions(part_id, id) ON DELETE CASCADE
+    );
+    INSERT INTO uses_new SELECT r.part_id, u.revision_id, u.ord, u.child_part, u.child_revision, u.quantity, u.body FROM uses u JOIN revisions r ON r.id = u.revision_id;
+    DROP TABLE uses;
+    DROP TABLE revisions;
+    DROP TABLE parts;
+    ALTER TABLE parts_new RENAME TO parts;
+    ALTER TABLE revisions_new RENAME TO revisions;
+    ALTER TABLE uses_new RENAME TO uses;
+    CREATE INDEX parts_category ON parts(category_lc);
+    CREATE INDEX uses_child_part ON uses(child_part);
+    CREATE INDEX uses_child_revision ON uses(child_part, child_revision);
+    "#,
+
 ];
 
 /// The schema version this build writes. A file with a HIGHER version was
@@ -348,7 +396,12 @@ fn migrate(conn: &mut Connection) -> rusqlite::Result<()> {
     }
     for (index, script) in MIGRATIONS.iter().enumerate().skip(version.max(0) as usize) {
         let tx = conn.transaction()?;
-        tx.execute_batch(script)?;
+        // Development fixtures may replay earlier migrations on a database
+        // that already has scoped revision keys.
+        let scoped: bool = index == 4 && tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('uses') WHERE name = 'part_id')",
+            [], |r| r.get(0))?;
+        if !scoped { tx.execute_batch(script)?; }
         tx.pragma_update(None, "user_version", index as i32 + 1)?;
         tx.commit()?;
     }
@@ -367,7 +420,9 @@ impl Sql {
         let path = path.into();
         let mut writer = Connection::open(&path)?;
         configure(&writer, durability)?;
+        writer.pragma_update(None, "foreign_keys", false)?;
         migrate(&mut writer)?;
+        writer.pragma_update(None, "foreign_keys", true)?;
         // The checkpointer thread folds the log back in; once it has, the next
         // write restarts the log from the top, and the file is cut back to
         // 64 MB rather than keeping the size of the largest burst ever.
@@ -981,7 +1036,7 @@ fn write_part(tx: &Transaction<'_>, position: usize, part: &Part, categories: &[
         ])?;
         for (line, use_) in revision.uses.iter().enumerate() {
             tx.prepare_cached(
-                "INSERT INTO uses(revision_id, ord, child_part, child_revision, quantity, body) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                "INSERT INTO uses(revision_id, ord, child_part, child_revision, quantity, body, part_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             )?
             .execute(params![
                 revision.id,
@@ -990,6 +1045,7 @@ fn write_part(tx: &Transaction<'_>, position: usize, part: &Part, categories: &[
                 use_.revision,
                 use_.quantity,
                 serde_json::to_string(use_).map_err(json_error)?,
+                part.id,
             ])?;
         }
     }
@@ -1072,13 +1128,13 @@ fn load_parts(conn: &Connection) -> rusqlite::Result<Parts> {
         sourcing.entry(part).or_default().push(mp);
     }
     let mut uses: HashMap<String, Vec<Use>> = HashMap::new();
-    for (revision, body) in rows("SELECT revision_id, body FROM uses ORDER BY revision_id, ord")? {
+    for (revision, body) in rows("SELECT json_array(part_id, revision_id), body FROM uses ORDER BY part_id, revision_id, ord")? {
         uses.entry(revision).or_default().push(serde_json::from_value(parse(&body)?).map_err(json_error)?);
     }
     let mut revisions: HashMap<String, Vec<Revision>> = HashMap::new();
     for (part, body) in rows("SELECT part_id, body FROM revisions ORDER BY part_id, ord")? {
         let mut revision: Revision = serde_json::from_value(parse(&body)?).map_err(json_error)?;
-        revision.uses = uses.remove(&revision.id).unwrap_or_default();
+        revision.uses = uses.remove(&serde_json::json!([part, revision.id]).to_string()).unwrap_or_default();
         revisions.entry(part).or_default().push(revision);
     }
     let mut parts = Vec::new();

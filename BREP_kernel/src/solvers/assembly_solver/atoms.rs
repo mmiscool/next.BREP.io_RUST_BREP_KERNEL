@@ -88,6 +88,8 @@ pub(super) enum Atom {
     DirCross(LocalDir, LocalDir),
     /// dot(da_w, db_w) − target (1 row).
     DirDot(LocalDir, LocalDir, f64),
+    /// Wrapped signed angular difference around a body-local reference axis.
+    DirAngle(LocalDir, LocalDir, LocalDir, f64),
     /// ‖wa − wb‖ − target (1 row).
     PointDistance(LocalPoint, LocalPoint, f64),
     /// Component of (p_w − o_w) perpendicular to axis dir (3 rows, eff 2).
@@ -162,6 +164,7 @@ impl Atom {
             | Atom::LineLineTouch(..) => 3,
             Atom::PointOnPlane(..)
             | Atom::DirDot(..)
+            | Atom::DirAngle(..)
             | Atom::PointDistance(..)
             | Atom::PointLineDistance(..)
             | Atom::LineLineDistance(..) => 1,
@@ -177,6 +180,7 @@ impl Atom {
             // never fabricates an "over" (redundancy) diagnosis.
             Atom::PointOnPlane(..)
             | Atom::DirDot(..)
+            | Atom::DirAngle(..)
             | Atom::PointDistance(..)
             | Atom::PointLineDistance(..)
             | Atom::LineLineDistance(..)
@@ -212,6 +216,13 @@ impl Atom {
                 let da = world_dir(poses, a);
                 let db = world_dir(poses, b);
                 out.push(da.dot(db) - target);
+            }
+            Atom::DirAngle(a, b, axis, target) => {
+                let da = world_dir(poses, a);
+                let db = world_dir(poses, b);
+                let n = world_dir(poses, axis);
+                let delta = n.dot(da.cross(db)).atan2(da.dot(db)) - target;
+                out.push(delta.sin().atan2(delta.cos()));
             }
             Atom::PointDistance(a, b, target) => {
                 let wa = world_point(poses, a);

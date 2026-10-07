@@ -102,6 +102,10 @@ pub fn ord_tool(id: &str) -> Option<&'static str> {
 /// no kinds and no axes, only a cutting line on a placed view.
 pub const SECTION_BUTTON_ID: &str = "drawing.section";
 
+/// The INSERT BOM TABLE button id: one table per sheet, so one button that
+/// inserts it (or, once inserted, opens the sheet's dialog on its columns).
+pub const BOM_BUTTON_ID: &str = "drawing.bom";
+
 /// The DETAIL VIEW button id: a circle on a placed view, redrawn larger.
 pub const DETAIL_BUTTON_ID: &str = "drawing.detail";
 
@@ -120,7 +124,7 @@ static BUTTONS: &[WorkbenchButton] = &[
     WorkbenchButton {
         id: ADD_SHEET_BUTTON_ID,
         glyph: "\u{E077}",
-        tooltip: "Add sheet \u{2014} a new drawing sheet at the default paper size, opened on the paper",
+        ribbon_path: "Home/Drawing/Add sheet", size: crate::workbench::CommandSize::Compact, tooltip: "Add sheet \u{2014} a new drawing sheet at the default paper size, opened on the paper",
         when: None,
         pressed: None,
         disabled: None,
@@ -130,7 +134,7 @@ static BUTTONS: &[WorkbenchButton] = &[
     WorkbenchButton {
         id: PLACE_VIEW_BUTTON_ID,
         glyph: "\u{E078}",
-        tooltip: "Place view \u{2014} put a saved PMI view on the open sheet and open its dialog",
+        ribbon_path: "Home/Drawing/Place view", size: crate::workbench::CommandSize::Compact, tooltip: "Place view \u{2014} put a saved PMI view on the open sheet and open its dialog",
         when: None,
         pressed: None,
         disabled: None,
@@ -142,7 +146,7 @@ static BUTTONS: &[WorkbenchButton] = &[
     WorkbenchButton {
         id: SHEET_CLOSE_BUTTON_ID,
         glyph: "\u{E068}",
-        tooltip: "Back to 3D (close the open sheet; it keeps its contents)",
+        ribbon_path: "Home/Drawing/Back to 3D", size: crate::workbench::CommandSize::Compact, tooltip: "Back to 3D (close the open sheet; it keeps its contents)",
         when: Some(sheet_is_open),
         pressed: None,
         disabled: None,
@@ -152,7 +156,7 @@ static BUTTONS: &[WorkbenchButton] = &[
     WorkbenchButton {
         id: "drawing.dim.horizontal",
         glyph: "\u{E069}",
-        tooltip: "Horizontal dimension \u{2014} the horizontal distance between two anchors",
+        ribbon_path: "Home/Drawing/Horizontal dimension", size: crate::workbench::CommandSize::Compact, tooltip: "Horizontal dimension \u{2014} the horizontal distance between two anchors",
         when: Some(sheet_is_open),
         pressed: None,
         disabled: None,
@@ -162,7 +166,7 @@ static BUTTONS: &[WorkbenchButton] = &[
     WorkbenchButton {
         id: "drawing.dim.vertical",
         glyph: "\u{E06A}",
-        tooltip: "Vertical dimension \u{2014} the vertical distance between two anchors",
+        ribbon_path: "Home/Drawing/Vertical dimension", size: crate::workbench::CommandSize::Compact, tooltip: "Vertical dimension \u{2014} the vertical distance between two anchors",
         when: Some(sheet_is_open),
         pressed: None,
         disabled: None,
@@ -172,7 +176,7 @@ static BUTTONS: &[WorkbenchButton] = &[
     WorkbenchButton {
         id: "drawing.dim.aligned",
         glyph: "\u{E06B}",
-        tooltip: "Aligned dimension \u{2014} the true distance between two anchors",
+        ribbon_path: "Home/Drawing/Aligned dimension", size: crate::workbench::CommandSize::Compact, tooltip: "Aligned dimension \u{2014} the true distance between two anchors",
         when: Some(sheet_is_open),
         pressed: None,
         disabled: None,
@@ -182,7 +186,7 @@ static BUTTONS: &[WorkbenchButton] = &[
     WorkbenchButton {
         id: "drawing.dim.angular",
         glyph: "\u{E06F}",
-        tooltip: "Angular dimension \u{2014} the angle between two straight edges AS THIS VIEW PROJECTS THEM",
+        ribbon_path: "Home/Drawing/Angular dimension", size: crate::workbench::CommandSize::Compact, tooltip: "Angular dimension \u{2014} the angle between two straight edges AS THIS VIEW PROJECTS THEM",
         when: Some(sheet_is_open),
         pressed: None,
         disabled: None,
@@ -192,7 +196,7 @@ static BUTTONS: &[WorkbenchButton] = &[
     WorkbenchButton {
         id: "drawing.dim.radius",
         glyph: "\u{E06C}",
-        tooltip: "Radius dimension \u{2014} a projected circle's radius (R6.000)",
+        ribbon_path: "Home/Drawing/Radius dimension", size: crate::workbench::CommandSize::Compact, tooltip: "Radius dimension \u{2014} a projected circle's radius (R6.000)",
         when: Some(sheet_is_open),
         pressed: None,
         disabled: None,
@@ -202,7 +206,7 @@ static BUTTONS: &[WorkbenchButton] = &[
     WorkbenchButton {
         id: "drawing.dim.diameter",
         glyph: "\u{E06D}",
-        tooltip: "Diameter dimension \u{2014} a projected circle's diameter (\u{2300}12.000)",
+        ribbon_path: "Home/Drawing/Diameter dimension", size: crate::workbench::CommandSize::Compact, tooltip: "Diameter dimension \u{2014} a projected circle's diameter (\u{2300}12.000)",
         when: Some(sheet_is_open),
         pressed: None,
         disabled: None,
@@ -212,7 +216,7 @@ static BUTTONS: &[WorkbenchButton] = &[
     WorkbenchButton {
         id: "drawing.ord.horizontal",
         glyph: "\u{E070}",
-        tooltip: "Horizontal ordinate set \u{2014} a datum, then a run of members reading their distance along the paper's X",
+        ribbon_path: "Home/Drawing/Horizontal ordinate set", size: crate::workbench::CommandSize::Compact, tooltip: "Horizontal ordinate set \u{2014} a datum, then a run of members reading their distance along the paper's X",
         when: Some(sheet_is_open),
         pressed: None,
         disabled: None,
@@ -222,7 +226,7 @@ static BUTTONS: &[WorkbenchButton] = &[
     WorkbenchButton {
         id: "drawing.ord.vertical",
         glyph: "\u{E071}",
-        tooltip: "Vertical ordinate set \u{2014} a datum, then a run of members reading their distance up the paper",
+        ribbon_path: "Home/Drawing/Vertical ordinate set", size: crate::workbench::CommandSize::Compact, tooltip: "Vertical ordinate set \u{2014} a datum, then a run of members reading their distance up the paper",
         when: Some(sheet_is_open),
         pressed: None,
         disabled: None,
@@ -232,7 +236,17 @@ static BUTTONS: &[WorkbenchButton] = &[
     WorkbenchButton {
         id: SECTION_BUTTON_ID,
         glyph: "\u{E072}",
-        tooltip: "Section view \u{2014} a new section; pick its cutting line on a placed view in its dialog",
+        ribbon_path: "Home/Drawing/Section view", size: crate::workbench::CommandSize::Compact, tooltip: "Section view \u{2014} a new section; pick its cutting line on a placed view in its dialog",
+        when: Some(sheet_is_open),
+        pressed: None,
+        disabled: None,
+        caption: None,
+        menu: &[],
+    },
+    WorkbenchButton {
+        id: BOM_BUTTON_ID,
+        glyph: "\u{E08E}",
+        ribbon_path: "Home/Drawing/BOM table", size: crate::workbench::CommandSize::Compact, tooltip: "BOM table \u{2014} insert the sheet's BOM table (one per sheet) and open the sheet's dialog, where its columns, position and column width are chosen",
         when: Some(sheet_is_open),
         pressed: None,
         disabled: None,
@@ -242,7 +256,7 @@ static BUTTONS: &[WorkbenchButton] = &[
     WorkbenchButton {
         id: DETAIL_BUTTON_ID,
         glyph: "\u{E074}",
-        tooltip: "Detail view \u{2014} a new detail; pick its circle's centre and rim on a placed view in its dialog",
+        ribbon_path: "Home/Drawing/Detail view", size: crate::workbench::CommandSize::Compact, tooltip: "Detail view \u{2014} a new detail; pick its circle's centre and rim on a placed view in its dialog",
         when: Some(sheet_is_open),
         pressed: None,
         disabled: None,

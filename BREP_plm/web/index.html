@@ -19,125 +19,170 @@
 </div>
 
 <div id="shell" hidden>
-  <header>
-    <strong>BREP PLM</strong>
-    <nav>
-      <a href="#/parts">Parts</a>
-      <a href="#/workspace">Workspace</a>
-      <a href="#/reviews">Reviews <span id="inbox-badge" class="count" hidden></span></a>
-      <a href="#/ecos">Changes</a>
-      <a href="#/catalog">Catalog</a>
-      <a href="#/sourcing">Sourcing</a>
-      <a href="#/bake">Bake queue</a>
-      <a href="#/types" class="admin-only">Part types</a>
-      <a href="#/users" class="admin-only">Users</a>
-      <a href="#/scripts" class="admin-only">Scripts</a>
-      <a href="#/settings" class="admin-only">Settings</a>
-      <a href="#/security" class="admin-only">Security</a>
-      <a href="#/audit" class="admin-only">Audit</a>
-      <a href="#/backups" class="admin-only">Backups</a>
-      <a href="#/account">Account</a>
+  <header class="application-header">
+    <div class="titlebar"><strong><span class="app-mark" aria-hidden="true">B</span> BREP PLM</strong>
+    <nav class="top-nav" aria-label="PLM navigation">
+      <a href="#/workspace">Home</a><a href="#/parts">Parts</a><a href="#/reviews">Inbox <span id="inbox-badge" class="count" hidden></span></a><a href="#/ecos">Changes</a><a href="#/workflows">Workflows</a>
+      <details class="command-menu"><summary>More</summary><div><a href="#/native-import" class="author-only">Import native files</a><button id="menu-new-part" class="author-only">New part…</button><a href="#/catalog">Classification</a><a href="#/sourcing">Sourcing</a><a href="#/bake">Bake queue</a><a href="#/bom-columns">BOM column configurations</a></div></details>
+      <span class="spacer"></span><button id="shell-back" class="ghost" aria-label="Go back">←</button><button id="shell-refresh" class="ghost" aria-label="Refresh current view">↻</button>
     </nav>
-    <span class="spacer"></span>
-    <span id="whoami" class="who"></span>
-    <button id="signout" class="ghost">Sign out</button>
-  </header>
+<details class="command-menu user-menu" id="user-menu">
+      <summary id="user-menu-trigger" aria-label="User account menu" title="Account and administration">
+        <span class="user-avatar" aria-hidden="true"><svg viewBox="0 0 24 24" width="21" height="21" fill="none" stroke="currentColor" stroke-width="1.7"><circle cx="12" cy="8" r="3.5"/><path d="M5 21v-2a7 7 0 0 1 14 0v2"/></svg></span><span class="user-chevron" aria-hidden="true">⌄</span>
+      </summary>
+      <div class="user-menu-panel">
+        <div class="user-menu-identity"><strong id="user-display-name"></strong><span id="whoami" class="who"></span></div>
+        <a href="#/account">My account</a>
+        <a href="#/account/password" id="menu-change-password">Change password</a>
+        <section class="admin-only user-menu-admin" aria-label="Administration">
+          <h2>Administration</h2>
+          <a href="#/users">Users and permissions</a>
+          <a href="#/types">Part types</a><a href="#/occurrence-fields">Occurrence fields</a>
+          <a href="#/workflow-editor/new">Workflow editor</a>
+          <a href="#/setup">Setup wizard</a>
+          <a href="#/settings">Server settings</a>
+          <a href="#/security">Security</a>
+          <a href="#/scripts">Scripts</a>
+          <a href="#/audit">Audit log</a>
+          <a href="#/backups">Backups</a>
+        </section>
+        <div class="user-menu-signout"><button id="signout" type="button">Sign out</button></div>
+      </div>
+    </details></div>
 
+  </header>
+  <nav id="open-pages" class="open-pages" role="tablist" aria-label="Open pages"></nav>
+  <div class="work-area">
+  <main id="view-empty" class="view" hidden><p class="empty">No open tabs. Use the navigation above to open a page.</p></main>
+  <main id="view-file" class="view" hidden></main>
   <p class="error" id="banner" hidden></p>
 
   <!-- Parts list -->
-  <main id="view-parts" class="view" hidden>
+  <main id="view-parts" class="view split-view" hidden>
     <div class="toolbar">
       <input id="search" type="search" placeholder="Search number, name, category, tag or value" aria-label="Search parts">
+      <select id="filter-geometry" class="narrow" aria-label="Contains 3D geometry"><option value="">Any geometry status</option><option value="true">Has 3D geometry</option><option value="false">No 3D geometry</option></select>
+      <select id="filter-thumbnail" class="narrow" aria-label="Thumbnail status"><option value="">Any thumbnail status</option><option value="false">Missing thumbnail</option><option value="true">Has thumbnail</option></select>
       <select id="filter-category" class="narrow" aria-label="Category"></select>
       <input id="filter-tag" class="short" placeholder="Tag" aria-label="Tag">
       <select id="filter-company" class="narrow" aria-label="Manufacturer or supplier"></select>
+      <span id="parts-count" class="muted" role="status"></span>
       <span class="spacer"></span>
+      <a href="#/native-import" class="author-only button">Import native files…</a>
       <button id="new-part" class="author-only">New part</button>
     </div>
+    <div class="toolbar" aria-label="Batch part operations">
+      <span id="parts-selection-count" class="muted" role="status">0 selected</span>
+      <button id="parts-select-matching" type="button" class="ghost">Select all matching</button>
+      <button id="parts-clear-selection" type="button" class="ghost" disabled>Clear selection</button>
+      <button id="parts-force-resave" type="button" class="author-only" disabled>Force resave selected parts</button>
+      <a href="#/bake" class="button-link">View bake queue</a>
+      <span id="parts-batch-status" class="muted" role="status"></span>
+    </div>
+    <details id="parts-batch-results" hidden><summary>Batch results</summary><ul id="parts-batch-result-list"></ul>
+      <nav class="pagination" aria-label="Batch result pages"><button type="button" id="parts-batch-prev" class="ghost" disabled>Previous</button><span id="parts-batch-page-status" role="status"></span><button type="button" id="parts-batch-next" class="ghost" disabled>Next</button></nav>
+    </details>
+    <div id="catalog-layout" class="master-detail" data-split-panes data-split-default-left="36%"><section class="catalog-list master-list">
     <div class="table-wrap">
       <table>
         <thead>
-          <tr><th aria-label="Picture"></th><th>Number</th><th>Name</th><th>Type</th><th>Class</th><th>Category</th><th>MPN</th><th>Rev</th><th>State</th><th></th></tr>
+          <tr><th><input id="parts-select-all" type="checkbox" aria-label="Select all parts on this page"></th><th aria-label="Picture"></th><th>Number</th><th>Name</th><th>Type</th><th>Category</th><th>MPN</th><th>Rev</th><th>State</th><th></th></tr>
         </thead>
         <tbody id="parts-rows"></tbody>
       </table>
     </div>
     <p id="parts-empty" class="empty" hidden>No parts yet.</p>
-    <p class="more"><button type="button" id="parts-more" class="ghost" hidden>Load more</button></p>
+    <nav class="pagination" aria-label="Parts pages">
+      <button type="button" id="parts-prev" class="ghost" disabled>Previous</button>
+      <span id="parts-page-status" role="status">Page 1</span>
+      <button type="button" id="parts-more" class="ghost" disabled>Next</button>
+      <label>Per page <select id="parts-page-size"><option>25</option><option selected>50</option><option>100</option></select></label>
+    </nav>
+    </section>
+    <section class="selection-pane detail-pane" aria-label="Selected part"><button type="button" class="detail-back ghost" data-master-back="catalog">← Back to parts</button>
+      <div class="pane-title">Summary <span class="muted">/ Selected object</span></div>
+      <div id="selection-content"><p class="selection-empty">Select a part to see its revisions and related information.</p></div>
+    </section></div>
+  </main>
+
+  <main id="view-native-import" class="view" hidden>
+    <h1>Import native parts and assemblies</h1>
+    <p>Upload a .nbrep model, a complete assembly, or a folder of native files. Embedded components become individual revision-controlled parts; repeated components share one part.</p>
+    <ol class="import-steps" aria-label="Import steps"><li>1. Choose files</li><li>2. Map parts</li><li>3. Review and import</li></ol>
+    <fieldset id="ni-files-step">
+      <legend>1. Choose files</legend>
+      <label>Import set <input id="ni-namespace" required placeholder="e.g. Pump assembly"></label>
+      <p class="muted">Use the same import set when updating this model later. The wizard uses it and the source paths to find previously imported parts.</p>
+      <div class="toolbar"><label>Native files <input id="ni-files" type="file" accept=".nbrep" multiple></label><label>Or a folder <input id="ni-folder" type="file" webkitdirectory multiple></label></div>
+      <p id="ni-file-summary" role="status">No files selected.</p>
+    </fieldset>
+    <section id="ni-mapping-step" hidden>
+      <h2>2. Map parts</h2>
+      <p>Choose a type for each new part to use its numbering scheme. Existing parts keep their type and number. Replacing a draft updates its document and BOM; creating a revision preserves the old revision.</p>
+      <fieldset id="ni-mapping-fields">
+        <div class="toolbar"><label class="inline">Default type <select id="ni-default-type"></select></label><button id="ni-apply-type" type="button" class="ghost">Apply to all new parts</button></div>
+        <div class="table-wrap"><table class="import-table"><thead><tr><th>File / name</th><th>Action</th><th>Part type / numbering</th><th>Number or existing target</th><th>Revision</th></tr></thead><tbody id="ni-rows"></tbody></table></div>
+        <p class="muted">Counter numbers are estimates until import. Missing files, inconsistent embedded copies, and circular assemblies must be resolved before continuing.</p>
+        <button id="ni-review" type="button">Review import</button>
+      </fieldset>
+    </section>
+    <section id="ni-review-step" hidden>
+      <h2>3. Review and import</h2>
+      <p id="ni-review-summary"></p>
+      <div class="table-wrap"><table><thead><tr><th>File</th><th>Action</th><th>Target part</th><th>Revision</th></tr></thead><tbody id="ni-review-rows"></tbody></table></div>
+      <p>Imported models stay in Draft. Replacing a document makes any prior review approvals stale. Files on your computer are unchanged.</p>
+      <label class="inline"><input id="ni-confirm" type="checkbox">I have reviewed every creation and replacement above.</label>
+      <div class="toolbar"><button id="ni-back" class="ghost" type="button">Back to mapping</button><button id="ni-run" type="button" disabled>Import</button></div>
+    </section>
+    <p id="ni-status" role="status" aria-live="polite"></p>
+    <p id="ni-error" class="error" role="alert" hidden></p>
+    <section id="ni-results" hidden><h2>Import results</h2><p>Progress is saved in this browser. If an import pauses or fails, completed parts remain in the system. Keep the receipt when reconciling an interrupted operation.</p><ul id="ni-result-rows"></ul><div class="toolbar"><button id="ni-stop" type="button" hidden>Pause after current operation</button><button id="ni-resume" type="button">Resume import</button><button id="ni-receipt" type="button" class="ghost">Download receipt</button><button id="ni-reset" type="button" class="ghost">Start another import</button></div></section>
   </main>
 
   <!-- One part -->
   <!-- A user's workspace: folders of links and files (D12). The CAD app's File > Open shows
        the same thing. -->
-  <main id="view-workspace" class="view" hidden>
-    <h1>Workspace</h1>
-    <div class="toolbar">
-      <label class="inline-select">Whose <select id="ws-owner"></select></label>
-      <span id="ws-readonly" class="muted" hidden>read-only — this is another user's workspace</span>
-      <span id="ws-private" class="muted" hidden>other workspaces are private on this server</span>
-      <span class="spacer"></span>
-      <button id="ws-reload" class="ghost">Reload</button>
+  <main id="view-workspace" class="view split-view" hidden>
+    <div id="home-layout" class="master-detail" data-split-panes data-split-default-left="36%">
+      <section class="master-list" aria-label="Home contents"><div id="home-tree" role="tree" aria-label="Home tree"></div><p id="home-status" role="status"></p></section>
+      <section class="detail-pane" aria-label="Selected Home item"><button type="button" class="detail-back ghost" data-master-back="home">← Back to Home tree</button><div id="home-detail" aria-live="polite"></div></section>
     </div>
-    <p id="ws-crumbs" class="crumbs"></p>
-    <p id="ws-cut" class="note" hidden><span id="ws-cut-name"></span> is cut.
-      <button id="ws-paste" class="link">Move it here</button>
-      <button id="ws-cut-cancel" class="link">Cancel</button></p>
-    <div id="ws-drop" class="drop" tabindex="0">
-      <p id="ws-empty" class="muted" hidden>This folder is empty.</p>
-      <div class="table-wrap" id="ws-wrap">
-        <table>
-          <thead><tr><th aria-label="Picture"></th><th>Name</th><th>What</th><th>Changed</th><th></th></tr></thead>
-          <tbody id="ws-rows"></tbody>
-        </table>
-      </div>
-      <p class="ws-write">Drop files here, or <label class="file-pick">choose files<input type="file" id="ws-file" multiple></label>.
-        A file with a name already in this folder becomes its next version; the one before is kept.
-        <span id="ws-status" class="muted"></span></p>
-    </div>
-    <div class="toolbar ws-write ws-make">
-      <input id="ws-folder-name" placeholder="folder name">
-      <button id="ws-new-folder" class="ghost">New folder</button>
-      <span class="spacer"></span>
-      <input id="ws-link-part" placeholder="part number">
-      <input id="ws-link-rev" placeholder="revision (empty: newest)" size="12">
-      <button id="ws-link" class="ghost">Link a part here</button>
-    </div>
-    <section id="ws-versions" hidden>
-      <h2>Versions of <span id="ws-versions-name" class="mono"></span></h2>
-      <div class="table-wrap">
-        <table>
-          <thead><tr><th>Version</th><th>Size</th><th>By</th><th>When</th><th></th></tr></thead>
-          <tbody id="ws-version-rows"></tbody>
-        </table>
-      </div>
-    </section>
   </main>
 
   <main id="view-part" class="view" hidden>
-    <a href="#/parts" class="back">&larr; All parts</a>
     <div class="part-head">
-      <span id="part-thumb"></span>
       <h1><span id="part-number"></span> <span id="part-name" class="muted"></span></h1>
     </div>
-    <p id="part-meta" class="muted"></p>
-    <div class="toolbar"><button id="part-add-ws" class="ghost">Add to workspace…</button>
-      <span id="part-ws-status" class="muted"></span></div>
 
-    <section class="details">
+    <div id="object-tabs" class="object-tabs" role="tablist" aria-label="Part views"></div>
+    <section class="details object-panel" data-object-panel="summary">
+      <a href="#/parts" class="back">&larr; All parts</a>
+      <div class="part-head">
+        <span id="part-thumb"></span>
+        <div>
+          <p id="part-meta" class="muted"></p>
+          <div class="toolbar"><span id="part-open-cad"></span><button id="part-add-ws" class="ghost">Add to workspace…</button>
+            <span id="part-ws-status" class="muted"></span></div>
+        </div>
+      </div>
       <div class="toolbar">
-        <h2>Catalog</h2>
+        <h2>Part attributes</h2>
         <span class="spacer"></span>
-        <button id="edit-part" class="ghost author-only">Edit details</button>
       </div>
       <p id="part-locked" class="note" hidden>This part is released, and the administrator has
         locked released catalog values. Start a new revision to change its category or attributes.</p>
-      <p id="part-category" class="muted"></p>
-      <p id="part-tags"></p>
-      <dl id="part-attrs" class="attrs"></dl>
+      <div class="summary-attributes">
+        <dl id="summary-record-fields" class="attrs"></dl>
+        <dl class="attrs">
+          <dt><label for="summary-revision">Revision</label></dt>
+          <dd><div class="part-attribute-input"><span class="attribute-lock" aria-hidden="true"></span><div class="summary-revision-choice"><select id="summary-revision" aria-label="Revision"></select><span id="summary-field-status" class="muted" role="status"></span></div></div></dd>
+        </dl>
+        <dl id="summary-revision-fields" class="attrs"></dl>
+        <dl id="part-attrs" class="attrs"></dl>
+      </div>
     </section>
 
-    <section class="sourcing">
+    <section class="sourcing object-panel" data-object-panel="sourcing">
       <div class="toolbar">
         <h2>Sourcing</h2>
         <span class="spacer"></span>
@@ -148,7 +193,7 @@
     </section>
 
     <!-- A family seed: its table and members -->
-    <section id="family-panel" class="details" hidden>
+    <section id="family-panel" class="details object-panel" data-object-panel="summary" hidden>
       <div class="toolbar">
         <h2>Family members</h2>
         <span class="spacer"></span>
@@ -190,7 +235,7 @@
     </section>
 
     <!-- A template: its inputs and the parts spun out of it -->
-    <section id="template-panel" class="details" hidden>
+    <section id="template-panel" class="details object-panel" data-object-panel="summary" hidden>
       <div class="toolbar">
         <h2>Template</h2>
         <span class="spacer"></span>
@@ -216,6 +261,8 @@
       <ul id="tpl-copies" class="plain"></ul>
     </section>
 
+    <section class="object-panel" data-object-panel="revisions">
+      <section class="card" id="revision-field-card"><div class="toolbar"><strong>Revision attributes</strong><label>Revision <select id="revision-field-revision"></select></label></div><div id="revision-field-values"></div></section>
     <h2>Revisions</h2>
     <form class="toolbar author-only" id="new-rev-form">
       <input id="new-rev-label" class="short" aria-label="Label for the new revision" placeholder="Label">
@@ -225,14 +272,16 @@
     <div class="table-wrap">
       <table>
         <thead>
-          <tr><th>Rev</th><th>State</th><th>Review</th><th>Source</th><th>Checked out</th><th>Size</th><th>Hash</th><th>Actions</th></tr>
+          <tr><th>Rev</th><th>State</th><th>Review</th><th>Checked out</th><th>Actions</th></tr>
         </thead>
         <tbody id="rev-rows"></tbody>
       </table>
     </div>
 
+    </section>
+
     <!-- Review and discussion of one revision -->
-    <section id="review-panel" class="details">
+    <section id="review-panel" class="details object-panel" data-object-panel="review">
       <div class="toolbar">
         <h2>Review</h2>
         <span class="spacer"></span>
@@ -259,7 +308,7 @@
 
     <!-- Assembly structure: the uses list, the BOM built from it, and the
          diff between two revisions' lists -->
-    <section id="bom-panel" class="details">
+    <section id="bom-panel" class="details object-panel" data-object-panel="structure">
       <div class="toolbar">
         <h2>Structure</h2>
         <span class="spacer"></span>
@@ -278,17 +327,13 @@
               <option value="indented">Indented</option>
               <option value="flat">Flat: totals per part</option>
             </select></label>
-          <label class="inline-select" id="bom-levels-label">Levels
-            <select id="bom-levels">
-              <option value="1">1</option>
-              <option value="2">2</option>
-              <option value="3">3</option>
-              <option value="0" selected>All</option>
-            </select></label>
           <span class="spacer"></span>
+          <label class="inline-select">Columns <select id="bom-layout"></select></label><a class="button-link" href="#/bom-columns">Configure columns…</a>
+          <button type="button" id="bom-edit-attributes" class="ghost author-only" aria-pressed="false">Edit attributes</button>
           <a id="bom-csv" class="button-link" href="#" download>Download CSV</a>
         </div>
-        <div id="bom-warnings" class="warn" hidden></div>
+        <div id="bom-tree-controls" class="toolbar bom-tree-controls"></div>
+        <p id="bom-edit-status" class="muted" role="status"></p>
         <p id="bom-empty" class="muted" hidden>This revision uses nothing, so it has no BOM. To make it an
           assembly, add the parts it is built from on the <strong>Uses list</strong> tab.</p>
         <div class="table-wrap" id="bom-wrap">
@@ -342,7 +387,7 @@
       </div>
     </section>
 
-    <section id="attach-panel" class="details">
+    <section id="attach-panel" class="details object-panel" data-object-panel="attachments">
       <div class="toolbar">
         <h2>Attachments</h2>
         <span class="spacer"></span>
@@ -378,7 +423,7 @@
       <div id="att-preview" class="att-preview" hidden></div>
     </section>
 
-    <section id="where-panel" class="details">
+    <section id="where-panel" class="details object-panel" data-object-panel="structure">
       <div class="toolbar">
         <h2>Where used</h2>
         <span class="spacer"></span>
@@ -399,7 +444,7 @@
       <p id="wu-empty" class="muted" hidden>Nothing uses this part.</p>
     </section>
 
-    <section id="history-panel" class="details">
+    <section id="history-panel" class="details object-panel" data-object-panel="history">
       <div class="toolbar">
         <h2>History</h2>
         <span class="spacer"></span>
@@ -432,13 +477,13 @@
   </main>
 
   <!-- Catalog -->
-  <main id="view-catalog" class="view" hidden>
+  <main id="view-catalog" class="view split-view-wide" hidden>
     <h1>Catalog</h1>
     <p class="muted">Every part sits in one category. A category's attributes apply to
       every category beneath it, and a sub-category can add its own but cannot
       redefine one it inherits. Values are checked when they are saved; required
       values are needed only when a revision is released.</p>
-    <div class="catalog">
+    <div class="catalog" data-split-panes data-split-default-left="280px" data-split-breakpoint="801">
       <aside>
         <ul id="category-tree" class="tree"></ul>
         <form id="category-new" class="card admin-only">
@@ -498,24 +543,12 @@
 
   <!-- Part types -->
   <!-- A person's reviews: what waits on them, what they submitted -->
-  <main id="view-reviews" class="view" hidden>
-    <h1>Reviews</h1>
-    <h2>Waiting on you</h2>
-    <div class="table-wrap">
-      <table>
-        <thead><tr><th>What</th><th>Name</th><th>Submitted by</th><th>Submitted</th><th>Due</th><th>Approvals</th><th>Status</th></tr></thead>
-        <tbody id="inbox-waiting"></tbody>
-      </table>
+  <main id="view-reviews" class="view split-view" hidden>
+    <div class="toolbar"><label>Show <select id="inbox-filter"><option value="waiting_on_me">Waiting on me</option><option value="submitted">Submitted by me</option></select></label></div>
+    <div id="inbox-layout" class="master-detail" data-split-panes data-split-default-left="36%">
+      <section class="master-list" aria-label="Reviews"><div id="inbox-items"></div><p id="inbox-empty" class="empty" hidden>No reviews here.</p></section>
+      <section class="detail-pane" aria-label="Selected review"><button type="button" class="detail-back ghost" data-master-back="inbox">← Back to inbox</button><div id="inbox-detail" aria-live="polite"><p class="empty">Select a review to see its details and respond.</p></div></section>
     </div>
-    <p id="inbox-waiting-empty" class="muted" hidden>Nothing is waiting on you.</p>
-    <h2>Submitted by you</h2>
-    <div class="table-wrap">
-      <table>
-        <thead><tr><th>What</th><th>Name</th><th>Submitted by</th><th>Submitted</th><th>Due</th><th>Approvals</th><th>Status</th></tr></thead>
-        <tbody id="inbox-submitted"></tbody>
-      </table>
-    </div>
-    <p id="inbox-submitted-empty" class="muted" hidden>You have nothing in review.</p>
   </main>
 
   <!-- Change orders -->
@@ -650,6 +683,20 @@
     </form>
   </main>
 
+
+  <main id="view-bom-columns" class="view" hidden>
+    <div class="toolbar"><label>Configuration <select id="bc-layout"></select></label><button id="bc-new">New configuration</button><button id="bc-copy">Make a copy</button><button id="bc-delete" class="ghost">Delete</button></div>
+    <form id="bc-form" class="card"><label>Name <input id="bc-name" required></label><label class="admin-only"><input type="checkbox" id="bc-shared"> Shared server configuration</label>
+      <p>Select available fields to add them. The configured list sets the column order.</p>
+      <div id="bc-fields" class="bom-column-picker" data-split-panes data-split-breakpoint="601">
+        <label>Available fields<select id="bc-available" multiple size="14" aria-label="Available fields"></select></label>
+        <div class="bom-column-transfer"><button type="button" id="bc-add">Add →</button><button type="button" id="bc-remove">← Remove</button></div>
+        <div><label>Configured columns<select id="bc-configured" multiple size="14" aria-label="Configured columns"></select></label><div class="toolbar"><button type="button" id="bc-up">Move up ↑</button><button type="button" id="bc-down">Move down ↓</button></div></div>
+      </div>
+      <div class="toolbar"><button type="submit">Save configuration</button><button type="button" id="bc-use">Use this configuration</button><span id="bc-status" role="status"></span></div>
+    </form>
+  </main>
+  <main id="view-occurrence-fields" class="view" hidden><div class="toolbar"><strong>Assembly occurrence fields</strong><button id="occurrence-fields-edit" class="admin-only">Edit fields…</button></div><div id="occurrence-fields-list"></div></main>
   <!-- Users -->
   <main id="view-users" class="view" hidden>
     <h1>Users</h1>
@@ -678,8 +725,21 @@
   <!-- The bake queue -->
   <main id="view-bake" class="view" hidden>
     <h1>Bake queue</h1>
-    <p class="muted">The server never runs the CAD kernel. A member or a spin-out the server
-      assembled waits here until a headless CAD worker (a user in the <strong>worker</strong> group)
+    <section id="bake-worker-controls" class="admin-only" hidden aria-label="Bake worker controls">
+      <div class="toolbar">
+        <strong>Server bake worker</strong>
+        <span id="bake-worker-status" role="status" aria-live="polite">Checking…</span>
+        <span class="spacer"></span>
+        <button id="bake-worker-start" disabled>Start worker</button>
+        <button id="bake-worker-stop" class="ghost" disabled>Stop worker</button>
+      </div>
+      <p id="bake-worker-message" class="muted"></p>
+      <p class="muted">These controls manage this server's worker. Stopping preserves the queue.
+        An interrupted job can be taken back below, or will become available when its claim expires.
+        Workers started elsewhere are managed separately.</p>
+    </section>
+    <p class="muted">A family member or a spin-out assembled by the server
+      waits here until a headless CAD worker (a user in the <strong>worker</strong> group)
       claims it, checks and rebuilds it, and writes it back. A claim lapses after 15 minutes, so a
       worker that stops never strands a job. A failed job waits for a person: fix the row or the
       template, then retry it. Saving the part from the CAD app also answers its bake.</p>
@@ -702,15 +762,21 @@
       </table>
     </div>
     <p id="bake-empty" class="empty" hidden>Nothing waiting.</p>
+    <nav class="pagination" aria-label="Bake queue pages">
+      <button type="button" id="bake-prev" class="ghost" disabled>Previous</button>
+      <span id="bake-page-status" role="status">Page 1</span>
+      <button type="button" id="bake-next" class="ghost" disabled>Next</button>
+      <label>Per page <select id="bake-page-size"><option>25</option><option selected>50</option><option>100</option></select></label>
+    </nav>
   </main>
 
   <!-- Sourcing: manufacturers and suppliers -->
-  <main id="view-sourcing" class="view" hidden>
+  <main id="view-sourcing" class="view split-view-wide" hidden>
     <h1>Sourcing</h1>
     <p class="muted">Manufacturers make parts and suppliers sell them. On a part, each
       manufacturer part (MPN) lists the suppliers that offer it, with their prices.
       A company that both makes and sells appears in both lists.</p>
-    <div class="companies">
+    <div class="companies" data-split-panes data-split-breakpoint="801">
       <section>
         <h2>Manufacturers</h2>
         <div class="table-wrap">
@@ -743,6 +809,12 @@
   </main>
 
   <!-- Settings -->
+  <main id="view-workflows" class="view" hidden></main>
+  <main id="view-workflow-editor" class="view" hidden></main>
+  <main id="view-workflow-run" class="view" hidden></main>
+
+  <main id="view-setup" class="view" hidden></main>
+
   <main id="view-settings" class="view" hidden>
     <h1>Settings</h1>
     <p class="muted">How this server works for everyone. Each setting starts at the
@@ -875,13 +947,13 @@
   </main>
 
   <!-- Scripts -->
-  <main id="view-scripts" class="view" hidden>
+  <main id="view-scripts" class="view split-view-wide" hidden>
     <h1>Scripts</h1>
+    <details class="scripts-help"><summary>About server scripts</summary>
     <p class="muted">Scripts are JavaScript files in a folder on the server:
       <code id="scripts-dir"></code>. That folder is the source of truth. You can
       keep it in git, and the server picks up a changed file on its next call,
       with no restart. This editor reads and writes the same files.</p>
-    <p class="warn" id="scripts-readonly" hidden></p>
     <table class="hooks">
       <thead><tr><th>File</th><th>Function</th><th>When it runs</th></tr></thead>
       <tbody id="hook-rows"></tbody>
@@ -892,7 +964,9 @@
       release stands. Scripts are fully trusted. They can use <code>http</code>,
       <code>fs</code>, <code>process</code> and <code>plm</code>.</p>
 
-    <div class="scripts">
+    </details>
+    <p class="warn" id="scripts-readonly" hidden></p>
+    <div class="scripts" data-split-panes data-split-default-left="240px" data-split-breakpoint="801">
       <aside>
         <ul id="script-list" class="file-list"></ul>
         <form id="script-new" class="toolbar">
@@ -986,7 +1060,7 @@
   <main id="view-account" class="view" hidden>
     <h1>Your account</h1>
     <p class="muted" id="account-who"></p>
-    <div class="account">
+    <div class="account" data-split-panes>
       <form id="password-form" class="card">
         <h2>Change password</h2>
         <label>Current password <input type="password" id="pw-current" autocomplete="current-password" required></label>
@@ -1105,6 +1179,8 @@
     <p class="muted">To make a token for another user, such as a worker account that never
       signs in with a password, use <a href="#/account">Account</a> and choose the user.</p>
   </main>
+  </div>
+  <footer class="statusbar"><span id="shell-status" role="status">Ready</span><span>BREP PLM · Engineering</span></footer>
 </div>
 
 <dialog id="ws-pick-dialog">
@@ -1115,7 +1191,7 @@
     <label id="ws-pick-rev-label">Revision <select id="ws-pick-rev"></select></label>
     <label>Name <input id="ws-pick-name" placeholder="empty: the part number"></label>
     <menu>
-      <button value="cancel" class="ghost">Cancel</button>
+      <button type="submit" value="cancel" formnovalidate class="ghost">Cancel</button>
       <button value="choose" id="ws-pick-go">Here</button>
     </menu>
   </form>
@@ -1135,7 +1211,7 @@
       <option value="other">other</option>
     </select></label>
     <menu>
-      <button value="cancel" class="ghost">Cancel</button>
+      <button type="submit" value="cancel" formnovalidate class="ghost">Cancel</button>
       <button value="promote">Promote</button>
     </menu>
   </form>
@@ -1149,7 +1225,7 @@
     <label>Due <input id="sb-due" type="date"></label>
     <label>Note to the reviewers <textarea id="sb-note" rows="3" class="short-area"></textarea></label>
     <menu>
-      <button value="cancel" class="ghost">Cancel</button>
+      <button type="submit" value="cancel" formnovalidate class="ghost">Cancel</button>
       <button value="submit">Submit for review</button>
     </menu>
   </form>
@@ -1162,7 +1238,7 @@
     <label>Due <input id="rd-due" type="date"></label>
     <label id="rd-required-label">Approvals needed <input id="rd-required" type="number" min="0" max="50" step="1"></label>
     <menu>
-      <button value="cancel" class="ghost">Cancel</button>
+      <button type="submit" value="cancel" formnovalidate class="ghost">Cancel</button>
       <button value="save">Save</button>
     </menu>
   </form>
@@ -1179,7 +1255,7 @@
       <option value="low">Low</option><option value="normal" selected>Normal</option>
       <option value="high">High</option><option value="critical">Critical</option></select></label>
     <menu>
-      <button value="cancel" class="ghost">Cancel</button>
+      <button type="submit" value="cancel" formnovalidate class="ghost">Cancel</button>
       <button value="save">Save</button>
     </menu>
   </form>
@@ -1192,7 +1268,7 @@
     <label>More reviewers <input id="es-reviewers" placeholder="user:grace, group:quality"></label>
     <label>Note to the reviewers <textarea id="es-note" rows="3" class="short-area"></textarea></label>
     <menu>
-      <button value="cancel" class="ghost">Cancel</button>
+      <button type="submit" value="cancel" formnovalidate class="ghost">Cancel</button>
       <button value="submit">Submit for review</button>
     </menu>
   </form>
@@ -1219,7 +1295,7 @@
     </div>
     <p id="rp-summary" class="muted"></p>
     <menu>
-      <button value="cancel" class="ghost">Close</button>
+      <button type="submit" value="cancel" formnovalidate class="ghost">Close</button>
       <button type="button" id="rp-preview" class="ghost">Preview</button>
       <button type="button" id="rp-apply" disabled>Apply</button>
     </menu>
@@ -1234,7 +1310,7 @@
     <label>Action <select id="ae-action">
       <option value="release">Release it</option><option value="obsolete">Obsolete it</option></select></label>
     <menu>
-      <button value="cancel" class="ghost">Cancel</button>
+      <button type="submit" value="cancel" formnovalidate class="ghost">Cancel</button>
       <button value="save">Add</button>
     </menu>
   </form>
@@ -1261,7 +1337,7 @@
     <label>Description <textarea id="np-description" rows="3" class="short-area"></textarea></label>
     <label>First revision label <input id="np-label" placeholder="A"></label>
     <menu>
-      <button value="cancel" class="ghost">Cancel</button>
+      <button type="submit" value="cancel" formnovalidate class="ghost">Cancel</button>
       <button value="create" id="np-create">Create</button>
     </menu>
   </form>
@@ -1283,7 +1359,7 @@
     <label class="check"><input type="checkbox" id="import-generate" checked>
       <span>Generate the members right after the import</span></label>
     <menu>
-      <button value="cancel" class="ghost">Cancel</button>
+      <button type="submit" value="cancel" formnovalidate class="ghost">Cancel</button>
       <button value="import">Import</button>
     </menu>
   </form>
@@ -1305,28 +1381,13 @@
     <label class="te-field" data-mode="script">Script file <input id="te-script" class="mono"></label>
     <p class="muted">Parts that already exist keep their numbers. The change applies to the next part created.</p>
     <menu>
-      <button value="cancel" class="ghost">Cancel</button>
+      <button type="submit" value="cancel" formnovalidate class="ghost">Cancel</button>
       <button value="save">Save</button>
     </menu>
   </form>
 </dialog>
 
-<dialog id="part-dialog">
-  <form method="dialog" id="part-edit-form">
-    <h2>Edit <span id="pe-number" class="mono muted"></span></h2>
-    <label>Name <input id="pe-name" required></label>
-    <label>Description <textarea id="pe-description" rows="3" class="short-area"></textarea></label>
-    <label>Category <select id="pe-category"></select></label>
-    <div id="pe-attrs" class="attr-form"></div>
-    <div id="pe-inert" class="inert" hidden></div>
-    <label>Tags <input id="pe-tags" placeholder="metric, stock"></label>
-    <p class="muted">These are the part's details, shared by all its revisions. No checkout is needed.</p>
-    <menu>
-      <button value="cancel" class="ghost">Cancel</button>
-      <button value="save">Save</button>
-    </menu>
-  </form>
-</dialog>
+
 
 <dialog id="company-dialog">
   <form method="dialog" id="company-form">
@@ -1335,7 +1396,7 @@
     <label>Website <input id="co-website" type="url" placeholder="https://"></label>
     <label>Notes <textarea id="co-notes" rows="3" class="short-area"></textarea></label>
     <menu>
-      <button value="cancel" class="ghost">Cancel</button>
+      <button type="submit" value="cancel" formnovalidate class="ghost">Cancel</button>
       <button value="save">Save</button>
     </menu>
   </form>
@@ -1358,7 +1419,7 @@
     <label>Datasheet <input id="mp-datasheet" type="url" placeholder="https://"></label>
     <label>Notes <textarea id="mp-notes" rows="2" class="short-area"></textarea></label>
     <menu>
-      <button value="cancel" class="ghost">Cancel</button>
+      <button type="submit" value="cancel" formnovalidate class="ghost">Cancel</button>
       <button value="save">Save</button>
     </menu>
   </form>
@@ -1387,12 +1448,21 @@
     </div>
     <label>Notes <textarea id="of-notes" rows="2" class="short-area"></textarea></label>
     <menu>
-      <button value="cancel" class="ghost">Cancel</button>
+      <button type="submit" value="cancel" formnovalidate class="ghost">Cancel</button>
       <button value="save">Save</button>
     </menu>
   </form>
 </dialog>
 
+<dialog id="fields-dialog"><form id="fields-form"><h2 id="fields-title"></h2><p>Values belong to the revision or assembly occurrence. Removing a definition preserves existing values.</p><div id="fields-editor"></div><button type="button" id="fields-add">Add field</button><div class="toolbar"><button type="submit">Save fields</button><button type="button" id="fields-cancel">Cancel</button></div></form></dialog>
+<script src="/native-import.js"></script>
+<script src="/workbench.js"></script>
+<script src="/file-documents.js"></script>
+<script src="/open-pages.js"></script>
+<script src="/split-panes.js"></script>
+<script src="/setup.js"></script>
+<script src="/workflows.js"></script>
 <script src="/app.js"></script>
+
 </body>
 </html>

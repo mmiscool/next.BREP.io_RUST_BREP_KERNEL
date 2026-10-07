@@ -310,7 +310,10 @@ impl SettingsPanel {
         let status = match &plm.status {
             Status::Connected { url, username } => format!("Connected to {url} as {username}."),
             Status::NotConnected { url, reason: None } => format!("Not connected to {url}."),
-            Status::NotConnected { url, reason: Some(why) } => format!("Not connected to {url}: {why}"),
+            Status::NotConnected {
+                url,
+                reason: Some(why),
+            } => format!("Not connected to {url}: {why}"),
         };
         let shown = ui.add(egui::Label::new(status).wrap());
         hits.insert("plm:status".into(), shown.rect);
@@ -320,33 +323,55 @@ impl SettingsPanel {
         let idle = !plm.busy();
         if native {
             ui.label("Paste an API token (from the PLM's web page):");
-            let token = ui.add(egui::TextEdit::singleline(&mut plm.token_input).password(true).hint_text("plm_…"));
+            let token = ui.add(
+                egui::TextEdit::singleline(&mut plm.token_input)
+                    .password(true)
+                    .hint_text("plm_…"),
+            );
             hits.insert("plm:token".into(), token.rect);
-            let use_token = ui.add_enabled(idle && !plm.token_input.trim().is_empty(), egui::Button::new("Use token"));
+            let use_token = ui.add_enabled(
+                idle && !plm.token_input.trim().is_empty(),
+                egui::Button::new("Use token"),
+            );
             hits.insert("plm:use-token".into(), use_token.rect);
             if use_token.clicked() {
                 plm.use_token();
             }
             ui.separator();
         }
-        ui.label(if native { "Or sign in, and this machine keeps a token (not the password):" } else { "Sign in to the PLM:" });
-        let username = ui.add(egui::TextEdit::singleline(&mut plm.username).hint_text("username"));
-        hits.insert("plm:username".into(), username.rect);
-        let password = ui.add(egui::TextEdit::singleline(&mut plm.password).password(true).hint_text("password"));
-        hits.insert("plm:password".into(), password.rect);
-        let can_sign_in = idle && !plm.username.trim().is_empty() && !plm.password.is_empty();
-        let sign_in = ui.add_enabled(can_sign_in, egui::Button::new("Sign in"));
-        hits.insert("plm:sign-in".into(), sign_in.rect);
-        if sign_in.clicked() {
-            plm.use_password();
+        if native {
+            ui.label("Or sign in, and this machine keeps a token (not the password):");
+            let username =
+                ui.add(egui::TextEdit::singleline(&mut plm.username).hint_text("username"));
+            hits.insert("plm:username".into(), username.rect);
+            let password = ui.add(
+                egui::TextEdit::singleline(&mut plm.password)
+                    .password(true)
+                    .hint_text("password"),
+            );
+            hits.insert("plm:password".into(), password.rect);
+            let can_sign_in = idle && !plm.username.trim().is_empty() && !plm.password.is_empty();
+            let sign_in = ui.add_enabled(can_sign_in, egui::Button::new("Sign in"));
+            hits.insert("plm:sign-in".into(), sign_in.rect);
+            if sign_in.clicked() {
+                plm.use_password();
+            }
+            ui.separator();
+        } else {
+            ui.label("This browser uses your PLM session. Manage your account and sign in on the PLM page.");
+            let account = ui.hyperlink_to(
+                "Open PLM account",
+                format!("{}/#/account", plm.url().trim_end_matches('/')),
+            );
+            hits.insert("plm:account".into(), account.rect);
         }
-        ui.separator();
         // Connect now (native): once the server has taken this machine's
         // sign-in, switch this session to it live instead of at next start
         // (only in the state a fresh start has: no named or dirty document).
         if native && matches!(plm.status, Status::NotConnected { .. }) && plm.connectable() {
             let blocked = self.reconnect_blocker.clone();
-            let connect = ui.add_enabled(idle && blocked.is_none(), egui::Button::new("Connect now"));
+            let connect =
+                ui.add_enabled(idle && blocked.is_none(), egui::Button::new("Connect now"));
             hits.insert("plm:connect".into(), connect.rect);
             if let Some(why) = &blocked {
                 ui.label(egui::RichText::new(why).color(PROBLEM_AMBER));
@@ -363,10 +388,13 @@ impl SettingsPanel {
             if check.clicked() {
                 plm.check();
             }
-            let forget = ui.add_enabled(idle, egui::Button::new(if native { "Forget this machine's sign-in" } else { "Sign out" }));
-            hits.insert("plm:forget".into(), forget.rect);
-            if forget.clicked() {
-                plm.forget();
+            if native {
+                let forget =
+                    ui.add_enabled(idle, egui::Button::new("Forget this machine's sign-in"));
+                hits.insert("plm:forget".into(), forget.rect);
+                if forget.clicked() {
+                    plm.forget();
+                }
             }
         });
         if !idle {
@@ -679,7 +707,7 @@ pub static HIT_KEYS: &[HitKeyDoc] = &[
     HitKeyDoc { panel: "settings", prefix: "field:", meaning: "a settings field by key", command: None },
     HitKeyDoc { panel: "settings", prefix: "group:", meaning: "a settings group header", command: None },
     HitKeyDoc { panel: "settings", prefix: "tab:", meaning: "a settings tab (tab:display, tab:assemblies, and tab:plm while a PLM is configured)", command: None },
-    HitKeyDoc { panel: "settings", prefix: "plm:", meaning: "the PLM tab: status, token, use-token, username, password, sign-in, check, forget, outcome", command: None },
+    HitKeyDoc { panel: "settings", prefix: "plm:", meaning: "the PLM tab: status, check, outcome; hosted account; desktop token, use-token, username, password, sign-in, forget", command: None },
     HitKeyDoc { panel: "settings", prefix: "box:", meaning: "expand/collapse a section", command: None },
     HitKeyDoc { panel: "settings", prefix: "bom-columns:reset", meaning: "reset the BOM columns", command: None },
     HitKeyDoc { panel: "settings", prefix: "panel:clip", meaning: "the visible region of the window", command: None },

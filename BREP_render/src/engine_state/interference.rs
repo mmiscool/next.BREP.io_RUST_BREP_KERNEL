@@ -233,13 +233,15 @@ impl EngineState {
                 for solid_b in &members[j] {
                     let (Some(&ha), Some(&hb)) = (handles.get(solid_a), handles.get(solid_b))
                     else {
-                        continue; // not resident (rolled back mid-frame)
+                        refusal.get_or_insert_with(|| format!("missing resident operand: {solid_a} or {solid_b}"));
+                        continue;
                     };
                     // Member-level prefilter: within an overlapping component
                     // pair, only member solids whose own boxes overlap pay.
                     let (Some(a), Some(b)) =
                         (self.scene.solid(solid_a), self.scene.solid(solid_b))
                     else {
+                        refusal.get_or_insert_with(|| format!("missing display operand: {solid_a} or {solid_b}"));
                         continue;
                     };
                     if !overlaps(&inflated(&a.bbox), &inflated(&b.bbox)) {
@@ -277,6 +279,181 @@ impl EngineState {
             .pairs
             .sort_by(|x, y| y.volume.total_cmp(&x.volume));
         report
+    }
+}
+
+
+/// A positive-weight rational surface lies inside its Euclidean control hull.
+/// Unlike tessellation bounds this cannot miss a curved extremum. Refuse the
+/// shortcut when any weight is nonpositive or geometry is unavailable.
+fn conservative_bounds(solid: &brep_kernel::BrepSolid) -> Option<Aabb> {
+    let mut bounds = Aabb::empty();
+    let mut count = 0;
+    for face in solid.shells.iter().flat_map(|s| &s.faces) {
+        if face.surface.control_points.is_empty() { return None; }
+        for cp in face.surface.control_points.iter().flatten() {
+            if cp.w <= 0.0 { return None; }
+            let p = [cp.x / cp.w, cp.y / cp.w, cp.z / cp.w];
+            if !p.iter().all(|x| x.is_finite()) { return None; }
+            for axis in 0..3 { bounds.min[axis] = bounds.min[axis].min(p[axis] - 1e-6); bounds.max[axis] = bounds.max[axis].max(p[axis] + 1e-6); }
+            count += 1;
+        }
+    }
+    (count > 0).then_some(bounds)
+}
+
+/// Positive evidence only: a topological vertex on the other solid's boundary
+/// within 1e-6 mm. No witness is not evidence of clearance.
+fn contact_witness(a: &brep_kernel::BrepSolid, b: &brep_kernel::BrepSolid) -> Result<bool, String> {
+    for (vertices, target) in [(&a.vertices, b), (&b.vertices, a)] {
+        for v in vertices {
+            if brep_kernel::classify_point(v.point, target, 1e-6)?.class == brep_kernel::PointClass::On { return Ok(true); }
+        }
+    }
+    Ok(false)
+}
+
+/// Continuations are server-owned, scoped to one engine and one applied model.
+/// Keep only a bounded number; expired tokens fail explicitly.
+#[derive(Clone)]
+pub(super) struct InterferenceCursor {
+    revision: u64,
+    document: String,
+    scope: Vec<String>,
+    next: usize,
+    unresolved: usize,
+    interfering: usize,
+}
+
+impl EngineState {
+    /// A pair budget bounds progress even for assemblies whose boxes are disjoint.
+    /// Zero-volume intersections do not establish contact: without an exact
+    /// distance witness they remain unresolved (never an all-clear).
+    pub fn interference_page(&mut self, scope: Option<Vec<String>>, budget: usize, token: Option<String>) -> Result<serde_json::Value, String> {
+        use serde_json::json;
+        if self.run_pending() { return Err("model rebuild is pending; wait before checking interference".into()); }
+        if !(1..=4096).contains(&budget) { return Err("budget must be in 1..=4096 component pairs".into()); }
+        let revision = self.applied_generation();
+        let document = self.history.request_json();
+        let mut cursor = if let Some(token) = &token {
+            let c = self.interference_sessions.get(token).ok_or("unknown or expired continuation token")?.clone();
+            if c.revision != revision || c.document != document { return Err("stale continuation: model changed; restart without a token".into()); }
+            if scope.as_ref().is_some_and(|s| s != &c.scope) { return Err("continuation scope differs from requested components".into()); }
+            c
+        } else {
+            let known = self.component_ids();
+            let ids = scope.unwrap_or_else(|| known.clone());
+            let mut seen = std::collections::HashSet::new();
+            for id in &ids {
+                if !known.contains(id) { return Err(format!("unknown component `{id}`")); }
+                if !seen.insert(id) { return Err(format!("duplicate component `{id}`")); }
+            }
+            InterferenceCursor { revision, document, scope: ids, next: 0, unresolved: 0, interfering: 0 }
+        };
+        let total = cursor.scope.len() * cursor.scope.len().saturating_sub(1) / 2;
+        let start = cursor.next;
+        let end = start.saturating_add(budget).min(total);
+        let handles = self.resident_solid_handles();
+        let mut outcomes = Vec::new();
+        let mut booleans_run = 0usize;
+        let mut boolean_operations = 0usize;
+        let mut pair_index = 0;
+        for i in 0..cursor.scope.len() {
+            for j in i+1..cursor.scope.len() {
+                let index = pair_index;
+                pair_index += 1;
+                if index < start || index >= end { continue; }
+                let a = &cursor.scope[i];
+                let b = &cursor.scope[j];
+                let ma = self.component_info(a).map(|c| c.members).unwrap_or_default();
+                let mb = self.component_info(b).map(|c| c.members).unwrap_or_default();
+                let mut volume = 0.0;
+                let mut errors = Vec::new();
+                let mut ambiguous = false;
+                let mut touching = false;
+                let mut ran_boolean = false;
+                if ma.is_empty() || mb.is_empty() { errors.push(json!({"operation":"resolve_operands", "category":"missing_geometry", "operands":[a,b]})); }
+                for sa in &ma {
+                    for sb in &mb {
+                        let (Some(ha), Some(hb), Some(da), Some(db)) = (handles.get(sa), handles.get(sb), self.scene.solid(sa), self.scene.solid(sb)) else {
+                            errors.push(json!({"operation":"resolve_operands", "category":"missing_geometry", "operands":[sa,sb]}));
+                            continue;
+                        };
+                        let _ = (da, db); // Display presence is coverage, not geometric evidence.
+                        let exact_a = brep_kernel::registered_solid_clone(*ha);
+                        let exact_b = brep_kernel::registered_solid_clone(*hb);
+                        if let (Ok(a), Ok(b)) = (&exact_a, &exact_b) {
+                            if let (Some(ba), Some(bb)) = (conservative_bounds(a), conservative_bounds(b)) {
+                                if !overlaps(&ba, &bb) { continue; }
+                            }
+                        }
+                        ran_boolean = true;
+                        boolean_operations += 1;
+                        match intersect_volume(*ha, *hb) {
+                            Ok(v) if v.is_finite() && v >= 0.0 => {
+                                volume += v;
+                                if v <= VOLUME_EPSILON {
+                                    match (&exact_a, &exact_b) {
+                                        (Ok(a), Ok(b)) => match contact_witness(a, b) {
+                                            Ok(true) => touching = true,
+                                            Ok(false) => ambiguous = true,
+                                            Err(e) => errors.push(json!({"operation":"contact_verification", "category":"kernel_refusal", "operands":[sa,sb], "detail":e})),
+                                        },
+                                        _ => ambiguous = true,
+                                    }
+                                }
+                            },
+                            Ok(_) => errors.push(json!({"operation":"intersection_volume", "category":"numerical", "operands":[sa,sb]})),
+                            Err(e) => errors.push(json!({"operation":"intersect", "category":"kernel_refusal", "operands":[sa,sb], "detail":e})),
+                        }
+                    }
+                }
+                for (n, diagnostic) in errors.iter_mut().enumerate() {
+                    if let Some(detail) = diagnostic.get("detail").and_then(serde_json::Value::as_str).map(str::to_owned) {
+                        let id = format!("interference:{revision}:{a}:{b}:{n}");
+                        self.geometry_diagnostics.insert(id.clone(), diagnostic.clone());
+                        diagnostic.as_object_mut().unwrap().remove("detail");
+                        diagnostic["message"] = json!(detail.chars().take(240).collect::<String>());
+                        diagnostic["detailId"] = json!(id);
+                    }
+                }
+                if ran_boolean { booleans_run += 1; }
+                let status = if !errors.is_empty() { "unverified" }
+                    else if volume > VOLUME_EPSILON { "verified_interference" }
+                    else if ambiguous { "unverified" } else if touching { "verified_touching" } else { "verified_clearance" };
+                if status == "unverified" { cursor.unresolved += 1; }
+                if volume > VOLUME_EPSILON { cursor.interfering += 1; }
+                outcomes.push(json!({"index":index, "a":a, "b":b, "status":status, "volume":volume,
+                    "aHidden":ma.iter().any(|n| self.scene.solid(n).is_some_and(|s| !s.visible)),
+                    "bHidden":mb.iter().any(|n| self.scene.solid(n).is_some_and(|s| !s.visible)),
+                    "diagnostics":errors, "reason":if ambiguous && errors.is_empty() { Some("zero_volume_does_not_distinguish_contact_from_clearance") } else { None }}));
+            }
+        }
+        cursor.next = end;
+        let complete = end == total;
+        let next_token = if complete { None } else {
+            self.interference_sequence += 1;
+            Some(format!("interference-{revision}-{}", self.interference_sequence))
+        };
+        if let Some(old) = token { self.interference_sessions.remove(&old); }
+        if let Some(next) = &next_token {
+            if self.interference_sessions.len() >= 16 {
+                let oldest = self.interference_sessions.keys().min_by_key(|key| key.rsplit('-').next().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0)).cloned();
+                if let Some(oldest) = oldest { self.interference_sessions.remove(&oldest); }
+            }
+            self.interference_sessions.insert(next.clone(), cursor.clone());
+        }
+        let mut interfering: Vec<&serde_json::Value> = outcomes.iter().filter(|p| p["volume"].as_f64().is_some_and(|v| v > VOLUME_EPSILON)).collect();
+        interfering.sort_by(|a,b| b["volume"].as_f64().unwrap().total_cmp(&a["volume"].as_f64().unwrap()));
+        let skipped: Vec<String> = if complete { vec![] } else { vec![format!("{} component pairs not checked: pair budget exhausted", total-end)] };
+        let unverified: Vec<String> = outcomes.iter().filter(|p| p["status"] == "unverified").map(|p| format!("{} × {}: unverified (see outcomes)",p["a"].as_str().unwrap_or(""),p["b"].as_str().unwrap_or(""))).collect();
+        Ok(json!({"modelRevision":revision, "scope":cursor.scope, "componentCount":cursor.scope.len(),
+            "budget":budget, "pairTotal":total, "checkedPairs":end, "pageStart":start, "pairs":interfering, "outcomes":outcomes, "skipped":skipped, "unverified":unverified, "booleansRun":booleans_run, "booleanOperations":boolean_operations,
+            "notChecked": {"count":total-end, "fromPairIndex":end, "status":"not_checked_budget_exhausted", "reason":if complete { serde_json::Value::Null } else { json!("budget_exhausted") }},
+            "unresolvedCount":cursor.unresolved, "interferenceCount":cursor.interfering,
+            "complete":complete, "allClear":complete && cursor.unresolved == 0 && cursor.interfering == 0,
+            "continuationToken":next_token, "volumeToleranceMm3":VOLUME_EPSILON,
+            "contactToleranceMm":1e-6, "contactVerification":"boundary vertex witness within tolerance after successful intersection; unwitnessed zero-volume pairs remain unverified"}))
     }
 }
 

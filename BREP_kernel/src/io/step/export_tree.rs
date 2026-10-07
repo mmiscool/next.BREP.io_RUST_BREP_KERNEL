@@ -203,6 +203,13 @@ fn add_part(
     // part document is in hand, so the writer can put it in the part's product
     // instead of the assembly's (`assembly.rs` step 7a).
     let pmi = parts_library::document_pmi(&entry.document);
+    let requires_plugin_pmi = entry.document.get("pmi")
+        .and_then(|v| serde_json::from_value::<crate::feature_pipeline::pmi::PmiState>(v.clone()).ok())
+        .is_some_and(|state| state.views.iter().flat_map(|v| &v.annotations)
+            .any(|a| a.enabled && a.kind.contains('/')));
+    if requires_plugin_pmi && pmi.is_none() {
+        return Err(format!("part '{part_name}': plugin annotation replay unavailable during export"));
+    }
     assembly.products.push(StepExportProduct {
         name: part_name.to_string(),
         id,

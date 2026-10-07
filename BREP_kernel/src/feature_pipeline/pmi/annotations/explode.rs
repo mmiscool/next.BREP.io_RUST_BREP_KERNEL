@@ -46,21 +46,20 @@ fn schema() -> serde_json::Value {
     )
 }
 
-fn triple(value: Option<&serde_json::Value>, default: [f64; 3]) -> [f64; 3] {
+fn triple(value: Option<&serde_json::Value>, default: [f64; 3], env: &crate::feature_pipeline::Env) -> Result<[f64; 3], String> {
     let Some(items) = value.and_then(serde_json::Value::as_array) else {
-        return default;
+        return Ok(default);
     };
     let mut out = default;
     for (slot, item) in out.iter_mut().zip(items) {
         if let Some(number) = item.as_f64() {
             *slot = number;
         } else if let Some(text) = item.as_str() {
-            if let Ok(number) = text.trim().parse::<f64>() {
-                *slot = number;
-            }
+            *slot = env.eval(text.trim()).map_err(|e| e.to_string())?;
         }
     }
-    out
+    if out.iter().any(|v| !v.is_finite()) { return Err("explode transform must be finite".into()); }
+    Ok(out)
 }
 
 fn resolve(annotation: &PmiAnnotation, context: &PmiContext<'_>) -> Result<Resolved, String> {
@@ -82,6 +81,8 @@ fn resolve(annotation: &PmiAnnotation, context: &PmiContext<'_>) -> Result<Resol
             return Err(format!("'{target}' is not a solid or component"));
         }
     }
+    let mut seen = std::collections::HashSet::new();
+    solids.retain(|(name, _)| seen.insert(name.clone()));
     let mut low = Vec3::new(f64::INFINITY, f64::INFINITY, f64::INFINITY);
     let mut high = Vec3::new(f64::NEG_INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY);
     for (_, handle) in &solids {
@@ -91,9 +92,10 @@ fn resolve(annotation: &PmiAnnotation, context: &PmiContext<'_>) -> Result<Resol
     }
     let center = low.add(high).scale(0.5);
     let transform = annotation.params.get("transform");
-    let translate = triple(transform.and_then(|t| t.get("position")), [0.0; 3]);
-    let rotate_deg = triple(transform.and_then(|t| t.get("rotationEuler")), [0.0; 3]);
-    let scale = triple(transform.and_then(|t| t.get("scale")), [1.0; 3]);
+    let translate = triple(transform.and_then(|t| t.get("position")), [0.0; 3], context.env)?;
+    let rotate_deg = triple(transform.and_then(|t| t.get("rotationEuler")), [0.0; 3], context.env)?;
+    let scale = triple(transform.and_then(|t| t.get("scale")), [1.0; 3], context.env)?;
+    if scale.iter().any(|v| *v <= 0.) { return Err("explode scale must be positive".into()); }
     let exploded = center.add(Vec3::new(translate[0], translate[1], translate[2]));
     let names: Vec<String> = solids.into_iter().map(|(name, _)| name).collect();
     Ok(Resolved {

@@ -200,11 +200,13 @@ pub async fn replace_file(
         }
         Ok(())
     })?;
-    let staged = receive(&db, &headers, body).await?;
+    let expected = headers.get(axum::http::header::IF_MATCH).and_then(|v| v.to_str().ok()).map(|v| v.trim_matches('"').to_string());
+    if expected.as_ref().is_some_and(|v| !crate::attach::is_sha256(v)) { return Err(Error::bad_request("If-Match must name the current file hash")); }
+    let staged = super::attachments::receive_with_empty(&db, &headers, body, true).await?;
     let media = media_type(&headers);
     let changed = blocking({
         let db = db.clone();
-        move || db.replace_file(&user, &id, &media, staged)
+        move || db.replace_file_checked(&user, &id, &media, staged, expected)
     })
     .await?;
     Ok(Json(json!({ "ok": true, "entry": changed, "seq": seq(&db) })))

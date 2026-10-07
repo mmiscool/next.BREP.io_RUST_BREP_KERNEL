@@ -67,6 +67,7 @@ pub(in crate::blend) const REFINE_ROUNDS: usize = 6;
 /// station count.
 pub(in crate::blend) const REFINE_STATION_FACTOR: usize = 4;
 
+#[derive(Clone, Copy, Debug)]
 pub(super) struct Station {
     pub(super) uv1: [f64; 2],
     pub(super) uv2: [f64; 2],
@@ -251,16 +252,59 @@ fn solve_station_state(
     section_tangent: Vec3,
     scale: f64,
 ) -> Result<([f64; 4], TangencyState), KernelRefusal> {
+    if !newton_trace_on() {
+        return solve_station_state_traced(first, second, rho, seed, section_point, section_tangent, scale, None);
+    }
+    let mut trace = NewtonTrace::default();
+    let result = solve_station_state_traced(first, second, rho, seed, section_point, section_tangent, scale, Some(&mut trace));
+    emit_newton_trace(seed, 1e-11 * (1.0 + scale), &trace, &result);
+    result
+}
+
+/// The station Newton itself. `trace`, when given, only RECORDS what each
+/// iteration read (its residual, the Jacobian's conditioning, the exit); it is
+/// never read back, so a traced solve takes exactly the steps an untraced one
+/// does.
+#[allow(clippy::too_many_arguments)]
+fn solve_station_state_traced(
+    first: &NurbsSurface,
+    second: &NurbsSurface,
+    rho: [f64; 2],
+    seed: [f64; 4],
+    section_point: Vec3,
+    section_tangent: Vec3,
+    scale: f64,
+    mut trace: Option<&mut NewtonTrace>,
+) -> Result<([f64; 4], TangencyState), KernelRefusal> {
     let mut uv = seed;
     let tolerance = 1e-11 * (1.0 + scale);
     for _ in 0..NEWTON_ITERATIONS {
-        let state = tangency_state(first, second, rho, uv, section_point, section_tangent)?;
+        let state = match tangency_state(first, second, rho, uv, section_point, section_tangent) {
+            Ok(state) => state,
+            Err(error) => {
+                if let Some(trace) = trace.as_deref_mut() {
+                    trace.exit = "state_unreadable";
+                }
+                return Err(error);
+            }
+        };
         let error = state
             .residual
             .iter()
             .map(|value| value.abs())
             .fold(0.0, f64::max);
+        if let Some(trace) = trace.as_deref_mut() {
+            // The decision below reads the folded max, which DROPS a NaN
+            // component (`f64::max`); the trace keeps each component's own
+            // finiteness, read on the raw residual, beside it.
+            trace.residuals.push(error);
+            trace.components_finite.push(state.residual.iter().all(|value| value.is_finite()));
+        }
         if error <= tolerance {
+            if let Some(trace) = trace.as_deref_mut() {
+                trace.exit = "converged";
+                trace.solution = Some(uv);
+            }
             return Ok((uv, state));
         }
         let mut jacobian = [[0.0f64; 4]; 4];
@@ -285,8 +329,19 @@ fn solve_station_state(
                 jacobian[row][column] = (probed.residual[row] - state.residual[row]) / step;
             }
         }
-        let delta = fit::solve_small::<4>(jacobian, state.residual, 4)
-            .map_err(|error| format!("blend: station Newton is singular ({error})")).or_refuse(KernelStage::Refine, "solve_small")?;
+        if let Some(trace) = trace.as_deref_mut() {
+            trace.conditioning = Some(jacobian_conditioning(&jacobian));
+            trace.charts = charts.iter().filter(|chart| chart.is_some()).count();
+        }
+        let delta = match fit::solve_small::<4>(jacobian, state.residual, 4) {
+            Ok(delta) => delta,
+            Err(error) => {
+                if let Some(trace) = trace.as_deref_mut() {
+                    trace.exit = "singular";
+                }
+                return Err(format!("blend: station Newton is singular ({error})")).or_refuse(KernelStage::Refine, "solve_small");
+            }
+        };
         for ((value, correction), chart) in uv.iter_mut().zip(delta).zip(charts) {
             match chart {
                 Some(chart) => *value = chart.parameter(chart.regular(*value) - correction),
@@ -294,8 +349,172 @@ fn solve_station_state(
             }
         }
     }
+    if let Some(trace) = trace.as_deref_mut() {
+        trace.exit = "iterations_spent";
+        trace.solution = Some(uv);
+    }
     Err(KernelRefusal::non_convergence(KernelStage::Refine, "tangency_newton", "blend: tangency Newton did not converge"))
 }
+
+// ====================================================================
+// `BREP_DEBUG_STATION_NEWTON=1`: a bounded trace of every station Newton
+// ====================================================================
+
+/// Where a station Newton runs, as its caller names it: the march `phase`
+/// (`open-initial`, `open-march`, `open-refine`, `open-dense`, ...), the
+/// station `index` and section parameter `t`, the edge's NATIVE domain (so an
+/// overshoot station reads as outside it), and the interval `[left, t]` a
+/// continuation solves across. `stage` is set by [`continue_station`]:
+/// `continuation` for the plain neighbour-seeded attempt, `retry` for every
+/// halved-seed attempt after a branch hop. Diagnostic only.
+#[derive(Clone, Copy, Debug, Default)]
+pub(in crate::blend) struct NewtonContext {
+    pub(in crate::blend) phase: &'static str,
+    pub(in crate::blend) stage: &'static str,
+    pub(in crate::blend) index: Option<usize>,
+    pub(in crate::blend) t: Option<f64>,
+    pub(in crate::blend) native: Option<[f64; 2]>,
+    pub(in crate::blend) interval: Option<[f64; 2]>,
+    pub(in crate::blend) depth: usize,
+}
+
+thread_local! {
+    static NEWTON_CONTEXT: std::cell::Cell<Option<NewtonContext>> = const { std::cell::Cell::new(None) };
+}
+
+/// What one traced Newton read: every iteration's max residual, the last
+/// Jacobian's conditioning, the charts it stepped in, how it exited and where.
+#[derive(Default)]
+struct NewtonTrace {
+    residuals: Vec<f64>,
+    /// Per iteration: whether EVERY raw residual component was finite (the
+    /// folded max in `residuals` cannot say; `f64::max` discards a NaN).
+    components_finite: Vec<bool>,
+    conditioning: Option<JacobianConditioning>,
+    charts: usize,
+    exit: &'static str,
+    solution: Option<[f64; 4]>,
+}
+
+/// The Jacobian's conditioning, read on a copy: the smallest and largest
+/// column norms, and the Hadamard ratio |det J| / prod(column norms) in
+/// [0, 1] (0: singular, 1: orthogonal columns), with whether every entry was
+/// finite.
+#[derive(Clone, Copy, Debug)]
+struct JacobianConditioning {
+    finite: bool,
+    column_min: f64,
+    column_max: f64,
+    hadamard: f64,
+}
+
+fn jacobian_conditioning(jacobian: &[[f64; 4]; 4]) -> JacobianConditioning {
+    let finite = jacobian.iter().flatten().all(|value| value.is_finite());
+    let norms: Vec<f64> = (0..4).map(|column| (0..4).map(|row| jacobian[row][column].powi(2)).sum::<f64>().sqrt()).collect();
+    let mut a = *jacobian;
+    let mut det = 1.0_f64;
+    for column in 0..4 {
+        let pivot = (column..4).max_by(|&x, &y| a[x][column].abs().total_cmp(&a[y][column].abs())).unwrap_or(column);
+        if pivot != column {
+            a.swap(pivot, column);
+            det = -det;
+        }
+        let head = a[column][column];
+        det *= head;
+        if head == 0.0 {
+            break;
+        }
+        for row in column + 1..4 {
+            let factor = a[row][column] / head;
+            for k in column..4 {
+                a[row][k] -= factor * a[column][k];
+            }
+        }
+    }
+    let product: f64 = norms.iter().product();
+    JacobianConditioning {
+        finite,
+        column_min: norms.iter().copied().fold(f64::INFINITY, f64::min),
+        column_max: norms.iter().copied().fold(0.0, f64::max),
+        hadamard: if product > 0.0 { det.abs() / product } else { 0.0 },
+    }
+}
+
+/// Whether station Newtons are traced: `BREP_DEBUG_STATION_NEWTON=1`, read
+/// once, or (tests only) the calling thread's capture.
+pub(in crate::blend) fn newton_trace_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("BREP_DEBUG_STATION_NEWTON").ok().as_deref() == Some("1"))
+}
+
+/// Run `body` with `context` as the station Newtons' context (the previous
+/// one restored after). A no-op wrapper when tracing is off.
+pub(in crate::blend) fn with_newton_context<R>(context: NewtonContext, body: impl FnOnce() -> R) -> R {
+    if !newton_trace_on() {
+        return body();
+    }
+    // Restored on EVERY exit -- a return, an error, or a panic unwinding
+    // through `body` -- so a context never leaks into a later solve.
+    struct Restore(Option<NewtonContext>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            NEWTON_CONTEXT.with(|cell| cell.set(self.0));
+        }
+    }
+    let _restore = Restore(NEWTON_CONTEXT.with(|cell| cell.replace(Some(context))));
+    body()
+}
+
+/// The current context with `edit` applied (tracing on only).
+fn newton_context_edited(edit: impl FnOnce(&mut NewtonContext)) -> NewtonContext {
+    let mut context = NEWTON_CONTEXT.with(|cell| cell.get()).unwrap_or_default();
+    edit(&mut context);
+    context
+}
+
+/// Emit one bounded line per traced solve (at most
+/// `BREP_DEBUG_STATION_NEWTON_MAX` lines a process, default 20000).
+fn emit_newton_trace(seed: [f64; 4], tolerance: f64, trace: &NewtonTrace, result: &Result<([f64; 4], TangencyState), KernelRefusal>) {
+    static LINES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    static MAX: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let context = NEWTON_CONTEXT.with(|cell| cell.get()).unwrap_or_default();
+    let inside = match (context.t, context.native) {
+        (Some(t), Some([a, b])) => Some(t >= a.min(b) && t <= a.max(b)),
+        _ => None,
+    };
+    let line = format!(
+        "STATION_NEWTON phase {} stage {} index {:?} t {:?} native {:?} inside {inside:?} interval {:?} depth {} \
+         seed {seed:?} exit {} iterations {} residuals {:?} tolerance {tolerance:.3e} folded_max_finite {} \
+         components_finite {} first_nonfinite_component_iteration {:?} \
+         jacobian {:?} charts {} solution {:?} ok {}",
+        if context.phase.is_empty() { "-" } else { context.phase },
+        if context.stage.is_empty() { "-" } else { context.stage },
+        context.index,
+        context.t,
+        context.native,
+        context.interval,
+        context.depth,
+        // A Jacobian probe or chart query that refused leaves no exit of its own.
+        if !trace.exit.is_empty() { trace.exit } else if result.is_ok() { "converged" } else { "probe_or_chart_error" },
+        trace.residuals.len(),
+        trace.residuals,
+        trace.residuals.iter().all(|value| value.is_finite()),
+        trace.components_finite.iter().all(|finite| *finite),
+        trace.components_finite.iter().position(|finite| !*finite),
+        trace.conditioning,
+        trace.charts,
+        trace.solution,
+        result.is_ok(),
+    );
+    let max = *MAX.get_or_init(|| std::env::var("BREP_DEBUG_STATION_NEWTON_MAX").ok().and_then(|value| value.parse().ok()).unwrap_or(20000));
+    let count = LINES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if count < max {
+        eprintln!("{line}");
+    } else if count == max {
+        eprintln!("STATION_NEWTON truncated after {max} lines (BREP_DEBUG_STATION_NEWTON_MAX)");
+    }
+}
+
 
 /// A column whose reach over its carrier's domain is below this fraction of the
 /// same carrier's other column is small enough to ask whether a stationary
@@ -534,7 +753,13 @@ pub(super) fn continue_station(
     t: f64,
     depth: usize,
 ) -> Result<Continued, KernelRefusal> {
-    let (uv, center) = solve(t, left.uv)?;
+    let context = newton_context_edited(|context| {
+        context.stage = if depth == 0 { "continuation" } else { "retry" };
+        context.t = Some(t);
+        context.interval = Some([left.t, t]);
+        context.depth = depth;
+    });
+    let (uv, center) = with_newton_context(context, || solve(t, left.uv))?;
     let node = Continued { t, uv, center: Some(center) };
     if depth >= MAX_REFINEMENT_DEPTH {
         return Ok(node);
@@ -708,6 +933,7 @@ pub(super) fn apex_point(
 /// One accepted station of the adaptive march: the edge parameter it was
 /// solved at, the converged unknowns (the continuation seed for the next
 /// solve), and the finished section sample.
+#[derive(Clone)]
 struct MarchNode {
     t: f64,
     uv: [f64; 4],
@@ -742,6 +968,13 @@ struct MarchFrame<'a> {
     /// Committed fit accuracy the sagitta refinement drives toward — see
     /// the derivation comment in [`march_stations`].
     fit_tolerance: f64,
+    /// Depth budget shared by the sagitta refinement and the Newton
+    /// step-halving retries: [`MAX_REFINEMENT_DEPTH`] for every march that
+    /// refuses a fold, raised rung by rung by the closed-edge lane's CARVE
+    /// ladder, whose wall has to stand on the rolling ball between stations
+    /// to the network's rail bar before its fold can be cut (the chain lane
+    /// climbs its own per-segment ladder for the same reason).
+    depth_budget: usize,
 }
 
 impl MarchFrame<'_> {
@@ -978,6 +1211,24 @@ impl MarchFrame<'_> {
                 .expect("march interval requires a solved left station");
             (left.t, left.uv, left.station.center)
         };
+        // A right station solved before subdivision may belong to a root
+        // reached from the old coarse left seed. Once the left interval has
+        // refined, continue from its actual last node instead of committing
+        // that stale solution. Reuse the existing branch reading; do not add
+        // a continuation bar or change the depth-cap geometry policy.
+        let mut reseeded = false;
+        let mut attempt: Option<u64> = None;
+        let presolved = presolved.filter(|node| {
+            let left = Continued { t: left_t, uv: left_uv, center: Some(left_center) };
+            let right = Continued { t: node.t, uv: node.uv, center: Some(node.station.center) };
+            let reuse = branch_hop([self.surface1, self.surface2], self.edge, self.rho_at, &left, &right).is_none();
+            reseeded = !reuse;
+            if reseeded {
+                attempt = Some(next_reseed_attempt());
+                trace_closed_reseed(attempt, self.edge.id, left_t, node.t, depth, lock, "attempt", true);
+            }
+            reuse
+        });
         let right = match presolved {
             Some(node) => node,
             None => match self.continue_node(
@@ -986,19 +1237,31 @@ impl MarchFrame<'_> {
                 left_center,
                 right_t,
                 lock,
-                depth < MAX_REFINEMENT_DEPTH,
+                depth < self.depth_budget,
             ) {
                 Ok(node) => node,
                 Err(error) => {
-                    if depth >= MAX_REFINEMENT_DEPTH {
+                    if depth >= self.depth_budget {
+                        self.trace_reseed_terminal(attempt, nodes, left_t, right_t, depth, lock, "declined_at_cap", Err(&error));
                         return Err(error);
                     }
-                    self.march_interval(nodes, 0.5 * (left_t + right_t), None, None, depth + 1)?;
-                    return self.march_interval(nodes, right_t, lock, None, depth + 1);
+                    if attempt.is_some() {
+                        trace_closed_reseed(attempt, self.edge.id, left_t, right_t, depth, lock, "deferred_newton", true);
+                    }
+                    let first = self.march_interval(nodes, 0.5 * (left_t + right_t), None, None, depth + 1);
+                    let result = first.and_then(|()| self.march_interval(nodes, right_t, lock, None, depth + 1));
+                    self.trace_reseed_terminal(attempt, nodes, left_t, right_t, depth, lock, "descendant_newton", result.as_ref().map(|_| ()));
+                    return result;
                 }
             },
         };
-        if depth < MAX_REFINEMENT_DEPTH {
+        if reseeded && reseed_census_enabled() {
+            let left = Continued { t: left_t, uv: left_uv, center: Some(left_center) };
+            let current = Continued { t: right.t, uv: right.uv, center: Some(right.station.center) };
+            let incoherent = branch_hop([self.surface1, self.surface2], self.edge, self.rho_at, &left, &current).is_some();
+            trace_closed_reseed(attempt, self.edge.id, left_t, right.t, depth, lock, "resolved", incoherent);
+        }
+        if depth < self.depth_budget {
             let mid_t = 0.5 * (left_t + right.t);
             match self.continue_node(left_t, left_uv, left_center, mid_t, None, true) {
                 Ok(probe) => {
@@ -1008,8 +1271,11 @@ impl MarchFrame<'_> {
                         &right.station,
                     );
                     if split {
-                        self.march_interval(nodes, mid_t, None, Some(probe), depth + 1)?;
-                        return self.march_interval(nodes, right.t, None, Some(right), depth + 1);
+                        let right_t = right.t;
+                        let first = self.march_interval(nodes, mid_t, None, Some(probe), depth + 1);
+                        let result = first.and_then(|()| self.march_interval(nodes, right_t, lock, Some(right), depth + 1));
+                        self.trace_reseed_terminal(attempt, nodes, left_t, right_t, depth, lock, "descendant_sagitta", result.as_ref().map(|_| ()));
+                        return result;
                     }
                 }
                 Err(_) => {
@@ -1020,15 +1286,111 @@ impl MarchFrame<'_> {
                     // deterministic) before halving toward it with closer
                     // seeds; if the failure persists at the depth cap the
                     // named Newton error surfaces.
-                    self.march_interval(nodes, mid_t, None, None, depth + 1)?;
-                    return self.march_interval(nodes, right.t, None, Some(right), depth + 1);
+                    let right_t = right.t;
+                    let first = self.march_interval(nodes, mid_t, None, None, depth + 1);
+                    let result = first.and_then(|()| self.march_interval(nodes, right_t, lock, Some(right), depth + 1));
+                    self.trace_reseed_terminal(attempt, nodes, left_t, right_t, depth, lock, "descendant_probe", result.as_ref().map(|_| ()));
+                    return result;
                 }
             }
         }
         nodes.push(right);
+        self.trace_reseed_terminal(attempt, nodes, left_t, right_t, depth, lock, "direct", Ok(()));
         Ok(())
     }
+
+    /// Read-only terminal provenance for a re-seeded cached station: after the
+    /// interval returns, the right end it actually installed (the free-t anchor
+    /// node when `lock` applies), its installed predecessor, and the existing
+    /// branch reading between them. Never feeds back into acceptance or order.
+    #[allow(clippy::too_many_arguments)]
+    fn trace_reseed_terminal(
+        &self,
+        attempt: Option<u64>,
+        nodes: &[MarchNode],
+        left_t: f64,
+        right_t: f64,
+        depth: usize,
+        lock: Option<f64>,
+        path: &str,
+        result: Result<(), &KernelRefusal>,
+    ) {
+        let Some(attempt) = attempt else { return };
+        if !reseed_census_enabled() {
+            return;
+        }
+        let mut row = serde_json::json!({
+            "attempt": attempt, "edge": self.edge.id, "left_t": left_t, "right_t": right_t,
+            "depth": depth, "lock": lock, "phase": "terminal", "path": path,
+        });
+        match result {
+            Err(error) => {
+                row["outcome"] = serde_json::json!("declined");
+                row["error"] = serde_json::json!(error.to_string());
+            }
+            Ok(()) => {
+                row["outcome"] = serde_json::json!("installed");
+                if let [.., before, installed] = nodes {
+                    let left = Continued { t: before.t, uv: before.uv, center: Some(before.station.center) };
+                    let right = Continued { t: installed.t, uv: installed.uv, center: Some(installed.station.center) };
+                    let hop = branch_hop([self.surface1, self.surface2], self.edge, self.rho_at, &left, &right);
+                    row["installed_t"] = serde_json::json!(installed.t);
+                    row["installed_center"] = serde_json::json!([installed.station.center.x, installed.station.center.y, installed.station.center.z]);
+                    row["predecessor_t"] = serde_json::json!(before.t);
+                    row["predecessor_center"] = serde_json::json!([before.station.center.x, before.station.center.y, before.station.center.z]);
+                    row["step"] = serde_json::json!(installed.station.center.sub(before.station.center).length());
+                    row["incoherent"] = serde_json::json!(hop.is_some());
+                    row["hop"] = serde_json::json!(hop.map(|reason| reason.to_string()));
+                }
+            }
+        }
+        write_reseed_row(row);
+    }
 }
+
+/// Optional read-only census of cached stations re-solved after refinement.
+/// The post-solve coherence reading never feeds back into acceptance.
+#[allow(clippy::too_many_arguments)]
+fn trace_closed_reseed(attempt: Option<u64>, edge: u64, left_t: f64, right_t: f64, depth: usize, lock: Option<f64>, phase: &str, incoherent: bool) {
+    if !reseed_census_enabled() {
+        return;
+    }
+    write_reseed_row(serde_json::json!({
+        "attempt":attempt,"edge":edge,"left_t":left_t,"right_t":right_t,"depth":depth,
+        "lock":lock,"phase":phase,"incoherent":incoherent
+    }));
+}
+
+/// Whether anything reads the census: the environment file, or a private
+/// test sink. Checked before any row or branch reading is built.
+fn reseed_census_enabled() -> bool {
+    #[cfg(not(test))]
+    let sink = false;
+    sink || std::env::var_os("BREP_CLOSED_RESEED_CENSUS").is_some()
+}
+
+/// Correlates every census row of one re-seeded station; numbering only.
+fn next_reseed_attempt() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// One census row, written whole with a single `write_all` so rows from
+/// parallel marches never splice.
+fn write_reseed_row(row: serde_json::Value) {
+    #[cfg(not(test))]
+    let captured = false;
+    if captured {
+        return;
+    }
+    if let Ok(path) = std::env::var("BREP_CLOSED_RESEED_CENSUS") {
+        use std::io::Write;
+        if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+            let _ = file.write_all(format!("{row}\n").as_bytes());
+        }
+    }
+}
+
 
 /// Characteristic length of a blend march: the LOCAL model scale of the
 /// geometry actually being solved.
@@ -1066,13 +1428,147 @@ pub(super) fn march_model_scale(
 /// t_start + span (or, when anchored, exactly ON the seam meridian with t
 /// freed — unchanged from the fixed grid), and the count adapts between
 /// SEED_INTERVALS + 1 and MAX_STATIONS + 1 with the spine's curvature.
+/// Fallback eligibility follows the solve phase, never the refusal's wording.
+/// Once local refinement starts, keep its anchors and its original typed error.
+#[derive(Debug)]
+pub(super) enum ClosedMarchFailure {
+    Initial(KernelRefusal),
+    Refinement(KernelRefusal),
+}
+impl From<KernelRefusal> for ClosedMarchFailure {
+    fn from(error: KernelRefusal) -> Self { Self::Initial(error) }
+}
+impl ClosedMarchFailure {
+    fn into_refusal(self) -> KernelRefusal {
+        match self { Self::Initial(error) | Self::Refinement(error) => error }
+    }
+    pub(super) fn into_initial(self) -> Result<KernelRefusal, KernelRefusal> {
+        match self { Self::Initial(error) => Ok(error), Self::Refinement(error) => Err(error) }
+    }
+}
+
 pub(super) fn march_stations(
     edge: &EdgeRecord,
     first: &BlendMate,
     second: &BlendMate,
     radius_at: &dyn Fn(f64) -> f64,
     anchor_u: Option<f64>,
+    fold: super::chain::FoldPolicy,
+    depth_budget: usize,
 ) -> Result<Vec<Station>, KernelRefusal> {
+    march_stations_impl(edge, first, second, radius_at, anchor_u, fold, depth_budget, None, None)
+        .map_err(ClosedMarchFailure::into_refusal)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn march_stations_with_rail_bar(
+    edge: &EdgeRecord,
+    first: &BlendMate,
+    second: &BlendMate,
+    radius_at: &dyn Fn(f64) -> f64,
+    anchor_u: Option<f64>,
+    fold: super::chain::FoldPolicy,
+    depth_budget: usize,
+    rail_bar: f64,
+    wall: Option<ClosedWallCheck>,
+) -> Result<Vec<Station>, ClosedMarchFailure> {
+    march_stations_impl(edge, first, second, radius_at, anchor_u, fold, depth_budget, Some(rail_bar), wall)
+}
+
+/// The closed-edge FILLET's wall verdict: a constant-radius rolling ball's
+/// wall is judged between its rails against the ball's own sweep, at the
+/// same declared reading and probes as the closed chain's
+/// (`chain::declared_wall_probe`), against the unchanged `bar`
+/// (`intersection_fit`). A chamfer, or a varying radius, has no single ball
+/// to judge against and passes `None`.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct ClosedWallCheck {
+    pub(super) radius: f64,
+    pub(super) bar: f64,
+    /// The construction request (`KernelTolerances::model`) a PLAIN fillet's
+    /// accepted wall is then refined toward, as the closed chain's is; `None`
+    /// judges acceptance only.
+    pub(super) model: Option<f64>,
+}
+
+thread_local! {
+    /// The closed-edge march's unmet construction request, for the lane to
+    /// report once its body is built: (declared reading, why it stopped,
+    /// local rounds ATTEMPTED, stations of the rung that SHIPS, station
+    /// ceiling). On `Rejected` the attempted round is one past the kept rung;
+    /// the stations and reading are the kept rung's. Written by the march,
+    /// taken by `blend_closed_edge_impl`.
+    /// The closed-edge request's last reading: (worst rail over the request
+    /// fractions, unreadable rail intervals, worst declared wall), for the
+    /// report's detail. Written by the march, taken by `blend_closed_edge_impl`.
+    pub(super) static CLOSED_REQUEST_RAILS: std::cell::Cell<Option<(f64, usize, f64)>> = const { std::cell::Cell::new(None) };
+    pub(super) static CLOSED_MODEL_UNMET: std::cell::Cell<Option<(f64, crate::BudgetReason, usize, usize, usize)>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Centres per interval for the closed-edge wall verdict (probes at the even
+/// ones, as the chain's `2 * LOCAL_RAIL_STENCIL`).
+const CLOSED_WALL_CENTRES: usize = 32;
+/// Section-angle probes across the wall, k/8 for k = 1..7.
+const CLOSED_WALL_SECTIONS: usize = 8;
+
+/// Every interval's largest DECLARED wall reading (reading + uncertainty)
+/// on the fitted fillet `rows`, `None` where any centre did not solve or any
+/// probe was unreadable (which fails the interval). Each interval's exact ball
+/// centres are continued node to node from its left station, under the
+/// march's own branch guard.
+fn closed_wall_interval_misses(
+    rows: &FittedRows,
+    nodes: &[MarchNode],
+    parameters: &[f64],
+    radius: f64,
+    solve: impl Fn(&MarchNode, f64) -> Result<MarchNode, KernelRefusal>,
+) -> Vec<Option<f64>> {
+    let [low, high] = rows.u_domain;
+    let [v_low, v_high] = match rows.surface.domain_v() {
+        Ok(domain) => domain,
+        Err(_) => return vec![None; nodes.len().saturating_sub(1)],
+    };
+    (0..nodes.len().saturating_sub(1))
+        .map(|interval| {
+            let (left, right) = (&nodes[interval], &nodes[interval + 1]);
+            let mut centres = Vec::with_capacity(CLOSED_WALL_CENTRES + 1);
+            centres.push(left.station.center);
+            let mut previous = left.clone();
+            for step in 1..CLOSED_WALL_CENTRES {
+                let t = left.t + (right.t - left.t) * step as f64 / CLOSED_WALL_CENTRES as f64;
+                previous = solve(&previous, t).ok()?;
+                centres.push(previous.station.center);
+            }
+            centres.push(right.station.center);
+            let (from, to) = (parameters[interval], parameters[interval + 1]);
+            let mut declared = 0.0_f64;
+            for step in (2..CLOSED_WALL_CENTRES).step_by(2) {
+                let u = low + (high - low) * (from + (to - from) * step as f64 / CLOSED_WALL_CENTRES as f64);
+                for k in 1..CLOSED_WALL_SECTIONS {
+                    let v = v_low + (v_high - v_low) * k as f64 / CLOSED_WALL_SECTIONS as f64;
+                    let point = rows.surface.evaluate(u, v).ok()?;
+                    let (reading, uncertainty) =
+                        super::chain::declared_wall_probe_located(point, &centres, step, step as f64 / CLOSED_WALL_CENTRES as f64, radius)?;
+                    declared = declared.max(reading + uncertainty);
+                }
+            }
+            declared.is_finite().then_some(declared)
+        })
+        .collect()
+}
+
+fn march_stations_impl(
+    edge: &EdgeRecord,
+    first: &BlendMate,
+    second: &BlendMate,
+    radius_at: &dyn Fn(f64) -> f64,
+    anchor_u: Option<f64>,
+    fold: super::chain::FoldPolicy,
+    depth_budget: usize,
+    rail_bar: Option<f64>,
+    wall: Option<ClosedWallCheck>,
+) -> Result<Vec<Station>, ClosedMarchFailure> {
     let span = edge.t1 - edge.t0;
     let radius_extent = [0.0, 0.5, 1.0]
         .into_iter()
@@ -1153,6 +1649,7 @@ pub(super) fn march_stations(
         signs,
         scale,
         fit_tolerance,
+        depth_budget,
     };
     let mut nodes: Vec<MarchNode> = Vec::with_capacity(SEED_INTERVALS + 1);
     nodes.push(frame.solve_node(t_start, seed, anchor_u)?);
@@ -1169,16 +1666,46 @@ pub(super) fn march_stations(
         };
         frame.march_interval(&mut nodes, t, lock, None, 0)?;
     }
+    // Read-only census: distinguish closing-lock winding from curve/edge wrapping.
+    // This flag never changes the marched stations or any acceptance decision.
+    if std::env::var_os("BREP_TRACE_CLOSED_STATIONS").is_some() {
+        let edge_uv0 = edge_uv_on_face(first.coedge, edge, edge.t0);
+        let edge_uv1 = edge_uv_on_face(first.coedge, edge, edge.t1);
+        eprintln!("C3-CLOSE-RANGE edge={} edge_range=[{:.17e},{:.17e}] curve_domain={:?} t_start={:.17e} intended_end={:.17e} anchor={:?} u_span={:.17e} edge_uv0={:?} edge_uv1={:?}",
+            edge.id, edge.t0, edge.t1, edge.curve.domain(), t_start, t_start + span, anchor_u, u_span, edge_uv0, edge_uv1);
+        for fraction in [1e-6, 1e-3, 0.1] {
+            let delta = span * fraction;
+            let past = edge.curve.point_and_unit_tangent_extended(edge.t1 + delta, edge.t0, edge.t1);
+            let wrapped = edge.curve.point_and_unit_tangent_extended(edge.t0 + delta, edge.t0, edge.t1);
+            eprintln!("C3-CLOSE-WRAP edge={} fraction={fraction:.17e} past={past:?} edge_wrapped={wrapped:?}", edge.id);
+        }
+        for (index, node) in nodes.iter().enumerate() {
+            match edge.curve.point_and_unit_tangent_extended(node.t, edge.t0, edge.t1) {
+                Ok((point, tangent)) => eprintln!("C3-CLOSE-SPINE {}", serde_json::json!({
+                    "edge":edge.id, "index":index, "t":node.t, "spine":point,
+                    "tangent":tangent, "weight":node.station.weight, "radius":radius_at(node.t),
+                    "reach_ratio":node.station.center.sub(point).length()*node.station.weight/radius_at(node.t).abs()
+                })),
+                Err(error) => eprintln!("C3-CLOSE-SPINE-ERROR edge={} index={index} {error}", edge.id),
+            }
+            eprintln!("C3-CLOSE-NODE edge={} index={index} t={:.17e} uv={:?} p1={:?} p2={:?} center={:?}",
+                edge.id, node.t, node.uv, node.station.p1, node.station.p2, node.station.center);
+        }
+    }
     debug_assert!(
-        nodes.len() <= MAX_STATIONS + 1,
+        nodes.len() <= (SEED_INTERVALS << depth_budget) + 1,
         "adaptive march exceeded its hard station cap"
     );
     // Does the wall this march would carry FOLD? The centre curve is the same
     // whichever lane marches it, so the closed-edge march asks the same
     // question the chain march does (`blend/fold.rs`) — measured by re-solving
     // the tangency system either side of each station, never off the station
-    // spacing, which on a bend the size of the radius reads clean.
-    {
+    // spacing, which on a bend the size of the radius reads clean.  Under
+    // `FoldPolicy::Carve` the caller has already read the fold and is about to
+    // carve the folded lens out of the wall (`blend/carve.rs`), so the march
+    // builds it.
+    let check_fold = |nodes: &[MarchNode]| -> Result<(), KernelRefusal> {
+      if fold == super::chain::FoldPolicy::Refuse {
         let probe = |t: f64,
                      seed: [f64; 4]|
          -> Result<([f64; 4], Vec3, Vec3, Vec3), KernelRefusal> {
@@ -1197,16 +1724,195 @@ pub(super) fn march_stations(
             scale,
         )?;
     }
+      Ok(())
+    };
+    check_fold(&nodes)?;
+    let mut refinement_started = false;
+    if let Some(bar) = rail_bar {
+        let initial: Vec<Station> = nodes.iter().map(|node| node.station).collect();
+        // Analytic revolution rows already carry the exact rail geometry.
+        if exact_closed_revolution_rows(&initial, first, second, false).is_none() {
+            refinement_started = true;
+            (|| -> Result<(), KernelRefusal> {
+            let original_count = nodes.len();
+            let station_ceiling = (SEED_INTERVALS << (MAX_REFINEMENT_DEPTH + 4)) + 1;
+            // The rung last ACCEPTED (rails and wall inside their bars) while
+            // the construction request refines past it, with its declared
+            // wall reading; and why the request stopped short, if it did.
+            let mut accepted: Option<(Vec<MarchNode>, f64)> = None;
+            let mut unmet: Option<(f64, crate::BudgetReason, usize, usize)> = None;
+            for round in 0..=REFINE_ROUNDS {
+                let stations: Vec<Station> = nodes.iter().map(|node| node.station).collect();
+                let parameters = station_parameters(&stations);
+                // The two rails are independent of the rational middle row.
+                // Fitting the chamfer rows here lets rail refinement proceed
+                // even when a coarse fillet middle row has negative weights.
+                let rows = fit_closed_rows(&stations, &parameters, true)?;
+                if std::env::var_os("BREP_TRACE_CLOSED_RAIL_FEET").is_some() {
+                    trace_closed_rail_feet(&rows, &stations, &parameters,
+                        [&first.face.surface, &second.face.surface]);
+                }
+                let misses = closed_rail_interval_misses(&rows, &stations, &parameters,
+                    [&first.face.surface, &second.face.surface])?;
+                let worst = misses.iter().copied().fold(0.0_f64, f64::max);
+                let mut count = misses.iter().filter(|&&miss| miss > bar).count();
+                if std::env::var("BREP_DEBUG_CLOSED_RAILS").is_ok() {
+                    eprintln!("closed local rails: edge {} round {round} original {original_count} stations {} failing {count} worst {worst:.9e} bar {bar:.9e} anchor={anchor_u:?}", edge.id, nodes.len());
+                }
+                // Rails on their carriers, a FILLET's wall is judged between
+                // them against the ball's own sweep (`ClosedWallCheck`): the
+                // rails can stand on their carriers while the wall stands off
+                // the ball (the 20-degree crossing's single closed exit edge
+                // shipped a wall 4.98e-6 off the exact sweep against the 2e-6
+                // bar on c5ea8fb80, read input-only). An interval whose
+                // declared reading is over the bar, or unreadable, refines
+                // like a rail interval; one that passes adds no station, so a
+                // wall already inside the bar builds exactly as it did.
+                let mut wall_failing: Vec<bool> = Vec::new();
+                let mut wall_worst = 0.0_f64;
+                let mut walls_read: Option<Vec<Option<f64>>> = None;
+                if count == 0 {
+                    if let Some(check) = wall {
+                        match fit_closed_rows(&stations, &parameters, false) {
+                            Ok(fillet) => {
+                                let walls = closed_wall_interval_misses(&fillet, &nodes, &parameters, check.radius, |previous, t| {
+                                    frame.continue_node(previous.t, previous.uv, previous.station.center, t, None, true)
+                                });
+                                wall_failing = walls.iter().map(|wall| !matches!(wall, Some(declared) if *declared <= check.bar)).collect();
+                                wall_worst = walls.iter().flatten().copied().fold(0.0_f64, f64::max);
+                                count = wall_failing.iter().filter(|&&failing| failing).count();
+                                if std::env::var("BREP_DEBUG_CLOSED_RAILS").is_ok() {
+                                    eprintln!("closed local wall: edge {} round {round} stations {} failing {count} ({} unreadable) worst declared {wall_worst:.9e} bar {:.9e}",
+                                        edge.id, nodes.len(), walls.iter().filter(|wall| wall.is_none()).count(), check.bar);
+                                }
+                                walls_read = Some(walls);
+                            }
+                            // The fillet rows themselves do not fit: the lane's
+                            // own fit after the march refuses as it always has.
+                            Err(_) => {}
+                        }
+                    }
+                }
+                if count == 0 {
+                    // ACCEPTED. A plain fillet's wall is then refined toward
+                    // the construction request, in exactly the intervals whose
+                    // declared reading is over it (the closed chain's request,
+                    // `chain::wall_model_missing`, on the same reading), within
+                    // the same rounds and ceiling; a wall inside it everywhere
+                    // inserts nothing and builds as accepted.
+                    let request = wall.and_then(|check| check.model).zip(walls_read.as_ref());
+                    let Some((model, walls)) = request else { break };
+                    // The RAILS against the same request: the shipped support
+                    // curves ARE these rails, so a rail standing off its
+                    // carrier ships that miss. Read at j/16 of every interval
+                    // (the acceptance read above reads three points); an
+                    // unreadable read is short. Acceptance is unchanged.
+                    let rails = closed_rail_interval_misses_at(&rows, &stations, &parameters,
+                        [&first.face.surface, &second.face.surface], &CLOSED_REQUEST_RAIL_FRACTIONS)
+                        .unwrap_or_else(|_| vec![f64::NAN; walls.len()]);
+                    let rails = if rails.len() == walls.len() { rails } else { vec![f64::NAN; walls.len()] };
+                    let missing: Vec<bool> = walls
+                        .iter()
+                        .zip(&rails)
+                        .map(|(wall, &rail)| !matches!(wall, Some(declared) if *declared <= model) || !(rail <= model))
+                        .collect();
+                    let short = missing.iter().filter(|&&missing| missing).count();
+                    if short == 0 {
+                        break;
+                    }
+                    let rail_worst = rails.iter().copied().filter(|rail| rail.is_finite()).fold(0.0_f64, f64::max);
+                    let declared = walls.iter().flatten().copied().fold(0.0_f64, f64::max).max(rail_worst);
+                    CLOSED_REQUEST_RAILS.with(|slot| slot.set(Some((
+                        rail_worst,
+                        rails.iter().filter(|rail| !rail.is_finite()).count(),
+                        walls.iter().flatten().copied().fold(0.0_f64, f64::max),
+                    ))));
+                    if round == REFINE_ROUNDS {
+                        unmet = Some((declared, crate::BudgetReason::RoundsSpent, round, nodes.len()));
+                        break;
+                    }
+                    if nodes.len() + short > station_ceiling {
+                        unmet = Some((declared, crate::BudgetReason::StationCeiling, round, nodes.len()));
+                        break;
+                    }
+                    // Each short interval by its measured declared reading
+                    // against the request.
+                    let counts: Vec<usize> = walls
+                        .iter()
+                        .zip(&rails)
+                        .map(|(&reading, &rail)| stations_for_miss(reading, model).max(stations_for_miss(Some(rail), model)))
+                        .collect();
+                    let allocated: usize = counts.iter().sum();
+                    // What is actually inserted: the allocation, or one station
+                    // per short interval when it would pass the ceiling.
+                    let short = if nodes.len() + allocated > station_ceiling { short } else { allocated };
+                    match refine_closed_node_counts(&nodes, &counts, station_ceiling, |previous, t| {
+                        frame.continue_node(previous.t, previous.uv, previous.station.center, t, None, true)
+                    }) {
+                        Ok(refined) => {
+                            accepted = Some((nodes.clone(), declared));
+                            nodes = refined;
+                            continue;
+                        }
+                        Err(_) => {
+                            // The attempted round counts; the rung that ships
+                            // is this accepted one.
+                            unmet = Some((declared, crate::BudgetReason::Incoherent, round + 1, nodes.len()));
+                            break;
+                        }
+                    }
+                }
+                // A rung the REQUEST refined that no longer passes acceptance:
+                // the accepted rung stands, and says so.
+                if let Some((kept, declared)) = accepted.take() {
+                    unmet = Some((declared, crate::BudgetReason::Rejected, round, kept.len()));
+                    nodes = kept;
+                    break;
+                }
+                if round == REFINE_ROUNDS || nodes.len() + count > station_ceiling {
+                    let what = if wall_failing.is_empty() {
+                        format!("rails stand {worst:.9e} off their carriers (bar {bar:.9e})")
+                    } else {
+                        format!("wall stands {wall_worst:.9e} off the rolling ball between its rails ({count} interval(s) over the bar or unreadable)")
+                    };
+                    return Err(KernelRefusal::non_convergence(KernelStage::Refine,
+                        super::miter::MARCHED_FIT_OFF_CARRIERS_WHAT,
+                        format!("blend: closed edge {} {what} after {} stations and {round} local rounds; bounded refinement exhausted", edge.id, nodes.len())));
+                }
+                // The intervals to refine, each by its measured miss: rails
+                // over their bar, or (rails passing) walls failing theirs.
+                let counts: Vec<usize> = if wall_failing.is_empty() {
+                    misses.iter().map(|&miss| stations_for_miss(Some(miss), bar)).collect()
+                } else {
+                    let walls = walls_read.as_ref().expect("a wall verdict read");
+                    let target = wall.map_or(f64::NAN, |check| check.bar);
+                    walls.iter().map(|&reading| stations_for_miss(reading, target)).collect()
+                };
+                nodes = refine_closed_node_counts(&nodes, &counts, station_ceiling, |previous, t| {
+                    frame.continue_node(previous.t, previous.uv, previous.station.center, t, None, true)
+                })?;
+            }
+            check_fold(&nodes)?;
+            // `round` counts the local rounds ATTEMPTED; on `Rejected` the
+            // stations (and the declared reading) are the KEPT accepted rung's
+            // — the geometry that ships — not the attempted one's.
+            CLOSED_MODEL_UNMET.with(|slot| slot.set(unmet.map(|(declared, reason, round, stations)| (declared, reason, round, stations, station_ceiling))));
+            Ok(())
+            })().map_err(ClosedMarchFailure::Refinement)?;
+        }
+    }
     let stations: Vec<Station> = nodes.into_iter().map(|node| node.station).collect();
     let first_station = &stations[0];
     let last_station = stations.last().expect("march produced stations");
     if last_station.p1.sub(first_station.p1).length() > 1e-6 * scale
         || last_station.p2.sub(first_station.p2).length() > 1e-6 * scale
     {
-        return Err(KernelRefusal::non_convergence(KernelStage::Refine, "closed_march_closure", "blend: closed-edge march did not return to its start"));
+        let error = KernelRefusal::non_convergence(KernelStage::Refine, "closed_march_closure", "blend: closed-edge march did not return to its start");
+        return Err(if refinement_started { ClosedMarchFailure::Refinement(error) } else { ClosedMarchFailure::Initial(error) });
     }
     Ok(stations)
 }
+
 
 /// Chord-length parameters over the mean of the two support polylines,
 /// normalised to [0, 1] (§4.9: station spacing proportional to the mean
@@ -1368,12 +2074,42 @@ pub(super) fn exact_closed_revolution_rows(
         }
         *revolution_parameters.last_mut().unwrap() = 1.0;
         let fitted = fit_closed_rows(stations, &revolution_parameters, chamfer)?;
+        let sphere_pcurve = |mate: &BlendMate, curve: &NurbsCurve, fallback: NurbsCurve,
+                             start_uv: [f64; 2]| -> Result<NurbsCurve, KernelRefusal> {
+            if !matches!(mate.face.surface.analytic(), Some(crate::AnalyticSurface::Sphere { .. })) {
+                return Ok(fallback);
+            }
+            // Refining the march against 3D chords does not bound the error
+            // of a sphere's curved UV track. Fit against the exact circle's
+            // image, checking between interpolation stations on the carrier.
+            let mut pcurve = crate::build_pcurve_on_surface_stations(
+                &mate.face.surface, &|t| curve.evaluate(t), &curve.knots,
+                crate::PCURVE_REFINEMENT_TOLERANCE, 64, 12, 4097,
+            ).or_refuse(KernelStage::Refine, "sphere_contact_pcurve")?;
+            let start = pcurve.evaluate(0.0).or_refuse(KernelStage::Refine, "sphere_contact_start")?;
+            let closed = mate.face.surface.closed_directions().or_refuse(KernelStage::Refine, "closed_directions")?;
+            for (axis, periodic, value, target) in [
+                (0, closed.0, start.x, start_uv[0]),
+                (1, closed.1, start.y, start_uv[1]),
+            ] {
+                if !periodic { continue; }
+                let [low, high] = if axis == 0 { mate.face.surface.domain_u() } else { mate.face.surface.domain_v() }
+                    .or_refuse(KernelStage::Refine, "sphere_contact_domain")?;
+                let shift = (high - low) * ((target - value) / (high - low)).round();
+                for control in &mut pcurve.control_points {
+                    if axis == 0 { control.x += shift * control.w; } else { control.y += shift * control.w; }
+                }
+            }
+            Ok(pcurve)
+        };
+        let cr_pcurve = sphere_pcurve(first, &cr, fitted.cr_pcurve, first_station.uv1)?;
+        let cs_pcurve = sphere_pcurve(second, &cs, fitted.cs_pcurve, first_station.uv2)?;
         Ok(FittedRows {
             surface,
             cr,
             cs,
-            cr_pcurve: fitted.cr_pcurve,
-            cs_pcurve: fitted.cs_pcurve,
+            cr_pcurve,
+            cs_pcurve,
             u_domain: [0.0, 1.0],
             center: None,
             exact_extrusion: false,
@@ -1488,6 +2224,263 @@ pub(super) fn fit_closed_rows(
     })
 }
 
+fn refine_closed_node_intervals(
+    nodes: &[MarchNode],
+    misses: &[f64],
+    bar: f64,
+    solve: impl Fn(&MarchNode, &MarchNode) -> Result<MarchNode, KernelRefusal>,
+) -> Result<Vec<MarchNode>, KernelRefusal> {
+    let count = misses.iter().filter(|&&miss| miss > bar).count();
+    let mut refined = Vec::with_capacity(nodes.len() + count);
+    for (index, &miss) in misses.iter().enumerate() {
+        let left = &nodes[index];
+        let right = &nodes[index + 1];
+        refined.push(left.clone());
+        if miss > bar {
+            refined.push(solve(left, right)?);
+        }
+    }
+    refined.push(nodes.last().expect("closed endpoint").clone());
+    Ok(refined)
+}
+
+/// How many stations a failing interval takes this round, from its MEASURED
+/// miss against the target it must meet: an interpolant's error falls about
+/// as the fourth power of its spacing, so an interval missing by `miss`
+/// is split into ⌈(miss / target)^¼⌉ equal parts (one station — bisection —
+/// for a miss within 16 × target, an unreadable or non-finite reading, or a
+/// target that is not positive). A PRIORITISATION of the existing local
+/// rounds, not an accuracy claim: every refined rung is measured again in
+/// full before it is accepted.
+fn stations_for_miss(miss: Option<f64>, target: f64) -> usize {
+    match miss {
+        Some(miss) if miss.is_finite() && target > 0.0 && miss > target => {
+            let parts = (miss / target).powf(0.25).ceil();
+            if parts.is_finite() && parts >= 2.0 && parts <= 1e6 { parts as usize - 1 } else { 1 }
+        }
+        Some(miss) if miss.is_finite() && miss <= target => 0,
+        _ => 1,
+    }
+}
+
+/// [`refine_closed_node_intervals`] with `counts[i]` stations in interval i,
+/// at equal fractions of its edge parameter, each continued from the station
+/// before it. An interval taking one station gets exactly the midpoint solve
+/// from its left station that bisection gives. When the counts would pass
+/// `ceiling` stations in all (summed with overflow checks), every refining
+/// interval takes one station instead (the plain bisection the rounds always
+/// made), and when even that would pass `ceiling` nothing is solved and the
+/// call refuses. Only the stations actually inserted are reserved. `counts`
+/// must hold one entry per interval, and an interval taking more than one
+/// station must run over finite, strictly increasing parameters.
+fn refine_closed_node_counts(
+    nodes: &[MarchNode],
+    counts: &[usize],
+    ceiling: usize,
+    solve: impl Fn(&MarchNode, f64) -> Result<MarchNode, KernelRefusal>,
+) -> Result<Vec<MarchNode>, KernelRefusal> {
+    if nodes.len() < 2 || counts.len() != nodes.len() - 1 {
+        return Err(KernelRefusal::internal(KernelStage::Refine, "closed_refine_counts", format!(
+            "blend: {} station counts for {} intervals", counts.len(), nodes.len().saturating_sub(1))));
+    }
+    let requested = counts.iter().try_fold(nodes.len(), |sum, &count| sum.checked_add(count));
+    let counts: Vec<usize> = match requested {
+        Some(total) if total <= ceiling => counts.to_vec(),
+        _ => counts.iter().map(|&count| count.min(1)).collect(),
+    };
+    let total = nodes.len() + counts.iter().sum::<usize>();
+    if total > ceiling {
+        return Err(KernelRefusal::non_convergence(KernelStage::Refine, "closed_refine_ceiling", format!(
+            "blend: refining {} interval(s) would pass the {ceiling}-station ceiling at {} stations",
+            counts.iter().filter(|&&count| count > 0).count(), nodes.len())));
+    }
+    let mut refined = Vec::with_capacity(total);
+    for (index, &count) in counts.iter().enumerate() {
+        let left = &nodes[index];
+        let right = &nodes[index + 1];
+        refined.push(left.clone());
+        if count > 1 && !(left.t.is_finite() && right.t.is_finite() && left.t < right.t) {
+            return Err(KernelRefusal::internal(KernelStage::Refine, "closed_refine_interval", format!(
+                "blend: interval {index} runs over [{}, {}], not a finite increasing span", left.t, right.t)));
+        }
+        let mut previous = left.clone();
+        for step in 1..=count {
+            // One station: bisection's own midpoint, to the bit.
+            let t = if count == 1 { 0.5 * (left.t + right.t) } else { left.t + (right.t - left.t) * step as f64 / (count + 1) as f64 };
+            if count > 1 && !(t > previous.t && t < right.t) {
+                return Err(KernelRefusal::internal(KernelStage::Refine, "closed_refine_interval", format!(
+                    "blend: station {step} of {count} in interval {index} at t {t} is not strictly inside ({}, {})", previous.t, right.t)));
+            }
+            let node = solve(&previous, t)?;
+            refined.push(node.clone());
+            previous = node;
+        }
+    }
+    refined.push(nodes.last().expect("closed endpoint").clone());
+    Ok(refined)
+}
+
+/// Read-only comparison of global, station-seeded and fitted-pcurve feet.
+/// The acceptance reading and refinement decisions remain unchanged.
+fn trace_closed_rail_feet(
+    rows: &FittedRows,
+    stations: &[Station],
+    parameters: &[f64],
+    carriers: [&NurbsSurface; 2],
+) {
+    let [low, high] = rows.u_domain;
+    for (interval, pair) in parameters.windows(2).enumerate() {
+        for fraction in [0.25, 0.5, 0.75] {
+            let u = low + (high - low) * (pair[0] + (pair[1] - pair[0]) * fraction);
+            for (side, rail, pcurve, carrier, left, right) in [
+                (0, &rows.cr, &rows.cr_pcurve, carriers[0], stations[interval].uv1, stations[interval + 1].uv1),
+                (1, &rows.cs, &rows.cs_pcurve, carriers[1], stations[interval].uv2, stations[interval + 1].uv2),
+            ] {
+                let read = (|| -> Result<serde_json::Value, String> {
+                    let point = rail.evaluate(u)?;
+                    let seed = [left[0] + fraction * (right[0] - left[0]), left[1] + fraction * (right[1] - left[1])];
+                    let global = crate::project_point_to_surface(carrier, point);
+                    let seeded = crate::project_point_to_surface_seeded(carrier, point, seed[0], seed[1]);
+                    let uv = pcurve.evaluate(u)?;
+                    let represented = carrier.evaluate_extended(uv.x, uv.y)?;
+                    let foot = |value: &Result<crate::SurfaceProjection, String>| match value {
+                        Ok(p) => serde_json::json!({"uv":[p.u,p.v],"distance":p.distance,
+                            "extended_distance":carrier.evaluate_extended(p.u,p.v).ok().map(|q|q.sub(point).length())}),
+                        Err(error) => serde_json::json!({"error":error}),
+                    };
+                    Ok(serde_json::json!({"interval":interval,"fraction":fraction,"side":side,"u":u,
+                        "point":[point.x,point.y,point.z],"seed":seed,"left_uv":left,"right_uv":right,
+                        "global":foot(&global),"seeded":foot(&seeded),"pcurve_uv":[uv.x,uv.y],
+                        "pcurve_distance":represented.sub(point).length(),"closed":carrier.closed_directions()?}))
+                })();
+                match read {
+                    Ok(row) => eprintln!("C3-RAIL-FOOT {row}"),
+                    Err(error) => eprintln!("C3-RAIL-FOOT-ERROR interval={interval} side={side} {error}"),
+                }
+            }
+        }
+    }
+}
+
+/// How far each fitted rail stands off its carrier between stations: an
+/// ACCURACY reading, so it is taken against the carrier's own extension
+/// (`NurbsSurface::derivatives_extended`), the surface the stations were
+/// solved on. A rail whose contact runs past the finite patch — the
+/// edge-preserving wall whose ball rests on the bottom rim, 0.5 below a
+/// washer's wall — is exactly on that extension, and the finite-patch
+/// projector, which clamps its foot to the patch, would read the overshoot
+/// as a miss no refinement can shrink. Whether such a contact is FEASIBLE is
+/// the edge-preserving / support lane's question, unchanged here. Each foot is
+/// seeded on the march's own branch: the interval's two station (u, v),
+/// continued and so unwrapped, interpolated at the probe's fraction.
+pub(super) fn closed_rail_interval_misses(
+    rows: &FittedRows,
+    stations: &[Station],
+    parameters: &[f64],
+    carriers: [&NurbsSurface; 2],
+) -> Result<Vec<f64>, KernelRefusal> {
+    closed_rail_interval_misses_at(rows, stations, parameters, carriers, &[0.25, 0.5, 0.75])
+}
+
+/// The fractions of every interval the closed-edge construction REQUEST reads
+/// the rails at, j/16: the shipped support curves are these rails, and a miss
+/// between the acceptance read's quarter points ships too.
+const CLOSED_REQUEST_RAIL_FRACTIONS: [f64; 15] = [
+    1.0 / 16.0, 2.0 / 16.0, 3.0 / 16.0, 4.0 / 16.0, 5.0 / 16.0, 6.0 / 16.0, 7.0 / 16.0, 8.0 / 16.0,
+    9.0 / 16.0, 10.0 / 16.0, 11.0 / 16.0, 12.0 / 16.0, 13.0 / 16.0, 14.0 / 16.0, 15.0 / 16.0,
+];
+
+/// [`closed_rail_interval_misses`] at the given fractions of every interval.
+pub(super) fn closed_rail_interval_misses_at(
+    rows: &FittedRows,
+    stations: &[Station],
+    parameters: &[f64],
+    carriers: [&NurbsSurface; 2],
+    fractions: &[f64],
+) -> Result<Vec<f64>, KernelRefusal> {
+    let [low, high] = rows.u_domain;
+    parameters.windows(2).enumerate().map(|(interval, pair)| {
+        let mut worst = 0.0_f64;
+        for &fraction in fractions {
+            let normalized = pair[0] + (pair[1] - pair[0]) * fraction;
+            let u = low + (high - low) * normalized;
+            let (left, right) = (&stations[interval], &stations[interval + 1]);
+            let lerp = |a: [f64; 2], b: [f64; 2]| [a[0] + fraction * (b[0] - a[0]), a[1] + fraction * (b[1] - a[1])];
+            for (rail, seed, carrier) in [
+                (&rows.cr, lerp(left.uv1, right.uv1), carriers[0]),
+                (&rows.cs, lerp(left.uv2, right.uv2), carriers[1]),
+            ] {
+                let point = rail.evaluate(u).or_refuse(KernelStage::Refine, "evaluate")?;
+                let gap = extended_foot_distance(carrier, point, seed)?;
+                worst = worst.max(gap);
+            }
+        }
+        Ok(worst)
+    }).collect()
+}
+
+/// Distance from `point` to `carrier`'s extension near `seed`: damped
+/// Gauss-Newton on the extended evaluation, taking only steps that bring the
+/// carrier closer, so the reading never exceeds the seed's own distance and
+/// is always the distance to an actual point of the extended carrier.
+pub(in crate::blend) fn extended_foot_distance(carrier: &NurbsSurface, point: Vec3, seed: [f64; 2]) -> Result<f64, KernelRefusal> {
+    let distance_at = |uv: [f64; 2]| -> Result<f64, KernelRefusal> {
+        Ok(carrier.evaluate_extended(uv[0], uv[1]).or_refuse(KernelStage::Refine, "evaluate_extended")?.sub(point).length())
+    };
+    if !(point.x.is_finite() && point.y.is_finite() && point.z.is_finite() && seed[0].is_finite() && seed[1].is_finite()) {
+        return Ok(f64::INFINITY);
+    }
+    let mut uv = seed;
+    let mut best = distance_at(uv)?;
+    if !best.is_finite() {
+        return Ok(f64::INFINITY);
+    }
+    for _ in 0..30 {
+        let d = carrier.derivatives_extended(uv[0], uv[1], 1).or_refuse(KernelStage::Refine, "derivatives_extended")?;
+        let (offset, su, sv) = (d[0][0].sub(point), d[1][0], d[0][1]);
+        let (a, b, c) = (su.dot(su), su.dot(sv), sv.dot(sv));
+        let (gu, gv) = (su.dot(offset), sv.dot(offset));
+        let det = a * c - b * b;
+        // UNREADABLE (any non-finite derivative, normal matrix, gradient or
+        // step) is never accurate: it reads infinitely far, deterministically.
+        if ![a, b, c, gu, gv, det].iter().all(|value| value.is_finite()) {
+            return Ok(f64::INFINITY);
+        }
+        // Finite but singular: no direction to improve in, so the foot stays
+        // where it is and its finite distance is the reading.
+        if !(det.abs() > 1e-300) {
+            break;
+        }
+        let mut step = [(c * gu - b * gv) / det, (a * gv - b * gu) / det];
+        if !(step[0].is_finite() && step[1].is_finite()) {
+            return Ok(f64::INFINITY);
+        }
+        let mut improved = false;
+        for _ in 0..30 {
+            let trial = [uv[0] - step[0], uv[1] - step[1]];
+            let distance = distance_at(trial)?;
+            if !distance.is_finite() {
+                return Ok(f64::INFINITY);
+            }
+            if distance < best {
+                uv = trial;
+                best = distance;
+                improved = true;
+                break;
+            }
+            step = [0.5 * step[0], 0.5 * step[1]];
+        }
+        // Zero progress (no decreasing step, or a step below roundoff): the
+        // finite distance reached is the reading.
+        if !improved || step[0].abs().max(step[1].abs()) < 1e-15 {
+            break;
+        }
+    }
+    // `best` only ever takes finite values above; kept explicit because
+    // `f64::max` would drop a NaN and read it as accurate.
+    Ok(if best.is_finite() { best } else { f64::INFINITY })
+}
+
 pub(super) fn locate_mate<'a>(
     solid: &'a BrepSolid,
     edge_id: u64,
@@ -1582,3 +2575,4 @@ pub(super) fn signed_radii(
     };
     Ok((rho1, rho2))
 }
+

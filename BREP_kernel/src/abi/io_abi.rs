@@ -167,7 +167,7 @@ pub fn read_stl_json(data: &[u8]) -> Result<String, JsValue> {
 pub fn import_stl_solid(data: &[u8], tolerance: f64) -> Result<String, JsValue> {
     crate::panic_hook::set_once();
     let stl = read_binary_stl(data).map_err(javascript_error)?;
-    let solid = mesh_to_faceted_brep(&stl.positions, None, tolerance).map_err(javascript_error)?;
+    let solid = mesh_to_faceted_brep(&stl.positions, None, tolerance).map_err(|refusal| javascript_error(refusal.message))?;
     serde_json::to_string(&solid).map_err(|error| javascript_error(error.to_string()))
 }
 
@@ -202,6 +202,6 @@ pub fn import_obj_solid(text: &str, tolerance: f64) -> Result<String, JsValue> {
     crate::panic_hook::set_once();
     let obj = read_obj(text).map_err(javascript_error)?;
     let solid = mesh_to_faceted_brep(&obj.positions, Some(&obj.indices), tolerance)
-        .map_err(javascript_error)?;
+        .map_err(|refusal| javascript_error(refusal.message))?;
     serde_json::to_string(&solid).map_err(|error| javascript_error(error.to_string()))
 }

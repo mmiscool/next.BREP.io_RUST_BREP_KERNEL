@@ -98,6 +98,16 @@ impl EngineState {
         self.controls.enabled = enabled;
     }
 
+    /// Two-finger pan/pinch, also available with the sketch camera locked:
+    /// neither operation changes its orientation relative to the sketch plane.
+    pub fn touch_navigation(&mut self, from: [f64; 2], to: [f64; 2], scale: f64) -> bool {
+        let changed = self
+            .controls
+            .touch_navigation(&mut self.camera, from, to, scale);
+        self.dirty |= changed;
+        changed
+    }
+
     // --- Camera commands (R21) --------------------------------------------
 
     pub fn toggle_projection(&mut self) -> &'static str {

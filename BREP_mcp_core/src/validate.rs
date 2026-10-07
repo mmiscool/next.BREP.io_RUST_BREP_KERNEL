@@ -58,6 +58,18 @@ pub fn validate(
         v.errors.push(format!("unknown feature type `{feature_type}`"));
         return v;
     };
+    validate_entry(&entry, params, known_names)
+}
+
+/// Validate against an owned catalogue entry supplied by the active document.
+/// Plugin schemas must not be cached in the process-wide built-in catalogue.
+pub fn validate_entry(
+    entry: &Value,
+    params: &Value,
+    known_names: Option<&HashSet<String>>,
+) -> Validation {
+    let mut v = Validation::default();
+    let feature_type = entry["type"].as_str().unwrap_or("");
     let Some(spec) = entry.get("inputParamsSchema").and_then(Value::as_object) else {
         v.errors.push(format!("feature `{feature_type}` has no inputParamsSchema"));
         return v;
@@ -185,8 +197,8 @@ fn check_kind(
                 for (k, val) in obj {
                     if !allowed.contains(&k.as_str()) {
                         v.errors.push(format!("unknown key `{key}.{k}` (allowed: {})", allowed.join(", ")));
-                    } else if !is_vec3(val) {
-                        v.errors.push(format!("`{key}.{k}` must be three numbers"));
+                    } else if !is_vec3_or_expression(val) {
+                        v.errors.push(format!("`{key}.{k}` must be three numbers or expressions"));
                     }
                 }
             }
@@ -210,10 +222,6 @@ fn check_kind(
             v.warnings.push(format!("`{key}` has type `{ty}`, which no tool can set; it is ignored"));
         }
     }
-}
-
-fn is_vec3(v: &Value) -> bool {
-    v.as_array().map(|a| a.len() == 3 && a.iter().all(Value::is_number)).unwrap_or(false)
 }
 
 /// A three-slot vector whose components may be numbers OR expression strings —
@@ -258,4 +266,5 @@ pub fn object(pairs: &[(&str, Value)]) -> Value {
     }
     Value::Object(m)
 }
+
 

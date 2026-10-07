@@ -130,6 +130,8 @@ pub fn schema() -> serde_json::Value {
     "type": "DF",
     "shortName": "DF",
     "longName": "Delete Face",
+    "ribbonPath": "Home/Synchronous Modeling/Delete Face",
+    "commandSize": "Compact",
     "displayBuilder": false,
     "inputParamsSchema": {
         "id": {

@@ -22,6 +22,8 @@ mod draft;
 mod miter;
 #[path = "sweep_topology/twist.rs"]
 mod twist;
+#[path = "sweep_topology/stations.rs"]
+mod stations;
 #[path = "sweep_topology/rib.rs"]
 mod rib;
 
@@ -38,11 +40,15 @@ pub use envelope::{
 
 pub use sweep::{
     fit_helix_curve, helix_sample_points, profile_anchor, sweep_bend_profile, sweep_closure,
-    sweep_profile_along_chain,
-    sweep_profile_along_chain_with_stations,
+    sweep_profile_along_chain, sweep_profile_along_chain_reported,
+    sweep_profile_along_chain_with_stations, sweep_profile_along_chain_with_stations_reported,
     sweep_profile_along_path, sweep_profile_along_path_anchored,
     sweep_profile_helix, sweep_profile_twisted, sweep_profile_twisted_anchored, BendStation,
-    ProfileAnchor, SectionPlacement, SweepClosure, SWEEP_TIGHT_BEND_REFUSAL,
+    ProfileAnchor, SectionPlacement, SweepClosure, SweptChain, SWEEP_TIGHT_BEND_REFUSAL,
+};
+pub use stations::{
+    StationBudget, SweepStationReport, SWEEP_DEFAULT_TOLERANCE, SWEEP_MAX_STATIONS,
+    SWEEP_REFINEMENT_ROUNDS,
 };
 
 pub(crate) use sweep::is_sweep_tight_bend;

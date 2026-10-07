@@ -164,6 +164,7 @@ fn pmi_update_view_visibility(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome,
 fn pmi_set_view_display(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
     let a: ViewDisplayArgs = parse_args(args)?;
     let patch = PmiViewPatch {
+        section: None,
         name: a.name,
         text_size_pt: a.text_size_pt,
         wireframe: a.wireframe,

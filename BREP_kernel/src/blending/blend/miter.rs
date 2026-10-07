@@ -301,6 +301,7 @@ pub(super) fn solve_miter(
     sharp: &EdgeRecord,
     scale: f64,
     fit_tolerance: f64,
+    consumed_band: f64,
 ) -> Result<MiterClosure, KernelRefusal> {
     let [first, second] = stripes;
     // The bar the EXIT is bisected to, and the exit is an endpoint of the
@@ -495,6 +496,7 @@ pub(super) fn solve_miter(
     };
     let (seam, seam_fit) = fit_on_ladder(&resample, "seam", &seam_off_carriers, fit_tolerance)?;
 
+    check_sharp_extent(sharp, exit_point, consumed_band, radius)?;
     let on_sharp = crate::project_point_to_curve(&sharp.curve, exit_point).or_refuse(KernelStage::Refine, "project_point_to_curve")?;
     let symmetric_bar = 1e-6 * (1.0 + radius);
     if on_sharp.distance <= symmetric_bar {
@@ -540,6 +542,7 @@ pub(super) fn solve_miter(
         .points
         .last()
         .ok_or(KernelRefusal::internal(KernelStage::Refine, "miter_connector_samples", "miter: the connector has no samples"))?;
+    check_sharp_extent(sharp, connector_end, consumed_band, radius)?;
     let on_sharp = crate::project_point_to_curve(&sharp.curve, connector_end).or_refuse(KernelStage::Refine, "project_point_to_curve")?;
     if on_sharp.distance > 1e-5 * (1.0 + radius) {
         return Err(KernelRefusal::internal(KernelStage::Refine, "miter_connector_end", format!(
@@ -561,6 +564,79 @@ pub(super) fn solve_miter(
         exit_follower,
         sharp_parameter: on_sharp.u,
     })
+}
+
+/// A corner closing on the continuation of its straight sharp edge has run
+/// out of its support faces. Projecting onto the finite curve clamps to its
+/// endpoint and used to report this as a generic connector failure, allowing
+/// the cutter to replace the miter with flat caps (October 1, r = 1.3 report).
+/// Keep the coincidence band used by the network's full-width surgery: a
+/// closure at the far vertex is supported; one past it needs new carriers.
+///
+/// The refusal names the radius that WOULD close on the far vertex. The
+/// corner's faces meet at the vertex the sharp edge leaves from, so the whole
+/// miter construction there is homogeneous in the blend size about that
+/// vertex: the closure's distance from it along a straight sharp edge is
+/// proportional to `radius`, and the edge's own length over that distance is
+/// the factor the size has to shrink by. Exact for planar carriers (the
+/// 2026-10-01 document: 1.3 · 1.129776 / 1.468708 = 1.0, the radius its r = 1
+/// sibling builds as the full-width miter); on curved carriers it is the
+/// first-order estimate, which is why the message says "about". The same
+/// document came back on 2026-10-06 as "fillet not wrapping correctly" with
+/// the capped body a build older than this refusal had shipped; a user who
+/// reads "reduce the radius" with no figure has only trial and error.
+fn check_sharp_extent(
+    sharp: &EdgeRecord,
+    point: Vec3,
+    band: f64,
+    radius: f64,
+) -> Result<(), KernelRefusal> {
+    if sharp.curve.straight_segment(band).is_none() {
+        return Ok(());
+    }
+    // Use the edge's trims, not the underlying curve's potentially larger
+    // domain. Measure the overrun in model units, independent of parameters.
+    let start = sharp.curve.evaluate(sharp.t0).or_refuse(KernelStage::Refine, "evaluate")?;
+    let end = sharp.curve.evaluate(sharp.t1).or_refuse(KernelStage::Refine, "evaluate")?;
+    let chord = end.sub(start);
+    let length = chord.length();
+    if length <= band {
+        return Ok(());
+    }
+    let direction = chord.scale(1.0 / length);
+    let offset = point.sub(start);
+    let along = offset.dot(direction);
+    if offset.sub(direction.scale(along)).length() > band {
+        return Ok(()); // Off the line is still a solver/fit failure.
+    }
+    let overrun = (-along).max(along - length);
+    if overrun > band {
+        // The closure's distance from the corner vertex is the edge plus the
+        // overrun whichever end it ran past; the size that lands it ON the far
+        // vertex is the requested size scaled by the edge's share of that.
+        let supported = radius * length / (length + overrun);
+        return Err(KernelRefusal::unsupported(
+            KernelStage::Refine,
+            MITER_SUPPORT_OVERRUN_WHAT,
+            format!(
+                "miter: the corner closure runs {overrun:.6} past sharp edge {} \
+                 ({length:.6} long) — the blend has exhausted its support faces and \
+                 needs to roll onto neighbouring faces, which this corner construction \
+                 does not support; reduce the radius: about {supported:.3} closes on \
+                 that edge's far vertex, and anything smaller is the ordinary corner",
+                sharp.id
+            ),
+        ));
+    }
+    Ok(())
+}
+
+const MITER_SUPPORT_OVERRUN_WHAT: &str = "miter_support_overrun";
+
+/// Neither cutter composition nor dropping edges can close this corner with
+/// the requested carriers and radius. Preserve the named geometry limit.
+pub(crate) fn is_miter_support_overrun(refusal: &KernelRefusal) -> bool {
+    matches!(&refusal.class, RefusalClass::UnsupportedGeometry { what } if what == MITER_SUPPORT_OVERRUN_WHAT)
 }
 
 /// Connector steps from the seam's exit to the sharp edge, on the ladder's

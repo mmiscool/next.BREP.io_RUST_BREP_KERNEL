@@ -57,11 +57,11 @@ pub const MAX_TEXT: usize = 20_000;
 // ===========================================================================
 
 /// The open change order (other than `except`) that names `revision_id`.
-pub fn holder<'a>(state: &'a State, revision_id: &str, except: &str) -> Option<&'a ChangeOrder> {
+pub fn holder<'a>(state: &'a State, part_id: &str, revision_id: &str, except: &str) -> Option<&'a ChangeOrder> {
     state
         .change_orders
         .iter()
-        .find(|e| e.id != except && e.state.is_open() && e.item(revision_id).is_some())
+        .find(|e| e.id != except && e.state.is_open() && e.item(part_id, revision_id).is_some())
 }
 
 /// The change order with this id, or else this number (ignoring case).
@@ -82,7 +82,7 @@ fn find_mut<'a>(state: &'a mut State, key: &str) -> Result<&'a mut ChangeOrder, 
 /// What stops `item` of `eco` being applied now, if anything. `releasing` is
 /// every revision the change order releases — a child among them counts as
 /// released.
-pub fn item_problem(state: &State, eco: &ChangeOrder, item: &EcoItem, releasing: &BTreeSet<String>) -> Option<String> {
+pub fn item_problem(state: &State, eco: &ChangeOrder, item: &EcoItem, releasing: &BTreeSet<(String, String)>) -> Option<String> {
     let Some(part) = state.part(&item.part_id) else {
         return Some("its part no longer exists".into());
     };
@@ -90,17 +90,22 @@ pub fn item_problem(state: &State, eco: &ChangeOrder, item: &EcoItem, releasing:
         return Some(format!("{}: its revision no longer exists", part.number));
     };
     let name = format!("{} rev {}", part.number, revision.label);
+    let target = match item.action { EcoAction::Release => Lifecycle::Released, EcoAction::Obsolete => Lifecycle::Obsolete };
+    if let Err(error) = lifecycle::check_enabled(&state.settings, target) {
+        return Some(format!("{name}: {error}"));
+    }
     let problem = match item.action {
         EcoAction::Release => release_problem(state, part, revision, releasing),
         EcoAction::Obsolete => obsolete_problem(revision, releasing, part),
     };
     let problem = problem.or_else(|| {
-        holder(state, &revision.id, &eco.id).map(|other| format!("it is also in {}", other.number))
+        holder(state, &part.id, &revision.id, &eco.id).map(|other| format!("it is also in {}", other.number))
     });
     problem.map(|p| format!("{name}: {p}"))
 }
 
-fn release_problem(state: &State, part: &Part, revision: &Revision, releasing: &BTreeSet<String>) -> Option<String> {
+fn release_problem(state: &State, part: &Part, revision: &Revision, releasing: &BTreeSet<(String, String)>) -> Option<String> {
+    if let Err(error) = crate::workflow::release_gate(state, &part.id, &revision.id, None) { return Some(error.to_string()); }
     if let Err(refusal) = lifecycle::check_transition(revision.lifecycle, Lifecycle::Released) {
         return Some(refusal);
     }
@@ -115,6 +120,8 @@ fn release_problem(state: &State, part: &Part, revision: &Revision, releasing: &
     if !missing.is_empty() {
         return Some(format!("its catalog values are incomplete: {}", missing.join("; ")));
     }
+    let field_problems=crate::bom_config::release_problems(state,part,revision);
+    if !field_problems.is_empty(){return Some(field_problems.join("; "));}
     if state.settings.require_released_children {
         let unreleased = unreleased_children_after(state, revision, releasing);
         if !unreleased.is_empty() {
@@ -124,10 +131,10 @@ fn release_problem(state: &State, part: &Part, revision: &Revision, releasing: &
     None
 }
 
-fn obsolete_problem(revision: &Revision, releasing: &BTreeSet<String>, part: &Part) -> Option<String> {
+fn obsolete_problem(revision: &Revision, releasing: &BTreeSet<(String, String)>, part: &Part) -> Option<String> {
     // A revision this order also releases is not obsoleted by it; one that
     // the order's release will SUPERSEDE is still obsoleted afterwards.
-    if releasing.contains(&revision.id) {
+    if releasing.contains(&(part.id.clone(), revision.id.clone())) {
         return Some("the same change order releases it".into());
     }
     let _ = part;
@@ -137,7 +144,7 @@ fn obsolete_problem(revision: &Revision, releasing: &BTreeSet<String>, part: &Pa
 /// [`bom::unreleased_children`], counting as released every child that
 /// `releasing` will release: a pinned child among them, or — for a floating
 /// line — any revision of that child part among them.
-pub fn unreleased_children_after(state: &State, revision: &Revision, releasing: &BTreeSet<String>) -> Vec<String> {
+pub fn unreleased_children_after(state: &State, revision: &Revision, releasing: &BTreeSet<(String, String)>) -> Vec<String> {
     let mut out = Vec::new();
     for line in &revision.uses {
         let Some(child) = state.part(&line.part) else {
@@ -145,9 +152,9 @@ pub fn unreleased_children_after(state: &State, revision: &Revision, releasing: 
             continue;
         };
         let released_here = if line.revision.is_empty() {
-            child.revisions.iter().any(|r| releasing.contains(&r.id))
+            child.revisions.iter().any(|r| releasing.contains(&(child.id.clone(), r.id.clone())))
         } else {
-            releasing.contains(&line.revision)
+            releasing.contains(&(child.id.clone(), line.revision.clone()))
         };
         if released_here {
             continue;
@@ -167,11 +174,11 @@ pub fn unreleased_children_after(state: &State, revision: &Revision, releasing: 
 }
 
 /// Every revision the change order releases.
-pub fn releasing(eco: &ChangeOrder) -> BTreeSet<String> {
+pub fn releasing(eco: &ChangeOrder) -> BTreeSet<(String, String)> {
     eco.items
         .iter()
         .filter(|i| i.action == EcoAction::Release)
-        .map(|i| i.revision_id.clone())
+        .map(|i| (i.part_id.clone(), i.revision_id.clone()))
         .collect()
 }
 
@@ -184,8 +191,8 @@ pub fn problems(state: &State, eco: &ChangeOrder) -> Vec<String> {
 /// The revision a change order's release or obsolete of it would conflict
 /// with, for `transition` of that revision alone: the open change order
 /// naming it, if any.
-pub fn standalone_holder<'a>(state: &'a State, revision_id: &str) -> Option<&'a ChangeOrder> {
-    holder(state, revision_id, "")
+pub fn standalone_holder<'a>(state: &'a State, part_id: &str, revision_id: &str) -> Option<&'a ChangeOrder> {
+    holder(state, part_id, revision_id, "")
 }
 
 fn check_text(what: &str, text: &str, max: usize) -> Result<String, Error> {
@@ -611,7 +618,7 @@ impl Db {
             let (part_id, revision_id) = (part.id.clone(), revision.id.clone());
             let this = find(state, key).ok_or_else(|| Error::not_found("change order"))?;
             let this_id = this.id.clone();
-            if let Some(other) = holder(state, &revision_id, &this_id) {
+            if let Some(other) = holder(state, &part_id, &revision_id, &this_id) {
                 return Err(Error::conflict(format!("{name} is already in {}", other.number)));
             }
             let eco = find_mut(state, &this_id)?;
@@ -622,7 +629,7 @@ impl Db {
                     eco.state.as_str()
                 )));
             }
-            if eco.item(&revision_id).is_some() {
+            if eco.item(&part_id, &revision_id).is_some() {
                 return Err(Error::conflict(format!("{name} is already in this change order")));
             }
             if action == EcoAction::Release
@@ -641,6 +648,19 @@ impl Db {
 
     /// Take an item out of a Draft change order.
     pub fn remove_eco_item(&self, user: &User, key: &str, revision_id: &str) -> Result<ChangeOrder, Error> {
+        let part_id = self.read(|state| -> Result<String, Error> {
+            let eco = find(state, key).ok_or_else(|| Error::not_found("change order"))?;
+            let matches: Vec<_> = eco.items.iter().filter(|i| i.revision_id == revision_id).collect();
+            match matches.as_slice() {
+                [item] => Ok(item.part_id.clone()),
+                [] => Err(Error::not_found("that item")),
+                _ => Err(Error::bad_request("name the part as well as the revision")),
+            }
+        })?;
+        self.remove_eco_part_item(user, key, &part_id, revision_id)
+    }
+
+    pub fn remove_eco_part_item(&self, user: &User, key: &str, part_id: &str, revision_id: &str) -> Result<ChangeOrder, Error> {
         if !user.can_author() {
             return Err(Error::forbidden("a change order is edited by the author group"));
         }
@@ -654,7 +674,7 @@ impl Db {
                 )));
             }
             let before = eco.items.len();
-            eco.items.retain(|i| i.revision_id != revision_id);
+            eco.items.retain(|i| i.part_id != part_id || i.revision_id != revision_id);
             if eco.items.len() == before {
                 return Err(Error::not_found("that item"));
             }
@@ -932,10 +952,10 @@ impl Db {
             let stamp = now();
             // Releases first — each supersedes its part's older release —
             // then obsoletes, which may land on a revision just superseded.
-            let mut replaced: Vec<(String, Option<String>)> = Vec::new();
+            let mut replaced: Vec<((String, String), Option<String>)> = Vec::new();
             for item in eco.items.iter().filter(|i| i.action == EcoAction::Release) {
                 let part = state.parts.get_mut(&item.part_id).ok_or_else(|| Error::not_found("part"))?;
-                replaced.push((item.revision_id.clone(), part.current_release().map(|r| r.id.clone())));
+                replaced.push(((item.part_id.clone(), item.revision_id.clone()), part.current_release().map(|r| r.id.clone())));
                 for other in part.revisions.iter_mut() {
                     if other.id != item.revision_id && other.lifecycle == Lifecycle::Released {
                         other.lifecycle = Lifecycle::Superseded;
@@ -965,7 +985,7 @@ impl Db {
                 round.closed_at = Some(stamp);
             }
             for item in eco.items.iter_mut() {
-                if let Some((_, before)) = replaced.iter().find(|(id, _)| *id == item.revision_id) {
+                if let Some((_, before)) = replaced.iter().find(|(id, _)| *id == (item.part_id.clone(), item.revision_id.clone())) {
                     item.replaced = before.clone();
                 }
             }
@@ -1170,7 +1190,7 @@ fn item_view(
     state: &State,
     eco: &ChangeOrder,
     item: &EcoItem,
-    releasing: &BTreeSet<String>,
+    releasing: &BTreeSet<(String, String)>,
     attribute_changes: Vec<AttributeChange>,
 ) -> ItemView {
     let part = state.part(&item.part_id);

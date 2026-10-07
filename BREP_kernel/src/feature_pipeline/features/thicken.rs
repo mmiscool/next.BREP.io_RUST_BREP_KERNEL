@@ -261,6 +261,8 @@ pub fn schema() -> serde_json::Value {
     "type": "THK",
     "shortName": "THK",
     "longName": "Thicken",
+    "ribbonPath": "Home/Modeling/Thicken",
+    "commandSize": "Compact",
     "displayBuilder": false,
     "inputParamsSchema": {
         "id": {

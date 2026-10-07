@@ -123,6 +123,8 @@ pub fn schema() -> serde_json::Value {
     "type": "D",
     "shortName": "D",
     "longName": "Datium",
+    "ribbonPath": "Home/Reference/Datium",
+    "commandSize": "Large",
     "displayBuilder": true,
     "inputParamsSchema": {
         "id": {

@@ -130,12 +130,13 @@ impl EngineState {
     /// carrying its pose — nested sub-assemblies included. Without components
     /// the flat single-product writer is used, exactly as before.
     pub fn export_step_text_named(&mut self, document_name: &str) -> Result<String, String> {
+        self.plugin_export_ready()?;
         // The component projection the structured lane places instances by is
         // the one the last run shipped (post-solve poses), so nothing has to be
         // synced here; the resident re-run below registers the geometry.
         let request: HistoryRequest = serde_json::from_value(self.run_request_value())
             .map_err(|e| format!("export STEP: history request: {e}"))?;
-        let named = crate::pipeline::resident_solid_handles(&request);
+        let named = self.plugin_resident_handles(&request)?;
         // A board document's BOARD — substrate, copper, via barrels — as exact
         // solids. The viewport's board is display triangles in no registry, so
         // these are handed to the writer as values, in the ROOT product beside
@@ -162,9 +163,13 @@ impl EngineState {
             .as_ref()
             .map(|_| {
                 let _trace = crate::run_trace::span("export_pmi");
-                brep_kernel::execute_history(&request).pmi
+                self.execute_plugin_history(&request).pmi
             })
             .flatten();
+        let annotation_errors = super::plugins::plugin_annotation_errors(report.as_ref());
+        if !annotation_errors.is_empty() {
+            return Err(format!("plugin annotation export replay failed: {}", annotation_errors.join("; ")));
+        }
         let pmi = match (request.pmi.as_ref(), report.as_ref()) {
             (Some(state), Some(report)) => Some(brep_kernel::StepPmi { state, report }),
             _ => None,
@@ -222,8 +227,9 @@ impl EngineState {
                 )
             })
             .collect();
-        let mut assembly =
-            brep_kernel::assembly_export_tree(document_name, resident(&named)?, &components)?;
+        let resident = resident(&named)?;
+        let mut assembly = self.with_plugin_provider(||
+            brep_kernel::assembly_export_tree(document_name, resident, &components))?;
         // The board is a product of its own, placed in the root at identity,
         // so a receiving system's tree lists it by name (`PCB`) beside the
         // parts. As the root's own geometry it read as an unnamed compound
@@ -387,9 +393,10 @@ impl EngineState {
     /// auto-target SM.CUTOUT uses). Errs with the exact `"no sheet-metal body in
     /// the part"` when there is none, and loudly when several are ambiguous.
     fn flat_pattern_target_handle(&self) -> Result<u32, String> {
+        self.plugin_export_ready()?;
         let request: HistoryRequest = serde_json::from_value(self.run_request_value())
             .map_err(|e| format!("export flat pattern: history request: {e}"))?;
-        let sheet_metal: Vec<(String, u32)> = crate::pipeline::resident_solid_handles(&request)
+        let sheet_metal: Vec<(String, u32)> = self.plugin_resident_handles(&request)?
             .into_iter()
             .filter(|(_, handle)| brep_kernel::is_sheet_metal_handle(*handle))
             .collect();
@@ -459,9 +466,10 @@ impl EngineState {
     /// trimmed NURBS surfaces — the IGES analogue of [`Self::export_step_text`],
     /// handing the resident handles to [`brep_kernel::export_iges_handles`].
     pub fn export_iges_text(&self) -> Result<String, String> {
+        self.plugin_export_ready()?;
         let request: HistoryRequest = serde_json::from_value(self.run_request_value())
             .map_err(|e| format!("export IGES: history request: {e}"))?;
-        let handles: Vec<u32> = crate::pipeline::resident_solid_handles(&request)
+        let handles: Vec<u32> = self.plugin_resident_handles(&request)?
             .into_iter()
             .map(|(_, handle)| handle)
             .collect();
@@ -478,6 +486,7 @@ impl EngineState {
     /// crosses the same string `ModelStore` seam the STEP lane uses. Errs when the
     /// scene has no triangles.
     pub fn export_stl_text(&self) -> Result<String, String> {
+        self.plugin_export_ready()?;
         let mut out = String::from("solid brep\n");
         let mut triangles = 0usize;
         for solid in self.scene.solids() {
@@ -511,6 +520,7 @@ impl EngineState {
     /// [`brep_kernel::write_obj`]. Millimetres, like every other export lane.
     /// Errs when the scene has no triangles.
     pub fn export_obj_text(&self) -> Result<String, String> {
+        self.plugin_export_ready()?;
         let mut mesh = brep_kernel::Mesh::default();
         for solid in self.scene.solids() {
             let base = (mesh.positions.len() / 3) as u32;
@@ -584,6 +594,7 @@ impl EngineState {
     ///
     /// Errs when the scene has no triangles.
     pub fn export_glb_bytes(&self, document_name: &str) -> Result<Vec<u8>, String> {
+        self.plugin_export_ready()?;
         let colors: std::collections::BTreeMap<String, [u8; 3]> =
             self.persisted_export_colors().into_iter().collect();
         let solids: Vec<brep_kernel::GlbSolid> = self

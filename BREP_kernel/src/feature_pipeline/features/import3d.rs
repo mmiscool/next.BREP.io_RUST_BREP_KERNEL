@@ -52,20 +52,27 @@
 //! not yet migrated — it errors loudly rather than silently skipping.
 
 use crate::feature_pipeline::features::common;
-use crate::feature_pipeline::{scene_metadata, AddedSolid, FeatureContext, FeatureResult};
+use crate::feature_pipeline::{
+    scene_metadata, AddedSolid, FeatureContext, FeatureRefusal, FeatureResult,
+};
 use crate::{
-    import_iges, import_step_with_appearance, restore_solids, BodyAppearance, BrepSolid,
-    ImportedColor, COLOR_METADATA_KEY,
+    import_iges, import_step_bodies, restore_solids, BodyAppearance, BrepSolid, ImportedColor,
+    StepBodyError, COLOR_METADATA_KEY,
 };
 
 pub fn execute(ctx: &FeatureContext) -> FeatureResult {
     match build(ctx) {
         Ok(result) => result,
-        Err(error) => ctx.fail(error),
+        Err(refusal) => ctx.fail(refusal),
     }
 }
 
-fn build(ctx: &FeatureContext) -> Result<FeatureResult, String> {
+/// `FeatureRefusal`, not `String`: the STEP lane's shell-closure gate refuses a
+/// body TYPED (`RefusalClass::UnsoundResult { defect: VectorArea }`,
+/// `io/step_import/builder/closure.rs`), and the class has to reach
+/// `FeatureResult::refusal` for the app to show it as more than text. Every
+/// other failure here is still text, and `?` accepts both.
+fn build(ctx: &FeatureContext) -> Result<FeatureResult, FeatureRefusal> {
     let feature_name = if ctx.id.is_empty() {
         "IMPORT3D".to_string()
     } else {
@@ -88,18 +95,36 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, String> {
         let payload = native
             .as_str()
             .ok_or("import3d: param `nativeBrep` must be a base64 snapshot string")?;
-        return restore_native_bodies(ctx, payload);
+        return Ok(restore_native_bodies(ctx, payload)?);
     }
 
     // 1. Fresh STEP text (baked into `stepText` by the toolbar Import lane).
     if let Some(step_text) = ctx.param("stepText").and_then(|v| v.as_str()) {
         if step_text.contains("ISO-10303-21") {
-            let (solids, appearances) = import_step_with_appearance(step_text)
-                .map_err(|error| format!("import3d: STEP import failed: {error}"))?;
-            if solids.is_empty() {
+            let imported = import_step_bodies(step_text).map_err(|error| match error {
+                StepBodyError::Text(text) => {
+                    FeatureRefusal::Text(format!("import3d: STEP import failed: {text}"))
+                }
+                StepBodyError::Refused(refusal) => FeatureRefusal::Typed(
+                    refusal.with_message(|message| format!("import3d: STEP import refused: {message}")),
+                ),
+            })?;
+            if imported.solids.is_empty() {
                 return Err("import3d: STEP file contained no importable solids".into());
             }
-            return Ok(add_named_bodies(ctx, solids, &appearances, &feature_name));
+            let mut result = add_named_bodies(ctx, imported.solids, &imported.appearances, &feature_name);
+            // The closure gate's approximations ride on the feature TYPED,
+            // re-keyed from the file index to the scene name the body was
+            // just given, so the app and the case runner can name the body.
+            for (index, mut approximation) in imported.approximations {
+                if let Some(added) = result.added.get(index) {
+                    approximation.body = added.name.clone();
+                    approximation.message =
+                        format!("{}: {}", added.name, approximation.message);
+                }
+                result.approximations.push(approximation);
+            }
+            return Ok(result);
         }
         return Err(
             "import3d: only STEP (ISO-10303-21) files are supported (STL/3MF mesh import was removed)"
@@ -140,7 +165,8 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, String> {
         }
         return Err(format!(
             "import3d: unsupported importCache kind '{kind}' (only 'step-brep')"
-        ));
+        )
+        .into());
     }
 
     // A failed-import retry payload without a cache is a not-yet-migrated lane.
@@ -417,6 +443,8 @@ pub fn schema() -> serde_json::Value {
     "type": "IMPORT3D",
     "shortName": "IMPORT3D",
     "longName": "Import 3D Model",
+    "ribbonPath": "Home/Modeling/Import 3D Model",
+    "commandSize": "Compact",
     "displayBuilder": false,
     "inputParamsSchema": {
         "id": {

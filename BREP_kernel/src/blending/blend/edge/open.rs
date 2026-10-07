@@ -10,16 +10,23 @@ pub fn blend_open_edge(
     chamfer: bool,
     name: Option<&str>,
 ) -> Result<BrepSolid, KernelRefusal> {
+    // One blend operation: the reports of an earlier one, never consumed, are
+    // dropped as it starts (nested calls keep this operation's).
+    let _operation = crate::blend::BlendOperation::enter();
     if !(radius > 0.0) || !radius.is_finite() {
         return Err(KernelRefusal::input(KernelStage::Collect, "radius", "blend: radius must be positive"));
     }
-    blend_open_edge_impl(solid, edge_id, &|_| radius, chamfer, name)
+    blend_open_edge_impl(solid, edge_id, &|_| radius, Some(radius), chamfer, name)
 }
 
+/// `constant`: the radius when the blend came in through a CONSTANT-radius
+/// entry point (`blend_open_edge`), `None` for a variable profile — the only
+/// provenance on which the wall is judged against one rolling ball.
 pub(super) fn blend_open_edge_impl(
     solid: &BrepSolid,
     edge_id: u64,
     radius_at: &dyn Fn(f64) -> f64,
+    constant: Option<f64>,
     chamfer: bool,
     name: Option<&str>,
 ) -> Result<BrepSolid, KernelRefusal> {
@@ -77,16 +84,35 @@ pub(super) fn blend_open_edge_impl(
             ep
         );
     }
-    let compute = |overshoot_fraction: f64| -> Result<(FittedRows, Vec<EndSurgery>, bool), KernelRefusal> {
+    // The rung's MEASUREMENT (before anything is built on it), over what it
+    // ships: each rail against its carrier's extension over its own crossing
+    // window (`rails_on_shipped_windows`, at the network lane's rail bar, half
+    // `intersection_fit`), and a constant-radius FILLET's wall over those
+    // windows' envelope against the rolling ball's own sweep (the declared
+    // reader the chains use, at `intersection_fit`).
+    let rail_bar = 0.5 * crate::KernelTolerances::for_solid(solid, 1e-7).intersection_fit;
+    let wall_bar = crate::KernelTolerances::for_solid(solid, 1e-7).intersection_fit;
+    let model = crate::KernelTolerances::for_solid(solid, 1e-7).model;
+    // Constant-radius PROVENANCE (the entry point), never sampled constancy:
+    // a variable profile can agree at any finite set of samples.
+    let wall_radius = constant.filter(|radius| radius.is_finite() && *radius > 0.0);
+    let wall_check = !chamfer && wall_radius.is_some() && crate::blend::station_refinement_on();
+    let compute = |overshoot_fraction: f64, station_count: usize| -> Result<(FittedRows, Vec<EndSurgery>, bool, OpenRungReading), KernelRefusal> {
         // The open-edge surgery locates its ends by support crossings, not by
         // the marched vertex stations; the snapped indices only break the fit
         // where the carriers' extension starts (`fit_open_rows`).
-        let (stations, vertex_indices) = march_open_stations(
+        let (stations, vertex_indices, refinement, dense) = march_open_stations_core(
             edge,
             &first_mate,
             &second_mate,
             radius_at,
             overshoot_fraction,
+            [edge.t0, edge.t1],
+            station_count,
+            [false, false],
+            [false, false],
+            crate::blend::station_refinement_on().then_some(rail_bar),
+            if wall_check { OPEN_WALL_CENTRES } else { 0 },
         )?;
         let parameters = station_parameters(&stations);
         let rows = fit_open_rows(
@@ -123,7 +149,46 @@ pub(super) fn blend_open_edge_impl(
             in_range &= side_in_range;
             ends.push(end);
         }
-        Ok((rows, ends, in_range))
+        // The measurement covers what SHIPS: each rail over its own crossing
+        // window (the `cr`/`cs` parameters `build_open_surgery` trims it to,
+        // any retained overshoot included), and the wall over the envelope of
+        // both windows -- not merely between the vertex stations.
+        let windows = [
+            shipped_window(&parameters, ends[0].cr_parameter, ends[1].cr_parameter),
+            shipped_window(&parameters, ends[0].cs_parameter, ends[1].cs_parameter),
+        ];
+        let (rails, rail_samples) =
+            rails_on_shipped_windows(&rows, &parameters, &stations, [&first_mate.face.surface, &second_mate.face.surface], windows);
+        let walls = match (wall_check, windows) {
+            (false, _) => Vec::new(),
+            (true, [Some(first), Some(second)]) => open_wall_readings_why(
+                &rows,
+                &parameters,
+                &stations,
+                [first[0].min(second[0]), first[1].max(second[1])],
+                &dense,
+                wall_radius.unwrap_or(f64::NAN),
+            ),
+            // No shipped window to read: no wall coverage, never acceptance.
+            (true, _) => vec![Err("no shipped window to read".to_string())],
+        };
+        let first_unread = walls.iter().find_map(|wall| wall.as_ref().err().cloned());
+        let walls: Vec<Option<f64>> = if wall_check && windows.iter().any(|window| window.is_none()) {
+            Vec::new()
+        } else {
+            walls.into_iter().map(|wall| wall.ok()).collect()
+        };
+        let reading = OpenRungReading {
+            station_count,
+            stations: stations.len(),
+            rails,
+            rail_samples,
+            walls,
+            first_unread,
+            refine_exit: refinement.exit,
+            inserted: refinement.inserted,
+        };
+        Ok((rows, ends, in_range, reading))
     };
 
     // Radius-aware seeded first attempt (occt-filleting-system-study §6(b)
@@ -172,32 +237,38 @@ pub(super) fn blend_open_edge_impl(
     // the blind ladder below runs exactly as before (including its
     // fallback-to-first-Ok semantics), so the seed can improve the first
     // landing but never change the fallback behaviour.
-    let mut chosen: Option<(FittedRows, Vec<EndSurgery>)> = None;
+    let choose = |station_count: usize| -> Result<(FittedRows, Vec<EndSurgery>, OpenRungReading), KernelRefusal> {
+    let mut chosen: Option<(FittedRows, Vec<EndSurgery>, OpenRungReading)> = None;
     let mut last_error: Option<KernelRefusal> = None;
+    // A wall that FOLDS is the shape's answer, not this rung's: every wider
+    // overshoot marches the same centre curve through the same bend, so the
+    // ladder is left at the first fold rather than re-proving it four times.
     if let Some(fraction) = seeded_fraction {
-        match compute(fraction) {
-            Ok((rows, ends, true)) => chosen = Some((rows, ends)),
+        match compute(fraction, station_count) {
+            Ok((rows, ends, true, reading)) => chosen = Some((rows, ends, reading)),
             Ok(_) => {}
+            Err(error) if crate::blend::is_wall_fold(&error) => return Err(error),
             Err(error) => last_error = Some(error),
         }
     }
     if chosen.is_none() {
         for &overshoot_fraction in &[0.08f64, 0.16, 0.28, 0.45] {
-            match compute(overshoot_fraction) {
-                Ok((rows, ends, in_range)) => {
+            match compute(overshoot_fraction, station_count) {
+                Ok((rows, ends, in_range, reading)) => {
                     let fallback = chosen.is_none();
                     if in_range {
-                        chosen = Some((rows, ends));
+                        chosen = Some((rows, ends, reading));
                         break;
                     } else if fallback {
-                        chosen = Some((rows, ends));
+                        chosen = Some((rows, ends, reading));
                     }
                 }
+                Err(error) if crate::blend::is_wall_fold(&error) => return Err(error),
                 Err(error) => last_error = Some(error),
             }
         }
     }
-    let (rows, ends) = chosen.ok_or_else(|| {
+    chosen.ok_or_else(|| {
         last_error.unwrap_or_else(|| {
             KernelRefusal::internal(
                 KernelStage::Refine,
@@ -205,7 +276,118 @@ pub(super) fn blend_open_edge_impl(
                 "blend: open march failed at every overshoot",
             )
         })
-    })?;
+    })
+    };
+    // The LADDER: the open march's existing budget — STATIONS doubling to
+    // MAX_OPEN_STATIONS, each rung with its local refinement (REFINE_ROUNDS,
+    // REFINE_STATION_FACTOR) against the rail bar — climbed until a rung is
+    // ACCEPTED (rails and wall inside their bars), then, for a plain fillet,
+    // further toward `model` on the wall. A rung the request climbs to that
+    // fails acceptance is not taken: the accepted rung ships and says so,
+    // typed. A ladder that never accepts ships its top rung with a named note,
+    // as the network lane's open march does (a body that built before is not
+    // turned into a refusal here) -- but it is NOT an accepted rung: it ships
+    // with a typed `blend.wall_acceptance` report of its measured deficit.
+    // Acceptance is stated positively: every reading present, finite and
+    // inside its bar (a NaN or an empty coverage never passes).
+    let accepts = |reading: &OpenRungReading| {
+        reading.rails_read()
+            && reading.rails <= rail_bar
+            && (!wall_check || reading.worst_wall().is_some_and(|wall| wall <= wall_bar))
+    };
+    let meets_model = |reading: &OpenRungReading| reading.worst_wall().is_some_and(|wall| wall <= model);
+    let mut station_count = STATIONS;
+    let mut accepted: Option<(FittedRows, Vec<EndSurgery>, OpenRungReading)> = None;
+    // The top rung of a ladder that NEVER accepted: shipped as built, kept
+    // apart from `accepted` so it is never reported as an accepted parent.
+    let mut unaccepted: Option<(FittedRows, Vec<EndSurgery>, OpenRungReading)> = None;
+    let mut request_rungs = 0usize;
+    let mut unmet: Option<crate::BudgetReason> = None;
+    loop {
+        // A rung climbed to after acceptance is a request rung ATTEMPTED,
+        // whatever it returns.
+        if accepted.is_some() {
+            request_rungs += 1;
+        }
+        let chosen = choose(station_count);
+        let (rows, ends, reading) = match chosen {
+            Ok(chosen) => chosen,
+            // A request rung that cannot be built: the accepted rung stands.
+            Err(_) if accepted.is_some() => {
+                unmet = Some(crate::BudgetReason::Incoherent);
+                break;
+            }
+            Err(error) => return Err(error),
+        };
+        #[cfg(not(test))]
+        let reject_request = false;
+        crate::blend::carve::carve_trace(format_args!(
+            "blend open edge {}: {} stations a rung ({} in all), rails {:.3e} (bar {rail_bar:.3e}), wall {:.3e} (bar {wall_bar:.3e}){}",
+            edge.id, reading.station_count, reading.stations, reading.rails,
+            reading.worst_wall().unwrap_or(f64::INFINITY),
+            if accepted.is_some() { ", a request rung" } else { "" }
+        ));
+        let accepted_now = accepts(&reading) && !reject_request;
+        if accepted.is_none() {
+            if accepted_now {
+                let met = !wall_check || meets_model(&reading);
+                accepted = Some((rows, ends, reading));
+                if met {
+                    break;
+                }
+            } else if station_count < MAX_OPEN_STATIONS {
+                station_count *= 2;
+                continue;
+            } else {
+                crate::blend::record_blend_note(format!(
+                    "blend: open edge {} at {} stations a rung ({} in all) — the top of the open march's \
+                     ladder — still leaves its rails {:.3e} from their carriers (bar {rail_bar:.3e}) or its \
+                     wall off the rolling ball (bar {wall_bar:.3e}); the wall ships as built, unaccepted",
+                    edge.id, reading.station_count, reading.stations, reading.rails
+                ));
+                unaccepted = Some((rows, ends, reading));
+                break;
+            }
+        } else {
+            if !accepted_now {
+                unmet = Some(crate::BudgetReason::Rejected);
+                break;
+            }
+            let met = meets_model(&reading);
+            accepted = Some((rows, ends, reading));
+            if met {
+                unmet = None;
+                break;
+            }
+        }
+        // Accepted, short of `model`: one more rung if the budget allows.
+        if station_count < MAX_OPEN_STATIONS {
+            station_count *= 2;
+        } else {
+            unmet = Some(crate::BudgetReason::StationCeiling);
+            break;
+        }
+    }
+    let (shipped_accepted, (rows, ends, reading)) = match (accepted, unaccepted) {
+        (Some(rung), _) => (true, rung),
+        (None, Some(rung)) => (false, rung),
+        (None, None) => {
+            return Err(KernelRefusal::internal(KernelStage::Refine, "open_ladder", "blend: the open ladder ended without a rung"));
+        }
+    };
+    // What the shipped wall owes, typed: an UNACCEPTED rung its measured
+    // acceptance deficit (or that a reading could not be taken); an accepted
+    // fillet short of `model` its construction request.
+    let report: Option<(crate::BudgetReason, f64, f64, String)> = if !shipped_accepted {
+        Some(acceptance_deficit(&reading, rail_bar, wall_bar, wall_check, reading.rails_read(), "no rung of the open ladder was accepted"))
+    } else if wall_check && !meets_model(&reading) {
+        let reason = unmet.unwrap_or(crate::BudgetReason::StationCeiling);
+        // An accepted rung's every wall interval was read (acceptance needs it).
+        let declared = reading.worst_wall().unwrap_or(f64::INFINITY);
+        Some((reason, model, declared, String::new()))
+    } else {
+        None
+    };
 
     let [start_end, finish_end] = match <[EndSurgery; 2]>::try_from(ends) {
         Ok(pair) => pair,
@@ -230,9 +412,402 @@ pub(super) fn blend_open_edge_impl(
         name,
     )?;
     prune_orphan_vertices(&mut result);
+    // Extended end boundaries can leave a finite planar chart. Rebuild those
+    // charts before validating the surgery, rather than rejecting a correct
+    // edge because its projected pcurve was clamped to the old rectangle.
+    crate::blend::fit_planar_charts_to_trims(solid, &mut result)?;
     check_snap_closure(solid, &result, sewn.snap)?;
-    crossings.gate(result)
+    let built = crossings.gate(result)?;
+    // The wall AS SEWN: the surgery may transpose the face (an exact
+    // extrusion), and a report is matched to its face by exact surface.
+    let sewn_surface = built
+        .shells
+        .iter()
+        .flat_map(|shell| &shell.faces)
+        .find(|face| face.id == sewn.blend_face_id)
+        .map(|face| face.surface.clone())
+        .ok_or(KernelRefusal::internal(KernelStage::Sew, "open_blend_face", "blend: the sewn open blend face is not in the built body"))?;
+    // A wall that SHIPS unaccepted, or short of its construction request,
+    // says so, typed, on the built body's wall (exact name and sewn surface).
+    if let Some((reason, bar, measured, deficit)) = report {
+        // The budget is the open march's GLOBAL station ladder (STATIONS
+        // doubling to MAX_OPEN_STATIONS), not local rounds: for a request,
+        // the rungs ATTEMPTED past the accepted one (a refused one included);
+        // for an unaccepted rung, the rungs climbed past the first. Each rung
+        // also ran its own local rail refinement, named in the detail.
+        let rungs_used = if shipped_accepted { request_rungs } else { (reading.station_count / STATIONS).trailing_zeros() as usize };
+        let mut detail = format!(
+            "the shipped rung's local rail refinement ended {:?} with {} stations inserted",
+            reading.refine_exit, reading.inserted
+        );
+        if !deficit.is_empty() {
+            detail = format!("{deficit}; {detail}");
+        }
+        crate::blend::record_wall_model_report(crate::blend::WallModelReport {
+            name: name.map(str::to_string),
+            surface: sewn_surface,
+            request: bar,
+            residual: measured,
+            detail: Some(detail),
+            budget: crate::ApproximationBudget {
+                reason,
+                rounds_used: rungs_used,
+                rounds_limit: OPEN_REQUEST_RUNGS,
+                stations: reading.stations,
+                station_limit: REFINE_STATION_FACTOR * (MAX_OPEN_STATIONS + 1),
+                mechanism: crate::BudgetMechanism::StationRungs,
+                measured_component: crate::MeasuredComponent::Wall,
+                unread: 0,
+            },
+        });
+    }
+    Ok(built)
 }
+
+/// An UNACCEPTED shipped rung's deficit, typed: `Unread` when any reading
+/// acceptance needs could not be taken (a non-finite rail, an empty shipped
+/// window, an unread or missing wall interval), else `Unaccepted`; the
+/// measured value and its bar are the readable component worst against its
+/// bar (rails against `rail_bar`, the wall against `wall_bar`; 0 against
+/// `rail_bar` when nothing could be read), always finite. The text names both
+/// readings against their bars, after `what` (what failed acceptance: the
+/// open ladder's every rung, or a network stripe's shipped windows).
+/// `rails_read` is the caller's verdict on whether the rails were READ (the
+/// open lane: [`OpenRungReading::rails_read`]; a network stripe also counts a
+/// validated collapsed rail as read with no samples).
+pub(in crate::blend) fn acceptance_deficit(
+    reading: &OpenRungReading,
+    rail_bar: f64,
+    wall_bar: f64,
+    wall_check: bool,
+    rails_read: bool,
+    what: &str,
+) -> (crate::BudgetReason, f64, f64, String) {
+    let rails = (rails_read && reading.rails.is_finite() && reading.rails >= 0.0).then_some(reading.rails);
+    let wall = if wall_check { reading.worst_wall() } else { None };
+    let unread = rails.is_none() || (wall_check && wall.is_none());
+    let mut worst = (0.0_f64, rail_bar);
+    for (value, bar) in [(rails, rail_bar), (wall, wall_bar)] {
+        if let Some(value) = value {
+            if value / bar > worst.0 / worst.1 {
+                worst = (value, bar);
+            }
+        }
+    }
+    let rail_text = match rails {
+        Some(value) => format!("rails {value:.3e} from their carriers (bar {rail_bar:.3e})"),
+        None => format!(
+            "rails UNREAD ({:?} over {} + {} samples) against bar {rail_bar:.3e}",
+            reading.rails, reading.rail_samples[0], reading.rail_samples[1]
+        ),
+    };
+    let wall_text = match (wall_check, wall) {
+        (false, _) => "the wall not judged (no constant-radius fillet provenance)".to_string(),
+        (true, Some(value)) => format!("wall {value:.3e} off the rolling ball (bar {wall_bar:.3e})"),
+        (true, None) => format!(
+            "wall UNREAD on {} of {} intervals against bar {wall_bar:.3e}{}",
+            reading.walls.iter().filter(|wall| !matches!(wall, Some(value) if value.is_finite())).count(),
+            reading.walls.len(),
+            reading.first_unread.as_deref().map(|why| format!(" (first: {why})")).unwrap_or_default()
+        ),
+    };
+    let reason = if unread { crate::BudgetReason::Unread } else { crate::BudgetReason::Unaccepted };
+    (reason, worst.1, worst.0, format!("{what}: {rail_text}, {wall_text}"))
+}
+
+/// Section probes per open wall interval (k/8 of the section), and centres
+/// per interval (probes at the even ones), as the chains read their walls.
+const OPEN_WALL_SECTIONS: usize = 8;
+pub(in crate::blend) const OPEN_WALL_CENTRES: usize = 32;
+/// The rungs the construction request may climb past the first accepted one:
+/// the open march's own ladder, STATIONS doubling to MAX_OPEN_STATIONS.
+pub(in crate::blend) const OPEN_REQUEST_RUNGS: usize = (MAX_OPEN_STATIONS / STATIONS).trailing_zeros() as usize;
+
+/// One open rung's measurement over what it SHIPS: its rung, its station
+/// count (refinement included), the rails' worst distance from their
+/// carriers over each rail's own crossing window and the samples read on
+/// each (0: no window), each wall interval's declared reading (`None`:
+/// unreadable) over the windows' envelope, and how the rung's own LOCAL rail
+/// refinement ended (its exit and the stations it inserted).
+#[derive(Clone, Debug)]
+pub(in crate::blend) struct OpenRungReading {
+    pub(in crate::blend) station_count: usize,
+    pub(in crate::blend) stations: usize,
+    pub(in crate::blend) rails: f64,
+    pub(in crate::blend) rail_samples: [usize; 2],
+    pub(in crate::blend) walls: Vec<Option<f64>>,
+    /// The first unread wall interval and why (diagnostic; `None` when every
+    /// interval read or the wall was not judged).
+    pub(in crate::blend) first_unread: Option<String>,
+    pub(in crate::blend) refine_exit: crate::blend::stations::StationRefineExit,
+    pub(in crate::blend) inserted: usize,
+}
+
+impl OpenRungReading {
+    /// Every rail READ: a finite, nonnegative worst distance from samples on
+    /// both rails' shipped windows. A NaN, an infinity (an unreadable foot)
+    /// or an empty window is never a reading.
+    pub(in crate::blend) fn rails_read(&self) -> bool {
+        self.rails.is_finite() && self.rails >= 0.0 && self.rail_samples.iter().all(|&samples| samples > 0)
+    }
+
+    /// Every wall interval READ (and at least one): `None` when any is not.
+    pub(in crate::blend) fn worst_wall(&self) -> Option<f64> {
+        if self.walls.is_empty() {
+            return None;
+        }
+        self.walls.iter().try_fold(0.0_f64, |worst, wall| match wall {
+            Some(declared) if declared.is_finite() && *declared >= 0.0 => Some(worst.max(*declared)),
+            _ => None,
+        })
+    }
+}
+
+/// The shipped window `[low, high]` of one rail between its two crossing
+/// parameters, within the rows' parameters (the surgery refuses a crossing
+/// outside them; the reading only never indexes past them). `None` when the
+/// window is empty or not finite: nothing ships there that could be read.
+pub(in crate::blend) fn shipped_window(parameters: &[f64], a: f64, b: f64) -> Option<[f64; 2]> {
+    let (&first, &last) = (parameters.first()?, parameters.last()?);
+    let (low, high) = (a.min(b).max(first), a.max(b).min(last));
+    (low.is_finite() && high.is_finite() && low < high).then_some([low, high])
+}
+
+/// The station interval holding `u` and `u`'s fraction of it.
+fn interval_at(parameters: &[f64], u: f64) -> Option<(usize, f64)> {
+    let last = parameters.len().checked_sub(2)?;
+    let interval = parameters.partition_point(|&parameter| parameter <= u).saturating_sub(1).min(last);
+    let (from, to) = (parameters[interval], parameters[interval + 1]);
+    (to > from).then(|| (interval, ((u - from) / (to - from)).clamp(0.0, 1.0)))
+}
+
+/// Each shipped rail's worst distance from its carrier over ITS OWN window
+/// ([`shipped_window`]): both window ends exactly and the quarter points of
+/// every station span inside it, each against the carrier's EXTENSION
+/// (`extended_foot_distance`, seeded by the stations' own contact uv) --
+/// a finite planar chart clamps its projection, so retained overshoot past a
+/// vertex would read a miss that is not there. `(worst, samples per rail)`;
+/// any unreadable sample (a failed evaluation, an infinite foot) makes the
+/// worst NaN, which [`OpenRungReading::rails_read`] never admits.
+pub(in crate::blend) fn rails_on_shipped_windows(
+    rows: &FittedRows,
+    parameters: &[f64],
+    stations: &[Station],
+    carriers: [&NurbsSurface; 2],
+    windows: [Option<[f64; 2]>; 2],
+) -> (f64, [usize; 2]) {
+    let mut worst = 0.0_f64;
+    let mut samples = [0usize; 2];
+    for (side, (rail, carrier)) in [(&rows.cr, carriers[0]), (&rows.cs, carriers[1])].into_iter().enumerate() {
+        let Some([low, high]) = windows[side] else { continue };
+        let mut at = vec![low, high];
+        for pair in parameters.windows(2) {
+            for fraction in [0.25, 0.5, 0.75] {
+                let u = pair[0] + (pair[1] - pair[0]) * fraction;
+                if u > low && u < high {
+                    at.push(u);
+                }
+            }
+        }
+        for u in at {
+            let off = interval_at(parameters, u)
+                .and_then(|(interval, fraction)| {
+                    let (left, right) = (&stations[interval], &stations[interval + 1]);
+                    let (a, b) = if side == 0 { (left.uv1, right.uv1) } else { (left.uv2, right.uv2) };
+                    let seed = [a[0] + fraction * (b[0] - a[0]), a[1] + fraction * (b[1] - a[1])];
+                    let point = rail.evaluate(u).ok()?;
+                    crate::blend::stations::extended_foot_distance(carrier, point, seed).ok()
+                })
+                .filter(|off| off.is_finite())
+                .unwrap_or(f64::NAN);
+            samples[side] += 1;
+            if !worst.is_nan() && (off.is_nan() || off > worst) {
+                worst = off;
+            }
+        }
+    }
+    (worst, samples)
+}
+
+/// The JUNCTION stencil across the station between interval `left` and
+/// `left + 1`: `left_nodes` (33 exact centres of `left`) from node 16 to 32,
+/// then `right_nodes` (33 of `left + 1`) from node 1 to 16, the shared
+/// station at node 16. Its native abscissae come from `station_ts` (the
+/// edge parameters the centres were solved at): `None` when the two native
+/// widths are bitwise equal -- uniform nodes, read by the ordinary reader --
+/// else each node's t, interior nodes by the dense solves' own arithmetic
+/// t_i + (t_{i+1} − t_i)·j/32 and the shared station at its STORED t. Err
+/// when a station t is not finite or a width is not strictly positive.
+pub(in crate::blend) fn junction_stencil(
+    left_nodes: &[Vec3],
+    right_nodes: &[Vec3],
+    station_ts: &[f64],
+    left: usize,
+) -> Result<(Vec<Vec3>, Option<Vec<f64>>), String> {
+    let half = OPEN_WALL_CENTRES / 2;
+    if left_nodes.len() != OPEN_WALL_CENTRES + 1 || right_nodes.len() != OPEN_WALL_CENTRES + 1 || left + 2 >= station_ts.len() {
+        return Err(format!("interval {left}: junction needs two {}-node intervals and their three station parameters", OPEN_WALL_CENTRES + 1));
+    }
+    let (t0, t1, t2) = (station_ts[left], station_ts[left + 1], station_ts[left + 2]);
+    let (w_left, w_right) = (t1 - t0, t2 - t1);
+    if !(t0.is_finite() && t1.is_finite() && t2.is_finite() && w_left > 0.0 && w_right > 0.0 && w_left.is_finite() && w_right.is_finite()) {
+        return Err(format!("interval {left}: junction station parameters {t0}, {t1}, {t2} are not finite and strictly increasing"));
+    }
+    let nodes: Vec<Vec3> = left_nodes[half..].iter().chain(&right_nodes[1..=half]).copied().collect();
+    if w_left.to_bits() == w_right.to_bits() {
+        return Ok((nodes, None));
+    }
+    let abscissae: Vec<f64> = (half..=OPEN_WALL_CENTRES)
+        .map(|j| if j == OPEN_WALL_CENTRES { t1 } else { t0 + w_left * j as f64 / OPEN_WALL_CENTRES as f64 })
+        .chain((1..=half).map(|j| t1 + w_right * j as f64 / OPEN_WALL_CENTRES as f64))
+        .collect();
+    Ok((nodes, Some(abscissae)))
+}
+
+/// One wall probe on a stencil: the ordinary uniform reader when it has no
+/// native abscissae (an interval's own nodes, or a junction of equal native
+/// widths), the native-abscissa reader when it has them.
+pub(in crate::blend) fn read_on_stencil(point: Vec3, nodes: &[Vec3], abscissae: Option<&[f64]>, step: usize, radius: f64) -> Result<(f64, f64), String> {
+    match abscissae {
+        None => crate::blend::chain::declared_wall_probe_why(point, nodes, step, radius),
+        Some(ts) => crate::blend::chain::declared_wall_probe_at_why(point, nodes, ts, step, radius),
+    }
+}
+
+/// Every interval's largest DECLARED wall reading (`chain::declared_wall_probe`,
+/// reading + uncertainty) on the open fillet `rows`, against the exact ball
+/// centres the march solved at j/32 of each interval ([`OpenDenseCentres`]),
+/// or, for each unread interval, WHY: its station
+/// interval and which component failed (no dense row, a dense row of the
+/// wrong size, an exact centre the march did not solve, a wall point the
+/// surface would not evaluate, a probe the declared reader declined, no probe
+/// in the shipped part, or a non-finite reading). The cause is diagnostic.
+///
+/// Read on the DECLARED SHIPPED REGION `window` only: an interval it overlaps
+/// is probed at its even stencil fractions that lie inside the window and at
+/// each window end inside the interval; a probe outside the window is not on
+/// the shipped wall and is not read. A window END whose nearest even stencil
+/// node falls outside 2..=30 -- an end within a node of the interval's own
+/// station, as the original bore's shipped spans were, 1e-16 from their
+/// vertex stations -- has its foot at the interval's end node, where
+/// [`crate::blend::chain::declared_wall_probe`] cannot read (the stencil
+/// cannot follow a foot out of its own interval). It is read on a JUNCTION
+/// stencil instead: the neighbouring interval's last half and this one's
+/// first half (or this one's last half and the next one's first), the same
+/// exact centres meeting at the shared station, with the probe at its
+/// middle node. Two intervals of unequal native width (local insertions)
+/// give the junction unequal node spacing, so it is then read by the
+/// native-abscissa reader (`chain::declared_wall_probe_at_why`) on the
+/// edge parameters the centres were solved at; of equal width, by the
+/// ordinary reader. With no neighbour it is read as before.
+pub(in crate::blend) fn open_wall_readings_why(
+    rows: &FittedRows,
+    parameters: &[f64],
+    stations: &[Station],
+    window: [f64; 2],
+    dense: &OpenDenseCentres,
+    radius: f64,
+) -> Vec<Result<f64, String>> {
+    let intervals = parameters.len().saturating_sub(1);
+    let overlapped: Vec<usize> =
+        (0..intervals).filter(|&interval| parameters[interval + 1] > window[0] && parameters[interval] < window[1]).collect();
+    let Ok([v_low, v_high]) = rows.surface.domain_v() else {
+        return overlapped.iter().map(|interval| Err(format!("interval {interval}: wall surface v domain unreadable"))).collect();
+    };
+    // The exact centres of one interval at j/32, its stations at both ends.
+    let nodes_of = |interval: usize| -> Result<Vec<Vec3>, String> {
+        let inner = dense.centres.get(interval).ok_or_else(|| format!("interval {interval}: no dense centre row"))?;
+        if dense.subdivisions != OPEN_WALL_CENTRES || inner.len() + 1 != OPEN_WALL_CENTRES {
+            return Err(format!("interval {interval}: dense row {} centres at {} subdivisions", inner.len(), dense.subdivisions));
+        }
+        let mut centres = Vec::with_capacity(OPEN_WALL_CENTRES + 1);
+        centres.push(stations[interval].center);
+        for (j, centre) in inner.iter().enumerate() {
+            centres.push(centre.ok_or_else(|| format!("interval {interval}: exact centre {} of {OPEN_WALL_CENTRES} unsolved", j + 1))?);
+        }
+        centres.push(stations[interval + 1].center);
+        Ok(centres)
+    };
+    let half = OPEN_WALL_CENTRES / 2;
+    // The junction stencil across the station between `left` and `left + 1`:
+    // left's nodes half..=32, then right's nodes 1..=half; the station is node
+    // `half`. With each node's NATIVE abscissa (the edge parameter its exact
+    // centre was solved at, `OpenDenseCentres::station_ts`), and `None` when
+    // the two intervals' native widths are bitwise equal: the nodes are then
+    // uniform and the ordinary reader reads them, bit for bit.
+    let junction = |left: usize| -> Result<(Vec<Vec3>, Option<Vec<f64>>), String> {
+        if dense.station_ts.len() != parameters.len() {
+            return Err(format!("interval {left}: junction without the native station parameters"));
+        }
+        junction_stencil(&nodes_of(left)?, &nodes_of(left + 1)?, &dense.station_ts, left)
+    };
+    overlapped
+        .into_iter()
+        .map(|interval| -> Result<f64, String> {
+            let centres = nodes_of(interval)?;
+            let (from, to) = (parameters[interval], parameters[interval + 1]);
+            let inside = |u: f64| u >= window[0] && u <= window[1];
+            // (u, stencil node, the stencil: None = this interval's own;
+            // a junction's nodes with its native abscissae when unequal).
+            let mut probes: Vec<(f64, usize, Option<(Vec<Vec3>, Option<Vec<f64>>)>)> = (2..OPEN_WALL_CENTRES)
+                .step_by(2)
+                .map(|step| (from + (to - from) * step as f64 / OPEN_WALL_CENTRES as f64, step))
+                .filter(|(u, _)| inside(*u))
+                .map(|(u, step)| (u, step, None))
+                .collect();
+            for end in window {
+                if end > from && end < to {
+                    let fraction = (end - from) / (to - from);
+                    let nearest = 2 * ((fraction * OPEN_WALL_CENTRES as f64 / 2.0).round() as usize);
+                    #[cfg(not(test))]
+                    let junction_off = false;
+                    if junction_off {
+                        probes.push((end, nearest.clamp(2, OPEN_WALL_CENTRES - 2), None));
+                    } else if nearest < 2 && interval > 0 {
+                        probes.push((end, half, Some(junction(interval - 1)?)));
+                    } else if nearest > OPEN_WALL_CENTRES - 2 && interval + 1 < intervals {
+                        probes.push((end, half, Some(junction(interval)?)));
+                    } else {
+                        probes.push((end, nearest.clamp(2, OPEN_WALL_CENTRES - 2), None));
+                    }
+                }
+            }
+            if probes.is_empty() {
+                return Err(format!("interval {interval}: no probe in its shipped part of [{:.17}, {:.17}]", window[0], window[1]));
+            }
+            let mut declared = 0.0_f64;
+            for (u, step, stencil) in probes {
+                let (nodes, abscissae, what) = match &stencil {
+                    Some((nodes, None)) => (nodes, None, "junction"),
+                    Some((nodes, Some(ts))) => (nodes, Some(ts), "native-abscissa junction"),
+                    None => (&centres, None, "interval"),
+                };
+                for k in 1..OPEN_WALL_SECTIONS {
+                    let v = v_low + (v_high - v_low) * k as f64 / OPEN_WALL_SECTIONS as f64;
+                    let point = rows.surface.evaluate(u, v).map_err(|error| format!("interval {interval}: wall point (u {u:.9}, v {v:.6}) unreadable: {error}"))?;
+                    // The interval's own stencil reads from the probe's node,
+                    // then (declined) from where its fraction reaches along the
+                    // centre path (a stationary section); a junction keeps its
+                    // own dispatch.
+                    let read = if stencil.is_none() {
+                        crate::blend::chain::declared_wall_probe_located_why(point, nodes, step, (u - from) / (to - from), radius)
+                    } else {
+                        read_on_stencil(point, nodes, abscissae.map(|ts| ts.as_slice()), step, radius)
+                    };
+                    let (reading, uncertainty) = read.map_err(|why| {
+                        format!(
+                            "interval {interval}: declared reader declined probe node {step} of the {what} stencil, section {k}/{OPEN_WALL_SECTIONS} \
+                             (u {u:.17}): {why}"
+                        )
+                    })?;
+                    declared = declared.max(reading + uncertainty);
+                }
+            }
+            if declared.is_finite() { Ok(declared) } else { Err(format!("interval {interval}: non-finite reading {declared}")) }
+        })
+        .collect()
+}
+
 
 /// A fresh id allocator seeded past the vertex, edge, face, loop and coedge IDs.
 /// Solid and shell IDs are outside this allocation domain. Shared by
@@ -267,6 +842,19 @@ pub(in crate::blend) fn fresh_id_source(solid: &BrepSolid) -> impl FnMut() -> u6
         next_id += 1;
         id
     }
+}
+
+
+/// May a declined support refit fall back on the march's own trim pcurve?
+/// Only when that trim, read independently as shipped
+/// (`read_shipped_pcurve`: miss, rail standoff, samples, worst), meets the
+/// floor ON its rail's branch: its miss PLUS the rail's standoff from the
+/// carrier at the trim's foot within `floor`. A trim on another branch of the
+/// carrier tracks its own foot perfectly (miss 0) while that foot stands far
+/// off the rail, so a miss alone would ship it; an unreadable trim never
+/// stands.
+pub(in crate::blend) fn march_trim_stands(read: &Result<(f64, f64, usize, f64), KernelRefusal>, floor: f64) -> bool {
+    matches!(read, Ok((miss, standoff, _, _)) if *miss + *standoff <= floor)
 }
 
 /// Sew ONE stripe into `result`.
@@ -363,21 +951,120 @@ pub(in crate::blend) fn build_open_surgery(
             )));
         }
     }
+    // The support pcurve the rows carry interpolates the stations' (u, v) and
+    // is read nowhere between them: on the 20-degree crossing's notched open
+    // exit arc it stood 2.98e-5 off the rail it trims (q1 = 9cd8c3163 + the
+    // section-fit fix, read against the exact cylinders). Inside the crossing
+    // window — on the face, never on a carrier's extension — it is refitted
+    // to the trimmed rail's own projected track at the pcurve floor and read
+    // again as shipped (`refit_closed_support_pcurve`, the closed edge's).
+    // A rail that overruns a PLANE carrier's chart (the rib-base fin top's
+    // rails run 0.303 past it) is on the plane's extension, which the chart
+    // clamps: there the refit and both reads would measure the clamp, and the
+    // trim is instead rebuilt from its edge on the widened chart and verified
+    // at the floor by `fit_planar_charts_to_trims`, which every lane that
+    // sews these stripes runs.
     let trim_rail = |collapsed: bool,
                      row: &NurbsCurve,
                      pcurve: &NurbsCurve,
+                     surface: &NurbsSurface,
                      a: f64,
                      b: f64|
      -> Result<Option<(NurbsCurve, NurbsCurve)>, KernelRefusal> {
         if collapsed {
             return Ok(None);
         }
-        Ok(Some((trim_row(row, a, b).map_err(describe_trim)?, trim_row(pcurve, a, b)?)))
+        let rail = trim_row(row, a, b).map_err(describe_trim)?;
+        let interpolated = trim_row(pcurve, a, b)?;
+        {
+            let [d0, d1] = rail.domain().or_refuse(KernelStage::Refine, "domain")?;
+            if crate::blend::planar_chart_overrun(surface, &|t| rail.evaluate(t), d0, d1)?.is_some_and(|excursion| excursion > band) {
+                return Ok(Some((rail, interpolated)));
+            }
+        }
+        // The march's OWN trim pcurve, read independently at the rail's own
+        // parameter against the same floor (`read_shipped_pcurve`): what a
+        // declined refit may fall back to, and the standoff a refit on the
+        // rail's own branch must match.
+        let [d0, d1] = rail.domain().or_refuse(KernelStage::Refine, "domain")?;
+        let march_read = crate::blend::track_fit::read_shipped_pcurve(surface, &|t| rail.evaluate(t), &interpolated, d0, d1);
+        let floor = crate::pcurve::PCURVE_REFINEMENT_TOLERANCE;
+        let declined = |why: KernelRefusal| -> Result<Option<(NurbsCurve, NurbsCurve)>, KernelRefusal> {
+            // Kept ONLY when the march's trim stands on its own read
+            // (`march_trim_stands`); otherwise the refusal stands.
+            let stands = march_trim_stands(&march_read, floor);
+            if stands {
+                Ok(Some((rail.clone(), interpolated.clone())))
+            } else {
+                Err(why)
+            }
+        };
+        let refit = super::closed::refit_closed_support_pcurve(&rail, &interpolated, surface);
+        match refit {
+            Ok(fitted) => {
+                // A refit tracks ITS OWN projected track; a track that took
+                // another branch of the carrier tracks itself perfectly while
+                // its foot stands far off the rail (the stationary-start
+                // prism's coedge read 6.0 off its edge). Its foot standoff
+                // must be the rail's own standoff on the march trim's branch.
+                // BOTH reads are required: an unreadable refit read declines
+                // the refit (the march trim then stands only on its own read
+                // within the floor), and an unreadable march read cannot
+                // establish that the refit is on the rail's branch, so it
+                // refuses. Never shipped on an unknown.
+                // The two are compared POINTWISE, at the same rail
+                // parameters (`standoff_excess`), never as two maxima read at
+                // each curve's own knots.
+                let refit_read = crate::blend::track_fit::read_shipped_pcurve(surface, &|t| rail.evaluate(t), &fitted, d0, d1);
+                let (march_standoff, refit_standoff) = match (&march_read, refit_read) {
+                    (_, Err(error)) => return declined(error),
+                    (Err(error), Ok(_)) => {
+                        return Err(KernelRefusal::non_convergence(KernelStage::Refine, "support_refit_branch_unread", format!(
+                            "blend: a support trim's refit cannot be shown to stand on its rail's branch: the march's own \
+                             trim is unreadable ({})",
+                            error.message
+                        )));
+                    }
+                    (Ok((_, march_standoff, _, _)), Ok((_, refit_standoff, _, _))) => (*march_standoff, refit_standoff),
+                };
+                let excess = match crate::blend::track_fit::standoff_excess(surface, &|t| rail.evaluate(t), &interpolated, &fitted, d0, d1) {
+                    Ok(excess) => excess,
+                    Err(error) => return declined(error),
+                };
+                if !(excess <= floor) {
+                    return declined(KernelRefusal::non_convergence(KernelStage::Refine, "support_refit_branch", format!(
+                        "blend: a support trim's refit stands up to {excess:.3e} farther off its rail than the march's own trim \
+                         at the same rail parameter (largest standoffs {refit_standoff:.3e} and {march_standoff:.3e}): it took \
+                         another branch of the carrier"
+                    )));
+                }
+                // ABSOLUTE: the comparison above is relative to the march
+                // trim, so a refit that follows an off-branch march trim
+                // passes it. The refit's foot must also stand within the floor
+                // of the rail's own deviation from its carrier, read by the
+                // nearest-point projector at the same parameters
+                // (`standoff_over_nearest`) -- the rail's approximation the
+                // lane reports, never more.
+                let absolute = match crate::blend::track_fit::standoff_over_nearest(surface, &|t| rail.evaluate(t), &fitted, d0, d1) {
+                    Ok(absolute) => absolute,
+                    Err(error) => return declined(error),
+                };
+                if !(absolute <= floor) {
+                    return declined(KernelRefusal::non_convergence(KernelStage::Refine, "support_refit_off_rail", format!(
+                        "blend: a support trim's refit stands up to {absolute:.3e} farther off its rail than the rail stands \
+                         off its carrier: its foot is not the rail's nearest point"
+                    )));
+                }
+                Ok(Some((rail, fitted)))
+            }
+            Err(error) => declined(error),
+        }
     };
     let cr_rail = trim_rail(
         cr_collapsed,
         &rows.cr,
         &rows.cr_pcurve,
+        &first.face.surface,
         start_end.cr_parameter(),
         finish_end.cr_parameter(),
     )?;
@@ -385,6 +1072,7 @@ pub(in crate::blend) fn build_open_surgery(
         cs_collapsed,
         &rows.cs,
         &rows.cs_pcurve,
+        &second.face.surface,
         start_end.cs_parameter(),
         finish_end.cs_parameter(),
     )?;

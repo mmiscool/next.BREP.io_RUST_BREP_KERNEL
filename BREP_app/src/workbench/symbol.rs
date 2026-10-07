@@ -10,12 +10,12 @@ use super::ecad::{ecad_button, no_features};
 use super::{Workbench, WorkbenchButton};
 
 static BUTTONS: &[WorkbenchButton] = &[
-    ecad_button!("symbol.tool.select", "\u{1F446}", "Select", toggle),
-    ecad_button!("symbol.tool.line", "\u{E06E}", "Line", toggle),
-    ecad_button!("symbol.tool.rectangle", "\u{2610}", "Rectangle", toggle),
-    ecad_button!("symbol.tool.circle", "\u{25EF}", "Circle", toggle),
-    ecad_button!("symbol.tool.pin", "\u{E088}", "Pin", toggle),
-    ecad_button!("symbol.tool.text", "\u{E089}", "Text", toggle),
+    ecad_button!("symbol.tool.select", "\u{1F446}", "Select", "Home/Symbol/Select", toggle),
+    ecad_button!("symbol.tool.line", "\u{E06E}", "Line", "Home/Symbol/Line", toggle),
+    ecad_button!("symbol.tool.rectangle", "\u{2610}", "Rectangle", "Home/Symbol/Rectangle", toggle),
+    ecad_button!("symbol.tool.circle", "\u{25EF}", "Circle", "Home/Symbol/Circle", toggle),
+    ecad_button!("symbol.tool.pin", "\u{E088}", "Pin", "Home/Symbol/Pin", toggle),
+    ecad_button!("symbol.tool.text", "\u{E089}", "Text", "Home/Symbol/Text", toggle),
 ];
 
 pub static SYMBOL: Workbench = Workbench {

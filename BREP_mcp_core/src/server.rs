@@ -218,7 +218,7 @@ impl BrepServer {
     fn compose_tools(&self, describe: Option<&Value>) -> Vec<ToolSpec> {
         let cx = self.context();
         let slot = self.state.slot.clone();
-        let mut tools = crate::tools::engine_tools();
+        let mut tools = crate::tools::session_engine_tools(slot.clone());
         tools.extend(crate::tools::compose::session_tools(cx));
         if let Some(describe) = describe {
             tools.extend(crate::tools::app::app_tools(slot.clone(), describe));
@@ -393,8 +393,21 @@ impl ServerHandler for BrepServer {
         _context: RequestContext<RoleServer>,
     ) -> impl Future<Output = Result<ListResourcesResult, McpError>> + Send + '_ {
         async move {
-            let set = self.state.resources.read().await;
-            Ok(ListResourcesResult::with_all_items(set.specs.iter().map(to_rmcp_resource).collect())
+            let mut resources: Vec<Resource> = self.state.resources.read().await.specs.iter().map(to_rmcp_resource).collect();
+            let session = self.state.slot.read().await.clone();
+            if let Some(session) = session {
+                let catalogue = session.host.call_ok("plugin_feature_catalogue", serde_json::json!({})).await
+                    .map_err(|error| McpError::internal_error(error, None))?.result.unwrap_or(Value::Null);
+                for entry in catalogue["features"].as_array().into_iter().flatten() {
+                    let id = crate::schema::identity(entry);
+                    if crate::schema::entry(&id.feature_type).is_some() { continue; }
+                    let mut resource = Resource::new(format!("brep://schema/features/{}", id.feature_type), format!("feature-schema-{}", id.feature_type));
+                    resource.description = Some(format!("inputParams JSON Schema and defaults of {}", id.long_name));
+                    resource.mime_type = Some("application/json".into());
+                    resources.push(resource);
+                }
+            }
+            Ok(ListResourcesResult::with_all_items(resources)
                 .with_ttl_ms(LIST_TTL_MS)
                 .with_cache_scope(CacheScope::Private))
         }
@@ -406,6 +419,26 @@ impl ServerHandler for BrepServer {
         _context: RequestContext<RoleServer>,
     ) -> impl Future<Output = Result<ReadResourceResponse, McpError>> + Send + '_ {
         async move {
+            let session = self.state.slot.read().await.clone();
+            if let Some(session) = session {
+                let value = if request.uri == "brep://schema/features" {
+                    let catalogue = session.host.call_ok("plugin_feature_catalogue", serde_json::json!({})).await
+                        .map_err(|error| McpError::internal_error(error, None))?.result.unwrap_or(Value::Null);
+                    Some(crate::schema::all_from_catalogue(&catalogue))
+                } else if let Some(ty) = request.uri.strip_prefix("brep://schema/features/").filter(|ty| ty.contains('/')) {
+                    let entry = crate::tools::session_feature_entry(&session, ty).await
+                        .map_err(|error| McpError::resource_not_found(error, None))?;
+                    Some(serde_json::json!({"schema":crate::schema::to_json_schema(&entry),"defaults":crate::schema::defaults_from_entry(&entry)}))
+                } else { None };
+                if let Some(value) = value {
+                    let text = serde_json::to_string_pretty(&value).map_err(|error| McpError::internal_error(error.to_string(), None))?;
+                    let mut contents = ResourceContents::text(text, request.uri.clone());
+                    if let ResourceContents::TextResourceContents { mime_type, .. } = &mut contents {
+                        *mime_type = Some("application/json".into());
+                    }
+                    return Ok(ReadResourceResult::new(vec![contents]).into());
+                }
+            }
             let spec = self.state.resources.read().await.get(&request.uri).cloned();
             let Some(spec) = spec else {
                 return Err(McpError::resource_not_found(format!("no resource `{}`", request.uri), None));

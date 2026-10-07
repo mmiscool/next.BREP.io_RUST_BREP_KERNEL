@@ -327,12 +327,16 @@ fn resolve(
                             radius: 500,
                         }),
                         "clock" => {}
-                        "input_low" | "clock_low" => graphics.push(Graphic::Path(vec![
+                        "input_low" | "clock_low" | "edge_clock_high" => graphics.push(Graphic::Path(vec![
                             offset(-1270, 0),
                             offset(0, 700),
                             end,
                         ])),
                         "output_low" => graphics.push(Graphic::Path(vec![offset(-1270, 700), end])),
+                        "non_logic" => {
+                            graphics.push(Graphic::Path(vec![offset(-500, -500), offset(500, 500)]));
+                            graphics.push(Graphic::Path(vec![offset(-500, 500), offset(500, -500)]));
+                        }
                         other => return Err(format!("Unsupported pin shape {other}")),
                     }
                     if item.arg(2).contains("clock") {

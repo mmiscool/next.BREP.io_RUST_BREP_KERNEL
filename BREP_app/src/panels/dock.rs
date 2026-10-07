@@ -64,6 +64,8 @@ pub enum PaneKind {
     /// [`DockState::sync_document_panes`] renumbers whatever it finds onto the
     /// live documents, which is what makes the persisted layout survive.
     Document(u64),
+    /// Index into the persisted, owned plugin ID table (never reused).
+    Plugin(u64),
     History,
     AssemblyConstraints,
     Bom,
@@ -133,6 +135,7 @@ impl PaneKind {
             // marker) comes from `DockBehavior::tab_title_for_pane`, which can
             // reach the open documents.
             PaneKind::Document(_) => "3D View",
+            PaneKind::Plugin(_) => "Plugin",
             PaneKind::History => "History",
             // The component TREE. It was titled "BOM" before the BOM
             // existed; now that there is a real columned parts list next to
@@ -157,7 +160,7 @@ impl PaneKind {
     /// ids used in `app.rs`'s old `panel_visible` gates + `workbench::assembly`.
     fn panel_id(self) -> Option<&'static str> {
         match self {
-            PaneKind::Document(_) => None,
+            PaneKind::Document(_) | PaneKind::Plugin(_) => None,
             PaneKind::History => Some("history"),
             PaneKind::Bom => Some(workbench::assembly::BOM_PANEL_ID),
             PaneKind::AssemblyConstraints => Some(workbench::assembly::CONSTRAINTS_PANEL_ID),
@@ -285,6 +288,7 @@ impl DialogTargets {
 /// One field on `BrepApp`.
 pub struct DockState {
     tree: Tree<PaneKind>,
+    plugin_ids: Vec<String>,
     /// Set by [`DockBehavior::on_edit`] when the user drags / resizes a tile;
     /// drained in [`DockState::ui`] to persist the new layout. A workbench
     /// switch never sets it: visibility is derived per frame, not stored state.
@@ -339,6 +343,7 @@ pub struct DockContext<'a> {
     /// `docs.engine_mut()` — a borrow of one FIELD, so it still composes with
     /// the disjoint panel borrows beside it (see `crate::document`).
     pub docs: &'a mut Documents,
+    pub plugins: &'a mut crate::plugins::PluginsPanel,
     pub viewport: &'a mut Viewport,
     pub history: &'a mut HistoryPanel,
     pub bom: &'a mut BomPanel,
@@ -388,12 +393,14 @@ impl DockState {
             .and_then(|json| json.get(ECAD_DECLINED_KEY))
             .and_then(|notes| serde_json::from_value::<Vec<PaneKind>>(notes.clone()).ok())
             .unwrap_or_default();
+        let plugin_ids = saved.as_ref().and_then(|v| v.get("brepPluginIds")).and_then(|v| serde_json::from_value(v.clone()).ok()).unwrap_or_default();
         let tree = saved
             .and_then(|json| serde_json::from_value::<Tree<PaneKind>>(json).ok())
             .and_then(salvage)
             .unwrap_or_else(default_tree);
         Self {
             tree,
+            plugin_ids,
             dirty: false,
             snapshot: Vec::new(),
             dialogs: None,
@@ -406,10 +413,12 @@ impl DockState {
     /// Draw the dock tree, delegating each visible pane to its panel's `show`.
     /// Applies workbench visibility first, then persists if the user re-laid it.
     pub fn ui(&mut self, ui: &mut egui::Ui, ctx: DockContext<'_>) -> DockOutcome {
+        ctx.plugins.clear_panel_hits();
         let wb = ctx.docs.engine().settings.workbench.clone();
         // Visibility is asked of the workbench AND the document, so it is
         // computed here, before the behavior takes `&mut docs`.
         self.apply_workbench_visibility(&wb, &workbench::ButtonState::of(ctx.docs.engine()));
+        self.sync_plugin_panes(ctx.docs.engine());
         // The QUALIFY pane's door, run right after the visibility pass and for
         // the same reason the dialog door runs where it does: a pane that was
         // hidden a moment ago cannot be surfaced until the pass has let it back
@@ -442,6 +451,7 @@ impl DockState {
 
         let store = ctx.model_store;
         let mut behavior = DockBehavior::new(ctx);
+        behavior.plugin_ids = self.plugin_ids.clone();
         behavior.tab_title_spacing = behavior.tab_title_spacing(ui.visuals());
         self.tree.ui(&mut behavior, ui);
 
@@ -490,6 +500,7 @@ impl DockState {
     /// For a frame the dock is NOT drawn (sketch mode, reference selection):
     /// no side pane is on screen, so none may keep publishing rects.
     pub fn retract_all(ctx: DockContext<'_>) {
+        ctx.plugins.clear_panel_hits();
         DockBehavior::new(ctx).retract_undrawn(&[]);
     }
 
@@ -511,12 +522,16 @@ impl DockState {
             .snapshot
             .iter()
             .map(|(kind, visible, rendered)| {
-                serde_json::json!({
+                let mut pane = serde_json::json!({
                     "kind": format!("{kind:?}"),
                     "visible": visible,
                     "activeTab": self.find_pane(*kind).is_some_and(|id| self.tab_active(id)),
                     "rendered": active && *rendered,
-                })
+                });
+                if let PaneKind::Plugin(index) = kind {
+                    pane["pluginId"] = serde_json::json!(self.plugin_ids.get(*index as usize));
+                }
+                pane
             })
             .collect();
         serde_json::json!({ "active": active, "panes": panes }).to_string()
@@ -1031,6 +1046,41 @@ impl DockState {
         best.map(|(_, id)| id)
     }
 
+    pub fn show_plugin_panel(&mut self, engine: &EngineState, id: &str) -> Result<(), String> {
+        if !workbench::plugin_panels(engine, &engine.settings.workbench).iter().any(|p| p["id"] == id) {
+            return Err("Panel is unavailable or not claimed by the active workbench".into());
+        }
+        self.sync_plugin_panes(engine);
+        let index = self.plugin_ids.iter().position(|p| p == id).ok_or("Panel is unavailable")?;
+        self.show_pane(PaneKind::Plugin(index as u64));
+        Ok(())
+    }
+
+    fn sync_plugin_panes(&mut self, engine: &EngineState) {
+        let catalogue = engine.plugin_catalogue();
+        for panel in catalogue["panels"].as_array().into_iter().flatten() {
+            let Some(id) = panel["id"].as_str() else { continue };
+            let index = match self.plugin_ids.iter().position(|s| s == id) {
+                Some(index) => index,
+                None => { self.plugin_ids.push(id.to_owned()); self.dirty = true; self.plugin_ids.len() - 1 }
+            };
+            if self.find_pane(PaneKind::Plugin(index as u64)).is_none() {
+                if let Some(home) = self.side_home() {
+                    let tile = self.tree.tiles.insert_pane(PaneKind::Plugin(index as u64));
+                    if let Some(Tile::Container(container)) = self.tree.tiles.get_mut(home) { container.add_child(tile); }
+                    self.dirty = true;
+                }
+            }
+        }
+        let claimed = workbench::plugin_panels(engine, &engine.settings.workbench);
+        let visibility: Vec<_> = self.tree.tiles.iter().filter_map(|(tile, pane)| {
+            let Tile::Pane(PaneKind::Plugin(index)) = pane else { return None };
+            let visible = self.plugin_ids.get(*index as usize).is_some_and(|id| claimed.iter().any(|p| p["id"].as_str() == Some(id)));
+            Some((*tile, visible))
+        }).collect();
+        for (tile, visible) in visibility { self.tree.tiles.set_visible(tile, visible); }
+    }
+
     /// Serialize the layout through the unified persistence seam (best-effort).
     /// The eCAD door's notes ([`Self::surface_ecad_pane`]) are written INTO the
     /// tree's object under [`ECAD_DECLINED_KEY`], not around it: `Tree`
@@ -1043,6 +1093,7 @@ impl DockState {
         if let (Some(fields), Ok(notes)) = (json.as_object_mut(), serde_json::to_value(&self.ecad_declined)) {
             fields.insert(ECAD_DECLINED_KEY.into(), notes);
         }
+        json["brepPluginIds"] = serde_json::json!(self.plugin_ids);
         let _ = store.write(DOCK_LAYOUT_KEY, &json.to_string());
     }
 }
@@ -1140,7 +1191,7 @@ fn salvage(tree: Tree<PaneKind>) -> Option<Tree<PaneKind>> {
     if missing.is_empty() {
         return Some(tree);
     }
-    let mut dock = DockState { tree, dirty: false, snapshot: Vec::new(), dialogs: None, ports: None, ecad_entry: None, ecad_declined: Vec::new() };
+    let mut dock = DockState { tree, plugin_ids: Vec::new(), dirty: false, snapshot: Vec::new(), dialogs: None, ports: None, ecad_entry: None, ecad_declined: Vec::new() };
     let home = dock.side_home()?;
     for kind in missing {
         let pane = dock.tree.tiles.insert_pane(kind);
@@ -1157,6 +1208,8 @@ fn salvage(tree: Tree<PaneKind>) -> Option<Tree<PaneKind>> {
 /// a layout-edit flag for the shell to act on after `Tree::ui`.
 struct DockBehavior<'a> {
     docs: &'a mut Documents,
+    plugins: &'a mut crate::plugins::PluginsPanel,
+    plugin_ids: Vec<String>,
     viewport: &'a mut Viewport,
     history: &'a mut HistoryPanel,
     bom: &'a mut BomPanel,
@@ -1202,6 +1255,8 @@ impl<'a> DockBehavior<'a> {
     fn new(ctx: DockContext<'a>) -> Self {
         DockBehavior {
             docs: ctx.docs,
+            plugins: ctx.plugins,
+            plugin_ids: Vec::new(),
             viewport: ctx.viewport,
             history: ctx.history,
             bom: ctx.bom,
@@ -1246,7 +1301,7 @@ impl<'a> DockBehavior<'a> {
                 PaneKind::Expressions => self.expressions.clear_hits(),
                 PaneKind::Qualify => self.qualify.clear_hits(),
                 PaneKind::FamilyTable => self.family_table.clear_hits(),
-                PaneKind::Plm => {}
+                PaneKind::Plm | PaneKind::Plugin(_) => {}
                 // The eCAD parts pane's rects (`parts:`) are cleared every frame
                 // by `ecad_parts::take_add_part_request`, so an undrawn one
                 // already publishes none; the inspector publishes none, and the
@@ -1417,6 +1472,11 @@ impl<'a> Behavior<PaneKind> for DockBehavior<'a> {
                     }
                 }
             }
+            PaneKind::Plugin(index) => {
+                if let Some(id) = self.plugin_ids.get(index as usize) {
+                    self.plugins.show_panel(ui, self.docs.engine_mut(), id);
+                }
+            }
             PaneKind::Plm => scroll(ui, "dock-plm", |ui| self.plm.ui(ui, self.docs)),
         }
         UiResponse::None
@@ -1427,6 +1487,10 @@ impl<'a> Behavior<PaneKind> for DockBehavior<'a> {
     /// several models are open at once. Every other pane keeps its fixed title.
     fn tab_title_for_pane(&mut self, pane: &PaneKind) -> egui::WidgetText {
         match pane {
+            PaneKind::Plugin(index) => self.plugin_ids.get(*index as usize).map(|id| {
+                self.docs.engine().plugin_catalogue()["panels"].as_array().into_iter().flatten()
+                    .find(|p| p["id"].as_str() == Some(id)).and_then(|p| p["label"].as_str()).unwrap_or(id).to_owned()
+            }).unwrap_or_else(|| "Unavailable plugin".into()).into(),
             PaneKind::Document(id) => match self.docs.iter().find(|d| d.id() == *id) {
                 Some(doc) => {
                     let title = doc.title();
@@ -1693,3 +1757,4 @@ fn scroll(ui: &mut egui::Ui, salt: &str, add: impl FnOnce(&mut egui::Ui)) {
         .auto_shrink([false, false])
         .show(ui, add);
 }
+

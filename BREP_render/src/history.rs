@@ -184,6 +184,29 @@ fn trailing_number(id: &str) -> u64 {
 }
 
 impl History {
+    pub(crate) fn fold_plugin_persistent_data(&mut self, id: &str, data: Value) {
+        let Some(index) = self.index_of(id) else { return; };
+        if self.features()[index].get("persistentData") == Some(&data) { return; }
+        if let Some(features) = self.document_mut().get_mut("features").and_then(Value::as_array_mut) {
+            features[index]["persistentData"] = data;
+        }
+    }
+
+    /// Publish a successfully recomputed staged transaction as exactly one undo step.
+    /// The caller must check its captured revision before reaching this door.
+    pub(crate) fn commit_staged(&mut self, staged: &Self) -> Result<(), String> {
+        if self.refuse_user() {
+            return Err(format!("the document is read-only: {}", self.locked().unwrap_or("locked")));
+        }
+        self.checkpoint(None);
+        *self.document_mut() = staged.document.clone();
+        self.parts_library = staged.parts_library.clone();
+        self.feature_counter = staged.feature_counter;
+        self.rollback = staged.rollback;
+        self.pin_port_hold = None;
+        Ok(())
+    }
+
     /// Load a whole history document (a saved part file parses as one). Rolls to
     /// the last feature. Ensures a `features` array exists.
     pub fn from_request_json(json: &str) -> Result<Self, String> {
@@ -550,6 +573,20 @@ impl History {
         }
         self.feature_counter += 1;
         format!("{base}{}", self.feature_counter)
+    }
+
+    /// Commit IDs reserved on a transaction's cloned history. Document adoption
+    /// deliberately ignores serialized counters, so the transaction must carry
+    /// its allocation high-water mark separately. Explicit committed IDs also
+    /// set a floor; undo keeps this monotonic, while rollback restores a clone.
+    pub(crate) fn retain_feature_allocations(&mut self, staged: &Self) {
+        if self.refuse_user() {
+            return;
+        }
+        self.feature_counter = self
+            .feature_counter
+            .max(staged.feature_counter)
+            .max(self.max_id_suffix());
     }
 
     /// The `stopAtId`-truncated request that stops AFTER the rolled-to feature —

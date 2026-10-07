@@ -73,7 +73,9 @@ pub mod attach;
 pub mod audit;
 pub mod auth;
 pub mod backup;
+pub mod bake_worker;
 pub mod bom;
+pub mod bom_config;
 pub mod cad;
 pub mod catalog;
 pub mod db;
@@ -92,6 +94,7 @@ pub mod sourcing;
 pub mod sql;
 pub mod table;
 pub mod thumbnail;
+pub mod geometry;
 pub mod tls;
 pub mod version;
 pub mod workspace;
@@ -163,3 +166,7 @@ impl IntoResponse for Error {
             .into_response()
     }
 }
+
+pub mod identity;
+
+pub mod workflow;

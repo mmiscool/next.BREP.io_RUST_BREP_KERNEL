@@ -259,6 +259,8 @@ pub fn schema() -> serde_json::Value {
     "type": "B",
     "shortName": "B",
     "longName": "Boolean",
+    "ribbonPath": "Home/Modeling/Boolean",
+    "commandSize": "Compact",
     "displayBuilder": false,
     "inputParamsSchema": {
         "id": {

@@ -97,15 +97,15 @@ pub(super) fn flat_step_bodies(
 pub(super) fn build_step_body(
     resolver: &Resolver,
     body: StepBody,
-) -> Result<(BrepSolid, Vec<builder::readings::BoundedTrim>), String> {
-    build_step_body_captured_or_not(resolver, body, false).map(|(solid, _, bounded)| (solid, bounded))
+) -> Result<(BrepSolid, builder::readings::BodyReadings), StepBodyError> {
+    build_step_body_captured_or_not(resolver, body, false).map(|(solid, _, readings)| (solid, readings))
 }
 
 fn build_step_body_captured_or_not(
     resolver: &Resolver,
     body: StepBody,
     capture: bool,
-) -> Result<(BrepSolid, Option<builder::readings::TrimCapture>, Vec<builder::readings::BoundedTrim>), String> {
+) -> Result<(BrepSolid, Option<builder::readings::TrimCapture>, builder::readings::BodyReadings), StepBodyError> {
     match body {
         StepBody::SolidBrep(entity_ref) => build_solid_inner(resolver, entity_ref, capture),
         StepBody::BrepWithVoids(entity_ref) => build_brep_with_voids_captured(resolver, entity_ref, capture),
@@ -120,7 +120,7 @@ fn build_step_body_captured_or_not(
 pub(super) fn build_step_body_captured(
     resolver: &Resolver,
     body: StepBody,
-) -> Result<(BrepSolid, Option<builder::readings::TrimCapture>, Vec<builder::readings::BoundedTrim>), String> {
+) -> Result<(BrepSolid, Option<builder::readings::TrimCapture>, builder::readings::BodyReadings), StepBodyError> {
     build_step_body_captured_or_not(resolver, body, true)
 }
 
@@ -285,6 +285,20 @@ pub(super) struct ImportedBodies {
     /// carriers. EMPTY on the assembly-occurrence lane, which does not carry
     /// them yet (named in the 2026-09-26 record).
     pub(super) bounded_trims: Vec<Vec<builder::readings::BoundedTrim>>,
+    /// Parallel to `solids` on the flat lane: what the shell-closure gate read
+    /// on each ACCEPTED body (`builder::ClosureNote`). EMPTY on the
+    /// assembly-occurrence lane, like `bounded_trims`.
+    pub(super) closure_notes: Vec<builder::ClosureNote>,
+    /// The bodies the closure gate REFUSED, typed, in file order — each is
+    /// also counted in `failed` and the first is `first_error`'s text. The
+    /// feature lane refuses the whole import on any of these; the report lane
+    /// returns them beside the bodies that did import.
+    pub(super) refused_bodies: Vec<KernelRefusal>,
+    /// The bodies that failed to build with a typed cause that is NOT the
+    /// closure gate's (`StepBodyError::closure_refusal`), in file order:
+    /// counted in `failed`, never a whole-file refusal, skipped on an
+    /// opportunistic sheet exactly as their text was.
+    pub(super) failed_refusals: Vec<KernelRefusal>,
 }
 
 /// [`shell_face_refs`] for the PMI reader (a sibling module).
@@ -346,6 +360,9 @@ pub(super) fn collect_step_solids(text: &str) -> Result<ImportedBodies, String> 
             }
             return Ok(ImportedBodies {
                 bounded_trims: Vec::new(),
+                closure_notes: Vec::new(),
+                refused_bodies: occurrences.refused_bodies,
+                failed_refusals: occurrences.failed_refusals,
                 solids: occurrences.solids,
                 appearances: occurrences.appearances,
                 face_refs: occurrences.face_refs,
@@ -378,16 +395,16 @@ pub(super) fn collect_step_solids(text: &str) -> Result<ImportedBodies, String> 
     let build = |body: StepBody| {
         (
             matches!(body, StepBody::SurfaceModelShell { .. }),
-            build_step_body(&resolver, body).map(|(solid, bounded)| {
+            build_step_body(&resolver, body).map(|(solid, readings)| {
                 let appearance = step_body_appearance(&resolver, &styles, body, &solid);
                 let face_refs = super::pmi::body_face_refs(&resolver, body, &solid);
-                (solid, appearance, face_refs, bounded)
+                (solid, appearance, face_refs, readings)
             }),
         )
     };
     type BuiltBody = (
         bool,
-        Result<(BrepSolid, BodyAppearance, Vec<usize>, Vec<builder::readings::BoundedTrim>), String>,
+        Result<(BrepSolid, BodyAppearance, Vec<usize>, builder::readings::BodyReadings), StepBodyError>,
     );
     #[cfg(feature = "parallel")]
     let results: Vec<BuiltBody> = {
@@ -403,6 +420,9 @@ pub(super) fn collect_step_solids(text: &str) -> Result<ImportedBodies, String> 
     let mut appearances = Vec::new();
     let mut face_refs = Vec::new();
     let mut bounded_trims = Vec::new();
+    let mut closure_notes = Vec::new();
+    let mut refused_bodies = Vec::new();
+    let mut failed_refusals = Vec::new();
     // A mapping the structure lane refused, on a file whose structure yielded no
     // positioned solid at all: the bodies below come in UNPLACED, and the refusal
     // is what says why one of them is not where the file put it.
@@ -423,17 +443,31 @@ pub(super) fn collect_step_solids(text: &str) -> Result<ImportedBodies, String> 
             // Solid, appearance, face refs and bounded trims are pushed
             // together — the vectors are parallel by construction, through
             // every skip arm below.
-            Ok((solid, appearance, refs, bounded)) => {
+            Ok((solid, appearance, refs, readings)) => {
                 solids.push(solid);
                 appearances.push(appearance);
                 face_refs.push(refs);
-                bounded_trims.push(bounded);
+                bounded_trims.push(readings.bounded);
+                closure_notes.push(readings.closure);
             }
-            Err(_) if opportunistic => {} // open surface-model sheet: not a solid, skip
+            // An open surface-model sheet is not a solid: skip it, whether its
+            // builder said so in text or, since 2026-10-03, in a typed class.
+            Err(error) if opportunistic && !error.closure_refusal() => {}
             Err(error) => {
+                // A closure refusal counts on an opportunistic shell too: it
+                // reached the gate, so it closed topologically and built as a
+                // solid; what it is not is sound.
                 failed += 1;
                 if first_error.is_none() {
-                    first_error = Some(error);
+                    first_error = Some(error.to_string());
+                }
+                let closure = error.closure_refusal();
+                if let StepBodyError::Refused(refusal) = error {
+                    if closure {
+                        refused_bodies.push(refusal);
+                    } else {
+                        failed_refusals.push(refusal);
+                    }
                 }
             }
         }
@@ -446,6 +480,9 @@ pub(super) fn collect_step_solids(text: &str) -> Result<ImportedBodies, String> 
         first_error,
         stated_precisions_mm,
         bounded_trims,
+        closure_notes,
+        refused_bodies,
+        failed_refusals,
     })
 }
 
@@ -1068,6 +1105,12 @@ pub(super) struct AssemblyResult {
     pub(super) appearances: Vec<BodyAppearance>,
     failed: usize,
     first_error: Option<String>,
+    /// Part bodies the shell-closure gate refused, typed, once per part; each
+    /// occurrence of such a part is also counted in `failed`.
+    refused_bodies: Vec<KernelRefusal>,
+    /// Part bodies that failed to build with a typed cause that is not the
+    /// closure gate's, once per part; each occurrence is counted in `failed`.
+    failed_refusals: Vec<KernelRefusal>,
     /// Mappings this lane would not instantiate, in edge order. Counted in
     /// `failed` and reported through `first_error` when this result is USED; kept
     /// separately so `collect_step_solids` can still report them when it abandons
@@ -1194,6 +1237,8 @@ pub(super) fn resolve_assembly(
         failed: 0,
         first_error: None,
         refusals: refusals.clone(),
+        refused_bodies: Vec::new(),
+        failed_refusals: Vec::new(),
         debug: Vec::new(),
     };
     // A refused mapping — a singular mapping transform, the only kind
@@ -1209,7 +1254,7 @@ pub(super) fn resolve_assembly(
     // Build each distinct part solid once — with its appearance, which is a
     // property of the PART, not of the placement — then re-use both for every
     // occurrence.
-    let mut solid_cache: HashMap<StepBody, Result<(BrepSolid, BodyAppearance, Vec<usize>), String>> =
+    let mut solid_cache: HashMap<StepBody, Result<(BrepSolid, BodyAppearance, Vec<usize>), StepBodyError>> =
         HashMap::default();
     let debug_on = std::env::var("BREP_DEBUG_STEP_ASM").is_ok();
 
@@ -1219,25 +1264,41 @@ pub(super) fn resolve_assembly(
         for body in pd_step_bodies(entities, resolver, node.pd) {
             let base = solid_cache.entry(body).or_insert_with(|| {
                 build_step_body(resolver, body)
-                    .map(|(solid, _bounded)| {
+                    .map(|(solid, _readings)| {
                         let appearance = step_body_appearance(resolver, styles, body, &solid);
                         let face_refs = super::pmi::body_face_refs(resolver, body, &solid);
                         (solid, appearance, face_refs)
                     })
                     .map_err(|error| {
-                        format!("step_import: part body {body:?} failed to build: {error}")
+                        error.with_context(|text| {
+                            format!("step_import: part body {body:?} failed to build: {text}")
+                        })
                     })
             });
             let (base_solid, base_appearance, base_refs) = match base {
                 Ok((solid, appearance, refs)) => (solid.clone(), appearance.clone(), refs.clone()),
                 // An OPEN SHELL_BASED_SURFACE_MODEL sheet is not a solid body, so
                 // (as in the flat path) its build failure is skipped rather than
-                // counted against the genuine solid bodies.
-                Err(_) if matches!(body, StepBody::SurfaceModelShell { .. }) => continue,
+                // counted against the genuine solid bodies — in text or typed,
+                // the closure gate's refusal excepted.
+                Err(error)
+                    if matches!(body, StepBody::SurfaceModelShell { .. }) && !error.closure_refusal() =>
+                {
+                    continue
+                }
                 Err(error) => {
                     result.failed += 1;
                     if result.first_error.is_none() {
-                        result.first_error = Some(error.clone());
+                        result.first_error = Some(error.to_string());
+                    }
+                    let closure = error.closure_refusal();
+                    if let StepBodyError::Refused(refusal) = error {
+                        // Once per PART, not per occurrence: the cache hands
+                        // the same refusal back for every placement.
+                        let list = if closure { &mut result.refused_bodies } else { &mut result.failed_refusals };
+                        if !list.iter().any(|known| known == refusal) {
+                            list.push(refusal.clone());
+                        }
                     }
                     continue;
                 }

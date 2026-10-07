@@ -481,6 +481,8 @@ pub fn schema() -> serde_json::Value {
     "type": "RIB",
     "shortName": "RIB",
     "longName": "Rib",
+    "ribbonPath": "Home/Modeling/Rib",
+    "commandSize": "Compact",
     "displayBuilder": false,
     "inputParamsSchema": {
         "id": {

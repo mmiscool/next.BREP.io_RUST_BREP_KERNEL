@@ -609,6 +609,18 @@ impl EngineState {
         }
     }
 
+    /// Finalize a dimension drag with a fresh run of the committed parameters.
+    /// Abandon background preview work first so releasing the arrow does not wait
+    /// behind an expensive intermediate value. The final run forces this feature
+    /// and its consumers to rebuild, rather than replaying the cached handle.
+    pub fn feature_dimension_release(&mut self, feature_id: &str) {
+        if self.history.index_of(feature_id).is_none() {
+            return;
+        }
+        self.cancel_run_with_notice(false);
+        self.rerun_history_forcing(Some(feature_id));
+    }
+
     /// Drag a dimension handle: project the pointer pixel `(x, y)` onto the
     /// annotation's world axis (`pointA → pointB`), take the distance along the
     /// axis from `pointA` as the new value (correcting for any transform scale so
@@ -818,6 +830,13 @@ impl EngineState {
         let Some(object) = params.as_object_mut() else {
             return;
         };
+        // A drag frame whose pointer has not moved (egui reports `dragged()`
+        // on every frame the button is held, and the frame loop keeps running
+        // while a run is in flight) resolves to the value already written. No
+        // run for it: each submit is a whole-history rebuild on the runner.
+        if object.get(field_key) == Some(&value) {
+            return;
+        }
         object.insert(field_key.to_string(), value);
         let _ = self.update_feature_params(feature_id, &params.to_string());
     }

@@ -771,7 +771,43 @@ impl SheetsPanel {
         let revision_rows = std::cell::RefCell::new(revisions);
         let revision_intents: std::cell::RefCell<Vec<RevisionIntent>> = std::cell::RefCell::new(Vec::new());
         let revision_hits: std::cell::RefCell<Vec<(String, egui::Rect)>> = std::cell::RefCell::new(Vec::new());
+        let bom = std::cell::RefCell::new(serde_json::from_value::<Option<brep_render::sheets::BomTable>>(seed.get("bomTable").cloned().unwrap_or(Value::Null)).unwrap_or_default());
+        let bom_changed = std::cell::Cell::new(false);
+        let mut columns = if is_sheet { state.sheet_bom_columns() } else { Vec::new() };
+        let config = if state.settings.bom_columns.is_empty() { crate::panels::bom_columns::default_text() } else { state.settings.bom_columns.clone() };
+        for column in crate::panels::bom_columns::parse(&config).columns { let key = column.key(); if !columns.contains(&key) { columns.push(key); } }
+        if let Some(table) = bom.borrow().as_ref() { for column in &table.columns { if !columns.contains(column) { columns.push(column.clone()); } } }
+        columns.sort_by_key(|column| !bom.borrow().as_ref().is_some_and(|table| table.columns.contains(column)));
         let draw_revisions = |ui: &mut egui::Ui| {
+            ui.label("BOM table");
+            let mut table = bom.borrow_mut();
+            let mut enabled = table.is_some();
+            let response = ui.checkbox(&mut enabled, "Show BOM table");
+            revision_hits.borrow_mut().push(("sheets:bom:enabled".into(), response.rect));
+            if response.changed() {
+                *table = enabled.then(brep_render::sheets::BomTable::default); bom_changed.set(true);
+            }
+            if let Some(table) = table.as_mut() {
+                ui.horizontal(|ui| {
+                    ui.label("Position (mm)");
+                    for coordinate in &mut table.position { if ui.add(egui::DragValue::new(coordinate).speed(1.)).changed() { bom_changed.set(true); } }
+                });
+                ui.horizontal(|ui| { ui.label("Column width (mm)"); if ui.add(egui::DragValue::new(&mut table.column_width_mm).range(8.0..=200.0)).changed() { bom_changed.set(true); } });
+                ui.label("Columns");
+                egui::ScrollArea::vertical().id_salt(("bom-columns", id)).max_height(180.0).show(ui, |ui| {
+                for column in &columns {
+                    let mut selected = table.columns.contains(column);
+                    let response = ui.checkbox(&mut selected, column.replace('_', " "));
+                    revision_hits.borrow_mut().push((format!("sheets:bom:column:{column}"), response.rect));
+                    if response.changed() {
+                        if selected { table.columns.push(column.clone()); } else { table.columns.retain(|c| c != column); }
+                        bom_changed.set(true);
+                    }
+                }
+                });
+            }
+            ui.separator();
+            ui.label("Revisions");
             draw_revision_rows(ui, id, &revision_rows, &revision_intents, &revision_hits);
         };
         let spec = FormViewSpec {
@@ -781,13 +817,14 @@ impl SheetsPanel {
             banner: note.map(|note| (note, egui::Color32::from_rgb(0x58, 0xa6, 0xff))),
             trailing: None,
             exit_label: "Return to tree",
-            extra: is_sheet.then_some(("Revisions", &draw_revisions as &dyn Fn(&mut egui::Ui))),
+            extra: is_sheet.then_some(("Tables", &draw_revisions as &dyn Fn(&mut egui::Ui))),
             rollback: false,
             hidden: None,
             hits_prefix: "sheets:",
             read_only: state.history.locked(),
         };
-        let out = form_view(ui, &spec, &mut params, Some(&mut self.hits));
+        let mut out = form_view(ui, &spec, &mut params, Some(&mut self.hits));
+        if is_sheet && bom_changed.get() { params["bomTable"] = serde_json::to_value(bom.into_inner()).unwrap_or(Value::Null); out.changed = true; }
         for (key, rect) in revision_hits.into_inner() {
             self.hits.insert(key, rect);
         }
@@ -927,6 +964,7 @@ pub static HIT_KEYS: &[HitKeyDoc] = &[
     HitKeyDoc { panel: "sheets", prefix: "sheets:form:", meaning: "the open sheet / placement form (sheets:form:object:<id>, sheets:form:feature, sheets:form:return)", command: Some("sheet_update") },
     HitKeyDoc { panel: "sheets", prefix: "sheets:field:", meaning: "one schema field of the open form (sheets:field:<path>) \u{2014} the paper size, the placed view, its position and scale, `sheets:field:flattenText`, the checkbox that lays that view's annotation text flat on the sheet, and a sheet dimension's kind, alignment, offset and precision and its tolerance block — `sheets:field:tolMode` (none / symmetric / deviation / limits), `sheets:field:tolUpper`, `sheets:field:tolLower` and the `sheets:field:isReference` checkbox, which an ordinate set's form carries too. `sheets:field:anchors#activate` opens the reference picker on the paper (anchors are clicked as `sheet/anchor:<ref>`, then `modebar/refsel:finish`), `sheets:field:anchors#line<n>` is one anchor row and `sheets:field:anchors#x<n>` drops it. An ORDINATE SET's form adds `sheets:field:axis` and its two reference fields `sheets:field:datum` and `sheets:field:members`; a SECTION's form its `sheets:field:cut` (the cutting line), `sheets:field:sectionLabel` and `sheets:field:sectionFlip`; a DETAIL's form its `sheets:field:centre`, `sheets:field:rim` and `sheets:field:detailLabel` \u{2014} each reference field with the same `#activate`, `#line<n>` and `#x<n>` keys", command: Some("sheet_update_dimension") },
     HitKeyDoc { panel: "sheets", prefix: "sheets:group:", meaning: "a collapsible group header of the open form (sheets:group:<name>)", command: None },
+    HitKeyDoc { panel: "sheets", prefix: "sheets:bom:", meaning: "the sheet BOM table toggle and column choices: sheets:bom:enabled, sheets:bom:column:<attribute>", command: Some("sheet_update") },
     HitKeyDoc { panel: "sheets", prefix: "sheets:rev:", meaning: "the SHEET dialog's Revisions section: `sheets:rev:add` appends a row (the next letter, today's date), and per row `sheets:rev:<n>:rev`, `sheets:rev:<n>:date` and `sheets:rev:<n>:description` are its three text edits and `sheets:rev:<n>:remove` removes it. Rows keep their order; the sheet draws them as the revision table beside its title block", command: Some("sheet_add_revision") },
 ];
 

@@ -813,6 +813,202 @@ pub(super) fn curve_lies_on_surface(
     Ok(true)
 }
 
+/// Most pieces the hug certificate ([`tangent_hit_endpoint`]) may bisect the
+/// window into before it gives up. A window the certificate cannot close in
+/// this many pieces is not the sub-weld tangency band the snap exists for; the
+/// helper then answers `None`, which is the pre-snap behaviour.
+const HUG_PIECE_CAP: usize = 64;
+
+/// Whether every control point of `curve` is finite with a finite, positive
+/// weight: the premise of the convex-hull certificate and of every evaluation
+/// the snap relies on. `NurbsCurve::new` enforces this at construction, but the
+/// field is public, so the certificate re-reads it rather than assume it.
+fn controls_are_finite(curve: &NurbsCurve) -> bool {
+    curve.control_points.iter().all(|control| {
+        control.w.is_finite()
+            && control.w > 0.0
+            && control.x.is_finite()
+            && control.y.is_finite()
+            && control.z.is_finite()
+    })
+}
+
+/// Whether every point of `along` over `[lo, hi]` lies within `limit` of the
+/// live trim of `other` (`[other_low, other_high]`), certified over the WHOLE
+/// window, not at stations. Each piece is compared with one point of the
+/// trim, the foot of the piece's midpoint: a NURBS with positive weights lies
+/// in the convex hull of its control points and `x ↦ |x − foot|` is convex,
+/// so the farthest point of the piece from that foot is a control point, and
+/// a piece whose control points all sit within `limit` of the foot lies within
+/// `limit` of the trim everywhere. A piece too long or too far for that bound
+/// is bisected and each half certified on its own, up to `budget` pieces in
+/// all; a window `split` cannot cut (within the knot identity band of an end)
+/// fails closed. The foot is clamped into the live interval so the certificate
+/// speaks for the trim, never for an unused stretch of the carrier.
+#[allow(clippy::too_many_arguments)]
+fn span_hull_within(
+    along: &NurbsCurve,
+    lo: f64,
+    hi: f64,
+    other: &NurbsCurve,
+    other_low: f64,
+    other_high: f64,
+    limit: f64,
+    budget: &mut usize,
+) -> Result<bool, KernelRefusal> {
+    if *budget == 0 || !(lo < hi) || !lo.is_finite() || !hi.is_finite() {
+        return Ok(false);
+    }
+    *budget -= 1;
+    let [d0, d1] = along.domain().or_refuse(KernelStage::Intersect, "domain")?;
+    let mut piece = along.clone();
+    if lo > d0 {
+        piece = match piece.split(lo) {
+            Ok((_, right)) => right,
+            Err(_) => return Ok(false),
+        };
+    }
+    if hi < d1 {
+        piece = match piece.split(hi) {
+            Ok((left, _)) => left,
+            Err(_) => return Ok(false),
+        };
+    }
+    let mid = 0.5 * (lo + hi);
+    let midpoint = along.evaluate(mid).or_refuse(KernelStage::Intersect, "evaluate")?;
+    let projection = project_point_to_curve(other, midpoint).or_refuse(KernelStage::Intersect, "project_point_to_curve")?;
+    if !projection.u.is_finite() {
+        return Ok(false);
+    }
+    let foot = other
+        .evaluate(projection.u.clamp(other_low, other_high))
+        .or_refuse(KernelStage::Intersect, "evaluate")?;
+    if !controls_are_finite(&piece) {
+        return Ok(false);
+    }
+    let mut worst = 0.0f64;
+    for control in &piece.control_points {
+        let point = control.point().or_refuse(KernelStage::Intersect, "control point")?;
+        let distance = point.sub(foot).length();
+        if !distance.is_finite() {
+            return Ok(false);
+        }
+        worst = worst.max(distance);
+    }
+    if worst <= limit {
+        return Ok(true);
+    }
+    if !(lo < mid && mid < hi) {
+        return Ok(false);
+    }
+    Ok(span_hull_within(along, lo, mid, other, other_low, other_high, limit, budget)?
+        && span_hull_within(along, mid, hi, other, other_low, other_high, limit, budget)?)
+}
+
+/// The endpoint of `along` (live over `[along_low, along_high]`) that a
+/// TANGENTIAL hit at `hit_parameter` against `other` (live over `[other_low,
+/// other_high]`) stands for, if any, as `(along parameter, other parameter)`.
+///
+/// A tangential hit is placed only to the tangency's flat band, so when the
+/// contact the finder was reaching for is an endpoint of `along` that itself
+/// lies on `other`, the endpoint is the junction. The answer is one of:
+///
+/// * **Identity.** The hit's parameter IS an endpoint's parameter: that
+///   endpoint, and only that endpoint, with a zero-length window and nothing
+///   to certify. On a closed ring or a retraced curve both endpoints share a
+///   point, and the exact parameter names this traversal's visit of it, so
+///   the far end's visit is never chosen. Physical nearness alone is not an
+///   identity: a hit that returns to an endpoint's point after an excursion
+///   has a window with the excursion in it, and goes through the certificate.
+/// * **Reach.** Otherwise an endpoint whose span back to the hit lies within
+///   `limit` of `other`'s live trim over the WHOLE window
+///   ([`span_hull_within`]), so no distinct topology can fit between hit and
+///   vertex. A curve that leaves `other` and returns, however briefly, between
+///   stations is refused by the hull bound, and so is a window the bound
+///   cannot close within [`HUG_PIECE_CAP`] pieces (a window many hundreds of
+///   floors long is never the tangency band). A hit that could reach BOTH
+///   endpoints is a coincident overlap, the overlap branch's territory: `None`.
+///
+/// In every case the endpoint must project onto `other` within `limit` AND at
+/// a parameter inside `other`'s live interval (widened only by that point's
+/// own parameter band), and the certificate's feet are taken on that
+/// interval. Every comparison fails closed on a non-finite value, and both
+/// curves must carry finite controls with finite positive weights
+/// ([`controls_are_finite`]) before anything is accepted.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn tangent_hit_endpoint(
+    along: &NurbsCurve,
+    along_low: f64,
+    along_high: f64,
+    hit_parameter: f64,
+    other: &NurbsCurve,
+    other_low: f64,
+    other_high: f64,
+    limit: f64,
+) -> Result<Option<(f64, f64)>, KernelRefusal> {
+    if ![along_low, along_high, hit_parameter, other_low, other_high, limit]
+        .iter()
+        .all(|value| value.is_finite())
+        || !(limit > 0.0)
+        || !controls_are_finite(along)
+        || !controls_are_finite(other)
+    {
+        return Ok(None);
+    }
+    let (along_low, along_high) = (along_low.min(along_high), along_low.max(along_high));
+    let (other_low, other_high) = (other_low.min(other_high), other_low.max(other_high));
+    let hit_point = along.evaluate(hit_parameter).or_refuse(KernelStage::Intersect, "evaluate")?;
+    // The endpoint's foot on the partner's LIVE trim, or None.
+    let foot = |end_parameter: f64| -> Result<Option<(f64, Vec3)>, KernelRefusal> {
+        let end_point = along.evaluate(end_parameter).or_refuse(KernelStage::Intersect, "evaluate")?;
+        let projection = project_point_to_curve(other, end_point).or_refuse(KernelStage::Intersect, "project_point_to_curve")?;
+        if !(projection.distance <= limit) || !projection.u.is_finite() {
+            return Ok(None);
+        }
+        let band = parameter_tolerance(other, projection.u, limit)?;
+        if !(projection.u >= other_low - band && projection.u <= other_high + band) {
+            return Ok(None);
+        }
+        let u = projection.u.clamp(other_low, other_high);
+        let reference = other.evaluate(u).or_refuse(KernelStage::Intersect, "evaluate")?;
+        if !(reference.sub(end_point).length() <= limit) {
+            return Ok(None);
+        }
+        Ok(Some((u, reference)))
+    };
+    // Identity: the hit IS an endpoint, by parameter. Only an exact endpoint
+    // parameter has a zero-length window and may bypass the certificate; a
+    // hit merely NEAR an endpoint's point, or returning to it after an
+    // excursion, is a candidate like any other and must certify its window
+    // and be the unique reachable end.
+    if hit_parameter == along_low || hit_parameter == along_high {
+        return Ok(foot(hit_parameter)?.map(|(u, _)| (hit_parameter, u)));
+    }
+    // Reach: the window from the hit to the endpoint hugs the partner's trim.
+    let mut reached: Vec<(f64, f64)> = Vec::new();
+    for end_parameter in [along_low, along_high] {
+        if !(hit_parameter > along_low && hit_parameter < along_high) {
+            break;
+        }
+        let Some((u, _)) = foot(end_parameter)? else {
+            continue;
+        };
+        let (lo, hi) = if end_parameter < hit_parameter {
+            (end_parameter, hit_parameter)
+        } else {
+            (hit_parameter, end_parameter)
+        };
+        let mut budget = HUG_PIECE_CAP;
+        if span_hull_within(along, lo, hi, other, other_low, other_high, limit, &mut budget)? {
+            reached.push((end_parameter, u));
+        }
+    }
+    Ok(match reached.as_slice() {
+        [one] => Some(*one),
+        _ => None,
+    })
+}
+
 /// The spans of an operand edge's `curve` that lie on the other operand's
 /// `face`, for the boundary-curve exchange: the whole curve when it lies on
 /// the face's surface ([`curve_lies_on_surface`]), and otherwise each span
@@ -897,14 +1093,29 @@ pub(super) fn curve_spans_on_face(
             // edge along a bend's inner arc) the hit lands 1.4e-6 off the corner,
             // and a span cut there started off it. A transversal hit is placed
             // to the search's tolerance and stays a crossing.
+            let mut crossing = hit.s;
             if hit.tangential {
                 let point = curve.evaluate(hit.s).or_refuse(KernelStage::Intersect, "evaluate")?;
                 let precision = CROSSING_TOLERANCE.sqrt() * (1.0 + point.length());
                 if point.sub(start_point).length() <= precision || point.sub(end_point).length() <= precision {
                     continue;
                 }
+                // Likewise a tangential hit reaching for the EDGE's own vertex
+                // — the cap circle touching the slab's height edge at the
+                // corner the circle passes through — is that vertex's crossing
+                // (`tangent_hit_endpoint`): the finder placed it 1.26e-5 along
+                // the edge from the corner, past the dedup band of the exact
+                // crossing the corner's other edge gives, and the 1.26e-5 arc
+                // between them "lay on" the side plane and was exchanged as a
+                // span, planting a sliver split on the height edge.
+                if let Some((_, snapped)) = tangent_hit_endpoint(&edge.curve, edge.t0, edge.t1, hit.t, &curve, start, end, overlap_limit)? {
+                    crossing = snapped;
+                    if crossing <= start + split_tolerance || crossing >= end - split_tolerance {
+                        continue;
+                    }
+                }
             }
-            crossings.push(hit.s);
+            crossings.push(crossing);
         }
     }
     if crossings.is_empty() {

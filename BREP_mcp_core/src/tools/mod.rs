@@ -134,7 +134,7 @@ pub fn engine_tools() -> Vec<ToolSpec> {
         ToolSpec::new(
             "feature_catalogue",
             "features",
-            "List every feature the kernel catalogue exposes: type, shortName, longName, displayBuilder. \
+            "List available features: type, shortName, longName, displayBuilder. A live session includes its document-scoped JavaScript plugins; without a session this lists built-in kernel features. \
              Read `brep://schema/features/{type}` or call `feature_schema` for a feature's parameter schema.",
             object_schema(json!({}), &[]),
             Annotations::READ,
@@ -159,8 +159,8 @@ pub fn engine_tools() -> Vec<ToolSpec> {
         ToolSpec::new(
             "feature_schema",
             "features",
-            "The JSON Schema of one feature's inputParams (derived from the kernel's inputParamsSchema) \
-             and its default parameter values. `type` is the catalogue type or shortName, e.g. `E`, `P.CU`, `B`. \
+            "The JSON Schema of one feature's inputParams (derived from its inputParamsSchema) \
+             and its default parameter values. `type` is the catalogue type or built-in shortName, e.g. `E`, `P.CU`, `B`; a live session also accepts exact namespaced plugin IDs. \
              A feature that carries a `persistentData` block (the sketch profile Extrude and Revolve consume) also \
              returns `persistentData` — its schema — and `persistentDataExample`, a complete working block.",
             object_schema(json!({ "type": { "type": "string", "description": "feature type or shortName" } }), &["type"]),
@@ -188,6 +188,60 @@ pub fn engine_tools() -> Vec<ToolSpec> {
             },
         ),
     ]
+}
+
+/// Resolve a custom schema from the active document without polluting the
+/// process-wide built-in catalogue. The host enforces installed package pins.
+pub(crate) async fn session_feature_entry(
+    session: &crate::session::Session,
+    feature_type: &str,
+) -> Result<Value, String> {
+    if let Some(entry) = schema::entry(feature_type) {
+        return Ok(entry);
+    }
+    let entry = session.host.call_ok("plugin_feature_schema", json!({"type": feature_type}))
+        .await?.result.ok_or_else(|| format!("unknown feature type `{feature_type}`"))?;
+    if entry["type"].as_str() != Some(feature_type) || !entry["inputParamsSchema"].is_object() {
+        return Err(format!("no installed schema for feature `{feature_type}`"));
+    }
+    Ok(entry)
+}
+
+/// Session-aware catalogue tools. The sessionless API keeps serving built-ins;
+/// live sessions resolve their own plugin revision on every call.
+pub fn session_engine_tools(slot: app::SessionSlot) -> Vec<ToolSpec> {
+    let mut specs = engine_tools();
+    for spec in &mut specs {
+        let fallback = spec.handler.clone();
+        let slot = slot.clone();
+        let catalogue = spec.name == "feature_catalogue";
+        spec.handler = Arc::new(move |args| {
+            let slot = slot.clone();
+            let fallback = fallback.clone();
+            Box::pin(async move {
+                let session = slot.read().await.clone();
+                let Some(session) = session else { return fallback(args).await; };
+                if catalogue {
+                    let raw = session.host.call_ok("plugin_feature_catalogue", json!({})).await?
+                        .result.ok_or("active document returned no feature catalogue")?;
+                    let entries = raw["features"].as_array().ok_or("active document returned an invalid feature catalogue")?;
+                    let features: Vec<Value> = entries.iter().map(|entry| {
+                        let id = schema::identity(entry);
+                        json!({"type":id.feature_type, "shortName":id.short_name,
+                            "longName":id.long_name, "displayBuilder":id.display_builder})
+                    }).collect();
+                    return Ok(ToolOutput::json(json!({"features":features})));
+                }
+                let ty = arg_str(&args, "type")?;
+                if schema::entry(&ty).is_some() { return fallback(args).await; }
+                let entry = session_feature_entry(&session, &ty).await?;
+                let id = schema::identity(&entry);
+                Ok(ToolOutput::json(json!({"type":id.feature_type, "longName":id.long_name,
+                    "schema":schema::to_json_schema(&entry), "defaults":schema::defaults_from_entry(&entry)})))
+            })
+        });
+    }
+    specs
 }
 
 /// Helper for handlers: the arguments as an object map.

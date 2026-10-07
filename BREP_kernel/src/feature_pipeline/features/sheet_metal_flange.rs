@@ -149,6 +149,8 @@ pub fn schema() -> serde_json::Value {
     "type": "SM.F",
     "shortName": "SM.F",
     "longName": "SM Flange",
+    "ribbonPath": "Home/Sheet Metal/Flange",
+    "commandSize": "Compact",
     "displayBuilder": false,
     "inputParamsSchema": {
         "id": {

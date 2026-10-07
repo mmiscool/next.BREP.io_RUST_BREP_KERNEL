@@ -180,7 +180,7 @@ impl Launch {
         // with no document yet. The server says which.
         if let State::Waiting = self.state {
             let (part, _) = split(&self.key);
-            let path = format!("/api/parts/{part}");
+            let path = crate::plm::identity::part_path(&part);
             let client = client.clone();
             self.state = State::Checking(Box::pin(async move {
                 let response = client.call("GET", &path, None).await.map_err(|e| e.to_string())?;
@@ -218,11 +218,8 @@ impl Launch {
     }
 }
 
-fn split(key: &str) -> (&str, &str) {
-    let mut parts = key.split('/');
-    let part = parts.nth(1).unwrap_or("");
-    let revision = parts.nth(1).unwrap_or("");
-    (part, revision)
+fn split(key: &str) -> (String, String) {
+    crate::plm::family::key_ids(key).unwrap_or_default()
 }
 
 /// Drop `?open=` from the address bar without reloading (wasm).

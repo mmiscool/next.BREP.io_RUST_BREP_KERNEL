@@ -444,6 +444,35 @@ pub(super) fn integrate_trimmed_polys(
     let corr_started = super::profile::profile_started();
     curved_boundary_correction(face, polygons, extended, domain, orientation, &station, &mut totals)?;
     mass_profile(|p| p.corr_ms += super::profile::elapsed_ms(corr_started));
+    // On a complete sphere, clockwise trims can be holes in the whole
+    // carrier. Normalizing their winding integrates the removed caps, while
+    // containment and meshing retain their complement. Measure that same
+    // complement. Winding rims and pole caps keep their existing routes.
+    if let Some(crate::AnalyticSurface::Sphere { frame, radius }) = face.surface.analytic() {
+        let mut no_winding = true;
+        for rim in &face.loops {
+            let mut travel = 0.0;
+            for coedge in &rim.coedges {
+                let [a, b] = coedge.pcurve.domain()?;
+                travel += coedge.pcurve.evaluate(b)?.x - coedge.pcurve.evaluate(a)?.x;
+            }
+            no_winding &= travel.abs() <= 1e-7 * (u1 - u0);
+        }
+        let bottom = face.surface.evaluate(u0, v0)?;
+        let top = face.surface.evaluate(u0, v1)?;
+        let pole = frame.axis.scale(*radius);
+        let band = 1e-8 * radius;
+        let complete = face.surface.closed_directions()? == (true, false)
+            && ((bottom.sub(frame.origin.sub(pole)).length() <= band
+                && top.sub(frame.origin.add(pole)).length() <= band)
+                || (bottom.sub(frame.origin.add(pole)).length() <= band
+                    && top.sub(frame.origin.sub(pole)).length() <= band));
+        if complete && no_winding && orientation != sign {
+            for (value, kind) in totals.iter_mut().zip(kinds) {
+                *value = integrate_untrimmed(face, *kind)? - *value;
+            }
+        }
+    }
     Ok(totals)
 }
 

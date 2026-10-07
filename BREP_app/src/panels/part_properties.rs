@@ -53,9 +53,15 @@ pub struct PartPropertiesPanel {
     /// Per-frame egui widget screen rects (keyed `field:<Field>`), published for
     /// the automation layer. Rebuilt every frame.
     hits: HashMap<String, egui::Rect>,
+    configuration: crate::panels::bom_configuration::BomConfiguration,
+    plm_target: Option<(std::rc::Rc<crate::plm::client::PlmClient>,String)>,
 }
 
 impl PartPropertiesPanel {
+    pub fn configure_plm(&mut self,client:Option<std::rc::Rc<crate::plm::client::PlmClient>>,document:Option<&str>){
+        self.plm_target=client.zip(document.filter(|key|crate::plm::bom::revision_of_document(key).is_some()).map(str::to_string));
+        if self.open {if let Some((client,key))=&self.plm_target{self.configuration.ensure(client,vec![key.clone()]);}}
+    }
     pub fn new() -> Self {
         Self::default()
     }
@@ -106,6 +112,11 @@ impl PartPropertiesPanel {
     /// The window body: the part's name, then one labelled row per field.
     fn body(&mut self, ui: &mut egui::Ui, state: &mut EngineState, title: &str, document: u64) {
         self.hits.clear();
+        if let Some((client,key))=&self.plm_target {
+            ui.label(egui::RichText::new(title).strong());
+            self.configuration.attributes_ui(ui,client,key,&mut self.hits);
+            return;
+        }
         ui.label(egui::RichText::new(title).strong());
         ui.label(
             egui::RichText::new(

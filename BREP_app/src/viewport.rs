@@ -70,6 +70,8 @@ pub struct Viewport {
     offscreen: Option<Offscreen>,
     /// True while a camera drag (orbit/pan) started over the viewport is live.
     dragging: bool,
+    touch: touch::TouchNavigation,
+    touch_suppressed: bool,
     /// True while a transform-gizmo HANDLE drag (armed via the in-viewport center
     /// sphere toggle) is live — the pointer press landed on a handle, so the drag
     /// drives the gizmo (edits the feature's transform) instead of orbiting the camera.
@@ -246,6 +248,7 @@ mod interaction;
 mod labels;
 mod popups;
 mod sheet;
+mod touch;
 
 pub use popups::{modal_open_last_pass, popup_open_last_pass};
 

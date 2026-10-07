@@ -97,8 +97,12 @@ impl Aabb {
     }
 
     fn intersects_segment(self, start: Vec3, delta: Vec3, tolerance: f64) -> bool {
+        self.intersects_parametric(start, delta, tolerance, 1.0)
+    }
+
+    fn intersects_parametric(self, start: Vec3, delta: Vec3, tolerance: f64, limit: f64) -> bool {
         let mut enter = 0.0f64;
-        let mut exit = 1.0f64;
+        let mut exit = limit;
         for index in 0..3 {
             let origin = axis(start, index);
             let direction = axis(delta, index);
@@ -128,6 +132,7 @@ impl Aabb {
 
 const LEAF_SIZE: usize = 4;
 
+#[derive(Debug)]
 struct Node {
     bounds: Aabb,
     /// Leaf: start index into `order`. Internal: index of the left child
@@ -141,6 +146,7 @@ struct Node {
 
 /// Static BVH over per-item boxes; queries return indices into the slice
 /// the tree was built from.
+#[derive(Debug)]
 pub struct Bvh {
     nodes: Vec<Node>,
     order: Vec<u32>,
@@ -179,6 +185,23 @@ impl Bvh {
         let delta = end.sub(start);
         self.visit(
             |bounds| bounds.intersects_segment(start, delta, tolerance),
+            out,
+        );
+    }
+
+    /// Collect indices whose box intersects the forward ray. Unlike a segment
+    /// query this has no far limit (camera clipping planes need not bound CPU
+    /// picking). `direction` need not be normalized; boxes behind the origin
+    /// are excluded and grazing hits are retained.
+    pub fn intersecting_ray(
+        &self,
+        origin: Vec3,
+        direction: Vec3,
+        tolerance: f64,
+        out: &mut Vec<usize>,
+    ) {
+        self.visit(
+            |bounds| bounds.intersects_parametric(origin, direction, tolerance, f64::INFINITY),
             out,
         );
     }

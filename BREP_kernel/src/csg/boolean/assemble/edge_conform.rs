@@ -453,6 +453,7 @@ fn conform_overlapping_one_use_edges_pass(
                 // original-boundary identity so its pieces re-weld only to
                 // pieces of the SAME original edge, never to a coincident twin.
                 let parent_key = assembler.edge_boundary_key.get(&edge.id).copied();
+                let parent_constructed = assembler.imprint_edges.contains(&edge.id);
                 let (edge_id, reversed) = assembler.edge(
                     SourceEdge {
                         curve: edge.curve.clone(),
@@ -462,6 +463,7 @@ fn conform_overlapping_one_use_edges_pass(
                         end,
                         degenerate: false,
                         name: edge.name.clone(),
+                        constructed: parent_constructed,
                         boundary_key: parent_key,
                     },
                     forward,

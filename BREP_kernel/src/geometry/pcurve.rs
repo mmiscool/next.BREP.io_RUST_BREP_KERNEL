@@ -68,6 +68,14 @@ fn worst_first() -> bool {
     *ON.get_or_init(|| std::env::var_os("BREP_PCURVE_WORST_FIRST").is_none_or(|value| value != "0"))
 }
 
+/// `BREP_PCURVE_C0_JOIN=0` builds one C2 interpolant through the stations as
+/// before 2026-10-03 (the C0 joins at the curve's corners off), for a
+/// same-binary A/B. Read once per process.
+fn c0_joins() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("BREP_PCURVE_C0_JOIN").is_none_or(|value| value != "0"))
+}
+
 fn seeded_inserts() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("BREP_PCURVE_SEEDED_INSERTS").is_none_or(|value| value != "0"))
@@ -156,11 +164,38 @@ fn unwrap_periodic(values: &mut [f64], minimum: f64, maximum: f64) {
     }
 }
 
+/// The interpolant through `raw_parameters`, and what building it CLAMPED:
+/// the largest parameter distance a sample was pulled back into an open
+/// direction's domain, and the 3D distance between the extended surface at
+/// the raw parameter and the clamped foot. Both zero when nothing was pulled.
+/// A closed direction wraps and is never clamped.
 fn build_interpolant(
     surface: &NurbsSurface,
     raw_parameters: &[[f64; 2]],
     curve_parameters: &[f64],
-) -> Result<NurbsCurve, String> {
+) -> Result<(NurbsCurve, f64, f64), String> {
+    build_interpolant_joined(surface, raw_parameters, curve_parameters, &[])
+}
+
+/// [`build_interpolant`] with C0 JOINS: `joins` are values of
+/// `curve_parameters` at which the edge curve itself has a corner (a knot of
+/// multiplicity ≥ its degree, `range_breaks`). One cubic through all the
+/// stations is C2 everywhere, so across a corner it overshoots on both sides
+/// by a first-order amount however many stations are inserted: `abc_00000011`
+/// face #585 edge 179 (79 such knots on a 241-point curve) read 2.055e-4 off
+/// at 153 stations with the file's curve 2.1e-7 off the carrier (measured
+/// 2026-10-03). The stations have been planted at those knots since
+/// 2026-09-26; what was missing was the interpolant honouring them. Each
+/// piece between joins is interpolated on its own and the pieces are
+/// concatenated at knots of multiplicity 3 — the join `blend/track_fit.rs`
+/// makes for a blend track. A piece shorter than four stations cannot carry
+/// a cubic, so its join is dropped and it merges with its neighbour.
+fn build_interpolant_joined(
+    surface: &NurbsSurface,
+    raw_parameters: &[[f64; 2]],
+    curve_parameters: &[f64],
+    joins: &[f64],
+) -> Result<(NurbsCurve, f64, f64), String> {
     let ([u0, u1], [v0, v1]) = surface_domains(surface)?;
     let (closed_u, closed_v) = surface_closedness(surface)?;
     let mut parameters = raw_parameters.to_vec();
@@ -283,23 +318,80 @@ fn build_interpolant(
     // analytic carriers too: a refitted cylinder can have stepped rims that
     // cross its seam. evaluate_extended wraps every closed direction.
     // Open directions must stay in-domain; their extension is a ruling.
-    let points = parameters
-        .into_iter()
-        .map(|parameter| {
-            let u = if closed_u {
-                parameter[0]
-            } else {
-                parameter[0].clamp(u0, u1)
-            };
-            let v = if closed_v {
-                parameter[1]
-            } else {
-                parameter[1].clamp(v0, v1)
-            };
-            Vec3::new(u, v, 0.0)
-        })
-        .collect::<Vec<_>>();
-    interpolate_curve(&points, 3usize.min(points.len() - 1), curve_parameters)
+    //
+    // The clamp is MEASURED, not silent: a sample pulled back into the domain
+    // is reported as the parameter distance it moved and the 3D distance
+    // between the extended surface at its raw parameter and the clamped foot
+    // ([`PcurveFitReport::clamped_excursion`]). Until 2026-09-30 a trim that
+    // ran past its chart came back folded onto the chart's boundary with
+    // nothing in the report to say so; on the rib-base document that was
+    // 3.03e-2 of volume on a body `validate()` passes.
+    let mut excursion = 0.0_f64;
+    let mut distance = 0.0_f64;
+    let mut points = Vec::with_capacity(parameters.len());
+    for parameter in parameters {
+        let u = if closed_u {
+            parameter[0]
+        } else {
+            parameter[0].clamp(u0, u1)
+        };
+        let v = if closed_v {
+            parameter[1]
+        } else {
+            parameter[1].clamp(v0, v1)
+        };
+        let pulled = ((parameter[0] - u).powi(2) + (parameter[1] - v).powi(2)).sqrt();
+        if pulled > 0.0 {
+            excursion = excursion.max(pulled);
+            let extended = surface.evaluate_extended(parameter[0], parameter[1])?;
+            distance = distance.max(extended.sub(surface.evaluate(u, v)?).length());
+        }
+        points.push(Vec3::new(u, v, 0.0));
+    }
+    let degree = 3usize.min(points.len() - 1);
+    let mut bounds: Vec<usize> = joins
+        .iter()
+        .filter_map(|join| curve_parameters.iter().position(|parameter| parameter == join))
+        .filter(|&index| index > 0 && index + 1 < curve_parameters.len())
+        .collect();
+    bounds.sort_unstable();
+    bounds.dedup();
+    if degree < 3 || bounds.is_empty() || !c0_joins() {
+        let curve = interpolate_curve(&points, degree, curve_parameters)?;
+        return Ok((curve, excursion, distance));
+    }
+    // Every piece needs four stations for a cubic: drop the join that
+    // closes a shorter piece, from the left, until all pieces carry one.
+    let mut pieces = vec![0usize];
+    for bound in bounds {
+        if bound + 1 - pieces[pieces.len() - 1] >= 4 {
+            pieces.push(bound);
+        }
+    }
+    if curve_parameters.len() - pieces[pieces.len() - 1] < 4 {
+        pieces.pop();
+    }
+    pieces.push(curve_parameters.len() - 1);
+    if pieces.len() < 3 {
+        let curve = interpolate_curve(&points, degree, curve_parameters)?;
+        return Ok((curve, excursion, distance));
+    }
+    let mut knots: Vec<f64> = Vec::with_capacity(curve_parameters.len() + 4);
+    let mut control: Vec<Vec4> = Vec::with_capacity(curve_parameters.len());
+    let last_piece = pieces.len() - 2;
+    for piece in 0..=last_piece {
+        let (from, to) = (pieces[piece], pieces[piece + 1]);
+        let fitted = interpolate_curve(&points[from..=to], 3, &curve_parameters[from..=to])?;
+        if piece == 0 {
+            knots.extend(fitted.knots[..4].iter().copied());
+        }
+        knots.extend(fitted.knots[4..fitted.knots.len() - 4].iter().copied());
+        let multiplicity = if piece == last_piece { 4 } else { 3 };
+        knots.extend(std::iter::repeat(curve_parameters[to]).take(multiplicity));
+        control.extend(fitted.control_points.iter().skip(usize::from(piece > 0)).copied());
+    }
+    let curve = NurbsCurve::new(3, knots, control)?;
+    Ok((curve, excursion, distance))
 }
 
 /// The 3D residual a pcurve's image must reach before `build_pcurve_on_surface`
@@ -412,6 +504,27 @@ pub struct PcurveFitReport {
     /// Whether the fit re-entered refinement with [`PCURVE_RAISED_SAMPLES`]
     /// after [`MAX_PCURVE_SAMPLES`] bound with the floor unmet.
     pub raised: bool,
+    /// Largest parameter distance a station's inversion was pulled back into
+    /// an OPEN direction's domain when the returned curve was interpolated: a
+    /// trim asked for outside its chart is folded onto the chart's boundary,
+    /// the edge stays right and the face becomes the wrong region on a body
+    /// `validate()` passes (3.03e-2 of volume on the rib-base document). Zero
+    /// when nothing was pulled. A REPORT, not a bar: nothing here refuses on
+    /// it. Its coverage is the clamp in `build_interpolant`, which is the only
+    /// place a raw out-of-domain parameter reaches today — an affine carrier's
+    /// inversion is unclamped, so an affine plane fitted through the station
+    /// lane reads here. It does NOT see a clamp the projector applied before
+    /// the fit: the analytic `Plane` closed form (a non-affine net) clamps to
+    /// its domain, `RuledRevolution` clamps its axial parameter to `[0, 1]`
+    /// and the general Newton clamps through `fit_parameter`; those stations
+    /// arrive in-domain and read as `off_surface` instead. The exact affine
+    /// lanes (`fit_pcurve_on_surface` on an affine carrier,
+    /// `affine_pcurve_on_range`) never clamp and read zero by construction.
+    pub clamped_excursion: f64,
+    /// The 3D distance the clamp corresponds to: between the extended surface
+    /// at the raw parameter and the clamped foot, at the station of the
+    /// largest such distance. Zero when nothing was pulled.
+    pub clamped_distance: f64,
 }
 
 impl PcurveFitReport {
@@ -460,6 +573,10 @@ pub enum PcurveFitExit {
     /// raised pass) the pcurve already tracks the surface's nearest point to
     /// within the floor. Either way the edge curve itself sits off the surface
     /// there and no pcurve can close that gap; the residual reports how far.
+    /// The range lane's end-span challenger (its station fitter's TRACKING
+    /// mode) also exits here when a round's probes all track their feet
+    /// within the floor while the deviation residual, which includes the
+    /// edge's standoff, stays over it.
     Stalled,
     /// The last probe round found every span it PROBED within the floor, but
     /// skipped spans narrower than the loop's own resolution floor — 1e-3 of
@@ -523,6 +640,13 @@ pub struct PcurveFitLedger {
     pub raise_declined: u64,
     /// Largest [`PcurveFitReport::off_surface`] over every fit.
     pub worst_off_surface: f64,
+    /// Fits whose interpolant was clamped into an open direction's domain
+    /// ([`PcurveFitReport::clamped_excursion`] above zero), met or not.
+    pub clamped: u64,
+    /// Largest [`PcurveFitReport::clamped_excursion`] over every fit.
+    pub worst_clamped_excursion: f64,
+    /// Largest [`PcurveFitReport::clamped_distance`] over every fit.
+    pub worst_clamped_distance: f64,
 }
 
 impl PcurveFitLedger {
@@ -532,6 +656,11 @@ impl PcurveFitLedger {
             self.raised += 1;
         }
         self.worst_off_surface = self.worst_off_surface.max(report.off_surface);
+        if report.clamped_excursion > 0.0 {
+            self.clamped += 1;
+            self.worst_clamped_excursion = self.worst_clamped_excursion.max(report.clamped_excursion);
+            self.worst_clamped_distance = self.worst_clamped_distance.max(report.clamped_distance);
+        }
         if report.met_floor() {
             return;
         }
@@ -562,6 +691,9 @@ impl PcurveFitLedger {
         self.raised += child.raised;
         self.raise_declined += child.raise_declined;
         self.worst_off_surface = self.worst_off_surface.max(child.worst_off_surface);
+        self.clamped += child.clamped;
+        self.worst_clamped_excursion = self.worst_clamped_excursion.max(child.worst_clamped_excursion);
+        self.worst_clamped_distance = self.worst_clamped_distance.max(child.worst_clamped_distance);
     }
 
     /// Write the tally into an operation's diagnostics: the `pcurve.*`
@@ -580,6 +712,9 @@ impl PcurveFitLedger {
         diagnostics.count_n("pcurve.budget_raise_declined", self.raise_declined);
         diagnostics.measure_max("pcurve.worst_unmet_residual", self.worst_unmet_residual);
         diagnostics.measure_max("pcurve.worst_off_surface", self.worst_off_surface);
+        diagnostics.count_n("pcurve.clamped", self.clamped);
+        diagnostics.measure_max("pcurve.worst_clamped_excursion", self.worst_clamped_excursion);
+        diagnostics.measure_max("pcurve.worst_clamped_distance", self.worst_clamped_distance);
         if self.unmet > 0 {
             diagnostics.event(
                 DiagnosticSeverity::Degraded,
@@ -589,7 +724,7 @@ impl PcurveFitLedger {
                     "{} of {} pcurve fits did not reach the {:.0e} floor \
                      (sample ceiling {}, round budget {}, stalled {}, span floor {}); \
                      worst residual {:.3e}; budget raised on {}, declined on {}; \
-                     edge curves sit off their surfaces by up to {:.3e}",
+                     edge curves sit off their surfaces by up to {:.3e}{}",
                     self.unmet,
                     self.fits,
                     PCURVE_REFINEMENT_TOLERANCE,
@@ -601,9 +736,130 @@ impl PcurveFitLedger {
                     self.raised,
                     self.raise_declined,
                     self.worst_off_surface,
+                    if self.clamped > 0 {
+                        format!(
+                            "; {} fit(s) clamped into their chart by up to {:.3e} in parameter, {:.3e} in 3D",
+                            self.clamped, self.worst_clamped_excursion, self.worst_clamped_distance
+                        )
+                    } else {
+                        String::new()
+                    },
                 ),
             );
         }
+    }
+}
+
+thread_local! {
+    /// The open [`FootMemo`] on this thread, if any ([`FootMemoScope`]).
+    static FOOT_MEMO: std::cell::RefCell<Option<FootMemo>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Exact-input memo of the common reader's projections on ONE surface: the
+/// global foot of an edge point and the foot seeded at a (u, v), keyed by the
+/// bit patterns of their inputs. Both projectors are pure functions of
+/// (surface, point[, seed]), so a hit returns the value a fresh call would:
+/// the readings, decisions and fits are bit-identical with or without it.
+/// It exists for cost: within one coedge the same edge points are read by
+/// the trigger read, every tracking-mode verification round, the
+/// challenger's final read and the importer's keep read, each of which
+/// projected them again (`importTestWorking`, 2026-10-05: about 10k probes
+/// read 3-5 times on each of nine off-carrier refits, 3-5 s apiece).
+struct FootMemo {
+    surface: *const NurbsSurface,
+    global: rustc_hash::FxHashMap<[u64; 3], Option<crate::SurfaceProjection>>,
+    seeded: rustc_hash::FxHashMap<[u64; 5], Option<crate::SurfaceProjection>>,
+}
+
+/// Opens a [`FootMemo`] for `surface` on this thread until dropped. Opening
+/// one where a memo for the SAME surface is already open reuses it (an inner
+/// scope, e.g. the range challenger inside an importer coedge); a memo for
+/// another surface is set aside and restored on drop. The borrow of `surface`
+/// keeps it alive and unmodified for the scope, so the pointer key cannot be
+/// reused by another surface while the memo answers for it.
+pub(crate) struct FootMemoScope<'a> {
+    previous: Option<Option<FootMemo>>,
+    _surface: std::marker::PhantomData<&'a NurbsSurface>,
+    /// Not `Send`: the scope must close on the thread that opened it.
+    _thread_bound: std::marker::PhantomData<*const ()>,
+}
+
+impl<'a> FootMemoScope<'a> {
+    pub(crate) fn open(surface: &'a NurbsSurface) -> Self {
+        let key = surface as *const NurbsSurface;
+        let previous = FOOT_MEMO.with(|memo| {
+            let mut memo = memo.borrow_mut();
+            if memo.as_ref().is_some_and(|open| std::ptr::eq(open.surface, key)) {
+                None
+            } else {
+                Some(memo.replace(FootMemo { surface: key, global: Default::default(), seeded: Default::default() }))
+            }
+        });
+        Self { previous, _surface: std::marker::PhantomData, _thread_bound: std::marker::PhantomData }
+    }
+}
+
+impl Drop for FootMemoScope<'_> {
+    fn drop(&mut self) {
+        if let Some(previous) = self.previous.take() {
+            FOOT_MEMO.with(|memo| *memo.borrow_mut() = previous);
+        }
+    }
+}
+
+fn point_bits(point: Vec3) -> [u64; 3] {
+    [point.x.to_bits(), point.y.to_bits(), point.z.to_bits()]
+}
+
+/// [`project_point_to_surface`] as `.ok()`, through the open memo for this
+/// surface when there is one. `#[track_caller]`: the projector still sees the
+/// reader's own call site. Under a `BREP_PROJECTION_GLOBAL_SITES`/`_EXCEPT`
+/// filter the projector's answer depends on that site, so the memo is not
+/// consulted then.
+#[track_caller]
+fn memo_global_foot(surface: &NurbsSurface, point: Vec3) -> Option<crate::SurfaceProjection> {
+    if crate::projection::global_site_filter_active() {
+        return project_point_to_surface(surface, point).ok();
+    }
+    let key = point_bits(point);
+    let hit = FOOT_MEMO.with(|memo| {
+        memo.borrow().as_ref().filter(|open| std::ptr::eq(open.surface, surface)).map(|open| open.global.get(&key).copied())
+    });
+    match hit {
+        Some(Some(foot)) => foot,
+        Some(None) => {
+            let foot = project_point_to_surface(surface, point).ok();
+            FOOT_MEMO.with(|memo| {
+                if let Some(open) = memo.borrow_mut().as_mut().filter(|open| std::ptr::eq(open.surface, surface)) {
+                    open.global.insert(key, foot);
+                }
+            });
+            foot
+        }
+        None => project_point_to_surface(surface, point).ok(),
+    }
+}
+
+/// [`project_point_to_surface_seeded`] as `.ok()`, through the open memo for
+/// this surface when there is one.
+fn memo_seeded_foot(surface: &NurbsSurface, point: Vec3, seed_u: f64, seed_v: f64) -> Option<crate::SurfaceProjection> {
+    let [x, y, z] = point_bits(point);
+    let key = [x, y, z, seed_u.to_bits(), seed_v.to_bits()];
+    let hit = FOOT_MEMO.with(|memo| {
+        memo.borrow().as_ref().filter(|open| std::ptr::eq(open.surface, surface)).map(|open| open.seeded.get(&key).copied())
+    });
+    match hit {
+        Some(Some(foot)) => foot,
+        Some(None) => {
+            let foot = project_point_to_surface_seeded(surface, point, seed_u, seed_v).ok();
+            FOOT_MEMO.with(|memo| {
+                if let Some(open) = memo.borrow_mut().as_mut().filter(|open| std::ptr::eq(open.surface, surface)) {
+                    open.seeded.insert(key, foot);
+                }
+            });
+            foot
+        }
+        None => project_point_to_surface_seeded(surface, point, seed_u, seed_v).ok(),
     }
 }
 
@@ -612,6 +868,11 @@ thread_local! {
     static PCURVE_FIT_SCOPES: std::cell::RefCell<Vec<PcurveFitLedger>> =
         const { std::cell::RefCell::new(Vec::new()) };
 }
+
+/// `BREP_DEBUG_PCURVE_FIT` only: a process-wide id per [`refine_pcurve`]
+/// call, so its first-pass and candidate `PCURVE-TRACK` lines pair up even
+/// when fits run on several threads.
+static PCURVE_TRACK_CALL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// An open tally of the pcurve fits made on this thread — see
 /// [`PcurveFitLedger`]. Open it where an operation starts, [`close`] it where
@@ -655,7 +916,7 @@ impl Drop for PcurveFitScope {
     }
 }
 
-fn record_fit(report: &PcurveFitReport) {
+pub(crate) fn record_fit(report: &PcurveFitReport) {
     // Per-fit trace for the convergence probes (`trim_floor_sweep_probe` and
     // its offset-shell sibling): one line per fit with the whole report, the
     // way `BREP_DEBUG_PCURVE` traces an endpoint failure.
@@ -678,22 +939,211 @@ fn probe_residual(
     curve: &NurbsCurve,
     pcurve: &NurbsCurve,
     parameters: &[f64],
+    domain: [f64; 2],
+    _u_domain: [f64; 2],
+    _v_domain: [f64; 2],
+) -> Result<f64, String> {
+    probe_residual_at(surface, curve, pcurve, parameters, domain, &[0.25, 0.5, 0.75])
+}
+
+/// Extra interior points per sample span, at `j/17` for `j = 1..=16`, that
+/// [`tracking_acceptance_residual`] reads IN ADDITION to [`probe_residual`]'s
+/// quarter, mid and three-quarter points (nineteen fractions per span in
+/// all), so it can never read below the three-point maximum on the same
+/// curve. The three quarter-points under-read the sixteen-point maximum by
+/// 3.3–6.5 % on the constructed-cylinder union's imprint pcurves, and sixteen
+/// sit within 0.4 % of sixty-four there (2026-10-04); the Converged path keeps
+/// its own read.
+const TRACKING_ACCEPTANCE_POINTS: usize = 16;
+
+/// The same-parameter image-vs-edge distance of `pcurve` at `locals` (span
+/// fractions) inside every span of `parameters`: the largest, or an error if
+/// any is not finite.
+fn probe_residual_at(
+    surface: &NurbsSurface,
+    curve: &NurbsCurve,
+    pcurve: &NurbsCurve,
+    parameters: &[f64],
     [t0, t1]: [f64; 2],
-    [u0, u1]: [f64; 2],
-    [v0, v1]: [f64; 2],
+    locals: &[f64],
 ) -> Result<f64, String> {
     let mut worst = 0.0_f64;
     for span in parameters.windows(2) {
-        for local in [0.25, 0.5, 0.75] {
+        for &local in locals {
             let fraction = span[0] + (span[1] - span[0]) * local;
             let parameter = pcurve.evaluate(fraction)?;
             let on_surface =
-                surface.evaluate(parameter.x.clamp(u0, u1), parameter.y.clamp(v0, v1))?;
+                surface.evaluate_extended(parameter.x, parameter.y)?;
             let on_curve = curve.evaluate(t0 + (t1 - t0) * fraction)?;
-            worst = worst.max(on_surface.sub(on_curve).length());
+            // `f64::max` drops a NaN operand, so a non-finite distance would
+            // leave `worst` reading the finite stations only. A residual that
+            // can accept a curve must have measured every station: fail
+            // closed instead.
+            let distance = on_surface.sub(on_curve).length();
+            if !distance.is_finite() {
+                return Err(format!(
+                    "probe_residual: non-finite image distance {distance} at fraction {fraction}"
+                ));
+            }
+            worst = worst.max(distance);
         }
     }
     Ok(worst)
+}
+
+/// The probe fractions a native read takes for the given pcurves: both
+/// domain ENDPOINTS, and the quarter points plus 16 interior points of every
+/// span between each curve's OWN distinct knots (the installed interpolant's
+/// spans, not the construction stations). Merged over all the curves, sorted
+/// and deduplicated, so a standing fit and a candidate are read at the SAME
+/// fractions.
+pub(crate) fn native_probe_fractions(curves: &[&NurbsCurve]) -> Result<Vec<f64>, String> {
+    let locals: Vec<f64> = [0.25, 0.5, 0.75]
+        .into_iter()
+        .chain((1..=TRACKING_ACCEPTANCE_POINTS).map(|index| index as f64 / (TRACKING_ACCEPTANCE_POINTS + 1) as f64))
+        .collect();
+    let mut fractions = Vec::new();
+    for curve in curves {
+        let [q0, q1] = curve.domain()?;
+        fractions.push(q0);
+        fractions.push(q1);
+        let mut knots: Vec<f64> = curve.knots.iter().copied().filter(|k| *k >= q0 && *k <= q1).collect();
+        knots.dedup();
+        for span in knots.windows(2).filter(|w| w[1] > w[0]) {
+            for &local in &locals {
+                fractions.push(span[0] + (span[1] - span[0]) * local);
+            }
+        }
+    }
+    fractions.sort_by(f64::total_cmp);
+    fractions.dedup();
+    Ok(fractions)
+}
+
+/// One pcurve read at given probe fractions against the edge curve (whose
+/// parameter is t0 + (t1 - t0) x fraction): the image's distance from the
+/// edge point's FOOT on the carrier (its TRACKING, the part a pcurve can
+/// improve; the foot is seeded at the pcurve's own uv, closed form on an
+/// analytic carrier), the image's distance from the edge point itself (the
+/// same-parameter DEVIATION), and the edge point's distance from the carrier
+/// (its INHERITED STANDOFF). Maxima over the probes; fails closed on any
+/// non-finite point or distance.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct NativeRead {
+    tracking: f64,
+    deviation: f64,
+    standoff: f64,
+}
+
+fn native_read(surface: &NurbsSurface, curve: &NurbsCurve, pcurve: &NurbsCurve, [t0, t1]: [f64; 2], fractions: &[f64]) -> Result<NativeRead, String> {
+    let mut read = NativeRead { tracking: 0.0, deviation: 0.0, standoff: 0.0 };
+    for &fraction in fractions {
+        let parameter = pcurve.evaluate(fraction)?;
+        let image = surface.evaluate_extended(parameter.x, parameter.y)?;
+        let on_curve = curve.evaluate(t0 + (t1 - t0) * fraction)?;
+        let foot = crate::projection::project_point_to_surface_from_seed(surface, on_curve, [parameter.x, parameter.y])?;
+        let tracking = image.sub(foot.point).length();
+        let deviation = image.sub(on_curve).length();
+        if !(tracking.is_finite() && deviation.is_finite() && foot.distance.is_finite()) {
+            return Err(format!("native read: non-finite reading at fraction {fraction}"));
+        }
+        read.tracking = read.tracking.max(tracking);
+        read.deviation = read.deviation.max(deviation);
+        read.standoff = read.standoff.max(foot.distance);
+    }
+    Ok(read)
+}
+
+/// Whether an off-carrier tracking candidate replaces the standing fit, both
+/// read at the SAME probes ([`native_probe_fractions`] of both curves): its
+/// tracking finite, within the unchanged floor and strictly lower, AND its
+/// same-parameter deviation no worse (the reported total, inherited standoff
+/// included, must not grow), AND its own refinement fields finite.
+fn standoff_candidate_accepted(standing: NativeRead, candidate: NativeRead, candidate_fields_finite: bool, floor: f64) -> bool {
+    candidate_fields_finite
+        && candidate.tracking.is_finite()
+        && candidate.deviation.is_finite()
+        && candidate.tracking <= floor
+        && candidate.tracking < standing.tracking
+        && candidate.deviation <= standing.deviation
+}
+
+/// [`probe_residual_at`] at [`probe_residual`]'s three quarter-points plus
+/// [`TRACKING_ACCEPTANCE_POINTS`] evenly spaced interior points of every span
+/// (nineteen per span): the maximum of the old three-point reading and the
+/// sixteen-point one. It is the reading a budget-exit tracking candidate is
+/// accepted on, and the residual it is then reported with.
+fn tracking_acceptance_residual(
+    surface: &NurbsSurface,
+    curve: &NurbsCurve,
+    pcurve: &NurbsCurve,
+    parameters: &[f64],
+    domain: [f64; 2],
+) -> Result<f64, String> {
+    let locals: Vec<f64> = [0.25, 0.5, 0.75]
+        .into_iter()
+        .chain((1..=TRACKING_ACCEPTANCE_POINTS).map(|index| index as f64 / (TRACKING_ACCEPTANCE_POINTS + 1) as f64))
+        .collect();
+    probe_residual_at(surface, curve, pcurve, parameters, domain, &locals)
+}
+
+/// Whether a projection-tracking candidate replaces the fit standing in
+/// [`refine_pcurve`], given the `reading` it is judged on (see
+/// [`judge_tracking_candidate`]). `standing_dense` says the standing fit's
+/// reading is itself a nineteen-point one: a budget-exit candidate was taken.
+///
+/// While the standing reading is the fitter's own, a `Converged` candidate is
+/// taken exactly as before (within the floor, better). A BUDGET exit
+/// (`SampleCeiling`, `RoundBudget`, `Stalled`, `SpanFloor`) is taken only to
+/// repair a standing fit that MISSES the floor, and only when its
+/// nineteen-point reading is finite, within the unchanged floor and strictly
+/// better. Once the standing reading is a nineteen-point one, every later
+/// candidate is compared nineteen against nineteen: a Converged one must read
+/// finite, within the floor and strictly better on the same stencil, and a
+/// budget exit is never taken (the standing fit is then within the floor).
+/// The exit label says how the loop stopped, not whether the curve is good: on
+/// the 15° constructed-cylinder union all six imprint pcurves that shipped
+/// 1.3e-7..7.0e-6 off had a tracking candidate reading 1.4e-8..9.95e-8 at
+/// three points per span, discarded for its label (2026-10-04). A standing
+/// fit already within the floor is never replaced by a budget exit, so every
+/// in-floor fit is unchanged; a taken candidate keeps its own exit, samples
+/// and raise, and reports the reading it was taken on.
+fn tracking_candidate_accepted(standing: f64, standing_dense: bool, floor: f64, exit: PcurveFitExit, reading: f64) -> bool {
+    if exit == PcurveFitExit::Converged && !standing_dense {
+        return reading <= floor && reading < standing;
+    }
+    if exit != PcurveFitExit::Converged && !(standing > floor) {
+        return false;
+    }
+    reading.is_finite() && reading <= floor && reading < standing
+}
+
+/// The reading a tracking candidate is judged on, and whether it replaces the
+/// standing fit: `own` (the candidate's own residual) for a Converged
+/// candidate while the standing reading is the fitter's own; otherwise
+/// `dense` ([`tracking_acceptance_residual`]'s nineteen points per span), read
+/// only when the candidate could be taken. An error from `dense` declines.
+/// [`refine_pcurve`] decides and traces through this one function.
+fn judge_tracking_candidate(
+    standing: f64,
+    standing_dense: bool,
+    floor: f64,
+    exit: PcurveFitExit,
+    own: f64,
+    dense: impl FnOnce() -> Result<f64, String>,
+) -> (Result<Option<f64>, String>, bool) {
+    let reading = if exit == PcurveFitExit::Converged && !standing_dense {
+        Ok(Some(own))
+    } else if exit == PcurveFitExit::Converged || standing > floor {
+        dense().map(Some)
+    } else {
+        Ok(None)
+    };
+    let accepted = matches!(
+        reading,
+        Ok(Some(value)) if tracking_candidate_accepted(standing, standing_dense, floor, exit, value)
+    );
+    (reading, accepted)
 }
 
 /// What one call to [`refine_pcurve`] achieved, beside the curve it left in
@@ -703,6 +1153,9 @@ struct Refinement {
     residual: f64,
     off_surface: f64,
     raised: bool,
+    /// [`PcurveFitReport::clamped_excursion`] and
+    /// [`PcurveFitReport::clamped_distance`] of the curve left in place.
+    clamped: [f64; 2],
 }
 
 /// Adaptive 3D-residual refinement of an interpolant, with the PER-TRIM sample
@@ -745,42 +1198,322 @@ fn refine_pcurve(
     u_domain: [f64; 2],
     v_domain: [f64; 2],
     floor: f64,
+    joins: &[f64],
     parameters: &mut Vec<f64>,
     raw: &mut Vec<[f64; 2]>,
     pcurve: &mut NurbsCurve,
     off_surface: f64,
+    clamped: [f64; 2],
     mut insert: impl FnMut(f64, Vec3, Vec3) -> Result<(Option<[f64; 2]>, f64), String>,
 ) -> Result<Refinement, String> {
+    // Trace only (`BREP_DEBUG_PCURVE_FIT`): reads values the passes already
+    // computed and decides nothing.
+    let trace = std::env::var_os("BREP_DEBUG_PCURVE_FIT").is_some();
+    let call = if trace {
+        PCURVE_TRACK_CALL.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
+    } else {
+        0
+    };
     let mut best = refine_pcurve_pass(surface, curve, domain, u_domain, v_domain,
-        floor, parameters, raw, pcurve, off_surface, false, 1.0, &mut insert)?;
-    if best.off_surface > floor { return Ok(best); }
+        floor, joins, parameters, raw, pcurve, off_surface, clamped, false, 1.0, false, &mut insert)?;
+    if trace {
+        eprintln!(
+            "PCURVE-TRACK call={call} first-pass exit={:?} residual={:e} floor={floor:e} off_surface={:e} samples={} raised={} tracking={}",
+            best.exit,
+            best.residual,
+            best.off_surface,
+            parameters.len(),
+            best.raised,
+            if best.off_surface <= floor { "eligible" } else { "standoff-tracking" }
+        );
+    }
+    if best.off_surface > floor {
+        // The edge curve itself stands off the carrier by more than the floor
+        // (its INHERITED standoff), so no pcurve can bring the image within the
+        // floor of the edge point. What a pcurve CAN improve is its tracking
+        // error: the image's distance from the edge point's foot. Measured
+        // 2026-10-04 (a2b401d4d, 15-degree crossing, turn 295): a first pass
+        // ended RoundBudget at 6.726e-6 over a 1.316e-7 standoff and every
+        // tracking pass was skipped. No candidate refinement when the ACTUAL
+        // tracking request is met: the first pass's own tracking, read on its
+        // native spans and endpoints (a diagnostic read; it adds no station),
+        // within the floor ([`standoff_tracking_rungs`]). A total residual
+        // under standoff + floor does not prove that: a tangential slip t over
+        // a standoff g reads sqrt(g^2 + t^2) < g + t.
+        // `BREP_PCURVE_STANDOFF_TRACKING=0`: diagnostic A/B hatch, not a
+        // policy. It restores the pre-lane answer (35c8610a1's parent: an
+        // off-carrier first pass is returned as it stands) for a same-binary
+        // attribution of a volume or census delta to this lane. Default (unset
+        // or any other value) is unchanged. It does not touch the in-floor
+        // tracking rungs or their raise rule, nor the range lane's end-span
+        // challenger.
+        if !standoff_tracking_enabled() {
+            return Ok(best);
+        }
+        return standoff_tracking_rungs(surface, curve, domain, u_domain, v_domain, floor, joins,
+            parameters, raw, pcurve, best, trace, call, &mut insert);
+    }
     // Each target starts from the same baseline station set: retaining the
     // coarser target's inserts can exhaust the cap before the finer target
-    // places its own error-directed stations. Keep the best converged rung.
+    // places its own error-directed stations. Keep the best rung
+    // [`tracking_candidate_accepted`] takes.
     let baseline_parameters = parameters.clone();
     let baseline_raw = raw.clone();
     let baseline_curve = pcurve.clone();
     let baseline_off_surface = best.off_surface;
+    let baseline_clamped = best.clamped;
+    // Whether the first pass MISSED the floor: only then may a tracking
+    // candidate that reaches the sample ceiling still missing its request take
+    // the existing one-time raise (2026-10-04, 20-degree crossing, turn 295:
+    // a 1.964e-6 first pass, a candidate at 600 samples reading 1.068e-7,
+    // declined; the raise needed residual > off_surface + floor). A first pass
+    // within the floor keeps exactly the work it did before.
+    // (On this path the edge stands within the floor of the carrier, so a
+    // first pass over the floor is a tracking miss, not inherited standoff.)
+    let standing_misses = best.residual > floor;
+    Ok(tracking_rungs(
+        best,
+        floor,
+        trace,
+        call,
+        true,
+        |fraction| {
+            let mut refined_parameters = baseline_parameters.clone();
+            let mut refined_raw = baseline_raw.clone();
+            let mut refined_curve = baseline_curve.clone();
+            let candidate = refine_pcurve_pass(surface, curve, domain, u_domain, v_domain,
+                floor, joins, &mut refined_parameters, &mut refined_raw, &mut refined_curve,
+                baseline_off_surface, baseline_clamped, true, fraction, standing_misses, &mut insert);
+            (candidate, (refined_parameters, refined_raw, refined_curve))
+        },
+        |state: &RungState| tracking_acceptance_residual(surface, curve, &state.2, &state.0, domain),
+        |state: &RungState| state.0.len(),
+        |(refined_parameters, refined_raw, refined_curve): RungState| {
+            *parameters = refined_parameters;
+            *raw = refined_raw;
+            *pcurve = refined_curve;
+        },
+    ))
+}
+
+/// A tracking candidate's station parameters, raw surface parameters and
+/// pcurve, as [`refine_pcurve`] hands them to [`tracking_rungs`].
+type RungState = (Vec<f64>, Vec<[f64; 2]>, NurbsCurve);
+
+/// The tracking rungs of [`refine_pcurve`] after an eligible first pass: for
+/// each tracking fraction, skip it if the standing fit is already that far
+/// inside the floor, otherwise run the candidate pass (`run_pass`), judge it
+/// ([`judge_tracking_candidate`], reading `dense` only when needed), trace
+/// it, and either take it (`adopt` its state; it becomes the standing fit) or
+/// stop. `samples` is the candidate's station count, for the trace. Separated
+/// so the accepted-budget state can be driven with scripted passes;
+/// `thread_dense` is `true` in production and `false` only to show, in a
+/// test, what dropping the nineteen-point standing flag would take.
+#[allow(clippy::too_many_arguments)]
+fn tracking_rungs<S>(
+    mut best: Refinement,
+    floor: f64,
+    trace: bool,
+    call: u64,
+    thread_dense: bool,
+    mut run_pass: impl FnMut(f64) -> (Result<Refinement, String>, S),
+    mut dense: impl FnMut(&S) -> Result<f64, String>,
+    samples: impl Fn(&S) -> usize,
+    mut adopt: impl FnMut(S),
+) -> Refinement {
+    // Whether the standing reading is a nineteen-point one (a budget-exit
+    // candidate was taken); every later candidate is then judged on it.
+    let mut standing_dense = false;
     for fraction in [0.1, 0.01] {
-        if best.residual <= floor * fraction { continue; }
-        let mut refined_parameters = baseline_parameters.clone();
-        let mut refined_raw = baseline_raw.clone();
-        let mut refined_curve = baseline_curve.clone();
-        let candidate = refine_pcurve_pass(surface, curve, domain, u_domain, v_domain,
-            floor, &mut refined_parameters, &mut refined_raw, &mut refined_curve,
-            baseline_off_surface, true, fraction, &mut insert);
+        if best.residual <= floor * fraction {
+            if trace {
+                eprintln!(
+                    "PCURVE-TRACK call={call} candidate fraction={fraction} skipped best_residual={:e} <= {:e}",
+                    best.residual,
+                    floor * fraction
+                );
+            }
+            continue;
+        }
+        let (candidate, state) = run_pass(fraction);
+        // The reading the candidate is judged on and the decision (see
+        // judge_tracking_candidate); an unreadable read declines like a
+        // failed pass.
+        let judged_dense = matches!(&candidate, Ok(seen) if seen.exit != PcurveFitExit::Converged || standing_dense);
+        let (effective, accepted) = match &candidate {
+            Ok(seen) => judge_tracking_candidate(best.residual, standing_dense, floor, seen.exit, seen.residual, || {
+                dense(&state)
+            }),
+            Err(_) => (Ok(None), false),
+        };
+        if trace {
+            let judged_on = match &effective {
+                Ok(Some(reading)) => format!("{reading:e}"),
+                Ok(None) => "-".to_string(),
+                Err(message) => format!("error:{message:?}"),
+            };
+            match &candidate {
+                Ok(seen) => eprintln!(
+                    "PCURVE-TRACK call={call} candidate fraction={fraction} exit={:?} residual={:e} judged_on={judged_on} standing_dense={standing_dense} floor={floor:e} off_surface={:e} samples={} raised={} residual_meets_floor={} decision={}",
+                    seen.exit,
+                    seen.residual,
+                    seen.off_surface,
+                    samples(&state),
+                    seen.raised,
+                    seen.residual <= floor,
+                    if accepted { "accept" } else { "decline-stop" }
+                ),
+                Err(message) => eprintln!(
+                    "PCURVE-TRACK call={call} candidate fraction={fraction} error={message:?} decision=decline-stop"
+                ),
+            }
+        }
         match candidate {
-            Ok(candidate) if candidate.exit == PcurveFitExit::Converged
-                && candidate.residual <= floor && candidate.residual < best.residual => {
-                *parameters = refined_parameters;
-                *raw = refined_raw;
-                *pcurve = refined_curve;
+            Ok(mut candidate) if accepted => {
+                // Report the reading it was taken on (its own, if Converged).
+                if let Ok(Some(reading)) = effective {
+                    candidate.residual = reading;
+                }
+                // From here on the standing reading is a nineteen-point one.
+                if thread_dense {
+                    standing_dense |= judged_dense;
+                }
+                adopt(state);
                 best = candidate;
             }
             _ => break,
         }
     }
+    best
+}
+
+/// Whether [`refine_pcurve`] takes [`standoff_tracking_rungs`] for an
+/// off-carrier first pass: true unless `BREP_PCURVE_STANDOFF_TRACKING=0`
+/// (diagnostic A/B hatch, read once per process).
+fn standoff_tracking_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("BREP_PCURVE_STANDOFF_TRACKING").is_none_or(|value| value != "0"))
+}
+
+/// The tracking rungs for an edge curve that stands OFF its carrier by more
+/// than the floor ([`refine_pcurve`]). The first pass is read natively
+/// ([`native_read`] on its own knot spans and endpoints); when its tracking is
+/// within the floor, or the read fails, nothing more is done. Otherwise each
+/// candidate pass (fractions 0.1 then 0.01 of the floor, from the same
+/// baseline stations, taking the one-time raise when its own tracking target
+/// is cut short by the ceiling) is read with the standing fit at the SAME
+/// probes (both curves' native spans and endpoints) and taken only per
+/// [`standoff_candidate_accepted`]: tracking finite, within the unchanged
+/// floor and strictly lower, same-parameter deviation no worse, refinement
+/// fields finite. A taken fit is REPORTED with its same-probe deviation
+/// (inherited standoff included, so still over the floor) and with an
+/// `off_surface` that is the larger of its station reading and the probes'
+/// standoff. Any error, or a candidate that does not qualify, stops the loop
+/// and keeps the standing curve and report.
+#[allow(clippy::too_many_arguments)]
+fn standoff_tracking_rungs(
+    surface: &NurbsSurface,
+    curve: &NurbsCurve,
+    domain: [f64; 2],
+    u_domain: [f64; 2],
+    v_domain: [f64; 2],
+    floor: f64,
+    joins: &[f64],
+    parameters: &mut Vec<f64>,
+    raw: &mut Vec<[f64; 2]>,
+    pcurve: &mut NurbsCurve,
+    mut best: Refinement,
+    trace: bool,
+    call: u64,
+    insert: &mut impl FnMut(f64, Vec3, Vec3) -> Result<(Option<[f64; 2]>, f64), String>,
+) -> Result<Refinement, String> {
+    let first = native_probe_fractions(&[&*pcurve]).and_then(|probes| native_read(surface, curve, pcurve, domain, &probes));
+    if trace {
+        eprintln!("PCURVE-TRACK call={call} standoff-tracking first-pass native={first:?} floor={floor:e}");
+    }
+    let Ok(first) = first else { return Ok(best) };
+    if first.tracking <= floor {
+        return Ok(best);
+    }
+    let baseline_parameters = parameters.clone();
+    let baseline_raw = raw.clone();
+    let baseline_curve = pcurve.clone();
+    for fraction in [0.1, 0.01] {
+        let mut refined_parameters = baseline_parameters.clone();
+        let mut refined_raw = baseline_raw.clone();
+        let mut refined_curve = baseline_curve.clone();
+        let candidate = refine_pcurve_pass(surface, curve, domain, u_domain, v_domain, floor, joins,
+            &mut refined_parameters, &mut refined_raw, &mut refined_curve, best.off_surface, best.clamped,
+            true, fraction, true, &mut *insert);
+        let reads = candidate.as_ref().ok().map(|_| {
+            native_probe_fractions(&[&*pcurve, &refined_curve]).and_then(|probes| {
+                Ok((native_read(surface, curve, pcurve, domain, &probes)?, native_read(surface, curve, &refined_curve, domain, &probes)?))
+            })
+        });
+        let fields_finite = matches!(&candidate, Ok(seen) if seen.residual.is_finite() && seen.off_surface.is_finite());
+        let decision = match &reads {
+            Some(Ok((standing, read))) => standoff_rung_decision(*standing, *read, fields_finite, floor),
+            _ => RungDecision::Stop,
+        };
+        if trace {
+            eprintln!(
+                "PCURVE-TRACK call={call} standoff-tracking fraction={fraction} candidate={} reads={reads:?} decision={}",
+                match &candidate { Ok(seen) => format!("{:?}/{:e}/raised={}", seen.exit, seen.residual, seen.raised), Err(message) => format!("error:{message:?}") },
+                match decision { RungDecision::Accept => "accept", RungDecision::Continue => "decline-continue", RungDecision::Stop => "decline-stop" }
+            );
+        }
+        let (Ok(mut taken), Some(Ok((_, read))), RungDecision::Accept) = (candidate, reads, decision) else {
+            if decision == RungDecision::Continue {
+                continue;
+            }
+            break;
+        };
+        taken.residual = read.deviation;
+        taken.off_surface = taken.off_surface.max(read.standoff);
+        *parameters = refined_parameters;
+        *raw = refined_raw;
+        *pcurve = refined_curve;
+        best = taken;
+        if read.tracking <= floor * 0.01 {
+            break;
+        }
+    }
     Ok(best)
+}
+
+/// What one off-carrier tracking rung does with its candidate
+/// ([`standoff_tracking_rungs`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RungDecision {
+    /// Taken ([`standoff_candidate_accepted`]).
+    Accept,
+    /// Not taken, but it read finite and LOWER tracking than the standing fit
+    /// while over the floor: the finer fraction is still tried from the same
+    /// baseline (fixture 25 on e90c30c94: one use read 2.33e-7 at 0.1 and
+    /// stopped while its partner was taken at 9.0e-9).
+    Continue,
+    /// Not taken and not improving (or unreadable): the rungs end.
+    Stop,
+}
+
+fn standoff_rung_decision(standing: NativeRead, candidate: NativeRead, fields_finite: bool, floor: f64) -> RungDecision {
+    if standoff_candidate_accepted(standing, candidate, fields_finite, floor) {
+        RungDecision::Accept
+    } else if candidate.tracking.is_finite() && candidate.tracking < standing.tracking {
+        RungDecision::Continue
+    } else {
+        RungDecision::Stop
+    }
+}
+
+/// The one-time raise decision of [`refine_pcurve_pass`]: a ceiling exit not
+/// yet raised, when the returned curve is worse than the edge's own gap by
+/// more than the floor (the original rule), or when a tracking pass for an
+/// unmet first pass returned a curve whose own tracking still misses the
+/// pass's target (`unmet_tracking`, read on the returned curve). Nothing else
+/// raises.
+fn takes_raise(exit: PcurveFitExit, raised: bool, residual: f64, off_surface: f64, floor: f64, unmet_tracking: bool) -> bool {
+    exit == PcurveFitExit::SampleCeiling && !raised && (residual > off_surface + floor || unmet_tracking)
 }
 
 fn refine_pcurve_pass(
@@ -790,12 +1523,15 @@ fn refine_pcurve_pass(
     [u0, u1]: [f64; 2],
     [v0, v1]: [f64; 2],
     floor: f64,
+    joins: &[f64],
     parameters: &mut Vec<f64>,
     raw: &mut Vec<[f64; 2]>,
     pcurve: &mut NurbsCurve,
     mut off_surface: f64,
+    mut clamped: [f64; 2],
     track_projection: bool,
     tracking_fraction: f64,
+    raise_unmet_tracking: bool,
     mut insert: impl FnMut(f64, Vec3, Vec3) -> Result<(Option<[f64; 2]>, f64), String>,
 ) -> Result<Refinement, String> {
     let tracking_floor = if track_projection { floor * tracking_fraction } else { floor };
@@ -823,6 +1559,9 @@ fn refine_pcurve_pass(
                 }
                 let start = parameters[index];
                 let end = parameters[index + 1];
+                // Keep construction's existing first-pass policy. Extended
+                // residual probes must not silently change its station ladder;
+                // projection tracking retains its established finer floor.
                 if end - start < if track_projection { SPAN_FLOOR } else { 1e-3 } {
                     skipped_narrow = true;
                     continue;
@@ -835,9 +1574,19 @@ fn refine_pcurve_pass(
                     let fraction = start + (end - start) * local_fraction;
                     let parameter = pcurve.evaluate(fraction)?;
                     let on_surface =
-                        surface.evaluate(parameter.x.clamp(u0, u1), parameter.y.clamp(v0, v1))?;
+                        surface.evaluate_extended(parameter.x, parameter.y)?;
                     let on_curve = curve.evaluate(t0 + (t1 - t0) * fraction)?;
                     let deviation = on_surface.sub(on_curve).length();
+                    // A non-finite distance must not reach `f64::max` (which
+                    // drops NaN) or the classification below, where a round
+                    // with an unreadable station could still exit Converged on
+                    // its readable ones. Fail closed: a first pass's error
+                    // goes to its caller, a tracking candidate's declines it.
+                    if !deviation.is_finite() {
+                        return Err(format!(
+                            "refine_pcurve_pass: non-finite station distance {deviation} at fraction {fraction}"
+                        ));
+                    }
                     round_max = round_max.max(deviation);
                     if deviation <= tracking_floor {
                         continue;
@@ -885,7 +1634,9 @@ fn refine_pcurve_pass(
                 parameters.insert(at, fraction);
                 raw.insert(at, surface_parameter);
             }
-            *pcurve = build_interpolant(surface, raw, parameters)?;
+            let (rebuilt, excursion, distance) = build_interpolant_joined(surface, raw, parameters, joins)?;
+            *pcurve = rebuilt;
+            clamped = [excursion, distance];
             if truncated {
                 exit = PcurveFitExit::SampleCeiling;
                 break;
@@ -914,7 +1665,25 @@ fn refine_pcurve_pass(
         // curve's own gap from the surface by more than the floor, so samples
         // can still buy accuracy. A curve already at its gap stops here —
         // reported, not retried.
-        if exit == PcurveFitExit::SampleCeiling && !raised && residual > off_surface + floor {
+        // A TRACKING pass for a standing fit that missed the floor (and only
+        // then) also takes the same one-time raise when it hits the ceiling
+        // still over the floor: its request is the projection's tracking, and
+        // the ceiling cut it short. The raised maximum itself is unchanged.
+        // The added raise serves a TRACKING pass for an unmet first pass whose
+        // RETURNED curve still misses the pass's own target: its tracking (the
+        // image against the projected foot, read natively on its own knot spans
+        // and endpoints) over the tracking floor (floor x fraction). Reaching
+        // the ceiling alone is exhaustion, not a miss, and the inherited
+        // standoff never triggers it. Read only at a ceiling exit not yet
+        // raised; an unreadable read does not raise.
+        let unmet_tracking = track_projection
+            && raise_unmet_tracking
+            && exit == PcurveFitExit::SampleCeiling
+            && !raised
+            && native_probe_fractions(&[&*pcurve])
+                .and_then(|probes| native_read(surface, curve, pcurve, [t0, t1], &probes))
+                .is_ok_and(|read| read.tracking > tracking_floor);
+        if takes_raise(exit, raised, residual, off_surface, floor, unmet_tracking) {
             raised = true;
             max_samples = PCURVE_RAISED_SAMPLES;
             continue;
@@ -924,6 +1693,7 @@ fn refine_pcurve_pass(
             residual,
             off_surface,
             raised,
+            clamped,
         });
     }
 }
@@ -1030,6 +1800,8 @@ pub fn fit_pcurve_on_surface(
                 exit: PcurveFitExit::Converged,
                 off_surface: 0.0,
                 raised: false,
+                clamped_excursion: 0.0,
+                clamped_distance: 0.0,
             },
             curve: pcurve,
         });
@@ -1048,11 +1820,27 @@ pub fn fit_pcurve_on_surface(
     // The edge curve's own distance from the surface at every station inverted,
     // accepted or not: the floor below which no pcurve can bring the residual.
     let mut off_surface = 0.0_f64;
-    for index in 0..=24 {
-        let fraction = index as f64 / 24.0;
+    // The edge's own C0 knots must remain corners of its parameter image.
+    // Plant those stations before inversion; refinement retains their joins.
+    let corners = range_breaks(curve, t0, t1, true);
+    let mut stations: Vec<f64> = (0..=24).map(|index| index as f64 / 24.0).collect();
+    // Replace nearby uniform seeds, never the native corner itself. Keep
+    // endpoints and other native corners even when their spans are short.
+    stations.retain(|station| {
+        *station == 0.0 || *station == 1.0 || corners.contains(station)
+            || !corners.iter().any(|corner| (*station - corner).abs() <= SPAN_FLOOR)
+    });
+    for &corner in &corners {
+        let at = stations.partition_point(|value| *value < corner);
+        if stations.get(at) != Some(&corner) {
+            stations.insert(at, corner);
+        }
+    }
+    let joins = corners;
+    for (index, &fraction) in stations.iter().enumerate() {
         let (parameter, distance) = invert(fraction)?;
         off_surface = off_surface.max(distance);
-        if distance > drop_tolerance && index != 0 && index != 24 {
+        if distance > drop_tolerance && index != 0 && index != stations.len() - 1 {
             continue;
         }
         if distance > endpoint_tolerance {
@@ -1073,7 +1861,8 @@ pub fn fit_pcurve_on_surface(
         raw_surface_parameters.push(parameter);
     }
 
-    let mut pcurve = build_interpolant(surface, &raw_surface_parameters, &parameters)?;
+    let (mut pcurve, excursion, distance) =
+        build_interpolant_joined(surface, &raw_surface_parameters, &parameters, &joins)?;
     let refinement = refine_pcurve(
         surface,
         curve,
@@ -1081,10 +1870,12 @@ pub fn fit_pcurve_on_surface(
         [u0, u1],
         [v0, v1],
         refinement_tolerance,
+        &joins,
         &mut parameters,
         &mut raw_surface_parameters,
         &mut pcurve,
         off_surface,
+        [excursion, distance],
         |fraction, _parameter, _on_curve| {
             let (surface_parameter, distance) = invert(fraction)?;
             Ok((
@@ -1102,6 +1893,8 @@ pub fn fit_pcurve_on_surface(
             exit: refinement.exit,
             off_surface: refinement.off_surface,
             raised: refinement.raised,
+            clamped_excursion: refinement.clamped[0],
+            clamped_distance: refinement.clamped[1],
         },
     })
 }
@@ -1244,7 +2037,7 @@ pub fn fit_pcurve_on_surface_marched(
     // each insert SEEDED from the interpolant (already on the marched branch), so
     // a mid-refinement global inversion cannot re-alias onto the far sheet.
     let mut parameters = fractions;
-    let mut pcurve = build_interpolant(surface, &raw, &parameters)?;
+    let (mut pcurve, excursion, distance) = build_interpolant(surface, &raw, &parameters)?;
     let refinement_tolerance = PCURVE_REFINEMENT_TOLERANCE;
     // Same classified exits and budget ladder as `fit_pcurve_on_surface`. A
     // seeded insert always lands, so this loop cannot stall.
@@ -1255,10 +2048,12 @@ pub fn fit_pcurve_on_surface_marched(
         [u0, u1],
         [v0, v1],
         refinement_tolerance,
+        &[],
         &mut parameters,
         &mut raw,
         &mut pcurve,
         off_surface,
+        [excursion, distance],
         |_fraction, seed, on_curve| {
             let seeded = crate::projection::project_point_to_surface_from_seed(surface, on_curve, [seed.x, seed.y])?;
             Ok((Some([seeded.u, seeded.v]), seeded.distance))
@@ -1273,6 +2068,8 @@ pub fn fit_pcurve_on_surface_marched(
             exit: refinement.exit,
             off_surface: refinement.off_surface,
             raised: refinement.raised,
+            clamped_excursion: refinement.clamped[0],
+            clamped_distance: refinement.clamped[1],
         },
     })
 }
@@ -1375,7 +2172,7 @@ fn accept_fit(fit: PcurveFit) -> Result<NurbsCurve, String> {
 fn off_bar_message(report: &PcurveFitReport) -> String {
     format!(
         "{PCURVE_OFF_BAR} {:.3e} out of sample against a bar of {:.3e} (asked {:.1e}, the \
-         stations stand {:.3e} off the carrier; {:?} at {} samples{})",
+         stations stand {:.3e} off the carrier; {:?} at {} samples{}{})",
         report.residual,
         report.floor + report.off_surface,
         report.floor,
@@ -1383,6 +2180,14 @@ fn off_bar_message(report: &PcurveFitReport) -> String {
         report.exit,
         report.samples,
         if report.raised { ", after the raise" } else { "" },
+        if report.clamped_excursion > 0.0 {
+            format!(
+                "; clamped into the chart by {:.3e} in parameter, {:.3e} in 3D",
+                report.clamped_excursion, report.clamped_distance
+            )
+        } else {
+            String::new()
+        },
     )
 }
 
@@ -1541,6 +2346,8 @@ fn affine_pcurve_on_range(
             exit: PcurveFitExit::Converged,
             off_surface: 0.0,
             raised: false,
+            clamped_excursion: 0.0,
+            clamped_distance: 0.0,
         },
     }))
 }
@@ -1784,16 +2591,548 @@ pub fn fit_pcurve_on_surface_range_dense(
         curve.evaluate(edge_start + (edge_end - edge_start) * edge_fraction)
     };
     let breaks = range_breaks(curve, edge_start, edge_end, forward);
-    fit_pcurve_on_surface_stations(
+    let ask = tolerance.max(PCURVE_REFINEMENT_TOLERANCE);
+    let fit = fit_station_pcurve(
         surface,
         &evaluate_edge,
         &breaks,
-        tolerance,
+        &breaks,
+        ask,
         base_samples,
         refinement_rounds,
         parameter_cap,
-    )
+        SPAN_FLOOR,
+    )?;
+    end_span_challenger(surface, curve, &evaluate_edge, edge_start, edge_end, forward, &breaks, ask, base_samples, refinement_rounds, parameter_cap, fit)
 }
+
+/// The edge curve's OWN distinct interior knots inside `[edge_start,
+/// edge_end]`, mapped through the trim's range and sense to coedge
+/// fractions, that fall inside `pcurve`'s FIRST or LAST span (between the
+/// domain end and its nearest interior knot), sorted.
+fn native_end_knot_fractions(curve: &NurbsCurve, edge_start: f64, edge_end: f64, forward: bool, pcurve: &NurbsCurve) -> Result<Vec<f64>, String> {
+    let [q0, q1] = pcurve.domain()?;
+    let mut interior: Vec<f64> = pcurve.knots.iter().copied().filter(|k| *k > q0 && *k < q1).collect();
+    interior.dedup();
+    let (Some(&first), Some(&last)) = (interior.first(), interior.last()) else { return Ok(Vec::new()) };
+    let (low, high) = (edge_start.min(edge_end), edge_start.max(edge_end));
+    let span = edge_end - edge_start;
+    let mut fractions: Vec<f64> = curve
+        .knots
+        .iter()
+        .copied()
+        .filter(|k| *k > low && *k < high)
+        .map(|k| {
+            let along = (k - edge_start) / span;
+            if forward { along } else { 1.0 - along }
+        })
+        .filter(|f| f.is_finite() && ((*f > q0 && *f < first) || (*f > last && *f < q1)))
+        .collect();
+    fractions.sort_by(f64::total_cmp);
+    fractions.dedup();
+    Ok(fractions)
+}
+
+/// The admission rule for a foot read against an edge point: finite distance,
+/// finite point, finite (u, v) inside the native domain. Shared by
+/// [`common_station_read`] and the station fitter's tracking mode.
+fn foot_admitted(foot: &crate::SurfaceProjection, [u0, u1]: [f64; 2], [v0, v1]: [f64; 2]) -> bool {
+    let finite = |p: Vec3| p.x.is_finite() && p.y.is_finite() && p.z.is_finite();
+    foot.distance.is_finite() && finite(foot.point) && foot.u.is_finite() && foot.v.is_finite() && (u0..=u1).contains(&foot.u) && (v0..=v1).contains(&foot.v)
+}
+
+/// The tracking mode's verification probes: the current pcurve's native probes
+/// ([`native_probe_fractions`]: endpoints, quarters and 16 interior points of
+/// each knot span), its EXACT knots (the final common read includes them, and
+/// the native probes do not), and the caller's fixed fractions; finite, in
+/// [0, 1], sorted, deduplicated.
+fn verification_fractions(pcurve: &NurbsCurve, verify: &[f64]) -> Result<Vec<f64>, String> {
+    let mut fractions = native_probe_fractions(&[pcurve])?;
+    fractions.extend(pcurve.knots.iter().copied());
+    fractions.extend(verify.iter().copied());
+    fractions.retain(|f| f.is_finite() && (0.0..=1.0).contains(f));
+    fractions.sort_by(f64::total_cmp);
+    fractions.dedup();
+    Ok(fractions)
+}
+
+/// The off-carrier candidate admission, at the same probes and shared feet
+/// (`[tracking, deviation, excess]` per curve, [`common_station_read_with_excess`]):
+/// every reading finite, the candidate's tracking strictly lower, and EITHER
+/// its maximum deviation no worse than the legacy's (the original rule) OR the
+/// candidate meeting the ORIGINAL floors outright, tracking and excess both
+/// within `PCURVE_REFINEMENT_TOLERANCE` (1e-7).
+///
+/// Why the second branch: for fits whose images follow the shared admitted
+/// feet, the maximum deviation can be dominated by the edge's standoff.
+/// Their measured maxima can then differ by rounding while tracking improves.
+/// This does not assert that the admitted foot is a certified global nearest
+/// point or that an arbitrary pcurve has the same maximum deviation.
+/// next5 fixture 25 (BREP_DEBUG_STATION_FIT): every tracking candidate reached
+/// the floor (9.52e-8 .. 9.94e-8 tracking) and was declined on a deviation
+/// 1.2e-14 .. 6.7e-13 above the legacy's at 2.1e-5 .. 9.0e-4 standoffs, while
+/// the legacy kept 5.9e-7 .. 8.5e-5 tracking. A candidate within the original
+/// floors on both readings is what those controls require; it is not a
+/// standoff allowance and no bar moves.
+pub(crate) fn floor_admits(old: [f64; 3], new: [f64; 3]) -> bool {
+    let floor = PCURVE_REFINEMENT_TOLERANCE;
+    old.iter().chain(new.iter()).all(|v| v.is_finite())
+        && new[0] < old[0]
+        && (new[1] <= old[1] || (new[0] <= floor && new[2] <= floor))
+}
+
+/// The common reader's foot: the NEAREST admitted ([`foot_admitted`]) of the
+/// global projection, the projection seeded at the reference (legacy) uv and
+/// the one seeded at the candidate (image) uv, in THAT order, so that between
+/// admitted feet at equal distance the first in this order is taken
+/// (`min_by` keeps the first minimum). [`common_station_read`] and the station
+/// fitter's tracking mode both take their foot here, so an equal-distance tie
+/// resolves to the same foot in both.
+fn common_foot(
+    global: Option<crate::SurfaceProjection>,
+    reference: Option<crate::SurfaceProjection>,
+    candidate: Option<crate::SurfaceProjection>,
+    domain_u: [f64; 2],
+    domain_v: [f64; 2],
+) -> Option<crate::SurfaceProjection> {
+    [global, reference, candidate]
+        .into_iter()
+        .flatten()
+        .filter(|f| foot_admitted(f, domain_u, domain_v))
+        .min_by(|a, b| a.distance.total_cmp(&b.distance))
+}
+
+/// The probes a RANGE trim is read at by the common reader: `curves`'
+/// native spans (endpoints, quarters and 16 interior points of each knot
+/// span) and exact knots, plus the edge curve's own knots CLIPPED to
+/// `[t0, t1]` (with the range ends) and the same 19 points on every clipped
+/// span, mapped through the coedge's sense to fractions; finite, in [0, 1],
+/// sorted, deduplicated.
+pub(crate) fn range_use_probes(curves: &[&NurbsCurve], edge_curve: &NurbsCurve, t0: f64, t1: f64, forward: bool) -> Result<Vec<f64>, String> {
+    let mut probes = native_probe_fractions(curves)?;
+    for curve in curves {
+        probes.extend(curve.knots.iter().copied());
+    }
+    let span = t1 - t0;
+    if span.is_finite() && span != 0.0 {
+        let (low, high) = (t0.min(t1), t0.max(t1));
+        let mut knots: Vec<f64> = edge_curve.knots.iter().copied().filter(|k| *k >= low && *k <= high).collect();
+        knots.push(low);
+        knots.push(high);
+        knots.sort_by(f64::total_cmp);
+        knots.dedup();
+        let locals: Vec<f64> = [0.25, 0.5, 0.75]
+            .into_iter()
+            .chain((1..=TRACKING_ACCEPTANCE_POINTS).map(|index| index as f64 / (TRACKING_ACCEPTANCE_POINTS + 1) as f64))
+            .collect();
+        let mut ts = knots.clone();
+        for pair in knots.windows(2).filter(|w| w[1] > w[0]) {
+            for &local in &locals {
+                ts.push(pair[0] + (pair[1] - pair[0]) * local);
+            }
+        }
+        for t in ts {
+            let along = (t - t0) / span;
+            probes.push(if forward { along } else { 1.0 - along });
+        }
+    }
+    probes.retain(|f| f.is_finite() && (0.0..=1.0).contains(f));
+    probes.sort_by(f64::total_cmp);
+    probes.dedup();
+    Ok(probes)
+}
+
+/// [`common_station_read`] for two RANGE trims of one coedge (`old`, `new`,
+/// both on the coedge fraction domain [0, 1]) against the edge curve over
+/// `[t0, t1]` in the coedge's sense, at [`range_use_probes`] of both: the same
+/// probes and one shared admitted foot per probe, finite or an error. A trim
+/// not on [0, 1] is an error.
+// Unused by the import lane since the tracking trigger and keep were withdrawn
+// for this merge; kept, with its controls, for their re-proposal.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn range_common_read(
+    surface: &NurbsSurface,
+    edge_curve: &NurbsCurve,
+    t0: f64,
+    t1: f64,
+    forward: bool,
+    old: &NurbsCurve,
+    new: &NurbsCurve,
+) -> Result<((f64, f64), (f64, f64)), String> {
+    let (o, n) = range_common_read_with_excess(surface, edge_curve, t0, t1, forward, old, new)?;
+    Ok(((o[0], o[1]), (n[0], n[1])))
+}
+
+/// [`range_common_read`] with each trim's maximum pointwise excess over the
+/// shared admitted foot's own distance: `[tracking, deviation, excess]` per
+/// trim ([`common_station_read_with_excess`]).
+// Unused by the import lane since the tracking trigger and keep were withdrawn
+// for this merge; kept, with its controls, for their re-proposal.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn range_common_read_with_excess(
+    surface: &NurbsSurface,
+    edge_curve: &NurbsCurve,
+    t0: f64,
+    t1: f64,
+    forward: bool,
+    old: &NurbsCurve,
+    new: &NurbsCurve,
+) -> Result<([f64; 3], [f64; 3]), String> {
+    for curve in [old, new] {
+        if !matches!(curve.domain(), Ok([a, b]) if a == 0.0 && b == 1.0) {
+            return Err("range common read: a trim not on [0, 1]".into());
+        }
+    }
+    let probes = range_use_probes(&[old, new], edge_curve, t0, t1, forward)?;
+    let evaluate = |fraction: f64| -> Result<Vec3, String> {
+        let along = if forward { fraction } else { 1.0 - fraction };
+        edge_curve.evaluate(t0 + (t1 - t0) * along)
+    };
+    common_station_read_with_excess(surface, &evaluate, old, new, &probes)
+}
+
+/// The legacy and candidate pcurves read against the edge at the SAME probes
+/// and against the SAME foot per probe: at each fraction, the edge point's
+/// foot is the NEAREST admitted one among the global projection and the
+/// projections seeded at the legacy and the candidate image's (u, v). A foot
+/// is admitted with a finite distance and point and a finite (u, v) inside the
+/// native domain. Both images are then measured against that one shared foot
+/// (TRACKING) and against the edge point (same-parameter DEVIATION). The
+/// shared foot is the nearest of these three, not a certified global nearest.
+/// Any non-finite image, point or distance, or a probe with no admitted foot,
+/// is an error (the caller keeps the legacy fit). Returns
+/// ((legacy tracking, legacy deviation), (candidate tracking, candidate
+/// deviation)), maxima over the probes.
+pub(crate) fn common_station_read(
+    surface: &NurbsSurface,
+    evaluate_edge: &dyn Fn(f64) -> Result<Vec3, String>,
+    legacy: &NurbsCurve,
+    candidate: &NurbsCurve,
+    probes: &[f64],
+) -> Result<((f64, f64), (f64, f64)), String> {
+    let (old, new) = common_station_read_with_excess(surface, evaluate_edge, legacy, candidate, probes)?;
+    Ok(((old[0], old[1]), (new[0], new[1])))
+}
+
+/// [`common_station_read`] that also returns, per curve, the maximum
+/// pointwise EXCESS: the same-parameter deviation minus the shared admitted
+/// foot's own distance at that probe (the part over the edge's standoff
+/// there, which the every-use controls bar at the original 1e-7). Returns
+/// `[tracking, deviation, excess]` for the legacy and the candidate.
+pub(crate) fn common_station_read_with_excess(
+    surface: &NurbsSurface,
+    evaluate_edge: &dyn Fn(f64) -> Result<Vec3, String>,
+    legacy: &NurbsCurve,
+    candidate: &NurbsCurve,
+    probes: &[f64],
+) -> Result<([f64; 3], [f64; 3]), String> {
+    let (domain_u, domain_v) = surface_domains(surface)?;
+    let finite = |p: Vec3| p.x.is_finite() && p.y.is_finite() && p.z.is_finite();
+    // [tracking, deviation, excess] per curve; the excess (deviation minus
+    // the shared foot's distance, per probe) starts at -inf, so a read with no
+    // probe is not finite and admits nothing.
+    let mut read = ([0.0_f64, 0.0, f64::NEG_INFINITY], [0.0_f64, 0.0, f64::NEG_INFINITY]);
+    for &fraction in probes {
+        let point = evaluate_edge(fraction)?;
+        let (old_uv, new_uv) = (legacy.evaluate(fraction)?, candidate.evaluate(fraction)?);
+        let (old_image, new_image) = (surface.evaluate_extended(old_uv.x, old_uv.y)?, surface.evaluate_extended(new_uv.x, new_uv.y)?);
+        if !(finite(point) && finite(old_image) && finite(new_image)) {
+            return Err(format!("common station read: non-finite point at fraction {fraction}"));
+        }
+        // Reading ONE curve against itself (`legacy` and `candidate` the same
+        // object, as a trigger's read is): the candidate-seeded projection is
+        // the reference-seeded one on identical inputs, so it is computed once
+        // (same result, same tie order).
+        let reference_foot = memo_seeded_foot(surface, point, old_uv.x, old_uv.y);
+        let candidate_foot = if std::ptr::eq(legacy, candidate) {
+            reference_foot
+        } else {
+            memo_seeded_foot(surface, point, new_uv.x, new_uv.y)
+        };
+        let foot = common_foot(
+            memo_global_foot(surface, point),
+            reference_foot,
+            candidate_foot,
+            domain_u,
+            domain_v,
+        )
+        .ok_or_else(|| format!("common station read: no admitted foot at fraction {fraction}"))?;
+        let values = [
+            old_image.sub(foot.point).length(),
+            old_image.sub(point).length(),
+            new_image.sub(foot.point).length(),
+            new_image.sub(point).length(),
+        ];
+        if values.iter().any(|v| !v.is_finite()) {
+            return Err(format!("common station read: non-finite distance at fraction {fraction}"));
+        }
+        if !foot.distance.is_finite() {
+            return Err(format!("common station read: non-finite foot distance at fraction {fraction}"));
+        }
+        read.0[0] = read.0[0].max(values[0]);
+        read.0[1] = read.0[1].max(values[1]);
+        read.0[2] = read.0[2].max(values[1] - foot.distance);
+        read.1[0] = read.1[0].max(values[2]);
+        read.1[1] = read.1[1].max(values[3]);
+        read.1[2] = read.1[2].max(values[3] - foot.distance);
+    }
+    Ok(read)
+}
+
+/// The interior probe fractions of the edge curve's own FIRST and LAST native
+/// knot spans inside `[edge_start, edge_end]` (quarter points and 16 interior
+/// points of each), mapped through the trim's range and sense to coedge
+/// fractions in [0, 1].
+fn edge_end_span_fractions(curve: &NurbsCurve, edge_start: f64, edge_end: f64, forward: bool) -> Vec<f64> {
+    let (low, high) = (edge_start.min(edge_end), edge_start.max(edge_end));
+    let mut knots: Vec<f64> = curve.knots.iter().copied().filter(|k| *k > low && *k < high).collect();
+    knots.dedup();
+    let spans = match (knots.first(), knots.last()) {
+        (Some(&first), Some(&last)) => vec![(low, first), (last, high)],
+        _ => vec![(low, high)],
+    };
+    let span = edge_end - edge_start;
+    let mut out = Vec::new();
+    for (a, b) in spans {
+        if !(b > a) {
+            continue;
+        }
+        for local in [0.25, 0.5, 0.75].into_iter().chain((1..=TRACKING_ACCEPTANCE_POINTS).map(|index| index as f64 / (TRACKING_ACCEPTANCE_POINTS + 1) as f64)) {
+            let along = (a + (b - a) * local - edge_start) / span;
+            let fraction = if forward { along } else { 1.0 - along };
+            if fraction.is_finite() && (0.0..=1.0).contains(&fraction) {
+                out.push(fraction);
+            }
+        }
+    }
+    out.sort_by(f64::total_cmp);
+    out.dedup();
+    out
+}
+
+/// At most this many of the legacy pcurve's worst spans are seeded.
+const WORST_SPANS: usize = 4;
+/// Interior stations seeded in each of them.
+const WORST_SPAN_SEEDS: usize = 7;
+
+/// The seed fractions of [`end_span_challenger`]'s worst-span source: the
+/// legacy pcurve's own spans (between its distinct knots) whose same-parameter
+/// deviation, read at the quarter points and 16 interior points, and at any of
+/// `extra_probes` (the edge's own end-span interior points mapped to coedge
+/// fractions) that fall inside the span, exceeds
+/// `bar`, worst first, at most [`WORST_SPANS`] of them, each seeded with
+/// [`WORST_SPAN_SEEDS`] evenly spaced interior fractions. Fails closed on any
+/// non-finite reading.
+fn legacy_worst_span_seeds(
+    evaluate_edge: &dyn Fn(f64) -> Result<Vec3, String>,
+    surface: &NurbsSurface,
+    pcurve: &NurbsCurve,
+    bar: f64,
+    extra_probes: &[f64],
+) -> Result<Vec<f64>, String> {
+    let [q0, q1] = pcurve.domain()?;
+    let mut knots: Vec<f64> = pcurve.knots.iter().copied().filter(|k| *k >= q0 && *k <= q1).collect();
+    knots.dedup();
+    let locals: Vec<f64> = [0.25, 0.5, 0.75]
+        .into_iter()
+        .chain((1..=TRACKING_ACCEPTANCE_POINTS).map(|index| index as f64 / (TRACKING_ACCEPTANCE_POINTS + 1) as f64))
+        .collect();
+    let mut over: Vec<(f64, f64, f64)> = Vec::new();
+    for span in knots.windows(2).filter(|w| w[1] > w[0]) {
+        let mut worst = 0.0_f64;
+        let inside = extra_probes.iter().copied().filter(|f| *f > span[0] && *f < span[1]);
+        for fraction in locals.iter().map(|local| span[0] + (span[1] - span[0]) * local).chain(inside) {
+            let uv = pcurve.evaluate(fraction)?;
+            let deviation = surface.evaluate_extended(uv.x, uv.y)?.sub(evaluate_edge(fraction)?).length();
+            if !deviation.is_finite() {
+                return Err(format!("worst-span read: non-finite deviation at fraction {fraction}"));
+            }
+            worst = worst.max(deviation);
+        }
+        if worst > bar {
+            over.push((worst, span[0], span[1]));
+        }
+    }
+    over.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.total_cmp(&b.1)));
+    over.truncate(WORST_SPANS);
+    Ok(over
+        .into_iter()
+        .flat_map(|(_, lo, hi)| (1..=WORST_SPAN_SEEDS).map(move |index| lo + (hi - lo) * index as f64 / (WORST_SPAN_SEEDS + 1) as f64))
+        .collect())
+}
+
+/// Why the range lane's [`end_span_challenger`] runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ChallengerTrigger {
+    /// The legacy residual misses `ask + standoff` (the original trigger).
+    Deviation,
+    /// The legacy residual is within `ask + standoff`, the edge stands off its
+    /// carrier by more than the ask, and the legacy fit's COMMON tracking
+    /// (`common_station_read` at the fixed probes) misses the ask.
+    Tracking,
+}
+
+/// The challenger's trigger. The original rule reads the same-parameter
+/// DEVIATION against `ask + standoff`; over a standoff `g` a tangential slip
+/// `d` adds only about d²/(2g) to it, so a slip up to sqrt(ask² + 2·ask·g)
+/// never triggers (about 1.3e-5 at g = 9e-4, the fixture-25 inherited edges).
+/// When the deviation rule does not fire and the edge stands off its carrier
+/// by more than the ask (the same gate `refine_pcurve` takes its
+/// standoff-tracking lane on), the legacy fit's common tracking is read
+/// (`tracking`, called only then): over the ask, the challenger runs on
+/// tracking. An unread tracking (None or non-finite) never triggers.
+fn challenger_trigger(residual: f64, off_surface: f64, ask: f64, tracking: impl FnOnce() -> Option<f64>) -> Option<ChallengerTrigger> {
+    if residual > ask + off_surface {
+        return Some(ChallengerTrigger::Deviation);
+    }
+    if !(off_surface > ask) {
+        return None;
+    }
+    match tracking() {
+        Some(value) if value.is_finite() && value > ask => Some(ChallengerTrigger::Tracking),
+        _ => None,
+    }
+}
+
+/// The END-SPAN CHALLENGER of the range lane (2026-10-05, the four original
+/// fitter rows of `abc_00000011/12` edges 7 and 243). On e90c30c94 their worst
+/// excess (4.58e-6 and 5.14e-6) sat in the installed pcurve's LAST span, at the
+/// edge's start, where the edge curve's own first knot span is only 4.5e-6
+/// (e7) and 1.2e-4 (e243) wide while the fitter's end span was 1.4e-4 wide at
+/// its cap. It runs when [`challenger_trigger`] fires: the legacy fit misses
+/// its bar (residual over the ask plus its standoff), or, on an edge standing
+/// off its carrier by more than the ask, its common tracking misses the ask.
+/// It refits with the edge's own interior knots that
+/// fall inside the legacy pcurve's first or last span as additional stations
+/// (not joins; corners stay the legacy ones), through the same fitter with the
+/// unchanged ask, SPAN_FLOOR, cap and rounds. The candidate replaces the legacy
+/// fit only when both, read at COMMON probes (both pcurves' own knot spans,
+/// knots and endpoints, plus the edge's own knots and knot spans mapped to
+/// fractions) against one SHARED foot per probe ([`common_station_read`]),
+/// read finite, the candidate's tracking is strictly lower and its
+/// same-parameter deviation no worse. Otherwise, or on any error or unreadable read, the legacy fit
+/// stands exactly.
+#[allow(clippy::too_many_arguments)]
+fn end_span_challenger(
+    surface: &NurbsSurface,
+    curve: &NurbsCurve,
+    evaluate_edge: &dyn Fn(f64) -> Result<Vec3, String>,
+    edge_start: f64,
+    edge_end: f64,
+    forward: bool,
+    breaks: &[f64],
+    ask: f64,
+    base_samples: usize,
+    refinement_rounds: usize,
+    parameter_cap: usize,
+    legacy: PcurveFit,
+) -> Result<PcurveFit, String> {
+    // On the bar by deviation: nothing is read (the original zero-work
+    // path). The TRACKING trigger (538dd700c: an off-carrier edge on its
+    // deviation bar challenged on its common tracking) is withdrawn from this
+    // merge (Claude master's ruling, 2026-10-05): bisected as the first commit
+    // that moved step_import's a_trim_off_its_bar_is_accepted_and_named, and
+    // the four original fitter rows do not need it (they enter on the
+    // deviation trigger).
+    if !(legacy.report.residual > ask + legacy.report.off_surface) {
+        return Ok(legacy);
+    }
+    // The trigger read, the candidate's tracking verification and the final
+    // read project the same edge points again: memoized, same answers.
+    let _feet = FootMemoScope::open(surface);
+    let Ok(end_knots) = native_end_knot_fractions(curve, edge_start, edge_end, forward, &legacy.curve) else { return Ok(legacy) };
+    // The legacy fit's own WORST native spans (2026-10-05, root's boundary
+    // audit of the four rows): the e90 witnesses read a 4.58e-6 / 5.14e-6
+    // pointwise excess at q 0.99996 inside the closed native domain, in the
+    // legacy pcurve's last span, where no edge knot falls. Each span between the
+    // legacy pcurve's own distinct knots is read at its 19 probes; the spans
+    // whose same-parameter deviation exceeds the ask plus the legacy standoff,
+    // worst first and at most WORST_SPANS of them, each get WORST_SPAN_SEEDS
+    // evenly spaced interior stations. Unreadable reads decline.
+    // The edge's OWN first and last native knot spans, read at their quarter
+    // points and 16 interior points, mapped through the trim's range and sense
+    // to coedge fractions (e7's first edge span [0, 4.496e-6] of a
+    // 0.018661-long trim maps reversed to q in [0.99976, 1], overlapping the
+    // legacy pcurve's last span [0.99986, 1]).
+    let edge_end_probes = edge_end_span_fractions(curve, edge_start, edge_end, forward);
+    // The FIXED part of the common probe set, known before the candidate is
+    // fitted: the legacy pcurve's own spans, endpoints and knots, and the
+    // edge's own end-span probes, knot-span quarters and knots (every probe
+    // that could have TRIGGERED the challenger among them). The candidate fit
+    // verifies against these as well as its own spans, so it stops on the
+    // reader that judges it.
+    let Ok(mut fixed) = native_probe_fractions(&[&legacy.curve]) else { return Ok(legacy) };
+    fixed.extend(edge_end_probes.iter().copied());
+    let (low, high) = (edge_start.min(edge_end), edge_start.max(edge_end));
+    let mut edge_knots: Vec<f64> = curve.knots.iter().copied().filter(|k| *k >= low && *k <= high).collect();
+    edge_knots.push(low);
+    edge_knots.push(high);
+    edge_knots.sort_by(f64::total_cmp);
+    edge_knots.dedup();
+    let to_fraction = |t: f64| {
+        let along = (t - edge_start) / (edge_end - edge_start);
+        if forward { along } else { 1.0 - along }
+    };
+    for span in edge_knots.windows(2).filter(|w| w[1] > w[0]) {
+        for local in [0.25, 0.5, 0.75] {
+            fixed.push(to_fraction(span[0] + (span[1] - span[0]) * local));
+        }
+    }
+    fixed.extend(edge_knots.iter().map(|&t| to_fraction(t)));
+    fixed.extend(end_knots.iter().copied());
+    fixed.extend(legacy.curve.knots.iter().copied());
+    fixed.retain(|f| f.is_finite() && (0.0..=1.0).contains(f));
+    fixed.sort_by(f64::total_cmp);
+    fixed.dedup();
+    let trigger = challenger_trigger(legacy.report.residual, legacy.report.off_surface, ask, || {
+        common_station_read(surface, evaluate_edge, &legacy.curve, &legacy.curve, &fixed).ok().map(|((tracking, _), _)| tracking)
+    });
+    let Some(trigger) = trigger else { return Ok(legacy) };
+    let Ok(worst_seeds) = legacy_worst_span_seeds(evaluate_edge, surface, &legacy.curve, ask + legacy.report.off_surface, &edge_end_probes) else { return Ok(legacy) };
+    // The original guard holds for the deviation trigger only: a tracking
+    // trigger needs no added station (the tracking mode and its verification
+    // read the fixed probes).
+    if trigger == ChallengerTrigger::Deviation && end_knots.is_empty() && worst_seeds.is_empty() {
+        return Ok(legacy);
+    }
+    let mut stations: Vec<f64> = breaks.iter().copied().chain(end_knots.iter().copied()).chain(worst_seeds.iter().copied()).collect();
+    stations.sort_by(f64::total_cmp);
+    stations.dedup();
+    // The fitter's cap is max(requested cap, initial station count): the added
+    // stations must not raise it. Decline when the merged initial count
+    // (base stations plus every break and end knot) could exceed the
+    // requested cap.
+    let initial = base_samples.max(1).checked_add(1).and_then(|count| count.checked_add(stations.len()));
+    if initial.is_none_or(|count| count > parameter_cap) {
+        return Ok(legacy);
+    }
+    let Ok(candidate) = fit_station_pcurve_mode(surface, evaluate_edge, &stations, breaks, ask, base_samples, refinement_rounds, parameter_cap, SPAN_FLOOR, true, Some(&legacy.curve), &fixed) else {
+        return Ok(legacy);
+    };
+    if !(candidate.report.residual.is_finite() && candidate.report.off_surface.is_finite() && candidate.report.clamped_excursion.is_finite() && candidate.report.clamped_distance.is_finite()) {
+        return Ok(legacy);
+    }
+    // Common probes: the fixed set plus the candidate's own knot spans,
+    // endpoints and knots (the same set as both curves' native probes plus
+    // the edge's, as before).
+    let Ok(mut probes) = native_probe_fractions(&[&candidate.curve]) else { return Ok(legacy) };
+    probes.extend(fixed.iter().copied());
+    probes.extend(candidate.curve.knots.iter().copied());
+    probes.retain(|f| f.is_finite() && (0.0..=1.0).contains(f));
+    probes.sort_by(f64::total_cmp);
+    probes.dedup();
+    let readings = common_station_read_with_excess(surface, evaluate_edge, &legacy.curve, &candidate.curve, &probes);
+    let accepted = matches!(&readings, Ok((old, new)) if floor_admits(*old, *new));
+    if station_fit_tracing() {
+        eprintln!(
+            "STATION-FIT end-span challenger: trigger={trigger:?} end_knots={} worst_span_seeds={} edge_end_probes={} legacy={:?}/{:e} candidate={:?}/{:e} common={readings:?} decision={}",
+            end_knots.len(), worst_seeds.len(), edge_end_probes.len(), legacy.report.exit, legacy.report.residual, candidate.report.exit, candidate.report.residual,
+            if accepted { "candidate" } else { "legacy" }
+        );
+    }
+    Ok(if accepted { candidate } else { legacy })
+}
+
 
 /// [`fit_pcurve_on_surface_range_dense`] for the callers that only need the
 /// curve, accepted or refused on its bar ([`accept_fit`]).
@@ -1920,16 +3259,161 @@ pub fn fit_pcurve_on_surface_stations(
     refinement_rounds: usize,
     parameter_cap: usize,
 ) -> Result<PcurveFit, String> {
+    fit_station_pcurve(
+        surface, stations, breaks, &[], tolerance.max(PCURVE_REFINEMENT_TOLERANCE),
+        base_samples, refinement_rounds, parameter_cap, SPAN_FLOOR,
+    )
+}
+
+/// Precision construction for stations on recognized analytic carriers. Unlike
+/// general projection, their inverse maps reach floating point accuracy. This
+/// is an explicit construction contract, not a change to general fit policy.
+pub(crate) fn analytic_station_pcurve(
+    surface: &NurbsSurface,
+    stations: &dyn Fn(f64) -> Result<Vec3, String>,
+    tolerance: f64,
+) -> Result<NurbsCurve, String> {
+    if surface.analytic().is_none() {
+        return Err("analytic pcurve requires an analytic carrier".into());
+    }
+    let mut breaks = Vec::new();
+    for _ in 0..4 {
+        let fit = fit_station_pcurve(surface, stations, &breaks, &[], tolerance, 64, 64, 8192, 1e-10)?;
+        if fit.report.residual > tolerance || fit.report.off_surface > tolerance {
+            return Err(format!(
+                "analytic pcurve construction missed its contract: {:?}",
+                fit.report
+            ));
+        }
+        let mut failed = Vec::new();
+        // Independent Gauss stations in every returned knot span, rather than
+        // re-reading the interpolation nodes or the fitter's quarter stations.
+        for pair in fit.curve.knots.windows(2) {
+            if pair[1] <= pair[0] {
+                continue;
+            }
+            for local in [
+                0.06943184420297371,
+                0.33000947820757187,
+                0.6699905217924281,
+                0.9305681557970262,
+            ] {
+                let t = pair[0] + (pair[1] - pair[0]) * local;
+                let uv = fit.curve.evaluate(t)?;
+                if surface
+                    .evaluate_extended(uv.x, uv.y)?
+                    .sub(stations(t)?)
+                    .length()
+                    > tolerance
+                {
+                    failed.push(t);
+                }
+            }
+        }
+        if failed.is_empty() {
+            return Ok(fit.curve);
+        }
+        if breaks.len() + failed.len() > 8192 {
+            break;
+        }
+        breaks.extend(failed);
+        breaks.sort_by(f64::total_cmp);
+        breaks.dedup();
+    }
+    Err("analytic pcurve failed independent knot-span witnesses".into())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn fit_station_pcurve(
+    surface: &NurbsSurface,
+    stations: &dyn Fn(f64) -> Result<Vec3, String>,
+    breaks: &[f64],
+    corners: &[f64],
+    tolerance: f64,
+    base_samples: usize,
+    refinement_rounds: usize,
+    parameter_cap: usize,
+    span_floor: f64,
+) -> Result<PcurveFit, String> {
+    fit_station_pcurve_mode(surface, stations, breaks, corners, tolerance, base_samples, refinement_rounds, parameter_cap, span_floor, false, None, &[])
+}
+
+/// [`fit_station_pcurve`] with an optional TRACKING mode, taken only by the
+/// range lane's [`end_span_challenger`]; every other caller keeps the legacy
+/// mode byte for byte. The legacy fitter probes, ranks and stops on the
+/// image's same-parameter DEVIATION from the edge point. On an edge standing
+/// off its carrier that deviation never falls under the ask, so every probe is
+/// a candidate, the cap goes to the probes with the largest STANDOFF, and a
+/// tangential slip of `d` adds only about d²/(2g) to a deviation over a
+/// standoff `g`: the four original rows' challenger met its standoff (4.670e-6)
+/// and kept a common tracking of 1.434e-6 (root's e24 run, 2026-10-05). In
+/// tracking mode each probe reads its TRACKING, the image against the edge
+/// point's foot (the nearer admitted one of the global projection and the
+/// projection seeded at the image's uv: finite, inside the native domain, as
+/// [`common_station_read`] admits). A probe is a candidate only over the ask,
+/// the cap goes to the worst TRACKING first, and the one raise is taken when
+/// the last round's tracking still misses the ask. The reported residual
+/// stays the same-parameter deviation (standoff included). A probe with no
+/// admitted foot is an error, which the challenger turns into the exact legacy
+/// fit.
+#[allow(clippy::too_many_arguments)]
+fn fit_station_pcurve_mode(
+    surface: &NurbsSurface,
+    stations: &dyn Fn(f64) -> Result<Vec3, String>,
+    breaks: &[f64],
+    corners: &[f64],
+    tolerance: f64,
+    base_samples: usize,
+    refinement_rounds: usize,
+    parameter_cap: usize,
+    span_floor: f64,
+    track_projection: bool,
+    reference: Option<&NurbsCurve>,
+    verify: &[f64],
+) -> Result<PcurveFit, String> {
+    // Read only in tracking mode: the legacy mode makes no extra call.
+    let domains = if track_projection { Some(surface_domains(surface)?) } else { None };
+    // The tracking reading at one fraction, by the SAME foot rule as
+    // [`common_station_read`], the reader the challenger accepts on: the
+    // nearest admitted foot among the global projection and the projections
+    // seeded at this image's uv and at the reference (legacy) pcurve's uv at
+    // the same fraction. Returns the tracking and that foot (uv, distance),
+    // which is where a tracking insert is placed.
+    let tracking_of = |represented: Vec3, edge_point: Vec3, uv: Vec3, fraction: f64| -> Result<(f64, [f64; 2], f64), String> {
+        let (domain_u, domain_v) = domains.ok_or_else(|| "station tracking: legacy mode".to_string())?;
+        let finite = |p: Vec3| p.x.is_finite() && p.y.is_finite() && p.z.is_finite();
+        let reference_seed = match reference {
+            Some(curve) => curve.evaluate(fraction).ok().and_then(|seed| memo_seeded_foot(surface, edge_point, seed.x, seed.y)),
+            None => None,
+        };
+        // The common reader's order (global, reference, candidate), so an
+        // equal-distance tie takes the same foot here as there.
+        let foot = common_foot(
+            memo_global_foot(surface, edge_point),
+            reference_seed,
+            memo_seeded_foot(surface, edge_point, uv.x, uv.y),
+            domain_u,
+            domain_v,
+        )
+        .ok_or_else(|| "station tracking: no admitted foot".to_string())?;
+        let tracking = represented.sub(foot.point).length();
+        if !(finite(represented) && tracking.is_finite()) {
+            return Err("station tracking: non-finite reading".into());
+        }
+        Ok((tracking, [foot.u, foot.v], foot.distance))
+    };
+    // The last round's tracking missed the ask (tracking mode only).
+    let mut tracking_unmet = false;
     let evaluate_edge = stations;
     let base_samples = base_samples.max(1);
-    // No fit reaches below the refinement floor: the projector places a foot
+    // The general caller floors its ask: its projector places a foot
     // to about `LINEAR_TOLERANCE` (1e-7), so a caller asking for 1e-9 asks for
     // more than any station can deliver. Chased to such an ask the fit spends
     // its cap and reads its own noise — the direct-edit heals asked 1e-9 on
     // stations 9.9e-8 off their carrier and were refused by 8.5e-9
     // (2026-09-26). The floor is the ask's floor; the report says what was
     // reached against it.
-    let tolerance = tolerance.max(PCURVE_REFINEMENT_TOLERANCE);
+
     let mut parameters = (0..=base_samples)
         .map(|index| index as f64 / base_samples as f64)
         .collect::<Vec<_>>();
@@ -1939,17 +3423,34 @@ pub fn fit_pcurve_on_surface_stations(
     // `abc_00000011` face #549's curve carries a triple knot 4e-7 before its
     // end; as a station it put the cubic 1.594e-2 off between it and the last
     // one (measured 2026-09-26), where the file's curve sits 1e-7 off.
+    // A break that is a CORNER of the curve (`corners`, a subset of
+    // `breaks`: the range lane passes its curve's knots of multiplicity >=
+    // degree as both) is a C0 JOIN of the interpolant
+    // (`build_interpolant_joined`): one cubic through the corner overshoots
+    // on both sides whatever is inserted. A break that is only a station
+    // (an analytic witness, a caller's own marker) joins nothing.
+    let mut joins = Vec::with_capacity(corners.len());
     for &fraction in breaks {
         if !(fraction > 0.0 && fraction < 1.0) {
             continue;
         }
+        let corner = corners.contains(&fraction);
         let at = parameters.partition_point(|parameter| *parameter < fraction);
-        let near_left = at > 0 && fraction - parameters[at - 1] <= SPAN_FLOOR;
-        let near_right = at < parameters.len() && parameters[at] - fraction <= SPAN_FLOOR;
+        let near_left = at > 0 && fraction - parameters[at - 1] <= span_floor;
+        let near_right = at < parameters.len() && parameters[at] - fraction <= span_floor;
         if near_left || near_right {
+            // The break IS that station (a corner at a base station, e.g.
+            // the midpoint of a two-piece curve at 32/64): no insert, but the
+            // station is still the join.
+            if corner {
+                joins.push(if near_right { parameters[at] } else { parameters[at - 1] });
+            }
             continue;
         }
         parameters.insert(at, fraction);
+        if corner {
+            joins.push(fraction);
+        }
     }
     // The 3D edge point behind each raw inversion sample, kept parallel so the
     // continuity repair can re-seed a jumped station from its own footpoint.
@@ -1969,7 +3470,8 @@ pub fn fit_pcurve_on_surface_stations(
         gaps.push(gap);
     }
     repair_branch_jumps(surface, &edge_points, &mut raw, tolerance)?;
-    let mut pcurve = build_interpolant(surface, &raw, &parameters)?;
+    let (mut pcurve, mut excursion, mut distance) =
+        build_interpolant_joined(surface, &raw, &parameters, &joins)?;
 
     let mut cap = parameter_cap.max(parameters.len());
     let mut rounds = refinement_rounds;
@@ -1977,6 +3479,9 @@ pub fn fit_pcurve_on_surface_stations(
     loop {
         let mut exit = PcurveFitExit::RoundBudget;
         let mut converged_max = None;
+        // This pass's last round probed every span (none narrow, none
+        // truncated) and every probe tracked within the ask (tracking mode).
+        let mut tracking_met = false;
         for _ in 0..rounds {
             if parameters.len() >= cap {
                 exit = PcurveFitExit::SampleCeiling;
@@ -2004,7 +3509,7 @@ pub fn fit_pcurve_on_surface_stations(
                 // cubic through them swung 1.594e-2 off between them (measured
                 // 2026-09-26). A miss that survives only inside such a span is
                 // reported as [`PcurveFitExit::SpanFloor`].
-                if parameters[index + 1] - parameters[index] < SPAN_FLOOR {
+                if parameters[index + 1] - parameters[index] < span_floor {
                     skipped_narrow = true;
                     continue;
                 }
@@ -2019,13 +3524,63 @@ pub fn fit_pcurve_on_surface_stations(
                     let represented = surface.evaluate_extended(uv.x, uv.y)?;
                     let edge_point = evaluate_edge(fraction)?;
                     let deviation = represented.sub(edge_point).length();
-                    round_max = round_max.max(deviation);
-                    if deviation <= target {
+                    // The probe's reading: its deviation (legacy), or its
+                    // tracking against the admitted foot (tracking mode).
+                    let (reading, foot) = if track_projection {
+                        let (tracking, foot_uv, foot_gap) = tracking_of(represented, edge_point, uv, fraction)?;
+                        (tracking, Some((foot_uv, foot_gap)))
+                    } else {
+                        (deviation, None)
+                    };
+                    round_max = round_max.max(reading);
+                    if reading <= target {
                         continue;
                     }
-                    candidates.push((index, fraction, edge_point, uv, deviation));
+                    candidates.push((index, fraction, edge_point, uv, reading, foot));
                 }
             }
+            // Tracking mode's VERIFICATION, before it may stop: a round whose
+            // quarter probes all track within the ask is read again at the
+            // probes the challenger's acceptance reads, the current pcurve's
+            // own knot spans (endpoints, quarters and 16 interior points: the
+            // interpolant's knots are averages of three stations, not the
+            // stations) and the caller's fixed fractions (the legacy pcurve's
+            // spans and the edge's own). A probe over the ask becomes a
+            // candidate at its own fraction, placed at its own foot. One
+            // within the span floor of a station cannot be inserted: it is
+            // counted, and the fit may not report its tracking as met. On e24
+            // the four rows stopped on their quarter probes and read 1.144e-7 /
+            // 1.590e-7 at the common probes (a4c84871 runtime, 2026-10-05).
+            let mut verify_blocked = false;
+            if track_projection && candidates.is_empty() && !truncated && !skipped_narrow {
+                for fraction in verification_fractions(&pcurve, verify)? {
+                    let index = parameters.partition_point(|parameter| *parameter <= fraction).saturating_sub(1).min(parameters.len() - 2);
+                    let uv = pcurve.evaluate(fraction)?;
+                    let represented = surface.evaluate_extended(uv.x, uv.y)?;
+                    let edge_point = evaluate_edge(fraction)?;
+                    let (tracking, foot_uv, foot_gap) = tracking_of(represented, edge_point, uv, fraction)?;
+                    round_max = round_max.max(tracking);
+                    if tracking <= target {
+                        continue;
+                    }
+                    if fraction - parameters[index] <= span_floor || parameters[index + 1] - fraction <= span_floor {
+                        verify_blocked = true;
+                        continue;
+                    }
+                    // Two over-ask probes closer than the span floor in one
+                    // span: keep the worse, so no near-duplicate stations.
+                    if let Some(last) = candidates.last_mut() {
+                        if last.0 == index && fraction - last.1 <= span_floor {
+                            if tracking > last.4 {
+                                *last = (index, fraction, edge_point, uv, tracking, Some((foot_uv, foot_gap)));
+                            }
+                            continue;
+                        }
+                    }
+                    candidates.push((index, fraction, edge_point, uv, tracking, Some((foot_uv, foot_gap))));
+                }
+            }
+            tracking_unmet = track_projection && round_max > target;
             // A round with more candidates than the cap has room for spends
             // that room on its WORST probes, kept in curve order, rather than
             // on the first spans in order: truncating in span order left the
@@ -2045,20 +3600,23 @@ pub fn fit_pcurve_on_surface_stations(
                 candidates = order.into_iter().map(|index| candidates[index]).collect();
             }
             let mut inserts = Vec::with_capacity(candidates.len());
-            for (index, fraction, edge_point, uv, _) in candidates {
-                let (parameter, gap) = invert_near(
-                    surface,
-                    edge_point,
-                    [uv.x, uv.y],
-                    gaps[index].max(gaps[index + 1]),
-                )?;
+            for (index, fraction, edge_point, uv, _, foot) in candidates {
+                // A tracking candidate is placed at the very foot it was read
+                // against, so the node's image IS that foot; the legacy
+                // inversion is unchanged.
+                let (parameter, gap) = match foot {
+                    Some(placed) => placed,
+                    None => invert_near(surface, edge_point, [uv.x, uv.y], gaps[index].max(gaps[index + 1]))?,
+                };
                 inserts.push((index + 1, fraction, edge_point, parameter, gap));
             }
             if station_fit_tracing() {
                 eprintln!(
-                    "STATION-FIT round: samples={} target={target:.3e} round_max={round_max:.3e} inserts={} truncated={truncated}",
+                    "STATION-FIT round: samples={} target={target:.3e} round_max={round_max:.3e} inserts={} truncated={truncated}{}",
                     parameters.len(),
-                    inserts.len()
+                    inserts.len(),
+                    // Tracking mode's round_max is a TRACKING reading.
+                    if track_projection { " mode=tracking" } else { "" }
                 );
             }
             if inserts.is_empty() {
@@ -2068,6 +3626,17 @@ pub fn fit_pcurve_on_surface_stations(
                     // Every probed span is within the target; the narrow ones
                     // were not probed, and the sweep below measures them.
                     PcurveFitExit::SpanFloor
+                } else if track_projection {
+                    // Every probe TRACKS within the ask, but round_max is a
+                    // tracking reading, not the deviation the report carries.
+                    // The exit is Stalled (no probe can be improved; the
+                    // residual measured below is the edge's own standoff),
+                    // and it becomes Converged below only if that measured
+                    // deviation itself meets the floor. A verification probe
+                    // over the ask that could not be inserted leaves the
+                    // tracking UNMET.
+                    tracking_met = !verify_blocked;
+                    PcurveFitExit::Stalled
                 } else {
                     converged_max = Some(round_max);
                     PcurveFitExit::Converged
@@ -2085,7 +3654,10 @@ pub fn fit_pcurve_on_surface_stations(
             // so a fold-flip introduced mid-refinement cannot poison the next
             // round's deviation interpolant.
             repair_branch_jumps(surface, &edge_points, &mut raw, tolerance)?;
-            pcurve = build_interpolant(surface, &raw, &parameters)?;
+            let rebuilt = build_interpolant_joined(surface, &raw, &parameters, &joins)?;
+            pcurve = rebuilt.0;
+            excursion = rebuilt.1;
+            distance = rebuilt.2;
             if truncated {
                 exit = PcurveFitExit::SampleCeiling;
                 break;
@@ -2148,12 +3720,21 @@ pub fn fit_pcurve_on_surface_stations(
                 }
             }
         }
-        if exit == PcurveFitExit::SpanFloor && residual <= tolerance + off_surface {
+        // Legacy only: a SpanFloor exit whose measured DEVIATION is on the
+        // bar is promoted. In tracking mode the deviation sits at the standoff
+        // whatever the unprobed narrow spans' TRACKING is, so SpanFloor stays
+        // SpanFloor (unread); a tracking-mode fit is Converged only when every
+        // span was probed within the ask AND the measured deviation meets the
+        // floor (the exit's documented meaning, never the standoff bar).
+        if !track_projection && exit == PcurveFitExit::SpanFloor && residual <= tolerance + off_surface {
+            exit = PcurveFitExit::Converged;
+        }
+        if tracking_met && residual <= tolerance {
             exit = PcurveFitExit::Converged;
         }
         if exit != PcurveFitExit::Converged
             && !raised
-            && residual > tolerance + off_surface
+            && (residual > tolerance + off_surface || tracking_unmet)
             && cap < PCURVE_RAISED_SAMPLES
         {
             raised = true;
@@ -2176,6 +3757,8 @@ pub fn fit_pcurve_on_surface_stations(
                 exit,
                 off_surface,
                 raised,
+                clamped_excursion: excursion,
+                clamped_distance: distance,
             },
         });
     }
@@ -2219,17 +3802,20 @@ fn station_residual(
     off_surface: &mut f64,
 ) -> Result<f64, String> {
     let mut worst = 0.0_f64;
+    let mut read = |fraction: f64| -> Result<(), String> {
+        let uv = pcurve.evaluate(fraction)?;
+        let represented = surface.evaluate_extended(uv.x, uv.y)?;
+        let station = stations(fraction)?;
+        let deviation = represented.sub(station).length();
+        worst = worst.max(deviation);
+        if deviation > tolerance + *off_surface {
+            *off_surface = off_surface.max(invert_checked(surface, station)?.1);
+        }
+        Ok(())
+    };
     for span in parameters.windows(2) {
         for local in [0.25, 0.5, 0.75] {
-            let fraction = span[0] + (span[1] - span[0]) * local;
-            let uv = pcurve.evaluate(fraction)?;
-            let represented = surface.evaluate_extended(uv.x, uv.y)?;
-            let station = stations(fraction)?;
-            let deviation = represented.sub(station).length();
-            worst = worst.max(deviation);
-            if deviation > tolerance + *off_surface {
-                *off_surface = off_surface.max(invert_checked(surface, station)?.1);
-            }
+            read(span[0] + (span[1] - span[0]) * local)?;
         }
     }
     Ok(worst)

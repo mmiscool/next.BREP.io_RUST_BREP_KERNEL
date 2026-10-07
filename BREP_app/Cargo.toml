@@ -1,6 +1,6 @@
 [package]
 name = "BREP_app"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2021"
 license-file = "LICENSE.md"
 repository = "https://github.com/mmiscool/next.BREP.io_RUST_BREP_KERNEL"
@@ -71,8 +71,9 @@ default = ["mcp", "scripting"]
 scripting = ["dep:brep-script-core"]
 
 [dependencies]
+brep-plugins = { package = "BREP_plugins", version = "0.1.0", path = "../BREP_plugins" }
 # The windowing-agnostic viewer brain + wgpu-29 render core we are hosting.
-brep-render = { package = "BREP_render", version = "0.6.0", path = "../BREP_render" }
+brep-render = { package = "BREP_render", version = "0.7.0", path = "../BREP_render" }
 # wgpu named directly so we can spell the types the render core hands back /
 # takes (TextureView, Device, ...). Resolves to the SAME wgpu 29.x as
 # brep-render and eframe's egui-wgpu (all constrain ^29), so the handle types
@@ -141,11 +142,11 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 # The electronics documents (schematic, wiring diagram, board, symbol, pads) and
 # their embeddable egui editors, moved in from eCAD as sibling crates. Their
 # manifests stand alone, like every crate here; see the profile section below.
-BREP_ecad_core = { version = "0.2.0", path = "../BREP_ecad_core" }
-BREP_ecad_egui = { version = "0.2.0", path = "../BREP_ecad_egui" }
+BREP_ecad_core = { version = "0.2.1", path = "../BREP_ecad_core" }
+BREP_ecad_egui = { version = "0.2.1", path = "../BREP_ecad_egui" }
 # The script interpreter core shared with the PLM server (feature `scripting`).
 # It turns on Boa's wasm backend itself, so nothing about Boa is spelled here.
-brep-script-core = { package = "BREP_script_core", version = "0.1.1", path = "../BREP_script_core", optional = true }
+brep-script-core = { package = "BREP_script_core", version = "0.1.2", path = "../BREP_script_core", optional = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 # BREP_ecad_core makes v4 uuids, and uuid refuses to compile for wasm32-unknown-unknown
@@ -212,7 +213,7 @@ web-sys = { version = "0.3", features = [
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 # The MCP server core (feature `mcp`): the same server `brep-mcp` hosts
 # headlessly, embedded here over the app's own automation queue.
-brep-mcp-core = { package = "BREP_mcp_core", version = "0.5.0", path = "../BREP_mcp_core", optional = true }
+brep-mcp-core = { package = "BREP_mcp_core", version = "0.6.0", path = "../BREP_mcp_core", optional = true }
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "net", "time"], optional = true }
 
 [[bin]]

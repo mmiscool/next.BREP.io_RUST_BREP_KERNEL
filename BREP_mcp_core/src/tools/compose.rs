@@ -1175,8 +1175,75 @@ impl Presentation {
 }
 
 pub fn capture_tools(slot: SessionSlot) -> Vec<ToolSpec> {
+    let illustration_slot = slot.clone();
     let annotate_slot = slot.clone();
     vec![ToolSpec::new(
+        "illustration_capture_many",
+        "capture",
+        "Capture multiple assembly illustrations using temporary presentation state. Each view starts from the original camera/visibility/selection/settings, optionally activates a saved 3D view, selects components, applies display-only explode translations and captures a PNG. All state is restored on success or failure. Cancellation stops between captures and still restores. No temporary documents or modeling features are created.",
+        object_schema(json!({
+            "views":{"type":"array","minItems":1,"maxItems":64,"items":{"type":"object","properties":{
+                "id":{"type":"string"},"components":{"type":"array","items":{"type":"string"}},
+                "visibility":{"type":"object","additionalProperties":{"type":"boolean"}},
+                "saved_view":{"type":"string"},"standard_view":{"type":"string"},"camera":{"type":"object"},
+                "explode":{"type":"object","description":"component ID to [x,y,z] presentation translation in mm"},
+                "settings":{"type":"object"},"clear_selection":{"type":"boolean","default":true},
+                "region":{"type":"string","enum":["full","viewport"],"default":"viewport"}
+            },"required":["id"],"additionalProperties":false}},
+            "max_width":{"type":"integer","minimum":1,"maximum":4096,"default":1024}
+        }), &["views"]),
+        Annotations { read_only:true, destructive:false, idempotent:false, waits:true },
+        move |args| {
+            let slot = illustration_slot.clone();
+            Box::pin(async move {
+                let session = current(&slot).await?;
+                let views = args["views"].as_array().filter(|a| !a.is_empty() && a.len() <= 64).ok_or("views must contain 1..=64 views")?.clone();
+                let mut ids = std::collections::HashSet::new();
+                for view in &views {
+                    let id = view["id"].as_str().ok_or("each view needs a string id")?;
+                    if !ids.insert(id.to_string()) { return Err(format!("duplicate view id {id}")); }
+                }
+                // A dropped MCP future signals cancellation but does not abort
+                // the owned cleanup task. It finishes the current capture and
+                // restores the presentation before stopping.
+                let (cancel_tx, mut cancel_rx) = tokio::sync::oneshot::channel::<()>();
+                let task = tokio::spawn(async move {
+                    wait_idle(&session, 60_000, 2).await?;
+                    let begin = session.host.call_ok("illustration_presentation", json!({"action":"begin"})).await?.result.unwrap_or(Value::Null);
+                    let document_id = begin["document_id"].clone();
+                    let capture = async {
+                        let mut captures = Vec::new();
+                        let mut images = Vec::new();
+                        for view in views {
+                            if matches!(cancel_rx.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Closed)) { break; }
+                            let mapping = session.host.call_ok("illustration_presentation", json!({"action":"view","document_id":document_id,"view":view})).await?.result.unwrap_or(Value::Null);
+                            let region = view.get("region").cloned().unwrap_or(json!("viewport"));
+                            let (_, img) = shot_with_pointer(&session, region, false, 1).await?;
+                            let full = image::encode_png(&img)?;
+                            let (shot, path) = session.next_shot();
+                            std::fs::write(&path, full).map_err(|e| format!("{}: {e}", path.display()))?;
+                            let inline = image::scale_to_width(&img, u(&args,"max_width",1024).clamp(1,4096) as u32);
+                            images.push(ToolImage {png:image::encode_png(&inline)?,mime:"image/png"});
+                            let manifest = path.with_extension("json");
+                            let capture = json!({"id":view["id"],"shot":shot,"path":path.display().to_string(),"manifest":manifest.display().to_string(),"components":mapping["components"],"solids":mapping["solids"],"visibleComponents":mapping["visibleComponents"],"visibleSolids":mapping["visibleSolids"],"camera":mapping["camera"],"requested":view,"document_id":document_id});
+                            std::fs::write(&manifest, serde_json::to_vec_pretty(&capture).map_err(|e| e.to_string())?).map_err(|e| format!("{}: {e}", manifest.display()))?;
+                            captures.push(capture);
+                        }
+                        Ok::<_,String>(ToolOutput {json:json!({"captures":captures,"document_id":document_id,"restored":true}),images})
+                    }.await;
+                    let restored = session.host.call_ok("illustration_presentation",json!({"action":"end","document_id":document_id})).await;
+                    match (capture, restored) {
+                        (Ok(output), Ok(_)) => Ok(output),
+                        (Err(error), Ok(_)) => Err(error),
+                        (capture, Err(restore)) => Err(format!("capture outcome: {}; presentation restoration failed: {restore}",capture.err().unwrap_or_else(|| "captured".into()))),
+                    }
+                });
+                let result = task.await.map_err(|e| format!("illustration task: {e}"))?;
+                drop(cancel_tx);
+                result
+            })
+        },
+    ),ToolSpec::new(
         "screenshot",
         "capture",
         "Capture the composited frame (panels and 3D view). region: full (default), viewport, or {x,y,w,h} in egui points. The image is returned inline, downscaled to max_width (1024), and the full-resolution PNG is written under the session's shots directory. cursor: draw the virtual pointer (cursor_scale makes it bigger). \
@@ -1415,6 +1482,19 @@ fn feature_item_schema() -> Value {
     })
 }
 
+fn batch_item_schema() -> Value {
+    let mut props = feature_item_schema();
+    let extra = json!({
+        "attributes": { "type": "object", "description": "Native component occurrenceAttributes" },
+        "display_name": { "type": "string", "description": "Component occurrence Name attribute" },
+        "material": { "type": "string", "description": "Component occurrence Material attribute" },
+        "alias": { "type": "string", "description": "Batch client alias; reference as @alias, @alias:referenceSuffix, @alias/output/0, @alias/face/0 or @alias/edge/0" },
+        "depends_on": { "type": "array", "items": {"type":"string"}, "description": "Batch dependency aliases" }
+    });
+    props.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+    props
+}
+
 /// Turn one `{type, params, id?, persistent_data?}` item into the complete
 /// `{type, inputParams, persistentData?}` feature the app's `feature_add` /
 /// `feature_add_many` commands take: seed the schema defaults, overlay the
@@ -1430,9 +1510,9 @@ async fn seed_feature(
     known: Option<&std::collections::HashSet<String>>,
 ) -> Result<(String, Value, Vec<String>), String> {
     let ty = s(item, "type").ok_or("missing `type`")?;
-    let entry = schema::entry(&ty).ok_or_else(|| format!("unknown feature type `{ty}` (see feature_catalogue)"))?;
+    let entry = super::session_feature_entry(session, &ty).await?;
     let id_ = schema::identity(&entry);
-    let mut params = validate::merge_params(&schema::defaults(&id_.feature_type), item.get("params").unwrap_or(&json!({})));
+    let mut params = validate::merge_params(&schema::defaults_from_entry(&entry), item.get("params").unwrap_or(&json!({})));
     // The id may be given as the item's own `id`, or inside `params` — the
     // kernel's inputParams really does carry one, so writing it there is the
     // natural thing to do and used to be silently overwritten by a minted id
@@ -1445,7 +1525,7 @@ async fn seed_feature(
         }
     };
     params["id"] = json!(id);
-    let v = validate::validate(&id_.feature_type, &params, known);
+    let v = validate::validate_entry(&entry, &params, known);
     if !v.ok() {
         return Err(format!("invalid parameters for {} `{id}`: {}", id_.long_name, v.errors.join("; ")));
     }
@@ -1454,6 +1534,32 @@ async fn seed_feature(
         feature["persistentData"] = pd.clone();
     }
     Ok((id, feature, v.warnings))
+}
+
+/// Reuse feature_add's schema validator without reserving live IDs. The native
+/// transaction subsequently validates identities, aliases and the whole graph.
+fn batch_validation_errors(args: &Value) -> Vec<Value> {
+    fn check(items: &[Value], prefix: &str, errors: &mut Vec<Value>) {
+        for (i, item) in items.iter().enumerate() {
+            let ty = item["type"].as_str().unwrap_or("");
+            // A nested part can pin a different plugin schema from its parent.
+            // Its runner validates the exact pinned callback, so the global
+            // built-in catalogue cannot prevalidate namespaced extension nodes.
+            if ty.contains('/') { continue; }
+            let mut patch = item.get("params").or_else(|| item.get("inputParams")).cloned().unwrap_or(json!({}));
+            if matches!(ty, "ACOMP" | "ASSEMBLY COMPONENT") { if let Some(o) = patch.as_object_mut() { o.remove("occurrenceAttributes"); } }
+            let mut params = validate::merge_params(&schema::defaults(ty), &patch);
+            if let Some(o) = params.as_object_mut() { o.insert("id".into(), item.get("id").cloned().unwrap_or(json!("batch_validation"))); }
+            let v = validate::validate(ty, &params, None);
+            for message in v.errors { errors.push(json!({"path":format!("{prefix}[{i}].params"),"position":i,"alias":item["alias"],"message":message})); }
+        }
+    }
+    let mut errors = Vec::new();
+    if let Some(items) = args["features"].as_array() { check(items, "features", &mut errors); }
+    if let Some(parts) = args["parts"].as_array() {
+        for (i, part) in parts.iter().enumerate() { if let Some(items) = part["document"]["features"].as_array() { check(items, &format!("parts[{i}].document.features"), &mut errors); } }
+    }
+    errors
 }
 
 pub fn feature_tools(slot: SessionSlot) -> Vec<ToolSpec> {
@@ -1495,12 +1601,19 @@ pub fn feature_tools(slot: SessionSlot) -> Vec<ToolSpec> {
         ToolSpec::new(
             "feature_add_many",
             "features",
-            "Add several features in ONE history run: each item takes the same `{type, params, id?, persistent_data?}` shape as `feature_add` and is seeded, given an id and validated the same way. \
+            "Append a native feature batch. The legacy fast lane uses one history run; the structured lane evaluates dependency stages and commits one undo checkpoint. Each item takes the same `{type, params, id?, persistent_data?}` shape as `feature_add` and is seeded, given an id and validated the same way. \
              ATOMIC in the history — if any item fails to validate nothing is appended, and the error names the item's position and id (the id counter still advances, so a refused batch leaves a gap in the numbering). \
+             Set structured or rollback_on_error, or supply aliases/parts/constraints, for native assembly transactions: aliases resolve in dependency order and geometry errors return per-item outcomes. The legacy fast lane reserves IDs during validation; the structured lane rolls counters back with the document. \
              A later item may reference what an earlier one builds. \
-             Returns the assigned ids, the single run report and the listing, with each feature's output solids under `after.report.featureOutputs`. Use this for patterns and assemblies: N features, one rebuild.",
+             The legacy response includes ids and after.report.featureOutputs. Structured responses include items (position, alias, id, status, committed, generatedSolids, generatedReferences), aliases, outputs, constraint diagnostics and transaction coverage. Full failure details are retrieved with geometry_diagnostics.",
             object_schema(json!({
-                "features": { "type": "array", "items": { "type": "object", "properties": feature_item_schema(), "required": ["type"], "additionalProperties": false } },
+                "features": { "type": "array", "items": { "type": "object", "properties": batch_item_schema(), "required": ["type"], "additionalProperties": false } },
+                "parts": { "type": "array", "items": {"type":"object", "properties":{"alias":{"type":"string"}, "document":{"type":"object"}}, "required":["alias","document"], "additionalProperties":false}, "description":"Native editable part documents, referenced by @alias in ACOMP partName; document.features accepts feature items or native descriptors" },
+                "constraints": { "type": "array", "items": {"type":"object"}, "description":"Native assembly constraint type, params, optional alias and enabled" },
+                "expressions": {"type":"string"},
+                "metadata": {"type":"object", "description":"Native document metadata patch"},
+                "rollback_on_error": {"type":"boolean", "default":false, "description":"Restore recipe, library, instances, constraints, metadata, counters and undo/redo on rebuild failure. Runtime generations/caches are invalidated."},
+                "structured": {"type":"boolean", "default":false, "description":"Return per-item evaluated/failed/not_evaluated results and dependency diagnostics"},
                 "wait": { "type": "boolean", "default": true },
                 "timeout_ms": { "type": "integer", "default": 60000 }
             }), &["features"]),
@@ -1514,8 +1627,30 @@ pub fn feature_tools(slot: SessionSlot) -> Vec<ToolSpec> {
                         .and_then(Value::as_array)
                         .ok_or("missing `features` (an array of {type, params, …} items)")?
                         .clone();
-                    if items.is_empty() {
+                    if items.is_empty() && ["parts", "constraints"].iter().all(|k| args[*k].as_array().is_none_or(|a| a.is_empty())) {
                         return Err("`features` is empty".into());
+                    }
+                    if b(&args, "structured", false) || b(&args, "rollback_on_error", false)
+                        || ["parts", "constraints", "expressions", "metadata"].iter().any(|k| args.get(*k).is_some())
+                        || items.iter().any(|f| ["alias", "depends_on", "attributes", "display_name", "material"].iter().any(|key| f.get(*key).is_some())) {
+                        let errors = batch_validation_errors(&args);
+                        if !errors.is_empty() {
+                            let results: Vec<Value> = items.iter().enumerate().map(|(i,item)| {
+                                let item_errors: Vec<&Value> = errors.iter().filter(|e| e["path"].as_str().is_some_and(|p| p.starts_with(&format!("features[{i}].")))).collect();
+                                json!({"position":i,"alias":item["alias"],"id":item["id"],"status":if item_errors.is_empty() {"not_evaluated"} else {"failed"},"committed":false,"validationErrors":item_errors})
+                            }).collect();
+                            return Ok(ToolOutput::json(json!({"success":false,"status":"validation_failed","validationErrors":errors,"items":results,"modelChanged":false})));
+                        }
+                        // The native transaction owns allocation, dependency resolution,
+                        // execution and rollback; no ID reservations cross its boundary.
+                        let mut request = args.clone();
+                        request.as_object_mut().unwrap().remove("wait");
+                        request.as_object_mut().unwrap().remove("timeout_ms");
+                        request["structured"] = json!(true);
+                        wait_idle(&session, u(&args, "timeout_ms", 60_000), 2).await?;
+                        let r = session.host.call_ok("feature_add_many", request).await?.result.unwrap_or(Value::Null);
+                        session.record("feature_add_many", &args, r["success"] == true, r.clone());
+                        return Ok(ToolOutput::json(r));
                     }
                     // Seed and validate EVERY item before the history sees any of
                     // them: a batch that would half-apply is refused whole, so a
@@ -1575,7 +1710,8 @@ pub fn feature_tools(slot: SessionSlot) -> Vec<ToolSpec> {
                     let ty = cur["type"].as_str().unwrap_or("").to_string();
                     let merged = validate::merge_params(&cur["inputParams"], args.get("patch").unwrap_or(&json!({})));
                     let known = known_names(&session).await;
-                    let v = validate::validate(&ty, &merged, known.as_ref());
+                    let entry = super::session_feature_entry(&session, &ty).await?;
+                    let v = validate::validate_entry(&entry, &merged, known.as_ref());
                     if !v.ok() {
                         return Err(format!("invalid parameters for {ty}: {}", v.errors.join("; ")));
                     }
@@ -1625,3 +1761,4 @@ fn base64_decode(text: &str) -> Result<Vec<u8>, String> {
         .decode(text)
         .map_err(|e| format!("document_export: the app's base64 payload does not decode: {e}"))
 }
+

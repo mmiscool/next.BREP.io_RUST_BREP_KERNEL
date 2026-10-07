@@ -30,8 +30,9 @@
 //!    of three of its points and the ball centre is available from the surface
 //!    alone.
 //! 2. With that centre, `g = (S_u x S_v) . (S - centre(u))` evaluates to
-//!    `-rho^2 (1 - rho kappa cos psi)`, so the SIGN of one scalar is the fold
-//!    locus — no reference normal, no heuristic threshold.
+//!    a signed multiple of `(1 - rho kappa cos psi)`. Its sign is normalized
+//!    by the section frame and centre travel before classifying the fold;
+//!    reversing either surface parameter cannot swap folded and regular material.
 //! 3. The fold locus is a closed lens in `(u, v)` whose two extremal-`v` points
 //!    (`g = 0` and `g_u = 0`) ARE the swallowtails, and the swallowtails are
 //!    exactly the two ends of the crease.  They are therefore SOLVED, not
@@ -136,7 +137,7 @@ pub(super) fn band_refusal(radius: f64, reason: &str) -> KernelRefusal {
 /// points. A CHAMFER section is straight and has none; that is an error here
 /// rather than a fallback, because everything below reads the sign of a
 /// Jacobian against this point.
-fn section_centre(surface: &NurbsSurface, u: f64) -> Result<Vec3, KernelRefusal> {
+pub(super) fn section_centre(surface: &NurbsSurface, u: f64) -> Result<Vec3, KernelRefusal> {
     let [v0, v1] = surface.domain_v().or_refuse(KernelStage::Sew, "domain_v")?;
     let a = surface.evaluate(u, v0).or_refuse(KernelStage::Sew, "evaluate")?;
     let b = surface.evaluate(u, 0.5 * (v0 + v1)).or_refuse(KernelStage::Sew, "evaluate")?;
@@ -156,15 +157,52 @@ fn section_centre(surface: &NurbsSurface, u: f64) -> Result<Vec3, KernelRefusal>
     Ok(a.add(to_centre))
 }
 
-/// `-rho^2 (1 - rho kappa cos psi)` read off the surface: negative on the
-/// regular part of a wall built this way, positive inside the fold.
+/// Orientation of the section frame relative to the centre's travel.
+/// A regular circular wall has J opposite to c'(u) dot ((b-a) cross (c-a)).
+/// Multiplying J by this sign makes folds positive under either u or v
+/// reversal. Differentiate the circumcentre exactly from surface derivatives;
+/// no sampled reference normal or assumed march orientation is needed.
+pub(super) fn section_orientation(surface: &NurbsSurface, u: f64) -> Result<f64, KernelRefusal> {
+    let [v0, v1] = surface.domain_v().or_refuse(KernelStage::Sew, "domain_v")?;
+    let a = surface.derivatives(u, v0, 1).or_refuse(KernelStage::Sew, "derivatives")?;
+    let b = surface.derivatives(u, 0.5 * (v0 + v1), 1).or_refuse(KernelStage::Sew, "derivatives")?;
+    let c = surface.derivatives(u, v1, 1).or_refuse(KernelStage::Sew, "derivatives")?;
+    let first = b[0][0].sub(a[0][0]);
+    let second = c[0][0].sub(a[0][0]);
+    let first_du = b[1][0].sub(a[1][0]);
+    let second_du = c[1][0].sub(a[1][0]);
+    let cross = first.cross(second);
+    let cross_du = first_du.cross(second).add(first.cross(second_du));
+    let denominator = 2.0 * cross.dot(cross);
+    let denominator_du = 4.0 * cross.dot(cross_du);
+    let numerator = second.cross(cross).scale(first.dot(first))
+        .add(cross.cross(first).scale(second.dot(second)));
+    let numerator_du = second_du.cross(cross).scale(first.dot(first))
+        .add(second.cross(cross_du).scale(first.dot(first)))
+        .add(second.cross(cross).scale(2.0 * first.dot(first_du)))
+        .add(cross_du.cross(first).scale(second.dot(second)))
+        .add(cross.cross(first_du).scale(second.dot(second)))
+        .add(cross.cross(first).scale(2.0 * second.dot(second_du)));
+    let travel = a[1][0].add(numerator_du.scale(1.0 / denominator))
+        .sub(numerator.scale(denominator_du / (denominator * denominator)));
+    let orientation = travel.dot(cross);
+    if !(denominator > 0.0) || !denominator.is_finite()
+        || !orientation.is_finite() || orientation == 0.0 {
+        return Err(KernelRefusal::internal(KernelStage::Sew, "section_orientation",
+            "blend carve: the section frame has no resolved orientation along its centre curve"));
+    }
+    Ok(orientation.signum())
+}
+
+/// Raw signed surface Jacobian; its zeros are independent of parameter
+/// orientation. Fold occupancy normalizes its sign with section_orientation.
 fn jacobian(surface: &NurbsSurface, u: f64, v: f64) -> Result<f64, KernelRefusal> {
     jacobian_about(surface, u, v, section_centre(surface, u)?)
 }
 
 /// The same, with the section's centre already in hand: it depends on `u`
 /// alone, so a scan down one section pays for it once.
-fn jacobian_about(surface: &NurbsSurface, u: f64, v: f64, centre: Vec3) -> Result<f64, KernelRefusal> {
+pub(super) fn jacobian_about(surface: &NurbsSurface, u: f64, v: f64, centre: Vec3) -> Result<f64, KernelRefusal> {
     let derivatives = surface.derivatives(u, v, 1).or_refuse(KernelStage::Sew, "derivatives")?;
     let point = derivatives[0][0];
     let du = derivatives[1][0];
@@ -361,15 +399,32 @@ pub(super) fn trace_wall_crease(
     for index in 0..=samples_u {
         let u = u0 + (u1 - u0) * index as f64 / samples_u as f64;
         let centre = section_centre(surface, u)?;
+        let orientation = section_orientation(surface, u)?;
         for step_v in 0..=samples_v {
             let v = v0 + (v1 - v0) * step_v as f64 / samples_v as f64;
-            if jacobian_about(surface, u, v, centre)? > 0.0 {
+            if orientation * jacobian_about(surface, u, v, centre)? > 0.0 {
                 inside.push([u, v]);
             }
         }
     }
     if inside.is_empty() {
         return Ok(None);
+    }
+    // Private diagnostic: distinguish an occupied full period from a local
+    // fold lens crossing the parameter seam, before the existing refusal.
+    // This does not change the carve, its samples, or any acceptance bar.
+    if std::env::var("BREP_BLEND_CARVE_TRACE").ok().as_deref() == Some("1") {
+        let mut occupied = vec![0usize; samples_u + 1];
+        for point in &inside {
+            let index = (((point[0] - u0) / (u1 - u0)) * samples_u as f64).round() as usize;
+            occupied[index.min(samples_u)] += 1;
+        }
+        eprintln!("CARVE_OCCUPANCY {}", serde_json::json!({
+            "radius": radius, "u_domain": [u0, u1], "v_domain": [v0, v1],
+            "samples_u": samples_u, "samples_v": samples_v,
+            "closed_directions": surface.closed_directions().ok(),
+            "occupied_v_counts_by_u": occupied, "inside": inside, "surface": surface,
+        }));
     }
     // A band that WRAPS the wall's whole u period is not a lens. That is the
     // circular spine: its evolute is a single point, every section crosses the

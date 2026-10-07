@@ -152,12 +152,30 @@
 //! does: outer and inner sweep the same path through the same
 //! rotation-minimizing frame at the same stations, so the bore is concentric and
 //! the end caps are coincident annuli, including in assemblies with junctions.
+//!
+//! # Closed edges (rings)
+//!
+//! A CLOSED edge — a cylinder or cone rim, a full circle in a sketch — has no
+//! two ends to hang a segment between: its chord is zero, and the ball-and-stick
+//! graph would read it as a self-loop at one node of degree 2 and seed a joint
+//! ball there. It is a different construction, so it takes a different lane: the
+//! circle is swept once round the edge by `sweep_profile_along_chain`, the
+//! closed-path builder Path Sweep's `pathAlign` drives, which closes the loft on
+//! itself and caps nothing. A ring is ONE body with its two side halves and no
+//! caps, and a hollow ring is the outer ring minus the concentric inner one.
+//!
+//! Each ring is its OWN body: it never joins the ball-and-stick assembly, so a
+//! ring selected together with open edges that touch it comes back as a
+//! separate solid alongside theirs. Selecting a rim that the tube cannot tell
+//! from a zero-length edge is what the report of 2026-10-05 was: *"tube should
+//! generate even with a closed loop path"* — the rim of an offset-shelled cone,
+//! refused as "path has a zero-length edge".
 
 use crate::feature_pipeline::features::common;
 use crate::feature_pipeline::{FeatureContext, FeatureRefusal, FeatureResult};
 use crate::{
     extrude_profile_brep, make_arc, make_cylinder_brep, make_line, make_sphere_brep_framed,
-    revolve_profile_brep_named, sew_solid, sweep_profile_along_chain_with_stations,
+    revolve_profile_brep_named, sew_solid, sweep_profile_along_chain_with_stations_reported,
     sweep_profile_along_path, AnalyticSurface, BooleanOperation, BooleanOptions, BrepSolid,
     NurbsCurve, Vec3,
 };
@@ -176,6 +194,14 @@ struct Segment {
     end: Vec3,
     /// `None` → straight (cylinder lane); `Some(curve)` → curved (sweep lane).
     curve: Option<NurbsCurve>,
+}
+
+/// One path edge, classified: an OPEN edge takes its place in the ball-and-stick
+/// graph as a [`Segment`]; a CLOSED one (see "Closed edges" in the module doc) is
+/// swept on its own as a capless ring.
+enum PathEdge {
+    Open(Segment),
+    Ring(NurbsCurve),
 }
 
 impl Segment {
@@ -218,6 +244,19 @@ pub fn execute(ctx: &FeatureContext) -> FeatureResult {
     }
 }
 
+thread_local! {
+    /// The station lane's measured bounds (`sweep.stations`) for the swept
+    /// bends of the component being assembled: the sweep runs several calls
+    /// deep under the joint-clearance ladder, so each attempt clears this and
+    /// the feature takes what the accepted attempt left. A side channel like
+    /// `take_blend_notes`, scoped to this thread.
+    static SWEEP_REPORTS: std::cell::RefCell<Vec<crate::Approximation>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn take_sweep_reports() -> Vec<crate::Approximation> {
+    SWEEP_REPORTS.with(|reports| std::mem::take(&mut *reports.borrow_mut()))
+}
+
 fn build(ctx: &FeatureContext) -> Result<FeatureResult, FeatureRefusal> {
     let radius = ctx.number("radius")?;
     if !(radius > 0.0) {
@@ -244,10 +283,16 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, FeatureRefusal> {
     // Resolve every input reference to INDIVIDUAL edge curves (one segment per
     // edge), then classify each: STRAIGHT ones become cylinders, CURVED ones
     // sweep the circle along themselves.
+    // A CLOSED edge is a ring of its own (see "Closed edges"): it is kept out of
+    // the graph, where its one node would read as a degree-2 junction.
     let curves = resolve_path_edges(ctx)?;
     let mut segments: Vec<Segment> = Vec::with_capacity(curves.len());
+    let mut rings: Vec<NurbsCurve> = Vec::new();
     for curve in &curves {
-        segments.push(classify_edge(curve, radius)?);
+        match classify_edge(curve, radius)? {
+            PathEdge::Open(segment) => segments.push(segment),
+            PathEdge::Ring(curve) => rings.push(curve),
+        }
     }
 
     // Junction graph: merge shared endpoints into nodes; group edges into
@@ -256,16 +301,21 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, FeatureRefusal> {
     let components = connected_components(&edge_nodes, nodes.len());
 
     let name = if ctx.id.is_empty() { "Tube" } else { ctx.id.as_str() };
-    let multi = components.len() > 1;
-
-    // One solid per connected component.
-    let mut bodies: Vec<(String, BrepSolid)> = Vec::with_capacity(components.len());
-    for (index, component) in components.iter().enumerate() {
-        let body_name = if multi {
+    let multi = components.len() + rings.len() > 1;
+    let body_name = |index: usize| {
+        if multi {
             format!("{name}[{index}]")
         } else {
             name.to_string()
-        };
+        }
+    };
+
+    // One solid per connected component, then one per ring.
+    let mut bodies: Vec<(String, BrepSolid)> =
+        Vec::with_capacity(components.len() + rings.len());
+    let mut approximations: Vec<crate::Approximation> = Vec::new();
+    for (index, component) in components.iter().enumerate() {
+        let body_name = body_name(index);
         let solid = assemble_component(
             &segments,
             component,
@@ -276,12 +326,23 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, FeatureRefusal> {
             bend,
             &body_name,
         )?;
+        approximations.extend(take_sweep_reports());
+        bodies.push((body_name, solid));
+    }
+    for (offset, ring) in rings.iter().enumerate() {
+        let body_name = body_name(components.len() + offset);
+        let solid = assemble_ring(ring, radius, inner, &body_name)?;
+        approximations.extend(take_sweep_reports());
         bodies.push((body_name, solid));
     }
 
     // NONE → each component as a separate added solid; a boolean set folds every
     // component sequentially into the targets.
-    Ok(common::finalize_solids(ctx, bodies))
+    let mut result = common::finalize_solids(ctx, bodies);
+    if result.error.is_none() {
+        result.approximations.extend(approximations);
+    }
+    Ok(result)
 }
 
 /// One connected component, at the SMALLEST joint clearance that builds it
@@ -315,6 +376,7 @@ fn assemble_component(
     for (rung, &clearance) in JOINT_CLEARANCE_LADDER.iter().enumerate() {
         let exact_only = rung + 1 < JOINT_CLEARANCE_LADDER.len();
         let attempt = (|| {
+            let _ = take_sweep_reports();
             let outer = build_assembly(
                 segments, component, nodes, edge_nodes, radius, name, "", clearance, exact_only,
                 bend,
@@ -1074,14 +1136,22 @@ fn named_chain(
     // tangent points); the classification is what the corner refusal reads when a
     // too-small bend radius leaves one that is not.
     let classified = crate::SweepPath::from_curves(path, &piece_names)?;
-    let mut swept = sweep_profile_along_chain_with_stations(
+    let crate::SweptChain { solid: mut swept, report } = sweep_profile_along_chain_with_stations_reported(
         &profile,
         &classified,
         stations,
         "raise the tube's bend radius so the corner is rounded, or set it to 0 to \
          join the segments with a ball instead",
+        None,
     )
     .map_err(|error| format!("tube: sweeping the section along a bent path failed: {error}"))?;
+    // The station lane's measured bound, for the body this chain ends up in
+    // (`take_sweep_reports` at the feature's exit).
+    if let Some(report) = report {
+        SWEEP_REPORTS.with(|reports| {
+            reports.borrow_mut().push(report.approximation(format!("{name}{suffix} segment {local}")))
+        });
+    }
     let faces = face_count(&swept);
     if faces != profile.len() + 2 {
         return Err(format!(
@@ -1528,6 +1598,110 @@ fn named_sphere(
     Ok(sphere)
 }
 
+/// One CLOSED edge as a ring body, hollowed when `inner > 0` — the closed-edge
+/// counterpart of [`assemble_component`]. No clearance ladder: a ring has no
+/// joint, so there is no ball to size.
+///
+/// The hollow subtract is a body entirely inside another with no shared face —
+/// the result is the outer wall plus an inner void shell. The boolean owns that
+/// case; a failure there is reported by name rather than as a raw boolean error.
+///
+/// Every refusal the lane's builders raise is TYPED ([`crate::KernelRefusal`])
+/// and is passed on as such: the tube prefixes the text and keeps the class and
+/// stage, so a sweep refusal reaches `FeatureResult.refusal` with the class it
+/// was raised with rather than flattened to text.
+fn assemble_ring(
+    curve: &NurbsCurve,
+    radius: f64,
+    inner: f64,
+    name: &str,
+) -> Result<BrepSolid, FeatureRefusal> {
+    let _ = take_sweep_reports();
+    let outer = named_ring(curve, radius, name, "")?;
+    if inner <= 0.0 {
+        return Ok(outer);
+    }
+    let cutter = named_ring(curve, inner, name, "_Inner")?;
+    common::subtract_solid(outer, cutter).map_err(|error| {
+        FeatureRefusal::from(error.with_message(|error| {
+            format!("tube: hollow subtract (outer − inner) of a closed-path ring failed: {error}")
+        }))
+    })
+}
+
+/// One named RING: the tube circle swept once round a CLOSED edge by the
+/// closed-chain sweep, which closes the loft on itself instead of capping it.
+///
+/// The same two-half-arc profile about the origin as [`named_swept`], under the
+/// same `Transplant` placement, so a ring's wall is the wall an open arc of the
+/// same edge would have. Face order out of the closed loft is `[side per profile
+/// curve…]` and nothing else — a ring has no caps — which is ASSERTED for the
+/// same reason [`named_swept`] asserts its own count. Both sides carry the
+/// `_Seg0_S` name an open segment's sides do.
+///
+/// The path classification and the sweep refuse with a typed
+/// [`crate::KernelRefusal`]; both are passed on with the tube's prefix on the
+/// text and the class and stage untouched (`with_message`), never through a
+/// `String`. The two consistency checks of this function's own are text.
+fn named_ring(
+    curve: &NurbsCurve,
+    radius: f64,
+    name: &str,
+    suffix: &str,
+) -> Result<BrepSolid, FeatureRefusal> {
+    use std::f64::consts::{PI, TAU};
+    let x = Vec3::new(1.0, 0.0, 0.0);
+    let y = Vec3::new(0.0, 1.0, 0.0);
+    let origin = Vec3::default();
+    let profile = [
+        make_arc(origin, x, y, radius, 0.0, PI)?,
+        make_arc(origin, x, y, radius, PI, TAU)?,
+    ];
+    let segment_name = format!("{name}{suffix}_Seg0");
+    let classified = crate::SweepPath::from_curves(std::slice::from_ref(curve), &[segment_name])
+        .map_err(|refusal| {
+            refusal.with_message(|message| {
+                format!("tube: classifying the closed edge as a sweep path failed: {message}")
+            })
+        })?;
+    if !classified.closed {
+        return Err(
+            "tube: internal error — an edge classified as closed is not a closed sweep path".into(),
+        );
+    }
+    let crate::SweptChain { solid: mut swept, report } = crate::sweep_profile_along_chain_reported(
+        &profile,
+        &classified,
+        0.0,
+        None,
+        None,
+        crate::SectionPlacement::Transplant,
+        "",
+        None,
+    )
+    .map_err(|refusal| {
+        refusal.with_message(|message| {
+            format!("tube: sweeping the section around a closed edge failed: {message}")
+        })
+    })?;
+    if let Some(report) = report {
+        SWEEP_REPORTS.with(|reports| {
+            reports.borrow_mut().push(report.approximation(format!("{name}{suffix} ring")))
+        });
+    }
+    let faces = face_count(&swept);
+    if faces != profile.len() {
+        return Err(format!(
+            "tube: swept ring produced {faces} faces, expected {} (sides only, no caps)",
+            profile.len()
+        )
+        .into());
+    }
+    let side = format!("{name}{suffix}_Seg0_S");
+    name_faces(&mut swept, &[side.clone(), side]);
+    Ok(swept)
+}
+
 /// Binary UNION of two owned solids, coplanar-merged. BINARY only — the n-ary
 /// path has no perturbation fallback and would die unrescued on the same tangent
 /// node.
@@ -1612,16 +1786,32 @@ fn resolve_path_edges(ctx: &FeatureContext) -> Result<Vec<NurbsCurve>, String> {
 /// `1e-6` of the chord, relative to the chord length.
 ///
 /// A curved edge is additionally checked for FOLD-OVER: see
-/// [`refuse_fold_over`]. A zero-length edge errors in either lane.
-fn classify_edge(curve: &NurbsCurve, radius: f64) -> Result<Segment, String> {
+/// [`refuse_fold_over`]. A CLOSED edge — no chord, but a sampled length — is a
+/// [`PathEdge::Ring`], fold-checked the same way; a zero-length edge errors.
+fn classify_edge(curve: &NurbsCurve, radius: f64) -> Result<PathEdge, String> {
     let [t0, t1] = curve.domain()?;
     let start = curve.evaluate(t0)?;
     let end = curve.evaluate(t1)?;
     let chord = end.sub(start);
     let chord_length = chord.length();
     if chord_length <= EPS {
-        // A closed or zero-length edge has no chord to measure against, and the
-        // ball-and-stick graph has no two ends to hang it between.
+        // No chord to measure against and no two ends to hang a segment between:
+        // either the edge went all the way ROUND (a rim circle), or it went
+        // nowhere. The sampled travel tells them apart, at the band `SweepPath`
+        // reads closure at for a path whose ends coincide (`1e-5`, floored at
+        // the unit scale), so the ring lane and its builder agree.
+        let mut travel = 0.0;
+        let mut previous = start;
+        for station in 1..=CLOSURE_SAMPLES {
+            let t = t0 + (t1 - t0) * station as f64 / CLOSURE_SAMPLES as f64;
+            let point = curve.evaluate(t)?;
+            travel += point.sub(previous).length();
+            previous = point;
+        }
+        if travel > CLOSURE_TRAVEL {
+            refuse_fold_over(curve, radius)?;
+            return Ok(PathEdge::Ring(curve.clone()));
+        }
         return Err("tube: path has a zero-length edge".into());
     }
     let tolerance = 1e-6 * chord_length.max(1.0);
@@ -1640,15 +1830,24 @@ fn classify_edge(curve: &NurbsCurve, radius: f64) -> Result<Segment, String> {
         }
     }
     if straight {
-        return Ok(Segment { start, end, curve: None });
+        return Ok(PathEdge::Open(Segment { start, end, curve: None }));
     }
     refuse_fold_over(curve, radius)?;
-    Ok(Segment {
+    Ok(PathEdge::Open(Segment {
         start,
         end,
         curve: Some(curve.clone()),
-    })
+    }))
 }
+
+/// Stations the closed-vs-zero-length test sums chords over: `SweepPath`'s own
+/// 16 per curve.
+const CLOSURE_SAMPLES: usize = 16;
+
+/// The travel below which an edge whose ends coincide is zero-length rather
+/// than closed: `SweepPath`'s `1e-5 * scale` with `scale` at its floor of 1,
+/// which is the scale a path whose endpoints all coincide reads.
+const CLOSURE_TRAVEL: f64 = 1e-5;
 
 /// Stations the straightness test measures against the chord (the interior ones
 /// — the ends are the chord). 16 is `profile_anchor`'s own per-curve sampling
@@ -1770,6 +1969,8 @@ pub fn schema() -> serde_json::Value {
     "type": "TU",
     "shortName": "TU",
     "longName": "Tube",
+    "ribbonPath": "Home/Sweep/Tube",
+    "commandSize": "Compact",
     "displayBuilder": false,
     "inputParamsSchema": {
         "id": {

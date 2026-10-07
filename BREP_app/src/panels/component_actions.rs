@@ -159,7 +159,8 @@ fn feature_index(state: &EngineState, id: &str) -> Option<usize> {
 /// The component's parts-library `sourceKey` (the ModelStore document name the
 /// part was inserted from), read off the document's `partsLibrary` block —
 /// `None` when the component / entry / key is absent (an imported or
-/// embedded-only part, which therefore has no file to open). The Edit-Part flow
+/// embedded-only part). The Edit-Part flow offers to create a file from the
+/// embedded document when a source is unavailable, and
 /// keys its store lookup on this.
 pub fn part_source_key(state: &EngineState, component_id: &str) -> Option<String> {
     let info = state.component_info(component_id)?;

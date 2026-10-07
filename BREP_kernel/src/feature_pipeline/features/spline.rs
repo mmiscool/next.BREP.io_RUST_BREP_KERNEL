@@ -326,6 +326,8 @@ pub fn schema() -> serde_json::Value {
     "type": "SP",
     "shortName": "SP",
     "longName": "Spline",
+    "ribbonPath": "Home/Reference/Spline",
+    "commandSize": "Compact",
     "displayBuilder": true,
     "inputParamsSchema": {
         "id": {

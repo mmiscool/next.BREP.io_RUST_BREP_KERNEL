@@ -902,6 +902,12 @@ fn global_stage_enabled() -> bool {
 /// that moves can be attributed to the call site that moved it.
 /// `BREP_PROJECTION_GLOBAL_EXCEPT=<a,b,…>` is the complement: every site but
 /// those. Unset: every site. Read once.
+/// Whether a `BREP_PROJECTION_GLOBAL_SITES`/`_EXCEPT` filter is set, i.e.
+/// whether [`project_point_to_surface`]'s answer can depend on its call site.
+pub(crate) fn global_site_filter_active() -> bool {
+    std::env::var_os("BREP_PROJECTION_GLOBAL_SITES").is_some() || std::env::var_os("BREP_PROJECTION_GLOBAL_EXCEPT").is_some()
+}
+
 fn global_answer_admitted(caller: &std::panic::Location<'_>) -> bool {
     fn list(name: &str) -> Option<Vec<String>> {
         std::env::var(name)

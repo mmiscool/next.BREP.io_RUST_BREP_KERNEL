@@ -17,14 +17,14 @@ pub const GRID_MENU_ID: &str = "pads.grid";
 /// draw that toolbar, so without these the grid could not be chosen at all:
 /// pads clicked at a 1.27 mm pitch landed 1.25 mm apart on the 50 µm default.
 pub static GRIDS: &[WorkbenchButton] = &[
-    ecad_button!("pads.grid.10", "\u{E08D}", "Grid 0.01 mm", toggle),
-    ecad_button!("pads.grid.50", "\u{E08D}", "Grid 0.05 mm", toggle),
-    ecad_button!("pads.grid.100", "\u{E08D}", "Grid 0.1 mm", toggle),
-    ecad_button!("pads.grid.250", "\u{E08D}", "Grid 0.25 mm", toggle),
-    ecad_button!("pads.grid.500", "\u{E08D}", "Grid 0.5 mm", toggle),
-    ecad_button!("pads.grid.635", "\u{E08D}", "Grid 0.635 mm (25 mil)", toggle),
-    ecad_button!("pads.grid.1270", "\u{E08D}", "Grid 1.27 mm (50 mil)", toggle),
-    ecad_button!("pads.grid.2540", "\u{E08D}", "Grid 2.54 mm (100 mil)", toggle),
+    ecad_button!("pads.grid.10", "\u{E08D}", "Grid 0.01 mm", "Home/Pads/Grid 0.01 mm", toggle),
+    ecad_button!("pads.grid.50", "\u{E08D}", "Grid 0.05 mm", "Home/Pads/Grid 0.05 mm", toggle),
+    ecad_button!("pads.grid.100", "\u{E08D}", "Grid 0.1 mm", "Home/Pads/Grid 0.1 mm", toggle),
+    ecad_button!("pads.grid.250", "\u{E08D}", "Grid 0.25 mm", "Home/Pads/Grid 0.25 mm", toggle),
+    ecad_button!("pads.grid.500", "\u{E08D}", "Grid 0.5 mm", "Home/Pads/Grid 0.5 mm", toggle),
+    ecad_button!("pads.grid.635", "\u{E08D}", "Grid 0.635 mm (25 mil)", "Home/Pads/Grid 0.635 mm (25 mil)", toggle),
+    ecad_button!("pads.grid.1270", "\u{E08D}", "Grid 1.27 mm (50 mil)", "Home/Pads/Grid 1.27 mm (50 mil)", toggle),
+    ecad_button!("pads.grid.2540", "\u{E08D}", "Grid 2.54 mm (100 mil)", "Home/Pads/Grid 2.54 mm (100 mil)", toggle),
 ];
 
 /// The grid menu's live caption: the step a click snaps to, so the closed
@@ -33,20 +33,20 @@ fn grid_menu_caption(state: &ButtonState) -> String {
     GRIDS
         .iter()
         .find(|entry| entry.offered(state) && entry.is_pressed(state))
-        .map_or_else(|| "Grid".to_string(), |entry| entry.label(state))
+        .map_or_else(|| "Grid".to_string(), |entry| entry.detail(state))
 }
 
 static BUTTONS: &[WorkbenchButton] = &[
-    ecad_button!("pads.tool.select", "\u{1F446}", "Select", toggle),
-    ecad_button!("pads.tool.smd", "\u{E08A}", "SMD pad", toggle),
-    ecad_button!("pads.tool.through_hole", "\u{E08B}", "Through-hole pad", toggle),
-    ecad_button!("pads.tool.line", "\u{E06E}", "Line", toggle),
-    ecad_button!("pads.tool.rectangle", "\u{2610}", "Rectangle", toggle),
-    ecad_button!("pads.tool.circle", "\u{25EF}", "Circle", toggle),
+    ecad_button!("pads.tool.select", "\u{1F446}", "Select", "Home/Pads/Select", toggle),
+    ecad_button!("pads.tool.smd", "\u{E08A}", "SMD pad", "Home/Pads/SMD pad", toggle),
+    ecad_button!("pads.tool.through_hole", "\u{E08B}", "Through-hole pad", "Home/Pads/Through-hole pad", toggle),
+    ecad_button!("pads.tool.line", "\u{E06E}", "Line", "Home/Pads/Line", toggle),
+    ecad_button!("pads.tool.rectangle", "\u{2610}", "Rectangle", "Home/Pads/Rectangle", toggle),
+    ecad_button!("pads.tool.circle", "\u{25EF}", "Circle", "Home/Pads/Circle", toggle),
     WorkbenchButton {
         id: GRID_MENU_ID,
         glyph: "\u{E08D}",
-        tooltip: "Snapping grid",
+        ribbon_path: "Home/Pads/Snapping grid", size: crate::workbench::CommandSize::Compact, tooltip: "Snapping grid",
         when: None,
         pressed: None,
         disabled: None,

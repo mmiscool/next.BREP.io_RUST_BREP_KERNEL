@@ -7,7 +7,7 @@
 //! - `plm.sqlite` — a snapshot of the metadata and the audit log, taken with
 //!   SQLite's `VACUUM INTO`, which reads one consistent transaction while the
 //!   server keeps writing;
-//! - `docs/…` — the document of every revision the snapshot records a hash for;
+//! - `models/<part>/<revision>.json` — the document of every revision the snapshot records a hash for;
 //! - `blobs/…` — every attachment the snapshot references, and every version
 //!   of every workspace file;
 //! - `scripts/…` — the administrator's scripts directory (without `.git`).
@@ -210,7 +210,7 @@ fn wanted(snapshot: &Path) -> io::Result<Wanted> {
             let body: Value = serde_json::from_str(&body).map_err(other)?;
             take_attachments(&body);
             if let Some(hash) = body.get("content_hash").and_then(Value::as_str).filter(|h| !h.is_empty()) {
-                let path = format!("docs/part/{part}/rev/{revision}.json");
+                let path = crate::identity::model_path(&part, &revision).to_string_lossy().replace('\\', "/");
                 let in_work = matches!(body.get("lifecycle").and_then(Value::as_str), Some("draft" | "inreview"));
                 if in_work { drafts.insert(path, hash.to_string()) } else { frozen.insert(path, hash.to_string()) };
             }
@@ -448,16 +448,22 @@ fn attempt(data: &Path, scripts: &Path, stage: &Path, hold: Hold<'_>, adjust: bo
 fn adjust_snapshot(snapshot: &Path, moved: &[(String, Option<(u64, String)>)]) -> io::Result<()> {
     let conn = rusqlite::Connection::open(snapshot).map_err(other_sql)?;
     for (path, now) in moved {
-        // docs/part/<part>/rev/<revision>.json
-        let revision = path.rsplit('/').next().unwrap_or("").trim_end_matches(".json").to_string();
+        let segments: Vec<_> = path.split('/').collect();
+        let (part, revision) = match segments.as_slice() {
+            ["models", part, revision] => (
+                crate::identity::unsegment(part).ok_or_else(|| other("invalid model part path"))?,
+                crate::identity::unsegment(revision.strip_suffix(".json").ok_or_else(|| other("invalid model revision path"))?).ok_or_else(|| other("invalid model revision path"))?,
+            ),
+            _ => return Err(other("invalid model path")),
+        };
         let body: String = conn
-            .query_row("SELECT body FROM revisions WHERE id = ?1", [&revision], |r| r.get(0))
+            .query_row("SELECT body FROM revisions WHERE part_id = ?1 AND id = ?2", [&part, &revision], |r| r.get(0))
             .map_err(other_sql)?;
         let mut body: Value = serde_json::from_str(&body).map_err(other)?;
         let (size, hash) = now.clone().unwrap_or((0, String::new()));
         body["content_hash"] = json!(hash);
         body["size"] = json!(size);
-        conn.execute("UPDATE revisions SET body = ?1 WHERE id = ?2", [body.to_string(), revision]).map_err(other_sql)?;
+        conn.execute("UPDATE revisions SET body = ?1 WHERE part_id = ?2 AND id = ?3", [body.to_string(), part, revision]).map_err(other_sql)?;
     }
     Ok(())
 }

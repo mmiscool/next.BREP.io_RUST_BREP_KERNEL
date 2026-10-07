@@ -23,6 +23,7 @@ use serde_json::{json, Value};
 #[derive(Clone, Debug, Default, PartialEq, Deserialize)]
 #[serde(default)]
 pub struct ServerBom {
+    pub comparison_lines: Vec<ServerLine>,
     pub part_id: String,
     pub number: String,
     pub name: String,
@@ -38,9 +39,16 @@ pub struct ServerBom {
 }
 
 /// One line of the server's BOM.
-#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, serde::Serialize)]
 #[serde(default)]
 pub struct ServerLine {
+    pub part_type: String,
+    pub part_values: std::collections::BTreeMap<String,Value>,
+    pub owner_part: String,
+    pub owner_revision: String,
+    pub occurrence_ids: Vec<String>,
+    pub occurrence_attributes: std::collections::BTreeMap<String,Value>,
+    pub notes: String,
     pub level: usize,
     pub position: String,
     pub find_number: String,
@@ -113,15 +121,20 @@ pub struct WhereUsedLine {
 
 /// The server's BOM of `part`/`revision`: every level, indented or flat.
 pub async fn fetch_bom(client: &PlmClient, part: &str, revision: &str, flat: bool) -> Result<ServerBom, PlmError> {
-    let path = format!("/api/parts/{part}/revisions/{revision}/bom?levels=0{}", if flat { "&flat=true" } else { "" });
+    let path = format!("{}/bom?levels=0{}", super::identity::revision_path(part, revision), if flat { "&flat=true" } else { "" });
     json(client.call("GET", &path, None).await?, &path)
+}
+
+pub async fn fetch_occurrence_bom(client:&PlmClient,part:&str,revision:&str,flat:bool)->Result<ServerBom,PlmError>{
+    let path=format!("{}/bom?levels=0&occurrences=true&flat={flat}",super::identity::revision_path(part,revision));
+    json(client.call("GET",&path,None).await?,&path)
 }
 
 /// Every assembly that uses `part` (at `revision`, or any), every level up.
 pub async fn where_used(client: &PlmClient, part: &str, revision: Option<&str>) -> Result<WhereUsed, PlmError> {
     let path = match revision {
-        Some(revision) => format!("/api/parts/{part}/where-used?levels=0&revision={revision}"),
-        None => format!("/api/parts/{part}/where-used?levels=0"),
+        Some(revision) => format!("{}/where-used?levels=0&revision={}", super::identity::part_path(part), super::identity::segment(revision)),
+        None => format!("{}/where-used?levels=0", crate::plm::identity::part_path(&part)),
     };
     json(client.call("GET", &path, None).await?, &path)
 }
@@ -132,7 +145,7 @@ pub async fn where_used(client: &PlmClient, part: &str, revision: Option<&str>) 
 pub async fn patch_attribute(client: &PlmClient, part: &str, key: &str, value: &Value) -> Result<(), PlmError> {
     let body = json!({ "attributes": { attribute_key(key): value } });
     client
-        .call("PATCH", &format!("/api/parts/{part}"), Some(body.to_string().into_bytes()))
+        .call("PATCH", &crate::plm::identity::part_path(&part), Some(body.to_string().into_bytes()))
         .await
         .map(|_| ())
 }

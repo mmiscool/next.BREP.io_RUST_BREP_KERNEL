@@ -1,7 +1,7 @@
 use crate::{KernelRefusal, KernelStage, OrRefuse};
 use super::*;
-use crate::offset_carve::carve_folded_trim;
-use crate::offset_regularity::{scan_offset_regularity, ScanBudget, TrimRegion};
+use crate::offset_carve::carve_folded_trim_scanned;
+use crate::offset_regularity::{scan_offset_regularity, Certainty, ScanBudget, TrimRegion};
 use crate::{NurbsCurve, NurbsSurface};
 
 pub(super) fn standalone_face(solid: &BrepSolid, face_id: u64) -> Result<BrepSolid, KernelRefusal> {
@@ -280,15 +280,38 @@ pub(super) fn carve_folded_support(
                 .collect::<Vec<_>>()
         })
         .collect::<Vec<_>>();
-    let Some(carved) = carve_folded_trim(
+    let displacement = shell_displacement(face, distance);
+    let mut outcome = carve_folded_trim_scanned(
         &face.surface,
         &loops,
-        &[shell_displacement(face, distance)],
+        &[displacement],
         COLLAPSE_FACTOR,
         ScanBudget::SHELL_FACE,
-    )?
-    else {
-        return Ok(None);
+    )?;
+    let Some(carved) = outcome.carved.take() else {
+        // Nothing to carve is not yet "build it whole": that is the third
+        // outcome, and it is the scan's CERTAINTY that decides between the two.
+        // A census that found nothing collapsed but could not clear every risky
+        // cell, or ran out of descent budget, has not seen enough to certify
+        // the support, and a carrier folded between its samples validates.
+        return match outcome.scan.certify(&face.surface, &outcome.region, &[displacement], COLLAPSE_FACTOR) {
+            Certainty::Regular => Ok(None),
+            // The certainty step's own refinement reached a collapsed sample the
+            // scan had not: a fold between the samples, on a support the carve
+            // has already declined to divide. Never "build it whole".
+            Certainty::Folded(sample) => Err(super::refusals::fold_between_samples(face.id, distance, sample)),
+            Certainty::Uncertain {
+                unresolved,
+                budget_exhausted,
+                least,
+            } => Err(super::refusals::regularity_uncertain(
+                face.id,
+                distance,
+                unresolved,
+                budget_exhausted,
+                least,
+            )),
+        };
     };
 
     let mut solid = source.clone();

@@ -132,6 +132,8 @@ pub fn schema() -> serde_json::Value {
     "type": "P.T",
     "shortName": "P.T",
     "longName": "Primitive Torus",
+    "ribbonPath": "Home/Primitives/Torus",
+    "commandSize": "Compact",
     "displayBuilder": false,
     "inputParamsSchema": {
         "id": {

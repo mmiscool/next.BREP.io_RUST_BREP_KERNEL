@@ -25,24 +25,12 @@
 //! polls its requests each frame with a waker that repaints, like S7's panel.
 //! Nothing here is constructed without a server.
 
-use crate::automation::hit_keys::HitKeyDoc;
 use crate::plm::PlmFuture;
 use eframe::egui;
 use std::collections::HashMap;
 use std::task::Waker;
 
 use super::plm_parts::Pending;
-
-/// Hit keys this section publishes, under the PLM pane's `plm/<section>:`
-/// prefix (`crate::panels::plm_host`).
-pub const HIT_KEYS: &[HitKeyDoc] = &[
-    HitKeyDoc { panel: "plm_attachments", prefix: "plm/attachments:file:", meaning: "a file row, by attachment id; double click downloads it", command: None },
-    HitKeyDoc { panel: "plm_attachments", prefix: "plm/attachments:download:", meaning: "a file's Download button, by attachment id", command: None },
-    HitKeyDoc { panel: "plm_attachments", prefix: "plm/attachments:pick", meaning: "Attach a file… (the host opens its file chooser)", command: None },
-    HitKeyDoc { panel: "plm_attachments", prefix: "plm/attachments:staged:", meaning: "the staged file's fields (kind, note, target, attach, cancel)", command: None },
-    HitKeyDoc { panel: "plm_attachments", prefix: "plm/attachments:reload", meaning: "reload the list", command: None },
-    HitKeyDoc { panel: "plm_attachments", prefix: "plm/attachments:export:", meaning: "attach this document's export: pdf (its drawing sheets) or step", command: None },
-];
 
 // --- the wire ------------------------------------------------------------------
 //

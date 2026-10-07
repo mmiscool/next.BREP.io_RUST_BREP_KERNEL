@@ -7,6 +7,7 @@ members = [
     "BREP_RANSAC",
     "BREP_ecad_core",
     "BREP_script_core",
+    "BREP_plugins",
     "BREP_reconstruction",
     "BREP_ecad_egui",
     "BREP_render",

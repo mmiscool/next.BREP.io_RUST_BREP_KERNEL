@@ -109,6 +109,8 @@ impl Viewport {
             sheet: super::sheet::SheetViewport::default(),
             ecad: super::ecad::EcadViewport::default(),
             dragging: false,
+            touch: Default::default(),
+            touch_suppressed: false,
             gizmo_dragging: false,
             component_gizmo_dragging: false,
             dim_dragging: None,

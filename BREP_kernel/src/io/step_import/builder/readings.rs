@@ -46,17 +46,44 @@ pub(in crate::step_import) struct BoundedTrim {
     pub(in crate::step_import) surface_ref: usize,
     /// The built edge's id in the solid.
     pub(in crate::step_import) edge_id: u64,
-    /// The fit's out-of-sample residual, mm — the band the edge will carry.
+    /// The trim's residual, mm — the band the edge will carry: the larger of
+    /// the fit's own out-of-sample sweep and the band-free read between its
+    /// stations (`geometry::trim_floor_reading`, 2026-10-03).
     pub(in crate::step_import) residual: f64,
-    /// How far the file's curve stands off the carrier at the fit's stations.
+    /// How far the file's curve stands off the carrier: the larger of the
+    /// fit's station standoff and the standoff read between the stations.
     pub(in crate::step_import) standoff: f64,
+    /// The fit's own two numbers, as reported, for the record.
+    pub(in crate::step_import) fit_residual: f64,
+    pub(in crate::step_import) fit_standoff: f64,
     /// How far the image sits from the stations' FEET, mm.
     pub(in crate::step_import) image_to_foot: f64,
+    /// The same read against the global projector's foot alone, the reading
+    /// before 2026-10-04. The foot `image_to_foot` uses is the one nearer the
+    /// EDGE point, so neither value bounds the other; NaN means unreadable.
+    pub(in crate::step_import) image_to_global_foot: f64,
     pub(in crate::step_import) samples: usize,
     pub(in crate::step_import) exit: String,
-    /// The image stands off the stations' feet by more than the floor: the
-    /// miss is the FITTER's, not the file's.
+    /// The residual exceeds the floor plus the file curve's standoff read
+    /// between the stations: the miss is the FITTER's, not the file's. Until
+    /// 2026-10-03 this read `image_to_foot > floor`, which tagged a trim
+    /// whose image slips tangentially along the carrier by less than the
+    /// file's own standoff — 89 of the 189 rows so tagged on the corpus.
     pub(in crate::step_import) fitter: bool,
+    /// How far the fit's stations were clamped into the carrier's chart, in
+    /// parameter ([`crate::PcurveFitReport::clamped_excursion`]); zero when
+    /// the trim stayed inside it.
+    pub(in crate::step_import) clamped_excursion: f64,
+    /// The 3D distance that clamp corresponds to, mm.
+    pub(in crate::step_import) clamped_distance: f64,
+}
+
+/// What one ACCEPTED body carries beside its solid: the trims accepted off the
+/// fit bar, and what the shell-closure gate read.
+#[derive(Clone, Debug)]
+pub(in crate::step_import) struct BodyReadings {
+    pub(in crate::step_import) bounded: Vec<BoundedTrim>,
+    pub(in crate::step_import) closure: super::ClosureNote,
 }
 
 impl<'a> SolidBuilder<'a> {

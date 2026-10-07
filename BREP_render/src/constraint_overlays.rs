@@ -301,7 +301,15 @@ fn build_row(row: &Value, state_constraints: &Value) -> Option<ConstraintOverlay
         ConstraintOverlayKind::Distance => {
             build_distance_annotation(&anchors, &directions, &geoms, value)
         }
-        ConstraintOverlayKind::Angle => build_angle_annotation(&anchors, &directions, value),
+        ConstraintOverlayKind::Angle => build_angle_annotation(
+            &anchors,
+            &directions,
+            &geoms,
+            value,
+            row.get("angleAxis")
+                .cloned()
+                .and_then(|v| serde_json::from_value(v).ok()),
+        ),
         ConstraintOverlayKind::Leader => None,
     };
 
@@ -395,32 +403,136 @@ fn build_distance_annotation(
     Some(FeatureDimAnnotation::linear("distance", a, b, value, "D"))
 }
 
-/// The angle constraint's ANGULAR annotation. Geometry: the arc sweeps from
-/// direction `d0` toward `d1` about `axis = normalize(d0 × d1)` — the axis that
-/// makes rotating `d0` by the measured interior angle land exactly on `d1` — and
-/// is centered at the closest-approach midpoint of the two carrier lines
-/// (`anchors[i] + t·dᵢ`), the natural angle vertex; parallel/degenerate carriers
-/// fall back to the anchor midpoint, and a parallel/antiparallel pair (the 0°/
-/// 180° satisfied states — `d0 × d1 ≈ 0`) falls back to an arbitrary
-/// perpendicular axis via the `angular` ctor, which still renders and keeps the
-/// drag well-defined once the value moves off zero. `None` unless both anchors
-/// AND both directions resolved.
+/// The angle arc uses the kernel's persistent world reference axis. Rebuilding
+/// an axis from `d0 × d1` would reverse it at negative/reflex targets, and lose
+/// it at 0/180 degrees. Legacy rows without an axis fall back to the cross.
+///
+/// The arc VERTEX is the angle's hinge — see [`angle_vertex`].
 fn build_angle_annotation(
     anchors: &[[f64; 3]],
     directions: &[Option<[f64; 3]>],
+    geoms: &[String],
     value: Option<f64>,
+    reference_axis: Option<[f64; 3]>,
 ) -> Option<FeatureDimAnnotation> {
     if anchors.len() < 2 || directions.len() < 2 {
         return None;
     }
     let d0 = directions[0]?;
     let d1 = directions[1]?;
-    let axis = co_cross(d0, d1);
-    let center = carrier_closest_midpoint(anchors[0], d0, anchors[1], d1);
+    let axis = reference_axis.unwrap_or_else(|| co_cross(d0, d1));
+    let center = angle_vertex(anchors, d0, d1, geoms);
+    // Plane directions are normals. Turn the reference into the first
+    // face's section through the hinge so the arc arms lie in the measured
+    // planes, rather than sticking out perpendicular to them. Rotating both
+    // normals by the same quarter turn preserves the signed sweep and axis.
+    // Choose the half-line towards the first face; using only that fixed arm
+    // avoids reversing the reference as the second component turns.
+    let ref_dir = if geoms.get(0).map(String::as_str) == Some("plane")
+        && geoms.get(1).map(String::as_str) == Some("plane")
+    {
+        let tangent = co_cross(axis, d0);
+        if co_dot(tangent, co_sub(anchors[0], center)) < 0.0 {
+            co_scale(tangent, -1.0)
+        } else {
+            tangent
+        }
+    } else {
+        d0
+    };
     let value = value.unwrap_or(0.0).clamp(-360.0, 360.0);
     Some(FeatureDimAnnotation::angular(
-        "angle", center, axis, d0, value, "A",
+        "angle", center, axis, ref_dir, value, "A",
     ))
+}
+
+/// `|n̂₀ × n̂₁|` below which two planes (or a line and a plane) count as
+/// parallel and have no hinge. The solver leaves a satisfied 0°/180° target
+/// with a residual around 1e-10, so the cutoff sits well above that: a target
+/// of exactly 180° must land on the fallback, not on a hinge 1e10 mm away.
+const PARALLEL_SIN: f64 = 1e-6;
+
+/// The arc vertex — the point the angle gizmo rotates about.
+///
+/// For two PLANAR faces the measured directions are the face NORMALS, and the
+/// angle between two planes is hinged on the intersection line of their
+/// INFINITE planes. The vertex is the point of that hinge nearest the midpoint
+/// of the two face anchors. That foot is invariant under any rotation about
+/// the hinge (a rotation about an axis preserves every point's component
+/// along it), so editing the angle of a hinge-pinned pair rotates the arc
+/// without moving it. That holds for every planar face because the kernel's
+/// face anchor is a FIXED point of its body (the boundary box centre in the
+/// face's own in-plane basis, `assembly_resolve::planar_face`), not a
+/// world-axis box that would slide over a triangle or an L as the body turns.
+///
+/// A plane paired with a direction carrier (edge, axis face, circle) is
+/// hinged where the carrier line pierces the plane. Two carriers meet at the
+/// closest-approach midpoint of their lines (the vertex of two edges). Rows
+/// without geometry tags (legacy sessions) take that carrier rule too.
+///
+/// Parallel elements have no hinge: the vertex falls back to the anchor
+/// midpoint, which lies on the mid-plane of two parallel faces. Approaching
+/// parallel, the true hinge recedes to infinity and the vertex follows it
+/// until [`PARALLEL_SIN`] switches to the fallback.
+fn angle_vertex(anchors: &[[f64; 3]], d0: [f64; 3], d1: [f64; 3], geoms: &[String]) -> [f64; 3] {
+    let is_plane = |i: usize| geoms.get(i).map(String::as_str) == Some("plane");
+    let (a0, a1) = (anchors[0], anchors[1]);
+    match (is_plane(0), is_plane(1)) {
+        (true, true) => plane_hinge_foot(a0, d0, a1, d1).unwrap_or_else(|| co_mid(a0, a1)),
+        (true, false) => {
+            line_plane_pierce(a1, d1, a0, d0).unwrap_or_else(|| co_mid(a0, a1))
+        }
+        (false, true) => {
+            line_plane_pierce(a0, d0, a1, d1).unwrap_or_else(|| co_mid(a0, a1))
+        }
+        (false, false) => carrier_closest_midpoint(a0, d0, a1, d1),
+    }
+}
+
+/// The point on the intersection line of the planes `(p0, n0)` and `(p1, n1)`
+/// nearest the midpoint `M` of `p0` and `p1` — the constrained least-squares
+/// solution `P = M + α·n̂₀ + β·n̂₁` with `[1 c; c 1]·[α β]ᵀ = [n̂₀·(p0−M), n̂₁·(p1−M)]ᵀ`,
+/// `c = n̂₀·n̂₁`. `None` when the planes are parallel ([`PARALLEL_SIN`]).
+fn plane_hinge_foot(
+    p0: [f64; 3],
+    n0: [f64; 3],
+    p1: [f64; 3],
+    n1: [f64; 3],
+) -> Option<[f64; 3]> {
+    let (l0, l1) = (co_norm(n0), co_norm(n1));
+    if l0 < 1e-9 || l1 < 1e-9 {
+        return None;
+    }
+    let n0 = co_scale(n0, 1.0 / l0);
+    let n1 = co_scale(n1, 1.0 / l1);
+    let c = co_dot(n0, n1);
+    let det = 1.0 - c * c; // = |n̂₀ × n̂₁|²
+    if det < PARALLEL_SIN * PARALLEL_SIN {
+        return None;
+    }
+    let m = co_mid(p0, p1);
+    let r0 = co_dot(n0, co_sub(p0, m));
+    let r1 = co_dot(n1, co_sub(p1, m));
+    let alpha = (r0 - c * r1) / det;
+    let beta = (r1 - c * r0) / det;
+    Some(co_add(m, co_add(co_scale(n0, alpha), co_scale(n1, beta))))
+}
+
+/// Where the carrier line `l + t·d` pierces the plane `(p, n)`; `None` when
+/// the line runs parallel to the plane ([`PARALLEL_SIN`] on the unit vectors).
+fn line_plane_pierce(l: [f64; 3], d: [f64; 3], p: [f64; 3], n: [f64; 3]) -> Option<[f64; 3]> {
+    let (ld, ln) = (co_norm(d), co_norm(n));
+    if ld < 1e-9 || ln < 1e-9 {
+        return None;
+    }
+    let d = co_scale(d, 1.0 / ld);
+    let n = co_scale(n, 1.0 / ln);
+    let denom = co_dot(d, n);
+    if denom.abs() < PARALLEL_SIN {
+        return None;
+    }
+    let t = co_dot(n, co_sub(p, l)) / denom;
+    Some(co_add(l, co_scale(d, t)))
 }
 
 /// The midpoint of the closest-approach segment between carrier lines
@@ -558,6 +670,14 @@ fn read_point3(value: &Value) -> Option<[f64; 3]> {
 
 fn co_mid(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
     [(a[0] + b[0]) * 0.5, (a[1] + b[1]) * 0.5, (a[2] + b[2]) * 0.5]
+}
+
+fn co_add(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+    [a[0] + b[0], a[1] + b[1], a[2] + b[2]]
+}
+
+fn co_scale(v: [f64; 3], k: f64) -> [f64; 3] {
+    [v[0] * k, v[1] * k, v[2] * k]
 }
 
 fn co_sub(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {

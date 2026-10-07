@@ -208,7 +208,7 @@ fn param_schema(name: &str, spec: &Value) -> Option<Value> {
             let rigid = default
                 .map(|d| d.get("translate").is_some() || d.get("rotateEulerDeg").is_some())
                 .unwrap_or(false);
-            let vec3 = json!({ "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 });
+            let vec3 = json!({ "type": "array", "items": { "oneOf": [{"type":"number"},{"type":"string"}] }, "minItems": 3, "maxItems": 3 });
             if rigid {
                 json!({
                     "type": "object",
@@ -259,6 +259,14 @@ pub(crate) fn modeling_transform_keys(spec: &Value) -> Vec<&'static str> {
 /// `default_value`; `id` is `null` until the engine assigns one).
 pub fn defaults(feature_type: &str) -> Value {
     features::feature_default_params(feature_type)
+}
+
+/// Defaults from a document-owned schema, including an installed plugin.
+pub fn defaults_from_entry(entry: &Value) -> Value {
+    let params = entry["inputParamsSchema"].as_object();
+    Value::Object(params.into_iter().flatten().map(|(key, spec)| {
+        (key.clone(), spec.get("default_value").cloned().unwrap_or(Value::Null))
+    }).collect())
 }
 
 /// Does this feature carry a SKETCH in its `persistentData`?
@@ -373,8 +381,13 @@ pub fn sketch_example() -> Value {
 /// serves and what `brep-mcp schema` prints.
 pub fn all() -> Value {
     let cat = catalogue();
-    let features: Vec<Value> = entries()
-        .iter()
+    all_from_catalogue(&cat)
+}
+
+/// Convert a live document's owned catalogue using the same public schema
+/// contract as the sessionless built-in resources.
+pub fn all_from_catalogue(cat: &Value) -> Value {
+    let features: Vec<Value> = cat["features"].as_array().into_iter().flatten()
         .map(|e| {
             let id = identity(e);
             let mut entry = json!({
@@ -383,7 +396,7 @@ pub fn all() -> Value {
                 "longName": id.long_name,
                 "displayBuilder": id.display_builder,
                 "schema": to_json_schema(e),
-                "defaults": defaults(&id.feature_type),
+                "defaults": defaults_from_entry(e),
             });
             // Only the features that HAVE one carry the key: a `null` on every
             // other feature is noise in a checked-in file.

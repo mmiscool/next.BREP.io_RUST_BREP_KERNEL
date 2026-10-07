@@ -96,14 +96,21 @@ pub async fn add_item(
     Ok(Json(db.add_eco_item(&user, &id, &body)?))
 }
 
-/// `DELETE /api/ecos/:id/items/:rev`
+#[derive(Default, Deserialize)]
+pub struct ItemOwner { pub part: Option<String> }
+
+/// `DELETE /api/ecos/:id/items/:rev?part=<part id>`
 pub async fn remove_item(
     State(db): State<Shared>,
     headers: HeaderMap,
     Path((id, rev)): Path<(String, String)>,
+    Query(owner): Query<ItemOwner>,
 ) -> Result<Json<ChangeOrder>, Error> {
     let user = require_user(&db, &headers)?;
-    Ok(Json(db.remove_eco_item(&user, &id, &rev)?))
+    Ok(Json(match owner.part {
+        Some(part) => db.remove_eco_part_item(&user, &id, &part, &rev)?,
+        None => db.remove_eco_item(&user, &id, &rev)?,
+    }))
 }
 
 #[derive(Debug, Default, Deserialize)]

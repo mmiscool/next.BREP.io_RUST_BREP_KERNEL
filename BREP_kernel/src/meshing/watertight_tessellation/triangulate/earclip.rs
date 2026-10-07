@@ -382,6 +382,40 @@ pub(super) fn lawson_flips_guarded(
     scale: [f64; 2],
     chord_guard: Option<(&FaceRecord, f64, bool)>,
 ) {
+    lawson_flips_incremental(
+        vertices, triangles, boundary_pairs, scale, chord_guard,
+    );
+}
+
+// Angles belong to a triangle's CURRENT vertices, not an index across writes.
+// One call owns the immutable vertices and its slots; there is no cross-call
+// identity cache. Option stores even NaNs/signed zero without reclassification.
+#[derive(Clone, Copy, Default)]
+struct TriangleCornerAngles([Option<f64>; 3]);
+
+impl TriangleCornerAngles {
+    fn angle(&mut self, triangle: [usize; 3], apex: usize, compute: impl FnOnce() -> f64) -> f64 {
+        let corner = triangle.iter().position(|&vertex| vertex == apex).expect("opposite corner in triangle");
+        if let Some(value) = self.0[corner] {
+            return value;
+        }
+        let value = compute();
+        self.0[corner] = Some(value);
+        value
+    }
+
+    fn clear(&mut self) {
+        self.0 = [None; 3];
+    }
+}
+
+fn lawson_flips_incremental(
+    vertices: &[FaceVertex],
+    triangles: &mut [[usize; 3]],
+    boundary_pairs: &HashSet<(usize, usize)>,
+    scale: [f64; 2],
+    chord_guard: Option<(&FaceRecord, f64, bool)>,
+) {
     // Classic planar Delaunay flipping, but in SCALED uv — the intrinsic
     // (unrolled) metric of the face. In 3D chordal space a boundary fan on a
     // curved strip cannot reach the ladder without passing through folded
@@ -429,35 +463,37 @@ pub(super) fn lawson_flips_guarded(
     // guard rejects is re-offered every round, and re-evaluating the surface for
     // it each time dominated the cost of the deeper round budget above.
     let mut sag_memo: HashMap<(usize, usize), f64> = HashMap::new();
+    // Each current triangle has just three possible opposite corners. The
+    // edge scan always supplies its endpoints in (min, max) order, so a slot
+    // for that opposite corner has exactly the original angle operands. Fill
+    // only on the original query path; every triangle write invalidates its
+    // three slots before any later candidate can use the new triangle.
+    let mut corner_angles = vec![TriangleCornerAngles::default(); triangles.len()];
     let mut total_flips = 0usize;
     let _timer = stage_timer(Stage::Flip);
-    // The per-round edge table, rebuilt in place each round. It was a
-    // `HashMap<(usize, usize), Vec<usize>>` plus a sort of its keys, which
-    // allocated one `Vec` per edge and rehashed every corner of every triangle
-    // on every round — 90% of a fine-chord tessellation (2026-09-13 profile:
-    // 57.7 s of 64.4 s over 12 722 rounds). Sorting the corner list gives the
-    // SAME thing without either: the groups come out in ascending edge order,
-    // which is what `edges.sort_unstable()` produced, and each group's triangle
-    // indices come out ascending, which is what pushing them in triangle order
-    // produced. Same edges, same order, same owners.
-    let mut corners: Vec<(usize, usize, usize)> = Vec::with_capacity(triangles.len() * 3);
+    // This table is exactly the old sorted (edge, triangle-index) corner
+    // multiset. Its immutable iteration is a ROUND-START snapshot: successful
+    // flips queue ownership deltas, applied only after every edge was visited.
+    // In particular we must not expose a newly created edge later in this same
+    // round. Owners include repeated corners of degenerate triangles.
+    let mut edge_owners = std::collections::BTreeMap::<(usize, usize), Vec<usize>>::new();
+    for (index, triangle) in triangles.iter().enumerate() {
+        for corner in 0..3 {
+            let a = triangle[corner];
+            let b = triangle[(corner + 1) % 3];
+            edge_owners.entry((a.min(b), a.max(b))).or_default().push(index);
+        }
+    }
+    let mut changes: Vec<(usize, [usize; 3], [usize; 3])> = Vec::new();
     let mut touched: Vec<bool> = Vec::with_capacity(triangles.len());
     // Protected segments, bucketed once per call — they are boundary vertices,
     // which no flip or split ever moves.
     let protected = ProtectedSegments::new(boundary_pairs.iter().copied(), |index| {
         vertices[index].uv
     });
-    for _ in 0..maximum_rounds {
+    for _round in 0..maximum_rounds {
         tess_profile(|p| p.flip_rounds += 1);
-        corners.clear();
-        for (triangle_index, triangle) in triangles.iter().enumerate() {
-            for corner in 0..3 {
-                let a = triangle[corner];
-                let b = triangle[(corner + 1) % 3];
-                corners.push((a.min(b), a.max(b), triangle_index));
-            }
-        }
-        corners.sort_unstable();
+        changes.clear();
         touched.clear();
         touched.resize(triangles.len(), false);
         let mut flipped_any = false;
@@ -470,19 +506,11 @@ pub(super) fn lawson_flips_guarded(
         // ambiguous ones resolve identically every run — the serial==parallel
         // fingerprint holds even where the curvature-adaptive refinement makes a
         // face dense enough to be cocircular.
-        let mut group = 0usize;
-        while group < corners.len() {
-            let (a, b, _) = corners[group];
-            let mut end = group + 1;
-            while end < corners.len() && corners[end].0 == a && corners[end].1 == b {
-                end += 1;
-            }
-            let owners = &corners[group..end];
-            group = end;
+        for (&(a, b), owners) in &edge_owners {
             if boundary_pairs.contains(&(a, b)) || owners.len() != 2 {
                 continue;
             }
-            let (first, second) = (owners[0].2, owners[1].2);
+            let (first, second) = (owners[0], owners[1]);
             if touched[first] || touched[second] {
                 continue;
             }
@@ -497,7 +525,9 @@ pub(super) fn lawson_flips_guarded(
             if c == d {
                 continue;
             }
-            if corner_angle(c, a, b) + corner_angle(d, a, b) <= std::f64::consts::PI + 1e-9 {
+            let first_angle = corner_angles[first].angle(triangles[first], c, || corner_angle(c, a, b));
+            let second_angle = corner_angles[second].angle(triangles[second], d, || corner_angle(d, a, b));
+            if first_angle + second_angle <= std::f64::consts::PI + 1e-9 {
                 continue;
             }
             if let Some((face, chord_tolerance, periodic)) = chord_guard {
@@ -556,6 +586,10 @@ pub(super) fn lawson_flips_guarded(
             {
                 continue;
             }
+            changes.push((first, triangles[first], candidates[0]));
+            changes.push((second, triangles[second], candidates[1]));
+            corner_angles[first].clear();
+            corner_angles[second].clear();
             triangles[first] = candidates[0];
             triangles[second] = candidates[1];
             touched[first] = true;
@@ -563,6 +597,30 @@ pub(super) fn lawson_flips_guarded(
             flipped_any = true;
             total_flips += 1;
             tess_profile(|p| p.flips += 1);
+        }
+        // Remove one occurrence for each old corner, not the entire owner:
+        // repeated vertices/edges must have the same multiplicity as a rebuild.
+        for &(index, old, _) in &changes {
+            for corner in 0..3 {
+                let a = old[corner];
+                let b = old[(corner + 1) % 3];
+                let key = (a.min(b), a.max(b));
+                let owners = edge_owners.get_mut(&key).expect("old triangle edge owner");
+                let offset = owners.binary_search(&index).expect("old triangle owner index");
+                owners.remove(offset);
+                if owners.is_empty() {
+                    edge_owners.remove(&key);
+                }
+            }
+        }
+        for &(index, _, new) in &changes {
+            for corner in 0..3 {
+                let a = new[corner];
+                let b = new[(corner + 1) % 3];
+                let owners = edge_owners.entry((a.min(b), a.max(b))).or_default();
+                let offset = owners.binary_search(&index).unwrap_or_else(|offset| offset);
+                owners.insert(offset, index);
+            }
         }
         if !flipped_any {
             break;
@@ -575,4 +633,5 @@ pub(super) fn lawson_flips_guarded(
         );
     }
 }
+
 

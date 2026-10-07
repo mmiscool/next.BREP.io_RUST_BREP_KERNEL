@@ -120,7 +120,6 @@
 
 use crate::feature_pipeline::features::common;
 use crate::feature_pipeline::{FeatureContext, FeatureRefusal, FeatureResult, SketchProfile};
-use crate::sweep_profile_along_chain;
 
 pub fn execute(ctx: &FeatureContext) -> FeatureResult {
     match build(ctx) {
@@ -206,6 +205,8 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, FeatureRefusal> {
 
     // One swept solid per REGION, unioned below.
     let mut region_solids = Vec::with_capacity(profile.regions.len());
+    // The station lane's measured bounds, one per swept loop (`sweep.stations`).
+    let mut approximations: Vec<crate::Approximation> = Vec::new();
     // Per region: the section is WIDER than its own bend and the kernel built the
     // swept ENVELOPE (a revolve) instead of skinning a tube. Read off the same
     // recognition the builder selects the lane on, so names and geometry agree.
@@ -243,7 +244,10 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, FeatureRefusal> {
                 region_index + 1
             ).into());
         }
-        let mut solid = sweep_profile_along_chain(
+        // The station lane's MEASURED BOUND rides into the result's
+        // `approximations` (`sweep.stations`); the mitre and envelope lanes are
+        // exact and report none.
+        let swept = crate::sweep_profile_along_chain_reported(
             &outer.curves,
             &path,
             twist_radians,
@@ -251,8 +255,17 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, FeatureRefusal> {
             (region_index != 0).then_some(anchor),
             crate::SectionPlacement::Transplant,
             "A corner between two STRAIGHT segments is MITRED — both sweeps trimmed to the joint's bisector plane, sharing one loop there — but a corner at a CURVED segment is not built by either sweep feature, because a curve has no single direction for a bisector plane to bisect. Split the path at that corner and sweep each run separately, or round the corner so the joint is tangent-continuous.",
+            None,
         )
         .map_err(|error| format!("path sweep: {error}"))?;
+        let mut solid = swept.solid;
+        if let Some(report) = swept.report {
+            approximations.push(report.approximation(if region_index == 0 {
+                feature_id.to_string()
+            } else {
+                format!("{feature_id} region {}", region_index + 1)
+            }));
+        }
 
         // Face names: `[${edgeName}_SWP..., ${id}_START, ${id}_END]` (INPUT-curve
         // order). A MITRED path — a cornered polyline, built as one exact piece
@@ -349,7 +362,7 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, FeatureRefusal> {
                 None,
                 &mut |loop_index, _depth| {
                     let hole_curves = &region[loop_index].curves;
-                    sweep_profile_along_chain(
+                    crate::sweep_profile_along_chain_reported(
                         hole_curves,
                         &path,
                         twist_radians,
@@ -357,7 +370,14 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, FeatureRefusal> {
                         Some(anchor),
                         crate::SectionPlacement::Transplant,
                         "A corner between two STRAIGHT segments is MITRED — both sweeps trimmed to the joint's bisector plane, sharing one loop there — but a corner at a CURVED segment is not built by either sweep feature, because a curve has no single direction for a bisector plane to bisect. Split the path at that corner and sweep each run separately, or round the corner so the joint is tangent-continuous.",
+                        None,
                     )
+                    .map(|swept| {
+                        if let Some(report) = swept.report {
+                            approximations.push(report.approximation(format!("{feature_id} hole {loop_index}")));
+                        }
+                        swept.solid
+                    })
                 },
             )?;
         }
@@ -435,6 +455,7 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, FeatureRefusal> {
     if result.error.is_some() {
         return Ok(result);
     }
+    result.approximations.extend(approximations);
     // A FACE profile has no sketch to consume — the source solid stays resident.
     if !from_face {
         common::consume_sketch(ctx, &profile_name, &mut result);
@@ -453,6 +474,8 @@ pub fn schema() -> serde_json::Value {
     "type": "SWP",
     "shortName": "SWP",
     "longName": "Path Sweep",
+    "ribbonPath": "Home/Sweep/Path Sweep",
+    "commandSize": "Compact",
     "displayBuilder": false,
     "inputParamsSchema": {
         "id": {

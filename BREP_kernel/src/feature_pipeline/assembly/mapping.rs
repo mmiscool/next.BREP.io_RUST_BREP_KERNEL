@@ -57,6 +57,7 @@ pub(super) struct ResolvedElement {
     pub component: String,
     pub world: SelectionGeometry,
     pub local: SelectionGeometry,
+    pub transform: AffineTransform,
 }
 
 /// Resolve one selection ref (conventions in the module doc). Every failure is
@@ -86,6 +87,7 @@ pub(super) fn resolve_element(
         component: record.id.clone(),
         world,
         local,
+        transform: record.transform,
     })
 }
 
@@ -255,6 +257,8 @@ pub(super) struct MappedConstraint {
     pub measured: Option<(f64, &'static str)>,
     /// The evaluated target (distance/angle), for the overlay label suffix.
     pub target: Option<f64>,
+    /// Persistent angle reference in world space for the viewport arc.
+    pub angle_axis: Option<Vec3>,
     /// The element ROLES a multi-element type inferred, as index groups into
     /// the entry's `elements` (center: `[width pair, tab]`) — the overlay lane
     /// draws by role, not by pick order. Empty for the pairing types.

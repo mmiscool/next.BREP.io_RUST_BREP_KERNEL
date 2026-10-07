@@ -256,6 +256,9 @@ impl Viewport {
                 .fixed_pos(pos)
                 .pivot(egui::Align2::CENTER_CENTER)
                 .show(ctx, |ui| {
+                    if self.touch_suppressed {
+                        ui.disable();
+                    }
                     let font = label_font(ui.style(), label_scale);
                     egui::Frame::popup(ui.style())
                         .inner_margin(chip_margin(4.0, 2.0, label_scale))
@@ -445,6 +448,7 @@ impl Viewport {
         let mut apply = false;
         let mut cancel = false;
         let mut drag_to: Option<(String, f64, f64)> = None;
+        let mut drag_released = false;
 
         for (i, annotation) in annotations.iter().enumerate() {
             let scr = screens[i];
@@ -474,6 +478,9 @@ impl Viewport {
                 .fixed_pos(pos)
                 .pivot(egui::Align2::CENTER_CENTER)
                 .show(ctx, |ui| {
+                    if self.touch_suppressed {
+                        ui.disable();
+                    }
                     // Dark rounded chip with a thin orange border + orange
                     // monospace text (matches the reference dimension image).
                     let orange = egui::Color32::from_rgb(245, 166, 35);
@@ -542,6 +549,16 @@ impl Viewport {
                                         ));
                                     }
                                 }
+                                if resp.drag_stopped() {
+                                    if let Some(p) = resp.interact_pointer_pos() {
+                                        drag_to = Some((
+                                            field.clone(),
+                                            (p.x - rect.min.x) as f64,
+                                            (p.y - rect.min.y) as f64,
+                                        ));
+                                    }
+                                    drag_released = true;
+                                }
                             }
                         });
                 });
@@ -561,6 +578,9 @@ impl Viewport {
 
         if let Some((field, lx, ly)) = drag_to {
             state.feature_dimension_drag(&feature, &field, lx, ly);
+        }
+        if drag_released {
+            state.feature_dimension_release(&feature);
         }
 
         if let Some((field, seed)) = start_edit {
@@ -658,6 +678,9 @@ impl Viewport {
                 .fixed_pos(pos)
                 .pivot(egui::Align2::CENTER_CENTER)
                 .show(ctx, |ui| {
+                    if self.touch_suppressed {
+                        ui.disable();
+                    }
                     // Dark rounded chip with a thin status-colored border +
                     // status-colored monospace text (the feature-dim chip look,
                     // colored by the requirements-§5 status vocabulary). The
@@ -818,6 +841,7 @@ impl Viewport {
             // carries, the constraint chip's selected accent.
             let selected = label["selected"].as_bool().unwrap_or(false);
             let text_size = label["textSizePt"].as_f64().unwrap_or(12.0);
+            let balloon = label["type"].as_str() == Some("balloon") && status == "ok";
             let rgb = &label["color"];
             let color = egui::Color32::from_rgb(
                 (rgb[0].as_f64().unwrap_or(1.0) * 255.0).round() as u8,
@@ -833,13 +857,16 @@ impl Viewport {
                 .fixed_pos(pos)
                 .pivot(egui::Align2::CENTER_CENTER)
                 .show(ctx, |ui| {
+                    if self.touch_suppressed {
+                        ui.disable();
+                    }
                     let dark = egui::Color32::from_rgb(20, 20, 20);
                     let font = label_font(ui.style(), scale);
                     egui::Frame::new()
                         .fill(dark)
                         .stroke(egui::Stroke::new(if open || selected { 2.5 } else { 1.0 }, color))
-                        .corner_radius(egui::CornerRadius::same(4))
-                        .inner_margin(chip_margin(6.0, 3.0, scale))
+                        .corner_radius(egui::CornerRadius::same(if balloon { 255 } else { 4 }))
+                        .inner_margin(chip_margin(if balloon { 3.0 } else { 6.0 }, 3.0, scale))
                         .show(ui, |ui| {
                             scale_label_spacing(ui, scale);
                             // A dimension chip is its value text; a datum /
@@ -863,6 +890,11 @@ impl Viewport {
                                 }
                                 None => egui::Button::new(rich),
                             };
+                            let button = if balloon {
+                                let size = ui.fonts_mut(|f| f.layout_no_wrap(text.clone(), font.clone(), color).size());
+                                let side = size.x.max(size.y) + 4.0 * scale;
+                                button.min_size(egui::vec2(side, side))
+                            } else { button };
                             let resp = ui.add(
                                 button
                                     .frame(false)

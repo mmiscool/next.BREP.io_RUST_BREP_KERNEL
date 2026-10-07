@@ -1,4 +1,8 @@
 use super::*;
+use super::stations::{
+    StationBudget, StationParam, SweepStationReport, SWEEP_DEFAULT_TOLERANCE, SWEEP_MAX_STATIONS,
+    SWEEP_REFINEMENT_ROUNDS,
+};
 
 /// Sweep a CLOSED PLANAR profile loop along a path curve (§3.3/§5.7),
 /// TRANSPLANTING the profile onto the path — see [`SectionPlacement`] for the
@@ -36,7 +40,9 @@ pub fn sweep_profile_along_path(
         0.0,
         None,
         SectionPlacement::Transplant,
+        SWEEP_DEFAULT_TOLERANCE,
     )
+    .map(|swept| swept.solid)
 }
 
 /// Twisted path sweep (§5.7): identical to [`sweep_profile_along_path`], but
@@ -99,7 +105,9 @@ pub fn sweep_profile_twisted(
         twist_angle,
         None,
         SectionPlacement::Transplant,
+        SWEEP_DEFAULT_TOLERANCE,
     )
+    .map(|swept| swept.solid)
     .map_err(|error| error.with_message(|error| format!("sweep_profile_twisted: {error}")))
 }
 
@@ -224,7 +232,9 @@ pub fn sweep_profile_along_path_anchored(
         0.0,
         Some(anchor),
         SectionPlacement::Transplant,
+        SWEEP_DEFAULT_TOLERANCE,
     )
+    .map(|swept| swept.solid)
 }
 
 /// [`sweep_profile_twisted`] with an explicit placement anchor: the hole loop
@@ -269,7 +279,9 @@ pub fn sweep_profile_twisted_anchored(
         twist_angle,
         Some(anchor),
         SectionPlacement::Transplant,
+        SWEEP_DEFAULT_TOLERANCE,
     )
+    .map(|swept| swept.solid)
     .map_err(|error| error.with_message(|error| format!("sweep_profile_twisted: {error}")))
 }
 
@@ -316,7 +328,57 @@ pub fn sweep_profile_along_chain(
     placement_mode: SectionPlacement,
     corner_advice: &str,
 ) -> Result<BrepSolid, KernelRefusal> {
+    sweep_profile_along_chain_reported(
+        profile,
+        path,
+        twist_angle,
+        name,
+        anchor,
+        placement_mode,
+        corner_advice,
+        None,
+    )
+    .map(|swept| swept.solid)
+}
+
+/// A swept solid with the MEASURED BOUND of its construction
+/// ([`SweepStationReport`]): `None` where the construction is exact — the
+/// mitre lane (exact pieces on bisector planes) and the envelope lane (a
+/// revolve) — and the station lane's report otherwise.
+#[derive(Debug)]
+pub struct SweptChain {
+    pub solid: BrepSolid,
+    pub report: Option<SweepStationReport>,
+}
+
+impl SweptChain {
+    fn exact(solid: BrepSolid) -> Self {
+        Self {
+            solid,
+            report: None,
+        }
+    }
+}
+
+/// [`sweep_profile_along_chain`] with the requested wall TOLERANCE (mm;
+/// `None` for [`SWEEP_DEFAULT_TOLERANCE`]) and the measured bound the build
+/// reached, for a caller that carries it on (the sweep features put it in
+/// `FeatureResult::approximations`). The station lane refines its stations
+/// until the loft's own interpolant stands within `tolerance` of the kinematic
+/// sweep's wall, or the station cap stops it; the report says which.
+#[allow(clippy::too_many_arguments)]
+pub fn sweep_profile_along_chain_reported(
+    profile: &[NurbsCurve],
+    path: &SweepPath,
+    twist_angle: f64,
+    name: Option<&str>,
+    anchor: Option<ProfileAnchor>,
+    placement_mode: SectionPlacement,
+    corner_advice: &str,
+    tolerance: Option<f64>,
+) -> Result<SweptChain, KernelRefusal> {
     use std::f64::consts::{FRAC_PI_2, TAU};
+    let tolerance = sweep_tolerance(tolerance)?;
 
     if path.is_empty() {
         return Err(KernelRefusal::input(
@@ -332,50 +394,76 @@ pub fn sweep_profile_along_chain(
     let envelope_lane = super::envelope::recognize_swept_envelope(profile, path, placement_mode)?
         .is_ok();
 
-    // Single segment under `Transplant`: the existing builders, byte for byte.
-    // `Rigid` has no single-curve wrapper to delegate to and falls through to the
-    // chain sampler, which samples a 1-element chain over exactly the domain the
-    // single-curve sampler would (no joints, the whole budget on one segment).
-    // A CLOSED single segment falls through too — the single-curve samplers end
-    // in a capped loft, and a ring has no caps.
-    if let ([single], SectionPlacement::Transplant, false, false) =
-        (path.curves.as_slice(), placement_mode, path.closed, envelope_lane)
-    {
-        return match (anchor, twist_angle == 0.0) {
-            (None, true) => sweep_profile_along_path(profile, single, name),
-            (Some(anchor), true) => {
-                sweep_profile_along_path_anchored(profile, single, name, anchor)
-            }
-            (None, false) => sweep_profile_twisted(profile, single, twist_angle, name),
-            (Some(anchor), false) => {
-                sweep_profile_twisted_anchored(profile, single, twist_angle, name, anchor)
-            }
-        };
-    }
-
-    // Everything else — any multi-segment chain, and a single segment under
-    // `Rigid` — takes the same station law the single-curve twisted builder
-    // uses, so density scales with twist identically on a chained path.
     if !twist_angle.is_finite() {
         return Err(KernelRefusal::input(
             KernelStage::Collect,
             "twist_finite",
-            "sweep_profile_along_chain: twist angle must be finite",
+            if path.curves.len() == 1 && placement_mode == SectionPlacement::Transplant {
+                "sweep_profile_twisted: twist angle must be finite"
+            } else {
+                "sweep_profile_along_chain: twist angle must be finite"
+            },
         ));
     }
     const MAX_TURNS: f64 = 16.0;
     if twist_angle.abs() > MAX_TURNS * TAU {
+        let who = if path.curves.len() == 1 && placement_mode == SectionPlacement::Transplant {
+            "sweep_profile_twisted"
+        } else {
+            "sweep_profile_along_chain"
+        };
         return Err(KernelRefusal::unsupported(
             KernelStage::Collect,
             "twist_cap",
             format!(
-            "sweep_profile_along_chain: twist of {:.3} turns exceeds the {MAX_TURNS}-turn \
+            "{who}: twist of {:.3} turns exceeds the {MAX_TURNS}-turn \
              limit the 1024-station cap can resolve at 16 stations per quarter turn; \
              split the sweep or reduce the twist",
             twist_angle.abs() / TAU
             ),
         ));
     }
+    // Single segment under `Transplant`: the single-curve sampler's own budget
+    // on the single-curve lane, so an ordinary one-edge path sweep emits the
+    // geometry it always has wherever it reads inside the tolerance. `Rigid`
+    // has no single-curve budget and falls through to the chain sampler, which
+    // samples a 1-element chain over exactly the domain the single-curve
+    // sampler would (no joints, the whole budget on one segment). A CLOSED
+    // single segment falls through too — the single-curve lane ends in a capped
+    // loft, and a ring has no caps.
+    if let ([single], SectionPlacement::Transplant, false, false) =
+        (path.curves.as_slice(), placement_mode, path.closed, envelope_lane)
+    {
+        // The single-curve builders' own budgets ([`path_turning_stations`],
+        // the twisted law), on the single-curve lane, at this tolerance.
+        let stations = if twist_angle == 0.0 {
+            path_turning_stations(single)
+        } else {
+            let quarter_turns = (twist_angle.abs() / FRAC_PI_2).ceil() as usize;
+            (quarter_turns * 16).clamp(32, 1024).max(path_turning_stations(single))
+        };
+        return sweep_profile_along_path_stations(
+            profile,
+            single,
+            name,
+            stations,
+            twist_angle,
+            anchor,
+            SectionPlacement::Transplant,
+            tolerance,
+        )
+        .map_err(|error| {
+            if twist_angle == 0.0 {
+                error
+            } else {
+                error.with_message(|error| format!("sweep_profile_twisted: {error}"))
+            }
+        });
+    }
+
+    // Everything else — any multi-segment chain, and a single segment under
+    // `Rigid` — takes the same station law the single-curve twisted builder
+    // uses, so density scales with twist identically on a chained path.
     // A CLOSED SPATIAL path lays its counter-twist down on top of the requested
     // twist, which adds up to half a turn, so the density is set for the most the
     // lap can roll.
@@ -400,7 +488,22 @@ pub fn sweep_profile_along_chain(
         placement_mode,
         corner_advice,
         CornerPolicy::Mitre,
+        tolerance,
     )
+}
+
+/// The wall tolerance a sweep is refined to: the caller's, or the default;
+/// refused when it is not a positive finite length.
+fn sweep_tolerance(tolerance: Option<f64>) -> Result<f64, KernelRefusal> {
+    let tolerance = tolerance.unwrap_or(SWEEP_DEFAULT_TOLERANCE);
+    if !(tolerance.is_finite() && tolerance > 0.0) {
+        return Err(KernelRefusal::input(
+            KernelStage::Collect,
+            "sweep_tolerance",
+            format!("sweepSolid: the requested wall tolerance must be a positive length, not {tolerance}"),
+        ));
+    }
+    Ok(tolerance)
 }
 
 /// [`sweep_profile_along_chain`] with an explicit STATION budget and no twist
@@ -416,6 +519,22 @@ pub fn sweep_profile_along_chain_with_stations(
     stations: usize,
     corner_advice: &str,
 ) -> Result<BrepSolid, KernelRefusal> {
+    sweep_profile_along_chain_with_stations_reported(profile, path, stations, corner_advice, None)
+        .map(|swept| swept.solid)
+}
+
+/// [`sweep_profile_along_chain_with_stations`] with the requested wall
+/// tolerance (`None` for the default) and the measured bound: the caller's
+/// budget is the FLOOR, refined where the measured deviation is over the
+/// tolerance.
+pub fn sweep_profile_along_chain_with_stations_reported(
+    profile: &[NurbsCurve],
+    path: &SweepPath,
+    stations: usize,
+    corner_advice: &str,
+    tolerance: Option<f64>,
+) -> Result<SweptChain, KernelRefusal> {
+    let tolerance = sweep_tolerance(tolerance)?;
     sweep_profile_along_chain_stations(
         profile,
         path,
@@ -425,6 +544,7 @@ pub fn sweep_profile_along_chain_with_stations(
         SectionPlacement::Transplant,
         corner_advice,
         CornerPolicy::Refuse,
+        tolerance,
     )
 }
 
@@ -507,11 +627,11 @@ fn sweep_profile_along_path_stations(
     twist_angle: f64,
     anchor: Option<ProfileAnchor>,
     placement_mode: SectionPlacement,
-) -> Result<BrepSolid, KernelRefusal> {
+    tolerance: f64,
+) -> Result<SweptChain, KernelRefusal> {
     // Loft carries no face names; the app stamps them onto the emitted face
     // order.  Accept `name` for ABI symmetry with the other builders.
     let _ = name;
-    let tolerance = 1e-6;
     if stations < 2 {
         return Err(KernelRefusal::input(
             KernelStage::Collect,
@@ -528,44 +648,37 @@ fn sweep_profile_along_path_stations(
     //        still reported ahead of a bad path exactly as it always was.
     let placement = resolve_placement(profile, anchor, placement_mode)?;
 
-    // --- 2. Sample the path; require a non-degenerate tangent at every station.
-    let [t0, t1] = path.domain().or_refuse(KernelStage::Collect, "domain")?;
-    if (t1 - t0).abs() <= tolerance {
-        return Err(KernelRefusal::input(
-            KernelStage::Collect,
-            "path_domain",
-            "sweepSolid: path domain is degenerate",
-        ));
-    }
-    let mut points = Vec::with_capacity(stations);
-    let mut tangents = Vec::with_capacity(stations);
-    let mut curvatures = Vec::with_capacity(stations);
-    for index in 0..stations {
-        let t = t0 + (t1 - t0) * index as f64 / (stations - 1) as f64;
-        let derivatives = path.derivatives_small(t, 2).or_refuse(KernelStage::Collect, "derivatives")?;
-        let tangent = derivatives[1].normalized().map_err(|_| {
-            KernelRefusal::input(
-                KernelStage::Classify,
-                "path_tangent",
-                format!("sweepSolid: path tangent is degenerate at station {index}"),
-            )
-        })?;
-        points.push(derivatives[0]);
-        tangents.push(tangent);
-        curvatures.push(curvature_vector(derivatives[1], derivatives[2]));
-    }
+    // --- 2. Sample the path as a one-segment chain on the single-curve lane:
+    //        `stations` uniform in the parameter, the sampling this builder
+    //        always had, refined only where the measured deviation is over the
+    //        tolerance (`chain_stations`).
+    let chain = std::slice::from_ref(path);
+    let (samples, budget) = chain_stations(chain, false, SamplerLane::SingleCurve, stations, tolerance)?;
+    let StationSamples {
+        points,
+        tangents,
+        curvatures,
+        params,
+        ..
+    } = &samples;
 
     sweep_sections_through_samples(
         profile,
-        &points,
-        &tangents,
-        &curvatures,
+        points,
+        tangents,
+        curvatures,
         twist_angle,
         placement,
         placement_mode,
         RingFrame::Open,
         None,
         None,
+        StationRun {
+            chain,
+            params,
+            budget,
+            tolerance,
+        },
     )
 }
 
@@ -703,7 +816,8 @@ fn sweep_profile_along_chain_stations(
     placement_mode: SectionPlacement,
     corner_advice: &str,
     corners: CornerPolicy,
-) -> Result<BrepSolid, KernelRefusal> {
+    tolerance: f64,
+) -> Result<SweptChain, KernelRefusal> {
     let chain = path.curves.as_slice();
     if chain.is_empty() {
         return Err(KernelRefusal::input(
@@ -741,7 +855,7 @@ fn sweep_profile_along_chain_stations(
             Ok(plan) => {
                 let mut bodies = super::envelope::build_swept_envelope(&plan)?;
                 if bodies.len() == 1 {
-                    return Ok(bodies.remove(0));
+                    return Ok(SweptChain::exact(bodies.remove(0)));
                 }
                 return Err(KernelRefusal::unsupported(
                     KernelStage::Fragment,
@@ -802,7 +916,8 @@ fn sweep_profile_along_chain_stations(
                 section_normal,
                 path,
                 twist_angle,
-            );
+            )
+            .map(SweptChain::exact);
         }
         // A path with BOTH a corner and a curved segment is in NEITHER lane, and
         // this is the refusal that says so: the mitre lane needs every segment
@@ -856,31 +971,63 @@ fn sweep_profile_along_chain_stations(
     //     that off the section and refuses by name a twist that does not close
     //     ([`closing_twist`]).
 
-    // --- Sample the chain as ONE trajectory (budget, domains, stations).
+    // --- A bend TIGHTER than the section is refused on the FLOOR stations,
+    //     before any are spent refining a run that folds, and so that the
+    //     refusal quotes the same stations whatever tolerance was asked
+    //     (`sweep_bend_profile` reads the same). Untwisted `Transplant` only —
+    //     the reach of a rolled section is the twisted placement's to read, in
+    //     §4c of `sweep_sections_through_samples`, which stays the backstop.
+    if placement_mode == SectionPlacement::Transplant
+        && twist_angle == 0.0
+        && std::env::var("BREP_SWEEP_BEND_GUARD").as_deref() != Ok("0")
+    {
+        let (floor, _) = chain_stations(path.curves.as_slice(), path.closed, SamplerLane::Chain, stations, 0.0)?;
+        let profile_stations = floor_bend_stations(profile, &placement, path, &floor)?;
+        if let Some(refusal) = tight_bend_refusal(&profile_stations, floor.points.len()) {
+            return Err(with_envelope_gap(refusal, Some(envelope_gap.as_str())));
+        }
+    }
+
+    // --- Sample the chain as ONE trajectory (budget, domains, stations), and
+    //     refine it to the requested tolerance.
+    let (samples, budget) = chain_stations(
+        path.curves.as_slice(),
+        path.closed,
+        SamplerLane::Chain,
+        stations,
+        tolerance,
+    )?;
     let StationSamples {
         points,
         tangents,
         curvatures,
         segments,
-    } = chain_stations(path, stations)?;
+        params,
+    } = &samples;
 
     // --- CLOSED: the ring needs a frame that comes back to itself. A PLANAR path
     //     has one for free (see `ring_normal`); a SPATIAL one comes back rolled by
     //     its own holonomy and is closed by the counter-twist policy
     //     ([`RingFrame::Spatial`]).
-    let closure = ring_frame(path, &tangents)?;
+    let closure = ring_frame(path, tangents)?;
 
     sweep_sections_through_samples(
         profile,
-        &points,
-        &tangents,
-        &curvatures,
+        points,
+        tangents,
+        curvatures,
         twist_angle,
         placement,
         placement_mode,
         closure,
         Some(envelope_gap.as_str()),
         Some((segments.as_slice(), path)),
+        StationRun {
+            chain: path.curves.as_slice(),
+            params,
+            budget,
+            tolerance,
+        },
     )
 }
 
@@ -1005,12 +1152,21 @@ pub fn sweep_closure(
         return super::miter::mitred_frame_closure(&section, section_normal, path, twist_angle)
             .map(Some);
     }
-    let StationSamples {
-        points,
-        tangents,
-        segments,
-        ..
-    } = chain_stations(path, stations.clamp(2, 1024))?;
+    let (
+        StationSamples {
+            points,
+            tangents,
+            segments,
+            ..
+        },
+        _,
+    ) = chain_stations(
+        path.curves.as_slice(),
+        path.closed,
+        SamplerLane::Chain,
+        stations.clamp(2, 1024),
+        SWEEP_DEFAULT_TOLERANCE,
+    )?;
     let screw = Some((segments.as_slice(), path)).filter(|_| placement_mode == SectionPlacement::Rigid);
     let closure = ring_frame(path, &tangents)?;
     let (section, _) = place_section(profile, placement, placement_mode, points[0], tangents[0])?;
@@ -1365,6 +1521,9 @@ pub(crate) struct StationSamples {
     /// The path SEGMENT each station belongs to. A joint station is emitted by
     /// the segment ARRIVING at it, so it carries that segment's index.
     pub(crate) segments: Vec<usize>,
+    /// Where each station sits for the span AFTER it: the segment it departs
+    /// into and its parameter there ([`StationParam`]).
+    pub(crate) params: Vec<StationParam>,
 }
 
 /// The CURVATURE VECTOR of a curve from its first two derivatives:
@@ -1390,15 +1549,78 @@ pub(crate) fn curvature_vector(first: Vec3, second: Vec3) -> Vec3 {
         .scale(1.0 / speed_squared)
 }
 
+/// Which sampler asked for the stations — the two differ in their FLOOR and
+/// in the words of the degenerate-tangent refusal, both pinned by callers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SamplerLane {
+    /// The chain sweep: every segment floored at its own turning, 16 stations
+    /// a quarter turn.
+    Chain,
+    /// The single-curve builders (`sweep_profile_along_path` and family): the
+    /// budget [`path_turning_stations`] hands them, uniform in the parameter,
+    /// exactly as they always sampled — no turning floor on top, so an
+    /// untwisted single-curve sweep that reads inside the tolerance is
+    /// bit-identical to the tree before refinement existed.
+    SingleCurve,
+}
+
 /// Sample a CHAIN as ONE trajectory: the per-segment arc-length estimate, the
-/// station budget it implies, and the stations themselves.
+/// station budget it implies, and the stations themselves — then REFINE the
+/// stations where the loft's own interpolant of them would stand off the path
+/// by more than `tolerance` (`sweep_topology/stations.rs`).
 ///
 /// Extracted from the chain sweep so the tight-bend INSTRUMENT
 /// ([`sweep_bend_profile`]) measures the very stations the sweep lofts through,
 /// rather than a second sampling that agrees with it today.
-fn chain_stations(path: &SweepPath, stations: usize) -> Result<StationSamples, KernelRefusal> {
-    let tolerance = 1e-6;
-    let chain = path.curves.as_slice();
+///
+/// STATION BUDGET. `stations` are distributed across the segments in proportion
+/// to estimated ARC LENGTH (chord sums over 16 samples per curve), floored at 2
+/// per segment so a short fillet between two long lines still carries its
+/// curvature, and — on the chain lane — at the segment's own TURNING at 16
+/// stations per quarter turn, the density the twisted builder already uses.
+/// That floor is the measured case behind the error rule: shared out by length
+/// alone, a rounded rectangle's four short corner arcs got the 2-station floor
+/// and the ring cut the corners, 6.2 % under `A · perimeter` on a 30 × 18 path
+/// with `r = 4`; the turning floor took the same path to 4.8e-4. The floor is
+/// kept as the STARTING budget on both lanes; the error rule below is what
+/// takes the rest.
+///
+/// WHAT THE ERROR RULE REPLACES. Until 2026-09-30 an OPEN path had its straight
+/// segments LIFTED to the density its turning segments were floored at
+/// (`floor_total × straight length / curved length`), because a coil with a
+/// straight lead of 2 stations bowed through the lead (2.7e-5 off Pappus on a
+/// lead of 10, 5.0e-4 on 100). Measured on 2026-09-30, that lift put a pipe of
+/// two 100-long legs round a 2-radius quarter bend at the 1024-station cap
+/// (correct, at 25× the stations it needs), and REFUSED the same pipe at
+/// `r = 1.5`, and any spatial variant, as "past the 1024-station cap" — a
+/// legitimate sweep refused for its own budget. The rule below reads the bow
+/// where it is and puts stations there; the lead of 100 gets a handful next to
+/// the joint instead of a thousand along its length.
+///
+/// THE RULE. The loft interpolates each control-point column with one cubic
+/// through the stations at shared chord parameters; the same fit through the
+/// station POINTS is the loft's centre track. Per span, the track's distance
+/// from the true path at the quarter points is measured
+/// (`stations::spine_deviations`); a span over `tolerance` is split into
+/// `ceil((deviation / tolerance)^(1/4))` equal parameter steps (the cubic's
+/// `h⁴` law), and the run is re-measured. At most [`SWEEP_REFINEMENT_ROUNDS`]
+/// rounds; a round that would pass the [`SWEEP_MAX_STATIONS`] cap refines the
+/// worst spans as far as the cap allows and the budget records `at_cap` — the
+/// sweep still builds and its report says the tolerance was not met.
+/// `BREP_SWEEP_STATION_REFINEMENT=0` switches the rule off (the bite proof).
+///
+/// The shared endpoint of two adjacent segments is sampled ONCE, not twice — a
+/// duplicated station would land in the RMF's coincident-step branch and waste
+/// a section on zero advance. A CLOSED path drops one more station for the
+/// same reason: its last station IS its first.
+fn chain_stations(
+    chain: &[NurbsCurve],
+    closed: bool,
+    lane: SamplerLane,
+    stations: usize,
+    tolerance: f64,
+) -> Result<(StationSamples, StationBudget), KernelRefusal> {
+    let position_tolerance = 1e-6;
     // --- Per-segment arc-length estimate, and the domain each one is sampled
     //     over. A degenerate domain is refused here rather than producing a
     //     silently collapsed station block.
@@ -1411,11 +1633,14 @@ fn chain_stations(path: &SweepPath, stations: usize) -> Result<StationSamples, K
     let mut turning = Vec::with_capacity(chain.len());
     for (index, curve) in chain.iter().enumerate() {
         let [t0, t1] = curve.domain().or_refuse(KernelStage::Collect, "domain")?;
-        if (t1 - t0).abs() <= tolerance {
+        if (t1 - t0).abs() <= position_tolerance {
             return Err(KernelRefusal::input(
                 KernelStage::Collect,
                 "path_domain",
-                format!("sweepSolid: path segment {index} has a degenerate domain"),
+                match lane {
+                    SamplerLane::Chain => format!("sweepSolid: path segment {index} has a degenerate domain"),
+                    SamplerLane::SingleCurve => "sweepSolid: path domain is degenerate".to_string(),
+                },
             ));
         }
         let mut length = 0.0;
@@ -1429,16 +1654,22 @@ fn chain_stations(path: &SweepPath, stations: usize) -> Result<StationSamples, K
         lengths.push(length);
         // `segment_turning` is a stringly reading of the curve's unit tangents;
         // a failure there is a degenerate tangent, which is the path's fault.
-        turning.push(segment_turning(curve, [t0, t1]).map_err(|error| {
-            KernelRefusal::input(
-                KernelStage::Classify,
-                "path_tangent",
-                format!("sweepSolid: path tangent is degenerate on segment {index}: {error}"),
-            )
-        })?);
+        // The single-curve lane never reads it: its budget was decided by
+        // [`path_turning_stations`] and a path it cannot read is refused by the
+        // sampling below, in that lane's own words.
+        turning.push(match lane {
+            SamplerLane::Chain => segment_turning(curve, [t0, t1]).map_err(|error| {
+                KernelRefusal::input(
+                    KernelStage::Classify,
+                    "path_tangent",
+                    format!("sweepSolid: path tangent is degenerate on segment {index}: {error}"),
+                )
+            })?,
+            SamplerLane::SingleCurve => 0.0,
+        });
     }
     let total_length: f64 = lengths.iter().sum();
-    if total_length <= tolerance {
+    if total_length <= position_tolerance {
         return Err(KernelRefusal::input(
             KernelStage::Collect,
             "path_length",
@@ -1447,64 +1678,13 @@ fn chain_stations(path: &SweepPath, stations: usize) -> Result<StationSamples, K
     }
 
     // --- Station budget per segment: proportional to arc length, floored at 2
-    //     (a segment needs its two ends), and the remainder handed to the
-    //     longest segment so the totals land exactly on `stations`.
-    //
-    //     The floor is raised to the segment's own TURNING, at 16
-    //     stations per quarter turn — the density the twisted builder already
-    //     uses, and the one that puts the cubic v-interpolant's own error around
-    //     1e-7 relative (it falls as the fourth power of the angular spacing,
-    //     `Δθ⁴/384`, which is ~2.4e-7 at 16 per quarter turn).
-    //
-    //     WHY THE CLOSED LANE NEEDS IT AND THE OPEN LANE DOES NOT, stated as the
-    //     measurement that forced it: a rounded rectangle's four quarter arcs are
-    //     SHORT next to its four straight runs, so a length-proportional share of
-    //     32 hands each arc the 2-station floor — its two ends and nothing in
-    //     between — and the interpolant cuts the corner. Measured on a 30 x 18
-    //     path with r = 4: the ring came out 6.2 % under `A · perimeter`, a
-    //     watertight, validating, WRONG solid. The floor takes the same case to
-    //     1e-5.
-    //
-    //     An OPEN path is under-sampled the same way and now takes the same floor.
-    //     It did not until 2026-09-25, and a coil showed what that cost: an 8-turn
-    //     helix got 32 stations, four a turn, and the loft between sections a
-    //     quarter turn apart folded its own wall — a `Rigid` sweep along the coil,
-    //     or a coil with a straight lead, was refused outright. (A curvature-JUMP
-    //     law at G1 joints is still this plan's remaining item 2; the floor is
-    //     about how far a segment turns, not how its curvature changes.)
-    //
-    //     Once the floors lift the turning segments past their share, the SHARES
-    //     are taken of the lifted total, not of the `stations` asked for: the
-    //     segments that do not turn are sampled at the density the turning ones
-    //     were raised to. Measured on the coil above with a tangent straight lead:
-    //     the floor gave the coil ~500 stations and the lead its share of 32 — its
-    //     two ends — and the interpolant, stiff from the coil, bowed through the
-    //     lead: 2.7e-5 off Pappus on a lead of 10, 5.0e-4 on a lead of 100, and
-    //     1.5e-7 / 2.1e-7 at the density the coil was given.
+    //     (a segment needs its two ends) and at the segment's turning, and the
+    //     remainder handed to the longest segment so the totals land exactly on
+    //     `stations`.
     let floors: Vec<usize> = turning
         .iter()
         .map(|turn| ((turn / std::f64::consts::FRAC_PI_2) * 16.0).ceil() as usize)
         .collect();
-    let floored_length: f64 = lengths
-        .iter()
-        .zip(&floors)
-        .filter(|(_, floor)| **floor > 2)
-        .map(|(length, _)| length)
-        .sum();
-    let floor_total: usize = floors.iter().sum();
-    //     A CLOSED path is not lifted — its shares stay those of the `stations`
-    //     asked for (its floors can still move where a segment's turning is
-    //     re-read densely, see `segment_turning`): its loft
-    //     runs every skin through as many laps as its section curves take to
-    //     cycle, so a lifted total multiplies against the cap there, and the
-    //     closed lane's measured residuals are pinned at its own budget.
-    let lifted = if !path.closed && floored_length > tolerance {
-        let straight = floor_total as f64 * (total_length - floored_length) / floored_length;
-        ((floor_total as f64 + straight).ceil() as usize).min(1024)
-    } else {
-        0
-    };
-    let stations = stations.max(lifted);
     let mut budget: Vec<usize> = lengths
         .iter()
         .zip(&floors)
@@ -1516,21 +1696,20 @@ fn chain_stations(path: &SweepPath, stations: usize) -> Result<StationSamples, K
     // Each interior joint shares one station between its two segments, so the
     // emitted total is sum(budget) - (segments - 1). A CLOSED path drops its very
     // last station too — it is the first one — so it emits one fewer again.
-    let shared = chain.len() - 1 + usize::from(path.closed);
+    let shared = chain.len() - 1 + usize::from(closed);
     let emitted: usize = budget.iter().sum::<usize>() - shared;
     // The 2-per-segment floor means a chain of n segments emits at least n+1
     // stations, so a long enough chain cannot be held under the loft's station
     // cap by any distribution. The loft's interpolation solve is O(stations³)
     // per control column, so silently accepting such a path would look like a
     // hang. Refuse with the count instead — the same honesty the twist cap uses.
-    const MAX_STATIONS: usize = 1024;
-    if emitted > MAX_STATIONS {
+    if emitted > SWEEP_MAX_STATIONS {
         return Err(KernelRefusal::unsupported(
             KernelStage::Collect,
             "station_cap",
             format!(
             "sweepSolid: a {}-segment path needs at least {emitted} stations, past the \
-             {MAX_STATIONS}-station cap the loft solve can carry; sweep it in fewer, \
+             {SWEEP_MAX_STATIONS}-station cap the loft solve can carry; sweep it in fewer, \
              longer pieces",
             chain.len()
             ),
@@ -1546,14 +1725,95 @@ fn chain_stations(path: &SweepPath, stations: usize) -> Result<StationSamples, K
         budget[longest] += stations - emitted;
     }
 
-    // --- Sample the chain as ONE trajectory.
+    // --- The parameters each segment is sampled at: uniform over its domain at
+    //     its budget, then refined where the measured deviation says so.
+    let mut per_segment: Vec<Vec<f64>> = domains
+        .iter()
+        .zip(&budget)
+        .map(|([t0, t1], count)| {
+            (0..*count)
+                .map(|sample| t0 + (t1 - t0) * sample as f64 / (count - 1) as f64)
+                .collect()
+        })
+        .collect();
+    let initial = per_segment.iter().map(Vec::len).sum::<usize>() - shared;
+    let mut budget = StationBudget {
+        initial,
+        stations: initial,
+        rounds: 0,
+        at_cap: false,
+        rounds_exhausted: false,
+    };
+    let refine = tolerance.is_finite() && tolerance > 0.0 && super::stations::refinement_enabled();
+    let mut samples = sample_chain(chain, closed, lane, &domains, &per_segment)?;
+    if refine {
+        loop {
+            let deviations = super::stations::spine_deviations(chain, &samples.params, &samples.points, closed)
+                .map_err(|error| {
+                    KernelRefusal::internal(
+                        KernelStage::Refine,
+                        "station_deviation",
+                        format!("sweepSolid: the station deviation could not be read: {error}"),
+                    )
+                })?;
+            if deviations.iter().all(|deviation| *deviation <= tolerance) {
+                break;
+            }
+            if budget.rounds >= SWEEP_REFINEMENT_ROUNDS {
+                budget.rounds_exhausted = true;
+                break;
+            }
+            let emitted = samples.points.len();
+            let (inserted, at_cap) = super::stations::refine_parameters(
+                chain,
+                &mut per_segment,
+                &samples.params,
+                &deviations,
+                tolerance,
+                closed,
+                emitted,
+            )
+            .map_err(|error| {
+                KernelRefusal::internal(
+                    KernelStage::Refine,
+                    "station_refinement",
+                    format!("sweepSolid: the stations could not be refined: {error}"),
+                )
+            })?;
+            budget.at_cap |= at_cap;
+            if inserted == 0 {
+                break;
+            }
+            budget.rounds += 1;
+            samples = sample_chain(chain, closed, lane, &domains, &per_segment)?;
+            if at_cap {
+                break;
+            }
+        }
+    }
+    budget.stations = samples.points.len();
+    Ok((samples, budget))
+}
+
+/// Sample the chain at `per_segment`'s parameters as ONE trajectory: the
+/// point, unit tangent and curvature vector at every station, the segment it
+/// arrived on, and where it sits ([`StationParam`]).
+fn sample_chain(
+    chain: &[NurbsCurve],
+    closed: bool,
+    lane: SamplerLane,
+    domains: &[[f64; 2]],
+    per_segment: &[Vec<f64>],
+) -> Result<StationSamples, KernelRefusal> {
     let mut points: Vec<Vec3> = Vec::new();
     let mut tangents: Vec<Vec3> = Vec::new();
     let mut curvatures: Vec<Vec3> = Vec::new();
     let mut segments: Vec<usize> = Vec::new();
+    let mut params: Vec<StationParam> = Vec::new();
     for (index, curve) in chain.iter().enumerate() {
-        let [t0, t1] = domains[index];
-        let count = budget[index];
+        let [t0, _] = domains[index];
+        let list = &per_segment[index];
+        let count = list.len();
         // Skip the first sample of every segment after the first: that station
         // is the joint, already emitted as the previous segment's last. On a
         // CLOSED path the LAST segment's last sample is skipped too — it is
@@ -1576,28 +1836,35 @@ fn chain_stations(path: &SweepPath, stations: usize) -> Result<StationSamples, K
                     *departing = arriving;
                 }
             }
+            // The joint station departs into THIS segment.
+            if let Some(joint) = params.last_mut() {
+                *joint = StationParam { segment: index, t: t0 };
+            }
         }
-        let last = count - usize::from(path.closed && index + 1 == chain.len());
-        for sample in first..last {
-            let t = t0 + (t1 - t0) * sample as f64 / (count - 1) as f64;
+        let last = count - usize::from(closed && index + 1 == chain.len());
+        for (sample, &t) in list.iter().enumerate().take(last).skip(first) {
             let derivatives = curve.derivatives_small(t, 2).or_refuse(KernelStage::Collect, "derivatives")?;
             let tangent = derivatives[1].normalized().map_err(|_| {
                 KernelRefusal::input(
                     KernelStage::Classify,
                     "path_tangent",
-                    format!("sweepSolid: path tangent is degenerate on segment {index}"),
+                    match lane {
+                        SamplerLane::Chain => format!("sweepSolid: path tangent is degenerate on segment {index}"),
+                        SamplerLane::SingleCurve => format!("sweepSolid: path tangent is degenerate at station {sample}"),
+                    },
                 )
             })?;
             points.push(derivatives[0]);
             tangents.push(tangent);
             curvatures.push(curvature_vector(derivatives[1], derivatives[2]));
             segments.push(index);
+            params.push(StationParam { segment: index, t });
         }
     }
     // A CLOSED path's seam is a joint like any other, and station 0 is the only
     // one whose two sides are sampled at opposite ends of the loop: the last
     // segment's end is station 0, and it was dropped rather than emitted.
-    if path.closed {
+    if closed {
         if let (Some(curve), Some(domain)) = (chain.last(), domains.last()) {
             let derivatives = curve.derivatives_small(domain[1], 2).or_refuse(KernelStage::Collect, "derivatives")?;
             let arriving = curvature_vector(derivatives[1], derivatives[2]);
@@ -1613,6 +1880,7 @@ fn chain_stations(path: &SweepPath, stations: usize) -> Result<StationSamples, K
         tangents,
         curvatures,
         segments,
+        params,
     })
 }
 
@@ -1844,30 +2112,64 @@ fn bend_stations(
 /// `stations` stations — the instrument behind the refusal below, exposed so a
 /// caller (or a probe) can measure a path BEFORE asking for the solid.
 ///
-/// Reads the very stations the sweep lofts through: the same budget, the same
-/// sampling, the same rotation-minimizing frame. Untwisted, which is the lane
-/// every caller of [`sweep_profile_along_chain_with_stations`] is in.
+/// Reads the very stations the sweep's tight-bend refusal reads: the FLOOR
+/// budget, before the error-driven refinement (`chain_stations`) adds any —
+/// the same sampling, the same rotation-minimizing frame. A bend too tight
+/// is decided and quoted on the floor stations so that a path which folds
+/// is refused before stations are spent refining it, and so that the
+/// refusal's numbers do not move with the tolerance. Untwisted, which is the
+/// lane every caller of [`sweep_profile_along_chain_with_stations`] is in.
 pub fn sweep_bend_profile(
     profile: &[NurbsCurve],
     path: &SweepPath,
     stations: usize,
 ) -> Result<Vec<BendStation>, KernelRefusal> {
     let placement = resolve_placement(profile, None, SectionPlacement::Transplant)?;
-    let StationSamples {
-        points,
-        tangents,
-        curvatures,
-        ..
-    } = chain_stations(path, stations.clamp(2, 1024))?;
-    let closure = ring_frame(path, &tangents)?;
+    let (samples, _) = chain_stations(
+        path.curves.as_slice(),
+        path.closed,
+        SamplerLane::Chain,
+        stations.clamp(2, 1024),
+        0.0,
+    )?;
+    floor_bend_stations(profile, &placement, path, &samples)
+}
+
+/// The `ρκ` profile of a TRANSPLANT sweep over `samples`, on the untwisted
+/// ring or open frame those stations take — what [`sweep_bend_profile`]
+/// reports and what the chain sweep refuses on before it refines.
+fn floor_bend_stations(
+    profile: &[NurbsCurve],
+    placement: &ProfileAnchor,
+    path: &SweepPath,
+    samples: &StationSamples,
+) -> Result<Vec<BendStation>, KernelRefusal> {
+    let closure = ring_frame(path, &samples.tangents)?;
     let untwisted = ClosingTwist {
         twist: 0.0,
         shift: 0,
     };
-    let (r_axes, s_axes, _) = station_frames(&points, &tangents, closure, None, untwisted)?;
+    let (r_axes, s_axes, _) = station_frames(&samples.points, &samples.tangents, closure, None, untwisted)?;
     let axes: Vec<(Vec3, Vec3)> = r_axes.into_iter().zip(s_axes).collect();
-    let offsets = section_offsets(profile, &placement)?;
-    Ok(bend_stations(&points, &curvatures, &axes, &offsets))
+    let offsets = section_offsets(profile, placement)?;
+    Ok(bend_stations(&samples.points, &samples.curvatures, &axes, &offsets))
+}
+
+/// A tight-bend refusal with the envelope lane's own measurement of WHICH
+/// half of its one configuration the sweep missed appended, when there is
+/// one — so the refusal names the boundary of what is built rather than
+/// only the bend that is refused.
+fn with_envelope_gap(refusal: KernelRefusal, envelope_gap: Option<&str>) -> KernelRefusal {
+    match envelope_gap {
+        Some(gap) if !gap.is_empty() => refusal.with_message(|refusal| {
+            format!(
+            "{refusal}. The swept envelope trimmed at its own self-intersection is built \
+             for a CIRCLE carried along one circular planar arc, and this sweep is not \
+             that: {gap}"
+            )
+        }),
+        _ => refusal,
+    }
 }
 
 /// The prefix every tight-bend refusal starts with, so a caller can CLASSIFY one
@@ -1960,6 +2262,15 @@ fn tight_bend_refusal(profile: &[BendStation], stations: usize) -> Option<Kernel
 /// `chain` is the station-to-segment map and the classified path, from the chain
 /// sampler; the single-curve sampler has none. Only `Rigid` reads it, to frame a
 /// HELIX segment's stations off its screw axis ([`screw_reference`]).
+/// The sampled run's geometry and budget, carried into
+/// [`sweep_sections_through_samples`] for the report it writes.
+struct StationRun<'a> {
+    chain: &'a [NurbsCurve],
+    params: &'a [StationParam],
+    budget: StationBudget,
+    tolerance: f64,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn sweep_sections_through_samples(
     profile: &[NurbsCurve],
@@ -1972,7 +2283,8 @@ fn sweep_sections_through_samples(
     closure: RingFrame,
     envelope_gap: Option<&str>,
     chain: Option<(&[usize], &SweepPath)>,
-) -> Result<BrepSolid, KernelRefusal> {
+    run: StationRun<'_>,
+) -> Result<SweptChain, KernelRefusal> {
     let tolerance = 1e-6;
     let stations = points.len();
     if stations < 2 {
@@ -2133,6 +2445,11 @@ fn sweep_sections_through_samples(
     // The axes the section is actually PLACED on, twist included — what the
     // tight-bend guard below measures the section's reach in.
     let mut placed_axes: Vec<(Vec3, Vec3)> = Vec::with_capacity(stations);
+    // The section's AFFINE placement per station, for the report: the image of
+    // the anchor origin (the centre track) and the images of `pu` and `pv`.
+    let mut centres: Vec<Vec3> = Vec::with_capacity(stations);
+    let mut axes_1: Vec<Vec3> = Vec::with_capacity(stations);
+    let mut axes_2: Vec<Vec3> = Vec::with_capacity(stations);
     for station in 0..stations {
         let station_origin = points[station];
         // Rotate the RMF axes about the tangent by the station's twist angle
@@ -2167,6 +2484,12 @@ fn sweep_sections_through_samples(
                     .add(si.scale(local.dot(pv)))
             }
         };
+        {
+            let centre = place(origin);
+            centres.push(centre);
+            axes_1.push(place(origin.add(pu)).sub(centre));
+            axes_2.push(place(origin.add(pv)).sub(centre));
+        }
         if rigid {
             // The section's own normal takes the same rotation (a direction, so
             // `R_k` without the translation), and the anchor origin's track is
@@ -2333,20 +2656,11 @@ fn sweep_sections_through_samples(
         if let Some(refusal) = tight_bend_refusal(&profile_stations, stations) {
             // The ENVELOPE lane builds this shape exactly for ONE configuration
             // (a circle on one circular planar arc), and a caller that lands here
-            // has missed it. `envelope_gap` is that lane's own measurement of
-            // WHICH half was missed, carried down from the entry that has the
-            // path to measure — so the refusal names the boundary of what is
-            // built rather than only the bend that is refused.
-            return Err(match envelope_gap {
-                Some(gap) if !gap.is_empty() => refusal.with_message(|refusal| {
-                    format!(
-                    "{refusal}. The swept envelope trimmed at its own self-intersection is built \
-                     for a CIRCLE carried along one circular planar arc, and this sweep is not \
-                     that: {gap}"
-                    )
-                }),
-                _ => refusal,
-            });
+            // has missed it (`with_envelope_gap`). An untwisted chain sweep was
+            // already asked this on its floor stations; this is the backstop
+            // for the twisted and single-curve runs, and for a bend that peaks
+            // between floor stations and shows on the refined ones.
+            return Err(with_envelope_gap(refusal, envelope_gap));
         }
     }
 
@@ -2367,7 +2681,7 @@ fn sweep_sections_through_samples(
     //   so there is still one wall per section curve.
     //   The loft mints its own refusals; the wrap below keeps that class and
     //   prefixes the text.
-    match closure {
+    let solid = match closure {
         RingFrame::Planar(_) | RingFrame::Spatial => {
             // The loft mints its own refusals; its class rides through the
             // sweep's wrap (a station cap stays a deferral, the acceptance's
@@ -2376,14 +2690,55 @@ fn sweep_sections_through_samples(
                 error.with_message(|error| {
                     format!("sweepSolid: closed loft through swept sections failed: {error}")
                 })
-            })
+            })?
         }
         RingFrame::Open => loft_profile_brep(&sections).map_err(|error| {
             error.with_message(|error| {
                 format!("sweepSolid: loft through swept sections failed: {error}")
             })
-        }),
-    }
+        })?,
+    };
+
+    // --- 6. The MEASURED BOUND of what was just built
+    //        (`sweep_topology/stations.rs`): the loft's own interpolants of the
+    //        centre track and the section axes against the true path and the
+    //        transported frame, and the built volume by quadrature against the
+    //        kinematic sweep's. Read off the very sections the loft skinned.
+    let moments = super::stations::section_moments(profile, origin, pu, pv).map_err(|error| {
+        KernelRefusal::internal(
+            KernelStage::Refine,
+            "section_moments",
+            format!("sweepSolid: the section's area could not be read: {error}"),
+        )
+    })?;
+    let (pu_in_frame, pv_in_frame) = if rigid {
+        ([pu.dot(t0), pu.dot(r0), pu.dot(s0)], [pv.dot(t0), pv.dot(r0), pv.dot(s0)])
+    } else {
+        ([0.0, 1.0, 0.0], [0.0, 0.0, 1.0])
+    };
+    let report = super::stations::station_report(&super::stations::PlacedRun {
+        chain: run.chain,
+        params: run.params,
+        points,
+        tangents,
+        axes: &placed_axes,
+        centres: &centres,
+        e1: &axes_1,
+        e2: &axes_2,
+        pu_in_frame,
+        pv_in_frame,
+        closed: closure.is_ring(),
+        sections: &sections,
+        moments,
+        reach: super::stations::section_reach(profile, origin),
+        shift: requested.shift,
+        budget: run.budget,
+        tolerance: run.tolerance,
+    })?;
+    Ok(SweptChain {
+        solid,
+        report: Some(report),
+    })
 }
 
 /// Helical sweep (§5.7): sweep a CLOSED PLANAR profile loop along a helix of
@@ -2714,6 +3069,8 @@ pub fn sweep_profile_helix(
         0.0,
         None,
         SectionPlacement::Transplant,
+        SWEEP_DEFAULT_TOLERANCE,
     )
-        .map_err(|error| error.with_message(|error| format!("sweep_profile_helix: {error}")))
+    .map(|swept| swept.solid)
+    .map_err(|error| error.with_message(|error| format!("sweep_profile_helix: {error}")))
 }

@@ -81,7 +81,7 @@ pub fn offset_freeform_face(
     // along the face's outward normal, which is `same_sense · (Su × Sv)`.
     let displacement = if face.same_sense { distance } else { -distance };
     let region = crate::offset_regularity::TrimRegion::from_face(face)?;
-    let scan = crate::offset_regularity::scan_offset_regularity(
+    let mut scan = crate::offset_regularity::scan_offset_regularity(
         &face.surface,
         &region,
         &[displacement],
@@ -101,6 +101,53 @@ pub fn offset_freeform_face(
             worst.v,
             worst.factor
         ),
+        ));
+    }
+    // The certainty step: nothing collapsed is the census; a scan that could
+    // not clear every risky cell, or ran out of descent budget, has not seen
+    // enough to certify the face, and this lane cannot carve either way.
+    let certainty = scan.certify(&face.surface, &region, &[displacement], crate::thicken::FOLD_FACTOR);
+    if let crate::offset_regularity::Certainty::Folded(worst) = certainty {
+        // The certainty step's own refinement reached the fold the census had
+        // not: the same refusal, at the sample it found.
+        return Err(KernelRefusal::unsupported(
+            KernelStage::Classify,
+            "fold",
+            format!(
+                "offset_freeform_face: a push by {distance} folds the offset through the face's evolute \
+                 — inside its trim the curvature radius {:.6} at (u={:.6}, v={:.6}) is not larger \
+                 than the push (fold factor {:.3e}, found between the scan's samples), and a push \
+                 cannot carve the fold away",
+                worst.radius(),
+                worst.u,
+                worst.v,
+                worst.factor
+            ),
+        ));
+    }
+    if let crate::offset_regularity::Certainty::Uncertain {
+        unresolved,
+        budget_exhausted,
+        least,
+    } = certainty
+    {
+        return Err(KernelRefusal::unsupported(
+            KernelStage::Classify,
+            "fold_uncertain",
+            format!(
+                "offset_freeform_face: a push by {distance} cannot be certified regular over the \
+                 face's trim — none of {} samples collapsed, but {} cell(s) were still risky at \
+                 the scan's finest spacing{}{}; a push cannot carve a fold it cannot place",
+                scan.sampled,
+                unresolved,
+                if budget_exhausted { " and the refinement budget ran out" } else { "" },
+                least
+                    .map(|least| format!(
+                        " (least fold factor {:.3e} at (u={:.6}, v={:.6}))",
+                        least.factor, least.u, least.v
+                    ))
+                    .unwrap_or_default()
+            ),
         ));
     }
     let offset = crate::offset_surface(face, -distance, 0.0)?;

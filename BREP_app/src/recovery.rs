@@ -297,6 +297,12 @@ impl RecoveryPanel {
         self.entries = entries;
     }
 
+    /// Respect the saved startup preference. Skipping the offer leaves the
+    /// stored copies alone; normal autosaves may replace them with new work.
+    pub fn arm_from_store(&mut self, store: &dyn ModelStore, disabled: bool) {
+        self.arm(if disabled { Vec::new() } else { read_entries(store) });
+    }
+
     pub fn is_open(&self) -> bool {
         !self.entries.is_empty()
     }

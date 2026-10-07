@@ -246,6 +246,26 @@ pub(super) fn expand_mates(
                     ang.to_radians().cos(),
                 ));
             }
+            MateKind::DirectedAngle {
+                direction_a,
+                direction_b,
+                axis_a,
+                angle_deg,
+            } => {
+                let da = unit_dir(*direction_a, "direction_a", &name)?;
+                let db = unit_dir(*direction_b, "direction_b", &name)?;
+                let axis = unit_dir(*axis_a, "axis_a", &name)?;
+                if da.dot(axis).abs() > 1e-8 {
+                    return Err(format!("{name}: axis_a must be perpendicular to direction_a"));
+                }
+                let ang = finite_scalar(*angle_deg, "angle_deg", &name)?;
+                atoms.push(Atom::DirAngle(
+                    LocalDir { body: ba, d: da },
+                    LocalDir { body: bb, d: db },
+                    LocalDir { body: ba, d: axis },
+                    ang.rem_euclid(360.0).to_radians(),
+                ));
+            }
             MateKind::Parallel {
                 direction_a,
                 direction_b,

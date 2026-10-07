@@ -31,6 +31,10 @@ pub struct UploadQuery {
 /// Stream a request body into the staging directory under the attachment
 /// limit. Workspace files arrive the same way.
 pub(crate) async fn receive(db: &Shared, headers: &HeaderMap, body: Body) -> Result<attach::Staged, Error> {
+    receive_with_empty(db, headers, body, false).await
+}
+
+pub(crate) async fn receive_with_empty(db: &Shared, headers: &HeaderMap, body: Body, allow_empty: bool) -> Result<attach::Staged, Error> {
     let mut upload = db.start_upload()?;
     let limit = db.security().config.attachment_limit();
     if let Some(length) = headers.get(header::CONTENT_LENGTH).and_then(|v| v.to_str().ok()).and_then(|v| v.parse::<u64>().ok()) {
@@ -46,7 +50,7 @@ pub(crate) async fn receive(db: &Shared, headers: &HeaderMap, body: Body) -> Res
         let chunk = chunk.map_err(|e| Error::bad_request(format!("the upload broke off: {e}")))?;
         upload.write(&chunk)?;
     }
-    upload.finish()
+    upload.finish_with_empty(allow_empty)
 }
 
 fn describe(headers: &HeaderMap, query: UploadQuery) -> Describe {
@@ -136,6 +140,10 @@ pub async fn list(
 
 #[derive(Debug, Deserialize, Default)]
 pub struct DownloadQuery {
+    #[serde(default)]
+    pub part: String,
+    #[serde(default)]
+    pub revision: String,
     /// Ask to see it in the browser; honoured only for the safe types.
     #[serde(default)]
     pub inline: bool,
@@ -169,7 +177,7 @@ pub async fn download(
     Query(query): Query<DownloadQuery>,
 ) -> Result<Response, Error> {
     require_user(&db, &headers)?;
-    let found = db.attachment(&id).ok_or_else(|| Error::not_found("attachment"))?;
+    let found = db.read(|state| attach::locate_scoped(state, &id, &query.part, &query.revision)).ok_or_else(|| Error::not_found("attachment"))?;
     let a = found.attachment;
     stream_blob(&db, &a.name, &a.media_type, &a.sha256, a.size, query.inline).await
 }
@@ -230,4 +238,29 @@ pub async fn remove(
     let user = require_author(&db, &headers)?;
     let gone = blocking(move || db.detach(&user, &id)).await?;
     Ok(Json(json!({ "ok": true, "removed": gone.attachment.id })))
+}
+
+/// Metadata and server-computed edit permission for a document tab.
+pub async fn info(State(db): State<Shared>, headers: HeaderMap, Path(id): Path<String>, Query(query): Query<DownloadQuery>) -> Result<Json<Value>, Error> {
+    let user = require_user(&db, &headers)?;
+    db.read(|state| {
+        let found = attach::locate_scoped(state, &id, &query.part, &query.revision).ok_or_else(|| Error::not_found("attachment"))?;
+        let permission = attach::attachment_writable(state, &user, &found);
+        Ok(Json(json!({ "attachment": found.attachment, "part_id": found.part_id, "part_number": found.number,
+            "revision_id": found.revision_id, "revision_label": found.revision_label,
+            "writable": permission.is_ok(), "read_only_reason": permission.err().map(|e| e.message).unwrap_or_default() })))
+    })
+}
+
+pub async fn replace(State(db): State<Shared>, headers: HeaderMap, Path(id): Path<String>, Query(query): Query<DownloadQuery>, body: Body) -> Result<Json<Value>, Error> {
+    let user = require_author(&db, &headers)?;
+    let expected = headers.get(header::IF_MATCH).and_then(|v| v.to_str().ok()).unwrap_or("").trim_matches('"').to_string();
+    if !attach::is_sha256(&expected) { return Err(Error::bad_request("saving an attachment requires its current If-Match hash")); }
+    db.read(|state| {
+        let found = attach::locate_scoped(state, &id, &query.part, &query.revision).ok_or_else(|| Error::not_found("attachment"))?;
+        attach::attachment_writable(state, &user, &found)
+    })?;
+    let staged = receive_with_empty(&db, &headers, body, true).await?;
+    let found = blocking(move || db.replace_attachment(&user, &id, &query.part, &query.revision, &expected, staged)).await?;
+    Ok(Json(json!({ "ok": true, "attachment": found.attachment })))
 }

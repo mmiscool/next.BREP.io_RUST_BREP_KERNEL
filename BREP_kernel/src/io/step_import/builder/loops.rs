@@ -1,11 +1,77 @@
 use super::*;
 
+fn finite_point(point: Vec3) -> bool {
+    point.x.is_finite() && point.y.is_finite() && point.z.is_finite()
+}
+
+/// A foot that can be compared: a finite distance and a finite point.
+fn usable_foot(foot: &crate::SurfaceProjection) -> bool {
+    foot.distance.is_finite() && finite_point(foot.point)
+}
+
+/// A maximum that cannot lose an unreadable value: once any value is not
+/// finite the reduction is NaN, reported as unreadable, never folded into a
+/// finite partial maximum by `f64::max`.
+fn fold_readable(worst: f64, value: f64) -> f64 {
+    if worst.is_nan() || !value.is_finite() {
+        f64::NAN
+    } else {
+        worst.max(value)
+    }
+}
+
+/// The nearer usable foot of `point` on `surface`: the global projector's, and Newton seeded at the
+/// trim's own `uv` (the image's parameter). Nearer means nearer the EDGE POINT; both are points OF
+/// the surface, so the nearer is still an upper bound on the true distance. Both feet take one
+/// admission: a finite distance and point and a finite (u, v) inside the surface's native domain
+/// (the seeded Newton is bounded to it; this checks the answer rather than trusting the bound). A
+/// tie keeps the global (legacy) foot. An unusable global foot does not block a usable seeded one;
+/// an unusable seed keeps a usable global foot exactly; with no usable foot, or an unreadable query
+/// point, the answer is `None` (unreadable). On a carrier that comes back near itself the global
+/// search can land on the far sheet; the seeded foot is then the nearer point.
+fn nearer_foot(
+    surface: &NurbsSurface,
+    point: Vec3,
+    global: crate::SurfaceProjection,
+    uv: Vec3,
+) -> Result<Option<crate::SurfaceProjection>, String> {
+    if !finite_point(point) {
+        return Ok(None);
+    }
+    // ONE admission for both feet: a finite distance and point, and a finite
+    // (u, v) inside the native domain.
+    let [u0, u1] = surface.domain_u()?;
+    let [v0, v1] = surface.domain_v()?;
+    let admitted = |foot: &crate::SurfaceProjection| {
+        usable_foot(foot) && foot.u.is_finite() && foot.v.is_finite() && (u0..=u1).contains(&foot.u) && (v0..=v1).contains(&foot.v)
+    };
+    let global = admitted(&global).then_some(global);
+    let mut seeded = None;
+    if uv.x.is_finite() && uv.y.is_finite() {
+        if let Ok(foot) = crate::project_point_to_surface_seeded(surface, point, uv.x, uv.y) {
+            if admitted(&foot) {
+                seeded = Some(foot);
+            }
+        }
+    }
+    // A tie keeps the global foot: the legacy reading stands unless the seed is
+    // strictly nearer.
+    Ok(match (global, seeded) {
+        (Some(global), Some(seeded)) => Some(if seeded.distance < global.distance { seeded } else { global }),
+        (global, seeded) => global.or(seeded),
+    })
+}
+
 /// The largest distance between `pcurve`'s image and the FOOT of the edge
-/// point it stands for (the edge point projected onto `surface`), over 1025
-/// evenly spaced fractions. The deviation from the edge point reads a
-/// tangential slip `d` at a station `g` off the carrier as only `d²/(2g)`;
-/// this reads it whole, and is what tells a file's residual (image on the
-/// feet) from a fitter's miss.
+/// point it stands for, over 1025 evenly spaced fractions, on the nearer
+/// usable foot ([`nearer_foot`]); the second value is the same read on the
+/// global projector's foot alone (the reading before 2026-10-04). The foot
+/// is chosen by its distance to the EDGE point, not to the image, so neither
+/// value bounds the other. Any unreadable station (query point, image or
+/// foot) makes that reading NaN ([`fold_readable`]). The deviation from the
+/// edge point reads a tangential slip `d` at a station `g` off the carrier as
+/// only `d²/(2g)`; this reads it whole, and is what tells a file's residual
+/// (image on the feet) from a fitter's miss.
 fn image_to_foot(
     surface: &NurbsSurface,
     pcurve: &NurbsCurve,
@@ -13,17 +79,26 @@ fn image_to_foot(
     t0: f64,
     t1: f64,
     forward: bool,
-) -> Result<f64, String> {
+) -> Result<(f64, f64), String> {
     let [p0, p1] = pcurve.domain()?;
-    let mut worst = 0.0_f64;
+    let (mut worst, mut worst_global) = (0.0_f64, 0.0_f64);
     for index in 0..=1024 {
         let fraction = index as f64 / 1024.0;
         let t = if forward { t0 + (t1 - t0) * fraction } else { t1 - (t1 - t0) * fraction };
-        let foot = crate::project_point_to_surface(surface, curve.evaluate(t)?)?;
+        let point = curve.evaluate(t)?;
+        let global = crate::project_point_to_surface(surface, point)?;
         let uv = pcurve.evaluate(p0 + (p1 - p0) * fraction)?;
-        worst = worst.max(surface.evaluate_extended(uv.x, uv.y)?.sub(foot.point).length());
+        let image = surface.evaluate_extended(uv.x, uv.y)?;
+        let readable_image = finite_point(image) && finite_point(point);
+        let global_read = if readable_image && usable_foot(&global) { image.sub(global.point).length() } else { f64::NAN };
+        worst_global = fold_readable(worst_global, global_read);
+        let chosen_read = match nearer_foot(surface, point, global, uv)? {
+            Some(foot) if readable_image => image.sub(foot.point).length(),
+            _ => f64::NAN,
+        };
+        worst = fold_readable(worst, chosen_read);
     }
-    Ok(worst)
+    Ok((worst, worst_global))
 }
 
 impl<'a> SolidBuilder<'a> {
@@ -141,6 +216,10 @@ impl<'a> SolidBuilder<'a> {
             let mut pcurve = match supplied {
                 Some(pcurve) => pcurve,
                 None => {
+                    // Every read below (the floor fit's challenger, the
+                    // keep's) projects the same edge points: memoized on
+                    // exact inputs, same answers.
+                    let _feet = crate::pcurve::FootMemoScope::open(surface);
                     // Fitted at the size-derived ask first, as the importer did
                     // until 2026-09-26: that is the refinement the corpus's
                     // off-carrier trims were built and tessellated at. A fit
@@ -161,9 +240,8 @@ impl<'a> SolidBuilder<'a> {
                         pcurve_tol,
                     )?;
                     let mut refitted = false;
-                    if fit.report.residual > trim_detector_bar(&fit.report)
-                        && pcurve_tol > crate::PCURVE_REFINEMENT_TOLERANCE
-                    {
+                    let deviation_trigger = fit.report.residual > trim_detector_bar(&fit.report);
+                    if deviation_trigger && pcurve_tol > crate::PCURVE_REFINEMENT_TOLERANCE {
                         let floor = crate::fit_pcurve_on_surface_range(
                             surface,
                             &edge.curve,
@@ -177,14 +255,38 @@ impl<'a> SolidBuilder<'a> {
                             refitted = true;
                         }
                     }
-                    if fit.report.residual > trim_detector_bar(&fit.report) {
+                    // The band-free read between the fit's stations
+                    // (`trim_floor_reading`): the residual at the pcurve's
+                    // knot-span quarter points and the edge curve's knot-span
+                    // midpoints, taken on EVERY derived trim so a miss the
+                    // fit's own grid cannot see (edge 237: 7.4e-4 inside a
+                    // 6e-5-wide knot span, read 6.8e-5 by the fit) is booked
+                    // as the band it is. The refit trigger above stays on the
+                    // fit's own residual: this read reports, it does not yet
+                    // act (2026-10-03).
+                    let floor = trim_floor_reading(surface, &fit.curve, &edge.curve, edge.t0, edge.t1, *forward, false)?;
+                    // NaN-preserving: an unread reading is reported, never
+                    // folded into a clean maximum.
+                    let residual = fold_reading(fit.report.residual, floor.residual);
+                    // A non-finite bar (an unread station standoff) is no bar:
+                    // `x <= inf` would suppress an unread trim.
+                    let bar = trim_detector_bar(&fit.report);
+                    if !(bar.is_finite() && residual <= bar) {
                         let report = fit.report;
-                        let image_to_foot =
+                        let (image_to_foot, image_to_global_foot) =
                             image_to_foot(surface, &fit.curve, &edge.curve, edge.t0, edge.t1, *forward)?;
-                        // Whose miss: the image sits on the stations' feet
-                        // (the residual is the file's curve standing off its
-                        // carrier) or it does not (the fitter's).
-                        let fitter = image_to_foot > crate::PCURVE_REFINEMENT_TOLERANCE;
+                        // The file curve's standoff BETWEEN the stations, on
+                        // the same grid the residual was read on; the bar's
+                        // standoff term is the larger of it and the nodes'.
+                        let between = trim_floor_reading(
+                            surface, &fit.curve, &edge.curve, edge.t0, edge.t1, *forward, true,
+                        )?;
+                        let standoff = fold_reading(report.off_surface, between.standoff);
+                        // Whose miss: the residual is within the floor of the
+                        // file curve's own standoff (the file's), or over it
+                        // (the fitter's).
+                        // Unread (NaN) is not exempted as the file's.
+                        let fitter = !(residual <= crate::PCURVE_REFINEMENT_TOLERANCE + standoff);
                         // Accepted whatever it reads, and named: the importer
                         // before the bar returned this fit unmeasured, so a
                         // refusal here loses a body it imported. `abc 00008080`
@@ -196,24 +298,41 @@ impl<'a> SolidBuilder<'a> {
                             face_ref,
                             surface_ref,
                             edge_id: *edge_id,
-                            residual: report.residual,
-                            standoff: report.off_surface,
+                            residual,
+                            standoff,
+                            fit_residual: report.residual,
+                            fit_standoff: report.off_surface,
                             image_to_foot,
+                            image_to_global_foot,
                             samples: report.samples,
                             exit: format!("{:?}", report.exit),
                             fitter,
+                            clamped_excursion: report.clamped_excursion,
+                            clamped_distance: report.clamped_distance,
                         });
                         self.capture_stage(*edge_id, || {
                             format!(
-                                "trim off its bar on face #{face_ref}: {:.3e} against a floor of {:.1e}, the file's curve {:.3e} off the carrier, image {:.3e} off its feet ({}; {:?} at {} samples{})",
-                                report.residual,
+                                "trim off its bar on face #{face_ref}: {:.3e} against a floor of {:.1e}, the file's curve {:.3e} off the carrier, image {:.3e} off its feet, {:.3e} off the global projector's ({}; {:?} at {} samples{}{}; the fit read {:.3e} with its stations {:.3e} off; the reading is the maximum at {} sampled probes, not a certified maximum)",
+                                residual,
                                 crate::PCURVE_REFINEMENT_TOLERANCE,
-                                report.off_surface,
+                                standoff,
                                 image_to_foot,
+                                image_to_global_foot,
                                 if fitter { "the fitter's miss" } else { "the file's residual" },
                                 report.exit,
                                 report.samples,
-                                if refitted { ", refitted at the floor" } else { "" }
+                                if refitted { ", refitted at the floor" } else { "" },
+                                if report.clamped_excursion > 0.0 {
+                                    format!(
+                                        "; clamped into the chart by {:.3e} in parameter, {:.3e} mm",
+                                        report.clamped_excursion, report.clamped_distance
+                                    )
+                                } else {
+                                    String::new()
+                                },
+                                report.residual,
+                                report.off_surface,
+                                floor.probes,
                             )
                         });
                     }

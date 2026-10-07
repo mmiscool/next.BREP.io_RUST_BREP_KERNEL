@@ -38,7 +38,7 @@ static BUTTONS: &[WorkbenchButton] = &[WorkbenchButton {
     // (U+1F5CE) it used to draw: that is the Note annotation's icon, and the
     // strip puts the two side by side.
     glyph: "\u{E076}",
-    tooltip: "Capture a PMI view (camera + visibility) and start annotating it",
+    ribbon_path: "Home/Annotations/Capture a PMI view", size: crate::workbench::CommandSize::Compact, tooltip: "Capture a PMI view (camera + visibility) and start annotating it",
     when: None,
     pressed: None,
     disabled: None,

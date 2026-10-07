@@ -15,7 +15,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use super::{blocking, require_user, Shared};
-use crate::review::{Inbox, RevisionReview, RoundChange, Submission};
+use crate::review::{RevisionReview, RoundChange, Submission};
 use crate::model::Verdict;
 use crate::Error;
 
@@ -151,7 +151,13 @@ pub async fn comment(
 }
 
 /// `GET /api/inbox` — what is waiting on the caller, and what they submitted.
-pub async fn inbox(State(db): State<Shared>, headers: HeaderMap) -> Result<Json<Inbox>, Error> {
+pub async fn inbox(State(db): State<Shared>, headers: HeaderMap) -> Result<Json<Value>, Error> {
     let user = require_user(&db, &headers)?;
-    Ok(Json(db.inbox(&user)))
+    let mut output = serde_json::to_value(db.inbox(&user)).map_err(Error::internal)?;
+    let tasks = db.read(|s|crate::workflow::inbox(s,&user));
+    output["count"] = json!(output["count"].as_u64().unwrap_or(0) + tasks.len() as u64);
+    output["waiting_on_me"].as_array_mut().unwrap().extend(tasks);
+    let submitted = db.read(|s|s.workflow_runs.iter().filter(|r|r.initiator==user.id).map(|r|json!({"kind":"workflow","target":r.id,"node":"","title":r.title,"name":r.definition.name,"approvals":0,"required_approvals":0,"due":0,"overdue":false,"state":r.state})).collect::<Vec<_>>());
+    output["submitted"].as_array_mut().unwrap().extend(submitted);
+    Ok(Json(output))
 }

@@ -140,7 +140,7 @@ pub fn eco_subject_hash(state: &State, eco: &crate::model::ChangeOrder) -> Strin
                 .and_then(|p| p.revision(&item.revision_id))
                 .map(|r| r.content_hash.clone())
                 .unwrap_or_default();
-            format!("{}={}", item.revision_id, hash)
+            serde_json::json!([item.part_id, item.revision_id, hash]).to_string()
         })
         .collect();
     lines.sort();
@@ -163,7 +163,7 @@ pub fn document_changed(state: &mut State, part_id: &str, revision_id: &str) {
         .change_orders
         .iter()
         .enumerate()
-        .filter(|(_, eco)| eco.state.is_open() && eco.items.iter().any(|i| i.revision_id == revision_id))
+        .filter(|(_, eco)| eco.state.is_open() && eco.items.iter().any(|i| i.part_id == part_id && i.revision_id == revision_id))
         .filter(|(_, eco)| eco.reviews.last().is_some_and(|r| r.is_live()))
         .map(|(i, _)| i)
         .collect();
@@ -813,6 +813,7 @@ impl Db {
         revision_id: &str,
         submission: &Submission,
     ) -> Result<Vec<String>, Error> {
+        lifecycle::check_enabled(&self.settings(), Lifecycle::InReview)?;
         let (part, revision) = self.snapshot(part_id, revision_id)?;
         lifecycle::check_transition(revision.lifecycle, Lifecycle::InReview).map_err(Error::conflict)?;
         self.read(|state| submit_lock_gate(state, user, &part.number, &revision))?;
@@ -886,6 +887,7 @@ impl Db {
         let note = submission.note.clone();
         let author = user.clone();
         self.mutate(move |state| {
+            lifecycle::check_enabled(&state.settings, Lifecycle::InReview)?;
             // Again inside the lock: someone may have checked it out since.
             let (number, snapshot) = {
                 let part = state.part(part_id).ok_or_else(|| Error::not_found("part"))?;

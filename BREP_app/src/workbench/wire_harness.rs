@@ -55,7 +55,7 @@ static BUTTONS: &[WorkbenchButton] = &[WorkbenchButton {
     id: DECLARE_POINT_BUTTON_ID,
     // U+22C8 ⋈ — a socket, a bar and a pin row: a connector seen end on.
     glyph: "\u{22C8}",
-    tooltip: "Declare connection point",
+    ribbon_path: "Home/Wire Harness/Declare connection point", size: crate::workbench::CommandSize::Compact, tooltip: "Declare connection point",
     when: Some(declares_none),
     pressed: None,
     disabled: None,

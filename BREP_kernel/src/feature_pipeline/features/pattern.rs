@@ -445,6 +445,8 @@ pub fn schema() -> serde_json::Value {
     "type": "PATTERN",
     "shortName": "PATTERN",
     "longName": "Pattern",
+    "ribbonPath": "Home/Pattern/Pattern",
+    "commandSize": "Compact",
     "displayBuilder": false,
     "inputParamsSchema": {
         "id": {

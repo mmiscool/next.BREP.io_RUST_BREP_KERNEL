@@ -15,7 +15,7 @@ under:
 - `stl_conversion` for recognition, hybrid/faceted fallback, and validated AP214 STEP
   serialization.
 
-It is a library-only package, version 0.4.0. The kernel dependency is pinned
-EXACTLY (`BREP_kernel = "=0.7.0"`), so the two move in lockstep; it also depends on
+It is a library-only package, version 0.5.0. The kernel dependency is pinned
+EXACTLY (`BREP_kernel = "=0.8.0"`), so the two move in lockstep; it also depends on
 `BREP_RANSAC`, `serde` and `serde_json`. Licence: the Autodrop3d licence in
 `LICENSE.md`, shipped in the crate.

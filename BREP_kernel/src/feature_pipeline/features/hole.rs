@@ -645,6 +645,8 @@ pub fn schema() -> serde_json::Value {
     "type": "H",
     "shortName": "H",
     "longName": "Hole",
+    "ribbonPath": "Home/Modeling/Hole",
+    "commandSize": "Compact",
     "displayBuilder": false,
     "inputParamsSchema": {
         "id": {

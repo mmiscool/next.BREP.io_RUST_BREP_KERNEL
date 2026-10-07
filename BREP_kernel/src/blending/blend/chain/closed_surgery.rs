@@ -330,65 +330,187 @@ pub(super) fn chain_surgery(
                     first_chain.forward == segments[segment_index].forward
                 };
                 side_use_forward[side] = chain_forward;
+                // EACH SEAM-BOUNDED RUN IS BUILT BY ITS TOPOLOGY, not by which
+                // segment a piece's parameter window is nearest. The rail is
+                // offset from the edge it replaces, so it crosses a carrier seam
+                // where the edge did not (the 20-degree seam-split chain's fat rail
+                // crosses inside segment 0): assigning pieces to runs by segment
+                // spliced a piece into the wrong run and left the loop open. A run
+                // starts at the END vertex and uv of the carrier coedge before it
+                // and must arrive at the START vertex and uv of the one after; each
+                // step takes the one unused piece of this face whose run-sense start
+                // vertex is the current vertex AND whose projected start uv is the
+                // current uv. A run never jumps a period: only the carrier's own
+                // seam coedges carry the shift. Continuity is read at the kernel's
+                // pcurve-consistency contract turned into a uv band at the point
+                // (`surface_uv_tolerance`). That band is the SPATIAL bar; which
+                // chart branch a joint sits on is a separate check
+                // (`uv_joint_continuous`): strict raw uv never accepts a jump of
+                // half a closed period or more, however large the band (the
+                // derivative floor makes it huge at a pole).
+                let spatial = crate::KernelTolerances::for_solid(solid, 1e-7).pcurve_consistency;
+                let uv_unreadable = |why: String| {
+                    KernelRefusal::internal(KernelStage::Sew, "chain_seam_run", format!(
+                        "blend: a seam-split rim's uv on face {face_id} is unreadable: {why}"
+                    ))
+                };
+                let uv_band = |uv: [f64; 2]| -> Result<f64, KernelRefusal> {
+                    if !uv.iter().all(|value| value.is_finite()) {
+                        return Err(uv_unreadable(format!("uv ({}, {})", uv[0], uv[1])));
+                    }
+                    let derivatives = surface.derivatives_extended(uv[0], uv[1], 1).or_refuse(KernelStage::Sew, "derivatives_extended")?;
+                    checked_uv_band(spatial, derivatives[1][0].length(), derivatives[0][1].length()).map_err(uv_unreadable)
+                };
+                let edge_vertices = |edge_id: u64| -> Result<(u64, u64), KernelRefusal> {
+                    result
+                        .edges
+                        .iter()
+                        .find(|edge| edge.id == edge_id)
+                        .map(|edge| (edge.start_vertex_id, edge.end_vertex_id))
+                        .ok_or(KernelRefusal::internal(KernelStage::Sew, "support_piece_edge", "blend: support piece edge lost"))
+                };
+                let pcurve_end = |pcurve: &crate::NurbsCurve, at_start: bool| -> Result<[f64; 2], KernelRefusal> {
+                    let [t0, t1] = pcurve.domain().or_refuse(KernelStage::Sew, "domain")?;
+                    let uv = pcurve.evaluate(if at_start { t0 } else { t1 }).or_refuse(KernelStage::Sew, "evaluate")?;
+                    Ok([uv.x, uv.y])
+                };
+                // A coedge's (start vertex, start uv, end vertex, end uv) in loop sense.
+                let coedge_ends = |coedge: &CoedgeRecord| -> Result<(u64, [f64; 2], u64, [f64; 2]), KernelRefusal> {
+                    let (start, end) = edge_vertices(coedge.edge_id)?;
+                    let (start, end) = if coedge.forward { (start, end) } else { (end, start) };
+                    Ok((start, pcurve_end(&coedge.pcurve, true)?, end, pcurve_end(&coedge.pcurve, false)?))
+                };
+                // This face's pieces (the same face association as before: the
+                // pieces of the segments the face carries), each projected once —
+                // the projection is a pure function of the piece — and oriented
+                // to the loop's sense.
+                let face_segments: HashSet<usize> = edge_to_segment.values().copied().collect();
+                let mut pool: Vec<(&RimPiece, u64, u64, crate::NurbsCurve)> = Vec::new();
+                for piece in pieces.iter().filter(|piece| face_segments.contains(&piece_segment(piece))) {
+                    let curve = result
+                        .edges
+                        .iter()
+                        .find(|edge| edge.id == piece.edge_id)
+                        .ok_or(KernelRefusal::internal(KernelStage::Sew, "support_piece_edge", "blend: support piece edge lost"))?
+                        .curve
+                        .clone();
+                    let (start_vertex, end_vertex) = edge_vertices(piece.edge_id)?;
+                    let base = project_piece_pcurve(
+                        &curve,
+                        &surface,
+                        crossing_set.contains(&start_vertex),
+                        crossing_set.contains(&end_vertex),
+                    )?;
+                    let (from, to, pcurve) = if chain_forward {
+                        (start_vertex, end_vertex, base)
+                    } else {
+                        (end_vertex, start_vertex, base.reversed().or_refuse(KernelStage::Refine, "reversed")?)
+                    };
+                    pool.push((piece, from, to, pcurve));
+                }
+                // The surface's actual closed periods. Read after every piece is
+                // projected: `project_piece_pcurve` (and `derivatives_extended`)
+                // read the same three on this surface first, so these reads add
+                // no refusal of their own. An empty pool projected nothing, and
+                // its first run is `Stuck` before any joint is read, so the
+                // periods are not read there either.
+                let periods: [Option<f64>; 2] = if pool.is_empty() {
+                    [None, None]
+                } else {
+                    let (closed_u, closed_v) = surface.closed_directions().or_refuse(KernelStage::Sew, "closed_directions")?;
+                    let [u0, u1] = surface.domain_u().or_refuse(KernelStage::Sew, "domain_u")?;
+                    let [v0, v1] = surface.domain_v().or_refuse(KernelStage::Sew, "domain_v")?;
+                    [closed_u.then_some(u1 - u0), closed_v.then_some(v1 - v0)]
+                };
+                let joint = |a: [f64; 2], b: [f64; 2], rule: UvJoint| -> Result<bool, KernelRefusal> {
+                    uv_joint_continuous(a, b, uv_band(a)?, periods, rule).map_err(uv_unreadable)
+                };
+                let same_uv = |a: [f64; 2], b: [f64; 2]| -> Result<bool, KernelRefusal> { joint(a, b, UvJoint::Strict) };
+                let mut used = vec![false; pool.len()];
+                // Each piece's run-sense ends, read once for every run's walk.
+                let entries: Vec<(u64, u64, [f64; 2], [f64; 2])> = pool
+                    .iter()
+                    .map(|(_, from, to, pcurve)| Ok((*from, *to, pcurve_end(pcurve, true)?, pcurve_end(pcurve, false)?)))
+                    .collect::<Result<_, KernelRefusal>>()?;
+                let decline = |why: String| {
+                    KernelRefusal::internal(KernelStage::Sew, "chain_seam_run", format!(
+                        "blend: the seam-split rim's support pieces on face {face_id} do not close its loop: {why}"
+                    ))
+                };
                 let mut new_coedges: Vec<CoedgeRecord> = Vec::new();
+                // Parallel to `new_coedges`: whether the coedge is a newly walked
+                // piece (true) or the loop's own untouched carrier coedge (false).
+                let mut walked_coedges: Vec<bool> = Vec::new();
                 let mut position = 0;
                 while position < count {
                     if !is_chain(&rotated[position]) {
                         new_coedges.push(rotated[position].clone());
+                        walked_coedges.push(false);
                         position += 1;
                         continue;
                     }
-                    // A maximal run of chain coedges (bounded by carrier
-                    // seams); gather the segments it covers.
-                    let mut run_segments: HashSet<usize> = HashSet::default();
+                    // A maximal run of chain coedges (bounded by carrier seams).
+                    let _run_start = position;
                     while position < count && is_chain(&rotated[position]) {
-                        run_segments.insert(edge_to_segment[&rotated[position].edge_id]);
                         position += 1;
                     }
-                    // The support pieces covering those segments, +param.
-                    let mut run_pieces: Vec<&RimPiece> = pieces
-                        .iter()
-                        .filter(|piece| run_segments.contains(&piece_segment(piece)))
-                        .collect();
-                    run_pieces.sort_by(|a, b| a.window[0].total_cmp(&b.window[0]));
-                    // A run spanning the blend seam owns both the first and
-                    // the last piece — rotate them contiguous.
-                    if run_pieces.len() > 1
-                        && (run_pieces[0].window[0] - u_start).abs() < 1e-9
-                        && (run_pieces[run_pieces.len() - 1].window[1] - u_end).abs() < 1e-9
-                    {
-                        let shift = run_pieces.len() - 1;
-                        run_pieces.rotate_left(shift);
+                    let previous = new_coedges.last().ok_or_else(|| decline("a run has no carrier coedge before it".into()))?;
+                    let (_, _, vertex, uv) = coedge_ends(previous)?;
+                    let (target_vertex, target_uv, _, _) = coedge_ends(&rotated[position % count])?;
+                    #[cfg(not(test))]
+                    let legacy: Option<Vec<usize>> = None;
+                    let walked = match legacy {
+                        Some(order) => {
+                            for &index in &order {
+                                used[index] = true;
+                            }
+                            RunWalk::Path(order)
+                        }
+                        None => walk_seam_run(&entries, &mut used, (vertex, uv), (target_vertex, target_uv), &same_uv)?,
+                    };
+                    match walked {
+                        RunWalk::Path(path) => {
+                            for index in path {
+                                let (piece, _, _, pcurve) = &pool[index];
+                                new_coedges.push(CoedgeRecord {
+                                    id: take_id(),
+                                    edge_id: piece.edge_id,
+                                    forward: chain_forward,
+                                    pcurve: pcurve.clone(),
+                                });
+                                walked_coedges.push(true);
+                            }
+                        }
+                        RunWalk::Ambiguous(at, candidates) => {
+                            return Err(KernelRefusal::unsupported(KernelStage::Classify, "chain_cross_edges", format!(
+                                "blend: {} support pieces (edges {:?}) leave chain vertex {at} at the same uv on face {face_id}",
+                                candidates.len(),
+                                candidates.iter().map(|&i| pool[i].0.edge_id).collect::<Vec<_>>()
+                            )));
+                        }
+                        RunWalk::Stuck(at, at_uv) => {
+                            return Err(decline(format!(
+                                "no unused piece leaves vertex {at} at uv ({:.9}, {:.9})", at_uv[0], at_uv[1]
+                            )));
+                        }
                     }
-                    if !chain_forward {
-                        run_pieces.reverse();
-                    }
-                    for piece in run_pieces {
-                        let (curve, start_vertex, end_vertex) = {
-                            let edge = result
-                                .edges
-                                .iter()
-                                .find(|edge| edge.id == piece.edge_id)
-                                .ok_or(KernelRefusal::internal(KernelStage::Sew, "support_piece_edge", "blend: support piece edge lost"))?;
-                            (edge.curve.clone(), edge.start_vertex_id, edge.end_vertex_id)
-                        };
-                        let base = project_piece_pcurve(
-                            &curve,
-                            &surface,
-                            crossing_set.contains(&start_vertex),
-                            crossing_set.contains(&end_vertex),
-                        )?;
-                        new_coedges.push(CoedgeRecord {
-                            id: take_id(),
-                            edge_id: piece.edge_id,
-                            forward: chain_forward,
-                            pcurve: if chain_forward {
-                                base
-                            } else {
-                                base.reversed().or_refuse(KernelStage::Refine, "reversed")?
-                            },
-                        });
-                    }
+                }
+                if let Some(index) = used.iter().position(|used| !used) {
+                    return Err(decline(format!("support piece edge {} is left out of every run", pool[index].0.edge_id)));
+                }
+                // The rebuilt loop closes at every joint: in vertex everywhere; in
+                // STRICT raw uv at every joint that touches a walked piece; and,
+                // at a joint between two untouched carrier coedges, in uv modulo
+                // only the surface's actual closed periods (an untouched loop may
+                // already cross its own chart edge there).
+                let ends: Vec<(u64, [f64; 2], u64, [f64; 2])> =
+                    new_coedges.iter().map(&coedge_ends).collect::<Result<_, KernelRefusal>>()?;
+                if let Some(index) = first_open_joint(&ends, &walked_coedges, &joint)? {
+                    return Err(decline(format!(
+                        "the rebuilt loop is open between its coedges {} and {}",
+                        new_coedges[index].id,
+                        new_coedges[(index + 1) % new_coedges.len()].id
+                    )));
                 }
                 let face = result
                     .shells
@@ -814,7 +936,7 @@ pub(super) fn chain_surgery(
 /// and reading both off the same sampler makes that true by measurement rather
 /// than by a convention this surgery would otherwise have to restate (it winds
 /// the outer loop two different ways already).
-fn signed_area(coedges: &[CoedgeRecord]) -> Result<f64, KernelRefusal> {
+pub(in crate::blend) fn signed_area(coedges: &[CoedgeRecord]) -> Result<f64, KernelRefusal> {
     const SAMPLES: usize = 24;
     let mut twice_area = 0.0;
     for coedge in coedges {
@@ -831,3 +953,140 @@ fn signed_area(coedges: &[CoedgeRecord]) -> Result<f64, KernelRefusal> {
     }
     Ok(0.5 * twice_area)
 }
+
+/// How one seam-bounded run of a carrier loop is filled.
+#[derive(Debug, PartialEq)]
+pub(in crate::blend) enum RunWalk {
+    /// The pool indices, in loop order, from the run's start to its target.
+    Path(Vec<usize>),
+    /// Two or more unused pieces leave this vertex at the same uv.
+    Ambiguous(u64, Vec<usize>),
+    /// No unused piece leaves this vertex at this uv (the target unreached).
+    Stuck(u64, [f64; 2]),
+}
+
+/// Fill one seam-bounded run by its topology: from `start` (vertex, uv), take
+/// at each step the ONE unused entry (from vertex, to vertex, start uv, end uv)
+/// whose from-vertex is the current vertex and whose start uv is the current
+/// uv under `same`, until the current vertex and uv are `target`'s (after at
+/// least one entry). Never a first-found pick: two matches are `Ambiguous`.
+/// `used` is updated only for a completed path.
+pub(in crate::blend) fn walk_seam_run(
+    entries: &[(u64, u64, [f64; 2], [f64; 2])],
+    used: &mut [bool],
+    start: (u64, [f64; 2]),
+    target: (u64, [f64; 2]),
+    same: &dyn Fn([f64; 2], [f64; 2]) -> Result<bool, KernelRefusal>,
+) -> Result<RunWalk, KernelRefusal> {
+    let mut taken = used.to_vec();
+    let (mut vertex, mut uv) = start;
+    let mut path = Vec::new();
+    loop {
+        if !path.is_empty() && vertex == target.0 && same(uv, target.1)? {
+            used.copy_from_slice(&taken);
+            return Ok(RunWalk::Path(path));
+        }
+        let mut matches = Vec::new();
+        for (index, (from, _, start_uv, _)) in entries.iter().enumerate() {
+            if !taken[index] && *from == vertex && same(uv, *start_uv)? {
+                matches.push(index);
+            }
+        }
+        match matches.as_slice() {
+            [one] => {
+                taken[*one] = true;
+                path.push(*one);
+                vertex = entries[*one].1;
+                uv = entries[*one].3;
+            }
+            [] => return Ok(RunWalk::Stuck(vertex, uv)),
+            _ => return Ok(RunWalk::Ambiguous(vertex, matches)),
+        }
+    }
+}
+
+/// The first joint (coedge `index` -> `index + 1`, cyclic) of a rebuilt loop
+/// that is open, from each coedge's (start vertex, start uv, end vertex, end
+/// uv) and whether it is a walked piece. Vertex continuity is required at
+/// EVERY joint; a joint touching a walked piece is read [`UvJoint::Strict`],
+/// one between two untouched carrier coedges [`UvJoint::ModuloClosedPeriods`].
+pub(in crate::blend) fn first_open_joint(
+    ends: &[(u64, [f64; 2], u64, [f64; 2])],
+    walked: &[bool],
+    joint: &dyn Fn([f64; 2], [f64; 2], UvJoint) -> Result<bool, KernelRefusal>,
+) -> Result<Option<usize>, KernelRefusal> {
+    for index in 0..ends.len() {
+        let next = (index + 1) % ends.len();
+        let rule = if walked[index] || walked[next] { UvJoint::Strict } else { UvJoint::ModuloClosedPeriods };
+        if ends[index].2 != ends[next].0 || !joint(ends[index].3, ends[next].1, rule)? {
+            return Ok(Some(index));
+        }
+    }
+    Ok(None)
+}
+
+/// Which chart branches two uv readings at one loop joint may sit on.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(in crate::blend) enum UvJoint {
+    /// Raw uv only: never a jump of half a closed period or more, whatever
+    /// the band. Every walk step, and every joint touching a walked piece.
+    Strict,
+    /// Raw uv up to whole multiples of the surface's ACTUAL closed periods;
+    /// a component the surface is not closed in stays raw. Only a joint
+    /// between two untouched carrier coedges.
+    ModuloClosedPeriods,
+}
+
+/// The spatial bar turned into a uv band at a point whose derivative
+/// magnitudes are `du`, `dv` — refusing an unreadable derivative or band
+/// BEFORE `surface_uv_tolerance`'s min/max (`f64::min` would drop a NaN and
+/// return the other derivative's band).
+pub(in crate::blend) fn checked_uv_band(spatial: f64, du: f64, dv: f64) -> Result<f64, String> {
+    if !(spatial.is_finite() && du.is_finite() && dv.is_finite()) {
+        return Err(format!("derivative magnitudes ({du}, {dv}) at spatial bar {spatial}"));
+    }
+    let band = crate::tolerance::surface_uv_tolerance(spatial, du, dv);
+    if !(band.is_finite() && band >= 0.0) {
+        return Err(format!("uv band {band}"));
+    }
+    Ok(band)
+}
+
+/// Chart-branch continuity of `a` -> `b` at one loop joint, separate from the
+/// spatial distance `band` (the spatial bar as uv at `a`). Every input must be
+/// finite (a period also positive) or the reading is refused, never compared.
+/// Under [`UvJoint::Strict`] a component the surface is closed in with a jump
+/// of half its period or more is discontinuous whatever `band` says: at a
+/// pole the derivative floor makes the band span whole periods, and a large
+/// band must never authorise a wrap.
+pub(in crate::blend) fn uv_joint_continuous(
+    a: [f64; 2],
+    b: [f64; 2],
+    band: f64,
+    periods: [Option<f64>; 2],
+    rule: UvJoint,
+) -> Result<bool, String> {
+    if !(a.iter().chain(&b).all(|value| value.is_finite()) && band.is_finite() && band >= 0.0) {
+        return Err(format!("uv ({}, {}) -> ({}, {}) at band {band}", a[0], a[1], b[0], b[1]));
+    }
+    if let Some(period) = periods.iter().flatten().find(|period| !(period.is_finite() && **period > 0.0)) {
+        return Err(format!("closed period {period}"));
+    }
+    let mut continuous = true;
+    for direction in 0..2 {
+        let mut jump = b[direction] - a[direction];
+        if let Some(period) = periods[direction] {
+            let turns = (jump / period).round();
+            match rule {
+                UvJoint::Strict if turns != 0.0 => continuous = false,
+                UvJoint::Strict => {}
+                UvJoint::ModuloClosedPeriods => jump -= turns * period,
+            }
+        }
+        if !(jump.abs() <= band) {
+            continuous = false;
+        }
+    }
+    Ok(continuous)
+}
+

@@ -23,7 +23,6 @@
 //! [`Workspaces`], which S1's client implements ([`PlmWorkspaces`]); the golden tests below
 //! run it against the REAL router. Nothing here is constructed without a server.
 
-use crate::automation::hit_keys::HitKeyDoc;
 use crate::plm::PlmFuture;
 use eframe::egui;
 use serde::Deserialize;
@@ -33,21 +32,6 @@ use std::task::Waker;
 
 use super::plm_attachments::{human_size, media_type_for, Attachment};
 use super::plm_parts::Pending;
-
-/// Hit keys the browser publishes, under the host's prefix (`<prefix>ws:…`).
-pub const HIT_KEYS: &[HitKeyDoc] = &[
-    HitKeyDoc { panel: "plm_workspace", prefix: "ws:entry:", meaning: "a workspace row, by entry name; click selects, double click opens a folder, a link's document or a file", command: None },
-    HitKeyDoc { panel: "plm_workspace", prefix: "ws:crumb:", meaning: "the breadcrumb: ws:crumb:0 is the top of the workspace", command: None },
-    HitKeyDoc { panel: "plm_workspace", prefix: "ws:owner", meaning: "whose workspace is shown (yours, or another user's, read-only)", command: None },
-    HitKeyDoc { panel: "plm_workspace", prefix: "ws:open-", meaning: "open by number: ws:open-part, ws:open-revision, ws:open-go", command: None },
-    HitKeyDoc { panel: "plm_workspace", prefix: "ws:new-folder", meaning: "New folder: ws:new-folder-name then ws:new-folder", command: None },
-    HitKeyDoc { panel: "plm_workspace", prefix: "ws:link-", meaning: "Link a part here: ws:link-part, ws:link-revision (empty follows the newest), ws:link-go", command: None },
-    HitKeyDoc { panel: "plm_workspace", prefix: "ws:sel:", meaning: "the selected entry's verbs: open, rename, rename-name, rename-go, cut, delete, delete-confirm, pin, follow, versions, download, promote, promote-part, promote-revision, promote-go", command: None },
-    HitKeyDoc { panel: "plm_workspace", prefix: "ws:paste", meaning: "move the cut entry into the folder shown", command: None },
-    HitKeyDoc { panel: "plm_workspace", prefix: "ws:version:", meaning: "a file's version row: ws:version:<n>:restore, ws:version:<n>:download", command: None },
-    HitKeyDoc { panel: "plm_workspace", prefix: "ws:reload", meaning: "reload the folder", command: None },
-    HitKeyDoc { panel: "plm_workspace", prefix: "ws:add-file", meaning: "Add file…: choose a file on this machine (the file chooser) to add to the folder shown", command: Some("file_pick") },
-];
 
 // --- the wire ------------------------------------------------------------------
 //
@@ -377,7 +361,7 @@ pub fn key_of(name: &str) -> Option<String> {
     match segments.as_slice() {
         ["part", part, "rev", revision] if !part.is_empty() && !revision.is_empty() => {
             let revision = revision.split('.').next().unwrap_or(revision);
-            (!revision.is_empty()).then(|| format!("part/{part}/rev/{revision}"))
+            (!revision.is_empty()).then(|| crate::plm::identity::document_key(&part, &revision))
         }
         _ => None,
     }
@@ -482,6 +466,7 @@ pub struct WorkspaceBrowser {
     thumbnails: crate::plm::thumbnail_view::ThumbnailCache,
     /// Whether the host has a file chooser: "Add file…" beside drag and drop.
     pub can_pick_files: bool,
+    pub browse_only: bool,
     /// "Add file…" was pressed this frame.
     pick_asked: bool,
     /// Whose workspace: empty is the signed-in user's own.
@@ -541,6 +526,7 @@ impl WorkspaceBrowser {
             session: None,
             thumbnails: Default::default(),
             can_pick_files: false,
+            browse_only: false,
             pick_asked: false,
             owner: String::new(),
             owner_label: "My workspace".into(),
@@ -587,7 +573,7 @@ impl WorkspaceBrowser {
 
     /// Another user's workspace: browse only.
     pub fn read_only(&self) -> bool {
-        !self.owner.is_empty()
+        self.browse_only || !self.owner.is_empty()
     }
 
     pub fn busy(&self) -> bool {
@@ -602,13 +588,11 @@ impl WorkspaceBrowser {
 
     /// Ask again for the folder shown, and for whose workspaces may be opened.
     pub fn reload(&mut self, plm: &dyn Workspaces) {
-        self.thumbnails.clear();
         self.list_pending = Some(Pending::new(plm.folder(&self.owner, self.current_folder())));
         self.owners_pending = Some(Pending::new(plm.workspaces()));
     }
 
     fn reload_folder(&mut self, plm: &dyn Workspaces) {
-        self.thumbnails.clear();
         self.list_pending = Some(Pending::new(plm.folder(&self.owner, self.current_folder())));
     }
 
@@ -862,6 +846,11 @@ impl WorkspaceBrowser {
                     self.entries = Some(entries);
                 }
                 Err(problem) => {
+                    // The rows stay up while a reload is in flight, but not past
+                    // its refusal: a listing the server would not give (a
+                    // workspace made private under a viewer) is not shown from
+                    // memory either (plan S14; `workspaces_browsable` off).
+                    if self.selected.is_some() { self.selection_cleared(); }
                     self.entries = Some(Vec::new());
                     self.problem = Some(problem);
                 }
@@ -988,8 +977,10 @@ impl WorkspaceBrowser {
             if self.session.as_ref().is_some_and(|old| !std::rc::Rc::ptr_eq(old, &client)) {
                 // The Open modal reuses this browser across connections too.
                 let can_pick_files = self.can_pick_files;
+                let browse_only = self.browse_only;
                 *self = Self::new();
                 self.can_pick_files = can_pick_files;
+                self.browse_only = browse_only;
             }
             self.session = Some(client);
         }
@@ -1056,6 +1047,17 @@ impl WorkspaceBrowser {
         }
     }
 
+    /// The Revision field's width, the SAME for the text box shown before a
+    /// lookup answers and the combo shown after. The widgets are drawn in
+    /// one row with the Open button to their right, and the lookup answers
+    /// asynchronously — a click already pressed on Open while the field was
+    /// the 60 pt text box released on a combo 100 pt wide (egui's default)
+    /// that had pushed the button 40 pt to the right; egui saw a press on one
+    /// widget and a release on another, and nothing opened (2026-10-03, the
+    /// open-by-number scripts). A width shared by both widgets keeps the
+    /// button where the pointer is.
+    const REVISION_FIELD_WIDTH: f32 = 80.0;
+
     fn open_row(&mut self, ui: &mut egui::Ui, plm: &dyn Workspaces, prefix: &str, outcome: &mut WorkspaceOutcome) {
         ui.horizontal(|ui| {
             ui.label("Part");
@@ -1072,10 +1074,14 @@ impl WorkspaceBrowser {
                 .map(|p| p.revision_views.iter().map(|r| (r.label.clone(), format!("{} ({})", r.label, r.lifecycle))).collect())
                 .unwrap_or_default();
             let revision = if labels.is_empty() {
-                ui.add(egui::TextEdit::singleline(&mut self.open_revision).desired_width(60.0).hint_text("newest"))
+                ui.add_sized(
+                    [Self::REVISION_FIELD_WIDTH, ui.spacing().interact_size.y],
+                    egui::TextEdit::singleline(&mut self.open_revision).hint_text("newest"),
+                )
             } else {
                 let text = self.open_revision.clone();
                 egui::ComboBox::from_id_salt((prefix, "ws-open-revision"))
+                    .width(Self::REVISION_FIELD_WIDTH)
                     .selected_text(text)
                     .show_ui(ui, |ui| {
                         for (label, shown) in labels.iter().rev() {
@@ -1162,12 +1168,11 @@ impl WorkspaceBrowser {
         let mut activated: Option<Entry> = None;
         egui::ScrollArea::vertical().id_salt((prefix, "ws-rows")).max_height(260.0).show(ui, |ui| {
             for entry in &entries {
+                ui.push_id(&entry.id, |ui| {
                 let selected = self.selected.as_deref() == Some(entry.id.as_str());
                 let text = format!("{} {}   {}", icon(entry), entry.name, entry.detail());
                 let row = ui.horizontal(|ui| {
-                    let url = if self.list_pending.is_some() { "" } else {
-                        entry.link.as_ref().map_or("", |link| link.thumbnail_url.as_str())
-                    };
+                    let url = entry.link.as_ref().map_or("", |link| link.thumbnail_url.as_str());
                     let preview = self.thumbnails.show(ui, url, |url| plm.thumbnail(url));
                     ui.add_sized(
                         [ui.available_width(), crate::plm::thumbnail_view::SIDE],
@@ -1182,6 +1187,7 @@ impl WorkspaceBrowser {
                 if row.double_clicked() {
                     activated = Some(entry.clone());
                 }
+                });
             }
         });
         if let Some(entry) = activated {
@@ -1368,4 +1374,5 @@ impl WorkspaceBrowser {
         });
     }
 }
+
 

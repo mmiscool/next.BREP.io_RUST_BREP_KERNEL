@@ -20,6 +20,9 @@ use crate::Error;
 /// A part in a list: enough to show a row, never the revision payloads.
 #[derive(Debug, Serialize)]
 pub struct PartRow {
+    pub has_geometry: bool,
+    /// Whether the part has the current preview used by the Parts listing.
+    pub has_thumbnail: bool,
     pub id: String,
     pub number: String,
     pub name: String,
@@ -62,6 +65,8 @@ impl PartRow {
     fn new(categories: &[crate::model::Category], part: &Part) -> Self {
         let latest = part.latest();
         Self {
+            has_geometry: latest.is_some_and(|r| r.has_geometry),
+            has_thumbnail: crate::thumbnail::of_part(part).is_some(),
             id: part.id.clone(),
             number: part.number.clone(),
             name: part.name.clone(),
@@ -107,8 +112,7 @@ pub struct Search {
     /// A supplier id or name: parts with an offer from it.
     #[serde(default)]
     pub supplier: String,
-    /// Page size. Given, the answer is `{ "parts": [...], "next": cursor }`
-    /// rather than the bare list, and `next` is `null` on the last page.
+    /// Page size, default 50. `next` is `null` on the last page.
     #[serde(default)]
     pub limit: Option<usize>,
     /// The `next` of the page before.
@@ -128,9 +132,8 @@ pub struct Search {
 /// The largest page a client may ask for.
 pub const MAX_PAGE: usize = 1000;
 
-/// Search and filter parts ([`crate::db::Db::find_parts_page`]). Without
-/// `limit`, every match as a bare list (what scripts and older clients
-/// read); with it, one page and the cursor to the next.
+/// Search and filter parts ([`crate::db::Db::find_parts_page`]), one page
+/// and the cursor to the next.
 pub async fn list_parts(
     State(db): State<Shared>,
     headers: HeaderMap,
@@ -155,30 +158,32 @@ pub async fn list_parts(
         "attributes" => true,
         other => return Err(Error::bad_request(format!("include={other}: the only thing a row can include is 'attributes'"))),
     };
-    let limit = search.limit.map(|l| l.clamp(1, MAX_PAGE));
-    let page = db.find_parts_page(&filter, search.after.as_deref(), limit);
+    let limit = search.limit.unwrap_or(50).clamp(1, MAX_PAGE);
+    let page = db.find_parts_page(&filter, search.after.as_deref(), Some(limit));
     let rows: Vec<PartRow> = db.read(|state| {
         page.parts
             .iter()
             .map(|p| {
                 let mut row = PartRow::new(&state.categories, p);
                 if with_attributes {
-                    row.attributes = Some(p.attributes.clone());
+                    let mut attributes = p.attributes.clone();
+                    attributes.insert("has_geometry".into(), serde_json::json!(row.has_geometry));
+                    attributes.insert("has_thumbnail".into(), serde_json::json!(row.has_thumbnail));
+                    row.attributes = Some(attributes);
                 }
                 row
             })
             .collect()
     });
-    let body = match limit {
-        None => serde_json::to_value(rows),
-        Some(_) => serde_json::to_value(serde_json::json!({ "parts": rows, "next": page.next })),
-    };
-    Ok(Json(body.map_err(Error::internal)?))
+    Ok(Json(serde_json::json!({ "parts": rows, "next": page.next })))
 }
 
 /// One part with its revisions, each carrying who holds it.
 #[derive(Debug, Serialize)]
 pub struct PartDetail {
+    pub has_geometry: bool,
+    /// Whether the part has the current preview used by the Parts listing.
+    pub has_thumbnail: bool,
     #[serde(flatten)]
     pub part: Part,
     pub revision_views: Vec<RevisionView>,
@@ -335,6 +340,8 @@ pub async fn get_part(
             .cloned()
             .collect();
         Ok(Json(PartDetail {
+            has_geometry: part.latest().is_some_and(|r| r.has_geometry),
+            has_thumbnail: crate::thumbnail::of_part(part).is_some(),
             part: part.clone(),
             revision_views,
             suggested_label: suggest_label(part),
@@ -410,11 +417,11 @@ fn view(
             may_decide: r.is_live() && state.user(viewer_id).is_some_and(|u| crate::review::is_reviewer(r, u)),
         }),
         comments: revision.comments.len(),
-        eco: crate::eco::standalone_holder(state, &revision.id).map(|e| EcoRef {
+        eco: crate::eco::standalone_holder(state, &part.id, &revision.id).map(|e| EcoRef {
             id: e.id.clone(),
             number: e.number.clone(),
             state: e.state.as_str(),
-            action: e.item(&revision.id).map(|i| i.action.as_str()).unwrap_or(""),
+            action: e.item(&part.id, &revision.id).map(|i| i.action.as_str()).unwrap_or(""),
         }),
         thumbnail: revision.thumbnail.as_ref().map(|t| ThumbnailView {
             current: crate::thumbnail::current(revision).is_some(),

@@ -76,6 +76,164 @@ pub(super) fn trim_detector_bar(report: &crate::PcurveFitReport) -> f64 {
     crate::PCURVE_REFINEMENT_TOLERANCE + report.off_surface
 }
 
+/// What a derived trim reads BETWEEN the fit's stations (2026-10-03).
+///
+/// `PcurveFitReport::residual` is the fit's own out-of-sample sweep, the
+/// quarter points of every span between its nodes, and `off_surface` the
+/// file curve's standoff at the nodes. Both under-read where the file's curve
+/// does something narrower than a quarter span: `abc_00000011` edge 237's fit
+/// (67 nodes, every quarter point within 6.8e-5) misses the curve by 7.4e-4
+/// inside a 6e-5-wide knot span at the trim's end, and the class the
+/// 2026-09-27 census called "the fitter's miss" on 84 rows was the bar's
+/// standoff term read at the nodes while the curve stands further off between
+/// them. This read is the band-free floor `validate()` uses, taken here on
+/// both sides of the bar:
+///
+/// * `residual`: the image-to-edge distance at the quarter points of every
+///   knot span of the pcurve AND at the midpoint of every knot span of the
+///   edge curve inside the coedge, through `evaluate_extended` — an
+///   interpolant is extremal between its own knots, and the file's curve
+///   changes polynomial at its own.
+/// * `standoff`: at the same stations, the file curve's distance from the
+///   carrier as the TIGHTER of the global projection and a Newton foot seeded
+///   at the trim's own parameter; both are points on the surface, so the
+///   smaller is still an upper bound on the true distance.
+///
+/// Since 2026-10-05 it also reads the NATIVE probes of the pcurve and of the
+/// clipped edge curve (`pcurve::range_use_probes`: endpoints, quarters, 16
+/// interior points per knot span, exact knots), and says how many it read.
+///
+/// Finite stations, so a global maximum is not certified: the read is
+/// exact at its stations and a lower bound on the trim's true deviation
+/// (and an upper bound on the standoff) elsewhere. The 8193-fraction census
+/// (`examples/import_miss_census.rs`) found no corpus row whose uniform read
+/// exceeded this one by more than the quarter-point grid's own aliasing.
+pub(super) struct TrimReading {
+    pub(super) residual: f64,
+    pub(super) standoff: f64,
+    /// How many fractions were read: the reading is the maximum at THESE
+    /// samples, not a certified maximum.
+    pub(super) probes: usize,
+}
+
+/// A maximum that keeps an unread (non-finite) value instead of dropping it:
+/// `f64::max` returns the finite operand when the other is NaN, so a NaN
+/// reading would vanish into a clean-looking maximum.
+/// Both operands are tested: an infinite `worst` is as unread as a NaN one.
+pub(super) fn fold_reading(worst: f64, value: f64) -> f64 {
+    if !worst.is_finite() || !value.is_finite() { f64::NAN } else { worst.max(value) }
+}
+
+/// The derived lane's TRACKING keep: the floor fit replaces the ask fit only
+/// by `pcurve::floor_admits`, the same admission the range challenger and the
+/// inherited stage use, on the same probes against the same shared admitted
+/// feet (`pcurve::range_common_read_with_excess`): all six readings
+/// (tracking, deviation, pointwise excess over the foot's distance, for both
+/// fits) finite, the floor fit's tracking strictly lower, and EITHER its
+/// deviation no worse OR the floor fit within the ORIGINAL 1e-7 floor on both
+/// tracking and excess. When images follow the shared admitted feet, deviation
+/// can be dominated by standoff, and a strict comparison can refuse a
+/// floor-meeting fit on rounding (next5 fixture 25: +1.2e-14 .. +6.7e-13).
+/// This is a measured shared-foot comparison, not a global nearest-point proof.
+/// `None` (unread) keeps the ask fit.
+// Unused by the import lane since the tracking trigger and keep were withdrawn
+// for this merge; kept, with its controls, for their re-proposal.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(super) fn derived_tracking_keep(read: Option<([f64; 3], [f64; 3])>) -> bool {
+    matches!(read, Some((old, new)) if crate::pcurve::floor_admits(old, new))
+}
+
+pub(super) fn trim_floor_reading(
+    surface: &NurbsSurface,
+    pcurve: &NurbsCurve,
+    curve: &NurbsCurve,
+    t0: f64,
+    t1: f64,
+    forward: bool,
+    read_standoff: bool,
+) -> Result<TrimReading, String> {
+    let [q0, q1] = pcurve.domain()?;
+    let station = |fraction: f64| -> Result<Vec3, String> {
+        let along = if forward { fraction } else { 1.0 - fraction };
+        curve.evaluate(t0 + (t1 - t0) * along)
+    };
+    let mut fractions: Vec<f64> = Vec::new();
+    if q1 > q0 {
+        let mut previous = q0;
+        for &knot in pcurve.knots.iter().chain(std::iter::once(&q1)) {
+            if knot > previous && knot <= q1 {
+                for local in [0.25, 0.5, 0.75] {
+                    fractions.push((previous + (knot - previous) * local - q0) / (q1 - q0));
+                }
+                previous = knot;
+            }
+        }
+    }
+    let span = t1 - t0;
+    if span.is_finite() && span != 0.0 {
+        let (low, high) = (t0.min(t1), t0.max(t1));
+        let mut previous = low;
+        for &knot in curve.knots.iter().chain(std::iter::once(&high)) {
+            if knot > previous && knot <= high {
+                let along = (0.5 * (previous + knot) - t0) / span;
+                fractions.push(if forward { along } else { 1.0 - along });
+                previous = knot;
+            }
+        }
+    }
+    // The NATIVE probes as well (2026-10-05): every knot span of the pcurve
+    // and of the edge curve clipped to the coedge, at its endpoints, quarters
+    // and 16 interior points, and the exact knots. The quarter/midpoint grid
+    // above alone left an on-carrier miss unreported: abc_00001167 face #140
+    // edge 67 read 1.943e-5 at an independent native witness (next3, full-408
+    // census) with the trim reported on its bar.
+    let unit = |c: &NurbsCurve| -> Option<NurbsCurve> {
+        if q0 == 0.0 && q1 == 1.0 {
+            return Some(c.clone());
+        }
+        let knots = c.knots.iter().map(|k| (k - q0) / (q1 - q0)).collect();
+        NurbsCurve::new(c.degree, knots, c.control_points.clone()).ok()
+    };
+    // The native probes are REQUIRED: a pcurve domain that is not a proper
+    // interval, a normalization that cannot be built, or probes that cannot
+    // be formed make the whole reading UNREAD (NaN, never a clean maximum or
+    // a proof of the floor), not a reading of whatever samples remain.
+    let mut native_unread = !(q1 > q0);
+    if !native_unread {
+        match unit(pcurve).map(|on_unit| crate::pcurve::range_use_probes(&[&on_unit], curve, t0, t1, forward)) {
+            Some(Ok(probes)) if !probes.is_empty() => fractions.extend(probes),
+            _ => native_unread = true,
+        }
+    }
+    fractions.sort_by(f64::total_cmp);
+    fractions.dedup();
+    let mut reading = TrimReading { residual: 0.0, standoff: 0.0, probes: 0 };
+    for fraction in fractions {
+        if !(0.0..=1.0).contains(&fraction) {
+            continue;
+        }
+        let uv = pcurve.evaluate(q0 + (q1 - q0) * fraction)?;
+        let image = surface.evaluate_extended(uv.x, uv.y)?;
+        let point = station(fraction)?;
+        reading.probes += 1;
+        reading.residual = fold_reading(reading.residual, image.sub(point).length());
+        if read_standoff {
+            let global = crate::project_point_to_surface(surface, point)?.distance;
+            let seeded = crate::project_point_to_surface_seeded(surface, point, uv.x, uv.y)
+                .map(|projection| projection.distance)
+                .unwrap_or(f64::INFINITY);
+            reading.standoff = fold_reading(reading.standoff, global.min(seeded));
+        }
+    }
+    if native_unread || reading.probes == 0 {
+        reading.residual = f64::NAN;
+        if read_standoff {
+            reading.standoff = f64::NAN;
+        }
+    }
+    Ok(reading)
+}
+
 /// The on-surface seam ruling between two rim seam-vertices of a periodic
 /// BAND face (see `stitch_seam_circle_loops`). When the two rim circles ride
 /// the SAME seam meridian (constant u) at different v — a toroidal/spherical

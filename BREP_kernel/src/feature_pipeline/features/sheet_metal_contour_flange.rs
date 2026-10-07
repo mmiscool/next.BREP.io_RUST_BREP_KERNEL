@@ -564,6 +564,8 @@ pub fn schema() -> serde_json::Value {
     "type": "SM.CF",
     "shortName": "SM.CF",
     "longName": "SM Contour Flange",
+    "ribbonPath": "Home/Sheet Metal/Contour Flange",
+    "commandSize": "Compact",
     "displayBuilder": false,
     "inputParamsSchema": {
         "id": {

@@ -60,10 +60,13 @@
 //! are unique per part; a feature control frame's datum references must name
 //! defined datums.
 
+pub mod anchor;
 pub mod annotations;
 pub mod font;
 pub mod layout;
 pub mod resolve;
+mod plugin;
+pub use plugin::{PluginAnnotationOutput, PluginAnnotationReplay};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -71,6 +74,10 @@ use std::collections::BTreeMap;
 
 use crate::feature_pipeline::{Env, HistoryRequest, SceneMap};
 
+pub use anchor::{
+    balloon_head, nearest_displayed_point, nearest_displayed_point_on_edge, nearest_point_on_edge, nearest_point_on_solid,
+    pose_apply, pose_unapply, BalloonAnchor, BalloonAnchorMode, HalfSpace, HeadScope, PmiPose, SolidPoses,
+};
 pub use annotations::{pmi_schema_catalogue, pmi_type, PmiTypeDef, PMI_TYPES};
 
 // ===========================================================================
@@ -163,6 +170,34 @@ pub struct PmiDisplay {
     /// on apply; a name that no longer exists is ignored).
     #[serde(default)]
     pub hidden: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub section: Option<PmiSection>,
+}
+
+/// A display-only half-space through the captured camera target plus an offset.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PmiSection {
+    pub axis: String,
+    pub offset: f64,
+    #[serde(default)]
+    pub flip: bool,
+}
+impl PmiView {
+    pub fn section_plane(&self) -> Option<([f64; 3], [f64; 3])> {
+        let section = self.display.section.as_ref()?;
+        let camera = self.camera.as_ref()?;
+        let mut normal = match section.axis.as_str() {
+            "X" => [1., 0., 0.],
+            "Y" => [0., 1., 0.],
+            "Z" => [0., 0., 1.],
+            _ => camera.view_direction(),
+        };
+        let point = std::array::from_fn(|i| camera.target[i] + normal[i] * section.offset);
+        if section.flip {
+            normal = normal.map(|v| -v);
+        }
+        Some((point, normal))
+    }
 }
 
 fn default_text_size() -> f64 {
@@ -175,6 +210,7 @@ impl Default for PmiDisplay {
             text_size_pt: default_text_size(),
             wireframe: false,
             hidden: Vec::new(),
+            section: None,
         }
     }
 }
@@ -196,11 +232,18 @@ pub struct PmiAnnotation {
     pub enabled: bool,
     #[serde(default, rename = "inputParams")]
     pub params: Value,
+    #[serde(default, rename = "persistentData", skip_serializing_if = "Value::is_null")]
+    pub persistent_data: Value,
+    /// Last accepted callback transition. Replays use its prior input, never saved geometry.
+    #[serde(default, rename = "pluginReplay", skip_serializing_if = "Option::is_none")]
+    pub plugin_replay: Option<PluginAnnotationReplay>,
     /// The draggable label's world anchor. Absent until the user moves it —
     /// the report then carries a default derived from the geometry.
     #[serde(default, rename = "labelWorld", skip_serializing_if = "Option::is_none")]
     pub label_world: Option<[f64; 3]>,
 }
+
+fn is_false(value: &bool) -> bool { !value }
 
 fn default_true() -> bool {
     true
@@ -452,6 +495,11 @@ pub enum PmiStatus {
 /// One resolved annotation.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PmiAnnotationReport {
+    /// Successful provider output only; errors must preserve saved input data.
+    #[serde(default, rename = "persistentData", skip_serializing_if = "Option::is_none")]
+    pub persistent_data: Option<Value>,
+    #[serde(default, rename = "pluginReplay", skip_serializing_if = "Option::is_none")]
+    pub plugin_replay: Option<PluginAnnotationReplay>,
     pub id: String,
     #[serde(rename = "type")]
     pub kind: String,
@@ -560,6 +608,12 @@ pub enum PmiGeometry {
     Leader {
         targets: Vec<[f64; 3]>,
         dot: bool,
+        #[serde(default, skip_serializing_if = "is_false")]
+        balloon: bool,
+        /// A balloon's head derivation recipe (`None` on a plain leader): the
+        /// viewport re-derives `targets[0]` from a dragged bubble with it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        anchor: Option<BalloonAnchor>,
     },
     Note {
         position: [f64; 3],
@@ -791,8 +845,19 @@ pub fn resolve_annotation(
     context: &PmiContext<'_>,
     camera: Option<&PmiCamera>,
 ) -> PmiAnnotationReport {
+    let mut persistent_data = None;
+    let mut plugin_replay = None;
     let outcome = match pmi_type(&annotation.kind) {
+        None if annotation.kind.contains('/') && !annotation.enabled => Ok(Resolved {
+            text: String::new(), value: None, unit: "", references: Vec::new(),
+            geometry: PmiGeometry::None, default_label: annotation.label_world.unwrap_or([0.; 3]),
+        }),
         Some(def) => (def.resolve)(annotation, context),
+        None if annotation.kind.contains('/') => plugin::resolve(annotation, context).map(|(resolved, data, replay)| {
+            persistent_data = Some(data);
+            plugin_replay = Some(replay);
+            resolved
+        }),
         None => Err(format!("unknown PMI annotation type '{}'", annotation.kind)),
     }
     .and_then(|resolved| {
@@ -803,6 +868,8 @@ pub fn resolve_annotation(
         Ok((resolved, plane)) => {
             let label = annotation.label_world.unwrap_or(resolved.default_label);
             PmiAnnotationReport {
+                persistent_data,
+                plugin_replay,
                 id: annotation.id().to_string(),
                 kind: annotation.kind.clone(),
                 enabled: annotation.enabled,
@@ -818,6 +885,8 @@ pub fn resolve_annotation(
             }
         }
         Err(message) => PmiAnnotationReport {
+            persistent_data: None,
+            plugin_replay: None,
             id: annotation.id().to_string(),
             kind: annotation.kind.clone(),
             enabled: annotation.enabled,
@@ -827,7 +896,12 @@ pub fn resolve_annotation(
             value: None,
             unit: String::new(),
             references: Vec::new(),
-            label_world: annotation.label_world.unwrap_or([0.0; 3]),
+            // A refused balloon's chip sits beside its occurrence, where the
+            // bubble would have been, not at the origin.
+            label_world: annotation
+                .label_world
+                .or_else(|| (annotation.kind == "balloon").then(|| annotations::balloon::error_bubble(annotation, context)).flatten())
+                .unwrap_or([0.0; 3]),
             plane: None,
             geometry: PmiGeometry::None,
         },

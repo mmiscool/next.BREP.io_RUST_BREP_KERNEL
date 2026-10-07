@@ -1,7 +1,7 @@
 # BREP_plm — a PLM server for the BREP CAD application
 
 `BREP_plm` is a self-hosted product lifecycle management server: parts with
-permanent identities and configurable numbers, revisions with a lifecycle,
+part numbers as their database keys, revisions with a lifecycle,
 explicit checkout, bills of materials, change orders and review, over one
 embedded SQLite file. It serves its own browser UI and the document API that
 the BREP CAD application saves and opens through, and it can host the CAD
@@ -18,6 +18,21 @@ cargo install BREP_plm
 brep-plm serve --data ./plm-data --bind 127.0.0.1:8088
 ```
 
+The UI is embedded in the executable by default. To override it with files from
+an existing frontend directory, start with `--web-dir`:
+
+```sh
+brep-plm serve --data ./plm-data --web-dir ./BREP_plm/web
+```
+
+Files in that directory override embedded assets at the same relative URLs
+(`/` uses `index.html`). Missing files fall back to the embedded bundle.
+Additional frontend assets and templates can also be served from this directory.
+Files are read on each request and responses use `Cache-Control: no-store` while
+this option is enabled, so editing HTML, JavaScript, or CSS only needs a browser
+refresh. API and hosted CAD routes remain separate. Without `--web-dir`, the
+server continues to use its embedded frontend.
+
 The first run creates `plm-data/` and seeds one administrator, printing its
 generated password **once**:
 
@@ -33,15 +48,44 @@ Open `http://127.0.0.1:8088/`, sign in as `admin`, and create a second
 administrator before you lose the password. SQLite is compiled in, so there is
 no system library to install.
 
+The part number is the actual database ID. Revision IDs are their labels,
+scoped by part (for example, `CPART000000001` / `A`). Documents are stored
+under `models/<part-number>/<revision-label>.json`, with unsafe filename
+characters percent-encoded.
+
+This development version requires a fresh data directory when upgrading from
+opaque model IDs. Stop the old server, reset its data directory and CAD caches,
+then start this version. Existing model data is not migrated.
+
 ## What it does
 
+- **Batch resave.** Select parts with the row checkboxes, Shift/Ctrl, or
+  **Select all matching**, then **Force resave selected parts**. Each saved
+  model gets a persistent job in the existing bake queue. The bake worker
+  rebuilds and resaves it with an embedded thumbnail; progress, failures and
+  retries remain available in **Bake queue** after the page closes. Existing
+  checkouts remain held; jobs wait on another user's checkout. A newer save
+  supersedes an older queued result. Run the normal `brep-app --bake-worker`
+  with a worker token to process these jobs alongside family/template bakes.
 - **Parts and revisions.** Part types number by counter (`CPART` + 9 digits by
   default), free text, an administrator's pattern, or a script. Revisions move
   `Draft → InReview → Released → Superseded | Obsolete`; a released revision is
   immutable, and a draft is written only by the user holding its checkout.
-- **Structure.** Each revision's uses list, the indented and flat BOM with
-  rolled-up quantities and costs, the diff between two revisions, and
-  where-used.
+- **Structure.** Each revision's uses list, an expandable BOM table tree with
+  connector lines, per-node toggles, expand/collapse all and expansion to a
+  chosen depth. The flat BOM rolls up quantities and costs; revision diff
+  and where-used show changes and dependencies.
+- **Revision and occurrence fields.** Administrators define typed fields on
+  each numbered part type through **Part types → Fields**, and placement fields
+  through **Occurrence fields**. Part values belong to the part revision;
+  occurrence values belong to the owning assembly revision and stable CAD
+  feature ID. Both the PLM BOM and CAD BOM edit the same stored values.
+- **BOM column configurations.** The separate **BOM columns** page manages
+  named shared and personal configurations, with available and configured
+  fields in two lists. Add/remove multiple fields and move selected columns
+  up or down while preserving their order. The CAD chooser uses the same
+  server configurations and can save personal configurations. Changing a view
+  does not remove attribute data. CSV exports follow the selected configuration.
 - **Change orders and review.** A set of revisions released or obsoleted
   together after one review round, all or none; reviewers, a release gate,
   threaded discussion and an inbox.
@@ -131,3 +175,22 @@ This needs `tokio` (with `macros` and `rt-multi-thread`) and `axum` 0.7 beside
 The Autodrop3d licence in `LICENSE.md`, shipped in the crate (`license-file`
 in the manifest). It is not an SPDX licence: read it before you modify or
 redistribute the crate.
+
+Administrators can use **Administration → Setup wizard** to configure numbering,
+catalog taxonomy, accounts and lifecycle labels, with optional KiCad symbols, linked footprints and STEP models in KiCad’s
+library taxonomy, plus mechanical family imports. **Workflows** provides a visual process editor,
+parallel reviews, smart forms with field permissions, JavaScript automation,
+lifecycle steps, an inbox and durable execution history. See the
+[operator guide](GUIDE.md#workflow-processes-and-smart-forms) for configuration
+and integration details.
+
+Admins can start/stop a server-owned native bake worker from the Bake queue
+when the operator configures `--bake-worker-executable`,
+`--bake-worker-token-file` and `--bake-worker-url`. Queued work survives Stop;
+interrupted claims can be taken back or recovered after lease expiry.
+
+KiCad setup defaults to all pinned official symbol libraries and the dedicated
+`kicad` counter (`ELEC00000000001` initially), with library-based taxonomy and
+linked available footprint/STEP assets. Browser checkpoints support pause,
+resume, detailed reports and retry of libraries with failures. Generic symbols
+and unavailable linked models remain visible gaps.

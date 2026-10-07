@@ -11,6 +11,9 @@
 const $ = (id) => document.getElementById(id);
 let me = null;
 let currentPart = null;
+let lifecycleOptions = [];
+const statusName = state => lifecycleOptions.find(s => s.state === state)?.name || state;
+const statusEnabled = state => lifecycleOptions.find(s => s.state === state)?.enabled !== false;
 
 // ---------------------------------------------------------------- transport
 
@@ -118,26 +121,59 @@ const bytes = (n) => (n ? `${n.toLocaleString()} B` : '—');
 
 // ------------------------------------------------------------------- routing
 
-const VIEWS = ['parts', 'workspace', 'part', 'reviews', 'ecos', 'eco', 'catalog', 'sourcing', 'bake', 'types', 'users', 'scripts', 'settings', 'account', 'security', 'audit', 'backups'];
+const VIEWS = ['workflows', 'workflow-editor', 'workflow-run', 'setup', 'file', 'empty', 'native-import', 'parts', 'workspace', 'part', 'reviews', 'ecos', 'eco', 'catalog', 'sourcing', 'bake', 'bom-columns', 'occurrence-fields', 'types', 'users', 'scripts', 'settings', 'account', 'security', 'audit', 'backups'];
 
+let visiblePage = null;
 function show(view) {
+  const names = { workflows: 'Workflows', 'workflow-editor': 'Workflow editor', 'workflow-run': 'Workflow process', setup: 'Server setup', 'native-import': 'Import native files', parts: 'Parts', part: currentPart?.number || 'Part', workspace: 'Home', reviews: 'Review inbox', ecos: 'Change orders', eco: 'Change order', catalog: 'Classification', sourcing: 'Sourcing', bake: 'Bake queue', 'bom-columns':'BOM column configurations', 'occurrence-fields':'Occurrence fields', types: 'Part types', users: 'Users', scripts: 'Scripts', settings: 'Settings', account: 'My account', security: 'Security', audit: 'Audit', backups: 'Backups' };
+  visiblePage = {view, title:names[view] || view};
+  for(const menu of document.querySelectorAll('.top-nav details[open]'))menu.open=false;
+  $('shell-status').textContent = names[view] || 'Ready';
   for (const name of VIEWS) $(`view-${name}`).hidden = name !== view;
-  for (const link of document.querySelectorAll('header nav a')) {
-    link.classList.toggle('current', link.getAttribute('href') === `#/${view}`);
+  for (const link of document.querySelectorAll('.top-nav a')) {
+    const current = link.getAttribute('href') === `#/${view === 'part' ? 'parts' : view === 'eco' ? 'ecos' : view}`;
+    link.classList.toggle('current', current);
+    if (current) link.setAttribute('aria-current', 'page');
+    else link.removeAttribute('aria-current');
   }
 }
 
-async function route() {
+let routeQueue = Promise.resolve();
+function route() {
+  for (const menu of document.querySelectorAll('.command-menu[open]')) menu.open = false;
+  const hash=location.hash || '#/workspace';
+  routeQueue=routeQueue.catch(()=>{}).then(async()=>{
+    if(!me)return;
+    OpenPages.capture();
+    document.querySelector('.work-area').inert=true;
+    try { await renderRoute(hash); }
+    finally { document.querySelector('.work-area').inert=false; }
+  });
+  return routeQueue;
+}
+async function renderRoute(hash) {
   if (!me) return;
   banner('');
-  const hash = location.hash || '#/parts';
-  const [, section, id] = hash.split('/');
+  const [, section, rawId, rawRevision, objectView] = hash.split('/');
+  const id = rawId && decodeURIComponent(rawId);
+  const revision = rawRevision && decodeURIComponent(rawRevision);
   try {
-    if (section === 'part' && id) {
-      await renderPart(id);
+    await OpenPages.beforeRender(hash);
+    const cached=OpenPages.resume(hash);
+    if(cached){show(cached.view);}
+    else if(section==='attachment'||section==='file'){const title=await FileDocuments.open(hash);show('file');visiblePage.title=title;}
+    else if (section === 'empty') { show('empty');
+    } else if (section === 'part' && id) {
+      await renderPart(id, revision);
+      if (OBJECT_TABS.some(([tab]) => tab === objectView)) selectObjectTab(objectView);
       show('part');
+    } else if (section === 'native-import') {
+      if (!me.can_author) { location.hash = '#/parts'; return; }
+      await openNativeImport();
+      show('native-import');
     } else if (section === 'workspace') {
-      await renderWorkspace();
+      Workbench.restore(OpenPages.workspace(hash));
+      await Workbench.home(id);
       show('workspace');
     } else if (section === 'reviews') {
       await renderReviews();
@@ -157,13 +193,32 @@ async function route() {
     } else if (section === 'bake') {
       await renderBake();
       show('bake');
+    } else if(section==='bom-columns'){await renderBomConfigurations();show('bom-columns');
+    } else if(section==='occurrence-fields'){await renderOccurrenceFields();show('occurrence-fields');
     } else if (section === 'types') {
       await renderTypes();
       show('types');
     } else if (section === 'scripts') {
       if (!me.is_admin) { location.hash = '#/parts'; return; }
-      await renderScripts();
+      if(id) {
+        const path=[rawId,rawRevision,objectView].filter(Boolean).map(decodeURIComponent).join('/');
+        const draft=OpenPages.scriptDraft(hash);
+        scriptPath=null;scriptSaved='';
+        await openScript(path, draft?.text, true);
+        if(draft){scriptSaved=draft.saved;syncScriptButtons();}
+      } else {scriptPath=null;scriptSaved='';$('script-text').value='';$('script-path').textContent='No file open';await renderScripts();}
       show('scripts');
+    } else if (section === 'workflows') {
+      await WorkflowUI.list(); show('workflows');
+    } else if (section === 'workflow-editor') {
+      if (!me.is_admin) { location.hash = '#/workflows'; return; }
+      await WorkflowUI.editor(id || 'new'); show('workflow-editor');
+    } else if (section === 'workflow-run' && id) {
+      await WorkflowUI.detail(id); show('workflow-run');
+    } else if (section === 'setup') {
+      if (!me.is_admin) { location.hash = '#/workspace'; return; }
+      await SetupWizard.open();
+      show('setup');
     } else if (section === 'settings') {
       if (!me.is_admin) { location.hash = '#/parts'; return; }
       await renderSettings();
@@ -175,6 +230,10 @@ async function route() {
     } else if (section === 'account') {
       await renderAccount();
       show('account');
+      if (id === 'password') {
+        $('password-form').scrollIntoView({ block: 'start' });
+        $('pw-current').focus({ preventScroll: true });
+      }
     } else if (section === 'backups') {
       if (!me.is_admin) { location.hash = '#/parts'; return; }
       await renderBackups();
@@ -200,6 +259,14 @@ async function route() {
       await renderParts();
       show('parts');
     }
+    let title=visiblePage.title;
+    if(visiblePage.view==='part')title=currentPart.number+(revision?'/'+(currentPart.revisions.find(r=>r.id===revision||r.label===revision)?.label || revision):'');
+    if(visiblePage.view==='workspace'&&id)title=$('home-detail').querySelector('h2')?.textContent || 'Folder';
+    if(visiblePage.view==='scripts'&&id)title=scriptPath;
+    if(visiblePage.view==='eco')title=$('eco-number').textContent;
+    if(visiblePage.view==='catalog'&&id)title=$('cat-title').textContent || title;
+    await OpenPages.afterRender(hash);
+    OpenPages.activate(hash,visiblePage.view,title);
   } catch (error) {
     banner(error.message);
   }
@@ -226,10 +293,13 @@ async function loadCadConfig() {
 // hosted. Any view may drop it into its markup: the one listener below opens
 // every such button in a new tab. Every document class (.nbrep, .fbrep, .tbrep)
 // opens in the CAD app, and a revision with no document yet opens as a new one.
+const idSegment = value => encodeURIComponent(value).replace(/[.!'()*~]/g, c => '%' + c.charCodeAt(0).toString(16).toUpperCase());
+const documentKey = (part, revision) => `part/${idSegment(part)}/rev/${idSegment(revision)}`;
+
 function openInCadButton(partId, revisionId, label = 'Open in CAD') {
   if (!cadApp || !partId || !revisionId) return '';
-  const key = `part/${partId}/rev/${revisionId}`;
-  return `<button class="link" data-open-cad="${escape(key)}" title="Open this revision in the CAD app, in a new tab">${escape(label)}</button>`;
+  const key = documentKey(partId, revisionId);
+  return `<button type="button" data-open-cad="${escape(key)}" title="Open this revision in the CAD app, in a new tab">${escape(label)}</button>`;
 }
 
 document.addEventListener('click', (event) => {
@@ -254,10 +324,26 @@ async function boot() {
   $('shell').hidden = !me;
   if (!me) return;
 
-  $('whoami').textContent = `${me.display_name || me.username} · ${me.groups.join(', ') || 'no groups'}`;
+  const cadReturn = new URLSearchParams(location.search).get('cad');
+  if (cadReturn) {
+    let target;
+    try { target = new URL(cadReturn, location.origin); } catch { /* Ignore malformed return paths. */ }
+    if (target && target.origin === location.origin && target.pathname.startsWith('/cad/app/')) {
+      location.replace(target.href);
+      return;
+    }
+  }
+
+  $('user-display-name').textContent = me.display_name || me.username;
+  $('whoami').textContent = `${me.username} · ${me.groups.join(', ') || 'no groups'}`;
+  $('user-menu-trigger').setAttribute('aria-label', `User account menu for ${me.display_name || me.username}`);
   for (const el of document.querySelectorAll('.admin-only')) el.hidden = !me.is_admin;
   for (const el of document.querySelectorAll('.author-only')) el.hidden = !me.can_author;
+  const setupSettings = await api('GET', '/api/settings');
+  lifecycleOptions = setupSettings.status_options;
+  if (me.is_admin && !setupSettings.setup_completed && !location.hash) location.hash = '#/setup';
   await loadCadConfig();
+  OpenPages.restoreSession();
   await route();
 }
 
@@ -286,13 +372,19 @@ $('signout').addEventListener('click', () => act(async () => {
 
 // --------------------------------------------------------------- parts list
 
-// How many parts one page of the list shows; "Load more" fetches the next.
-const PARTS_PAGE = 100;
+// A page replaces the previous rows, keeping DOM size bounded.
+const PARTS_PAGE = 100; // Chunk size for explicitly selecting all matching parts.
+let partsCursors = [null], partsPageIndex = 0, partsPageBusy = false, partsRestorePage = null;
 // Bumped by every fresh render, so a slow page for an older search cannot
 // land in the list after a newer one.
 let partsGeneration = 0;
 let partsNext = null;
 let partsQuery = '';
+let listedParts = [];
+let selectedPartId = null;
+const selectedParts = new Map();
+let partsSelectionAnchor = null, partsBatchRunning = false, partsSelecting = false;
+let partsBatchReport = null, partsBatchUser = null, partsBatchPolling = false, partsBatchOffset = 0;
 
 async function renderParts() {
   if (!categoriesLoaded) {
@@ -309,45 +401,257 @@ async function renderParts() {
     manufacturer: kind === 'm' ? company : '',
     supplier: kind === 's' ? company : '',
   });
-  const filtered = params.get('q') || params.get('category') || params.get('tag') || company;
+  if ($('filter-geometry').value) params.set('attr.has_geometry', $('filter-geometry').value);
+  if ($('filter-thumbnail').value) params.set('attr.has_thumbnail', $('filter-thumbnail').value);
   partsQuery = params.toString();
+  partsCursors = partsRestorePage?.cursors || [null];
+  partsPageIndex = partsRestorePage?.index || 0;
+  partsRestorePage = null;
+  partsSelectionAnchor = null;
+  await loadPartsPage(partsPageIndex);
+}
+
+function updatePartsPager() {
+  $('parts-prev').disabled = partsPageBusy || partsPageIndex === 0;
+  $('parts-more').disabled = partsPageBusy || !partsNext;
+  $('parts-page-size').disabled = partsPageBusy;
+  $('parts-page-status').textContent = `Page ${partsPageIndex + 1}`;
+}
+
+async function loadPartsPage(index) {
   const generation = ++partsGeneration;
-  const page = await api('GET', `/api/parts?${partsQuery}&limit=${PARTS_PAGE}`);
+  const cursor = partsCursors[index];
+  const size = Number($('parts-page-size').value);
+  partsPageBusy = true; updatePartsPager();
+  try {
+  const page = await api('GET', `/api/parts?${partsQuery}&limit=${size}${cursor ? `&after=${encodeURIComponent(cursor)}` : ''}`);
   if (generation !== partsGeneration) return;
   $('parts-empty').hidden = page.parts.length > 0;
-  $('parts-empty').textContent = filtered ? 'No parts match.' : 'No parts yet.';
+  $('parts-empty').textContent = 'No parts match.';
+  partsPageIndex = index; partsSelectionAnchor = null;
+  listedParts = page.parts;
   $('parts-rows').innerHTML = page.parts.map(partRow).join('');
   partsNext = page.next;
-  $('parts-more').hidden = !partsNext;
+  partsCursors[index + 1] = page.next;
+  updatePartsSummary();
+  } finally { if (generation === partsGeneration) { partsPageBusy = false; updatePartsPager(); updatePartSelection(); } }
 }
 
 async function moreParts() {
-  if (!partsNext) return;
-  const generation = partsGeneration;
-  const page = await api('GET', `/api/parts?${partsQuery}&limit=${PARTS_PAGE}&after=${encodeURIComponent(partsNext)}`);
-  if (generation !== partsGeneration) return;
-  $('parts-rows').insertAdjacentHTML('beforeend', page.parts.map(partRow).join(''));
-  partsNext = page.next;
-  $('parts-more').hidden = !partsNext;
+  if (!partsNext || partsPageBusy) return;
+  await loadPartsPage(partsPageIndex + 1);
 }
 
 $('parts-more').addEventListener('click', () => act(moreParts));
+$('parts-prev').addEventListener('click', () => act(() => loadPartsPage(partsPageIndex - 1)));
+$('parts-page-size').addEventListener('change', () => act(renderParts));
 
 function partRow(part) {
   return `
-    <tr>
-      <td class="thumb-cell"><a href="#/part/${escape(part.id)}" tabindex="-1">${thumb(part.thumbnail_url)}</a></td>
-      <td class="number"><a href="#/part/${escape(part.id)}">${escape(part.number)}</a></td>
-      <td>${escape(part.name)}${part.tags.length ? `<br>${tagChips(part.tags)}` : ''}</td>
+    <tr data-part-id="${escape(part.id)}">
+      <td><input type="checkbox" class="part-select" aria-label="Select ${escape(part.number)}"${selectedParts.has(part.id)?' checked':''}></td>
+      <td class="thumb-cell"><span class="part-tile-preview"><a href="#/part/${encodeURIComponent(part.id)}" tabindex="-1">${thumb(part.thumbnail_url)}</a>${part.locked ? `<span class="part-tile-lock" role="img" aria-label="Checked out" title="Checked out">${PART_ATTRIBUTE_LOCK_ICON}</span>` : ''}</span></td>
+      <td class="number"><div class="part-tile-identity"><a href="#/part/${encodeURIComponent(part.id)}">${escape(part.number)}/${escape(part.latest_label)}</a><span class="state state-${escape(part.latest_state)}">${escape(statusName(part.latest_state))}</span></div></td>
+      <td><span class="part-tile-name">${escape(part.name)}</span>${part.document_class && part.document_class !== 'normal' ? classBadge(part.document_class) : ''}${part.tags.length ? tagChips(part.tags) : ''}</td>
       <td>${escape(part.part_type)}</td>
-      <td>${classBadge(part.document_class)}</td>
       <td>${categoryText(part)}</td>
       <td class="mono">${escape(part.mpn) || '<span class="muted">—</span>'}</td>
       <td>${escape(part.latest_label)}</td>
-      <td><span class="state state-${escape(part.latest_state)}">${escape(part.latest_state)}</span></td>
-      <td class="actions">${part.locked ? '🔒' : ''}</td>
+      <td><span class="state state-${escape(part.latest_state)}">${escape(statusName(part.latest_state))}</span></td>
+      <td class="actions"><button class="link inspect-part" aria-label="Inspect ${escape(part.number)}" aria-pressed="false">Properties</button></td>
     </tr>`;
 }
+
+function updatePartsSummary() {
+  const first = partsPageIndex * Number($('parts-page-size').value) + 1;
+  $('parts-count').textContent = listedParts.length ? `Showing ${first}–${first + listedParts.length - 1}` : '0 parts';
+  refreshPartsBatch();
+  updatePartSelection();
+  selectPartSummary(selectedPartId);
+}
+
+function selectPartSummary(id, reveal = false) {
+  const part = listedParts.find(p => p.id === id);
+  selectedPartId = part ? id : null;
+  for (const row of $('parts-rows').rows) {
+    const selected = row.dataset.partId === selectedPartId;
+    row.classList.toggle('selected', selectedParts.has(row.dataset.partId));
+    row.querySelector('.inspect-part').setAttribute('aria-pressed', String(selected));
+  }
+  if (!part) {
+    $('selection-content').innerHTML = '<p class="selection-empty">Select a row to inspect its properties. Open a part number to work with its revisions.</p>';
+    return;
+  }
+  return Workbench.catalog(part.id, reveal);
+}
+
+$('parts-rows').addEventListener('click', event => {
+  if (event.target.closest('button.tag')) return;
+  const row = event.target.closest('tr[data-part-id]');
+  if(!row)return;
+  const id=row.dataset.partId,index=listedParts.findIndex(part=>part.id===id);
+  const checkbox=event.target.closest('.part-select');
+  if(partsBatchRunning||partsSelecting){if(checkbox)event.preventDefault();return;}
+  if(event.shiftKey&&partsSelectionAnchor!==null) {
+    for(const part of listedParts.slice(Math.min(index,partsSelectionAnchor),Math.max(index,partsSelectionAnchor)+1))selectedParts.set(part.id,part.number);
+  } else if(checkbox||event.ctrlKey||event.metaKey) {
+    if(selectedParts.has(id))selectedParts.delete(id);else selectedParts.set(id,listedParts[index].number);
+  }
+  partsSelectionAnchor=index;updatePartSelection();
+  if(!checkbox){event.preventDefault();selectPartSummary(id,true);}
+});
+
+
+$('parts-rows').addEventListener('dblclick', event => {
+  if (partsBatchRunning || partsSelecting || event.ctrlKey || event.metaKey || event.shiftKey
+      || event.target.closest('input, select, textarea, button, label')) return;
+  const row = event.target.closest('tr[data-part-id]');
+  const part = listedParts.find(part => part.id === row?.dataset.partId);
+  if (!part) return;
+  event.preventDefault();
+  location.hash = `#/part/${encodeURIComponent(part.id)}/${encodeURIComponent(part.latest_revision_id)}/summary`;
+});
+
+function updatePartSelection() {
+  const busy=partsBatchRunning||partsSelecting||partsPageBusy;
+  $('parts-selection-count').textContent=`${selectedParts.size} selected`;
+  let loadedSelected=0;
+  for(const row of $('parts-rows').rows) {
+    const selected=selectedParts.has(row.dataset.partId);
+    row.classList.toggle('selected',selected);
+    const checkbox=row.querySelector('.part-select');checkbox.checked=selected;checkbox.disabled=busy;
+    if(selected)loadedSelected++;
+  }
+  $('parts-select-all').checked=listedParts.length>0&&loadedSelected===listedParts.length;
+  $('parts-select-all').indeterminate=loadedSelected>0&&loadedSelected<listedParts.length;
+  $('parts-select-all').disabled=busy||!listedParts.length;
+  $('parts-select-matching').disabled=busy;
+  $('parts-clear-selection').disabled=busy||!selectedParts.size;
+  $('parts-force-resave').disabled=busy||!selectedParts.size||!me?.can_author;
+}
+$('parts-select-all').addEventListener('change',()=>{
+  for(const part of listedParts)if($('parts-select-all').checked)selectedParts.set(part.id,part.number);else selectedParts.delete(part.id);
+  updatePartSelection();
+});
+$('parts-clear-selection').addEventListener('click',()=>{selectedParts.clear();partsSelectionAnchor=null;updatePartSelection();});
+$('parts-select-matching').addEventListener('click',()=>act(async()=>{
+  partsSelecting=true;updatePartSelection();
+  const query=partsQuery,generation=partsGeneration;let next=null;
+  try {
+    selectedParts.clear();
+    do {
+      const page=await api('GET',`/api/parts?${query}&limit=${PARTS_PAGE}${next?`&after=${encodeURIComponent(next)}`:''}`);
+      if(generation!==partsGeneration)return;
+      for(const part of page.parts)selectedParts.set(part.id,part.number);
+      next=page.next;updatePartSelection();
+    } while(next);
+  } finally {partsSelecting=false;updatePartSelection();}
+}));
+$('parts-force-resave').addEventListener('click',()=>act(forceResaveSelectedParts));
+function restorePartBatch() {
+  if(partsBatchUser===me.id)return;
+  partsBatchUser=me.id;partsBatchReport=null;partsBatchOffset=0;
+  try {partsBatchReport=JSON.parse(localStorage.getItem(`plm.parts.resave:${me.id}`));}catch {}
+}
+async function forceResaveSelectedParts() {
+  if(partsBatchRunning||!selectedParts.size)return;
+  partsBatchRunning=true;updatePartSelection();
+  $('parts-batch-status').textContent='Adding selected parts to the bake queue…';
+  const labels=new Map(selectedParts);
+  try {
+    const report=await api('POST','/api/bake/resave',{parts:[...labels.keys()]});
+    partsBatchOffset=0;
+    partsBatchReport={...report,jobs:report.jobs.map(job=>({id:job.id})),failures:report.failures.map(f=>({...f,number:labels.get(f.part_id)||f.part_id}))};
+    partsBatchUser=me.id;
+    try {localStorage.setItem(`plm.parts.resave:${me.id}`,JSON.stringify(partsBatchReport));}catch {}
+    const counts={pending:0,claimed:0,done:0,failed:0,waiting:0};
+    for(const job of report.jobs){counts[job.status]++;if(job.status==='pending'&&job.waiting_on_checkout)counts.waiting++;}
+    drawPartsBatch({jobs:report.jobs.slice(0,50),total:report.jobs.length,counts});
+  } finally {partsBatchRunning=false;updatePartSelection();}
+}
+function drawPartsBatch(page) {
+  if(!partsBatchReport)return;
+  const {counts}=page,failures=partsBatchReport.failures;
+  const total=page.total+failures.length;
+  partsBatchOffset=Math.min(partsBatchOffset,Math.floor(Math.max(0,total-1)/50)*50);
+  const tracked=partsBatchOffset<page.total?page.jobs:[];
+  const shownFailures=failures.slice(Math.max(0,partsBatchOffset-page.total),Math.max(0,partsBatchOffset+50-page.total));
+  $('parts-batch-status').textContent=`${counts.pending} queued, ${counts.claimed} running, ${counts.done} completed, ${counts.failed+failures.length} failed${counts.waiting?`, ${counts.waiting} waiting for checkout`:''}.`;
+  $('parts-batch-results').hidden=false;
+  $('parts-batch-result-list').innerHTML=tracked.map(job=>`<li${job.status==='failed'?' class="error"':''}>${escape(job.number)}: ${escape(job.status==='done'?(job.error||'Resaved model and thumbnail'):job.status==='claimed'?'Baking…':job.status==='failed'?job.error:job.waiting_on_checkout?`Waiting for ${job.locked_by} to check in`:'Queued for bake worker')}</li>`).join('')
+    +shownFailures.map(f=>`<li class="error">${escape(f.number)}: ${escape(f.error)}</li>`).join('');
+  $('parts-batch-page-status').textContent=`Page ${Math.floor(partsBatchOffset/50)+1} of ${Math.max(1,Math.ceil(total/50))} · ${total} results`;
+  $('parts-batch-prev').disabled=partsBatchPolling||partsBatchOffset===0;
+  $('parts-batch-next').disabled=partsBatchPolling||partsBatchOffset+50>=total;
+}
+async function refreshPartsBatch() {
+  if(!me||document.hidden||partsBatchRunning||partsBatchPolling||$('view-parts').hidden)return;
+  restorePartBatch();if(!partsBatchReport)return;
+  partsBatchPolling=true;
+  $('parts-batch-prev').disabled=true;$('parts-batch-next').disabled=true;
+  const batch=partsBatchReport;
+  try {
+    const page=await api('POST','/api/bake/jobs/progress',{ids:batch.jobs.map(job=>job.id),offset:partsBatchOffset,limit:50});
+    if(batch!==partsBatchReport)return;
+    partsBatchPolling=false;drawPartsBatch(page);
+  }catch {} finally {partsBatchPolling=false;}
+}
+for(const [id,step] of [['parts-batch-prev',-50],['parts-batch-next',50]]) {
+  $(id).addEventListener('click',()=>{if(partsBatchPolling)return;partsBatchOffset+=step;refreshPartsBatch();});
+}
+setInterval(refreshPartsBatch,5000);
+
+const OBJECT_TABS = [['summary', 'Summary'], ['revisions', 'Revisions'], ['structure', 'Structure'], ['review', 'Review'], ['attachments', 'Attachments'], ['sourcing', 'Sourcing'], ['history', 'History']];
+let objectTab = 'summary';
+$('object-tabs').innerHTML = OBJECT_TABS.map(([id, label]) => `<button type="button" role="tab" id="object-tab-${id}" data-object-tab="${id}" aria-controls="object-panel-${id}" aria-selected="false">${label}</button>`).join('');
+for (const [id] of OBJECT_TABS) {
+  const panel = document.querySelector(`[data-object-panel="${id}"]`);
+  panel.id = panel.id || `object-panel-${id}`;
+  $(`object-tab-${id}`).setAttribute('aria-controls', panel.id);
+  panel.setAttribute('role', 'tabpanel');
+  panel.setAttribute('aria-labelledby', `object-tab-${id}`);
+}
+function selectObjectTab(id) {
+  objectTab = id;
+  for (const button of $('object-tabs').querySelectorAll('button')) {
+    const active = button.dataset.objectTab === id;
+    button.setAttribute('aria-selected', String(active));
+    button.tabIndex = active ? 0 : -1;
+  }
+  for (const panel of document.querySelectorAll('[data-object-panel]')) panel.classList.toggle('active', panel.dataset.objectPanel === id);
+}
+$('object-tabs').addEventListener('click', event => {
+  const tab = event.target.closest('[data-object-tab]');
+  if (tab) selectObjectTab(tab.dataset.objectTab);
+});
+$('object-tabs').addEventListener('keydown', event => {
+  if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
+  event.preventDefault();
+  const index = OBJECT_TABS.findIndex(([id]) => id === objectTab);
+  const next = event.key === 'Home' ? 0 : event.key === 'End' ? OBJECT_TABS.length - 1 : (index + (event.key === 'ArrowRight' ? 1 : -1) + OBJECT_TABS.length) % OBJECT_TABS.length;
+  selectObjectTab(OBJECT_TABS[next][0]);
+  $(`object-tab-${objectTab}`).focus();
+});
+selectObjectTab('summary');
+
+$('menu-change-password').addEventListener('click', () => {
+  if (location.hash === '#/account/password') act(route);
+});
+$('shell-back').addEventListener('click', () => history.back());
+$('shell-refresh').addEventListener('click', () => act(route));
+$('menu-new-part').addEventListener('click', () => $('new-part').click());
+for (const menu of document.querySelectorAll('.command-menu')) {
+  menu.addEventListener('toggle', () => {
+    if (menu.open) for (const other of document.querySelectorAll('.command-menu')) if (other !== menu) other.open = false;
+  });
+  menu.addEventListener('click', event => { if (event.target.closest('a, button')) menu.open = false; });
+}
+document.addEventListener('click', event => {
+  if (!event.target.closest('.command-menu')) for (const menu of document.querySelectorAll('.command-menu')) menu.open = false;
+});
+document.addEventListener('keydown', event => {
+  if (event.key === 'Escape') for (const menu of document.querySelectorAll('.command-menu[open]')) { menu.open = false; menu.querySelector('summary').focus(); }
+});
 
 let searchTimer = null;
 for (const id of ['search', 'filter-tag']) {
@@ -356,6 +660,8 @@ for (const id of ['search', 'filter-tag']) {
     searchTimer = setTimeout(() => act(renderParts), 150);
   });
 }
+$('filter-geometry').addEventListener('change', () => act(renderParts));
+$('filter-thumbnail').addEventListener('change', () => act(renderParts));
 $('filter-category').addEventListener('change', () => act(renderParts));
 $('filter-company').addEventListener('change', () => act(renderParts));
 
@@ -371,25 +677,33 @@ document.addEventListener('click', (event) => {
 
 // ----------------------------------------------------------------- one part
 
-async function renderPart(id) {
+async function renderPart(id, selectedRevision) {
   const detail = await api('GET', `/api/parts/${encodeURIComponent(id)}`);
   // The editor belongs to one part's document; opening another part closes it
   // rather than leaving the last part's text under this part's heading.
-  if (editorKey && !editorKey.startsWith(`part/${detail.id}/`)) {
+  if (editorKey && !editorKey.startsWith(`part/${idSegment(detail.id)}/`)) {
     $('editor').hidden = true;
     editorKey = null;
   }
+  if (currentPart?.id !== detail.id) selectObjectTab('summary');
   currentPart = detail;
+  if (selectedRevision && detail.revision_views.some(r => r.id === selectedRevision)) {
+    structure.part = detail.id; structure.revision = selectedRevision;
+    attaching.part = detail.id; attaching.revision = selectedRevision; reviewRevision = selectedRevision;
+  }
+  const cadRevision = detail.revision_views.find(r => r.id === selectedRevision) || detail.revision_views.at(-1);
+  $('part-open-cad').innerHTML = cadRevision ? openInCadButton(detail.id, cadRevision.id, cadRevision.editable ? 'Edit in CAD' : 'Open in CAD') : '';
   $('part-thumb').innerHTML = thumb(detail.thumbnail_url, 'lg');
   $('part-number').textContent = detail.number;
   $('part-name').textContent = detail.name;
   $('part-meta').innerHTML =
-    `${escape(detail.part_type)} · ${classBadge(detail.document_class)} · created ${escape(when(detail.created_at))}`
+    `${escape(detail.part_type)}${detail.document_class && detail.document_class !== 'normal' ? ` · ${classBadge(detail.document_class)}` : ''} · created ${escape(when(detail.created_at))}`
     + (detail.description ? ` · ${escape(detail.description)}` : '');
-  renderDetails(detail);
+  await renderDetails(detail);
   renderSourcing(detail);
   await renderSeed(detail);
   await renderStructure(detail);
+  await loadSummaryFields(detail, selectedRevision || structure.revision);
   await renderAttachments(detail);
   await renderReview(detail);
   await renderHistory(detail);
@@ -409,14 +723,11 @@ async function renderPart(id) {
       ? `${escape(rev.locked_by)}${rev.locked_by_me ? ' (you)' : ''}<br><span class="muted">${when(rev.locked_at)}</span>`
       : '—';
     return `
-      <tr>
-        <td><span class="rev-label">${revThumb(rev)}<strong>${escape(rev.label)}</strong></span></td>
-        <td><span class="state state-${escape(rev.lifecycle)}">${escape(rev.lifecycle)}</span></td>
+      <tr data-revision-id="${escape(rev.id)}">
+        <td><span class="rev-label">${revThumb(rev)}<strong>${escape(rev.label)}</strong></span>${revisionContext(rev)}</td>
+        <td><span class="state state-${escape(rev.lifecycle)}">${escape(statusName(rev.lifecycle))}</span></td>
         <td>${reviewCell(rev)}</td>
-        <td class="source">${sourceText(rev)}</td>
         <td>${held}</td>
-        <td>${bytes(rev.size)}</td>
-        <td class="mono muted">${escape(rev.content_hash.slice(0, 12)) || '—'}</td>
         <td class="actions">${actions(rev)}</td>
       </tr>`;
   }).join('');
@@ -424,42 +735,45 @@ async function renderPart(id) {
   for (const button of $('rev-rows').querySelectorAll('button[data-do]')) {
     button.addEventListener('click', () => onRevisionAction(button.dataset.do, button.dataset.rev));
   }
+  Workbench.partChanged(detail);
 }
 
 function revThumb(rev) {
   const t = rev.thumbnail;
   if (!t) return thumb('', 'xs', 'No picture yet');
   if (!t.current) return thumb('', 'xs', 'The picture is of an older save; the next save from CAD makes a new one');
-  return thumb(t.url, 'xs', `Rendered by ${t.renderer}`);
+  return thumb(t.url, 'xs', `Revision ${rev.label} preview`);
 }
 
 function actions(rev) {
   const out = [];
+  const advanced = [];
   const rid = escape(rev.id);
   const cad = openInCadButton(currentPart.id, rev.id);
   if (cad) out.push(cad);
   if (rev.editable) {
     if (!rev.locked_by && me.can_author) out.push(`<button class="link" data-do="checkout" data-rev="${rid}">Check out</button>`);
     if (rev.locked_by_me) {
-      out.push(`<button class="link" data-do="edit" data-rev="${rid}">Edit</button>`);
+      advanced.push(`<button class="link" data-do="edit" data-rev="${rid}">Edit model JSON</button>`);
       out.push(`<button class="link" data-do="checkin" data-rev="${rid}">Check in</button>`);
     } else if (rev.locked_by && me.can_checkin) {
       out.push(`<button class="link danger" data-do="break" data-rev="${rid}">Break lock</button>`);
     }
-    if (rev.lifecycle === 'draft' && me.can_author) out.push(`<button class="link" data-do="submit" data-rev="${rid}">Submit for review</button>`);
+    if (rev.lifecycle === 'draft' && me.can_author && statusEnabled('inreview')) out.push(`<button class="link" data-do="submit" data-rev="${rid}">Submit for review</button>`);
     if (rev.lifecycle === 'inreview' && me.can_author) out.push(`<button class="link" data-do="withdraw" data-rev="${rid}">Withdraw</button>`);
     if (!rev.eco && me.can_author) out.push(`<button class="link" data-do="to-eco" data-rev="${rid}">Add to change order</button>`);
-    if (!rev.locked_by && me.can_checkin) out.push(`<button class="link" data-do="release" data-rev="${rid}">Release</button>`);
+    if (!rev.locked_by && me.can_checkin && statusEnabled('released')) out.push(`<button class="link" data-do="release" data-rev="${rid}">Release</button>`);
     if (me.can_author) out.push(`<button class="link" data-do="delete" data-rev="${rid}">Delete</button>`);
   } else {
-    out.push(`<button class="link" data-do="view" data-rev="${rid}">View</button>`);
-    if (rev.lifecycle === 'released' && me.can_checkin) {
+    advanced.push(`<button class="link" data-do="view" data-rev="${rid}">View model JSON</button>`);
+    if (rev.lifecycle === 'released' && me.can_checkin && statusEnabled('obsolete')) {
       out.push(`<button class="link" data-do="obsolete" data-rev="${rid}">Obsolete</button>`);
     }
     if (['released', 'superseded'].includes(rev.lifecycle) && !rev.eco && me.can_author) {
       out.push(`<button class="link" data-do="to-eco" data-rev="${rid}">Add to change order</button>`);
     }
   }
+  if (advanced.length) out.push(`<details class="revision-advanced"><summary>Advanced</summary>${advanced.join(' ')}</details>`);
   return out.join(' ');
 }
 
@@ -521,22 +835,23 @@ let editorKey = null;
 async function openEditor(revisionId, writable) {
   const rev = currentPart.revision_views.find((r) => r.id === revisionId);
   editorKey = rev.document_key;
-  const body = await api('GET', `/api/store/doc/${rev.document_key}`);
+  const body = await api('GET', `/api/store/doc/${rev.document_key.replaceAll('%', '%25')}`);
   $('editor').hidden = false;
-  $('editor-key').textContent = rev.document_key;
+  $('editor-key').textContent = `${currentPart.number}/${rev.label}`;
   $('editor-body').value = body === null ? '' : (typeof body === 'string' ? body : JSON.stringify(body, null, 2));
   $('editor-body').readOnly = !writable;
   $('editor-save').hidden = !writable;
   $('editor-note').textContent = writable
-    ? 'This is the CAD document. It is stored verbatim; the CAD app will read and write this same key.'
-    : `Revision ${rev.label} is ${rev.lifecycle} and immutable — shown read-only.`;
+    ? 'Advanced model editing. Use Edit in CAD for normal design changes.'
+    : `Revision ${rev.label} is shown read-only${rev.locked_by ? `; checked out by ${rev.locked_by}` : ''}. Saved changes remain visible.`;
   $('editor-status').textContent = '';
   $('editor').scrollIntoView({ behavior: 'smooth', block: 'start' });
 }
 
 $('editor-save').addEventListener('click', () => act(async () => {
-  const result = await api('PUT', `/api/store/doc/${editorKey}`, $('editor-body').value);
-  $('editor-status').textContent = `saved · seq ${result.seq} · ${result.content_hash.slice(0, 12)}`;
+  await api('PUT', `/api/store/doc/${editorKey.replaceAll('%', '%25')}`, $('editor-body').value);
+  $('editor-status').textContent = 'Saved.';
+  OpenPages.saved();
   await renderPart(currentPart.id);
 }));
 
@@ -557,7 +872,7 @@ $('editor-file').addEventListener('change', () => act(async () => {
 // text would silently undo the import, so the editor re-reads it.
 async function reloadEditor(key) {
   if ($('editor').hidden || editorKey !== key) return;
-  const body = await api('GET', `/api/store/doc/${key}`);
+  const body = await api('GET', `/api/store/doc/${key.replaceAll('%', '%25')}`);
   $('editor-body').value = body === null ? '' : (typeof body === 'string' ? body : JSON.stringify(body, null, 2));
   $('editor-status').textContent = 'reloaded: the import changed this document';
 }
@@ -630,7 +945,7 @@ $('new-part-form').addEventListener('submit', (event) => {
     for (const id of ['np-number', 'np-name', 'np-category', 'np-tags', 'np-description', 'np-label']) $(id).value = '';
     $('np-attrs').innerHTML = '';
     $('np-class').value = 'normal';
-    location.hash = `#/part/${part.id}`;
+    location.hash = `#/part/${encodeURIComponent(part.id)}`;
   });
 });
 
@@ -764,84 +1079,57 @@ function readAttrForm(container, clearEmpty = false) {
 
 // -- the part's catalog panel and its edit dialog
 
-function renderDetails(detail) {
+const PART_ATTRIBUTE_LOCK_ICON = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="5" y="10" width="14" height="11" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/></svg>';
+function partAttributeEditor(field, value, editable, attributes = '') {
+  const lock = editable ? '' : PART_ATTRIBUTE_LOCK_ICON;
+  return `<div class="part-attribute-input${editable ? '' : ' is-read-only'}"><span class="attribute-lock" aria-hidden="true"${editable ? '' : ' title="Read-only"'}>${lock}</span>${fieldValueEditor(field, value, !editable, attributes)}</div>`;
+}
+
+async function renderDetails(detail) {
+  await loadCategories();
+  const catalogEditable = me.can_author && !detail.catalog_locked;
   $('part-locked').hidden = !detail.catalog_locked;
-  $('part-category').innerHTML = detail.category_path
-    ? `Category: <a href="#/catalog/${encodeURIComponent(detail.category)}">${escape(detail.category_path)}</a>`
-    : detail.category
-      ? `Category text <strong>${escape(detail.category)}</strong> is not a catalog category, so the part is uncategorized.`
-      : 'Uncategorized.';
-  $('part-tags').innerHTML = detail.tags.length ? tagChips(detail.tags) : '';
-  const rows = detail.schema.map((def) => {
+  const options = categories.map(c => ({value: c.id, label: c.path || c.name}));
+  if (detail.category && !options.some(o => o.value === detail.category)) {
+    options.push({value: detail.category, label: `${detail.category} (not in the catalog)`});
+  }
+  const metadata = [
+    {key: 'has_geometry', name: 'Contains 3D geometry', type: 'bool', editable: false},
+    {key: 'has_thumbnail', name: 'Has thumbnail', type: 'bool', editable: false},
+    {key: 'category', name: 'Category', type: 'enum', options, empty_label: 'Uncategorized', editable: catalogEditable},
+    {key: 'tags', name: 'Tags', type: 'text', encoding: 'comma-list', editable: me.can_author},
+  ];
+  const rows = metadata.map(f => `<dt>${escape(f.name)}</dt><dd>${partAttributeEditor(f, detail[f.key], f.editable, `data-summary-metadata="${escape(f.key)}"`)}</dd>`);
+  rows.push(...detail.schema.map(def => {
     const value = detail.attributes[def.key];
-    const shown = valueText(def, value);
-    const cell = shown
-      || (def.required ? '<span class="missing">missing — needed before release</span>' : '<span class="muted">—</span>');
-    return `<dt>${escape(def.name)}${def.required ? ' <span class="req">*</span>' : ''}</dt><dd>${cell}</dd>`;
-  });
+    const cell = partAttributeEditor(def, value, catalogEditable, `data-summary-catalog="${escape(def.key)}"`);
+    return `<dt>${escape(def.name)}${def.required ? ' <span class="req">*</span>' : ''}</dt><dd>${cell}${def.required && value == null ? '<span class="missing">missing — needed before release</span>' : ''}</dd>`;
+  }));
   for (const key of detail.inert) {
-    rows.push(`<dt class="muted">${escape(key)}</dt><dd><span class="inert-value">${escape(detail.attributes[key])}</span>
-      <span class="muted">not an attribute of this category; kept, no effect</span></dd>`);
+    rows.push(`<dt class="muted">${escape(key)}</dt><dd>${partAttributeEditor({name: key, type: 'text'}, detail.attributes[key], false)}
+      <span class="muted">Not an attribute of this category; kept, no effect.</span>
+      <button type="button" class="ghost" data-summary-clear="${escape(key)}"${catalogEditable ? '' : ' disabled'}>Clear value</button></dd>`);
   }
   $('part-attrs').innerHTML = rows.join('');
-  $('part-attrs').hidden = rows.length === 0;
-}
-
-$('edit-part').addEventListener('click', () => act(async () => {
-  const part = currentPart;
-  await loadCategories();
-  $('pe-number').textContent = part.number;
-  $('pe-name').value = part.name;
-  $('pe-description').value = part.description;
-  $('pe-tags').value = part.tags.join(', ');
-  categoryOptions($('pe-category'), { blank: '— none —' });
-  // Old free text that names no category stays selectable, so saving the
-  // other fields does not silently change it.
-  if (part.category && !categories.some((c) => c.id === part.category)) {
-    $('pe-category').insertAdjacentHTML('beforeend',
-      `<option value="${escape(part.category)}">${escape(part.category)} (not in the catalog)</option>`);
-  }
-  $('pe-category').value = part.category;
-  $('pe-attrs').innerHTML = ''; // not the last part's inputs
-  await syncEditAttrs();
-  $('part-dialog').showModal();
-}));
-
-// The edit dialog's attribute inputs, and the values the chosen category
-// does not define — which can be cleared, not changed.
-async function syncEditAttrs() {
-  const part = currentPart;
-  const typed = $('pe-attrs').children.length ? readAttrForm($('pe-attrs')) : {};
-  const values = { ...part.attributes, ...typed };
-  const schema = await syncAttrForm($('pe-category').value, $('pe-attrs'), values);
-  const keys = new Set(schema.map((d) => d.key));
-  const inert = Object.keys(part.attributes).filter((k) => !keys.has(k));
-  $('pe-inert').hidden = inert.length === 0;
-  $('pe-inert').innerHTML = inert.length
-    ? `<p class="muted">Kept from another category; they have no effect here:</p>${inert.map((k) => `
-      <label class="inline"><input type="checkbox" data-clear="${escape(k)}"><span>clear <strong>${escape(k)}</strong> = ${escape(part.attributes[k])}</span></label>`).join('')}`
-    : '';
-}
-
-$('pe-category').addEventListener('change', () => act(syncEditAttrs));
-
-$('part-edit-form').addEventListener('submit', (event) => {
-  if (event.submitter && event.submitter.value !== 'save') return;
-  event.preventDefault();
-  act(async () => {
-    const attributes = readAttrForm($('pe-attrs'), true);
-    for (const box of $('pe-inert').querySelectorAll('input[data-clear]:checked')) attributes[box.dataset.clear] = null;
-    await api('PATCH', `/api/parts/${encodeURIComponent(currentPart.id)}`, {
-      name: $('pe-name').value,
-      description: $('pe-description').value,
-      category: $('pe-category').value,
-      tags: splitTags($('pe-tags').value),
-      attributes,
-    });
-    $('part-dialog').close();
-    await renderPart(currentPart.id);
+  $('part-attrs').hidden = false;
+  for (const input of $('part-attrs').querySelectorAll('[data-summary-metadata]')) input.onchange = () => act(async () => {
+    const field = metadata.find(f => f.key === input.dataset.summaryMetadata);
+    input.disabled = true;
+    try { await api('PATCH', `/api/parts/${encodeURIComponent(detail.id)}`, {[field.key]: editedFieldValue(field, input)}); }
+    finally { await renderPart(detail.id, $('summary-revision').value); }
   });
-});
+  for (const input of $('part-attrs').querySelectorAll('[data-summary-catalog]')) input.onchange = () => act(async () => {
+    const def = detail.schema.find(f => f.key === input.dataset.summaryCatalog);
+    input.disabled = true;
+    try { await api('PATCH', `/api/parts/${encodeURIComponent(detail.id)}`, {attributes: {[def.key]: editedFieldValue(def, input)}}); }
+    finally { await renderPart(detail.id, $('summary-revision').value); }
+  });
+  for (const button of $('part-attrs').querySelectorAll('[data-summary-clear]')) button.onclick = () => act(async () => {
+    button.disabled = true;
+    try { await api('PATCH', `/api/parts/${encodeURIComponent(detail.id)}`, {attributes: {[button.dataset.summaryClear]: null}}); }
+    finally { await renderPart(detail.id, $('summary-revision').value); }
+  });
+}
 
 // -- the catalog view
 
@@ -873,11 +1161,12 @@ async function renderCatalog(id) {
   $('cat-title').textContent = c.path;
   $('cat-parts').href = `#/parts/${encodeURIComponent(c.id)}`;
   $('cat-parts').textContent = `Show parts (${c.parts_within})`;
-  $('cat-meta').innerHTML = `<span class="mono">${escape(c.id)}</span> · ${c.parts} part${c.parts === 1 ? '' : 's'} filed here, ${c.parts_within} including sub-categories`;
+  $('cat-meta').innerHTML = `${c.parts} part${c.parts === 1 ? '' : 's'} filed here, ${c.parts_within} including sub-categories`;
 
   const inherited = schema.attributes.filter((a) => a.from !== c.id);
   const nameOf = (id) => (categories.find((x) => x.id === id) || { name: id }).name;
   $('cat-inherited-none').hidden = inherited.length > 0;
+  $('cat-inherited-none').textContent = c.parent ? 'No inherited fields are defined by this category’s ancestors.' : 'None. This is a top-level category.';
   $('cat-inherited-table').hidden = inherited.length === 0;
   $('cat-inherited').innerHTML = inherited.map((a) => `
     <tr><td class="mono">${escape(a.key)}</td><td>${escape(a.name)}</td><td>${typeText(a)}</td>
@@ -981,8 +1270,9 @@ async function renderTypes() {
         ? `counter <span class="mono">${escape(t.prefix)}</span> + ${t.digits} digits`
         : modeText(t.mode)}</td>
       <td class="mono">${t.mode.kind === 'counter' ? escape(t.next_number) : '<span class="muted">typed or scripted</span>'}</td>
-      <td class="actions">${me.is_admin ? `<button class="link" data-type="${escape(t.id)}">Edit</button>` : ''}</td>
+      <td class="actions">${me.is_admin ? `<button class="link" data-type="${escape(t.id)}">Edit</button> <button class="link" data-type-fields="${escape(t.id)}">Fields…</button>` : ''}</td>
     </tr>`).join('');
+  for(const button of $('type-rows').querySelectorAll('[data-type-fields]'))button.addEventListener('click',()=>act(()=>openFieldDefinitions(button.dataset.typeFields)));
   for (const button of $('type-rows').querySelectorAll('button[data-type]')) {
     button.addEventListener('click', () => openTypeEditor(button.dataset.type));
   }
@@ -1467,6 +1757,7 @@ $('settings-form').addEventListener('submit', (event) => {
     await api('PATCH', '/api/ecos/numbering', readEcoNumbering());
     await renderSettings();
     $('settings-status').textContent = 'Saved.';
+    OpenPages.saved();
   });
 });
 
@@ -1584,8 +1875,9 @@ function guessFunction(path, text) {
   return 'partNumber';
 }
 
-async function openScript(path, starter) {
-  if (scriptDirty() && !confirm(`Discard unsaved changes to ${scriptPath}?`)) return;
+async function openScript(path, starter, routed = false) {
+  if(!routed && (starter===undefined || OpenPages.scriptDraft(`#/scripts/${encodeURIComponent(path)}`))){location.hash=`#/scripts/${encodeURIComponent(path)}`;return;}
+  if(!routed)OpenPages.capture();
   let text = starter;
   if (text === undefined) {
     text = (await api('GET', `/api/scripts/file/${path}`)).text;
@@ -1604,6 +1896,7 @@ async function openScript(path, starter) {
   $('run-output').hidden = true;
   $('run-status').textContent = '';
   await renderScripts();
+  if(!routed){const hash=`#/scripts/${encodeURIComponent(path)}`;history.replaceState(null,'',hash);OpenPages.activate(hash,'scripts',path);OpenPages.capture();}
 }
 
 $('script-text').addEventListener('input', syncScriptButtons);
@@ -1624,12 +1917,14 @@ $('script-new').addEventListener('submit', (event) => {
 $('script-save').addEventListener('click', () => act(async () => {
   await api('PUT', `/api/scripts/file/${scriptPath}`, $('script-text').value);
   scriptSaved = $('script-text').value;
+  OpenPages.saved();
   await renderScripts();
 }));
 
 $('script-delete').addEventListener('click', () => act(async () => {
   if (!confirm(`Delete ${scriptPath} from the scripts directory?`)) return;
   await api('DELETE', `/api/scripts/file/${scriptPath}`);
+  OpenPages.closeTab(OpenPages.keyOf(location.hash),true);
   scriptPath = null;
   scriptSaved = '';
   $('script-path').textContent = 'No file open';
@@ -1662,9 +1957,7 @@ $('run-go').addEventListener('click', () => act(async () => {
   out.textContent = lines.join('\n');
 }));
 
-window.addEventListener('beforeunload', (event) => {
-  if (scriptDirty()) event.preventDefault();
-});
+// OpenPages owns unload warnings for active and background script drafts.
 
 // ---------------------------------------------------------------------- go
 
@@ -1672,19 +1965,20 @@ window.addEventListener('beforeunload', (event) => {
 
 // ------------------------------------------------- families and templates
 
-// Where a revision came from: the family row or the template that made it,
-// its bake, and whether someone has edited it since.
-function sourceText(rev) {
-  const out = [];
-  const link = (p) => `<a href="#/part/${encodeURIComponent(p.part_id)}">${escape(p.number)}</a> rev ${escape(p.revision_label)}`;
-  if (rev.family) out.push(`family ${link(rev.family)}`);
-  if (rev.template) out.push(`template ${link(rev.template)}`);
-  if (rev.hand_edited) out.push('<span class="st st-stale">edited since</span>');
-  if (rev.uses) out.push(`assembly: uses ${rev.uses} part${rev.uses === 1 ? '' : 's'}`);
+// Surface build failures and regeneration risks; ancestry is useful on demand.
+function revisionContext(rev) {
+  const notices = [];
+  if (rev.hand_edited) notices.push('<span class="st st-stale">Edited after generation</span>');
   if (rev.bake && rev.bake !== 'done') {
-    out.push(`<span class="st st-${escape(rev.bake)}" title="${escape(rev.bake_error)}">bake ${escape(rev.bake)}</span>`);
+    const label = { pending: 'Build queued', claimed: 'Building', failed: 'Build failed' }[rev.bake] || `Build ${rev.bake}`;
+    notices.push(`<span class="st st-${escape(rev.bake)}">${escape(label)}</span>${rev.bake_error ? `<div class="error">${escape(rev.bake_error)}</div>` : ''}`);
   }
-  return out.join(' · ') || '<span class="muted">—</span>';
+  const parents = [];
+  const link = p => `<a href="#/part/${encodeURIComponent(p.part_id)}/${encodeURIComponent(p.revision_label)}/summary">${escape(p.number)}/${escape(p.revision_label)}</a>`;
+  if (rev.family) parents.push(`Family ${link(rev.family)}`);
+  if (rev.template) parents.push(`Template ${link(rev.template)}`);
+  if (parents.length) notices.push(`<details><summary>Generated from</summary>${parents.join('<br>')}</details>`);
+  return notices.length ? `<div class="revision-context">${notices.join(' ')}</div>` : '';
 }
 
 const STATUS_WORDS = {
@@ -1713,7 +2007,7 @@ async function renderFamily(detail) {
   const q = familyRevision ? `?revision=${encodeURIComponent(familyRevision)}` : '';
   const view = await api('GET', `/api/parts/${encodeURIComponent(detail.id)}/family${q}`);
   $('fam-revision').innerHTML = view.revisions
-    .map((r) => `<option value="${escape(r.id)}">${escape(r.label)} (${escape(r.lifecycle)})</option>`)
+    .map((r) => `<option value="${escape(r.id)}">${escape(r.label)} (${escape(statusName(r.lifecycle))})</option>`)
     .join('');
   $('fam-revision').value = view.revision_id;
   await memberTypeOptions($('fam-member-type'), view.member_part_type);
@@ -1733,7 +2027,7 @@ async function renderFamily(detail) {
     const m = row.member;
     const member = m
       ? `<a href="#/part/${encodeURIComponent(m.part_id)}">${escape(m.number)}</a>`
-        + (m.revision_label ? ` rev ${escape(m.revision_label)} <span class="state state-${escape(m.lifecycle)}">${escape(m.lifecycle)}</span>` : '')
+        + (m.revision_label ? ` rev ${escape(m.revision_label)} <span class="state state-${escape(m.lifecycle)}">${escape(statusName(m.lifecycle))}</span>` : '')
         + (m.bake && m.bake !== 'done' ? ` <span class="st st-${escape(m.bake)}" title="${escape(m.bake_error)}">bake ${escape(m.bake)}</span>` : '')
       : '<span class="muted">not yet</span>';
     const cells = view.columns.map((c) => `<td class="mono">${escape(row.values[c.name] ?? '')}</td>`).join('');
@@ -1825,7 +2119,7 @@ $('import-form').addEventListener('submit', (event) => {
     $('import-csv').value = '';
     familyRevision = result.import.revision_id;
     await renderPart(currentPart.id);
-    await reloadEditor(`part/${currentPart.id}/rev/${result.import.revision_id}`);
+    await reloadEditor(documentKey(currentPart.id, result.import.revision_id));
     const i = result.import;
     const box = $('fam-report');
     if (result.generate) {
@@ -1871,7 +2165,7 @@ async function renderTemplate(detail) {
       ? `<select data-input="${escape(input.name)}">${input.choices.map((c) =>
         `<option${c.trim() === input.default ? ' selected' : ''}>${escape(c)}</option>`).join('')}</select>`
       : `<input class="mono" data-input="${escape(input.name)}" value="${escape(input.default)}">`;
-    return `<label><span>${label} <span class="mono muted">${escape(input.name)}</span>${limits ? ` <span class="muted">(${escape(limits)})</span>` : ''}</span>${field}</label>`;
+    return `<label><span title="${escape(input.name)}">${label}${limits ? ` <span class="muted">(${escape(limits)})</span>` : ''}</span>${field}</label>`;
   }).join('');
   $('tpl-copies-none').hidden = view.copies.length > 0;
   $('tpl-copies').innerHTML = view.copies.map((c) =>
@@ -1896,15 +2190,51 @@ $('spin-form').addEventListener('submit', (event) => {
     });
     $('spin-name').value = '';
     $('spin-number').value = '';
-    location.hash = `#/part/${part.id}`;
+    location.hash = `#/part/${encodeURIComponent(part.id)}`;
   });
 });
 
 // ----------------------------------------------------------- the bake queue
 
+let bakeWorkerBusy = false, bakeOffset = 0, bakeGeneration = 0, bakeLoading = false, bakeNext = null;
+async function renderBakeWorker() {
+  $('bake-worker-controls').hidden = !me.is_admin;
+  if (!me.is_admin || bakeWorkerBusy) return;
+  const worker = await api('GET', '/api/bake/worker');
+  if (bakeWorkerBusy) return;
+  $('bake-worker-status').textContent = worker.running ? `Running (PID ${worker.pid})` : 'Stopped';
+  $('bake-worker-message').textContent = worker.error || (worker.configured
+    ? (worker.running ? 'The worker is processing queued jobs.' : 'Start the worker to process queued jobs.')
+    : 'The server operator must configure the native worker executable, token file and server URL before it can be started here.');
+  $('bake-worker-start').disabled = !worker.configured || worker.running;
+  $('bake-worker-stop').disabled = !worker.running;
+}
+for (const action of ['start', 'stop']) {
+  $(`bake-worker-${action}`).addEventListener('click', () => act(async () => {
+    if (bakeWorkerBusy) return;
+    bakeWorkerBusy = true;
+    $('bake-worker-start').disabled = true;
+    $('bake-worker-stop').disabled = true;
+    try {
+      await api('POST', `/api/bake/worker/${action}`);
+    } finally {
+      bakeWorkerBusy = false;
+      await renderBakeWorker();
+    }
+  }));
+}
 async function renderBake() {
+  const generation=++bakeGeneration;
+  bakeLoading=true;$('bake-prev').disabled=true;$('bake-next').disabled=true;
+  try {
+  await renderBakeWorker();
   const filter = $('bake-filter').value;
-  const jobs = await api('GET', `/api/bake/jobs${filter ? `?status=${encodeURIComponent(filter)}` : ''}`);
+  const size=Number($('bake-page-size').value);
+  const page = await api('GET', `/api/bake/jobs?${new URLSearchParams({status:filter,limit:size,offset:bakeOffset})}`);
+  if(generation!==bakeGeneration)return;
+  const jobs=page.jobs;
+  bakeOffset=page.offset;bakeNext=page.next;
+  $('bake-page-status').textContent=`Page ${Math.floor(bakeOffset/size)+1} of ${Math.max(1,Math.ceil(page.total/size))} · ${page.total} jobs`;
   $('bake-empty').hidden = jobs.length > 0;
   $('bake-empty').textContent = filter ? 'No jobs.' : 'Nothing waiting.';
   $('bake-rows').innerHTML = jobs.map((job) => {
@@ -1921,7 +2251,7 @@ async function renderBake() {
         job.error ? `<br><span class="muted">${escape(job.error)}</span>` : ''}</td>
       <td>${escape(job.reason)}</td>
       <td>${escape(when(job.requested_at))}<br><span class="muted">${escape(job.requested_by)}</span></td>
-      <td>${worker}${job.locked_by && job.status === 'pending'
+      <td>${worker}${job.waiting_on_checkout && job.status === 'pending'
         ? `<br><span class="muted">waits: checked out by ${escape(job.locked_by)}</span>` : ''}</td>
       <td>${job.attempts}</td>
       <td class="actions">${retry}</td>
@@ -1933,10 +2263,17 @@ async function renderBake() {
       await renderBake();
     }));
   }
+  } finally {
+    if(generation===bakeGeneration){bakeLoading=false;$('bake-prev').disabled=bakeOffset===0;$('bake-next').disabled=bakeNext===null;}
+  }
 }
 
-$('bake-filter').addEventListener('change', () => act(renderBake));
+$('bake-filter').addEventListener('change', () => act(async()=>{bakeOffset=0;await renderBake();}));
+$('bake-page-size').addEventListener('change', () => act(async()=>{bakeOffset=0;await renderBake();}));
+$('bake-prev').addEventListener('click', () => act(async()=>{bakeOffset=Math.max(0,bakeOffset-Number($('bake-page-size').value));await renderBake();}));
+$('bake-next').addEventListener('click', () => act(async()=>{if(bakeNext===null)return;bakeOffset=bakeNext;await renderBake();}));
 $('bake-refresh').addEventListener('click', () => act(renderBake));
+setInterval(()=>{if(me&&!bakeLoading&&!document.hidden&&!$('view-bake').hidden)renderBake().catch(()=>{});},5000);
 
 window.addEventListener('hashchange', route);
 boot();
@@ -1965,7 +2302,7 @@ function defaultRevision(detail) {
 
 function revisionOptions(select, detail, value, { any = false } = {}) {
   const rows = [...detail.revision_views].reverse()
-    .map((r) => `<option value="${escape(r.id)}">${escape(r.label)} · ${escape(r.lifecycle)}</option>`);
+    .map((r) => `<option value="${escape(r.id)}">${escape(r.label)} · ${escape(statusName(r.lifecycle))}</option>`);
   select.innerHTML = (any ? '<option value="">any revision</option>' : '') + rows.join('');
   select.value = value;
 }
@@ -1989,7 +2326,7 @@ async function renderStructure(detail) {
   }
   revisionOptions($('bom-revision'), detail, structure.revision);
   showTab(structure.tab);
-  await Promise.all([loadBom(), loadUses(), loadDiff(), loadWhereUsed()]);
+  await Promise.all([loadBom(), loadUses(), loadDiff(), loadWhereUsed(), loadRevisionFields(detail)]);
 }
 
 function showTab(tab) {
@@ -2009,14 +2346,15 @@ $('bom-revision').addEventListener('change', () => act(async () => {
   await Promise.all([loadBom(), loadUses()]);
 }));
 $('bom-view').addEventListener('change', () => act(loadBom));
-$('bom-levels').addEventListener('change', () => act(loadBom));
 
+let bomReadSerial=0;
 async function loadBom() {
+  const serial=++bomReadSerial;
   const flat = $('bom-view').value === 'flat';
-  $('bom-levels-label').hidden = flat;
-  const query = `levels=${encodeURIComponent($('bom-levels').value)}&flat=${flat}`;
+  const query = `levels=0&flat=${flat}&occurrences=true`;
   const base = `${revUrl(structure.revision)}/bom`;
   const bom = await api('GET', `${base}?${query}`);
+  if(serial!==bomReadSerial)return;
   $('bom-csv').href = `${base}?${query}&format=csv`;
   const empty = bom.lines.length === 0;
   $('bom-empty').hidden = !empty;
@@ -2024,41 +2362,8 @@ async function loadBom() {
   $('bom-csv').hidden = empty;
   $('bom-totals').hidden = empty;
 
-  const warnings = bom.warnings;
-  $('bom-warnings').hidden = warnings.length === 0;
-  $('bom-warnings').innerHTML = warnings.length
-    ? `<strong>${warnings.length} thing${warnings.length === 1 ? '' : 's'} to check before release</strong>
-       <ul>${warnings.map((w) => `<li>${escape(w)}</li>`).join('')}</ul>`
-    : '';
-
-  $('bom-head').innerHTML = `<tr>${flat ? '' : '<th>Pos</th>'}<th>Find</th><th>Number</th><th>Name</th><th>Rev</th><th>State</th>
-    ${flat ? '' : '<th class="num">Qty</th>'}<th class="num">Total</th><th>MPN</th><th>Supplier</th>
-    <th class="num">Each</th><th class="num">Extended</th></tr>`;
-  $('bom-rows').innerHTML = bom.lines.map((line) => {
-    const unit = line.unit === 'each' ? '' : ` ${escape(line.unit)}`;
-    const pos = `${'\u00a0\u00a0'.repeat(Math.max(0, line.level - 1))}${escape(line.position)}`;
-    const rev = `${escape(line.revision_label || '?')}${line.floating ? ' <span class="floating" title="Follows the current release">floating</span>' : ''}`;
-    const flags = line.flags.map((f, i) => `<span class="flag-chip" title="${escape(line.warnings[i])}">${escape(f)}</span>`).join('');
-    const attrs = line.attributes.length ? `<span class="attrs-line">${escape(line.attributes.join(' · '))}</span>` : '';
-    const each = line.unit_price == null ? '—' : `${escape(line.currency)} ${money(line.unit_price)}`;
-    const extended = line.extended == null ? '—'
-      : line.costed ? `${escape(line.currency)} ${money(line.extended)}`
-        : `<span class="muted" title="An assembly: its parts are counted, not its own price">(${money(line.extended)})</span>`;
-    return `<tr class="${line.assembly ? 'assembly' : ''}">
-      ${flat ? '' : `<td class="pos">${pos}</td>`}
-      <td>${escape(line.find_number)}</td>
-      <td class="number"><a href="#/part/${encodeURIComponent(line.part_id)}">${escape(line.number)}</a></td>
-      <td class="name">${escape(line.name)}${flags ? ` ${flags}` : ''}${attrs}</td>
-      <td>${rev}</td>
-      <td>${stateChip(line.state)}</td>
-      ${flat ? '' : `<td class="num">${qtyText(line.quantity)}${unit}</td>`}
-      <td class="num">${qtyText(line.total)}${unit}</td>
-      <td class="mono">${escape(line.mpn) || '—'}</td>
-      <td>${escape(line.supplier) || '—'}</td>
-      <td class="num">${each}</td>
-      <td class="num">${extended}</td>
-    </tr>`;
-  }).join('');
+  await drawConfiguredBom(bom,serial);
+  if(serial!==bomReadSerial)return;
   const totals = bom.totals.map((t) => `${escape(t.currency || '(no currency)')} ${money(t.total)}`).join(' · ');
   $('bom-totals').innerHTML = `Total: ${totals || '—'}`
     + (bom.unpriced ? ` <span class="muted">· ${bom.unpriced} line${bom.unpriced === 1 ? '' : 's'} with no price</span>` : '');
@@ -2174,7 +2479,7 @@ async function searchUses() {
   $('uses-results').innerHTML = found.length
     ? found.map((p) => `<li><button type="button" data-add="${escape(p.id)}" data-number="${escape(p.number)}" data-name="${escape(p.name)}">
         ${thumb(p.thumbnail_url, 'xs')}<strong class="mono">${escape(p.number)}</strong> ${escape(p.name)}
-        <span class="muted">· rev ${escape(p.latest_label)} ${escape(p.latest_state)}</span></button></li>`).join('')
+        <span class="muted">· rev ${escape(p.latest_label)} ${escape(statusName(p.latest_state))}</span></button></li>`).join('')
     : '<li class="muted">No part matches.</li>';
 }
 
@@ -2276,7 +2581,7 @@ async function openReplace() {
   replacing.report = null;
   $('rp-title').textContent = currentPart.number;
   $('rp-from').innerHTML = '<option value="">Any revision (the whole part)</option>'
-    + currentPart.revision_views.map((r) => `<option value="${escape(r.id)}">Rev ${escape(r.label)} (${escape(r.lifecycle)})</option>`).join('');
+    + currentPart.revision_views.map((r) => `<option value="${escape(r.id)}">Rev ${escape(r.label)} (${escape(statusName(r.lifecycle))})</option>`).join('');
   $('rp-from').value = $('wu-revision').value || '';
   $('rp-search').value = '';
   $('rp-results').innerHTML = '';
@@ -2308,7 +2613,7 @@ function chooseReplacement(id, number, name, revisions) {
   replacing.to = { id, number };
   $('rp-chosen').textContent = `Replacement: ${number} ${name}`;
   $('rp-to-rev').innerHTML = '<option value="">Follow its current release (floating)</option>'
-    + revisions.map((r) => `<option value="${escape(r.id)}">Rev ${escape(r.label)} (${escape(r.lifecycle)})</option>`).join('');
+    + revisions.map((r) => `<option value="${escape(r.id)}">Rev ${escape(r.label)} (${escape(statusName(r.lifecycle))})</option>`).join('');
   const released = revisions.find((r) => r.lifecycle === 'released');
   if (id === currentPart.id) {
     // A revision swap needs a revision; default to the current release.
@@ -2332,7 +2637,7 @@ async function searchReplacement() {
   $('rp-results').innerHTML = found.length
     ? found.map((p) => `<li><button type="button" data-pick="${escape(p.id)}">
         ${thumb(p.thumbnail_url, 'xs')}<strong class="mono">${escape(p.number)}</strong> ${escape(p.name)}
-        <span class="muted">· rev ${escape(p.latest_label)} ${escape(p.latest_state)}</span></button></li>`).join('')
+        <span class="muted">· rev ${escape(p.latest_label)} ${escape(statusName(p.latest_state))}</span></button></li>`).join('')
     : '<li class="muted">No part matches.</li>';
 }
 
@@ -2378,7 +2683,7 @@ function renderReplace(report, preview) {
     const result = `${escape(REPLACE_STATUS[r.status] || r.status)}${r.reason ? `: ${escape(r.reason)}` : ''}${r.eco ? `<br><span class="muted">change order: ${escape(r.eco)}</span>` : ''}`;
     return `
       <tr>
-        <td>${preview && doable ? `<input type="checkbox" data-parent="${escape(r.parent_revision_id)}" checked aria-label="Include ${escape(r.number)} rev ${escape(r.parent_revision)}">` : ''}</td>
+        <td>${preview && doable ? `<input type="checkbox" data-parent="${escape(documentKey(r.part_id, r.parent_revision_id))}" checked aria-label="Include ${escape(r.number)} rev ${escape(r.parent_revision)}">` : ''}</td>
         <td><a href="#/part/${encodeURIComponent(r.part_id)}">${escape(r.number)}</a> <span class="muted">${escape(r.name)}</span></td>
         <td>${escape(r.parent_revision)} ${stateChip(r.parent_state)}</td>
         <td>${writes}</td>
@@ -2459,11 +2764,11 @@ async function loadAttachments() {
     const view = a.inline
       ? (a.media_type.startsWith('image/')
         ? `<button type="button" class="link" data-preview="${escape(a.id)}">Preview</button>`
-        : `<a href="${href}?inline=true" target="_blank" rel="noopener">Open</a>`)
+        : `<a href="${FileDocuments.route('attachment',a.id,currentPart.id,a.on==='part'?'':attaching.revision)}">Open</a>`)
       : '';
     return `
       <tr>
-        <td>${thumb}<a href="${href}" download="${escape(a.name)}">${escape(a.name)}</a>
+        <td>${thumb}${FileDocuments.documentLink(a,currentPart.id,a.on==='part'?'':attaching.revision)}
           <span class="muted mono">${escape(a.media_type)}</span></td>
         <td>${escape(a.on)}</td>
         <td>${escape(a.kind)}</td>
@@ -2742,7 +3047,10 @@ function auditSummary(field, value) {
 }
 
 function auditChanges(event) {
-  const lines = Object.entries(event.changes || {}).map(([field, raw]) => {
+  const lines = Object.entries(event.changes || {}).flatMap(([field, raw]) => {
+    if (field === 'content_hash') return '<div>Model document updated</div>';
+    if (field === 'thumbnail') return '<div>Preview updated</div>';
+    if (field === 'size' && event.changes.content_hash) return [];
     const change = { before: raw.before === null ? null : auditSummary(field, raw.before), after: auditSummary(field, raw.after) };
     const before = change.before === null ? '' : `${escape(auditValue(change.before))}<span class="arrow">→</span>`;
     const full = `${field}: ${JSON.stringify(raw.before)} → ${JSON.stringify(raw.after)}`;
@@ -2884,28 +3192,7 @@ function reviewCell(rev) {
 
 // -- the reviews page
 
-function inboxRow(item) {
-  const href = item.kind === 'eco' ? `#/eco/${escape(item.target)}` : `#/part/${escape(item.target)}`;
-  const due = item.due ? `${escape(when(item.due))}${item.overdue ? ' <span class="state review-rejected">overdue</span>' : ''}` : '—';
-  return `
-    <tr>
-      <td class="number"><a href="${href}">${escape(item.title)}</a></td>
-      <td>${escape(item.name)}</td>
-      <td>${escape(item.opened_by)}</td>
-      <td>${escape(when(item.opened_at))}</td>
-      <td>${due}</td>
-      <td>${item.approvals}/${item.required_approvals}</td>
-      <td>${reviewChip(item.status)}</td>
-    </tr>`;
-}
-
-async function renderReviews() {
-  const inbox = await api('GET', '/api/inbox');
-  $('inbox-waiting').innerHTML = inbox.waiting_on_me.map(inboxRow).join('');
-  $('inbox-waiting-empty').hidden = inbox.waiting_on_me.length > 0;
-  $('inbox-submitted').innerHTML = inbox.submitted.map(inboxRow).join('');
-  $('inbox-submitted-empty').hidden = inbox.submitted.length > 0;
-}
+async function renderReviews() { await Workbench.inbox(); }
 
 // -- one revision's review, on the part page
 
@@ -2992,7 +3279,7 @@ function threadHtml(comments, canComment) {
 async function renderReview(detail) {
   const views = detail.revision_views;
   if (!views.some((r) => r.id === reviewRevision)) reviewRevision = defaultReviewRevision(detail);
-  $('rv-revision').innerHTML = views.map((r) => `<option value="${escape(r.id)}">${escape(r.label)} — ${escape(r.lifecycle)}</option>`).join('');
+  $('rv-revision').innerHTML = views.map((r) => `<option value="${escape(r.id)}">${escape(r.label)} — ${escape(statusName(r.lifecycle))}</option>`).join('');
   $('rv-revision').value = reviewRevision;
   if (!reviewRevision) return;
   const panel = await api('GET', `${revUrl(reviewRevision)}/review`);
@@ -3275,8 +3562,7 @@ function itemChanges(item) {
 function itemDetail(item) {
   const parts = [];
   if (item.document_changed !== null && item.document_changed !== undefined) {
-    parts.push(`<div><span class="field">document</span> <span class="mono">${escape(item.previous_hash.slice(0, 12) || '—')}</span>
-      <span class="arrow">→</span> <span class="mono">${escape(item.content_hash.slice(0, 12) || '—')}</span></div>`);
+    parts.push(`<div>${item.document_changed ? 'Model changed from the previous revision' : 'Model unchanged from the previous revision'}</div>`);
   }
   if (item.bom_diff && item.bom_diff.lines.length) {
     parts.push(`<div><span class="field">BOM</span><ul class="plain">${item.bom_diff.lines.map((l) => `
@@ -3313,17 +3599,17 @@ async function renderEco(id) {
   $('eco-items').innerHTML = eco.items.map((item) => `
     <tr>
       <td><span class="badge action-${escape(item.action)}">${escape(item.action)}</span></td>
-      <td class="number"><a href="#/part/${escape(item.part_id)}">${escape(item.number)}</a><br><span class="muted">${escape(item.name)}</span></td>
-      <td><strong>${escape(item.label)}</strong> <span class="state state-${escape(item.lifecycle)}">${escape(item.lifecycle)}</span></td>
+      <td class="number"><a href="#/part/${encodeURIComponent(item.part_id)}">${escape(item.number)}</a><br><span class="muted">${escape(item.name)}</span></td>
+      <td><strong>${escape(item.label)}</strong> <span class="state state-${escape(item.lifecycle)}">${escape(statusName(item.lifecycle))}</span></td>
       <td>${escape(item.replaces || '—')}</td>
       <td>${itemChanges(item)}${item.problem ? `<div class="error">${escape(item.problem)}</div>` : ''}
         ${itemDetail(item) ? `<details><summary>Details</summary><div class="item-detail">${itemDetail(item)}</div></details>` : ''}</td>
-      <td class="actions">${eco.can_edit ? `<button class="link danger" data-remove="${escape(item.revision_id)}">Remove</button>` : ''}</td>
+      <td class="actions">${eco.can_edit ? `<button class="link danger" data-part="${escape(item.part_id)}" data-remove="${escape(item.revision_id)}">Remove</button>` : ''}</td>
     </tr>`).join('');
   $('eco-items-empty').hidden = eco.items.length > 0;
   for (const button of $('eco-items').querySelectorAll('button[data-remove]')) {
     button.addEventListener('click', () => act(async () => {
-      await api('DELETE', `${ecoUrl()}/items/${encodeURIComponent(button.dataset.remove)}`);
+      await api('DELETE', `${ecoUrl()}/items/${encodeURIComponent(button.dataset.remove)}?part=${encodeURIComponent(button.dataset.part)}`);
       await renderEco(eco.id);
     }));
   }
@@ -3445,7 +3731,7 @@ $('eco-add-search').addEventListener('input', () => {
 async function pickEcoPart(id) {
   ecoAddPart = await api('GET', `/api/parts/${encodeURIComponent(id)}`);
   $('eco-add-part').textContent = `${ecoAddPart.number} ${ecoAddPart.name}`;
-  $('eco-add-rev').innerHTML = ecoAddPart.revision_views.map((r) => `<option value="${escape(r.id)}">${escape(r.label)} — ${escape(r.lifecycle)}</option>`).join('');
+  $('eco-add-rev').innerHTML = ecoAddPart.revision_views.map((r) => `<option value="${escape(r.id)}">${escape(r.label)} — ${escape(statusName(r.lifecycle))}</option>`).join('');
   const views = ecoAddPart.revision_views;
   const open = [...views].reverse().find((r) => r.editable);
   $('eco-add-rev').value = (open || views[views.length - 1]).id;
@@ -3567,280 +3853,7 @@ function readEcoNumbering() {
 // A user's folders of links and files (D12, the server's P6). The CAD app's File > Open
 // shows the same workspace. Delete removes a link or a file, never a part (D9).
 
-const wsState = { owner: '', ownerLabel: 'My workspace', path: [], entries: [], cut: null, versionsOf: null, list: null };
-
-const wsReadOnly = () => wsState.owner !== '';
-const wsFolder = () => (wsState.path.length ? wsState.path[wsState.path.length - 1].id : '');
-const wsEntry = (id) => wsState.entries.find((e) => e.id === id);
-
-async function renderWorkspace() {
-  wsState.list = await api('GET', '/api/workspaces');
-  $('ws-owner').innerHTML = wsState.list.workspaces.map((w) => {
-    const value = w.mine ? '' : w.user_id;
-    const label = w.mine ? 'My workspace' : `${w.display_name || w.username}'s workspace`;
-    return `<option value="${escape(value)}"${value === wsState.owner ? ' selected' : ''}>${escape(label)}</option>`;
-  }).join('');
-  $('ws-private').hidden = wsState.list.browsable;
-  await wsLoad();
-}
-
-async function wsLoad() {
-  $('ws-status').textContent = '';
-  const query = new URLSearchParams({ owner: wsState.owner, parent: wsFolder() });
-  const folder = await api('GET', `/api/workspace/entries?${query}`);
-  wsState.entries = folder.entries;
-  const writable = !wsReadOnly();
-  $('ws-readonly').hidden = writable;
-  for (const el of document.querySelectorAll('#view-workspace .ws-write')) el.hidden = !writable;
-  $('ws-crumbs').innerHTML = [`<button class="link" data-ws-crumb="0">${escape(wsState.ownerLabel)}</button>`]
-    .concat(wsState.path.map((p, i) => `<button class="link" data-ws-crumb="${i + 1}">${escape(p.name)}</button>`))
-    .join(' / ');
-  $('ws-cut').hidden = !wsState.cut || !writable;
-  $('ws-cut-name').textContent = wsState.cut ? wsState.cut.name : '';
-  $('ws-empty').hidden = folder.entries.length > 0;
-  $('ws-wrap').hidden = folder.entries.length === 0;
-  $('ws-rows').innerHTML = folder.entries.map(wsRow).join('');
-  if (wsState.versionsOf && !wsEntry(wsState.versionsOf)) {
-    wsState.versionsOf = null;
-    $('ws-versions').hidden = true;
-  }
-}
-
-function wsWhat(e) {
-  if (e.kind === 'folder') return `folder · ${e.children ?? 0} item${e.children === 1 ? '' : 's'}`;
-  if (e.kind === 'file' && e.file) return `file · v${e.file.version} of ${e.file.versions} · ${fileSize(e.file.size)}`;
-  const l = e.link || {};
-  if (l.part_missing) return '<span class="error">the linked part is gone</span>';
-  const part = `<a href="#/part/${encodeURIComponent(l.part_id)}">${escape(l.number)}</a> ${escape(l.name)}`;
-  if (l.revision_missing) return `${part} · <span class="error">the pinned revision was deleted</span>`;
-  return `${part} · rev ${escape(l.revision_label)} (${escape(l.lifecycle)}, ${l.pinned ? 'pinned' : 'follows the newest'})`;
-}
-
-function wsRow(e) {
-  const writable = !wsReadOnly();
-  const id = escape(e.id);
-  const actions = [];
-  if (e.kind === 'folder') actions.push(`<button class="link" data-ws-open="${id}">Open</button>`);
-  if (e.kind === 'link' && e.link && !e.link.part_missing && !e.link.revision_missing) {
-    actions.push(`<a href="#/part/${encodeURIComponent(e.link.part_id)}">Part</a>`);
-    if (typeof openInCadButton === 'function') actions.push(openInCadButton(e.link.part_id, e.link.revision_id));
-    if (writable) {
-      actions.push(e.link.pinned
-        ? `<button class="link" data-ws-follow="${id}">Follow newest</button>`
-        : `<button class="link" data-ws-pin="${id}" data-rev="${escape(e.link.revision_id)}">Pin to ${escape(e.link.revision_label)}</button>`);
-    }
-  }
-  if (e.kind === 'file') {
-    actions.push(`<a href="/api/workspace/entries/${encodeURIComponent(e.id)}/content" download="${escape(e.name)}">Download</a>`);
-    actions.push(`<button class="link" data-ws-versions="${id}">Versions</button>`);
-    if (writable && me.can_author) actions.push(`<button class="link" data-ws-promote="${id}">Promote…</button>`);
-  }
-  if (writable) {
-    actions.push(`<button class="link" data-ws-rename="${id}">Rename</button>`);
-    actions.push(`<button class="link" data-ws-move="${id}">Move…</button>`);
-    const verb = e.kind === 'link' ? 'Remove link' : 'Delete';
-    actions.push(`<button class="link danger" data-ws-delete="${id}">${verb}</button>`);
-  }
-  const name = e.kind === 'folder'
-    ? `<button class="link" data-ws-open="${id}">${escape(e.name)}/</button>`
-    : escape(e.name);
-  return `
-    <tr data-ws-row="${id}">
-      <td class="thumb-cell">${e.kind === 'link' ? thumb(e.link?.thumbnail_url) : ''}</td>
-      <td>${name}</td>
-      <td>${wsWhat(e)}</td>
-      <td class="muted">${escape(when(e.modified_at))}</td>
-      <td class="actions">${actions.join(' ')}</td>
-    </tr>`;
-}
-
-async function wsUpdate(id, fields) {
-  await api('PATCH', `/api/workspace/entries/${encodeURIComponent(id)}`, fields);
-  await wsLoad();
-}
-
-$('ws-owner').addEventListener('change', () => act(async () => {
-  wsState.owner = $('ws-owner').value;
-  wsState.ownerLabel = $('ws-owner').selectedOptions[0]?.textContent || 'My workspace';
-  wsState.path = [];
-  wsState.versionsOf = null;
-  $('ws-versions').hidden = true;
-  await wsLoad();
-}));
-
-$('ws-reload').addEventListener('click', () => act(renderWorkspace));
-
-$('ws-crumbs').addEventListener('click', (event) => {
-  const crumb = event.target.closest('button[data-ws-crumb]');
-  if (!crumb) return;
-  wsState.path = wsState.path.slice(0, Number(crumb.dataset.wsCrumb));
-  act(wsLoad);
-});
-
-$('ws-rows').addEventListener('click', (event) => {
-  const button = event.target.closest('button');
-  if (!button) return;
-  const d = button.dataset;
-  if (d.wsOpen) {
-    const folder = wsEntry(d.wsOpen);
-    wsState.path.push({ id: folder.id, name: folder.name });
-    act(wsLoad);
-  } else if (d.wsRename) {
-    const entry = wsEntry(d.wsRename);
-    const name = prompt(`Rename ${entry.name} to`, entry.name);
-    if (name && name.trim() && name !== entry.name) act(() => wsUpdate(entry.id, { name: name.trim() }));
-  } else if (d.wsMove) {
-    wsState.cut = wsEntry(d.wsMove);
-    act(wsLoad);
-  } else if (d.wsDelete) {
-    const entry = wsEntry(d.wsDelete);
-    const question = entry.kind === 'link'
-      ? `Remove the link ${entry.name}? The part and its revisions are not touched.`
-      : entry.kind === 'folder'
-        ? `Delete the folder ${entry.name} and everything in it? Parts are not touched.`
-        : `Delete ${entry.name} and every version of it?`;
-    if (!confirm(question)) return;
-    act(async () => {
-      await api('DELETE', `/api/workspace/entries/${encodeURIComponent(entry.id)}?recursive=${entry.kind === 'folder'}`);
-      await wsLoad();
-    });
-  } else if (d.wsPin) {
-    act(() => wsUpdate(d.wsPin, { revision: d.rev }));
-  } else if (d.wsFollow) {
-    act(() => wsUpdate(d.wsFollow, { revision: '' }));
-  } else if (d.wsVersions) {
-    wsState.versionsOf = d.wsVersions;
-    act(wsVersions);
-  } else if (d.wsPromote) {
-    const entry = wsEntry(d.wsPromote);
-    $('ws-promote-form').dataset.id = entry.id;
-    $('ws-promote-name').textContent = entry.name;
-    $('ws-promote-dialog').showModal();
-  }
-});
-
-$('ws-paste').addEventListener('click', () => act(async () => {
-  const cut = wsState.cut;
-  wsState.cut = null;
-  if (cut) await wsUpdate(cut.id, { parent: wsFolder() });
-}));
-
-$('ws-cut-cancel').addEventListener('click', () => {
-  wsState.cut = null;
-  act(wsLoad);
-});
-
-$('ws-new-folder').addEventListener('click', () => act(async () => {
-  const name = $('ws-folder-name').value.trim();
-  if (!name) return;
-  await api('POST', '/api/workspace/folders', { parent: wsFolder(), name });
-  $('ws-folder-name').value = '';
-  await wsLoad();
-}));
-
-$('ws-link').addEventListener('click', () => act(async () => {
-  const part = $('ws-link-part').value.trim();
-  if (!part) return;
-  await api('POST', '/api/workspace/links', { parent: wsFolder(), part, revision: $('ws-link-rev').value.trim() });
-  $('ws-link-part').value = '';
-  $('ws-link-rev').value = '';
-  await wsLoad();
-}));
-
-async function wsVersions() {
-  const entry = wsEntry(wsState.versionsOf);
-  if (!entry) return;
-  const { versions } = await api('GET', `/api/workspace/entries/${encodeURIComponent(entry.id)}/versions`);
-  $('ws-versions-name').textContent = entry.name;
-  $('ws-versions').hidden = false;
-  const base = `/api/workspace/entries/${encodeURIComponent(entry.id)}`;
-  $('ws-version-rows').innerHTML = versions.slice().reverse().map((v) => `
-    <tr>
-      <td>v${v.version}${v.current ? ' (current)' : ''}${v.restored_from ? ` <span class="muted">restored from v${v.restored_from}</span>` : ''}</td>
-      <td class="num">${fileSize(v.size)}</td>
-      <td>${escape(v.uploaded_by_name)}</td>
-      <td class="muted">${escape(when(v.uploaded_at))}</td>
-      <td class="actions"><a href="${base}/content?version=${v.version}" download="${escape(entry.name)}">Download</a>
-        ${!v.current && !wsReadOnly() ? `<button class="link" data-ws-restore="${v.version}">Restore</button>` : ''}</td>
-    </tr>`).join('');
-}
-
-$('ws-version-rows').addEventListener('click', (event) => {
-  const restore = event.target.closest('button[data-ws-restore]');
-  if (!restore) return;
-  act(async () => {
-    await api('POST', `/api/workspace/entries/${encodeURIComponent(wsState.versionsOf)}/versions/${restore.dataset.wsRestore}/restore`);
-    await wsLoad();
-    await wsVersions();
-  });
-});
-
-async function wsUpload(files) {
-  let done = 0;
-  for (const file of files) {
-    $('ws-status').textContent = `Uploading ${file.name} (${fileSize(file.size)})…`;
-    // A file whose name is already here becomes its next version.
-    const same = wsState.entries.find((e) => e.kind === 'file' && e.name.toLowerCase() === file.name.toLowerCase());
-    const url = same
-      ? `/api/workspace/entries/${encodeURIComponent(same.id)}/content`
-      : `/api/workspace/files?${new URLSearchParams({ parent: wsFolder(), name: file.name })}`;
-    const response = await fetch(url, {
-      method: same ? 'PUT' : 'POST',
-      credentials: 'same-origin',
-      headers: { 'Content-Type': file.type || 'application/octet-stream', 'X-CSRF-Token': csrfToken || '' },
-      body: file,
-    });
-    if (!response.ok) {
-      let message = `${response.status} ${response.statusText}`;
-      try { message = (await response.json()).error || message; } catch { /* not JSON */ }
-      $('ws-status').textContent = '';
-      await wsLoad();
-      throw new Error(`${file.name}: ${message}`);
-    }
-    done += 1;
-  }
-  await wsLoad();
-  $('ws-status').textContent = done ? `Added ${done} file${done === 1 ? '' : 's'}.` : '';
-  if (wsState.versionsOf) await wsVersions();
-}
-
-$('ws-file').addEventListener('change', () => {
-  const files = [...$('ws-file').files];
-  $('ws-file').value = '';
-  if (files.length) act(() => wsUpload(files));
-});
-
-for (const name of ['dragenter', 'dragover']) {
-  $('ws-drop').addEventListener(name, (event) => {
-    if (wsReadOnly()) return;
-    event.preventDefault();
-    $('ws-drop').classList.add('over');
-  });
-}
-for (const name of ['dragleave', 'drop']) {
-  $('ws-drop').addEventListener(name, () => $('ws-drop').classList.remove('over'));
-}
-$('ws-drop').addEventListener('drop', (event) => {
-  if (wsReadOnly()) return;
-  event.preventDefault();
-  const files = [...event.dataTransfer.files];
-  if (files.length) act(() => wsUpload(files));
-});
-
-$('ws-promote-form').addEventListener('submit', (event) => {
-  if (event.submitter && event.submitter.value !== 'promote') return;
-  event.preventDefault();
-  act(async () => {
-    const id = $('ws-promote-form').dataset.id;
-    const done = await api('POST', `/api/workspace/entries/${encodeURIComponent(id)}/promote`, {
-      part: $('ws-promote-part').value.trim(),
-      revision: $('ws-promote-rev').value.trim(),
-      kind: $('ws-promote-kind').value,
-    });
-    $('ws-promote-dialog').close();
-    $('ws-status').textContent = `Promoted to an attachment: ${done.attachment.name} (${done.attachment.kind}).`;
-  });
-});
+async function renderWorkspace() { await Workbench.home(); }
 
 // "Add to workspace…" on a part's page: pick one of your folders, and follow the newest
 // revision or pin one.
@@ -3878,7 +3891,7 @@ $('part-add-ws').addEventListener('click', () => act(async () => {
   $('part-ws-status').textContent = '';
   $('ws-pick-title').textContent = `Add ${currentPart.number} to your workspace`;
   $('ws-pick-rev').innerHTML = ['<option value="">follow the newest revision</option>']
-    .concat(currentPart.revision_views.slice().reverse().map((r) => `<option value="${escape(r.id)}">pin to ${escape(r.label)} (${escape(r.lifecycle)})</option>`))
+    .concat(currentPart.revision_views.slice().reverse().map((r) => `<option value="${escape(r.id)}">pin to ${escape(r.label)} (${escape(statusName(r.lifecycle))})</option>`))
     .join('');
   await wsPickLoad();
   $('ws-pick-dialog').showModal();
@@ -3896,3 +3909,532 @@ $('ws-pick-form').addEventListener('submit', (event) => {
     $('part-ws-status').textContent = `Added to ${where}.`;
   });
 });
+
+// ------------------------------------------------ native model import wizard
+let nativeWizard = { rows: [], types: [], job: null, running: false, stop: false, owner: null, busy: false };
+const niError = error => { $('ni-error').textContent = error?.message || String(error || ''); $('ni-error').hidden = !error; };
+async function niAct(fn) {
+  if (nativeWizard.busy || nativeWizard.running) return;
+  nativeWizard.busy = true; niError(null);
+  $('ni-files-step').disabled = true; $('ni-mapping-fields').disabled = true;
+  try { await fn(); } catch (error) { niError(error); }
+  finally {
+    nativeWizard.busy = false;
+    const frozen = Boolean(nativeWizard.job) || !$('ni-review-step').hidden;
+    $('ni-files-step').disabled = frozen; $('ni-mapping-fields').disabled = frozen;
+  }
+}
+function importDatabase() {
+  return new Promise((resolve, reject) => {
+    const request = indexedDB.open('brep-plm-native-import', 1);
+    request.onupgradeneeded = () => request.result.createObjectStore('jobs');
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(new Error('Cannot save import progress in this browser. Enable browser storage before importing.'));
+  });
+}
+async function importStorage(operation, value) {
+  const db = await importDatabase();
+  try {
+    return await new Promise((resolve, reject) => {
+      const transaction = db.transaction('jobs', operation === 'get' ? 'readonly' : 'readwrite');
+      const store = transaction.objectStore('jobs');
+      const key = nativeWizard.owner;
+      const request = operation === 'get' ? store.get(key) : operation === 'delete' ? store.delete(key) : store.put(value, key);
+      transaction.oncomplete = () => resolve(request.result);
+      transaction.onerror = transaction.onabort = () => reject(new Error('Import progress could not be saved. Free browser storage before resuming.'));
+    });
+  } finally { db.close(); }
+}
+async function openNativeImport() {
+  if (nativeWizard.owner === me.id) return;
+  nativeWizard = { rows: [], types: await api('GET', '/api/part-types'), job: null, running: false, stop: false, owner: me.id, busy: false };
+  $('ni-default-type').innerHTML = nativeWizard.types.map(t => `<option value="${escape(t.id)}">${escape(t.name)}</option>`).join('');
+  nativeWizard.job = await importStorage('get');
+  if (nativeWizard.job) niProgress(nativeWizard.job);
+}
+function niType(row) { return nativeWizard.types.find(t => t.id === row.part_type); }
+function niNumbering(row) {
+  const type = niType(row);
+  if (!type) return 'Choose a part type';
+  if (type.mode.kind === 'counter') {
+    const before = nativeWizard.rows.slice(0, nativeWizard.rows.indexOf(row)).filter(r => r.action === 'create' && r.part_type === row.part_type).length;
+    return `Estimated ${type.prefix}${String(type.next + before).padStart(type.digits, '0')}`;
+  }
+  return type.mode.kind === 'pattern' ? `Pattern: ${type.mode.regex}` : type.mode.kind === 'script' ? `Server script: ${type.mode.script}` : 'Enter a unique part number';
+}
+function niRenderRows() {
+  $('ni-mapping-step').hidden = false;
+  $('ni-rows').innerHTML = nativeWizard.rows.map((row, i) => {
+    const creating = row.action === 'create', counter = niType(row)?.mode.kind === 'counter';
+    return `<tr data-import-row="${i}"><td><input data-field="name" aria-label="Name for ${escape(row.name)}" value="${escape(row.name)}"><small>${row.assembly ? 'Assembly' : 'Part'} · ${escape(row.id)}${row.root ? ' · uploaded file' : ' · embedded'}</small></td>
+      <td><select data-field="action" aria-label="Action for ${escape(row.name)}">${[['create','Create part'],['revise','Create new revision'],['replace','Replace editable draft'],['reuse','Reuse existing revision']].map(([v,t]) => `<option value="${v}" ${row.action === v ? 'selected' : ''}>${t}</option>`).join('')}</select></td>
+      <td><select data-field="part_type" aria-label="Part type for ${escape(row.name)}" ${creating ? '' : 'disabled'}>${nativeWizard.types.map(t => `<option value="${escape(t.id)}" ${row.part_type === t.id ? 'selected' : ''}>${escape(t.name)}</option>`).join('')}</select><small>${creating ? escape(niNumbering(row)) : 'Existing part keeps its type and number'}</small></td>
+      <td><input data-field="${creating ? 'number' : 'part'}" aria-label="${creating ? 'Number' : 'Existing part'} for ${escape(row.name)}" value="${escape(creating ? row.number : row.part)}" ${creating && counter ? 'disabled placeholder="Assigned on import"' : ''}>${creating ? '' : '<button type="button" data-target-lookup class="ghost">Load revisions</button>'}</td>
+      <td>${creating ? 'First revision' : row.action === 'revise' ? 'Next revision' : `<select data-field="revision" aria-label="Revision for ${escape(row.name)}"><option value="">Newest (load to choose)</option>${(row.available || []).map(r => `<option value="${escape(r.id)}" ${r.id === row.revision ? 'selected' : ''}>${escape(r.label)} · ${escape(statusName(r.lifecycle))}${r.locked_by ? ' · checked out' : ''}</option>`).join('')}</select>`}</td></tr>`;
+  }).join('');
+}
+async function niReadFiles(list) {
+  if (nativeWizard.job) throw new Error('Finish the current import or choose Start another import before choosing files.');
+  const files = [...list].filter(f => /\.nbrep$/i.test(f.name));
+  if (!files.length) throw new Error('Choose at least one .nbrep file.');
+  $('ni-review-step').hidden = true;
+  $('ni-mapping-step').hidden = true;
+  nativeWizard.rows = [];
+  $('ni-rows').replaceChildren();
+  $('ni-file-summary').textContent = 'Reading native models…';
+  const documents = [];
+  for (const file of files) {
+    try { documents.push({ name: file.webkitRelativePath || file.name, document: JSON.parse(await file.text()) }); }
+    catch { throw new Error(`${file.name}: this is not valid native JSON`); }
+  }
+  if (!$('ni-namespace').value.trim()) $('ni-namespace').value = NativeImport.path(documents[0].name).split('/')[0];
+  const plan = NativeImport.plan(documents);
+  if (plan.errors.length) { $('ni-file-summary').textContent = 'Files need attention.'; throw new Error(plan.errors.join('\n')); }
+  const types = nativeWizard.types;
+  if (!types.length) throw new Error('Create a part type before importing models.');
+  for (const row of plan.rows) {
+    row.action = 'create'; row.number = ''; row.part = ''; row.revision = '';
+    row.part_type = (types.find(t => t.id === (row.assembly ? 'assembly' : 'component')) || types[0]).id;
+    const matches = (await api('GET', `/api/parts?external_ref=${encodeURIComponent(NativeImport.externalRef($('ni-namespace').value, row.id))}&limit=2`)).parts;
+    if (matches.length === 1) {
+      const p = await api('GET', `/api/parts/${encodeURIComponent(matches[0].id)}`);
+      row.part = p.number; row.part_type = p.part_type; row.available = p.revision_views;
+      const rev = p.revision_views.at(-1);
+      row.revision = rev?.id || '';
+      row.action = rev?.editable && !rev.locked_by ? 'replace' : p.revision_views.some(r => r.editable) ? 'reuse' : 'revise';
+    }
+  }
+  nativeWizard.rows = plan.rows;
+  $('ni-file-summary').textContent = `${files.length} file(s), ${plan.rows.length} distinct parts and assemblies, ${plan.rows.reduce((n,r) => n + Object.keys(r.dependencies).length, 0)} component links.`;
+  niRenderRows();
+}
+for (const id of ['ni-files', 'ni-folder']) $(id).addEventListener('change', event => niAct(() => niReadFiles(event.target.files)));
+$('ni-rows').addEventListener('change', event => {
+  const tr = event.target.closest('[data-import-row]'), field = event.target.dataset.field;
+  if (!tr || !field || nativeWizard.running || nativeWizard.busy) return;
+  const row = nativeWizard.rows[Number(tr.dataset.importRow)];
+  row[field] = event.target.value;
+  if (field === 'part') { row.available = []; row.revision = ''; }
+  if (field === 'part_type') row.number = '';
+  if (['action','part_type'].includes(field)) niRenderRows();
+});
+$('ni-rows').addEventListener('click', event => {
+  if (!event.target.closest('[data-target-lookup]')) return;
+  const row = nativeWizard.rows[Number(event.target.closest('[data-import-row]').dataset.importRow)];
+  niAct(async () => {
+    const p = await api('GET', `/api/parts/${encodeURIComponent(row.part.trim())}`);
+    row.part = p.number; row.part_type = p.part_type; row.available = p.revision_views; row.revision = p.revision_views.at(-1)?.id || '';
+    niRenderRows();
+  });
+});
+$('ni-apply-type').addEventListener('click', () => {
+  for (const row of nativeWizard.rows.filter(r => r.action === 'create')) { row.part_type = $('ni-default-type').value; row.number = ''; }
+  niRenderRows();
+});
+$('ni-review').addEventListener('click', () => niAct(async () => {
+  const namespace = $('ni-namespace').value.trim();
+  if (!namespace) throw new Error('Give this import set a name.');
+  if (!nativeWizard.rows.length) throw new Error('Choose native files first.');
+  for (const row of nativeWizard.rows) {
+    if (!row.name.trim()) throw new Error('Every part needs a name.');
+    delete row.reviewed;
+    row.external_ref = NativeImport.externalRef(namespace, row.id);
+    if (row.action !== 'create') continue;
+    const type = niType(row);
+    if (!type) throw new Error(`${row.name}: select a part type`);
+    if (['free','pattern'].includes(type.mode.kind) && !row.number.trim()) throw new Error(`${row.name}: enter a number for ${type.name}`);
+    if (row.number.trim()) {
+      const matches = (await api('GET', `/api/parts?q=${encodeURIComponent(row.number.trim())}&limit=50`)).parts;
+      if (matches.some(p => p.number.toLowerCase() === row.number.trim().toLowerCase())) throw new Error(`${row.number}: already exists; choose an update action for this row`);
+    }
+    const matches = (await api('GET', `/api/parts?external_ref=${encodeURIComponent(row.external_ref)}&part_type=${encodeURIComponent(row.part_type)}&limit=2`)).parts;
+    if (matches.length) throw new Error(`${row.name}: already imported as ${matches[0].number}; choose an update action`);
+  }
+  const numbers = nativeWizard.rows.filter(r => r.action === 'create' && r.number.trim()).map(r => r.number.trim().toLowerCase());
+  if (new Set(numbers).size !== numbers.length) throw new Error('Two new parts have the same number.');
+  await api('POST', '/api/import/validate', nativeWizard.rows.filter(r => r.action === 'create').map(r => ({part_type: r.part_type, number: r.number})));
+  await NativeImport.inspect(nativeWizard.rows, api);
+  $('ni-review-rows').innerHTML = nativeWizard.rows.map(row => `<tr><td>${escape(row.name)}<br><small>${escape(row.id)}</small></td><td>${escape({create:'Create part',revise:'Create new revision',replace:'REPLACE draft document and BOM',reuse:'Reuse without changes'}[row.action])}</td><td>${escape(row.reviewed?.number || row.number || niNumbering(row))}</td><td>${escape(row.action === 'create' ? 'First revision' : row.action === 'revise' ? 'New revision' : row.reviewed.label)}</td></tr>`).join('');
+  $('ni-review-summary').textContent = `${nativeWizard.rows.length} items: ${nativeWizard.rows.filter(r=>r.action==='create').length} new parts, ${nativeWizard.rows.filter(r=>r.action==='revise').length} new revisions, ${nativeWizard.rows.filter(r=>r.action==='replace').length} draft replacements, ${nativeWizard.rows.filter(r=>r.action==='reuse').length} reused revisions.`;
+  $('ni-review-step').hidden = false; $('ni-files-step').disabled = true; $('ni-mapping-fields').disabled = true;
+  $('ni-confirm').checked = false; $('ni-run').disabled = true;
+  $('ni-review-step').scrollIntoView({ block: 'start' });
+}));
+$('ni-confirm').addEventListener('change', () => { $('ni-run').disabled = !$('ni-confirm').checked; });
+$('ni-back').addEventListener('click', () => {
+  $('ni-review-step').hidden = true; $('ni-files-step').disabled = false; $('ni-mapping-fields').disabled = false;
+});
+function niProgress(job) {
+  $('ni-results').hidden = false; $('ni-status').textContent = job.current || 'Ready to resume';
+  $('ni-files-step').disabled = true; $('ni-mapping-fields').disabled = true;
+  $('ni-result-rows').innerHTML = job.rows.map(row => {
+    const target = job.targets[row.id];
+    return `<li>${escape(row.name)} — ${target ? `<a href="#/part/${encodeURIComponent(target.part)}">${escape(target.number)} / ${escape(target.label)}</a> · ${target.done ? row.action === 'reuse' ? 'reused' : 'imported' : target.written ? 'saved, awaiting check-in' : 'allocated, awaiting document'}` : row.allocating ? 'allocation outcome unconfirmed — inspect the server before retrying' : 'not started'}</li>`;
+  }).join('');
+  $('ni-resume').hidden = Boolean(job.complete); $('ni-resume').disabled = nativeWizard.running;
+  $('ni-reset').disabled = nativeWizard.running; $('ni-stop').hidden = !nativeWizard.running;
+}
+async function niExecute() {
+  nativeWizard.running = true; nativeWizard.stop = false; niError(null);
+  $('ni-review-step').hidden = true;
+  $('ni-run').disabled = true;
+  try { await NativeImport.run(nativeWizard.job, api, job => importStorage('put', job), niProgress, () => nativeWizard.stop); }
+  catch (error) { niError(error); }
+  finally { nativeWizard.running = false; niProgress(nativeWizard.job); }
+}
+$('ni-run').addEventListener('click', () => niAct(async () => {
+  if (!$('ni-confirm').checked) return;
+  nativeWizard.job = { rows: JSON.parse(JSON.stringify(nativeWizard.rows)), targets: {}, complete: false, current: 'Ready to import' };
+  await importStorage('put', nativeWizard.job);
+  await niExecute();
+}));
+$('ni-resume').addEventListener('click', () => niAct(niExecute));
+$('ni-stop').addEventListener('click', () => { nativeWizard.stop = true; });
+$('ni-receipt').addEventListener('click', () => {
+  const job = nativeWizard.job;
+  const receipt = { complete: job.complete, current: job.current, items: job.rows.map(row => ({ source: row.id, action: row.action, allocationPending: Boolean(row.allocating && !job.targets[row.id]), reviewed: row.reviewed, target: job.targets[row.id] && { ...job.targets[row.id], reusedDocument: undefined } })) };
+  const url = URL.createObjectURL(new Blob([JSON.stringify(receipt,null,2)], {type:'application/json'}));
+  const a = document.createElement('a'); a.href = url; a.download = 'native-import-receipt.json'; a.click(); setTimeout(() => URL.revokeObjectURL(url), 1000);
+});
+$('ni-reset').addEventListener('click', () => niAct(async () => {
+  if (!nativeWizard.job?.complete && !confirm('Keep existing parts and discard this import’s saved progress? Download its receipt first if you need to reconcile it.')) return;
+  await importStorage('delete'); nativeWizard.job = null; nativeWizard.rows = [];
+  for (const id of ['ni-results','ni-mapping-step','ni-review-step']) $(id).hidden = true;
+  $('ni-files-step').disabled = false; $('ni-mapping-fields').disabled = false;
+  $('ni-rows').replaceChildren();
+  $('ni-files').value = ''; $('ni-folder').value = ''; $('ni-file-summary').textContent = 'No files selected.'; $('ni-status').textContent = '';
+}));
+window.addEventListener('beforeunload', event => { if (nativeWizard.running) { event.preventDefault(); event.returnValue = ''; } });
+
+Workbench.init();
+
+// Checkout protects writes. Keep readers up to date with every accepted save
+// and its later thumbnail upload, without replacing forms or local drafts.
+let modelChangeSeq = 0, modelChangeBusy = false;
+async function refreshSavedModels() {
+  if(!me || document.hidden || modelChangeBusy || document.querySelector('.work-area').inert)return;
+  modelChangeBusy=true;
+  const hash=location.hash,user=me.id;
+  try {
+    const changes=await api('GET',`/api/store/changes?since=${modelChangeSeq}`);
+    if(me?.id!==user || location.hash!==hash)return;
+    const changed=new Set(changes.keys.map(key=>decodeURIComponent(key.split('/')[1])));
+    if(!changes.stale&&!changed.size){modelChangeSeq=changes.seq;return;}
+    if(!$('view-parts').hidden) {
+      const generation=partsGeneration;
+      for(const part of listedParts) {
+        if(!changes.stale&&!changed.has(part.id))continue;
+        const detail=await api('GET',`/api/parts/${encodeURIComponent(part.id)}`);
+        if(location.hash!==hash || generation!==partsGeneration)return;
+        part.thumbnail_url=detail.thumbnail_url;
+        const row=[...$('parts-rows').rows].find(row=>row.dataset.partId===part.id);
+        const preview=row?.querySelector('.thumb-cell a');
+        if(preview)preview.innerHTML=thumb(detail.thumbnail_url);
+      }
+    }
+    if(!$('view-part').hidden&&currentPart&&(changes.stale||changed.has(currentPart.id))) {
+      const id=currentPart.id;
+      const detail=await api('GET',`/api/parts/${encodeURIComponent(id)}`);
+      if(location.hash!==hash || currentPart?.id!==id)return;
+      currentPart=detail;
+      $('part-thumb').innerHTML=thumb(detail.thumbnail_url,'lg');
+      for(const row of $('rev-rows').rows) {
+        const revision=detail.revision_views.find(revision=>revision.id===row.dataset.revisionId);
+        const preview=row.querySelector('.rev-label .thumb');
+        if(revision&&preview)preview.outerHTML=revThumb(revision);
+      }
+      if(editorKey&&!$('editor').hidden&&$('editor-body').readOnly) {
+        const key=editorKey;
+        const body=await api('GET',`/api/store/doc/${key.replaceAll('%','%25')}`);
+        if(location.hash===hash&&editorKey===key&&$('editor-body').readOnly)$('editor-body').value=body===null?'':typeof body==='string'?body:JSON.stringify(body,null,2);
+      }
+    }
+    if(location.hash!==hash)return;
+    await Workbench.savedModels(changed,changes.stale);
+    modelChangeSeq=changes.seq;
+  } catch {
+    // Retry after a temporary outage; background refresh must not erase work.
+  } finally { modelChangeBusy=false; }
+}
+setInterval(refreshSavedModels,2000);
+window.addEventListener('focus',refreshSavedModels);
+document.addEventListener('visibilitychange',refreshSavedModels);
+
+// Field definitions and the BOM layouts are shared with the CAD application.
+let fieldDefinitionTarget=null, fieldDefinitions=[];
+function drawFieldDefinitions(){
+  $('fields-editor').innerHTML=fieldDefinitions.map((d,i)=>`<fieldset data-index="${i}"><label>Key <input data-def="key" value="${escape(d.key)}" required></label><label>Name <input data-def="name" value="${escape(d.name)}" required></label><label>Type <select data-def="type">${['text','number','bool','enum'].map(t=>`<option${d.type===t?' selected':''}>${t}</option>`).join('')}</select></label><label>Units <input data-def="unit" value="${escape(d.unit||'')}" ${d.type==='number'?'':'disabled'}></label><label>Choices (one per line) <textarea data-def="values" ${d.type==='enum'?'':'disabled'}>${escape((d.values||[]).join('\n'))}</textarea></label><label><input type="checkbox" data-def="required" ${d.required?'checked':''}> Required</label><button type="button" data-remove="${i}" class="ghost">Remove field</button></fieldset>`).join('');
+  for(const row of $('fields-editor').querySelectorAll('fieldset')){
+    for(const input of row.querySelectorAll('[data-def]'))input.addEventListener(input.matches('select,input[type=checkbox]')?'change':'input',()=>{
+      const d=fieldDefinitions[Number(row.dataset.index)],key=input.dataset.def;
+      d[key]=key==='required'?input.checked:key==='values'?input.value.split('\n').map(v=>v.trim()).filter(Boolean):input.value;
+      if(key==='type')drawFieldDefinitions();
+    });
+  }
+  for(const button of $('fields-editor').querySelectorAll('[data-remove]'))button.addEventListener('click',()=>{fieldDefinitions.splice(Number(button.dataset.remove),1);drawFieldDefinitions();});
+}
+async function openFieldDefinitions(type){
+  fieldDefinitionTarget=type;
+  const data=type?await api('GET',`/api/part-types/${encodeURIComponent(type)}/fields`):await api('GET','/api/bom/configuration');
+  fieldDefinitions=structuredClone(type?data.fields:data.occurrence_fields);
+  $('fields-title').textContent=type?`Fields for ${partTypes.find(t=>t.id===type)?.name||type}`:'Occurrence fields';
+  drawFieldDefinitions();$('fields-dialog').showModal();
+}
+$('fields-add').addEventListener('click',()=>{fieldDefinitions.push({key:'',name:'',type:'text',required:false});drawFieldDefinitions();});
+$('fields-cancel').addEventListener('click',()=>$('fields-dialog').close());
+$('fields-form').addEventListener('submit',e=>{e.preventDefault();act(async()=>{
+  const fields=fieldDefinitions.map(d=>({key:d.key.trim(),name:d.name.trim(),type:d.type,required:d.required,...(d.type==='number'?{unit:d.unit||''}:{}),...(d.type==='enum'?{values:d.values||[]}: {})}));
+  await api('PUT',fieldDefinitionTarget?`/api/part-types/${encodeURIComponent(fieldDefinitionTarget)}/fields`:'/api/bom/occurrence-fields',{fields});
+  $('fields-dialog').close();if(!fieldDefinitionTarget)await renderOccurrenceFields();
+});});
+$('occurrence-fields-edit').addEventListener('click',()=>act(()=>openFieldDefinitions(null)));
+async function renderOccurrenceFields(){
+  const config=await api('GET','/api/bom/configuration');
+  $('occurrence-fields-list').innerHTML='<p>Callout / find number, reference designator, and installation notes are built-in occurrence fields.</p>'+config.occurrence_fields.map(d=>`<p><strong>${escape(d.name)}</strong> — ${escape(d.type)}${d.unit?` (${escape(d.unit)})`:''}</p>`).join('');
+}
+let bomConfiguration=null, bomLayoutEditing='', bomLayoutColumns=[];
+const DEFAULT_BOM_COLUMNS=['builtin.number','builtin.name','builtin.revision_label','builtin.quantity','builtin.total'];
+async function renderBomConfigurations(){
+  bomConfiguration=await api('GET','/api/bom/configuration');
+  $('bc-layout').innerHTML='<option value="">New configuration</option>'+bomConfiguration.layouts.map(l=>`<option value="${escape(l.id)}">${escape(l.name)} (${l.owner?'Personal':'Shared'})</option>`).join('');
+  const target=bomConfiguration.layouts.find(l=>l.id===bomLayoutEditing)||bomConfiguration.layouts.find(l=>l.id===bomConfiguration.selected);
+  chooseBomConfiguration(target?.id||'');
+}
+function chooseBomConfiguration(id){
+  bomLayoutEditing=id;const l=bomConfiguration.layouts.find(l=>l.id===id);
+  bomLayoutColumns=[...(l?.columns||DEFAULT_BOM_COLUMNS)];
+  $('bc-layout').value=id;$('bc-name').value=l?.name||'';$('bc-shared').checked=Boolean(l&&!l.owner);
+  const editable=!l||Boolean(l.owner)||me.is_admin;
+  $('bc-name').disabled=!editable;$('bc-shared').disabled=!editable;$('bc-delete').disabled=!l||!editable;
+  $('bc-form').querySelector('[type=submit]').disabled=!editable;
+  $('bc-use').disabled=!l;$('bc-status').textContent='';drawBomConfigurationFields(editable);
+}
+let bomLayoutCanEdit=true;
+const selectedColumns=element=>new Set([...element.selectedOptions].map(option=>option.value));
+function drawBomConfigurationFields(editable=true,selectedRight=new Set(),selectedLeft=new Set()){
+  bomLayoutCanEdit=editable;
+  const label=field=>`${field.name} — ${field.scope==='part'?'Part revision':field.scope==='occurrence'?'Occurrence':field.edit?.resource==='part'?'Part':'Built-in'}${field.unit?` (${field.unit})`:''}`;
+  const available=bomConfiguration.fields.filter(field=>!bomLayoutColumns.includes(field.id)).sort((a,b)=>a.name.localeCompare(b.name));
+  $('bc-available').innerHTML=available.map(field=>`<option value="${escape(field.id)}" ${selectedLeft.has(field.id)?'selected':''}>${escape(label(field))}</option>`).join('');
+  $('bc-configured').innerHTML=bomLayoutColumns.map(id=>{const field=bomConfiguration.fields.find(field=>field.id===id);return `<option value="${escape(id)}" ${selectedRight.has(id)?'selected':''}>${escape(field?label(field):`${id} (Unavailable field)`)}</option>`;}).join('');
+  $('bc-available').disabled=!editable;$('bc-configured').disabled=!editable;refreshBomColumnButtons();
+}
+function refreshBomColumnButtons(){
+  const selected=selectedColumns($('bc-configured'));
+  $('bc-add').disabled=!bomLayoutCanEdit||!$('bc-available').selectedOptions.length;
+  $('bc-remove').disabled=!bomLayoutCanEdit||!selected.size;
+  $('bc-up').disabled=!bomLayoutCanEdit||!bomLayoutColumns.some((id,i)=>selected.has(id)&&i>0&&!selected.has(bomLayoutColumns[i-1]));
+  $('bc-down').disabled=!bomLayoutCanEdit||!bomLayoutColumns.some((id,i)=>selected.has(id)&&i+1<bomLayoutColumns.length&&!selected.has(bomLayoutColumns[i+1]));
+}
+$('bc-available').addEventListener('change',refreshBomColumnButtons);
+$('bc-configured').addEventListener('change',refreshBomColumnButtons);
+$('bc-add').addEventListener('click',()=>{
+  if(!bomLayoutCanEdit)return;
+  const selected=selectedColumns($('bc-available'));
+  for(const id of selected)if(!bomLayoutColumns.includes(id))bomLayoutColumns.push(id);
+  drawBomConfigurationFields(true,selected);
+});
+$('bc-remove').addEventListener('click',()=>{
+  if(!bomLayoutCanEdit)return;
+  const selected=selectedColumns($('bc-configured'));
+  bomLayoutColumns=bomLayoutColumns.filter(id=>!selected.has(id));drawBomConfigurationFields(true,new Set(),selected);
+});
+function moveBomColumns(direction){
+  if(!bomLayoutCanEdit)return;
+  const selected=selectedColumns($('bc-configured'));
+  const indices=Array.from({length:bomLayoutColumns.length},(_,i)=>i);if(direction>0)indices.reverse();
+  for(const i of indices){const to=i+direction;if(to>=0&&to<bomLayoutColumns.length&&selected.has(bomLayoutColumns[i])&&!selected.has(bomLayoutColumns[to]))[bomLayoutColumns[i],bomLayoutColumns[to]]=[bomLayoutColumns[to],bomLayoutColumns[i]];}
+  drawBomConfigurationFields(true,selected);
+}
+$('bc-up').addEventListener('click',()=>moveBomColumns(-1));
+$('bc-down').addEventListener('click',()=>moveBomColumns(1));
+$('bc-layout').addEventListener('change',()=>chooseBomConfiguration($('bc-layout').value));
+$('bc-new').addEventListener('click',()=>chooseBomConfiguration(''));
+$('bc-copy').addEventListener('click',()=>{const columns=[...bomLayoutColumns],name=$('bc-name').value;chooseBomConfiguration('');bomLayoutColumns=columns;$('bc-name').value=name?`${name} copy`:'';drawBomConfigurationFields();});
+$('bc-form').addEventListener('submit',e=>{e.preventDefault();act(async()=>{const saved=await api('POST','/api/bom/layouts',{id:bomLayoutEditing,name:$('bc-name').value,columns:bomLayoutColumns,shared:me.is_admin&&$('bc-shared').checked});bomLayoutEditing=saved.id;await renderBomConfigurations();$('bc-status').textContent='Saved';});});
+$('bc-use').addEventListener('click',()=>act(async()=>{await api('PUT','/api/bom/selection',{id:bomLayoutEditing});$('bc-status').textContent='Selected for CAD and PLM';}));
+$('bc-delete').addEventListener('click',()=>act(async()=>{await api('DELETE',`/api/bom/layouts/${encodeURIComponent(bomLayoutEditing)}`);bomLayoutEditing='';await renderBomConfigurations();}));
+
+function fieldValueEditor(field,value,disabled,attributes=''){
+  if(field.encoding==='comma-list'&&Array.isArray(value))value=value.join(', ');
+  const common=`${attributes} ${disabled?'disabled':''} aria-label="${escape(field.name)}"`;
+  if(field.type==='bool')return `<input type="checkbox" ${common} ${value===true?'checked':''}>`;
+  if(field.type==='enum')return `<select ${common}><option value="">${escape(field.empty_label||'')}</option>${(field.options||(field.values||[]).map(v=>({value:v,label:v}))).map(o=>`<option value="${escape(o.value)}" ${o.value===value?'selected':''}>${escape(o.label)}</option>`).join('')}</select>`;
+  return `<input type="${field.type==='number'?'number':'text'}" ${field.type==='number'?'step="any"':''} ${common} value="${escape(value==null?'':String(value))}">`;
+}
+function editedFieldValue(field,input){if(field.encoding==='comma-list')return splitTags(input.value);if(field.type==='bool')return input.checked;if(input.value==='')return null;return field.type==='number'?Number(input.value):input.value;}
+// Summary always shows the complete part schema, independent of BOM layouts.
+let summaryReadSerial = 0;
+async function loadSummaryFields(detail=currentPart, selectedRevision=$('summary-revision').value, {background=false}={}) {
+  if (!detail || !detail.revision_views.length) return;
+  const serial = ++summaryReadSerial;
+  const revision = detail.revision_views.some(r => r.id === selectedRevision) ? selectedRevision : defaultRevision(detail);
+  const revisionSelect = $('summary-revision');
+  const optionsSignature = JSON.stringify(detail.revision_views.map(r => [r.id, r.label, r.lifecycle]));
+  if (revisionSelect._summaryOptions !== optionsSignature) {
+    revisionOptions(revisionSelect, detail, revision);
+    revisionSelect._summaryOptions = optionsSignature;
+  } else if (revisionSelect.value !== revision) revisionSelect.value = revision;
+  const path = `/api/parts/${encodeURIComponent(detail.id)}`;
+  const data = await api('GET', `${path}/revisions/${encodeURIComponent(revision)}/attributes`);
+  if (serial !== summaryReadSerial || currentPart?.id !== detail.id) return;
+  if (background && document.activeElement?.closest('.summary-attributes')) return;
+  const draw = (container, fields, values, resource) => {
+    // Keep input nodes stable during background reads and after value saves.
+    // Rebuild only when the configured field definitions actually change.
+    const schema = JSON.stringify(fields.map(({value, editable, ...definition}) => definition));
+    if (container._partAttributeSchema !== schema) {
+      container.innerHTML = fields.map(f => `<dt>${escape(f.name)}${f.unit ? ` (${escape(f.unit)})` : ''}</dt><dd>${partAttributeEditor(f, values[f.key], f.editable, `data-summary-field="${escape(f.key)}"`)}</dd>`).join('');
+      container._partAttributeSchema = schema;
+    }
+    for (const input of container.querySelectorAll('[data-summary-field]')) {
+      const field = fields.find(f => f.key === input.dataset.summaryField);
+      const value = values[field.key];
+      if (input.disabled !== !field.editable) input.disabled = !field.editable;
+      const wrapper = input.closest('.part-attribute-input');
+      if (wrapper.classList.contains('is-read-only') !== !field.editable) {
+        wrapper.classList.toggle('is-read-only', !field.editable);
+        const lock = wrapper.querySelector('.attribute-lock');
+        lock.innerHTML = field.editable ? '' : PART_ATTRIBUTE_LOCK_ICON;
+        if (field.editable) lock.removeAttribute('title'); else lock.title = 'Read-only';
+      }
+      if (field.type === 'bool') {
+        if (input.checked !== (value === true)) input.checked = value === true;
+      } else {
+        const shown = field.encoding === 'comma-list' && Array.isArray(value) ? value.join(', ') : value == null ? '' : String(value);
+        if (input.value !== shown) input.value = shown;
+      }
+      input.onchange = () => act(async () => {
+        const value = editedFieldValue(field, input);
+        input.disabled = true;
+        try {
+          await api('PATCH', resource === 'part' ? path : `${path}/revisions/${encodeURIComponent(revision)}/attributes`, resource === 'part' ? {[field.key]: value ?? ''} : {attributes: {[field.key]: value}});
+          $('summary-field-status').textContent = 'Saved';
+          if (resource === 'part') {
+            const fresh = await api('GET', path);
+            if (currentPart?.id === detail.id) { currentPart = fresh; $('part-name').textContent = fresh.name; }
+          }
+        } finally { await loadSummaryFields(currentPart, revision); }
+      });
+    }
+  };
+  draw($('summary-record-fields'), data.record_fields, Object.fromEntries(data.record_fields.map(f => [f.key, f.value])), 'part');
+  draw($('summary-revision-fields'), data.fields.map(f => ({...f, editable: data.editable})), data.attributes, 'revision');
+  const status = data.editable ? 'Revision fields are editable' : 'Revision fields are read-only';
+  if ($('summary-field-status').textContent !== status) $('summary-field-status').textContent = status;
+}
+$('summary-revision').addEventListener('change', () => act(() => loadSummaryFields()));
+async function loadRevisionFields(detail=currentPart){
+  if(!detail)return;
+  const revision=$('revision-field-revision').value;
+  revisionOptions($('revision-field-revision'),detail,detail.revision_views.some(r=>r.id===revision)?revision:defaultRevision(detail));
+  const rev=$('revision-field-revision').value;
+  const data=await api('GET',`/api/parts/${encodeURIComponent(detail.id)}/revisions/${encodeURIComponent(rev)}/attributes`);
+  const editable=data.editable;
+  $('revision-field-values').innerHTML=data.fields.length?data.fields.map(f=>`<label>${escape(f.name)}${f.unit?` (${escape(f.unit)})`:''}${fieldValueEditor(f,data.attributes[f.key],!editable,`data-revision-field="${escape(f.key)}"`)}</label>`).join(''):'<p class="muted">No revision fields configured for this part type.</p>';
+  for(const input of $('revision-field-values').querySelectorAll('[data-revision-field]'))input.addEventListener('change',()=>act(async()=>{
+    const field=data.fields.find(f=>f.key===input.dataset.revisionField);input.disabled=true;
+    try{await api('PATCH',`/api/parts/${encodeURIComponent(detail.id)}/revisions/${encodeURIComponent(rev)}/attributes`,{attributes:{[field.key]:editedFieldValue(field,input)}});}finally{await loadRevisionFields(detail);}
+  }));
+}
+$('revision-field-revision').addEventListener('change',()=>act(()=>loadRevisionFields()));
+const bomAttributeView={show:false};
+async function drawConfiguredBom(bom,serial){
+  await drawBomAttributes({bom,head:$('bom-head'),rows:$('bom-rows'),selection:$('bom-layout'),editButton:$('bom-edit-attributes'),status:$('bom-edit-status'),treeControls:$('bom-tree-controls'),view:bomAttributeView,reload:loadBom,isCurrent:()=>serial===bomReadSerial});
+}
+// Every PLM BOM uses this editor, including Home, Parts and review detail panes.
+async function drawBomAttributes({bom,head,rows,selection,editButton,status,treeControls,view,reload,isCurrent}){
+  const config=await api('GET','/api/bom/configuration');
+  if(!isCurrent())return;
+  selection.innerHTML='<option value="">Default</option>'+config.layouts.map(l=>`<option value="${escape(l.id)}">${escape(l.name)} (${l.owner?'Personal':'Shared'})</option>`).join('');
+  selection.value=config.selected||'';
+  selection.onchange=()=>act(async()=>{await api('PUT','/api/bom/selection',{id:selection.value});view.show=false;await reload();});
+  editButton.hidden=!me.can_author;
+  editButton.textContent=view.show?'Hide extra attribute columns':'Edit attributes';
+  editButton.setAttribute('aria-pressed',String(view.show));
+  editButton.onclick=()=>act(async()=>{view.show=!view.show;await reload();});
+  const layout=config.layouts.find(l=>l.id===config.selected),ids=[...(layout?.columns||DEFAULT_BOM_COLUMNS)];
+  if(view.show)for(const field of config.fields){
+    if(field.editable&&!ids.includes(field.id)&&(field.scope!=='part'||bom.lines.some(line=>line.part_type===field.part_type)))ids.push(field.id);
+  }
+  const fields=ids.map(id=>config.fields.find(f=>f.id===id)).filter(f=>f&&(bom.flat||f.id!=='builtin.number'));
+  const treeKey=`${bom.part_id}/${bom.revision_id}`;
+  if(view.treeKey!==treeKey){view.treeKey=treeKey;view.collapsed=new Set();}
+  const branches=new Set(),lastSibling=new Set(),siblings=new Map();
+  for(const line of bom.lines){
+    const parent=line.position.split('.').slice(0,-1).join('.');
+    if(parent)branches.add(parent);
+    if(!siblings.has(parent))siblings.set(parent,[]);siblings.get(parent).push(line.position);
+  }
+  for(const children of siblings.values())lastSibling.add(children.at(-1));
+  rows.closest('table').setAttribute('role',bom.flat?'table':'treegrid');
+  treeControls.hidden=bom.flat;
+  const maxDepth=bom.lines.reduce((depth,line)=>Math.max(depth,line.level),1);
+  treeControls.innerHTML=`<button type="button" class="ghost" data-bom-expand-all>Expand all</button><button type="button" class="ghost" data-bom-collapse-all>Collapse all</button><label class="inline-select">Depth <select data-bom-expand-depth>${Array.from({length:maxDepth},(_,i)=>`<option value="${i+1}" ${Number(view.expandDepth||1)===i+1?'selected':''}>${i+1}</option>`).join('')}</select></label><button type="button" class="ghost" data-bom-expand-to>Expand to depth</button>`;
+  treeControls.querySelector('[data-bom-expand-all]').onclick=()=>{view.collapsed.clear();paint();};
+  treeControls.querySelector('[data-bom-collapse-all]').onclick=()=>{view.collapsed=new Set(branches);paint();};
+  treeControls.querySelector('[data-bom-expand-depth]').onchange=event=>{view.expandDepth=Number(event.target.value);};
+  treeControls.querySelector('[data-bom-expand-to]').onclick=()=>{
+    const depth=Number(treeControls.querySelector('[data-bom-expand-depth]').value);view.expandDepth=depth;
+    view.collapsed=new Set(bom.lines.filter(line=>branches.has(line.position)&&line.level>=depth).map(line=>line.position));paint();
+  };
+  const treeCell=line=>{
+    const segments=line.position.split('.');
+    const guides=segments.slice(0,-1).map((_,i)=>`<span class="bom-tree-guide ${lastSibling.has(segments.slice(0,i+1).join('.'))?'':'continues'}" data-bom-guide-index="${i}"></span>`).join('');
+    const expanded=!view.collapsed.has(line.position),branch=branches.has(line.position);
+    return `<td class="bom-tree-cell"><div class="bom-tree-entry">${guides}<span class="bom-tree-guide elbow ${lastSibling.has(line.position)?'last':''}" data-bom-guide-index="${segments.length-1}"></span>${branch?`<button type="button" class="bom-tree-toggle" data-bom-toggle="${escape(line.position)}" aria-expanded="${expanded}" aria-label="${expanded?'Collapse':'Expand'} ${escape(line.number)} at ${escape(line.position)}">${expanded?'▾':'▸'}</button>`:'<span class="bom-tree-spacer"></span>'}<svg class="bom-tree-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true">${line.assembly?'<path d="M3 6h7l2 3h9v12H3z"/>':'<path d="M5 3h9l5 5v13H5zM14 3v6h5"/>'}</svg><a href="#/part/${encodeURIComponent(line.part_id)}" title="Position ${escape(line.position)}">${escape(line.number)}</a></div></td>`;
+  };
+  const hasWarnings=bom.lines.some(line=>line.warnings?.length);
+  head.innerHTML=`<tr>${hasWarnings?'<th class="bom-warning-column" aria-label="Warnings"></th>':''}${bom.flat?'':'<th>Part</th>'}${fields.map(f=>`<th>${escape(f.name)}${f.unit?` (${escape(f.unit)})`:''}</th>`).join('')}</tr>`;
+  const valueOf=(line,f)=>f.scope==='part'?(f.part_type===line.part_type?line.part_values[f.key]:null):f.scope==='occurrence'?(f.id.startsWith('builtin.')?line[f.key]:line.occurrence_attributes[f.key]):line[f.key];
+  function paint(){
+  rows.innerHTML=bom.lines.map((line,i)=>{
+    const ancestors=line.position.split('.').slice(0,-1).map((_,j)=>line.position.split('.').slice(0,j+1).join('.'));
+    if(!bom.flat&&ancestors.some(parent=>view.collapsed.has(parent)))return '';
+    return `<tr data-bom-position="${escape(line.position)}" ${bom.flat?'':`aria-level="${line.level}" ${branches.has(line.position)?`aria-expanded="${!view.collapsed.has(line.position)}"`:''}`}>${hasWarnings?`<td class="bom-warning-column">${line.warnings?.length?`<button type="button" class="bom-warning-icon" data-bom-warning="${i}" title="${escape(line.warnings.join('\n'))}" aria-label="Warnings for ${escape(line.number)} rev ${escape(line.revision_label)}">⚠</button>`:''}</td>`:''}${bom.flat?'':treeCell(line)}${fields.map(f=>{
+    const value=valueOf(line,f),applicable=f.edit?.resource==='part'||(f.scope==='part'?f.part_type===line.part_type:line.occurrence_ids.length>0);
+    if(f.editable&&applicable&&me.can_author)return `<td>${fieldValueEditor(f,value,false,`data-bom-row="${i}" data-bom-field="${escape(f.id)}"`)}</td>`;
+    if(f.id==='builtin.number')return `<td><a href="#/part/${encodeURIComponent(line.part_id)}">${escape(line.number)}</a></td>`;
+    return `<td>${escape(value==null?'—':String(value))}</td>`;
+  }).join('')}</tr>`;}).join('');
+  // The guide column offset is a custom property; set on the element, not written inline (the CSP allows no style attribute).
+  for(const guide of rows.querySelectorAll('.bom-tree-guide[data-bom-guide-index]'))guide.style.setProperty('--bom-guide-index',guide.dataset.bomGuideIndex);
+  for(const button of rows.querySelectorAll('[data-bom-toggle]')){
+    const toggle=()=>{const position=button.dataset.bomToggle;if(view.collapsed.has(position))view.collapsed.delete(position);else view.collapsed.add(position);paint();rows.querySelector(`[data-bom-toggle="${CSS.escape(position)}"]`)?.focus();};
+    button.onclick=toggle;button.onkeydown=event=>{if((event.key==='ArrowRight'&&view.collapsed.has(button.dataset.bomToggle))||(event.key==='ArrowLeft'&&!view.collapsed.has(button.dataset.bomToggle))){event.preventDefault();toggle();}};
+  }
+  for(const button of rows.querySelectorAll('[data-bom-warning]'))button.onclick=()=>{
+    const line=bom.lines[Number(button.dataset.bomWarning)];
+    let dialog=$('bom-warning-dialog');
+    if(!dialog){dialog=document.createElement('dialog');dialog.id='bom-warning-dialog';document.body.append(dialog);}
+    dialog.innerHTML=`<form method="dialog"><h2>${escape(line.number)} rev ${escape(line.revision_label)}</h2><ul>${line.warnings.map(w=>`<li>${escape(w)}</li>`).join('')}</ul><button type="submit">Close</button></form>`;
+    dialog.showModal();
+  };
+  status.textContent=me.can_author?'Edit attribute values in the table. Changes save automatically.':'';
+  for(const input of rows.querySelectorAll('[data-bom-field]'))input.addEventListener('change',()=>act(async()=>{
+    const line=bom.lines[Number(input.dataset.bomRow)],field=fields.find(f=>f.id===input.dataset.bomField);input.disabled=true;
+    const value=editedFieldValue(field,input);
+    const target=field.edit;
+    const part=target.resource==='occurrence'?line.owner_part:line.part_id,revision=target.resource==='occurrence'?line.owner_revision:line.revision_id;
+    const base=`/api/parts/${encodeURIComponent(part)}`;
+    const path=target.resource==='part'?base:`${base}/revisions/${encodeURIComponent(revision)}/${target.resource==='revision'?'attributes':'occurrences'}`;
+    const payload=target.resource==='part'?{[target.key]:value??''}:{...(target.resource==='occurrence'?{ids:line.occurrence_ids}:{}),attributes:{[target.key]:value}};
+    try{
+      await api('PATCH',path,payload);
+      if(isCurrent()){await reload();status.textContent='Attributes saved.';}
+    }catch(error){
+      if(isCurrent()){await reload();status.textContent=error.message;}
+      throw error;
+    }
+  }));
+  }
+  paint();
+}
+
+let bomMetadataPolling=false;
+setInterval(async()=>{
+  if(!me||!currentPart||document.hidden||$('view-part').hidden||bomMetadataPolling||document.querySelector('.work-area').inert)return;
+  if(document.activeElement?.closest('#bom-rows,#revision-field-values,[data-object-panel="summary"]'))return;
+  bomMetadataPolling=true;
+  try{if(objectTab==='structure'&&structure.tab==='bom')await loadBom();else if(objectTab==='revisions')await loadRevisionFields();else if(objectTab==='summary')await loadSummaryFields(currentPart,$('summary-revision').value,{background:true});}catch{}finally{bomMetadataPolling=false;}
+},5000);

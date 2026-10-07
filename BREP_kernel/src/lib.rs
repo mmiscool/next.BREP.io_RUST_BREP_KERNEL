@@ -1,3 +1,4 @@
+
 use serde::{Deserialize, Serialize};
 use wasm_bindgen::prelude::*;
 
@@ -25,7 +26,8 @@ pub use entity_tolerance::{EntityTolerances, EDGE_CAP_FRACTION, VERTEX_CAP_FRACT
 #[path = "props/diagnostics.rs"]
 mod diagnostics;
 pub use diagnostics::{
-    Backing, DiagnosticEvent, DiagnosticSeverity, KernelDiagnostics, KernelOutcome, KernelRefusal,
+    Approximation, ApproximationBudget, Backing, BudgetMechanism, BudgetReason, MeasuredComponent, DiagnosticEvent, DiagnosticSeverity, EdgeOrigin, KernelDiagnostics,
+    KernelOutcome, KernelRefusal, OffCarrierEdge,
     KernelStage, OrRefuse, RefusalClass, SoundnessDefect, UndecidedCause,
 };
 #[path = "geometry/polygon.rs"]
@@ -39,7 +41,7 @@ pub use curve::{
 #[path = "blending/blend/mod.rs"]
 mod blend;
 pub use blend::{
-    take_blend_notes,
+    take_blend_approximations, take_blend_notes,
     blend_closed_edge, blend_edge_variable, blend_open_edge, blend_smooth_chain,
     round_convex_corner,
 };
@@ -139,10 +141,14 @@ pub use sweep_topology::{
     SWEEP_TWIST_CLOSURE_REFUSAL,
     build_swept_envelope, recognize_swept_envelope, swept_envelope_volume, SweptEnvelope,
     SWEEP_ENVELOPE_REFUSAL, sweep_envelope_bodies,
-    sweep_profile_along_chain, sweep_profile_along_chain_with_stations, sweep_profile_along_path,
+    sweep_profile_along_chain, sweep_profile_along_chain_reported,
+    sweep_profile_along_chain_with_stations, sweep_profile_along_chain_with_stations_reported,
+    sweep_profile_along_path,
     sweep_profile_along_path_anchored,
     sweep_profile_helix,
     sweep_profile_twisted, sweep_profile_twisted_anchored, ProfileAnchor, SectionPlacement,
+    StationBudget, SweepStationReport, SweptChain, SWEEP_DEFAULT_TOLERANCE, SWEEP_MAX_STATIONS,
+    SWEEP_REFINEMENT_ROUNDS,
 };
 #[path = "construction/revolve_topology.rs"]
 mod revolve_topology;
@@ -185,7 +191,7 @@ pub use watertight_tessellation::{
 // each feature against a live scene-map of resident handles, and returns per-feature
 // results (handles + face/edge names). See feature_pipeline/mod.rs for the contract.
 #[path = "feature_pipeline/mod.rs"]
-mod feature_pipeline;
+pub mod feature_pipeline;
 pub use feature_pipeline::execute_history_json;
 pub use feature_pipeline::{first_reference_name, reference_names};
 // Transform Face's default pivot (the selection's boundary centre) over the
@@ -237,10 +243,12 @@ pub use feature_pipeline::ports::{
 // its schemas / selection predicates, the tail's resolved report, and the
 // presentation layout shared by the viewport and the AP242 export.
 pub use feature_pipeline::pmi::{
-    clamp_text_size, format_dimension, format_number, pmi_schema_catalogue, pmi_type,
-    resolve_state as pmi_resolve_state, FcfFrame, PmiAnnotation, PmiAnnotationReport, PmiCamera,
-    PmiDisplay, PmiGeometry, PmiPlane, PmiProjection, PmiReport, PmiState, PmiStatus, PmiTypeDef, PmiView,
-    PmiViewReport, ToleranceBlock, ToleranceMode, PMI_TYPES,
+    balloon_head as pmi_balloon_head, clamp_text_size, format_dimension, format_number,
+    nearest_point_on_edge, nearest_point_on_solid, pmi_schema_catalogue, pmi_type,
+    nearest_displayed_point, nearest_displayed_point_on_edge, pose_apply as pmi_pose_apply, pose_unapply as pmi_pose_unapply,
+    resolve_state as pmi_resolve_state, BalloonAnchor, BalloonAnchorMode, FcfFrame, HalfSpace as PmiHalfSpace, HeadScope as PmiHeadScope, PmiAnnotation,
+    PmiAnnotationReport, PmiCamera, PmiDisplay, PmiGeometry, PmiPlane, PmiPose, PmiProjection, PmiReport,
+    PmiState, PmiStatus, PmiTypeDef, PmiView, PmiViewReport, SolidPoses as PmiSolidPoses, ToleranceBlock, ToleranceMode, PMI_TYPES,
 };
 pub use feature_pipeline::pmi::layout::{present as pmi_present, LayoutStyle as PmiLayoutStyle, Presentation as PmiPresentation};
 pub use feature_pipeline::pmi::annotations::fcf::{characteristic as pmi_characteristic, Characteristic as PmiCharacteristic, CHARACTERISTICS as PMI_CHARACTERISTICS};
@@ -542,9 +550,9 @@ pub use appearance::{BodyAppearance, ImportedColor, COLOR_METADATA_KEY};
 #[path = "io/step_import/mod.rs"]
 mod step_import;
 pub use step_import::{
-    import_step, import_step_report, import_step_trim_readings, import_step_with_appearance,
+    import_step, import_step_bodies, import_step_report, import_step_trim_readings, import_step_with_appearance,
     occurrence_ref_parts, read_step_assembly, read_step_pmi, rewrite_occurrence_refs,
-    StepAssembly, StepBodyTrimReadings, StepEdgeReading, StepFaceReading, StepImportReport,
+    ImportedStep, StepAssembly, StepBodyError, StepBodyTrimReadings, StepEdgeReading, StepFaceReading, StepImportReport,
     StepOccurrence, StepProduct, StepSuppliedTrim, StepTrimReadings, OCCURRENCE_REF_PREFIX,
     STATED_PRECISION_INCONSISTENCY_RATIO,
 };
@@ -637,6 +645,10 @@ pub use mesh_segment::{
     mesh_regions_to_brep, segment_mesh_faces, MeshRegion, MeshSegmentation, RegionCarrier,
     SegmentOptions, UNASSIGNED_REGION,
 };
+
+#[path = "meshing/spherical_union.rs"]
+mod spherical_union;
+pub use spherical_union::reconstruct_spherical_mesh_union;
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize)]
 pub struct Vec3 {

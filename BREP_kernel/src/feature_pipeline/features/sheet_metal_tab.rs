@@ -250,6 +250,8 @@ pub fn schema() -> serde_json::Value {
     "type": "SM.TAB",
     "shortName": "SM.TAB",
     "longName": "SM Tab",
+    "ribbonPath": "Home/Sheet Metal/Tab",
+    "commandSize": "Compact",
     "displayBuilder": false,
     "inputParamsSchema": {
         "id": {

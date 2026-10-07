@@ -67,6 +67,8 @@ impl std::str::FromStr for CookieSecurity {
 /// nothing in the browser can change it.
 #[derive(Debug, Clone, Default)]
 pub struct ServerConfig {
+    /// Native worker pinned by the server operator, controlled by admins.
+    pub bake_worker: Option<crate::bake_worker::Config>,
     pub secure_cookies: CookieSecurity,
     /// Believe `X-Forwarded-For` and `X-Forwarded-Proto`. Only right behind a
     /// reverse proxy that sets them; otherwise any client could claim any
@@ -99,6 +101,8 @@ pub struct ServerConfig {
     /// `--cad-app`: the directory the wasm CAD app is served from
     /// ([`crate::cad`]). None: no app is hosted.
     pub cad_app_dir: Option<std::path::PathBuf>,
+    /// `--web-dir`: live PLM frontend files overriding the embedded bundle.
+    pub web_dir: Option<std::path::PathBuf>,
     /// `--cad-connect-src`: origins the hosted CAD app may call besides this
     /// server ([`crate::cad::policy`]).
     pub cad_connect_src: Vec<String>,
@@ -382,7 +386,7 @@ pub fn scope_refusal(scope: TokenScope, method: &Method, path: &str) -> Option<S
         TokenScope::Full => None,
         TokenScope::Read => Some("this API token may only read".into()),
         TokenScope::Worker => {
-            let allowed = path.starts_with("/api/bake/")
+            let allowed = (path.starts_with("/api/bake/") && !path.starts_with("/api/bake/worker"))
                 || path.starts_with("/api/store/doc/")
                 || (*method == Method::PUT && is_thumbnail_route(path));
             (!allowed).then(|| "this worker token may only read, work the bake queue, write documents and their thumbnails".into())
@@ -398,7 +402,7 @@ pub fn scope_refusal(scope: TokenScope, method: &Method, path: &str) -> Option<S
 /// with no inline script or style and no third-party anything, so everything
 /// is `'self'` and nothing may frame it.
 pub const CONTENT_SECURITY_POLICY: &str = "default-src 'none'; script-src 'self'; style-src 'self'; \
-img-src 'self' data:; connect-src 'self'; font-src 'self'; form-action 'self'; \
+img-src 'self' data:; connect-src 'self'; font-src 'self'; frame-src 'self'; form-action 'self'; \
 frame-ancestors 'none'; base-uri 'none'";
 
 /// Headers every response carries.

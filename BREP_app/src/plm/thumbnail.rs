@@ -267,16 +267,12 @@ async fn upload(client: &PlmClient, key: &str, hash: &str, picture: Picture) {
 /// document whose hash is `hash`. The bake worker calls this directly.
 pub async fn put(client: &PlmClient, key: &str, hash: &str, png: Vec<u8>) -> Result<(), String> {
     let (part, revision) = revision_of(key)?;
-    let path = format!("/api/parts/{part}/revisions/{revision}/thumbnail?content_hash={hash}&renderer={}", raster::RENDERER);
+    let path = format!("{}/thumbnail?content_hash={hash}&renderer={}", super::identity::revision_path(&part, &revision), raster::RENDERER);
     client.call_typed("PUT", &path, png, "image/png").await.map(|_| ()).map_err(|e| e.to_string())
 }
 
-fn revision_of(key: &str) -> Result<(&str, &str), String> {
-    let mut parts = key.split('/');
-    match (parts.next(), parts.next(), parts.next(), parts.next(), parts.next()) {
-        (Some("part"), Some(p), Some("rev"), Some(r), None) if !p.is_empty() && !r.is_empty() => Ok((p, r)),
-        _ => Err(format!("`{key}` is not a revision key")),
-    }
+fn revision_of(key: &str) -> Result<(String, String), String> {
+    super::family::key_ids(key).ok_or_else(|| format!("'{key}' is not a revision key"))
 }
 
 fn detach(task: impl Future<Output = ()> + 'static) {

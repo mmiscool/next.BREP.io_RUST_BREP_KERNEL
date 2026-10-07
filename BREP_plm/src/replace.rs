@@ -60,7 +60,7 @@ pub struct ReplaceRequest {
     /// The replacement's revision, by id or label. Empty: floating.
     #[serde(default)]
     pub to_revision: String,
-    /// Parent revisions to touch, by id. Empty: every current direct parent.
+    /// Parent revisions to touch, by readable part/revision document key. Empty: every current direct parent.
     #[serde(default)]
     pub parents: Vec<String>,
     /// Compute the report without writing.
@@ -338,10 +338,11 @@ impl Db {
             let mut plans = Vec::new();
             let mut seen = std::collections::BTreeSet::new();
             for line in &found.lines {
-                if !seen.insert(line.revision_id.clone()) {
+                let key = crate::identity::document_key(&line.part_id, &line.revision_id);
+                if !seen.insert(key.clone()) {
                     continue;
                 }
-                if !wanted.is_empty() && !wanted.contains(&line.revision_id.as_str()) {
+                if !wanted.is_empty() && !wanted.contains(&key.as_str()) {
                     continue;
                 }
                 if wanted.is_empty() && !line.current {
@@ -513,7 +514,7 @@ impl Db {
     /// undo the write; the row says why it is not in the change order.
     fn replace_into_eco(&self, user: &User, eco_id: &str, row: &ReplaceRow) -> String {
         let already = self.read(|state| {
-            crate::eco::find(state, eco_id).is_some_and(|e| e.item(&row.revision_id).is_some())
+            crate::eco::find(state, eco_id).is_some_and(|e| e.item(&row.part_id, &row.revision_id).is_some())
         });
         if already {
             return "already in it".into();

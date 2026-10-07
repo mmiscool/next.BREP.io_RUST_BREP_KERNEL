@@ -16,9 +16,9 @@
 //! tessellation.
 //!
 //! ```toml
-//! BREP = "0.2"                                    # kernel only
-//! BREP = { version = "0.2", features = ["render"] } # + the wgpu render engine
-//! BREP = { version = "0.2", features = ["full"] }   # everything, incl. the eframe app
+//! BREP = "0.8"                                    # kernel only
+//! BREP = { version = "0.8", features = ["render"] } # + the wgpu render engine
+//! BREP = { version = "0.8", features = ["full"] }   # everything, incl. the eframe app
 //! ```
 //!
 //! ```no_run

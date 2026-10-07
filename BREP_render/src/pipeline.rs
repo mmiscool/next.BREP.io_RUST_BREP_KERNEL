@@ -14,6 +14,9 @@ use std::collections::HashMap;
 /// point of the artifact).
 #[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SceneBuildReport {
+    /// Successful plugin callback state, committed with the accepted scene only.
+    #[serde(default)]
+    pub plugin_persistent_data: Vec<(String, serde_json::Value)>,
     /// Per-feature hard errors, as `"<feature id>: <message>"`.
     pub feature_errors: Vec<String>,
     /// Unresolved reference-selection names, as `"<feature id>: <name>"`.
@@ -44,6 +47,17 @@ pub struct SceneBuildReport {
     /// it, and omitted when empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub feature_refusals: Vec<(String, brep_kernel::KernelRefusal, Option<String>)>,
+    /// The MEASURED approximations each SUCCESSFUL feature carries
+    /// (`brep_kernel::FeatureResult::approximations`): `(feature id,
+    /// approximations)` in run order, only for the features that carry any.
+    /// The result stands and this says by how much, and why, it is not exact —
+    /// the third kind of report beside a refusal (the result does not stand)
+    /// and a fulfilment (what was done of what was asked); today the STEP
+    /// import's shell-closure gate (`import.shell_closure`) is the producer.
+    /// Additive: `#[serde(default)]` for reports serialized before it, and
+    /// omitted when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub feature_approximations: Vec<(String, Vec<brep_kernel::Approximation>)>,
     /// Solids whose display payload (tessellation) failed, as
     /// `"<solid name>: <message>"` — the solid is skipped, not fatal.
     pub display_errors: Vec<String>,
@@ -134,6 +148,15 @@ pub fn scene_from_history(
     Ok((scene, report))
 }
 
+/// Explicitly provision trusted packages for a one-shot headless scene build.
+/// The document itself provides only exact pins; loading it never installs code.
+pub fn scene_from_history_with_plugins(
+    request: &HistoryRequest,
+    runtime: &brep_plugins::Runtime,
+) -> Result<(RenderScene, SceneBuildReport), String> {
+    runtime.with_provider(|| scene_from_history(request))
+}
+
 /// The fold of a history run into an ordered scene layout: each entry is the
 /// solid's final name, its resident handle, and whether the feature that
 /// produced it REPLAYED from the incremental cache (R10 — a reused solid is the
@@ -186,6 +209,9 @@ fn fold_history(result: &brep_kernel::HistoryResult, report: &mut SceneBuildRepo
     let mut entity_origin: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
     for (index, feature) in result.results.iter().enumerate() {
+        if let Some(data) = &feature.persistent_data {
+            if feature.error.is_none() { report.plugin_persistent_data.push((feature.id.clone(), data.clone())); }
+        }
         // A feature whose `inputParams` carry no `id` still has to be nameable in
         // the report, or its errors read as `": <message>"` and point at nothing.
         // Its POSITION is the only handle it has, and the one `feature_delete`
@@ -246,6 +272,11 @@ fn fold_history(result: &brep_kernel::HistoryResult, report: &mut SceneBuildRepo
                 .feature_refusals
                 .push((feature.id.clone(), refusal.clone(), feature.refused_step.clone()));
         }
+        if !feature.approximations.is_empty() {
+            report
+                .feature_approximations
+                .push((feature.id.clone(), feature.approximations.clone()));
+        }
         // The feature's output solid name(s) — the history tree's Outputs node.
         report.feature_outputs.push((
             feature.id.clone(),
@@ -295,6 +326,9 @@ fn fold_history(result: &brep_kernel::HistoryResult, report: &mut SceneBuildRepo
 /// Tracks resident handles so unchanged solids retain their meshes and GPU
 /// buffers when the main thread applies the resulting [`RunOutput`].
 pub struct SceneRunner {
+    pub(crate) plugin_revision: Option<u64>,
+    plugins: Option<brep_plugins::Runtime>,
+    plugin_error: Option<String>,
     /// Last emitted handle per solid name. Handles are never recycled, so a
     /// matching handle identifies a cache replay whose display can be reused.
     last_sent: HashMap<String, u32>,
@@ -323,6 +357,12 @@ pub struct ComponentSnapshot {
     /// The rigid instance pose (part-local snapshot space -> assembly space)
     /// as the kernel's row-major 4x4; [`Self::affine`] wraps it back up.
     pub transform: [f64; 16],
+    /// Evaluated pose before the constraint solver adjusts it.
+    #[serde(default)]
+    pub requested_transform: Option<[f64; 16]>,
+    /// Authored expressions captured at the run boundary.
+    #[serde(default)]
+    pub authored_transform: serde_json::Value,
     /// Grounded flag (the feature's `isFixed`).
     pub fixed: bool,
     /// Opaque source metadata (`sourceKey` / `sourceSignature` / …).
@@ -386,6 +426,8 @@ impl From<&brep_kernel::ComponentRecord> for ComponentSnapshot {
             id: record.id.clone(),
             part_name: record.part_name.clone(),
             transform: record.transform.elements,
+            requested_transform: Some(record.transform.elements),
+            authored_transform: serde_json::Value::Null,
             fixed: record.fixed,
             source: record.source.clone(),
             solids: record.solids.clone(),
@@ -510,8 +552,34 @@ pub struct RunOutput {
 }
 
 impl SceneRunner {
+    /// Provision explicitly trusted packages on this runner's execution thread.
+    pub fn set_plugins(&mut self, revision: u64, packages: serde_json::Value) {
+        let runtime = serde_json::from_value(packages)
+            .map_err(|e| format!("plugin packages: {e}"))
+            .and_then(brep_plugins::Runtime::new);
+        match runtime {
+            Ok(runtime) => { self.plugins = Some(runtime); self.plugin_error = None; }
+            Err(error) => { self.plugins = None; self.plugin_error = Some(error); }
+        }
+        self.plugin_revision = Some(revision);
+        self.last_sent.clear();
+    }
+
+    pub(crate) fn plugin_action(&self, request: crate::runner::PluginActionRequest) -> crate::runner::PluginActionReply {
+        let result = if let Some(source) = &request.script {
+            brep_plugins::execute_script(source, &request.input)
+        } else { match &self.plugins {
+            Some(runtime) => runtime.execute_action(&request.pins, &request.action, &request.input),
+            None => Err(self.plugin_error.clone().unwrap_or_else(|| "no plugin packages installed".into())),
+        }};
+        crate::runner::PluginActionReply { id: request.id, result }
+    }
+
     pub fn new() -> Self {
         Self {
+            plugin_revision: None,
+            plugins: None,
+            plugin_error: None,
             last_sent: HashMap::new(),
             last_lod: 1.0,
             parts_library_revision: None,
@@ -564,7 +632,10 @@ impl SceneRunner {
         let library_revision_before = brep_kernel::parts_library_revision();
         let result = {
             let mut trace = crate::run_trace::span("runner");
-            let result = brep_kernel::execute_history_observed(request, observe);
+            let result = match &self.plugins {
+                Some(runtime) => runtime.with_provider(|| brep_kernel::execute_history_observed(request, observe)),
+                None => brep_kernel::execute_history_observed(request, observe),
+            };
             if let Some(trace) = trace.as_mut() {
                 trace.result(&result);
             }
@@ -617,6 +688,9 @@ impl SceneRunner {
         // Same thread-local reason as the poses above, and the whole point of
         // `AssemblySync`: read here, applied there, never re-executed.
         let assembly = request_has_assembly(request).then(|| {
+            let authored: HashMap<&str, &serde_json::Value> = request.features.iter()
+                .filter_map(|f| f.input_params["id"].as_str().map(|id| (id, &f.input_params["transform"])))
+                .collect();
             let mut components: std::collections::BTreeMap<String, ComponentSnapshot> =
                 std::collections::BTreeMap::new();
             for feature in &result.results {
@@ -624,7 +698,10 @@ impl SceneRunner {
                     components.remove(removed);
                 }
                 for record in &feature.components {
-                    components.insert(record.id.clone(), ComponentSnapshot::from(record));
+                    let mut snapshot = ComponentSnapshot::from(record);
+                    snapshot.authored_transform = authored.get(record.id.as_str())
+                        .map(|value| (*value).clone()).unwrap_or_default();
+                    components.insert(record.id.clone(), snapshot);
                 }
             }
             // A record's pose is captured when its ACOMP EXECUTES, which is

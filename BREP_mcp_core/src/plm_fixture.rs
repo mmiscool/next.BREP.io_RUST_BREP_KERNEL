@@ -366,6 +366,9 @@ impl PlmFixture {
             bearer = format!("Bearer {token}");
             headers.push(("Authorization", &bearer));
         }
+        if let Some(content_type) = call.content_type.as_deref().filter(|_| call.raw.is_some()) {
+            headers.push(("Content-Type", content_type));
+        }
         let method = call.method.to_ascii_uppercase();
         let answer = self.send(&method, &path, &headers, body)?;
         if !call.bind.is_empty() {

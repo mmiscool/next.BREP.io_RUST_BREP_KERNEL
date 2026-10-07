@@ -213,7 +213,19 @@ pub fn assembly_apply_document_impl(document_json: &str) -> Result<String, Strin
                 };
                 let id = id.to_string();
                 if let Some(pose) = session.pose_updates.get(&id) {
-                    params.insert("transform".into(), pose.clone());
+                    // Numeric solver write-back must not erase authored motion
+                    // expressions. The evaluated component record owns that pose.
+                    fn has_expression(value: &serde_json::Value) -> bool {
+                        match value {
+                            serde_json::Value::String(_) => true,
+                            serde_json::Value::Array(a) => a.iter().any(has_expression),
+                            serde_json::Value::Object(o) => o.values().any(has_expression),
+                            _ => false,
+                        }
+                    }
+                    if !params.get("transform").is_some_and(has_expression) {
+                        params.insert("transform".into(), pose.clone());
+                    }
                 }
                 if let Some(&fixed) = session.fixed_updates.get(&id) {
                     params.insert("isFixed".into(), serde_json::Value::Bool(fixed));
@@ -320,6 +332,9 @@ fn overlay_row(entry: &ConstraintEntry, scene: &SceneMap, env: &Env) -> serde_js
         if let Some((value, unit)) = mapped.measured {
             object.insert("value".into(), serde_json::json!(value));
             object.insert("unit".into(), serde_json::json!(unit));
+        }
+        if let Some(axis) = mapped.angle_axis {
+            object.insert("angleAxis".into(), serde_json::json!([axis.x, axis.y, axis.z]));
         }
         if let Some(target) = mapped.target {
             object.insert("target".into(), serde_json::json!(target));

@@ -117,6 +117,8 @@ pub fn schema() -> serde_json::Value {
     "type": "CH",
     "shortName": "CH",
     "longName": "Chamfer",
+    "ribbonPath": "Home/Blend/Chamfer",
+    "commandSize": "Compact",
     "displayBuilder": false,
     "inputParamsSchema": {
         "id": {

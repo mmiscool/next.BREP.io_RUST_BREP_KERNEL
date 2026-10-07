@@ -569,7 +569,7 @@ pub fn merge_curve_continuations_json(request_json: &str) -> Result<String, JsVa
     let request: CoalesceRequest =
         serde_json::from_str(request_json).map_err(|error| javascript_error(error.to_string()))?;
     let solid = merge_curve_continuation_edges(&request.solid, request.tolerance)
-        .map_err(javascript_error)?;
+        .map_err(|refusal| javascript_error(refusal.message))?;
     serde_json::to_string(&solid).map_err(|error| javascript_error(error.to_string()))
 }
 

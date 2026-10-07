@@ -164,6 +164,9 @@ pub struct BomPanel {
     /// The PLM half: the server's BOM of the open revision, and part
     /// attribute edits waiting for the server (S6).
     plm: crate::panels::bom_plm::PlmBomView,
+    configuration: crate::panels::bom_configuration::BomConfiguration,
+    owner_key: Option<String>,
+    plm_mode: bool,
 }
 
 impl Default for BomPanel {
@@ -185,6 +188,9 @@ impl BomPanel {
             collapsed: HashSet::new(),
             margin_edit: None,
             plm: Default::default(),
+            configuration: Default::default(),
+            owner_key: None,
+            plm_mode: false,
         }
     }
 
@@ -205,6 +211,16 @@ impl BomPanel {
         // session signed in to that PLM.
         self.plm.settle(state);
         let plm_target = plm_target(store, document);
+        self.owner_key = plm_target.as_ref().map(|(_,part,rev)|crate::plm::identity::document_key(part,rev));
+        self.plm_mode = store.plm_client().is_some();
+        if let Some(client) = store.plm_client() {
+            let history: Value = serde_json::from_str(&state.history_request_json()).unwrap_or_default();
+            let mut keys: Vec<String> = history["partsLibrary"].as_object().into_iter().flat_map(|l|l.values()).filter_map(|entry|entry["sourceKey"].as_str().filter(|key|crate::plm::bom::revision_of_document(key).is_some()).map(str::to_string)).collect();
+            if let Some(key)=&self.owner_key { keys.push(key.clone()); }
+            keys.sort(); keys.dedup();
+            self.configuration.ensure(&client,keys);
+            self.configuration.ui(ui,&client,&mut self.hits);
+        }
         // What is actually VISIBLE of this pane. Every other rect below is a
         // raw LAYOUT rect, so a widget scrolled past the pane's edge is still
         // published while being unclickable — a headed verifier has to scroll
@@ -215,8 +231,12 @@ impl BomPanel {
 
         self.sync_columns(state);
         let component_rows = assembly_components::snapshot(state, updates);
-        let occurrences = occurrences_from(state, &component_rows);
-        let groups = group(&occurrences, self.packed, &self.packing_fields());
+        let mut occurrences = occurrences_from(state, &component_rows);
+        if let Some(owner)=&self.owner_key {
+            for occurrence in &mut occurrences {if let Some(attributes)=self.configuration.occurrence(owner,&occurrence.id){occurrence.attributes=attributes;}}
+        }
+        let packing_fields = if self.plm_mode {occurrences.iter().flat_map(|o|o.attributes.as_object().into_iter().flat_map(|a|a.keys().cloned())).collect::<std::collections::BTreeSet<_>>().into_iter().collect()}else{self.packing_fields()};
+        let groups = group(&occurrences, self.packed, &packing_fields);
         let wires = state.wire_bom_lines();
         let margin = state.wire_harness_state().cut_margin;
         let mut margin_commit: Option<f64> = None;
@@ -241,7 +261,7 @@ impl BomPanel {
             self.plm.active = false;
         }
         if let (true, Some((client, part, revision))) = (self.plm.active, &plm_target) {
-            self.plm.ui(ui, state, client, part, revision, &mut self.hits);
+            self.plm.ui(ui, state, client, part, revision, &self.configuration, &mut self.hits);
             if crate::automation::registry::enabled() {
                 self.publish_plm(true);
                 self.publish_hits();
@@ -336,7 +356,8 @@ impl BomPanel {
             })
             .collect();
         rows.extend(wires.iter().map(wire_row));
-        let specs = bom_columns::column_specs(&self.parsed);
+        let mut specs = bom_columns::column_specs(&self.parsed);
+        if self.plm_mode {for spec in &mut specs {if let Some(field)=self.configuration.field(&spec.key){spec.label=if field.unit.is_empty(){field.name.clone()}else{format!("{} ({})",field.name,field.unit)};spec.kind=field.cell_kind();}}}
         let mut root_cells: HashMap<String, Value> = HashMap::new();
         root_cells.insert(
             QUANTITY_KEY.to_string(),
@@ -490,7 +511,7 @@ impl BomPanel {
     /// and sort are session state and survive the rebuild — a re-parse must
     /// not resize the table under the user's hands.
     fn sync_columns(&mut self, state: &EngineState) {
-        let text = bom_columns::effective_text(&state.settings.bom_columns);
+        let text = if self.plm_mode {self.configuration.text().unwrap_or_else(||bom_columns::effective_text(&state.settings.bom_columns))}else{bom_columns::effective_text(&state.settings.bom_columns)};
         if text == self.layout_source {
             return;
         }
@@ -503,6 +524,7 @@ impl BomPanel {
     /// so the table and the configuration can never disagree.
     fn persist_layout(&mut self, state: &mut EngineState, store: &dyn ModelStore) {
         let columns = bom_columns::columns_from_layout(&self.parsed, &self.layout);
+        if self.plm_mode {self.configuration.adopt_layout(&columns);return;}
         let text = bom_columns::serialize(
             &columns,
             &self.parsed.preserved,
@@ -576,6 +598,25 @@ impl BomPanel {
             if key == QUANTITY_KEY || key == PMI_KEY || key == MF_QTY_KEY {
                 continue;
             }
+            if self.plm_mode {
+                if let Some(field)=self.configuration.field(&key) {
+                    if let Some(target)=field.edit.as_ref().filter(|target|target.resource=="part") {
+                        if let Some((source_key,_))=state.part_source(&group.part_name){
+                            if let Some(snapshot)=self.configuration.snapshot(&source_key){if let Some(value)=snapshot["record"].get(&target.key){cells.insert(key.clone(),value.clone());}}
+                        }
+                        continue;
+                    }
+                    if field.scope=="part" {
+                        if let Some((source_key,_))=state.part_source(&group.part_name){
+                            if let Some(snapshot)=self.configuration.snapshot(&source_key){
+                                if snapshot["part_type"].as_str()==field.part_type.as_deref(){if let Some(value)=snapshot["attributes"].get(&field.key){cells.insert(key.clone(),value.clone());}}
+                            }
+                        }
+                        continue;
+                    }
+                    if field.id=="builtin.total"{cells.insert(key.clone(),Value::from(group.ids.len() as u64));continue;}
+                }
+            }
             let source = match column.scope {
                 Scope::Part => &part_attributes,
                 Scope::Occurrence => &group.attributes,
@@ -622,6 +663,32 @@ impl BomPanel {
         else {
             return;
         };
+        if self.plm_mode {
+            if let Some(field)=self.configuration.field(&column.key()).cloned(){
+                if !field.editable {return;}
+                if let Some(client)=store.plm_client(){
+                    if let Some(target)=field.edit.as_ref().filter(|target|target.resource=="part") {
+                        if let Some((key,_))=state.part_source(&group.part_name){if let Some((part,_))=crate::plm::bom::revision_of_document(&key){self.plm.queue_part_record_patch(&client,&part,&group.part_name,&target.key,&field.cad_field,edit.value.clone());return;}}
+                    }
+                    if field.scope=="part"{
+                        if let Some((key,_))=state.part_source(&group.part_name){
+                            if let Some((part,rev))=crate::plm::bom::revision_of_document(&key){
+                                if self.configuration.snapshot(&key).is_some_and(|s|s["part_type"].as_str()==field.part_type.as_deref()){
+                                    self.plm.queue_revision_patch(&client,&part,&rev,&group.part_name,&field.key,edit.value.clone());
+                                }
+                                return;
+                            }
+                        }
+                    }else if field.scope=="occurrence"{
+                        if let Some(owner)=&self.owner_key{
+                            if group.ids.iter().all(|id|self.configuration.occurrence(owner,id).is_some()){
+                                if let Some((part,rev))=crate::plm::bom::revision_of_document(owner){self.plm.queue_occurrence_patch(&client,&part,&rev,&group.ids,&field.cad_field,edit.value.clone(),true);return;}
+                            }
+                        }
+                    }
+                }
+            }
+        }
         match column.scope {
             Scope::Occurrence => {
                 // The fan-out: EVERY occurrence the packed row rolls up, as
@@ -1116,7 +1183,7 @@ fn plm_cells(row: &mut RowNode, state: &EngineState, store: &dyn ModelStore, par
 fn plm_entry(state: &EngineState, store: &dyn ModelStore, part_name: &str) -> Option<crate::plm::client::IndexEntry> {
     let (key, _) = state.part_source(part_name)?;
     let (part, rev) = crate::plm::bom::revision_of_document(&key)?;
-    store.plm_revision(&format!("part/{part}/rev/{rev}"))
+    store.plm_revision(&crate::plm::identity::document_key(&part, &rev))
 }
 
 /// The PLM revision the open document is, with the session's client
