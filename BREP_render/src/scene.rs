@@ -520,6 +520,69 @@ impl RenderScene {
         None
     }
 
+    /// Whether the display face named `name` is PLANAR: every one of its mesh
+    /// triangles' normals is parallel to the face's summed normal (within
+    /// `1e-4` in the sine). A cylinder, cone or freeform face fails this; a
+    /// face with no triangles is not planar either. Linear scan like
+    /// [`face_plane_world`](Self::face_plane_world) — the 3D sketch editor asks
+    /// this once per reference pick, never per frame.
+    pub fn face_is_planar(&self, name: &str) -> bool {
+        for solid in &self.solids {
+            let Some(face) = solid.faces.iter().find(|face| face.name == name) else {
+                continue;
+            };
+            let positions = &solid.mesh.positions;
+            let indices = &solid.mesh.indices;
+            let start = face.tri_start as usize;
+            let end = (start + face.tri_count as usize).min(indices.len() / 3);
+            if start >= end {
+                return false;
+            }
+            let cross_of = |tri: usize| -> [f64; 3] {
+                let a = f64_point(positions[indices[tri * 3] as usize]);
+                let b = f64_point(positions[indices[tri * 3 + 1] as usize]);
+                let c = f64_point(positions[indices[tri * 3 + 2] as usize]);
+                let ab = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+                let ac = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
+                [
+                    ab[1] * ac[2] - ab[2] * ac[1],
+                    ab[2] * ac[0] - ab[0] * ac[2],
+                    ab[0] * ac[1] - ab[1] * ac[0],
+                ]
+            };
+            let mut sum = [0.0f64; 3];
+            for tri in start..end {
+                let n = cross_of(tri);
+                for k in 0..3 {
+                    sum[k] += n[k];
+                }
+            }
+            let sum_len = (sum[0] * sum[0] + sum[1] * sum[1] + sum[2] * sum[2]).sqrt();
+            if sum_len <= 1e-18 {
+                return false;
+            }
+            let unit = [sum[0] / sum_len, sum[1] / sum_len, sum[2] / sum_len];
+            for tri in start..end {
+                let n = cross_of(tri);
+                let len = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
+                if len <= 1e-18 {
+                    continue; // A sliver triangle says nothing about the plane.
+                }
+                let cross = [
+                    n[1] * unit[2] - n[2] * unit[1],
+                    n[2] * unit[0] - n[0] * unit[2],
+                    n[0] * unit[1] - n[1] * unit[0],
+                ];
+                let sine = (cross[0] * cross[0] + cross[1] * cross[1] + cross[2] * cross[2]).sqrt() / len;
+                if sine > 1e-4 {
+                    return false;
+                }
+            }
+            return true;
+        }
+        false
+    }
+
     pub fn is_empty(&self) -> bool {
         self.solids.is_empty()
     }

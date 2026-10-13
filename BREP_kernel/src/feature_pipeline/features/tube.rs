@@ -93,6 +93,13 @@
 //! running solid) so the boolean is never asked to union two DISJOINT bodies
 //! (untested multi-shell assembly). BINARY folds only.
 //!
+//! Since 2026-10-13 a component without bends is assembled JOINT BY JOINT
+//! rather than as one growing chain: each junction's ball is unioned with a
+//! stub of each of its arms (an arm between two junctions is split at its
+//! midpoint), and the joint bodies are stitched and sewn at the midpoints —
+//! see [`assemble_component_by_joints`] for the measurements behind it and the
+//! gate that sends everything else down the chain lane above.
+//!
 //! # Where the joint ball's seam runs
 //!
 //! A sphere is ONE face with a pole-to-pole seam edge and a degenerate edge at
@@ -372,9 +379,17 @@ fn assemble_component(
     bend: f64,
     name: &str,
 ) -> Result<BrepSolid, FeatureRefusal> {
+    // The joint-local lane first (see [`assemble_component_by_joints`]); the
+    // chain of unions below is what it falls back to.
+    if let Some(solid) =
+        assemble_component_by_joints(segments, component, nodes, edge_nodes, radius, inner, bend, name)
+    {
+        return Ok(solid);
+    }
     let mut last: Option<FeatureRefusal> = None;
     for (rung, &clearance) in JOINT_CLEARANCE_LADDER.iter().enumerate() {
         let exact_only = rung + 1 < JOINT_CLEARANCE_LADDER.len();
+        let rung_started = web_time::Instant::now();
         let attempt = (|| {
             let _ = take_sweep_reports();
             let outer = build_assembly(
@@ -395,6 +410,16 @@ fn assemble_component(
                     }))
                 })
         })();
+        if trace_enabled() {
+            eprintln!(
+                "tube-trace rung {rung} clearance {clearance} {:.1} ms -> {}",
+                rung_started.elapsed().as_secs_f64() * 1e3,
+                match &attempt {
+                    Ok(_) => "ok".to_string(),
+                    Err(error) => format!("ERR {error}"),
+                }
+            );
+        }
         match attempt {
             Ok(solid) => return Ok(solid),
             Err(error) => last = Some(error),
@@ -402,6 +427,272 @@ fn assemble_component(
     }
     Err(last.unwrap_or_else(|| "tube: internal error — empty clearance ladder".into()))
 }
+
+/// The JOINT-LOCAL lane: every junction is built as its OWN small body — its
+/// ball unioned with a STUB of each incident arm — and the joint bodies are
+/// then STITCHED and SEWN at the arms' midpoints, where two stubs of one arm
+/// meet on a coincident disc. The result is the same ball-and-stick solid the
+/// chain of unions in [`build_assembly`] produces; what changes is what each
+/// boolean is asked to do.
+///
+/// # Why (reported 2026-10-13, "tube generation takes way too long")
+///
+/// A seven-edge path with six junctions took 23–33 s (release, `TU7` of the
+/// report's model). The chain lane unions every segment and every ball into
+/// ONE running solid, so it runs 13 booleans whose right operand is 1–4 faces
+/// but whose LEFT operand grows to 17, and the boolean's acceptance passes
+/// (the inherited-trim challenger, the volume sign check, the soundness scan,
+/// the operand heal, the imprint's face pairing) each read the whole running
+/// body: the unions measured 0.08 s on the first joint and 1.2–2.6 s by the
+/// last, and the sum at the accepted rung was 18.3 s, of which the inherited
+/// challenger alone was 7.7 s. On top of that the clearance ladder restarts
+/// the whole chain at every rung, and three rungs refused at the first joint
+/// (a cylinder meeting a swept arm tangentially) before the fourth built:
+/// 5.4 s more. Nothing in that body ever needed to see more than one ball and
+/// its arms.
+///
+/// Here every union is `ball ∪ stub`, 1–5 faces a side, so the boolean's
+/// whole-body passes read a body of bounded size, the count of unions is the
+/// same but their cost no longer grows (the report's model: 2.9 s against
+/// 35.8 s measured back to back; its straight five-edge run 3.1 s against
+/// 9.8 s), and the ladder climbs PER JOINT —
+/// a joint that needs a wider ball no longer forces a bead on every other
+/// joint, and a refused rung costs one small body rather than the whole run.
+/// For a hollow tube a rung is accepted at a joint only when BOTH radii build
+/// there, which is what keeps that joint's wall at `k·(radius − innerRadius)`
+/// (the invariant the chain lane kept per component).
+///
+/// # Stubs
+///
+/// An arm whose other end is a FREE end (degree 1) is a stub whole: the same
+/// body [`named_segment`] builds. An arm whose other end is another junction
+/// is SPLIT at its midpoint into two cylinders built along the SAME axis
+/// direction from the arm's start, so their two mid caps are the same disc
+/// with the same seam vertex (`make_cylinder_surface` seats the seam at
+/// `axis.perpendicular()`, and the axis is shared). [`stitch_faces`] drops
+/// the two mid caps by their `_M` name and [`sew_solid`] pairs the rims by
+/// locus; measured on a 40-long arm between two balls, the sewn body's
+/// volume is the chain lane's bit for bit (`probe_split_arm_sews_at_its_mid_rim`).
+/// Both halves carry the arm's `Seg{k}_S` name, so an arm between two
+/// junctions comes out as two wall faces on one carrier; its end caps keep
+/// `_B`/`_T` where a free end leaves one standing.
+///
+/// # Stub order
+///
+/// At a joint the ball goes first, then the CYLINDRICAL stubs, then the swept
+/// ones. A curved arm that leaves a straight one G1 — the report's sketch
+/// constrains its bezier and its arc tangent to their lines — meets the
+/// inscribed ball along the whole rim circle, and a sphere-versus-NURBS
+/// contact along a curve is the pair the imprint declines ("unsupported
+/// tangent-curve surface intersection"): with the sweep first, rung 0 refused
+/// and rung 1's `ball ∪ sweep ∪ cylinder` took 0.9 + 3.9 s, the second union
+/// spending 2.3 s in the imprint on the cylinder-versus-sweep carriers. With
+/// the cylinder first the same rim is a sphere-versus-cylinder contact, which
+/// the imprint has in closed form, and the sweep then arrives at a body whose
+/// cap is its own end disc: the ball ends up buried whole inside the two
+/// walls, which is the exact G1 pipe, at rung 0, in 0.1 + 0.25 s. A crotch
+/// joint has no tangency and is indifferent to the order.
+///
+/// # Gate (anything else takes the chain lane)
+///
+/// - no bends (`bendRadius = 0`): a bend's chain is a run swept as one body,
+///   and splitting a run is not this construction;
+/// - every arm between two junctions is STRAIGHT: a swept arm's two halves
+///   would start fresh rotation-minimizing frames at the midpoint and their
+///   half-circle rims would not pair edge for edge (a terminal swept arm is a
+///   stub whole and is fine — the report's two curved arms are terminal);
+/// - every split arm is at least [`SPLIT_ARM_MIN_RADII`] tube radii long, so
+///   each half pokes clear of the widest ball on the ladder;
+/// - no edge whose two ends are the same node;
+/// - the sewn assemblies pass the global crossing/fold scan: local unions
+///   cannot remove overlaps between distant arms.
+///
+/// `None` — a joint no rung builds, a stitch the sew does not close, a
+/// hollow subtract that refuses — hands the component back to the chain
+/// lane unchanged, so nothing that built before stops building. A genuine
+/// refusal therefore pays both ladders before it is reported.
+/// `BREP_TUBE_JOINT_LANE=0` is the diagnostic A/B hatch: every component
+/// takes the chain lane.
+#[allow(clippy::too_many_arguments)]
+fn assemble_component_by_joints(
+    segments: &[Segment],
+    component: &[usize],
+    nodes: &[Vec3],
+    edge_nodes: &[(usize, usize)],
+    radius: f64,
+    inner: f64,
+    bend: f64,
+    name: &str,
+) -> Option<BrepSolid> {
+    if bend > 0.0 || std::env::var("BREP_TUBE_JOINT_LANE").as_deref() == Ok("0") {
+        return None;
+    }
+    let mut degree: HashMap<usize, usize> = HashMap::new();
+    for &edge in component {
+        let (a, b) = edge_nodes[edge];
+        if a == b {
+            return None;
+        }
+        *degree.entry(a).or_default() += 1;
+        *degree.entry(b).or_default() += 1;
+    }
+    let is_junction = |node: usize| degree.get(&node).copied().unwrap_or(0) >= 2;
+    let mut junction_nodes: Vec<usize> = degree.keys().copied().filter(|&node| is_junction(node)).collect();
+    junction_nodes.sort_unstable();
+    if junction_nodes.is_empty() {
+        return None;
+    }
+    let joint_index: HashMap<usize, usize> =
+        junction_nodes.iter().enumerate().map(|(index, &node)| (node, index)).collect();
+    // Which arms are split, and where.
+    let mut split: HashMap<usize, Vec3> = HashMap::new();
+    for &edge in component {
+        let (a, b) = edge_nodes[edge];
+        if !(is_junction(a) && is_junction(b)) {
+            continue;
+        }
+        let segment = &segments[edge];
+        if segment.curve.is_some() {
+            return None;
+        }
+        let chord = segment.end.sub(segment.start);
+        if chord.length() < SPLIT_ARM_MIN_RADII * radius {
+            return None;
+        }
+        split.insert(edge, segment.start.add(chord.scale(0.5)));
+    }
+    let local_index = |edge: usize| component.iter().position(|&e| e == edge).expect("edge in component");
+
+    // One joint body at `node`, radius `r`, clearance `clearance`: the ball,
+    // then each incident stub in selection order.
+    let joint_body = |node: usize, r: f64, suffix: &str, clearance: f64, exact_only: bool| -> Result<BrepSolid, String> {
+        let ball_radius = if node_needs_clearance(segments, component, edge_nodes, node) { r * clearance } else { r };
+        let frame = joint_ball_frame(segments, component, edge_nodes, nodes, node, r, ball_radius);
+        let mut solid = named_sphere(nodes[node], ball_radius, name, suffix, joint_index[&node], frame)?;
+        // Cylindrical stubs first, swept ones after (see "Stub order").
+        let mut incident: Vec<usize> = component
+            .iter()
+            .copied()
+            .filter(|&edge| {
+                let (a, b) = edge_nodes[edge];
+                a == node || b == node
+            })
+            .collect();
+        incident.sort_by_key(|&edge| segments[edge].curve.is_some());
+        for edge in incident {
+            let (a, b) = edge_nodes[edge];
+            let segment = &segments[edge];
+            let local = local_index(edge);
+            let stub = match split.get(&edge) {
+                None => named_segment(segment, r, name, suffix, local)?,
+                Some(&mid) => {
+                    let mut half = if a == node {
+                        named_cylinder((segment.start, mid), r, name, suffix, local)?
+                    } else {
+                        named_cylinder((mid, segment.end), r, name, suffix, local)?
+                    };
+                    // The cap on the midpoint is the one the stitch drops.
+                    let dropped = format!("{name}{suffix}_Seg{local}_{}", if a == node { "T" } else { "B" });
+                    for face in half.shells.iter_mut().flat_map(|shell| &mut shell.faces) {
+                        if face.name.as_deref() == Some(dropped.as_str()) {
+                            face.name = Some(format!("{name}{suffix}_Seg{local}_M"));
+                        }
+                    }
+                    half
+                }
+            };
+            solid = union_solid(solid, stub, exact_only)?;
+        }
+        Ok(solid)
+    };
+
+    let mut outer_bodies: Vec<BrepSolid> = Vec::with_capacity(junction_nodes.len());
+    let mut inner_bodies: Vec<BrepSolid> = Vec::new();
+    let mut reports: Vec<crate::Approximation> = Vec::new();
+    for &node in &junction_nodes {
+        let mut built = false;
+        for (rung, &clearance) in JOINT_CLEARANCE_LADDER.iter().enumerate() {
+            let exact_only = rung + 1 < JOINT_CLEARANCE_LADDER.len();
+            let _ = take_sweep_reports();
+            let Ok(outer) = joint_body(node, radius, "", clearance, exact_only) else { continue };
+            let cutter = if inner > 0.0 {
+                match joint_body(node, inner, "_Inner", clearance, exact_only) {
+                    Ok(cutter) => Some(cutter),
+                    Err(_) => continue,
+                }
+            } else {
+                None
+            };
+            reports.extend(take_sweep_reports());
+            outer_bodies.push(outer);
+            inner_bodies.extend(cutter);
+            built = true;
+            break;
+        }
+        if !built {
+            return None;
+        }
+    }
+
+    // Stitch the joint bodies at the dropped mid caps and sew the rims.
+    let is_mid_cap = |_: &BrepSolid, face: &crate::FaceRecord| face.name.as_deref().is_some_and(|n| n.ends_with("_M"));
+    let sew = |bodies: &[BrepSolid]| -> Option<BrepSolid> {
+        if bodies.len() == 1 {
+            return Some(bodies[0].clone());
+        }
+        let stitched = stitch_faces(bodies, &is_mid_cap);
+        let (sewn, report) = sew_solid(&stitched, 1e-7).ok()?;
+        // The report counts a ball's surviving degenerate pole edges among its
+        // open edges (one use each, as `validate` accepts them); what must be
+        // zero is the one-use edges that are not degenerate.
+        if open_edges(&sewn) != 0 || !report.oriented_outward || sewn.shells.len() != 1 || !sewn.validate().is_empty() {
+            return None;
+        }
+        // A closed sewn shell can still contain distant arms crossing each
+        // other. Local unions never saw those pairs; the chain fallback does.
+        let scan = crate::solid_self_intersections(
+            &sewn, crate::SelfIntersectionOptions::for_solid(&sewn),
+        ).ok()?;
+        if scan.truncated || scan.is_flagged() {
+            return None;
+        }
+        Some(sewn)
+    };
+    let outer = sew(&outer_bodies)?;
+    let solid = if inner > 0.0 {
+        let cutter = sew(&inner_bodies)?;
+        common::subtract_solid(outer, cutter).ok()?
+    } else {
+        outer
+    };
+    SWEEP_REPORTS.with(|channel| channel.borrow_mut().extend(reports));
+    Some(solid)
+}
+
+/// One-use edges of `solid` that are not degenerate: the rims a stitch left
+/// unpaired, as distinct from a sphere's pole edges.
+fn open_edges(solid: &BrepSolid) -> usize {
+    let mut uses: HashMap<u64, usize> = HashMap::new();
+    for coedge in solid
+        .shells
+        .iter()
+        .flat_map(|shell| &shell.faces)
+        .flat_map(|face| &face.loops)
+        .flat_map(|entry| &entry.coedges)
+    {
+        *uses.entry(coedge.edge_id).or_default() += 1;
+    }
+    solid
+        .edges
+        .iter()
+        .filter(|edge| !edge.degenerate && uses.get(&edge.id).copied().unwrap_or(0) == 1)
+        .count()
+}
+
+/// The shortest arm between two junctions the joint-local lane will split, in
+/// tube radii: each half must clear the widest ball on the ladder (1.1 radii)
+/// with room for the crossing to be a plain transversal one.
+const SPLIT_ARM_MIN_RADII: f64 = 3.0;
 
 /// One tube assembly along one connected component: ONE body per edge (a cylinder
 /// for a straight edge, a swept tube for a curved one) + a sphere at every
@@ -578,7 +869,16 @@ fn named_chain_or_segment(
     local: usize,
 ) -> Result<BrepSolid, String> {
     if chain.segments.len() == 1 {
-        return named_segment(&segments[chain.segments[0]], radius, name, suffix, local);
+        let started = web_time::Instant::now();
+        let body = named_segment(&segments[chain.segments[0]], radius, name, suffix, local);
+        if trace_enabled() {
+            eprintln!(
+                "tube-trace   segment {local} curved={} {:.1} ms",
+                segments[chain.segments[0]].curve.is_some(),
+                started.elapsed().as_secs_f64() * 1e3
+            );
+        }
+        return body;
     }
     let (path, length) = chain_path(chain, segments, nodes, edge_nodes, bend)?;
     named_chain(&path, length, radius, bend, name, suffix, local)
@@ -970,6 +1270,14 @@ fn stitch_pieces(pieces: &[BrepSolid], joints: &[Vec3], radius: f64) -> BrepSoli
             })
         })
     };
+    stitch_faces(pieces, &interior)
+}
+
+/// Concatenate `pieces` into ONE shell, leaving out every face `dropped` names,
+/// so the rims those faces bounded become one-use edges for [`sew_solid`] to
+/// pair. Ids are offset per piece so nothing collides.
+fn stitch_faces(pieces: &[BrepSolid], dropped: &dyn Fn(&BrepSolid, &crate::FaceRecord) -> bool) -> BrepSolid {
+    let interior = |solid: &BrepSolid, face: &crate::FaceRecord| -> bool { dropped(solid, face) };
     let mut out = pieces[0].clone();
     out.vertices.clear();
     out.edges.clear();
@@ -1712,17 +2020,89 @@ fn named_ring(
 /// clearance rungs with it, because a joint that only stands up under the rescue
 /// is the joint whose geometry is microns off and whose end cap survives as a
 /// crescent — the defect the clearance exists to prevent, not a success.
+/// `BREP_TUBE_TRACE` (any value) prints every union the tube runs — operand
+/// face names and counts, wall time, outcome — and every clearance rung the
+/// chain lane tries, to stderr. The reading behind the 2026-10-13 report:
+/// `examples/tube_timing_probe.rs` runs a document under it.
+fn trace_enabled() -> bool {
+    std::env::var_os("BREP_TUBE_TRACE").is_some()
+}
+
+
+/// Whether `name` is a tube segment's wall, `<id>_Seg<n>_S` (as minted) or a
+/// boolean's piece of one, `<id>_Seg<n>_S_<k>`.
+fn is_segment_wall_name(name: &str) -> bool {
+    let Some(at) = name.rfind("_Seg") else {
+        return false;
+    };
+    let rest = &name[at + 4..];
+    let digits = rest.chars().take_while(|c| c.is_ascii_digit()).count();
+    if digits == 0 {
+        return false;
+    }
+    let rest = &rest[digits..];
+    match rest.strip_prefix("_S") {
+        Some("") => true,
+        Some(tail) => tail
+            .strip_prefix('_')
+            .is_some_and(|k| !k.is_empty() && k.chars().all(|c| c.is_ascii_digit())),
+        None => false,
+    }
+}
+
 fn union_solid(a: BrepSolid, b: BrepSolid, exact_only: bool) -> Result<BrepSolid, String> {
+    // Segment walls are pinned out of the union's face merge, the doctrine
+    // `common::union_solids_keeping` states for the multi-segment sweep: two
+    // consecutive segments' coaxial walls would fuse into ONE face carrying
+    // ONE of the names (a straight pass-through at a branch node merged the
+    // -X arm's wall into the +X leg's, master's battery of 2026-10-13), so
+    // what a downstream fillet resolves to would depend on face order and
+    // move when the path is edited. The exact wall names of both operands
+    // are the needles; a piece the boolean names `…_S_2` still contains its
+    // wall's name, and the caps (`_T`, `_B`, `_M`) do not match.
+    let keep_unmerged_name_substrs: Vec<String> = {
+        let mut names: Vec<String> = [&a, &b]
+            .iter()
+            .flat_map(|solid| solid.shells.iter().flat_map(|shell| &shell.faces))
+            .filter_map(|face| face.name.clone())
+            .filter(|name| is_segment_wall_name(name))
+            .collect();
+        names.sort();
+        names.dedup();
+        names
+    };
     let options = BooleanOptions {
         merge_coplanar_faces: true,
+        keep_unmerged_name_substrs,
         ..BooleanOptions::default()
     };
+    let started = web_time::Instant::now();
+    let describe = |solid: &BrepSolid| {
+        let faces: Vec<String> = solid
+            .shells
+            .iter()
+            .flat_map(|shell| &shell.faces)
+            .map(|face| face.name.clone().unwrap_or_default())
+            .collect();
+        format!("{} faces [{}]", faces.len(), faces.join(","))
+    };
+    let (da, db) = if trace_enabled() { (describe(&a), describe(&b)) } else { Default::default() };
     let result = if exact_only {
         crate::boolean_operation_with_diagnostics(&a, &b, BooleanOperation::Union, &options)
             .map(|outcome| outcome.value)
     } else {
         crate::boolean_operation(&a, &b, BooleanOperation::Union, &options)
     };
+    if trace_enabled() {
+        eprintln!(
+            "tube-trace   union {:.1} ms exact_only={exact_only} A={da} B={db} -> {}",
+            started.elapsed().as_secs_f64() * 1e3,
+            match &result {
+                Ok(solid) => format!("ok {}", describe(solid)),
+                Err(error) => format!("ERR {error}"),
+            }
+        );
+    }
     result.map_err(|error| format!("tube: joining segments/joints failed: {error}"))
 }
 

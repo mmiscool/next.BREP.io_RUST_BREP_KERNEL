@@ -629,23 +629,73 @@ fn affine_patch_outside(face: &FaceRecord, patch: &NurbsSurface) -> bool {
     true
 }
 
-fn swept_edge_clear(
+/// The edge-only half of a swept-edge clearance sweep: the old and new
+/// curves' Bézier spans and the covering correspondence between them. It
+/// reads the two curves and nothing of the target face, so one sweep over
+/// many faces builds it ONCE (`motion_clear`). Before 2026-10-07 every face
+/// rebuilt it: on the shell report of that day a 515-control-point tube edge
+/// paid its 576-node correspondence — each node a projection onto the 512
+/// spans — for each of the sheet's 50 faces, 0.2 s × 50 per clearance call,
+/// and the four settled vertices' twelve calls took the offset shell to
+/// 130 s where the tile sweep itself separates in a millisecond.
+struct SweptEdge {
+    a_spans: Vec<NurbsCurve>,
+    b_spans: Vec<NurbsCurve>,
+    mapping: Vec<(f64, f64)>,
+}
+
+thread_local! {
+    /// How many swept edges this thread has prepared: the witness that a
+    /// sweep over a sheet prepares its edge once, read by the tests.
+    static SWEPT_EDGES_PREPARED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The running count of [`prepare_swept_edge`] calls on this thread.
+#[allow(dead_code)]
+pub(super) fn swept_edges_prepared() -> usize {
+    SWEPT_EDGES_PREPARED.with(|count| count.get())
+}
+
+/// `Err` carries the sweep's refusal reason: `"unsupported"` for a span
+/// structure the Bézier split declines, `"correspondence"` for curves with no
+/// covering monotone correspondence.
+fn prepare_swept_edge(
     a: &NurbsCurve,
     ar: [f64; 2],
     b: &NurbsCurve,
     br: [f64; 2],
+) -> Result<SweptEdge, &'static str> {
+    SWEPT_EDGES_PREPARED.with(|count| count.set(count.get() + 1));
+    let Some(a_spans) = super::image::bezier_spans(a) else {
+        return Err("unsupported");
+    };
+    let Some(b_spans) = super::image::bezier_spans(b) else {
+        return Err("unsupported");
+    };
+    let Some(mapping) = covering_correspondence(a, ar, b, br) else {
+        return Err("correspondence");
+    };
+    Ok(SweptEdge {
+        a_spans,
+        b_spans,
+        mapping,
+    })
+}
+
+fn swept_edge_clear_prepared(
+    a: &NurbsCurve,
+    ar: [f64; 2],
+    b: &NurbsCurve,
+    br: [f64; 2],
+    swept: &SweptEdge,
     face: &FaceRecord,
     budget: usize,
 ) -> Result<(bool, usize, &'static str), String> {
-    let Some(a_spans) = super::image::bezier_spans(a) else {
-        return Ok((false, 0, "unsupported"));
-    };
-    let Some(b_spans) = super::image::bezier_spans(b) else {
-        return Ok((false, 0, "unsupported"));
-    };
-    let Some(mapping) = covering_correspondence(a, ar, b, br) else {
-        return Ok((false, 0, "correspondence"));
-    };
+    let SweptEdge {
+        a_spans,
+        b_spans,
+        mapping,
+    } = swept;
     if motion_trace_enabled() {
         trace_motion(
             serde_json::json!({"kind":"edge-motion","target":face,"old":a,"new":b,"old_range":ar,"new_range":br,"mapping":mapping}),
@@ -658,12 +708,12 @@ fn swept_edge_clear(
             return Ok((true, count, "separated"));
         };
         let (Some(ba), Some(bb), Some(bs)) = (
-            span_bounds(&a_spans, ar, left, right),
+            span_bounds(a_spans, ar, left, right),
             span_bounds(
-                &b_spans,
+                b_spans,
                 br,
-                mapped(&mapping, left),
-                mapped(&mapping, right),
+                mapped(mapping, left),
+                mapped(mapping, right),
             ),
             sf.bounds(),
         ) else {
@@ -711,6 +761,10 @@ pub(super) fn motion_clear(
     let Ok(range) = curve.domain() else {
         return false;
     };
+    // The edge's spans and correspondence are built once, at the first face
+    // that needs them: a sweep whose every face is vertex-incident never
+    // builds them, exactly as before the hoist.
+    let mut prepared: Option<SweptEdge> = None;
     for face in faces {
         let vertex_incident = face.loops.iter().flat_map(|l| &l.coedges).any(|c| {
             edges.iter().find(|e| e.id == c.edge_id).is_some_and(|e| {
@@ -724,7 +778,32 @@ pub(super) fn motion_clear(
         if vertex_incident {
             continue;
         }
-        let result = swept_edge_clear(&old.curve, [old.t0, old.t1], curve, range, face, 1024);
+        if prepared.is_none() {
+            match prepare_swept_edge(&old.curve, [old.t0, old.t1], curve, range) {
+                Ok(swept) => prepared = Some(swept),
+                Err(reason) => {
+                    if std::env::var("BREP_DEBUG_JOINTS").is_ok() {
+                        eprintln!(
+                            "edge clearance: edge {} target {} {:?}",
+                            old.id,
+                            face.id,
+                            Ok::<(bool, usize, &str), String>((false, 0, reason))
+                        );
+                    }
+                    return false;
+                }
+            }
+        }
+        let swept = prepared.as_ref().expect("prepared above");
+        let result = swept_edge_clear_prepared(
+            &old.curve,
+            [old.t0, old.t1],
+            curve,
+            range,
+            swept,
+            face,
+            1024,
+        );
         if !matches!(&result, Ok((true, _, _))) {
             if std::env::var("BREP_DEBUG_JOINTS").is_ok() {
                 eprintln!(

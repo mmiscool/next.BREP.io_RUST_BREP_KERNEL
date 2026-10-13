@@ -305,6 +305,7 @@ pub(crate) fn loft_profile_brep_closed_shifted(
             faces,
         }],
         genus: 1,
+        kind: crate::BodyKind::Solid,
     };
     let issues = solid.validate();
     if !issues.is_empty() {

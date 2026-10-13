@@ -1394,14 +1394,19 @@ fn shared_use_agrees(sf: &NurbsSurface, pc: &NurbsCurve, curve: &NurbsCurve, bar
     true
 }
 
-pub(super) fn reconstruct(solid: &mut BrepSolid, bar: f64) -> (Vec<ReplacedTrim>, HashSet<usize>) {
+pub(super) fn reconstruct(solid: &mut BrepSolid, bar: f64, scope: Option<&HashSet<u64>>) -> (Vec<ReplacedTrim>, HashSet<usize>) {
     let tracing = super::super::clearance::motion_trace_enabled();
     if tracing {
         super::super::clearance::trace_motion(
             serde_json::json!({"kind":"paired-before","solid":solid}),
         );
     }
-    let result = reconstruct_impl(solid, bar);
+    let skip_empty = !matches!(std::env::var("BREP_PAIRED_EMPTY").as_deref(), Ok("0") | Ok("off"));
+    let mut scans = 0;
+    let result = reconstruct_impl(solid, bar, scope, skip_empty, &mut scans);
+    if std::env::var_os("BREP_PROFILE").is_some() {
+        eprintln!("assemble.paired.profile containment_scans={scans} skip_empty={skip_empty}");
+    }
     if tracing {
         super::super::clearance::trace_motion(
             serde_json::json!({"kind":"paired-after","solid":solid,"changed_uses":result.0.len(),"certified_faces":result.1}),
@@ -1410,7 +1415,13 @@ pub(super) fn reconstruct(solid: &mut BrepSolid, bar: f64) -> (Vec<ReplacedTrim>
     result
 }
 
-fn reconstruct_impl(solid: &mut BrepSolid, bar: f64) -> (Vec<ReplacedTrim>, HashSet<usize>) {
+fn reconstruct_impl(
+    solid: &mut BrepSolid,
+    bar: f64,
+    scope: Option<&HashSet<u64>>,
+    skip_empty: bool,
+    containment_scans: &mut usize,
+) -> (Vec<ReplacedTrim>, HashSet<usize>) {
     let debug = std::env::var("BREP_DEBUG_JOINTS").is_ok();
     let faces: Vec<_> = solid.shells.iter().flat_map(|s| &s.faces).collect();
     let edge_indices: HashMap<_, _> = solid
@@ -1431,6 +1442,9 @@ fn reconstruct_impl(solid: &mut BrepSolid, bar: f64) -> (Vec<ReplacedTrim>, Hash
     }
     let mut accepted = Vec::new();
     for (fi, face) in faces.iter().enumerate() {
+        if scope.is_some_and(|scope| !scope.contains(&face.id)) {
+            continue;
+        }
         if face.surface.degree_v != 1
             || face.surface.is_affine().unwrap_or(false)
             || face
@@ -1823,6 +1837,14 @@ fn reconstruct_impl(solid: &mut BrepSolid, bar: f64) -> (Vec<ReplacedTrim>, Hash
         }
         accepted.push((fi, rebuilt, new_edges, companions));
     }
+    // No candidate was accepted and nothing has been mutated. Every coupled
+    // face/edge proposal below originates in `accepted`, so the transaction
+    // and its reported certified-face set are empty. Crossing scans of two
+    // identical bodies cannot introduce a crossing and cannot change that
+    // empty result (an unreadable scan also returns the same empty result).
+    if skip_empty && accepted.is_empty() {
+        return (Vec::new(), HashSet::default());
+    }
     let primary: HashSet<_> = accepted.iter().map(|(fi, _, _, _)| *fi).collect();
     let mut final_faces = HashMap::<usize, FaceRecord>::default();
     let mut proposals = HashMap::<u64, (NurbsCurve, f64, f64)>::default();
@@ -2102,12 +2124,14 @@ fn reconstruct_impl(solid: &mut BrepSolid, bar: f64) -> (Vec<ReplacedTrim>, Hash
     // inherited polyline neighbour, so its chords can cross a disjoint trim.
     // Refine only reported new pairs, preserving the complete rational image.
     // Genuine crossings survive refinement and the outer guard still rejects.
+    *containment_scans += 1;
     let old_crossings = crate::loop_self_crossings(solid);
     for round in 0..=3 {
         let mut preview = solid.clone();
         for (&fi, face) in &final_faces {
             *face_at_mut(&mut preview.shells, fi) = face.clone();
         }
+        *containment_scans += 1;
         let report = crate::loop_self_crossings(&preview);
         if !report.unreadable.is_empty() {
             return (Vec::new(), HashSet::default());

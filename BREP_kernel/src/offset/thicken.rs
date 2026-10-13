@@ -40,6 +40,9 @@ use crate::{make_arc, make_line, NurbsCurve, NurbsSurface, Vec3};
 #[path = "thicken/band.rs"]
 pub(crate) mod band;
 
+#[path = "thicken/periodic.rs"]
+mod periodic;
+
 /// The fold factor at or below which the equidistant sheet has collapsed.  The
 /// offset-shell carrier lane refuses at the same number on the same condition
 /// (`offset/offset_shell/carriers.rs`), which is why both read it through the
@@ -525,7 +528,8 @@ fn boundary_images(
 /// those is its own body: they share no edge, because the dropped band lies
 /// between them.
 ///
-/// Refuses (Err) on: zero/non-finite thickness, closed sheets, open or
+/// Refuses (Err) on: zero/non-finite thickness, trims spanning a closed
+/// carrier's seam, open or
 /// misoriented loops, pinched loops, a general pcurve image that cannot be
 /// fitted to tolerance, and offsets that fold through the evolute INSIDE THE
 /// SELECTED TRIM (a fold the trim excludes is not this sheet's problem) that
@@ -568,12 +572,41 @@ pub fn thicken_trimmed_sheet(
         Some(band::Recognized::Partial(partial)) => return Ok(band::build_partial(&partial)?),
         None => {}
     }
-    let (closed_u, closed_v) = surface.closed_directions().or_refuse(KernelStage::Refine, "closed_directions")?;
-    if closed_u || closed_v {
-        return Err(KernelRefusal::unsupported(KernelStage::Collect, "thicken_closed_sheet", "thickenSheet: closed sheets are not supported (split the patch at its seam first)"));
+    if let Some(solid) = periodic::build(surface, loops, distance_bottom, distance_top)? {
+        return Ok(vec![solid]);
     }
+    let (closed_u, closed_v) = surface.closed_directions().or_refuse(KernelStage::Refine, "closed_directions")?;
     let [u0, u1] = surface.domain_u().or_refuse(KernelStage::Refine, "domain_u")?;
     let [v0, v1] = surface.domain_v().or_refuse(KernelStage::Refine, "domain_v")?;
+    // A closed CARRIER is not a closed SHEET: spherical fillet corners, for
+    // example, trim a small patch out of a full sphere. The ordinary cap/wall
+    // builder works on that patch as long as it stays in one parameter chart
+    // and does not identify opposite seam boundaries. Bound the entire trim
+    // by its rational control hull (positive weights), rather than samples
+    // that could miss an excursion to the seam. This is conservative for a
+    // loose control hull; a full-period sheet still needs seam-aware topology.
+    let mut trim_min = [f64::INFINITY; 2];
+    let mut trim_max = [f64::NEG_INFINITY; 2];
+    if closed_u || closed_v {
+        for control in loops.iter().flatten().flat_map(|curve| &curve.control_points) {
+            let point = control.point().or_refuse(KernelStage::Collect, "point")?;
+            for (axis, value) in [point.x, point.y].into_iter().enumerate() {
+                trim_min[axis] = trim_min[axis].min(value);
+                trim_max[axis] = trim_max[axis].max(value);
+            }
+        }
+    }
+    let in_open_chart = |axis: usize, lo: f64, hi: f64| {
+        let epsilon = 1e-7 * (hi - lo);
+        trim_min[axis] >= lo - epsilon
+            && trim_max[axis] <= hi + epsilon
+            && trim_max[axis] - trim_min[axis] < hi - lo - 2.0 * epsilon
+    };
+    if (closed_u && !in_open_chart(0, u0, u1))
+        || (closed_v && !in_open_chart(1, v0, v1))
+    {
+        return Err(KernelRefusal::unsupported(KernelStage::Collect, "thicken_closed_sheet", "thickenSheet: closed sheets are not supported (split the patch at its seam first)"));
+    }
     let uv_tolerance = 1e-7 * (u1 - u0).max(v1 - v0);
     let minimum_area = 1e-10 * (u1 - u0) * (v1 - v0);
     // Loop validation runs BEFORE the regularity gate: the gate now reads the
@@ -726,6 +759,9 @@ fn thicken_one_region(
     let [u0, u1] = surface.domain_u().or_refuse(KernelStage::Refine, "domain_u")?;
     let [v0, v1] = surface.domain_v().or_refuse(KernelStage::Refine, "domain_v")?;
 
+    let seam = periodic::seams(surface, loops)?;
+    let mut vertex_welds = Vec::new();
+    let mut edge_welds = Vec::new();
     let bottom = offset_sheet(surface, loops, distance_bottom)?;
     let top = offset_sheet(surface, loops, distance_top)?;
     // Each sheet's fit is refined by its own measured deviation, so the two can
@@ -791,7 +827,11 @@ fn thicken_one_region(
             next_id += 1;
             bottom_points.push(bottom_point);
             top_points.push(top_point);
-            bottom_junction_points.push(bottom_point);
+            // Opposite chart endpoints represent one junction on a periodic
+            // strip; all other coincidences remain the pinch refusal below.
+            if seam.is_none() || (start.x - u0).abs() <= eps_u {
+                bottom_junction_points.push(bottom_point);
+            }
         }
 
         // ---- Boundary edges on both sheets + vertical junction edges. ----
@@ -857,6 +897,37 @@ fn thicken_one_region(
             next_id += 1;
         }
 
+        if let Some([first, second]) = seam {
+            // The iso meridians have the same increasing-v parameterization.
+            // Verify both offset sheets still close before identifying edges.
+            for fraction in 0..=16 {
+                let t = images[first].t0
+                    + (images[first].t1 - images[first].t0) * fraction as f64 / 16.0;
+                for (a, b) in [
+                    (&images[first].bottom, &images[second].bottom),
+                    (&images[first].top, &images[second].top),
+                ] {
+                    if a.evaluate(t).or_refuse(KernelStage::Sew, "evaluate")?
+                        .sub(b.evaluate(t).or_refuse(KernelStage::Sew, "evaluate")?)
+                        .length() > fit_tolerance
+                    {
+                        return Err(KernelRefusal::unsupported(KernelStage::Sew, "thicken_offset_seam", "thickenSheet: offset meridians do not close within the fit tolerance"));
+                    }
+                }
+            }
+            edge_welds.push((bottom_edge_ids[second], bottom_edge_ids[first]));
+            edge_welds.push((top_edge_ids[second], top_edge_ids[first]));
+            for i in 0..count {
+                for j in i + 1..count {
+                    if (starts[i].y - starts[j].y).abs() <= eps_v {
+                        vertex_welds.push((bottom_vertex_ids[j], bottom_vertex_ids[i]));
+                        vertex_welds.push((top_vertex_ids[j], top_vertex_ids[i]));
+                        edge_welds.push((vertical_edge_ids[j], vertical_edge_ids[i]));
+                    }
+                }
+            }
+        }
+
         // ---- One ruled wall per boundary pcurve. ----
         //
         // The wall's s parameter is the edge parameter; its loop traverses
@@ -867,6 +938,9 @@ fn thicken_one_region(
         // CW hole loop (material on the left, void on the right).  Hence
         // same_sense = dir uniformly, with the loop winding to match.
         for (index, image) in images.iter().enumerate() {
+            if seam.is_some_and(|indices| indices.contains(&index)) {
+                continue;
+            }
             let next_index = (index + 1) % count;
             let wall = ruled_wall(&image.bottom, &image.top)?;
             let (s_start, s_end) = if image.dir {
@@ -992,6 +1066,30 @@ fn thicken_one_region(
     });
     next_id += 1;
 
+    // Identify only the seam pairs recognized above. The UV pcurves stay on
+    // their own sides of the chart; they traverse each shared seam oppositely.
+    for edge in &mut edges {
+        for (from, to) in &vertex_welds {
+            if edge.start_vertex_id == *from {
+                edge.start_vertex_id = *to;
+            }
+            if edge.end_vertex_id == *from {
+                edge.end_vertex_id = *to;
+            }
+        }
+    }
+    for coedge in faces.iter_mut()
+        .flat_map(|f| &mut f.loops)
+        .flat_map(|l| &mut l.coedges)
+    {
+        for (from, to) in &edge_welds {
+            if coedge.edge_id == *from {
+                coedge.edge_id = *to;
+            }
+        }
+    }
+    vertices.retain(|v| !vertex_welds.iter().any(|(from, _)| *from == v.id));
+    edges.retain(|e| !edge_welds.iter().any(|(from, _)| *from == e.id));
     let shell_id = next_id;
     let solid = BrepSolid {
         mass_properties_cache: Default::default(),
@@ -1002,7 +1100,8 @@ fn thicken_one_region(
             id: shell_id,
             faces,
         }],
-        genus: loops.len() as i64 - 1,
+        genus: loops.len() as i64 - 1 + i64::from(seam.is_some()),
+        kind: crate::BodyKind::Solid,
     };
     let issues = solid.validate();
     if !issues.is_empty() {
@@ -1032,9 +1131,11 @@ fn thicken_one_region(
 /// Thin wrapper over [`thicken_trimmed_sheet`] passing the full-domain
 /// rectangle as the (counter-clockwise) outer loop.  The result is one
 /// genus-0 body with 8 vertices, 12 edges, and 6 faces (offset caps + four
-/// ruled walls), oriented outward and validated — or, where a fold BAND
+/// ruled walls), or a genus-1 periodic strip with 4 vertices, 8 edges and 4
+/// faces (offset caps + two ruled walls). Both are oriented outward and
+/// validated — or, where a fold BAND
 /// crosses the domain, one such body per regular piece.  Refuses (Err) on:
-/// zero/non-finite thickness, closed sheets (split at the seam first),
+/// zero/non-finite thickness, unsupported periodic trims (split at the seam first),
 /// degenerate boundaries, and offsets that would self-intersect because a
 /// concave curvature radius is smaller than the offset distance.
 pub fn thicken_face_sheet(

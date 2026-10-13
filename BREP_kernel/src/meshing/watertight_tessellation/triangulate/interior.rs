@@ -1,5 +1,61 @@
 use super::*;
-use super::earclip::{lawson_flips, lawson_flips_guarded};
+use super::earclip::{lawson_flips, lawson_flips_guarded_with_memo, FaceMemo};
+use std::cell::Cell;
+
+/// `BREP_TESS_RULING_SEED`: the seed's diagonal correction with a relative
+/// slack, so a twist at rounding level never opens a station row across a
+/// straight ruling (the plate scan's remaining cost).
+///
+/// On a cylinder wall one direction is a straight ruling: its second
+/// derivative is exactly zero, its step is infinite and its cell is the whole
+/// extent, while the curved direction's step solves `Suu·du² = 8·tol` — so the
+/// cell diagonal's quadratic form equals the target by construction, plus a
+/// twist term that is exactly zero on paper and 7e-15 on the rational
+/// cylinder's evaluated derivatives. `diagonal > 8·tol` then reads true by
+/// rounding, both steps shrink by a factor that is 1 to fourteen digits, the
+/// infinite step becomes the finite extent, and the grid gains a second row:
+/// 13 stations across the wall's mid-height, whose long diagonals to the rim
+/// stations start a twelve-pass bisection cascade (189 splits, 466 triangles
+/// from a 66-vertex rim pair; the rims alone already carry the curvature, and
+/// their 64-triangle zigzag meets the chord and angular bars as it stands).
+/// With the rule on, the correction fires only when the diagonal exceeds the
+/// target by more than [`RULING_SEED_SLACK`] of it; a genuinely twisted ruled
+/// strip or cone exceeds it by a comparable fraction, a doubly curved face by
+/// at least twice, so both keep their stations. On by default since the
+/// census in the tessellator-cost record (2026-10-11): `BREP_TESS_RULING_SEED=0`
+/// is the off lever, unset or anything else on.
+const RULING_SEED_DEFAULT: bool = true;
+
+/// The relative margin the diagonal must exceed its target by before the
+/// correction fires under the ruling-seed rule.
+pub(in crate::watertight_tessellation) const RULING_SEED_SLACK: f64 = 1e-9;
+
+#[cfg(not(target_arch = "wasm32"))]
+fn ruling_seed_from_env() -> bool {
+    match std::env::var("BREP_TESS_RULING_SEED") {
+        Err(_) => RULING_SEED_DEFAULT,
+        Ok(value) => !(value.is_empty() || value == "0"),
+    }
+}
+
+/// No env vars in the browser: the shipped wasm path reads the default.
+#[cfg(target_arch = "wasm32")]
+fn ruling_seed_from_env() -> bool {
+    RULING_SEED_DEFAULT
+}
+
+thread_local! {
+    /// A test's override of the rule on its own thread (the environment is
+    /// process-wide).
+    static RULING_SEED_OVERRIDE: Cell<Option<bool>> = const { Cell::new(None) };
+}
+
+pub(in crate::watertight_tessellation) fn ruling_seed_enabled() -> bool {
+    RULING_SEED_OVERRIDE.with(|cell| cell.get()).unwrap_or_else(ruling_seed_from_env)
+}
+
+
+
 
 /// How the boundary triangulation `seed_interior_grid` densifies was built —
 /// it decides how a grid station's containment is tested. See the parameter
@@ -111,12 +167,26 @@ pub(in crate::watertight_tessellation) fn seed_interior_grid(
         let cell_v = dv.min(v1 - v0);
         let diagonal =
             suu * cell_u * cell_u + 2.0 * suv * cell_u * cell_v + svv * cell_v * cell_v;
-        if diagonal > 8.0 * chord_tolerance {
+        // The ruling-seed rule (`BREP_TESS_RULING_SEED`, see the switch above):
+        // a diagonal that exceeds its target by rounding alone is at it.
+        let target = 8.0 * chord_tolerance;
+        let exceeds = if ruling_seed_enabled() {
+            diagonal > target * (1.0 + RULING_SEED_SLACK)
+        } else {
+            diagonal > target
+        };
+        if exceeds {
             let shrink = (8.0 * chord_tolerance / diagonal).sqrt();
             du = cell_u * shrink;
             dv = cell_v * shrink;
+            tess_profile(|p| p.seed_diagonal_shrunk += 1);
         }
     }
+    tess_profile(|p| {
+        p.seed_suu += suu;
+        p.seed_svv += svv;
+        p.seed_suv += suv;
+    });
     let clamp = |d: f64, extent: f64| -> f64 {
         if d.is_finite() {
             d.min(extent).max(extent / 256.0)
@@ -136,6 +206,10 @@ pub(in crate::watertight_tessellation) fn seed_interior_grid(
     } else {
         1
     };
+    tess_profile(|p| {
+        p.seed_grid_u += nu as u64;
+        p.seed_grid_v += nv as u64;
+    });
     if nu <= 1 || nv <= 1 {
         return Ok(());
     }
@@ -308,6 +382,9 @@ pub(in crate::watertight_tessellation) fn refine_interior(
     // protect here — and this is the largest candidate set the flipper ever
     // sees, so paying two surface evaluations per candidate is pure cost.
     lawson_flips(vertices, triangles, boundary_pairs, scale);
+    // Midpoint and normal readings shared across the passes and with the
+    // guarded flipper; vertices never move once placed.
+    let mut memo = FaceMemo::default();
     for _ in 0..MAX_REFINE_PASSES {
         tess_profile(|p| p.refine_passes += 1);
         // Corner list sorted into edge groups rather than a map of `Vec`s: the
@@ -351,11 +428,7 @@ pub(in crate::watertight_tessellation) fn refine_interior(
                 (vertices[a].uv[0] + vertices[b].uv[0]) * 0.5,
                 (vertices[a].uv[1] + vertices[b].uv[1]) * 0.5,
             ];
-            let surface_mid = if periodic {
-                face.surface.evaluate_extended(uv_mid[0], uv_mid[1])?
-            } else {
-                face.surface.evaluate(uv_mid[0], uv_mid[1])?
-            };
+            let surface_mid = memo.midpoint(face, vertices, a, b, periodic)?;
             let chord_sag =
                 deflection_to_chord(surface_mid, vertices[a].position, vertices[b].position);
             if chord_sag <= chord_tolerance {
@@ -366,8 +439,11 @@ pub(in crate::watertight_tessellation) fn refine_interior(
                 // means shared/seam edges are never touched, so watertightness
                 // is preserved. The sag floor bounds how far below the chord
                 // target angular refinement may cascade.
-                let angular_gated = chord_sag < ANGULAR_SAG_FLOOR * chord_tolerance
-                    || interior_edge_within_angle(face, vertices[a].uv, vertices[b].uv, periodic);
+                let angular_gated = chord_sag < ANGULAR_SAG_FLOOR * chord_tolerance || {
+                    let _timer = stage_timer(Stage::AngleGate);
+                    tess_profile(|p| p.angle_gate_tests += 1);
+                    interior_edge_within_angle_memo(face, vertices, a, b, periodic, &mut memo)
+                };
                 if angular_gated {
                     continue;
                 }
@@ -407,12 +483,13 @@ pub(in crate::watertight_tessellation) fn refine_interior(
             );
         }
         if splits.is_empty() {
-            lawson_flips_guarded(
+            lawson_flips_guarded_with_memo(
                 vertices,
                 triangles,
                 boundary_pairs,
                 scale,
                 Some((face, chord_tolerance, periodic)),
+                &mut memo,
             );
             return Ok(());
         }
@@ -450,20 +527,22 @@ pub(in crate::watertight_tessellation) fn refine_interior(
         // diagonal that sags past the chord tolerance (see
         // `lawson_flips_guarded`), or this loop spends its passes re-splitting
         // what the previous round's flips lengthened.
-        lawson_flips_guarded(
+        lawson_flips_guarded_with_memo(
             vertices,
             triangles,
             boundary_pairs,
             scale,
             Some((face, chord_tolerance, periodic)),
+            &mut memo,
         );
     }
-    lawson_flips_guarded(
+    lawson_flips_guarded_with_memo(
         vertices,
         triangles,
         boundary_pairs,
         scale,
         Some((face, chord_tolerance, periodic)),
+        &mut memo,
     );
     Ok(())
 }
@@ -472,33 +551,26 @@ pub(in crate::watertight_tessellation) fn refine_interior(
 /// the two endpoints of an INTERIOR edge — the curvature-adaptive refinement
 /// gate. Returns `true` (do not force an angular split) when either normal is
 /// indeterminate (e.g. a degenerate Su×Sv at a pole), leaving such edges to the
-/// chord criterion alone.
-///
-/// Alloc-free via `deriv1`/`deriv1_extended` → Su×Sv, mirroring the position
-/// path (the extended evaluator for an unwrapped periodic ribbon whose interior
-/// uvs run outside the domain). Symmetric in the two endpoints and a pure
-/// function of the surface, so both adjacent faces — and serial vs. parallel
-/// face passes — decide identically.
-fn interior_edge_within_angle(
+/// chord criterion alone. The normals are read from (and left in) `memo`:
+/// `Su × Sv` normalised at the vertex, through the extended evaluator on an
+/// unwrapped periodic ribbon, as the gate always computed them. Symmetric in
+/// the two endpoints and a pure function of the surface, so both adjacent
+/// faces — and serial vs. parallel passes — agree on every shared edge.
+fn interior_edge_within_angle_memo(
     face: &FaceRecord,
-    uv_a: [f64; 2],
-    uv_b: [f64; 2],
+    vertices: &[FaceVertex],
+    a: usize,
+    b: usize,
     periodic: bool,
+    memo: &mut FaceMemo,
 ) -> bool {
-    let normal = |uv: [f64; 2]| -> Option<Vec3> {
-        let (_, su, sv) = if periodic {
-            face.surface.deriv1_extended(uv[0], uv[1]).ok()?
-        } else {
-            face.surface.deriv1(uv[0], uv[1]).ok()?
-        };
-        su.cross(sv).normalized().ok()
-    };
-    let (Some(na), Some(nb)) = (normal(uv_a), normal(uv_b)) else {
+    let (Some(na), Some(nb)) = (memo.normal(face, vertices, a, periodic), memo.normal(face, vertices, b, periodic))
+    else {
         return true;
     };
-    // Both unit ⇒ na·nb = cos(swing). Within tolerance ⇔ cos(swing) ≥ cos(TOL).
     na.dot(nb) >= ANGULAR_TOL.cos()
 }
+
 
 pub(in crate::watertight_tessellation) fn face_normal_at(face: &FaceRecord, uv: [f64; 2], domains: [f64; 4]) -> Result<Vec3, String> {
     let (_, su, sv) = face.surface.deriv1(uv[0], uv[1])?;

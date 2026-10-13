@@ -65,7 +65,6 @@ pub const BAKE_LEASE: u64 = 15 * 60;
 /// without one the server assembles it and queues a bake.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct GenerateRow {
-    #[serde(alias = "part_number", alias = "partNumber")]
     pub number: String,
     #[serde(default)]
     pub revision: String,

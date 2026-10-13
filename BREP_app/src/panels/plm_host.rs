@@ -104,7 +104,7 @@ pub static HIT_KEYS: &[crate::automation::hit_keys::HitKeyDoc] = &[
     crate::automation::hit_keys::HitKeyDoc { panel: "plm", prefix: "section:", meaning: "section:lifecycle, the revision browser and checkout", command: None },
     crate::automation::hit_keys::HitKeyDoc { panel: "plm", prefix: "lifecycle:", meaning: "lifecycle:revision:<label> opens a revision; lifecycle:verb:check-out acquires its lock", command: None },
     crate::automation::hit_keys::HitKeyDoc { panel: "plm", prefix: "save:", meaning: "checkout-on-save consent: save:yes, save:no, save:remember", command: None },
-    crate::automation::hit_keys::HitKeyDoc { panel: "plm", prefix: "web:", meaning: "management links opening the PLM web app in another tab: summary, revisions, attachments, structure, history, parts, workspace, reviews, ecos", command: None },
+    crate::automation::hit_keys::HitKeyDoc { panel: "plm", prefix: "web:", meaning: "management links opening the PLM web app in another tab: summary, revisions, attachments, structure, history, parts, workspace, reviews", command: None },
 ];
 
 pub const SECTIONS: &[(&str, &str)] = &[(LIFECYCLE, "Revision")];
@@ -123,7 +123,7 @@ pub const IMPORT: &str = "import";
 /// lifecycle section's New revision confirmation.
 pub const WHERE_USED: &str = "where-used";
 
-/// The review section: a revision's review round or a change order (S4).
+/// The review section: a revision's review round (S4).
 pub const REVIEW: &str = "review";
 
 /// The lifecycle section: the revision picker and the checkout verbs (S3).
@@ -200,7 +200,7 @@ pub struct PlmHost {
     /// The lifecycle panel of each open PLM document, by document id.
     lifecycle: HashMap<u64, PlmPanel>,
     /// Events a panel raised that another section acts on. S4's review section
-    /// drains `OpenReview` / `OpenChangeOrder` here.
+    /// drains `OpenReview` here.
     pub routed: Vec<PanelEvent>,
     /// What the user picked while the pane drew (another revision to open),
     /// applied by the next [`Self::sync`], which knows the store.
@@ -246,7 +246,7 @@ pub struct PlmHost {
     import: crate::panels::plm_import::PlmImportPanel,
     /// The review section (S4).
     review: crate::panels::plm_review::ReviewSection,
-    /// Reviews and change orders asked for — by the lifecycle section, the
+    /// Reviews asked for — by the lifecycle section, the
     /// toolbar's inbox — opened by the next [`Self::sync`], which has the client.
     review_asked: Vec<crate::panels::plm_review::PlmReviewEvent>,
 }
@@ -313,7 +313,7 @@ impl PlmHost {
         actions
     }
 
-    /// Open a review or a change order in the review section (the toolbar's
+    /// Open a review in the review section (the toolbar's
     /// inbox rows). Opened by the next [`Self::sync`].
     pub fn open_review(&mut self, event: crate::panels::plm_review::PlmReviewEvent) {
         self.review_asked.push(event);
@@ -575,7 +575,7 @@ impl PlmHost {
     }
 
     /// Hand the routed events to whichever section acts on them: the
-    /// lifecycle section's Submit for review, Review… and Open change order
+    /// lifecycle section's Submit for review, Review…
     /// open the review section. Run at the end of every [`Self::sync_with`].
     pub fn route(&mut self) {
         for event in std::mem::take(&mut self.routed) {
@@ -674,7 +674,7 @@ impl PlmHost {
                 self.hits.insert(format!("web:{tab}"), link.rect);
             }
         }
-        for (label, route) in [("Parts and new parts", "parts"), ("Workspace", "workspace"), ("Reviews and approvals", "reviews"), ("Change orders", "ecos")] {
+        for (label, route) in [("Parts and new parts", "parts"), ("Workspace", "workspace"), ("Reviews and approvals", "reviews")] {
             let link = web_link(ui, label, format!("{}#/{route}", self.web_base));
             self.hits.insert(format!("web:{route}"), link.rect);
         }

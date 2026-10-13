@@ -148,7 +148,7 @@ impl ContextBarPanel {
         // editor's own tool card. The selection itself is kept for the return.
         if (!has_geometry && constraint_target.is_none())
             || state.ref_select_active()
-            || state.sketch_mode()
+            || state.any_sketch_mode()
             || crate::workbench::ecad::Target::of_workbench(&state.settings.workbench).is_some()
         {
             return ContextOutcome::default();
@@ -817,7 +817,7 @@ fn offer_fields(engine: Option<&EngineState>, ty: &str, kinds: &[&str]) -> Vec<O
 /// selection made entirely of component geometry seeds nothing (the kernel
 /// rejects component references). Returns the number of fields seeded.
 pub(crate) fn prefill_from_selection(state: &EngineState, type_code: &str, params: &mut Value) -> usize {
-    if state.sketch_mode() || state.ref_select_active() {
+    if state.any_sketch_mode() || state.ref_select_active() {
         return 0;
     }
     let sel = Selection::read(state);

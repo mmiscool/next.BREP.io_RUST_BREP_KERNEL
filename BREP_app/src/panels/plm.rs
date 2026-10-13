@@ -64,7 +64,7 @@ pub struct PartDetail {
     pub multiple_open_drafts: bool,
 }
 
-/// One revision with its lock, review, change order, bake and provenance.
+/// One revision with its lock, review, bake and provenance.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(default)]
 pub struct RevisionView {
@@ -97,7 +97,6 @@ pub struct RevisionView {
     pub uses: usize,
     pub review: Option<ReviewSummary>,
     pub comments: usize,
-    pub eco: Option<EcoRef>,
 }
 
 /// Where a generated or spun-out revision came from.
@@ -118,17 +117,6 @@ pub struct ReviewSummary {
     pub approvals: usize,
     pub required_approvals: u32,
     pub may_decide: bool,
-}
-
-/// The open change order naming a revision.
-#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
-#[serde(default)]
-pub struct EcoRef {
-    pub id: String,
-    pub number: String,
-    pub state: String,
-    /// `release` or `obsolete`.
-    pub action: String,
 }
 
 /// A new revision, as `POST /api/parts/:id/revisions` answers.
@@ -245,8 +233,6 @@ pub enum Verb {
     Submit,
     /// Open the review pane on the revision's current round.
     Review,
-    /// A release was refused and a change order holds the revision: open it.
-    OpenChangeOrder,
 }
 
 impl Verb {
@@ -260,7 +246,7 @@ impl Verb {
             Verb::NewRevision => "new-revision",
             Verb::Submit => "submit",
             Verb::Review => "review",
-            Verb::OpenChangeOrder => "open-change-order",
+
         }
     }
 
@@ -273,7 +259,7 @@ impl Verb {
             Verb::NewRevision => "New revision",
             Verb::Submit => "Submit for review",
             Verb::Review => "Review…",
-            Verb::OpenChangeOrder => "Open change order",
+
         }
     }
 }
@@ -326,9 +312,6 @@ pub fn describe(revision: &RevisionView) -> String {
         } else {
             parts.push(format!("review {}", review.status));
         }
-    }
-    if let Some(eco) = &revision.eco {
-        parts.push(format!("{} ({} {})", eco.number, eco.action, eco.state));
     }
     if let Some(bake) = &revision.bake {
         if revision.bake_error.is_empty() {
@@ -396,9 +379,6 @@ pub enum PanelEvent {
     /// Open the review pane on a revision: its submit form, or its round
     /// (`panels::plm_review`, S4).
     OpenReview { part: String, revision: String },
-    /// Open a change order, by id — the one holding a revision whose release
-    /// was refused.
-    OpenChangeOrder { eco: String },
 }
 
 /// The lifecycle panel for ONE document opened from the PLM.
@@ -421,9 +401,6 @@ pub struct PlmPanel {
     /// New revision was pressed in the pane: show what uses the part, then
     /// start only on the user's confirmation.
     confirm_new: bool,
-    /// The last Release was refused, so a change order holding the revision is
-    /// offered ([`Verb::OpenChangeOrder`]).
-    release_refused: bool,
     /// Events a press raised without a server call, handed out by the next poll.
     queued: Vec<PanelEvent>,
 }
@@ -444,7 +421,6 @@ impl PlmPanel {
             reported: None,
             open_newest_after: false,
             confirm_new: false,
-            release_refused: false,
             queued: Vec::new(),
         };
         panel.work = Some(Work::Part(Pending::new(server.part(part_id))));
@@ -480,10 +456,7 @@ impl PlmPanel {
     pub fn offered(&self) -> Vec<Verb> {
         match (&self.part, self.revision()) {
             (Some(part), Some(revision)) if self.work.is_none() || self.refreshing() => {
-                let mut offered = verbs(part, revision, self.rights);
-                if self.release_refused && revision.eco.is_some() {
-                    offered.push(Verb::OpenChangeOrder);
-                }
+                let offered = verbs(part, revision, self.rights);
                 offered
             }
             _ => Vec::new(),
@@ -498,21 +471,15 @@ impl PlmPanel {
         }
         if self.refreshing() { self.work = None; }
         let (part, rev) = (self.part_id.clone(), self.revision_id.clone());
-        // The review pane and the change order pane are S4's: these open them.
+        // The review pane are S4's: these open them.
         match verb {
             Verb::Submit | Verb::Review => {
                 self.queued.push(PanelEvent::OpenReview { part, revision: rev });
                 return;
             }
-            Verb::OpenChangeOrder => {
-                if let Some(eco) = self.revision().and_then(|r| r.eco.clone()) {
-                    self.queued.push(PanelEvent::OpenChangeOrder { eco: eco.id });
-                }
-                return;
-            }
+
             _ => {}
         }
-        self.release_refused = false;
         let done = |label: &'static str| move |_| label.to_string();
         let future: PlmFuture<String> = match verb {
             Verb::CheckOut => map(server.checkout(&part, &rev), done("Checked out")),
@@ -521,10 +488,10 @@ impl PlmPanel {
             Verb::Release => map(server.set_state(&part, &rev, "released"), |warnings: Vec<String>| {
                 if warnings.is_empty() { "Released".to_string() } else { format!("Released — {}", warnings.join("; ")) }
             }),
+            Verb::Submit | Verb::Review => unreachable!("opened above"),
             Verb::NewRevision => map(server.create_revision(&part, self.new_label.trim()), |r: NewRevision| {
                 format!("Revision {} started", r.label)
             }),
-            Verb::Submit | Verb::Review | Verb::OpenChangeOrder => unreachable!("opened above"),
         };
         self.message = None;
         self.work = Some(Work::Verb(verb, Pending::new(future)));
@@ -582,7 +549,6 @@ impl PlmPanel {
                                 }
                             }
                             Err(error) => {
-                                self.release_refused = verb == Verb::Release;
                                 self.message = Some(error);
                             }
                         }
@@ -693,10 +659,7 @@ impl PlmPanel {
         let offered = self.offered();
         ui.horizontal_wrapped(|ui| {
             for verb in offered.iter().copied().filter(|v| *v != Verb::NewRevision) {
-                let label = match (verb, self.revision().and_then(|r| r.eco.as_ref())) {
-                    (Verb::OpenChangeOrder, Some(eco)) => format!("Open change order {}", eco.number),
-                    _ => verb.label().to_string(),
-                };
+                let label = verb.label();
                 let button = ui.button(label);
                 hits.put(&format!("verb:{}", verb.key()), button.rect);
                 if button.clicked() {

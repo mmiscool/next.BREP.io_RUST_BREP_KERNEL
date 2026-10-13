@@ -281,7 +281,7 @@ pub fn schema() -> serde_json::Value {
         "shortName": "ACOMP",
         "longName": "Assembly Component",
     "ribbonPath": "Home/Assembly/Assembly Component",
-    "commandSize": "Compact",
+    "commandSize": "Large",
         "displayBuilder": false,
         "inputParamsSchema": {
             "id": {

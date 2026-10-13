@@ -113,6 +113,7 @@ pub(super) fn blend_open_edge_impl(
             [false, false],
             crate::blend::station_refinement_on().then_some(rail_bar),
             if wall_check { OPEN_WALL_CENTRES } else { 0 },
+            true,
         )?;
         let parameters = station_parameters(&stations);
         let rows = fit_open_rows(
@@ -700,6 +701,132 @@ pub(in crate::blend) fn read_on_stencil(point: Vec3, nodes: &[Vec3], abscissae: 
 /// native-abscissa reader (`chain::declared_wall_probe_at_why`) on the
 /// edge parameters the centres were solved at; of equal width, by the
 /// ordinary reader. With no neighbour it is read as before.
+/// The wall reading of an EXACT extrusion's rows, read directly: the wall is
+/// the ball's sweep along the centre line, so every point of the shipped
+/// surface stands exactly the radius off that line, and the reading is how
+/// far it does not. One entry per interval overlapping `window`, probes at
+/// the interval's quarters inside the window and at the window's ends, over
+/// the section at k/8 (the ball-resolve reader's sections). Never for fitted
+/// rows: those are read against the exact centres between their stations
+/// ([`open_wall_readings_why`]).
+pub(in crate::blend) fn exact_extrusion_wall_readings(
+    rows: &FittedRows,
+    parameters: &[f64],
+    window: [f64; 2],
+    radius: f64,
+) -> Vec<Result<f64, String>> {
+    let intervals = parameters.len().saturating_sub(1);
+    let overlapped: Vec<usize> =
+        (0..intervals).filter(|&interval| parameters[interval + 1] > window[0] && parameters[interval] < window[1]).collect();
+    let line = match (rows.exact_extrusion, rows.center.as_ref()) {
+        (true, Some(center)) => center.domain().and_then(|[a, b]| Ok((center.evaluate(a)?, center.evaluate(b)?))),
+        (false, _) => Err("the rows are not an exact extrusion".to_string()),
+        (true, None) => Err("the exact rows carry no centre line".to_string()),
+    };
+    let (anchor, direction) = match line.and_then(|(a, b)| b.sub(a).normalized().map(|d| (a, d))) {
+        Ok(line) => line,
+        Err(error) => return overlapped.iter().map(|interval| Err(format!("interval {interval}: {error}"))).collect(),
+    };
+    let Ok([v_low, v_high]) = rows.surface.domain_v() else {
+        return overlapped.iter().map(|interval| Err(format!("interval {interval}: wall surface v domain unreadable"))).collect();
+    };
+    overlapped
+        .into_iter()
+        .map(|interval| -> Result<f64, String> {
+            let (from, to) = (parameters[interval], parameters[interval + 1]);
+            let inside = |u: f64| u >= window[0] && u <= window[1];
+            let mut probes: Vec<f64> =
+                (1..4).map(|step| from + (to - from) * step as f64 / 4.0).filter(|u| inside(*u)).collect();
+            probes.extend(window.into_iter().filter(|end| *end > from && *end < to));
+            if probes.is_empty() {
+                return Err(format!("interval {interval}: no probe in its shipped part of [{:.17}, {:.17}]", window[0], window[1]));
+            }
+            let mut worst = 0.0_f64;
+            for u in probes {
+                for k in 1..OPEN_WALL_SECTIONS {
+                    let v = v_low + (v_high - v_low) * k as f64 / OPEN_WALL_SECTIONS as f64;
+                    let point = rows.surface.evaluate(u, v).map_err(|error| format!("interval {interval}: wall point (u {u:.9}, v {v:.6}) unreadable: {error}"))?;
+                    let offset = point.sub(anchor);
+                    let standoff = offset.sub(direction.scale(offset.dot(direction))).length();
+                    let reading = (standoff - radius).abs();
+                    if !reading.is_finite() {
+                        return Err(format!("interval {interval}: wall point (u {u:.9}, v {v:.6}) reads {reading}"));
+                    }
+                    worst = worst.max(reading);
+                }
+            }
+            Ok(worst)
+        })
+        .collect()
+}
+
+/// The wall reading of an EXACT REVOLUTION's rows
+/// (`support::exact_revolution_rows`), read directly: the wall is the ball's
+/// sweep along the centre CIRCLE, so every point of the shipped surface
+/// stands exactly the radius off that circle, and the reading is how far it
+/// does not. The distance to the circle is closed-form in the point's
+/// meridian half-plane: `hypot(ρ − R_c, h − h_c)` for the point's radial
+/// distance ρ and axial height h about the rows' axis. Same probes as
+/// [`exact_extrusion_wall_readings`]: one entry per interval overlapping
+/// `window`, the interval's quarters inside the window and the window's
+/// ends, over the section at k/8.
+pub(in crate::blend) fn exact_revolution_wall_readings(
+    rows: &FittedRows,
+    parameters: &[f64],
+    window: [f64; 2],
+    radius: f64,
+) -> Vec<Result<f64, String>> {
+    let intervals = parameters.len().saturating_sub(1);
+    let overlapped: Vec<usize> =
+        (0..intervals).filter(|&interval| parameters[interval + 1] > window[0] && parameters[interval] < window[1]).collect();
+    let circle = match (rows.revolution_axis, rows.center.as_ref()) {
+        (Some((origin, axis)), Some(center)) => center.domain().and_then(|[a, _]| center.evaluate(a)).map(|point| (origin, axis, point)),
+        (None, _) => Err("the rows are not an exact revolution".to_string()),
+        (Some(_), None) => Err("the exact rows carry no centre circle".to_string()),
+    };
+    let (origin, axis, centre_radius, centre_height) = match circle {
+        Ok((origin, axis, point)) => {
+            let offset = point.sub(origin);
+            let height = offset.dot(axis);
+            (origin, axis, offset.sub(axis.scale(height)).length(), height)
+        }
+        Err(error) => return overlapped.iter().map(|interval| Err(format!("interval {interval}: {error}"))).collect(),
+    };
+    let Ok([v_low, v_high]) = rows.surface.domain_v() else {
+        return overlapped.iter().map(|interval| Err(format!("interval {interval}: wall surface v domain unreadable"))).collect();
+    };
+    overlapped
+        .into_iter()
+        .map(|interval| -> Result<f64, String> {
+            let (from, to) = (parameters[interval], parameters[interval + 1]);
+            let inside = |u: f64| u >= window[0] && u <= window[1];
+            let mut probes: Vec<f64> =
+                (1..4).map(|step| from + (to - from) * step as f64 / 4.0).filter(|u| inside(*u)).collect();
+            probes.extend(window.into_iter().filter(|end| *end > from && *end < to));
+            if probes.is_empty() {
+                return Err(format!("interval {interval}: no probe in its shipped part of [{:.17}, {:.17}]", window[0], window[1]));
+            }
+            let mut worst = 0.0_f64;
+            for u in probes {
+                for k in 1..OPEN_WALL_SECTIONS {
+                    let v = v_low + (v_high - v_low) * k as f64 / OPEN_WALL_SECTIONS as f64;
+                    let point = rows.surface.evaluate(u, v).map_err(|error| format!("interval {interval}: wall point (u {u:.9}, v {v:.6}) unreadable: {error}"))?;
+                    let offset = point.sub(origin);
+                    let height = offset.dot(axis);
+                    let radial = offset.sub(axis.scale(height)).length();
+                    let standoff = (radial - centre_radius).hypot(height - centre_height);
+                    let reading = (standoff - radius).abs();
+                    if !reading.is_finite() {
+                        return Err(format!("interval {interval}: wall point (u {u:.9}, v {v:.6}) reads {reading}"));
+                    }
+                    worst = worst.max(reading);
+                }
+            }
+            Ok(worst)
+        })
+        .collect()
+}
+
 pub(in crate::blend) fn open_wall_readings_why(
     rows: &FittedRows,
     parameters: &[f64],
@@ -857,6 +984,34 @@ pub(in crate::blend) fn march_trim_stands(read: &Result<(f64, f64, usize, f64), 
     matches!(read, Ok((miss, standoff, _, _)) if *miss + *standoff <= floor)
 }
 
+/// Slice 1b of the surgery lane (`exact_trim_on`): the support trim of a
+/// straight rail on a PLANE, exact. The feet of the rail's two ends on the
+/// plane (the kernel's closed-form projection) joined by a degree-1 pcurve
+/// on the rail's own parameter range, so the surgery reads it at the rail's
+/// parameter as it reads every trim; read once as shipped
+/// (`read_shipped_pcurve`) and kept only when it stands within the pcurve
+/// floor by the march trim's own rule (`march_trim_stands`: miss plus rail
+/// standoff). `None` hands the trim to the refit road, as a march trim that
+/// does not stand would be.
+fn exact_planar_trim(rail: &NurbsCurve, surface: &NurbsSurface, d0: f64, d1: f64) -> Result<Option<NurbsCurve>, KernelRefusal> {
+    if !matches!(surface.analytic(), Some(crate::AnalyticSurface::Plane { .. })) || !(d1 > d0) {
+        return Ok(None);
+    }
+    let feet_timing = crate::blend::BlendTimer::start("timing.surgery.trim.exact.feet_ms");
+    let mut control = Vec::with_capacity(2);
+    for t in [d0, d1] {
+        let point = rail.evaluate(t).or_refuse(KernelStage::Refine, "evaluate")?;
+        let foot = crate::project_point_to_surface(surface, point).or_refuse(KernelStage::Refine, "project")?;
+        control.push(crate::Vec4::from_point(crate::Vec3::new(foot.u, foot.v, 0.0), 1.0));
+    }
+    let line = NurbsCurve::new(1, vec![d0, d0, d1, d1], control).or_refuse(KernelStage::Refine, "new")?;
+    feet_timing.stop();
+    let read_timing = crate::blend::BlendTimer::start("timing.surgery.trim.exact.read_ms");
+    let read = crate::blend::track_fit::read_shipped_pcurve(surface, &|t| rail.evaluate(t), &line, d0, d1);
+    read_timing.stop();
+    Ok(march_trim_stands(&read, crate::pcurve::PCURVE_REFINEMENT_TOLERANCE).then_some(line))
+}
+
 /// Sew ONE stripe into `result`.
 ///
 /// `solid` is the ORIGINAL topology every stripe was marched against (the
@@ -927,6 +1082,7 @@ pub(in crate::blend) fn build_open_surgery(
     // identifies (`SewnStripe::identified`) once every stripe is in.  A stripe
     // free at BOTH ends has no corner to collapse onto, so it refuses.
     let band = consumed_band(solid);
+    let exact_trim = crate::blend::exact_trim_on();
     let collapses = |row: &NurbsCurve, a: f64, b: f64| -> Result<bool, KernelRefusal> {
         let from = row.evaluate(a).or_refuse(KernelStage::Refine, "evaluate")?;
         Ok(row.evaluate(b).or_refuse(KernelStage::Refine, "evaluate")?.sub(from).length() <= band
@@ -974,20 +1130,56 @@ pub(in crate::blend) fn build_open_surgery(
         if collapsed {
             return Ok(None);
         }
+        let rows_timing = crate::blend::BlendTimer::start("timing.surgery.trim.rows_ms");
         let rail = trim_row(row, a, b).map_err(describe_trim)?;
         let interpolated = trim_row(pcurve, a, b)?;
+        rows_timing.stop();
         {
+            let overrun_timing = crate::blend::BlendTimer::start("timing.surgery.trim.overrun_ms");
             let [d0, d1] = rail.domain().or_refuse(KernelStage::Refine, "domain")?;
-            if crate::blend::planar_chart_overrun(surface, &|t| rail.evaluate(t), d0, d1)?.is_some_and(|excursion| excursion > band) {
+            let overrun = crate::blend::planar_chart_overrun(surface, &|t| rail.evaluate(t), d0, d1)?;
+            overrun_timing.stop();
+            if overrun.is_some_and(|excursion| excursion > band) {
                 return Ok(Some((rail, interpolated)));
             }
+        }
+        let [d0, d1] = rail.domain().or_refuse(KernelStage::Refine, "domain")?;
+        // Slice 1b (`exact_trim_on`): an exact extrusion row's rail on a
+        // plane ships the exact line in uv, read once; the refit road below
+        // is for what it declines.
+        if exact_trim && rows.exact_extrusion {
+            if let Some(line) = exact_planar_trim(&rail, surface, d0, d1)? {
+                crate::blend::record_count("count.surgery.exact_trim", 1);
+                return Ok(Some((rail, line)));
+            }
+        }
+        // The exact REVOLUTION rows' own trims are exact by construction
+        // (the carrier's uv line, the plane's affine image of the rail):
+        // read once as shipped by the march trim's rule (`march_trim_stands`)
+        // and kept; whatever does not stand takes the refit road below.
+        if rows.revolution_axis.is_some() {
+            let read_timing = crate::blend::BlendTimer::start("timing.surgery.trim.exact.read_ms");
+            let read = crate::blend::track_fit::read_shipped_pcurve(surface, &|t| rail.evaluate(t), &interpolated, d0, d1);
+            read_timing.stop();
+            if march_trim_stands(&read, crate::pcurve::PCURVE_REFINEMENT_TOLERANCE) {
+                crate::blend::record_count("count.surgery.exact_revolution_trim", 1);
+                return Ok(Some((rail, interpolated)));
+            }
+            crate::blend::record_count("count.surgery.exact_revolution_trim_declined", 1);
         }
         // The march's OWN trim pcurve, read independently at the rail's own
         // parameter against the same floor (`read_shipped_pcurve`): what a
         // declined refit may fall back to, and the standoff a refit on the
         // rail's own branch must match.
-        let [d0, d1] = rail.domain().or_refuse(KernelStage::Refine, "domain")?;
-        let march_read = crate::blend::track_fit::read_shipped_pcurve(surface, &|t| rail.evaluate(t), &interpolated, d0, d1);
+        // The feet of each pcurve against the rail are sought once and
+        // shared between the reads below (`FootMemo`): the march trim's for
+        // its own read and the branch comparison, the refit's for the
+        // refit's own read, the branch comparison and the absolute bound.
+        let mut march_feet = crate::blend::track_fit::FootMemo::default();
+        let mut refit_feet = crate::blend::track_fit::FootMemo::default();
+        let march_read_timing = crate::blend::BlendTimer::start("timing.surgery.trim.read.march_ms");
+        let march_read = crate::blend::track_fit::read_shipped_pcurve_memo(surface, &|t| rail.evaluate(t), &interpolated, d0, d1, &mut march_feet);
+        march_read_timing.stop();
         let floor = crate::pcurve::PCURVE_REFINEMENT_TOLERANCE;
         let declined = |why: KernelRefusal| -> Result<Option<(NurbsCurve, NurbsCurve)>, KernelRefusal> {
             // Kept ONLY when the march's trim stands on its own read
@@ -999,9 +1191,12 @@ pub(in crate::blend) fn build_open_surgery(
                 Err(why)
             }
         };
-        let refit = super::closed::refit_closed_support_pcurve(&rail, &interpolated, surface);
+        let refit_timing = crate::blend::BlendTimer::start("timing.surgery.trim.refit_ms");
+        let refit = super::closed::refit_closed_support_pcurve_read(&rail, &interpolated, surface, &mut refit_feet);
+        refit_timing.stop();
+        let _reads_timing = crate::blend::BlendTimer::start("timing.surgery.trim.reads_ms");
         match refit {
-            Ok(fitted) => {
+            Ok((fitted, refit_read)) => {
                 // A refit tracks ITS OWN projected track; a track that took
                 // another branch of the carrier tracks itself perfectly while
                 // its foot stands far off the rail (the stationary-start
@@ -1015,8 +1210,10 @@ pub(in crate::blend) fn build_open_surgery(
                 // The two are compared POINTWISE, at the same rail
                 // parameters (`standoff_excess`), never as two maxima read at
                 // each curve's own knots.
-                let refit_read = crate::blend::track_fit::read_shipped_pcurve(surface, &|t| rail.evaluate(t), &fitted, d0, d1);
-                let (march_standoff, refit_standoff) = match (&march_read, refit_read) {
+                // The refit's read is the shipped curve's own, handed back by
+                // the refit (the same `read_shipped_pcurve` on the same
+                // inputs, once).
+                let (march_standoff, refit_standoff) = match (&march_read, Ok::<_, KernelRefusal>(refit_read)) {
                     (_, Err(error)) => return declined(error),
                     (Err(error), Ok(_)) => {
                         return Err(KernelRefusal::non_convergence(KernelStage::Refine, "support_refit_branch_unread", format!(
@@ -1027,7 +1224,12 @@ pub(in crate::blend) fn build_open_surgery(
                     }
                     (Ok((_, march_standoff, _, _)), Ok((_, refit_standoff, _, _))) => (*march_standoff, refit_standoff),
                 };
-                let excess = match crate::blend::track_fit::standoff_excess(surface, &|t| rail.evaluate(t), &interpolated, &fitted, d0, d1) {
+                let excess_timing = crate::blend::BlendTimer::start("timing.surgery.trim.read.excess_ms");
+                let excess = crate::blend::track_fit::standoff_excess_memo(
+                    surface, &|t| rail.evaluate(t), &interpolated, &fitted, d0, d1, &mut march_feet, &mut refit_feet,
+                );
+                excess_timing.stop();
+                let excess = match excess {
                     Ok(excess) => excess,
                     Err(error) => return declined(error),
                 };
@@ -1045,7 +1247,10 @@ pub(in crate::blend) fn build_open_surgery(
                 // nearest-point projector at the same parameters
                 // (`standoff_over_nearest`) -- the rail's approximation the
                 // lane reports, never more.
-                let absolute = match crate::blend::track_fit::standoff_over_nearest(surface, &|t| rail.evaluate(t), &fitted, d0, d1) {
+                let nearest_timing = crate::blend::BlendTimer::start("timing.surgery.trim.read.nearest_ms");
+                let absolute = crate::blend::track_fit::standoff_over_nearest_memo(surface, &|t| rail.evaluate(t), &fitted, d0, d1, &mut refit_feet);
+                nearest_timing.stop();
+                let absolute = match absolute {
                     Ok(absolute) => absolute,
                     Err(error) => return declined(error),
                 };
@@ -1060,6 +1265,7 @@ pub(in crate::blend) fn build_open_surgery(
             Err(error) => declined(error),
         }
     };
+    let trim_timing = crate::blend::BlendTimer::start("timing.surgery.trim_rails_ms");
     let cr_rail = trim_rail(
         cr_collapsed,
         &rows.cr,
@@ -1076,6 +1282,7 @@ pub(in crate::blend) fn build_open_surgery(
         start_end.cs_parameter(),
         finish_end.cs_parameter(),
     )?;
+    trim_timing.stop();
     // A collapsed rail's domain is its two stops, which are one point.
     let cr_domain = match &cr_rail {
         Some((cr, _)) => cr.domain().or_refuse(KernelStage::Refine, "domain")?,
@@ -1204,10 +1411,13 @@ pub(in crate::blend) fn build_open_surgery(
             }
         }
     };
+    let crossings_timing = crate::blend::BlendTimer::start("timing.surgery.crossings_ms");
     let start_first = resolve_side(&start_end, true, old_start)?;
     let start_second = resolve_side(&start_end, false, old_start)?;
     let finish_first = resolve_side(&finish_end, true, old_finish)?;
     let finish_second = resolve_side(&finish_end, false, old_finish)?;
+    crossings_timing.stop();
+    let _topology_timing = crate::blend::BlendTimer::start("timing.surgery.topology_ms");
 
     // Manifold pairing: the blend's use of the first support row must oppose
     // F1's use of the blended edge (see the blend-loop construction below).

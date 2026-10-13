@@ -78,6 +78,12 @@ pub struct FormViewSpec<'a> {
     /// saying why, so nothing is typed that the engine would refuse and the
     /// field's buffer would keep; the exit button stays live.
     pub read_only: Option<&'a str>,
+    /// The reference field a pick is RUNNING in, when one is — the form draws
+    /// it as the focused selection box ([`form::ActivePick`]): its button
+    /// reads `Done`, its list is the engine's running picks and its `✕`s come
+    /// out as [`FormViewOut::pick_remove`]. `None` draws every reference field
+    /// at rest.
+    pub picking: Option<form::ActivePick<'a>>,
 }
 
 /// A reference field's `Select` was pressed — the caller dispatches this to its
@@ -103,8 +109,15 @@ pub struct FormViewOut {
     pub changed: bool,
     /// A [`FieldKind::Button`] field was clicked, by its key (`"editSketch"`).
     pub button_clicked: Option<String>,
-    /// A reference field's `Select` was pressed.
+    /// A reference field's `Select` was pressed. With a pick already running
+    /// in ANOTHER field (`spec.picking`), the consumer finishes that one first:
+    /// focus moves from box to box, one pick at a time.
     pub ref_activate: Option<RefActivate>,
+    /// The focused reference field's `Done` was pressed: commit the running
+    /// pick.
+    pub pick_done: bool,
+    /// An `✕` on the focused reference field: drop the i-th running pick.
+    pub pick_remove: Option<usize>,
     /// The title row's exit button was pressed — the caller returns to its list.
     pub exit_clicked: bool,
     /// The exit ALSO means "roll the model to the tip" — set only when the exit
@@ -131,7 +144,7 @@ pub struct FormViewOut {
 /// | `form:return` | the exit button, right end of the title row |
 /// | `field:{path}` | a field's input widget |
 /// | `field:{path}#{variant}` | an OPEN enum's items |
-/// | `field:{path}#activate` / `#x{i}` | a reference's Select / remove buttons |
+/// | `field:{path}#activate` / `#x{i}` | a reference's Select / remove buttons (the focused field's Select is its Done) |
 /// | `field:{path}#line{i}` | a reference's i-th chosen-entity line |
 /// | `form:trailing:{Section}:{i}` | a read-only section's i-th line (`Outputs`) |
 ///
@@ -426,7 +439,8 @@ fn draw_field(
     // extrudes mid-edit must not hand one's half-typed `distance` to the other.
     // `make_persistent_id` folds in the ui id-stack only.
     ui.push_id((spec.title, field.key()), |ui| {
-        let (changed, r) = form::field_input(ui, field, params, Some(&mut probe), &mut actions);
+        let (changed, r) =
+            form::field_input_with(ui, field, params, Some(&mut probe), &mut actions, spec.picking);
         out.changed |= changed;
         rect = r;
     });
@@ -442,6 +456,11 @@ fn draw_field(
     // last field to report wins — and only one ever reports.
     if actions.hovered_entity.is_some() {
         out.hovered_entity = actions.hovered_entity.take();
+    }
+    // The focused reference field's own two intents.
+    out.pick_done |= actions.pick_done;
+    if actions.pick_remove.is_some() {
+        out.pick_remove = actions.pick_remove;
     }
     // `field_input` reports the two ACTION kinds through the same out-param, by
     // field key; which intent it is comes from the field's own kind.

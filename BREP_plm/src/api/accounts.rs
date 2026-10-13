@@ -202,7 +202,7 @@ pub async fn logout(State(db): State<Shared>, headers: HeaderMap) -> Result<Resp
 }
 
 /// Who am I, and what may I do. For a browser this also hands out the
-/// session's CSRF token, issuing one for a session from before hardening.
+/// session's CSRF token.
 pub async fn me(State(db): State<Shared>, headers: HeaderMap) -> Result<Json<PublicUser>, Error> {
     let identity = super::identify(&db, &headers)?;
     let mut public = PublicUser::from(&identity.user);
@@ -216,9 +216,6 @@ pub async fn me(State(db): State<Shared>, headers: HeaderMap) -> Result<Json<Pub
                 .iter_mut()
                 .find(|s| s.token == token)
                 .ok_or_else(|| Error::unauthorized("session has expired"))?;
-            if session.csrf.is_empty() {
-                session.csrf = auth::random_token(32);
-            }
             Ok(session.csrf.clone())
         })?;
         public.csrf = Some(csrf);

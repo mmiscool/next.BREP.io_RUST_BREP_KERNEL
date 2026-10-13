@@ -171,6 +171,8 @@ mod polygons;
 mod rule;
 #[path = "mass_properties/solid_props.rs"]
 mod solid_props;
+#[path = "mass_properties/sphere_sign.rs"]
+mod sphere_sign;
 #[path = "mass_properties/trimmed.rs"]
 mod trimmed;
 #[path = "mass_properties/winding.rs"]
@@ -192,7 +194,10 @@ pub use measures::{
     curve_arc_length, edge_arc_length, face_area, face_boundary_length,
     face_volume_contribution, solid_edge_length_total,
 };
-pub use solid_props::{solid_mass_properties, solid_mass_properties_full, solid_signed_volume};
+pub use solid_props::{
+    solid_mass_properties, solid_mass_properties_full, solid_signed_volume, solid_signed_volume_for_sign,
+};
 pub(crate) use solid_props::shell_signed_volume;
 pub use polygons::trim_polygons;
 pub use identity::{face_set_identity, FaceSetIdentity};
+pub(crate) use identity::{coedge_use_identity, face_contribution_identity};

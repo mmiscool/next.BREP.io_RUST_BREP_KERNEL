@@ -16,6 +16,17 @@ use super::edge_conform::edge_lies_on;
 /// position, and does not worsen the worst adjacent edge-endpoint gap;
 /// every adjacent edge endpoint is then re-snapped to the solved point.
 pub(in crate::boolean) fn polish_triple_junction_vertices(solid: &mut BrepSolid, tolerance: f64) -> Result<usize, KernelRefusal> {
+    polish_triple_junction_vertices_in(solid, tolerance, None)
+}
+
+/// [`polish_triple_junction_vertices`] over the vertices in `scope` only
+/// (`None` reads every vertex): a boolean passes the vertices of the faces
+/// it touched.
+pub(in crate::boolean) fn polish_triple_junction_vertices_in(
+    solid: &mut BrepSolid,
+    tolerance: f64,
+    scope: Option<&HashSet<u64>>,
+) -> Result<usize, KernelRefusal> {
     let weld_tolerance = assembler_weld(tolerance);
     let mut vertex_faces = HashMap::<u64, Vec<usize>>::default();
     let edge_vertices: HashMap<u64, (u64, u64)> = solid
@@ -41,6 +52,9 @@ pub(in crate::boolean) fn polish_triple_junction_vertices(solid: &mut BrepSolid,
     }
     let mut moves = Vec::<(u64, Vec3)>::new();
     for vertex in &solid.vertices {
+        if scope.is_some_and(|scope| !scope.contains(&vertex.id)) {
+            continue;
+        }
         let Some(adjacent) = vertex_faces.get(&vertex.id) else {
             continue;
         };

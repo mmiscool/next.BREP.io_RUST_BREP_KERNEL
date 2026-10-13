@@ -67,18 +67,126 @@ pub(super) fn interior_points(
     };
     let outer_polygon = polygon(outer);
     let hole_polygons = holes.iter().map(|hole| polygon(hole)).collect::<Vec<_>>();
+    interior_points_in_polygons(&outer_polygon, &hole_polygons, area, count)
+}
+
+/// A conservative nearest-segment index. Each leaf still evaluates the
+/// original point/segment expression; boxes only discard edges that cannot
+/// lower the current distance. Padding encloses roundoff in a+t*(b-a).
+struct InteriorSegmentIndex {
+    edges: Vec<(Vec2, Vec2)>,
+    nodes: Vec<InteriorSegmentNode>,
+}
+struct InteriorSegmentNode {
+    low: Vec2,
+    high: Vec2,
+    start: usize,
+    end: usize,
+    children: Option<[usize; 2]>,
+}
+impl InteriorSegmentIndex {
+    fn new(edges: Vec<(Vec2, Vec2)>) -> Self {
+        let mut index = Self { edges, nodes: Vec::new() };
+        index.build(0, index.edges.len());
+        index
+    }
+    fn build(&mut self, start: usize, end: usize) -> usize {
+        let mut low = Vec2 { x: f64::INFINITY, y: f64::INFINITY };
+        let mut high = Vec2 { x: f64::NEG_INFINITY, y: f64::NEG_INFINITY };
+        for &(a, b) in &self.edges[start..end] {
+            for p in [a, b] {
+                low.x = low.x.min(p.x); low.y = low.y.min(p.y);
+                high.x = high.x.max(p.x); high.y = high.y.max(p.y);
+            }
+        }
+        let pad = 16.0 * f64::EPSILON * low.x.abs().max(low.y.abs()).max(high.x.abs()).max(high.y.abs()).max(1.0);
+        low.x -= pad; low.y -= pad; high.x += pad; high.y += pad;
+        let id = self.nodes.len();
+        self.nodes.push(InteriorSegmentNode { low, high, start, end, children: None });
+        if end - start > 8 {
+            let x_axis = high.x - low.x >= high.y - low.y;
+            self.edges[start..end].sort_by(|(a, b), (c, d)| {
+                let first = if x_axis { a.x + b.x } else { a.y + b.y };
+                let second = if x_axis { c.x + d.x } else { c.y + d.y };
+                first.total_cmp(&second)
+            });
+            let middle = start + (end - start) / 2;
+            let left = self.build(start, middle);
+            let right = self.build(middle, end);
+            self.nodes[id].children = Some([left, right]);
+        }
+        id
+    }
+    fn lower(&self, id: usize, point: Vec2) -> f64 {
+        let node = &self.nodes[id];
+        point.sub(Vec2 { x: point.x.clamp(node.low.x, node.high.x), y: point.y.clamp(node.low.y, node.high.y) }).length()
+    }
+    fn visit(&self, id: usize, point: Vec2, best: &mut f64) {
+        if self.lower(id, point) > *best { return; }
+        let node = &self.nodes[id];
+        if let Some([left, right]) = node.children {
+            let (first, second) = if self.lower(left, point) <= self.lower(right, point) { (left, right) } else { (right, left) };
+            self.visit(first, point, best);
+            self.visit(second, point, best);
+        } else {
+            for &(a, b) in &self.edges[node.start..node.end] {
+                *best = best.min(point_segment_distance(point, a, b));
+            }
+        }
+    }
+    fn distance(&self, point: Vec2) -> f64 {
+        let mut best = f64::INFINITY;
+        self.visit(0, point, &mut best);
+        best
+    }
+}
+
+
+/// [`interior_points`] on the polygons themselves: each cycle use is one
+/// polygon edge (its start is the polygon's vertex), so the loop split's
+/// sampled loops read the same points the arrangement's cycles would.
+pub(super) fn interior_points_in_polygons(
+    outer_polygon: &[Vec2],
+    hole_polygons: &[Vec<Vec2>],
+    area: f64,
+    count: usize,
+) -> Vec<Vec2> {
+    let mode = std::env::var("BREP_FRAGMENT_INTERIOR_INDEX").unwrap_or_else(|_| "on".into());
+    let enabled = mode == "on" || mode == "1";
+    if mode == "check" {
+        let old = interior_points_in_polygons_indexed(outer_polygon, hole_polygons, area, count, false);
+        let new = interior_points_in_polygons_indexed(outer_polygon, hole_polygons, area, count, true);
+        let identical = old.len() == new.len() && old.iter().zip(&new).all(|(a, b)| a.x.to_bits() == b.x.to_bits() && a.y.to_bits() == b.y.to_bits());
+        if let Ok(path) = std::env::var("BREP_INTERIOR_INDEX_CENSUS") {
+            use std::io::Write;
+            if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+                let _ = writeln!(file, "fragment.interior_census identical={identical} edges={} holes={} points={}", outer_polygon.len(), hole_polygons.len(), old.len());
+            }
+        }
+        return old;
+    }
+    interior_points_in_polygons_indexed(outer_polygon, hole_polygons, area, count, enabled)
+}
+
+pub(super) fn interior_points_in_polygons_indexed(
+    outer_polygon: &[Vec2], hole_polygons: &[Vec<Vec2>], area: f64, count: usize, indexed: bool,
+) -> Vec<Vec2> {
     let scale = area.abs().sqrt();
     let mut seen: Vec<(Vec2, f64)> = Vec::new();
     let mut best = None;
     let mut best_clearance = -1.0;
+    let edges = |polygon: &[Vec2]| -> Vec<(Vec2, Vec2)> {
+        (0..polygon.len()).map(|i| (polygon[i], polygon[(i + 1) % polygon.len()])).collect()
+    };
+    let outer_edges = edges(outer_polygon);
+    let hole_edges: Vec<Vec<(Vec2, Vec2)>> = hole_polygons.iter().map(|hole| edges(hole)).collect();
+    let edge_count = outer_edges.len() + hole_edges.iter().map(Vec::len).sum::<usize>();
+    let index = (indexed && edge_count >= 64
+        && std::iter::once(&outer_edges).chain(hole_edges.iter()).flatten().all(|(a, b)| a.x.is_finite() && a.y.is_finite() && b.x.is_finite() && b.y.is_finite()))
+        .then(|| InteriorSegmentIndex::new(std::iter::once(&outer_edges).chain(hole_edges.iter()).flatten().copied().collect()));
     for factor in [0.25, 0.1, 0.05, 0.01, 0.002, 4e-4] {
         let epsilon = scale * factor;
-        for usage in outer {
-            let (a, b) = if usage.forward {
-                (usage.piece.a, usage.piece.b)
-            } else {
-                (usage.piece.b, usage.piece.a)
-            };
+        for &(a, b) in &outer_edges {
             let direction = b.sub(a);
             let length = direction.length();
             if length <= 1e-12 {
@@ -91,23 +199,23 @@ pub(super) fn interior_points(
                 }
                 .scale(epsilon),
             );
-            if !point_in_polygon(candidate, &outer_polygon)
+            if !point_in_polygon(candidate, outer_polygon)
                 || hole_polygons
                     .iter()
                     .any(|hole| point_in_polygon(candidate, hole))
             {
                 continue;
             }
-            let mut clearance = f64::INFINITY;
-            for cycle in std::iter::once(outer).chain(holes.iter().map(Vec::as_slice)) {
-                for edge in cycle {
-                    clearance = clearance.min(point_segment_distance(
-                        candidate,
-                        edge.piece.a,
-                        edge.piece.b,
-                    ));
+            let clearance = match &index {
+                Some(index) => index.distance(candidate),
+                None => {
+                    let mut clearance = f64::INFINITY;
+                    for cycle in std::iter::once(&outer_edges).chain(hole_edges.iter()) {
+                        for (a, b) in cycle { clearance = clearance.min(point_segment_distance(candidate, *a, *b)); }
+                    }
+                    clearance
                 }
-            }
+            };
             seen.push((candidate, clearance));
             if clearance > best_clearance {
                 best = Some(candidate);

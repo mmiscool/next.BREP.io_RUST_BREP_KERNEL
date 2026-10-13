@@ -364,9 +364,17 @@ pub fn menu_row(
 /// switcher. Re-deriving egui's button padding and atom-gap arithmetic here
 /// would go quietly loose or tight the next time either changes.
 pub fn menu_width(ui: &egui::Ui, rows: &[(&str, &str)]) -> f32 {
+    menu_width_salted(ui, "menu-measure", rows)
+}
+
+/// [`menu_width`] under its own probe id, for a menu that measures two
+/// column's rows in one frame (the File menu's workbench and document
+/// columns): two probes under one id would register the same widget ids
+/// at different rects.
+pub fn menu_width_salted(ui: &egui::Ui, salt: &str, rows: &[(&str, &str)]) -> f32 {
     let mut probe = egui::Ui::new(
         ui.ctx().clone(),
-        ui.id().with("menu-measure"),
+        ui.id().with(salt),
         egui::UiBuilder::new()
             .sizing_pass()
             .invisible()

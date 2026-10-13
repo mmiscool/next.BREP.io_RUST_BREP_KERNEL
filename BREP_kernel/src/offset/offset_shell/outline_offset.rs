@@ -854,6 +854,7 @@ pub(super) fn offset_outline_wall(
             }],
         }],
         genus: 0,
+        kind: crate::BodyKind::Solid,
     }))
 }
 

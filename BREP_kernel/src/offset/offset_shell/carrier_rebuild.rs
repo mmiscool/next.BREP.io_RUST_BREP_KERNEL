@@ -335,6 +335,7 @@ pub(super) fn extend_offset_carriers_past_open_hole_rims(
                 }],
             }],
             genus: 0,
+            kind: crate::BodyKind::Solid,
         };
         extended.insert(index);
     }
@@ -1100,6 +1101,7 @@ fn rebuild_carrier_full_domain(
             }],
         }],
         genus: 0,
+        kind: crate::BodyKind::Solid,
     };
     Ok(true)
 }
@@ -2002,6 +2004,16 @@ pub(super) fn fallshort_opening_reach(
 /// 16.788671 against 18.164 for the operation's own definition (a 400³ grid
 /// integral of "the source less every point farther than d from a retained
 /// face"), 7.6% short. That is refused by name instead.
+///
+/// SHORT is a signed reading: the rim's offset image lies on the MATERIAL side
+/// of the opening (the cup's cylinder skin ends 0.4 inside its dome). An image
+/// on the void side is the opposite case — the skin has already crossed the
+/// opening — and the skin meets it where it comes back through, which the
+/// ordinary wall imprint cuts. The reported 2026-10-12 sphere boss, filleted
+/// onto a cylinder that was then subtracted again by the same cylinder, is
+/// one: the fillet is TANGENT to the concave opening along their shared rim,
+/// so its inward image sits exactly d past the opening (r = 4.9 inside the
+/// cut), and an unsigned gap of exactly d refused a shell the pipeline builds.
 pub(super) fn offset_falls_short_of_curved_opening(
     source: &BrepSolid,
     face: &FaceRecord,
@@ -2043,7 +2055,14 @@ pub(super) fn offset_falls_short_of_curved_opening(
             let Ok(image) = offsets.at(uv.x, uv.y, -distance) else {
                 continue;
             };
-            let gap = project_point_to_surface(&opening.surface, image.point).or_refuse(KernelStage::Refine, "project_point_to_surface")?.distance;
+            let foot = project_point_to_surface(&opening.surface, image.point).or_refuse(KernelStage::Refine, "project_point_to_surface")?;
+            // Signed along the opening's OUTWARD normal: negative is the
+            // material side, where the skin ends without reaching. A pole or
+            // an apex has no readable normal; such a station is skipped.
+            let Ok(outward) = face_normal(opening, foot.u, foot.v) else {
+                continue;
+            };
+            let gap = -image.point.sub(foot.point).dot(outward);
             if gap > band && worst.is_none_or(|(_, seen)| gap > seen) {
                 worst = Some((opening.id, gap));
             }

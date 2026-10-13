@@ -531,6 +531,7 @@ fn build_faceted_brep(points: &[Vec3], triangles: &[[usize; 3]]) -> Result<BrepS
         edges,
         shells: vec![ShellRecord { id: next_id, faces }],
         genus: 0,
+        kind: crate::BodyKind::Solid,
     };
     let vertex_count = result.vertices.len() as i64;
     let edge_count = result.edges.len() as i64;

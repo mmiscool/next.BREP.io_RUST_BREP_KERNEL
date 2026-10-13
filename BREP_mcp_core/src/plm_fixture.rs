@@ -97,18 +97,19 @@ pub fn server_binary() -> Result<PathBuf, String> {
         let bin = PathBuf::from(bin);
         return if bin.is_file() { Ok(bin) } else { Err(format!("BREP_PLM_BIN={} is not a file", bin.display())) };
     }
-    let target = Path::new(env!("CARGO_MANIFEST_DIR")).join("../BREP_plm/target");
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let targets = [root.join("../target"), root.join("../BREP_plm/target")];
     let name = if cfg!(windows) { "brep-plm.exe" } else { "brep-plm" };
     let modified = |p: &PathBuf| std::fs::metadata(p).and_then(|m| m.modified()).ok();
-    ["debug", "release"]
+    targets
         .iter()
-        .map(|profile| target.join(profile).join(name))
+        .flat_map(|target| ["debug", "release"].map(|profile| target.join(profile).join(name)))
         .filter(|p| p.is_file())
         .max_by_key(modified)
         .ok_or_else(|| {
             format!(
-                "no brep-plm binary under {} — build it with `cargo build --manifest-path BREP_plm/Cargo.toml --bin brep-plm` or set BREP_PLM_BIN",
-                target.display()
+                "no brep-plm binary under {} or {} — build it with `cargo build --manifest-path BREP_plm/Cargo.toml --bin brep-plm` or set BREP_PLM_BIN",
+                targets[0].display(), targets[1].display()
             )
         })
 }

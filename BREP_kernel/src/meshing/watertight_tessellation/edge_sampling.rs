@@ -85,6 +85,14 @@ pub(super) fn edge_fractions(
     edge: &EdgeRecord,
     chord_tolerance: f64,
 ) -> Result<(Vec<f64>, bool), String> {
+    edge_fractions_with_guard(edge, chord_tolerance, false)
+}
+
+fn edge_fractions_with_guard(
+    edge: &EdgeRecord,
+    chord_tolerance: f64,
+    guard: bool,
+) -> Result<(Vec<f64>, bool), String> {
     if edge.degenerate {
         return Ok((vec![0.0, 1.0], false));
     }
@@ -109,10 +117,10 @@ pub(super) fn edge_fractions(
     // while interior spans wander — the sampled chain then short-circuits
     // whole lobes of the boundary and the face triangulates a region far
     // larger than its trim (the merged revolve-wall faces of the
-    // 2026-07-30 user model meshed at 3x their trimmed area).  Within one
-    // polynomial span the midpoint criterion is sound; across spans it is
-    // not (Golovanov §4.12: steps must budget the whole span, not probe
-    // one midpoint).
+    // 2026-07-30 user model meshed at 3x their trimmed area). Knot seeds
+    // protect spans that a whole-domain midpoint would skip (Golovanov §4.12:
+    // steps must budget the whole span, not probe one midpoint). Single-span
+    // inflections need the optional rectangle boundary guard below as well.
     let span = edge.t1 - edge.t0;
     if span.abs() > 1e-12 && edge.curve.knots.len() > 2 * edge.curve.degree {
         let interior =
@@ -143,9 +151,9 @@ pub(super) fn edge_fractions(
             if fractions.len() <= MAX_EDGE_SPANS {
                 let middle = (pair[0] + pair[1]) * 0.5;
                 let curve_mid = evaluate(middle)?;
-                let chord_sags =
-                    deflection_to_chord(curve_mid, evaluate(pair[0])?, evaluate(pair[1])?)
-                        > chord_tolerance;
+                let a = evaluate(pair[0])?;
+                let b = evaluate(pair[1])?;
+                let mut chord_sags = deflection_to_chord(curve_mid, a, b) > chord_tolerance;
                 // Angular (curvature) criterion: split when the edge's 3D-curve
                 // unit tangent rotates more than `EDGE_ANGULAR_TOL` across the
                 // interval. `t_a · t_b >= cos(EDGE_ANGULAR_TOL)` means the swing
@@ -153,10 +161,23 @@ pub(super) fn edge_fractions(
                 // a small-radius circle on a large part still gets ~2π/tol
                 // segments instead of a coarse polygon. A degenerate tangent at
                 // either end (pole/cusp) leaves the chord criterion in charge.
-                let tangent_swings = match (tangent(pair[0])?, tangent(pair[1])?) {
+                let mut tangent_swings = match (tangent(pair[0])?, tangent(pair[1])?) {
                     (Some(ta), Some(tb)) => ta.dot(tb) < angular_cos,
                     _ => false,
                 };
+                if guard && edge.curve.degree >= 3 {
+                    for q in [0.25, 0.75] {
+                        let f = pair[0] + q * (pair[1] - pair[0]);
+                        chord_sags |= deflection_to_chord(evaluate(f)?, a, b) > chord_tolerance;
+                    }
+                    if let Some(tm) = tangent(middle)? {
+                        for f in [pair[0], pair[1]] {
+                            if let Some(t) = tangent(f)? {
+                                tangent_swings |= t.dot(tm) < angular_cos;
+                            }
+                        }
+                    }
+                }
                 if chord_sags || tangent_swings {
                     refined.push(middle);
                     split_any = true;
@@ -306,15 +327,37 @@ pub(super) fn sample_all_edges(
             continue;
         };
         for coedge in face.loops.iter().flat_map(|record| record.coedges.iter()) {
-            chart_atlases
-                .entry(coedge.edge_id)
-                .or_default()
-                .push(atlas);
+            chart_atlases.entry(coedge.edge_id).or_default().push(atlas);
         }
     }
     let mut samples = HashMap::new();
+    let degenerate_edges: HashSet<u64> = solid
+        .edges
+        .iter()
+        .filter(|e| e.degenerate)
+        .map(|e| e.id)
+        .collect();
+    let guarded: HashSet<u64> = solid
+        .shells
+        .iter()
+        .flat_map(|s| &s.faces)
+        .filter(|f| rectangle_edge_guard(f))
+        // The pole-patch lane owns collapsed rims and their shared seams.
+        .filter(|f| {
+            f.loops[0]
+                .coedges
+                .iter()
+                .all(|c| !degenerate_edges.contains(&c.edge_id))
+        })
+        .flat_map(|f| f.loops[0].coedges.iter().map(|c| c.edge_id))
+        .collect();
     for edge in &solid.edges {
-        let (mut fractions, capped) = edge_fractions(edge, chord_tolerance)?;
+        let guard = guarded.contains(&edge.id) && edge.curve.degree >= 3;
+        let (mut fractions, capped) = if guard {
+            edge_fractions_with_guard(edge, chord_tolerance, true)?
+        } else {
+            edge_fractions(edge, chord_tolerance)?
+        };
         if let Some(atlases) = chart_atlases.get(&edge.id) {
             let mut extra = Vec::new();
             for atlas in atlases {
@@ -354,15 +397,22 @@ pub(super) fn sample_all_edges(
         let mut worst_sag = 0.0f64;
         if capped && !edge.degenerate {
             for index in 0..fractions.len() - 1 {
-                let middle = (fractions[index] + fractions[index + 1]) * 0.5;
-                let curve_mid = edge
-                    .curve
-                    .evaluate(edge.t0 + (edge.t1 - edge.t0) * middle)?;
-                worst_sag = worst_sag.max(deflection_to_chord(
-                    curve_mid,
-                    positions[index],
-                    positions[index + 1],
-                ));
+                let probes: &[f64] = if guard { &[0.25, 0.5, 0.75] } else { &[0.5] };
+                for &q in probes {
+                    let middle = if guard {
+                        fractions[index] + q * (fractions[index + 1] - fractions[index])
+                    } else {
+                        (fractions[index] + fractions[index + 1]) * 0.5
+                    };
+                    let curve_mid = edge
+                        .curve
+                        .evaluate(edge.t0 + (edge.t1 - edge.t0) * middle)?;
+                    worst_sag = worst_sag.max(deflection_to_chord(
+                        curve_mid,
+                        positions[index],
+                        positions[index + 1],
+                    ));
+                }
             }
         }
         samples.insert(

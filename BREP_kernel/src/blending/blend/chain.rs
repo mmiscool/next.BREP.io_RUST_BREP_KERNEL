@@ -22,7 +22,7 @@ pub(in crate::blend) use closed_surgery::signed_area;
 // The marches' own tests drive the chain march directly (`blend/tests`).
 pub(in crate::blend) use collect::collect_smooth_chain;
 use collect::{ChainSegment, SmoothChain};
-pub(in crate::blend) use march::{march_chain, ChainSample, FoldPolicy, CHAIN_PER_SEGMENT};
+pub(in crate::blend) use march::{march_chain, ChainBudget, ChainSample, FoldPolicy, CHAIN_PER_SEGMENT};
 pub(in crate::blend) use march::{march_chain_typed, ChainMarchError};
 pub(in crate::blend) use march::{assign_chain_parameters, chain_dense_contacts, insert_chain_stations, DenseContacts};
 use march::{ChainStationFailure, CHAIN_CARVE_MAX_PER_SEGMENT};

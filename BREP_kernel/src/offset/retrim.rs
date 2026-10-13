@@ -231,6 +231,23 @@ pub(crate) fn rebuild_loop_pcurves(
     tolerance: f64,
     op: &str,
 ) -> Result<(), KernelRefusal> {
+    let closed = surface
+        .closed_directions()
+        .or_refuse(KernelStage::Refine, "closed_directions")?;
+    let periods = [
+        if closed.0 {
+            let [a, b] = surface.domain_u().or_refuse(KernelStage::Refine, "domain_u")?;
+            b - a
+        } else {
+            0.0
+        },
+        if closed.1 {
+            let [a, b] = surface.domain_v().or_refuse(KernelStage::Refine, "domain_v")?;
+            b - a
+        } else {
+            0.0
+        },
+    ];
     for loop_record in &mut face.loops {
         for coedge in &mut loop_record.coedges {
             let edge = edges
@@ -240,7 +257,7 @@ pub(crate) fn rebuild_loop_pcurves(
             let span = (d1 - d0).max(1e-12);
             let is_subrange =
                 (edge.t0 - d0).abs() > 1e-9 * span || (edge.t1 - d1).abs() > 1e-9 * span;
-            coedge.pcurve = if is_subrange {
+            let mut pcurve = if is_subrange {
                 build_pcurve_on_surface_range(
                     surface,
                     &edge.curve,
@@ -256,6 +273,33 @@ pub(crate) fn rebuild_loop_pcurves(
                 }
                 pcurve
             };
+            // The 3D edge does not distinguish periodic chart images. In
+            // particular, the two uses of a seam project onto the same image,
+            // although the wire needs one on each side of the period. Keep
+            // the branch of THIS coedge rather than collapsing the seam pair.
+            // Carrier growth remaps the old pcurves before reaching here.
+            if closed.0 || closed.1 {
+                let [old_t0, _] = coedge.pcurve.domain().or_refuse(KernelStage::Refine, "domain")?;
+                let [new_t0, _] = pcurve.domain().or_refuse(KernelStage::Refine, "domain")?;
+                let old_start = coedge.pcurve.evaluate(old_t0)
+                    .or_refuse(KernelStage::Refine, "evaluate")?;
+                let new_start = pcurve.evaluate(new_t0)
+                    .or_refuse(KernelStage::Refine, "evaluate")?;
+                let shift = |old: f64, new: f64, period: f64| {
+                    if period > 0.0 {
+                        ((old - new) / period).round() * period
+                    } else {
+                        0.0
+                    }
+                };
+                let du = shift(old_start.x, new_start.x, periods[0]);
+                let dv = shift(old_start.y, new_start.y, periods[1]);
+                for control in &mut pcurve.control_points {
+                    control.x += du * control.w;
+                    control.y += dv * control.w;
+                }
+            }
+            coedge.pcurve = pcurve;
         }
     }
     Ok(())

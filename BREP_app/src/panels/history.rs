@@ -36,9 +36,11 @@
 use crate::automation::hit_keys::HitKeyDoc;
 use crate::form_view::{form_view, FormViewSpec};
 use crate::panels::spline_anchors;
+use crate::panels::cage_editor;
 use crate::palette::{Palette, PaletteItem};
 use crate::panels::tree::{self, TreeRow};
 use brep_render::engine_state::EngineState;
+use brep_render::engine_state::RefSelectTarget;
 use brep_render::features;
 use eframe::egui;
 use serde_json::Value;
@@ -348,8 +350,10 @@ impl HistoryPanel {
         // --- THE MODE SWITCH: the tree, or ONE feature's form -----------------
         match self.mode.clone() {
             PanelMode::Tree => {
-                // No spline form is open: no anchor cage in the viewport.
+                // No spline form is open: no anchor cage in the viewport; no
+                // NURBS Solid form: no control cage either.
                 state.refresh_spline_edit_overlay(None, None);
+                state.refresh_cage_edit_overlay(None);
                 self.show_tree(ui, state, &report);
             }
             PanelMode::Form { feature_id } => self.show_form(ui, state, &report, &feature_id),
@@ -510,6 +514,30 @@ impl HistoryPanel {
             spline_anchors::draw(ui, &anchor_rows, anchor_selected, &anchor_intents, &anchor_hits);
         };
 
+        // A NURBS SOLID's editing surface is its control cage: the points are
+        // viewport handles (the engine owns the selection, armed as the
+        // transform gizmo's subject), and the form's consumer section carries
+        // the loop selections, the loop insertions and Reset. Intent-out like
+        // the anchors. See [`super::cage_editor`].
+        let is_cage = ty == "NS";
+        let cage_summary = if is_cage { state.cage_summary(id) } else { None };
+        let cage_points = if is_cage { state.cage_points(id) } else { Vec::new() };
+        let cage_selected = if is_cage && state.cage_armed_for(id) { state.cage_selected() } else { Vec::new() };
+        let cage_intents: std::cell::RefCell<Vec<cage_editor::CageIntent>> =
+            std::cell::RefCell::new(Vec::new());
+        let cage_hits: std::cell::RefCell<Vec<(String, egui::Rect)>> =
+            std::cell::RefCell::new(Vec::new());
+        let draw_cage = |ui: &mut egui::Ui| {
+            cage_editor::draw(ui, cage_summary.as_ref(), &cage_points, &cage_selected, &cage_intents, &cage_hits);
+        };
+
+        // The reference pick running in THIS feature's form, if one is: that
+        // field draws focused, lists the engine's running picks and ends the
+        // pick from its own button. (A spline anchor's port pick is not a form
+        // field's — it keeps the top-right card and never matches here.)
+        let picking = state
+            .ref_select_field()
+            .filter(|f| f.target == RefSelectTarget::Feature && f.subject == id);
         let spec = FormViewSpec {
             title: &title,
             subtitle: None,
@@ -518,7 +546,14 @@ impl HistoryPanel {
             banner,
             trailing: Some(trailing.as_slice()),
             exit_label: "Return to tree",
-            extra: is_spline.then_some(("Anchors", &draw_anchors as &dyn Fn(&mut egui::Ui))),
+            extra: if is_spline {
+                Some(("Anchors", &draw_anchors as &dyn Fn(&mut egui::Ui)))
+            } else if is_cage {
+                Some(("Cage", &draw_cage as &dyn Fn(&mut egui::Ui)))
+            } else {
+                None
+            },
+            picking: picking.as_ref().map(|f| crate::form::ActivePick { path: &f.path, names: &f.names }),
             // A feature LIVES in the rolled history, so leaving its form rolls to
             // the tip (Q2). Declared here, acted on below via `out.roll_to_tip`.
             rollback: true,
@@ -533,6 +568,9 @@ impl HistoryPanel {
         for (key, rect) in anchor_hits.into_inner() {
             self.hits.insert(key, rect);
         }
+        for (key, rect) in cage_hits.into_inner() {
+            self.hits.insert(key, rect);
+        }
         if is_spline {
             // ONE anchor intent per frame (each is a document edit + re-run).
             if let Some(intent) = anchor_intents.into_inner().into_iter().next() {
@@ -541,6 +579,15 @@ impl HistoryPanel {
             state.refresh_spline_edit_overlay(Some(id), self.anchor_selected);
         } else {
             state.refresh_spline_edit_overlay(None, None);
+        }
+        if is_cage {
+            // ONE cage intent per frame (each is a document edit + re-run).
+            if let Some(intent) = cage_intents.into_inner().into_iter().next() {
+                cage_editor::apply(state, id, intent);
+            }
+            state.refresh_cage_edit_overlay(Some(id));
+        } else {
+            state.refresh_cage_edit_overlay(None);
         }
 
         // WHICH feature the form is showing, as a presence-only zero-size rect
@@ -556,16 +603,42 @@ impl HistoryPanel {
             egui::Rect::from_min_size(anchor, egui::Vec2::ZERO),
         );
 
+        // The focused reference field's own intents: an `✕` drops a running
+        // pick; `Done` commits the list.
+        if let Some(index) = out.pick_remove {
+            state.ref_select_remove(index);
+        }
+        if out.pick_done {
+            state.finish_ref_select();
+        }
         if out.changed {
             let _ = state.update_feature_params(id, &params.to_string());
+            // An edit elsewhere on the form while a pick runs ends the pick
+            // (at the end of the frame, see `ref_select_request_finish`): the
+            // model is rolled to BEFORE this feature while its field is being
+            // picked, so the edit would otherwise show nothing until the pick
+            // ended, and the user has moved on. The picks made so far commit
+            // with it.
+            if picking.is_some() {
+                state.ref_select_request_finish();
+            }
         }
         // A button click (e.g. `editSketch`) binds to no param — stage it as a
         // deferred action keyed by (feature id, button key); `show` acts after the
-        // draw so no engine mutation happens mid-render.
+        // draw so no engine mutation happens mid-render. A running pick ends
+        // first: the sketcher it may open is a mode of its own.
         if let Some(key) = out.button_clicked {
+            if picking.is_some() {
+                state.finish_ref_select();
+            }
             self.pending_button = Some((id.to_string(), key));
         }
         if let Some(activate) = out.ref_activate {
+            // Focus moves from one selection box to the next: the pick running
+            // in another field (of this form, or a stale one) commits first.
+            if state.ref_select_active() {
+                state.finish_ref_select();
+            }
             state.begin_ref_select(
                 id,
                 activate.path,
@@ -592,7 +665,23 @@ impl HistoryPanel {
             ui.ctx().request_repaint();
         }
         if out.exit_clicked {
+            // Leaving the form commits the pick running in it, BEFORE the roll
+            // to the tip below: finishing restores the pick's own roll (this
+            // feature's step), so it has to come first or the tip would be
+            // rolled back from under the user.
+            if state.ref_select_field().is_some_and(|f| f.target == RefSelectTarget::Feature) {
+                state.finish_ref_select();
+            }
             self.mode = PanelMode::Tree;
+        }
+        // This form drew the pick this frame (or opened it): the shell finishes
+        // an in-form pick that no form claims, so a pick never runs on with its
+        // field off the screen.
+        if state
+            .ref_select_field()
+            .is_some_and(|f| f.target == RefSelectTarget::Feature && f.subject == id)
+        {
+            state.ref_select_claim();
         }
         if out.roll_to_tip {
             // Finished editing → return the model to the TIP so the WHOLE history
@@ -1023,6 +1112,10 @@ impl HistoryPanel {
                     #[cfg(not(target_arch = "wasm32"))]
                     eprintln!("Edit Sketch failed for '{feature_id}': {_err}");
                 }
+            },
+            brep_render::brep_kernel::SKETCH3D_EDIT_BUTTON => match state.enter_sketch3d_mode(feature_id) {
+                Ok(_) => self.mode = PanelMode::Tree,
+                Err(error) => state.push_notice(format!("Edit 3D Sketch: {error}")),
             },
             _ => {}
         }

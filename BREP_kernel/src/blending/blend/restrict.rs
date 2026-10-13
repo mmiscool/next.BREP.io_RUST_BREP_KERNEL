@@ -1902,7 +1902,14 @@ fn apply_restriction(
                 plan.obstacle_face
             )));
         };
-        super::network::apply_carrier_seam_split(result, take_id, split)?;
+        match split {
+            super::network::CarrierSeamRepair::Split(split) => {
+                super::network::apply_carrier_seam_split(result, take_id, split)?;
+            }
+            super::network::CarrierSeamRepair::Trim(trim) => {
+                super::network::apply_carrier_seam_trim(result, trim)?;
+            }
+        }
     }
     for face in [plan.blend_face, plan.obstacle_face, plan.mate_face].into_iter().chain(split_off) {
         check_loops_closed(result, face)?;
@@ -2295,7 +2302,17 @@ fn under_the_arc(
 /// Whether `(u, v)` lies inside a face's trimmed region, at a uv band
 /// equivalent to the model band there (capped, as the classifier caps it).
 fn uv_inside_face(face: &FaceRecord, u: f64, v: f64, spatial: f64) -> Result<bool, KernelRefusal> {
-    let derivatives = face.surface.derivatives(u, v, 1).or_refuse(KernelStage::Refine, "derivatives")?;
+    let band = uv_band(face, u, v, spatial).or_refuse(KernelStage::Refine, "derivatives")?;
+    Ok(matches!(
+        crate::parameter_point_in_face(face, crate::Vec2 { x: u, y: v }, band).or_refuse(KernelStage::Refine, "parameter_point_in_face")?,
+        crate::PolygonClass::Inside
+    ))
+}
+
+/// [`uv_inside_face`]'s band: the uv width of `spatial` at (u, v), capped
+/// to a twentieth of the smaller domain span.
+fn uv_band(face: &FaceRecord, u: f64, v: f64, spatial: f64) -> Result<f64, String> {
+    let derivatives = face.surface.derivatives(u, v, 1)?;
     let band = crate::tolerance::surface_uv_tolerance(
         spatial,
         derivatives[1][0].length(),
@@ -2305,10 +2322,7 @@ fn uv_inside_face(face: &FaceRecord, u: f64, v: f64, spatial: f64) -> Result<boo
         (Ok([a0, a1]), Ok([b0, b1])) => ((a1 - a0).min(b1 - b0) * 0.05).max(1e-12),
         _ => f64::INFINITY,
     };
-    Ok(matches!(
-        crate::parameter_point_in_face(face, crate::Vec2 { x: u, y: v }, band.min(cap)).or_refuse(KernelStage::Refine, "parameter_point_in_face")?,
-        crate::PolygonClass::Inside
-    ))
+    Ok(band.min(cap))
 }
 
 /// The axis-aligned box of a surface over its domain, sampled.
@@ -2684,9 +2698,13 @@ pub(in crate::blend) fn restrict_closures(
         return Ok(0);
     }
     let classifier = crate::SolidClassifier::new(original, policy.model).or_refuse(KernelStage::Refine, "new")?;
+    // Each probe's side is read off its nearest face where that read is
+    // rigorous (`NearestFaceSide`), and cast as a ray otherwise.
+    let nearest = crate::fillet::NearestFaceSide::new(original, policy.model).or_refuse(KernelStage::Refine, "nearest_face")?;
     let mut applied = 0usize;
     for &closure in closures {
         let Some(face) = face_of(result, closure) else { continue };
+        let neighbours_timing = crate::blend::BlendTimer::start("timing.restriction.closure.neighbours_ms");
         let own: Vec<u64> = face_edges(face).into_iter().map(|(_, _, id)| id).collect();
         let neighbours: Vec<u64> = result
             .shells
@@ -2696,32 +2714,44 @@ pub(in crate::blend) fn restrict_closures(
             .filter(|other| face_edges(other).iter().any(|(_, _, id)| own.contains(id)))
             .map(|other| other.id)
             .collect();
+        neighbours_timing.stop();
         // Convexity, by majority over a grid of the closure's interior: one
         // probe can land inside the very void under the closure (the cone's
         // middle sits over the bore), and read as air.
-        let [u0, u1] = face.surface.domain_u().or_refuse(KernelStage::Refine, "domain_u")?;
-        let [v0, v1] = face.surface.domain_v().or_refuse(KernelStage::Refine, "domain_v")?;
+        let convexity_timing = crate::blend::BlendTimer::start("timing.restriction.closure.convexity_ms");
+        crate::classification::classify_profile_begin();
+        crate::classification::containment_profile_begin();
+        face.surface.domain_u().or_refuse(KernelStage::Refine, "domain_u")?;
+        face.surface.domain_v().or_refuse(KernelStage::Refine, "domain_v")?;
         let (mut inside, mut outside) = (0usize, 0usize);
         const GRID: usize = 7;
-        for i in 1..GRID {
-            for j in 1..GRID {
-                let (u, v) = (
-                    u0 + (u1 - u0) * i as f64 / GRID as f64,
-                    v0 + (v1 - v0) * j as f64 / GRID as f64,
-                );
-                if !uv_inside_face(face, u, v, policy.model)? {
-                    continue;
-                }
-                let point = face.surface.evaluate(u, v).or_refuse(KernelStage::Refine, "evaluate")?;
-                let normal = outward_normal(face, u, v)?;
-                let probe = point.add(normal.scale(size * 0.05));
-                match classifier.classify(probe).or_refuse(KernelStage::Refine, "classify")?.class {
-                    crate::PointClass::In => inside += 1,
-                    crate::PointClass::Out => outside += 1,
-                    crate::PointClass::On => {}
-                }
+        // The lattice's interior nodes (`uv_inside_face`'s own band), the
+        // far ones answered by one query (`face_grid_classes`).
+        let band_at = |uv: crate::Vec2| uv_band(face, uv.x, uv.y, policy.model);
+        for (uv, class) in crate::fillet::face_grid_classes(face, GRID, &band_at) {
+            let (u, v) = (uv.x, uv.y);
+            match class {
+                None | Some(Ok(crate::PolygonClass::Outside | crate::PolygonClass::Boundary)) => continue,
+                Some(Err(error)) => return Err(KernelRefusal::internal(KernelStage::Refine, "parameter_point_in_face", error)),
+                Some(Ok(crate::PolygonClass::Inside)) => {}
+            }
+            let point = face.surface.evaluate(u, v).or_refuse(KernelStage::Refine, "evaluate")?;
+            let normal = outward_normal(face, u, v)?;
+            let probe = point.add(normal.scale(size * 0.05));
+            crate::blend::record_count("count.restriction.closure.probes", 1);
+            let class = match nearest.side(probe) {
+                Some(class) => class,
+                None => classifier.classify(probe).or_refuse(KernelStage::Refine, "classify")?.class,
+            };
+            match class {
+                crate::PointClass::In => inside += 1,
+                crate::PointClass::Out => outside += 1,
+                crate::PointClass::On => {}
             }
         }
+        convexity_timing.stop();
+        crate::classification::classify_profile_report("blend.restriction.closure");
+        crate::classification::containment_profile_report("blend.restriction.closure");
         if inside == outside {
             if std::env::var("BREP_DEBUG_NETWORK").is_ok() {
                 eprintln!("blend restriction: closure face {closure}: convexity undecided ({inside} in, {outside} out), left alone");
@@ -2736,10 +2766,15 @@ pub(in crate::blend) fn restrict_closures(
             );
         }
         for _ in 0..OBSTACLE_BUDGET {
-            let Some(plan) = plan_void(result, closure, &neighbours, convex, size, policy)? else {
+            let plan_timing = crate::blend::BlendTimer::start("timing.restriction.closure.plan_ms");
+            let plan = plan_void(result, closure, &neighbours, convex, size, policy)?;
+            plan_timing.stop();
+            let Some(plan) = plan else {
                 break;
             };
+            let apply_timing = crate::blend::BlendTimer::start("timing.restriction.closure.apply_ms");
             apply_void(result, take_id, plan)?;
+            apply_timing.stop();
             applied += 1;
         }
     }

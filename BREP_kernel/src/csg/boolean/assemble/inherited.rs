@@ -108,6 +108,62 @@ fn checked_loop_gap(face: &crate::FaceRecord, loop_index: usize, overrides: &Has
     Some(worst)
 }
 
+/// A cylinder range fit interpolates the analytic projections of its two
+/// edge endpoints. Branch repair preserves those stations; periodic alignment
+/// changes only their chart branch. Test these fixed endpoints against their
+/// loop neighbours before fitting the interior: if either joint would exceed
+/// the existing loop bar, the completed candidate would be discarded anyway.
+/// Other carriers keep the full fitting and admission path.
+fn endpoint_join_blocked(
+    face: &crate::FaceRecord,
+    loop_index: usize,
+    coedge_index: usize,
+    edge: &crate::topology::EdgeRecord,
+    overrides: Option<&HashMap<usize, NurbsCurve>>,
+    bar: f64,
+) -> bool {
+    let Some(analytic @ crate::AnalyticSurface::RuledRevolution { rho0, rho1, .. }) = face.surface.analytic() else {
+        return false;
+    };
+    // A rigidly transformed cylinder's two reconstructed radii can differ
+    // by a few ulps. This rounding band excludes cones and their apex repair.
+    let radial_rounding = 64.0 * f64::EPSILON * rho0.abs().max(rho1.abs());
+    if !(*rho0 > 0.0 && *rho1 > 0.0 && (rho0 - rho1).abs() <= radial_rounding)
+        || !matches!(face.surface.closed_directions(), Ok((true, false)))
+    {
+        return false;
+    }
+    let coedges = &face.loops[loop_index].coedges;
+    let count = coedges.len();
+    // A one-coedge loop replaces both sides of its own joint.
+    if count < 2 { return false; }
+    let forward = coedges[coedge_index].forward;
+    for (index, at_end, parameter) in [
+        ((coedge_index + count - 1) % count, true, if forward { edge.t0 } else { edge.t1 }),
+        ((coedge_index + 1) % count, false, if forward { edge.t1 } else { edge.t0 }),
+    ] {
+        let trim = overrides.and_then(|m| m.get(&index)).unwrap_or(&coedges[index].pcurve);
+        let Ok([start, end]) = trim.domain() else { continue };
+        let Ok(uv) = trim.evaluate(if at_end { end } else { start }) else { continue };
+        let Ok(neighbour) = face.surface.evaluate_extended(uv.x, uv.y) else { continue };
+        let Ok(point) = edge.curve.evaluate(parameter) else { continue };
+        let Some(projected) = analytic.project(&face.surface, point) else { continue };
+        // Allow rounding from interpolation and periodic chart alignment.
+        let rounding = 64.0 * f64::EPSILON * (1.0 + neighbour.length() + projected.point.length());
+        let gap = neighbour.sub(projected.point).length();
+        // Most unchanged endpoints already meet the bare bar. Only read
+        // the whole loop when its existing gap could affect the decision.
+        if gap.is_finite() && gap > bar + rounding {
+            let Some(before) = checked_loop_gap(face, loop_index, &HashMap::default()) else { continue };
+            let allowed = before.max(bar);
+            if allowed.is_finite() && gap > allowed + rounding {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// `curve` reparameterised affinely onto [0, 1] (the same geometry: the
 /// knots mapped, the controls kept), so a restricted trim reads at coedge
 /// fractions as the common reader assumes.
@@ -181,13 +237,24 @@ fn edge_point_at(edge: &crate::topology::EdgeRecord, forward: bool) -> impl Fn(f
 /// The old trim's tracking at its use's probes, on [0, 1]; None if unread.
 fn old_tracking(face: &crate::FaceRecord, edge: &crate::topology::EdgeRecord, coedge: &crate::topology::CoedgeRecord) -> Option<(NurbsCurve, f64)> {
     let old = on_unit_domain(&coedge.pcurve)?;
-    let probes = use_probes(&[&old], edge, coedge.forward)?;
-    let evaluate = edge_point_at(edge, coedge.forward);
-    let ((tracking, _), _) = crate::pcurve::common_station_read(&face.surface, &evaluate, &old, &old, &probes).ok()?;
-    tracking.is_finite().then_some((old, tracking))
+    // A pure function of this use's content, served from the reading memo
+    // when the same use was read before (`reading_memo.rs`).
+    let tracking = crate::reading_memo::memoized(
+        crate::reading_memo::Reading::OldTracking,
+        crate::mass_properties::coedge_use_identity(&face.surface, &coedge.pcurve, edge, coedge.forward),
+        || {
+            let probes = use_probes(&[&old], edge, coedge.forward)?;
+            let evaluate = edge_point_at(edge, coedge.forward);
+            let ((tracking, _), _) = crate::pcurve::common_station_read(&face.surface, &evaluate, &old, &old, &probes).ok()?;
+            tracking.is_finite().then_some(tracking)
+        },
+    )?;
+    Some((old, tracking))
 }
 
+
 fn candidate(face: &crate::FaceRecord, edge: &crate::topology::EdgeRecord, coedge: &crate::topology::CoedgeRecord, old: &NurbsCurve, bar: f64) -> UseRead {
+
     let forward = coedge.forward;
     let Ok(fit) = crate::fit_pcurve_on_surface_range(&face.surface, &edge.curve, edge.t0, edge.t1, forward, bar) else {
         return UseRead::Declined("range lane refused".into());
@@ -370,8 +437,21 @@ pub(in crate::boolean) fn challenge_inherited_trims(
     boundary: &HashMap<u64, (u8, u64)>,
     constructed: &HashSet<u64>,
 ) -> Result<Vec<ReplacedTrim>, KernelRefusal> {
+    challenge_inherited_trims_in(solid, tolerance, boundary, constructed, None)
+}
+
+/// [`challenge_inherited_trims`] over the edges with a use on a face in
+/// `scope` (`None` reads every edge): a boolean passes the faces it touched
+/// and their neighbours.
+pub(in crate::boolean) fn challenge_inherited_trims_in(
+    solid: &mut BrepSolid,
+    tolerance: f64,
+    boundary: &HashMap<u64, (u8, u64)>,
+    constructed: &HashSet<u64>,
+    scope: Option<&HashSet<u64>>,
+) -> Result<Vec<ReplacedTrim>, KernelRefusal> {
     let enabled = std::env::var("BREP_INHERITED_TRIM_REFIT").as_deref() != Ok("0");
-    challenge_inherited_trims_with(solid, tolerance, boundary, constructed, enabled)
+    challenge_inherited_trims_with(solid, tolerance, boundary, constructed, enabled, scope)
 }
 
 /// [`challenge_inherited_trims`] with the hatch's value passed in. Returns
@@ -383,6 +463,7 @@ pub(super) fn challenge_inherited_trims_with(
     boundary: &HashMap<u64, (u8, u64)>,
     constructed: &HashSet<u64>,
     enabled: bool,
+    scope: Option<&HashSet<u64>>,
 ) -> Result<Vec<ReplacedTrim>, KernelRefusal> {
     if !enabled {
         return Ok(Vec::new());
@@ -413,7 +494,19 @@ pub(super) fn challenge_inherited_trims_with(
         if edge_uses.len() != 2 || edge_uses[0].0 == edge_uses[1].0 {
             continue;
         }
+        if scope.is_some_and(|scope| edge_uses.iter().all(|&(face_index, _, _)| !scope.contains(&faces[face_index].id))) {
+            continue;
+        }
         if edge_uses.iter().any(|&(face_index, _, _)| faces[face_index].surface.is_affine().unwrap_or(true)) {
+            continue;
+        }
+        if edge_uses.iter().any(|&(face_index, loop_index, coedge_index)| {
+            endpoint_join_blocked(faces[face_index], loop_index, coedge_index, edge,
+                accepted.get(&(face_index, loop_index)), bar)
+        }) {
+            if debug {
+                eprintln!("inherited: edge {} {:?} (operand {operand} edge {source_edge}) pair left unchanged: the refit's fixed endpoint would open its loop", edge.id, edge.name);
+            }
             continue;
         }
         let olds: Vec<Option<(NurbsCurve, f64)>> = edge_uses.iter().map(|u| old_tracking(faces[u.0], edge, &faces[u.0].loops[u.1].coedges[u.2])).collect();

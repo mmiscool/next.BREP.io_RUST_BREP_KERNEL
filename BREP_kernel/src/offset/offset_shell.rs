@@ -86,6 +86,12 @@ mod outline_offset;
 mod vacated_rim;
 #[path = "offset_shell/pipeline.rs"]
 mod pipeline;
+#[path = "offset_shell/acceptance.rs"]
+mod acceptance;
+#[path = "offset_shell/profile.rs"]
+mod profile;
+#[path = "offset_shell/solid.rs"]
+mod solid;
 #[path = "offset_shell/refusals.rs"]
 mod refusals;
 
@@ -99,6 +105,7 @@ use rim_welds::*;
 use smooth_sync::*;
 
 pub use pipeline::{offset_shell, offset_shell_with_diagnostics};
+pub use solid::{offset_shell_by_boolean, offset_solid, OffsetCorners};
 pub(crate) use refusals::{is_offset_shell_no_retained_face, is_offset_shell_open_curved_rim};
 pub(crate) use orientation::{flip_all_faces, flip_shell_faces, orient_open_solid_faces};
 

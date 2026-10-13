@@ -364,3 +364,183 @@ pub(in crate::blend) fn corner_faces<'a>(
     }
     Ok(prepared)
 }
+
+// ======================================================================
+// The rail/rail point
+// ======================================================================
+//
+// Two stripes of DIFFERENT radii bordering one face have no common ball at
+// the vertex: there is no sphere tangent to the shared face and to both
+// side faces at both radii.  What they do share is a POINT of the shared
+// face — the point where their two rails on it cross — and the catalogue's
+// construction ends both stripes there.  That point is the one contact p on
+// the shared face F such that the ball of stripe A rolling on F and its side
+// face S_A touches F at p, and the ball of stripe B rolling on F and S_B
+// touches F at p too: two balls on one normal line of F at their own
+// heights,
+//
+//     p_F + ρ_A·n_F = p_A + ρ_A·n_A       (A's ball, on F and S_A)
+//     p_F + ρ_B·n_F = p_B + ρ_B·n_B       (B's ball, on F and S_B)
+//
+// — six unknowns (the parameters of p on F and of the two side contacts),
+// six equations, the march's own offset evaluators (`blend_offset`), and
+// the same damped Gauss-Newton as the corner ball above, seeded at the
+// vertex.  Where the two radii are equal this is the corner ball's own
+// contact on F, which is what `solve_corner_ball` finds in that case.
+
+/// The point where two stripes' rails on one shared face cross.
+pub(in crate::blend) struct RailRailPoint {
+    /// The point on the shared face.
+    pub(in crate::blend) point: Vec3,
+    /// Its parameters on the shared face.
+    pub(in crate::blend) uv: [f64; 2],
+    /// The two balls' centres there, in the order the stripes were given.
+    pub(in crate::blend) centers: [Vec3; 2],
+    /// Worst disagreement between the per-ball offset evaluations at
+    /// convergence, in model units.
+    pub(in crate::blend) residual: f64,
+}
+
+/// One stripe's part in a rail/rail solve: its side face (the mate that is
+/// NOT the shared face), with the signed radius the stripe is marched at on
+/// the shared face and on that side face.
+pub(in crate::blend) struct RailRailStripe<'a> {
+    pub(in crate::blend) side: &'a FaceRecord,
+    /// Signed ρ on the SHARED face: `centre = p_F + rho_shared·n_F(p_F)`.
+    pub(in crate::blend) rho_shared: f64,
+    /// Signed ρ on the side face: `centre = p_S + rho_side·n_S(p_S)`.
+    pub(in crate::blend) rho_side: f64,
+}
+
+/// Solve the rail/rail point of `stripes` on `shared`, seeded at `corner`
+/// (the vertex), to the corner ball's own bar (`1e-11·(1 + scale)`).
+pub(in crate::blend) fn solve_rail_rail_point(
+    shared: &FaceRecord,
+    stripes: [&RailRailStripe<'_>; 2],
+    corner: Vec3,
+    scale: f64,
+) -> Result<RailRailPoint, KernelRefusal> {
+    let seed = |face: &FaceRecord| -> Result<[f64; 2], KernelRefusal> {
+        let projection = crate::project_point_to_surface(&face.surface, corner)
+            .or_refuse(KernelStage::Collect, "project")?;
+        Ok([projection.u, projection.v])
+    };
+    let shared_seed = seed(shared)?;
+    let mut x: Vec<f64> = vec![shared_seed[0], shared_seed[1]];
+    for stripe in stripes {
+        let side_seed = seed(stripe.side)?;
+        x.extend_from_slice(&side_seed);
+    }
+    let offset_shared = blend_offset(&shared.surface);
+    let offsets_side = [blend_offset(&stripes[0].side.surface), blend_offset(&stripes[1].side.surface)];
+    // Six residual rows: each ball's centre read off the shared face minus
+    // the same centre read off that stripe's side face.
+    let residual = |x: &[f64]| -> Result<Vec<f64>, KernelRefusal> {
+        let mut rows = Vec::with_capacity(6);
+        for (index, stripe) in stripes.iter().enumerate() {
+            let on_shared = offset_shared
+                .at(x[0], x[1], stripe.rho_shared)
+                .or_refuse(KernelStage::Refine, "offset_at")?
+                .point;
+            let on_side = offsets_side[index]
+                .at(x[2 + 2 * index], x[3 + 2 * index], stripe.rho_side)
+                .or_refuse(KernelStage::Refine, "offset_at")?
+                .point;
+            let delta = on_shared.sub(on_side);
+            rows.extend_from_slice(&[delta.x, delta.y, delta.z]);
+        }
+        Ok(rows)
+    };
+    let tolerance = 1e-11 * (1.0 + scale);
+    let step = 1e-7;
+    let mut current = residual(&x)?;
+    for _ in 0..CORNER_ITERATIONS {
+        if norm(&current) <= tolerance {
+            break;
+        }
+        let mut jacobian = vec![vec![0.0f64; 6]; 6];
+        for column in 0..6 {
+            let mut probe = x.clone();
+            probe[column] += step;
+            let probed = residual(&probe)?;
+            for row in 0..6 {
+                jacobian[row][column] = (probed[row] - current[row]) / step;
+            }
+        }
+        let delta = fit::solve_dense(jacobian, current.clone()).map_err(|error| {
+            KernelRefusal::ill_posed(
+                KernelStage::Refine,
+                "singular_jacobian",
+                format!("rail/rail point: Newton is singular ({error})"),
+            )
+        })?;
+        let mut accepted = false;
+        let mut damping = 1.0f64;
+        for _ in 0..8 {
+            let trial: Vec<f64> = x
+                .iter()
+                .zip(&delta)
+                .map(|(value, correction)| value - damping * correction)
+                .collect();
+            if let Ok(trial_residual) = residual(&trial) {
+                if norm(&trial_residual) < norm(&current) {
+                    x = trial;
+                    current = trial_residual;
+                    accepted = true;
+                    break;
+                }
+            }
+            damping *= 0.5;
+        }
+        if !accepted {
+            break;
+        }
+    }
+    let final_residual = norm(&current);
+    if final_residual > tolerance {
+        return Err(KernelRefusal::non_convergence(
+            KernelStage::Refine,
+            "rail_rail_point",
+            format!(
+                "rail/rail point: the two balls' contacts on face {} do not meet \
+                 (residual {final_residual:.3e} > {tolerance:.3e})",
+                shared.id
+            ),
+        ));
+    }
+    // The root is only a rail/rail point if every contact landed on its
+    // CARRIER, by the corner ball's own test (`on_real_carrier`).
+    let carriers = [
+        (&offset_shared, x[0], x[1], shared.id),
+        (&offsets_side[0], x[2], x[3], stripes[0].side.id),
+        (&offsets_side[1], x[4], x[5], stripes[1].side.id),
+    ];
+    for (offset, u, v, face_id) in carriers {
+        if !offset
+            .on_real_carrier(u, v, tolerance)
+            .or_refuse(KernelStage::Refine, "on_real_carrier")?
+        {
+            return Err(KernelRefusal::unsupported(
+                KernelStage::Refine,
+                "carrier_extension",
+                format!(
+                    "rail/rail point: the contact on face {face_id} converged onto a fictitious \
+                     EXTENSION of that carrier (u={u:.6}, v={v:.6}); no pair of balls at these \
+                     radii touches the real faces at one point"
+                ),
+            ));
+        }
+    }
+    let sample = offset_shared
+        .at(x[0], x[1], stripes[0].rho_shared)
+        .or_refuse(KernelStage::Refine, "offset_at")?;
+    let second = offset_shared
+        .at(x[0], x[1], stripes[1].rho_shared)
+        .or_refuse(KernelStage::Refine, "offset_at")?;
+    Ok(RailRailPoint {
+        point: sample.source,
+        uv: [x[0], x[1]],
+        centers: [sample.point, second.point],
+        residual: final_residual,
+    })
+}

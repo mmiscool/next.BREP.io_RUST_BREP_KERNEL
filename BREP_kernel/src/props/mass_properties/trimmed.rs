@@ -1,5 +1,32 @@
 use super::*;
 use super::mass_profile;
+use std::cell::Cell;
+
+thread_local! {
+    /// While set, [`curved_boundary_correction`] skips the chords whose
+    /// pcurve is straight in uv ([`is_straight_in_uv`]): their sliver has no
+    /// area and the correction is zero to rounding. Set only by
+    /// [`with_straight_corrections_skipped`], for the volume SIGN reading;
+    /// the exact integration never sees it.
+    static SKIP_STRAIGHT_CORRECTIONS: Cell<bool> = const { Cell::new(false) };
+    /// How many chords were skipped so far on this thread (a test reads the
+    /// delta to prove the route was taken).
+    static STRAIGHT_CORRECTIONS_SKIPPED: Cell<u64> = const { Cell::new(0) };
+}
+
+/// Run `f` with the straight-chord corrections skipped (see
+/// [`SKIP_STRAIGHT_CORRECTIONS`]); the flag is restored afterwards.
+pub(super) fn with_straight_corrections_skipped<T>(f: impl FnOnce() -> T) -> T {
+    let previous = SKIP_STRAIGHT_CORRECTIONS.with(|cell| cell.replace(true));
+    let result = f();
+    SKIP_STRAIGHT_CORRECTIONS.with(|cell| cell.set(previous));
+    result
+}
+
+/// Chords whose correction was skipped on this thread since it started.
+pub(super) fn straight_corrections_skipped() -> u64 {
+    STRAIGHT_CORRECTIONS_SKIPPED.with(|cell| cell.get())
+}
 
 /// Integrate all `kinds` over the trimmed parameter region in ONE pass over
 /// a conforming cell decomposition (Golovanov §8.10): knot-span grid cells,
@@ -508,12 +535,30 @@ fn curved_boundary_correction(
     let [u0, u1, v0, v1] = domain;
     let eps_u = 1e-12 * (u1 - u0).abs();
     let eps_v = 1e-12 * (v1 - v0).abs();
+    let skip_straight = SKIP_STRAIGHT_CORRECTIONS.with(|cell| cell.get());
+    // One straightness reading per coedge, taken the first time one of its
+    // chords asks.
+    let mut straight: Vec<Vec<Option<bool>>> = if skip_straight {
+        face.loops.iter().map(|loop_record| vec![None; loop_record.coedges.len()]).collect()
+    } else {
+        Vec::new()
+    };
     for polygon in polygons {
         let n = polygon.points.len();
         for (k, arc) in polygon.arcs.iter().enumerate() {
             let Some(arc) = arc else {
                 continue;
             };
+            if skip_straight {
+                let slot = &mut straight[arc.loop_index][arc.coedge_index];
+                let is_straight = *slot.get_or_insert_with(|| {
+                    is_straight_in_uv(&face.loops[arc.loop_index].coedges[arc.coedge_index].pcurve)
+                });
+                if is_straight {
+                    STRAIGHT_CORRECTIONS_SKIPPED.with(|cell| cell.set(cell.get() + 1));
+                    continue;
+                }
+            }
             let p0 = polygon.points[k];
             let p1 = polygon.points[(k + 1) % n];
             let chord = [p1[0] - p0[0], p1[1] - p0[1]];

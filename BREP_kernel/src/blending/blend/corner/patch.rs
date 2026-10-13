@@ -160,6 +160,11 @@ pub(in crate::blend) fn build_general_corner_patch(
     next_id: &mut dyn FnMut() -> u64,
 ) -> Result<FaceRecord, KernelRefusal> {
     use std::f64::consts::{FRAC_PI_2, PI, TAU};
+    // BREP_PROFILE split of one corner patch (the box fillet's eight pay
+    // `timing.surgery.closures_ms`): the frame search, the sphere, each
+    // arc's track fit, the sense read.
+    let _patch_timing = crate::blend::BlendTimer::start("timing.surgery.closure.patch_ms");
+    let frame_timing = crate::blend::BlendTimer::start("timing.surgery.closure.patch.frame_ms");
     let n_faces = normals.len();
     if n_faces < 3 || arc_edges.len() != n_faces {
         return Err(KernelRefusal::input(
@@ -219,11 +224,14 @@ pub(in crate::blend) fn build_general_corner_patch(
         .add(e1.scale(best_phi.sin()))
         .normalized()
         .or_refuse(KernelStage::Fragment, "normalized")?;
+    frame_timing.stop();
+    let surface_timing = crate::blend::BlendTimer::start("timing.surgery.closure.patch.surface_ms");
     let x_axis = pc.scale(-1.0);
     let meridian = crate::make_arc(center, x_axis, polar, radius, -FRAC_PI_2, FRAC_PI_2)
         .or_refuse(KernelStage::Fragment, "make_arc")?;
     let surface = crate::make_revolution(center, polar, &meridian, TAU)
         .or_refuse(KernelStage::Fragment, "make_revolution")?;
+    surface_timing.stop();
 
     // Chain the three arcs into a closed loop traversed OPPOSITE to the fillet
     // use: each arc is stored start->end and used forward=true by its fillet,
@@ -270,6 +278,7 @@ pub(in crate::blend) fn build_general_corner_patch(
     let floor = crate::pcurve::PCURVE_REFINEMENT_TOLERANCE;
     let mut coedges = Vec::with_capacity(n_faces);
     for &ai in &order {
+        let track_timing = crate::blend::BlendTimer::start("timing.surgery.closure.patch.track_ms");
         let edge = &arc_edges[ai];
         let at = |fraction: f64| edge.curve.evaluate(edge.t1 - (edge.t1 - edge.t0) * fraction);
         let breaks = super::super::track_fit::curve_breaks(&edge.curve, edge.t0, edge.t1, false);
@@ -307,10 +316,12 @@ pub(in crate::blend) fn build_general_corner_patch(
             forward: false,
             pcurve: fit.curve,
         });
+        track_timing.stop();
     }
 
     // same_sense so the face normal points radially away from C for a convex
     // corner, toward it for a concave one.
+    let _sense_timing = crate::blend::BlendTimer::start("timing.surgery.closure.patch.sense_ms");
     let centre_projection =
         crate::project_point_to_surface(&surface, center.add(pc.scale(radius)))
             .or_refuse(KernelStage::Fragment, "project")?;
@@ -330,6 +341,155 @@ pub(in crate::blend) fn build_general_corner_patch(
         }],
         name: name.map(|value| value.to_string()),
     })
+}
+
+// ----------------------------------------------------------------------
+// The exact octant for an orthogonal corner (the box fillet's corner
+// closures). On a corner whose three mate normals are mutually orthogonal
+// the three tangent arcs are iso-parameter lines of the sphere revolved
+// about one normal with another as its x-axis — the equator and two
+// meridians — so the patch's pcurves are exact parameter lines and nothing
+// is fitted ([`build_octant_face`], which `round_convex_corner` already
+// uses). The general patch fits each arc's track on a sphere framed away
+// from its poles (`fit_curve_track`, 512 dense samples), which on the box
+// fillet is 28.1 of the surgery's 28.4 ms of closures (measured 2026-10-12:
+// the fit 19.1, the projection 9.2; a coarser dense grid moves the body's
+// bytes at 256 samples already and verifies the same rungs against fewer
+// midpoints). The octant's pole is a degenerate edge the caller must push
+// into the solid, hence the pair returned. Behind `BREP_BLEND_EXACT_OCTANT`
+// until its census: it moves the box pin's bytes.
+// ----------------------------------------------------------------------
+
+/// `BREP_BLEND_EXACT_OCTANT=1`/`on` turns the exact octant on, `=0`/`off`
+/// off; `set_exact_octant_for_test` forces it on a test's own thread.
+const EXACT_OCTANT_DEFAULT: bool = false;
+
+thread_local! {
+    static EXACT_OCTANT_FOR_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+pub(in crate::blend) fn exact_octant_on() -> bool {
+    if let Some(forced) = EXACT_OCTANT_FOR_TEST.with(|forced| forced.get()) {
+        return forced;
+    }
+    match std::env::var("BREP_BLEND_EXACT_OCTANT").as_deref() {
+        Ok("0") | Ok("off") => false,
+        Ok("1") | Ok("on") => true,
+        _ => EXACT_OCTANT_DEFAULT,
+    }
+}
+
+
+/// [`build_general_corner_patch`], taking the exact octant first when the
+/// switch is on and the corner permits it: three mutually orthogonal normals
+/// (to 1e-12) and three arcs whose ends sit on the tangent points
+/// `C + r·nₖ` (to 1e-9·(1 + r)) in one consistent cycle.  Returns the face
+/// and, for the octant, its degenerate pole edge, which the caller pushes
+/// into the solid's edges.  Every other corner, and the switch off, is the
+/// fitted patch with `None`, byte for byte.
+pub(in crate::blend) fn build_corner_patch_exact(
+    center: Vec3,
+    radius: f64,
+    normals: &[Vec3],
+    arc_edges: &[EdgeRecord],
+    outward: bool,
+    name: Option<&str>,
+    next_id: &mut dyn FnMut() -> u64,
+) -> Result<(FaceRecord, Option<EdgeRecord>), KernelRefusal> {
+    if exact_octant_on() {
+        if let Some((face, pole)) = try_exact_octant(center, radius, normals, arc_edges, outward, name, next_id)? {
+            return Ok((face, Some(pole)));
+        }
+    }
+    Ok((build_general_corner_patch(center, radius, normals, arc_edges, outward, name, next_id)?, None))
+}
+
+/// The exact octant when the corner permits it (see
+/// [`build_corner_patch_exact`]); `None` says to fit instead.
+fn try_exact_octant(
+    center: Vec3,
+    radius: f64,
+    normals: &[Vec3],
+    arc_edges: &[EdgeRecord],
+    outward: bool,
+    name: Option<&str>,
+    next_id: &mut dyn FnMut() -> u64,
+) -> Result<Option<(FaceRecord, EdgeRecord)>, KernelRefusal> {
+    if normals.len() != 3 || arc_edges.len() != 3 {
+        return Ok(None);
+    }
+    let orthogonal = (0..3).all(|i| ((i + 1)..3).all(|j| normals[i].dot(normals[j]).abs() <= 1e-12));
+    if !orthogonal || normals.iter().any(|n| (n.length() - 1.0).abs() > 1e-12) {
+        return Ok(None);
+    }
+    // Right-handed labelling: swap two normals when the frame is left-handed.
+    let mut m = [normals[0], normals[1], normals[2]];
+    if m[0].cross(m[1]).dot(m[2]) < 0.0 {
+        m.swap(1, 2);
+    }
+    let ideal: [Vec3; 3] = [center.add(m[0].scale(radius)), center.add(m[1].scale(radius)), center.add(m[2].scale(radius))];
+    let near = 1e-9 * (1.0 + radius);
+    let which = |point: Vec3| (0..3).find(|&k| point.sub(ideal[k]).length() <= near);
+    // Each arc's ends on two distinct tangent points, the three arcs covering
+    // the three pairs, and the stored directions one consistent cycle (the
+    // fillets use every arc forward, so the patch must walk each backward).
+    let mut triples: Vec<(u64, u64, u64)> = Vec::with_capacity(3);
+    let mut t_ids = [None::<u64>; 3];
+    let mut labels: Vec<(usize, usize)> = Vec::with_capacity(3);
+    for edge in arc_edges {
+        let start = edge.curve.evaluate(edge.t0).or_refuse(KernelStage::Fragment, "evaluate")?;
+        let end = edge.curve.evaluate(edge.t1).or_refuse(KernelStage::Fragment, "evaluate")?;
+        let (Some(ks), Some(ke)) = (which(start), which(end)) else { return Ok(None) };
+        if ks == ke {
+            return Ok(None);
+        }
+        for (k, id) in [(ks, edge.start_vertex_id), (ke, edge.end_vertex_id)] {
+            match t_ids[k] {
+                None => t_ids[k] = Some(id),
+                Some(known) if known == id => {}
+                Some(_) => return Ok(None),
+            }
+        }
+        triples.push((edge.id, edge.start_vertex_id, edge.end_vertex_id));
+        labels.push((ks, ke));
+    }
+    let [Some(t1), Some(t2), Some(t3)] = t_ids else { return Ok(None) };
+    let mut pairs: Vec<(usize, usize)> = labels.iter().map(|&(a, b)| (a.min(b), a.max(b))).collect();
+    pairs.sort_unstable();
+    if pairs != vec![(0, 1), (0, 2), (1, 2)] {
+        return Ok(None);
+    }
+    // A consistent cycle: every label appears once as a start and once as an end.
+    let starts: Vec<usize> = labels.iter().map(|&(a, _)| a).collect();
+    if !(0..3).all(|k| starts.iter().filter(|&&a| a == k).count() == 1) {
+        return Ok(None);
+    }
+    let (mut face, pole) = build_octant_face(center, m, radius, [t1, t2, t3], ideal, &triples, name, next_id)?;
+    // The octant walks T1 → T2 → T3 → T1; the patch must walk every arc
+    // against its fillet's use (the stored direction).  When the stored cycle
+    // runs the same way, walk the loop the other way round: the coedges in
+    // reverse order, each pcurve reversed.
+    let arcs_forward = face.loops[0].coedges.iter().filter(|coedge| coedge.edge_id != pole.id).map(|coedge| coedge.forward).collect::<Vec<bool>>();
+    if arcs_forward.iter().any(|&forward| forward) {
+        if !arcs_forward.iter().all(|&forward| forward) {
+            return Ok(None);
+        }
+        let mut reversed = Vec::with_capacity(face.loops[0].coedges.len());
+        for coedge in face.loops[0].coedges.iter().rev() {
+            reversed.push(CoedgeRecord {
+                id: coedge.id,
+                edge_id: coedge.edge_id,
+                forward: if coedge.edge_id == pole.id { true } else { !coedge.forward },
+                pcurve: coedge.pcurve.reversed().or_refuse(KernelStage::Fragment, "reversed")?,
+            });
+        }
+        face.loops[0].coedges = reversed;
+        face.same_sense = !face.same_sense;
+    }
+    if !outward {
+        face.same_sense = !face.same_sense;
+    }
+    Ok(Some((face, pole)))
 }
 
 /// The CHAMFER counterpart of [`build_general_corner_patch`]: the planar facet

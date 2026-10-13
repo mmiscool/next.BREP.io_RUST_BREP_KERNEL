@@ -55,14 +55,16 @@ pub mod plm_import;
 pub mod plm_parts;
 /// The family table pane on a PLM store (S9): Generate on the server, the member part type, the category keys.
 pub mod plm_family;
-/// Review, change orders and the inbox (plm-cad-integration-todo §3 S4).
+/// Review and the inbox (plm-cad-integration-todo §3 S4).
 pub mod plm_review;
 pub mod qualify;
 pub mod family_table_editor;
 pub mod scene;
 pub mod selection;
 pub mod sketch;
+pub mod sketch3d;
 pub mod spline_anchors;
+pub mod cage_editor;
 pub mod settings;
 pub mod sheets;
 pub mod step_parts;

@@ -2,7 +2,7 @@
 
 `BREP_plm` is a self-hosted product lifecycle management server: parts with
 part numbers as their database keys, revisions with a lifecycle,
-explicit checkout, bills of materials, change orders and review, over one
+explicit checkout, bills of materials, configurable workflows and review, over one
 embedded SQLite file. It serves its own browser UI and the document API that
 the BREP CAD application saves and opens through, and it can host the CAD
 application's web build on the same origin.
@@ -55,7 +55,9 @@ characters percent-encoded.
 
 This development version requires a fresh data directory when upgrading from
 opaque model IDs. Stop the old server, reset its data directory and CAD caches,
-then start this version. Existing model data is not migrated.
+then start this version with schema 6. Existing model data is not migrated.
+This greenfield schema requires a fresh data directory; old change orders,
+workflow purpose fields, file-store imports and schema upgrades are not supported.
 
 ## What it does
 

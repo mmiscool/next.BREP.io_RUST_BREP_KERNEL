@@ -5,6 +5,16 @@ globalThis.Workbench = (() => {
   const channels = Object.fromEntries(['home','inbox','catalog'].map(k => [k, { serial: 0, node: null, detail: null }]));
   const homeState = { user: null, nodes: new Map(), expanded: new Set(['root']), focus: 'root', moving: null, epoch: 0 };
   let inboxData = null, inboxSerial = 0;
+  let pendingLoads=new Map();
+  let activeReads=0;
+  const readWaiters=[];
+  async function treeRead(path) {
+    if(activeReads>=6)await new Promise(resolve=>readWaiters.push(resolve));
+    else activeReads++;
+    try{return await api('GET',path);}finally{
+      const next=readWaiters.shift();if(next)next();else activeReads--;
+    }
+  }
   const box = mode => document.getElementById(mode === 'catalog' ? 'selection-content' : `${mode}-detail`);
   const layout = mode => document.getElementById(`${mode}-layout`);
   const enc = encodeURIComponent;
@@ -28,40 +38,50 @@ globalThis.Workbench = (() => {
     homeState.nodes.set(node.key,value); return value;
   }
   function entryNode(entry, parent) {
-    return register({key:`e:${entry.id}`,label:entry.name,kind:entry.kind === 'link' ? 'part' : entry.kind,entry,
-      part:entry.link?.part_id,revision:entry.link?.pinned ? entry.link.revision_id : '',children:null},parent);
+    const key=`e:${entry.id}`,old=homeState.nodes.get(key);
+    const revision=entry.link?.pinned ? entry.link.revision_id : '';
+    const reusable=old?.entry?.kind===entry.kind && old.part===entry.link?.part_id && old.revision===revision;
+    return register({key,label:entry.name,kind:entry.kind === 'link' ? 'part' : entry.kind,entry,
+      part:entry.link?.part_id,revision,children:reusable ? old.children : null},parent);
   }
   const canExpand = node => ['folder','part','revision','catalog'].includes(node.kind);
   const movable = node => (Boolean(node.entry) || ['part','revision'].includes(node.kind));
-  async function load(node) {
-    if (node.children !== null && node.children !== undefined) return;
+  async function load(node, {refresh=false}={}) {
+    if(pendingLoads.has(node.key))return pendingLoads.get(node.key);
+    if(!refresh && node.loadedEpoch===homeState.epoch && node.children !== null && node.children !== undefined)return;
+    const loads=pendingLoads;
+    const promise=loadChildren(node);
+    loads.set(node.key,promise);
+    try{return await promise;}finally{if(loads.get(node.key)===promise)loads.delete(node.key);}
+  }
+  async function loadChildren(node) {
     const epoch=homeState.epoch;
     let children=[];
     if (node.kind === 'folder') {
-      const response=await api('GET',`/api/workspace/entries?${new URLSearchParams({parent:node.entry?.id || ''})}`);
+      const response=await treeRead(`/api/workspace/entries?${new URLSearchParams({parent:node.entry?.id || ''})}`);
       if(epoch!==homeState.epoch)return;
       children=response.entries.map(e=>entryNode(e,node.key));
-      if(node.key==='root')children.push(register({key:'catalog',label:'All parts',kind:'catalog',children:null},'root'));
+      if(node.key==='root')children.push(register({key:'catalog',label:'All parts',kind:'catalog',children:homeState.nodes.get('catalog')?.children ?? null},'root'));
     } else if(node.kind === 'catalog') {
-      const page=await api('GET','/api/parts?limit=100');
+      const page=await treeRead('/api/parts?limit=100');
       if(epoch!==homeState.epoch)return;
-      children=page.parts.map(p=>register({key:`p:${p.id}`,label:`${p.number} · ${p.name}`,part:p.id,kind:'part',children:null},node.key));
+      children=page.parts.map(p=>register({key:`p:${p.id}`,label:`${p.number} · ${p.name}`,part:p.id,kind:'part',children:homeState.nodes.get(`p:${p.id}`)?.children ?? null},node.key));
       if(page.next)children.push(register({key:'more',kind:'more',label:'Load more parts',cursor:page.next},node.key));
     } else if(node.kind === 'part') {
-      const detail=await api('GET',`/api/parts/${enc(node.part)}`);
+      const detail=await treeRead(`/api/parts/${enc(node.part)}`);
       if(epoch!==homeState.epoch)return;
       node.partDetail=detail;
       children=(detail.attachments || []).map(a=>attachmentNode(a,node,'Part attachment'));
-      children.push(...detail.revision_views.slice().reverse().map(r=>register({key:`${node.key}:r:${r.id}`,kind:'revision',label:`Revision ${r.label}`,part:detail.id,revision:r.id,state:r.lifecycle,children:null,partDetail:detail},node.key)));
+      children.push(...detail.revision_views.slice().reverse().map(r=>register({key:`${node.key}:r:${r.id}`,kind:'revision',label:`Revision ${r.label}`,part:detail.id,revision:r.id,state:r.lifecycle,children:homeState.nodes.get(`${node.key}:r:${r.id}`)?.children ?? null,partDetail:detail},node.key)));
     } else if(node.kind === 'revision') {
-      const detail=await api('GET',`/api/parts/${enc(node.part)}`);
+      const detail=homeState.nodes.get(node.parent)?.partDetail || await treeRead(`/api/parts/${enc(node.part)}`);
       if(epoch!==homeState.epoch)return;
       const revision=detail.revisions.find(r=>r.id===node.revision);
       if(!revision)throw new Error('This revision was deleted. Refresh Home.');
       children=(revision.attachments || []).map(a=>attachmentNode(a,node,'Revision attachment'));
       if(revision.content_hash)children.unshift(register({key:`${node.key}:model`,kind:'model',label:'CAD model',part:node.part,revision:node.revision},node.key));
     }
-    node.children=children;
+    node.children=children;node.loadedEpoch=epoch;
   }
   function attachmentNode(attachment,parent,scope) {
     return register({key:`${parent.key}:a:${attachment.id}`,kind:'attachment',label:attachment.name,attachment,scope,part:parent.part,revision:parent.kind==='revision'?parent.revision:''},parent.key);
@@ -95,19 +115,22 @@ globalThis.Workbench = (() => {
     $('home-tree').innerHTML=treeMarkup(root);
     if(active)$('home-tree').querySelector(`[data-tree-key="${CSS.escape(active)}"]`)?.focus({preventScroll:true});
   }
-  async function hydrate(node) {
-    if(!homeState.expanded.has(node.key))return;
-    await load(node);
-    for(const child of node.children || [])if(canExpand(child))await hydrate(child);
+  async function hydrate(node, {refresh=false,epoch=homeState.epoch,skipRoot=false}={}) {
+    if(!node || !homeState.expanded.has(node.key) || epoch!==homeState.epoch)return;
+    if(!skipRoot)await load(node,{refresh});
+    if(epoch!==homeState.epoch)return;
+    drawTree();
+    await Promise.all((node.children || []).filter(canExpand).map(child=>hydrate(child,{refresh,epoch})));
   }
   async function home(folderId) {
     if(homeState.user!==me.id) {
-      homeState.user=me.id;homeState.expanded=new Set(['root']);homeState.moving=null;channels.home.node=null;
+      homeState.user=me.id;homeState.nodes=new Map();homeState.expanded=new Set(['root']);homeState.moving=null;channels.home.node=null;
     }
     const epoch=++homeState.epoch;
     ++channels.home.serial;
-    homeState.nodes=new Map();
-    const root=register({key:'root',label:'Home',kind:'folder',children:null},null);
+    pendingLoads=new Map();
+    const root=homeState.nodes.get('root') || register({key:'root',label:'Home',kind:'folder',children:null},null);
+    drawTree();
     if(folderId) {
       let id=folderId;const visited=new Set();
       while(id&&!visited.has(id)) {
@@ -118,15 +141,37 @@ globalThis.Workbench = (() => {
         homeState.expanded.add(`e:${id}`);id=entry.parent;
       }
     }
-    await hydrate(root);if(epoch!==homeState.epoch)return;
+    await load(root,{refresh:true});if(epoch!==homeState.epoch)return;
+    // Refresh descendants without delaying the root contents or navigation.
+    const hydration=hydrate(root,{refresh:true,epoch,skipRoot:true}).then(async()=>{
+      if(epoch!==homeState.epoch)return;
+      const reachable=new Set();
+      const visit=node=>{if(reachable.has(node.key))return;reachable.add(node.key);for(const child of node.children || [])visit(child);};
+      visit(root);
+      for(const key of homeState.nodes.keys())if(!reachable.has(key))homeState.nodes.delete(key);
+      if(channels.home.node && !reachable.has(channels.home.node.key))await select('home',root,false);
+    });
+    hydration.catch(error=>{if(epoch===homeState.epoch)$('home-status').textContent=error.message;});
+    if(folderId){await hydration;if(epoch!==homeState.epoch)return;}
     const previous=channels.home.node;
-    const selected=homeState.nodes.get(previous?.key)||(folderId?homeState.nodes.get(`e:${folderId}`):null)||root;
+    let selected=homeState.nodes.get(previous?.key)||(folderId?homeState.nodes.get(`e:${folderId}`):null)||root;
+    // Refresh the selected item's ancestors before reading its metadata.
+    // Other expanded branches continue independently in the background.
+    const path=[];let ancestor=selected;
+    while(ancestor?.parent){path.unshift(ancestor.key);ancestor=homeState.nodes.get(ancestor.parent);}
+    let parent=root;
+    for(const key of path){
+      await load(parent);if(epoch!==homeState.epoch)return;
+      const child=parent.children?.find(node=>node.key===key);
+      if(!child){selected=root;break;}
+      selected=child;parent=child;
+    }
     homeState.focus=selected.key;drawTree();
     await select('home',selected,false);
   }
   async function toggle(node) {
     if(homeState.expanded.has(node.key))homeState.expanded.delete(node.key);
-    else {homeState.expanded.add(node.key);drawTree();await load(node);}
+    else {homeState.expanded.add(node.key);drawTree();await load(node,{refresh:true});}
     drawTree();
   }
   async function more(node) {
@@ -179,10 +224,7 @@ globalThis.Workbench = (() => {
         const answer=await api('GET',`/api/workspace/entries/${enc(node.entry.id)}/versions`);if(serial!==channel.serial)return;
         const versions=answer.versions || answer;
         box(mode).innerHTML=`<h2>${escape(node.label)}</h2>${pairs([['Version',node.entry.file?.version],['Size',fileSize(node.entry.file?.size || 0)]])}<div class="toolbar"><a class="button-link" href="${FileDocuments.route('workspace',node.entry.id)}">Open document</a> <a class="button-link" href="/api/workspace/entries/${enc(node.entry.id)}/content" download>Download</a>${entryActions(node)}</div><details><summary>File versions</summary><ul class="detail-files">${versions.slice().reverse().map(v=>`<li>Version ${v.version} · ${fileSize(v.size)} <a href="/api/workspace/entries/${enc(node.entry.id)}/content?version=${v.version}" download>Download</a>${!v.current?action('restore','Restore',`data-version="${v.version}"`):''}</li>`).join('')}</ul></details>${me.can_author?`<details><summary>Promote to attachment</summary><label>Part number<input data-promote-part></label><label>Revision (optional)<input data-promote-revision></label>${action('promote','Promote')}</details>`:''}`;
-      } else if(node.kind==='eco') {
-        const eco=await api('GET',`/api/ecos/${enc(node.part)}`);if(serial!==channel.serial)return;
-        channel.eco=eco;
-        box(mode).innerHTML=`<h2>${escape(eco.number)} · ${escape(eco.title)}</h2>${stateChip(eco.state)}<p>${escape(eco.reason)}</p><p>${escape(eco.description)}</p><section class="selection-review">${reviewHtml(eco.current,eco.comments)}</section><details><summary>Affected revisions (${eco.items.length})</summary><ul>${eco.items.map(i=>`<li><a href="${partLink(i.part_id,i.revision_id)}">${escape(i.number)} · ${escape(i.revision)}</a> · ${escape(i.action)}</li>`).join('')}</ul></details><p><a href="#/eco/${enc(eco.id)}">Open change order</a></p>`;
+
       }
       if(['file','attachment'].includes(node.kind)) {
         const hash=node.kind==='file'?FileDocuments.route('workspace',node.entry.id):FileDocuments.route('attachment',node.attachment.id,node.part,node.revision);
@@ -299,7 +341,7 @@ globalThis.Workbench = (() => {
     else if(name==='approve'||name==='reject') {
       const comment=area.querySelector('[data-review-comment]')?.value || '';
       if(name==='reject'&&!comment.trim())throw new Error('Add a comment explaining the rejection.');
-      const url=node.kind==='eco'?`/api/ecos/${enc(node.part)}`:base;
+      const url=base;
       showWarnings(await api('POST',`${url}/review/decision`,{verdict:name,comment}));
     } else if(name==='bom') {
       const serial=channel.serial;
@@ -389,7 +431,7 @@ globalThis.Workbench = (() => {
       const button=event.target.closest('[data-inbox-index]');if(!button)return;
       const item=inboxData[$('inbox-filter').value][Number(button.dataset.inboxIndex)];
       if(item.kind==='workflow'){location.hash=`#/workflow-run/${encodeURIComponent(item.target)}`;return;}
-      safe(async()=>{await select('inbox',{kind:item.kind==='eco'?'eco':'revision',part:item.target,revision:item.revision_id});drawInbox();});
+      safe(async()=>{await select('inbox',{kind:'revision',part:item.target,revision:item.revision_id});drawInbox();});
     });
     document.querySelectorAll('[data-master-back]').forEach(button=>button.addEventListener('click',()=>{
       const mode=button.dataset.masterBack;layout(mode).classList.remove('detail-open');
@@ -451,6 +493,6 @@ globalThis.Workbench = (() => {
   return {init,home,inbox,catalog,partChanged,savedModels,
     inboxSelection:()=>channels.inbox.node,restoreInbox:node=>{channels.inbox.node=node;},
     snapshot:()=>({expanded:[...homeState.expanded],selected:channels.home.node?.key,focus:homeState.focus}),
-    restore:state=>{homeState.user=me.id;homeState.expanded=new Set(state?.expanded || ['root']);channels.home.node=state?.selected?{key:state.selected}:null;homeState.focus=state?.focus || 'root';}
+    restore:state=>{if(homeState.user!==me.id){homeState.nodes=new Map();homeState.moving=null;$('home-tree').replaceChildren();FileDocuments.park(box('home'));box('home').replaceChildren();}homeState.user=me.id;homeState.expanded=new Set(state?.expanded || ['root']);channels.home.node=state?.selected?{key:state.selected}:null;homeState.focus=state?.focus || 'root';}
   };
 })();

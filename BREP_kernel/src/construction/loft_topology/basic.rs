@@ -207,6 +207,10 @@ fn cap_face(
     })
 }
 
+/// Loft corresponding edges of closed sections. For two sections, exact
+/// degree elevation and knot insertion reconcile mixed line/arc representations
+/// and the ruled skins retain both boundaries' rational weights. Multi-section
+/// interpolation requires matching degrees, knots and weights.
 pub fn loft_profile_brep(input_sections: &[Vec<NurbsCurve>]) -> Result<BrepSolid, KernelRefusal> {
     loft_profile_brep_core(input_sections, None)
 }
@@ -253,7 +257,14 @@ fn loft_profile_brep_core(
         ));
     }
     let mut sections = input_sections.to_vec();
-    let curve_count = validate_sections(&sections, tolerance, "loftSolid", true)?;
+    // A two-section loft is a ruled rational patch: unlike the interpolated
+    // multi-station/tangent paths it can retain different boundary weights.
+    let ruled = section_count == 2 && end_tangents.is_none();
+    let curve_count = if ruled {
+        super::validation::validate_section_loops(&sections, tolerance, "loftSolid")?
+    } else {
+        validate_sections(&sections, tolerance, "loftSolid", true)?
+    };
 
     let first_frame = section_frame(&sections[0], tolerance)?;
     let last_frame = section_frame(&sections[section_count - 1], tolerance)?;
@@ -385,6 +396,30 @@ fn loft_profile_brep_core(
         }
     }
 
+    if ruled {
+        // Match AFTER winding normalization: reversing a loop changes which
+        // curves correspond. Degree elevation and knot insertion preserve the
+        // exact line/arc geometry; no sampling or refitting is involved.
+        for curve_index in 0..curve_count {
+            let family = [
+                sections[0][curve_index].clone(),
+                sections[1][curve_index].clone(),
+            ];
+            // Preserve existing parameter domains when no conversion is needed.
+            if family[0].degree == family[1].degree
+                && family[0].knots == family[1].knots
+                && family[0].control_points.len() == family[1].control_points.len()
+            {
+                continue;
+            }
+            let (compatible, _) = crate::coons::compat::make_family_compatible(&family, 1)
+                .or_refuse(KernelStage::Refine, "section_compatibility")?;
+            for (section, curve) in sections.iter_mut().zip(compatible) {
+                section[curve_index] = curve;
+            }
+        }
+    }
+
     let mut parameters = vec![0.0; section_count];
     let mut accumulated = vec![0.0; section_count];
     let mut columns = 0usize;
@@ -441,6 +476,28 @@ fn loft_profile_brep_core(
     let mut skins = Vec::with_capacity(curve_count);
     for curve_index in 0..curve_count {
         let reference = &sections[0][curve_index];
+        if ruled {
+            // Interpolate HOMOGENEOUS controls, including each end's own
+            // weights. Copying the first end's weights onto the second would
+            // turn an exact circular arc into a different boundary curve.
+            let grid = reference
+                .control_points
+                .iter()
+                .zip(&sections[1][curve_index].control_points)
+                .map(|(&start, &end)| vec![start, end])
+                .collect();
+            skins.push(
+                NurbsSurface::new(
+                    reference.degree,
+                    1,
+                    reference.knots.clone(),
+                    vec![0.0, 0.0, 1.0, 1.0],
+                    grid,
+                )
+                .or_refuse(KernelStage::Fragment, "skin")?,
+            );
+            continue;
+        }
         let mut grid = Vec::with_capacity(reference.control_points.len());
         let mut knots_v = Vec::new();
         for control_index in 0..reference.control_points.len() {
@@ -645,6 +702,7 @@ fn loft_profile_brep_core(
         edges,
         shells: vec![ShellRecord { id: next_id, faces }],
         genus: 0,
+        kind: crate::BodyKind::Solid,
     };
     let issues = solid.validate();
     if !issues.is_empty() {

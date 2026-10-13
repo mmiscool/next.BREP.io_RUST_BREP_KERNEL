@@ -9,6 +9,12 @@
 //!
 //! Layout (all values f64):
 //!   header:  [VERSION, solid_id, genus, n_vertices, n_edges, n_shells]
+//!            at version 1.0, written for every `Solid` body: the bytes of
+//!            every payload written before the kind existed, unchanged;
+//!            [VERSION, solid_id, genus, kind, n_vertices, n_edges, n_shells]
+//!            at version 1.1, written only when the body's kind is not
+//!            `Solid` (kind: Solid 0, Sheet 1, Cellular 2, Wire 3). The
+//!            reader accepts both; a 1.0 payload reads as `Solid`.
 //!   vertex:  [id, x, y, z]
 //!   edge:    [id, t0, t1, start_vertex_id, end_vertex_id, degenerate] curve
 //!   shell:   [id, n_faces] face*
@@ -20,12 +26,18 @@
 //!             knots_v..., n_rows, n_columns, (x, y, z, w)... row-major]
 
 use crate::topology::{
-    BrepSolid, CoedgeRecord, EdgeRecord, FaceRecord, LoopRecord, ShellRecord, VertexRecord,
+    BodyKind, BrepSolid, CoedgeRecord, EdgeRecord, FaceRecord, LoopRecord, ShellRecord,
+    VertexRecord,
 };
 use crate::{NurbsCurve, NurbsSurface, Vec3, Vec4};
 use std::collections::BTreeMap;
 
+/// The header a `Solid` body writes, and the oldest version the reader
+/// accepts. The snapshot container (`io/snapshot.rs`) names this format
+/// durable: a Solid keeps writing 1.0 so no stored payload moves.
 pub const SOLID_CODEC_VERSION: f64 = 1.0;
+/// The header a body of any other kind writes: the kind slot follows `genus`.
+pub const SOLID_CODEC_VERSION_KIND: f64 = 1.1;
 
 /// Largest integer f64 represents exactly. Ids above this would silently
 /// round during encode (and the decoder's integrality check cannot detect
@@ -78,10 +90,17 @@ fn push_surface(data: &mut Vec<f64>, surface: &NurbsSurface) {
 pub fn encode_solid(solid: &BrepSolid) -> Result<(Vec<f64>, SolidNames), String> {
     let mut names = SolidNames::default();
     let mut data = Vec::with_capacity(4096);
+    if solid.kind.is_solid() {
+        data.extend_from_slice(&[SOLID_CODEC_VERSION, id_to_f64(solid.id)?, solid.genus as f64]);
+    } else {
+        data.extend_from_slice(&[
+            SOLID_CODEC_VERSION_KIND,
+            id_to_f64(solid.id)?,
+            solid.genus as f64,
+            solid.kind.codec_code(),
+        ]);
+    }
     data.extend_from_slice(&[
-        SOLID_CODEC_VERSION,
-        id_to_f64(solid.id)?,
-        solid.genus as f64,
         solid.vertices.len() as f64,
         solid.edges.len() as f64,
         solid.shells.len() as f64,
@@ -243,11 +262,18 @@ impl<'a> Reader<'a> {
 pub fn decode_solid(data: &[f64], names: &SolidNames) -> Result<BrepSolid, String> {
     let mut reader = Reader { data, cursor: 0 };
     let version = reader.next()?;
-    if version != SOLID_CODEC_VERSION {
+    if version != SOLID_CODEC_VERSION && version != SOLID_CODEC_VERSION_KIND {
         return Err(format!("solid codec: unsupported version {version}"));
     }
     let id = reader.next_id()?;
     let genus = reader.next()? as i64;
+    let kind = if version == SOLID_CODEC_VERSION_KIND {
+        let code = reader.next()?;
+        BodyKind::from_codec_code(code)
+            .ok_or_else(|| format!("solid codec: unknown body kind {code}"))?
+    } else {
+        BodyKind::Solid
+    };
     let vertex_count = reader.next_usize()?;
     let edge_count = reader.next_usize()?;
     let shell_count = reader.next_usize()?;
@@ -333,6 +359,7 @@ pub fn decode_solid(data: &[f64], names: &SolidNames) -> Result<BrepSolid, Strin
         edges,
         shells,
         genus,
+        kind,
     })
 }
 

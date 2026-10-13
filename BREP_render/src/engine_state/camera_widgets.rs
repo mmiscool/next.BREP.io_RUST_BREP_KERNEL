@@ -36,6 +36,7 @@ impl EngineState {
         // Live sketch mode: draggable dimension leaders, constraint glyphs and
         // construction dashes, all sized in pixels at bake time.
         self.ensure_sketch_overlay_current();
+        self.ensure_sketch3d_overlay_current();
         // The active PMI view's annotation graphics (screen-constant arrows
         // that also face the camera).
         self.ensure_pmi_overlay_current();

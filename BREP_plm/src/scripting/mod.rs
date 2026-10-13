@@ -79,11 +79,6 @@ pub const HOOKS: &[HookDoc] = &[
         when: "creating a part of a Script-mode part type; return the number or throw to refuse",
     },
     HookDoc {
-        file: "(named by the change-order numbering)",
-        function: "ecoNumber",
-        when: "creating a change order when change orders number by script; return the number or throw to refuse",
-    },
-    HookDoc {
         file: REVISION_LABEL,
         function: "revisionLabel",
         when: "creating a revision; return the label or throw to refuse",
@@ -101,12 +96,12 @@ pub const HOOKS: &[HookDoc] = &[
     HookDoc {
         file: REVIEWERS,
         function: "reviewers",
-        when: "submitting a revision or a change order (input.kind is eco) for review; return { reviewers, required_approvals, due } to change the round, or throw to refuse",
+        when: "submitting a revision for review; return { reviewers, required_approvals, due } to change the round, or throw to refuse",
     },
     HookDoc {
         file: REVIEW_EVENT,
         function: "reviewEvent",
-        when: "after a review is opened, decided, withdrawn, changed or commented on, and a change order released or cancelled; for notifications — a throw is reported, the event stands",
+        when: "after a review is opened, decided, withdrawn, changed or commented on; for notifications — a throw is reported, the event stands",
     },
 ];
 

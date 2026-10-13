@@ -1,6 +1,6 @@
 [package]
 name = "BREP_plm"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 # The floor the rest of the family builds on, and the compiler
 # rust-toolchain.toml pins. Nothing here needs more.
@@ -8,7 +8,7 @@ rust-version = "1.92"
 license-file = "LICENSE.md"
 repository = "https://github.com/mmiscool/next.BREP.io_RUST_BREP_KERNEL"
 homepage = "https://v2.brep.io"
-description = "The BREP PLM server: parts, revisions, lifecycle, checkout, BOMs and change orders over an embedded SQLite store, with a browser UI and the document API the BREP CAD app stores through."
+description = "The BREP PLM server: parts, revisions, lifecycle, checkout, BOMs and configurable workflows over an embedded SQLite store, with a browser UI and the document API the BREP CAD app stores through."
 readme = "README.md"
 keywords = ["plm", "cad", "bom", "engineering", "server"]
 categories = ["web-programming::http-server", "database", "command-line-utilities"]
@@ -21,6 +21,8 @@ include = [
     "/web/native-import.js",
     "/web/setup.js",
     "/web/workflows.js",
+    "/web/workflow-flowchart.js",
+    "/web/workflow-help.html",
     "/web/workbench.js",
     "/web/split-panes.js",
     "/web/markdown-editor.js",
@@ -90,7 +92,7 @@ brep-script-core = { package = "BREP_script_core", version = "0.1.2", path = "..
 # Scripts' synchronous `http.request`. Sync on purpose: a Boa host function
 # cannot await, and every call carries its own timeout.
 ureq = "2"
-brep-kernel = { package = "BREP_kernel", version = "0.8.0", path = "../BREP_kernel" }
+brep-kernel = { package = "BREP_kernel", version = "0.9.0", path = "../BREP_kernel" }
 brep-ecad-core = { package = "BREP_ecad_core", version = "0.2.1", path = "../BREP_ecad_core" }
 # Optional native TLS (`--tls-cert` / `--tls-key`). rustls and ring are
 # already in the tree through ureq; ring, not aws-lc, so no cmake. Plain

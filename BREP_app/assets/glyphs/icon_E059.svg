@@ -1,5 +1,7 @@
 <svg xmlns="http://www.w3.org/2000/svg" xmlns:brep="https://brep.io/icons"
-     viewBox="0 0 1233 2384" width="1233" height="2384" brep:glyph-name="icon_feat_sm_unfold" brep:unicode="E059">
-  <path d="M196 1597L676 1597L676 1505L196 1505ZM722 1551L722 1161L630 1161L630 1551Z" fill="#5c86a6"/>
-  <path d="M802 1307L956 1153.1L903.9 1101L750 1255ZM1036 1021L988.3 1185.4L871.6 1068.7Z" fill="#3d86c4"/>
+     viewBox="0 0 24 24" width="24" height="24" brep:glyph-name="icon_feat_sm_unfold" brep:unicode="E059">
+  <!-- A flat blank with bend lines and an outward arrow showing the fold opening. -->
+  <path d="M2 10H7V7H17V10H22V19H17V22H7V19H2Z" fill="#bcd7e8" stroke="#2b4c63" stroke-width="1.2" stroke-linejoin="round"/>
+  <path d="M7 11V18M17 11V18" style="fill:none" stroke="#3d86c4" stroke-width="1.3" stroke-dasharray="2 1.5"/>
+  <path d="M7 5Q12 0 19 5M15 5H19V1" style="fill:none" stroke="#3d86c4" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
 </svg>

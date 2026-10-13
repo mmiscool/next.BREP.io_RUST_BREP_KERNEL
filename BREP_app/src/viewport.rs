@@ -91,6 +91,9 @@ pub struct Viewport {
     /// press grabbed a movable sketch point, so the drag moves it instead of
     /// orbiting the camera.
     sketch_dragging: bool,
+    /// True while a 3D sketch POINT drag started over the viewport is live —
+    /// the press grabbed a movable 3D sketch point.
+    sketch3d_dragging: bool,
     /// True while a freehand handdraw STROKE started over the viewport is live
     /// (S6b-3) — the press began a stroke, so the drag captures it as a polyline
     /// instead of orbiting the camera.
@@ -213,6 +216,7 @@ impl Viewport {
         self.component_gizmo_dragging = false;
         self.dim_dragging = None;
         self.sketch_dragging = false;
+        self.sketch3d_dragging = false;
         self.sketch_handdrawing = false;
         self.constraint_dragging = false;
     }
@@ -254,6 +258,7 @@ pub use popups::{modal_open_last_pass, popup_open_last_pass};
 
 /// The hit keys the viewport publishes (see `automation::hit_keys`).
 pub static HIT_KEYS: &[crate::automation::hit_keys::HitKeyDoc] = &[
+    crate::automation::hit_keys::HitKeyDoc { panel: "cage", prefix: "point:", meaning: "one zero-size rect per CONTROL POINT of the NURBS Solid whose form is open (cage/point:<index> — 0 the bottom pole, then every ring bottom-up, the top pole last), in SCREEN points, at the dot the viewport draws for it. A click SELECTS the point and arms the move/rotate gizmo at the selection's centre; with Shift / Ctrl held (`modifiers_set`) it TOGGLES the point into the selection, so several points move as one. The form's Cage section (`history/cage:`) grows the selection to whole rings and columns and inserts new loops beside it", command: None },
     crate::automation::hit_keys::HitKeyDoc { panel: "candidate", prefix: "", meaning: "one rect per entry of the open pick-candidate popup, keyed by the entry's index \u{2014} the same index `__brepCandidates` carries. `click_widget candidate/<i>` picks that entry (replace, or toggle in Click-toggles mode / with Ctrl held), which is how a script chooses between overlapping faces without a coordinate", command: None },
     crate::automation::hit_keys::HitKeyDoc { panel: "pmilabel", prefix: "", meaning: "one rect per PMI label chip, keyed by annotation id \u{2014} a click SELECTS the annotation, a double click opens its form, a drag moves the label, and a RIGHT-click selects it and opens its menu (`pmimenu/menuitem:`)", command: None },
     crate::automation::hit_keys::HitKeyDoc { panel: "pmimenu", prefix: "menuitem:", meaning: "one rect per entry of a PMI label chip's open RIGHT-CLICK menu (pmimenu/menuitem:<annotation id>:<action id>) \u{2014} the same entries, and the same dispatch, as that annotation's PMI tree row menu (`pmi/menuitem:`): edit, move-up, move-down, delete", command: None },
@@ -268,7 +273,7 @@ pub static HIT_KEYS: &[crate::automation::hit_keys::HitKeyDoc] = &[
     crate::automation::hit_keys::HitKeyDoc { panel: "sheet", prefix: "dim:", meaning: "one rect per PLACED dimension's value box (sheet/dim:<dimension id>) \u{2014} DRAG it to move that dimension's line, one coalesced undo step per drag; click it to SELECT the dimension, double-click it to open its form in the Sheets pane, right-click it for its menu (`sheet/menuitem:`)", command: Some("sheet_move_dimension") },
     crate::automation::hit_keys::HitKeyDoc { panel: "sheet", prefix: "ord:", meaning: "one rect per ORDINATE SET's datum value box (sheet/ord:<set id>) \u{2014} DRAG it to move the whole run's shared baseline, one coalesced undo step per drag; click it to SELECT the set, double-click it to open the set's form in the Sheets pane, right-click it for its menu (`sheet/menuitem:`). A set whose DATUM is lost publishes none: it has no datum box to grab", command: Some("sheet_move_ordinate") },
     crate::automation::hit_keys::HitKeyDoc { panel: "sheet", prefix: "menuitem:", meaning: "one rect per entry of the open RIGHT-CLICK menu on the paper (sheet/menuitem:<object id>:<action id>) \u{2014} a right-click on a placement, a dimension's value box or an ordinate set's datum box selects that object and opens its Sheets tree row menu (`sheets/menuitem:`), with the same entries and the same dispatch; a right-click on bare paper opens the open sheet's own", command: None },
-    crate::automation::hit_keys::HitKeyDoc { panel: "sheet", prefix: "anchor:", meaning: "one rect per ANCHOR CANDIDATE of every placement on the open sheet (sheet/anchor:<reference>, e.g. sheet/anchor:SV2:vertex:Box#1) \u{2014} each projected vertex, each named edge's two ends and midpoint, and each circular edge's centre. Published only while the REFERENCE PICKER is up for a sheet object's reference row (a dimension's anchors, an ordinate set's datum or members, a section's cutting line, a detail's centre or rim \u{2014} opened by that row's `#activate`), because the list is as long as the model's topology; clicking one adds it to the picker's list (`modebar/refsel:finish` commits). A DETAIL placement offers only the candidates inside its circle", command: Some("sheet_anchor_pick") },
+    crate::automation::hit_keys::HitKeyDoc { panel: "sheet", prefix: "anchor:", meaning: "one rect per ANCHOR CANDIDATE of every placement on the open sheet (sheet/anchor:<reference>, e.g. sheet/anchor:SV2:vertex:Box#1) \u{2014} each projected vertex, each named edge's two ends and midpoint, and each circular edge's centre. Published only while the REFERENCE PICKER is up for a sheet object's reference row (a dimension's anchors, an ordinate set's datum or members, a section's cutting line, a detail's centre or rim \u{2014} opened by that row's `#activate`), because the list is as long as the model's topology; clicking one adds it to the field's list (a list commits from the field's own `#activate`, Done while the pick runs; a single field commits on its pick). A DETAIL placement offers only the candidates inside its circle", command: Some("sheet_anchor_pick") },
     // The eCAD editors' widgets — the tile an eCAD workbench draws its editor
     // in, and the tool card over it (`viewport/ecad.rs`), in screen points.
     crate::automation::hit_keys::HitKeyDoc { panel: "ecad", prefix: "canvas", meaning: "the eCAD editor's tile in screen points, while the Diagram, PCB, Symbol or Pads workbench draws its editor in place of the 3D view \u{2014} the sheet, board, symbol or pads canvas; a click, drag or wheel over it is the editor's own", command: None },

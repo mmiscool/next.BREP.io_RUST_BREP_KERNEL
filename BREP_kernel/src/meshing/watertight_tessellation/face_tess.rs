@@ -76,6 +76,46 @@ fn region_uv_box(vertices: &[FaceVertex]) -> [f64; 4] {
     bounds
 }
 
+/// The trim region's single polygon for the ear-clip path: either a branch
+/// handed one over directly, or the outer loop and holes `bridge_holes` will
+/// join on first use. The bridged length is known without bridging: every
+/// hole adds its vertices plus the two bridge copies.
+enum Bridged {
+    Ready(Vec<FaceVertex>),
+    Pending(Vec<FaceVertex>, Vec<Vec<FaceVertex>>),
+}
+
+impl Bridged {
+    fn len(&self) -> usize {
+        match self {
+            Bridged::Ready(polygon) => polygon.len(),
+            Bridged::Pending(outer, holes) => {
+                outer.len() + holes.iter().map(|hole| hole.len() + 2).sum::<usize>()
+            }
+        }
+    }
+
+    /// The polygon, bridging it now if it was pending.
+    fn polygon(&mut self) -> &[FaceVertex] {
+        if let Bridged::Pending(outer, holes) = self {
+            let polygon = bridge_holes(std::mem::take(outer), std::mem::take(holes));
+            *self = Bridged::Ready(polygon);
+        }
+        match self {
+            Bridged::Ready(polygon) => polygon,
+            Bridged::Pending(..) => unreachable!("bridged above"),
+        }
+    }
+
+    fn into_polygon(mut self) -> Vec<FaceVertex> {
+        self.polygon();
+        match self {
+            Bridged::Ready(polygon) => polygon,
+            Bridged::Pending(..) => unreachable!("bridged above"),
+        }
+    }
+}
+
 pub(super) fn tessellate_face_watertight(
     face: &FaceRecord,
     samples: &HashMap<u64, EdgeSamples>,
@@ -90,6 +130,20 @@ pub(super) fn tessellate_face_watertight(
     // paths below, bit-for-bit — for any surface that is not a sphere and for any
     // sphere whose charts it could not triangulate cleanly.
     if tessellate_spherical_face_watertight(face, samples, chord_tolerance, face_id, mesh)? {
+        tess_route(Route::SphereAtlas);
+        return Ok(());
+    }
+    // An UNTRIMMED pole-to-pole patch on a general surface (a NURBS Solid's
+    // cage body) is a structured grid, not a trim region (`pole_patch.rs`);
+    // the lane declines for every other face.
+    if tessellate_pole_patch_watertight(face, samples, chord_tolerance, face_id, mesh)? {
+        tess_route(Route::PolePatch);
+        return Ok(());
+    }
+    // Rectangular general NURBS faces consume the shared boundary unchanged.
+    // The opt-in grid lane declines every other trim or primitive carrier.
+    if tessellate_rectangle_watertight(face, samples, chord_tolerance, face_id, mesh)? {
+        tess_route(Route::NurbsRectangle);
         return Ok(());
     }
     let ku = KnotVector::new(face.surface.knots_u.clone(), face.surface.degree_u)?;
@@ -197,6 +251,7 @@ pub(super) fn tessellate_face_watertight(
     // real topological boundary needed by the pole-cap path.
     let full_biperiodic = crate::topology::doubly_periodic_has_only_collapsed_loops(face)?;
     if full_biperiodic {
+        tess_route(Route::FullBiperiodic);
         return tessellate_full_biperiodic_face(
             face,
             [u0, u1, v0, v1],
@@ -321,7 +376,7 @@ pub(super) fn tessellate_face_watertight(
     } else {
         None
     };
-    let mut vertices = if let Some((outer, holes)) = recut {
+    let bridged = if let Some((outer, holes)) = recut {
         if std::env::var("BREP_DEBUG_TESS_DISPATCH").is_ok() {
             eprintln!(
                 "[DISPATCH] face {face_id}: -> close_periodic_recut_wall (outer={}, holes={})",
@@ -335,7 +390,8 @@ pub(super) fn tessellate_face_watertight(
         // the CDT (the clean multi-loop path that replaces the folding notch bite).
         periodic_interior = true;
         cdt_input = Some((outer.clone(), holes.clone()));
-        bridge_holes(outer, holes)
+        tess_route(Route::RecutWall);
+        Bridged::Pending(outer, holes)
     } else if let Some((outer, holes)) = seam_straddle {
         if std::env::var("BREP_DEBUG_TESS_DISPATCH").is_ok() {
             eprintln!(
@@ -349,7 +405,8 @@ pub(super) fn tessellate_face_watertight(
         // domain-wrapping evaluator (like the biperiodic-unwrapped branch).
         periodic_interior = true;
         cdt_input = Some((outer.clone(), holes.clone()));
-        bridge_holes(outer, holes)
+        tess_route(Route::SeamStraddle);
+        Bridged::Pending(outer, holes)
     } else if let Some((outer, holes)) = biperiodic_straddle {
         if std::env::var("BREP_DEBUG_TESS_DISPATCH").is_ok() {
             eprintln!(
@@ -363,7 +420,8 @@ pub(super) fn tessellate_face_watertight(
         // domain-wrapping evaluator; the simple PSLG is offered to the CDT.
         periodic_interior = true;
         cdt_input = Some((outer.clone(), holes.clone()));
-        bridge_holes(outer, holes)
+        tess_route(Route::BiperiodicStraddle);
+        Bridged::Pending(outer, holes)
     } else if biperiodic_unwrapped {
         // The implicit torus seam is already unwrapped into one continuous
         // covering-plane polygon per loop: bridge holes and ear-clip it like an
@@ -422,7 +480,8 @@ pub(super) fn tessellate_face_watertight(
         // already set above, so CDT-path refinement uses the domain-wrapping
         // evaluator. Orientation (outer CCW / holes CW) is established just above.
         cdt_input = Some((outer.clone(), holes.clone()));
-        bridge_holes(outer, holes)
+        tess_route(Route::BiperiodicUnwrapped);
+        Bridged::Pending(outer, holes)
     } else if let Some((polygon, wraps_cross_seam)) = close_periodic_trim(
         face,
         &chains,
@@ -442,7 +501,8 @@ pub(super) fn tessellate_face_watertight(
             periodic_interior = true;
             single_period_cover = true;
         }
-        polygon
+        tess_route(Route::PeriodicTrim);
+        Bridged::Ready(polygon)
     } else if let Some(polygon) = close_biperiodic_seam_band(
         face,
         &chains,
@@ -458,7 +518,8 @@ pub(super) fn tessellate_face_watertight(
         // a single-valued wavy cut: seam-cut in domain (the rim shifted to the
         // opposite extreme keeps it in domain), then the shared seed+refine path
         // fills the curved tube like close_periodic_trim's between-rims band.
-        polygon
+        tess_route(Route::BiperiodicSeamBand);
+        Bridged::Ready(polygon)
     } else if let Some(polygon) = close_periodic_band(
         face,
         &chains,
@@ -474,7 +535,8 @@ pub(super) fn tessellate_face_watertight(
         // single-valued varying-level profile loop (thread runout/transition):
         // seam-cut in domain, then the shared seed+refine path (like
         // close_periodic_trim).
-        polygon
+        tess_route(Route::PeriodicBand);
+        Bridged::Ready(polygon)
     } else if let Some(polygon) =
         close_periodic_spiral_annulus(face, &chains, [u0, u1, v0, v1], closed_u, closed_v)?
     {
@@ -486,7 +548,8 @@ pub(super) fn tessellate_face_watertight(
         // parameters run many periods past the seam — refine through the
         // domain-wrapping evaluator, with no grid seed (single-period extent).
         periodic_interior = true;
-        polygon
+        tess_route(Route::SpiralAnnulus);
+        Bridged::Ready(polygon)
     } else if let Some((polygon, needs_periodic)) = unwrap_seam_crossing_trim(
         face,
         &chains,
@@ -503,7 +566,8 @@ pub(super) fn tessellate_face_watertight(
         } else {
             skip_interior = true;
         }
-        polygon
+        tess_route(Route::SeamCrossing);
+        Bridged::Ready(polygon)
     } else if let Some((polygon, _wraps_cross_seam)) = close_periodic_wavy_band(
         face,
         &chains,
@@ -518,7 +582,8 @@ pub(super) fn tessellate_face_watertight(
         // A full-wrap castellated band (spoked / gear web): meshed like
         // close_periodic_trim's in-domain band — seed + refine over the seam-cut
         // rectangle, so the window notches stay outside the boundary (open).
-        polygon
+        tess_route(Route::WavyBand);
+        Bridged::Ready(polygon)
     } else if let Some((outer, holes)) = close_periodic_wrap_wall(
         face,
         &chains,
@@ -542,7 +607,8 @@ pub(super) fn tessellate_face_watertight(
         // of the self-touching wrap ear-clip would spray into a fold).
         periodic_interior = true;
         cdt_input = Some((outer.clone(), holes.clone()));
-        bridge_holes(outer, holes)
+        tess_route(Route::WrapWall);
+        Bridged::Pending(outer, holes)
     } else {
         if std::env::var("BREP_DEBUG_TESS_DISPATCH").is_ok() {
             eprintln!("[DISPATCH] face {face_id}: -> GENERIC bridge_holes (closed=(u:{closed_u},v:{closed_v}) loops={})", chains.len());
@@ -598,12 +664,23 @@ pub(super) fn tessellate_face_watertight(
         // The CDT wants CCW outer / CW holes, as established just above.
         defer_cdt = holes.is_empty() && polygon_is_simple(&outer);
         cdt_input = Some((outer.clone(), holes.clone()));
-        bridge_holes(outer, holes)
+        tess_route(Route::Generic);
+        Bridged::Pending(outer, holes)
     };
-    if vertices.len() < 3 {
+    if bridged.len() < 3 {
         return Ok(());
     }
-    if tessellate_pointed_cone_fan(face, &vertices, [u0, u1, v0, v1], chord_tolerance, face_id, mesh)? {
+    // The pointed-cone fan reads the bridged polygon, but only on a ruled
+    // revolution (its first test); every other face keeps the bridge pending
+    // until the CDT has declined it, because `bridge_holes` is the single
+    // most expensive stage of a many-holed planar face (113 of the plate's
+    // 166 ms per face) and its polygon is dropped unread whenever
+    // `surface_cdt` succeeds.
+    let mut bridged = bridged;
+    if matches!(face.surface.analytic(), Some(crate::AnalyticSurface::RuledRevolution { .. }))
+        && tessellate_pointed_cone_fan(face, bridged.polygon(), [u0, u1, v0, v1], chord_tolerance, face_id, mesh)?
+    {
+        tess_route(Route::PointedCone);
         return Ok(());
     }
     // Intrinsic uv scale, computed HERE (before triangulation) so the CDT path
@@ -650,6 +727,7 @@ pub(super) fn tessellate_face_watertight(
         // Ear-clip path on the bridged polygon (the historical route). Boundary
         // (and bridge) segments are the consecutive index pairs of the bridged
         // polygon; refinement must never split these.
+        let vertices = bridged.into_polygon();
         let mut boundary_pairs = HashSet::new();
         for index in 0..vertices.len() {
             let next = (index + 1) % vertices.len();
@@ -694,7 +772,9 @@ pub(super) fn tessellate_face_watertight(
             ring: &original_ring,
             max_split_span,
         };
+        let earclip_started = profile_started();
         let triangles = ear_clip(&vertices, &mut indices, &region_guard);
+        tess_profile(|p| p.earclip_ms += elapsed_ms(earclip_started));
         if std::env::var("BREP_DEBUG_TESS").is_ok() {
             eprintln!(
                 "face {}: boundary={} ear_clip={} triangles",
@@ -745,6 +825,7 @@ pub(super) fn tessellate_face_watertight(
             }
         }
     }
+    tess_profile(|p| p.cdt_used += u64::from(used_cdt));
     if used_cdt {
         // The CDT gave a Delaunay boundary triangulation. Seed its interior on
         // the same curvature grid the ear-clip path uses: reaching that density
@@ -838,6 +919,7 @@ pub(super) fn tessellate_face_watertight(
         )?;
     }
     if let Some((outer, holes)) = planar_trim {
+        let _timer = stage_timer(Stage::Certify);
         if !certified_planar_trim(&vertices, &triangles, &outer, &holes) {
             if let Some(direct) = direct_planar_cdt(outer, holes) {
                 if std::env::var("BREP_DEBUG_PLANAR_CDT").is_ok() {

@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:brep="https://brep.io/icons"
+     viewBox="0 0 24 24" width="24" height="24" brep:glyph-name="icon_feat_sketch3d" brep:unicode="E0C6">
+  <!-- A 3D sketch: a tube-frame run that leaves the ground plane, climbs through a bend and turns in space; the ground plane in the curve family's body tone, the run in its ink, every vertex marked. -->
+  <path d="M2 17.2 9.6 13.4 16.2 16.6 8.6 20.4Z" fill="#a5e8c4" stroke="#125236" stroke-width="1.1" stroke-linejoin="round" stroke-linecap="round"/>
+  <path d="M5.2 18.6 12.4 15.1 12.4 7.4 Q12.4 4.6 15.2 4.6 L21.4 4.6" style="fill:none" stroke="#2fa469" stroke-width="2.1" stroke-linejoin="round" stroke-linecap="round"/>
+  <path d="M15.2 4.6 18.8 9.8" style="fill:none" stroke="#2fa469" stroke-width="2.1" stroke-linejoin="round" stroke-linecap="round"/>
+  <ellipse cx="5.2" cy="18.6" rx="1.1" ry="1.1" fill="#125236"/>
+  <ellipse cx="12.4" cy="15.1" rx="1.1" ry="1.1" fill="#125236"/>
+  <ellipse cx="12.4" cy="7.4" rx="1.1" ry="1.1" fill="#125236"/>
+  <ellipse cx="21.4" cy="4.6" rx="1.1" ry="1.1" fill="#125236"/>
+  <ellipse cx="18.8" cy="9.8" rx="1.1" ry="1.1" fill="#125236"/>
+</svg>

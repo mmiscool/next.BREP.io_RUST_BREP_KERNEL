@@ -1,5 +1,6 @@
 use crate::{KernelRefusal, KernelStage, OrRefuse};
 use super::*;
+use super::sector::{borders_section, sector_census_line, sector_class, SectorContext, SectorMode, SelectCensus};
 
 fn face_normal(fragment: &FaceFragmentRecord) -> Result<Vec3, KernelRefusal> {
     let normal = fragment
@@ -23,6 +24,20 @@ fn classify_fragment(
     fragment: &FaceFragmentRecord,
     debug: bool,
 ) -> Result<crate::PointClassification, KernelRefusal> {
+    classify_fragment_traced(classifier, fragment, debug).map(|(classification, _)| classification)
+}
+
+/// [`classify_fragment`] with the route the verdict took: `primary` (the test
+/// point alone), `on_kept` / `on_to_in` / `on_to_out` (an On primary kept or
+/// overturned by the extras' vote), `coincident_rescue` (an In/Out primary
+/// rescued to On by the size-derived band) or `overturned` (an In/Out primary
+/// the extras unanimously contradicted). The sector classification reads the
+/// route to count the votes it makes unnecessary.
+pub(super) fn classify_fragment_traced(
+    classifier: &SolidClassifier,
+    fragment: &FaceFragmentRecord,
+    debug: bool,
+) -> Result<(crate::PointClassification, &'static str), KernelRefusal> {
     let primary = classifier.classify(fragment.test_point).or_refuse(KernelStage::Select, "classify")?;
     if debug {
         eprintln!(
@@ -77,10 +92,10 @@ fn classify_fragment(
                     fragment.source_face_id
                 );
             }
-            return Ok(crate::PointClassification {
+            return Ok((crate::PointClassification {
                 class: PointClass::Out,
                 on_normal: None,
-            });
+            }, "on_to_out"));
         }
         if on_votes == 0 && out_votes == 0 && in_votes >= 2 {
             if debug {
@@ -89,12 +104,12 @@ fn classify_fragment(
                     fragment.source_face_id
                 );
             }
-            return Ok(crate::PointClassification {
+            return Ok((crate::PointClassification {
                 class: PointClass::In,
                 on_normal: None,
-            });
+            }, "on_to_in"));
         }
-        return Ok(primary);
+        return Ok((primary, if fragment.extra_test_points.is_empty() { "primary" } else { "on_kept" }));
     }
     // A stray In/Out on a face that is actually coincident with the other
     // solid's boundary (near-coincident across a noise-scale gap that the
@@ -113,14 +128,14 @@ fn classify_fragment(
                     fragment.source_face_id, primary.class
                 );
             }
-            return Ok(crate::PointClassification {
+            return Ok((crate::PointClassification {
                 class: PointClass::On,
                 on_normal: Some(on_normal),
-            });
+            }, "coincident_rescue"));
         }
     }
     if fragment.extra_test_points.is_empty() {
-        return Ok(primary);
+        return Ok((primary, "primary"));
     }
     let mut agreeing = 0usize;
     let mut opposing = 0usize;
@@ -142,12 +157,12 @@ fn classify_fragment(
                 fragment.source_face_id, primary.class, overturned, opposing
             );
         }
-        return Ok(crate::PointClassification {
+        return Ok((crate::PointClassification {
             class: overturned,
             on_normal: None,
-        });
+        }, "overturned"));
     }
-    Ok(primary)
+    Ok((primary, "primary"))
 }
 
 /// Adjacency key of a boundary coedge: the ORIGINAL edge id paired with
@@ -258,11 +273,20 @@ fn side_keep_decisions(
     barrier_edges: &HashSet<(u8, u64)>,
     cosurface_partners: &HashMap<u64, Vec<&FaceRecord>>,
     coincident: &CoincidentPairs,
+    sector: Option<(&SectorContext<'_>, SectorMode)>,
+    census: &mut SelectCensus,
 ) -> Result<Vec<bool>, KernelRefusal> {
-    let classify_side = |fragment: &FaceFragmentRecord| -> Result<crate::PointClassification, KernelRefusal> {
-        let classification = classify_fragment(classifier, fragment, debug)?;
+    let side = if first_operand { "A" } else { "B" };
+    let ray_cast = |fragment: &FaceFragmentRecord, census: &mut SelectCensus| -> Result<(crate::PointClassification, &'static str), KernelRefusal> {
+        let (classification, route) = classify_fragment_traced(classifier, fragment, debug)?;
+        census.ray_casts += 1;
+        match route {
+            "on_kept" | "on_to_in" | "on_to_out" => census.on_votes += 1,
+            "overturned" => census.overturns += 1,
+            _ => {}
+        }
         if classification.class == PointClass::On {
-            return Ok(classification);
+            return Ok((classification, route));
         }
         match cosurface_on(fragment, cosurface_partners, tolerance)? {
             Some(on) => {
@@ -272,9 +296,64 @@ fn side_keep_decisions(
                         fragment.source_face_id, classification.class
                     );
                 }
-                Ok(on)
+                Ok((on, "cosurface_on"))
             }
-            None => Ok(classification),
+            None => Ok((classification, route)),
+        }
+    };
+    let classify_side = |fragment: &FaceFragmentRecord, census: &mut SelectCensus| -> Result<crate::PointClassification, KernelRefusal> {
+        let Some((context, mode)) = sector else {
+            return ray_cast(fragment, census).map(|(classification, _)| classification);
+        };
+        if !borders_section(fragment) {
+            return ray_cast(fragment, census).map(|(classification, _)| classification);
+        }
+        let verdict = sector_class(context, fragment)?;
+        census.eligible += 1;
+        match verdict.class {
+            Some(class) => {
+                census.sector_primary += 1;
+                if mode == SectorMode::On {
+                    if debug {
+                        eprintln!(
+                            "frag {side} src_face={} sector {class:?} ({}, {} ladder steps, {} samples)",
+                            fragment.source_face_id, verdict.route, verdict.ladder_steps, verdict.samples
+                        );
+                    }
+                    return Ok(crate::PointClassification { class, on_normal: None });
+                }
+                let (ray, route) = ray_cast(fragment, census)?;
+                let agree = ray.class == class;
+                if !agree {
+                    census.disagree += 1;
+                    if debug {
+                        eprintln!(
+                            "frag {side} src_face={} sector {class:?} ({}) DISAGREES with ray {:?} ({route})",
+                            fragment.source_face_id, verdict.route, ray.class
+                        );
+                    }
+                }
+                sector_census_line(|| {
+                    format!(
+                        "fragment {side} face={} sector={class:?}:{} ladder={} samples={} ray={:?}:{route} agree={agree}",
+                        fragment.source_face_id, verdict.route, verdict.ladder_steps, verdict.samples, ray.class
+                    )
+                });
+                Ok(ray)
+            }
+            None => {
+                census.sector_fallback += 1;
+                let (ray, route) = ray_cast(fragment, census)?;
+                if mode == SectorMode::Check {
+                    sector_census_line(|| {
+                        format!(
+                            "fragment {side} face={} sector=None:{} ladder={} samples={} ray={:?}:{route} agree=n/a",
+                            fragment.source_face_id, verdict.route, verdict.ladder_steps, verdict.samples, ray.class
+                        )
+                    });
+                }
+                Ok(ray)
+            }
         }
     };
     let decide = |fragment: &FaceFragmentRecord,
@@ -353,7 +432,7 @@ fn side_keep_decisions(
             .flat_map(|loop_record| &loop_record.coedges)
             .any(|coedge| !matches!(coedge.source, FragmentEdgeSource::Boundary { .. }));
         if touched || classifier.near_surface(fragment.test_point).or_refuse(KernelStage::Select, "near_surface")? {
-            let classification = classify_side(fragment)?;
+            let classification = classify_side(fragment, census)?;
             let (value, source) = decide(fragment, &classification)?;
             keep[index] = Some(value);
             propagatable[index] = source;
@@ -405,7 +484,7 @@ fn side_keep_decisions(
     }
     for index in 0..fragments.len() {
         if on_adjacent[index] && keep[index].is_none() {
-            let classification = classify_side(&fragments[index])?;
+            let classification = classify_side(&fragments[index], census)?;
             let (value, source) = decide(&fragments[index], &classification)?;
             keep[index] = Some(value);
             propagatable[index] = source;
@@ -440,7 +519,7 @@ fn side_keep_decisions(
                             let mut direct = Vec::with_capacity(fragments.len());
                             for fragment in fragments {
                                 let classification =
-                                    classify_side(fragment)?;
+                                    classify_side(fragment, census)?;
                                 direct.push(decide(fragment, &classification)?.0);
                             }
                             return Ok(direct);
@@ -470,7 +549,7 @@ fn side_keep_decisions(
         if !progressed {
             match keep.iter().position(Option::is_none) {
                 Some(index) => {
-                    let classification = classify_side(&fragments[index])?;
+                    let classification = classify_side(&fragments[index], census)?;
                     let (value, source) = decide(&fragments[index], &classification)?;
                     keep[index] = Some(value);
                     propagatable[index] = source;
@@ -493,10 +572,15 @@ pub(super) fn select_fragments(
     operation: BooleanOperation,
     tolerance: f64,
     barrier_edges: &HashSet<(u8, u64)>,
-    cosurface_pairs: &[(FaceKey, FaceKey)],
+    imprint: &ImprintResultRecord,
     coincident: &CoincidentPairs,
+    mode: SectorMode,
+    census: &mut SelectCensus,
 ) -> Result<Vec<FaceFragmentRecord>, KernelRefusal> {
     let debug = std::env::var("BREP_DEBUG_BOOL").is_ok();
+    let cosurface_pairs = &imprint.cosurface_pairs;
+    let context = SectorContext::new(imprint, pristine_a, pristine_b, tolerance);
+    let sector = (mode != SectorMode::Off).then_some((&context, mode));
     let mut selected = Vec::new();
     // Each operand's face id -> the other pristine operand's faces the imprint
     // read as the same surface.
@@ -529,6 +613,8 @@ pub(super) fn select_fragments(
         barrier_edges,
         &partners_of_a,
         coincident,
+        sector,
+        census,
     )?;
     for (fragment, keep) in fragments_a.into_iter().zip(keep_a) {
         if keep {
@@ -545,6 +631,8 @@ pub(super) fn select_fragments(
         barrier_edges,
         &partners_of_b,
         coincident,
+        sector,
+        census,
     )?;
     for (mut fragment, keep) in fragments_b.into_iter().zip(keep_b) {
         if !keep {

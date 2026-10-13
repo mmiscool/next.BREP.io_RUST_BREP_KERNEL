@@ -1124,6 +1124,128 @@ pub(in crate::blend) fn read_shipped_pcurve(
     d0: f64,
     d1: f64,
 ) -> Result<(f64, f64, usize, f64), KernelRefusal> {
+    read_shipped_pcurve_memo(surface, rail, pcurve, d0, d1, &mut FootMemo::transient())
+}
+
+/// The carrier's point at `(u, v)` as `evaluate_extended` reads it, without
+/// the derivative engine. Inside the domain the extended evaluator returns
+/// `derivatives(u, v, 0)[0][0]`: the basis derivative table (A2.3) for zero
+/// derivatives, the homogeneous sum, two nested vectors, and the point scaled
+/// by the reciprocal weight. The point-only evaluator (`evaluate_homogeneous`)
+/// builds the same basis values by the same recurrence (A2.2 is A2.3's row
+/// zero, term for term, on the stack and on the heap alike), clamps and finds
+/// the span the same way and sums the same control points in the same order,
+/// so its homogeneous point is the derivative engine's to the bit; the
+/// de-homogenization is repeated here the derivative engine's way (scale by
+/// `1 / w`, the same zero-weight bar), where `Vec4::point` would divide.
+/// Outside the domain (a seed past a closed seam, a station on the extension)
+/// the extended evaluator itself answers, as before. The shipped read asks
+/// twice per station, 12.7k times on the box fillet's 24 rails, where the
+/// two derivative-engine answers were 7.2 of the read's 10.3 ms (2026-10-12).
+pub(in crate::blend) fn carrier_point(surface: &NurbsSurface, u: f64, v: f64) -> Result<Vec3, String> {
+    let [u0, u1] = surface.domain_u()?;
+    let [v0, v1] = surface.domain_v()?;
+    if u >= u0 && u <= u1 && v >= v0 && v <= v1 {
+        let homogeneous = surface.evaluate_homogeneous(u, v)?;
+        let weight = homogeneous.w;
+        // The derivative engine's bar (`NurbsSurface::derivatives`, EPS).
+        if weight.abs() <= 1e-12 {
+            return Err("NurbsSurface: zero evaluated weight".into());
+        }
+        return Ok(Vec3::new(homogeneous.x, homogeneous.y, homogeneous.z).scale(1.0 / weight));
+    }
+    surface.evaluate_extended(u, v)
+}
+
+/// One sample of a shipped support pcurve read against its rail: the
+/// pcurve's (u, v) at the rail parameter, the rail point there, and the
+/// rail point's foot on the carrier sought from that (u, v) ([`foot`]) with
+/// the carrier evaluated at the foot. What every read of one trim computes
+/// per parameter before it reduces; kept so the reads share it.
+#[derive(Clone)]
+struct FootRead {
+    uv: [f64; 2],
+    point: Vec3,
+    on_carrier: Vec3,
+}
+
+/// The feet of ONE support pcurve against ONE rail, by rail parameter (its
+/// bits): [`read_shipped_pcurve_memo`], [`standoff_excess_memo`] and
+/// [`standoff_over_nearest_memo`] seek each foot once and share it, because
+/// the three reads sample the same 513 uniform parameters and the same
+/// knots, and a foot is a deterministic function of its inputs (the same
+/// (u, v) seed, the same rail point, the same carrier), so sharing moves no
+/// bit of any reading. A memo belongs to one (pcurve, rail, carrier) triple;
+/// the caller keeps one per pcurve it reads. A failed sample is memoised as
+/// its refusal, so each read applies its own rule to it (an unreadable
+/// sample in the shipped read, a refusal in the standoff reads).
+#[derive(Default)]
+pub(in crate::blend) struct FootMemo {
+    feet: std::collections::HashMap<u64, Result<FootRead, KernelRefusal>>,
+    /// A memo that keeps nothing: the one-shot read (`read_shipped_pcurve`)
+    /// has no second read to share feet with, and storing the 530 feet it
+    /// never read back was 1.7 of the box fillet's 10.3 ms of exact reads
+    /// (2026-10-12). A repeated parameter is sought again and, a foot being a
+    /// deterministic function of its inputs, reads the same bits.
+    transient: bool,
+}
+
+impl FootMemo {
+    /// A memo that stores no foot (see `transient`).
+    pub(in crate::blend) fn transient() -> Self {
+        FootMemo { feet: Default::default(), transient: true }
+    }
+
+    /// How many feet are stored.
+    pub(in crate::blend) fn stored(&self) -> usize {
+        self.feet.len()
+    }
+
+    /// Forget every foot (the pcurve it was read for is replaced).
+    pub(in crate::blend) fn clear(&mut self) {
+        self.feet.clear();
+    }
+
+    /// The foot at `t`, sought once: the rail point first (so a rail that
+    /// cannot be evaluated refuses as the rail's, as the unshared reads did),
+    /// then the pcurve's (u, v) and the foot sought from it.
+    fn at(
+        &mut self,
+        surface: &NurbsSurface,
+        rail: &dyn Fn(f64) -> Result<Vec3, String>,
+        pcurve: &crate::NurbsCurve,
+        t: f64,
+    ) -> Result<FootRead, KernelRefusal> {
+        if !self.transient {
+            if let Some(read) = self.feet.get(&t.to_bits()) {
+                return read.clone();
+            }
+        }
+        let read = (|| -> Result<FootRead, KernelRefusal> {
+            let point = rail(t).or_refuse(KernelStage::Refine, "rail")?;
+            let uv = pcurve.evaluate(t).or_refuse(KernelStage::Refine, "evaluate")?;
+            let [u, v] = foot(surface, point, Some([uv.x, uv.y]))?;
+            let on_carrier = carrier_point(surface, u, v).or_refuse(KernelStage::Refine, "evaluate_extended")?;
+            Ok(FootRead { uv: [uv.x, uv.y], point, on_carrier })
+        })();
+        if !self.transient {
+            self.feet.insert(t.to_bits(), read.clone());
+        }
+        read
+    }
+}
+
+/// [`read_shipped_pcurve`] with its feet shared through `memo` (the memo of
+/// `pcurve` against `rail`): the same parameters, the same samples, the same
+/// reduction, bit for bit.
+pub(in crate::blend) fn read_shipped_pcurve_memo(
+    surface: &NurbsSurface,
+    rail: &dyn Fn(f64) -> Result<Vec3, String>,
+    pcurve: &crate::NurbsCurve,
+    d0: f64,
+    d1: f64,
+    memo: &mut FootMemo,
+) -> Result<(f64, f64, usize, f64), KernelRefusal> {
     let mut parameters: Vec<f64> = pcurve.knots.iter().copied().filter(|knot| *knot >= d0 && *knot <= d1).collect();
     parameters.push(d0);
     parameters.push(d1);
@@ -1136,11 +1258,8 @@ pub(in crate::blend) fn read_shipped_pcurve(
     let mut offset = 0.0_f64;
     for &t in &parameters {
         let read = (|| -> Result<(f64, f64), KernelRefusal> {
-            let uv = pcurve.evaluate(t).or_refuse(KernelStage::Refine, "evaluate")?;
-            let point = rail(t).or_refuse(KernelStage::Refine, "rail")?;
-            let [u, v] = foot(surface, point, Some([uv.x, uv.y]))?;
-            let on_carrier = surface.evaluate_extended(u, v).or_refuse(KernelStage::Refine, "evaluate_extended")?;
-            let image = surface.evaluate_extended(uv.x, uv.y).or_refuse(KernelStage::Refine, "evaluate_extended")?;
+            let FootRead { uv, point, on_carrier } = memo.at(surface, rail, pcurve, t)?;
+            let image = carrier_point(surface, uv[0], uv[1]).or_refuse(KernelStage::Refine, "evaluate_extended")?;
             Ok((image.sub(on_carrier).length(), point.sub(on_carrier).length()))
         })();
         // A sample is read only when BOTH its residual and the rail's
@@ -1178,6 +1297,21 @@ pub(in crate::blend) fn standoff_excess(
     d0: f64,
     d1: f64,
 ) -> Result<f64, KernelRefusal> {
+    standoff_excess_memo(surface, rail, reference, candidate, d0, d1, &mut FootMemo::default(), &mut FootMemo::default())
+}
+
+/// [`standoff_excess`] with the reference's and the candidate's feet shared
+/// through their memos (each the memo of that pcurve against `rail`).
+pub(in crate::blend) fn standoff_excess_memo(
+    surface: &NurbsSurface,
+    rail: &dyn Fn(f64) -> Result<Vec3, String>,
+    reference: &crate::NurbsCurve,
+    candidate: &crate::NurbsCurve,
+    d0: f64,
+    d1: f64,
+    reference_memo: &mut FootMemo,
+    candidate_memo: &mut FootMemo,
+) -> Result<f64, KernelRefusal> {
     let mut parameters: Vec<f64> = reference.knots.iter().chain(&candidate.knots).copied().filter(|knot| *knot >= d0 && *knot <= d1).collect();
     parameters.push(d0);
     parameters.push(d1);
@@ -1186,15 +1320,16 @@ pub(in crate::blend) fn standoff_excess(
     let spans: Vec<f64> = parameters.windows(2).flat_map(|pair| (1..16).map(move |j| pair[0] + (pair[1] - pair[0]) * j as f64 / 16.0)).collect();
     parameters.extend(spans);
     parameters.extend((0..=512).map(|k| d0 + (d1 - d0) * k as f64 / 512.0));
-    let standoff = |pcurve: &crate::NurbsCurve, point: Vec3, t: f64| -> Result<f64, KernelRefusal> {
-        let uv = pcurve.evaluate(t).or_refuse(KernelStage::Refine, "evaluate")?;
-        let [u, v] = foot(surface, point, Some([uv.x, uv.y]))?;
-        Ok(point.sub(surface.evaluate_extended(u, v).or_refuse(KernelStage::Refine, "evaluate_extended")?).length())
+    // The rail point is read first, as the unshared read did, so a rail that
+    // cannot be evaluated refuses as the rail's.
+    let standoff = |memo: &mut FootMemo, pcurve: &crate::NurbsCurve, t: f64| -> Result<f64, KernelRefusal> {
+        let FootRead { point, on_carrier, .. } = memo.at(surface, rail, pcurve, t)?;
+        Ok(point.sub(on_carrier).length())
     };
     let mut excess = f64::NEG_INFINITY;
     for &t in &parameters {
-        let point = rail(t).or_refuse(KernelStage::Refine, "rail")?;
-        let difference = standoff(candidate, point, t)? - standoff(reference, point, t)?;
+        rail(t).or_refuse(KernelStage::Refine, "rail")?;
+        let difference = standoff(candidate_memo, candidate, t)? - standoff(reference_memo, reference, t)?;
         if !difference.is_finite() {
             return Err(KernelRefusal::non_convergence(KernelStage::Refine, "track_fit_unreadable", format!(
                 "blend: a support trim's standoff is unreadable at t = {t}"
@@ -1223,16 +1358,28 @@ pub(in crate::blend) fn standoff_over_nearest(
     d0: f64,
     d1: f64,
 ) -> Result<f64, KernelRefusal> {
+    standoff_over_nearest_memo(surface, rail, candidate, d0, d1, &mut FootMemo::default())
+}
+
+/// [`standoff_over_nearest`] with the candidate's feet shared through `memo`
+/// (the memo of `candidate` against `rail`); the nearest-point projection is
+/// this read's own.
+pub(in crate::blend) fn standoff_over_nearest_memo(
+    surface: &NurbsSurface,
+    rail: &dyn Fn(f64) -> Result<Vec3, String>,
+    candidate: &crate::NurbsCurve,
+    d0: f64,
+    d1: f64,
+    memo: &mut FootMemo,
+) -> Result<f64, KernelRefusal> {
     let mut parameters: Vec<f64> = candidate.knots.iter().copied().filter(|knot| *knot >= d0 && *knot <= d1).collect();
     parameters.extend((0..=512).map(|k| d0 + (d1 - d0) * k as f64 / 512.0));
     parameters.sort_by(f64::total_cmp);
     parameters.dedup();
     let mut excess = f64::NEG_INFINITY;
     for &t in &parameters {
-        let point = rail(t).or_refuse(KernelStage::Refine, "rail")?;
-        let uv = candidate.evaluate(t).or_refuse(KernelStage::Refine, "evaluate")?;
-        let [u, v] = foot(surface, point, Some([uv.x, uv.y]))?;
-        let standoff = point.sub(surface.evaluate_extended(u, v).or_refuse(KernelStage::Refine, "evaluate_extended")?).length();
+        let FootRead { point, on_carrier, .. } = memo.at(surface, rail, candidate, t)?;
+        let standoff = point.sub(on_carrier).length();
         let nearest = crate::project_point_to_surface(surface, point).or_refuse(KernelStage::Refine, "project")?.distance;
         let difference = standoff - nearest;
         if !difference.is_finite() {

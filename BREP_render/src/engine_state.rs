@@ -102,6 +102,14 @@ pub struct EngineState {
     /// to restore on exit. All the enter/exit/new logic lives in the appended
     /// sketch-mode impl block at the END of this file.
     sketch_edit: Option<SketchEdit>,
+    /// The active engine-native 3D SKETCH edit (`Some` while in 3D sketch
+    /// mode): the live [`crate::sketch3d::Sketch3dSession`] plus the pre-entry
+    /// camera + roll. See `sketch3d_mode.rs`.
+    sketch3d_edit: Option<Sketch3dEdit>,
+    /// The `world_per_pixel` the 3D sketch overlay was last baked at (its
+    /// working-plane and reference-plane squares are pixel-sized); `0.0` =
+    /// not in 3D sketch mode.
+    pub(crate) sketch3d_overlay_wpp: f64,
     /// Sketch-mode camera lock. When true (the default on every sketch entry), the
     /// camera is held flat-on to the sketch plane and an empty drag only PANS —
     /// no orbit. Toggling it back on re-faces the camera to the plane. Meaningful
@@ -292,6 +300,13 @@ pub struct EngineState {
     /// that anchor; the index of the last such pick, until the panel takes it.
     spline_edit_feature: Option<String>,
     spline_anchor_picked: Option<usize>,
+    /// The NURBS solid whose control-cage editor is open (fed by the history
+    /// panel with the cage overlay) and what that overlay was last fed for —
+    /// `(feature id, selected points, applied run generation)`. The selection
+    /// itself is the transform gizmo's (`TransformArm::cage`). See
+    /// `cage_edit.rs`.
+    cage_edit_feature: Option<String>,
+    cage_overlay_key: Option<(String, Vec<usize>, u64)>,
     /// Construction datum/plane visibility: the frame NAMES whose datum plane is
     /// HIDDEN (its Scene-tree checkbox off). Absent = visible. Mirrors
     /// [`hidden_sketches`].
@@ -423,6 +438,11 @@ pub struct EngineState {
     /// Re-entrancy guard for the parts-library resync in [`Self::pump`] (a
     /// refused run re-runs, and `rerun_history` pumps).
     pub(crate) library_resync: bool,
+    /// A run just RELEASED a sketch's edge links whose edges it could not
+    /// resolve (see [`Self::release_unresolved_sketch_links`]): the history
+    /// changed under the applied report, so [`Self::pump`] re-runs it once and
+    /// the report stops naming edges the sketch no longer lists.
+    pub(crate) sketch_links_released: bool,
     /// The assembly-constraint viewport overlays — the cached
     /// [`crate::constraint_overlays::ConstraintOverlay`] records the engine last
     /// built from the kernel session (`assembly_overlay_json` + state), the source
@@ -604,6 +624,24 @@ pub struct RefSelectState {
     /// Which surface Finish commits the names to (feature params vs an
     /// assembly constraint's `inputParams`). Defaults to [`RefSelectTarget::Feature`].
     pub target: RefSelectTarget,
+    /// How many picks landed since the field was activated (a viewport click,
+    /// a fed name, a sheet anchor). A SINGLE-valued field drawn IN ITS FORM
+    /// finishes on its first pick — the form's consumer has nothing to wait
+    /// for once the one reference is in — and this is what says one landed,
+    /// as opposed to the seed the field opened with.
+    pub picks: usize,
+    /// Whether the field's own form drew the pick this frame. An in-form pick
+    /// has no card of its own, so a form that stops being drawn (its pane
+    /// tabbed away or closed, its subject gone) would strand the pick with
+    /// nothing on screen to end it; the shell finishes a pick nobody claimed.
+    pub claimed: bool,
+    /// The form asked for the pick to finish at the END of this frame rather
+    /// than now: an edit elsewhere on a feature's form while its pick runs.
+    /// Deferred because the viewport pane may draw AFTER the form in the same
+    /// frame and the click that caused the edit (a text field losing focus)
+    /// may itself be the pick — finishing at once would hand that click to
+    /// the ordinary selection instead.
+    pub finish_requested: bool,
 }
 
 impl Default for EngineState {
@@ -627,6 +665,8 @@ impl Default for EngineState {
             transform_gizmo: TransformArm::default(),
             component_move: ComponentMoveArm::default(),
             sketch_edit: None,
+            sketch3d_edit: None,
+            sketch3d_overlay_wpp: 0.0,
             sketch_camera_locked: true,
             sketch_list_hover_active: false,
             notices: Vec::new(),
@@ -669,6 +709,8 @@ impl Default for EngineState {
             component_ports_visible: false,
             spline_edit_feature: None,
             spline_anchor_picked: None,
+            cage_edit_feature: None,
+            cage_overlay_key: None,
             hidden_datums: std::collections::HashSet::new(),
             shown_datum_names: Vec::new(),
             runner: Box::new(crate::runner::InlineRunner::new()),
@@ -701,6 +743,7 @@ impl Default for EngineState {
             assembly_session_generation: None,
             consumed_names: std::collections::HashSet::new(),
             library_resync: false,
+            sketch_links_released: false,
             constraint_overlays: Vec::new(),
             constraint_drag: None,
             constraint_overlay_wpp: 0.0,
@@ -848,6 +891,10 @@ mod sketch_input;
 /// Sketch mode session: `SketchDrag`/`SketchEdit` state, plane-frame helpers,
 /// enter/exit/new sketch, and the camera lock.
 mod sketch_mode;
+/// 3D sketch mode: `Sketch3dEdit`, enter/exit/new, the cursor-to-3D mapping,
+/// the draw tools, reference linking, constraint edits and undo.
+mod sketch3d_mode;
+pub use sketch3d_mode::{Sketch3dCursorHit, Sketch3dEdit};
 /// Sketch entity-list panel rows + notices + solver settings
 /// (`SketchEntityRow`), and the constraint palette/actions
 /// (`SketchConstraintAction`, add-constraint builders, ground/construction
@@ -866,6 +913,7 @@ mod wire_harness_ops;
 /// references reach a caller, the tail not being a feature.
 mod ports_ops;
 pub use ports_ops::PortRefField;
+pub use selection_ux::RefSelectField;
 // Every harness wire as a BOM line with its cut length (MF QTY), or the reason
 // the last applied run cannot give one.
 mod wire_bom;
@@ -880,6 +928,11 @@ pub(crate) mod pmi_overlay;
 /// the anchor flavour of the transform gizmo, the port-attach flavour of the
 /// reference picker, and the direction-cage overlay.
 mod spline_edit;
+/// The NURBS Solid CONTROL-CAGE editor: the cage's points through the
+/// kernel's resolver, the multi-point selection that arms the transform
+/// gizmo at its centroid, the drag write-back, loop insertion, reset and the
+/// cage overlay.
+mod cage_edit;
 
 // Re-exports preserving the original `engine_state::*` public surface.
 pub use assembly_ops::{document_signature, ComponentInsert};
@@ -900,8 +953,10 @@ pub use sketch_panel::{NoticeSeverity, SketchConstraintAction, SketchEntityRow};
 pub use wire_harness_ops::ConnectionPatch;
 pub use wire_bom::{WireBomLine, WireLengthState};
 pub use spline_edit::SplineAnchorRow;
+pub use cage_edit::{CageArm, CageSelect, CageSummary, CAGE_PICK_RADIUS_PX};
 pub use transform_gizmo::{GizmoMode, TransformArm};
 pub(crate) use transform_gizmo::rotate_euler_xyz_f64;
+
 
 
 

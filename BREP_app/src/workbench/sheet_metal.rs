@@ -23,8 +23,7 @@ fn includes(feature: &FeatureInfo<'_>) -> bool {
 /// the All workbench automatically (no hand-maintained list).
 static BUTTONS: &[WorkbenchButton] = &[WorkbenchButton {
     id: "sheetmetal.flat_pattern",
-    // ▤ (U+25A4, square with horizontal fill) — a flat sheet with fold lines;
-    // renders in the bundled DejaVu font (no tofu).
+    // Developed sheet with bend lines and a download arrow, from the SVG catalog.
     glyph: "\u{25A4}",
     ribbon_path: "Home/Sheet Metal/Export flat pattern", size: crate::workbench::CommandSize::Compact, tooltip: "Export flat pattern (DXF / SVG)",
     when: None,

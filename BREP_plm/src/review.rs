@@ -126,32 +126,7 @@ pub fn refresh(review: &mut Review, current: &str) {
     };
 }
 
-/// What a change order's round decides on: every item's revision and its
-/// document's content hash, in a stable order, hashed. Saving any item's
-/// document — or changing the items — changes it, so approvals given before
-/// go stale as a revision's do.
-pub fn eco_subject_hash(state: &State, eco: &crate::model::ChangeOrder) -> String {
-    let mut lines: Vec<String> = eco
-        .items
-        .iter()
-        .map(|item| {
-            let hash = state
-                .part(&item.part_id)
-                .and_then(|p| p.revision(&item.revision_id))
-                .map(|r| r.content_hash.clone())
-                .unwrap_or_default();
-            serde_json::json!([item.part_id, item.revision_id, hash]).to_string()
-        })
-        .collect();
-    lines.sort();
-    crate::auth::content_hash(&lines.join("\n"))
-}
-
-/// A revision's document hash changed (a save, a bake result, a generated
-/// document): re-judge its live round, and every live change-order round
-/// naming it, on what the reviewers would now be approving. A change order
-/// whose round was approved goes back to in review until its approvals are
-/// renewed (and forward again if the document returns to what they saw).
+/// Re-judge a revision's live review after its document changes.
 pub fn document_changed(state: &mut State, part_id: &str, revision_id: &str) {
     if let Some(revision) = state.parts.get_mut(part_id).and_then(|p| p.revision_mut(revision_id)) {
         let hash = revision.content_hash.clone();
@@ -159,28 +134,7 @@ pub fn document_changed(state: &mut State, part_id: &str, revision_id: &str) {
             refresh(review, &hash);
         }
     }
-    let affected: Vec<usize> = state
-        .change_orders
-        .iter()
-        .enumerate()
-        .filter(|(_, eco)| eco.state.is_open() && eco.items.iter().any(|i| i.part_id == part_id && i.revision_id == revision_id))
-        .filter(|(_, eco)| eco.reviews.last().is_some_and(|r| r.is_live()))
-        .map(|(i, _)| i)
-        .collect();
-    for index in affected {
-        let hash = eco_subject_hash(state, &state.change_orders[index]);
-        let eco = &mut state.change_orders[index];
-        if let Some(round) = eco.reviews.last_mut() {
-            refresh(round, &hash);
-            if matches!(eco.state, crate::model::EcoState::Approved | crate::model::EcoState::InReview) {
-                eco.state = if round.status == ReviewStatus::Approved {
-                    crate::model::EcoState::Approved
-                } else {
-                    crate::model::EcoState::InReview
-                };
-            }
-        }
-    }
+
 }
 
 /// Whether `user` is one of the round's reviewers — named, in a named group,
@@ -257,7 +211,7 @@ pub fn normalize_settings_json(state: &State, settings: &mut Value) -> Result<()
     let mut overrides = None;
     for (key, value) in object.iter_mut() {
         match key.as_str() {
-            "review_rule" | "eco_review_rule" => rules.push(value),
+            "review_rule" => rules.push(value),
             "review_overrides" => overrides = Some(value),
             _ => {}
         }
@@ -288,7 +242,6 @@ pub fn check_rule(state: &State, rule: &mut ReviewRule) -> Result<(), Error> {
 /// [`Db::update_settings`] stores them.
 pub fn check_settings(state: &State, settings: &mut Settings) -> Result<(), Error> {
     check_rule(state, &mut settings.review_rule)?;
-    check_rule(state, &mut settings.eco_review_rule)?;
     let mut seen: Vec<(String, String)> = Vec::new();
     for o in &mut settings.review_overrides {
         o.id = o.id.trim().to_string();
@@ -432,7 +385,7 @@ pub fn record_decision(
         verdict,
         comment: comment.to_string(),
         at,
-        content_hash: Some(current.to_string()),
+        content_hash: current.to_string(),
     });
     refresh(review, current);
     if verdict == Verdict::Reject {
@@ -532,9 +485,8 @@ pub struct DecisionView {
     pub verdict: Verdict,
     pub comment: String,
     pub at: u64,
-    /// The subject's content hash it was given on; `null` for a decision
-    /// recorded before decisions carried one.
-    pub content_hash: Option<String>,
+    /// The document hash the reviewer decided on.
+    pub content_hash: String,
     /// Given on the subject as it is now. `false`: "on an older version" —
     /// an approval that no longer counts until it is renewed.
     pub current: bool,
@@ -703,13 +655,13 @@ pub struct RevisionReview {
 /// One entry in a person's review inbox.
 #[derive(Debug, Clone, Serialize)]
 pub struct InboxItem {
-    /// `revision` or `eco`.
+    /// `revision`.
     pub kind: &'static str,
-    /// The page link's target: a part id or a change order id.
+    /// The page link's target: a part id.
     pub target: String,
-    /// A revision's id; empty for a change order.
+    /// The revision's id.
     pub revision_id: String,
-    /// `CPART000000001 rev B`, or a change order's number.
+    /// `CPART000000001 rev B`.
     pub title: String,
     pub name: String,
     pub status: &'static str,
@@ -1040,13 +992,6 @@ impl Db {
                         )
                     });
                 }
-            }
-            for eco in &state.change_orders {
-                let Some(review) = eco.reviews.last() else { continue };
-                let current = eco_subject_hash(state, eco);
-                file_item(&mut inbox, review, user, &current, || {
-                    inbox_item(state, review, "eco", &eco.id, "", eco.number.clone(), &eco.title, &current)
-                });
             }
             inbox.waiting_on_me.sort_by_key(|i| (i.due.unwrap_or(u64::MAX), i.opened_at));
             inbox.submitted.sort_by_key(|i| std::cmp::Reverse(i.opened_at));

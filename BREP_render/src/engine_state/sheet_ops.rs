@@ -1736,6 +1736,9 @@ impl EngineState {
             names: seed_names,
             restore_index: self.history.rollback(),
             target: RefSelectTarget::Sheet,
+            picks: 0,
+            claimed: false,
+            finish_requested: false,
         });
         self.dirty = true;
         Ok(())
@@ -1777,6 +1780,7 @@ impl EngineState {
             }
             state.names.push(anchor.to_string());
         }
+        state.picks += 1;
         self.dirty = true;
         Ok(())
     }

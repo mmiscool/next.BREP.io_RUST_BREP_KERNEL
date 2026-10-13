@@ -1387,6 +1387,7 @@ fn convex_solid(
         edges,
         shells: vec![ShellRecord { id: shell_id, faces }],
         genus: 0,
+        kind: crate::BodyKind::Solid,
     };
     let issues = solid.validate();
     if !issues.is_empty() {

@@ -260,6 +260,7 @@ pub use refit_faces::{
 };
 pub use face_move::move_faces;
 pub use face_rotate::rotate_faces;
+pub(crate) use face_rotate::rotate_faces_rigid;
 // The ROUTING reading: which faces a moved selection would have to open a new
 // hole in, measured before anything is built. Public so the matrix probe can
 // print the partition over every cell without the road being wired to it.

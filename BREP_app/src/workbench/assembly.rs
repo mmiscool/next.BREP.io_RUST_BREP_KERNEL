@@ -8,7 +8,7 @@
 //! Claims the two assembly panels (Assembly Structure tree + Assembly
 //! Constraints), which therefore show ONLY under Assembly (and "All").
 
-use super::{FeatureInfo, Workbench, WorkbenchButton};
+use super::{ButtonState, FeatureInfo, Workbench, WorkbenchButton};
 
 /// The Assembly Structure tree panel's id (claim + registration key).
 /// The Assembly Constraints panel's id (the requirements-§5 record id).
@@ -25,6 +25,12 @@ fn includes(feature: &FeatureInfo<'_>) -> bool {
 /// the PCB row that borrows it both refer to one button, not to a spelling.
 pub const ADD_COMPONENT_BUTTON_ID: &str = "assembly.add_component";
 
+// The feature command already provides insertion wherever ACOMP is creatable.
+// Keep the borrowed insertion action for PCB, whose feature palette omits ACOMP.
+fn needs_component_button(state: &ButtonState<'_>) -> bool {
+    !super::includes_feature(&state.engine.settings.workbench, "ACOMP")
+}
+
 /// The assembly toolbar tools. A click surfaces the button id out of the toolbar to the shell:
 /// `"assembly.add_component"` opens the insert-component modal (the same
 /// `FileAction::InsertComponent` flow the ACOMP palette pick routes through),
@@ -36,11 +42,10 @@ pub const ADD_COMPONENT_BUTTON_ID: &str = "assembly.add_component";
 static BUTTONS: [WorkbenchButton; 4] = [
     WorkbenchButton {
         id: ADD_COMPONENT_BUTTON_ID,
-        // ⊕ (U+2295, circled plus) — ADD a part instance; renders in the
-        // bundled DejaVu font (no tofu).
-        glyph: "\u{2295}",
-        ribbon_path: "Home/Assembly/Add component", size: crate::workbench::CommandSize::Compact, tooltip: "Add component (insert a part from the library or a saved model)",
-        when: None,
+        // The same placed-instance artwork as Assembly Component.
+        glyph: "\u{E058}",
+        ribbon_path: "Home/Assembly/Add component", size: crate::workbench::CommandSize::Large, tooltip: "Add component (insert a part from the library or a saved model)",
+        when: Some(needs_component_button),
         pressed: None,
         disabled: None,
         caption: None,
@@ -48,11 +53,9 @@ static BUTTONS: [WorkbenchButton; 4] = [
     },
     WorkbenchButton {
         id: "assembly.step_parts_library",
-        // `menu_book` Material Symbol (base glyph U+1F4DA) — the online
-        // step.parts library. `toolbar_button` auto-renders it as a layered
-        // colour icon straight from the SVG catalog.
+        // Library books and a solid part, drawn from the SVG catalog.
         glyph: "\u{1F4DA}",
-        ribbon_path: "Home/Assembly/step.parts library", size: crate::workbench::CommandSize::Compact, tooltip: "step.parts library — browse & import an online STEP part as a component",
+        ribbon_path: "Home/Assembly/step.parts library", size: crate::workbench::CommandSize::Large, tooltip: "step.parts library — browse & import an online STEP part as a component",
         when: None,
         pressed: None,
         disabled: None,
@@ -64,7 +67,7 @@ static BUTTONS: [WorkbenchButton; 4] = [
         // Our own artwork (U+E067): two parts closing on a shared axis with the
         // inference spark. Catalogued SVG, like every picture the app draws.
         glyph: "\u{E067}",
-        ribbon_path: "Home/Assembly/Auto constraints", size: crate::workbench::CommandSize::Compact, tooltip: "Auto constraints \u{2014} infer mates (concentric, touch align, coincident) from where the components already sit",
+        ribbon_path: "Home/Assembly/Auto constraints", size: crate::workbench::CommandSize::Large, tooltip: "Auto constraints \u{2014} infer mates (concentric, touch align, coincident) from where the components already sit",
         when: None,
         pressed: None,
         disabled: None,
@@ -73,10 +76,9 @@ static BUTTONS: [WorkbenchButton; 4] = [
     },
     WorkbenchButton {
         id: "assembly.interference",
-        // ∩ (U+2229, intersection) — the pairwise-INTERSECT tool; renders in the
-        // bundled DejaVu font (no tofu).
+        // Intersecting solid instances with the overlap highlighted red.
         glyph: "\u{2229}",
-        ribbon_path: "Home/Assembly/Interference check", size: crate::workbench::CommandSize::Compact, tooltip: "Interference check (pairwise intersect)",
+        ribbon_path: "Home/Assembly/Interference check", size: crate::workbench::CommandSize::Large, tooltip: "Interference check (pairwise intersect)",
         when: None,
         pressed: None,
         disabled: None,

@@ -198,7 +198,7 @@ pub(super) struct TangencyState {
     pub(super) n2: Vec3,
 }
 
-fn tangency_state(
+pub(super) fn tangency_state(
     first: &NurbsSurface,
     second: &NurbsSurface,
     rho: [f64; 2],
@@ -1960,20 +1960,25 @@ pub(super) struct FittedRows {
     /// its own vertex — a flush join with a tangent neighbour, or a capped
     /// end — stops here.  Only the open march sets them.
     pub(super) vertex_stations: Option<[f64; 2]>,
+    /// The exact revolution lane's rows (`support::exact_revolution_rows`):
+    /// the axis (origin, unit direction) the one section revolves about,
+    /// with `center` the exact centre circle, `cr` / `cs` exact circles and
+    /// the pcurves exact (the carrier's uv line, the plane's affine image).
+    /// `None` on every other row set. Appended last (2026-10-13).
+    pub(super) revolution_axis: Option<(Vec3, Vec3)>,
 }
 
-/// Preserve the exact rotational geometry of a coaxial analytic blend.
-/// The general closed-row interpolator is intentionally approximate in the
+/// Preserve the exact rotational geometry of a coaxial analytic blend. The
+/// general closed-row interpolator is intentionally approximate in the
 /// marching direction; when every station is a rigid rotation of one exact
 /// section, rebuilding that section as a revolution preserves exact circular
-/// support rims.  Spheres are symmetric about every axis through their centre;
-/// other revolution carriers must expose the same axis line.
-pub(super) fn exact_closed_revolution_rows(
-    stations: &[Station],
-    first: &BlendMate,
-    second: &BlendMate,
-    chamfer: bool,
-) -> Option<Result<FittedRows, KernelRefusal>> {
+/// support rims. Spheres are symmetric about every axis through their centre;
+/// other revolution carriers must expose the same axis line. The axis (origin,
+/// direction) a closed edge's blend revolves about when both mates are
+/// rotationally symmetric about one line: two spheres, or a framed carrier and
+/// a coaxial mate. Decided from the mates alone, before any station is solved.
+/// `None` when the pair is not one.
+pub(in crate::blend) fn closed_revolution_axis(first: &BlendMate, second: &BlendMate) -> Option<(Vec3, Vec3)> {
     let analytic1 = first.face.surface.analytic()?;
     let analytic2 = second.face.surface.analytic()?;
     let (axis_origin, base_axis) = match (analytic1, analytic2) {
@@ -1987,7 +1992,13 @@ pub(super) fn exact_closed_revolution_rows(
             (frame1.origin, axis)
         }
         _ => {
-            let carrier = if !matches!(analytic1, crate::AnalyticSurface::Sphere { .. }) {
+            // Off the lane a plane has no frame and the pair is not
+            // recognised.
+            let exact_lane = crate::blend::exact_rim_lane_on();
+            let is_plane = |surface: &crate::AnalyticSurface| matches!(surface, crate::AnalyticSurface::Plane { .. });
+            let carrier = if !matches!(analytic1, crate::AnalyticSurface::Sphere { .. })
+                && !(exact_lane && is_plane(analytic1))
+            {
                 analytic1.frame()?
             } else {
                 analytic2.frame()?
@@ -1996,6 +2007,12 @@ pub(super) fn exact_closed_revolution_rows(
             let origin = carrier.origin;
             let scale = origin.length().max(1.0);
             let on_same_axis = |surface: &crate::AnalyticSurface| {
+                if let (true, crate::AnalyticSurface::Plane { u_dir, v_dir, .. }) = (exact_lane, surface) {
+                    return u_dir
+                        .cross(*v_dir)
+                        .normalized()
+                        .is_ok_and(|normal| normal.cross(axis).length() <= 1e-7);
+                }
                 let (point, aligned) = match surface {
                     crate::AnalyticSurface::Sphere { frame, .. } => (frame.origin, true),
                     other => {
@@ -2015,6 +2032,16 @@ pub(super) fn exact_closed_revolution_rows(
             (origin, axis)
         }
     };
+    Some((axis_origin, base_axis))
+}
+
+pub(super) fn exact_closed_revolution_rows(
+    stations: &[Station],
+    first: &BlendMate,
+    second: &BlendMate,
+    chamfer: bool,
+) -> Option<Result<FittedRows, KernelRefusal>> {
+    let (axis_origin, base_axis) = closed_revolution_axis(first, second)?;
     Some((|| {
         let first_station = stations.first().ok_or(KernelRefusal::internal(KernelStage::Refine, "sphere_stations", "blend: no sphere stations"))?;
         let next_station = stations
@@ -2104,6 +2131,70 @@ pub(super) fn exact_closed_revolution_rows(
         };
         let cr_pcurve = sphere_pcurve(first, &cr, fitted.cr_pcurve, first_station.uv1)?;
         let cs_pcurve = sphere_pcurve(second, &cs, fitted.cs_pcurve, first_station.uv2)?;
+        // A PLANE mate's rail is a circle on an affine chart, so its pcurve
+        // is the rail's own control points carried through the chart — an
+        // exact rational circle in (u, v) — read back the same way. Whatever
+        // does not read back takes the refined projector the sphere mate
+        // takes.
+        let plane_pcurve = |mate: &BlendMate, curve: &NurbsCurve, fallback: NurbsCurve| -> Result<NurbsCurve, KernelRefusal> {
+            if !crate::blend::exact_rim_lane_on()
+                || matches!(mate.face.surface.analytic(), Some(crate::AnalyticSurface::Sphere { .. }))
+            {
+                return Ok(fallback);
+            }
+            let is_plane = matches!(mate.face.surface.analytic(), Some(crate::AnalyticSurface::Plane { .. }));
+            let surface = &mate.face.surface;
+            let [u0, u1] = surface.domain_u().or_refuse(KernelStage::Refine, "domain_u")?;
+            let [v0, v1] = surface.domain_v().or_refuse(KernelStage::Refine, "domain_v")?;
+            let origin = surface.evaluate(u0, v0).or_refuse(KernelStage::Refine, "plane_origin")?;
+            let du = surface.evaluate(u1, v0).or_refuse(KernelStage::Refine, "plane_u")?.sub(origin).scale(1.0 / (u1 - u0));
+            let dv = surface.evaluate(u0, v1).or_refuse(KernelStage::Refine, "plane_v")?.sub(origin).scale(1.0 / (v1 - v0));
+            let (a, b, c) = (du.dot(du), du.dot(dv), dv.dot(dv));
+            let det = a * c - b * b;
+            let chart_scale = origin.length().max(du.length()).max(dv.length()).max(1.0);
+            let affine = |point: Vec3| -> Option<[f64; 2]> {
+                if !(det > 1e-24 * chart_scale.powi(4)) {
+                    return None;
+                }
+                let offset = point.sub(origin);
+                let (r, s) = (offset.dot(du), offset.dot(dv));
+                Some([u0 + (c * r - b * s) / det, v0 + (a * s - b * r) / det])
+            };
+            let mapped = (|| -> Option<NurbsCurve> {
+                let mut pcurve = if is_plane { curve.clone() } else { fallback.clone() };
+                if is_plane {
+                    for control in &mut pcurve.control_points {
+                        let weight = control.w;
+                        let [u, v] = affine(Vec3::new(control.x / weight, control.y / weight, control.z / weight))?;
+                        control.x = u * weight;
+                        control.y = v * weight;
+                        control.z = 0.0;
+                    }
+                }
+                // Read back: the pcurve must land on the rail, at the rail's
+                // own parameter, between the stations it was fitted through.
+                let [t0, t1] = curve.domain().ok()?;
+                let floor = crate::KernelTolerances::for_scale(chart_scale, 1e-7).model;
+                for step in 0..=64 {
+                    let t = t0 + (t1 - t0) * step as f64 / 64.0;
+                    let uv = pcurve.evaluate(t).ok()?;
+                    let on_chart = surface.evaluate(uv.x, uv.y).ok()?;
+                    if on_chart.sub(curve.evaluate(t).ok()?).length() > floor {
+                        return None;
+                    }
+                }
+                Some(pcurve)
+            })();
+            match mapped {
+                Some(pcurve) => Ok(pcurve),
+                None => crate::build_pcurve_on_surface_stations(
+                    surface, &|t| curve.evaluate(t), &curve.knots,
+                    crate::PCURVE_REFINEMENT_TOLERANCE, 64, 12, 4097,
+                ).or_refuse(KernelStage::Refine, "plane_contact_pcurve"),
+            }
+        };
+        let cr_pcurve = plane_pcurve(first, &cr, cr_pcurve)?;
+        let cs_pcurve = plane_pcurve(second, &cs, cs_pcurve)?;
         Ok(FittedRows {
             surface,
             cr,
@@ -2114,6 +2205,7 @@ pub(super) fn exact_closed_revolution_rows(
             center: None,
             exact_extrusion: false,
             vertex_stations: None,
+            revolution_axis: None,
         })
     })())
 }
@@ -2221,6 +2313,7 @@ pub(super) fn fit_closed_rows(
         center: None,
         exact_extrusion: false,
         vertex_stations: None,
+        revolution_axis: None,
     })
 }
 
@@ -2424,6 +2517,24 @@ pub(super) fn closed_rail_interval_misses_at(
 /// carrier closer, so the reading never exceeds the seed's own distance and
 /// is always the distance to an actual point of the extended carrier.
 pub(in crate::blend) fn extended_foot_distance(carrier: &NurbsSurface, point: Vec3, seed: [f64; 2]) -> Result<f64, KernelRefusal> {
+    let reading = extended_foot_distance_halving(carrier, point, seed, true);
+    reading
+}
+
+
+/// [`extended_foot_distance`]'s loop. `shortcut` ends a halving whose trial
+/// is the foot itself TO THE BIT: that trial reads `best` again (the
+/// distance is a pure function of its inputs, and `best` is the distance at
+/// `uv`), so it is not an improvement, and every halved step after it also
+/// rounds `uv - step` to `uv` (a correctly rounded subtraction is monotone:
+/// a shorter step lands no farther from `uv`), reading `best` again each
+/// time; the spent loop then exits with `improved` false, which is where the
+/// shortcut breaks. The reading, the exit and the error (an evaluation at
+/// `uv` already succeeded) are the spent loop's. On an exact plane Newton's
+/// first step lands on the foot and the second is below the uv's ulp, so the
+/// spent loop evaluated the carrier thirty more times per foot there
+/// (the box fillet's two rails reads: 7 296 feet between them).
+fn extended_foot_distance_halving(carrier: &NurbsSurface, point: Vec3, seed: [f64; 2], shortcut: bool) -> Result<f64, KernelRefusal> {
     let distance_at = |uv: [f64; 2]| -> Result<f64, KernelRefusal> {
         Ok(carrier.evaluate_extended(uv[0], uv[1]).or_refuse(KernelStage::Refine, "evaluate_extended")?.sub(point).length())
     };
@@ -2458,6 +2569,9 @@ pub(in crate::blend) fn extended_foot_distance(carrier: &NurbsSurface, point: Ve
         let mut improved = false;
         for _ in 0..30 {
             let trial = [uv[0] - step[0], uv[1] - step[1]];
+            if shortcut && trial[0].to_bits() == uv[0].to_bits() && trial[1].to_bits() == uv[1].to_bits() {
+                break;
+            }
             let distance = distance_at(trial)?;
             if !distance.is_finite() {
                 return Ok(f64::INFINITY);

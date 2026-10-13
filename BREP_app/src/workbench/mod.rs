@@ -45,6 +45,7 @@ pub mod pcb;
 pub mod pmi;
 pub mod sheet_metal;
 pub mod sketch;
+pub mod sketch3d;
 pub mod symbol;
 pub mod wire_harness;
 
@@ -255,7 +256,28 @@ pub fn resolve(id: &str) -> &'static Workbench {
 /// [`button_by_id`] searches it, so the row, `describe_workbenches` and the
 /// `workbench_button` command agree about what exists.
 pub fn shared_buttons() -> &'static [WorkbenchButton] {
-    sketch::BUTTONS
+    /// The two shared sets in one slice, built once: the planar sketch's
+    /// tools, then the 3D sketch's. Each set is conditional on its own mode,
+    /// so a row never shows both.
+    static SHARED: std::sync::LazyLock<Vec<WorkbenchButton>> = std::sync::LazyLock::new(|| {
+        sketch::BUTTONS
+            .iter()
+            .chain(sketch3d::BUTTONS.iter())
+            .map(|b| WorkbenchButton {
+                id: b.id,
+                glyph: b.glyph,
+                ribbon_path: b.ribbon_path,
+                size: b.size,
+                tooltip: b.tooltip,
+                when: b.when,
+                pressed: b.pressed,
+                disabled: b.disabled,
+                caption: b.caption,
+                menu: b.menu,
+            })
+            .collect()
+    });
+    &SHARED
 }
 
 /// Buttons one workbench LENDS to another: `(borrower id, the lent buttons)`.
@@ -399,6 +421,7 @@ pub const SYNONYMS: &[(&[&str], &str)] = &[
     (
         &[
             "sketch.tool.select",
+            "sketch3d.tool.select",
             "diagram.sheet.tool.select",
             "pcb.sheet.tool.select",
             "pcb.board.tool.select",
@@ -407,7 +430,11 @@ pub const SYNONYMS: &[(&[&str], &str)] = &[
         ],
         "select and drag, in every editor",
     ),
-    (&["sketch.tool.line", "symbol.tool.line", "pads.tool.line"], "draws a straight line"),
+    (&["sketch.tool.line", "sketch3d.tool.line", "symbol.tool.line", "pads.tool.line"], "draws a straight line"),
+    (&["sketch.tool.point", "sketch3d.tool.point"], "places a point"),
+    (&["sketch.tool.arc", "sketch3d.tool.arc"], "draws an arc from centre, start and end"),
+    (&["sketch.tool.bezier", "sketch3d.tool.bezier"], "draws a cubic bezier"),
+    (&["sketch.tool.pickEdges", "sketch3d.tool.pickRef"], "links model geometry into the sketch as a fixed reference"),
     (&["sketch.tool.rect", "symbol.tool.rectangle", "pads.tool.rectangle"], "draws a rectangle"),
     (&["sketch.tool.circle", "symbol.tool.circle", "pads.tool.circle"], "draws a circle"),
     (&["pcb.sheet.wire.finish", "pcb.board.route.finish"], "ends the path being drawn"),

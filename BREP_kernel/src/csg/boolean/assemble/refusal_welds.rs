@@ -182,13 +182,7 @@ pub(super) fn weld_tangency_duplicate_vertices(
     tolerance: f64,
     limit: usize,
 ) -> usize {
-    let scale = vertices
-        .iter()
-        .map(|v| v.point.length())
-        .fold(1.0_f64, f64::max);
-    // Tangent-order marching drift is O(√tol·scale); 10× headroom, floored at
-    // the model tolerance itself.
-    let band = (tolerance.max(1e-12).sqrt() * scale * 10.0).max(tolerance * 10.0);
+    let band = tangency_weld_band(vertices, tolerance);
 
     let mut connected = rustc_hash::FxHashSet::<(u64, u64)>::default();
     for edge in edges.iter().filter(|edge| !edge.degenerate) {
@@ -207,28 +201,7 @@ pub(super) fn weld_tangency_duplicate_vertices(
     }
     pairs.sort_by(|x, y| x.0.partial_cmp(&y.0).expect("finite distances"));
 
-    // How well a vertex's incident curve endpoints agree with its position —
-    // the exact operand vertex scores ~0, the drifted seam endpoint ~O(band).
-    let endpoint_error = |vertices: &[VertexRecord], edges: &[EdgeRecord], id: u64| -> f64 {
-        let point = match vertices.iter().find(|v| v.id == id) {
-            Some(v) => v.point,
-            None => return f64::INFINITY,
-        };
-        let mut worst = 0.0_f64;
-        for edge in edges.iter().filter(|edge| !edge.degenerate) {
-            if edge.start_vertex_id == id {
-                if let Ok(p) = edge.curve.evaluate(edge.t0) {
-                    worst = worst.max(p.sub(point).length());
-                }
-            }
-            if edge.end_vertex_id == id {
-                if let Ok(p) = edge.curve.evaluate(edge.t1) {
-                    worst = worst.max(p.sub(point).length());
-                }
-            }
-        }
-        worst
-    };
+    let endpoint_error = vertex_endpoint_error;
 
     let mut welds = 0usize;
     for (_, a, b) in pairs {
@@ -256,6 +229,245 @@ pub(super) fn weld_tangency_duplicate_vertices(
         welds += 1;
     }
     welds
+}
+
+/// Weld band of the tangency repairs: tangent-order marching drift is
+/// O(√tol·scale); 10× headroom, floored at the model tolerance itself.
+fn tangency_weld_band(vertices: &[VertexRecord], tolerance: f64) -> f64 {
+    let scale = vertices
+        .iter()
+        .map(|v| v.point.length())
+        .fold(1.0_f64, f64::max);
+    (tolerance.max(1e-12).sqrt() * scale * 10.0).max(tolerance * 10.0)
+}
+
+/// How well a vertex's incident curve endpoints agree with its position —
+/// the exact operand vertex scores ~0, a drifted section endpoint ~O(band).
+fn vertex_endpoint_error(vertices: &[VertexRecord], edges: &[EdgeRecord], id: u64) -> f64 {
+    let point = match vertices.iter().find(|v| v.id == id) {
+        Some(v) => v.point,
+        None => return f64::INFINITY,
+    };
+    let mut worst = 0.0_f64;
+    for edge in edges.iter().filter(|edge| !edge.degenerate) {
+        if edge.start_vertex_id == id {
+            if let Ok(p) = edge.curve.evaluate(edge.t0) {
+                worst = worst.max(p.sub(point).length());
+            }
+        }
+        if edge.end_vertex_id == id {
+            if let Ok(p) = edge.curve.evaluate(edge.t1) {
+                worst = worst.max(p.sub(point).length());
+            }
+        }
+    }
+    worst
+}
+
+/// OPEN-CORNER WELD (repair-not-refuse): a loop whose consecutive SECTION
+/// coedges end on two DIFFERENT vertices within the tangency band is welded
+/// shut there.
+///
+/// Where two section curves cross at an isolated tangent node — the two
+/// ellipses of an equal-radius cylinder pair meet at the points where the
+/// cylinders are tangent — each curve is split at the node by its own face's
+/// arrangement, and the two split points disagree by the arrangement's chord
+/// error (measured 1.4e-5 on the 2026-10-11 report's r = 5 pair, against the
+/// assembler's 1e-7 vertex weld). A loop that walks from one curve onto the
+/// other at the node then has an open corner: the result a SUBTRACT leaves
+/// there (the cut body pinched into two pieces touching at the node) carries
+/// eight of them and refused as `invalid topology`, while the union's and
+/// the intersection's single-shell results happened to be caught by the
+/// Euler-gated duplicate-vertex weld below — a gate that reads `2S − χ` and
+/// is blind to a pinch BETWEEN two shells, whose shared vertex keeps the
+/// count integral.
+///
+/// The node's signature is a corner where BOTH coedges are section edges
+/// (`section_edges`: the imprint's pieces and the sub-edges the arrangement
+/// derived from them, every edge without an operand boundary key): two
+/// curves the imprint minted, meeting at two vertices a chord error apart.
+/// A corner between a section edge and an
+/// operand edge, or between two operand edges, is a different defect — a
+/// section clipped short of a rim, a hairline sliver bridging a gap — with
+/// its own lanes (`conform_unmatched_one_use_edges`, the heal chain), and
+/// welding it pre-empts them: measured on the ABC `00000312#p7 × sphere`
+/// fixture, where an unrestricted corner weld chained three vertices into
+/// one and closed a sliver edge onto itself. Hence the restriction, and the
+/// connectivity test against the LIVE edges before every weld: a pair an
+/// edge joins is never welded, however the pass reached it. The survivor is
+/// the vertex its incident curves agree with better (the exact node), and
+/// the drifted curve endpoints are clamped onto it. Returns the surviving
+/// vertex ids (the debug line names them).
+pub(super) fn weld_open_loop_corners(
+    vertices: &mut Vec<VertexRecord>,
+    edges: &mut [EdgeRecord],
+    faces: &[FaceRecord],
+    section_edges: &HashSet<u64>,
+    tolerance: f64,
+) -> Vec<u64> {
+    let band = tangency_weld_band(vertices, tolerance);
+    let debug = std::env::var("BREP_DEBUG_BOOL").is_ok();
+    let mut survivors = Vec::new();
+    // Welds chain (a corner's loser may be another corner's survivor), so
+    // the scan repeats until a pass welds nothing.
+    loop {
+        let endpoints: HashMap<u64, (u64, u64)> = edges
+            .iter()
+            .map(|edge| (edge.id, (edge.start_vertex_id, edge.end_vertex_id)))
+            .collect();
+        let point = |id: u64| vertices.iter().find(|v| v.id == id).map(|v| v.point);
+        let mut pairs: Vec<(f64, u64, u64)> = Vec::new();
+        for loop_record in faces.iter().flat_map(|face| &face.loops) {
+            let count = loop_record.coedges.len();
+            for index in 0..count {
+                let current = &loop_record.coedges[index];
+                let next = &loop_record.coedges[(index + 1) % count];
+                if !section_edges.contains(&current.edge_id) || !section_edges.contains(&next.edge_id) {
+                    continue;
+                }
+                let (Some(&(s0, e0)), Some(&(s1, e1))) =
+                    (endpoints.get(&current.edge_id), endpoints.get(&next.edge_id))
+                else {
+                    continue;
+                };
+                let leaving = if current.forward { e0 } else { s0 };
+                let arriving = if next.forward { s1 } else { e1 };
+                if leaving == arriving {
+                    continue;
+                }
+                let key = (leaving.min(arriving), leaving.max(arriving));
+                if pairs.iter().any(|(_, a, b)| (*a, *b) == key) {
+                    continue;
+                }
+                let (Some(a), Some(b)) = (point(leaving), point(arriving)) else {
+                    continue;
+                };
+                let distance = a.sub(b).length();
+                if distance <= band {
+                    pairs.push((distance, key.0, key.1));
+                }
+            }
+        }
+        if pairs.is_empty() {
+            break;
+        }
+        pairs.sort_by(|x, y| x.0.partial_cmp(&y.0).expect("finite distances"));
+        let mut welded = 0usize;
+        for (distance, a, b) in pairs {
+            if !vertices.iter().any(|v| v.id == a) || !vertices.iter().any(|v| v.id == b) {
+                continue; // consumed by an earlier weld of this pass
+            }
+            // Against the LIVE edges: an earlier weld of this pass may have
+            // re-pointed an edge onto one of the pair.
+            let joined = edges.iter().any(|edge| {
+                !edge.degenerate
+                    && ((edge.start_vertex_id == a && edge.end_vertex_id == b)
+                        || (edge.start_vertex_id == b && edge.end_vertex_id == a))
+            });
+            if joined {
+                continue;
+            }
+            if debug {
+                eprintln!(
+                    "boolean assembly: open section corner between vertices {a} and {b}, {distance:.3e} apart (band {band:.3e})"
+                );
+            }
+            let (survivor, loser) = if vertex_endpoint_error(vertices, edges, a)
+                <= vertex_endpoint_error(vertices, edges, b)
+            {
+                (a, b)
+            } else {
+                (b, a)
+            };
+            weld_vertex_onto(vertices, edges, loser, survivor, band);
+            survivors.push(survivor);
+            welded += 1;
+        }
+        if welded == 0 {
+            break;
+        }
+    }
+    survivors.sort_unstable();
+    survivors.dedup();
+    survivors
+}
+
+/// Give every vertex used by edges of MORE THAN ONE shell its own vertex
+/// record per shell, so two edge-disconnected shells touching at a point are
+/// two closed manifold shells rather than one complex pinched at a vertex.
+/// Shells are edge-connected face groups, so a vertex used by two of them is
+/// exactly a point contact between separate bodies: the subtract that cuts a
+/// cylinder with an equal-radius crossing cylinder leaves two pieces that
+/// touch at the two tangent points, and nothing else. One node there may be
+/// welded by the assembler's own vertex weld (the two ellipses' split points
+/// within 1e-7) and the other by the open-corner weld above, so this reads
+/// the shells, not the welds: a shared vertex of EITHER origin would leave
+/// `V − E + F` one short per contact — an odd count refuses outright, an
+/// even one validates with a genus read as 1. Returns the records added.
+pub(super) fn split_vertices_shared_across_shells(
+    vertices: &mut Vec<VertexRecord>,
+    edges: &mut [EdgeRecord],
+    shells: &[ShellRecord],
+    next_vertex_id: &mut u64,
+) -> usize {
+    if shells.len() < 2 {
+        return 0;
+    }
+    let mut shell_of_edge: HashMap<u64, usize> = HashMap::default();
+    for (shell_index, shell) in shells.iter().enumerate() {
+        for coedge in shell
+            .faces
+            .iter()
+            .flat_map(|face| &face.loops)
+            .flat_map(|loop_record| &loop_record.coedges)
+        {
+            shell_of_edge.insert(coedge.edge_id, shell_index);
+        }
+    }
+    // vertex id → the shells whose edges use it, in shell order.
+    let mut shells_of_vertex: HashMap<u64, Vec<usize>> = HashMap::default();
+    for edge in edges.iter() {
+        let Some(&shell_index) = shell_of_edge.get(&edge.id) else {
+            continue;
+        };
+        for vertex_id in [edge.start_vertex_id, edge.end_vertex_id] {
+            let users = shells_of_vertex.entry(vertex_id).or_default();
+            if !users.contains(&shell_index) {
+                users.push(shell_index);
+            }
+        }
+    }
+    let mut shared: Vec<(u64, Vec<usize>)> = shells_of_vertex
+        .into_iter()
+        .filter(|(_, users)| users.len() > 1)
+        .collect();
+    shared.sort_unstable();
+    let mut added = 0usize;
+    for (vertex_id, mut users) in shared {
+        let Some(point) = vertices.iter().find(|v| v.id == vertex_id).map(|v| v.point) else {
+            continue;
+        };
+        users.sort_unstable();
+        // The first shell keeps the record; every other shell gets a copy.
+        for &shell_index in users.iter().skip(1) {
+            let copy = *next_vertex_id;
+            *next_vertex_id += 1;
+            vertices.push(VertexRecord { id: copy, point });
+            for edge in edges.iter_mut() {
+                if shell_of_edge.get(&edge.id) != Some(&shell_index) {
+                    continue;
+                }
+                if edge.start_vertex_id == vertex_id {
+                    edge.start_vertex_id = copy;
+                }
+                if edge.end_vertex_id == vertex_id {
+                    edge.end_vertex_id = copy;
+                }
+            }
+            added += 1;
+        }
+    }
+    added
 }
 
 /// Re-point every edge endpoint from `loser` to `survivor`, clamp curve

@@ -10,6 +10,30 @@ impl BrepSolid {
     }
 
     pub fn validate_detailed(&self, tolerances: &KernelTolerances) -> ValidationReport {
+        self.validate_detailed_scoped(tolerances, None)
+    }
+
+    /// [`validate`](Self::validate) reading the per-coedge GEOMETRY (carrier,
+    /// pcurve against edge, uv wire) of the faces in `geometry_faces` only.
+    /// Every structural check — ids, loop closure, edge use counts, curve
+    /// endpoints against vertices, the Euler count — still reads the whole
+    /// solid. A boolean uses this for faces it carried through unchanged
+    /// from an operand (`BooleanOptions::untouched_passthrough`): their
+    /// geometry is the operand's, byte for byte, and re-reading it is the
+    /// cost the record named.
+    pub fn validate_scoped(&self, geometry_faces: &HashSet<u64>) -> Vec<ValidationIssue> {
+        self.validate_detailed_scoped(&KernelTolerances::for_solid(self, 1e-7), Some(geometry_faces))
+            .issues
+    }
+
+    /// [`validate_detailed`](Self::validate_detailed) with the geometry checks
+    /// restricted as [`validate_scoped`](Self::validate_scoped) describes;
+    /// `None` reads every face.
+    pub fn validate_detailed_scoped(
+        &self,
+        tolerances: &KernelTolerances,
+        geometry_faces: Option<&HashSet<u64>>,
+    ) -> ValidationReport {
         let mut issues = Vec::new();
         let mut wire_warnings = Vec::new();
         let mut max_pcurve_error = 0.0f64;
@@ -88,21 +112,27 @@ impl BrepSolid {
                         face.id
                     )));
                 }
-                let surface = match NurbsSurface::new(
-                    face.surface.degree_u,
-                    face.surface.degree_v,
-                    face.surface.knots_u.clone(),
-                    face.surface.knots_v.clone(),
-                    face.surface.control_points.clone(),
-                ) {
-                    Ok(surface) => surface,
-                    Err(error) => {
-                        issues.push(ValidationIssue::error(format!(
-                            "face {} has invalid surface: {}",
-                            face.id, error
-                        )));
-                        continue;
+                let read_geometry =
+                    geometry_faces.is_none_or(|scope| scope.contains(&face.id));
+                let surface = if read_geometry {
+                    match NurbsSurface::new(
+                        face.surface.degree_u,
+                        face.surface.degree_v,
+                        face.surface.knots_u.clone(),
+                        face.surface.knots_v.clone(),
+                        face.surface.control_points.clone(),
+                    ) {
+                        Ok(surface) => Some(surface),
+                        Err(error) => {
+                            issues.push(ValidationIssue::error(format!(
+                                "face {} has invalid surface: {}",
+                                face.id, error
+                            )));
+                            continue;
+                        }
                     }
+                } else {
+                    None
                 };
                 for (loop_index, loop_record) in face.loops.iter().enumerate() {
                     if loop_record.coedges.is_empty() {
@@ -151,6 +181,9 @@ impl BrepSolid {
                                 loop_record.id, face.id, current.id, next.id
                             )));
                         }
+                        let Some(surface) = &surface else {
+                            continue;
+                        };
 
                         let pcurve = match NurbsCurve::new(
                             current.pcurve.degree,
@@ -181,7 +214,7 @@ impl BrepSolid {
                             }
                         };
                         match coedge_error_floored(
-                            &surface,
+                            surface,
                             &pcurve,
                             &curve,
                             current_edge,
@@ -205,8 +238,11 @@ impl BrepSolid {
                         }
                     }
 
+                    let Some(surface) = &surface else {
+                        continue;
+                    };
                     if let Some(warning) = validate_uv_wire(
-                        &surface,
+                        surface,
                         loop_record,
                         &edges,
                         tolerances,

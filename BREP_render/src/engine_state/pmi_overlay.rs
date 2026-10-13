@@ -33,7 +33,7 @@ impl EngineState {
             self.clear_pmi_overlay();
             return;
         };
-        if self.sketch_mode() {
+        if self.any_sketch_mode() {
             self.clear_pmi_overlay();
             return;
         }
@@ -141,7 +141,7 @@ impl EngineState {
             }
             return;
         };
-        if self.sketch_mode() {
+        if self.any_sketch_mode() {
             self.clear_pmi_overlay();
             return;
         }

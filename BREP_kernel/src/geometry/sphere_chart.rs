@@ -728,6 +728,61 @@ pub struct SphericalRegion {
     /// A unit direction known to be material, or `None` when there is no
     /// boundary at all (the whole sphere) or none usable.
     seed: Option<Vec3>,
+    /// The arcs in runs of [`ARC_GROUP`] consecutive ones, each under a
+    /// bounding cone, so a crossing count skips every run whose ends all lie
+    /// strictly on one side of the leg's plane ([`ArcGroup::clear_of`]).
+    groups: Vec<ArcGroup>,
+}
+
+/// How many consecutive arcs share one bounding cone.
+const ARC_GROUP: usize = 16;
+
+/// A run of consecutive boundary arcs under a bounding cone: `axis` is a
+/// unit direction and `cos_half`/`sin_half` the cosine and sine of the
+/// largest angle from it to any end of the run's arcs. A run with no usable
+/// cone (ends spread past a quarter turn, or none) carries `cos_half <= 0`
+/// and is never skipped.
+#[derive(Clone, Copy, Debug)]
+struct ArcGroup {
+    first: usize,
+    last: usize,
+    axis: Vec3,
+    cos_half: f64,
+    sin_half: f64,
+}
+
+impl ArcGroup {
+    /// The runs of `arcs`, in order.
+    fn runs(arcs: &[Arc]) -> Vec<ArcGroup> {
+        (0..arcs.len())
+            .step_by(ARC_GROUP)
+            .map(|first| {
+                let last = (first + ARC_GROUP).min(arcs.len());
+                let ends = arcs[first..last].iter().flat_map(|arc| [arc.start, arc.end]);
+                let sum = ends.clone().fold(Vec3::new(0.0, 0.0, 0.0), |acc, p| acc.add(p));
+                let (axis, cos_half) = match sum.normalized() {
+                    Ok(axis) => (axis, ends.map(|p| axis.dot(p)).fold(1.0, f64::min)),
+                    Err(_) => (Vec3::new(0.0, 0.0, 1.0), 0.0),
+                };
+                let sin_half = if cos_half > 0.0 { (1.0 - cos_half * cos_half).max(0.0).sqrt() } else { 1.0 };
+                ArcGroup { first, last, axis, cos_half, sin_half }
+            })
+            .collect()
+    }
+
+    /// Whether every end of this run's arcs lies STRICTLY on one side of the
+    /// plane with unit normal `leg`, by more than the rounding of a dot
+    /// product of unit vectors, so [`arcs_cross`]'s straddle test declines
+    /// every arc of the run against that leg: for an end at angle `a <=
+    /// half` from the axis, `|leg · end| >= |leg · axis| cos(half) -
+    /// sqrt(1 - (leg · axis)^2) sin(half)`, and that bound must clear `1e-9`.
+    fn clear_of(&self, leg: Vec3) -> bool {
+        if !(self.cos_half > 0.0) {
+            return false;
+        }
+        let d = leg.dot(self.axis).abs();
+        d * self.cos_half - (1.0 - d * d).max(0.0).sqrt() * self.sin_half > 1e-9
+    }
 }
 
 impl SphericalRegion {
@@ -754,10 +809,14 @@ impl SphericalRegion {
     /// not reverses of each other, and the region that comes out is not the one
     /// the face means.
     pub fn from_segments(centre: Vec3, segments: &[(Vec3, Vec3)], outward_face_normal: bool) -> Self {
-        use std::collections::HashMap;
+        // The maps are looked up by key and never walked for an answer (the
+        // walk over `counts` only fills `budget`, another map), so the hasher
+        // cannot change the region: Fx, because the trim of a corner patch
+        // is 2 500 chords and the two maps were 1.5 ms of its first query.
+        use rustc_hash::FxHashMap as HashMap;
         type Key = [u64; 3];
         let key = |p: Vec3| -> Key { [p.x.to_bits(), p.y.to_bits(), p.z.to_bits()] };
-        let mut counts: HashMap<(Key, Key), usize> = HashMap::new();
+        let mut counts: HashMap<(Key, Key), usize> = HashMap::default();
         let mut directed: Vec<(Vec3, Vec3)> = Vec::new();
         for &(a, b) in segments {
             if key(a) == key(b) {
@@ -770,7 +829,7 @@ impl SphericalRegion {
         // Cancel each directed segment against a matching reverse. The seam of a
         // trimmed ball is used once each way by the SAME face, so both uses go;
         // what is left is the material boundary and nothing else.
-        let mut budget: HashMap<(Key, Key), usize> = HashMap::new();
+        let mut budget: HashMap<(Key, Key), usize> = HashMap::default();
         for (&(from, to), &forward) in &counts {
             let backward = counts.get(&(to, from)).copied().unwrap_or(0);
             budget.insert((from, to), forward.saturating_sub(backward.min(forward)));
@@ -793,8 +852,9 @@ impl SphericalRegion {
                 }
             }
         }
-        let seed = Self::seed_from(&arcs, outward_face_normal);
-        Self { arcs, seed }
+        let groups = ArcGroup::runs(&arcs);
+        let seed = Self::seed_from(&arcs, &groups, outward_face_normal);
+        Self { arcs, seed, groups }
     }
 
     /// A unit direction just to the MATERIAL side of the longest boundary arc.
@@ -804,7 +864,7 @@ impl SphericalRegion {
     /// arc it came from and reached no further boundary, so it is inside the
     /// material and not merely near it. A region thinner than the first offset is
     /// found by the bisection rather than mis-seeded.
-    fn seed_from(arcs: &[Arc], outward_face_normal: bool) -> Option<Vec3> {
+    fn seed_from(arcs: &[Arc], groups: &[ArcGroup], outward_face_normal: bool) -> Option<Vec3> {
         let longest = arcs.iter().copied().max_by(|x, y| {
             x.start
                 .sub(x.end)
@@ -828,7 +888,7 @@ impl SphericalRegion {
         for _ in 0..24 {
             let inside = middle.add(left.scale(step)).normalized().ok()?;
             let outside = middle.sub(left.scale(step)).normalized().ok()?;
-            if Self::crossings(arcs, inside, outside) == 1 {
+            if Self::crossings(arcs, groups, inside, outside) == 1 {
                 return Some(inside);
             }
             step *= 0.5;
@@ -836,16 +896,25 @@ impl SphericalRegion {
         None
     }
 
-    fn crossings(arcs: &[Arc], from: Vec3, to: Vec3) -> usize {
+    fn crossings(arcs: &[Arc], groups: &[ArcGroup], from: Vec3, to: Vec3) -> usize {
         // The leg's own plane, once for the whole walk: a leg that names no plane
         // crosses nothing, which is what testing each arc against it used to
         // conclude one arc at a time.
         let Ok(leg) = from.cross(to).normalized() else {
             return 0;
         };
-        arcs.iter()
-            .filter(|arc| arcs_cross(from, to, leg, arc))
-            .count()
+        // Run by run, skipping a run whose cone clears the leg's plane: every
+        // arc of it would fail the straddle test, so the count is the walk's.
+        groups
+            .iter()
+            .filter(|group| !group.clear_of(leg))
+            .map(|group| {
+                arcs[group.first..group.last]
+                    .iter()
+                    .filter(|arc| arcs_cross(from, to, leg, arc))
+                    .count()
+            })
+            .sum()
     }
 
     /// Crossing parity along a TWO-LEG path `from → via → to`.
@@ -856,14 +925,14 @@ impl SphericalRegion {
     /// Routing through a via point that is far from both endpoints makes each leg
     /// well conditioned, and taking three different via points and a majority
     /// makes a single grazed vertex harmless.
-    fn parity(arcs: &[Arc], from: Vec3, to: Vec3) -> bool {
+    fn parity(arcs: &[Arc], groups: &[ArcGroup], from: Vec3, to: Vec3) -> bool {
         let mut even = 0usize;
         let mut odd = 0usize;
         for index in 0..3 {
             let Some(via) = Self::via_point(from, to, index) else {
                 continue;
             };
-            let count = Self::crossings(arcs, from, via) + Self::crossings(arcs, via, to);
+            let count = Self::crossings(arcs, groups, from, via) + Self::crossings(arcs, groups, via, to);
             if count % 2 == 0 {
                 even += 1;
             } else {
@@ -918,7 +987,7 @@ impl SphericalRegion {
             // declined already ([`Self::is_decidable`]).
             return true;
         };
-        Self::parity(&self.arcs, seed, probe)
+        Self::parity(&self.arcs, &self.groups, seed, probe)
     }
 
     /// How many boundary arcs separate `point` from the region's seed.  A caller
@@ -931,7 +1000,7 @@ impl SphericalRegion {
         match self.seed {
             Some(seed) => Self::via_point(seed, probe, 0)
                 .map(|via| {
-                    Self::crossings(&self.arcs, seed, via) + Self::crossings(&self.arcs, via, probe)
+                    Self::crossings(&self.arcs, &self.groups, seed, via) + Self::crossings(&self.arcs, &self.groups, via, probe)
                 })
                 .unwrap_or(usize::MAX),
             None => 0,
@@ -954,7 +1023,27 @@ pub fn canonicalize_points(points: &mut [Vec3], relative_tolerance: f64) {
         .fold(0.0, f64::max)
         .max(1.0);
     let cell = (relative_tolerance * scale).max(f64::MIN_POSITIVE);
-    let mut table: std::collections::HashMap<[i64; 3], Vec3> = std::collections::HashMap::new();
+    // One representative per cell, found by the 27-cell walk below in its own
+    // fixed order; the table is only ever looked up by cell, never walked, so
+    // the hasher cannot change which representative a point takes. Fx: the
+    // walk is 27 lookups per point, 2.8 ms of a corner patch's first query
+    // with the default hasher.
+    let mut table: rustc_hash::FxHashMap<[i64; 3], Vec3> = rustc_hash::FxHashMap::default();
+    // Occupancy of the cells, by a hash of the cell into 2^16 bits: a probe
+    // whose bit is clear names a cell no point has been inserted at, so the
+    // lookup is skipped; a set bit only sends the probe to the table. Of the
+    // 27 probes a point makes, nearly every one is at an empty cell (a trim
+    // of 2 500 samples merges a handful of shared vertices), and the walk
+    // was 0.8 ms of a corner patch's first query in the table alone.
+    let mut occupied = vec![0u64; 1024];
+    let bit = |cell: [i64; 3]| -> (usize, u64) {
+        let hash = (cell[0] as u64)
+            .wrapping_mul(0x9e37_79b9_7f4a_7c15)
+            .wrapping_add((cell[1] as u64).wrapping_mul(0xbf58_476d_1ce4_e5b9))
+            .wrapping_add((cell[2] as u64).wrapping_mul(0x94d0_49bb_1331_11eb));
+        let index = (hash >> 48) as usize;
+        (index >> 6, 1u64 << (index & 63))
+    };
     for point in points.iter_mut() {
         let base = [
             (point.x / cell).round() as i64,
@@ -966,6 +1055,10 @@ pub fn canonicalize_points(points: &mut [Vec3], relative_tolerance: f64) {
             for dy in -1..=1 {
                 for dz in -1..=1 {
                     let probe = [base[0] + dx, base[1] + dy, base[2] + dz];
+                    let (word, mask) = bit(probe);
+                    if occupied[word] & mask == 0 {
+                        continue;
+                    }
                     if let Some(&existing) = table.get(&probe) {
                         if existing.sub(*point).length() <= cell {
                             found = Some(existing);
@@ -978,6 +1071,8 @@ pub fn canonicalize_points(points: &mut [Vec3], relative_tolerance: f64) {
         match found {
             Some(existing) => *point = existing,
             None => {
+                let (word, mask) = bit(base);
+                occupied[word] |= mask;
                 table.insert(base, *point);
             }
         }

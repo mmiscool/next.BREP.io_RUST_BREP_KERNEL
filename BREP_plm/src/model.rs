@@ -109,9 +109,7 @@ pub struct Session {
     pub last_seen: Timestamp,
     /// The CSRF token of this session (synchronizer pattern): handed to the
     /// page at sign-in and by `/api/me`, and required back in `X-CSRF-Token`
-    /// on every request that changes anything. Empty for a session written
-    /// before hardening; `/api/me` issues one on first use.
-    #[serde(default)]
+    /// on every request that changes anything.
     pub csrf: String,
 }
 
@@ -151,7 +149,6 @@ pub struct ApiToken {
     pub user_id: String,
     /// What the owner called it ("bake worker on cad-01").
     pub name: String,
-    #[serde(default)]
     pub scope: TokenScope,
     /// Hex SHA-256 of the whole secret.
     pub hash: String,
@@ -1040,25 +1037,18 @@ pub struct Decision {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub comment: String,
     pub at: Timestamp,
-    /// What was decided on: the subject's content hash when the decision was
-    /// given — a revision's `content_hash`, or a change order's
-    /// [`crate::review::eco_subject_hash`]. An approval counts only while this
-    /// equals the subject's hash NOW (operator ruling D8, 2026-09-25:
-    /// approvals go stale when the document changes). `None` is a decision
-    /// recorded before decisions carried a hash: what it was given on is
-    /// unknown, so it never counts — it is "on an older version".
-    #[serde(default)]
-    pub content_hash: Option<String>,
+    /// The document hash approved or rejected by this decision.
+    pub content_hash: String,
 }
 
 impl Decision {
     /// Whether this decision was given on the subject as it is now.
     pub fn is_current(&self, current: &str) -> bool {
-        self.content_hash.as_deref() == Some(current)
+        self.content_hash == current
     }
 }
 
-/// One round of review of a revision or a change order, opened when its
+/// One round of review of a revision, opened when its
 /// subject moves to review.
 ///
 /// The rule it is judged by is COPIED in when it opens (`required_approvals`,
@@ -1125,8 +1115,7 @@ impl Review {
         self.standing_approvals().into_iter().filter(|d| d.is_current(current)).map(|d| d.user_id.as_str()).collect()
     }
 
-    /// Standing approvals given on an older version of the subject (or before
-    /// decisions recorded one): they need renewing to count.
+    /// Standing approvals given on an older version of the subject: they need renewing to count.
     pub fn stale_approvers(&self, current: &str) -> Vec<&str> {
         self.standing_approvals().into_iter().filter(|d| !d.is_current(current)).map(|d| d.user_id.as_str()).collect()
     }
@@ -1139,7 +1128,7 @@ impl Review {
     }
 }
 
-/// A comment on a revision or a change order.
+/// A comment on a revision.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Comment {
     pub id: String,
@@ -1175,172 +1164,6 @@ pub struct ReviewOverride {
     pub scope: String,
     pub id: String,
     pub rule: ReviewRule,
-}
-
-// ===========================================================================
-// Change orders (ECO)
-// ===========================================================================
-
-/// Where a change order stands. `Released` and `Cancelled` are final.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum EcoState {
-    #[default]
-    Draft,
-    InReview,
-    Approved,
-    Released,
-    Cancelled,
-}
-
-impl EcoState {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            EcoState::Draft => "draft",
-            EcoState::InReview => "inreview",
-            EcoState::Approved => "approved",
-            EcoState::Released => "released",
-            EcoState::Cancelled => "cancelled",
-        }
-    }
-
-    /// Still going somewhere: it holds the revisions it names.
-    pub fn is_open(self) -> bool {
-        matches!(self, EcoState::Draft | EcoState::InReview | EcoState::Approved)
-    }
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum EcoPriority {
-    Low,
-    #[default]
-    Normal,
-    High,
-    Critical,
-}
-
-impl EcoPriority {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            EcoPriority::Low => "low",
-            EcoPriority::Normal => "normal",
-            EcoPriority::High => "high",
-            EcoPriority::Critical => "critical",
-        }
-    }
-}
-
-/// What a change order does to one revision when it is released.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum EcoAction {
-    /// Release this Draft or In-review revision.
-    Release,
-    /// Obsolete this Released or Superseded revision.
-    Obsolete,
-}
-
-impl EcoAction {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            EcoAction::Release => "release",
-            EcoAction::Obsolete => "obsolete",
-        }
-    }
-}
-
-/// One revision a change order acts on.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct EcoItem {
-    pub part_id: String,
-    pub revision_id: String,
-    pub action: EcoAction,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub note: String,
-    /// For a release, set when the change order releases: the revision that
-    /// was current before, which this one superseded. What the item changed
-    /// stays readable after the release.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub replaced: Option<String>,
-}
-
-/// A change order: a set of revisions reviewed together and released — or
-/// obsoleted — together, all or none (round 9 item 5).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ChangeOrder {
-    pub id: String,
-    /// Its number, from [`State::eco_numbering`]. Unique among change orders.
-    pub number: String,
-    pub title: String,
-    #[serde(default)]
-    pub description: String,
-    /// Why the change is made.
-    #[serde(default)]
-    pub reason: String,
-    #[serde(default)]
-    pub priority: EcoPriority,
-    #[serde(default)]
-    pub state: EcoState,
-    #[serde(default)]
-    pub items: Vec<EcoItem>,
-    pub created_by: String,
-    pub created_at: Timestamp,
-    #[serde(default)]
-    pub modified_at: Timestamp,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub released_by: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub released_at: Option<Timestamp>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cancelled_by: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cancelled_at: Option<Timestamp>,
-    /// Its review rounds, oldest first ([`Review`]).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub reviews: Vec<Review>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub comments: Vec<Comment>,
-}
-
-impl ChangeOrder {
-    /// The item acting on `revision_id`, if any.
-    pub fn item(&self, part_id: &str, revision_id: &str) -> Option<&EcoItem> {
-        self.items.iter().find(|i| i.part_id == part_id && i.revision_id == revision_id)
-    }
-}
-
-/// How change orders are numbered: a part type's numbering scheme — mode,
-/// prefix, digits and counter — used for change orders alone.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct EcoNumbering(pub PartType);
-
-impl Default for EcoNumbering {
-    fn default() -> Self {
-        EcoNumbering(default_eco_numbering())
-    }
-}
-
-impl std::ops::Deref for EcoNumbering {
-    type Target = PartType;
-    fn deref(&self) -> &PartType {
-        &self.0
-    }
-}
-
-/// How change orders are numbered when nobody has changed it: `ECO` + 6
-/// digits by counter.
-pub fn default_eco_numbering() -> PartType {
-    PartType {
-        id: "eco".into(),
-        name: "Change order".into(),
-        prefix: "ECO".into(),
-        digits: 6,
-        next: 1,
-        created_at: 0,
-        mode: NumberMode::Counter,
-    }
 }
 
 // ===========================================================================
@@ -1401,13 +1224,6 @@ pub struct Settings {
     pub review_rule: ReviewRule,
     /// Rules for particular part types and categories ([`ReviewOverride`]).
     pub review_overrides: Vec<ReviewOverride>,
-    /// The review rule a change order opens its round with. 0 approvals by
-    /// default: submitting approves it at once.
-    pub eco_review_rule: ReviewRule,
-    /// Refuse to release or obsolete, on its own, a revision an open change
-    /// order names. Off by default: it goes ahead, with a warning naming the
-    /// change order.
-    pub eco_holds_revisions: bool,
     /// Let a signed-in user browse (read only) other users' workspaces
     /// ([`WorkspaceEntry`]). On by default, the permissive choice of rounds
     /// 6-7: a workspace holds links to parts everyone may already read, and
@@ -1430,8 +1246,6 @@ impl Default for Settings {
             script_editor_enabled: true,
             review_rule: ReviewRule::default(),
             review_overrides: Vec::new(),
-            eco_review_rule: ReviewRule::default(),
-            eco_holds_revisions: false,
             workspaces_browsable: true,
         }
     }

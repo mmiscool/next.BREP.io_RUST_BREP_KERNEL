@@ -751,6 +751,7 @@ fn revolve_full(
         } else {
             1
         },
+        kind: crate::BodyKind::Solid,
     };
     let issues = solid.validate();
     if issues.is_empty() {
@@ -1016,6 +1017,7 @@ fn revolve_partial(
             faces,
         }],
         genus: 0,
+        kind: crate::BodyKind::Solid,
     };
     let issues = solid.validate();
     if issues.is_empty() {

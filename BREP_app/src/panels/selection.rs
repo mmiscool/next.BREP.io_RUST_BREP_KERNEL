@@ -88,7 +88,7 @@ impl SelectionPanel {
                 ui.icon_label(egui::RichText::new("\u{1f512} Reference selection — filter locked").weak())
                     .on_hover_text(
                         "The pick filter is set by the field being referenced. \
-                         Finish or cancel the reference selection to change it.",
+                         Finish the pick (Done on its field, or Escape) to change it.",
                     );
             } else {
                 ui.label("Pickable:");

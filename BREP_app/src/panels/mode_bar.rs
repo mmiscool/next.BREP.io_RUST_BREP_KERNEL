@@ -1,7 +1,10 @@
 //! mode_bar — the special-mode EXIT controls, always pinned to the TOP-RIGHT
-//! corner of the screen. Every special mode (reference-selection, sketch mode,
-//! and any future mode) surfaces its Finish / Cancel here so the exit is in a
-//! single, predictable place — the pattern the user asked for.
+//! corner of the screen. Every special mode (a card-based reference pick,
+//! sketch mode, and any future mode) surfaces its Finish / Cancel here so the
+//! exit is in a single, predictable place — the pattern the user asked for.
+//! A FORM FIELD's reference pick is not a mode: the field stays focused in its
+//! own form and takes the picks (`EngineState::ref_select_in_form`), so it has
+//! no card here.
 //!
 //! It draws INTO a caller-owned `ui` (the shell owns the top-right `Area` and
 //! stacks the context-action rail below it), and owns no model state.
@@ -34,11 +37,40 @@ impl ModeBar {
     pub fn card(&mut self, ui: &mut egui::Ui, state: &mut EngineState) {
         self.hits.clear();
 
-        if state.ref_select_active() {
+        // A FORM FIELD's pick draws no card: the field itself, focused in its
+        // pane, lists the picks and ends them (`form::ActivePick`). The card is
+        // for the picks opened from a list row with no field of their own — a
+        // connection point's seat, a spline anchor's port.
+        if state.ref_select_modal() {
             self.reference_card(ui, state);
         } else if state.sketch_mode() {
             self.sketch_card(ui, state);
+        } else if state.sketch3d_mode() {
+            self.sketch3d_card(ui, state);
         }
+    }
+
+    /// 3D sketch mode's exit: Finish commits, Cancel discards (deleting a sketch
+    /// this session created).
+    fn sketch3d_card(&mut self, ui: &mut egui::Ui, state: &mut EngineState) {
+        egui::Frame::popup(ui.style()).show(ui, |ui| {
+            let id = state.sketch3d_edit_feature_id().unwrap_or("").to_string();
+            ui.label(egui::RichText::new(format!("3D sketch: {id}")).strong());
+            ui.horizontal(|ui| {
+                let finish = ui.button("Finish").on_hover_text("Commit the 3D sketch");
+                self.hits.insert("sketch3d:finish".into(), finish.rect);
+                if finish.clicked() {
+                    let _ = state.exit_sketch3d_mode(true);
+                }
+                let cancel = ui
+                    .button("Cancel")
+                    .on_hover_text("Discard changes (deletes a new 3D sketch)");
+                self.hits.insert("sketch3d:cancel".into(), cancel.rect);
+                if cancel.clicked() {
+                    let _ = state.exit_sketch3d_mode(false);
+                }
+            });
+        });
     }
 
     /// Reference-selection: the running picked-name list (each with an ✕ to drop
@@ -178,10 +210,12 @@ impl ModeBar {
 
 /// The hit keys this panel publishes (see `automation::hit_keys`).
 pub static HIT_KEYS: &[HitKeyDoc] = &[
-    HitKeyDoc { panel: "modebar", prefix: "refsel:finish", meaning: "finish reference selection", command: None },
-    HitKeyDoc { panel: "modebar", prefix: "refsel:cancel", meaning: "cancel reference selection", command: None },
+    HitKeyDoc { panel: "modebar", prefix: "refsel:finish", meaning: "finish a CARD-based reference selection (a connection point's seat, a spline anchor's port). A form field's pick has no card: its own `<panel>/field:<path>#activate` is its Done, and a single-valued field finishes on its pick", command: None },
+    HitKeyDoc { panel: "modebar", prefix: "refsel:cancel", meaning: "cancel a card-based reference selection (Escape cancels a form field's)", command: None },
     HitKeyDoc { panel: "modebar", prefix: "refsel:x", meaning: "remove the i-th picked reference (refsel:xi)", command: None },
     HitKeyDoc { panel: "modebar", prefix: "refsel:line", meaning: "the i-th picked reference's name line — hovering it lights that entity (refsel:linei)", command: None },
     HitKeyDoc { panel: "modebar", prefix: "sketch:finish", meaning: "commit the sketch", command: None },
     HitKeyDoc { panel: "modebar", prefix: "sketch:cancel", meaning: "abandon the sketch", command: None },
+    HitKeyDoc { panel: "modebar", prefix: "sketch3d:finish", meaning: "commit the 3D sketch", command: None },
+    HitKeyDoc { panel: "modebar", prefix: "sketch3d:cancel", meaning: "abandon the 3D sketch", command: None },
 ];

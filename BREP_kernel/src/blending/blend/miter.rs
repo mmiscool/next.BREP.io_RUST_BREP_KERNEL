@@ -45,6 +45,10 @@ pub(super) struct MiterStripe<'a> {
     /// The carrier of this stripe's OTHER mate: the face the sibling's
     /// connector runs on when this stripe is the one the seam leaves first.
     pub(super) other_face: &'a FaceRecord,
+    /// The seam is the level set `dist(p, spine) = radius` of the SIBLING,
+    /// so an unequal miter reads each canal at its own radius; at an equal
+    /// miter both are the corner's one radius.
+    pub(super) radius: f64,
 }
 
 impl MiterStripe<'_> {
@@ -167,7 +171,7 @@ pub(super) enum MiterClosure {
 /// every sample its march had put on both carriers read 0.303 off them by
 /// projection distance, and 1.1e-12 at its samples (9.8e-7 between them) by
 /// this.
-fn off_surface(surface: &crate::NurbsSurface, point: Vec3) -> Result<f64, KernelRefusal> {
+pub(super) fn off_surface(surface: &crate::NurbsSurface, point: Vec3) -> Result<f64, KernelRefusal> {
     let foot = crate::project_point_to_surface(surface, point).or_refuse(KernelStage::Refine, "project_point_to_surface")?;
     let normal = raw_normal(surface, foot.u, foot.v)?;
     Ok(point.sub(foot.point).dot(normal).abs())
@@ -315,6 +319,13 @@ pub(super) fn solve_miter(
     // with the model.
     let bar = 1e-14;
     let center_second = second.center()?;
+    // Two straight canals can have two section crossings on an oblique
+    // miter. Curved spines can turn their section branch around; retain their
+    // existing exit march rather than applying the straight-canal ordering.
+    let straight_bar = MARCH_STRAIGHT * (1.0 + scale);
+    let two_straight_canals = !chamfer
+        && first.center()?.straight_segment(straight_bar).is_some()
+        && center_second.straight_segment(straight_bar).is_some();
     // Distance-to-the-sibling's-spine level: zero where a point of stripe 0
     // lies on stripe 1.  A CHAMFER's wall is the chord ruling INSIDE that
     // canal, not the canal, so the level asks the same question of the right
@@ -323,7 +334,7 @@ pub(super) fn solve_miter(
         if chamfer {
             return bevel_level(second, point, scale);
         }
-        Ok(crate::project_point_to_curve(center_second, point).or_refuse(KernelStage::Refine, "project_point_to_curve")?.distance - radius)
+        Ok(crate::project_point_to_curve(center_second, point).or_refuse(KernelStage::Refine, "project_point_to_curve")?.distance - second.radius)
     };
     let level = |u: f64, fraction: f64| -> Result<f64, KernelRefusal> {
         sibling_level(first.point(u, fraction)?)
@@ -371,19 +382,56 @@ pub(super) fn solve_miter(
     let mut uv_first = vec![[u_start, first.z(0.0)]];
     let mut uv_second = vec![[second.u_ball, second.z(0.0)]];
 
-    // One station of the seam: the fraction where the level crosses zero, or
-    // `None` when the level is non-negative on the whole other-rail end (the
-    // seam has already left this strip).
+    // One station of the seam: its first crossing from the shared rail, or
+    // `None` when no interior crossing remains in this section.
     let station = |u: f64| -> Result<Option<(f64, Vec3)>, KernelRefusal> {
+        // The corner ball's contact is the seam's known starting point,
+        // where both walls are tangent and the shared-rail level is zero.
+        // A shallow corner can leave a strip in the very first march step;
+        // exit bisection then evaluates this endpoint before any interior
+        // sample exists. Do not classify that tangency as rail re-entry.
+        if u == u_start {
+            return Ok(Some((0.0, first.point(u_start, 0.0)?)));
+        }
         let at_far = level(u, 1.0)?;
-        if at_far >= 0.0 {
+        if at_far >= 0.0 && !two_straight_canals {
             return Ok(None);
         }
         let at_near = level(u, 0.0)?;
         if at_near <= 0.0 {
             return Err(KernelRefusal::unsupported(KernelStage::Refine, "miter_rail_reentry", "miter: the shared rail re-enters the sibling blend"));
         }
-        let fraction = bisect(0.0, 1.0, at_near, &mut |f| level(u, f), 1e-13)?;
+        let mut far = 1.0;
+        if at_far >= 0.0 {
+            // An oblique miter can cross the sibling canal twice within
+            // this section. The far rail then leaves the canal while the
+            // seam continued from the shared rail is still inside the strip.
+            // Bracket that first crossing instead of jumping to the other
+            // branch's far-rail exit.
+            let mut best = (0usize, at_near);
+            for step in 1..=16 {
+                let value = level(u, step as f64 / 16.0)?;
+                if value < best.1 {
+                    best = (step, value);
+                }
+            }
+            let mut low = best.0.saturating_sub(1) as f64 / 16.0;
+            let mut high = (best.0 + 1).min(16) as f64 / 16.0;
+            for _ in 0..48 {
+                let a = low + (high - low) / 3.0;
+                let b = high - (high - low) / 3.0;
+                if level(u, a)? < level(u, b)? {
+                    high = b;
+                } else {
+                    low = a;
+                }
+            }
+            far = 0.5 * (low + high);
+            if level(u, far)? >= 0.0 {
+                return Ok(None);
+            }
+        }
+        let fraction = bisect(0.0, far, at_near, &mut |f| level(u, f), 1e-13)?;
         Ok(Some((fraction, first.point(u, fraction)?)))
     };
     // The seam's own point at `u`, or — once stripe 0 has been left — the far
@@ -425,7 +473,27 @@ pub(super) fn solve_miter(
             let mut predicate =
                 |candidate: f64| -> Result<f64, KernelRefusal> { level(candidate, 1.0) };
             let f_low = predicate(previous_u)?;
-            candidates.push((0, bisect(previous_u, u, f_low, &mut predicate, bar)?));
+            // With two section crossings the other branch may have left
+            // this rail earlier. Its level is already positive here and
+            // cannot bracket the exit of the seam we are following.
+            if !two_straight_canals {
+                candidates.push((0, bisect(previous_u, u, f_low, &mut predicate, bar)?));
+            } else if f_low <= 0.0 {
+                let candidate = bisect(previous_u, u, f_low, &mut predicate, bar)?;
+                // A whole coarse step may contain the far-rail crossing
+                // of the second branch followed by the active seam's exit
+                // on its sibling. Keep this candidate only if the continued
+                // seam actually reaches the far rail at that station.
+                let reaches_rail = match station(candidate)? {
+                    Some((_, point)) => {
+                        point.sub(first.point(candidate, 1.0)?).length() <= fit_tolerance
+                    }
+                    None => true,
+                };
+                if reaches_rail {
+                    candidates.push((0, candidate));
+                }
+            }
         }
         if left_second {
             let mut predicate =
@@ -444,19 +512,25 @@ pub(super) fn solve_miter(
              radius is too large for this corner"),
         );
     };
-    // The exit point, and whether the other stripe leaves there too.  Its foot
-    // on stripe 1 continues from the COARSE march's last sample: the resample
-    // below is a closure the ladder may run more than once, so its own last
-    // foot is not available here, and both seeds sit on the same branch.
-    let (exit_point, exit_uv_first, exit_uv_second, exit_u_second) = if leaves_first == 0 {
+    // The exit point on stripe 0. Its foot on stripe 1 is continued through
+    // the resamples below: at a first-step exit the coarse march's last foot
+    // is still the starting tangency, where a direct Newton projection to
+    // the exit can stall on the shared rail instead of reaching the far rail.
+    let (exit_point, exit_uv_first) = if leaves_first == 0 {
         let point = first.point(u_exit, 1.0)?;
-        let uv2 = sample_second(point, uv_second[uv_second.len() - 1])?;
-        (point, [u_exit, first.z(1.0)], uv2, uv2[0])
+        (point, [u_exit, first.z(1.0)])
     } else {
-        let (fraction, point) = station(u_exit)?
-            .ok_or(KernelRefusal::internal(KernelStage::Refine, "miter_exit_seam", "miter: the exit station lost the seam"))?;
-        let uv2 = sample_second(point, uv_second[uv_second.len() - 1])?;
-        (point, [u_exit, first.z(fraction)], [uv2[0], second.z(1.0)], uv2[0])
+        let (fraction, point) = match station(u_exit)? {
+            Some(sample) => sample,
+            // Both rails can be reached at the same station. Bisection's
+            // rounded endpoint may then be on stripe 0's far rail rather
+            // than strictly inside it. Keep that common exit only if it
+            // still lies on the sibling canal within the seam's fit bar.
+            None if level(u_exit, 1.0)?.abs() <= fit_tolerance =>
+                (1.0, first.point(u_exit, 1.0)?),
+            None => return Err(KernelRefusal::internal(KernelStage::Refine, "miter_exit_seam", "miter: the exit station lost the seam")),
+        };
+        (point, [u_exit, first.z(fraction)])
     };
     // The exit is known: resample the seam densely between P and the exit so
     // the fitted edge rides both blends between samples too.  The coarse
@@ -482,7 +556,11 @@ pub(super) fn solve_miter(
         }
         points.push(exit_point);
         uv_first.push(exit_uv_first);
-        uv_second.push(exit_uv_second);
+        let mut exit_uv = sample_second(exit_point, *uv_second.last().expect("a seeded sample"))?;
+        if leaves_first == 1 {
+            exit_uv[1] = second.z(1.0);
+        }
+        uv_second.push(exit_uv);
         Ok(MarchedCurve {
             points,
             uv_first,
@@ -495,6 +573,8 @@ pub(super) fn solve_miter(
         Ok(off_surface(&first.rows.surface, point)?.max(sibling_level(point)?.abs()))
     };
     let (seam, seam_fit) = fit_on_ladder(&resample, "seam", &seam_off_carriers, fit_tolerance)?;
+    let exit_uv_second = *seam.uv_second.last().expect("a resampled seam");
+    let exit_u_second = exit_uv_second[0];
 
     check_sharp_extent(sharp, exit_point, consumed_band, radius)?;
     let on_sharp = crate::project_point_to_curve(&sharp.curve, exit_point).or_refuse(KernelStage::Refine, "project_point_to_curve")?;

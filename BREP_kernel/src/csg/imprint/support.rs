@@ -1034,9 +1034,10 @@ pub(super) fn tangent_hit_endpoint(
 /// that end. A boundary edge whose control hull stands farther than that
 /// search's reach from the curve's is not searched. A curve that meets the
 /// surface only where it lifts off inside the face has no crossing there and
-/// is not exchanged, as before. `whole_only` is the caller's answer to "does an
-/// exact lane already mint this pair's section": where one does, a span would
-/// be a second copy of it. Escape hatch for tamper-verification:
+/// is not exchanged, as before. `whole_only` is used for seam edges when an
+/// exact lane already retains the section. Ordinary boundary sections are
+/// discarded by that lane, so their partial spans must still be exchanged.
+/// Escape hatch for tamper-verification:
 /// `BREP_LIES_ON_SPANS=0` exchanges whole curves only.
 pub(super) fn curve_spans_on_face(
     curve: NurbsCurve,
@@ -1143,7 +1144,7 @@ pub(super) fn curve_spans_on_face(
 }
 
 /// Which predicate admits a direction of a carrier into the exact lane of
-/// [`planar_linear_iso_intersection`].
+/// [`planar_iso_section`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum IsoGate {
     /// The count proxy: degree 1 with exactly two control rows across the
@@ -1279,7 +1280,7 @@ pub(super) fn rulings_are_straight_and_affine(
     measure
 }
 
-/// How [`planar_linear_iso_intersection`] answered one direction.
+/// How [`planar_iso_section`] answered one direction.
 #[derive(Clone, Debug)]
 pub(super) enum IsoOutcome {
     /// The gate declined the direction.
@@ -1311,7 +1312,7 @@ impl IsoOutcome {
     }
 }
 
-/// Recover an exact isoparametric intersection when an affine plane slices
+/// [`planar_iso_section`] recovers an exact isoparametric intersection when an affine plane slices
 /// a surface that is linear across one parameter direction. General SSI can
 /// miss this case when the other direction is a high-degree rational curve:
 /// all seeds lie on two distant trim boundaries even though the intersection
@@ -1321,22 +1322,8 @@ impl IsoOutcome {
 /// net's geometry ([`rulings_are_straight_and_affine`]), at any degree and any
 /// row count — and the root, root-agreement and `curve_lies_on_surface` checks
 /// below stand behind it unchanged.
-fn planar_linear_iso_intersection(
-    plane: &NurbsSurface,
-    ruled: &NurbsSurface,
-    tolerance: f64,
-) -> Result<Option<NurbsCurve>, KernelRefusal> {
-    for linear_v in [true, false] {
-        if let IsoOutcome::Curve(curve) =
-            planar_linear_iso_direction(plane, ruled, tolerance, linear_v, iso_gate())?
-        {
-            return Ok(Some(curve));
-        }
-    }
-    Ok(None)
-}
-
-/// One direction of [`planar_linear_iso_intersection`] under a named gate.
+///
+/// One direction of [`planar_iso_section`] under a named gate.
 pub(super) fn planar_linear_iso_direction(
     plane: &NurbsSurface,
     ruled: &NurbsSurface,
@@ -1344,11 +1331,35 @@ pub(super) fn planar_linear_iso_direction(
     linear_v: bool,
     gate: IsoGate,
 ) -> Result<IsoOutcome, KernelRefusal> {
+    Ok(match planar_linear_iso_direction_section(plane, ruled, tolerance, linear_v, gate)? {
+        IsoAnswer::Declined(outcome) => outcome,
+        IsoAnswer::Curve { curve, .. } => IsoOutcome::Curve(curve),
+    })
+}
+
+/// [`planar_linear_iso_direction`]'s answer with the pcurves of an accepted
+/// curve ([`planar_iso_section`]).
+enum IsoAnswer {
+    Declined(IsoOutcome),
+    Curve {
+        curve: NurbsCurve,
+        on_plane: Option<NurbsCurve>,
+        on_ruled: Option<NurbsCurve>,
+    },
+}
+
+fn planar_linear_iso_direction_section(
+    plane: &NurbsSurface,
+    ruled: &NurbsSurface,
+    tolerance: f64,
+    linear_v: bool,
+    gate: IsoGate,
+) -> Result<IsoAnswer, KernelRefusal> {
     if !plane
         .is_affine()
         .or_refuse(KernelStage::Intersect, "is_affine")?
     {
-        return Ok(IsoOutcome::Gate);
+        return Ok(IsoAnswer::Declined(IsoOutcome::Gate));
     }
     let admitted = match gate {
         IsoGate::Count => {
@@ -1361,7 +1372,7 @@ pub(super) fn planar_linear_iso_direction(
         IsoGate::Geometry => rulings_are_straight_and_affine(ruled, linear_v, tolerance).admits(tolerance),
     };
     if !admitted {
-        return Ok(IsoOutcome::Gate);
+        return Ok(IsoAnswer::Declined(IsoOutcome::Gate));
     }
     let plane_u = KnotVector::new(plane.knots_u.clone(), plane.degree_u)
         .or_refuse(KernelStage::Intersect, "new")?
@@ -1413,11 +1424,11 @@ pub(super) fn planar_linear_iso_direction(
         let second_distance = signed_distance(second);
         let denominator = first_distance - second_distance;
         if denominator.abs() <= root_tolerance {
-            return Ok(IsoOutcome::Root);
+            return Ok(IsoAnswer::Declined(IsoOutcome::Root));
         }
         let root = first_distance / denominator;
         if root < -root_tolerance || root > 1.0 + root_tolerance {
-            return Ok(IsoOutcome::Root);
+            return Ok(IsoAnswer::Declined(IsoOutcome::Root));
         }
         roots.push(root.clamp(0.0, 1.0));
     }
@@ -1426,15 +1437,23 @@ pub(super) fn planar_linear_iso_direction(
         .iter()
         .any(|candidate| (candidate - root).abs() > root_tolerance * 10.0)
     {
-        return Ok(IsoOutcome::RootAgreement);
+        return Ok(IsoAnswer::Declined(IsoOutcome::RootAgreement));
     }
+    // The iso parameter, computed once and shared by the curve and its
+    // pcurve on the ruled carrier (`iso_curve_*` clamps it to the domain the
+    // same way `knot_clamp` does; the root is already within it).
+    let fixed = if linear_v {
+        v_domain[0] + (v_domain[1] - v_domain[0]) * root
+    } else {
+        u_domain[0] + (u_domain[1] - u_domain[0]) * root
+    };
     let curve = if linear_v {
         ruled
-            .iso_curve_v(v_domain[0] + (v_domain[1] - v_domain[0]) * root)
+            .iso_curve_v(fixed)
             .or_refuse(KernelStage::Intersect, "iso_curve_v")?
     } else {
         ruled
-            .iso_curve_u(u_domain[0] + (u_domain[1] - u_domain[0]) * root)
+            .iso_curve_u(fixed)
             .or_refuse(KernelStage::Intersect, "iso_curve_u")?
     };
     let anchor = curve
@@ -1449,13 +1468,17 @@ pub(super) fn planar_linear_iso_direction(
                 .unwrap_or(false)
         });
         if collapsed {
-            return Ok(IsoOutcome::Pole);
+            return Ok(IsoAnswer::Declined(IsoOutcome::Pole));
         }
     }
     if !curve_lies_on_surface(&curve, plane, tolerance)? {
-        return Ok(IsoOutcome::OffPlane);
+        return Ok(IsoAnswer::Declined(IsoOutcome::OffPlane));
     }
-    Ok(IsoOutcome::Curve(curve))
+    // An iso-curve in `u` (`iso_curve_v`, `v` fixed) runs along the ruled
+    // carrier's `u`; one in `v` runs along its `v`.
+    let on_ruled = iso_line_pcurve(&curve, fixed, linear_v).ok();
+    let on_plane = crate::fit_pcurve_on_surface(plane, &curve).ok().map(|fit| fit.curve);
+    Ok(IsoAnswer::Curve { curve, on_plane, on_ruled })
 }
 
 /// [`planar_iso_intersection`] under a named gate — what the census asks of
@@ -1595,10 +1618,71 @@ pub(super) fn planar_iso_intersection(
     second: &NurbsSurface,
     tolerance: f64,
 ) -> Result<Option<NurbsCurve>, KernelRefusal> {
-    if let Some(curve) = planar_linear_iso_intersection(first, second, tolerance)? {
-        return Ok(Some(curve));
+    Ok(planar_iso_section(first, second, tolerance)?.map(|section| section.curve))
+}
+
+/// A planar-iso section with its two EXACT pcurves (2026-10-11, the
+/// catalogue's P3 for the exact lanes). The curve is the one
+/// [`planar_iso_intersection`] returns, to the bit: the same gate, root,
+/// agreement and on-plane checks decide it, the pcurves are read off the
+/// construction afterwards.
+///
+/// On the ruled carrier the section IS an iso-curve, so its pcurve is the
+/// straight line at the iso parameter traced at unit speed in the curve's own
+/// parameter: control points at the Greville abscissae of the curve's knots
+/// with unit weights, which a B-spline reproduces exactly (`Σ N_k(t)·ξ_k = t`).
+/// On the plane the pcurve is the affine inverse image of the curve's control
+/// net (`fit_pcurve_on_surface`'s affine arm, which maps the net and keeps the
+/// weights; no fit is recorded). Both share the curve's degree and knots, so
+/// the builder splits them with the curve and the junction pass moves their
+/// ends instead of re-marching them, as it does for a Hermite-emitted pcurve.
+pub(super) struct IsoSection {
+    pub(super) curve: NurbsCurve,
+    /// The pcurves on `first` and on `second`, in that order; `None` when
+    /// either could not be built (an affine plane whose inverse is not
+    /// determined), which leaves the fit lane to say so as it always has.
+    pub(super) pcurves: Option<[NurbsCurve; 2]>,
+}
+
+pub(super) fn planar_iso_section(
+    first: &NurbsSurface,
+    second: &NurbsSurface,
+    tolerance: f64,
+) -> Result<Option<IsoSection>, KernelRefusal> {
+    for (plane, ruled, plane_first) in [(first, second, true), (second, first, false)] {
+        for linear_v in [true, false] {
+            if let IsoAnswer::Curve { curve, on_plane, on_ruled } =
+                planar_linear_iso_direction_section(plane, ruled, tolerance, linear_v, iso_gate())?
+            {
+                let pcurves = match (on_plane, on_ruled) {
+                    (Some(on_plane), Some(on_ruled)) if plane_first => Some([on_plane, on_ruled]),
+                    (Some(on_plane), Some(on_ruled)) => Some([on_ruled, on_plane]),
+                    _ => None,
+                };
+                return Ok(Some(IsoSection { curve, pcurves }));
+            }
+        }
     }
-    planar_linear_iso_intersection(second, first, tolerance)
+    Ok(None)
+}
+
+/// The straight pcurve of an iso-curve on its own carrier, on the curve's
+/// knots: `(ξ_k, fixed)` for an iso-curve in `u` at `v = fixed`, `(fixed, ξ_k)`
+/// for one in `v` at `u = fixed`.
+fn iso_line_pcurve(curve: &NurbsCurve, fixed: f64, along_u: bool) -> Result<NurbsCurve, String> {
+    let degree = curve.degree;
+    let count = curve.control_points.len();
+    if degree == 0 || curve.knots.len() != count + degree + 1 {
+        return Err("iso_line_pcurve: the curve's knots do not match its net".into());
+    }
+    let controls = (0..count)
+        .map(|index| {
+            let greville = curve.knots[index + 1..=index + degree].iter().sum::<f64>() / degree as f64;
+            let (x, y) = if along_u { (greville, fixed) } else { (fixed, greville) };
+            Vec4 { x, y, z: 0.0, w: 1.0 }
+        })
+        .collect();
+    NurbsCurve::new(degree, curve.knots.clone(), controls)
 }
 
 fn coplanar_pair(

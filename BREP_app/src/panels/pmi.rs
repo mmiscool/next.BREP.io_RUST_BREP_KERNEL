@@ -47,7 +47,7 @@ use crate::automation::hit_keys::HitKeyDoc;
 use crate::column_tree::{self, CellKind, ColumnLayout, ColumnSpec, ColumnTreeSpec, RowAction, RowNode};
 use crate::form_view::{form_view, FormViewSpec};
 use brep_render::brep_kernel::{pmi_schema_catalogue, pmi_type, PmiReport, PmiState, PmiStatus, PMI_TYPES};
-use brep_render::engine_state::{pmi_view_params, pmi_view_schema, EngineState, PmiViewPatch};
+use brep_render::engine_state::{pmi_view_params, pmi_view_schema, EngineState, PmiViewPatch, RefSelectField, RefSelectTarget};
 use brep_render::features::form_fields_from_schema;
 use eframe::egui;
 use serde_json::Value;
@@ -116,6 +116,10 @@ enum Action {
         multiple: bool,
         seed: Vec<String>,
     },
+    /// The focused reference field's `Done`: commit the running pick.
+    FinishRefSelect,
+    /// An `✕` on the focused reference field: drop the i-th running pick.
+    RefSelectRemove(usize),
 }
 
 /// Drive the engine for one deferred [`Action`]. A refusal comes back as the
@@ -160,7 +164,20 @@ fn apply(state: &mut EngineState, action: Action) -> Result<(), String> {
         Action::Delete(id) => state.pmi_remove_annotation(&id),
         Action::UpdateParams(id, params) => state.pmi_update_annotation(&id, &params.to_string()),
         Action::BeginRefSelect { id, path, label, filter, multiple, seed } => {
+            // Focus moves from one selection box to the next: a pick already
+            // running commits first.
+            if state.ref_select_active() {
+                state.finish_ref_select();
+            }
             state.begin_ref_select_for_pmi(&id, path, label, filter, multiple, seed);
+            Ok(())
+        }
+        Action::FinishRefSelect => {
+            state.finish_ref_select();
+            Ok(())
+        }
+        Action::RefSelectRemove(index) => {
+            state.ref_select_remove(index);
             Ok(())
         }
     }
@@ -311,7 +328,13 @@ impl PmiPanel {
                 self.plugin_form = Some(PluginAnnotationForm { id: Some(annotation.id().to_owned()), kind: annotation.kind.clone(), view, pending: None, params: annotation.params.clone(), error: None });
                 self.show_plugin_form(ui, state);
             }
-            (Some(annotation), _) => self.show_form(ui, &annotation, &report, &mut action, &mut close, &mut hover),
+            (Some(annotation), _) => {
+                // The pick running in this annotation's form, if one is.
+                let picking = state
+                    .ref_select_field()
+                    .filter(|f| f.target == RefSelectTarget::Pmi && f.subject == annotation.id());
+                self.show_form(ui, &annotation, &report, picking.as_ref(), &mut action, &mut close, &mut hover);
+            }
             (None, Some(view)) => self.show_view_form(ui, &view, &mut action, &mut close),
             (None, None) => self.show_tree(ui, &pmi, &report, active.as_deref(), selected.as_deref(), &mut action, &state.plugin_annotation_catalogue()),
         }
@@ -321,9 +344,20 @@ impl PmiPanel {
             state.push_notice(format!("PMI: {error}"));
         }
         if close {
+            // Leaving the form commits the pick running in it.
+            if state.ref_select_field().is_some_and(|f| f.target == RefSelectTarget::Pmi) {
+                state.finish_ref_select();
+            }
             // The pane shows one dialog, so whichever is up is the one closing.
             state.pmi_set_annotation_open(None);
             state.pmi_set_view_open(None);
+        }
+        // This pane drew (or opened) the pick: the shell finishes an in-form
+        // pick no form claims, so one never runs on with its field off screen.
+        if let Some(field) = state.ref_select_field() {
+            if field.target == RefSelectTarget::Pmi && state.pmi_open_annotation() == Some(field.subject.as_str()) {
+                state.ref_select_claim();
+            }
         }
         let open_explode = state.pmi_open_annotation().and_then(|id| state.pmi_state().find_annotation(id).filter(|(_, a)| a.kind == "explode").map(|_| id.to_owned()));
         if let Some(id) = open_explode {
@@ -659,6 +693,8 @@ impl PmiPanel {
             rollback: false,
             hits_prefix: "pmi:",
             read_only: self.locked.as_deref(),
+            // A view's form has no reference field.
+            picking: None,
         };
         let out = form_view(ui, &spec, &mut params, Some(&mut self.hits));
         let anchor = self.hits.get("pmi:form:feature").map(|rect| rect.min).unwrap_or(egui::Pos2::ZERO);
@@ -684,11 +720,13 @@ impl PmiPanel {
     }
 
     /// Draw ONE annotation's dialog through the shared form view.
+    #[allow(clippy::too_many_arguments)]
     fn show_form(
         &mut self,
         ui: &mut egui::Ui,
         annotation: &brep_render::brep_kernel::PmiAnnotation,
         report: &PmiReport,
+        picking: Option<&RefSelectField>,
         action: &mut Option<Action>,
         close: &mut bool,
         hover: &mut Option<String>,
@@ -724,6 +762,7 @@ impl PmiPanel {
             rollback: false,
             hits_prefix: "pmi:",
             read_only: self.locked.as_deref(),
+            picking: picking.map(|f| crate::form::ActivePick { path: &f.path, names: &f.names }),
         };
         let out = form_view(ui, &spec, &mut params, Some(&mut self.hits));
         let anchor = self.hits.get("pmi:form:feature").map(|rect| rect.min).unwrap_or(egui::Pos2::ZERO);
@@ -737,6 +776,13 @@ impl PmiPanel {
                 multiple: activate.multiple,
                 seed: activate.seed,
             });
+        }
+        // The focused reference field's own intents.
+        if let Some(index) = out.pick_remove {
+            *action = Some(Action::RefSelectRemove(index));
+        }
+        if out.pick_done {
+            *action = Some(Action::FinishRefSelect);
         }
         if out.changed {
             *action = Some(Action::UpdateParams(id.clone(), params));

@@ -175,6 +175,8 @@ pub(in crate::watertight_tessellation) fn unwrap_seam_crossing_trim(
 /// result is identical to the quadratic scan, while dense hole grids avoid
 /// repeatedly comparing every boundary segment with every other segment.
 pub(in crate::watertight_tessellation) fn polygon_is_simple(polygon: &[FaceVertex]) -> bool {
+    let _timer = stage_timer(Stage::Simple);
+    tess_profile(|p| p.simple_tests += 1);
     let n = polygon.len();
     if n < 4 {
         return true;

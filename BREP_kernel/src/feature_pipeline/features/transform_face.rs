@@ -38,34 +38,18 @@
 //!   Rotate Face's road, unchanged. `R` is converted to that axis and angle from
 //!   the same matrix the compose builds, so the stored Euler angles and the
 //!   kernel's Rodrigues rotation are one rotation;
-//! * a COMBINED motion is rotate-then-translate: `rotate_faces` about the pivot,
-//!   then `move_faces` by `position` on the solid the rotation left. Both are
-//!   pure geometry edits that keep every face id, so the second call takes the
-//!   same ids the first did.
+//! * a COMBINED motion goes through the rotation solver with the translation
+//!   composed into its affine before any corner is solved. The carrier normals
+//!   turn and their positions move together, and every edge inversion, winding
+//!   and soundness check sees the final geometry. A rotation-only intermediate
+//!   can invert a wall that the final translation extends safely; it is not a
+//!   shape the user requested and must not block the edit.
 //!
-//! Why not one rigid re-intersection: neither primitive accepts a general rigid
-//! motion. `move_faces` takes a vector and builds its rim maps from it (the
-//! exact affine for a ruled carrier, the plane × sphere circle); `rotate_faces`
-//! takes an axis and an angle and tests carrier invariance against that axis
-//! line. A third road accepting a matrix would have to redo both invariance
-//! analyses per case, which is precisely the objection the Rotate Face contract
-//! raised against a matrix: a matrix names no invariant. Decomposing keeps the
-//! invariant each road proves.
-//!
-//! Why not the screw decomposition (Chasles: any rigid motion is a rotation
-//! about SOME axis plus a slide along it, which would fold the in-plane part of
-//! `position` into a single `rotate_faces` call): that axis sits at
-//! `|position⊥| / (2·sin(θ/2))` from the pivot — metres away for a degree of turn
-//! — and it is no longer the selection's own axis, so a coaxial cylinder spun
-//! and slid would lose the rigid regime it has about the pivot. The pivot the
-//! user stated is the axis the invariance test must see.
-//!
-//! The price of two calls is an INTERMEDIATE state: the faces rotated but not yet
-//! translated. A motion whose end state is buildable can still refuse there (a
-//! rotation that alone inverts a neighbour the translation would have restored).
-//! Such a refusal is named as the step it happened in — "the rotation step" or
-//! "the translation step" — with the primitive's own message after it, so the
-//! user reads which half of the motion to change.
+//! The rigid regime requires the fixed carrier to be invariant under both
+//! parts: an in-plane spin does not leave a plane invariant when followed by a
+//! normal translation, and a cone cannot ride an axial translation. Cylinders
+//! still admit an axial slide. Other pairs use the existing re-intersection
+//! and re-trimming machinery against the final moved planes and ruled frames.
 //!
 //! # The pivot
 //!
@@ -123,9 +107,9 @@ use crate::{move_faces, rotate_faces, BrepSolid, KernelRefusal, KernelStage, Vec
 /// rational circle split into quarter spans is sampled at its span ends — the
 /// points where an axis-aligned circle reaches its bounds.
 /// [`FeatureResult::refused_step`] of a Transform Face whose ROTATION refused
-/// (a turn alone, or the first half of rotate-then-translate).
+/// (a turn alone, or a combined rigid motion through the rotation solver).
 pub const REFUSED_STEP_ROTATION: &str = "rotation";
-/// … whose TRANSLATION refused (a move alone, or the second half).
+/// … whose pure TRANSLATION refused.
 pub const REFUSED_STEP_TRANSLATION: &str = "translation";
 
 pub const CENTRE_SAMPLES: usize = 64;
@@ -376,7 +360,7 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, FeatureRefusal> {
             Some((pivot, axis, angle))
         }
     };
-    // Every motion step records itself on refusal (`refused_step`), so the
+    // The motion records itself on refusal (`refused_step`), so the
     // app names the motion the user asked for without reading this text.
     let refused_at = |error: KernelRefusal, step: &str| {
         let mut refused = ctx.fail(error);
@@ -395,33 +379,15 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, FeatureRefusal> {
                     Err(error) => return Ok(refused_at(error, REFUSED_STEP_ROTATION)),
                 }
             } else {
-                // ROTATE-THEN-TRANSLATE, each step named on refusal (module doc).
-                // The primitive's class rides through the step's wrap.
-                // The refused step is also RECORDED on the result
-                // (`FeatureResult::refused_step`), so a reader need not parse it
-                // out of this text.
-                let turned = match rotate_faces(&solid, &face_ids, pivot, axis, angle) {
-                    Ok(turned) => turned,
-                    Err(error) => {
-                        let error = error.with_message(|error| {
-                            format!(
-                                "transformFace: the ROTATION step of this rotate-then-translate motion \
-                                 refused — {error}"
-                            )
-                        });
-                        return Ok(refused_at(error, REFUSED_STEP_ROTATION));
-                    }
-                };
-                match move_faces(&turned, &face_ids, translation) {
+                match crate::direct_edit::rotate_faces_rigid(
+                    &solid, &face_ids, pivot, axis, angle, translation,
+                ) {
                     Ok(moved) => moved,
                     Err(error) => {
                         let error = error.with_message(|error| {
-                            format!(
-                                "transformFace: the TRANSLATION step of this rotate-then-translate \
-                                 motion, applied to the faces as the rotation left them, refused — {error}"
-                            )
+                            format!("transformFace: the combined rigid motion refused — {error}")
                         });
-                        return Ok(refused_at(error, REFUSED_STEP_TRANSLATION));
+                        return Ok(refused_at(error, REFUSED_STEP_ROTATION));
                     }
                 }
             }
@@ -443,9 +409,8 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, FeatureRefusal> {
     // rotate-then-translate as well as a translation (the 2026-09-22 slot
     // document with its wall also TURNED 16.9° refused here while the same
     // drag without the turn built). See `edit/direct_edit/face_move_recut.rs`.
-    // It runs only after a refusal, so no motion that builds today changes by a
-    // bit, and a motion `move_faces` / `rotate_faces` itself refused never
-    // reaches it.
+    // It runs only after an acceptance refusal; a motion refused by the
+    // direct re-intersection solver never reaches it.
     let moved = match crate::accept_sound(moved, "transformFace") {
         Ok(body) => body,
         Err(refusal) => {

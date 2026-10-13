@@ -173,6 +173,30 @@ pub(super) fn section_refine_route(
 /// it was (k = 10 flips it).
 const SECTION_REFINE_GATE: f64 = 100.0;
 
+/// The axis-aligned box of a curve's control points (rational ones read at
+/// their Cartesian position), grown by `margin` on every side: a box the
+/// curve cannot leave, since a NURBS curve with positive weights lies in its
+/// control hull.
+pub(super) fn control_hull_box(curve: &NurbsCurve, margin: f64) -> [Vec3; 2] {
+    let mut low = Vec3::new(f64::INFINITY, f64::INFINITY, f64::INFINITY);
+    let mut high = Vec3::new(f64::NEG_INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY);
+    for control in &curve.control_points {
+        let w = if control.w.abs() > 1e-300 { control.w } else { 1.0 };
+        let point = Vec3::new(control.x / w, control.y / w, control.z / w);
+        low = Vec3::new(low.x.min(point.x), low.y.min(point.y), low.z.min(point.z));
+        high = Vec3::new(high.x.max(point.x), high.y.max(point.y), high.z.max(point.z));
+    }
+    [
+        Vec3::new(low.x - margin, low.y - margin, low.z - margin),
+        Vec3::new(high.x + margin, high.y + margin, high.z + margin),
+    ]
+}
+
+/// Whether two closed boxes share a point.
+pub(super) fn boxes_overlap(a: &[Vec3; 2], b: &[Vec3; 2]) -> bool {
+    a[0].x <= b[1].x && b[0].x <= a[1].x && a[0].y <= b[1].y && b[0].y <= a[1].y && a[0].z <= b[1].z && b[0].z <= a[1].z
+}
+
 /// A clipped run's END span can be a sliver: the clip endpoint lands beside a
 /// march station, a spacing ratio to the run's median of 0.011 on
 /// `anotherBooleanFail`, and a global interpolant rings next to such a jump —
@@ -301,6 +325,119 @@ fn section_fit_degree() -> usize {
             .filter(|degree| (1..=7).contains(degree))
             .unwrap_or(5)
     })
+}
+
+/// `BREP_SPAN_BUDGET`, read once: unset leaves [`ImprintOptions::span_budget`]
+/// in charge; `off` forces none; `fit` is the pair's `intersection_fit` at the
+/// operands' scale; a number is an absolute budget.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum SpanBudgetSwitch {
+    Unset,
+    Off,
+    Fit,
+    Absolute(f64),
+}
+
+fn span_budget_switch() -> SpanBudgetSwitch {
+    static SWITCH: std::sync::OnceLock<SpanBudgetSwitch> = std::sync::OnceLock::new();
+    *SWITCH.get_or_init(|| match std::env::var("BREP_SPAN_BUDGET") {
+        Ok(value) if value == "fit" => SpanBudgetSwitch::Fit,
+        Ok(value) if value == "off" || value == "0" => SpanBudgetSwitch::Off,
+        Ok(value) => value
+            .parse::<f64>()
+            .ok()
+            .filter(|budget| *budget > 0.0)
+            .map_or(SpanBudgetSwitch::Unset, SpanBudgetSwitch::Absolute),
+        Err(_) => SpanBudgetSwitch::Unset,
+    })
+}
+
+/// The span budget every march of this imprint carries: the option under
+/// its environment override. `fit` is what the catalogue names as the
+/// budget a lane may carry, the imprint's `intersection_fit`
+/// (`KernelTolerances::for_scale`), never the corrector's `tolerance`.
+pub(super) fn span_budget(options: &ImprintOptions, scale: f64) -> Option<f64> {
+    match span_budget_switch() {
+        SpanBudgetSwitch::Unset => options.span_budget,
+        SpanBudgetSwitch::Off => None,
+        SpanBudgetSwitch::Fit => Some(crate::KernelTolerances::for_scale(scale, options.tolerance).intersection_fit),
+        SpanBudgetSwitch::Absolute(budget) => Some(budget),
+    }
+}
+
+/// [`ImprintOptions::hermite_sections`] under its environment override.
+fn hermite_sections(options: &ImprintOptions) -> bool {
+    match std::env::var("BREP_HERMITE_SECTIONS").as_deref() {
+        Ok("0") => false,
+        Ok(_) => true,
+        Err(_) => options.hermite_sections,
+    }
+}
+
+/// [`ImprintOptions::exact_iso_pcurves`] under its environment override
+/// (`BREP_EXACT_ISO_PCURVES`: `0`/`off`, `check`, anything else on).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ExactIsoPcurves {
+    Off,
+    On,
+    /// The fit lane runs; the exact pcurve is built beside it and compared
+    /// (`ImprintBuilder::exact_pcurve_check`).
+    Check,
+}
+
+fn exact_iso_pcurves(options: &ImprintOptions) -> ExactIsoPcurves {
+    match std::env::var("BREP_EXACT_ISO_PCURVES").as_deref() {
+        Ok("0") | Ok("off") => ExactIsoPcurves::Off,
+        Ok("check") => ExactIsoPcurves::Check,
+        Ok(_) => ExactIsoPcurves::On,
+        Err(_) if options.exact_iso_pcurves => ExactIsoPcurves::On,
+        Err(_) => ExactIsoPcurves::Off,
+    }
+}
+
+thread_local! {
+    /// Set by `build_imprints_impl` as it returns, read by the boolean
+    /// right after ([`take_rescue_firings`]) into
+    /// `intersect.march_swap_rescue` and `intersect.clip_swap_rescue`; a
+    /// thread-local rather than a field so the shared record's eight
+    /// literals stay as they are.
+    static RESCUE_FIRINGS: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+/// `(march-order swap rescues, clip-order swap rescues)` of the last imprint
+/// built on this thread, cleared by the read.
+pub(crate) fn take_rescue_firings() -> (u64, u64) {
+    RESCUE_FIRINGS.with(|cell| cell.replace((0, 0)))
+}
+
+/// [`ImprintOptions::march_starts`] under its environment override, as
+/// `(ordered_starts, consume_starts, tree_seeds)` for every march this
+/// imprint runs. `BREP_MARCH_STARTS`: `0`/`off`; `order` (A3's ordering
+/// alone); `snap` (the ordering with run-through starts consumed); `tree`
+/// (A4 alone); `order+tree`; anything else all three.
+fn march_starts(options: &ImprintOptions) -> (bool, bool, bool) {
+    match std::env::var("BREP_MARCH_STARTS").as_deref() {
+        Ok("0") | Ok("off") => (false, false, false),
+        Ok("order") => (true, false, false),
+        Ok("snap") => (true, true, false),
+        Ok("tree") => (false, false, true),
+        Ok("order+tree") => (true, false, true),
+        Ok(_) => (true, true, true),
+        Err(_) => (options.march_starts, options.march_starts, options.march_starts),
+    }
+}
+
+/// `BREP_SPAN_CENSUS=<file>`: one line per clipped section, appended, so a
+/// corpus replay can be read for station growth and refine-route firings
+/// under a budget. `BREP_CENSUS_LABEL` names the run on every line.
+fn span_census(line: impl FnOnce() -> String) {
+    if let Ok(path) = std::env::var("BREP_SPAN_CENSUS") {
+        use std::io::Write;
+        if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+            let label = std::env::var("BREP_CENSUS_LABEL").unwrap_or_default();
+            let _ = writeln!(file, "span-budget census: label {label} {}", line());
+        }
+    }
 }
 
 /// A marched section is held to the fit tolerance against the CARRIERS, not
@@ -1132,7 +1269,7 @@ pub fn build_imprints(
     solid_b: &BrepSolid,
     options: &ImprintOptions,
 ) -> Result<ImprintResultRecord, KernelRefusal> {
-    build_imprints_impl(solid_a, solid_b, options, false)
+    build_imprints_impl(solid_a, solid_b, options, false, super::pcurve_cache::enabled())
 }
 
 /// Imprint temporary open offset sheets. A section riding one sheet's trim
@@ -1142,15 +1279,17 @@ pub(crate) fn build_carrier_imprints(
     solid_b: &BrepSolid,
     options: &ImprintOptions,
 ) -> Result<ImprintResultRecord, KernelRefusal> {
-    build_imprints_impl(solid_a, solid_b, options, true)
+    build_imprints_impl(solid_a, solid_b, options, true, super::pcurve_cache::enabled())
 }
 
-fn build_imprints_impl(
+pub(super) fn build_imprints_impl(
     solid_a: &BrepSolid,
     solid_b: &BrepSolid,
     options: &ImprintOptions,
     open_carriers: bool,
+    pcurve_cache: bool,
 ) -> Result<ImprintResultRecord, KernelRefusal> {
+    let _pcurve_cache = super::pcurve_cache::FitCacheScope::open(pcurve_cache);
     let mut section_evidence = false;
     let edges = edge_map(solid_a, solid_b);
     let mut builder = ImprintBuilder {
@@ -1162,12 +1301,23 @@ fn build_imprints_impl(
         scale: solid_scale(solid_a).max(solid_scale(solid_b)),
         vertices: Vec::new(),
         vertex_radii: HashMap::default(),
+        vertex_sources: HashMap::default(),
         pieces: Vec::new(),
         by_face: HashMap::default(),
         edge_splits: HashMap::default(),
         marched_pieces: HashSet::default(),
+        emitted_pcurves: HashSet::default(),
+        exact_pcurve_check: false,
         next_id: 1,
     };
+    let hermite_lane = hermite_sections(options);
+    let exact_iso = exact_iso_pcurves(options);
+    let (ordered_starts, consume_starts, tree_seeds) = march_starts(options);
+    builder.exact_pcurve_check = exact_iso == ExactIsoPcurves::Check;
+    // The Hermite lane needs the march's span test; with no budget asked for
+    // it carries the one the catalogue names, the pair's `intersection_fit`.
+    let march_span_budget = span_budget(options, builder.scale)
+        .or_else(|| hermite_lane.then(|| crate::KernelTolerances::for_scale(builder.scale, options.tolerance).intersection_fit));
     let mut first_faces = faces(solid_a, 0);
     let mut second_faces = faces(solid_b, 1);
     // Per-face trim-window carriers, computed once: tighter BVH bounds, and
@@ -1261,8 +1411,18 @@ fn build_imprints_impl(
         }
     };
     let mut profile = ImprintProfile::new();
+    let mut march_swap_rescues = 0_u64;
+    let mut clip_swap_rescues = 0_u64;
+    // `imprint.fits`: the pcurve fits the pairs record, read through a nested
+    // scope that folds into the operation's own ledger on close.
+    let pairs_fits = profile.enabled.then(crate::PcurveFitScope::open);
     let mut tangent_nodes: Vec<Vec3> = Vec::new();
+    let mut tangent_sections: Vec<TangentSectionRecord> = Vec::new();
+    // Planar tangent runs to IMPRINT once every pair has minted its pieces
+    // (`ImprintOptions::tangent_curve_imprint`): (section index, run, pair).
+    let mut tangent_imprint_candidates: Vec<(usize, Vec<Vec3>, TaggedFace<'_>, TaggedFace<'_>)> = Vec::new();
     let mut cosurface_pairs: Vec<(FaceKey, FaceKey)> = Vec::new();
+    let mut deferred_boundary_spans = Vec::new();
     let mut paired = Vec::new();
     for (first_index, first) in first_faces.iter().enumerate() {
         let first = *first;
@@ -1338,6 +1498,7 @@ fn build_imprints_impl(
                             &[first],
                             &[first],
                             false,
+                            None,
                         )?;
                     }
                 }
@@ -1350,6 +1511,7 @@ fn build_imprints_impl(
                             &[second],
                             &[second],
                             false,
+                            None,
                         )?;
                     }
                 }
@@ -1357,14 +1519,13 @@ fn build_imprints_impl(
                 continue;
             }
 
-            // The exact section lanes below (planar-iso, analytic) mint this
-            // pair's whole intersection, the part over either trim included, so
-            // a SPAN of an edge lying on the other face would be a second copy
-            // of a curve they already mint — which reorders the face's pieces
-            // and with them its fragments' names (the 2026-09-10 chamfer groove
-            // rim's `Box_PX` / `Box_PX_1`). Where they answer, only a whole
-            // edge is exchanged, as before.
-            let planar_iso = planar_iso_intersection(
+            // Exact lanes discard sections riding an ordinary trim boundary:
+            // that face already owns the edge, but the other face still needs
+            // the overlapping span as a cut. Keep the existing whole-edge
+            // exchange order, and append missing partial spans after all pairs
+            // have run so duplicate sections retain their established IDs and
+            // fragment names. Seams are retained by the exact lane itself.
+            let planar_iso = planar_iso_section(
                 &first.face.surface,
                 &second.face.surface,
                 options.tolerance,
@@ -1378,21 +1539,28 @@ fn build_imprints_impl(
             profile.analytic += profile.lap(&mut lap_start);
             let exact_section = planar_iso.is_some() || analytic.is_some();
 
-            for edge in &face_edge_lists[&first.key()] {
-                if !edge.degenerate {
-                    let curve = cached_subcurve(first.operand, edge)?;
-                    let spans = curve_spans_on_face(curve, second.face, &face_edge_lists[&second.key()], options.tolerance, exact_section)?;
-                    for span in spans {
-                        builder.process_curve(span, first, second, &[second], &[second], false)?;
+            for (source, target) in [(first, second), (second, first)] {
+                for edge in &face_edge_lists[&source.key()] {
+                    if edge.degenerate {
+                        continue;
                     }
-                }
-            }
-            for edge in &face_edge_lists[&second.key()] {
-                if !edge.degenerate {
-                    let curve = cached_subcurve(second.operand, edge)?;
-                    let spans = curve_spans_on_face(curve, first.face, &face_edge_lists[&first.key()], options.tolerance, exact_section)?;
+                    let curve = cached_subcurve(source.operand, edge)?;
+                    let spans = curve_spans_on_face(
+                        curve.clone(), target.face, &face_edge_lists[&target.key()],
+                        options.tolerance, exact_section,
+                    )?;
+                    let seam = source.face.loops.iter().flat_map(|loop_record| &loop_record.coedges)
+                        .filter(|coedge| coedge.edge_id == edge.id).count() >= 2;
+                    if spans.is_empty() && exact_section && !seam {
+                        for span in curve_spans_on_face(
+                            curve, target.face, &face_edge_lists[&target.key()],
+                            options.tolerance, false,
+                        )? {
+                            deferred_boundary_spans.push((span, first, second, target));
+                        }
+                    }
                     for span in spans {
-                        builder.process_curve(span, first, second, &[first], &[first], false)?;
+                        builder.process_curve(span, first, second, &[target], &[target], false, None)?;
                     }
                 }
             }
@@ -1406,10 +1574,26 @@ fn build_imprints_impl(
             } else {
                 None
             };
-            if let Some(curve) = planar_iso {
+            if let Some(IsoSection { curve, pcurves }) = planar_iso {
                 if debug_pairs {
                     eprintln!("pair {}x{}: planar_iso", first.face.id, second.face.id);
                 }
+                // Slice 1: the exact pcurves ride along with the curve when
+                // the lane is on (or checked). A face read in a lifted chart
+                // declines: the iso line is in the carrier's own frame, and
+                // the lifted chart's period is not the carrier's.
+                let exact_pcurves = match (exact_iso, pcurves) {
+                    (ExactIsoPcurves::Off, _) => None,
+                    (_, Some(pcurves)) if first.lifted.is_none() && second.lifted.is_none() => {
+                        profile.exact_iso_sections += 1;
+                        Some(pcurves)
+                    }
+                    _ => {
+                        profile.exact_iso_declined += 1;
+                        None
+                    }
+                };
+                let lane_fits = profile.enabled.then(crate::PcurveFitScope::open);
                 builder.process_curve(
                     curve,
                     first,
@@ -1417,7 +1601,11 @@ fn build_imprints_impl(
                     &[first, second],
                     &[first, second],
                     true,
+                    exact_pcurves,
                 )?;
+                if let Some(scope) = lane_fits {
+                    profile.exact_lane_fits += scope.close().fits;
+                }
                 profile.process_curve += profile.lap(&mut lap_start);
                 continue;
             }
@@ -1436,6 +1624,27 @@ fn build_imprints_impl(
                         curves.len()
                     );
                 }
+                // TANGENT-CURVE LANE. An exact lane's "provably empty" is a
+                // proof about TRANSVERSE curves: a plane at exactly the
+                // cylinder's radius from its axis has no generatrix pair, and
+                // the pair would be dropped here without a word while the
+                // carriers touch along a whole line. Where the classification
+                // read the pair as near-tangent, the lane looks for the
+                // extended contact and records it typed.
+                if curves.is_empty()
+                    && options.tangent_curve_lane
+                    && pair_classification.relation == SurfacePairRelation::NearTangent
+                {
+                    if let Some((mut section, run)) = tangent_curve_section(
+                        first, second, options, &first_faces, &second_faces, &face_edge_lists, debug_pairs,
+                    )? {
+                        if options.tangent_curve_imprint && section.planar && run.len() >= 2 {
+                            tangent_imprint_candidates.push((tangent_sections.len(), run, first, second));
+                        }
+                        tangent_sections.push(section);
+                    }
+                }
+                let lane_fits = profile.enabled.then(crate::PcurveFitScope::open);
                 for curve in curves {
                     builder.process_curve(
                         curve,
@@ -1444,7 +1653,11 @@ fn build_imprints_impl(
                         &[first, second],
                         &[first, second],
                         true,
+                        None,
                     )?;
+                }
+                if let Some(scope) = lane_fits {
+                    profile.exact_lane_fits += scope.close().fits;
                 }
                 profile.process_curve += profile.lap(&mut lap_start);
                 continue;
@@ -1499,6 +1712,7 @@ fn build_imprints_impl(
                     &SurfaceIntersectionOptions {
                         tolerance: options.tolerance,
                         maximum_step: options.maximum_ssi_step,
+                        span_budget: march_span_budget,
                         ..Default::default()
                     },
                 ).or_refuse(KernelStage::Intersect, "csg.imprint.driver")?;
@@ -1523,6 +1737,21 @@ fn build_imprints_impl(
                             "pair {}x{}: tangential-only contact, march skipped",
                             first.face.id, second.face.id
                         );
+                    }
+                    // TANGENT-CURVE LANE: the skip is right for a transverse
+                    // march, which has nothing to walk here, but the contact
+                    // may still be a CURVE inside both trims (the same
+                    // generatrix on a carrier no exact lane recognises).
+                    // Recognise and record it, typed, rather than lose it.
+                    if options.tangent_curve_lane {
+                        if let Some((mut section, run)) = tangent_curve_section(
+                            first, second, options, &first_faces, &second_faces, &face_edge_lists, debug_pairs,
+                        )? {
+                            if options.tangent_curve_imprint && section.planar && run.len() >= 2 {
+                                tangent_imprint_candidates.push((tangent_sections.len(), run, first, second));
+                            }
+                            tangent_sections.push(section);
+                        }
                     }
                     continue;
                 }
@@ -1745,6 +1974,10 @@ fn build_imprints_impl(
                         builder.scale,
                     ),
                     seed_points: seed_points.clone(),
+                    span_budget: march_span_budget,
+                    ordered_starts,
+                    consume_starts,
+                    tree_seeds,
                     ..Default::default()
                 },
             );
@@ -1818,6 +2051,10 @@ fn build_imprints_impl(
                             builder.scale,
                         ),
                         seed_points: seed_points.clone(),
+                        span_budget: march_span_budget,
+                        ordered_starts,
+                        consume_starts,
+                        tree_seeds,
                         ..Default::default()
                     },
                 )
@@ -1833,6 +2070,7 @@ fn build_imprints_impl(
                 }
                 if !swapped.is_empty() {
                     branches = swapped;
+                    march_swap_rescues += 1;
                 }
             }
             // NEAR-TANGENT CLIP-ORDER RESCUE (hatch BREP_MARCH_SWAP_CLIP_RESCUE=0).
@@ -1880,6 +2118,10 @@ fn build_imprints_impl(
                             builder.scale,
                         ),
                         seed_points: seed_points.clone(),
+                        span_budget: march_span_budget,
+                        ordered_starts,
+                        consume_starts,
+                        tree_seeds,
                         ..Default::default()
                     },
                 )
@@ -1936,6 +2178,7 @@ fn build_imprints_impl(
                         }
                         if adopt {
                             branches = swapped;
+                            clip_swap_rescues += 1;
                         }
                     }
                 }
@@ -2024,6 +2267,44 @@ fn build_imprints_impl(
                     let mut start = 0;
                     while start + 1 < run.len() {
                         let end = (start + chunk_points - 1).min(run.len() - 1);
+                        // HERMITE EMISSION (`imprint/hermite.rs`): with the lane on
+                        // and every span of this run within the budget, the section
+                        // is the march's own cubic Hermite with its two parameter
+                        // Hermites, and the fit lane below is skipped.
+                        let hermite_started = profile.enabled.then(Instant::now);
+                        let hermite: Option<Result<super::hermite::HermiteSection, super::hermite::HermiteDecline>> = if hermite_lane {
+                            Some(match march_span_budget {
+                                Some(budget) => super::hermite::hermite_section(&run[start..=end], &branch, first_march, second_march, budget)
+                                    .or_refuse(KernelStage::Intersect, "csg.imprint.driver.hermite")?,
+                                None => Err(super::hermite::HermiteDecline::NoTangents),
+                            })
+                        } else {
+                            None
+                        };
+                        if let Some(started) = hermite_started {
+                            profile.hermite += started.elapsed();
+                        }
+                        let (section_curve, exact_pcurves) = match hermite {
+                            Some(Ok(emitted)) => {
+                                profile.hermite_runs += 1;
+                                span_census(|| {
+                                    format!(
+                                        "pair {}x{} budget {} branch_stations {} run_stations {} kept {} span_deviation {:.3e} tangents true route None met_requested true lane hermite inserted {}",
+                                        first.face.id,
+                                        second.face.id,
+                                        march_span_budget.map_or("none".to_string(), |budget| format!("{budget:.3e}")),
+                                        branch.points.len(),
+                                        emitted.stations,
+                                        emitted.stations,
+                                        emitted.deviation,
+                                        emitted.inserted,
+                                    )
+                                });
+                                (emitted.curve, Some([emitted.pcurve_a, emitted.pcurve_b]))
+                            }
+                            other => {
+                        let hermite_decline = other.map(|lane| lane.err());
+                        profile.fit_runs += 1;
                         let fit_started = profile.enabled.then(Instant::now);
                         let fit_tolerance = options.tolerance.max(1e-7);
                         let (mut section, mut fit, recovered, evening) = even_sliver_ends_measured(
@@ -2118,6 +2399,22 @@ fn build_imprints_impl(
                             }
                             fit = refined;
                         }
+                        span_census(|| {
+                            format!(
+                                "pair {}x{} budget {} branch_stations {} run_stations {} kept {} span_deviation {} tangents {} route {:?} met_requested {} lane fit hermite {}",
+                                first.face.id,
+                                second.face.id,
+                                march_span_budget.map_or("none".to_string(), |budget| format!("{budget:.3e}")),
+                                branch.points.len(),
+                                section.len(),
+                                fit.kept.len(),
+                                branch.span_deviation.map_or("none".to_string(), |deviation| format!("{deviation:.3e}")),
+                                branch.tangents.is_some(),
+                                refine_route.map(|(_, route)| route),
+                                met_requested,
+                                hermite_decline.map_or("off".to_string(), |decline| decline.map_or("none".to_string(), |decline| format!("{decline:?}"))),
+                            )
+                        });
                         // `BREP_SECTION_OVERSHOOT_CENSUS=<file>` (debug only; nothing
                         // reads it): EVERY section's final fit, on any route, is read
                         // against both carriers at its kept stations and at its
@@ -2167,14 +2464,18 @@ fn build_imprints_impl(
                         if let Some(census) = pair_census.as_mut() {
                             census.record_fit(&fit);
                         }
+                        (fit.curve, None)
+                            }
+                        };
                         let process_started = profile.enabled.then(Instant::now);
                         builder.process_curve(
-                            fit.curve,
+                            section_curve,
                             first,
                             second,
                             &[first, second],
                             &[first, second],
                             true,
+                            exact_pcurves,
                         )?;
                         if let Some(started) = process_started {
                             profile.process += started.elapsed();
@@ -2197,23 +2498,37 @@ fn build_imprints_impl(
             profile.clip_and_fit += profile.lap(&mut lap_start);
         }
     }
+    for (span, first, second, target) in deferred_boundary_spans {
+        builder.process_curve(span, first, second, &[target], &[target], false, None)?;
+    }
+    if let Some(scope) = pairs_fits {
+        profile.pairs_fits = scope.close().fits;
+    }
     profile.report();
     // SELF-TOUCH SPLIT: a face whose loops touch at an edge interior (a hole
     // tangent to a fillet setback) gets a vertex minted at the touch on BOTH
     // edges, so the fragment arrangement's pinch resolution assembles — see
     // `imprint/self_touch.rs`. Escape hatch: BREP_SELF_TOUCH_SPLIT=0.
     let mut tail_lap: Option<Instant> = None;
-    let mut tail_ms = Vec::<(&str, f64)>::new();
-    let mut lap = |name: &'static str, started: &mut Option<Instant>, tail_ms: &mut Vec<(&str, f64)>| {
+    // Beside each stage's time, the pcurve fits it recorded (a nested
+    // `PcurveFitScope` per stage, folded into the operation's ledger).
+    let mut tail_fits: Option<crate::PcurveFitScope> = None;
+    let mut tail_ms = Vec::<(&str, f64, u64)>::new();
+    let mut lap = |name: &'static str,
+                   started: &mut Option<Instant>,
+                   fits: &mut Option<crate::PcurveFitScope>,
+                   tail_ms: &mut Vec<(&str, f64, u64)>| {
         if profile.enabled {
             let now = Instant::now();
+            let recorded = fits.take().map_or(0, |scope| scope.close().fits);
             if let Some(previous) = *started {
-                tail_ms.push((name, (now - previous).as_secs_f64() * 1_000.0));
+                tail_ms.push((name, (now - previous).as_secs_f64() * 1_000.0, recorded));
             }
             *started = Some(now);
+            *fits = Some(crate::PcurveFitScope::open());
         }
     };
-    lap("pairs", &mut tail_lap, &mut tail_ms);
+    lap("pairs", &mut tail_lap, &mut tail_fits, &mut tail_ms);
     if std::env::var("BREP_SELF_TOUCH_SPLIT").as_deref() != Ok("0") {
         builder.split_self_touching_loops(&first_faces, &face_edge_lists, &cached_subcurve)?;
         builder.split_self_touching_loops(&second_faces, &face_edge_lists, &cached_subcurve)?;
@@ -2223,7 +2538,42 @@ fn build_imprints_impl(
     // open riding piece's junction endpoints onto the ridden edges (see the
     // method doc; hatch BREP_OVERLAP_PIECE_ENDPOINT_SPLIT=0).
     builder.exchange_piece_endpoint_junctions()?;
-    lap("self_touch", &mut tail_lap, &mut tail_ms);
+    // TANGENT-SECTION IMPRINT (`ImprintOptions::tangent_curve_imprint`), after
+    // every pair: whether a run splits a face is read against the face's trim
+    // AND the pieces the other pairs minted on it, so the runs are minted
+    // once the piece set is complete (the through-bore's contact ends on the
+    // bore's cap circles, which the box's top and bottom minted).
+    for (index, run, first, second) in std::mem::take(&mut tangent_imprint_candidates) {
+        let closed = tangent_sections[index].closed;
+        tangent_sections[index].piece_ids = imprint_tangent_run(
+            &mut builder,
+            &run,
+            closed,
+            first,
+            second,
+            &face_edge_lists,
+            options,
+            std::env::var("BREP_DEBUG_PAIRS").is_ok(),
+        )?;
+    }
+    // TANGENT-SECTION T-JUNCTIONS (`ImprintOptions::tangent_curve_imprint`):
+    // an imprinted contact ends on operand edges, which `process_curve` split,
+    // and on earlier SECTIONS of the same carrier, which nothing splits — the
+    // through-bore's contact line ends on the two cap circles the box's top
+    // and bottom minted on the bore. Split those pieces at the contact's end
+    // vertices so both faces of each circle carry the vertex the bore's
+    // arrangement needs there (see `split_pieces_at_tangent_ends`).
+    if tangent_sections.iter().any(|section| !section.piece_ids.is_empty()) {
+        split_pieces_at_tangent_ends(
+            &mut builder,
+            &tangent_sections,
+            &first_faces,
+            &second_faces,
+            options,
+            std::env::var("BREP_DEBUG_PAIRS").is_ok(),
+        )?;
+    }
+    lap("self_touch", &mut tail_lap, &mut tail_fits, &mut tail_ms);
     let mut edge_splits = builder
         .edge_splits
         .into_iter()
@@ -2249,8 +2599,14 @@ fn build_imprints_impl(
     by_face.sort_by_key(|record| (record.operand, record.face_id));
     let section_evidence = section_evidence || !builder.pieces.is_empty();
     let marched_pieces = std::mem::take(&mut builder.marched_pieces);
+    let mut emitted_pcurves = std::mem::take(&mut builder.emitted_pcurves);
+    let junction_evidence = JunctionEvidence {
+        radii: std::mem::take(&mut builder.vertex_radii),
+        sources: std::mem::take(&mut builder.vertex_sources),
+    };
     let mut result = ImprintResultRecord {
         tangent_nodes,
+        tangent_sections,
         vertices: builder.vertices,
         pieces: builder.pieces,
         by_face,
@@ -2259,6 +2615,10 @@ fn build_imprints_impl(
         section_evidence,
         cosurface_pairs,
     };
+    RESCUE_FIRINGS.with(|cell| cell.set((march_swap_rescues, clip_swap_rescues)));
+    if profile.enabled {
+        eprintln!("imprint.rescues march_swap={march_swap_rescues} clip_swap={clip_swap_rescues}");
+    }
     // COINCIDENT-PIECE MERGE (problemInbox equator-tangent, and the generic
     // one-circle-from-many-pairs class): the SAME section curve can be minted
     // by several pairs — a cosurface boundary-edge copy (the cylinder cap
@@ -2270,7 +2630,7 @@ fn build_imprints_impl(
     // the weld band): keep the first, union the supports/pcurves/by_face
     // registrations of the rest into it. Escape hatch:
     // BREP_COINCIDENT_PIECE_MERGE=0.
-    lap("collect", &mut tail_lap, &mut tail_ms);
+    lap("collect", &mut tail_lap, &mut tail_fits, &mut tail_ms);
     if std::env::var("BREP_COINCIDENT_PIECE_MERGE").as_deref() != Ok("0") {
         let weld = assembler_weld(options.tolerance).max(options.tolerance * 10.0);
         // Two pieces that coincide along their WHOLE spans (deviation within
@@ -2289,6 +2649,20 @@ fn build_imprints_impl(
             ]);
         }
         let end_band = 4.0 * weld;
+        // CONTROL-HULL CULL (2026-10-10): the plate minus 36 cylinders mints 72
+        // CLOSED rings, every one of which took the full sweep against every other —
+        // 2 556 pairs, 230 of the imprint's 288 ms — although rings 16 units apart
+        // cannot coincide. A NURBS curve lies in the convex hull of its control
+        // points, so two curves within `weld` of each other along their whole spans
+        // have control boxes that overlap once each is grown by `weld`; a pair whose
+        // boxes do not is skipped before any projection. Exact, so the merged set is
+        // the one the sweep alone found. `BREP_COINCIDENT_MERGE_BOX=0` restores the
+        // unculled sweep for a before/after reading.
+        let box_cull = std::env::var("BREP_COINCIDENT_MERGE_BOX").as_deref() != Ok("0");
+        let mut boxes: Vec<[Vec3; 2]> = Vec::with_capacity(result.pieces.len());
+        for piece in &result.pieces {
+            boxes.push(control_hull_box(&piece.curve, weld));
+        }
         // A CLOSED piece (a full ring) has no end points to speak of: two
         // rings of the same circle seamed at different azimuths coincide
         // along their whole spans while their domain ends sit anywhere on
@@ -2305,15 +2679,18 @@ fn build_imprints_impl(
         while index < result.pieces.len() {
             let mut other = index + 1;
             while other < result.pieces.len() {
-                let coincide = ends_match(&ends[index], &ends[other]) && {
-                    let a = &result.pieces[index];
-                    let b = &result.pieces[other];
-                    max_curve_deviation(&a.curve, &b.curve)? <= weld
-                        && max_curve_deviation(&b.curve, &a.curve)? <= weld
-                };
+                let coincide = (!box_cull || boxes_overlap(&boxes[index], &boxes[other]))
+                    && ends_match(&ends[index], &ends[other])
+                    && {
+                        let a = &result.pieces[index];
+                        let b = &result.pieces[other];
+                        max_curve_deviation(&a.curve, &b.curve)? <= weld
+                            && max_curve_deviation(&b.curve, &a.curve)? <= weld
+                    };
                 if coincide {
                     let absorbed = result.pieces.remove(other);
                     ends.remove(other);
+                    boxes.remove(other);
                     removed.push(absorbed.id);
                     let keeper = &mut result.pieces[index];
                     for pcurve in absorbed.pcurves {
@@ -2325,6 +2702,10 @@ fn build_imprints_impl(
                                     && existing.face_id == pcurve.face_id
                             })
                         {
+                            let key = FaceKey { operand: pcurve.operand, face_id: pcurve.face_id };
+                            if emitted_pcurves.remove(&(absorbed.id, key)) {
+                                emitted_pcurves.insert((keeper.id, key));
+                            }
                             keeper.pcurves.push(pcurve);
                         }
                     }
@@ -2353,7 +2734,7 @@ fn build_imprints_impl(
     // Rescue near-tangent SSI truncations BEFORE canonicalization so the added
     // bridge pieces' endpoints (existing crossing/stub vertices) fold into the
     // same junction merges as every other section.
-    lap("coincident_merge", &mut tail_lap, &mut tail_ms);
+    lap("coincident_merge", &mut tail_lap, &mut tail_fits, &mut tail_ms);
     extend_truncated_sections(
         &mut result,
         &face_edge_lists,
@@ -2362,9 +2743,18 @@ fn build_imprints_impl(
         &charts,
         options.tolerance,
     )?;
-    lap("extend_truncated", &mut tail_lap, &mut tail_ms);
-    canonicalize_imprint_junctions(&mut result, solid_a, solid_b, &charts, options.tolerance)?;
-    lap("canonicalize", &mut tail_lap, &mut tail_ms);
+    lap("extend_truncated", &mut tail_lap, &mut tail_fits, &mut tail_ms);
+    canonicalize_imprint_junctions(
+        &mut result,
+        solid_a,
+        solid_b,
+        &charts,
+        options.tolerance,
+        &emitted_pcurves,
+        &junction_evidence,
+        junction_combine_mode(options),
+    )?;
+    lap("canonicalize", &mut tail_lap, &mut tail_fits, &mut tail_ms);
     // ONE RIM, ONE EDGE: with vertex identity final, dissolve the section
     // vertices that no operand edge passes through — the marcher's own
     // parameterization origin, which `process_curve` cannot tell from a
@@ -2380,7 +2770,7 @@ fn build_imprints_impl(
     if dissolved > 0 && std::env::var("BREP_DEBUG_BOOL").is_ok() {
         eprintln!("origin-dissolve: {dissolved} parameterization vertex/vertices removed");
     }
-    lap("origin_dissolve", &mut tail_lap, &mut tail_ms);
+    lap("origin_dissolve", &mut tail_lap, &mut tail_fits, &mut tail_ms);
     // B2: reuse an existing boundary edge as the shared section edge wherever a
     // section coincides with one along its whole span (vertices are final after
     // canonicalization; `face_edge_lists` holds each face's boundary edges on
@@ -2398,15 +2788,24 @@ fn build_imprints_impl(
     // the bands here first validates the graze-contact model on the
     // acceptance suite before step 2's common-block machinery replaces a
     // grazed overlap with a shared edge.
-    lap("reuse_boundary", &mut tail_lap, &mut tail_ms);
+    lap("reuse_boundary", &mut tail_lap, &mut tail_fits, &mut tail_ms);
     report_graze_contacts(&result, &face_edge_lists, solid_a, solid_b, options.tolerance)?;
     if profile.enabled {
+        if let Some(scope) = tail_fits.take() {
+            scope.close();
+        }
         let line = tail_ms
             .iter()
-            .map(|(name, ms)| format!("{name}={ms:.2}"))
+            .map(|(name, ms, _)| format!("{name}={ms:.2}"))
             .collect::<Vec<_>>()
             .join(" ");
         eprintln!("imprint.stages {line}");
+        let fits = tail_ms
+            .iter()
+            .map(|(name, _, fits)| format!("{name}={fits}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        eprintln!("imprint.stage_fits {fits}");
     }
     Ok(result)
 }
@@ -2497,9 +2896,469 @@ fn report_graze_contacts(
 /// The test the tangential-only refusal above needs: a point on the marched
 /// intersection is a TANGENT NODE when the two surface normals there are
 /// parallel. The threshold is the transversality bound the supplemental
-/// detector already accepts seeds by (`TRANSVERSE_SEED_CROSS`), not the
-/// far tighter pair-classifier bound — a node the march merely passes CLOSE to
+/// detector already accepts seeds by (`TRANSVERSE_SEED_CROSS`), not the far
+/// tighter pair-classifier bound — a node the march merely passes CLOSE to
 /// still poisons the assembly, so this errs toward calling a pair singular.
+/// The tangent-curve lane's recognition of one pair: find the pair's
+/// tangential contact without a witness, keep only an EXTENDED one (a node or
+/// a point contact is the existing paths' business), and with one planar
+/// carrier march it along the null direction of `II_a − II_b` and clip the
+/// curve to both trims. `None` when there is no extended contact, or its trace
+/// has no run inside both trims (a contact on the carriers' extensions
+/// imprints nothing, exactly as today).
+///
+/// The section is RECORDED, not imprinted: a tangent edge whose two sides
+/// both survive is a four-coedge incidence the assembler cannot represent
+/// (the pinch gate in `csg/boolean/mod.rs` names the subtract case), and a
+/// tangent edge only one side of which survives dissolves into its face.
+/// What the record buys is the boolean's attribution: a refusal whose faces
+/// the contact involves names the contact instead of the arrangement's own
+/// symptom. The involved faces are the two carriers' and every face sharing
+/// an edge a run end lies on (`TangentSectionRecord::faces`).
+#[allow(clippy::too_many_arguments)]
+fn tangent_curve_section(
+    first: TaggedFace<'_>,
+    second: TaggedFace<'_>,
+    options: &ImprintOptions,
+    first_faces: &[TaggedFace<'_>],
+    second_faces: &[TaggedFace<'_>],
+    face_edge_lists: &HashMap<FaceKey, Vec<&EdgeRecord>>,
+    debug_pairs: bool,
+) -> Result<Option<(TangentSectionRecord, Vec<Vec3>)>, KernelRefusal> {
+    let Some(contact) =
+        crate::find_tangent_contact(&first.face.surface, &second.face.surface, options.tolerance)
+            .or_refuse(KernelStage::Intersect, "find_tangent_contact")?
+    else {
+        return Ok(None);
+    };
+    if debug_pairs {
+        eprintln!(
+            "pair {}x{}: tangent-curve lane contact {:?}",
+            first.face.id, second.face.id, contact
+        );
+    }
+    if !contact.is_extended() {
+        return Ok(None);
+    }
+    let is_plane = |face: TaggedFace<'_>| {
+        matches!(face.face.surface.analytic(), Some(crate::AnalyticSurface::Plane { .. }))
+    };
+    let planar = is_plane(first) || is_plane(second);
+    if !planar {
+        // The curved/curved branch: recognised and named, not traced.
+        return Ok(Some((
+            TangentSectionRecord {
+                first: first.key(),
+                second: second.key(),
+                start: contact.point,
+                end: contact.point,
+                length: 0.0,
+                closed: false,
+                stations: 0,
+                planar: false,
+                faces: vec![first.key(), second.key()],
+                piece_ids: Vec::new(),
+            },
+            Vec::new(),
+        )));
+    }
+    let Some(curve) = crate::trace_tangent_curve(
+        &first.face.surface,
+        &second.face.surface,
+        &contact,
+        &SurfaceIntersectionOptions {
+            tolerance: options.tolerance,
+            maximum_step: options.maximum_ssi_step,
+            ..Default::default()
+        },
+    )
+    .or_refuse(KernelStage::Intersect, "trace_tangent_curve")?
+    else {
+        return Ok(None);
+    };
+    let mut longest: Option<Vec<Vec3>> = None;
+    let mut longest_length = 0.0f64;
+    for run in clip_branch_to_trims(&curve.points, first, second)? {
+        if run.len() < 2 {
+            continue;
+        }
+        let length: f64 = run.windows(2).map(|pair| pair[1].sub(pair[0]).length()).sum();
+        if length > longest_length {
+            longest_length = length;
+            longest = Some(run);
+        }
+    }
+    let Some(run) = longest else {
+        return Ok(None);
+    };
+    if longest_length <= options.tolerance * 100.0 {
+        return Ok(None);
+    }
+    if debug_pairs {
+        eprintln!(
+            "pair {}x{}: tangent-curve lane traced {} stations, run of {} inside both trims, length {:.6}, closed {}",
+            first.face.id, second.face.id, curve.points.len(), run.len(), longest_length, curve.closed
+        );
+    }
+    let closed = curve.closed && run.len() == curve.points.len();
+    // The faces the contact involves: the carriers' own, and across every
+    // edge of theirs that a run end lies on, the faces sharing that edge.
+    let mut faces = vec![first.key(), second.key()];
+    if !closed {
+        let band = options.tolerance * 100.0;
+        for end in [run[0], run[run.len() - 1]] {
+            for face in [first, second] {
+                let Some(edges) = face_edge_lists.get(&face.key()) else {
+                    continue;
+                };
+                for edge in edges {
+                    if edge.degenerate {
+                        continue;
+                    }
+                    let Ok(projection) = project_point_to_curve(&edge.curve, end) else {
+                        continue;
+                    };
+                    if projection.distance > band {
+                        continue;
+                    }
+                    let siblings = if face.operand == first.operand { first_faces } else { second_faces };
+                    for sibling in siblings {
+                        let shares = sibling
+                            .face
+                            .loops
+                            .iter()
+                            .flat_map(|loop_record| &loop_record.coedges)
+                            .any(|coedge| coedge.edge_id == edge.id);
+                        if shares && !faces.contains(&sibling.key()) {
+                            faces.push(sibling.key());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if debug_pairs {
+        eprintln!(
+            "pair {}x{}: tangent-curve lane involves faces {:?}",
+            first.face.id, second.face.id, faces
+        );
+    }
+    Ok(Some((
+        TangentSectionRecord {
+            first: first.key(),
+            second: second.key(),
+            start: run[0],
+            end: run[run.len() - 1],
+            length: longest_length,
+            closed,
+            stations: run.len(),
+            planar: true,
+            faces,
+            piece_ids: Vec::new(),
+        },
+        run,
+    )))
+}
+
+/// Imprint a traced tangent run ([`ImprintOptions::tangent_curve_imprint`]):
+/// the run's stations become a section curve — the exact line through its
+/// ends when they are collinear (a plane's contact with a cylinder or cone is
+/// a generatrix), the marched lane's polyline fit otherwise (a torus parallel)
+/// — and `process_curve` mints it on both carriers exactly as it mints a
+/// transverse section: pieces with pcurves on each face, the operand edges the
+/// ends lie on split there. Returns the ids of the pieces minted, in order.
+///
+/// Only a run that SPLITS both faces is minted: a closed run, or one each of
+/// whose ends lies, on each carrier, on that face's trim or on a section
+/// piece already minted on it (the through-bore's contact ends on the wall's
+/// top and bottom edges and, on the bore, on the circles the box's top and
+/// bottom cut there). A run with an end inside a face — the blind pocket's
+/// contact ends on the bore's cap rings but inside the wall, where both of
+/// its sides are one face — would be a slit, and a slit is not a boundary:
+/// measured with the slit minted, the wall's four edges came out one-use and
+/// the pocket refused `NonIntegralGenus`. Such a contact stays recorded only,
+/// as before.
+#[allow(clippy::too_many_arguments)]
+fn imprint_tangent_run(
+    builder: &mut ImprintBuilder<'_>,
+    run: &[Vec3],
+    closed: bool,
+    first: TaggedFace<'_>,
+    second: TaggedFace<'_>,
+    face_edge_lists: &HashMap<FaceKey, Vec<&EdgeRecord>>,
+    options: &ImprintOptions,
+    debug: bool,
+) -> Result<Vec<u64>, KernelRefusal> {
+    if run.len() < 2 {
+        return Ok(Vec::new());
+    }
+    if !closed {
+        let band = options.tolerance * 100.0;
+        let within = |curve: &NurbsCurve, t0: f64, t1: f64, point: Vec3| -> bool {
+            project_point_to_curve(curve, point)
+                .map(|projection| {
+                    projection.distance <= band
+                        && projection.u >= t0.min(t1) - 1e-9
+                        && projection.u <= t0.max(t1) + 1e-9
+                })
+                .unwrap_or(false)
+        };
+        let on_boundary = |face: TaggedFace<'_>, point: Vec3| -> bool {
+            let on_trim = face_edge_lists
+                .get(&face.key())
+                .map(|edges| {
+                    edges
+                        .iter()
+                        .any(|edge| !edge.degenerate && within(&edge.curve, edge.t0, edge.t1, point))
+                })
+                .unwrap_or(false);
+            on_trim
+                || builder
+                    .pieces
+                    .iter()
+                    .any(|piece| piece.support_faces.contains(&face.key()) && within(&piece.curve, piece.t0, piece.t1, point))
+        };
+        let ends = [run[0], run[run.len() - 1]];
+        for face in [first, second] {
+            if !ends.iter().all(|end| on_boundary(face, *end)) {
+                if debug {
+                    eprintln!(
+                        "pair {}x{}: tangent-curve lane run not imprinted: an end lies inside face {}:{}'s trim (a slit)",
+                        first.face.id, second.face.id, face.operand, face.face.id
+                    );
+                }
+                return Ok(Vec::new());
+            }
+        }
+    }
+    let start = run[0];
+    let end = run[run.len() - 1];
+    let chord = end.sub(start);
+    let chord_length = chord.length();
+    let fit_tolerance = options.tolerance.max(1e-7);
+    let collinear = chord_length > fit_tolerance && {
+        let direction = chord.scale(1.0 / chord_length);
+        run.iter().all(|station| {
+            let offset = station.sub(start);
+            offset.sub(direction.scale(offset.dot(direction))).length() <= 10.0 * fit_tolerance
+        })
+    };
+    let curve = if collinear {
+        crate::make_line(start, end).or_refuse(KernelStage::Intersect, "make_line")?
+    } else {
+        fit_polyline_of_degree(
+            run,
+            fit_tolerance,
+            run.len().min(MAX_FIT_STATIONS),
+            options.local_fit,
+            section_fit_degree(),
+        )
+        .or_refuse(KernelStage::Intersect, "fit_polyline_of_degree")?
+        .curve
+    };
+    let before = builder.pieces.len();
+    builder.process_curve(curve, first, second, &[first, second], &[first, second], true, None)?;
+    let ids: Vec<u64> = builder.pieces[before..].iter().map(|piece| piece.id).collect();
+    if debug {
+        eprintln!(
+            "pair {}x{}: tangent-curve lane imprinted the run as {} ({} piece(s) {:?})",
+            first.face.id,
+            second.face.id,
+            if collinear { "a line" } else { "a fitted section" },
+            ids.len(),
+            ids
+        );
+    }
+    Ok(ids)
+}
+
+/// Split every piece an imprinted tangent section ENDS ON, at that end
+/// (`ImprintOptions::tangent_curve_imprint`). A tangent run is clipped to both
+/// trims, so its ends lie on operand edges — split by `process_curve` — or on
+/// the trim of the OTHER carrier's neighbours, where they also lie on the
+/// sections those neighbours minted on this carrier: the through-bore's
+/// contact line ends on the circles the box's top and bottom cut on the bore,
+/// at a point no edge pierce put a vertex on (the box edge grazes the bore
+/// there, and a grazing pierce is deliberately not a junction). Without the
+/// vertex, the bore's arrangement would split the circle where the line
+/// meets it while the cap's arrangement keeps the circle whole — one closed
+/// edge against two arcs, one-use at assembly. The piece is split here, at
+/// the imprint, so every face it is minted on sees the vertex: the halves
+/// take the tangent end's vertex id, the pcurves are split with the curve
+/// where they were emitted on its knots and rebuilt on the face's chart
+/// otherwise, and the piece's face lists and lane sets follow the halves. A
+/// piece that resolves to an operand edge (`shared_edge`) is left as it is:
+/// that edge's own split is the exchange pass's.
+fn split_pieces_at_tangent_ends(
+    builder: &mut ImprintBuilder<'_>,
+    sections: &[TangentSectionRecord],
+    first_faces: &[TaggedFace<'_>],
+    second_faces: &[TaggedFace<'_>],
+    options: &ImprintOptions,
+    debug: bool,
+) -> Result<(), KernelRefusal> {
+    let tangent_ids: HashSet<u64> = sections.iter().flat_map(|section| section.piece_ids.iter().copied()).collect();
+    if tangent_ids.is_empty() {
+        return Ok(());
+    }
+    let overlap_limit = options.tolerance.max(1e-5);
+    let vertex_points: HashMap<u64, Vec3> =
+        builder.vertices.iter().map(|vertex| (vertex.id, vertex.point)).collect();
+    // (end vertex, its point, the tangent piece's supports)
+    let mut ends: Vec<(u64, Vec3, [FaceKey; 2])> = Vec::new();
+    for piece in builder.pieces.iter().filter(|piece| tangent_ids.contains(&piece.id)) {
+        for vertex_id in [piece.start_vertex_id, piece.end_vertex_id] {
+            if let Some(point) = vertex_points.get(&vertex_id) {
+                if !ends.iter().any(|(id, _, _)| *id == vertex_id) {
+                    ends.push((vertex_id, *point, piece.support_faces));
+                }
+            }
+        }
+    }
+    let face_of = |key: FaceKey| {
+        first_faces
+            .iter()
+            .chain(second_faces)
+            .copied()
+            .find(|face| face.key() == key)
+    };
+    let mut index = 0;
+    while index < builder.pieces.len() {
+        let piece = &builder.pieces[index];
+        if tangent_ids.contains(&piece.id) || piece.shared_edge.is_some() || !(piece.t1 > piece.t0) {
+            index += 1;
+            continue;
+        }
+        let mut split: Option<(u64, f64, Vec3)> = None;
+        for (vertex_id, point, supports) in &ends {
+            if *vertex_id == piece.start_vertex_id || *vertex_id == piece.end_vertex_id {
+                continue;
+            }
+            if !supports.iter().any(|support| piece.support_faces.contains(support)) {
+                continue;
+            }
+            let projection = project_point_to_curve(&piece.curve, *point)
+                .or_refuse(KernelStage::Intersect, "project_point_to_curve")?;
+            if projection.distance > overlap_limit {
+                continue;
+            }
+            let span = piece.t1 - piece.t0;
+            let margin = (span * KNOT_IDENTITY_TOL).max(2e-9);
+            if projection.u <= piece.t0 + margin || projection.u >= piece.t1 - margin {
+                continue;
+            }
+            // Interior in PARAMETER but at an END in space: a closed piece's
+            // origin seen from the far side of its domain.
+            if projection.point.sub(vertex_points[&piece.start_vertex_id]).length() <= overlap_limit
+                || projection.point.sub(vertex_points[&piece.end_vertex_id]).length() <= overlap_limit
+            {
+                continue;
+            }
+            split = Some((*vertex_id, projection.u, *point));
+            break;
+        }
+        let Some((vertex_id, parameter, point)) = split else {
+            index += 1;
+            continue;
+        };
+        let piece = builder.pieces.remove(index);
+        let (left, right) = piece.curve.split(parameter).or_refuse(KernelStage::Intersect, "split")?;
+        let [left_t0, _] = left.domain().or_refuse(KernelStage::Intersect, "domain")?;
+        let [_, right_t1] = right.domain().or_refuse(KernelStage::Intersect, "domain")?;
+        let start_point = vertex_points[&piece.start_vertex_id];
+        let end_point = vertex_points[&piece.end_vertex_id];
+        let left = snap_curve_ends(&left, start_point, point)?;
+        let right = snap_curve_ends(&right, point, end_point)?;
+        let left_id = builder.next_id;
+        let right_id = builder.next_id + 1;
+        builder.next_id += 2;
+        let mut left_pcurves = Vec::with_capacity(piece.pcurves.len());
+        let mut right_pcurves = Vec::with_capacity(piece.pcurves.len());
+        for face_pcurve in &piece.pcurves {
+            let key = FaceKey { operand: face_pcurve.operand, face_id: face_pcurve.face_id };
+            let emitted = builder.emitted_pcurves.remove(&(piece.id, key));
+            let halves = if emitted {
+                match face_pcurve.pcurve.split(parameter) {
+                    Ok((a, b)) => {
+                        builder.emitted_pcurves.insert((left_id, key));
+                        builder.emitted_pcurves.insert((right_id, key));
+                        Some((a, b))
+                    }
+                    Err(_) => None,
+                }
+            } else {
+                None
+            };
+            let (a, b) = match halves {
+                Some(halves) => halves,
+                None => {
+                    let Some(face) = face_of(key) else {
+                        return Err(KernelRefusal::internal(
+                            KernelStage::Intersect,
+                            "imprint.tangent_split",
+                            format!("tangent-section split: piece {} has a pcurve on an unknown face {key:?}", piece.id),
+                        ));
+                    };
+                    (
+                        build_pcurve_on_surface_marched(face.chart(), &left)
+                            .or_refuse(KernelStage::Intersect, "build_pcurve_on_surface_marched")?,
+                        build_pcurve_on_surface_marched(face.chart(), &right)
+                            .or_refuse(KernelStage::Intersect, "build_pcurve_on_surface_marched")?,
+                    )
+                }
+            };
+            left_pcurves.push(FacePcurve { operand: key.operand, face_id: key.face_id, pcurve: a });
+            right_pcurves.push(FacePcurve { operand: key.operand, face_id: key.face_id, pcurve: b });
+        }
+        if builder.marched_pieces.remove(&piece.id) {
+            builder.marched_pieces.insert(left_id);
+            builder.marched_pieces.insert(right_id);
+        }
+        for ids in builder.by_face.values_mut() {
+            if let Some(slot) = ids.iter().position(|id| *id == piece.id) {
+                ids[slot] = left_id;
+                ids.insert(slot + 1, right_id);
+            }
+        }
+        if debug {
+            eprintln!(
+                "tangent-curve lane: piece {} split at vertex {} (t={parameter:.6}) into pieces {left_id} and {right_id}",
+                piece.id, vertex_id
+            );
+        }
+        builder.pieces.insert(
+            index,
+            ImprintPieceRecord {
+                id: left_id,
+                curve: left,
+                t0: left_t0,
+                t1: parameter,
+                start_vertex_id: piece.start_vertex_id,
+                end_vertex_id: vertex_id,
+                pcurves: left_pcurves,
+                support_faces: piece.support_faces,
+                shared_edge: None,
+            },
+        );
+        builder.pieces.insert(
+            index + 1,
+            ImprintPieceRecord {
+                id: right_id,
+                curve: right,
+                t0: parameter,
+                t1: right_t1,
+                start_vertex_id: vertex_id,
+                end_vertex_id: piece.end_vertex_id,
+                pcurves: right_pcurves,
+                support_faces: piece.support_faces,
+                shared_edge: None,
+            },
+        );
+        // Re-examine the halves: a run may end on the same piece twice.
+    }
+    Ok(())
+}
+
 fn pair_normals_parallel_at(
     first: TaggedFace<'_>,
     second: TaggedFace<'_>,

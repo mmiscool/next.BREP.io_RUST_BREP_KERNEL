@@ -28,8 +28,7 @@
 //! Behind [`AuditSink`], so the storage can change without the rest noticing.
 //! The store's sink is the `audit` table of `plm.sqlite` ([`crate::sql::Sql`]),
 //! with an index for each filter the API offers. Nothing is ever deleted from
-//! it. [`JsonlSink`] is the file store's sink (`audit.jsonl`), kept so an old
-//! log can still be read; [`crate::db::migrate_files`] imports one.
+//! it.
 //!
 //! # Actions
 //!
@@ -49,10 +48,7 @@
 //!   `@recovery` mirror is not logged ([`crate::api::preferences`]).
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{File, OpenOptions};
-use std::io::{self, BufRead, BufReader, Write};
-use std::path::PathBuf;
-use std::sync::Mutex;
+use std::io;
 
 use serde::Deserialize;
 use serde_json::{Map, Value};
@@ -147,76 +143,6 @@ impl AuditFilter {
     }
 }
 
-/// `audit.jsonl`: one event per line, appended, never rewritten.
-///
-/// A query reads the whole file. A line that does not parse (a torn write from
-/// a crash) is skipped, not fatal. No longer the store's sink: see
-/// [`crate::sql::Sql`].
-pub struct JsonlSink {
-    path: PathBuf,
-    /// The next id, and the lock that keeps two appends from interleaving.
-    next: Mutex<u64>,
-}
-
-impl JsonlSink {
-    pub fn open(path: impl Into<PathBuf>) -> io::Result<Self> {
-        let path = path.into();
-        let mut last = 0;
-        if path.exists() {
-            for line in BufReader::new(File::open(&path)?).lines() {
-                if let Ok(event) = serde_json::from_str::<AuditEvent>(&line?) {
-                    last = last.max(event.id);
-                }
-            }
-        }
-        Ok(JsonlSink { path, next: Mutex::new(last + 1) })
-    }
-}
-
-impl AuditSink for JsonlSink {
-    fn append(&self, mut events: Vec<AuditEvent>) -> io::Result<Vec<AuditEvent>> {
-        if events.is_empty() {
-            return Ok(events);
-        }
-        let mut next = self.next.lock().unwrap_or_else(|e| e.into_inner());
-        let mut text = String::new();
-        let mut id = *next;
-        for event in &mut events {
-            event.id = id;
-            id += 1;
-            text.push_str(&serde_json::to_string(event).map_err(io::Error::other)?);
-            text.push('\n');
-        }
-        // One write per batch, in append mode, so a batch lands whole or a
-        // reader sees a torn last line it skips.
-        let mut file = OpenOptions::new().create(true).append(true).open(&self.path)?;
-        file.write_all(text.as_bytes())?;
-        file.flush()?;
-        *next = id;
-        Ok(events)
-    }
-
-    fn query(&self, filter: &AuditFilter) -> io::Result<Vec<AuditEvent>> {
-        // Hold the append lock so a query never sees half a batch.
-        let _next = self.next.lock().unwrap_or_else(|e| e.into_inner());
-        if !self.path.exists() {
-            return Ok(Vec::new());
-        }
-        let mut found = Vec::new();
-        for line in BufReader::new(File::open(&self.path)?).lines() {
-            let Ok(event) = serde_json::from_str::<AuditEvent>(&line?) else { continue };
-            if filter.matches(&event) {
-                found.push(event);
-            }
-        }
-        found.reverse();
-        if let Some(limit) = filter.limit {
-            found.truncate(limit);
-        }
-        Ok(found)
-    }
-}
-
 // ===========================================================================
 // Turning a change into events
 // ===========================================================================
@@ -233,9 +159,8 @@ const BOOKKEEPING: [&str; 3] = ["seq", "changes", "changes_from"];
 
 /// Collections of records keyed by `id`: the store key, the entity kind, and
 /// the field a person calls one by.
-const COLLECTIONS: [(&str, &str, &str); 8] = [
+const COLLECTIONS: [(&str, &str, &str); 7] = [
     ("workspace", "workspace", "name"),
-    ("change_orders", "eco", "number"),
     ("users", "user", "username"),
     ("api_tokens", "token", "name"),
     ("part_types", "part-type", "name"),
@@ -376,7 +301,6 @@ fn diff_collection(
             _ => {
                 let action = match kind {
                     "user" => user_action(&changes),
-                    "eco" => eco_action(&changes),
                     "workspace" => workspace_action(&changes),
                     _ => "update",
                 };
@@ -498,37 +422,6 @@ fn revision_action(changes: &BTreeMap<String, FieldChange>) -> &'static str {
     }
     if changes.contains_key("bake") {
         return "bake";
-    }
-    if changes.contains_key("reviews") {
-        return "review-update";
-    }
-    if changes.contains_key("comments") {
-        return "comment";
-    }
-    "update"
-}
-
-/// The one word that best says what happened to a change order: a decision,
-/// then its state, then its items, its round, its discussion.
-fn eco_action(changes: &BTreeMap<String, FieldChange>) -> &'static str {
-    if let Some(change) = changes.get("reviews") {
-        if let Some(verdict) = new_decision(&change.before, &change.after) {
-            return verdict;
-        }
-    }
-    if let Some(change) = changes.get("state") {
-        let was = change.before.as_str().unwrap_or("");
-        return match change.after.as_str().unwrap_or("") {
-            "inreview" | "approved" if was == "draft" => "submit",
-            "approved" => "approve",
-            "released" => "release",
-            "cancelled" => "cancel",
-            "draft" => "withdraw",
-            _ => "update",
-        };
-    }
-    if changes.contains_key("items") {
-        return "items";
     }
     if changes.contains_key("reviews") {
         return "review-update";

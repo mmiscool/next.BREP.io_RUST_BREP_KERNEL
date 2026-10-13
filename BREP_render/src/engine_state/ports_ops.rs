@@ -197,6 +197,9 @@ impl EngineState {
             names: seed,
             restore_index: self.history.rollback(),
             target: RefSelectTarget::PortPoint { field },
+            picks: 0,
+            claimed: false,
+            finish_requested: false,
         });
         self.sync_ref_select_emphasis();
     }

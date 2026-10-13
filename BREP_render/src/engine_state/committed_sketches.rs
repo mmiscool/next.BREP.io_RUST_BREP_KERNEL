@@ -32,13 +32,16 @@ const PORT_WAYPOINT_COLOR: [f32; 3] = [
 ///   * `WP` — a routing waypoint draws its line, `{id}:PortLine`;
 ///   * `PORTS` — a declared connection point, which is not a feature at all:
 ///     its address stands in for the id and it draws the same line.
-/// Anything else (a solid feature) has no sheet here. Only `S` is ever
-/// ENTERABLE — the sketch-mode guards check the type separately.
+///   * `S3D` — a 3D sketch draws one curve per model geometry, `{id}:G{gid}`,
+///     like a planar sketch (it never has a sheet: nothing closes a region).
+/// Anything else (a solid feature) has no sheet here. Only `S` and `S3D` are
+/// ever ENTERABLE — the sketch-mode guards check the type separately.
 fn curve_feature_segment_prefix(feature_type: &str, id: &str) -> Option<String> {
     match feature_type {
         "S" => Some(format!("{id}:G")),
         "HX" => Some(format!("{id}:HelixEdge")),
         "SP" => Some(format!("{id}:SplineEdge")),
+        brep_kernel::SKETCH3D_FEATURE_TYPE => Some(format!("{id}:G")),
         "WP" | brep_kernel::PORTS_FEATURE_TYPE => Some(format!("{id}:PortLine")),
         _ => None,
     }
@@ -53,7 +56,7 @@ fn curve_feature_segment_prefix(feature_type: &str, id: &str) -> Option<String> 
 /// draws, so it has no point prefix.
 fn curve_feature_point_prefix(feature_type: &str, id: &str) -> Option<String> {
     match feature_type {
-        "S" | "SP" => Some(format!("{id}:P")),
+        "S" | "SP" | brep_kernel::SKETCH3D_FEATURE_TYPE => Some(format!("{id}:P")),
         "WP" | brep_kernel::PORTS_FEATURE_TYPE => Some(format!("{id}:Base")),
         _ => None,
     }
@@ -89,7 +92,11 @@ impl EngineState {
     /// feature's TYPE beside its id — the sheet refresh colours a port sheet
     /// by type.
     fn committed_curve_features_typed(&self) -> Vec<(String, String, String, Option<String>)> {
-        let editing = self.sketch_edit.as_ref().map(|edit| edit.feature_id.as_str());
+        let editing = self
+            .sketch_edit
+            .as_ref()
+            .map(|edit| edit.feature_id.as_str())
+            .or_else(|| self.sketch3d_edit.as_ref().map(|edit| edit.feature_id.as_str()));
         let rollback = self.history.rollback();
         let mut ids = Vec::new();
         for index in 0..=rollback {

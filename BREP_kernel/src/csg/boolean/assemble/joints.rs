@@ -12,6 +12,29 @@ use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 #[path = "paired.rs"]
 mod paired;
 
+/// Operation-local timing, with no clock reads unless BREP_PROFILE is set.
+struct JointProfile {
+    started: Option<web_time::Instant>,
+    ms: std::collections::BTreeMap<&'static str, f64>,
+}
+
+impl JointProfile {
+    fn new(enabled: bool) -> Self {
+        Self { started: enabled.then(web_time::Instant::now), ms: Default::default() }
+    }
+    fn lap(&mut self, stage: &'static str) {
+        if let Some(started) = self.started.as_mut() {
+            *self.ms.entry(stage).or_default() += started.elapsed().as_secs_f64() * 1000.0;
+            *started = web_time::Instant::now();
+        }
+    }
+    fn report(&self, replaced: usize) {
+        if self.started.is_some() {
+            eprintln!("assemble.joints.profile replaced={replaced} stages_ms={:?}", self.ms);
+        }
+    }
+}
+
 /// The joint bar: how far a trim's end may sit from the image of the vertex
 /// its loop passes through. The default kernel policy's MODEL tolerance,
 /// which is the floor the assembler's own section trims are fitted to
@@ -356,16 +379,33 @@ pub(in crate::boolean) fn close_trim_loop_joints(
     solid: &mut BrepSolid,
     tolerance: f64,
 ) -> Result<Vec<ReplacedTrim>, KernelRefusal> {
+    close_trim_loop_joints_in(solid, tolerance, None)
+}
+
+/// [`close_trim_loop_joints`] over the faces in `scope` only (`None` reads
+/// every face): a boolean passes the faces it touched and their
+/// neighbours; a joint on any other face is the operand's.
+pub(in crate::boolean) fn close_trim_loop_joints_in(
+    solid: &mut BrepSolid,
+    tolerance: f64,
+    scope: Option<&HashSet<u64>>,
+) -> Result<Vec<ReplacedTrim>, KernelRefusal> {
+    let mut profile = JointProfile::new(std::env::var_os("BREP_PROFILE").is_some());
     let previous = solid.clone();
-    let result = close_trim_loop_joints_impl(solid, tolerance);
+    profile.lap("clone");
+    let result = close_trim_loop_joints_impl(solid, tolerance, scope, &mut profile);
     let Ok(replaced) = result else {
+        profile.report(0);
         *solid = previous;
         return Ok(Vec::new());
     };
     if replaced.is_empty() {
+        profile.report(0);
         return Ok(replaced);
     }
     let safe = topology_not_worse(&previous, solid);
+    profile.lap("topology_guard");
+    profile.report(replaced.len());
     if !safe {
         *solid = previous;
         if std::env::var("BREP_DEBUG_JOINTS").is_ok() {
@@ -459,6 +499,8 @@ fn face_joints_not_worse(old: &crate::FaceRecord, new: &crate::FaceRecord, bar: 
 fn close_trim_loop_joints_impl(
     solid: &mut BrepSolid,
     tolerance: f64,
+    scope: Option<&HashSet<u64>>,
+    profile: &mut JointProfile,
 ) -> Result<Vec<ReplacedTrim>, KernelRefusal> {
     // Rounds: rebuilding one trim toward its vertex can OPEN the joint at its
     // other end, where a neighbour that used to meet the old, displaced end
@@ -472,11 +514,13 @@ fn close_trim_loop_joints_impl(
     if std::env::var("BREP_TRIM_JOINTS").as_deref() == Ok("0") {
         return Ok(replaced);
     }
-    let (initial, exact_curved) = paired::reconstruct(solid, trim_joint_bar(solid, tolerance));
+    let (initial, exact_curved) = paired::reconstruct(solid, trim_joint_bar(solid, tolerance), scope);
+    profile.lap("paired");
     replaced.extend(initial);
     for _round in 0..4 {
         let previous = solid.clone();
-        let mut this_round = close_trim_loop_joints_once(solid, tolerance, &exact_curved)?;
+        let mut this_round = close_trim_loop_joints_once(solid, tolerance, &exact_curved, scope)?;
+        profile.lap("round");
         let bar = trim_joint_bar(solid, tolerance);
         let mut rejected_faces = Vec::new();
         for face_index in this_round.iter().map(|item| item.face) {
@@ -520,9 +564,11 @@ fn close_trim_loop_joints_impl(
             }
         }
         if this_round.is_empty() {
+            profile.lap("round_guard");
             break;
         }
         replaced.extend(this_round);
+        profile.lap("round_guard");
     }
     Ok(replaced)
 }
@@ -615,6 +661,7 @@ fn close_trim_loop_joints_once(
     solid: &mut BrepSolid,
     tolerance: f64,
     exact_curved: &HashSet<usize>,
+    scope: Option<&HashSet<u64>>,
 ) -> Result<Vec<ReplacedTrim>, KernelRefusal> {
     let bar = trim_joint_bar(solid, tolerance);
     let debug =
@@ -659,6 +706,9 @@ fn close_trim_loop_joints_once(
     let face_count: usize = solid.shells.iter().map(|shell| shell.faces.len()).sum();
     for face_index in 0..face_count {
         let face = face_at(&solid.shells, face_index);
+        if scope.is_some_and(|scope| !scope.contains(&face.id)) {
+            continue;
+        }
         for (loop_index, loop_record) in face.loops.iter().enumerate() {
             let count = loop_record.coedges.len();
             if count < 2 {

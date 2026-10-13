@@ -4,6 +4,7 @@ use super::earclip::{crossing_parity_inside, point_in_triangle};
 /// Bridge every hole into the outer loop (classic two-way bridge, vertices
 /// duplicated), producing one simple polygon for ear clipping.
 pub(in crate::watertight_tessellation) fn bridge_holes(outer: Vec<FaceVertex>, holes: Vec<Vec<FaceVertex>>) -> Vec<FaceVertex> {
+    let _timer = stage_timer(Stage::Bridge);
     let mut polygon = outer;
     let mut remaining: Vec<Vec<FaceVertex>> = holes;
     // Bridge holes right-to-left so previously inserted bridges stay valid.
@@ -435,7 +436,7 @@ fn point_strictly_on_segment(p: [f64; 2], a: [f64; 2], b: [f64; 2], epsilon: f64
 }
 
 /// Crossing-parity point-in-polygon test over a whole vertex chain.
-pub(super) fn point_in_polygon(polygon: &[FaceVertex], p: [f64; 2]) -> bool {
+pub(in crate::watertight_tessellation) fn point_in_polygon(polygon: &[FaceVertex], p: [f64; 2]) -> bool {
     crossing_parity_inside(polygon.len(), |offset| polygon[offset].uv, p)
 }
 

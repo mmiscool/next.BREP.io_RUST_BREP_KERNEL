@@ -636,40 +636,76 @@ impl EngineState {
         true
     }
 
-    /// Re-project every loaded external-reference edge against the CURRENT backdrop
-    /// scene (called on enter): for each ref whose edge is still present, refresh its
-    /// points' coordinates in place (via [`link_or_update`](crate::sketch::external_ref::link_or_update),
-    /// which updates without duplicating). Best-effort — a ref whose edge is gone
-    /// keeps its persisted coordinates as the fallback. Re-solves + refreshes when any
-    /// ref moved. Returns whether anything changed. No undo snapshot (it is part of
-    /// entering, not a user edit).
-    pub(super) fn sketch_reproject_external_refs(&mut self) -> bool {
-        // Gather the current world polylines for the loaded refs without holding a
-        // borrow across the mutation.
-        let jobs: Vec<(String, String, Vec<[f64; 3]>)> = match self.sketch_edit.as_ref() {
-            Some(edit) if !edit.external_refs.is_empty() => edit
-                .external_refs
-                .iter()
-                .filter_map(|r| {
-                    let poly = self.scene.edge_polyline_world(&r.edge_name)?;
-                    let solid = self
-                        .scene
-                        .edge_solid_name(&r.edge_name)
-                        .unwrap_or_default()
-                        .to_string();
-                    Some((r.edge_name.clone(), solid, poly))
-                })
-                .collect(),
-            _ => return false,
-        };
-        if jobs.is_empty() {
+    /// Sync the active sketch's edge links with its `projectedEdges` list against
+    /// the CURRENT backdrop scene (called on enter):
+    ///
+    /// - every loaded ref whose edge is present re-projects in place (via
+    ///   [`link_or_update`](crate::sketch::external_ref::link_or_update), which
+    ///   updates without duplicating) so a linked edge tracks upstream edits;
+    /// - every `listed` edge with no ref that the backdrop resolves is linked
+    ///   (an entry added in the feature dialog appears in the editor); one the
+    ///   backdrop does not resolve is remembered in `listed_unlinked` so Finish
+    ///   keeps it listed;
+    /// - when `links_listed` (a unified Finish stamped the marker), a ref the
+    ///   list no longer names was removed in the dialog and is RELEASED — its
+    ///   geometry stays as fixed construction geometry — whether or not its edge
+    ///   is present. Before the marker the entries predate the list and are kept.
+    ///
+    /// A ref whose edge is absent keeps its persisted coordinates: the backdrop
+    /// can lag the run on a background runner, so a miss here is never a
+    /// release; the regenerate fold releases on the kernel's word. Re-solves +
+    /// refreshes when anything changed. Returns whether it did. No undo
+    /// snapshot (it is part of entering, not a user edit).
+    pub(super) fn sketch_sync_external_refs(&mut self, listed: &[String], links_listed: bool) -> bool {
+        // Gather the current world polylines without holding a borrow across the
+        // mutation.
+        let Some(edit) = self.sketch_edit.as_ref() else {
             return false;
+        };
+        let mut names: Vec<String> = listed.to_vec();
+        for r in &edit.external_refs {
+            if !names.contains(&r.edge_name) {
+                names.push(r.edge_name.clone());
+            }
         }
+        let mut jobs: Vec<(String, String, Vec<[f64; 3]>)> = Vec::new();
+        let mut unlinked: Vec<String> = Vec::new();
+        for name in &names {
+            match self.scene.edge_polyline_world(name) {
+                Some(poly) => {
+                    let solid = self.scene.edge_solid_name(name).unwrap_or_default().to_string();
+                    jobs.push((name.clone(), solid, poly));
+                }
+                None => {
+                    if listed.contains(name) && !edit.external_refs.iter().any(|r| &r.edge_name == name) {
+                        unlinked.push(name.clone());
+                    }
+                }
+            }
+        }
+        let released: Vec<crate::sketch::ExternalRef> = if links_listed {
+            edit.external_refs
+                .iter()
+                .filter(|r| !listed.contains(&r.edge_name))
+                .cloned()
+                .collect()
+        } else {
+            Vec::new()
+        };
         let Some(edit) = self.sketch_edit.as_mut() else {
             return false;
         };
+        edit.listed_unlinked = unlinked;
         let mut changed = false;
+        for r in &released {
+            crate::sketch::external_ref::release_ref(&mut edit.session.doc, r);
+            edit.external_refs.retain(|live| live.edge_name != r.edge_name);
+            changed = true;
+        }
         for (edge_name, solid_name, world_poly) in &jobs {
+            if released.iter().any(|r| &r.edge_name == edge_name) {
+                continue;
+            }
             changed |= crate::sketch::external_ref::link_or_update(
                 &mut edit.session.doc,
                 &mut edit.external_refs,
@@ -680,7 +716,7 @@ impl EngineState {
             );
         }
         if changed {
-            self.resolve_active_sketch("external-ref reproject");
+            self.resolve_active_sketch("external-ref sync");
             self.refresh_sketch_overlay();
             self.dirty = true;
         }

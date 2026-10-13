@@ -79,7 +79,8 @@ pub struct StlConversionOptions {
     /// it is primarily useful for diagnosing the fully faceted repair path.
     pub try_hybrid_rebuild: bool,
     /// Vertex weld tolerance for hybrid segmentation and faceted repair;
-    /// non-positive derives a scale-relative tolerance in the kernel.
+    /// Non-positive uses the STL reader's scale-relative tolerance for
+    /// segmentation; faceted repair retains the kernel's default tolerance.
     pub weld_tolerance: f64,
     /// Absolute coordinate uncertainty introduced by the source encoding.
     ///
@@ -796,7 +797,7 @@ fn convert_component(
                 source_positions,
                 source_indices.unwrap_or(&[]),
                 seg,
-                &segmentation_options(options),
+                &segmentation_options(source_positions, options),
             )
         })
     } else {
@@ -2008,12 +2009,32 @@ fn solid_face_count(solid: &brep_kernel::BrepSolid) -> usize {
 /// ring torus is one region.
 const MAX_WHOLE_PRIMITIVE_REGIONS: usize = 3;
 
-fn segmentation_options(options: &StlConversionOptions) -> SegmentOptions {
+fn segmentation_options(positions: &[f64], options: &StlConversionOptions) -> SegmentOptions {
     SegmentOptions {
         deflection_angle_deg: options.kernel_deflection_angle_degrees,
         fit_tolerance: options.kernel_fit_tolerance,
         normal_tolerance_deg: options.kernel_normal_tolerance_degrees,
-        weld_tolerance: options.weld_tolerance,
+        // The conversion buffers have already been welded by the STL reader
+        // or mesh repair. Preserve that indexed topology: the kernel's default
+        // weld (diagonal * 1e-6) is wider than the STL reader's (1e-9), and can
+        // merge distinct vertices before the hybrid builder consumes the IDs.
+        weld_tolerance: if options.weld_tolerance > 0.0 {
+            options.weld_tolerance
+        } else {
+            let mut low = [f64::INFINITY; 3];
+            let mut high = [f64::NEG_INFINITY; 3];
+            for point in positions.chunks_exact(3) {
+                for axis in 0..3 {
+                    low[axis] = low[axis].min(point[axis]);
+                    high[axis] = high[axis].max(point[axis]);
+                }
+            }
+            let diagonal = (0..3)
+                .map(|axis| (high[axis] - low[axis]).powi(2))
+                .sum::<f64>()
+                .sqrt();
+            (diagonal * crate::stl::DEFAULT_RELATIVE_WELD_TOLERANCE).max(f64::MIN_POSITIVE)
+        },
         ..SegmentOptions::default()
     }
 }
@@ -2033,7 +2054,7 @@ fn gate_segmentation(
             &owned_indices
         }
     };
-    segment_mesh_faces(positions, indices, &segmentation_options(options))
+    segment_mesh_faces(positions, indices, &segmentation_options(positions, options))
         .map_err(|error| format!("kernel segmentation failed: {error}"))
 }
 
@@ -2095,7 +2116,7 @@ fn try_kernel_analytic(
             &owned_indices
         }
     };
-    let segmentation_options = segmentation_options(options);
+    let segmentation_options = segmentation_options(positions, options);
     let segmentation = segment_mesh_faces(positions, indices, &segmentation_options)?;
     if segmentation
         .triangle_region_ids
@@ -2126,7 +2147,7 @@ fn try_hybrid_analytic(
     crate::hybrid_region_brep::hybrid_plane_cylinder_brep(
         positions,
         indices,
-        &segmentation_options(options),
+        &segmentation_options(positions, options),
     )
 }
 
@@ -2159,3 +2180,4 @@ fn hybrid_report(stats: crate::hybrid_region_brep::HybridBrepStats) -> HybridCon
 fn kernel_vec(value: Vec3) -> brep_kernel::Vec3 {
     brep_kernel::Vec3::new(value.x, value.y, value.z)
 }
+

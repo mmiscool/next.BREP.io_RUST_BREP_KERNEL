@@ -31,10 +31,16 @@
 //!     modelling history made it, and a line laid out name-first would push its
 //!     own remove button off the panel.
 //!     Pressing the button is surfaced to the caller by the field key (the same
-//!     `clicked` out-param a `Button` uses) — entering the picker needs the
+//!     `clicked` out-param a `Button` uses) — opening the pick needs the
 //!     engine, and this file deliberately has none. HOVERING a line reports the
 //!     entity NAME on it the same way ([`FieldActions::hovered_entity`]), so the
-//!     caller can light that entity in the 3D scene.
+//!     caller can light that entity in the 3D scene. While a pick RUNS in a
+//!     field ([`ActivePick`], passed through [`field_input_with`]) that field
+//!     draws FOCUSED — an accent ring, the engine's running picks as its list,
+//!     its button reading `Done` — and reports [`FieldActions::pick_done`] and
+//!     [`FieldActions::pick_remove`] instead of an edit: the dialog's selection
+//!     box, the way other CAD applications keep it in focus while you click in
+//!     the view.
 //!
 //! # Width, and who decides it
 //!
@@ -90,6 +96,29 @@ pub struct FieldActions {
     /// The pointer is over a reference LINE: the entity NAME that line lists, for
     /// the caller to hover-highlight in the 3D scene.
     pub hovered_entity: Option<String>,
+    /// The FOCUSED reference field's button (`Done`) was pressed: the running
+    /// pick is to be committed. Never set together with `clicked`.
+    pub pick_done: bool,
+    /// An `✕` on the FOCUSED reference field's list: drop the i-th RUNNING pick.
+    /// That list is the engine's, not `current`'s, so this is an intent for the
+    /// consumer rather than an edit reported through `changed`.
+    pub pick_remove: Option<usize>,
+}
+
+/// The reference field a pick is RUNNING in, as the form draws it: the
+/// field whose `path` this names is the FOCUSED one — it lists `names` (the
+/// engine's running picks, not the stored value), its button reads `Done`
+/// and ends the pick, and its `✕`s report [`FieldActions::pick_remove`]. The
+/// other reference fields draw as usual, and pressing one of them is still
+/// [`FieldActions::clicked`]: the consumer finishes this pick and opens that
+/// one, the way a CAD dialog moves its focus from one selection box to the
+/// next.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ActivePick<'a> {
+    /// The focused field's JSON path.
+    pub path: &'a [String],
+    /// The running picks.
+    pub names: &'a [String],
 }
 
 /// Emit ONLY the input widget(s) for one field — NO leading label, NO forced row
@@ -110,8 +139,22 @@ pub fn field_input(
     ui: &mut egui::Ui,
     field: &FormField,
     current: &mut Value,
+    probe: Option<&mut HashMap<String, egui::Rect>>,
+    actions: &mut FieldActions,
+) -> (bool, egui::Rect) {
+    field_input_with(ui, field, current, probe, actions, None)
+}
+
+/// [`field_input`] for a form that may have a reference pick RUNNING:
+/// `picking` names the focused field (see [`ActivePick`]). Every other field
+/// draws exactly as [`field_input`] draws it.
+pub fn field_input_with(
+    ui: &mut egui::Ui,
+    field: &FormField,
+    current: &mut Value,
     mut probe: Option<&mut HashMap<String, egui::Rect>>,
     actions: &mut FieldActions,
+    picking: Option<ActivePick<'_>>,
 ) -> (bool, egui::Rect) {
     let path = &field.path;
     match &field.kind {
@@ -285,35 +328,69 @@ pub fn field_input(
             // to see, so it is never hidden behind a `[+]`.
             //
             // Pressing `Select` reports the field key through `clicked` (exactly
-            // as a `Button` does) — entering the modal picker is the ENGINE's job
-            // and the caller owns which flavour of picker to enter. Removing a
-            // line, by contrast, is a pure edit of `current`, so it happens here
-            // and reports `changed` like any other field.
-            let names = reference_names(value_at(current, path));
+            // as a `Button` does) — opening the pick is the ENGINE's job and the
+            // caller owns which flavour of pick to open. Removing a line, by
+            // contrast, is a pure edit of `current`, so it happens here and
+            // reports `changed` like any other field.
+            //
+            // The FOCUSED field — the one a pick is running in — lists the
+            // engine's running picks instead of the stored value, and its
+            // button ends the pick rather than starting one. This is how the
+            // dialog keeps its selection box in focus while the user clicks in
+            // the view, instead of handing the picks to a separate mode.
+            let focused = picking.filter(|pick| pick.path == path.as_slice());
+            let names = match focused {
+                Some(pick) => pick.names.to_vec(),
+                None => reference_names(value_at(current, path)),
+            };
             let pkey = path.join(".");
             let mut removed: Option<usize> = None;
             let mut activate_rect = egui::Rect::NOTHING;
             ui.vertical(|ui| {
                 let width = ui.available_width();
-                let hint = format!(
-                    "▣ Select {}{}",
-                    filter.join("/"),
-                    if *multiple { " …" } else { "" }
-                );
-                let select = crate::icon_text::icon_button(ui, &hint);
+                let hint = if focused.is_some() {
+                    // A list keeps taking picks until the user says so; a
+                    // single field closes on its one pick (the consumer
+                    // finishes it), and Done before that keeps what it has.
+                    "▣ Done".to_string()
+                } else {
+                    format!(
+                        "▣ Select {}{}",
+                        filter.join("/"),
+                        if *multiple { " …" } else { "" }
+                    )
+                };
+                let select = crate::icon_text::icon_button(ui, &hint).selected(focused.is_some());
                 let button = ui.add_sized(
                     [width, ui.spacing().interact_size.y],
                     select,
                 );
                 activate_rect = button.rect;
                 if button.clicked() {
-                    actions.clicked = Some(field.key().to_string());
+                    if focused.is_some() {
+                        actions.pick_done = true;
+                    } else {
+                        actions.clicked = Some(field.key().to_string());
+                    }
                 }
                 if let Some(map) = probe.as_deref_mut() {
                     map.insert(format!("{pkey}#activate"), button.rect);
                 }
+                if focused.is_some() {
+                    // The focus ring: the whole field reads as the one the
+                    // view's clicks go to, not just its button.
+                    let accent = ui.visuals().selection.stroke.color;
+                    ui.painter().rect_stroke(
+                        button.rect.expand(2.0),
+                        3.0,
+                        egui::Stroke::new(1.5, accent),
+                        egui::StrokeKind::Outside,
+                    );
+                    let what = if *multiple { "Click in the view to add; Escape restores" } else { "Click in the view to pick; Escape restores" };
+                    ui.label(egui::RichText::new(what).weak().small());
+                }
                 if names.is_empty() {
-                    ui.label(egui::RichText::new("(none)").weak());
+                    ui.label(egui::RichText::new(if focused.is_some() { "(nothing picked yet)" } else { "(none)" }).weak());
                     return;
                 }
                 for (i, name) in names.iter().enumerate() {
@@ -384,6 +461,11 @@ pub fn field_input(
                 }
             });
             if let Some(i) = removed {
+                if focused.is_some() {
+                    // The running list is the engine's: an intent, not an edit.
+                    actions.pick_remove = Some(i);
+                    return (false, activate_rect);
+                }
                 let mut kept = names;
                 kept.remove(i);
                 let value = if *multiple {

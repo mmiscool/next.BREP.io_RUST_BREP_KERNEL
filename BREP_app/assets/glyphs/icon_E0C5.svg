@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:brep="https://brep.io/icons"
+     viewBox="0 0 24 24" width="24" height="24" brep:glyph-name="icon_sketch3d_plane_xz" brep:unicode="E0C5">
+  <!-- The XZ working plane: a square lying flat (seen from above at a slant) with X across and Z receding. -->
+  <g fill="#111" stroke="#111" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M3.5 17 L8.5 8.5 H20.5 L15.5 17 Z" style="fill:none" stroke-dasharray="2.6 2.2"/>
+    <path d="M3.5 17 H14" style="fill:none"/>
+    <path d="M3.5 17 L7.5 10.2" style="fill:none"/>
+    <circle cx="3.5" cy="17" r="2" stroke="none"/>
+  </g>
+</svg>

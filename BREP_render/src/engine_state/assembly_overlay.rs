@@ -32,7 +32,7 @@ impl EngineState {
     /// Graphics setting is off or a sketch edit is active. A live handle drag's
     /// preview survives the rebuild (re-applied onto the fresh cache).
     pub fn refresh_constraint_overlay(&mut self) {
-        if !self.settings.show_constraint_graphics || self.sketch_mode() {
+        if !self.settings.show_constraint_graphics || self.any_sketch_mode() {
             self.clear_constraint_overlay();
             return;
         }
@@ -114,7 +114,7 @@ impl EngineState {
     /// sizing stays pixel-true. Re-bakes only on actual change, so a quiet
     /// frame stays quiet (no dirty loop).
     pub fn ensure_constraint_overlay_current(&mut self) {
-        let want = self.settings.show_constraint_graphics && !self.sketch_mode();
+        let want = self.settings.show_constraint_graphics && !self.any_sketch_mode();
         if !want {
             self.clear_constraint_overlay();
             return;
@@ -327,7 +327,7 @@ impl EngineState {
     /// projectors. Non-draggable overlays (expression-valued params, leader-only
     /// types) contribute nothing.
     fn constraint_hit_regions(&self) -> Vec<(String, HitShape)> {
-        if !self.settings.show_constraint_graphics || self.sketch_mode() {
+        if !self.settings.show_constraint_graphics || self.any_sketch_mode() {
             return Vec::new();
         }
         let wpp = self.camera.world_per_pixel();
@@ -392,7 +392,7 @@ impl EngineState {
     /// expression. The app publishes it as the `constraint` hit panel, in SCREEN
     /// points.
     pub fn constraint_handle_points_json(&self) -> String {
-        if !self.settings.show_constraint_graphics || self.sketch_mode() {
+        if !self.settings.show_constraint_graphics || self.any_sketch_mode() {
             return "{}".to_string();
         }
         let wpp = self.camera.world_per_pixel();

@@ -435,6 +435,20 @@ pub fn euler_handle_native(handle: u32) -> Result<crate::EulerReport, String> {
     with_registered_solid_str(handle, |solid| Ok(crate::solid_euler(solid)))
 }
 
+/// The body-kind report of a resident solid. A report beside the Euler
+/// one, not a gate: no body carries a kind yet. Pure counting, one
+/// registry borrow.
+pub fn topology_kind_handle_native(handle: u32) -> Result<crate::KindReport, String> {
+    with_registered_solid_str(handle, |solid| Ok(crate::topology_kind(solid)))
+}
+
+/// The kind a resident solid DECLARES (`BrepSolid::kind`), as distinct
+/// from the kind the report above reads from the edge census. `Solid`
+/// for every body built today.
+pub fn body_kind_handle_native(handle: u32) -> Result<crate::BodyKind, String> {
+    with_registered_solid_str(handle, |solid| Ok(solid.kind))
+}
+
 /// Face-loop self-crossing of a resident solid — the check no OTHER detector
 /// here can make. `validate()` is silent (the incidence is perfect), the
 /// face-versus-face scan has no pair to confirm (both triangles are on one

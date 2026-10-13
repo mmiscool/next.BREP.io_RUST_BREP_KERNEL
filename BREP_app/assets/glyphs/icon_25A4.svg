@@ -1,4 +1,7 @@
 <svg xmlns="http://www.w3.org/2000/svg" xmlns:brep="https://brep.io/icons"
-     viewBox="-134 0 1501 2384" width="1501" height="2384" brep:glyph-name="icon_25A4" brep:unicode="25A4">
-  <path d="M-133.5 1502.2V1314.8H1366.5V1502.2H-133.5ZM-133.5 1877.2V1689.8H1366.5V1877.2H-133.5ZM-133.5 1127.2V939.8H1366.5V1127.2H-133.5ZM-133.5 752.2V564.8H1366.5V752.2H-133.5Z" fill="#111"/>
+     viewBox="0 0 24 24" width="24" height="24" brep:glyph-name="icon_sheet_metal_export_flat_pattern" brep:unicode="25A4">
+  <!-- A developed sheet blank with bend lines and a download arrow. -->
+  <path d="M2 5H5V2H13V5H16V16H13V19H5V16H2Z" fill="#bcd7e8" stroke="#2b4c63" stroke-width="1.2" stroke-linejoin="round"/>
+  <path d="M5 6V15M13 6V15" style="fill:none" stroke="#3d86c4" stroke-width="1.2" stroke-dasharray="2 1.5"/>
+  <path d="M19 11V20M15.5 16.5 19 20 22.5 16.5M15.5 22H22.5" style="fill:none" stroke="#3d86c4" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
 </svg>

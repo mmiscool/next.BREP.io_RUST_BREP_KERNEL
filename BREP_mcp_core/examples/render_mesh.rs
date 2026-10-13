@@ -9,7 +9,7 @@
 //! host.
 //!
 //!     cargo build --release --manifest-path BREP_mcp_core/Cargo.toml --example render_mesh
-//!     BREP_mcp_core/target/release/examples/render_mesh mesh.json out.png --normalize
+//!     target/release/examples/render_mesh mesh.json out.png --normalize
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match brep_mcp_core::render_mesh::cli(&args) {

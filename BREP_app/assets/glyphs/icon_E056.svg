@@ -1,4 +1,10 @@
 <svg xmlns="http://www.w3.org/2000/svg" xmlns:brep="https://brep.io/icons"
-     viewBox="0 0 1233 2384" width="1233" height="2384" brep:glyph-name="icon_feat_transform" brep:unicode="E056">
-  <path d="M652.8 1221L652.8 951L579.2 951L579.2 1221ZM616 801L698.5 951L533.5 951ZM579.2 1221L579.2 1491L652.8 1491L652.8 1221ZM616 1641L533.5 1491L698.5 1491ZM616 1184.2L346 1184.2L346 1257.8L616 1257.8ZM196 1221L346 1138.5L346 1303.5ZM616 1257.8L886 1257.8L886 1184.2L616 1184.2ZM1036 1221L886 1303.5L886 1138.5Z" fill="#3d86c4"/>
+     viewBox="0 0 24 24" width="24" height="24" brep:glyph-name="icon_feat_transform" brep:unicode="E056">
+  <!-- A solid block with three placement arrows along the axes it moves on. -->
+  <path d="M3 19 6.8 21.8 6.8 15.8 3 13Z" fill="#f0b840" stroke="#7a4d10" stroke-width="1.2" stroke-linejoin="round" stroke-linecap="round"/>
+  <path d="M6.8 21.8 12.2 19.2 12.2 13.2 6.8 15.8Z" fill="#d4901f" stroke="#7a4d10" stroke-width="1.2" stroke-linejoin="round" stroke-linecap="round"/>
+  <path d="M3 13 8.4 10.5 12.2 13.2 6.8 15.8Z" fill="#ffd977" stroke="#7a4d10" stroke-width="1.2" stroke-linejoin="round" stroke-linecap="round"/>
+  <path d="M12.2 13.2L12.2 4.2M14.3 6.8L12.2 4.2L10.1 6.8" style="fill:none" stroke="#3d86c4" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+  <path d="M12.2 13.2L20.3 9.4M18.8 12.4L20.3 9.4L17.1 8.7" style="fill:none" stroke="#3d86c4" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+  <path d="M12.2 13.2L18.3 17.6M15 17.8L18.3 17.6L17.4 14.4" style="fill:none" stroke="#3d86c4" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
 </svg>

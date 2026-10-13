@@ -115,6 +115,7 @@ impl Viewport {
             component_gizmo_dragging: false,
             dim_dragging: None,
             sketch_dragging: false,
+            sketch3d_dragging: false,
             sketch_handdrawing: false,
             last_rect: None,
             candidate_popup: None,

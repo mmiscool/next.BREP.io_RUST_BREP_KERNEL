@@ -128,7 +128,6 @@ globalThis.OpenPages = (() => {
       if(view==='part'&&tab.objectView&&hash===priorHash)selectObjectTab(tab.objectView);
       if(view==='part'&&tab.editor){editorKey=tab.editor.key;document.getElementById('editor-body').value=tab.editor.text;document.getElementById('editor-key').textContent=tab.editor.title;document.getElementById('editor').hidden=tab.editor.hidden;document.getElementById('editor-note').textContent=tab.editor.note;document.getElementById('editor-body').readOnly=tab.editor.readonly;document.getElementById('editor-save').hidden=tab.editor.saveHidden;}
       if(view==='scripts')syncScriptButtons();
-      if(view==='settings')syncEcoModeFields();
       for(const layout of tab.layouts||[])document.getElementById(layout.id)?.classList.toggle('detail-open',layout.open);
       document.querySelectorAll(`#view-${view} details`).forEach((n,i)=>{if(tab.details?.[i]!==undefined)n.open=tab.details[i];});
     }
@@ -176,6 +175,12 @@ globalThis.OpenPages = (() => {
     const next=event.key==='ArrowRight'?(i+1)%buttons.length:event.key==='ArrowLeft'?(i+buttons.length-1)%buttons.length:event.key==='Home'?0:event.key==='End'?buttons.length-1:-1;
     if(next>=0){event.preventDefault();buttons[next].focus();buttons[next].click();}
   });
-  return {restoreSession,beforeRender,afterRender,replaceRoute,capture,activate,scriptDraft,saved,closeTab,keyOf,workspace:hash=>tabs.get(keyOf(hash))?.workspace,
-    resume:hash=>{const tab=tabs.get(keyOf(hash));return tab&&tab.loaded&&tab.key!==active&&!['workflows','workflow-editor','workflow-run','setup','file','part','workspace','scripts','eco','catalog','parts'].includes(tab.view)?tab:null;}};
+  return {restoreSession,beforeRender,afterRender,replaceRoute,capture,activate,scriptDraft,saved,closeTab,keyOf,
+    partView:hash=>tabs.get(keyOf(hash))?.objectView,
+    partPanelReady:id=>{
+      const tab=tabs.get(active);if(tab?.view!=='part')return;
+      controls('part').forEach((n,i)=>{if(n.closest(`[data-object-panel="${id}"]`))tab.baseline.set(fieldKey(n,i),value(n));});
+      restoring=true;try{applyFields(tab);}finally{restoring=false;}
+    },workspace:hash=>tabs.get(keyOf(hash))?.workspace,
+    resume:hash=>{const tab=tabs.get(keyOf(hash));return tab&&tab.loaded&&tab.key!==active&&!['workflows','workflow-editor','workflow-run','setup','file','part','workspace','scripts','catalog','parts'].includes(tab.view)?tab:null;}};
 })();

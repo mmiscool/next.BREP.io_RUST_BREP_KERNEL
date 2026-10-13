@@ -270,14 +270,12 @@ pub fn check_value(def: &AttributeDef, value: &Value) -> Result<Option<Value>, S
 /// Why `part` cannot release, as far as its catalog values go: every required
 /// attribute of its category has a value, and every value its category
 /// defines still fits (an administrator may have changed an attribute's type
-/// since it was written). An uncategorized part — or one whose category text
-/// names no category — has no schema and nothing to check.
+/// since it was written). An uncategorized part has no schema to check.
 pub fn release_problems(categories: &[Category], part: &Part) -> Vec<String> {
-    if find(categories, &part.category).is_none() {
-        return Vec::new();
-    }
-    let Ok(schema) = schema(categories, &part.category) else {
-        return Vec::new();
+    if part.category.is_empty() { return Vec::new(); }
+    let schema = match schema(categories, &part.category) {
+        Ok(schema) => schema,
+        Err(error) => return vec![error.to_string()],
     };
     let mut problems = Vec::new();
     for Effective { def, .. } in &schema {
@@ -312,10 +310,7 @@ pub fn apply_values(
     values: &mut std::collections::BTreeMap<String, Value>,
     changes: &serde_json::Map<String, Value>,
 ) -> Result<(), Error> {
-    let schema = match find(categories, category) {
-        Some(found) => schema(categories, &found.id)?,
-        None => Vec::new(),
-    };
+    let schema = if category.is_empty() { Vec::new() } else { schema(categories, category)? };
     for (key, value) in changes {
         let key = key.trim().to_ascii_lowercase();
         let clearing = value.is_null() || value.as_str().is_some_and(|s| s.trim().is_empty());

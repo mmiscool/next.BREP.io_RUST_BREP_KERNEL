@@ -1,6 +1,9 @@
 <svg xmlns="http://www.w3.org/2000/svg" xmlns:brep="https://brep.io/icons"
-     viewBox="0 0 1233 2384" width="1233" height="2384" brep:glyph-name="icon_feat_extrude" brep:unicode="E03D">
-  <path d="M282 1071L950 1071L950 1555L282 1555Z" fill="#ffd977"/>
-  <path d="M236 1647L996 1647L996 1555L236 1555ZM282 1601L282 1401L190 1401L190 1601ZM1042 1601L1042 1401L950 1401L950 1601Z" fill="#7a4d10"/>
-  <path d="M662 1471L662 1001L570 1001L570 1471ZM616 821L715 1001L517 1001Z" fill="#2fa469"/>
+     viewBox="0 0 24 24" width="24" height="24" brep:glyph-name="icon_feat_extrude" brep:unicode="E03D">
+  <!-- A sketch profile pulled straight up into a solid block. -->
+  <path d="M2 19 14.6 13.1 22.2 18.6 9.6 24.5Z" fill="#a5e8c4" stroke="#125236" stroke-width="1.2" stroke-linejoin="round" stroke-linecap="round"/>
+  <path d="M6.2 18.8 10.8 22.1 10.8 13.1 6.2 9.8Z" fill="#f0b840" stroke="#7a4d10" stroke-width="1.2" stroke-linejoin="round" stroke-linecap="round"/>
+  <path d="M10.8 22.1 17.1 19.2 17.1 10.2 10.8 13.1Z" fill="#d4901f" stroke="#7a4d10" stroke-width="1.2" stroke-linejoin="round" stroke-linecap="round"/>
+  <path d="M6.2 9.8 12.5 6.9 17.1 10.2 10.8 13.1Z" fill="#ffd977" stroke="#7a4d10" stroke-width="1.2" stroke-linejoin="round" stroke-linecap="round"/>
+  <path d="M15.9 9.9L15.9 2.9M18 5.5L15.9 2.9L13.8 5.5" style="fill:none" stroke="#2fa469" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
 </svg>

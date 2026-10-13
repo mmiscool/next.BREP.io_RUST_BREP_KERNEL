@@ -20,9 +20,10 @@ pub(crate) use finalize::{
 };
 pub(super) use finalize::repair_open_assembly_via_heal_chain;
 pub(crate) use pipeline::{assemble_fragments, assemble_open_fragments};
-pub(super) use edges::{reconstruct_edges_from_carriers, restore_edges};
-pub(super) use polish::polish_triple_junction_vertices;
-pub(super) use vertices::{restore_vertices, settle_vertices_onto_carriers};
+pub(super) use pipeline::{assemble_fragments_scoped, AssemblyScope};
+pub(super) use edges::{reconstruct_edges_from_carriers, reconstruct_edges_from_carriers_in, restore_edges};
+pub(super) use polish::{polish_triple_junction_vertices, polish_triple_junction_vertices_in};
+pub(super) use vertices::{restore_vertices, settle_vertices_onto_carriers, settle_vertices_onto_carriers_in};
 pub(super) use refusal_welds::conform_unmatched_one_use_edges;
 
-pub(super) use joints::{close_trim_loop_joints, restore_trims};
+pub(super) use joints::{close_trim_loop_joints, close_trim_loop_joints_in, restore_trims};

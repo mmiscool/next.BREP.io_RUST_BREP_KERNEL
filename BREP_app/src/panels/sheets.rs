@@ -72,7 +72,7 @@
 use crate::automation::hit_keys::HitKeyDoc;
 use crate::column_tree::{self, CellKind, ColumnLayout, ColumnSpec, ColumnTreeSpec, RowAction, RowNode};
 use crate::form_view::{form_view, FormViewSpec};
-use brep_render::engine_state::EngineState;
+use brep_render::engine_state::{EngineState, RefSelectTarget};
 use brep_render::features::form_fields_from_schema;
 use brep_render::sheets::SheetState;
 use eframe::egui;
@@ -129,6 +129,10 @@ enum Action {
         multiple: bool,
         seed: Vec<String>,
     },
+    /// The focused reference field's `Done`: commit the running pick.
+    FinishRefSelect,
+    /// An `✕` on the focused reference field: drop the i-th running pick.
+    RefSelectRemove(usize),
     /// The sheet dialog's Revisions section: append a row…
     AddRevision(String),
     /// …edit one field of row `n`…
@@ -180,7 +184,20 @@ fn apply(state: &mut EngineState, action: Action) -> Result<(), String> {
             state.sheet_update_ordinate(&id, &params.to_string())
         }
         Action::BeginRefSelect { id, path, label, filter, multiple, seed } => {
+            // Focus moves from one selection box to the next: a pick already
+            // running commits first.
+            if state.ref_select_active() {
+                state.finish_ref_select();
+            }
             state.begin_ref_select_for_sheet(&id, path, label, filter, multiple, seed)
+        }
+        Action::FinishRefSelect => {
+            state.finish_ref_select();
+            Ok(())
+        }
+        Action::RefSelectRemove(index) => {
+            state.ref_select_remove(index);
+            Ok(())
         }
         Action::AddRevision(id) => state.sheet_add_revision(&id, None, None, None).map(|_| ()),
         Action::UpdateRevision(id, index, params) => {
@@ -386,7 +403,18 @@ impl SheetsPanel {
             state.push_notice(format!("Sheets: {error}"));
         }
         if close {
+            // Leaving the form commits the pick running in it.
+            if state.ref_select_is_sheet() {
+                state.finish_ref_select();
+            }
             state.sheet_set_object_open(None);
+        }
+        // This pane drew (or opened) the pick: the shell finishes an in-form
+        // pick no form claims, so one never runs on with its field off screen.
+        if let Some(field) = state.ref_select_field() {
+            if field.target == RefSelectTarget::Sheet && state.sheet_open_object() == Some(field.subject.as_str()) {
+                state.ref_select_claim();
+            }
         }
     }
 
@@ -810,6 +838,11 @@ impl SheetsPanel {
             ui.label("Revisions");
             draw_revision_rows(ui, id, &revision_rows, &revision_intents, &revision_hits);
         };
+        // The pick running in THIS object's form, if one is: that field draws
+        // focused and lists the anchors picked so far.
+        let picking = state
+            .ref_select_field()
+            .filter(|f| f.target == RefSelectTarget::Sheet && f.subject == id);
         let spec = FormViewSpec {
             title: &title,
             subtitle: None,
@@ -822,6 +855,7 @@ impl SheetsPanel {
             hidden: None,
             hits_prefix: "sheets:",
             read_only: state.history.locked(),
+            picking: picking.as_ref().map(|f| crate::form::ActivePick { path: &f.path, names: &f.names }),
         };
         let mut out = form_view(ui, &spec, &mut params, Some(&mut self.hits));
         if is_sheet && bom_changed.get() { params["bomTable"] = serde_json::to_value(bom.into_inner()).unwrap_or(Value::Null); out.changed = true; }
@@ -864,6 +898,13 @@ impl SheetsPanel {
                 multiple: activate.multiple,
                 seed: activate.seed,
             });
+        }
+        // The focused reference field's own intents.
+        if let Some(index) = out.pick_remove {
+            *action = Some(Action::RefSelectRemove(index));
+        }
+        if out.pick_done {
+            *action = Some(Action::FinishRefSelect);
         }
         if out.exit_clicked {
             *close = true;
@@ -962,7 +1003,7 @@ pub static HIT_KEYS: &[HitKeyDoc] = &[
     HitKeyDoc { panel: "sheets", prefix: "sheets:menu:", meaning: "a row's action-menu trigger cell (sheets:menu:<row id>); a right-click on the row opens the same menu", command: None },
     HitKeyDoc { panel: "sheets", prefix: "sheets:menuitem:", meaning: "one entry of the OPEN row action menu (sheets:menuitem:<row id>:<action>) \u{2014} published only while the menu is up", command: None },
     HitKeyDoc { panel: "sheets", prefix: "sheets:form:", meaning: "the open sheet / placement form (sheets:form:object:<id>, sheets:form:feature, sheets:form:return)", command: Some("sheet_update") },
-    HitKeyDoc { panel: "sheets", prefix: "sheets:field:", meaning: "one schema field of the open form (sheets:field:<path>) \u{2014} the paper size, the placed view, its position and scale, `sheets:field:flattenText`, the checkbox that lays that view's annotation text flat on the sheet, and a sheet dimension's kind, alignment, offset and precision and its tolerance block — `sheets:field:tolMode` (none / symmetric / deviation / limits), `sheets:field:tolUpper`, `sheets:field:tolLower` and the `sheets:field:isReference` checkbox, which an ordinate set's form carries too. `sheets:field:anchors#activate` opens the reference picker on the paper (anchors are clicked as `sheet/anchor:<ref>`, then `modebar/refsel:finish`), `sheets:field:anchors#line<n>` is one anchor row and `sheets:field:anchors#x<n>` drops it. An ORDINATE SET's form adds `sheets:field:axis` and its two reference fields `sheets:field:datum` and `sheets:field:members`; a SECTION's form its `sheets:field:cut` (the cutting line), `sheets:field:sectionLabel` and `sheets:field:sectionFlip`; a DETAIL's form its `sheets:field:centre`, `sheets:field:rim` and `sheets:field:detailLabel` \u{2014} each reference field with the same `#activate`, `#line<n>` and `#x<n>` keys", command: Some("sheet_update_dimension") },
+    HitKeyDoc { panel: "sheets", prefix: "sheets:field:", meaning: "one schema field of the open form (sheets:field:<path>) \u{2014} the paper size, the placed view, its position and scale, `sheets:field:flattenText`, the checkbox that lays that view's annotation text flat on the sheet, and a sheet dimension's kind, alignment, offset and precision and its tolerance block — `sheets:field:tolMode` (none / symmetric / deviation / limits), `sheets:field:tolUpper`, `sheets:field:tolLower` and the `sheets:field:isReference` checkbox, which an ordinate set's form carries too. `sheets:field:anchors#activate` focuses the field and opens the anchor pick on the paper (anchors are clicked as `sheet/anchor:<ref>`; the same key, now Done, commits a list, and a single field commits on its pick), `sheets:field:anchors#line<n>` is one anchor row and `sheets:field:anchors#x<n>` drops it. An ORDINATE SET's form adds `sheets:field:axis` and its two reference fields `sheets:field:datum` and `sheets:field:members`; a SECTION's form its `sheets:field:cut` (the cutting line), `sheets:field:sectionLabel` and `sheets:field:sectionFlip`; a DETAIL's form its `sheets:field:centre`, `sheets:field:rim` and `sheets:field:detailLabel` \u{2014} each reference field with the same `#activate`, `#line<n>` and `#x<n>` keys", command: Some("sheet_update_dimension") },
     HitKeyDoc { panel: "sheets", prefix: "sheets:group:", meaning: "a collapsible group header of the open form (sheets:group:<name>)", command: None },
     HitKeyDoc { panel: "sheets", prefix: "sheets:bom:", meaning: "the sheet BOM table toggle and column choices: sheets:bom:enabled, sheets:bom:column:<attribute>", command: Some("sheet_update") },
     HitKeyDoc { panel: "sheets", prefix: "sheets:rev:", meaning: "the SHEET dialog's Revisions section: `sheets:rev:add` appends a row (the next letter, today's date), and per row `sheets:rev:<n>:rev`, `sheets:rev:<n>:date` and `sheets:rev:<n>:description` are its three text edits and `sheets:rev:<n>:remove` removes it. Rows keep their order; the sheet draws them as the revision table beside its title block", command: Some("sheet_add_revision") },

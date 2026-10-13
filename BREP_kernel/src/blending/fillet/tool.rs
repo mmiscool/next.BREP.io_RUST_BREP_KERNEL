@@ -400,6 +400,47 @@ fn fillet_or_chamfer_inner(
                         }
                         crate::blend::blend_open_edge(solid, edge_id, radius, chamfer, name)
                     })
+                    .or_else(|error| {
+                        if is_terminal_blend_refusal(&error) {
+                            return Err(error);
+                        }
+                        // The one-edge network, which the general-first lane
+                        // runs BEFORE the open-edge march and this rung never
+                        // ran: the two differ at a free end whose mates run
+                        // tangent into the vertex (a POLE — the seam between
+                        // two rounds where both meet a third face flush).
+                        // The network reads that end (`pole_end`), stops its
+                        // march on the vertex and closes the end by that
+                        // point; the open-edge march overshoots past it,
+                        // where the two offset carriers coincide and the
+                        // station Newton is singular.  The 2026-10-13 star
+                        // boss: F3 selects the four F2 corner seams beside
+                        // mixed-convexity star corners, so the group is a
+                        // cutter composition, and its first seam refused
+                        // here while the same seam filleted alone built.
+                        // Tried LAST so a composition the open-edge march
+                        // already answers keeps that answer; the march's own
+                        // refusal is what is reported when the network
+                        // declines too.
+                        let names = [name.map(str::to_string)];
+                        match crate::blend::blend_star_network(
+                            solid,
+                            &[edge_id],
+                            radius,
+                            chamfer,
+                            &names,
+                            &|_| None,
+                        ) {
+                            Ok(result) if result.validate().is_empty() => Ok(result),
+                            Ok(_) => Err(error),
+                            Err(network_error) => {
+                                if is_terminal_blend_refusal(&network_error) {
+                                    return Err(network_error);
+                                }
+                                Err(error)
+                            }
+                        }
+                    })
             };
             // Last rung of the ladder, and the same contract: an untrimmed
             // blend is a failure here too.  Nothing is left to fall through

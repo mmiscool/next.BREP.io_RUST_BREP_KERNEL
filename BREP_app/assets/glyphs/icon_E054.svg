@@ -1,6 +1,9 @@
 <svg xmlns="http://www.w3.org/2000/svg" xmlns:brep="https://brep.io/icons"
-     viewBox="0 0 1233 2384" width="1233" height="2384" brep:glyph-name="icon_feat_hole" brep:unicode="E054">
-  <path d="M276 1221A340 340 0 1 1 956 1221A340 340 0 1 1 276 1221Z" fill="#ffd977"/>
-  <path d="M616 835C829.2 835 1002 1007.8 1002 1221C1002 1434.2 829.2 1607 616 1607C402.8 1607 230 1434.2 230 1221C230 1007.8 402.8 835 616 835ZM616 1515C778.4 1515 910 1383.4 910 1221C910 1058.6 778.4 927 616 927C453.6 927 322 1058.6 322 1221C322 1383.4 453.6 1515 616 1515Z" fill="#7a4d10"/>
-  <path d="M466 1253.2L766 1253.2L766 1188.8L466 1188.8ZM583.8 1071L583.8 1371L648.2 1371L648.2 1071Z" fill="#d94438"/>
+     viewBox="0 0 24 24" width="24" height="24" brep:glyph-name="icon_feat_hole" brep:unicode="E054">
+  <!-- A round hole through a solid block, its cut rim marked in red. -->
+  <path d="M3.5 18 9.2 22.1 9.2 17.1 3.5 13Z" fill="#f0b840" stroke="#7a4d10" stroke-width="1.2" stroke-linejoin="round" stroke-linecap="round"/>
+  <path d="M9.2 22.1 18.2 17.9 18.2 12.9 9.2 17.1Z" fill="#d4901f" stroke="#7a4d10" stroke-width="1.2" stroke-linejoin="round" stroke-linecap="round"/>
+  <path d="M7.6 13V16A3.2 1.5 0 0 0 14.1 16V13Z" fill="#d4901f"/>
+  <path d="M3.5 13 12.5 8.8 18.2 12.9 9.2 17.1ZM7.6 13A3.2 1.5 0 1 0 14.1 13A3.2 1.5 0 1 0 7.6 13Z" fill="#ffd977" stroke="#7a4d10" stroke-width="1.2" stroke-linejoin="round" stroke-linecap="round" fill-rule="evenodd"/>
+  <ellipse cx="10.8" cy="13" rx="3.2" ry="1.5" style="fill:none" stroke="#d94438" stroke-width="1.8"/>
 </svg>

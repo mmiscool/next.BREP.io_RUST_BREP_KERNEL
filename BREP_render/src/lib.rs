@@ -40,6 +40,7 @@ pub mod runner;
 pub mod scene;
 pub mod sheets;
 pub mod sketch;
+pub mod sketch3d;
 pub mod style;
 pub mod thumbnail;
 pub mod visibility;

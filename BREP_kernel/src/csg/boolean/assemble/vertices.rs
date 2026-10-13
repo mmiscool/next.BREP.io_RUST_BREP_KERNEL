@@ -632,6 +632,17 @@ fn settle_supported_boundary(
                 break;
             };
             if residual <= bar * 0.1 {
+                // A candidate no nearer the start than the one already held
+                // cannot replace it, so its edge motions are never swept: the
+                // shell report of 2026-10-07 brought three boundaries to the
+                // same point and paid the sweep for each (10 s apiece on its
+                // 515-control-point tube edge before the clearance hoist).
+                // Strictly nearer, as the replacement read it: the negation
+                // of that comparison, so a non-finite reading declines here
+                // exactly as it failed to replace there.
+                if best.is_some_and(|old| !(point.sub(start).length() < old.sub(start).length())) {
+                    break;
+                }
                 // Check complete induced edge motions, not just the vertex.
                 let mut safe = true;
                 for edge in solid
@@ -663,11 +674,7 @@ fn settle_supported_boundary(
                         break;
                     }
                 }
-                if safe
-                    && best.map_or(true, |old| {
-                        point.sub(start).length() < old.sub(start).length()
-                    })
-                {
+                if safe {
                     best = Some(point);
                 }
                 break;
@@ -725,6 +732,19 @@ pub(in crate::boolean) fn settle_vertices_onto_carriers(
     tolerance: f64,
     constructed: &rustc_hash::FxHashSet<u64>,
 ) -> Result<Vec<VertexMove>, KernelRefusal> {
+    settle_vertices_onto_carriers_in(solid, tolerance, constructed, None)
+}
+
+/// [`settle_vertices_onto_carriers`] over the vertices in `scope` only
+/// (`None` reads every vertex): a boolean passes the vertices of the faces
+/// it touched; the rest stand where the operand put them, on carriers the
+/// operation never changed.
+pub(in crate::boolean) fn settle_vertices_onto_carriers_in(
+    solid: &mut BrepSolid,
+    tolerance: f64,
+    constructed: &rustc_hash::FxHashSet<u64>,
+    scope: Option<&rustc_hash::FxHashSet<u64>>,
+) -> Result<Vec<VertexMove>, KernelRefusal> {
     let policy = KernelTolerances::for_solid(solid, 1e-7);
     let bar = policy.model.min(tolerance.max(1e-12));
     let carrier_band = policy.pcurve_consistency;
@@ -763,6 +783,9 @@ pub(in crate::boolean) fn settle_vertices_onto_carriers(
     let mut moves = Vec::<(u64, Vec3, Vec3, f64, f64)>::new();
     let mut declined = Vec::<String>::new();
     for vertex in &solid.vertices {
+        if scope.is_some_and(|scope| !scope.contains(&vertex.id)) {
+            continue;
+        }
         let Some(adjacent) = vertex_faces.get(&vertex.id) else {
             continue;
         };

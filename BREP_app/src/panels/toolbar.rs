@@ -35,7 +35,7 @@ pub struct ToolbarOutcome {
     /// not the engine. `BrepApp::zoom_to_fit` owns that branch, and the
     /// `zoom_to_fit` command calls the very same method.
     pub zoom_to_fit: bool,
-    /// A row of the PLM review inbox was opened: the review or change order it
+    /// A row of the PLM review inbox was opened: the review it
     /// names (`panels::plm_review`, S4). The shell hands it to the PLM pane.
     pub plm_review: Vec<crate::panels::plm_review::PlmReviewEvent>,
 }
@@ -201,6 +201,8 @@ impl ToolbarPanel {
             "undo" => {
                 if state.sketch_mode() {
                     state.sketch_undo();
+                } else if state.sketch3d_mode() {
+                    state.sketch3d_undo();
                 } else {
                     state.undo();
                 }
@@ -208,6 +210,8 @@ impl ToolbarPanel {
             "redo" => {
                 if state.sketch_mode() {
                     state.sketch_redo();
+                } else if state.sketch3d_mode() {
+                    state.sketch3d_redo();
                 } else {
                     state.redo();
                 }
@@ -321,6 +325,7 @@ pub static HIT_KEYS: &[HitKeyDoc] = &[
     HitKeyDoc { panel: "toolbar", prefix: "plugin:action:", meaning: "open the form for a named plugin action", command: Some("plugin_action") },
     HitKeyDoc { panel: "toolbar", prefix: "file:menu", meaning: "open the shared File menu", command: None },
     HitKeyDoc { panel: "toolbar", prefix: "file:recent", meaning: "recent documents section and document rows, present only when nonempty", command: Some("doc_load") },
+    HitKeyDoc { panel: "toolbar", prefix: "file:recent:thumb:", meaning: "the thumbnail square at the left of a recent-document row (file:recent:thumb:name): the document's saved picture, or the neutral placeholder before it has one", command: Some("doc_load") },
     HitKeyDoc { panel: "toolbar", prefix: "ribbon:", meaning: "ribbon tabs (ribbon:tab:<Tab>), group borders (ribbon:group:<Group>) and the overflow menu (ribbon:overflow)", command: None },
     HitKeyDoc { panel: "toolbar", prefix: "wbtb:", meaning: "Home creation commands; same keys as the Classic feature strip", command: Some("feature_add") },
     HitKeyDoc { panel: "toolbar", prefix: "file:new", meaning: "new document", command: Some("doc_new") },

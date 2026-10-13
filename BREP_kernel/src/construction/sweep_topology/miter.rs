@@ -527,6 +527,7 @@ pub(super) fn sweep_section_mitered(
         // `V − E + F = 2 − 2g` over one shell: 2 for an open run's capped tube,
         // 0 for a frame, whose one hole makes it a torus.
         genus: i64::from(closed),
+        kind: crate::BodyKind::Solid,
     };
     let issues = solid.validate();
     if !issues.is_empty() {

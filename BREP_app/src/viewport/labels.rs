@@ -166,14 +166,21 @@ impl Viewport {
         rect: egui::Rect,
         state: &mut EngineState,
     ) {
-        if !state.sketch_mode() {
+        // The 3D sketch publishes the same label shape; its labels have no
+        // draggable leader, and its values apply through its own setter.
+        let three_d = state.sketch3d_mode();
+        if !state.sketch_mode() && !three_d {
             self.editing_dim = None;
             return;
         }
 
         // The dimension labels (id/text/world/value/valueExpr/mode) from the engine.
-        let labels: Vec<serde_json::Value> =
-            serde_json::from_str(&state.sketch_dimension_labels_json()).unwrap_or_default();
+        let labels: Vec<serde_json::Value> = serde_json::from_str(&if three_d {
+            state.sketch3d_dimension_labels_json()
+        } else {
+            state.sketch_dimension_labels_json()
+        })
+        .unwrap_or_default();
 
         // Drop an open editor whose constraint no longer has a label (e.g. deleted).
         if let Some((id, _)) = self.editing_dim.as_ref() {
@@ -327,7 +334,13 @@ impl Viewport {
         // --- apply deferred actions (state is free to borrow again here) ---------
         if apply {
             if let Some((id, text)) = editing.take() {
-                state.sketch_set_dimension_value(&id, &text);
+                if three_d {
+                    if let Err(error) = state.sketch3d_set_dimension_value(&id, &text) {
+                        state.push_notice(format!("3D sketch dimension: {error}"));
+                    }
+                } else {
+                    state.sketch_set_dimension_value(&id, &text);
+                }
             }
             self.editing_dim = None;
         } else if cancel {
@@ -338,17 +351,27 @@ impl Viewport {
         }
 
         if let Some((id, lx, ly)) = drag_to {
-            state.sketch_dimension_drag_to(&id, lx, ly);
+            if !three_d {
+                state.sketch_dimension_drag_to(&id, lx, ly);
+            }
         }
-        if drag_ended {
+        if drag_ended && !three_d {
             state.sketch_dimension_drag_end();
         }
 
         if let Some(id) = start_edit {
             // Seed the field from the display value (diameter shows the diameter),
-            // preferring the expression when one is set.
-            let seed: serde_json::Value =
-                serde_json::from_str(&state.sketch_dimension_value_json(&id)).unwrap_or_default();
+            // preferring the expression when one is set. A 3D label carries its
+            // own value and expression.
+            let seed: serde_json::Value = if three_d {
+                labels
+                    .iter()
+                    .find(|l| l["id"].to_string() == id.to_string())
+                    .cloned()
+                    .unwrap_or_default()
+            } else {
+                serde_json::from_str(&state.sketch_dimension_value_json(&id)).unwrap_or_default()
+            };
             let text = seed
                 .get("valueExpr")
                 .and_then(|v| v.as_str())

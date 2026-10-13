@@ -98,7 +98,12 @@ impl<'a> SolidBuilder<'a> {
     /// 3D curve by projecting it onto the surface it should ride. Endpoints
     /// stay EXACTLY at the existing vertices (vendor vertices are accurate;
     /// the drift is mid-span) so shared topology and loop chaining are
-    /// untouched. Runs before any pcurve is fitted, so every face fits
+    /// untouched. A straight line whose projected locus collapses to a point
+    /// on an affine carrier retains its authored curve when that point cannot
+    /// reach its endpoints within the reconciliation band; pinning the ends
+    /// back into that collapsed locus would fold the interpolant. Endpoint
+    /// displacement alone does not prevent other edges from reconciling.
+    /// Runs before any pcurve is fitted, so every face fits
     /// against the corrected curve.
     ///
     /// **"Off the carrier" is read off the trim the face will be given, not
@@ -192,17 +197,37 @@ impl<'a> SolidBuilder<'a> {
                     if worst <= band || worst > upper_rel * scale {
                         continue;
                     }
+                    // A LINE normal to a plane projects to a point. If that
+                    // point misses an endpoint, pinning the endpoint back into
+                    // a cubic interpolant folds it. Retain the authored line
+                    // when its entire projected locus collapses within the
+                    // existing reconciliation band on an affine carrier.
+                    // Endpoint displacement ALONE must not decline repair:
+                    // curved vendor edges can need this reconciliation even
+                    // at their endpoints (ABC 00000023 otherwise gains a loop
+                    // crossing). Resolved projected loci keep the legacy path.
+                    let start = edge.curve.evaluate(edge.t0)?;
+                    let end = edge.curve.evaluate(edge.t1)?;
+                    let endpoint_miss = projected[0].sub(start).length() > band
+                        || projected[SAMPLES].sub(end).length() > band;
+                    if endpoint_miss
+                        && edge.curve.degree == 1
+                        && edge.curve.control_points.len() == 2
+                        && surface.is_affine()?
+                        && projected.iter().all(|point| point.sub(projected[0]).length() <= band)
+                    {
+                        continue;
+                    }
                     // The replacement rides the surface at every interior
                     // sample; only the endpoints are forced back onto the
-                    // existing vertices (vendor vertices are true corner
-                    // intersections, so that correction is tiny and confined
-                    // to the first/last spans). A partial blend is NOT an
+                    // existing vertices, confining their correction to the
+                    // first/last spans. A partial blend is NOT an
                     // option: any residual off-surface stretch gives the
                     // pcurve fitter an unrepresentable target and its
                     // refinement degenerates into max-insertion every round.
                     let mut reconciled = projected;
-                    reconciled[0] = edge.curve.evaluate(edge.t0)?;
-                    reconciled[SAMPLES] = edge.curve.evaluate(edge.t1)?;
+                    reconciled[0] = start;
+                    reconciled[SAMPLES] = end;
                     let replacement = crate::interpolate_curve(&reconciled, 3, &parameters)?;
                     if let Some(record) =
                         self.edges.iter_mut().find(|record| record.id == edge_id)

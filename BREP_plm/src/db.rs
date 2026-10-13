@@ -38,12 +38,6 @@
 //! further back than the log reaches is told `stale`, and its correct response
 //! is to re-read the index rather than to trust a short answer.
 //!
-//! # From the file store
-//!
-//! A data directory written before SQLite holds `plm.json` and `audit.jsonl`.
-//! [`Db::open`] imports both in one transaction into a new `plm.sqlite`, then
-//! renames them `*.migrated-<unix time>` ([`migrate_files`]).
-
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io;
@@ -84,58 +78,41 @@ pub struct Change {
 /// contains.
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct State {
-    #[serde(default)]
     pub workflows: Vec<crate::workflow::Definition>,
-    #[serde(default)]
     pub workflow_runs: Vec<crate::workflow::Run>,
-    #[serde(default)]
     pub bom_configuration: crate::bom_config::Configuration,
-    #[serde(default)]
     pub seq: u64,
-    #[serde(default)]
     pub users: Vec<User>,
     /// Browser sessions, journaled ([`crate::journal`]): one is added per
     /// sign-in, so this grows with use, and a list outside a journal costs
     /// every write O(its length).
+    // Stored separately from the metadata snapshot and restored after decoding it.
     #[serde(default)]
     pub sessions: crate::journal::Journaled<Session>,
     /// Bearer tokens for callers that are not a browser ([`ApiToken`]).
-    #[serde(default)]
     pub api_tokens: Vec<ApiToken>,
-    #[serde(default)]
     pub part_types: Vec<PartType>,
+    // Stored separately from the metadata snapshot and restored after decoding it.
     #[serde(default)]
     pub parts: Parts,
     /// The catalog tree, flat: each category names its parent.
-    #[serde(default)]
     pub categories: Vec<Category>,
     /// Who makes parts ([`Company`]); a manufacturer part names one.
-    #[serde(default)]
     pub manufacturers: Vec<Company>,
     /// Who sells parts ([`Company`]); a supplier offer names one.
-    #[serde(default)]
     pub suppliers: Vec<Company>,
     /// The administrator's policy choices ([`Settings`]).
-    #[serde(default)]
     pub settings: Settings,
-    #[serde(default)]
     pub changes: Vec<Change>,
     /// The lowest sequence the change log can still answer for completely.
     /// It moves only when [`CHANGE_LOG_LIMIT`] forces entries out, so a
     /// client is told `stale` when the log has actually DROPPED something it
     /// needed — not merely because nothing happened at the sequence it asked
     /// from, which is the ordinary case for a client that has been idle.
-    #[serde(default)]
     pub changes_from: u64,
-    /// Change orders, oldest first ([`crate::model::ChangeOrder`]).
-    #[serde(default)]
-    pub change_orders: Vec<crate::model::ChangeOrder>,
-    /// How change orders are numbered: a part type's numbering, with its own
-    /// counter ([`crate::model::default_eco_numbering`]).
-    #[serde(default)]
-    pub eco_numbering: crate::model::EcoNumbering,
     /// Every user's workspace entries ([`crate::model::WorkspaceEntry`]),
     /// in creation order.
+    // Stored separately from the metadata snapshot and restored after decoding it.
     #[serde(default)]
     pub workspace: crate::workspace::Workspace,
 }
@@ -277,16 +254,13 @@ impl Db {
         let lock = crate::dirlock::DirLock::acquire(&root)?;
         fs::create_dir_all(root.join("models"))?;
         let scripts = Scripts::new(scripts.unwrap_or_else(|| root.join("scripts")))?;
-        if let Some(report) = migrate_files(&root, false)? {
-            eprintln!("brep-plm: {report}");
-        }
         let sql = Sql::open_with(root.join(SQLITE_FILE), durability).map_err(io::Error::other)?;
         let loaded = sql.load().map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         let fresh = loaded.is_none();
         let mut state = loaded.unwrap_or_default();
         if state.parts.iter().any(|p| p.id != p.number || p.revisions.iter().any(|r| r.id != r.label)) {
             return Err(io::Error::new(io::ErrorKind::InvalidData,
-                "legacy opaque model IDs are no longer supported; stop the server and reset its data directory"));
+                "part and revision identities must match their current number and label"));
         }
         let before = sql::small_value(&mut state);
 
@@ -350,34 +324,11 @@ impl Db {
             Ok(n) => eprintln!("brep-plm: removed {n} unreferenced attachment file(s)"),
             Err(error) => eprintln!("brep-plm: could not sweep attachment files: {error}"),
         }
-        db.initialize_geometry().map_err(io::Error::other)?;
-        db.initialize_bom_occurrences().map_err(io::Error::other)?;
         db.recover_workflows().map_err(io::Error::other)?;
         Ok((db, seeded))
     }
 
-    /// Backfill derived metadata once per document hash, including released
-    /// history, without changing document bytes, lifecycle or checkout.
-    fn initialize_geometry(&self) -> Result<(), Error> {
-        let pending = self.read(|state| state.parts.iter().flat_map(|p| p.revisions.iter()
-            .filter(|r| !r.content_hash.is_empty() && r.geometry_content_hash != r.content_hash)
-            .map(|r| (p.id.clone(), r.id.clone(), r.content_hash.clone(), r.document_key(&p.id))))
-            .collect::<Vec<_>>());
-        if pending.is_empty() { return Ok(()); }
-        let mut updates = Vec::new();
-        for (part, revision, hash, key) in pending {
-            let body = self.read_document(&key)?.unwrap_or_default();
-            updates.push((part, revision, hash, crate::geometry::contains_geometry(&body)));
-        }
-        self.mutate(|state| {
-            for (part, revision, hash, geometry) in updates {
-                let r = find_revision_mut(state, &part, &revision)?.1;
-                if r.content_hash == hash { r.has_geometry = geometry; r.geometry_content_hash = hash; }
-                state.touch(crate::identity::document_key(&part, &revision));
-            }
-            Ok(())
-        })
-    }
+
 
     /// The administrator's scripts directory.
     /// The data directory.
@@ -816,111 +767,6 @@ fn restore_small(state: &mut State, before: &Value) -> Result<(), Error> {
     state.workspace = workspace;
     state.sessions = sessions;
     Ok(())
-}
-
-/// Import a file-store data directory (`plm.json`, and `audit.jsonl` if it is
-/// there) into a new `plm.sqlite`, and say what was imported.
-///
-/// Nothing happens when `plm.sqlite` already exists or there is no
-/// `plm.json`. The import is built in `plm.sqlite.migrating` in ONE
-/// transaction, and only a complete file is renamed into place; a crash
-/// before that leaves the old files untouched and the next start does it
-/// again. Afterwards the old files are renamed `<name>.migrated-<unix time>`,
-/// never deleted. A crash between those renames leaves a `plm.json` beside a
-/// finished `plm.sqlite`, which the next start moves aside.
-///
-/// With `dry_run` the import is built in a scratch file beside the data (not
-/// in it), counted, and deleted: the data directory is not changed.
-pub fn migrate_files(root: &Path, dry_run: bool) -> io::Result<Option<String>> {
-    let json = root.join("plm.json");
-    let audit_file = root.join("audit.jsonl");
-    let sqlite = root.join(SQLITE_FILE);
-    let stamp = now();
-    if sqlite.exists() {
-        if json.exists() && !dry_run {
-            let migrated = Sql::open(&sqlite).and_then(|sql| sql.meta("migrated_from")).map_err(io::Error::other)?;
-            if migrated.is_some() {
-                fs::rename(&json, root.join(format!("plm.json.migrated-{stamp}")))?;
-                if audit_file.exists() {
-                    fs::rename(&audit_file, root.join(format!("audit.jsonl.migrated-{stamp}")))?;
-                }
-                return Ok(Some("moved aside a plm.json left by an interrupted migration".into()));
-            }
-        }
-        return Ok(None);
-    }
-    if !json.exists() {
-        return Ok(None);
-    }
-    let text = fs::read_to_string(&json)?;
-    let mut state: State = serde_json::from_str(&text)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{json:?}: {e}")))?;
-    let mut events = Vec::new();
-    let mut skipped = 0usize;
-    if audit_file.exists() {
-        use std::io::BufRead;
-        for line in io::BufReader::new(fs::File::open(&audit_file)?).lines() {
-            let line = line?;
-            if line.trim().is_empty() {
-                continue;
-            }
-            match serde_json::from_str::<AuditEvent>(&line) {
-                Ok(event) => events.push(event),
-                // A torn last line from a crash: the file store skipped it
-                // on every read, and so does the import.
-                Err(_) => skipped += 1,
-            }
-        }
-    }
-    let building = if dry_run {
-        std::env::temp_dir().join(format!("brep-plm-dry-run-{}-{stamp}.sqlite", std::process::id()))
-    } else {
-        root.join("plm.sqlite.migrating")
-    };
-    let remove_building = |path: &Path| {
-        for suffix in ["", "-wal", "-shm"] {
-            let _ = fs::remove_file(format!("{}{suffix}", path.display()));
-        }
-    };
-    remove_building(&building);
-    let event_count = events.len();
-    let counts = {
-        let sql = Sql::open(&building).map_err(io::Error::other)?;
-        sql.import(&mut state, events).map_err(io::Error::other)?;
-        sql.set_meta(
-            "migrated_from",
-            &json!({ "at": stamp, "plm_json_bytes": text.len(), "audit_events": event_count, "audit_lines_skipped": skipped })
-                .to_string(),
-        )
-        .map_err(io::Error::other)?;
-        sql.checkpoint().map_err(io::Error::other)?;
-        sql.counts().map_err(io::Error::other)?
-    };
-    let summary: Vec<String> = counts.iter().map(|(table, n)| format!("{table} {n}")).collect();
-    let mut report = format!(
-        "{} plm.json{} into {}: {}",
-        if dry_run { "dry run: would import" } else { "imported" },
-        if audit_file.exists() { " and audit.jsonl" } else { "" },
-        SQLITE_FILE,
-        summary.join(", ")
-    );
-    if skipped > 0 {
-        report.push_str(&format!(" ({skipped} unreadable audit line(s) skipped)"));
-    }
-    if dry_run {
-        remove_building(&building);
-        return Ok(Some(report));
-    }
-    for suffix in ["-wal", "-shm"] {
-        let _ = fs::remove_file(format!("{}{suffix}", building.display()));
-    }
-    fs::rename(&building, &sqlite)?;
-    fs::rename(&json, root.join(format!("plm.json.migrated-{stamp}")))?;
-    if audit_file.exists() {
-        fs::rename(&audit_file, root.join(format!("audit.jsonl.migrated-{stamp}")))?;
-    }
-    report.push_str(&format!("; the old files are now *.migrated-{stamp}"));
-    Ok(Some(report))
 }
 
 /// Write `body` to `path` through a temporary file and a rename, so a reader
@@ -1513,12 +1359,7 @@ fn apply_part_fields(
     }
     if let Some(value) = fields.get("category") {
         let requested = text(value).unwrap_or_default();
-        // Re-sending the text a part already carries is not a change, so a
-        // category written before the catalog existed survives an edit of the
-        // part's name.
-        if requested != part.category {
-            part.category = known_category(categories, &requested)?;
-        }
+        part.category = known_category(categories, &requested)?;
     }
     if let Some(value) = fields.get("external_ref") {
         part.external_ref = text(value).unwrap_or_default();
@@ -1571,7 +1412,7 @@ pub struct PartFilter {
     /// tags, attribute values, and every MPN and SPN.
     pub q: String,
     /// A category id: the parts in it AND in every category beneath it.
-    /// [`UNCATEGORIZED`] selects the parts in no known category.
+    /// [`UNCATEGORIZED`] selects the parts without a category.
     pub category: String,
     /// A tag, matched whole and without regard to case.
     pub tag: String,
@@ -1805,7 +1646,7 @@ struct Matcher {
     needle: String,
     tag: String,
     /// The category ids (lower-case) a part must be in; `Some(empty)` with
-    /// `uncategorized` for "in no known category".
+    /// `uncategorized` for "without a category".
     within: Option<BTreeSet<String>>,
     uncategorized: bool,
     /// `Some(None)`: the filter names a company that does not exist, which
@@ -1856,7 +1697,7 @@ impl Matcher {
     fn matches(&self, categories: &[Category], part: &Part) -> bool {
         (match &self.within {
             None => true,
-            Some(_) if self.uncategorized => catalog::find(categories, &part.category).is_none(),
+            Some(_) if self.uncategorized => part.category.is_empty(),
             Some(ids) => ids.contains(&part.category.to_ascii_lowercase()),
         }) && (self.tag.is_empty() || part.tags.iter().any(|t| t.eq_ignore_ascii_case(&self.tag)))
             && (match &self.manufacturer {
@@ -1876,8 +1717,8 @@ impl Matcher {
     }
 }
 
-/// The `category` filter value that selects parts in no known category —
-/// empty, or text from before the catalog that names no category.
+/// The `category` filter value that selects parts without a category —
+/// an empty category.
 pub const UNCATEGORIZED: &str = "_none";
 
 impl Db {
@@ -2120,12 +1961,6 @@ impl Db {
             return self.submit_for_review(user, part_id, revision_id, &crate::review::Submission::default());
         }
 
-        // A revision an open change order names is released (or obsoleted)
-        // through it — refused alone when the administrator says so.
-        if matches!(to, Lifecycle::Released | Lifecycle::Obsolete) {
-            self.read(|state| eco_hold_gate(state, part_id, revision_id, to))?;
-        }
-
         // The before-release gate, on a snapshot. Refusals the locked write
         // would make anyway are made first, so a script is never asked about
         // a release that cannot happen.
@@ -2175,9 +2010,6 @@ impl Db {
                 if !field_problems.is_empty() { return Err(Error::conflict(field_problems.join("; "))); }
                 children_gate(state, part, revision)?;
                 review_gate(state, part, revision)?;
-            }
-            if matches!(to, Lifecycle::Released | Lifecycle::Obsolete) {
-                eco_hold_gate(state, part_id, revision_id, to)?;
             }
             let (_, revision) = find_revision_mut(state, part_id, revision_id)?;
             lifecycle::check_transition(revision.lifecycle, to).map_err(Error::conflict)?;
@@ -2229,14 +2061,6 @@ impl Db {
         })?;
 
         let mut warnings = Vec::new();
-        if matches!(to, Lifecycle::Released | Lifecycle::Obsolete) {
-            if let Some(number) = self.read(|state| crate::eco::standalone_holder(state, part_id, revision_id).map(|e| e.number.clone())) {
-                warnings.push(format!(
-                    "{} outside {number}, which names this revision — that change order will not release until the item is removed",
-                    if to == Lifecycle::Released { "released" } else { "obsoleted" }
-                ));
-            }
-        }
         if to == Lifecycle::Draft {
             warnings.extend(self.review_withdrawn(user, part_id, revision_id));
         }
@@ -2495,26 +2319,6 @@ fn catalog_gate(categories: &[Category], part: &Part) -> Result<(), Error> {
         part.number,
         problems.join("; ")
     )))
-}
-
-/// Refuse a release while something the revision uses is not Released —
-/// only when the administrator has turned
-/// [`Settings::require_released_children`] on. Every child is named at once.
-/// With [`Settings::eco_holds_revisions`] on, a revision an open change
-/// order names is released and obsoleted only through it.
-fn eco_hold_gate(state: &State, part_id: &str, revision_id: &str, to: Lifecycle) -> Result<(), Error> {
-    if !state.settings.eco_holds_revisions {
-        return Ok(());
-    }
-    match crate::eco::standalone_holder(state, part_id, revision_id) {
-        Some(eco) => Err(Error::conflict(format!(
-            "this revision is in {} ({}) — {} it through the change order, or take it out of there first",
-            eco.number,
-            eco.state.as_str(),
-            if to == Lifecycle::Released { "release" } else { "obsolete" }
-        ))),
-        None => Ok(()),
-    }
 }
 
 /// A revision whose review rule is not met cannot release ([`crate::review`]).

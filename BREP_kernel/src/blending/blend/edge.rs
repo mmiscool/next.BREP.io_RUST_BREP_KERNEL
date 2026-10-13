@@ -19,6 +19,7 @@ pub(super) use support::{
 };
 pub(super) use support::{locate_end_corner, resolve_free_end, splice_end_corner, RIM_MARGIN};
 pub(super) use support::trim_parameter_at_point;
+pub(super) use closed::{refit_closed_support_pcurve, replace_rim_in_face, trim_seam_edges};
 pub(crate) use support::{
     consumed_band, is_consumed_snap, is_rail_collapse, RAIL_COLLAPSE_UNSUPPORTED, RAIL_COLLAPSE_WHAT,
 };
@@ -26,7 +27,7 @@ pub(super) use support::BLEND_WIDER_THAN_FACE;
 pub(super) use support::check_snap_closure;
 pub(super) use open::{build_open_surgery, fresh_id_source, prune_orphan_vertices};
 pub(super) use open::{
-    acceptance_deficit, junction_stencil, open_wall_readings_why, read_on_stencil, rails_on_shipped_windows, shipped_window, OpenRungReading, OPEN_REQUEST_RUNGS,
+    acceptance_deficit, exact_extrusion_wall_readings, junction_stencil, open_wall_readings_why, read_on_stencil, rails_on_shipped_windows, shipped_window, OpenRungReading, OPEN_REQUEST_RUNGS,
     OPEN_WALL_CENTRES,
 };
 pub(super) use support::{
@@ -34,6 +35,8 @@ pub(super) use support::{
     march_open_stations_core, march_open_stations_ending, open_station_parameters, pole_end, rails_off_carriers,
     vertex_stations, OpenDenseCentres,
 };
+pub(super) use support::{exact_revolution_rows, revolution_lane_axis, ExactRevolution};
+pub(super) use open::exact_revolution_wall_readings;
 
 
 

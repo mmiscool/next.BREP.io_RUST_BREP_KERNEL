@@ -1,5 +1,10 @@
 <svg xmlns="http://www.w3.org/2000/svg" xmlns:brep="https://brep.io/icons"
-     viewBox="0 0 1233 2384" width="1233" height="2384" brep:glyph-name="icon_feat_sm_flange" brep:unicode="E048">
-  <path d="M196 1597L866 1597L866 1505L196 1505Z" fill="#5c86a6"/>
-  <path d="M912 1551L912 891L820 891L820 1551Z" fill="#2fa469"/>
+     viewBox="0 0 24 24" width="24" height="24" brep:glyph-name="icon_feat_sm_flange" brep:unicode="E048">
+  <!-- A new upright wall bent from the far edge of a flat plate. -->
+  <g stroke-width="1.2" stroke-linejoin="round">
+    <path d="M2 14 14 8 22 13 10 19Z" fill="#bcd7e8" stroke="#2b4c63"/>
+    <path d="M2 14V16L10 21 22 15V13L10 19Z" fill="#5c86a6" stroke="#2b4c63"/>
+    <path d="M14 8V2L22 7V13Z" fill="#a5e8c4" stroke="#125236"/>
+    <path d="M14 8 22 13" style="fill:none" stroke="#2fa469" stroke-width="2"/>
+  </g>
 </svg>

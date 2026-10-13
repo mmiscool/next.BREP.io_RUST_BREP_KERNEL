@@ -378,6 +378,9 @@ pub fn enforce_reference_fence(
     if matches!(
         feature_type,
         "S" | "SKETCH"
+            | "S3D"
+            | "SKETCH3D"
+            | "3D SKETCH"
             | "D"
             | "DATUM"
             | "DATIUM"

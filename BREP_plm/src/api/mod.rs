@@ -29,7 +29,6 @@ pub mod preferences;
 pub mod review;
 pub mod scripts;
 pub mod credentials;
-pub mod eco;
 pub mod settings;
 pub mod setup;
 pub mod workflow;
@@ -139,19 +138,6 @@ pub fn router(db: Shared) -> Router {
         .route("/api/parts/:id/revisions/:rev/review/decision", post(review::decide))
         .route("/api/parts/:id/revisions/:rev/comments", post(review::comment))
         .route("/api/inbox", get(review::inbox))
-        // -- change orders -------------------------------------------------
-        .route("/api/ecos", get(eco::list).post(eco::create))
-        .route("/api/ecos/numbering", get(eco::numbering).patch(eco::set_numbering))
-        .route("/api/ecos/:id", get(eco::get).patch(eco::update))
-        .route("/api/ecos/:id/items", post(eco::add_item))
-        .route("/api/ecos/:id/items/:rev", delete(eco::remove_item))
-        .route("/api/ecos/:id/submit", post(eco::submit))
-        .route("/api/ecos/:id/withdraw", post(eco::withdraw))
-        .route("/api/ecos/:id/cancel", post(eco::cancel))
-        .route("/api/ecos/:id/release", post(eco::release))
-        .route("/api/ecos/:id/review", patch(eco::change_review))
-        .route("/api/ecos/:id/review/decision", post(eco::decide))
-        .route("/api/ecos/:id/comments", post(eco::comment))
         // -- assembly structure: uses lists, BOMs and where-used -----------
         .route(
             "/api/parts/:id/revisions/:rev/uses",

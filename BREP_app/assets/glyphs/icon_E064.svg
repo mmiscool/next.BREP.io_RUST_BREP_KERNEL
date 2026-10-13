@@ -1,3 +1,11 @@
-<svg xmlns="http://www.w3.org/2000/svg" xmlns:brep="https://brep.io/icons" viewBox="0 0 24 24" brep:glyph-name="icon_workbench_assembly" brep:unicode="E064">
-  <path d="M8 2 15 6 8 10 1 6Z" fill="#93c5fd"/><path d="M1 6 8 10 15 6V14L8 18 1 14Z" fill="#3b82f6"/><path d="M16 9 23 13 16 17 9 13Z" fill="#fde68a"/><path d="M9 13 16 17 23 13V20L16 24 9 20Z" fill="#f59e0b"/>
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:brep="https://brep.io/icons"
+     viewBox="0 0 24 24" width="24" height="24" brep:glyph-name="icon_workbench_assembly" brep:unicode="E064">
+  <!-- Assembly workbench: placed solid instances in the shared oblique projection. -->
+  <path d="M1 6 7 3 11 6 5 9Z" fill="#ffd977" stroke="#7a4d10" stroke-width="1.2" stroke-linejoin="round"/>
+  <path d="M1 6 5 9V16L1 13Z" fill="#f0b840" stroke="#7a4d10" stroke-width="1.2" stroke-linejoin="round"/>
+  <path d="M5 9 11 6V13L5 16Z" fill="#d4901f" stroke="#7a4d10" stroke-width="1.2" stroke-linejoin="round"/>
+  <path d="M12 11 18 8 22 11 16 14Z" fill="#c9b6f0" stroke="#3d2a6b" stroke-width="1.2" stroke-linejoin="round"/>
+  <path d="M12 11 16 14V21L12 18Z" fill="#8b6fd4" stroke="#3d2a6b" stroke-width="1.2" stroke-linejoin="round"/>
+  <path d="M16 14 22 11V18L16 21Z" fill="#8b6fd4" stroke="#3d2a6b" stroke-width="1.2" stroke-linejoin="round"/>
+  <path d="M7 3 12 1 20 7M18 5 20 7 21 4" style="fill:none" stroke="#3d86c4" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
 </svg>

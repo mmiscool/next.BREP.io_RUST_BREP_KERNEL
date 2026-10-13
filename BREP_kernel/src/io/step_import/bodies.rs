@@ -299,6 +299,9 @@ pub(super) struct ImportedBodies {
     /// counted in `failed`, never a whole-file refusal, skipped on an
     /// opportunistic sheet exactly as their text was.
     pub(super) failed_refusals: Vec<KernelRefusal>,
+    /// Open surface-model sheets skipped at the skip arms below: not solids,
+    /// so not in `failed`, but no longer uncounted (`SHEETS_SKIPPED`).
+    pub(super) sheets_skipped: usize,
 }
 
 /// [`shell_face_refs`] for the PMI reader (a sibling module).
@@ -369,6 +372,7 @@ pub(super) fn collect_step_solids(text: &str) -> Result<ImportedBodies, String> 
                 failed: occurrences.failed,
                 first_error: occurrences.first_error,
                 stated_precisions_mm,
+                sheets_skipped: occurrences.sheets_skipped,
             });
         }
         refused = occurrences.refusals;
@@ -423,6 +427,7 @@ pub(super) fn collect_step_solids(text: &str) -> Result<ImportedBodies, String> 
     let mut closure_notes = Vec::new();
     let mut refused_bodies = Vec::new();
     let mut failed_refusals = Vec::new();
+    let mut sheets_skipped = 0usize;
     // A mapping the structure lane refused, on a file whose structure yielded no
     // positioned solid at all: the bodies below come in UNPLACED, and the refusal
     // is what says why one of them is not where the file put it.
@@ -451,8 +456,9 @@ pub(super) fn collect_step_solids(text: &str) -> Result<ImportedBodies, String> 
                 closure_notes.push(readings.closure);
             }
             // An open surface-model sheet is not a solid: skip it, whether its
-            // builder said so in text or, since 2026-10-03, in a typed class.
-            Err(error) if opportunistic && !error.closure_refusal() => {}
+            // builder said so in text or, since 2026-10-03, in a typed class;
+            // counted since 2026-10-12 (`SHEETS_SKIPPED`), never failed.
+            Err(error) if opportunistic && !error.closure_refusal() => sheets_skipped += 1,
             Err(error) => {
                 // A closure refusal counts on an opportunistic shell too: it
                 // reached the gate, so it closed topologically and built as a
@@ -483,6 +489,7 @@ pub(super) fn collect_step_solids(text: &str) -> Result<ImportedBodies, String> 
         closure_notes,
         refused_bodies,
         failed_refusals,
+        sheets_skipped,
     })
 }
 
@@ -1117,6 +1124,9 @@ pub(super) struct AssemblyResult {
     /// the assembly branch for want of a positioned solid.
     refusals: Vec<StepMappedItemError>,
     debug: Vec<String>,
+    /// Open surface-model sheet part bodies skipped, once per PART however
+    /// many occurrences place it (`SHEETS_SKIPPED`).
+    sheets_skipped: usize,
 }
 
 /// The assembly ROOTS: products that appear as an edge parent but never as an
@@ -1240,6 +1250,7 @@ pub(super) fn resolve_assembly(
         refused_bodies: Vec::new(),
         failed_refusals: Vec::new(),
         debug: Vec::new(),
+        sheets_skipped: 0,
     };
     // A refused mapping — a singular mapping transform, the only kind
     // `mapped.rs` will not instantiate — is one placement that did not come in,
@@ -1257,6 +1268,9 @@ pub(super) fn resolve_assembly(
     let mut solid_cache: HashMap<StepBody, Result<(BrepSolid, BodyAppearance, Vec<usize>), StepBodyError>> =
         HashMap::default();
     let debug_on = std::env::var("BREP_DEBUG_STEP_ASM").is_ok();
+    // Sheet part bodies already counted as skipped: once per part, like the
+    // refusal lists below, not once per placement.
+    let mut skipped_sheets: HashSet<StepBody> = HashSet::default();
 
     walk_occurrences(resolver, edges, &transforms, |node| {
         // Emit this product's own solids (leaf parts carry geometry; a pure
@@ -1280,10 +1294,14 @@ pub(super) fn resolve_assembly(
                 // An OPEN SHELL_BASED_SURFACE_MODEL sheet is not a solid body, so
                 // (as in the flat path) its build failure is skipped rather than
                 // counted against the genuine solid bodies — in text or typed,
-                // the closure gate's refusal excepted.
+                // the closure gate's refusal excepted. Counted as a skipped
+                // sheet once per part (`SHEETS_SKIPPED`).
                 Err(error)
                     if matches!(body, StepBody::SurfaceModelShell { .. }) && !error.closure_refusal() =>
                 {
+                    if skipped_sheets.insert(body) {
+                        result.sheets_skipped += 1;
+                    }
                     continue
                 }
                 Err(error) => {

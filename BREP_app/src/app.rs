@@ -34,6 +34,7 @@ use crate::panels::info_windows::InfoWindows;
 use crate::panels::scene::ScenePanel;
 use crate::panels::selection::SelectionPanel;
 use crate::panels::sketch::SketchPanel;
+use crate::panels::sketch3d::Sketch3dPanel;
 use crate::panels::part_properties::PartPropertiesPanel;
 use crate::panels::settings::SettingsPanel;
 use crate::panels::toasts::Toasts;
@@ -207,8 +208,10 @@ pub struct BrepApp {
     /// + circle to the `set_overlay` channel colored by solver mobility, and shows
     /// the DOF status readout. The engine-native sketcher's foundation surface.
     sketch: SketchPanel,
+    sketch3d: Sketch3dPanel,
     /// Special-mode EXIT controls (Finish/Cancel), always pinned to the top-right
-    /// corner — reference-selection, sketch mode, and any future special mode.
+    /// corner — a card-based reference pick, sketch mode, and any future
+    /// special mode. A form field's pick draws no card: its field is the UI.
     mode_bar: ModeBar,
     /// Transient toast overlay: drains the engine's queued notices each frame
     /// (e.g. a sketch solve that failed after an edit) and shows each briefly.
@@ -604,6 +607,7 @@ impl BrepApp {
             selection: SelectionPanel::new(),
             context_bar: ContextBarPanel::new(),
             sketch: SketchPanel::new(),
+            sketch3d: Sketch3dPanel::new(),
             mode_bar: ModeBar::new(),
             toasts: Toasts::new(),
             busy: crate::panels::busy::BusyIndicator::new(),
@@ -731,13 +735,40 @@ impl BrepApp {
         if crate::javascript::JavaScriptEditor::editing_source(ctx) {
             return;
         }
-        let (redo, undo, esc) = ctx.input_mut(|i| {
+        let sketching_3d = self.docs.engine().sketch3d_mode();
+        let (redo, undo, esc, tab) = ctx.input_mut(|i| {
             let redo = i.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::Z)
                 || i.consume_key(Modifiers::COMMAND, Key::Y);
             let undo = i.consume_key(Modifiers::COMMAND, Key::Z);
             let esc = keys_free && i.consume_key(Modifiers::NONE, Key::Escape);
-            (redo, undo, esc)
+            // Tab cycles the 3D sketch's working plane; outside that mode it
+            // stays egui's focus key.
+            let tab = sketching_3d && keys_free && i.consume_key(Modifiers::NONE, Key::Tab);
+            (redo, undo, esc, tab)
         });
+        // The 3D sketch editor: the same per-session undo routing as the
+        // planar one; Esc drops the armed tool's pending clicks first and the
+        // tool itself second.
+        if sketching_3d {
+            if redo {
+                self.docs.engine_mut().sketch3d_redo();
+            }
+            if undo {
+                self.docs.engine_mut().sketch3d_undo();
+            }
+            if esc {
+                let engine = self.docs.engine_mut();
+                if engine.sketch3d_pending_len() > 0 {
+                    engine.sketch3d_tool_cancel();
+                } else {
+                    let _ = engine.sketch3d_set_tool(Some("select"));
+                }
+            }
+            if tab {
+                self.docs.engine_mut().sketch3d_cycle_work_plane();
+            }
+            return;
+        }
         // While editing a sketch, Ctrl+Z / Ctrl+Shift+Z drive the PER-SESSION sketch
         // history (S6a), not the model-level undo — this global router consumes the
         // keys first (before the viewport), so it must intercept here. Esc drops the
@@ -806,6 +837,34 @@ impl BrepApp {
                 return;
             }
             self.docs.engine_mut().clear_selection();
+        }
+    }
+
+    /// A FORM FIELD's reference pick, settled at the end of the frame (after
+    /// the dock has drawn every pane, the viewport's click included):
+    ///
+    /// * a SINGLE-valued field finishes on its first pick — there is nothing
+    ///   left to wait for, and the feature's result appears at once;
+    /// * a form that asked for the pick to end (`ref_select_request_finish`:
+    ///   an edit elsewhere on a feature's form) gets it now, after the frame's
+    ///   viewport click has landed in the pick;
+    /// * a pick NO form claimed this frame (`ref_select_claim`) is finished:
+    ///   its pane was tabbed away, closed, or its subject is gone, and a pick
+    ///   with no field on screen has nothing to end it.
+    ///
+    /// Card-based picks are not this method's: their card is always on screen.
+    fn settle_form_pick(&mut self) {
+        let engine = self.docs.engine_mut();
+        let Some(field) = engine.ref_select_field() else {
+            return;
+        };
+        if !engine.ref_select_in_form() {
+            return;
+        }
+        let claimed = engine.ref_select_take_claim();
+        let single_done = !field.multiple && field.picks > 0;
+        if single_done || engine.ref_select_finish_requested() || !claimed {
+            engine.finish_ref_select();
         }
     }
 
@@ -1169,6 +1228,17 @@ impl BrepApp {
             engine.sketch_set_tool(Some(if armed { "select" } else { tool }));
             return true;
         }
+        // The 3D sketch's tools and working-plane radio, shared the same way.
+        if let Some(tool) = crate::workbench::sketch3d::draw_tool(id) {
+            let engine = self.docs.engine_mut();
+            let armed = engine.sketch3d_active_tool().unwrap_or("select") == tool;
+            let _ = engine.sketch3d_set_tool(Some(if armed { "select" } else { tool }));
+            return true;
+        }
+        if let Some(plane) = crate::workbench::sketch3d::work_plane(id) {
+            let _ = self.docs.engine_mut().sketch3d_set_work_plane(plane);
+            return true;
+        }
         match id {
             // The sketch strip's one-shot action, now the row's: infer the
             // constraints the rough-in geometry already implies.
@@ -1293,6 +1363,8 @@ impl eframe::App for BrepApp {
         crate::plm::native::run_pending();
         // A PLM save made mid-rebuild is pictured once its run lands.
         crate::plm::thumbnail::tick(|id| self.docs.iter().find(|d| d.id() == id).map(|d| &d.engine));
+        // The File menu's recent-file pictures that finished since last frame.
+        crate::plm::thumbnail::persist_recent(self.model_store.as_ref());
 
         // --- global keyboard shortcuts (undo/redo/clear-selection) ------------
         // Handled before any panel draws so a Ctrl+Z etc. this frame takes effect
@@ -1575,7 +1647,7 @@ impl eframe::App for BrepApp {
         self.plugins.active_document = self.docs.active_id();
         self.plugins.show(&ctx, self.docs.engine_mut(), self.model_store.as_ref());
         self.javascript.show(&ctx, &mut self.docs, self.model_store.as_ref());
-        // An inbox row opens its review or change order in the PLM pane.
+        // An inbox row opens its review in the PLM pane.
         for event in toolbar_outcome.plm_review {
             self.plm.open_review(event);
         }
@@ -1712,6 +1784,11 @@ impl eframe::App for BrepApp {
                             // click a phantom rect for an off-screen widget).
                             self.selection.clear_hits();
                             self.sketch.show_status_bar(ui, self.docs.engine_mut());
+                        } else if self.docs.engine().sketch3d_mode() {
+                            // The 3D sketch's status row: DOF, selection, the
+                            // working plane in force and what the last click hit.
+                            self.selection.clear_hits();
+                            self.sketch3d.show_status_bar(ui, self.docs.engine_mut());
                         } else if crate::workbench::ecad::Target::of_workbench(&self.docs.engine().settings.workbench).is_some() {
                             // An eCAD editor owns the central tile, and a click there
                             // picks nothing 3D: the pickable-kinds filter would be a
@@ -1752,8 +1829,14 @@ impl eframe::App for BrepApp {
         // top-right mode card own those flows). Drawing the viewport HERE — before
         // the top-right overlay below — keeps `viewport.last_rect()` current-frame
         // so the overlay anchors to the live 3D-view rect with no lag.
-        let sketch = self.docs.engine().sketch_mode();
-        let ref_select = self.docs.engine().ref_select_active();
+        let sketch = self.docs.engine().any_sketch_mode();
+        // Only a CARD-based pick (a connection point's seat, a spline anchor's
+        // port) takes the shell over. A FORM FIELD's pick — a feature's, a
+        // constraint's, an annotation's, a sheet object's — keeps the dock: the
+        // field is drawn focused in its own pane and the picks go to it, the
+        // way other CAD applications keep the dialog up while you click in the
+        // view (`EngineState::ref_select_in_form`).
+        let modal_pick = self.docs.engine().ref_select_modal();
 
         if sketch {
             // Sketch entity lists (Curves / Points / Constraints) + solver
@@ -1764,7 +1847,11 @@ impl eframe::App for BrepApp {
                 .default_size(300.0)
                 .size_range(200.0..=560.0)
                 .show(ui, |ui| {
-                    self.sketch.show_entity_lists(ui, self.docs.engine_mut());
+                    if self.docs.engine().sketch3d_mode() {
+                        self.sketch3d.show_entity_lists(ui, self.docs.engine_mut());
+                    } else {
+                        self.sketch.show_entity_lists(ui, self.docs.engine_mut());
+                    }
                 });
         }
 
@@ -1806,7 +1893,7 @@ impl eframe::App for BrepApp {
         if let Some(next) = self.plm.next_follow_in() {
             ui.ctx().request_repaint_after(std::time::Duration::from_secs_f64(next.max(0.1)));
         }
-        if sketch || ref_select {
+        if sketch || modal_pick {
             // Special mode: the viewport fills the remaining central area; no
             // dock, no modeling side panes — and therefore no DOCUMENT TAB
             // STRIP either, which is the guard that keeps a live sketch /
@@ -1858,6 +1945,11 @@ impl eframe::App for BrepApp {
                 },
             );
 
+            // A form field's pick, settled for the frame: finished when its
+            // single field has its one pick, when its form asked (an edit
+            // elsewhere on it), or when no form drew it.
+            self.settle_form_pick();
+
             // The ACOMP palette pick must open the COMPONENT SELECTOR, never a
             // bare feature dialog — the file dialog is shell-owned.
             if outcome.insert_component_requested {
@@ -1870,6 +1962,14 @@ impl eframe::App for BrepApp {
             // The DOCUMENT TAB STRIP inside the viewport tile. Activation is
             // immediate; a close routes through the file dialog because a dirty
             // document has to be confirmed first, and that prompt lives there.
+            // A pick runs in ONE document's engine: switching or closing a
+            // document commits a form field's pick first, so it is never left
+            // running in a document that is no longer on screen.
+            if outcome.document_tabs.activate.is_some() || outcome.document_tabs.close.is_some() {
+                if self.docs.engine().ref_select_in_form() {
+                    self.docs.engine_mut().finish_ref_select();
+                }
+            }
             if let Some(index) = outcome.document_tabs.activate {
                 self.docs.activate(index);
             }
@@ -2020,6 +2120,8 @@ impl eframe::App for BrepApp {
                     // modeling selection actions. Same rail, mode-appropriate items.
                     if self.docs.engine().sketch_mode() {
                         self.sketch.context_card(ui, self.docs.engine_mut());
+                    } else if self.docs.engine().sketch3d_mode() {
+                        self.sketch3d.context_card(ui, self.docs.engine_mut());
                     } else {
                         let outcome = self.context_bar.card(ui, self.docs.engine_mut());
                         focus = outcome.focus;
@@ -2181,7 +2283,7 @@ impl eframe::App for BrepApp {
             // The PLM pane (a PLM session only): its sections' widget rects,
             // `plm/section:<id>` and `plm/<section>:<widget>`, and the active
             // document's access and revision.
-            crate::automation::registry::publish("__brepPlmHit", "PLM pane rects: section:lifecycle, lifecycle:revision:<label>, lifecycle:verb:check-out, save:<yes|no|remember>, web:<summary|revisions|attachments|structure|history|parts|workspace|reviews|ecos>", &self.plm.hits_json());
+            crate::automation::registry::publish("__brepPlmHit", "PLM pane rects: section:lifecycle, lifecycle:revision:<label>, lifecycle:verb:check-out, save:<yes|no|remember>, web:<summary|revisions|attachments|structure|history|parts|workspace|reviews>", &self.plm.hits_json());
             crate::automation::registry::publish("__brepPlmDoc", "the active document on the PLM: {access:{editable, reason}, plmDocument, revision:{id,label,lifecycle,lockedBy,lockedByMe}, busy, message, offered:[verb key], files:{staged:{name,mediaType,kind,size,target}, revision:[name], part:[name], problem, notice, status, busy}}; null with no PLM session", &self.plm.state_json(&self.docs));
             // The queued toast texts — the only trace of a refusal the app shows
             // as a transient card (e.g. a constraint the strip could not add).
@@ -2268,13 +2370,29 @@ impl eframe::App for BrepApp {
             crate::automation::registry::publish("__brepSketch", "sketch mode state (session, tool, selection, constraints)", &self.sketch.published_json(self.docs.engine()));
             crate::automation::registry::publish("__brepSketchHit", "sketch-mode overlay widget rects: the SKETCH ACTIONS card (constraint:glyph fix construction cleanup delete) \u{2014} empty out of sketch mode. The draw tools are NOT here: they are workbench buttons in the toolbar row (toolbar/workbench:btn:sketch.tool.* and sketch.autoconstrain)", &self.sketch.hits_json(self.docs.engine()));
             crate::automation::registry::publish("__brepSketchListHit", "sketch entity-list widget rects: section:* geometry:id point:id constraint:id del:kind:id panel:clip (empty out of sketch mode)", &self.sketch.list_hits_json(self.docs.engine()));
+            crate::automation::registry::publish("__brepSketch3d", "3D sketch mode state: {sketch3dMode, featureId, dof, status, conflicting, tool, workPlane, workPlaneAnchor, pointCount, geometryCount, constraintCount, pendingLen, selection, applicableConstraints, dimensions, externalRefs, lastHit, canUndo, canRedo, entities}", &self.sketch3d.published_json(self.docs.engine()));
+            crate::automation::registry::publish("__brepSketch3dHit", "3D sketch-mode overlay widget rects: the 3D SKETCH ACTIONS card (constraint:type fix construction delete) \u{2014} empty out of 3D sketch mode. The draw tools and the working-plane radio are workbench buttons in the toolbar row (toolbar/workbench:btn:sketch3d.tool.* and sketch3d.plane.*)", &self.sketch3d.hits_json(self.docs.engine()));
+            crate::automation::registry::publish("__brepSketch3dListHit", "3D sketch entity-list widget rects: section:* geometry:id point:id constraint:id del:kind:id reference:name unlink:name panel:clip (empty out of 3D sketch mode)", &self.sketch3d.list_hits_json(self.docs.engine()));
             crate::automation::registry::publish("__brepWireframe", "wireframe toggle", &format!("{}", self.docs.engine().settings.wireframe));
-            crate::automation::registry::publish("__brepRefSelect", "reference-selection picker {active, prompt, names}",
-                &serde_json::json!({
-                    "active": self.docs.engine().ref_select_active(),
-                    "prompt": self.docs.engine().ref_select_prompt(),
-                    "names": self.docs.engine().ref_select_names(),
-                })
+            // The pick's `subject` and `path` name the FORM FIELD it runs in
+            // (`<panel>/field:<path>#activate` is that field's button, Done
+            // while the pick runs); `inForm` is false for the card-based
+            // picks, whose controls are `modebar/refsel:*`.
+            crate::automation::registry::publish("__brepRefSelect", "reference-selection pick {active, prompt, names, subject, path, multiple, picks, inForm}",
+                &{
+                    let engine = self.docs.engine();
+                    let field = engine.ref_select_field();
+                    serde_json::json!({
+                        "active": engine.ref_select_active(),
+                        "prompt": engine.ref_select_prompt(),
+                        "names": engine.ref_select_names(),
+                        "subject": field.as_ref().map(|f| f.subject.clone()),
+                        "path": field.as_ref().map(|f| f.path.join(".")),
+                        "multiple": field.as_ref().map(|f| f.multiple),
+                        "picks": field.as_ref().map(|f| f.picks),
+                        "inForm": engine.ref_select_in_form(),
+                    })
+                }
                 .to_string(),
             );
             // Viewport origin + projected probe points (viewport-local logical
@@ -2288,7 +2406,7 @@ impl eframe::App for BrepApp {
             // can see which side panels are on-screen and, once a user tabs panels
             // together, activate the right tab before asserting on its widgets.
             // `active=false` in sketch / ref-select (the dock is bypassed).
-            crate::automation::registry::publish("__brepDock", "dock layout in tab-strip order: per-pane visible/activeTab/rendered", &self.dock.state_json(!sketch && !ref_select));
+            crate::automation::registry::publish("__brepDock", "dock layout in tab-strip order: per-pane visible/activeTab/rendered", &self.dock.state_json(!sketch && !modal_pick));
             crate::automation::registry::publish("__brepProbe", "projected seed-model probe points (viewport-local px) for the verifier",
                 &self
                     .docs

@@ -1,5 +1,67 @@
 use super::*;
 use super::bridge::point_in_polygon;
+use rustc_hash::{FxHashMap, FxHashSet};
+
+/// Parameter-space box of a ring, `[u_min, u_max, v_min, v_max]`.
+fn ring_box(ring: &[FaceVertex]) -> [f64; 4] {
+    ring.iter().fold(
+        [f64::INFINITY, f64::NEG_INFINITY, f64::INFINITY, f64::NEG_INFINITY],
+        |[u0, u1, v0, v1], vertex| {
+            [
+                u0.min(vertex.uv[0]),
+                u1.max(vertex.uv[0]),
+                v0.min(vertex.uv[1]),
+                v1.max(vertex.uv[1]),
+            ]
+        },
+    )
+}
+
+/// True when the two boxes are separated by more than `margin` on some axis.
+fn boxes_apart(a: [f64; 4], b: [f64; 4], margin: f64) -> bool {
+    a[1] + margin < b[0] || b[1] + margin < a[0] || a[3] + margin < b[2] || b[3] + margin < a[2]
+}
+
+/// Which hole rings a point can lie in: the rings whose box, grown by a
+/// rounding margin, holds it. `point_in_polygon` is exactly false outside
+/// the grown box — above or below the ring no edge straddles the ray's
+/// height; right of it every straddling edge's crossing lies left of the
+/// point (the crossing is an interpolation between the edge's ends, which
+/// rounds past their larger abscissa by ulps, inside the margin); left of it
+/// every straddling edge counts, and a closed ring straddles a height an
+/// even number of times — so skipping those rings answers the same boolean.
+/// The plate's planar faces asked all 37 rings about each of 1 226 centroids
+/// (the acceptance lane's remaining cost).
+pub(in crate::watertight_tessellation) struct HoleBoxes {
+    boxes: Vec<[f64; 4]>,
+    margin: f64,
+}
+
+impl HoleBoxes {
+    pub(in crate::watertight_tessellation) fn new(holes: &[Vec<FaceVertex>]) -> Self {
+        let boxes: Vec<[f64; 4]> = holes.iter().map(|hole| ring_box(hole)).collect();
+        let magnitude = boxes
+            .iter()
+            .flat_map(|b| b.iter().map(|value| value.abs()))
+            .fold(0.0f64, f64::max);
+        Self {
+            boxes,
+            margin: 64.0 * f64::EPSILON * magnitude.max(1e-300),
+        }
+    }
+
+    /// `holes.iter().any(|hole| point_in_polygon(hole, p))`, asking only the
+    /// rings whose grown box holds `p`.
+    pub(in crate::watertight_tessellation) fn any_contains(&self, holes: &[Vec<FaceVertex>], p: [f64; 2]) -> bool {
+        self.boxes.iter().zip(holes).any(|(b, hole)| {
+            p[0] >= b[0] - self.margin
+                && p[0] <= b[1] + self.margin
+                && p[1] >= b[2] - self.margin
+                && p[1] <= b[3] + self.margin
+                && point_in_polygon(hole, p)
+        })
+    }
+}
 
 pub(in crate::watertight_tessellation) fn certified_planar_trim(
     v: &[FaceVertex],
@@ -7,6 +69,7 @@ pub(in crate::watertight_tessellation) fn certified_planar_trim(
     outer: &[FaceVertex],
     holes: &[Vec<FaceVertex>],
 ) -> bool {
+    tess_profile(|p| p.certify_calls += 1);
     if ts.is_empty() {
         return false;
     }
@@ -29,8 +92,9 @@ pub(in crate::watertight_tessellation) fn certified_planar_trim(
     type K = (u64, u64);
     let key = |p: &FaceVertex| (p.uv[0].to_bits(), p.uv[1].to_bits());
     let ek = |a: K, b: K| if a <= b { (a, b) } else { (b, a) };
-    let mut boundary = HashSet::new();
-    let mut directed_boundary = HashSet::new();
+    let hole_boxes = HoleBoxes::new(holes);
+    let mut boundary = FxHashSet::default();
+    let mut directed_boundary = FxHashSet::default();
     for ring in std::iter::once(outer).chain(holes.iter().map(Vec::as_slice)) {
         for i in 0..ring.len() {
             let edge = (key(&ring[i]), key(&ring[(i + 1) % ring.len()]));
@@ -40,9 +104,9 @@ pub(in crate::watertight_tessellation) fn certified_planar_trim(
         }
     }
     let mut area = 0.0;
-    let mut edges = HashMap::new();
-    let mut directed_edges = HashMap::new();
-    let mut unique = HashSet::new();
+    let mut edges = FxHashMap::default();
+    let mut directed_edges = FxHashMap::default();
+    let mut unique = FxHashSet::default();
     for &[a, b, c] in ts {
         if a >= v.len() || b >= v.len() || c >= v.len() {
             return false;
@@ -59,7 +123,8 @@ pub(in crate::watertight_tessellation) fn certified_planar_trim(
                 (uv[0][0] + uv[1][0] + uv[2][0]) / 3.0,
                 (uv[0][1] + uv[1][1] + uv[2][1]) / 3.0,
             ];
-            if !point_in_polygon(outer, p) || holes.iter().any(|h| point_in_polygon(h, p)) {
+            tess_profile(|p| p.certify_centroid_tests += 1);
+            if !point_in_polygon(outer, p) || hole_boxes.any_contains(holes, p) {
                 return false;
             }
         }
@@ -97,6 +162,7 @@ pub(in crate::watertight_tessellation) fn certified_planar_trim(
 }
 
 pub(in crate::watertight_tessellation) fn valid_planar_pslg(outer: &[FaceVertex], holes: &[Vec<FaceVertex>]) -> bool {
+    let _timer = stage_timer(Stage::Pslg);
     let rings = std::iter::once(outer)
         .chain(holes.iter().map(Vec::as_slice))
         .collect::<Vec<_>>();
@@ -122,13 +188,30 @@ pub(in crate::watertight_tessellation) fn valid_planar_pslg(outer: &[FaceVertex]
             && point[1] >= a[1].min(b[1]) - epsilon
             && point[1] <= a[1].max(b[1]) + epsilon
     };
+    // A pair of segments whose boxes sit more than `epsilon` apart on an axis
+    // can neither touch nor cross: `on_segment` wants the point inside the
+    // other segment's box grown by `epsilon`, and a proper crossing (both
+    // pairs of ends strictly on opposite sides of the other's line) meets at
+    // a point of both boxes. Rings whose boxes sit that far apart hold no
+    // such pair at all. Every pair the scan still tests gets the same test,
+    // so the boolean is the one the all-pairs scan returned (683 140 pairs on
+    // the plate's 37-ring face, the acceptance lane).
+    let margin = epsilon + 4.0 * f64::EPSILON * span;
+    let ring_boxes: Vec<[f64; 4]> = rings.iter().map(|ring| ring_box(ring)).collect();
+    let segment_box = |a: [f64; 2], b: [f64; 2]| -> [f64; 4] {
+        [a[0].min(b[0]), a[0].max(b[0]), a[1].min(b[1]), a[1].max(b[1])]
+    };
     for (ring_a, a) in rings.iter().enumerate() {
         for edge_a in 0..a.len() {
             let (a0, a1) = (a[edge_a].uv, a[(edge_a + 1) % a.len()].uv);
             if a0 == a1 {
                 return false;
             }
+            let box_a = segment_box(a0, a1);
             for (ring_b, b) in rings.iter().enumerate().skip(ring_a) {
+                if ring_a != ring_b && boxes_apart(ring_boxes[ring_a], ring_boxes[ring_b], margin) {
+                    continue;
+                }
                 for edge_b in 0..b.len() {
                     if ring_a == ring_b
                         && (edge_a == edge_b
@@ -138,6 +221,10 @@ pub(in crate::watertight_tessellation) fn valid_planar_pslg(outer: &[FaceVertex]
                         continue;
                     }
                     let (b0, b1) = (b[edge_b].uv, b[(edge_b + 1) % b.len()].uv);
+                    if boxes_apart(box_a, segment_box(b0, b1), margin) {
+                        continue;
+                    }
+                    tess_profile(|p| p.pslg_segment_tests += 1);
                     let cross = segments_properly_cross(a0, a1, b0, b1, epsilon);
                     let touch = on_segment(a0, b0, b1)
                         || on_segment(a1, b0, b1)
@@ -336,6 +423,7 @@ pub(in crate::watertight_tessellation) fn direct_planar_cdt(
         return None;
     }
     let mut triangles = Vec::new();
+    let hole_boxes = HoleBoxes::new(&holes);
     for f in cdt.inner_faces() {
         let mut t = f.vertices().map(|x| x.data().authored);
         let uv = t.map(|i| vertices[i].uv);
@@ -343,7 +431,7 @@ pub(in crate::watertight_tessellation) fn direct_planar_cdt(
             (uv[0][0] + uv[1][0] + uv[2][0]) / 3.0,
             (uv[0][1] + uv[1][1] + uv[2][1]) / 3.0,
         ];
-        if !point_in_polygon(&outer, m) || holes.iter().any(|h| point_in_polygon(h, m)) {
+        if !point_in_polygon(&outer, m) || hole_boxes.any_contains(&holes, m) {
             continue;
         }
         let ar = triangle_area(uv[0], uv[1], uv[2]);
@@ -427,6 +515,7 @@ pub(in crate::watertight_tessellation) struct CdtMesh {
 /// not form a simple PSLG or the Delaunay does not reproduce every constraint
 /// edge, so a face this can't safely handle keeps its existing path bit-for-bit.
 pub(in crate::watertight_tessellation) fn surface_cdt(outer: &[FaceVertex], holes: &[Vec<FaceVertex>], scale: [f64; 2]) -> Option<CdtMesh> {
+    let _timer = stage_timer(Stage::Cdt);
     use spade::{ConstrainedDelaunayTriangulation, Point2, Triangulation};
     let decline = |why: &str| -> Option<CdtMesh> {
         if std::env::var("BREP_DEBUG_CDT").is_ok() {
@@ -458,6 +547,7 @@ pub(in crate::watertight_tessellation) fn surface_cdt(outer: &[FaceVertex], hole
         return None;
     }
     let [su, sv] = [scale[0].max(1e-12), scale[1].max(1e-12)];
+    let build_timer = stage_timer(Stage::CdtBuild);
     let mut cdt = ConstrainedDelaunayTriangulation::<IndexedPoint>::new();
     let mut handles = Vec::with_capacity(vertices.len());
     for (i, p) in vertices.iter().enumerate() {
@@ -503,6 +593,8 @@ pub(in crate::watertight_tessellation) fn surface_cdt(outer: &[FaceVertex], hole
     if actual != boundary_pairs {
         return decline("constraint set mismatch");
     }
+    drop(build_timer);
+    let flood_timer = stage_timer(Stage::CdtFlood);
     // Keep only faces inside the outer loop and outside every hole, determined
     // TOPOLOGICALLY by flooding from the outer (infinite) face and counting
     // CONSTRAINT-edge crossings: a face is in the trimmed region iff that parity
@@ -557,12 +649,14 @@ pub(in crate::watertight_tessellation) fn surface_cdt(outer: &[FaceVertex], hole
         }
         triangles.push(t);
     }
+    drop(flood_timer);
     if triangles.len() < ranges.iter().map(|r| r.len()).sum::<usize>().saturating_sub(2) {
         // A valid trim triangulation has at least (boundary_verts - 2 - 2*holes)
         // triangles; far fewer means the inside filter rejected the real region
         // (e.g. an inverted outer loop). Decline and let ear-clip try.
         return decline("too few interior triangles");
     }
+    let _check_timer = stage_timer(Stage::CdtCheck);
     // Manifold check: every kept triangle's directed edges are unique, every
     // boundary edge is used from ONE side only, and every interior edge is shared
     // by an opposite twin. A SLIT loop (an edge traversed both ways) or a filter

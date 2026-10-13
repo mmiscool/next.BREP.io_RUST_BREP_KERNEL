@@ -5,8 +5,8 @@
 //! operations; these handlers decide only who is asking.
 
 use axum::extract::{Path, State};
-use axum::http::HeaderMap;
-use axum::response::Response;
+use axum::http::{header, HeaderMap, StatusCode};
+use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::{Deserialize, Serialize};
 
@@ -36,9 +36,22 @@ pub struct CategoryView {
 pub async fn list(
     State(db): State<Shared>,
     headers: HeaderMap,
-) -> Result<Json<Vec<CategoryView>>, Error> {
+) -> Result<Response, Error> {
     require_user(&db, &headers)?;
-    Ok(Json(db.read(|state| {
+    db.read(|state| {
+        // The sequence covers category edits and part moves/creation. Compare
+        // under the same guard as the tree, so the validator names these counts.
+        let etag = format!("\"categories-{}\"", state.seq);
+        if headers.get(header::IF_NONE_MATCH).and_then(|v| v.to_str().ok())
+            .is_some_and(|value| value.split(',').any(|tag| tag.trim() == etag || tag.trim() == "*"))
+        {
+            return Ok((StatusCode::NOT_MODIFIED, [(header::ETAG, etag),
+                (header::CACHE_CONTROL, "private, no-cache".to_string())]).into_response());
+        }
+        let mut counts = std::collections::BTreeMap::<String, usize>::new();
+        for part in &state.parts {
+            *counts.entry(part.category.to_ascii_lowercase()).or_default() += 1;
+        }
         let categories = &state.categories;
         let mut out = Vec::with_capacity(categories.len());
         let mut roots: Vec<&Category> = categories
@@ -52,17 +65,13 @@ pub async fn list(
             if !seen.insert(category.id.clone()) {
                 continue;
             }
-            let within = catalog::descendants(categories, &category.id);
-            let count = |ids: &dyn Fn(&str) -> bool| {
-                state.parts.iter().filter(|p| ids(&p.category.to_ascii_lowercase())).count()
-            };
-            let own = category.id.to_ascii_lowercase();
+            let own = counts.get(&category.id.to_ascii_lowercase()).copied().unwrap_or(0);
             out.push(CategoryView {
                 category: category.clone(),
                 path: catalog::path_name(categories, &category.id),
                 depth,
-                parts: count(&|id| id == own),
-                parts_within: count(&|id| within.contains(id)),
+                parts: own,
+                parts_within: own,
             });
             let mut children: Vec<&Category> = categories
                 .iter()
@@ -71,8 +80,19 @@ pub async fn list(
             children.sort_by_key(|c| c.name.to_ascii_lowercase());
             stack.extend(children.into_iter().rev().map(|c| (c, depth + 1)));
         }
-        out
-    })))
+        // Children follow parents in the traversal. Accumulate totals in
+        // reverse order; every part is counted once, even in deep trees.
+        let positions: std::collections::BTreeMap<String, usize> = out.iter().enumerate()
+            .map(|(i, row)| (row.category.id.to_ascii_lowercase(), i)).collect();
+        for i in (0..out.len()).rev() {
+            if let Some(&parent) = positions.get(&out[i].category.parent.to_ascii_lowercase()) {
+                let total = out[i].parts_within;
+                out[parent].parts_within += total;
+            }
+        }
+        Ok(([(header::ETAG, etag), (header::CACHE_CONTROL, "private, no-cache".to_string())],
+            Json(out)).into_response())
+    })
 }
 
 #[derive(Debug, Deserialize)]

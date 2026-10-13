@@ -54,6 +54,9 @@ mod expression;
 #[path = "features/mod.rs"]
 pub(crate) mod features;
 pub use features::common::{first_reference_name, reference_names};
+/// The NURBS Solid's cage resolver, which the engine's cage editor reads its
+/// handles through (`resolve_cage`, `primitive_cage`, `has_persisted_cage`).
+pub use features::nurbs_solid;
 pub(crate) use features::transform::bbox_center as transform_bbox_center;
 // Transform Face's default pivot over a replayed prefix: the value the app
 // stores into `pivot` when a face selection is committed, computed by the same
@@ -1449,6 +1452,7 @@ pub fn execute_feature(
         "P.CO" | "CONE" => features::cone::execute(&ctx),
         "P.T" | "TORUS" => features::torus::execute(&ctx),
         "P.PY" | "PYRAMID" => features::pyramid::execute(&ctx),
+        "NS" | "NURBS SOLID" | "NURBSSOLID" => features::nurbs_solid::execute(&ctx),
         // --- Add-material ---
         "E" | "EXTRUDE" => features::extrude::execute(&ctx),
         "R" | "REVOLVE" => features::revolve::execute(&ctx),
@@ -1494,6 +1498,8 @@ pub fn execute_feature(
         "P" | "PLANE" => features::plane::execute(&ctx),
         // --- Sketch: solves + extracts a profile the add-material features consume ---
         "S" | "SKETCH" => features::sketch::execute(&ctx),
+        // --- 3D sketch: free-space points/lines/arcs/beziers solved in 3D, published as paths ---
+        "S3D" | "SKETCH3D" | "3D SKETCH" => features::sketch3d::execute(&ctx),
         // --- Non-solid construction geometry: editor-drawn pass-throughs ---
         "SP" | "SPLINE" => features::spline::execute(&ctx),
         "WP" | "WAYPOINT" => features::waypoint::execute(&ctx),
@@ -1590,6 +1596,8 @@ pub fn clear_history_cache() {
         cache.clear();
     });
     sheet_metal::clear_trees();
+    // The per-coedge reading memo the boolean's operand preparation keeps.
+    crate::reading_memo::clear();
     // The wire-harness tail's bundle solids are owned outside the per-feature
     // entries; they die with the cache too.
     wire_harness::clear_cache();

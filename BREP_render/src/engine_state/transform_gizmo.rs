@@ -40,6 +40,11 @@ pub struct TransformArm {
     /// FIRST everywhere the pose is read or written, before any lookup that
     /// goes through the history. See the section at the foot of this file.
     pub(super) port: Option<String>,
+    /// When the armed subject is a NURBS Solid's CONTROL CAGE: the selected
+    /// points of `feature_id` and the drag's grab snapshot. The gizmo sits at
+    /// the selection's centroid; a drag moves (and turns) every selected
+    /// point. See `cage_edit.rs`.
+    pub(super) cage: Option<super::cage_edit::CageArm>,
 }
 
 /// A grab snapshot for an in-flight transform-gizmo drag: the grabbed handle,
@@ -129,6 +134,7 @@ impl EngineState {
             "feature": self.transform_gizmo.feature_id,
             "anchor": self.transform_gizmo.anchor,
             "portPoint": self.transform_gizmo.port,
+            "cage": self.transform_gizmo.cage.as_ref().map(|cage| cage.selected.clone()),
             "origin": self.widgets.transform_origin(),
             // A Transform Face turns about its stored `pivot`, and the gizmo
             // sits at `pivot + position` — so the two coincide only while the
@@ -311,6 +317,7 @@ impl EngineState {
         self.transform_gizmo.drag = None;
         self.transform_gizmo.anchor = None;
         self.transform_gizmo.port = None;
+        self.transform_gizmo.cage = None;
         self.clear_feature_dimension_overlay();
         self.sync_transform_gizmo();
     }
@@ -325,6 +332,7 @@ impl EngineState {
         self.transform_gizmo.drag = None;
         self.transform_gizmo.anchor = None;
         self.transform_gizmo.port = None;
+        self.transform_gizmo.cage = None;
         let _ = self.widgets.set_transform_json("null");
         self.clear_feature_dimension_overlay();
         self.dirty = true;
@@ -364,6 +372,11 @@ impl EngineState {
             }
         }
         let index = self.history.index_of(id)?;
+        if self.transform_gizmo.cage.is_some() {
+            // A control cage: the selection's centroid, or the live drag pose
+            // (see `cage_edit.rs`).
+            return self.cage_pose();
+        }
         if let Some(anchor) = self.transform_gizmo.anchor {
             // A spline anchor: its position + the intrinsic-XYZ Euler of its
             // stored axis triad (see `spline_edit.rs`).
@@ -551,9 +564,12 @@ impl EngineState {
             self.disarm_transform();
             return;
         };
+        // A cage with ONE point selected has nothing to turn about: its
+        // gizmo draws no rotation rings.
+        let show_rings = self.cage_shows_rings().unwrap_or(true);
         let _ = self
             .widgets
-            .set_transform_json(&transform_frame_json(&pose));
+            .set_transform_json(&transform_frame_json_with(&pose, show_rings));
         self.dirty = true;
     }
 
@@ -693,6 +709,8 @@ impl EngineState {
             start: pose,
             last: None,
         });
+        // A cage drag re-derives every selected point from the grab.
+        self.cage_grab_begin();
         self.dirty = true;
         true
     }
@@ -746,6 +764,7 @@ impl EngineState {
             // on release, and it is what makes "undo the drag that refused,
             // keep the one before it" work.
             self.history.break_coalescing();
+            self.cage_grab_end();
             self.sync_transform_gizmo();
         }
     }
@@ -804,6 +823,10 @@ impl EngineState {
         let Some(index) = self.history.index_of(&id) else {
             return;
         };
+        if self.transform_gizmo.cage.is_some() {
+            self.write_cage_pose(pose);
+            return;
+        }
         if let Some(anchor) = self.transform_gizmo.anchor {
             self.write_spline_anchor_pose(&id, anchor, pose.position, pose.rotation_deg);
             return;
@@ -943,6 +966,11 @@ fn read_pose_vec3(
 /// `position`, axes = the feature's rotated basis (intrinsic XYZ Euler order, matching
 /// the kernel bake), with the center free-move handle shown.
 fn transform_frame_json(pose: &TransformPose) -> String {
+    transform_frame_json_with(pose, true)
+}
+
+/// [`transform_frame_json`] with the rotation rings shown or hidden.
+fn transform_frame_json_with(pose: &TransformPose, show_rings: bool) -> String {
     let euler = [
         pose.rotation_deg[0].to_radians(),
         pose.rotation_deg[1].to_radians(),
@@ -957,6 +985,8 @@ fn transform_frame_json(pose: &TransformPose) -> String {
         "y": y,
         "z": z,
         "showCenter": true,
+        "showAxes": true,
+        "showRings": show_rings,
     })
     .to_string()
 }
@@ -1100,6 +1130,7 @@ impl EngineState {
         self.component_move_reset();
         self.transform_gizmo.feature_id = None;
         self.transform_gizmo.anchor = None;
+        self.transform_gizmo.cage = None;
         self.transform_gizmo.port = Some(address.to_string());
         self.transform_gizmo.mode = GizmoMode::Transform;
         self.transform_gizmo.drag = None;

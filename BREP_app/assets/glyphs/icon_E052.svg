@@ -1,6 +1,10 @@
 <svg xmlns="http://www.w3.org/2000/svg" xmlns:brep="https://brep.io/icons"
-     viewBox="0 0 1233 2384" width="1233" height="2384" brep:glyph-name="icon_feat_sweep" brep:unicode="E052">
-  <path d="M166 1021A150 200 0 1 1 466 1021A150 200 0 1 1 166 1021Z" fill="#ffd977"/>
-  <path d="M316 775C424.2 775 512 885.1 512 1021C512 1156.9 424.2 1267 316 1267C207.8 1267 120 1156.9 120 1021C120 885.1 207.8 775 316 775ZM316 1175C373.4 1175 420 1106.1 420 1021C420 935.9 373.4 867 316 867C258.6 867 212 935.9 212 1021C212 1106.1 258.6 1175 316 1175Z" fill="#7a4d10"/>
-  <path d="M316 1241C516 1641 766 1641 996 1341L936 1275C766 1553 516 1553 316 1153Z" fill="#2fa469"/>
+     viewBox="0 0 24 24" width="24" height="24" brep:glyph-name="icon_feat_sweep" brep:unicode="E052">
+  <!-- A round profile driven along a curve into a bent solid. -->
+  <path d="M4 7.5Q4 18 19 18V12Q10 12 10 7.5Z" fill="#f0b840" stroke="#7a4d10" stroke-width="1.2" stroke-linejoin="round" stroke-linecap="round"/>
+  <path d="M10 7.5Q10 12 19 12V18Q4 18 4 7.5Z" fill="#d4901f"/>
+  <path d="M4 7.5Q4 18 19 18V12Q10 12 10 7.5" style="fill:none" stroke="#7a4d10" stroke-width="1.2" stroke-linejoin="round" stroke-linecap="round"/>
+  <ellipse cx="19" cy="15" rx="1.4" ry="3" fill="#ffd977" stroke="#7a4d10" stroke-width="1.2"/>
+  <ellipse cx="7" cy="7.5" rx="3" ry="1.4" fill="#a5e8c4" stroke="#125236" stroke-width="1.2"/>
+  <path d="M7 9Q7 15 19 15" style="fill:none" stroke="#2fa469" stroke-width="1.2" stroke-linejoin="round" stroke-linecap="round" stroke-dasharray="1.8 1.4"/>
 </svg>

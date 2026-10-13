@@ -39,6 +39,8 @@ async fn serve(db: &Shared, path: &str) -> Response {
 fn embedded(path: &str, mime: &'static str) -> Response {
     let bytes: &'static [u8] = match path {
         "index.html" => include_bytes!("../../web/index.html"),
+        "workflow-help.html" => include_bytes!("../../web/workflow-help.html"),
+        "workflow-flowchart.js" => include_bytes!("../../web/workflow-flowchart.js"),
         "workflows.js" => include_bytes!("../../web/workflows.js"),
         "setup.js" => include_bytes!("../../web/setup.js"),
         "app.js" => include_bytes!("../../web/app.js"),

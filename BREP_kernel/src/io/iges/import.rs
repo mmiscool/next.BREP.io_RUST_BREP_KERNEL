@@ -102,6 +102,7 @@ pub fn import_iges(text: &str) -> Result<Vec<BrepSolid>, String> {
                 faces: body_faces,
             }],
             genus: 0,
+            kind: crate::BodyKind::Solid,
         };
         let (sewn, _report) = sew_solid(&solid, sew_tol)?;
         let issues = sewn.validate();

@@ -4,6 +4,96 @@ use super::*;
 /// In-segment stations per chain segment, for a wall that does not fold.
 pub(in crate::blend) const CHAIN_PER_SEGMENT: usize = 24;
 
+///
+/// The ladder climbs the `rung` (24, 48, 96, ...), which used to be every
+/// segment's count whatever its length: on the 2026-09-02 collar the two arcs
+/// are 20 % and 80 % of the edge, so the long arc's chords were four times
+/// the short arc's and every rung's miss sat in the long arc while the short
+/// one read three to five decades under the bar. [`ChainBudget::for_chain`]
+/// shares the rung's `rung × segments` stations out IN PROPORTION TO ARC
+/// LENGTH, with a floor of a quarter of the rung so a short arc keeps a grid
+/// of its own; a chain whose segments are equal in length gets `rung` in
+/// every segment, exactly the old grid. Behind
+/// [`crate::blend::chain_arc_stations_on`]; [`ChainBudget::uniform`] is the
+/// old grid, which the switch's off side and the march's own unit tests use.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(in crate::blend) struct ChainBudget {
+    /// The rung the ladder climbed to: the per-segment count of the uniform
+    /// grid, and what the traces and the typed reports name.
+    pub(in crate::blend) rung: usize,
+    /// In-segment stations of each segment (positions `0..count`; `count` is
+    /// the segment's end station, shared with the next segment's position 0).
+    pub(in crate::blend) counts: Vec<usize>,
+}
+
+impl ChainBudget {
+    /// The old grid: `rung` stations in every one of `segments` segments.
+    pub(in crate::blend) fn uniform(rung: usize, segments: usize) -> Self {
+        ChainBudget { rung, counts: vec![rung; segments] }
+    }
+
+    /// The rung's stations shared out by arc length (the switch on), else
+    /// the uniform grid.
+    pub(in crate::blend) fn for_chain(segments: &[ChainSegment<'_>], rung: usize) -> Result<Self, KernelRefusal> {
+        if !crate::blend::chain_arc_stations_on() || segments.len() < 2 {
+            return Ok(Self::uniform(rung, segments.len()));
+        }
+        let mut lengths = Vec::with_capacity(segments.len());
+        for segment in segments {
+            let length = crate::edge_arc_length(segment.edge)
+                .map_err(|error| KernelRefusal::internal(KernelStage::Refine, "edge_arc_length", error))?;
+            if !(length.is_finite() && length > 0.0) {
+                return Err(KernelRefusal::input(KernelStage::Collect, "chain_segment_length", format!(
+                    "blend chain: edge {} has no arc length to share stations by ({length})",
+                    segment.edge.id
+                )));
+            }
+            lengths.push(length);
+        }
+        Ok(Self::by_lengths(rung, &lengths))
+    }
+
+    /// The allocation itself, from the segment lengths: `rung × n` stations
+    /// in proportion, each rounded, none under a quarter of the rung (and
+    /// never under 2, the middle station's own grid).
+    pub(in crate::blend) fn by_lengths(rung: usize, lengths: &[f64]) -> Self {
+        let total: f64 = lengths.iter().sum();
+        let stations = (rung * lengths.len()) as f64;
+        let floor = (rung / 4).max(2);
+        let counts = lengths
+            .iter()
+            .map(|length| ((stations * length / total).round() as usize).max(floor))
+            .collect();
+        ChainBudget { rung, counts }
+    }
+
+    /// This segment's in-segment station count.
+    pub(in crate::blend) fn count(&self, segment: usize) -> usize {
+        self.counts[segment]
+    }
+
+    /// The largest segment count: what the ladder's resource ceiling reads.
+    pub(in crate::blend) fn largest(&self) -> usize {
+        self.counts.iter().copied().max().unwrap_or(self.rung)
+    }
+
+    /// The next rung: every count doubled, so each old interval is halved and
+    /// a station is seeded from a neighbour half as far away.
+    pub(in crate::blend) fn doubled(&self) -> Self {
+        ChainBudget { rung: self.rung * 2, counts: self.counts.iter().map(|count| count * 2).collect() }
+    }
+
+    /// For traces: the rung, and the per-segment counts when they differ.
+    pub(in crate::blend) fn describe(&self) -> String {
+        if self.counts.iter().all(|&count| count == self.rung) {
+            format!("{} stations per segment", self.rung)
+        } else {
+            let counts: Vec<String> = self.counts.iter().map(|count| count.to_string()).collect();
+            format!("rung {} ({} stations by arc length)", self.rung, counts.join("/"))
+        }
+    }
+}
+
 /// The TOP of the ladder a folding chain is re-marched up (24, 48, 96, ...).
 ///
 /// A carve traces the crease on the surface the fit produced, so it is sound at
@@ -104,10 +194,10 @@ pub(in crate::blend) fn march_chain(
     segments: &[ChainSegment<'_>],
     radius: f64,
     open: bool,
-    per_segment: usize,
+    budget: &ChainBudget,
     fold: FoldPolicy,
 ) -> Result<Vec<ChainSample>, KernelRefusal> {
-    march_chain_typed(segments, radius, open, per_segment, fold).map_err(ChainMarchError::into_refusal)
+    march_chain_typed(segments, radius, open, budget, fold).map_err(ChainMarchError::into_refusal)
 }
 
 /// [`march_chain`] with a station-continuation non-convergence kept typed, so
@@ -116,11 +206,12 @@ pub(in crate::blend) fn march_chain_typed(
     segments: &[ChainSegment<'_>],
     radius: f64,
     open: bool,
-    per_segment: usize,
+    budget: &ChainBudget,
     fold: FoldPolicy,
 ) -> Result<Vec<ChainSample>, ChainMarchError> {
     let mut samples = Vec::new();
     for (index, segment) in segments.iter().enumerate() {
+        let per_segment = budget.count(index);
         // Signs from this segment's own cross-section seed.
         let (rho1, rho2) = signed_radii(
             segment.edge,
@@ -394,7 +485,7 @@ pub(in crate::blend) fn march_chain_typed(
             });
         }
     }
-    assign_chain_parameters(&mut samples, segments.len(), per_segment, open);
+    assign_chain_parameters(&mut samples, segments.len(), budget, open);
     Ok(samples)
 }
 
@@ -410,7 +501,7 @@ pub(in crate::blend) fn march_chain_typed(
 pub(in crate::blend) fn insert_chain_stations(
     segments: &[ChainSegment<'_>],
     radius: f64,
-    per_segment: usize,
+    budget: &ChainBudget,
     samples: &mut Vec<ChainSample>,
     failing: &[usize],
 ) -> Result<(), ChainMarchError> {
@@ -423,6 +514,7 @@ pub(in crate::blend) fn insert_chain_stations(
         .collect();
     for index in touched {
         let segment = &segments[index];
+        let per_segment = budget.count(index);
         let (rho1, rho2) = signed_radii(
             segment.edge,
             segment.first.face,
@@ -621,12 +713,13 @@ pub(in crate::blend) struct DenseContacts {
 pub(in crate::blend) fn chain_dense_contacts(
     segments: &[ChainSegment<'_>],
     radius: f64,
-    per_segment: usize,
+    budget: &ChainBudget,
     samples: &[ChainSample],
     subdivisions: usize,
 ) -> Result<DenseContacts, KernelRefusal> {
     let mut out = DenseContacts { solved: Vec::new(), centers: Vec::new(), unsolved: 0, unsolved_at: Vec::new() };
     for (index, segment) in segments.iter().enumerate() {
+        let per_segment = budget.count(index);
         let (rho1, rho2) = signed_radii(
             segment.edge,
             segment.first.face,
@@ -699,7 +792,7 @@ fn chain_order(a: &ChainSample, b: &ChainSample) -> std::cmp::Ordering {
 pub(in crate::blend) fn assign_chain_parameters(
     samples: &mut [ChainSample],
     segment_count: usize,
-    per_segment: usize,
+    budget: &ChainBudget,
     open: bool,
 ) {
     // Global chord parameters over the IN-SEGMENT stations (position
@@ -707,7 +800,7 @@ pub(in crate::blend) fn assign_chain_parameters(
     // interval, in chain order), then assign overshoot samples by
     // extrapolating with their own chords.
     let mut order: Vec<usize> = (0..samples.len())
-        .filter(|&index| (0..per_segment as isize).contains(&samples[index].position))
+        .filter(|&index| (0..budget.count(samples[index].segment) as isize).contains(&samples[index].position))
         .collect();
     order.sort_by(|&a, &b| chain_order(&samples[a], &samples[b]));
     let mut accumulated = 0.0;
@@ -746,6 +839,7 @@ pub(in crate::blend) fn assign_chain_parameters(
     // when the neighbouring segment's station spacing differs, and the
     // support pieces' crossing region lies exactly there).
     for segment in 0..segment_count {
+        let per_segment = budget.count(segment);
         let sample_at = |samples: &[ChainSample], position: isize| -> usize {
             samples
                 .iter()
@@ -788,7 +882,7 @@ pub(in crate::blend) fn assign_chain_parameters(
             previous_point = point;
         }
     }
-    station_trace(samples, per_segment);
+    station_trace(samples, budget);
     // Re-origin the global parameter at segment 0's MIDDLE station so the
     // blend seam falls far from every junction (a seam ON a junction
     // collides with that junction's spoke crossing).  Kept UNWRAPPED so
@@ -799,7 +893,7 @@ pub(in crate::blend) fn assign_chain_parameters(
     if !open {
         let p_mid = samples
             .iter()
-            .find(|sample| sample.segment == 0 && sample.position == per_segment as isize / 2 && sample.offset == 0.0)
+            .find(|sample| sample.segment == 0 && sample.position == budget.count(0) as isize / 2 && sample.offset == 0.0)
             .map(|sample| sample.parameter)
             .expect("chain mid sample");
         for sample in samples.iter_mut() {
@@ -816,14 +910,14 @@ pub(in crate::blend) fn assign_chain_parameters(
 /// the face cannot tell a station apart from the interpolant through it — a
 /// branch hop between two stations hides inside one cubic span. This prints
 /// the samples themselves, so the fit and the march can be told apart.
-fn station_trace(samples: &[ChainSample], per_segment: usize) {
+fn station_trace(samples: &[ChainSample], budget: &ChainBudget) {
     if std::env::var("BREP_BLEND_STATION_TRACE").ok().as_deref() != Some("1") {
         return;
     }
     eprintln!(
-        "blend chain stations: {} sample(s) (in-segment 0..{})",
+        "blend chain stations: {} sample(s) ({})",
         samples.len(),
-        per_segment - 1
+        budget.describe()
     );
     let mut ordered: Vec<&ChainSample> = samples.iter().collect();
     ordered.sort_by(|a, b| chain_order(a, b));

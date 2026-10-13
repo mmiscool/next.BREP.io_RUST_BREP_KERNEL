@@ -121,17 +121,17 @@ const bytes = (n) => (n ? `${n.toLocaleString()} B` : '—');
 
 // ------------------------------------------------------------------- routing
 
-const VIEWS = ['workflows', 'workflow-editor', 'workflow-run', 'setup', 'file', 'empty', 'native-import', 'parts', 'workspace', 'part', 'reviews', 'ecos', 'eco', 'catalog', 'sourcing', 'bake', 'bom-columns', 'occurrence-fields', 'types', 'users', 'scripts', 'settings', 'account', 'security', 'audit', 'backups'];
+const VIEWS = ['workflows', 'workflow-editor', 'workflow-run', 'setup', 'file', 'empty', 'native-import', 'parts', 'workspace', 'part', 'reviews', 'catalog', 'sourcing', 'bake', 'bom-columns', 'occurrence-fields', 'types', 'users', 'scripts', 'settings', 'account', 'security', 'audit', 'backups'];
 
 let visiblePage = null;
 function show(view) {
-  const names = { workflows: 'Workflows', 'workflow-editor': 'Workflow editor', 'workflow-run': 'Workflow process', setup: 'Server setup', 'native-import': 'Import native files', parts: 'Parts', part: currentPart?.number || 'Part', workspace: 'Home', reviews: 'Review inbox', ecos: 'Change orders', eco: 'Change order', catalog: 'Classification', sourcing: 'Sourcing', bake: 'Bake queue', 'bom-columns':'BOM column configurations', 'occurrence-fields':'Occurrence fields', types: 'Part types', users: 'Users', scripts: 'Scripts', settings: 'Settings', account: 'My account', security: 'Security', audit: 'Audit', backups: 'Backups' };
+  const names = { workflows: 'Workflows', 'workflow-editor': 'Workflow editor', 'workflow-run': 'Workflow process', setup: 'Server setup', 'native-import': 'Import native files', parts: 'Parts', part: currentPart?.number || 'Part', workspace: 'Home', reviews: 'Review inbox', catalog: 'Classification', sourcing: 'Sourcing', bake: 'Bake queue', 'bom-columns':'BOM column configurations', 'occurrence-fields':'Occurrence fields', types: 'Part types', users: 'Users', scripts: 'Scripts', settings: 'Settings', account: 'My account', security: 'Security', audit: 'Audit', backups: 'Backups' };
   visiblePage = {view, title:names[view] || view};
   for(const menu of document.querySelectorAll('.top-nav details[open]'))menu.open=false;
   $('shell-status').textContent = names[view] || 'Ready';
   for (const name of VIEWS) $(`view-${name}`).hidden = name !== view;
   for (const link of document.querySelectorAll('.top-nav a')) {
-    const current = link.getAttribute('href') === `#/${view === 'part' ? 'parts' : view === 'eco' ? 'ecos' : view}`;
+    const current = link.getAttribute('href') === `#/${view === 'part' ? 'parts' : view}`;
     link.classList.toggle('current', current);
     if (current) link.setAttribute('aria-current', 'page');
     else link.removeAttribute('aria-current');
@@ -164,8 +164,7 @@ async function renderRoute(hash) {
     else if(section==='attachment'||section==='file'){const title=await FileDocuments.open(hash);show('file');visiblePage.title=title;}
     else if (section === 'empty') { show('empty');
     } else if (section === 'part' && id) {
-      await renderPart(id, revision);
-      if (OBJECT_TABS.some(([tab]) => tab === objectView)) selectObjectTab(objectView);
+      await renderPart(id, revision, OBJECT_TABS.some(([tab]) => tab === objectView) ? objectView : OpenPages.partView(hash));
       show('part');
     } else if (section === 'native-import') {
       if (!me.can_author) { location.hash = '#/parts'; return; }
@@ -173,17 +172,12 @@ async function renderRoute(hash) {
       show('native-import');
     } else if (section === 'workspace') {
       Workbench.restore(OpenPages.workspace(hash));
+      show('workspace');
       await Workbench.home(id);
       show('workspace');
     } else if (section === 'reviews') {
       await renderReviews();
       show('reviews');
-    } else if (section === 'ecos') {
-      await renderEcos();
-      show('ecos');
-    } else if (section === 'eco' && id) {
-      await renderEco(decodeURIComponent(id));
-      show('eco');
     } else if (section === 'catalog') {
       await renderCatalog(id ? decodeURIComponent(id) : null);
       show('catalog');
@@ -209,7 +203,7 @@ async function renderRoute(hash) {
       } else {scriptPath=null;scriptSaved='';$('script-text').value='';$('script-path').textContent='No file open';await renderScripts();}
       show('scripts');
     } else if (section === 'workflows') {
-      await WorkflowUI.list(); show('workflows');
+      await WorkflowUI.list(id, revision); show('workflows');
     } else if (section === 'workflow-editor') {
       if (!me.is_admin) { location.hash = '#/workflows'; return; }
       await WorkflowUI.editor(id || 'new'); show('workflow-editor');
@@ -263,7 +257,6 @@ async function renderRoute(hash) {
     if(visiblePage.view==='part')title=currentPart.number+(revision?'/'+(currentPart.revisions.find(r=>r.id===revision||r.label===revision)?.label || revision):'');
     if(visiblePage.view==='workspace'&&id)title=$('home-detail').querySelector('h2')?.textContent || 'Folder';
     if(visiblePage.view==='scripts'&&id)title=scriptPath;
-    if(visiblePage.view==='eco')title=$('eco-number').textContent;
     if(visiblePage.view==='catalog'&&id)title=$('cat-title').textContent || title;
     await OpenPages.afterRender(hash);
     OpenPages.activate(hash,visiblePage.view,title);
@@ -611,7 +604,7 @@ for (const [id] of OBJECT_TABS) {
   panel.setAttribute('role', 'tabpanel');
   panel.setAttribute('aria-labelledby', `object-tab-${id}`);
 }
-function selectObjectTab(id) {
+function selectObjectTab(id, {load=true}={}) {
   objectTab = id;
   for (const button of $('object-tabs').querySelectorAll('button')) {
     const active = button.dataset.objectTab === id;
@@ -619,6 +612,15 @@ function selectObjectTab(id) {
     button.tabIndex = active ? 0 : -1;
   }
   for (const panel of document.querySelectorAll('[data-object-panel]')) panel.classList.toggle('active', panel.dataset.objectPanel === id);
+  if(load && currentPart && !$('view-part').hidden && partPanels && !partPanels.loaded.has(id)) {
+    const state=partPanels;
+    // Use the navigation queue so a loader's global helpers cannot write
+    // another part's panels if the user switches pages during a request.
+    routeQueue=routeQueue.catch(()=>{}).then(async()=>{
+      if(partPanels!==state || $('view-part').hidden || objectTab!==id)return;
+      await act(async()=>{await loadPartPanel(id,state);OpenPages.partPanelReady(id);});
+    });
+  }
 }
 $('object-tabs').addEventListener('click', event => {
   const tab = event.target.closest('[data-object-tab]');
@@ -677,7 +679,37 @@ document.addEventListener('click', (event) => {
 
 // ----------------------------------------------------------------- one part
 
-async function renderPart(id, selectedRevision) {
+let partPanels = null;
+async function loadPartPanel(tab, state=partPanels) {
+  if(!state || state.loaded.has(tab))return;
+  const detail=state.detail;
+  const panels=[...document.querySelectorAll(`[data-object-panel="${tab}"]`)];
+  for(const panel of panels){
+    panel.inert=true;panel.dataset.partLoading='true';panel.setAttribute('aria-busy','true');
+    if(!panel.querySelector(':scope > .part-load-status')){
+      const status=document.createElement('p');status.className='part-load-status';status.textContent='Loading…';panel.prepend(status);
+    }
+  }
+  try {
+    switch(tab) {
+      case 'summary': await Promise.all([renderDetails(detail),renderSeed(detail),loadSummaryFields(detail,state.revision)]);break;
+      case 'revisions': await loadRevisionFields(detail);break;
+      case 'structure': await renderStructure(detail);break;
+      case 'attachments': await renderAttachments(detail);break;
+      case 'review': await renderReview(detail);break;
+      case 'history': await renderHistory(detail);break;
+      case 'sourcing': renderSourcing(detail);break;
+    }
+    state.loaded.add(tab);
+    for(const panel of panels)delete panel.dataset.partPending;
+  } catch(error) {
+    for(const panel of panels)panel.querySelector(':scope > .part-load-status').textContent=`Could not load this view: ${error.message}. Select the view again to retry.`;
+    throw error;
+  } finally {
+    for(const panel of panels){panel.inert=false;delete panel.dataset.partLoading;panel.removeAttribute('aria-busy');if(state.loaded.has(tab))panel.querySelector(':scope > .part-load-status')?.remove();}
+  }
+}
+async function renderPart(id, selectedRevision, requestedTab) {
   const detail = await api('GET', `/api/parts/${encodeURIComponent(id)}`);
   // The editor belongs to one part's document; opening another part closes it
   // rather than leaving the last part's text under this part's heading.
@@ -685,7 +717,7 @@ async function renderPart(id, selectedRevision) {
     $('editor').hidden = true;
     editorKey = null;
   }
-  if (currentPart?.id !== detail.id) selectObjectTab('summary');
+  const targetTab=requestedTab || (currentPart?.id===detail.id ? objectTab : 'summary');
   currentPart = detail;
   if (selectedRevision && detail.revision_views.some(r => r.id === selectedRevision)) {
     structure.part = detail.id; structure.revision = selectedRevision;
@@ -694,19 +726,20 @@ async function renderPart(id, selectedRevision) {
   const cadRevision = detail.revision_views.find(r => r.id === selectedRevision) || detail.revision_views.at(-1);
   $('part-open-cad').innerHTML = cadRevision ? openInCadButton(detail.id, cadRevision.id, cadRevision.editable ? 'Edit in CAD' : 'Open in CAD') : '';
   $('part-thumb').innerHTML = thumb(detail.thumbnail_url, 'lg');
+  $('part-start-workflow').onclick = () => {
+    const revision = $('summary-revision').value || partPanels.revision;
+    location.hash = `#/workflows/${encodeURIComponent(detail.id)}/${encodeURIComponent(revision)}`;
+  };
   $('part-number').textContent = detail.number;
   $('part-name').textContent = detail.name;
   $('part-meta').innerHTML =
     `${escape(detail.part_type)}${detail.document_class && detail.document_class !== 'normal' ? ` · ${classBadge(detail.document_class)}` : ''} · created ${escape(when(detail.created_at))}`
     + (detail.description ? ` · ${escape(detail.description)}` : '');
-  await renderDetails(detail);
-  renderSourcing(detail);
-  await renderSeed(detail);
-  await renderStructure(detail);
-  await loadSummaryFields(detail, selectedRevision || structure.revision);
-  await renderAttachments(detail);
-  await renderReview(detail);
-  await renderHistory(detail);
+  partPanels={detail,revision:selectedRevision || defaultRevision(detail),loaded:new Set()};
+  revisionOptions($('revision-field-revision'),detail,partPanels.revision);
+  for(const panel of document.querySelectorAll('[data-object-panel]'))panel.dataset.partPending='true';
+  $('family-panel').hidden=detail.document_class!=='family';
+  $('template-panel').hidden=detail.document_class!=='template';
 
   const openDraft = detail.revision_views.some((r) => r.editable);
   const blocked = openDraft && !detail.multiple_open_drafts;
@@ -714,7 +747,7 @@ async function renderPart(id, selectedRevision) {
   $('new-rev-label').disabled = blocked;
   $('new-rev-label').placeholder = detail.suggested_label;
   $('new-rev-note').textContent = blocked
-    ? 'A revision is still open, and this server allows one at a time. Release or delete it first.'
+    ? 'A revision is still open, and this server allows one at a time. Use a workflow to release it, or delete it first.'
     : `Labels are free text. Leave it empty to use ${detail.suggested_label}.`
       + (openDraft ? ' The new revision starts from the released document, not from the open one.' : '');
 
@@ -735,6 +768,9 @@ async function renderPart(id, selectedRevision) {
   for (const button of $('rev-rows').querySelectorAll('button[data-do]')) {
     button.addEventListener('click', () => onRevisionAction(button.dataset.do, button.dataset.rev));
   }
+  selectObjectTab(targetTab,{load:false});
+  show('part');
+  await loadPartPanel(targetTab);
   Workbench.partChanged(detail);
 }
 
@@ -751,6 +787,7 @@ function actions(rev) {
   const rid = escape(rev.id);
   const cad = openInCadButton(currentPart.id, rev.id);
   if (cad) out.push(cad);
+  out.push(`<a class="button link" href="#/workflows/${encodeURIComponent(currentPart.id)}/${encodeURIComponent(rev.id)}">Start workflow</a>`);
   if (rev.editable) {
     if (!rev.locked_by && me.can_author) out.push(`<button class="link" data-do="checkout" data-rev="${rid}">Check out</button>`);
     if (rev.locked_by_me) {
@@ -761,16 +798,12 @@ function actions(rev) {
     }
     if (rev.lifecycle === 'draft' && me.can_author && statusEnabled('inreview')) out.push(`<button class="link" data-do="submit" data-rev="${rid}">Submit for review</button>`);
     if (rev.lifecycle === 'inreview' && me.can_author) out.push(`<button class="link" data-do="withdraw" data-rev="${rid}">Withdraw</button>`);
-    if (!rev.eco && me.can_author) out.push(`<button class="link" data-do="to-eco" data-rev="${rid}">Add to change order</button>`);
-    if (!rev.locked_by && me.can_checkin && statusEnabled('released')) out.push(`<button class="link" data-do="release" data-rev="${rid}">Release</button>`);
+
     if (me.can_author) out.push(`<button class="link" data-do="delete" data-rev="${rid}">Delete</button>`);
   } else {
     advanced.push(`<button class="link" data-do="view" data-rev="${rid}">View model JSON</button>`);
     if (rev.lifecycle === 'released' && me.can_checkin && statusEnabled('obsolete')) {
       out.push(`<button class="link" data-do="obsolete" data-rev="${rid}">Obsolete</button>`);
-    }
-    if (['released', 'superseded'].includes(rev.lifecycle) && !rev.eco && me.can_author) {
-      out.push(`<button class="link" data-do="to-eco" data-rev="${rid}">Add to change order</button>`);
     }
   }
   if (advanced.length) out.push(`<details class="revision-advanced"><summary>Advanced</summary>${advanced.join(' ')}</details>`);
@@ -792,20 +825,8 @@ function onRevisionAction(action, revisionId) {
         if (!confirm('Break this lock? The holder may have unsaved work — their edit stays in their app and is NOT written here.')) return;
         await api('POST', `${base}/checkin`, { force: true });
         break;
-      case 'release': {
-        if (!confirm('Release this revision? A released revision is immutable.')) return;
-        const result = await api('POST', `${base}/state`, { to: 'released' });
-        reviewRevision = revisionId;
-        await renderPart(part);
-        // The release stands; an after-release script that failed says so.
-        if (result.warnings && result.warnings.length) banner(result.warnings.join('\n'));
-        return;
-      }
       case 'submit':
         await openSubmit(revisionId);
-        return;
-      case 'to-eco':
-        await openAddToEco(revisionId);
         return;
       case 'withdraw':
         if (!confirm('Withdraw this revision from review? Its review ends, and it goes back to Draft.')) return;
@@ -964,11 +985,22 @@ $('new-rev-form').addEventListener('submit', (event) => {
 
 let categories = [];
 let categoriesLoaded = false;
+let categoriesEtag = '', categoriesUser = null, categoriesRequest = null;
 
 async function loadCategories() {
-  categories = await api('GET', '/api/categories');
-  categoriesLoaded = true;
-  return categories;
+  if(categoriesUser!==me.id){categoriesUser=me.id;categoriesEtag='';categoriesLoaded=false;categories=[];}
+  if(categoriesRequest)return categoriesRequest;
+  const user=me.id;
+  categoriesRequest=(async()=>{
+    const response=await fetch('/api/categories',{credentials:'same-origin',headers:categoriesEtag?{'If-None-Match':categoriesEtag}:{}});
+    if(response.status===304)return categories;
+    const payload=await response.json();
+    if(!response.ok)throw new Error(payload.error || 'Could not load categories.');
+    if(me?.id!==user)return categories;
+    categories=payload;categoriesEtag=response.headers.get('ETag') || '';categoriesLoaded=true;
+    return categories;
+  })();
+  try{return await categoriesRequest;}finally{categoriesRequest=null;}
 }
 
 const indent = (depth) => '\u00a0\u00a0\u00a0'.repeat(depth);
@@ -1730,7 +1762,6 @@ async function renderSettings() {
   $('set-workspaces-browsable').checked = settings.workspaces_browsable;
   $('set-script-locked').hidden = !settings.script_editor_locked;
   await renderReviewSettings(settings);
-  await renderEcoSettings(settings);
   $('settings-status').textContent = '';
 }
 
@@ -1749,12 +1780,7 @@ $('settings-form').addEventListener('submit', (event) => {
         required: $('set-rv-required'), due: $('set-rv-due'), reviewers: $('set-rv-reviewers'), self: $('set-rv-self'),
       }),
       review_overrides: readOverrides(),
-      eco_review_rule: readRule({
-        required: $('set-eco-required'), due: $('set-eco-due'), reviewers: $('set-eco-reviewers'), self: $('set-eco-self'),
-      }),
-      eco_holds_revisions: $('set-eco-holds').checked,
     });
-    await api('PATCH', '/api/ecos/numbering', readEcoNumbering());
     await renderSettings();
     $('settings-status').textContent = 'Saved.';
     OpenPages.saved();
@@ -2585,20 +2611,10 @@ async function openReplace() {
   $('rp-from').value = $('wu-revision').value || '';
   $('rp-search').value = '';
   $('rp-results').innerHTML = '';
-  const drafts = await api('GET', '/api/ecos?state=draft');
-  $('rp-eco').innerHTML = '<option value="-">None</option>'
-    + drafts.map((e) => `<option value="${escape(e.id)}">${escape(e.number)} — ${escape(e.title)}</option>`).join('')
-    + '<option value="">A new change order…</option>';
-  $('rp-eco-title').value = `Replace ${currentPart.number}`;
   chooseReplacement(currentPart.id, currentPart.number, currentPart.name, currentPart.revision_views);
-  syncReplaceEco();
   $('replace-dialog').showModal();
 }
 
-function syncReplaceEco() {
-  $('rp-eco-new-label').hidden = $('rp-eco').value !== '';
-}
-$('rp-eco').addEventListener('change', syncReplaceEco);
 
 // Any change to the question makes the previous preview stale.
 function staleReplace() {
@@ -2661,9 +2677,6 @@ function replaceRequest(dryRun) {
   };
   if (!dryRun) {
     body.parents = [...$('rp-rows').querySelectorAll('input[data-parent]:checked')].map((c) => c.dataset.parent);
-    const eco = $('rp-eco').value;
-    if (eco === '') body.eco = { new: { title: $('rp-eco-title').value || `Replace ${currentPart.number}` } };
-    else if (eco !== '-') body.eco = eco;
   }
   return body;
 }
@@ -2680,7 +2693,7 @@ function renderReplace(report, preview) {
     const writes = r.plan === 'edit' ? `rev ${escape(r.revision)} in place`
       : r.plan === 'new-revision' ? `new rev ${escape(r.revision)}` : '—';
     const lines = r.lines.map((l) => `${escape(l.from)} → ${escape(l.to)} <span class="muted">×${qtyText(l.quantity)}${l.find_number ? ` · find ${escape(l.find_number)}` : ''}</span>`).join('<br>');
-    const result = `${escape(REPLACE_STATUS[r.status] || r.status)}${r.reason ? `: ${escape(r.reason)}` : ''}${r.eco ? `<br><span class="muted">change order: ${escape(r.eco)}</span>` : ''}`;
+    const result = `${escape(REPLACE_STATUS[r.status] || r.status)}${r.reason ? `: ${escape(r.reason)}` : ''}`;
     return `
       <tr>
         <td>${preview && doable ? `<input type="checkbox" data-parent="${escape(documentKey(r.part_id, r.parent_revision_id))}" checked aria-label="Include ${escape(r.number)} rev ${escape(r.parent_revision)}">` : ''}</td>
@@ -2694,7 +2707,7 @@ function renderReplace(report, preview) {
   const doable = report.rows.filter((r) => r.status === 'would-write' || r.status === 'would-create').length;
   $('rp-summary').textContent = preview
     ? (report.rows.length ? `${doable} of ${report.rows.length} assemblies can be changed. Untick any to leave out.` : 'No current assembly uses it.')
-    : `${report.written} changed, ${report.skipped} skipped, ${report.refused} refused.${report.eco_number ? ` Change order ${report.eco_number}.` : ''}`;
+    : `${report.written} changed, ${report.skipped} skipped, ${report.refused} refused.`;
   $('rp-apply').disabled = !preview || doable === 0;
 }
 
@@ -3186,7 +3199,6 @@ function reviewCell(rev) {
     if (r.live && r.required_approvals) parts.push(`<span class="muted">${r.approvals}/${r.required_approvals}</span>`);
   }
   if (rev.comments) parts.push(`<span class="muted" title="Comments">💬 ${rev.comments}</span>`);
-  if (rev.eco) parts.push(`<a class="badge" href="#/eco/${escape(rev.eco.id)}" title="${escape(rev.eco.action)} in ${escape(rev.eco.number)} (${escape(rev.eco.state)})">${escape(rev.eco.number)}</a>`);
   return parts.length ? parts.join(' ') : '<span class="muted">—</span>';
 }
 
@@ -3387,7 +3399,7 @@ function openRoundDialog(round) {
 }
 
 // Where the round dialog saves, and what it refreshes: a revision's round or
-// a change order's.
+// a revision's.
 let roundTarget = null;
 
 $('round-form').addEventListener('submit', (event) => {
@@ -3476,377 +3488,6 @@ async function renderReviewSettings(settings) {
 
 $('set-rv-add').addEventListener('click', () => act(() => addOverrideRow()));
 
-// ----------------------------------------------------------- change orders
-
-const ECO_STATES = { draft: 'draft', inreview: 'in review', approved: 'approved', released: 'released', cancelled: 'cancelled' };
-const ecoChip = (state) => `<span class="state eco-${escape(state)}">${escape(ECO_STATES[state] || state)}</span>`;
-const priorityChip = (p) => (p === 'normal' ? '<span class="muted">normal</span>' : `<span class="badge priority-${escape(p)}">${escape(p)}</span>`);
-
-async function renderEcos() {
-  const rows = await api('GET', `/api/ecos?state=${encodeURIComponent($('eco-filter').value)}`);
-  $('eco-rows').innerHTML = rows.map((e) => `
-    <tr>
-      <td class="number"><a href="#/eco/${escape(e.id)}">${escape(e.number)}</a></td>
-      <td>${escape(e.title)}</td>
-      <td>${ecoChip(e.state)}</td>
-      <td>${priorityChip(e.priority)}</td>
-      <td>${e.item_count}</td>
-      <td>${e.review ? reviewChip(e.review) : '—'}</td>
-      <td>${escape(e.created_by)}<br><span class="muted">${escape(when(e.created_at))}</span></td>
-    </tr>`).join('');
-  $('eco-empty').hidden = rows.length > 0;
-}
-
-$('eco-filter').addEventListener('change', () => act(renderEcos));
-
-// -- creating and editing
-
-let ecoNumbering = null;
-let editingEco = null;
-
-async function openEcoDialog(eco) {
-  editingEco = eco;
-  ecoNumbering = await api('GET', '/api/ecos/numbering');
-  const typed = ecoNumbering.mode.kind !== 'counter';
-  $('eco-dialog-title').textContent = eco ? `Edit ${eco.number}` : 'New change order';
-  $('ed-number-label').hidden = !!eco || !typed;
-  $('ed-number').value = '';
-  $('ed-number').placeholder = ecoNumbering.mode.kind === 'pattern' ? ecoNumbering.mode.regex : '';
-  $('ed-title').value = eco ? eco.title : '';
-  $('ed-reason').value = eco ? eco.reason : '';
-  $('ed-description').value = eco ? eco.description : '';
-  $('ed-priority').value = eco ? eco.priority : 'normal';
-  $('eco-dialog').showModal();
-}
-
-$('eco-new').addEventListener('click', () => act(() => openEcoDialog(null)));
-
-$('eco-form').addEventListener('submit', (event) => {
-  if (event.submitter && event.submitter.value !== 'save') return;
-  event.preventDefault();
-  act(async () => {
-    const body = {
-      title: $('ed-title').value,
-      reason: $('ed-reason').value,
-      description: $('ed-description').value,
-      priority: $('ed-priority').value,
-    };
-    let id;
-    if (editingEco) {
-      id = (await api('PATCH', `/api/ecos/${encodeURIComponent(editingEco.id)}`, body)).id;
-    } else {
-      body.number = $('ed-number').value;
-      id = (await api('POST', '/api/ecos', body)).id;
-    }
-    $('eco-dialog').close();
-    if (location.hash === `#/eco/${id}`) await renderEco(id);
-    else location.hash = `#/eco/${id}`;
-  });
-});
-
-// -- one change order
-
-let currentEco = null;
-let ecoReplyTo = '';
-const ecoUrl = () => `/api/ecos/${encodeURIComponent(currentEco.id)}`;
-
-function itemChanges(item) {
-  const out = [];
-  if (item.document_changed === true) out.push('document changed');
-  if (item.document_changed === false) out.push('<span class="muted">same document</span>');
-  if (item.bom_diff && item.bom_diff.lines.length) out.push(`${item.bom_diff.lines.length} BOM change${item.bom_diff.lines.length === 1 ? '' : 's'}`);
-  if (item.attribute_changes.length) out.push(`${item.attribute_changes.length} catalog change${item.attribute_changes.length === 1 ? '' : 's'}`);
-  return out.join(' · ') || '<span class="muted">—</span>';
-}
-
-function itemDetail(item) {
-  const parts = [];
-  if (item.document_changed !== null && item.document_changed !== undefined) {
-    parts.push(`<div>${item.document_changed ? 'Model changed from the previous revision' : 'Model unchanged from the previous revision'}</div>`);
-  }
-  if (item.bom_diff && item.bom_diff.lines.length) {
-    parts.push(`<div><span class="field">BOM</span><ul class="plain">${item.bom_diff.lines.map((l) => `
-      <li><strong>${escape(l.number)}</strong> ${escape(l.change)}${l.details.length ? ` — ${escape(l.details.join(", "))}` : ''}</li>`).join('')}</ul></div>`);
-  }
-  for (const c of item.attribute_changes) {
-    parts.push(`<div><span class="field">${escape(c.field)}</span> ${escape(auditValue(c.before))}<span class="arrow">→</span>${escape(auditValue(c.after))}
-      <span class="muted">${escape(c.by)} ${escape(when(c.at))}</span></div>`);
-  }
-  return parts.join('');
-}
-
-async function renderEco(id) {
-  const eco = await api('GET', `/api/ecos/${encodeURIComponent(id)}`);
-  currentEco = eco;
-  $('eco-number').textContent = eco.number;
-  $('eco-title').textContent = eco.title;
-  $('eco-meta').innerHTML = `${ecoChip(eco.state)} · priority ${priorityChip(eco.priority)} · created by ${escape(eco.created_by)} ${escape(when(eco.created_at))}`
-    + (eco.released_at ? ` · released by ${escape(eco.released_by)} ${escape(when(eco.released_at))}` : '')
-    + (eco.cancelled_at ? ` · cancelled by ${escape(eco.cancelled_by)} ${escape(when(eco.cancelled_at))}` : '');
-  $('eco-reason').textContent = eco.reason || '—';
-  $('eco-description').textContent = eco.description || '—';
-  const open = ['draft', 'inreview', 'approved'].includes(eco.state);
-  $('eco-submit').hidden = !(eco.state === 'draft' && me.can_author);
-  $('eco-withdraw').hidden = !(['inreview', 'approved'].includes(eco.state) && me.can_author);
-  $('eco-release').hidden = !eco.can_release;
-  $('eco-edit').hidden = !(open && me.can_author);
-  $('eco-cancel').hidden = !(open && me.can_author);
-  $('eco-problems').hidden = !(open && eco.problems.length);
-  $('eco-problems').innerHTML = eco.problems.length
-    ? `<strong>It cannot release yet:</strong><ul>${eco.problems.map((p) => `<li>${escape(p)}</li>`).join('')}</ul>`
-    : '';
-
-  $('eco-items').innerHTML = eco.items.map((item) => `
-    <tr>
-      <td><span class="badge action-${escape(item.action)}">${escape(item.action)}</span></td>
-      <td class="number"><a href="#/part/${encodeURIComponent(item.part_id)}">${escape(item.number)}</a><br><span class="muted">${escape(item.name)}</span></td>
-      <td><strong>${escape(item.label)}</strong> <span class="state state-${escape(item.lifecycle)}">${escape(statusName(item.lifecycle))}</span></td>
-      <td>${escape(item.replaces || '—')}</td>
-      <td>${itemChanges(item)}${item.problem ? `<div class="error">${escape(item.problem)}</div>` : ''}
-        ${itemDetail(item) ? `<details><summary>Details</summary><div class="item-detail">${itemDetail(item)}</div></details>` : ''}</td>
-      <td class="actions">${eco.can_edit ? `<button class="link danger" data-part="${escape(item.part_id)}" data-remove="${escape(item.revision_id)}">Remove</button>` : ''}</td>
-    </tr>`).join('');
-  $('eco-items-empty').hidden = eco.items.length > 0;
-  for (const button of $('eco-items').querySelectorAll('button[data-remove]')) {
-    button.addEventListener('click', () => act(async () => {
-      await api('DELETE', `${ecoUrl()}/items/${encodeURIComponent(button.dataset.remove)}?part=${encodeURIComponent(button.dataset.part)}`);
-      await renderEco(eco.id);
-    }));
-  }
-  $('eco-add').hidden = !eco.can_edit;
-  $('eco-add-pick').hidden = true;
-  $('eco-add-results').innerHTML = '';
-  $('eco-add-search').value = '';
-
-  $('eco-round').innerHTML = eco.current ? roundHtml(eco.current, true, 'eco') : '';
-  $('eco-round-none').hidden = !!eco.current;
-  const n = eco.rule.required_approvals;
-  $('eco-round-none').textContent = `Not submitted yet. ${n ? `It needs ${n} approval${n === 1 ? '' : 's'}` : 'No approval is needed'} before it can release.`;
-  $('eco-history').hidden = eco.history.length === 0;
-  $('eco-history-list').innerHTML = eco.history.map((r) => roundHtml(r, false, 'eco-old')).join('');
-  $('eco-comments').innerHTML = eco.comments.length ? threadHtml(eco.comments, eco.can_comment) : '';
-  $('eco-comments-empty').hidden = eco.comments.length > 0;
-  $('eco-comment-form').hidden = !eco.can_comment;
-  setEcoReplyTo('', '');
-
-  for (const button of $('eco-round').querySelectorAll('button[data-verdict]')) {
-    button.addEventListener('click', () => act(async () => {
-      const verdict = button.dataset.verdict;
-      if (verdict === 'reject' && !confirm('Reject this change order? It goes back to Draft, and the review ends.')) return;
-      showWarnings(await api('POST', `${ecoUrl()}/review/decision`, { verdict, comment: $('eco-decision-comment').value }));
-      await renderEco(eco.id);
-      refreshInbox();
-    }));
-  }
-  const change = $('eco-change');
-  if (change) {
-    change.addEventListener('click', () => {
-      roundTarget = { url: `${ecoUrl()}/review`, refresh: () => renderEco(eco.id) };
-      openRoundDialog(eco.current);
-    });
-  }
-  for (const button of $('eco-comments').querySelectorAll('button[data-reply]')) {
-    button.addEventListener('click', () => {
-      setEcoReplyTo(button.dataset.reply, button.dataset.author);
-      $('eco-comment').focus();
-    });
-  }
-}
-
-function setEcoReplyTo(id, author) {
-  ecoReplyTo = id;
-  $('eco-reply-to').hidden = !id;
-  $('eco-reply-to').textContent = id ? `Replying to ${author}` : '';
-  $('eco-reply-cancel').hidden = !id;
-}
-
-$('eco-reply-cancel').addEventListener('click', () => setEcoReplyTo('', ''));
-$('eco-comment-form').addEventListener('submit', (event) => {
-  event.preventDefault();
-  act(async () => {
-    showWarnings(await api('POST', `${ecoUrl()}/comments`, { body: $('eco-comment').value, parent: ecoReplyTo }));
-    $('eco-comment').value = '';
-    await renderEco(currentEco.id);
-  });
-});
-
-$('eco-edit').addEventListener('click', () => act(() => openEcoDialog(currentEco)));
-
-$('eco-submit').addEventListener('click', () => {
-  const n = currentEco.rule.required_approvals;
-  $('es-title').textContent = currentEco.number;
-  $('es-rule').textContent = n ? `It needs ${n} approval${n === 1 ? '' : 's'}.` : 'No approval is needed: it is approved as soon as it is submitted.';
-  $('es-reviewers').value = '';
-  $('es-note').value = '';
-  $('eco-submit-dialog').showModal();
-});
-
-$('eco-submit-form').addEventListener('submit', (event) => {
-  if (event.submitter && event.submitter.value !== 'submit') return;
-  event.preventDefault();
-  act(async () => {
-    const body = { note: $('es-note').value };
-    const extra = splitList($('es-reviewers').value);
-    if (extra.length) body.reviewers = extra;
-    const result = await api('POST', `${ecoUrl()}/submit`, body);
-    $('eco-submit-dialog').close();
-    await renderEco(currentEco.id);
-    showWarnings(result);
-  });
-});
-
-for (const [button, path, question] of [
-  ['eco-withdraw', 'withdraw', 'Withdraw this change order? Its review ends, and it goes back to Draft.'],
-  ['eco-cancel', 'cancel', 'Cancel this change order? Its revisions are left as they are. This cannot be undone.'],
-  ['eco-release', 'release', 'Release this change order? Every item is applied together, and released revisions are immutable.'],
-]) {
-  $(button).addEventListener('click', () => act(async () => {
-    if (!confirm(question)) return;
-    const result = await api('POST', `${ecoUrl()}/${path}`);
-    await renderEco(currentEco.id);
-    showWarnings(result);
-  }));
-}
-
-// -- adding an item from the change order's page
-
-let ecoAddTimer = null;
-let ecoAddPart = null;
-
-$('eco-add-search').addEventListener('input', () => {
-  clearTimeout(ecoAddTimer);
-  ecoAddTimer = setTimeout(() => act(async () => {
-    const q = $('eco-add-search').value.trim();
-    if (!q) { $('eco-add-results').innerHTML = ''; return; }
-    const page = await api('GET', `/api/parts?q=${encodeURIComponent(q)}&limit=10`);
-    $('eco-add-results').innerHTML = page.parts.map((p) => `
-      <li><button type="button" class="link" data-pick="${escape(p.id)}">${escape(p.number)}</button> ${escape(p.name)}</li>`).join('')
-      || '<li class="muted">No parts match.</li>';
-    for (const button of $('eco-add-results').querySelectorAll('button[data-pick]')) {
-      button.addEventListener('click', () => act(() => pickEcoPart(button.dataset.pick)));
-    }
-  }), 150);
-});
-
-async function pickEcoPart(id) {
-  ecoAddPart = await api('GET', `/api/parts/${encodeURIComponent(id)}`);
-  $('eco-add-part').textContent = `${ecoAddPart.number} ${ecoAddPart.name}`;
-  $('eco-add-rev').innerHTML = ecoAddPart.revision_views.map((r) => `<option value="${escape(r.id)}">${escape(r.label)} — ${escape(statusName(r.lifecycle))}</option>`).join('');
-  const views = ecoAddPart.revision_views;
-  const open = [...views].reverse().find((r) => r.editable);
-  $('eco-add-rev').value = (open || views[views.length - 1]).id;
-  syncEcoAddAction();
-  $('eco-add-results').innerHTML = '';
-  $('eco-add-pick').hidden = false;
-}
-
-function syncEcoAddAction() {
-  const rev = ecoAddPart && ecoAddPart.revision_views.find((r) => r.id === $('eco-add-rev').value);
-  if (rev) $('eco-add-action').value = rev.editable ? 'release' : 'obsolete';
-}
-
-$('eco-add-rev').addEventListener('change', syncEcoAddAction);
-
-$('eco-add').addEventListener('submit', (event) => {
-  event.preventDefault();
-  act(async () => {
-    await api('POST', `${ecoUrl()}/items`, {
-      part: ecoAddPart.id,
-      revision: $('eco-add-rev').value,
-      action: $('eco-add-action').value,
-      note: $('eco-add-note').value,
-    });
-    $('eco-add-note').value = '';
-    await renderEco(currentEco.id);
-  });
-});
-
-// -- adding an item from a part's page
-
-let addingRevision = null;
-
-async function openAddToEco(revisionId) {
-  addingRevision = currentPart.revision_views.find((r) => r.id === revisionId);
-  const drafts = await api('GET', '/api/ecos?state=draft');
-  $('ae-title').textContent = `${currentPart.number} rev ${addingRevision.label}`;
-  $('ae-eco').innerHTML = drafts.map((e) => `<option value="${escape(e.id)}">${escape(e.number)} — ${escape(e.title)}</option>`).join('')
-    + '<option value="">A new change order…</option>';
-  $('ae-new-title').value = '';
-  $('ae-action').value = addingRevision.editable ? 'release' : 'obsolete';
-  syncAddToEco();
-  $('add-to-eco-dialog').showModal();
-}
-
-function syncAddToEco() {
-  $('ae-new-label').hidden = $('ae-eco').value !== '';
-}
-
-$('ae-eco').addEventListener('change', syncAddToEco);
-
-$('add-to-eco-form').addEventListener('submit', (event) => {
-  if (event.submitter && event.submitter.value !== 'save') return;
-  event.preventDefault();
-  act(async () => {
-    let id = $('ae-eco').value;
-    if (!id) {
-      id = (await api('POST', '/api/ecos', { title: $('ae-new-title').value || `Change ${currentPart.number}` })).id;
-    }
-    await api('POST', `/api/ecos/${encodeURIComponent(id)}/items`, {
-      part: currentPart.id,
-      revision: addingRevision.id,
-      action: $('ae-action').value,
-    });
-    $('add-to-eco-dialog').close();
-    await renderPart(currentPart.id);
-  });
-});
-
-// -- settings
-
-function syncEcoModeFields() {
-  const mode = $('set-eco-mode').value;
-  $('set-eco-regex-label').hidden = mode !== 'pattern';
-  $('set-eco-script-label').hidden = mode !== 'script';
-  $('set-eco-counter').hidden = mode !== 'counter';
-  const digits = Math.max(1, Number($('set-eco-digits').value) || 1);
-  $('set-eco-preview').textContent = mode === 'counter'
-    ? `${$('set-eco-prefix').value}${String(Math.max(1, Number($('set-eco-next').value) || 1)).padStart(digits, '0')}`
-    : 'typed or decided by the script';
-}
-
-for (const id of ['set-eco-mode', 'set-eco-prefix', 'set-eco-digits', 'set-eco-next']) {
-  $(id).addEventListener('input', syncEcoModeFields);
-}
-
-async function renderEcoSettings(settings) {
-  const rule = settings.eco_review_rule;
-  $('set-eco-required').value = rule.required_approvals;
-  $('set-eco-due').value = rule.due_days;
-  $('set-eco-reviewers').value = reviewersText(rule.reviewers, reviewNames);
-  $('set-eco-self').checked = rule.allow_self_approval;
-  $('set-eco-holds').checked = settings.eco_holds_revisions;
-  const numbering = await api('GET', '/api/ecos/numbering');
-  $('set-eco-mode').value = numbering.mode.kind;
-  $('set-eco-regex').value = numbering.mode.regex || '';
-  $('set-eco-script').value = numbering.mode.script || '';
-  $('set-eco-prefix').value = numbering.prefix;
-  $('set-eco-digits').value = numbering.digits;
-  $('set-eco-next').value = numbering.next;
-  syncEcoModeFields();
-}
-
-function readEcoNumbering() {
-  const kind = $('set-eco-mode').value;
-  const mode = { kind };
-  if (kind === 'pattern') mode.regex = $('set-eco-regex').value;
-  if (kind === 'script') mode.script = $('set-eco-script').value;
-  return {
-    mode,
-    prefix: $('set-eco-prefix').value,
-    digits: Number($('set-eco-digits').value),
-    next: Number($('set-eco-next').value),
-  };
-}
 
 // --------------------------------------------------------------- workspace
 //

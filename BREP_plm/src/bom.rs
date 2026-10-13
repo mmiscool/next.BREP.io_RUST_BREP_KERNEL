@@ -44,7 +44,7 @@ pub const MAX_DEPTH: usize = 32;
 
 /// The revision a use points at: the pinned one, or for a floating use the
 /// child's current release, else its newest revision. `None` when a pinned
-/// revision no longer exists (a deleted draft from before that was refused).
+/// revision no longer exists.
 pub fn resolve<'a>(part: &'a Part, line: &Use) -> Option<&'a Revision> {
     if line.revision.is_empty() {
         part.current_release().or(part.latest())

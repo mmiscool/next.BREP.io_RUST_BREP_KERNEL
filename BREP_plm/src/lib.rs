@@ -52,11 +52,6 @@
 //! waits for the rule, and every revision carries a threaded discussion. One
 //! process holds a data directory at a time ([`dirlock`]).
 //!
-//! Change orders ([`eco`]): a set of revisions to release or obsolete, with
-//! its own numbering, reviewed as a whole and released as a whole — every
-//! item's gates and hooks, then all of them applied in one transaction, or
-//! none.
-//!
 //! Library import is designed but not built — where the design named a field it
 //! will need ([`model::Origin`], `external_ref`), the field is here and inert.
 //!
@@ -80,7 +75,6 @@ pub mod cad;
 pub mod catalog;
 pub mod db;
 pub mod dirlock;
-pub mod eco;
 pub mod family;
 pub mod journal;
 pub mod lifecycle;

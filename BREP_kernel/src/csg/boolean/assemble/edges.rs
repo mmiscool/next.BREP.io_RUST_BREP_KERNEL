@@ -5,7 +5,7 @@
 //! movement and nonincident face clearance checks. No station fit is used.
 
 use crate::{BrepSolid, KernelRefusal, KernelStage, KernelTolerances, NurbsCurve, NurbsSurface, OrRefuse, Vec3, Vec4};
-use rustc_hash::FxHashMap as HashMap;
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 /// An edge this pass replaced, with the curve it replaced.
 pub(in crate::boolean) struct ReplacedEdge {
@@ -341,6 +341,18 @@ fn candidate_from_image(image: &NurbsCurve, start: Vec3, end: Vec3, bar: f64) ->
 /// carriers by more than the joint bar, from a planar use's trim. Returns the
 /// edges replaced, with their previous curves.
 pub(in crate::boolean) fn reconstruct_edges_from_carriers(solid: &mut BrepSolid, tolerance: f64) -> Result<Vec<ReplacedEdge>, KernelRefusal> {
+    reconstruct_edges_from_carriers_in(solid, tolerance, None)
+}
+
+/// [`reconstruct_edges_from_carriers`] over the edges with a use on a face
+/// in `scope` (`None` reads every edge): a boolean passes the faces it
+/// touched; an edge between two untouched faces stands where the operand
+/// put it.
+pub(in crate::boolean) fn reconstruct_edges_from_carriers_in(
+    solid: &mut BrepSolid,
+    tolerance: f64,
+    scope: Option<&HashSet<u64>>,
+) -> Result<Vec<ReplacedEdge>, KernelRefusal> {
     let policy = KernelTolerances::for_solid(solid, 1e-7);
     let bar = policy.model.min(tolerance.max(1e-12));
     let carrier_band = policy.pcurve_consistency;
@@ -371,6 +383,9 @@ pub(in crate::boolean) fn reconstruct_edges_from_carriers(solid: &mut BrepSolid,
         }
         let Some(edge_uses) = uses.get(&edge.id) else { continue };
         if edge_uses.len() != 2 || edge_uses[0].0 == edge_uses[1].0 {
+            continue;
+        }
+        if scope.is_some_and(|scope| edge_uses.iter().all(|(face_index, _, _)| !scope.contains(&faces[*face_index].id))) {
             continue;
         }
         let surfaces = [&faces[edge_uses[0].0].surface, &faces[edge_uses[1].0].surface];

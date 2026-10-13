@@ -39,10 +39,12 @@ impl WorkbenchToolbarPanel {
     }
 
     /// Whether the strip is drawn this frame: the setting is on AND no special
-    /// mode owns the shell (a sketch creates no features; reference selection
-    /// hides the dock the new feature's form would open in).
+    /// mode owns the shell (a sketch creates no features; a card-based
+    /// reference pick hides the dock the new feature's form would open in). A
+    /// form field's pick keeps the strip on screen, its buttons disabled
+    /// (`offered_home_commands`), so the layout holds still while picking.
     pub fn visible(state: &EngineState) -> bool {
-        state.settings.show_workbench_toolbar && !state.sketch_mode() && !state.ref_select_active()
+        state.settings.show_workbench_toolbar && !state.any_sketch_mode() && !state.ref_select_modal()
     }
 
     /// Draw the strip as a top panel — called right AFTER the primary toolbar

@@ -803,6 +803,26 @@ pub fn rotate_faces(
     axis_direction: Vec3,
     angle_radians: f64,
 ) -> Result<BrepSolid, KernelRefusal> {
+    rotate_faces_rigid(
+        solid, face_ids, axis_point, axis_direction, angle_radians, Vec3::new(0.0, 0.0, 0.0),
+    )
+}
+
+/// Re-intersect against the final rigidly moved carriers. The translation is
+/// applied to the rotation's affine before solving any corner, so a combined
+/// face edit never has to build or validate a rotation-only intermediate body.
+/// The public rotation primitive uses exactly this solver with zero translation.
+pub(crate) fn rotate_faces_rigid(
+    solid: &BrepSolid,
+    face_ids: &[u64],
+    axis_point: Vec3,
+    axis_direction: Vec3,
+    angle_radians: f64,
+    translation: Vec3,
+) -> Result<BrepSolid, KernelRefusal> {
+    if !(translation.x.is_finite() && translation.y.is_finite() && translation.z.is_finite()) {
+        return Err(KernelRefusal::input(KernelStage::Collect, "translation", "rotate_faces: the translation must be finite"));
+    }
     if !(axis_point.x.is_finite() && axis_point.y.is_finite() && axis_point.z.is_finite()) {
         return Err(KernelRefusal::input(KernelStage::Collect, "axis_point", "rotate_faces: the axis point must be finite"));
     }
@@ -849,7 +869,10 @@ pub fn rotate_faces(
     // "The corner landed exactly where R put it": the rigid endpoints are
     // assigned `R(point)` verbatim, so this only absorbs rounding noise.
     let rigid_tolerance = (scale * 1e-9).max(1e-12);
-    let rotation = rotation_about(axis_point, axis, angle_radians).or_refuse(KernelStage::Collect, "rotation")?;
+    let mut rotation = rotation_about(axis_point, axis, angle_radians).or_refuse(KernelStage::Collect, "rotation")?;
+    rotation.elements[3] += translation.x;
+    rotation.elements[7] += translation.y;
+    rotation.elements[11] += translation.z;
 
     // --- Classify every edge by how the group uses it ----------------------
     let mut faces_of_edge: HashMap<u64, Vec<u64>> = HashMap::default();
@@ -866,7 +889,7 @@ pub fn rotate_faces(
         }
     }
     let invariant = |face_id: u64| -> bool {
-        carrier_invariant_under(
+        let rotation_invariant = carrier_invariant_under(
             solid,
             &face_lookup,
             face_id,
@@ -874,7 +897,28 @@ pub fn rotate_faces(
             axis,
             angular_tolerance,
             plane_tolerance,
-        )
+        );
+        if !rotation_invariant || translation.length() == 0.0 {
+            return rotation_invariant;
+        }
+        // A rigid corner may ride only when BOTH parts leave its carrier
+        // invariant. In particular, a plane spun within itself is no longer
+        // invariant when translated along its normal, nor is an axially shifted
+        // cone. A cylinder still admits a slide along its own axis.
+        let (shell, face) = face_lookup[&face_id];
+        let surface = &solid.shells[shell].faces[face].surface;
+        if let Some(AnalyticSurface::Plane { u_dir, v_dir, .. }) = surface.analytic() {
+            return u_dir.cross(*v_dir).normalized()
+                .map(|normal| normal.dot(translation).abs() <= rigid_tolerance)
+                .unwrap_or(false);
+        }
+        let Some((frame, rho0, rho1, _)) = carrier_ruled(solid, &face_lookup, face_id) else {
+            return false;
+        };
+        if (rho1 - rho0).abs() > 1e-9 * rho0.abs().max(rho1.abs()).max(1.0) {
+            return translation.length() <= rigid_tolerance;
+        }
+        translation.sub(frame.axis.scale(translation.dot(frame.axis))).length() <= rigid_tolerance
     };
 
     let mut classes: HashMap<u64, EdgeClass> = HashMap::default();
@@ -1060,7 +1104,15 @@ pub fn rotate_faces(
         // it is the right answer, and it is what makes a cap spun about its own
         // cylinder's axis return the input rather than dragging the rim's seam
         // vertex around a circle the wall's own seam edge cannot follow.
-        if adjacent.iter().all(|&face_id| invariant(face_id)) {
+        if adjacent.iter().all(|&face_id| invariant(face_id))
+            || (translation.length() > 0.0
+                && adjacent.iter().filter(|face_id| moved.contains(face_id))
+                    .all(|&face_id| invariant(face_id)))
+        {
+            // In a combined motion an axially spun/slid cylinder can stay
+            // invariant while its fixed cap would not. Only the selected
+            // carriers actually move: when they all stay put, so does this
+            // vertex, regardless of how the affine would move a fixed face.
             continue;
         }
         let fixed_at: Vec<u64> = adjacent

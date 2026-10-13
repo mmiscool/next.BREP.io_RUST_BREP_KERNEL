@@ -82,10 +82,13 @@ impl Viewport {
         // drawing (discarding would lose it silently, and refusing the switch
         // leaves a workbench that cannot draw its editor), and Finish refuses
         // nothing, so neither does this.
-        if crate::workbench::ecad::Target::of_workbench(&state.settings.workbench).is_some()
-            && state.sketch_mode()
-        {
-            let _ = state.exit_sketch_mode(true);
+        if crate::workbench::ecad::Target::of_workbench(&state.settings.workbench).is_some() {
+            if state.sketch_mode() {
+                let _ = state.exit_sketch_mode(true);
+            }
+            if state.sketch3d_mode() {
+                let _ = state.exit_sketch3d_mode(true);
+            }
         }
         let ppp = ui.ctx().pixels_per_point();
         // Empty frame → NO inner margin/padding: the 3D view fills the central
@@ -221,6 +224,9 @@ impl Viewport {
             // The armed gizmo's handle rects — `gizmo/…`, the VIEWPORT-hosted
             // widget panel, in SCREEN points like every other hit blob.
             crate::automation::registry::publish("__brepGizmoHit", "armed gizmo handle rects in screen points (anchor)", &gizmo_anchor_hits_json(self.last_rect, state));
+            // The open NURBS Solid's control-cage dots — `cage/point:<i>`, a
+            // VIEWPORT-hosted widget panel in SCREEN points.
+            crate::automation::registry::publish("__brepCageHit", "control-cage dot rects in screen points (point:<index>) while a NURBS Solid's form is open", &cage_point_hits_json(self.last_rect, state));
             // The DRAGGABLE constraint handles' grab points — `constraint/<id>`,
             // the other VIEWPORT-hosted widget panel, in SCREEN points.
             crate::automation::registry::publish("__brepConstraintHit", "draggable assembly-constraint handle rects in screen points (by constraint id)", &constraint_handle_hits_json(self.last_rect, state));
@@ -271,6 +277,122 @@ impl Viewport {
     /// hover lights the entity under the cursor. The ViewCube corner + wheel zoom
     /// keep working. NONE of the modeling select/candidate/transform/ref-select
     /// branches run here.
+    /// Pointer routing in 3D SKETCH mode — the planar handler's shape over the
+    /// 3D editor's calls: hover / select / point-drag through the live camera,
+    /// a draw tool's clicks PLACING points, right-click dropping the pending
+    /// clicks, Delete removing the selection, and an empty drag orbiting.
+    fn handle_sketch3d_input(
+        &mut self,
+        ui: &egui::Ui,
+        rect: egui::Rect,
+        response: &egui::Response,
+        state: &mut EngineState,
+    ) {
+        let local = |p: egui::Pos2| ((p.x - rect.min.x) as f64, (p.y - rect.min.y) as f64);
+        let draw_mode = state.sketch3d_active_tool().is_some();
+        if draw_mode && response.secondary_clicked() {
+            state.sketch3d_tool_cancel();
+        }
+        let delete = !ui.ctx().text_edit_focused()
+            && ui
+                .ctx()
+                .input(|i| i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace));
+        if delete {
+            state.sketch3d_delete_selection();
+        }
+        if response.drag_started() {
+            if let Some(pos) = response.interact_pointer_pos() {
+                let (lx, ly) = local(pos);
+                if let Some((cx, cy)) = self.viewcube_local(state, lx, ly) {
+                    state.viewcube_click(cx, cy);
+                } else if !draw_mode && state.sketch3d_drag_begin(lx, ly) {
+                    self.sketch3d_dragging = true;
+                } else {
+                    let btn = if response.dragged_by(egui::PointerButton::Secondary) {
+                        BUTTON_RIGHT
+                    } else if response.dragged_by(egui::PointerButton::Middle) {
+                        BUTTON_MIDDLE
+                    } else {
+                        BUTTON_LEFT
+                    };
+                    state.pointer_down(lx, ly, btn);
+                    self.dragging = true;
+                }
+            }
+        }
+        if response.dragged() {
+            if let Some(pos) = response.interact_pointer_pos() {
+                let (lx, ly) = local(pos);
+                if self.sketch3d_dragging {
+                    state.sketch3d_drag_to(lx, ly);
+                } else if self.dragging {
+                    state.pointer_move(lx, ly);
+                }
+            }
+        }
+        if response.drag_stopped() {
+            if self.sketch3d_dragging {
+                state.sketch3d_drag_end();
+                self.sketch3d_dragging = false;
+            }
+            if self.dragging {
+                state.pointer_up();
+                self.dragging = false;
+            }
+        }
+        if response.clicked() {
+            if let Some(pos) = response.interact_pointer_pos() {
+                let (lx, ly) = local(pos);
+                if let Some((cx, cy)) = self.viewcube_local(state, lx, ly) {
+                    state.viewcube_click(cx, cy);
+                } else if draw_mode {
+                    state.sketch3d_tool_click_at(lx, ly);
+                } else {
+                    let mods = ui.ctx().input(|i| i.modifiers);
+                    state.sketch3d_click_at(lx, ly, mods.command || mods.ctrl);
+                }
+            }
+        }
+        let primary_held = ui.input(|i| i.pointer.primary_down());
+        if !self.sketch3d_dragging && !self.dragging && !(primary_held && !draw_mode) {
+            match response.hover_pos() {
+                Some(pos) => {
+                    let (lx, ly) = local(pos);
+                    match self.viewcube_local(state, lx, ly) {
+                        Some((cx, cy)) => {
+                            state.viewcube_hover(cx, cy);
+                            state.sketch3d_clear_hover();
+                        }
+                        None => {
+                            state.viewcube_clear_hover();
+                            state.sketch3d_hover_at(lx, ly);
+                            // A draw tool lands on model geometry under the
+                            // cursor, and the reference tool links it: light
+                            // the vertex / edge / face it would take.
+                            if draw_mode {
+                                state.hover_at(lx, ly);
+                            }
+                        }
+                    }
+                }
+                None => {
+                    state.viewcube_clear_hover();
+                    state.sketch3d_clear_hover();
+                }
+            }
+        }
+        if response.hovered() {
+            let scroll_y = raw_wheel_delta_y(ui.ctx());
+            if scroll_y != 0.0 {
+                let cursor = response.hover_pos().map(|p| {
+                    let (lx, ly) = local(p);
+                    [lx, ly]
+                });
+                state.wheel(-(scroll_y as f64), cursor);
+            }
+        }
+    }
+
     fn handle_sketch_input(
         &mut self,
         ui: &egui::Ui,
@@ -504,6 +626,11 @@ impl Viewport {
             self.handle_sketch_input(ui, rect, response, state);
             return;
         }
+        // 3D sketch mode owns the pointer the same way, in screen space.
+        if state.sketch3d_mode() {
+            self.handle_sketch3d_input(ui, rect, response, state);
+            return;
+        }
 
         if response.drag_started() {
             if let Some(pos) = response.interact_pointer_pos() {
@@ -701,6 +828,17 @@ impl Viewport {
                     // The dwell is SPENT on the list it opened: dismissing this
                     // one must not leave a clock that re-opens it on the spot.
                     self.hover_lit_since = None;
+                } else if state.cage_edit_feature().is_some()
+                    && state
+                        .cage_point_pick_at(lx, ly, mods.command || mods.ctrl || mods.shift)
+                        .is_some()
+                {
+                    // A control point of the NURBS Solid whose cage editor is
+                    // open: selected — toggled into the selection with Ctrl /
+                    // Cmd / Shift held — and the transform gizmo arms at the
+                    // selection's centroid. The click stops here: the body
+                    // under the dot is not selected. Ahead of the Ctrl branch
+                    // because the modifier is the cage's additive select too.
                 } else if mods.command || mods.ctrl {
                     // Ctrl/Cmd+click ADDS/TOGGLES the top pick directly, no list
                     // (the classic additive shortcut, both multi-select modes).
@@ -1005,7 +1143,7 @@ impl Viewport {
         // A modal mode (reference-selection / sketch edit) supersedes the pick
         // list: drop a popup left open by modeling clicks so it neither draws
         // over the modal nor swallows the modal's first viewport click.
-        if state.ref_select_active() || state.sketch_mode() {
+        if state.ref_select_active() || state.any_sketch_mode() {
             self.candidate_popup = None;
         }
         let Some(popup) = self.candidate_popup.as_ref() else {
@@ -1308,6 +1446,42 @@ pub(super) fn gizmo_anchor_hits_json(view: Option<egui::Rect>, state: &EngineSta
                 .into_iter()
                 .map(|(key, point)| (format!("ball:{key}"), at(point))),
         )
+        .collect();
+    if hits.is_empty() {
+        return "{}".to_string();
+    }
+    crate::automation::hit_rects::hits_json(hits.iter().map(|(key, rect)| (key, rect)))
+}
+
+/// The open NURBS Solid's control-cage DOTS as zero-size rects in SCREEN
+/// points — the `__brepCageHit` blob, which merges under the panel name
+/// `cage` (`cage/point:<index>`, the cage's linear point index: `0` the
+/// bottom pole, then the rings bottom-up, the top pole last).
+///
+/// ITS OWN BLOB for the same two reasons as `gizmo/anchor`: the rects are the
+/// VIEWPORT's, and there is no `panel:clip` to scroll a dot into. A click on
+/// one is what `EngineState::cage_point_pick_at` answers with that point
+/// (the nearest dot within its pick radius), so `click_widget` on the key
+/// selects it, and with `modifiers_set {shift: true}` first toggles it into
+/// the selection.
+///
+/// Empty while no cage editor is open, or before the viewport has a rect.
+pub(super) fn cage_point_hits_json(view: Option<egui::Rect>, state: &EngineState) -> String {
+    let Some(view) = view else {
+        return "{}".to_string();
+    };
+    let hits: Vec<(String, egui::Rect)> = state
+        .cage_point_screen_points()
+        .into_iter()
+        .map(|(index, (x, y))| {
+            (
+                format!("point:{index}"),
+                egui::Rect::from_min_size(
+                    egui::pos2(view.min.x + x as f32, view.min.y + y as f32),
+                    egui::Vec2::ZERO,
+                ),
+            )
+        })
         .collect();
     if hits.is_empty() {
         return "{}".to_string();

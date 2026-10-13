@@ -43,6 +43,10 @@ pub(super) struct ImprintBuilder<'a> {
     pub(super) scale: f64,
     pub(super) vertices: Vec<ImprintVertex>,
     pub(super) vertex_radii: HashMap<u64, f64>,
+    /// What minted each vertex: an operand edge's crossing or pierce, or
+    /// a section end polished onto its two carriers. The lowest
+    /// dimension any mint reported wins.
+    pub(super) vertex_sources: HashMap<u64, JunctionSource>,
     pub(super) pieces: Vec<ImprintPieceRecord>,
     pub(super) by_face: HashMap<FaceKey, Vec<u64>>,
     pub(super) edge_splits: HashMap<(u8, u64), Vec<f64>>,
@@ -59,7 +63,78 @@ pub(super) struct ImprintBuilder<'a> {
     /// an exact analytic ring's origin split is the coalescer's exact-band
     /// closure, and dissolving it moved an offset shell's corners (see there).
     pub(super) marched_pieces: HashSet<u64>,
+    /// `(piece id, face)` of every pcurve the Hermite lane EMITTED rather
+    /// than fitted: the junction passes move its ends instead of re-marching
+    /// it, and the coincident merge re-keys it to the keeper.
+    pub(super) emitted_pcurves: HashSet<(u64, FaceKey)>,
+    /// Slice 1's `check` mode (`BREP_EXACT_ISO_PCURVES=check`): a pcurve
+    /// handed in exactly is built beside the fitted one, the two are compared
+    /// in 3-D on the face's chart and one census line is appended
+    /// (`BREP_EXACT_ISO_CENSUS=<file>`), and the FITTED one is kept, so the
+    /// record is the default lane's to the byte.
+    pub(super) exact_pcurve_check: bool,
     pub(super) next_id: u64,
+}
+
+/// `BREP_EXACT_ISO_CENSUS=<file>`: one line per checked pcurve, appended;
+/// `BREP_CENSUS_LABEL` names the run on every line.
+fn exact_iso_census(line: impl FnOnce() -> String) {
+    if let Ok(path) = std::env::var("BREP_EXACT_ISO_CENSUS") {
+        use std::io::Write;
+        let label = std::env::var("BREP_CENSUS_LABEL").unwrap_or_default();
+        if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+            let _ = writeln!(file, "exact-iso census: label={label} {}", line());
+        }
+    }
+}
+
+/// Largest 3-D distance over `samples` fractions of the piece's domain
+/// between the chart images of two pcurves, and of each from the curve.
+/// Each pcurve is read at the same FRACTION of its own domain (a fitted
+/// pcurve lives on `[0, 1]`, an exact one on the curve's knots); a
+/// parameter past a closed direction's domain is read a period in (the
+/// loops are drawn in a band), an open one clamped as the chart would.
+/// Returns the three distances and the curve parameter of the largest of
+/// the first.
+fn pcurve_images_apart(
+    chart: &NurbsSurface,
+    curve: &NurbsCurve,
+    fitted: &NurbsCurve,
+    exact: &NurbsCurve,
+    samples: usize,
+) -> Result<([f64; 3], f64), String> {
+    let [t0, t1] = curve.domain()?;
+    let (closed_u, closed_v) = chart.closed_directions()?;
+    let (du, dv) = (chart.domain_u()?, chart.domain_v()?);
+    let wrap = |value: f64, closed: bool, domain: [f64; 2]| -> f64 {
+        let period = domain[1] - domain[0];
+        if closed && period > 0.0 {
+            domain[0] + (value - domain[0]).rem_euclid(period)
+        } else {
+            value.clamp(domain[0], domain[1])
+        }
+    };
+    let [f0, f1] = fitted.domain()?;
+    let [e0, e1] = exact.domain()?;
+    let mut apart = [0.0_f64; 3];
+    let mut worst_t = t0;
+    for k in 0..=samples {
+        let fraction = k as f64 / samples as f64;
+        let t = t0 + (t1 - t0) * fraction;
+        let on_curve = curve.evaluate(t)?;
+        let a = fitted.evaluate(f0 + (f1 - f0) * fraction)?;
+        let b = exact.evaluate(e0 + (e1 - e0) * fraction)?;
+        let image_a = chart.evaluate(wrap(a.x, closed_u, du), wrap(a.y, closed_v, dv))?;
+        let image_b = chart.evaluate(wrap(b.x, closed_u, du), wrap(b.y, closed_v, dv))?;
+        let between = image_a.sub(image_b).length();
+        if between > apart[0] {
+            apart[0] = between;
+            worst_t = t;
+        }
+        apart[1] = apart[1].max(image_a.sub(on_curve).length());
+        apart[2] = apart[2].max(image_b.sub(on_curve).length());
+    }
+    Ok((apart, worst_t))
 }
 
 impl<'a> ImprintBuilder<'a> {
@@ -302,7 +377,10 @@ impl<'a> ImprintBuilder<'a> {
         test_faces: &[TaggedFace<'_>],
         target_faces: &[TaggedFace<'_>],
         refine: bool,
+        exact_pcurves: Option<[NurbsCurve; 2]>,
     ) -> Result<(), KernelRefusal> {
+        let profile = std::env::var_os("BREP_PROFILE").is_some();
+        let began = profile.then(Instant::now);
         let mut split_parameters = Vec::new();
         let mut fuzzy_junctions: Vec<(Vec3, f64)> = Vec::new();
         // Operand edges the section curve geometrically RIDES (the overlap
@@ -894,8 +972,11 @@ impl<'a> ImprintBuilder<'a> {
                     .collect::<Vec<_>>()
             );
         }
-        let mut pieces = Vec::new();
+        let crossing_ms = began.map_or(0.0, |start| start.elapsed().as_secs_f64() * 1000.0);
+        let emission_started = profile.then(Instant::now);
+        let mut pieces: Vec<(NurbsCurve, Option<[NurbsCurve; 2]>)> = Vec::new();
         let mut rest = curve;
+        let mut rest_pcurves = exact_pcurves;
         for parameter in split_parameters {
             if parameter <= curve_start + split_tolerance
                 || parameter >= curve_end - split_tolerance
@@ -903,16 +984,26 @@ impl<'a> ImprintBuilder<'a> {
                 continue;
             }
             let (left, right) = rest.split(parameter).or_refuse(KernelStage::Intersect, "split")?;
-            pieces.push(left);
+            // The pcurves share the curve's knots, so the same parameter splits
+            // them alike; a split that fails leaves both halves to the march.
+            let (left_pcurves, right_pcurves) = match rest_pcurves.take() {
+                Some([a, b]) => match (a.split(parameter), b.split(parameter)) {
+                    (Ok((a0, a1)), Ok((b0, b1))) => (Some([a0, b0]), Some([a1, b1])),
+                    _ => (None, None),
+                },
+                None => (None, None),
+            };
+            pieces.push((left, left_pcurves));
             rest = right;
+            rest_pcurves = right_pcurves;
         }
-        pieces.push(rest);
+        pieces.push((rest, rest_pcurves));
 
         let debug_process = std::env::var("BREP_DEBUG_PROCESS_CURVE").is_ok();
         if debug_process {
             let spans: Vec<String> = pieces
                 .iter()
-                .map(|piece| {
+                .map(|(piece, _)| {
                     piece
                         .domain()
                         .map(|[a, b]| format!("[{a:.4},{b:.4}]"))
@@ -927,7 +1018,7 @@ impl<'a> ImprintBuilder<'a> {
                 spans.join(" ")
             );
         }
-        for piece in pieces {
+        for (piece, piece_pcurves) in pieces {
             let [t0, t1] = piece.domain().or_refuse(KernelStage::Intersect, "domain")?;
             if debug_process {
                 eprintln!(
@@ -1068,6 +1159,11 @@ impl<'a> ImprintBuilder<'a> {
             }
             let (start_vertex_id, canonical_start) = self.vertex(start, start_radius);
             let (end_vertex_id, canonical_end) = self.vertex(end, end_radius);
+            for (vertex_id, fuzzy) in [(start_vertex_id, start_fuzzy.is_some()), (end_vertex_id, end_fuzzy.is_some())] {
+                let source = if fuzzy { JunctionSource::EdgePoint } else { JunctionSource::FacePoint };
+                let entry = self.vertex_sources.entry(vertex_id).or_insert(source);
+                *entry = (*entry).min(source);
+            }
             start = canonical_start;
             end = canonical_end;
             if start_vertex_id == end_vertex_id
@@ -1087,9 +1183,55 @@ impl<'a> ImprintBuilder<'a> {
                 continue;
             }
             let snapped = snap_curve_ends(&piece, start, end)?;
+            let exact_for = |face: &TaggedFace<'_>| -> Option<&NurbsCurve> {
+                let [on_first, on_second] = piece_pcurves.as_ref()?;
+                if face.key() == first.key() {
+                    Some(on_first)
+                } else if face.key() == second.key() {
+                    Some(on_second)
+                } else {
+                    None
+                }
+            };
+            let check = self.exact_pcurve_check;
+            let piece_id = self.next_id;
+            let pcurve_started = profile.then(Instant::now);
             let pcurves = attach
                 .iter()
                 .map(|face| {
+                    if let Some(exact) = exact_for(face) {
+                        let exact = super::hermite::piece_pcurve_on_chart(exact, face.chart(), start, end)
+                            .or_refuse(KernelStage::Intersect, "piece_pcurve_on_chart")?;
+                        if check {
+                            // Slice 1's census: the fit lane's pcurve stands,
+                            // the exact one is measured against it.
+                            let fitted = build_pcurve_on_surface_marched(face.chart(), &snapped)
+                                .or_refuse(KernelStage::Intersect, "build_pcurve_on_surface_marched")?;
+                            let (apart, worst_t) = pcurve_images_apart(face.chart(), &snapped, &fitted, &exact, 32)
+                                .or_refuse(KernelStage::Intersect, "pcurve_images_apart")?;
+                            exact_iso_census(|| {
+                                let at = |pcurve: &NurbsCurve| {
+                                    pcurve
+                                        .domain()
+                                        .and_then(|[q0, q1]| pcurve.evaluate(q0 + (q1 - q0) * (worst_t - t0) / (t1 - t0).max(1e-300)))
+                                        .map(|uv| format!("({:.6},{:.6})", uv.x, uv.y))
+                                        .unwrap_or_default()
+                                };
+                                format!(
+                                    "pair={}x{} face={}/{} piece={piece_id} lifted={} fitted_vs_exact={:.3e} fitted_off_curve={:.3e} exact_off_curve={:.3e} tolerance={:.3e} worst_t={worst_t:.6} fitted_uv={} exact_uv={} domain_u={:?} domain_v={:?}",
+                                    first.face.id, second.face.id, face.operand, face.face.id,
+                                    face.lifted.is_some(), apart[0], apart[1], apart[2], self.tolerance,
+                                    at(&fitted), at(&exact), face.chart().domain_u().unwrap_or_default(), face.chart().domain_v().unwrap_or_default()
+                                )
+                            });
+                            return Ok(FacePcurve { operand: face.operand, face_id: face.face.id, pcurve: fitted });
+                        }
+                        return Ok(FacePcurve {
+                            operand: face.operand,
+                            face_id: face.face.id,
+                            pcurve: exact,
+                        });
+                    }
                     Ok(FacePcurve {
                         operand: face.operand,
                         face_id: face.face.id,
@@ -1106,8 +1248,16 @@ impl<'a> ImprintBuilder<'a> {
                     })
                 })
                 .collect::<Result<Vec<_>, KernelRefusal>>()?;
+            if let Some(start) = pcurve_started {
+                eprintln!("imprint.process_pcurves ms={:.3}", start.elapsed().as_secs_f64() * 1000.0);
+            }
             let id = self.next_id;
             self.next_id += 1;
+            for face in &attach {
+                if exact_for(face).is_some() && !check {
+                    self.emitted_pcurves.insert((id, face.key()));
+                }
+            }
             if debug_process {
                 eprintln!(
                     "process_curve[{:?}/{:?}]: MINT piece {id} [{t0:.4},{t1:.4}] attach={:?}",
@@ -1130,6 +1280,9 @@ impl<'a> ImprintBuilder<'a> {
                 support_faces: [first.key(), second.key()],
                 shared_edge: None,
             });
+        }
+        if let Some(start) = emission_started {
+            eprintln!("imprint.process_time crossing={crossing_ms:.3} emission={:.3}", start.elapsed().as_secs_f64() * 1000.0);
         }
         Ok(())
     }

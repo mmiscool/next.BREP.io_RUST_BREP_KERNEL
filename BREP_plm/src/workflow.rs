@@ -82,7 +82,6 @@ pub struct Definition {
     pub id: String,
     pub name: String,
     pub description: String,
-    pub kind: String,
     pub active: bool,
     pub require_for_release: bool,
     pub part_types: Vec<String>,
@@ -310,19 +309,6 @@ fn validate(state: &State, definition: &Definition) -> Result<(), Error> {
             "workflow needs a name; maximum 100 nodes, 300 paths and 100 fields",
         ));
     }
-    if definition.require_for_release && definition.kind != "release" {
-        return Err(Error::bad_request(
-            "only release workflows can be required for release",
-        ));
-    }
-    if !matches!(
-        definition.kind.as_str(),
-        "general" | "release" | "change_request"
-    ) {
-        return Err(Error::bad_request(
-            "choose general, release or change_request workflow",
-        ));
-    }
     for kind in &definition.part_types {
         if state.part_type(kind).is_none() {
             return Err(Error::bad_request("unknown workflow part type"));
@@ -345,15 +331,15 @@ fn validate(state: &State, definition: &Definition) -> Result<(), Error> {
         }
         if !matches!(
             node.kind.as_str(),
-            "start" | "end" | "form" | "review" | "script" | "check" | "status" | "fork" | "join"
+            "start" | "end" | "form" | "review" | "decision" | "script" | "check" | "decision-script" | "status" | "fork" | "join"
         ) {
             return Err(Error::bad_request("unknown workflow node kind"));
         }
-        if matches!(node.kind.as_str(), "form" | "review") && node.assignees.is_empty() {
+        if matches!(node.kind.as_str(), "form" | "review" | "decision") && node.assignees.is_empty() {
             return Err(Error::bad_request("human steps need assignees"));
         }
         check_selectors(state, &node.assignees, false)?;
-        if matches!(node.kind.as_str(), "script" | "check")
+        if matches!(node.kind.as_str(), "script" | "check" | "decision-script")
             && (node.code.trim().is_empty() || node.code.len() > 64000)
         {
             return Err(Error::bad_request(
@@ -403,6 +389,13 @@ fn validate(state: &State, definition: &Definition) -> Result<(), Error> {
             return Err(Error::bad_request(
                 "each non-End step needs an outgoing path",
             ));
+        }
+    }
+    for node in definition.nodes.iter().filter(|n| matches!(n.kind.as_str(), "decision" | "decision-script")) {
+        let paths: Vec<_> = definition.edges.iter().filter(|e| e.from == node.id).collect();
+        let outcomes: BTreeSet<_> = paths.iter().map(|e| e.on.as_str()).collect();
+        if paths.len() < 2 || paths.len() != outcomes.len() || outcomes.contains("always") {
+            return Err(Error::bad_request("decisions need at least two uniquely named outgoing paths; always is not a decision outcome"));
         }
     }
     // Topological sort also rejects loops. Every node must be reachable.
@@ -471,8 +464,8 @@ impl Db {
             validate(state,&definition)?;
             if self.security().config.lock_script_editor || !state.settings.script_editor_enabled {
                 let previous=state.workflows.iter().find(|d|d.id==definition.id);
-                for node in definition.nodes.iter().filter(|n|matches!(n.kind.as_str(),"script"|"check")) {
-                    if !previous.is_some_and(|d|d.nodes.iter().any(|n|n.id==node.id && n.code==node.code && matches!(n.kind.as_str(),"script"|"check"))) {
+                for node in definition.nodes.iter().filter(|n|matches!(n.kind.as_str(),"script"|"check"|"decision-script")) {
+                    if !previous.is_some_and(|d|d.nodes.iter().any(|n|n.id==node.id && n.code==node.code && matches!(n.kind.as_str(),"script"|"check"|"decision-script"))) {
                         return Err(Error::forbidden("workflow JavaScript editing is disabled by server script-editor policy"));
                     }
                 }
@@ -575,7 +568,7 @@ impl Db {
                     })
                     .map(|u| u.id.clone())
                     .collect();
-                if matches!(node.kind.as_str(), "form" | "review")
+                if matches!(node.kind.as_str(), "form" | "review" | "decision")
                     && (assignees.is_empty() || node.approvals > assignees.len())
                 {
                     return Err(Error::bad_request(format!(
@@ -671,9 +664,6 @@ impl Db {
         comment: &str,
         fields: Map<String, Value>,
     ) -> Result<(), Error> {
-        if !matches!(outcome, "success" | "reject") {
-            return Err(Error::bad_request("choose success or reject"));
-        }
         if comment.len() > 20000 {
             return Err(Error::bad_request("comment is too long"));
         }
@@ -709,6 +699,13 @@ impl Db {
                 .find(|n| n.id == node_id)
                 .cloned()
                 .ok_or_else(|| Error::not_found("workflow step"))?;
+            if node.kind == "decision" {
+                if !run.definition.edges.iter().any(|e| e.from == node_id && e.on == outcome) {
+                    return Err(Error::bad_request("choose one of this decision's outgoing paths"));
+                }
+            } else if !matches!(node.kind.as_str(), "form" | "review") || !matches!(outcome, "success" | "reject") {
+                return Err(Error::bad_request("choose success or reject for a human form or review step"));
+            }
             let step = run.steps.get(node_id).unwrap();
             if step.state != "waiting" || !step.assignees.contains(&user.id) {
                 return Err(Error::forbidden("this step is not waiting on you"));
@@ -717,7 +714,7 @@ impl Db {
                 return Err(Error::conflict("you already completed this step"));
             }
             fields_patch(run, user, node_id, &fields, false)?;
-            if outcome == "success" {
+            if outcome == "success" || node.kind == "decision" {
                 required(run, node_id)?;
             }
             let step = run.steps.get_mut(node_id).unwrap();
@@ -737,7 +734,7 @@ impl Db {
             } else {
                 1
             };
-            if outcome == "reject"
+            if node.kind == "decision" || outcome == "reject"
                 || step
                     .decisions
                     .iter()
@@ -751,7 +748,9 @@ impl Db {
             event(
                 run,
                 node_id,
-                if outcome == "success" {
+                if node.kind == "decision" {
+                    "path_chosen_by_user"
+                } else if outcome == "success" {
                     "completed_by_user"
                 } else {
                     "rejected_by_user"
@@ -821,12 +820,12 @@ impl Db {
                             run.steps.get_mut(&node.id).unwrap().state="skipped".into();
                             event(run,&node.id,"skipped",&executor,"No selected incoming path");changed=true;continue;
                         }
-                        if matches!(node.kind.as_str(),"form"|"review") {
+                        if matches!(node.kind.as_str(),"form"|"review"|"decision") {
                             run.steps.get_mut(&node.id).unwrap().state="waiting".into();
                             let assigned=run.steps[&node.id].assignees.iter().filter_map(|id|names.get(id)).cloned().collect::<Vec<_>>().join(", ");
                             event(run,&node.id,"assigned",&executor,assigned);changed=true;continue;
                         }
-                        if let Err(error)=if matches!(node.kind.as_str(),"script"|"check") {Ok(())}else{required(run,&node.id)} {
+                        if let Err(error)=if matches!(node.kind.as_str(),"script"|"check"|"decision-script") {Ok(())}else{required(run,&node.id)} {
                             run.steps.get_mut(&node.id).unwrap().state="failed".into();run.state="blocked".into();
                             event(run,&node.id,"failed",&executor,error.to_string());return Ok(None);
                         }
@@ -924,8 +923,11 @@ impl Db {
         let input = json!({"runId":run.id,"nodeId":node.id,"idempotencyKey":format!("{}:{}",run.id,node.id),"fields":run.fields,"partId":run.part,"revisionId":run.revision,"modelHash":run.model_hash,"initiator":run.initiator_name,"attempt":run.steps[&node.id].attempt});
         match scripting::run_source(self, executor, &node.code, "workflow.js", "step", &input) {
             scripting::HookResult::Returned(success) => {
-                if success.value == Value::Bool(false) {
+                if success.value == Value::Bool(false) && node.kind != "decision-script" {
                     return Ok(("reject".into(), Map::new(), success.logs));
+                }
+                if node.kind == "decision-script" && success.value.get("outcome").and_then(Value::as_str).is_none() {
+                    return Err(Error::bad_request("decision script must return an explicit outcome naming an outgoing path"));
                 }
                 let outcome = success
                     .value
@@ -937,6 +939,9 @@ impl Db {
                     return Err(Error::bad_request(
                         "script outcome needs a nonempty name up to 80 bytes",
                     ));
+                }
+                if node.kind == "decision-script" && !run.definition.edges.iter().any(|e| e.from == node.id && e.on == outcome) {
+                    return Err(Error::bad_request("decision script must return the name of an outgoing path in outcome"));
                 }
                 let fields = match success.value.get("fields") {
                     Some(Value::Object(map)) => map.clone(),
@@ -1005,7 +1010,7 @@ pub fn inbox(state: &State, user: &User) -> Vec<Value> {
             let waiting=step.state=="waiting" && step.assignees.contains(&user.id) && !step.decisions.iter().any(|d|d.user_id==user.id);
             let failed=user.is_admin() && step.state=="failed";
             if !waiting && !failed {return None;}
-            Some(json!({"kind":"workflow","target":run.id,"node":node.id,"title":run.title,"name":node.label,"state":step.state,"approvals":step.decisions.iter().filter(|d|d.outcome=="success").count(),"required_approvals":if node.approvals==0{step.assignees.len()}else{node.approvals},"initiator":run.initiator,"due":0,"overdue":false}))
+            Some(json!({"kind":"workflow","target":run.id,"node":node.id,"title":run.title,"name":node.label,"state":step.state,"approvals":step.decisions.iter().filter(|d|d.outcome=="success").count(),"required_approvals":if node.kind!="review"{1}else if node.approvals==0{step.assignees.len()}else{node.approvals},"initiator":run.initiator,"due":0,"overdue":false}))
         }).collect::<Vec<_>>()
     }).collect()
 }
@@ -1051,7 +1056,6 @@ pub fn release_gate(
         .iter()
         .filter(|d| {
             d.active
-                && d.kind == "release"
                 && d.require_for_release
                 && (d.part_types.is_empty() || d.part_types.contains(&part.part_type))
         })

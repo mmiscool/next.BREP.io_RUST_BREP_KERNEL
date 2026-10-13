@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:brep="https://brep.io/icons"
+     viewBox="0 0 24 24" width="24" height="24" brep:glyph-name="icon_feat_nurbs_solid" brep:unicode="E05F">
+  <!-- A smooth blob inside its control cage: the body is lit like the other primitives, the cage is drawn over it with its points as dots. -->
+  <path d="M6.2 13.2C5.6 9.4 8.2 5.6 12.3 5.6C16.6 5.6 19.1 9.3 18.4 13.4C17.8 17 15.2 19.2 11.8 19.1C8.4 19 6.7 16.6 6.2 13.2Z" fill="#f0b840" stroke="#7a4d10" stroke-width="1.2"/>
+  <path d="M7.4 11.2C7.9 8.2 9.8 6.5 12.3 6.5C14.9 6.5 16.9 8.3 17.2 11.1C14 12.4 10.6 12.4 7.4 11.2Z" fill="#ffd977"/>
+  <path d="M3.5 4.5 20.5 3.5 21.5 15.5 5 18.5Z" style="fill:none" stroke="#7a4d10" stroke-width="1.1" stroke-linejoin="round"/>
+  <path d="M3.5 4.5 12 9.5 20.5 3.5M5 18.5 12 9.5 21.5 15.5" style="fill:none" stroke="#7a4d10" stroke-width="1.1" stroke-linejoin="round"/>
+  <circle cx="3.5" cy="4.5" r="1.6" fill="#d94438" stroke="#7a4d10" stroke-width="0.8"/>
+  <circle cx="20.5" cy="3.5" r="1.6" fill="#d94438" stroke="#7a4d10" stroke-width="0.8"/>
+  <circle cx="21.5" cy="15.5" r="1.6" fill="#d94438" stroke="#7a4d10" stroke-width="0.8"/>
+  <circle cx="5" cy="18.5" r="1.6" fill="#d94438" stroke="#7a4d10" stroke-width="0.8"/>
+  <circle cx="12" cy="9.5" r="1.6" fill="#d94438" stroke="#7a4d10" stroke-width="0.8"/>
+</svg>

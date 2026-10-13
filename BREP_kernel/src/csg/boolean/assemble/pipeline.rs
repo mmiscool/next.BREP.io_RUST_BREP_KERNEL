@@ -2,7 +2,77 @@ use crate::{KernelRefusal, KernelStage, OrRefuse, RefusalClass};
 use super::*;
 use super::builder::{face_name_in_solids, snap_edge_curve_endpoints, source_edge, AssembleIndex};
 use super::edge_conform::{conform_overlapping_one_use_edges, edge_lies_on};
-use super::refusal_welds::{refresh_derived_genus, weld_identical_coincident_one_use_edges, weld_tangency_duplicate_vertices};
+use super::refusal_welds::{
+    refresh_derived_genus, split_vertices_shared_across_shells, weld_identical_coincident_one_use_edges,
+    weld_open_loop_corners, weld_tangency_duplicate_vertices,
+};
+
+/// Which result faces the operation TOUCHED, read off the touch census of
+/// the fragments they were built from (`touch.rs`).
+pub(in crate::boolean) struct AssemblyScope {
+    /// Result faces built from a touched fragment.
+    pub(in crate::boolean) touched: HashSet<u64>,
+    /// The touched faces and every face sharing a vertex with one: the faces
+    /// whose geometry the acceptance passes read. A face outside this set is
+    /// an operand's face carried through unchanged, with every vertex it
+    /// stands on shared only with faces carried through the same way.
+    pub(in crate::boolean) examined: HashSet<u64>,
+    /// Result face id → the operand its fragment came from.
+    pub(in crate::boolean) operand_of: HashMap<u64, u8>,
+}
+
+impl AssemblyScope {
+    fn build(
+        origins: &[(u64, u8, bool)],
+        shells: &[ShellRecord],
+        edges: &[EdgeRecord],
+        aliases: &HashMap<u64, u64>,
+    ) -> Self {
+        let canonical = |mut id: u64| {
+            while let Some(&next) = aliases.get(&id) {
+                id = next;
+            }
+            id
+        };
+        let edge_vertices: HashMap<u64, (u64, u64)> = edges
+            .iter()
+            .map(|edge| (edge.id, (canonical(edge.start_vertex_id), canonical(edge.end_vertex_id))))
+            .collect();
+        let touched: HashSet<u64> = origins
+            .iter()
+            .filter(|(_, _, touched)| *touched)
+            .map(|(face_id, _, _)| *face_id)
+            .collect();
+        let operand_of: HashMap<u64, u8> =
+            origins.iter().map(|(face_id, operand, _)| (*face_id, *operand)).collect();
+        let mut vertex_faces: HashMap<u64, Vec<u64>> = HashMap::default();
+        let mut face_vertices: HashMap<u64, Vec<u64>> = HashMap::default();
+        for face in shells.iter().flat_map(|shell| &shell.faces) {
+            for coedge in face.loops.iter().flat_map(|loop_record| &loop_record.coedges) {
+                let Some(&(start, end)) = edge_vertices.get(&coedge.edge_id) else {
+                    continue;
+                };
+                for vertex in [start, end] {
+                    let users = vertex_faces.entry(vertex).or_default();
+                    if !users.contains(&face.id) {
+                        users.push(face.id);
+                    }
+                    let owned = face_vertices.entry(face.id).or_default();
+                    if !owned.contains(&vertex) {
+                        owned.push(vertex);
+                    }
+                }
+            }
+        }
+        let mut examined = touched.clone();
+        for face_id in &touched {
+            for vertex in face_vertices.get(face_id).map(Vec::as_slice).unwrap_or(&[]) {
+                examined.extend(vertex_faces.get(vertex).into_iter().flatten().copied());
+            }
+        }
+        Self { touched, examined, operand_of }
+    }
+}
 
 fn assemble_fragments_impl(
     selected: Vec<FaceFragmentRecord>,
@@ -10,7 +80,9 @@ fn assemble_fragments_impl(
     imprint: &ImprintResultRecord,
     tolerance: f64,
     allow_open: bool,
-) -> Result<BrepSolid, KernelRefusal> {
+    touch: Option<&TouchCensus>,
+    touched_passes: bool,
+) -> Result<(BrepSolid, Option<AssemblyScope>), KernelRefusal> {
     if selected.is_empty() {
         return Err(KernelRefusal::new(
             RefusalClass::ConservativeEmptyOverlap,
@@ -32,6 +104,8 @@ fn assemble_fragments_impl(
         next_coedge_id: 1,
         next_loop_id: 1,
         next_face_id: 1,
+        edge_by_boundary_key: HashMap::default(),
+        edge_tangent_side: HashMap::default(),
     };
     let mut faces = Vec::new();
     let mut used_face_names = HashSet::<String>::default();
@@ -42,14 +116,48 @@ fn assemble_fragments_impl(
     let index = AssembleIndex::build(solids, imprint);
     let dbg_asm = std::env::var("BREP_DEBUG_ASM_EDGES").is_ok();
     let mut dbg_edge_src: HashMap<u64, Vec<String>> = HashMap::default();
+    // (result face id, operand, touched) per face built, for the scope.
+    let mut origins: Vec<(u64, u8, bool)> = Vec::new();
+    // The pieces an imprinted TANGENT section was minted as
+    // (`TangentSectionRecord::piece_ids`): their coedges carry a material
+    // side into the weld (`SourceEdge::tangent_side`).
+    let tangent_pieces: HashSet<u64> = imprint
+        .tangent_sections
+        .iter()
+        .flat_map(|section| section.piece_ids.iter().copied())
+        .collect();
     for fragment in selected {
         let dbg_operand = fragment.operand;
         let dbg_face = fragment.source_face_id;
+        let mut untouched = false;
+        if let Some(touch) = touch {
+            let touched = touch.is_touched(fragment.operand, fragment.source_face_id);
+            origins.push((assembler.next_face_id, fragment.operand, touched));
+            untouched = touched_passes && !touched;
+        }
         let mut loops = Vec::new();
         for fragment_loop in fragment.loops {
             let mut coedges = Vec::new();
             for usage in fragment_loop.coedges {
-                let source = source_edge(&usage.source, &index)?;
+                let mut source = source_edge(&usage.source, &index)?;
+                if let crate::fragment::FragmentEdgeSource::Imprint { piece_id } = &usage.source {
+                    if tangent_pieces.contains(piece_id) {
+                        source.tangent_side = tangent_material_side(
+                            &source,
+                            usage.forward,
+                            &usage.pcurve,
+                            &fragment.surface,
+                            fragment.same_sense,
+                        );
+                        // The result names its tangent edges: `tangent` after
+                        // the section's face-pair name (`a|b|tangent`), or
+                        // `tangent` alone on unnamed operands.
+                        source.name = Some(match source.name.take() {
+                            Some(name) => format!("{name}|{TANGENT_EDGE_NAME}"),
+                            None => TANGENT_EDGE_NAME.to_string(),
+                        });
+                    }
+                }
                 let dbg_desc = if dbg_asm {
                     Some(format!(
                         "{:?} bkey={:?} name={:?} s=({:.5},{:.5},{:.5}) e=({:.5},{:.5},{:.5}) face={}:{}",
@@ -63,7 +171,11 @@ fn assemble_fragments_impl(
                 } else {
                     None
                 };
-                let (edge_id, reversed) = assembler.edge(source, usage.forward)?;
+                let (edge_id, reversed) = if untouched {
+                    assembler.edge_untouched(source, usage.forward)?
+                } else {
+                    assembler.edge(source, usage.forward)?
+                };
                 if let Some(desc) = dbg_desc {
                     dbg_edge_src.entry(edge_id).or_default().push(desc);
                 }
@@ -139,8 +251,36 @@ fn assemble_fragments_impl(
     // boundaries that failed to weld. Fuse identical coincident duplicates so the
     // shell closes. Skipped for intentionally-open sheets (their boundary edges
     // are legitimately one-use).
+    // A closed loop that walks from one section curve onto another at an
+    // isolated tangent node arrives at a DIFFERENT vertex than it left (the
+    // two curves were split at the node by two arrangements, a chord error
+    // apart); weld those corners shut. Section-to-section corners only: a
+    // gap against an operand edge belongs to the conformance lanes below.
     if !allow_open {
         weld_identical_coincident_one_use_edges(&mut assembler, &mut faces)?;
+        // Section edges: the imprint's pieces and the sub-edges the
+        // arrangement derived from them — every edge that is not an
+        // operand's (those carry a boundary key).
+        let section_edges: HashSet<u64> = assembler
+            .edges
+            .iter()
+            .map(|edge| edge.id)
+            .filter(|id| !assembler.edge_boundary_key.contains_key(id))
+            .collect();
+        let welded_corners = weld_open_loop_corners(
+            &mut assembler.vertices,
+            &mut assembler.edges,
+            &faces,
+            &section_edges,
+            tolerance,
+        );
+        if !welded_corners.is_empty() && std::env::var("BREP_DEBUG_BOOL").is_ok() {
+            eprintln!(
+                "boolean assembly welded {} open loop corner(s) at vertices {:?}",
+                welded_corners.len(),
+                welded_corners
+            );
+        }
     }
     if profile {
         eprintln!(
@@ -193,6 +333,15 @@ fn assemble_fragments_impl(
             faces,
         })
         .collect::<Vec<_>>();
+    let scope = touch.map(|_| {
+        AssemblyScope::build(&origins, &shells, &assembler.edges, &assembler.vertex_aliases)
+    });
+    // The geometry checks of a scoped validation read the examined faces
+    // only; every structural check still reads the whole solid.
+    let validate_in = |solid: &BrepSolid| match &scope {
+        Some(scope) => solid.validate_scoped(&scope.examined),
+        None => solid.validate(),
+    };
     let used_edges = edge_faces.keys().copied().collect::<HashSet<_>>();
     assembler.edges.retain(|edge| used_edges.contains(&edge.id));
     let used_vertices = assembler
@@ -217,6 +366,7 @@ fn assemble_fragments_impl(
             edges: assembler.edges,
             shells,
             genus: 0,
+            kind: crate::BodyKind::Solid,
         };
         // EDGE RECONSTRUCTION on the open path (`edges.rs`): the offset
         // shell's welded edges stand off their carriers from here on
@@ -226,7 +376,13 @@ fn assemble_fragments_impl(
         // the pass's own bounds decide each edge.
         let stage_started = Instant::now();
         let settled = settle_vertices_onto_carriers(&mut solid, tolerance, &assembler.imprint_edges)?;
+        if profile {
+            eprintln!("assemble.open_settle_ms={:.2}", stage_started.elapsed().as_secs_f64() * 1_000.0);
+        }
         let rebuilt = reconstruct_edges_from_carriers(&mut solid, tolerance)?;
+        if profile {
+            eprintln!("assemble.open_reconstruct_ms={:.2}", stage_started.elapsed().as_secs_f64() * 1_000.0);
+        }
         let trims = close_trim_loop_joints(&mut solid, tolerance)?;
         if profile {
             eprintln!(
@@ -237,7 +393,7 @@ fn assemble_fragments_impl(
                 trims.len()
             );
         }
-        return Ok(solid);
+        return Ok((solid, None));
     }
     let face_count: i64 = shells.iter().map(|shell| shell.faces.len() as i64).sum();
     let hole_count: i64 = shells
@@ -352,6 +508,7 @@ fn assemble_fragments_impl(
                 edges: assembler.edges.clone(),
                 shells: shells.clone(),
                 genus: 0,
+                kind: crate::BodyKind::Solid,
             };
             if let Some(repaired) = repair_open_assembly_via_heal_chain(provisional, tolerance) {
                 if std::env::var("BREP_DEBUG_BOOL").is_ok() {
@@ -361,7 +518,8 @@ fn assemble_fragments_impl(
                         "boolean assembly repaired {one_use_before} one-use edges via heal chain"
                     );
                 }
-                return Ok(repaired);
+                // The heal chain rebuilt the body; nothing passes through it.
+                return Ok((repaired, None));
             }
         }
         let one_use = edge_faces
@@ -475,6 +633,35 @@ fn assemble_fragments_impl(
             },
         )));
     }
+    // A vertex used by edges of two edge-disconnected shells is a point
+    // contact between two bodies (the subtract that cuts a cylinder with an
+    // equal-radius crossing cylinder leaves two pieces touching at the two
+    // tangent points). Each shell gets its own vertex there: two closed
+    // manifold shells, no pinch, and a genus read off each one's own count.
+    // Runs after the Euler-gated welds above, whose nearest-pair search would
+    // otherwise merge the copies straight back.
+    if shells.len() > 1 {
+        let split = split_vertices_shared_across_shells(
+            &mut assembler.vertices,
+            &mut assembler.edges,
+            &shells,
+            &mut assembler.next_vertex_id,
+        );
+        if split > 0 {
+            edge_count = assembler
+                .edges
+                .iter()
+                .filter(|edge| !edge.degenerate)
+                .count() as i64;
+            let euler = assembler.vertices.len() as i64 - edge_count + face_count - hole_count;
+            numerator = shells.len() as i64 * 2 - euler;
+            if std::env::var("BREP_DEBUG_BOOL").is_ok() {
+                eprintln!(
+                    "boolean assembly split {split} welded node vertex/vertices between shells (numerator now {numerator})"
+                );
+            }
+        }
+    }
     let solid = BrepSolid {
         mass_properties_cache: Default::default(),
         id: 1,
@@ -482,9 +669,33 @@ fn assemble_fragments_impl(
         edges: assembler.edges,
         shells,
         genus: numerator / 2,
+        kind: crate::BodyKind::Solid,
     };
+    let (touched_faces, examined_faces) = match (&scope, touched_passes) {
+        (Some(scope), true) => (Some(&scope.touched), Some(&scope.examined)),
+        _ => (None, None),
+    };
+    let touched_vertices: Option<HashSet<u64>> = touched_faces.map(|faces| {
+        let edge_vertices: HashMap<u64, (u64, u64)> = solid
+            .edges
+            .iter()
+            .map(|edge| (edge.id, (edge.start_vertex_id, edge.end_vertex_id)))
+            .collect();
+        solid
+            .shells
+            .iter()
+            .flat_map(|shell| &shell.faces)
+            .filter(|face| faces.contains(&face.id))
+            .flat_map(|face| face.loops.iter().flat_map(|loop_record| &loop_record.coedges))
+            .filter_map(|coedge| edge_vertices.get(&coedge.edge_id))
+            .flat_map(|&(start, end)| [start, end])
+            .collect()
+    });
     let stage_started = Instant::now();
-    let mut solid = merge_curve_continuation_edges(&solid, tolerance)?;
+    let mut solid = match &touched_vertices {
+        Some(vertices) => crate::coalesce::merge_curve_continuation_edges_at(&solid, tolerance, vertices)?,
+        None => merge_curve_continuation_edges(&solid, tolerance)?,
+    };
     if profile {
         eprintln!(
             "assemble.continuation_ms={:.2}",
@@ -492,7 +703,7 @@ fn assemble_fragments_impl(
         );
     }
     let stage_started = Instant::now();
-    let polished = polish_triple_junction_vertices(&mut solid, tolerance)?;
+    let polished = polish_triple_junction_vertices_in(&mut solid, tolerance, touched_vertices.as_ref())?;
     if profile {
         eprintln!(
             "assemble.junction_ms={:.2} polished={polished}",
@@ -507,7 +718,7 @@ fn assemble_fragments_impl(
     // the same shell-aware formula validate() checks against.
     refresh_derived_genus(&mut solid);
     let stage_started = Instant::now();
-    let mut issues = solid.validate();
+    let mut issues = validate_in(&solid);
     if profile {
         eprintln!(
             "assemble.validate_ms={:.2}",
@@ -530,7 +741,7 @@ fn assemble_fragments_impl(
         if conformed > 0 {
             CONFORMANCE_REPAIRS.with(|count| count.set(count.get() + conformed as u64));
             refresh_derived_genus(&mut solid);
-            issues = solid.validate();
+            issues = validate_in(&solid);
             if std::env::var("BREP_DEBUG_BOOL").is_ok() {
                 eprintln!(
                     "boolean assembly conformed {conformed} unmatched one-use edges at validation ({} issues remain)",
@@ -591,7 +802,7 @@ fn assemble_fragments_impl(
         }
         if snapped_any {
             refresh_derived_genus(&mut solid);
-            issues = solid.validate();
+            issues = validate_in(&solid);
             if std::env::var("BREP_DEBUG_BOOL").is_ok() {
                 eprintln!(
                     "boolean assembly snapped curve endpoints onto vertices ({} issues remain)",
@@ -608,14 +819,25 @@ fn assemble_fragments_impl(
         // standoffs, so this runs on the validated result; a set the
         // validator then disagrees with is put back whole.
         let stage_started = Instant::now();
-        let settled = settle_vertices_onto_carriers(&mut solid, tolerance, &assembler.imprint_edges)?;
-        let rebuilt = reconstruct_edges_from_carriers(&mut solid, tolerance)?;
-        let trims = close_trim_loop_joints(&mut solid, tolerance)?;
+        let mut pass_started = Instant::now();
+        let mut pass_ms = |label: &str, pass_started: &mut Instant| {
+            if profile {
+                eprintln!("assemble.edges.{label}_ms={:.2}", pass_started.elapsed().as_secs_f64() * 1_000.0);
+                *pass_started = Instant::now();
+            }
+        };
+        let settled = settle_vertices_onto_carriers_in(&mut solid, tolerance, &assembler.imprint_edges, touched_vertices.as_ref())?;
+        pass_ms("settle", &mut pass_started);
+        let rebuilt = reconstruct_edges_from_carriers_in(&mut solid, tolerance, touched_faces)?;
+        pass_ms("reconstruct", &mut pass_started);
+        let trims = close_trim_loop_joints_in(&mut solid, tolerance, examined_faces)?;
+        pass_ms("joints", &mut pass_started);
         // The DERIVED inherited-trim challenger (`inherited.rs`): output uses
         // of operand edges only, restored first if the stage goes back.
-        let inherited = super::inherited::challenge_inherited_trims(&mut solid, tolerance, &assembler.edge_boundary_key, &assembler.imprint_edges)?;
+        let inherited = super::inherited::challenge_inherited_trims_in(&mut solid, tolerance, &assembler.edge_boundary_key, &assembler.imprint_edges, examined_faces)?;
+        pass_ms("inherited", &mut pass_started);
         if !rebuilt.is_empty() || !settled.is_empty() || !trims.is_empty() || !inherited.is_empty() {
-            let after = solid.validate();
+            let after = validate_in(&solid);
             let count = rebuilt.len();
             if after.is_empty() {
                 if std::env::var("BREP_DEBUG_BOOL").is_ok() {
@@ -744,24 +966,58 @@ fn assemble_fragments_impl(
     }
     // Exercise exact integration here so a geometrically inverted shell is
     // rejected at the kernel boundary instead of reaching the application.
-    // Volume-only: the gate reads nothing but the sign.
+    // Volume-only: the gate reads nothing but the sign, so it reads
+    // `solid_signed_volume_for_sign`, which skips the sliver corrections on
+    // chords whose pcurve is straight in uv (a bore's rims: 105 of the plate
+    // case's 128 ms assembly were those corrections) and otherwise is the
+    // exact integration, including bit for bit whenever the reading sits
+    // within its margin of the bar.
     let stage_started = Instant::now();
     let _caller = crate::mass_caller("assemble.mass_check");
-    let volume = solid_signed_volume(&solid).or_refuse(KernelStage::Sew, "solid_signed_volume")?;
+    let bar = tolerance.powi(3);
+    // A shell with no touched face is an operand's shell as the operand held
+    // it; its sign is the operand's and it is left out of the check. With no
+    // shell touched (a disjoint union) there is nothing to integrate.
+    let volume = match &scope {
+        Some(scope) => {
+            let touched_shells = solid
+                .shells
+                .iter()
+                .filter(|shell| shell.faces.iter().any(|face| scope.touched.contains(&face.id)))
+                .collect::<Vec<_>>();
+            if touched_shells.is_empty() {
+                None
+            } else if touched_shells.len() == solid.shells.len() {
+                Some(solid_signed_volume_for_sign(&solid, bar).or_refuse(KernelStage::Sew, "solid_signed_volume")?)
+            } else {
+                let subset = BrepSolid {
+                    mass_properties_cache: Default::default(),
+                    id: solid.id,
+                    vertices: solid.vertices.clone(),
+                    edges: solid.edges.clone(),
+                    shells: touched_shells.into_iter().cloned().collect(),
+                    genus: 0,
+                    kind: crate::BodyKind::Solid,
+                };
+                Some(solid_signed_volume_for_sign(&subset, bar).or_refuse(KernelStage::Sew, "solid_signed_volume")?)
+            }
+        }
+        None => Some(solid_signed_volume_for_sign(&solid, bar).or_refuse(KernelStage::Sew, "solid_signed_volume")?),
+    };
     if profile {
         eprintln!(
             "assemble.mass_check_ms={:.2}",
             stage_started.elapsed().as_secs_f64() * 1_000.0
         );
     }
-    if volume <= tolerance.powi(3) {
+    if volume.is_some_and(|volume| volume <= bar) {
         return Err(KernelRefusal::new(
             RefusalClass::NonPositiveVolume,
             KernelStage::Validate,
             "boolean assembly produced non-positive volume",
         ));
     }
-    Ok(solid)
+    Ok((solid, scope))
 }
 
 pub(crate) fn assemble_fragments(
@@ -770,7 +1026,26 @@ pub(crate) fn assemble_fragments(
     imprint: &ImprintResultRecord,
     tolerance: f64,
 ) -> Result<BrepSolid, KernelRefusal> {
-    assemble_fragments_impl(selected, solids, imprint, tolerance, false)
+    assemble_fragments_impl(selected, solids, imprint, tolerance, false, None, false).map(|(solid, _)| solid)
+}
+
+/// [`assemble_fragments`] reporting which result faces the operation touched
+/// (`BooleanOptions::untouched_passthrough`): the acceptance passes inside
+/// read the geometry of the touched faces and their neighbours only, and the
+/// caller's passes read the returned scope the same way. With
+/// `touched_passes` (`BooleanOptions::touched_assembly`) the weld finds an
+/// untouched face's mate by key and the settle, reconstruction, joint,
+/// inherited-trim, junction and continuation passes read the touched faces
+/// (and their neighbours where the pass reaches across an edge) only.
+pub(in crate::boolean) fn assemble_fragments_scoped(
+    selected: Vec<FaceFragmentRecord>,
+    solids: &HashMap<u8, &BrepSolid>,
+    imprint: &ImprintResultRecord,
+    tolerance: f64,
+    touch: &TouchCensus,
+    touched_passes: bool,
+) -> Result<(BrepSolid, Option<AssemblyScope>), KernelRefusal> {
+    assemble_fragments_impl(selected, solids, imprint, tolerance, false, Some(touch), touched_passes)
 }
 
 pub(crate) fn assemble_open_fragments(
@@ -779,6 +1054,36 @@ pub(crate) fn assemble_open_fragments(
     imprint: &ImprintResultRecord,
     tolerance: f64,
 ) -> Result<BrepSolid, KernelRefusal> {
-    assemble_fragments_impl(selected, solids, imprint, tolerance, true)
+    assemble_fragments_impl(selected, solids, imprint, tolerance, true, None, false).map(|(solid, _)| solid)
 }
 
+
+/// The name a tangent section's edge records carry in the result (alone on
+/// unnamed operands, after the face-pair name otherwise).
+pub const TANGENT_EDGE_NAME: &str = "tangent";
+
+/// The direction INTO a face from a tangent section's midpoint, `n_out × t`
+/// (see `SourceEdge::tangent_side`): the face's outward normal at the
+/// section's midpoint crossed with the coedge's direction of travel along
+/// the section. `None` where the geometry cannot be read (a pole, a collapsed
+/// span), which leaves the coedge to the arrival-order weld.
+fn tangent_material_side(
+    source: &SourceEdge,
+    forward: bool,
+    pcurve: &NurbsCurve,
+    surface: &crate::NurbsSurface,
+    same_sense: bool,
+) -> Option<Vec3> {
+    let middle = 0.5 * (source.t0 + source.t1);
+    let derivatives = source.curve.derivatives(middle, 1).ok()?;
+    let mut travel = derivatives.get(1).copied()?.normalized().ok()?;
+    if !forward {
+        travel = travel.scale(-1.0);
+    }
+    let [p0, p1] = pcurve.domain().ok()?;
+    let uv = pcurve.evaluate(0.5 * (p0 + p1)).ok()?;
+    let normal = surface.normal(uv.x, uv.y).ok()?;
+    let outward = if same_sense { normal } else { normal.scale(-1.0) };
+    let side = outward.cross(travel);
+    (side.length() > 1e-9).then(|| side.normalized().ok()).flatten()
+}

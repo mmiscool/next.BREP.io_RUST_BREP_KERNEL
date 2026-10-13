@@ -22,6 +22,26 @@ impl FeatureSelection {
     }
 }
 
+/// The active reference pick as a FORM sees it (see
+/// [`EngineState::ref_select_field`]): the subject whose field is being
+/// filled, the field's path, and the running list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefSelectField {
+    /// The feature / constraint / annotation / sheet-object id the field
+    /// belongs to.
+    pub subject: String,
+    /// The field's JSON path (`["targetSolid"]`, `["boolean","targets"]`).
+    pub path: Vec<String>,
+    /// Whether the field takes a list.
+    pub multiple: bool,
+    /// The picked names so far.
+    pub names: Vec<String>,
+    /// Picks since the field was activated (see `RefSelectState::picks`).
+    pub picks: usize,
+    /// Which commit lane the pick belongs to.
+    pub target: RefSelectTarget,
+}
+
 impl EngineState {
     /// Clear the current SELECTION (Esc): drop all selected solids/faces/edges/
     /// vertices (hover is left untouched). Bumps the emphasis generation + marks
@@ -260,6 +280,9 @@ impl EngineState {
             names: seed_names,
             restore_index,
             target: RefSelectTarget::Feature,
+            picks: 0,
+            claimed: false,
+            finish_requested: false,
         });
         // Roll to the before-state (re-runs + marks dirty), then light up the seed.
         self.history.set_rollback(before);
@@ -339,6 +362,7 @@ impl EngineState {
             }
             let state = self.ref_select.as_mut().expect("active by guard above");
             state.names = vec![owner];
+            state.picks += 1;
             self.sync_ref_select_emphasis();
             return;
         }
@@ -413,6 +437,7 @@ impl EngineState {
         } else {
             state.names = vec![picked];
         }
+        state.picks += 1;
         self.sync_ref_select_emphasis();
     }
 
@@ -431,6 +456,7 @@ impl EngineState {
         } else {
             state.names = vec![name];
         }
+        state.picks += 1;
         self.sync_ref_select_emphasis();
     }
 
@@ -564,6 +590,81 @@ impl EngineState {
     /// and the modal's hint speaks of the paper rather than the 3D view.
     pub fn ref_select_is_sheet(&self) -> bool {
         self.ref_select.as_ref().is_some_and(|state| state.target == RefSelectTarget::Sheet)
+    }
+
+    /// Whether the active pick belongs to a FORM FIELD — a feature's, an
+    /// assembly constraint's, a PMI annotation's or a sheet object's reference
+    /// row. Such a pick is drawn by the field itself, the way other CAD
+    /// applications keep the dialog up and the selection box focused: the
+    /// field lists the picks, its button ends them, and the rest of the UI
+    /// stays. The other targets (a connection point's seat, a spline anchor's
+    /// port) are opened from list rows that have no field, so they keep the
+    /// top-right card and the shell steps everything else aside for them —
+    /// [`Self::ref_select_modal`].
+    pub fn ref_select_in_form(&self) -> bool {
+        self.ref_select.as_ref().is_some_and(|state| {
+            matches!(
+                state.target,
+                RefSelectTarget::Feature
+                    | RefSelectTarget::AssemblyConstraint
+                    | RefSelectTarget::Pmi
+                    | RefSelectTarget::Sheet
+            )
+        })
+    }
+
+    /// Whether a pick is up that takes the shell over (the dock folds away and
+    /// the top-right card is the picker): an active pick that is NOT a form
+    /// field's. The shell's "special mode" question.
+    pub fn ref_select_modal(&self) -> bool {
+        self.ref_select_active() && !self.ref_select_in_form()
+    }
+
+    /// The active pick as its form sees it — who it is for, which field, what
+    /// it holds — or `None` while no pick is up. A form draws the field whose
+    /// `subject` and `path` match as the FOCUSED one.
+    pub fn ref_select_field(&self) -> Option<RefSelectField> {
+        self.ref_select.as_ref().map(|state| RefSelectField {
+            subject: state.feature_id.clone(),
+            path: state.path.clone(),
+            multiple: state.multiple,
+            names: state.names.clone(),
+            picks: state.picks,
+            target: state.target,
+        })
+    }
+
+    /// The pick's form drew it this frame. Called by the form's consumer every
+    /// frame it draws the focused field; read back by the shell through
+    /// [`Self::ref_select_take_claim`].
+    pub fn ref_select_claim(&mut self) {
+        if let Some(state) = self.ref_select.as_mut() {
+            state.claimed = true;
+        }
+    }
+
+    /// Ask for the running pick to finish at the end of the frame (see
+    /// `RefSelectState::finish_requested`); the shell's settle step does it.
+    pub fn ref_select_request_finish(&mut self) {
+        if let Some(state) = self.ref_select.as_mut() {
+            state.finish_requested = true;
+        }
+    }
+
+    /// Whether [`Self::ref_select_request_finish`] was called on the running
+    /// pick.
+    pub fn ref_select_finish_requested(&self) -> bool {
+        self.ref_select.as_ref().is_some_and(|state| state.finish_requested)
+    }
+
+    /// Whether the pick was claimed since the last call — and reset, so each
+    /// frame answers for itself. `true` while no pick is up, so the shell's
+    /// "finish an unclaimed in-form pick" never fires on nothing.
+    pub fn ref_select_take_claim(&mut self) -> bool {
+        match self.ref_select.as_mut() {
+            Some(state) => std::mem::replace(&mut state.claimed, false),
+            None => true,
+        }
     }
 
     /// Restore the rolled-to step + clear emphasis + re-run + reset the selection

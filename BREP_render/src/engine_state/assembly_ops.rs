@@ -670,6 +670,9 @@ impl EngineState {
             names: seed_names,
             restore_index,
             target: RefSelectTarget::AssemblyConstraint,
+            picks: 0,
+            claimed: false,
+            finish_requested: false,
         });
         self.sync_ref_select_emphasis();
     }

@@ -264,7 +264,7 @@ const DISABLED_UNEXPLAINED: &str = "the editor does not allow it right now";
 /// agree on every registered id.
 pub fn active_target(state: &ButtonState) -> Option<Target> {
     state.ecad?;
-    if state.engine.sketch_mode() {
+    if state.engine.any_sketch_mode() {
         return None;
     }
     Target::of_workbench(&state.engine.settings.workbench)

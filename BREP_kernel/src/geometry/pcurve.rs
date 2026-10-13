@@ -7,6 +7,26 @@ use crate::{
 const EPSILON: f64 = 1e-12;
 const LINEAR_TOLERANCE: f64 = 1e-7;
 
+/// Coarse clocks only: no per-station timing overhead in a measured fit.
+struct PcurvePhaseClock {
+    started: Option<web_time::Instant>,
+    phase: &'static str,
+    samples: usize,
+    tracking: bool,
+}
+impl PcurvePhaseClock {
+    fn new(phase: &'static str, samples: usize, tracking: bool) -> Self {
+        Self { started: std::env::var_os("BREP_PROFILE").is_some().then(web_time::Instant::now), phase, samples, tracking }
+    }
+}
+impl Drop for PcurvePhaseClock {
+    fn drop(&mut self) {
+        if let Some(started) = self.started {
+            eprintln!("pcurve.phase_time phase={} initial_samples={} tracking={} ms={:.3}", self.phase, self.samples, self.tracking, started.elapsed().as_secs_f64()*1000.0);
+        }
+    }
+}
+
 fn surface_domains(surface: &NurbsSurface) -> Result<([f64; 2], [f64; 2]), String> {
     Ok((
         KnotVector::new(surface.knots_u.clone(), surface.degree_u)?.domain(),
@@ -24,7 +44,184 @@ fn surface_closedness(surface: &NurbsSurface) -> Result<(bool, bool), String> {
     surface.closed_directions()
 }
 
+thread_local! {
+    static PCURVE_REJECT_BOUNDS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+struct PcurveRejectScope(bool);
+impl PcurveRejectScope {
+    fn open(enabled: bool) -> Self {
+        Self(PCURVE_REJECT_BOUNDS.with(|state| state.replace(enabled)))
+    }
+}
+impl Drop for PcurveRejectScope {
+    fn drop(&mut self) { PCURVE_REJECT_BOUNDS.with(|state| state.set(self.0)); }
+}
+
+thread_local! {
+    static PCURVE_STACK_POINT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+struct PcurveStackPointScope(bool);
+impl PcurveStackPointScope {
+    fn open(enabled: bool) -> Self { Self(PCURVE_STACK_POINT.with(|state| state.replace(enabled))) }
+}
+impl Drop for PcurveStackPointScope {
+    fn drop(&mut self) { PCURVE_STACK_POINT.with(|state| state.set(self.0)); }
+}
+
+/// The count-zero basis recurrence has the same operations as the value
+/// basis recurrence. Its homogeneous sum uses the same row/column order.
+/// Preserve derivative dehomogenization (multiply by reciprocal, not divide)
+/// while avoiding both the derivative grids and their allocation. Other
+/// degrees and open-direction extension keep the original API. Periodic
+/// wrap retains the original parameter arithmetic before value evaluation.
+fn section_extended_point(surface: &NurbsSurface, u: f64, v: f64, enabled: bool) -> Result<Vec3, String> {
+    if enabled && u.is_finite() && v.is_finite()
+        && surface.degree_u <= crate::curve::MAX_STACK_DEGREE
+        && surface.degree_v <= crate::curve::MAX_STACK_DEGREE {
+        let [u0,u1] = surface.domain_u()?;
+        let [v0,v1] = surface.domain_v()?;
+        let mut uu = u;
+        let mut vv = v;
+        if u < u0 || u > u1 || v < v0 || v > v1 {
+            let (closed_u, closed_v) = surface_closedness(surface)?;
+            // Identical to derivatives_extended: keep the original add,
+            // subtract and remainder order before taking the count-zero path.
+            if closed_u && (u < u0 || u > u1) { uu = u0 + (u - u0).rem_euclid(u1 - u0); }
+            if closed_v && (v < v0 || v > v1) { vv = v0 + (v - v0).rem_euclid(v1 - v0); }
+        }
+        if uu >= u0 && uu <= u1 && vv >= v0 && vv <= v1 {
+            let point = surface.evaluate_homogeneous(uu, vv)?;
+            if point.w.abs() <= EPSILON {
+                return Err("NurbsSurface: zero evaluated weight".into());
+            }
+            return Ok(Vec3::new(point.x, point.y, point.z).scale(1.0 / point.w));
+        }
+    }
+    surface.evaluate_extended(u,v)
+}
+
+/// One immutable sphere/section pair; nested fits own separate maps. Keys
+/// preserve all parameter bits, and failed evaluations are never retained.
+struct PcurveSampleCache {
+    surface: usize,
+    curve: usize,
+    curves: rustc_hash::FxHashMap<u64, Vec3>,
+    surfaces: rustc_hash::FxHashMap<(u64, u64, bool), Vec3>,
+    inversions: rustc_hash::FxHashMap<[u64; 3], ([f64; 2], f64)>,
+    requests: [usize; 4],
+    hits: [usize; 4],
+    speeds: rustc_hash::FxHashMap<(u64, u64), f64>,
+}
+thread_local! {
+    static PCURVE_SAMPLES: std::cell::RefCell<Vec<Option<PcurveSampleCache>>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+struct PcurveSampleScope;
+impl PcurveSampleScope {
+    fn open(surface: &NurbsSurface, curve: &NurbsCurve, enabled: bool) -> Self {
+        let cache = (enabled && matches!(surface.analytic(), Some(AnalyticSurface::Sphere { .. })))
+            .then(|| PcurveSampleCache { surface: surface as *const _ as usize,
+                curve: curve as *const _ as usize, curves: Default::default(),
+                surfaces: Default::default(), inversions: Default::default(), requests: [0; 4], hits: [0; 4], speeds: Default::default() });
+        PCURVE_SAMPLES.with(|stack| stack.borrow_mut().push(cache));
+        Self
+    }
+}
+impl Drop for PcurveSampleScope {
+    fn drop(&mut self) {
+        PCURVE_SAMPLES.with(|stack| {
+            if let Some(Some(cache)) = stack.borrow_mut().pop() {
+                if std::env::var_os("BREP_PROFILE").is_some() {
+                    eprintln!("pcurve.samples requests={:?} hits={:?} retained={:?}", cache.requests,
+                        cache.hits, [cache.curves.len(), cache.surfaces.len(), cache.inversions.len(), cache.speeds.len()]);
+                }
+            }
+        });
+    }
+}
+const PCURVE_SAMPLE_CACHE_LIMIT: usize = 16384;
+fn section_u_speed(surface: &NurbsSurface, u: f64, v: f64) -> Result<f64, String> {
+    let key = (u.to_bits(), v.to_bits());
+    let (active, hit) = PCURVE_SAMPLES.with(|stack| {
+        let mut stack = stack.borrow_mut();
+        let Some(Some(cache)) = stack.last_mut() else { return (false, None) };
+        if cache.surface != surface as *const _ as usize { return (false, None) }
+        cache.requests[3] += 1;
+        let hit = cache.speeds.get(&key).copied();
+        cache.hits[3] += usize::from(hit.is_some());
+        (true, hit)
+    });
+    if let Some(hit) = hit { return Ok(hit) }
+    let speed = surface.deriv1(u, v)?.1.length();
+    if active { PCURVE_SAMPLES.with(|stack| {
+        let mut stack = stack.borrow_mut();
+        let cache = stack.last_mut().unwrap().as_mut().unwrap();
+        if cache.speeds.len() < PCURVE_SAMPLE_CACHE_LIMIT { cache.speeds.insert(key, speed); }
+    }); }
+    Ok(speed)
+}
+
+fn section_curve_point(curve: &NurbsCurve, parameter: f64) -> Result<Vec3, String> {
+    let key = parameter.to_bits();
+    let (active, hit) = PCURVE_SAMPLES.with(|stack| {
+        let mut stack = stack.borrow_mut();
+        let Some(Some(cache)) = stack.last_mut() else { return (false, None) };
+        if cache.curve != curve as *const _ as usize { return (false, None) }
+        cache.requests[0] += 1;
+        let hit = cache.curves.get(&key).copied();
+        cache.hits[0] += usize::from(hit.is_some());
+        (true, hit)
+    });
+    if let Some(hit) = hit { return Ok(hit) }
+    let point = curve.evaluate(parameter)?;
+    if active { PCURVE_SAMPLES.with(|stack| {
+        let mut stack = stack.borrow_mut();
+        let cache = stack.last_mut().unwrap().as_mut().unwrap();
+        if cache.curves.len() < PCURVE_SAMPLE_CACHE_LIMIT { cache.curves.insert(key, point); }
+    }); }
+    Ok(point)
+}
+fn section_surface_point(surface: &NurbsSurface, u: f64, v: f64, extended: bool) -> Result<Vec3, String> {
+    let key = (u.to_bits(), v.to_bits(), extended);
+    let (active, hit) = PCURVE_SAMPLES.with(|stack| {
+        let mut stack = stack.borrow_mut();
+        let Some(Some(cache)) = stack.last_mut() else { return (false, None) };
+        if cache.surface != surface as *const _ as usize { return (false, None) }
+        cache.requests[1] += 1;
+        let hit = cache.surfaces.get(&key).copied();
+        cache.hits[1] += usize::from(hit.is_some());
+        (true, hit)
+    });
+    if let Some(hit) = hit { return Ok(hit) }
+    let point = if extended { section_extended_point(surface, u, v, PCURVE_STACK_POINT.with(|state| state.get()))? } else { surface.evaluate(u, v)? };
+    if active { PCURVE_SAMPLES.with(|stack| {
+        let mut stack = stack.borrow_mut();
+        let cache = stack.last_mut().unwrap().as_mut().unwrap();
+        if cache.surfaces.len() < PCURVE_SAMPLE_CACHE_LIMIT { cache.surfaces.insert(key, point); }
+    }); }
+    Ok(point)
+}
 fn invert_checked(surface: &NurbsSurface, point: Vec3) -> Result<([f64; 2], f64), String> {
+    let key = [point.x.to_bits(), point.y.to_bits(), point.z.to_bits()];
+    let (active, hit) = PCURVE_SAMPLES.with(|stack| {
+        let mut stack = stack.borrow_mut();
+        let Some(Some(cache)) = stack.last_mut() else { return (false, None) };
+        if cache.surface != surface as *const _ as usize { return (false, None) }
+        cache.requests[2] += 1;
+        let hit = cache.inversions.get(&key).copied();
+        cache.hits[2] += usize::from(hit.is_some());
+        (true, hit)
+    });
+    if let Some(hit) = hit { return Ok(hit) }
+    let projection = invert_checked_uncached(surface, point)?;
+    if active { PCURVE_SAMPLES.with(|stack| {
+        let mut stack = stack.borrow_mut();
+        let cache = stack.last_mut().unwrap().as_mut().unwrap();
+        if cache.inversions.len() < PCURVE_SAMPLE_CACHE_LIMIT { cache.inversions.insert(key, projection); }
+    }); }
+    Ok(projection)
+}
+
+fn invert_checked_uncached(surface: &NurbsSurface, point: Vec3) -> Result<([f64; 2], f64), String> {
     if surface.is_affine()? {
         let ([u0, _], [v0, _]) = surface_domains(surface)?;
         let (origin, du, dv) = surface.deriv1(u0, v0)?;
@@ -196,6 +393,7 @@ fn build_interpolant_joined(
     curve_parameters: &[f64],
     joins: &[f64],
 ) -> Result<(NurbsCurve, f64, f64), String> {
+    let _clock = PcurvePhaseClock::new("interpolant", raw_parameters.len(), false);
     let ([u0, u1], [v0, v1]) = surface_domains(surface)?;
     let (closed_u, closed_v) = surface_closedness(surface)?;
     let mut parameters = raw_parameters.to_vec();
@@ -211,7 +409,7 @@ fn build_interpolant_joined(
     if cone_apex_u() && matches!(surface.analytic(), Some(AnalyticSurface::RuledRevolution { .. })) && parameters.len() >= 2 {
         let speeds = parameters
             .iter()
-            .map(|parameter| surface.deriv1(parameter[0], parameter[1]).map(|(_, su, _)| su.length()))
+            .map(|parameter| section_u_speed(surface, parameter[0], parameter[1]))
             .collect::<Result<Vec<_>, _>>()?;
         let reference = speeds.iter().copied().fold(0.0_f64, f64::max);
         let singular = |index: usize| speeds[index] <= reference * 1e-2;
@@ -242,9 +440,7 @@ fn build_interpolant_joined(
         let speeds = parameters
             .iter()
             .map(|parameter| {
-                surface
-                    .deriv1(parameter[0], parameter[1])
-                    .map(|(_, su, _)| su.length())
+                section_u_speed(surface, parameter[0], parameter[1])
             })
             .collect::<Result<Vec<_>, _>>()?;
         let reference = speeds.iter().copied().fold(0.0_f64, f64::max);
@@ -973,8 +1169,8 @@ fn probe_residual_at(
             let fraction = span[0] + (span[1] - span[0]) * local;
             let parameter = pcurve.evaluate(fraction)?;
             let on_surface =
-                surface.evaluate_extended(parameter.x, parameter.y)?;
-            let on_curve = curve.evaluate(t0 + (t1 - t0) * fraction)?;
+                section_surface_point(surface, parameter.x, parameter.y, true)?;
+            let on_curve = section_curve_point(curve, t0 + (t1 - t0) * fraction)?;
             // `f64::max` drops a NaN operand, so a non-finite distance would
             // leave `worst` reading the finite stations only. A residual that
             // can accept a curve must have measured every station: fail
@@ -1039,8 +1235,8 @@ fn native_read(surface: &NurbsSurface, curve: &NurbsCurve, pcurve: &NurbsCurve, 
     let mut read = NativeRead { tracking: 0.0, deviation: 0.0, standoff: 0.0 };
     for &fraction in fractions {
         let parameter = pcurve.evaluate(fraction)?;
-        let image = surface.evaluate_extended(parameter.x, parameter.y)?;
-        let on_curve = curve.evaluate(t0 + (t1 - t0) * fraction)?;
+        let image = section_surface_point(surface, parameter.x, parameter.y, true)?;
+        let on_curve = section_curve_point(curve, t0 + (t1 - t0) * fraction)?;
         let foot = crate::projection::project_point_to_surface_from_seed(surface, on_curve, [parameter.x, parameter.y])?;
         let tracking = image.sub(foot.point).length();
         let deviation = image.sub(on_curve).length();
@@ -1132,6 +1328,25 @@ fn judge_tracking_candidate(
     own: f64,
     dense: impl FnOnce() -> Result<f64, String>,
 ) -> (Result<Option<f64>, String>, bool) {
+    judge_tracking_candidate_with_bounds(standing, standing_dense, floor, exit, own, dense, false)
+}
+
+fn judge_tracking_candidate_with_bounds(
+    standing: f64,
+    standing_dense: bool,
+    floor: f64,
+    exit: PcurveFitExit,
+    own: f64,
+    dense: impl FnOnce() -> Result<f64, String>,
+    bounds: bool,
+) -> (Result<Option<f64>, String>, bool) {
+    // A budget exit's own residual probes the quarter points of every
+    // returned span. They are a subset of the nineteen-point stencil, so its
+    // maximum cannot fall below this already over-floor lower bound.
+    if bounds && exit != PcurveFitExit::Converged && own > floor {
+        if std::env::var_os("BREP_PROFILE").is_some() { eprintln!("pcurve.reject_bound kind=quarter_residual"); }
+        return (Ok(Some(own)), false);
+    }
     let reading = if exit == PcurveFitExit::Converged && !standing_dense {
         Ok(Some(own))
     } else if exit == PcurveFitExit::Converged || standing > floor {
@@ -1214,8 +1429,9 @@ fn refine_pcurve(
     } else {
         0
     };
+    let reject_bounds = PCURVE_REJECT_BOUNDS.with(|state| state.get());
     let mut best = refine_pcurve_pass(surface, curve, domain, u_domain, v_domain,
-        floor, joins, parameters, raw, pcurve, off_surface, clamped, false, 1.0, false, &mut insert)?;
+        floor, joins, parameters, raw, pcurve, off_surface, clamped, false, 1.0, false, &mut insert, false)?;
     if trace {
         eprintln!(
             "PCURVE-TRACK call={call} first-pass exit={:?} residual={:e} floor={floor:e} off_surface={:e} samples={} raised={} tracking={}",
@@ -1283,7 +1499,7 @@ fn refine_pcurve(
             let mut refined_curve = baseline_curve.clone();
             let candidate = refine_pcurve_pass(surface, curve, domain, u_domain, v_domain,
                 floor, joins, &mut refined_parameters, &mut refined_raw, &mut refined_curve,
-                baseline_off_surface, baseline_clamped, true, fraction, standing_misses, &mut insert);
+                baseline_off_surface, baseline_clamped, true, fraction, standing_misses, &mut insert, reject_bounds && !standing_misses);
             (candidate, (refined_parameters, refined_raw, refined_curve))
         },
         |state: &RungState| tracking_acceptance_residual(surface, curve, &state.2, &state.0, domain),
@@ -1324,6 +1540,7 @@ fn tracking_rungs<S>(
     // Whether the standing reading is a nineteen-point one (a budget-exit
     // candidate was taken); every later candidate is then judged on it.
     let mut standing_dense = false;
+    let reject_bounds = PCURVE_REJECT_BOUNDS.with(|state| state.get());
     for fraction in [0.1, 0.01] {
         if best.residual <= floor * fraction {
             if trace {
@@ -1341,9 +1558,9 @@ fn tracking_rungs<S>(
         // failed pass.
         let judged_dense = matches!(&candidate, Ok(seen) if seen.exit != PcurveFitExit::Converged || standing_dense);
         let (effective, accepted) = match &candidate {
-            Ok(seen) => judge_tracking_candidate(best.residual, standing_dense, floor, seen.exit, seen.residual, || {
+            Ok(seen) => judge_tracking_candidate_with_bounds(best.residual, standing_dense, floor, seen.exit, seen.residual, || {
                 dense(&state)
-            }),
+            }, reject_bounds),
             Err(_) => (Ok(None), false),
         };
         if trace {
@@ -1444,7 +1661,7 @@ fn standoff_tracking_rungs(
         let mut refined_curve = baseline_curve.clone();
         let candidate = refine_pcurve_pass(surface, curve, domain, u_domain, v_domain, floor, joins,
             &mut refined_parameters, &mut refined_raw, &mut refined_curve, best.off_surface, best.clamped,
-            true, fraction, true, &mut *insert);
+            true, fraction, true, &mut *insert, false);
         let reads = candidate.as_ref().ok().map(|_| {
             native_probe_fractions(&[&*pcurve, &refined_curve]).and_then(|probes| {
                 Ok((native_read(surface, curve, pcurve, domain, &probes)?, native_read(surface, curve, &refined_curve, domain, &probes)?))
@@ -1533,7 +1750,9 @@ fn refine_pcurve_pass(
     tracking_fraction: f64,
     raise_unmet_tracking: bool,
     mut insert: impl FnMut(f64, Vec3, Vec3) -> Result<(Option<[f64; 2]>, f64), String>,
+    reject_budget: bool,
 ) -> Result<Refinement, String> {
+    let _clock = PcurvePhaseClock::new("refinement", parameters.len(), track_projection);
     let tracking_floor = if track_projection { floor * tracking_fraction } else { floor };
     let mut max_samples = MAX_PCURVE_SAMPLES;
     let mut raised = false;
@@ -1543,7 +1762,7 @@ fn refine_pcurve_pass(
         // after a fourth round of inserts is the round-budget exit.
         let mut exit = PcurveFitExit::RoundBudget;
         let mut residual = None;
-        for _ in 0..4 {
+        for round in 0..4 {
             if parameters.len() >= max_samples {
                 exit = PcurveFitExit::SampleCeiling;
                 break;
@@ -1574,8 +1793,8 @@ fn refine_pcurve_pass(
                     let fraction = start + (end - start) * local_fraction;
                     let parameter = pcurve.evaluate(fraction)?;
                     let on_surface =
-                        surface.evaluate_extended(parameter.x, parameter.y)?;
-                    let on_curve = curve.evaluate(t0 + (t1 - t0) * fraction)?;
+                        section_surface_point(surface, parameter.x, parameter.y, true)?;
+                    let on_curve = section_curve_point(curve, t0 + (t1 - t0) * fraction)?;
                     let deviation = on_surface.sub(on_curve).length();
                     // A non-finite distance must not reach `f64::max` (which
                     // drops NaN) or the classification below, where a round
@@ -1604,7 +1823,7 @@ fn refine_pcurve_pass(
                         // input (6e-6 of slop at g = 1.9e-4, floor 1e-7).
                         if raised || track_projection {
                             let projected =
-                                surface.evaluate(surface_parameter[0], surface_parameter[1])?;
+                                section_surface_point(surface, surface_parameter[0], surface_parameter[1], false)?;
                             if on_surface.sub(projected).length() <= tracking_floor {
                                 continue;
                             }
@@ -1629,6 +1848,14 @@ fn refine_pcurve_pass(
                     PcurveFitExit::Converged
                 };
                 break;
+            }
+            // With inserts still needed after the fourth non-truncated
+            // round, this exit is RoundBudget. An in-floor standing fit
+            // never adopts any budget exit; rebuilding and probing this
+            // discarded candidate cannot affect its curve or report.
+            if reject_budget && round == 3 && !truncated {
+                if std::env::var_os("BREP_PROFILE").is_some() { eprintln!("pcurve.reject_bound kind=fifth_round"); }
+                return Err("pcurve tracking candidate requires a fifth round".into());
             }
             for (at, fraction, surface_parameter) in inserts.into_iter().rev() {
                 parameters.insert(at, fraction);
@@ -1786,6 +2013,39 @@ pub fn fit_pcurve_on_surface(
     surface: &NurbsSurface,
     curve: &NurbsCurve,
 ) -> Result<PcurveFit, String> {
+    let mode = std::env::var("BREP_PCURVE_EVAL_CACHE").unwrap_or_default();
+    let bounds = std::env::var("BREP_PCURVE_REJECT_BOUNDS").unwrap_or_else(|_| "on".into());
+    let stack = std::env::var("BREP_PCURVE_STACK_POINT").unwrap_or_else(|_| "on".into());
+    if mode == "check" || bounds == "check" || stack == "check" {
+        let old = fit_pcurve_on_surface_cached(surface, curve, false, false, false)?;
+        if matches!(surface.analytic(), Some(AnalyticSurface::Sphere { .. })) {
+            let candidate = fit_pcurve_on_surface_cached(surface, curve, mode == "check" || mode == "on" || mode == "1", bounds == "check" || bounds == "on" || bounds == "1", stack == "check" || stack == "on" || stack == "1");
+            let identical = candidate.as_ref().is_ok_and(|new| {
+                old.curve.degree == new.curve.degree
+                    && old.curve.knots.len() == new.curve.knots.len()
+                    && old.curve.knots.iter().zip(&new.curve.knots).all(|(a, b)| a.to_bits() == b.to_bits())
+                    && old.curve.control_points.len() == new.curve.control_points.len()
+                    && old.curve.control_points.iter().zip(&new.curve.control_points).all(|(a, b)| {
+                        [a.x.to_bits(), a.y.to_bits(), a.z.to_bits(), a.w.to_bits()]
+                            == [b.x.to_bits(), b.y.to_bits(), b.z.to_bits(), b.w.to_bits()]
+                    }) && old.report == new.report
+            });
+            if let Ok(path) = std::env::var("BREP_PCURVE_EVAL_CENSUS") {
+                use std::io::Write;
+                if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+                    let _ = writeln!(file, "pcurve.eval_census identical={identical} controls={} samples={}", old.curve.control_points.len(), old.report.samples);
+                }
+            }
+        }
+        return Ok(old);
+    }
+    fit_pcurve_on_surface_cached(surface, curve, mode == "1" || mode == "on", bounds == "1" || bounds == "on", stack == "1" || stack == "on")
+}
+
+fn fit_pcurve_on_surface_cached(surface: &NurbsSurface, curve: &NurbsCurve, enabled: bool, bounds: bool, stack: bool) -> Result<PcurveFit, String> {
+    let _stack = PcurveStackPointScope::open(stack && matches!(surface.analytic(), Some(AnalyticSurface::Sphere { .. })));
+    let _samples = PcurveSampleScope::open(surface, curve, enabled);
+    let _bounds = PcurveRejectScope::open(bounds && matches!(surface.analytic(), Some(AnalyticSurface::Sphere { .. })));
     let [t0, t1] = curve.domain()?;
     if surface.is_affine()? {
         let Some(inversion) = AffineInversion::of(surface)? else {
@@ -1813,7 +2073,7 @@ pub fn fit_pcurve_on_surface(
     let refinement_tolerance = PCURVE_REFINEMENT_TOLERANCE;
     let ([u0, u1], [v0, v1]) = surface_domains(surface)?;
     let invert =
-        |fraction: f64| invert_checked(surface, curve.evaluate(t0 + (t1 - t0) * fraction)?);
+        |fraction: f64| invert_checked(surface, section_curve_point(curve, t0 + (t1 - t0) * fraction)?);
 
     let mut parameters = Vec::with_capacity(25);
     let mut raw_surface_parameters = Vec::with_capacity(25);
@@ -1912,6 +2172,29 @@ pub fn build_pcurve_on_surface(
     Ok(fit.curve)
 }
 
+/// Optional section-fit clock; records every early fallback without changing it.
+struct SectionFitClock {
+    started: Option<web_time::Instant>,
+    global: std::time::Duration,
+    seeded: bool,
+}
+impl SectionFitClock {
+    fn new() -> Self {
+        Self { started: std::env::var_os("BREP_PROFILE").is_some().then(web_time::Instant::now),
+            global: std::time::Duration::ZERO, seeded: false }
+    }
+}
+impl Drop for SectionFitClock {
+    fn drop(&mut self) {
+        if let Some(started) = self.started {
+            eprintln!("pcurve.section_time global={:.3} seeded={:.3} result={}",
+                self.global.as_secs_f64() * 1000.0,
+                started.elapsed().saturating_sub(self.global).as_secs_f64() * 1000.0,
+                if self.seeded { "seeded" } else { "global" });
+        }
+    }
+}
+
 /// SECTION-PCURVE SEEDED MARCH (t222: cone × ABC 00000327, non-integral genus).
 ///
 /// `build_pcurve_on_surface` inverts every sample by GLOBAL closest point. Where
@@ -1946,7 +2229,9 @@ pub fn fit_pcurve_on_surface_marched(
     surface: &NurbsSurface,
     curve: &NurbsCurve,
 ) -> Result<PcurveFit, String> {
+    let mut clock = SectionFitClock::new();
     let global = fit_pcurve_on_surface(surface, curve)?;
+    if let Some(started) = clock.started { clock.global = started.elapsed(); }
     if std::env::var("BREP_SECTION_PCURVE_MARCH").as_deref() == Ok("0") || surface.is_affine()? {
         return Ok(global);
     }
@@ -2059,6 +2344,7 @@ pub fn fit_pcurve_on_surface_marched(
             Ok((Some([seeded.u, seeded.v]), seeded.distance))
         },
     )?;
+    clock.seeded = true;
     Ok(PcurveFit {
         curve: pcurve,
         report: PcurveFitReport {

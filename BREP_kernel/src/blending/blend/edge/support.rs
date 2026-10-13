@@ -72,7 +72,7 @@ pub(in crate::blend) fn march_open_stations_ending(
     refine_bar: Option<f64>,
 ) -> Result<(Vec<Station>, [usize; 2], StationRefinement), KernelRefusal> {
     march_open_stations_core(
-        edge, first, second, radius_at, overshoot_fraction, ends, station_count, poles, bounded_ends, refine_bar, 0,
+        edge, first, second, radius_at, overshoot_fraction, ends, station_count, poles, bounded_ends, refine_bar, 0, true,
     )
     .map(|(stations, vertex_indices, refinement, _)| (stations, vertex_indices, refinement))
 }
@@ -108,6 +108,7 @@ pub(in crate::blend) fn march_open_stations_core(
     bounded_ends: [bool; 2],
     refine_bar: Option<f64>,
     dense: usize,
+    probe_fold: bool,
 ) -> Result<(Vec<Station>, [usize; 2], StationRefinement, OpenDenseCentres), KernelRefusal> {
     let span = edge.t1 - edge.t0;
     let overshoot = span * overshoot_fraction;
@@ -219,6 +220,7 @@ pub(in crate::blend) fn march_open_stations_core(
         });
         Ok((uv, center.ok()))
     };
+    let solve_timing = crate::blend::BlendTimer::start("timing.march.solve_ms");
     let mut solutions = vec![[0.0f64; 4]; station_count + 1];
     let mut centers: Vec<Option<Vec3>> = vec![None; station_count + 1];
     if pole_index(mid_index) {
@@ -293,6 +295,7 @@ pub(in crate::blend) fn march_open_stations_core(
             break;
         }
     }
+    solve_timing.stop();
     if last_kept - first_kept < FIT_DEGREE {
         return Err(KernelRefusal::non_convergence(KernelStage::Refine,
             "bounded_march", "blend: too few regular stations before a carrier pole"));
@@ -312,6 +315,7 @@ pub(in crate::blend) fn march_open_stations_core(
     // and the two halves are checked next round. Stations only where the wall
     // needs them: every downstream scan samples per knot.
     let mut refinement = StationRefinement::default();
+    let refine_timing = refine_bar.map(|_| crate::blend::BlendTimer::start("timing.march.refine_ms"));
     let (station_ts, vertex_indices, solutions, final_centers) = match refine_bar {
         None => (station_ts, vertex_indices, solutions, centers),
         Some(bar) => {
@@ -435,6 +439,9 @@ pub(in crate::blend) fn march_open_stations_core(
             (ts, vertex_indices, sols, cens)
         }
     };
+    if let Some(refine_timing) = refine_timing {
+        refine_timing.stop();
+    }
     let station_count = station_ts.len() - 1;
     let station_t = |index: usize| station_ts[index];
     let pole_index = |index: usize| {
@@ -455,7 +462,11 @@ pub(in crate::blend) fn march_open_stations_core(
     // carrier's real extent may turn any way at all — refusing on extrapolated
     // geometry would refuse walls that build.  `vertex_indices` are the two
     // stations snapped exactly onto `t0` and `t1`, so they bound the real span.
-    {
+    //
+    // Not asked (`probe_fold` false) by the network's exact extrusion lane:
+    // planar mates have no curvature for the ball to exceed.
+    if probe_fold {
+        let _fold_timing = crate::blend::BlendTimer::start("timing.march.fold_ms");
         let probe = |t: f64,
                      seed: [f64; 4]|
          -> Result<([f64; 4], Vec3, Vec3, Vec3), KernelRefusal> {
@@ -491,6 +502,7 @@ pub(in crate::blend) fn march_open_stations_core(
         )?;
     }
     // The exact centres between the final stations, when a wall verdict asks.
+    let dense_timing = (dense > 1).then(|| crate::blend::BlendTimer::start("timing.march.dense_ms"));
     let mut dense_centres = OpenDenseCentres { subdivisions: dense, centres: Vec::new(), station_ts: station_ts.clone() };
     if dense > 1 {
         for interval in 0..station_ts.len().saturating_sub(1) {
@@ -515,6 +527,10 @@ pub(in crate::blend) fn march_open_stations_core(
             dense_centres.centres.push(row);
         }
     }
+    if let Some(dense_timing) = dense_timing {
+        dense_timing.stop();
+    }
+    let _assemble_timing = crate::blend::BlendTimer::start("timing.march.assemble_ms");
     let mut stations = Vec::with_capacity(station_count + 1);
     for (index, uv) in solutions.iter().enumerate() {
         let t = station_t(index);
@@ -891,6 +907,7 @@ pub(in crate::blend) fn fit_open_rows(
         center: Some(center),
         exact_extrusion: false,
         vertex_stations: None,
+        revolution_axis: None,
     })
 }
 
@@ -957,6 +974,7 @@ pub(in crate::blend) fn fit_rows_breaking(
         center: Some(center),
         exact_extrusion: false,
         vertex_stations: None,
+        revolution_axis: None,
     })
 }
 
@@ -1241,7 +1259,410 @@ fn exact_extrusion_rows(
         center: Some(center),
         exact_extrusion: true,
         vertex_stations: None,
+        revolution_axis: None,
     }))
+}
+
+/// The exact REVOLUTION lane's pre-march decision (2026-10-13): the axis
+/// both mates revolve about ([`closed_revolution_axis`]: a plane normal
+/// to it counts) when `edge` is a circle about that axis — nine samples
+/// of the edge at one radial distance and one axial height, each against
+/// the kernel's `model` tolerance at the edge's scale. `None` otherwise,
+/// and the ladder marches the stripe as before.
+pub(in crate::blend) fn revolution_lane_axis(edge: &EdgeRecord, first: &BlendMate, second: &BlendMate) -> Option<(Vec3, Vec3)> {
+    let (origin, axis) = closed_revolution_axis(first, second)?;
+    let axis = axis.normalized().ok()?;
+    let tolerance = crate::KernelTolerances::for_scale(
+        march_model_scale(&edge.curve, edge.t0, edge.t1, 0.0).ok()?,
+        1e-7,
+    )
+    .model;
+    let mut reference: Option<(f64, f64)> = None;
+    for step in 0..=8 {
+        let t = edge.t0 + (edge.t1 - edge.t0) * step as f64 / 8.0;
+        let offset = edge.curve.evaluate(t).ok()?.sub(origin);
+        let height = offset.dot(axis);
+        let radial = offset.sub(axis.scale(height)).length();
+        match reference {
+            None => reference = Some((radial, height)),
+            Some((known_radial, known_height)) => {
+                if (radial - known_radial).abs() > tolerance || (height - known_height).abs() > tolerance {
+                    return None;
+                }
+            }
+        }
+    }
+    (reference?.0 > tolerance).then_some((origin, axis))
+}
+
+/// What the exact revolution lane hands the network: the rows, every
+/// station's parameter on them, and the stations with the OVERSHOOT ones
+/// (outside the vertex window) replaced by the rows' own sections — the
+/// march solved those on the carriers' ruled extension, where a partial
+/// sweep continues as its tangent strip, not as the circle the rows follow.
+/// The window's stations are the march's, bit for bit.
+pub(in crate::blend) struct ExactRevolution {
+    pub(in crate::blend) rows: FittedRows,
+    pub(in crate::blend) parameters: Vec<f64>,
+    pub(in crate::blend) stations: Vec<Station>,
+}
+
+/// The exact rows of a march whose stations between the vertices are ONE
+/// section revolved about `axis` (the revolution mates' axis,
+/// [`revolution_lane_axis`]), or the reason they are not (the lane then
+/// declines to the ladder by name).
+///
+/// The spine takes the revolution CARRIER's own angular parameterisation:
+/// the contact rail on that carrier is its latitude circle at the contact's
+/// held coordinate (`iso_curve_v` / `iso_curve_u`), extended past the
+/// carrier's sweep along the circle ([`extend_conic_ends`]) to cover the
+/// overshoot and affinely on `[0, 1]`, so the support trim on the carrier is
+/// a straight line in (u, v) by construction. Every other row is that circle
+/// carried by the affine map that takes the carrier contact of the first
+/// window station to the row's own point of that section (a radial scaling
+/// about the axis with an axial shift: an affine map commutes with the
+/// rational construction, so each row is the exact circle of its point and
+/// the tensor product is the exact torus patch of the section, in the
+/// carrier's parameterisation). The mate's trim is the rail's image through
+/// the plane's affine chart when the mate is a plane
+/// (`plane_chart_pcurve`), else the uv line through the window's two end
+/// contacts; the surgery reads either once as shipped and refits only what
+/// does not stand.
+///
+/// Witness (`1e-9 · (1 + scale)`, the solver's bar with two orders of
+/// margin): every window station's two contacts, apex and centre are the
+/// rows' at that station's parameter. Declines by name: no revolution
+/// carrier among the mates; a contact drifting across the carrier or not
+/// monotone along it; a window shorter than three stations; a section that
+/// reaches the axis, or a centre circle inside the ball (the wall would
+/// fold, which this lane does not probe); a circle whose extension would
+/// carry a non-positive weight.
+pub(in crate::blend) fn exact_revolution_rows(
+    stations: &[Station],
+    vertex_indices: [usize; 2],
+    chamfer: bool,
+    axis: (Vec3, Vec3),
+    radius: f64,
+    first: &BlendMate,
+    second: &BlendMate,
+) -> Result<ExactRevolution, String> {
+    let (origin, axis) = axis;
+    let (lo, hi) = (vertex_indices[0].min(vertex_indices[1]), vertex_indices[0].max(vertex_indices[1]));
+    if stations.len() < 3 || hi >= stations.len() || hi < lo + 2 {
+        return Err("fewer than three stations between the vertices".to_string());
+    }
+    let scale = stations.iter().fold(0.0f64, |worst, station| worst.max(station.center.length())).max(1.0);
+    let bar = 1e-9 * (1.0 + scale);
+    let is_plane = |mate: &BlendMate| matches!(mate.face.surface.analytic(), Some(crate::AnalyticSurface::Plane { .. }));
+    // The carrier whose own parameterisation the rows take: the revolution
+    // mate, the second when both are.
+    let carrier_is_second = if !is_plane(second) {
+        true
+    } else if !is_plane(first) {
+        false
+    } else {
+        return Err("no revolution carrier among the mates".to_string());
+    };
+    let (carrier, mate) = if carrier_is_second { (second, first) } else { (first, second) };
+    let carrier_uv = |station: &Station| if carrier_is_second { station.uv2 } else { station.uv1 };
+    let mate_uv = |station: &Station| if carrier_is_second { station.uv1 } else { station.uv2 };
+    let contact = |station: &Station| if carrier_is_second { station.p2 } else { station.p1 };
+    let surface = &carrier.face.surface;
+    let [u0, u1] = surface.domain_u()?;
+    let [v0, v1] = surface.domain_v()?;
+    let window = &stations[lo..=hi];
+    let (first_uv, last_uv) = (carrier_uv(&window[0]), carrier_uv(&window[window.len() - 1]));
+    let along_u = (last_uv[0] - first_uv[0]).abs() >= (last_uv[1] - first_uv[1]).abs();
+    let (along, held, held_span) = if along_u { (0usize, 1usize, v1 - v0) } else { (1, 0, u1 - u0) };
+    let held_value = window.iter().map(|station| carrier_uv(station)[held]).sum::<f64>() / window.len() as f64;
+    if window.iter().any(|station| (carrier_uv(station)[held] - held_value).abs() > 1e-8 * held_span.abs().max(1e-300)) {
+        return Err("the carrier contact drifts across the carrier".to_string());
+    }
+    let along_of = |station: &Station| carrier_uv(station)[along];
+    let sweep = along_of(&window[window.len() - 1]) - along_of(&window[0]);
+    if !(sweep.abs() > 0.0) || window.windows(2).any(|pair| (along_of(&pair[1]) - along_of(&pair[0])) * sweep <= 0.0) {
+        return Err("the carrier contact is not monotone along the carrier".to_string());
+    }
+    // The carrier's latitude circle at the held coordinate, run the
+    // stations' way.
+    let circle = if along_u { surface.iso_curve_v(held_value) } else { surface.iso_curve_u(held_value) }?;
+    let [c0, c1] = circle.domain()?;
+    let reversed = sweep < 0.0;
+    let circle = if reversed { circle.reversed()? } else { circle };
+    let on_curve = |along: f64| if reversed { c0 + c1 - along } else { along };
+    // Every station's along coordinate: the window's own, the overshoot's at
+    // the window's mean spacing past its ends.
+    let step = sweep / (hi - lo) as f64;
+    let along_at = |index: usize| -> f64 {
+        if index < lo {
+            along_of(&window[0]) - step * (lo - index) as f64
+        } else if index > hi {
+            along_of(&window[window.len() - 1]) + step * (index - hi) as f64
+        } else {
+            along_of(&stations[index])
+        }
+    };
+    let (parameter_lo, parameter_hi) = (on_curve(along_at(0)), on_curve(along_at(stations.len() - 1)));
+    if !(parameter_hi > parameter_lo) {
+        return Err("the rows' parameter range is empty".to_string());
+    }
+    let rail = extend_conic_ends(&circle, parameter_lo, parameter_hi)?;
+    let [r0, r1] = rail.domain()?;
+    let mut rail = rail;
+    for knot in rail.knots.iter_mut() {
+        *knot = ((*knot - r0) / (r1 - r0)).clamp(0.0, 1.0);
+    }
+    let degree = rail.degree;
+    for knot in rail.knots.iter_mut().take(degree + 1) {
+        *knot = 0.0;
+    }
+    let count = rail.knots.len();
+    for knot in rail.knots.iter_mut().skip(count - degree - 1) {
+        *knot = 1.0;
+    }
+    let rail = NurbsCurve::new(degree, rail.knots.clone(), rail.control_points.clone())?;
+    let mut parameters: Vec<f64> = (0..stations.len()).map(|index| (on_curve(along_at(index)) - parameter_lo) / (parameter_hi - parameter_lo)).collect();
+    parameters[0] = 0.0;
+    *parameters.last_mut().unwrap() = 1.0;
+    if parameters.windows(2).any(|pair| !(pair[1] > pair[0])) {
+        return Err("the rows' parameters are not increasing".to_string());
+    }
+    // The one section: the first window station, carried along the circle.
+    let seat = &window[0];
+    let axial = |point: Vec3| point.sub(origin).dot(axis);
+    let radial = |point: Vec3| {
+        let height = axial(point);
+        point.sub(origin).sub(axis.scale(height))
+    };
+    let seat_contact = contact(seat);
+    let contact_radius = radial(seat_contact).length();
+    if contact_radius <= bar {
+        return Err("the carrier contact sits on the axis".to_string());
+    }
+    let contact_height = axial(seat_contact);
+    let map_row = |target: Vec3| -> Result<NurbsCurve, String> {
+        let (target_radius, target_height) = (radial(target).length(), axial(target));
+        let factor = target_radius / contact_radius;
+        let control = rail
+            .control_points
+            .iter()
+            .map(|control| {
+                let weight = control.w;
+                let point = Vec3::new(control.x / weight, control.y / weight, control.z / weight);
+                let image = origin.add(axis.scale(axial(point) - contact_height + target_height)).add(radial(point).scale(factor));
+                Vec4 { x: image.x * weight, y: image.y * weight, z: image.z * weight, w: weight }
+            })
+            .collect();
+        NurbsCurve::new(rail.degree, rail.knots.clone(), control)
+    };
+    let centre_radius = radial(seat.center).length();
+    let section_radius = radial(seat.p1).length().min(radial(seat.p2).length()).min(radial(seat.apex).length());
+    if section_radius <= 1e-6 * scale {
+        return Err("the section reaches the axis".to_string());
+    }
+    if !chamfer && centre_radius <= radius.abs() * (1.0 + 1e-6) {
+        return Err("the centre circle is inside the ball (the wall would fold)".to_string());
+    }
+    let (cr, cs) = if carrier_is_second { (map_row(seat.p1)?, rail.clone()) } else { (rail.clone(), map_row(seat.p2)?) };
+    let apex = map_row(seat.apex)?;
+    let apex_weighted = NurbsCurve::new(
+        apex.degree,
+        apex.knots.clone(),
+        apex.control_points.iter().map(|control| control.scale(seat.weight)).collect(),
+    )?;
+    let center = map_row(seat.center)?;
+    let surface = crate::blend::rows::surface_from_rows(rail.degree, &cr, &cs, (!chamfer).then_some(&apex_weighted), false).map_err(|error| error.message)?;
+    // The witness: every window station is the rows' section at its parameter.
+    for index in lo..=hi {
+        let (station, s) = (&stations[index], parameters[index]);
+        let off = |curve: &NurbsCurve, point: Vec3| -> Result<f64, String> { Ok(curve.evaluate(s)?.sub(point).length()) };
+        let worst = off(&cr, station.p1)?.max(off(&cs, station.p2)?).max(off(&center, station.center)?).max(off(&apex, station.apex)?);
+        if !(worst <= bar) {
+            return Err(format!("station {index} stands {worst:.3e} off the revolved section (bar {bar:.1e})"));
+        }
+    }
+    // The support trims: the carrier's uv line, exact by construction; the
+    // mate's through the plane's chart, or the line through the window's
+    // ends when the mate is itself a revolution.
+    let line = |from: [f64; 2], to: [f64; 2]| -> Result<NurbsCurve, String> {
+        NurbsCurve::new(
+            1,
+            vec![0.0, 0.0, 1.0, 1.0],
+            vec![Vec4::from_point(Vec3::new(from[0], from[1], 0.0), 1.0), Vec4::from_point(Vec3::new(to[0], to[1], 0.0), 1.0)],
+        )
+    };
+    let carrier_point = |along: f64| -> [f64; 2] { if along_u { [along, held_value] } else { [held_value, along] } };
+    let carrier_pcurve = line(carrier_point(along_at(0)), carrier_point(along_at(stations.len() - 1)))?;
+    let mate_row = if carrier_is_second { &cr } else { &cs };
+    let mate_pcurve = match plane_chart_pcurve(&mate.face.surface, mate_row) {
+        Some(pcurve) => pcurve,
+        None => {
+            let (a, b) = (mate_uv(&window[0]), mate_uv(&window[window.len() - 1]));
+            let (sa, sb) = (parameters[lo], parameters[hi]);
+            let at = |s: f64| -> [f64; 2] {
+                let fraction = (s - sa) / (sb - sa);
+                [a[0] + fraction * (b[0] - a[0]), a[1] + fraction * (b[1] - a[1])]
+            };
+            line(at(0.0), at(1.0))?
+        }
+    };
+    let (cr_pcurve, cs_pcurve) = if carrier_is_second { (mate_pcurve, carrier_pcurve) } else { (carrier_pcurve, mate_pcurve) };
+    // The overshoot stations, read off the rows.
+    let mut stations = stations.to_vec();
+    for index in (0..lo).chain(hi + 1..stations.len()) {
+        let s = parameters[index];
+        let uv = |pcurve: &NurbsCurve| -> Result<[f64; 2], String> {
+            let point = pcurve.evaluate(s)?;
+            Ok([point.x, point.y])
+        };
+        stations[index] = Station {
+            uv1: uv(&cr_pcurve)?,
+            uv2: uv(&cs_pcurve)?,
+            p1: cr.evaluate(s)?,
+            p2: cs.evaluate(s)?,
+            center: center.evaluate(s)?,
+            weight: seat.weight,
+            apex: apex.evaluate(s)?,
+        };
+    }
+    Ok(ExactRevolution {
+        rows: FittedRows {
+            surface,
+            cr,
+            cs,
+            cr_pcurve,
+            cs_pcurve,
+            u_domain: [0.0, 1.0],
+            center: Some(center),
+            exact_extrusion: false,
+            vertex_stations: None,
+            revolution_axis: Some((origin, axis)),
+        },
+        parameters,
+        stations,
+    })
+}
+
+/// `curve` continued past its ends ALONG ITS OWN CONIC pieces to the domain
+/// `[a, b]` (one or both ends past the domain), or cut back to it (an end
+/// inside the domain). The end piece is rewritten as the same rational
+/// polynomial over the wider range — de Casteljau's polygon at the range's
+/// local parameter, past 0 or 1 — so a rational quadratic circle piece
+/// continues as that circle; the interior pieces are untouched. Refuses
+/// when the rewritten polygon carries a non-positive weight (an extension
+/// too far for the piece's parameterisation).
+pub(in crate::blend) fn extend_conic_ends(curve: &NurbsCurve, a: f64, b: f64) -> Result<NurbsCurve, String> {
+    let [d0, d1] = curve.domain()?;
+    if !(b > a) || !a.is_finite() || !b.is_finite() {
+        return Err(format!("extend_conic_ends: [{a}, {b}] is not a range"));
+    }
+    let degree = curve.degree;
+    let tolerance = crate::KNOT_IDENTITY_TOL;
+    // Every interior knot to full multiplicity: piecewise Bezier.
+    let mut bezier = curve.clone();
+    let mut interior: Vec<f64> = curve.knots.iter().copied().filter(|knot| *knot > d0 + tolerance && *knot < d1 - tolerance).collect();
+    interior.dedup_by(|next, previous| (*next - *previous).abs() <= tolerance);
+    for knot in interior {
+        bezier = bezier.insert_knot(knot, degree)?;
+    }
+    // de Casteljau's polygons at local parameter `s` on one piece: the left
+    // polygon covers local [0, s], the right one [s, 1] — for s past 0 or 1
+    // the same algebra gives the piece over the extended range.
+    let polygons = |piece: &[Vec4], s: f64| -> (Vec<Vec4>, Vec<Vec4>) {
+        let mut levels: Vec<Vec<Vec4>> = vec![piece.to_vec()];
+        while levels.last().map_or(false, |level| level.len() > 1) {
+            let previous = levels.last().unwrap();
+            let next: Vec<Vec4> = previous.windows(2).map(|pair| pair[0].scale(1.0 - s).add(pair[1].scale(s))).collect();
+            levels.push(next);
+        }
+        let left: Vec<Vec4> = levels.iter().map(|level| level[0]).collect();
+        let right: Vec<Vec4> = levels.iter().rev().map(|level| level[level.len() - 1]).collect();
+        (left, right)
+    };
+    let mut knots = bezier.knots.clone();
+    let mut control = bezier.control_points.clone();
+    let count = knots.len();
+    if a < d0 - tolerance {
+        let piece_end = knots[degree + 1];
+        let s = (a - d0) / (piece_end - d0);
+        let (_, right) = polygons(&control[..=degree], s);
+        control[..=degree].copy_from_slice(&right);
+        for knot in knots.iter_mut().take(degree + 1) {
+            *knot = a;
+        }
+    }
+    if b > d1 + tolerance {
+        let piece_start = knots[count - degree - 2];
+        let s = (b - piece_start) / (d1 - piece_start);
+        let last = control.len() - 1;
+        let (left, _) = polygons(&control[last - degree..=last], s);
+        control[last - degree..=last].copy_from_slice(&left);
+        for knot in knots.iter_mut().skip(count - degree - 1) {
+            *knot = b;
+        }
+    }
+    // The curve constructor's own weight floor (`NurbsCurve::new`: weights
+    // above 1e-12), asked here so the refusal is this function's.
+    if control.iter().any(|point| !(point.w > 1e-12)) {
+        return Err("extend_conic_ends: the extended piece carries a non-positive weight".to_string());
+    }
+    let mut extended = NurbsCurve::new(degree, knots, control)?;
+    let [e0, e1] = extended.domain()?;
+    if a > e0 + tolerance {
+        extended = extended.split(a)?.1;
+    }
+    if b < e1 - tolerance {
+        extended = extended.split(b)?.0;
+    }
+    Ok(extended)
+}
+
+/// A rail's pcurve on a PLANE mate: the rail's own control points carried
+/// through the plane's affine chart — an exact rational image of the rail
+/// in (u, v) — read back at 64 stations against the chart at the kernel's
+/// `model` tolerance of the chart's scale. `None` when the mate is not a
+/// plane, the chart is degenerate or the read-back fails (the closed
+/// exact-revolution lane's rule, `stations.rs`, for an open rail).
+pub(in crate::blend) fn plane_chart_pcurve(surface: &NurbsSurface, curve: &NurbsCurve) -> Option<NurbsCurve> {
+    if !matches!(surface.analytic(), Some(crate::AnalyticSurface::Plane { .. })) {
+        return None;
+    }
+    let [u0, u1] = surface.domain_u().ok()?;
+    let [v0, v1] = surface.domain_v().ok()?;
+    let origin = surface.evaluate(u0, v0).ok()?;
+    let du = surface.evaluate(u1, v0).ok()?.sub(origin).scale(1.0 / (u1 - u0));
+    let dv = surface.evaluate(u0, v1).ok()?.sub(origin).scale(1.0 / (v1 - v0));
+    let (a, b, c) = (du.dot(du), du.dot(dv), dv.dot(dv));
+    let det = a * c - b * b;
+    let chart_scale = origin.length().max(du.length()).max(dv.length()).max(1.0);
+    if !(det > 1e-24 * chart_scale.powi(4)) {
+        return None;
+    }
+    let affine = |point: Vec3| -> [f64; 2] {
+        let offset = point.sub(origin);
+        let (r, s) = (offset.dot(du), offset.dot(dv));
+        [u0 + (c * r - b * s) / det, v0 + (a * s - b * r) / det]
+    };
+    let mut pcurve = curve.clone();
+    for control in &mut pcurve.control_points {
+        let weight = control.w;
+        let [u, v] = affine(Vec3::new(control.x / weight, control.y / weight, control.z / weight));
+        control.x = u * weight;
+        control.y = v * weight;
+        control.z = 0.0;
+    }
+    let pcurve = NurbsCurve::new(pcurve.degree, pcurve.knots.clone(), pcurve.control_points.clone()).ok()?;
+    let [t0, t1] = curve.domain().ok()?;
+    let floor = crate::KernelTolerances::for_scale(chart_scale, 1e-7).model;
+    for step in 0..=64 {
+        let t = t0 + (t1 - t0) * step as f64 / 64.0;
+        let uv = pcurve.evaluate(t).ok()?;
+        let on_chart = surface.evaluate_extended(uv.x, uv.y).ok()?;
+        if on_chart.sub(curve.evaluate(t).ok()?).length() > floor {
+            return None;
+        }
+    }
+    Some(pcurve)
 }
 
 /// One end of an open blend: the mates' boundary edges meeting the end
@@ -1544,6 +1965,14 @@ pub(in crate::blend) fn resolve_free_end(
                 "blend: mate does not use its end boundary edge",
             )
         })?;
+    let end_record = solid
+        .shells
+        .iter()
+        .flat_map(|shell| &shell.faces)
+        .find(|face| face.id == end_face)
+        .ok_or_else(|| {
+            KernelRefusal::internal(KernelStage::Collect, "end_face", "blend: end face missing")
+        })?;
     let (cr_parameter, first_edge_parameter, cr_escalated) =
         match support_crossing(solid, &rows.cr, first_boundary, at_start) {
             Ok((s, t, _, escalated)) => (s, t, escalated),
@@ -1554,6 +1983,7 @@ pub(in crate::blend) fn resolve_free_end(
                 first_boundary,
                 first_boundary_coedge,
                 at_start,
+                end_record,
             )?,
         };
     let (cs_parameter, second_edge_parameter, cs_escalated) =
@@ -1566,6 +1996,7 @@ pub(in crate::blend) fn resolve_free_end(
                 second_boundary,
                 second_boundary_coedge,
                 at_start,
+                end_record,
             )?,
         };
     // A crossing past the boundary's far vertex is not an end on this face.
@@ -1604,14 +2035,6 @@ pub(in crate::blend) fn resolve_free_end(
     } else {
         cr_parameter <= 1.0 - RIM_MARGIN && cs_parameter <= 1.0 - RIM_MARGIN
     };
-    let end_record = solid
-        .shells
-        .iter()
-        .flat_map(|shell| &shell.faces)
-        .find(|face| face.id == end_face)
-        .ok_or_else(|| {
-            KernelRefusal::internal(KernelStage::Collect, "end_face", "blend: end face missing")
-        })?;
     let clamp01 = |value: f64| value.clamp(0.0, 1.0);
     let (transverse, blend_pcurve, end_pcurve) = match exact_section_transverse(
         rows,
@@ -2494,6 +2917,7 @@ pub(in crate::blend) fn support_crossing_uv(
     boundary: &EdgeRecord,
     boundary_coedge: &CoedgeRecord,
     at_start: bool,
+    end_face: &FaceRecord,
 ) -> Result<(f64, f64, bool), KernelRefusal> {
     let [s0, s1] = support_pcurve.domain().or_refuse(KernelStage::Refine, "domain")?;
     let [q0, q1] = boundary_coedge.pcurve.domain().or_refuse(KernelStage::Refine, "domain")?;
@@ -2565,15 +2989,34 @@ pub(in crate::blend) fn support_crossing_uv(
         1.0 - fraction
     };
     let t = boundary.t0 + (boundary.t1 - boundary.t0) * fraction;
-    // A UV solution is only a crossing if the two 3D curves meet there.  A
-    // rational pcurve evaluated past its domain sweeps away from its surface
-    // image, so a boundary the rail never reaches — one that CONTINUES the
-    // blended edge tangentially, the rail running parallel to it — can still
-    // hand Newton a phantom (s, q).  The §6.9 EXTEND case, a short straight
-    // boundary met just past its end, keeps its 3D point on the boundary's
-    // line and passes.
-    let on_support = support.evaluate_extended(s).or_refuse(KernelStage::Refine, "evaluate_extended")?;
-    let on_boundary = boundary.curve.evaluate_extended(t).or_refuse(KernelStage::Refine, "evaluate_extended")?;
+    // A crossing that lands PAST the boundary's trim (the §6.9 EXTEND
+    // landing) was solved on two pcurves EXTRAPOLATED off their surface
+    // images: the boundary's past its own end, the support's past the march.
+    // That extrapolation is the pcurve fit's polynomial continuation, not the
+    // boundary's carrier intersection, and its error grows with the square
+    // of the reach — on the 2026-10-12 report (a free-form body's short cap
+    // edge continued past the vertex a rolling ball of r = 0.5 … 1.0 ends
+    // beyond) the GENUINE crossing read 4.1e-3 … 1.6e-2 off in 3D and was
+    // refused below as a phantom, while r ≤ 0.4 passed on the same path.
+    // The boundary's 3D curve is no arbiter there either: it is the fit of
+    // the carriers' intersection over the edge and a short margin, and
+    // `evaluate_extended` continues it LINEARLY past that, so the closest
+    // approach of the two 3D curves still read 1.4e-3 … 3.6e-3 and the rim
+    // vertex it placed sat off the end face — the cap's loop then crossed
+    // itself at r = 1.  What the landing IS: the point where the support row
+    // (on the mate) meets the END FACE's surface, since the boundary is that
+    // face's intersection with the mate.  The row parameter is polished onto
+    // the end surface (three equations in `s` and the end face's `uv`, read
+    // through the extensions: the landing lies outside the end face's trim),
+    // and the boundary parameter is the nearest point of its extended curve
+    // to that landing — the surgery uses it only to extend the edge's range,
+    // and re-marches the carriers to the rim vertex itself.  A boundary that
+    // CONTINUES the blended edge keeps its rail a rail offset away along its
+    // whole extension, so the polish either does not converge or leaves the
+    // row's domain, and the historical reading (the phantom test below)
+    // stands.  Inside the trim the pcurves are on their images and nothing
+    // here changes.
+    let extended = fraction < -1e-9 || fraction > 1.0 + 1e-9;
     // Model scale from the boundary's own extent — never from the evaluated
     // points, which an extrapolation can throw arbitrarily far and thereby
     // make any gap look small.
@@ -2583,7 +3026,55 @@ pub(in crate::blend) fn support_crossing_uv(
         .length()
         .max(boundary.curve.evaluate(boundary.t1).or_refuse(KernelStage::Refine, "evaluate")?.length())
         .max(1.0);
-    let gap = on_support.sub(on_boundary).length();
+    let historical = 1e-6 * scale;
+    let band = crate::KernelTolerances::for_solid(solid, 1e-7).pcurve_consistency;
+    // The reading as it always was: the two 3D curves at the pcurve landing.
+    let raw_gap = support
+        .evaluate_extended(s).or_refuse(KernelStage::Refine, "evaluate_extended")?
+        .sub(boundary.curve.evaluate_extended(t).or_refuse(KernelStage::Refine, "evaluate_extended")?)
+        .length();
+    // Only an extended landing the historical bar would not pass as it
+    // stands is polished; one inside that bar ships exactly as it always has.
+    let mut polished = false;
+    let (s, t) = if extended && raw_gap > historical {
+        let vertex_t = if fraction < 0.0 { boundary.t0 } else { boundary.t1 };
+        match polish_crossing_onto_end_face(support, boundary, end_face, s, t, vertex_t)? {
+            Some((s_polished, t_polished))
+                if s_polished >= s0 - 1e-6 * span && s_polished <= s1 + 1e-6 * span =>
+            {
+                polished = true;
+                (s_polished, t_polished)
+            }
+            _ => (s, t),
+        }
+    } else {
+        (s, t)
+    };
+    // A UV solution is only a crossing if the two 3D curves meet there.  A
+    // rational pcurve evaluated past its domain sweeps away from its surface
+    // image, so a boundary the rail never reaches — one that CONTINUES the
+    // blended edge tangentially, the rail running parallel to it — can still
+    // hand Newton a phantom (s, q).  The §6.9 EXTEND case, a short straight
+    // boundary met just past its end, keeps its 3D point on the boundary's
+    // line and passes.
+    let gap = if polished {
+        // The polish converged on the end face to the Newton bar; the
+        // distance to the boundary's LINEAR continuation is not a reading of
+        // the landing (see above) and is left out of the phantom test.
+        0.0
+    } else {
+        raw_gap
+    };
+    if std::env::var("BREP_DEBUG_BLEND_MARCH").is_ok() {
+        let on_support = support.evaluate_extended(s).or_refuse(KernelStage::Refine, "evaluate_extended")?;
+        let on_boundary = boundary.curve.evaluate_extended(t).or_refuse(KernelStage::Refine, "evaluate_extended")?;
+        let domain = boundary.curve.domain().unwrap_or([f64::NAN, f64::NAN]);
+        eprintln!(
+            "  support_crossing_uv: boundary {} edge t=[{:.4},{:.4}] curve domain [{:.4},{:.4}] fraction {fraction:.4} extended={extended} polished={polished} s={s:.6} of [{s0:.4},{s1:.4}] t={t:.6} raw_gap={raw_gap:.3e} gap={gap:.3e} on_support=({:.6},{:.6},{:.6}) on_boundary=({:.6},{:.6},{:.6})",
+            boundary.id, boundary.t0, boundary.t1, domain[0], domain[1],
+            on_support.x, on_support.y, on_support.z, on_boundary.x, on_boundary.y, on_boundary.z
+        );
+    }
     // Both sides of that subtraction are APPROXIMATIONS of the same rail: the
     // support is a cubic fit through the marched stations, and the crossing
     // parameter came out of the pcurve fit through the SAME stations — two
@@ -2598,8 +3089,6 @@ pub(in crate::blend) fn support_crossing_uv(
     // judged against `pcurve_consistency`, the same contract, and never
     // against a literal of its own.  A crossing accepted only past the
     // historical bar is ESCALATED: the caller must validate what it builds.
-    let historical = 1e-6 * scale;
-    let band = crate::KernelTolerances::for_solid(solid, 1e-7).pcurve_consistency;
     if gap > band.max(historical) {
         return Err(KernelRefusal::unsupported(
             KernelStage::Intersect,
@@ -2611,7 +3100,103 @@ pub(in crate::blend) fn support_crossing_uv(
             ),
         ));
     }
-    Ok((s, t, gap > historical))
+    Ok((s, t, polished || gap > historical))
+}
+
+/// An EXTEND landing polished onto the end face: the row parameter `s` and
+/// the end face's `(u, v)` at which `support(s) = end_surface(u, v)`, by
+/// Newton from the pcurve landing's `s` and the end face's own uv of the
+/// boundary's vertex (the end nearest the landing, `vertex_t`), both read
+/// through their extensions.  Returns the polished `(s, t)`, `t` the nearest
+/// parameter of the boundary's extended curve to the landing, or `None` when
+/// the system does not converge, the landing moves further than the reach it
+/// polishes (another crossing of the end surface, not this one), or the end
+/// face does not use the boundary edge.
+fn polish_crossing_onto_end_face(
+    support: &NurbsCurve,
+    boundary: &EdgeRecord,
+    end_face: &FaceRecord,
+    seed_s: f64,
+    seed_t: f64,
+    vertex_t: f64,
+) -> Result<Option<(f64, f64)>, KernelRefusal> {
+    let Some(end_coedge) = end_face
+        .loops
+        .iter()
+        .flat_map(|loop_record| &loop_record.coedges)
+        .find(|coedge| coedge.edge_id == boundary.id)
+    else {
+        return Ok(None);
+    };
+    let seed_uv = edge_uv_on_face(end_coedge, boundary, vertex_t)?;
+    let vertex_point = boundary.curve.evaluate(vertex_t).or_refuse(KernelStage::Refine, "evaluate")?;
+    let landing = support.evaluate_extended(seed_s).or_refuse(KernelStage::Refine, "evaluate_extended")?;
+    let reach = landing.sub(vertex_point).length();
+    let scale = landing.length().max(vertex_point.length()).max(1.0);
+    let tolerance = 1e-12 * scale;
+    let surface = &end_face.surface;
+    let mut x = [seed_s, seed_uv[0], seed_uv[1]];
+    let mut converged = false;
+    for _ in 0..NEWTON_ITERATIONS {
+        let a = support.derivatives_extended(x[0], 1).or_refuse(KernelStage::Refine, "derivatives_extended")?;
+        let d = surface.derivatives_extended(x[1], x[2], 1).or_refuse(KernelStage::Refine, "derivatives_extended")?;
+        let residual = a[0].sub(d[0][0]);
+        if residual.length() <= tolerance {
+            converged = true;
+            break;
+        }
+        let matrix = [
+            [a[1].x, -d[1][0].x, -d[0][1].x],
+            [a[1].y, -d[1][0].y, -d[0][1].y],
+            [a[1].z, -d[1][0].z, -d[0][1].z],
+        ];
+        let Ok(delta) = fit::solve_small::<3>(matrix, [residual.x, residual.y, residual.z], 3) else {
+            return Ok(None);
+        };
+        if delta.iter().any(|value| !value.is_finite()) {
+            return Ok(None);
+        }
+        for (value, correction) in x.iter_mut().zip(delta) {
+            *value -= correction;
+        }
+    }
+    if !converged {
+        let a = support.evaluate_extended(x[0]).or_refuse(KernelStage::Refine, "evaluate_extended")?;
+        let d = surface.evaluate_extended(x[1], x[2]).or_refuse(KernelStage::Refine, "evaluate_extended")?;
+        if a.sub(d).length() > 1e-9 * scale {
+            return Ok(None);
+        }
+    }
+    let polished = support.evaluate_extended(x[0]).or_refuse(KernelStage::Refine, "evaluate_extended")?;
+    // The polish corrects the pcurves' extrapolation, which is a fraction of
+    // the extension itself; a landing that moves further than its whole
+    // reach has found another crossing of the end surface.
+    if polished.sub(landing).length() > reach.max(1e-9 * scale) {
+        return Ok(None);
+    }
+    // The boundary parameter: the nearest point of the extended curve.
+    let mut t = seed_t;
+    for _ in 0..NEWTON_ITERATIONS {
+        let b = boundary.curve.derivatives_extended(t, 2).or_refuse(KernelStage::Refine, "derivatives_extended")?;
+        let offset = b[0].sub(polished);
+        let g = offset.dot(b[1]);
+        let dg = b[1].dot(b[1]) + offset.dot(b[2]);
+        if !(dg.abs() > 0.0) || !dg.is_finite() {
+            break;
+        }
+        let step = g / dg;
+        if !step.is_finite() {
+            break;
+        }
+        t -= step;
+        if step.abs() <= 1e-14 * (1.0 + t.abs()) {
+            break;
+        }
+    }
+    if !t.is_finite() {
+        return Ok(None);
+    }
+    Ok(Some((x[0], t)))
 }
 
 /// Where a fitted support curve crosses a boundary edge (nearest genuine

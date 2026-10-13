@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:brep="https://brep.io/icons"
+     viewBox="0 0 24 24" width="24" height="24" brep:glyph-name="icon_sketch3d_plane_xy" brep:unicode="E0C3">
+  <!-- The XY working plane: a face-on square with its two in-plane axes, X across and Y up. -->
+  <g fill="#111" stroke="#111" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M4.5 4.5 H19.5 V19.5 H4.5 Z" style="fill:none" stroke-dasharray="2.6 2.2"/>
+    <path d="M4.5 19.5 H15.5" style="fill:none"/>
+    <path d="M4.5 19.5 V8.5" style="fill:none"/>
+    <circle cx="4.5" cy="19.5" r="2" stroke="none"/>
+  </g>
+</svg>

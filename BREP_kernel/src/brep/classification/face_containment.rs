@@ -593,7 +593,16 @@ fn generic_scan(
     scan: ChordScan,
 ) -> (usize, bool, Option<(usize, usize, f64)>) {
     if scan.indexes(generic.chord_count) && in_index_range(point) {
-        if let Some(index) = generic.index.get_or_init(|| ChordIndex::build(generic.loops.as_slice())) {
+        if let Some(index) = generic.index.get_or_init(|| {
+            let started = containment_profile_started();
+            let built = ChordIndex::build(generic.loops.as_slice());
+            let ms = containment_elapsed_ms(started);
+            containment_profile(|p| {
+                p.index_builds += 1;
+                p.index_ms += ms;
+            });
+            built
+        }) {
             let loops = generic.loops.as_slice();
             let nearest = index.nearest(loops, point);
             let boundary = nearest.is_some_and(|(_, _, distance)| distance <= tolerance);
@@ -624,6 +633,11 @@ struct PreparedFace {
     generic: std::cell::OnceCell<Result<GenericPrep, String>>,
     /// The spherical trim lane's region, built from `generic`'s samples.
     sphere_region: std::cell::OnceCell<Result<crate::sphere_chart::SphericalRegion, String>>,
+    /// Each loop's trim samples at [`trim_station`] `0..count` per pcurve, in
+    /// coedge order, taken once and shared by the sphere-cap, wrapped-horizon
+    /// and generic lanes ([`loop_samples`]); one entry per loop, filled the
+    /// first time a lane reaches that loop.
+    loop_samples: std::cell::RefCell<Vec<Option<Result<std::rc::Rc<Vec<Vec2>>, String>>>>,
 }
 
 impl PreparedFace {
@@ -635,8 +649,154 @@ impl PreparedFace {
             rim_strip: std::cell::OnceCell::new(),
             generic: std::cell::OnceCell::new(),
             sphere_region: std::cell::OnceCell::new(),
+            loop_samples: std::cell::RefCell::new(Vec::new()),
         }
     }
+}
+
+/// Loop `loop_index` of `face` sampled as the lanes sample it: every pcurve
+/// at [`trim_sample_count`] chords, [`trim_station`] `0..count`, in coedge
+/// order. The three lanes that read exactly these samples (the sphere cap,
+/// the wrapped horizon, the generic scan) used to each evaluate them again,
+/// 2 500 pcurve evaluations per pass on a box-fillet corner patch; the
+/// samples are taken the first time any lane reaches the loop and shared
+/// from then on, loop by loop, so a loop a lane never reaches (it declined
+/// on an earlier loop) is never sampled, and a sampling error surfaces at
+/// the loop and the query it did when each lane sampled for itself.
+fn loop_samples(prepared: &PreparedFace, face: &FaceRecord, loop_index: usize) -> Result<std::rc::Rc<Vec<Vec2>>, String> {
+    if let Some(Some(sampled)) = prepared.loop_samples.borrow().get(loop_index) {
+        return sampled.clone();
+    }
+    let sampled = (|| {
+        let mut points: Vec<Vec2> = Vec::new();
+        for coedge in &face.loops[loop_index].coedges {
+            let curve = &coedge.pcurve;
+            let [start, end] = curve.domain()?;
+            let sample_count = trim_sample_count(curve);
+            for index in 0..sample_count {
+                let parameter = trim_station(start, end, index, sample_count);
+                let evaluated = curve.evaluate(parameter)?;
+                points.push(Vec2 {
+                    x: evaluated.x,
+                    y: evaluated.y,
+                });
+            }
+        }
+        Ok(std::rc::Rc::new(points))
+    })();
+    let mut cells = prepared.loop_samples.borrow_mut();
+    if cells.len() < face.loops.len() {
+        cells.resize(face.loops.len(), None);
+    }
+    cells[loop_index] = Some(sampled.clone());
+    sampled
+}
+
+/// Per-thread split of what a face's FIRST query pays to prepare it, printed
+/// by [`containment_profile_report`] when `BREP_PROFILE` is set (the
+/// restriction lane and the interference scan report it beside the
+/// classifier's `classify.profile`): how many faces missed the prepared-face
+/// cache, how many of each lane's preparations ran and their wall time, the
+/// generic scan's chord index builds, and the spherical lane's region builds
+/// split into the surface evaluations, the canonicalization and the region's
+/// own construction (`from_segments`, its seed included). When the switch is
+/// off every counter is one thread-local flag test.
+#[derive(Default, Clone, Copy)]
+struct ContainmentProfile {
+    enabled: bool,
+    cache_misses: u64,
+    seam_band_preps: u64,
+    seam_band_ms: f64,
+    sphere_cap_preps: u64,
+    sphere_cap_ms: f64,
+    horizon_preps: u64,
+    horizon_ms: f64,
+    rim_strip_preps: u64,
+    rim_strip_ms: f64,
+    generic_preps: u64,
+    generic_ms: f64,
+    generic_chords: u64,
+    index_builds: u64,
+    index_ms: f64,
+    region_builds: u64,
+    region_evaluate_ms: f64,
+    region_canonical_ms: f64,
+    region_segments_ms: f64,
+}
+
+thread_local! {
+    static CONTAINMENT_PROFILE: std::cell::Cell<ContainmentProfile> =
+        const { std::cell::Cell::new(ContainmentProfile {
+            enabled: false, cache_misses: 0, seam_band_preps: 0, seam_band_ms: 0.0,
+            sphere_cap_preps: 0, sphere_cap_ms: 0.0, horizon_preps: 0, horizon_ms: 0.0,
+            rim_strip_preps: 0, rim_strip_ms: 0.0, generic_preps: 0, generic_ms: 0.0,
+            generic_chords: 0, index_builds: 0, index_ms: 0.0, region_builds: 0,
+            region_evaluate_ms: 0.0, region_canonical_ms: 0.0, region_segments_ms: 0.0,
+        }) };
+}
+
+fn containment_profile(update: impl FnOnce(&mut ContainmentProfile)) {
+    CONTAINMENT_PROFILE.with(|cell| {
+        let mut profile = cell.get();
+        if profile.enabled {
+            update(&mut profile);
+            cell.set(profile);
+        }
+    });
+}
+
+fn containment_profile_started() -> Option<web_time::Instant> {
+    CONTAINMENT_PROFILE
+        .with(|cell| cell.get().enabled)
+        .then(web_time::Instant::now)
+}
+
+fn containment_elapsed_ms(started: Option<web_time::Instant>) -> f64 {
+    started.map_or(0.0, |s| s.elapsed().as_secs_f64() * 1_000.0)
+}
+
+/// Arm the preparation counters (reset to zero) when `BREP_PROFILE` is set.
+pub(crate) fn containment_profile_begin() {
+    let enabled = std::env::var("BREP_PROFILE").is_ok();
+    CONTAINMENT_PROFILE.with(|cell| {
+        cell.set(ContainmentProfile {
+            enabled,
+            ..ContainmentProfile::default()
+        })
+    });
+}
+
+/// Print the counters gathered since [`containment_profile_begin`] under
+/// `label` and disarm them. Silent when profiling is off.
+pub(crate) fn containment_profile_report(label: &str) {
+    let p = CONTAINMENT_PROFILE.with(|cell| cell.get());
+    if !p.enabled {
+        return;
+    }
+    eprintln!(
+        "containment.profile {label} cache_misses={} seam_band: preps={} ms={:.2} sphere_cap: preps={} ms={:.2} horizon: preps={} ms={:.2} rim_strip: preps={} ms={:.2} generic: preps={} ms={:.2} chords={} index: builds={} ms={:.2} region: builds={} evaluate_ms={:.2} canonical_ms={:.2} segments_ms={:.2}",
+        p.cache_misses, p.seam_band_preps, p.seam_band_ms, p.sphere_cap_preps, p.sphere_cap_ms,
+        p.horizon_preps, p.horizon_ms, p.rim_strip_preps, p.rim_strip_ms, p.generic_preps,
+        p.generic_ms, p.generic_chords, p.index_builds, p.index_ms, p.region_builds,
+        p.region_evaluate_ms, p.region_canonical_ms, p.region_segments_ms,
+    );
+    CONTAINMENT_PROFILE.with(|cell| cell.set(ContainmentProfile::default()));
+}
+
+/// A lane's preparation, timed into the profile's `(count, ms)` pair when it
+/// is on.
+fn timed_lane<'a, T>(
+    cell: &'a std::cell::OnceCell<Result<T, String>>,
+    build: impl FnOnce() -> Result<T, String>,
+    record: fn(&mut ContainmentProfile, f64),
+) -> Result<&'a T, String> {
+    lane(cell, || {
+        let started = containment_profile_started();
+        let built = build();
+        let ms = containment_elapsed_ms(started);
+        containment_profile(|p| record(p, ms));
+        built
+    })
 }
 
 fn lane<'a, T>(
@@ -835,6 +995,7 @@ fn prepared_face(face: &FaceRecord) -> std::rc::Rc<PreparedFace> {
         let prepared = std::rc::Rc::new(PreparedFace::new());
         entries.insert(0, (hash, signature, prepared.clone()));
         entries.truncate(PREPARED_FACE_CACHE_ENTRIES);
+        containment_profile(|p| p.cache_misses += 1);
         prepared
     })
 }
@@ -1094,7 +1255,7 @@ fn seam_band_point_in_face(
 /// classifier bit-identically. Loops that WIND the period (net winding ≠ 0)
 /// do not close under unwrapping — bail to the plain path rather than guess.
 /// Escape hatch `BREP_HORIZON_CONTAINMENT=0`.
-fn prepare_wrapped_horizon(face: &FaceRecord) -> Result<Option<HorizonPrep>, String> {
+fn prepare_wrapped_horizon(face: &FaceRecord, prepared: &PreparedFace) -> Result<Option<HorizonPrep>, String> {
     if face.surface.closed_directions()? != (true, false) || face.loops.is_empty() {
         return Ok(None);
     }
@@ -1122,21 +1283,8 @@ fn prepare_wrapped_horizon(face: &FaceRecord) -> Result<Option<HorizonPrep>, Str
     let debug = std::env::var("BREP_DEBUG_HORIZON").is_ok();
     let mut loops: Vec<Vec<Vec2>> = Vec::new();
     let mut straddling = false;
-    for loop_record in &face.loops {
-        let mut points: Vec<Vec2> = Vec::new();
-        for coedge in &loop_record.coedges {
-            let curve = &coedge.pcurve;
-            let [start, end] = curve.domain()?;
-            let sample_count = trim_sample_count(curve);
-            for index in 0..sample_count {
-                let parameter = trim_station(start, end, index, sample_count);
-                let evaluated = curve.evaluate(parameter)?;
-                points.push(Vec2 {
-                    x: evaluated.x,
-                    y: evaluated.y,
-                });
-            }
-        }
+    for loop_index in 0..face.loops.len() {
+        let points = loop_samples(prepared, face, loop_index)?;
         if points.len() < 3 {
             continue;
         }
@@ -1295,7 +1443,7 @@ fn wrapped_horizon_point_in_face(
 /// the oppositely wound collapsed rim at one sphere pole.  This is the natural
 /// topology when a circle about an oblique axis encloses a pole of the sphere's
 /// stored parameter frame.
-fn prepare_winding_sphere_cap(face: &FaceRecord) -> Result<Option<SphereCapPrep>, String> {
+fn prepare_winding_sphere_cap(face: &FaceRecord, prepared: &PreparedFace) -> Result<Option<SphereCapPrep>, String> {
     if !matches!(
         face.surface.analytic(),
         Some(crate::AnalyticSurface::Sphere { .. })
@@ -1318,17 +1466,8 @@ fn prepare_winding_sphere_cap(face: &FaceRecord) -> Result<Option<SphereCapPrep>
         vmax: f64,
     }
     let mut loops = Vec::with_capacity(2);
-    for loop_record in &face.loops {
-        let mut points = Vec::new();
-        for coedge in &loop_record.coedges {
-            let [start, end] = coedge.pcurve.domain()?;
-            let samples = trim_sample_count(&coedge.pcurve);
-            for index in 0..samples {
-                let parameter = trim_station(start, end, index, samples);
-                let p = coedge.pcurve.evaluate(parameter)?;
-                points.push(Vec2 { x: p.x, y: p.y });
-            }
-        }
+    for loop_index in 0..face.loops.len() {
+        let points = loop_samples(prepared, face, loop_index)?;
         if points.len() < 2 {
             return Ok(None);
         }
@@ -1617,26 +1756,21 @@ fn covering_rim_strip_point_in_face(
 /// The generic scan's trim samples: every pcurve at `(interior knots + 1) ×
 /// (degree + 1) × 4` chords, the closed polygon per loop, and the chord
 /// parameters behind every polygon edge.
-fn prepare_generic(face: &FaceRecord) -> Result<GenericPrep, String> {
+fn prepare_generic(face: &FaceRecord, prepared: &PreparedFace) -> Result<GenericPrep, String> {
     let mut loops: Vec<LoopSamples> = Vec::with_capacity(face.loops.len());
     let mut segments: Vec<Vec<SegmentPrep>> = Vec::with_capacity(face.loops.len());
     let mut chord_count = 0;
-    for loop_record in &face.loops {
-        let mut polygon = Vec::new();
-        let mut chords = Vec::new();
+    for (loop_index, loop_record) in face.loops.iter().enumerate() {
+        let polygon = loop_samples(prepared, face, loop_index)?;
+        let mut chords = Vec::with_capacity(polygon.len());
         let mut coedges = Vec::with_capacity(loop_record.coedges.len());
+        let mut first = 0;
         for (coedge_index, coedge) in loop_record.coedges.iter().enumerate() {
-            let first = polygon.len();
             let curve = &coedge.pcurve;
             let [start, end] = curve.domain()?;
             let sample_count = trim_sample_count(curve);
             for index in 0..sample_count {
                 let parameter = trim_station(start, end, index, sample_count);
-                let evaluated = curve.evaluate(parameter)?;
-                polygon.push(Vec2 {
-                    x: evaluated.x,
-                    y: evaluated.y,
-                });
                 let parameter_end = if index + 1 < sample_count {
                     trim_station(start, end, index + 1, sample_count)
                 } else {
@@ -1648,12 +1782,15 @@ fn prepare_generic(face: &FaceRecord) -> Result<GenericPrep, String> {
                     parameter_end,
                 });
             }
-            coedges.push((coedge.edge_id, first, polygon.len() - first));
+            coedges.push((coedge.edge_id, first, sample_count));
+            first += sample_count;
         }
+        debug_assert_eq!(first, polygon.len());
         chord_count += chords.len();
         loops.push(LoopSamples { polygon, coedges });
         segments.push(chords);
     }
+    containment_profile(|p| p.generic_chords += chord_count as u64);
     Ok(GenericPrep {
         loops,
         segments,
@@ -1667,7 +1804,7 @@ fn prepare_generic(face: &FaceRecord) -> Result<GenericPrep, String> {
 /// per coedge in loop order, which is all the spherical lane needs to drop a slit
 /// and to rebuild the boundary as SEGMENTS rather than as one ring.
 struct LoopSamples {
-    polygon: Vec<Vec2>,
+    polygon: std::rc::Rc<Vec<Vec2>>,
     coedges: Vec<(u64, usize, usize)>,
 }
 
@@ -1776,6 +1913,7 @@ fn build_sphere_region(
     // of the boundary seen from `same_sense ? Su x Sv : -(Su x Sv)`.
     let outward_face_normal =
         face.same_sense == atlas.parameterization_is_outward(&face.surface)?;
+    let evaluate_started = containment_profile_started();
     let mut points: Vec<Vec3> = Vec::new();
     let mut spans: Vec<(usize, usize)> = Vec::new();
     for samples in sampled {
@@ -1802,18 +1940,30 @@ fn build_sphere_region(
     // two coedges is evaluated twice and the two answers agree only to
     // rounding, which the exact-reverse cancellation and the loop walk
     // both need collapsed.
+    let evaluate_ms = containment_elapsed_ms(evaluate_started);
+    let canonical_started = containment_profile_started();
     crate::sphere_chart::canonicalize_points(&mut points, 1e-9);
+    let canonical_ms = containment_elapsed_ms(canonical_started);
+    let segments_started = containment_profile_started();
     let mut boundary: Vec<(Vec3, Vec3)> = Vec::new();
     for (first, last) in spans {
         for index in first..last.saturating_sub(1) {
             boundary.push((points[index], points[index + 1]));
         }
     }
-    Ok(crate::sphere_chart::SphericalRegion::from_segments(
+    let region = crate::sphere_chart::SphericalRegion::from_segments(
         atlas.centre,
         &boundary,
         outward_face_normal,
-    ))
+    );
+    let segments_ms = containment_elapsed_ms(segments_started);
+    containment_profile(|p| {
+        p.region_builds += 1;
+        p.region_evaluate_ms += evaluate_ms;
+        p.region_canonical_ms += canonical_ms;
+        p.region_segments_ms += segments_ms;
+    });
+    Ok(region)
 }
 
 
@@ -1870,23 +2020,35 @@ fn lane_from<'a>(
     from: usize,
 ) -> Result<(usize, Lane<'a>), String> {
     if from == 0 {
-        let band = lane(&prepared.seam_band, || prepare_seam_band(face))?;
+        let band = timed_lane(&prepared.seam_band, || prepare_seam_band(face), |p, ms| {
+            p.seam_band_preps += 1;
+            p.seam_band_ms += ms;
+        })?;
         if !matches!(band, SeamBandPrep::NotApplicable | SeamBandPrep::Declined) {
             return Ok((0, Lane::SeamBand(band)));
         }
     }
     if from <= 1 {
-        if let Some(cap) = lane(&prepared.sphere_cap, || prepare_winding_sphere_cap(face))? {
+        if let Some(cap) = timed_lane(&prepared.sphere_cap, || prepare_winding_sphere_cap(face, prepared), |p, ms| {
+            p.sphere_cap_preps += 1;
+            p.sphere_cap_ms += ms;
+        })? {
             return Ok((1, Lane::SphereCap(cap)));
         }
     }
     if from <= 2 {
-        if let Some(horizon) = lane(&prepared.horizon, || prepare_wrapped_horizon(face))? {
+        if let Some(horizon) = timed_lane(&prepared.horizon, || prepare_wrapped_horizon(face, prepared), |p, ms| {
+            p.horizon_preps += 1;
+            p.horizon_ms += ms;
+        })? {
             return Ok((2, Lane::Horizon(horizon)));
         }
     }
     if from <= 3 {
-        if let Some(strip) = lane(&prepared.rim_strip, || prepare_covering_rim_strip(face))? {
+        if let Some(strip) = timed_lane(&prepared.rim_strip, || prepare_covering_rim_strip(face), |p, ms| {
+            p.rim_strip_preps += 1;
+            p.rim_strip_ms += ms;
+        })? {
             return Ok((3, Lane::RimStrip(strip)));
         }
     }
@@ -2042,7 +2204,10 @@ fn point_in_face_scanned(
         }
         from = position + 1;
     }
-    let generic = lane(&prepared.generic, || prepare_generic(face))?;
+    let generic = timed_lane(&prepared.generic, || prepare_generic(face, &prepared), |p, ms| {
+        p.generic_preps += 1;
+        p.generic_ms += ms;
+    })?;
     let (crossings, boundary, nearest) = generic_scan(generic, point, tolerance, scan);
     if boundary {
         trace_lane(face, point, "polygon_boundary", PolygonClass::Boundary);

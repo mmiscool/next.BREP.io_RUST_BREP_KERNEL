@@ -42,25 +42,27 @@ pub(super) fn blend_open_smooth_chain(
     // stood 2.12e-6 off the exact sweep (4.43e-6 with the fat seam turned
     // 295), read input-free on 871581076 + the section-fit fix.
     let bar = crate::KernelTolerances::for_solid(solid, 1e-7).intersection_fit;
-    let mut per_segment = CHAIN_PER_SEGMENT;
+    let mut budget = ChainBudget::for_chain(&chain.segments, CHAIN_PER_SEGMENT)?;
     loop {
-        let samples = march_chain(&chain.segments, radius, true, per_segment, FoldPolicy::Refuse)?;
+        let per_segment = budget.rung;
+        let samples = march_chain(&chain.segments, radius, true, &budget, FoldPolicy::Refuse)?;
         let deepest = std::cell::Cell::new(0);
-        match open_chain_rung(solid, chain, radius, chamfer, name, per_segment, bar, samples, 0, &deepest)? {
+        match open_chain_rung(solid, chain, radius, chamfer, name, &budget, bar, samples, 0, &deepest)? {
             OpenRung::Built(built) => return Ok(built),
             OpenRung::TooCoarse { deviation } => {
                 crate::blend::carve::carve_trace(format_args!(
-                    "blend open chain: {per_segment} stations per segment leaves the blend {deviation:.6e} \
-                     from the rolling ball, against {bar:.3e}"
+                    "blend open chain: {} leaves the blend {deviation:.6e} \
+                     from the rolling ball, against {bar:.3e}",
+                    budget.describe()
                 ));
-                if per_segment * 2 > CHAIN_CARVE_MAX_PER_SEGMENT {
+                if budget.largest() * 2 > CHAIN_CARVE_MAX_PER_SEGMENT {
                     return Err(KernelRefusal::non_convergence(KernelStage::Refine, "open_chain_ladder_top", format!(
                         "blend: at {per_segment} stations per segment — the top of the chain's ladder — \
                          this open chain's rails or wall still stand {deviation:.6e} from the rolling ball \
                          against a bar of {bar:.3e}, so there is no blend accurate enough to build"
                     )));
                 }
-                per_segment *= 2;
+                budget = budget.doubled();
             }
         }
     }
@@ -87,12 +89,15 @@ fn open_chain_rung(
     radius: f64,
     chamfer: bool,
     name: Option<&str>,
-    per_segment: usize,
+    budget: &ChainBudget,
     bar: f64,
     mut samples: Vec<ChainSample>,
     round: usize,
     deepest: &std::cell::Cell<usize>,
 ) -> Result<OpenRung, KernelRefusal> {
+    // The rung, for the traces and the typed reports; each segment's own
+    // count is the budget's.
+    let per_segment = budget.rung;
     // The deepest local round any rung of this ladder step attempted: a
     // rejected refinement reports the rounds it actually spent.
     deepest.set(deepest.get().max(round));
@@ -106,10 +111,10 @@ fn open_chain_rung(
     for sample in &samples {
         let keep = if sample.segment == 0 && sample.position < 0 {
             true
-        } else if sample.segment == last_seg && sample.position >= per_segment as isize {
+        } else if sample.segment == last_seg && sample.position >= budget.count(last_seg) as isize {
             true
         } else {
-            (0..per_segment as isize).contains(&sample.position)
+            (0..budget.count(sample.segment) as isize).contains(&sample.position)
         };
         if keep {
             global.push((sample.parameter, &sample.station));
@@ -158,7 +163,7 @@ fn open_chain_rung(
     let segment_count = |samples: &[ChainSample], segment: usize| {
         samples
             .iter()
-            .filter(|sample| sample.segment == segment && (0..per_segment as isize).contains(&sample.position))
+            .filter(|sample| sample.segment == segment && (0..budget.count(segment) as isize).contains(&sample.position))
             .count()
     };
     let in_segment_count = |samples: &[ChainSample]| (0..segments.len()).map(|segment| segment_count(samples, segment)).max().unwrap_or(0);
@@ -170,13 +175,13 @@ fn open_chain_rung(
                 <= CHAIN_CARVE_MAX_PER_SEGMENT
         })
     };
-    let contacts = super::chain_dense_contacts(segments, radius, per_segment, &samples, super::closed::LOCAL_RAIL_STENCIL)?;
+    let contacts = super::chain_dense_contacts(segments, radius, budget, &samples, super::closed::LOCAL_RAIL_STENCIL)?;
     let (dense, unreadable) = super::closed::dense_rail_misses(&contacts, &samples, &cr, &cs, global_low, global_range, false)?;
     let failed_to_read: Vec<usize> = contacts.unsolved_at.iter().chain(&unreadable).copied().collect();
     let (mut deviation, mut failing) = super::closed::combine_rail_verdict((0.0, Vec::new()), &dense, &failed_to_read, bar);
     let mut wall_readings: Vec<(usize, f64, f64, f64)> = Vec::new();
     if !chamfer && super::closed::wall_verdict_on() {
-        let wall_contacts = super::chain_dense_contacts(segments, radius, per_segment, &samples, 2 * super::closed::LOCAL_RAIL_STENCIL)?;
+        let wall_contacts = super::chain_dense_contacts(segments, radius, budget, &samples, 2 * super::closed::LOCAL_RAIL_STENCIL)?;
         let (wall, unreadable) = super::closed::wall_interior_misses(
             &wall_contacts, &samples, &surface, global_low, global_range, radius,
             2 * super::closed::LOCAL_RAIL_STENCIL, super::closed::WALL_SECTION_PROBES, false,
@@ -204,10 +209,10 @@ fn open_chain_rung(
         }
         // The insertion is the next round's attempt, whatever it returns.
         deepest.set(deepest.get().max(round + 1));
-        return match insert_chain_stations(segments, radius, per_segment, &mut samples, &failing) {
+        return match insert_chain_stations(segments, radius, budget, &mut samples, &failing) {
             Ok(()) => {
-                assign_chain_parameters(&mut samples, segments.len(), per_segment, true);
-                open_chain_rung(solid, chain, radius, chamfer, name, per_segment, bar, samples, round + 1, deepest)
+                assign_chain_parameters(&mut samples, segments.len(), budget, true);
+                open_chain_rung(solid, chain, radius, chamfer, name, budget, bar, samples, round + 1, deepest)
             }
             // A station that cannot be placed coherently: this rung is as
             // coarse as it measured, and the ladder decides.
@@ -238,10 +243,10 @@ fn open_chain_rung(
                 let mut refined = samples.clone();
                 // The insertion is the next round's attempt, whatever it returns.
                 deepest.set(deepest.get().max(round + 1));
-                match insert_chain_stations(segments, radius, per_segment, &mut refined, &missing) {
+                match insert_chain_stations(segments, radius, budget, &mut refined, &missing) {
                     Ok(()) => {
-                        assign_chain_parameters(&mut refined, segments.len(), per_segment, true);
-                        match open_chain_rung(solid, chain, radius, chamfer, name, per_segment, bar, refined, round + 1, deepest) {
+                        assign_chain_parameters(&mut refined, segments.len(), budget, true);
+                        match open_chain_rung(solid, chain, radius, chamfer, name, budget, bar, refined, round + 1, deepest) {
                             Ok(OpenRung::Built(built)) => return Ok(OpenRung::Built(built)),
                             _ => Some((short, crate::BudgetReason::Rejected)),
                         }
@@ -328,6 +333,7 @@ fn open_chain_rung(
         center: None,
         exact_extrusion: false,
         vertex_stations: None,
+        revolution_axis: None,
     };
 
     // ---- the two free ends (shared open-edge end construction) -------

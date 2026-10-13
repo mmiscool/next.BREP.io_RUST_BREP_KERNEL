@@ -529,10 +529,23 @@ fn inline_svg(svg: &str, path: &Path) -> String {
     } else {
         inner.to_string()
     };
+    // A font-era file is a tall em box with the ink in its middle; the
+    // stylesheet sizes that box differently from a square 24-unit canvas.
+    let box_attr = if is_em_box(view_box) { " data-box=\"em\"" } else { "" };
     format!(
-        "<svg class=\"brep-icon\" xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"{view_box}\" \
+        "<svg class=\"brep-icon\"{box_attr} xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"{view_box}\" \
          aria-hidden=\"true\" focusable=\"false\">{inner}</svg>"
     )
+}
+
+/// Whether a viewBox is a font em box — taller than wide — rather than a
+/// square icon canvas. The glyph files converted from the old icon font keep
+/// their `… x 2384` box, which is `1233` wide for most and up to `2013` wide
+/// for the widest arrows; hand-drawn artwork is `24 x 24` or `1000 x 1000`.
+fn is_em_box(view_box: &str) -> bool {
+    let mut nums = view_box.split_whitespace().filter_map(|n| n.parse::<f32>().ok());
+    let (_, _, w, h) = (nums.next(), nums.next(), nums.next(), nums.next());
+    matches!((w, h), (Some(w), Some(h)) if h > w * 1.1)
 }
 
 /// The value of an XML attribute, matched literally as `name="value"` — enough
@@ -593,12 +606,16 @@ const CSS: &str = r#"
 * { box-sizing: border-box; }
 body { margin:0; font:15px/1.6 ui-monospace,"Cascadia Mono","Segoe UI Mono",monospace; color:var(--fg); background:var(--bg); }
 /* Icons are inline SVG, sized in `em` so one rule follows the text everywhere it
-   appears — 13.5px sidebar row, 15px prose, 2em page heading. The artwork sits
-   in the middle of a tall em box (these files were once font glyphs), so the box
-   is drawn larger than the text and dropped below the baseline to put the ink
-   itself on the line. Monochrome artwork is `currentColor` and takes the colour
-   of the text it sits in; colour artwork paints itself. */
-.brep-icon { height:2em; width:auto; vertical-align:-0.68em; }
+   appears — 13.5px sidebar row, 15px prose, 2em page heading. Artwork on a
+   square 24-unit canvas (every feature icon) fills its box, so it is drawn a
+   little taller than the text and dropped a touch to centre it on the x-height.
+   Artwork still on a font em box (`data-box="em"`, most monochrome glyphs) has
+   its ink in the middle of a tall canvas, so that box is drawn larger and
+   dropped further to put the ink itself on the line. Monochrome artwork is
+   `currentColor` and takes the colour of the text it sits in; colour artwork
+   paints itself. */
+.brep-icon { height:1.3em; width:auto; vertical-align:-0.3em; }
+.brep-icon[data-box="em"] { height:2em; vertical-align:-0.68em; }
 nav.side .brep-icon, .home-toc .brep-icon { margin-right:.15em; }
 a { color:var(--accent); text-decoration:none; } a:hover { text-decoration:underline; }
 .layout { display:flex; min-height:100vh; }

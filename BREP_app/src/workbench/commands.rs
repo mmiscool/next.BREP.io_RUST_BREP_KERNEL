@@ -313,10 +313,30 @@ pub fn feature_command_label(feature: &serde_json::Value) -> String {
 
 /// The same Home descriptors feed the Classic strip and Ribbon. Order is catalogue order.
 pub fn offered_home_commands(engine: &EngineState) -> Vec<OfferedCommand> {
-    if !engine.settings.show_workbench_toolbar || engine.sketch_mode() || engine.ref_select_active()
+    if !engine.settings.show_workbench_toolbar || engine.any_sketch_mode() || engine.ref_select_modal()
     {
         return vec![];
     }
+    // A FORM FIELD's reference pick keeps the strip drawn (the dock stays, so
+    // the layout must not jump) but nothing on it may run: a new feature's
+    // form would replace the one being picked into.
+    let picking = engine.ref_select_active();
+    let mut commands = offered_home_commands_unchecked(engine);
+    if picking {
+        for command in &mut commands {
+            command.disabled_reason = Some(PICKING_DISABLED.into());
+        }
+    }
+    commands
+}
+
+/// Why every creation command is disabled while a form field's reference
+/// pick runs.
+pub const PICKING_DISABLED: &str = "Finish picking the reference first (Done on its field, or Escape)";
+
+/// [`offered_home_commands`] before its mode gate: the catalogue's offer for
+/// the active workbench.
+fn offered_home_commands_unchecked(engine: &EngineState) -> Vec<OfferedCommand> {
     let active = &engine.settings.workbench;
     let dynamic = super::owned_workbenches(engine);
     let active_owned = dynamic.iter().find(|w| w.id == *active);
@@ -379,7 +399,16 @@ pub fn offered_home_commands(engine: &EngineState) -> Vec<OfferedCommand> {
             ));
         }
     }
-    commands
+    // The Reference group leads the home commands: the catalogue lists its
+    // features in two runs (Datium and Plane, then Sketch, Spline, Waypoint
+    // and Helix after the Primitives), and the group is shown as one block
+    // directly after Undo (`place_reference_after_undo`), so the creation
+    // order here is the order the toolbar draws.
+    let (reference, rest): (Vec<_>, Vec<_>) = commands.into_iter().partition(|c| {
+        let s = c.segments();
+        s[0] == "Home" && s[1] == "Reference"
+    });
+    reference.into_iter().chain(rest).collect()
 }
 fn creation(id: String, glyph: &str, path: String, target: CommandTarget) -> OfferedCommand {
     let label = path.rsplit('/').next().unwrap_or("");
@@ -440,6 +469,8 @@ pub fn offered_commands(state: &ButtonState, info_open: bool) -> Vec<OfferedComm
                 "undo" => {
                     !(if engine.sketch_mode() {
                         engine.sketch_can_undo()
+                    } else if engine.sketch3d_mode() {
+                        engine.sketch3d_can_undo()
                     } else {
                         engine.can_undo()
                     })
@@ -447,6 +478,8 @@ pub fn offered_commands(state: &ButtonState, info_open: bool) -> Vec<OfferedComm
                 "redo" => {
                     !(if engine.sketch_mode() {
                         engine.sketch_can_redo()
+                    } else if engine.sketch3d_mode() {
+                        engine.sketch3d_can_redo()
                     } else {
                         engine.can_redo()
                     })
@@ -457,8 +490,8 @@ pub fn offered_commands(state: &ButtonState, info_open: bool) -> Vec<OfferedComm
                 c.disabled_reason = Some("No history step available".into());
             }
             match p.id {
-                "undo" if engine.sketch_mode() => c.detail = "Undo sketch edit (Ctrl+Z)".into(),
-                "redo" if engine.sketch_mode() => c.detail = "Redo sketch edit (Ctrl+Y)".into(),
+                "undo" if engine.any_sketch_mode() => c.detail = "Undo sketch edit (Ctrl+Z)".into(),
+                "redo" if engine.any_sketch_mode() => c.detail = "Redo sketch edit (Ctrl+Y)".into(),
                 "fit" if engine.sheet_open().is_some() => {
                     c.detail = "Zoom to fit (the open sheet's paper)".into()
                 }
@@ -505,12 +538,37 @@ pub fn offered_commands(state: &ButtonState, info_open: bool) -> Vec<OfferedComm
         });
     }
     commands.extend(offered_home_commands(engine));
+    place_reference_after_undo(&mut commands);
     debug_assert!(
         validate_commands(&commands).is_ok(),
         "invalid command registry: {:?}",
         validate_commands(&commands)
     );
     commands
+}
+
+/// The Reference group sits directly after Undo in every workbench. A
+/// workbench's own buttons (the Sheet Metal and Assembly groups) are declared
+/// before the feature catalogue, which is where Reference comes from, so
+/// without this they would push Reference behind them. Commands keep their
+/// relative order; only the Reference ones move.
+fn place_reference_after_undo(commands: &mut Vec<OfferedCommand>) {
+    let in_group = |c: &OfferedCommand, group: &str| {
+        let s = c.segments();
+        s[0] == "Home" && s[1] == group
+    };
+    if !commands.iter().any(|c| in_group(c, "Undo")) {
+        return;
+    }
+    let (reference, mut rest): (Vec<_>, Vec<_>) = std::mem::take(commands)
+        .into_iter()
+        .partition(|c| in_group(c, "Reference"));
+    let insert = rest
+        .iter()
+        .rposition(|c| in_group(c, "Undo"))
+        .map_or(rest.len(), |i| i + 1);
+    rest.splice(insert..insert, reference);
+    *commands = rest;
 }
 
 /// Groups are derived in first-declaration order; commands retain source order within them.

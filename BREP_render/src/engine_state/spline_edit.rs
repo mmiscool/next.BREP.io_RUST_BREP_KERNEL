@@ -571,6 +571,9 @@ impl EngineState {
             names: seed,
             restore_index,
             target: RefSelectTarget::SplineAnchor { index: anchor },
+            picks: 0,
+            claimed: false,
+            finish_requested: false,
         });
         if before != restore_index {
             self.history.set_rollback(before);

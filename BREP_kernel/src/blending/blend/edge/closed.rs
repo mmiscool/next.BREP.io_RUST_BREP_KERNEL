@@ -112,6 +112,8 @@ fn blend_closed_edge_impl(
     chamfer: bool,
     name: Option<&str>,
 ) -> Result<BrepSolid, KernelRefusal> {
+    let _closed_timing = crate::blend::BlendTimer::start("timing.closed_rim_ms");
+    let prepare_timing = crate::blend::BlendTimer::start("timing.closed.prepare_ms");
     if let Some(separated) = separate_spherical_domain_cut(solid, edge_id)? {
         return blend_closed_edge_impl(&separated, edge_id, radius_at, constant, chamfer, name);
     }
@@ -229,7 +231,15 @@ fn blend_closed_edge_impl(
     };
     crate::blend::stations::CLOSED_MODEL_UNMET.with(|slot| slot.set(None));
     crate::blend::stations::CLOSED_REQUEST_RAILS.with(|slot| slot.set(None));
-    let marched = match march_stations_with_rail_bar(edge, &first_mate, &second_mate, radius_at, anchor_u, FoldPolicy::Refuse, MAX_REFINEMENT_DEPTH, rail_bar, wall_check) {
+    prepare_timing.stop();
+    let exact_revolution = crate::blend::exact_rim_lane_on()
+        && crate::blend::stations::closed_revolution_axis(&first_mate, &second_mate).is_some();
+    let depth_budget = if exact_revolution { 0 } else { MAX_REFINEMENT_DEPTH };
+    if exact_revolution {
+        crate::blend::record_count("count.closed.exact_lane", 1);
+    }
+    let march_timing = crate::blend::BlendTimer::start("timing.closed.march_ms");
+    let marched = match march_stations_with_rail_bar(edge, &first_mate, &second_mate, radius_at, anchor_u, FoldPolicy::Refuse, depth_budget, rail_bar, wall_check) {
         Ok(stations) => Ok(stations),
         Err(failure) => {
             // Post-refinement errors return directly, before either the
@@ -239,7 +249,7 @@ fn blend_closed_edge_impl(
                 if std::env::var("BREP_DEBUG_CLOSED_RAILS").is_ok() {
                     eprintln!("closed initial anchor fallback: edge {}: {anchored_error}", edge.id);
                 }
-                match march_stations_with_rail_bar(edge, &first_mate, &second_mate, radius_at, None, FoldPolicy::Refuse, MAX_REFINEMENT_DEPTH, rail_bar, wall_check) {
+                match march_stations_with_rail_bar(edge, &first_mate, &second_mate, radius_at, None, FoldPolicy::Refuse, depth_budget, rail_bar, wall_check) {
                     Ok(stations) => Ok(stations),
                     Err(failure) => {
                         let retry_error = failure.into_initial()?;
@@ -402,7 +412,39 @@ fn blend_closed_edge_impl(
                 .unwrap_or(true)
         })
     };
-    if support_exits(second_face, true) {
+    // The edge-preserving construction below cannot answer it (it consumes
+    // the mate up to one preserved far boundary; a rolled track has none) and
+    // on the reported bore mouth it said "ambiguous preserved boundary edge"
+    // about a face it was never meant to consume. The crossings are located
+    // and the lane declines BY NAME; the ladder falls through to the cutter
+    // as before. An exit across a sharp boundary, or onto a tangent neighbour
+    // the ball cannot roll onto, keeps the route below unchanged.
+    let exits = [support_exits(first_face, false), support_exits(second_face, true)];
+    if exits[0] || exits[1] {
+        let scale = crate::blend::stations::march_model_scale(&edge.curve, edge.t0, edge.t1, radius_at(mid_t))?;
+        match crate::blend::rollover::plan_closed(solid, edge, &stations, [&first_mate, &second_mate], radius_at, scale) {
+            Ok(Some(plan)) => {
+                // The BUILD (behind its switch): every piece marched on its
+                // own carriers and fitted, then sewn on the crossing ribs.
+                if crate::blend::rollover_on() {
+                    let pieces = crate::blend::rollover::march_pieces(
+                        solid, edge, &plan, &stations, [&first_mate, &second_mate], radius_at, scale, rail_bar, chamfer, anchor_u,
+                    )?;
+                    let built = crate::blend::rollover::build(solid, edge, [&first_mate, &second_mate], &plan, pieces, anchor_u, name)?;
+                    march_timing.stop();
+                    return Ok(built);
+                }
+                return Err(crate::blend::rollover::refusal(&plan, radius_at(mid_t).abs()));
+            }
+            Ok(None) => {}
+            Err(error) => {
+                if std::env::var("BREP_DEBUG_NETWORK").is_ok() {
+                    eprintln!("closed-rim rollover scan did not read the exit: {error}");
+                }
+            }
+        }
+    }
+    if exits[1] {
         return blend_closed_edge_keep(
             solid,
             edge,
@@ -414,7 +456,7 @@ fn blend_closed_edge_impl(
             name,
         );
     }
-    if support_exits(first_face, false) {
+    if exits[0] {
         return blend_closed_edge_keep(
             solid,
             edge,
@@ -443,8 +485,15 @@ fn blend_closed_edge_impl(
             );
         }
     }
+    march_timing.stop();
+    crate::blend::record_count("count.closed.stations", stations.len() as u64);
+    let rows_timing = crate::blend::BlendTimer::start("timing.closed.rows_ms");
     let parameters = station_parameters(&stations);
     let exact_rows = exact_closed_revolution_rows(&stations, &first_mate, &second_mate, chamfer);
+    crate::blend::record_count(
+        if exact_rows.is_some() { "count.rows.exact_revolution" } else { "count.rows.fitted_closed" },
+        1,
+    );
     let rows = match exact_rows {
         Some(rows) => rows?,
         None => {
@@ -463,11 +512,15 @@ fn blend_closed_edge_impl(
             rows
         }
     };
+    rows_timing.stop();
+    let carve_timing = crate::blend::BlendTimer::start("timing.closed.carve_ms");
     let crease = if carve_fold {
         Some(carve_closed_wall(solid, &rows, &stations, &parameters, &first_mate, &second_mate, radius_at(mid_t).abs())?)
     } else {
         None
     };
+    carve_timing.stop();
+    let surgery_timing = crate::blend::BlendTimer::start("timing.closed.surgery_ms");
 
     // Both mates seam-structured: the second support crosses ITS carrier's
     // seam meridian somewhere mid-loop; split cs there so face2's loop can
@@ -561,6 +614,7 @@ fn blend_closed_edge_impl(
         name,
         crease,
     )?;
+    surgery_timing.stop();
     if let (Some((declared, reason, round, stations, ceiling)), Some(surface)) = (model_unmet, wall_surface) {
         crate::blend::record_wall_model_report(crate::blend::WallModelReport {
             name: name.map(str::to_string),
@@ -1139,18 +1193,37 @@ fn carve_closed_wall(
 /// a fit is refitted, at the SAME floor, with its track refined where the
 /// shipped read found the miss, up to `SHIPPED_READ_REPAIRS` times; the floor
 /// never moves, and a fit read within it the first time ships as before.
-pub(super) fn refit_closed_support_pcurve(rail: &NurbsCurve, old: &NurbsCurve, surface: &NurbsSurface) -> Result<NurbsCurve, KernelRefusal> {
+pub(in crate::blend) fn refit_closed_support_pcurve(rail: &NurbsCurve, old: &NurbsCurve, surface: &NurbsSurface) -> Result<NurbsCurve, KernelRefusal> {
+    refit_closed_support_pcurve_read(rail, old, surface, &mut crate::blend::track_fit::FootMemo::default()).map(|(fitted, _)| fitted)
+}
+
+/// [`refit_closed_support_pcurve`] handing back the shipped curve's own read
+/// `(miss, rail standoff, samples, worst parameter)` -- the
+/// `read_shipped_pcurve` of the curve returned, which a caller that reads
+/// the shipped trim again would otherwise compute a second time on the same
+/// inputs -- with the feet of that read left in `memo` (cleared before each
+/// fit, so it holds the returned curve's feet only) for the caller's
+/// further reads of the same curve against the same rail.
+pub(in crate::blend) fn refit_closed_support_pcurve_read(
+    rail: &NurbsCurve,
+    old: &NurbsCurve,
+    surface: &NurbsSurface,
+    memo: &mut crate::blend::track_fit::FootMemo,
+) -> Result<(NurbsCurve, (f64, f64, usize, f64)), KernelRefusal> {
     const SHIPPED_READ_REPAIRS: usize = 3;
     let floor = crate::pcurve::PCURVE_REFINEMENT_TOLERANCE;
     let [d0, d1] = rail.domain().or_refuse(KernelStage::Refine, "domain")?;
     let mut near: Vec<f64> = Vec::new();
-    let (mut fitted, mut read) = fit_and_read_support(rail, old, surface, &near)?;
+    let (mut fitted, mut read) = fit_and_read_support(rail, old, surface, &near, memo)?;
     for _ in 0..SHIPPED_READ_REPAIRS {
         if read.0 <= floor || !(d1 > d0) {
             break;
         }
         near.push((read.3 - d0) / (d1 - d0));
-        match fit_and_read_support(rail, old, surface, &near) {
+        crate::blend::record_count("count.surgery.refit_repairs", 1);
+        // A repair that fails keeps the last fit AND its feet: a failed
+        // fit or an unreadable read hands nothing to the memo.
+        match fit_and_read_support(rail, old, surface, &near, memo) {
             Ok(repaired) => (fitted, read) = repaired,
             Err(_) => break,
         }
@@ -1163,7 +1236,7 @@ pub(super) fn refit_closed_support_pcurve(rail: &NurbsCurve, old: &NurbsCurve, s
             crate::blend::PCURVE_OFF_FLOOR,
         )));
     }
-    Ok(fitted)
+    Ok((fitted, read))
 }
 
 /// [`refit_closed_support_pcurve`]'s fit, its track refined near the
@@ -1174,6 +1247,7 @@ fn fit_and_read_support(
     old: &NurbsCurve,
     surface: &NurbsSurface,
     near: &[f64],
+    memo: &mut crate::blend::track_fit::FootMemo,
 ) -> Result<(NurbsCurve, (f64, f64, usize, f64)), KernelRefusal> {
     let [d0, d1] = rail.domain().or_refuse(KernelStage::Refine, "domain")?;
     // Every foot of the track is sought from the march's own trim `old` at
@@ -1227,8 +1301,15 @@ fn fit_and_read_support(
     // and seam ends were edited), so it is read again, at the rail's own
     // parameter, against the fitter's floor; a miss refuses as the fitter's
     // own would, and an unreadable sample refuses.
+    // The feet are the shipped curve's, read into a memo of their own and
+    // handed over only with a readable curve: a read that refuses (an
+    // unreadable sample, found after every sample was sought) must leave
+    // the caller's memo holding the feet of the curve the caller keeps,
+    // not this curve's.
+    let mut own = crate::blend::track_fit::FootMemo::default();
     let (miss, standoff, samples, worst) =
-        crate::blend::track_fit::read_shipped_pcurve(surface, &|t| rail.evaluate(t), &fitted, d0, d1)?;
+        crate::blend::track_fit::read_shipped_pcurve_memo(surface, &|t| rail.evaluate(t), &fitted, d0, d1, &mut own)?;
+    *memo = own;
     if debug {
         eprintln!("TRACK_FIT closed-edge support: shipped pcurve miss {miss:.3e} at t {worst:.9} of [{d0:.9}, {d1:.9}] ({samples} samples); rail standoff from its carrier {standoff:.3e}");
     }
@@ -1350,204 +1431,8 @@ fn build_surgery(
         name: None,
     });
 
-    let old_vertex = edge.start_vertex_id;
-    let replace_in_face = |result: &mut BrepSolid,
-                           mate: &BlendMate,
-                           pieces: &[(u64, [f64; 2], NurbsCurve)],
-                           uv_new: [f64; 2]|
-     -> Result<bool, KernelRefusal> {
-        let v_new = uv_new[1];
-        // (edge id, the START vertex is the removed one, the END vertex is).
-        let seam_edge_ends: Vec<(u64, bool, bool)> = result
-            .edges
-            .iter()
-            .filter(|candidate| {
-                candidate.id != edge.id
-                    && (candidate.start_vertex_id == old_vertex
-                        || candidate.end_vertex_id == old_vertex)
-            })
-            .map(|candidate| {
-                (
-                    candidate.id,
-                    candidate.start_vertex_id == old_vertex,
-                    candidate.end_vertex_id == old_vertex,
-                )
-            })
-            .collect();
-        let seam_edge_ids: Vec<u64> = seam_edge_ends.iter().map(|(id, ..)| *id).collect();
-        let pcurve_band = crate::KernelTolerances::for_solid(result, 1e-7).pcurve_consistency;
-        let debug = std::env::var("BREP_DEBUG_NETWORK").is_ok();
-        let face = result
-            .shells
-            .iter_mut()
-            .flat_map(|shell| &mut shell.faces)
-            .find(|face| face.id == mate.face.id)
-            .ok_or(KernelRefusal::internal(KernelStage::Sew, "mate_face", "blend: mate face lost during surgery"))?;
-        let face_id = face.id;
-        let FaceRecord { surface, loops, .. } = &mut *face;
-        let loop_record = &mut loops[mate.loop_index];
-        let position = loop_record
-            .coedges
-            .iter()
-            .position(|coedge| coedge.edge_id == edge.id)
-            .ok_or(KernelRefusal::internal(KernelStage::Sew, "edge_coedge", "blend: edge coedge lost during surgery"))?;
-        let old_forward = loop_record.coedges[position].forward;
-        let old_seam_v = {
-            let pcurve = &loop_record.coedges[position].pcurve;
-            let [d0, _] = pcurve.domain().or_refuse(KernelStage::Refine, "domain")?;
-            pcurve.evaluate(d0).or_refuse(KernelStage::Refine, "evaluate")?.y
-        };
-        // Replacement coedges: pieces run in u order; a reversed loop use
-        // takes them in reverse order, each reversed.
-        let mut replacements = Vec::new();
-        let ordered: Vec<&(u64, [f64; 2], NurbsCurve)> = if old_forward {
-            pieces.iter().collect()
-        } else {
-            pieces.iter().rev().collect()
-        };
-        for (index, (edge_id, _, pcurve)) in ordered.iter().enumerate() {
-            replacements.push(CoedgeRecord {
-                id: if index == 0 {
-                    loop_record.coedges[position].id
-                } else {
-                    0 // patched by the caller with fresh ids
-                },
-                edge_id: *edge_id,
-                forward: old_forward,
-                pcurve: if old_forward {
-                    pcurve.clone()
-                } else {
-                    pcurve.reversed().or_refuse(KernelStage::Refine, "reversed")?
-                },
-            });
-        }
-        loop_record
-            .coedges
-            .splice(position..=position, replacements);
-        let mut repaired = false;
-        if loop_record.coedges.len() > 1 {
-            // Anchored carrier: the loop's other coedges ride the seam
-            // meridian between the old edge and the rest of the trim.
-            // Pull the pcurve endpoint that met the old edge down to the
-            // support crossing.  (The seam EDGE itself is trimmed after
-            // both replacements, outside this borrow.)
-            for coedge in &mut loop_record.coedges {
-                if pieces
-                    .iter()
-                    .any(|(edge_id, ..)| *edge_id == coedge.edge_id)
-                    || !seam_edge_ids.contains(&coedge.edge_id)
-                {
-                    continue;
-                }
-                let controls = &coedge.pcurve.control_points;
-                let last_index = controls.len() - 1;
-                let first_u = controls[0].x / controls[0].w;
-                let last_u = controls[last_index].x / controls[last_index].w;
-                let constant_u = (first_u - last_u).abs()
-                    <= 1e-9 * (1.0 + first_u.abs().max(last_u.abs()));
-                // Which end of the pcurve met the removed vertex, and the uv
-                // the crossing sits at on this carrier.
-                let (target, target_uv, fraction) = if constant_u {
-                    // Seam MERIDIAN pcurve: constant u, runs along the v
-                    // direction; the endpoint at the removed edge's v moves
-                    // onto the support crossing.
-                    let first_v = controls[0].y / controls[0].w;
-                    let last_v = controls[last_index].y / controls[last_index].w;
-                    let target = if (first_v - old_seam_v).abs() < (last_v - old_seam_v).abs() {
-                        0
-                    } else {
-                        last_index
-                    };
-                    let span = last_v - first_v;
-                    let fraction = if span.abs() > 0.0 { (v_new - first_v) / span } else { 0.0 };
-                    (target, [first_u, v_new], fraction)
-                } else {
-                    // The adjacent trim runs along U at constant v — the
-                    // carrier's OTHER (v) seam, which is what a closed edge
-                    // lying on one whole MERIDIAN borders (an axial-plane
-                    // collar on a torus).  Its endpoint moves in U, not V,
-                    // and the v-distance rule above cannot pick the end at
-                    // all: both ends share the same v, so it always lands on
-                    // `last_index`, which is wrong for one of the seam PAIR
-                    // (the v-seam edge appears twice in the loop, at v = 0
-                    // and v = 1).  Take the end from the TOPOLOGY.
-                    let Some((_, start_is_old, end_is_old)) = seam_edge_ends
-                        .iter()
-                        .find(|(id, ..)| *id == coedge.edge_id)
-                        .copied()
-                    else {
-                        continue;
-                    };
-                    if start_is_old == end_is_old {
-                        return Err(KernelRefusal::ill_posed(KernelStage::Sew, "neighbour_trim_end", format!(
-                            "blend: neighbour edge {} meets the blended edge at both ends; \
-                             its trim end is ambiguous",
-                            coedge.edge_id
-                        )));
-                    }
-                    // `forward` maps the coedge's pcurve domain start onto the
-                    // edge's t0 (its start vertex).
-                    let target = if start_is_old == coedge.forward { 0 } else { last_index };
-                    let v_end = controls[target].y / controls[target].w;
-                    let span = last_u - first_u;
-                    let fraction = if span.abs() > 0.0 { (uv_new[0] - first_u) / span } else { 0.0 };
-                    (target, [uv_new[0], v_end], fraction)
-                };
-                // The trim is a SPLIT of the pcurve at the crossing's own
-                // parameter, never a moved control point.  Moving the end
-                // control point of a pcurve with interior knots re-slopes its
-                // end span alone and breaks the pcurve ↔ edge parameter
-                // correspondence validate reads (measured 2026-10-03 on the
-                // torus-box-edge and axial-collar documents: the torus's
-                // v-seam pcurve, a 3-span polyline, read 0.548 mm off its
-                // edge at the same parameter while its image was on the edge
-                // to 1e-10).  The seam-edge pass below projects the same
-                // physical point onto the edge curve for the edge's own
-                // parameter, so both sides keep the correspondence they had.
-                let [q0, q1] = coedge.pcurve.domain().or_refuse(KernelStage::Refine, "domain")?;
-                let target_point = surface
-                    .evaluate_extended(target_uv[0], target_uv[1])
-                    .or_refuse(KernelStage::Refine, "evaluate_extended")?;
-                // Seeded at the AFFINE fraction of the pcurve's extent in the
-                // moving direction (the seed `trim_edge_at` uses), not at the
-                // pcurve's end: a crossing deep in a long seam would hand the
-                // point solver a far seed and turn a blend that built into a
-                // refusal.  The solver refines the seed to the physical point.
-                let seed = (q0 + (q1 - q0) * fraction).clamp(q0.min(q1), q0.max(q1));
-                let q_split = trim_parameter_at_point(
-                    surface, &coedge.pcurve, seed, target_point, pcurve_band,
-                )?;
-                let interior = q_split > q0 + 1e-9 * (q1 - q0) && q_split < q1 - 1e-9 * (q1 - q0);
-                if debug {
-                    eprintln!(
-                        "closed-edge seam trim: face {face_id} edge {} coedge {} ({}): {} at q {q_split:.9} of [{q0:.6}, {q1:.6}], {} control points",
-                        coedge.edge_id, coedge.id, if constant_u { "meridian, constant u" } else { "along u" },
-                        if interior { "SPLIT" } else { "EXTEND" }, controls.len()
-                    );
-                }
-                if interior {
-                    let (low, high) = coedge.pcurve.split(q_split).or_refuse(KernelStage::Refine, "split")?;
-                    coedge.pcurve = if target == 0 { high } else { low };
-                } else {
-                    // The crossing lies at or past the pcurve's end: the seam
-                    // EXTENDS to meet it.  Exact for a two-point linear
-                    // pcurve, whose one span IS the whole parameterisation;
-                    // anything else would need a refit and is refused by name.
-                    if coedge.pcurve.degree != 1 || controls.len() != 2 {
-                        return Err(KernelRefusal::unsupported(KernelStage::Sew, "neighbour_seam_extend_curved", format!(
-                            "blend: neighbour seam edge {} would have to extend past its own end to meet the blend's support crossing, and its pcurve is not a single straight span (degree {}, {} control points)",
-                            coedge.edge_id, coedge.pcurve.degree, controls.len()
-                        )));
-                    }
-                    let w = coedge.pcurve.control_points[target].w;
-                    coedge.pcurve.control_points[target] = crate::Vec4::from_point(
-                        Vec3::new(target_uv[0], target_uv[1], 0.0), w,
-                    );
-                }
-                repaired = true;
-            }
-        }
-        Ok(repaired)
+    let replace_in_face = |result: &mut BrepSolid, mate: &BlendMate, pieces: &[(u64, [f64; 2], NurbsCurve)], uv_new: [f64; 2]| -> Result<bool, KernelRefusal> {
+        replace_rim_in_face(result, edge, mate, pieces, uv_new)
     };
     let uv1_new = rows.cr_pcurve.evaluate(u_start).or_refuse(KernelStage::Refine, "evaluate")?;
     let v1_new = uv1_new.y;
@@ -1674,63 +1559,14 @@ fn build_surgery(
         .iter()
         .flat_map(|loop_record| loop_record.coedges.iter().map(|coedge| coedge.edge_id))
         .collect();
-    for seam_edge in result.edges.iter_mut() {
-        if new_edge_ids.contains(&seam_edge.id) {
-            continue;
-        }
-        if seam_edge.start_vertex_id != old_vertex && seam_edge.end_vertex_id != old_vertex {
-            continue;
-        }
-        let (target_vertex, target_v, target_point) = if first_face_edges.contains(&seam_edge.id) {
-            (vertex1_id, v1_new, cr_start)
-        } else {
-            (second_seam_vertex, v2_new, second_seam_point)
-        };
-        let [c0, c1] = seam_edge.curve.domain().or_refuse(KernelStage::Refine, "domain")?;
-        let clamped = target_v.clamp(c0.min(c1), c0.max(c1));
-        // Using the support crossing's V as the neighbour's CURVE parameter is
-        // only valid when that neighbour is the carrier's seam MERIDIAN, whose
-        // 3D curve is parameterized by v.  Verify it against the vertex the
-        // endpoint is moving to; a neighbour running along U instead (the
-        // carrier's v-seam, bordered by a collar edge that lies on one whole
-        // meridian) lands nowhere near it — the 2026-09-01 report trimmed the
-        // torus' equator seam to u = 0, 10.885 away from its own vertex, and
-        // the solid failed validation with "curve start does not match vertex".
-        let band = 1e-6 * (1.0 + target_point.length());
-        let split_parameter = if seam_edge.id == edge.id {
-            // The BLENDED edge itself still carries the removed vertex at this
-            // point.  Its coedges have already been replaced in both mates, so
-            // the used-edge sweep below discards it; leave its (meaningless)
-            // trim exactly as it was rather than asking a doomed edge to pass
-            // through the support start.
-            clamped
-        } else {
-            match seam_edge.curve.evaluate(clamped) {
-                Ok(point) if point.sub(target_point).length() <= band => clamped,
-                _ => {
-                    repaired = true;
-                    let projection =
-                        crate::project_point_to_curve(&seam_edge.curve, target_point).or_refuse(KernelStage::Refine, "project_point_to_curve")?;
-                    if projection.distance > band {
-                        return Err(KernelRefusal::unsupported(KernelStage::Sew, "neighbour_off_support", format!(
-                            "blend: neighbour edge {} does not pass through the blend's support \
-                             start (off by {:.9}); the trim has no parameter to move to",
-                            seam_edge.id, projection.distance
-                        )));
-                    }
-                    projection.u.clamp(c0.min(c1), c0.max(c1))
-                }
-            }
-        };
-        if seam_edge.start_vertex_id == old_vertex {
-            seam_edge.t0 = split_parameter;
-            seam_edge.start_vertex_id = target_vertex;
-        }
-        if seam_edge.end_vertex_id == old_vertex {
-            seam_edge.t1 = split_parameter;
-            seam_edge.end_vertex_id = target_vertex;
-        }
-    }
+    repaired |= trim_seam_edges(
+        &mut result,
+        edge,
+        &new_edge_ids,
+        &first_face_edges,
+        (vertex1_id, v1_new, cr_start),
+        (second_seam_vertex, v2_new, second_seam_point),
+    )?;
 
     // Blend face: outward orientation matches F1's outward at the v=0 rim.
     let mid_u = (u_start + u_end) * 0.5;
@@ -1888,4 +1724,288 @@ fn build_surgery(
         }
     }
     Ok(result)
+}
+
+/// Replace the blended edge's coedge in one mate's loop with the support
+/// pieces (edge id, fit-space window, forward pcurve) in u order, and pull
+/// the loop's seam-meridian pcurves that met the removed vertex down to the
+/// support crossing at `uv_new` on this carrier. `true` when a neighbour trim
+/// was repaired. The closed lane's own surgery and the rollover's share it.
+pub(in crate::blend) fn replace_rim_in_face(
+    result: &mut BrepSolid,
+    edge: &EdgeRecord,
+    mate: &BlendMate,
+    pieces: &[(u64, [f64; 2], NurbsCurve)],
+    uv_new: [f64; 2],
+) -> Result<bool, KernelRefusal> {
+    let old_vertex = edge.start_vertex_id;
+    let v_new = uv_new[1];
+    // (edge id, the START vertex is the removed one, the END vertex is).
+    let seam_edge_ends: Vec<(u64, bool, bool)> = result
+        .edges
+        .iter()
+        .filter(|candidate| {
+            candidate.id != edge.id
+                && (candidate.start_vertex_id == old_vertex
+                    || candidate.end_vertex_id == old_vertex)
+        })
+        .map(|candidate| {
+            (
+                candidate.id,
+                candidate.start_vertex_id == old_vertex,
+                candidate.end_vertex_id == old_vertex,
+            )
+        })
+        .collect();
+    let seam_edge_ids: Vec<u64> = seam_edge_ends.iter().map(|(id, ..)| *id).collect();
+    let pcurve_band = crate::KernelTolerances::for_solid(result, 1e-7).pcurve_consistency;
+    let debug = std::env::var("BREP_DEBUG_NETWORK").is_ok();
+    let face = result
+        .shells
+        .iter_mut()
+        .flat_map(|shell| &mut shell.faces)
+        .find(|face| face.id == mate.face.id)
+        .ok_or(KernelRefusal::internal(KernelStage::Sew, "mate_face", "blend: mate face lost during surgery"))?;
+    let face_id = face.id;
+    let FaceRecord { surface, loops, .. } = &mut *face;
+    let loop_record = &mut loops[mate.loop_index];
+    let position = loop_record
+        .coedges
+        .iter()
+        .position(|coedge| coedge.edge_id == edge.id)
+        .ok_or(KernelRefusal::internal(KernelStage::Sew, "edge_coedge", "blend: edge coedge lost during surgery"))?;
+    let old_forward = loop_record.coedges[position].forward;
+    let old_seam_v = {
+        let pcurve = &loop_record.coedges[position].pcurve;
+        let [d0, _] = pcurve.domain().or_refuse(KernelStage::Refine, "domain")?;
+        pcurve.evaluate(d0).or_refuse(KernelStage::Refine, "evaluate")?.y
+    };
+    // Replacement coedges: pieces run in u order; a reversed loop use
+    // takes them in reverse order, each reversed.
+    let mut replacements = Vec::new();
+    let ordered: Vec<&(u64, [f64; 2], NurbsCurve)> = if old_forward {
+        pieces.iter().collect()
+    } else {
+        pieces.iter().rev().collect()
+    };
+    for (index, (edge_id, _, pcurve)) in ordered.iter().enumerate() {
+        replacements.push(CoedgeRecord {
+            id: if index == 0 {
+                loop_record.coedges[position].id
+            } else {
+                0 // patched by the caller with fresh ids
+            },
+            edge_id: *edge_id,
+            forward: old_forward,
+            pcurve: if old_forward {
+                pcurve.clone()
+            } else {
+                pcurve.reversed().or_refuse(KernelStage::Refine, "reversed")?
+            },
+        });
+    }
+    loop_record
+        .coedges
+        .splice(position..=position, replacements);
+    let mut repaired = false;
+    if loop_record.coedges.len() > 1 {
+        // Anchored carrier: the loop's other coedges ride the seam
+        // meridian between the old edge and the rest of the trim.
+        // Pull the pcurve endpoint that met the old edge down to the
+        // support crossing.  (The seam EDGE itself is trimmed after
+        // both replacements, outside this borrow.)
+        for coedge in &mut loop_record.coedges {
+            if pieces
+                .iter()
+                .any(|(edge_id, ..)| *edge_id == coedge.edge_id)
+                || !seam_edge_ids.contains(&coedge.edge_id)
+            {
+                continue;
+            }
+            let controls = &coedge.pcurve.control_points;
+            let last_index = controls.len() - 1;
+            let first_u = controls[0].x / controls[0].w;
+            let last_u = controls[last_index].x / controls[last_index].w;
+            let constant_u = (first_u - last_u).abs()
+                <= 1e-9 * (1.0 + first_u.abs().max(last_u.abs()));
+            // Which end of the pcurve met the removed vertex, and the uv
+            // the crossing sits at on this carrier.
+            let (target, target_uv, fraction) = if constant_u {
+                // Seam MERIDIAN pcurve: constant u, runs along the v
+                // direction; the endpoint at the removed edge's v moves
+                // onto the support crossing.
+                let first_v = controls[0].y / controls[0].w;
+                let last_v = controls[last_index].y / controls[last_index].w;
+                let target = if (first_v - old_seam_v).abs() < (last_v - old_seam_v).abs() {
+                    0
+                } else {
+                    last_index
+                };
+                let span = last_v - first_v;
+                let fraction = if span.abs() > 0.0 { (v_new - first_v) / span } else { 0.0 };
+                (target, [first_u, v_new], fraction)
+            } else {
+                // The adjacent trim runs along U at constant v — the
+                // carrier's OTHER (v) seam, which is what a closed edge
+                // lying on one whole MERIDIAN borders (an axial-plane
+                // collar on a torus).  Its endpoint moves in U, not V,
+                // and the v-distance rule above cannot pick the end at
+                // all: both ends share the same v, so it always lands on
+                // `last_index`, which is wrong for one of the seam PAIR
+                // (the v-seam edge appears twice in the loop, at v = 0
+                // and v = 1).  Take the end from the TOPOLOGY.
+                let Some((_, start_is_old, end_is_old)) = seam_edge_ends
+                    .iter()
+                    .find(|(id, ..)| *id == coedge.edge_id)
+                    .copied()
+                else {
+                    continue;
+                };
+                if start_is_old == end_is_old {
+                    return Err(KernelRefusal::ill_posed(KernelStage::Sew, "neighbour_trim_end", format!(
+                        "blend: neighbour edge {} meets the blended edge at both ends; \
+                         its trim end is ambiguous",
+                        coedge.edge_id
+                    )));
+                }
+                // `forward` maps the coedge's pcurve domain start onto the
+                // edge's t0 (its start vertex).
+                let target = if start_is_old == coedge.forward { 0 } else { last_index };
+                let v_end = controls[target].y / controls[target].w;
+                let span = last_u - first_u;
+                let fraction = if span.abs() > 0.0 { (uv_new[0] - first_u) / span } else { 0.0 };
+                (target, [uv_new[0], v_end], fraction)
+            };
+            // The trim is a SPLIT of the pcurve at the crossing's own
+            // parameter, never a moved control point.  Moving the end
+            // control point of a pcurve with interior knots re-slopes its
+            // end span alone and breaks the pcurve ↔ edge parameter
+            // correspondence validate reads (measured 2026-10-03 on the
+            // torus-box-edge and axial-collar documents: the torus's
+            // v-seam pcurve, a 3-span polyline, read 0.548 mm off its
+            // edge at the same parameter while its image was on the edge
+            // to 1e-10).  The seam-edge pass below projects the same
+            // physical point onto the edge curve for the edge's own
+            // parameter, so both sides keep the correspondence they had.
+            let [q0, q1] = coedge.pcurve.domain().or_refuse(KernelStage::Refine, "domain")?;
+            let target_point = surface
+                .evaluate_extended(target_uv[0], target_uv[1])
+                .or_refuse(KernelStage::Refine, "evaluate_extended")?;
+            // Seeded at the AFFINE fraction of the pcurve's extent in the
+            // moving direction (the seed `trim_edge_at` uses), not at the
+            // pcurve's end: a crossing deep in a long seam would hand the
+            // point solver a far seed and turn a blend that built into a
+            // refusal.  The solver refines the seed to the physical point.
+            let seed = (q0 + (q1 - q0) * fraction).clamp(q0.min(q1), q0.max(q1));
+            let q_split = trim_parameter_at_point(
+                surface, &coedge.pcurve, seed, target_point, pcurve_band,
+            )?;
+            let interior = q_split > q0 + 1e-9 * (q1 - q0) && q_split < q1 - 1e-9 * (q1 - q0);
+            if debug {
+                eprintln!(
+                    "closed-edge seam trim: face {face_id} edge {} coedge {} ({}): {} at q {q_split:.9} of [{q0:.6}, {q1:.6}], {} control points",
+                    coedge.edge_id, coedge.id, if constant_u { "meridian, constant u" } else { "along u" },
+                    if interior { "SPLIT" } else { "EXTEND" }, controls.len()
+                );
+            }
+            if interior {
+                let (low, high) = coedge.pcurve.split(q_split).or_refuse(KernelStage::Refine, "split")?;
+                coedge.pcurve = if target == 0 { high } else { low };
+            } else {
+                // The crossing lies at or past the pcurve's end: the seam
+                // EXTENDS to meet it.  Exact for a two-point linear
+                // pcurve, whose one span IS the whole parameterisation;
+                // anything else would need a refit and is refused by name.
+                if coedge.pcurve.degree != 1 || controls.len() != 2 {
+                    return Err(KernelRefusal::unsupported(KernelStage::Sew, "neighbour_seam_extend_curved", format!(
+                        "blend: neighbour seam edge {} would have to extend past its own end to meet the blend's support crossing, and its pcurve is not a single straight span (degree {}, {} control points)",
+                        coedge.edge_id, coedge.pcurve.degree, controls.len()
+                    )));
+                }
+                let w = coedge.pcurve.control_points[target].w;
+                coedge.pcurve.control_points[target] = crate::Vec4::from_point(
+                    Vec3::new(target_uv[0], target_uv[1], 0.0), w,
+                );
+            }
+            repaired = true;
+        }
+    }
+    Ok(repaired)
+}
+
+/// Trim the seam EDGES that ended on the removed vertex: each endpoint moves
+/// onto the support crossing on ITS carrier — an edge of the first mate's
+/// face to `first_target`, any other to `second_target`, each a (vertex,
+/// seam-meridian parameter, point). `new_edge_ids` are the surgery's own
+/// edges, skipped. `true` when a trim had to be re-projected (repaired).
+pub(in crate::blend) fn trim_seam_edges(
+    result: &mut BrepSolid,
+    edge: &EdgeRecord,
+    new_edge_ids: &[u64],
+    first_face_edges: &[u64],
+    first_target: (u64, f64, Vec3),
+    second_target: (u64, f64, Vec3),
+) -> Result<bool, KernelRefusal> {
+    let old_vertex = edge.start_vertex_id;
+    let mut repaired = false;
+    let (vertex1_id, v1_new, cr_start) = first_target;
+    let (second_seam_vertex, v2_new, second_seam_point) = second_target;
+    for seam_edge in result.edges.iter_mut() {
+        if new_edge_ids.contains(&seam_edge.id) {
+            continue;
+        }
+        if seam_edge.start_vertex_id != old_vertex && seam_edge.end_vertex_id != old_vertex {
+            continue;
+        }
+        let (target_vertex, target_v, target_point) = if first_face_edges.contains(&seam_edge.id) {
+            (vertex1_id, v1_new, cr_start)
+        } else {
+            (second_seam_vertex, v2_new, second_seam_point)
+        };
+        let [c0, c1] = seam_edge.curve.domain().or_refuse(KernelStage::Refine, "domain")?;
+        let clamped = target_v.clamp(c0.min(c1), c0.max(c1));
+        // Using the support crossing's V as the neighbour's CURVE parameter is
+        // only valid when that neighbour is the carrier's seam MERIDIAN, whose
+        // 3D curve is parameterized by v.  Verify it against the vertex the
+        // endpoint is moving to; a neighbour running along U instead (the
+        // carrier's v-seam, bordered by a collar edge that lies on one whole
+        // meridian) lands nowhere near it — the 2026-09-01 report trimmed the
+        // torus' equator seam to u = 0, 10.885 away from its own vertex, and
+        // the solid failed validation with "curve start does not match vertex".
+        let band = 1e-6 * (1.0 + target_point.length());
+        let split_parameter = if seam_edge.id == edge.id {
+            // The BLENDED edge itself still carries the removed vertex at this
+            // point.  Its coedges have already been replaced in both mates, so
+            // the used-edge sweep below discards it; leave its (meaningless)
+            // trim exactly as it was rather than asking a doomed edge to pass
+            // through the support start.
+            clamped
+        } else {
+            match seam_edge.curve.evaluate(clamped) {
+                Ok(point) if point.sub(target_point).length() <= band => clamped,
+                _ => {
+                    repaired = true;
+                    let projection =
+                        crate::project_point_to_curve(&seam_edge.curve, target_point).or_refuse(KernelStage::Refine, "project_point_to_curve")?;
+                    if projection.distance > band {
+                        return Err(KernelRefusal::unsupported(KernelStage::Sew, "neighbour_off_support", format!(
+                            "blend: neighbour edge {} does not pass through the blend's support \
+                             start (off by {:.9}); the trim has no parameter to move to",
+                            seam_edge.id, projection.distance
+                        )));
+                    }
+                    projection.u.clamp(c0.min(c1), c0.max(c1))
+                }
+            }
+        };
+        if seam_edge.start_vertex_id == old_vertex {
+            seam_edge.t0 = split_parameter;
+            seam_edge.start_vertex_id = target_vertex;
+        }
+        if seam_edge.end_vertex_id == old_vertex {
+            seam_edge.t1 = split_parameter;
+            seam_edge.end_vertex_id = target_vertex;
+        }
+    }
+    Ok(repaired)
 }

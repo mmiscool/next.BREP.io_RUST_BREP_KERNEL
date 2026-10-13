@@ -619,6 +619,7 @@ pub fn mesh_regions_to_brep(
             faces,
         }],
         genus: 0,
+        kind: crate::BodyKind::Solid,
     };
     let vertex_count = solid.vertices.len() as i64;
     let edge_count = solid.edges.len() as i64;

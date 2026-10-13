@@ -1,5 +1,8 @@
 <svg xmlns="http://www.w3.org/2000/svg" xmlns:brep="https://brep.io/icons"
-     viewBox="0 0 1233 2384" width="1233" height="2384" brep:glyph-name="icon_feat_sm_chamfer" brep:unicode="E04B">
-  <path d="M170 821L170 1201L262 1201L262 821ZM183.5 1233.5L603.5 1653.5L668.5 1588.5L248.5 1168.5ZM636 1667L1016 1667L1016 1575L636 1575Z" fill="#5c86a6"/>
-  <path d="M380.7 821L380.7 1131L431.3 1131L431.3 821ZM388.1 1148.9L728.1 1488.9L763.9 1453.1L423.9 1113.1ZM746 1496.3L1016 1496.3L1016 1445.7L746 1445.7Z" fill="#3d86c4"/>
+     viewBox="0 0 24 24" width="24" height="24" brep:glyph-name="icon_feat_sm_chamfer" brep:unicode="E04B">
+  <!-- A sheet outline with a straight clipped corner; dashes mark the original sharp corner. -->
+  <path d="M3 7H13L20 14V20H3Z" fill="#5c86a6" stroke="#2b4c63" stroke-width="1.2" stroke-linejoin="round"/>
+  <path d="M3 4H13L20 11V17H3Z" fill="#bcd7e8" stroke="#2b4c63" stroke-width="1.2" stroke-linejoin="round"/>
+  <path d="M13 4H20V11" style="fill:none" stroke="#3d86c4" stroke-width="1.2" stroke-dasharray="2 2"/>
+  <path d="M13 4 20 11" style="fill:none" stroke="#2fa469" stroke-width="2.4" stroke-linecap="round"/>
 </svg>

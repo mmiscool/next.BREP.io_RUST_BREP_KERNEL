@@ -1206,6 +1206,7 @@ fn solid_from_shell(source: &BrepSolid, shell: &ShellRecord) -> BrepSolid {
         edges,
         shells: vec![shell.clone()],
         genus: 0,
+        kind: crate::BodyKind::Solid,
     }
 }
 

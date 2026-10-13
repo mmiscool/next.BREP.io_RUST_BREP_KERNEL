@@ -1,7 +1,7 @@
 # BREP_app
 
 The BREP CAD application: one Rust egui/wgpu codebase for native desktop and
-WebAssembly. Package `BREP_app`, library `brep_app`, version 0.7.0.
+WebAssembly. Package `BREP_app`, library `brep_app`, version 0.8.0.
 The 3D engine is `BREP_render`; geometry comes from `BREP_kernel`.
 
 ## Build and run

@@ -97,4 +97,4 @@ tessellation feature; the wasm build deliberately does not.
 
 - License: the Autodrop3d licence in `LICENSE.md`, shipped in the crate
   (`license-file` in the manifest).
-- Version: 0.6.0.
+- Version: 0.8.0.

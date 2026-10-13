@@ -295,6 +295,7 @@ impl TopologyArena {
             edges,
             shells,
             genus: self.genus,
+            kind: crate::BodyKind::Solid,
         })
     }
 }

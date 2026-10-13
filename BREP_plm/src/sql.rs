@@ -18,7 +18,6 @@
 //! | `supplier_offers` | offer under an MPN | `supplier`, `spn_lc` |
 //! | `part_tags` | tag on a part | `tag_lc` |
 //! | `users`, `sessions`, `api_tokens`, `part_types`, `categories`, `manufacturers`, `suppliers` | record | their ids |
-//! | `change_orders` | change order | `number_lc` UNIQUE, `state` |
 //! | `workspace` | workspace folder, link or file | `(owner, parent)`, `ord` |
 //! | `changes` | document key in the change log | `seq` |
 //! | `preferences` | one reserved key of one user ([`crate::api::preferences`]), not in the in-memory state | `(user_id, key)`, `(user_id, version)` |
@@ -38,10 +37,8 @@
 //!
 //! # Versions
 //!
-//! `PRAGMA user_version` is the schema version. [`MIGRATIONS`] are applied in
-//! order, each in its own transaction, from whatever version the file has.
-//! A new schema change is a new entry at the end — never an edit to an old
-//! one, which a file in the field has already run.
+//! `PRAGMA user_version` identifies the current schema. Existing files must
+//! match it exactly; new files are initialized directly without upgrade paths.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
@@ -56,11 +53,8 @@ use crate::db::State;
 use crate::model::{AuditEvent, Category, ManufacturerPart, Part, Revision, Session, SupplierOffer, Use, WorkspaceEntry};
 use crate::table::Parts;
 
-/// The schema, one entry per version. Index `i` takes a file from version `i`
-/// to `i + 1`.
-const MIGRATIONS: &[&str] = &[
-    // 1: the first schema.
-    r#"
+/// The current schema, created directly for a new store.
+const SCHEMA: &str = r#"
     CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
     CREATE TABLE users (id TEXT PRIMARY KEY, username_lc TEXT NOT NULL UNIQUE, ord INTEGER NOT NULL, body TEXT NOT NULL);
     CREATE TABLE sessions (token TEXT PRIMARY KEY, user_id TEXT NOT NULL, ord INTEGER NOT NULL, body TEXT NOT NULL);
@@ -72,8 +66,8 @@ const MIGRATIONS: &[&str] = &[
     CREATE TABLE suppliers (id TEXT PRIMARY KEY, ord INTEGER NOT NULL, body TEXT NOT NULL);
 
     CREATE TABLE parts (
-        ord INTEGER PRIMARY KEY,
-        id TEXT NOT NULL UNIQUE,
+        id TEXT PRIMARY KEY NOT NULL,
+        ord INTEGER NOT NULL UNIQUE,
         number TEXT NOT NULL,
         number_lc TEXT NOT NULL UNIQUE,
         part_type TEXT NOT NULL,
@@ -84,25 +78,28 @@ const MIGRATIONS: &[&str] = &[
     );
     CREATE INDEX parts_category ON parts(category_lc);
     CREATE TABLE revisions (
-        id TEXT PRIMARY KEY,
+        id TEXT NOT NULL,
         part_id TEXT NOT NULL REFERENCES parts(id) ON DELETE CASCADE,
         ord INTEGER NOT NULL,
         label_lc TEXT NOT NULL,
         lifecycle TEXT NOT NULL,
         body TEXT NOT NULL,
-        UNIQUE (part_id, label_lc)
+        PRIMARY KEY(part_id, id),
+        UNIQUE(part_id, label_lc)
     );
     CREATE TABLE uses (
-        revision_id TEXT NOT NULL REFERENCES revisions(id) ON DELETE CASCADE,
+        part_id TEXT NOT NULL,
+        revision_id TEXT NOT NULL,
         ord INTEGER NOT NULL,
         child_part TEXT NOT NULL,
         child_revision TEXT NOT NULL,
         quantity REAL NOT NULL,
         body TEXT NOT NULL,
-        PRIMARY KEY (revision_id, ord)
+        PRIMARY KEY(part_id, revision_id, ord),
+        FOREIGN KEY(part_id, revision_id) REFERENCES revisions(part_id, id) ON DELETE CASCADE
     );
     CREATE INDEX uses_child_part ON uses(child_part);
-    CREATE INDEX uses_child_revision ON uses(child_revision);
+    CREATE INDEX uses_child_revision ON uses(child_part, child_revision);
     CREATE TABLE manufacturer_parts (
         id TEXT PRIMARY KEY,
         part_id TEXT NOT NULL REFERENCES parts(id) ON DELETE CASCADE,
@@ -159,23 +156,7 @@ const MIGRATIONS: &[&str] = &[
         number, name, description, category_id, category_path, tags, attributes, mpn, spn,
         tokenize = 'trigram', content = '', contentless_delete = 1
     );
-    "#,
-    // 2: change orders.
-    r#"
-    CREATE TABLE change_orders (
-        id TEXT PRIMARY KEY,
-        ord INTEGER NOT NULL,
-        number_lc TEXT NOT NULL UNIQUE,
-        state TEXT NOT NULL,
-        body TEXT NOT NULL
-    );
-    CREATE INDEX change_orders_state ON change_orders(state);
-    "#,
-    // 3: each user's preferences (`crate::api::preferences`). Not part of the
-    // in-memory state: a value is read and written here directly. A row whose
-    // `value` is NULL is a deleted key, kept so a client polling `since` sees
-    // the deletion; `version` counts per user and never goes down.
-    r#"
+
     CREATE TABLE preferences (
         user_id TEXT NOT NULL,
         key TEXT NOT NULL,
@@ -186,74 +167,21 @@ const MIGRATIONS: &[&str] = &[
         PRIMARY KEY (user_id, key)
     );
     CREATE INDEX preferences_version ON preferences(user_id, version);
-    "#,
-    // 4: workspaces (plm-cad-integration P6): one row per folder, link or file.
-    r#"
-    CREATE TABLE IF NOT EXISTS workspace (
+
+    CREATE TABLE workspace (
         id TEXT PRIMARY KEY,
         ord INTEGER NOT NULL,
         owner TEXT NOT NULL,
         parent TEXT NOT NULL,
         body TEXT NOT NULL
     );
-    CREATE INDEX IF NOT EXISTS workspace_folder ON workspace(owner, parent);
-    CREATE INDEX IF NOT EXISTS workspace_ord ON workspace(ord);
-    "#,
-    // 5: readable part primary keys and revisions scoped to their owning part.
-    r#"
-    CREATE TABLE parts_new (
-        id TEXT PRIMARY KEY NOT NULL,
-        ord INTEGER NOT NULL UNIQUE,
-        number TEXT NOT NULL,
-        number_lc TEXT NOT NULL UNIQUE,
-        part_type TEXT NOT NULL,
-        category_lc TEXT NOT NULL,
-        document_class TEXT NOT NULL,
-        created_at INTEGER NOT NULL,
-        body TEXT NOT NULL
-    );
-    INSERT INTO parts_new SELECT id, ord, number, number_lc, part_type, category_lc, document_class, created_at, body FROM parts;
-    CREATE TABLE revisions_new (
-        id TEXT NOT NULL,
-        part_id TEXT NOT NULL REFERENCES parts(id) ON DELETE CASCADE,
-        ord INTEGER NOT NULL,
-        label_lc TEXT NOT NULL,
-        lifecycle TEXT NOT NULL,
-        body TEXT NOT NULL,
-        PRIMARY KEY(part_id, id),
-        UNIQUE(part_id, label_lc)
-    );
-    INSERT INTO revisions_new SELECT * FROM revisions;
-    CREATE TABLE uses_new (
-        part_id TEXT NOT NULL,
-        revision_id TEXT NOT NULL,
-        ord INTEGER NOT NULL,
-        child_part TEXT NOT NULL,
-        child_revision TEXT NOT NULL,
-        quantity REAL NOT NULL,
-        body TEXT NOT NULL,
-        PRIMARY KEY(part_id, revision_id, ord),
-        FOREIGN KEY(part_id, revision_id) REFERENCES revisions(part_id, id) ON DELETE CASCADE
-    );
-    INSERT INTO uses_new SELECT r.part_id, u.revision_id, u.ord, u.child_part, u.child_revision, u.quantity, u.body FROM uses u JOIN revisions r ON r.id = u.revision_id;
-    DROP TABLE uses;
-    DROP TABLE revisions;
-    DROP TABLE parts;
-    ALTER TABLE parts_new RENAME TO parts;
-    ALTER TABLE revisions_new RENAME TO revisions;
-    ALTER TABLE uses_new RENAME TO uses;
-    CREATE INDEX parts_category ON parts(category_lc);
-    CREATE INDEX uses_child_part ON uses(child_part);
-    CREATE INDEX uses_child_revision ON uses(child_part, child_revision);
-    "#,
+    CREATE INDEX workspace_folder ON workspace(owner, parent);
+    CREATE INDEX workspace_ord ON workspace(ord);
+    "#;
 
-];
-
-/// The schema version this build writes. A file with a HIGHER version was
-/// written by a newer server, and this one refuses to open it rather than
-/// guess what the newer columns mean.
+/// The only schema version this build reads and writes.
 pub fn schema_version() -> i32 {
-    MIGRATIONS.len() as i32
+    6
 }
 
 /// Separates the values of one multi-valued search column (tags, attribute
@@ -279,11 +207,6 @@ const KEYED: &[Keyed] = &[
     Keyed { name: "categories", key: "id", columns: &[("id_lc", "id", true), ("parent", "parent", false)] },
     Keyed { name: "manufacturers", key: "id", columns: &[] },
     Keyed { name: "suppliers", key: "id", columns: &[] },
-    Keyed {
-        name: "change_orders",
-        key: "id",
-        columns: &[("number_lc", "number", true), ("state", "state", false)],
-    },
 ];
 
 /// The state fields with a home of their own; any OTHER top-level field is
@@ -385,31 +308,24 @@ fn configure(conn: &Connection, durability: Durability) -> rusqlite::Result<()> 
     Ok(())
 }
 
-/// Bring `conn`'s schema up to [`schema_version`].
-fn migrate(conn: &mut Connection) -> rusqlite::Result<()> {
+/// Initialize a new store or require the exact current schema.
+fn initialize(conn: &mut Connection) -> rusqlite::Result<()> {
     let version: i32 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-    if version > schema_version() {
+    if version == schema_version() { return Ok(()); }
+    if version != 0 {
         return Err(rusqlite::Error::InvalidParameterName(format!(
-            "plm.sqlite is schema version {version}, and this server only knows up to {} — run a newer server",
-            schema_version()
+            "unsupported PLM schema {version}; expected {}. Create a fresh data directory", schema_version()
         )));
     }
-    for (index, script) in MIGRATIONS.iter().enumerate().skip(version.max(0) as usize) {
-        let tx = conn.transaction()?;
-        // Development fixtures may replay earlier migrations on a database
-        // that already has scoped revision keys.
-        let scoped: bool = index == 4 && tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('uses') WHERE name = 'part_id')",
-            [], |r| r.get(0))?;
-        if !scoped { tx.execute_batch(script)?; }
-        tx.pragma_update(None, "user_version", index as i32 + 1)?;
-        tx.commit()?;
-    }
+    let tx = conn.transaction()?;
+    tx.execute_batch(SCHEMA)?;
+    tx.pragma_update(None, "user_version", schema_version())?;
+    tx.commit()?;
     Ok(())
 }
 
 impl Sql {
-    /// Open (or create) the store file at `path`, migrating its schema, with
+    /// Open (or create) the store file at `path`, requiring the current schema, with
     /// [`Durability::Full`].
     pub fn open(path: impl Into<PathBuf>) -> rusqlite::Result<Sql> {
         Sql::open_with(path, Durability::Full)
@@ -421,7 +337,7 @@ impl Sql {
         let mut writer = Connection::open(&path)?;
         configure(&writer, durability)?;
         writer.pragma_update(None, "foreign_keys", false)?;
-        migrate(&mut writer)?;
+        initialize(&mut writer)?;
         writer.pragma_update(None, "foreign_keys", true)?;
         // The checkpointer thread folds the log back in; once it has, the next
         // write restarts the log from the top, and the file is cut back to
@@ -562,7 +478,7 @@ impl Sql {
             }
         }
         if query.uncategorized {
-            sql.push_str(" AND p.category_lc NOT IN (SELECT id_lc FROM categories)");
+            sql.push_str(" AND p.category_lc = ''");
         }
         // `IN (subquery)`, not a correlated `EXISTS`: SQLite then walks the
         // filter's own index once instead of probing it for every part.
@@ -596,34 +512,13 @@ impl Sql {
         rows.collect()
     }
 
-    /// Replace everything in the file with `state` and `events`, in one
-    /// transaction — the import from the file store.
-    pub fn import(&self, state: &mut State, events: Vec<AuditEvent>) -> rusqlite::Result<()> {
-        let after = small_value(state);
-        let mut conn = self.writer();
-        let tx = conn.transaction()?;
-        let empty = Value::Object(Map::new());
-        write_small(&tx, &empty, &after)?;
-        for (position, part) in state.parts.iter().enumerate() {
-            write_part(&tx, position, part, &state.categories)?;
-        }
-        for entry in state.workspace.iter() {
-            write_entry(&tx, &entry.id, Some(entry))?;
-        }
-        for session in state.sessions.iter() {
-            write_session(&tx, &session.token, Some(session))?;
-        }
-        insert_events(&tx, events)?;
-        tx.commit()
-    }
-
     /// Fold the write-ahead log into the main file, so the file alone is
     /// the whole store (before it is renamed or copied).
     pub fn checkpoint(&self) -> rusqlite::Result<()> {
         self.writer().execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
     }
 
-    /// Row counts by table, for the migration report.
+    /// Row counts by table.
     pub fn counts(&self) -> rusqlite::Result<BTreeMap<String, i64>> {
         let conn = self.writer();
         let mut out = BTreeMap::new();
@@ -635,7 +530,6 @@ impl Sql {
             "categories",
             "manufacturers",
             "suppliers",
-            "change_orders",
             "workspace",
             "parts",
             "revisions",

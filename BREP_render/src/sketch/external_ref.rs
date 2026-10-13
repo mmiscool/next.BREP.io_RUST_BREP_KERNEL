@@ -3,6 +3,16 @@
 //! Projected polylines become lines, circles, arcs, or line-chain fallbacks.
 //! Ground constraints pin the generated points. Edge names identify persisted
 //! references, so picking an edge again updates its coordinates in place.
+//!
+//! The sketch feature's `projectedEdges` list is the ONE record of which edges
+//! a sketch links: an edge picked inside the editor is written into that list
+//! on Finish, and an edge put into the list from the feature dialog is
+//! materialized here on the next enter, through the same classifier. The
+//! `persistentData.externalRefs` entries only remember which points and
+//! geometry each listed edge became. When a listed edge stops resolving (its
+//! feature was deleted, or a regeneration lost the edge) the link is RELEASED:
+//! the geometry stays in the sketch as ordinary fixed construction geometry
+//! ([`release_ref`]), the entry and the list item go.
 
 use crate::geometry2d::{distance as dist, point_segment_distance};
 
@@ -22,6 +32,9 @@ pub enum EdgeLink {
     /// A closed circular edge — link as a `circle` (center + a rim point).
     Circle { center: (f64, f64), rim: (f64, f64) },
     /// A circular ARC — link as an `arc` (center, start, end; CCW start→end).
+    /// The endpoints are NORMALIZED to that convention: a polyline sampled
+    /// clockwise about its center is published with its ends swapped, so the
+    /// arc covers the sampled points and never their complement.
     Arc {
         center: (f64, f64),
         start: (f64, f64),
@@ -113,10 +126,15 @@ pub fn classify_uv(uv: &[(f64, f64)]) -> EdgeLink {
                         rim: (cx + r, cy),
                     };
                 }
+                // The sketch convention sweeps CCW start→end (the kernel's
+                // `(end − start).rem_euclid(TAU)`, the overlay's `arc_poly`): a
+                // polyline that runs CLOCKWISE about the center must publish its
+                // ends swapped, or the arc covers the complement of the edge.
+                let (start, end) = if winding_ccw(uv, (cx, cy)) { (a, b) } else { (b, a) };
                 return EdgeLink::Arc {
                     center: (cx, cy),
-                    start: a,
-                    end: b,
+                    start,
+                    end,
                 };
             }
         }
@@ -299,6 +317,86 @@ pub fn prune_dead_refs(doc: &SketchDoc, refs: &mut Vec<ExternalRef>) -> bool {
     refs.len() != before
 }
 
+/// The `persistentData` key a unified commit stamps: once it is set, the
+/// `projectedEdges` list and the `externalRefs` entries describe the SAME set
+/// of edges, so an entry whose edge the dialog no longer lists was removed by
+/// the user. A document without it predates the unification: its entries were
+/// never listed, so they are adopted into the list, never released.
+pub const LINKS_LISTED_KEY: &str = "linksInProjectedEdges";
+
+/// Release a linked edge whose source edge is gone: its materialized points stay
+/// where they are, `fixed` and grounded (`⏚`), but stop being external
+/// references, so the line / arc / circle becomes an ordinary sketch entity the
+/// user owns. It stays CONSTRUCTION: flipping that on a feature deletion would
+/// add profile edges and change what a downstream extrude builds. Returns
+/// whether any point changed (`false` when the entry's points are all gone).
+pub fn release_ref(doc: &mut SketchDoc, r: &ExternalRef) -> bool {
+    let mut changed = false;
+    for id in &r.point_ids {
+        if let Some(p) = doc.point_mut(id) {
+            if p.external_reference || !p.fixed {
+                changed = true;
+            }
+            p.external_reference = false;
+            p.fixed = true;
+        }
+    }
+    changed
+}
+
+/// [`release_ref`] on the persisted JSON doc (`persistentData.sketch`), for the
+/// regenerate-time fold that cannot go through the editor: every point the entry
+/// materialized loses `externalReference` and keeps (or regains) `fixed`; nothing
+/// else in the doc is touched, so the fold is lossless. Returns whether any
+/// point changed.
+pub fn release_ref_json(sketch: &mut Value, r: &ExternalRef) -> bool {
+    let keys: HashSet<String> = r.point_ids.iter().map(id_key).collect();
+    let Some(points) = sketch.get_mut("points").and_then(Value::as_array_mut) else {
+        return false;
+    };
+    let mut changed = false;
+    for point in points.iter_mut() {
+        if !point.get("id").is_some_and(|id| keys.contains(&id_key(id))) {
+            continue;
+        }
+        if point.get("externalReference").and_then(Value::as_bool) != Some(false) {
+            changed = true;
+        }
+        if point.get("fixed").and_then(Value::as_bool) != Some(true) {
+            changed = true;
+        }
+        point["externalReference"] = Value::Bool(false);
+        point["fixed"] = Value::Bool(true);
+    }
+    changed
+}
+
+/// The `projectedEdges` list a Finish writes: every name the feature listed
+/// before, in its order, minus the ones whose link the session dropped (deleted
+/// in the editor, or released), plus every live link the list did not name yet.
+/// `kept_unlinked` are listed names that had nothing to materialize at enter
+/// (the edge did not resolve in the backdrop) — they stay listed for the kernel
+/// to report.
+pub fn listed_edge_names(
+    listed: &[String],
+    refs: &[ExternalRef],
+    kept_unlinked: &[String],
+) -> Vec<String> {
+    let mut out: Vec<String> = listed
+        .iter()
+        .filter(|name| {
+            refs.iter().any(|r| &r.edge_name == *name) || kept_unlinked.contains(name)
+        })
+        .cloned()
+        .collect();
+    for r in refs {
+        if !out.contains(&r.edge_name) {
+            out.push(r.edge_name.clone());
+        }
+    }
+    out
+}
+
 /// Ensure the sketch carries the PART ORIGIN reference point: world `(0, 0, 0)`
 /// projected onto `plane`, under the reserved id
 /// [`brep_kernel::SKETCH_ORIGIN_POINT_ID`], flagged fixed + construction +
@@ -394,6 +492,25 @@ fn polyline_extent(uv: &[(f64, f64)]) -> f64 {
         maxy = maxy.max(y);
     }
     ((maxx - minx).powi(2) + (maxy - miny).powi(2)).sqrt()
+}
+
+/// Whether `uv` travels counter-clockwise about `center`: the sum of the WRAPPED
+/// signed angle steps between consecutive samples (each in `(−π, π]`) is positive.
+/// Summing the per-step turns, rather than comparing one midpoint's side of the
+/// chord, stays correct for sweeps beyond 180°.
+fn winding_ccw(uv: &[(f64, f64)], center: (f64, f64)) -> bool {
+    use std::f64::consts::{PI, TAU};
+    let angle = |p: (f64, f64)| (p.1 - center.1).atan2(p.0 - center.0);
+    let total: f64 = uv
+        .windows(2)
+        .map(|w| {
+            let step = angle(w[1]) - angle(w[0]);
+            // Wrap into (−π, π] so a sample straddling the ±π cut does not read
+            // as an almost-full turn the other way.
+            step - TAU * ((step + PI) / TAU).floor()
+        })
+        .sum();
+    total >= 0.0
 }
 
 /// Fit a circle through three points (circumcenter + radius), or `None` when the

@@ -58,7 +58,7 @@ pub(super) fn libraries(db: &Db) -> Result<Value, Error> {
     Ok(json!({"release":TAG,"libraries":names}))
 }
 
-/// Reclassify legacy imports without touching any document, revision or
+/// Reclassify current imports without touching any document, revision or
 /// lifecycle. In particular, user edits and released recipes remain intact.
 pub(super) fn repair_taxonomy(db: &Db, root: &str) -> Result<Value, Error> {
     if !root.is_empty() && db.read(|s| crate::catalog::find(&s.categories, root).is_none()) {
@@ -75,8 +75,7 @@ pub(super) fn repair_taxonomy(db: &Db, root: &str) -> Result<Value, Error> {
         let modern = document["kicadImport"]["library"].as_str() == Some(library)
             && document["kicadImport"]["release"].as_str() == Some(TAG)
             && document["kicadImport"]["sourceHash"].as_str().is_some_and(|h| h.len() == 64 && h.chars().all(|c| c.is_ascii_hexdigit()));
-        let legacy = part.description == "KiCad symbol library import";
-        if modern || legacy { parts.push((part.id.clone(), library.to_string(), part.category.clone())); }
+        if modern { parts.push((part.id.clone(), library.to_string(), part.category.clone())); }
     }
     let mut changed = 0;
     for (id, library, old) in &parts {
@@ -410,14 +409,7 @@ fn install(
             attributes = old_attributes.clone();
         }
         let hash = source_hash(&old);
-        let legacy = json!({"features":[],"expressions":"","symbol":symbol});
-        // The former starter installer touched familyTable.rows even on symbols,
-        // materializing this otherwise inert field in its old documents.
-        let mut legacy_family = legacy.clone();
-        legacy_family["familyTable"] = json!({"rows":null});
-        let unchanged = old["kicadImport"]["sourceHash"].as_str() == Some(hash.as_str())
-            || hash == source_hash(&legacy)
-            || hash == source_hash(&legacy_family);
+        let unchanged = old["kicadImport"]["sourceHash"].as_str() == Some(hash.as_str());
         let would_lose_assets = (old.get("pads").is_some() && document.get("pads").is_none())
             || old["features"].as_array().map_or(0, Vec::len)
                 > document["features"].as_array().map_or(0, Vec::len);

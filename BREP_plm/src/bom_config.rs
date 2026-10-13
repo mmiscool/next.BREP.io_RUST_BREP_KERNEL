@@ -578,7 +578,7 @@ pub fn capture_occurrences(
         if let Some(old) = existing.occurrences.iter().find(|o| o.id == occurrence.id) {
             occurrence.attributes = old.attributes.clone();
         }
-        // Unknown document fields are retained for standalone CAD compatibility.
+        // Current CAD documents may carry custom occurrence values; validate configured fields.
         for def in &state.bom_configuration.occurrence_fields {
             if let Some(value) = occurrence.attributes.get(&def.key).cloned() {
                 match catalog::check_value(def, &value).map_err(Error::bad_request)? {
@@ -705,44 +705,6 @@ pub fn document_occurrences(document: &Value) -> Option<Vec<Occurrence>> {
         })
         .collect();
     Some(occurrences)
-}
-impl Db {
-    pub fn initialize_bom_occurrences(&self) -> Result<(), Error> {
-        let candidates = self.read(|state| {
-            state
-                .parts
-                .iter()
-                .flat_map(|p| {
-                    p.revisions
-                        .iter()
-                        .filter(|r| r.occurrences.is_empty() && !r.uses.is_empty())
-                        .map(|r| (p.id.clone(), r.id.clone()))
-                })
-                .collect::<Vec<_>>()
-        });
-        let mut updates = Vec::new();
-        for (part, rev) in candidates {
-            if let Some(body) = self.read_document(&crate::identity::document_key(&part, &rev))? {
-                if let Ok(document) = serde_json::from_str::<Value>(&body) {
-                    if let Some(occurrences) =
-                        document_occurrences(&document).filter(|o| !o.is_empty())
-                    {
-                        updates.push((part, rev, occurrences));
-                    }
-                }
-            }
-        }
-        if updates.is_empty() {
-            return Ok(());
-        }
-        self.mutate(|state| {
-            for (part, rev, occurrences) in updates {
-                find_revision_mut(state, &part, &rev)?.1.occurrences = occurrences;
-                state.touch(crate::identity::document_key(&part, &rev));
-            }
-            Ok(())
-        })
-    }
 }
 
 pub fn synchronize_uses(revision: &mut Revision) {

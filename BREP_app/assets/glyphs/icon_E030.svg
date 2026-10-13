@@ -1,5 +1,8 @@
 <svg xmlns="http://www.w3.org/2000/svg" xmlns:brep="https://brep.io/icons"
-     viewBox="0 0 1233 2384" width="1233" height="2384" brep:glyph-name="icon_feat_datum" brep:unicode="E030">
-  <path d="M286 1567L946 1567L946 1475L286 1475ZM332 1521L332 891L240 891L240 1521ZM286 1567L866 1567L866 1475L286 1475ZM1016 1521L866 1603.5L866 1438.5ZM332 1521L332 971L240 971L240 1521ZM286 821L368.5 971L203.5 971Z" fill="#3d86c4"/>
-  <path d="M286 1425C339 1425 382 1468 382 1521C382 1574 339 1617 286 1617C233 1617 190 1574 190 1521C190 1468 233 1425 286 1425Z" fill="#c9871a"/>
+     viewBox="0 0 24 24" width="24" height="24" brep:glyph-name="icon_feat_datum" brep:unicode="E030">
+  <!-- A reference triad: three orthogonal planes sharing one origin corner. -->
+  <path d="M3.5 16.5 13.4 11.9 13.4 0.9 3.5 5.5Z" fill="#a8d4f7" stroke="#1c5384" stroke-width="1.2" stroke-linejoin="round" stroke-linecap="round"/>
+  <path d="M3.5 16.5 9.6 20.9 9.6 9.9 3.5 5.5Z" fill="#3d86c4" stroke="#1c5384" stroke-width="1.2" stroke-linejoin="round" stroke-linecap="round"/>
+  <path d="M3.5 16.5 13.4 11.9 19.5 16.3 9.6 20.9Z" fill="#a8d4f7" stroke="#1c5384" stroke-width="1.2" stroke-linejoin="round" stroke-linecap="round"/>
+  <ellipse cx="3.5" cy="16.5" rx="1.7" ry="1.7" fill="#c9871a" stroke="#7a4d10" stroke-width="1.2"/>
 </svg>

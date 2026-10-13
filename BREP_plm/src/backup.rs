@@ -216,21 +216,14 @@ fn wanted(snapshot: &Path) -> io::Result<Wanted> {
             }
         }
     }
-    // Every version of every workspace file. A snapshot from a server older
-    // than workspaces has no such table.
-    let has_workspace: bool = conn
-        .query_row("SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'workspace'", [], |r| r.get::<_, i64>(0))
-        .map_err(other_sql)?
-        > 0;
-    if has_workspace {
-        let mut stmt = conn.prepare("SELECT body FROM workspace").map_err(other_sql)?;
-        let rows = stmt.query_map([], |r| r.get::<_, String>(0)).map_err(other_sql)?;
-        for body in rows {
-            let body: Value = serde_json::from_str(&body.map_err(other_sql)?).map_err(other)?;
-            for v in body.get("versions").and_then(Value::as_array).into_iter().flatten() {
-                if let Some(sha) = v.get("sha256").and_then(Value::as_str) {
-                    blobs.insert(sha.to_string());
-                }
+    // Every version of every workspace file in the current schema.
+    let mut stmt = conn.prepare("SELECT body FROM workspace").map_err(other_sql)?;
+    let rows = stmt.query_map([], |r| r.get::<_, String>(0)).map_err(other_sql)?;
+    for body in rows {
+        let body: Value = serde_json::from_str(&body.map_err(other_sql)?).map_err(other)?;
+        for v in body.get("versions").and_then(Value::as_array).into_iter().flatten() {
+            if let Some(sha) = v.get("sha256").and_then(Value::as_str) {
+                blobs.insert(sha.to_string());
             }
         }
     }
@@ -557,8 +550,8 @@ pub fn read_manifest(archive: &Path) -> io::Result<Manifest> {
     if manifest.format != FORMAT {
         return Err(other(format!("the archive's format is '{}', not '{FORMAT}'", manifest.format)));
     }
-    if manifest.version > VERSION {
-        return Err(other(format!("the archive is version {}, newer than this server's {VERSION}", manifest.version)));
+    if manifest.version != VERSION || manifest.schema_version != i64::from(crate::sql::schema_version()) {
+        return Err(other(format!("the archive is version {}, different from this server's {VERSION}", manifest.version)));
     }
     Ok(manifest)
 }
@@ -599,7 +592,7 @@ fn restore_into(archive: &Path, data: &Path) -> io::Result<Manifest> {
         return Err(other("the archive does not start with manifest.json — is it a brep-plm backup?"));
     }
     let manifest: Manifest = serde_json::from_reader(first).map_err(other)?;
-    if manifest.format != FORMAT || manifest.version > VERSION {
+    if manifest.format != FORMAT || manifest.version != VERSION || manifest.schema_version != i64::from(crate::sql::schema_version()) {
         return Err(other("the archive is not a backup this server can restore"));
     }
     let listed: BTreeMap<&str, &FileEntry> = manifest.files.iter().map(|f| (f.path.as_str(), f)).collect();
@@ -725,7 +718,6 @@ pub fn export_json(state: &State) -> Value {
         "suppliers": state.suppliers,
         "users": users,
         "parts": parts,
-        "change_orders": state.change_orders,
     })
 }
 

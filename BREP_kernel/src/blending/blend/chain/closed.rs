@@ -91,25 +91,27 @@ fn blend_closed_smooth_chain(
     let bar = crate::KernelTolerances::for_solid(solid, 1e-7).intersection_fit;
     // The plain collar climbs the same measured ladder the carve does, from the
     // same first rung: a budget picked once is a resolution request in disguise.
-    let mut per_segment = CHAIN_PER_SEGMENT;
+    let mut budget = ChainBudget::for_chain(segments, CHAIN_PER_SEGMENT)?;
     let first = loop {
+        let per_segment = budget.rung;
         let rung = build_closed_smooth_chain(
             solid,
             segments,
             radius,
             chamfer,
             name,
-            per_segment,
+            &budget,
             FoldPolicy::Refuse,
             bar,
         );
         match rung {
             Ok(Rung::TooCoarse { deviation }) => {
                 crate::blend::carve::carve_trace(format_args!(
-                    "blend chain: {per_segment} stations per segment leaves the rails \
-                     {deviation:.6e} from the rolling ball, against {bar:.3e}"
+                    "blend chain: {} leaves the rails \
+                     {deviation:.6e} from the rolling ball, against {bar:.3e}",
+                    budget.describe()
                 ));
-                if per_segment * 2 > CHAIN_CARVE_MAX_PER_SEGMENT {
+                if budget.largest() * 2 > CHAIN_CARVE_MAX_PER_SEGMENT {
                     return Err(KernelRefusal::non_convergence(KernelStage::Refine, "chain_ladder_top", format!(
                         "blend: at {per_segment} stations per segment — the top of the chain's \
                          ladder — this collar's fitted rails are still {deviation:.6e} from the \
@@ -117,7 +119,7 @@ fn blend_closed_smooth_chain(
                          wall accurate enough to build"
                     )));
                 }
-                per_segment *= 2;
+                budget = budget.doubled();
             }
             // The continuation Newton of one station did not converge from its
             // neighbour at this spacing. Only that typed station failure climbs:
@@ -130,17 +132,17 @@ fn blend_closed_smooth_chain(
                     failure.segment, failure.position, failure.t, failure.from_position,
                     failure.from_t, failure.seed_uv, failure.error
                 ));
-                if per_segment * 2 > CHAIN_CARVE_MAX_PER_SEGMENT {
+                if budget.largest() * 2 > CHAIN_CARVE_MAX_PER_SEGMENT {
                     break Err(failure.error);
                 }
-                per_segment *= 2;
+                budget = budget.doubled();
             }
             other => break other,
         }
     };
     if let Err(error) = &first {
         crate::blend::carve::carve_trace(format_args!(
-            "blend chain: the march at {per_segment} stations per segment refused: {error}"
+            "blend chain: the march at {} refused: {error}", budget.describe()
         ));
     }
     match first {
@@ -201,22 +203,24 @@ fn carve_ladder(
     name: Option<&str>,
     bar: f64,
 ) -> Result<BrepSolid, KernelRefusal> {
-    let mut per_segment = CHAIN_PER_SEGMENT;
+    let mut budget = ChainBudget::for_chain(segments, CHAIN_PER_SEGMENT)?;
     loop {
+        let per_segment = budget.rung;
         match build_closed_smooth_chain(
             solid,
             segments,
             radius,
             false,
             name,
-            per_segment,
+            &budget,
             FoldPolicy::Carve,
             bar,
         )? {
             Rung::Built(built) => {
                 crate::blend::carve::carve_trace(format_args!(
-                    "blend carve: {per_segment} stations per segment is the first rung inside \
-                     {bar:.3e}"
+                    "blend carve: {} is the first rung inside \
+                     {bar:.3e}",
+                    budget.describe()
                 ));
                 return Ok(built);
             }
@@ -225,10 +229,11 @@ fn carve_ladder(
             Rung::StationFailed(failure) => return Err(failure.error),
             Rung::TooCoarse { deviation } => {
                 crate::blend::carve::carve_trace(format_args!(
-                    "blend carve: {per_segment} stations per segment leaves the rails \
-                     {deviation:.6e} from the rolling ball, against {bar:.3e}"
+                    "blend carve: {} leaves the rails \
+                     {deviation:.6e} from the rolling ball, against {bar:.3e}",
+                    budget.describe()
                 ));
-                if per_segment * 2 > CHAIN_CARVE_MAX_PER_SEGMENT {
+                if budget.largest() * 2 > CHAIN_CARVE_MAX_PER_SEGMENT {
                     return Err(crate::blend::fold::wall_fold_refusal(
                         Vec::new(),
                         format!(
@@ -241,7 +246,7 @@ fn carve_ladder(
                         ),
                     ));
                 }
-                per_segment *= 2;
+                budget = budget.doubled();
             }
         }
     }
@@ -286,14 +291,14 @@ fn rail_deviation(
     cs: &NurbsCurve,
     fit_low: f64,
     fit_range: f64,
-    per_segment: usize,
+    budget: &ChainBudget,
     bar: f64,
 ) -> Result<(f64, Vec<usize>), KernelRefusal> {
     // Each interval runs from a station to the NEXT one along its segment — the
     // next grid position, a station local refinement inserted, or the
     // segment's own end station — in the order the stations take.
     let mut order: Vec<usize> = (0..samples.len())
-        .filter(|&index| (0..=per_segment as isize).contains(&samples[index].position))
+        .filter(|&index| (0..=budget.count(samples[index].segment) as isize).contains(&samples[index].position))
         .collect();
     order.sort_by(|&a, &b| {
         let (a, b) = (&samples[a], &samples[b]);
@@ -1082,11 +1087,11 @@ fn build_closed_smooth_chain(
     radius: f64,
     chamfer: bool,
     name: Option<&str>,
-    per_segment: usize,
+    budget: &ChainBudget,
     fold: FoldPolicy,
     bar: f64,
 ) -> Result<Rung, KernelRefusal> {
-    let samples = match march_chain_typed(segments, radius, false, per_segment, fold) {
+    let samples = match march_chain_typed(segments, radius, false, budget, fold) {
         Ok(samples) => samples,
         Err(ChainMarchError::Station(failure)) => return Ok(Rung::StationFailed(failure)),
         // Only local refinement reports incoherence; the march never does, so
@@ -1095,7 +1100,7 @@ fn build_closed_smooth_chain(
         Err(ChainMarchError::Other(error)) => return Err(error),
     };
     CHAIN_DEEPEST_ROUND.with(|deepest| deepest.set(0));
-    build_closed_chain_from_samples(solid, segments, radius, chamfer, name, per_segment, fold, bar, samples, 0)
+    build_closed_chain_from_samples(solid, segments, radius, chamfer, name, budget, fold, bar, samples, 0)
 }
 
 
@@ -1121,18 +1126,21 @@ fn build_closed_chain_from_samples(
     radius: f64,
     chamfer: bool,
     name: Option<&str>,
-    per_segment: usize,
+    budget: &ChainBudget,
     fold: FoldPolicy,
     bar: f64,
     mut samples: Vec<ChainSample>,
     round: usize,
 ) -> Result<Rung, KernelRefusal> {
+    // The rung, for the traces and the typed reports; each segment's own
+    // count is the budget's.
+    let per_segment = budget.rung;
     CHAIN_DEEPEST_ROUND.with(|deepest| deepest.set(deepest.get().max(round)));
 
     // Global rows from the in-segment samples (wrapped-overlap closed fit).
     let mut global: Vec<(f64, &ChainSample)> = samples
         .iter()
-        .filter(|sample| (0..per_segment as isize).contains(&sample.position))
+        .filter(|sample| (0..budget.count(sample.segment) as isize).contains(&sample.position))
         .map(|sample| (sample.parameter.rem_euclid(1.0), sample))
         .collect();
     global.sort_by(|a, b| a.0.total_cmp(&b.0));
@@ -1204,7 +1212,7 @@ fn build_closed_chain_from_samples(
     // supposed to ride — by far more than the kernel's intersection-fit
     // contract. A carve pays for surgery only on an accurate rung; a plain
     // collar pays nothing more than the measurement unless it misses.
-    let (halfway, halfway_failing) = rail_deviation(&samples, &cr, &cs, low, range, per_segment, bar)?;
+    let (halfway, halfway_failing) = rail_deviation(&samples, &cr, &cs, low, range, budget, bar)?;
     // A rung that local insertion has refined is judged on the dense stencil of
     // exact contacts, not the halfway point alone (the NX collar's rung 24 read
     // 1.943844e-6 halfway and 2.009538e-6 at 7/16 against 2e-6). A rung that
@@ -1217,7 +1225,7 @@ fn build_closed_chain_from_samples(
     // against 2e-6). A chamfer is not a rolling ball and is not judged
     // against one. One stencil of exact contacts serves rails and wall.
     let stencil = if round > 0 {
-        Some(crate::blend::chain::chain_dense_contacts(segments, radius, per_segment, &samples, LOCAL_RAIL_STENCIL)?)
+        Some(crate::blend::chain::chain_dense_contacts(segments, radius, budget, &samples, LOCAL_RAIL_STENCIL)?)
     } else {
         None
     };
@@ -1226,7 +1234,7 @@ fn build_closed_chain_from_samples(
     // (`declared_wall_probe`). The rails keep their own stencil, read exactly
     // as before.
     let wall_stencil = if !chamfer && wall_verdict_on() {
-        Some(crate::blend::chain::chain_dense_contacts(segments, radius, per_segment, &samples, 2 * LOCAL_RAIL_STENCIL)?)
+        Some(crate::blend::chain::chain_dense_contacts(segments, radius, budget, &samples, 2 * LOCAL_RAIL_STENCIL)?)
     } else {
         None
     };
@@ -1280,7 +1288,7 @@ fn build_closed_chain_from_samples(
         let in_segment = |segment: usize| {
             samples
                 .iter()
-                .filter(|sample| sample.segment == segment && (0..per_segment as isize).contains(&sample.position))
+                .filter(|sample| sample.segment == segment && (0..budget.count(segment) as isize).contains(&sample.position))
                 .count()
         };
         let within_ceiling = (0..segments.len()).all(|segment| {
@@ -1299,7 +1307,7 @@ fn build_closed_chain_from_samples(
         }
         // The insertion is the next round's attempt, whatever it returns.
         CHAIN_DEEPEST_ROUND.with(|deepest| deepest.set(deepest.get().max(round + 1)));
-        match insert_chain_stations(segments, radius, per_segment, &mut samples, &failing) {
+        match insert_chain_stations(segments, radius, budget, &mut samples, &failing) {
             Ok(()) => {}
             Err(ChainMarchError::Station(failure)) => return Ok(Rung::StationFailed(failure)),
             // An inserted station that does not reach its retained right
@@ -1315,9 +1323,9 @@ fn build_closed_chain_from_samples(
             }
             Err(ChainMarchError::Other(error)) => return Err(error),
         }
-        assign_chain_parameters(&mut samples, segments.len(), per_segment, false);
+        assign_chain_parameters(&mut samples, segments.len(), budget, false);
         return build_closed_chain_from_samples(
-            solid, segments, radius, chamfer, name, per_segment, fold, bar, samples, round + 1,
+            solid, segments, radius, chamfer, name, budget, fold, bar, samples, round + 1,
         );
     }
     crate::blend::carve::carve_trace(format_args!(
@@ -1342,7 +1350,7 @@ fn build_closed_chain_from_samples(
         .map(|segment| {
             samples
                 .iter()
-                .filter(|sample| sample.segment == segment && (0..per_segment as isize).contains(&sample.position))
+                .filter(|sample| sample.segment == segment && (0..budget.count(segment) as isize).contains(&sample.position))
                 .count()
         })
         .max()
@@ -1396,7 +1404,7 @@ fn build_closed_chain_from_samples(
             let within_ceiling = (0..segments.len()).all(|segment| {
                 let present = samples
                     .iter()
-                    .filter(|sample| sample.segment == segment && (0..per_segment as isize).contains(&sample.position))
+                    .filter(|sample| sample.segment == segment && (0..budget.count(segment) as isize).contains(&sample.position))
                     .count();
                 present + missing.iter().filter(|&&index| samples[index].segment == segment).count()
                     <= CHAIN_CARVE_MAX_PER_SEGMENT
@@ -1415,11 +1423,11 @@ fn build_closed_chain_from_samples(
                 let mut refined = samples.clone();
                 // The insertion is the next round's attempt, whatever it returns.
                 CHAIN_DEEPEST_ROUND.with(|deepest| deepest.set(deepest.get().max(round + 1)));
-                match insert_chain_stations(segments, radius, per_segment, &mut refined, &missing) {
+                match insert_chain_stations(segments, radius, budget, &mut refined, &missing) {
                     Ok(()) => {
-                        assign_chain_parameters(&mut refined, segments.len(), per_segment, false);
+                        assign_chain_parameters(&mut refined, segments.len(), budget, false);
                         match build_closed_chain_from_samples(
-                            solid, segments, radius, chamfer, name, per_segment, fold, bar, refined, round + 1,
+                            solid, segments, radius, chamfer, name, budget, fold, bar, refined, round + 1,
                         ) {
                             Ok(Rung::Built(built)) => return Ok(Rung::Built(built)),
                             _ => Some((short, crate::BudgetReason::Rejected)),
@@ -1439,7 +1447,7 @@ fn build_closed_chain_from_samples(
     // where `rail_deviation` reads only the halfway one. Nothing reads it to
     // decide.
     if let Some(subdivisions) = std::env::var("BREP_DEBUG_CHAIN_DENSE_RAILS").ok().and_then(|value| value.parse::<usize>().ok()) {
-        let contacts = crate::blend::chain::chain_dense_contacts(segments, radius, per_segment, &samples, subdivisions.max(2))?;
+        let contacts = crate::blend::chain::chain_dense_contacts(segments, radius, budget, &samples, subdivisions.max(2))?;
         let mut worst = (0.0_f64, 0usize, 0isize, 0.0_f64);
         let mut unreadable = 0usize;
         for (left, next, fraction, p1, p2) in &contacts.solved {
@@ -1808,6 +1816,7 @@ pub(in crate::blend) fn project_piece_pcurve_within(
     // 2026-09-02 two-torus collar), and a pcurve fitted and checked at 97
     // samples of it was accepted 1.19e-3 off the rail it claims.
     let dense = (8 * piece.control_points.len()).clamp(96, PIECE_TRACK_CEILING);
+    crate::blend::record_count("count.track.piece_samples", dense as u64 + 1);
     let mut proj_u = Vec::with_capacity(dense + 1);
     let mut proj_v = Vec::with_capacity(dense + 1);
     let mut point3 = Vec::with_capacity(dense + 1);

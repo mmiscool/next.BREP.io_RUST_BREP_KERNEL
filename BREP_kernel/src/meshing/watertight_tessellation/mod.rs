@@ -26,6 +26,8 @@ mod face_tess;
 mod cone;
 mod orient;
 mod sphere_atlas;
+mod pole_patch;
+mod rectangle;
 mod stride_encode;
 
 use profile::*;
@@ -35,6 +37,8 @@ use edge_sampling::*;
 use face_tess::*;
 use cone::tessellate_pointed_cone_fan;
 use sphere_atlas::*;
+use pole_patch::*;
+use rectangle::*;
 
 pub use face_tess::triangulate_planar_region;
 pub use orient::tessellate_brep_watertight;

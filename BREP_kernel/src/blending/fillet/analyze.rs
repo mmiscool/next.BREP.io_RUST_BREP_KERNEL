@@ -1,4 +1,6 @@
 use super::*;
+use crate::projection::SurfaceProjection;
+use crate::{parameter_point_in_face, project_point_to_surface, PointClass, PolygonClass, SolidClassifier, Vec2};
 
 pub(super) fn edge_and_faces<'a>(
     solid: &'a BrepSolid,
@@ -32,7 +34,7 @@ pub(super) fn edge_and_faces<'a>(
     Ok((edge, faces))
 }
 
-pub(super) fn face_plane_normal(
+pub(crate) fn face_plane_normal(
     face: &FaceRecord,
     near: Vec3,
 ) -> Result<(Vec3, Vec3), KernelRefusal> {
@@ -734,7 +736,7 @@ fn tangent_neighbours<'a>(solid: &'a BrepSolid, face: &FaceRecord) -> Vec<&'a Fa
 /// stands then is the refusal this check gave before tangent neighbours
 /// counted.  A station that cannot be projected or differentiated declines
 /// the same way.
-fn neighbour_carries_ball(
+pub(crate) fn neighbour_carries_ball(
     solid: &BrepSolid,
     face: &FaceRecord,
     neighbour: &FaceRecord,
@@ -776,6 +778,50 @@ fn neighbour_carries_ball(
         }
     }
     stations > 0
+}
+
+/// Upper bound on the boundary's projection along a support direction.
+/// Positive-weight rational curves lie in their dehomogenized control hull.
+/// Subdivide only hulls that straddle the required reach; a sampled maximum
+/// is a lower bound and cannot justify refusing a curved support. Unresolved
+/// hulls (including split failures) keep their upper bound and do not refuse.
+fn boundary_extent_bound(
+    curve: &NurbsCurve,
+    station: Vec3,
+    direction: Vec3,
+    required: f64,
+    depth: usize,
+) -> f64 {
+    let mut upper = f64::NEG_INFINITY;
+    for p in &curve.control_points {
+        let Ok(point) = p.point() else {
+            return f64::INFINITY;
+        };
+        if p.w <= 0.0 {
+            return f64::INFINITY;
+        }
+        upper = upper.max(point.sub(station).dot(direction));
+    }
+    if upper < required || depth == 20 {
+        return upper;
+    }
+    let Ok([a, b]) = curve.domain() else {
+        return upper;
+    };
+    let mid = (a + b) * 0.5;
+    if [a, mid, b].iter().any(|&t| {
+        curve
+            .evaluate(t)
+            .is_ok_and(|p| p.sub(station).dot(direction) >= required)
+    }) {
+        return upper;
+    }
+    let Ok((left, right)) = curve.split(mid) else {
+        return upper;
+    };
+    boundary_extent_bound(&left, station, direction, required, depth + 1).max(
+        boundary_extent_bound(&right, station, direction, required, depth + 1),
+    )
 }
 
 /// **The rolling ball must actually TOUCH the faces it is supposed to be
@@ -855,10 +901,7 @@ pub(super) fn check_support_extent(
     };
     let straight = matches!(cross.path, EdgePath::Straight { .. });
     const SAMPLES: usize = 8;
-    for (face, into) in [
-        (faces[0], cross.into_first),
-        (faces[1], cross.into_second),
-    ] {
+    for (face, into) in [(faces[0], cross.into_first), (faces[1], cross.into_second)] {
         // The face's own boundary, in 3D.  The test below is a BOUND, not a
         // containment test, and deliberately so: `project_point_to_surface`
         // clamps to the carrier's parameter rectangle, so a contact point past
@@ -866,9 +909,10 @@ pub(super) fn check_support_extent(
         // exactly the census case — and `parameter_point_in_face` then
         // classifies the clamped point Inside.  Measuring how far the face
         // itself reaches along the into-direction needs no inversion, and it
-        // errs only toward NOT refusing: a face that reaches far enough
-        // somewhere is given the benefit of the doubt even if it does not
-        // reach there at this station.
+        // gives a face that reaches far enough somewhere the benefit of the
+        // doubt even if it does not reach there at this station. Samples can
+        // establish sufficient reach, but only a control-hull upper bound on
+        // every trimmed boundary curve can establish insufficient reach.
         //
         // The reach is measured over this face's boundary AND over the
         // boundary of every face joined to it TANGENTIALLY.  A support that
@@ -886,12 +930,14 @@ pub(super) fn check_support_extent(
         // (`neighbour_carries_ball`): the far mouth's own round on a blended
         // through-hole is G1 with the wall and still no wall to lie on.
         let mut boundary: Vec<Vec3> = Vec::new();
-        let sample_face = |sampled: &FaceRecord, boundary: &mut Vec<Vec3>| {
+        let mut boundary_edges = Vec::new();
+        let mut sample_face = |sampled: &FaceRecord, boundary: &mut Vec<Vec3>| {
             for loop_record in &sampled.loops {
                 for coedge in &loop_record.coedges {
                     let Some(border) = solid.edges.iter().find(|e| e.id == coedge.edge_id) else {
                         continue;
                     };
+                    boundary_edges.push(border);
                     for step in 0..=SAMPLES {
                         let t = border.t0 + (border.t1 - border.t0) * step as f64 / SAMPLES as f64;
                         if let Ok(point) = border.curve.evaluate(t) {
@@ -914,10 +960,9 @@ pub(super) fn check_support_extent(
         for step in 0..=SAMPLES {
             let fraction = step as f64 / SAMPLES as f64;
             let (station, direction) = match &cross.path {
-                EdgePath::Straight { direction, length } if straight => (
-                    cross.start.add(direction.scale(length * fraction)),
-                    into,
-                ),
+                EdgePath::Straight { direction, length } if straight => {
+                    (cross.start.add(direction.scale(length * fraction)), into)
+                }
                 _ => {
                     let angle = sweep * fraction;
                     (
@@ -941,6 +986,17 @@ pub(super) fn check_support_extent(
             // slack admits a rail that runs off its face and is neither
             // snapped nor refused.
             if reach <= extent + crate::blend::consumed_band(solid) {
+                continue;
+            }
+            let required = reach - crate::blend::consumed_band(solid);
+            let extent = boundary_edges
+                .iter()
+                .map(|border| match crate::step::edge_subcurve(border) {
+                    Ok(curve) => boundary_extent_bound(&curve, station, direction, required, 0),
+                    Err(_) => f64::INFINITY,
+                })
+                .fold(f64::NEG_INFINITY, f64::max);
+            if extent >= required {
                 continue;
             }
             return Err(KernelRefusal::input(
@@ -1024,7 +1080,10 @@ pub(super) fn check_blend_interference(
     edge_ids: &[u64],
     entry: &str,
 ) -> Result<(), KernelRefusal> {
-    use crate::{parameter_point_in_face, PointClass, PolygonClass, SolidClassifier, Vec2};
+    let _timing = crate::blend::BlendTimer::start("timing.interference_ms");
+    // The classifier's own counters (builds, band projections, rays) for the
+    // scan, printed under `BREP_PROFILE` as `classify.profile blend.interference.*`.
+    crate::classification::classify_profile_begin();
 
     if edge_ids.is_empty() || !original.validate().is_empty() {
         return Ok(());
@@ -1105,33 +1164,47 @@ pub(super) fn check_blend_interference(
     // anything; a rail that has actually run out over a hole is a whole blend
     // radius away from the skin, orders above it.
     const EDGE_SAMPLES: usize = 24;
+    let edges_timing = crate::blend::BlendTimer::start("timing.interference.edges_ms");
     let inherited: Vec<u64> = original.edges.iter().map(|edge| edge.id).collect();
     let fresh: Vec<_> = result
         .edges
         .iter()
         .filter(|edge| !inherited.contains(&edge.id))
         .collect();
+    // Each sample's side is read off its nearest face where that read is
+    // rigorous (`NearestFaceSide`), and cast as a ray otherwise: the same
+    // verdict, without two agreeing rays per sample.
     let skin = match fresh.is_empty() {
         true => None,
-        false => Some(
+        false => Some((
             SolidClassifier::new(original, policy.pcurve_consistency / 10.0)
                 .or_refuse(KernelStage::Validate, "edge_classifier")?,
-        ),
+            NearestFaceSide::new(original, policy.pcurve_consistency / 10.0)
+                .or_refuse(KernelStage::Validate, "edge_nearest_face")?,
+        )),
     };
     for edge in fresh {
-        let Some(skin) = skin.as_ref() else { break };
+        let Some((skin, nearest)) = skin.as_ref() else { break };
         let mut sampled = 0usize;
         let mut violations: Vec<Vec3> = Vec::new();
+        crate::blend::record_count("count.interference.edges", 1);
         for step in 1..EDGE_SAMPLES {
             let t = edge.t0 + (edge.t1 - edge.t0) * step as f64 / EDGE_SAMPLES as f64;
             let Ok(point) = edge.curve.evaluate(t) else {
                 continue;
             };
             sampled += 1;
-            let Ok(classification) = skin.classify(point) else {
-                continue;
+            crate::blend::record_count("count.interference.edge_samples", 1);
+            let class = match nearest.side(point) {
+                Some(class) => class,
+                None => {
+                    let Ok(classification) = skin.classify(point) else {
+                        continue;
+                    };
+                    classification.class
+                }
             };
-            if classification.class == forbidden {
+            if class == forbidden {
                 violations.push(point);
             }
         }
@@ -1145,6 +1218,8 @@ pub(super) fn check_blend_interference(
         }
     }
 
+    edges_timing.stop();
+    crate::classification::classify_profile_report("blend.interference.edges");
     // Pass 2 — the new FACES.  Interior grid nodes only: the boundary of a
     // blend face IS the rail, already covered above and already On.  This one
     // classifies at `intersection_fit`: a wall sample is not a boundary point,
@@ -1152,36 +1227,41 @@ pub(super) fn check_blend_interference(
     if grown.is_empty() {
         return Ok(());
     }
+    let faces_timing = crate::blend::BlendTimer::start("timing.interference.faces_ms");
+    crate::classification::classify_profile_begin();
+    crate::classification::containment_profile_begin();
     let classifier = SolidClassifier::new(original, policy.intersection_fit)
         .or_refuse(KernelStage::Validate, "face_classifier")?;
+    let nearest = NearestFaceSide::new(original, policy.intersection_fit)
+        .or_refuse(KernelStage::Validate, "face_nearest_face")?;
     const GRID: usize = 9;
     for face in grown {
-        let (Ok([u0, u1]), Ok([v0, v1])) = (face.surface.domain_u(), face.surface.domain_v())
-        else {
-            continue;
-        };
+        crate::blend::record_count("count.interference.faces", 1);
         let mut sampled = 0usize;
         let mut violations: Vec<Vec3> = Vec::new();
-        for iu in 1..GRID {
-            for iv in 1..GRID {
-                let uv = Vec2 {
-                    x: u0 + (u1 - u0) * iu as f64 / GRID as f64,
-                    y: v0 + (v1 - v0) * iv as f64 / GRID as f64,
-                };
-                let band = face_sample_uv_band(face, uv.x, uv.y, policy.model);
-                let Ok(PolygonClass::Inside) = parameter_point_in_face(face, uv, band) else {
-                    continue;
-                };
-                let Ok(point) = face.surface.evaluate(uv.x, uv.y) else {
-                    continue;
-                };
-                sampled += 1;
-                let Ok(classification) = classifier.classify(point) else {
-                    continue;
-                };
-                if classification.class == forbidden {
-                    violations.push(point);
+        // The lattice's interior nodes, the far ones answered by one query
+        // (`face_grid_classes`).
+        let band_at = |uv: Vec2| Ok(face_sample_uv_band(face, uv.x, uv.y, policy.model));
+        for (uv, class) in face_grid_classes(face, GRID, &band_at) {
+            let Some(Ok(PolygonClass::Inside)) = class else {
+                continue;
+            };
+            let Ok(point) = face.surface.evaluate(uv.x, uv.y) else {
+                continue;
+            };
+            sampled += 1;
+            crate::blend::record_count("count.interference.face_samples", 1);
+            let class = match nearest.side(point) {
+                Some(class) => class,
+                None => {
+                    let Ok(classification) = classifier.classify(point) else {
+                        continue;
+                    };
+                    classification.class
                 }
+            };
+            if class == forbidden {
+                violations.push(point);
             }
         }
         // Two independent interior points on the wrong side of the material is
@@ -1195,13 +1275,246 @@ pub(super) fn check_blend_interference(
             .unwrap_or_else(|| format!("face {}", face.id));
         return Err(report(label, &violations, sampled, "inside the grown face"));
     }
+    faces_timing.stop();
+    crate::classification::classify_profile_report("blend.interference.faces");
+    crate::classification::containment_profile_report("blend.interference.faces");
     Ok(())
+}
+
+/// The interior nodes of a `grid × grid` lattice over a face's domain, each
+/// with the face's own answer to whether it is inside the trims
+/// (`parameter_point_in_face` at the uv band of a spatial `spatial` at that
+/// node, [`face_sample_uv_band`]), in lattice order (u outer, v inner,
+/// `1..grid` each). `None` is a node the kernel was NOT asked about because
+/// it is FAR: outside the uv box of every loop's control points by more than
+/// its own band. A pcurve lies in the hull of its control points (positive
+/// weights), so far nodes are farther than their band from every trim
+/// chord; the set of far nodes is kept inside ONE connected piece of the
+/// domain minus that box (two pieces exist only when the box spans the
+/// whole u or the whole v range, and then every far node must sit on the
+/// same side), and a face's membership is constant on a connected set that
+/// meets no trim. One far node, the farthest from the box, is asked for them
+/// all: `Outside` stands for every far node; anything else, or any doubt
+/// about the hull (a weight not positive, no far node, more than one piece),
+/// asks about every node. On a corner patch (a spherical triangle bounded
+/// by three arcs of 57 control points each) the sphere lane answers each
+/// node in ~73 µs, 2 600 arcs walked six times, and 56 of 64 nodes are far;
+/// on an extruded wall every node is ~2 µs and nothing is far.
+pub(crate) fn face_grid_classes(
+    face: &FaceRecord,
+    grid: usize,
+    band_at: &dyn Fn(Vec2) -> Result<f64, String>,
+) -> Vec<(Vec2, Option<Result<PolygonClass, String>>)> {
+    let (Ok([u0, u1]), Ok([v0, v1])) = (face.surface.domain_u(), face.surface.domain_v()) else {
+        return Vec::new();
+    };
+    // A node whose band cannot be read carries that error as its answer.
+    let nodes: Vec<(Vec2, Result<f64, String>)> = (1..grid)
+        .flat_map(|iu| (1..grid).map(move |iv| (iu, iv)))
+        .map(|(iu, iv)| {
+            let uv = Vec2 {
+                x: u0 + (u1 - u0) * iu as f64 / grid as f64,
+                y: v0 + (v1 - v0) * iv as f64 / grid as f64,
+            };
+            (uv, band_at(uv))
+        })
+        .collect();
+    let ask = |uv: Vec2, band: &Result<f64, String>| {
+        crate::blend::record_count("count.grid.nodes_asked", 1);
+        match band {
+            Ok(band) => parameter_point_in_face(face, uv, *band),
+            Err(error) => Err(error.clone()),
+        }
+    };
+    let every = |nodes: &[(Vec2, Result<f64, String>)]| nodes.iter().map(|(uv, band)| (*uv, Some(ask(*uv, band)))).collect::<Vec<_>>();
+    // The loops' uv box, from control points that are all positively weighted.
+    let mut hull: Option<[f64; 4]> = None;
+    for coedge in face.loops.iter().flat_map(|record| record.coedges.iter()) {
+        for control in &coedge.pcurve.control_points {
+            if !(control.w > 0.0) {
+                return every(&nodes);
+            }
+            let (x, y) = (control.x / control.w, control.y / control.w);
+            if !(x.is_finite() && y.is_finite()) {
+                return every(&nodes);
+            }
+            hull = Some(match hull {
+                None => [x, x, y, y],
+                Some([a, b, c, d]) => [a.min(x), b.max(x), c.min(y), d.max(y)],
+            });
+        }
+    }
+    let Some([ua, ub, va, vb]) = hull else {
+        return every(&nodes);
+    };
+    // How far a node stands outside the box, and on which side-strip it
+    // lies when the box spans a whole range: (-1, 0, +1) in u and in v.
+    let far = |uv: Vec2, band: &Result<f64, String>| -> Option<(f64, (i8, i8))> {
+        let Ok(band) = band else { return None };
+        let band = *band;
+        let du = if uv.x < ua { ua - uv.x } else if uv.x > ub { uv.x - ub } else { 0.0 };
+        let dv = if uv.y < va { va - uv.y } else if uv.y > vb { uv.y - vb } else { 0.0 };
+        let distance = du.max(dv);
+        if !(distance > band) {
+            return None;
+        }
+        let side_u = if uv.x < ua { -1 } else if uv.x > ub { 1 } else { 0 };
+        let side_v = if uv.y < va { -1 } else if uv.y > vb { 1 } else { 0 };
+        Some((distance, (side_u, side_v)))
+    };
+    let spans_u = ua <= u0 && ub >= u1;
+    let spans_v = va <= v0 && vb >= v1;
+    let far_nodes: Vec<(usize, f64, (i8, i8))> = nodes
+        .iter()
+        .enumerate()
+        .filter_map(|(index, (uv, band))| far(*uv, band).map(|(distance, sides)| (index, distance, sides)))
+        .collect();
+    crate::blend::record_count("count.grid.nodes_far", far_nodes.len() as u64);
+    if far_nodes.is_empty() {
+        return every(&nodes);
+    }
+    // One connected piece: with the box spanning the whole u range the
+    // far nodes must all be below or all above it in v (and likewise for v).
+    let one_piece = (!spans_u || far_nodes.iter().all(|(_, _, sides)| sides.1 == far_nodes[0].2 .1))
+        && (!spans_v || far_nodes.iter().all(|(_, _, sides)| sides.0 == far_nodes[0].2 .0));
+    if !one_piece {
+        crate::blend::record_count("count.grid.far_split", 1);
+        return every(&nodes);
+    }
+    let &(farthest, _, _) = far_nodes
+        .iter()
+        .max_by(|a, b| a.1.total_cmp(&b.1))
+        .expect("a far node");
+    let representative = ask(nodes[farthest].0, &nodes[farthest].1);
+    if !matches!(representative, Ok(PolygonClass::Outside)) {
+        crate::blend::record_count("count.grid.far_not_outside", 1);
+        return every(&nodes);
+    }
+    let is_far: std::collections::HashSet<usize> = far_nodes.iter().map(|(index, _, _)| *index).collect();
+    nodes
+        .iter()
+        .enumerate()
+        .map(|(index, (uv, band))| {
+            if index == farthest {
+                (*uv, Some(Ok(PolygonClass::Outside)))
+            } else if is_far.contains(&index) {
+                (*uv, None)
+            } else {
+                (*uv, Some(ask(*uv, band)))
+            }
+        })
+        .collect()
+}
+
+/// The side of a solid's boundary a point is on, read from the point's
+/// NEAREST boundary point instead of a ray: a cheap answer the ray
+/// classifier ([`SolidClassifier::classify`]) would also give, or `None`
+/// when the read is not rigorous, in which case the caller casts the ray.
+///
+/// For a closed solid the open segment from a point `P` to its nearest
+/// boundary point `Q` meets no boundary (a point of the boundary on it
+/// would be nearer), so `P` lies on the side of `Q`'s own face: inside when
+/// `(P − Q)` runs against the face's outward normal. The read is rigorous
+/// when `Q` is known to be a nearest boundary point: it is the foot of `P`
+/// on a face's carrier, that foot lies INSIDE the face's trims (so it is on
+/// the face, and no point of that face is nearer), every face whose box
+/// comes nearer than `Q` has been projected, and every face whose foot is
+/// NOT inside its trims (whose nearest point is then somewhere on its
+/// boundary, no nearer than its carrier) has a carrier no nearer than `Q`.
+/// A `P` within the classifier's On band of `Q` is the classifier's to
+/// read (it answers `On` with a normal); so is a `P` whose offset from `Q`
+/// does not run along the normal (a foot that is not a foot). Carriers are
+/// projected with the kernel's own projector, whose analytic lanes make a
+/// plane or a cylinder a closed form.
+///
+/// Built for the blend acceptance's interference scan and the restriction's
+/// convexity vote, whose probes sit between the mates of a blend: a wall
+/// sample's nearest boundary point is on a mate, and the ray classifier
+/// spent 18–36 µs per sample confirming it with two agreeing rays.
+pub(crate) struct NearestFaceSide<'a> {
+    faces: Vec<&'a FaceRecord>,
+    boxes: Vec<crate::Aabb>,
+    bounds: crate::Aabb,
+    on_band: f64,
+}
+
+impl<'a> NearestFaceSide<'a> {
+    /// `tolerance` is the ray classifier's: its On band is ten times it.
+    pub(crate) fn new(solid: &'a BrepSolid, tolerance: f64) -> Result<Self, String> {
+        let faces: Vec<&FaceRecord> = solid.shells.iter().flat_map(|shell| &shell.faces).collect();
+        let boxes = faces.iter().map(|face| crate::Aabb::from_surface_controls(&face.surface)).collect::<Result<Vec<_>, _>>()?;
+        let mut bounds = crate::Aabb::empty();
+        for face_box in &boxes {
+            bounds.include(*face_box);
+        }
+        Ok(Self { faces, boxes, bounds, on_band: tolerance * 10.0 })
+    }
+
+    /// Distance from `point` to a box (zero inside it).
+    fn box_distance(face_box: &crate::Aabb, point: Vec3) -> f64 {
+        let axis = |value: f64, low: f64, high: f64| if value < low { low - value } else if value > high { value - high } else { 0.0 };
+        let dx = axis(point.x, face_box.minimum.x, face_box.maximum.x);
+        let dy = axis(point.y, face_box.minimum.y, face_box.maximum.y);
+        let dz = axis(point.z, face_box.minimum.z, face_box.maximum.z);
+        (dx * dx + dy * dy + dz * dz).sqrt()
+    }
+
+    /// `Some(In)` or `Some(Out)` when the nearest-face read is rigorous
+    /// (above), `None` otherwise.
+    pub(crate) fn side(&self, point: Vec3) -> Option<PointClass> {
+        if !self.bounds.expanded(self.on_band).contains(point) {
+            // The classifier's own first answer (Out), left to it.
+            return None;
+        }
+        let mut order: Vec<(f64, usize)> = self.boxes.iter().enumerate().map(|(index, face_box)| (Self::box_distance(face_box, point), index)).collect();
+        order.sort_by(|a, b| a.0.total_cmp(&b.0));
+        // The nearest interior foot, and the nearest carrier among faces
+        // whose foot was not inside their trims.
+        let mut nearest: Option<(f64, usize, SurfaceProjection)> = None;
+        let mut nearest_exterior = f64::INFINITY;
+        for &(lower_bound, index) in &order {
+            if nearest.as_ref().is_some_and(|(distance, _, _)| lower_bound >= *distance) {
+                break;
+            }
+            let face = self.faces[index];
+            // Only analytic carriers (closed-form projections): a general
+            // NURBS face within reach hands the point back to the ray.
+            if face.surface.analytic().is_none() {
+                return None;
+            }
+            let projection = project_point_to_surface(&face.surface, point).ok()?;
+            if !projection.distance.is_finite() {
+                return None;
+            }
+            let band = crate::classification::surface_uv_band(&face.surface, projection.u, projection.v, self.on_band);
+            let inside = parameter_point_in_face(face, Vec2 { x: projection.u, y: projection.v }, band).ok()?;
+            if inside == PolygonClass::Inside {
+                if nearest.as_ref().map_or(true, |(distance, _, _)| projection.distance < *distance) {
+                    nearest = Some((projection.distance, index, projection));
+                }
+            } else {
+                nearest_exterior = nearest_exterior.min(projection.distance);
+            }
+        }
+        let (distance, index, projection) = nearest?;
+        if !(distance > self.on_band) || nearest_exterior < distance {
+            return None;
+        }
+        let face = self.faces[index];
+        let normal = face.surface.normal(projection.u, projection.v).ok()?;
+        let normal = if face.same_sense { normal } else { normal.scale(-1.0) };
+        let along = point.sub(projection.point).dot(normal);
+        if !(along.abs() >= 0.5 * distance) {
+            return None;
+        }
+        Some(if along > 0.0 { PointClass::Out } else { PointClass::In })
+    }
 }
 
 /// UV band equivalent to a spatial band of `spatial` at (u, v), capped to a
 /// fraction of the smaller domain span so a pole cannot widen it into the whole
 /// face — the same derivation `SolidClassifier` uses for its own trim probes.
-fn face_sample_uv_band(face: &FaceRecord, u: f64, v: f64, spatial: f64) -> f64 {
+pub(crate) fn face_sample_uv_band(face: &FaceRecord, u: f64, v: f64, spatial: f64) -> f64 {
     let Ok(derivatives) = face.surface.derivatives(u, v, 1) else {
         return spatial;
     };
@@ -1244,6 +1557,7 @@ pub(super) fn check_loop_self_crossings(
     result: &BrepSolid,
     entry: &str,
 ) -> Result<(), KernelRefusal> {
+    let _timing = crate::blend::BlendTimer::start("timing.bowtie_ms");
     let report = crate::loop_self_crossings(result);
     let Some(crossing) = report.crossings.first() else {
         return Ok(());

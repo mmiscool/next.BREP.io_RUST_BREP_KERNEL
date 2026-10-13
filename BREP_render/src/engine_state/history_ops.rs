@@ -214,6 +214,14 @@ impl EngineState {
                 }
             }
         }
+        // The run just applied released sketch links the kernel could not
+        // resolve, editing the history after the fact: run it again so the
+        // report matches the document. Once, since the second run finds no
+        // listed edge left to release (the inline runner applies it before
+        // this returns; a background runner lands it on a later frame).
+        if std::mem::take(&mut self.sketch_links_released) {
+            self.rerun_history();
+        }
         if !self.run_pending() {
             self.run_progress = None;
         }
@@ -377,6 +385,7 @@ impl EngineState {
         self.pending_step_probes.clear();
         self.pending_fit = false;
         self.library_resync = false;
+        self.sketch_links_released = false;
         self.cancelled_run = Some(stalled_on.clone().unwrap_or_default());
         if notify {
             self.push_notice(match stalled_on {
@@ -645,7 +654,91 @@ impl EngineState {
             &report,
         )
         .to_string();
+        self.release_unresolved_sketch_links(&report.unresolved);
         self.finish_apply(report_json);
+    }
+
+    /// Release every sketch edge link whose edge this run could not resolve —
+    /// the kernel's own `unresolved` word, per feature, so an edge a LATER
+    /// feature consumed (gone from the final scene, present where the sketch
+    /// runs) is never mistaken for a lost one. For each such link the sketch
+    /// keeps its geometry as ordinary fixed construction geometry
+    /// ([`crate::sketch::external_ref::release_ref_json`]), drops the
+    /// `externalRefs` entry and takes the name out of `projectedEdges`. A
+    /// listed name that never materialized has nothing to keep and stays
+    /// listed (the report keeps naming it).
+    ///
+    /// Folded like the assembly pose write-back: no undo checkpoint, so undoing
+    /// the deletion that lost the edge restores the snapshot with the link
+    /// intact, and no run from here (re-entrancy); the flag makes `pump` run
+    /// once more. Nothing happens while a sketch is being edited (the editor
+    /// owns its doc and the rolled-back run never runs it) or while the
+    /// document is locked (a refused fold would be retried every run).
+    fn release_unresolved_sketch_links(&mut self, unresolved: &[String]) {
+        if unresolved.is_empty() || self.sketch_edit.is_some() || self.history.locked().is_some() {
+            return;
+        }
+        let mut released_any = false;
+        for index in 0..self.history.len() {
+            if !self.history.feature_type(index).is_some_and(|t| matches!(t.as_str(), "S" | "SKETCH")) {
+                continue;
+            }
+            let Some(id) = self.history.feature_id(index).filter(|id| !id.is_empty()) else {
+                continue;
+            };
+            let Some(mut persistent) = self.history.feature_persistent_data(index) else {
+                continue;
+            };
+            let mut refs: Vec<crate::sketch::ExternalRef> = persistent
+                .get("externalRefs")
+                .and_then(|v| serde_json::from_value(v.clone()).ok())
+                .unwrap_or_default();
+            if refs.is_empty() {
+                continue;
+            }
+            // `"{id}: {name}"`, possibly with the kernel's rename hint appended.
+            let lost: Vec<String> = refs
+                .iter()
+                .map(|r| r.edge_name.clone())
+                .filter(|name| {
+                    let line = format!("{id}: {name}");
+                    unresolved
+                        .iter()
+                        .any(|u| *u == line || u.starts_with(&format!("{line} (renamed:")))
+                })
+                .collect();
+            if lost.is_empty() {
+                continue;
+            }
+            let mut sketch = persistent.get("sketch").cloned().unwrap_or(serde_json::Value::Null);
+            for r in refs.iter().filter(|r| lost.contains(&r.edge_name)) {
+                crate::sketch::external_ref::release_ref_json(&mut sketch, r);
+            }
+            refs.retain(|r| !lost.contains(&r.edge_name));
+            if let Some(object) = persistent.as_object_mut() {
+                if !sketch.is_null() {
+                    object.insert("sketch".into(), sketch);
+                }
+                object.insert(
+                    "externalRefs".into(),
+                    serde_json::to_value(&refs).unwrap_or_else(|_| serde_json::Value::Array(Vec::new())),
+                );
+            }
+            let listed = brep_kernel::reference_names(
+                self.history.feature_params(index).as_ref().and_then(|p| p.get("projectedEdges")),
+            );
+            let kept: Vec<serde_json::Value> = listed
+                .into_iter()
+                .filter(|name| !lost.contains(name))
+                .map(serde_json::Value::String)
+                .collect();
+            self.history.fold_plugin_persistent_data(&id, persistent);
+            self.history.fold_param_no_undo(&id, "projectedEdges", serde_json::Value::Array(kept));
+            released_any = true;
+        }
+        if released_any {
+            self.sketch_links_released = true;
+        }
     }
 
     /// The shared post-apply TAIL: mark dirty, store the report JSON, re-sync an

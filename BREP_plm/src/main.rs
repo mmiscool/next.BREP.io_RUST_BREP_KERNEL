@@ -7,7 +7,6 @@
 //!                [--max-attachment-mb <n>]
 //!                [--backup-dir <dir> [--backup-every <minutes>] [--backup-keep <n>]]
 //!                [--cad-app <dir>] [--cad-connect-src <origin>]...
-//! brep-plm migrate [--data <dir>] [--dry-run]
 //! brep-plm backup  [--data <dir>] [--scripts <dir>] --out <file.tar.gz>
 //! brep-plm restore --from <file.tar.gz> --data <new dir>
 //! brep-plm export  [--data <dir>] --out <file> [--format json|parts-csv|structure-csv]
@@ -20,11 +19,6 @@
 //! administrator and prints its generated password ONCE. No build of this
 //! server ships a known password, which is why it cannot be recovered — make
 //! another admin before you lose it.
-//!
-//! A data directory from before SQLite (`plm.json`, `audit.jsonl`) is imported
-//! on the first `serve`. `migrate` does the same import without serving, and
-//! `migrate --dry-run` reports what it would import without changing the
-//! directory.
 //!
 //! `--scripts` names the administrator's scripts directory (default
 //! `<data>/scripts`), typically a git checkout. See `brep_plm::scripting`.
@@ -48,7 +42,6 @@ fn usage() -> ! {
          \n\
          USAGE:\n    \
              brep-plm serve [OPTIONS]\n    \
-             brep-plm migrate [--data <dir>] [--dry-run]\n    \
              brep-plm backup  [--data <dir>] [--scripts <dir>] --out <file.tar.gz>\n    \
              brep-plm restore --from <file.tar.gz> --data <new dir>\n    \
              brep-plm export  [--data <dir>] --out <file> [--format json|parts-csv|structure-csv]\n\
@@ -84,9 +77,6 @@ async fn main() {
     let command = args.next().unwrap_or_else(|| "serve".into());
     if command == "-h" || command == "--help" {
         usage();
-    }
-    if command == "migrate" {
-        migrate(args);
     }
     if command == "backup" {
         backup(args);
@@ -324,50 +314,6 @@ async fn main() {
     if let Err(error) = axum::serve(listener, service).with_graceful_shutdown(shutdown).await {
         eprintln!("brep-plm: {error}");
         std::process::exit(1);
-    }
-}
-
-/// `brep-plm migrate [--data <dir>] [--dry-run]`: import a file-store data
-/// directory into SQLite, or with `--dry-run` only say what it would import.
-fn migrate(mut args: impl Iterator<Item = String>) -> ! {
-    let mut data = DEFAULT_DATA.to_string();
-    let mut dry_run = false;
-    while let Some(flag) = args.next() {
-        match flag.as_str() {
-            "--data" => data = args.next().unwrap_or_else(|| usage()),
-            "--dry-run" => dry_run = true,
-            other => {
-                eprintln!("brep-plm: unknown option '{other}'");
-                usage();
-            }
-        }
-    }
-    // A real import renames files in the directory, so it waits for no
-    // server to be using it; a dry run only reads, and builds elsewhere.
-    let _lock = if dry_run {
-        None
-    } else {
-        match brep_plm::dirlock::DirLock::acquire(std::path::Path::new(&data)) {
-            Ok(lock) => Some(lock),
-            Err(error) => {
-                eprintln!("brep-plm: migrate {data}: {error}");
-                std::process::exit(1)
-            }
-        }
-    };
-    match brep_plm::db::migrate_files(std::path::Path::new(&data), dry_run) {
-        Ok(Some(report)) => {
-            println!("brep-plm: {report}");
-            std::process::exit(0)
-        }
-        Ok(None) => {
-            println!("brep-plm: nothing to migrate in {data} (no plm.json, or plm.sqlite already exists)");
-            std::process::exit(0)
-        }
-        Err(error) => {
-            eprintln!("brep-plm: migrate {data}: {error}");
-            std::process::exit(1)
-        }
     }
 }
 

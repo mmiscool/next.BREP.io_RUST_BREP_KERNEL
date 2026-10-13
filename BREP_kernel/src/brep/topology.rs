@@ -71,6 +71,12 @@ pub struct BrepSolid {
     pub shells: Vec<ShellRecord>,
     #[serde(default)]
     pub genus: i64,
+    /// The kind the body declares (`Solid` unless a producer says
+    /// otherwise). Skipped in JSON when `Solid`, so every body written
+    /// before the field existed reads and writes byte-identically; the flat
+    /// codec keeps its 1.0 header for a Solid for the same reason.
+    #[serde(default, skip_serializing_if = "BodyKind::is_solid")]
+    pub kind: BodyKind,
 }
 
 /// The closed kind of a [`ValidationIssue`]. Only the kinds a dispatcher
@@ -144,6 +150,8 @@ mod seam;
 mod validate;
 #[path = "topology/primitives.rs"]
 mod primitives;
+#[path = "topology/kind.rs"]
+mod kind;
 
 pub use seam::{
     analyze_doubly_periodic_seam_band, loop_seam_offsets, seam_band_uv_polygon, seam_band_uv_polygon_with,
@@ -151,4 +159,5 @@ pub use seam::{
 pub(crate) use seam::doubly_periodic_has_only_collapsed_loops;
 pub(crate) use validate::{adaptive_coedge_error, coedge_error_floored};
 pub use primitives::{make_box_brep, make_cylinder_brep, make_pyramid_brep};
+pub use kind::{topology_kind, BodyKind, KindReport, TopologyKind};
 

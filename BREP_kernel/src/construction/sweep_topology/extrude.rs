@@ -307,6 +307,7 @@ pub fn extrude_profile_brep(
         edges,
         shells: vec![ShellRecord { id: next_id, faces }],
         genus: 0,
+        kind: crate::BodyKind::Solid,
     };
     let issues = solid.validate();
     if issues.is_empty() {

@@ -16,7 +16,20 @@ fn rebuild_pcurve_preserving_branch(
     surface: &NurbsSurface,
     curve: &NurbsCurve,
     previous: &NurbsCurve,
+    emitted: bool,
 ) -> Result<NurbsCurve, KernelRefusal> {
+    // An EMITTED pcurve (`imprint/hermite.rs`, named by the builder's
+    // `emitted_pcurves`) shares the curve's knots; the snap moved the
+    // curve's end control points only, so its ends move to the chart images
+    // of the new ends and nothing is re-fitted. The branch is preserved by
+    // construction. A fitted pcurve is re-marched as before, whatever its
+    // shape (fixture 25's `pcurve.fits` pins that).
+    if emitted {
+        let [t0, t1] = curve.domain().or_refuse(KernelStage::Intersect, "domain")?;
+        let start = curve.evaluate(t0).or_refuse(KernelStage::Intersect, "evaluate")?;
+        let end = curve.evaluate(t1).or_refuse(KernelStage::Intersect, "evaluate")?;
+        return super::hermite::piece_pcurve_on_chart(previous, surface, start, end).or_refuse(KernelStage::Intersect, "piece_pcurve_on_chart");
+    }
     // Marched builder (see build_pcurve_on_surface_marched): the mint uses it so
     // a section riding a compressed carrier row does not fold; the canonicalize
     // rebuild must use it too or the fold returns. Fail-soft to the global build.
@@ -71,18 +84,69 @@ fn rebuild_pcurve_preserving_branch(
     Ok(rebuilt)
 }
 
-pub(super) fn canonicalize_imprint_junctions(
-    result: &mut ImprintResultRecord,
-    solid_a: &BrepSolid,
-    solid_b: &BrepSolid,
-    charts: &FaceCharts<'_>,
-    tolerance: f64,
-) -> Result<(), KernelRefusal> {
-    let face_map = faces(solid_a, 0)
-        .into_iter()
-        .chain(faces(solid_b, 1))
-        .map(|face| (face.key(), face.face))
-        .collect::<HashMap<_, _>>();
+/// What minted an imprint junction vertex, in the order a combine prefers:
+/// an operand's own vertex, a point on an operand edge (the section crossed
+/// or pierced it), a section end polished onto its two carriers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) enum JunctionSource {
+    OperandVertex,
+    EdgePoint,
+    FacePoint,
+}
+
+/// Per-vertex evidence the builder kept: the merge radius each mint asked
+/// for and the lowest-dimensional source that minted it.
+#[derive(Default)]
+pub(super) struct JunctionEvidence {
+    pub(super) radii: HashMap<u64, f64>,
+    pub(super) sources: HashMap<u64, JunctionSource>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum JunctionCombineMode {
+    Off,
+    Check,
+    On,
+}
+
+/// [`ImprintOptions::two_radius_junctions`] under `BREP_JUNCTION_COMBINE`.
+pub(super) fn junction_combine_mode(options: &ImprintOptions) -> JunctionCombineMode {
+    match std::env::var("BREP_JUNCTION_COMBINE").as_deref() {
+        Ok("0") | Ok("off") => JunctionCombineMode::Off,
+        Ok("check") => JunctionCombineMode::Check,
+        Ok(_) => JunctionCombineMode::On,
+        Err(_) => {
+            if options.two_radius_junctions {
+                JunctionCombineMode::On
+            } else {
+                JunctionCombineMode::Off
+            }
+        }
+    }
+}
+
+/// Strict combine radius as a multiple of the two candidates' own evidence
+/// radii: two definitions of one junction combine only within
+/// `STRICT_FACTOR × (r_a + r_b)`. Chosen from the census in the record.
+const STRICT_FACTOR: f64 = 5.0;
+
+/// `BREP_JUNCTION_CENSUS=<file>`: one line per junction vertex in check and
+/// on mode, labelled by `BREP_CENSUS_LABEL`.
+fn junction_census_line(line: impl FnOnce() -> String) {
+    if let Ok(path) = std::env::var("BREP_JUNCTION_CENSUS") {
+        use std::io::Write;
+        if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+            let label = std::env::var("BREP_CENSUS_LABEL").unwrap_or_default();
+            let _ = writeln!(file, "junction census: label {label} {}", line());
+        }
+    }
+}
+
+/// Every vertex's incident support faces and the piece end points that
+/// reference it.
+fn junction_incidence(
+    result: &ImprintResultRecord,
+) -> Result<(HashMap<u64, HashSet<FaceKey>>, HashMap<u64, Vec<Vec3>>), KernelRefusal> {
     let mut incident_faces = HashMap::<u64, HashSet<FaceKey>>::default();
     let mut incident_points = HashMap::<u64, Vec<Vec3>>::default();
     for piece in &result.pieces {
@@ -96,6 +160,238 @@ pub(super) fn canonicalize_imprint_junctions(
             incident_points.entry(vertex_id).or_default().push(point);
         }
     }
+    Ok((incident_faces, incident_points))
+}
+
+/// For every junction vertex, the operand vertices of its support faces and
+/// the other junctions sharing a support face (not joined to it by a piece)
+/// within the wide residual band are its candidates; an operand vertex
+/// within the strict radius anchors the junction there, else another
+/// junction within the strict radius merges with it, the surviving position
+/// being the lower-dimensional source's (the smaller evidence radius on a
+/// tie). In check mode nothing moves; both modes log one census line per
+/// junction. Returns whether any junction moved or merged, with the anchored
+/// representatives in `anchored`.
+#[allow(clippy::too_many_arguments)]
+fn two_radius_combine(
+    result: &mut ImprintResultRecord,
+    solid_a: &BrepSolid,
+    solid_b: &BrepSolid,
+    face_map: &HashMap<FaceKey, &FaceRecord>,
+    charts: &FaceCharts<'_>,
+    incident_faces: &HashMap<u64, HashSet<FaceKey>>,
+    tolerance: f64,
+    raw_extent: f64,
+    evidence: &JunctionEvidence,
+    emitted_pcurves: &HashSet<(u64, FaceKey)>,
+    mode: JunctionCombineMode,
+    anchored: &mut HashSet<u64>,
+) -> Result<bool, KernelRefusal> {
+    let weld = assembler_weld(tolerance);
+    let (_, capture) = residual_merge_bands(raw_extent, tolerance);
+    // The operand vertices on each support face's loops.
+    let mut face_vertices: HashMap<FaceKey, Vec<(u64, Vec3)>> = HashMap::default();
+    for (operand, solid) in [(0u8, solid_a), (1u8, solid_b)] {
+        let points: HashMap<u64, Vec3> = solid.vertices.iter().map(|vertex| (vertex.id, vertex.point)).collect();
+        let ends: HashMap<u64, (u64, u64)> =
+            solid.edges.iter().map(|edge| (edge.id, (edge.start_vertex_id, edge.end_vertex_id))).collect();
+        for face in solid.shells.iter().flat_map(|shell| &shell.faces) {
+            let mut ids: Vec<u64> = Vec::new();
+            for coedge in face.loops.iter().flat_map(|loop_record| &loop_record.coedges) {
+                if let Some(&(start, end)) = ends.get(&coedge.edge_id) {
+                    for id in [start, end] {
+                        if !ids.contains(&id) {
+                            ids.push(id);
+                        }
+                    }
+                }
+            }
+            let entries = ids.into_iter().filter_map(|id| points.get(&id).map(|point| (id, *point))).collect();
+            face_vertices.insert(FaceKey { operand, face_id: face.id }, entries);
+        }
+    }
+    let radius_of = |id: u64| evidence.radii.get(&id).copied().unwrap_or(0.0).max(weld);
+    let source_of = |id: u64| evidence.sources.get(&id).copied().unwrap_or(JunctionSource::FacePoint);
+    let piece_connected: HashSet<(u64, u64)> = result
+        .pieces
+        .iter()
+        .map(|piece| (piece.start_vertex_id.min(piece.end_vertex_id), piece.start_vertex_id.max(piece.end_vertex_id)))
+        .collect();
+    let verts: Vec<(u64, Vec3)> = result.vertices.iter().map(|vertex| (vertex.id, vertex.point)).collect();
+    let empty = HashSet::default();
+    // Pass 1: the anchors (an operand vertex within the strict radius).
+    let mut anchor: HashMap<u64, (u8, u64, Vec3)> = HashMap::default();
+    let mut nearest_junction: HashMap<u64, (f64, u64, f64)> = HashMap::default();
+    for &(id, point) in &verts {
+        let keys = incident_faces.get(&id).unwrap_or(&empty);
+        let radius = radius_of(id);
+        let mut nearest_vertex: Option<(f64, u8, u64, Vec3)> = None;
+        for key in keys {
+            for &(vertex_id, vertex_point) in face_vertices.get(key).map(Vec::as_slice).unwrap_or(&[]) {
+                let distance = vertex_point.sub(point).length();
+                if distance <= capture && nearest_vertex.is_none_or(|best| distance < best.0) {
+                    nearest_vertex = Some((distance, key.operand, vertex_id, vertex_point));
+                }
+            }
+        }
+        let mut nearest: Option<(f64, u64, f64)> = None;
+        for &(other_id, other_point) in &verts {
+            if other_id == id || piece_connected.contains(&(id.min(other_id), id.max(other_id))) {
+                continue;
+            }
+            let other_keys = incident_faces.get(&other_id).unwrap_or(&empty);
+            if keys.is_disjoint(other_keys) {
+                continue;
+            }
+            let distance = other_point.sub(point).length();
+            if distance <= capture && nearest.is_none_or(|best| distance < best.0) {
+                nearest = Some((distance, other_id, STRICT_FACTOR * (radius + radius_of(other_id))));
+            }
+        }
+        let strict_vertex = STRICT_FACTOR * (radius + weld);
+        junction_census_line(|| {
+            format!(
+                "vertex={id} source={:?} radius={radius:.3e} faces={} capture={capture:.3e} operand_vertex={} junction={}",
+                source_of(id),
+                keys.len(),
+                match nearest_vertex {
+                    Some((distance, operand, vertex_id, _)) => format!(
+                        "{distance:.3e}/{operand}:{vertex_id} strict={strict_vertex:.3e} inside={}",
+                        distance <= strict_vertex
+                    ),
+                    None => "none".to_string(),
+                },
+                match nearest {
+                    Some((distance, other_id, strict)) => format!(
+                        "{distance:.3e}/{other_id}:{:?} strict={strict:.3e} inside={}",
+                        source_of(other_id),
+                        distance <= strict
+                    ),
+                    None => "none".to_string(),
+                }
+            )
+        });
+        // A junction already on the operand vertex (within the model
+        // tolerance) has nothing to combine: the pieces end there as minted.
+        if let Some((distance, operand, vertex_id, vertex_point)) = nearest_vertex {
+            if distance > tolerance && distance <= strict_vertex {
+                anchor.insert(id, (operand, vertex_id, vertex_point));
+            }
+        }
+        if let Some(found) = nearest {
+            nearest_junction.insert(id, found);
+        }
+    }
+    if mode != JunctionCombineMode::On {
+        return Ok(false);
+    }
+    // Pass 2: merges between junctions within their strict radius, the
+    // position of the lower-dimensional one surviving (an anchored junction
+    // counts as an operand vertex).
+    let mut parent: HashMap<u64, u64> = verts.iter().map(|(id, _)| (*id, *id)).collect();
+    let mut merged_point: HashMap<u64, Vec3> = HashMap::default();
+    let anchors = anchor.clone();
+    let effective = |id: u64| -> (JunctionSource, f64, Vec3) {
+        match anchors.get(&id) {
+            Some((_, _, point)) => (JunctionSource::OperandVertex, weld, *point),
+            None => (
+                source_of(id),
+                radius_of(id),
+                verts.iter().find(|(other, _)| *other == id).map(|(_, point)| *point).unwrap_or_default(),
+            ),
+        }
+    };
+    let mut changed = false;
+    for &(id, _) in &verts {
+        let Some(&(distance, other_id, strict)) = nearest_junction.get(&id) else {
+            continue;
+        };
+        if distance <= tolerance || distance > strict {
+            continue;
+        }
+        let (ra, rb) = (junction_find(&mut parent, id), junction_find(&mut parent, other_id));
+        if ra == rb {
+            continue;
+        }
+        let (source_a, radius_a, point_a) = effective(ra);
+        let (source_b, radius_b, point_b) = effective(rb);
+        let keep_a = (source_a, radius_a, ra) <= (source_b, radius_b, rb);
+        let (rep, absorbed, point) = if keep_a { (ra, rb, point_a) } else { (rb, ra, point_b) };
+        parent.insert(absorbed, rep);
+        merged_point.insert(rep, point);
+        if anchor.contains_key(&absorbed) && !anchor.contains_key(&rep) {
+            if let Some(found) = anchor.get(&absorbed).copied() {
+                anchor.insert(rep, found);
+            }
+        }
+        if std::env::var("BREP_DEBUG_JUNCTION").is_ok() {
+            eprintln!(
+                "[two-radius] v{rep} <- v{absorbed} sep={distance:.3e} strict={strict:.3e} sources {source_a:?}/{source_b:?} to=({:.7},{:.7},{:.7})",
+                point.x, point.y, point.z
+            );
+        }
+        changed = true;
+    }
+    // An anchored junction's operand vertex beats the operand edge too: the
+    // split the crossing or pierce recorded a strict radius from that vertex
+    // is retracted, so the pieces end at the vertex and the edge is not cut
+    // beside it.
+    let edge_curves: HashMap<(u8, u64), &EdgeRecord> = [(0u8, solid_a), (1u8, solid_b)]
+        .into_iter()
+        .flat_map(|(operand, solid)| solid.edges.iter().map(move |edge| ((operand, edge.id), edge)))
+        .collect();
+    for (&id, &(operand, vertex_id, point)) in &anchor {
+        let rep = junction_find(&mut parent, id);
+        merged_point.insert(rep, point);
+        anchored.insert(rep);
+        let strict = STRICT_FACTOR * (radius_of(id) + weld);
+        for record in result.edge_splits.iter_mut().filter(|record| record.operand == operand) {
+            let Some(edge) = edge_curves.get(&(operand, record.edge_id)) else {
+                continue;
+            };
+            if edge.start_vertex_id != vertex_id && edge.end_vertex_id != vertex_id {
+                continue;
+            }
+            record.parameters.retain(|&parameter| {
+                edge.curve
+                    .evaluate(parameter)
+                    .map(|split_point| split_point.sub(point).length() > strict)
+                    .unwrap_or(true)
+            });
+        }
+        if std::env::var("BREP_DEBUG_JUNCTION").is_ok() {
+            eprintln!(
+                "[two-radius] v{id} anchored to operand {operand} vertex {vertex_id} at ({:.7},{:.7},{:.7})",
+                point.x, point.y, point.z
+            );
+        }
+        changed = true;
+    }
+    if !changed {
+        return Ok(false);
+    }
+    let (_, sep_cap) = residual_merge_bands(raw_extent, tolerance);
+    relocate_junctions(result, &mut parent, &merged_point, face_map, charts, emitted_pcurves, (4.0 * sep_cap).max(1e-3), true)?;
+    Ok(true)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn canonicalize_imprint_junctions(
+    result: &mut ImprintResultRecord,
+    solid_a: &BrepSolid,
+    solid_b: &BrepSolid,
+    charts: &FaceCharts<'_>,
+    tolerance: f64,
+    emitted_pcurves: &HashSet<(u64, FaceKey)>,
+    evidence: &JunctionEvidence,
+    combine: JunctionCombineMode,
+) -> Result<(), KernelRefusal> {
+    let face_map = faces(solid_a, 0)
+        .into_iter()
+        .chain(faces(solid_b, 1))
+        .map(|face| (face.key(), face.face))
+        .collect::<HashMap<_, _>>();
+    let (mut incident_faces, mut incident_points) = junction_incidence(result)?;
     // Residual-derived coincident-vertex merge (OCCT's ComputeTolReached3d idea).
     // Two imprint junctions that are the SAME intersection point — proven by the
     // whole segment between them lying on the UNION of their incident surfaces
@@ -117,24 +413,30 @@ pub(super) fn canonicalize_imprint_junctions(
             &incident_faces,
             tolerance,
             raw_extent,
+            emitted_pcurves,
         )?
     {
         // Incidence changed under the merge — rebuild it for the polish below.
-        incident_faces.clear();
-        incident_points.clear();
-        for piece in &result.pieces {
-            let [start, end] = piece.curve.domain().or_refuse(KernelStage::Intersect, "domain")?;
-            for (vertex_id, point) in [
-                (piece.start_vertex_id, piece.curve.evaluate(start).or_refuse(KernelStage::Intersect, "evaluate")?),
-                (piece.end_vertex_id, piece.curve.evaluate(end).or_refuse(KernelStage::Intersect, "evaluate")?),
-            ] {
-                incident_faces
-                    .entry(vertex_id)
-                    .or_default()
-                    .extend(piece.support_faces);
-                incident_points.entry(vertex_id).or_default().push(point);
-            }
-        }
+        (incident_faces, incident_points) = junction_incidence(result)?;
+    }
+    let mut anchored: HashSet<u64> = HashSet::default();
+    if combine != JunctionCombineMode::Off
+        && two_radius_combine(
+            result,
+            solid_a,
+            solid_b,
+            &face_map,
+            charts,
+            &incident_faces,
+            tolerance,
+            raw_extent,
+            evidence,
+            emitted_pcurves,
+            combine,
+            &mut anchored,
+        )?
+    {
+        (incident_faces, incident_points) = junction_incidence(result)?;
     }
     // Freeze an intrinsic reference before any vertex is polished. A world
     // origin gives identical junctions different acceptance budgets after a
@@ -173,6 +475,11 @@ pub(super) fn canonicalize_imprint_junctions(
     }
     for vertex in &mut result.vertices {
         if !canonical_vertices.contains(&vertex.id) {
+            continue;
+        }
+        // An operand vertex's position wins over the carriers' average: a
+        // junction anchored to one is not polished off it.
+        if anchored.contains(&vertex.id) {
             continue;
         }
         let Some(keys) = incident_faces.get(&vertex.id) else {
@@ -269,7 +576,7 @@ pub(super) fn canonicalize_imprint_junctions(
                 .ok_or_else(|| KernelRefusal::internal(KernelStage::Intersect, "imprint.junctions", format!("missing imprint support face {key:?}")))?;
             // In the face's CHART: the mint drew this pcurve there, and on a
             // lifted face the carrier's own frame is a period away from it.
-            pcurve.pcurve = rebuild_pcurve_preserving_branch(chart_of(charts, key, face), &piece.curve, &pcurve.pcurve)?;
+            pcurve.pcurve = rebuild_pcurve_preserving_branch(chart_of(charts, key, face), &piece.curve, &pcurve.pcurve, emitted_pcurves.contains(&(piece.id, key)))?;
         }
     }
     Ok(())
@@ -378,6 +685,7 @@ pub(super) fn merge_residual_coincident_vertices(
     incident_faces: &HashMap<u64, HashSet<FaceKey>>,
     tolerance: f64,
     raw_extent: f64,
+    emitted_pcurves: &HashSet<(u64, FaceKey)>,
 ) -> Result<bool, KernelRefusal> {
     let (band, sep_cap) = residual_merge_bands(raw_extent, tolerance);
 
@@ -516,11 +824,35 @@ pub(super) fn merge_residual_coincident_vertices(
     if !merged_any {
         return Ok(false);
     }
+    relocate_junctions(result, &mut parent, &merged_point, face_map, charts, emitted_pcurves, (4.0 * sep_cap).max(1e-3), false)?;
+    Ok(true)
+}
 
+/// Apply a set of junction merges and moves: every vertex takes its
+/// union-find representative, a representative with a point in
+/// `merged_point` moves there, pieces whose vertex ids changed are
+/// repointed, their curve ends snapped and their pcurves rebuilt, and a
+/// piece whose two ends collapsed to one vertex and is shorter than
+/// `spur_limit` is dropped. With `snap_moved` a piece whose vertex kept its
+/// id but moved is snapped as well (the combine's anchors); the residual
+/// merge keeps its historical behaviour of leaving those pieces' ends where
+/// the march put them. Shared by the residual merge and the two-radius
+/// combine.
+#[allow(clippy::too_many_arguments)]
+fn relocate_junctions(
+    result: &mut ImprintResultRecord,
+    parent: &mut HashMap<u64, u64>,
+    merged_point: &HashMap<u64, Vec3>,
+    face_map: &HashMap<FaceKey, &FaceRecord>,
+    charts: &FaceCharts<'_>,
+    emitted_pcurves: &HashSet<(u64, FaceKey)>,
+    spur_limit: f64,
+    snap_moved: bool,
+) -> Result<(), KernelRefusal> {
     let all_ids: Vec<u64> = parent.keys().copied().collect();
     let mut rep_of: HashMap<u64, u64> = HashMap::default();
     for id in all_ids {
-        let rep = junction_find(&mut parent, id);
+        let rep = junction_find(parent, id);
         rep_of.insert(id, rep);
     }
     // Keep one vertex per representative, at the merged joint point.
@@ -551,7 +883,9 @@ pub(super) fn merge_residual_coincident_vertices(
             .get(&piece.end_vertex_id)
             .copied()
             .unwrap_or(piece.end_vertex_id);
-        let moved = start_rep != piece.start_vertex_id || end_rep != piece.end_vertex_id;
+        let moved = start_rep != piece.start_vertex_id
+            || end_rep != piece.end_vertex_id
+            || (snap_moved && (merged_point.contains_key(&start_rep) || merged_point.contains_key(&end_rep)));
         piece.start_vertex_id = start_rep;
         piece.end_vertex_id = end_rep;
         if moved {
@@ -564,9 +898,7 @@ pub(super) fn merge_residual_coincident_vertices(
             // Both ends collapsed to one vertex and the piece is short: it can no
             // longer bound a fragment — drop it (mirrors the creation-time guard
             // in `process_curve`). A genuine long closed loop is preserved.
-            if start_rep == end_rep
-                && curve_length_rough(&piece.curve)? < (4.0 * sep_cap).max(1e-3)
-            {
+            if start_rep == end_rep && curve_length_rough(&piece.curve)? < spur_limit {
                 dropped_pieces.insert(piece.id);
                 continue;
             }
@@ -585,6 +917,7 @@ pub(super) fn merge_residual_coincident_vertices(
                     chart_of(charts, key, face),
                     &piece.curve,
                     &pcurve.pcurve,
+                    emitted_pcurves.contains(&(piece.id, key)),
                 )?;
             }
         }
@@ -598,6 +931,6 @@ pub(super) fn merge_residual_coincident_vertices(
             face.piece_ids.retain(|id| !dropped_pieces.contains(id));
         }
     }
-    Ok(true)
+    Ok(())
 }
 

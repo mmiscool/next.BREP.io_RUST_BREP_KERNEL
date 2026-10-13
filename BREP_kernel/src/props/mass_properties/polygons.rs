@@ -35,6 +35,44 @@ pub(super) struct TrimPolygon {
     jump_tolerance: f64,
 }
 
+/// Whether every control point of `curve` lies on the line through its two
+/// ends, to 1e-12 of the control polygon's extent. By the convex-hull
+/// property the whole curve then lies on that line, so the sliver between any
+/// chord of it and the arc behind the chord has no area: its correction is
+/// zero. `is_straight_polyline` is the exact degree-1 case the sampler keeps
+/// at its knots; this is the wider one the sign reading skips corrections
+/// on — a bore's rim on its wall, written by the imprint as a rational
+/// quadratic (the circle's own knots and weights) whose control points sit
+/// on one `v` line.
+pub(super) fn is_straight_in_uv(curve: &NurbsCurve) -> bool {
+    let mut points = Vec::with_capacity(curve.control_points.len());
+    for control in &curve.control_points {
+        let Ok(point) = control.point() else {
+            return false;
+        };
+        points.push([point.x, point.y]);
+    }
+    let (Some(first), Some(last)) = (points.first().copied(), points.last().copied()) else {
+        return false;
+    };
+    let extent = points
+        .iter()
+        .map(|point| (point[0] - first[0]).hypot(point[1] - first[1]))
+        .fold(0.0f64, f64::max);
+    if extent <= 0.0 {
+        return true;
+    }
+    let direction = [last[0] - first[0], last[1] - first[1]];
+    let length = direction[0].hypot(direction[1]);
+    if length <= 1e-12 * extent {
+        return false;
+    }
+    points.iter().all(|point| {
+        ((point[0] - first[0]) * direction[1] - (point[1] - first[1]) * direction[0]).abs()
+            <= 1e-12 * extent * length
+    })
+}
+
 fn is_straight_polyline(curve: &NurbsCurve) -> bool {
     let rational = curve
         .control_points

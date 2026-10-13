@@ -153,7 +153,6 @@ pub(crate) fn heal_operands(
     }
 
     let original = solid.clone();
-    let before = original.validate_with_tolerances(policy).len();
 
     let moved = heal_operands_inner(solid, heal_tol, policy.model)?;
     let debug = std::env::var("BREP_DEBUG_BOOL").is_ok();
@@ -164,6 +163,10 @@ pub(crate) fn heal_operands(
         }
         return Ok(());
     }
+    // The original's issue count is read only to judge a heal that moved
+    // something; on a clean operand (the common case) that validation was
+    // the whole cost of this pass, 1.6 ms of a disjoint box union's 7.2.
+    let before = original.validate_with_tolerances(policy).len();
     if debug {
         let count = original
             .vertices
@@ -879,8 +882,17 @@ fn refit_inherited_trims_with(
                         decision: TrimRefitDecision::Declined(TrimRefitDecline::Unreadable),
                     };
                     let started = web_time::Instant::now();
-                    let miss = detection_stations(&coedge.pcurve, edge, coedge.forward)
-                        .and_then(|stations| worst_same_parameter(&face.surface, &coedge.pcurve, edge, coedge.forward, &stations));
+                    // The detection read is a pure function of this use's
+                    // content, so it is served from the reading memo when
+                    // the same use was read before (`reading_memo.rs`).
+                    let miss = crate::reading_memo::memoized(
+                        crate::reading_memo::Reading::RefitDetection,
+                        crate::mass_properties::coedge_use_identity(&face.surface, &coedge.pcurve, edge, coedge.forward),
+                        || {
+                            detection_stations(&coedge.pcurve, edge, coedge.forward)
+                                .and_then(|stations| worst_same_parameter(&face.surface, &coedge.pcurve, edge, coedge.forward, &stations))
+                        },
+                    );
                     report.seconds.detect += started.elapsed().as_secs_f64();
                     let Some(miss) = miss else {
                         report.entries.push(entry);
@@ -894,12 +906,15 @@ fn refit_inherited_trims_with(
                     // candidacy only (the binding proof is the edge claim).
                     profiling(|profile| profile.phase = ScopePhase::Candidacy);
                     let started = web_time::Instant::now();
-                    let own = edge_standoff(
+                    let own = edge_standoff_read(
                         &face.surface,
                         edge,
                         coedge.forward,
                         scope_stations(&[&coedge.pcurve], edge, coedge.forward, TRIM_REFIT_DETECT_INTERIOR).as_deref(),
                         policy.model,
+                        None,
+                        None,
+                        Some(miss),
                     );
                     report.seconds.scope += started.elapsed().as_secs_f64();
                     let Some(own) = own.map(|read| read.worst) else {
@@ -1930,6 +1945,7 @@ fn native_reach(surface: &crate::NurbsSurface, along_u: bool, uv: [f64; 2]) -> O
 /// The edge read against `surface` over `stations` (fractions of a use running
 /// `forward`), each station's foot seeded from the previous one. `None` if any
 /// station or point cannot be read, or there are no stations.
+#[cfg_attr(not(test), allow(dead_code))]
 fn edge_standoff(
     surface: &crate::NurbsSurface,
     edge: &crate::topology::EdgeRecord,
@@ -1984,7 +2000,27 @@ fn edge_standoff_replay(
     stations: Option<&[f64]>,
     model: f64,
     replay: Option<&StationReplay>,
+    record: Option<&mut StationRecord>,
+) -> Option<ScopeRead> {
+    edge_standoff_read(surface, edge, forward, stations, model, replay, record, None)
+}
+
+/// Candidacy only needs to know whether the trim's miss exceeds the floor
+/// plus the edge's worst standoff. That worst is a running maximum: once
+/// it covers the miss, later stations cannot make this use a candidate.
+/// Stop there rather than projecting every knot span of a dense imported
+/// trim. A partial read can only decline a refit; binding edge claims and
+/// candidates not ruled out still read every station, including witnesses.
+#[allow(clippy::too_many_arguments)]
+fn edge_standoff_read(
+    surface: &crate::NurbsSurface,
+    edge: &crate::topology::EdgeRecord,
+    forward: bool,
+    stations: Option<&[f64]>,
+    model: f64,
+    replay: Option<&StationReplay>,
     mut record: Option<&mut StationRecord>,
+    candidacy_miss: Option<f64>,
 ) -> Option<ScopeRead> {
     let stations = stations?;
     if stations.is_empty() {
@@ -2047,6 +2083,9 @@ fn edge_standoff_replay(
             }
         };
         read.worst = read.worst.max(distance);
+        if candidacy_miss.is_some_and(|miss| miss <= crate::PCURVE_REFINEMENT_TOLERANCE + read.worst) {
+            break;
+        }
     }
     Some(read)
 }

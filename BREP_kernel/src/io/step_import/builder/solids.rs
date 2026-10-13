@@ -291,6 +291,7 @@ pub(in crate::step_import) fn certify_brep_with_voids_containment(solid: &BrepSo
         edges: solid.edges.clone(),
         shells: vec![solid.shells[0].clone()],
         genus: 0,
+        kind: crate::BodyKind::Solid,
     };
     // Build the outer-shell point classifier ONCE and reuse it for every void
     // vertex/edge sample. `classify_point` rebuilds this per call, which for a
@@ -523,6 +524,7 @@ pub(in crate::step_import) fn build_brep_with_voids_captured(
         edges: builder.edges,
         shells,
         genus: 0,
+        kind: crate::BodyKind::Solid,
     };
     solid = finalize_imported_solid(solid)?;
     solid.genus = euler_genus(&solid);
@@ -716,6 +718,7 @@ pub(in crate::step_import) fn build_solid_from_shell_captured(
             faces,
         }],
         genus: 0,
+        kind: crate::BodyKind::Solid,
     };
     solid = finalize_imported_solid(solid)?;
     solid.genus = euler_genus(&solid);

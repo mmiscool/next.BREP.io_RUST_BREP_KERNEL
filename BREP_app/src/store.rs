@@ -43,6 +43,15 @@ pub const PLUGINS_KEY: &str = "@plugins";
 pub const JAVASCRIPT_DRAFT_KEY: &str = "@javascript_draft";
 /// Recent document identities, shared through the user preference store.
 pub const RECENT_DOCUMENTS_KEY: &str = "@recent_documents";
+/// The File menu's recent-document thumbnails (`plm::thumbnail::recent`): ONE
+/// JSON map, store name → base64 PNG, pruned to [`RECENT_DOCUMENTS_KEY`]'s
+/// names, so it is bounded by the recent list. Local, not a preference: a
+/// picture cache of this machine's saves, never sent to a PLM server (which
+/// keeps its own thumbnail per revision). One reserved name rather than a key
+/// derived per document, because a derived name would fall through
+/// [`KeySpace::of`] to `Documents` — listed by Open, written as a model file,
+/// routed to the PLM server.
+pub const RECENT_THUMBNAILS_KEY: &str = "@recent_thumbnails";
 
 /// The reserved names that are a user's PREFERENCES (plm-cad-integration-todo
 /// D1): state that follows the user, not the machine. A file backend keeps them
@@ -65,7 +74,7 @@ pub const PREFERENCE_KEYS: &[&str] = &[
 /// after the local write (D1, S1's composition); the local copy is what a
 /// network drop cannot take away — and `@plm_import`, which is never
 /// mirrored.
-pub const LOCAL_KEYS: &[&str] = &[RECOVERY_KEY, PLM_IMPORT_KEY, PLUGINS_KEY, JAVASCRIPT_DRAFT_KEY];
+pub const LOCAL_KEYS: &[&str] = &[RECOVERY_KEY, PLM_IMPORT_KEY, PLUGINS_KEY, JAVASCRIPT_DRAFT_KEY, RECENT_THUMBNAILS_KEY];
 
 /// Which of the three key spaces a store name belongs to (D1, the round 10
 /// answer). Every name is exactly one of them:
@@ -1180,6 +1189,7 @@ mod native_model {
                 RECOVERY_KEY => return self.app_dir.join("recovery.json"),
                 KICAD_LIBRARY_KEY => return self.app_dir.join("kicad_library.json"),
                 super::RECENT_DOCUMENTS_KEY => return self.app_dir.join("recent_documents.json"),
+                super::RECENT_THUMBNAILS_KEY => return self.app_dir.join("recent_thumbnails.json"),
                 PLM_IMPORT_KEY => return self.app_dir.join("plm_import.json"),
                 super::PLUGINS_KEY => return self.app_dir.join("plugins.json"),
                 super::JAVASCRIPT_DRAFT_KEY => return self.app_dir.join("javascript_draft.js"),
@@ -2124,6 +2134,7 @@ pub(crate) mod mirror_store {
                 // LIST as a document the day anything wrote it here.
                 KICAD_LIBRARY_KEY => "brep-app:kicad_library".into(),
                 super::RECENT_DOCUMENTS_KEY => "brep-app:recent_documents".into(),
+                super::RECENT_THUMBNAILS_KEY => "brep-app:recent_thumbnails".into(),
                 PLM_IMPORT_KEY => "brep-app:plm_import".into(),
                 super::PLUGINS_KEY => "brep-app:plugins".into(),
                 super::JAVASCRIPT_DRAFT_KEY => "brep-app:javascript_draft".into(),

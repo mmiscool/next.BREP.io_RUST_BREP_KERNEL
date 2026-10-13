@@ -269,6 +269,9 @@ pub struct StepImportReport {
     /// `first_error`'s text; none refuses the whole file on any lane, which
     /// is the outcome their text had.
     pub failed_refusals: Vec<crate::KernelRefusal>,
+    /// Open surface-model sheets skipped (not solids, so not in `failed`);
+    /// also the counter [`SHEETS_SKIPPED`] in `diagnostics`.
+    pub sheets_skipped: usize,
     /// `(index into solids, approximation)` for every imported body whose
     /// shell closes over its bar (`import.shell_closure`); see
     /// [`ImportedStep::approximations`].
@@ -313,6 +316,13 @@ pub const CLOSURE_RATIO_MAX: &str = "import.closure_ratio_max";
 pub const CLOSURE_APPROXIMATE: &str = "import.closure_approximate";
 pub const CLOSURE_UNJUDGED: &str = "import.closure_unjudged";
 pub const CLOSURE_REFUSED: &str = "import.closure_refused";
+
+/// Open `SHELL_BASED_SURFACE_MODEL` sheets the importer SKIPPED, counted
+/// where it drops them (the flat lane, the occurrence lane once per part, and
+/// [`import_step_assembly`] once per product body). A sheet is not a solid,
+/// so it is neither `failed` nor `refused`; before 2026-10-12 it vanished
+/// uncounted (table 3: ten in `BIMExample-Site.step`).
+pub const SHEETS_SKIPPED: &str = "import.sheets_skipped";
 
 fn closure_diagnostics(
     notes: &[builder::ClosureNote],
@@ -433,12 +443,14 @@ pub fn import_step_report(text: &str) -> Result<StepImportReport, String> {
         precision::stated_precision_diagnostics(&imported.stated_precisions_mm, &imported.solids);
     bounded_trim_diagnostics(&imported.bounded_trims, &mut diagnostics);
     closure_diagnostics(&imported.closure_notes, &imported.refused_bodies, &mut diagnostics);
+    diagnostics.count_n(SHEETS_SKIPPED, imported.sheets_skipped as u64);
     Ok(StepImportReport {
         solids: imported.solids,
         failed: imported.failed,
         first_error: imported.first_error,
         refused: imported.refused_bodies,
         failed_refusals: imported.failed_refusals,
+        sheets_skipped: imported.sheets_skipped,
         approximations: imported
             .closure_notes
             .iter()

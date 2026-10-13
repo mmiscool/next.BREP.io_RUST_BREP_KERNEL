@@ -13,6 +13,7 @@ pub mod assembly_component;
 // Solid-producing primitives.
 pub mod cone;
 pub mod cylinder;
+pub mod nurbs_solid;
 pub mod pyramid;
 pub mod torus;
 pub mod transform_bake;
@@ -25,6 +26,7 @@ pub mod waypoint;
 pub mod face_profile;
 pub mod plane;
 pub mod sketch;
+pub mod sketch3d;
 
 // Add-material.
 pub mod extrude;

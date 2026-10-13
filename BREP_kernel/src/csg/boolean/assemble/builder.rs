@@ -24,6 +24,23 @@ pub(in crate::boolean) struct SourceEdge {
     // single weld-tolerance apart). This keeps the weld from confusing a hole
     // wall's two rims, or a rim with its neighbouring plate rim.
     pub(in crate::boolean) boundary_key: Option<(u8, u64)>,
+    /// MATERIAL SIDE of a TANGENT section's coedge (`ImprintOptions::
+    /// tangent_curve_imprint`; `TangentSectionRecord::piece_ids`): the
+    /// direction into the face from the section's midpoint, `n_out × t`
+    /// (the face's outward normal crossed with the coedge's travel
+    /// direction). Where two operands' faces touch along a tangent section
+    /// and material survives on both of its sides, four coedges arrive on
+    /// one locus; the two bounding one sliver of material point INTO it the
+    /// same way (the wall half and the bore quarter on the same side of the
+    /// contact), the two bounding the other point the opposite way. The weld
+    /// pairs coedges whose sides agree and refuses the rest, so the locus is
+    /// carried as two manifold edge records instead of one four-coedge
+    /// incidence — or, when only two coedges arrive (a union keeps the wall
+    /// halves and drops the bore), the identical-edge weld joins them
+    /// afterwards and the coplanar merge dissolves the flat edge. `None` on
+    /// every other source: the scan pairs by arrival as before. Appended at
+    /// the end of the struct (2026-10-11).
+    pub(in crate::boolean) tangent_side: Option<Vec3>,
 }
 
 /// id-index over the immutable operands + imprint, built once before the
@@ -138,6 +155,7 @@ fn boundary_source_edge(
         name: edge.name.clone(),
         constructed: false,
         boundary_key: Some((operand, edge_id)),
+        tangent_side: None,
     })
 }
 
@@ -169,6 +187,7 @@ pub(super) fn source_edge(source: &FragmentEdgeSource, index: &AssembleIndex) ->
                 name: imprint_edge_name(index, &piece.support_faces),
                 constructed: true,
                 boundary_key: None,
+                tangent_side: None,
             })
         }
         FragmentEdgeSource::Derived {
@@ -187,6 +206,7 @@ pub(super) fn source_edge(source: &FragmentEdgeSource, index: &AssembleIndex) ->
             name: None,
             constructed: false,
             boundary_key: None,
+            tangent_side: None,
         }),
     }
 }
@@ -223,6 +243,15 @@ pub(in crate::boolean) struct Assembler {
     pub(in crate::boolean) next_coedge_id: u64,
     pub(in crate::boolean) next_loop_id: u64,
     pub(in crate::boolean) next_face_id: u64,
+    // The FIRST assembler edge minted from each operand boundary edge, by
+    // `(operand, edge_id)`: the mate an untouched face's coedge welds to
+    // without the geometric scan (`edge_untouched`).
+    pub(in crate::boolean) edge_by_boundary_key: HashMap<(u8, u64), u64>,
+    // The material side recorded for each assembler edge minted from a
+    // sided source (`SourceEdge::tangent_side`): a weld candidate whose side
+    // points the other way bounds the other sliver and is refused. Appended
+    // at the end of the struct (2026-10-11).
+    pub(in crate::boolean) edge_tangent_side: HashMap<u64, Vec3>,
 }
 
 pub(super) fn snap_edge_curve_endpoints(
@@ -381,6 +410,16 @@ impl Assembler {
                 ) {
                     continue;
                 }
+                // A tangent section's coedges pair by material side (see
+                // `SourceEdge::tangent_side`): a candidate recorded with the
+                // opposite side bounds the other sliver of the pinch.
+                if let (Some(side), Some(existing)) =
+                    (source.tangent_side, self.edge_tangent_side.get(&edge.id))
+                {
+                    if side.dot(*existing) < 0.0 {
+                        continue;
+                    }
+                }
                 let start = self.vertex_point(edge.start_vertex_id)?;
                 let end = self.vertex_point(edge.end_vertex_id)?;
                 if edge.degenerate || start.sub(end).length() <= identity_tolerance {
@@ -521,6 +560,16 @@ impl Assembler {
                     self.edge_boundary_key.get(&edge.id).copied(),
                 ) {
                     continue;
+                }
+                // A tangent section's coedges pair by material side (see
+                // `SourceEdge::tangent_side`): a candidate recorded with the
+                // opposite side bounds the other sliver of the pinch.
+                if let (Some(side), Some(existing)) =
+                    (source.tangent_side, self.edge_tangent_side.get(&edge.id))
+                {
+                    if side.dot(*existing) < 0.0 {
+                        continue;
+                    }
                 }
                 let start = self.vertex_point(edge.start_vertex_id)?;
                 let end = self.vertex_point(edge.end_vertex_id)?;
@@ -719,11 +768,50 @@ impl Assembler {
         self.edge_first_forward.insert(id, incoming_forward);
         if let Some(key) = source.boundary_key {
             self.edge_boundary_key.insert(id, key);
+            self.edge_by_boundary_key.entry(key).or_insert(id);
         }
         if source.constructed {
             self.imprint_edges.insert(id);
         }
+        if let Some(side) = source.tangent_side {
+            self.edge_tangent_side.insert(id, side);
+        }
         Ok((id, false))
+    }
+
+    /// [`edge`](Self::edge) for a coedge of a face the operation did not
+    /// touch. Such a face's operand edge is whole and coincides with no
+    /// section, so an assembler edge already minted from the SAME operand
+    /// edge is its mate: the curve, span and endpoints are the operand's on
+    /// both sides, and the geometric scan would read the same record. The
+    /// scan still answers everything else — a closed or degenerate source,
+    /// a first use, a mate already two-use or facing the same way (a
+    /// non-manifold input), or a key the scan may have welded onto another
+    /// operand's coincident edge first.
+    pub(in crate::boolean) fn edge_untouched(
+        &mut self,
+        source: SourceEdge,
+        incoming_forward: bool,
+    ) -> Result<(u64, bool), KernelRefusal> {
+        let identity_tolerance = self.tolerance.max(1e-7);
+        let open = !source.degenerate && source.start.sub(source.end).length() > identity_tolerance;
+        if let (true, Some(key)) = (open, source.boundary_key) {
+            if let Some(&id) = self.edge_by_boundary_key.get(&key) {
+                let uses = self.edge_use_counts.get(&id).copied().unwrap_or(0);
+                let same_sense = self.edge_first_forward.get(&id) == Some(&incoming_forward);
+                if let Ok(index) = self.edges.binary_search_by_key(&id, |edge| edge.id) {
+                    let edge = &mut self.edges[index];
+                    if uses < 2 && !same_sense && !edge.degenerate {
+                        if edge.name.is_none() {
+                            edge.name = source.name;
+                        }
+                        *self.edge_use_counts.entry(id).or_default() += 1;
+                        return Ok((id, false));
+                    }
+                }
+            }
+        }
+        self.edge(source, incoming_forward)
     }
 }
 

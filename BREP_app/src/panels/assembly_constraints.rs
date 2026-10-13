@@ -61,7 +61,7 @@ use crate::panels::tree::{self, TreeRow};
 use crate::panels::update_components::UpdateComponents;
 use crate::store::ModelStore;
 use brep_render::assembly_status;
-use brep_render::engine_state::EngineState;
+use brep_render::engine_state::{EngineState, RefSelectField, RefSelectTarget};
 use brep_render::features::form_fields_from_schema;
 use eframe::egui;
 use serde_json::Value;
@@ -123,6 +123,10 @@ enum Action {
         multiple: bool,
         seed: Vec<String>,
     },
+    /// The focused reference field's `Done`: commit the running pick.
+    FinishRefSelect,
+    /// An `✕` on the focused reference field: drop the i-th running pick.
+    RefSelectRemove(usize),
 }
 
 /// The Assembly Constraints panel's transient UI state.
@@ -194,7 +198,13 @@ impl AssemblyConstraintsPanel {
         // state — see the module doc: the kernel keeps it an accordion (at most
         // one open) and two other surfaces set it without going through here.
         match rows.iter().find(|row| row.open) {
-            Some(row) => self.show_form(ui, row, &schemas, &mut action, &mut close, &mut hover),
+            Some(row) => {
+                // The pick running in this constraint's form, if one is.
+                let picking = state.ref_select_field().filter(|f| {
+                    f.target == RefSelectTarget::AssemblyConstraint && f.subject == row.id
+                });
+                self.show_form(ui, row, &schemas, picking.as_ref(), &mut action, &mut close, &mut hover)
+            }
             None => self.show_tree(
                 ui,
                 state,
@@ -242,7 +252,20 @@ impl AssemblyConstraintsPanel {
                 multiple,
                 seed,
             }) => {
+                // Focus moves from one selection box to the next: a pick
+                // already running commits first.
+                if state.ref_select_active() {
+                    state.finish_ref_select();
+                }
                 state.begin_ref_select_for_constraint(&id, path, label, filter, multiple, seed);
+                Ok(())
+            }
+            Some(Action::FinishRefSelect) => {
+                state.finish_ref_select();
+                Ok(())
+            }
+            Some(Action::RefSelectRemove(index)) => {
+                state.ref_select_remove(index);
                 Ok(())
             }
             None => Ok(()),
@@ -253,8 +276,24 @@ impl AssemblyConstraintsPanel {
         // Leaving the form is a SECOND mutation, applied after the action so a
         // commit and an exit in the same frame both land (see `close` above).
         if let Some(id) = close {
+            // Leaving the form commits the pick running in it.
+            if state
+                .ref_select_field()
+                .is_some_and(|f| f.target == RefSelectTarget::AssemblyConstraint)
+            {
+                state.finish_ref_select();
+            }
             if let Err(error) = state.assembly_set_constraint_open(&id, false) {
                 state.push_notice(format!("Assembly constraints: {error}"));
+            }
+        }
+        // This pane drew (or opened) the pick: the shell finishes an in-form
+        // pick no form claims, so one never runs on with its field off screen.
+        if let Some(field) = state.ref_select_field() {
+            if field.target == RefSelectTarget::AssemblyConstraint
+                && state.assembly_open_constraint().as_deref() == Some(field.subject.as_str())
+            {
+                state.ref_select_claim();
             }
         }
 
@@ -634,11 +673,13 @@ impl AssemblyConstraintsPanel {
     /// supplies the schema, the live params and the status; the form supplies
     /// every pixel of layout and hands back the intents the engine must act on.
     /// Editing is LIVE; the one exit button closes the row.
+    #[allow(clippy::too_many_arguments)]
     fn show_form(
         &mut self,
         ui: &mut egui::Ui,
         row: &ConstraintRow,
         schemas: &[Value],
+        picking: Option<&RefSelectField>,
         action: &mut Option<Action>,
         close: &mut Option<String>,
         hover: &mut Option<String>,
@@ -686,6 +727,7 @@ impl AssemblyConstraintsPanel {
             // namespaced.
             hits_prefix: "acon:",
             read_only: self.locked.as_deref(),
+            picking: picking.map(|f| crate::form::ActivePick { path: &f.path, names: &f.names }),
         };
         let out = form_view(ui, &spec, &mut params, Some(&mut self.hits));
 
@@ -713,6 +755,13 @@ impl AssemblyConstraintsPanel {
                 multiple: activate.multiple,
                 seed: activate.seed,
             });
+        }
+        // The focused reference field's own intents.
+        if let Some(index) = out.pick_remove {
+            *action = Some(Action::RefSelectRemove(index));
+        }
+        if out.pick_done {
+            *action = Some(Action::FinishRefSelect);
         }
         if out.changed {
             *action = Some(Action::UpdateParams(row.id.clone(), params));

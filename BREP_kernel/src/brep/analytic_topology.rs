@@ -123,6 +123,7 @@ pub fn make_sphere_brep_framed(
                 }],
             }],
             genus: 0,
+            kind: crate::BodyKind::Solid,
         },
         "sphere",
     )
@@ -207,6 +208,7 @@ pub fn make_torus_brep(
                 }],
             }],
             genus: 1,
+            kind: crate::BodyKind::Solid,
         },
         "torus",
     )
@@ -344,6 +346,7 @@ pub fn make_cone_brep(
                     ],
                 }],
                 genus: 0,
+                kind: crate::BodyKind::Solid,
             },
             "cone",
         );
@@ -466,6 +469,7 @@ pub fn make_cone_brep(
                 ],
             }],
             genus: 0,
+            kind: crate::BodyKind::Solid,
         },
         "cone frustum",
     )

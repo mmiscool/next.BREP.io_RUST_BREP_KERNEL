@@ -129,6 +129,10 @@ use crate::topology::{BrepSolid, FaceRecord, LoopRecord};
 use crate::{NurbsCurve, NurbsSurface, Vec3};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use serde::Serialize;
+use web_time::Instant;
+
+#[path = "soundness/sphere_certificate.rs"]
+mod sphere_certificate;
 
 // ---------------------------------------------------------------------------
 // Disjoint set — shared by the shell and the vertex-fan scans
@@ -484,6 +488,17 @@ macro_rules! pierce_trace {
     };
 }
 
+/// `BREP_PROFILE` (the switch the boolean's `boolean.*_ms` and the mass
+/// integrator's `mass.profile` read) prints one `soundness.profile` line per
+/// scan with its stage split — tessellation, weld, BVH build, the pair sweep,
+/// the fold pass — and the counts behind them, so a scan's cost can be named
+/// per stage rather than as one `timing.soundness_ms` ("Rules every slice
+/// follows", measure before changing).
+fn scan_profile_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("BREP_PROFILE").is_ok())
+}
+
 /// Knobs for [`solid_self_intersections`]. [`SelfIntersectionOptions::for_solid`]
 /// derives every one from the solid's own size.
 #[derive(Clone, Copy, Debug, Serialize)]
@@ -737,7 +752,18 @@ pub fn solid_self_intersections(
     solid: &BrepSolid,
     options: SelfIntersectionOptions,
 ) -> Result<SelfIntersectionReport, String> {
-    let mut report = SelfIntersectionReport {
+    let started = scan_profile_enabled().then(Instant::now);
+    if sphere_certificate::enabled() && sphere_certificate::certifies(solid, options) {
+        if let Some(started) = started {
+            eprintln!("soundness.profile ms={:.2} faces={} certificate=native_trimmed_spheres triangles=0 confirmed=0 folds=0", started.elapsed().as_secs_f64()*1000.0, solid.shells[0].faces.len());
+        }
+        return Ok(empty_intersection_report(options));
+    }
+    solid_self_intersections_full(solid, options)
+}
+
+fn empty_intersection_report(options: SelfIntersectionOptions) -> SelfIntersectionReport {
+    SelfIntersectionReport {
         triangles: 0,
         candidate_pairs: 0,
         confirmed: Vec::new(),
@@ -749,11 +775,22 @@ pub fn solid_self_intersections(
         fold_undecided: 0,
         truncated: false,
         options,
-    };
+    }
+}
+
+fn solid_self_intersections_full(
+    solid: &BrepSolid,
+    options: SelfIntersectionOptions,
+) -> Result<SelfIntersectionReport, String> {
+    let mut report = empty_intersection_report(options);
     if !(options.chord_tolerance > 0.0) || !options.chord_tolerance.is_finite() {
         return Err("solid_self_intersections: chord tolerance must be positive".into());
     }
 
+    let profile = scan_profile_enabled().then(Instant::now);
+    let stage_ms = |started: Option<Instant>| -> f64 {
+        started.map(|at| at.elapsed().as_secs_f64() * 1_000.0).unwrap_or(0.0)
+    };
     // The face-stride entry point rather than `tessellate_brep_watertight`:
     // the latter runs a coherent-orientation pass and a mesh validation that
     // can fail on exactly the broken solids this detector exists to inspect,
@@ -764,6 +801,7 @@ pub fn solid_self_intersections(
         1,
         0,
     )?;
+    let tessellate_ms = stage_ms(profile);
     let triangle_count = mesh.indices.len() / 3;
     report.triangles = triangle_count;
     if triangle_count == 0 {
@@ -791,8 +829,11 @@ pub fn solid_self_intersections(
         )
     };
 
+    let weld_started = scan_profile_enabled().then(Instant::now);
     let welded = weld_positions(&mesh.positions, options.weld);
+    let weld_ms = stage_ms(weld_started);
 
+    let bvh_started = scan_profile_enabled().then(Instant::now);
     let mut boxes = Vec::with_capacity(triangle_count);
     let mut corners: Vec<[Vec3; 3]> = Vec::with_capacity(triangle_count);
     for triangle in 0..triangle_count {
@@ -810,6 +851,11 @@ pub fn solid_self_intersections(
         corners.push(points);
     }
     let bvh = Bvh::build(&boxes);
+    let bvh_ms = stage_ms(bvh_started);
+    let sweep_started = scan_profile_enabled().then(Instant::now);
+    let mut overlaps: u64 = 0;
+    let mut crossings: u64 = 0;
+    let mut confirm_ms = 0.0f64;
 
     // Deepest confirmed crossing per unordered face pair, and the
     // widest-separated confirmed fold per face.
@@ -825,6 +871,7 @@ pub fn solid_self_intersections(
             if second <= first {
                 continue;
             }
+            overlaps += 1;
             let shares_vertex = (0..3).any(|a| {
                 let wa = welded[mesh.indices[first * 3 + a] as usize];
                 (0..3).any(|b| wa == welded[mesh.indices[second * 3 + b] as usize])
@@ -840,6 +887,8 @@ pub fn solid_self_intersections(
             if length <= options.min_crossing_length {
                 continue;
             }
+            crossings += 1;
+            let confirm_started = scan_profile_enabled().then(Instant::now);
             let face_first = mesh.face_ids[first] as usize;
             let face_second = mesh.face_ids[second] as usize;
             if face_first == face_second {
@@ -980,8 +1029,11 @@ pub fn solid_self_intersections(
             if crossing.straddle > slot.straddle {
                 *slot = crossing;
             }
+            confirm_ms += stage_ms(confirm_started);
         }
     }
+    let sweep_ms = stage_ms(sweep_started);
+    let fold_started = scan_profile_enabled().then(Instant::now);
 
     // ---- the fold pass ---------------------------------------------------
     // One grid per face that produced a same-face crossing at all, and at most
@@ -1033,6 +1085,25 @@ pub fn solid_self_intersections(
     report
         .folds
         .sort_by(|a, b| b.uv_separation.total_cmp(&a.uv_separation).then(a.face.cmp(&b.face)));
+    if profile.is_some() {
+        eprintln!(
+            "soundness.profile ms={:.2} faces={} tris={triangle_count} chord={:.3e} | \
+             tessellate_ms={tessellate_ms:.2} weld_ms={weld_ms:.2} bvh_ms={bvh_ms:.2} \
+             sweep_ms={sweep_ms:.2} confirm_ms={confirm_ms:.2} fold_ms={:.2} | \
+             overlaps={overlaps} candidate_pairs={} mesh_crossings={crossings} \
+             confirmed={} rejected={} undecided={} same_face={} folds={}",
+            stage_ms(profile),
+            faces.len(),
+            options.chord_tolerance,
+            stage_ms(fold_started),
+            report.candidate_pairs,
+            report.confirmed.len(),
+            report.rejected,
+            report.undecided,
+            report.same_face_candidates,
+            report.folds.len(),
+        );
+    }
     Ok(report)
 }
 

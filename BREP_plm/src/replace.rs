@@ -42,12 +42,12 @@ use serde_json::Value;
 
 use crate::bom;
 use crate::db::{now, Db, State};
-use crate::eco::{NewEco, NewItem};
 use crate::model::{Lifecycle, Part, Revision, Use, User};
 use crate::Error;
 
 /// What the caller asks for.
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReplaceRequest {
     /// The revision of the OLD part to replace, by id or label. Empty: every
     /// revision of it (the whole part).
@@ -66,17 +66,6 @@ pub struct ReplaceRequest {
     /// Compute the report without writing.
     #[serde(default)]
     pub dry_run: bool,
-    /// Put every written revision into a change order.
-    #[serde(default)]
-    pub eco: Option<EcoTarget>,
-}
-
-/// An existing change order by id or number, or a new one.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(untagged)]
-pub enum EcoTarget {
-    Existing(String),
-    New { new: NewEco },
 }
 
 /// One changed line: what it named, and what it will name.
@@ -111,9 +100,6 @@ pub struct ReplaceRow {
     pub lines: Vec<LineChange>,
     /// Floating lines of the old part left alone.
     pub floating_left: usize,
-    /// What adding the written revision to the change order did: `added`,
-    /// `already in it`, or why it could not be added.
-    pub eco: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -127,9 +113,6 @@ pub struct ReplaceReport {
     pub written: usize,
     pub skipped: usize,
     pub refused: usize,
-    /// The change order the written revisions went into, if any.
-    pub eco_number: String,
-    pub eco_id: String,
 }
 
 /// The resolved request: ids, and the names a report prints.
@@ -274,7 +257,7 @@ fn plan_row(state: &State, user: &User, target: &Target, parent: &Part, revision
         revision: String::new(),
         lines,
         floating_left: floating_left(target, revision),
-        eco: String::new(),
+
     };
     let refuse = |row: &mut ReplaceRow, status: &str, reason: String| {
         row.status = status.to_string();
@@ -373,8 +356,7 @@ impl Db {
             written: 0,
             skipped: 0,
             refused: 0,
-            eco_number: String::new(),
-            eco_id: String::new(),
+
         };
         if request.dry_run {
             for row in plans {
@@ -386,28 +368,6 @@ impl Db {
                 report.rows.push(row);
             }
             return Ok(report);
-        }
-
-        // The change order first, so a bad one refuses before anything is
-        // written.
-        let eco = match &request.eco {
-            None => None,
-            Some(EcoTarget::Existing(key)) => {
-                let (id, number) = self.read(|state| {
-                    crate::eco::find(state, key.trim())
-                        .map(|e| (e.id.clone(), e.number.clone()))
-                        .ok_or_else(|| Error::not_found(format!("change order '{}'", key.trim())))
-                })?;
-                Some((id, number))
-            }
-            Some(EcoTarget::New { new }) => {
-                let eco = self.create_eco(user, new)?;
-                Some((eco.id, eco.number))
-            }
-        };
-        if let Some((id, number)) = &eco {
-            report.eco_id = id.clone();
-            report.eco_number = number.clone();
         }
 
         for mut row in plans {
@@ -435,9 +395,6 @@ impl Db {
             match row.status.as_str() {
                 "written" | "created" => {
                     report.written += 1;
-                    if let Some((eco_id, _)) = &eco {
-                        row.eco = self.replace_into_eco(user, eco_id, &row);
-                    }
                 }
                 "skipped" => report.skipped += 1,
                 _ => report.refused += 1,
@@ -510,24 +467,4 @@ impl Db {
         }
     }
 
-    /// Add a written revision to the change order. A refusal here does not
-    /// undo the write; the row says why it is not in the change order.
-    fn replace_into_eco(&self, user: &User, eco_id: &str, row: &ReplaceRow) -> String {
-        let already = self.read(|state| {
-            crate::eco::find(state, eco_id).is_some_and(|e| e.item(&row.part_id, &row.revision_id).is_some())
-        });
-        if already {
-            return "already in it".into();
-        }
-        let item = NewItem {
-            part: row.part_id.clone(),
-            revision: row.revision_id.clone(),
-            action: "release".into(),
-            note: String::new(),
-        };
-        match self.add_eco_item(user, eco_id, &item) {
-            Ok(_) => "added".into(),
-            Err(error) => error.message,
-        }
-    }
 }

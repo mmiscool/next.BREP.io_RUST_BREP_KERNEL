@@ -297,6 +297,7 @@ fn hybrid_plane_cylinder_brep_retry(
         mass_properties_cache: Default::default(),
         id: 1,
         genus: 0,
+        kind: brep_kernel::BodyKind::Solid,
         vertices: Vec::new(),
         edges: Vec::new(),
         shells: Vec::new(),
@@ -1544,8 +1545,12 @@ fn local_regions(
     let mut original_spheres = HashMap::<u32, SphereCarrier>::new();
     let mut original_tori = HashMap::<u32, TorusCarrier>::new();
     let mut original_planes = HashMap::<u32, PlaneInfo>::new();
+    let mut unresolved_regions = BTreeSet::new();
     let mut retained = BTreeSet::<u32>::new();
     for region in regions {
+        if matches!(region.carrier, RegionCarrier::Freeform) {
+            unresolved_regions.insert(region.id);
+        }
         if let RegionCarrier::Plane { origin, normal } = region.carrier {
             original_planes.insert(region.id, PlaneInfo { origin, normal });
         }
@@ -1751,7 +1756,26 @@ fn local_regions(
                     }
                     _ => {}
                 }
-                if let Some(&plane) = original_planes.get(&neighbor) {
+                // An unresolved compound is later split into coplanar patches.
+                // Its facet at this interface may already be a valid planar
+                // trim (for example a small bore cap below the segmenter's
+                // planar area cutoff). Judge that actual support before
+                // discarding the entire curved face as a non-planar adjacency.
+                let neighbor_plane = if let Some(&plane) = original_planes.get(&neighbor) {
+                    Some(plane)
+                } else if unresolved_regions.contains(&neighbor) {
+                    let triangle = incident
+                        .iter()
+                        .copied()
+                        .find(|&t| triangle_regions[t] == neighbor)
+                        .ok_or_else(|| {
+                            "hybrid BREP: missing unresolved interface triangle".to_owned()
+                        })?;
+                    Some(facet_plane(triangles[triangle], vertices)?)
+                } else {
+                    None
+                };
+                if let Some(plane) = neighbor_plane {
                     let supported = match own {
                         Revolve::Cylinder(cylinder) => cylinder_plane_edge_supported(
                             cylinder,

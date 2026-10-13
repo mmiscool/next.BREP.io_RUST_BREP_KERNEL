@@ -28,8 +28,7 @@ pub struct PartRow {
     pub name: String,
     pub part_type: String,
     pub document_class: DocumentClass,
-    /// The stored category text: a category id, empty, or text from before
-    /// the catalog that names no category.
+    /// A catalog category id, or empty for uncategorized parts.
     pub category: String,
     /// "Fasteners / Screws" when `category` names a category; empty when the
     /// part is uncategorized.
@@ -261,8 +260,6 @@ pub struct RevisionView {
     pub review: Option<ReviewSummary>,
     /// How many comments its discussion has.
     pub comments: usize,
-    /// The open change order that names this revision, if one does.
-    pub eco: Option<EcoRef>,
     /// This revision's thumbnail, current or stale; absent with none.
     pub thumbnail: Option<ThumbnailView>,
 }
@@ -279,16 +276,6 @@ pub struct ThumbnailView {
     pub height: u32,
     pub renderer: String,
     pub content_hash: String,
-}
-
-/// The open change order holding a revision, in brief.
-#[derive(Debug, Serialize)]
-pub struct EcoRef {
-    pub id: String,
-    pub number: String,
-    pub state: &'static str,
-    /// `release` or `obsolete`.
-    pub action: &'static str,
 }
 
 /// A review round in one line of the revision table.
@@ -417,12 +404,6 @@ fn view(
             may_decide: r.is_live() && state.user(viewer_id).is_some_and(|u| crate::review::is_reviewer(r, u)),
         }),
         comments: revision.comments.len(),
-        eco: crate::eco::standalone_holder(state, &part.id, &revision.id).map(|e| EcoRef {
-            id: e.id.clone(),
-            number: e.number.clone(),
-            state: e.state.as_str(),
-            action: e.item(&part.id, &revision.id).map(|i| i.action.as_str()).unwrap_or(""),
-        }),
         thumbnail: revision.thumbnail.as_ref().map(|t| ThumbnailView {
             current: crate::thumbnail::current(revision).is_some(),
             url: crate::thumbnail::revision_url(&part.id, revision),

@@ -27,6 +27,7 @@ fn coheres_face_normals(solid: &mut BrepSolid) -> Result<(), KernelRefusal> {
             edges: solid.edges.clone(),
             shells: vec![solid.shells[shell_index].clone()],
             genus: 0,
+            kind: crate::BodyKind::Solid,
         };
         if crate::solid_signed_volume(&single).or_refuse(KernelStage::Sew, "solid_signed_volume")? < 0.0 {
             flip_shell_faces(&mut solid.shells[shell_index])?;
@@ -101,14 +102,74 @@ const RULED_NEIGHBOUR_CLEARANCE_BANDS: f64 = 16.0;
 /// the shell distance (see the fall-short reach in the carrier loop).
 const REACH_CLEARANCE: f64 = 0.25;
 
+/// What the pipeline assembles.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum Body {
+    /// A shell: the retained source faces, their offset skins and the walls
+    /// at the openings, bounding the material between source and offset.
+    Shell,
+    /// The offset body itself: the offset skins alone, closed by their
+    /// mutual sections; `opening_face_ids` are HELD faces, copied at
+    /// distance zero as walls, with no source face assembled and no skin
+    /// flipped. The whole-solid offset and the boolean fallback's offset
+    /// body are built this way.
+    Whole,
+}
+
+
+#[cfg(not(test))]
+fn forced_direct_refusal() -> Option<KernelRefusal> {
+    None
+}
+
 pub fn offset_shell(
     source: &BrepSolid,
     opening_face_ids: &[u64],
     distance: f64,
 ) -> Result<OffsetShellResultRecord, KernelRefusal> {
-    let result = offset_shell_any_lane(source, opening_face_ids, distance)?;
-    outward_shell_is_connected(source, distance, &result)?;
-    Ok(result)
+    let direct = match forced_direct_refusal() {
+        Some(forced) => Err(forced),
+        None => offset_body(source, opening_face_ids, distance, Body::Shell, "offset_shell"),
+    };
+    match direct {
+        Ok(result) => Ok(result),
+        // The boolean lane answers the direct construction's own named
+        // refusals; when it refuses too, the direct refusal is the one
+        // reported, because it names the cause.
+        Err(direct) if super::solid::direct_refusal_takes_the_boolean_lane(&direct) => {
+            os_debug!("direct pipeline refused ({direct}); taking the boolean lane");
+            match super::solid::offset_shell_by_boolean(source, opening_face_ids, distance) {
+                Ok(result) => Ok(result),
+                Err(boolean) => {
+                    os_debug!("boolean lane refused too ({boolean})");
+                    Err(direct)
+                }
+            }
+        }
+        Err(direct) => Err(direct),
+    }
+}
+
+/// The pipeline's one timed entry: `offset_shell` and `offset_solid` both run
+/// through it, so the `timing.*` split and the acceptance step are the same.
+pub(super) fn offset_body(
+    source: &BrepSolid,
+    opening_face_ids: &[u64],
+    distance: f64,
+    body: Body,
+    entry: &str,
+) -> Result<OffsetShellResultRecord, KernelRefusal> {
+    profile::reset();
+    let started = web_time::Instant::now();
+    let result = offset_shell_any_lane(source, opening_face_ids, distance, body).and_then(|result| {
+        let mut clock = web_time::Instant::now();
+        let connected = outward_shell_is_connected(source, distance, &result);
+        profile::lap(&mut clock, profile::ACCEPTANCE);
+        connected.map(|()| result)
+    });
+    profile::add(profile::TOTAL, started.elapsed());
+    profile::report(entry);
+    result
 }
 
 /// Every shell of an OUTWARD result must bound volume. The shell is the grown
@@ -155,12 +216,18 @@ fn offset_shell_any_lane(
     source: &BrepSolid,
     opening_face_ids: &[u64],
     distance: f64,
+    body: Body,
 ) -> Result<OffsetShellResultRecord, KernelRefusal> {
     // Pinched source faces are un-modellable by the arrangement until the
     // touch is a vertex; do it once here so BOTH `offset_shell_impl` attempts
     // and every carrier built from the source see the same topology.
     let prepared = split_self_touching_source(source)?;
     let source = prepared.as_ref().unwrap_or(source);
+    // The revolved-wedge lane answers a SHELL question (the material between
+    // a revolve and its grown image); the offset body takes the pipeline.
+    if body == Body::Whole {
+        return imprint_attempts(source, opening_face_ids, distance, body);
+    }
     // An outward shell of the one circular face of a partial revolve is planar
     // in the meridian half-plane, fold band and all: build it there and revolve
     // it once (`revolved_wedge.rs`). Anything else declines and takes the
@@ -179,7 +246,7 @@ fn offset_shell_any_lane(
             os_debug!("revolved wedge lane declined: could not read the source ({error})");
         }
     }
-    imprint_attempts(source, opening_face_ids, distance)
+    imprint_attempts(source, opening_face_ids, distance, body)
 }
 
 
@@ -187,6 +254,7 @@ fn imprint_attempts(
     source: &BrepSolid,
     opening_face_ids: &[u64],
     distance: f64,
+    body: Body,
 ) -> Result<OffsetShellResultRecord, KernelRefusal> {
     // First try with oblique hole-wall carriers extended past their opening
     // planes (the lane that closes tilted/conical through-holes). If that
@@ -204,6 +272,7 @@ fn imprint_attempts(
         source,
         opening_face_ids,
         distance,
+        body,
         true,
         &mut extension_fired,
         &mut reflex_rebuilds,
@@ -235,6 +304,7 @@ fn imprint_attempts(
                 source,
                 opening_face_ids,
                 distance,
+                body,
                 false,
                 &mut unused,
                 &mut retry_reflex,
@@ -337,6 +407,7 @@ fn offset_shell_impl(
     source: &BrepSolid,
     opening_face_ids: &[u64],
     distance: f64,
+    body: Body,
     extend_oblique_carriers: bool,
     extension_fired: &mut bool,
     reflex_rebuilds: &mut usize,
@@ -345,12 +416,14 @@ fn offset_shell_impl(
     omitted_supports: &mut HashSet<u64>,
     vacated_notes: &mut Vec<String>,
 ) -> Result<OffsetShellResultRecord, KernelRefusal> {
+    profile::attempt();
+    let mut clock = web_time::Instant::now();
     omitted_supports.clone_from(shadowed_supports);
     vacated_notes.clear();
     if !distance.is_finite() || distance.abs() <= MINIMUM_DISTANCE {
         return Err(KernelRefusal::input(KernelStage::Collect, "offset_shell_distance", "offset_shell: distance must be finite and non-zero"));
     }
-    if opening_face_ids.is_empty() {
+    if opening_face_ids.is_empty() && body == Body::Shell {
         return Err(KernelRefusal::input(KernelStage::Collect, "offset_shell_no_opening", "offset_shell: at least one opening face is required"));
     }
     let source_faces = source
@@ -381,7 +454,10 @@ fn offset_shell_impl(
 
     for face_id in &retained {
         let face = source_faces.iter().find(|face| face.id == *face_id).unwrap();
-        if offset_support_collapsed(face, distance)? {
+        profile::lap(&mut clock, profile::CARRIER_TRIM);
+        let collapsed = offset_support_collapsed(face, distance)?;
+        profile::lap(&mut clock, profile::CARRIER_REGULARITY);
+        if collapsed {
             os_debug!("omitting collapsed offset support for source face {face_id}");
             continue;
         }
@@ -490,7 +566,9 @@ fn offset_shell_impl(
         // support anyway: the refusal is the answer, because a carrier with an
         // inverted patch in it welds into a shell that validates and bounds the
         // wrong solid.
+        profile::lap(&mut clock, profile::CARRIER_TRIM);
         let carved = carve_folded_support(source, face, distance)?;
+        profile::lap(&mut clock, profile::CARRIER_REGULARITY);
         // A CUT RIM — the face's rim with a planar opening running across
         // its surface rather than along a v end — has the trim rebuilt over
         // the surface's full rectangle so the opening plane truncates the
@@ -524,7 +602,10 @@ fn offset_shell_impl(
             }
             (None, None) => source,
         };
-        let mut carrier = carrier_solid_sided(carrier_source, *face_id, distance, &extension)?;
+        profile::lap(&mut clock, profile::CARRIER_TRIM);
+        let (mut carrier, lane) = carrier_solid_sided_lane(carrier_source, *face_id, distance, &extension)?;
+        profile::carrier_built(lane, clock.elapsed());
+        clock = web_time::Instant::now();
         if (distance < 0.0 || reflex_extension.is_some()) && face.surface.is_affine().or_refuse(KernelStage::Sew, "is_affine")? {
             // PADDED planes: the pad slides the plane's net while the trim's
             // loops are cloned in uv, so an INTERIOR loop (a bore or boss rim
@@ -617,6 +698,7 @@ fn offset_shell_impl(
             kind: OffsetFaceRole::Offset,
         });
     }
+    profile::lap(&mut clock, profile::CARRIER_TRIM);
     // APEX-CAP carriers: a retained face whose DEGENERATE edge (an apex
     // point, e.g. a conic crater's tip) offsets into a RING is an EXTERIOR
     // cone offset — the parallel surface truncates at the ring and the exact
@@ -708,6 +790,7 @@ fn offset_shell_impl(
             }
         }
     }
+    profile::lap(&mut clock, profile::APEX_CAPS);
     // A fold the carve's probe did not see (`outward_fold_the_carve_missed`):
     // a band too thin for its grid is built whole, and the torus wedge grown by
     // 1.001 then held the reflected lemon beyond its axis. Asked of every
@@ -734,6 +817,7 @@ fn offset_shell_impl(
             }
         }
     }
+    profile::lap(&mut clock, profile::CARRIER_REGULARITY);
     // Wall carriers built as a RULED opening face extended along itself, by
     // carrier index: the in-front guard reads their sides off the surface
     // normal where it would read a plane's.
@@ -958,6 +1042,7 @@ fn offset_shell_impl(
     if carriers.len() >= SOURCE_OPERAND as usize {
         return Err(KernelRefusal::unsupported(KernelStage::Collect, "offset_shell_carrier_count", "offset_shell: too many carrier faces for current ABI"));
     }
+    profile::lap(&mut clock, profile::WALLS);
     // The characteristic length every tolerance below is derived from.  This
     // was `max ‖vertex‖` — the distance from the WORLD ORIGIN — until audit
     // slice 0: that form made every band widen as the part was moved away from
@@ -1013,6 +1098,7 @@ fn offset_shell_impl(
             oblique_extended.len(),
         );
     }
+    profile::lap(&mut clock, profile::EXTENSION);
     let tolerance = 1e-7f64.max(scale * 1e-9);
     let pair_tolerance = (scale * 1e-8).max(2e-6);
     let reach = distance.abs() * 4.0 + pair_tolerance;
@@ -1217,6 +1303,13 @@ fn offset_shell_impl(
                     // miss a shared junction when thickness crosses one of
                     // those branches.
                     maximum_ssi_step: Some((scale * 0.0005).max(tolerance * 100.0)),
+                    span_budget: None,
+                    hermite_sections: false,
+                    tangent_curve_lane: false,
+                    exact_iso_pcurves: false,
+                    march_starts: false,
+                    two_radius_junctions: false,
+                    tangent_curve_imprint: false,
                 },
             ) {
                 Ok(pair) => pair,
@@ -1251,7 +1344,7 @@ fn offset_shell_impl(
             );
         }
     }
-    if distance < 0.0 || !inward_extended_walls.is_empty() {
+    if body == Body::Shell && (distance < 0.0 || !inward_extended_walls.is_empty()) {
         // An extended opening-wall carrier (outward, or inward at a reflex
         // rim) no longer carries the source outline. OUTWARD it has the GROWN
         // outline. Its inner boundary — where the wall ring stops at the
@@ -1286,6 +1379,13 @@ fn offset_shell_impl(
                         local_fit: false,
                         fit_chunk_points: None,
                         maximum_ssi_step: Some((scale * 0.0005).max(tolerance * 100.0)),
+                        span_budget: None,
+                        hermite_sections: false,
+                        tangent_curve_lane: false,
+                        exact_iso_pcurves: false,
+                        march_starts: false,
+                        two_radius_junctions: false,
+                        tangent_curve_imprint: false,
                     },
                 ) {
                     Ok(pair) => pair,
@@ -1465,6 +1565,7 @@ fn offset_shell_impl(
             );
         }
     }
+    profile::lap(&mut clock, profile::IMPRINT);
     let mut split_carriers = Vec::new();
     let mut fragments_by_carrier = Vec::new();
     for (index, carrier) in carriers.iter().enumerate() {
@@ -1481,12 +1582,14 @@ fn offset_shell_impl(
         } else {
             apply_edge_splits(&carrier.solid, index as u8, &imprint)?
         };
+        let fragment_clock = web_time::Instant::now();
         let fragments = fragment_solid(&split, index as u8, &imprint)?;
         os_debug!(
-            "carrier[{index}] kind={:?} src={} fragments={}",
+            "carrier[{index}] kind={:?} src={} fragments={} ({:.3} ms)",
             carrier.kind,
             carrier.source_face_id,
             fragments.len(),
+            fragment_clock.elapsed().as_secs_f64() * 1e3,
         );
         if debug_enabled() {
             for (fragment_index, fragment) in fragments.iter().enumerate() {
@@ -1515,6 +1618,7 @@ fn offset_shell_impl(
         split_carriers.push(split);
         fragments_by_carrier.push(fragments);
     }
+    profile::lap(&mut clock, profile::FRAGMENT);
     let mut assembly_sources = [(SOURCE_OPERAND, source)]
         .into_iter()
         .collect::<HashMap<_, _>>();
@@ -2016,6 +2120,20 @@ fn offset_shell_impl(
                 region_skins = classified;
             }
             chosen_offsets.extend(region_skins);
+        } else if body == Body::Whole {
+            // A HELD face of the offset body: its carrier is the face at
+            // distance zero, cut by the neighbouring offset skins; the body
+            // keeps the region the face's own seed lies in, whole. There is
+            // no source rim to stop at and no void in front of it.
+            for (fragment_index, fragment) in fragments_by_carrier[index].iter().enumerate() {
+                if seeds.iter().any(|seed| {
+                    parameter_point_in_face(&fragment_as_trim(fragment), *seed, 1e-8)
+                        .is_ok_and(|class| class != PolygonClass::Outside)
+                }) {
+                    os_debug!("  held[{index}.{fragment_index}] kept: contains the face's seed");
+                    chosen_walls.push(fragment.clone());
+                }
+            }
         } else {
             // Keep arrangement order stable. Besides making the result
             // reproducible, this matches the reference kernel's Set insertion
@@ -2309,10 +2427,12 @@ fn offset_shell_impl(
         // What this pass sampled belongs to carriers the next pass may not
         // build.
         shadowed_points.clear();
+        profile::lap(&mut clock, profile::SELECT);
         return offset_shell_impl(
             source,
             opening_face_ids,
             distance,
+            body,
             extend_oblique_carriers,
             extension_fired,
             reflex_rebuilds,
@@ -2376,7 +2496,16 @@ fn offset_shell_impl(
     );
     let chosen_walls = manifold_walls;
 
-    let source_fragments = fragment_solid(source, SOURCE_OPERAND, &empty_imprint())?;
+    profile::lap(&mut clock, profile::SELECT);
+    let stage_clock = web_time::Instant::now();
+    // The offset BODY has no source face in it: it is the skins (and the held
+    // faces) alone, oriented as the source is, so nothing is flipped either.
+    let source_fragments = if body == Body::Whole {
+        Vec::new()
+    } else {
+        fragment_solid(source, SOURCE_OPERAND, &empty_imprint())?
+    };
+    os_debug!("stage: source fragments {:.3}s", stage_clock.elapsed().as_secs_f64());
     let mut selected = source_fragments
         .into_iter()
         .filter(|fragment| retained.contains(&fragment.source_face_id))
@@ -2393,7 +2522,7 @@ fn offset_shell_impl(
             flip_fragment(fragment)?;
         }
     }
-    if distance > 0.0 {
+    if distance > 0.0 && body == Body::Shell {
         for fragment in &mut chosen_offsets {
             flip_fragment(fragment)?;
         }
@@ -2422,7 +2551,9 @@ fn offset_shell_impl(
         &imprint,
         2e-3f64.max(scale * 5e-5),
     )?;
+    os_debug!("stage: assembled open fragments {:.3}s", stage_clock.elapsed().as_secs_f64());
     orient_open_solid_faces(&mut solid)?;
+    os_debug!("stage: oriented {:.3}s", stage_clock.elapsed().as_secs_f64());
     let connector_images = complete_sharp_offset_connectors(
         &mut solid,
         source,
@@ -2431,8 +2562,9 @@ fn offset_shell_impl(
         2e-3f64.max(scale * 5e-5),
     )?;
     os_debug!(
-        "sharp connector completion added {} faces",
-        connector_images.len()
+        "sharp connector completion added {} faces ({:.3}s)",
+        connector_images.len(),
+        stage_clock.elapsed().as_secs_f64()
     );
     if !connector_images.is_empty() {
         // Wall fragments were arranged before the sharp seam was closed, so
@@ -2570,6 +2702,7 @@ fn offset_shell_impl(
         coheres_face_normals(&mut solid)?;
     }
     let solid = solid;
+    profile::lap(&mut clock, profile::ASSEMBLY);
     face_images = solid
         .shells
         .iter()
@@ -2730,7 +2863,8 @@ fn offset_shell_impl(
             }
         }
     }
-    let solid = crate::accept_sound(solid, "offsetShell")?;
+    let solid = super::acceptance::accept_offset_result(solid)?;
+    profile::lap(&mut clock, profile::ACCEPTANCE);
     Ok(OffsetShellResultRecord { solid, face_images })
 }
 
@@ -2766,6 +2900,16 @@ pub fn offset_shell_with_diagnostics(
     let result = offset_shell(source, opening_face_ids, distance)?;
     fit_scope.close().report_into(&mut diagnostics);
     polyline_scope.close().report_into(&mut diagnostics);
+    // The phase split of the run that just finished (`profile.rs`), in the
+    // boolean's `timing.<phase>_ms` shape so one reader serves both.
+    let timings = profile::snapshot();
+    diagnostics.count_n("shell.attempts", timings.attempts);
+    for (phase, count) in &timings.carriers {
+        diagnostics.count_n(format!("shell.{phase}"), *count);
+    }
+    for (phase, ms) in &timings.ms {
+        diagnostics.measure_max(format!("timing.{phase}_ms"), *ms);
+    }
     diagnostics.count_n(
         "sew.output_faces",
         result

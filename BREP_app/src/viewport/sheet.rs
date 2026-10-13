@@ -49,14 +49,16 @@
 //! What a sheet object measures or cuts is picked from its DIALOG's reference
 //! rows, with the reference picker every dialog uses
 //! ([`EngineState::begin_ref_select_for_sheet`]). While that picker is up the
-//! shell draws this tile alone, every ANCHOR CANDIDATE of every placement is
+//! dialog stays in its pane with the field focused (the picks list there, and
+//! its button is Done), every ANCHOR CANDIDATE of every placement is
 //! marked on the paper and published as its own hit rect — a square on a
 //! projected corner, a dot on a point of an edge or a circle's centre — the
 //! anchors already picked drawn larger in the pick colour, and a click picks
 //! the nearest, preferring a corner over a point on an edge the way the 3D
 //! viewport prefers a vertex over an edge. A click there does nothing else: no
-//! form opens and nothing drags; the paper still pans and zooms. The picker's
-//! card, top right, lists the picks with Finish and Cancel; Escape cancels.
+//! form opens and nothing drags; the paper still pans and zooms. A list
+//! commits from the field's Done, a single field on its one pick; Escape
+//! cancels.
 //!
 //! A placed dimension's VALUE BOX is its handle: drag it to move the dimension
 //! line (one coalesced undo step per drag, the placement drag's rule), click it
@@ -377,7 +379,7 @@ impl SheetViewport {
 fn sheet_pick(state: &EngineState) -> Option<SheetPick> {
     state.ref_select_is_sheet().then(|| SheetPick {
         picked: state.ref_select_names(),
-        prompt: format!("picking {}  \u{00b7}  click anchors, then Finish  \u{00b7}  Escape cancels", state.ref_select_prompt()),
+        prompt: format!("picking {}  \u{00b7}  click anchors on the paper  \u{00b7}  Done on the field commits, Escape cancels", state.ref_select_prompt()),
     })
 }
 

@@ -3,19 +3,20 @@ use super::*;
 use super::types::{Chain, ChainSource};
 use super::sampling::{enforce_boundary_crossing_parity, refine_near_hints, sag_refine_chain, sample_chain, trimmed_curve};
 use super::loops::{build_loop, edge_for, interior_points, pcurve_for, point_in_polygon, vertex_point};
+use super::loop_split::{fragments_agree, loop_split_census, loop_split_face, loop_split_mode, LoopSplitMode};
 /// Imprint id-index shared across every face of one operand. Built ONCE in
 /// `fragment_solid`; without it each face rebuilt `pieces_by_id`/`vertex_by_id`
 /// over ALL pieces (O(F*(P + P*V))) and linear-scanned `by_face`. Lookup-only,
 /// so every face gets the identical pieces/points the scans returned.
-struct FragmentIndex<'a> {
-    by_face: HashMap<(u8, u64), &'a [u64]>,
-    pieces_by_id: HashMap<u64, &'a ImprintPieceRecord>,
-    vertex_points: HashMap<u64, Vec3>,
-    cosurface_pairs: HashSet<(FaceKey, FaceKey)>,
+pub(super) struct FragmentIndex<'a> {
+    pub(super) by_face: HashMap<(u8, u64), &'a [u64]>,
+    pub(super) pieces_by_id: HashMap<u64, &'a ImprintPieceRecord>,
+    pub(super) vertex_points: HashMap<u64, Vec3>,
+    pub(super) cosurface_pairs: HashSet<(FaceKey, FaceKey)>,
 }
 
 impl<'a> FragmentIndex<'a> {
-    fn build(imprint: &'a ImprintResultRecord) -> Self {
+    pub(super) fn build(imprint: &'a ImprintResultRecord) -> Self {
         let mut by_face: HashMap<(u8, u64), &'a [u64]> = HashMap::default();
         for entry in &imprint.by_face {
             // `.entry().or_insert` keeps the FIRST entry, matching the previous
@@ -51,7 +52,10 @@ pub fn fragment_face(
     imprint: &ImprintResultRecord,
 ) -> Result<Vec<FaceFragmentRecord>, KernelRefusal> {
     let index = FragmentIndex::build(imprint);
-    fragment_face_indexed(solid, operand, face, &index)
+    let mut profile = FragmentProfile::new();
+    let fragments = fragment_face_indexed(solid, operand, face, &index, &mut profile)?;
+    profile.report(operand);
+    Ok(fragments)
 }
 
 /// The winding the SOURCE face's own outer loop uses in its (u,v) chart:
@@ -253,6 +257,22 @@ fn fragment_face_indexed(
     operand: u8,
     face: &FaceRecord,
     index: &FragmentIndex,
+    profile: &mut FragmentProfile,
+) -> Result<Vec<FaceFragmentRecord>, KernelRefusal> {
+    let face_started = profile.enabled.then(Instant::now);
+    let mut lap_start = face_started;
+    let result = fragment_face_stages(solid, operand, face, index, profile, &mut lap_start);
+    profile.face_done(face.id, face_started);
+    result
+}
+
+fn fragment_face_stages(
+    solid: &BrepSolid,
+    operand: u8,
+    face: &FaceRecord,
+    index: &FragmentIndex,
+    profile: &mut FragmentProfile,
+    lap_start: &mut Option<Instant>,
 ) -> Result<Vec<FaceFragmentRecord>, KernelRefusal> {
     let face_key = FaceKey {
         operand,
@@ -284,7 +304,7 @@ fn fragment_face_indexed(
                     extra_test_points.push(face.surface.evaluate(candidate.x, candidate.y).or_refuse(KernelStage::Fragment, "evaluate")?);
                 }
             }
-            return Ok(vec![FaceFragmentRecord {
+            let untouched = vec![FaceFragmentRecord {
                 operand,
                 source_face_id: face.id,
                 surface: face.surface.clone(),
@@ -310,9 +330,65 @@ fn fragment_face_indexed(
                 test_point: face.surface.evaluate(uv.x, uv.y).or_refuse(KernelStage::Fragment, "evaluate")?,
                 test_uv: uv,
                 extra_test_points,
-            }]);
+            }];
+            profile.untouched += profile.lap(lap_start);
+            return Ok(untouched);
         }
     }
+    if !piece_ids.is_empty() {
+        profile.cut_faces += 1;
+    }
+    // LOOP SPLIT (`fragment/loop_split.rs`): a face whose pieces are simple is
+    // split loop by loop; `check` runs both paths and returns the
+    // arrangement's; `on` returns the split's where it applies.
+    let mode = loop_split_mode();
+    let mut split_result: Option<Result<Vec<FaceFragmentRecord>, super::loop_split::Decline>> = None;
+    if mode != LoopSplitMode::Off && !piece_ids.is_empty() {
+        let started = profile.enabled.then(Instant::now);
+        let outcome = loop_split_face(solid, operand, face, face_key, piece_ids, index)?;
+        if let Some(started) = started {
+            profile.loop_split += started.elapsed();
+        }
+        match &outcome {
+            Ok(_) => profile.loop_split_faces += 1,
+            Err(_) => profile.loop_split_declined += 1,
+        }
+        if mode == LoopSplitMode::On {
+            if let Ok(fragments) = outcome {
+                *lap_start = profile.enabled.then(Instant::now);
+                return Ok(fragments);
+            }
+        }
+        split_result = Some(outcome);
+        *lap_start = profile.enabled.then(Instant::now);
+    }
+    let arranged = fragment_face_arranged(solid, operand, face, face_key, piece_ids, index, profile, lap_start);
+    if let Some(split) = split_result {
+        let verdict = match (&split, &arranged) {
+            (Err(decline), _) => format!("declined {decline}"),
+            (Ok(_), Err(refusal)) => format!("MISMATCH split built {} fragments, arrangement refused: {refusal}", split.as_ref().map_or(0, Vec::len)),
+            (Ok(split), Ok(arranged)) => match fragments_agree(split, arranged) {
+                Ok(agreement) => agreement.to_string(),
+                Err(why) => format!("MISMATCH {why}"),
+            },
+        };
+        loop_split_census(|| format!("operand {operand} face {} pieces {} loops {} {verdict}", face.id, piece_ids.len(), face.loops.len()));
+    }
+    arranged
+}
+
+
+#[allow(clippy::too_many_arguments)]
+fn fragment_face_arranged(
+    solid: &BrepSolid,
+    operand: u8,
+    face: &FaceRecord,
+    face_key: FaceKey,
+    piece_ids: &[u64],
+    index: &FragmentIndex,
+    profile: &mut FragmentProfile,
+    lap_start: &mut Option<Instant>,
+) -> Result<Vec<FaceFragmentRecord>, KernelRefusal> {
 
     let u_domain = KnotVector::new(face.surface.knots_u.clone(), face.surface.degree_u).or_refuse(KernelStage::Fragment, "new")?.domain();
     let v_domain = KnotVector::new(face.surface.knots_v.clone(), face.surface.degree_v).or_refuse(KernelStage::Fragment, "new")?.domain();
@@ -513,6 +589,7 @@ fn fragment_face_indexed(
             point
         }
     };
+    profile.setup += profile.lap(lap_start);
     let pieces_by_id = &index.pieces_by_id;
     let mut cut_hints = Vec::new();
     let mut active_pieces = Vec::new();
@@ -674,7 +751,7 @@ fn fragment_face_indexed(
         Ok(())
     };
 
-    let _tc = web_time::Instant::now();
+    profile.hints += profile.lap(lap_start);
     // SEAM-IMAGE LOOPS: per-loop u-control-hulls, computed once for the
     // straddling-hole gate below (does any OTHER loop span the full closed-u
     // domain — the rectangle-with-seam outer that closes the strip walls).
@@ -941,6 +1018,7 @@ fn fragment_face_indexed(
         }
         (clamp_u, clamp_v)
     };
+    profile.boundary += profile.lap(lap_start);
     for piece_id in active_pieces {
         let piece = pieces_by_id[&piece_id];
         let pcurve = pcurve_for(piece, face_key)?.clone();
@@ -1399,6 +1477,7 @@ fn fragment_face_indexed(
     // spanning two legs, rather than retracing this one edge. A true retrace
     // (box duplicate, cap-rim chord) has endpoints AT the matched chain's ends
     // (gap ~0), so the veto never triggers for it. Hatch restores the old drop.
+    profile.cuts += profile.lap(lap_start);
     let corner_veto_enabled = std::env::var("BREP_DUP_DROP_CORNER_VETO")
         .map(|value| value != "0")
         .unwrap_or(true);
@@ -2058,7 +2137,9 @@ fn fragment_face_indexed(
             }
         }
     }
+    profile.dedup_bridge += profile.lap(lap_start);
     let regions = arrange_segments(&segments, arrangement_tolerance).or_refuse(KernelStage::Fragment, "arrange_segments")?;
+    profile.arrange += profile.lap(lap_start);
     // Orient every rebuilt loop the way the SOURCE face's own loops are
     // oriented, rather than assuming `same_sense` predicts it. The two agree on
     // every face whose chart is right-handed against its normal, so this is a
@@ -2082,7 +2163,9 @@ fn fragment_face_indexed(
     }
     let mut fragments = Vec::new();
     for region in regions {
+        let mut region_lap = profile.enabled.then(Instant::now);
         let arranged: Vec<Vec2> = interior_points(&region.outer, &region.holes, region.area, 3);
+        let interior_ms = profile.lap(&mut region_lap).as_secs_f64() * 1000.0;
         let candidates: Vec<Vec2> = arranged.iter().copied().map(wrap_back).collect();
         let Some(&test_uv) = candidates.first() else {
             if debug {
@@ -2131,6 +2214,7 @@ fn fragment_face_indexed(
                 region.area, test_uv.x, test_uv.y
             );
         }
+        let containment_ms = profile.lap(&mut region_lap).as_secs_f64() * 1000.0;
         let Some(outer_loop) = build_loop(
             &region.outer,
             reverse_loops,
@@ -2178,6 +2262,10 @@ fn fragment_face_indexed(
                 extra_test_points.push(face.surface.evaluate(candidate.x, candidate.y).or_refuse(KernelStage::Fragment, "evaluate")?);
             }
         }
+        if profile.enabled {
+            eprintln!("fragment.region face={} edges={} holes={} interior={interior_ms:.3} containment={containment_ms:.3} loops={:.3}",
+                face.id, region.outer.len(), region.holes.len(), profile.lap(&mut region_lap).as_secs_f64() * 1000.0);
+        }
         fragments.push(FaceFragmentRecord {
             operand,
             source_face_id: face.id,
@@ -2201,6 +2289,7 @@ fn fragment_face_indexed(
     // so pass the unchanged face through — we only need a valid interior test
     // point, found by gridding the ACTUAL knot domain. Gated on
     // `fragments.is_empty()`, this never touches a face the arrangement handled.
+    profile.regions += profile.lap(lap_start);
     if fragments.is_empty() && piece_ids.is_empty() {
         const GRID: usize = 12;
         let mut test_uv: Option<Vec2> = None;
@@ -2362,6 +2451,7 @@ fn fragment_face_indexed(
             });
         }
     }
+    profile.rescue += profile.lap(lap_start);
     Ok(fragments)
 }
 
@@ -2372,9 +2462,11 @@ pub fn fragment_solid(
 ) -> Result<Vec<FaceFragmentRecord>, KernelRefusal> {
     let index = FragmentIndex::build(imprint);
     let mut fragments = Vec::new();
+    let mut profile = FragmentProfile::new();
     for face in solid.shells.iter().flat_map(|shell| shell.faces.iter()) {
-        fragments.extend(fragment_face_indexed(solid, operand, face, &index)?);
+        fragments.extend(fragment_face_indexed(solid, operand, face, &index, &mut profile)?);
     }
+    profile.report(operand);
     Ok(fragments)
 }
 

@@ -44,6 +44,7 @@ pub(super) fn standalone_face(solid: &BrepSolid, face_id: u64) -> Result<BrepSol
             faces: vec![face],
         }],
         genus: 0,
+        kind: crate::BodyKind::Solid,
     })
 }
 
@@ -617,18 +618,34 @@ pub(super) fn carrier_solid_sided(
     distance: f64,
     extension: &crate::CarrierExtension,
 ) -> Result<BrepSolid, KernelRefusal> {
+    carrier_solid_sided_lane(source, face_id, distance, extension).map(|(solid, _)| solid)
+}
+
+/// [`carrier_solid_sided`], naming the lane the offset surface took, for the
+/// pipeline's per-lane carrier timing (`profile.rs`).
+pub(super) fn carrier_solid_sided_lane(
+    source: &BrepSolid,
+    face_id: u64,
+    distance: f64,
+    extension: &crate::CarrierExtension,
+) -> Result<(BrepSolid, crate::OffsetSurfaceLane), KernelRefusal> {
     let carrier = crate::offset_face_carrier_sided(source, face_id, distance, extension)?;
-    Ok(BrepSolid {
-        mass_properties_cache: Default::default(),
-        id: 1,
-        vertices: carrier.vertices,
-        edges: carrier.edges,
-        shells: vec![ShellRecord {
+    let lane = carrier.lane;
+    Ok((
+        BrepSolid {
+            mass_properties_cache: Default::default(),
             id: 1,
-            faces: vec![carrier.face],
-        }],
-        genus: 0,
-    })
+            vertices: carrier.vertices,
+            edges: carrier.edges,
+            shells: vec![ShellRecord {
+                id: 1,
+                faces: vec![carrier.face],
+            }],
+            genus: 0,
+            kind: crate::BodyKind::Solid,
+        },
+        lane,
+    ))
 }
 
 /// Keep only the outer (largest |UV area|) loop of a one-face wall carrier and
@@ -819,6 +836,7 @@ pub(super) fn empty_imprint() -> ImprintResultRecord {
         tangent_nodes: Vec::new(),
         section_evidence: false,
         cosurface_pairs: Vec::new(),
+        tangent_sections: Vec::new(),
     }
 }
 

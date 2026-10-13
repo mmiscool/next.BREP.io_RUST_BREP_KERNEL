@@ -41,7 +41,7 @@ pub const FIRST_PURPOSE: &str = "wiring";
 
 /// Datum / Plane / Sketch / Spline / Waypoint / Component.
 fn includes(feature: &FeatureInfo<'_>) -> bool {
-    matches!(feature.type_code, "S" | "D" | "P" | "SP" | "WP" | "ACOMP")
+    matches!(feature.type_code, "S" | "S3D" | "D" | "P" | "SP" | "WP" | "ACOMP")
 }
 
 /// Whether the part declares NO connection point yet — the one condition the

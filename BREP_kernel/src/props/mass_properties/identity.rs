@@ -171,6 +171,42 @@ fn hash_face(lane: &mut TwoLane, face: &FaceRecord) {
     }
 }
 
+/// The 128-bit content identity of one coedge's USE: the face's carrier, the
+/// pcurve, the edge's curve and domain and the coedge's sense — every input
+/// of a reading that compares the trim's image with the edge (the refit's
+/// detection miss, the challenger's old-trim tracking). Two uses with equal
+/// identities read the same number, bit for bit; `reading_memo.rs` keys on it.
+pub(crate) fn coedge_use_identity(
+    surface: &NurbsSurface,
+    pcurve: &NurbsCurve,
+    edge: &crate::topology::EdgeRecord,
+    forward: bool,
+) -> [u64; 2] {
+    let mut lane = TwoLane::new();
+    hash_surface(&mut lane, surface);
+    hash_curve(&mut lane, pcurve);
+    hash_curve(&mut lane, &edge.curve);
+    lane.f64(edge.t0);
+    lane.f64(edge.t1);
+    lane.bool(edge.degenerate);
+    lane.bool(forward);
+    lane.finish()
+}
+
+/// The 128-bit content identity of one face's volume contribution about
+/// `reference` under the sign reading's correction policy: everything
+/// `face_volume_contribution_about` reads (the face as `hash_face` walks it,
+/// the reference point's bits). `reading_memo.rs` keys the boolean's
+/// assembly sign check on it.
+pub(crate) fn face_contribution_identity(face: &FaceRecord, reference: crate::Vec3) -> [u64; 2] {
+    let mut lane = TwoLane::new();
+    hash_face(&mut lane, face);
+    lane.f64(reference.x);
+    lane.f64(reference.y);
+    lane.f64(reference.z);
+    lane.finish()
+}
+
 /// Hash exactly what the integrator reads, in the order it reads it.
 pub fn face_set_identity(solid: &BrepSolid) -> FaceSetIdentity {
     let mut lane = TwoLane::new();

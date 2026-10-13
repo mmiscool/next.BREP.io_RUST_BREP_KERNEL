@@ -1,4 +1,4 @@
-//! Review, change orders and the inbox (plm-cad-integration-todo §3 S4).
+//! Review and the inbox (plm-cad-integration-todo §3 S4).
 //!
 //! What a PLM's review process looks like from the CAD app:
 //!
@@ -8,17 +8,10 @@
 //!   with no live round offers **Submit for review** with extra reviewers, a
 //!   due date and a note. A reviewer who may decide gets **Approve** and
 //!   **Reject** with a comment. Anyone who may comment can.
-//! * **A change order** ([`Subject::ChangeOrder`]): its items (each revision it
-//!   releases or obsoletes, and what would stop it), its problems, its review,
-//!   its comments, and **Release** through the order. With the server's
-//!   `eco_holds_revisions` on, a revision an open order names releases only
-//!   this way: the lifecycle panel's refused Release offers the order, found
-//!   through the revision view's `eco` (the refusal's sentence names only its
-//!   number), and emits [`PlmReviewEvent::OpenChangeOrder`].
 //! * **The inbox badge** ([`InboxBadge`]): `GET /api/inbox`'s `count`, asked
 //!   again every [`INBOX_POLL_SECS`], beside the PLM connection indicator. It
 //!   opens a list of what waits on the user and what they submitted; a row
-//!   opens its review or its change order.
+//!   opens its review round.
 //! * **A save during review warns** ([`save_warning`], D8) and saves.
 //!
 //! Every refusal is shown in the server's own words, as every PLM refusal is:
@@ -44,8 +37,8 @@ pub const INBOX_POLL_SECS: f64 = 60.0;
 
 // --- the wire ------------------------------------------------------------------
 //
-// These mirror the server's answers (`BREP_plm/src/review.rs` and `eco.rs`,
-// through `api/review.rs` and `api/eco.rs`) and are pinned against the REAL
+// These mirror the server's answers (`BREP_plm/src/review.rs`,
+// through `api/review.rs`) and are pinned against the REAL
 // router by the golden tests below. Every field the app does not need is left
 // out; every field it reads defaults, so a server adding one breaks nothing.
 
@@ -79,14 +72,10 @@ pub struct Decision {
     pub comment: String,
     #[serde(default)]
     pub at: u64,
-    /// The document's content hash the decision was made on; `None` when it
-    /// was recorded before decisions carried one.
-    #[serde(default)]
-    pub content_hash: Option<String>,
-    /// `Some(false)`: made on an older version of the document (D8: an
-    /// approval goes stale when the document changes).
-    #[serde(default)]
-    pub current: Option<bool>,
+    /// The document hash the reviewer decided on.
+    pub content_hash: String,
+    /// Whether the decision applies to the current document.
+    pub current: bool,
 }
 
 /// A review round, as the server's `ReviewView` describes it to the person
@@ -131,7 +120,7 @@ pub struct Round {
     pub live: bool,
 }
 
-/// A comment on a revision or a change order.
+/// A comment on a revision.
 #[derive(Clone, Debug, Default, PartialEq, serde::Deserialize)]
 pub struct Comment {
     #[serde(default)]
@@ -190,13 +179,13 @@ pub struct InboxItem {
     /// `revision` or `eco`.
     #[serde(default)]
     pub kind: String,
-    /// A part id, or a change order's id.
+    /// The part id.
     #[serde(default)]
     pub target: String,
-    /// A revision's id; empty for a change order.
+    /// The revision id.
     #[serde(default)]
     pub revision_id: String,
-    /// `CPART000000001 rev B`, or a change order's number.
+    /// `CPART000000001 rev B`.
     #[serde(default)]
     pub title: String,
     #[serde(default)]
@@ -218,7 +207,6 @@ impl InboxItem {
     pub fn event(&self) -> Option<PlmReviewEvent> {
         match self.kind.as_str() {
             "revision" => Some(PlmReviewEvent::OpenReview { part: self.target.clone(), revision: self.revision_id.clone() }),
-            "eco" => Some(PlmReviewEvent::OpenChangeOrder { eco: self.target.clone() }),
             _ => None,
         }
     }
@@ -248,68 +236,6 @@ pub struct Inbox {
     /// `waiting_on_me.len()`: the badge.
     #[serde(default)]
     pub count: usize,
-}
-
-/// One revision a change order releases or obsoletes.
-#[derive(Clone, Debug, Default, PartialEq, serde::Deserialize)]
-pub struct ChangeOrderItem {
-    #[serde(default)]
-    pub part_id: String,
-    #[serde(default)]
-    pub number: String,
-    #[serde(default)]
-    pub name: String,
-    #[serde(default)]
-    pub revision_id: String,
-    #[serde(default)]
-    pub label: String,
-    #[serde(default)]
-    pub lifecycle: String,
-    /// `release` or `obsolete`.
-    #[serde(default)]
-    pub action: String,
-    #[serde(default)]
-    pub note: String,
-    /// Why it could not be applied now; empty when nothing stops it.
-    #[serde(default)]
-    pub problem: String,
-}
-
-/// `GET /api/ecos/:id`.
-#[derive(Clone, Debug, Default, PartialEq, serde::Deserialize)]
-pub struct ChangeOrder {
-    #[serde(default)]
-    pub id: String,
-    #[serde(default)]
-    pub number: String,
-    #[serde(default)]
-    pub title: String,
-    /// `draft`, `open`, `inreview`, `approved`, `released`, `cancelled`, …
-    #[serde(default)]
-    pub state: String,
-    #[serde(default)]
-    pub priority: String,
-    #[serde(default)]
-    pub description: String,
-    #[serde(default)]
-    pub reason: String,
-    #[serde(default)]
-    pub items: Vec<ChangeOrderItem>,
-    #[serde(default)]
-    pub current: Option<Round>,
-    #[serde(default)]
-    pub history: Vec<Round>,
-    #[serde(default)]
-    pub comments: Vec<Comment>,
-    /// Every problem that would stop the release now.
-    #[serde(default)]
-    pub problems: Vec<String>,
-    #[serde(default)]
-    pub can_edit: bool,
-    #[serde(default)]
-    pub can_release: bool,
-    #[serde(default)]
-    pub can_comment: bool,
 }
 
 /// What every mutating review route answers: `{ ok, seq, warnings }`. A
@@ -408,8 +334,7 @@ impl Verdict {
 pub enum PlmReviewEvent {
     /// Open the review of a revision.
     OpenReview { part: String, revision: String },
-    /// Open a change order, by its id.
-    OpenChangeOrder { eco: String },
+
 }
 
 impl PlmReviewEvent {
@@ -421,7 +346,6 @@ impl PlmReviewEvent {
         use crate::panels::plm::PanelEvent;
         match event {
             PanelEvent::OpenReview { part, revision } => Some(Self::OpenReview { part: part.clone(), revision: revision.clone() }),
-            PanelEvent::OpenChangeOrder { eco } => Some(Self::OpenChangeOrder { eco: eco.clone() }),
             PanelEvent::Access(_) | PanelEvent::Open(_) => None,
         }
     }
@@ -455,11 +379,7 @@ pub trait PlmReview {
     fn decide(&self, part: &str, revision: &str, verdict: Verdict, comment: &str) -> PlmFuture<Done>;
     fn comment(&self, part: &str, revision: &str, body: &str) -> PlmFuture<Done>;
     fn inbox(&self) -> PlmFuture<Inbox>;
-    fn change_order(&self, eco: &str) -> PlmFuture<ChangeOrder>;
-    fn submit_change_order(&self, eco: &str, note: &str) -> PlmFuture<Done>;
-    fn decide_change_order(&self, eco: &str, verdict: Verdict, comment: &str) -> PlmFuture<Done>;
-    fn comment_change_order(&self, eco: &str, body: &str) -> PlmFuture<Done>;
-    fn release_change_order(&self, eco: &str) -> PlmFuture<Done>;
+
 }
 
 /// [`PlmReview`] over S1's client.
@@ -513,22 +433,7 @@ impl PlmReview for PlmReviewClient {
     fn inbox(&self) -> PlmFuture<Inbox> {
         self.json("GET", "/api/inbox".into(), None)
     }
-    fn change_order(&self, eco: &str) -> PlmFuture<ChangeOrder> {
-        self.json("GET", format!("/api/ecos/{}", segment(eco)), None)
-    }
-    fn submit_change_order(&self, eco: &str, note: &str) -> PlmFuture<Done> {
-        self.json("POST", format!("/api/ecos/{}/submit", segment(eco)), Some(serde_json::json!({ "note": note })))
-    }
-    fn decide_change_order(&self, eco: &str, verdict: Verdict, comment: &str) -> PlmFuture<Done> {
-        let body = serde_json::json!({ "verdict": verdict.as_str(), "comment": comment });
-        self.json("POST", format!("/api/ecos/{}/review/decision", segment(eco)), Some(body))
-    }
-    fn comment_change_order(&self, eco: &str, body: &str) -> PlmFuture<Done> {
-        self.json("POST", format!("/api/ecos/{}/comments", segment(eco)), Some(serde_json::json!({ "body": body })))
-    }
-    fn release_change_order(&self, eco: &str) -> PlmFuture<Done> {
-        self.json("POST", format!("/api/ecos/{}/release", segment(eco)), Some(serde_json::json!({})))
-    }
+
 }
 
 /// A path segment, percent-encoded outside the unreserved set.
@@ -582,7 +487,7 @@ pub fn describe_round(round: &Round) -> String {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Subject {
     Revision { part: String, revision: String },
-    ChangeOrder { eco: String },
+
 }
 
 impl Subject {
@@ -590,7 +495,6 @@ impl Subject {
     pub fn of(event: &PlmReviewEvent) -> Self {
         match event {
             PlmReviewEvent::OpenReview { part, revision } => Subject::Revision { part: part.clone(), revision: revision.clone() },
-            PlmReviewEvent::OpenChangeOrder { eco } => Subject::ChangeOrder { eco: eco.clone() },
         }
     }
 }
@@ -599,7 +503,7 @@ impl Subject {
 #[derive(Clone, Debug, PartialEq)]
 pub enum Loaded {
     Revision(RevisionReview),
-    ChangeOrder(ChangeOrder),
+
 }
 
 /// The last thing an action said: a refusal in the server's words, or what a
@@ -610,7 +514,7 @@ pub enum Message {
     Done(String),
 }
 
-/// A revision's review, or a change order, with what the user may do to it.
+/// A revision's review and the actions available to the user.
 pub struct ReviewPanel {
     pub subject: Subject,
     loaded: Option<Loaded>,
@@ -691,10 +595,7 @@ impl ReviewPanel {
                 let request = server.review(part, revision);
                 Box::pin(async move { request.await.map(Loaded::Revision) })
             }
-            Subject::ChangeOrder { eco } => {
-                let request = server.change_order(eco);
-                Box::pin(async move { request.await.map(Loaded::ChangeOrder) })
-            }
+
         };
         self.load = Some(Pending::new(future));
     }
@@ -741,17 +642,14 @@ impl ReviewPanel {
 
     // --- the actions, which the UI and a script both reach ----------------------
 
-    /// Submit the revision (from the form), or the change order (with the note).
+    /// Submit the revision from the form.
     pub fn submit(&mut self, server: &dyn PlmReview, now: u64) {
         match self.subject.clone() {
             Subject::Revision { part, revision } => match SubmitRequest::from_form(&self.reviewers, &self.due_days, &self.note, now) {
                 Ok(request) => self.act(server.submit(&part, &revision, &request)),
                 Err(problem) => self.message = Some(Message::Refused(problem)),
             },
-            Subject::ChangeOrder { eco } => {
-                let note = self.note.trim().to_string();
-                self.act(server.submit_change_order(&eco, &note));
-            }
+
         }
     }
 
@@ -759,7 +657,7 @@ impl ReviewPanel {
         let comment = self.decision_comment.trim().to_string();
         match self.subject.clone() {
             Subject::Revision { part, revision } => self.act(server.decide(&part, &revision, verdict, &comment)),
-            Subject::ChangeOrder { eco } => self.act(server.decide_change_order(&eco, verdict, &comment)),
+
         }
     }
 
@@ -770,14 +668,7 @@ impl ReviewPanel {
         }
         match self.subject.clone() {
             Subject::Revision { part, revision } => self.act(server.comment(&part, &revision, &body)),
-            Subject::ChangeOrder { eco } => self.act(server.comment_change_order(&eco, &body)),
-        }
-    }
 
-    /// Release a change order: every item it names, together.
-    pub fn release_change_order(&mut self, server: &dyn PlmReview) {
-        if let Subject::ChangeOrder { eco } = self.subject.clone() {
-            self.act(server.release_change_order(&eco));
         }
     }
 
@@ -841,48 +732,7 @@ impl ReviewPanel {
                 self.show_history(ui, &review.history);
                 self.show_comments(ui, server, &review.comments, review.can_comment);
             }
-            Loaded::ChangeOrder(order) => {
-                ui.heading(format!("{} — {} ({})", order.number, order.title, order.state));
-                if !order.description.is_empty() {
-                    ui.label(&order.description);
-                }
-                for item in &order.items {
-                    let mut text = format!("{} rev {} — {} ({})", item.number, item.label, item.action, item.lifecycle);
-                    if !item.problem.is_empty() {
-                        text.push_str(&format!(" — {}", item.problem));
-                    }
-                    let row = ui.selectable_label(false, text);
-                    self.hits.insert(format!("eco:item:{}", crate::plm::identity::document_key(&item.part_id, &item.revision_id)), row.rect);
-                    if row.double_clicked() {
-                        events.push(PlmReviewEvent::OpenReview { part: item.part_id.clone(), revision: item.revision_id.clone() });
-                    }
-                }
-                for problem in &order.problems {
-                    ui.colored_label(ui.visuals().warn_fg_color, problem);
-                }
-                self.show_round(ui, server, order.current.as_ref());
-                let live = order.current.as_ref().is_some_and(|r| r.live);
-                ui.horizontal(|ui| {
-                    if !live && order.can_edit && matches!(order.state.as_str(), "draft" | "open") {
-                        let note = ui.add(egui::TextEdit::singleline(&mut self.note).hint_text("Note for the reviewers"));
-                        self.hits.insert("eco:note".into(), note.rect);
-                        let submit = ui.button("Submit for review");
-                        self.hits.insert("eco:submit".into(), submit.rect);
-                        if submit.clicked() {
-                            self.submit(server, now);
-                        }
-                    }
-                    if order.can_release {
-                        let release = ui.button(format!("Release through {}", order.number));
-                        self.hits.insert("eco:release".into(), release.rect);
-                        if release.clicked() {
-                            self.release_change_order(server);
-                        }
-                    }
-                });
-                self.show_history(ui, &order.history);
-                self.show_comments(ui, server, &order.comments, order.can_comment);
-            }
+
         }
         events
     }
@@ -903,7 +753,7 @@ impl ReviewPanel {
         }
         for decision in &round.decisions {
             let mut line = format!("  {} {} on {}", decision.name, decision.verdict, date(decision.at));
-            if decision.current == Some(false) {
+            if !decision.current {
                 line.push_str(" (on an older version)");
             }
             if !decision.comment.is_empty() {
@@ -983,8 +833,8 @@ impl ReviewPanel {
 // --- the section in the PLM pane -------------------------------------------------
 
 /// This panel's section of the PLM pane (`panels::plm_host`, S3): the one
-/// review or change order open now. The lifecycle panel's Submit for review,
-/// Review… and Open change order, an inbox row, and a change order's item all
+/// review open now. The lifecycle panel's Submit for review,
+/// Review… and an inbox row all
 /// open it through [`Self::open`].
 #[derive(Default)]
 pub struct ReviewSection {
@@ -1045,7 +895,7 @@ impl ReviewSection {
         let Some(panel) = &self.panel else { return serde_json::Value::Null };
         let subject = match &panel.subject {
             Subject::Revision { part, revision } => serde_json::json!({ "kind": "revision", "part": part, "revision": revision }),
-            Subject::ChangeOrder { eco } => serde_json::json!({ "kind": "eco", "eco": eco }),
+
         };
         let round = |r: &Round| serde_json::json!({
             "status": r.status, "approvals": r.approvals, "stale": r.stale_approvals, "required": r.required_approvals,
@@ -1053,7 +903,6 @@ impl ReviewSection {
         });
         let (lifecycle, current, comments) = match panel.loaded() {
             Some(Loaded::Revision(v)) => (Some(v.lifecycle.clone()), v.current.as_ref().map(round), v.comments.len()),
-            Some(Loaded::ChangeOrder(o)) => (Some(o.state.clone()), o.current.as_ref().map(round), o.comments.len()),
             None => (None, None, 0),
         };
         let message = match panel.message() {
@@ -1070,7 +919,7 @@ impl ReviewSection {
         self.panel.as_mut().is_some_and(ReviewPanel::take_acted)
     }
 
-    /// Draw the open pane, if any. An event it raises (a change order's item)
+    /// Draw the open pane, if any. An event it raises
     /// opens here too.
     pub fn ui(&mut self, ui: &mut egui::Ui, server: &dyn PlmReview) {
         self.hits.clear();

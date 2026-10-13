@@ -293,10 +293,53 @@ impl BlendSelection {
 ///
 /// The result is the same solid `fillet_edges` would build; the difference is
 /// that an incomplete selection comes back as `Ok` with the misses named,
-/// which is the explicit partial-result contract.  Every named refusal that
+/// which is the explicit partial-result contract. Every named refusal that
 /// applies to the WHOLE selection — mixed concavity, a radius the local wall
 /// cannot hold, a mixed-convexity corner — is still an `Err`: dropping edges
 /// cannot rescue those, so a partial answer would be a different defect.
+/// [`fillet_edges_reported`] with the solid and the edge points translated by
+/// `offset` for the operation and the result translated back. Refusal
+/// messages name the translated coordinates.
+pub fn fillet_edges_reported_at_offset(
+    solid: &BrepSolid,
+    edge_points: &[Vec3],
+    edge_names: Option<&[String]>,
+    radius: f64,
+    chamfer: bool,
+    name: Option<&str>,
+    offset: Vec3,
+) -> Result<(BrepSolid, BlendSelection), KernelRefusal> {
+    fillet_translated(solid, edge_points, edge_names, radius, chamfer, name, offset, crate::recentre::EntryKind::Control)
+}
+
+/// The translated run behind the control and the guard.
+#[allow(clippy::too_many_arguments)]
+fn fillet_translated(
+    solid: &BrepSolid,
+    edge_points: &[Vec3],
+    edge_names: Option<&[String]>,
+    radius: f64,
+    chamfer: bool,
+    name: Option<&str>,
+    offset: Vec3,
+    kind: crate::recentre::EntryKind,
+) -> Result<(BrepSolid, BlendSelection), KernelRefusal> {
+    let _entry = crate::recentre::TranslatedEntry::open(kind);
+    let translate = |solid: &BrepSolid, offset: Vec3| {
+        crate::recentre::translate_solid(solid, offset).map_err(|message| {
+            KernelRefusal::internal(
+                KernelStage::Collect,
+                "translation_control",
+                format!("fillet_edges: the translation control could not move the solid: {message}"),
+            )
+        })
+    };
+    let moved = translate(solid, offset)?;
+    let points: Vec<Vec3> = edge_points.iter().map(|point| point.add(offset)).collect();
+    let (result, selection) = fillet_edges_reported(&moved, &points, edge_names, radius, chamfer, name)?;
+    Ok((translate(&result, offset.scale(-1.0))?, selection))
+}
+
 pub fn fillet_edges_reported(
     solid: &BrepSolid,
     edge_points: &[Vec3],
@@ -305,9 +348,24 @@ pub fn fillet_edges_reported(
     chamfer: bool,
     name: Option<&str>,
 ) -> Result<(BrepSolid, BlendSelection), KernelRefusal> {
+    // The translation control (`BREP_TRANSLATION_CONTROL`, `brep/recentre.rs`):
+    // the outermost entry runs the fillet on a translated solid.
+    if let Some(offset) = crate::recentre::control_offset_at_entry() {
+        return fillet_edges_reported_at_offset(solid, edge_points, edge_names, radius, chamfer, name, offset);
+    }
+    // The recentre guard: a solid far from the origin in its own units
+    // is filleted at the origin.
+    let bounds = crate::recentre::solid_bounds(solid);
+    if let Some(offset) = crate::recentre::guard_offset(bounds) {
+        crate::recentre::profile_fired("fillet", offset, bounds);
+        return fillet_translated(solid, edge_points, edge_names, radius, chamfer, name, offset, crate::recentre::EntryKind::Guard);
+    }
     // One blend operation: the reports of an earlier one, never consumed, are
     // dropped as it starts (nested calls keep this operation's).
     let _operation = crate::blend::BlendOperation::enter();
+    // Dropped before `_operation`, so the total is on the ledger when the
+    // outermost operation prints it.
+    let _total = crate::blend::BlendTimer::start("timing.total_ms");
     if !(radius > 0.0) || !radius.is_finite() {
         return Err(KernelRefusal::input(
             KernelStage::Collect,
@@ -331,12 +389,14 @@ pub fn fillet_edges_reported(
     // this runs before the subset search rather than inside it.
     let entry = if chamfer { "chamfer_edges" } else { "fillet_edges" };
     let mut selected_ids = Vec::with_capacity(edge_points.len());
+    let selection_checks = crate::blend::BlendTimer::start("timing.selection_checks_ms");
     for point in edge_points {
         let edge_id = resolve_edge_by_point(solid, *point)?;
         check_mixed_concavity(solid, edge_id, entry)?;
         check_support_extent(solid, edge_id, radius, entry)?;
         selected_ids.push(edge_id);
     }
+    selection_checks.stop();
     // A corner where the selection mixes convexity — a convex edge dying into
     // the concave edges it meets — has no rolling-ball closure at all: the
     // blends run out against each other partway along, which is the vertex
@@ -380,13 +440,21 @@ pub fn fillet_edges_reported(
         // first, then one wall per spine from pole to pole (`blend/runout.rs`,
         // the 2026-09-30 record §5) — and refused by name, with the
         // composition's own reason appended, where it does not.
-        let corners = crate::blend::mixed_convexity_corners(solid, &selected_ids, radius);
+        let corner_analysis = crate::blend::BlendTimer::start("timing.corner_analysis_ms");
+        let mut corners = crate::blend::mixed_convexity_corners(solid, &selected_ids, radius);
+        corners.extend(crate::blend::runout::one_ended_runout_corners(solid, &selected_ids, radius));
+        corner_analysis.stop();
         if !corners.is_empty() {
             let composed = rounded_boss_composition(
                 solid, &selected_ids, edge_points, edge_names, radius, name, &corners,
-            ).or_else(|_| runout_composition(
-                solid, &selected_ids, edge_points, edge_names, radius, name, &corners, entry,
-            ));
+            ).or_else(|error| {
+                if std::env::var("BREP_DEBUG_NETWORK").is_ok() {
+                    eprintln!("rounded boss composition refused: {error}");
+                }
+                runout_composition(
+                    solid, &selected_ids, edge_points, edge_names, radius, name, &corners, entry,
+                )
+            });
             match composed {
                 Ok(result) => {
                     let missing = walls_missing(
@@ -423,6 +491,7 @@ pub fn fillet_edges_reported(
         // the network to build and nothing the cutter or the subset search
         // can rescue (the search answered the r = 10 cube with nine walls and
         // a 5174 volume against the sphere's 4189).  Terminal, by name, here.
+        let corner_analysis = crate::blend::BlendTimer::start("timing.corner_analysis_ms");
         check_degenerate_corner_setbacks(
             solid,
             &selected_ids,
@@ -431,6 +500,7 @@ pub fn fillet_edges_reported(
             radius,
             name,
         )?;
+        corner_analysis.stop();
     }
 
     let n = edge_points.len();
@@ -584,12 +654,17 @@ pub(super) fn walls_missing(
     if selected.is_empty() {
         return Ok(Vec::new());
     }
+    let _timing = crate::blend::BlendTimer::start("timing.walls_missing_ms");
+    crate::classification::classify_profile_begin();
+    crate::classification::containment_profile_begin();
     let band = crate::KernelTolerances::for_solid(result, 1e-7).model;
     // `classify` reads `On` within ten times its band; attribution needs the
     // move to clear that by the same margin again.
     let visible = band * 100.0;
+    let build_timing = crate::blend::BlendTimer::start("timing.walls_missing.classifier_ms");
     let classifier = SolidClassifier::new(result, band)
         .or_refuse(KernelStage::Validate, "wall_classifier")?;
+    build_timing.stop();
     const STATIONS: usize = 9;
     let mut missing = Vec::new();
     for &index in selected {
@@ -652,16 +727,239 @@ pub(super) fn walls_missing(
                 ),
             ));
         }
-        if classifier
-            .classify(station)
-            .or_refuse(KernelStage::Validate, "wall_classify")?
-            .class
-            == PointClass::On
-        {
+        let classify_timing = crate::blend::BlendTimer::start("timing.walls_missing.classify_ms");
+        // The question is On or not On, never In against Out: a station the
+        // certificate below puts farther than `visible` from every face of
+        // the result cannot read On by the classifier's band pass (a foot on
+        // a carrier within ten bands) nor by its ray pass (a hit within ten
+        // bands), so it is not asked. Anything the certificate declines is
+        // classified as before.
+        let certified = station_clear_of_skin(result, station, band * 10.0, visible);
+        let on = if certified {
+            crate::blend::record_count("count.walls_missing.certified", 1);
+            false
+        } else {
+            crate::blend::record_count("count.walls_missing.classified", 1);
+            classifier.classify(station).or_refuse(KernelStage::Validate, "wall_classify")?.class == PointClass::On
+        };
+        classify_timing.stop();
+        if on {
             missing.push(index);
         }
     }
+    crate::classification::classify_profile_report("blend.walls_missing");
+    crate::classification::containment_profile_report("blend.walls_missing");
     Ok(missing)
+}
+
+
+/// Is `station` certainly farther than `margin` from every face of `result`,
+/// trims included, read without a classifier query? `true` only when every
+/// face is certified by one of three readings, each a lower bound on the
+/// distance from the station to that face's trimmed carrier:
+///
+/// - its control-point box, widened by `on_band`, does not hold the station
+///   (the carrier lies in the hull of positively weighted control points);
+/// - its carrier is a recognised revolution (`NurbsSurface::analytic`,
+///   matched to 1e-9 relative): a sphere or torus farther than `margin` in
+///   closed form; a cone, cylinder or straight-generatrix partial sweep
+///   whose PATCH is farther than `margin` by the larger of three lower
+///   bounds, the meridian distance to the generatrix line, the axial
+///   clearance from the generatrix's slab and the clearance from the
+///   sweep's wedge (a station on one box edge lies ON the infinite cylinder
+///   of each neighbouring wall, a radius from its centre line, and is a
+///   radius short of its slab);
+/// - its carrier is a recognised plane, the station's foot on it is
+///   `Outside` the trims (`parameter_point_in_face`, the kernel's own lane
+///   at the band the classifier would use), every loop pcurve is a straight
+///   two-point unit-weight chord (so its image under the affine chart is a
+///   straight 3-D segment, and the trim polygon is exact), and the station
+///   is farther than `margin` from every chord's segment: a foot outside the
+///   region is nearer to the region's boundary than to any of its points.
+///
+/// Any face none of the three reads (an unrecognised carrier, a plane the
+/// station lies on whose trims are curved, a foot inside or on the trims)
+/// declines the whole station to the classifier. The recogniser's 1e-9
+/// relative bar sits four orders below the `margin` the caller passes
+/// (a hundred model bands), which is what absorbs it.
+fn station_clear_of_skin(result: &BrepSolid, station: Vec3, on_band: f64, margin: f64) -> bool {
+    use crate::AnalyticSurface;
+    // The station in a revolution frame: (ρ, h) in the meridian plane and
+    // its azimuth θ in [0, 2π) from the frame's x axis.
+    let meridian = |frame: &crate::RevolutionFrame| -> (f64, f64, f64) {
+        let offset = station.sub(frame.origin);
+        let axial = offset.dot(frame.axis);
+        let radial = offset.sub(frame.axis.scale(axial));
+        let mut azimuth = radial.dot(frame.y_axis).atan2(radial.dot(frame.x_axis));
+        if azimuth < 0.0 {
+            azimuth += std::f64::consts::TAU;
+        }
+        (radial.length(), axial, azimuth)
+    };
+    // A patch of a revolution lies inside the axial slab of its generatrix
+    // and inside the wedge of its sweep, so the station's clearance from
+    // either is a lower bound on its distance to the patch.
+    let axial_clearance = |axial: f64, h0: f64, h1: f64| (h0.min(h1) - axial).max(axial - h0.max(h1)).max(0.0);
+    let wedge_clearance = |radial: f64, azimuth: f64, sweep: f64| -> f64 {
+        if sweep >= std::f64::consts::TAU || azimuth <= sweep {
+            return 0.0;
+        }
+        // Outside the sweep: the angle to the nearer bounding meridian.
+        let turn = (azimuth - sweep).min(std::f64::consts::TAU - azimuth);
+        if turn >= std::f64::consts::FRAC_PI_2 { radial } else { radial * turn.sin() }
+    };
+    // Distance in the meridian plane from (ρ, h) to the LINE through two
+    // generatrix points: a lower bound for a cone or cylinder's carrier.
+    let line_distance = |radial: f64, axial: f64, (rho0, h0): (f64, f64), (rho1, h1): (f64, f64)| -> Option<f64> {
+        let (du, dv) = (rho1 - rho0, h1 - h0);
+        let length = (du * du + dv * dv).sqrt();
+        (length > 0.0).then(|| ((radial - rho0) * dv - (axial - h0) * du).abs() / length)
+    };
+    let clear = |distance: f64| distance.is_finite() && distance > margin;
+    for face in result.shells.iter().flat_map(|shell| &shell.faces) {
+        let Ok(controls) = crate::Aabb::from_surface_controls(&face.surface) else { return false };
+        if !controls.expanded(on_band).contains(station) {
+            continue;
+        }
+        let certified = match face.surface.analytic() {
+            Some(AnalyticSurface::RuledRevolution { frame, rho0, rho1, height }) => {
+                let (radial, axial, _) = meridian(frame);
+                let Some(line) = line_distance(radial, axial, (*rho0, 0.0), (*rho1, *height)) else { return false };
+                clear(line.max(axial_clearance(axial, 0.0, *height)))
+            }
+            Some(AnalyticSurface::Sphere { frame, radius }) => clear((station.sub(frame.origin).length() - radius).abs()),
+            Some(AnalyticSurface::Torus { frame, major_radius, minor_radius }) => {
+                let (radial, axial, _) = meridian(frame);
+                let tube = radial - major_radius;
+                clear(((tube * tube + axial * axial).sqrt() - minor_radius).abs())
+            }
+            Some(AnalyticSurface::Revolution { frame, sweep, generatrix, .. }) => {
+                // A STRAIGHT generatrix in the frame's zero meridian (the
+                // extruded-arc walls: a line parallel to the axis at the
+                // radius): its two control points read as (ρ, h), and the
+                // patch's distance is bounded below by the meridian line
+                // distance, the axial clearance and the wedge clearance
+                // together. A curved or off-meridian generatrix declines.
+                let [a, b] = generatrix.control_points.as_slice() else { return false };
+                if generatrix.degree != 1 || a.w != 1.0 || b.w != 1.0 {
+                    return false;
+                }
+                let meridian_of = |point: Vec3| -> Option<(f64, f64)> {
+                    let offset = point.sub(frame.origin);
+                    let axial = offset.dot(frame.axis);
+                    let radial = offset.sub(frame.axis.scale(axial));
+                    let rho = radial.length();
+                    let on_meridian = radial.dot(frame.y_axis).abs() <= 1e-9 * rho.max(1.0) && radial.dot(frame.x_axis) >= -1e-9 * rho.max(1.0);
+                    on_meridian.then_some((rho, axial))
+                };
+                let (Some(p0), Some(p1)) = (meridian_of(Vec3::new(a.x, a.y, a.z)), meridian_of(Vec3::new(b.x, b.y, b.z))) else {
+                    return false;
+                };
+                let (radial, axial, azimuth) = meridian(frame);
+                let Some(line) = line_distance(radial, axial, p0, p1) else { return false };
+                // The TRIMMED face's slab is narrower than the surface's:
+                // a station on one box edge lies on the untrimmed surface
+                // of each perpendicular wall (that wall's rail line runs
+                // through the corner), a radius short of its trimmed face.
+                let slab = trimmed_axial_slab(face, frame).unwrap_or((p0.1, p1.1));
+                clear(line.max(axial_clearance(axial, slab.0, slab.1)).max(wedge_clearance(radial, azimuth, *sweep)))
+            }
+            Some(plane @ AnalyticSurface::Plane { origin, u_dir, v_dir, .. }) => {
+                let Ok(normal) = u_dir.cross(*v_dir).normalized() else { return false };
+                if clear(station.sub(*origin).dot(normal).abs()) {
+                    true
+                } else {
+                    planar_trims_clear_of(face, plane, station, on_band, margin)
+                }
+            }
+            None => false,
+        };
+        if !certified {
+            return false;
+        }
+    }
+    true
+}
+
+/// The axial range `(h_low, h_high)` of a face's TRIMMED region on a
+/// revolution whose generatrix is straight: the region lies in the uv box
+/// of its straight-chord loops (every pcurve a two-point unit-weight
+/// chord), the surface is a tensor product in which the axial coordinate
+/// `h = (S − origin)·axis` depends on one parameter only and affinely
+/// (degree 1, two control points along it), so `h` over the box is the
+/// range between its values at the box's corners. `None` when any of that
+/// is not read: a curved chord, an `h` that moves along both parameters,
+/// a degree or control count that is not affine, an evaluation that fails.
+fn trimmed_axial_slab(face: &FaceRecord, frame: &crate::RevolutionFrame) -> Option<(f64, f64)> {
+    let (mut u_low, mut u_high, mut v_low, mut v_high) = (f64::INFINITY, f64::NEG_INFINITY, f64::INFINITY, f64::NEG_INFINITY);
+    for coedge in face.loops.iter().flat_map(|loop_record| &loop_record.coedges) {
+        let pcurve = &coedge.pcurve;
+        let [a, b] = pcurve.control_points.as_slice() else { return None };
+        if pcurve.degree != 1 || a.w != 1.0 || b.w != 1.0 {
+            return None;
+        }
+        for control in [a, b] {
+            u_low = u_low.min(control.x);
+            u_high = u_high.max(control.x);
+            v_low = v_low.min(control.y);
+            v_high = v_high.max(control.y);
+        }
+    }
+    if !(u_low <= u_high && v_low <= v_high) {
+        return None;
+    }
+    let axial_at = |u: f64, v: f64| face.surface.evaluate(u, v).ok().map(|point| point.sub(frame.origin).dot(frame.axis));
+    let corners = [axial_at(u_low, v_low)?, axial_at(u_high, v_low)?, axial_at(u_low, v_high)?, axial_at(u_high, v_high)?];
+    let scale = corners.iter().fold(1.0_f64, |scale, h| scale.max(h.abs()));
+    let same = |a: f64, b: f64| (a - b).abs() <= 1e-9 * scale;
+    let surface = &face.surface;
+    // h constant along u (the generatrix runs along v), or along v.
+    let affine_in_v = same(corners[0], corners[1]) && same(corners[2], corners[3])
+        && surface.degree_v == 1 && surface.control_points.first().is_some_and(|row| row.len() == 2);
+    let affine_in_u = same(corners[0], corners[2]) && same(corners[1], corners[3])
+        && surface.degree_u == 1 && surface.control_points.len() == 2;
+    if !(affine_in_v || affine_in_u) {
+        return None;
+    }
+    let low = corners.iter().copied().fold(f64::INFINITY, f64::min);
+    let high = corners.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    (low.is_finite() && high.is_finite()).then_some((low, high))
+}
+
+/// The planar reading of [`station_clear_of_skin`]: the station's foot on
+/// the plane lies `Outside` the face's trims and every straight loop chord's
+/// 3-D segment is farther than `margin` from the station.
+fn planar_trims_clear_of(
+    face: &FaceRecord,
+    plane: &crate::AnalyticSurface,
+    station: Vec3,
+    on_band: f64,
+    margin: f64,
+) -> bool {
+    use crate::PolygonClass;
+    let Some(foot) = plane.project(&face.surface, station) else { return false };
+    let uv_band = crate::classification::surface_uv_band(&face.surface, foot.u, foot.v, on_band);
+    match crate::parameter_point_in_face(face, crate::Vec2 { x: foot.u, y: foot.v }, uv_band) {
+        Ok(PolygonClass::Outside) => {}
+        _ => return false,
+    }
+    for coedge in face.loops.iter().flat_map(|loop_record| &loop_record.coedges) {
+        let pcurve = &coedge.pcurve;
+        let [a, b] = pcurve.control_points.as_slice() else { return false };
+        if pcurve.degree != 1 || a.w != 1.0 || b.w != 1.0 {
+            return false;
+        }
+        let (Ok(start), Ok(end)) = (face.surface.evaluate(a.x, a.y), face.surface.evaluate(b.x, b.y)) else { return false };
+        let chord = end.sub(start);
+        let length_squared = chord.dot(chord);
+        let offset = station.sub(start);
+        let along = if length_squared > 0.0 { (offset.dot(chord) / length_squared).clamp(0.0, 1.0) } else { 0.0 };
+        let distance = offset.sub(chord.scale(along)).length();
+        if !(distance.is_finite() && distance > margin) {
+            return false;
+        }
+    }
+    true
 }
 
 /// The blend-FACE name for the `i`-th selected edge: its per-edge name when the
@@ -707,9 +1005,15 @@ fn corner_face_name(
     }
 }
 
-/// Round an isolated convex boss edge first, then blend the concave rim
-/// including its new circular bridge across the convex wall. Omitting that
-/// bridge leaves the two rim stripes disconnected at the mixed corner.
+/// Round a connected group of convex edges first, including its ordinary
+/// convex corner patches, then blend the concave rim across a curved bridge
+/// at each transverse mixed corner. The spine's carriers and the cap may be
+/// planes or curved analytic faces alike: transversality is read from the
+/// three normals at the corner, and the rim network marches the bridge on the
+/// actual carriers. Without these bridges the rim stripes would remain
+/// disconnected. Redispatch the remaining selection: other mixed corners may
+/// need another convex group or a pole-to-pole runout.
+/// Each step removes the rounded group from the pending selection.
 #[allow(clippy::too_many_arguments)]
 fn rounded_boss_composition(
     solid: &BrepSolid,
@@ -720,37 +1024,120 @@ fn rounded_boss_composition(
     name: Option<&str>,
     corners: &[crate::blend::MixedCorner],
 ) -> Result<BrepSolid, KernelRefusal> {
+    // The legacy API gives every wall the same base name (or none). Use
+    // distinct temporary identities through the recursive composition so a
+    // bridge can be attributed to its own convex wall. Restore that API's
+    // naming contract after the whole selection has been built.
+    if edge_names.is_none() {
+        let prefix = "FILLET:COMPOSITION";
+        let names: Vec<_> = selected_ids
+            .iter()
+            .map(|id| format!("{prefix}:{id}"))
+            .collect();
+        let mut result = rounded_boss_composition(
+            solid,
+            selected_ids,
+            edge_points,
+            Some(&names),
+            radius,
+            Some(prefix),
+            corners,
+        )?;
+        for face in result.shells.iter_mut().flat_map(|shell| &mut shell.faces) {
+            if face
+                .name
+                .as_deref()
+                .is_some_and(|value| value.starts_with("FILLET:COMPOSITION:"))
+            {
+                face.name = name.map(str::to_owned);
+            }
+        }
+        return Ok(result);
+    }
     let decline = || {
         KernelRefusal::unsupported(KernelStage::Classify, "rounded_boss_selection",
-        "the rounded boss composition requires one isolated convex edge and one orthogonal mixed corner")
+        "the rounded boss composition requires a convex group meeting transverse mixed corners at one end of each spine")
     };
-    if std::env::var("BREP_NO_NETWORK").is_ok() || corners.len() != 1 {
+    if std::env::var("BREP_NO_NETWORK").is_ok() {
         return Err(decline());
     }
-    let corner = &corners[0];
-    if corner.convex.len() != 1 || corner.concave.len() != 2 {
-        return Err(decline());
-    }
+    // Select by topology id so reversing the requested edges preserves the
+    // construction order. Two-ended spines are left for runout composition.
+    let corner = corners
+        .iter()
+        .filter(|corner| {
+            corner.convex.len() == 1
+                && corner.concave.len() == 2
+                && corners
+                    .iter()
+                    .filter(|other| other.convex.contains(&corner.convex[0]))
+                    .count()
+                    == 1
+        })
+        .min_by_key(|corner| selected_ids[corner.convex[0]])
+        .ok_or_else(decline)?;
     let convexity =
         crate::blend::selection_convexity(solid, selected_ids, radius).ok_or_else(decline)?;
-    if convexity.iter().filter(|convex| **convex).count() != 1 {
+    if !convexity[corner.convex[0]] {
         return Err(decline());
     }
     let spine_index = corner.convex[0];
-    let spine = solid
-        .edges
+    // Resolve once so a missing selected edge refuses before connectivity
+    // traversal rather than panicking inside the adjacency predicate.
+    let selected_edges: Vec<&EdgeRecord> = selected_ids
         .iter()
-        .find(|edge| edge.id == selected_ids[spine_index])
-        .ok_or_else(decline)?;
-    let far = if spine.start_vertex_id == corner.vertex {
-        spine.end_vertex_id
-    } else {
-        spine.start_vertex_id
-    };
-    if solid.edges.iter().any(|edge| {
-        edge.id != spine.id
-            && selected_ids.contains(&edge.id)
-            && (edge.start_vertex_id == far || edge.end_vertex_id == far)
+        .map(|id| {
+            solid
+                .edges
+                .iter()
+                .find(|edge| edge.id == *id)
+                .ok_or_else(|| {
+                    KernelRefusal::internal(
+                        KernelStage::Collect,
+                        "rounded_boss_selected_edge",
+                        format!("rounded boss composition: selected edge {id} is missing"),
+                    )
+                })
+        })
+        .collect::<Result<_, _>>()?;
+    // Round the connected convex selection together. Its far corners need
+    // their usual vertex patches before a concave rim can cross these walls.
+    let mut convex_indices = vec![spine_index];
+    loop {
+        let next = (0..selected_ids.len()).find(|index| {
+            convexity[*index]
+                && !convex_indices.contains(index)
+                && convex_indices.iter().any(|other| {
+                    let edge = selected_edges[*index];
+                    let mate = selected_edges[*other];
+                    [edge.start_vertex_id, edge.end_vertex_id]
+                        .iter()
+                        .any(|v| *v == mate.start_vertex_id || *v == mate.end_vertex_id)
+                })
+        });
+        match next {
+            Some(index) => convex_indices.push(index),
+            None => break,
+        }
+    }
+    convex_indices.sort_by_key(|index| selected_ids[*index]);
+    let mixed: Vec<_> = corners
+        .iter()
+        .filter(|corner| {
+            corner
+                .convex
+                .iter()
+                .any(|index| convex_indices.contains(index))
+        })
+        .collect();
+    if mixed.iter().any(|corner| {
+        corner.convex.len() != 1
+            || corner.concave.len() != 2
+            || corners
+                .iter()
+                .filter(|other| other.convex.contains(&corner.convex[0]))
+                .count()
+                != 1
     }) {
         return Err(decline());
     }
@@ -760,95 +1147,142 @@ fn rounded_boss_composition(
             .flat_map(|rim| &rim.coedges)
             .any(|coedge| coedge.edge_id == edge)
     };
-    let cap = solid
-        .shells
-        .iter()
-        .flat_map(|shell| &shell.faces)
-        .find(|face| {
-            corner
-                .concave
-                .iter()
-                .all(|index| uses(face, selected_ids[*index]))
-        })
-        .ok_or_else(decline)?;
-    let faces: Vec<&FaceRecord> = solid
-        .shells
-        .iter()
-        .flat_map(|shell| &shell.faces)
-        .filter(|face| face.id == cap.id || uses(face, spine.id))
-        .collect();
-    let normals: Option<Vec<Vec3>> = faces
-        .iter()
-        .map(|face| match face.surface.analytic() {
-            Some(crate::AnalyticSurface::Plane { u_dir, v_dir, .. }) => {
-                u_dir.cross(*v_dir).normalized().ok()
-            }
-            _ => None,
-        })
-        .collect();
-    let normals = normals.ok_or_else(decline)?;
-    if normals.len() != 3
-        || (0..3).any(|a| (a + 1..3).any(|b| normals[a].dot(normals[b]).abs() > 1e-6))
-    {
-        return Err(decline());
+    let mut caps = Vec::new();
+    for corner in &mixed {
+        let spine_id = selected_ids[corner.convex[0]];
+        let cap = solid
+            .shells
+            .iter()
+            .flat_map(|shell| &shell.faces)
+            .find(|face| {
+                corner
+                    .concave
+                    .iter()
+                    .all(|index| uses(face, selected_ids[*index]))
+            })
+            .ok_or_else(decline)?;
+        let faces: Vec<_> = solid
+            .shells
+            .iter()
+            .flat_map(|shell| &shell.faces)
+            .filter(|face| face.id == cap.id || uses(face, spine_id))
+            .collect();
+        // The normals at the corner: a plane's from its frame, any other
+        // carrier's at the corner's own foot on it.  The 2026-10-12 sprocket
+        // report (`inbox_20261012_sprocket_fillet`) was the first curved CAP;
+        // the 2026-10-13 reports on the same part put the SPINE on a cylinder
+        // (the rim top's arc, rim wall ∩ rim top, dying into the spoke wall)
+        // and were declined here before anything was tried, which handed the
+        // whole selection to the runout lane and its refusal
+        // (`inbox_20261013_sprocket_spoke_fillet`).
+        let normals: Option<Vec<Vec3>> = faces
+            .iter()
+            .map(|face| match face.surface.analytic() {
+                Some(crate::AnalyticSurface::Plane { u_dir, v_dir, .. }) => {
+                    u_dir.cross(*v_dir).normalized().ok()
+                }
+                _ => {
+                    let uv = crate::project_point_to_surface(&face.surface, corner.point).ok()?;
+                    face.surface.normal(uv.u, uv.v).ok()
+                }
+            })
+            .collect();
+        let normals = normals.ok_or_else(decline)?;
+        // The cap need not be perpendicular to the spine's two carriers.
+        // An oblique or cylindrical cap cuts the rounded wall in a curved
+        // bridge. The rim network marches that bridge on the actual carriers.
+        // Test transversality at the corner; a cylindrical cap need not be
+        // replaced by its tangent plane to build this composition.
+        if normals.len() != 3
+            || normals[0].cross(normals[1]).dot(normals[2]).abs() < 1e-6
+        {
+            return Err(decline());
+        }
+        caps.push(cap.id);
     }
-    // Name the wall even for unnamed callers so the bridge is identified
-    // from its carriers rather than its distance to the old vertex.
-    let spine_name = per_edge_name(edge_names, name, spine_index)
-        .unwrap_or("FILLET:ROUNDED_BOSS_SPINE")
-        .to_owned();
+    // Give unnamed walls distinct identities too: bridges are located by
+    // their two carriers, never proximity to the old corner.
+    let convex_names: Vec<String> = convex_indices
+        .iter()
+        .map(|index| {
+            per_edge_name(edge_names, name, *index)
+                .map(str::to_owned)
+                .unwrap_or_else(|| format!("FILLET:ROUNDED_BOSS_SPINE:{index}"))
+        })
+        .collect();
+    let convex_points: Vec<Vec3> = convex_indices
+        .iter()
+        .map(|index| edge_points[*index])
+        .collect();
     let rounded = fillet_edges_group_in(
         solid,
-        &[edge_points[spine_index]],
-        Some(&[spine_name.clone()]),
+        &convex_points,
+        Some(&convex_names),
         radius,
         false,
         name,
         None,
     )?;
-    let bridges: Vec<&EdgeRecord> = rounded
-        .edges
-        .iter()
-        .filter(|edge| {
-            let faces: Vec<&FaceRecord> = rounded
-                .shells
-                .iter()
-                .flat_map(|shell| &shell.faces)
-                .filter(|face| uses(face, edge.id))
-                .collect();
-            faces.iter().any(|face| face.id == cap.id)
-                && faces
+    let mut bridges = Vec::new();
+    for (corner, cap) in mixed.iter().zip(&caps) {
+        let wall_index = convex_indices
+            .iter()
+            .position(|index| *index == corner.convex[0])
+            .ok_or_else(|| {
+                KernelRefusal::internal(
+                    KernelStage::Classify,
+                    "rounded_boss_bridge_wall",
+                    format!(
+                        "rounded boss composition: no convex wall for corner {}",
+                        corner.vertex
+                    ),
+                )
+            })?;
+        let candidates: Vec<_> = rounded
+            .edges
+            .iter()
+            .filter(|edge| {
+                let faces: Vec<_> = rounded
+                    .shells
                     .iter()
-                    .any(|face| face.name.as_deref() == Some(&spine_name))
-        })
-        .collect();
-    if bridges.len() != 1 {
-        return Err(decline());
+                    .flat_map(|shell| &shell.faces)
+                    .filter(|face| uses(face, edge.id))
+                    .collect();
+                faces.iter().any(|face| face.id == *cap)
+                    && faces
+                        .iter()
+                        .any(|face| face.name.as_deref() == Some(&convex_names[wall_index]))
+            })
+            .collect();
+        if candidates.len() != 1 {
+            return Err(decline());
+        }
+        bridges.push(candidates[0]);
     }
-    let bridge = bridges[0];
     let rim_ids: Vec<u64> = selected_ids
         .iter()
         .enumerate()
-        .filter(|(index, _)| *index != spine_index)
+        .filter(|(index, _)| !convex_indices.contains(index))
         .map(|(_, id)| *id)
         .collect();
     // Both ends must join requested rim edges: never extend a selection
     // into an unselected perimeter.
-    if ![bridge.start_vertex_id, bridge.end_vertex_id]
-        .iter()
-        .all(|vertex| {
-            rounded.edges.iter().any(|edge| {
-                rim_ids.contains(&edge.id)
-                    && (edge.start_vertex_id == *vertex || edge.end_vertex_id == *vertex)
+    if !bridges.iter().all(|bridge| {
+        [bridge.start_vertex_id, bridge.end_vertex_id]
+            .iter()
+            .all(|vertex| {
+                rounded.edges.iter().any(|edge| {
+                    rim_ids.contains(&edge.id)
+                        && (edge.start_vertex_id == *vertex || edge.end_vertex_id == *vertex)
+                })
             })
-        })
-    {
+    }) {
         return Err(decline());
     }
     let mut points = Vec::new();
     let mut names = Vec::new();
     for (index, id) in selected_ids.iter().enumerate() {
-        if index == spine_index {
+        if convex_indices.contains(&index) {
             continue;
         }
         let edge = rounded
@@ -867,18 +1301,31 @@ fn rounded_boss_composition(
                 .to_owned(),
         );
     }
-    points.push(
-        bridge
-            .curve
-            .evaluate(0.5 * (bridge.t0 + bridge.t1))
-            .or_refuse(KernelStage::Collect, "bridge_midpoint")?,
-    );
-    let mut adjacent = corner.concave.clone();
-    adjacent.push(spine_index);
-    names.push(
-        corner_face_name(edge_names, name, &adjacent).unwrap_or("FILLET:BOSS_CORNER".to_owned()),
-    );
-    fillet_edges_group_in(&rounded, &points, Some(&names), radius, false, name, None)
+    for (corner, bridge) in mixed.iter().zip(&bridges) {
+        points.push(
+            bridge
+                .curve
+                .evaluate(0.5 * (bridge.t0 + bridge.t1))
+                .or_refuse(KernelStage::Collect, "bridge_midpoint")?,
+        );
+        let mut adjacent = corner.concave.clone();
+        adjacent.push(corner.convex[0]);
+        names.push(
+            corner_face_name(edge_names, name, &adjacent)
+                .unwrap_or_else(|| format!("FILLET:BOSS_CORNER:{}", corner.vertex)),
+        );
+    }
+    // A partial rim would leave an open mixed-corner construction. Require
+    // every pending wall, including each bridge, before accepting composition.
+    fillet_edges_reported(&rounded, &points, Some(&names), radius, false, name).and_then(
+        |(result, selection)| {
+            if selection.applied.len() != points.len() {
+                Err(decline())
+            } else {
+                Ok(result)
+            }
+        },
+    )
 }
 
 /// A corner with two concave edges and a convex one requires composition.
@@ -944,6 +1391,7 @@ fn runout_composition(
     for (index, ends) in spine_ends.iter().enumerate() {
         match (*ends, convexity[index]) {
             (2, true) => spines.push(index),
+            (1, true) if crate::blend::runout::one_ended_runout_on() => spines.push(index),
             (0, false) => concave.push(index),
             (ends, convex) => {
                 return Err(KernelRefusal::unsupported(KernelStage::Classify, "runout_selection_shape", format!(
@@ -960,7 +1408,7 @@ fn runout_composition(
     // Stage 1: the ring, exactly as the concave edges build on their own.
     let ring_points: Vec<Vec3> = concave.iter().map(|index| edge_points[*index]).collect();
     let ring_names: Option<Vec<String>> = edge_names.map(|names| concave.iter().map(|index| names[*index].clone()).collect());
-    let ring = fillet_edges_group_with_corner_policy(solid, &ring_points, ring_names.as_deref(), radius, false, name, None, false)
+    let ring = fillet_edges_group_with_corner_policy(solid, &ring_points, ring_names.as_deref(), radius, false, name, None, false, true)
         .map_err(|error| error.with_message(|error| format!("the concave ring did not build: {error}")))?;
     // Stage 2: the runout walls on it.
     let spine_walls: Vec<(u64, Option<String>)> = spines
@@ -1284,7 +1732,7 @@ fn fillet_edges_group_in(
     name: Option<&str>,
     memo: Option<&mut ComponentMemo>,
 ) -> Result<BrepSolid, KernelRefusal> {
-    fillet_edges_group_with_corner_policy(solid, edge_points, edge_names, radius, chamfer, name, memo, true)
+    fillet_edges_group_with_corner_policy(solid, edge_points, edge_names, radius, chamfer, name, memo, true, true)
 }
 
 fn fillet_edges_group_with_corner_policy(
@@ -1296,12 +1744,25 @@ fn fillet_edges_group_with_corner_policy(
     name: Option<&str>,
     memo: Option<&mut ComponentMemo>,
     wrap_concave: bool,
+    accept: bool,
 ) -> Result<BrepSolid, KernelRefusal> {
     GROUP_BUILDS.with(|count| count.set(count.get() + 1));
     let entry = if chamfer { "chamfer_edges" } else { "fillet_edges" };
-    let result =
+    let GroupBody { body: result, bowtie_clean } =
         fillet_edges_group_unchecked(solid, edge_points, edge_names, radius, chamfer, name, memo, wrap_concave)?;
-    check_loop_self_crossings(&result, entry)?;
+    if !accept {
+        return Ok(result);
+    }
+    // A body the network or the closed-rim lane already scanned clean and
+    // handed up untouched is not scanned again (the scan is a pure function
+    // of the body, 2026-10-12). The composite road and the cutter road hand
+    // up bodies no lane scanned, and are scanned here.
+    if bowtie_clean {
+        crate::blend::record_count("count.bowtie.lane_scan_reused", 1);
+    } else {
+        check_loop_self_crossings(&result, entry)?;
+    }
+    let soundness = crate::blend::BlendTimer::start("timing.soundness_ms");
     // The BODY's own soundness, beside the loop's. A blend wall is a FITTED
     // surface and a fit can carry two parameters of one wall to one point in
     // space — measured on `inbox-20260902-fillet-two-torus-box-edges`, whose
@@ -1310,7 +1771,18 @@ fn fillet_edges_group_with_corner_policy(
     // are all silent. Two walls crossing each other is the same class and is
     // repaired where it can be. Neither is visible to a volume oracle, so a
     // result carrying one reports success for a different shape.
-    crate::accept_sound(result, entry)
+    let accepted = crate::accept_sound(result, entry);
+    soundness.stop();
+    accepted
+}
+
+/// What the unchecked group lane hands up: the body, and whether a lane's
+/// own acceptance already ran the bowtie scan on exactly this body and
+/// found it clean (the network and closed-rim exits return the scanned
+/// body unchanged; the composite and cutter exits do not scan).
+struct GroupBody {
+    body: BrepSolid,
+    bowtie_clean: bool,
 }
 
 fn fillet_edges_group_unchecked(
@@ -1322,7 +1794,7 @@ fn fillet_edges_group_unchecked(
     name: Option<&str>,
     mut memo: Option<&mut ComponentMemo>,
     wrap_concave: bool,
-) -> Result<BrepSolid, KernelRefusal> {
+) -> Result<GroupBody, KernelRefusal> {
     use rustc_hash::FxHashSet as HashSet;
 
     // Fuse-first operand heal (Lever A) before the multi-edge surgery: snap the
@@ -1331,10 +1803,13 @@ fn fillet_edges_group_unchecked(
     // edges.  The selected edges are resolved geometrically below, so a
     // sub-heal_tol vertex move never changes which edges are picked; a clean
     // input is left byte-identical.
+    let heal = crate::blend::BlendTimer::start("timing.heal_operands_ms");
     let mut healed_input = solid.clone();
     let heal_policy = crate::KernelTolerances::for_solid(&healed_input, 1e-7);
     crate::heal::heal_operands(&mut healed_input, &heal_policy)?;
     let solid = &healed_input;
+    heal.stop();
+    let group_analysis = crate::blend::BlendTimer::start("timing.group_analysis_ms");
 
     // 1. Detect convex corners from the ORIGINAL solid: a point that is an
     //    endpoint of >=3 of the selected edges (a cube/prism-style vertex).
@@ -1452,6 +1927,7 @@ fn fillet_edges_group_unchecked(
         component.sort_unstable();
         components.push(component);
     }
+    group_analysis.stop();
     if components.len() > 1 {
         let mut separated = solid.clone();
         let mut chain: Vec<ComponentKey> = Vec::with_capacity(components.len());
@@ -1466,6 +1942,7 @@ fn fillet_edges_group_unchecked(
                     .map(|index| all[*index].clone())
                     .collect::<Vec<_>>()
             });
+            let accept_component = !crate::blend::accept_once_on();
             let Some(memo) = memo.as_deref_mut() else {
                 separated = fillet_edges_group_with_corner_policy(
                     &separated,
@@ -1476,6 +1953,7 @@ fn fillet_edges_group_unchecked(
                     name,
                     None,
                     wrap_concave,
+                    accept_component,
                 )?;
                 continue;
             };
@@ -1493,6 +1971,7 @@ fn fillet_edges_group_unchecked(
                         name,
                         None,
                         wrap_concave,
+                        accept_component,
                     );
                     memo.built.insert(chain.clone(), built.clone());
                     built
@@ -1500,7 +1979,7 @@ fn fillet_edges_group_unchecked(
             };
             separated = built?;
         }
-        return Ok(separated);
+        return Ok(GroupBody { body: separated, bowtie_clean: false });
     }
 
     // 2a. The stripe network (blend/network.rs) is the lane for EVERY
@@ -1540,7 +2019,9 @@ fn fillet_edges_group_unchecked(
                 match crate::blend::blend_closed_edge(solid, edge_id, radius, chamfer, rim_name) {
                     Ok(mut rim) => {
                         let entry = if chamfer { "chamfer_edges" } else { "fillet_edges" };
+                        let heal = crate::blend::BlendTimer::start("timing.heal_vertex_gaps_ms");
                         let healed = heal_edge_vertex_gaps(&mut rim, radius);
+                        heal.stop();
                         // A trim the surgery ran outside its planar carrier's
                         // chart is a wrong body the three checks below all pass
                         // (`crate::blend::fit_planar_charts_to_trims`), so the
@@ -1549,8 +2030,12 @@ fn fillet_edges_group_unchecked(
                         // bowtie scan reads them.  Its refusals are TERMINAL:
                         // the composition is not a second opinion on a body
                         // whose trims left their carrier.
+                        let charts = crate::blend::BlendTimer::start("timing.planar_charts_ms");
                         crate::blend::fit_planar_charts_to_trims(solid, &mut rim)?;
+                        charts.stop();
+                        let validate = crate::blend::BlendTimer::start("timing.validate_ms");
                         let issues = rim.validate();
+                        validate.stop();
                         let interference =
                             check_blend_interference(solid, &rim, &selected_edge_ids, entry);
                         let bowtie = check_loop_self_crossings(&rim, entry);
@@ -1559,7 +2044,7 @@ fn fillet_edges_group_unchecked(
                             && interference.is_ok()
                             && bowtie.is_ok()
                         {
-                            return Ok(rim);
+                            return Ok(GroupBody { body: rim, bowtie_clean: true });
                         }
                         if std::env::var("BREP_DEBUG_NETWORK").is_ok() {
                             eprintln!(
@@ -1599,12 +2084,18 @@ fn fillet_edges_group_unchecked(
                 // crossing the swept volume -- `validate` cannot, because a
                 // self-intersecting solid is still a watertight one.
                 let entry = if chamfer { "chamfer_edges" } else { "fillet_edges" };
+                let heal = crate::blend::BlendTimer::start("timing.heal_vertex_gaps_ms");
                 let healed = heal_edge_vertex_gaps(&mut network, radius);
+                heal.stop();
                 // See the closed-rim lane above: widen a planar carrier the
                 // surgery overran, or refuse — terminally — rather than fall
                 // through to a composition that cannot answer that question.
+                let charts = crate::blend::BlendTimer::start("timing.planar_charts_ms");
                 crate::blend::fit_planar_charts_to_trims(solid, &mut network)?;
+                charts.stop();
+                let validate = crate::blend::BlendTimer::start("timing.validate_ms");
                 let issues = network.validate();
+                validate.stop();
                 let interference =
                     check_blend_interference(solid, &network, &selected_edge_ids, entry);
                 // And the fourth question, which the other three all pass: does
@@ -1613,7 +2104,7 @@ fn fillet_edges_group_unchecked(
                 // and a bowtie is watertight, incident and connected.
                 let bowtie = check_loop_self_crossings(&network, entry);
                 if healed.is_ok() && issues.is_empty() && interference.is_ok() && bowtie.is_ok() {
-                    return Ok(network);
+                    return Ok(GroupBody { body: network, bowtie_clean: true });
                 }
                 if std::env::var("BREP_DEBUG_NETWORK").is_ok() {
                     eprintln!(
@@ -1677,6 +2168,8 @@ fn fillet_edges_group_unchecked(
     }
 
     CUTTER_COMPOSITIONS.with(|count| count.set(count.get() + 1));
+    crate::blend::record_count("count.cutter_fallback", 1);
+    let _cutter = crate::blend::BlendTimer::start("timing.cutter_ms");
     // 2. Build the blends.
     //
     //    CHAIN corners (§6.9.6 — exactly TWO selected edges share a vertex):
@@ -1762,9 +2255,28 @@ fn fillet_edges_group_unchecked(
     } else {
         Lane::CutterFirst
     };
+    // The order the sequential build blends the selection in: the input
+    // order, except that a CONCAVE edge ending at a star corner goes before
+    // every convex edge (`sequential_build_order`). The §6.9.7 torus-sector
+    // closure of a re-entrant vertex whose concave edge is selected too
+    // (`round_mixed_concave_corner`) reads the concave blend's tangency
+    // vertices off the convex cap cutters, so it exists only when the concave
+    // edge was cut FIRST; a user who picks the keyway's rim and then its
+    // inner corners (the 2026-10-13 sprocket report) got flat caps at both
+    // corners from the input order, and the closure's own closed form from
+    // this one. Every other selection keeps its input order, byte for byte.
+    let concave_at_star = concave_star_edges(solid, &selected_edge_ids, &corner_edges, radius, chamfer);
+    let sequential_order = sequential_build_order(edge_points.len(), &concave_at_star);
+    // And the corners close in the same precedence: a star with a concave
+    // edge (the torus sector) before the convex stars, which on the report's
+    // keyway share a 3.8-long rim edge with it — the convex star's surgery
+    // read an open edge when it ran first (measured 2026-10-13), and closes
+    // cleanly after the sector has trimmed that rim.
+    let (corners, corner_edges) = corners_concave_first(corners, corner_edges, &concave_at_star);
     let build_sequential = || -> Result<BrepSolid, KernelRefusal> {
         let mut sequential = solid.clone();
-        for (index, point) in edge_points.iter().enumerate() {
+        for &index in &sequential_order {
+            let point = &edge_points[index];
             let edge_id = resolve_edge_by_point(&sequential, *point)?;
             // Earlier cutters in this loop TRIM the edges that share a corner
             // with them; extend this cutter back over what they took so the
@@ -1921,10 +2433,13 @@ fn fillet_edges_group_unchecked(
     if !chamfer {
         for (ci, corner) in corners.iter().enumerate() {
             let corner_name = corner_face_name(edge_names, name, &corner_edges[ci]);
-            if let Ok(rounded) =
-                crate::blend::round_convex_corner(&result, *corner, radius, corner_name.as_deref())
-            {
-                result = rounded;
+            match crate::blend::round_convex_corner(&result, *corner, radius, corner_name.as_deref()) {
+                Ok(rounded) => result = rounded,
+                Err(error) => {
+                    if std::env::var("BREP_DEBUG_NETWORK").is_ok() {
+                        eprintln!("corner at {corner:?} left as the edge fillets: {error}");
+                    }
+                }
             }
         }
     }
@@ -1933,8 +2448,67 @@ fn fillet_edges_group_unchecked(
     // surgery (the per-edge results are already healed inside fillet_or_chamfer).
     heal_edge_vertex_gaps(&mut result, radius)?;
     crate::blend::fit_planar_charts_to_trims(solid, &mut result)?;
-    Ok(settle_cutter_scaffold(result))
+    Ok(GroupBody { body: settle_cutter_scaffold(result), bowtie_clean: false })
 }
+
+/// The selected edges (indices into the selection) that are CONCAVE and end
+/// at a star corner (`corner_edges`: three or more selected edges at one
+/// vertex), in input order. Empty for a chamfer, a selection with no star
+/// corner, one whose star corners carry no concave edge, and one whose
+/// convexity cannot be read — the cases the composition builds in input
+/// order, exactly as before.
+fn concave_star_edges(
+    solid: &BrepSolid,
+    selected_edge_ids: &[u64],
+    corner_edges: &[Vec<usize>],
+    radius: f64,
+    chamfer: bool,
+) -> Vec<usize> {
+    if chamfer || corner_edges.is_empty() || !concave_first_on() {
+        return Vec::new();
+    }
+    let Some(convexity) = crate::blend::selection_convexity(solid, selected_edge_ids, radius) else {
+        return Vec::new();
+    };
+    (0..selected_edge_ids.len())
+        .filter(|&index| !convexity[index] && corner_edges.iter().any(|adjacent| adjacent.contains(&index)))
+        .collect()
+}
+
+/// The order the cutter composition's sequential build blends a selection
+/// in: the input order, except that the edges in `first` (a star corner's
+/// concave edges, [`concave_star_edges`]) are moved ahead of every other
+/// edge, keeping the input order among the moved edges and among the rest.
+/// With `first` empty this is the input order.
+fn sequential_build_order(count: usize, first: &[usize]) -> Vec<usize> {
+    first.iter().copied().chain((0..count).filter(|index| !first.contains(index))).collect()
+}
+
+/// `corners` and their `corner_edges` (parallel), with every corner that one
+/// of the `first` edges ends at moved ahead of the rest, both runs in their
+/// detection order. With `first` empty both come back as they were.
+fn corners_concave_first(
+    corners: Vec<Vec3>,
+    corner_edges: Vec<Vec<usize>>,
+    first: &[usize],
+) -> (Vec<Vec3>, Vec<Vec<usize>>) {
+    if first.is_empty() {
+        return (corners, corner_edges);
+    }
+    let mut ordered: Vec<(Vec3, Vec<usize>)> = Vec::with_capacity(corners.len());
+    let pairs: Vec<(Vec3, Vec<usize>)> = corners.into_iter().zip(corner_edges).collect();
+    let with_concave = |adjacent: &Vec<usize>| adjacent.iter().any(|index| first.contains(index));
+    ordered.extend(pairs.iter().filter(|(_, adjacent)| with_concave(adjacent)).cloned());
+    ordered.extend(pairs.iter().filter(|(_, adjacent)| !with_concave(adjacent)).cloned());
+    ordered.into_iter().unzip()
+}
+
+/// Whether the sequential build moves a star corner's concave edge first
+/// ([`sequential_build_order`]); always, outside a test that forces it off.
+fn concave_first_on() -> bool {
+    true
+}
+
 
 /// Variable-radius fillet/chamfer of a GROUP of edges (§4.9.5), the app entry
 /// for tapered blends: each selected edge (resolved by a point on it) is
@@ -1996,6 +2570,41 @@ fn fillet_edges_variable_impl(
     entry: &str,
     allow_tapered_sequential: bool,
 ) -> Result<BrepSolid, KernelRefusal> {
+    // The translation control (`BREP_TRANSLATION_CONTROL`, `brep/recentre.rs`)
+    // and the recentre guard, as `fillet_edges_reported` applies them.
+    let bounds = crate::recentre::solid_bounds(solid);
+    let translated = match crate::recentre::control_offset_at_entry() {
+        Some(offset) => Some((offset, crate::recentre::EntryKind::Control)),
+        None => crate::recentre::guard_offset(bounds).map(|offset| {
+            crate::recentre::profile_fired(entry, offset, bounds);
+            (offset, crate::recentre::EntryKind::Guard)
+        }),
+    };
+    if let Some((offset, kind)) = translated {
+        let _entry = crate::recentre::TranslatedEntry::open(kind);
+        let translate = |solid: &BrepSolid, offset: Vec3| {
+            crate::recentre::translate_solid(solid, offset).map_err(|message| {
+                KernelRefusal::internal(
+                    KernelStage::Collect,
+                    "translation_control",
+                    format!("{entry}: the translation control could not move the solid: {message}"),
+                )
+            })
+        };
+        let moved = translate(solid, offset)?;
+        let points: Vec<Vec3> = edge_points.iter().map(|point| point.add(offset)).collect();
+        let result = fillet_edges_variable_impl(
+            &moved,
+            &points,
+            edge_names,
+            per_edge_stops,
+            chamfer,
+            name,
+            entry,
+            allow_tapered_sequential,
+        )?;
+        return translate(&result, offset.scale(-1.0));
+    }
     debug_assert_eq!(per_edge_stops.len(), edge_points.len());
     // A law that is one constant everywhere IS the constant-radius fillet:
     // hand it to the constant group, whose corners are constructed (the
@@ -2019,6 +2628,18 @@ fn fillet_edges_variable_impl(
         .flat_map(|stops| stops.iter())
         .map(|(_, r)| r.abs())
         .fold(0.0_f64, f64::max);
+
+    // Tried first behind its switch; whatever the network does not build (an
+    // unequal-radius corner, a flush join or re-entrant vertex at a varying
+    // radius, a result its acceptance rejects) falls through to the
+    // composition below exactly as before.
+    if crate::blend::taper_network_on() && edge_points.len() >= 2 {
+        if let Some(built) = fillet_variable_network(
+            solid, edge_points, edge_names, per_edge_stops, chamfer, name, entry, max_radius,
+        )? {
+            return Ok(built);
+        }
+    }
 
     // Chain corners miter exactly like the constant-radius group (§6.9.6):
     // per-edge blends on the ORIGINAL solid composed by boolean — Intersect
@@ -2231,6 +2852,100 @@ fn fillet_edges_variable_impl(
     // test: a tapered wall that passes through a neighbour, or through itself,
     // satisfies every check it makes and still measures a volume.
     crate::accept_sound(result, entry)
+}
+
+/// `Ok(None)` is "not this lane" — the network refused, or its result
+/// failed the same acceptance the constant group holds the network to —
+/// and the caller composes as before; `Err` is a refusal nothing below
+/// can answer.
+#[allow(clippy::too_many_arguments)]
+fn fillet_variable_network(
+    solid: &BrepSolid,
+    edge_points: &[Vec3],
+    edge_names: Option<&[String]>,
+    per_edge_stops: &[Vec<(f64, f64)>],
+    chamfer: bool,
+    name: Option<&str>,
+    entry: &str,
+    max_radius: f64,
+) -> Result<Option<BrepSolid>, KernelRefusal> {
+    let mut edge_ids = Vec::with_capacity(edge_points.len());
+    for point in edge_points {
+        edge_ids.push(resolve_edge_by_point(solid, *point)?);
+    }
+    let laws: Vec<crate::blend::StripeRadius> =
+        per_edge_stops.iter().map(|stops| crate::blend::StripeRadius::from_stops(stops)).collect();
+    let network_names: Vec<Option<String>> = (0..edge_points.len())
+        .map(|index| per_edge_name(edge_names, name, index).map(str::to_string))
+        .collect();
+    let network_corner_name = |adjacent: &[usize]| corner_face_name(edge_names, name, adjacent);
+    let debug = std::env::var("BREP_DEBUG_NETWORK").is_ok();
+    let mut network = match crate::blend::blend_star_network_laws(
+        solid, &edge_ids, &laws, chamfer, &network_names, &network_corner_name, true,
+    ) {
+        Ok(network) => network,
+        Err(refusal) => {
+            if debug {
+                eprintln!("law network refused: {refusal}");
+            }
+            return Ok(None);
+        }
+    };
+    // The constant group's acceptance of a network result, in its order:
+    // the vertex-gap heal, the planar charts, validation, the interference
+    // classifier and the bowtie scan; then the soundness acceptance the
+    // variable lane's exit takes.
+    let healed = heal_edge_vertex_gaps(&mut network, max_radius);
+    crate::blend::fit_planar_charts_to_trims(solid, &mut network)?;
+    let issues = network.validate();
+    let interference = check_blend_interference(solid, &network, &edge_ids, entry);
+    let bowtie = check_loop_self_crossings(&network, entry);
+    if healed.is_ok() && issues.is_empty() && interference.is_ok() && bowtie.is_ok() {
+        match crate::accept_sound(network, entry) {
+            Ok(sound) => return Ok(Some(sound)),
+            Err(refusal) => {
+                if debug {
+                    eprintln!("law network result unsound: {refusal}");
+                }
+                return Ok(None);
+            }
+        }
+    }
+    if debug {
+        eprintln!(
+            "law network result rejected: heal={healed:?} issues={issues:?} \
+             interference={interference:?} bowtie={bowtie:?}"
+        );
+    }
+    Ok(None)
+}
+
+pub(crate) fn fillet_edges_variable_stops(
+    solid: &BrepSolid,
+    edge_points: &[Vec3],
+    edge_names: Option<&[String]>,
+    per_edge_stops: &[Vec<(f64, f64)>],
+    chamfer: bool,
+    name: Option<&str>,
+) -> Result<BrepSolid, KernelRefusal> {
+    let _operation = crate::blend::BlendOperation::enter();
+    if edge_points.is_empty() || per_edge_stops.len() != edge_points.len() {
+        return Err(KernelRefusal::input(
+            KernelStage::Collect,
+            "variable_selection",
+            "fillet_edges_variable_stops: one stop list per selected edge is required",
+        ));
+    }
+    fillet_edges_variable_impl(
+        solid,
+        edge_points,
+        edge_names,
+        per_edge_stops,
+        chamfer,
+        name,
+        "fillet_edges_variable_stops",
+        false,
+    )
 }
 
 /// One selected edge placed on the ordered chain, with its arc-length
@@ -2757,9 +3472,22 @@ fn dump_loops_debug(label: &str, solid: &BrepSolid) {
                     .coedges
                     .iter()
                     .map(|coedge| {
+                        // The pcurve's walk endpoints in the face's (u, v), so a
+                        // loop that closes in space but not in parameter space
+                        // (a periodic carrier's seam) is visible in the dump.
+                        let uv = coedge
+                            .pcurve
+                            .domain()
+                            .ok()
+                            .and_then(|[q0, q1]| {
+                                let a = coedge.pcurve.evaluate(q0).ok()?;
+                                let b = coedge.pcurve.evaluate(q1).ok()?;
+                                Some(format!("uv[({:.4},{:.4})->({:.4},{:.4})]", a.x, a.y, b.x, b.y))
+                            })
+                            .unwrap_or_default();
                         match solid.edges.iter().find(|e| e.id == coedge.edge_id) {
                             Some(edge) => format!(
-                                "c{}:e{}{}({}->{})",
+                                "c{}:e{}{}({}->{}){uv}",
                                 coedge.id,
                                 edge.id,
                                 if coedge.forward { "+" } else { "-" },

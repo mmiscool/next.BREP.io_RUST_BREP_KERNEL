@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Workflow guide · BREP PLM</title><link rel="stylesheet" href="/style.css"></head>
+<body><main class="workflow-help">
+<a href="/#/workflows">← Back to workflows</a>
+<h1>Build a workflow</h1>
+<p>A workflow describes a process as steps connected by paths. Forms collect information, reviews request decisions, and automated steps check or update a part. The flowchart runs from top to bottom: ovals start or end a process, rectangles perform work, parallelograms collect input, and diamonds choose a path. Administrators design workflows; assigned participants complete tasks in their Inbox.</p>
+<nav aria-label="Guide contents"><a href="#quick-start">Quick start</a><a href="#settings">Settings</a><a href="#steps">Step types</a><a href="#paths">Paths</a><a href="#fields">Form fields</a><a href="#scripts">Scripts</a><a href="#running">Run a process</a></nav>
+<h2 id="quick-start">Your first workflow</h2>
+<ol>
+<li>Create a workflow and choose a template. <strong>Smart form</strong> starts with Start → Complete request → Complete. Choose the template before customizing: changing it replaces the current draft.</li>
+<li>Give it a descriptive name and describe when people should use it.</li>
+<li>Click a step to edit its details. For a form, set its assignees; <code>initiator</code> assigns the person who starts the process.</li>
+<li>Click a palette button to add a step, or drag it to a position on the canvas. Drag existing steps to arrange them.</li>
+<li>Drag a step’s bottom OUT connector to another step’s top IN connector (or its box) and release to create a path. You can also click OUT, then IN, or choose From step and To step in the Paths section and click Add path. Set its outcome in the Paths section.</li>
+<li>Add the information you need in Form fields. The starter includes a Reason field required at the start.</li>
+<li>Save the workflow. Open Workflows and start a process to try it. Complete assigned tasks in the Inbox and follow progress in the process monitor.</li>
+</ol>
+<p>Example: Start → Request details (Form) → Approve request (Review) → Complete (End). Connect the review to Complete with <code>success</code>, and add another End step named Rejected with a <code>reject</code> path.</p>
+<h2 id="settings">Workflow settings</h2>
+<ul>
+<li><strong>Available to start:</strong> makes the workflow available for new processes. Save changes to apply them.</li>
+<li><strong>Allowed part types:</strong> leave the selection empty for all types. Hold Ctrl (Windows/Linux) or Command (Mac) to select or deselect individual types.</li>
+<li><strong>Who can start:</strong> comma-separated <code>user:username</code>, <code>group:name</code>, or <code>*</code> for everyone. Empty allows authors. Administrators can also start workflows.</li>
+<li><strong>Require this workflow for part release:</strong> This enables the workflow requirement for applicable part types; add a Status step to perform the lifecycle change.</li>
+</ul>
+<h2 id="steps">Step types</h2>
+<div class="table-wrap"><table><thead><tr><th>Step</th><th>Use it for</th></tr></thead><tbody>
+<tr><td>Start</td><td>The single entry point. Every workflow needs exactly one.</td></tr>
+<tr><td>Form</td><td>A task for assigned people to enter information and complete or reject. One assigned participant completes the task.</td></tr>
+<tr><td>Human decision</td><td>A diamond with at least two named outgoing paths. An assigned person chooses one path; the first response completes the decision.</td></tr>
+<tr><td>Programmatic decision</td><td>A diamond that calls <code>step(input)</code>. Return <code>{ outcome: "yes" }</code> (or another outgoing path name) to choose exactly one route. An unknown outcome blocks the process for correction.</td></tr>
+<tr><td>Review</td><td>Assigned reviewers approve or reject independently. Required approvals of 0 means all assigned reviewers. Self review is disabled unless enabled in the step.</td></tr>
+<tr><td>Check</td><td>A JavaScript check that returns an outcome, updates fields, or fails with an error.</td></tr>
+<tr><td>Script</td><td>A JavaScript automation, such as an integration with another system.</td></tr>
+<tr><td>Status</td><td>Changes the target part revision’s lifecycle status. Choose the status in Step details.</td></tr>
+<tr><td>Fork</td><td>Branches into parallel paths. Multiple matching paths from other step types also run in parallel.</td></tr>
+<tr><td>Join</td><td>Waits for all incoming sources to finish, then proceeds only when every incoming path matches. Otherwise it is skipped. Use it to reunite parallel branches.</td></tr>
+<tr><td>End</td><td>Finishes a branch. At least one End is required.</td></tr>
+</tbody></table></div>
+<p>Step IDs appear on the canvas and in Step details. Use these IDs when specifying where fields are required. Deleting a step also removes its connected paths.</p>
+<p><strong>Keyboard:</strong> Tab to focus a step, Enter to edit its details, and arrow keys to move it by 10 pixels. Escape or Cancel connection exits connection mode. Back to start scrolls the canvas to its upper left corner.</p>
+<p><strong>Arrange top down</strong> lays out the graph in rows from Start to End. Parallel branches share a row. Drag steps to refine the layout; all connections use horizontal and vertical segments and route around other steps. The canvas grows with the diagram. Scroll the workflow tab to navigate; the palette and properties remain beside the diagram on larger screens.</p>
+<h2 id="paths">Connections and outcomes</h2>
+<p>Paths point from a source step’s OUT connector on the bottom to a destination’s IN connector on the top. Drag OUT to IN and release; a dashed preview follows your pointer and a valid destination is highlighted. You can also click an output connector, then IN. Start has no incoming connection; End finishes a branch and has no outgoing connection. The connection banner shows when you are choosing a destination. Click a path line or outcome label to select it and edit its outcome in the designer’s Path details panel. Choose always, success or reject from the suggestions, or type a custom outcome. To remove a path, select its line and click Delete path, or press Delete or Backspace while the canvas is focused.</p>
+<ul>
+<li><code>always</code> follows any completed outcome, including rejection.</li>
+<li><code>success</code> follows successful completion or approval.</li>
+<li><code>reject</code> follows rejection.</li>
+<li>A script can return a custom outcome name; use that exact name on the path.</li>
+</ul>
+<p>All matching paths are followed. An <code>always</code> path and a <code>reject</code> path can both run after a rejection. For mutually exclusive branches, use explicit outcomes. A Join needs all incoming paths to match; do not join alternative approval and rejection branches.</p>
+<p>The graph must have no cycles, all steps must be reachable from Start, and End steps cannot have outgoing paths. Save validates the definition and reports invalid settings.</p>
+<p>Decision diamonds select exactly one outgoing path. Give each path a unique name such as <code>yes</code> and <code>no</code>; do not use <code>always</code> on a decision. Each named choice has its own output connector on the diamond. Drag that connector to a destination to connect or rewire its branch. Use Add output in Step details for extra choices; connect every output before saving. Human participants see these names as buttons. Programmatic decisions return the same name in <code>outcome</code>. Forms and reviews retain their Complete/Approve and Reject choices.</p>
+<h2 id="fields">Form fields and permissions</h2>
+<p>Each field has a unique <strong>Key</strong> used in scripts and a <strong>Label</strong> shown to people. Types are text, textarea, number, boolean or choice. Choice options are comma-separated values.</p>
+<p><strong>Required at</strong> accepts comma-separated step IDs or <code>start</code>. For example, <code>start, request</code> requires a value when starting and when completing the request step. Leave empty for an optional field.</p>
+<p><strong>Can read</strong> and <strong>Can edit</strong> accept comma-separated <code>user:username</code>, <code>group:name</code>, <code>initiator</code>, <code>assignee</code> or <code>*</code>. Here, initiator means the person who started the process; assignee means a person assigned to the current task; * allows everyone. Empty grants no permission in that list. Administrators can read and edit fields regardless of these lists. A field required from a person should be visible and editable to them.</p>
+<h2 id="scripts">Automated checks and scripts</h2>
+<p>Define <code>function step(input)</code>. The input includes <code>fields</code>, <code>partId</code>, <code>revisionId</code> and <code>idempotencyKey</code>. Return an object with an outcome and optional field updates:</p>
+<pre><code>function step(input) {
+  return { outcome: "success", fields: { checked: true } };
+}</code></pre>
+<p>Return <code>false</code> for rejection, or throw an error to fail the step. The editor includes model-check, ERP-order and vendor-PDF examples. Configure endpoints and authentication before using integration examples. Script editing depends on the server’s script-editor settings.</p>
+<p>Scripts execute with trusted server capabilities, including <code>plm</code>, <code>http.request</code>, <code>fs</code> and <code>process</code>. Use the supplied idempotency key for external operations that might be retried.</p>
+<h2 id="running">Save and run</h2>
+<p>If the canvas is empty, add exactly one Start, at least one End, and connect the steps before saving. Save errors appear beside the editor toolbar; your draft stays available while you correct them. Save creates a version of the workflow. Existing processes keep the definition version they started with. Unsaved changes stay in this browser session’s editor draft; save before leaving or reloading the app.</p>
+<p>From a part page, select <strong>Start workflow</strong> to choose an available workflow for the selected revision. The part and revision are filled in automatically. The Revisions tab also offers Start workflow for each revision. To release a part, use a workflow with a Status step set to Released. From Workflows, select Start, enter a process title, choose an optional part and revision, and complete required starting fields. Participants receive Inbox tasks. The process view shows step states, form values and history. Administrators can retry a failed step after fixing its cause. Administrators and the initiator can cancel an active or blocked process.</p>
+</main></body></html>

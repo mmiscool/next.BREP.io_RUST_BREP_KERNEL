@@ -252,6 +252,80 @@ fn solve_band_storage(band: &CollocationBand, rhs: &[f64]) -> Result<Vec<f64>, S
     Ok(result)
 }
 
+// Three ordinates of one interpolant have the same collocation matrix.
+// Eliminate that matrix once, applying each row operation to each RHS in its
+// original order. Keep the original per-axis residual check and dense fallback.
+fn solve_collocation_banded_axes(
+    band: &CollocationBand,
+    mut rhs: [Vec<f64>; 3],
+) -> Result<[Vec<f64>; 3], String> {
+    let original = rhs.clone();
+    let count = band.count;
+    let bandwidth = band.bandwidth;
+    let width = 2 * bandwidth + 1;
+    let at = |row: usize, column: usize| row * width + column + bandwidth - row;
+    let fallback = || Ok([
+        solve_collocation_banded(band, &original[0])?,
+        solve_collocation_banded(band, &original[1])?,
+        solve_collocation_banded(band, &original[2])?,
+    ]);
+    if count == 0 || rhs.iter().any(|axis| axis.len() != count) {
+        return fallback();
+    }
+    let mut matrix = band.data.clone();
+    for column in 0..count {
+        let pivot = matrix[at(column, column)];
+        if pivot.abs() <= 1e-300 { return fallback(); }
+        let maximum_row = (column + bandwidth).min(count - 1);
+        for row in column + 1..=maximum_row {
+            let factor = matrix[at(row, column)] / pivot;
+            if factor == 0.0 { continue; }
+            let maximum_column = (column + bandwidth).min(count - 1);
+            for entry in column..=maximum_column {
+                matrix[at(row, entry)] -= factor * matrix[at(column, entry)];
+            }
+            for axis in &mut rhs {
+                axis[row] -= factor * axis[column];
+            }
+        }
+    }
+    let mut solutions = std::array::from_fn(|_| vec![0.0; count]);
+    for axis in 0..3 {
+        for row in (0..count).rev() {
+            let mut value = rhs[axis][row];
+            let maximum_column = (row + bandwidth).min(count - 1);
+            for column in row + 1..=maximum_column {
+                value -= matrix[at(row, column)] * solutions[axis][column];
+            }
+            if matrix[at(row, row)].abs() <= 1e-300 { return fallback(); }
+            solutions[axis][row] = value / matrix[at(row, row)];
+        }
+        let scale = original[axis].iter().fold(0.0_f64, |m, v| m.max(v.abs()));
+        let tolerance = 1e-9 * scale.max(1.0);
+        let mut residual = 0.0_f64;
+        for row in 0..count {
+            let lo = row.saturating_sub(bandwidth);
+            let hi = (row + bandwidth).min(count - 1);
+            let mut accumulated = 0.0;
+            for col in lo..=hi {
+                accumulated += band.get(row, col) * solutions[axis][col];
+            }
+            residual = residual.max((accumulated - original[axis][row]).abs());
+        }
+        if residual > tolerance {
+            solutions[axis] = solve_dense(band.to_dense(), original[axis].clone())?;
+        }
+    }
+    Ok(solutions)
+}
+
+fn assert_interpolant_bits(before: &NurbsCurve, after: &NurbsCurve) {
+    let bits = |c: &NurbsCurve| (c.degree,
+        c.knots.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+        c.control_points.iter().map(|p| (p.x.to_bits(), p.y.to_bits(), p.z.to_bits(), p.w.to_bits())).collect::<Vec<_>>());
+    assert_eq!(bits(before), bits(after), "shared interpolant elimination moved a coefficient");
+}
+
 pub fn solve_banded(
     matrix: &[Vec<f64>],
     rhs: &[f64],
@@ -379,6 +453,28 @@ pub fn interpolate_curve(
     degree: usize,
     parameters: &[f64],
 ) -> Result<NurbsCurve, String> {
+    let option = std::env::var("BREP_INTERPOLANT_AXIS_REUSE").unwrap_or_default();
+    let enabled = matches!(option.as_str(), "on" | "1" | "check");
+    if option == "check" {
+        let before = interpolate_curve_with_axis_reuse(points, degree, parameters, false);
+        let after = interpolate_curve_with_axis_reuse(points, degree, parameters, true);
+        match (&before, &after) {
+            (Ok(a), Ok(b)) => assert_interpolant_bits(a, b),
+            (Err(a), Err(b)) => assert_eq!(a, b),
+            _ => panic!("shared interpolant elimination changed the result"),
+        }
+        eprintln!("BREP_INTERPOLANT_AXIS_CENSUS stations={} matched=true", points.len());
+        return before;
+    }
+    interpolate_curve_with_axis_reuse(points, degree, parameters, enabled)
+}
+
+fn interpolate_curve_with_axis_reuse(
+    points: &[Vec3],
+    degree: usize,
+    parameters: &[f64],
+    reuse_axes: bool,
+) -> Result<NurbsCurve, String> {
     if points.len() < 2 || parameters.len() != points.len() {
         return Err(
             "interpolate_curve: points and parameters must have matching length >= 2".into(),
@@ -421,9 +517,15 @@ pub fn interpolate_curve(
             None => solve_collocation_banded(&band, &rhs),
         }
     };
-    let xs = solve_axis(|point| point.x)?;
-    let ys = solve_axis(|point| point.y)?;
-    let zs = solve_axis(|point| point.z)?;
+    let [xs, ys, zs] = if reuse_axes && dense.is_none() {
+        solve_collocation_banded_axes(&band, [
+            points.iter().map(|p| p.x).collect(),
+            points.iter().map(|p| p.y).collect(),
+            points.iter().map(|p| p.z).collect(),
+        ])?
+    } else {
+        [solve_axis(|point| point.x)?, solve_axis(|point| point.y)?, solve_axis(|point| point.z)?]
+    };
     NurbsCurve::new(
         degree,
         knots,

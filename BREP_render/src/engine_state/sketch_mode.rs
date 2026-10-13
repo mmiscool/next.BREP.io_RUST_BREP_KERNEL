@@ -60,6 +60,12 @@ pub struct SketchEdit {
     /// written back on commit, and captured in the undo snapshot so undo restores it
     /// alongside the doc.
     pub(super) external_refs: Vec<crate::sketch::ExternalRef>,
+    /// Names the feature's `projectedEdges` list carried at enter that had
+    /// nothing to materialize: the edge did not resolve in the backdrop scene
+    /// (a downstream edge, a typo). They are not links, so they are not in
+    /// `external_refs`, but Finish keeps them listed for the kernel to report
+    /// as unresolved — the editor never silently drops a dialog entry.
+    pub(super) listed_unlinked: Vec<String>,
     /// The in-progress freehand stroke (S6b-3): raw plane `(u, v)` samples captured
     /// during a handdraw drag, recognized into geometry on drag-end. Empty when no
     /// stroke is live. Transient interaction state — NOT part of the undo snapshot.
@@ -265,6 +271,23 @@ impl EngineState {
         // entry's dead dedup path would otherwise block the re-link forever). Reproject
         // (below) then only touches live refs.
         crate::sketch::external_ref::prune_dead_refs(&session.doc, &mut external_refs);
+        // The feature's `projectedEdges` list is the one record of the linked
+        // edges: every listed edge the backdrop resolves is materialized below
+        // (a dialog entry shows up in the editor), and a link the list no
+        // longer names was removed from the dialog — but only once a unified
+        // Finish stamped the marker; before that the entries were never
+        // listed, so they are adopted, not released.
+        let listed = brep_kernel::reference_names(
+            self.history
+                .feature_params(index)
+                .as_ref()
+                .and_then(|p| p.get("projectedEdges")),
+        );
+        let links_listed = persistent
+            .as_ref()
+            .and_then(|p| p.get(crate::sketch::external_ref::LINKS_LISTED_KEY))
+            .and_then(serde_json::Value::as_bool)
+            == Some(true);
 
         // Drop any MODEL selection carried in from picking the sketch plane, so no
         // faces/edges stay highlighted inside the sketch — the only highlight the
@@ -300,13 +323,17 @@ impl EngineState {
             redo_stack: Vec::new(),
             dim_drag_snapshotted: false,
             external_refs,
+            listed_unlinked: Vec::new(),
             handdraw_stroke: Vec::new(),
         });
-        // Re-project the loaded external refs against the CURRENT backdrop model so a
-        // linked edge tracks upstream geometry edits (best-effort; a no-op when the
-        // edge is absent — the persisted coords then stand as the fallback). This may
-        // move the ref points + re-solve, so re-read diagnostics afterward.
-        let reprojected = self.sketch_reproject_external_refs();
+        // Sync the links with the list against the CURRENT backdrop model: every
+        // loaded ref re-projects so a linked edge tracks upstream geometry edits,
+        // a listed edge without a ref is linked, and (once unified) a ref the
+        // list dropped is released. Best-effort on a missing edge — the
+        // persisted coords stand as the fallback; the regenerate fold, which
+        // has the kernel's word on what resolves, is what releases those. This
+        // may move the ref points + re-solve, so re-read diagnostics afterward.
+        let reprojected = self.sketch_sync_external_refs(&listed, links_listed);
         let diagnostics = if reprojected {
             self.sketch_edit
                 .as_ref()
@@ -357,11 +384,33 @@ impl EngineState {
                 // session changed nothing). A sketch this session created
                 // writes into its creation's step, so the whole new sketch is
                 // one step.
-                let fields = vec![
+                // The linked edges are the feature's `projectedEdges` list:
+                // listed order kept, dropped links gone, unmaterialized entries
+                // kept, new links appended.
+                let current = self.history.feature_params(index);
+                let listed = brep_kernel::reference_names(
+                    current.as_ref().and_then(|p| p.get("projectedEdges")),
+                );
+                let names = crate::sketch::external_ref::listed_edge_names(
+                    &listed,
+                    &edit.external_refs,
+                    &edit.listed_unlinked,
+                );
+                let mut fields = vec![
                     ("sketch", sketch_value),
                     ("dimOffsets", serde_json::Value::Object(edit.session.dim_offsets.clone())),
                     ("externalRefs", refs_value),
                 ];
+                // From the first Finish that has a link on, the list names every
+                // link (see `enter_sketch_mode`'s adopt-or-release rule). A
+                // sketch that never linked anything is left unstamped, so a
+                // Finish that changed nothing still writes nothing.
+                if !names.is_empty() || !edit.external_refs.is_empty() {
+                    fields.push((
+                        crate::sketch::external_ref::LINKS_LISTED_KEY,
+                        serde_json::Value::Bool(true),
+                    ));
+                }
                 match edit.creation_step {
                     Some(step) => {
                         self.history.set_feature_persistent_fields_in_step(index, fields, step);
@@ -369,6 +418,17 @@ impl EngineState {
                     None => {
                         self.history.set_feature_persistent_fields(index, fields);
                     }
+                }
+                // Write the links into the list. Folded without a checkpoint so
+                // Finish stays ONE undo step — the snapshot above already holds
+                // the pre-Finish list — and skipped when the names already match,
+                // so an unchanged Finish does not tick the revision.
+                if names != listed {
+                    self.history.fold_param_no_undo(
+                        &edit.feature_id,
+                        "projectedEdges",
+                        serde_json::Value::Array(names.into_iter().map(serde_json::Value::String).collect()),
+                    );
                 }
             }
         } else if edit.is_new {

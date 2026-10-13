@@ -329,10 +329,73 @@ pub fn accept_sound_against(
     accept_sound(solid, entry)
 }
 
+/// [`accept_sound_against`] reading only the faces in `candidates`: the faces
+/// the operation built or changed, their neighbours, and every face whose box
+/// reaches the other operand. A face outside that set is an operand's own,
+/// untouched, and lies clear of everything the operation added, so a crossing
+/// on it was the operand's and passes through exactly as the full scan passes
+/// it (the inputs are scanned, flagged, and the result returned). An empty
+/// set is a result with nothing to scan. A flagged subset hands the whole
+/// result to the full acceptance, so every repair and refusal reads as
+/// before. (`BooleanOptions::untouched_passthrough`)
+pub fn accept_sound_against_scoped(
+    inputs: &[&BrepSolid],
+    solid: BrepSolid,
+    entry: &str,
+    candidates: &rustc_hash::FxHashSet<u64>,
+) -> Result<BrepSolid, KernelRefusal> {
+    if candidates.is_empty() {
+        return Ok(solid);
+    }
+    let faces: Vec<crate::topology::FaceRecord> = solid
+        .shells
+        .iter()
+        .flat_map(|shell| &shell.faces)
+        .filter(|face| candidates.contains(&face.id))
+        .cloned()
+        .collect();
+    if faces.len() == solid.shells.iter().map(|shell| shell.faces.len()).sum::<usize>() {
+        return accept_sound_against(inputs, solid, entry);
+    }
+    let edge_ids: rustc_hash::FxHashSet<u64> = faces
+        .iter()
+        .flat_map(|face| &face.loops)
+        .flat_map(|loop_record| &loop_record.coedges)
+        .map(|coedge| coedge.edge_id)
+        .collect();
+    let edges: Vec<crate::topology::EdgeRecord> =
+        solid.edges.iter().filter(|edge| edge_ids.contains(&edge.id)).cloned().collect();
+    let vertex_ids: rustc_hash::FxHashSet<u64> =
+        edges.iter().flat_map(|edge| [edge.start_vertex_id, edge.end_vertex_id]).collect();
+    let subset = BrepSolid {
+        mass_properties_cache: Default::default(),
+        id: solid.id,
+        vertices: solid.vertices.iter().filter(|vertex| vertex_ids.contains(&vertex.id)).cloned().collect(),
+        edges,
+        shells: vec![crate::topology::ShellRecord { id: 1, faces }],
+        genus: 0,
+        kind: crate::BodyKind::Solid,
+    };
+    // The bands come from the whole result, as the full scan derives them.
+    let options = SelfIntersectionOptions::for_solid(&solid);
+    let report = scan_with(&subset, options, entry)?;
+    if !report.is_flagged() {
+        return Ok(solid);
+    }
+    accept_sound_against(inputs, solid, entry)
+}
+
 /// The scan, with a read failure reported as a refusal rather than swallowed:
 /// a result that could not be scanned is not a result that scanned clean.
 fn scan(solid: &BrepSolid, entry: &str) -> Result<SelfIntersectionReport, KernelRefusal> {
-    let options = SelfIntersectionOptions::for_solid(solid);
+    scan_with(solid, SelfIntersectionOptions::for_solid(solid), entry)
+}
+
+fn scan_with(
+    solid: &BrepSolid,
+    options: SelfIntersectionOptions,
+    entry: &str,
+) -> Result<SelfIntersectionReport, KernelRefusal> {
     solid_self_intersections(solid, options).map_err(|message| {
         KernelRefusal::internal(
             KernelStage::Validate,
@@ -3317,6 +3380,7 @@ fn one_face_body(solid: &BrepSolid, face_id: u64) -> Result<BrepSolid, KernelRef
         mass_properties_cache: Default::default(),
         id: solid.id,
         genus: 0,
+        kind: crate::BodyKind::Solid,
         vertices: solid
             .vertices
             .iter()

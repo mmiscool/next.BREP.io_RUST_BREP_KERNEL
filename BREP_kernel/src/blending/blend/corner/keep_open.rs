@@ -132,19 +132,6 @@ pub(in crate::blend) fn keep_open_surgery(
                     "blend: F1 does not use its end boundary edge",
                 )
             })?;
-        let (cr_parameter, first_edge_parameter, escalated) =
-            match support_crossing(solid, &rows.cr, first_boundary, at_start) {
-                Ok((s, t, _, escalated)) => (s, t, escalated),
-                Err(_) => support_crossing_uv(
-                    solid,
-                    &rows.cr,
-                    &rows.cr_pcurve,
-                    first_boundary,
-                    first_boundary_coedge,
-                    at_start,
-                )?,
-            };
-        crossings.note(escalated);
         let end_record = solid
             .shells
             .iter()
@@ -157,6 +144,20 @@ pub(in crate::blend) fn keep_open_surgery(
                     "blend: keep end face missing",
                 )
             })?;
+        let (cr_parameter, first_edge_parameter, escalated) =
+            match support_crossing(solid, &rows.cr, first_boundary, at_start) {
+                Ok((s, t, _, escalated)) => (s, t, escalated),
+                Err(_) => support_crossing_uv(
+                    solid,
+                    &rows.cr,
+                    &rows.cr_pcurve,
+                    first_boundary,
+                    first_boundary_coedge,
+                    at_start,
+                    end_record,
+                )?,
+            };
+        crossings.note(escalated);
         let (transverse, _blend_pcurve, end_pcurve) = transverse_curve(
             &rows,
             end_record,

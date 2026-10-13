@@ -52,11 +52,13 @@ mod tool;
 
 pub use edges::{
     chamfer_edge, chamfer_edge_angle, chamfer_edge_asymmetric, chamfer_edges_angle,
-    chamfer_edges_asymmetric, fillet_edge, fillet_edges, fillet_edges_reported,
+    chamfer_edges_asymmetric, fillet_edge, fillet_edges, fillet_edges_reported, fillet_edges_reported_at_offset,
     fillet_edges_variable, fillet_edges_variable_law, fillet_edges_variable_vertex_radii,
     BlendSelection,
 };
 pub(crate) use analyze::into_face_direction;
+pub(crate) use analyze::{face_grid_classes, NearestFaceSide};
+pub(crate) use analyze::{face_plane_normal, neighbour_carries_ball};
 
 use analyze::{
     analyze_edge, check_blend_interference, check_loop_self_crossings, check_mixed_concavity,
@@ -71,3 +73,4 @@ use tool::{
 };
 #[allow(unused_imports)] // consumed by the corner-closure lanes' cfg(test) siblings
 pub(crate) use edges::fillet_edge_cutter;
+pub(crate) use edges::fillet_edges_variable_stops;

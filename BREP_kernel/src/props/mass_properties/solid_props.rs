@@ -202,6 +202,118 @@ pub fn solid_signed_volume(solid: &BrepSolid) -> Result<f64, String> {
     result
 }
 
+/// The margin, as a fraction of the sum of the face contributions' magnitudes,
+/// inside which [`solid_signed_volume_for_sign`] trusts no reading of its own
+/// and integrates exactly. The skipped corrections are zero to rounding
+/// (collinear control points, 1e-12 of the extent), so this is a very wide
+/// safety margin, not a measured error.
+const SIGN_READING_MARGIN: f64 = 1e-6;
+
+/// [`solid_signed_volume`] read for its SIGN against `bar`, as the boolean's
+/// assembly reads it (`volume <= tolerance³` refuses an inverted shell).
+///
+/// The exact integration spends most of a trimmed wall's time on the sliver
+/// correction behind every chord of its rim pcurves; where such a pcurve is a
+/// straight line in uv (a bore's rims, 85 % of the plate case's 105 ms check:
+/// 256 chords per wall half, 442 368 correction stations in all) the sliver
+/// has no area and the correction is zero to rounding, so this reading skips
+/// it (`trimmed::with_straight_corrections_skipped`). Every other chord, face
+/// and route reads exactly as `solid_signed_volume` does; nothing is cached.
+///
+/// Native two-sphere supports with the certified trim scope can return a
+/// positive lower bound; `BREP_SPHERE_SIGN_BOUND=0|off` keeps the old path. Only a
+/// comparison against `bar` is meaningful for that result; it is never stored
+/// in the full mass cache. If the bound cannot prove `> bar`, the old path runs.
+///
+/// The verdict is the exact check's: when the reading sits within
+/// [`SIGN_READING_MARGIN`] of the magnitudes of the bar, the exact value is
+/// returned instead, bit for bit. Callers compare the result with `bar`.
+pub fn solid_signed_volume_for_sign(solid: &BrepSolid, bar: f64) -> Result<f64, String> {
+    let enabled = match std::env::var("BREP_SPHERE_SIGN_BOUND") {
+        Ok(value) => value == "1" || value == "on",
+        Err(std::env::VarError::NotPresent) => true,
+        Err(_) => false,
+    };
+    solid_signed_volume_for_sign_with_bound(solid, bar, enabled)
+}
+
+pub(super) fn solid_signed_volume_for_sign_with_bound(solid: &BrepSolid, bar: f64, enabled: bool) -> Result<f64, String> {
+    if enabled {
+        if let Some(lower) = super::sphere_sign::positive_volume_bound(solid) {
+            if bar.is_finite() && lower > bar {
+                if std::env::var("BREP_PROFILE").is_ok() {
+                    eprintln!("mass.sign_certificate kind=trimmed_spheres lower={lower:.9} bar={bar:.3e}");
+                }
+                return Ok(lower);
+            }
+        }
+    }
+    let token = super::profile::begin("solid_signed_volume_for_sign");
+    let outcome = super::trimmed::with_straight_corrections_skipped(|| {
+        let (mut reading, mut magnitude) = (0.0, 0.0);
+        for shell in &solid.shells {
+            let (volume, faces) = shell_volume_sign_reading(shell)?;
+            reading += volume;
+            magnitude += faces;
+        }
+        Ok::<(f64, f64), String>((reading, magnitude))
+    });
+    super::profile::end(token);
+    let (reading, magnitude) = outcome?;
+    if (reading - bar).abs() > SIGN_READING_MARGIN * magnitude {
+        return Ok(reading);
+    }
+    solid_signed_volume(solid)
+}
+
+/// [`shell_signed_volume`]'s sum under the caller's correction policy, with
+/// the sum of the face contributions' magnitudes beside it (the scale the
+/// sign reading's margin is read against).
+fn shell_volume_sign_reading(shell: &ShellRecord) -> Result<(f64, f64), String> {
+    let reference = shell_volume_reference(shell)?;
+    if std::env::var_os("BREP_PROFILE").is_some() {
+        eprintln!(
+            "mass.sign_reference faces={} reference=({:.9},{:.9},{:.9})",
+            shell.faces.len(), reference.x, reference.y, reference.z
+        );
+    }
+    let mut volume = 0.0;
+    let mut compensation = 0.0;
+    let mut magnitude = 0.0;
+    let face_lines = super::profile::face_lines_enabled();
+    for (face_index, face) in shell.faces.iter().enumerate() {
+        mass_profile(|p| p.faces += 1);
+        let line_before = face_lines.then(super::profile::snapshot);
+        let line_started = face_lines.then(Instant::now);
+        // A pure function of the face's content and the reference, served
+        // from the reading memo when this face was read about this reference
+        // before (`reading_memo.rs`). The stored term is the one read under
+        // `with_straight_corrections_skipped` — this function is that
+        // policy's only caller, which is what makes a key without the policy
+        // sound; a reader of the exact path must not share this memo. A
+        // failed reading is stored as `None` and recomputed below, so its
+        // error still propagates.
+        let contribution = match crate::reading_memo::memoized(
+            crate::reading_memo::Reading::SignContribution,
+            super::identity::face_contribution_identity(face, reference),
+            || face_volume_contribution_about(face, reference).ok(),
+        ) {
+            Some(contribution) => contribution,
+            None => face_volume_contribution_about(face, reference)?,
+        };
+        emit_face_line("shell_volume_sign_reading", 0, face_index, face, line_before, line_started);
+        magnitude += contribution.abs();
+        let next = volume + contribution;
+        if volume.abs() >= contribution.abs() {
+            compensation += (volume - next) + contribution;
+        } else {
+            compensation += (contribution - next) + volume;
+        }
+        volume = next;
+    }
+    Ok((volume + compensation, magnitude))
+}
+
 fn solid_signed_volume_uncached(solid: &BrepSolid) -> Result<f64, String> {
     let mut volume = 0.0;
     for shell in &solid.shells {

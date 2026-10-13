@@ -129,6 +129,7 @@ pub fn make_box_brep(
             faces,
         }],
         genus: 0,
+        kind: crate::BodyKind::Solid,
     };
     let issues = solid.validate();
     if !issues.is_empty() {
@@ -280,6 +281,7 @@ pub fn make_pyramid_brep(
             faces,
         }],
         genus: 0,
+        kind: crate::BodyKind::Solid,
     };
     let issues = solid.validate();
     if !issues.is_empty() {
@@ -460,6 +462,7 @@ pub fn make_cylinder_brep(
             faces: vec![side_face, bottom_face, top_face],
         }],
         genus: 0,
+        kind: crate::BodyKind::Solid,
     };
     let issues = solid.validate();
     if !issues.is_empty() {

@@ -2157,6 +2157,9 @@ impl FileDialog {
         }
         match store.browser_write(&name, &docs.engine().history_request_json()) {
             Ok(identity) => {
+                // The recent list's picture, under the identity the backend
+                // chose (the name the recent row will carry).
+                crate::plm::thumbnail::stage_recent(&identity, docs.engine(), docs.active_id());
                 self.name_buf = model_display_name(&identity);
                 let doc = docs.active_mut();
                 self.member_ack.remove(&doc.id());
@@ -3593,7 +3596,18 @@ pub struct FileMenuOutcome {
     pub javascript: bool,
 }
 
-/// Shared File menu for both appearances; workbench selection uses apply + store.
+/// The side of a recent row's thumbnail square, in points.
+pub const RECENT_THUMB_SIDE: f32 = crate::plm::thumbnail::RECENT_SIDE;
+
+/// The neutral square a recent document without a picture yet shows: the
+/// same size as a thumbnail, never a gap. Drawn through the SVG loader the
+/// menu's artwork already uses.
+const RECENT_PLACEHOLDER_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 40 40"><rect x="1.5" y="1.5" width="37" height="37" rx="4" fill="#8a8a8a" fill-opacity="0.16" stroke="#8a8a8a" stroke-opacity="0.45"/></svg>"##;
+
+/// Shared File menu for both appearances: the workbench picker on the left,
+/// the document commands on the right, the recent documents (with their
+/// thumbnails) in one column under both. Workbench selection uses apply +
+/// store.
 pub fn file_menu(
     ui: &mut egui::Ui,
     state: &mut EngineState,
@@ -3607,157 +3621,200 @@ pub fn file_menu(
     let presentation = crate::workbench::file_presentation;
     egui_extras::install_image_loaders(ui.ctx());
     let menu = ui.menu_button("File", |ui| {
-        let rows: Vec<_> = crate::workbench::FILE_COMMANDS
+        // Plugin workbenches declare no artwork of their own; they share the
+        // plugin manager's glyph.
+        let plugin_glyph = presentation("workbench:manage:plugins").glyph;
+        let dynamic = crate::workbench::owned_workbenches(state);
+        let workbench_rows: Vec<(&str, &str)> = crate::workbench::WORKBENCHES
+            .iter()
+            .map(|w| (w.glyph, w.label))
+            .chain(dynamic.iter().map(|w| (plugin_glyph, w.label.as_str())))
+            .collect();
+        let file_rows: Vec<_> = crate::workbench::FILE_COMMANDS
             .iter()
             .map(|p| (p.glyph, p.label()))
             .collect();
-        // A fixed measured width avoids feeding the popup's previous width back
-        // through full-width rows while egui settles its area.
-        ui.set_width(toolbar_button::menu_width(ui, &rows));
+        // Fixed measured widths — one per column — avoid feeding the popup's
+        // previous width back through full-width rows while egui settles its
+        // area. The recent rows span both columns.
+        let left_width = toolbar_button::menu_width_salted(ui, "workbench-measure", &workbench_rows);
+        let right_width = toolbar_button::menu_width(ui, &file_rows);
+        let gap = ui.spacing().item_spacing.x;
+        let width = left_width + gap + right_width;
+        ui.set_width(width);
         let max_height = ui.ctx().content_rect().height() * 0.8;
         ui.set_max_height(max_height);
+        // The whole body sits in one scroll area so a window too short for
+        // the columns themselves still shows a menu that fits; on any taller
+        // window the columns never scroll and only the recent list does, up
+        // to the room left under the cap (`cap_bottom`).
+        let cap_bottom = ui.max_rect().bottom();
         egui::ScrollArea::vertical()
+            .id_salt("file-menu-body")
             .auto_shrink([false, true])
             .max_height(max_height)
             .show(ui, |ui| {
-                for (class, p) in DocumentClass::ALL
-                    .into_iter()
-                    .zip(crate::workbench::NEW_DOCUMENT_COMMANDS)
-                {
-                    let row = toolbar_button::menu_row(
-                        ui,
-                        p.glyph,
-                        p.label(),
-                        false,
-                        ui.available_width(),
-                    );
-                    hits.insert(p.id.into(), row.rect);
-                    if class == DocumentClass::Normal {
-                        hits.insert("file:new".into(), row.rect);
-                        hits.insert("file:newmenu".into(), row.rect);
-                    }
-                    if row.clicked() {
-                        outcome.action = Some(FileAction::NewOfClass(class));
-                        ui.close();
-                    }
-                }
-                let open = toolbar_button::menu_row(
-                    ui,
-                    presentation("file:open").glyph,
-                    presentation("file:open").label(),
-                    false,
-                    ui.available_width(),
-                );
-                hits.insert("file:open".into(), open.rect);
-                if open.clicked() {
-                    outcome.action = Some(FileAction::Open);
-                    ui.close();
-                }
-                let recent = recent_documents(store);
-                if !recent.is_empty() {
-                    let caption = ui.weak("Recent Documents");
-                    hits.insert("file:recent".into(), caption.rect);
-                    for name in &recent {
-                        let row = ui
-                            .add(
-                                egui::Button::new(model_display_name(name))
-                                    .wrap_mode(egui::TextWrapMode::Truncate),
-                            )
-                            .on_hover_text(name);
-                        hits.insert(format!("file:recent:{name}"), row.rect);
-                        if row.clicked() {
-                            outcome.recent = Some(name.clone());
+                ui.horizontal_top(|ui| {
+                    // LEFT: the workbench picker.
+                    ui.vertical(|ui| {
+                        ui.set_width(left_width);
+                        ui.weak("Workbench");
+                        let current = crate::workbench::resolved_id(state, &state.settings.workbench);
+                        if current != state.settings.workbench {
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(format!(
+                                        "Unavailable workbench: {}; using Modeling",
+                                        state.settings.workbench
+                                    ))
+                                    .weak(),
+                                )
+                                .wrap(),
+                            );
+                        }
+                        let options = crate::workbench::WORKBENCHES
+                            .iter()
+                            .map(|w| (w.id, w.label, w.glyph))
+                            .chain(dynamic.iter().map(|w| (w.id.as_str(), w.label.as_str(), plugin_glyph)));
+                        for (id, label, glyph) in options {
+                            let row = toolbar_button::menu_row(ui, glyph, label, current == id, left_width);
+                            hits.insert(format!("workbench:item:{id}"), row.rect);
+                            if row.clicked() {
+                                let _ = state
+                                    .apply_settings_json(&serde_json::json!({"workbench": id}).to_string());
+                                let _ = store.write(crate::store::SETTINGS_KEY, &state.settings_json());
+                                ui.close();
+                            }
+                        }
+                    });
+                    // RIGHT: everything else, in the order the one-column menu had.
+                    ui.vertical(|ui| {
+                        ui.set_width(right_width);
+                        ui.weak("Document");
+                        for (class, p) in DocumentClass::ALL
+                            .into_iter()
+                            .zip(crate::workbench::NEW_DOCUMENT_COMMANDS)
+                        {
+                            let row = toolbar_button::menu_row(ui, p.glyph, p.label(), false, right_width);
+                            hits.insert(p.id.into(), row.rect);
+                            if class == DocumentClass::Normal {
+                                hits.insert("file:new".into(), row.rect);
+                                hits.insert("file:newmenu".into(), row.rect);
+                            }
+                            if row.clicked() {
+                                outcome.action = Some(FileAction::NewOfClass(class));
+                                ui.close();
+                            }
+                        }
+                        for (id, action) in [
+                            ("file:open", FileAction::Open),
+                            ("file:save", FileAction::Save),
+                            ("file:saveas", FileAction::SaveAs),
+                            ("file:import", FileAction::Import),
+                            ("file:export", FileAction::Export),
+                        ] {
+                            let p = presentation(id);
+                            let row = toolbar_button::menu_row(ui, p.glyph, p.label(), false, right_width);
+                            hits.insert(id.into(), row.rect);
+                            if row.clicked() {
+                                outcome.action = Some(action);
+                                ui.close();
+                            }
+                        }
+                        let properties = toolbar_button::menu_row(
+                            ui,
+                            presentation("properties").glyph,
+                            presentation("properties").label(),
+                            *properties_open,
+                            right_width,
+                        );
+                        hits.insert("properties".into(), properties.rect);
+                        if properties.clicked() {
+                            *properties_open = !*properties_open;
                             ui.close();
                         }
-                    }
-                }
+                        let settings = toolbar_button::menu_row(
+                            ui,
+                            presentation("settings").glyph,
+                            presentation("settings").label(),
+                            *settings_open,
+                            right_width,
+                        );
+                        hits.insert("settings".into(), settings.rect);
+                        if settings.clicked() {
+                            *settings_open = !*settings_open;
+                            ui.close();
+                        }
+                        // Plugin management sits under Settings: the plugin manager
+                        // and the JavaScript editor, the same rows in both styles.
+                        for (id, flag) in [
+                            ("workbench:manage:plugins", &mut outcome.plugins),
+                            ("workbench:manage:javascript", &mut outcome.javascript),
+                        ] {
+                            let row = toolbar_button::menu_row(
+                                ui,
+                                presentation(id).glyph,
+                                presentation(id).label(),
+                                false,
+                                right_width,
+                            );
+                            hits.insert(id.into(), row.rect);
+                            if row.clicked() {
+                                *flag = true;
+                                ui.close();
+                            }
+                        }
+                    });
+                });
 
-                for (id, action) in [
-                    ("file:save", FileAction::Save),
-                    ("file:saveas", FileAction::SaveAs),
-                    ("file:import", FileAction::Import),
-                    ("file:export", FileAction::Export),
-                ] {
-                    let p = presentation(id);
-                    let row = toolbar_button::menu_row(
-                        ui,
-                        p.glyph,
-                        p.label(),
-                        false,
-                        ui.available_width(),
-                    );
-                    hits.insert(id.into(), row.rect);
-                    if row.clicked() {
-                        outcome.action = Some(action);
-                        ui.close();
-                    }
-                }
-                let properties = toolbar_button::menu_row(
-                    ui,
-                    presentation("properties").glyph,
-                    presentation("properties").label(),
-                    *properties_open,
-                    ui.available_width(),
-                );
-                hits.insert("properties".into(), properties.rect);
-                if properties.clicked() {
-                    *properties_open = !*properties_open;
-                    ui.close();
-                }
-                let settings = toolbar_button::menu_row(
-                    ui,
-                    presentation("settings").glyph,
-                    presentation("settings").label(),
-                    *settings_open,
-                    ui.available_width(),
-                );
-                hits.insert("settings".into(), settings.rect);
-                if settings.clicked() {
-                    *settings_open = !*settings_open;
-                    ui.close();
-                }
-                // Plugin management sits under Settings: the plugin manager
-                // and the JavaScript editor, the same rows in both styles.
-                for (id, flag) in [
-                    ("workbench:manage:plugins", &mut outcome.plugins),
-                    ("workbench:manage:javascript", &mut outcome.javascript),
-                ] {
-                    let row = toolbar_button::menu_row(
-                        ui,
-                        presentation(id).glyph,
-                        presentation(id).label(),
-                        false,
-                        ui.available_width(),
-                    );
-                    hits.insert(id.into(), row.rect);
-                    if row.clicked() {
-                        *flag = true;
-                        ui.close();
-                    }
-                }
-                ui.separator();
-                ui.weak("Workbench");
-                let current = crate::workbench::resolved_id(state, &state.settings.workbench);
-                if current != state.settings.workbench {
-                    ui.weak(format!(
-                        "Unavailable workbench: {}; using Modeling",
-                        state.settings.workbench
-                    ));
-                }
-                let dynamic = crate::workbench::owned_workbenches(state);
-                let options = crate::workbench::WORKBENCHES
-                    .iter()
-                    .map(|w| (w.id, w.label))
-                    .chain(dynamic.iter().map(|w| (w.id.as_str(), w.label.as_str())));
-                for (id, label) in options {
-                    let row = ui.radio(current == id, label);
-                    hits.insert(format!("workbench:item:{id}"), row.rect);
-                    if row.clicked() {
-                        let _ = state
-                            .apply_settings_json(&serde_json::json!({"workbench": id}).to_string());
-                        let _ = store.write(crate::store::SETTINGS_KEY, &state.settings_json());
-                        ui.close();
-                    }
+                // BELOW BOTH: the recent documents, one column, a thumbnail each. The
+                // list scrolls under the 80% cap; the columns above it never do.
+                let recent = recent_documents(store);
+                if !recent.is_empty() {
+                    ui.separator();
+                    let caption = ui.weak("Recent Documents");
+                    hits.insert("file:recent".into(), caption.rect);
+                    let thumbs = crate::plm::thumbnail::recent_textures(ui.ctx(), store);
+                    let side = egui::Vec2::splat(RECENT_THUMB_SIDE);
+                    let row_height = RECENT_THUMB_SIDE + 2.0 * ui.spacing().button_padding.y;
+                    // The room left under the cap; at least two rows even when the
+                    // columns already fill it (then the outer area scrolls).
+                    let room = cap_bottom - ui.cursor().top();
+                    let list_height = room.max(2.0 * row_height + ui.spacing().item_spacing.y);
+                    egui::ScrollArea::vertical()
+                        .id_salt("file-recent")
+                        .auto_shrink([false, true])
+                        .max_height(list_height)
+                        .show(ui, |ui| {
+                            for name in &recent {
+                                let image = match thumbs.get(name) {
+                                    Some((_, texture)) => egui::Image::from_texture((texture.id(), side)),
+                                    None => egui::Image::new(egui::ImageSource::Bytes {
+                                        uri: "bytes://brep-recent-thumb/placeholder.svg".into(),
+                                        bytes: egui::load::Bytes::Static(RECENT_PLACEHOLDER_SVG.as_bytes()),
+                                    }),
+                                }
+                                .fit_to_exact_size(side);
+                                let row = ui
+                                    .add(
+                                        egui::Button::new((image, model_display_name(name)))
+                                            .wrap_mode(egui::TextWrapMode::Truncate)
+                                            .min_size(egui::vec2(width, row_height)),
+                                    )
+                                    .on_hover_text(name);
+                                hits.insert(format!("file:recent:{name}"), row.rect);
+                                let padding = ui.spacing().button_padding;
+                                let thumb = egui::Rect::from_min_size(
+                                    row.rect.min + egui::vec2(padding.x, (row.rect.height() - RECENT_THUMB_SIDE) / 2.0),
+                                    side,
+                                );
+                                hits.insert(format!("file:recent:thumb:{name}"), thumb);
+                                if row.clicked() {
+                                    outcome.recent = Some(name.clone());
+                                    ui.close();
+                                }
+                            }
+                        });
                 }
             });
     });

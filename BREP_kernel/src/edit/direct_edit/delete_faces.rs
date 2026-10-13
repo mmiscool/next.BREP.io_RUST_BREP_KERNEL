@@ -70,6 +70,15 @@
 //! carrier's runs close into one loop again. Nothing is intersected and nothing
 //! is guessed — every bridge is an edge the solid already had, continued.
 //!
+//! A planar opening can also end where two survivors share only a VERTEX,
+//! rather than interrupting a spine edge. Paired corners on the same two
+//! planar carriers define a straight closing edge, checked against both
+//! rebuilt trims. This extension can shrink one survivor while another grows,
+//! so it keeps winding rather than requiring each individual area to grow.
+//! Existing imported trim discrepancies are bounded at the bridge's source
+//! vertices; they cannot be increased. Curved vertex-only corners remain
+//! deferred, and interrupted spines retain their collinearity checks.
+//!
 //! A rejoined group is the one place this lane refits. Its faces are twins
 //! whose patches were fitted apart (a mirrored plane is the same plane with
 //! reflected control points and a flipped `same_sense`, which bit-identity
@@ -139,6 +148,10 @@ struct FacePatch {
     /// tangent line, that the deleted band interrupted. Empty for a pure
     /// cap, where every survivor loop closes on the topology it already has.
     bridges: Vec<EdgeRecord>,
+    /// A planar feature can rejoin at vertices rather than interrupted edges.
+    /// Extending its survivor planes can shrink one trim while growing another;
+    /// it is not the hole-loop cap's strictly area-increasing operation.
+    planar_vertex_rejoin: bool,
 }
 
 /// Survivor faces on ONE carrier that the free boundary's removal rejoins into
@@ -441,7 +454,22 @@ fn classify_patch(solid: &BrepSolid, face_ids: &[u64]) -> Option<FacePatch> {
         // closed shell. Capping has nothing to cap onto.
         return None;
     }
-    let (merges, bridges) = splice_fragments(solid, shell_index, &fragments, &patch_edges)?;
+    let (merges, bridges, planar_vertex_rejoin) =
+        splice_fragments(solid, shell_index, &fragments, &patch_edges)?;
+
+    if planar_vertex_rejoin {
+        let tolerance = (solid_model_scale(solid) * 1e-7).max(1e-9);
+        if solid.shells[shell_index].faces.iter().any(|face| {
+            selected.contains(&face.id)
+                && plane_of_surface(&face.surface, tolerance, "delete_faces_and_heal").is_err()
+        }) {
+            // Planar survivors also border curved blend networks. Their
+            // vertex-only corners do not make the selected cylinders a planar
+            // opening: keep that selection in the blend-network lane, which
+            // preserves the standing strips and caps of a later round.
+            return None;
+        }
+    }
 
     Some(FacePatch {
         shell_index,
@@ -450,6 +478,7 @@ fn classify_patch(solid: &BrepSolid, face_ids: &[u64]) -> Option<FacePatch> {
         merges,
         edges: patch_edges,
         bridges,
+        planar_vertex_rejoin,
     })
 }
 
@@ -544,9 +573,9 @@ fn splice_fragments(
     shell_index: usize,
     fragments: &[Fragment],
     patch_edges: &HashSet<u64>,
-) -> Option<(Vec<FaceMerge>, Vec<EdgeRecord>)> {
+) -> Option<(Vec<FaceMerge>, Vec<EdgeRecord>, bool)> {
     if fragments.is_empty() {
-        return Some((Vec::new(), Vec::new()));
+        return Some((Vec::new(), Vec::new(), false));
     }
     let mut by_start: HashMap<u64, usize> = HashMap::default();
     for (index, fragment) in fragments.iter().enumerate() {
@@ -580,6 +609,18 @@ fn splice_fragments(
     let scale = solid_model_scale(solid);
     let carriers = carrier_classes(solid, shell_index, fragments, scale)?;
     let corners = circuit_corners(fragments, &circuits, &carriers)?;
+    let planar_vertex_rejoin = corners.iter().any(|corner| corner.spine.is_none());
+    if planar_vertex_rejoin && fragments.iter().any(|fragment| {
+        plane_of_surface(
+            &solid.shells[shell_index].faces[fragment.face].surface,
+            (scale * 1e-7).max(1e-9),
+            "delete_faces_and_heal",
+        ).is_err()
+    }) {
+        // The vertex rejoin's area rule and endpoint residual bounds are
+        // planar constructions. Mixed or curved openings keep their old gate.
+        return None;
+    }
     let (rebuilt, bridges) = if corners.is_empty() {
         // Every circuit stays on one carrier all the way round: the pinch
         // rejoin, which closes on the topology it already has.
@@ -601,7 +642,14 @@ fn splice_fragments(
             Vec::new(),
         )
     } else {
-        rejoin_across_corners(solid, fragments, &circuits, &carriers, &corners)?
+        rejoin_across_corners(
+            solid,
+            shell_index,
+            fragments,
+            &circuits,
+            &carriers,
+            &corners,
+        )?
     };
 
     // --- Faces that share a rebuilt loop become ONE face -------------------
@@ -737,6 +785,11 @@ fn splice_fragments(
                 &candidate.loops,
                 &edges,
                 &source_carriers,
+                &if planar_vertex_rejoin {
+                    planar_bridge_residuals(solid, shell_index, &faces, &bridges, scale)
+                } else {
+                    HashMap::default()
+                },
                 scale,
             ) {
                 return None;
@@ -761,7 +814,7 @@ fn splice_fragments(
             surface,
         });
     }
-    Some((merges, bridges))
+    Some((merges, bridges, planar_vertex_rejoin))
 }
 
 
@@ -785,8 +838,9 @@ struct Corner {
     incoming: usize,
     outgoing: usize,
     vertex: u64,
-    /// The edge both flanking coedges ride.
-    spine: u64,
+    /// The edge both flanking coedges ride, when the opening interrupted one.
+    /// None at a planar pocket corner where the survivors only share a vertex.
+    spine: Option<u64>,
 }
 
 /// Whether every new coedge lies on `surface`, and each retained coedge is
@@ -800,12 +854,14 @@ struct Corner {
 /// already stand off their carrier. Rejoining preserves those edges verbatim;
 /// require their pointwise residual not to increase rather than rejecting a
 /// valid bridge because of an unrelated, inherited trim discrepancy. New
-/// bridge coedges have no source carrier and must meet the absolute tolerance.
+/// bridge coedges must meet the absolute tolerance, except for straight planar
+/// bridges with an explicit inherited endpoint-residual bound.
 fn loops_ride_carrier(
     surface: &NurbsSurface,
     loops: &[LoopRecord],
     edges: &HashMap<u64, EdgeRecord>,
     source_carriers: &HashMap<u64, &NurbsSurface>,
+    bridge_residuals: &HashMap<u64, f64>,
     scale: f64,
 ) -> bool {
     let tolerance = (scale * 1e-7).max(1e-9);
@@ -828,6 +884,12 @@ fn loops_ride_carrier(
                 continue;
             }
             let Some(source) = source_carriers.get(&coedge.id) else {
+                if bridge_residuals
+                    .get(&edge.id)
+                    .is_some_and(|limit| projection.distance <= limit + tolerance)
+                {
+                    continue;
+                }
                 return false;
             };
             match crate::project_point_to_surface(source, point) {
@@ -837,6 +899,55 @@ fn loops_ride_carrier(
         }
     }
     true
+}
+
+/// A straight bridge on a planar rejoin may inherit a trim discrepancy at
+/// its existing endpoints. Bound it by those endpoint residuals on the original
+/// carrier; linear interpolation on a plane cannot exceed that bound. Both
+/// endpoints must belong to this group's original trim, so this is not a
+/// tolerance for an arbitrary new edge or a curved carrier.
+fn planar_bridge_residuals(
+    solid: &BrepSolid,
+    shell_index: usize,
+    faces: &[usize],
+    bridges: &[EdgeRecord],
+    scale: f64,
+) -> HashMap<u64, f64> {
+    let mut residuals = HashMap::default();
+    let host = &solid.shells[shell_index].faces[faces[0]];
+    let Ok(plane) = plane_of_surface(
+        &host.surface,
+        (scale * 1e-7).max(1e-9),
+        "delete_faces_and_heal",
+    ) else {
+        return residuals;
+    };
+    let vertices: HashSet<u64> = faces
+        .iter()
+        .flat_map(|position| {
+            solid.shells[shell_index].faces[*position]
+                .loops
+                .iter()
+                .flat_map(|l| &l.coedges)
+        })
+        .filter_map(|c| solid.edges.iter().find(|e| e.id == c.edge_id))
+        .flat_map(|e| [e.start_vertex_id, e.end_vertex_id])
+        .collect();
+    for bridge in bridges {
+        if !vertices.contains(&bridge.start_vertex_id) || !vertices.contains(&bridge.end_vertex_id)
+        {
+            continue;
+        }
+        let endpoints = [bridge.start_vertex_id, bridge.end_vertex_id].map(|id| {
+            edge_point(solid, id)
+                .ok()
+                .map(|point| point.sub(plane.origin).dot(plane.normal).abs())
+        });
+        if let [Some(a), Some(b)] = endpoints {
+            residuals.insert(bridge.id, a.max(b));
+        }
+    }
+    residuals
 }
 
 /// Which carrier each fragment's face rides, as a class index — cosurface
@@ -880,10 +991,9 @@ fn carrier_classes(
 
 /// Every handover in `circuits` where the circuit changes carrier.
 ///
-/// `None` — not an empty list — when a handover changes carrier WITHOUT the
-/// two runs sharing an edge there. That is a genuine gap between neighbours
-/// rather than an interrupted edge, which is what re-intersection is for, so
-/// the whole classification declines and the caller's chain takes it.
+/// A shared edge is the spine interrupted by a band. Without one, the runs
+/// meet at a pocket vertex; the bridge builder accepts that case only for
+/// paired planar carriers, and the rebuilt trims must still ride those planes.
 fn circuit_corners(
     fragments: &[Fragment],
     circuits: &[Vec<usize>],
@@ -899,14 +1009,11 @@ fn circuit_corners(
             }
             let arriving = fragments[index].coedges.last()?.edge_id;
             let leaving = fragments[next].coedges.first()?.edge_id;
-            if arriving != leaving {
-                return None;
-            }
             corners.push(Corner {
                 incoming: index,
                 outgoing: next,
                 vertex: fragments[index].end,
-                spine: arriving,
+                spine: (arriving == leaving).then_some(arriving),
             });
         }
     }
@@ -926,6 +1033,7 @@ fn circuit_corners(
 /// chain that re-intersects it.
 fn rejoin_across_corners(
     solid: &BrepSolid,
+    shell_index: usize,
     fragments: &[Fragment],
     circuits: &[Vec<usize>],
     carriers: &HashMap<usize, usize>,
@@ -941,10 +1049,9 @@ fn rejoin_across_corners(
     let mut partner = vec![usize::MAX; corners.len()];
     for (index, corner) in corners.iter().enumerate() {
         let (arriving, leaving) = signature(corner);
-        let mut matches = corners
-            .iter()
-            .enumerate()
-            .filter(|(other, candidate)| *other != index && signature(candidate) == (leaving, arriving));
+        let mut matches = corners.iter().enumerate().filter(|(other, candidate)| {
+            *other != index && signature(candidate) == (leaving, arriving)
+        });
         let (found, _) = matches.next()?;
         if matches.next().is_some() {
             return None;
@@ -968,7 +1075,36 @@ fn rejoin_across_corners(
             continue;
         }
         let other = partner[index];
-        let bridge = bridge_edge(solid, &corners[index], &corners[other], next_id, tolerance)?;
+        let bridge = if corners[index].spine.is_some() && corners[other].spine.is_some() {
+            bridge_edge(solid, &corners[index], &corners[other], next_id, tolerance)?
+        } else {
+            // An open pocket can terminate at a vertex shared by two survivor
+            // planes without sharing a survivor edge there. Its paired corners
+            // still define the straight boundary of both rejoined planes.
+            for corner in [&corners[index], &corners[other]] {
+                for fragment in [corner.incoming, corner.outgoing] {
+                    let face = &solid.shells[shell_index].faces[fragments[fragment].face];
+                    plane_of_surface(&face.surface, tolerance, "delete_faces_and_heal").ok()?;
+                }
+            }
+            let start = edge_point(solid, corners[index].vertex).ok()?;
+            let end = edge_point(solid, corners[other].vertex).ok()?;
+            if end.sub(start).length() <= tolerance {
+                return None;
+            }
+            let curve = make_line(start, end).ok()?;
+            let [t0, t1] = curve.domain().ok()?;
+            EdgeRecord {
+                id: next_id,
+                curve,
+                t0,
+                t1,
+                start_vertex_id: corners[index].vertex,
+                end_vertex_id: corners[other].vertex,
+                degenerate: false,
+                name: None,
+            }
+        };
         next_id += 1;
         bridge_at.insert(index, (bridge.id, true));
         bridge_at.insert(other, (bridge.id, false));
@@ -1082,7 +1218,10 @@ fn bridge_edge(
     }
     let direction = span.scale(1.0 / length);
     for (corner, anchor, sense) in [(from, start, -1.0f64), (to, end, 1.0f64)] {
-        let spine = solid.edges.iter().find(|edge| edge.id == corner.spine)?;
+        let spine = solid
+            .edges
+            .iter()
+            .find(|edge| Some(edge.id) == corner.spine)?;
         let mut reach = 0.0f64;
         for step in 0..=8 {
             let t = spine.t0 + (spine.t1 - spine.t0) * step as f64 / 8.0;
@@ -1349,7 +1488,14 @@ fn cap_preconditions(solid: &BrepSolid, patch: &FacePatch, op: &str) -> Result<(
             let winding = parameter_space_area(&rejoined)
                 .or_refuse(KernelStage::Classify, "parameter_space_area")?;
             let host_winding = loop_signed_area(host, 0)?;
-            if after <= before * (1.0 + 1e-9) || winding * host_winding <= 0.0 {
+            // A vertex rejoin extends a stepped planar feature's survivors,
+            // and one can shrink as another grows. Its winding must remain
+            // intact; connectivity, Euler accounting and soundness still
+            // check the completed body. Ordinary caps must strictly grow.
+            if after <= 0.0
+                || (!patch.planar_vertex_rejoin && after <= before * (1.0 + 1e-9))
+                || winding * host_winding <= 0.0
+            {
                 return Err(KernelRefusal::unsupported(
                     KernelStage::Classify,
                     "rejoin_shrinks_grown",

@@ -465,6 +465,7 @@ fn conform_overlapping_one_use_edges_pass(
                         name: edge.name.clone(),
                         constructed: parent_constructed,
                         boundary_key: parent_key,
+                        tangent_side: None,
                     },
                     forward,
                 )?;

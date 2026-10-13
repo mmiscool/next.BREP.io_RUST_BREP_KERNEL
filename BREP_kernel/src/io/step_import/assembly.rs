@@ -146,6 +146,11 @@ pub struct StepAssembly {
     /// of a reference, it arrives as a row that reports itself.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pmi_diagnostics: Vec<String>,
+    /// Open `SHELL_BASED_SURFACE_MODEL` sheets this lane skipped, summed over
+    /// every product's bodies: not solids, so in no product's `failed_bodies`,
+    /// and uncounted before 2026-10-12 (`SHEETS_SKIPPED` on the flat lane).
+    #[serde(default)]
+    pub sheets_skipped: usize,
 }
 
 /// Read a STEP file's product structure AND build each product's own bodies, in
@@ -199,6 +204,7 @@ pub fn read_step_assembly(text: &str) -> Result<Option<StepAssembly>, String> {
         refusals,
     } = resolve_structure_edges(&entities, &edges, |node| scales.get(node));
     let mut first_error: Option<String> = refusals.first().map(ToString::to_string);
+    let mut sheets_skipped = 0usize;
     if edges.is_empty() {
         return Ok(None); // every edge refused: nothing to build a structure from
     }
@@ -262,8 +268,9 @@ pub fn read_step_assembly(text: &str) -> Result<Option<StepAssembly>, String> {
                     appearances.push(appearance.clone());
                 }
                 // An OPEN SHELL_BASED_SURFACE_MODEL sheet is not a solid body:
-                // skipped, not counted, exactly as both existing lanes do.
-                Err(_) if matches!(body, StepBody::SurfaceModelShell { .. }) => {}
+                // skipped, never a failed body, exactly as both other lanes do;
+                // counted as a skipped sheet since 2026-10-12.
+                Err(_) if matches!(body, StepBody::SurfaceModelShell { .. }) => sheets_skipped += 1,
                 Err(error) => {
                     failed_bodies += 1;
                     if first_error.is_none() {
@@ -359,6 +366,7 @@ pub fn read_step_assembly(text: &str) -> Result<Option<StepAssembly>, String> {
         first_error,
         pmi: pmi.assembly,
         pmi_diagnostics: pmi.diagnostics,
+        sheets_skipped,
     }))
 }
 

@@ -99,9 +99,29 @@ pub(super) fn tessellate_faces_stride(
             sequential_face_id += 1;
         }
     }
+    // `BREP_PROFILE_TESS_FACES`: arm the counters when nothing outer did (the
+    // soundness scan enters here, not through the orient entry) and print one
+    // `tess.face` line per face; the whole call's `tess.profile` line follows
+    // at the end when this call armed them. Nothing here touches the mesh.
+    let armed_here = arm_for_face_lines();
+    let face_lines = face_lines_enabled();
     tess_profile(|p| p.faces += work.len() as u64);
     let mesh_one = |face_id: u32, face: &FaceRecord| -> Result<Mesh, String> {
         let mut fragment = Mesh::default();
+        if face_lines {
+            let before = snapshot();
+            let started = web_time::Instant::now();
+            tess_profile(|p| p.route = 0);
+            tessellate_face_watertight(face, samples, chord_tolerance, face_id, &mut fragment)?;
+            report_face(
+                face_id,
+                face,
+                fragment.indices.len() / 3,
+                started.elapsed().as_secs_f64() * 1_000.0,
+                before,
+            );
+            return Ok(fragment);
+        }
         tessellate_face_watertight(face, samples, chord_tolerance, face_id, &mut fragment)?;
         Ok(fragment)
     };
@@ -119,7 +139,11 @@ pub(super) fn tessellate_faces_stride(
         .iter()
         .map(|&(id, face)| mesh_one(id, face))
         .collect::<Result<Vec<Mesh>, String>>()?;
-    Ok(concatenate_meshes(fragments))
+    let mesh = concatenate_meshes(fragments);
+    if armed_here.is_some() {
+        profile::end(armed_here, chord_tolerance, mesh.indices.len() / 3);
+    }
+    Ok(mesh)
 }
 
 /// Concatenate mesh fragments in order, re-basing each fragment's triangle

@@ -1992,6 +1992,11 @@ pub struct OffsetFaceCarrier {
     /// that payload byte-identical.
     #[serde(skip)]
     pub deviation: Option<CarrierDeviation>,
+    /// Which branch built the carrier surface (always known; `deviation`
+    /// carries it too, but only on the measured entry point). Skipped on the
+    /// ABI for the same reason as `deviation`.
+    #[serde(skip)]
+    pub lane: OffsetSurfaceLane,
 }
 
 fn claim_vertex_image(
@@ -2394,6 +2399,7 @@ fn offset_face_carrier_impl(
             name: source.name.as_ref().map(|name| format!("{name}_Offset")),
         },
         deviation,
+        lane,
     })
 }
 

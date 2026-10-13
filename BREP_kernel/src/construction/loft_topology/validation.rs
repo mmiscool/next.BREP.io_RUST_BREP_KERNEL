@@ -8,20 +8,37 @@ pub(super) fn validate_sections(
     operation: &str,
     detailed_errors: bool,
 ) -> Result<usize, KernelRefusal> {
+    let curve_count = validate_section_loops(sections, tolerance, operation)?;
+    validate_representations(sections, operation, detailed_errors)?;
+    Ok(curve_count)
+}
+
+/// Loop topology is independent of the NURBS representation of each edge.
+pub(super) fn validate_section_loops(
+    sections: &[Vec<NurbsCurve>],
+    tolerance: f64,
+    operation: &str,
+) -> Result<usize, KernelRefusal> {
     let curve_count = sections[0].len();
     if sections.iter().any(|section| section.len() != curve_count) {
         return Err(KernelRefusal::input(
             KernelStage::Collect,
             "curve_count",
-            format!(
-                "{operation}: sections must have the same curve count"
-            ),
+            format!("{operation}: sections must have the same curve count"),
         ));
     }
     for section in sections {
         closed_points(section, tolerance)?;
     }
-    for curve_index in 0..curve_count {
+    Ok(curve_count)
+}
+
+fn validate_representations(
+    sections: &[Vec<NurbsCurve>],
+    operation: &str,
+    detailed_errors: bool,
+) -> Result<(), KernelRefusal> {
+    for curve_index in 0..sections[0].len() {
         let reference = &sections[0][curve_index];
         for (section_index, section) in sections.iter().enumerate().skip(1) {
             let curve = &section[curve_index];
@@ -51,9 +68,7 @@ pub(super) fn validate_sections(
                 return Err(KernelRefusal::input(
                     KernelStage::Collect,
                     "section_knots",
-                    format!(
-                        "{operation}: section {section_index} curve {curve_index} {reason}"
-                    ),
+                    format!("{operation}: section {section_index} curve {curve_index} {reason}"),
                 ));
             }
             if curve
@@ -70,14 +85,12 @@ pub(super) fn validate_sections(
                 return Err(KernelRefusal::input(
                     KernelStage::Collect,
                     "section_weights",
-                    format!(
-                        "{operation}: section {section_index} curve {curve_index} {reason}"
-                    ),
+                    format!("{operation}: section {section_index} curve {curve_index} {reason}"),
                 ));
             }
         }
     }
 
-    Ok(curve_count)
+    Ok(())
 }
 

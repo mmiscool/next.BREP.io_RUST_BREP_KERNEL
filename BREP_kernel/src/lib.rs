@@ -42,6 +42,7 @@ pub use curve::{
 mod blend;
 pub use blend::{
     take_blend_approximations, take_blend_notes,
+    blend_timing_capture, take_blend_timings, BlendTiming,
     blend_closed_edge, blend_edge_variable, blend_open_edge, blend_smooth_chain,
     round_convex_corner,
 };
@@ -49,7 +50,7 @@ pub use blend::{
 mod fillet;
 pub use fillet::{
     chamfer_edge, chamfer_edge_angle, chamfer_edge_asymmetric, chamfer_edges_angle,
-    chamfer_edges_asymmetric, fillet_edge, fillet_edges, fillet_edges_reported,
+    chamfer_edges_asymmetric, fillet_edge, fillet_edges, fillet_edges_reported, fillet_edges_reported_at_offset,
     fillet_edges_variable, fillet_edges_variable_law, fillet_edges_variable_vertex_radii,
     BlendSelection,
 };
@@ -74,6 +75,12 @@ pub use surface::{
     make_revolution, make_sphere_surface, make_sphere_surface_framed, make_torus_surface,
     ExtendRefusal, NurbsSurface, SurfaceSide, WeightSite, MAXIMUM_FOLD_ANGLE,
     MAXIMUM_GROWTH_RATIO,
+};
+#[path = "geometry/control_cage.rs"]
+mod control_cage;
+pub use control_cage::{
+    CagePoint, CagePrimitive, ControlCage, CAGE_DEGREE, MAX_RINGS, MAX_SEGMENTS, MIN_RINGS,
+    MIN_SEGMENTS,
 };
 #[path = "geometry/coons.rs"]
 mod coons;
@@ -103,12 +110,12 @@ pub use sphere_chart::{
 };
 #[path = "brep/solid_codec.rs"]
 mod solid_codec;
-pub use solid_codec::{decode_solid, encode_solid, SolidNames, SOLID_CODEC_VERSION};
+pub use solid_codec::{decode_solid, encode_solid, SolidNames, SOLID_CODEC_VERSION, SOLID_CODEC_VERSION_KIND};
 #[path = "brep/topology.rs"]
 mod topology;
 pub use topology::{
-    make_box_brep, make_cylinder_brep, make_pyramid_brep, BrepSolid, FaceRecord, IssueKind,
-    ValidationReport,
+    make_box_brep, make_cylinder_brep, make_pyramid_brep, topology_kind, BodyKind, BrepSolid,
+    FaceRecord, IssueKind, KindReport, TopologyKind, ValidationReport,
 };
 #[path = "brep/soundness.rs"]
 mod soundness;
@@ -162,6 +169,8 @@ pub use loft_topology::{
 pub(crate) use loft_topology::loft_profile_brep_closed_shifted;
 #[path = "brep/transform_topology.rs"]
 mod transform_topology;
+#[path = "brep/recentre.rs"]
+mod recentre;
 pub use transform_topology::{mirror_brep, transform_brep, AffineTransform};
 #[path = "edit/split.rs"]
 mod split;
@@ -174,7 +183,8 @@ pub use mass_properties::{
     curve_arc_length, edge_arc_length, face_area, face_boundary_length, face_volume_contribution,
     face_set_identity, mass_caller, parameter_space_area, solid_edge_length_total,
     solid_mass_properties,
-    solid_mass_properties_full, solid_signed_volume, trim_polygons, DensityMassProperties,
+    solid_mass_properties_full, solid_signed_volume, solid_signed_volume_for_sign, trim_polygons,
+    DensityMassProperties,
     FaceSetIdentity, FullMassProperties, MassCaller, MassProperties, MassPropertiesCache,
 };
 #[path = "meshing/tessellation.rs"]
@@ -256,6 +266,15 @@ pub use feature_pipeline::pmi::annotations::fcf::{characteristic as pmi_characte
 // geometries so per-loop face names survive deleting the edge an id came from.
 // The editor calls it when a sketch is committed.
 pub use feature_pipeline::assign_sketch_loop_ids;
+// The 3D sketch feature's reference resolver and record shape, shared with the
+// engine-native 3D sketch editor so the editor materializes exactly what the
+// feature re-resolves on every run.
+pub use feature_pipeline::features::sketch3d::{
+    reference_record as sketch3d_reference_record, resolve_reference as resolve_sketch3d_reference,
+    ResolvedReference as Sketch3dResolvedReference, REFERENCE_TIP_LENGTH as SKETCH3D_REFERENCE_TIP_LENGTH,
+    SKETCH3D_DOC_KEY, SKETCH3D_EDIT_BUTTON, SKETCH3D_FEATURE_TYPE, SKETCH3D_REFERENCES_PARAM,
+    SKETCH3D_REFS_KEY,
+};
 // Sheet-metal flat-pattern (unfold) → 2D vector export, keyed by resident handle.
 pub use feature_pipeline::{flat_pattern_dxf, flat_pattern_svg, is_sheet_metal_handle};
 // Native IMPORT3D payload: finished solids → the `io/snapshot` container with
@@ -358,6 +377,12 @@ pub use surface_surface_intersection::{
     SurfaceIntersectionOptions,
 };
 pub(crate) use surface_surface_intersection::TRANSVERSE_SEED_CROSS;
+#[path = "intersect/tangent_curve.rs"]
+mod tangent_curve;
+pub use tangent_curve::{
+    classify_tangent_contact_at, find_tangent_contact, trace_tangent_curve, TangentContact,
+    EXTENDED_RANK_FLOOR,
+};
 #[path = "brep/classification.rs"]
 mod classification;
 pub use classification::{
@@ -397,7 +422,7 @@ pub use pcurve::{
 mod imprint;
 pub use imprint::{
     build_imprints, EdgeSplitRecord, FaceImprints, FaceKey, FacePcurve, ImprintOptions,
-    ImprintPieceRecord, ImprintResultRecord, ImprintVertex,
+    ImprintPieceRecord, ImprintResultRecord, ImprintVertex, TangentSectionRecord,
 };
 #[path = "csg/edge_split.rs"]
 mod edge_split;
@@ -411,7 +436,7 @@ pub use fragment::{
 #[path = "csg/boolean/mod.rs"]
 mod boolean;
 pub use boolean::{
-    boolean_operation, boolean_operation_nary, boolean_operation_with_diagnostics, boolean_split_operands,
+    boolean_operation, boolean_operation_nary, boolean_operation_with_diagnostics, boolean_operation_with_diagnostics_at_offset, boolean_split_operands,
     BooleanOperation, BooleanOptions,
 };
 #[path = "csg/oracle.rs"]
@@ -422,6 +447,10 @@ pub use oracle::{
 };
 #[path = "healing/heal.rs"]
 mod heal;
+// The content-keyed memo of the per-coedge readings the heal pre-pass and
+// the assembly's inherited-trim challenger take on every boolean.
+#[path = "healing/reading_memo.rs"]
+mod reading_memo;
 // The soundness ACCEPTANCE: the one place a construction lane asks "is this
 // result sound enough to return", repairs it where it can and refuses it by
 // name where it cannot. Declared beside the heal pre-pass it is the mirror of
@@ -430,7 +459,7 @@ mod heal;
 #[path = "healing/accept.rs"]
 mod accept;
 pub use accept::{
-    accept_sound, accept_sound_against, resolve_face_crossing, resolve_face_crossing_between,
+    accept_sound, accept_sound_against, accept_sound_against_scoped, resolve_face_crossing, resolve_face_crossing_between,
     take_crossing_repairs,
     CrossingRepairRecord,
 };
@@ -522,13 +551,13 @@ mod face_merge;
 #[allow(dead_code)]
 #[path = "healing/faceted_repair.rs"]
 mod faceted_repair;
-pub use face_merge::{merge_same_surface_faces, merge_same_surface_faces_excluding};
+pub use face_merge::{merge_same_surface_faces, merge_same_surface_faces_excluding, merge_same_surface_faces_scoped};
 pub use faceted_repair::{mesh_to_faceted_brep, repair_triangle_soup, MeshRepairReport};
 #[path = "offset/offset_shell.rs"]
 mod offset_shell;
 pub use offset_shell::{
-    offset_shell, offset_shell_with_diagnostics, OffsetFaceRole, OffsetShellFaceImageRecord,
-    OffsetShellResultRecord,
+    offset_shell, offset_shell_by_boolean, offset_shell_with_diagnostics, offset_solid, OffsetCorners,
+    OffsetFaceRole, OffsetShellFaceImageRecord, OffsetShellResultRecord,
 };
 pub(crate) use offset_shell::{is_offset_shell_no_retained_face, is_offset_shell_open_curved_rim};
 #[path = "io/step_matrix.rs"]
@@ -615,6 +644,14 @@ pub use assembly_solver::{
 // Assembly selection resolution: a namespaced selection ref resolved to an
 // analytic frame (plane/axis/sphere/circle/line/point) read from the exact
 // BREP, feeding `MateKind` inputs in component-local coordinates.
+#[path = "solvers/sketch3d_solver.rs"]
+mod sketch3d_solver;
+pub use sketch3d_solver::{
+    sketch3d_constraint_type, solve_sketch3d, solve_sketch3d_doc, solve_sketch3d_from_json,
+    Sketch3dConstraint, Sketch3dConstraintType, Sketch3dDiagnostics, Sketch3dDoc,
+    Sketch3dGeometry, Sketch3dPoint, Sketch3dSolveOptions, SolveSketch3dRequest,
+    SKETCH3D_CONSTRAINT_TYPES,
+};
 #[path = "solvers/assembly_resolve.rs"]
 mod assembly_resolve;
 pub use assembly_resolve::{
