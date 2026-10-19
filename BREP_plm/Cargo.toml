@@ -1,6 +1,6 @@
 [package]
 name = "BREP_plm"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2021"
 # The floor the rest of the family builds on, and the compiler
 # rust-toolchain.toml pins. Nothing here needs more.
@@ -18,6 +18,7 @@ include = [
     "src/**/*.rs",
     "/web/index.html",
     "/web/app.js",
+    "/web/webmcp.js",
     "/web/native-import.js",
     "/web/setup.js",
     "/web/workflows.js",
@@ -92,8 +93,8 @@ brep-script-core = { package = "BREP_script_core", version = "0.1.2", path = "..
 # Scripts' synchronous `http.request`. Sync on purpose: a Boa host function
 # cannot await, and every call carries its own timeout.
 ureq = "2"
-brep-kernel = { package = "BREP_kernel", version = "0.9.0", path = "../BREP_kernel" }
-brep-ecad-core = { package = "BREP_ecad_core", version = "0.2.1", path = "../BREP_ecad_core" }
+brep-kernel = { package = "BREP_kernel", version = "0.10.0", path = "../BREP_kernel" }
+brep-ecad-core = { package = "BREP_ecad_core", version = "0.3.0", path = "../BREP_ecad_core" }
 # Optional native TLS (`--tls-cert` / `--tls-key`). rustls and ring are
 # already in the tree through ureq; ring, not aws-lc, so no cmake. Plain
 # HTTP/1.1 over the TLS stream, through hyper directly, because axum 0.7's

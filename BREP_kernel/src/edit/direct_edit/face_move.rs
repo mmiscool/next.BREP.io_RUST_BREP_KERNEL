@@ -2657,7 +2657,13 @@ pub fn move_faces(
     }
     // Belt and braces on top of the per-edge inversion guard: a global
     // inversion flips the signed volume even if every edge kept its direction.
-    if let (Ok(before), Ok(after)) = (solid_signed_volume(solid), solid_signed_volume(&result)) {
+    // Sign only, through the per-face term memo (`solid_signed_volume_for_sign`:
+    // the verdict against the bar is the exact integral's; a face read about
+    // the same reference before is served its term). 2026-10-17, the
+    // shelled-box report: the exact reads cost 0.26 s a body here.
+    if let (Ok(before), Ok(after)) =
+        (crate::signed_volume_against(solid, 0.0), crate::signed_volume_against(&result, 0.0))
+    {
         if before * after <= 0.0 {
             return Err(KernelRefusal::unsupported(KernelStage::Validate, SOLID_INVERSION,
                 "move_faces: the translation inverts the solid (signed volume changed sign) \
@@ -3071,7 +3077,13 @@ fn move_planar_face_across_sphere(
             "move_faces: moved solid failed validation: {issues:?}"
         )));
     }
-    if let (Ok(before), Ok(after)) = (solid_signed_volume(solid), solid_signed_volume(&result)) {
+    // Sign only, through the per-face term memo (`solid_signed_volume_for_sign`:
+    // the verdict against the bar is the exact integral's; a face read about
+    // the same reference before is served its term). 2026-10-17, the
+    // shelled-box report: the exact reads cost 0.26 s a body here.
+    if let (Ok(before), Ok(after)) =
+        (crate::signed_volume_against(solid, 0.0), crate::signed_volume_against(&result, 0.0))
+    {
         if before * after <= 0.0 {
             return Err(KernelRefusal::unsupported(KernelStage::Validate, SPHERE_SOLID_INVERSION,
                 "move_faces: the push inverts the solid (signed volume changed sign) — refusing"));

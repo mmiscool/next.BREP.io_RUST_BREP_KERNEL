@@ -27,6 +27,7 @@ pub struct ModeBar {
 }
 
 impl ModeBar {
+    pub(crate) fn clear_hits(&mut self) { self.hits.clear(); }
     pub fn new() -> Self {
         Self::default()
     }

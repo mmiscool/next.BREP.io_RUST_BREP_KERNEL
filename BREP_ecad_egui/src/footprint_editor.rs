@@ -734,9 +734,9 @@ impl FootprintEditor {
         let name = ui.text_edit_singleline(&mut self.footprint.name);
         self.inspector.mark("footprint_name", &name);
         ui.small(format!(
-            "{} pads · {} silkscreen lines",
-            self.footprint.pads.len(),
-            self.footprint.silk.len()
+            "{} · {}",
+            crate::count(self.footprint.pads.len(), "pad", "pads"),
+            crate::count(self.footprint.silk.len(), "silkscreen line", "silkscreen lines")
         ));
         // What the pads are ON, at a glance and before anything is selected,
         // because the failure this answers is that a user cannot tell.

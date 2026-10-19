@@ -184,7 +184,29 @@ impl FileExplorer {
         let mut out = FileExplorerOutput::default();
 
         let selected_before = self.selected.clone();
-        self.show_nav_bar(ui, store, &location, options, &mut out);
+        let compact = crate::viewport::touch::compact(ui.ctx());
+        if compact {
+            ui.horizontal_wrapped(|ui| {
+                let places_menu = ui.menu_button("Places", |ui| {
+                    ui.set_height((ui.ctx().content_rect().height() - 100.0).clamp(80.0, 300.0));
+                    self.show_sidebar(ui, store, &places, &pins, &location, options, &mut out);
+                });
+                out.hits.push((format!("{}:places-menu", options.hit_prefix), places_menu.response.rect));
+                let up = ui.add(egui::Button::new("Up").min_size(crate::viewport::touch::target_size(ui.ctx(), egui::Vec2::ZERO)));
+                out.hits.push((format!("{}:up", options.hit_prefix), up.rect));
+                if up.clicked() { self.nav(store, || store.browser_up()); }
+                let folder = ui.menu_button("Folder", |ui| {
+                    self.show_nav_bar(ui, store, &location, options, &mut out);
+                    let hidden = ui.checkbox(&mut self.show_hidden, "Show hidden files");
+                    out.hits.push((format!("{}:hidden-toggle", options.hit_prefix), hidden.rect));
+                });
+                out.hits.push((format!("{}:folder-menu", options.hit_prefix), folder.response.rect));
+                let filter_width = ui.available_width().clamp(60.0, 150.0);
+                let filter = ui.add(egui::TextEdit::singleline(&mut self.query).margin(crate::viewport::touch::text_edit_margin(ui)).hint_text("Filter files")
+                    .desired_width(filter_width).min_size(crate::viewport::touch::target_size(ui.ctx(), egui::Vec2::ZERO)));
+                out.hits.push((format!("{}:filter", options.hit_prefix), filter.rect));
+            });
+        } else { self.show_nav_bar(ui, store, &location, options, &mut out); }
         if !self.error.is_empty() {
             ui.colored_label(ui.visuals().error_fg_color, &self.error);
         }
@@ -200,7 +222,9 @@ impl FileExplorer {
         bottom_panel(ui, "brep-file-explorer-footer", options.hit_prefix, |ui| {
             self.show_footer(ui, options, &mut out)
         });
-        ui.horizontal_top(|ui| {
+        if compact {
+            self.show_list(ui, store, &entries, options, &mut out);
+        } else { ui.horizontal_top(|ui| {
             if !places.is_empty() {
                 ui.vertical(|ui| {
                     self.show_sidebar(ui, store, &places, &pins, &location, options, &mut out);
@@ -210,7 +234,7 @@ impl FileExplorer {
             ui.vertical(|ui| {
                 self.show_list(ui, store, &entries, options, &mut out);
             });
-        });
+        }); }
 
         self.handle_keys(ui, options, &mut out);
         out.selected = self.selected.clone();
@@ -284,20 +308,23 @@ impl FileExplorer {
         out: &mut FileExplorerOutput,
     ) {
         ui.horizontal(|ui| {
-            let back = ui.add_enabled(!self.history.is_empty(), egui::Button::new("\u{25C0}").small());
+            let back = ui.add_enabled(!self.history.is_empty(), egui::Button::new("\u{25C0}").small()
+                .min_size(crate::viewport::touch::target_size(ui.ctx(), egui::Vec2::ZERO)));
             out.hits.push((format!("{}:back", options.hit_prefix), back.rect));
             if back.clicked() {
                 self.back(store);
             }
             let fwd = {
-            let b = crate::icon_text::icon_button(ui, "\u{25B6}").small();
+            let b = crate::icon_text::icon_button(ui, "\u{25B6}").small()
+                .min_size(crate::viewport::touch::target_size(ui.ctx(), egui::Vec2::ZERO));
             ui.add_enabled(!self.forward.is_empty(), b)
         };
             out.hits.push((format!("{}:forward", options.hit_prefix), fwd.rect));
             if fwd.clicked() {
                 self.forward_go(store);
             }
-            let up = ui.small_button("\u{2191}");
+            let up = ui.add(egui::Button::new("\u{2191}").small()
+                .min_size(crate::viewport::touch::target_size(ui.ctx(), egui::Vec2::ZERO)));
             out.hits.push((format!("{}:up", options.hit_prefix), up.rect));
             if up.clicked() {
                 self.nav(store, || store.browser_up());
@@ -306,13 +333,15 @@ impl FileExplorer {
             self.show_breadcrumb(ui, store, location, options, out);
         });
         ui.horizontal(|ui| {
-            let create = ui.small_button("+ Folder");
+            let create = ui.add(egui::Button::new("+ Folder").small()
+                .min_size(crate::viewport::touch::target_size(ui.ctx(), egui::Vec2::ZERO)));
             out.hits
                 .push((format!("{}:new-folder", options.hit_prefix), create.rect));
             let field = ui.add(
-                egui::TextEdit::singleline(&mut self.new_folder)
+                egui::TextEdit::singleline(&mut self.new_folder).margin(crate::viewport::touch::text_edit_margin(ui))
                     .hint_text("New folder")
-                    .desired_width(140.0),
+                    .desired_width(140.0)
+                    .min_size(crate::viewport::touch::target_size(ui.ctx(), egui::Vec2::ZERO)),
             );
             out.hits
                 .push((format!("{}:new-folder-name", options.hit_prefix), field.rect));
@@ -342,7 +371,7 @@ impl FileExplorer {
         if self.editing_path.is_some() {
             let mut buf = self.editing_path.take().unwrap();
             let resp = ui.add(
-                egui::TextEdit::singleline(&mut buf)
+                egui::TextEdit::singleline(&mut buf).margin(crate::viewport::touch::text_edit_margin(ui))
                     .hint_text("type a path, Enter to go")
                     .desired_width(300.0),
             );
@@ -364,7 +393,8 @@ impl FileExplorer {
         // The pencil comes FIRST, outside the crumbs' scroll area: at the end of
         // a long path it sat past the dialog's right edge (x = 1910 in a
         // 1400-wide window), where no one could press it.
-        let edit = ui.add(crate::icon_text::icon_button(ui, "\u{270E}").small()); // ✎
+        let edit = ui.add(crate::icon_text::icon_button(ui, "\u{270E}").small()
+            .min_size(crate::viewport::touch::target_size(ui.ctx(), egui::Vec2::ZERO))); // ✎
         out.hits
             .push((format!("{}:path-edit-toggle", options.hit_prefix), edit.rect));
         if edit.on_hover_text("Type a path").clicked() {
@@ -388,7 +418,8 @@ impl FileExplorer {
                         if i > 0 {
                             ui.weak("\u{203A}"); // ›
                         }
-                        let seg = ui.add(egui::Button::new(label).frame(false).small());
+                        let seg = ui.add(egui::Button::new(label).frame(false).small()
+                            .min_size(crate::viewport::touch::target_size(ui.ctx(), egui::Vec2::ZERO)));
                         out.hits
                             .push((format!("{}:crumb:{i}", options.hit_prefix), seg.rect));
                         if seg.clicked() {
@@ -420,8 +451,8 @@ impl FileExplorer {
             .show(ui, |ui| {
                 ui.weak("Places");
                 for place in places {
-                    let glyph = place_glyph(place.kind);
-                    let resp = ui.selectable_label(false, format!("{glyph} {}", place.label));
+                    let caption = format!("{} {}", place_glyph(place.kind), place.label);
+                    let resp = ui.add(sidebar_row(ui, &caption));
                     out.hits
                         .push((format!("{}:place:{}", options.hit_prefix, place.label), resp.rect));
                     if resp.clicked() {
@@ -435,7 +466,8 @@ impl FileExplorer {
                     for pin in pins {
                         ui.horizontal(|ui| {
                             let label = pin.rsplit(['/', '\\']).find(|s| !s.is_empty()).unwrap_or(pin);
-                            let resp = ui.selectable_label(false, format!("\u{1F4CC} {label}"));
+                            let caption = format!("{PIN_GLYPH} {label}");
+                            let resp = ui.add(sidebar_row(ui, &caption));
                             out.hits
                                 .push((format!("{}:pin:{label}", options.hit_prefix), resp.rect));
                             if resp.clicked() {
@@ -456,12 +488,8 @@ impl FileExplorer {
                 }
                 ui.add_space(6.0);
                 let pinned_now = pins.iter().any(|p| p == location);
-                let label = if pinned_now {
-                    "\u{2715} Unpin folder"
-                } else {
-                    "\u{1F4CC} Pin folder"
-                };
-                let btn = ui.small_button(label);
+                let label = if pinned_now { "\u{2715} Unpin folder" } else { "Pin folder" };
+                let btn = ui.add(crate::icon_text::icon_button(ui, label).small());
                 out.hits
                     .push((format!("{}:pin-current", options.hit_prefix), btn.rect));
                 if btn.clicked() {
@@ -506,20 +534,20 @@ impl FileExplorer {
         out: &mut FileExplorerOutput,
     ) {
         // Header row: hidden toggle (left) + filter (right).
-        ui.horizontal(|ui| {
+        if !crate::viewport::touch::compact(ui.ctx()) { ui.horizontal(|ui| {
             let hidden = ui.checkbox(&mut self.show_hidden, "Hidden");
             out.hits
                 .push((format!("{}:hidden-toggle", options.hit_prefix), hidden.rect));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let search = ui.add(
-                    egui::TextEdit::singleline(&mut self.query)
+                    egui::TextEdit::singleline(&mut self.query).margin(crate::viewport::touch::text_edit_margin(ui))
                         .hint_text("Filter files")
                         .desired_width(150.0),
                 );
                 out.hits
                     .push((format!("{}:filter", options.hit_prefix), search.rect));
             });
-        });
+        }); }
 
         let query = self.query.trim().to_ascii_lowercase();
         let mut visible: Vec<&BrowserEntry> = entries
@@ -555,6 +583,46 @@ impl FileExplorer {
         if visible.is_empty() {
             ui.separator();
             ui.weak(options.empty_label);
+            return;
+        }
+
+        if crate::viewport::touch::compact(ui.ctx()) {
+            let sort = ui.menu_button("Sort", |ui| {
+                for (label, key) in [("Name", SortKey::Name), ("Type", SortKey::Kind), ("Size", SortKey::Size), ("Date", SortKey::Date)] {
+                    if ui.selectable_label(self.sort_key == key, label).clicked() {
+                        if self.sort_key == key { self.sort_desc = !self.sort_desc; }
+                        else { self.sort_key = key; self.sort_desc = false; }
+                        ui.close();
+                    }
+                }
+            });
+            out.hits.push((format!("{}:sort-menu", options.hit_prefix), sort.response.rect));
+            let row_h = crate::viewport::touch::target_size(ui.ctx(), egui::vec2(0.0, egui::TextStyle::Body.resolve(ui.style()).size + 6.0)).y;
+            egui::ScrollArea::vertical().id_salt(format!("{}-compact-list", options.hit_prefix)).show(ui, |ui| {
+                for entry in visible {
+                    ui.horizontal(|ui| {
+                        let icon = if entry.is_dir { "\u{1F5C0}" } else { options.row_icon };
+                        let highlight = self.selected.as_deref().or(options.current) == Some(entry.identity.as_str());
+                        let deletable = options.allow_delete && !entry.is_dir;
+                        let width = (ui.available_width() - if deletable { 44.0 + ui.spacing().item_spacing.x } else { 0.0 }).max(44.0);
+                        let text = format!("{icon} {}", entry.name);
+                        let r = ui.add_sized([width, row_h], crate::icon_text::icon_button(ui, &text).selected(highlight).truncate());
+                        out.hits.push((format!("{}:{}", options.hit_prefix, entry.name), r.rect));
+                        if r.double_clicked() && !entry.is_dir {
+                            self.selected = Some(entry.identity.clone()); out.activated = Some(entry.identity.clone());
+                        } else if r.clicked() {
+                            if entry.is_dir { self.nav(store, || store.browser_enter(&entry.identity)); }
+                            else { self.selected = Some(entry.identity.clone()); out.picked = Some(entry.identity.clone()); }
+                        }
+                        if deletable {
+                            let delete = ui.add(crate::icon_text::icon_button(ui, "\u{2715}").small()
+                                .min_size(crate::viewport::touch::target_size(ui.ctx(), egui::Vec2::ZERO)));
+                            out.hits.push((format!("del:{}", entry.name), delete.rect));
+                            if delete.clicked() { out.remove = Some(entry.identity.clone()); }
+                        }
+                    });
+                }
+            });
             return;
         }
 
@@ -773,9 +841,11 @@ impl FileExplorer {
 /// removes.
 pub fn dialog_body<R>(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui) -> R) -> R {
     let screen = ui.ctx().content_rect().size();
-    let max = egui::vec2((screen.x - 40.0).max(320.0), (screen.y - 80.0).max(240.0));
+    let compact = crate::viewport::touch::compact(ui.ctx());
+    let max = if compact { (screen - egui::Vec2::splat(24.0)).max(egui::Vec2::splat(80.0)) }
+        else { egui::vec2((screen.x - 40.0).max(320.0), (screen.y - 80.0).max(240.0)) };
     egui::Resize::default()
-        .id_salt("brep-file-dialog-size")
+        .id_salt(if compact { "brep-file-dialog-size-mobile" } else { "brep-file-dialog-size" })
         // The modal frame already draws the dialog's border; the resize region
         // fills it exactly, so its own stroke would only double it up.
         .with_stroke(false)
@@ -915,14 +985,25 @@ fn breadcrumb_segments(location: &str) -> Vec<(String, String)> {
     out
 }
 
-/// The built-in glyph a sidebar place draws for its category.
+/// The glyph a pinned folder's row draws: the Open command's folder artwork.
+const PIN_GLYPH: &str = "\u{E011}";
+
+/// The glyph a sidebar place draws for its category — catalogued artwork
+/// (`icons.rs`), drawn by [`sidebar_row`]. The plain characters these used to
+/// be were partly missing from the UI font (🗀 and 📌 drew as empty boxes), and
+/// Root drew "/" beside its label "/" (lane U audit item 12).
 fn place_glyph(kind: PlaceKind) -> &'static str {
     match kind {
-        PlaceKind::Home => "\u{2302}",       // ⌂
-        PlaceKind::Documents => "\u{1F5CE}", // 🗎
-        PlaceKind::Downloads => "\u{2B07}",  // ⬇
-        PlaceKind::Models => "\u{1F5C0}",    // 🗀
-        PlaceKind::Root => "/",
+        PlaceKind::Home => "\u{2302}",      // ⌂ — the font draws it
+        PlaceKind::Documents => "\u{1F5CE}", // 🗎 catalogued
+        PlaceKind::Downloads => "\u{2B07}",  // ⬇ catalogued
+        PlaceKind::Models | PlaceKind::Root => PIN_GLYPH,
     }
+}
+
+/// A Places / Pinned row: the leading catalogued glyph as artwork, framed only
+/// on hover — what `selectable_label(false, …)` drew, with the icon.
+fn sidebar_row<'a>(ui: &egui::Ui, caption: &'a str) -> egui::Button<'a> {
+    crate::icon_text::icon_button(ui, caption).frame_when_inactive(false)
 }
 

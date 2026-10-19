@@ -11,6 +11,25 @@
 //! the shell. See `brep-app/README.md` → "Adding a panel".
 
 pub mod action_rail;
+
+/// Where the toolbar/ribbon ends this frame, recorded by the shell right after
+/// drawing it (`set_chrome_bottom`); [`below_chrome`] reads it.
+const CHROME_BOTTOM: &str = "brep-chrome-bottom";
+
+/// Record the bottom of the top chrome (menu bar + toolbar or ribbon).
+pub fn set_chrome_bottom(ctx: &egui::Context, y: f32) {
+    ctx.data_mut(|d| d.insert_temp(egui::Id::new(CHROME_BOTTOM), y));
+}
+
+/// A floating window's first-open position: `x` across, and `dy` below the
+/// toolbar or ribbon, whatever its height. The windows used to name a fixed
+/// y (56, 80, 96, …) that the Ribbon, taller than the old toolbar, now covers:
+/// Settings and Part Properties opened over its buttons and Plugins, with no
+/// default, over the menu bar (lane U audit item 4).
+pub fn below_chrome(ctx: &egui::Context, x: f32, dy: f32) -> egui::Pos2 {
+    let top = ctx.data(|d| d.get_temp::<f32>(egui::Id::new(CHROME_BOTTOM))).unwrap_or(56.0);
+    egui::pos2(x, top + 8.0 + dy)
+}
 pub mod assembly_components;
 pub mod assembly_constraints;
 pub mod bom;

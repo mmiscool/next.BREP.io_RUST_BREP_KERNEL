@@ -226,3 +226,73 @@ pub fn vertex_endpoint_gap(vertex_point: Vec3, curve_end: Vec3) -> f64 {
     curve_end.sub(vertex_point).length()
 }
 
+
+
+
+/// The completed spherical construction reading, reusable only by identical
+/// source/result content. The first request always uses the ordinary sampler.
+pub(crate) fn sphere_fit_reading(
+    source: &NurbsSurface, same_sense: bool, fitted: &NurbsSurface, distance: f64, band: f64,
+) -> Result<MeasuredTolerance, KernelRefusal> {
+    sphere_fit_reading_mode(source, same_sense, fitted, distance, band,
+        std::env::var("BREP_OFFSET_SPHERE_READING").map_or(true, |v| v != "0" && v != "off"))
+}
+thread_local! {
+    static SPHERE_FIT_READINGS: std::cell::RefCell<rustc_hash::FxHashMap<Vec<u64>, f64>> =
+        std::cell::RefCell::new(rustc_hash::FxHashMap::default());
+}
+
+// Exact content equality, including every homogeneous control bit. The nets
+// are immutable by NurbsSurface's contract. No recognition label or sampled
+// closeness is used as an identity. Limit both key size and entry count.
+fn sphere_fit_key(source: &NurbsSurface, fitted: &NurbsSurface, same_sense: bool, distance: f64) -> Option<Vec<u64>> {
+    let size = |s: &NurbsSurface| 5 + s.knots_u.len() + s.knots_v.len()
+        + s.control_points.iter().map(|row| 1 + 4 * row.len()).sum::<usize>();
+    if size(source) + size(fitted) + 3 > 4096 { return None; }
+    let mut key = vec![same_sense as u64, distance.to_bits(),
+        (std::env::var("BREP_CUSP_TANGENT_RESCUE").as_deref() == Ok("0")) as u64];
+    for surface in [source, fitted] {
+        key.extend([surface.degree_u as u64, surface.degree_v as u64]);
+        for knots in [&surface.knots_u, &surface.knots_v] {
+            key.push(knots.len() as u64);
+            key.extend(knots.iter().map(|v| v.to_bits()));
+        }
+        key.push(surface.control_points.len() as u64);
+        for row in &surface.control_points {
+            key.push(row.len() as u64);
+            for p in row { key.extend([p.x.to_bits(), p.y.to_bits(), p.z.to_bits(), p.w.to_bits()]); }
+        }
+    }
+    Some(key)
+}
+
+fn sphere_fit_reading_mode(
+    source: &NurbsSurface, same_sense: bool, fitted: &NurbsSurface, distance: f64, band: f64, enabled: bool,
+) -> Result<MeasuredTolerance, KernelRefusal> {
+    // A requested diagnostic trace still visits every station.
+    let key = (enabled && std::env::var_os("BREP_OFFSET_DIAG").is_none())
+        .then(|| sphere_fit_key(source, fitted, same_sense, distance)).flatten();
+    if let Some(deviation) = key.as_ref().and_then(|key|
+        SPHERE_FIT_READINGS.with(|memo| memo.borrow().get(key).copied())) {
+        if std::env::var_os("BREP_PROFILE").is_some() {
+            eprintln!("offset.sphere_fit_memo hit=1 stations=0");
+        }
+        // Band is not an input to the fixed grid. Preserve the actual reading
+        // and judge it against this caller's band, never the stored caller's.
+        return Ok(MeasuredTolerance::new(deviation, band));
+    }
+    let measured = measure_surface_fit_against_pointwise_offset(source, same_sense, fitted, distance, band)?;
+    if let Some(key) = key {
+        SPHERE_FIT_READINGS.with(|memo| {
+            let mut memo = memo.borrow_mut();
+            if memo.len() >= 64 { memo.clear(); }
+            memo.insert(key, measured.deviation());
+        });
+    }
+    if std::env::var_os("BREP_PROFILE").is_some() {
+        eprintln!("offset.sphere_fit_memo hit=0 stations={}", FIT_SAMPLES * FIT_SAMPLES);
+    }
+    Ok(measured)
+}
+
+

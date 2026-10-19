@@ -30,7 +30,9 @@ pub fn tessellate_brep_watertight(solid: &BrepSolid, chord_tolerance: f64) -> Re
     // inward; this pass repairs both at the mesh level. Positions are never
     // touched, so watertightness is preserved (validated below).
     orient_mesh_coherently(&mut mesh, chord_tolerance, &face_shell_signs)?;
+    let validation_timer = stage_timer(Stage::Validation);
     mesh.validate()?;
+    drop(validation_timer);
     crate::watertight_tessellation::profile::end(profile, chord_tolerance, mesh.indices.len() / 3);
     Ok(mesh)
 }

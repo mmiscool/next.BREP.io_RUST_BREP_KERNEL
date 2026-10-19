@@ -25,7 +25,7 @@ use collect::{ChainSegment, SmoothChain};
 pub(in crate::blend) use march::{march_chain, ChainBudget, ChainSample, FoldPolicy, CHAIN_PER_SEGMENT};
 pub(in crate::blend) use march::{march_chain_typed, ChainMarchError};
 pub(in crate::blend) use march::{assign_chain_parameters, chain_dense_contacts, insert_chain_stations, DenseContacts};
-use march::{ChainStationFailure, CHAIN_CARVE_MAX_PER_SEGMENT};
+use march::{ladder_trend, ChainStationFailure, CHAIN_CARVE_MAX_PER_SEGMENT};
 use open::blend_open_smooth_chain;
 
 
@@ -35,7 +35,8 @@ pub(in crate::blend) use closed::{
     declared_wall_probe_why,
 };
 /// The support-piece pcurve fitter, shared with the closed-edge lane.
-pub(in crate::blend) use closed::{pcurve_guide, project_piece_pcurve, project_piece_pcurve_within};
+pub(in crate::blend) use closed::{pcurve_guide, project_piece_pcurve, project_piece_pcurve_within, project_piece_pcurve_within_knot_retry};
+pub(crate) use closed::CHAIN_PCURVE_FLOOR_WHAT;
 
 
 

@@ -611,6 +611,7 @@ pub fn mesh_regions_to_brep(
     let solid_id = builder.allocate_id();
     let mut solid = BrepSolid {
         mass_properties_cache: Default::default(),
+        cells: Default::default(),
         id: solid_id,
         vertices: builder.vertices,
         edges: builder.edges,

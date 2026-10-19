@@ -30,9 +30,11 @@ mod cavities;
 mod degenerate_coverage;
 mod feature_fragments;
 mod primitive_gate;
+pub mod t_junctions;
 
 use crate::{
-    recognize_surfaces_with_unresolved, reconstruct_surface, AnalyticSurface, Mesh,
+    recognize_surfaces_with_candidates, reconstruct_surface, AnalyticSurface, ComponentCandidate,
+    ConeSurface, CylinderSurface, Mesh, PlaneSurface, SphereSurface, TorusSurface,
     MeshAnalysisOptions, PhaseTimings, RecognitionOptions, SamplingMode, SurfaceFitResult,
     SurfaceHint, SurfaceRegion, SurfaceType, Vec3,
 };
@@ -388,8 +390,60 @@ pub struct StlConversionReport {
     pub manifold_audit_issues: Vec<String>,
     /// Stage and total wall-clock measurements.
     pub timings: ConversionTimings,
+    /// Counted RANSAC recognition work, summed over every body.
+    #[serde(default)]
+    pub recognition_work: RecognitionWorkReport,
+    /// Row 11's local scan on whole carriers (lane J row 13), summed.
+    #[serde(default)]
+    pub whole_carrier_scan: WholeCarrierScanReport,
     /// Useful chronological terminal messages.
     pub messages: Vec<String>,
+}
+
+/// Counted work of the top-level RANSAC recognition.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+pub struct RecognitionWorkReport {
+    /// Generic hypotheses drawn.
+    pub hypotheses: usize,
+    /// Regions accepted by generic extraction.
+    pub rounds: usize,
+    /// Connected components accepted whole on the segmentation's own carrier
+    /// after their own whole fit was refused (lane J row 12).
+    pub seeded_components: usize,
+}
+
+/// Lane J row 13: verdicts of row 11's local residual scan on the carriers
+/// of a whole primitive (RANSAC's direct builders and the segmentation's
+/// whole sphere or torus). An abstention is not a pass: the residuals were
+/// not independent noise (or too few to tell), so the scan could not decide
+/// and the build went ahead as before.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+pub struct WholeCarrierScanReport {
+    /// Carriers the scan read at or under its threshold.
+    pub accepted: usize,
+    /// Carriers the scan withheld from a whole-primitive build.
+    pub declined: usize,
+    /// Carriers above the threshold whose residuals failed the independence test.
+    pub abstained: usize,
+}
+
+impl WholeCarrierScanReport {
+    pub(crate) fn add(&mut self, verdict: crate::hybrid_whole_freeform::ScanVerdict) {
+        use crate::hybrid_whole_freeform::ScanVerdict;
+        match verdict {
+            ScanVerdict::Accepted => self.accepted += 1,
+            ScanVerdict::Declined => self.declined += 1,
+            ScanVerdict::Abstained => self.abstained += 1,
+        }
+    }
+
+    fn sum(self, other: Self) -> Self {
+        Self {
+            accepted: self.accepted + other.accepted,
+            declined: self.declined + other.declined,
+            abstained: self.abstained + other.abstained,
+        }
+    }
 }
 
 /// STEP text and its complete conversion report.
@@ -604,6 +658,8 @@ fn refused_component(mesh: &Mesh, triangles: usize, reason: String) -> Component
         faces: 0,
         segmentation_seconds: 0.0,
         recognition_seconds: 0.0,
+        recognition_work: RecognitionWorkReport::default(),
+        whole_carrier_scan: WholeCarrierScanReport::default(),
         topology_build_seconds: 0.0,
         messages: vec![format!("refused, not in the model: {reason}")],
         refusal: Some(reason),
@@ -635,6 +691,8 @@ struct ComponentDetail {
     faces: usize,
     segmentation_seconds: f64,
     recognition_seconds: f64,
+    recognition_work: RecognitionWorkReport,
+    whole_carrier_scan: WholeCarrierScanReport,
     topology_build_seconds: f64,
     messages: Vec<String>,
     /// Why every lane refused this body; set only by [`refused_component`].
@@ -733,11 +791,22 @@ fn convert_component(
     let effective_distance_tolerance = recognition_options.distance_tolerance;
 
     let recognition_started = Instant::now();
+    let mut recognition_work = RecognitionWorkReport::default();
     let (recognition, completed_plane_regions, completed_degenerate_triangles) = if recognition_gate.is_ok() {
-        let mut recognition = recognize_surfaces_with_unresolved(mesh, &recognition_options)
-            .map_err(|error| {
-                StlConversionError(format!("surface recognition failed: {error}"))
-            })?;
+        let candidates = match &segmentation {
+            Ok(segmentation) if segment_carrier_enabled() => segmentation_candidates(mesh, segmentation),
+            _ => Vec::new(),
+        };
+        let (mut recognition, work) =
+            recognize_surfaces_with_candidates(mesh, &recognition_options, &candidates)
+                .map_err(|error| {
+                    StlConversionError(format!("surface recognition failed: {error}"))
+                })?;
+        recognition_work = RecognitionWorkReport {
+            hypotheses: work.attempts,
+            rounds: work.rounds,
+            seeded_components: work.seeded_components,
+        };
         feature_fragments::complete(
             mesh,
             &recognition_options,
@@ -803,7 +872,18 @@ fn convert_component(
     } else {
         None
     };
-    let primitive = if analytic_coverage && closed_for_analytics {
+    // Lane J row 12: a component accepted on the segmentation's carrier is a
+    // noisy one (its own refit missed the tolerance the noise set), and the
+    // direct capped builders place their caps at the EXTREME vertex heights
+    // along the axis, which jitter biases outward. Such a body takes the
+    // rebuild lanes below, as it did when generic extraction shredded it;
+    // recognition only got cheaper.
+    let mut whole_carrier_scan = WholeCarrierScanReport::default();
+    let primitive = if analytic_coverage
+        && closed_for_analytics
+        && recognition_work.seeded_components == 0
+        && whole_fits_pass_the_local_scan(mesh, &recognition.regions, encoding_distance_tolerance, &mut whole_carrier_scan)
+    {
         direct_analytic_solid(mesh, &recognition.regions, &recognition_options)
     } else {
         None
@@ -928,6 +1008,24 @@ fn convert_component(
                 };
                 match hybrid_attempt {
                     Ok(output) => {
+                        let stats = output.stats;
+                        whole_carrier_scan = whole_carrier_scan.sum(stats.whole_carrier_scan);
+                        if stats.split_freeform_regions
+                            + stats.split_declined_regions
+                            + stats.split_over_budget_regions
+                            + stats.split_budget_hit_regions
+                            + stats.split_band_declined_regions
+                            > 0
+                        {
+                            messages.push(format!(
+                                "freeform split: {} region(s) divided into carriers, {} tried and left as segmented, {} above the triangle budget and not tried, {} out of the hypothesis budget and left as segmented, {} declined by the normal-band pre-test",
+                                stats.split_freeform_regions,
+                                stats.split_declined_regions,
+                                stats.split_over_budget_regions,
+                                stats.split_budget_hit_regions,
+                                stats.split_band_declined_regions
+                            ));
+                        }
                         let hybrid_report = hybrid_report(output.stats);
                         if options.policy == ConversionPolicy::RequireFullyAnalytic
                             && hybrid_report.faceted_faces != 0
@@ -1057,6 +1155,8 @@ fn convert_component(
         faces,
         segmentation_seconds,
         recognition_seconds,
+        recognition_work,
+        whole_carrier_scan,
         topology_build_seconds,
         messages,
         refusal: None,
@@ -1272,6 +1372,16 @@ fn aggregate_report(
             step_validation_seconds: 0.0,
             total_seconds: 0.0,
         },
+        recognition_work: details.iter().fold(RecognitionWorkReport::default(), |sum, detail| {
+            RecognitionWorkReport {
+                hypotheses: sum.hypotheses + detail.recognition_work.hypotheses,
+                rounds: sum.rounds + detail.recognition_work.rounds,
+                seeded_components: sum.seeded_components + detail.recognition_work.seeded_components,
+            }
+        }),
+        whole_carrier_scan: details
+            .iter()
+            .fold(WholeCarrierScanReport::default(), |sum, detail| sum.sum(detail.whole_carrier_scan)),
         messages,
     }
 }
@@ -1682,8 +1792,26 @@ fn repaired_closed_mesh(
     source_indices: Option<&[u32]>,
     options: &StlConversionOptions,
 ) -> Option<RepairedMesh> {
+    // A vertex sitting on the interior of a neighbour's edge (a T-junction)
+    // leaves three edges used once, which no boundary cap can close: split
+    // the long edge at it first, on the file's own vertex.
+    let owned_indices;
+    let stitched_indices = match source_indices {
+        Some(indices) => indices,
+        None => {
+            owned_indices = (0..source_positions.len() as u32 / 3).collect::<Vec<_>>();
+            &owned_indices
+        }
+    };
+    let stitch_tolerance = if options.weld_tolerance > 0.0 {
+        options.weld_tolerance
+    } else {
+        mesh_diagonal_of(source_positions) * crate::stl::DEFAULT_RELATIVE_WELD_TOLERANCE
+    };
+    let (stitched, stitch) =
+        t_junctions::stitch_t_junctions(source_positions, stitched_indices, stitch_tolerance);
     let (positions, indices, report) =
-        repair_triangle_soup(source_positions, source_indices, options.weld_tolerance).ok()?;
+        repair_triangle_soup(source_positions, Some(&stitched), options.weld_tolerance).ok()?;
     let vertices = positions
         .chunks_exact(3)
         .map(|point| Vec3::new(point[0], point[1], point[2]))
@@ -1698,9 +1826,17 @@ fn repaired_closed_mesh(
     }
     let message = format!(
         "the source mesh is not a closed two-manifold; the analytic lanes ran on the repaired mesh \
-         ({} welded vertices, {} triangles: {} dropped as degenerate or duplicate, {} surplus \
+         ({}{} welded vertices, {} triangles: {} dropped as degenerate or duplicate, {} surplus \
          sheet(s) pruned, {} reoriented to agree with their neighbours, {} boundary loop(s) \
          capped with {} triangle(s))",
+        if stitch.stitched_edges > 0 {
+            format!(
+                "{} T-junction edge(s) split at a vertex on their interior, {} triangle(s) added; ",
+                stitch.stitched_edges, stitch.added_triangles
+            )
+        } else {
+            String::new()
+        },
         report.welded_vertices,
         report.triangles,
         report.dropped_triangles,
@@ -1715,6 +1851,19 @@ fn repaired_closed_mesh(
         indices,
         message,
     })
+}
+
+/// Bounding-box diagonal of a flat xyz buffer.
+fn mesh_diagonal_of(positions: &[f64]) -> f64 {
+    let mut low = [f64::INFINITY; 3];
+    let mut high = [f64::NEG_INFINITY; 3];
+    for point in positions.chunks_exact(3) {
+        for axis in 0..3 {
+            low[axis] = low[axis].min(point[axis]);
+            high[axis] = high[axis].max(point[axis]);
+        }
+    }
+    (0..3).map(|axis| (high[axis] - low[axis]).powi(2)).sum::<f64>().sqrt()
 }
 
 fn closed_manifold(mesh: &Mesh) -> bool {
@@ -2041,6 +2190,162 @@ fn segmentation_options(positions: &[f64], options: &StlConversionOptions) -> Se
 
 /// The kernel segmentation that decides whether RANSAC recognition and the
 /// kernel region rebuilder can pay for themselves.
+/// Lane J row 12, promoted ON 2026-10-16: BREP_RECOG_SEGMENT_CARRIER=0
+/// restores recognition without the segmentation's carriers.
+fn segment_carrier_enabled() -> bool {
+    std::env::var("BREP_RECOG_SEGMENT_CARRIER").map_or(true, |v| v != "0")
+}
+
+/// Lane J row 12: the recognition tolerance is raised to the segmentation's
+/// own measured maximum vertex deviation, measured against the
+/// SEGMENTATION's carrier. RANSAC's least-squares refit of the same kind on
+/// the same component is a different model, and its maximum lands just above
+/// that tolerance about as often as below (a jittered torus: 2.973e-3 against
+/// 2.972e-3), after which generic extraction shreds the component with tens
+/// of thousands of hypotheses. Every analytic region is therefore offered as
+/// a candidate for the component it covers.
+///
+/// That carrier passes the distance gate by construction — the tolerance was
+/// measured on it — so the distance gate certifies nothing here. The
+/// independent check is row 11's local residual scan on the carrier's own
+/// vertex residuals: a region whose scan reads above its false-alarm
+/// threshold (a flat or dimple the carrier was fitted across) is not offered.
+fn segmentation_candidates(mesh: &Mesh, segmentation: &MeshSegmentation) -> Vec<ComponentCandidate> {
+    if segmentation.triangle_count != mesh.triangles.len()
+        || segmentation.triangle_region_ids.len() != mesh.triangles.len()
+    {
+        return Vec::new();
+    }
+    let mut members = vec![Vec::new(); segmentation.regions.len()];
+    for (triangle, &region) in segmentation.triangle_region_ids.iter().enumerate() {
+        if let Some(list) = members.get_mut(region as usize) {
+            list.push(triangle);
+        }
+    }
+    segmentation
+        .regions
+        .iter()
+        .zip(members)
+        .filter_map(|(region, triangles)| {
+            let (surface, parameters) = carrier_surface(&region.carrier)?;
+            if triangles.is_empty() || !surface.is_valid() {
+                return None;
+            }
+            let indices: Vec<u32> = triangles.iter().flat_map(|&t| mesh.triangles[t]).collect();
+            let (statistic, threshold) = crate::hybrid_whole_freeform::carrier_local_scan(
+                &indices,
+                |v| surface.signed_distance(mesh.vertices[v as usize]),
+                parameters,
+            );
+            if std::env::var_os("BREP_DEBUG_SPLIT").is_some() {
+                eprintln!(
+                    "[candidate] region {} {} tris {} local {statistic:.2} threshold {threshold:.2} {}",
+                    region.id,
+                    region.carrier.kind(),
+                    triangles.len(),
+                    if statistic <= threshold { "offered" } else { "declined" }
+                );
+            }
+            (statistic <= threshold).then_some(ComponentCandidate { triangle_indices: triangles, surface })
+        })
+        .collect()
+}
+
+/// Lane J row 13: the direct analytic builders take RANSAC's own regions as
+/// they stand. Once the recognition tolerance has been raised to the
+/// segmentation's measured deviation, the distance gate those regions passed
+/// is the tolerance the noise set, so a small flat on a torus tube (h =
+/// 0.015, 2.5x the jitter amplitude) passes it. Row 11's local residual scan
+/// reads every region's own vertex residuals; a region whose scan reads
+/// above its false-alarm threshold, with residuals that pass the
+/// independence test the threshold assumes, keeps the body off the direct
+/// builders. A region whose own largest residual is within `requested`
+/// (the encoding distance tolerance, before the segmentation's deviation
+/// raised it) is not scanned: the requested gate certifies it, and on an
+/// exact mesh the residuals are roundoff (census r13: a clean torus at
+/// 1.4e-15), which the scale-free scan reads as flats. A scan that abstains
+/// (`carrier_scan_verdict`) keeps the status quo.
+fn whole_fits_pass_the_local_scan(
+    mesh: &Mesh,
+    regions: &[SurfaceRegion],
+    requested: f64,
+    tally: &mut WholeCarrierScanReport,
+) -> bool {
+    if !crate::hybrid_whole_freeform::whole_carrier_scan_enabled() {
+        return true;
+    }
+    let mut passes = true;
+    for region in regions.iter().filter(|region| region.metrics.max_error > requested) {
+        let surface = &region.surface;
+        let indices: Vec<u32> = region
+            .triangle_indices
+            .iter()
+            .flat_map(|&t| mesh.triangles[t])
+            .collect();
+        let reading = crate::hybrid_whole_freeform::carrier_scan_verdict(
+            &indices,
+            |v| surface.signed_distance(mesh.vertices[v as usize]),
+            analytic_parameters(surface),
+        );
+        if std::env::var_os("BREP_DEBUG_SPLIT").is_some() {
+            eprintln!(
+                "[whole-fit] {} tris {} local {:.2} threshold {:.2} independence {:.3} bound {:.3} edges {} {:?}",
+                surface.surface_type().name(),
+                region.triangle_indices.len(),
+                reading.statistic,
+                reading.threshold,
+                reading.independence,
+                reading.bound,
+                reading.outside_edges,
+                reading.verdict
+            );
+        }
+        tally.add(reading.verdict);
+        if reading.verdict == crate::hybrid_whole_freeform::ScanVerdict::Declined {
+            passes = false;
+            break;
+        }
+    }
+    passes
+}
+
+/// A RANSAC surface's parameter count, as `carrier_surface` counts them.
+fn analytic_parameters(surface: &AnalyticSurface) -> usize {
+    match surface {
+        AnalyticSurface::Plane(_) => 3,
+        AnalyticSurface::Cylinder(_) => 5,
+        AnalyticSurface::Cone(_) => 6,
+        AnalyticSurface::Sphere(_) => 4,
+        AnalyticSurface::Torus(_) => 7,
+    }
+}
+
+/// A segmentation carrier as a RANSAC surface, with its parameter count.
+fn carrier_surface(carrier: &RegionCarrier) -> Option<(AnalyticSurface, usize)> {
+    let v = |p: brep_kernel::Vec3| crate::brep::vec3_from_kernel(p);
+    Some(match *carrier {
+        RegionCarrier::Plane { origin, normal } => {
+            (AnalyticSurface::Plane(PlaneSurface { origin: v(origin), normal: v(normal) }), 3)
+        }
+        RegionCarrier::Cylinder { axis_point, axis_dir, radius, .. } => (
+            AnalyticSurface::Cylinder(CylinderSurface { axis_origin: v(axis_point), axis: v(axis_dir), radius }),
+            5,
+        ),
+        RegionCarrier::Cone { apex, axis_dir, half_angle_rad, .. } => (
+            AnalyticSurface::Cone(ConeSurface { apex: v(apex), axis: v(axis_dir), half_angle: half_angle_rad }),
+            6,
+        ),
+        RegionCarrier::Sphere { center, radius, .. } => {
+            (AnalyticSurface::Sphere(SphereSurface { center: v(center), radius }), 4)
+        }
+        RegionCarrier::Torus { center, axis_dir, major_radius, minor_radius, .. } => (
+            AnalyticSurface::Torus(TorusSurface { center: v(center), axis: v(axis_dir), major_radius, minor_radius }),
+            7,
+        ),
+        RegionCarrier::Freeform => return None,
+    })
+}
+
 fn gate_segmentation(
     positions: &[f64],
     indices: Option<&[u32]>,

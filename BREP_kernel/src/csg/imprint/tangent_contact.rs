@@ -471,6 +471,7 @@ pub(super) fn classify_tangent_contact(
     witness: Vec3,
     tolerance: f64,
 ) -> Result<Option<TangentContact>, KernelRefusal> {
+    let _clock = ImprintSubphaseClock::new("tangent_classify");
     let Some((parameters, tangency_residual)) = refine_contact(first, second, witness, tolerance)?
     else {
         return Ok(None);

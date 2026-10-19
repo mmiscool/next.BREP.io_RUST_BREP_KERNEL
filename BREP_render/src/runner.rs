@@ -632,6 +632,7 @@ fn reconstruct_mesh(request: MeshImportRequest) -> MeshImportReply {
 
         // A 3MF build's placements, kept only to name each body afterwards.
         let mut instances = Vec::new();
+        let mut reader_messages = Vec::new();
         let (mesh, positions, indices, coordinate_precision_tolerance) = match request.format {
             MeshImportFormat::Stl => {
                 use brep_reconstruction::stl::{parse_stl_bytes, StlFormat, StlReadOptions};
@@ -659,6 +660,14 @@ fn reconstruct_mesh(request: MeshImportRequest) -> MeshImportReply {
                 } else {
                     0.0
                 };
+                if !imported.dropped_facets.is_empty() {
+                    reader_messages.push(format!(
+                        "the STL reader dropped {} of {} facet(s) with no area: {}",
+                        imported.dropped_facets.len(),
+                        imported.source_triangle_count,
+                        imported.dropped_facets.iter().take(8).map(ToString::to_string).collect::<Vec<_>>().join("; ")
+                    ));
+                }
                 (imported.mesh, positions, indices, precision)
             }
             MeshImportFormat::Obj => {
@@ -727,6 +736,7 @@ fn reconstruct_mesh(request: MeshImportRequest) -> MeshImportReply {
         )
         .map(|mut output| {
             name_bodies(&mut output.report, &instances);
+            output.report.messages.splice(0..0, reader_messages);
             output
         })
         .map_err(|error| format!("RANSAC reconstruction failed: {error}"))

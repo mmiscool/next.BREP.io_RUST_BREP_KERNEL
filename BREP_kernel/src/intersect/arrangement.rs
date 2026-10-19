@@ -70,6 +70,9 @@ pub struct ArrangementRegion {
     pub outer: Vec<CycleUse>,
     pub holes: Vec<Vec<CycleUse>>,
     pub area: f64,
+    /// The outer cycle's area alone, the key regions are returned by
+    /// (ascending); `area` nets the holes out.
+    pub outer_area: f64,
 }
 
 #[derive(Clone)]
@@ -558,6 +561,7 @@ fn arrange_segments_impl(
                     outer: cycle.uses,
                     holes: Vec::new(),
                     area: cycle.area,
+                    outer_area: cycle.area,
                 },
                 polygon,
             )

@@ -286,6 +286,85 @@ impl DialogTargets {
 
 /// The dock layout: the tile tree + a dirty flag so a user layout edit persists.
 /// One field on `BrepApp`.
+#[derive(Default)]
+struct CompactDock {
+    active: bool,
+    open: bool,
+    pane: Option<PaneKind>,
+    hits: std::collections::HashMap<String, egui::Rect>,
+}
+
+/// Shared mobile tab artwork, also used by the sketch entity panel.
+pub(crate) fn mobile_tab(ui: &mut egui::Ui, title: &str, selected: bool) -> egui::Response {
+    let font = egui::FontId::proportional(12.0);
+    let galley = ui.painter().layout_no_wrap(title.to_string(), font, ui.visuals().text_color());
+    let height = (galley.size().x + 20.0).max(44.0);
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(44.0, height), egui::Sense::click());
+    if ui.is_rect_visible(rect) {
+        let visuals = ui.style().interact_selectable(&response, selected);
+        ui.painter().rect(rect, 4.0, visuals.bg_fill, visuals.bg_stroke, egui::StrokeKind::Inside);
+        let pos = rect.center() + egui::vec2(-galley.size().y / 2.0, galley.size().x / 2.0);
+        ui.painter().add(egui::epaint::TextShape::new(pos, galley, visuals.text_color()).with_angle(-std::f32::consts::FRAC_PI_2));
+    }
+    response
+}
+
+/// Bound the rail explicitly: a floating Area's remembered size must not cap
+/// the scroll region, especially after a short landscape viewport is rotated.
+fn mobile_tabs(
+    ctx: &egui::Context,
+    view: egui::Rect,
+    available: &[PaneKind],
+    pane: &mut PaneKind,
+    open: &mut bool,
+    hits: &mut std::collections::HashMap<String, egui::Rect>,
+) {
+    egui::Area::new(egui::Id::new("brep-mobile-panel-tabs"))
+        .order(egui::Order::Middle).fixed_pos(view.left_top() + egui::vec2(2.0, 4.0))
+        .movable(false).show(ctx, |ui| {
+            ui.set_width(44.0);
+            // Area remembers its previous content size. A ScrollArea
+            // otherwise inherits that short height and cannot grow
+            // back to the viewport's height.
+            // Reset it every frame, including after browser rotation.
+            ui.set_height((view.height() - 8.0).max(44.0));
+            egui::ScrollArea::vertical().id_salt("mobile-panel-tabs")
+                .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+                .max_height((view.height() - 8.0).max(44.0)).show(ui, |ui| {
+                    for kind in available {
+                        let selected = *open && *pane == *kind;
+                        let tab = mobile_tab(ui, kind.title(), selected);
+                        if ui.clip_rect().contains_rect(tab.rect) {
+                            hits.insert(format!("tab:{}", kind.title()), tab.rect);
+                            if selected { hits.insert("close".into(), tab.rect); }
+                        }
+                        if tab.clicked() {
+                            *open = !selected;
+                            *pane = *kind;
+                            ui.ctx().request_repaint();
+                        }
+                    }
+                });
+        });
+}
+
+/// The same panel contents render over the viewport; only the frame differs.
+pub(crate) fn mobile_panel(ctx: &egui::Context, id: egui::Id, rect: egui::Rect, contents: impl FnOnce(&mut egui::Ui)) {
+    let base = ctx.global_style().visuals.panel_fill;
+    let fill = egui::Color32::from_rgba_unmultiplied(base.r(), base.g(), base.b(), 188);
+    egui::Area::new(id).order(egui::Order::Middle).fixed_pos(rect.min).default_size(rect.size()).movable(false)
+        .show(ctx, |ui| {
+            egui::Frame::new().fill(fill).corner_radius(6.0).inner_margin(6.0).show(ui, |ui| {
+                ui.set_min_size(rect.size() - egui::vec2(12.0, 12.0));
+                ui.set_max_size(rect.size() - egui::vec2(12.0, 12.0));
+                // The owning frame paints the translucent background once;
+                // existing pane renderers otherwise paint their normal opaque fill.
+                ui.style_mut().visuals.panel_fill = egui::Color32::TRANSPARENT;
+                contents(ui);
+            });
+        });
+}
+
 pub struct DockState {
     tree: Tree<PaneKind>,
     plugin_ids: Vec<String>,
@@ -318,6 +397,7 @@ pub struct DockState {
     /// behind on the next entry: the user's choice, not the door's. Saved with
     /// the layout, so a restart remembers it too.
     ecad_declined: Vec<PaneKind>,
+    mobile: CompactDock,
 }
 
 /// Whether the eCAD door takes notes this frame ([`DockState::surface_ecad_pane`]).
@@ -407,6 +487,7 @@ impl DockState {
             ports: None,
             ecad_entry: None,
             ecad_declined,
+            mobile: CompactDock::default(),
         }
     }
 
@@ -449,15 +530,49 @@ impl DockState {
         let active_id = ctx.docs.active_id();
         let document_ids: Vec<u64> = ctx.docs.iter().map(|d| d.id()).collect();
 
+        let documents = self.document_group();
+        let compact = crate::viewport::touch::compact(ui.ctx());
+        ctx.viewport.set_chrome_obscured(compact && self.mobile.open);
+        self.mobile.active = compact;
+        self.mobile.hits.clear();
+        if !compact { apply_side_floor(&mut self.tree, documents, ui.ctx().content_rect().width()); }
+        let available: Vec<PaneKind> = self.panes_in_layout_order().into_iter()
+            .filter(|(id, kind)| self.tree.tiles.is_visible(*id) && !matches!(kind, PaneKind::Document(_)))
+            .map(|(_, kind)| kind).collect();
+
         let store = ctx.model_store;
         let mut behavior = DockBehavior::new(ctx);
+        behavior.touch = crate::viewport::touch::enabled(ui.ctx());
         behavior.plugin_ids = self.plugin_ids.clone();
         behavior.tab_title_spacing = behavior.tab_title_spacing(ui.visuals());
-        self.tree.ui(&mut behavior, ui);
+        if compact {
+            // Mobile draws the active document directly; the shared document
+            // menu replaces the desktop tab bar without rewriting its tree.
+            if let Some(id) = self.tree.tiles.iter().find_map(|(id, tile)| matches!(tile, Tile::Pane(PaneKind::Document(doc)) if *doc == active_id).then_some(*id)) {
+                let mut pane = PaneKind::Document(active_id);
+                let _ = behavior.pane_ui(ui, id, &mut pane);
+            }
+            let view = behavior.viewport.last_rect().unwrap_or(ui.max_rect());
+            let mut pane = self.mobile.pane.filter(|p| available.contains(p))
+                .or_else(|| available.first().copied()).unwrap_or(PaneKind::History);
+            mobile_tabs(ui.ctx(), view, &available, &mut pane, &mut self.mobile.open, &mut self.mobile.hits);
+            self.mobile.pane = Some(pane);
+            if self.mobile.open {
+                let panel = egui::Rect::from_min_size(view.left_top() + egui::vec2(52.0, 4.0),
+                    egui::vec2((view.width() - 60.0).min(400.0).max(100.0), (view.height() - 8.0).max(100.0)));
+                mobile_panel(ui.ctx(), egui::Id::new("brep-mobile-panels"), panel, |ui| {
+                    if let Some(id) = self.tree.tiles.iter().find_map(|(id, tile)| matches!(tile, Tile::Pane(k) if *k == pane).then_some(*id)) {
+                        let _ = behavior.pane_ui(ui, id, &mut pane);
+                    }
+                });
+            }
+        } else {
+            self.tree.ui(&mut behavior, ui);
+        }
 
         // A tab CLICK shows up as egui_tiles' own active tab disagreeing with
         // `Documents`; the shell resolves it by activating that document.
-        behavior.document_tabs.activate = self.tab_bar_selection(active_id, &document_ids);
+        if !compact { behavior.document_tabs.activate = self.tab_bar_selection(active_id, &document_ids); }
 
         let outcome = DockOutcome {
             insert_component_requested: behavior.insert_component_requested,
@@ -465,7 +580,7 @@ impl DockState {
             component_request: behavior.component_request.take(),
             document_tabs: std::mem::take(&mut behavior.document_tabs),
         };
-        if behavior.layout_changed {
+        if behavior.layout_changed && !compact {
             self.dirty = true;
         }
         let rendered = std::mem::take(&mut behavior.rendered);
@@ -537,6 +652,14 @@ impl DockState {
         serde_json::json!({ "active": active, "panes": panes }).to_string()
     }
 
+    pub(crate) fn mobile_drawer_open(&self) -> bool { self.mobile.active && self.mobile.open }
+    pub(crate) fn toggle_mobile_drawer(&mut self) { self.mobile.open = !self.mobile.open; }
+
+    pub(crate) fn mobile_state_json(&self) -> String {
+        let rects: serde_json::Value = serde_json::from_str(&crate::automation::hit_rects::hits_json(self.mobile.hits.iter())).unwrap_or_default();
+        serde_json::json!({"compact": self.mobile.active, "open": self.mobile.open, "pane": self.mobile.pane.map(|pane| pane.title()), "rects": rects}).to_string()
+    }
+
     /// Whether tile `id` is the tab its tab group would draw — for EVERY tab
     /// container between it and the root, so a pane tabbed inside a tabbed
     /// container answers honestly.
@@ -575,6 +698,10 @@ impl DockState {
         match self.find_pane(kind) {
             Some(id) if self.tree.tiles.is_visible(id) => {}
             _ => return,
+        }
+        if self.mobile.active {
+            self.mobile.pane = Some(kind);
+            self.mobile.open = true;
         }
         self.tree
             .make_active(|_id, tile| matches!(tile, Tile::Pane(k) if *k == kind));
@@ -1098,6 +1225,42 @@ impl DockState {
     }
 }
 
+/// The side column's floor, in points of WINDOW width: the default 30 % share
+/// left 384 pt at 1280x800, where five or more pane titles elide ("Hist…",
+/// "Qual…") and pane toolbars clip (lane U, integrator ruling P1). 420 is the
+/// 30 % of the 1400-wide window every test-mcp script runs in, so the gate's
+/// layout does not move.
+pub const SIDE_FLOOR: f32 = 420.0;
+/// …but never more than this fraction of the window, so a small window keeps
+/// most of its width for the viewport.
+pub const SIDE_FLOOR_MAX_FRACTION: f32 = 0.40;
+
+/// Raise the side column's share of a `[ side | documents ]` root split to
+/// [`SIDE_FLOOR`] (capped at [`SIDE_FLOOR_MAX_FRACTION`] of `window_width`) when
+/// it is narrower. A column at or above the floor — the default at 1400 wide and
+/// up, or one the user dragged wider — is left exactly as it is; one dragged
+/// narrower comes back to the floor. Layouts of another shape (a vertical root,
+/// three columns) are not touched. Returns whether the shares changed.
+fn apply_side_floor(tree: &mut Tree<PaneKind>, document_group: Option<TileId>, window_width: f32) -> bool {
+    let (Some(root), Some(documents)) = (tree.root, document_group) else { return false };
+    if window_width <= 0.0 {
+        return false;
+    }
+    let Some(Tile::Container(Container::Linear(linear))) = tree.tiles.get_mut(root) else { return false };
+    if linear.dir != egui_tiles::LinearDir::Horizontal || linear.children.len() != 2 || !linear.children.contains(&documents) {
+        return false;
+    }
+    let side = if linear.children[0] == documents { linear.children[1] } else { linear.children[0] };
+    let total = linear.shares[side] + linear.shares[documents];
+    let floor = SIDE_FLOOR.min(SIDE_FLOOR_MAX_FRACTION * window_width) / window_width;
+    if total <= 0.0 || linear.shares[side] / total >= floor - 1e-4 {
+        return false;
+    }
+    linear.shares.set_share(side, floor * total);
+    linear.shares.set_share(documents, (1.0 - floor) * total);
+    true
+}
+
 /// The default layout: a horizontal split of `[ tabs(side panes) | viewport ]`.
 ///
 /// Every side pane is a TAB in one full-height strip down the left, so a fresh
@@ -1191,7 +1354,7 @@ fn salvage(tree: Tree<PaneKind>) -> Option<Tree<PaneKind>> {
     if missing.is_empty() {
         return Some(tree);
     }
-    let mut dock = DockState { tree, plugin_ids: Vec::new(), dirty: false, snapshot: Vec::new(), dialogs: None, ports: None, ecad_entry: None, ecad_declined: Vec::new() };
+    let mut dock = DockState { tree, plugin_ids: Vec::new(), dirty: false, snapshot: Vec::new(), dialogs: None, ports: None, ecad_entry: None, ecad_declined: Vec::new(), mobile: CompactDock::default() };
     let home = dock.side_home()?;
     for kind in missing {
         let pane = dock.tree.tiles.insert_pane(kind);
@@ -1207,6 +1370,7 @@ fn salvage(tree: Tree<PaneKind>) -> Option<Tree<PaneKind>> {
 /// owning panel's existing `show(...)`, and collects the cross-panel requests +
 /// a layout-edit flag for the shell to act on after `Tree::ui`.
 struct DockBehavior<'a> {
+    touch: bool,
     docs: &'a mut Documents,
     plugins: &'a mut crate::plugins::PluginsPanel,
     plugin_ids: Vec<String>,
@@ -1254,6 +1418,7 @@ fn is_document_tile(tiles: &Tiles<PaneKind>, tile_id: TileId) -> bool {
 impl<'a> DockBehavior<'a> {
     fn new(ctx: DockContext<'a>) -> Self {
         DockBehavior {
+            touch: false,
             docs: ctx.docs,
             plugins: ctx.plugins,
             plugin_ids: Vec::new(),
@@ -1313,6 +1478,9 @@ impl<'a> DockBehavior<'a> {
 }
 
 impl<'a> Behavior<PaneKind> for DockBehavior<'a> {
+    fn tab_bar_height(&self, _style: &egui::Style) -> f32 { if self.touch { 44.0 } else { 24.0 } }
+    fn close_button_outer_size(&self) -> f32 { if self.touch { 44.0 } else { 12.0 } }
+    fn close_button_inner_margin(&self) -> f32 { if self.touch { 16.0 } else { 2.0 } }
     fn pane_ui(
         &mut self,
         ui: &mut egui::Ui,
@@ -1493,15 +1661,7 @@ impl<'a> Behavior<PaneKind> for DockBehavior<'a> {
             }).unwrap_or_else(|| "Unavailable plugin".into()).into(),
             PaneKind::Document(id) => match self.docs.iter().find(|d| d.id() == *id) {
                 Some(doc) => {
-                    let title = doc.title();
-                    // U+2022, not U+25CF: the icon font draws the latter as a
-                    // hollow ring, which reads as a status light rather than
-                    // "unsaved".
-                    if doc.dirty_marker() {
-                        format!("{title} \u{2022}").into()
-                    } else {
-                        title.into()
-                    }
+                    crate::panels::document_tabs::display_title(doc).into()
                 }
                 // A pane whose document is gone is about to be removed by
                 // `sync_document_panes`; it must not panic in the meantime.

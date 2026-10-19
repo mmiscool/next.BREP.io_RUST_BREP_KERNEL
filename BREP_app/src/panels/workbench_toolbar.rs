@@ -119,7 +119,7 @@ impl WorkbenchToolbarPanel {
 
 /// A small, dim group caption ahead of its buttons.
 fn caption(ui: &mut egui::Ui, text: &str) {
-    ui.label(egui::RichText::new(text).weak().small());
+    ui.label(egui::RichText::new(text).weak().size(super::ribbon::CHROME_CAPTION_SIZE));
 }
 
 

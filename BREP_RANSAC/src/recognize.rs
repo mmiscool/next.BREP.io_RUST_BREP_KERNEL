@@ -171,6 +171,148 @@ pub fn recognize_surfaces_with_unresolved(
     mesh: &Mesh,
     options: &RecognitionOptions,
 ) -> Result<RecognitionResult, RecognitionError> {
+    recognize_budgeted(mesh, options, &mut AttemptBudget::unlimited())
+}
+
+/// Work spent by [`recognize_surfaces_with_attempt_budget`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RecognitionWork {
+    /// Generic hypotheses drawn, over every extraction round of every
+    /// connected component.
+    pub attempts: usize,
+    /// Regions accepted by generic extraction.
+    pub rounds: usize,
+    /// Whether the budget ran out before extraction finished. The regions
+    /// are then those accepted before the budget ran out (the round in
+    /// progress is dropped), so they are a prefix of the unbudgeted run's.
+    pub exhausted: bool,
+    /// Connected components accepted whole on a supplied
+    /// [`ComponentCandidate`] after their own whole fit was refused.
+    pub seeded_components: usize,
+}
+
+/// A carrier another stage already fitted to exactly the triangles of one
+/// connected component, offered to [`recognize_surfaces_with_candidates`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct ComponentCandidate {
+    /// The component's triangles, in any order.
+    pub triangle_indices: Vec<usize>,
+    /// The carrier to validate on them.
+    pub surface: AnalyticSurface,
+}
+
+/// Roundoff allowance, in units of `f64::EPSILON` times the coordinate
+/// magnitude, for a [`ComponentCandidate`] whose fitting stage measured its
+/// maximum vertex deviation with the same expression (see
+/// [`AnalyticSurface::signed_distance`]) in a different operation order.
+///
+/// Each distance is at most ~30 floating-point operations (the torus: 3
+/// subtractions, a 5-operation dot product, 6 for the axial projection, 6
+/// and a square root for its length, then 5 more and a second square root),
+/// every intermediate bounded by twice the magnitude `M` of the coordinates
+/// and parameters involved. Each operation contributes at most `eps / 2`
+/// relative error, so one evaluation is within `30 * eps * M` of the exact
+/// value and two evaluations differ by at most `60 * eps * M`; 64 rounds that
+/// up. It is not a tolerance on the fit: on the measured near-misses this
+/// path exists for, the refit missed by 1e-6 to 4e-5 relative, and the
+/// allowance is about 1e-14.
+const CANDIDATE_ROUNDOFF_EPSILONS: f64 = 64.0;
+
+/// [`recognize_surfaces_with_unresolved`] with a cap on the generic
+/// hypotheses drawn over the whole call, and optionally fewer primitive
+/// kinds to draw them for.
+///
+/// `max_hypotheses` bounds one extraction round only, and extraction keeps
+/// running rounds while any candidate reaches `minimum_support`; on a mesh
+/// where only small patches fit, the rounds, and the time, are unbounded.
+/// Up to the cap the run is identical to the unbudgeted one: hypotheses are
+/// drawn in the same deterministic order.
+///
+/// `kinds` limits generic hypotheses to those primitive kinds, drawn in the
+/// recognizer's own kind order; empty means every kind, and then the run is
+/// the unbudgeted one up to the cap. A component that one carrier explains
+/// whole is still classified among every kind.
+pub fn recognize_surfaces_with_attempt_budget(
+    mesh: &Mesh,
+    options: &RecognitionOptions,
+    max_attempts: usize,
+    kinds: &[SurfaceType],
+) -> Result<(RecognitionResult, RecognitionWork), RecognitionError> {
+    let kinds: Vec<_> = TYPES.into_iter().filter(|kind| kinds.is_empty() || kinds.contains(kind)).collect();
+    let mut budget = AttemptBudget {
+        limit: Some(max_attempts),
+        kinds,
+        work: RecognitionWork::default(),
+        candidates: Vec::new(),
+    };
+    let result = recognize_budgeted(mesh, options, &mut budget)?;
+    Ok((result, budget.work))
+}
+
+/// [`recognize_surfaces_with_unresolved`], except that a connected component
+/// whose own whole fit is refused is first validated on a supplied candidate
+/// carrier for exactly its triangles before generic extraction divides it.
+///
+/// The candidate is accepted by the ordinary distance, normal and support
+/// gates, with only [`CANDIDATE_ROUNDOFF_EPSILONS`] added to the distance
+/// tolerance. A component whose whole fit passes, or that has no candidate,
+/// runs exactly as in [`recognize_surfaces_with_unresolved`], so with no
+/// candidates the result is identical. The returned work counts the
+/// generic hypotheses drawn and the components accepted on a candidate.
+pub fn recognize_surfaces_with_candidates(
+    mesh: &Mesh,
+    options: &RecognitionOptions,
+    candidates: &[ComponentCandidate],
+) -> Result<(RecognitionResult, RecognitionWork), RecognitionError> {
+    let mut budget = AttemptBudget::unlimited();
+    budget.candidates = candidates
+        .iter()
+        .map(|candidate| {
+            let mut ids = candidate.triangle_indices.clone();
+            ids.sort_unstable();
+            ids.dedup();
+            (ids, candidate.surface)
+        })
+        .collect();
+    let result = recognize_budgeted(mesh, options, &mut budget)?;
+    Ok((result, budget.work))
+}
+
+struct AttemptBudget {
+    limit: Option<usize>,
+    /// Kinds generic hypotheses are drawn for, in [`TYPES`] order.
+    kinds: Vec<SurfaceType>,
+    work: RecognitionWork,
+    /// Sorted triangle sets and their candidate carriers.
+    candidates: Vec<(Vec<usize>, AnalyticSurface)>,
+}
+
+impl AttemptBudget {
+    fn unlimited() -> Self {
+        Self {
+            limit: None,
+            kinds: TYPES.to_vec(),
+            work: RecognitionWork::default(),
+            candidates: Vec::new(),
+        }
+    }
+
+    /// Takes one attempt, or marks the budget exhausted and refuses.
+    fn take(&mut self) -> bool {
+        if self.work.exhausted || self.limit.is_some_and(|limit| self.work.attempts >= limit) {
+            self.work.exhausted = true;
+            return false;
+        }
+        self.work.attempts += 1;
+        true
+    }
+}
+
+fn recognize_budgeted(
+    mesh: &Mesh,
+    options: &RecognitionOptions,
+    budget: &mut AttemptBudget,
+) -> Result<RecognitionResult, RecognitionError> {
     options.validate()?;
     let analyzed = mesh.analyze(&MeshAnalysisOptions {
         feature_angle: options.feature_angle,
@@ -236,7 +378,7 @@ pub fn recognize_surfaces_with_unresolved(
         vec![remaining]
     };
     for component in components {
-        extract_component(&analyzed, &component, options, &mut regions);
+        extract_component(&analyzed, &component, options, &mut regions, budget);
     }
     if options.allow_disconnected_same_surface {
         merge_disconnected_regions(&analyzed, options, &mut regions);
@@ -1038,11 +1180,17 @@ fn extract_component(
     component: &[usize],
     options: &RecognitionOptions,
     out: &mut Vec<SurfaceRegion>,
+    budget: &mut AttemptBudget,
 ) {
-    if component.len() < options.minimum_support {
+    if component.len() < options.minimum_support || budget.work.exhausted {
         return;
     }
     if let Ok(fit) = reconstruct_analyzed(mesh, component, &SurfaceHint::Unknown, options) {
+        out.push(to_region(fit, component.to_vec()));
+        return;
+    }
+    if let Some(fit) = candidate_fit(mesh, component, options, &budget.candidates) {
+        budget.work.seeded_components += 1;
         out.push(to_region(fit, component.to_vec()));
         return;
     }
@@ -1057,22 +1205,26 @@ fn extract_component(
         // primitive. At the full cap every remaining triangle is tried once
         // for every carrier; random-with-replacement sampling could waste
         // roughly a third of that budget on duplicate seeds.
-        let seed_orders: Vec<_> = TYPES
+        let kinds = budget.kinds.clone();
+        let seed_orders: Vec<_> = kinds
             .iter()
             .map(|_| shuffled_seed_order(&ids, &mut rng))
             .collect();
         let mut best: Option<(usize, ModelRank, SurfaceFitResult, Vec<usize>)> = None;
-        let attempt_cap = options.max_hypotheses.min(ids.len() * TYPES.len());
+        let attempt_cap = options.max_hypotheses.min(ids.len() * kinds.len());
         let mut attempts_required = attempt_cap;
         let mut attempt = 0;
         let mut region_growth_seconds = options.collect_phase_timings.then_some(0.0);
         while attempt < attempts_required {
+            if !budget.take() {
+                return;
+            }
             let attempt_index = attempt;
             attempt += 1;
-            let kind_index = attempt_index % TYPES.len();
-            let round = attempt_index / TYPES.len();
+            let kind_index = attempt_index % kinds.len();
+            let round = attempt_index / kinds.len();
             let seed = seed_orders[kind_index][round];
-            let kind = TYPES[kind_index];
+            let kind = kinds[kind_index];
             // Generate each primitive from the smallest diverse triangle set
             // that supplies its fitter's required independent observations in
             // every public sampling mode. Final support is still grown and
@@ -1184,7 +1336,7 @@ fn extract_component(
                 attempts_required = attempts_required.min(required_seed_hypotheses(
                     options.confidence,
                     support_fraction,
-                    TYPES.len(),
+                    kinds.len(),
                     attempt_cap,
                 ));
                 attempts_required = attempts_required.max(attempt);
@@ -1198,8 +1350,49 @@ fn extract_component(
         for id in &support {
             remaining.remove(id);
         }
+        budget.work.rounds += 1;
         out.push(to_region(fit, support));
     }
+}
+
+/// The supplied candidate for exactly `component`'s non-degenerate
+/// triangles, validated by the ordinary gates plus the roundoff allowance.
+fn candidate_fit(
+    mesh: &AnalyzedMesh,
+    component: &[usize],
+    options: &RecognitionOptions,
+    candidates: &[(Vec<usize>, AnalyticSurface)],
+) -> Option<SurfaceFitResult> {
+    if candidates.is_empty() {
+        return None;
+    }
+    let mut ids = component.to_vec();
+    ids.sort_unstable();
+    let surface = candidates.iter().find_map(|(candidate, surface)| {
+        let mut usable = candidate
+            .iter()
+            .copied()
+            .filter(|&id| id < mesh.triangles.len() && mesh.triangles[id].area > 0.0);
+        usable.by_ref().eq(ids.iter().copied()).then_some(*surface)
+    })?;
+    let magnitude = ids
+        .iter()
+        .flat_map(|&tid| mesh.triangles[tid].vertices)
+        .map(|vid| {
+            let p = mesh.vertices[vid];
+            p.x.abs().max(p.y.abs()).max(p.z.abs())
+        })
+        .fold(1.0_f64, f64::max);
+    let mut seeded = options.clone();
+    seeded.distance_tolerance += CANDIDATE_ROUNDOFF_EPSILONS * f64::EPSILON * magnitude;
+    let scale = selection_scale(mesh, &ids);
+    let mut fit = evaluate_surface(mesh, &ids, surface, &seeded, FitPath::ExactCandidateReused).ok()?;
+    let vertex_samples_only = matches!(seeded.sampling, crate::SamplingMode::Vertices);
+    if !accepted_impl(&fit, &seeded, scale, vertex_samples_only) {
+        return None;
+    }
+    fit.diagnostics.reason = "a supplied component carrier validated whole after the component's own whole fit was refused".into();
+    Some(fit)
 }
 
 fn shuffled_seed_order(ids: &[usize], rng: &mut SplitMix) -> Vec<usize> {

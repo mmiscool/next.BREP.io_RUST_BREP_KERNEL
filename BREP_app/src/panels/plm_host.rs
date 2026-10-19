@@ -489,7 +489,18 @@ impl PlmHost {
                 let plm = crate::panels::plm_workspace::PlmWorkspaces { client: client.clone() };
                 self.workspace.reload(&plm);
                 if let Some(key) = created.first_revision_key() {
-                    let (client, document) = (client.clone(), docs.engine().history_request_json());
+                    let (client, mut document) = (client.clone(), docs.engine().history_request_json());
+                    if docs.engine().history_len() == 0 {
+                        // New part adopts a COPY, including when the source is
+                        // read-only. Seed the destination without editing that source.
+                        let mut engine = docs.spawn_engine();
+                        if let Err(problem) = engine.load_model_and_fit(&document) {
+                            docs.engine_mut().push_notice(format!("The new part could not be prepared: {problem}"));
+                            continue;
+                        }
+                        crate::document::seed_new_part_datum(&mut engine);
+                        document = engine.history_request_json();
+                    }
                     let at = key.clone();
                     let write: crate::plm::PlmFuture<()> =
                         Box::pin(async move { crate::plm::adoption::load_into_revision(&client, &at, &document).await });

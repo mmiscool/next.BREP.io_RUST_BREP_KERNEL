@@ -82,6 +82,77 @@ fn offset_ruled_carrier(
         .or_refuse(KernelStage::Classify, "make_revolution")
 }
 
+/// The rim of two COAXIAL ruled revolutions whose straight meridians cross
+/// outside one carrier's finite axial span, or `None` when they do not cross
+/// (parallel meridians, or a crossing on or past the axis).
+///
+/// In the meridian half-plane both carriers are lines, `ρ = ρ0 + m·t` along
+/// the shared axis, so the crossing station is closed-form. Each carrier is
+/// rebuilt over its own span prolonged to that station (same frame, same
+/// seam azimuth, same slope: the same surface, a longer patch) and the pair
+/// is handed to the same exact intersector, which then finds the circle.
+fn coaxial_rim_past_spans(
+    pushed: &NurbsSurface,
+    neighbour: &NurbsSurface,
+    tolerance: f64,
+) -> Result<Option<Vec<NurbsCurve>>, KernelRefusal> {
+    let ruled = |surface: &NurbsSurface| match surface.analytic() {
+        Some(AnalyticSurface::RuledRevolution { frame, rho0, rho1, height }) => {
+            Some((frame.clone(), *rho0, *rho1, *height))
+        }
+        _ => None,
+    };
+    let (Some((frame_a, rho0_a, rho1_a, height_a)), Some((frame_b, rho0_b, rho1_b, height_b))) =
+        (ruled(pushed), ruled(neighbour))
+    else {
+        return Ok(None);
+    };
+    // Both meridians in A's axial coordinate `t`: B's own coordinate of the
+    // axis point at `t` is `c + sign·t`.
+    let slope_a = (rho1_a - rho0_a) / height_a;
+    let slope_b = (rho1_b - rho0_b) / height_b;
+    let sign = frame_a.axis.dot(frame_b.axis).signum();
+    let c = frame_a.origin.sub(frame_b.origin).dot(frame_b.axis);
+    let denominator = slope_a - slope_b * sign;
+    if denominator.abs() <= 1e-12 {
+        return Ok(None);
+    }
+    let t = (rho0_b + slope_b * c - rho0_a) / denominator;
+    let radius = rho0_a + slope_a * t;
+    if !t.is_finite() || radius <= tolerance {
+        return Ok(None);
+    }
+    // Prolong one carrier over `[min(0, station), max(height, station)]` of
+    // its own coordinate, with a margin so the circle lies strictly inside.
+    let prolong = |frame: &crate::RevolutionFrame,
+                   rho0: f64,
+                   slope: f64,
+                   height: f64,
+                   station: f64|
+     -> Result<Option<NurbsSurface>, KernelRefusal> {
+        let margin = 0.05 * height.max(station.abs());
+        let low = (station - margin).min(0.0);
+        let high = (station + margin).max(height);
+        let (rho_low, rho_high) = (rho0 + slope * low, rho0 + slope * high);
+        if rho_low <= tolerance || rho_high <= tolerance {
+            return Ok(None);
+        }
+        let start = frame.origin.add(frame.axis.scale(low)).add(frame.x_axis.scale(rho_low));
+        let end = frame.origin.add(frame.axis.scale(high)).add(frame.x_axis.scale(rho_high));
+        let generatrix = make_line(start, end).or_refuse(KernelStage::Refine, "make_line")?;
+        make_revolution(frame.origin, frame.axis, &generatrix, std::f64::consts::TAU)
+            .map(Some)
+            .or_refuse(KernelStage::Refine, "make_revolution")
+    };
+    let Some(long_a) = prolong(&frame_a, rho0_a, slope_a, height_a, t)? else {
+        return Ok(None);
+    };
+    let Some(long_b) = prolong(&frame_b, rho0_b, slope_b, height_b, c + sign * t)? else {
+        return Ok(None);
+    };
+    Ok(intersect_analytic_pair(&long_a, &long_b, tolerance).filter(|curves| !curves.is_empty()))
+}
+
 /// The face's OUTWARD unit normal at its parameter-domain midpoint, oriented by
 /// `same_sense` (the convention `push_face::planar_face_normal` uses).
 fn outward_normal_mid(face: &FaceRecord) -> Result<(Vec3, Vec3), KernelRefusal> {
@@ -405,9 +476,24 @@ pub fn offset_ruled_face(
                 // UNCHANGED: the exact call, with the same arguments in the same
                 // order, so every pair this function answered before is answered
                 // bit-identically now.
-                intersect_analytic_pair(&s_prime, neighbour_surface, tolerance)
+                match intersect_analytic_pair(&s_prime, neighbour_surface, tolerance)
                     .filter(|curves| !curves.is_empty())
-                    .ok_or_else(separated)?
+                {
+                    Some(curves) => curves,
+                    // A coaxial ruled pair whose meridians still cross, only
+                    // past the end of one carrier's finite span: the rim slides
+                    // further along the axis than either patch reached (a
+                    // countersink pushed out runs its rim down the bore it
+                    // sinks). The two carriers are prolonged to the crossing
+                    // and re-intersected; the retrim below grows each face's
+                    // carrier over the moved rim, as it does for any rim that
+                    // slid inside the spans.
+                    None if is_coaxial_ruled => {
+                        coaxial_rim_past_spans(&s_prime, neighbour_surface, tolerance)?
+                            .ok_or_else(separated)?
+                    }
+                    None => return Err(separated()),
+                }
             };
             let rim = nearest_curve(&curves, old_mid)?;
             if !rim_edges.contains(&edge.id) {
@@ -1113,8 +1199,14 @@ pub fn offset_ruled_face(
         ),
         ));
     }
+    // Sign only, through the per-face term memo (`solid_signed_volume_for_sign`,
+    // the verdict against the bar is the exact integral's): the body before the
+    // push was read about the same reference by the feature that built it, and
+    // the pushed body differs from it in the pushed face and its re-trimmed
+    // neighbours. The exact reads cost 0.26 s a body on the shelled-box
+    // report's push (34 faces, 42 of them fitted).
     if let (Ok(before), Ok(after)) =
-        (solid_signed_volume(solid), solid_signed_volume(&result))
+        (crate::signed_volume_against(solid, 0.0), crate::signed_volume_against(&result, 0.0))
     {
         if before * after <= 0.0 {
             return Err(KernelRefusal::internal(

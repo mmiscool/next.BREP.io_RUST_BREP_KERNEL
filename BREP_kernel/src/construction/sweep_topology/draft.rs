@@ -511,6 +511,7 @@ pub fn extrude_profile_brep_draft(
 
     let solid = BrepSolid {
         mass_properties_cache: Default::default(),
+        cells: Default::default(),
         id: next_id + 1,
         vertices,
         edges,

@@ -195,7 +195,7 @@ fn icon_tile(
 /// The palette's transient state. The caller owns ONE, calls [`Palette::open`]
 /// to populate + show it, and [`Palette::show`] every frame; the return of
 /// `show` is the selection outcome.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct Palette {
     open: bool,
     pub display: PaletteDisplay,
@@ -208,6 +208,7 @@ pub struct Palette {
     placeholder: String,
     /// The items, pre-sorted alphabetical by label at [`open`](Palette::open).
     items: Vec<PaletteItem>,
+    disabled: HashMap<String, String>,
     /// Set on open (and after a no-op Enter) so the text input grabs focus.
     want_focus: bool,
     /// Per-frame widget rects (text input + visible rows) for the headed
@@ -231,11 +232,19 @@ impl Palette {
     ) {
         sort_by_label(&mut items);
         self.items = items;
+        self.disabled.clear();
         self.title = title.into();
         self.placeholder = placeholder.into();
         self.query.clear();
         self.open = true;
         self.want_focus = true;
+    }
+
+    /// Refresh live action offers without resetting the search/display state.
+    pub(crate) fn refresh_items(&mut self, mut items: Vec<PaletteItem>, disabled: HashMap<String, String>) {
+        sort_by_label(&mut items);
+        self.items = items;
+        self.disabled = disabled;
     }
 
     pub fn take_display_change(&mut self) -> bool {
@@ -250,6 +259,7 @@ impl Palette {
         self.open = false;
         self.query.clear();
         self.items.clear();
+        self.disabled.clear();
         self.hits.clear();
     }
 
@@ -267,6 +277,10 @@ impl Palette {
     /// while nothing is chosen, and on cancel (Esc / backdrop click, which also
     /// close it). Idempotent when closed.
     pub fn show(&mut self, ctx: &egui::Context) -> Option<String> {
+        self.show_with_id(ctx, egui::Id::new("brep-command-palette"))
+    }
+
+    pub(crate) fn show_with_id(&mut self, ctx: &egui::Context, id: egui::Id) -> Option<String> {
         if !self.open {
             return None;
         }
@@ -274,8 +288,9 @@ impl Palette {
 
         let mut selected: Option<String> = None;
         let mut enter_no_match = false;
+        let mut cancel = false;
 
-        let modal = egui::Modal::new(egui::Id::new("brep-command-palette")).show(ctx, |ui| {
+        let modal = egui::Modal::new(id).show(ctx, |ui| {
             let desired_width: f32 = if self.display == PaletteDisplay::CompactSingle {
                 360.0
             } else {
@@ -284,10 +299,28 @@ impl Palette {
             ui.set_width(desired_width.min((ctx.content_rect().width() - 40.0).max(160.0)));
 
             if !self.title.is_empty() {
-                ui.heading(&self.title);
+                if crate::viewport::touch::enabled(ctx) {
+                    ui.horizontal(|ui| {
+                        ui.heading(&self.title);
+                        let close = ui.button("Close");
+                        self.hits.insert("close".into(), close.rect);
+                        cancel = close.clicked();
+                    });
+                } else { ui.heading(&self.title); }
                 ui.add_space(4.0);
             }
 
+            if crate::viewport::touch::enabled(ctx) {
+                ui.horizontal(|ui| {
+                    ui.label("Display");
+                    for (mode, label) in [(PaletteDisplay::CompactSingle, "List"), (PaletteDisplay::LargeIcons, "Icons")] {
+                        let option = ui.selectable_value(&mut self.display, mode, label);
+                        self.hits.insert(format!("display:{mode:?}"), option.rect);
+                        if mode == PaletteDisplay::CompactSingle { self.hits.insert("display".into(), option.rect); }
+                        if option.changed() { self.display_changed = true; }
+                    }
+                });
+            } else {
             ui.horizontal(|ui| {
                 ui.label("Display");
                 let combo = egui::ComboBox::from_id_salt("palette-display")
@@ -304,17 +337,18 @@ impl Palette {
                     });
                 self.hits.insert("display".into(), combo.response.rect);
             });
+            }
             ui.add_space(4.0);
 
             // --- search input (focused by default) ----------------------------
             let input = ui.add(
-                egui::TextEdit::singleline(&mut self.query)
+                egui::TextEdit::singleline(&mut self.query).margin(crate::viewport::touch::text_edit_margin(ui))
                     .hint_text(&self.placeholder)
                     .desired_width(f32::INFINITY),
             );
             self.hits.insert("input".into(), input.rect);
             if self.want_focus {
-                input.request_focus();
+                if !crate::viewport::touch::enabled(ctx) { input.request_focus(); }
                 self.want_focus = false;
             }
             // While focused, keep Esc for the modal (its `should_close` consumes
@@ -341,7 +375,7 @@ impl Palette {
             // --- filtered, ranked list ---------------------------------------
             let filtered = filter_items(&self.items, &self.query);
             if enter {
-                match filtered.first() {
+                match filtered.iter().find(|item| !self.disabled.contains_key(&item.id)) {
                     Some(top) => selected = Some(top.id.clone()),
                     None => enter_no_match = true,
                 }
@@ -379,11 +413,12 @@ impl Palette {
                         let width = ((ui.available_width() - gap * (columns - 1) as f32)
                             / columns as f32)
                             .max(1.0);
-                        for (row_index, items) in filtered.chunks(columns).enumerate() {
+                        for items in filtered.chunks(columns) {
                             ui.horizontal(|ui| {
-                                for (column, item) in items.iter().enumerate() {
-                                    let is_top = row_index == 0 && column == 0;
-                                    let row = ui
+                                for item in items.iter() {
+                                    let is_top = filtered.iter().find(|item| !self.disabled.contains_key(&item.id))
+                                        .is_some_and(|top| top.id == item.id);
+                                    let draw = |ui: &mut egui::Ui| ui
                                         .push_id(&item.id, |ui| match self.display.tile() {
                                             // Every icon size draws the same tile;
                                             // only its geometry differs.
@@ -421,11 +456,14 @@ impl Palette {
                                                 } else {
                                                     egui::Button::selectable(is_top, caption)
                                                 };
-                                                ui.add_sized([width, 24.0], button.truncate())
+                                                ui.add_sized(crate::viewport::touch::target_size(ui.ctx(), egui::vec2(width, 24.0)), button.truncate())
                                                     .on_hover_text(caption)
                                             }
                                         })
                                         .inner;
+                                    let row = if let Some(reason) = self.disabled.get(&item.id) {
+                                        ui.add_enabled_ui(false, draw).inner.on_disabled_hover_text(reason)
+                                    } else { draw(ui) };
                                     if ui.is_rect_visible(row.rect) {
                                         let visible = row.rect.intersect(ui.clip_rect());
                                         self.hits.insert(format!("item:{}", item.id), visible);
@@ -443,7 +481,8 @@ impl Palette {
             });
         });
 
-        // A pick closes + reports; a cancel (Esc / backdrop) just closes.
+        // A pick closes + reports; a cancel (Esc / backdrop / mobile Close) just closes.
+        if cancel { self.close(); return None; }
         if let Some(id) = selected {
             self.close();
             return Some(id);

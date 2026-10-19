@@ -43,11 +43,19 @@ pub(super) fn blend_open_smooth_chain(
     // 295), read input-free on 871581076 + the section-fit fix.
     let bar = crate::KernelTolerances::for_solid(solid, 1e-7).intersection_fit;
     let mut budget = ChainBudget::for_chain(&chain.segments, CHAIN_PER_SEGMENT)?;
+    // Every too-coarse rung's reading, for the refusal at the top.
+    let mut trend: Vec<(usize, f64)> = Vec::new();
     loop {
         let per_segment = budget.rung;
+        crate::blend::record_count("count.open_chain.rungs", 1);
+        let march = crate::blend::BlendTimer::start("timing.open_chain.march_ms");
         let samples = march_chain(&chain.segments, radius, true, &budget, FoldPolicy::Refuse)?;
+        march.stop();
         let deepest = std::cell::Cell::new(0);
-        match open_chain_rung(solid, chain, radius, chamfer, name, &budget, bar, samples, 0, &deepest)? {
+        let rung = crate::blend::BlendTimer::start("timing.open_chain.rung_ms");
+        let outcome = open_chain_rung(solid, chain, radius, chamfer, name, &budget, bar, samples, 0, &deepest)?;
+        rung.stop();
+        match outcome {
             OpenRung::Built(built) => return Ok(built),
             OpenRung::TooCoarse { deviation } => {
                 crate::blend::carve::carve_trace(format_args!(
@@ -55,11 +63,14 @@ pub(super) fn blend_open_smooth_chain(
                      from the rolling ball, against {bar:.3e}",
                     budget.describe()
                 ));
+                trend.push((per_segment, deviation));
                 if budget.largest() * 2 > CHAIN_CARVE_MAX_PER_SEGMENT {
+                    let (best_rung, best, listing) = ladder_trend(&trend);
                     return Err(KernelRefusal::non_convergence(KernelStage::Refine, "open_chain_ladder_top", format!(
-                        "blend: at {per_segment} stations per segment — the top of the chain's ladder — \
-                         this open chain's rails or wall still stand {deviation:.6e} from the rolling ball \
-                         against a bar of {bar:.3e}, so there is no blend accurate enough to build"
+                        "blend: the chain's ladder reached its top, {per_segment} stations per segment, \
+                         and no rung passed — its best, {best_rung} stations per segment, left this open \
+                         chain's rails or wall {best:.6e} from the rolling ball against a bar of {bar:.3e} \
+                         (rung by rung: {listing}), so there is no blend accurate enough to build"
                     )));
                 }
                 budget = budget.doubled();
@@ -175,17 +186,25 @@ fn open_chain_rung(
                 <= CHAIN_CARVE_MAX_PER_SEGMENT
         })
     };
+    let stencil = crate::blend::BlendTimer::start("timing.open_chain.rung.contacts_ms");
     let contacts = super::chain_dense_contacts(segments, radius, budget, &samples, super::closed::LOCAL_RAIL_STENCIL)?;
+    stencil.stop();
+    let misses = crate::blend::BlendTimer::start("timing.open_chain.rung.rail_misses_ms");
     let (dense, unreadable) = super::closed::dense_rail_misses(&contacts, &samples, &cr, &cs, global_low, global_range, false)?;
+    misses.stop();
     let failed_to_read: Vec<usize> = contacts.unsolved_at.iter().chain(&unreadable).copied().collect();
     let (mut deviation, mut failing) = super::closed::combine_rail_verdict((0.0, Vec::new()), &dense, &failed_to_read, bar);
     let mut wall_readings: Vec<(usize, f64, f64, f64)> = Vec::new();
     if !chamfer && super::closed::wall_verdict_on() {
+        let wall_stencil = crate::blend::BlendTimer::start("timing.open_chain.rung.wall_contacts_ms");
         let wall_contacts = super::chain_dense_contacts(segments, radius, budget, &samples, 2 * super::closed::LOCAL_RAIL_STENCIL)?;
+        wall_stencil.stop();
+        let wall_misses = crate::blend::BlendTimer::start("timing.open_chain.rung.wall_misses_ms");
         let (wall, unreadable) = super::closed::wall_interior_misses(
             &wall_contacts, &samples, &surface, global_low, global_range, radius,
             2 * super::closed::LOCAL_RAIL_STENCIL, super::closed::WALL_SECTION_PROBES, false,
         );
+        wall_misses.stop();
         for &(left, declared, _, _) in &wall {
             if !(declared <= bar) {
                 failing.push(left);
@@ -474,6 +493,25 @@ fn refit_open_piece_pcurve(
         let head = if t0 > c0 { edge.curve.split(t0).or_refuse(KernelStage::Refine, "split")?.1 } else { edge.curve.clone() };
         if t1 < c1 { head.split(t1).or_refuse(KernelStage::Refine, "split")?.0 } else { head }
     };
+    if std::env::var_os("BREP_DEBUG_TRACK_FIT").is_some() {
+        // The piece against its carrier: a piece that is itself off the
+        // carrier holds the pcurve ladder at its top however fine the fit.
+        let mut worst = (0.0f64, 0.0f64);
+        for sample in 0..=40 {
+            let t = t0 + (t1 - t0) * sample as f64 / 40.0;
+            if let (Ok(point), Ok(projection)) = (piece.evaluate(t), piece.evaluate(t).and_then(|p| crate::project_point_to_surface(surface, p))) {
+                let _ = point;
+                if projection.distance > worst.0 {
+                    worst = (projection.distance, sample as f64 / 40.0);
+                }
+            }
+        }
+        let (start, end) = (piece.evaluate(t0), piece.evaluate(t1));
+        eprintln!(
+            "TRACK_FIT open-chain support: edge {edge_id} from {:?} to {:?}; worst standoff from its carrier {:.3e} at fraction {:.3}",
+            start.ok(), end.ok(), worst.0, worst.1
+        );
+    }
     // Every foot sought from the interpolated pcurve `old` at the same
     // fraction, on the branch it runs on (`pcurve_guide`).
     let guide = super::closed::pcurve_guide(old, surface)?;

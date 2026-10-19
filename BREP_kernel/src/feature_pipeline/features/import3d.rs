@@ -201,7 +201,16 @@ fn restore_native_bodies(ctx: &FeatureContext, payload: &str) -> Result<FeatureR
     }
     let mut result = FeatureResult::empty(ctx.id.clone(), ctx.feature_type.clone());
     for solid in restored.solids {
-        result.added.push(register_verbatim(solid.solid, &solid.name));
+        let mut body = solid.solid;
+        // Exactly analytic faces in a foreign parametrisation take the
+        // kernel's canonical one (`analytic_surface/canonical.rs`).
+        if crate::canonical_carriers_enabled() {
+            let report = crate::canonicalise_carriers(&mut body);
+            if std::env::var_os("BREP_PROFILE").is_some() && !report.rewritten.is_empty() {
+                eprintln!("import3d.canonical_carriers solid={} rewritten={:?}", solid.name, report.rewritten);
+            }
+        }
+        result.added.push(register_verbatim(body, &solid.name));
     }
     // Overwriting: the payload's records ARE the part's metadata. The pipeline's
     // own `sourceFeatureId` seed runs after this feature returns and is

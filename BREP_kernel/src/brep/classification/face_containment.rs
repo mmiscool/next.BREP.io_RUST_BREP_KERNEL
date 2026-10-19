@@ -147,7 +147,7 @@ struct SegmentPrep {
 /// Which of the environment switches the lanes read were set when a face was
 /// prepared; part of the cache signature so a test that flips one between two
 /// queries on one thread never answers from data prepared under the other.
-fn lane_switches() -> f64 {
+pub(crate) fn lane_switches() -> f64 {
     let mut bits = 0u32;
     if switched_off(SEAM_BAND_MERGED_SWITCH) {
         bits |= 1;

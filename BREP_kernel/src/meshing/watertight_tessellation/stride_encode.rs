@@ -25,14 +25,32 @@ pub fn tessellate_brep_watertight_face_stride(
     stride: usize,
     offset: usize,
 ) -> Result<Mesh, String> {
+    tessellate_brep_watertight_face_stride_keyed(solid, chord_tolerance, stride, offset).map(|(mesh, _)| mesh)
+}
+
+/// [`tessellate_brep_watertight_face_stride`] handing back, beside the mesh,
+/// each meshed face's content key (`face_memo::key`: the face record, its
+/// coedges' shared samples and the chord), in the order the faces were meshed.
+/// Two faces with equal keys mesh to the same bits; the soundness scan keys
+/// its face-pair memo on them.
+pub(crate) fn tessellate_brep_watertight_face_stride_keyed(
+    solid: &BrepSolid,
+    chord_tolerance: f64,
+    stride: usize,
+    offset: usize,
+) -> Result<(Mesh, Vec<[u64; 2]>), String> {
     if !(chord_tolerance > 0.0) || !chord_tolerance.is_finite() {
         return Err("tessellate_brep_watertight: chord tolerance must be positive".into());
     }
+    let armed_here = arm_for_face_lines();
     let started = profile_started();
     let samples = sample_all_edges(solid, chord_tolerance)?;
     let sampling_ms = elapsed_ms(started);
     tess_profile(|p| p.edge_sampling_ms += sampling_ms);
-    tessellate_faces_stride(solid, &samples, chord_tolerance, stride, offset)
+    let mut keys = Vec::new();
+    let mesh = tessellate_faces_stride_keyed(solid, &samples, chord_tolerance, stride, offset, Some(&mut keys))?;
+    profile::end(armed_here, chord_tolerance, mesh.indices.len() / 3);
+    Ok((mesh, keys))
 }
 
 /// As [`tessellate_brep_watertight_face_stride`], but the caller supplies edge
@@ -51,8 +69,11 @@ pub fn tessellate_brep_watertight_face_stride_with_samples(
     if !(chord_tolerance > 0.0) || !chord_tolerance.is_finite() {
         return Err("tessellate_brep_watertight: chord tolerance must be positive".into());
     }
+    let armed_here = arm_for_face_lines();
     let samples = decode_edge_samples(encoded_samples)?;
-    tessellate_faces_stride(solid, &samples, chord_tolerance, stride, offset)
+    let mesh = tessellate_faces_stride(solid, &samples, chord_tolerance, stride, offset)?;
+    profile::end(armed_here, chord_tolerance, mesh.indices.len() / 3);
+    Ok(mesh)
 }
 
 /// A `(face_id, &FaceRecord)` that can cross rayon worker threads.
@@ -87,6 +108,19 @@ pub(super) fn tessellate_faces_stride(
     stride: usize,
     offset: usize,
 ) -> Result<Mesh, String> {
+    tessellate_faces_stride_keyed(solid, samples, chord_tolerance, stride, offset, None)
+}
+
+/// [`tessellate_faces_stride`], filling `keys` (when asked) with each meshed
+/// face's content key in meshing order.
+pub(super) fn tessellate_faces_stride_keyed(
+    solid: &BrepSolid,
+    samples: &HashMap<u64, EdgeSamples>,
+    chord_tolerance: f64,
+    stride: usize,
+    offset: usize,
+    keys: Option<&mut Vec<[u64; 2]>>,
+) -> Result<Mesh, String> {
     let stride = stride.max(1);
     let offset = offset % stride;
     let mut work: Vec<(u32, &FaceRecord)> = Vec::new();
@@ -106,7 +140,7 @@ pub(super) fn tessellate_faces_stride(
     let armed_here = arm_for_face_lines();
     let face_lines = face_lines_enabled();
     tess_profile(|p| p.faces += work.len() as u64);
-    let mesh_one = |face_id: u32, face: &FaceRecord| -> Result<Mesh, String> {
+    let mesh_fresh = |face_id: u32, face: &FaceRecord| -> Result<Mesh, String> {
         let mut fragment = Mesh::default();
         if face_lines {
             let before = snapshot();
@@ -125,21 +159,59 @@ pub(super) fn tessellate_faces_stride(
         tessellate_face_watertight(face, samples, chord_tolerance, face_id, &mut fragment)?;
         Ok(fragment)
     };
+    let memo = super::face_memo::enabled();
+    // The faces' content keys, computed once here when the memo or the caller
+    // wants them (the key is a hash of the face and its samples, cheap next to
+    // a mesh).
+    let face_keys: Option<Vec<[u64; 2]>> = (memo || keys.is_some())
+        .then(|| work.iter().map(|&(_, face)| super::face_memo::key(face, samples, chord_tolerance)).collect());
+    if let Some(keys) = keys {
+        *keys = face_keys.clone().unwrap_or_default();
+    }
+    let mesh_one = |index: usize, face_id: u32, face: &FaceRecord| -> Result<Mesh, String> {
+        // The content memo (`face_memo.rs`): a face meshed before under the
+        // same carrier, trims, shared samples and chord is served its stored
+        // fragment, restamped. A miss meshes as before and stores the result.
+        let key = if memo { face_keys.as_ref().map(|keys| keys[index]) } else { None };
+        if let Some(key) = key {
+            if let Some(fragment) = super::face_memo::lookup(key, face_id) {
+                if face_lines {
+                    eprintln!(
+                        "tess.face face={face_id} id={} memo=hit tris={}",
+                        face.id,
+                        fragment.indices.len() / 3
+                    );
+                }
+                return Ok(fragment);
+            }
+        }
+        let fragment = mesh_fresh(face_id, face)?;
+        if let Some(key) = key {
+            super::face_memo::store(key, &fragment);
+        }
+        Ok(fragment)
+    };
     #[cfg(feature = "parallel")]
     let fragments = {
         use rayon::prelude::*;
         let sync_work: Vec<SyncFace> = work.iter().map(|&(id, face)| SyncFace(id, face)).collect();
         sync_work
             .par_iter()
-            .map(|face| mesh_one(face.0, face.1))
+            .enumerate()
+            .map(|(index, face)| mesh_one(index, face.0, face.1))
             .collect::<Result<Vec<Mesh>, String>>()?
     };
     #[cfg(not(feature = "parallel"))]
     let fragments = work
         .iter()
-        .map(|&(id, face)| mesh_one(id, face))
+        .enumerate()
+        .map(|(index, &(id, face))| mesh_one(index, id, face))
         .collect::<Result<Vec<Mesh>, String>>()?;
     let mesh = concatenate_meshes(fragments);
+    if tess_profile_enabled() {
+        let (hits, misses, entries, triangles) = super::face_memo::take_counts();
+        eprintln!("tess.memo enabled={memo} hits={hits} misses={misses} entries={entries} stored_tris={triangles}");
+    }
     if armed_here.is_some() {
         profile::end(armed_here, chord_tolerance, mesh.indices.len() / 3);
     }
@@ -198,11 +270,17 @@ pub fn sample_edges_encoded(solid: &BrepSolid, chord_tolerance: f64) -> Result<V
     if !(chord_tolerance > 0.0) || !chord_tolerance.is_finite() {
         return Err("tessellate_brep_watertight: chord tolerance must be positive".into());
     }
+    let armed_here = arm_for_face_lines();
+    let started = profile_started();
     let samples = sample_all_edges(solid, chord_tolerance)?;
-    Ok(encode_edge_samples(&samples))
+    tess_profile(|p| p.edge_sampling_ms += elapsed_ms(started));
+    let encoded = encode_edge_samples(&samples);
+    profile::end(armed_here, chord_tolerance, 0);
+    Ok(encoded)
 }
 
 pub(super) fn encode_edge_samples(samples: &HashMap<u64, EdgeSamples>) -> Vec<f64> {
+    let _timer = stage_timer(Stage::Encode);
     let mut out = Vec::new();
     out.push(samples.len() as f64);
     for (edge_id, edge) in samples {
@@ -220,6 +298,7 @@ pub(super) fn encode_edge_samples(samples: &HashMap<u64, EdgeSamples>) -> Vec<f6
 }
 
 pub(super) fn decode_edge_samples(data: &[f64]) -> Result<HashMap<u64, EdgeSamples>, String> {
+    let _timer = stage_timer(Stage::Decode);
     let mut cursor = 0usize;
     let mut take = |count: usize| -> Result<&[f64], String> {
         let end = cursor

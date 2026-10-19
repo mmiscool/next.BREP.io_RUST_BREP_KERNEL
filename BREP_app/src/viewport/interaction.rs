@@ -141,12 +141,32 @@ impl Viewport {
                 rect,
                 ViewportCallback,
             ));
+            if super::touch::enabled(ui.ctx()) && state.sketch_mode()
+                && state.sketch_active_tool().is_some_and(|tool| tool != "pickEdges" && tool != "handdraw")
+                && !self.touch_suppressed
+            {
+                if let Some(finger) = ui.input(|i| i.pointer.interact_pos()).filter(|p| rect.contains(*p)) {
+                    let (x, y) = super::touch::sketch_target(state,
+                        f64::from(finger.x - rect.left()), f64::from(finger.y - rect.top()), true);
+                    let cursor = rect.min + egui::vec2(x as f32, y as f32);
+                    let painter = ui.painter().with_clip_rect(rect);
+                    painter.line_segment([finger, cursor], egui::Stroke::new(1.5, egui::Color32::LIGHT_BLUE));
+                    painter.circle_stroke(cursor, 8.0, egui::Stroke::new(3.0, egui::Color32::BLACK));
+                    painter.circle_stroke(cursor, 8.0, egui::Stroke::new(1.0, egui::Color32::WHITE));
+                    for axis in [egui::vec2(11.0, 0.0), egui::vec2(0.0, 11.0)] {
+                        painter.line_segment([cursor - axis, cursor + axis], egui::Stroke::new(1.0, egui::Color32::WHITE));
+                    }
+                }
+            }
         });
 
         // The "candidates under the cursor" disambiguation popup (Alt+click)
         // floats over the viewport at ctx level, like the file dialog / palette.
         let ctx = ui.ctx().clone();
-        self.show_candidate_popup(&ctx, state);
+        if self.chrome_obscured {
+            self.candidate_popup = None;
+            self.candidate_popup_rect = None;
+        } else { self.show_candidate_popup(&ctx, state); }
 
         // Editable dimension labels (S5): value text drawn at each dimension's
         // screen-projected anchor, click-to-edit + drag-to-reposition. Drawn at ctx
@@ -154,7 +174,7 @@ impl Viewport {
         // NONE of these belong on a sheet: they are 3D-anchored overlays, and
         // the sheet mode already drew everything the paper carries.
         let sheet_open = state.sheet_open().is_some();
-        if let Some(rect) = self.last_rect.filter(|_| !sheet_open) {
+        if let Some(rect) = self.last_rect.filter(|_| !sheet_open && !self.chrome_obscured) {
             self.draw_dimension_labels(&ctx, rect, state);
             // Feature-dimension labels (FD-1): the ◎ dimension-gizmo mode draws the
             // primitive's param dims here, click-to-edit + drag-to-resize.
@@ -407,6 +427,9 @@ impl Viewport {
         // (so an empty drag still orbits the camera); hover still runs for snap + the
         // rubber-band preview.
         let draw_mode = state.sketch_active_tool().is_some();
+        let finger = super::touch::enabled(ui.ctx());
+        let precision = finger && draw_mode
+            && !matches!(state.sketch_active_tool(), Some("handdraw" | "pickEdges"));
 
         // Right-click aborts the in-progress draw geometry. (Escape → drop back to
         // the Select/drag tool is handled globally in `BrepApp::handle_shortcuts`,
@@ -442,7 +465,18 @@ impl Viewport {
                 } else if state.sketch_active_tool() == Some("handdraw") {
                     state.sketch_handdraw_begin(lx, ly);
                     self.sketch_handdrawing = true;
-                } else if !draw_mode && state.sketch_drag_begin(lx, ly) {
+                } else if precision {
+                    self.touch_drawing = true;
+                } else if !draw_mode && {
+                    self.touch_drag_offset = (0.0, 0.0);
+                    let (gx, gy) = if finger {
+                        let point = super::touch::sketch_target(state, lx, ly, false);
+                        state.sketch_hover_at(point.0, point.1);
+                        self.touch_drag_offset = (point.0 - lx, point.1 - ly);
+                        point
+                    } else { (lx, ly) };
+                    state.sketch_drag_begin(gx, gy)
+                } {
                     self.sketch_dragging = true;
                 } else {
                     let btn = if response.dragged_by(egui::PointerButton::Secondary) {
@@ -462,14 +496,29 @@ impl Viewport {
                 let (lx, ly) = local(pos);
                 if self.sketch_handdrawing {
                     state.sketch_handdraw_move(lx, ly);
+                } else if self.touch_drawing {
+                    let (x, y) = super::touch::sketch_target(state, lx, ly, true);
+                    state.sketch_hover_at(x, y);
                 } else if self.sketch_dragging {
-                    state.sketch_drag_to(lx, ly);
+                    if finger {
+                        state.sketch_drag_to(lx + self.touch_drag_offset.0, ly + self.touch_drag_offset.1);
+                    } else {
+                        state.sketch_drag_to(lx, ly);
+                    }
                 } else if self.dragging {
                     state.pointer_move(lx, ly);
                 }
             }
         }
         if response.drag_stopped() {
+            if self.touch_drawing {
+                if let Some(pos) = response.interact_pointer_pos() {
+                    let (x, y) = local(pos);
+                    let point = super::touch::sketch_target(state, x, y, true);
+                    state.sketch_tool_click_at(point.0, point.1);
+                }
+                self.touch_drawing = false;
+            }
             if self.sketch_handdrawing {
                 state.sketch_handdraw_end();
                 self.sketch_handdrawing = false;
@@ -503,10 +552,12 @@ impl Viewport {
                     // (pixel coords), never a plane place/select.
                     state.sketch_pick_edge_at(lx, ly);
                 } else if draw_mode {
-                    state.sketch_tool_click_at(lx, ly);
+                    let point = if precision { super::touch::sketch_target(state, lx, ly, true) } else { (lx, ly) };
+                    state.sketch_tool_click_at(point.0, point.1);
                 } else {
                     let mods = ui.ctx().input(|i| i.modifiers);
-                    state.sketch_click_at(lx, ly, mods.command || mods.ctrl);
+                    let point = if finger { super::touch::sketch_target(state, lx, ly, false) } else { (lx, ly) };
+                    state.sketch_click_at(point.0, point.1, mods.command || mods.ctrl);
                 }
             }
         }
@@ -522,6 +573,7 @@ impl Viewport {
         if !self.sketch_dragging
             && !self.dragging
             && !self.sketch_handdrawing
+            && !self.touch_drawing
             && !(primary_held && !draw_mode)
         {
             match response.hover_pos() {
@@ -534,7 +586,8 @@ impl Viewport {
                         }
                         None => {
                             state.viewcube_clear_hover();
-                            state.sketch_hover_at(lx, ly);
+                            let point = if finger { super::touch::sketch_target(state, lx, ly, precision) } else { (lx, ly) };
+                            state.sketch_hover_at(point.0, point.1);
                             // pickEdges (S6b-2) targets a 3D scene edge, so also
                             // hover-highlight the edge under the cursor (modeling
                             // emphasis) as a link affordance.
@@ -619,6 +672,21 @@ impl Viewport {
             return;
         }
 
+        // Touch has no hover dwell or Alt key. A stationary held contact asks
+        // for the same ranked candidate list as Alt+click on a mouse. egui's
+        // long-touch flag never fires for desktop mouse input.
+        if response.long_touched() && !state.any_sketch_mode() && !state.ref_select_active() {
+            if let Some(pos) = response.interact_pointer_pos() {
+                let (lx, ly) = local(pos);
+                let candidates = state.candidates_filtered_at(lx, ly);
+                self.candidate_popup = (!candidates.is_empty())
+                    .then(|| CandidatePopup { anchor: pos, candidates });
+                self.candidate_popup_fresh = self.candidate_popup.is_some();
+                self.hover_lit_since = None;
+            }
+            return;
+        }
+
         // Sketch mode (S2) owns the pointer: hover/select/point-drag in plane space,
         // never the modeling select/candidate/transform/ref-select branches. Routed
         // BEFORE the modeling path, which stays byte-for-byte for `!sketch_mode()`.
@@ -650,7 +718,14 @@ impl Viewport {
                 // a press a drag once the pointer has left the click radius, so by
                 // this frame `pos` has already drifted off whatever the user
                 // pressed on.
-                let (gx, gy) = drag_start_local(response, rect).unwrap_or((lx, ly));
+                let (mut gx, mut gy) = drag_start_local(response, rect).unwrap_or((lx, ly));
+                self.touch_drag_offset = (0.0, 0.0);
+                if super::touch::enabled(ui.ctx()) && self.viewcube_local(state, gx, gy).is_none() {
+                    if let Some((tx, ty)) = super::touch::handle_target(state, gx, gy) {
+                        self.touch_drag_offset = (tx - gx, ty - gy);
+                        (gx, gy) = (tx, ty);
+                    }
+                }
                 // A drag that STARTS over the ViewCube corner snaps/orbits via the
                 // cube (a plain click — which never fires drag_started — is snapped
                 // in the `clicked()` branch below); a press on an armed
@@ -693,6 +768,7 @@ impl Viewport {
         if response.dragged() {
             if let Some(pos) = response.interact_pointer_pos() {
                 let (lx, ly) = local(pos);
+                let (lx, ly) = (lx + self.touch_drag_offset.0, ly + self.touch_drag_offset.1);
                 if self.gizmo_dragging {
                     // Drive the transform gizmo: updates the feature's transform +
                     // re-runs the history (the model moves live).
@@ -722,6 +798,7 @@ impl Viewport {
                 (self.dim_dragging.as_ref(), response.interact_pointer_pos())
             {
                 let (lx, ly) = local(pos);
+                let (lx, ly) = (lx + self.touch_drag_offset.0, ly + self.touch_drag_offset.1);
                 let feature = state.dimension_armed_feature();
                 state.feature_dimension_drag(&feature, field, lx, ly);
             }
@@ -769,6 +846,9 @@ impl Viewport {
                         .unwrap_or(false);
                 let (lx, ly) = local(pos);
                 let mods = ui.ctx().input(|i| i.modifiers);
+                let (lx, ly) = if super::touch::enabled(ui.ctx()) && self.viewcube_local(state, lx, ly).is_none() {
+                    super::touch::handle_target(state, lx, ly).unwrap_or((lx, ly))
+                } else { (lx, ly) };
                 if on_popup {
                     // A click inside the OPEN popup belongs to the popup — its
                     // entry buttons handle it in `show_candidate_popup`. Don't let
@@ -1014,6 +1094,8 @@ impl Viewport {
 
     /// Close captures before handing a single pointer to multitouch navigation.
     fn finish_pointer_drag(&mut self, state: &mut EngineState) {
+        self.touch_drag_offset = (0.0, 0.0);
+        self.touch_drawing = false;
         if self.gizmo_dragging {
             state.transform_release();
             self.gizmo_dragging = false;

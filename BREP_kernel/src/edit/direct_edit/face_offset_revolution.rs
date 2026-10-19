@@ -899,6 +899,49 @@ fn extend_to(surface: &NurbsSurface, parameter: f64) -> Result<Option<NurbsSurfa
         .map(Some)
 }
 
+/// Whether the straight segment `point(fraction)`, `fraction ∈ (0, 1)`, runs
+/// through the TRIMMED region of face `face_id`: interior samples are projected
+/// onto the face's carrier and classified against its loops. A sample off the
+/// carrier by more than `tolerance` is not on the face; one on the carrier that
+/// classifies `Inside` or `Boundary` is. The segment's two ends are not
+/// sampled — a meridian between two caps ends on the caps' planes, where a
+/// wall face's own boundary runs.
+fn meridian_meets_face(
+    solid: &BrepSolid,
+    face_id: u64,
+    point: impl Fn(f64) -> Vec3,
+    tolerance: f64,
+) -> Result<bool, KernelRefusal> {
+    let (shell_index, face_index) = find_face(solid, face_id).ok_or_else(|| {
+        KernelRefusal::internal(
+            KernelStage::Refine,
+            "crossing_neighbour_lookup",
+            format!("offset_revolution_face: missing neighbour face {face_id}"),
+        )
+    })?;
+    let face = &solid.shells[shell_index].faces[face_index];
+    const SAMPLES: usize = 7;
+    for sample in 1..=SAMPLES {
+        let fraction = sample as f64 / (SAMPLES + 1) as f64;
+        let projection = crate::project_point_to_surface(&face.surface, point(fraction))
+            .or_refuse(KernelStage::Refine, "project_point_to_surface")?;
+        if projection.distance > tolerance {
+            continue;
+        }
+        let uv = crate::Vec2 {
+            x: projection.u,
+            y: projection.v,
+        };
+        if crate::parameter_point_in_face(face, uv, 1e-9)
+            .or_refuse(KernelStage::Refine, "parameter_point_in_face")?
+            != crate::PolygonClass::Outside
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// A meridian boundary of a partial cylinder and the fixed plane across it.
 struct Meridian<'a> {
     edge: &'a EdgeRecord,
@@ -1194,16 +1237,37 @@ fn offset_partial_cylinder_face(
         ));
     }
     // A crossing strictly inside the new arc means the arc passes through a
-    // neighbour's plane before reaching its own corner — a convex round grown
-    // past the two walls it was tangent to has no corner on either. Both
-    // corners of an arc cut from one sketch line solve against two faces whose
-    // planes agree only to the sketch solver's precision, so a crossing within
-    // the residual bar of a corner is that corner.
+    // neighbour's PLANE before reaching its own corner. That is a fold only
+    // where the neighbour's FACE is there to be crossed — a convex round grown
+    // past the two walls it was tangent to has no corner on either, and its
+    // second crossing lands in the wall's interior. A concave bore whose arc
+    // sweeps past a half turn (a ring with a slot cut from its axis outward,
+    // 2026-10-17 inbox) crosses each slot wall's plane a second time on the
+    // far side of the axis, where the wall face does not reach: that crossing
+    // was already inside the old arc and stays harmless. Both corners of an
+    // arc cut from one sketch line solve against two faces whose planes agree
+    // only to the sketch solver's precision, so a crossing within the residual
+    // bar of a corner is that corner.
     let crossing_margin = residual_tolerance / new_radius;
+    let (station_low, station_high) = (rims[0].1.min(rims[1].1), rims[0].1.max(rims[1].1));
     for (meridian, crossings) in [(start, start_crossings), (end, end_crossings)] {
         for crossing in crossings {
             let along = ccw(start_azimuth, crossing);
-            if along > crossing_margin && along < new_sweep - crossing_margin {
+            if along <= crossing_margin || along >= new_sweep - crossing_margin {
+                continue;
+            }
+            let radial = x_axis.scale(crossing.cos()).add(y_axis.scale(crossing.sin())).scale(new_radius);
+            let on_neighbour = meridian_meets_face(
+                solid,
+                meridian.neighbour,
+                |fraction| {
+                    origin
+                        .add(axis.scale(station_low + fraction * (station_high - station_low)))
+                        .add(radial)
+                },
+                residual_tolerance,
+            )?;
+            if on_neighbour {
                 return Err(KernelRefusal::unsupported(
                     KernelStage::Refine,
                     "arc_through_neighbour",
@@ -1480,7 +1544,13 @@ fn retrim_planar_neighbours(
         ),
         ));
     }
-    if let (Ok(before), Ok(after)) = (solid_signed_volume(solid), solid_signed_volume(&result)) {
+    // Sign only, through the per-face term memo (`solid_signed_volume_for_sign`:
+    // the verdict against the bar is the exact integral's; a face read about
+    // the same reference before is served its term). 2026-10-17, the
+    // shelled-box report: the exact reads cost 0.26 s a body here.
+    if let (Ok(before), Ok(after)) =
+        (crate::signed_volume_against(solid, 0.0), crate::signed_volume_against(&result, 0.0))
+    {
         if before * after <= 0.0 {
             return Err(KernelRefusal::internal(
                 KernelStage::Validate,

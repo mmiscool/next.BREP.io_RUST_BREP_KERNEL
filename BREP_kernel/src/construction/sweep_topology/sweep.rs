@@ -41,6 +41,7 @@ pub fn sweep_profile_along_path(
         None,
         SectionPlacement::Transplant,
         SWEEP_DEFAULT_TOLERANCE,
+        false, // This solid-only API does not return station diagnostics.
     )
     .map(|swept| swept.solid)
 }
@@ -106,6 +107,7 @@ pub fn sweep_profile_twisted(
         None,
         SectionPlacement::Transplant,
         SWEEP_DEFAULT_TOLERANCE,
+        true,
     )
     .map(|swept| swept.solid)
     .map_err(|error| error.with_message(|error| format!("sweep_profile_twisted: {error}")))
@@ -233,6 +235,7 @@ pub fn sweep_profile_along_path_anchored(
         Some(anchor),
         SectionPlacement::Transplant,
         SWEEP_DEFAULT_TOLERANCE,
+        true,
     )
     .map(|swept| swept.solid)
 }
@@ -280,6 +283,7 @@ pub fn sweep_profile_twisted_anchored(
         Some(anchor),
         SectionPlacement::Transplant,
         SWEEP_DEFAULT_TOLERANCE,
+        true,
     )
     .map(|swept| swept.solid)
     .map_err(|error| error.with_message(|error| format!("sweep_profile_twisted: {error}")))
@@ -328,7 +332,7 @@ pub fn sweep_profile_along_chain(
     placement_mode: SectionPlacement,
     corner_advice: &str,
 ) -> Result<BrepSolid, KernelRefusal> {
-    sweep_profile_along_chain_reported(
+    sweep_profile_along_chain_reported_core(
         profile,
         path,
         twist_angle,
@@ -337,6 +341,7 @@ pub fn sweep_profile_along_chain(
         placement_mode,
         corner_advice,
         None,
+        false, // This solid-only API does not return station diagnostics.
     )
     .map(|swept| swept.solid)
 }
@@ -376,6 +381,22 @@ pub fn sweep_profile_along_chain_reported(
     placement_mode: SectionPlacement,
     corner_advice: &str,
     tolerance: Option<f64>,
+) -> Result<SweptChain, KernelRefusal> {
+    sweep_profile_along_chain_reported_core(profile, path, twist_angle, name, anchor,
+        placement_mode, corner_advice, tolerance, true)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn sweep_profile_along_chain_reported_core(
+    profile: &[NurbsCurve],
+    path: &SweepPath,
+    twist_angle: f64,
+    name: Option<&str>,
+    anchor: Option<ProfileAnchor>,
+    placement_mode: SectionPlacement,
+    corner_advice: &str,
+    tolerance: Option<f64>,
+    measure_report: bool,
 ) -> Result<SweptChain, KernelRefusal> {
     use std::f64::consts::{FRAC_PI_2, TAU};
     let tolerance = sweep_tolerance(tolerance)?;
@@ -451,6 +472,7 @@ pub fn sweep_profile_along_chain_reported(
             anchor,
             SectionPlacement::Transplant,
             tolerance,
+            measure_report,
         )
         .map_err(|error| {
             if twist_angle == 0.0 {
@@ -489,6 +511,7 @@ pub fn sweep_profile_along_chain_reported(
         corner_advice,
         CornerPolicy::Mitre,
         tolerance,
+        measure_report,
     )
 }
 
@@ -545,6 +568,7 @@ pub fn sweep_profile_along_chain_with_stations_reported(
         corner_advice,
         CornerPolicy::Refuse,
         tolerance,
+        true,
     )
 }
 
@@ -628,10 +652,12 @@ fn sweep_profile_along_path_stations(
     anchor: Option<ProfileAnchor>,
     placement_mode: SectionPlacement,
     tolerance: f64,
+    measure_report: bool,
 ) -> Result<SweptChain, KernelRefusal> {
     // Loft carries no face names; the app stamps them onto the emitted face
     // order.  Accept `name` for ABI symmetry with the other builders.
     let _ = name;
+    let mut timing = crate::loft_topology::ConstructionProfile::new("sweep_path");
     if stations < 2 {
         return Err(KernelRefusal::input(
             KernelStage::Collect,
@@ -647,6 +673,7 @@ fn sweep_profile_along_path_stations(
     //        Resolved HERE, before the path is touched, so a bad profile is
     //        still reported ahead of a bad path exactly as it always was.
     let placement = resolve_placement(profile, anchor, placement_mode)?;
+    timing.lap("profile");
 
     // --- 2. Sample the path as a one-segment chain on the single-curve lane:
     //        `stations` uniform in the parameter, the sampling this builder
@@ -662,6 +689,7 @@ fn sweep_profile_along_path_stations(
         ..
     } = &samples;
 
+    timing.lap("sampling");
     sweep_sections_through_samples(
         profile,
         points,
@@ -678,6 +706,7 @@ fn sweep_profile_along_path_stations(
             params,
             budget,
             tolerance,
+            measure_report,
         },
     )
 }
@@ -817,6 +846,7 @@ fn sweep_profile_along_chain_stations(
     corner_advice: &str,
     corners: CornerPolicy,
     tolerance: f64,
+    measure_report: bool,
 ) -> Result<SweptChain, KernelRefusal> {
     let chain = path.curves.as_slice();
     if chain.is_empty() {
@@ -1027,6 +1057,7 @@ fn sweep_profile_along_chain_stations(
             params,
             budget,
             tolerance,
+            measure_report,
         },
     )
 }
@@ -2269,6 +2300,7 @@ struct StationRun<'a> {
     params: &'a [StationParam],
     budget: StationBudget,
     tolerance: f64,
+    measure_report: bool,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2285,6 +2317,7 @@ fn sweep_sections_through_samples(
     chain: Option<(&[usize], &SweepPath)>,
     run: StationRun<'_>,
 ) -> Result<SweptChain, KernelRefusal> {
+    let mut timing = crate::loft_topology::ConstructionProfile::new("sweep_sections");
     let tolerance = 1e-6;
     let stations = points.len();
     if stations < 2 {
@@ -2434,6 +2467,7 @@ fn sweep_sections_through_samples(
     //   offset from the path and its angle to it. At station 0 the frames
     //   coincide and the section IS the profile, so the START cap lies in the
     //   plane it was drawn in.
+    timing.lap("frames");
     let path_start = points[0];
     let (t0, r0, s0) = (tangents[0], r_axes[0], s_axes[0]);
     let rigid = placement_mode == SectionPlacement::Rigid;
@@ -2681,6 +2715,7 @@ fn sweep_sections_through_samples(
     //   so there is still one wall per section curve.
     //   The loft mints its own refusals; the wrap below keeps that class and
     //   prefixes the text.
+    timing.lap("sections_preflight");
     let solid = match closure {
         RingFrame::Planar(_) | RingFrame::Spatial => {
             // The loft mints its own refusals; its class rides through the
@@ -2699,6 +2734,12 @@ fn sweep_sections_through_samples(
         })?,
     };
 
+    timing.lap("loft");
+    if !run.measure_report {
+        // The station refinement, tight-bend guard, loft validation and soundness
+        // acceptance have all completed. Only solid-only callers reach this exit.
+        return Ok(SweptChain { solid, report: None });
+    }
     // --- 6. The MEASURED BOUND of what was just built
     //        (`sweep_topology/stations.rs`): the loft's own interpolants of the
     //        centre track and the section axes against the true path and the
@@ -2735,6 +2776,7 @@ fn sweep_sections_through_samples(
         budget: run.budget,
         tolerance: run.tolerance,
     })?;
+    timing.lap("approximation");
     Ok(SweptChain {
         solid,
         report: Some(report),
@@ -3070,7 +3112,9 @@ pub fn sweep_profile_helix(
         None,
         SectionPlacement::Transplant,
         SWEEP_DEFAULT_TOLERANCE,
+        true,
     )
     .map(|swept| swept.solid)
     .map_err(|error| error.with_message(|error| format!("sweep_profile_helix: {error}")))
 }
+

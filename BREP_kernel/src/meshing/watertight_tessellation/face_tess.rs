@@ -116,6 +116,21 @@ impl Bridged {
     }
 }
 
+/// `BREP_TESS_DEVELOPABLE_CDT=0` sends a developable wall's simple loop to the
+/// ear clip as before 2026-10-17; unset or anything else takes the CDT first.
+/// Read once; the browser build reads the default.
+fn developable_cdt_enabled() -> bool {
+    #[cfg(target_arch = "wasm32")]
+    {
+        true
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| std::env::var("BREP_TESS_DEVELOPABLE_CDT").as_deref() != Ok("0"))
+    }
+}
+
 pub(super) fn tessellate_face_watertight(
     face: &FaceRecord,
     samples: &HashMap<u64, EdgeSamples>,
@@ -662,7 +677,25 @@ pub(super) fn tessellate_face_watertight(
         // a nearly collinear rim can stall it and leave curved slivers that fold
         // during refinement. Keep the original loops for a validated CDT retry.
         // The CDT wants CCW outer / CW holes, as established just above.
-        defer_cdt = holes.is_empty() && polygon_is_simple(&outer);
+        //
+        // A DEVELOPABLE wall — a cylinder or cone, whose straight ruling makes
+        // one scaled uv direction an isometry of the unrolled surface — is the
+        // exception, and goes to the CDT first (2026-10-17, the shelled-box
+        // report's bore wall): the metric-scaled chart of a cylinder IS its
+        // unrolled plane, so a Delaunay triangulation in that chart is the
+        // intrinsic Delaunay triangulation the flipper converges to, and the
+        // flipper has nothing to do. Ear-clipping the same loop from its densely
+        // sampled rims starts a fan across the wall, which `lawson_flips`
+        // converts to the ladder one rung a round (that bore wall: 730 rounds,
+        // 67 837 flips, 0.26 s of a 0.55 s soundness scan on every feature
+        // after the shell). Where the CDT declines, the ear clip runs as before.
+        // `BREP_TESS_DEVELOPABLE_CDT=0` keeps a developable wall on the ear
+        // clip (the road before 2026-10-17), for an on/off census.
+        let developable = matches!(
+            face.surface.analytic(),
+            Some(crate::AnalyticSurface::RuledRevolution { .. })
+        ) && developable_cdt_enabled();
+        defer_cdt = holes.is_empty() && polygon_is_simple(&outer) && !developable;
         cdt_input = Some((outer.clone(), holes.clone()));
         tess_route(Route::Generic);
         Bridged::Pending(outer, holes)

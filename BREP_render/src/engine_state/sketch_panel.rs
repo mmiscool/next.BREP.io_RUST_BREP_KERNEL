@@ -674,6 +674,19 @@ fn sketch_palette_for(session: &crate::sketch::SketchSession) -> Vec<SketchConst
         push("⌒", "Tangent", false);
         return out;
     }
+    // 3+ lines → equal length; 3+ arcs/circles → equal radius. The other pair
+    // relations have no many-geometry reading, so equality is the only offer; the
+    // build anchors every further geometry to the first selected (N−1 constraints).
+    if geos.len() > 2 && sel_points.is_empty() {
+        if geos.iter().all(|g| g.geom_type == "line") {
+            push("⇌", "Equal distance", false);
+            return out;
+        }
+        if geos.iter().all(|g| is_radial(g)) {
+            push("⊜", "Equal radius", false);
+            return out;
+        }
+    }
     // line + arc/circle → tangent, plus curvature when the line is a spline
     // handle guide at an END anchor: the spline's curvature there becomes the
     // circle's 1/ρ, which is how a curve is continued into an arc.
@@ -962,6 +975,27 @@ fn sketch_build_and_add_constraint(
         lists: Vec<Vec<serde_json::Value>>,
     }
 
+    /// `[first.p0, first.p1, other.p0, other.p1]` for every geometry after the first:
+    /// line ends for `⇌`, centre + rim for `⊜`.
+    fn sketch_equal_to_first(t: &str, geos: &[&crate::sketch::SketchGeometry]) -> Built {
+        let first = geos[0];
+        Built {
+            store_type: t.to_string(),
+            display_style: "",
+            lists: geos[1..]
+                .iter()
+                .map(|g| {
+                    vec![
+                        first.points[0].clone(),
+                        first.points[1].clone(),
+                        g.points[0].clone(),
+                        g.points[1].clone(),
+                    ]
+                })
+                .collect(),
+        }
+    }
+
     // --- Phase 1: read-only — assemble the constraint(s) from the selection. ---
     let built: Option<Built> = {
         let doc = &session.doc;
@@ -1031,22 +1065,27 @@ fn sketch_build_and_add_constraint(
                         None
                     }
                 }
+                // Equal radius over 2+ arcs/circles: one `⊜` per further geometry,
+                // each tied to the first selected, so N geometries give N−1
+                // constraints and deleting one frees exactly one geometry.
                 "⊜" => {
-                    if geo_items.len() == 2 && geo_items.iter().all(|g| radial(g)) {
-                        let (g0, g1) = (geo_items[0], geo_items[1]);
-                        Some(simple(
-                            "⊜",
-                            vec![
-                                g0.points[0].clone(),
-                                g0.points[1].clone(),
-                                g1.points[0].clone(),
-                                g1.points[1].clone(),
-                            ],
-                            "",
-                        ))
+                    if geo_items.len() >= 2
+                        && geo_items.iter().all(|g| radial(g) && g.points.len() >= 2)
+                    {
+                        Some(sketch_equal_to_first("⊜", &geo_items))
                     } else {
                         None
                     }
+                }
+                // Equal length over 2+ lines (and nothing else selected), anchored the
+                // same way. Point selections fall through to the count-based `⇌`.
+                "⇌" if geo_items.len() >= 2
+                    && point_items.is_empty()
+                    && geo_items
+                        .iter()
+                        .all(|g| g.geom_type == "line" && g.points.len() >= 2) =>
+                {
+                    Some(sketch_equal_to_first("⇌", &geo_items))
                 }
                 "⌒" => sketch_build_tangent_points(doc, &geo_items).map(|pts| simple("⌒", pts, "")),
                 "ϰ" => {

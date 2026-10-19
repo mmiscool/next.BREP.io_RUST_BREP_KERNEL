@@ -91,7 +91,7 @@ impl InterferenceWindow {
             .movable(true)
             .resizable(true)
             .default_size([360.0, 320.0])
-            .default_pos([860.0, 80.0])
+            .default_pos(super::below_chrome(ctx, 860.0, 0.0))
             .show(ctx, |ui| {
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])

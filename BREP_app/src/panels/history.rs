@@ -824,13 +824,15 @@ impl HistoryPanel {
                         let del = ui.add(
                             crate::icon_text::icon_button_colored(ui, "✕", Some(DELETE_RED))
                                 .stroke(egui::Stroke::new(1.0, DELETE_RED))
-                                .small(),
+                                .small()
+                                .min_size(crate::viewport::touch::target_size(ui.ctx(), egui::Vec2::ZERO)),
                         );
                         del_rect = del.rect;
                         del_clicked = del.clicked();
                         ui.add_space(4.0);
                         let edit = ui
-                            .add(crate::icon_text::icon_button(ui, "✎").small())
+                            .add(crate::icon_text::icon_button(ui, "✎").small()
+                                .min_size(crate::viewport::touch::target_size(ui.ctx(), egui::Vec2::ZERO)))
                             .on_hover_text("Edit this feature");
                         edit_rect = edit.rect;
                         edit_clicked = edit.clicked();

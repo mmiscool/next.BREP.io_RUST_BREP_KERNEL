@@ -277,7 +277,7 @@ pub fn node(
 
                 // --- collapse box (expandable) or an equally-wide empty slot (leaf) ----
                 let (brect, bresp) = ui.allocate_exact_size(
-                    egui::vec2(BOX, BOX),
+                    crate::viewport::touch::target_size(ui.ctx(), egui::vec2(BOX, BOX)),
                     if row.expandable {
                         egui::Sense::click()
                     } else {
@@ -286,7 +286,8 @@ pub fn node(
                 );
                 box_rect = brect;
                 if row.expandable {
-                    paint_box(ui, brect, row.expanded);
+                    let painted = egui::Rect::from_center_size(brect.center(), egui::Vec2::splat(BOX));
+                    paint_box(ui, painted, row.expanded);
                     if bresp.clicked() {
                         toggled = true;
                     }

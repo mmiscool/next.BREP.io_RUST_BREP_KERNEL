@@ -143,10 +143,10 @@ impl SettingsPanel {
                 // tab strip) makes the window FREELY resizable LARGER than its
                 // content: without a filling child egui hugs the window to content
                 // and won't grow.
-                .default_size([320.0, 400.0])
+                .default_size([460.0, 480.0])
                 // Rest on the right so it floats clear of the left panel; the user
                 // can drag it anywhere.
-                .default_pos([720.0, 56.0])
+                .default_pos(super::below_chrome(ctx, 720.0, 0.0))
                 .show(ctx, |ui| self.body(ui, state, store));
             self.open = open;
         } else {

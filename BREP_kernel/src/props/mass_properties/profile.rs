@@ -46,6 +46,10 @@ pub(crate) struct MassProfile {
     pub rule_sampled: u64,
     /// Emit one `mass.face` line per face (`BREP_PROFILE_MASS_FACES`).
     pub face_lines: bool,
+    /// Sign-query attribution.
+    pub sign_reused: u64,
+    pub sign_reread: u64,
+    pub sign_hash_ms: f64,
 }
 
 thread_local! {
@@ -58,6 +62,7 @@ thread_local! {
         polygons_ms: 0.0, base_clip_ms: 0.0, cells_ms: 0.0, child_clip_ms: 0.0, full_ms: 0.0,
         leaf_ms: 0.0, corr_ms: 0.0, untrimmed_ms: 0.0, gate_ms: 0.0, rule_ms: 0.0,
         rule_spans: 0, rule_sampled: 0, face_lines: false,
+        sign_reused: 0, sign_reread: 0, sign_hash_ms: 0.0,
     }) };
 }
 
@@ -219,6 +224,11 @@ pub(crate) fn end(token: Option<(String, Instant)>) {
         p.rule_spans,
         p.rule_sampled,
     );
+    if call == "solid_signed_volume_for_sign" {
+        eprintln!("mass.sign_query caller={} faces={} reused={} reread={} hash_ms={:.3} ms={:.3}",
+            current_caller(), p.faces, p.sign_reused, p.sign_reread, p.sign_hash_ms,
+            started.elapsed().as_secs_f64() * 1000.0);
+    }
     PROFILE.with(|cell| cell.set(MassProfile::default()));
 }
 
@@ -352,4 +362,38 @@ pub(crate) fn emit_identity(
             format!(" path={path}")
         },
     );
+}
+
+/// Per-face attribution beside the integrator's detailed route line.
+pub(crate) fn sign_face(shell: usize, face: &crate::FaceRecord, reread: bool, hash_ms: f64) {
+    mass_profile(|p| {
+        p.sign_reread += u64::from(reread);
+        p.sign_reused += u64::from(!reread);
+        p.sign_hash_ms += hash_ms;
+    });
+    if face_lines_enabled() {
+        eprintln!("mass.sign_face caller={} shell={shell} id={} reused={} hash_ms={hash_ms:.3}",
+            current_caller(), face.id, !reread);
+    }
+}
+
+/// Persist successful oracle readings even when case_replay captures a
+/// successful child's stderr. The file is diagnostic evidence, never a memo.
+pub(crate) fn emit_sign_oracle(solid: &crate::BrepSolid, reading: f64, exact: f64) -> Result<(), String> {
+    let identity = crate::mass_properties::face_set_identity(solid);
+    let error = (reading - exact).abs();
+    let relative = if exact == 0.0 { 0.0 } else { error / exact.abs() };
+    eprintln!("mass.sign_oracle caller={} faces={} relative={relative:.3e}", current_caller(), identity.faces);
+    if let Some(path) = std::env::var_os("BREP_SIGN_TERMS_ORACLE_LOG") {
+        use std::io::Write;
+        let row = serde_json::json!({
+            "faces": identity.faces, "identity": identity.hex(),
+            "retained": reading, "whole_body": exact, "relative_error": relative,
+            "caller": current_caller(),
+        });
+        let mut file = std::fs::OpenOptions::new().create(true).append(true).open(path)
+            .map_err(|error| format!("sign terms oracle log: {error}"))?;
+        writeln!(file, "{row}").map_err(|error| format!("sign terms oracle log: {error}"))?;
+    }
+    Ok(())
 }

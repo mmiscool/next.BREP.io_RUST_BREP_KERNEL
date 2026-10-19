@@ -61,8 +61,8 @@ pub(crate) use analyze::{face_grid_classes, NearestFaceSide};
 pub(crate) use analyze::{face_plane_normal, neighbour_carries_ball};
 
 use analyze::{
-    analyze_edge, check_blend_interference, check_loop_self_crossings, check_mixed_concavity,
-    check_support_extent, EdgeCross,
+    analyze_edge, check_blend_interference, check_blend_wall_loops, check_loop_self_crossings, check_mixed_concavity,
+    check_support_extent, check_support_extent_clipping, concave_clip_face, concave_clip_outline, EdgeCross,
     EdgePath,
 };
 use edges::heal_edge_vertex_gaps;

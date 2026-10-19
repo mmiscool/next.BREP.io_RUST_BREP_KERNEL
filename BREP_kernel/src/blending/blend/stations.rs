@@ -56,6 +56,17 @@ pub(in crate::blend) struct StationRefinement {
     pub(in crate::blend) inserted: usize,
     pub(in crate::blend) worst_miss: f64,
     pub(in crate::blend) worst_t: f64,
+    /// Stations inserted exactly where a contact crosses its carrier's domain
+    /// boundary in a bounded direction (the rail passes from the carrier onto
+    /// its tangent-plane continuation, a curvature jump the row fit breaks
+    /// at: `fit_open_rows_breaking_at`). Up to four, in station order.
+    pub(in crate::blend) boundary_breaks: [Option<usize>; 4],
+    /// Every station the boundary insertion added (the crossings and their
+    /// plain neighbours), in station order; the rows fit drops the ones whose
+    /// chord parameter would not increase (`network.rs`). At most five per
+    /// crossing.
+    pub(in crate::blend) boundary_inserted: [usize; 20],
+    pub(in crate::blend) boundary_inserted_count: usize,
 }
 
 /// Rounds of local station refinement an open march may take: each halves
@@ -261,6 +272,102 @@ fn solve_station_state(
     result
 }
 
+/// Lane G row 3 (2026-10-14, `closed_wall_predict_on`): the station Newton
+/// with its Jacobian CARRIED between neighbouring solves (the chord method).
+/// The closed-edge wall check solves 31 exact ball centres per interval, each
+/// a few thousandths of the edge from the last; the plain solver rebuilds the
+/// finite-difference Jacobian (four more evaluations of the tangency system)
+/// at every iteration of every one of them, and from the neighbour's (u, v)
+/// needs three iterations: eleven evaluations a centre, 7 936 centres on the
+/// half torus's two rims, 89 ms. Here the caller hands in the Jacobian the
+/// last centre converged with: a chord step with it is taken first, and the
+/// Jacobian is rebuilt only when that step did not cut the residual by four
+/// (it is then this centre's, kept for the next). With the caller's
+/// extrapolated seed ([`MarchFrame::continue_node_predicted`]) a centre
+/// converges in two evaluations. The stop is the plain solver's own
+/// (`1e-11 · (1 + scale)` on the residual), so a converged centre is the
+/// same root to that tolerance, not the same bits; the wall reading judged on
+/// those centres moves in its last digits and its verdict does not, which is
+/// why this road is behind its switch until its census. Whatever this solver
+/// cannot finish on its own (a column the plain solver would step in a
+/// stationary chart, a singular Jacobian, the iterations spent) is handed to
+/// the plain solver from `fallback_seed`, the seed the plain road used, and
+/// the carried Jacobian is dropped.
+#[allow(clippy::too_many_arguments)]
+pub(in crate::blend) fn solve_station_state_chord(
+    first: &NurbsSurface,
+    second: &NurbsSurface,
+    rho: [f64; 2],
+    seed: [f64; 4],
+    fallback_seed: [f64; 4],
+    section_point: Vec3,
+    section_tangent: Vec3,
+    scale: f64,
+    jacobian: &mut Option<[[f64; 4]; 4]>,
+) -> Result<([f64; 4], TangencyState), KernelRefusal> {
+    let mut uv = seed;
+    let tolerance = 1e-11 * (1.0 + scale);
+    let mut previous_error = f64::INFINITY;
+    let mut evaluations = 0u64;
+    // Every failure inside the loop (an unreadable state from the
+    // extrapolated seed, a chart the plain solver would step in, a singular
+    // Jacobian, the iterations spent) BREAKS to the plain solve from the
+    // plain road's own seed, so the predicted road can refuse nothing the
+    // plain road would not.
+    for _ in 0..NEWTON_ITERATIONS {
+        evaluations += 1;
+        let Ok(state) = tangency_state(first, second, rho, uv, section_point, section_tangent) else {
+            break;
+        };
+        let error = state.residual.iter().map(|value| value.abs()).fold(0.0, f64::max);
+        if error <= tolerance {
+            crate::blend::record_count("count.march.tangency_evals", evaluations);
+            return Ok((uv, state));
+        }
+        if !error.is_finite() {
+            break;
+        }
+        if jacobian.is_none() || error > 0.25 * previous_error {
+            let mut fresh = [[0.0f64; 4]; 4];
+            let step = 1e-7;
+            let mut readable = true;
+            for column in 0..4 {
+                let mut probe = uv;
+                probe[column] += step;
+                evaluations += 1;
+                let Ok(probed) = tangency_state(first, second, rho, probe, section_point, section_tangent) else {
+                    readable = false;
+                    break;
+                };
+                for row in 0..4 {
+                    fresh[row][column] = (probed.residual[row] - state.residual[row]) / step;
+                }
+            }
+            if !readable {
+                break;
+            }
+            let Ok(charts) = station_charts([first, second], uv, &fresh) else {
+                break;
+            };
+            if charts.iter().any(|chart| chart.is_some()) {
+                break;
+            }
+            *jacobian = Some(fresh);
+        }
+        previous_error = error;
+        let Ok(delta) = fit::solve_small::<4>(jacobian.expect("a fresh or carried Jacobian"), state.residual, 4) else {
+            break;
+        };
+        for (value, correction) in uv.iter_mut().zip(delta) {
+            *value -= correction;
+        }
+    }
+    *jacobian = None;
+    crate::blend::record_count("count.march.tangency_evals", evaluations);
+    crate::blend::record_count("count.closed.march.wall_centre_fallback", 1);
+    solve_station_state(first, second, rho, fallback_seed, section_point, section_tangent, scale)
+}
+
 /// The station Newton itself. `trace`, when given, only RECORDS what each
 /// iteration read (its residual, the Jacobian's conditioning, the exit); it is
 /// never read back, so a traced solve takes exactly the steps an untraced one
@@ -278,13 +385,16 @@ fn solve_station_state_traced(
 ) -> Result<([f64; 4], TangencyState), KernelRefusal> {
     let mut uv = seed;
     let tolerance = 1e-11 * (1.0 + scale);
+    let mut evaluations = 0u64;
     for _ in 0..NEWTON_ITERATIONS {
+        evaluations += 1;
         let state = match tangency_state(first, second, rho, uv, section_point, section_tangent) {
             Ok(state) => state,
             Err(error) => {
                 if let Some(trace) = trace.as_deref_mut() {
                     trace.exit = "state_unreadable";
                 }
+                crate::blend::record_count("count.march.tangency_evals", evaluations);
                 return Err(error);
             }
         };
@@ -305,6 +415,7 @@ fn solve_station_state_traced(
                 trace.exit = "converged";
                 trace.solution = Some(uv);
             }
+            crate::blend::record_count("count.march.tangency_evals", evaluations);
             return Ok((uv, state));
         }
         let mut jacobian = [[0.0f64; 4]; 4];
@@ -312,7 +423,14 @@ fn solve_station_state_traced(
         for column in 0..4 {
             let mut probe = uv;
             probe[column] += step;
-            let probed = tangency_state(first, second, rho, probe, section_point, section_tangent)?;
+            evaluations += 1;
+            let probed = match tangency_state(first, second, rho, probe, section_point, section_tangent) {
+                Ok(probed) => probed,
+                Err(error) => {
+                    crate::blend::record_count("count.march.tangency_evals", evaluations);
+                    return Err(error);
+                }
+            };
             for row in 0..4 {
                 jacobian[row][column] = (probed.residual[row] - state.residual[row]) / step;
             }
@@ -324,7 +442,14 @@ fn solve_station_state_traced(
             };
             let mut probe = uv;
             probe[column] = chart.parameter(chart.regular(uv[column]) + step);
-            let probed = tangency_state(first, second, rho, probe, section_point, section_tangent)?;
+            evaluations += 1;
+            let probed = match tangency_state(first, second, rho, probe, section_point, section_tangent) {
+                Ok(probed) => probed,
+                Err(error) => {
+                    crate::blend::record_count("count.march.tangency_evals", evaluations);
+                    return Err(error);
+                }
+            };
             for row in 0..4 {
                 jacobian[row][column] = (probed.residual[row] - state.residual[row]) / step;
             }
@@ -339,6 +464,7 @@ fn solve_station_state_traced(
                 if let Some(trace) = trace.as_deref_mut() {
                     trace.exit = "singular";
                 }
+                crate::blend::record_count("count.march.tangency_evals", evaluations);
                 return Err(format!("blend: station Newton is singular ({error})")).or_refuse(KernelStage::Refine, "solve_small");
             }
         };
@@ -353,6 +479,7 @@ fn solve_station_state_traced(
         trace.exit = "iterations_spent";
         trace.solution = Some(uv);
     }
+    crate::blend::record_count("count.march.tangency_evals", evaluations);
     Err(KernelRefusal::non_convergence(KernelStage::Refine, "tangency_newton", "blend: tangency Newton did not converge"))
 }
 
@@ -1188,6 +1315,36 @@ impl MarchFrame<'_> {
         }
     }
 
+    /// Lane G row 3 (`closed_wall_predict_on`): the station at `t` as the
+    /// continuation of `left`, solved by the chord solver from an
+    /// extrapolated `seed` with the Jacobian `jacobian` carried from the last
+    /// solve ([`solve_station_state_chord`]; the plain solver from `left`'s
+    /// own (u, v) is its fall-back), under the same branch guard as
+    /// [`MarchFrame::continue_node`] with `enforce`.
+    fn continue_node_predicted(
+        &self,
+        left: &MarchNode,
+        seed: [f64; 4],
+        t: f64,
+        jacobian: &mut Option<[[f64; 4]; 4]>,
+    ) -> Result<MarchNode, KernelRefusal> {
+        let (section_point, section_tangent) = self
+            .edge
+            .curve
+            .point_and_unit_tangent_extended(t, self.edge.t0, self.edge.t1)
+            .map_err(|error| format!("blend march: edge {}: {error}", self.edge.id)).or_refuse(KernelStage::Refine, "point_and_unit_tangent_extended")?;
+        let (uv, state) = solve_station_state_chord(
+            self.surface1, self.surface2, (self.rho_at)(t), seed, left.uv, section_point, section_tangent, self.scale, jacobian,
+        )?;
+        let node = self.node(t, uv, &state)?;
+        let before = Continued { t: left.t, uv: left.uv, center: Some(left.station.center) };
+        let after = Continued { t: node.t, uv: node.uv, center: Some(node.station.center) };
+        match branch_hop([self.surface1, self.surface2], self.edge, self.rho_at, &before, &after) {
+            Some(reason) => Err(reason),
+            None => Ok(node),
+        }
+    }
+
     /// Solve and append every station in (nodes.last().t, right_t], in
     /// strictly increasing parameter order.  An interval is bisected when
     /// its midpoint sagitta says the fitted rows would miss the tolerance
@@ -1522,24 +1679,47 @@ fn closed_wall_interval_misses(
     nodes: &[MarchNode],
     parameters: &[f64],
     radius: f64,
-    solve: impl Fn(&MarchNode, f64) -> Result<MarchNode, KernelRefusal>,
+    frame: &MarchFrame<'_>,
 ) -> Vec<Option<f64>> {
     let [low, high] = rows.u_domain;
     let [v_low, v_high] = match rows.surface.domain_v() {
         Ok(domain) => domain,
         Err(_) => return vec![None; nodes.len().saturating_sub(1)],
     };
+    // Lane G row 3 (`closed_wall_predict_on`): each centre is solved by the
+    // chord solver from a seed extrapolated through the last three centres
+    // (quadratic in t; linear from two, the neighbour's own (u, v) from one),
+    // with the Jacobian carried from centre to centre across the whole rim.
+    // Off the switch, the plain continuation from the neighbour, as before.
+    let predict = crate::blend::closed_wall_predict_on();
+    let mut jacobian: Option<[[f64; 4]; 4]> = None;
     (0..nodes.len().saturating_sub(1))
         .map(|interval| {
             let (left, right) = (&nodes[interval], &nodes[interval + 1]);
             let mut centres = Vec::with_capacity(CLOSED_WALL_CENTRES + 1);
             centres.push(left.station.center);
             let mut previous = left.clone();
+            let mut history: Vec<(f64, [f64; 4])> = vec![(left.t, left.uv)];
+            let centres_timing = crate::blend::BlendTimer::start("timing.closed.march.ladder.wall.centres_ms");
             for step in 1..CLOSED_WALL_CENTRES {
                 let t = left.t + (right.t - left.t) * step as f64 / CLOSED_WALL_CENTRES as f64;
-                previous = solve(&previous, t).ok()?;
+                previous = if predict {
+                    let seed = extrapolated_seed(&history, t);
+                    let node = frame.continue_node_predicted(&previous, seed, t, &mut jacobian).ok()?;
+                    history.push((t, node.uv));
+                    if history.len() > 3 {
+                        history.remove(0);
+                    }
+                    crate::blend::record_count("count.closed.march.wall_centre_predicted", 1);
+                    node
+                } else {
+                    frame.continue_node(previous.t, previous.uv, previous.station.center, t, None, true).ok()?
+                };
                 centres.push(previous.station.center);
             }
+            centres_timing.stop();
+            crate::blend::record_count("count.closed.march.wall_centres", (CLOSED_WALL_CENTRES - 1) as u64);
+            let _probes_timing = crate::blend::BlendTimer::start("timing.closed.march.ladder.wall.probes_ms");
             centres.push(right.station.center);
             let (from, to) = (parameters[interval], parameters[interval + 1]);
             let mut declared = 0.0_f64;
@@ -1556,6 +1736,36 @@ fn closed_wall_interval_misses(
             declared.is_finite().then_some(declared)
         })
         .collect()
+}
+
+/// The (u, v, a, b) at `t` extrapolated through the last solves in `history`
+/// (at most three, in increasing t): the Lagrange quadratic through three,
+/// the line through two, the last point itself from one. The seed of a
+/// predicted centre ([`closed_wall_interval_misses`] under
+/// `closed_wall_predict_on`); never a result.
+fn extrapolated_seed(history: &[(f64, [f64; 4])], t: f64) -> [f64; 4] {
+    match history {
+        [.., (ta, a), (tb, b), (tc, c)] if ta < tb && tb < tc => {
+            let la = (t - tb) * (t - tc) / ((ta - tb) * (ta - tc));
+            let lb = (t - ta) * (t - tc) / ((tb - ta) * (tb - tc));
+            let lc = (t - ta) * (t - tb) / ((tc - ta) * (tc - tb));
+            let mut seed = [0.0; 4];
+            for (index, value) in seed.iter_mut().enumerate() {
+                *value = la * a[index] + lb * b[index] + lc * c[index];
+            }
+            if seed.iter().all(|value| value.is_finite()) { seed } else { *c }
+        }
+        [.., (tb, b), (tc, c)] if tb < tc => {
+            let ratio = (t - tc) / (tc - tb);
+            let mut seed = [0.0; 4];
+            for (index, value) in seed.iter_mut().enumerate() {
+                *value = c[index] + ratio * (c[index] - b[index]);
+            }
+            if seed.iter().all(|value| value.is_finite()) { seed } else { *c }
+        }
+        [.., (_, c)] => *c,
+        [] => [0.0; 4],
+    }
 }
 
 fn march_stations_impl(
@@ -1652,6 +1862,7 @@ fn march_stations_impl(
         depth_budget,
     };
     let mut nodes: Vec<MarchNode> = Vec::with_capacity(SEED_INTERVALS + 1);
+    let seed_timing = crate::blend::BlendTimer::start("timing.closed.march.seed_ms");
     nodes.push(frame.solve_node(t_start, seed, anchor_u)?);
     for index in 1..=SEED_INTERVALS {
         let t = t_start + span * index as f64 / SEED_INTERVALS as f64;
@@ -1666,6 +1877,8 @@ fn march_stations_impl(
         };
         frame.march_interval(&mut nodes, t, lock, None, 0)?;
     }
+    seed_timing.stop();
+    crate::blend::record_count("count.closed.march.seed_stations", nodes.len() as u64);
     // Read-only census: distinguish closing-lock winding from curve/edge wrapping.
     // This flag never changes the marched stations or any acceptance decision.
     if std::env::var_os("BREP_TRACE_CLOSED_STATIONS").is_some() {
@@ -1705,7 +1918,19 @@ fn march_stations_impl(
     // carve the folded lens out of the wall (`blend/carve.rs`), so the march
     // builds it.
     let check_fold = |nodes: &[MarchNode]| -> Result<(), KernelRefusal> {
+      let _fold_timing = crate::blend::BlendTimer::start("timing.closed.march.fold_ms");
       if fold == super::chain::FoldPolicy::Refuse {
+        // Lane R1 row 2 (lane B's B2): on coaxial revolution mates with one
+        // ball the centre curve is a parallel circle and each contact runs
+        // along a parallel of its mate, so the two things the probe measures
+        // (the centre curve's curvature, each mate's normal curvature along
+        // the contact track) are read exactly here; the probe runs whenever
+        // the reading is not clear by a margin or the mates are not that.
+        if closed_form_fold_on() && revolution_fold_clear(nodes, first, second, radius_at) {
+            crate::blend::record_count("count.closed.march.fold_closed_form", 1);
+            return Ok(());
+        }
+        crate::blend::record_count("count.closed.march.fold_probes", 1);
         let probe = |t: f64,
                      seed: [f64; 4]|
          -> Result<([f64; 4], Vec3, Vec3, Vec3), KernelRefusal> {
@@ -1729,9 +1954,11 @@ fn march_stations_impl(
     check_fold(&nodes)?;
     let mut refinement_started = false;
     if let Some(bar) = rail_bar {
-        let initial: Vec<Station> = nodes.iter().map(|node| node.station).collect();
-        // Analytic revolution rows already carry the exact rail geometry.
-        if exact_closed_revolution_rows(&initial, first, second, false).is_none() {
+        // Analytic revolution rows already carry the exact rail geometry. The
+        // rows builder's only `None` is the axis recogniser's, so the gate asks
+        // that and does not build (and discard) the exact rows the caller
+        // builds again after the march (lane B row B5, lane R1 row 1).
+        if closed_revolution_axis(first, second).is_none() {
             refinement_started = true;
             (|| -> Result<(), KernelRefusal> {
             let original_count = nodes.len();
@@ -1741,19 +1968,29 @@ fn march_stations_impl(
             // wall reading; and why the request stopped short, if it did.
             let mut accepted: Option<(Vec<MarchNode>, f64)> = None;
             let mut unmet: Option<(f64, crate::BudgetReason, usize, usize)> = None;
+            // Whether any round replaced the node set (a refinement, or the
+            // accepted rung restored over a rejected one): the fold probe
+            // after the ladder reads the nodes it ships, and the seed march's
+            // probe already read these very nodes when nothing replaced them.
+            let mut nodes_changed = false;
             for round in 0..=REFINE_ROUNDS {
+                crate::blend::record_count("count.closed.march.rounds", 1);
                 let stations: Vec<Station> = nodes.iter().map(|node| node.station).collect();
                 let parameters = station_parameters(&stations);
                 // The two rails are independent of the rational middle row.
                 // Fitting the chamfer rows here lets rail refinement proceed
                 // even when a coarse fillet middle row has negative weights.
+                let fit_timing = crate::blend::BlendTimer::start("timing.closed.march.ladder.fit_ms");
                 let rows = fit_closed_rows(&stations, &parameters, true)?;
+                fit_timing.stop();
                 if std::env::var_os("BREP_TRACE_CLOSED_RAIL_FEET").is_some() {
                     trace_closed_rail_feet(&rows, &stations, &parameters,
                         [&first.face.surface, &second.face.surface]);
                 }
+                let rails_timing = crate::blend::BlendTimer::start("timing.closed.march.ladder.rails_ms");
                 let misses = closed_rail_interval_misses(&rows, &stations, &parameters,
                     [&first.face.surface, &second.face.surface])?;
+                rails_timing.stop();
                 let worst = misses.iter().copied().fold(0.0_f64, f64::max);
                 let mut count = misses.iter().filter(|&&miss| miss > bar).count();
                 if std::env::var("BREP_DEBUG_CLOSED_RAILS").is_ok() {
@@ -1773,11 +2010,14 @@ fn march_stations_impl(
                 let mut walls_read: Option<Vec<Option<f64>>> = None;
                 if count == 0 {
                     if let Some(check) = wall {
-                        match fit_closed_rows(&stations, &parameters, false) {
+                        let wall_fit_timing = crate::blend::BlendTimer::start("timing.closed.march.ladder.wall.fit_ms");
+                        let fillet = fit_closed_rows(&stations, &parameters, false);
+                        wall_fit_timing.stop();
+                        match fillet {
                             Ok(fillet) => {
-                                let walls = closed_wall_interval_misses(&fillet, &nodes, &parameters, check.radius, |previous, t| {
-                                    frame.continue_node(previous.t, previous.uv, previous.station.center, t, None, true)
-                                });
+                                let wall_read_timing = crate::blend::BlendTimer::start("timing.closed.march.ladder.wall.read_ms");
+                                let walls = closed_wall_interval_misses(&fillet, &nodes, &parameters, check.radius, &frame);
+                                wall_read_timing.stop();
                                 wall_failing = walls.iter().map(|wall| !matches!(wall, Some(declared) if *declared <= check.bar)).collect();
                                 wall_worst = walls.iter().flatten().copied().fold(0.0_f64, f64::max);
                                 count = wall_failing.iter().filter(|&&failing| failing).count();
@@ -1807,9 +2047,11 @@ fn march_stations_impl(
                     // carrier ships that miss. Read at j/16 of every interval
                     // (the acceptance read above reads three points); an
                     // unreadable read is short. Acceptance is unchanged.
+                    let request_timing = crate::blend::BlendTimer::start("timing.closed.march.ladder.request_ms");
                     let rails = closed_rail_interval_misses_at(&rows, &stations, &parameters,
                         [&first.face.surface, &second.face.surface], &CLOSED_REQUEST_RAIL_FRACTIONS)
                         .unwrap_or_else(|_| vec![f64::NAN; walls.len()]);
+                    request_timing.stop();
                     let rails = if rails.len() == walls.len() { rails } else { vec![f64::NAN; walls.len()] };
                     let missing: Vec<bool> = walls
                         .iter()
@@ -1846,12 +2088,16 @@ fn march_stations_impl(
                     // What is actually inserted: the allocation, or one station
                     // per short interval when it would pass the ceiling.
                     let short = if nodes.len() + allocated > station_ceiling { short } else { allocated };
-                    match refine_closed_node_counts(&nodes, &counts, station_ceiling, |previous, t| {
+                    let refine_timing = crate::blend::BlendTimer::start("timing.closed.march.ladder.refine_ms");
+                    let refined = refine_closed_node_counts(&nodes, &counts, station_ceiling, |previous, t| {
                         frame.continue_node(previous.t, previous.uv, previous.station.center, t, None, true)
-                    }) {
+                    });
+                    refine_timing.stop();
+                    match refined {
                         Ok(refined) => {
                             accepted = Some((nodes.clone(), declared));
                             nodes = refined;
+                            nodes_changed = true;
                             continue;
                         }
                         Err(_) => {
@@ -1867,6 +2113,7 @@ fn march_stations_impl(
                 if let Some((kept, declared)) = accepted.take() {
                     unmet = Some((declared, crate::BudgetReason::Rejected, round, kept.len()));
                     nodes = kept;
+                    nodes_changed = true;
                     break;
                 }
                 if round == REFINE_ROUNDS || nodes.len() + count > station_ceiling {
@@ -1888,11 +2135,24 @@ fn march_stations_impl(
                     let target = wall.map_or(f64::NAN, |check| check.bar);
                     walls.iter().map(|&reading| stations_for_miss(reading, target)).collect()
                 };
-                nodes = refine_closed_node_counts(&nodes, &counts, station_ceiling, |previous, t| {
+                let refine_timing = crate::blend::BlendTimer::start("timing.closed.march.ladder.refine_ms");
+                let refined = refine_closed_node_counts(&nodes, &counts, station_ceiling, |previous, t| {
                     frame.continue_node(previous.t, previous.uv, previous.station.center, t, None, true)
-                })?;
+                });
+                refine_timing.stop();
+                nodes = refined?;
+                nodes_changed = true;
             }
-            check_fold(&nodes)?;
+            // Lane G row 1 (2026-10-14): the fold probe is a pure reading of
+            // the nodes (`fold::check_wall_fold` solves either side of each
+            // station from the nodes alone and keeps nothing), so a ladder
+            // that inserted no station ships the nodes the seed march's probe
+            // already passed, and probing them again returns the same verdict
+            // at the same cost (7 ms of the half torus's 169 ms march). The
+            // probe runs again only on nodes the ladder changed.
+            if nodes_changed {
+                check_fold(&nodes)?;
+            }
             // `round` counts the local rounds ATTEMPTED; on `Rejected` the
             // stations (and the declared reading) are the KEPT accepted rung's
             // — the geometry that ships — not the attempted one's.
@@ -1966,6 +2226,136 @@ pub(super) struct FittedRows {
     /// the pcurves exact (the carrier's uv line, the plane's affine image).
     /// `None` on every other row set. Appended last (2026-10-13).
     pub(super) revolution_axis: Option<(Vec3, Vec3)>,
+}
+
+/// Lane R1 row 2 (lane B's B2): the fold of a closed rim between coaxial
+/// revolutions read in closed form. On by default (promoted 2026-10-18 on the
+/// 98 + 144 census); `BREP_CLOSED_FOLD_CLOSED_FORM=0` (or `off`) restores the
+/// probe on every closed-rim march.
+pub(super) fn closed_form_fold_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !matches!(std::env::var("BREP_CLOSED_FOLD_CLOSED_FORM").as_deref(), Ok("0") | Ok("off")))
+}
+
+
+/// The fold probe's margin a closed-form reading must clear to stand in for
+/// it: the probe refuses at a factor of exactly 1 (and at a rail where the
+/// ball's radius exceeds the mate's radius of curvature by `1e-11 (1 + ρ)`);
+/// a reading within this fraction of either bar goes to the probe.
+const CLOSED_FORM_FOLD_MARGIN: f64 = 1.0e-6;
+
+/// Is every station of a coaxial-revolution march clear of a fold by the
+/// closed form? True only when `first` and `second` are revolutions about one
+/// axis (`closed_revolution_axis`), the radius is one constant over the
+/// stations (the probe's own `1e-11 (1 + ρ)` bar), and at EVERY station the
+/// centre's distance from the axis exceeds ρ·(1 + margin) and each mate's
+/// normal curvature toward the centre along its parallel at the contact reads
+/// ρ·κ_n ≤ 1 − margin (or turns away). Anything unreadable is `false`: the
+/// probe decides, as before.
+fn revolution_fold_clear(nodes: &[MarchNode], first: &BlendMate, second: &BlendMate, radius_at: &dyn Fn(f64) -> f64) -> bool {
+    let Some((axis_origin, axis)) = closed_revolution_axis(first, second) else { return false };
+    let Some(head) = nodes.first() else { return false };
+    let radius = radius_at(head.t).abs();
+    if !(radius > 0.0) || !radius.is_finite() {
+        return false;
+    }
+    let radius_bar = 1.0e-11 * (1.0 + radius);
+    let radial = |point: Vec3| {
+        let offset = point.sub(axis_origin);
+        offset.sub(axis.scale(offset.dot(axis)))
+    };
+    for node in nodes {
+        if (radius_at(node.t).abs() - radius).abs() > radius_bar {
+            return false;
+        }
+        // The centre curve is the parallel circle through the centre: its
+        // curvature vector points at the axis with magnitude 1/ρ_c.
+        let centre_radial = radial(node.station.center);
+        let centre_radius_sq = centre_radial.length_squared();
+        if !(centre_radius_sq > 0.0) {
+            return false;
+        }
+        let curvature = centre_radial.scale(-1.0 / centre_radius_sq);
+        let Some(factor) = revolution_fold_factor(radius, curvature, node.station.center, node.station.p1, node.station.p2) else {
+            return false;
+        };
+        if !(factor <= 1.0 - CLOSED_FORM_FOLD_MARGIN) {
+            return false;
+        }
+        for (mate, uv, contact) in [
+            (first, node.station.uv1, node.station.p1),
+            (second, node.station.uv2, node.station.p2),
+        ] {
+            let Ok(travel) = axis.cross(radial(contact)).normalized() else { return false };
+            let Some(curvature) = parallel_normal_curvature(&mate.face.surface, uv, contact, node.station.center, travel) else {
+                return false;
+            };
+            if !(curvature <= 0.0 || radius * curvature <= 1.0 - CLOSED_FORM_FOLD_MARGIN) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// The fold factor `blend/fold.rs::factor_of` reads from a centre-curve
+/// curvature vector and the two contacts, here with the EXACT curvature of
+/// the parallel circle: ρ times the curvature's component toward the built
+/// arc — its larger component along either contact direction, or its full
+/// in-plane length when it points into the arc between them.
+pub(in crate::blend) fn revolution_fold_factor(radius: f64, curvature: Vec3, centre: Vec3, p1: Vec3, p2: Vec3) -> Option<f64> {
+    let first = p1.sub(centre).normalized().ok()?;
+    let second = p2.sub(centre).normalized().ok()?;
+    let endpoint = curvature.dot(first).max(curvature.dot(second)) * radius;
+    let across = second.sub(first.scale(second.dot(first)));
+    let Ok(across) = across.normalized() else {
+        return Some(endpoint);
+    };
+    let total = second.dot(first).clamp(-1.0, 1.0).acos();
+    let along_first = curvature.dot(first);
+    let along_across = curvature.dot(across);
+    let angle = along_across.atan2(along_first);
+    if !(0.0..=total).contains(&angle) {
+        return Some(endpoint);
+    }
+    let in_plane = along_first.hypot(along_across);
+    Some(endpoint.max(radius * in_plane))
+}
+
+/// The normal curvature of `surface` at `uv` toward `centre` in the tangent
+/// direction `travel` — the carrier's second fundamental form, read as
+/// `blend/fold.rs::rail_curvature` reads it (parameter wrapped onto a closed
+/// domain, clamped on an open one; `None` off the carrier or on a degenerate
+/// first fundamental form).
+fn parallel_normal_curvature(surface: &NurbsSurface, uv: [f64; 2], contact: Vec3, centre: Vec3, travel: Vec3) -> Option<f64> {
+    let (closed_u, closed_v) = surface.closed_directions().ok()?;
+    let onto = |value: f64, [low, high]: [f64; 2], closed: bool| {
+        if closed { low + (value - low).rem_euclid(high - low) } else { value.clamp(low, high) }
+    };
+    let u = onto(uv[0], surface.domain_u().ok()?, closed_u);
+    let v = onto(uv[1], surface.domain_v().ok()?, closed_v);
+    let derivatives = surface.derivatives(u, v, 2).ok()?;
+    if derivatives[0][0].sub(contact).length() > 1.0e-9 * (1.0 + contact.length()) {
+        return None;
+    }
+    let (su, sv) = (derivatives[1][0], derivatives[0][1]);
+    let inward = centre.sub(contact).normalized().ok()?;
+    let (e, f, g) = (su.dot(su), su.dot(sv), sv.dot(sv));
+    let determinant = e * g - f * f;
+    if !(determinant > 0.0) {
+        return None;
+    }
+    let (along_u, along_v) = (su.dot(travel), sv.dot(travel));
+    let du = (g * along_u - f * along_v) / determinant;
+    let dv = (e * along_v - f * along_u) / determinant;
+    let first = e * du * du + 2.0 * f * du * dv + g * dv * dv;
+    if !(first > 0.0) {
+        return None;
+    }
+    let second = derivatives[2][0].dot(inward) * du * du
+        + 2.0 * derivatives[1][1].dot(inward) * du * dv
+        + derivatives[0][2].dot(inward) * dv * dv;
+    Some(second / first)
 }
 
 /// Preserve the exact rotational geometry of a coaxial analytic blend. The
@@ -2042,6 +2432,7 @@ pub(super) fn exact_closed_revolution_rows(
     chamfer: bool,
 ) -> Option<Result<FittedRows, KernelRefusal>> {
     let (axis_origin, base_axis) = closed_revolution_axis(first, second)?;
+    crate::blend::record_count("count.rows.exact_revolution_built", 1);
     Some((|| {
         let first_station = stations.first().ok_or(KernelRefusal::internal(KernelStage::Refine, "sphere_stations", "blend: no sphere stations"))?;
         let next_station = stations

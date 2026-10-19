@@ -102,6 +102,10 @@ pub(crate) struct ClassifyProfile {
     pub rays: u64,
     pub ray_faces: u64,
     pub ray_csi_ms: f64,
+    /// Ray-face intersections the exact lane seeded (`exact_ray_enabled`) and
+    /// the ones it declined to the sampled search.
+    pub ray_exact_faces: u64,
+    pub ray_fallback_faces: u64,
     pub ray_trim_tests: u64,
     pub ray_trim_ms: f64,
     pub coincident_calls: u64,
@@ -115,7 +119,7 @@ thread_local! {
         const { std::cell::Cell::new(ClassifyProfile {
             enabled: false, classify_calls: 0, band_candidates: 0, band_project_ms: 0.0,
             band_trim_tests: 0, band_trim_ms: 0.0, rays: 0, ray_faces: 0, ray_csi_ms: 0.0,
-            ray_trim_tests: 0, ray_trim_ms: 0.0, coincident_calls: 0, coincident_ms: 0.0,
+            ray_exact_faces: 0, ray_fallback_faces: 0, ray_trim_tests: 0, ray_trim_ms: 0.0, coincident_calls: 0, coincident_ms: 0.0,
             classifier_builds: 0, classifier_build_ms: 0.0,
         }) };
 }
@@ -159,12 +163,45 @@ pub(crate) fn classify_profile_report(label: &str) {
         return;
     }
     eprintln!(
-        "classify.profile {label} calls={} builds={} build_ms={:.2} band: candidates={} project_ms={:.2} trim_tests={} trim_ms={:.2} rays={} ray_faces={} csi_ms={:.2} ray_trim_tests={} ray_trim_ms={:.2} coincident: calls={} ms={:.2}",
+        "classify.profile {label} calls={} builds={} build_ms={:.2} band: candidates={} project_ms={:.2} trim_tests={} trim_ms={:.2} rays={} ray_faces={} csi_ms={:.2} exact_faces={} fallback_faces={} ray_trim_tests={} ray_trim_ms={:.2} coincident: calls={} ms={:.2}",
         p.classify_calls, p.classifier_builds, p.classifier_build_ms, p.band_candidates,
         p.band_project_ms, p.band_trim_tests, p.band_trim_ms, p.rays, p.ray_faces,
-        p.ray_csi_ms, p.ray_trim_tests, p.ray_trim_ms, p.coincident_calls, p.coincident_ms,
+        p.ray_csi_ms, p.ray_exact_faces, p.ray_fallback_faces, p.ray_trim_tests, p.ray_trim_ms, p.coincident_calls, p.coincident_ms,
     );
     CLASSIFY_PROFILE.with(|cell| cell.set(ClassifyProfile::default()));
+}
+
+/// The exact ray lane (lane B row 1, 2026-10-17): a ray against an ANALYTIC
+/// face is seeded with its closed-form roots (`crate::exact_line_surface`)
+/// instead of the sampled search's 32-sample scan, then solved and filtered
+/// by the same code. Default ON since its on/off census (production 96/96,
+/// bench 52/52 bodies and 1197/1197 lines) read identical;
+/// `BREP_CLASSIFY_EXACT_RAY=0` (or `off`) restores the sampled search.
+fn exact_ray_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let enabled = *ENABLED.get_or_init(|| {
+        !matches!(std::env::var("BREP_CLASSIFY_EXACT_RAY").as_deref(), Ok("0") | Ok("off"))
+    });
+    enabled
+}
+
+
+/// One ray-face intersection of the ray pass: the exact lane's seeds when it
+/// is on and the face admits them, the sampled search otherwise. Counted on
+/// the profile as `exact_faces` / `fallback_faces` (never timed).
+fn ray_face_intersections(
+    sub_ray: &NurbsCurve,
+    surface: &crate::NurbsSurface,
+    tolerance: f64,
+) -> Result<Vec<crate::CurveSurfaceIntersection>, String> {
+    if exact_ray_enabled() {
+        if let Some(seeds) = crate::exact_line_surface::exact_line_surface_seeds(sub_ray, surface, tolerance) {
+            classify_profile(|p| p.ray_exact_faces += 1);
+            return crate::curve_surface_intersection::intersect_curve_surface_from_seeds(sub_ray, surface, tolerance, seeds);
+        }
+        classify_profile(|p| p.ray_fallback_faces += 1);
+    }
+    intersect_curve_surface(sub_ray, surface, tolerance)
 }
 
 /// Point-in-solid classification with per-solid precomputation: face
@@ -425,7 +462,7 @@ impl<'a> SolidClassifier<'a> {
                     point.add(direction.scale(span_end)),
                 )?;
                 let csi_started = classify_profile_started();
-                let intersections = intersect_curve_surface(&sub_ray, &face.surface, tolerance)?;
+                let intersections = ray_face_intersections(&sub_ray, &face.surface, tolerance)?;
                 classify_profile(|p| {
                     p.ray_faces += 1;
                     p.ray_csi_ms += classify_elapsed_ms(csi_started);

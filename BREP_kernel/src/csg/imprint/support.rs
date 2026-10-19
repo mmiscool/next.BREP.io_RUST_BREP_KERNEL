@@ -1049,7 +1049,18 @@ pub(super) fn curve_spans_on_face(
     if curve_lies_on_surface(&curve, &face.surface, tolerance)? {
         return Ok(vec![curve]);
     }
-    if whole_only || std::env::var("BREP_LIES_ON_SPANS").as_deref() == Ok("0") {
+    if whole_only {
+        return Ok(Vec::new());
+    }
+    curve_spans_after_whole_miss(curve, face, face_edges, tolerance)
+}
+
+/// Continue the partial-span search after the caller proved this exact curve
+/// does not lie wholly on this face, with the same tolerance and no mutation.
+pub(super) fn curve_spans_after_whole_miss(
+    curve: NurbsCurve, face: &FaceRecord, face_edges: &[&EdgeRecord], tolerance: f64,
+) -> Result<Vec<NurbsCurve>, KernelRefusal> {
+    if std::env::var("BREP_LIES_ON_SPANS").as_deref() == Ok("0") {
         return Ok(Vec::new());
     }
     let hull = |curve: &NurbsCurve| -> Result<Aabb, KernelRefusal> {
@@ -1348,12 +1359,69 @@ enum IsoAnswer {
     },
 }
 
+/// A complete control-net proof that distance to the plane is affine in
+/// one parameter and independent of the other. The spatial ruling may curve:
+/// only its normal component matters. Constant positive weights along that
+/// parameter let the rational basis reproduce its Greville abscissae. Every
+/// row must reproduce the SAME affine function, so five agreeing samples
+/// cannot hide an extra section between them. Off by default in the caller.
+pub(super) fn plane_distance_is_affine(
+    plane: &NurbsSurface, surface: &NurbsSurface, along_v: bool, tolerance: f64,
+) -> bool {
+    let proof = || -> Option<()> {
+        if !tolerance.is_finite() || tolerance <= 0. || !plane.is_affine().ok()? {
+            return None;
+        }
+        let d = plane.derivatives(plane.domain_u().ok()?[0], plane.domain_v().ok()?[0], 1).ok()?;
+        let origin = d[0][0];
+        let normal = d[1][0].cross(d[0][1]).normalized().ok()?;
+        let (degree, knots) = if along_v { (surface.degree_v, &surface.knots_v) }
+            else { (surface.degree_u, &surface.knots_u) };
+        let rows = &surface.control_points;
+        let columns = rows.first()?.len();
+        if rows.iter().any(|row| row.len() != columns) || degree == 0 { return None; }
+        let count = if along_v { columns } else { rows.len() };
+        if count < 2 || knots.len() != count + degree + 1 || knots.windows(2).any(|k| k[1] < k[0]) { return None; }
+        let greville: Vec<_> = (0..count).map(|i| knots[i+1..=i+degree].iter().sum::<f64>() / degree as f64).collect();
+        if greville.iter().any(|t| !t.is_finite()) || greville[count-1] <= greville[0] { return None; }
+        let control = |line: usize, index: usize| if along_v { rows[line][index] } else { rows[index][line] };
+        let first = control(0,0).point().ok()?.sub(origin).dot(normal);
+        let last = control(0,count-1).point().ok()?.sub(origin).dot(normal);
+        let slope = (last-first)/(greville[count-1]-greville[0]);
+        if !slope.is_finite() || (last-first).abs() <= tolerance * 100. { return None; }
+        for line in 0..if along_v { rows.len() } else { columns } {
+            let weight = control(line,0).w;
+            if !weight.is_finite() || weight <= 0. { return None; }
+            for (i, t) in greville.iter().enumerate() {
+                let h = control(line,i);
+                if h.w.to_bits() != weight.to_bits() { return None; }
+                let point = h.point().ok()?;
+                let expected = first + slope * (t-greville[0]);
+                let residual = (point.sub(origin).dot(normal)-expected).abs();
+                let round = 128. * f64::EPSILON * (1. + point.length() + origin.length() + expected.abs());
+                if !residual.is_finite() || residual + round > tolerance * 0.01 { return None; }
+            }
+        }
+        Some(())
+    };
+    proof().is_some()
+}
+
 fn planar_linear_iso_direction_section(
     plane: &NurbsSurface,
     ruled: &NurbsSurface,
     tolerance: f64,
     linear_v: bool,
     gate: IsoGate,
+) -> Result<IsoAnswer, KernelRefusal> {
+    // Named Count/Geometry answers are reference readings for the gate
+    // census. Only production dispatch opts into the additional proof.
+    planar_linear_iso_direction_section_with(plane, ruled, tolerance, linear_v, gate, false)
+}
+
+fn planar_linear_iso_direction_section_with(
+    plane: &NurbsSurface, ruled: &NurbsSurface, tolerance: f64,
+    linear_v: bool, gate: IsoGate, projected: bool,
 ) -> Result<IsoAnswer, KernelRefusal> {
     if !plane
         .is_affine()
@@ -1371,7 +1439,9 @@ fn planar_linear_iso_direction_section(
         }
         IsoGate::Geometry => rulings_are_straight_and_affine(ruled, linear_v, tolerance).admits(tolerance),
     };
-    if !admitted {
+    let projected_iso = !admitted && projected
+        && plane_distance_is_affine(plane, ruled, linear_v, tolerance);
+    if !admitted && !projected_iso {
         return Ok(IsoAnswer::Declined(IsoOutcome::Gate));
     }
     let plane_u = KnotVector::new(plane.knots_u.clone(), plane.degree_u)
@@ -1644,15 +1714,94 @@ pub(super) struct IsoSection {
     pub(super) pcurves: Option<[NurbsCurve; 2]>,
 }
 
+/// `BREP_IMPRINT_PLANE_POINT_SKIP` (lane X row 5): two exact parallelogram
+/// carriers on clearly non-parallel planes whose contact is ONE point. Each
+/// parallelogram is cut by the other's plane (a corner within `band` of that
+/// plane counts as on it, so a near-touching edge is contact, never a miss);
+/// both cuts lie on the planes' common line, and when both are non-empty and
+/// overlap there in no more than rounding (1e-12 of the extent) the faces,
+/// which lie inside their carriers, meet at most at that point: no section
+/// curve exists for the march to find. `None` when either carrier is not an
+/// exact parallelogram or the planes are near parallel.
+pub(super) fn planar_point_contact(first: &NurbsSurface, second: &NurbsSurface, band: f64) -> Option<bool> {
+    let corners = |surface: &NurbsSurface| -> Option<[Vec3; 4]> {
+        if surface.degree_u != 1 || surface.degree_v != 1 || surface.control_points.len() != 2
+            || surface.control_points.iter().any(|row| row.len() != 2)
+        {
+            return None;
+        }
+        let w = surface.control_points[0][0].w;
+        if surface.control_points.iter().flatten().any(|control| control.w != w) {
+            return None;
+        }
+        let p00 = surface.control_points[0][0].point().ok()?;
+        let p01 = surface.control_points[0][1].point().ok()?;
+        let p10 = surface.control_points[1][0].point().ok()?;
+        let p11 = surface.control_points[1][1].point().ok()?;
+        let defect = p11.sub(p10).sub(p01.sub(p00));
+        if defect.x != 0.0 || defect.y != 0.0 || defect.z != 0.0 {
+            return None;
+        }
+        Some([p00, p10, p11, p01])
+    };
+    let a = corners(first)?;
+    let b = corners(second)?;
+    let normal = |c: &[Vec3; 4]| c[1].sub(c[0]).cross(c[3].sub(c[0]));
+    let (na, nb) = (normal(&a), normal(&b));
+    let (la, lb) = (na.length(), nb.length());
+    if la == 0.0 || lb == 0.0 {
+        return None;
+    }
+    let line = na.cross(nb);
+    if line.length() <= 1e-6 * la * lb {
+        return None;
+    }
+    let line = line.scale(1.0 / line.length());
+    let extent = a.iter().chain(b.iter()).map(|p| p.sub(a[0]).length()).fold(0.0, f64::max).max(1.0);
+    // The interval along `line` where polygon `c` meets the plane through
+    // `origin` with unit normal `n`.
+    let cut = |c: &[Vec3; 4], origin: Vec3, n: Vec3| -> Option<[f64; 2]> {
+        let d: Vec<f64> = c.iter().map(|p| n.dot(p.sub(origin))).collect();
+        let mut low = f64::INFINITY;
+        let mut high = f64::NEG_INFINITY;
+        let mut take = |p: Vec3| {
+            let t = line.dot(p);
+            low = low.min(t);
+            high = high.max(t);
+        };
+        for i in 0..4 {
+            let j = (i + 1) % 4;
+            if d[i].abs() <= band {
+                take(c[i]);
+            }
+            if (d[i] > band && d[j] < -band) || (d[i] < -band && d[j] > band) {
+                take(c[i].add(c[j].sub(c[i]).scale(d[i] / (d[i] - d[j]))));
+            }
+        }
+        (low <= high).then_some([low, high])
+    };
+    let on_b = cut(&a, b[0], nb.scale(1.0 / lb))?;
+    let on_a = cut(&b, a[0], na.scale(1.0 / la))?;
+    let overlap = on_b[1].min(on_a[1]) - on_b[0].max(on_a[0]);
+    Some(overlap.abs() <= 1e-12 * extent)
+}
+
 pub(super) fn planar_iso_section(
     first: &NurbsSurface,
     second: &NurbsSurface,
     tolerance: f64,
 ) -> Result<Option<IsoSection>, KernelRefusal> {
+    // Promoted after the whole ON kernel/manifest/HLR and body-byte census.
+    // Explicit 0/off retains the pre-promotion production dispatch.
+    let projected = match std::env::var("BREP_NURBS_PLANE_ISO") {
+        Ok(value) => value == "1" || value == "on",
+        Err(std::env::VarError::NotPresent) => true,
+        Err(_) => false,
+    };
     for (plane, ruled, plane_first) in [(first, second, true), (second, first, false)] {
         for linear_v in [true, false] {
             if let IsoAnswer::Curve { curve, on_plane, on_ruled } =
-                planar_linear_iso_direction_section(plane, ruled, tolerance, linear_v, iso_gate())?
+                planar_linear_iso_direction_section_with(plane, ruled, tolerance, linear_v, iso_gate(), projected)?
             {
                 let pcurves = match (on_plane, on_ruled) {
                     (Some(on_plane), Some(on_ruled)) if plane_first => Some([on_plane, on_ruled]),
@@ -1785,3 +1934,5 @@ pub(super) fn cosurface_pair(
     }
     Ok(true)
 }
+
+

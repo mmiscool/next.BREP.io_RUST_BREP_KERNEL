@@ -251,6 +251,11 @@ fn fit_stripe(
                 let extrusion = extrusion_direction(edge, first, second);
                 match fit_open_rows(&stations, &parameters, false, Some(vertex_indices), extrusion) {
                     Ok(mut rows) => {
+                        // The fitted wall itself must not double back along
+                        // a row (`fold::check_rows_loop`); terminal.
+                        super::fold::check_rows_loop(
+                            &rows, &stations, &parameters, Some(vertex_indices), radius, vec![first.face.id, second.face.id], stations.iter().map(|station| station.center.length()).fold(1.0f64, f64::max),
+                        )?;
                         rows.vertex_stations = vertex_stations(&parameters, vertex_indices);
                         return Ok(rows);
                     }
@@ -831,7 +836,9 @@ struct EndChain {
 /// `BREP_BLEND_ONE_ENDED_RUNOUT=1` turns the one-ended runout on, `=0` off;
 /// `set_one_ended_runout_for_test` forces it on a test's own thread.  Off,
 /// the public entry refuses the class exactly as before.
-const ONE_ENDED_RUNOUT_DEFAULT: bool = false;
+/// Promoted 2026-10-14: the switch-on census held the
+/// battery, the case manifest and hlr_tests; `=0`/`off` is the escape hatch.
+const ONE_ENDED_RUNOUT_DEFAULT: bool = true;
 
 thread_local! {
     static ONE_ENDED_RUNOUT_FOR_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
@@ -845,6 +852,56 @@ pub(crate) fn one_ended_runout_on() -> bool {
         Ok("0") | Ok("off") => false,
         Ok("1") | Ok("on") => true,
         _ => ONE_ENDED_RUNOUT_DEFAULT,
+    }
+}
+
+
+/// The refusal class of a one-ended end whose unselected third edge is
+/// CONCAVE and whose pad overshoots it (lane L, 2026-10-15).
+pub(crate) const ONE_ENDED_CONCAVE_THIRD_WHAT: &str = "one_ended_concave_third";
+
+// ======================================================================
+// Lane L row 2 (2026-10-15): the one-ended end with a CONCAVE third edge
+// (the wedge nine-pick's spine A at the wall).
+//
+// The pad (the selected concave edge's stripe) overshoots the unselected
+// concave edge: its end arc on the kept mate climbs past that edge, and the
+// kept face's boundary turns straight back along it.  The ball:
+//
+//  * runs on the spine's mates to the PAD'S GRAZE — the section through the
+//    spine's ring vertex, where the ball's contact on the replaced mate sits
+//    on the pad's rail and the ball touches the pad there (the mirror
+//    identity on that mate; the floor tangency the convex-third end solves
+//    coincides with it only for a right-angled pad);
+//  * then rolls on the kept mate EXTENDED and on the pad, until its pad
+//    contact reaches the pad's rail on the FLOOR (the face across the
+//    unselected edge) — the terminus;
+//  * and the stripe is TRIMMED by the floor's plane: the part past it lies
+//    inside the floor's material.  The kept rail ends where it crosses that
+//    plane (on the unselected edge), the trim curve runs on the floor from
+//    there to the terminus's pad contact (on the pad's floor rail), and the
+//    pad's end arc and the corner of the kept face it bounded are consumed.
+//
+// `BREP_BLEND_CONCAVE_THIRD_RUNOUT=0`/`off` is the escape hatch; promoted
+// 2026-10-15 (the wedge nine-pick at its quadrature).
+// ======================================================================
+
+const CONCAVE_THIRD_RUNOUT_DEFAULT: bool = true;
+
+thread_local! {
+    static CONCAVE_THIRD_RUNOUT_FOR_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// `BREP_BLEND_CONCAVE_THIRD_RUNOUT=1`/`on` builds the concave-third
+/// one-ended end, `=0`/`off` refuses it by name (`ONE_ENDED_CONCAVE_THIRD_WHAT`).
+pub(crate) fn concave_third_runout_on() -> bool {
+    if let Some(forced) = CONCAVE_THIRD_RUNOUT_FOR_TEST.with(|forced| forced.get()) {
+        return forced;
+    }
+    match std::env::var("BREP_BLEND_CONCAVE_THIRD_RUNOUT").as_deref() {
+        Ok("0") | Ok("off") => false,
+        Ok("1") | Ok("on") => true,
+        _ => CONCAVE_THIRD_RUNOUT_DEFAULT,
     }
 }
 
@@ -866,6 +923,9 @@ struct OneEndChain {
     side_rail: u64,
     /// The unselected edge's convexity: convex takes the C5 cliff.
     third_convex: bool,
+    /// A CONCAVE third edge (row 2): the pad's rail on the floor, leaving
+    /// `mid_vertex` (the pad ∩ floor edge) — trimmed at the terminus.
+    floor_rail: Option<u64>,
 }
 
 /// Read a one-ended end on the ring, or say why this end is not one.
@@ -892,10 +952,35 @@ fn one_ended_chain(
         KernelStage::Classify, "one_ended_chain", format!("blend one-ended runout: edge {e1_id} has one face"),
     ))?;
     let mid_vertex = other_vertex(e1, spine_vertex);
-    let e2_id = continuation(ring, e1, mid_vertex)?.ok_or_else(|| refuse(
-        "one_ended_chain",
-        format!("the pad's end arc {e1_id} does not continue smoothly past vertex {mid_vertex}"),
-    ))?;
+    let e2_id = match continuation(ring, e1, mid_vertex)? {
+        Some(id) => id,
+        None => {
+            // Lane L (2026-10-15): the CONCAVE-third branch. When the unselected
+            // third edge is concave the pad overshoots it: its end arc on the
+            // kept mate climbs past the edge's end and the kept mate's boundary
+            // turns BACK down along the unselected edge's continuation (the wedge
+            // nine-pick at its wall: arc to z = 6.339, back down to z = 6).
+            let arriving = tangent_away_from(e1, mid_vertex)?;
+            let reverses = edges_at(ring, mid_vertex).into_iter().filter(|id| *id != e1_id).any(|id| {
+                let Ok(edge) = edge_by_id(ring, id) else { return false };
+                faces_of(ring, id).contains(&kept)
+                    && tangent_away_from(edge, mid_vertex)
+                        .is_ok_and(|leaving| leaving.dot(arriving) >= 1.0 - 1e-6)
+            });
+            let point = vertex_point(ring, mid_vertex)?;
+            if reverses && concave_third_runout_on() {
+                return concave_third_chain(ring, spine, spine_vertex, mates, kept, replaced, pad, e1_id, mid_vertex, arriving);
+            }
+            return Err(if reverses {
+                refuse(ONE_ENDED_CONCAVE_THIRD_WHAT, format!(
+                    "at ({:.3}, {:.3}, {:.3}) the spine {} runs out with a CONCAVE unselected third edge: the pad's end arc {e1_id} on the kept face climbs past that edge and the kept face's boundary turns back along it, so the stripe must roll on the kept face EXTENDED and be trimmed by the face across the unselected edge — not built here",
+                    point.x, point.y, point.z, spine.id
+                ))
+            } else {
+                refuse("one_ended_chain", format!("the pad's end arc {e1_id} does not continue smoothly past vertex {mid_vertex}"))
+            });
+        }
+    };
     let e2_faces = faces_of(ring, e2_id);
     if !e2_faces.contains(&kept) || e2_faces.contains(&pad) {
         return Err(refuse("one_ended_chain", format!(
@@ -925,22 +1010,164 @@ fn one_ended_chain(
         .and_then(|convexity| convexity.first().copied())
         .ok_or_else(|| refuse("one_ended_chain", format!("the convexity of the unselected edge {e2_id} could not be read")))?;
     Ok((
-        OneEndChain { spine_vertex, e1: e1_id, mid_vertex, e2: e2_id, pad, floor, side_rail, third_convex },
+        OneEndChain { spine_vertex, e1: e1_id, mid_vertex, e2: e2_id, pad, floor, side_rail, third_convex, floor_rail: None },
         kept,
         replaced,
     ))
 }
 
+/// Read the concave-third one-ended end (row 2) at `mid_vertex`, where the
+/// pad's end arc `e1` arrives going `arriving` and the kept face's boundary
+/// turns straight back along the unselected edge.
+#[allow(clippy::too_many_arguments)]
+fn concave_third_chain(
+    ring: &BrepSolid,
+    spine: &EdgeRecord,
+    spine_vertex: u64,
+    mates: [u64; 2],
+    kept: u64,
+    replaced: u64,
+    pad: u64,
+    e1_id: u64,
+    mid_vertex: u64,
+    arriving: Vec3,
+) -> Result<(OneEndChain, u64, u64), KernelRefusal> {
+    let refuse = |message: String| KernelRefusal::unsupported(KernelStage::Classify, ONE_ENDED_CONCAVE_THIRD_WHAT, format!("blend one-ended runout (concave third): {message}"));
+    let _ = mates;
+    // The unselected edge: on the kept face, leaving mid_vertex straight back.
+    let e2_id = edges_at(ring, mid_vertex)
+        .into_iter()
+        .filter(|id| *id != e1_id)
+        .find(|id| {
+            let Ok(edge) = edge_by_id(ring, *id) else { return false };
+            faces_of(ring, *id).contains(&kept)
+                && tangent_away_from(edge, mid_vertex).is_ok_and(|leaving| leaving.dot(arriving) >= 1.0 - 1e-6)
+        })
+        .ok_or_else(|| refuse(format!("no edge of the kept face {kept} turns back from vertex {mid_vertex}")))?;
+    let floor = *faces_of(ring, e2_id).iter().find(|id| **id != kept).ok_or_else(|| KernelRefusal::internal(
+        KernelStage::Classify, "one_ended_chain", format!("blend one-ended runout: edge {e2_id} has one face"),
+    ))?;
+    if floor == pad || floor == replaced {
+        return Err(refuse(format!("the unselected edge {e2_id} runs onto face {floor}, the pad or the replaced mate")));
+    }
+    // The pad's rail on the floor, leaving mid_vertex.
+    let floor_rail = edges_at(ring, mid_vertex)
+        .into_iter()
+        .filter(|id| *id != e1_id && *id != e2_id)
+        .find(|id| {
+            let faces = faces_of(ring, *id);
+            faces.contains(&pad) && faces.contains(&floor)
+        })
+        .ok_or_else(|| refuse(format!("no rail of pad {pad} on the floor {floor} leaves vertex {mid_vertex}")))?;
+    let side_rail = edges_at(ring, spine_vertex)
+        .into_iter()
+        .filter(|id| *id != spine.id && *id != e1_id)
+        .find(|id| {
+            let faces = faces_of(ring, *id);
+            faces.contains(&replaced) && faces.contains(&pad)
+        })
+        .ok_or_else(|| refuse(format!("no rail of pad {pad} on face {replaced} ends at vertex {spine_vertex}")))?;
+    // The floor must be a plane: the trim is by its plane.
+    if !matches!(face_by_id(ring, floor)?.surface.analytic(), Some(crate::AnalyticSurface::Plane { .. })) {
+        return Err(refuse(format!("the floor {floor} across the unselected edge is not planar; the wall is trimmed by its plane")));
+    }
+    Ok((
+        OneEndChain { spine_vertex, e1: e1_id, mid_vertex, e2: e2_id, pad, floor, side_rail, third_convex: false, floor_rail: Some(floor_rail) },
+        kept,
+        replaced,
+    ))
+}
+
+/// A plain OPEN end of a spine on the ring (the L prism's far end): the
+/// spine's vertex is three-valent, its two other edges are unselected and
+/// run along the spine's two mates onto one END FACE, a plane perpendicular
+/// to the spine there, so the wall ends FLUSH: its last section lies in that
+/// plane and becomes an edge of the end face.
+struct OpenEnd {
+    spine_vertex: u64,
+    end_face: u64,
+    /// The unselected edge on the FIRST mate and the end face, and the one
+    /// on the second mate and the end face.
+    edge_first: u64,
+    edge_second: u64,
+}
+
+/// Read a plain open end at `spine_vertex`, or say why this end is not one.
+/// `mates` is (first, second) in the spine's own mate order.
+fn open_end(ring: &BrepSolid, spine: &EdgeRecord, spine_vertex: u64, mates: [u64; 2]) -> Result<OpenEnd, KernelRefusal> {
+    let refuse = |what: &str, message: String| KernelRefusal::unsupported(KernelStage::Classify, what, format!("blend one-ended runout: {message}"));
+    if continuation(ring, spine, spine_vertex)?.is_some() {
+        return Err(refuse("open_end", format!("the spine {} continues smoothly past vertex {spine_vertex}, which is not an open end", spine.id)));
+    }
+    let others: Vec<u64> = edges_at(ring, spine_vertex).into_iter().filter(|id| *id != spine.id).collect();
+    if others.len() != 2 {
+        return Err(refuse("open_end", format!(
+            "vertex {spine_vertex} carries {} edges beside the spine (an open end has exactly two)", others.len()
+        )));
+    }
+    let mut on_mate = [None; 2];
+    let mut end_face = None;
+    for id in &others {
+        let faces = faces_of(ring, *id);
+        let Some(side) = (0..2).find(|k| faces.contains(&mates[*k])) else {
+            return Err(refuse("open_end", format!("edge {id} at vertex {spine_vertex} runs along neither of the spine's mates")));
+        };
+        let Some(third) = faces.iter().copied().find(|f| *f != mates[side]) else {
+            return Err(KernelRefusal::internal(KernelStage::Classify, "open_end", format!("blend one-ended runout: edge {id} has one face")));
+        };
+        if on_mate[side].is_some() {
+            return Err(refuse("open_end", format!("both edges at vertex {spine_vertex} run along mate {}", mates[side])));
+        }
+        on_mate[side] = Some(*id);
+        match end_face {
+            None => end_face = Some(third),
+            Some(face) if face == third => {}
+            Some(face) => {
+                return Err(refuse("open_end", format!(
+                    "the two edges at vertex {spine_vertex} end on different faces ({face} and {third}), not on one end face"
+                )));
+            }
+        }
+    }
+    let (Some(edge_first), Some(edge_second), Some(end_face)) = (on_mate[0], on_mate[1], end_face) else {
+        return Err(refuse("open_end", format!("the edges at vertex {spine_vertex} do not run along both mates")));
+    };
+    if mates.contains(&end_face) {
+        return Err(refuse("open_end", format!("the end face at vertex {spine_vertex} is one of the spine's own mates")));
+    }
+    // Flush: the end face is a plane whose normal is the spine's tangent at
+    // the vertex, so the spine's last section plane IS the end face.
+    let face = face_by_id(ring, end_face)?;
+    let Some(crate::AnalyticSurface::Plane { u_dir, v_dir, .. }) = face.surface.analytic() else {
+        return Err(refuse("open_end_oblique", format!(
+            "the end face {end_face} at vertex {spine_vertex} is not planar; a flush open end needs the spine's section plane to be the end face"
+        )));
+    };
+    let normal = u_dir.cross(*v_dir).normalized().or_refuse(KernelStage::Refine, "normalized")?;
+    let tangent = tangent_away_from(spine, spine_vertex)?;
+    let lean = 1.0 - normal.dot(tangent).abs();
+    if lean > 1e-9 {
+        return Err(refuse("open_end_oblique", format!(
+            "the end face {end_face} at vertex {spine_vertex} leans 1 − |n·t| = {lean:.3e} off the spine's section plane; an oblique open end (the wall trimmed by the end face) is not built here"
+        )));
+    }
+    Ok(OpenEnd { spine_vertex, end_face, edge_first, edge_second })
+}
+
 /// One end of a spine's ridge on the ring: a two-ended chain (seam and
-/// pole) or a one-ended end (the pad's end arc and the unselected edge).
+/// pole), a one-ended end (the pad's end arc and the unselected edge), or
+/// a plain open end (two unselected edges onto a flush end face).
 enum RingEnd {
     Chain(EndChain),
     One(OneEndChain),
+    Open(OpenEnd),
 }
 
 /// Read either end kind at `spine_vertex`.  A two-ended chain is read first
-/// (the shipped class); the one-ended end only with its switch on, and the
-/// chain's own refusal is kept when neither reads.
+/// (the shipped class); the one-ended end and the plain open end only with
+/// the switch on, and the chain's own refusal is kept when none reads.  An
+/// open end keeps no mate of its own: its (kept, replaced) are the mates in
+/// the spine's order and the caller takes the other end's.
 fn read_end(
     ring: &BrepSolid,
     spine: &EdgeRecord,
@@ -956,7 +1183,12 @@ fn read_end(
             }
             match one_ended_chain(ring, spine, spine_vertex, mates, radius) {
                 Ok((chain, kept, replaced)) => Ok((RingEnd::One(chain), kept, replaced)),
-                Err(one_error) => Err(chain_error.with_message(|message| format!("{message}; nor a one-ended end: {one_error}"))),
+                Err(one_error) => match open_end(ring, spine, spine_vertex, mates) {
+                    Ok(end) => Ok((RingEnd::Open(end), mates[0], mates[1])),
+                    Err(open_error) => Err(chain_error.with_message(|message| format!(
+                        "{message}; nor a one-ended end: {one_error}; nor an open end: {open_error}"
+                    ))),
+                },
             }
         }
     }
@@ -1316,6 +1548,69 @@ pub(crate) fn shared_chain_claim(claims: &[ChainClaim]) -> Option<(ChainClaim, C
 /// a graze minimum), and closes on the ring's own pole vertices across a
 /// degenerate edge.  The rails are split at the switches into one edge per
 /// carrier; nothing is cut and nothing is intersected.
+/// Row 2: the station where the ball on (`surface1`, `surface2`) GRAZES
+/// `pad` — the minimum of |dist(centre, pad) − r| along the spine between
+/// `t_from` and `t_to` (sampled, then golden-section), with its ball.
+#[allow(clippy::too_many_arguments)]
+fn graze_station(
+    surface1: &NurbsSurface,
+    surface2: &NurbsSurface,
+    rho: [f64; 2],
+    pad: &NurbsSurface,
+    spine: &EdgeRecord,
+    seed: [f64; 4],
+    t_from: f64,
+    t_to: f64,
+    radius: f64,
+    scale: f64,
+) -> Result<(f64, Ball), KernelRefusal> {
+    let graze = |t: f64, seed: [f64; 4]| -> Result<(f64, Ball), KernelRefusal> {
+        let ball = solve_ball(surface1, surface2, rho, seed, spine, t, scale)?;
+        Ok(((surface_gap(pad, ball.center)?.0 - radius).abs(), ball))
+    };
+    let mut seed = seed;
+    let mut samples: Vec<(f64, f64, [f64; 4])> = Vec::new();
+    for sample in 0..=STOP_SAMPLES {
+        let t = t_from + (t_to - t_from) * sample as f64 / STOP_SAMPLES as f64;
+        let Ok((value, ball)) = graze(t, seed) else { break };
+        seed = ball.uv;
+        samples.push((t, value, ball.uv));
+    }
+    let (index, _) = samples
+        .iter()
+        .enumerate()
+        .min_by(|a, b| a.1 .1.partial_cmp(&b.1 .1).unwrap_or(std::cmp::Ordering::Equal))
+        .filter(|(index, _)| *index > 0 && *index + 1 < samples.len())
+        .ok_or_else(|| KernelRefusal::unsupported(KernelStage::Refine, ONE_ENDED_CONCAVE_THIRD_WHAT, format!(
+            "blend one-ended runout (concave third): the ball never grazes the pad ({} stations marched)", samples.len()
+        )))?;
+    const GOLDEN: f64 = 0.618_033_988_749_894_9;
+    let seed = samples[index].2;
+    let (mut low, mut high) = (samples[index - 1].0, samples[index + 1].0);
+    let mut x1 = high - GOLDEN * (high - low);
+    let mut x2 = low + GOLDEN * (high - low);
+    let mut f1 = graze(x1, seed)?.0;
+    let mut f2 = graze(x2, seed)?.0;
+    for _ in 0..BISECTIONS {
+        if f1 < f2 {
+            high = x2;
+            x2 = x1;
+            f2 = f1;
+            x1 = high - GOLDEN * (high - low);
+            f1 = graze(x1, seed)?.0;
+        } else {
+            low = x1;
+            x1 = x2;
+            f1 = f2;
+            x2 = low + GOLDEN * (high - low);
+            f2 = graze(x2, seed)?.0;
+        }
+    }
+    let t = 0.5 * (low + high);
+    let (_, ball) = graze(t, seed)?;
+    Ok((t, ball))
+}
+
 pub(crate) fn build_runout_walls(
     ring: &BrepSolid,
     spines: &[(u64, Option<String>)],
@@ -1352,6 +1647,19 @@ pub(crate) fn build_runout_walls(
                         for (role, id) in [(ChainRole::Edge("ridge edge"), chain.e1), (ChainRole::Edge("side rail"), chain.side_rail)] {
                             claims.push(ChainClaim { spine: *spine_id, role, id });
                         }
+                        // Row 2: the concave-third end also trims the
+                        // unselected edge and the pad's floor rail.
+                        if let Some(floor_rail) = chain.floor_rail {
+                            for (role, id) in [(ChainRole::Edge("unselected edge"), chain.e2), (ChainRole::Edge("floor rail"), floor_rail)] {
+                                claims.push(ChainClaim { spine: *spine_id, role, id });
+                            }
+                        }
+                    }
+                    // An open end trims the two unselected edges at its vertex.
+                    RingEnd::Open(end) => {
+                        for (role, id) in [(ChainRole::Edge("open-end edge"), end.edge_first), (ChainRole::Edge("open-end edge"), end.edge_second)] {
+                            claims.push(ChainClaim { spine: *spine_id, role, id });
+                        }
                     }
                 }
             }
@@ -1386,14 +1694,42 @@ fn build_runout_wall(
     // The ridge past each end, and which mate is KEPT past A (the one the
     // chain's first edge runs along).  Both ends must agree.
     let (end0_ring, kept0, replaced0) = read_end(ring, spine, spine.start_vertex_id, mate_ids, radius)?;
-    let (end1_ring, kept1, _) = read_end(ring, spine, spine.end_vertex_id, mate_ids, radius)?;
-    if kept0 != kept1 {
-        return Err(KernelRefusal::unsupported(KernelStage::Classify, "runout_chain", format!(
-            "blend runout: the two ends of spine {spine_id} keep different mates ({kept0} and {kept1})"
-        )));
-    }
-    let (kept, replaced) = (kept0, replaced0);
+    let (end1_ring, kept1, replaced1) = read_end(ring, spine, spine.end_vertex_id, mate_ids, radius)?;
+    // An open end keeps no mate: the other end decides.  Two open ends are
+    // no runout at all.
+    let (kept, replaced) = match (&end0_ring, &end1_ring) {
+        (RingEnd::Open(_), RingEnd::Open(_)) => {
+            return Err(KernelRefusal::unsupported(KernelStage::Classify, "runout_chain", format!(
+                "blend runout: both ends of spine {spine_id} are open ends; the spine runs out at neither"
+            )));
+        }
+        (RingEnd::Open(_), _) => (kept1, replaced1),
+        (_, RingEnd::Open(_)) => (kept0, replaced0),
+        _ => {
+            // Row 2: a concave-third end keeps the mate its pad does NOT
+            // replace, which need not be the other end's (the wedge's spine
+            // A keeps the roof at its tip, the side at the wall); with the
+            // switch on, each end keeps its own.
+            let mixed_allowed = concave_third_runout_on()
+                && [&end0_ring, &end1_ring].iter().any(|end| matches!(end, RingEnd::One(chain) if chain.floor_rail.is_some()));
+            if kept0 != kept1 && !mixed_allowed {
+                return Err(KernelRefusal::unsupported(KernelStage::Classify, "runout_chain", format!(
+                    "blend runout: the two ends of spine {spine_id} keep different mates ({kept0} and {kept1})"
+                )));
+            }
+            (kept0, replaced0)
+        }
+    };
     let kept_is_first = kept == first.face.id;
+    // Each end's kept mate (an open end takes the other end's): equal to
+    // `kept` at both ends unless row 2's mixed case.
+    let end_kept: [u64; 2] = match (&end0_ring, &end1_ring) {
+        (RingEnd::Open(_), _) => [kept1, kept1],
+        (_, RingEnd::Open(_)) => [kept0, kept0],
+        _ => [kept0, kept1],
+    };
+    let end_kept_first = [end_kept[0] == first.face.id, end_kept[1] == first.face.id];
+    let _ = replaced;
     // Each end runs out against ITS OWN shared face: the floor at the rib's
     // tip, the back wall at the other end.
     let ring_ends = [end0_ring, end1_ring];
@@ -1428,6 +1764,17 @@ fn build_runout_wall(
             t_stop: f64,
             stop: Station,
         },
+        /// A flush open end: the spine's own last section, on the end face.
+        Open {
+            station: Station,
+        },
+        /// Row 2: a concave-third one-ended end — the section where the
+        /// ball's PAD contact reaches the floor's plane; the wall is trimmed
+        /// by that plane.
+        WallTrim {
+            t_end: f64,
+            end: Station,
+        },
     }
     struct EndSolve {
         t_a: f64,
@@ -1439,13 +1786,47 @@ fn build_runout_wall(
     }
     let mut ends: Vec<EndSolve> = Vec::with_capacity(2);
     for (slot, ring_end) in ring_ends.iter().enumerate() {
+        // This end's own kept mate (row 2; the same at both ends otherwise).
+        let (kept, kept_is_first) = (end_kept[slot], end_kept_first[slot]);
         let vertex_t = if slot == 0 { spine.t0 } else { spine.t1 };
+        // An open end has no station A: the wall runs on the spine's own
+        // mates to the vertex's section, which lies in the end face.
+        if let RingEnd::Open(end) = ring_end {
+            let ball = solve_ball(surface1, surface2, rho, seed_at(vertex_t)?, spine, vertex_t, scale)?;
+            let station = make_station(surface1, surface2, rho, ball.uv, spine, vertex_t)?;
+            let end_face = face_by_id(ring, end.end_face)?;
+            let mut off_face: f64 = 0.0;
+            for point in [station.p1, station.p2, station.center] {
+                off_face = off_face.max(surface_gap(&end_face.surface, point)?.0);
+            }
+            let band = crate::KernelTolerances::for_solid(ring, 1e-7).pcurve_consistency;
+            if off_face > band {
+                return Err(KernelRefusal::unsupported(KernelStage::Refine, "open_end_oblique", format!(
+                    "blend one-ended runout: the spine {spine_id}'s last section at vertex {} stands {off_face:.3e} off the end face {} (band {band:.1e}); the open end is not flush",
+                    end.spine_vertex, end.end_face
+                )));
+            }
+            if debug {
+                eprintln!(
+                    "runout spine {spine_id} end {slot} (open): section at t={vertex_t:.6} on end face {} ({off_face:.3e} off it); p1 ({:.6}, {:.6}, {:.6}) p2 ({:.6}, {:.6}, {:.6})",
+                    end.end_face, station.p1.x, station.p1.y, station.p1.z, station.p2.x, station.p2.y, station.p2.z
+                );
+            }
+            ends.push(EndSolve {
+                t_a: vertex_t,
+                pad_s_first: !kept_is_first,
+                middle: (first.face.id, second.face.id, rho, ball.uv),
+                terminus: Terminus::Open { station },
+            });
+            continue;
+        }
         // Station A is bracketed from the spine's middle to the pole's
         // section on a chain, and to half a spine past the vertex on a
         // one-ended end (the ball meets the floor's plane near the vertex).
         let (t_pole, floor_id, pad_s_id) = match ring_end {
             RingEnd::Chain(chain) => (section_parameter(spine, chain.pole_point, t_mid, vertex_t)?, chain.floor, chain.pad_s),
             RingEnd::One(chain) => (vertex_t + (vertex_t - t_mid), chain.floor, chain.pad),
+            RingEnd::Open(_) => unreachable!("an open end was solved above"),
         };
         let floor = face_by_id(ring, floor_id)?;
         // A one-ended end reads the floor's distance on its PLANE (C5's
@@ -1454,7 +1835,7 @@ fn build_runout_wall(
         // the projector clamps and the gap never closes.  A chain end reads
         // the projected distance exactly as before.
         let floor_plane: Option<(Vec3, Vec3)> = match ring_end {
-            RingEnd::Chain(_) => None,
+            RingEnd::Chain(_) | RingEnd::Open(_) => None,
             RingEnd::One(chain) => {
                 let Some(crate::AnalyticSurface::Plane { origin, u_dir, v_dir, .. }) = floor.surface.analytic() else {
                     return Err(KernelRefusal::unsupported(KernelStage::Classify, "one_ended_floor", format!(
@@ -1486,7 +1867,13 @@ fn build_runout_wall(
         // flipped its sign walked to the far end of the bracket instead.
         let exact = 1e-12 * (1.0 + scale);
         let mut hit: Option<(f64, Ball)> = None;
+        // Row 2: a concave-third end's station A is the PAD'S graze, solved
+        // below; the floor tangency is not on its path.
+        let concave_third = matches!(ring_end, RingEnd::One(chain) if chain.floor_rail.is_some());
         for sample in 0..=BRACKET_SAMPLES {
+            if concave_third {
+                break;
+            }
             let t = t_mid + (t_pole - t_mid) * sample as f64 / BRACKET_SAMPLES as f64;
             let (value, ball) = gap_at(t, seed)?;
             seed = ball.uv;
@@ -1502,7 +1889,10 @@ fn build_runout_wall(
             }
             previous = Some((t, value));
         }
-        let (t_a, ball_a) = if let Some((t, ball)) = hit {
+        let (t_a, ball_a) = if concave_third {
+            graze_station(surface1, surface2, rho, &face_by_id(ring, pad_s_id)?.surface, spine, seed_at(t_mid)?, t_mid, t_pole, radius, scale)
+                .map_err(|error| error.with_message(|message| format!("{message} (spine {spine_id}, the concave-third end at vertex {})", if slot == 0 { spine.start_vertex_id } else { spine.end_vertex_id })))?
+        } else if let Some((t, ball)) = hit {
             (t, ball)
         } else {
         let (mut low, mut high) = bracket.ok_or_else(|| KernelRefusal::unsupported(KernelStage::Refine, "runout_station_a", format!(
@@ -1653,6 +2043,89 @@ fn build_runout_wall(
                     chain.spine_vertex, report.station_a_residual[slot], chain.pad
                 )));
             }
+            if chain.floor_rail.is_some() {
+                // Row 2: past the graze the ball rolls on the kept mate
+                // (extended) and the pad until its PAD contact reaches the
+                // pad's rail on the floor.  The pad is TANGENT to the floor
+                // along that rail, so neither the contact's height over the
+                // floor (a double root) nor the ball's tangency to the floor
+                // (identically true on the pad's linear extension past the
+                // rail) is transversal there; the contact's own PARAMETER on
+                // the pad is: it crosses the rail's iso-line at full speed.
+                let (floor_origin, floor_normal) = floor_plane.expect("a one-ended end has a planar floor");
+                let pad_contact = |ball: &Ball| if kept_is_first { ball.p2 } else { ball.p1 };
+                let floor_rail = chain.floor_rail.expect("checked");
+                let rail_iso = {
+                    let pad_face = face_by_id(ring, chain.pad)?;
+                    let coedge = pad_face.loops.iter().flat_map(|lp| &lp.coedges).find(|coedge| coedge.edge_id == floor_rail)
+                        .ok_or_else(|| KernelRefusal::internal(KernelStage::Classify, "one_ended_chain", "blend one-ended runout: the pad does not use its floor rail"))?;
+                    let [q0, q1] = coedge.pcurve.domain().or_refuse(KernelStage::Refine, "domain")?;
+                    let a = coedge.pcurve.evaluate(q0).or_refuse(KernelStage::Refine, "evaluate")?;
+                    let b = coedge.pcurve.evaluate(q1).or_refuse(KernelStage::Refine, "evaluate")?;
+                    if (a.x - b.x).abs() <= (a.y - b.y).abs() { (0usize, 0.5 * (a.x + b.x)) } else { (1usize, 0.5 * (a.y + b.y)) }
+                };
+                let pad_uv = |ball: &Ball| if kept_is_first { [ball.uv[2], ball.uv[3]] } else { [ball.uv[0], ball.uv[1]] };
+                let height = |t: f64, seed: [f64; 4]| -> Result<(f64, Ball), KernelRefusal> {
+                    let ball = solve_ball(middle_s1, middle_s2, middle_rho, seed, spine, t, scale)?;
+                    Ok((pad_uv(&ball)[rail_iso.0] - rail_iso.1, ball))
+                };
+                let chord = spine.curve.evaluate(spine.t1).or_refuse(KernelStage::Refine, "evaluate")?
+                    .sub(spine.curve.evaluate(spine.t0).or_refuse(KernelStage::Refine, "evaluate")?).length();
+                let speed = (chord / (spine.t1 - spine.t0).abs()).max(1e-300);
+                let direction = (vertex_t - t_mid).signum();
+                let t_far = t_a + direction * 4.0 * radius / speed;
+                let mut seed = middle_seed;
+                let (mut low, mut low_value) = (t_a, height(t_a, seed)?.0);
+                let mut bracket: Option<(f64, f64)> = None;
+                let mut hit: Option<(f64, Ball)> = None;
+                for sample in 1..=STOP_SAMPLES {
+                    let t = t_a + (t_far - t_a) * sample as f64 / STOP_SAMPLES as f64;
+                    let (value, ball) = height(t, seed)?;
+                    seed = ball.uv;
+                    if value.abs() <= exact {
+                        hit = Some((t, ball));
+                        break;
+                    }
+                    if value.signum() != low_value.signum() {
+                        bracket = Some((low, t));
+                        break;
+                    }
+                    low = t;
+                    low_value = value;
+                }
+                let (t_end, ball_end) = if let Some(hit) = hit {
+                    hit
+                } else {
+                    let (mut low, mut high) = bracket.ok_or_else(|| KernelRefusal::unsupported(KernelStage::Refine, ONE_ENDED_CONCAVE_THIRD_WHAT, format!(
+                        "blend one-ended runout (concave third): the pad contact on spine {spine_id} never reaches the floor {floor_id}'s plane within 4 r past the graze"
+                    )))?;
+                    let (mut low_value, mut ball_end) = height(low, seed)?;
+                    for _ in 0..BISECTIONS {
+                        let middle = 0.5 * (low + high);
+                        let (value, ball) = height(middle, seed)?;
+                        seed = ball.uv;
+                        if value.signum() == low_value.signum() {
+                            low = middle;
+                            low_value = value;
+                        } else {
+                            high = middle;
+                        }
+                        ball_end = ball;
+                    }
+                    (0.5 * (low + high), ball_end)
+                };
+                // Reported: the pad contact's distance off the floor's plane
+                // (zero at the rail).
+                report.station_b_residual[slot] = pad_contact(&ball_end).sub(floor_origin).dot(floor_normal).abs();
+                let end = make_station(middle_s1, middle_s2, middle_rho, ball_end.uv, spine, t_end)?;
+                if debug {
+                    eprintln!(
+                        "runout spine {spine_id} end {slot} (concave third): graze A t={t_a:.6} (pad residual {:.3e}), wall terminus t={t_end:.6} (pad contact {:.3e} off the floor's plane) centre ({:.6}, {:.6}, {:.6})",
+                        report.station_a_residual[slot], report.station_b_residual[slot], end.center.x, end.center.y, end.center.z
+                    );
+                }
+                Terminus::WallTrim { t_end, end }
+            } else {
             if !chain.third_convex {
                 return Err(KernelRefusal::unsupported(KernelStage::Classify, "one_ended_concave_third", format!(
                     "blend one-ended runout: the unselected edge {} at vertex {} is concave; the roll on the kept mate extended to the pad's far rail, trimmed by the floor, is not built here (the convex case ends at C5's extended edge with a cliff)",
@@ -1725,7 +2198,9 @@ fn build_runout_wall(
                 );
             }
             Terminus::Cliff { t_stop, stop }
+            }
         }
+        RingEnd::Open(_) => unreachable!("an open end was solved above"),
         };
         ends.push(EndSolve {
             t_a,
@@ -1782,9 +2257,11 @@ fn build_runout_wall(
                 StretchSpec { first: last.0, second: last.1, rho: last.2, seed: last.3, t_from: *t_b, t_to: *t_pole, pole: Some(*pole_station), seed_middle: false },
                 StretchSpec { first: end.middle.0, second: end.middle.1, rho: end.middle.2, seed: end.middle.3, t_from: end.t_a, t_to: *t_b, pole: None, seed_middle: false },
             ],
-            Terminus::Cliff { t_stop, .. } => vec![
-                StretchSpec { first: end.middle.0, second: end.middle.1, rho: end.middle.2, seed: end.middle.3, t_from: end.t_a, t_to: *t_stop, pole: None, seed_middle: false },
+            Terminus::Cliff { t_stop: t_to, .. } | Terminus::WallTrim { t_end: t_to, .. } => vec![
+                StretchSpec { first: end.middle.0, second: end.middle.1, rho: end.middle.2, seed: end.middle.3, t_from: end.t_a, t_to: *t_to, pole: None, seed_middle: false },
             ],
+            // An open end adds no stretch: the centre stretch reaches it.
+            Terminus::Open { .. } => Vec::new(),
         }
     };
     let mut specs: Vec<StretchSpec> = end_specs(&end0);
@@ -2064,14 +2541,24 @@ fn build_runout_wall(
     let pieces_cr = pieces_on(true);
     let pieces_cs = pieces_on(false);
     // A chain end adds a pad piece on both sides, a one-ended end on the
-    // replaced side only: the replaced side always has three pieces, the
-    // kept side one more than its chain ends.
-    let chain_ends = ring_ends.iter().filter(|end| matches!(end, RingEnd::Chain(_))).count();
-    let (kept_pieces, replaced_pieces) = if kept_is_first { (pieces_cr.len(), pieces_cs.len()) } else { (pieces_cs.len(), pieces_cr.len()) };
-    if replaced_pieces != 3 || kept_pieces != 1 + chain_ends {
+    // replaced side only, an open end on neither: the replaced side has one
+    // piece more than its runout ends, the kept side one more than its
+    // chain ends.
+    // Counted per side and per end (row 2: the ends may keep different
+    // mates): a side gains a piece at every non-open end where it is
+    // replaced, and at every chain end where it is kept.
+    let expected_pieces = |first_side: bool| -> usize {
+        1 + ring_ends.iter().enumerate().filter(|(slot, end)| {
+            let kept_here = end_kept_first[*slot] == first_side;
+            (!matches!(end, RingEnd::Open(_)) && !kept_here) || (matches!(end, RingEnd::Chain(_)) && kept_here)
+        }).count()
+    };
+    let (expected_cr, expected_cs) = (expected_pieces(true), expected_pieces(false));
+    if pieces_cr.len() != expected_cr || pieces_cs.len() != expected_cs {
+        let (kept_pieces, replaced_pieces) = if kept_is_first { (pieces_cr.len(), pieces_cs.len()) } else { (pieces_cs.len(), pieces_cr.len()) };
+        let (kept_expected, replaced_expected) = if kept_is_first { (expected_cr, expected_cs) } else { (expected_cs, expected_cr) };
         return Err(KernelRefusal::internal(KernelStage::Refine, "runout_pieces", format!(
-            "blend runout: spine {spine_id}'s rails split into {kept_pieces} kept-side and {replaced_pieces} replaced-side pieces ({} and three expected)",
-            1 + chain_ends
+            "blend runout: spine {spine_id}'s rails split into {kept_pieces} kept-side and {replaced_pieces} replaced-side pieces ({kept_expected} and {replaced_expected} expected)"
         )));
     }
 
@@ -2080,10 +2567,69 @@ fn build_runout_wall(
     // ring's pole for a chain end, two fresh vertices at the stop station's
     // contacts for a one-ended end.
     let mut end_vertices = [[0u64; 2]; 2];
+    // Row 2: at a wall-trim end the kept rail stops where it crosses the
+    // floor's plane (u_K on the kept row): (u_K, the trim's u at the pad
+    // contact) per slot.
+    let mut wall_trim_u: [Option<(f64, f64)>; 2] = [None, None];
+    for (slot, (ring_end, end)) in ring_ends.iter().zip([&end0, &end1]).enumerate() {
+        let (RingEnd::One(chain), Terminus::WallTrim { .. }) = (ring_end, &end.terminus) else { continue };
+        let kept_row = if end_kept_first[slot] { &rows.cr } else { &rows.cs };
+        let floor = face_by_id(ring, chain.floor)?;
+        let Some(crate::AnalyticSurface::Plane { origin, u_dir, v_dir, .. }) = floor.surface.analytic() else {
+            return Err(KernelRefusal::internal(KernelStage::Refine, "runout_wall_trim", "blend runout: a wall-trim floor is not planar"));
+        };
+        let normal = u_dir.cross(*v_dir).normalized().or_refuse(KernelStage::Refine, "normalized")?;
+        let height = |u: f64| -> Result<f64, KernelRefusal> {
+            Ok(kept_row.evaluate(u).or_refuse(KernelStage::Refine, "evaluate")?.sub(*origin).dot(normal))
+        };
+        // The end's own stretch, outermost first in parameter order.
+        let range = if slot == 0 { ranges[0] } else { ranges[ranges.len() - 1] };
+        let u_end = if slot == 0 { parameters[range[0]] } else { parameters[range[1]] };
+        let u_a = if slot == 0 { parameters[range[1]] } else { parameters[range[0]] };
+        // Walk from A toward the end until the kept contact's height changes
+        // sign, then bisect on the row itself.
+        let steps = 4 * (range[1] - range[0]).max(1);
+        let mut low = u_a;
+        let mut low_value = height(low)?;
+        let mut found = None;
+        for k in 1..=steps {
+            let u = u_a + (u_end - u_a) * k as f64 / steps as f64;
+            let value = height(u)?;
+            if value.signum() != low_value.signum() {
+                found = Some((low, u));
+                break;
+            }
+            low = u;
+            low_value = value;
+        }
+        let (mut low, mut high) = found.ok_or_else(|| KernelRefusal::unsupported(KernelStage::Refine, ONE_ENDED_CONCAVE_THIRD_WHAT, format!(
+            "blend one-ended runout (concave third): the kept rail of spine {spine_id} never crosses the floor {}'s plane before the terminus", chain.floor
+        )))?;
+        for _ in 0..BISECTIONS {
+            let middle = 0.5 * (low + high);
+            if height(middle)?.signum() == low_value.signum() {
+                low = middle;
+            } else {
+                high = middle;
+            }
+        }
+        wall_trim_u[slot] = Some((0.5 * (low + high), u_end));
+    }
     for (slot, (ring_end, end)) in ring_ends.iter().zip([&end0, &end1]).enumerate() {
         end_vertices[slot] = match (ring_end, &end.terminus) {
             (RingEnd::Chain(chain), _) => [chain.pole, chain.pole],
-            (RingEnd::One(_), Terminus::Cliff { stop, .. }) => {
+            (RingEnd::One(_), Terminus::WallTrim { end: station, .. }) => {
+                let kept_is_first = end_kept_first[slot];
+                let kept_row = if kept_is_first { &rows.cr } else { &rows.cs };
+                let (u_k, _) = wall_trim_u[slot].expect("solved above");
+                let k_point = kept_row.evaluate(u_k).or_refuse(KernelStage::Refine, "evaluate")?;
+                let pad_point = if kept_is_first { station.p2 } else { station.p1 };
+                let (k_id, p_id) = (take_id(), take_id());
+                result.vertices.push(VertexRecord { id: k_id, point: k_point });
+                result.vertices.push(VertexRecord { id: p_id, point: pad_point });
+                if kept_is_first { [k_id, p_id] } else { [p_id, k_id] }
+            }
+            (RingEnd::One(_), Terminus::Cliff { stop, .. }) | (RingEnd::Open(_), Terminus::Open { station: stop }) => {
                 let mut fresh = [0u64; 2];
                 for (side, point) in [stop.p1, stop.p2].into_iter().enumerate() {
                     let id = take_id();
@@ -2092,8 +2638,8 @@ fn build_runout_wall(
                 }
                 fresh
             }
-            (RingEnd::One(_), Terminus::Pole { .. }) => {
-                return Err(KernelRefusal::internal(KernelStage::Refine, "runout_terminus", "blend runout: a one-ended end solved a pole"));
+            _ => {
+                return Err(KernelRefusal::internal(KernelStage::Refine, "runout_terminus", "blend runout: an end's terminus does not match its ring end"));
             }
         };
     }
@@ -2157,26 +2703,56 @@ fn build_runout_wall(
         }
         Ok(out)
     };
-    let rails_cr = commit_pieces(&pieces_cr, true, result, take_id)?;
-    let rails_cs = commit_pieces(&pieces_cs, false, result, take_id)?;
-    // Which rail side runs on the kept mate (and hence on the pad_r pads)?
-    let (kept_rails, replaced_rails) = if kept_is_first { (&rails_cr, &rails_cs) } else { (&rails_cs, &rails_cr) };
+    let mut rails_cr = commit_pieces(&pieces_cr, true, result, take_id)?;
+    let mut rails_cs = commit_pieces(&pieces_cs, false, result, take_id)?;
+    // Row 2: a wall-trim end's kept rail stops at u_K (on the floor's plane):
+    // its edge range and its mate pcurve end there.
+    for slot in 0..2 {
+        let Some((u_k, _)) = wall_trim_u[slot] else { continue };
+        let kept_side = if end_kept_first[slot] { &mut rails_cr } else { &mut rails_cs };
+        let index = if slot == 0 { 0 } else { kept_side.len() - 1 };
+        let rail = &mut kept_side[index];
+        let (low, high) = rail.3.split(u_k).or_refuse(KernelStage::Refine, "split")?;
+        rail.3 = if slot == 0 { high } else { low };
+        let edge = result.edges.iter_mut().find(|edge| edge.id == rail.0).ok_or_else(|| KernelRefusal::internal(KernelStage::Sew, "runout_wall_trim", "blend runout: the kept rail is missing"))?;
+        if slot == 0 { edge.t0 = u_k; } else { edge.t1 = u_k; }
+    }
+    // Each end's rail pieces by side: an end's kept side runs on its kept
+    // mate (and so on its pad_r), its replaced side on its pad (row 2: the
+    // sides are per end).
+    let side_rails = |first_side: bool| if first_side { &rails_cr } else { &rails_cs };
+    let end_rail = |first_side: bool, slot: usize| {
+        let rails = side_rails(first_side);
+        if slot == 0 { rails[0].clone() } else { rails[rails.len() - 1].clone() }
+    };
     // Trim the pad rails at the switch vertices: a chain's roof rail at B
-    // and side rail at A; a one-ended end's side rail at A.
-    let kept_last = kept_rails.len() - 1;
-    let replaced_last = replaced_rails.len() - 1;
+    // and side rail at A; a one-ended end's side rail at A; an open end's
+    // two unselected edges at the section's contacts (first-mate side, then
+    // second-mate side).
     for (slot, ring_end) in ring_ends.iter().enumerate() {
-        let (b_vertex, a_vertex) = if slot == 0 {
-            (kept_rails[0].2, replaced_rails[0].2)
-        } else {
-            (kept_rails[kept_last].1, replaced_rails[replaced_last].1)
-        };
+        let kept_is_first = end_kept_first[slot];
+        let (kept_end, replaced_end) = (end_rail(kept_is_first, slot), end_rail(!kept_is_first, slot));
+        let (b_vertex, a_vertex) = if slot == 0 { (kept_end.2, replaced_end.2) } else { (kept_end.1, replaced_end.1) };
         let trims: Vec<(u64, u64, u64, usize)> = match ring_end {
             RingEnd::Chain(chain) => vec![
                 (chain.roof_rail, chain.mid_vertex, b_vertex, 0usize),
                 (chain.side_rail, chain.spine_vertex, a_vertex, 1usize),
             ],
-            RingEnd::One(chain) => vec![(chain.side_rail, chain.spine_vertex, a_vertex, 1usize)],
+            RingEnd::One(chain) => {
+                let mut trims = vec![(chain.side_rail, chain.spine_vertex, a_vertex, 1usize)];
+                // Row 2: the pad's floor rail at the terminus's pad contact
+                // and the unselected edge at K.
+                if let (Some(floor_rail), Some(_)) = (chain.floor_rail, wall_trim_u[slot]) {
+                    let side_of = |kept_side: bool| if kept_side == kept_is_first { 0 } else { 1 };
+                    trims.push((floor_rail, chain.mid_vertex, end_vertices[slot][side_of(false)], 2usize));
+                    trims.push((chain.e2, chain.mid_vertex, end_vertices[slot][side_of(true)], 2usize));
+                }
+                trims
+            }
+            RingEnd::Open(end) => vec![
+                (end.edge_first, end.spine_vertex, end_vertices[slot][0], 2usize),
+                (end.edge_second, end.spine_vertex, end_vertices[slot][1], 2usize),
+            ],
         };
         for (rail_id, old_vertex, new_vertex, which) in trims {
             let rail = edge_by_id(result, rail_id)?;
@@ -2187,7 +2763,7 @@ fn build_runout_wall(
                 let fraction = (projection.u - rail.t0) / (rail.t1 - rail.t0);
                 eprintln!(
                     "runout spine {spine_id} end {slot}: {} rail {rail_id} trimmed at fraction {fraction:.6} (vertex {new_vertex} {:.3e} off the rail)",
-                    if which == 0 { "roof" } else { "side" }, projection.distance
+                    ["roof", "side", "open-end"][which], projection.distance
                 );
             }
             trim_edge_at(result, rail_id, projection.u, old_vertex, new_vertex)?;
@@ -2216,6 +2792,7 @@ fn build_runout_wall(
     let pcurve_band = crate::KernelTolerances::for_solid(ring, 1e-7).pcurve_consistency;
     for (slot, (ring_end, end)) in ring_ends.iter().zip([&end0, &end1]).enumerate() {
         let (RingEnd::One(chain), Terminus::Cliff { stop, .. }) = (ring_end, &end.terminus) else { continue };
+        let (kept, kept_is_first) = (end_kept[slot], end_kept_first[slot]);
         let centre = stop.center;
         let x_axis = stop.p1.sub(centre).normalized().or_refuse(KernelStage::Refine, "normalized")?;
         let to_p2 = stop.p2.sub(centre);
@@ -2339,8 +2916,8 @@ fn build_runout_wall(
         // mate gains the segment with its rail pieces (spliced below with
         // the ridge run).  The cliff face: its arc coedge opposite to the
         // wall's, the other two chained by their vertices.
-        let k = if slot == 0 { 0 } else { replaced_last };
-        splice_loop(result, chain.pad, &[], Some((chain.e1, chain.side_rail)), &[(generator, generator_on_pad), (replaced_rails[k].0, replaced_rails[k].3.clone())], take_id)?;
+        let pad_piece = end_rail(!kept_is_first, slot);
+        splice_loop(result, chain.pad, &[], Some((chain.e1, chain.side_rail)), &[(generator, generator_on_pad), (pad_piece.0, pad_piece.3.clone())], take_id)?;
         cliffs[slot] = Some(CliffEdges { arc, generator, segment, q, plane });
         // Kept-mate pcurve of the segment, and the plane pcurves, are
         // carried into the splice and the face below.
@@ -2348,31 +2925,218 @@ fn build_runout_wall(
         cliff_planes.push((slot, arc_on_plane, generator_on_plane, segment_on_plane));
     }
 
+    // ---- The open ends: the section arc at the spine's vertex, exactly on
+    //      the ball, from the first-mate rail's end to the second's (v = 0
+    //      to v = 1 on the wall); the end face's loop gains it between the
+    //      two trimmed edges (an anchored empty run).  Its pcurve on the end
+    //      face maps the rational arc's control points through the plane's
+    //      affine inverse, exact for a rational arc. ----
+    let mut open_arcs: [Option<u64>; 2] = [None, None];
+    for (slot, (ring_end, end)) in ring_ends.iter().zip([&end0, &end1]).enumerate() {
+        let (RingEnd::Open(open), Terminus::Open { station }) = (ring_end, &end.terminus) else { continue };
+        let centre = station.center;
+        let x_axis = station.p1.sub(centre).normalized().or_refuse(KernelStage::Refine, "normalized")?;
+        let to_p2 = station.p2.sub(centre);
+        let plane_normal = x_axis.cross(to_p2).normalized().or_refuse(KernelStage::Refine, "normalized")?;
+        let y_axis = plane_normal.cross(x_axis).normalized().or_refuse(KernelStage::Refine, "normalized")?;
+        let angle = to_p2.dot(y_axis).atan2(to_p2.dot(x_axis));
+        let arc_curve = crate::make_arc(centre, x_axis, y_axis, radius, 0.0, angle).or_refuse(KernelStage::Refine, "make_arc")?;
+        let [arc_t0, arc_t1] = arc_curve.domain().or_refuse(KernelStage::Refine, "domain")?;
+        let arc = take_id();
+        result.edges.push(EdgeRecord { id: arc, curve: arc_curve.clone(), t0: arc_t0, t1: arc_t1, start_vertex_id: end_vertices[slot][0], end_vertex_id: end_vertices[slot][1], degenerate: false, name: None });
+        let end_face = face_by_id(ring, open.end_face)?;
+        let arc_on_face = {
+            let mut points = Vec::with_capacity(arc_curve.control_points.len());
+            for cp in &arc_curve.control_points {
+                let w = cp.w;
+                let projection = project_point_to_surface(&end_face.surface, Vec3::new(cp.x / w, cp.y / w, cp.z / w)).or_refuse(KernelStage::Refine, "project_point_to_surface")?;
+                points.push(Vec4 { x: projection.u * w, y: projection.v * w, z: 0.0, w });
+            }
+            NurbsCurve::new(arc_curve.degree, arc_curve.knots.clone(), points).or_refuse(KernelStage::Refine, "new")?
+        };
+        {
+            let mid_t = 0.5 * (arc_t0 + arc_t1);
+            let uv = arc_on_face.evaluate(mid_t).or_refuse(KernelStage::Refine, "evaluate")?;
+            let on_face = end_face.surface.evaluate(uv.x, uv.y).or_refuse(KernelStage::Refine, "evaluate")?;
+            let on_arc = arc_curve.evaluate(mid_t).or_refuse(KernelStage::Refine, "evaluate")?;
+            let miss = on_face.sub(on_arc).length();
+            if miss > pcurve_band {
+                return Err(KernelRefusal::unsupported(KernelStage::Refine, "open_end_oblique", format!(
+                    "blend one-ended runout: the open end's section arc on spine {spine_id} misses the end face {} by {miss:.3e} at its middle (band {pcurve_band:.1e})",
+                    open.end_face
+                )));
+            }
+        }
+        if debug {
+            eprintln!(
+                "runout spine {spine_id} end {slot} (open): section arc {arc} of angle {angle:.6} on end face {} between vertices {} and {}; edges {} and {} trimmed to them",
+                open.end_face, end_vertices[slot][0], end_vertices[slot][1], open.edge_first, open.edge_second
+            );
+        }
+        splice_loop(result, open.end_face, &[], Some((open.edge_first, open.edge_second)), &[(arc, arc_on_face)], take_id)?;
+        open_arcs[slot] = Some(arc);
+    }
+
+    // ---- Row 2: the wall-trim ends.  The wall ∩ the floor's plane from K
+    //      (the kept rail's end, v = the kept side) to the terminus's pad
+    //      contact (u_end, v = the pad side), traced on the FITTED wall: for
+    //      each u the v where the wall's section crosses the plane.  One knot
+    //      vector for the edge and both pcurves; the floor pcurve is the
+    //      plane's affine image of the edge's samples.  It goes into the
+    //      floor's loop between the trimmed unselected edge and the trimmed
+    //      floor rail, walked first-mate side to second-mate side as the
+    //      section arcs are. ----
+    let mut wall_trims: [Option<(u64, NurbsCurve)>; 2] = [None, None];
+    for (slot, ring_end) in ring_ends.iter().enumerate() {
+        let (RingEnd::One(chain), Some((u_k, u_end))) = (ring_end, wall_trim_u[slot]) else { continue };
+        let Some(floor_rail) = chain.floor_rail else { continue };
+        let kept_is_first = end_kept_first[slot];
+        let floor = face_by_id(ring, chain.floor)?;
+        let Some(crate::AnalyticSurface::Plane { origin, u_dir, v_dir, .. }) = floor.surface.analytic() else {
+            return Err(KernelRefusal::internal(KernelStage::Refine, "runout_wall_trim", "blend runout: a wall-trim floor is not planar"));
+        };
+        let normal = u_dir.cross(*v_dir).normalized().or_refuse(KernelStage::Refine, "normalized")?;
+        let (v_kept, v_pad) = if kept_is_first { (0.0, 1.0) } else { (1.0, 0.0) };
+        let wall_height = |u: f64, v: f64| -> Result<f64, KernelRefusal> {
+            Ok(rows.surface.evaluate(u, v).or_refuse(KernelStage::Refine, "evaluate")?.sub(*origin).dot(normal))
+        };
+        let crossing_v = |u: f64| -> Result<f64, KernelRefusal> {
+            let (mut low, mut high) = (v_kept, v_pad);
+            let low_value = wall_height(u, low)?;
+            let high_value = wall_height(u, high)?;
+            if low_value.signum() == high_value.signum() {
+                // At the ends the crossing IS an end of the section.
+                return Ok(if low_value.abs() <= high_value.abs() { v_kept } else { v_pad });
+            }
+            for _ in 0..BISECTIONS {
+                let middle = 0.5 * (low + high);
+                if wall_height(u, middle)?.signum() == low_value.signum() {
+                    low = middle;
+                } else {
+                    high = middle;
+                }
+            }
+            Ok(0.5 * (low + high))
+        };
+        let floor_uv = |point: Vec3| -> Result<Vec3, KernelRefusal> {
+            let projection = project_point_to_surface(&floor.surface, point).or_refuse(KernelStage::Refine, "project_point_to_surface")?;
+            Ok(Vec3::new(projection.u, projection.v, 0.0))
+        };
+        let pcurve_band = crate::KernelTolerances::for_solid(ring, 1e-7).intersection_fit;
+        let mut samples = 16usize;
+        let (curve, blend_pcurve, floor_pcurve) = loop {
+            // From K (u_k, v_kept) to the pad contact (u_end, v_pad), then
+            // ordered first-mate side (v = 0) to second (v = 1).
+            let mut uv: Vec<Vec3> = Vec::with_capacity(samples + 1);
+            for k in 0..=samples {
+                let fraction = k as f64 / samples as f64;
+                let u = u_k + (u_end - u_k) * fraction;
+                let v = if k == 0 { v_kept } else if k == samples { v_pad } else { crossing_v(u)? };
+                uv.push(Vec3::new(u, v, 0.0));
+            }
+            if v_kept > v_pad {
+                uv.reverse();
+            }
+            let points: Vec<Vec3> = uv.iter().map(|p| rows.surface.evaluate(p.x, p.y)).collect::<Result<_, _>>().or_refuse(KernelStage::Refine, "evaluate")?;
+            let parameters: Vec<f64> = (0..=samples).map(|k| k as f64 / samples as f64).collect();
+            let to4 = |values: &[Vec3]| -> Vec<Vec4> { values.iter().map(|p| Vec4::from_point(*p, 1.0)).collect() };
+            let floor_samples: Vec<Vec3> = points.iter().map(|p| floor_uv(*p)).collect::<Result<_, _>>()?;
+            let curve = crate::fit::interpolate_homogeneous(&to4(&points), 3, &parameters).or_refuse(KernelStage::Refine, "interpolate_homogeneous")?;
+            let blend_pcurve = crate::fit::interpolate_homogeneous(&to4(&uv), 3, &parameters).or_refuse(KernelStage::Refine, "interpolate_homogeneous")?;
+            let floor_pcurve = crate::fit::interpolate_homogeneous(&to4(&floor_samples), 3, &parameters).or_refuse(KernelStage::Refine, "interpolate_homogeneous")?;
+            // Read between the samples: the edge on the plane and on the
+            // wall, through its wall pcurve.
+            let mut worst: f64 = 0.0;
+            for k in 0..samples {
+                let z = (k as f64 + 0.5) / samples as f64;
+                let point = curve.evaluate(z).or_refuse(KernelStage::Refine, "evaluate")?;
+                let on_wall = blend_pcurve.evaluate(z).or_refuse(KernelStage::Refine, "evaluate")?;
+                let wall_point = rows.surface.evaluate(on_wall.x, on_wall.y).or_refuse(KernelStage::Refine, "evaluate")?;
+                worst = worst.max(point.sub(*origin).dot(normal).abs()).max(point.sub(wall_point).length());
+            }
+            if debug {
+                eprintln!("runout spine {spine_id} end {slot}: wall trim on floor {} at {samples} samples, u [{u_k:.6}, {u_end:.6}]: {worst:.3e} off the plane / its wall pcurve (bar {pcurve_band:.1e})", chain.floor);
+            }
+            if worst <= pcurve_band {
+                break (curve, blend_pcurve, floor_pcurve);
+            }
+            if samples >= 256 {
+                return Err(KernelRefusal::non_convergence(KernelStage::Refine, ONE_ENDED_CONCAVE_THIRD_WHAT, format!(
+                    "blend one-ended runout (concave third): the wall trim on floor {} stands {worst:.3e} off its surfaces at {samples} samples (bar {pcurve_band:.1e})", chain.floor
+                )));
+            }
+            samples *= 2;
+        };
+        let [t0, t1] = curve.domain().or_refuse(KernelStage::Refine, "domain")?;
+        let trim = take_id();
+        result.edges.push(EdgeRecord { id: trim, curve, t0, t1, start_vertex_id: end_vertices[slot][0], end_vertex_id: end_vertices[slot][1], degenerate: false, name: None });
+        splice_loop(result, chain.floor, &[], Some((chain.e2, floor_rail)), &[(trim, floor_pcurve)], take_id)?;
+        wall_trims[slot] = Some((trim, blend_pcurve));
+    }
+
     // The mate loops: each loses its run of ridge coedges and gains the rail
     // piece(s) that replace it.  (face, removed edges, inserted rail pieces)
-    let kept_centre = if matches!(ring_ends[0], RingEnd::Chain(_)) { 1 } else { 0 };
-    let mut kept_run: Vec<u64> = Vec::new();
-    if let RingEnd::Chain(chain) = &ring_ends[0] {
-        kept_run.push(chain.e1);
+    // Each mate face gets the centre piece of its own side: the piece after
+    // end 0's pad pieces on that side (row 2: per end, by the side's role
+    // there).
+    let centre_index = |first_side: bool| -> usize {
+        let kept_here = end_kept_first[0] == first_side;
+        match &ring_ends[0] {
+            RingEnd::Chain(_) => 1,
+            RingEnd::Open(_) => 0,
+            RingEnd::One(_) => usize::from(!kept_here),
+        }
+    };
+    let centre_piece = |first_side: bool| side_rails(first_side)[centre_index(first_side)].clone();
+    // The ridge edges each mate loses with the spine: a chain end's ridge
+    // edge, and (row 2) a wall-trim end's pad end arc, both on that END's
+    // kept mate.
+    let ridge_e1 = |slot: usize| -> Option<u64> {
+        match &ring_ends[slot] {
+            RingEnd::Chain(chain) => Some(chain.e1),
+            RingEnd::One(chain) if wall_trim_u[slot].is_some() => Some(chain.e1),
+            _ => None,
+        }
+    };
+    let mate_run = |mate: u64| -> Vec<u64> {
+        let mut run: Vec<u64> = Vec::new();
+        if end_kept[0] == mate {
+            run.extend(ridge_e1(0));
+        }
+        run.push(spine_id);
+        if end_kept[1] == mate {
+            run.extend(ridge_e1(1));
+        }
+        run
+    };
+    // `kept` (end 0's, or the only non-open end's) first, as before.
+    let mut splices: Vec<(u64, Vec<u64>, Vec<(u64, NurbsCurve)>)> = Vec::new();
+    for mate in [kept, if kept == first.face.id { second.face.id } else { first.face.id }] {
+        let first_side = mate == first.face.id;
+        let centre = centre_piece(first_side);
+        let mut inserted: Vec<(u64, NurbsCurve)> = vec![(centre.0, centre.3.clone())];
+        for (slot, segment, segment_on_kept) in &cliff_segments {
+            if end_kept[*slot] == mate {
+                inserted.push((*segment, segment_on_kept.clone()));
+            }
+        }
+        splices.push((mate, mate_run(mate), inserted));
     }
-    kept_run.push(spine_id);
-    if let RingEnd::Chain(chain) = &ring_ends[1] {
-        kept_run.push(chain.e1);
-    }
-    let mut kept_inserted: Vec<(u64, NurbsCurve)> = vec![(kept_rails[kept_centre].0, kept_rails[kept_centre].3.clone())];
-    for (_, segment, segment_on_kept) in &cliff_segments {
-        kept_inserted.push((*segment, segment_on_kept.clone()));
-    }
-    let mut splices: Vec<(u64, Vec<u64>, Vec<(u64, NurbsCurve)>)> = vec![
-        (kept, kept_run, kept_inserted),
-        (replaced, vec![spine_id], vec![(replaced_rails[1].0, replaced_rails[1].3.clone())]),
-    ];
     for (slot, ring_end) in ring_ends.iter().enumerate() {
         let RingEnd::Chain(chain) = ring_end else { continue };
-        let k = if slot == 0 { 0 } else { replaced_last };
-        let kk = if slot == 0 { 0 } else { kept_last };
-        splices.push((chain.pad_s, vec![chain.e1, chain.e2], vec![(replaced_rails[k].0, replaced_rails[k].3.clone())]));
-        splices.push((chain.pad_r, vec![chain.e2], vec![(kept_rails[kk].0, kept_rails[kk].3.clone())]));
+        let kept_is_first = end_kept_first[slot];
+        let (pad_s_piece, pad_r_piece) = (end_rail(!kept_is_first, slot), end_rail(kept_is_first, slot));
+        splices.push((chain.pad_s, vec![chain.e1, chain.e2], vec![(pad_s_piece.0, pad_s_piece.3.clone())]));
+        splices.push((chain.pad_r, vec![chain.e2], vec![(pad_r_piece.0, pad_r_piece.3.clone())]));
+    }
+    // Row 2: a wall-trim end's pad loses its end arc for its rail piece.
+    for (slot, ring_end) in ring_ends.iter().enumerate() {
+        let RingEnd::One(chain) = ring_end else { continue };
+        if wall_trim_u[slot].is_none() {
+            continue;
+        }
+        let pad_piece = end_rail(!end_kept_first[slot], slot);
+        splices.push((chain.pad, vec![chain.e1], vec![(pad_piece.0, pad_piece.3.clone())]));
     }
     // The wall's use of each rail edge: cr pieces walked forward exactly
     // when the blend loop's walk is station order (`build_open_surgery`).
@@ -2421,10 +3185,15 @@ fn build_runout_wall(
     // Delete the ridge edges: the spine, and a chain end's two chain edges
     // (a one-ended end's arc was trimmed, its unselected edge is untouched).
     let mut ridge: Vec<u64> = vec![spine_id];
-    for ring_end in &ring_ends {
+    for (slot, ring_end) in ring_ends.iter().enumerate() {
         if let RingEnd::Chain(chain) = ring_end {
             ridge.push(chain.e1);
             ridge.push(chain.e2);
+        }
+        if let RingEnd::One(chain) = ring_end {
+            if wall_trim_u[slot].is_some() {
+                ridge.push(chain.e1);
+            }
         }
     }
     result.edges.retain(|edge| !ridge.contains(&edge.id));
@@ -2451,8 +3220,14 @@ fn build_runout_wall(
                 });
                 pole_edges[slot] = id;
             }
+            RingEnd::One(_) if wall_trims[slot].is_some() => {
+                pole_edges[slot] = wall_trims[slot].as_ref().map(|(id, _)| *id).expect("checked");
+            }
             RingEnd::One(_) => {
                 pole_edges[slot] = cliffs[slot].as_ref().ok_or_else(|| KernelRefusal::internal(KernelStage::Sew, "runout_cliff", "blend runout: a one-ended end has no cliff"))?.arc;
+            }
+            RingEnd::Open(_) => {
+                pole_edges[slot] = open_arcs[slot].ok_or_else(|| KernelRefusal::internal(KernelStage::Sew, "runout_open_end", "blend runout: an open end has no section arc"))?;
             }
         }
     }
@@ -2477,6 +3252,11 @@ fn build_runout_wall(
     // v = 0 is its reverse.
     let pole_coedge = |slot: usize, from_v: f64, to_v: f64, take_id: &mut dyn FnMut() -> u64| -> Result<CoedgeRecord, KernelRefusal> {
         let forward = matches!(ring_ends[slot], RingEnd::Chain(_)) || from_v < to_v;
+        // Row 2: a wall trim's own pcurve on the wall (it runs v = 0 -> 1).
+        if let Some((_, pcurve)) = &wall_trims[slot] {
+            let pcurve = if forward { pcurve.clone() } else { pcurve.reversed().or_refuse(KernelStage::Refine, "reversed")? };
+            return Ok(CoedgeRecord { id: take_id(), edge_id: pole_edges[slot], forward, pcurve });
+        }
         Ok(CoedgeRecord { id: take_id(), edge_id: pole_edges[slot], forward, pcurve: line(u_pole[slot], from_v, u_pole[slot], to_v)? })
     };
     let mut coedges = Vec::new();
@@ -2508,7 +3288,7 @@ fn build_runout_wall(
         .position(|shell| shell.faces.iter().any(|face| face.id == kept))
         .ok_or(KernelRefusal::internal(KernelStage::Sew, "mate_shell", "blend runout: the kept mate's shell is missing"))?;
     let wall_arc_forward: Vec<(usize, bool)> = (0..2)
-        .filter(|slot| matches!(ring_ends[*slot], RingEnd::One(_)))
+        .filter(|slot| matches!(ring_ends[*slot], RingEnd::One(_) | RingEnd::Open(_)))
         .map(|slot| (slot, coedges.iter().find(|coedge| coedge.edge_id == pole_edges[slot]).map(|coedge| coedge.forward).unwrap_or(true)))
         .collect();
     result.shells[shell_index].faces.push(FaceRecord {

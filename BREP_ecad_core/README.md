@@ -60,7 +60,8 @@ With KiCad's `Device.kicad_sym` this prints `N$1: R1.1`, `N$2: R1.2, R2.2` and
 ## What is in it
 
 - `Document` / `DocumentKind` — one schematic or wiring-diagram sheet, and its
-  editing surface: `place`, `place_part`, `add_wire`, `connect`,
+  editing surface: `place_assembly_component` (the one door for a valued part: it
+  takes the assembly occurrence the component is), `place_power_symbol`, `add_wire`, `connect`,
   `set_reference`, `set_net_flag`, `refresh_part`. `History` records edits as
   undoable steps. `to_json` / `from_json` save and load it.
 - `Point` — integer micrometres, +Y **down** on a sheet, with quarter-turn

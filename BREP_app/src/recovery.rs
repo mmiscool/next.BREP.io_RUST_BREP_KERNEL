@@ -232,6 +232,7 @@ pub fn restore_entries(entries: &[RecoveryEntry], docs: &mut Documents) -> (usiz
     }
     if restored > 0 && pristine_seed {
         docs.close(0);
+        docs.renumber_untitled();
     }
     (restored, failures)
 }

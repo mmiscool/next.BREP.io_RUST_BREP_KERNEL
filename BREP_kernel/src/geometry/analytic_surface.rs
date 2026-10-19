@@ -148,10 +148,13 @@ mod recognition;
 mod intersect;
 #[path = "analytic_surface/revolution.rs"]
 mod revolution;
+#[path = "analytic_surface/canonical.rs"]
+mod canonical;
 
 pub use intersect::{intersect_analytic_pair, plane_ruled_section_arc};
 pub(crate) use intersect::{intersect_analytic_pair_with, ruled_gate, ruled_gate_census, RuledGate};
 pub use recognition::recognize;
+pub(crate) use canonical::{canonical_carriers_enabled, canonicalise_carriers, CanonicalReport, CanonicalRewrite};
 pub use revolution::{revolution_structure, RevolutionStructure};
 pub(crate) use revolution::circumcenter;
 use recognition::generatrix_is_meridional_half_ray;

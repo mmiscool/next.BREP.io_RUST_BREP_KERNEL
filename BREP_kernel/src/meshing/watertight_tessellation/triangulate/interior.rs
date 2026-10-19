@@ -381,7 +381,7 @@ pub(in crate::watertight_tessellation) fn refine_interior(
     // within the chord tolerance yet, so the accuracy guard has nothing to
     // protect here — and this is the largest candidate set the flipper ever
     // sees, so paying two surface evaluations per candidate is pure cost.
-    lawson_flips(vertices, triangles, boundary_pairs, scale);
+    let mut converged = lawson_flips(vertices, triangles, boundary_pairs, scale);
     // Midpoint and normal readings shared across the passes and with the
     // guarded flipper; vertices never move once placed.
     let mut memo = FaceMemo::default();
@@ -483,14 +483,19 @@ pub(in crate::watertight_tessellation) fn refine_interior(
             );
         }
         if splits.is_empty() {
-            lawson_flips_guarded_with_memo(
-                vertices,
-                triangles,
-                boundary_pairs,
-                scale,
-                Some((face, chord_tolerance, periodic)),
-                &mut memo,
-            );
+            // An unchanged mesh at an unguarded (or identical guarded) fixed
+            // point cannot gain an allowed flip from a stricter chord guard.
+            // A round-budget exit carries no certificate and still retries.
+            if !converged {
+                lawson_flips_guarded_with_memo(
+                    vertices,
+                    triangles,
+                    boundary_pairs,
+                    scale,
+                    Some((face, chord_tolerance, periodic)),
+                    &mut memo,
+                );
+            }
             return Ok(());
         }
         let mut next_triangles = Vec::with_capacity(triangles.len() + splits.len() * 2);
@@ -527,6 +532,16 @@ pub(in crate::watertight_tessellation) fn refine_interior(
         // diagonal that sags past the chord tolerance (see
         // `lawson_flips_guarded`), or this loop spends its passes re-splitting
         // what the previous round's flips lengthened.
+        converged = lawson_flips_guarded_with_memo(
+            vertices,
+            triangles,
+            boundary_pairs,
+            scale,
+            Some((face, chord_tolerance, periodic)),
+            &mut memo,
+        );
+    }
+    if !converged {
         lawson_flips_guarded_with_memo(
             vertices,
             triangles,
@@ -536,14 +551,6 @@ pub(in crate::watertight_tessellation) fn refine_interior(
             &mut memo,
         );
     }
-    lawson_flips_guarded_with_memo(
-        vertices,
-        triangles,
-        boundary_pairs,
-        scale,
-        Some((face, chord_tolerance, periodic)),
-        &mut memo,
-    );
     Ok(())
 }
 

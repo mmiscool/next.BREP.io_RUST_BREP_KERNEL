@@ -103,6 +103,13 @@ workflow purpose fields, file-store imports and schema upgrades are not supporte
   [`BREP_script_core`](https://crates.io/crates/BREP_script_core), with an
   in-browser editor and a test run. A directory of scripts can live in git.
 - **An audit log** of every committed change, written in the same transaction.
+- **WebMCP.** The page registers its API as tools on the browser's
+  [WebMCP](https://webmachinelearning.github.io/webmcp/) surface
+  (`document.modelContext`), so an agent built into the browser can search
+  and read parts, BOMs, reviews and the audit trail, create and change parts
+  and revisions, check out and in, submit and decide reviews, act on
+  workflows, and open pages of the app — as the signed-in user, refused by
+  the server exactly as the page would be. See the guide.
 - **Security.** PBKDF2 password verifiers, cookie sessions with CSRF tokens,
   scoped API tokens (`Authorization: Bearer plm_…`) for everything that is not a
   browser, a sign-in throttle, session limits, security headers, and optional

@@ -40,18 +40,53 @@ pub struct StoreArgs {
     pub name: String,
 }
 
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StoreWriteArgs {
+    /// The file's name, extension included. A model extension (`.nbrep`,
+    /// `.fbrep`, `.tbrep`) makes it a DOCUMENT of the store, listed by Open;
+    /// any other name is handed to the user as a file (a download in the
+    /// browser, a file in the app's models folder natively).
+    pub name: String,
+    /// The content, for a text file (a document, STEP, SVG, CSV, …).
+    #[serde(default)]
+    pub text: Option<String>,
+    /// The content, for a binary file (a GLB, a PDF, a zip), as base64.
+    #[serde(default)]
+    pub base64: Option<String>,
+    /// Replace a document that already exists; refused otherwise.
+    #[serde(default)]
+    pub overwrite: bool,
+}
+
+/// What `store_write` does with a name: keep it as one of the store's
+/// documents, or hand it to the user as a file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoreLane {
+    Document,
+    Export,
+}
+
+/// The lane a name takes — the store's own rule: a model extension is a
+/// document, everything else is a file for the user (an export never shows up
+/// in Open as if it were a part).
+pub fn store_lane(name: &str) -> StoreLane {
+    let ext = name.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase()).unwrap_or_default();
+    if crate::store::MODEL_EXTENSIONS.contains(&ext.as_str()) {
+        StoreLane::Document
+    } else {
+        StoreLane::Export
+    }
+}
+
 fn doc_new_of_class(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
     let a: NewArgs = parse_args(args)?;
     let class = DocumentClass::ALL
         .into_iter()
         .find(|class| class.slug() == a.class)
         .ok_or_else(|| format!("class `{}`: expected normal, family or template", a.class))?;
-    let mut engine = ctx.app.docs.spawn_engine();
-    let _ = engine.set_history_json(crate::document::EMPTY_DOCUMENT);
-    // Before `Document::new`, so the class is part of the clean baseline —
-    // what the toolbar's New menu does.
-    document_class::set_document_class(&mut engine, class);
-    let index = ctx.app.docs.open_document(crate::document::Document::new(engine));
+    let doc = crate::document::Document::fresh(ctx.app.docs.spawn_engine(), class);
+    let index = ctx.app.docs.open_document(doc);
     Ok(Outcome::Done(json!({ "index": index, "class": class.slug() })))
 }
 
@@ -150,12 +185,88 @@ fn store_document(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
     })))
 }
 
+fn store_list(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
+    let _: NoArgs = parse_args(args)?;
+    let (_, _, store) = ctx.app.file_docs_store();
+    Ok(Outcome::Done(json!({
+        "backend": store.backend_label(),
+        "names": store.list(),
+        "storeGeneration": store.mutation_generation(),
+    })))
+}
+
+fn store_read(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
+    let a: StoreArgs = parse_args(args)?;
+    let (_, _, store) = ctx.app.file_docs_store();
+    match store.read(&a.name) {
+        Some(text) => Ok(Outcome::Done(json!({ "name": a.name, "exists": true, "bytes": text.len(), "text": text }))),
+        None => Ok(Outcome::Done(json!({ "name": a.name, "exists": false }))),
+    }
+}
+
+fn store_write(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
+    let a: StoreWriteArgs = parse_args(args)?;
+    let (_, _, store) = ctx.app.file_docs_store();
+    let lane = store_lane(&a.name);
+    let (text, bytes) = match (a.text, a.base64) {
+        (Some(_), Some(_)) => return Err("give `text` or `base64`, not both".into()),
+        (Some(t), None) => (Some(t), None),
+        (None, Some(b)) => (None, Some(super::cmd_document::base64_decode(&b)?)),
+        (None, None) => return Err("missing the content: `text` or `base64`".into()),
+    };
+    let written = match lane {
+        StoreLane::Document => {
+            let text = match (text, bytes) {
+                (Some(t), _) => t,
+                (None, Some(b)) => String::from_utf8(b).map_err(|_| "a document is text; this base64 is not UTF-8".to_string())?,
+                (None, None) => unreachable!(),
+            };
+            if !a.overwrite && store.read(&a.name).is_some() {
+                return Err(format!("{} exists; pass overwrite: true", a.name));
+            }
+            let len = text.len();
+            store.write(&a.name, &text)?;
+            len
+        }
+        StoreLane::Export => match (text, bytes) {
+            (Some(t), _) => {
+                store.export_file_named(&a.name, &t)?;
+                t.len()
+            }
+            (None, Some(b)) => {
+                store.export_file_named_bytes(&a.name, &b)?;
+                b.len()
+            }
+            (None, None) => unreachable!(),
+        },
+    };
+    Ok(Outcome::Done(json!({
+        "name": a.name,
+        "bytes": written,
+        "lane": match lane { StoreLane::Document => "document", StoreLane::Export => "export" },
+        "storeGeneration": store.mutation_generation(),
+    })))
+}
+
+fn store_remove(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
+    let a: StoreArgs = parse_args(args)?;
+    let (_, _, store) = ctx.app.file_docs_store();
+    let existed = store.read(&a.name).is_some();
+    store.remove(&a.name)?;
+    Ok(Outcome::Done(json!({ "name": a.name, "existed": existed, "storeGeneration": store.mutation_generation() })))
+}
+
 pub static COMMANDS: &[CommandSpec] = &[
-    CommandSpec { name: "doc_new_of_class", group: "document", doc: "Open a new, empty document of a class — `normal` (a part), `family` (a family seed, `.fbrep`) or `template` (`.tbrep`) — as a tab and make it active: the toolbar's New menu. The class is in the document before it has a file.", phase: Phase::Mutate, annotations: Annotations::MUTATE, args_schema: schema_of::<NewArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(doc_new_of_class) },
+    CommandSpec { name: "doc_new_of_class", group: "document", doc: "Open a new document of a class — `normal` (a part), `family` (a family seed, `.fbrep`) or `template` (`.tbrep`) — as a tab and make it active: the toolbar's New menu. Parts start with a datum (D). The class is in the document before it has a file.", phase: Phase::Mutate, annotations: Annotations::MUTATE, args_schema: schema_of::<NewArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(doc_new_of_class) },
     CommandSpec { name: "family_generate", group: "document", doc: "Generate the ACTIVE family seed (.fbrep): write every table row as `<part number>.nbrep` beside the family file, the family's model with the row's values baked into its expressions and a `familySource` stamp. An unchanged row is skipped; a row that cannot be written is reported and the rest still generate. Returns each row's outcome, a summary, and `writes` — how many files the store actually wrote. The same Generate the table editor's button runs. On a PLM store (the family is a `part/…/rev/…` revision) the SERVER writes each member as a part, from the family's saved revision: the app builds and bakes every member first and sends the ones that build, each row's revision column is the revision written, and the rows come back written, skipped (unchanged) or failed with the server's sentence. A family with unsaved changes is refused there unless `save: true`.", phase: Phase::Mutate, annotations: Annotations::MUTATE, args_schema: schema_of::<GenerateArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(family_generate) },
     CommandSpec { name: "family_table_get", group: "document", doc: "The active document's class and its family table (`familyTable`; empty when it has none).", phase: Phase::Read, annotations: Annotations::READ, args_schema: schema_of::<NoArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(family_table_get) },
     CommandSpec { name: "family_table_set", group: "document", doc: "Replace the active family seed's table as one undoable edit. Refused on a document that is not a family.", phase: Phase::Mutate, annotations: Annotations::MUTATE_NOWAIT, args_schema: schema_of::<TableArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(family_table_set) },
     CommandSpec { name: "template_inputs_get", group: "document", doc: "The active document's class and its template input marks (`templateInputs`).", phase: Phase::Read, annotations: Annotations::READ, args_schema: schema_of::<NoArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(template_inputs_get) },
     CommandSpec { name: "template_inputs_set", group: "document", doc: "Replace the active template's input marks as one undoable edit (what the Expressions pane's Template inputs grid edits). Refused on a document that is not a template.", phase: Phase::Mutate, annotations: Annotations::MUTATE_NOWAIT, args_schema: schema_of::<InputsArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(template_inputs_set) },
     CommandSpec { name: "store_document", group: "document", doc: "Read one document back from the app's store: whether it exists, its class (by extension and by its own field), its expressions, part attributes, family or template stamp, a content hash, and the store's mutation generation (which every landed write moves by one).", phase: Phase::Read, annotations: Annotations::READ, args_schema: schema_of::<StoreArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(store_document) },
+    CommandSpec { name: "store_list", group: "document", doc: "The names of the documents in the app's store — what Open lists — with the store's label (a models folder natively, browser storage or a PLM server in the browser) and its mutation generation.", phase: Phase::Read, annotations: Annotations::READ, args_schema: schema_of::<NoArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(store_list) },
+    CommandSpec { name: "store_read", group: "document", doc: "One stored document's text by name (`exists: false` when there is none). This is the browser's `document_open` lane: the server reads the file, the page reads its store.", phase: Phase::Read, annotations: Annotations::READ, args_schema: schema_of::<StoreArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(store_read) },
+    CommandSpec { name: "store_write", group: "document", doc: "Write a file by name: a model extension (`.nbrep` / `.fbrep` / `.tbrep`) makes it a document of the store — refused if one exists unless `overwrite` — and any other name is handed to the user as a file (a browser download; the app's models folder natively), so an export never lands in Open as a part. `text` or `base64` carries the content. This is the browser's `document_save` / `document_export` lane.", phase: Phase::Mutate, annotations: Annotations::MUTATE_NOWAIT, args_schema: schema_of::<StoreWriteArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(store_write) },
+    CommandSpec { name: "store_remove", group: "document", doc: "Delete a stored document by name (`Ok` when it is already gone).", phase: Phase::Mutate, annotations: Annotations { read_only: false, destructive: true, idempotent: true, waits: false }, args_schema: schema_of::<StoreArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(store_remove) },
 ];
+

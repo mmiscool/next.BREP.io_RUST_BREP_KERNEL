@@ -2229,135 +2229,193 @@ pub fn fit_pcurve_on_surface_marched(
     surface: &NurbsSurface,
     curve: &NurbsCurve,
 ) -> Result<PcurveFit, String> {
-    let mut clock = SectionFitClock::new();
-    let global = fit_pcurve_on_surface(surface, curve)?;
-    if let Some(started) = clock.started { clock.global = started.elapsed(); }
-    if std::env::var("BREP_SECTION_PCURVE_MARCH").as_deref() == Ok("0") || surface.is_affine()? {
-        return Ok(global);
-    }
-    let [t0, t1] = curve.domain()?;
-    // A closed (ring) section has no distinct endpoints to anchor the march;
-    // leave it to the existing path (closed rings are handled elsewhere).
-    if curve.evaluate(t0)?.sub(curve.evaluate(t1)?).length() <= 1e-6 {
-        return Ok(global);
-    }
-    const SAMPLES: usize = 24;
-    let fractions: Vec<f64> = (0..=SAMPLES).map(|i| i as f64 / SAMPLES as f64).collect();
-    let edge: Vec<Vec3> = fractions
-        .iter()
-        .map(|fraction| curve.evaluate(t0 + (t1 - t0) * fraction))
-        .collect::<Result<Vec<_>, _>>()?;
-    let scale = 1.0 + curve.evaluate((t0 + t1) / 2.0)?.length();
-    let endpoint_tolerance = 1e-3 * scale;
-    let (first, first_distance) = invert_checked(surface, edge[0])?;
-    let (last, last_distance) = invert_checked(surface, edge[SAMPLES])?;
-    if first_distance > endpoint_tolerance || last_distance > endpoint_tolerance {
-        return Ok(global);
-    }
-    // The edge curve's distance from the surface at every station this chain
-    // inverts — on the MARCHED branch, which is the one being fitted.
-    let mut off_surface = first_distance.max(last_distance);
-    let ([u0, u1], [v0, v1]) = surface_domains(surface)?;
-    let u_span = (u1 - u0).abs().max(EPSILON);
-    let v_span = (v1 - v0).abs().max(EPSILON);
-    let (closed_u, closed_v) = surface_closedness(surface)?;
-    let norm_step = |a: [f64; 2], b: [f64; 2]| -> f64 {
-        let mut du = a[0] - b[0];
-        if closed_u {
-            while du > 0.5 * u_span {
-                du -= u_span;
-            }
-            while du < -0.5 * u_span {
-                du += u_span;
-            }
+    fn run(surface: &NurbsSurface, curve: &NurbsCurve, eager: bool) -> Result<PcurveFit, String> {
+        let mut clock = SectionFitClock::new();
+        // The global builder owns only scoped sample caches. Its fit/report is
+        // discarded on a successful seeded route; do that work on fallback only.
+        // Profile phase/sample lines for the discarded global fit disappear ON.
+        let mut fallback = || {
+            let started = clock.started.map(|_| web_time::Instant::now());
+            let fit = fit_pcurve_on_surface(surface, curve);
+            if let Some(started) = started { clock.global += started.elapsed(); }
+            fit
+        };
+        let global = if eager { Some(fallback()?) } else { None };
+        // The global builder's first fallible geometry read validates the
+        // curve domain. Preserve that error priority before the affine probe
+        // when the unused global fit is deferred (both inputs may be invalid).
+        if !eager { curve.domain()?; }
+        if std::env::var("BREP_SECTION_PCURVE_MARCH").as_deref() == Ok("0") || surface.is_affine()? {
+            return global.map_or_else(&mut fallback, Ok);
         }
-        let mut dv = a[1] - b[1];
-        if closed_v {
-            while dv > 0.5 * v_span {
-                dv -= v_span;
-            }
-            while dv < -0.5 * v_span {
-                dv += v_span;
-            }
+        let [t0, t1] = curve.domain()?;
+        // A closed (ring) section has no distinct endpoints to anchor the march;
+        // leave it to the existing path (closed rings are handled elsewhere).
+        if curve.evaluate(t0)?.sub(curve.evaluate(t1)?).length() <= 1e-6 {
+            return global.map_or_else(&mut fallback, Ok);
         }
-        ((du / u_span).powi(2) + (dv / v_span).powi(2)).sqrt()
+        const SAMPLES: usize = 24;
+        let fractions: Vec<f64> = (0..=SAMPLES).map(|i| i as f64 / SAMPLES as f64).collect();
+        let edge: Vec<Vec3> = fractions
+            .iter()
+            .map(|fraction| curve.evaluate(t0 + (t1 - t0) * fraction))
+            .collect::<Result<Vec<_>, _>>()?;
+        let scale = 1.0 + curve.evaluate((t0 + t1) / 2.0)?.length();
+        let endpoint_tolerance = 1e-3 * scale;
+        let (first, first_distance) = invert_checked(surface, edge[0])?;
+        let (last, last_distance) = invert_checked(surface, edge[SAMPLES])?;
+        if first_distance > endpoint_tolerance || last_distance > endpoint_tolerance {
+            return global.map_or_else(&mut fallback, Ok);
+        }
+        // The edge curve's distance from the surface at every station this chain
+        // inverts — on the MARCHED branch, which is the one being fitted.
+        let mut off_surface = first_distance.max(last_distance);
+        let ([u0, u1], [v0, v1]) = surface_domains(surface)?;
+        let u_span = (u1 - u0).abs().max(EPSILON);
+        let v_span = (v1 - v0).abs().max(EPSILON);
+        let (closed_u, closed_v) = surface_closedness(surface)?;
+        let norm_step = |a: [f64; 2], b: [f64; 2]| -> f64 {
+            let mut du = a[0] - b[0];
+            if closed_u {
+                while du > 0.5 * u_span {
+                    du -= u_span;
+                }
+                while du < -0.5 * u_span {
+                    du += u_span;
+                }
+            }
+            let mut dv = a[1] - b[1];
+            if closed_v {
+                while dv > 0.5 * v_span {
+                    dv -= v_span;
+                }
+                while dv < -0.5 * v_span {
+                    dv += v_span;
+                }
+            }
+            ((du / u_span).powi(2) + (dv / v_span).powi(2)).sqrt()
+        };
+        // Forward seeded march over the interior samples.
+        let mut raw = vec![first];
+        let mut previous = first;
+        for index in 1..SAMPLES {
+            let seeded =
+                crate::projection::project_point_to_surface_from_seed(surface, edge[index], previous)?;
+            let (_, global_distance) = invert_checked(surface, edge[index])?;
+            // The seeded footpoint must still sit on the surface — as tight as the
+            // fit band or the global answer already had it. If it fell off (the
+            // seed led Newton into a valley), abandon the march and keep global.
+            if seeded.distance > 4.0 * global_distance + endpoint_tolerance {
+                return global.map_or_else(&mut fallback, Ok);
+            }
+            off_surface = off_surface.max(seeded.distance);
+            previous = [seeded.u, seeded.v];
+            raw.push(previous);
+        }
+        raw.push(last);
+        // CLOSURE GATE: the last marched interior sample must be parameter-adjacent
+        // to the global far endpoint — the march stayed on ONE branch the whole way.
+        // Measure the endpoint gap against the chain's OWN median step so a genuine
+        // long edge is not rejected while a sheet-hop (which leaves a big gap to the
+        // endpoint) is.
+        let mut steps: Vec<f64> = (1..raw.len())
+            .map(|i| norm_step(raw[i], raw[i - 1]))
+            .collect();
+        let endpoint_gap = steps.pop().unwrap_or(0.0);
+        steps.sort_by(f64::total_cmp);
+        let median = steps
+            .get(steps.len() / 2)
+            .copied()
+            .unwrap_or(0.0)
+            .max(EPSILON);
+        if endpoint_gap > (4.0 * median).max(0.05) {
+            return global.map_or_else(&mut fallback, Ok);
+        }
+        // Build the interpolant from the marched samples, then refine — re-projecting
+        // each insert SEEDED from the interpolant (already on the marched branch), so
+        // a mid-refinement global inversion cannot re-alias onto the far sheet.
+        let mut parameters = fractions;
+        let (mut pcurve, excursion, distance) = build_interpolant(surface, &raw, &parameters)?;
+        let refinement_tolerance = PCURVE_REFINEMENT_TOLERANCE;
+        // Same classified exits and budget ladder as `fit_pcurve_on_surface`. A
+        // seeded insert always lands, so this loop cannot stall.
+        let refinement = refine_pcurve(
+            surface,
+            curve,
+            [t0, t1],
+            [u0, u1],
+            [v0, v1],
+            refinement_tolerance,
+            &[],
+            &mut parameters,
+            &mut raw,
+            &mut pcurve,
+            off_surface,
+            [excursion, distance],
+            |_fraction, seed, on_curve| {
+                let seeded = crate::projection::project_point_to_surface_from_seed(surface, on_curve, [seed.x, seed.y])?;
+                Ok((Some([seeded.u, seeded.v]), seeded.distance))
+            },
+        )?;
+        clock.seeded = true;
+        Ok(PcurveFit {
+            curve: pcurve,
+            report: PcurveFitReport {
+                residual: refinement.residual,
+                floor: refinement_tolerance,
+                samples: parameters.len(),
+                exit: refinement.exit,
+                off_surface: refinement.off_surface,
+                raised: refinement.raised,
+                clamped_excursion: refinement.clamped[0],
+                clamped_distance: refinement.clamped[1],
+            },
+        })
+    }
+
+    let mode = match std::env::var("BREP_PCURVE_LAZY_GLOBAL") {
+        Ok(mode) => mode,
+        Err(std::env::VarError::NotPresent) => "on".to_owned(),
+        Err(std::env::VarError::NotUnicode(_)) => String::new(),
     };
-    // Forward seeded march over the interior samples.
-    let mut raw = vec![first];
-    let mut previous = first;
-    for index in 1..SAMPLES {
-        let seeded =
-            crate::projection::project_point_to_surface_from_seed(surface, edge[index], previous)?;
-        let (_, global_distance) = invert_checked(surface, edge[index])?;
-        // The seeded footpoint must still sit on the surface — as tight as the
-        // fit band or the global answer already had it. If it fell off (the
-        // seed led Newton into a valley), abandon the march and keep global.
-        if seeded.distance > 4.0 * global_distance + endpoint_tolerance {
-            return Ok(global);
+    if mode != "check" {
+        return run(surface, curve, !matches!(mode.as_str(), "1" | "on"));
+    }
+    // Clone BEFORE eager evaluation: lazy must start with the same carrier
+    // cache state, rather than benefiting from eager's recognition/projection.
+    let lazy_surface = surface.clone();
+    let lazy_curve = curve.clone();
+    let eager = run(surface, curve, true);
+    let lazy = run(&lazy_surface, &lazy_curve, false);
+    let identical = match (&eager, &lazy) {
+        (Ok(a), Ok(b)) => {
+            a.curve.degree == b.curve.degree
+                && a.curve.knots.len() == b.curve.knots.len()
+                && a.curve.knots.iter().zip(&b.curve.knots).all(|(a,b)| a.to_bits() == b.to_bits())
+                && a.curve.control_points.len() == b.curve.control_points.len()
+                && a.curve.control_points.iter().zip(&b.curve.control_points).all(|(a,b)| {
+                    [a.x.to_bits(),a.y.to_bits(),a.z.to_bits(),a.w.to_bits()]
+                        == [b.x.to_bits(),b.y.to_bits(),b.z.to_bits(),b.w.to_bits()]
+                })
+                && a.report == b.report
+                && [a.report.residual, a.report.floor, a.report.off_surface,
+                    a.report.clamped_excursion, a.report.clamped_distance].map(f64::to_bits)
+                    == [b.report.residual, b.report.floor, b.report.off_surface,
+                        b.report.clamped_excursion, b.report.clamped_distance].map(f64::to_bits)
         }
-        off_surface = off_surface.max(seeded.distance);
-        previous = [seeded.u, seeded.v];
-        raw.push(previous);
+        (Err(a), Err(b)) => a == b,
+        _ => false,
+    };
+    if let Ok(path) = std::env::var("BREP_PCURVE_LAZY_GLOBAL_CENSUS") {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new().create(true).append(true).open(path)
+            .expect("open lazy-global differential ledger");
+        writeln!(file, "pcurve.lazy_global identical={identical} eager_ok={} lazy_ok={} degree={} controls={}",
+            eager.is_ok(), lazy.is_ok(), curve.degree, curve.control_points.len())
+            .expect("append lazy-global differential ledger");
     }
-    raw.push(last);
-    // CLOSURE GATE: the last marched interior sample must be parameter-adjacent
-    // to the global far endpoint — the march stayed on ONE branch the whole way.
-    // Measure the endpoint gap against the chain's OWN median step so a genuine
-    // long edge is not rejected while a sheet-hop (which leaves a big gap to the
-    // endpoint) is.
-    let mut steps: Vec<f64> = (1..raw.len())
-        .map(|i| norm_step(raw[i], raw[i - 1]))
-        .collect();
-    let endpoint_gap = steps.pop().unwrap_or(0.0);
-    steps.sort_by(f64::total_cmp);
-    let median = steps
-        .get(steps.len() / 2)
-        .copied()
-        .unwrap_or(0.0)
-        .max(EPSILON);
-    if endpoint_gap > (4.0 * median).max(0.05) {
-        return Ok(global);
-    }
-    // Build the interpolant from the marched samples, then refine — re-projecting
-    // each insert SEEDED from the interpolant (already on the marched branch), so
-    // a mid-refinement global inversion cannot re-alias onto the far sheet.
-    let mut parameters = fractions;
-    let (mut pcurve, excursion, distance) = build_interpolant(surface, &raw, &parameters)?;
-    let refinement_tolerance = PCURVE_REFINEMENT_TOLERANCE;
-    // Same classified exits and budget ladder as `fit_pcurve_on_surface`. A
-    // seeded insert always lands, so this loop cannot stall.
-    let refinement = refine_pcurve(
-        surface,
-        curve,
-        [t0, t1],
-        [u0, u1],
-        [v0, v1],
-        refinement_tolerance,
-        &[],
-        &mut parameters,
-        &mut raw,
-        &mut pcurve,
-        off_surface,
-        [excursion, distance],
-        |_fraction, seed, on_curve| {
-            let seeded = crate::projection::project_point_to_surface_from_seed(surface, on_curve, [seed.x, seed.y])?;
-            Ok((Some([seeded.u, seeded.v]), seeded.distance))
-        },
-    )?;
-    clock.seeded = true;
-    Ok(PcurveFit {
-        curve: pcurve,
-        report: PcurveFitReport {
-            residual: refinement.residual,
-            floor: refinement_tolerance,
-            samples: parameters.len(),
-            exit: refinement.exit,
-            off_surface: refinement.off_surface,
-            raised: refinement.raised,
-            clamped_excursion: refinement.clamped[0],
-            clamped_distance: refinement.clamped[1],
-        },
-    })
+    assert!(identical, "lazy global pcurve fallback changed the curve, report or error");
+    eager
 }
 
 /// [`fit_pcurve_on_surface_marched`] for the callers that only need the curve;

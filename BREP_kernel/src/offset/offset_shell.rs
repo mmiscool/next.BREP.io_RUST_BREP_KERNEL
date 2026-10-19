@@ -92,6 +92,8 @@ mod acceptance;
 mod profile;
 #[path = "offset_shell/solid.rs"]
 mod solid;
+#[path = "offset_shell/joint_offset.rs"]
+mod joint_offset;
 #[path = "offset_shell/refusals.rs"]
 mod refusals;
 

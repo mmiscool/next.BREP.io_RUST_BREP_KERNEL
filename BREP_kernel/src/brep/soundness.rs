@@ -134,6 +134,29 @@ use web_time::Instant;
 #[path = "soundness/sphere_certificate.rs"]
 mod sphere_certificate;
 
+#[path = "soundness/nurbs_certificate.rs"]
+mod nurbs_certificate;
+
+#[path = "soundness/census.rs"]
+pub(crate) mod census;
+#[path = "soundness/pair_certificate.rs"]
+mod pair_certificate;
+#[path = "soundness/pair_memo.rs"]
+pub(crate) mod pair_memo;
+#[path = "soundness/fold_memo.rs"]
+pub(crate) mod fold_memo;
+#[path = "soundness/analytic_body.rs"]
+mod analytic_body;
+#[path = "soundness/tube_grid.rs"]
+mod tube_grid;
+#[path = "soundness/resolve.rs"]
+pub(crate) mod resolve;
+pub use resolve::{CrossingUndecidedCause, UndecidedCrossing};
+#[path = "soundness/blend_patch.rs"]
+mod blend_patch;
+#[path = "soundness/blend_curved.rs"]
+mod blend_curved;
+
 // ---------------------------------------------------------------------------
 // Disjoint set — shared by the shell and the vertex-fan scans
 // ---------------------------------------------------------------------------
@@ -604,9 +627,43 @@ pub struct FaceFold {
     pub normal_angle: f64,
 }
 
+/// Separating support of one omitted distinct-face pair. Bounds are signed
+/// coordinates on the named world axis; no adjacency inference is involved.
+#[derive(Clone, Debug, Serialize)]
+pub struct CertifiedFacePair {
+    pub faces: [u64; 2],
+    pub rule: &'static str,
+    pub axis: usize,
+    pub bounds: [[f64; 2]; 2],
+}
+
+/// Explicit scope of an opt-in analytic pair scan. Original counters describe
+/// only examined pairs. Same-face fold work is retained in this first row.
+#[derive(Clone, Debug, Serialize)]
+pub struct CertificateScope {
+    pub examined_face_pairs: usize,
+    pub certified_face_pairs: usize,
+    pub omitted_faces: usize,
+    pub skipped_candidate_pairs: usize,
+    pub retained_fold_faces: usize,
+    pub faces_in_uncertified_pairs: usize,
+    pub triangles_in_uncertified_pairs: usize,
+    pub retained_triangles: usize,
+}
+
 /// Outcome of [`solid_self_intersections`].
 #[derive(Clone, Debug, Serialize)]
 pub struct SelfIntersectionReport {
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub certified_pairs: Vec<CertifiedFacePair>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skipped_by_certificate: Option<CertificateScope>,
+    /// The whole-body proof that stood in for the scan, when one did: the
+    /// counters below then read zero because no mesh was built, and this names
+    /// why, so a caller can still tell a proved-clean body from a scan that
+    /// never ran.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub certificate: Option<&'static str>,
     pub triangles: usize,
     /// Triangle pairs whose boxes overlapped and that survived the welded-
     /// vertex skip — the work the exact confirmation was offered.
@@ -618,9 +675,21 @@ pub struct SelfIntersectionReport {
     /// tangent neighbours and chord error. A large number here beside zero
     /// confirmations is the detector working, not failing.
     pub rejected: usize,
-    /// Mesh crossings whose confirmation could not be evaluated (projection or
-    /// normal failed). Never counted as either verdict.
+    /// Mesh crossings whose confirmation could not be evaluated (the witness
+    /// is not a point both faces own, or a projection or a normal failed) and
+    /// that the carriers did not settle either when asked again on their exact
+    /// geometry (`resolve.rs`). Never counted as either verdict; a caller that
+    /// accepts a body must not read zero `confirmed` beside a nonzero count
+    /// here as clean.
     pub undecided: usize,
+    /// The first [`MAX_LISTED_UNDECIDED`] of those, with their faces and cause.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub undecided_pairs: Vec<UndecidedCrossing>,
+    /// Candidates the mesh confirmation left undecided that the carriers then
+    /// CLEARED: every point of the carriers' common curve near the crossing
+    /// lies on an edge both faces share, or outside a trim.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub resolved_clear: usize,
     /// Mesh crossings between two triangles of ONE face: the candidates the
     /// fold confirmation was offered. A candidate is not a defect — a sharply
     /// curved face's chords cross each other without the face folding.
@@ -753,22 +822,70 @@ pub fn solid_self_intersections(
     options: SelfIntersectionOptions,
 ) -> Result<SelfIntersectionReport, String> {
     let started = scan_profile_enabled().then(Instant::now);
+    // First, because it declines in microseconds where the NURBS certificate
+    // validates the whole body. Every certificate returns this same empty
+    // report, so the order changes only what a scan costs.
+    if analytic_body::enabled() && analytic_body::certifies(solid, options) {
+        if let Some(started) = started {
+            eprintln!("soundness.profile ms={:.2} faces={} certificate=analytic_plane_cylinder triangles=0 confirmed=0 folds=0", started.elapsed().as_secs_f64()*1000.0, solid.shells.iter().map(|shell| shell.faces.len()).sum::<usize>());
+        }
+        return Ok(SelfIntersectionReport {
+            certificate: Some("analytic_plane_cylinder"),
+            ..empty_intersection_report(options)
+        });
+    }
+    if tube_grid::enabled() && tube_grid::certifies(solid, options) {
+        if let Some(started) = started {
+            eprintln!("soundness.profile ms={:.2} faces={} certificate=tube_grid triangles=0 confirmed=0 folds=0", started.elapsed().as_secs_f64()*1000.0, solid.shells.iter().map(|shell| shell.faces.len()).sum::<usize>());
+        }
+        return Ok(SelfIntersectionReport {
+            certificate: Some("tube_grid"),
+            ..empty_intersection_report(options)
+        });
+    }
+    if blend_patch::enabled() && blend_patch::certifies(solid, options) {
+        if let Some(started) = started {
+            eprintln!("soundness.profile ms={:.2} faces={} certificate=analytic_blend triangles=0 confirmed=0 folds=0", started.elapsed().as_secs_f64()*1000.0, solid.shells.iter().map(|shell| shell.faces.len()).sum::<usize>());
+        }
+        return Ok(SelfIntersectionReport {
+            certificate: Some("analytic_blend"),
+            ..empty_intersection_report(options)
+        });
+    }
     if sphere_certificate::enabled() && sphere_certificate::certifies(solid, options) {
         if let Some(started) = started {
             eprintln!("soundness.profile ms={:.2} faces={} certificate=native_trimmed_spheres triangles=0 confirmed=0 folds=0", started.elapsed().as_secs_f64()*1000.0, solid.shells[0].faces.len());
         }
         return Ok(empty_intersection_report(options));
     }
+    if nurbs_certificate::enabled() && nurbs_certificate::certifies(solid, options) {
+        if let Some(started) = started {
+            eprintln!("soundness.profile ms={:.2} faces={} certificate=native_nurbs_horizontal_sections triangles=0 confirmed=0 folds=0", started.elapsed().as_secs_f64()*1000.0, solid.shells[0].faces.len());
+        }
+        return Ok(empty_intersection_report(options));
+    }
     solid_self_intersections_full(solid, options)
 }
 
+fn is_zero(value: &usize) -> bool {
+    *value == 0
+}
+
+/// How many undecided candidates a report lists by name.
+pub const MAX_LISTED_UNDECIDED: usize = 16;
+
 fn empty_intersection_report(options: SelfIntersectionOptions) -> SelfIntersectionReport {
     SelfIntersectionReport {
+        certified_pairs: Vec::new(),
+        skipped_by_certificate: None,
+        certificate: None,
         triangles: 0,
         candidate_pairs: 0,
         confirmed: Vec::new(),
         rejected: 0,
         undecided: 0,
+        undecided_pairs: Vec::new(),
+        resolved_clear: 0,
         same_face_candidates: 0,
         folds: Vec::new(),
         fold_rejected: 0,
@@ -778,9 +895,91 @@ fn empty_intersection_report(options: SelfIntersectionOptions) -> SelfIntersecti
     }
 }
 
+/// Ask the carriers about every candidate the mesh confirmation left
+/// undecided (`resolve.rs`), within its budget. Skipped when a crossing is
+/// already confirmed (the body is flagged either way) or the trim switches are
+/// off; what stays undecided is counted and the first few are named.
+fn resolve_pending(
+    solid: &BrepSolid,
+    faces: &[&crate::topology::FaceRecord],
+    pending: Vec<(usize, usize, CrossingUndecidedCause, Vec3, Vec3)>,
+    options: SelfIntersectionOptions,
+    best: &mut HashMap<(u64, u64), FaceCrossing>,
+    report: &mut SelfIntersectionReport,
+) {
+    let mut attempt = resolve::enabled() && best.is_empty() && trim_samples_enabled() && node_membership_enabled();
+    let curves: HashMap<u64, &NurbsCurve> = solid.edges.iter().map(|edge| (edge.id, &edge.curve)).collect();
+    let ends: HashMap<u64, [u64; 2]> = solid.edges.iter().map(|edge| (edge.id, [edge.start_vertex_id, edge.end_vertex_id])).collect();
+    let points: HashMap<u64, Vec3> = solid.vertices.iter().map(|vertex| (vertex.id, vertex.point)).collect();
+    let edges_of = |face: &crate::topology::FaceRecord| -> HashSet<u64> {
+        face.loops.iter().flat_map(|l| &l.coedges).map(|coedge| coedge.edge_id).collect()
+    };
+    for (index, (first, second, cause, start, end)) in pending.into_iter().enumerate() {
+        let (face_a, face_b) = (faces.get(first), faces.get(second));
+        let id = |face: Option<&&crate::topology::FaceRecord>| face.map_or(u64::MAX, |f| f.id);
+        let resolution = match (face_a, face_b) {
+            (Some(a), Some(b)) if attempt && index < resolve::MAX_RESOLVED => {
+                let shared_ids: Vec<u64> = edges_of(a).intersection(&edges_of(b)).copied().collect();
+                let shared: Vec<&NurbsCurve> = shared_ids.iter().filter_map(|edge| curves.get(edge).copied()).collect();
+                let vertices_of = |edges: &HashSet<u64>| -> HashSet<u64> { edges.iter().filter_map(|e| ends.get(e)).flatten().copied().collect() };
+                let corners: Vec<Vec3> = vertices_of(&edges_of(a)).intersection(&vertices_of(&edges_of(b))).filter_map(|v| points.get(v).copied()).collect();
+                resolve::resolve(a, b, &shared, &corners, (start, end), options)
+            }
+            _ => resolve::Resolution::Undecided,
+        };
+        match resolution {
+            resolve::Resolution::Crossing { point, straddle } => {
+                let (a, b) = (face_a.expect("resolved faces"), face_b.expect("resolved faces"));
+                let (lo, hi) = if a.id <= b.id { (a, b) } else { (b, a) };
+                let crossing = FaceCrossing {
+                    face_a: lo.id,
+                    face_b: hi.id,
+                    name_a: lo.name.clone(),
+                    name_b: hi.name.clone(),
+                    point,
+                    crossing_length: end.sub(start).length(),
+                    straddle,
+                    confirmation: CrossingConfirmation::Resolved,
+                    penetration: 0.0,
+                };
+                let slot = best.entry((lo.id, hi.id)).or_insert_with(|| crossing.clone());
+                if crossing.straddle > slot.straddle {
+                    *slot = crossing;
+                }
+                // Flagged now: the rest need not be asked.
+                attempt = false;
+            }
+            resolve::Resolution::Clear => report.resolved_clear += 1,
+            resolve::Resolution::Undecided => {
+                report.undecided += 1;
+                if report.undecided_pairs.len() < MAX_LISTED_UNDECIDED {
+                    report.undecided_pairs.push(UndecidedCrossing { face_a: id(face_a), face_b: id(face_b), cause, point: start.add(end).scale(0.5) });
+                }
+            }
+        }
+    }
+}
+
 fn solid_self_intersections_full(
     solid: &BrepSolid,
     options: SelfIntersectionOptions,
+) -> Result<SelfIntersectionReport, String> {
+    solid_self_intersections_with_census(solid, options, census::enabled())
+}
+
+fn solid_self_intersections_with_census(
+    solid: &BrepSolid,
+    options: SelfIntersectionOptions,
+    collect_census: bool,
+) -> Result<SelfIntersectionReport, String> {
+    solid_self_intersections_with_pair_certificates(solid, options, collect_census, pair_certificate::enabled())
+}
+
+fn solid_self_intersections_with_pair_certificates(
+    solid: &BrepSolid,
+    options: SelfIntersectionOptions,
+    collect_census: bool,
+    certify_pairs: bool,
 ) -> Result<SelfIntersectionReport, String> {
     let mut report = empty_intersection_report(options);
     if !(options.chord_tolerance > 0.0) || !options.chord_tolerance.is_finite() {
@@ -795,11 +994,8 @@ fn solid_self_intersections_full(
     // the latter runs a coherent-orientation pass and a mesh validation that
     // can fail on exactly the broken solids this detector exists to inspect,
     // and winding is irrelevant to a crossing test.
-    let mesh = crate::watertight_tessellation::tessellate_brep_watertight_face_stride(
-        solid,
-        options.chord_tolerance,
-        1,
-        0,
+    let (mesh, face_keys) = crate::watertight_tessellation::tessellate_brep_watertight_face_stride_keyed(
+        solid, options.chord_tolerance, 1, 0,
     )?;
     let tessellate_ms = stage_ms(profile);
     let triangle_count = mesh.indices.len() / 3;
@@ -820,6 +1016,10 @@ fn solid_self_intersections_full(
         .flat_map(|shell| shell.faces.iter())
         .collect();
 
+    let mut census = collect_census.then(|| {
+        let ids: Vec<_> = mesh.face_ids.iter().map(|&index| faces[index as usize].id).collect();
+        census::ScanCensus::new(&ids)
+    });
     let point_of = |index: u32| -> Vec3 {
         let base = index as usize * 3;
         Vec3::new(
@@ -850,8 +1050,24 @@ fn solid_self_intersections_full(
         boxes.push(Aabb::from_points(points));
         corners.push(points);
     }
+    let mut certificates = (certify_pairs && trim_samples_enabled() && node_membership_enabled()
+        && faces.len() <= 256
+        && options.straddle_band.is_finite() && options.straddle_band > 0.
+        && options.min_crossing_length.is_finite() && options.min_crossing_length > 0.
+    ).then(|| pair_certificate::Plan::new(solid, &faces, &corners, &mesh.face_ids));
     let bvh = Bvh::build(&boxes);
     let bvh_ms = stage_ms(bvh_started);
+    // The face-pair memo (`pair_memo.rs`): a pair of fragments the sweep
+    // read clean under these bands skips its triangle crossing tests; every
+    // count the report carries is kept. Off while the census collects (its
+    // tallies read every candidate) and when the mesh's face keys are not
+    // the faces' (a stride other than 1 never reaches here).
+    let pair_memo = pair_memo::enabled() && !collect_census && face_keys.len() == faces.len();
+    let pair_options = pair_memo::options_key(options.chord_tolerance, options.weld, options.min_crossing_length);
+    // Per unordered face pair: 0 untouched, 1 swept clean so far, 2 served
+    // from the memo, 3 crossed in the mesh.
+    let face_count = faces.len();
+    let mut pair_state: Vec<u8> = if pair_memo { vec![0u8; face_count * face_count] } else { Vec::new() };
     let sweep_started = scan_profile_enabled().then(Instant::now);
     let mut overlaps: u64 = 0;
     let mut crossings: u64 = 0;
@@ -863,6 +1079,9 @@ fn solid_self_intersections_full(
     let mut folded: HashMap<u64, FaceFold> = HashMap::default();
     // Same-face mesh crossings, per face index, as `(crossing length, point)`.
     let mut same_face: HashMap<usize, Vec<(f64, Vec3)>> = HashMap::default();
+    // Candidates the mesh confirmation could not decide, asked of the carriers
+    // after the sweep: `(face index, face index, cause, crossing segment)`.
+    let mut pending: Vec<(usize, usize, CrossingUndecidedCause, Vec3, Vec3)> = Vec::new();
     let mut hits = Vec::new();
     for first in 0..triangle_count {
         hits.clear();
@@ -872,6 +1091,7 @@ fn solid_self_intersections_full(
                 continue;
             }
             overlaps += 1;
+            if let Some(census) = &mut census { census.pair(first, second, false); }
             let shares_vertex = (0..3).any(|a| {
                 let wa = welded[mesh.indices[first * 3 + a] as usize];
                 (0..3).any(|b| wa == welded[mesh.indices[second * 3 + b] as usize])
@@ -879,8 +1099,31 @@ fn solid_self_intersections_full(
             if shares_vertex {
                 continue;
             }
+            if let Some(plan) = &mut certificates {
+                if plan.skips(mesh.face_ids[first], mesh.face_ids[second]) {
+                    plan.scope.skipped_candidate_pairs += 1;
+                    continue;
+                }
+            }
             report.candidate_pairs += 1;
-            let Some((start, end)) = triangle_crossing(&corners[first], &corners[second]) else {
+            if let Some(census) = &mut census { census.pair(first, second, true); }
+            if pair_memo {
+                let (fa, fb) = (mesh.face_ids[first] as usize, mesh.face_ids[second] as usize);
+                let slot = fa.min(fb) * face_count + fa.max(fb);
+                match pair_state[slot] {
+                    2 => continue,
+                    0 => {
+                        let served = pair_memo::contains(pair_memo::pair_key(pair_options, face_keys[fa], face_keys[fb]));
+                        pair_state[slot] = if served { 2 } else { 1 };
+                        if served {
+                            continue;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let segment = triangle_crossing(&corners[first], &corners[second]);
+            let Some((start, end)) = segment else {
                 continue;
             };
             let length = end.sub(start).length();
@@ -891,6 +1134,9 @@ fn solid_self_intersections_full(
             let confirm_started = scan_profile_enabled().then(Instant::now);
             let face_first = mesh.face_ids[first] as usize;
             let face_second = mesh.face_ids[second] as usize;
+            if pair_memo {
+                pair_state[face_first.min(face_second) * face_count + face_first.max(face_second)] = 3;
+            }
             if face_first == face_second {
                 report.same_face_candidates += 1;
                 // Confirmed in a SECOND pass, per face: the fold test needs a
@@ -905,7 +1151,7 @@ fn solid_self_intersections_full(
             }
             let (Some(face_a), Some(face_b)) = (faces.get(face_first), faces.get(face_second))
             else {
-                report.undecided += 1;
+                pending.push((face_first, face_second, CrossingUndecidedCause::MissingFace, start, end));
                 continue;
             };
             // The mesh crossing's midpoint must be a point BOTH faces own: a
@@ -927,7 +1173,7 @@ fn solid_self_intersections_full(
                         "pair faces {}|{} triangles {first}|{second}: crossing witness ({:.6}, {:.6}, {:.6}) in face {}: {in_a:?}, in face {}: {in_b:?} — not a point both faces own; undecided",
                         face_a.id, face_b.id, witness.x, witness.y, witness.z, face_a.id, face_b.id
                     );
-                    report.undecided += 1;
+                    pending.push((face_first, face_second, CrossingUndecidedCause::Witness, start, end));
                     continue;
                 }
             }
@@ -992,7 +1238,7 @@ fn solid_self_intersections_full(
                             || matches!(verdict, PierceVerdict::Undecided)
                         {
                             pierce_trace!(" verdict: undecided");
-                            report.undecided += 1;
+                            pending.push((face_first, face_second, CrossingUndecidedCause::Pierce, start, end));
                         } else {
                             pierce_trace!(" verdict: rejected");
                             report.rejected += 1;
@@ -1033,7 +1279,24 @@ fn solid_self_intersections_full(
         }
     }
     let sweep_ms = stage_ms(sweep_started);
+    if pair_memo {
+        // Every pair that was swept and never crossed is clean under these
+        // inputs; pairs no triangle box ever brought together cost nothing to
+        // sweep again and are left out.
+        let clean = (0..face_count).flat_map(|a| (a..face_count).map(move |b| (a, b)))
+            .filter(|&(a, b)| pair_state[a * face_count + b] == 1)
+            .map(|(a, b)| pair_memo::pair_key(pair_options, face_keys[a], face_keys[b]));
+        pair_memo::store(clean);
+        if profile.is_some() {
+            let (hits, stored, entries) = pair_memo::take_counts();
+            eprintln!("soundness.pair_memo served={hits} stored={stored} entries={entries}");
+        }
+    }
+    let resolve_started = scan_profile_enabled().then(Instant::now);
+    resolve_pending(solid, &faces, pending, options, &mut best, &mut report);
+    let resolve_ms = stage_ms(resolve_started);
     let fold_started = scan_profile_enabled().then(Instant::now);
+    let fold_counts = fold_memo::counts();
 
     // ---- the fold pass ---------------------------------------------------
     // One grid per face that produced a same-face crossing at all, and at most
@@ -1055,16 +1318,10 @@ fn solid_self_intersections_full(
         let mut points = same_face.remove(&face_index).unwrap_or_default();
         points.sort_by(|a, b| b.0.total_cmp(&a.0));
         points.truncate(MAX_FOLD_PROBES);
-        let Some(grid) = fold_grid(
-            &face.surface,
-            triangles_on_face.get(&face_index).copied().unwrap_or(0),
-        ) else {
-            fold_trace!("fold face {}: the sample grid could not be built", face.id);
-            report.fold_undecided += points.len();
-            continue;
-        };
-        for (_, point) in points {
-            match confirm_fold(face, &grid, point, options) {
+        let triangles = triangles_on_face.get(&face_index).copied().unwrap_or(0);
+        let verdicts = fold_memo::read(face, triangles, &points, options);
+        for verdict in verdicts {
+            match verdict {
                 FoldVerdict::Confirmed(fold) => {
                     let slot = folded.entry(face.id).or_insert_with(|| fold.clone());
                     if fold.uv_separation > slot.uv_separation {
@@ -1077,6 +1334,10 @@ fn solid_self_intersections_full(
         }
     }
 
+    if profile.is_some() {
+        let after = fold_memo::counts();
+        eprintln!("soundness.fold_memo reused={} read={}", after.0 - fold_counts.0, after.1 - fold_counts.1);
+    }
     report.confirmed = best.into_values().collect();
     report
         .confirmed
@@ -1089,7 +1350,7 @@ fn solid_self_intersections_full(
         eprintln!(
             "soundness.profile ms={:.2} faces={} tris={triangle_count} chord={:.3e} | \
              tessellate_ms={tessellate_ms:.2} weld_ms={weld_ms:.2} bvh_ms={bvh_ms:.2} \
-             sweep_ms={sweep_ms:.2} confirm_ms={confirm_ms:.2} fold_ms={:.2} | \
+             sweep_ms={sweep_ms:.2} confirm_ms={confirm_ms:.2} resolve_ms={resolve_ms:.2} fold_ms={:.2} | \
              overlaps={overlaps} candidate_pairs={} mesh_crossings={crossings} \
              confirmed={} rejected={} undecided={} same_face={} folds={}",
             stage_ms(profile),
@@ -1104,6 +1365,18 @@ fn solid_self_intersections_full(
             report.folds.len(),
         );
     }
+    if let Some(plan) = certificates {
+        if !plan.proofs.is_empty() {
+            if profile.is_some() {
+                let mut rules = std::collections::BTreeMap::new();
+                for proof in &plan.proofs { *rules.entry(proof.rule).or_insert(0usize) += 1; }
+                eprintln!("soundness.certificates {}", serde_json::json!({"rules": rules, "skipped_by_certificate": plan.scope}));
+            }
+            report.certified_pairs = plan.proofs;
+            report.skipped_by_certificate = Some(plan.scope);
+        }
+    }
+    if let Some(census) = census { census.emit(&boxes); }
     Ok(report)
 }
 
@@ -1389,26 +1662,37 @@ fn confirm_fold(
     // ON the trim boundary counts as inside — a fold that reaches the boundary
     // is still a fold.
     let trim_band = UV_WELD_FRACTION * (span_u.abs() + span_v.abs()).max(1.0);
-    let mut inside: Vec<(&crate::projection::SurfaceProjection, Vec3)> = Vec::new();
+    // Each kept foot with whether it sits ON the trim boundary. Two feet
+    // that both sit on the boundary are the TRIM's: a seam the face declares
+    // by its loops, or the two arms of a slit a carved wall leaves along its
+    // crease (the closed-edge lane's carve cuts the fold's lens out of the
+    // trim and keeps one crease edge, used twice, as the hole's boundary —
+    // the surface's two sheets meet there by construction). Such a pair
+    // carries one point on two parameters exactly as a fold does, and is not
+    // one: 2026-10-17, `fillet-mouth-over-wall-bore-5p5-r2p2`, convicted
+    // under a coarser rim mesh whose triangles crossed the slit. A fold that
+    // reaches the boundary from INSIDE is still a fold (one foot inside).
+    let mut inside: Vec<(&crate::projection::SurfaceProjection, Vec3, bool)> = Vec::new();
     for foot in &feet {
         let uv = Vec2 {
             x: foot.u,
             y: foot.v,
         };
-        match parameter_point_in_face(face, uv, trim_band) {
+        let on_boundary = match parameter_point_in_face(face, uv, trim_band) {
             Ok(PolygonClass::Outside) => continue,
-            Ok(_) => {}
+            Ok(PolygonClass::Boundary) => true,
+            Ok(PolygonClass::Inside) => false,
             Err(message) => {
                 fold_trace!("fold face {}: containment: {message}", face.id);
                 return FoldVerdict::Undecided;
             }
-        }
+        };
         let Ok(normal) = surface.normal(foot.u, foot.v).and_then(|normal| normal.normalized())
         else {
             fold_trace!("fold face {}: a normal could not be evaluated", face.id);
             return FoldVerdict::Undecided;
         };
-        inside.push((foot, normal));
+        inside.push((foot, normal, on_boundary));
     }
     if inside.len() < 2 {
         fold_trace!(
@@ -1423,8 +1707,32 @@ fn confirm_fold(
     let mut chosen: Option<(f64, usize, usize, f64)> = None;
     let mut worst_sine = 0.0f64;
     let mut identified = 0usize;
+    let mut trim_pairs = 0usize;
     for first in 0..inside.len() {
         for second in (first + 1)..inside.len() {
+            if inside[first].2 && inside[second].2 {
+                trim_pairs += 1;
+                continue;
+            }
+            // Two feet with the TRIM between them — the uv segment joining
+            // them leaves the face — are the two sheets either side of a
+            // slit or a hole, within the coincidence band of each other
+            // because they meet along it; a fold's two feet are joined
+            // through the material that folds. (The carved wall again: a
+            // mesh triangle spanning the slit puts one foot a few 1e-5 of u
+            // to each side of the crease, 1.1e-5 apart in 3D.)
+            {
+                let (a, b) = (inside[first].0, inside[second].0);
+                let separated = (1..8).any(|k| {
+                    let s = k as f64 / 8.0;
+                    let uv = Vec2 { x: a.u + (b.u - a.u) * s, y: a.v + (b.v - a.v) * s };
+                    matches!(parameter_point_in_face(face, uv, trim_band), Ok(PolygonClass::Outside))
+                });
+                if separated {
+                    trim_pairs += 1;
+                    continue;
+                }
+            }
             let sine = inside[first].1.cross(inside[second].1).length();
             worst_sine = worst_sine.max(sine);
             if sine <= FOLD_TRANSVERSAL_SINE {
@@ -1461,13 +1769,13 @@ fn confirm_fold(
     }
     let Some((separation, first, second, sine)) = chosen else {
         fold_trace!(
-            "fold face {}: no pair of feet is a fold (widest sine {worst_sine:.3e}, {identified} pair(s) are one locus across an undeclared seam) — a degenerate parameterization, not a fold",
+            "fold face {}: no pair of feet is a fold (widest sine {worst_sine:.3e}, {identified} pair(s) are one locus across an undeclared seam, {trim_pairs} pair(s) both on the trim's own boundary) — a degenerate parameterization or the trim's own seam, not a fold",
             face.id
         );
         return FoldVerdict::Rejected;
     };
-    let (foot_a, normal_a) = inside[first];
-    let (foot_b, normal_b) = inside[second];
+    let (foot_a, normal_a, _) = inside[first];
+    let (foot_b, normal_b, _) = inside[second];
     let angle = sine.atan2(normal_a.dot(normal_b));
     fold_trace!(
         "fold face {}: CONFIRMED feet ({:.6}, {:.6}) and ({:.6}, {:.6}) separation {separation:.3e} vs merge {:.3e} residual {:.3e} (feet {:.3e}/{:.3e} from the point, band {coincidence:.3e}) normals {:.2}deg",
@@ -1700,12 +2008,17 @@ fn straddle_material(
 /// the other's carrier — of different sample points, and the sample points are
 /// the whole difference between them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[non_exhaustive]
 pub enum CrossingConfirmation {
     /// [`straddle`]: the triangles' OWN CORNERS, in both directions.
     Corners,
     /// [`pierce_straddle`]: an edge of one triangle through the other's
     /// interior, with the samples taken at the pierce.
     Pierce,
+    /// Neither of those decided it; the carriers did (`resolve.rs`): a point
+    /// both faces own on their common curve, crossed transversally, straddled
+    /// past the band both ways. Added 2026-10-16 (lane K2).
+    Resolved,
 }
 
 /// Signed distance from `point` to `surface`, positive on the side the

@@ -581,7 +581,10 @@ pub fn revolve_profile_brep_named(
         ));
     }
     let full_turn = angle > std::f64::consts::TAU - 1e-9;
-    let built = prepare_profile(input, axis_point, axis_direction, !full_turn).and_then(|profile| {
+    let mut timing = crate::loft_topology::ConstructionProfile::new("revolve");
+    let prepared = prepare_profile(input, axis_point, axis_direction, !full_turn);
+    timing.lap("profile");
+    let built = prepared.and_then(|profile| {
         if full_turn {
             revolve_full(profile, axis_point, side_names)
         } else {
@@ -640,6 +643,7 @@ fn revolve_full(
     origin: Vec3,
     side_names: &[Option<String>],
 ) -> Result<BrepSolid, String> {
+    let mut timing = crate::loft_topology::ConstructionProfile::new("revolve_full");
     let count = profile.curves.len();
     let surfaces: Vec<Option<NurbsSurface>> = profile
         .curves
@@ -653,6 +657,7 @@ fn revolve_full(
             }
         })
         .collect::<Result<_, String>>()?;
+    timing.lap("surface");
     let vertices: Vec<VertexRecord> = profile
         .points
         .iter()
@@ -681,6 +686,7 @@ fn revolve_full(
             name: None,
         });
     }
+    timing.lap("edges");
     let mut faces = Vec::new();
     for index in 0..count {
         if profile.axis_curves[index] {
@@ -739,6 +745,7 @@ fn revolve_full(
     }
     let solid = BrepSolid {
         mass_properties_cache: Default::default(),
+        cells: Default::default(),
         id: next_id(&mut counter),
         vertices,
         edges,
@@ -753,7 +760,9 @@ fn revolve_full(
         },
         kind: crate::BodyKind::Solid,
     };
+    timing.lap("topology_pcurves");
     let issues = solid.validate();
+    timing.lap("validation");
     if issues.is_empty() {
         Ok(solid)
     } else {
@@ -768,6 +777,7 @@ fn revolve_partial(
     side_names: &[Option<String>],
     cap_names: &[Option<String>],
 ) -> Result<BrepSolid, String> {
+    let mut timing = crate::loft_topology::ConstructionProfile::new("revolve_partial");
     let count = profile.curves.len();
     let end_curves: Vec<NurbsCurve> = profile
         .curves
@@ -786,6 +796,7 @@ fn revolve_partial(
             }
         })
         .collect::<Result<_, String>>()?;
+    timing.lap("surface");
     let mut vertices = Vec::new();
     let mut start_vertex_ids = Vec::with_capacity(count);
     let mut end_vertex_ids = Vec::with_capacity(count);
@@ -862,6 +873,7 @@ fn revolve_partial(
         }
     }
 
+    timing.lap("edges");
     let mut faces = Vec::new();
     for index in 0..count {
         if profile.axis_curves[index] {
@@ -1009,6 +1021,7 @@ fn revolve_partial(
 
     let solid = BrepSolid {
         mass_properties_cache: Default::default(),
+        cells: Default::default(),
         id: next_id(&mut counter),
         vertices,
         edges,
@@ -1019,7 +1032,9 @@ fn revolve_partial(
         genus: 0,
         kind: crate::BodyKind::Solid,
     };
+    timing.lap("topology_pcurves");
     let issues = solid.validate();
+    timing.lap("validation");
     if issues.is_empty() {
         Ok(solid)
     } else {

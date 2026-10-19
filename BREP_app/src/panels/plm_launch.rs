@@ -22,7 +22,7 @@
 //! (`history.replaceState`), so reloading the tab does not reopen the key on
 //! top of the user's work. Only the sign-in case keeps it.
 
-use crate::document::{Document, Documents, EMPTY_DOCUMENT};
+use crate::document::{Document, Documents};
 use crate::panels::file::FileDialog;
 use crate::plm::PlmFuture;
 use crate::store::{ModelStore, Residency};
@@ -99,6 +99,7 @@ impl Step {
 struct PartCheck {
     number: String,
     document_class: String,
+    part_type: String,
     revisions: Vec<RevisionCheck>,
 }
 
@@ -198,16 +199,24 @@ impl Launch {
                 None => Step::Refused(format!("{} could not be opened: part {} has no revision {revision}", self.key, part.number)),
                 Some(found) => {
                     let mut engine = docs.spawn_engine();
-                    if let Err(e) = engine.set_history_json(EMPTY_DOCUMENT) {
-                        return Step::Refused(format!("{} could not be opened: {e}", self.key));
-                    }
+                    // A missing PLM document is new content: its type, rather
+                    // than the previous tab's workspace, decides what it starts with.
+                    engine.settings.workbench = match part.part_type.as_str() {
+                        "assembly" => "assembly",
+                        "drawing" => "drawing",
+                        "diagram" => "diagram",
+                        "wire_harness" | "wireHarness" => "wireHarness",
+                        "pcb" => "pcb",
+                        "symbol" => "symbol",
+                        "pads" => "pads",
+                        _ => "modeling",
+                    }.into();
                     let class = match part.document_class.as_str() {
                         "family" => crate::document_class::DocumentClass::Family,
                         "template" => crate::document_class::DocumentClass::Template,
                         _ => crate::document_class::DocumentClass::Normal,
                     };
-                    crate::document_class::set_document_class(&mut engine, class);
-                    let mut doc = Document::new(engine);
+                    let mut doc = Document::fresh(engine, class);
                     doc.set_name(Some(name.clone()));
                     docs.open_document(doc);
                     let _ = found;

@@ -215,6 +215,16 @@ pub(crate) struct HybridBrepStats {
     pub(crate) segmentation_sphere_regions: usize,
     pub(crate) segmentation_torus_regions: usize,
     pub(crate) segmentation_unsupported_regions: usize,
+    /// Lane J row 7: freeform regions the split divided into carriers,
+    /// tried and left as they were, and above its budget (not tried).
+    pub(crate) split_freeform_regions: usize,
+    pub(crate) split_declined_regions: usize,
+    pub(crate) split_over_budget_regions: usize,
+    pub(crate) split_budget_hit_regions: usize,
+    pub(crate) split_band_declined_regions: usize,
+    /// Lane J row 13: row 11's scan on the segmentation's whole sphere or
+    /// torus carrier.
+    pub(crate) whole_carrier_scan: crate::stl_conversion::WholeCarrierScanReport,
 }
 
 /// Validated reconstructed solid and the accounting used to select policy.
@@ -269,6 +279,492 @@ pub(crate) fn hybrid_plane_cylinder_brep(
 /// builder cannot use, and the faceted fallback is the honest answer.
 const HYBRID_RETRY_LIMIT: usize = 512;
 
+/// The partition the mixed builder starts from: the kernel segmentation with
+/// the fragmented cylinder/cone recovery applied, before any boundary is
+/// validated or any region demoted. Exposed so a census can read the
+/// carrier-accept stage the way the builder sees it.
+pub fn segment_for_hybrid(
+    positions: &[f64],
+    indices: &[u32],
+    options: &SegmentOptions,
+) -> Result<MeshSegmentation, String> {
+    segment_for_hybrid_measured(positions, indices, options).map(|(segmentation, _)| segmentation)
+}
+
+/// Lane J row 7, promoted ON 2026-10-16: the freeform split and the crossing
+/// fixes it relies on; BREP_HYBRID_SPLIT_FREEFORM=0 restores the old path.
+fn split_freeform_enabled() -> bool {
+    std::env::var("BREP_HYBRID_SPLIT_FREEFORM").map_or(true, |v| v != "0")
+}
+
+/// The hybrid segmentation and what the freeform split did (its measured
+/// noise is zero when it wrote no carrier).
+fn segment_for_hybrid_measured(
+    positions: &[f64],
+    indices: &[u32],
+    options: &SegmentOptions,
+) -> Result<(MeshSegmentation, crate::hybrid_freeform_split::SplitReport), String> {
+    let mut segmentation = segment_mesh_faces(positions, indices, options)?;
+    crate::hybrid_recovery::recover(positions, indices, options, &mut segmentation);
+    // Lane J row 7, promoted ON: a freeform region that holds several
+    // carriers is split into them (crossing cylinder walls under vertex
+    // noise). BREP_HYBRID_SPLIT_FREEFORM=0 restores the unsplit region.
+    let split = if split_freeform_enabled() {
+        crate::hybrid_freeform_split::split(positions, indices, options, &mut segmentation)
+    } else {
+        Default::default()
+    };
+    let split_noise = split.noise;
+    // Lane J row 5, promoted ON: BREP_HYBRID_NOISE_PLANES=0 restores the
+    // unjoined fragments.
+    if std::env::var("BREP_HYBRID_NOISE_PLANES").map_or(true, |v| v != "0") {
+        let noise = measured_plane_noise(&segmentation).max(split_noise);
+        join_noisy_planar_fragments(&mut segmentation, positions, indices, noise, split_noise > 0.0);
+        if split_noise > 0.0 {
+            crate::hybrid_freeform_split::absorb_plane_fragments(&mut segmentation, positions, indices, noise);
+        }
+    }
+    if std::env::var("BREP_DEBUG_SPLIT").is_ok() {
+        for r in &segmentation.regions {
+            eprintln!("[seg] {} {} tris {} dev {:.2e} bbox ({:.2},{:.2},{:.2})..({:.2},{:.2},{:.2})", r.id, r.carrier.kind(), r.triangle_count, r.max_deviation, r.bbox_min.x, r.bbox_min.y, r.bbox_min.z, r.bbox_max.x, r.bbox_max.y, r.bbox_max.z);
+        }
+    }
+    Ok((segmentation, split))
+}
+
+/// Vertex noise the mesh demonstrably carries: the largest residual of a
+/// plane region the segmenter accepted with at least 16 triangles (a plane
+/// is unambiguous, so its residual is noise, not shape). Zero when no such
+/// plane exists.
+fn measured_plane_noise(segmentation: &MeshSegmentation) -> f64 {
+    segmentation
+        .regions
+        .iter()
+        .filter(|region| matches!(region.carrier, RegionCarrier::Plane { .. }) && region.triangle_count >= 16)
+        .map(|region| region.max_deviation)
+        .fold(0.0_f64, f64::max)
+}
+
+/// On a noisy mesh the small fan triangles of a planar cap tilt past the
+/// region grower's dihedral and each piece fails a plane fit whose bar scales
+/// with that piece's own size: a jittered frustum cap read as eight freeform
+/// and five plane fragments, and the mixed builder demoted the cone wall
+/// against them. Edge-connected runs of freeform and small plane regions
+/// (under 16 triangles) are joined into one plane region when the
+/// least-squares plane of the run holds every vertex within the noise the
+/// mesh carries on its large planes (the tilted fan normals that split the
+/// cap are not evidence either way). A clean mesh measures no noise and is
+/// unchanged.
+fn join_noisy_planar_fragments(
+    segmentation: &mut MeshSegmentation,
+    positions: &[f64],
+    indices: &[u32],
+    noise: f64,
+    curved_slivers: bool,
+) {
+    let triangle_count = segmentation.triangle_region_ids.len();
+    if !(noise > 0.0) || indices.len() != triangle_count * 3 {
+        return;
+    }
+    let point = |i: u32| {
+        let at = i as usize * 3;
+        Vec3::new(positions[at], positions[at + 1], positions[at + 2])
+    };
+    let small = |region: u32| -> bool {
+        segmentation.regions.get(region as usize).is_some_and(|r| {
+            matches!(r.carrier, RegionCarrier::Freeform)
+                || (matches!(r.carrier, RegionCarrier::Plane { .. }) && r.triangle_count < 16)
+                // Row 7: once the freeform split has measured the noise, a
+                // curved carrier on a handful of cap triangles (a jittered
+                // fan read as a 4-triangle cone) is a fragment too; the run
+                // still joins only when its plane holds every vertex.
+                || (curved_slivers && r.triangle_count < 8)
+        })
+    };
+    let mut edges = HashMap::<(u32, u32), Vec<usize>>::new();
+    for t in 0..triangle_count {
+        for c in 0..3 {
+            let (a, b) = (indices[3 * t + c], indices[3 * t + (c + 1) % 3]);
+            edges.entry((a.min(b), a.max(b))).or_default().push(t);
+        }
+    }
+    let mut neighbours = vec![Vec::new(); triangle_count];
+    for incident in edges.values() {
+        for &x in incident {
+            for &y in incident {
+                if x != y {
+                    neighbours[x].push(y);
+                }
+            }
+        }
+    }
+    let mut seen = vec![false; triangle_count];
+    let mut joins = Vec::new();
+    for start in 0..triangle_count {
+        if seen[start] || !small(segmentation.triangle_region_ids[start]) {
+            continue;
+        }
+        let mut run = vec![start];
+        seen[start] = true;
+        let mut at = 0;
+        while at < run.len() {
+            let t = run[at];
+            at += 1;
+            for &n in &neighbours[t] {
+                if !seen[n] && small(segmentation.triangle_region_ids[n]) {
+                    seen[n] = true;
+                    run.push(n);
+                }
+            }
+        }
+        let regions = run.iter().map(|&t| segmentation.triangle_region_ids[t]).collect::<BTreeSet<_>>();
+        if regions.len() < 2 {
+            continue;
+        }
+        // Least-squares plane through the run's vertices: the centroid and
+        // the smallest-variance direction of their covariance (Jacobi).
+        let mut verts = run.iter().flat_map(|&t| (0..3).map(move |c| indices[3 * t + c])).collect::<Vec<_>>();
+        verts.sort_unstable();
+        verts.dedup();
+        let inv = 1.0 / verts.len() as f64;
+        let centroid = verts.iter().fold(Vec3::new(0.0, 0.0, 0.0), |acc, &v| acc.add(point(v).scale(inv)));
+        let mut m = [[0.0_f64; 3]; 3];
+        for &v in &verts {
+            let d = point(v).sub(centroid);
+            let d = [d.x, d.y, d.z];
+            for i in 0..3 {
+                for j in 0..3 {
+                    m[i][j] += d[i] * d[j];
+                }
+            }
+        }
+        let mut basis = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+        for _ in 0..50 {
+            let (mut p, mut q, mut largest) = (0, 1, 0.0_f64);
+            for i in 0..3 {
+                for j in (i + 1)..3 {
+                    if m[i][j].abs() > largest {
+                        largest = m[i][j].abs();
+                        p = i;
+                        q = j;
+                    }
+                }
+            }
+            if largest < 1e-30 {
+                break;
+            }
+            let theta = 0.5 * (m[q][q] - m[p][p]) / m[p][q];
+            let t = theta.signum() / (theta.abs() + (theta * theta + 1.0).sqrt());
+            let t = if theta == 0.0 { 1.0 } else { t };
+            let (c, sn) = (1.0 / (t * t + 1.0).sqrt(), t / (t * t + 1.0).sqrt());
+            let mut next = m;
+            for k in 0..3 {
+                next[k][p] = c * m[k][p] - sn * m[k][q];
+                next[k][q] = sn * m[k][p] + c * m[k][q];
+            }
+            let rotated = next;
+            for k in 0..3 {
+                next[p][k] = c * rotated[p][k] - sn * rotated[q][k];
+                next[q][k] = sn * rotated[p][k] + c * rotated[q][k];
+            }
+            m = next;
+            for row in &mut basis {
+                let (a, b) = (row[p], row[q]);
+                row[p] = c * a - sn * b;
+                row[q] = sn * a + c * b;
+            }
+        }
+        let smallest = (0..3).min_by(|&a, &b| m[a][a].total_cmp(&m[b][b])).unwrap();
+        let Ok(normal) = Vec3::new(basis[0][smallest], basis[1][smallest], basis[2][smallest]).normalized() else {
+            continue;
+        };
+        // Orient with the run's triangles.
+        let mut facing = 0.0;
+        let mut area = 0.0;
+        for &t in &run {
+            let [a, b, c] = [point(indices[3 * t]), point(indices[3 * t + 1]), point(indices[3 * t + 2])];
+            let cross = b.sub(a).cross(c.sub(a));
+            facing += cross.dot(normal);
+            area += cross.length();
+        }
+        let normal = if facing < 0.0 { normal.scale(-1.0) } else { normal };
+        let max_deviation = verts.iter().map(|&v| point(v).sub(centroid).dot(normal).abs()).fold(0.0_f64, f64::max);
+        if max_deviation <= noise {
+            joins.push((run, centroid, normal, max_deviation, area * 0.5));
+        }
+    }
+    if joins.is_empty() {
+        return;
+    }
+    for (run, origin, normal, max_deviation, area) in joins {
+        let mut low = Vec3::new(f64::INFINITY, f64::INFINITY, f64::INFINITY);
+        let mut high = Vec3::new(f64::NEG_INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY);
+        for &t in &run {
+            for c in 0..3 {
+                let q = point(indices[3 * t + c]);
+                low = Vec3::new(low.x.min(q.x), low.y.min(q.y), low.z.min(q.z));
+                high = Vec3::new(high.x.max(q.x), high.y.max(q.y), high.z.max(q.z));
+            }
+        }
+        let id = segmentation.regions.len() as u32;
+        for &t in &run {
+            let old = segmentation.triangle_region_ids[t] as usize;
+            segmentation.regions[old].triangle_count -= 1;
+            segmentation.triangle_region_ids[t] = id;
+        }
+        segmentation.regions.push(MeshRegion {
+            id,
+            triangle_count: run.len(),
+            area,
+            bbox_min: low,
+            bbox_max: high,
+            carrier: RegionCarrier::Plane { origin, normal },
+            max_deviation,
+            rms_deviation: max_deviation,
+            max_normal_angle_deg: 30.0,
+        });
+    }
+    // Drop emptied regions and renumber densely.
+    let mut remap = vec![u32::MAX; segmentation.regions.len()];
+    let mut kept = Vec::new();
+    for region in std::mem::take(&mut segmentation.regions) {
+        if region.triangle_count == 0 {
+            continue;
+        }
+        remap[region.id as usize] = kept.len() as u32;
+        let mut region = region;
+        region.id = kept.len() as u32;
+        kept.push(region);
+    }
+    for id in &mut segmentation.triangle_region_ids {
+        if *id != brep_kernel::UNASSIGNED_REGION {
+            *id = remap[*id as usize];
+        }
+    }
+    segmentation.regions = kept;
+}
+
+/// Lane J row 10: a stray region beside the whole primitive has fewer
+/// triangles than this (row 7's sliver bar), and the strays together hold at
+/// most 1 % of the mesh.
+const WHOLE_STRAY_TRIANGLES: usize = 8;
+
+/// Lane J row 10, promoted ON 2026-10-16: BREP_HYBRID_WHOLE_STRAYS=0 restores
+/// rows 6 and 9's one-region requirement.
+fn whole_strays_enabled() -> bool {
+    std::env::var("BREP_HYBRID_WHOLE_STRAYS").map_or(true, |v| v != "0")
+}
+
+/// The exact sphere or ring torus for a closed mesh that the segmentation
+/// holds as one region of that carrier, or `None` when any check fails:
+/// every triangle in the region, outward sense, a closed edge-manifold mesh
+/// of the carrier's genus (0 / 1), and the mesh's enclosed volume within
+/// `area × (max vertex deviation + chord sag)` of the primitive's.
+fn whole_closed_primitive(
+    positions: &[f64],
+    indices: &[u32],
+    segmentation: &MeshSegmentation,
+    weld_tolerance: f64,
+    tally: &mut crate::stl_conversion::WholeCarrierScanReport,
+) -> Option<HybridBrepOutput> {
+    let triangle_count = indices.len() / 3;
+    // Lane J row 10: besides the whole primitive the segmenter may leave stray
+    // regions of a few triangles, slivers fitted exactly by any plane or
+    // sphere. They join the dominant region; the fit and checks below then run
+    // over the whole mesh as before.
+    let strays_enabled = whole_strays_enabled();
+    let region = if strays_enabled {
+        let region = segmentation.regions.iter().max_by_key(|region| region.triangle_count)?;
+        let strays = segmentation.regions.iter().filter(|other| other.id != region.id);
+        let admitted = !strays.clone().any(|other| other.triangle_count >= WHOLE_STRAY_TRIANGLES)
+            && 100 * strays.clone().map(|other| other.triangle_count).sum::<usize>() <= triangle_count;
+        if segmentation.regions.len() > 1 && std::env::var("BREP_DEBUG_SPLIT").is_ok() {
+            let listed: Vec<_> = strays.map(|other| (other.carrier.kind(), other.triangle_count)).collect();
+            eprintln!(
+                "[stray] {} dominant {} tris {} strays {listed:?}",
+                if admitted { "admitted" } else { "declined" },
+                region.carrier.kind(),
+                region.triangle_count
+            );
+        }
+        if !admitted {
+            return None;
+        }
+        region
+    } else {
+        let [region] = segmentation.regions.as_slice() else {
+            return None;
+        };
+        region
+    };
+    let is_stray = |id: u32| id != region.id && segmentation.regions.iter().any(|other| other.id == id);
+    if triangle_count == 0
+        || segmentation.triangle_region_ids.len() != triangle_count
+        || segmentation.triangle_region_ids.iter().any(|&id| id != region.id && !(strays_enabled && is_stray(id)))
+    {
+        return None;
+    }
+    let point = |v: u32| {
+        let i = 3 * v as usize;
+        Vec3::new(positions[i], positions[i + 1], positions[i + 2])
+    };
+    // Closed, consistently oriented edge incidence; Euler characteristic.
+    let mut edges = HashMap::<(u32, u32), i32>::new();
+    let mut used = BTreeSet::new();
+    let mut longest = 0.0_f64;
+    let mut mesh_volume = 0.0;
+    for t in indices.chunks_exact(3) {
+        if t[0] == t[1] || t[1] == t[2] || t[2] == t[0] {
+            return None;
+        }
+        for k in 0..3 {
+            let (a, b) = (t[k], t[(k + 1) % 3]);
+            *edges.entry((a.min(b), a.max(b))).or_default() += if a < b { 1 } else { -1 };
+            longest = longest.max(point(a).sub(point(b)).length());
+            used.insert(a);
+        }
+        mesh_volume += point(t[0]).dot(point(t[1]).cross(point(t[2]))) / 6.0;
+    }
+    let chi = used.len() as i64 - edges.len() as i64 + triangle_count as i64;
+    if edges.values().any(|&sense| sense != 0) || 2 * edges.len() != 3 * triangle_count {
+        return None;
+    }
+    let mut fitted_deviation = None;
+    let (solid, genus, area, volume, smallest_radius, sphere) = match region.carrier {
+        RegionCarrier::Sphere { center, radius, sense: 1 } => (
+            brep_kernel::make_sphere_brep(center, radius, Vec3::new(0.0, 0.0, 1.0)).ok()?,
+            0,
+            4.0 * std::f64::consts::PI * radius * radius,
+            4.0 / 3.0 * std::f64::consts::PI * radius.powi(3),
+            radius,
+            true,
+        ),
+        RegionCarrier::Torus { center, axis_dir, major_radius, minor_radius, sense: 1 }
+            if major_radius > minor_radius =>
+        (
+            brep_kernel::make_torus_brep(center, axis_dir, major_radius, minor_radius).ok()?,
+            1,
+            4.0 * std::f64::consts::PI * std::f64::consts::PI * major_radius * minor_radius,
+            2.0 * std::f64::consts::PI * std::f64::consts::PI * major_radius * minor_radius * minor_radius,
+            minor_radius,
+            false,
+        ),
+        // Lane J row 9: one freeform region over the whole closed mesh (no
+        // segmenter carrier met its bar under the jitter). The primitive of
+        // the mesh's genus is fitted to its vertices and taken only when the
+        // residual reads as noise (hybrid_whole_freeform.rs).
+        RegionCarrier::Freeform if crate::hybrid_whole_freeform::whole_freeform_enabled() && mesh_volume > 0.0 => {
+            let genus = match chi {
+                2 => 0,
+                0 => 1,
+                _ => return None,
+            };
+            let report = crate::hybrid_whole_freeform::fit_whole_primitive(positions, indices, genus)?;
+            if std::env::var("BREP_DEBUG_SPLIT").is_ok() {
+                eprintln!(
+                    "[whole] genus {genus} vertices {} statistic {:.2} quantile {:.2} local {:.2} threshold {:.2} max deviation {:.3e} {:?}",
+                    report.vertices,
+                    report.statistic,
+                    report.quantile,
+                    report.local_statistic,
+                    report.local_threshold,
+                    report.max_deviation,
+                    report.fit
+                );
+            }
+            if !report.residual_is_noise() {
+                return None;
+            }
+            fitted_deviation = Some(report.max_deviation);
+            let v = |p: [f64; 3]| Vec3::new(p[0], p[1], p[2]);
+            match report.fit {
+                crate::hybrid_whole_freeform::WholeFit::Sphere { center, radius } => (
+                    brep_kernel::make_sphere_brep(v(center), radius, Vec3::new(0.0, 0.0, 1.0)).ok()?,
+                    0,
+                    4.0 * std::f64::consts::PI * radius * radius,
+                    4.0 / 3.0 * std::f64::consts::PI * radius.powi(3),
+                    radius,
+                    true,
+                ),
+                crate::hybrid_whole_freeform::WholeFit::Torus { center, axis, major, minor } => (
+                    brep_kernel::make_torus_brep(v(center), v(axis), major, minor).ok()?,
+                    1,
+                    4.0 * std::f64::consts::PI * std::f64::consts::PI * major * minor,
+                    2.0 * std::f64::consts::PI * std::f64::consts::PI * major * minor * minor,
+                    minor,
+                    false,
+                ),
+            }
+        }
+        _ => return None,
+    };
+    if chi != 2 - 2 * genus {
+        return None;
+    }
+    // Lane J row 13: the segmentation's sphere or torus carrier passed only
+    // the segmenter's own distance bar, which the jitter set; a small flat
+    // (h = 0.015 on a 0.006-jitter torus tube) passes it. Row 11's local
+    // residual scan reads the carrier's vertex residuals, as row 9's fitted
+    // primitive already does; a scan that abstains keeps the status quo. A
+    // decline is taken only on a mesh that is not exact: row 9's refit of the
+    // primitive must leave a vertex farther off than the weld tolerance (the
+    // mesh's own positional resolution). On an exact mesh the carrier's
+    // residual is the segmenter's fit error (census r13: 1.7e-4 on a clean
+    // coarse torus, whose refit reads roundoff), not noise.
+    if fitted_deviation.is_none() && crate::hybrid_whole_freeform::whole_carrier_scan_enabled() {
+        let residual = |v: u32| match region.carrier {
+            RegionCarrier::Sphere { center, radius, .. } => point(v).sub(center).length() - radius,
+            RegionCarrier::Torus { center, axis_dir, major_radius, minor_radius, .. } => {
+                let d = point(v).sub(center);
+                let axial = d.dot(axis_dir);
+                let radial = d.sub(axis_dir.scale(axial)).length();
+                (radial - major_radius).hypot(axial) - minor_radius
+            }
+            _ => f64::NAN,
+        };
+        let reading = crate::hybrid_whole_freeform::carrier_scan_verdict(indices, residual, if sphere { 4 } else { 7 });
+        if std::env::var("BREP_DEBUG_SPLIT").is_ok() {
+            eprintln!(
+                "[whole-carrier] {} local {:.2} threshold {:.2} independence {:.3} bound {:.3} edges {} {:?}",
+                region.carrier.kind(),
+                reading.statistic,
+                reading.threshold,
+                reading.independence,
+                reading.bound,
+                reading.outside_edges,
+                reading.verdict
+            );
+        }
+        let exact = reading.verdict == crate::hybrid_whole_freeform::ScanVerdict::Declined
+            && crate::hybrid_whole_freeform::fit_whole_primitive(positions, indices, genus)
+                .is_some_and(|refit| refit.max_deviation <= weld_tolerance);
+        if !exact {
+            tally.add(reading.verdict);
+            if reading.verdict == crate::hybrid_whole_freeform::ScanVerdict::Declined {
+                return None;
+            }
+        }
+    }
+    let sag = longest * longest / (8.0 * smallest_radius);
+    if !((mesh_volume - volume).abs() <= area * (fitted_deviation.unwrap_or(region.max_deviation) + sag)) {
+        return None;
+    }
+    if !solid.validate().is_empty() || !solid_signed_volume(&solid).is_ok_and(|v| v > 0.0) {
+        return None;
+    }
+    let mut stats = HybridBrepStats { total_faces: 1, ..Default::default() };
+    if sphere {
+        stats.analytic_sphere_faces = 1;
+        stats.analytic_sphere_triangles = triangle_count;
+        stats.segmentation_sphere_regions = 1;
+    } else {
+        stats.analytic_torus_faces = 1;
+        stats.analytic_torus_triangles = triangle_count;
+        stats.segmentation_torus_regions = 1;
+    }
+    Some(HybridBrepOutput { solid, stats })
+}
+
 fn hybrid_plane_cylinder_brep_retry(
     positions: &[f64],
     indices: Option<&[u32]>,
@@ -284,8 +780,28 @@ fn hybrid_plane_cylinder_brep_retry(
             &owned_indices
         }
     };
-    let mut segmentation = segment_mesh_faces(positions, index_buffer, options)?;
-    crate::hybrid_recovery::recover(positions, index_buffer, options, &mut segmentation);
+    let (mut segmentation, split) = segment_for_hybrid_measured(positions, index_buffer, options)?;
+    let split_noise = split.noise;
+    let mut whole_carrier_scan = crate::stl_conversion::WholeCarrierScanReport::default();
+    let with_split = |mut output: HybridBrepOutput| {
+        output.stats.split_freeform_regions = split.split_regions;
+        output.stats.split_declined_regions = split.declined_regions;
+        output.stats.split_over_budget_regions = split.over_budget_regions;
+        output.stats.split_budget_hit_regions = split.budget_hit_regions;
+        output.stats.split_band_declined_regions = split.band_declined_regions;
+        output
+    };
+    // Lane J row 6, promoted ON: a closed mesh the segmentation holds as ONE
+    // sphere or ring-torus region has no boundary ring for the builder below
+    // (it failed "not bounded by closed rings" and faceted everything), while
+    // raw RANSAC fragmented the same noisy body and never offered the whole
+    // primitive. BREP_HYBRID_WHOLE_PRIMITIVE=0 restores the faceted path.
+    if std::env::var("BREP_HYBRID_WHOLE_PRIMITIVE").map_or(true, |v| v != "0") {
+        if let Some(mut output) = whole_closed_primitive(positions, index_buffer, &segmentation, options.weld_tolerance, &mut whole_carrier_scan) {
+            output.stats.whole_carrier_scan = whole_carrier_scan;
+            return Ok(with_split(output));
+        }
+    }
     let mut split_attempted = BTreeSet::new();
     // Start with empty topology. Building, validating and tessellating a full
     // faceted solid only to clear it costs work proportional to every source
@@ -295,6 +811,7 @@ fn hybrid_plane_cylinder_brep_retry(
     // geometry still pass the ordinary reconstruction validation.
     let blank = TopologyArena::from_brep(&BrepSolid {
         mass_properties_cache: Default::default(),
+        cells: Default::default(),
         id: 1,
         genus: 0,
         kind: brep_kernel::BodyKind::Solid,
@@ -315,12 +832,16 @@ fn hybrid_plane_cylinder_brep_retry(
                 index_buffer,
                 options,
                 &segmentation,
+                split_noise,
                 blank.clone(),
                 &forced_demotions,
             )
         };
         match attempt {
-            Ok(output) => return Ok(output),
+            Ok(mut output) => {
+                output.stats.whole_carrier_scan = whole_carrier_scan;
+                return Ok(with_split(output));
+            }
             Err(HybridBuildFailure::Periodic { original }) => {
                 if split_attempted.len() < HYBRID_RETRY_LIMIT
                     && split_attempted.insert(original)
@@ -459,6 +980,7 @@ fn hybrid_plane_cylinder_brep_once(
     indices: &[u32],
     options: &SegmentOptions,
     segmentation: &MeshSegmentation,
+    split_noise: f64,
     mut arena: TopologyArena,
     forced_demotions: &BTreeSet<u32>,
 ) -> Result<HybridBrepOutput, HybridBuildFailure> {
@@ -500,6 +1022,14 @@ fn hybrid_plane_cylinder_brep_once(
     let tolerance = (options.fit_tolerance * diagonal)
         .min(2.0e-6 * diagonal)
         .max(1.0e-10);
+    // Lane J row 5, promoted ON: the exact-topology bar is raised to twice
+    // the vertex noise the mesh carries on its large planes.
+    // BREP_HYBRID_MESH_NOISE=0 keeps the bar at the fit tolerance alone.
+    let tolerance = if std::env::var("BREP_HYBRID_MESH_NOISE").map_or(true, |v| v != "0") {
+        tolerance.max(2.0 * measured_plane_noise(segmentation).max(split_noise))
+    } else {
+        tolerance
+    };
     let incidence = edge_incidence(&triangles)?;
     validate_closed_incidence(&triangles, &incidence)?;
     let local = local_regions(
@@ -577,6 +1107,16 @@ fn hybrid_plane_cylinder_brep_once(
         &cylinder_carriers,
         tolerance,
     );
+    let chains = split_crossing_cylinder_chains(
+        chains,
+        &mut boundaries,
+        &mut vertices,
+        &cylinder_carriers,
+        tolerance,
+    );
+    if split_freeform_enabled() {
+        pin_crossing_chain_ends(&chains, &mut vertices, &cylinder_carriers, tolerance);
+    }
     let pointed_cones = pointed_cone_regions(
         &cone_carriers,
         &local.triangle_regions,
@@ -884,16 +1424,37 @@ fn hybrid_plane_cylinder_brep_once(
         .filter(|region| spheres.contains_key(region) || cylinders.contains_key(region))
         .map(|region| local_to_original[region])
         .collect::<BTreeSet<_>>();
-    finish_shell(arena, stats).map_err(|message| {
+    let fail = |message: String| {
         if speculative.is_empty() {
             HybridBuildFailure::Global(message)
         } else {
             HybridBuildFailure::Speculative {
-                originals: speculative.into_iter().collect(),
+                originals: speculative.iter().copied().collect(),
                 message,
             }
         }
-    })
+    };
+    let output = finish_shell(arena, stats).map_err(&fail)?;
+    // The rebuild must keep the source shell's topology. A closed source
+    // mesh has genus (2 − V + E − F)/2; an output with another genus is a
+    // different body however close its area and volume: the kernel's
+    // crossed cylinders at chord 0.05 rebuilt with exact area and volume as
+    // a genus-1 shell (the two branch arms one seamless face), and point-in-
+    // face then read 605 of 777 arm points outside it.
+    let mut used = BTreeSet::new();
+    for triangle in &triangles {
+        used.extend(triangle.iter().copied());
+    }
+    let mesh_chi = used.len() as i64 - incidence.len() as i64 + triangles.len() as i64;
+    let output_genus = brep_kernel::solid_euler(&output.solid).genus;
+    if mesh_chi % 2 == 0 && output_genus.is_some_and(|genus| genus != (2 - mesh_chi) / 2) {
+        return Err(fail(format!(
+            "hybrid BREP: the rebuilt shell has genus {} but the source mesh has genus {}",
+            output_genus.unwrap_or(-1),
+            (2 - mesh_chi) / 2
+        )));
+    }
+    Ok(output)
 }
 
 /// Convert the assembled arena and run the whole-body checks.
@@ -1299,6 +1860,42 @@ fn cylinder_pair_section(
     Some((p1.add(p2).scale(0.5), normals))
 }
 
+/// A mesh edge that cuts the corner at a tangent point of two equal-radius
+/// crossing cylinders: both ends on both walls, one end on each section
+/// plane, and the tangent point `center ± r·(a1 × a2)` closer to the edge than
+/// the edge is long. `split_crossing_cylinder_chains` moves the end nearest
+/// the tangent point onto it, so the edge is not a reason to demote.
+fn cylinder_pair_corner_cut(
+    first: CylinderCarrier,
+    second: CylinderCarrier,
+    a: Vec3,
+    b: Vec3,
+    tolerance: f64,
+) -> bool {
+    let Some((center, normals)) = cylinder_pair_section(first, second, tolerance) else {
+        return false;
+    };
+    let bar = |cylinder: CylinderCarrier| accepted_radial_bar(tolerance * 4.0, cylinder.deviation);
+    if [a, b].iter().any(|&point| {
+        (radial(first, point).length() - first.radius).abs() > bar(first)
+            || (radial(second, point).length() - second.radius).abs() > bar(second)
+    }) {
+        return false;
+    }
+    let on = |point: Vec3, k: usize| point.sub(center).dot(normals[k]).abs() <= tolerance * 4.0;
+    if !((on(a, 0) && on(b, 1)) || (on(a, 1) && on(b, 0))) {
+        return false;
+    }
+    let Ok(minor) = first.axis.cross(second.axis).normalized() else {
+        return false;
+    };
+    let radius = 0.5 * (first.radius + second.radius);
+    let length = b.sub(a).length();
+    [center.add(minor.scale(radius)), center.sub(minor.scale(radius))]
+        .iter()
+        .any(|&tangent| tangent.sub(a).length().min(tangent.sub(b).length()) < length)
+}
+
 /// The section plane normal a cylinder/cylinder edge lies in, when both
 /// ends are on both walls and on one plane of [`cylinder_pair_section`].
 fn cylinder_pair_section_normal(
@@ -1697,7 +2294,14 @@ fn local_regions(
                                     &[vertices[a], vertices[b]],
                                     tolerance,
                                 )
-                                .is_some(),
+                                .is_some()
+                                || cylinder_pair_corner_cut(
+                                    first,
+                                    second,
+                                    vertices[a],
+                                    vertices[b],
+                                    tolerance,
+                                ),
                             "cylinder/cylinder edge is neither a shared ruling nor an equal-radius crossing",
                         ),
                         (Revolve::Sphere(sphere), Some(other))
@@ -2034,6 +2638,13 @@ fn local_regions(
             - original_cones.len()
             - original_spheres.len()
             - original_tori.len(),
+        // Filled in by the retry loop from the segmentation's split report.
+        split_freeform_regions: 0,
+        split_declined_regions: 0,
+        split_over_budget_regions: 0,
+        split_budget_hit_regions: 0,
+        split_band_declined_regions: 0,
+        whole_carrier_scan: Default::default(),
     };
     Ok(LocalRegions {
         triangle_regions: local_triangle_regions,
@@ -2058,7 +2669,14 @@ fn region_boundaries(
     let mut chain_by_edges = BTreeMap::<Vec<EdgeKey>, usize>::new();
     let mut boundaries = Vec::with_capacity(region_count);
     for region in 0..region_count as u32 {
-        let mut outgoing = BTreeMap::<usize, (usize, u32)>::new();
+        // Directed boundary edges of this region, keyed by their start, with
+        // the region triangle that owns each. A vertex normally starts one;
+        // where two holes of one face touch at a vertex (two equal-radius
+        // crossing cylinders leave the through wall's two branch openings
+        // meeting at the tangent points) it starts two, and the walk picks
+        // the successor by turning through this region's own triangles
+        // around the vertex, which keeps each loop on its own side.
+        let mut outgoing = BTreeMap::<usize, Vec<(usize, u32, usize)>>::new();
         for (triangle_id, triangle) in triangles.iter().enumerate() {
             if regions[triangle_id] != region {
                 continue;
@@ -2069,34 +2687,72 @@ fn region_boundaries(
                 let incident = &incidence[&edge_key(a, b)];
                 let other = incident.iter().copied().find(|&id| id != triangle_id);
                 let neighbor = other.map(|id| regions[id]).unwrap_or(u32::MAX);
-                if neighbor != region && outgoing.insert(a, (b, neighbor)).is_some() {
-                    return Err(format!(
-                        "hybrid BREP: region {region} boundary pinches at vertex {a}"
-                    ));
+                if neighbor != region {
+                    outgoing.entry(a).or_default().push((b, neighbor, triangle_id));
                 }
             }
         }
-        let starts = outgoing.keys().copied().collect::<Vec<_>>();
-        let mut visited = BTreeSet::new();
+        // The successor of boundary edge (from -> at) owned by `owner`:
+        // rotate around `at` through region triangles until an edge leaving
+        // `at` is a boundary edge.
+        let successor = |at: usize, owner: usize| -> Option<(usize, u32)> {
+            let starts = outgoing.get(&at)?;
+            if starts.len() == 1 {
+                return Some((starts[0].0, starts[0].1));
+            }
+            let mut triangle_id = owner;
+            for _ in 0..triangles.len() {
+                let triangle = triangles[triangle_id];
+                let corner = (0..3).find(|&c| triangle[c] == at)?;
+                let next = triangle[(corner + 1) % 3];
+                if let Some(&(b, neighbor, _)) = starts.iter().find(|&&(b, _, t)| b == next && t == triangle_id) {
+                    return Some((b, neighbor));
+                }
+                let across = incidence[&edge_key(at, next)]
+                    .iter()
+                    .copied()
+                    .find(|&id| id != triangle_id && regions[id] == region)?;
+                triangle_id = across;
+            }
+            None
+        };
+        let mut owner_of = HashMap::<(usize, usize), usize>::new();
+        for (&a, list) in &outgoing {
+            for &(b, _, t) in list {
+                owner_of.insert((a, b), t);
+            }
+        }
+        let starts = outgoing
+            .iter()
+            .flat_map(|(&a, list)| list.iter().map(move |&(b, _, _)| (a, b)))
+            .collect::<Vec<_>>();
+        let mut visited = BTreeSet::<(usize, usize)>::new();
         let mut cycles = Vec::new();
-        for start in starts {
-            if visited.contains(&start) {
+        for (start_a, start_b) in starts {
+            if visited.contains(&(start_a, start_b)) {
                 continue;
             }
             let mut steps = Vec::<(usize, usize, u32)>::new();
-            let mut current = start;
+            let (mut current, mut next) = (start_a, start_b);
+            let mut neighbor = outgoing[&start_a]
+                .iter()
+                .find(|&&(b, _, _)| b == start_b)
+                .map(|&(_, n, _)| n)
+                .unwrap_or(u32::MAX);
             loop {
-                if !visited.insert(current) {
+                if !visited.insert((current, next)) {
                     return Err(format!(
                         "hybrid BREP: region {region} boundary self-crosses"
                     ));
                 }
-                let &(next, neighbor) = outgoing
-                    .get(&current)
-                    .ok_or_else(|| format!("hybrid BREP: region {region} boundary walk is open"))?;
                 steps.push((current, next, neighbor));
+                let owner = owner_of[&(current, next)];
+                let (after, after_neighbor) = successor(next, owner)
+                    .ok_or_else(|| format!("hybrid BREP: region {region} boundary walk is open"))?;
                 current = next;
-                if current == start {
+                next = after;
+                neighbor = after_neighbor;
+                if (current, next) == (start_a, start_b) {
                     break;
                 }
             }
@@ -2159,12 +2815,19 @@ fn region_boundaries(
                     .iter()
                     .position(|&vertex| vertex == a)
                     .ok_or("hybrid BREP: shared chain start is missing")?;
+                // A loop pinned at one vertex (a face boundary touching itself
+                // where two openings meet) is stored open with equal ends.
+                let pinned = !stored.closed
+                    && stored.vertices.len() > 2
+                    && stored.vertices.first() == stored.vertices.last();
                 let forward = if stored.closed {
                     stored.vertices[(position + 1) % stored.vertices.len()] == b
                 } else if position + 1 < stored.vertices.len() && stored.vertices[position + 1] == b
                 {
                     true
                 } else if position > 0 && stored.vertices[position - 1] == b {
+                    false
+                } else if pinned && position == 0 && stored.vertices[stored.vertices.len() - 2] == b {
                     false
                 } else {
                     return Err("hybrid BREP: shared chain directions disagree".into());
@@ -2248,6 +2911,204 @@ fn split_bent_planar_chains(
     result
 }
 
+/// Rewrite every traversal of chain `i` as the traversals of
+/// `replacement[i]`, in order (reversed for a backward traversal).
+fn rewrite_traversals(boundaries: &mut [RegionBoundary], replacement: &[Vec<usize>]) {
+    for boundary in boundaries.iter_mut() {
+        for cycle in &mut boundary.cycles {
+            let mut rewritten = Vec::with_capacity(cycle.len());
+            for traversal in cycle.iter() {
+                let pieces = &replacement[traversal.chain];
+                if traversal.forward {
+                    rewritten.extend(pieces.iter().map(|&chain| Traversal { chain, forward: true }));
+                } else {
+                    rewritten.extend(pieces.iter().rev().map(|&chain| Traversal { chain, forward: false }));
+                }
+            }
+            *cycle = rewritten;
+        }
+    }
+}
+
+/// Two equal-radius cylinders whose axes cross meet in two half-ellipses,
+/// one in each section plane of [`cylinder_pair_section`], joined at the two
+/// tangent points `center ± r·(a1 × a2)`. A tessellation rarely puts a vertex
+/// exactly there: the mesh edge that cuts the corner has one end on each
+/// plane, the closed chain lies in neither, and the builder demoted both
+/// walls ("neither a shared ruling nor an equal-radius crossing": the kernel's
+/// own crossed cylinders faceted at every chord).
+///
+/// For such a closed chain the vertex nearest each tangent point is moved
+/// ONTO it — the vertex already lies on both cylinders (it is on their
+/// intersection curve) and the tangent point does too, so no carrier is left
+/// — provided no other chain uses that vertex and the move is shorter than
+/// the chain edges beside it. The loop is then split at those two vertices
+/// into two open chains, each kept only if all its points lie on one section
+/// plane; otherwise nothing is changed.
+/// Lane J row 7 (unless BREP_HYBRID_SPLIT_FREEFORM=0): when both crossing
+/// walls are in two pieces each, every seam is already an open chain ending
+/// at a tangent point, which [`split_crossing_cylinder_chains`] never moves.
+/// On a noisy mesh that end sits up to the noise off the point (5e-3 at
+/// radius 10) and each section curve misses it by as much. An open
+/// cylinder/cylinder chain end within the exact-topology bar of a tangent
+/// point of its pair moves onto the point; the point lies on both walls, and
+/// every chain through it is a seam of the same crossing.
+fn pin_crossing_chain_ends(
+    chains: &[Chain],
+    vertices: &mut [Vec3],
+    cylinders: &HashMap<u32, CylinderCarrier>,
+    tolerance: f64,
+) {
+    for chain in chains {
+        if chain.closed || chain.vertices.len() < 2 {
+            continue;
+        }
+        let (Some(&first), Some(&second)) = (cylinders.get(&chain.adjacent.0), cylinders.get(&chain.adjacent.1)) else {
+            continue;
+        };
+        let Some((center, _)) = cylinder_pair_section(first, second, tolerance) else {
+            continue;
+        };
+        let Ok(minor) = first.axis.cross(second.axis).normalized() else {
+            continue;
+        };
+        let radius = 0.5 * (first.radius + second.radius);
+        for end in [chain.vertices[0], *chain.vertices.last().unwrap()] {
+            for tangent in [center.add(minor.scale(radius)), center.sub(minor.scale(radius))] {
+                if vertices[end].sub(tangent).length() <= tolerance * 4.0 {
+                    vertices[end] = tangent;
+                }
+            }
+        }
+    }
+}
+
+fn split_crossing_cylinder_chains(
+    chains: Vec<Chain>,
+    boundaries: &mut [RegionBoundary],
+    vertices: &mut [Vec3],
+    cylinders: &HashMap<u32, CylinderCarrier>,
+    tolerance: f64,
+) -> Vec<Chain> {
+    let mut uses = HashMap::<usize, usize>::new();
+    for chain in &chains {
+        for &vertex in &chain.vertices {
+            *uses.entry(vertex).or_default() += 1;
+        }
+    }
+    let mut result = Vec::with_capacity(chains.len());
+    let mut replacement: Vec<Vec<usize>> = Vec::with_capacity(chains.len());
+    let mut changed = false;
+    for chain in chains {
+        let split = (|| -> Option<(Vec<Chain>, Vec<(usize, Vec3)>)> {
+            // A loop pinned at one vertex is stored open with equal ends;
+            // split it as the loop of its distinct vertices, keeping the pin
+            // as the first piece's start.
+            let pinned = !chain.closed
+                && chain.vertices.len() > 3
+                && chain.vertices.first() == chain.vertices.last();
+            if !(chain.closed || pinned) || chain.vertices.len() < 4 {
+                return None;
+            }
+            let loop_vertices = if pinned {
+                chain.vertices[..chain.vertices.len() - 1].to_vec()
+            } else {
+                chain.vertices.clone()
+            };
+            let first = *cylinders.get(&chain.adjacent.0)?;
+            let second = *cylinders.get(&chain.adjacent.1)?;
+            let (center, normals) = cylinder_pair_section(first, second, tolerance)?;
+            let bar = tolerance * 4.0;
+            let points: Vec<Vec3> = loop_vertices.iter().map(|&id| vertices[id]).collect();
+            let on = |point: Vec3, k: usize| point.sub(center).dot(normals[k]).abs() <= bar;
+            if points.iter().all(|&p| on(p, 0)) || points.iter().all(|&p| on(p, 1)) {
+                return None;
+            }
+            let minor = first.axis.cross(second.axis).normalized().ok()?;
+            let radius = 0.5 * (first.radius + second.radius);
+            let count = loop_vertices.len();
+            let mut corners = Vec::new();
+            for tangent in [center.add(minor.scale(radius)), center.sub(minor.scale(radius))] {
+                let (index, distance) = points
+                    .iter()
+                    .enumerate()
+                    .map(|(i, p)| (i, p.sub(tangent).length()))
+                    .min_by(|a, b| a.1.total_cmp(&b.1))?;
+                let before = points[(index + count - 1) % count].sub(points[index]).length();
+                let after = points[(index + 1) % count].sub(points[index]).length();
+                // Already on the tangent point: nothing moves, so other
+                // chains through it (the pin) are unaffected. Lane J row 7
+                // (unless BREP_HYBRID_SPLIT_FREEFORM=0): on a noisy mesh "on"
+                // means within the noise-raised bar, and a pin 5e-3 off the
+                // point at radius 10 left every section curve that gap from
+                // it, past topology validation; the pin then moves onto the
+                // point (below), which every chain through it shares.
+                let exact = distance <= bar;
+                if !exact && (uses.get(&loop_vertices[index]) != Some(&1) || distance >= before.max(after)) {
+                    return None;
+                }
+                corners.push((index, tangent));
+            }
+            let (i, j) = (corners[0].0.min(corners[1].0), corners[0].0.max(corners[1].0));
+            if i == j || j - i < 2 || count - (j - i) < 2 {
+                return None;
+            }
+            let mut moved = points.clone();
+            for &(index, tangent) in &corners {
+                moved[index] = tangent;
+            }
+            let one_plane = |range: &[Vec3]| range.iter().all(|&p| on(p, 0)) || range.iter().all(|&p| on(p, 1));
+            let mut wrap = moved[j..].to_vec();
+            wrap.extend_from_slice(&moved[..=i]);
+            if !one_plane(&moved[i..=j]) || !one_plane(&wrap) {
+                return None;
+            }
+            // A pinned chain is traversed from its pin (stored vertex 0), so
+            // the pin must be one of the two corners.
+            if pinned && i != 0 {
+                return None;
+            }
+            let mut tail = loop_vertices[j..].to_vec();
+            tail.extend_from_slice(&loop_vertices[..=i]);
+            // Traversal order: from stored vertex 0 (= corner i when i == 0)
+            // the loop runs i..=j, then j.. wrapping back to i.
+            let pieces = vec![
+                Chain { vertices: loop_vertices[i..=j].to_vec(), closed: false, adjacent: chain.adjacent },
+                Chain { vertices: tail, closed: false, adjacent: chain.adjacent },
+            ];
+            let pin_moves = split_freeform_enabled();
+            let moves = corners
+                .iter()
+                .filter(|&&(index, t)| {
+                    let off = points[index].sub(t).length();
+                    off > bar || (pin_moves && off > 0.0)
+                })
+                .map(|&(index, t)| (loop_vertices[index], t))
+                .collect();
+            Some((pieces, moves))
+        })();
+        match split {
+            Some((pieces, moves)) => {
+                for (vertex, tangent) in moves {
+                    vertices[vertex] = tangent;
+                }
+                let start = result.len();
+                replacement.push((start..start + pieces.len()).collect());
+                result.extend(pieces);
+                changed = true;
+            }
+            None => {
+                replacement.push(vec![result.len()]);
+                result.push(chain);
+            }
+        }
+    }
+    if changed {
+        rewrite_traversals(boundaries, &replacement);
+    }
+    result
+}
+
 fn chain_points(chain: &Chain, vertices: &[Vec3]) -> Vec<Vec3> {
     chain.vertices.iter().map(|&id| vertices[id]).collect()
 }
@@ -2259,7 +3120,8 @@ fn snap_cylinder_axes(
     vertices: &[Vec3],
     tolerance: f64,
 ) -> Result<(), (u32, String)> {
-    for (&region, cylinder) in cylinders.iter_mut() {
+    let mut snapped = HashMap::<u32, Vec<Vec3>>::new();
+    for (&region, cylinder) in cylinders.iter() {
         let mut candidates = Vec::new();
         for chain in chains.iter().filter(|chain| {
             chain.closed && (chain.adjacent.0 == region || chain.adjacent.1 == region)
@@ -2289,6 +3151,34 @@ fn snap_cylinder_axes(
                 candidates.push(axis.normalized().map_err(|error| (region, error))?);
             }
         }
+        snapped.insert(region, candidates);
+    }
+    // Lane J row 7 (unless BREP_HYBRID_SPLIT_FREEFORM=0): regions that carry
+    // one carrier bit for bit are pieces of one wall (the freeform split
+    // writes each edge-connected piece of a carrier as its own region) and
+    // take one axis: the walls of crossing cylinders meet at tangent points
+    // shared by every piece, so pieces snapped to different noisy cap normals
+    // imply different tangent points and the section curves miss them.
+    let shared = split_freeform_enabled();
+    let original = cylinders.clone();
+    let mut regions: Vec<u32> = cylinders.keys().copied().collect();
+    regions.sort_unstable();
+    for &region in &regions {
+        let cylinder = original[&region];
+        let group: Vec<u32> = if shared {
+            regions
+                .iter()
+                .copied()
+                .filter(|other| {
+                    let o = original[other];
+                    let same = |a: Vec3, b: Vec3| a.x == b.x && a.y == b.y && a.z == b.z;
+                    same(o.origin, cylinder.origin) && same(o.axis, cylinder.axis) && o.radius == cylinder.radius
+                })
+                .collect()
+        } else {
+            vec![region]
+        };
+        let candidates: Vec<Vec3> = group.iter().flat_map(|member| snapped[member].iter().copied()).collect();
         if let Some(&axis) = candidates.first() {
             // Independent plane fits to rounded STL rings need not have
             // bit-identical normals. Bound their disagreement by the
@@ -2303,7 +3193,18 @@ fn snap_cylinder_axes(
                     format!("hybrid BREP: cylinder {region} has inconsistent ring normals"),
                 ));
             }
-            cylinder.axis = axis;
+            let axis = if group.len() > 1 {
+                candidates
+                    .iter()
+                    .fold(Vec3::new(0.0, 0.0, 0.0), |sum, &c| sum.add(c))
+                    .normalized()
+                    .map_err(|error| (region, error))?
+            } else {
+                axis
+            };
+            if let Some(cylinder) = cylinders.get_mut(&region) {
+                cylinder.axis = axis;
+            }
         }
     }
     Ok(())

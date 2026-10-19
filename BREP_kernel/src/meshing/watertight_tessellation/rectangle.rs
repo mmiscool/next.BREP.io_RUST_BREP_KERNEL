@@ -6,12 +6,26 @@
 //! consuming each boundary segment exactly once without inserting stations.
 //! No station seeding, ear clipping or Lawson flips are needed. Failure of any
 //! shape, sample or tolerance check declines atomically to the existing path.
+//!
+//! The grid is sized to nine tenths of the chord from sampled curvature; a
+//! candidate that still misses an interior check grows by the measured
+//! overshoot, not by a whole bisection, so a diagonal 0.15 % over the bar
+//! costs a tenth more lines rather than four times the triangles.
 use super::*;
 use std::cell::Cell;
 
 const RECTANGLE_DEFAULT: bool = true;
 const MAX_LINES: usize = 512;
 const MAX_VERTICES: usize = 100_000;
+/// The grid is sized to this fraction of the chord: the curvature estimate is
+/// read at nine samples per span pair, and a curvature between the samples
+/// must still leave the candidate inside the bar. A convex rim fillet sized
+/// at the bar itself missed by 0.15 % on one diagonal.
+const SAG_SIZING_FRACTION: f64 = 0.9;
+/// A failed interior check lengthens the grid by the measured overshoot
+/// (sag scales as the inverse square of the count), at least by this factor
+/// so every pass makes progress, at most by two (the old bisection).
+const MIN_REFINE_FACTOR: f64 = 1.1;
 thread_local! {
     static RECTANGLE_OVERRIDE: Cell<Option<bool>> = const { Cell::new(None) };
 }
@@ -219,10 +233,19 @@ fn knot_lines(knots: &[f64], lo: f64, hi: f64) -> Vec<f64> {
 }
 
 /// Sample each knot span separately so an inflected multi-span carrier cannot
-/// disappear at the whole-domain midpoint. Bound the quadratic diagonal by
-/// allocating a quarter chord to each pure partial and half to the mixed one.
-/// The bounds are estimates, not interval proofs; emitted triangles are checked
-/// independently below, and a failed check refines or declines.
+/// disappear at the whole-domain midpoint. Each direction is sized at the
+/// whole chord from the component of its second partial square to its own
+/// tangent: the deflection an edge midpoint shows from its chord, which a
+/// rational parametrization's tangential acceleration never adds to. The
+/// cell diagonal the grid triangulates is then read with its mixed term and
+/// its normal turn, and a cell that would exceed either bar lengthens both
+/// its counts by the factor that brings it to the bar. The promoted lane
+/// allocated a quarter chord to each pure partial and half to the mixed one
+/// from the full second-derivative lengths, which gridded a concave fillet
+/// band 489 x 70 (66 806 triangles, mean sag chord/11) where the generic
+/// road emits 21 314 at the bar; this estimate reads 262 x 51 (26 054).
+/// The bounds are estimates, not interval proofs; emitted triangles are
+/// checked independently below, and a failed check refines or declines.
 fn curvature_grid(
     face: &FaceRecord,
     bounds: [f64; 4],
@@ -233,6 +256,14 @@ fn curvature_grid(
     let vs = knot_lines(&face.surface.knots_v, v0, v1);
     let mut nu = vec![3usize; us.len() - 1];
     let mut nv = vec![3usize; vs.len() - 1];
+    let perp = |x: Vec3, t: Vec3| -> Vec3 {
+        let tt = t.length_squared();
+        if tt > 0. {
+            x.sub(t.scale(x.dot(t) / tt))
+        } else {
+            x
+        }
+    };
     for (i, u) in us.windows(2).enumerate() {
         for (j, v) in vs.windows(2).enumerate() {
             let du = u[1] - u[0];
@@ -257,16 +288,73 @@ fn curvature_grid(
                         |x: Vec3| x.sub(normal.scale(x.dot(normal))).length() / length;
                     let turn_u = normal_rate(d[2][0].cross(d[0][1]).add(d[1][0].cross(d[1][1])));
                     let turn_v = normal_rate(d[1][1].cross(d[0][1]).add(d[1][0].cross(d[0][2])));
-                    let su = d[2][0].length() + d[1][1].length() * dv / du;
-                    let sv = d[0][2].length() + d[1][1].length() * du / dv;
+                    let su = perp(d[2][0], d[1][0]).length();
+                    let sv = perp(d[0][2], d[0][1]).length();
                     let count = |width: f64, second: f64, turn: f64| {
-                        (width * (second / (2. * chord)).sqrt())
-                            .max(width * turn / ANGULAR_TOL)
+                        (width * (second / (8. * chord * SAG_SIZING_FRACTION)).sqrt())
+                            .max(width * turn / (ANGULAR_TOL * SAG_SIZING_FRACTION))
                             .ceil() as usize
                     };
                     nu[i] = nu[i].max(count(du, su, turn_u));
                     nv[j] = nv[j].max(count(dv, sv, turn_v));
                 }
+            }
+        }
+    }
+    {
+        // The cell diagonal the grid triangulates runs from (u, v) to
+        // (u + du, v + dv): its midpoint deflection is the second derivative
+        // along it, square to its tangent, over eight; its normal turn is the
+        // rate along it. Lengthen both counts of a cell that exceeds either
+        // bar by the factor that brings it to the bar (sag scales as the
+        // inverse square of the count, the turn as the inverse); repeat
+        // until every sampled cell holds, since a count serves every cell of
+        // its span.
+        for _ in 0..6 {
+            let mut grew = false;
+            for (i, u) in us.windows(2).enumerate() {
+                for (j, v) in vs.windows(2).enumerate() {
+                    let cu = (u[1] - u[0]) / nu[i] as f64;
+                    let cv = (v[1] - v[0]) / nv[j] as f64;
+                    let mut worst = 1.0_f64;
+                    for a in [0.0, 0.5, 1.0] {
+                        for b in [0.0, 0.5, 1.0] {
+                            let a: f64 = a;
+                            let b: f64 = b;
+                            let d = face.surface.derivatives_small(
+                                u[0] + a.clamp(1e-8, 1. - 1e-8) * (u[1] - u[0]),
+                                v[0] + b.clamp(1e-8, 1. - 1e-8) * (v[1] - v[0]),
+                                2,
+                            )?;
+                            let tangent = d[1][0].scale(cu).add(d[0][1].scale(cv));
+                            let second = d[2][0]
+                                .scale(cu * cu)
+                                .add(d[1][1].scale(2. * cu * cv))
+                                .add(d[0][2].scale(cv * cv));
+                            let sag = perp(second, tangent).length() / 8.;
+                            let cross = d[1][0].cross(d[0][1]);
+                            let length = cross.length();
+                            let normal = cross.scale(1. / length);
+                            let rate = |x: Vec3| x.sub(normal.scale(x.dot(normal))).length() / length;
+                            let turn = rate(
+                                d[2][0].cross(d[0][1]).add(d[1][0].cross(d[1][1])).scale(cu).add(
+                                    d[1][1].cross(d[0][1]).add(d[1][0].cross(d[0][2])).scale(cv),
+                                ),
+                            );
+                            worst = worst
+                                .max((sag / (chord * SAG_SIZING_FRACTION)).sqrt())
+                                .max(turn / (ANGULAR_TOL * SAG_SIZING_FRACTION));
+                        }
+                    }
+                    if worst > 1.0 {
+                        nu[i] = (nu[i] as f64 * worst).ceil() as usize;
+                        nv[j] = (nv[j] as f64 * worst).ceil() as usize;
+                        grew = true;
+                    }
+                }
+            }
+            if !grew {
+                break;
             }
         }
     }
@@ -392,7 +480,10 @@ fn triangle_distance(p: Vec3, a: Vec3, b: Vec3, c: Vec3) -> f64 {
 #[derive(Clone, Copy)]
 enum GridCheck {
     Passed,
-    RefineGrid,
+    /// An interior triangle failed; carries the factor by which the line
+    /// counts must grow for the failing reading to meet its bar (two when
+    /// the reading has no such scale, as a normal disagreement).
+    RefineGrid(f64),
     RefineRim,
 }
 
@@ -409,10 +500,13 @@ fn within_tolerance(
         .map(|p| face_normal_at(face, p.uv, bounds))
         .collect::<Result<_, _>>()?;
     for &[a, b, c] in triangles {
-        let failure = if [a, b, c].iter().any(|&i| i < boundary_count) {
-            GridCheck::RefineRim
-        } else {
-            GridCheck::RefineGrid
+        let rim = [a, b, c].iter().any(|&i| i < boundary_count);
+        let failure = |factor: f64| {
+            if rim {
+                GridCheck::RefineRim
+            } else {
+                GridCheck::RefineGrid(factor)
+            }
         };
         let points = [vertices[a], vertices[b], vertices[c]];
         let geometric = points[1]
@@ -430,7 +524,7 @@ fn within_tolerance(
                     points.map(|p| p.uv)
                 );
             }
-            return Ok(failure);
+            return Ok(failure(2.0));
         }
         for (i, j) in [(a, b), (b, c), (c, a)] {
             // Both boundary endpoints: the shared sampler owns the angular
@@ -441,15 +535,16 @@ fn within_tolerance(
             ];
             let p = face.surface.evaluate(uv[0], uv[1])?;
             let sag = deflection_to_chord(p, vertices[i].position, vertices[j].position);
-            if sag > chord
-                || ((i >= boundary_count || j >= boundary_count)
-                    && sag >= ANGULAR_SAG_FLOOR * chord
-                    && normals[i].dot(normals[j]) < ANGULAR_TOL.cos())
-            {
+            let cos = normals[i].dot(normals[j]);
+            let angular = (i >= boundary_count || j >= boundary_count)
+                && sag >= ANGULAR_SAG_FLOOR * chord
+                && cos < ANGULAR_TOL.cos();
+            if sag > chord || angular {
                 if std::env::var("BREP_DEBUG_TESS_DISPATCH").is_ok() {
-                    eprintln!("[nurbs-rectangle] edge failure: {:?} -> {:?}, sag={sag}, chord={chord}, cos={}", vertices[i].uv, vertices[j].uv, normals[i].dot(normals[j]));
+                    eprintln!("[nurbs-rectangle] edge failure: {:?} -> {:?}, sag={sag}, chord={chord}, cos={cos}", vertices[i].uv, vertices[j].uv);
                 }
-                return Ok(failure);
+                let turn = if angular { cos.clamp(-1., 1.).acos() / ANGULAR_TOL } else { 1. };
+                return Ok(failure((sag / chord).sqrt().max(turn)));
             }
         }
         // Interior probes in addition to edge midpoints catch a mixed-partial
@@ -463,20 +558,20 @@ fn within_tolerance(
             let uv: [f64; 2] =
                 std::array::from_fn(|k| points.iter().zip(weights).map(|(p, w)| p.uv[k] * w).sum());
             let p = face.surface.evaluate(uv[0], uv[1])?;
-            if triangle_distance(
+            let distance = triangle_distance(
                 p,
                 points[0].position,
                 points[1].position,
                 points[2].position,
-            ) > chord
-            {
+            );
+            if distance > chord {
                 if std::env::var("BREP_DEBUG_TESS_DISPATCH").is_ok() {
                     eprintln!(
                         "[nurbs-rectangle] interior failure: {:?}, probe={uv:?}",
                         points.map(|p| p.uv)
                     );
                 }
-                return Ok(failure);
+                return Ok(failure((distance / chord).sqrt()));
             }
         }
     }
@@ -562,10 +657,18 @@ pub(super) fn tessellate_rectangle_watertight(
             }
             return Ok(true);
         }
-        let bisect = |lines: &[f64]| {
-            let mut out = Vec::with_capacity(2 * lines.len() - 1);
-            for pair in lines.windows(2) {
-                out.extend([pair[0], 0.5 * (pair[0] + pair[1])]);
+        // Lengthen the line count by `factor`: the extra lines halve
+        // intervals spread evenly along the direction; a factor of two
+        // halves every interval (the former bisection).
+        let densify = |lines: &[f64], factor: f64| {
+            let n = lines.len() - 1;
+            let extra = ((n as f64 * factor).ceil() as usize).saturating_sub(n).min(n);
+            let mut out = Vec::with_capacity(lines.len() + extra);
+            for (k, pair) in lines.windows(2).enumerate() {
+                out.push(pair[0]);
+                if (k + 1) * extra / n > k * extra / n {
+                    out.push(0.5 * (pair[0] + pair[1]));
+                }
             }
             out.push(*lines.last().unwrap());
             out
@@ -589,9 +692,10 @@ pub(super) fn tessellate_rectangle_watertight(
                 us = inset(&us);
                 vs = inset(&vs);
             }
-            GridCheck::RefineGrid => {
-                us = bisect(&us);
-                vs = bisect(&vs);
+            GridCheck::RefineGrid(overshoot) => {
+                let factor = (overshoot / SAG_SIZING_FRACTION.sqrt()).clamp(MIN_REFINE_FACTOR, 2.0);
+                us = densify(&us, factor);
+                vs = densify(&vs, factor);
             }
             GridCheck::Passed => unreachable!(),
         }

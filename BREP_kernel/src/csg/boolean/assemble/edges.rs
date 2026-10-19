@@ -31,10 +31,32 @@ pub(in crate::boolean) fn restore_edges(solid: &mut BrepSolid, replaced: Vec<Rep
 
 const STATIONS: usize = 33;
 
+thread_local! {
+    static RESIDUAL_QUERIES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static RESIDUAL_WORK: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+
 /// Worst distance from `curve` over `[t0, t1]` to the carriers in `surfaces`.
 fn worst_residual(curve: &NurbsCurve, t0: f64, t1: f64, surfaces: &[&NurbsSurface]) -> Result<f64, KernelRefusal> {
+    RESIDUAL_QUERIES.with(|queries| queries.set(queries.get() + 1));
+    // Union folds repeatedly revisit edges beside a touched face, even when
+    // their geometry and both carriers are unchanged. Cache the reading,
+    // never the repair decision: policy bars and candidate checks still run.
+    let key = crate::mass_properties::carrier_residual_identity(curve, t0, t1, surfaces);
+    crate::reading_memo::memoized(crate::reading_memo::Reading::CarrierResidual, key,
+        || worst_residual_uncached(curve, t0, t1, surfaces).ok())
+        .map(Ok).unwrap_or_else(|| worst_residual_uncached(curve, t0, t1, surfaces))
+}
+
+fn worst_residual_uncached(curve: &NurbsCurve, t0: f64, t1: f64, surfaces: &[&NurbsSurface]) -> Result<f64, KernelRefusal> {
+    let stations = carrier_stations(curve, t0, t1);
+    RESIDUAL_WORK.with(|work| {
+        let (calls, projections) = work.get();
+        work.set((calls + 1, projections + (stations.len() * surfaces.len()) as u64));
+    });
     let mut worst = 0.0f64;
-    for t in carrier_stations(curve, t0, t1) {
+    for t in stations {
         let point = curve.evaluate(t).or_refuse(KernelStage::Sew, "evaluate")?;
         for surface in surfaces {
             let projection = crate::project_point_to_surface(surface, point).or_refuse(KernelStage::Sew, "project_point_to_surface")?;
@@ -353,6 +375,8 @@ pub(in crate::boolean) fn reconstruct_edges_from_carriers_in(
     tolerance: f64,
     scope: Option<&HashSet<u64>>,
 ) -> Result<Vec<ReplacedEdge>, KernelRefusal> {
+    let queries_before = RESIDUAL_QUERIES.with(|queries| queries.get());
+    let work_before = RESIDUAL_WORK.with(|work| work.get());
     let policy = KernelTolerances::for_solid(solid, 1e-7);
     let bar = policy.model.min(tolerance.max(1e-12));
     let carrier_band = policy.pcurve_consistency;
@@ -486,6 +510,10 @@ pub(in crate::boolean) fn reconstruct_edges_from_carriers_in(
         }
     }
 
+    if std::env::var("BREP_PROFILE").is_ok() {
+        let work = RESIDUAL_WORK.with(|work| work.get());
+        eprintln!("assemble.reconstruct.work queries={} readings={} projections={}", RESIDUAL_QUERIES.with(|queries| queries.get()) - queries_before, work.0 - work_before.0, work.1 - work_before.1);
+    }
     let mut replaced = Vec::new();
     for (edge_index, curve, residual_before, residual_after) in candidates {
         let edge = &mut solid.edges[edge_index];

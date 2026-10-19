@@ -30,6 +30,7 @@ pub(crate) fn plane_section_graph_range(
     ruled: &NurbsSurface,
     range: [f64; 2],
 ) -> Option<PlaneSectionGraph> {
+    let _clock = super::ImprintSubphaseClock::new("section_graph_range");
     range_impl(plane, ruled, range, 0.0, 0.0)
 }
 
@@ -43,6 +44,7 @@ pub(crate) fn plane_section_graph_range_bounded(
     tolerance: f64,
     max_extension: f64,
 ) -> Option<PlaneSectionGraph> {
+    let _clock = super::ImprintSubphaseClock::new("section_graph_bounded");
     if !tolerance.is_finite()
         || tolerance < 0.0
         || !max_extension.is_finite()
@@ -199,6 +201,7 @@ pub(crate) fn plane_section_graph(
     plane: &NurbsSurface,
     ruled: &NurbsSurface,
 ) -> Option<PlaneSectionGraph> {
+    let _clock = super::ImprintSubphaseClock::new("section_graph");
     graph_impl(plane, ruled, 0.0, 0.0)
 }
 fn graph_impl(

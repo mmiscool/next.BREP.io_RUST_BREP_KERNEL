@@ -9,6 +9,25 @@ use super::*;
 /// Free-standing because the SOLID-level self-touch scan
 /// ([`super::self_touch::self_touch_edge_splits`]) has no builder to record
 /// into and must not diverge from the guard the builder applies.
+/// `BREP_IMPRINT_HULL_CULL`: skips the overlap test and curve crossing for
+/// boundary edges whose control hull is clear of the section's. On by
+/// default; `0`/`off` disables it.
+pub(super) fn hull_cull_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let enabled = *ON.get_or_init(|| !matches!(std::env::var("BREP_IMPRINT_HULL_CULL").as_deref(), Ok("0") | Ok("off")));
+    enabled
+}
+
+
+thread_local! {
+    /// Edges the hull cull skipped since the last [`take_hull_culls`].
+    pub(super) static HULL_CULLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+pub(super) fn take_hull_culls() -> u64 {
+    HULL_CULLS.with(|count| count.replace(0))
+}
+
 pub(super) fn push_edge_split(
     parameters: &mut Vec<f64>,
     edge: &EdgeRecord,
@@ -412,6 +431,18 @@ impl<'a> ImprintBuilder<'a> {
         } else {
             target_faces.to_vec()
         };
+        // HULL CULL (`BREP_IMPRINT_HULL_CULL`, lane X): a boundary edge whose
+        // control hull stays farther than the overlap and crossing bands from
+        // the section's can neither be ridden by it nor crossed by it (a NURBS
+        // curve lies in its control hull), so the overlap test and the curve
+        // crossing are skipped for it; its exact pierces still run.
+        let hull_cull = hull_cull_enabled();
+        let hull_band = overlap_limit.max(1e-5) * 4.0;
+        let control_hull = |nurbs: &NurbsCurve| -> Option<crate::spatial::Aabb> {
+            let points = nurbs.control_points.iter().map(|control| control.point()).collect::<Result<Vec<_>, _>>().ok()?;
+            Some(crate::spatial::Aabb::from_points(points))
+        };
+        let curve_hull = if hull_cull { control_hull(&curve) } else { None };
         for face in split_faces {
             let other = if face.key() == first.key() {
                 second
@@ -442,7 +473,14 @@ impl<'a> ImprintBuilder<'a> {
                 // spraying micro edge-splits (glue unions copy each face's
                 // edges onto the other and then hit-test them against their
                 // own coincident twins).
-                if curve_overlaps_edge(&curve, edge, overlap_limit)? {
+                let apart = match (&curve_hull, hull_cull) {
+                    (Some(hull), true) => control_hull(&edge.curve).is_some_and(|edge_hull| !hull.intersects(edge_hull, hull_band)),
+                    _ => false,
+                };
+                if apart {
+                    HULL_CULLS.with(|count| count.set(count.get() + 1));
+                }
+                if !apart && curve_overlaps_edge(&curve, edge, overlap_limit)? {
                     self.barrier_edges.insert((face.operand, edge.id));
                     self.overlap_ridden_edges.insert((face.operand, edge.id));
                     overlapped_edges.push((face.operand, edge));
@@ -480,9 +518,9 @@ impl<'a> ImprintBuilder<'a> {
                     }
                     continue;
                 }
-                let curve_hits = intersect_curves(&curve, &edge.curve, 1e-5).map_err(|error| {
+                let curve_hits = if apart { Vec::new() } else { intersect_curves(&curve, &edge.curve, 1e-5).map_err(|error| {
                     format!("imprint curve-edge crossing on edge {}: {error}", edge.id)
-                }).or_refuse(KernelStage::Intersect, "csg.imprint.builder")?;
+                }).or_refuse(KernelStage::Intersect, "csg.imprint.builder")? };
                 for hit in curve_hits {
                     if hit.t < edge.t0 - 1e-9 || hit.t > edge.t1 + 1e-9 {
                         continue;

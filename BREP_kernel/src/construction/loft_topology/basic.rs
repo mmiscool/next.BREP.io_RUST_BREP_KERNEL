@@ -247,6 +247,7 @@ fn loft_profile_brep_core(
     input_sections: &[Vec<NurbsCurve>],
     end_tangents: Option<(Vec3, Vec3)>,
 ) -> Result<BrepSolid, KernelRefusal> {
+    let mut profile = super::ConstructionProfile::new("loft");
     let tolerance = 1e-6;
     let section_count = input_sections.len();
     if section_count < 2 {
@@ -420,6 +421,7 @@ fn loft_profile_brep_core(
         }
     }
 
+    profile.lap("profile");
     let mut parameters = vec![0.0; section_count];
     let mut accumulated = vec![0.0; section_count];
     let mut columns = 0usize;
@@ -546,6 +548,7 @@ fn loft_profile_brep_core(
         .or_refuse(KernelStage::Fragment, "skin")?);
     }
 
+    profile.lap("surface");
     let bottom = &sections[0];
     let top = &sections[section_count - 1];
     let bottom_points = closed_points(bottom, tolerance)?;
@@ -620,6 +623,7 @@ fn loft_profile_brep_core(
         });
     }
 
+    profile.lap("edges");
     let mut next_id = 1000u64;
     let mut faces = Vec::with_capacity(curve_count + 2);
     for index in 0..curve_count {
@@ -697,6 +701,7 @@ fn loft_profile_brep_core(
     )?);
     let solid = BrepSolid {
         mass_properties_cache: Default::default(),
+        cells: Default::default(),
         id: next_id + 1,
         vertices,
         edges,
@@ -704,7 +709,9 @@ fn loft_profile_brep_core(
         genus: 0,
         kind: crate::BodyKind::Solid,
     };
+    profile.lap("topology_pcurves");
     let issues = solid.validate();
+    profile.lap("validation");
     if !issues.is_empty() {
         return Err(KernelRefusal::internal(
             KernelStage::Validate,
@@ -719,5 +726,7 @@ fn loft_profile_brep_core(
     // half-width — satisfies every one of its checks. This is the soundness
     // question asked at the lane's single exit, repaired where it can be and
     // refused by name where it cannot. Every path sweep ends here too.
-    crate::accept_sound(solid, "loftSolid")
+    let accepted = crate::accept_sound(solid, "loftSolid");
+    profile.lap("acceptance");
+    accepted
 }

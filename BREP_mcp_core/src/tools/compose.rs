@@ -35,6 +35,43 @@ fn u(v: &Value, k: &str, d: u64) -> u64 {
     v.get(k).and_then(Value::as_u64).unwrap_or(d)
 }
 
+/// The last segment of `path`, whichever separator the platform writes:
+/// the name a document opened from it gets.
+fn file_name(path: &str) -> Option<String> {
+    path.rsplit(['/', '\\']).next().filter(|n| !n.is_empty()).map(str::to_string)
+}
+
+/// Build a host through a spawning backend's `spawn`, off the runtime's
+/// worker: the app boots on its own thread and the call blocks until it is
+/// settled. Native only — a browser host is the page, never spawned.
+#[cfg(feature = "server")]
+async fn spawn_host(spawn: crate::host::SpawnFn, cfg: HostConfig) -> Result<crate::host::HostHandle, String> {
+    tokio::task::spawn_blocking(move || spawn(cfg)).await.map_err(|e| e.to_string())?
+}
+
+#[cfg(not(feature = "server"))]
+async fn spawn_host(_spawn: crate::host::SpawnFn, _cfg: HostConfig) -> Result<crate::host::HostHandle, String> {
+    Err("this host spawns no app: it is the session".into())
+}
+
+/// Stop a host off the runtime's worker (joining an owned host's thread
+/// blocks); an attached host is left alone either way.
+async fn stop_host(host: crate::host::HostHandle) -> Result<(), String> {
+    if !host.is_owned() {
+        host.stop();
+        return Ok(());
+    }
+    #[cfg(feature = "server")]
+    {
+        tokio::task::spawn_blocking(move || host.stop()).await.map_err(|e| e.to_string())
+    }
+    #[cfg(not(feature = "server"))]
+    {
+        host.stop();
+        Ok(())
+    }
+}
+
 pub fn session_tools(cx: Arc<ServerContext>) -> Vec<ToolSpec> {
     let start_cx = cx.clone();
     let stop_cx = cx.clone();
@@ -64,6 +101,9 @@ pub fn session_tools(cx: Arc<ServerContext>) -> Vec<ToolSpec> {
                             session.set_recording(b(&args, "record", true));
                             session
                         }
+                        #[cfg(not(feature = "server"))]
+                        Backend::Spawn { .. } => return Err("this host spawns no app: it is the session".into()),
+                        #[cfg(feature = "server")]
                         Backend::Spawn { name, spawn } => {
                             if cx.slot.read().await.is_some() {
                                 return Err("a session is already live; call session_stop first".into());
@@ -86,16 +126,13 @@ pub fn session_tools(cx: Arc<ServerContext>) -> Vec<ToolSpec> {
                                 seed: b(&args, "seed", false),
                                 store_dir,
                             };
-                            let spawn = spawn.clone();
-                            let built = cfg.clone();
-                            let host = tokio::task::spawn_blocking(move || spawn(built)).await.map_err(|e| e.to_string())??;
+                            let host = spawn_host(spawn.clone(), cfg.clone()).await?;
                             Arc::new(Session::new(&root, host, Some(cfg), b(&args, "record", true))?)
                         }
                     };
                     if let Some(path) = s(&args, "document") {
-                        let text = std::fs::read_to_string(&path).map_err(|e| format!("{path}: {e}"))?;
-                        let name = std::path::Path::new(&path).file_name().map(|n| n.to_string_lossy().to_string());
-                        session.host.call_ok("doc_load", json!({ "json": text, "name": name })).await?;
+                        let text = session.host.platform.read_text(path.clone()).await?;
+                        session.host.call_ok("doc_load", json!({ "json": text, "name": file_name(&path) })).await?;
                     }
                     let describe = session.host.call_ok("describe_commands", json!({})).await?.result.unwrap_or(Value::Null);
                     let was_live = cx.slot.read().await.is_some();
@@ -134,7 +171,7 @@ pub fn session_tools(cx: Arc<ServerContext>) -> Vec<ToolSpec> {
                     };
                     let info = session.info();
                     match Arc::try_unwrap(session) {
-                        Ok(s) => tokio::task::spawn_blocking(move || s.host.stop()).await.map_err(|e| e.to_string())?,
+                        Ok(s) => stop_host(s.host).await?,
                         Err(_) => return Err("session still in use by another call".into()),
                     }
                     (cx.on_tools_changed)();
@@ -172,16 +209,14 @@ pub fn session_tools(cx: Arc<ServerContext>) -> Vec<ToolSpec> {
                     // the whole point of a restart is to read what the first one
                     // left behind.
                     match Arc::try_unwrap(old) {
-                        Ok(s) => tokio::task::spawn_blocking(move || s.host.stop()).await.map_err(|e| e.to_string())?,
+                        Ok(s) => stop_host(s.host).await?,
                         Err(still_held) => {
                             *cx.slot.write().await = Some(still_held);
                             return Err("session still in use by another call".into());
                         }
                     }
                     let root = cx.session_root.clone();
-                    let spawn = spawn.clone();
-                    let built = config.clone();
-                    let host = tokio::task::spawn_blocking(move || spawn(built)).await.map_err(|e| e.to_string())??;
+                    let host = spawn_host(spawn.clone(), config.clone()).await?;
                     let session = Arc::new(Session::new(&root, host, Some(config), record)?);
                     *cx.slot.write().await = Some(session.clone());
                     let after = after_wait(&session, u(&args, "timeout_ms", 60_000)).await?;
@@ -299,9 +334,7 @@ pub async fn attach_session(cx: &ServerContext, record: bool) -> Result<Arc<Sess
     if let Some(ppp) = frame["ppp"].as_f64() {
         host.info.ppp = ppp as f32;
     }
-    let root = cx.session_root.clone();
-    std::fs::create_dir_all(&root).map_err(|e| format!("session root {}: {e}", root.display()))?;
-    let session = Arc::new(Session::new(&root, host, None, record)?);
+    let session = Arc::new(Session::new(&cx.session_root, host, None, record)?);
     *cx.slot.write().await = Some(session.clone());
     Ok(session)
 }
@@ -651,11 +684,11 @@ pub fn pointer_tools(slot: SessionSlot) -> Vec<ToolSpec> {
                     let session = current(&slot).await?;
                     let want = u(&args, "count", 1).max(1);
                     let timeout_ms = u(&args, "timeout_ms", 60_000);
-                    let started = std::time::Instant::now();
+                    let started = session.host.platform.now_ms();
                     let from = session.host.call_ok("ping", json!({})).await?.frame;
                     let mut now = from;
                     while now < from + want {
-                        if started.elapsed().as_millis() as u64 > timeout_ms {
+                        if session.host.platform.now_ms() - started > timeout_ms as f64 {
                             return Err(format!("wait_frames: only {} of {want} frames in {timeout_ms} ms", now - from));
                         }
                         now = session.host.call_ok("ping", json!({})).await?.frame;
@@ -687,7 +720,7 @@ pub fn pointer_tools(slot: SessionSlot) -> Vec<ToolSpec> {
                         serde_json::from_value(args.get("until").cloned().unwrap_or(json!([]))).map_err(|e| format!("wait_state: `until`: {e}"))?;
                     let max_frames = u(&args, "max_frames", 600).max(1);
                     let timeout_ms = u(&args, "timeout_ms", 60_000);
-                    let started = std::time::Instant::now();
+                    let started = session.host.platform.now_ms();
                     let mut frames = 0;
                     loop {
                         let state = session.host.call_ok("state_get", json!({ "names": names })).await?.result.unwrap_or(Value::Null);
@@ -695,7 +728,7 @@ pub fn pointer_tools(slot: SessionSlot) -> Vec<ToolSpec> {
                         let Some(unmet) = unmet else {
                             return Ok(ToolOutput::json(json!({ "frames": frames, "state": state })));
                         };
-                        if frames >= max_frames || started.elapsed().as_millis() as u64 > timeout_ms {
+                        if frames >= max_frames || session.host.platform.now_ms() - started > timeout_ms as f64 {
                             return Err(format!("wait_state: after {frames} frames, still {unmet}"));
                         }
                         session.host.call_ok("ping", json!({})).await?;
@@ -1204,10 +1237,13 @@ pub fn capture_tools(slot: SessionSlot) -> Vec<ToolSpec> {
                     if !ids.insert(id.to_string()) { return Err(format!("duplicate view id {id}")); }
                 }
                 // A dropped MCP future signals cancellation but does not abort
-                // the owned cleanup task. It finishes the current capture and
-                // restores the presentation before stopping.
+                // the owned cleanup task (the platform runs it to its end). It
+                // finishes the current capture and restores the presentation
+                // before stopping.
                 let (cancel_tx, mut cancel_rx) = tokio::sync::oneshot::channel::<()>();
-                let task = tokio::spawn(async move {
+                let (done_tx, done_rx) = tokio::sync::oneshot::channel::<Result<ToolOutput, String>>();
+                let platform = session.host.platform.clone();
+                let task = async move {
                     wait_idle(&session, 60_000, 2).await?;
                     let begin = session.host.call_ok("illustration_presentation", json!({"action":"begin"})).await?.result.unwrap_or(Value::Null);
                     let document_id = begin["document_id"].clone();
@@ -1220,13 +1256,17 @@ pub fn capture_tools(slot: SessionSlot) -> Vec<ToolSpec> {
                             let region = view.get("region").cloned().unwrap_or(json!("viewport"));
                             let (_, img) = shot_with_pointer(&session, region, false, 1).await?;
                             let full = image::encode_png(&img)?;
-                            let (shot, path) = session.next_shot();
-                            std::fs::write(&path, full).map_err(|e| format!("{}: {e}", path.display()))?;
                             let inline = image::scale_to_width(&img, u(&args,"max_width",1024).clamp(1,4096) as u32);
                             images.push(ToolImage {png:image::encode_png(&inline)?,mime:"image/png"});
-                            let manifest = path.with_extension("json");
-                            let capture = json!({"id":view["id"],"shot":shot,"path":path.display().to_string(),"manifest":manifest.display().to_string(),"components":mapping["components"],"solids":mapping["solids"],"visibleComponents":mapping["visibleComponents"],"visibleSolids":mapping["visibleSolids"],"camera":mapping["camera"],"requested":view,"document_id":document_id});
-                            std::fs::write(&manifest, serde_json::to_vec_pretty(&capture).map_err(|e| e.to_string())?).map_err(|e| format!("{}: {e}", manifest.display()))?;
+                            // The manifest is written BESIDE the shot, by the platform, and
+                            // names the shot's own path — so the capture record is
+                            // completed in two steps: the record without the paths, then
+                            // the paths the platform answered with.
+                            let mut capture = json!({"id":view["id"],"components":mapping["components"],"solids":mapping["solids"],"visibleComponents":mapping["visibleComponents"],"visibleSolids":mapping["visibleSolids"],"camera":mapping["camera"],"requested":view,"document_id":document_id});
+                            let (shot, kept) = session.keep_shot(&full, Some(&capture))?;
+                            capture["shot"] = json!(shot);
+                            capture["path"] = json!(kept.path);
+                            capture["manifest"] = json!(kept.manifest);
                             captures.push(capture);
                         }
                         Ok::<_,String>(ToolOutput {json:json!({"captures":captures,"document_id":document_id,"restored":true}),images})
@@ -1237,8 +1277,11 @@ pub fn capture_tools(slot: SessionSlot) -> Vec<ToolSpec> {
                         (Err(error), Ok(_)) => Err(error),
                         (capture, Err(restore)) => Err(format!("capture outcome: {}; presentation restoration failed: {restore}",capture.err().unwrap_or_else(|| "captured".into()))),
                     }
-                });
-                let result = task.await.map_err(|e| format!("illustration task: {e}"))?;
+                };
+                platform.spawn(Box::pin(async move {
+                    let _ = done_tx.send(task.await);
+                }));
+                let result = done_rx.await.map_err(|_| "illustration task: the capture task ended without answering".to_string())?;
                 drop(cancel_tx);
                 result
             })
@@ -1246,7 +1289,7 @@ pub fn capture_tools(slot: SessionSlot) -> Vec<ToolSpec> {
     ),ToolSpec::new(
         "screenshot",
         "capture",
-        "Capture the composited frame (panels and 3D view). region: full (default), viewport, or {x,y,w,h} in egui points. The image is returned inline, downscaled to max_width (1024), and the full-resolution PNG is written under the session's shots directory. cursor: draw the virtual pointer (cursor_scale makes it bigger). \
+        "Capture the composited frame (panels and 3D view). region: full (default), viewport, or {x,y,w,h} in egui points. The image is returned inline, downscaled to max_width (1024), and the full-resolution PNG is kept by the session (`path`: under its shots directory natively, a blob URL the page holds in the browser). cursor: draw the virtual pointer (cursor_scale makes it bigger). \
          For a clean presentation render pass `settings` and/or `clear_selection`: they apply for THIS capture only and are put back afterwards, so a screenshot never leaves the session looking different than it found it — e.g. `settings: {showVertices: false, showEdges: false}` for a shaded render.",
         object_schema(json!({
             "region": { "oneOf": [{ "type": "string", "enum": ["full", "viewport"] }, { "type": "object", "properties": { "x": {"type":"number"}, "y": {"type":"number"}, "w": {"type":"number"}, "h": {"type":"number"} }, "required": ["x","y","w","h"] }], "default": "full" },
@@ -1278,15 +1321,14 @@ pub fn capture_tools(slot: SessionSlot) -> Vec<ToolSpec> {
                 presentation.restore(&session).await;
                 let (mut info, img) = shot?;
                 let full_png = image::encode_png(&img)?;
-                let (n, path) = session.next_shot();
-                std::fs::write(&path, &full_png).map_err(|e| format!("{}: {e}", path.display()))?;
+                let (n, kept) = session.keep_shot(&full_png, None)?;
                 if let Some(p) = s(&args, "save_as") {
-                    std::fs::write(&p, &full_png).map_err(|e| format!("{p}: {e}"))?;
+                    session.host.platform.write_file(p, full_png.clone(), true).await?;
                 }
                 let inline = image::scale_to_width(&img, u(&args, "max_width", 1024) as u32);
                 let inline_png = image::encode_png(&inline)?;
                 info["shot"] = json!(n);
-                info["path"] = json!(path.display().to_string());
+                info["path"] = json!(kept.path);
                 info["inline_size"] = json!([inline.width(), inline.height()]);
                 info["flat"] = json!(image::is_flat(&img));
                 session.record("screenshot", &args, true, json!({ "shot": n }));
@@ -1352,7 +1394,7 @@ pub fn document_tools(slot: SessionSlot) -> Vec<ToolSpec> {
         ToolSpec::new(
             "document_open",
             "document",
-            "Open a .nbrep file from disk in a new tab and run it (the server reads the file; the app sees only its content).",
+            "Open a .nbrep file in a new tab and run it (the host reads the file — the filesystem natively, the page's document store in the browser; the app sees only its content).",
             object_schema(json!({ "path": { "type": "string" }, "timeout_ms": { "type": "integer", "default": 60000 } }), &["path"]),
             Annotations { read_only: false, destructive: false, idempotent: false, waits: true },
             move |args| {
@@ -1360,9 +1402,8 @@ pub fn document_tools(slot: SessionSlot) -> Vec<ToolSpec> {
                 Box::pin(async move {
                     let session = current(&slot).await?;
                     let path = s(&args, "path").ok_or("missing `path`")?;
-                    let text = std::fs::read_to_string(&path).map_err(|e| format!("{path}: {e}"))?;
-                    let name = std::path::Path::new(&path).file_name().map(|n| n.to_string_lossy().to_string());
-                    let mut r = session.host.call_ok("doc_load", json!({ "json": text, "name": name })).await?.result.unwrap_or(Value::Null);
+                    let text = session.host.platform.read_text(path.clone()).await?;
+                    let mut r = session.host.call_ok("doc_load", json!({ "json": text, "name": file_name(&path) })).await?.result.unwrap_or(Value::Null);
                     r["after"] = after_wait(&session, u(&args, "timeout_ms", 60_000)).await?;
                     session.record("document_open", &args, true, json!({}));
                     Ok(ToolOutput::json(r))
@@ -1372,7 +1413,7 @@ pub fn document_tools(slot: SessionSlot) -> Vec<ToolSpec> {
         ToolSpec::new(
             "document_save",
             "document",
-            "Write the active document as .nbrep to `path` and mark it clean. Refuses to overwrite unless overwrite is true.",
+            "Write the active document as .nbrep to `path` (a filesystem path natively; in the browser a name in the page's document store, where Save As puts it) and mark it clean. Refuses to overwrite unless overwrite is true.",
             object_schema(json!({ "path": { "type": "string" }, "overwrite": { "type": "boolean", "default": false } }), &["path"]),
             Annotations { read_only: false, destructive: false, idempotent: true, waits: false },
             move |args| {
@@ -1380,15 +1421,9 @@ pub fn document_tools(slot: SessionSlot) -> Vec<ToolSpec> {
                 Box::pin(async move {
                     let session = current(&slot).await?;
                     let path = s(&args, "path").ok_or("missing `path`")?;
-                    if std::path::Path::new(&path).exists() && !b(&args, "overwrite", false) {
-                        return Err(format!("{path} exists; pass overwrite: true"));
-                    }
                     let doc = session.host.call_ok("doc_json", json!({})).await?.result.unwrap_or(Value::Null);
                     let text = serde_json::to_string_pretty(&doc["document"]).map_err(|e| e.to_string())?;
-                    if let Some(parent) = std::path::Path::new(&path).parent() {
-                        let _ = std::fs::create_dir_all(parent);
-                    }
-                    std::fs::write(&path, &text).map_err(|e| format!("{path}: {e}"))?;
+                    let path = session.host.platform.write_file(path, text.clone().into_bytes(), b(&args, "overwrite", false)).await?;
                     session.host.call_ok("doc_mark_clean", json!({})).await?;
                     session.record("document_save", &args, true, json!({}));
                     Ok(ToolOutput::json(json!({ "path": path, "bytes": text.len() })))
@@ -1398,7 +1433,7 @@ pub fn document_tools(slot: SessionSlot) -> Vec<ToolSpec> {
         ToolSpec::new(
             "document_import",
             "document",
-            "Import a STEP / IGES / STL / OBJ / 3MF file from disk as an Import 3D Model feature (format by extension unless given).",
+            "Import a STEP / IGES / STL / OBJ / 3MF file from the host's files (the filesystem natively; the page's document store in the browser, which holds text formats only — a binary file goes through `doc_import` with its content) as an Import 3D Model feature (format by extension unless given).",
             object_schema(json!({ "path": { "type": "string" }, "format": { "type": "string", "enum": ["step", "iges", "stl", "obj", "3mf"] }, "timeout_ms": { "type": "integer", "default": 120000 } }), &["path"]),
             Annotations { read_only: false, destructive: false, idempotent: false, waits: true },
             move |args| {
@@ -1406,7 +1441,7 @@ pub fn document_tools(slot: SessionSlot) -> Vec<ToolSpec> {
                 Box::pin(async move {
                     let session = current(&slot).await?;
                     let path = s(&args, "path").ok_or("missing `path`")?;
-                    let ext = std::path::Path::new(&path).extension().map(|e| e.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
+                    let ext = path.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase()).unwrap_or_default();
                     let format = s(&args, "format").unwrap_or(match ext.as_str() {
                         "step" | "stp" => "step".into(),
                         "iges" | "igs" => "iges".into(),
@@ -1415,9 +1450,9 @@ pub fn document_tools(slot: SessionSlot) -> Vec<ToolSpec> {
                         "3mf" => "3mf".into(),
                         _ => return Err(format!("cannot tell the format of `{path}`; pass `format`")),
                     });
-                    let bytes = std::fs::read(&path).map_err(|e| format!("{path}: {e}"))?;
+                    let bytes = session.host.platform.read_bytes(path.clone()).await?;
                     let b64 = base64_encode(&bytes);
-                    let name = std::path::Path::new(&path).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+                    let name = file_name(&path).unwrap_or_default();
                     let mut r = session.host.call_ok("doc_import", json!({ "format": format, "name": name, "base64": b64 })).await?.result.unwrap_or(Value::Null);
                     r["after"] = after_wait(&session, u(&args, "timeout_ms", 120_000)).await?;
                     session.record("document_import", &args, true, json!({}));
@@ -1428,7 +1463,7 @@ pub fn document_tools(slot: SessionSlot) -> Vec<ToolSpec> {
         ToolSpec::new(
             "document_export",
             "document",
-            "Export the active document to a file: brep (native JSON), step, stl, obj, iges, glb (binary glTF 2.0 of the display mesh), the sheet-metal flat pattern as dxf / svg, the open drawing sheet as sheet_svg, every drawing sheet as sheet_pdf (one PDF, a page per sheet in sheet order), or that drawing set with the live 3D model as sheet_pdf_3d (a 3D box over every placement marked `threeD`, and a last page given over to the model), or, for a document whose PCB board has parts, its manufacturing files: fabrication (a zip of Gerber X2 layers, Excellon drills, pick-and-place and parts-BOM CSVs and a README), pick_place_csv or ecad_bom_csv. The reply carries the file's size and first bytes, for the sheet formats `texts`: every text string the file shows, read back from what was written, and for sheet_pdf_3d `model3d`: its 3D boxes, views, view buttons and U3D size, read back likewise, and for fabrication `files` (each file in the zip), `readBack` (copper flashes, drill hits, outline size and CSV rows, counted from the files) and `warnings`; the CSVs answer `rows`.",
+            "Export the active document to a file (a filesystem path natively; in the browser a download under that name, where the Export dialog's goes): brep (native JSON), step, stl, obj, iges, glb (binary glTF 2.0 of the display mesh), the sheet-metal flat pattern as dxf / svg, the open drawing sheet as sheet_svg, every drawing sheet as sheet_pdf (one PDF, a page per sheet in sheet order), or that drawing set with the live 3D model as sheet_pdf_3d (a 3D box over every placement marked `threeD`, and a last page given over to the model), or, for a document whose PCB board has parts, its manufacturing files: fabrication (a zip of Gerber X2 layers, Excellon drills, pick-and-place and parts-BOM CSVs and a README), pick_place_csv or ecad_bom_csv. The reply carries the file's size and first bytes, for the sheet formats `texts`: every text string the file shows, read back from what was written, and for sheet_pdf_3d `model3d`: its 3D boxes, views, view buttons and U3D size, read back likewise, and for fabrication `files` (each file in the zip), `readBack` (copper flashes, drill hits, outline size and CSV rows, counted from the files) and `warnings`; the CSVs answer `rows`.",
             object_schema(json!({ "format": { "type": "string", "enum": ["brep", "step", "stl", "obj", "iges", "glb", "dxf", "svg", "sheet_svg", "sheet_pdf", "sheet_pdf_3d", "fabrication", "pick_place_csv", "ecad_bom_csv"] }, "path": { "type": "string" } }), &["format", "path"]),
             Annotations { read_only: false, destructive: false, idempotent: true, waits: false },
             move |args| {
@@ -1445,7 +1480,7 @@ pub fn document_tools(slot: SessionSlot) -> Vec<ToolSpec> {
                         Some(b64) => base64_decode(b64)?,
                         None => r["text"].as_str().unwrap_or("").as_bytes().to_vec(),
                     };
-                    std::fs::write(&path, &bytes).map_err(|e| format!("{path}: {e}"))?;
+                    let path = session.host.platform.write_file(path, bytes.clone(), true).await?;
                     session.record("document_export", &args, true, json!({}));
                     // `head` is the file's first bytes as text: what a script
                     // needs to assert that a format's MAGIC is there (`%PDF-1.4`,

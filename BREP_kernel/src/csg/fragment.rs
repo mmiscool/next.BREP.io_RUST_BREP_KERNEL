@@ -21,7 +21,9 @@ mod face_split;
 mod loop_split;
 
 pub use face_split::{fragment_face, fragment_solid};
-pub use types::{FaceFragmentRecord, FragmentCoedge, FragmentEdgeSource, FragmentLoop};
+pub(crate) use face_split::{fragment_solid_against, bounded_carriers, face_separated};
+pub use types::{FaceFragmentRecord, FragmentCoedge, FragmentEdgeSource, FragmentLoop, FragmentOrder};
+pub(crate) use types::canonical_fragment_order;
 use std::time::Duration;
 use web_time::Instant;
 
@@ -38,6 +40,13 @@ pub(crate) struct FragmentProfile {
     pub(crate) enabled: bool,
     faces: u64,
     cut_faces: u64,
+    arranged_faces: u64,
+    uncut_probe_faces: u64,
+    region_faces: u64,
+    box_candidates: u64,
+    separated_faces: u64,
+    far_arranged: u64,
+    far_regions: u64,
     untouched: Duration,
     setup: Duration,
     hints: Duration,
@@ -86,6 +95,7 @@ impl FragmentProfile {
         if !self.enabled {
             return;
         }
+        eprintln!("fragment.scope operand={operand} faces={} box_candidates={} arranged={} regions={} far_arranged={} far_regions={} separated={} uncut_probes={}", self.faces, self.box_candidates, self.arranged_faces, self.region_faces, self.far_arranged, self.far_regions, self.separated_faces, self.uncut_probe_faces);
         let ms = |d: Duration| d.as_secs_f64() * 1_000.0;
         eprintln!(
             "fragment.profile operand={operand} faces={} cut_faces={} untouched={:.2} setup={:.2} hints={:.2} boundary={:.2} cuts={:.2} dedup_bridge={:.2} arrange={:.2} regions={:.2} rescue={:.2} loop_split_faces={} loop_split_declined={} loop_split={:.2} slowest={:?}",

@@ -58,3 +58,47 @@ pub static HIT_KEYS: &[HitKeyDoc] = &[
     HitKeyDoc { panel: "documents", prefix: "doctab:", meaning: "activate a document tab (doctab:i) or close it (doctab:i:close)", command: None },
     HitKeyDoc { panel: "documents", prefix: "pane:", meaning: "a side pane's tab in the dock, by its title in kebab case (pane:inspector); a click brings the pane to the front", command: Some("show_pane") },
 ];
+
+/// One title formatter for dock tabs and the mobile document menu.
+pub(crate) fn display_title(doc: &crate::document::Document) -> String {
+    if doc.dirty_marker() { format!("{} \u{2022}", doc.title()) } else { doc.title() }
+}
+
+#[derive(Default)]
+pub(crate) struct MenuState {
+    titles: Vec<String>,
+    active: usize,
+    enabled: bool,
+}
+
+impl MenuState {
+    pub(crate) fn from_documents(docs: &Documents) -> Self {
+        Self { titles: docs.iter().map(display_title).collect(), active: docs.active_index(),
+            enabled: !docs.engine().any_sketch_mode() && !docs.engine().ref_select_active() }
+    }
+}
+
+/// The same open documents and TabsOutcome, presented as a finger-sized menu.
+pub(crate) fn menu(ui: &mut egui::Ui, state: &MenuState) -> (TabsOutcome, egui::Response) {
+    let mut outcome = TabsOutcome::default();
+    let response = ui.add_enabled_ui(state.enabled, |ui| {
+        ui.menu_button("Docs", |ui| {
+            ui.set_width((ui.ctx().content_rect().width() - 40.0).min(360.0).max(160.0));
+            ui.strong("Open documents");
+            egui::ScrollArea::vertical().max_height((ui.ctx().content_rect().height() - 120.0).max(88.0)).show(ui, |ui| {
+                for (index, title) in state.titles.iter().enumerate() {
+                    ui.horizontal(|ui| {
+                        let width = (ui.available_width() - 44.0 - ui.spacing().item_spacing.x).max(44.0);
+                        let row = ui.add_sized([width, 44.0], egui::Button::selectable(index == state.active, title).truncate());
+                        outcome.hits.push((format!("doctab:{index}"), row.rect));
+                        if row.clicked() { outcome.activate = Some(index); ui.close(); }
+                        let close = ui.add_sized([44.0, 44.0], egui::Button::new("×")).on_hover_text("Close document");
+                        outcome.hits.push((format!("doctab:{index}:close"), close.rect));
+                        if close.clicked() { outcome.close = Some(index); ui.close(); }
+                    });
+                }
+            });
+        }).response
+    }).inner.on_disabled_hover_text("Finish the sketch or reference selection before switching documents");
+    (outcome, response)
+}

@@ -94,6 +94,7 @@ pub fn import_iges(text: &str) -> Result<Vec<BrepSolid>, String> {
         next_id += 2;
         let solid = BrepSolid {
             mass_properties_cache: Default::default(),
+            cells: Default::default(),
             id: solid_id,
             vertices: body_vertices,
             edges: body_edges,

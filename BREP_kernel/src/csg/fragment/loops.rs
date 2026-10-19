@@ -251,6 +251,35 @@ pub(super) fn interior_points_in_polygons_indexed(
     picked
 }
 
+/// The (chain, segment) of an arrangement use's parent segment, from the
+/// segment's tag; a segment without a position reads as `u64::MAX`.
+fn chain_segment(usage: &crate::CycleUse) -> (u64, u64) {
+    let tag = &usage.piece.parent.tag;
+    (
+        tag.get("chain").and_then(serde_json::Value::as_u64).unwrap_or(u64::MAX),
+        tag.get("seg").and_then(serde_json::Value::as_u64).unwrap_or(u64::MAX),
+    )
+}
+
+/// A region's topological key (lane X row 9): the sorted (chain, segment)
+/// list of its outer loop, then the sorted lists of its holes. It reads no
+/// coordinate, so congruent regions are ordered the same whatever the last
+/// bits of their areas.
+pub(super) fn region_topology_key(outer: &[crate::CycleUse], holes: &[Vec<crate::CycleUse>]) -> (Vec<(u64, u64)>, Vec<Vec<(u64, u64)>>) {
+    let mut outer_key: Vec<(u64, u64)> = outer.iter().map(chain_segment).collect();
+    outer_key.sort_unstable();
+    let mut hole_keys: Vec<Vec<(u64, u64)>> = holes
+        .iter()
+        .map(|hole| {
+            let mut key: Vec<(u64, u64)> = hole.iter().map(chain_segment).collect();
+            key.sort_unstable();
+            key
+        })
+        .collect();
+    hole_keys.sort_unstable();
+    (outer_key, hole_keys)
+}
+
 fn chain_index(usage: &crate::CycleUse) -> Result<usize, KernelRefusal> {
     usage
         .piece

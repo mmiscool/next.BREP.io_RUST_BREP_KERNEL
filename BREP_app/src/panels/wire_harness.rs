@@ -86,7 +86,9 @@ impl WireHarnessPanel {
         let mut add_clicked = false;
         let mut bundles = harness.build_bundles;
         let mut bundles_changed = false;
-        ui.horizontal(|ui| {
+        // Wrapped, so a narrow dock breaks the counts onto a second line
+        // instead of clipping them (lane U audit item 5).
+        ui.horizontal_wrapped(|ui| {
             let add = ui
                 .button("Add wire")
                 .on_hover_text("Add a connection between two termination ports");
@@ -97,15 +99,18 @@ impl WireHarnessPanel {
                 .on_hover_text("Sweep a bundle solid along every routed segment (off keeps the routing only)");
             self.hits.insert("wh:bundles".into(), toggle.rect);
             bundles_changed = toggle.changed();
-            ui.label(
-                egui::RichText::new(format!(
-                    "{} connection{} | {} endpoint{} | {routed} routed",
-                    harness.connections.len(),
-                    if harness.connections.len() == 1 { "" } else { "s" },
-                    endpoints.len(),
-                    if endpoints.len() == 1 { "" } else { "s" },
-                ))
-                .weak(),
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(format!(
+                        "{} connection{} | {} endpoint{} | {routed} routed",
+                        harness.connections.len(),
+                        if harness.connections.len() == 1 { "" } else { "s" },
+                        endpoints.len(),
+                        if endpoints.len() == 1 { "" } else { "s" },
+                    ))
+                    .weak(),
+                )
+                .wrap_mode(egui::TextWrapMode::Extend),
             );
         });
         for problem in &report.segment_problems {

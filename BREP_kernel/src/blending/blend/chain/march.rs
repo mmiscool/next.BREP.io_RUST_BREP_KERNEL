@@ -94,6 +94,20 @@ impl ChainBudget {
     }
 }
 
+/// A ladder that topped out without passing, as its refusal reads it: the
+/// best rung's per-segment count and reading, and every rung's reading in the
+/// order climbed (lane L, 2026-10-16, lCount_234). The top rung alone misleads:
+/// it can reach the station ceiling before any local round, so its reading is
+/// the raw first round's, not the closest the ladder came.
+pub(super) fn ladder_trend(trend: &[(usize, f64)]) -> (usize, f64, String) {
+    let (best_rung, best) = trend
+        .iter()
+        .copied()
+        .fold((0, f64::INFINITY), |best, (rung, reading)| if reading < best.1 { (rung, reading) } else { best });
+    let listing: Vec<String> = trend.iter().map(|(rung, reading)| format!("{rung} {reading:.3e}")).collect();
+    (best_rung, best, listing.join(", "))
+}
+
 /// The TOP of the ladder a folding chain is re-marched up (24, 48, 96, ...).
 ///
 /// A carve traces the crease on the surface the fit produced, so it is sound at

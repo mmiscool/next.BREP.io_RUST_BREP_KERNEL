@@ -71,6 +71,124 @@ pub fn blend_smooth_chain_if_closed(
     blend_closed_smooth_chain(solid, &chain.segments, radius, chamfer, name)
 }
 
+// BREP lane L: begin lcount236_chain_ladder_memo_20261016
+/// A closed chain's ladder that tops out answers the same refusal for the same
+/// inputs, and a fillet selection asks it again and again: the group's cutter
+/// composition, then every drop-one subset, each blending the same collar on a
+/// solid the earlier edges did not touch there (up to four calls a case). Up
+/// to its verdict the ladder reads only the chain — every segment's edge, both
+/// mate faces (surface, sense, loops) and coedges, the signed radii — the
+/// radius, the chamfer flag, the bar and three switches, never the rest of the
+/// solid; the key is exactly those, bit for bit. Only the `chain_ladder_top`
+/// refusal is kept, and a hit returns that refusal unchanged.
+/// `BREP_CHAIN_LADDER_MEMO=0` turns the memo off; `=verify` recomputes every
+/// hit and panics unless the recomputed answer is the cached refusal, byte for
+/// byte.
+fn blend_closed_smooth_chain(
+    solid: &BrepSolid,
+    segments: &[ChainSegment<'_>],
+    radius: f64,
+    chamfer: bool,
+    name: Option<&str>,
+) -> Result<BrepSolid, KernelRefusal> {
+    let mode = std::env::var("BREP_CHAIN_LADDER_MEMO");
+    let (memo_on, verify) = match mode.as_deref() {
+        Ok("0") => (false, false),
+        Ok("verify") => (true, true),
+        _ => (true, false),
+    };
+    if !memo_on {
+        return blend_closed_smooth_chain_unmemoized(solid, segments, radius, chamfer, name);
+    }
+    let bar = crate::KernelTolerances::for_solid(solid, 1e-7).intersection_fit;
+    let key = ladder_memo_key(segments, radius, chamfer, bar);
+    let cached = LADDER_MEMO.with(|memo| memo.borrow().iter().find(|(stored, _)| *stored == key).map(|(_, refusal)| refusal.clone()));
+    if let (Some(refusal), false) = (&cached, verify) {
+        crate::blend::record_count("count.chain_ladder_memo.hit", 1);
+        return Err(refusal.clone());
+    }
+    let result = blend_closed_smooth_chain_unmemoized(solid, segments, radius, chamfer, name);
+    if let Some(refusal) = cached {
+        let same = matches!(&result, Err(again) if *again == refusal && format!("{again:?}") == format!("{refusal:?}"));
+        assert!(same, "chain ladder memo mismatch: cached {refusal:?}, recomputed {:?}", result.as_ref().err());
+        crate::blend::record_count("count.chain_ladder_memo.verified", 1);
+        return result;
+    }
+    if let Err(refusal) = &result {
+        if matches!(&refusal.class, crate::RefusalClass::NonConvergence { what } if what == "chain_ladder_top") {
+            LADDER_MEMO.with(|memo| {
+                let mut memo = memo.borrow_mut();
+                if memo.len() >= LADDER_MEMO_CAPACITY {
+                    memo.remove(0);
+                }
+                memo.push((key, refusal.clone()));
+            });
+        }
+    }
+    result
+}
+
+/// How many topped-out ladders the memo keeps (oldest dropped first).
+const LADDER_MEMO_CAPACITY: usize = 32;
+
+thread_local! {
+    /// Topped-out closed-chain ladders: the bit-exact key and the refusal.
+    static LADDER_MEMO: std::cell::RefCell<Vec<(Vec<u64>, KernelRefusal)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Every input the closed-chain ladder reads up to its verdict, as raw bits.
+fn ladder_memo_key(segments: &[ChainSegment<'_>], radius: f64, chamfer: bool, bar: f64) -> Vec<u64> {
+    fn curve(key: &mut Vec<u64>, curve: &NurbsCurve) {
+        key.extend([curve.degree as u64, curve.knots.len() as u64, curve.control_points.len() as u64]);
+        key.extend(curve.knots.iter().map(|knot| knot.to_bits()));
+        for point in &curve.control_points {
+            key.extend([point.x.to_bits(), point.y.to_bits(), point.z.to_bits(), point.w.to_bits()]);
+        }
+    }
+    fn face(key: &mut Vec<u64>, face: &FaceRecord) {
+        let surface = &face.surface;
+        key.extend([face.id, face.same_sense as u64, surface.degree_u as u64, surface.degree_v as u64]);
+        key.extend([surface.knots_u.len() as u64, surface.knots_v.len() as u64, surface.control_points.len() as u64]);
+        key.extend(surface.knots_u.iter().chain(&surface.knots_v).map(|knot| knot.to_bits()));
+        for row in &surface.control_points {
+            key.push(row.len() as u64);
+            for point in row {
+                key.extend([point.x.to_bits(), point.y.to_bits(), point.z.to_bits(), point.w.to_bits()]);
+            }
+        }
+        key.push(face.loops.len() as u64);
+        for loop_record in &face.loops {
+            key.extend([loop_record.id, loop_record.coedges.len() as u64]);
+            for coedge in &loop_record.coedges {
+                key.extend([coedge.id, coedge.edge_id, coedge.forward as u64]);
+                curve(key, &coedge.pcurve);
+            }
+        }
+    }
+    let mut key = vec![
+        radius.to_bits(),
+        chamfer as u64,
+        bar.to_bits(),
+        crate::blend::station_refinement_on() as u64,
+        crate::blend::chain_arc_stations_on() as u64,
+        wall_verdict_on() as u64,
+        local_continue_on() as u64,
+        segments.len() as u64,
+    ];
+    for segment in segments {
+        let edge = segment.edge;
+        key.extend([edge.id, edge.start_vertex_id, edge.end_vertex_id, edge.t0.to_bits(), edge.t1.to_bits(), segment.forward as u64]);
+        curve(&mut key, &edge.curve);
+        for mate in [&segment.first, &segment.second] {
+            key.extend([mate.coedge.id, mate.coedge.edge_id, mate.coedge.forward as u64, mate.loop_index as u64, mate.rho.to_bits()]);
+            curve(&mut key, &mate.coedge.pcurve);
+            face(&mut key, mate.face);
+        }
+    }
+    key
+}
+// BREP lane L: end lcount236_chain_ladder_memo_20261016
+
 /// Blend a CLOSED chain of conjugated edges with one rolling-ball blend
 /// face (Golovanov §6.9.5: all conjugated edges processed together).
 ///
@@ -81,7 +199,7 @@ pub fn blend_smooth_chain_if_closed(
 /// is carved out along the crease (`blend/carve.rs`).  The re-march is the
 /// whole of the extra cost and only a folding wall pays it — the first march is
 /// the ordinary one, and its refusal is what asks for the second.
-fn blend_closed_smooth_chain(
+fn blend_closed_smooth_chain_unmemoized(
     solid: &BrepSolid,
     segments: &[ChainSegment<'_>],
     radius: f64,
@@ -92,6 +210,8 @@ fn blend_closed_smooth_chain(
     // The plain collar climbs the same measured ladder the carve does, from the
     // same first rung: a budget picked once is a resolution request in disguise.
     let mut budget = ChainBudget::for_chain(segments, CHAIN_PER_SEGMENT)?;
+    // Every too-coarse rung's reading, for the refusal at the top.
+    let mut trend: Vec<(usize, f64)> = Vec::new();
     let first = loop {
         let per_segment = budget.rung;
         let rung = build_closed_smooth_chain(
@@ -111,12 +231,15 @@ fn blend_closed_smooth_chain(
                      {deviation:.6e} from the rolling ball, against {bar:.3e}",
                     budget.describe()
                 ));
+                trend.push((per_segment, deviation));
                 if budget.largest() * 2 > CHAIN_CARVE_MAX_PER_SEGMENT {
+                    let (best_rung, best, listing) = ladder_trend(&trend);
                     return Err(KernelRefusal::non_convergence(KernelStage::Refine, "chain_ladder_top", format!(
-                        "blend: at {per_segment} stations per segment — the top of the chain's \
-                         ladder — this collar's fitted rails are still {deviation:.6e} from the \
-                         rolling ball's own contacts against a bar of {bar:.3e}, so there is no \
-                         wall accurate enough to build"
+                        "blend: the chain's ladder reached its top, {per_segment} stations per segment, \
+                         and no rung passed — its best, {best_rung} stations per segment, left this \
+                         collar's fitted rails {best:.6e} from the rolling ball's own contacts against \
+                         a bar of {bar:.3e} (rung by rung: {listing}), so there is no wall accurate \
+                         enough to build"
                     )));
                 }
                 budget = budget.doubled();
@@ -1111,6 +1234,49 @@ thread_local! {
     static CHAIN_DEEPEST_ROUND: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+// BREP lane L: begin lcount234_chain_local_continue_20261016
+/// Whether a rung's local refinement may run past [`REFINE_ROUNDS`] while it
+/// still improves (`BREP_CHAIN_LOCAL_CONTINUE=1`; off by default until its
+/// census promotes it). The ladder repeats its local rounds from scratch on
+/// every rung.
+fn local_continue_on() -> bool {
+    std::env::var("BREP_CHAIN_LOCAL_CONTINUE").as_deref() == Ok("1")
+}
+
+/// The most local rounds a rung may take with the switch on.
+const LOCAL_CONTINUE_MAX_ROUNDS: usize = 4 * REFINE_ROUNDS;
+
+/// Rounds without a new best stencil reading before the rung is spent.
+const LOCAL_CONTINUE_STALL_ROUNDS: usize = 3;
+
+thread_local! {
+    /// The best stencil reading of the rung being refined, and its round.
+    static CHAIN_LOCAL_BEST: std::cell::Cell<(f64, usize)> = const { std::cell::Cell::new((f64::INFINITY, 0)) };
+}
+
+/// Whether a rung's local rounds are spent with the switch on: past
+/// [`LOCAL_CONTINUE_MAX_ROUNDS`], or [`LOCAL_CONTINUE_STALL_ROUNDS`] rounds
+/// since the best stencil reading. Counted in rounds, never in time. Round 0
+/// reads the halfway point only, a different instrument from the dense stencil
+/// every later round reads, so the best is kept from round 1 on.
+fn local_rounds_spent(round: usize, deviation: f64) -> bool {
+    if round == 0 {
+        CHAIN_LOCAL_BEST.with(|best| best.set((f64::INFINITY, 0)));
+        return false;
+    }
+    let (_, best_round) = CHAIN_LOCAL_BEST.with(|best| {
+        let (reading, at) = best.get();
+        if deviation < reading {
+            best.set((deviation, round));
+            (deviation, round)
+        } else {
+            (reading, at)
+        }
+    });
+    round >= LOCAL_CONTINUE_MAX_ROUNDS || round - best_round >= LOCAL_CONTINUE_STALL_ROUNDS
+}
+// BREP lane L: end lcount234_chain_local_continue_20261016
+
 /// Fit, measure and build one rung from its stations. A plain (non-carve)
 /// rung whose fitted rails miss the halfway contacts by more than `bar`
 /// first REFINES LOCALLY: one continuation station into each failing interval
@@ -1302,7 +1468,14 @@ fn build_closed_chain_from_samples(
             failing.len(),
             if within_ceiling { "ok" } else { "reached" }
         ));
-        if fold != FoldPolicy::Refuse || round >= REFINE_ROUNDS || !within_ceiling {
+        // BREP lane L: begin lcount234_chain_local_continue_20261016
+        let rounds_spent = if local_continue_on() {
+            local_rounds_spent(round, deviation)
+        } else {
+            round >= REFINE_ROUNDS
+        };
+        // BREP lane L: end lcount234_chain_local_continue_20261016
+        if fold != FoldPolicy::Refuse || rounds_spent || !within_ceiling {
             return Ok(Rung::TooCoarse { deviation });
         }
         // The insertion is the next round's attempt, whatever it returns.
@@ -1794,6 +1967,9 @@ pub(in crate::blend) fn project_piece_pcurve_from(
 /// in the dense interval holding each fraction of `refine_near` — where a
 /// caller that read the SHIPPED curve again found it over the floor between
 /// the fitter's own stencil points — and then fitted at the same floor.
+/// The code of a support pcurve fit that misses the refinement floor.
+pub(crate) const CHAIN_PCURVE_FLOOR_WHAT: &str = "chain_pcurve_floor";
+
 pub(in crate::blend) fn project_piece_pcurve_within(
     piece: &NurbsCurve,
     surface: &NurbsSurface,
@@ -1801,6 +1977,48 @@ pub(in crate::blend) fn project_piece_pcurve_within(
     end_is_crossing: bool,
     guide: Option<&dyn Fn(f64) -> Option<[f64; 2]>>,
     refine_near: &[f64],
+) -> Result<NurbsCurve, KernelRefusal> {
+    project_piece_pcurve_track(piece, surface, start_is_crossing, end_is_crossing, guide, refine_near, false)
+}
+
+/// [`project_piece_pcurve_within`], retried where it misses the floor on a
+/// track that also samples the piece's own knots (lane L, 2026-10-16). A track
+/// sampled uniformly in the piece's parameter cannot follow a rail whose own
+/// knot spans are finer than its spacing — a closed march crowds its stations
+/// where the rim's curvature jumps (G1 not G2 at its seam: rail spans of
+/// 3.6e-5 against a track spacing of 2.4e-4, the fit stalled 1.7e-5 off). Only
+/// for a caller whose floor miss is TERMINAL: a caller that answers the miss
+/// itself (a ladder that refines its march) keeps its own answer. A fit
+/// already on the floor never takes the second track; a retry that misses
+/// returns the uniform refusal unchanged.
+pub(in crate::blend) fn project_piece_pcurve_within_knot_retry(
+    piece: &NurbsCurve,
+    surface: &NurbsSurface,
+    start_is_crossing: bool,
+    end_is_crossing: bool,
+    guide: Option<&dyn Fn(f64) -> Option<[f64; 2]>>,
+    refine_near: &[f64],
+) -> Result<NurbsCurve, KernelRefusal> {
+    match project_piece_pcurve_track(piece, surface, start_is_crossing, end_is_crossing, guide, refine_near, false) {
+        Err(uniform) if matches!(&uniform.class, crate::RefusalClass::NonConvergence { what } if what == CHAIN_PCURVE_FLOOR_WHAT) => {
+            project_piece_pcurve_track(piece, surface, start_is_crossing, end_is_crossing, guide, refine_near, true).map_err(|_| uniform)
+        }
+        other => other,
+    }
+}
+
+/// [`project_piece_pcurve_within`]'s track and fit, the track sampled
+/// uniformly in the piece's parameter, and with `knot_aware` at the piece's
+/// interior knots too.
+#[allow(clippy::too_many_arguments)]
+fn project_piece_pcurve_track(
+    piece: &NurbsCurve,
+    surface: &NurbsSurface,
+    start_is_crossing: bool,
+    end_is_crossing: bool,
+    guide: Option<&dyn Fn(f64) -> Option<[f64; 2]>>,
+    refine_near: &[f64],
+    knot_aware: bool,
 ) -> Result<NurbsCurve, KernelRefusal> {
     let [u0, u1] = surface.domain_u().or_refuse(KernelStage::Refine, "domain_u")?;
     let [v0, v1] = surface.domain_v().or_refuse(KernelStage::Refine, "domain_v")?;
@@ -1815,7 +2033,22 @@ pub(in crate::blend) fn project_piece_pcurve_within(
     // re-marched rail carries hundreds of control points (574 on the
     // 2026-09-02 two-torus collar), and a pcurve fitted and checked at 97
     // samples of it was accepted 1.19e-3 off the rail it claims.
-    let dense = (8 * piece.control_points.len()).clamp(96, PIECE_TRACK_CEILING);
+    // The knot-aware retry's track holds the piece's knots on top of the
+    // uniform samples; its repair may use twice the uniform ceiling.
+    let ceiling = if knot_aware { 2 * PIECE_TRACK_CEILING } else { PIECE_TRACK_CEILING };
+    let uniform = (8 * piece.control_points.len()).clamp(96, PIECE_TRACK_CEILING);
+    let mut fractions: Vec<f64> = (0..=uniform).map(|section| section as f64 / uniform as f64).collect();
+    if knot_aware {
+        // The piece's distinct interior knots, as fractions, merged in where no
+        // uniform sample already sits within a millionth of the span.
+        let span = d1 - d0;
+        let mut knots: Vec<f64> = piece.knots.iter().copied().filter(|knot| *knot > d0 && *knot < d1).map(|knot| (knot - d0) / span).collect();
+        knots.dedup();
+        fractions.extend(knots);
+        fractions.sort_by(|a, b| a.total_cmp(b));
+        fractions.dedup_by(|b, a| (*b - *a).abs() <= 1e-6 / uniform as f64);
+    }
+    let dense = fractions.len() - 1;
     crate::blend::record_count("count.track.piece_samples", dense as u64 + 1);
     let mut proj_u = Vec::with_capacity(dense + 1);
     let mut proj_v = Vec::with_capacity(dense + 1);
@@ -1828,8 +2061,13 @@ pub(in crate::blend) fn project_piece_pcurve_within(
     // surface, which on a carrier that comes back near itself is another sheet.
     let mut previous_foot: Option<[f64; 2]> = None;
     let mut feet: Vec<[f64; 2]> = Vec::with_capacity(dense + 1);
+    let project_timer = crate::blend::BlendTimer::start("timing.track.project_ms");
     for section in 0..=dense {
-        let t = d0 + (d1 - d0) * section as f64 / dense as f64;
+        let fraction = fractions[section];
+        // The uniform track keeps its own expression, bit for bit (the
+        // product before the quotient); only knot-aware samples use the
+        // fraction directly.
+        let t = if knot_aware { d0 + (d1 - d0) * fraction } else { d0 + (d1 - d0) * section as f64 / dense as f64 };
         let point = piece.evaluate(t).or_refuse(KernelStage::Refine, "evaluate")?;
         let guide = guide.filter(|_| {
             true
@@ -1838,7 +2076,7 @@ pub(in crate::blend) fn project_piece_pcurve_within(
         // NEARER foot kept: the seeded projector is local and returns a
         // stalled Newton's iterate without saying so, so neither seed is
         // trusted alone (a foot on its carrier is nearer than any stall).
-        let seeds: Vec<[f64; 2]> = guide.and_then(|guide| guide(section as f64 / dense as f64)).into_iter().chain(previous_foot).collect();
+        let seeds: Vec<[f64; 2]> = guide.and_then(|guide| guide(fraction)).into_iter().chain(previous_foot).collect();
         let mut projection: Option<crate::projection::SurfaceProjection> = None;
         for seed in &seeds {
             let found = crate::projection::project_point_to_surface_from_seed(surface, point, *seed).or_refuse(KernelStage::Refine, "project_point_to_surface_from_seed")?;
@@ -1865,8 +2103,9 @@ pub(in crate::blend) fn project_piece_pcurve_within(
         proj_u.push(u);
         proj_v.push(projection.v);
         point3.push(point);
-        params.push(section as f64 / dense as f64);
+        params.push(fraction);
     }
+    project_timer.stop();
     // A biperiodic carrier needs the SAME unwrap in v, or a track that walks up
     // to the v seam comes back as 0 at the far end and the fit swings across
     // the whole carrier.  Anchor the chain on the first INTERIOR sample and
@@ -1985,12 +2224,17 @@ pub(in crate::blend) fn project_piece_pcurve_within(
         breaks: Vec::new(),
     };
     let breaks = crate::blend::track_fit::curve_breaks(piece, d0, d1, true);
+    let polish_timer = crate::blend::BlendTimer::start("timing.track.polish_ms");
     crate::blend::track_fit::polish_track(surface, &at, &mut track)?;
+    polish_timer.stop();
+    let crossings_timer = crate::blend::BlendTimer::start("timing.track.crossings_ms");
     crate::blend::track_fit::insert_knot_crossings(surface, &at, &mut track, &breaks)?;
+    crossings_timer.stop();
+    crate::blend::record_count("count.track.breaks", track.breaks.len() as u64);
     for &fraction in refine_near {
         for _ in 0..2 {
             let Some(index) = track.fractions.windows(2).position(|pair| pair[0] <= fraction && fraction <= pair[1]) else { break };
-            if crate::blend::track_fit::refine_track_intervals(surface, &at, &mut track, &[index], PIECE_TRACK_CEILING)?.is_none() {
+            if crate::blend::track_fit::refine_track_intervals(surface, &at, &mut track, &[index], ceiling)?.is_none() {
                 break;
             }
         }
@@ -2001,14 +2245,18 @@ pub(in crate::blend) fn project_piece_pcurve_within(
     // sample per knot span where the rail turns hardest), within the dense
     // ceiling the track was built under; every other sample, the pinned ends
     // and the breaks are kept. The floor and the refusal below are unchanged.
+    let fit_timer = crate::blend::BlendTimer::start("timing.track.fit_local_ms");
     let (fit, inserted) = crate::blend::track_fit::fit_track_locally(
         surface,
         &mut track,
         &at,
         tolerance,
         REFINE_ROUNDS,
-        PIECE_TRACK_CEILING,
+        ceiling,
     )?;
+    fit_timer.stop();
+    crate::blend::record_count("count.track.fit_sections", fit.sections as u64);
+    crate::blend::record_count("count.track.local_inserted", inserted as u64);
     if std::env::var("BREP_DEBUG_TRACK_FIT").is_ok() {
         eprintln!("TRACK_FIT closed-chain piece: {inserted} sample(s) inserted locally");
         eprintln!(
@@ -2046,7 +2294,20 @@ pub(in crate::blend) fn project_piece_pcurve_within(
     // each of them reaches the floor. What still misses is a rail the march tore
     // (2.7 to 3.3 on the oversized radii, a body refused or rejected anyway).
     if !fit.on_floor {
-        return Err(KernelRefusal::non_convergence(KernelStage::Refine, "chain_pcurve_floor", format!(
+        if std::env::var("BREP_DEBUG_TRACK_FIT").is_ok() {
+            // The piece's two ends against the carrier: a rail end that is
+            // itself off the carrier holds the ladder however fine the fit.
+            for (label, t) in [("start", d0), ("end", d1)] {
+                if let Ok(point) = piece.evaluate(t) {
+                    let standoff = crate::project_point_to_surface(surface, point).map(|p| p.distance).unwrap_or(f64::NAN);
+                    eprintln!(
+                        "TRACK_FIT closed-chain piece {label} ({:.9}, {:.9}, {:.9}) stands {standoff:.3e} off the carrier",
+                        point.x, point.y, point.z
+                    );
+                }
+            }
+        }
+        return Err(KernelRefusal::non_convergence(KernelStage::Refine, CHAIN_PCURVE_FLOOR_WHAT, format!(
             "{} a closed chain's support piece misses its pcurve by {:.3e} at {} samples, \
              against a floor of {tolerance:.1e}",
             crate::blend::PCURVE_OFF_FLOOR,

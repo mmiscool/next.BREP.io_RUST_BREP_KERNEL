@@ -51,6 +51,8 @@ pub struct SketchPanel {
 }
 
 impl SketchPanel {
+    pub(crate) fn clear_context_hits(&mut self) { self.ctx_hits.clear(); }
+    pub(crate) fn clear_list_hits(&mut self) { self.list_hits.clear(); }
     pub fn new() -> Self {
         Self {
             // Solver Settings is advanced — start it collapsed.
@@ -170,7 +172,10 @@ impl SketchPanel {
         ));
 
         let subtitle = format!("{} selected", state.sketch_selection_count());
-        let clicked = egui::Frame::popup(ui.style())
+        let clicked = if crate::viewport::touch::compact(ui.ctx()) {
+            action_rail(ui, Some("Sketch actions"), Some(&subtitle), &items, &mut self.ctx_hits)
+        } else {
+            egui::Frame::popup(ui.style())
             .show(ui, |ui| {
                 action_rail(
                     ui,
@@ -180,7 +185,8 @@ impl SketchPanel {
                     &mut self.ctx_hits,
                 )
             })
-            .inner;
+            .inner
+        };
 
         match clicked.as_deref() {
             Some(key) if key.starts_with("constraint:") => {
@@ -460,7 +466,8 @@ fn entity_section(
                 .selected(row.selected)
                 .tint(tint),
             |ui| {
-                let del = crate::icon_text::icon_button(ui, "✕").small();
+                let del = crate::icon_text::icon_button(ui, "✕").small()
+                    .min_size(crate::viewport::touch::target_size(ui.ctx(), egui::Vec2::ZERO));
                 let resp = ui.add(del).on_hover_text("Delete");
                 del_rect = resp.rect;
                 if resp.clicked() {
@@ -472,7 +479,13 @@ fn entity_section(
         // index moves when a sibling is deleted and its label is display text, but
         // the id is what select/hover/delete are addressed by.
         let key = id_key(&row.id);
-        hits.insert(format!("{kind}:{key}"), resp.label.rect);
+        let hit = if crate::viewport::touch::enabled(ui.ctx()) {
+            egui::Rect::from_min_max(
+                egui::pos2(resp.label.rect.left(), resp.row_rect.top()),
+                egui::pos2(del_rect.left() - 4.0, resp.row_rect.bottom()),
+            )
+        } else { resp.label.rect };
+        hits.insert(format!("{kind}:{key}"), hit);
         hits.insert(format!("del:{kind}:{key}"), del_rect);
         if delete_clicked {
             to_delete = Some(row.id.clone());

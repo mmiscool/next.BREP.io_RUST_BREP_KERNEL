@@ -294,6 +294,92 @@ pub(super) fn fit_plane(data: &MeshData, tri_ids: &[u32], vert_ids: &[usize]) ->
     })
 }
 
+/// Gauss–Newton polish of a cylinder (an axis point in the plane normal to
+/// the axis, the axis tilt, the radius) on the region vertices. The seed
+/// axis comes from the facet normals, which carry a chordal bias — on a
+/// coarse tessellation a three-ring seed group's cold fit read 1.26e-4 off
+/// vertices that lie on the carrier to 1e-11, against a peel bar of 8e-5 —
+/// while the vertices themselves lie exactly on the surface, so a few
+/// Newton steps on the point-to-cylinder distance remove that bias. The
+/// polished estimate replaces the cold one only when it reads at most a
+/// tenth of its maximum deviation: on a short noisy arc the axis tilt and
+/// the axis offset trade off along a flat optimum, and three pieces of one
+/// r 30 lobe polished apart put a shared chain 8.7e-3 off the snapped axis
+/// while the cold fits, whose axis comes from the facet normals, agreed.
+fn refine_cylinder(
+    data: &MeshData,
+    vert_ids: &[usize],
+    axis_point: Vec3,
+    axis: Vec3,
+    radius: f64,
+) -> (Vec3, Vec3, f64) {
+    let max_dev = |c: Vec3, a: Vec3, r: f64| -> f64 {
+        vert_ids
+            .iter()
+            .map(|&vid| {
+                let d = data.verts[vid].sub(c);
+                (d.sub(a.scale(d.dot(a))).length() - r).abs()
+            })
+            .fold(0.0_f64, f64::max)
+    };
+    let (mut c, mut a, mut r) = (axis_point, axis, radius);
+    let cold = max_dev(c, a, r);
+    let mut best = (cold, c, a, r);
+    for _ in 0..12 {
+        let Ok(e1) = a.perpendicular() else {
+            break;
+        };
+        let e2 = a.cross(e1);
+        let mut ata = [[0.0_f64; 5]; 5];
+        let mut atb = [0.0_f64; 5];
+        for &vid in vert_ids {
+            let d = data.verts[vid].sub(c);
+            let h = d.dot(a);
+            let radial = d.sub(a.scale(h));
+            let rho = radial.length();
+            if rho <= 1e-14 * data.diag.max(1e-12) {
+                continue;
+            }
+            let w = radial.scale(1.0 / rho);
+            let residual = rho - r;
+            // ∂ρ/∂c_i = −(w·e_i); ∂ρ/∂tilt_i = −h (w·e_i); ∂r/∂R = −1.
+            let (w1, w2) = (w.dot(e1), w.dot(e2));
+            let row = [-w1, -w2, -h * w1, -h * w2, -1.0];
+            for i in 0..5 {
+                for j in 0..5 {
+                    ata[i][j] += row[i] * row[j];
+                }
+                atb[i] -= row[i] * residual;
+            }
+        }
+        let Ok(step) = solve_small::<5>(ata, atb, 5) else {
+            break;
+        };
+        c = c.add(e1.scale(step[0])).add(e2.scale(step[1]));
+        a = match a.add(e1.scale(step[2])).add(e2.scale(step[3])).normalized() {
+            Ok(v) => v,
+            Err(_) => break,
+        };
+        r += step[4];
+        if !(r > 0.0) || !r.is_finite() {
+            break;
+        }
+        let dev = max_dev(c, a, r);
+        if dev < best.0 {
+            best = (dev, c, a, r);
+        }
+        let step_size = (step.iter().map(|s| s * s).sum::<f64>()).sqrt();
+        if step_size < 1e-12 * data.diag.max(1e-12) {
+            break;
+        }
+    }
+    if best.0 <= 0.1 * cold {
+        (best.1, best.2, best.3)
+    } else {
+        (axis_point, axis, radius)
+    }
+}
+
 pub(super) fn fit_cylinder(data: &MeshData, tri_ids: &[u32], vert_ids: &[usize]) -> Option<CandidateFit> {
     let (_, covariance) = normal_statistics(data, tri_ids)?;
     let (values, vectors) = eigen_symmetric3(covariance);
@@ -318,6 +404,8 @@ pub(super) fn fit_cylinder(data: &MeshData, tri_ids: &[u32], vert_ids: &[usize])
         .collect();
     let (cx, cy, radius) = fit_circle_2d(&projected)?;
     let axis_point = centroid.add(u.scale(cx)).add(v.scale(cy));
+    let (axis_point, axis, radius) = refine_cylinder(data, vert_ids, axis_point, axis, radius);
+    let axis = canonical_dir(axis);
     let devs: Vec<f64> = vert_ids
         .iter()
         .map(|&vid| {

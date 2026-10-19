@@ -1,6 +1,6 @@
 [package]
 name = "BREP_mcp_core"
-version = "0.6.1"
+version = "0.7.0"
 edition = "2021"
 license-file = "LICENSE.md"
 repository = "https://github.com/mmiscool/next.BREP.io_RUST_BREP_KERNEL"
@@ -32,20 +32,47 @@ include = [
 name = "brep_mcp_core"
 path = "src/lib.rs"
 
+[features]
+# The server: the MCP protocol over rmcp, the two transports, the script
+# runner, the PLM fixture and the native platform (files, the clock, tokio's
+# timers). On by default — every host so far is a native process. Without it
+# the crate is the TOOL SET alone: the registry adapter, the compositions,
+# the schema and validation, over the host protocol and a `Platform` the
+# host supplies — which is what the browser build of the app compiles for
+# wasm32, so the page serves the same tools the desktop does
+# (`BREP_app/src/webmcp.rs`).
+default = ["server"]
+server = [
+    "dep:rmcp",
+    "dep:hyper",
+    "dep:hyper-util",
+    "dep:ureq",
+    "tokio/rt-multi-thread",
+    "tokio/macros",
+    "tokio/io-std",
+    "tokio/io-util",
+    "tokio/time",
+    "tokio/net",
+]
+
 [dependencies]
-rmcp = { version = "3.2", default-features = false, features = ["server", "transport-io", "transport-streamable-http-server"] }
+rmcp = { version = "3.2", default-features = false, features = ["server", "transport-io", "transport-streamable-http-server"], optional = true }
 schemars = "1.2"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std", "io-util", "sync", "time", "net"] }
+# `sync` alone in the base: the host protocol's channels. It is the one tokio
+# feature set that compiles for wasm32-unknown-unknown; the runtime, timers
+# and sockets come with `server`.
+tokio = { version = "1", default-features = false, features = ["sync"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 image = { version = "0.25", default-features = false, features = ["png", "gif"] }
 base64 = "0.22"
 # The feature catalogue (schema.rs) is read straight from the engine.
-brep-render = { package = "BREP_render", version = "0.8.0", path = "../BREP_render" }
+brep-render = { package = "BREP_render", version = "0.9.0", path = "../BREP_render" }
 # The streamable-HTTP transport is a tower service; hyper serves it on a
 # loopback listener (http.rs). hyper-util's `service` bridges tower to hyper.
-hyper = { version = "1", features = ["server", "http1"] }
-hyper-util = { version = "0.1", features = ["tokio", "service"] }
+hyper = { version = "1", features = ["server", "http1"], optional = true }
+hyper-util = { version = "0.1", features = ["tokio", "service"], optional = true }
 # The PLM fixture (plm_fixture.rs) talks to a loopback `brep-plm serve`: plain
 # HTTP, so no TLS stack. ureq is already in BREP_mcp's tree through the app.
-ureq = { version = "2", default-features = false }
+ureq = { version = "2", default-features = false, optional = true }
+

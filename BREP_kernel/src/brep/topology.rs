@@ -59,6 +59,16 @@ pub struct ShellRecord {
     pub faces: Vec<FaceRecord>,
 }
 
+/// A declared closed region of a Cellular body. Face senses are relative
+/// to the body's face records; a shared wall has opposite senses in its
+/// two cells. `void` distinguishes a void region from material.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct CellRecord {
+    pub id: u64,
+    pub faces: Vec<(u64, bool)>,
+    pub void: bool,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct BrepSolid {
     /// Content-checked measurements; cloned with this solid, never serialized.
@@ -77,6 +87,10 @@ pub struct BrepSolid {
     /// codec keeps its 1.0 header for a Solid for the same reason.
     #[serde(default, skip_serializing_if = "BodyKind::is_solid")]
     pub kind: BodyKind,
+    /// Explicit regions, empty on all historical bodies. Empty storage is
+    /// omitted so every existing JSON body keeps its bytes and digest.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cells: Vec<CellRecord>,
 }
 
 /// The closed kind of a [`ValidationIssue`]. Only the kinds a dispatcher
@@ -157,7 +171,7 @@ pub use seam::{
     analyze_doubly_periodic_seam_band, loop_seam_offsets, seam_band_uv_polygon, seam_band_uv_polygon_with,
 };
 pub(crate) use seam::doubly_periodic_has_only_collapsed_loops;
-pub(crate) use validate::{adaptive_coedge_error, coedge_error_floored};
+pub(crate) use validate::{adaptive_coedge_error, coedge_error_floored, coedge_memo_enabled, exact_line_on_plane_error, CoedgeMemoScope};
 pub use primitives::{make_box_brep, make_cylinder_brep, make_pyramid_brep};
 pub use kind::{topology_kind, BodyKind, KindReport, TopologyKind};
 

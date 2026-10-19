@@ -472,6 +472,7 @@ impl FeatureResult {
             requested: requested.to_vec(),
             applied,
             rejected,
+            extended: Vec::new(),
         });
     }
 
@@ -1249,6 +1250,13 @@ pub struct FeatureContext<'a> {
     pub persistent: &'a serde_json::Value,
     pub env: &'a Env,
     pub scene: &'a SceneMap,
+    /// `Some` when the history walk knows nothing that follows this feature
+    /// references the solids it consumes, by face name or by persistent data
+    /// (lane X row 11b): the boolean feature may then re-seat an operand's
+    /// cylinder seam before imprint. `None` (the walk cannot tell, or a later
+    /// feature might reference them, or a direct `execute_feature` call)
+    /// never re-seats.
+    pub later_inputs: Option<&'a [String]>,
 }
 
 impl<'a> FeatureContext<'a> {
@@ -1308,6 +1316,12 @@ pub struct Fulfilment {
     pub applied: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rejected: Vec<Rejected>,
+    /// Edges the feature acted on that were NOT selected: today a fillet
+    /// whose selection ends inside a tangent chain and refused there, rerun
+    /// once along the open chain
+    /// (`common::open_tangent_chain_extension`). Their names, in walk order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extended: Vec<String>,
 }
 
 impl Fulfilment {
@@ -1319,17 +1333,24 @@ impl Fulfilment {
     /// One line for a report or a tree leaf: "2 of 3 selected references
     /// applied; `ghost` resolves to nothing on this model".
     pub fn summary(&self) -> String {
-        let misses: Vec<String> = self
+        let mut notes: Vec<String> = self
             .rejected
             .iter()
             .map(|rejected| format!("`{}` {}", rejected.name, rejected.reason))
             .collect();
+        if !self.extended.is_empty() {
+            let names: Vec<String> = self.extended.iter().map(|name| format!("`{name}`")).collect();
+            notes.push(format!(
+                "the selection ends inside a tangent chain, so the fillet continued along it onto {}",
+                names.join(", ")
+            ));
+        }
         format!(
             "{} of {} selected reference{} applied; {}",
             self.applied.len(),
             self.requested.len(),
             if self.requested.len() == 1 { "" } else { "s" },
-            misses.join("; ")
+            notes.join("; ")
         )
     }
 }
@@ -1422,6 +1443,17 @@ pub fn execute_feature(
     env: &Env,
     scene: &SceneMap,
 ) -> FeatureResult {
+    execute_feature_with_later(descriptor, env, scene, None)
+}
+
+/// [`execute_feature`] with what the history walk knows about the features
+/// after this one ([`FeatureContext::later_inputs`]).
+pub(crate) fn execute_feature_with_later(
+    descriptor: &FeatureDescriptor,
+    env: &Env,
+    scene: &SceneMap,
+    later_inputs: Option<&[String]>,
+) -> FeatureResult {
     let id = extract_id(&descriptor.input_params);
     let feature_type = descriptor.feature_type.clone();
     // The feature fence: component geometry is valid input for sketch
@@ -1439,6 +1471,7 @@ pub fn execute_feature(
         persistent: &descriptor.persistent_data,
         env,
         scene,
+        later_inputs,
     };
     // Alias resolution mirrors the caller's feature registry, which matches short name,
     // LONG name, and class name (all uppercased) — saved files and tests use
@@ -1598,6 +1631,11 @@ pub fn clear_history_cache() {
     sheet_metal::clear_trees();
     // The per-coedge reading memo the boolean's operand preparation keeps.
     crate::reading_memo::clear();
+    // The per-face mesh fragments the soundness scan and the display share.
+    crate::watertight_tessellation::clear_face_memo();
+    crate::soundness::pair_memo::clear();
+    crate::soundness::fold_memo::clear();
+    crate::pair_classification::clear_classify_memo();
     // The wire-harness tail's bundle solids are owned outside the per-feature
     // entries; they die with the cache too.
     wire_harness::clear_cache();
@@ -1713,6 +1751,50 @@ const SKETCH_REFERENCE_ALIASES: [&str; 2] = [":PROFILE", ":FACE"];
 /// recursively) that EXACT-matches a name available earlier in the history
 /// (directly, or with a selection ALIAS suffix — [`SKETCH_REFERENCE_ALIASES`] —
 /// stripped) — the feature's resolvable reference set.
+/// Whether a feature's persistent data holds anything (a later feature's
+/// id-based references live there).
+fn has_persistent_data(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Null => false,
+        serde_json::Value::Object(map) => !map.is_empty(),
+        serde_json::Value::Array(items) => !items.is_empty(),
+        serde_json::Value::String(text) => !text.is_empty(),
+        _ => true,
+    }
+}
+
+/// The boolean's seam re-seat gate (lane X row 11b): `None` when a feature
+/// after it carries persistent data (an id-based reference this walk cannot
+/// read) or it consumes no resident solid; otherwise every face and edge name
+/// of the solids it consumes that a later feature's inputParams text spells
+/// (every derived edge name embeds its faces' names), sorted. The kernel
+/// re-seats only a wall none of these names touches.
+fn seam_reseat_references(
+    consumed: &std::collections::BTreeSet<String>,
+    scene: &SceneMap,
+    later_texts: &[String],
+    later_persistent: bool,
+) -> Option<Vec<String>> {
+    if later_persistent {
+        return None;
+    }
+    let handles: Vec<u32> = consumed.iter().filter_map(|name| scene.solids.get(name).copied()).collect();
+    if handles.is_empty() {
+        return None;
+    }
+    let spelled = |name: &String| later_texts.iter().any(|text| text.contains(name.as_str()));
+    let mut names: Vec<String> = scene
+        .faces
+        .iter()
+        .filter(|(name, face)| handles.contains(&face.handle) && spelled(name))
+        .map(|(name, _)| name.clone())
+        .chain(scene.edges.iter().filter(|(name, edge)| handles.contains(&edge.handle) && spelled(name)).map(|(name, _)| name.clone()))
+        .collect();
+    names.sort();
+    names.dedup();
+    Some(names)
+}
+
 fn scan_consumed(
     descriptor: &FeatureDescriptor,
     available: &HashMap<String, ()>,
@@ -1924,6 +2006,14 @@ pub fn execute_history_observed(
     }
 
     let total = request.features.len();
+    // Lane X row 11b: each feature's inputParams text, and whether any feature
+    // AFTER index i carries persistent data (an id-based reference this walk
+    // cannot read), for the boolean feature's seam re-seat gate.
+    let input_texts: Vec<String> = request.features.iter().map(|descriptor| descriptor.input_params.to_string()).collect();
+    let mut persistent_after = vec![false; total + 1];
+    for index in (0..total).rev() {
+        persistent_after[index] = persistent_after[index + 1] || has_persistent_data(&request.features[index].persistent_data);
+    }
     for (index, descriptor) in request.features.iter().enumerate() {
         let id = extract_id(&descriptor.input_params);
         // Editor stop-point: BEFORE this feature — the rest of the request is
@@ -1944,6 +2034,21 @@ pub fn execute_history_observed(
         let (fingerprint, library_dirty) =
             parts_library::mix_descriptor_fingerprint(descriptor, fingerprint);
         let consumed = scan_consumed(descriptor, &available);
+        let reseat_references = if matches!(descriptor.feature_type.as_str(), "B" | "BOOLEAN") {
+            seam_reseat_references(&consumed, &scene, &input_texts[index + 1..], persistent_after[index + 1])
+        } else {
+            None
+        };
+        // What the boolean may re-seat changes what it builds, so it keys the cache.
+        let fingerprint = match &reseat_references {
+            Some(names) => {
+                use std::hash::{Hash, Hasher};
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                (fingerprint, "seam-reseat", names).hash(&mut hasher);
+                hasher.finish()
+            }
+            None => fingerprint,
+        };
         // Merkle input hash over this feature + its consumed producers' versions.
         // Computed for EVERY feature (cacheable or not) so its produced names can
         // publish a version for downstream consumers.
@@ -2014,9 +2119,12 @@ pub fn execute_history_observed(
         // The feature is ONE blend operation however many blend calls it
         // makes: none of them drops another's reports before the consume below.
         let blend_operation = crate::blend::BlendOperation::enter();
+        let feature_profile = crate::boolean::profile::Feature::begin();
         let feat_start = web_time::Instant::now();
-        let mut result = execute_feature(descriptor, &env, &scene);
-        timings.push((id.clone(), feat_start.elapsed().as_secs_f64() * 1000.0));
+        let mut result = execute_feature_with_later(descriptor, &env, &scene, reseat_references.as_deref());
+        let feature_ms = feat_start.elapsed().as_secs_f64() * 1000.0;
+        feature_profile.finish(&id, feature_ms);
+        timings.push((id.clone(), feature_ms));
         // A result the soundness acceptance REPAIRED rather than returned as
         // built says so on the feature that built it. Drained here, so a repair
         // made by any lane reaches the caller's report by one route instead of

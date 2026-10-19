@@ -286,6 +286,7 @@ pub(in crate::step_import) fn certify_brep_with_voids_containment(solid: &BrepSo
     }
     let outer = BrepSolid {
         mass_properties_cache: Default::default(),
+        cells: Default::default(),
         id: solid.id,
         vertices: solid.vertices.clone(),
         edges: solid.edges.clone(),
@@ -519,6 +520,7 @@ pub(in crate::step_import) fn build_brep_with_voids_captured(
     let closure_context = builder.closure_context();
     let mut solid = BrepSolid {
         mass_properties_cache: Default::default(),
+        cells: Default::default(),
         id: solid_id,
         vertices: builder.vertices,
         edges: builder.edges,
@@ -710,6 +712,7 @@ pub(in crate::step_import) fn build_solid_from_shell_captured(
     let closure_context = builder.closure_context();
     let mut solid = BrepSolid {
         mass_properties_cache: Default::default(),
+        cells: Default::default(),
         id: solid_id,
         vertices: builder.vertices,
         edges: builder.edges,

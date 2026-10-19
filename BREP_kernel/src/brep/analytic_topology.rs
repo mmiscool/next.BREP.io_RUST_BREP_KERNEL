@@ -7,8 +7,56 @@ use crate::{
     Vec3,
 };
 
-fn validated(solid: BrepSolid, label: &str) -> Result<BrepSolid, String> {
+// A certificate owns the just-built body; it is consumed at this module's
+// acceptance boundary. It is never attached to mutable BrepSolid data or
+// serialized, and no caller can certify an imported or subsequently edited body.
+// Primitive certificate type: begin
+struct CertifiedPrimitive { solid: BrepSolid }
+// Primitive certificate type: end
+impl CertifiedPrimitive {
+    fn accept(self) -> BrepSolid {
+        primitive_check_count(true);
+        self.solid
+    }
+}
+
+pub(crate) fn primitive_certificate_enabled() -> bool {
+    // Promoted after the 98/144-case byte census. Explicit =0 restores the
+    // full constructor validator; eligibility never changes geometry or errors.
+    match std::env::var("BREP_CERTIFIED_PRIMITIVES") {
+        Ok(value) => value == "1" || value == "on",
+        Err(std::env::VarError::NotPresent) => true,
+        Err(_) => false,
+    }
+}
+
+// This is an eligibility bound, never a new refusal: every input outside it
+// takes the original validator. Keep floating point conditioning far from the
+// model/edge coincidence bands: dimensions 1e-3..1e3, origin at most 1000
+// times the smallest dimension, and axes of order unity. Surface/curve builders
+// still check finite homogeneous control points, positive weights and knots.
+// The trusted builders supply incidence and exact shared boundary construction:
+// box affine faces; cylinder two iso-curves and their plane images; sphere
+// one periodic chart with two pole edges; ring torus two periodic seams.
+// Neither a certificate nor this eligibility predicate accepts arbitrary bodies.
+pub(crate) fn primitive_domain(origin: Vec3, dimensions: &[f64], axis: Option<Vec3>) -> bool {
+    if !dimensions.iter().all(|v| v.is_finite() && (1e-3..=1e3).contains(v)) { return false; }
+    let minimum = dimensions.iter().copied().fold(f64::INFINITY, f64::min);
+    if ![origin.x, origin.y, origin.z].iter().all(|v| v.is_finite() && v.abs() <= minimum * 1000.) { return false; }
+    axis.is_none_or(|a| [a.x, a.y, a.z].iter().all(|v| v.is_finite())
+        && (0.25..=4.).contains(&a.length_squared()))
+}
+
+pub(crate) fn primitive_check_count(certified: bool) {
+    let _ = certified;
+}
+
+
+fn validated(solid: BrepSolid, label: &'static str) -> Result<BrepSolid, String> {
+    let mut profile = crate::loft_topology::ConstructionProfile::new(label);
+    primitive_check_count(false);
     let issues = solid.validate();
+    profile.lap("validation");
     if issues.is_empty() {
         Ok(solid)
     } else {
@@ -34,13 +82,14 @@ pub fn make_sphere_brep_framed(
     polar_axis: Vec3,
     seam_direction: Option<Vec3>,
 ) -> Result<BrepSolid, String> {
+    let mut profile = crate::loft_topology::ConstructionProfile::new("sphere");
     let surface = make_sphere_surface_framed(center, radius, polar_axis, seam_direction)?;
     let south = surface.evaluate(0.0, 0.0)?;
     let north = surface.evaluate(0.0, 1.0)?;
     let seam = surface.iso_curve_u(0.0)?;
-    validated(
-        BrepSolid {
+    let solid = BrepSolid {
             mass_properties_cache: Default::default(),
+            cells: Default::default(),
             id: 120,
             vertices: vec![
                 VertexRecord {
@@ -124,9 +173,15 @@ pub fn make_sphere_brep_framed(
             }],
             genus: 0,
             kind: crate::BodyKind::Solid,
-        },
-        "sphere",
-    )
+        };
+    profile.lap("construct");
+    // The pole/seam topology above is fixed. A caller-selected seam keeps the
+    // full validator until that separate construction is certified as well.
+    if primitive_certificate_enabled() && seam_direction.is_none()
+        && primitive_domain(center, &[radius], Some(polar_axis)) {
+        return Ok(CertifiedPrimitive { solid }.accept());
+    }
+    validated(solid, "sphere")
 }
 
 pub fn make_torus_brep(
@@ -135,13 +190,14 @@ pub fn make_torus_brep(
     major_radius: f64,
     minor_radius: f64,
 ) -> Result<BrepSolid, String> {
+    let mut profile = crate::loft_topology::ConstructionProfile::new("torus");
     let surface = make_torus_surface(center, axis_direction, major_radius, minor_radius)?;
     let corner = surface.evaluate(0.0, 0.0)?;
     let major_curve = surface.iso_curve_v(0.0)?;
     let tube_curve = surface.iso_curve_u(0.0)?;
-    validated(
-        BrepSolid {
+    let solid = BrepSolid {
             mass_properties_cache: Default::default(),
+            cells: Default::default(),
             id: 130,
             vertices: vec![VertexRecord {
                 id: 1,
@@ -209,9 +265,16 @@ pub fn make_torus_brep(
             }],
             genus: 1,
             kind: crate::BodyKind::Solid,
-        },
-        "torus",
-    )
+        };
+    profile.lap("construct");
+    // Positive clearance makes the periodic tube a ring torus, not a horn or
+    // spindle. Near-horn numerics keep the original validation path.
+    if primitive_certificate_enabled()
+        && major_radius - minor_radius >= minor_radius * 1e-3
+        && primitive_domain(center, &[major_radius, minor_radius], Some(axis_direction)) {
+        return Ok(CertifiedPrimitive { solid }.accept());
+    }
+    validated(solid, "torus")
 }
 
 pub fn make_cone_brep(
@@ -264,6 +327,7 @@ pub fn make_cone_brep(
         return validated(
             BrepSolid {
                 mass_properties_cache: Default::default(),
+                cells: Default::default(),
                 id: 140,
                 vertices: vec![
                     VertexRecord {
@@ -369,6 +433,7 @@ pub fn make_cone_brep(
     validated(
         BrepSolid {
             mass_properties_cache: Default::default(),
+            cells: Default::default(),
             id: 150,
             vertices: vec![
                 VertexRecord {
@@ -474,4 +539,5 @@ pub fn make_cone_brep(
         "cone frustum",
     )
 }
+
 

@@ -46,6 +46,12 @@ pub mod store;
 /// A template's input marks and its spin-out (`.tbrep`).
 pub mod template;
 pub mod viewport;
+/// The browser's tool surface (WebMCP): the MCP server's tool set, served by
+/// the page as the tools it registers with `document.modelContext`, answered
+/// through the automation queue. The pure half compiles natively for its
+/// tests; the host and the exports `web/webmcp.js` imports exist on wasm only.
+#[cfg(feature = "mcp")]
+pub mod webmcp;
 pub mod workbench;
 pub mod plugins;
 pub mod javascript;
@@ -92,7 +98,14 @@ mod web {
                 Box::new(|cc| {
                     crate::fonts::install(&cc.egui_ctx);
                     crate::app::BrepApp::new(cc)
-                        .map(|app| Box::new(app) as Box<dyn eframe::App>)
+                        .map(|app| {
+                            // The page's tool surface (WebMCP) answers through
+                            // the app's own automation queue: hand it over
+                            // here, where the app first exists.
+                            #[cfg(feature = "mcp")]
+                            crate::webmcp::attach(app.automation().clone(), app.diagnostics().adapter_line());
+                            Box::new(app) as Box<dyn eframe::App>
+                        })
                         .map_err(|e| e.into())
                 }),
             )

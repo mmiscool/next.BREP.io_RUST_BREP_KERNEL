@@ -52,6 +52,43 @@ pub struct StlImport {
     pub welded_vertex_count: usize,
     /// Absolute tolerance used for vertex welding.
     pub weld_tolerance: f64,
+    /// Source facets the reader left out, each with why. Only a facet with
+    /// NO area is dropped — a zero scaled cross product in the file, or
+    /// corners that weld to one vertex — so nothing with a surface is lost;
+    /// `mesh` holds every other facet in file order.
+    pub dropped_facets: Vec<DroppedFacet>,
+}
+
+/// One source facet the reader dropped, by its zero-based facet index.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DroppedFacet {
+    /// Zero-based index of the facet in the file.
+    pub facet: usize,
+    /// Why it carries no area.
+    pub reason: DroppedFacetReason,
+}
+
+/// Why a dropped facet has no area.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DroppedFacetReason {
+    /// The facet's own corners are collinear or coincident: its scaled
+    /// cross product is exactly zero in the file.
+    ZeroArea,
+    /// Two of its corners weld to one vertex at the weld tolerance.
+    CollapsedByWeld,
+}
+
+impl Display for DroppedFacet {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self.reason {
+            DroppedFacetReason::ZeroArea => {
+                write!(f, "facet {} has zero area (collinear or coincident corners)", self.facet)
+            }
+            DroppedFacetReason::CollapsedByWeld => {
+                write!(f, "facet {} has zero area after its corners weld together", self.facet)
+            }
+        }
+    }
 }
 
 /// Failure to read, parse, or validate STL input.
@@ -375,6 +412,8 @@ fn build_import(
     })?;
     let mut bbox_min = source[0][0];
     let mut bbox_max = source[0][0];
+    let mut dropped_facets = Vec::new();
+    let mut kept = Vec::with_capacity(source.len());
     for (facet, triangle) in source.iter().enumerate() {
         for &point in triangle {
             if !point.is_finite() {
@@ -389,7 +428,23 @@ fn build_import(
             bbox_max.y = bbox_max.y.max(point.y);
             bbox_max.z = bbox_max.z.max(point.z);
         }
-        validate_triangle(*triangle, facet)?;
+        // A facet with no area at all (a tessellator's pole triangle, a
+        // collapsed sliver) is dropped and named, not a reason to refuse
+        // the file: it bounds nothing. Anything with area, however thin,
+        // is kept — the converter's degenerate-coverage pass owns those.
+        if facet_has_area(*triangle, facet)? {
+            kept.push((facet, *triangle));
+        } else {
+            dropped_facets.push(DroppedFacet {
+                facet,
+                reason: DroppedFacetReason::ZeroArea,
+            });
+        }
+    }
+    if kept.is_empty() {
+        return Err(StlError::InvalidGeometry(format!(
+            "every one of the {source_triangle_count} facet(s) has zero area"
+        )));
     }
     let extent = bbox_max - bbox_min;
     let diagonal = extent.length();
@@ -406,7 +461,14 @@ fn build_import(
             "the derived weld tolerance is outside the supported numeric range".into(),
         ));
     }
-    let (vertices, triangles) = weld_vertices(&source, bbox_min, diagonal, weld_tolerance)?;
+    let (vertices, triangles) =
+        weld_vertices(&kept, bbox_min, diagonal, weld_tolerance, &mut dropped_facets)?;
+    if triangles.is_empty() {
+        return Err(StlError::InvalidGeometry(format!(
+            "every one of the {source_triangle_count} facet(s) has zero area after welding"
+        )));
+    }
+    dropped_facets.sort_by_key(|dropped| dropped.facet);
     let welded_vertex_count = vertices.len();
     Ok(StlImport {
         mesh: Mesh::new(vertices, triangles),
@@ -415,10 +477,13 @@ fn build_import(
         source_vertex_count,
         welded_vertex_count,
         weld_tolerance,
+        dropped_facets,
     })
 }
 
-fn validate_triangle(points: [Vec3; 3], facet: usize) -> Result<(), StlError> {
+/// Whether the facet has any area: its scaled cross product is not exactly
+/// zero. Non-finite arithmetic is still an error.
+fn facet_has_area(points: [Vec3; 3], facet: usize) -> Result<bool, StlError> {
     let ab = points[1] - points[0];
     let ac = points[2] - points[0];
     if !ab.is_finite() || !ac.is_finite() {
@@ -434,22 +499,23 @@ fn validate_triangle(points: [Vec3; 3], facet: usize) -> Result<(), StlError> {
     } else {
         Vec3::ZERO
     };
-    if !cross.is_finite() || cross.length_squared() == 0.0 {
+    if !cross.is_finite() {
         return Err(StlError::InvalidGeometry(format!(
-            "facet {facet} is degenerate"
+            "facet {facet} exceeds the supported numeric range"
         )));
     }
-    Ok(())
+    Ok(cross.length_squared() != 0.0)
 }
 
 fn weld_vertices(
-    source: &[[Vec3; 3]],
+    source: &[(usize, [Vec3; 3])],
     bbox_min: Vec3,
     diagonal: f64,
     tolerance: f64,
+    dropped: &mut Vec<DroppedFacet>,
 ) -> Result<(Vec<Vec3>, Vec<[u32; 3]>), StlError> {
     if tolerance == 0.0 {
-        return weld_exact(source);
+        return weld_exact(source, dropped);
     }
     // Leave headroom for the neighbor-cell offsets below.
     if diagonal / tolerance > (i64::MAX - 2) as f64 {
@@ -462,7 +528,7 @@ fn weld_vertices(
     let mut vertices = Vec::<Vec3>::new();
     let mut cells = BTreeMap::<[i64; 3], Vec<u32>>::new();
     let mut triangles = Vec::with_capacity(source.len());
-    for (facet, points) in source.iter().enumerate() {
+    for &(facet, points) in source {
         let mut triangle = [0_u32; 3];
         for (corner, &point) in points.iter().enumerate() {
             let key = cell_key(point, bbox_min, tolerance)?;
@@ -499,12 +565,17 @@ fn weld_vertices(
             };
             triangle[corner] = index;
         }
-        if triangle[0] == triangle[1] || triangle[1] == triangle[2] || triangle[2] == triangle[0] {
-            return Err(StlError::InvalidGeometry(format!(
-                "facet {facet} becomes degenerate at weld tolerance {tolerance:e}"
-            )));
+        if triangle[0] == triangle[1]
+            || triangle[1] == triangle[2]
+            || triangle[2] == triangle[0]
+            || !facet_has_area(triangle.map(|index| vertices[index as usize]), facet)?
+        {
+            dropped.push(DroppedFacet {
+                facet,
+                reason: DroppedFacetReason::CollapsedByWeld,
+            });
+            continue;
         }
-        validate_triangle(triangle.map(|index| vertices[index as usize]), facet)?;
         triangles.push(triangle);
     }
     Ok((vertices, triangles))
@@ -524,11 +595,14 @@ fn cell_key(point: Vec3, origin: Vec3, tolerance: f64) -> Result<[i64; 3], StlEr
     Ok(cell.map(|value| value as i64))
 }
 
-fn weld_exact(source: &[[Vec3; 3]]) -> Result<(Vec<Vec3>, Vec<[u32; 3]>), StlError> {
+fn weld_exact(
+    source: &[(usize, [Vec3; 3])],
+    dropped: &mut Vec<DroppedFacet>,
+) -> Result<(Vec<Vec3>, Vec<[u32; 3]>), StlError> {
     let mut vertices = Vec::new();
     let mut indices = HashMap::<[u64; 3], u32>::new();
     let mut triangles = Vec::with_capacity(source.len());
-    for (facet, points) in source.iter().enumerate() {
+    for &(facet, points) in source {
         let mut triangle = [0_u32; 3];
         for (corner, &point) in points.iter().enumerate() {
             let canonical_bits = |value: f64| if value == 0.0 { 0 } else { value.to_bits() };
@@ -552,12 +626,17 @@ fn weld_exact(source: &[[Vec3; 3]]) -> Result<(Vec<Vec3>, Vec<[u32; 3]>), StlErr
             };
             triangle[corner] = index;
         }
-        if triangle[0] == triangle[1] || triangle[1] == triangle[2] || triangle[2] == triangle[0] {
-            return Err(StlError::InvalidGeometry(format!(
-                "facet {facet} becomes degenerate after exact vertex welding"
-            )));
+        if triangle[0] == triangle[1]
+            || triangle[1] == triangle[2]
+            || triangle[2] == triangle[0]
+            || !facet_has_area(triangle.map(|index| vertices[index as usize]), facet)?
+        {
+            dropped.push(DroppedFacet {
+                facet,
+                reason: DroppedFacetReason::CollapsedByWeld,
+            });
+            continue;
         }
-        validate_triangle(triangle.map(|index| vertices[index as usize]), facet)?;
         triangles.push(triangle);
     }
     Ok((vertices, triangles))

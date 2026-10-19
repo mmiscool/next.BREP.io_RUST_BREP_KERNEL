@@ -82,6 +82,7 @@ pub fn fit_groups(
 /// Rows of Compact commands that stack inside the Large row height: a run of
 /// small icons fills these top to bottom before it adds a column.
 pub fn compact_rows(ui: &egui::Ui) -> usize {
+    if crate::viewport::touch::enabled(ui.ctx()) { return 1; }
     let spacing = ui.spacing().item_spacing.y;
     (((LARGE_BTN + spacing) / (toolbar_button::TOOLBAR_BTN + spacing)).floor() as usize).max(1)
 }
@@ -96,6 +97,12 @@ pub fn hit_key(command: &OfferedCommand) -> String {
         CommandTarget::Shell(id) => (*id).into(),
     }
 }
+
+/// The toolbar and Ribbon group captions keep egui's own 9 pt when the app's
+/// caption style grows (`app::SMALL_TEXT_SIZE`): the chrome's height decides
+/// where the viewport and every pane start, and a 2 pt taller Ribbon moved all
+/// of them (measured: 31 test-mcp scripts pin those positions).
+pub const CHROME_CAPTION_SIZE: f32 = 9.0;
 
 pub fn group_key(name: &str) -> String {
     format!("ribbon:group:{name}")
@@ -121,17 +128,12 @@ pub fn draw_command(
                 )),
         )
     } else if compact {
-        if command.toggle {
-            toolbar_button::toggle_enabled(
-                ui,
-                enabled,
-                command.pressed,
-                &command.glyph,
-                command.label(),
-            )
-        } else {
-            toolbar_button::button_enabled(ui, enabled, &command.glyph, command.label())
-        }
+        // The bare glyph button: the tooltip is attached once, below, with the
+        // command's detail. The `toolbar_button` helpers carry their own hover
+        // text, which stacked a second tooltip under this one.
+        let button = toolbar_button::glyph_button(ui, &command.glyph);
+        let button = if command.toggle { button.selected(command.pressed) } else { button };
+        ui.add_enabled(enabled, button)
     } else {
         toolbar_button::large_button(
             ui,
@@ -230,7 +232,7 @@ fn draw_group(
                     target = Some(t);
                 }
             });
-            ui.label(egui::RichText::new(name).weak().small());
+            ui.label(egui::RichText::new(name).weak().size(CHROME_CAPTION_SIZE));
         });
     });
     hits.insert(group_key(name), frame.response.rect);
@@ -319,7 +321,10 @@ impl RibbonPanel {
                 }
             }
             if layout.visible < groups.len() {
-                let more = ui.button("More ▾");
+                // As tall as the groups' Large buttons, so it stands with them
+                // instead of a small chip floating at mid-height (lane U audit
+                // item 14). Its width — what `fit_groups` reserved — is the same.
+                let more = ui.add(egui::Button::new("More ▾").min_size(egui::vec2(0.0, LARGE_BTN)));
                 hits.insert("ribbon:overflow".into(), more.rect);
                 egui::Popup::menu(&more).show(|ui| {
                     egui::ScrollArea::vertical()

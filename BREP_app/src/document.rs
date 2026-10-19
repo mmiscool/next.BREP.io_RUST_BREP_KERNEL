@@ -44,8 +44,28 @@ impl Access {
     }
 }
 
-/// The empty model a **New** document starts from.
+/// Empty history for loading fixtures and creating nonpart documents.
 pub const EMPTY_DOCUMENT: &str = r#"{"expressions":"","configurator":{},"features":[]}"#;
+
+/// Workbenches share a document format. Only part workspaces seed geometry
+/// references; assembly, drawing, harness and eCAD workspaces start empty.
+fn is_part_workbench(id: &str) -> bool {
+    !matches!(crate::workbench::resolve(id).id,
+        "assembly" | "drawing" | "wireHarness" | "diagram" | "pcb" | "symbol" | "pads")
+}
+
+/// Seed only a feature-empty part when explicitly creating a new part. PLM
+/// adoption uses this too, preserving the source's expressions and document blocks.
+pub fn seed_new_part_datum(engine: &mut EngineState) {
+    if engine.history_len() == 0 && is_part_workbench(&engine.settings.workbench) {
+        let id = engine.next_feature_id(&brep_render::features::feature_short_name("D"));
+        let mut params = engine.feature_default_params("D");
+        params["id"] = serde_json::json!(id);
+        engine.add_feature(&serde_json::json!({
+            "type": "D", "inputParams": params, "persistentData": {}
+        }).to_string()).expect("valid default datum");
+    }
+}
 
 /// ONE open model: the engine that owns it plus the identity the file lane needs
 /// — the store name it was opened from / saved to, and the clean baseline.
@@ -57,6 +77,11 @@ pub struct Document {
     /// identity, not the display name — a native dialog hands back a full path
     /// and a plain Save must write back to it.
     name: Option<String>,
+    /// Which untitled document this is while it has no `name`: 1 is plain
+    /// "untitled", 2 and up read "untitled 2", … — assigned by
+    /// [`Documents::open_document`], the lowest number no other open untitled
+    /// tab holds, so two new tabs never share a label (lane U, ruling P2).
+    untitled: u32,
     /// PLM write permission is independent of editing the session copy.
     plm_save_access: Option<Access>,
     /// The model request JSON as of the last New / Open / Save — the baseline
@@ -151,6 +176,16 @@ fn ecad_blocks() -> [ecad::BlockSync; 4] {
 }
 
 impl Document {
+    /// Create a fresh document. Part workbenches start with the same ordinary,
+    /// schema-seeded datum a user adds from the palette. Existing content must
+    /// use `new` instead: opening a file never changes its feature history.
+    pub fn fresh(mut engine: EngineState, class: crate::document_class::DocumentClass) -> Self {
+        engine.set_history_json(EMPTY_DOCUMENT).expect("valid empty document");
+        crate::document_class::set_document_class(&mut engine, class);
+        seed_new_part_datum(&mut engine);
+        Self::new(engine)
+    }
+
     /// Wrap `engine` as a document, taking its CURRENT model as the clean
     /// baseline — so a freshly loaded (or freshly emptied) document is clean and
     /// the first edit marks it dirty.
@@ -165,6 +200,7 @@ impl Document {
             marker_key: None,
             dirty_checks: 0,
             id: next_document_id(),
+            untitled: 1,
             ecad: crate::workbench::ecad::Editors::new(),
             ecad_blocks: ecad_blocks(),
             ecad_parts_revision: None,
@@ -191,6 +227,7 @@ impl Document {
             marker_key: None,
             dirty_checks: 0,
             id: next_document_id(),
+            untitled: 1,
             ecad: crate::workbench::ecad::Editors::new(),
             ecad_blocks: ecad_blocks(),
             ecad_parts_revision: None,
@@ -254,13 +291,22 @@ impl Document {
         self.name = name;
     }
 
-    /// The tab label: PLM part/revision, the bare file name, or `untitled`.
+    /// The tab label: PLM part/revision, the bare file name, or `untitled`
+    /// (`untitled 2`, … for the second and later untitled tabs).
     pub fn title(&self) -> String {
         match &self.name {
             Some(name) => crate::panels::plm_host::revision_of(name)
                 .map(|(part, revision)| format!("{part}/{revision}"))
                 .unwrap_or_else(|| crate::store::model_display_name(name)),
-            None => "untitled".to_string(),
+            None => self.untitled_title(),
+        }
+    }
+
+    /// What an untitled document is called, and what Save As offers for it.
+    pub fn untitled_title(&self) -> String {
+        match self.untitled {
+            0 | 1 => "untitled".to_string(),
+            n => format!("untitled {n}"),
         }
     }
 
@@ -413,9 +459,9 @@ pub struct Documents {
 }
 
 impl Documents {
-    /// A session holding ONE empty document built by `new_engine`.
+    /// A session holding one fresh document built by `new_engine`.
     pub fn new(new_engine: EngineFactory) -> Self {
-        let first = Document::new(new_engine());
+        let first = Document::fresh(new_engine(), crate::document_class::DocumentClass::Normal);
         Self {
             open: vec![first],
             active: 0,
@@ -589,11 +635,25 @@ impl Documents {
     }
 
     /// Add `doc` as a new tab and make it active.
-    pub fn open_document(&mut self, doc: Document) -> usize {
+    pub fn open_document(&mut self, mut doc: Document) -> usize {
+        if doc.name.is_none() {
+            let taken: Vec<u32> = self.open.iter().filter(|d| d.name.is_none()).map(|d| d.untitled).collect();
+            doc.untitled = (1..).find(|n| !taken.contains(n)).unwrap_or(1);
+        }
         self.open.push(doc);
         let index = self.open.len() - 1;
         self.activate(index);
         index
+    }
+
+    /// Number the untitled tabs 1, 2, … in tab order. Only for a session being
+    /// built before anyone has seen its tabs — the autosave restore, which adds
+    /// the recovered documents beside the boot seed and then closes the seed,
+    /// so the seed's "untitled" must not push a recovered tab to "untitled 2".
+    pub(crate) fn renumber_untitled(&mut self) {
+        for (n, doc) in self.open.iter_mut().filter(|d| d.name.is_none()).enumerate() {
+            doc.untitled = n as u32 + 1;
+        }
     }
 
     /// Make tab `index` active, carrying the session's display settings over to
@@ -648,7 +708,9 @@ impl Documents {
         // included — exactly as `New` does through `spawn_engine`.
         let refilled = self.open.is_empty();
         if refilled {
-            self.open.push(Document::new((self.new_engine)()));
+            let mut engine = (self.new_engine)();
+            carry_settings(&settings, &mut engine, true);
+            self.open.push(Document::fresh(engine, crate::document_class::DocumentClass::Normal));
             self.active = 0;
             self.open[0].engine.resize(viewport.0, viewport.1);
         } else if closed_active {

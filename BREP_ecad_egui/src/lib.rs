@@ -7,6 +7,12 @@ use brep_ecad_core::{
 use egui::{Align2, Color32, FontId, Key, PointerButton, Pos2, Rect, Sense, Stroke, Vec2};
 
 mod actions;
+
+/// `n` and its noun, singular for exactly one: "1 pad", "2 pads", "0 pads".
+/// The panels' counts read "1 pads" and "1 graphics" (lane U audit item 8).
+pub(crate) fn count(n: usize, one: &str, many: &str) -> String {
+    format!("{n} {}", if n == 1 { one } else { many })
+}
 mod board_view;
 mod erc_panel;
 mod footprint_editor;
@@ -263,6 +269,16 @@ pub struct Editor {
     pub add_part_label: Option<String>,
     /// Set by that button, for the host to take and answer.
     pub add_part_requested: bool,
+    /// Set by **Duplicate** on a component placed from a part every offered
+    /// occurrence of which is already on the sheet: the part keys the user asked
+    /// for ANOTHER occurrence of, for the host to take and add to the assembly
+    /// (a board is an assembly, so another footprint is another component). The
+    /// editor arms placement of the new occurrence when the host offers it
+    /// ([`Editor::arm_pending_duplicate`]).
+    pub duplicate_requests: Vec<String>,
+    /// The part key and rotation a duplicate is waiting on, until the host
+    /// offers an occurrence of it that is not on the sheet.
+    pending_duplicate: Option<(String, u8)>,
     /// The library panel's widgets as last drawn, keyed for automation (`parts:add`,
     /// `parts:search`, `parts:card:<reference, else name>`), for the host to take each frame. Empty
     /// when the panel was not drawn, so a hidden panel publishes nothing stale.
@@ -347,6 +363,8 @@ impl Default for Editor {
             open_part_requests: vec![],
             add_part_label: None,
             add_part_requested: false,
+            duplicate_requests: vec![],
+            pending_duplicate: None,
             library_hits: vec![],
             labels_from_host: None,
             placing_part: None,
@@ -700,19 +718,40 @@ impl Editor {
         self.tool = Tool::Place;
         self.rotation = 0;
     }
-    /// Place the part being placed, or `symbol` for a copy of a component drawn
-    /// without a part. A part that carries its label is placed once: the tool is put
-    /// down after it, and a label already on the sheet is refused with a notice.
+    /// Place the part being placed — the assembly occurrence it is — or `symbol`
+    /// for a power symbol. An occurrence is placed once: the tool is put down after
+    /// it, and one already on the sheet, or a label already on the sheet, is refused
+    /// with a notice.
     fn place_here(&mut self, symbol: Symbol, at: Point, rotation: u8) -> Option<Uuid> {
         let part = self.placing_part.clone();
-        let labelled = part.as_ref().is_some_and(|p| p.reference.is_some());
+        // An assembly occurrence is placed ONCE: the tool is put down after it.
+        let labelled = part.is_some();
         let mut placed = Ok(None);
         self.transaction(|d| {
             placed = match part {
-                Some(part) => d
-                    .place_part(part.source, part.symbol, part.pads, part.reference, at, rotation)
-                    .map(Some),
-                None => Ok(Some(d.place(symbol, at, rotation))),
+                // A part is placed as the assembly component it IS: the host offers
+                // occurrences, and a card without one is not a part a sheet takes.
+                Some(part) => match part.source.instance.clone() {
+                    Some(occurrence) => d
+                        .place_assembly_component(
+                            &occurrence,
+                            part.source,
+                            part.symbol,
+                            part.pads,
+                            part.reference,
+                            at,
+                            rotation,
+                        )
+                        .map(Some),
+                    None => Err(format!(
+                        "{} is not an assembly component. Add the part to the assembly with \
+                         Add component; it is placed from there.",
+                        part.reference.as_deref().unwrap_or(&part.name)
+                    )),
+                },
+                // A symbol with no part behind it is a net flag, or nothing a sheet
+                // takes: a copy of a legacy free symbol is refused here.
+                None => d.place_power_symbol(symbol, at, rotation).map(Some),
             }
         });
         match placed {
@@ -1273,9 +1312,9 @@ impl Editor {
             ui.heading("Connections");
             let connections = self.document.connections();
             ui.label(format!(
-                "{} components · {} connections",
-                self.document.components.len(),
-                connections.len()
+                "{} · {}",
+                count(self.document.components.len(), "component", "components"),
+                count(connections.len(), "connection", "connections")
             ));
             egui::ScrollArea::vertical()
                 .id_salt("connections")
@@ -1297,16 +1336,16 @@ impl Editor {
         ui.heading("Connectivity");
         let netlist = self.document.netlist();
         ui.label(format!(
-            "{} components · {} nets",
-            self.document.components.len(),
-            netlist.nets.len()
+            "{} · {}",
+            count(self.document.components.len(), "component", "components"),
+            count(netlist.nets.len(), "net", "nets")
         ));
         self.erc_section(ui);
         ui.add_space(8.);
         ui.label(egui::RichText::new("Nets").strong());
         egui::ScrollArea::vertical().id_salt("nets").show(ui, |ui| {
             for net in &netlist.nets {
-                ui.collapsing(format!("{}  ·  {} pins", net.name, net.pins.len()), |ui| {
+                ui.collapsing(format!("{}  ·  {}", net.name, count(net.pins.len(), "pin", "pins")), |ui| {
                     for pin in &net.pins {
                         ui.small(format!("{}.{}", pin.reference, pin.number));
                     }
@@ -1425,13 +1464,62 @@ impl Editor {
                 self.begin_placing_part(part);
                 self.rotation = rotation;
             }
+            // Every occurrence of the part is on the sheet, so another footprint
+            // means another component: ask the host to add one to the assembly.
+            // Placement is armed when the host offers it (`arm_pending_duplicate`).
             None => {
-                self.notice = Some(format!(
-                    "Every {} in the assembly is already on the sheet.",
-                    c.value
-                ))
+                let key = source.key.clone();
+                self.note = Some(format!("Adding another {} to the assembly\u{2026}", c.value));
+                self.pending_duplicate = Some((key.clone(), rotation));
+                self.duplicate_requests.push(key);
             }
         }
+    }
+    /// Arm placement of the occurrence a **Duplicate** asked the host for, once the
+    /// host offers one of that part that is not on the sheet yet. Called by the host
+    /// after it refreshes [`Editor::parts`]; returns whether placement was armed.
+    pub fn arm_pending_duplicate(&mut self) -> bool {
+        let Some((key, rotation)) = self.pending_duplicate.clone() else {
+            return false;
+        };
+        let on_sheet = |r: &String| self.document.components.iter().any(|c| &c.reference == r);
+        let bound: std::collections::BTreeSet<&str> = self
+            .document
+            .components
+            .iter()
+            .filter_map(|c| c.part.as_ref()?.instance.as_deref())
+            .collect();
+        let next = self
+            .parts
+            .iter()
+            .find(|p| {
+                p.source.key == key
+                    && p.source.instance.as_deref().is_some_and(|i| !bound.contains(i))
+                    && !p.reference.as_ref().is_some_and(on_sheet)
+            })
+            .cloned();
+        let Some(part) = next else {
+            return false;
+        };
+        self.pending_duplicate = None;
+        // On the PCB's sheet a part with pads is seated by the board the frame
+        // it is offered (`follow_parts`): arming it too would place the
+        // occurrence twice, and the second would be refused.
+        if part.pads.is_some() && !self.wiring() {
+            self.note = Some(format!(
+                "{} added to the assembly; the board seats it.",
+                part.reference.as_deref().unwrap_or(&part.name)
+            ));
+            return false;
+        }
+        self.begin_placing_part(part);
+        self.rotation = rotation;
+        true
+    }
+    /// Forget a duplicate the host could not answer (a part it cannot add another
+    /// of), so the next offer does not arm a placement nobody asked for.
+    pub fn cancel_pending_duplicate(&mut self) {
+        self.pending_duplicate = None;
     }
     fn delete(&mut self) {
         if let Some(s) = self.selected.take() {
@@ -1737,7 +1825,7 @@ impl Editor {
         }
         let joined = self.label_joins("Power symbol", &name, q);
         let mut id = None;
-        self.transaction(|d| id = Some(d.place(power_symbol(&name), q, 0)));
+        self.transaction(|d| id = d.place_power_symbol(power_symbol(&name), q, 0).ok());
         self.selected = id.map(Selection::Component);
         match joined {
             Some((line, true)) => self.notice = Some(line),

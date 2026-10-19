@@ -3,6 +3,148 @@
 //! until ALL fingers lift; a leftover finger must never become a click or orbit.
 use egui::{Event, Pos2, TouchDeviceId, TouchId, TouchPhase};
 
+pub(crate) const TARGET: f32 = 44.0;
+pub(super) const CURSOR_OFFSET: f64 = 36.0;
+
+
+pub(crate) fn enabled(ctx: &egui::Context) -> bool {
+    ctx.data(|d| d.get_temp::<bool>(egui::Id::new("brep-touch-input"))).unwrap_or(false)
+}
+
+pub(crate) fn compact(ctx: &egui::Context) -> bool {
+    #[cfg(target_arch = "wasm32")]
+    {
+        enabled(ctx)
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    { let _ = ctx; false }
+}
+
+pub(crate) fn target_size(ctx: &egui::Context, desktop: egui::Vec2) -> egui::Vec2 {
+    if enabled(ctx) { desktop.max(egui::Vec2::splat(TARGET)) } else { desktop }
+}
+
+pub(crate) fn text_edit_margin(ui: &egui::Ui) -> egui::Margin {
+    // egui 0.35 currently ignores TextEdit.min_size.y. Padding must provide
+    // the actual contact height; the desktop value is TextEdit's own default.
+    let pad = if enabled(ui.ctx()) { ((TARGET - ui.text_style_height(&egui::TextStyle::Body)) * 0.5).ceil().max(2.0) as i8 } else { 2 };
+    egui::Margin::symmetric(4, pad)
+}
+
+/// The browser's mobile policy selects the sizing layer. Desktop browser width
+/// and touch hardware never opt in; web/index.html owns identity and URL override.
+pub(crate) fn prepare_browser_input(ui: &mut egui::Ui) {
+    #[cfg(target_arch = "wasm32")]
+    let active = web_sys::window().and_then(|w| w.document())
+        .and_then(|d| d.document_element())
+        .is_some_and(|e| e.has_attribute("data-brep-touch"));
+    #[cfg(not(target_arch = "wasm32"))]
+    let active = false;
+    apply_sizing(ui, active);
+}
+
+/// Shared browser seam for every focused egui text editor. egui already masks
+/// password values before emitting widget output.
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn publish_editor(ctx: &egui::Context) {
+    use wasm_bindgen::{JsCast, JsValue};
+    if !enabled(ctx) { return; }
+    if let Some(rect) = ctx.data(|d| d.get_temp::<egui::Rect>(egui::Id::new("brep-mobile-fullscreen-slot"))) {
+        if let Some(window) = web_sys::window() {
+            if let Ok(callback) = js_sys::Reflect::get(window.as_ref(), &JsValue::from_str("__brepMobileFullscreenRect")) {
+                if let Ok(callback) = callback.dyn_into::<js_sys::Function>() {
+                    let zoom = ctx.zoom_factor();
+                    let style = ctx.global_style();
+                    let payload = serde_json::json!({ "x": rect.left() * zoom, "y": rect.top() * zoom,
+                        "bg": style.visuals.widgets.inactive.bg_fill.to_array(), "fg": style.visuals.text_color().to_array(),
+                        "visible": ctx.memory(|m| m.top_modal_layer().is_none()) }).to_string();
+                    let _ = callback.call1(&JsValue::NULL, &JsValue::from_str(&payload));
+                }
+            }
+        }
+    }
+    let focused = ctx.memory(|m| m.focused());
+    let selection = focused.and_then(|id| egui::TextEdit::load_state(ctx, id))
+        .and_then(|state| state.cursor.char_range()).map(|range| range.as_sorted_char_range());
+    let payload = ctx.output(|output| {
+        if output.ime.is_none() || focused.is_none() { return "null".to_string(); }
+        let text = output.events.iter().rev().find_map(|event| event.widget_info().current_text_value.clone());
+        let reopen = output.events.iter().any(|event| {
+            event.widget_info().current_text_value.is_some() && matches!(event,
+                egui::output::OutputEvent::Clicked(_) | egui::output::OutputEvent::DoubleClicked(_) |
+                egui::output::OutputEvent::FocusGained(_))
+        });
+        serde_json::json!({ "id": format!("{:?}", focused.unwrap()), "text": text, "reopen": reopen,
+            "selection": selection.map(|range| [range.start, range.end]) }).to_string()
+    });
+    let cache = egui::Id::new("brep-mobile-editor-output");
+    if ctx.data(|d| d.get_temp::<String>(cache)).as_deref() == Some(&payload) { return; }
+    if let Some(window) = web_sys::window() {
+        if let Ok(callback) = js_sys::Reflect::get(window.as_ref(), &JsValue::from_str("__brepMobileEditor")) {
+            if let Ok(callback) = callback.dyn_into::<js_sys::Function>() {
+                if callback.call1(&JsValue::NULL, &JsValue::from_str(&payload)).is_ok() {
+                    ctx.data_mut(|d| d.insert_temp(cache, payload));
+                }
+            }
+        }
+    }
+}
+
+fn apply_sizing(ui: &mut egui::Ui, active: bool) {
+    let ctx = ui.ctx().clone();
+    ctx.data_mut(|d| d.insert_temp(egui::Id::new("brep-touch-input"), active));
+    let key = egui::Id::new(("brep-touch-desktop-spacing", format!("{:?}", ctx.theme())));
+    let saved = ctx.data(|d| d.get_temp::<egui::style::Spacing>(key));
+    if active {
+        let mut spacing = saved.unwrap_or_else(|| {
+            let spacing = ctx.style_of(ctx.theme()).spacing.clone();
+            ctx.data_mut(|d| d.insert_temp(key, spacing.clone()));
+            spacing
+        });
+        spacing.interact_size = spacing.interact_size.max(egui::Vec2::splat(TARGET));
+        spacing.button_padding.x = spacing.button_padding.x.max(14.0);
+        spacing.item_spacing.y = spacing.item_spacing.y.max(6.0);
+        spacing.slider_width = spacing.slider_width.max(120.0);
+        spacing.scroll.bar_width = spacing.scroll.bar_width.max(16.0);
+        ctx.style_mut_of(ctx.theme(), |style| style.spacing = spacing.clone());
+        *ui.spacing_mut() = spacing;
+    } else if let Some(spacing) = saved {
+        ctx.style_mut_of(ctx.theme(), |style| style.spacing = spacing.clone());
+        *ui.spacing_mut() = spacing;
+        ctx.data_mut(|d| d.remove::<egui::style::Spacing>(key));
+    }
+}
+
+/// Broaden the app's handle acquisition without changing engine/render defaults.
+/// The caller retains this offset for the whole drag so acquisition never jumps.
+pub(super) fn handle_target(state: &brep_render::engine_state::EngineState, x: f64, y: f64) -> Option<(f64, f64)> {
+    let mut points: Vec<(f64, f64)> = state.transform_handle_points().into_iter().map(|(_, p)| p).collect();
+    points.extend(state.transform_gizmo_anchor());
+    points.extend(state.dimension_handle_points().into_iter().map(|(_, p)| p));
+    points.extend(state.dimension_origin_points().into_iter().map(|(_, p)| p));
+    if let Ok(serde_json::Value::Object(handles)) = serde_json::from_str(&state.constraint_handle_points_json()) {
+        points.extend(handles.values().filter_map(|p| Some((p[0].as_f64()?, p[1].as_f64()?))));
+    }
+    points.into_iter().filter_map(|p| {
+        let d = (p.0 - x).hypot(p.1 - y);
+        (d <= f64::from(TARGET) * 0.5).then_some((d, p))
+    }).min_by(|a, b| a.0.total_cmp(&b.0)).map(|(_, p)| p)
+}
+
+/// The visible cursor leads a drawing finger, then snaps to the nearest visible
+/// solved point. All tolerances are screen pixels, independent of model scale.
+pub(super) fn sketch_target(state: &brep_render::engine_state::EngineState, x: f64, y: f64, drawing: bool) -> (f64, f64) {
+    let y = if drawing { (y - CURSOR_OFFSET).clamp(0.0, state.camera.height.max(0.0)) } else { y };
+    let Some(session) = state.sketch_edit_session() else { return (x, y) };
+    session.doc.points.iter().filter_map(|p| {
+        let world = session.plane.to_world(p.x, p.y);
+        if !state.camera.label_anchor_visible(world) { return None; }
+        let (sx, sy, _) = state.camera.project(world);
+        let distance = (sx - x).hypot(sy - y);
+        (distance <= f64::from(TARGET) * 0.5).then_some((distance, (sx, sy)))
+    }).min_by(|a, b| a.0.total_cmp(&b.0)).map(|(_, p)| p).unwrap_or((x, y))
+}
+
 #[derive(Clone, Copy)]
 struct Contact {
     device: TouchDeviceId,

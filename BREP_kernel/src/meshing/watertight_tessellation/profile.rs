@@ -16,6 +16,11 @@ pub(in crate::watertight_tessellation) struct TessProfile {
     pub enabled: bool,
     pub faces: u64,
     pub edge_sampling_ms: f64,
+    pub encode_ms: f64,
+    pub decode_ms: f64,
+    pub cdt_insert_ms: f64,
+    pub cdt_constraint_ms: f64,
+    pub validation_ms: f64,
     pub seed_ms: f64,
     pub refine_ms: f64,
     /// Grid stations the seed offered (`nu`×`nv` after the budget clamp).
@@ -150,7 +155,8 @@ pub(in crate::watertight_tessellation) fn tess_route(route: Route) {
 
 thread_local! {
     static PROFILE: Cell<TessProfile> = const { Cell::new(TessProfile {
-        enabled: false, faces: 0, edge_sampling_ms: 0.0, seed_ms: 0.0, refine_ms: 0.0,
+        enabled: false, faces: 0, edge_sampling_ms: 0.0,
+        encode_ms: 0.0, decode_ms: 0.0, cdt_insert_ms: 0.0, cdt_constraint_ms: 0.0, validation_ms: 0.0, seed_ms: 0.0, refine_ms: 0.0,
         stations: 0, stations_placed: 0, margin_tests: 0, parity_tests: 0, host_visits: 0,
         refine_passes: 0, splits: 0, flip_ms: 0.0, flip_rounds: 0, flips: 0, host_ms: 0.0,
         boundary_cross_tests: 0, bridge_ms: 0.0, cdt_ms: 0.0, earclip_ms: 0.0, certify_ms: 0.0,
@@ -271,7 +277,7 @@ pub(in crate::watertight_tessellation) fn report_face(
          | suu={:.3e} svv={:.3e} suv={:.3e} grid={}x{} diagonal_shrunk={} stations={} placed={} \
          refine_passes={} splits={} flip_calls={} flip_rounds={} flips={} flip_edges_visited={} \
          flip_sag_evals={} angle_gate_tests={} simple_tests={} pslg_tests={} certify_calls={} \
-         certify_centroid_tests={} cdt_build_ms={:.3} cdt_flood_ms={:.3} cdt_check_ms={:.3} rectangle_ms={:.3} rectangle_faces={} rectangle_vertices={} rectangle_declines={}",
+         certify_centroid_tests={} cdt_build_ms={:.3} cdt_flood_ms={:.3} cdt_check_ms={:.3} rectangle_ms={:.3} rectangle_faces={} rectangle_vertices={} rectangle_declines={} encode_ms={:.6} decode_ms={:.6} cdt_insert_ms={:.6} cdt_constraint_ms={:.6} validation_ms={:.6}",
         face.id,
         face.surface.degree_u,
         face.surface.degree_v,
@@ -315,6 +321,11 @@ pub(in crate::watertight_tessellation) fn report_face(
         now.rectangle_faces - before.rectangle_faces,
         now.rectangle_vertices - before.rectangle_vertices,
         now.rectangle_declines - before.rectangle_declines,
+        now.encode_ms - before.encode_ms,
+        now.decode_ms - before.decode_ms,
+        now.cdt_insert_ms - before.cdt_insert_ms,
+        now.cdt_constraint_ms - before.cdt_constraint_ms,
+        now.validation_ms - before.validation_ms,
     );
 }
 
@@ -333,7 +344,7 @@ pub(in crate::watertight_tessellation) fn end(started: Option<Instant>, chord: f
          flip_calls={} flip_sag_evals={} angle_gate_ms={:.2} angle_gate_tests={} \
          flip_build_ms={:.2} flip_scan_ms={:.2} flip_apply_ms={:.2} flip_edges_visited={} \
          cdt_used={} pslg_ms={:.2} pslg_tests={} certify_calls={} certify_centroid_tests={} \
-         cdt_build_ms={:.2} cdt_flood_ms={:.2} cdt_check_ms={:.2} rectangle_ms={:.2} rectangle_faces={} rectangle_vertices={} rectangle_declines={}",
+         cdt_build_ms={:.2} cdt_flood_ms={:.2} cdt_check_ms={:.2} rectangle_ms={:.2} rectangle_faces={} rectangle_vertices={} rectangle_declines={} encode_ms={:.6} decode_ms={:.6} cdt_insert_ms={:.6} cdt_constraint_ms={:.6} validation_ms={:.6}",
         started.elapsed().as_secs_f64() * 1_000.0,
         p.faces,
         p.edge_sampling_ms,
@@ -374,6 +385,7 @@ pub(in crate::watertight_tessellation) fn end(started: Option<Instant>, chord: f
         p.cdt_flood_ms,
         p.cdt_check_ms,
         p.rectangle_ms, p.rectangle_faces, p.rectangle_vertices, p.rectangle_declines,
+        p.encode_ms, p.decode_ms, p.cdt_insert_ms, p.cdt_constraint_ms, p.validation_ms,
     );
     PROFILE.with(|cell| cell.set(TessProfile::default()));
 }
@@ -396,6 +408,11 @@ pub(in crate::watertight_tessellation) enum Stage {
     CdtFlood,
     CdtCheck,
     Rectangle,
+    Encode,
+    Decode,
+    CdtInsert,
+    CdtConstraint,
+    Validation,
 }
 
 /// Scope timer: adds its lifetime to `stage` when it drops, so a function with
@@ -431,6 +448,12 @@ impl Drop for StageTimer {
             Stage::CdtFlood => tess_profile(|p| p.cdt_flood_ms += ms),
             Stage::CdtCheck => tess_profile(|p| p.cdt_check_ms += ms),
             Stage::Rectangle => tess_profile(|p| p.rectangle_ms += ms),
+            Stage::Encode => tess_profile(|p| p.encode_ms += ms),
+            Stage::Decode => tess_profile(|p| p.decode_ms += ms),
+            Stage::CdtInsert => tess_profile(|p| p.cdt_insert_ms += ms),
+            Stage::CdtConstraint => tess_profile(|p| p.cdt_constraint_ms += ms),
+            Stage::Validation => tess_profile(|p| p.validation_ms += ms),
         }
     }
 }
+

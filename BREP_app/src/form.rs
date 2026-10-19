@@ -240,11 +240,13 @@ pub fn field_input_with(
             if *read_only {
                 let r = ui.add_enabled(
                     false,
-                    egui::TextEdit::singleline(&mut s).desired_width(width),
+                    egui::TextEdit::singleline(&mut s).margin(crate::viewport::touch::text_edit_margin(ui)).desired_width(width)
+                        .min_size(crate::viewport::touch::target_size(ui.ctx(), egui::Vec2::ZERO)),
                 );
                 (false, r.rect)
             } else {
-                let r = ui.add(egui::TextEdit::singleline(&mut s).desired_width(width));
+                let r = ui.add(egui::TextEdit::singleline(&mut s).margin(crate::viewport::touch::text_edit_margin(ui)).desired_width(width)
+                    .min_size(crate::viewport::touch::target_size(ui.ctx(), egui::Vec2::ZERO)));
                 if r.changed() {
                     set_at(current, path, Value::String(s));
                 }
@@ -551,15 +553,25 @@ fn scalar_widget(
         .unwrap_or_else(|| stored_text.clone());
 
     let r = ui.add(
-        egui::TextEdit::singleline(&mut buf)
+        egui::TextEdit::singleline(&mut buf).margin(crate::viewport::touch::text_edit_margin(ui))
             .id(buf_id)
-            .desired_width(width),
+            .desired_width(width)
+            .min_size(crate::viewport::touch::target_size(ui.ctx(), egui::Vec2::ZERO))
+            .vertical_align(if crate::viewport::touch::enabled(ui.ctx()) { egui::Align::Center } else { egui::Align::TOP }),
     );
 
     let mut committed = None;
     if r.gained_focus() {
         // Start each edit from the current stored value.
         buf = stored_text.clone();
+        if crate::viewport::touch::enabled(ui.ctx()) {
+            if let Some(mut edit) = egui::TextEdit::load_state(ui.ctx(), r.id) {
+                edit.cursor.set_char_range(Some(egui::text::CCursorRange::two(
+                    egui::text::CCursor::new(0), egui::text::CCursor::new(buf.chars().count()),
+                )));
+                edit.store(ui.ctx(), r.id);
+            }
+        }
     }
     // Scroll-to-step a PURE number by `step` (wheel up = +step) while the field
     // is focused AND the pointer is over it ("scroll over the field to step

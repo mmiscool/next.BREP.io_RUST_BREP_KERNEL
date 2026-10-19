@@ -89,13 +89,60 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, FeatureRefusal> {
         ),
     })
     // The blend's refusal keeps its class through the feature's wrap.
-    .map_err(|error| error.with_message(|error| format!("fillet failed: {error}")))?;
+    .map_err(|error| error.with_message(|error| format!("fillet failed: {error}")));
+    let blended = match blended {
+        Ok(blended) => blended,
+        Err(refusal) => {
+            // A constant-radius selection that ends inside a tangent chain
+            // and refused is rerun ONCE along the open chain; the plain
+            // refusal stands unless that rerun builds.
+            let rerun = if taper.is_none() { along_tangent_chain(ctx, &target, radius, &blend_base) } else { None };
+            let Some((blended, extended)) = rerun else { return Err(refusal.into()) };
+            let requested = common::reference_names(ctx.param("edges"));
+            let fulfilment = result.fulfilment.get_or_insert_with(|| crate::feature_pipeline::Fulfilment {
+                applied: requested.clone(),
+                requested,
+                ..Default::default()
+            });
+            fulfilment.extended = extended;
+            blended
+        }
+    };
 
     result.added.push(common::register_added(blended, &target.name));
     result.removed.push(target.name);
     Ok(result)
 }
 
+/// The fallback for a selection that refused while ending inside a tangent
+/// chain: the same blend with the chain's unselected edges added
+/// (`common::open_tangent_chain_extension`). `None` when no selected edge
+/// runs on into one, or when the rerun refuses too; otherwise the body and
+/// the added edges' names.
+fn along_tangent_chain(
+    ctx: &FeatureContext,
+    target: &common::BlendTarget,
+    radius: f64,
+    blend_base: &str,
+) -> Option<(crate::BrepSolid, Vec<String>)> {
+    crate::with_registered_solid_typed(target.handle, |solid| {
+        let extension = common::open_tangent_chain_extension(solid, &target.edge_ids)
+            .map_err(|error| KernelRefusal::internal(KernelStage::Collect, "tangent_chain", error))?;
+        if extension.is_empty() {
+            return Err(KernelRefusal::internal(KernelStage::Collect, "tangent_chain", "no tangent continuation"));
+        }
+        let mut points = target.edge_points.clone();
+        let mut names: Vec<String> = target.edge_names.iter().map(|name| common::blend_face_name(&ctx.id, name)).collect();
+        let mut extended = Vec::with_capacity(extension.len());
+        for (_, point, name) in extension {
+            points.push(point);
+            names.push(common::blend_face_name(&ctx.id, &name));
+            extended.push(name);
+        }
+        crate::fillet_edges(solid, &points, Some(&names), radius, false, Some(blend_base)).map(|body| (body, extended))
+    })
+    .ok()
+}
 
 /// The refusal for a blend selection none of whose references resolve on
 /// the model, shared with the chamfer feature: an invalid input, class

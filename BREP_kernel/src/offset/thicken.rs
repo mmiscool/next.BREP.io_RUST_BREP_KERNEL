@@ -1093,6 +1093,7 @@ fn thicken_one_region(
     let shell_id = next_id;
     let solid = BrepSolid {
         mass_properties_cache: Default::default(),
+        cells: Default::default(),
         id: next_id + 1,
         vertices,
         edges,

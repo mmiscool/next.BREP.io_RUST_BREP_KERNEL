@@ -17,6 +17,8 @@ use std::collections::HashMap;
 /// Toolbar actions returned to the shell for dispatch.
 #[derive(Default)]
 pub struct ToolbarOutcome {
+    pub toggle_mobile_panels: bool,
+    pub documents: super::document_tabs::TabsOutcome,
     /// A File button click (New / Open / Save / …), dispatched to the file dialog.
     pub file: Option<FileAction>,
     pub recent_document: Option<String>,
@@ -48,6 +50,7 @@ pub struct ToolbarPanel {
     hits: HashMap<String, egui::Rect>,
     ribbon: super::ribbon::RibbonPanel,
     pub read_only: bool,
+    pub(crate) documents: super::document_tabs::MenuState,
     /// The PLM review inbox badge beside the connection indicator (S4).
     inbox: crate::panels::plm_review::InboxBadge,
 }
@@ -80,6 +83,9 @@ impl ToolbarPanel {
         info_open: &mut bool,
     ) -> ToolbarOutcome {
         self.hits.clear();
+        if crate::viewport::touch::compact(ui.ctx()) {
+            return self.show_compact(ui, state, ecad, store, settings_open, properties_open, info_open);
+        }
         let mut outcome = ToolbarOutcome::default();
         egui::containers::panel::Panel::top("brep-toolbar")
             .resizable(false)
@@ -156,6 +162,59 @@ impl ToolbarPanel {
             }
         }
         commands
+    }
+
+    fn show_compact(
+        &mut self, ui: &mut egui::Ui, state: &mut EngineState,
+        ecad: Option<&crate::workbench::ecad::Editors>, store: &dyn ModelStore,
+        settings_open: &mut bool, properties_open: &mut bool, info_open: &mut bool,
+    ) -> ToolbarOutcome {
+        let mut outcome = ToolbarOutcome::default();
+        let mut target = None;
+        egui::containers::panel::Panel::top("brep-mobile-toolbar").resizable(false).show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                let file = super::file::file_menu(ui, state, store, settings_open, properties_open, &mut self.hits);
+                outcome.file = file.action;
+                outcome.recent_document = file.recent;
+                outcome.plugins = file.plugins;
+                outcome.javascript = file.javascript;
+                let mut commands = self.commands(state, ecad, *info_open);
+                if state.any_sketch_mode() {
+                    commands.sort_by_key(|c| !matches!(&c.target, workbench::CommandTarget::Workbench(_)));
+                }
+                let menu = ui.menu_button("Tools", |ui| {
+                    ui.set_max_width((ui.ctx().content_rect().width() - 32.0).max(100.0));
+                    egui::ScrollArea::vertical().max_height((ui.ctx().content_rect().height() - 80.0).max(80.0)).show(ui, |ui| {
+                        let mut group = String::new();
+                        for command in &commands {
+                            let segments = command.segments();
+                            let heading = format!("{} / {}", segments[0], segments[1]);
+                            if heading != group { ui.separator(); ui.weak(&heading); group = heading; }
+                            if let Some(chosen) = super::ribbon::draw_command(ui, command, true, true, &mut self.hits) {
+                                target = Some(chosen);
+                            }
+                        }
+                    });
+                });
+                self.hits.insert("ribbon:overflow".into(), menu.response.rect);
+                let (documents, button) = super::document_tabs::menu(ui, &self.documents);
+                self.hits.insert("mobile:documents".into(), button.rect);
+                outcome.documents = documents;
+                for command in commands.iter().filter(|c| matches!(&c.target, workbench::CommandTarget::Shell("undo" | "redo"))) {
+                    if let Some(chosen) = super::ribbon::draw_command(ui, command, true, false, &mut self.hits) { target = Some(chosen); }
+                }
+                // A DOM entry button shares this toolbar slot so the browser
+                // receives the trusted click required by the Fullscreen API.
+                let (slot, _) = ui.allocate_exact_size(egui::vec2(44.0, 44.0), egui::Sense::hover());
+                ui.ctx().data_mut(|d| d.insert_temp(egui::Id::new("brep-mobile-fullscreen-slot"), slot));
+                self.hits.insert("mobile:fullscreen".into(), slot);
+                outcome.plm_review = self.plm_indicator(ui, store, settings_open);
+            });
+            if let Some(target) = target {
+                self.dispatch_target(ui.ctx(), target, state, store, info_open, &mut outcome);
+            }
+        });
+        outcome
     }
 
     fn dispatch_target(
@@ -327,6 +386,8 @@ pub static HIT_KEYS: &[HitKeyDoc] = &[
     HitKeyDoc { panel: "toolbar", prefix: "file:recent", meaning: "recent documents section and document rows, present only when nonempty", command: Some("doc_load") },
     HitKeyDoc { panel: "toolbar", prefix: "file:recent:thumb:", meaning: "the thumbnail square at the left of a recent-document row (file:recent:thumb:name): the document's saved picture, or the neutral placeholder before it has one", command: Some("doc_load") },
     HitKeyDoc { panel: "toolbar", prefix: "ribbon:", meaning: "ribbon tabs (ribbon:tab:<Tab>), group borders (ribbon:group:<Group>) and the overflow menu (ribbon:overflow)", command: None },
+    #[cfg(target_arch = "wasm32")]
+    HitKeyDoc { panel: "toolbar", prefix: "mobile:", meaning: "compact browser drawer controls", command: None },
     HitKeyDoc { panel: "toolbar", prefix: "wbtb:", meaning: "Home creation commands; same keys as the Classic feature strip", command: Some("feature_add") },
     HitKeyDoc { panel: "toolbar", prefix: "file:new", meaning: "new document", command: Some("doc_new") },
     HitKeyDoc { panel: "toolbar", prefix: "file:newmenu", meaning: "legacy key for the flat New part row in File", command: Some("doc_new_of_class") },

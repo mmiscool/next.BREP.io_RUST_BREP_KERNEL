@@ -517,6 +517,7 @@ pub(super) fn sweep_section_mitered(
 
     let solid = BrepSolid {
         mass_properties_cache: Default::default(),
+        cells: Default::default(),
         id: next_id + 1,
         vertices,
         edges,

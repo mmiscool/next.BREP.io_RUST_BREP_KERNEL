@@ -16,6 +16,7 @@
 //! a rasterised image "would buy nothing" — true in isolation, but it was the
 //! last thing keeping a whole font in the binary, so it went too.
 use eframe::egui;
+use egui::AtomExt as _;
 
 /// The catalogued artwork for a button glyph — what lets a plain
 /// `button`/`button_enabled`/`toggle` call site render its icon with no per-site
@@ -40,8 +41,8 @@ pub fn wrapped<R>(ui: &mut egui::Ui, contents: impl FnOnce(&mut egui::Ui) -> R) 
 /// Maximum painted edge length, independent of legacy SVG canvas padding.
 const GLYPH_SIZE: f32 = 17.0;
 
-fn square() -> egui::Vec2 {
-    egui::vec2(TOOLBAR_BTN, TOOLBAR_BTN)
+fn square(ui: &egui::Ui) -> egui::Vec2 {
+    crate::viewport::touch::target_size(ui.ctx(), egui::vec2(TOOLBAR_BTN, TOOLBAR_BTN))
 }
 
 /// The button for one glyph: its catalogued artwork if it has any, else the
@@ -51,7 +52,7 @@ fn square() -> egui::Vec2 {
 /// multiplies it by the button's LIVE text colour — which is what keeps hover,
 /// pressed and disabled states looking exactly as they did when the font drew
 /// the glyph. Colour artwork must never be tinted, so it opts out.
-fn glyph_button<'a>(ui: &egui::Ui, glyph: &'a str) -> egui::Button<'a> {
+pub(crate) fn glyph_button<'a>(ui: &egui::Ui, glyph: &'a str) -> egui::Button<'a> {
     match artwork(glyph) {
         Some(icon) => {
             // Idempotent, and the only place a toolbar button needs it: a button
@@ -65,9 +66,9 @@ fn glyph_button<'a>(ui: &egui::Ui, glyph: &'a str) -> egui::Button<'a> {
             .fit_to_exact_size(egui::vec2(height * icon.artwork_aspect, height));
             egui::Button::new(image)
                 .image_tint_follows_text_color(icon.mono)
-                .min_size(square())
+                .min_size(square(ui))
         }
-        None => egui::Button::new(glyph).min_size(square()),
+        None => egui::Button::new(glyph).min_size(square(ui)),
     }
 }
 
@@ -337,7 +338,13 @@ pub(crate) fn menu_row_button(glyph: &str, label: &str) -> egui::Button<'static>
         bytes: egui::load::Bytes::Static(icon.artwork_svg.as_bytes()),
     })
     .fit_to_exact_size(egui::vec2(height * icon.artwork_aspect, height));
-    egui::Button::new((image, label.to_owned()))
+    // Every row's icon takes one GLYPH_SIZE-wide slot, so the labels of a menu
+    // start at one x: the artwork is as wide as its aspect makes it (a tall
+    // glyph narrower), which shifted each label by its icon (lane U audit item
+    // 6). The spacer pads the slot; an image atom given the full size would be
+    // stretched to it instead.
+    let pad = (GLYPH_SIZE - height * icon.artwork_aspect).max(0.0);
+    egui::Button::new((image, egui::Atom::default().atom_size(egui::vec2(pad, 0.0)), label.to_owned()))
         .image_tint_follows_text_color(icon.mono)
         .wrap_mode(egui::TextWrapMode::Extend)
 }

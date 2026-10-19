@@ -19,6 +19,7 @@ mod convex;
 mod general_star;
 mod keep_open;
 mod mixed_concave;
+mod mixed_open;
 mod mixed_curved;
 mod mixed_support;
 mod patch;
@@ -31,6 +32,7 @@ pub(in crate::blend) use crossed::{hood_rows, march_rib, HoodFrame};
 pub(in crate::blend) use ball::{corner_faces, solve_corner_ball, solve_rail_rail_point, CornerBall, CornerContact, CornerFace, RailRailPoint, RailRailStripe};
 pub(super) use keep_open::build_keep_open_surgery;
 pub(crate) use mixed_concave::round_concave_chain_corner;
+pub(crate) use mixed_open::{open_mixed_corner_on, round_mixed_concave_open_corner};
 #[allow(unused_imports)] // blend-surface re-export; consumed only by cfg(test) siblings today
 pub(super) use mixed_curved::{detect_mixed_concave_curved_corner, MixedCurvedCorner};
 

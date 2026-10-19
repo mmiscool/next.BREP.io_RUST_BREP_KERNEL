@@ -15,6 +15,6 @@ pub use face_containment::{
     HORIZON_CONTAINMENT_SWITCH, HORIZON_CROSS_FRAME_SWITCH, HORIZON_SINGLE_LOOP_SWITCH,
     NO_SPHERE_CHART_TRIM_SWITCH, SEAM_BAND_MERGED_SWITCH,
 };
-pub(crate) use face_containment::{containment_profile_begin, containment_profile_report, forget_prepared_faces};
+pub(crate) use face_containment::{containment_profile_begin, containment_profile_report, forget_prepared_faces, lane_switches};
 pub use solid_classifier::{classify_point, PointClass, PointClassification, SolidClassifier};
 pub(crate) use solid_classifier::{classify_profile_begin, classify_profile_report, surface_uv_band};

@@ -47,7 +47,8 @@ pub async fn current(slot: &SessionSlot) -> Result<Arc<Session>, String> {
 /// Poll `frame_info` until the runner is idle plus `settle` frames, or the
 /// timeout. Returns the last frame_info.
 pub async fn wait_idle(session: &Session, timeout_ms: u64, settle: u32) -> Result<Value, String> {
-    let start = std::time::Instant::now();
+    let platform = &session.host.platform;
+    let start = platform.now_ms();
     let mut idle_seen = 0u32;
     loop {
         let r = session.host.call_ok("frame_info", json!({})).await?;
@@ -62,7 +63,7 @@ pub async fn wait_idle(session: &Session, timeout_ms: u64, settle: u32) -> Resul
             }
         } else {
             idle_seen = 0;
-            if start.elapsed().as_millis() as u64 > timeout_ms {
+            if platform.now_ms() - start > timeout_ms as f64 {
                 // NAME the work still in flight, the way the headless host's
                 // own settle does: "still pending: mesh_imports" says which
                 // part of the app is stuck, where a bare timeout reads as a
@@ -73,7 +74,7 @@ pub async fn wait_idle(session: &Session, timeout_ms: u64, settle: u32) -> Resul
                     info["progress"]
                 ));
             }
-            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+            platform.sleep(30).await;
         }
     }
 }
@@ -131,7 +132,13 @@ pub fn app_tools(slot: SessionSlot, describe: &Value) -> Vec<ToolSpec> {
         let ann = annotations_of(&desc);
         let mut schema = desc["argsSchema"].clone();
         if ann.waits {
-            // Every waiting tool takes the idle-contract knobs.
+            // Every waiting tool takes the idle-contract knobs. A command that
+            // takes nothing has no `properties` block at all (`doc_new`); the
+            // knobs still need somewhere to go, or the tool waits by default
+            // without saying it can be told not to.
+            if let Some(o) = schema.as_object_mut() {
+                o.entry("properties").or_insert_with(|| json!({}));
+            }
             if let Some(props) = schema.get_mut("properties").and_then(Value::as_object_mut) {
                 props.insert("wait".into(), json!({ "type": "boolean", "default": true, "description": "wait for the runner to go idle before replying" }));
                 props.insert("timeout_ms".into(), json!({ "type": "integer", "default": 60000 }));

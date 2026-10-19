@@ -219,6 +219,83 @@ struct Region<'a> {
     holes: Vec<LoopUnderConstruction<'a>>,
 }
 
+/// Insert a chord (`forward`, its reverse `backward`) from junction `a` to
+/// junction `b` of region `ra`: a split when both are on one loop, a join of
+/// two loops otherwise.
+fn insert_chord<'a>(
+    regions: &mut Vec<Region<'a>>,
+    ra: usize,
+    (la, ka): (usize, usize),
+    (lb, kb): (usize, usize),
+    forward: Vec<Entry<'a>>,
+    backward: Vec<Entry<'a>>,
+    outer_sign: bool,
+) {
+    let region = regions.swap_remove(ra);
+    let Region { outer, mut holes } = region;
+    fn take<'b>(l: usize, outer: &LoopUnderConstruction<'b>, holes: &[LoopUnderConstruction<'b>]) -> LoopUnderConstruction<'b> {
+        if l == 0 { outer.clone() } else { holes[l - 1].clone() }
+    }
+    if la == lb {
+        // Split: from a forward to b, back along the piece; from b
+        // forward to a, along the piece.
+        let loop_a = take(la, &outer, &holes);
+        let mut first = loop_a.arc(ka, kb);
+        first.extend(backward);
+        let mut second = loop_a.arc(kb, ka);
+        second.extend(forward);
+        let first = LoopUnderConstruction { entries: first };
+        let second = LoopUnderConstruction { entries: second };
+        if la == 0 {
+            // The outer split into two outers; the holes go to the one
+            // that contains them.
+            let first_polygon = first.polygon();
+            let mut first_holes = Vec::new();
+            let mut second_holes = Vec::new();
+            for hole in holes {
+                if point_in_polygon(hole.entries[0].start(), &first_polygon) {
+                    first_holes.push(hole);
+                } else {
+                    second_holes.push(hole);
+                }
+            }
+            regions.push(Region { outer: first, holes: first_holes });
+            regions.push(Region { outer: second, holes: second_holes });
+        } else {
+            // A hole split by a chord: one side is a hole of the region,
+            // the other is a new region (its loop winds against the
+            // hole's, hence like the outer).
+            holes.remove(la - 1);
+            let (hole_side, region_side) = if (first.area() >= 0.0) == outer_sign { (second, first) } else { (first, second) };
+            holes.push(hole_side);
+            regions.push(Region { outer, holes });
+            regions.push(Region { outer: region_side, holes: Vec::new() });
+        }
+    } else {
+        // Join: around a's loop from a, along the piece to b, around b's
+        // loop from b, back along the piece.
+        let loop_a = take(la, &outer, &holes);
+        let loop_b = take(lb, &outer, &holes);
+        let mut joined = loop_a.arc(ka, ka);
+        joined.extend(forward);
+        joined.extend(loop_b.arc(kb, kb));
+        joined.extend(backward);
+        let joined = LoopUnderConstruction { entries: joined };
+        let mut remaining: Vec<LoopUnderConstruction<'_>> = Vec::new();
+        for (l, hole) in holes.into_iter().enumerate() {
+            if l + 1 != la && l + 1 != lb {
+                remaining.push(hole);
+            }
+        }
+        if la == 0 || lb == 0 {
+            regions.push(Region { outer: joined, holes: remaining });
+        } else {
+            remaining.push(joined);
+            regions.push(Region { outer, holes: remaining });
+        }
+    }
+}
+
 fn signed_area(polygon: &[Vec2]) -> f64 {
     let mut area = 0.0;
     for index in 0..polygon.len() {
@@ -311,8 +388,37 @@ pub(super) fn loop_split_face(
 ) -> Result<Result<Vec<FaceFragmentRecord>, Decline>, KernelRefusal> {
     let cycles = !matches!(std::env::var("BREP_LOOP_SPLIT_CYCLES").as_deref(), Ok("0") | Ok("off"));
     let shared_rings = !matches!(std::env::var("BREP_LOOP_SPLIT_SHARED_RINGS").as_deref(), Ok("0") | Ok("off"));
-    loop_split_face_with_options(solid, operand, face, face_key, piece_ids, index, cycles, shared_rings)
+    let touch_rings = touch_rings_enabled();
+    loop_split_face_impl(solid, operand, face, face_key, piece_ids, index, cycles, shared_rings, touch_rings, touch_rings && junction_chords_enabled())
 }
+
+/// `BREP_LOOP_SPLIT_JUNCTION_CHORDS` (lane X row 6): the touching pieces of a
+/// face reach TWO or more loop junctions through vertices inside the face (the
+/// wall of a bore tangent to the box wall: each cap circle crosses the chart
+/// from seam to seam through its tangent vertex, and the tangent line joins
+/// the two tangent vertices). Each path of pieces from a loop junction through
+/// interior vertices to a loop junction is a chord, inserted as an open piece
+/// is; its interior vertices are junctions for the next. A piece left with an
+/// end on no loop declines. On by default: `0`/`off` declines the class (it
+/// needs `BREP_LOOP_SPLIT_TOUCH_RINGS`).
+pub(super) fn junction_chords_enabled() -> bool {
+    let enabled = !matches!(std::env::var("BREP_LOOP_SPLIT_JUNCTION_CHORDS").as_deref(), Ok("0") | Ok("off"));
+    enabled
+}
+
+
+/// `BREP_LOOP_SPLIT_TOUCH_RINGS` (lane X row 1): a closed section that touches
+/// a loop at ONE minted junction and is otherwise interior (a bore tangent to
+/// the box wall: the cap circle meets the wall edge at the tangent vertex and
+/// is split at the cylinder's seam vertex inside the face). The arrangement
+/// splices that ring into the loop at the junction, a pinched loop, and makes
+/// the disc its own region; so does the split. On by default: `0`/`off`
+/// declines the class.
+pub(super) fn touch_rings_enabled() -> bool {
+    let enabled = !matches!(std::env::var("BREP_LOOP_SPLIT_TOUCH_RINGS").as_deref(), Ok("0") | Ok("off"));
+    enabled
+}
+
 
 /// A measured extension for two interior arcs on an affine carrier. The
 /// extension passed the kernel, manifest and HLR census; `off` retains
@@ -340,6 +446,22 @@ pub(super) fn loop_split_face_with_options(
     index: &FragmentIndex,
     cycles: bool,
     shared_rings: bool,
+) -> Result<Result<Vec<FaceFragmentRecord>, Decline>, KernelRefusal> {
+    loop_split_face_impl(solid, operand, face, face_key, piece_ids, index, cycles, shared_rings, false, false)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn loop_split_face_impl(
+    solid: &BrepSolid,
+    operand: u8,
+    face: &FaceRecord,
+    face_key: FaceKey,
+    piece_ids: &[u64],
+    index: &FragmentIndex,
+    cycles: bool,
+    shared_rings: bool,
+    touch_rings: bool,
+    junction_chords: bool,
 ) -> Result<Result<Vec<FaceFragmentRecord>, Decline>, KernelRefusal> {
     if index.cosurface_pairs.iter().any(|(a, b)| *a == face_key || *b == face_key) {
         return Ok(Err(Decline::Cosurface));
@@ -440,6 +562,9 @@ pub(super) fn loop_split_face_with_options(
         area: f64,
     }
     let mut interior_arcs = Vec::new();
+    // Pieces of a ring touching a loop at one junction (`touch_rings`), with
+    // their vertex ids, chained below.
+    let mut touch_arcs: Vec<(Entry<'_>, u64, u64)> = Vec::new();
     let mut open_pieces: Vec<OpenPiece<'_>> = Vec::new();
     let mut rings: Vec<Ring<'_>> = Vec::new();
     let mut keys: HashSet<((i64, i64), (i64, i64), (i64, i64))> = HashSet::default();
@@ -509,6 +634,10 @@ pub(super) fn loop_split_face_with_options(
             );
         }
         if closed {
+            if touch_rings && shared_ring.is_none() && on_a_loop(start_point, &regions) {
+                touch_arcs.push((cut_entry(*piece_id, pcurve, &samples, start_point, end_point, key), piece.start_vertex_id, piece.end_vertex_id));
+                continue;
+            }
             if on_a_loop(start_point, &regions) {
                 return Ok(Err(Decline::RingTouches(*piece_id)));
             }
@@ -527,6 +656,10 @@ pub(super) fn loop_split_face_with_options(
                     && !on_a_loop(start_point, &regions) && !on_a_loop(end_point, &regions)
                 {
                     interior_arcs.push(cut_entry(*piece_id, pcurve, &samples, start_point, end_point, key));
+                    continue;
+                }
+                if touch_rings {
+                    touch_arcs.push((cut_entry(*piece_id, pcurve, &samples, start_point, end_point, key), piece.start_vertex_id, piece.end_vertex_id));
                     continue;
                 }
                 return Ok(Err(Decline::EndNotOnLoop(*piece_id)));
@@ -574,6 +707,93 @@ pub(super) fn loop_split_face_with_options(
         let point = first.start_point;
         rings.push(Ring { id: first_id, entries: vec![first, second], samples, point, area });
     }
+    // A touching ring: every piece chains into ONE cycle through exactly one
+    // loop junction J (by minted vertex id, never by proximity), no other
+    // piece on the face. Its chain starts at J.
+    // Junction chords (`junction_chords`): touching pieces that reach two or
+    // more loop junctions, with no other piece on the face, leave the
+    // one-junction ring path for the chord insertion below.
+    let mut chord_arcs: Vec<(Entry<'_>, u64, u64)> = Vec::new();
+    if junction_chords && !touch_arcs.is_empty() && open_pieces.is_empty() && rings.is_empty() && interior_arcs.is_empty() {
+        let mut junctions: Vec<u64> = Vec::new();
+        for (entry, start_id, end_id) in &touch_arcs {
+            for (id, point) in [(*start_id, entry.start_point), (*end_id, entry.end_point)] {
+                if on_a_loop(point, &regions) && !junctions.contains(&id) {
+                    junctions.push(id);
+                }
+            }
+        }
+        if junctions.len() >= 2 {
+            chord_arcs = std::mem::take(&mut touch_arcs);
+        }
+    }
+    let mut touch: Option<Ring<'_>> = None;
+    if !touch_arcs.is_empty() {
+        let first_id = match &touch_arcs[0].0.side { Side::Cut { piece_id, .. } => *piece_id, Side::Boundary { .. } => 0 };
+        if !open_pieces.is_empty() || !rings.is_empty() || !interior_arcs.is_empty() {
+            return Ok(Err(Decline::EndNotOnLoop(first_id)));
+        }
+        let mut junctions: Vec<u64> = Vec::new();
+        for (entry, start_id, end_id) in &touch_arcs {
+            for (id, point) in [(*start_id, entry.start_point), (*end_id, entry.end_point)] {
+                if on_a_loop(point, &regions) && !junctions.contains(&id) {
+                    junctions.push(id);
+                }
+            }
+        }
+        if junctions.len() != 1 {
+            return Ok(Err(Decline::EndNotOnLoop(first_id)));
+        }
+        let junction = junctions[0];
+        // Every vertex of the cycle is used by exactly two piece ends.
+        let mut uses: HashMap<u64, usize> = HashMap::default();
+        for (_, start_id, end_id) in &touch_arcs {
+            *uses.entry(*start_id).or_default() += 1;
+            *uses.entry(*end_id).or_default() += 1;
+        }
+        if uses.values().any(|&count| count != 2) {
+            return Ok(Err(Decline::EndNotOnLoop(first_id)));
+        }
+        let mut remaining: Vec<(Entry<'_>, u64, u64)> = std::mem::take(&mut touch_arcs);
+        let mut entries: Vec<Entry<'_>> = Vec::with_capacity(remaining.len());
+        let mut at = junction;
+        while !remaining.is_empty() {
+            let Some(position) = remaining.iter().position(|(_, start_id, end_id)| *start_id == at || *end_id == at) else {
+                return Ok(Err(Decline::EndNotOnLoop(first_id)));
+            };
+            let (entry, start_id, end_id) = remaining.remove(position);
+            if start_id == at {
+                at = end_id;
+                entries.push(entry);
+            } else {
+                at = start_id;
+                entries.push(entry.reversed());
+            }
+            if at == junction && !remaining.is_empty() {
+                return Ok(Err(Decline::EndNotOnLoop(first_id)));
+            }
+        }
+        if at != junction {
+            return Ok(Err(Decline::EndNotOnLoop(first_id)));
+        }
+        for k in 0..entries.len() {
+            let next = (k + 1) % entries.len();
+            if entries[k].end().sub(entries[next].start()).length() > uv_match {
+                return Ok(Err(Decline::SeamHop));
+            }
+        }
+        let mut samples: Vec<Vec2> = Vec::new();
+        for entry in &entries {
+            samples.extend_from_slice(&entry.samples[..entry.samples.len() - 1]);
+        }
+        samples.push(entries[0].start());
+        let area = signed_area(&samples[..samples.len() - 1]);
+        if area.abs() <= (arrangement_tolerance * arrangement_tolerance).max(1e-24) {
+            return Ok(Err(Decline::RingTooSmall(first_id)));
+        }
+        let point = entries[0].start_point;
+        touch = Some(Ring { id: first_id, entries, samples, point, area });
+    }
     // Every piece's interior stays clear of the loops and of the other
     // pieces. The band is the chart band a piece end may miss its junction
     // by; an open piece is read clear of its own two junctions by the radius
@@ -593,7 +813,23 @@ pub(super) fn loop_split_face_with_options(
             .iter()
             .map(|piece| (piece.id, piece.samples.as_slice(), vec![piece.samples[0], piece.samples[piece.samples.len() - 1]]))
             .chain(rings.iter().map(|ring| (ring.id, ring.samples.as_slice(), Vec::new())))
+            // A touching ring leaves its junction tangentially or at an angle;
+            // it is read clear of that one junction like an open piece's end.
+            .chain(touch.iter().map(|ring| (ring.id, ring.samples.as_slice(), vec![ring.samples[0]])))
+            // A chord arc is read clear only of its ends ON a loop: an interior
+            // junction near the loop is a graze the arrangement resolves.
+            .chain(chord_arcs.iter().map(|(entry, _, _)| {
+                let id = match &entry.side { Side::Cut { piece_id, .. } => *piece_id, Side::Boundary { .. } => 0 };
+                let on_loop_ends = [(entry.start_point, entry.start()), (entry.end_point, entry.end())]
+                    .into_iter()
+                    .filter(|(point, _)| on_a_loop(*point, &regions))
+                    .map(|(_, at)| at)
+                    .collect();
+                (id, entry.samples.as_slice(), on_loop_ends)
+            }))
             .collect();
+        let chord_start = piece_chains.len() - chord_arcs.len();
+        let chord_ends: Vec<Vec<Vec2>> = chord_arcs.iter().map(|(entry, _, _)| vec![entry.start(), entry.end()]).collect();
         let piece_boxes: Vec<[Vec2; 2]> = piece_chains.iter().map(|(_, chain, _)| chain_box(chain, band)).collect();
         for (i, (id, chain, clear)) in piece_chains.iter().enumerate() {
             for (loop_chain, loop_box) in loop_chains.iter().zip(&loop_boxes) {
@@ -602,7 +838,15 @@ pub(super) fn loop_split_face_with_options(
                 }
             }
             for (j, (_, other, _)) in piece_chains.iter().enumerate().skip(i + 1) {
-                if boxes_meet(&piece_boxes[i], &piece_boxes[j]) && chains_meet(chain, other, band, &[], 0.0).is_some() {
+                // Two chord arcs meet only at the junctions they share.
+                let shared: Vec<Vec2> = if i >= chord_start {
+                    let (mine, theirs) = (&chord_ends[i - chord_start], &chord_ends[j - chord_start]);
+                    mine.iter().copied().filter(|end| theirs.iter().any(|o| o.sub(*end).length() <= uv_match)).collect()
+                } else {
+                    Vec::new()
+                };
+                let radius = if shared.is_empty() { 0.0 } else { clear_radius };
+                if boxes_meet(&piece_boxes[i], &piece_boxes[j]) && chains_meet(chain, other, band, &shared, radius).is_some() {
                     return Ok(Err(Decline::Crosses(*id)));
                 }
             }
@@ -669,71 +913,153 @@ pub(super) fn loop_split_face_with_options(
         }
         let forward = cut_entry(piece.id, piece.pcurve, &piece.samples, piece.start_point, piece.end_point, piece.key);
         let backward = forward.reversed();
-        let region = regions.swap_remove(ra);
-        let Region { outer, mut holes } = region;
-        fn take<'b>(l: usize, outer: &LoopUnderConstruction<'b>, holes: &[LoopUnderConstruction<'b>]) -> LoopUnderConstruction<'b> {
-            if l == 0 { outer.clone() } else { holes[l - 1].clone() }
-        }
-        if la == lb {
-            // Split: from a forward to b, back along the piece; from b
-            // forward to a, along the piece.
-            let loop_a = take(la, &outer, &holes);
-            let mut first = loop_a.arc(ka, kb);
-            first.push(backward);
-            let mut second = loop_a.arc(kb, ka);
-            second.push(forward);
-            let first = LoopUnderConstruction { entries: first };
-            let second = LoopUnderConstruction { entries: second };
-            if la == 0 {
-                // The outer split into two outers; the holes go to the one
-                // that contains them.
-                let first_polygon = first.polygon();
-                let mut first_holes = Vec::new();
-                let mut second_holes = Vec::new();
-                for hole in holes {
-                    if point_in_polygon(hole.entries[0].start(), &first_polygon) {
-                        first_holes.push(hole);
-                    } else {
-                        second_holes.push(hole);
-                    }
-                }
-                regions.push(Region { outer: first, holes: first_holes });
-                regions.push(Region { outer: second, holes: second_holes });
-            } else {
-                // A hole split by a chord: one side is a hole of the region,
-                // the other is a new region (its loop winds against the
-                // hole's, hence like the outer).
-                holes.remove(la - 1);
-                let (hole_side, region_side) = if (first.area() >= 0.0) == outer_sign { (second, first) } else { (first, second) };
-                holes.push(hole_side);
-                regions.push(Region { outer, holes });
-                regions.push(Region { outer: region_side, holes: Vec::new() });
-            }
-        } else {
-            // Join: around a's loop from a, along the piece to b, around b's
-            // loop from b, back along the piece.
-            let loop_a = take(la, &outer, &holes);
-            let loop_b = take(lb, &outer, &holes);
-            let mut joined = loop_a.arc(ka, ka);
-            joined.push(forward);
-            joined.extend(loop_b.arc(kb, kb));
-            joined.push(backward);
-            let joined = LoopUnderConstruction { entries: joined };
-            let mut remaining: Vec<LoopUnderConstruction<'_>> = Vec::new();
-            for (l, hole) in holes.into_iter().enumerate() {
-                if l + 1 != la && l + 1 != lb {
-                    remaining.push(hole);
-                }
-            }
-            if la == 0 || lb == 0 {
-                regions.push(Region { outer: joined, holes: remaining });
-            } else {
-                remaining.push(joined);
-                regions.push(Region { outer, holes: remaining });
-            }
-        }
+        insert_chord(&mut regions, ra, (la, ka), (lb, kb), vec![forward], vec![backward], outer_sign);
     }
 
+    // Junction chords: a path of the remaining arcs from a loop junction
+    // through vertices on no loop to a loop junction (minted vertex ids),
+    // inserted as one chord into the region its interior lies in; its interior
+    // vertices are loop junctions from then on.
+    let mut remaining = chord_arcs;
+    while !remaining.is_empty() {
+        let first_id = match &remaining[0].0.side { Side::Cut { piece_id, .. } => *piece_id, Side::Boundary { .. } => 0 };
+        let mut path: Option<Vec<(usize, bool)>> = None;
+        'search: for start in 0..remaining.len() {
+            for forward in [true, false] {
+                let (entry, start_id, end_id) = &remaining[start];
+                let (from_point, from_id, mut at_id, mut at_point) = if forward {
+                    (entry.start_point, *start_id, *end_id, entry.end_point)
+                } else {
+                    (entry.end_point, *end_id, *start_id, entry.start_point)
+                };
+                if !on_a_loop(from_point, &regions) {
+                    continue;
+                }
+                let mut steps = vec![(start, forward)];
+                let mut visited = vec![from_id];
+                loop {
+                    if on_a_loop(at_point, &regions) {
+                        path = Some(steps);
+                        break 'search;
+                    }
+                    if visited.contains(&at_id) {
+                        break;
+                    }
+                    visited.push(at_id);
+                    let next = remaining.iter().enumerate().find(|(k, (_, s, e))| {
+                        !steps.iter().any(|(used, _)| used == k) && (*s == at_id || *e == at_id)
+                    });
+                    let Some((k, (next_entry, s, e))) = next else {
+                        break;
+                    };
+                    let along = *s == at_id;
+                    steps.push((k, along));
+                    (at_id, at_point) = if along { (*e, next_entry.end_point) } else { (*s, next_entry.start_point) };
+                }
+            }
+        }
+        let Some(steps) = path else {
+            return Ok(Err(Decline::EndNotOnLoop(first_id)));
+        };
+        let forward: Vec<Entry<'_>> = steps.iter().map(|(k, along)| if *along { remaining[*k].0.clone() } else { remaining[*k].0.reversed() }).collect();
+        let backward: Vec<Entry<'_>> = forward.iter().rev().map(Entry::reversed).collect();
+        let mut used: Vec<usize> = steps.iter().map(|(k, _)| *k).collect();
+        used.sort_unstable_by(|a, b| b.cmp(a));
+        for k in used {
+            remaining.remove(k);
+        }
+        // The region: the one whose interior holds the chord's first arc.
+        let first_samples = &forward[0].samples;
+        let middle = first_samples.len() / 2;
+        let probe = first_samples[middle - 1].add(first_samples[middle]).scale(0.5);
+        let Some(r) = regions.iter().position(|region| {
+            point_in_polygon(probe, &region.outer.polygon()) && !region.holes.iter().any(|hole| point_in_polygon(probe, &hole.polygon()))
+        }) else {
+            return Ok(Err(Decline::RingOutside(first_id)));
+        };
+        // Its two junctions in that region, each matched exactly once.
+        let locate = |point: Vec3, at: Vec2| -> Option<(usize, usize)> {
+            let mut found = None;
+            let region = &regions[r];
+            for (l, l_record) in std::iter::once(&region.outer).chain(region.holes.iter()).enumerate() {
+                for (k, entry) in l_record.entries.iter().enumerate() {
+                    if entry.start_point.sub(point).length() <= vertex_band && entry.start().sub(at).length() <= uv_match {
+                        if found.is_some() {
+                            return None;
+                        }
+                        found = Some((l, k));
+                    }
+                }
+            }
+            found
+        };
+        let last = &forward[forward.len() - 1];
+        let (Some((la, ka)), Some((lb, kb))) = (locate(forward[0].start_point, forward[0].start()), locate(last.end_point, last.end())) else {
+            return Ok(Err(Decline::EndNotOnLoop(first_id)));
+        };
+        if la == lb && ka == kb {
+            return Ok(Err(Decline::SameJunction(first_id)));
+        }
+        insert_chord(&mut regions, r, (la, ka), (lb, kb), forward, backward, outer_sign);
+    }
+
+    // The touching ring: spliced into its loop at the junction against the
+    // material winding (the pinched loop the arrangement walks), and the disc
+    // inside it a new region; a hole inside the disc moves into it.
+    if let Some(ring) = &touch {
+        let mut found: Option<(usize, usize, usize)> = None;
+        let mut best = f64::INFINITY;
+        for (r, region) in regions.iter().enumerate() {
+            for (l, l_record) in std::iter::once(&region.outer).chain(region.holes.iter()).enumerate() {
+                for (k, entry) in l_record.entries.iter().enumerate() {
+                    if entry.start_point.sub(ring.point).length() > vertex_band {
+                        continue;
+                    }
+                    let distance = entry.start().sub(ring.samples[0]).length();
+                    if distance <= uv_match && distance < best {
+                        best = distance;
+                        found = Some((r, l, k));
+                    }
+                }
+            }
+        }
+        let Some((r, l, k)) = found else {
+            return Ok(Err(Decline::EndNotOnLoop(ring.id)));
+        };
+        let probe = ring.samples[ring.samples.len() / 2];
+        let region = &regions[r];
+        let inside_outer = point_in_polygon(probe, &region.outer.polygon());
+        let in_a_hole = region.holes.iter().any(|hole| point_in_polygon(probe, &hole.polygon()));
+        if !inside_outer || in_a_hole {
+            return Ok(Err(Decline::RingOutside(ring.id)));
+        }
+        let along = LoopUnderConstruction { entries: ring.entries.clone() };
+        let against = LoopUnderConstruction { entries: ring.entries.iter().rev().map(Entry::reversed).collect() };
+        let (as_outer, as_hole) = if (ring.area >= 0.0) == outer_sign { (along, against) } else { (against, along) };
+        let Region { outer, holes } = regions.swap_remove(r);
+        let ring_polygon = as_outer.polygon();
+        let host = if l == 0 { outer.clone() } else { holes[l - 1].clone() };
+        let mut pinched = host.arc(k, k);
+        pinched.extend(as_hole.entries);
+        let pinched = LoopUnderConstruction { entries: pinched };
+        let (mut outer, holes) = (outer, holes);
+        let mut inside_ring = Vec::new();
+        let mut outside_ring = Vec::new();
+        for (index, hole) in holes.into_iter().enumerate() {
+            if index + 1 == l {
+                outside_ring.push(pinched.clone());
+            } else if point_in_polygon(hole.entries[0].start(), &ring_polygon) {
+                inside_ring.push(hole);
+            } else {
+                outside_ring.push(hole);
+            }
+        }
+        if l == 0 {
+            outer = pinched;
+        }
+        regions.push(Region { outer, holes: outside_ring });
+        regions.push(Region { outer: as_outer, holes: inside_ring });
+    }
     // Rings, largest first, each a new region and a hole of the region that
     // contains it; a hole already inside it moves into it.
     rings.sort_by(|a, b| b.area.abs().total_cmp(&a.area.abs()));
@@ -773,7 +1099,18 @@ pub(super) fn loop_split_face_with_options(
     let mut ordered: Vec<(f64, Region<'_>)> = regions.into_iter().map(|region| (region.outer.area().abs(), region)).collect();
     ordered.sort_by(|a, b| a.0.total_cmp(&b.0));
     let mut fragments = Vec::with_capacity(ordered.len());
-    for (_, mut region) in ordered {
+    for (outer_area, mut region) in ordered {
+        // The arrangement's key ([`super::types::FragmentOrder`]): every chain
+        // here is used whole, so a loop's sorted chain keys order regions as
+        // the arrangement's sorted (chain, segment) lists do.
+        let loop_key = |l: &LoopUnderConstruction<'_>| {
+            let mut keys: Vec<(u64, u64)> = l.entries.iter().map(|entry| (entry.key as u64, 0)).collect();
+            keys.sort_unstable();
+            keys
+        };
+        let mut hole_keys: Vec<Vec<(u64, u64)>> = region.holes.iter().map(loop_key).collect();
+        hole_keys.sort_unstable();
+        let order = FragmentOrder { area: outer_area, key: (loop_key(&region.outer), hole_keys) };
         region.holes.sort_by_key(|hole| hole.min_key());
         region.outer.rotate_like_arrangement(reverse_loops);
         for hole in &mut region.holes {
@@ -851,6 +1188,7 @@ pub(super) fn loop_split_face_with_options(
             test_point: face.surface.evaluate(test_uv.x, test_uv.y).or_refuse(KernelStage::Fragment, "evaluate")?,
             test_uv,
             extra_test_points,
+            order: Some(order),
         });
     }
     Ok(Ok(fragments))

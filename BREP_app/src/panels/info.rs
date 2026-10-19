@@ -123,9 +123,9 @@ impl InfoPanel {
             // filling child egui hugs the window to its content and the user
             // cannot drag it larger.
             .default_size([560.0, 520.0])
-            // Clear of the Settings (620, 80) and Part Properties (660, 96)
+            // Clear of the Settings (x 720) and Part Properties (x 660)
             // rest positions, so opening all three does not stack them.
-            .default_pos([120.0, 120.0])
+            .default_pos(super::below_chrome(ctx, 120.0, 0.0))
             .show(ctx, |ui| self.body(ui, diagnostics, mcp));
         self.open = open;
 

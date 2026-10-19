@@ -82,6 +82,7 @@ fn assemble_fragments_impl(
     allow_open: bool,
     touch: Option<&TouchCensus>,
     touched_passes: bool,
+    declared_kind: crate::BodyKind,
 ) -> Result<(BrepSolid, Option<AssemblyScope>), KernelRefusal> {
     if selected.is_empty() {
         return Err(KernelRefusal::new(
@@ -90,7 +91,9 @@ fn assemble_fragments_impl(
             "boolean assembly: operation produced no boundary faces",
         ));
     }
+    let selected = if canonical_fragment_order_enabled() { crate::fragment::canonical_fragment_order(selected) } else { selected };
     let mut assembler = Assembler {
+        weld_candidates: Default::default(),
         tolerance,
         vertices: Vec::new(),
         vertex_aliases: HashMap::default(),
@@ -106,6 +109,7 @@ fn assemble_fragments_impl(
         next_face_id: 1,
         edge_by_boundary_key: HashMap::default(),
         edge_tangent_side: HashMap::default(),
+        cellular: declared_kind == crate::BodyKind::Cellular,
     };
     let mut faces = Vec::new();
     let mut used_face_names = HashSet::<String>::default();
@@ -134,6 +138,8 @@ fn assemble_fragments_impl(
             let touched = touch.is_touched(fragment.operand, fragment.source_face_id);
             origins.push((assembler.next_face_id, fragment.operand, touched));
             untouched = touched_passes && !touched;
+        } else if declared_kind == crate::BodyKind::Cellular {
+            origins.push((assembler.next_face_id, fragment.operand, true));
         }
         let mut loops = Vec::new();
         for fragment_loop in fragment.loops {
@@ -226,10 +232,11 @@ fn assemble_fragments_impl(
     }
     if profile {
         eprintln!(
-            "assemble.weld_ms={:.2} edges={} vertices={}",
+            "assemble.weld_ms={:.2} edges={} vertices={} candidates={} exhaustive={}",
             stage_started.elapsed().as_secs_f64() * 1_000.0,
             assembler.edges.len(),
-            assembler.vertices.len()
+            assembler.vertices.len(),
+            assembler.weld_candidates.offered, assembler.weld_candidates.exhaustive
         );
     }
     if dbg_asm {
@@ -338,9 +345,15 @@ fn assemble_fragments_impl(
     });
     // The geometry checks of a scoped validation read the examined faces
     // only; every structural check still reads the whole solid.
-    let validate_in = |solid: &BrepSolid| match &scope {
-        Some(scope) => solid.validate_scoped(&scope.examined),
-        None => solid.validate(),
+    let validate_in = |solid: &BrepSolid| {
+        if profile {
+            eprintln!("assemble.validate_reads faces={} examined={}", solid.shells.iter().map(|s| s.faces.len()).sum::<usize>(),
+                scope.as_ref().map_or_else(|| solid.shells.iter().map(|s| s.faces.len()).sum::<usize>(), |s| s.examined.len()));
+        }
+        match &scope {
+            Some(scope) => solid.validate_scoped(&scope.examined),
+            None => solid.validate(),
+        }
     };
     let used_edges = edge_faces.keys().copied().collect::<HashSet<_>>();
     assembler.edges.retain(|edge| used_edges.contains(&edge.id));
@@ -358,16 +371,36 @@ fn assemble_fragments_impl(
             stage_started.elapsed().as_secs_f64() * 1_000.0
         );
     }
-    if allow_open {
+    if allow_open || declared_kind == crate::BodyKind::Cellular {
+        let cells = if declared_kind == crate::BodyKind::Cellular {
+            let mut operands = solids.keys().copied().collect::<Vec<_>>();
+            operands.sort_unstable();
+            operands.into_iter().map(|operand| crate::CellRecord {
+                id: operand as u64 + 1,
+                faces: origins.iter().filter(|(_, source, _)| *source == operand)
+                    .map(|(face, _, _)| (*face, true)).collect(),
+                void: false,
+            }).collect()
+        } else { Vec::new() };
         let mut solid = BrepSolid {
             mass_properties_cache: Default::default(),
+            cells,
             id: 1,
             vertices: assembler.vertices,
             edges: assembler.edges,
             shells,
             genus: 0,
-            kind: crate::BodyKind::Solid,
+            kind: declared_kind,
         };
+        if declared_kind == crate::BodyKind::Cellular {
+            let issues = solid.validate();
+            if !issues.is_empty() {
+                return Err(KernelRefusal::new(
+                    RefusalClass::InvalidResultTopology { issues: issues.len() as u32 },
+                    KernelStage::Validate, format!("Cellular contact assembly: {issues:?}")));
+            }
+            return Ok((solid, None));
+        }
         // EDGE RECONSTRUCTION on the open path (`edges.rs`): the offset
         // shell's welded edges stand off their carriers from here on
         // (2026-09-30 record §8: arc 40 3.2e-6 off the offset ball while its
@@ -503,6 +536,7 @@ fn assemble_fragments_impl(
         if !allow_open {
             let provisional = BrepSolid {
                 mass_properties_cache: Default::default(),
+                cells: Default::default(),
                 id: 1,
                 vertices: assembler.vertices.clone(),
                 edges: assembler.edges.clone(),
@@ -664,6 +698,7 @@ fn assemble_fragments_impl(
     }
     let solid = BrepSolid {
         mass_properties_cache: Default::default(),
+        cells: Default::default(),
         id: 1,
         vertices: assembler.vertices,
         edges: assembler.edges,
@@ -834,7 +869,9 @@ fn assemble_fragments_impl(
         pass_ms("joints", &mut pass_started);
         // The DERIVED inherited-trim challenger (`inherited.rs`): output uses
         // of operand edges only, restored first if the stage goes back.
-        let inherited = super::inherited::challenge_inherited_trims_in(&mut solid, tolerance, &assembler.edge_boundary_key, &assembler.imprint_edges, examined_faces)?;
+        let separated = super::inherited::separated_faces(&solid, solids, &origins, tolerance);
+        let inherited = super::inherited::challenge_inherited_trims_scoped(&mut solid, tolerance, &assembler.edge_boundary_key, &assembler.imprint_edges,
+            std::env::var("BREP_INHERITED_TRIM_REFIT").as_deref() != Ok("0"), examined_faces, Some(&separated))?;
         pass_ms("inherited", &mut pass_started);
         if !rebuilt.is_empty() || !settled.is_empty() || !trims.is_empty() || !inherited.is_empty() {
             let after = validate_in(&solid);
@@ -992,6 +1029,7 @@ fn assemble_fragments_impl(
             } else {
                 let subset = BrepSolid {
                     mass_properties_cache: Default::default(),
+                    cells: Default::default(),
                     id: solid.id,
                     vertices: solid.vertices.clone(),
                     edges: solid.edges.clone(),
@@ -1020,13 +1058,26 @@ fn assemble_fragments_impl(
     Ok((solid, scope))
 }
 
+/// `BREP_FRAGMENT_CANONICAL_ORDER` (lane X, fillet-bore-notch): the assembler
+/// builds the fragments in [`crate::fragment::canonical_fragment_order`], so the
+/// `_1`, `_2` names of a split face's pieces and every id do not follow a tie
+/// between near-equal areas. On by default (promoted on the 239-document
+/// census: 21 documents changed, every body geometrically identical, every
+/// moved fragment swapped with one whose area lies within 4.2e-10 of its own);
+/// `0`/`off` disables it.
+fn canonical_fragment_order_enabled() -> bool {
+    let enabled = !matches!(std::env::var("BREP_FRAGMENT_CANONICAL_ORDER").as_deref(), Ok("0") | Ok("off"));
+    enabled
+}
+
+
 pub(crate) fn assemble_fragments(
     selected: Vec<FaceFragmentRecord>,
     solids: &HashMap<u8, &BrepSolid>,
     imprint: &ImprintResultRecord,
     tolerance: f64,
 ) -> Result<BrepSolid, KernelRefusal> {
-    assemble_fragments_impl(selected, solids, imprint, tolerance, false, None, false).map(|(solid, _)| solid)
+    assemble_fragments_impl(selected, solids, imprint, tolerance, false, None, false, crate::BodyKind::Solid).map(|(solid, _)| solid)
 }
 
 /// [`assemble_fragments`] reporting which result faces the operation touched
@@ -1045,7 +1096,7 @@ pub(in crate::boolean) fn assemble_fragments_scoped(
     touch: &TouchCensus,
     touched_passes: bool,
 ) -> Result<(BrepSolid, Option<AssemblyScope>), KernelRefusal> {
-    assemble_fragments_impl(selected, solids, imprint, tolerance, false, Some(touch), touched_passes)
+    assemble_fragments_impl(selected, solids, imprint, tolerance, false, Some(touch), touched_passes, crate::BodyKind::Solid)
 }
 
 pub(crate) fn assemble_open_fragments(
@@ -1054,7 +1105,19 @@ pub(crate) fn assemble_open_fragments(
     imprint: &ImprintResultRecord,
     tolerance: f64,
 ) -> Result<BrepSolid, KernelRefusal> {
-    assemble_fragments_impl(selected, solids, imprint, tolerance, true, None, false).map(|(solid, _)| solid)
+    assemble_fragments_impl(selected, solids, imprint, tolerance, true, None, false, crate::BodyKind::Solid).map(|(solid, _)| solid)
+}
+
+/// The producer declares the Cellular kind before assembly. It is admitted
+/// only after the boolean has kept both complete operand boundaries.
+pub(in crate::boolean) fn assemble_cellular_fragments(
+    selected: Vec<FaceFragmentRecord>,
+    solids: &HashMap<u8, &BrepSolid>,
+    imprint: &ImprintResultRecord,
+    tolerance: f64,
+) -> Result<BrepSolid, KernelRefusal> {
+    assemble_fragments_impl(selected, solids, imprint, tolerance, false, None, false,
+        crate::BodyKind::Cellular).map(|(solid, _)| solid)
 }
 
 

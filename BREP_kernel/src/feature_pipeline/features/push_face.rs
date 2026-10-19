@@ -120,6 +120,16 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, FeatureRefusal> {
     // recomputed from the CURRENT solid each pass (face ids are stable across
     // `move_faces`), so multiple faces push along their own up-to-date normals.
     let mut solid = crate::with_registered_solid_str(target_handle, |solid| Ok(solid.clone()))?;
+
+    // A selected cylinder or cone written as SEVERAL faces (an imported bore
+    // whose wall the exporter split into two half cylinders, its countersink
+    // into two half cones) is one carrier the user picked whole. A half pushed
+    // alone can never meet its unmoved sibling, so the selected pieces of one
+    // carrier are first joined into the one face a whole-built bore has, and
+    // that face is pushed once. Only faces of the selection join, only with
+    // each other; a face that joins nothing is pushed as it was. The joined
+    // face keeps the first piece's id and name.
+    let face_ids = merge_selected_ruled_pieces(&mut solid, &face_ids)?;
     for face_id in &face_ids {
         // Route by the pushed face's CARRIER (a face is a trimmed surface):
         // - PLANAR → translate the plane + re-intersect neighbours (`move_faces`,
@@ -139,7 +149,10 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, FeatureRefusal> {
                 solid = move_faces(&solid, &[*face_id], normal.scale(distance))?;
             }
             FaceCarrier::Ruled => {
-                solid = crate::offset_ruled_face(&solid, *face_id, distance)?;
+                solid = match crate::offset_ruled_face(&solid, *face_id, distance) {
+                    Ok(pushed) => pushed,
+                    Err(refusal) => return Err(name_unselected_sibling(&solid, *face_id, refusal).into()),
+                };
             }
             FaceCarrier::Sphere => {
                 solid = crate::offset_sphere_face(&solid, *face_id, distance)?;
@@ -178,6 +191,88 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, FeatureRefusal> {
     // The target is consumed; the loop reuses its name for the result.
     result.removed.push(target_name);
     Ok(result)
+}
+
+/// Join the selected cylinder/cone faces that are pieces of one carrier
+/// (`crate::merge_faces_within`) and return the face ids to push: each
+/// selected face replaced by the face now carrying it, in selection order,
+/// deduplicated. With fewer than two ruled faces selected nothing is read and
+/// the ids come back unchanged.
+fn merge_selected_ruled_pieces(solid: &mut BrepSolid, face_ids: &[u64]) -> Result<Vec<u64>, crate::KernelRefusal> {
+    let ruled: Vec<u64> = face_ids
+        .iter()
+        .copied()
+        .filter(|id| matches!(face_carrier(solid, *id), Ok(FaceCarrier::Ruled)))
+        .collect();
+    if ruled.len() < 2 {
+        return Ok(face_ids.to_vec());
+    }
+    let (merged, carried_by) = crate::merge_faces_within(solid, PIECE_MERGE_TOLERANCE, &ruled)?;
+    *solid = merged;
+    let mut seen: HashSet<u64> = HashSet::new();
+    Ok(face_ids
+        .iter()
+        .map(|id| {
+            carried_by
+                .iter()
+                .find(|(face, _)| face == id)
+                .map(|(_, carrier)| *carrier)
+                .unwrap_or(*id)
+        })
+        .filter(|id| seen.insert(*id))
+        .collect())
+}
+
+/// The tolerance the face merge is given (the value its own solid-wide tests
+/// use; its cosurface bands floor at `1e-7 x` the model's coordinates).
+const PIECE_MERGE_TOLERANCE: f64 = 1e-7;
+
+/// A ruled push that refused is re-read for its most common cause on imported
+/// bodies: the face is ONE piece of a carrier split into several faces, and
+/// its sibling was not selected. When an edge-adjacent unselected face joins
+/// it under the same merge Push Face applies to a selection, the refusal names
+/// that face and says to select it too; otherwise the original refusal stands.
+fn name_unselected_sibling(solid: &BrepSolid, face_id: u64, refusal: crate::KernelRefusal) -> crate::KernelRefusal {
+    let edges_of = |id: u64| -> HashSet<u64> {
+        solid
+            .shells
+            .iter()
+            .flat_map(|shell| &shell.faces)
+            .filter(|face| face.id == id)
+            .flat_map(|face| &face.loops)
+            .flat_map(|loop_record| &loop_record.coedges)
+            .map(|coedge| coedge.edge_id)
+            .collect()
+    };
+    let own = edges_of(face_id);
+    let siblings: Vec<&crate::FaceRecord> = solid
+        .shells
+        .iter()
+        .flat_map(|shell| &shell.faces)
+        .filter(|face| {
+            face.id != face_id
+                && matches!(face.surface.analytic(), Some(AnalyticSurface::RuledRevolution { .. }))
+                && !edges_of(face.id).is_disjoint(&own)
+        })
+        .collect();
+    for sibling in siblings {
+        let Ok((_, carried_by)) = crate::merge_faces_within(solid, PIECE_MERGE_TOLERANCE, &[face_id, sibling.id]) else {
+            continue;
+        };
+        if carried_by.iter().all(|(_, carrier)| *carrier == carried_by[0].1) {
+            let name = sibling.name.clone().unwrap_or_else(|| format!("face {}", sibling.id));
+            return crate::KernelRefusal::input(
+                crate::KernelStage::Collect,
+                "split_carrier_piece",
+                format!(
+                    "push_face: face {face_id} is one piece of a cylinder/cone split into several faces; \
+                     select its sibling `{name}` too so the whole carrier is pushed ({})",
+                    refusal.message
+                ),
+            );
+        }
+    }
+    refusal
 }
 
 /// The supported push carriers, dispatched on in `build`.

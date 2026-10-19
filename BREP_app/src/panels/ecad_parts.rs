@@ -149,8 +149,10 @@ fn named_pads(mut pads: brep_ecad_core::board::Footprint, key: &str) -> brep_eca
 /// a part is not offered, and `sync` names it, rather than letting the board seat
 /// it and every later store of the sheet be refused for it.
 fn unplaceable(part: &Part) -> Option<String> {
+    // A scratch sheet, thrown away: the probe places under a stand-in occurrence
+    // and reads only whether the symbol and pads are refused.
     let mut probe = brep_ecad_core::Document::default();
-    probe.place_part(part.source.clone(), part.symbol.clone(), part.pads.clone(), None,
+    probe.place_assembly_component("probe", part.source.clone(), part.symbol.clone(), part.pads.clone(), None,
         brep_ecad_core::Point::default(), 0).err()
         .or_else(|| probe.validate().err())
 }
@@ -229,7 +231,10 @@ pub(crate) struct OccurrenceMark {
 /// components carried a chain — by its part key and its label, which is what
 /// [`follow_sheet`] binds one by.
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) struct Occurrence { key: String, reference: String }
+pub(crate) struct Occurrence { key: String, reference: String,
+    /// The ACOMP's `transform` as written, so a step that moves a component in
+    /// 3D can be told from one that does not ([`follow_poses`]).
+    transform: Value }
 
 /// The top-level assembly occurrences, by feature id.
 fn top_occurrences(history: &brep_render::history::History) -> BTreeMap<String, Occurrence> {
@@ -240,7 +245,8 @@ fn top_occurrences(history: &brep_render::history::History) -> BTreeMap<String, 
             let params = history.feature_params(index)?;
             let designator = params["bom"]["Reference_Designator"].as_str().unwrap_or("").trim();
             let reference = if designator.is_empty() { id.clone() } else { designator.to_owned() };
-            Some((id, Occurrence { key: params["partName"].as_str().unwrap_or("").to_owned(), reference }))
+            Some((id, Occurrence { key: params["partName"].as_str().unwrap_or("").to_owned(), reference,
+                transform: params["transform"].clone() }))
         })
         .collect()
 }
@@ -279,12 +285,26 @@ pub(crate) fn follow_occurrences(doc: &mut Document) {
     let step = history.undo_top();
     let forward = !history.can_redo();
     let Some(mark) = doc.ecad_occurrences.take() else {
-        // The first sight of a document records it and acts on nothing: a loaded
-        // file's occurrences are not new, and its labels are the user's.
-        doc.ecad_occurrences = Some(OccurrenceMark { revision, step, occurrences: now, pending: BTreeSet::new() });
+        // The first sight of a document acts on no occurrence of its own: a loaded
+        // file's occurrences are not new, and its labels are the user's. It is
+        // where an older board — components with no assembly component — is
+        // brought to the one set, as part of opening it (`adopt_unbound_components`).
+        adopt_unbound_components(doc);
+        let history = &doc.engine.history;
+        doc.ecad_occurrences = Some(OccurrenceMark {
+            revision: history.revision(), step: history.undo_top(), occurrences: top_occurrences(history), pending: BTreeSet::new(),
+        });
         return;
     };
     let moved = forward && step.is_some() && step > mark.step;
+    // A board is an assembly in both directions: a component moved in 3D moves its
+    // footprint on the board, inside the same step (`follow_poses`). Read on any
+    // forward state, not only a new step: a gizmo drag's frames coalesce into
+    // one undo entry (`param:{index}`), and each frame's pose is followed.
+    let posed: Vec<String> = if forward {
+        now.iter().filter(|(id, o)| mark.occurrences.get(*id).is_some_and(|m| m.transform != o.transform))
+            .map(|(id, _)| id.clone()).collect()
+    } else { Vec::new() };
     let gone: Vec<(String, Occurrence)> = mark.occurrences.iter()
         .filter(|(id, _)| !now.contains_key(*id)).map(|(id, o)| (id.clone(), o.clone())).collect();
     let added: BTreeSet<String> = now.keys().filter(|id| !mark.occurrences.contains_key(*id)).cloned().collect();
@@ -296,9 +316,184 @@ pub(crate) fn follow_occurrences(doc: &mut Document) {
     if moved && gone.is_empty() { pending.extend(added.iter().cloned()); }
     if !pending.is_empty() { pending = designate(&mut doc.engine, pending); }
     if moved && !gone.is_empty() && added.is_empty() { retire(&mut doc.engine, &gone); }
+    if !posed.is_empty() { follow_poses(&mut doc.engine, &posed); }
     doc.ecad_occurrences = Some(OccurrenceMark {
         revision: doc.engine.history.revision(), step: doc.engine.history.undo_top(), occurrences: now, pending,
     });
+}
+
+/// EXISTING DOCUMENTS. A board is an assembly, but every eCAD document saved
+/// before 2026-10-14 but one was drawn without one: free components, each a copy
+/// of a symbol and pads with no part and no occurrence behind it, or LEGACY
+/// components bound to a part by key and label alone. On a document's first sight
+/// they are brought to the one set, as part of opening it:
+///
+/// - a legacy component takes the top-level occurrence that carries its key and
+///   its label (the rule [`follow_sheet`] bound it by), and a label already on the
+///   other sheet takes that sheet's component — one label, one component;
+/// - a free component becomes an assembly component of a part that is its own
+///   symbol and pads: one library entry per distinct symbol-and-pads, named after
+///   the symbol (`R`, `Conn_01x04`, `name-2` when taken), with NO source file
+///   (`sourceKey` empty: there is nothing for Update components to read, and the
+///   entry is its own snapshot); one ACOMP per component, its label as the
+///   designator, its board placement as the pose, the first one fixed;
+/// - a power symbol is a net flag and is left alone.
+///
+/// Written with no undo step and absorbed into the clean baseline
+/// (`Document::absorb_open_write`): the open is no edit of the user's, and says
+/// nothing — nothing the user drew moves. An unreadable block is its editor's to
+/// report and is left as it is.
+fn adopt_unbound_components(doc: &mut Document) {
+    // A read-only document (a PLM revision not checked out) takes no write, as
+    // its editors hold their own first-frame shape unwritten (`viewport::ecad`'s
+    // `store`): what it shows is what it holds, free components and all.
+    if doc.engine.history.locked().is_some() { return; }
+    let Ok(mut draft) = serde_json::from_str::<Value>(&doc.engine.history.request_json()) else { return; };
+    let before = draft.clone();
+    let key = doc.edit_key();
+    let mut sheets: Vec<(&str, brep_ecad_core::Document)> = ["pcb", "diagram"].iter()
+        .filter_map(|block| Some((*block, brep_ecad_core::Document::from_value(draft.get(block)?.clone()).ok()?)))
+        .collect();
+    let unbound = |c: &brep_ecad_core::Component| c.is_valued_part() && !c.part.as_ref().is_some_and(|p| p.instance.is_some());
+    if sheets.iter().all(|(_, sheet)| !sheet.components.iter().any(unbound)) { return; }
+    let mut features = draft["features"].as_array().cloned().unwrap_or_default();
+    // The parts made here go through the kernel's own library door, as Add
+    // component's do (`EngineState::insert_component`), and the block adopted
+    // below is the store's own serialization of the whole library: the run that
+    // follows installs the store's form back into the document, and a block
+    // written by hand in another shape would read as an edit. The store is one
+    // per thread and holds the active document's library (`Documents::activate`);
+    // it is told this document's first, which keeps an entry it already holds.
+    let stored: brep_render::brep_kernel::PartsLibraryMap =
+        serde_json::from_value(draft["partsLibrary"].clone()).unwrap_or_default();
+    brep_render::brep_kernel::install_parts_library(&stored);
+    let mut library = draft["partsLibrary"].as_object().cloned().unwrap_or_default();
+    let signature_of = |entry: &Value| entry["sourceSignature"].as_str().filter(|s| !s.is_empty()).map(str::to_owned)
+        .unwrap_or_else(|| super::parts_library::document_signature(&entry["document"].to_string()));
+    // Label → (occurrence, key, signature) of the top-level devices, for a label
+    // that is one component on both sheets.
+    let mut by_label: BTreeMap<String, (String, String, String)> = devices(&features, &Value::Object(library.clone()))
+        .into_iter().filter(|device| device.local_index.is_some())
+        .map(|device| (device.reference.clone(), (device.occurrence, device.key, device.signature))).collect();
+    let mut by_signature: BTreeMap<String, String> = library.iter().map(|(name, entry)| (signature_of(entry), name.clone())).collect();
+    let mut first = !features.iter().any(is_component);
+    let mut changed = false;
+    for (_, sheet) in sheets.iter_mut() {
+        let placements: Vec<brep_ecad_core::board::Placement> = sheet.board.placements.clone();
+        // Occurrences already bound on THIS sheet: a label repeated on one sheet is
+        // two components, and two components are two occurrences.
+        let mut used: BTreeSet<String> = sheet.components.iter()
+            .filter_map(|c| c.part.as_ref()?.instance.clone()).collect();
+        for component in sheet.components.iter_mut() {
+            if !unbound(component) { continue; }
+            let legacy_key = component.part.as_ref().map(|p| p.key.clone());
+            let found = by_label.get(&component.reference).filter(|(id, key, _)| {
+                !used.contains(id) && legacy_key.as_ref().is_none_or(|legacy| legacy == key)
+            }).cloned();
+            let (id, part_key, signature) = match found {
+                Some(found) => found,
+                None => {
+                    let (part_key, signature) = match legacy_key.filter(|key| library.contains_key(key)) {
+                        Some(key) => { let signature = signature_of(&library[&key]); (key, signature) }
+                        None => {
+                            let mut document = serde_json::json!({
+                                "features": [], "symbol": component.symbol, "ports": [pin_ports(&component.symbol, component.pads.as_ref())] });
+                            if let Some(pads) = &component.pads { document["pads"] = serde_json::to_value(pads).unwrap_or_default(); }
+                            let signature = super::parts_library::document_signature(&document.to_string());
+                            let name = match by_signature.get(&signature) {
+                                Some(name) => name.clone(),
+                                None => {
+                                    let name = free_part_name(&library, &component.symbol, &component.value);
+                                    let added = brep_render::brep_kernel::add_part_to_library_impl(
+                                        &name, "", &signature, &document.to_string());
+                                    let name = match added {
+                                        Ok(name) => name,
+                                        Err(error) => {
+                                            doc.engine.push_notice(format!(
+                                                "'{}' could not be made an assembly component: {error}", component.reference));
+                                            continue;
+                                        }
+                                    };
+                                    if let Some(store) = serde_json::from_str::<Value>(&brep_render::brep_kernel::parts_library_json())
+                                        .ok().and_then(|store| store.as_object().cloned()) {
+                                        library = store;
+                                    }
+                                    by_signature.insert(signature.clone(), name.clone());
+                                    name
+                                }
+                            };
+                            (name, signature)
+                        }
+                    };
+                    let id = doc.engine.history.next_feature_id("ACOMP");
+                    let transform = placements.iter().find(|p| p.component == component.id).map(board_transform)
+                        .unwrap_or_else(|| serde_json::json!({ "translate": [0, 0, 0], "rotateEulerDeg": [0, 0, 0] }));
+                    features.push(serde_json::json!({
+                        "type": "ACOMP",
+                        "inputParams": { "id": id, "partName": part_key, "transform": transform, "isFixed": first,
+                            "bom": { "Reference_Designator": component.reference } },
+                        "persistentData": {}
+                    }));
+                    first = false;
+                    by_label.insert(component.reference.clone(), (id.clone(), part_key.clone(), signature.clone()));
+                    (id, part_key, signature)
+                }
+            };
+            used.insert(id.clone());
+            component.part = Some(brep_ecad_core::PartSource { instance: Some(id), key: part_key, signature });
+            changed = true;
+        }
+    }
+    if !changed { return; }
+    draft["features"] = Value::Array(features);
+    draft["partsLibrary"] = Value::Object(library);
+    for (block, sheet) in &sheets {
+        let Ok(value) = sheet.to_value() else { return; };
+        draft[*block] = value;
+    }
+    // The document now has components, so the run that follows opens an assembly
+    // session and folds its state back in, silently, when the reply lands — after
+    // the clean baseline below is taken. A fresh session's state is written here
+    // so that fold finds it already there and writes nothing: the open stays no
+    // edit (`EngineState::fold_assembly_state` skips an equal block).
+    if draft.get("assembly").is_none_or(Value::is_null) {
+        draft["assembly"] = serde_json::json!({ "constraints": [], "idCounter": 0 });
+    }
+    if let Err(error) = doc.engine.history.adopt_document(&draft.to_string()) {
+        doc.engine.push_notice(format!("This board's components could not be bound to assembly components: {error}"));
+        return;
+    }
+    doc.engine.rebuild_current_history();
+    let Ok(after) = serde_json::from_str::<Value>(&doc.engine.history.request_json()) else { return; };
+    doc.absorb_open_write(&before, &after, key);
+}
+
+/// A part's connection points for a free component's own symbol, as the KiCad
+/// import declares them (`kicad_import::port_points`): one point per symbol pin,
+/// named with the pin's number, in the `Pins` group of purpose `pcb`, on the
+/// first pad of that number (mm, Y up) or at the part origin when no pad carries
+/// it, pointing +Z out of the board. A wiring-diagram wire to the component
+/// resolves to these, as it does to an imported part's.
+fn pin_ports(symbol: &brep_ecad_core::Symbol, pads: Option<&brep_ecad_core::board::Footprint>) -> Value {
+    let points: Vec<Value> = symbol.pins.iter().map(|pin| {
+        let position = pads.and_then(|footprint| footprint.pads.iter().find(|pad| pad.number == pin.number))
+            .map(|pad| [f64::from(pad.at.x) / 1000., -f64::from(pad.at.y) / 1000., 0.])
+            .unwrap_or([0., 0., 0.]);
+        serde_json::json!({ "name": pin.number, "transform": { "position": position, "rotationEuler": [0., -90., 0.] } })
+    }).collect();
+    serde_json::json!({ "name": "Pins", "purpose": "pcb", "points": points })
+}
+
+/// A library name for a part that is a free component's own symbol: the symbol's
+/// name without its KiCad library (`Device:R` → `R`), else the component's value,
+/// else `part`; `-2`, `-3`, … while the name is taken.
+fn free_part_name(library: &serde_json::Map<String, Value>, symbol: &brep_ecad_core::Symbol, value: &str) -> String {
+    let base = symbol.library_id.rsplit(':').next().unwrap_or("").trim();
+    let base = if base.is_empty() { value.trim() } else { base };
+    let base = if base.is_empty() { "part" } else { base };
+    let base = base.replace(['/', ':'], "-");
+    if !library.contains_key(&base) { return base; }
+    (2u32..).map(|n| format!("{base}-{n}")).find(|name| !library.contains_key(name)).unwrap_or(base)
 }
 
 /// The designators already in use: every device's label the walk reaches and every
@@ -354,6 +549,97 @@ fn designate(engine: &mut brep_render::engine_state::EngineState, occurrences: B
 /// Whether an occurrence chain is `occurrence` or lies inside it.
 fn under(chain: &str, occurrence: &str) -> bool {
     chain == occurrence || chain.strip_prefix(occurrence).is_some_and(|rest| rest.starts_with(':'))
+}
+
+/// The ACOMP `transform` a board placement IS, as [`follow_sheet`] writes it and
+/// [`board_pose`] reads it back. Pad coordinates are µm with Y down; BREP is mm
+/// with Y up. The bottom mirror in X is a rigid 180° turn about Y in 3D. A part
+/// is referenced to the COPPER PLANE it is soldered to: the top one is z = 0, and
+/// a part on the underside sits on the bottom one, a substrate's thickness below
+/// it. Until the board had a thickness both sides were written at 0, which put
+/// every bottom-side part inside the board the moment there was a board to be
+/// inside (`board_geometry`).
+pub(crate) fn board_transform(placement: &brep_ecad_core::board::Placement) -> Value {
+    let angle = f64::from(placement.rotation % 4) * 90.;
+    let z = if placement.bottom { -f64::from(brep_ecad_core::board::SUBSTRATE_THICKNESS) / 1000. } else { 0. };
+    serde_json::json!({
+        "translate": [f64::from(placement.at.x) / 1000., -f64::from(placement.at.y) / 1000., z],
+        "rotateEulerDeg": [0., if placement.bottom {180.} else {0.}, if placement.bottom {angle} else {-angle}],
+    })
+}
+
+/// The board placement a top-level component's `transform` IS, when it is one: flat
+/// on the top copper (`rotateEulerDeg` `[0, 0, -θ]`) or turned over onto the
+/// bottom (`[0, 180, θ]`) at a quarter turn θ, the inverse of what
+/// [`follow_sheet`] writes. `None` for a pose a board cannot hold — a tilt, or a
+/// turn that is no quarter — and for a transform that is not one. Height is not
+/// read: the copper plane a part sits on is its side's, whatever z says.
+fn board_pose(transform: &Value) -> Option<(brep_ecad_core::Point, u8, bool)> {
+    let reals = |key: &str| -> Option<[f64; 3]> {
+        let values = transform[key].as_array()?;
+        Some([values.first()?.as_f64()?, values.get(1)?.as_f64()?, values.get(2)?.as_f64()?])
+    };
+    let [x, y, _z] = reals("translate")?;
+    let [rx, ry, rz] = reals("rotateEulerDeg")?;
+    let wrap = |angle: f64| angle.rem_euclid(360.);
+    let near = |a: f64, b: f64| (wrap(a) - wrap(b)).abs() < 1e-6 || (wrap(a) - wrap(b)).abs() > 360. - 1e-6;
+    if !near(rx, 0.) { return None; }
+    let bottom = if near(ry, 0.) { false } else if near(ry, 180.) { true } else { return None; };
+    let angle = wrap(if bottom { rz } else { -rz });
+    let quarters = (angle / 90.).round();
+    if (angle - quarters * 90.).abs() > 1e-6 { return None; }
+    let rotation = (quarters as i64).rem_euclid(4) as u8;
+    let at = brep_ecad_core::Point::new((x * 1000.).round() as i32, (-y * 1000.).round() as i32);
+    Some((at, rotation, bottom))
+}
+
+/// Move the board placements of the top-level occurrences `posed`, whose ACOMP
+/// transform a step just changed, to the pose the transform is, with no undo step
+/// of its own (it joins the move's). A footprint moved on the board writes its
+/// transform through [`follow_sheet`] and arrives here reading the same pose, so
+/// nothing is written twice. A pose the board cannot hold leaves the placement
+/// where it was, and says so once, in the step that made it.
+fn follow_poses(engine: &mut brep_render::engine_state::EngineState, posed: &[String]) {
+    let Ok(mut draft) = serde_json::from_str::<Value>(&engine.history.request_json()) else { return; };
+    let Some(value) = draft.get("pcb").filter(|v| !v.is_null()).cloned() else { return; };
+    let Ok(mut sheet) = brep_ecad_core::Document::from_value(value) else { return; };
+    let features = draft["features"].as_array().cloned().unwrap_or_default();
+    let mut changed = false;
+    let mut off_plane: Vec<String> = Vec::new();
+    for id in posed {
+        let Some(feature) = features.iter().find(|f| f["inputParams"]["id"].as_str() == Some(id)) else { continue; };
+        let Some((component, reference)) = sheet.components.iter()
+            .find(|c| c.part.as_ref().and_then(|p| p.instance.as_deref()) == Some(id))
+            .map(|c| (c.id, c.reference.clone())) else { continue; };
+        let Some(placement) = sheet.board.placements.iter_mut().find(|p| p.component == component) else { continue; };
+        match board_pose(&feature["inputParams"]["transform"]) {
+            Some((at, rotation, bottom)) => {
+                if (placement.at, placement.rotation, placement.bottom) != (at, rotation, bottom) {
+                    placement.at = at;
+                    placement.rotation = rotation;
+                    placement.bottom = bottom;
+                    changed = true;
+                }
+            }
+            None => off_plane.push(reference),
+        }
+    }
+    if changed {
+        if let Ok(stored) = sheet.to_value() {
+            draft["pcb"] = stored;
+            if let Err(error) = engine.history.adopt_document(&draft.to_string()) {
+                engine.push_notice(format!("The board placement did not follow the 3D move: {error}"));
+                return;
+            }
+            engine.refresh_board_geometry();
+        }
+    }
+    if !off_plane.is_empty() {
+        engine.push_notice_as(NoticeSeverity::Warning, format!(
+            "{} moved off the board plane in 3D. A footprint lies flat on the top or the bottom copper at a \
+             quarter turn, so the board placement stays where it was until the part is put back flat.",
+            off_plane.join(", ")));
+    }
 }
 
 /// Take the components of the removed top-level `gone` occurrences off both sheets
@@ -422,6 +708,105 @@ fn retire(engine: &mut brep_render::engine_state::EngineState, gone: &[(String, 
     };
     engine.push_notice_as(NoticeSeverity::Warning, format!("{what} left the assembly, so it left eCAD too: {}. Undo brings it all back.",
         lines.join(", ")));
+}
+
+/// A board is an assembly, so a component DELETED on a sheet is the assembly
+/// component deleted: the top-level occurrences that `stored` (the block as the
+/// document holds it) binds and `sheet` (the editor's document after the edit)
+/// no longer has are taken out of `draft`'s features, for the host to adopt in the
+/// sheet edit's own undo step. The other sheet, the board and the harness let go
+/// of them the frame after ([`follow_occurrences`] retires a removed occurrence).
+/// A legacy component — bound by key and label, no occurrence — takes the one
+/// occurrence that carries both, the rule [`follow_sheet`] binds it by.
+///
+/// A device inside a sub-assembly is not this document's: its occurrence lives in
+/// the sub-assembly's own document, where every instance of the parent shares it,
+/// so the delete is refused and the host puts the sheet back. Returns the labels
+/// of the components whose occurrence went.
+pub(crate) fn delete_gone_occurrences(
+    draft: &mut Value, stored: Option<&Value>, sheet: &brep_ecad_core::Document,
+) -> Result<Vec<String>, String> {
+    let Some(stored) = stored.cloned().and_then(|value| brep_ecad_core::Document::from_value(value).ok()) else {
+        return Ok(Vec::new());
+    };
+    let kept: BTreeSet<&str> = sheet.components.iter()
+        .filter_map(|c| c.part.as_ref()?.instance.as_deref()).collect();
+    let kept_legacy: BTreeSet<(&str, &str)> = sheet.components.iter()
+        .filter_map(|c| { let part = c.part.as_ref()?; part.instance.is_none().then_some((part.key.as_str(), c.reference.as_str())) })
+        .collect();
+    let mut gone: Vec<String> = Vec::new();
+    for component in &stored.components {
+        let Some(part) = &component.part else { continue };
+        match &part.instance {
+            Some(chain) if !kept.contains(chain.as_str()) => {
+                if let Some((parent, _)) = chain.split_once(':') {
+                    return Err(format!(
+                        "'{}' is a device inside '{parent}', a sub-assembly of this document: it is deleted \
+                         from the sub-assembly's own document, not from this sheet. The edit was taken back.",
+                        component.reference
+                    ));
+                }
+                if remove_feature_by_id(draft, chain) { gone.push(component.reference.clone()); }
+            }
+            Some(_) => {}
+            None if !kept_legacy.contains(&(part.key.as_str(), component.reference.as_str())) => {
+                let features = draft["features"].as_array().cloned().unwrap_or_default();
+                let matched: Vec<&str> = features.iter().filter(|feature| is_component(feature)
+                        && feature["inputParams"]["partName"].as_str() == Some(part.key.as_str())
+                        && feature["inputParams"]["bom"]["Reference_Designator"].as_str().map(str::trim) == Some(component.reference.as_str()))
+                    .filter_map(|feature| feature["inputParams"]["id"].as_str()).collect();
+                if let [id] = matched[..] {
+                    if remove_feature_by_id(draft, id) { gone.push(component.reference.clone()); }
+                }
+            }
+            None => {}
+        }
+    }
+    Ok(gone)
+}
+
+/// Take the feature whose `inputParams.id` is `id` out of `draft`; whether one went.
+fn remove_feature_by_id(draft: &mut Value, id: &str) -> bool {
+    let Some(features) = draft["features"].as_array_mut() else { return false };
+    let before = features.len();
+    features.retain(|feature| feature["inputParams"]["id"].as_str() != Some(id));
+    features.len() != before
+}
+
+/// Answer the sheets' **Duplicate** requests (`Editor::duplicate_requests`): a
+/// component whose part has every occurrence on the sheet was duplicated, and a
+/// board is an assembly, so another footprint is another assembly component. Each
+/// request adds one (`ComponentInsert::Existing`, the parts pane's Add Component by
+/// another door), which [`follow_occurrences`] designates inside the insert's own
+/// step; the parts are offered again and the editor arms the new occurrence's
+/// placement (`Editor::arm_pending_duplicate`) — on a wiring diagram, that is; on
+/// the PCB's sheet a part with pads is seated by the board the frame it is offered.
+/// A part the assembly cannot add another of is said, and arms nothing.
+pub(crate) fn answer_duplicate_requests(doc: &mut Document) {
+    let requests: Vec<String> = doc.ecad.diagram.duplicate_requests.drain(..)
+        .chain(doc.ecad.pcb.duplicate_requests.drain(..)).collect();
+    if requests.is_empty() { return; }
+    let mut answered = false;
+    for key in requests {
+        // `ComponentInsert::Existing` takes the library's word for the name, so
+        // the library is asked first: a nested device's key is its parent's, not
+        // this document's, and another of it is added in the parent's own document.
+        if !doc.engine.history.parts_library()[&key].is_object() {
+            doc.engine.push_notice(format!(
+                "Could not add another '{key}' to the assembly: this document's parts library does not carry it \
+                 (a device inside a sub-assembly is added in the sub-assembly's own document)."));
+            continue;
+        }
+        match doc.engine.insert_component(brep_render::engine_state::ComponentInsert::Existing { part_name: &key }) {
+            Ok(_) => answered = true,
+            Err(error) => doc.engine.push_notice(format!("Could not add another '{key}' to the assembly: {error}")),
+        }
+    }
+    if answered { sync(doc); }
+    for editor in [&mut doc.ecad.diagram, &mut doc.ecad.pcb] {
+        editor.arm_pending_duplicate();
+        editor.cancel_pending_duplicate();
+    }
 }
 
 pub(crate) fn sync(doc: &mut Document) {
@@ -742,17 +1127,7 @@ pub(crate) fn follow_sheet(
             // thickness both sides were written at 0, which put every
             // bottom-side part inside the board the moment there was a board to
             // be inside (`board_geometry`).
-            let angle = f64::from(placement.rotation % 4) * 90.;
-            let z = if placement.bottom {
-                -f64::from(brep_ecad_core::board::SUBSTRATE_THICKNESS) / 1000.
-            } else {
-                0.
-            };
-            let params = &mut document["features"][index]["inputParams"];
-            params["transform"] = serde_json::json!({
-                "translate": [f64::from(placement.at.x) / 1000., -f64::from(placement.at.y) / 1000., z],
-                "rotateEulerDeg": [0., if placement.bottom {180.} else {0.}, if placement.bottom {angle} else {-angle}],
-            });
+            document["features"][index]["inputParams"]["transform"] = board_transform(placement);
         }
     } else if block == "diagram" {
         let mut connections = document["wireHarness"]["connections"].as_array().cloned().unwrap_or_default();

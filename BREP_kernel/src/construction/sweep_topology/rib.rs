@@ -1196,6 +1196,7 @@ fn solid_from_shell(source: &BrepSolid, shell: &ShellRecord) -> BrepSolid {
         .collect();
     BrepSolid {
         mass_properties_cache: Default::default(),
+        cells: Default::default(),
         id: source.id,
         vertices: source
             .vertices

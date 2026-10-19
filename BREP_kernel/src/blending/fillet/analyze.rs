@@ -868,14 +868,63 @@ pub(super) fn check_support_extent(
     size: f64,
     entry: &str,
 ) -> Result<(), KernelRefusal> {
+    match support_extent(solid, edge_id, size, entry)? {
+        SupportExtent::Fits => Ok(()),
+        SupportExtent::ConcaveClip { refusal, .. } => Err(refusal),
+    }
+}
+
+/// [`check_support_extent`] for a selection of ONE edge, which also admits a
+/// concave overrun the exact cutter clips (lane F row 5): the face outline
+/// prism of [`concave_clip_face`]. A group keeps the refusal — its network
+/// would build the pad unclipped.
+pub(super) fn check_support_extent_clipping(
+    solid: &BrepSolid,
+    edge_id: u64,
+    size: f64,
+    entry: &str,
+) -> Result<(), KernelRefusal> {
+    support_extent(solid, edge_id, size, entry).map(|_| ())
+}
+
+/// The planar support face whose outline clips a concave edge's fill, when
+/// the fill's contact runs past that face's outer boundary into air and
+/// nowhere else (lane F row 5). `None` for every other edge, including one
+/// that fits.
+pub(super) fn concave_clip_face(solid: &BrepSolid, edge_id: u64, size: f64) -> Option<u64> {
+    match support_extent(solid, edge_id, size, "") {
+        Ok(SupportExtent::ConcaveClip { face, .. }) => Some(face),
+        _ => None,
+    }
+}
+
+enum SupportExtent {
+    Fits,
+    /// A concave edge overruns only `face`, a plane whose outline neighbours
+    /// are all planes parallel to its normal meeting it at sharp convex
+    /// edges: the fill clipped by that outline's prism is the blend, and
+    /// `refusal` is what the strict check says.
+    ConcaveClip { face: u64, refusal: KernelRefusal },
+}
+
+fn support_extent(
+    solid: &BrepSolid,
+    edge_id: u64,
+    size: f64,
+    entry: &str,
+) -> Result<SupportExtent, KernelRefusal> {
+    // Diagnostic (lane F, 2026-10-15).
+    if std::env::var_os("BREP_NO_SUPPORT_EXTENT").is_some() {
+        return Ok(SupportExtent::Fits);
+    }
     let Ok(cross) = analyze_edge(solid, edge_id, size) else {
-        return Ok(());
+        return Ok(SupportExtent::Fits);
     };
     let Ok((_, faces)) = edge_and_faces(solid, edge_id) else {
-        return Ok(());
+        return Ok(SupportExtent::Fits);
     };
     if faces.len() != 2 {
-        return Ok(());
+        return Ok(SupportExtent::Fits);
     }
     let phi = cross
         .into_first
@@ -885,11 +934,11 @@ pub(super) fn check_support_extent(
     // Tangent supports are already refused by `analyze_edge`; a degenerate
     // wedge here would only make `reach` meaningless.
     if !(phi > 1e-9) || phi >= std::f64::consts::PI - 1e-9 {
-        return Ok(());
+        return Ok(SupportExtent::Fits);
     }
     let reach = size / (phi * 0.5).tan();
     if !reach.is_finite() || reach <= 0.0 {
-        return Ok(());
+        return Ok(SupportExtent::Fits);
     }
     let (center, axis, sweep) = match &cross.path {
         EdgePath::Circular {
@@ -901,7 +950,53 @@ pub(super) fn check_support_extent(
     };
     let straight = matches!(cross.path, EdgePath::Straight { .. });
     const SAMPLES: usize = 8;
-    for (face, into) in [(faces[0], cross.into_first), (faces[1], cross.into_second)] {
+    // Every station is read before deciding (lane F row 2, 2026-10-15;
+    // `BREP_SUPPORT_EXTENT_STRICT=1` restores the refusal at the first overrun
+    // station, for comparison). A CONVEX edge whose ball runs off ONE support while
+    // it still touches the other is admitted at that station when the overrun leaves
+    // that support across a SHARP CONVEX edge — out of the part into air, so the
+    // overrunning wall removes only material the solid does not have and the third
+    // face it meets clips it. An overrun across a concave or tangent edge hands the
+    // ball to a third face it would cut into (a bore's last wall ending at the far
+    // mouth's blend) and still refuses; so does a station where the ball runs off
+    // BOTH supports, tangent to nothing (the 20-cube at r = 25 below), and a concave
+    // edge at any unsupported station, whose pad overhangs the part unclipped
+    // (lCount_413 +1.0 % volume).
+    let partial = std::env::var_os("BREP_SUPPORT_EXTENT_STRICT").is_none();
+    let mut overrun = [0u8; SAMPLES + 1];
+    let angular = crate::KernelTolerances::for_solid(solid, 1e-7).angular;
+    // The boundary edge the overrun leaves its support across: the one
+    // nearest the segment from the station to the contact point.
+    let exits_into_air = |edges: &[&EdgeRecord], station: Vec3, contact: Vec3| {
+        let span = contact.sub(station);
+        let to_segment = |point: Vec3| {
+            let along = (point.sub(station).dot(span) / span.dot(span)).clamp(0.0, 1.0);
+            point.sub(station.add(span.scale(along))).length()
+        };
+        let exit = edges
+            .iter()
+            .filter(|border| border.id != edge_id)
+            .map(|border| {
+                let nearest = (0..=64)
+                    .filter_map(|step| {
+                        let t = border.t0 + (border.t1 - border.t0) * step as f64 / 64.0;
+                        border.curve.evaluate(t).ok().map(to_segment)
+                    })
+                    .fold(f64::INFINITY, f64::min);
+                (border.id, nearest)
+            })
+            .min_by(|a, b| a.1.total_cmp(&b.1));
+        exit.is_some_and(|(exit_id, _)| {
+            scan_dihedral(solid, exit_id)
+                .is_ok_and(|profile| profile.samples > 0 && profile.max_angle < std::f64::consts::PI - angular)
+        })
+    };
+    let mut first_refusal: Option<KernelRefusal> = None;
+    // Which support each overrun station ran off (bit 0 = first, 1 = second).
+    let mut overrun_faces = [0u8; SAMPLES + 1];
+    for (support, (face, into)) in
+        [(faces[0], cross.into_first), (faces[1], cross.into_second)].into_iter().enumerate()
+    {
         // The face's own boundary, in 3D.  The test below is a BOUND, not a
         // containment test, and deliberately so: `project_point_to_surface`
         // clamps to the carrier's parameter rectangle, so a contact point past
@@ -999,7 +1094,7 @@ pub(super) fn check_support_extent(
             if extent >= required {
                 continue;
             }
-            return Err(KernelRefusal::input(
+            let refusal = KernelRefusal::input(
                 KernelStage::Classify,
                 "support_extent",
                 format!(
@@ -1012,10 +1107,265 @@ pub(super) fn check_support_extent(
                     face.id,
                     phi.to_degrees(),
                 ),
-            ));
+            );
+            if !partial {
+                return Err(refusal);
+            }
+            overrun_faces[step] |= 1 << support;
+            let contact = station.add(direction.scale(reach));
+            overrun[step] += if exits_into_air(&boundary_edges, station, contact) { 1 } else { 2 };
+            first_refusal.get_or_insert(refusal);
         }
     }
-    Ok(())
+    let Some(refusal) = first_refusal else {
+        return Ok(SupportExtent::Fits);
+    };
+    if cross.convex {
+        return if overrun.contains(&2) { Err(refusal) } else { Ok(SupportExtent::Fits) };
+    }
+    // A concave edge: its pad is admitted only where one clip makes it exact.
+    let ran_off = overrun_faces.iter().fold(0u8, |all, bits| all | bits);
+    let support = match ran_off {
+        0b01 => 0,
+        0b10 => 1,
+        _ => return Err(refusal),
+    };
+    match concave_clip_outline(solid, faces[support], edge_id, angular) {
+        Some(_) => Ok(SupportExtent::ConcaveClip { face: faces[support].id, refusal }),
+        None => Err(refusal),
+    }
+}
+
+/// The outline of `face` that clips a concave edge's fill: every loop that
+/// does not hold `edge_id`, when `face` is a plane and every edge of those
+/// loops is a sharp convex edge to a wall parallel to `face`'s normal (a plane
+/// containing it, or a cylinder about an axis along it), so the region's prism
+/// along that normal IS the walls the fill runs into: the outer loop's side
+/// planes and each hole's own wall (lane F). The loops' indices in
+/// `face.loops`, the outer loop (the largest projected area) first, then the
+/// holes.
+pub(super) fn concave_clip_outline(
+    solid: &BrepSolid,
+    face: &FaceRecord,
+    edge_id: u64,
+    angular: f64,
+) -> Option<Vec<usize>> {
+    if !matches!(face.surface.analytic(), Some(crate::AnalyticSurface::Plane { .. })) {
+        return None;
+    }
+    let mut loops: Vec<usize> = (0..face.loops.len())
+        .filter(|&index| face.loops[index].coedges.iter().all(|coedge| coedge.edge_id != edge_id))
+        .collect();
+    if loops.is_empty() || loops.len() + 1 != face.loops.len() {
+        return None;
+    }
+    let anchor = solid.edges.iter().find(|edge| edge.id == edge_id)?.curve.evaluate(0.0).ok()?;
+    let (_, normal) = face_plane_normal(face, anchor).ok()?;
+    let mut areas = Vec::with_capacity(loops.len());
+    for &index in &loops {
+        let mut samples = Vec::new();
+        for coedge in &face.loops[index].coedges {
+            let (border, mates) = edge_and_faces(solid, coedge.edge_id).ok()?;
+            let side = mates.iter().find(|mate| mate.id != face.id)?;
+            let wall = match side.surface.analytic() {
+                Some(crate::AnalyticSurface::Plane { .. }) => {
+                    let (_, side_normal) = face_plane_normal(side, border.curve.evaluate(border.t0).ok()?).ok()?;
+                    side_normal.dot(normal).abs() <= angular
+                }
+                Some(crate::AnalyticSurface::RuledRevolution { frame, rho0, rho1, .. }) => {
+                    let scale = rho0.abs().max(rho1.abs()).max(1.0);
+                    (rho0 - rho1).abs() <= 1e-9 * scale && frame.axis.cross(normal).length() <= angular
+                }
+                _ => false,
+            };
+            if !wall {
+                return None;
+            }
+            let sharp = scan_dihedral(solid, border.id)
+                .is_ok_and(|profile| profile.samples > 0 && profile.max_angle < std::f64::consts::PI - angular);
+            if !sharp {
+                return None;
+            }
+            let curve = crate::step::edge_subcurve(border).ok()?;
+            let [t0, t1] = curve.domain().ok()?;
+            for step in 0..16 {
+                let fraction = if coedge.forward { step as f64 / 16.0 } else { 1.0 - step as f64 / 16.0 };
+                samples.push(curve.evaluate(t0 + (t1 - t0) * fraction).ok()?);
+            }
+        }
+        areas.push(crate::polygon::newell_normal(&samples).dot(normal).abs());
+    }
+    let outer = (0..loops.len()).max_by(|&a, &b| areas[a].total_cmp(&areas[b]))?;
+    loops.swap(0, outer);
+    Some(loops)
+}
+
+/// Lane R1 row 5: the interference check's revolution certificate. On by
+/// default (promoted 2026-10-18 on the 98 + 144 census);
+/// `BREP_INTERFERENCE_REVOLUTION_CERT=0` (or `off`) samples every body.
+pub(crate) fn interference_revolution_cert_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !matches!(std::env::var("BREP_INTERFERENCE_REVOLUTION_CERT").as_deref(), Ok("0") | Ok("off")))
+}
+
+
+/// A grown face that is the FULL-TURN revolution of its own u = 0 row about
+/// an axis: `(axis origin, unit axis, [ρmin, ρmax, zmin, zmax], a point of
+/// the box's interior)`, where the box is the meridian (ρ, z) extent of the
+/// generatrix's control hull — it holds the generatrix (positive weights) and
+/// so, revolved, the whole carrier and every trimmed piece of it. Read from
+/// the net alone: the axis from the first column's u circle, the net rebuilt
+/// by `make_revolution` from that axis and row and compared to `1e-12` of its
+/// size; the row in one meridian half-plane (ρ is then linear on its hull).
+/// `None` for anything else, a partial turn included.
+fn revolution_band(surface: &crate::NurbsSurface) -> Option<(Vec3, Vec3, [f64; 4], Vec3)> {
+    const DELTA: f64 = 1e-12;
+    let net = &surface.control_points;
+    if surface.degree_u != 2 || net.len() != 9 || net.iter().any(|row| row.len() != net[0].len()) || net[0].len() < 2 {
+        return None;
+    }
+    let at = |i: usize| net[i][0].point().ok();
+    let (first, quarter, opposite) = (at(0)?, at(2)?, at(4)?);
+    let origin = first.add(opposite).scale(0.5);
+    let axis = first.sub(origin).cross(quarter.sub(origin)).normalized().ok()?;
+    let generatrix = crate::NurbsCurve::new(surface.degree_v, surface.knots_v.clone(), net[0].clone()).ok()?;
+    let rebuilt = crate::make_revolution(origin, axis, &generatrix, std::f64::consts::TAU).ok()?;
+    let same_bits = |a: &[f64], b: &[f64]| a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits());
+    if !same_bits(&surface.knots_u, &rebuilt.knots_u) || !same_bits(&surface.knots_v, &rebuilt.knots_v) || rebuilt.degree_u != 2 {
+        return None;
+    }
+    let size = net.iter().flatten().filter_map(|c| c.point().ok()).fold(0f64, |m, q| m.max(q.x.abs()).max(q.y.abs()).max(q.z.abs()));
+    if !(size > 0.) || rebuilt.control_points.len() != net.len() || rebuilt.control_points.iter().zip(net).any(|(a, b)| a.len() != b.len()) {
+        return None;
+    }
+    let close = net.iter().flatten().zip(rebuilt.control_points.iter().flatten()).all(|(a, b)| {
+        a.w > 0.
+            && b.w > 0.
+            && (a.w - b.w).abs() <= DELTA * a.w.abs().max(b.w.abs())
+            && (a.x / a.w - b.x / b.w).abs() <= DELTA * size
+            && (a.y / a.w - b.y / b.w).abs() <= DELTA * size
+            && (a.z / a.w - b.z / b.w).abs() <= DELTA * size
+    });
+    if !close {
+        return None;
+    }
+    // The meridian half-plane of the u = 0 row: through the axis and the
+    // first column's radial direction.
+    let radial_of = |q: Vec3| {
+        let d = q.sub(origin);
+        d.sub(axis.scale(d.dot(axis)))
+    };
+    let x_axis = radial_of(first).normalized().ok()?;
+    let normal = axis.cross(x_axis);
+    let mut bounds = [f64::INFINITY, f64::NEG_INFINITY, f64::INFINITY, f64::NEG_INFINITY];
+    for control in &net[0] {
+        let q = control.point().ok()?;
+        let d = q.sub(origin);
+        if d.dot(normal).abs() > DELTA * size {
+            return None;
+        }
+        let (x, z) = (d.dot(x_axis), d.dot(axis));
+        if !(x >= 0.) {
+            return None;
+        }
+        bounds = [bounds[0].min(x), bounds[1].max(x), bounds[2].min(z), bounds[3].max(z)];
+    }
+    if !(bounds[1] > bounds[0] || bounds[3] > bounds[2]) {
+        return None;
+    }
+    let interior = origin
+        .add(x_axis.scale(0.5 * (bounds[0] + bounds[1])))
+        .add(axis.scale(0.5 * (bounds[2] + bounds[3])));
+    Some((origin, axis, bounds, interior))
+}
+
+/// Does no face of `original` reach into the open box `ρ ∈ (ρmin, ρmax),
+/// z ∈ (zmin, zmax)` about `(origin, axis)`, past `tol`? Each face is cleared
+/// EXACTLY, never by a sample: a plane perpendicular to the axis by its level,
+/// a coaxial cylinder by its radius (the whole carriers), any other face by
+/// the meridian extent of its control hull — z is linear on the hull, and ρ
+/// convex, so the hull's largest ρ is a control point's.
+fn revolution_box_clear(original: &BrepSolid, origin: Vec3, axis: Vec3, [rho0, rho1, z0, z1]: [f64; 4], tol: f64) -> bool {
+    const PARALLEL: f64 = 1e-12;
+    original.shells.iter().flat_map(|shell| &shell.faces).all(|face| {
+        let surface = &face.surface;
+        match surface.analytic() {
+            Some(crate::AnalyticSurface::Plane { origin: at, u_dir, v_dir, .. }) => {
+                if let Ok(normal) = u_dir.cross(*v_dir).normalized() {
+                    if normal.cross(axis).length() <= PARALLEL {
+                        let level = at.sub(origin).dot(axis);
+                        if level >= z1 - tol || level <= z0 + tol {
+                            return true;
+                        }
+                    }
+                }
+            }
+            Some(crate::AnalyticSurface::RuledRevolution { frame, rho0: a, rho1: b, .. }) if a == b => {
+                let offset = frame.origin.sub(origin);
+                let off_axis = offset.sub(axis.scale(offset.dot(axis))).length();
+                if frame.axis.cross(axis).length() <= PARALLEL && off_axis <= tol && (*a >= rho1 - tol || *a <= rho0 + tol) {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+        let (mut low, mut high, mut far) = (f64::INFINITY, f64::NEG_INFINITY, 0f64);
+        for control in surface.control_points.iter().flatten() {
+            let Ok(q) = control.point() else { return false };
+            if !(control.w > 0.) {
+                return false;
+            }
+            let d = q.sub(origin);
+            let z = d.dot(axis);
+            low = low.min(z);
+            high = high.max(z);
+            far = far.max(d.sub(axis.scale(z)).length());
+        }
+        high <= z0 + tol || low >= z1 - tol || far <= rho0 + tol
+    })
+}
+
+/// The interference verdict for a body whose every grown face is a full-turn
+/// revolution band (`revolution_band`) about an axis no face of the original
+/// enters inside the band's meridian box `A`: `int A` is connected and misses
+/// the original's boundary, so every point of `A` that is not ON the boundary
+/// shares the class of one interior point; the bands lie in their `A`, and
+/// every fresh edge bounds a band. One classification per band then decides
+/// what the edge and face samples would: `Some(true)` clear (no sample can be
+/// on the forbidden side), `None` when any condition does not hold (the
+/// samples run, as before). Never `Some(false)`: a forbidden interior point
+/// is the samples' to report.
+fn revolution_interference_certificate(
+    original: &BrepSolid,
+    result: &BrepSolid,
+    grown: &[&FaceRecord],
+    fresh_edges: &[u64],
+    forbidden: PointClass,
+    classifier: &SolidClassifier,
+    tol: f64,
+) -> Option<bool> {
+    if grown.is_empty() {
+        return None;
+    }
+    let mut banded: Vec<u64> = Vec::with_capacity(grown.len());
+    for face in grown {
+        let (origin, axis, bounds, interior) = revolution_band(&face.surface)?;
+        if !revolution_box_clear(original, origin, axis, bounds, tol) {
+            return None;
+        }
+        let class = classifier.classify(interior).ok()?.class;
+        if class == forbidden || class == PointClass::On {
+            return None;
+        }
+        banded.push(face.id);
+    }
+    // Every fresh edge bounds a band: its samples are points of the band.
+    let on_band = |edge_id: u64| {
+        result.shells.iter().flat_map(|shell| &shell.faces).filter(|face| banded.contains(&face.id)).any(|face| {
+            face.loops.iter().flat_map(|l| &l.coedges).any(|coedge| coedge.edge_id == edge_id)
+        })
+    };
+    fresh_edges.iter().all(|&edge_id| on_band(edge_id)).then_some(true)
 }
 
 /// **A blend is LOCAL: it may only remove material that is there, or add
@@ -1085,7 +1435,13 @@ pub(super) fn check_blend_interference(
     // scan, printed under `BREP_PROFILE` as `classify.profile blend.interference.*`.
     crate::classification::classify_profile_begin();
 
-    if edge_ids.is_empty() || !original.validate().is_empty() {
+    if edge_ids.is_empty() {
+        return Ok(());
+    }
+    let validate_timing = crate::blend::BlendTimer::start("timing.interference.validate_ms");
+    let original_invalid = !original.validate_memoised().is_empty();
+    validate_timing.stop();
+    if original_invalid {
         return Ok(());
     }
     // Which side of the original boundary the new faces may NOT be on.
@@ -1166,14 +1522,37 @@ pub(super) fn check_blend_interference(
     const EDGE_SAMPLES: usize = 24;
     let edges_timing = crate::blend::BlendTimer::start("timing.interference.edges_ms");
     let inherited: Vec<u64> = original.edges.iter().map(|edge| edge.id).collect();
+    // A degenerate edge (a runout's pole, t0 == t1) is a vertex: its 23
+    // samples are one point ON the body's boundary, and every one went to a
+    // ray (2026-10-17 face ring: 3 poles, 69 rays).
     let fresh: Vec<_> = result
         .edges
         .iter()
-        .filter(|edge| !inherited.contains(&edge.id))
+        .filter(|edge| !inherited.contains(&edge.id) && !edge.degenerate && edge.t1 != edge.t0)
         .collect();
+    // Lane R1 row 5: bands that are full-turn revolutions in a box no face of
+    // the original enters are decided by one classification each
+    // (`revolution_interference_certificate`); anything else samples.
+    if interference_revolution_cert_on() {
+        let cert_timing = crate::blend::BlendTimer::start("timing.interference.revolution_cert_ms");
+        let band = policy.pcurve_consistency.min(policy.intersection_fit) / 10.0;
+        let fresh_ids: Vec<u64> = fresh.iter().map(|edge| edge.id).collect();
+        let certified = SolidClassifier::new(original, policy.pcurve_consistency / 10.0)
+            .ok()
+            .and_then(|classifier| revolution_interference_certificate(original, result, &grown, &fresh_ids, forbidden, &classifier, band));
+        cert_timing.stop();
+        if certified == Some(true) {
+            crate::blend::record_count("count.interference.revolution_certified", 1);
+            edges_timing.stop();
+            crate::classification::classify_profile_report("blend.interference.edges");
+            return Ok(());
+        }
+        crate::blend::record_count("count.interference.revolution_declined", 1);
+    }
     // Each sample's side is read off its nearest face where that read is
     // rigorous (`NearestFaceSide`), and cast as a ray otherwise: the same
     // verdict, without two agreeing rays per sample.
+    let edge_build_timing = crate::blend::BlendTimer::start("timing.interference.edges.build_ms");
     let skin = match fresh.is_empty() {
         true => None,
         false => Some((
@@ -1183,6 +1562,7 @@ pub(super) fn check_blend_interference(
                 .or_refuse(KernelStage::Validate, "edge_nearest_face")?,
         )),
     };
+    edge_build_timing.stop();
     for edge in fresh {
         let Some((skin, nearest)) = skin.as_ref() else { break };
         let mut sampled = 0usize;
@@ -1199,6 +1579,9 @@ pub(super) fn check_blend_interference(
                 Some(class) => class,
                 None => {
                     let Ok(classification) = skin.classify(point) else {
+                        // A classifier error at a sample counts as no violation
+                        // (integrator finding 2026-10-17): counted so it is seen.
+                        crate::blend::record_count("count.interference.classify_err", 1);
                         continue;
                     };
                     classification.class
@@ -1230,10 +1613,12 @@ pub(super) fn check_blend_interference(
     let faces_timing = crate::blend::BlendTimer::start("timing.interference.faces_ms");
     crate::classification::classify_profile_begin();
     crate::classification::containment_profile_begin();
+    let face_build_timing = crate::blend::BlendTimer::start("timing.interference.faces.build_ms");
     let classifier = SolidClassifier::new(original, policy.intersection_fit)
         .or_refuse(KernelStage::Validate, "face_classifier")?;
     let nearest = NearestFaceSide::new(original, policy.intersection_fit)
         .or_refuse(KernelStage::Validate, "face_nearest_face")?;
+    face_build_timing.stop();
     const GRID: usize = 9;
     for face in grown {
         crate::blend::record_count("count.interference.faces", 1);
@@ -1255,6 +1640,7 @@ pub(super) fn check_blend_interference(
                 Some(class) => class,
                 None => {
                     let Ok(classification) = classifier.classify(point) else {
+                        crate::blend::record_count("count.interference.classify_err", 1);
                         continue;
                     };
                     classification.class
@@ -1406,6 +1792,13 @@ pub(crate) fn face_grid_classes(
         .collect()
 }
 
+/// `BREP_NEAREST_FACE_ANALYTIC_ONLY=1`: the road until 2026-10-17, on which
+/// a general (NURBS) face within reach of the point hands it back to the ray.
+fn nearest_face_analytic_only() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("BREP_NEAREST_FACE_ANALYTIC_ONLY").as_deref() == Ok("1"))
+}
+
 /// The side of a solid's boundary a point is on, read from the point's
 /// NEAREST boundary point instead of a ray: a cheap answer the ray
 /// classifier ([`SolidClassifier::classify`]) would also give, or `None`
@@ -1424,14 +1817,19 @@ pub(crate) fn face_grid_classes(
 /// A `P` within the classifier's On band of `Q` is the classifier's to
 /// read (it answers `On` with a normal); so is a `P` whose offset from `Q`
 /// does not run along the normal (a foot that is not a foot). Carriers are
-/// projected with the kernel's own projector, whose analytic lanes make a
-/// plane or a cylinder a closed form.
+/// projected with the kernel's own projector: the closed form on a plane,
+/// a cylinder, a cone, a sphere or a torus, and on a general surface the
+/// seed-grid Newton followed by the global stage that certifies the foot
+/// against every lattice cell of the net (`project_point_to_surface_general`
+/// states the one step it does not certify) — the same query every other
+/// nearest-point read in the kernel rests on.
 ///
 /// Built for the blend acceptance's interference scan and the restriction's
 /// convexity vote, whose probes sit between the mates of a blend: a wall
 /// sample's nearest boundary point is on a mate, and the ray classifier
 /// spent 18–36 µs per sample confirming it with two agreeing rays.
 pub(crate) struct NearestFaceSide<'a> {
+    solid: &'a BrepSolid,
     faces: Vec<&'a FaceRecord>,
     boxes: Vec<crate::Aabb>,
     bounds: crate::Aabb,
@@ -1447,7 +1845,7 @@ impl<'a> NearestFaceSide<'a> {
         for face_box in &boxes {
             bounds.include(*face_box);
         }
-        Ok(Self { faces, boxes, bounds, on_band: tolerance * 10.0 })
+        Ok(Self { solid, faces, boxes, bounds, on_band: tolerance * 10.0 })
     }
 
     /// Distance from `point` to a box (zero inside it).
@@ -1462,52 +1860,146 @@ impl<'a> NearestFaceSide<'a> {
     /// `Some(In)` or `Some(Out)` when the nearest-face read is rigorous
     /// (above), `None` otherwise.
     pub(crate) fn side(&self, point: Vec3) -> Option<PointClass> {
+        match self.side_or_reason(point) {
+            Ok(class) => Some(class),
+            Err(reason) => {
+                // Why a sample went to the ray, under `BREP_DEBUG_NEAREST_SIDE`
+                // (2026-10-17 face-ring timing: every wall-interior sample of
+                // the interference scan was cast as two rays).
+                if std::env::var_os("BREP_DEBUG_NEAREST_SIDE").is_some() {
+                    eprintln!("nearest-face side: ray for ({:.6}, {:.6}, {:.6}): {reason}", point.x, point.y, point.z);
+                }
+                crate::blend::record_count(reason_counter(reason), 1);
+                None
+            }
+        }
+    }
+
+    /// [`Self::side`], naming the condition that hands the point to the ray.
+    fn side_or_reason(&self, point: Vec3) -> Result<PointClass, &'static str> {
         if !self.bounds.expanded(self.on_band).contains(point) {
             // The classifier's own first answer (Out), left to it.
-            return None;
+            return Err("outside the body's box");
         }
         let mut order: Vec<(f64, usize)> = self.boxes.iter().enumerate().map(|(index, face_box)| (Self::box_distance(face_box, point), index)).collect();
         order.sort_by(|a, b| a.0.total_cmp(&b.0));
         // The nearest interior foot, and the nearest carrier among faces
         // whose foot was not inside their trims.
         let mut nearest: Option<(f64, usize, SurfaceProjection)> = None;
-        let mut nearest_exterior = f64::INFINITY;
+        // Faces whose foot fell outside their trims, with their carrier distance:
+        // their nearest point is on their boundary, no nearer than the carrier.
+        let mut exterior: Vec<(f64, usize)> = Vec::new();
         for &(lower_bound, index) in &order {
             if nearest.as_ref().is_some_and(|(distance, _, _)| lower_bound >= *distance) {
                 break;
             }
             let face = self.faces[index];
-            // Only analytic carriers (closed-form projections): a general
-            // NURBS face within reach hands the point back to the ray.
-            if face.surface.analytic().is_none() {
-                return None;
+            if nearest_face_analytic_only() && face.surface.analytic().is_none() {
+                return Err("a general carrier within reach (analytic-only switch)");
             }
-            let projection = project_point_to_surface(&face.surface, point).ok()?;
+            // The kernel's own nearest-point query: the closed form on an
+            // analytic carrier, the certified global stage on a general
+            // surface (`projection.rs::project_point_to_surface_general`,
+            // which says what it guarantees). Until 2026-10-17 a general
+            // face within reach handed the point back to the ray instead,
+            // and on a body whose blends are fitted surfaces that was
+            // every point: the 2026-10-17 shelled-box report's F9 cast
+            // 216 rays for its 108 wall samples at 6.4 ms a sample — each
+            // ray clipped to ten faces' boxes and seeded 32 Newtons on
+            // each — where this read answers from two or three feet at
+            // 30–300 µs each.
+            let projection = project_point_to_surface(&face.surface, point).map_err(|_| "a carrier projection failed")?;
             if !projection.distance.is_finite() {
-                return None;
+                return Err("a carrier projection read a non-finite distance");
             }
             let band = crate::classification::surface_uv_band(&face.surface, projection.u, projection.v, self.on_band);
-            let inside = parameter_point_in_face(face, Vec2 { x: projection.u, y: projection.v }, band).ok()?;
+            let inside = parameter_point_in_face(face, Vec2 { x: projection.u, y: projection.v }, band).map_err(|_| "a trim test failed")?;
             if inside == PolygonClass::Inside {
                 if nearest.as_ref().map_or(true, |(distance, _, _)| projection.distance < *distance) {
                     nearest = Some((projection.distance, index, projection));
                 }
             } else {
-                nearest_exterior = nearest_exterior.min(projection.distance);
+                exterior.push((projection.distance, index));
             }
         }
-        let (distance, index, projection) = nearest?;
-        if !(distance > self.on_band) || nearest_exterior < distance {
-            return None;
+        let (distance, index, projection) = nearest.ok_or("no foot inside a face's trims")?;
+        if !(distance > self.on_band) {
+            // The classifier's own On band is this band (`SolidClassifier::classify`
+            // reads On at any face within `tolerance * 10` whose foot is inside its
+            // trims), so its answer here is On too; said directly, the rail
+            // samples of the interference scan — every one ON a mate by
+            // construction — no longer cast a ray each (2026-10-17 face ring:
+            // 531 of its 861 rays).
+            return Ok(PointClass::On);
+        }
+        for &(carrier_distance, exterior_index) in &exterior {
+            if carrier_distance >= distance {
+                continue;
+            }
+            // That face's nearest point is on its boundary: no nearer than the
+            // point's distance to its boundary edges' curves (the whole curve, a
+            // bound no larger than the edge's own). Nearer than `Q`, and the
+            // read is not rigorous; otherwise `Q` stays the nearest.
+            let face = self.faces[exterior_index];
+            let mut boundary = f64::INFINITY;
+            for loop_record in &face.loops {
+                for coedge in &loop_record.coedges {
+                    let Some(edge) = self.solid.edges.iter().find(|edge| edge.id == coedge.edge_id) else {
+                        return Err("a boundary edge is missing");
+                    };
+                    // The edge's own range of its curve where it can be cut out
+                    // (`split` at both ends); the whole curve, a bound no larger
+                    // than the edge's, where it cannot.
+                    let (low, high) = (edge.t0.min(edge.t1), edge.t0.max(edge.t1));
+                    let piece = edge
+                        .curve
+                        .split(low)
+                        .and_then(|(_, rest)| rest.split(high))
+                        .map(|(piece, _)| piece)
+                        .unwrap_or_else(|_| edge.curve.clone());
+                    let projection = crate::project_point_to_curve(&piece, point).map_err(|_| "a boundary curve projection failed")?;
+                    if !projection.distance.is_finite() {
+                        return Err("a boundary curve projection read a non-finite distance");
+                    }
+                    boundary = boundary.min(projection.distance);
+                }
+            }
+            if !(boundary > self.on_band) {
+                // The point is within the On band of that face's boundary, so of
+                // the face: the classifier reads On there.
+                return Ok(PointClass::On);
+            }
+            if !(boundary > distance) {
+                if std::env::var_os("BREP_DEBUG_NEAREST_SIDE").is_some() {
+                    eprintln!(
+                        "nearest-face side: exterior face {} ({}) carrier {:.3e} boundary {:.3e} vs nearest face {} ({}) at {:.3e}",
+                        face.id, face.name.as_deref().unwrap_or("-"), carrier_distance, boundary,
+                        self.faces[index].id, self.faces[index].name.as_deref().unwrap_or("-"), distance
+                    );
+                }
+                return Err("an exterior foot's carrier is nearer than the nearest face point");
+            }
         }
         let face = self.faces[index];
-        let normal = face.surface.normal(projection.u, projection.v).ok()?;
+        let normal = face.surface.normal(projection.u, projection.v).map_err(|_| "the normal failed")?;
         let normal = if face.same_sense { normal } else { normal.scale(-1.0) };
         let along = point.sub(projection.point).dot(normal);
         if !(along.abs() >= 0.5 * distance) {
-            return None;
+            return Err("the offset does not run along the normal");
         }
-        Some(if along > 0.0 { PointClass::Out } else { PointClass::In })
+        Ok(if along > 0.0 { PointClass::Out } else { PointClass::In })
+    }
+}
+
+/// The ledger counter for a [`NearestFaceSide::side`] fall-through reason.
+fn reason_counter(reason: &'static str) -> &'static str {
+    match reason {
+        "outside the body's box" => "count.nearest_side.ray.outside_box",
+        "no foot inside a face's trims" => "count.nearest_side.ray.no_interior_foot",
+        "within the On band" => "count.nearest_side.ray.on_band",
+        "an exterior foot's carrier is nearer than the nearest face point" => "count.nearest_side.ray.exterior_nearer",
+        "the offset does not run along the normal" => "count.nearest_side.ray.off_normal",
+        _ => "count.nearest_side.ray.failed_query",
     }
 }
 
@@ -1529,6 +2021,78 @@ pub(crate) fn face_sample_uv_band(face: &FaceRecord, u: f64, v: f64, spatial: f6
     };
     band.min(cap)
 }
+
+thread_local! {
+    /// Faces whose loops [`crate::loop_self_crossings`] read CLEAN (no
+    /// crossing, nothing unreadable), keyed by the face's serialised record
+    /// and the bits of the solid scale its vertex band is derived from.
+    pub(super) static CLEAN_LOOP_FACES: std::cell::RefCell<std::collections::HashSet<Vec<u8>>> =
+        std::cell::RefCell::new(std::collections::HashSet::new());
+}
+
+/// Bound on [`CLEAN_LOOP_FACES`]; the set is emptied when it would pass it.
+const CLEAN_LOOP_FACES_CAP: usize = 8192;
+
+/// [`crate::loop_self_crossings`] of `result`, every face it already read clean
+/// on an earlier call skipped. The scan reads each face on its own -- its
+/// surface, its loops' pcurves and edge ids, its id and name -- and one
+/// solid-wide band, `assembler_weld` of the model scale of the solid's
+/// VERTICES. So a copy holding every vertex but only the faces not yet read
+/// reports, face for face and in the same order, what the whole scan reports
+/// for those faces, and a face whose serialised record and scale are those of
+/// a face read clean before reads clean again. The acceptance reads only the
+/// crossings (the first and the count), which are therefore the whole scan's.
+/// A composition re-scanned the whole evolving body at every component: 13
+/// scans, 8.4 s of the sprocket report's 68.5 s `F9` (2026-10-14).
+/// `BREP_BLEND_BOWTIE_FACE_MEMO=0` scans every face every time, as before.
+pub(super) fn loop_self_crossings_reusing_clean_faces(result: &BrepSolid) -> crate::LoopCrossingReport {
+    if std::env::var("BREP_BLEND_BOWTIE_FACE_MEMO").as_deref() == Ok("0") {
+        return crate::loop_self_crossings(result);
+    }
+    let scale = crate::tolerance::solid_scale(result).to_bits().to_le_bytes();
+    let key = |face: &crate::topology::FaceRecord| -> Option<Vec<u8>> {
+        let mut bytes = serde_json::to_vec(face).ok()?;
+        bytes.extend_from_slice(&scale);
+        Some(bytes)
+    };
+    let mut reduced = result.clone();
+    let mut pending: Vec<(u64, Option<Vec<u8>>)> = Vec::new();
+    let mut skipped = 0u64;
+    CLEAN_LOOP_FACES.with(|clean| {
+        let clean = clean.borrow();
+        for shell in &mut reduced.shells {
+            shell.faces.retain(|face| {
+                let key = key(face);
+                if key.as_ref().is_some_and(|key| clean.contains(key)) {
+                    skipped += 1;
+                    return false;
+                }
+                pending.push((face.id, key));
+                true
+            });
+        }
+    });
+    crate::blend::record_count("count.bowtie.faces_reused", skipped);
+    crate::blend::record_count("count.bowtie.faces_scanned", pending.len() as u64);
+    let report = crate::loop_self_crossings(&reduced);
+    if report.unreadable.is_empty() {
+        CLEAN_LOOP_FACES.with(|clean| {
+            let mut clean = clean.borrow_mut();
+            for (id, key) in pending {
+                let Some(key) = key else { continue };
+                if report.crossings.iter().any(|crossing| crossing.face == id) {
+                    continue;
+                }
+                if clean.len() >= CLEAN_LOOP_FACES_CAP {
+                    clean.clear();
+                }
+                clean.insert(key);
+            }
+        });
+    }
+    report
+}
+
 
 /// **Does any face of the result have a trim loop that crosses ITSELF?**
 ///
@@ -1558,7 +2122,7 @@ pub(super) fn check_loop_self_crossings(
     entry: &str,
 ) -> Result<(), KernelRefusal> {
     let _timing = crate::blend::BlendTimer::start("timing.bowtie_ms");
-    let report = crate::loop_self_crossings(result);
+    let report = loop_self_crossings_reusing_clean_faces(result);
     let Some(crossing) = report.crossings.first() else {
         return Ok(());
     };
@@ -1592,3 +2156,136 @@ pub(super) fn check_loop_self_crossings(
         ),
     ))
 }
+
+/// Samples along an iso-line and the window the reversal test reads across.
+const WALL_LOOP_SAMPLES: usize = 512;
+const WALL_LOOP_LINES: usize = 9;
+const WALL_LOOP_WINDOW: usize = 8;
+
+thread_local! {
+    /// Faces whose iso-lines read free of a loop, keyed by the face's content
+    /// digest (`hash_face`) and the scale bits the bar is derived from.
+    static LOOP_FREE_FACES: std::cell::RefCell<rustc_hash::FxHashSet<[u64; 2]>> =
+        std::cell::RefCell::new(rustc_hash::FxHashSet::default());
+}
+
+/// Bound on [`LOOP_FREE_FACES`]; the set is emptied when it would pass it.
+const LOOP_FREE_FACES_CAP: usize = 8192;
+
+/// Does any fitted face of `result` pass back through itself along an
+/// iso-line? (2026-10-17, `fillet-mouth-over-wall-bore-5p5-r2p2`: the F2
+/// wall's row at v = 0.156 runs x = 10.000 → 9.974 → 10.000 → 10.026 →
+/// 10.000 across the rim's midpoint, a 2.6e-2-wide loop the soundness
+/// scan's fold half — two of the face's own mesh triangles crossing — never
+/// saw under the 512-sample rim mesh and convicted under a 40-sample one.
+/// The verdict must not depend on a mesh.)
+///
+/// Each general (non-analytic) face is read along [`WALL_LOOP_LINES`]
+/// iso-lines in each direction at [`WALL_LOOP_SAMPLES`] points: a step
+/// between consecutive samples that runs AGAINST the line's own direction
+/// over the [`WALL_LOOP_WINDOW`] samples either side of it is the line
+/// doubling back — a loop at least a window wide, which at these counts is
+/// 3 % of the domain, two station intervals of a 64-station march, and far
+/// below any bend a wall can legitimately turn through in that span. Steps
+/// and windows shorter than the bar (`1e-7 (1 + scale)`, the fit's own
+/// residual three decades down) are not read, so a pole or a collapsed
+/// section flags nothing. A face read clean is not read again
+/// (`LOOP_FREE_FACES`, keyed on its content). The refusal is the wall-fold
+/// class (`blend::wall_loop_refusal`), terminal as the march's own fold
+/// verdicts are. `BREP_BLEND_WALL_LOOP_CHECK=0` is the hatch.
+pub(super) fn check_blend_wall_loops(result: &BrepSolid, entry: &str) -> Result<(), KernelRefusal> {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ENABLED.get_or_init(|| std::env::var("BREP_BLEND_WALL_LOOP_CHECK").as_deref() != Ok("0")) {
+        return Ok(());
+    }
+    let _timing = crate::blend::BlendTimer::start("timing.wall_loops_ms");
+    let scale = crate::solid_scale(result);
+    let bar = 1.0e-7 * (1.0 + scale);
+    for face in result.shells.iter().flat_map(|shell| shell.faces.iter()) {
+        if face.surface.analytic().is_some() {
+            continue;
+        }
+        let key = {
+            let mut lane = crate::mass_properties::TwoLane::new();
+            crate::mass_properties::hash_face(&mut lane, face);
+            lane.f64(scale);
+            lane.finish()
+        };
+        if LOOP_FREE_FACES.with(|set| set.borrow().contains(&key)) {
+            continue;
+        }
+        crate::blend::record_count("count.wall_loops.faces_read", 1);
+        let Ok([u0, u1]) = face.surface.domain_u() else { continue };
+        let Ok([v0, v1]) = face.surface.domain_v() else { continue };
+        for (along_u, lines_from, lines_to, from, to) in [(true, v0, v1, u0, u1), (false, u0, u1, v0, v1)] {
+            for l in 0..WALL_LOOP_LINES {
+                let line = lines_from + (lines_to - lines_from) * (l as f64 + 0.5) / WALL_LOOP_LINES as f64;
+                let mut points = Vec::with_capacity(WALL_LOOP_SAMPLES + 1);
+                for k in 0..=WALL_LOOP_SAMPLES {
+                    let t = from + (to - from) * k as f64 / WALL_LOOP_SAMPLES as f64;
+                    let point = if along_u { face.surface.evaluate(t, line) } else { face.surface.evaluate(line, t) };
+                    let Ok(point) = point else { break };
+                    points.push((t, point));
+                }
+                if points.len() != WALL_LOOP_SAMPLES + 1 {
+                    continue;
+                }
+                for k in WALL_LOOP_WINDOW..WALL_LOOP_SAMPLES - WALL_LOOP_WINDOW {
+                    let step = points[k + 1].1.sub(points[k].1);
+                    let window = points[k + WALL_LOOP_WINDOW].1.sub(points[k - WALL_LOOP_WINDOW].1);
+                    let (step_length, window_length) = (step.length(), window.length());
+                    if step_length <= bar || window_length <= bar {
+                        continue;
+                    }
+                    if step.dot(window) < -bar * window_length {
+                        // Only MATERIAL can fold: a reversal whose samples lie
+                        // outside the face's trim is the untrimmed carrier
+                        // doubling back where the face does not reach — the
+                        // lens a carved wall cut away (the closed-edge lane's
+                        // carve leaves the crease as a zero-width slit, and
+                        // the surface inside it still loops: 2026-10-17,
+                        // `fillet-mouth-over-wall-bore-5p5-r2p2`). Both
+                        // samples of the step must be strictly inside the
+                        // trim; a sample on the trim boundary is the slit's.
+                        let uv_band = crate::tolerance::surface_uv_tolerance(bar, 1.0, 1.0).max(1e-9);
+                        let uv_of = |t: f64| if along_u { Vec2 { x: t, y: line } } else { Vec2 { x: line, y: t } };
+                        let material = [points[k].0, points[k + 1].0].iter().all(|&t| {
+                            matches!(parameter_point_in_face(face, uv_of(t), uv_band), Ok(PolygonClass::Inside))
+                        });
+                        if !material {
+                            continue;
+                        }
+                        let (which, other) = if along_u { ("row (u)", "v") } else { ("column (v)", "u") };
+                        return Err(crate::blend::wall_loop_refusal(
+                            face.id,
+                            format!(
+                                "{} {entry}: the result's face {}{} passes back through itself along its {which} \
+                                 line at {other} = {line:.6}: between parameters {:.6} and {:.6} the line moves \
+                                 {step_length:.3e} against its own direction over the surrounding window \
+                                 ({:.6}..{:.6}), so the wall carries two parameters on one point there. A \
+                                 fitted wall that loops is wrong in shape, not in area; nothing downstream can \
+                                 trim it right.",
+                                crate::blend::WALL_FOLDS,
+                                face.id,
+                                face.name.as_ref().map(|name| format!(" '{name}'")).unwrap_or_default(),
+                                points[k].0,
+                                points[k + 1].0,
+                                points[k - WALL_LOOP_WINDOW].0,
+                                points[k + WALL_LOOP_WINDOW].0,
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
+        LOOP_FREE_FACES.with(|set| {
+            let mut set = set.borrow_mut();
+            if set.len() >= LOOP_FREE_FACES_CAP {
+                set.clear();
+            }
+            set.insert(key);
+        });
+    }
+    Ok(())
+}
+

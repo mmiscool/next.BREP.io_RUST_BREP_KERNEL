@@ -270,7 +270,9 @@ impl BomPanel {
         }
 
         // --- header: the packed/unpacked switch ------------------------------
-        ui.horizontal(|ui| {
+        // Wrapped: at a narrow dock (384 pt at 1280x800) the row used to run
+        // past the pane and clip "Cut m…" (lane U audit item 5).
+        ui.horizontal_wrapped(|ui| {
             let packed = ui
                 .selectable_label(self.packed, "Packed")
                 .on_hover_text("One row per part, rolled up where every occurrence field matches");
@@ -306,7 +308,8 @@ impl BomPanel {
             // Offered once there is a wire to add it to (or a margin already
             // set), and written when the drag or the typing ENDS.
             if !wires.is_empty() || margin != 0.0 {
-                ui.label("Cut margin");
+                // Unwrapped, so the wrapping row moves the label whole.
+                ui.add(egui::Label::new("Cut margin").wrap_mode(egui::TextWrapMode::Extend));
                 let mut value = self.margin_edit.unwrap_or(margin);
                 let field = ui
                     .add(egui::DragValue::new(&mut value).range(0.0..=f64::MAX).speed(0.5))
@@ -329,13 +332,16 @@ impl BomPanel {
             } else {
                 format!(" / {} wire{}", wires.len(), if wires.len() == 1 { "" } else { "s" })
             };
-            ui.label(
-                egui::RichText::new(format!(
-                    "{} rows / {} occurrences{wire_count}",
-                    groups.len() + wires.len(),
-                    occurrences.len()
-                ))
-                .weak(),
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(format!(
+                        "{} rows / {} occurrences{wire_count}",
+                        groups.len() + wires.len(),
+                        occurrences.len()
+                    ))
+                    .weak(),
+                )
+                .wrap_mode(egui::TextWrapMode::Extend),
             );
         });
         if updates.outdated_count() > 0 {

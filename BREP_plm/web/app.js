@@ -2374,7 +2374,7 @@ $('bom-revision').addEventListener('change', () => act(async () => {
 $('bom-view').addEventListener('change', () => act(loadBom));
 
 let bomReadSerial=0;
-async function loadBom() {
+async function loadBom({background=false}={}) {
   const serial=++bomReadSerial;
   const flat = $('bom-view').value === 'flat';
   const query = `levels=0&flat=${flat}&occurrences=true`;
@@ -2388,7 +2388,7 @@ async function loadBom() {
   $('bom-csv').hidden = empty;
   $('bom-totals').hidden = empty;
 
-  await drawConfiguredBom(bom,serial);
+  await drawConfiguredBom(bom,serial,background);
   if(serial!==bomReadSerial)return;
   const totals = bom.totals.map((t) => `${escape(t.currency || '(no currency)')} ${money(t.total)}`).join(' · ');
   $('bom-totals').innerHTML = `Total: ${totals || '—'}`
@@ -3980,11 +3980,17 @@ async function loadRevisionFields(detail=currentPart){
 }
 $('revision-field-revision').addEventListener('change',()=>act(()=>loadRevisionFields()));
 const bomAttributeView={show:false};
-async function drawConfiguredBom(bom,serial){
-  await drawBomAttributes({bom,head:$('bom-head'),rows:$('bom-rows'),selection:$('bom-layout'),editButton:$('bom-edit-attributes'),status:$('bom-edit-status'),treeControls:$('bom-tree-controls'),view:bomAttributeView,reload:loadBom,isCurrent:()=>serial===bomReadSerial});
+async function drawConfiguredBom(bom,serial,background=false){
+  await drawBomAttributes({background,bom,head:$('bom-head'),rows:$('bom-rows'),selection:$('bom-layout'),editButton:$('bom-edit-attributes'),status:$('bom-edit-status'),treeControls:$('bom-tree-controls'),view:bomAttributeView,reload:loadBom,isCurrent:()=>serial===bomReadSerial});
 }
 // Every PLM BOM uses this editor, including Home, Parts and review detail panes.
-async function drawBomAttributes({bom,head,rows,selection,editButton,status,treeControls,view,reload,isCurrent}){
+// Edits whose PATCH is still in flight (every pane). The 5 s metadata poll
+// waits for them: its loadBom() moves bomReadSerial, which told the edit
+// handler below the table it drew for was stale, so a save that took longer
+// than the poll interval never wrote 'Attributes saved.' (the server had the
+// value; the user only saw the hint).
+let bomEditsInFlight=0;
+async function drawBomAttributes({bom,head,rows,selection,editButton,status,treeControls,view,reload,isCurrent,background=false}){
   const config=await api('GET','/api/bom/configuration');
   if(!isCurrent())return;
   selection.innerHTML='<option value="">Default</option>'+config.layouts.map(l=>`<option value="${escape(l.id)}">${escape(l.name)} (${l.owner?'Personal':'Shared'})</option>`).join('');
@@ -4051,7 +4057,9 @@ async function drawBomAttributes({bom,head,rows,selection,editButton,status,tree
     dialog.innerHTML=`<form method="dialog"><h2>${escape(line.number)} rev ${escape(line.revision_label)}</h2><ul>${line.warnings.map(w=>`<li>${escape(w)}</li>`).join('')}</ul><button type="submit">Close</button></form>`;
     dialog.showModal();
   };
-  status.textContent=me.can_author?'Edit attribute values in the table. Changes save automatically.':'';
+  // A background refresh keeps the status the user last caused ('Attributes
+  // saved.' or a refusal); only a foreground draw resets it to the hint.
+  if(!background)status.textContent=me.can_author?'Edit attribute values in the table. Changes save automatically.':'';
   for(const input of rows.querySelectorAll('[data-bom-field]'))input.addEventListener('change',()=>act(async()=>{
     const line=bom.lines[Number(input.dataset.bomRow)],field=fields.find(f=>f.id===input.dataset.bomField);input.disabled=true;
     const value=editedFieldValue(field,input);
@@ -4060,13 +4068,14 @@ async function drawBomAttributes({bom,head,rows,selection,editButton,status,tree
     const base=`/api/parts/${encodeURIComponent(part)}`;
     const path=target.resource==='part'?base:`${base}/revisions/${encodeURIComponent(revision)}/${target.resource==='revision'?'attributes':'occurrences'}`;
     const payload=target.resource==='part'?{[target.key]:value??''}:{...(target.resource==='occurrence'?{ids:line.occurrence_ids}:{}),attributes:{[target.key]:value}};
+    bomEditsInFlight++;
     try{
       await api('PATCH',path,payload);
       if(isCurrent()){await reload();status.textContent='Attributes saved.';}
     }catch(error){
       if(isCurrent()){await reload();status.textContent=error.message;}
       throw error;
-    }
+    }finally{bomEditsInFlight--;}
   }));
   }
   paint();
@@ -4074,8 +4083,8 @@ async function drawBomAttributes({bom,head,rows,selection,editButton,status,tree
 
 let bomMetadataPolling=false;
 setInterval(async()=>{
-  if(!me||!currentPart||document.hidden||$('view-part').hidden||bomMetadataPolling||document.querySelector('.work-area').inert)return;
+  if(!me||!currentPart||document.hidden||$('view-part').hidden||bomMetadataPolling||bomEditsInFlight>0||document.querySelector('.work-area').inert)return;
   if(document.activeElement?.closest('#bom-rows,#revision-field-values,[data-object-panel="summary"]'))return;
   bomMetadataPolling=true;
-  try{if(objectTab==='structure'&&structure.tab==='bom')await loadBom();else if(objectTab==='revisions')await loadRevisionFields();else if(objectTab==='summary')await loadSummaryFields(currentPart,$('summary-revision').value,{background:true});}catch{}finally{bomMetadataPolling=false;}
+  try{if(objectTab==='structure'&&structure.tab==='bom')await loadBom({background:true});else if(objectTab==='revisions')await loadRevisionFields();else if(objectTab==='summary')await loadSummaryFields(currentPart,$('summary-revision').value,{background:true});}catch{}finally{bomMetadataPolling=false;}
 },5000);

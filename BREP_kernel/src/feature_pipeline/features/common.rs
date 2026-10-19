@@ -686,6 +686,8 @@ pub struct BlendTarget {
     /// Canonical names parallel to `edge_points`, used to name generated faces.
     /// Unnamed edges fall back to `E{edge_id}`.
     pub edge_names: Vec<String>,
+    /// The selected edges' ids on the target solid, parallel to `edge_points`.
+    pub edge_ids: Vec<u64>,
 }
 
 /// Resolved blend selection; callers decide how to handle cross-solid input.
@@ -839,16 +841,18 @@ pub fn resolve_blend_selection(ctx: &FeatureContext) -> Result<BlendSelection, S
     // (dedup spans the whole selection, not per-face) in a single short borrow.
     // The originating edge NAME is captured PARALLEL to each point so the grown
     // blend face can be named after the edge it came from.
-    let (edge_points, edge_names) = crate::with_registered_solid_str(handle, |solid| {
+    let (edge_points, edge_names, edge_ids) = crate::with_registered_solid_str(handle, |solid| {
         let mut seen = FxHashSet::default();
         let mut points = Vec::new();
         let mut names = Vec::new();
+        let mut ids = Vec::new();
         for (_, entity) in &resolved {
             match entity {
                 ResolvedRef::Edge(edge_id) => {
                     if seen.insert(*edge_id) {
                         points.push(sample_edge_midpoint(solid, *edge_id)?);
                         names.push(edge_name_or_id(solid, *edge_id));
+                        ids.push(*edge_id);
                     }
                 }
                 ResolvedRef::Face(face_id) => {
@@ -856,12 +860,13 @@ pub fn resolve_blend_selection(ctx: &FeatureContext) -> Result<BlendSelection, S
                         if seen.insert(edge_id) {
                             points.push(sample_edge_midpoint(solid, edge_id)?);
                             names.push(edge_name_or_id(solid, edge_id));
+                            ids.push(edge_id);
                         }
                     }
                 }
             }
         }
-        Ok((points, names))
+        Ok((points, names, ids))
     })?;
 
     Ok(BlendSelection {
@@ -870,10 +875,96 @@ pub fn resolve_blend_selection(ctx: &FeatureContext) -> Result<BlendSelection, S
             name,
             edge_points,
             edge_names,
+            edge_ids,
         }),
         multi_solid: false,
         unresolved,
     })
+}
+
+/// The unselected edges that continue `selected` along OPEN tangent chains:
+/// from each end vertex of each selected edge, walk the single other edge
+/// whose tangent there continues the chain's (unit tangents within 1e-6 of
+/// parallel, the blend's own conjugacy bar), until a vertex has no such edge
+/// or more than one, the walk reaches a selected edge, or it closes. Returns
+/// each added edge's `(id, midpoint sample, name)` in walk order; empty when
+/// no selected edge ends inside a tangent chain.
+///
+/// A fillet that stops at a vertex where its edge runs on smoothly has no
+/// clean end there when a mate's CARRIER changes across that vertex — the
+/// cap plane normal to the edge can cross the mate's tangent seam with the
+/// next surface (the 2026-10-14 bore-wall reports) — and every mainstream
+/// kernel blends such a chain whole. So a walk starts only from a selected
+/// end where the continuation's mates are not both on the selected edge's
+/// own carriers: an end at a mere split of the same two surfaces caps
+/// cleanly and is left as selected. The fillet feature reads this only after
+/// the plain selection has refused, as a one-time fallback.
+pub fn open_tangent_chain_extension(solid: &BrepSolid, selected: &[u64]) -> Result<Vec<(u64, Vec3, String)>, String> {
+    let tangent_at = |edge: &crate::topology::EdgeRecord, vertex: u64| -> Result<Vec3, String> {
+        // The tangent pointing AWAY from `vertex`, into the edge.
+        let at_start = edge.start_vertex_id == vertex;
+        let t = if at_start { edge.t0 } else { edge.t1 };
+        let tangent = edge.curve.unit_tangent(t, edge.t0, edge.t1)?;
+        Ok(if at_start { tangent } else { tangent.scale(-1.0) })
+    };
+    let carriers = |edge_id: u64| -> Vec<&crate::NurbsSurface> {
+        solid
+            .shells
+            .iter()
+            .flat_map(|shell| &shell.faces)
+            .filter(|face| face.loops.iter().flat_map(|lp| &lp.coedges).any(|coedge| coedge.edge_id == edge_id))
+            .map(|face| &face.surface)
+            .collect()
+    };
+    let changes_carrier = |from: u64, to: u64| -> bool {
+        let own = carriers(from);
+        !carriers(to)
+            .iter()
+            .all(|next| own.iter().any(|surface| crate::face_merge::same_surface(surface, next, 1e-9)))
+    };
+    let mut taken: FxHashSet<u64> = selected.iter().copied().collect();
+    let mut added = Vec::new();
+    for &seed in selected {
+        let Some(seed_edge) = solid.edges.iter().find(|edge| edge.id == seed) else { continue };
+        if seed_edge.start_vertex_id == seed_edge.end_vertex_id || seed_edge.degenerate {
+            continue;
+        }
+        for start in [seed_edge.start_vertex_id, seed_edge.end_vertex_id] {
+            let mut current = seed_edge;
+            let mut vertex = start;
+            for _ in 0..128 {
+                // The chain's direction leaving `vertex` onward is minus the
+                // current edge's tangent away from it.
+                let onward = tangent_at(current, vertex)?.scale(-1.0);
+                let mut next = None;
+                let mut count = 0;
+                for candidate in &solid.edges {
+                    if candidate.id == current.id
+                        || candidate.degenerate
+                        || candidate.start_vertex_id == candidate.end_vertex_id
+                        || (candidate.start_vertex_id != vertex && candidate.end_vertex_id != vertex)
+                    {
+                        continue;
+                    }
+                    if tangent_at(candidate, vertex)?.dot(onward) >= 1.0 - 1e-6 {
+                        count += 1;
+                        next = Some(candidate);
+                    }
+                }
+                let Some(next) = next.filter(|_| count == 1) else { break };
+                if current.id == seed && !changes_carrier(seed, next.id) {
+                    break;
+                }
+                if !taken.insert(next.id) {
+                    break;
+                }
+                added.push((next.id, sample_edge_midpoint(solid, next.id)?, edge_name_or_id(solid, next.id)));
+                vertex = if next.start_vertex_id == vertex { next.end_vertex_id } else { next.start_vertex_id };
+                current = next;
+            }
+        }
+    }
+    Ok(added)
 }
 
 /// Shared wall and corner prefix, `{featureID || 'F'}:BLEND`.

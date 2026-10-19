@@ -560,11 +560,27 @@ pub fn interpolate_curve_with_end_tangents(
     let control_count = n + 3;
     let t0 = parameters[0];
     let t1 = parameters[n];
-    // Clamped knots with n−1 interior values averaged over parameter runs
-    // (the tangent rows consume the two extra controls).
+    const PT_KNOTS_DEFAULT: bool = true;
+    static PT_KNOTS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let pt_knots = *PT_KNOTS.get_or_init(|| {
+        match std::env::var("BREP_FIT_PT_KNOTS").as_deref() {
+            Ok("0") => false,
+            Ok("1") => true,
+            _ => PT_KNOTS_DEFAULT,
+        }
+    });
+    // Piegl–Tiller §9.2.2, eq. 9.22: with the two end-derivative
+    // constraints, the n−1 interior knots average u_j..u_{j+2}, including
+    // the first/last parameters in the first/last complete cubic window.
+    // The shifted reference windows can meet the samples yet oscillate
+    // severely between them. Keep them only for the comparison switch.
     let mut knots = vec![t0; degree + 1];
     for j in 0..n.saturating_sub(1) {
-        let window = &parameters[j + 1..(j + degree).min(n) + 1];
+        let window = if pt_knots {
+            &parameters[j..j + degree]
+        } else {
+            &parameters[j + 1..(j + degree).min(n) + 1]
+        };
         knots.push(window.iter().sum::<f64>() / window.len() as f64);
     }
     knots.extend(std::iter::repeat(t1).take(degree + 1));

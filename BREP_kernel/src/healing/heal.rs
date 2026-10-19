@@ -651,6 +651,9 @@ pub(crate) struct TrimRefitEntry {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct TrimRefitReport {
     pub coedges_read: usize,
+    /// Edge claims READ this call ([`edge_claim_with`]), not served from the
+    /// claim memo: the refit's work count.
+    pub claims_read: usize,
     pub entries: Vec<TrimRefitEntry>,
     pub seconds: TrimRefitSeconds,
 }
@@ -829,6 +832,10 @@ fn refit_inherited_trims_with(
     // One scope claim per edge, read once over the union of the edge's knots
     // and every use's OLD trim, so opposite uses share one verdict.
     let mut claims: HashMap<u64, (EdgeClaim, Option<TrimRefitDecline>)> = HashMap::default();
+    // The memo key of each claim READ this call (not served): a passing one
+    // is kept after the pass when no use of its edge got past the claim's own
+    // readings ([`claim_memo_insert_passing`]).
+    let mut read_keys: HashMap<u64, [u64; 2]> = HashMap::default();
     // The old claims' feet, replayed by the final claims ([`edge_standoff_replay`]);
     // off under `BREP_DEBUG_TRIM_REFIT_NO_REPLAY` (a same-binary A/B).
     let replay_on = std::env::var_os("BREP_DEBUG_TRIM_REFIT_NO_REPLAY").is_none();
@@ -885,9 +892,10 @@ fn refit_inherited_trims_with(
                     // The detection read is a pure function of this use's
                     // content, so it is served from the reading memo when
                     // the same use was read before (`reading_memo.rs`).
+                    let use_key = crate::mass_properties::coedge_use_identity(&face.surface, &coedge.pcurve, edge, coedge.forward);
                     let miss = crate::reading_memo::memoized(
                         crate::reading_memo::Reading::RefitDetection,
-                        crate::mass_properties::coedge_use_identity(&face.surface, &coedge.pcurve, edge, coedge.forward),
+                        use_key,
                         || {
                             detection_stations(&coedge.pcurve, edge, coedge.forward)
                                 .and_then(|stations| worst_same_parameter(&face.surface, &coedge.pcurve, edge, coedge.forward, &stations))
@@ -906,18 +914,28 @@ fn refit_inherited_trims_with(
                     // candidacy only (the binding proof is the edge claim).
                     profiling(|profile| profile.phase = ScopePhase::Candidacy);
                     let started = web_time::Instant::now();
-                    let own = edge_standoff_read(
-                        &face.surface,
-                        edge,
-                        coedge.forward,
-                        scope_stations(&[&coedge.pcurve], edge, coedge.forward, TRIM_REFIT_DETECT_INTERIOR).as_deref(),
-                        policy.model,
-                        None,
-                        None,
-                        Some(miss),
+                    // A pure function of the use's content and the model
+                    // tolerance, served from the memo like the detection
+                    // read (the key carries the tolerance).
+                    let own = crate::reading_memo::memoized(
+                        crate::reading_memo::Reading::RefitCandidacy,
+                        crate::mass_properties::identity_with_model(use_key, policy.model),
+                        || {
+                            edge_standoff_read(
+                                &face.surface,
+                                edge,
+                                coedge.forward,
+                                scope_stations(&[&coedge.pcurve], edge, coedge.forward, TRIM_REFIT_DETECT_INTERIOR).as_deref(),
+                                policy.model,
+                                None,
+                                None,
+                                Some(miss),
+                            )
+                            .map(|read| read.worst)
+                        },
                     );
                     report.seconds.scope += started.elapsed().as_secs_f64();
-                    let Some(own) = own.map(|read| read.worst) else {
+                    let Some(own) = own else {
                         report.entries.push(entry);
                         continue;
                     };
@@ -950,13 +968,27 @@ fn refit_inherited_trims_with(
                     if !claims.contains_key(&edge.id) {
                         profiling(|profile| profile.phase = ScopePhase::OldClaim);
                         let started = web_time::Instant::now();
-                        let old_trims = trims_of(solid, uses);
-                        let (claim, record) = edge_claim_with(solid, uses, edge, &old_trims, policy.model, None, replay_on);
+                        // The claim is a pure function of the edge's uses
+                        // and the model tolerance; one that DECLINED is
+                        // served from the claim memo (its record is never
+                        // needed: a declined edge is refit on no use).
+                        let key = claim_memo_key(solid, uses, edge, policy.model);
+                        let claim = match claim_memo_get(key, solid, uses) {
+                            Some(claim) => claim,
+                            None => {
+                                let old_trims = trims_of(solid, uses);
+                                report.claims_read += 1;
+                                let (claim, record) = edge_claim_with(solid, uses, edge, &old_trims, policy.model, None, replay_on);
+                                if replay_on {
+                                    records.insert(edge.id, record);
+                                }
+                                claim_memo_insert(key, &claim);
+                                read_keys.insert(edge.id, key);
+                                claim
+                            }
+                        };
                         report.seconds.scope += started.elapsed().as_secs_f64();
                         claims.insert(edge.id, claim);
-                        if replay_on {
-                            records.insert(edge.id, record);
-                        }
                     }
                     let claim = &claims[&edge.id];
                     // The working copy holds the trims refit so far, so a
@@ -1018,6 +1050,29 @@ fn refit_inherited_trims_with(
         }
     }
     report.seconds.scope += started.elapsed().as_secs_f64();
+    // A PASSING claim read this call is kept too when every use of its edge
+    // that reached `refit_one` declined on the claim and the use alone
+    // (`EdgeOffCarrier`, `OldEndWrong`: no neighbour, construction or
+    // working-copy read), so no final claim needs its record. The same uses
+    // read the same claim and decline the same way on the next boolean; the
+    // 2026-10-13 sprocket's F9 re-read one such edge's claim (OldEndWrong on
+    // both uses, ~0.23 s) on each of its last 30 booleans.
+    for (edge_id, key) in &read_keys {
+        let claim = &claims[edge_id];
+        let mut reached = report.entries.iter().filter(|entry| entry.edge == *edge_id).peekable();
+        if claim.1.is_none()
+            && !replacements.iter().any(|(_, _, index)| report.entries[*index].edge == *edge_id)
+            && reached.peek().is_some()
+            && reached.all(|entry| {
+                matches!(
+                    entry.decision,
+                    TrimRefitDecision::Declined(TrimRefitDecline::EdgeOffCarrier | TrimRefitDecline::OldEndWrong)
+                )
+            })
+        {
+            claim_memo_insert_passing(*key, &claim.0);
+        }
+    }
     if let Some(current) = working.as_mut() {
         settle_refits(solid, current, &replacements, &mut report.entries);
     }
@@ -1088,6 +1143,103 @@ struct EdgeClaim {
 /// sense, at [`TRIM_REFIT_SCOPE_INTERIOR`] points per span. Every use of the
 /// edge is judged by the same claim, so opposite uses cannot contradict.
 /// Returns what was read, and the decline if the claim fails.
+thread_local! {
+    /// Declined edge claims by [`claim_memo_key`]: the same contract as
+    /// `reading_memo.rs` (content-keyed, per thread, bounded, cleared with
+    /// it, off with it), holding the claim's own rows so a served candidate
+    /// reports exactly what a read one does. A DECLINED claim is kept, and a
+    /// passing one only when no use of its edge got past the claim's own
+    /// readings ([`claim_memo_insert_passing`]): a passing one that feeds a
+    /// refit needs the record this memo does not hold, for the final claim.
+    static CLAIM_MEMO: std::cell::RefCell<HashMap<[u64; 2], (EdgeClaim, Option<TrimRefitDecline>)>> =
+        std::cell::RefCell::new(HashMap::default());
+}
+
+/// Drop every memoised claim (`reading_memo::clear`).
+pub(crate) fn clear_claim_memo() {
+    CLAIM_MEMO.with(|memo| memo.borrow_mut().clear());
+}
+
+/// The identity of the claim [`edge_claim_with`] reads for `edge` over
+/// `uses` with no replay: every use's content identity in the order the
+/// claim is handed them, the order it visits their distinct carriers in
+/// (by face index, which decides which failing carrier names the decline),
+/// and the model tolerance.
+fn claim_memo_key(solid: &BrepSolid, uses: &[CoedgeIndex], edge: &crate::topology::EdgeRecord, model: f64) -> [u64; 2] {
+    let keys: Vec<[u64; 2]> = uses
+        .iter()
+        .map(|&(s, f, l, c)| {
+            let face = &solid.shells[s].faces[f];
+            let coedge = &face.loops[l].coedges[c];
+            crate::mass_properties::coedge_use_identity(&face.surface, &coedge.pcurve, edge, coedge.forward)
+        })
+        .collect();
+    let mut faces: Vec<(usize, usize)> = uses.iter().map(|&(s, f, _, _)| (s, f)).collect();
+    faces.sort_unstable();
+    faces.dedup();
+    let ranks: Vec<usize> = faces
+        .iter()
+        .map(|&(s, f)| uses.iter().position(|&(us, uf, _, _)| (us, uf) == (s, f)).unwrap_or(usize::MAX))
+        .collect();
+    crate::mass_properties::edge_claim_identity(&keys, &ranks, model)
+}
+
+/// The claim the memo holds for `key`, counted as a hit or a miss
+/// beside the reading memo's; `None` with the memo off.
+fn claim_memo_get(key: [u64; 2], solid: &BrepSolid, uses: &[CoedgeIndex]) -> Option<(EdgeClaim, Option<TrimRefitDecline>)> {
+    if !crate::reading_memo::memo_on() {
+        return None;
+    }
+    let held = CLAIM_MEMO.with(|memo| memo.borrow().get(&key).cloned());
+    crate::reading_memo::note(held.is_some());
+    held.map(|(mut claim, decline)| {
+        // The key identifies geometry and carrier order, so a relabeled
+        // body can reuse the readings. Report labels belong to THIS body,
+        // in the same sorted carrier order edge_claim_with reads. An
+        // unreadable claim may contain only a prefix of those carriers.
+        let mut faces: Vec<(usize, usize)> = uses.iter().map(|&(s, f, _, _)| (s, f)).collect();
+        faces.sort_unstable();
+        faces.dedup();
+        for ((id, _), (s, f)) in claim.standoff.iter_mut().zip(faces) {
+            *id = solid.shells[s].faces[f].id;
+        }
+        (claim, decline)
+    })
+}
+
+/// Keep `claim` for `key` when it declined.
+fn claim_memo_insert(key: [u64; 2], claim: &(EdgeClaim, Option<TrimRefitDecline>)) {
+    if !crate::reading_memo::memo_on() {
+        return;
+    }
+    let Some(decline) = claim.1 else {
+        return;
+    };
+    CLAIM_MEMO.with(|memo| {
+        let mut memo = memo.borrow_mut();
+        if memo.len() >= crate::reading_memo::capacity() {
+            memo.clear();
+        }
+        memo.insert(key, (claim.0.clone(), Some(decline)));
+    });
+}
+
+/// Keep a PASSING `claim` for `key`: only for an edge whose every use that
+/// reached `refit_one` declined on the claim and that use alone, so the next
+/// read of the same uses declines the same way without the record.
+fn claim_memo_insert_passing(key: [u64; 2], claim: &EdgeClaim) {
+    if !crate::reading_memo::memo_on() {
+        return;
+    }
+    CLAIM_MEMO.with(|memo| {
+        let mut memo = memo.borrow_mut();
+        if memo.len() >= crate::reading_memo::capacity() {
+            memo.clear();
+        }
+        memo.insert(key, (claim.clone(), None));
+    });
+}
+
 /// A fresh claim with nothing replayed or recorded (the controls' reference).
 #[cfg_attr(not(test), allow(dead_code))]
 fn edge_claim(

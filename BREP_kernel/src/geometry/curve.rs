@@ -537,6 +537,13 @@ impl KnotVector {
     }
 }
 
+/// A rational B-spline curve.
+///
+/// **Invariant: an in-place edit of the public fields must keep the curve
+/// valid.** The curve caches that it passed validation (finite values,
+/// positive weights, a clamped knot vector with a positive domain), and
+/// `Clone` copies that flag; nothing re-checks a field edited in place. Prefer
+/// building a new value with [`NurbsCurve::new`].
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct NurbsCurve {
     pub degree: usize,

@@ -10,7 +10,11 @@ embedded in [`BREP_app`](https://crates.io/crates/BREP_app) behind
 Hosts implement the protocol in `host`: an *attached* host is a running
 application the server lives inside (every session shares it), a *spawning*
 host builds an application per session. Either way the same tool, session and
-transport code runs.
+transport code runs. A host also supplies the `host::Platform` the tools touch
+the world through — the clock, a pause, files, the pictures a session keeps:
+the native platform is the filesystem and tokio; the browser build of the
+application is one too (the page's document store, `setTimeout`, blob URLs),
+which is how a page serves the same tools over WebMCP.
 
 ## What is in it
 
@@ -29,7 +33,11 @@ It depends on [`BREP_render`](https://crates.io/crates/BREP_render), and on
 
 ## Feature flags
 
-None.
+- `server` (default): the server — the protocol over `rmcp`, the two
+  transports, the runner, the generated docs, the PLM fixture and the native
+  `Platform`. Without it the crate is the tool set alone over the host
+  protocol (`tokio` with `sync` only), for a host that supplies its own
+  platform; that build compiles for `wasm32-unknown-unknown`.
 
 ## Licence
 

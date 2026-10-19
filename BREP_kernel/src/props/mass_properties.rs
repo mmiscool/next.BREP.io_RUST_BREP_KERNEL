@@ -31,6 +31,10 @@ enum Integrand {
     Area,
     Volume,
     VolumeAbout(Vec3),
+    /// Oriented vector area, integrated with the volume at the same stations.
+    NormalX,
+    NormalY,
+    NormalZ,
     /// Divergence-theorem first moments: ∫x dV = ∮ (x²/2)·nx dA, etc.
     MomentX,
     MomentY,
@@ -195,9 +199,9 @@ pub use measures::{
     face_volume_contribution, solid_edge_length_total,
 };
 pub use solid_props::{
-    solid_mass_properties, solid_mass_properties_full, solid_signed_volume, solid_signed_volume_for_sign,
+    solid_mass_properties, solid_mass_properties_full, signed_volume_against, solid_signed_volume, solid_signed_volume_for_sign,
 };
 pub(crate) use solid_props::shell_signed_volume;
 pub use polygons::trim_polygons;
 pub use identity::{face_set_identity, FaceSetIdentity};
-pub(crate) use identity::{coedge_use_identity, face_contribution_identity};
+pub(crate) use identity::{carrier_residual_identity, coedge_use_identity, edge_claim_identity, face_contribution_identity, hash_face, hash_surface, identity_with_model, TwoLane};

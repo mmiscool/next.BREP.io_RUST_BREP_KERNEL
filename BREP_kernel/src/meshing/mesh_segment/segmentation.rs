@@ -401,8 +401,16 @@ const CYLINDER_PEEL_SEED_RINGS: usize = 3;
 /// interpolation: three times the carrier's degrees of freedom (a cylinder
 /// has five, a cone six, a sphere four).  Each pass works on what the
 /// previous ones left.
+///
+/// The cone pass runs before the cylinder pass: a cone strip one column
+/// wide (its vertices on the two rim circles) reads as a cylinder about its
+/// generatrix at 5.6e-5 against a 7.5e-5 bar, and such strips cut the cone
+/// into patches its own pass could no longer seed; claimed whole first, the
+/// cone leaves no strip to misread. A cylinder offered to the cone pass fits
+/// a cone of zero half-angle that the cascade reads as a cylinder, which the
+/// kind check declines, so the cylinder pass still claims it.
 const PEEL_KINDS: [(&str, usize); 4] =
-    [("cylinder", 15), ("cone", 18), ("sphere", 12), ("torus", 21)];
+    [("cone", 18), ("cylinder", 15), ("sphere", 12), ("torus", 21)];
 
 /// Peel single-carrier groups off a tangent-smooth compound the cascade
 /// could not classify: a rounded outline (arcs of different radii joined on
@@ -427,6 +435,7 @@ fn peel_carriers(
     options: &SegmentOptions,
 ) -> (Vec<(Vec<u32>, RegionOutcome)>, Vec<u32>) {
     let debug = std::env::var("BREP_DEBUG_SEG").is_ok();
+    let started = debug.then(web_time::Instant::now);
     let local: HashMap<u32, usize> = tri_ids
         .iter()
         .enumerate()
@@ -559,6 +568,15 @@ fn peel_carriers(
         refine_torus_carrier(data, &tris, &verts, carrier, TORUS_REFINE_ITERATIONS)
             .filter(|fit| fit.max_dev.is_finite() && fit.max_dev <= bar)
     };
+    // Every vertex of the facet on the carrier at the precision bar.
+    let held_by = |carrier: &RegionCarrier, facet: usize| -> bool {
+        facets[facet].iter().all(|&index| {
+            data.tris[tri_ids[index] as usize]
+                .verts
+                .iter()
+                .all(|&v| carrier_distance(carrier, data.verts[v]) <= bar)
+        })
+    };
     // Loose pre-filter against the current carrier: the refit decides.
     let plausible = |carrier: &RegionCarrier, facet: usize| -> bool {
         let sense = carrier_sense(carrier);
@@ -575,8 +593,34 @@ fn peel_carriers(
         })
     };
 
+    // Dihedral between two neighbouring facets (their first triangles'
+    // normals: a facet is coplanar at 1e-4 rad).
+    let facet_dihedral = |a: usize, b: usize| -> f64 {
+        let na = data.tris[tri_ids[facets[a][0]] as usize].normal;
+        let nb = data.tris[tri_ids[facets[b][0]] as usize].normal;
+        na.dot(nb).clamp(-1.0, 1.0).acos()
+    };
+    // Three times the median dihedral of the seed's own in-region edges, or
+    // no gate at all for a seed with fewer than two neighbours.
+    let seed_dihedral_gate = |seed: usize| -> f64 {
+        let mut dihedrals: Vec<f64> = facet_neighbors[seed].iter().map(|&o| facet_dihedral(seed, o)).collect();
+        if dihedrals.len() < 2 {
+            return f64::INFINITY;
+        }
+        dihedrals.sort_by(f64::total_cmp);
+        3.0 * dihedrals[dihedrals.len() / 2]
+    };
+
     let mut order: Vec<usize> = (0..facets.len()).collect();
     order.sort_by(|&a, &b| facet_area[b].total_cmp(&facet_area[a]).then(a.cmp(&b)));
+    if let Some(started) = started {
+        eprintln!(
+            "[seg] peel timing: {} facets of {} tris built in {:.1} ms",
+            facets.len(),
+            tri_ids.len(),
+            started.elapsed().as_secs_f64() * 1e3
+        );
+    }
     let mut assigned = vec![false; facets.len()];
     let mut pieces: Vec<(Vec<u32>, RegionOutcome)> = Vec::new();
     // A torus seed is tried once across all rounds: the rounds exist for a
@@ -590,6 +634,11 @@ fn peel_carriers(
     let claimed = pieces.len();
     for (kind, min_vertices) in PEEL_KINDS {
     let mut tried = vec![false; facets.len()];
+    // Seed-stage accounting for the trace: how many seeds the pass tried,
+    // how many seed fits it got at the bar, the best seed residual it saw
+    // refused, and how many grown groups fell under the support floor.
+    let (mut seeds_tried, mut seed_fits, mut small_groups) = (0usize, 0usize, 0usize);
+    let mut best_refused_seed = f64::INFINITY;
     for &seed in &order {
         if assigned[seed] || tried[seed] || (kind == "torus" && torus_tried[seed]) {
             continue;
@@ -602,11 +651,20 @@ fn peel_carriers(
         let mut in_group = vec![false; facets.len()];
         in_group[seed] = true;
         let mut frontier = vec![seed];
+        // A ring neighbour across a crease is left out: on an anisotropic
+        // tessellation whose columns span a wall's full height, every seed
+        // neighbourhood of the bore touches the countersink cone across a
+        // 26.6-degree crease and no whole-neighbourhood fit can pass the bar.
+        // The crease is an outlier among the seed's own dihedrals (3.6 degrees
+        // between its columns), so a neighbour is admitted only when its
+        // dihedral across the shared edge is at most three times the median
+        // dihedral of the seed facet's own in-region edges.
+        let dihedral_gate = seed_dihedral_gate(seed);
         for _ in 0..CYLINDER_PEEL_SEED_RINGS {
             let mut next = Vec::new();
             for &facet in &frontier {
                 for &other in &facet_neighbors[facet] {
-                    if !assigned[other] && !in_group[other] {
+                    if !assigned[other] && !in_group[other] && facet_dihedral(facet, other) <= dihedral_gate {
                         in_group[other] = true;
                         group.push(other);
                         next.push(other);
@@ -615,11 +673,25 @@ fn peel_carriers(
             }
             frontier = next;
         }
+        seeds_tried += 1;
         let Some(seed_fit) = fit_facets(kind, &group) else {
+            if debug {
+                if let Some(fit) = fit_kind(kind, &group) {
+                    best_refused_seed = best_refused_seed.min(fit.max_dev);
+                }
+            }
             continue;
         };
+        seed_fits += 1;
         let mut carrier = seed_fit.carrier;
         let mut blocked = vec![false; facets.len()];
+        let mut blocked_list: Vec<usize> = Vec::new();
+        // Growth, then a sweep of the facets blocked while the carrier was
+        // still settling on a small support: those on its final estimate at
+        // the bar are admitted in one refit and growth resumes from them.
+        // Without the sweep a densely gridded band leaves hundreds of two-
+        // and four-triangle slivers behind, each re-fitted on its own later.
+        loop {
         loop {
             let mut wave = Vec::new();
             for &facet in &group {
@@ -652,18 +724,11 @@ fn peel_carriers(
             // the bar, then refits once: a refit per junction facet is what
             // a dense freeform compound cannot afford.
             if kind == "torus" {
-                let holds = |facet: usize| {
-                    facets[facet].iter().all(|&index| {
-                        data.tris[tri_ids[index] as usize]
-                            .verts
-                            .iter()
-                            .all(|&v| carrier_distance(&carrier, data.verts[v]) <= bar)
-                    })
-                };
                 let (inside, outside): (Vec<usize>, Vec<usize>) =
-                    wave.into_iter().partition(|&facet| holds(facet));
+                    wave.into_iter().partition(|&facet| held_by(&carrier, facet));
                 for facet in outside {
                     blocked[facet] = true;
+                    blocked_list.push(facet);
                 }
                 if inside.is_empty() {
                     break;
@@ -673,6 +738,7 @@ fn peel_carriers(
                 let Some(fit) = grow_fit(kind, &trial, &carrier) else {
                     for facet in inside {
                         blocked[facet] = true;
+                        blocked_list.push(facet);
                     }
                     break;
                 };
@@ -694,16 +760,39 @@ fn peel_carriers(
                     accepted_any = true;
                 } else {
                     blocked[facet] = true;
+                    blocked_list.push(facet);
                 }
             }
             if !accepted_any {
                 break;
             }
         }
+        blocked_list.retain(|&facet| blocked[facet] && !in_group[facet]);
+        let held: Vec<usize> = blocked_list
+            .iter()
+            .copied()
+            .filter(|&facet| held_by(&carrier, facet))
+            .collect();
+        if held.is_empty() {
+            break;
+        }
+        let mut trial = group.clone();
+        trial.extend(held.iter().copied());
+        let Some(fit) = grow_fit(kind, &trial, &carrier) else {
+            break;
+        };
+        for &facet in &held {
+            in_group[facet] = true;
+            blocked[facet] = false;
+        }
+        group = trial;
+        carrier = fit.carrier;
+        }
         let mut tris = facet_tris(&group);
         if tris.len() < options.min_region_triangles.max(4)
             || region_vertices(data, &tris).len() < min_vertices
         {
+            small_groups += 1;
             continue;
         }
         tris.sort_unstable();
@@ -713,8 +802,19 @@ fn peel_carriers(
                 RegionCarrier::Cylinder { radius, .. } | RegionCarrier::Sphere { radius, .. } => {
                     format!(" r={radius:.4}")
                 }
-                RegionCarrier::Cone { half_angle_rad, .. } => {
-                    format!(" ha={:.2}deg", half_angle_rad.to_degrees())
+                RegionCarrier::Cone { half_angle_rad, apex, axis_dir, .. } => {
+                    format!(
+                        " ha={:.2}deg apex=({:.3},{:.3},{:.3}) axis=({:+.4},{:+.4},{:+.4})",
+                        half_angle_rad.to_degrees(),
+                        apex.x, apex.y, apex.z,
+                        axis_dir.x, axis_dir.y, axis_dir.z
+                    )
+                }
+                RegionCarrier::Torus { center, axis_dir, major_radius, minor_radius, .. } => {
+                    format!(
+                        " R={major_radius:.4} r={minor_radius:.4} centre=({:.3},{:.3},{:.3}) axis=({:+.4},{:+.4},{:+.4})",
+                        center.x, center.y, center.z, axis_dir.x, axis_dir.y, axis_dir.z
+                    )
                 }
                 _ => String::new(),
             };
@@ -745,13 +845,33 @@ fn peel_carriers(
         }
         pieces.push((tris, outcome));
     }
+    if debug {
+        eprintln!(
+            "[seg] peel {kind} seeds: {seeds_tried} tried, {seed_fits} seed fits at {bar:.3e}, best refused seed max_dev={best_refused_seed:.3e}, {small_groups} grown groups under the support floor ({min_vertices} vertices)"
+        );
+    }
     }
     if pieces.len() == claimed {
         break;
     }
     }
+    if let Some(started) = started {
+        eprintln!(
+            "[seg] peel timing: seeds done at {:.1} ms, {} pieces",
+            started.elapsed().as_secs_f64() * 1e3,
+            pieces.len()
+        );
+    }
     if pieces.is_empty() {
         return (pieces, tri_ids.to_vec());
+    }
+    absorb_held_pieces(data, options, bar, &mut pieces, &facets, &facet_of, &local, &facet_neighbors, debug);
+    if let Some(started) = started {
+        eprintln!(
+            "[seg] peel timing: absorption done at {:.1} ms, {} pieces",
+            started.elapsed().as_secs_f64() * 1e3,
+            pieces.len()
+        );
     }
     // A leftover strip whose every peeled neighbor is the same carrier is an
     // interior gap — a tessellator T-vertex on a rim chord — not a
@@ -818,7 +938,113 @@ fn peel_carriers(
         }
     }
     remainder.sort_unstable();
+    if let Some(started) = started {
+        eprintln!(
+            "[seg] peel timing: leftovers done at {:.1} ms, {} remainder tris",
+            started.elapsed().as_secs_f64() * 1e3,
+            remainder.len()
+        );
+    }
     (pieces, remainder)
+}
+
+/// A piece every vertex of which lies on a neighbouring, larger piece's
+/// carrier at the precision bar is a sub-patch of that carrier, not evidence
+/// of a kind of its own: the cone pass claimed 144 triangles off the plane
+/// rim of a densely gridded fillet torus at 3.9e-4 against a 4.1e-4 bar
+/// before the torus pass reached the band, and the rebuild then demoted the
+/// torus for the cone edge across it. Such a piece rejoins the neighbour
+/// whose carrier holds it closest when the union still passes the cascade
+/// as that neighbour's kind; a pair that fails stays apart. Repeats until
+/// nothing rejoins.
+#[allow(clippy::too_many_arguments)]
+fn absorb_held_pieces(
+    data: &MeshData,
+    options: &SegmentOptions,
+    bar: f64,
+    pieces: &mut Vec<(Vec<u32>, RegionOutcome)>,
+    facets: &[Vec<usize>],
+    facet_of: &[usize],
+    local: &HashMap<u32, usize>,
+    facet_neighbors: &[Vec<usize>],
+    debug: bool,
+) {
+    let mut refused: Vec<(Vec<u32>, Vec<u32>)> = Vec::new();
+    loop {
+        let mut piece_of_facet = vec![usize::MAX; facets.len()];
+        for (piece, (tris, _)) in pieces.iter().enumerate() {
+            for &t in tris {
+                piece_of_facet[facet_of[local[&t]]] = piece;
+            }
+        }
+        let area: Vec<f64> = pieces
+            .iter()
+            .map(|(tris, _)| tris.iter().map(|&t| data.tris[t as usize].area).sum())
+            .collect();
+        let mut by_area: Vec<usize> = (0..pieces.len()).collect();
+        by_area.sort_by(|&a, &b| area[a].total_cmp(&area[b]).then(a.cmp(&b)));
+        let mut merge = None;
+        for &small in &by_area {
+            let verts = region_vertices(data, &pieces[small].0);
+            let mut neighbours: Vec<usize> = Vec::new();
+            for &t in &pieces[small].0 {
+                for &other in &facet_neighbors[facet_of[local[&t]]] {
+                    let piece = piece_of_facet[other];
+                    if piece != usize::MAX && piece != small && !neighbours.contains(&piece) {
+                        neighbours.push(piece);
+                    }
+                }
+            }
+            let best = neighbours
+                .iter()
+                .copied()
+                .filter(|&large| area[large] > area[small])
+                .filter(|&large| {
+                    !refused
+                        .iter()
+                        .any(|(a, b)| *a == pieces[small].0 && *b == pieces[large].0)
+                })
+                .filter_map(|large| {
+                    let carrier = &pieces[large].1.fit.carrier;
+                    let worst = verts
+                        .iter()
+                        .map(|&v| carrier_distance(carrier, data.verts[v]))
+                        .fold(0.0_f64, f64::max);
+                    (worst <= bar).then_some((large, worst))
+                })
+                .min_by(|a, b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)));
+            if let Some((large, worst)) = best {
+                merge = Some((small, large, worst));
+                break;
+            }
+        }
+        let Some((small, large, worst)) = merge else {
+            break;
+        };
+        let mut union: Vec<u32> = pieces[large].0.iter().chain(pieces[small].0.iter()).copied().collect();
+        union.sort_unstable();
+        let outcome = fit_peeled(data, &union, options);
+        let rejoined = outcome.accepted
+            && outcome.fit.carrier.kind() == pieces[large].1.fit.carrier.kind();
+        if debug {
+            eprintln!(
+                "[seg] peel absorb: {} piece of {} tris lies on the {} piece of {} tris at {worst:.3e} (bar {bar:.3e}); union {} accepted={} max_dev={:.3e}",
+                pieces[small].1.fit.carrier.kind(),
+                pieces[small].0.len(),
+                pieces[large].1.fit.carrier.kind(),
+                pieces[large].0.len(),
+                outcome.fit.carrier.kind(),
+                outcome.accepted,
+                outcome.fit.max_dev
+            );
+        }
+        if rejoined {
+            pieces[large] = (union, outcome);
+            pieces.remove(small);
+        } else {
+            refused.push((pieces[small].0.clone(), pieces[large].0.clone()));
+        }
+    }
 }
 
 /// The cascade's verdict on a peeled piece. The cascade keeps its plain

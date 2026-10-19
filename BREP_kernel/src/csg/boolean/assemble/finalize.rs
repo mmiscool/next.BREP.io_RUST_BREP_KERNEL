@@ -10,6 +10,52 @@ fn repair_edges_from_consistent_pcurves(
     solid: &mut BrepSolid,
     tolerance: f64,
 ) -> Result<(), KernelRefusal> {
+    let enabled = std::env::var("BREP_OFFSET_LAZY_REPAIR_TRACE")
+        .map_or(true, |value| value == "1" || value == "on");
+    let started = web_time::Instant::now();
+    let work = repair_edges_from_consistent_pcurves_mode(solid, tolerance, enabled)?;
+    if std::env::var("BREP_PROFILE").is_ok() {
+        eprintln!("assemble.repair_trace.profile ms={:.3} edges={} samples={} skipped={}",
+            started.elapsed().as_secs_f64() * 1000.0, work.edges, work.samples, work.skipped);
+    }
+    Ok(())
+}
+
+#[derive(Default, Debug)]
+struct RepairTraceWork {
+    edges: usize,
+    samples: usize,
+    skipped: usize,
+}
+
+// This is a total-evaluation certificate, not a geometric tolerance. On a
+// single-span degree-one unit-weight net, clamped Bernstein evaluation has a
+// nonzero homogeneous denominator everywhere. Malformed/other representations
+// retain the original eager trace and its refusal ordering. Inspect raw fields:
+// public control edits must not be hidden by a previously populated cache.
+fn total_unit_trace(surface: &crate::NurbsSurface, pcurve: &NurbsCurve) -> bool {
+    let knots = [0.0, 0.0, 1.0, 1.0];
+    // Stay away from the basis evaluator's zero-denominator floor and from
+    // overflow. This only limits eligibility; it changes no geometry or bar.
+    let domain = |k: &[f64]| k.len() == 4 && k.iter().all(|v| v.is_finite())
+        && k[0] == k[1] && k[2] == k[3]
+        && (1.0..=f64::MAX / 4.0).contains(&(k[2] - k[0]));
+    let finite_unit = |p: &crate::Vec4| p.w == 1.0
+        && p.x.is_finite() && p.y.is_finite() && p.z.is_finite();
+    surface.degree_u == 1 && surface.degree_v == 1
+        && domain(&surface.knots_u) && domain(&surface.knots_v)
+        && surface.control_points.len() == 2
+        && surface.control_points.iter().all(|row| row.len() == 2 && row.iter().all(&finite_unit))
+        && pcurve.degree == 1 && pcurve.knots == knots
+        && pcurve.control_points.len() == 2 && pcurve.control_points.iter().all(finite_unit)
+}
+
+fn repair_edges_from_consistent_pcurves_mode(
+    solid: &mut BrepSolid,
+    tolerance: f64,
+    lazy: bool,
+) -> Result<RepairTraceWork, KernelRefusal> {
+    let mut work = RepairTraceWork::default();
     // Assembly/search tolerances may be deliberately broad. Repairs are
     // governed by the committed pcurve contract so a search radius cannot
     // authorize geometry that the final validator must reject.
@@ -69,6 +115,7 @@ fn repair_edges_from_consistent_pcurves(
         let Some(edge_uses) = uses.get(&edge.id).filter(|uses| uses.len() == 2) else {
             continue;
         };
+        work.edges += 1;
         let first = &edge_uses[0];
         let first_face = faces[first.face];
         let first_loop = &first_face.loops[first.loop_index];
@@ -79,6 +126,22 @@ fn repair_edges_from_consistent_pcurves(
         let intended_traversal_start = traversal_end(previous);
         let intended_traversal_end = traversal_start(next);
         let [p0, p1] = first_coedge.pcurve.domain().or_refuse(KernelStage::Validate, "domain")?;
+        // Measure eligibility before manufacturing a repair trace only when
+        // every skipped evaluation is certified total. Reuse this identical
+        // reading below if a repair is actually needed; no station/bar changes.
+        let measured = if lazy && total_unit_trace(&first_face.surface, &first_coedge.pcurve) {
+            let error = adaptive_coedge_error(
+                &first_face.surface, &first_coedge.pcurve, &edge.curve, edge,
+                first_coedge.forward, repair_tolerance,
+            ).or_refuse(KernelStage::Validate, "csg.boolean.assemble.finalize")?;
+            if error <= repair_tolerance {
+                work.skipped += 1;
+                continue;
+            }
+            Some(error)
+        } else {
+            None
+        };
         // Repairs are uncommon and must satisfy the adaptive validator between
         // interpolation nodes. Use a dense carrier trace for every degree;
         // sparse samples can leave localized SSI-fit drift on tight offsets.
@@ -86,19 +149,20 @@ fn repair_edges_from_consistent_pcurves(
         let mut traversal_points = Vec::with_capacity(sample_count + 1);
         let mut parameters = Vec::with_capacity(sample_count + 1);
         for index in 0..=sample_count {
+            work.samples += 1;
             let fraction = index as f64 / sample_count as f64;
             let uv = first_coedge.pcurve.evaluate(p0 + (p1 - p0) * fraction).or_refuse(KernelStage::Validate, "evaluate")?;
             traversal_points.push(first_face.surface.evaluate(uv.x, uv.y).or_refuse(KernelStage::Validate, "evaluate")?);
             parameters.push(fraction);
         }
-        let worst_current = adaptive_coedge_error(
+        let worst_current = if let Some(error) = measured { error } else { adaptive_coedge_error(
             &first_face.surface,
             &first_coedge.pcurve,
             &edge.curve,
             edge,
             first_coedge.forward,
             repair_tolerance,
-        ).or_refuse(KernelStage::Validate, "csg.boolean.assemble.finalize")?;
+        ).or_refuse(KernelStage::Validate, "csg.boolean.assemble.finalize")? };
         if worst_current <= repair_tolerance {
             continue;
         }
@@ -326,7 +390,7 @@ fn repair_edges_from_consistent_pcurves(
                 .pcurve = pcurve;
         }
     }
-    Ok(())
+    Ok(work)
 }
 
 /// Commit assembler endpoint welds into edge geometry. Candidate matching is
@@ -595,7 +659,11 @@ pub(crate) fn finalize_assembled_solid(
         )));
     }
     let _caller = crate::mass_caller("finalize.closed_tail");
-    let volume = solid_signed_volume(&solid).or_refuse(KernelStage::Validate, "solid_signed_volume")?;
+    // Read for its sign against the bar through the per-face term memo
+    // (`solid_signed_volume_for_sign`: the verdict against `bar` is the exact
+    // integral's). The exact read cost 0.26 s on the shelled-box report's
+    // 34-face shell, and the next feature reads the same faces again.
+    let volume = crate::signed_volume_against(&solid, tolerance.powi(3)).or_refuse(KernelStage::Validate, "solid_signed_volume")?;
     if volume <= tolerance.powi(3) {
         return Err(KernelRefusal::new(
             RefusalClass::NonPositiveVolume,
@@ -683,10 +751,11 @@ pub(in crate::boolean) fn repair_open_assembly_via_heal_chain(
         return None;
     }
     let _caller = crate::mass_caller("finalize.heal_fallback");
-    let volume = solid_signed_volume(&solid).ok()?;
+    let volume = crate::signed_volume_against(&solid, tolerance.powi(3)).ok()?;
     if volume <= tolerance.powi(3) {
         return None;
     }
     Some(solid)
 }
+
 

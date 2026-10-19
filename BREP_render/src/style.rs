@@ -232,8 +232,10 @@ pub struct RenderSettings {
     /// 2026-09-11 on a heavy model, frame `draw` fell 33.61 ms -> 24.76 ms
     /// (-26%). The viewport looks materially different with it off — edges
     /// behind a face simply are not there — which is why this is a user's
-    /// choice and not a performance default. Defaults to true, the look the
-    /// viewer has always had.
+    /// choice rather than something a performance heuristic flips. Defaults to
+    /// FALSE since the 2026-10-14 display defaults directive (the user's chosen
+    /// look: no occluded-edge pass, see [`RenderSettings::default`]); before that
+    /// it defaulted to true.
     ///
     /// Distinct from setting [`Self::hidden_edge_alpha`] to 0, which also skips
     /// the pass: the alpha is how DIM the occluded edges are, this is WHETHER
@@ -278,7 +280,10 @@ pub struct RenderSettings {
     pub pick_double_sided: bool,
     /// How a plain viewport click builds a multi-selection (see [`MultiSelectMode`]).
     pub multi_select: MultiSelectMode,
-    /// Tessellation LOD factor (1.0 = the app's "Normal" preset).
+    /// Tessellation LOD factor — the chord-tolerance multiplier behind the
+    /// "Render Quality" dropdown (see [`RENDER_QUALITY`]: 1.0 = "Medium", 0.5 =
+    /// "High"). Defaults to 0.5, the "High" level, per the 2026-10-14 display
+    /// defaults directive.
     pub lod_factor: f64,
     // --- Sketcher overlay palette (managed here like every other display color) ---
     // Defaults come from `SketchColors::default()` (the single source of the
@@ -342,20 +347,31 @@ impl Default for RenderSettings {
             label_scale: 1.0,
             // Debug grab-handle outlines are off by default (a diagnostic aid).
             debug_grab_handles: false,
+            // The viewport look is the user's 2026-10-14 display defaults
+            // directive (a screenshot of their Settings window, every value
+            // below read from it): a slate background, a light grey-blue face
+            // colour, dark slate 1px edges with no occluded-edge pass. The
+            // selection/hover colours, the vertex colours and the whole sketch
+            // palette were already these values; vertex dots stay shown (the
+            // user's explicit follow-up to the directive).
             background: [
-                ((0x0b) as f32) / 255.0,
-                ((0x0d) as f32) / 255.0,
-                ((0x10) as f32) / 255.0,
+                ((0x13) as f32) / 255.0,
+                ((0x1b) as f32) / 255.0,
+                ((0x24) as f32) / 255.0,
             ],
             face_color_mode: FaceColorMode::Uniform,
-            face_color: hex(0x00009e, 1.0),
+            face_color: hex(0xa9bdcc, 1.0),
             face_selected_color: hex(0xffc400, 1.0),
             hover_color: hex(0xfbff00, 1.0),
-            edge_color: hex(0x009dff, 1.0),
+            edge_color: hex(0x324452, 1.0),
             edge_selected_color: hex(0xff00ff, 1.0),
-            edge_width_px: 2.0,
-            show_occluded_edges: true,
-            hidden_edge_alpha: 0.22,
+            edge_width_px: 1.0,
+            // No occluded-edge pass by default: the toggle is off AND its alpha
+            // is 0, so switching the pass back on starts from "invisible" until
+            // the user also raises the alpha (the two are independent on purpose,
+            // see `show_occluded_edges`).
+            show_occluded_edges: false,
+            hidden_edge_alpha: 0.0,
             vertex_color: hex(0x4aff03, 1.0),
             vertex_selected_color: hex(0x00ffff, 1.0),
             vertex_size_px: 6.0,
@@ -375,7 +391,9 @@ impl Default for RenderSettings {
             viewcube_size_px: brep_gizmos::view_cube::ViewCube::DEFAULT_SIZE_PX,
             pick_double_sided: true,
             multi_select: MultiSelectMode::ClickToggles,
-            lod_factor: 1.0,
+            // "High" render quality (RENDER_QUALITY: 0.5 = half the "Medium"
+            // chord tolerance) — the directive's dropdown value.
+            lod_factor: 0.5,
             // Sketch palette: derive each Rgba from the ONE source of the literals
             // (`SketchColors::default`) so nothing changes visually until edited.
             sketch_movable_color: hex(sk.movable, 1.0),
@@ -404,7 +422,10 @@ impl Default for RenderSettings {
 impl RenderSettings {
     /// The artifact-corpus preset: byte-faithful to the slice-1 artifact look
     /// (per-solid hashed colors, 0x101418 background, 1.6px edges in
-    /// 0x0d1030, no hidden-edge pass, no vertices, no axes).
+    /// 0x0d1030, no hidden-edge pass, no vertices, no axes, "Medium" LOD).
+    /// Every field the corpus look depends on is pinned HERE, so a change to the
+    /// app's own defaults (2026-10-14 moved the viewport colours, the edge pass
+    /// and the LOD) never shifts the corpus.
     pub fn artifact() -> Self {
         Self {
             background: [
@@ -415,9 +436,12 @@ impl RenderSettings {
             face_color_mode: FaceColorMode::HashedBySolid,
             edge_color: hex(0x0d1030, 1.0),
             edge_width_px: 1.6,
+            show_occluded_edges: false,
             hidden_edge_alpha: 0.0,
+            show_vertices: false,
             vertex_size_px: 0.0,
             axis_length_px: 0.0,
+            lod_factor: 1.0,
             ..Self::default()
         }
     }

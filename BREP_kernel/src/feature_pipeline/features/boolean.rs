@@ -103,13 +103,22 @@ fn fold_boolean(
     operation: BooleanOperation,
     options: &BooleanOptions,
 ) -> Result<BrepSolid, FeatureRefusal> {
+    let _sign_fold = crate::reading_memo::SignFoldScope::begin();
     let mut current = base;
-    for (name, handle) in targets {
+    for (index, (name, handle)) in targets.iter().enumerate() {
+        let sign_before = crate::reading_memo::sign_new();
+        let registration = crate::boolean::profile::Scope::new("feature.intermediate_register");
         let operand = crate::register_solid_value(current);
+        drop(registration);
         let folded = crate::with_two_registered_solids(*handle, operand, |target, running| {
             crate::boolean_operation(target, running, operation, options)
         });
+        if std::env::var_os("BREP_PROFILE").is_some() {
+            eprintln!("mass.sign_fold boolean={} target={} genuinely_new={}", index + 1, name, crate::reading_memo::sign_new()-sign_before);
+        }
+        let freeing = crate::boolean::profile::Scope::new("feature.intermediate_free");
         crate::free_registered_solid(operand);
+        drop(freeing);
         // The boolean's class rides through the feature's wrap: a degeneracy
         // refused by the kernel is a degeneracy at the feature boundary.
         current = folded.map_err(|error: crate::KernelRefusal| {
@@ -127,6 +136,7 @@ fn fold_boolean(
 /// `{featureID, owningFeatureID}`), so [`BooleanOptions::default`]
 /// (merge = true) is used here. Only called with ≥ 2 tools.
 fn union_tools(tools: &[(String, u32)]) -> Result<BrepSolid, FeatureRefusal> {
+    let _sign_fold = crate::reading_memo::SignFoldScope::begin();
     let options = BooleanOptions::default();
     let mut current = crate::with_registered_solid_str(tools[0].1, |solid| Ok(solid.clone()))?;
     for (name, handle) in &tools[1..] {
@@ -192,6 +202,7 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, FeatureRefusal> {
     // Only the final subtract / fold honors the user's mergeCoplanarFaces.
     let options = BooleanOptions {
         merge_coplanar_faces: boolean.merge_coplanar_faces,
+        seam_reseat_later_references: ctx.later_inputs.map(<[String]>::to_vec),
         ..BooleanOptions::default()
     };
 
@@ -242,7 +253,9 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, FeatureRefusal> {
     // Face names propagated by `boolean_operation` stand; the derived EDGE names
     // are re-stamped from the RESULT's adjacency like every other feature's
     // (`common::register_added`) — see the module note on name fidelity.
+    let registration = crate::boolean::profile::Scope::new("feature.final_register");
     result.added.push(common::register_added(solid, &result_name));
+    drop(registration);
     result.removed = removed;
     Ok(result)
 }

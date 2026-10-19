@@ -187,6 +187,161 @@ enum VertexKind<'a> {
         cap: &'a FaceRecord,
         sharp: &'a EdgeRecord,
     },
+    /// Lane L (2026-10-14): a MIXED star — one CONCAVE stripe Q between two
+    /// walls and two CONVEX stripes, each on one of those walls and the cap
+    /// they share, at a planar corner whose walls stand normal to the cap (at
+    /// any concave angle to each other), Q's axis normal to the cap (§6.9.7, the class `round_mixed_concave_corner` closes behind the
+    /// cutter).  No ball touches all three faces from one side; the rolling
+    /// ball rides Q's rim, its centre 2r from Q's axis and r below the cap,
+    /// so the closure is the exact torus sector bounded by the two convex
+    /// stripes' end sections, Q's inner-equator section and the cap's contact
+    /// arc.  Behind `BREP_BLEND_MIXED_STAR`.
+    MixedStar(MixedStar),
+}
+
+/// The closed-form points of a [`VertexKind::MixedStar`] corner.
+#[derive(Clone, Copy, Debug)]
+struct MixedStar {
+    radius: f64,
+    cap: u64,
+    wall_a: u64,
+    wall_b: u64,
+    /// Stripe indices: the concave stripe and the convex stripes on wall A
+    /// and on wall B.
+    q: usize,
+    a: usize,
+    b: usize,
+    /// Q's inner-equator ends on the walls, and the cap contact ends.
+    v_a: Vec3,
+    v_b: Vec3,
+    w_a: Vec3,
+    w_b: Vec3,
+    /// Q's axis at the inner-equator level, its direction (away from the cap
+    /// into the material's side), and the convex stripes' ball centres at
+    /// their stops.
+    q_v: Vec3,
+    q_w: Vec3,
+    axis: Vec3,
+    c_a: Vec3,
+    c_b: Vec3,
+}
+
+/// `BREP_BLEND_MIXED_STAR=1` lets the network close a mixed star
+/// ([`VertexKind::MixedStar`]), `=0` is the escape hatch. Promoted 2026-10-15
+/// (lane L's record: census with it on — cases OK, integration 417/0, lib
+/// green once the three cutter-composition tests were pinned to the
+/// composition).
+const MIXED_STAR_DEFAULT: bool = true;
+
+thread_local! {
+    static MIXED_STAR_FOR_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+pub(crate) fn mixed_star_on() -> bool {
+    if let Some(forced) = MIXED_STAR_FOR_TEST.with(|forced| forced.get()) {
+        return forced;
+    }
+    match std::env::var("BREP_BLEND_MIXED_STAR").as_deref() {
+        Ok("0") | Ok("off") => false,
+        Ok("1") | Ok("on") => true,
+        _ => MIXED_STAR_DEFAULT,
+    }
+}
+
+
+/// The outward normal of a PLANAR face, or `None`.
+fn planar_outward_normal(face: &FaceRecord) -> Option<Vec3> {
+    let Some(crate::AnalyticSurface::Plane { u_dir, v_dir, .. }) = face.surface.analytic() else {
+        return None;
+    };
+    let normal = u_dir.cross(*v_dir).normalized().ok()?;
+    Some(if face.same_sense { normal } else { normal.scale(-1.0) })
+}
+
+/// Whether the three stripes at `point` are a [`VertexKind::MixedStar`],
+/// and its closed-form points when they are.  `None` for every other
+/// configuration, which the classification then reads as before.
+fn detect_mixed_star(
+    mates: &[(&EdgeRecord, BlendMate, BlendMate)],
+    stripe_indices: &[usize],
+    point: Vec3,
+    radius: f64,
+) -> Option<MixedStar> {
+    if stripe_indices.len() != 3 || !(radius > 0.0) {
+        return None;
+    }
+    let convex: Vec<(usize, bool)> = stripe_indices
+        .iter()
+        .map(|&index| {
+            let (edge, first, second) = &mates[index];
+            edge_is_convex(edge, first, second).ok().map(|convex| (index, convex))
+        })
+        .collect::<Option<Vec<_>>>()?;
+    let concave: Vec<usize> = convex.iter().filter(|(_, c)| !*c).map(|(i, _)| *i).collect();
+    let rims: Vec<usize> = convex.iter().filter(|(_, c)| *c).map(|(i, _)| *i).collect();
+    let ([q], [r0, r1]) = (concave.as_slice(), rims.as_slice()) else {
+        return None;
+    };
+    let faces_of = |index: usize| [mates[index].1.face, mates[index].2.face];
+    let [q0, q1] = faces_of(*q);
+    // Each rim shares exactly one face with Q (its wall); the rims share the cap.
+    let wall_of = |index: usize| -> Option<(&FaceRecord, &FaceRecord)> {
+        let [f0, f1] = faces_of(index);
+        match (f0.id == q0.id || f0.id == q1.id, f1.id == q0.id || f1.id == q1.id) {
+            (true, false) => Some((f0, f1)),
+            (false, true) => Some((f1, f0)),
+            _ => None,
+        }
+    };
+    let (wall_a, cap_a) = wall_of(*r0)?;
+    let (wall_b, cap_b) = wall_of(*r1)?;
+    if cap_a.id != cap_b.id || wall_a.id == wall_b.id {
+        return None;
+    }
+    let (na, nb, nc) = (planar_outward_normal(wall_a)?, planar_outward_normal(wall_b)?, planar_outward_normal(cap_a)?);
+    // Both walls stand normal to the cap (Q's axis is the cap's normal); the
+    // walls themselves meet at any concave angle.
+    let k = na.dot(nb);
+    if na.dot(nc).abs() > 1e-9 || nb.dot(nc).abs() > 1e-9 || k <= -1.0 + 1e-6 {
+        return None;
+    }
+    for face in [wall_a, wall_b, cap_a] {
+        // The corner must lie on every plane (the faces meet at the vertex).
+        let Some(crate::AnalyticSurface::Plane { origin, .. }) = face.surface.analytic() else {
+            return None;
+        };
+        let normal = planar_outward_normal(face)?;
+        if normal.dot(point.sub(*origin)).abs() > 1e-7 * (1.0 + radius) {
+            return None;
+        }
+    }
+    // Q's axis: in the cap plane, r off both walls into the air —
+    // corner + r/(1 + n_a·n_b)·(n_a + n_b).  Each rim's centre line runs r
+    // inside its wall and r below the cap, so it is 2r from Q's axis and
+    // tangent to the torus' centre circle: its stop centre is the foot of
+    // the perpendicular, q_v − 2r·n_wall, and the ball touches Q at
+    // q_v − r·n_wall (on the wall) and the cap at q_w − 2r·n_wall.
+    let r = radius;
+    let q_w = point.add(na.add(nb).scale(r / (1.0 + k)));
+    let q_v = q_w.sub(nc.scale(r));
+    Some(MixedStar {
+        radius: r,
+        cap: cap_a.id,
+        wall_a: wall_a.id,
+        wall_b: wall_b.id,
+        q: *q,
+        a: *r0,
+        b: *r1,
+        v_a: q_v.sub(na.scale(r)),
+        v_b: q_v.sub(nb.scale(r)),
+        w_a: q_w.sub(na.scale(2.0 * r)),
+        w_b: q_w.sub(nb.scale(2.0 * r)),
+        q_v,
+        q_w,
+        axis: nc.scale(-1.0),
+        c_a: q_v.sub(na.scale(2.0 * r)),
+        c_b: q_v.sub(nb.scale(2.0 * r)),
+    })
 }
 
 /// The overshoot ladder for the marches, as fractions of the edge span.  A
@@ -414,6 +569,70 @@ pub(crate) fn mixed_convexity_corners(
     }
     found
 }
+
+/// The inside-corner refusal's name: two selected concave edges over an
+/// unselected concave sharp edge.
+pub(crate) const REENTRANT_CONCAVE_WHAT: &str = "reentrant_concave";
+
+/// Whether `refusal` is the inside-corner classification above.
+pub(crate) fn is_reentrant_concave(refusal: &KernelRefusal) -> bool {
+    matches!(&refusal.class, RefusalClass::UnsupportedGeometry { what } if what == REENTRANT_CONCAVE_WHAT)
+}
+
+/// `BREP_BLEND_CONCAVE_MITER`: send an inside corner (two selected concave
+/// edges over a concave sharp edge) down the two-edge miter lane instead of
+/// refusing it by name. `=0`/`off` is the escape hatch. Promoted 2026-10-15
+/// (lane L's census with it on: the 96 cases OK, integration and lib green
+/// but for three refusal pins whose refusal moves one corner further, to the
+/// one-ended concave-third end).
+const CONCAVE_MITER_DEFAULT: bool = true;
+
+thread_local! {
+    static CONCAVE_MITER_FOR_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+pub(crate) fn concave_miter_on() -> bool {
+    if let Some(forced) = CONCAVE_MITER_FOR_TEST.with(|forced| forced.get()) {
+        return forced;
+    }
+    match std::env::var("BREP_BLEND_CONCAVE_MITER").as_deref() {
+        Ok("0") | Ok("off") => false,
+        Ok("1") | Ok("on") => true,
+        _ => CONCAVE_MITER_DEFAULT,
+    }
+}
+
+
+// BREP named hunk: begin lcount234_creased_seam_join_20261016
+/// `BREP_BLEND_CREASED_SEAM`: close a smooth vertex whose two side faces CREASE
+/// along their seam down the two-edge miter lane, with the seam as its sharp
+/// edge, instead of refusing it as "not a flush join". The two balls then meet
+/// the seam at different points when the seam's faces turn their normals out of
+/// the shared face's normal plane, and the closure is the miter's asymmetric
+/// one (`solve_miter`): the seam leaves the shallower blend through its side
+/// rail at P, and a connector on that blend's side face runs to S on the seam.
+/// `=0`/`off` is the escape hatch. Promoted 2026-10-17 (no case reaches a
+/// creased BUILD yet, lCount_234 reaches the lane at five vertices and is
+/// declined by the corner ball's carrier-extension guard, the same final
+/// refusal either way).
+const CREASED_SEAM_DEFAULT: bool = true;
+
+thread_local! {
+    static CREASED_SEAM_FOR_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+pub(crate) fn creased_seam_on() -> bool {
+    if let Some(forced) = CREASED_SEAM_FOR_TEST.with(|forced| forced.get()) {
+        return forced;
+    }
+    match std::env::var("BREP_BLEND_CREASED_SEAM").as_deref() {
+        Ok("0") | Ok("off") => false,
+        Ok("1") | Ok("on") => true,
+        _ => CREASED_SEAM_DEFAULT,
+    }
+}
+
+// BREP named hunk: end lcount234_creased_seam_join_20261016
 
 /// Whether each selected edge is CONVEX (its ball inside the material), in
 /// selection order; `None` when the selection's mates cannot be read.
@@ -654,6 +873,9 @@ fn blend_star_network_building(
         .fold(0.0f64, |worst, vertex| worst.max(vertex.point.length()))
         .max(1.0);
     let mut corners: Vec<(u64, Vec<usize>, VertexKind)> = Vec::new();
+    // The smooth vertices whose side faces crease along their seam, closed
+    // down the miter lane (`creased_seam_on`).
+    let mut creased_vertices: Vec<u64> = Vec::new();
     let mut vertex_radii: Vec<(u64, f64)> = Vec::new();
     for (vertex_id, stripe_indices) in &vertex_stripes {
         if stripe_indices.len() < 2 {
@@ -665,6 +887,23 @@ fn blend_star_network_building(
             .find(|vertex| vertex.id == *vertex_id)
             .ok_or_else(|| format!("blend network: vertex {vertex_id} missing")).or_refuse(KernelStage::Refine, "ok_or_else")?
             .point;
+        // Lane L: a mixed star (one concave + two convex stripes at an
+        // orthogonal planar corner) is its own kind, read before the faces'
+        // sides are compared (they disagree there by construction).
+        if !chamfer && stripe_indices.len() == 3 && mixed_star_on() {
+            let ends: Vec<f64> = stripe_indices
+                .iter()
+                .map(|&index| laws[index].end(mates[index].0.start_vertex_id == *vertex_id))
+                .collect();
+            let constant = stripe_indices.iter().all(|&index| laws[index].constant().is_some());
+            if constant && ends.iter().all(|end| (end - ends[0]).abs() <= 1e-12 * (1.0 + ends[0])) {
+                if let Some(mixed) = detect_mixed_star(&mates, stripe_indices, point, ends[0]) {
+                    vertex_radii.push((*vertex_id, ends[0]));
+                    corners.push((*vertex_id, stripe_indices.clone(), VertexKind::MixedStar(mixed)));
+                    continue;
+                }
+            }
+        }
         // The faces around the corner are the mates of the stripes that end
         // there, with the signed offset each stripe was marched at.
         let mut faces: Vec<(&FaceRecord, f64, usize)> = Vec::new();
@@ -746,6 +985,7 @@ fn blend_star_network_building(
         // two stripes must share exactly one face with one sharp edge
         // between the other two.
         let mut miter: Option<(&FaceRecord, &EdgeRecord)> = None;
+        let mut creased = false;
         if !is_star {
             let [a, b] = [stripe_indices[0], stripe_indices[1]];
             let tangent_a = tangent_away_from(mates[a].0, *vertex_id)?;
@@ -760,9 +1000,47 @@ fn blend_star_network_building(
                          a flush join at a varying radius is not in this lane"
                     )));
                 }
-                let join = flush_join(solid, &mates[a], &mates[b], *vertex_id, point, scale)?;
-                corners.push((*vertex_id, stripe_indices.clone(), VertexKind::Flush { join }));
-                continue;
+                match flush_join(solid, &mates[a], &mates[b], *vertex_id, point, scale) {
+                    Ok(join) => {
+                        if std::env::var("BREP_DEBUG_NETWORK").is_ok() {
+                            match &join {
+                                Some(join) => eprintln!(
+                                    "flush join at vertex {vertex_id} (edges {} and {}): ball centre ({:.6}, {:.6}, {:.6}); contacts {}",
+                                    mates[a].0.id,
+                                    mates[b].0.id,
+                                    join.center.x,
+                                    join.center.y,
+                                    join.center.z,
+                                    join.contacts
+                                        .iter()
+                                        .map(|contact| format!(
+                                            "faces {:?} at ({:.6}, {:.6}, {:.6}) seam {:?}",
+                                            contact.faces, contact.point.x, contact.point.y, contact.point.z, contact.seam
+                                        ))
+                                        .collect::<Vec<_>>()
+                                        .join("; ")
+                                ),
+                                None => eprintln!("flush join at vertex {vertex_id} (edges {} and {}): the vertex section (same two faces)", mates[a].0.id, mates[b].0.id),
+                            }
+                        }
+                        corners.push((*vertex_id, stripe_indices.clone(), VertexKind::Flush { join }));
+                        continue;
+                    }
+                    // A creased seam (the side faces tangent only at the
+                    // vertex) goes down the miter lane, its seam the sharp
+                    // edge.
+                    Err(refusal)
+                        if creased_seam_on()
+                            && matches!(&refusal.class, crate::RefusalClass::UnsupportedGeometry { what } if what == "flush_join") =>
+                    {
+                        if std::env::var("BREP_DEBUG_NETWORK").is_ok() {
+                            eprintln!("creased seam at vertex {vertex_id}: {refusal}; trying the miter lane");
+                        }
+                        creased = true;
+                        creased_vertices.push(*vertex_id);
+                    }
+                    Err(refusal) => return Err(refusal),
+                }
             }
             if faces.len() != 3 {
                 return Err(KernelRefusal::unsupported(KernelStage::Classify, "corner_face_count", format!(
@@ -843,10 +1121,22 @@ fn blend_star_network_building(
                 ));
                 continue;
             }
-            if !sharp_convex {
-                return Err(KernelRefusal::unsupported(KernelStage::Classify, "reentrant_concave", format!(
-                    "blend network: vertex {vertex_id} is re-entrant with concave selected \
-                     edges — the mirror of the horn-torus closure is not in this lane"
+            if !sharp_convex && !concave_miter_on() {
+                // An INSIDE corner: every edge at the vertex is concave and
+                // two are selected.  This is not the horn torus's mirror (the
+                // horn's mirror is two concave stripes over a CONVEX sharp
+                // edge, built above): a ball in the air here is seated by all
+                // three faces at once and cannot wrap the sharp edge without
+                // entering a wall, so the two pads meet in a SEAM from their
+                // floor rails' crossing up to the sharp edge — the mirror of
+                // the convex two-edge miter.  `BREP_BLEND_CONCAVE_MITER=1`
+                // sends it down that miter lane; off, refused by name.
+                return Err(KernelRefusal::unsupported(KernelStage::Classify, REENTRANT_CONCAVE_WHAT, format!(
+                    "blend network: vertex {vertex_id} at ({:.3}, {:.3}, {:.3}) is an inside corner: the selected \
+                     concave edges {} and {} meet the unselected concave edge {}; the ball in the air is seated by \
+                     all three faces and cannot wrap that edge, so the closure is the two pads' seam up to it (the \
+                     mirror of the convex two-edge miter, not of the horn torus), which this lane does not build",
+                    point.x, point.y, point.z, mates[a].0.id, mates[b].0.id, sharp.id
                 )));
             }
             miter = Some((shared, sharp));
@@ -858,8 +1148,17 @@ fn blend_star_network_building(
                 .find(|(face, _, _)| face.id == id)
                 .map(|(_, rho, _)| *rho)
         };
-        let prepared = corner_faces(&face_refs, &rho_of, point)?;
+        // A creased seam's side faces are tangent AT the vertex, where the
+        // corner-ball Newton is singular, so it is seeded a radius up the seam.
+        let seed = match (creased, miter) {
+            (true, Some((_, sharp))) => point.add(tangent_away_from(sharp, *vertex_id)?.scale(corner_radius)),
+            _ => point,
+        };
+        let prepared = corner_faces(&face_refs, &rho_of, seed)?;
         let ball = solve_corner_ball(&prepared, scale)?;
+        if creased && std::env::var("BREP_DEBUG_NETWORK").is_ok() {
+            eprintln!("creased seam corner ball at vertex {vertex_id}: centre {:?} residual {:.3e} contacts {:?}", ball.center, ball.residual, ball.contacts.iter().map(|c| (c.face_id, c.point)).collect::<Vec<_>>());
+        }
         // The residual IS the common-ball test: N = 3 always has a root, and
         // beyond that a non-zero residual means the fillet cylinders have no
         // single inscribed sphere and the notch needs an N-sided fill.
@@ -1125,6 +1424,7 @@ fn blend_star_network_building(
             if let Some((_, _, VertexKind::Flush { join: Some(join) })) =
                 corners.iter().find(|(id, _, _)| *id == vertex)
             {
+                let before = ends[slot];
                 ends[slot] = section_parameter_through(edge, join.center, ends[slot], scale)
                     .map_err(|error| {
                         format!(
@@ -1133,6 +1433,12 @@ fn blend_star_network_building(
                             edge.id
                         )
                     }).or_refuse(KernelStage::Refine, "map_err")?;
+                if std::env::var("BREP_DEBUG_NETWORK").is_ok() {
+                    eprintln!(
+                        "flush join at vertex {vertex}: edge {}'s end moves from t={before:.6} to the seam ball's section t={:.6} (edge t in [{:.6}, {:.6}]); ball centre {:?}",
+                        edge.id, ends[slot], edge.t0, edge.t1, join.center
+                    );
+                }
             }
         }
         let law = &laws[index];
@@ -1245,7 +1551,22 @@ fn blend_star_network_building(
         // rungs added here are read off the corner ball already seated
         // (`concave_corner_reach`); nothing changes for a stripe the shared
         // rungs settle, because the climb stops at the first rung that does.
-        let ladder = concave_corner_ladder(edge, &corners);
+        // A FLUSH JOIN across a seam places its stop where the stripe's side
+        // contact crosses the seam (`ends`, the section through the seam
+        // ball), and that can sit well past the vertex: on the 2026-10-17
+        // shell report the torus|column stripe's contact crosses the pad's
+        // rail 0.94 of the stripe's own span beyond its vertex, so no shared
+        // rung carried the rows to the stop and the join refused "outside
+        // the marched rows" on every rung. The reach a flush end asks for is
+        // read off `ends` exactly as a concave corner's is read off its ball.
+        let flush_reach = {
+            let span = (edge.t1 - edge.t0).abs();
+            [(edge.t0 - ends[0]) / span, (ends[1] - edge.t1) / span]
+                .into_iter()
+                .filter(|reach| reach.is_finite())
+                .fold(0.0f64, f64::max)
+        };
+        let ladder = concave_corner_ladder(edge, &corners, flush_reach);
         // The rung's MEASUREMENT, as the open edge's (C3): rails positive and
         // finite inside the rail bar on samples of both rails, and -- a FILLET
         // only (the network's one scalar radius is constant by construction;
@@ -1337,6 +1658,49 @@ fn blend_star_network_building(
                 Ok((stations, vertex_indices, refinement, dense)) => {
                     let mut stations = stations;
                     let mut parameters = station_parameters(&stations);
+                    // A boundary station (`StationRefinement::boundary_inserted`)
+                    // whose chord parameter does not increase on a neighbour's
+                    // is one the rows fit would refuse ("parameters must be
+                    // strictly increasing"): on the F6 ring of the 2026-10-17
+                    // report a crossing 1e-14..1e-8 of a spacing from a flush
+                    // join's station got plain stations that solved to the
+                    // join's own contacts. Exactly those stations are dropped
+                    // — the fit's own test, on the fit's own parameters — and
+                    // a dropped crossing leaves its break at the neighbour it
+                    // coincides with. Nothing else moves (F7 keeps every one
+                    // of its 24 crossings).
+                    let mut vertex_indices = vertex_indices;
+                    let mut boundary_breaks: Vec<usize> = refinement.boundary_breaks.iter().flatten().copied().collect();
+                    for &inserted in refinement.boundary_inserted[..refinement.boundary_inserted_count].iter().rev() {
+                        if inserted == 0 || inserted + 1 >= stations.len() {
+                            continue;
+                        }
+                        let with_previous = parameters[inserted] <= parameters[inserted - 1];
+                        let with_next = parameters[inserted + 1] <= parameters[inserted];
+                        if !(with_previous || with_next) {
+                            continue;
+                        }
+                        stations.remove(inserted);
+                        parameters = station_parameters(&stations);
+                        for vertex in vertex_indices.iter_mut() {
+                            if *vertex > inserted {
+                                *vertex -= 1;
+                            }
+                        }
+                        for break_index in boundary_breaks.iter_mut() {
+                            if *break_index > inserted {
+                                *break_index -= 1;
+                            } else if *break_index == inserted {
+                                *break_index = if with_previous { inserted - 1 } else { inserted };
+                            }
+                        }
+                        super::record_count("count.march.boundary_stations_coincident", 1);
+                        if std::env::var("BREP_DEBUG_NETWORK").is_ok() {
+                            eprintln!("open march: edge {}'s boundary station {inserted} coincides with its neighbour in the rows' chord parameter; dropped", edge.id);
+                        }
+                    }
+                    boundary_breaks.sort_unstable();
+                    boundary_breaks.dedup();
                     let fit_timing = super::BlendTimer::start("timing.rows_fit_ms");
                     let fitted = if let Some(axis) = revolution {
                         match exact_revolution_rows(&stations, vertex_indices, chamfer, axis, wall_radius.unwrap_or(radius), first, second) {
@@ -1358,7 +1722,12 @@ fn blend_star_network_building(
                             }
                         }
                     } else {
-                        fit_open_rows(&stations, &parameters, chamfer, Some(vertex_indices), extrusion)
+                        fit_open_rows_breaking_at(&stations, &parameters, chamfer, Some(vertex_indices), extrusion, &boundary_breaks).and_then(|rows| {
+                            // The fitted wall itself must not double back
+                            // along a row (`fold::check_rows_loop`).
+                            super::fold::check_rows_loop(&rows, &stations, &parameters, Some(vertex_indices), radius, vec![first.face.id, second.face.id], scale)?;
+                            Ok(rows)
+                        })
                     };
                     let at_vertices = vertex_stations(&parameters, vertex_indices);
                     let fit_ms = fit_timing.stop();
@@ -1428,6 +1797,18 @@ fn blend_star_network_building(
                                 })
                             });
                             let settled = settled_ends.iter().all(|reached| *reached);
+                            if std::env::var("BREP_DEBUG_NETWORK").is_ok() {
+                                eprintln!(
+                                    "rung: edge {} overshoot {overshoot:.3} stations {} ends [{:.6}, {:.6}] marched t [{:.6}, {:.6}] vertex stations {:?} settled {settled_ends:?}",
+                                    edge.id,
+                                    parameters.len(),
+                                    ends[0],
+                                    ends[1],
+                                    edge.t0 - overshoot * (edge.t1 - edge.t0),
+                                    edge.t1 + overshoot * (edge.t1 - edge.t0),
+                                    vertex_indices,
+                                );
+                            }
                             let bounded_reached = (0..2)
                                 .all(|slot| !bounded_ends[slot] || settled_ends[slot]);
                             if (chosen.is_none() || settled) && bounded_reached
@@ -1438,6 +1819,10 @@ fn blend_star_network_building(
                                 break;
                             }
                         }
+                        // A fold of the rows is terminal, as the march's own
+                        // fold verdict is on the open lane: the ladder's next
+                        // rung fits the same looping wall.
+                        Err(error) if super::fold::is_wall_fold(&error) => return Err(error),
                         Err(error) => last_error = Some(error),
                     }
                 }
@@ -1999,13 +2384,15 @@ fn blend_star_network_building(
         converted_rows.push((r_index, hood));
         super::record_count("count.crossed_rails_converted", 1);
     }
+    // BREP_PROFILE split of the end plans, one measure per corner kind's loop.
+    let stars_miters_timing = super::BlendTimer::start("timing.end_plans.stars_miters_ms");
     for (vertex_id, stripe_indices, kind) in &corners {
         if handled_corners.contains(vertex_id) {
             continue;
         }
         match kind {
             // Planned below, once every star and miter is in.
-            VertexKind::Reentrant { .. } | VertexKind::Flush { .. } => continue,
+            VertexKind::Reentrant { .. } | VertexKind::Flush { .. } | VertexKind::MixedStar(_) => continue,
             VertexKind::Star { corner } => {
                 let radius = corner.radius;
                 let mut arcs: Vec<EdgeRecord> = Vec::with_capacity(stripe_indices.len());
@@ -2277,17 +2664,60 @@ fn blend_star_network_building(
                         radius: stripe.end_radius[usize::from(!at_start)],
                     })
                 };
-                let described = [describe(ia)?, describe(ib)?];
+                let mut described = [describe(ia)?, describe(ib)?];
                 let fit_tolerance = crate::KernelTolerances::for_solid(solid, 1e-7).intersection_fit;
-                let closure = solve_miter(
-                    [&described[0], &described[1]],
-                    radius,
-                    chamfer,
-                    sharp,
-                    scale,
-                    fit_tolerance,
-                    consumed_band(solid),
-                )?;
+                // At a creased seam whose two side rails reach the seam at
+                // DIFFERENT points the closure must be the asymmetric one,
+                // and their separation is second order in the crease (1.5e-4
+                // on the tilted fixture at r = 1), far inside the miter's
+                // 1e-6 symmetric bar: read at that bar, the follower's rail
+                // was pulled onto the leader's seam point (P = S) and the
+                // body read 1.1e-4 off its oracle.  Where the rails reach the
+                // seam at one point (a seam in the shared face's normal plane:
+                // P = S exactly) nothing changes.
+                let creased_bar = if creased_vertices.contains(vertex_id) {
+                    let rail_on_seam = |index: usize| -> Result<Vec3, KernelRefusal> {
+                        let stripe = &stripes[index];
+                        let side_row = if stripe.first.face.id == shared.id { &stripe.rows.cs } else { &stripe.rows.cr };
+                        Ok(support_crossing(solid, side_row, sharp, stripe.at_start(*vertex_id))?.2)
+                    };
+                    let apart = rail_on_seam(ia)?.sub(rail_on_seam(ib)?).length();
+                    if std::env::var("BREP_DEBUG_NETWORK").is_ok() {
+                        eprintln!("creased seam at vertex {vertex_id}: the side rails reach the seam {apart:.3e} apart");
+                    }
+                    (apart > 1e-9 * (1.0 + scale)).then(|| 1e-10 * (1.0 + radius))
+                } else {
+                    None
+                };
+                let _miter_timing = super::BlendTimer::start("timing.end_plans.miter_ms");
+                let solve = |described: &[MiterStripe; 2]| {
+                    solve_miter(
+                        [&described[0], &described[1]],
+                        radius,
+                        chamfer,
+                        sharp,
+                        scale,
+                        fit_tolerance,
+                        consumed_band(solid),
+                        creased_bar,
+                    )
+                };
+                // A seam that FOLDS in the leader's sections where it meets
+                // the follower's far rail (`miter_seam_fold`) is marched on
+                // the follower's domain instead, where that rail is the
+                // leader's own and its crossing is transversal.
+                let closure = match solve(&described) {
+                    Err(refusal) if super::miter::is_miter_seam_fold(&refusal) => {
+                        if std::env::var("BREP_DEBUG_NETWORK").is_ok() {
+                            eprintln!("miter at vertex {vertex_id}: {refusal}; marching the seam on the other stripe");
+                        }
+                        super::record_count("count.miter.fold_swapped", 1);
+                        std::mem::swap(&mut ia, &mut ib);
+                        described = [describe(ia)?, describe(ib)?];
+                        solve(&described)?
+                    }
+                    other => other?,
+                };
                 if std::env::var("BREP_DEBUG_NETWORK").is_ok() {
                     let seam = match &closure {
                         MiterClosure::Symmetric { seam, .. } => seam,
@@ -2457,7 +2887,33 @@ fn blend_star_network_building(
                         };
                         let exit_point = *seam.points.last().ok_or(KernelRefusal::internal(KernelStage::Refine, "miter_seam", "miter: empty seam"))?;
                         let x_vertex = commit_vertex(&mut result, &mut take_id, exit_point);
-                        let q_point = sharp.curve.evaluate(sharp_parameter).or_refuse(KernelStage::Refine, "evaluate")?;
+                        // At a creased seam S is where the FOLLOWER's own ball
+                        // touches the seam: seated exactly (the flush join's
+                        // seam ball on the follower's carriers) rather than
+                        // read off the connector's marched end, which carries
+                        // the follower rail's fit (1.6e-9 on the tilted
+                        // fixture at r = 1).
+                        let (sharp_parameter, q_point) = if creased_bar.is_some() {
+                            let follower = &stripes[follower_index];
+                            let (on_shared, on_side) = if follower.first.face.id == shared.id {
+                                (&follower.first, &follower.second)
+                            } else {
+                                (&follower.second, &follower.first)
+                            };
+                            let ball = solve_flush_seam_ball(
+                                on_shared.face,
+                                on_shared.rho,
+                                on_side.face,
+                                on_side.rho,
+                                sharp,
+                                *vertex_id,
+                                vertex_point_of(solid, *vertex_id)?,
+                                scale,
+                            )?;
+                            (ball.seam_parameter, ball.seam_point)
+                        } else {
+                            (sharp_parameter, sharp.curve.evaluate(sharp_parameter).or_refuse(KernelStage::Refine, "evaluate")?)
+                        };
                         let q_vertex = commit_on_sharp(&mut result, &mut take_id, q_point);
                         let seam_id = commit_curve(
                             &mut result,
@@ -2528,6 +2984,8 @@ fn blend_star_network_building(
         name: Option<String>,
     }
     let mut pending_horns: Vec<PendingHorn> = Vec::new();
+    stars_miters_timing.stop();
+    let reentrant_timing = super::BlendTimer::start("timing.end_plans.reentrant_ms");
     for (vertex_id, stripe_indices, kind) in &corners {
         let radius = vertex_radius_of(*vertex_id).unwrap_or(radius);
         let VertexKind::Reentrant { cap, sharp } = kind else {
@@ -2705,6 +3163,109 @@ fn blend_star_network_building(
         });
     }
 
+    // Lane L, mixed stars: each convex stripe stops at its section through
+    // its wall's tangency point V (where Q's rail on that wall meets its
+    // own), Q stops at its inner-equator section V_A..V_B; the cap's contact
+    // arc W_A..W_B and the torus sector are sewn after the stripes.
+    struct PendingMixedStar {
+        vertex: u64,
+        mixed: MixedStar,
+        /// The three end-section arcs: rim A, rim B, Q.
+        arcs: [EdgeRecord; 3],
+        v_a: u64,
+        v_b: u64,
+        w_a: u64,
+        w_b: u64,
+        name: Option<String>,
+    }
+    let mut pending_mixed: Vec<PendingMixedStar> = Vec::new();
+    reentrant_timing.stop();
+    let mixed_star_timing = super::BlendTimer::start("timing.end_plans.mixed_star_ms");
+    for (vertex_id, stripe_indices, kind) in &corners {
+        let VertexKind::MixedStar(mixed) = kind else {
+            continue;
+        };
+        let mut new_vertex = |point: Vec3, result: &mut BrepSolid| {
+            let id = take_id();
+            result.vertices.push(VertexRecord { id, point });
+            id
+        };
+        let v_a = new_vertex(mixed.v_a, &mut result);
+        let v_b = new_vertex(mixed.v_b, &mut result);
+        let w_a = new_vertex(mixed.w_a, &mut result);
+        let w_b = new_vertex(mixed.w_b, &mut result);
+        // (stripe, [(face, point, vertex); 2], ball centre at the stop)
+        let plans = [
+            (mixed.a, [(mixed.wall_a, mixed.v_a, v_a), (mixed.cap, mixed.w_a, w_a)], mixed.c_a),
+            (mixed.b, [(mixed.wall_b, mixed.v_b, v_b), (mixed.cap, mixed.w_b, w_b)], mixed.c_b),
+            (mixed.q, [(mixed.wall_a, mixed.v_a, v_a), (mixed.wall_b, mixed.v_b, v_b)], mixed.q_v),
+        ];
+        let mut arcs: Vec<EdgeRecord> = Vec::with_capacity(3);
+        for (index, contacts, center) in plans {
+            let stripe = &stripes[index];
+            let at_start = stripe.at_start(*vertex_id);
+            let station_0 = station_on(stripe, contacts[0].0, contacts[0].1)?;
+            let station_1 = station_on(stripe, contacts[1].0, contacts[1].1)?;
+            if (station_0 - station_1).abs() > 1e-3 {
+                return Err(KernelRefusal::internal(KernelStage::Refine, "mixed_star_stations", format!(
+                    "blend network: edge {} meets the mixed star at vertex {vertex_id} at inconsistent \
+                     stations ({station_0:.6} and {station_1:.6})",
+                    stripe.edge.id
+                )));
+            }
+            let station = 0.5 * (station_0 + station_1);
+            let on = |face_id: u64| contacts.iter().find(|(face, _, _)| *face == face_id).copied();
+            let (_, first_point, first_vertex) = on(stripe.first.face.id).ok_or(KernelRefusal::internal(
+                KernelStage::Refine, "mixed_star_face", "blend network: a mixed star stripe misses its face"))?;
+            let (_, second_point, second_vertex) = on(stripe.second.face.id).ok_or(KernelRefusal::internal(
+                KernelStage::Refine, "mixed_star_face", "blend network: a mixed star stripe misses its face"))?;
+            let walk_first_to_second = stripe.walk_first_to_second(at_start);
+            let (from, to, from_vertex, to_vertex) = if walk_first_to_second {
+                (first_point, second_point, first_vertex, second_vertex)
+            } else {
+                (second_point, first_point, second_vertex, first_vertex)
+            };
+            let arc = corner_section_arc(center, mixed.radius, from, to)?;
+            let arc_domain = arc.domain().or_refuse(KernelStage::Refine, "domain")?;
+            let record = EdgeRecord {
+                id: take_id(),
+                curve: arc,
+                t0: arc_domain[0],
+                t1: arc_domain[1],
+                start_vertex_id: from_vertex,
+                end_vertex_id: to_vertex,
+                degenerate: false,
+                name: None,
+            };
+            result.edges.push(record.clone());
+            let arc_blend_pcurve = if walk_first_to_second {
+                crate::sweep_topology::parameter_line(station, 0.0, station, 1.0).or_refuse(KernelStage::Refine, "parameter_line")?
+            } else {
+                crate::sweep_topology::parameter_line(station, 1.0, station, 0.0).or_refuse(KernelStage::Refine, "parameter_line")?
+            };
+            end_plans[index][usize::from(!at_start)] = Some(EndPlan::Corner(CornerEnd {
+                cr_parameter: station,
+                cs_parameter: station,
+                first_vertex,
+                second_vertex,
+                arc_edge_id: record.id,
+                arc_blend_pcurve,
+            }));
+            arcs.push(record);
+        }
+        let arcs: [EdgeRecord; 3] = arcs.try_into().map_err(|_| KernelRefusal::internal(KernelStage::Refine, "mixed_star_arcs", "blend network: a mixed star needs three arcs"))?;
+        pending_mixed.push(PendingMixedStar {
+            vertex: *vertex_id,
+            mixed: *mixed,
+            arcs,
+            v_a,
+            v_b,
+            w_a,
+            w_b,
+            name: corner_name(stripe_indices),
+        });
+    }
+
     // Flush joins: both stripes stop at their own vertex section, which is
     // the same ball on both sides, and share one arc.
     struct PendingFlush {
@@ -2714,6 +3275,8 @@ fn blend_star_network_building(
         seam_trims: Vec<(u64, f64, u64)>,
     }
     let mut pending_flush: Vec<PendingFlush> = Vec::new();
+    mixed_star_timing.stop();
+    let flush_timing = super::BlendTimer::start("timing.end_plans.flush_ms");
     for (vertex_id, stripe_indices, kind) in &corners {
         let radius = vertex_radius_of(*vertex_id).unwrap_or(radius);
         let VertexKind::Flush { join } = kind else {
@@ -2957,6 +3520,8 @@ fn blend_star_network_building(
 
     let mut pending_caps: Vec<PendingCap> = Vec::new();
 
+    flush_timing.stop();
+    let free_ends_timing = super::BlendTimer::start("timing.end_plans.free_ends_ms");
     // ---- 6. Free ends keep the §6.9 transverse construction — or, where
     //         the edge runs smoothly into an unselected one, a CAP. ----
     for (index, stripe) in stripes.iter().enumerate() {
@@ -3019,6 +3584,7 @@ fn blend_star_network_building(
                                 RefusalClass::UnsupportedGeometry { what }
                                     if what == "support_crossing_uv_outside"
                                         || what == "support_crossing_uv_none"
+                                        || what == super::edge::END_TANGENT_CONTINUATION_WHAT
                             );
                             (tangent || (missing_crossing && alignment <= -(1.0 - 1e-4)))
                                 .then_some((boundary, tangent))
@@ -3060,6 +3626,7 @@ fn blend_star_network_building(
         }
     }
 
+    free_ends_timing.stop();
     end_plans_timing.stop();
     // ---- 7. Sew: every stripe, then the corner patches and the miter
     //         trims, then one prune. ----
@@ -3660,6 +4227,9 @@ fn blend_star_network_building(
             .position(|shell| !shell.faces.is_empty())
             .ok_or(KernelRefusal::internal(KernelStage::Sew, "shell", "blend network: the solid has no shell to sew the horn torus into"))?;
         result.shells[shell_index].faces.push(face);
+    }
+    for pending in pending_mixed {
+        sew_mixed_star(&mut result, solid, &mut take_id, &stripes, &sewn, pending.vertex, &pending.mixed, &pending.arcs, [pending.v_a, pending.v_b, pending.w_a, pending.w_b], pending.name)?;
     }
     for flush in pending_flush {
         for (seam_id, parameter, rim) in flush.seam_trims {
@@ -4507,7 +5077,7 @@ fn concave_corner_reach(
     let (_, _, kind) = corners.iter().find(|(id, _, _)| *id == vertex)?;
     let corner = match kind {
         VertexKind::Star { corner } | VertexKind::RibbonStar { corner } | VertexKind::Miter { corner, .. } => corner,
-        VertexKind::Flush { .. } | VertexKind::Reentrant { .. } => return None,
+        VertexKind::Flush { .. } | VertexKind::Reentrant { .. } | VertexKind::MixedStar(_) => return None,
     };
     if corner.outward {
         return None;
@@ -4531,7 +5101,9 @@ fn concave_corner_reach(
 
 /// The overshoot ladder for one stripe of the network: [`OVERSHOOTS`], and
 /// past its last rung the rungs a concave corner at either end needs
-/// ([`concave_corner_reach`]).  `rail_station` wants the tangency point
+/// ([`concave_corner_reach`]) or a flush join's seam-ball stop needs
+/// (`flush_reach`, the stop's distance past the vertex as a fraction of the
+/// span; zero when no end has one).  `rail_station` wants the tangency point
 /// inside the fitted row by `RIM_MARGIN`, so the needed fraction itself would
 /// land it on the row's rim: the rungs stand a quarter and then a whole of
 /// the need beyond it.  Two rungs, no more — each is a full march, paid again
@@ -4539,12 +5111,16 @@ fn concave_corner_reach(
 fn concave_corner_ladder(
     edge: &EdgeRecord,
     corners: &[(u64, Vec<usize>, VertexKind<'_>)],
+    flush_reach: f64,
 ) -> Vec<f64> {
     let mut ladder = OVERSHOOTS.to_vec();
+    // The overshoot (as a fraction of the edge's span) that carries the rows
+    // past every stop the ends ask for: a concave corner's ball, or a flush
+    // join's seam ball (`flush_reach`, read off the stripe's `ends`).
     let needed = [(edge.start_vertex_id, true), (edge.end_vertex_id, false)]
         .into_iter()
         .filter_map(|(vertex, at_start)| concave_corner_reach(edge, corners, vertex, at_start))
-        .fold(0.0f64, f64::max);
+        .fold(flush_reach.max(0.0), f64::max);
     let top = *OVERSHOOTS.last().unwrap_or(&0.0);
     for factor in [1.25, 2.0] {
         let rung = needed * factor;
@@ -4581,7 +5157,22 @@ fn corner_rails_reach(
         } else {
             return false;
         };
-        rail_station(row, point, bar).is_ok()
+        let station = rail_station(row, point, bar);
+        if std::env::var("BREP_DEBUG_NETWORK").is_ok() {
+            eprintln!(
+                "corner reach: face {face_id} point ({:.6}, {:.6}, {:.6}) -> {}",
+                point.x,
+                point.y,
+                point.z,
+                match &station {
+                    Ok(u) => format!("on the rail at {u:.6}"),
+                    Err(RailMiss::OffRail(distance)) => format!("off the rail by {distance:.3e} (bar {bar:.3e})"),
+                    Err(RailMiss::OffSpan(u)) => format!("off the span at {u:.6}"),
+                    Err(RailMiss::Projection(error)) => format!("projection failed: {error}"),
+                }
+            );
+        }
+        station.is_ok()
     };
     let on = |corner: &Corner, face_id: u64| {
         corner
@@ -4607,7 +5198,183 @@ fn corner_rails_reach(
             }),
         // Their own lanes decide where these stop.
         VertexKind::Reentrant { .. } | VertexKind::Flush { join: None } => true,
+        // Every stripe of a mixed star stops at two closed-form contacts.
+        VertexKind::MixedStar(mixed) => {
+            let contact = |face_id: u64| -> Option<Vec3> {
+                let (a, b) = (first.face.id, second.face.id);
+                let pair = |x: u64, y: u64| (a == x && b == y) || (a == y && b == x);
+                if pair(mixed.wall_a, mixed.cap) {
+                    Some(if face_id == mixed.wall_a { mixed.v_a } else { mixed.w_a })
+                } else if pair(mixed.wall_b, mixed.cap) {
+                    Some(if face_id == mixed.wall_b { mixed.v_b } else { mixed.w_b })
+                } else if pair(mixed.wall_a, mixed.wall_b) {
+                    Some(if face_id == mixed.wall_a { mixed.v_a } else { mixed.v_b })
+                } else {
+                    None
+                }
+            };
+            [first.face.id, second.face.id]
+                .into_iter()
+                .all(|face_id| contact(face_id).is_some_and(|point| reaches(face_id, point)))
+        }
     }
+}
+
+/// Sew a [`VertexKind::MixedStar`]: splice the cap's contact arc W_A..W_B
+/// (2r about Q's axis) between the two rims' cap rails, and the exact torus
+/// sector — rim A's end section revolved about Q's axis to rim B's — bounded
+/// by the two rims' end arcs, Q's inner-equator arc and the cap arc, each
+/// shared edge used opposite to its neighbour.
+#[allow(clippy::too_many_arguments)]
+fn sew_mixed_star(
+    result: &mut BrepSolid,
+    solid: &BrepSolid,
+    take_id: &mut dyn FnMut() -> u64,
+    stripes: &[Stripe],
+    sewn: &[SewnStripe],
+    vertex: u64,
+    mixed: &MixedStar,
+    arcs: &[EdgeRecord; 3],
+    [v_a, v_b, w_a, w_b]: [u64; 4],
+    name: Option<String>,
+) -> Result<(), KernelRefusal> {
+    let r = mixed.radius;
+    let cap_rail = |index: usize| -> Result<u64, KernelRefusal> {
+        if stripes[index].first.face.id == mixed.cap { sewn[index].cr_edge_id } else { sewn[index].cs_edge_id }
+            .ok_or_else(|| KernelRefusal::unsupported(KernelStage::Sew, RAIL_COLLAPSE_WHAT, format!(
+                "{RAIL_COLLAPSE_UNSUPPORTED} a cap rail at the mixed star {vertex} collapsed to a point"
+            )))
+    };
+    let (rail_a, rail_b) = (cap_rail(mixed.a)?, cap_rail(mixed.b)?);
+    let cap_arc = corner_section_arc(mixed.q_w, 2.0 * r, mixed.w_a, mixed.w_b)?;
+    let cap_domain = cap_arc.domain().or_refuse(KernelStage::Refine, "domain")?;
+    let cap_arc_id = take_id();
+    result.edges.push(EdgeRecord {
+        id: cap_arc_id,
+        curve: cap_arc.clone(),
+        t0: cap_domain[0],
+        t1: cap_domain[1],
+        start_vertex_id: w_a,
+        end_vertex_id: w_b,
+        degenerate: false,
+        name: None,
+    });
+    let cap_forward_on_cap = {
+        let cap_face = result
+            .shells
+            .iter_mut()
+            .flat_map(|shell| &mut shell.faces)
+            .find(|face| face.id == mixed.cap)
+            .ok_or(KernelRefusal::internal(KernelStage::Sew, "cap_face", "blend network: the mixed star's cap is missing"))?;
+        // The cap is planar (detected): the arc's exact affine image.
+        let cap_pcurve = crate::pcurve::build_pcurve_on_surface(&cap_face.surface, &cap_arc).or_refuse(KernelStage::Refine, "build_pcurve")?;
+        let mut spliced: Option<bool> = None;
+        for loop_record in &mut cap_face.loops {
+            let count = loop_record.coedges.len();
+            let (Some(at_a), Some(at_b)) = (
+                loop_record.coedges.iter().position(|c| c.edge_id == rail_a),
+                loop_record.coedges.iter().position(|c| c.edge_id == rail_b),
+            ) else {
+                continue;
+            };
+            let (insert_at, forward, pcurve) = if (at_a + 1) % count == at_b {
+                (at_a + 1, true, cap_pcurve.clone())
+            } else if (at_b + 1) % count == at_a {
+                (at_b + 1, false, cap_pcurve.reversed().or_refuse(KernelStage::Refine, "reversed")?)
+            } else {
+                return Err(KernelRefusal::internal(KernelStage::Sew, "mixed_star_cap_rails", "blend network: the mixed star's two cap rails are not adjacent on the cap"));
+            };
+            loop_record.coedges.insert(insert_at, CoedgeRecord { id: take_id(), edge_id: cap_arc_id, forward, pcurve });
+            spliced = Some(forward);
+            break;
+        }
+        spliced.ok_or(KernelRefusal::internal(KernelStage::Sew, "mixed_star_cap_loop", "blend network: no cap loop holds both of the mixed star's cap rails"))?
+    };
+    // The sector: rim A's end section run V_A -> W_A, revolved about Q's
+    // axis through q_v by the angle between the two rims' ball centres.
+    let radial_a = mixed.c_a.sub(mixed.q_v).normalized().or_refuse(KernelStage::Refine, "normalized")?;
+    let radial_b = mixed.c_b.sub(mixed.q_v).normalized().or_refuse(KernelStage::Refine, "normalized")?;
+    let sweep = radial_a.dot(radial_b).clamp(-1.0, 1.0).acos();
+    if sweep < 1e-9 {
+        return Err(KernelRefusal::internal(KernelStage::Refine, "mixed_star_sweep", "blend network: degenerate mixed star sweep"));
+    }
+    let revolve_axis = if radial_a.cross(radial_b).dot(mixed.axis) > 0.0 { mixed.axis } else { mixed.axis.scale(-1.0) };
+    let generatrix = corner_section_arc(mixed.c_a, r, mixed.v_a, mixed.w_a)?;
+    let surface = crate::make_revolution(mixed.q_v, revolve_axis, &generatrix, sweep).or_refuse(KernelStage::Refine, "make_revolution")?;
+    let [u0, u1] = surface.domain_u().or_refuse(KernelStage::Refine, "domain_u")?;
+    let [g0, g1] = generatrix.domain().or_refuse(KernelStage::Refine, "domain")?;
+    let far = surface.evaluate(u1, g1).or_refuse(KernelStage::Refine, "evaluate")?;
+    if far.sub(mixed.w_b).length() > 1e-6 * (1.0 + r) {
+        return Err(KernelRefusal::internal(KernelStage::Refine, "mixed_star_closure", format!(
+            "blend network: the mixed star's torus does not close on W_B ({:.3e} off)",
+            far.sub(mixed.w_b).length()
+        )));
+    }
+    let uv = |id: u64| -> Option<(f64, f64)> {
+        if id == v_a { Some((u0, g0)) } else if id == w_a { Some((u0, g1)) } else if id == v_b { Some((u1, g0)) } else if id == w_b { Some((u1, g1)) } else { None }
+    };
+    // Sides with the senses opposite their neighbours: the blends use their
+    // end arcs forward, the cap uses the cap arc as spliced.
+    let cap_arc_record = result.edges.iter().find(|e| e.id == cap_arc_id).cloned().ok_or(KernelRefusal::internal(KernelStage::Sew, "mixed_star_cap_arc", "blend network: the cap arc vanished"))?;
+    let sides: [(EdgeRecord, bool); 4] = [
+        (arcs[0].clone(), false),
+        (arcs[1].clone(), false),
+        (arcs[2].clone(), false),
+        (cap_arc_record, !cap_forward_on_cap),
+    ];
+    let walk = |edge: &EdgeRecord, forward: bool| if forward { (edge.start_vertex_id, edge.end_vertex_id) } else { (edge.end_vertex_id, edge.start_vertex_id) };
+    let mut order = vec![0usize];
+    let mut cursor = walk(&sides[0].0, sides[0].1).1;
+    for _ in 0..3 {
+        let next = (0..4)
+            .find(|s| !order.contains(s) && walk(&sides[*s].0, sides[*s].1).0 == cursor)
+            .ok_or(KernelRefusal::internal(KernelStage::Sew, "mixed_star_walk", "blend network: the blends and the cap do not walk the mixed star's boundary consistently"))?;
+        cursor = walk(&sides[next].0, sides[next].1).1;
+        order.push(next);
+    }
+    if cursor != walk(&sides[0].0, sides[0].1).0 {
+        return Err(KernelRefusal::internal(KernelStage::Sew, "mixed_star_loop", "blend network: the mixed star's boundary does not close"));
+    }
+    let mut coedges = Vec::with_capacity(4);
+    for s in order {
+        let (edge, forward) = &sides[s];
+        let (start, end) = walk(edge, *forward);
+        let (Some((su, sv)), Some((eu, ev))) = (uv(start), uv(end)) else {
+            return Err(KernelRefusal::internal(KernelStage::Sew, "mixed_star_uv", "blend network: a mixed star side ends off the sector's corners"));
+        };
+        coedges.push(CoedgeRecord {
+            id: take_id(),
+            edge_id: edge.id,
+            forward: *forward,
+            pcurve: crate::sweep_topology::parameter_line(su, sv, eu, ev).or_refuse(KernelStage::Refine, "parameter_line")?,
+        });
+    }
+    // Orient at the tangency with the cap, as the horn torus does.
+    let (um, gm) = (0.5 * (u0 + u1), g1);
+    let contact = surface.evaluate(um, gm).or_refuse(KernelStage::Refine, "evaluate")?;
+    let cap = solid.shells.iter().flat_map(|shell| &shell.faces)
+        .find(|face| face.id == mixed.cap)
+        .ok_or(KernelRefusal::internal(KernelStage::Refine, "cap_face", "blend network: missing mixed star cap"))?;
+    let projection = crate::project_point_to_surface(&cap.surface, contact).or_refuse(KernelStage::Refine, "project")?;
+    let cap_normal = cap.surface.normal(projection.u, projection.v).or_refuse(KernelStage::Refine, "normal")?;
+    let outward = if cap.same_sense { cap_normal } else { cap_normal.scale(-1.0) };
+    let surface_normal = surface.normal(um, gm).or_refuse(KernelStage::Refine, "normal")?;
+    let same_sense = surface_normal.dot(outward) > 0.0;
+    let loop_id = take_id();
+    let face = FaceRecord {
+        id: take_id(),
+        surface,
+        same_sense,
+        loops: vec![crate::topology::LoopRecord { id: loop_id, coedges }],
+        name,
+    };
+    let shell_index = result
+        .shells
+        .iter()
+        .position(|shell| !shell.faces.is_empty())
+        .ok_or(KernelRefusal::internal(KernelStage::Sew, "shell", "blend network: the solid has no shell to sew the mixed star into"))?;
+    result.shells[shell_index].faces.push(face);
+    Ok(())
 }
 
 /// Whether the SHARP edge between `wall_a` and `wall_b` is convex, by the

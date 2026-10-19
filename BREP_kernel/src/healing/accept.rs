@@ -160,7 +160,7 @@ use crate::{solid_self_intersections, SelfIntersectionOptions, SelfIntersectionR
 pub fn accept_sound(solid: BrepSolid, entry: &str) -> Result<BrepSolid, KernelRefusal> {
     let report = scan(&solid, entry)?;
     if !report.is_flagged() {
-        return accept_or_break_out(solid, entry);
+        return accept_or_break_out(solid, entry, &report);
     }
     dump_flagged(&solid, entry);
     if let Some(refusal) = fold_refusal(&report, entry) {
@@ -209,7 +209,7 @@ pub fn accept_sound(solid: BrepSolid, entry: &str) -> Result<BrepSolid, KernelRe
             ),
         ));
     }
-    accept_or_break_out(repaired, entry)
+    accept_or_break_out(repaired, entry, &after)
 }
 
 /// How many hole-containment breaches one acceptance may break out, before it
@@ -248,8 +248,15 @@ const MAX_BREAKOUT_ROUNDS: usize = 4;
 /// declines, and the refusal names each face it tried and the distance it
 /// tried it at. That is measured, not assumed, by
 /// `a_mouth_that_has_left_the_body_reaches_the_migration_route_and_is_refused_by_name`.
-fn accept_or_break_out(solid: BrepSolid, entry: &str) -> Result<BrepSolid, KernelRefusal> {
+fn accept_or_break_out(solid: BrepSolid, entry: &str, report: &SelfIntersectionReport) -> Result<BrepSolid, KernelRefusal> {
     if refuse_holes_leaving_their_faces(&solid, entry).is_ok() {
+        // accept_refuses_undecided_crossing_20261016: contained, and a scan
+        // that ended undecided is still not a clean one. A hole that left its
+        // face is named by the floor below first: that is the more specific
+        // diagnosis, and its breakout re-scans what it builds.
+        if let Some(refusal) = undecided_refusal(report, entry) {
+            return Err(refusal);
+        }
         return Ok(solid);
     }
     break_out_until_contained(solid, entry)
@@ -269,7 +276,7 @@ fn break_out_until_contained(solid: BrepSolid, entry: &str) -> Result<BrepSolid,
     for _ in 0..MAX_BREAKOUT_ROUNDS {
         let Some(breach) = first_hole_breach(&current) else {
             // Contained. It still has to be SOUND to be returned.
-            let report = scan(&current, entry)?;
+            let report = scan_output(&current, entry)?;
             if report.is_flagged() {
                 return Err(KernelRefusal::unsound(
                     KernelStage::Validate,
@@ -315,7 +322,7 @@ pub fn accept_sound_against(
     solid: BrepSolid,
     entry: &str,
 ) -> Result<BrepSolid, KernelRefusal> {
-    let report = scan(&solid, entry)?;
+    let report = scan_output(&solid, entry)?;
     if !report.is_flagged() {
         return Ok(solid);
     }
@@ -369,6 +376,7 @@ pub fn accept_sound_against_scoped(
         edges.iter().flat_map(|edge| [edge.start_vertex_id, edge.end_vertex_id]).collect();
     let subset = BrepSolid {
         mass_properties_cache: Default::default(),
+        cells: Default::default(),
         id: solid.id,
         vertices: solid.vertices.iter().filter(|vertex| vertex_ids.contains(&vertex.id)).cloned().collect(),
         edges,
@@ -379,6 +387,9 @@ pub fn accept_sound_against_scoped(
     // The bands come from the whole result, as the full scan derives them.
     let options = SelfIntersectionOptions::for_solid(&solid);
     let report = scan_with(&subset, options, entry)?;
+    if let Some(refusal) = undecided_refusal(&report, entry) {
+        return Err(refusal);
+    }
     if !report.is_flagged() {
         return Ok(solid);
     }
@@ -390,6 +401,61 @@ pub fn accept_sound_against_scoped(
 fn scan(solid: &BrepSolid, entry: &str) -> Result<SelfIntersectionReport, KernelRefusal> {
     scan_with(solid, SelfIntersectionOptions::for_solid(solid), entry)
 }
+
+// BREP named hunk: begin accept_refuses_undecided_crossing_20261016
+/// Opt-in (`BREP_SOUNDNESS_REFUSE_UNDECIDED=1`), see `resolve::refuse_enabled`.
+/// A RESULT whose scan ends undecided is not a result that scanned clean: the
+/// mesh confirmation could not decide some candidate crossings and the carriers
+/// did not settle them either (`brep/soundness/resolve.rs`). It is refused,
+/// naming the face pairs and why each stayed open. A report that is flagged is
+/// left to the crossing and fold refusals, which say what is wrong.
+fn undecided_refusal(report: &SelfIntersectionReport, entry: &str) -> Option<KernelRefusal> {
+    if !crate::soundness::resolve::enabled() || !crate::soundness::resolve::refuse_enabled() {
+        return None;
+    }
+    undecided_refusal_message(report, entry)
+}
+
+/// The refusal itself, whatever the switch: `None` for a flagged or a clean report.
+fn undecided_refusal_message(report: &SelfIntersectionReport, entry: &str) -> Option<KernelRefusal> {
+    if report.is_flagged() || report.undecided == 0 {
+        return None;
+    }
+    let pairs: Vec<String> = report
+        .undecided_pairs
+        .iter()
+        .map(|pair| {
+            let cause = match pair.cause {
+                crate::CrossingUndecidedCause::Witness => "the mesh crossing's witness is not a point both faces own",
+                crate::CrossingUndecidedCause::Pierce => "a projection or a normal could not be evaluated",
+                crate::CrossingUndecidedCause::MissingFace => "a triangle's face is not in the body",
+            };
+            format!("faces {} and {} near ({:.4}, {:.4}, {:.4}): {cause}", pair.face_a, pair.face_b, pair.point.x, pair.point.y, pair.point.z)
+        })
+        .collect();
+    let more = report.undecided.saturating_sub(pairs.len());
+    Some(KernelRefusal::non_convergence(
+        KernelStage::Validate,
+        "self_intersection_undecided",
+        format!(
+            "{entry}: the soundness scan could not decide {} candidate crossing(s), and the exact carriers \
+             did not settle them either, so the result is not known to be free of self-intersection: {}{}",
+            report.undecided,
+            pairs.join("; "),
+            if more > 0 { format!(" (and {more} more)") } else { String::new() },
+        ),
+    ))
+}
+
+/// [`scan`] for a RESULT about to be returned: an undecided scan refuses.
+fn scan_output(solid: &BrepSolid, entry: &str) -> Result<SelfIntersectionReport, KernelRefusal> {
+    let report = scan(solid, entry)?;
+    match undecided_refusal(&report, entry) {
+        Some(refusal) => Err(refusal),
+        None => Ok(report),
+    }
+}
+// BREP named hunk: end accept_refuses_undecided_crossing_20261016
 
 fn scan_with(
     solid: &BrepSolid,
@@ -3378,6 +3444,7 @@ fn one_face_body(solid: &BrepSolid, face_id: u64) -> Result<BrepSolid, KernelRef
         .collect();
     Ok(BrepSolid {
         mass_properties_cache: Default::default(),
+        cells: Default::default(),
         id: solid.id,
         genus: 0,
         kind: crate::BodyKind::Solid,

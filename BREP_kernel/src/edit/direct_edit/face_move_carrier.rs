@@ -547,7 +547,13 @@ pub(super) fn move_faces_by_carrier(
     if !issues.is_empty() {
         return Err(KernelRefusal::internal(KernelStage::Validate, "validate", format!("{OP}: moved solid failed validation: {issues:?}")));
     }
-    if let (Ok(before), Ok(after)) = (solid_signed_volume(solid), solid_signed_volume(&result)) {
+    // Sign only, through the per-face term memo (`solid_signed_volume_for_sign`:
+    // the verdict against the bar is the exact integral's; a face read about
+    // the same reference before is served its term). 2026-10-17, the
+    // shelled-box report: the exact reads cost 0.26 s a body here.
+    if let (Ok(before), Ok(after)) =
+        (crate::signed_volume_against(solid, 0.0), crate::signed_volume_against(&result, 0.0))
+    {
         if before * after <= 0.0 {
             return Err(KernelRefusal::unsupported(KernelStage::Validate, SOLID_INVERSION, format!(
                 "{OP}: the translation inverts the solid (signed volume changed sign) — refusing"

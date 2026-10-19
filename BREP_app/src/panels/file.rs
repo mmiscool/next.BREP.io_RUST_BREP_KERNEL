@@ -29,7 +29,7 @@
 mod plm_save_as;
 
 use crate::automation::hit_keys::HitKeyDoc;
-use crate::document::{Document, Documents, EMPTY_DOCUMENT};
+use crate::document::{Document, Documents};
 use crate::document_class::{self, DocumentClass};
 use crate::family_table::{self, FamilySource};
 use crate::template::{self, TemplateInput};
@@ -1380,7 +1380,7 @@ impl FileDialog {
                 file_explorer::dialog_footer(ui, "saveas", |ui| {
                     ui.label("File name");
                     let field = ui.add(
-                        egui::TextEdit::singleline(&mut self.name_buf)
+                        egui::TextEdit::singleline(&mut self.name_buf).margin(crate::viewport::touch::text_edit_margin(ui)).min_size(crate::viewport::touch::target_size(ui.ctx(), egui::Vec2::ZERO))
                             .hint_text("model name")
                             .desired_width(f32::INFINITY),
                     );
@@ -1492,12 +1492,14 @@ impl FileDialog {
         let mut fab_chosen: Option<super::fabrication_export::Output> = None;
         let mut cancel = false;
         let modal = egui::Modal::new(egui::Id::new("brep-file-export")).show(ctx, |ui| {
-            ui.set_width(320.0);
+            // Wide enough for the 3D formats on one line; each group wraps
+            // rather than widening the modal (lane U audit item 7).
+            ui.set_width(440.0);
             ui.heading("Export model");
             ui.add_space(4.0);
             Self::preview_export_line(ui, docs);
             let field = ui.add(
-                egui::TextEdit::singleline(&mut self.name_buf)
+                egui::TextEdit::singleline(&mut self.name_buf).margin(crate::viewport::touch::text_edit_margin(ui)).min_size(crate::viewport::touch::target_size(ui.ctx(), egui::Vec2::ZERO))
                     .hint_text("file name")
                     .desired_width(f32::INFINITY),
             );
@@ -1506,8 +1508,15 @@ impl FileDialog {
                 field.request_focus();
                 self.want_focus = false;
             }
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
+            // One headed, wrapping row per kind of output, and Cancel on its
+            // own row below them all — it used to sit among the 3D formats,
+            // with "Sheets + 3D (PDF)" orphaned on a line of its own.
+            let group = |ui: &mut egui::Ui, title: &str| {
+                ui.add_space(6.0);
+                ui.label(egui::RichText::new(title).weak());
+            };
+            group(ui, "3D model");
+            ui.horizontal_wrapped(|ui| {
                 let step = ui.button("STEP (.step)");
                 self.hit("export:step", &step);
                 if step.clicked() {
@@ -1541,14 +1550,9 @@ impl FileDialog {
                 if json.clicked() {
                     chosen = Some("json");
                 }
-                let c = ui.button("Cancel");
-                self.hit("cancel", &c);
-                if c.clicked() {
-                    cancel = true;
-                }
             });
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
+            group(ui, "Bill of materials");
+            ui.horizontal_wrapped(|ui| {
                 // The BOM: one row per parts-library entry with the live
                 // instance count, then one per harness wire with its cut
                 // length. Disabled while the document has neither.
@@ -1562,6 +1566,9 @@ impl FileDialog {
                 if json.clicked() {
                     bom_chosen = Some("json");
                 }
+            });
+            group(ui, "Drawing");
+            ui.horizontal_wrapped(|ui| {
                 // The DRAWING SHEET: the paper as an SVG of lines and text.
                 // Not the sheet-METAL flat pattern, which is its own dialog.
                 let sheet = ui
@@ -1582,8 +1589,6 @@ impl FileDialog {
                 if pdf.clicked() {
                     chosen = Some("sheetpdf");
                 }
-            });
-            ui.horizontal(|ui| {
                 // The same drawing set with the LIVE 3D model: a 3D box over
                 // every placement marked "Live 3D in PDF", and a last page
                 // given over to the model with a button per saved PMI view.
@@ -1597,7 +1602,8 @@ impl FileDialog {
                     chosen = Some("sheetpdf3d");
                 }
             });
-            ui.horizontal(|ui| {
+            group(ui, "Electronics");
+            ui.horizontal_wrapped(|ui| {
                 // The PCB's manufacturing files. The zip is what a board house
                 // takes; the two CSVs are also inside it, and on their own for
                 // an assembler that asks for them separately.
@@ -1626,6 +1632,13 @@ impl FileDialog {
             if !self.status.is_empty() {
                 ui.add_space(4.0);
                 ui.weak(&self.status);
+            }
+            ui.add_space(6.0);
+            ui.separator();
+            let c = ui.button("Cancel");
+            self.hit("cancel", &c);
+            if c.clicked() {
+                cancel = true;
             }
         });
         if let Some(format) = chosen {
@@ -1671,7 +1684,7 @@ impl FileDialog {
             ui.weak("Unfolds the sheet-metal body to a 2D vector file.");
             ui.add_space(4.0);
             let field = ui.add(
-                egui::TextEdit::singleline(&mut self.name_buf)
+                egui::TextEdit::singleline(&mut self.name_buf).margin(crate::viewport::touch::text_edit_margin(ui)).min_size(crate::viewport::touch::target_size(ui.ctx(), egui::Vec2::ZERO))
                     .hint_text("file name")
                     .desired_width(f32::INFINITY),
             );
@@ -2015,7 +2028,7 @@ impl FileDialog {
     // --- model operations -----------------------------------------------------
 
     /// The name to save under: the field if non-empty, else the active
-    /// document's display name, else `"untitled"`.
+    /// document's display name, else its untitled name (`"untitled"`, `"untitled 2"`, …).
     fn effective_name(&self, docs: &Documents) -> String {
         let field = self.name_buf.trim();
         if !field.is_empty() {
@@ -2031,21 +2044,17 @@ impl FileDialog {
     /// name), and never the field's last contents, which belong to whichever
     /// tab last used it.
     fn document_name(docs: &Documents) -> String {
-        docs.active().name().map(model_display_name).unwrap_or_else(|| "untitled".into())
+        docs.active().name().map(model_display_name).unwrap_or_else(|| docs.active().untitled_title())
     }
 
-    /// **New** — an empty model in a NEW TAB. Nothing is replaced, so there is
+    /// **New** — a fresh document in a NEW TAB. Nothing is replaced, so there is
     /// nothing to confirm.
     fn new_document(&mut self, docs: &mut Documents, class: DocumentClass) {
-        let mut engine = docs.spawn_engine();
-        let _ = engine.set_history_json(EMPTY_DOCUMENT);
-        // Before `Document::new`, so the class is part of the clean baseline.
-        document_class::set_document_class(&mut engine, class);
-        docs.open_document(Document::new(engine));
+        docs.open_document(Document::fresh(docs.spawn_engine(), class));
         self.name_buf.clear();
         self.status = match class {
-            DocumentClass::Normal => "new (empty) model".into(),
-            _ => format!("new (empty) {}", class.label().to_ascii_lowercase()),
+            DocumentClass::Normal => "new model".into(),
+            _ => format!("new {}", class.label().to_ascii_lowercase()),
         };
     }
 
@@ -3024,13 +3033,13 @@ impl FileDialog {
             ui.add_space(6.0);
             egui::Grid::new("brep-spin-out-grid").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
                 ui.label("New part name");
-                let field = ui.add(egui::TextEdit::singleline(&mut spin.name).desired_width(240.0));
+                let field = ui.add(egui::TextEdit::singleline(&mut spin.name).margin(crate::viewport::touch::text_edit_margin(ui)).min_size(crate::viewport::touch::target_size(ui.ctx(), egui::Vec2::ZERO)).desired_width(240.0));
                 self.hit("spinout:name", &field);
                 ui.end_row();
                 if spin.plm_template.is_some() {
                     ui.label("Part number");
                     let field = ui.add(
-                        egui::TextEdit::singleline(&mut spin.number)
+                        egui::TextEdit::singleline(&mut spin.number).margin(crate::viewport::touch::text_edit_margin(ui)).min_size(crate::viewport::touch::target_size(ui.ctx(), egui::Vec2::ZERO))
                             .hint_text("empty: the part type numbers it")
                             .desired_width(240.0),
                     );
@@ -3042,7 +3051,7 @@ impl FileDialog {
                     ui.vertical(|ui| {
                         let value = spin.values.entry(input.name.clone()).or_default();
                         if input.choices.is_empty() {
-                            let field = ui.add(egui::TextEdit::singleline(value).desired_width(240.0));
+                            let field = ui.add(egui::TextEdit::singleline(value).margin(crate::viewport::touch::text_edit_margin(ui)).min_size(crate::viewport::touch::target_size(ui.ctx(), egui::Vec2::ZERO)).desired_width(240.0));
                             self.hit(&format!("spinout:input:{}", input.name), &field);
                         } else {
                             ui.horizontal_wrapped(|ui| {
@@ -3640,7 +3649,10 @@ pub fn file_menu(
         let left_width = toolbar_button::menu_width_salted(ui, "workbench-measure", &workbench_rows);
         let right_width = toolbar_button::menu_width(ui, &file_rows);
         let gap = ui.spacing().item_spacing.x;
-        let width = left_width + gap + right_width;
+        let compact = crate::viewport::touch::compact(ui.ctx());
+        let width = if compact { left_width.max(right_width).min((ui.ctx().content_rect().width() - 32.0).max(100.0)) }
+            else { left_width + gap + right_width };
+        let (left_width, right_width) = if compact { (width, width) } else { (left_width, right_width) };
         ui.set_width(width);
         let max_height = ui.ctx().content_rect().height() * 0.8;
         ui.set_max_height(max_height);
@@ -3649,12 +3661,12 @@ pub fn file_menu(
         // window the columns never scroll and only the recent list does, up
         // to the room left under the cap (`cap_bottom`).
         let cap_bottom = ui.max_rect().bottom();
-        egui::ScrollArea::vertical()
+        let body = egui::ScrollArea::vertical()
             .id_salt("file-menu-body")
             .auto_shrink([false, true])
             .max_height(max_height)
             .show(ui, |ui| {
-                ui.horizontal_top(|ui| {
+                let columns = |ui: &mut egui::Ui| {
                     // LEFT: the workbench picker.
                     ui.vertical(|ui| {
                         ui.set_width(left_width);
@@ -3765,7 +3777,8 @@ pub fn file_menu(
                             }
                         }
                     });
-                });
+                };
+                if compact { ui.vertical(columns); } else { ui.horizontal_top(columns); }
 
                 // BELOW BOTH: the recent documents, one column, a thumbnail each. The
                 // list scrolls under the 80% cap; the columns above it never do.
@@ -3817,6 +3830,7 @@ pub fn file_menu(
                         });
                 }
             });
+        if compact { hits.insert("file:clip".into(), body.inner_rect); }
     });
     hits.insert("file:menu".into(), menu.response.rect);
     // Retain the historic menu-opener key for coordinate automation.

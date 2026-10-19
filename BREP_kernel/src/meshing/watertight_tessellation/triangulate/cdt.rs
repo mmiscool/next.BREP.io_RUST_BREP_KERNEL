@@ -1,5 +1,6 @@
 use super::*;
 use super::bridge::point_in_polygon;
+use super::box_index::BoxIndex;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 /// Parameter-space box of a ring, `[u_min, u_max, v_min, v_max]`.
@@ -35,6 +36,7 @@ fn boxes_apart(a: [f64; 4], b: [f64; 4], margin: f64) -> bool {
 pub(in crate::watertight_tessellation) struct HoleBoxes {
     boxes: Vec<[f64; 4]>,
     margin: f64,
+    index: BoxIndex,
 }
 
 impl HoleBoxes {
@@ -44,21 +46,28 @@ impl HoleBoxes {
             .iter()
             .flat_map(|b| b.iter().map(|value| value.abs()))
             .fold(0.0f64, f64::max);
-        Self {
-            boxes,
-            margin: 64.0 * f64::EPSILON * magnitude.max(1e-300),
-        }
+        let margin = 64.0 * f64::EPSILON * magnitude.max(1e-300);
+        let expanded = boxes.iter().map(|b| [b[0] - margin, b[1] + margin, b[2] - margin, b[3] + margin]).collect::<Vec<_>>();
+        Self { boxes, margin, index: BoxIndex::new(&expanded) }
     }
 
     /// `holes.iter().any(|hole| point_in_polygon(hole, p))`, asking only the
     /// rings whose grown box holds `p`.
     pub(in crate::watertight_tessellation) fn any_contains(&self, holes: &[Vec<FaceVertex>], p: [f64; 2]) -> bool {
-        self.boxes.iter().zip(holes).any(|(b, hole)| {
-            p[0] >= b[0] - self.margin
+        self.any_contains_except(holes, p, None)
+    }
+
+    fn any_contains_except(&self, holes: &[Vec<FaceVertex>], p: [f64; 2], except: Option<usize>) -> bool {
+        // Store the original grown-box bounds, rather than growing the query:
+        // p >= min-margin and p+margin >= min can round differently at a rim.
+        self.index.visit([p[0], p[0], p[1], p[1]], 0.0, |i| {
+            let b = self.boxes[i];
+            except != Some(i)
+                && p[0] >= b[0] - self.margin
                 && p[0] <= b[1] + self.margin
                 && p[1] >= b[2] - self.margin
                 && p[1] <= b[3] + self.margin
-                && point_in_polygon(hole, p)
+                && point_in_polygon(&holes[i], p)
         })
     }
 }
@@ -201,14 +210,24 @@ pub(in crate::watertight_tessellation) fn valid_planar_pslg(outer: &[FaceVertex]
     let segment_box = |a: [f64; 2], b: [f64; 2]| -> [f64; 4] {
         [a[0].min(b[0]), a[0].max(b[0]), a[1].min(b[1]), a[1].max(b[1])]
     };
+    let ring_index = BoxIndex::new(&ring_boxes);
     for (ring_a, a) in rings.iter().enumerate() {
+        // The same box predicate used to run once per edge and other ring.
+        // Query it once per ring; keep authored order for rejection diagnostics.
+        let mut nearby = Vec::new();
+        ring_index.visit(ring_boxes[ring_a], margin, |ring_b| {
+            if ring_b >= ring_a { nearby.push(ring_b); }
+            false
+        });
+        nearby.sort_unstable();
         for edge_a in 0..a.len() {
             let (a0, a1) = (a[edge_a].uv, a[(edge_a + 1) % a.len()].uv);
             if a0 == a1 {
                 return false;
             }
             let box_a = segment_box(a0, a1);
-            for (ring_b, b) in rings.iter().enumerate().skip(ring_a) {
+            for &ring_b in &nearby {
+                let b = rings[ring_b];
                 if ring_a != ring_b && boxes_apart(ring_boxes[ring_a], ring_boxes[ring_b], margin) {
                     continue;
                 }
@@ -249,12 +268,25 @@ pub(in crate::watertight_tessellation) fn valid_planar_pslg(outer: &[FaceVertex]
             return false;
         }
     }
-    for a in 0..holes.len() {
-        for b in a + 1..holes.len() {
-            if point_in_polygon(&holes[a], holes[b][0].uv)
-                || point_in_polygon(&holes[b], holes[a][0].uv)
-            {
+    if holes.iter().flatten().flat_map(|v| v.uv).all(|x| x.is_finite() && x.abs() <= f64::MAX / 4.0) {
+        let hole_boxes = HoleBoxes::new(holes);
+        for (i, hole) in holes.iter().enumerate() {
+            if hole_boxes.any_contains_except(holes, hole[0].uv, Some(i)) {
                 return false;
+            }
+        }
+    } else {
+        // An invalid ring can have an odd ray count even outside its box
+        // (e.g. a NaN edge removes only one crossing). Preserve the original
+        // all-pairs answer there; extreme differences must not overflow the
+        // interpolation used by the grown-box containment proof either.
+        for a in 0..holes.len() {
+            for b in a + 1..holes.len() {
+                if point_in_polygon(&holes[a], holes[b][0].uv)
+                    || point_in_polygon(&holes[b], holes[a][0].uv)
+                {
+                    return false;
+                }
             }
         }
     }
@@ -539,7 +571,7 @@ pub(in crate::watertight_tessellation) fn surface_cdt(outer: &[FaceVertex], hole
         ranges.push(s..vertices.len());
     }
     // Reject exact uv-duplicates (a degenerate PSLG spade can't constrain).
-    let mut seen = HashSet::new();
+    let mut seen = FxHashSet::default();
     if vertices
         .iter()
         .any(|p| !seen.insert((p.uv[0].to_bits(), p.uv[1].to_bits())))
@@ -550,6 +582,7 @@ pub(in crate::watertight_tessellation) fn surface_cdt(outer: &[FaceVertex], hole
     let build_timer = stage_timer(Stage::CdtBuild);
     let mut cdt = ConstrainedDelaunayTriangulation::<IndexedPoint>::new();
     let mut handles = Vec::with_capacity(vertices.len());
+    let insert_timer = stage_timer(Stage::CdtInsert);
     for (i, p) in vertices.iter().enumerate() {
         // Metric-scaled uv: Delaunay quality is judged in ~unrolled 3D lengths.
         let h = cdt
@@ -566,8 +599,10 @@ pub(in crate::watertight_tessellation) fn surface_cdt(outer: &[FaceVertex], hole
     if cdt.num_vertices() != vertices.len() {
         return None;
     }
+    drop(insert_timer);
+    let constraint_timer = stage_timer(Stage::CdtConstraint);
     let mut boundary_pairs: HashSet<(usize, usize)> = HashSet::new();
-    let mut directed_boundary: HashSet<(usize, usize)> = HashSet::new();
+    let mut directed_boundary: FxHashSet<(usize, usize)> = FxHashSet::default();
     for range in &ranges {
         for i in range.clone() {
             let n = if i + 1 == range.end { range.start } else { i + 1 };
@@ -593,6 +628,7 @@ pub(in crate::watertight_tessellation) fn surface_cdt(outer: &[FaceVertex], hole
     if actual != boundary_pairs {
         return decline("constraint set mismatch");
     }
+    drop(constraint_timer);
     drop(build_timer);
     let flood_timer = stage_timer(Stage::CdtFlood);
     // Keep only faces inside the outer loop and outside every hole, determined
@@ -603,7 +639,7 @@ pub(in crate::watertight_tessellation) fn surface_cdt(outer: &[FaceVertex], hole
     // the near-collinear edges of an axis-aligned rim/hole on a thin
     // metric-scaled wall and mis-counts (ABC 00000333 rings: it kept slivers
     // straddling the rim, so the manifold check rejected an otherwise clean CDT).
-    let mut adjacency: HashMap<usize, [(Option<usize>, bool); 3]> = HashMap::new();
+    let mut adjacency = vec![[(None, false); 3]; cdt.num_all_faces()];
     let mut queue: std::collections::VecDeque<(usize, bool)> = std::collections::VecDeque::new();
     for face in cdt.inner_faces() {
         let face_index = face.fix().index();
@@ -618,17 +654,17 @@ pub(in crate::watertight_tessellation) fn surface_cdt(outer: &[FaceVertex], hole
                 entry[slot] = (Some(inner.index()), is_constraint);
             }
         }
-        adjacency.insert(face_index, entry);
+        adjacency[face_index] = entry;
     }
-    let mut inside: HashMap<usize, bool> = HashMap::new();
+    let mut inside = vec![None; cdt.num_all_faces()];
     while let Some((face_index, parity)) = queue.pop_front() {
-        if inside.contains_key(&face_index) {
+        if inside[face_index].is_some() {
             continue;
         }
-        inside.insert(face_index, parity);
-        for &(neighbor, is_constraint) in &adjacency[&face_index] {
+        inside[face_index] = Some(parity);
+        for &(neighbor, is_constraint) in &adjacency[face_index] {
             if let Some(neighbor) = neighbor {
-                if !inside.contains_key(&neighbor) {
+                if inside[neighbor].is_none() {
                     queue.push_back((neighbor, parity ^ is_constraint));
                 }
             }
@@ -636,7 +672,7 @@ pub(in crate::watertight_tessellation) fn surface_cdt(outer: &[FaceVertex], hole
     }
     let mut triangles: Vec<[usize; 3]> = Vec::new();
     for f in cdt.inner_faces() {
-        if !inside.get(&f.fix().index()).copied().unwrap_or(false) {
+        if !inside[f.fix().index()].unwrap_or(false) {
             continue;
         }
         let mut t = f.vertices().map(|x| x.data().authored);
@@ -662,7 +698,7 @@ pub(in crate::watertight_tessellation) fn surface_cdt(outer: &[FaceVertex], hole
     // by an opposite twin. A SLIT loop (an edge traversed both ways) or a filter
     // that kept an outside triangle both violate this — decline and let the
     // ear-clip path (which tolerates degenerate slit trims via slivers) own them.
-    let mut dir: HashMap<(usize, usize), usize> = HashMap::new();
+    let mut dir: FxHashMap<(usize, usize), usize> = FxHashMap::default();
     for &[a, b, c] in &triangles {
         for e in [(a, b), (b, c), (c, a)] {
             *dir.entry(e).or_insert(0) += 1;
@@ -699,4 +735,5 @@ pub(in crate::watertight_tessellation) fn surface_cdt(outer: &[FaceVertex], hole
         boundary_pairs,
     })
 }
+
 

@@ -53,7 +53,7 @@ use crate::{BrepSolid, KernelRefusal, KernelTolerances, NurbsCurve, Vec3};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 /// One use's candidate outcome.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 enum UseRead {
     /// An admitted candidate, with (old tracking, new tracking).
     Admitted(NurbsCurve, f64, f64),
@@ -235,6 +235,26 @@ fn edge_point_at(edge: &crate::topology::EdgeRecord, forward: bool) -> impl Fn(f
 }
 
 /// The old trim's tracking at its use's probes, on [0, 1]; None if unread.
+fn clean_tracking_cached(face: &crate::FaceRecord, edge: &crate::topology::EdgeRecord, coedge: &crate::topology::CoedgeRecord, bar: f64) -> bool {
+    matches!(crate::reading_memo::lookup(crate::reading_memo::Reading::OldTracking,
+        crate::mass_properties::coedge_use_identity(&face.surface, &coedge.pcurve, edge, coedge.forward)),
+        Some(Some(value)) if value.is_finite() && value <= bar)
+}
+
+/// Reuse the fragmentation proof, with the other operand's full certified
+/// box. Unknown provenance, extended trims and uncertified tools stay near.
+pub(super) fn separated_faces(solid: &BrepSolid, solids: &HashMap<u8, &BrepSolid>, origins: &[(u64, u8, bool)], tolerance: f64) -> HashSet<u64> {
+    if solids.len() != 2 || std::env::var("BREP_INHERITED_SCOPE_MEMO").as_deref() == Ok("0") { return HashSet::default(); }
+    let boxes: HashMap<_, _> = solids.iter().filter(|(_, s)| crate::fragment::bounded_carriers(s))
+        .map(|(id, s)| (*id, crate::boolean::operand_bounds(s))).collect();
+    let owners: HashMap<_, _> = origins.iter().map(|(face, operand, _)| (*face, *operand)).collect();
+    let band = KernelTolerances::for_solid(solid, tolerance).sew_search;
+    solid.shells.iter().flat_map(|s| &s.faces).filter(|face| {
+        owners.get(&face.id).is_some_and(|owner| boxes.iter().any(|(id, bounds)|
+            id != owner && crate::fragment::face_separated(face, *bounds, band)))
+    }).map(|f| f.id).collect()
+}
+
 fn old_tracking(face: &crate::FaceRecord, edge: &crate::topology::EdgeRecord, coedge: &crate::topology::CoedgeRecord) -> Option<(NurbsCurve, f64)> {
     let old = on_unit_domain(&coedge.pcurve)?;
     // A pure function of this use's content, served from the reading memo
@@ -252,6 +272,46 @@ fn old_tracking(face: &crate::FaceRecord, edge: &crate::topology::EdgeRecord, co
     Some((old, tracking))
 }
 
+
+thread_local! {
+    /// [`candidate`]'s reading per use, keyed by the use's content
+    /// (`coedge_use_identity`: carrier, pcurve, edge curve and range, sense)
+    /// and the bar's bits: everything the fit reads. The fillet's cutter
+    /// composition hands the same blend-on-blend uses, under new ids, to
+    /// boolean after boolean (35 on the sprocket report 1d179b4a, every fit
+    /// declined or refused at the loop gate). The loop and body gates still
+    /// run on a served read. Governed by `reading_memo::memo_on`, bounded by
+    /// its capacity and cleared with it.
+    static CANDIDATE_MEMO: std::cell::RefCell<HashMap<([u64; 2], u64), UseRead>> = std::cell::RefCell::new(HashMap::default());
+}
+
+/// Drop every memoised candidate read (`reading_memo::clear`).
+pub(crate) fn clear_candidate_memo() {
+    CANDIDATE_MEMO.with(|memo| memo.borrow_mut().clear());
+}
+
+/// [`candidate`], served from [`CANDIDATE_MEMO`] when the same use was read
+/// under the same bar; true when served.
+fn candidate_memoized(face: &crate::FaceRecord, edge: &crate::topology::EdgeRecord, coedge: &crate::topology::CoedgeRecord, old: &NurbsCurve, bar: f64) -> (UseRead, bool) {
+    if !crate::reading_memo::memo_on() {
+        return (candidate(face, edge, coedge, old, bar), false);
+    }
+    let key = (crate::mass_properties::coedge_use_identity(&face.surface, &coedge.pcurve, edge, coedge.forward), bar.to_bits());
+    if let Some(read) = CANDIDATE_MEMO.with(|memo| memo.borrow().get(&key).cloned()) {
+        crate::reading_memo::note(true);
+        return (read, true);
+    }
+    crate::reading_memo::note(false);
+    let read = candidate(face, edge, coedge, old, bar);
+    CANDIDATE_MEMO.with(|memo| {
+        let mut memo = memo.borrow_mut();
+        if memo.len() >= crate::reading_memo::capacity() {
+            memo.clear();
+        }
+        memo.insert(key, read.clone());
+    });
+    (read, false)
+}
 
 fn candidate(face: &crate::FaceRecord, edge: &crate::topology::EdgeRecord, coedge: &crate::topology::CoedgeRecord, old: &NurbsCurve, bar: f64) -> UseRead {
 
@@ -465,6 +525,20 @@ pub(super) fn challenge_inherited_trims_with(
     enabled: bool,
     scope: Option<&HashSet<u64>>,
 ) -> Result<Vec<ReplacedTrim>, KernelRefusal> {
+    challenge_inherited_trims_scoped(solid, tolerance, boundary, constructed, enabled, scope, None)
+}
+
+/// Distant edges may reuse a clean content reading, but an unseen or changed
+/// imported trim must still be challenged. Distance alone certifies no repair.
+pub(super) fn challenge_inherited_trims_scoped(
+    solid: &mut BrepSolid,
+    tolerance: f64,
+    boundary: &HashMap<u64, (u8, u64)>,
+    constructed: &HashSet<u64>,
+    enabled: bool,
+    scope: Option<&HashSet<u64>>,
+    separated: Option<&HashSet<u64>>,
+) -> Result<Vec<ReplacedTrim>, KernelRefusal> {
     if !enabled {
         return Ok(Vec::new());
     }
@@ -485,6 +559,10 @@ pub(super) fn challenge_inherited_trims_with(
     // Accepted overrides, per loop: (face index, loop index) -> coedge index -> pcurve.
     let mut accepted: HashMap<(usize, usize), HashMap<usize, NurbsCurve>> = HashMap::default();
     let mut order: Vec<(usize, usize, usize)> = Vec::new();
+    let profile = std::env::var("BREP_PROFILE").is_ok();
+    let before_memo = crate::reading_memo::counts();
+    let (mut eligible, mut endpoints, mut tracking, mut candidates) = (0usize, 0usize, 0usize, 0usize);
+    let (mut far_reused, mut far_read, mut fits_served) = (0usize, 0usize, 0usize);
     for edge in edges {
         if edge.degenerate || !(edge.t1 != edge.t0) || constructed.contains(&edge.id) {
             continue;
@@ -500,7 +578,16 @@ pub(super) fn challenge_inherited_trims_with(
         if edge_uses.iter().any(|&(face_index, _, _)| faces[face_index].surface.is_affine().unwrap_or(true)) {
             continue;
         }
+        eligible += 1;
+        if separated.is_some_and(|far| edge_uses.iter().all(|u| far.contains(&faces[u.0].id))) {
+            if edge_uses.iter().all(|u| clean_tracking_cached(faces[u.0], edge, &faces[u.0].loops[u.1].coedges[u.2], bar)) {
+                far_reused += 1;
+                continue;
+            }
+            far_read += 1;
+        }
         if edge_uses.iter().any(|&(face_index, loop_index, coedge_index)| {
+            endpoints += 1;
             endpoint_join_blocked(faces[face_index], loop_index, coedge_index, edge,
                 accepted.get(&(face_index, loop_index)), bar)
         }) {
@@ -509,6 +596,7 @@ pub(super) fn challenge_inherited_trims_with(
             }
             continue;
         }
+        tracking += edge_uses.len();
         let olds: Vec<Option<(NurbsCurve, f64)>> = edge_uses.iter().map(|u| old_tracking(faces[u.0], edge, &faces[u.0].loops[u.1].coedges[u.2])).collect();
         if olds.iter().any(|old| old.is_none()) {
             if debug {
@@ -520,10 +608,15 @@ pub(super) fn challenge_inherited_trims_with(
             continue;
         }
         // Either use over the bar: BOTH get a candidate and both must be admitted.
+        candidates += edge_uses.len();
         let reads: Vec<UseRead> = edge_uses
             .iter()
             .zip(&olds)
-            .map(|(u, old)| candidate(faces[u.0], edge, &faces[u.0].loops[u.1].coedges[u.2], &old.as_ref().expect("read above").0, bar))
+            .map(|(u, old)| {
+                let (read, served) = candidate_memoized(faces[u.0], edge, &faces[u.0].loops[u.1].coedges[u.2], &old.as_ref().expect("read above").0, bar);
+                fits_served += served as usize;
+                read
+            })
             .collect();
         let Some(taken) = edge_decision(&reads) else {
             if debug {
@@ -566,6 +659,11 @@ pub(super) fn challenge_inherited_trims_with(
             order.push(edge_uses[index]);
         }
         accepted = trial;
+    }
+    if profile {
+        let after = crate::reading_memo::counts();
+        eprintln!("assemble.inherited_reads faces={} scoped={} eligible={eligible} far_reused={far_reused} far_read={far_read} endpoints={endpoints} tracking={tracking} candidates={candidates} fits={} fits_served={fits_served} reused={} reread={}",
+            faces.len(), scope.map_or(faces.len(), |s| s.len()), candidates - fits_served, after.0 - before_memo.0, after.1 - before_memo.1);
     }
     drop(faces);
     if order.is_empty() {

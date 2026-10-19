@@ -211,7 +211,52 @@ pub(super) fn source_edge(source: &FragmentEdgeSource, index: &AssembleIndex) ->
     }
 }
 
+/// Same-binary attribution for the identity index; never an acceptance switch.
+fn weld_index_on() -> bool {
+    thread_local! {
+        static OFF: std::cell::OnceCell<bool> = const { std::cell::OnceCell::new() };
+    }
+    !OFF.with(|cell| *cell.get_or_init(|| std::env::var("BREP_ASSEMBLY_MEMO").as_deref() == Ok("0")))
+}
+
+/// Index the exact identity exclusion already enforced by the weld. Keep
+/// every possible candidate (including duplicate keys) in insertion order;
+/// geometry, incidence and tangent-side acceptance still run unchanged.
+#[derive(Default)]
+pub(in crate::boolean) struct WeldCandidates {
+    indexed: usize,
+    by_operand: HashMap<Option<u8>, Vec<usize>>,
+    by_key: HashMap<(u8, u64), Vec<usize>>,
+    pub(super) offered: usize,
+    pub(super) exhaustive: usize,
+}
+
+impl WeldCandidates {
+    fn push(&mut self, key: Option<(u8, u64)>) {
+        self.by_operand.entry(key.map(|k| k.0)).or_default().push(self.indexed);
+        if let Some(key) = key { self.by_key.entry(key).or_default().push(self.indexed); }
+        self.indexed += 1;
+    }
+
+    fn candidates(&mut self, source: Option<(u8, u64)>) -> Vec<usize> {
+        let mut result = if let Some(key) = source {
+            let mut indices = self.by_key.get(&key).cloned().unwrap_or_default();
+            for (operand, bucket) in &self.by_operand {
+                if *operand != Some(key.0) { indices.extend_from_slice(bucket); }
+            }
+            indices.sort_unstable();
+            indices
+        } else { (0..self.indexed).collect() };
+        self.exhaustive += self.indexed;
+        self.offered += result.len();
+        // Diagnostic attribution only; both paths retain identical ordering.
+        if !weld_index_on() { result = (0..self.indexed).collect(); }
+        result
+    }
+}
+
 pub(in crate::boolean) struct Assembler {
+    pub(in crate::boolean) weld_candidates: WeldCandidates,
     pub(in crate::boolean) tolerance: f64,
     pub(in crate::boolean) vertices: Vec<VertexRecord>,
     // Source positions retain their lookup records after a witnessed edge
@@ -252,6 +297,10 @@ pub(in crate::boolean) struct Assembler {
     // points the other way bounds the other sliver and is refused. Appended
     // at the end of the struct (2026-10-11).
     pub(in crate::boolean) edge_tangent_side: HashMap<u64, Vec3>,
+    /// Set from the producer's declared kind before assembly. Each source
+    /// boundary key is a region's edge pair; radial validation certifies
+    /// the resulting multi-region edge before anything is returned.
+    pub(in crate::boolean) cellular: bool,
 }
 
 pub(super) fn snap_edge_curve_endpoints(
@@ -286,6 +335,28 @@ pub(super) fn snap_edge_curve_endpoints(
 }
 
 impl Assembler {
+    fn weld_candidate_indices(&mut self, key: Option<(u8, u64)>) -> Vec<usize> {
+        // Edges are append-only throughout building. Identity is assigned on
+        // creation and never changes when another use joins an edge.
+        for edge in &self.edges[self.weld_candidates.indexed..] {
+            self.weld_candidates.push(self.edge_boundary_key.get(&edge.id).copied());
+        }
+        self.weld_candidates.candidates(key)
+    }
+
+    fn cellular_boundary_matches(&self, source: Option<(u8, u64)>, candidate: u64) -> bool {
+        if !self.cellular { return true; }
+        let Some(key) = source else { return false; };
+        if let Some(&mapped) = self.edge_by_boundary_key.get(&key) {
+            return mapped == candidate;
+        }
+        // Never join two DIFFERENT edges of one region merely because
+        // their geometry coincides. The other use of a region's edge must
+        // follow its established source correspondence.
+        !self.edge_by_boundary_key.iter()
+            .any(|(&(operand, _), &edge)| operand == key.0 && edge == candidate)
+    }
+
     /// Vertex ids are dense (1..=len) because only `vertex()` appends with a
     /// sequential id. This lookup checks that invariant instead of assuming
     /// it, so a future change that breaks density fails loudly rather than
@@ -399,9 +470,10 @@ impl Assembler {
         // remain distinct so each is referenced by exactly one coedge.
         if !source_degenerate {
             let mut welded: Option<(usize, bool)> = None;
-            for index in 0..self.edges.len() {
+            for index in self.weld_candidate_indices(source.boundary_key) {
                 let edge = &self.edges[index];
-                if self.edge_use_counts.get(&edge.id).copied().unwrap_or(0) >= 2 {
+                if (!self.cellular && self.edge_use_counts.get(&edge.id).copied().unwrap_or(0) >= 2)
+                    || !self.cellular_boundary_matches(source.boundary_key, edge.id) {
                     continue;
                 }
                 if weld_refused_by_identity(
@@ -490,7 +562,7 @@ impl Assembler {
                     } else {
                         incoming_forward
                     };
-                    if self.edge_first_forward.get(&edge.id) == Some(&would_be_forward) {
+                    if !self.cellular && self.edge_first_forward.get(&edge.id) == Some(&would_be_forward) {
                         continue;
                     }
                     let endpoints = (edge.start_vertex_id, edge.end_vertex_id);
@@ -509,6 +581,9 @@ impl Assembler {
                 }
                 let id = edge.id;
                 *self.edge_use_counts.entry(id).or_default() += 1;
+                if self.cellular {
+                    if let Some(key) = source.boundary_key { self.edge_by_boundary_key.entry(key).or_insert(id); }
+                }
                 return Ok((id, reversed));
             }
         }
@@ -550,9 +625,10 @@ impl Assembler {
         }
         if source_closed {
             let mut welded: Option<(usize, bool)> = None;
-            for index in 0..self.edges.len() {
+            for index in self.weld_candidate_indices(source.boundary_key) {
                 let edge = &self.edges[index];
-                if self.edge_use_counts.get(&edge.id).copied().unwrap_or(0) >= 2 {
+                if (!self.cellular && self.edge_use_counts.get(&edge.id).copied().unwrap_or(0) >= 2)
+                    || !self.cellular_boundary_matches(source.boundary_key, edge.id) {
                     continue;
                 }
                 if weld_refused_by_identity(
@@ -632,7 +708,7 @@ impl Assembler {
                 } else {
                     incoming_forward
                 };
-                if self.edge_first_forward.get(&edge.id) == Some(&would_be_forward) {
+                if !self.cellular && self.edge_first_forward.get(&edge.id) == Some(&would_be_forward) {
                     if std::env::var("BREP_DEBUG_EDGE").as_deref() == Ok("weld") {
                         eprintln!(
                             "closed-weld REFUSED same-sense: edge {} first_forward={:?} incoming would_be={}",
@@ -666,6 +742,9 @@ impl Assembler {
                 edge.degenerate = false;
                 let id = edge.id;
                 *self.edge_use_counts.entry(id).or_default() += 1;
+                if self.cellular {
+                    if let Some(key) = source.boundary_key { self.edge_by_boundary_key.entry(key).or_insert(id); }
+                }
                 return Ok((id, reversed));
             }
         }

@@ -160,6 +160,82 @@ pub(super) enum MiterClosure {
     },
 }
 
+/// The refusal slug of a seam that folds in the leader's sections at the
+/// follower's far rail ([`solve_miter`]); the network re-marches it on the
+/// other stripe.
+pub(super) const MITER_SEAM_FOLD: &str = "miter_seam_fold";
+
+pub(super) fn is_miter_seam_fold(refusal: &KernelRefusal) -> bool {
+    matches!(&refusal.class, crate::RefusalClass::UnsupportedGeometry { what } if what == MITER_SEAM_FOLD)
+}
+
+/// `BREP_BLEND_MITER_FOLD=1`/`on` re-marches a folding seam on the other
+/// stripe ([`MITER_SEAM_FOLD`], lane R2 2026-10-18; the default since its
+/// census at 433ed426b), `=0`/`off` keeps the exit the leader found;
+/// `set_miter_fold_for_test` forces it on a test's own thread.
+const MITER_FOLD_DEFAULT: bool = true;
+
+thread_local! {
+    static MITER_FOLD_FOR_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+pub(super) fn miter_fold_on() -> bool {
+    if let Some(forced) = MITER_FOLD_FOR_TEST.with(|forced| forced.get()) {
+        return forced;
+    }
+    match std::env::var("BREP_BLEND_MITER_FOLD").as_deref() {
+        Ok("0") | Ok("off") => false,
+        Ok("1") | Ok("on") => true,
+        _ => MITER_FOLD_DEFAULT,
+    }
+}
+
+
+/// Lane R2 row 5a (2026-10-18): `BREP_BLEND_LINE_CANAL=1`/`on` reads a
+/// straight canal's level in closed form ([`canal_distance`]; the default
+/// since its census), `=0`/`off` projects onto the spine as before;
+/// `set_line_canal_for_test` forces it on a test's own thread.
+const LINE_CANAL_DEFAULT: bool = true;
+
+thread_local! {
+    static LINE_CANAL_FOR_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+pub(super) fn line_canal_on() -> bool {
+    if let Some(forced) = LINE_CANAL_FOR_TEST.with(|forced| forced.get()) {
+        return forced;
+    }
+    match std::env::var("BREP_BLEND_LINE_CANAL").as_deref() {
+        Ok("0") | Ok("off") => false,
+        Ok("1") | Ok("on") => true,
+        _ => LINE_CANAL_DEFAULT,
+    }
+}
+
+
+/// The distance from `point` to the spine `center`, as
+/// `project_point_to_curve` answers it: the nearest point of the curve over
+/// its domain. A STRAIGHT spine (degree 1, two control points of equal
+/// weight: an exact extrusion's centre line) is a segment, and with
+/// `line_canal_on` its distance is the segment's own closed form; any other
+/// spine, or the switch off, is projected.
+pub(super) fn canal_distance(center: &crate::NurbsCurve, point: Vec3) -> Result<f64, KernelRefusal> {
+    if line_canal_on() && center.degree == 1 && center.control_points.len() == 2 {
+        let [a, b] = [center.control_points[0], center.control_points[1]];
+        if a.w > 0.0 && a.w == b.w {
+            let (from, to) = (a.point().or_refuse(KernelStage::Refine, "point")?, b.point().or_refuse(KernelStage::Refine, "point")?);
+            let along = to.sub(from);
+            let length_squared = along.length_squared();
+            if length_squared > 0.0 {
+                crate::blend::record_count("count.miter.line_canal", 1);
+                let fraction = (point.sub(from).dot(along) / length_squared).clamp(0.0, 1.0);
+                return Ok(point.sub(from.add(along.scale(fraction))).length());
+            }
+        }
+    }
+    Ok(crate::project_point_to_curve(center, point).or_refuse(KernelStage::Refine, "project_point_to_curve")?.distance)
+}
+
 /// How far `point` stands off `surface` the way the marches here solve "on":
 /// along the surface normal at the point's projection.
 ///
@@ -306,6 +382,10 @@ pub(super) fn solve_miter(
     scale: f64,
     fit_tolerance: f64,
     consumed_band: f64,
+    // The exit-on-the-sharp-edge bar that makes the closure symmetric, when
+    // the caller knows the two rails meet the sharp edge apart (a creased
+    // seam); `None` is the default 1e-6 relative bar.
+    symmetric_bar_override: Option<f64>,
 ) -> Result<MiterClosure, KernelRefusal> {
     let [first, second] = stripes;
     // The bar the EXIT is bisected to, and the exit is an endpoint of the
@@ -334,7 +414,7 @@ pub(super) fn solve_miter(
         if chamfer {
             return bevel_level(second, point, scale);
         }
-        Ok(crate::project_point_to_curve(center_second, point).or_refuse(KernelStage::Refine, "project_point_to_curve")?.distance - second.radius)
+        Ok(canal_distance(center_second, point)? - second.radius)
     };
     let level = |u: f64, fraction: f64| -> Result<f64, KernelRefusal> {
         sibling_level(first.point(u, fraction)?)
@@ -444,6 +524,9 @@ pub(super) fn solve_miter(
         })
     };
 
+    // BREP_PROFILE split of one miter: the coarse seam march to the exit,
+    // the seam's resample-and-fit ladder, the connector.
+    let march_timing = crate::blend::BlendTimer::start("timing.miter.seam_march_ms");
     let mut previous_u = u_start;
     let mut exit: Option<(usize, f64)> = None; // (stripe that exits, u on stripe 0)
     for step in 1..=SEAM_STEPS + 8 {
@@ -506,6 +589,7 @@ pub(super) fn solve_miter(
             .min_by(|a, b| (a.1 - u_start).abs().total_cmp(&(b.1 - u_start).abs()));
         break;
     }
+    march_timing.stop();
     let Some((leaves_first, u_exit)) = exit else {
         return Err(
             KernelRefusal::unsupported(KernelStage::Refine, "miter_radius_too_large", "miter: the seam does not leave either blend within the marched rows — the \
@@ -516,6 +600,37 @@ pub(super) fn solve_miter(
     // the resamples below: at a first-step exit the coarse march's last foot
     // is still the starting tangency, where a direct Newton projection to
     // the exit can stall on the shared rail instead of reaching the far rail.
+    if std::env::var("BREP_DEBUG_NETWORK").is_ok() {
+        let near = level(u_exit, 0.0).map_or(f64::NAN, |value| value);
+        let far = level(u_exit, 1.0).map_or(f64::NAN, |value| value);
+        let past = first.point(u_exit, 1.0).and_then(|point| past_second(point)).map_or(f64::NAN, |value| value);
+        let found = station(u_exit).map(|found| found.map(|(fraction, point)| (fraction, past_second(point).map_or(f64::NAN, |value| value))));
+        eprintln!(
+            "miter exit: leaves {leaves_first} at u {u_exit:.17} (start {u_start:.6}, end {u_end:.6}); levels near {near:.3e} far {far:.3e}; \
+             far rail past stripe 1 {past:.3e}; station {found:?}; fit tolerance {fit_tolerance:.3e}; two straight canals {two_straight_canals}"
+        );
+    }
+    // The exit through stripe 1's far rail stands only where the seam
+    // CROSSES that rail: past a crossing the seam goes on in the leader's
+    // sections (it has only left the follower). Where it does not, the
+    // seam folded back in the leader's sections at the rail — the leader's
+    // section is tangent to it there, so whether a station is found at the
+    // exit at all is a rounding decision — and it is marched on the other
+    // stripe (`miter_fold_on`; the caller swaps on `miter_seam_fold`).
+    // A seam that reaches the leader's far rail at the same station (its far
+    // level within the fit bar there: a symmetric chamfer's corner) leaves
+    // both stripes at once — the common exit below, not a fold.
+    if miter_fold_on()
+        && leaves_first == 1
+        && level(u_exit, 1.0)?.abs() > fit_tolerance
+        && matches!(station(u_exit + du / 16.0), Ok(None))
+    {
+        return Err(KernelRefusal::unsupported(
+            KernelStage::Refine,
+            MITER_SEAM_FOLD,
+            format!("miter: the seam folds in the leader's sections where it meets the follower's far rail (u {u_exit:.12})"),
+        ));
+    }
     let (exit_point, exit_uv_first) = if leaves_first == 0 {
         let point = first.point(u_exit, 1.0)?;
         (point, [u_exit, first.z(1.0)])
@@ -572,13 +687,16 @@ pub(super) fn solve_miter(
     let seam_off_carriers = |point: Vec3| -> Result<f64, KernelRefusal> {
         Ok(off_surface(&first.rows.surface, point)?.max(sibling_level(point)?.abs()))
     };
+    let seam_timing = crate::blend::BlendTimer::start("timing.miter.seam_fit_ms");
     let (seam, seam_fit) = fit_on_ladder(&resample, "seam", &seam_off_carriers, fit_tolerance)?;
+    seam_timing.stop();
+    let _connector_timing = crate::blend::BlendTimer::start("timing.miter.connector_ms");
     let exit_uv_second = *seam.uv_second.last().expect("a resampled seam");
     let exit_u_second = exit_uv_second[0];
 
     check_sharp_extent(sharp, exit_point, consumed_band, radius)?;
     let on_sharp = crate::project_point_to_curve(&sharp.curve, exit_point).or_refuse(KernelStage::Refine, "project_point_to_curve")?;
-    let symmetric_bar = 1e-6 * (1.0 + radius);
+    let symmetric_bar = symmetric_bar_override.unwrap_or(1e-6 * (1.0 + radius));
     if on_sharp.distance <= symmetric_bar {
         return Ok(MiterClosure::Symmetric {
             seam,

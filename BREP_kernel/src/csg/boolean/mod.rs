@@ -1,3 +1,4 @@
+pub(crate) mod profile;
 use crate::arrangement::Vec2;
 use crate::classification::{classify_point, parameter_point_in_face, PolygonClass};
 use crate::fragment::{FaceFragmentRecord, FragmentEdgeSource};
@@ -77,6 +78,17 @@ pub struct BooleanOptions {
     /// else on).
     #[serde(default = "default_true")]
     pub disjoint_fast_path: bool,
+    /// Lane X row 12: when, in at least two axes, one operand's control-net
+    /// box ends at or before the other's begins (exactly, no band), the
+    /// operands can share no interior and touch on a line or at a point: the
+    /// disjoint path's answers hold. Every control weight must be positive
+    /// (the hull property), both operands plain solids, and the caller must
+    /// say what follows (`seam_reseat_later_references` is `Some`), so a
+    /// caller that cannot keeps today's ids. On by default since the row 12
+    /// census; `BREP_CONTACT_FAST_PATH` overrides either way (`0` off,
+    /// anything else on).
+    #[serde(default = "default_true")]
+    pub contact_fast_path: bool,
     /// OFF by default: the 94-case census read unchanged with it, but the
     /// kernel battery's `offset_subtract_fixture` pins a result whose
     /// untouched planar face carries an open trim joint of 8.7e-4 from its
@@ -95,6 +107,22 @@ pub struct BooleanOptions {
     /// struct (2026-10-11).
     #[serde(default = "default_true")]
     pub sector_classification: bool,
+    /// Non-manifold plan 1.6: trim a declared Sheet by a Solid with Intersect.
+    /// On after the 2026-10-14 Sheet census and whole-kernel qualification.
+    /// BREP_SHEET_TRIM overrides this option (1 enables, 0 disables).
+    #[serde(default = "default_true")]
+    pub sheet_trim: bool,
+    /// Preserve the closed operand regions at a lower-dimensional union
+    /// contact as explicit cells. Opt-in pending the Cellular census.
+    /// BREP_KEEP_CELLS overrides this option (1 enables, 0 disables).
+    #[serde(default)]
+    pub keep_cells: bool,
+    /// The references later features hold (their `inputParams` text), when
+    /// the caller knows them: `Some` admits the operand seam re-seat
+    /// (`BREP_SEAM_RESEAT`, lane X row 11b) for every cylinder wall none of
+    /// them names; `None` (the caller cannot tell) never re-seats.
+    #[serde(default)]
+    pub seam_reseat_later_references: Option<Vec<String>>,
 }
 
 /// [`BooleanOptions::touched_assembly`] under its environment override.
@@ -112,6 +140,15 @@ fn disjoint_fast_path(options: &BooleanOptions) -> bool {
         Ok("0") => false,
         Ok(_) => true,
         Err(_) => options.disjoint_fast_path,
+    }
+}
+
+/// [`BooleanOptions::contact_fast_path`] under its environment override.
+fn contact_fast_path(options: &BooleanOptions) -> bool {
+    match std::env::var("BREP_CONTACT_FAST_PATH").as_deref() {
+        Ok("0") => false,
+        Ok(_) => true,
+        Err(_) => options.contact_fast_path,
     }
 }
 
@@ -142,19 +179,26 @@ impl Default for BooleanOptions {
             keep_unmerged_name_substrs: Vec::new(),
             untouched_passthrough: true,
             disjoint_fast_path: true,
+            contact_fast_path: true,
             touched_assembly: false,
             sector_classification: true,
+            sheet_trim: true,
+            keep_cells: false,
+            seam_reseat_later_references: None,
         }
     }
 }
 
 mod select;
+mod sheet;
+mod cellular;
 mod sector;
 mod assemble;
 mod operand_state;
 mod rim;
 mod coincident;
 mod touch;
+mod reseat;
 
 use rim::*;
 use select::*;
@@ -162,7 +206,7 @@ use coincident::*;
 use touch::TouchCensus;
 pub(crate) use assemble::{
     assemble_fragments, assemble_open_fragments, commit_nearby_edge_endpoints,
-    edge_interior_lies_on, finalize_assembled_solid,
+    clear_candidate_memo, edge_interior_lies_on, finalize_assembled_solid,
 };
 use assemble::{assemble_fragments_scoped, AssemblyScope};
 // Currently referenced only inside `assemble`, so the re-export is unused.
@@ -1458,7 +1502,13 @@ pub fn boolean_operation_nary(
 /// refusal class the whole tangent-node family carries, naming the point.
 ///
 /// Only classes that are ALREADY perturbation-eligible are re-attributed, so a
-/// refusal that could never take the ladder still cannot.
+/// refusal that could never take the ladder still cannot. The stage's own
+/// message — the one-use edges, the genus — is NOT carried into the refusal:
+/// `tangent_node_assembly` and `torus_torus_singular_refusal` hold the
+/// tangent-node refusal to naming its cause without the arrangement's
+/// symptom text ("open between", "genus", "pcurve"), the policy the class
+/// exists for. It is printed under `BREP_DEBUG_BOOL` instead, so what the
+/// assembly actually read is still there for a reader of the trace.
 ///
 /// It does decide WHICH refusals are retried, though, and since 2026-09-13 that
 /// matters: `boolean_operation`'s failure arm gates `TangentNodeSingularity` out
@@ -1477,6 +1527,12 @@ fn attribute_to_tangent_node(error: KernelRefusal, nodes: &[Vec3]) -> KernelRefu
         || matches!(error.class, RefusalClass::TangentNodeSingularity)
     {
         return error;
+    }
+    if std::env::var("BREP_DEBUG_BOOL").is_ok() {
+        eprintln!(
+            "boolean: tear downstream of the tangent node at ({:.6},{:.6},{:.6}) attributed to it; the stage read: {}",
+            node.x, node.y, node.z, error.message
+        );
     }
     KernelRefusal::new(
         RefusalClass::TangentNodeSingularity,
@@ -1526,10 +1582,15 @@ fn attribute_to_tangent_section(
         .into_iter()
         .filter_map(|id| origins.get(id.checked_sub(1)? as usize).copied())
         .collect::<Vec<FaceKey>>();
-    let Some(section) = sections
-        .iter()
-        .find(|section| named.iter().any(|face| section.faces.contains(face)))
-    else {
+    // A record the lane's own sites minted before one the grazing-pierce
+    // path minted (`TangentSectionRecord::grazing`): the sprocket slit star's
+    // cutter names its traced contact, not the pierce of a neighbouring pair.
+    let involving = |fallback: bool| {
+        sections.iter().find(|section| {
+            section.grazing.is_empty() != fallback && named.iter().any(|face| section.faces.contains(face))
+        })
+    };
+    let Some(section) = involving(false).or_else(|| involving(true)) else {
         return error;
     };
     // A clipped end sits on a trim at round-off, and `-0.000000` names no
@@ -1538,7 +1599,32 @@ fn attribute_to_tangent_section(
         let shown = |value: f64| if value.abs() < 5e-7 { 0.0 } else { value };
         format!("({:.6},{:.6},{:.6})", shown(point.x), shown(point.y), shown(point.z))
     };
-    let shape = if section.planar {
+    // The grazing pierces (`imprint/driver.rs`, 2026-10-17): trim edges that
+    // pierce the other carrier inside both trims below the seed gate while
+    // the pair marched nothing. A record the lane built stands on its contact
+    // and carries them as a note; a record standing on the pierces ALONE
+    // (its `start` IS the first pierce) is named by them.
+    let pierces = (!section.grazing.is_empty()).then(|| {
+        let shown = section.grazing.len().min(4);
+        let mut listed = section.grazing[..shown]
+            .iter()
+            .map(|(point, tangency)| format!("{} at |tan·n| = {tangency:.4}", at(*point)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        if section.grazing.len() > shown {
+            listed.push_str(&format!(" and {} more", section.grazing.len() - shown));
+        }
+        listed
+    });
+    let pierce_only = section.pierce_only();
+    let shape = if let (true, Some(pierces)) = (pierce_only, pierces.as_deref()) {
+        format!(
+            "cross at a grazing angle: a trim edge pierces the other carrier inside both \
+             trims at {pierces}, below the marcher's start gate, and no transverse section was \
+             marched between the pierces — a near-tangent crossing born on a tangent contact \
+             (a third-order singularity) the imprint does not build yet"
+        )
+    } else if section.planar {
         format!(
             "touch along a tangent curve from {} to {} (length {:.6}, {} stations{}) which the \
              imprint does not build yet",
@@ -1554,6 +1640,13 @@ fn attribute_to_tangent_section(
              tangent contact the lane does not trace yet",
             at(section.start)
         )
+    };
+    let shape = match (pierce_only, pierces) {
+        (false, Some(pierces)) => format!(
+            "{shape}; a trim edge also pierces the other carrier inside both trims at {pierces}, \
+             below the marcher's start gate, with no transverse section marched"
+        ),
+        _ => shape,
     };
     let involved = named
         .iter()
@@ -1611,7 +1704,14 @@ pub fn boolean_operation_with_diagnostics(
     operation: BooleanOperation,
     options: &BooleanOptions,
 ) -> Result<KernelOutcome<BrepSolid>, KernelRefusal> {
+    let _account = profile::Scope::new("boolean.other");
     let closed_inputs = matches!(std::env::var("BREP_CLOSED_OPERAND_INPUT").as_deref(), Err(_) | Ok("1") | Ok("on"));
+    if let (true, Some(later)) = (reseat::seam_reseat_enabled(), &options.seam_reseat_later_references) {
+        let started = Instant::now();
+        let (first, second) = reseat::reseat_tangent_seams(first, second, later, options.tolerance);
+        profile_stage("seam_prepare_ms", started.elapsed().as_secs_f64() * 1000.0);
+        return boolean_operation_with_diagnostics_impl(&first, &second, operation, options, closed_inputs);
+    }
     boolean_operation_with_diagnostics_impl(first, second, operation, options, closed_inputs)
 }
 
@@ -1622,6 +1722,21 @@ fn boolean_operation_with_diagnostics_impl(
     options: &BooleanOptions,
     closed_inputs: bool,
 ) -> Result<KernelOutcome<BrepSolid>, KernelRefusal> {
+    // One coedge-check memo per operation (`BREP_VALIDATE_COEDGE_MEMO`): the
+    // assembly, face-merge and closing validations re-read coedges unchanged.
+    let _coedge_memo = crate::topology::CoedgeMemoScope::open(crate::topology::coedge_memo_enabled());
+    // Plan 1.6: only a declared Sheet enters the trim path. The unchanged
+    // Solid path continues below; no kind is inferred from failed closure.
+    if matches!(operation, BooleanOperation::Intersect)
+        && [first, second].iter().any(|body| body.kind == crate::BodyKind::Sheet)
+        && match std::env::var("BREP_SHEET_TRIM").as_deref() {
+            Ok("1") => true,
+            Ok("0") => false,
+            _ => options.sheet_trim,
+        }
+    {
+        return sheet::trim(first, second, options);
+    }
     // OPERAND-KIND GATE. A body that DECLARES itself a Sheet has no
     // inside, so a union or subtract with it has no solid answer; the
     // survey (record 2026-10-12, table 2) measured the arrangement
@@ -1640,7 +1755,7 @@ fn boolean_operation_with_diagnostics_impl(
                 "sheet_operand",
                 format!(
                     "boolean: operand {operand} is a Sheet, which encloses no solid; union and \
-                     subtract of a sheet are refused (slice and trim are not built)"
+                     subtract of a sheet are refused; Intersect trims a Sheet by a Solid"
                 ),
             ));
         }
@@ -1763,6 +1878,21 @@ fn boolean_translated(
 /// `imprint.profile` and `assemble.*_ms` use — so a REFUSED boolean, whose
 /// `KernelDiagnostics` never reach a caller, still shows where its time went.
 fn profile_stage(code: &str, ms: f64) {
+    let row = match code {
+        "heal_ms" => Some("boolean.operand_prepare"),
+        "imprint_ms" => Some("boolean.imprint"),
+        "edge_split_ms" => Some("boolean.edge_split"),
+        "fragment_ms" => Some("boolean.fragment"),
+        "select_ms" => Some("boolean.select"),
+        "assemble_ms" => Some("boolean.assemble"),
+        "face_merge_ms" => Some("boolean.face_merge"),
+        "soundness_ms" => Some("boolean.soundness"),
+        "operand_closure_ms" => Some("boolean.operand_closure"),
+        "seam_prepare_ms" => Some("boolean.seam_prepare"),
+        "final_validate_ms" => Some("boolean.final_validate"),
+        _ => None,
+    };
+    if let Some(row) = row { profile::record(row, ms); }
     if std::env::var("BREP_PROFILE").is_ok() {
         eprintln!("boolean.{code}={ms:.2}");
     }
@@ -1900,6 +2030,29 @@ fn operand_bounds(solid: &BrepSolid) -> crate::Aabb {
     bounds
 }
 
+/// Row 12's gate: the boxes are separated or touch exactly in at least two
+/// axes. A trimmed face lies in its carrier's control-net box when every
+/// weight is positive, so a point interior to both operands would lie
+/// strictly inside both boxes in every axis; two such axes leave a line or a
+/// point of contact, which has no area to merge.
+fn line_or_point_contact(first: &BrepSolid, second: &BrepSolid, bounds: [crate::Aabb; 2]) -> bool {
+    let plain = |solid: &BrepSolid| {
+        solid.kind == crate::BodyKind::Solid
+            && solid.cells.is_empty()
+            && solid.shells.iter().flat_map(|shell| &shell.faces).all(|face| {
+                face.surface.control_points.iter().flatten().all(|control| control.w > 0.0 && control.w.is_finite())
+            })
+    };
+    let [a, b] = bounds;
+    let apart = |a_min: f64, a_max: f64, b_min: f64, b_max: f64| a_max <= b_min || b_max <= a_min;
+    let axes = [
+        apart(a.minimum.x, a.maximum.x, b.minimum.x, b.maximum.x),
+        apart(a.minimum.y, a.maximum.y, b.minimum.y, b.maximum.y),
+        apart(a.minimum.z, a.maximum.z, b.minimum.z, b.maximum.z),
+    ];
+    axes.iter().filter(|&&apart| apart).count() >= 2 && plain(first) && plain(second)
+}
+
 /// The result faces the soundness scan reads under pass-through: the
 /// examined faces (touched and their neighbours) and every other face whose
 /// control-net box reaches the OTHER operand's bounds within `band`. A face
@@ -1935,6 +2088,7 @@ fn soundness_candidates(
 fn empty_solid() -> BrepSolid {
     BrepSolid {
         mass_properties_cache: Default::default(),
+        cells: Default::default(),
         id: 0,
         vertices: Vec::new(),
         edges: Vec::new(),
@@ -2033,6 +2187,7 @@ fn concatenate_disjoint(first: &BrepSolid, second: &BrepSolid) -> BrepSolid {
     }
     BrepSolid {
         mass_properties_cache: Default::default(),
+        cells: Default::default(),
         id: 1,
         vertices,
         edges,
@@ -2069,16 +2224,23 @@ fn boolean_pipeline(
     // soundness scan is skipped as well (an empty candidate set): the
     // operands cannot cross each other, and a crossing an operand carried in
     // passes through the full acceptance unrepaired exactly the same.
-    if disjoint_fast_path(options)
-        && !operand_bounds(first).intersects(operand_bounds(second), policy.sew_search)
-    {
+    //
+    // CONTACT FAST PATH (row 12): boxes that only meet along a line or at a
+    // point, read exactly; see `line_or_point_contact`.
+    let bounds = [operand_bounds(first), operand_bounds(second)];
+    let disjoint = disjoint_fast_path(options) && !bounds[0].intersects(bounds[1], policy.sew_search);
+    let contact = !disjoint
+        && contact_fast_path(options)
+        && options.seam_reseat_later_references.is_some()
+        && line_or_point_contact(first, second, bounds);
+    if disjoint || contact {
         let operation_started = Instant::now();
         let mut diagnostics = KernelDiagnostics::default();
         diagnostics.count_n(
             "collect.faces",
             first.shells.iter().chain(&second.shells).map(|shell| shell.faces.len() as u64).sum(),
         );
-        diagnostics.count("boolean.disjoint_fast_path");
+        diagnostics.count(if contact { "boolean.contact_fast_path" } else { "boolean.disjoint_fast_path" });
         diagnostics.measure_max("tolerance.model", policy.model);
         diagnostics.measure_max("tolerance.sew_search", policy.sew_search);
         let value = match operation {
@@ -2176,8 +2338,8 @@ fn boolean_pipeline(
     diagnostics.measure_max("timing.edge_split_ms", stage_ms);
     let stage_started = Instant::now();
     crate::classification::classify_profile_begin();
-    let fragments_a = fragment_solid(&split_first, 0, &imprint)?;
-    let fragments_b = fragment_solid(&split_second, 1, &imprint)?;
+    let fragments_a = crate::fragment::fragment_solid_against(&split_first, 0, &imprint, crate::fragment::bounded_carriers(second).then_some((bounds[1], policy.sew_search)))?;
+    let fragments_b = crate::fragment::fragment_solid_against(&split_second, 1, &imprint, crate::fragment::bounded_carriers(first).then_some((bounds[0], policy.sew_search)))?;
     crate::classification::classify_profile_report("fragment");
     let stage_ms = stage_started.elapsed().as_secs_f64() * 1_000.0;
     profile_stage("fragment_ms", stage_ms);
@@ -2378,10 +2540,28 @@ fn boolean_pipeline(
             .map(|fragment| FaceKey { operand: fragment.operand, face_id: fragment.source_face_id })
             .collect()
     };
+    // A record the grazing-pierce path minted (`TangentSectionRecord::
+    // grazing` non-empty, whether or not the lane then found a contact to
+    // name) yields to a tangent NODE the imprint classified: the node is the
+    // nearer cause and `attribute_to_tangent_node` names it on the way out
+    // (the G1 elbow over its own-radius arm: the arm's cap circle also
+    // pierces the elbow under the seed gate, and the lane sees the join).
+    let attributable: Vec<crate::imprint::TangentSectionRecord> = imprint
+        .tangent_sections
+        .iter()
+        .filter(|section| imprint.tangent_nodes.is_empty() || section.grazing.is_empty())
+        .cloned()
+        .collect();
     let attribute = |error: KernelRefusal| {
-        attribute_to_tangent_section(error, &imprint.tangent_sections, &assembled_origins)
+        attribute_to_tangent_section(error, &attributable, &assembled_origins)
     };
-    let (solid, scope) = if untouched_passthrough(options) {
+    let cellular_result = matches!(operation, BooleanOperation::Union)
+        && cellular::enabled(options)
+        && cellular::complete_contact(first, second, &selected, tolerance);
+    let (solid, scope) = if cellular_result {
+        (assemble::assemble_cellular_fragments(selected, &solids, &imprint, tolerance)
+            .map_err(attribute)?, None)
+    } else if untouched_passthrough(options) {
         assemble_fragments_scoped(selected, &solids, &imprint, tolerance, &touch, touched_assembly(options))
             .map_err(attribute)?
     } else {
@@ -2408,7 +2588,7 @@ fn boolean_pipeline(
                 .unwrap_or_default()
         );
     }
-    let solid = if options.merge_coplanar_faces
+    let solid = if solid.kind != crate::BodyKind::Cellular && options.merge_coplanar_faces
         && std::env::var("BREP_COPLANAR_MERGE").as_deref() != Ok("0")
     {
         let merged = match &scope {
@@ -2441,7 +2621,9 @@ fn boolean_pipeline(
     let stage_ms = stage_started.elapsed().as_secs_f64() * 1_000.0;
     profile_stage("face_merge_ms", stage_ms);
     diagnostics.measure_max("timing.face_merge_ms", stage_ms);
+    let validation_started = Instant::now();
     let validation = solid.validate_detailed_scoped(&policy, scope.as_ref().map(|scope| &scope.examined));
+    profile_stage("final_validate_ms", validation_started.elapsed().as_secs_f64() * 1000.0);
     diagnostics.count_n("validate.issues", validation.issues.len() as u64);
     diagnostics.count_n(
         "validate.wire_warnings",
@@ -2516,6 +2698,7 @@ fn boolean_pipeline(
             policy.sew_search,
         );
         diagnostics.count_n("passthrough.soundness_candidates", candidates.len() as u64);
+        crate::soundness::census::profile_operation(&solid, &[first, second], Some(&scope.touched), "boolean");
         candidates
     });
     Ok((

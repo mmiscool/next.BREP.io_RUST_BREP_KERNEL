@@ -1,12 +1,14 @@
 //! A session: one app instance under one host, plus the session directory
-//! (store, shots, exports, log) and the recorder.
-use crate::host::{HostConfig, HostHandle, HostInfo};
+//! (store, shots, exports, log) and the recorder. Where the directory and
+//! the log ARE is the host's platform's business
+//! (`crate::host::Platform`): a directory tree natively, a name and a blob
+//! URL in a browser page.
+use crate::host::{HostConfig, HostHandle, HostInfo, KeptShot};
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
-use std::time::Instant;
 
 pub struct Session {
     pub id: String,
@@ -16,7 +18,8 @@ pub struct Session {
     /// SAME store (`session_restart`). `None` for an attached window: that app
     /// is the user's and the server never built it.
     pub config: Option<HostConfig>,
-    pub started: Instant,
+    /// The platform clock's reading when the session started (`now_ms`).
+    pub started_ms: f64,
     shots: AtomicU64,
     recorder: Mutex<Recorder>,
 }
@@ -39,17 +42,15 @@ pub struct SessionInfo {
 
 impl Session {
     pub fn new(root: &std::path::Path, host: HostHandle, config: Option<HostConfig>, record: bool) -> Result<Self, String> {
-        let id = format!("{}-{}", chrono_free_stamp(), std::process::id());
-        let dir = root.join(&id);
-        for sub in ["shots", "exports", "config"] {
-            std::fs::create_dir_all(dir.join(sub)).map_err(|e| format!("session dir {}: {e}", dir.display()))?;
-        }
+        let id = host.platform.stamp();
+        let dir = host.platform.session_dir(root, &id)?;
+        let started_ms = host.platform.now_ms();
         Ok(Self {
             id,
             dir,
             host,
             config,
-            started: Instant::now(),
+            started_ms,
             shots: AtomicU64::new(0),
             recorder: Mutex::new(Recorder { on: record, steps: Vec::new() }),
         })
@@ -60,16 +61,19 @@ impl Session {
             id: self.id.clone(),
             dir: self.dir.display().to_string(),
             host: self.host.info.clone(),
-            uptime_ms: self.started.elapsed().as_millis(),
+            uptime_ms: (self.host.platform.now_ms() - self.started_ms).max(0.0) as u128,
             shots: self.shots.load(Ordering::Relaxed),
             recording: self.recorder.lock().unwrap().on,
         }
     }
 
-    /// Reserve the next shot number and its path.
-    pub fn next_shot(&self) -> (u64, PathBuf) {
+    /// Keep the next shot: reserve its number, hand the PNG (and the
+    /// manifest, when the capture made one) to the platform, and answer with
+    /// the number and where it went.
+    pub fn keep_shot(&self, png: &[u8], manifest: Option<&Value>) -> Result<(u64, KeptShot), String> {
         let n = self.shots.fetch_add(1, Ordering::Relaxed) + 1;
-        (n, self.dir.join("shots").join(format!("{n:04}.png")))
+        let kept = self.host.platform.keep_shot(&self.dir, n, png, manifest)?;
+        Ok((n, kept))
     }
 
     pub fn record(&self, tool: &str, args: &Value, ok: bool, digest: Value) {
@@ -79,10 +83,7 @@ impl Session {
         }
         let entry = json!({ "tool": tool, "args": args, "ok": ok, "digest": digest });
         r.steps.push(entry.clone());
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(self.dir.join("log.jsonl")) {
-            use std::io::Write;
-            let _ = writeln!(f, "{entry}");
-        }
+        self.host.platform.append_log(&self.dir, &entry.to_string());
     }
 
     pub fn set_recording(&self, on: bool) {
@@ -110,11 +111,3 @@ impl Session {
     }
 }
 
-/// A sortable timestamp without pulling in a date crate.
-fn chrono_free_stamp() -> String {
-    let secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    format!("{secs}")
-}

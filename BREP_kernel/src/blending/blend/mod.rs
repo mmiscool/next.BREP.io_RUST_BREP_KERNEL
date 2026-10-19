@@ -51,6 +51,43 @@ thread_local! {
 }
 
 thread_local! {
+    /// Set only while the open-pad composition (`fillet/edges.rs`, the
+    /// 2026-10-17 face-ring report) builds its two stages on this thread.
+    static OPEN_PAD_NETWORK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `build` as the open-pad composition's network: the open march takes
+/// a station where a contact crosses its carrier's domain boundary and the
+/// row fit breaks there (`march_open_stations_core`), and the march extends
+/// past a section end that lies outside the overshoot
+/// (`open_station_parameters`). Both are what the composition's walls need
+/// (the F6 blend rail of the reported ring stood 7.1e-5 off its carrier at
+/// the boundary; the pads' stripes start before their trims) and both move
+/// a body the plain network already built (2026-10-18: the reported model's
+/// F6 moved by a refinement rung and a broken row), so outside the
+/// composition every network is built exactly as before. Restores the flag
+/// after.
+pub(crate) fn with_open_pad_network<T>(build: impl FnOnce() -> T) -> T {
+    /// Restores the previous flag on every exit path, an unwinding panic
+    /// included, so a later network on this thread never inherits it.
+    struct Reset(bool);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            OPEN_PAD_NETWORK.with(|flag| flag.set(self.0));
+        }
+    }
+    let _reset = Reset(OPEN_PAD_NETWORK.with(|flag| flag.replace(true)));
+    build()
+}
+
+/// Whether the march runs as the open-pad composition's network (see
+/// [`with_open_pad_network`]).
+pub(in crate::blend) fn open_pad_network_on() -> bool {
+    OPEN_PAD_NETWORK.with(|flag| flag.get())
+}
+
+
+thread_local! {
     static EXACT_LANE_FOR_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
     static EXACT_REVOLUTION_FOR_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
     static EXACT_RIM_LANE_FOR_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
@@ -724,7 +761,7 @@ pub fn take_blend_approximations(bodies: &[(&str, &crate::BrepSolid)]) -> Vec<cr
 pub use chain::{blend_smooth_chain, blend_smooth_chain_if_closed};
 pub(crate) use corner::round_concave_chain_corner;
 pub use corner::round_convex_corner;
-pub use edge::{blend_closed_edge, blend_edge_variable, blend_open_edge};
+pub use edge::{blend_closed_edge, blend_closed_edge_knot_aware, blend_edge_variable, blend_open_edge, is_pcurve_floor_refusal, with_pcurve_knot_retry};
 pub(crate) use collapse::is_full_width_collapse;
 pub(crate) use planar_chart::{
     fit_planar_charts_to_trims, is_planar_chart_refusal, planar_chart_overrun,
@@ -736,6 +773,94 @@ pub(crate) use network::{
     MixedCorner,
 };
 pub(crate) use miter::{is_marched_fit_off_carriers, is_miter_support_overrun};
+/// The two faces each selected edge lies on, in the network's mate order
+/// (the open-pad composition reads which is planar and which is the boss).
+pub(crate) fn selection_mates<'a>(
+    solid: &'a crate::topology::BrepSolid,
+    edge_ids: &[u64],
+    radius: f64,
+) -> Result<Vec<(&'a crate::topology::EdgeRecord, [&'a crate::topology::FaceRecord; 2])>, crate::KernelRefusal> {
+    Ok(network::stripe_mates(solid, edge_ids, radius)?
+        .into_iter()
+        .map(|(edge, first, second)| (edge, [first.face, second.face]))
+        .collect())
+}
+
 pub(crate) use runout::{build_runout_walls, plan_runout, take_runout_reports, RunoutPlan, RunoutWallReport};
-pub(crate) use fold::{is_wall_fold, WALL_FOLDS};
+pub(crate) use fold::{is_wall_fold, wall_loop_refusal, WALL_FOLDS};
 pub(crate) use stations::is_ball_off_carrier;
+// Lane D 2026-10-14 (appended): the inside-corner classification's name and
+// its opt-in miter switch, read by the runout composition and its tests.
+pub(crate) use network::is_reentrant_concave;
+
+/// Off the switch every closed rim's two support pcurves are refitted to their
+/// rail's projected track (`edge/closed.rs::refit_closed_support_pcurve`, the
+/// closed chain's support-piece fitter: a dense track of analytic feet, a
+/// verified fit ladder and the shipped read), 96 of the half torus's 98 ms of
+/// rows. On the switch each trim is first READ as shipped at the same floor
+/// (`track_fit::read_shipped_pcurve`, `PCURVE_REFINEMENT_TOLERANCE`): a plane
+/// mate's trim is the rail's own control points through the plane's affine
+/// chart (exact by construction, the exact revolution lane's rule); any other
+/// mate's trim, or an image that misses, takes the refit as before (the
+/// march's own interpolated pcurve was measured as a candidate and dropped:
+/// 8.5e-5 off on the half torus's torus mate). The shipped contract is
+/// unchanged (every trim read within the floor); the bytes are not, so it
+/// landed OFF and was promoted by its census (the kernel battery, the case
+/// manifest and hlr_tests with the switch on). ON by default;
+/// `BREP_BLEND_CLOSED_TRIM_READ_FIRST=0` is the escape hatch back to the refit
+/// road, `=1` forces it on; `set_closed_trim_read_first_for_test` forces
+/// either way on a test's thread.
+const CLOSED_TRIM_READ_FIRST_DEFAULT: bool = true;
+
+thread_local! {
+    static CLOSED_TRIM_READ_FIRST_FOR_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+pub(crate) fn closed_trim_read_first_on() -> bool {
+    if let Some(forced) = CLOSED_TRIM_READ_FIRST_FOR_TEST.with(|forced| forced.get()) {
+        return forced;
+    }
+    match std::env::var("BREP_BLEND_CLOSED_TRIM_READ_FIRST").as_deref() {
+        Ok("0") => false,
+        Ok("1") => true,
+        _ => CLOSED_TRIM_READ_FIRST_DEFAULT,
+    }
+}
+
+
+/// The check solves 31 centres per interval by continuation from the
+/// neighbour, each a full station Newton with a finite-difference Jacobian
+/// rebuilt at every iteration (eleven evaluations of the tangency system a
+/// centre, 89 of the half torus's 169 ms of march). On the switch each centre
+/// is seeded by a quadratic extrapolation through the last three and solved
+/// by the chord method with the Jacobian carried from centre to centre
+/// (`stations::solve_station_state_chord`), to the plain solver's own stop;
+/// the plain solver from the neighbour is the fall-back for anything the
+/// chord cannot finish. The centres are the same roots to the same tolerance,
+/// not the same bits: the declared wall reading moves in its last digits, its
+/// verdict and the body do not, which is why it landed OFF and was promoted
+/// by its census. ON by default; `BREP_BLEND_CLOSED_WALL_PREDICT=0` is the
+/// escape hatch back to the plain continuation solves, `=1` forces it on;
+/// `set_closed_wall_predict_for_test` forces either way on a test's thread.
+const CLOSED_WALL_PREDICT_DEFAULT: bool = true;
+
+thread_local! {
+    static CLOSED_WALL_PREDICT_FOR_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+pub(crate) fn closed_wall_predict_on() -> bool {
+    if let Some(forced) = CLOSED_WALL_PREDICT_FOR_TEST.with(|forced| forced.get()) {
+        return forced;
+    }
+    match std::env::var("BREP_BLEND_CLOSED_WALL_PREDICT").as_deref() {
+        Ok("0") => false,
+        Ok("1") => true,
+        _ => CLOSED_WALL_PREDICT_DEFAULT,
+    }
+}
+
+
+// BREP lane L: begin keyway_floor_open_mixed_corner_20261014
+pub(crate) use corner::{open_mixed_corner_on, round_mixed_concave_open_corner};
+// BREP lane L: end keyway_floor_open_mixed_corner_20261014
+

@@ -56,6 +56,81 @@ fn cross_section_profile(
     Ok(profile)
 }
 
+/// The FULL ROUND of a circular edge (lane F row 4): a convex rim whose ball radius
+/// equals the distance from the rim to its axis along one support, so that support's
+/// tangency lands ON the revolve axis and the blend wall is a sphere capping the
+/// rod's end. The ordinary profile (corner, tangency, arc, tangency) then pinches to
+/// a point at the pole — the cap line and the arc meet tangentially on the axis —
+/// and its revolution is not a manifold solid (Euler 1, expected 2). This profile
+/// grows the cutter into the air past the pinched support instead: it runs from a
+/// point one radius beyond the corner down the other support to its tangency, along
+/// the arc to the pole, up the axis and back out, so the revolved cutter is the end
+/// slab minus the ball, with the ball's pole on the axis. The arc stays the second
+/// curve (the blend wall, `build_exact_tool`). `None` when no tangency is on the
+/// axis: that edge takes `cross_section_profile`.
+fn full_round_profile(
+    cross: &EdgeCross,
+    radius: f64,
+    chamfer: bool,
+) -> Result<Option<Vec<NurbsCurve>>, KernelRefusal> {
+    let EdgePath::Circular { center, axis, .. } = &cross.path else {
+        return Ok(None);
+    };
+    if chamfer || !cross.convex {
+        return Ok(None);
+    }
+    let corner = cross.start;
+    let theta = cross.into_first.dot(cross.into_second).clamp(-1.0, 1.0).acos();
+    if theta <= 1e-6 || theta >= std::f64::consts::PI - 1e-6 {
+        return Ok(None);
+    }
+    let tangent_offset = radius / (theta * 0.5).tan();
+    let radial = |point: Vec3| {
+        let offset = point.sub(*center);
+        offset.sub(axis.scale(offset.dot(*axis))).length()
+    };
+    let rim_radius = radial(corner);
+    let on_axis = |point: Vec3| radial(point) <= 1e-9 * rim_radius.max(1.0);
+    let first_tangency = corner.add(cross.into_first.scale(tangent_offset));
+    let second_tangency = corner.add(cross.into_second.scale(tangent_offset));
+    // `pole` is the tangency on the axis, `wall` the other support's.
+    let (pole, wall, into_wall) = if on_axis(first_tangency) {
+        (first_tangency, second_tangency, cross.into_second)
+    } else if on_axis(second_tangency) {
+        (second_tangency, first_tangency, cross.into_first)
+    } else {
+        return Ok(None);
+    };
+    let bisector = cross
+        .into_first
+        .add(cross.into_second)
+        .normalized()
+        .or_refuse(KernelStage::Fragment, "full_round_bisector")?;
+    let ball = corner.add(bisector.scale(radius / (theta * 0.5).sin()));
+    // Away from the material across the pinched support: back along the
+    // wall support's inward direction, by one radius.
+    let lift = into_wall.scale(-radius);
+    let corner_up = corner.add(lift);
+    let pole_up = pole.add(lift);
+    let line = |from: Vec3, to: Vec3| {
+        make_line(from, to).or_refuse(KernelStage::Fragment, "full_round_line")
+    };
+    let x_axis = wall.sub(ball).scale(1.0 / radius);
+    let toward_pole = pole.sub(ball).scale(1.0 / radius);
+    let y_axis = toward_pole
+        .sub(x_axis.scale(toward_pole.dot(x_axis)))
+        .normalized()
+        .or_refuse(KernelStage::Fragment, "full_round_arc_axis")?;
+    let arc = make_arc(ball, x_axis, y_axis, radius, 0.0, std::f64::consts::PI - theta)
+        .or_refuse(KernelStage::Fragment, "full_round_arc")?;
+    Ok(Some(vec![
+        line(corner_up, wall)?,
+        arc,
+        line(pole, pole_up)?,
+        line(pole_up, corner_up)?,
+    ]))
+}
+
 /// Asymmetric chamfer cross-section (Golovanov §6.11): the removed triangular
 /// sliver has EXPLICIT per-face setbacks — the standard CAD "d1 × d2"
 /// convention, `d1` along face 1 (`into_first`) and `d2` along face 2
@@ -311,7 +386,16 @@ fn fillet_or_chamfer_inner(
     let lane_note = |what: &'static str, message: &str| {
         KernelRefusal::unsupported(KernelStage::Classify, what, message)
     };
-    let general = if ends != ToolEnds::default() {
+    // A concave fill that runs past its support face into air is built only
+    // by the clipped cutter: the general lanes would build the pad unclipped,
+    // overhanging the part (lane F row 5).
+    let clip_probe = crate::blend::BlendTimer::start("timing.cutter.clip_probe_ms");
+    let clipped_fill = !chamfer && ends == ToolEnds::default() && concave_clip_face(solid, edge_id, radius).is_some();
+    clip_probe.stop();
+    let general_first = crate::blend::BlendTimer::start("timing.cutter.general_first_ms");
+    let general = if clipped_fill {
+        Err(lane_note("clipped_fill", "a concave fill past its support face is clipped by the cutter"))
+    } else if ends != ToolEnds::default() {
         Err(lane_note("padded_cutter", "a padded cutter was requested"))
     } else if lane == Lane::CutterFirst {
         Err(lane_note(
@@ -349,9 +433,13 @@ fn fillet_or_chamfer_inner(
     // the ladder carries on to the cutter, whose boolean does split the
     // crossing faces and drop the fragments in the void.
     let entry = if chamfer { "chamfer" } else { "fillet" };
+    general_first.stop();
     let general_error = match general {
         Ok(result) if result.validate().is_empty() => {
-            match check_blend_interference(solid, &result, &[edge_id], entry) {
+            let interference = crate::blend::BlendTimer::start("timing.cutter.general_first.interference_ms");
+            let checked = check_blend_interference(solid, &result, &[edge_id], entry).and_then(|()| check_blend_wall_loops(&result, entry));
+            interference.stop();
+            match checked {
                 Ok(()) => return Ok(result),
                 Err(untrimmed) => untrimmed,
             }
@@ -383,27 +471,59 @@ fn fillet_or_chamfer_inner(
     if is_terminal_blend_refusal(&general_error) {
         return Err(general_error);
     }
-    match fillet_or_chamfer_exact(solid, edge_id, radius, chamfer, name, ends, lane) {
+    let exact_timer = crate::blend::BlendTimer::start("timing.cutter.exact_ms");
+    let exact = fillet_or_chamfer_exact(solid, edge_id, radius, chamfer, name, ends, lane);
+    exact_timer.stop();
+    match exact {
         Ok(result) => Ok(result),
         Err(exact_error) => {
+            let _general_last = crate::blend::BlendTimer::start("timing.cutter.general_last_ms");
             // The exact special cases (straight×planar extrude, circular×
             // straight-meridian rotational revolve) cover a subset; every
             // other edge goes through the general §4.9 tangency march with
             // direct §6.9 surgery.
             let general = if closed {
-                crate::blend::blend_closed_edge(solid, edge_id, radius, chamfer, name)
+                // BREP lane L: begin lcount201_knot_aware_last_rung_20261016
+                // The last rung: a support pcurve off the floor is terminal for
+                // the whole fillet here, so the closed rim gets ONE knot-aware
+                // retry; a retry that also fails keeps the first refusal.
+                crate::blend::blend_closed_edge(solid, edge_id, radius, chamfer, name).or_else(|first| {
+                    if crate::blend::is_pcurve_floor_refusal(&first) {
+                        crate::blend::blend_closed_edge_knot_aware(solid, edge_id, radius, chamfer, name).map_err(|_| first)
+                    } else {
+                        Err(first)
+                    }
+                })
+                // BREP lane L: end lcount201_knot_aware_last_rung_20261016
             } else {
-                crate::blend::blend_smooth_chain(solid, edge_id, radius, chamfer, name)
+                let rung = crate::blend::BlendTimer::start("timing.cutter.general_last.smooth_chain_ms");
+                let chain = crate::blend::blend_smooth_chain(solid, edge_id, radius, chamfer, name);
+                let chain_ms = rung.stop();
+                if let Err(error) = &chain {
+                    if std::env::var("BREP_DEBUG_NETWORK").is_ok() {
+                        eprintln!("last rung, smooth chain of edge {edge_id} refused after {chain_ms:.1} ms: {error}");
+                    }
+                }
+                chain
                     .or_else(|error| {
                         if is_terminal_blend_refusal(&error) {
                             return Err(error);
                         }
-                        crate::blend::blend_open_edge(solid, edge_id, radius, chamfer, name)
+                        let rung = crate::blend::BlendTimer::start("timing.cutter.general_last.open_edge_ms");
+                        let open = crate::blend::blend_open_edge(solid, edge_id, radius, chamfer, name);
+                        let open_ms = rung.stop();
+                        if let Err(error) = &open {
+                            if std::env::var("BREP_DEBUG_NETWORK").is_ok() {
+                                eprintln!("last rung, open march of edge {edge_id} refused after {open_ms:.1} ms: {error}");
+                            }
+                        }
+                        open
                     })
                     .or_else(|error| {
                         if is_terminal_blend_refusal(&error) {
                             return Err(error);
                         }
+                        let _rung = crate::blend::BlendTimer::start("timing.cutter.general_last.star_network_ms");
                         // The one-edge network, which the general-first lane
                         // runs BEFORE the open-edge march and this rung never
                         // ran: the two differ at a free end whose mates run
@@ -448,7 +568,10 @@ fn fillet_or_chamfer_inner(
             // than as a self-intersecting solid.
             general
                 .and_then(|result| {
-                    check_blend_interference(solid, &result, &[edge_id], entry).map(|()| result)
+                    let rung = crate::blend::BlendTimer::start("timing.cutter.general_last.interference_ms");
+                    let checked = check_blend_interference(solid, &result, &[edge_id], entry).and_then(|()| check_blend_wall_loops(&result, entry)).map(|()| result);
+                    rung.stop();
+                    checked
                 })
                 .map_err(|error| {
                     // Reachable with a fold only in the cutter-first
@@ -478,6 +601,15 @@ fn fillet_or_chamfer_inner(
 pub(super) struct ToolEnds {
     start: f64,
     end: f64,
+}
+
+impl ToolEnds {
+    /// The two pads as bit patterns: an exact key for a memo of cutters
+    /// built with these ends (the sequential composition's prefix memo in
+    /// `fillet/edges.rs`).
+    pub(super) fn key_bits(&self) -> [u64; 2] {
+        [self.start.to_bits(), self.end.to_bits()]
+    }
 }
 
 /// Build the fillet/chamfer cutter for one edge.  `overshoot` extends a
@@ -581,6 +713,89 @@ fn build_exact_tool(
         }
     }
     Ok(tool)
+}
+
+/// Clip a concave edge's fill tool by the prism of its support face's outline
+/// (lane F row 5): where the fill's contact runs past the face's outer boundary
+/// into air, the blend is the fill cut back to the side planes the face is
+/// bounded by — the outline, extruded along the face's normal
+/// (`concave_clip_outline` admits only walls parallel to it). A hole loop of
+/// the face (a through-hole the fill runs over, lCount_415) is cut out of the
+/// clipped fill by its own prism, so the fill neither bridges the hole nor
+/// plugs it. Each prism reaches `depth` below the face and the fill's whole
+/// height above it; its faces are scaffold like the tool's own, so where they
+/// survive on the walls they settle into them.
+fn clip_fill_by_face_outline(
+    solid: &BrepSolid,
+    tool: &BrepSolid,
+    face_id: u64,
+    edge_id: u64,
+    height: f64,
+    name: Option<&str>,
+) -> Result<BrepSolid, KernelRefusal> {
+    let unclippable = |what: &'static str| {
+        KernelRefusal::unsupported(KernelStage::Fragment, what, "the fill's clip outline cannot be built")
+    };
+    let face = solid
+        .shells
+        .iter()
+        .flat_map(|shell| &shell.faces)
+        .find(|face| face.id == face_id)
+        .ok_or_else(|| unclippable("clip_face"))?;
+    let angular = crate::KernelTolerances::for_solid(solid, 1e-7).angular;
+    let loops = concave_clip_outline(solid, face, edge_id, angular).ok_or_else(|| unclippable("clip_outline"))?;
+    let first_edge = face.loops[loops[0]].coedges.first().ok_or_else(|| unclippable("clip_loop"))?.edge_id;
+    let first = solid.edges.iter().find(|edge| edge.id == first_edge).ok_or_else(|| unclippable("clip_edge"))?;
+    let (_, normal) = face_plane_normal(face, first.curve.evaluate(first.t0).or_refuse(KernelStage::Fragment, "clip_anchor")?)?;
+    let depth = height;
+    let prism_of = |loop_record: &crate::topology::LoopRecord| -> Result<BrepSolid, KernelRefusal> {
+        let mut profile = Vec::with_capacity(loop_record.coedges.len() + 1);
+        for coedge in &loop_record.coedges {
+            let border = solid.edges.iter().find(|edge| edge.id == coedge.edge_id).ok_or_else(|| unclippable("clip_edge"))?;
+            let curve = crate::step::edge_subcurve(border).or_refuse(KernelStage::Fragment, "clip_subcurve")?;
+            let mut curve = if coedge.forward {
+                curve
+            } else {
+                curve.reversed().or_refuse(KernelStage::Fragment, "clip_reverse")?
+            };
+            // Homogeneous control points store (P·w, w): move P by −depth·normal.
+            for cp in curve.control_points.iter_mut() {
+                let delta = normal.scale(-depth * cp.w);
+                cp.x += delta.x;
+                cp.y += delta.y;
+                cp.z += delta.z;
+            }
+            profile.push(curve);
+        }
+        // A loop of one closed edge (a round hole) is two halves to the extrude.
+        if profile.len() == 1 {
+            let [t0, t1] = profile[0].domain().or_refuse(KernelStage::Fragment, "clip_domain")?;
+            let (head, tail) = profile[0].split(0.5 * (t0 + t1)).or_refuse(KernelStage::Fragment, "clip_split")?;
+            profile = vec![head, tail];
+        }
+        let mut prism = extrude_profile_brep(&profile, normal, depth + 2.0 * height)?;
+        for shell in &mut prism.shells {
+            for face in &mut shell.faces {
+                face.name = Some(scaffold_tag(name));
+            }
+        }
+        Ok(prism)
+    };
+    let options = BooleanOptions {
+        merge_coplanar_faces: false,
+        ..BooleanOptions::default()
+    };
+    let outer = prism_of(&face.loops[loops[0]])?;
+    let mut clipped = crate::boolean_operation_with_diagnostics(tool, &outer, BooleanOperation::Intersect, &options)?.value;
+    for &hole in &loops[1..] {
+        let prism = prism_of(&face.loops[hole])?;
+        let tolerance = crate::KernelTolerances::for_solid(solid, 1e-7).model;
+        if !crate::recentre::solid_bounds(&clipped).intersects(crate::recentre::solid_bounds(&prism), tolerance) {
+            continue;
+        }
+        clipped = crate::boolean_operation_with_diagnostics(&clipped, &prism, BooleanOperation::Subtract, &options)?.value;
+    }
+    Ok(clipped)
 }
 
 /// Prefix of the name stamped on every cutter face except the blend wall while
@@ -843,7 +1058,15 @@ fn fillet_or_chamfer_exact(
     lane: Lane,
 ) -> Result<BrepSolid, KernelRefusal> {
     let cross = analyze_edge(solid, edge_id, radius)?;
-    let profile = cross_section_profile(&cross, radius, chamfer)?;
+    let clip = if chamfer || ends != ToolEnds::default() {
+        None
+    } else {
+        concave_clip_face(solid, edge_id, radius)
+    };
+    let profile = match full_round_profile(&cross, radius, chamfer)? {
+        Some(profile) => profile,
+        None => cross_section_profile(&cross, radius, chamfer)?,
+    };
     // Straight edges: try a flush tool first (the workhorse box/prism case,
     // where the end caps land coincident on transverse end faces and the
     // boolean handles them), then retry with a small overshoot if that
@@ -886,6 +1109,10 @@ fn fillet_or_chamfer_exact(
     for exact_only in [true, false] {
         for (attempt, &overshoot) in overshoots.iter().enumerate() {
             let tool = build_exact_tool(&cross, &profile, overshoot, ends, name)?;
+            let tool = match clip {
+                Some(face) => clip_fill_by_face_outline(solid, &tool, face, edge_id, 2.0 * radius, name)?,
+                None => tool,
+            };
             let assembled = if exact_only {
                 apply_tool_exact(solid, &tool, cross.convex)
             } else {

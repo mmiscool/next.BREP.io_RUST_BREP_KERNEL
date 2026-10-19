@@ -129,10 +129,17 @@ fn label_text_edit<'t>(
     // Size the box to its text so the value never wraps — measured in the SAME
     // scaled font it draws with.
     let width = text_edit_width(ui, buf.as_str(), font);
+    let mut margin = chip_margin(4.0, 2.0, scale);
+    if super::touch::enabled(ui.ctx()) {
+        let height = ui.fonts_mut(|fonts| fonts.row_height(font));
+        let pad = ((super::touch::TARGET - height) * 0.5).ceil().max(2.0) as i8;
+        margin.top = margin.top.max(pad); margin.bottom = margin.bottom.max(pad);
+    }
     egui::TextEdit::singleline(buf)
         .desired_width(width)
-        .margin(chip_margin(4.0, 2.0, scale))
+        .margin(margin)
         .font(egui::FontSelection::FontId(font.clone()))
+        .min_size(super::touch::target_size(ui.ctx(), egui::Vec2::ZERO))
 }
 
 /// Select the ENTIRE contents of a just-opened inline `TextEdit`. Call on the
@@ -166,6 +173,10 @@ impl Viewport {
         rect: egui::Rect,
         state: &mut EngineState,
     ) {
+        let finger = super::touch::enabled(ctx);
+        let mut touch_rects: Vec<(String, egui::Rect)> = Vec::new();
+        #[cfg(all(feature = "automation", target_arch = "wasm32"))]
+        crate::automation::registry::publish("__brepTouchSketchDimensions", "touch sketch dimension label/input/apply/cancel rectangles", "{}");
         // The 3D sketch publishes the same label shape; its labels have no
         // draggable leader, and its values apply through its own setter.
         let three_d = state.sketch3d_mode();
@@ -274,10 +285,14 @@ impl Viewport {
                             // unscaled — without this the chip's HEIGHT is
                             // floored at the 1.0 button height at every scale.
                             scale_label_spacing(ui, label_scale);
+                            if finger {
+                                ui.spacing_mut().interact_size = ui.spacing().interact_size.max(egui::Vec2::splat(super::touch::TARGET));
+                            }
                             if is_editing {
                                 let buf = &mut editing.as_mut().expect("editing buffer").1;
                                 let editor = label_text_edit(ui, buf, &font, label_scale);
                                 let resp = ui.add(editor);
+                                if finger { touch_rects.push((format!("input:{cid_key}"), resp.rect)); }
                                 if fresh {
                                     resp.request_focus();
                                     select_all_text_edit(ui.ctx(), resp.id, buf.chars().count());
@@ -294,6 +309,16 @@ impl Viewport {
                                 if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
                                     cancel = true;
                                 }
+                                if finger {
+                                    ui.horizontal(|ui| {
+                                        let ok = ui.button("Apply");
+                                        let no = ui.button("Cancel");
+                                        touch_rects.push((format!("apply:{cid_key}"), ok.rect));
+                                        touch_rects.push((format!("cancel:{cid_key}"), no.rect));
+                                        apply |= ok.clicked();
+                                        cancel |= no.clicked();
+                                    });
+                                }
                             } else {
                                 let text = label["text"].as_str().unwrap_or("").to_string();
                                 let color = if label["conflicting"].as_bool() == Some(true) {
@@ -309,9 +334,11 @@ impl Viewport {
                                     )
                                     // Never wrap/clip the chip — extend to fit its text.
                                     .wrap_mode(egui::TextWrapMode::Extend)
-                                    .sense(egui::Sense::click_and_drag()),
+                                    .sense(egui::Sense::click_and_drag())
+                                    .min_size(super::touch::target_size(ctx, egui::Vec2::ZERO)),
                                 );
-                                if resp.double_clicked() {
+                                if finger { touch_rects.push((format!("label:{cid_key}"), resp.rect)); }
+                                if resp.double_clicked() || (finger && resp.clicked()) {
                                     start_edit = Some(cid.clone());
                                 }
                                 if resp.dragged() {
@@ -330,6 +357,10 @@ impl Viewport {
                         });
                 });
         }
+
+        #[cfg(all(feature = "automation", target_arch = "wasm32"))]
+        crate::automation::registry::publish("__brepTouchSketchDimensions", "touch sketch dimension label/input/apply/cancel rectangles",
+            &crate::automation::hit_rects::hits_json(touch_rects.iter().map(|(key, rect)| (key, rect))));
 
         // --- apply deferred actions (state is free to borrow again here) ---------
         if apply {

@@ -281,6 +281,7 @@ pub(super) fn extend_offset_carriers_past_open_hole_rims(
         );
         carriers[index].solid = BrepSolid {
             mass_properties_cache: Default::default(),
+            cells: Default::default(),
             id: carriers[index].solid.id,
             vertices: vec![
                 VertexRecord {
@@ -894,6 +895,126 @@ pub(super) fn full_rectangle_face(source: &BrepSolid, face: &FaceRecord) -> Resu
     Ok(solid)
 }
 
+/// An open fitted profile whose U trim stops strictly inside the natural
+/// domain. Its V ends already span the profile, so only the two U ends need
+/// construction reach. Closed directions and nonrectangular trims decline.
+pub(super) fn open_profile_has_construction_headroom(face: &FaceRecord) -> Result<bool, KernelRefusal> {
+    let surface = &face.surface;
+    if surface.degree_u <= 1 || surface.degree_v <= 1 || surface.analytic().is_some()
+        || face.loops.len() != 1 || face.loops[0].coedges.len() != 4
+        || surface.control_points.iter().flatten().any(|point| point.w <= 0.0)
+    {
+        return Ok(false);
+    }
+    let (closed_u, closed_v) = surface.closed_directions().or_refuse(KernelStage::Refine, "closed_directions")?;
+    if closed_u || closed_v { return Ok(false); }
+    let [u0,u1] = surface.domain_u().or_refuse(KernelStage::Refine, "domain_u")?;
+    let [v0,v1] = surface.domain_v().or_refuse(KernelStage::Refine, "domain_v")?;
+    let [a,b,c,d] = crate::offset_regularity::TrimRegion::from_face(face)?.bounds();
+    let eu = (u1-u0)*1e-9;
+    let ev = (v1-v0)*1e-9;
+    if a <= u0+eu || b >= u1-eu || (c-v0).abs() > ev || (d-v1).abs() > ev {
+        return Ok(false);
+    }
+    let mut sides = 0u8;
+    for coedge in &face.loops[0].coedges {
+        let controls = &coedge.pcurve.control_points;
+        if controls.iter().any(|p| p.w <= 0.0) { return Ok(false); }
+        let side = if controls.iter().all(|p| (p.x/p.w-a).abs() <= eu) { 1 }
+            else if controls.iter().all(|p| (p.x/p.w-b).abs() <= eu) { 2 }
+            else if controls.iter().all(|p| (p.y/p.w-c).abs() <= ev) { 4 }
+            else if controls.iter().all(|p| (p.y/p.w-d).abs() <= ev) { 8 }
+            else { return Ok(false); };
+        if sides & side != 0 { return Ok(false); }
+        sides |= side;
+    }
+    Ok(sides == 15)
+}
+
+/// Supply the reach that a non-ruled profile's requested U extension cannot
+/// consume. The fitted surface already covers this natural domain; only its
+/// copied source trim clips the sections. Planar neighbours likewise use
+/// their construction rectangles instead of a scaled partial outline.
+pub(super) fn open_section_construction(
+    source: &BrepSolid,
+    face: &FaceRecord,
+    carrier: &BrepSolid,
+    extension: &crate::CarrierExtension,
+    distance: f64,
+) -> Result<Option<BrepSolid>, KernelRefusal> {
+    if !extension.is_active() { return Ok(None); }
+    if face.surface.is_affine().or_refuse(KernelStage::Refine, "is_affine")? {
+        if face.loops.len() == 1
+            && (face.loops[0].coedges.len() > 4 || outline_has_free_element(source, face)?)
+        {
+            return Ok(Some(full_rectangle_face(carrier, &carrier.shells[0].faces[0])?));
+        }
+        return Ok(None);
+    }
+    if (extension.u_min == 0.0 && extension.u_max == 0.0)
+        || !open_profile_has_construction_headroom(face)?
+    {
+        return Ok(None);
+    }
+    let rectangle = full_rectangle_face(source, face)?;
+    let full_face = rectangle.shells.iter().flat_map(|shell| &shell.faces).find(|other| other.id == face.id).unwrap();
+    // Reusing a larger natural domain must pass the ordinary fold/carve gate
+    // there too. A partial carve needs its own reach construction and declines.
+    if carve_folded_support(&rectangle, full_face, distance)?.is_some() {
+        return Ok(None);
+    }
+    Ok(Some(full_rectangle_face(carrier, &carrier.shells[0].faces[0])?))
+}
+
+/// End planes bound the central region of an open profile. At its two V
+/// ends require the original tangent planar joins, so the only new trimming
+/// decisions are the exact sections with the two offset U-end planes.
+pub(super) fn open_profile_end_neighbours(
+    index: usize,
+    carriers: &[Carrier],
+    source_faces: &[&FaceRecord],
+) -> Result<Option<Vec<usize>>, KernelRefusal> {
+    let Some(face) = source_faces.iter().find(|face| face.id == carriers[index].source_face_id) else { return Ok(None); };
+    if !open_profile_has_construction_headroom(face)? { return Ok(None); }
+    let [a,b,_,_] = crate::offset_regularity::TrimRegion::from_face(face)?.bounds();
+    let eu = (b-a)*1e-9;
+    let mut ends = Vec::new();
+    for coedge in &face.loops[0].coedges {
+        let Some((mate, mate_use)) = junction_mate(source_faces, face, coedge.edge_id) else { return Ok(None); };
+        if !mate.surface.is_affine().or_refuse(KernelStage::Select, "is_affine")? { return Ok(None); }
+        let Some((other, _)) = carriers.iter().enumerate().find(|(_, carrier)|
+            carrier.source_face_id == mate.id && matches!(carrier.kind, OffsetFaceRole::Offset))
+        else { return Ok(None); };
+        let at_end = [a,b].iter().any(|u| coedge.pcurve.control_points.iter().all(|p| (p.x/p.w-u).abs() <= eu));
+        if at_end {
+            ends.push(other);
+        } else if !uses_are_tangent(face, coedge, mate, mate_use)? {
+            return Ok(None);
+        }
+    }
+    Ok((ends.len() == 2).then_some(ends))
+}
+
+/// The outside-neighbour rule describes a convex spherical union component.
+/// A spherical void has the opposite physical normal and must retain its
+/// existing construction. Analytic recognition alone does not encode that
+/// orientation; read the original face at a regular station too.
+fn convex_sphere_source(face: &FaceRecord) -> Result<Option<crate::NurbsSurface>, KernelRefusal> {
+    // Imported and canonical charts describe the same physical component.
+    // Canonical and transposed sphere charts share the physical continuation rules.
+    let canonical = std::env::var("BREP_OFFSET_SPHERE_CHART_PARITY").as_deref() != Ok("0")
+        && face.surface.analytic().and_then(|shape| shape.sphere_geometry()).is_some();
+    let turned = if canonical { face.surface.clone() }
+        else { crate::offset::transpose_offset_surface(&face.surface)? };
+    let Some((center, _)) = turned.analytic().and_then(|shape| shape.sphere_geometry()) else { return Ok(None); };
+    let [u0,u1] = face.surface.domain_u().or_refuse(KernelStage::Refine, "domain_u")?;
+    let [v0,v1] = face.surface.domain_v().or_refuse(KernelStage::Refine, "domain_v")?;
+    let (u,v) = ((u0+u1)*0.5, (v0+v1)*0.5);
+    let (Ok(point), Ok(normal)) = (face.surface.evaluate(u,v), face.surface.normal(u,v)) else { return Ok(None); };
+    let outward = normal.scale(if face.same_sense { 1.0 } else { -1.0 });
+    Ok((outward.dot(point.sub(center)) > 0.0).then_some(turned))
+}
+
 /// Rebuild an offset carrier as its surface's FULL-DOMAIN face: seam edge
 /// used twice, v-domain ends as closed rims — or degenerate point edges when
 /// the iso curve collapses (poles), matching a freshly made sphere face. Any
@@ -920,6 +1041,37 @@ fn rebuild_carrier_full_domain(
         .length()
         > weld_band
     {
+        // A sphere's periodic direction can be V. Its cloned source trim
+        // stops before the new offset neighbours; the same full-domain
+        // construction must work in either chart. Normalize only a
+        // proved sphere, preserving the physical face normal and
+        // transforming every pcurve with its surface.
+        if distance > 0.0 && std::env::var("BREP_OFFSET_SPHERE_SECTION_REACH").as_deref() != Ok("0") {
+            // This branch changes a V-periodic imported chart into a
+            // U-periodic one. An already analytic source is not a chart
+            // transposition candidate, even when neighbour parity is on.
+            if let Some(transposed_source) = convex_sphere_source(source_face)?
+                .filter(|_| source_face.surface.analytic().is_none())
+            {
+                let mut normalized = carrier.clone();
+                let face = &mut normalized.solid.shells[0].faces[0];
+                face.surface = crate::offset::transpose_offset_surface(&face.surface)?;
+                face.same_sense = !face.same_sense;
+                for coedge in face.loops.iter_mut().flat_map(|lp| &mut lp.coedges) {
+                    for control in &mut coedge.pcurve.control_points {
+                        std::mem::swap(&mut control.x, &mut control.y);
+                    }
+                }
+                let mut source = source_face.clone();
+                source.surface = transposed_source;
+                source.same_sense = !source.same_sense;
+                if rebuild_carrier_full_domain(&mut normalized, &source, weld_band, distance, index, reason)? {
+                    os_debug!("carrier[{index}] sphere section reach: normalized periodic V chart");
+                    *carrier = normalized;
+                    return Ok(true);
+                }
+            }
+        }
         return Ok(false);
     }
     // A SPHERE source gets its carrier rebuilt on the EXACT full offset
@@ -1065,6 +1217,7 @@ fn rebuild_carrier_full_domain(
     );
     carrier.solid = BrepSolid {
         mass_properties_cache: Default::default(),
+        cells: Default::default(),
         id: carrier.solid.id,
         vertices: vec![
             VertexRecord {
@@ -1131,18 +1284,54 @@ pub(super) fn rebuild_reflex_rim_carriers(
         if !matches!(carriers[index].kind, OffsetFaceRole::Offset) {
             continue;
         }
-        if smooth_pairs
-            .iter()
-            .any(|(first, second)| *first == index || *second == index)
-        {
-            continue;
-        }
         let Some(source_face) = source_faces
             .iter()
             .find(|face| face.id == carriers[index].source_face_id)
         else {
             continue;
         };
+        // At a cropped sphere junction all participating supports need
+        // construction reach: continuing only the sphere leaves the planar
+        // or extruded neighbour clipped at the old sphere's section.
+        if distance > 0.0 && std::env::var("BREP_OFFSET_SPHERE_SECTION_REACH").as_deref() != Ok("0")
+            && face_reflex_miter_tan(source, source_face)?.is_some()
+            && (source_face.surface.is_affine().or_refuse(KernelStage::Refine, "is_affine")?
+                || (source_face.surface.degree_u == 1 && source_face.surface.control_points.len() == 2))
+        {
+            let mut spherical_neighbour = false;
+            for neighbour in source_faces {
+                if !source_faces_adjacent(source_face, neighbour) {
+                    continue;
+                }
+                if convex_sphere_source(neighbour)?.is_some() {
+                    spherical_neighbour = true;
+                    break;
+                }
+            }
+            if spherical_neighbour && rectangle_preserves_smooth_sides(
+                index, source_face, carriers, source_faces, smooth_pairs)?
+            {
+                // Use the plane's natural domain, without sliding its net:
+                // a uniform reflex pad also moves its tangent ends away
+                // from the neighbouring extrusion's exact end isolines.
+                let construction = if source_face.surface.is_affine().or_refuse(KernelStage::Refine, "is_affine")? {
+                    carrier_solid(source, source_face.id, distance, 0.0)?
+                } else {
+                    carriers[index].solid.clone()
+                };
+                carriers[index].solid = full_rectangle_face(
+                    &construction, &construction.shells[0].faces[0])?;
+                os_debug!("carrier[{index}] src={} continued across cropped sphere junction", source_face.id);
+                rebuilt.insert(index);
+                continue;
+            }
+        }
+        if smooth_pairs
+            .iter()
+            .any(|(first, second)| *first == index || *second == index)
+        {
+            continue;
+        }
         if source_face.surface.is_affine().or_refuse(KernelStage::Refine, "is_affine")? {
             continue;
         }
@@ -1161,6 +1350,115 @@ pub(super) fn rebuild_reflex_rim_carriers(
         }
     }
     Ok(rebuilt)
+}
+
+/// A full rectangle may replace a cropped trim only when every synchronized
+/// tangent join remains the same complete domain side. Positive pcurve weights
+/// and their control hull prove the isoline; its ends prove full-side reach.
+fn rectangle_preserves_smooth_sides(
+    index: usize,
+    face: &FaceRecord,
+    carriers: &[Carrier],
+    source_faces: &[&FaceRecord],
+    smooth_pairs: &HashSet<(usize, usize)>,
+) -> Result<bool, KernelRefusal> {
+    let [u0,u1] = face.surface.domain_u().or_refuse(KernelStage::Refine, "domain_u")?;
+    let [v0,v1] = face.surface.domain_v().or_refuse(KernelStage::Refine, "domain_v")?;
+    for &(first, second) in smooth_pairs {
+        let mate = if first == index { second } else if second == index { first } else { continue; };
+        let Some(other) = source_faces.iter().find(|other| other.id == carriers[mate].source_face_id) else { return Ok(false); };
+        for coedge in face.loops.iter().flat_map(|lp| &lp.coedges) {
+            if !other.loops.iter().flat_map(|lp| &lp.coedges).any(|other| other.edge_id == coedge.edge_id) {
+                continue;
+            }
+            let controls = &coedge.pcurve.control_points;
+            if controls.iter().any(|point| point.w <= 0.0) { return Ok(false); }
+            let [t0,t1] = coedge.pcurve.domain().or_refuse(KernelStage::Refine, "domain")?;
+            let a = coedge.pcurve.evaluate(t0).or_refuse(KernelStage::Refine, "evaluate")?;
+            let b = coedge.pcurve.evaluate(t1).or_refuse(KernelStage::Refine, "evaluate")?;
+            let eu = (u1-u0).abs()*1e-9;
+            let ev = (v1-v0).abs()*1e-9;
+            let u_side = [u0,u1].iter().any(|u| controls.iter().all(|p| (p.x/p.w-u).abs() <= eu))
+                && (a.y.min(b.y)-v0).abs() <= ev && (a.y.max(b.y)-v1).abs() <= ev;
+            let v_side = [v0,v1].iter().any(|v| controls.iter().all(|p| (p.y/p.w-v).abs() <= ev))
+                && (a.x.min(b.x)-u0).abs() <= eu && (a.x.max(b.x)-u1).abs() <= eu;
+            if !u_side && !v_side { return Ok(false); }
+        }
+    }
+    Ok(true)
+}
+
+/// The reflex neighbours of a continued sphere bound the other, convex
+/// component of its cavity. Its full-domain sections partition the sphere
+/// into several faces; every portion outside that component is real skin.
+/// A single source seed cannot stand for all of those portions.
+pub(super) fn continued_sphere_neighbours(
+    index: usize,
+    carriers: &[Carrier],
+    source_faces: &[&FaceRecord],
+    scale: f64,
+) -> Result<Option<Vec<usize>>, KernelRefusal> {
+    if std::env::var("BREP_OFFSET_SPHERE_SECTION_REACH").as_deref() == Ok("0") {
+        return Ok(None);
+    }
+    let own = &carriers[index];
+    let Some(source) = source_faces.iter().find(|face| face.id == own.source_face_id) else { return Ok(None); };
+    if (source.surface.analytic().is_some()
+            && std::env::var("BREP_OFFSET_SPHERE_CHART_PARITY").as_deref() == Ok("0"))
+        || own.solid.shells[0].faces[0].surface.analytic().and_then(|shape| shape.sphere_geometry()).is_none()
+    {
+        return Ok(None);
+    }
+    if convex_sphere_source(source)?.is_none() { return Ok(None); }
+    let mut neighbours = Vec::new();
+    for face in source_faces.iter().filter(|face| face.id != source.id && source_faces_adjacent(source, face)) {
+        let Some((other, _)) = carriers.iter().enumerate().find(|(_, carrier)|
+            carrier.source_face_id == face.id && matches!(carrier.kind, OffsetFaceRole::Offset))
+        else { return Ok(None); };
+        if !face.surface.is_affine().or_refuse(KernelStage::Select, "is_affine")? {
+            // Admit a conic extrusion, not an arbitrary ruled or fitted wall.
+            let surface = &face.surface;
+            if surface.degree_u != 1 || surface.degree_v != 2
+                || surface.control_points.len() != 2 || surface.control_points[0].len() != 3
+            {
+                return Ok(None);
+            }
+            let rows = &surface.control_points;
+            let translation = rows[1][0].point().or_refuse(KernelStage::Select, "point")?
+                .sub(rows[0][0].point().or_refuse(KernelStage::Select, "point")?);
+            for column in 0..3 {
+                let a = rows[0][column];
+                let b = rows[1][column];
+                if a.w <= 0.0 || b.w <= 0.0 || (a.w-b.w).abs() > 1e-12
+                    || b.point().or_refuse(KernelStage::Select, "point")?
+                        .sub(a.point().or_refuse(KernelStage::Select, "point")?)
+                        .sub(translation).length() > scale*1e-9
+                {
+                    return Ok(None);
+                }
+            }
+        }
+        neighbours.push(other);
+    }
+    Ok((neighbours.len() >= 2).then_some(neighbours))
+}
+
+pub(super) fn outside_continued_neighbours(
+    point: Vec3,
+    neighbours: &[usize],
+    carriers: &[Carrier],
+    tolerance: f64,
+) -> Result<bool, KernelRefusal> {
+    for &index in neighbours {
+        let face = &carriers[index].solid.shells[0].faces[0];
+        let foot = project_point_to_surface(&face.surface, point).or_refuse(KernelStage::Select, "project_point_to_surface")?;
+        let normal = face.surface.normal(foot.u, foot.v).or_refuse(KernelStage::Select, "normal")?
+            .scale(if face.same_sense { 1.0 } else { -1.0 });
+        if point.sub(foot.point).dot(normal) > tolerance {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// One sampled station of the junction between `face` and `mate` along
@@ -1822,8 +2120,51 @@ pub(super) fn outward_fold_the_carve_missed(
     face: &FaceRecord,
     distance: f64,
 ) -> Result<Option<crate::offset_regularity::FoldSample>, KernelRefusal> {
+    let enabled = !std::env::var("BREP_OFFSET_SPHERE_FOLD_CERT")
+        .is_ok_and(|value| value == "0" || value == "off");
+    outward_fold_the_carve_missed_with_certificate(face, distance, enabled)
+}
+
+/// A recognized sphere has a constant signed radius factor over its entire
+/// support, including chart poles. Re-recognize the current net: public
+/// control edits may have left the ordinary analytic cache populated.
+/// This only certifies absence of a fold; construction and acceptance remain
+/// unchanged. Every other carrier, and a sphere at its collapse bar, takes
+/// the original dense hunt and minimum polishing below.
+pub(super) fn regular_outward_sphere(face: &FaceRecord, distance: f64) -> Result<bool, KernelRefusal> {
+    if !distance.is_finite() || distance >= 0.0 {
+        return Ok(false);
+    }
+    let geometry = crate::analytic_surface::recognize(&face.surface)
+        .and_then(|shape| shape.sphere_geometry());
+    let Some((center, radius)) = geometry else { return Ok(false); };
+    if !radius.is_finite() || radius <= 0.0 {
+        return Ok(false);
+    }
+    let [u0, u1] = face.surface.domain_u().or_refuse(KernelStage::Refine, "domain_u")?;
+    let [v0, v1] = face.surface.domain_v().or_refuse(KernelStage::Refine, "domain_v")?;
+    let (u, v) = ((u0 + u1) * 0.5, (v0 + v1) * 0.5);
+    let radial = face.surface.evaluate(u, v).or_refuse(KernelStage::Refine, "evaluate")?.sub(center);
+    let normal = face.surface.normal(u, v).or_refuse(KernelStage::Refine, "normal")?;
+    let sense = if face.same_sense { 1.0 } else { -1.0 };
+    let alignment = sense * normal.dot(radial) / radius;
+    if !alignment.is_finite() || alignment.abs() < 0.5 {
+        return Ok(false);
+    }
+    let factor = 1.0 - distance * alignment.signum() / radius;
+    Ok(factor.is_finite() && factor > COLLAPSE_FACTOR)
+}
+
+pub(super) fn outward_fold_the_carve_missed_with_certificate(
+    face: &FaceRecord,
+    distance: f64,
+    enabled: bool,
+) -> Result<Option<crate::offset_regularity::FoldSample>, KernelRefusal> {
     use crate::offset_regularity::{fold_sample_at, scan_offset_regularity, TrimRegion};
     if distance >= 0.0 || face.surface.is_affine().or_refuse(KernelStage::Refine, "is_affine")? {
+        return Ok(None);
+    }
+    if enabled && regular_outward_sphere(face, distance)? {
         return Ok(None);
     }
     let region = TrimRegion::from_face(face)?;
@@ -2071,6 +2412,60 @@ pub(super) fn offset_falls_short_of_curved_opening(
     Ok(worst)
 }
 
+/// Construction sheet for an inward skin that must cross a held curved
+/// opening. The original trimmed face is still the material classifier; only
+/// its construction sheet grows. Natural continuation preserves the carrier's
+/// geometry, and the ordinary skin x opening imprint supplies the final trim.
+/// A single open ruled patch is the scope measured by the Q1 suite. Closed
+/// bands, holes and general free-form patches retain the existing refusal.
+pub(super) fn curved_opening_reach_source(
+    source: &BrepSolid,
+    face: &FaceRecord,
+    distance: f64,
+) -> Result<Option<BrepSolid>, KernelRefusal> {
+    if distance <= 0.0 || face.loops.len() != 1 || face.loops[0].coedges.len() != 4
+        || (face.surface.degree_u != 1 && face.surface.degree_v != 1)
+    {
+        return Ok(None);
+    }
+    let (closed_u, closed_v) = face.surface.closed_directions()
+        .or_refuse(KernelStage::Refine, "closed_directions")?;
+    if closed_u || closed_v {
+        return Ok(None);
+    }
+    let source_faces = source.shells.iter().flat_map(|shell| &shell.faces).collect::<Vec<_>>();
+    for coedge in &face.loops[0].coedges {
+        if let Some((mate, mate_use)) = junction_mate(&source_faces, face, coedge.edge_id) {
+            // The rectangle replaces the use ordering. Smooth-boundary sync
+            // needs the original uses and is a separate construction lane.
+            if uses_are_tangent(face, coedge, mate, mate_use)? {
+                return Ok(None);
+            }
+        }
+    }
+    let rectangle = full_rectangle_face(source, face)?;
+    let rebuilt = source_by_id_lookup(
+        &rectangle.shells.iter().flat_map(|shell| &shell.faces).collect::<Vec<_>>(),
+        face.id,
+    ).unwrap();
+    let tolerance = 1e-7f64.max(crate::solid_scale(source) * 1e-9);
+    let grown = match extended_ruled_wall(&rectangle, rebuilt, 2.0 * distance, tolerance)? {
+        Ok(grown) => grown.solid,
+        Err(reason) => {
+            os_debug!("curved opening reach: source face {} declined: {reason}", face.id);
+            return Ok(None);
+        }
+    };
+    // Continuation is not permission to build an offset folded outside the
+    // old trim. Run the ordinary certainty/carve gate on the entire new sheet.
+    // A partial carve would require a new reach proof, so this lane declines it.
+    if carve_folded_support(&grown, &grown.shells[0].faces[0], distance)?.is_some() {
+        return Ok(None);
+    }
+    os_debug!("curved opening reach: source face {} uses its continued full rectangle", face.id);
+    Ok(Some(grown))
+}
+
 pub(super) fn source_by_id_lookup<'a>(
     source_faces: &[&'a FaceRecord],
     face_id: u64,
@@ -2187,15 +2582,33 @@ pub(super) fn sharp_side_continued_source(
     extension: &crate::CarrierExtension,
 ) -> Result<Option<BrepSolid>, KernelRefusal> {
     use crate::SurfaceSide;
-    if distance >= 0.0 || face.loops.len() != 1 || face.loops[0].coedges.len() != 4 {
+    let profile_reach = distance > 0.0
+        && std::env::var("BREP_OFFSET_PROFILE_REACH").as_deref() != Ok("0");
+    if (distance >= 0.0 && !profile_reach) || face.loops.len() != 1 || face.loops[0].coedges.len() != 4 {
         return Ok(None);
     }
-    if extension.u_min <= 0.0 && extension.u_max <= 0.0 {
+    if !profile_reach && extension.u_min <= 0.0 && extension.u_max <= 0.0 {
         return Ok(None);
     }
     let surface = &face.surface;
     if surface.is_affine().or_refuse(KernelStage::Refine, "is_affine")? {
         return Ok(None);
+    }
+    if profile_reach {
+        // This lane continues a planar drafted support in a nonlinear chart.
+        // Curved or singular revolve caps retain their established reach road.
+        // Positive weights and a coplanar control hull certify the whole sheet,
+        // rather than inferring planarity from the station samples alone.
+        let plane_band = (crate::solid_scale(source).max(1.0) * 1e-9).max(1e-9);
+        let Ok(Some((origin, normal))) = planar_surface_frame(surface, plane_band) else {
+            return Ok(None);
+        };
+        for control in surface.control_points.iter().flatten() {
+            let Ok(point) = control.point() else { return Ok(None); };
+            if control.w <= 0.0 || point.sub(origin).dot(normal).abs() > plane_band {
+                return Ok(None);
+            }
+        }
     }
     let (closed_u, _) = surface.closed_directions().or_refuse(KernelStage::Refine, "closed_directions")?;
     if closed_u {
@@ -2229,18 +2642,46 @@ pub(super) fn sharp_side_continued_source(
     }
     // The u-sides to continue: asked to grow, mate retained, junction sharp.
     let mut grow = [0.0f64; 2];
+    let mut opening_planes: [Option<(Vec3, Vec3)>; 2] = [None, None];
     for (index, coedge) in face.loops[0].coedges.iter().enumerate() {
         let side = sides[index];
         if side > 1 {
             continue;
         }
         let asked = if side == 0 { extension.u_min } else { extension.u_max };
-        if asked <= 0.0 {
+        if !profile_reach && asked <= 0.0 {
             continue;
         }
         let Some((mate, mate_use)) = junction_mate(source_faces, face, coedge.edge_id) else {
             continue;
         };
+        if profile_reach {
+            // A drafted/profile end in U is not the linear-V reach lane's
+            // case. Continue its own terminal span, preserving all four uses
+            // so tangent-neighbour synchronization still has the same image.
+            if !opening_set.contains(&mate.id) { continue; }
+            let band = 2e-3f64.max(crate::solid_scale(source) * 5e-5);
+            let Some((point, _)) = planar_surface_frame(&mate.surface, band)? else { continue; };
+            let [ou0,ou1] = mate.surface.domain_u().or_refuse(KernelStage::Refine, "domain_u")?;
+            let [ov0,ov1] = mate.surface.domain_v().or_refuse(KernelStage::Refine, "domain_v")?;
+            let normal = face_normal(mate, (ou0+ou1)*0.5, (ov0+ov1)*0.5)?;
+            let offsets = face_offsets(face);
+            let mut worst_gap = f64::NEG_INFINITY;
+            let u = if side == 0 { u0 } else { u1 };
+            for station in 0..=8 {
+                let v = v0 + (v1-v0)*station as f64/8.0;
+                let Ok(image) = offsets.at(u, v, -distance) else {
+                    return Ok(None);
+                };
+                worst_gap = worst_gap.max(-image.point.sub(point).dot(normal));
+            }
+            // Only a measured short skin takes this new road. Coincident
+            // rims and skins already crossing keep their existing path.
+            if worst_gap <= band { continue; }
+            opening_planes[side] = Some((point, normal));
+            grow[side] = 2.0 * distance;
+            continue;
+        }
         if opening_set.contains(&mate.id) || uses_are_tangent(face, coedge, mate, mate_use)? {
             continue;
         }
@@ -2293,10 +2734,14 @@ pub(super) fn sharp_side_continued_source(
                 crate::OffsetNormal::Face { same_sense: face.same_sense },
             );
             let mut least = f64::INFINITY;
+            let mut opening_clearance = f64::INFINITY;
             for index in 0..=STATIONS {
                 let v = v0 + (v1 - v0) * index as f64 / STATIONS as f64;
                 let start = offsets.at(u_end, v, -distance).or_refuse(KernelStage::Refine, "at")?.point;
                 let far = offsets.at(u_end + sense * delta, v, -distance).or_refuse(KernelStage::Refine, "at")?.point;
+                if let Some((point, normal)) = opening_planes[slot] {
+                    opening_clearance = opening_clearance.min(far.sub(point).dot(normal));
+                }
                 let direction = far.sub(start);
                 let mut previous = start;
                 for step in 1..=16 {
@@ -2314,11 +2759,16 @@ pub(super) fn sharp_side_continued_source(
                 }
                 least = least.min(direction.length());
             }
-            if least >= wanted * (1.0 - 1e-9) {
+            let clears_opening = opening_clearance >= 0.25 * distance.abs();
+            if least >= wanted * (1.0 - 1e-9) && clears_opening {
                 accepted = Some(candidate);
                 break;
             }
-            delta *= (wanted / least.max(wanted * 1e-3)) * 1.05;
+            if !clears_opening {
+                delta *= 2.0;
+            } else {
+                delta *= (wanted / least.max(wanted * 1e-3)) * 1.05;
+            }
         }
         let Some(candidate) = accepted else {
             return Err(KernelRefusal::unsupported(KernelStage::Refine, refusals::SHARP_SIDE_CONTINUATION, format!(
@@ -2403,3 +2853,356 @@ pub(super) fn sharp_side_continued_source(
     );
     Ok(Some(solid))
 }
+
+/// APEX REACH of an inward reflex-extended carrier, per trim side
+/// `[u_min, u_max, v_min, v_max]` (zero where nothing is asked).
+///
+/// A reflex edge whose end is the APEX of a corner blend (a retained face
+/// with a degenerate edge there: the ball rolled around a reflex vertical
+/// edge under a filleted top) has its mitre end ON that blend's offset, well
+/// past the rim the face shares with its tangent neighbour at the apex: the
+/// offset corner is a ring torus whose hole is the apex's |d| circle, so the
+/// mitre line rises sqrt((R−d)² − (R−ρ)²) above the rim (0.48 for R 1.2,
+/// d 0.1 in the 2026-10-18 report). The uniform reflex extension (0.26
+/// there) stops short of it, and a carrier whose grown edge ends INSIDE the
+/// corner's offset leaves that edge one-use. So the side running smoothly
+/// through the apex grows past the whole corner face: its farthest vertex
+/// from the apex plus |d|.
+pub(super) fn apex_corner_reach(
+    source: &BrepSolid,
+    face: &FaceRecord,
+    source_faces: &[&FaceRecord],
+    opening_set: &HashSet<u64>,
+    distance: f64,
+) -> Result<[f64; 4], KernelRefusal> {
+    let mut reach = [0.0f64; 4];
+    if distance <= 0.0 {
+        return Ok(reach);
+    }
+    let edge_by_id = source.edges.iter().map(|edge| (edge.id, edge)).collect::<HashMap<_, _>>();
+    let point_of = |id: u64| source.vertices.iter().find(|vertex| vertex.id == id).map(|vertex| vertex.point);
+    // Apex vertex → the corner face's reach past it.
+    let mut apex_reach = HashMap::<u64, f64>::default();
+    for other in source_faces {
+        if other.id == face.id || opening_set.contains(&other.id) {
+            continue;
+        }
+        for coedge in other.loops.iter().flat_map(|loop_record| &loop_record.coedges) {
+            let Some(edge) = edge_by_id.get(&coedge.edge_id) else {
+                continue;
+            };
+            if !edge.degenerate {
+                continue;
+            }
+            let Some(apex) = point_of(edge.start_vertex_id) else {
+                continue;
+            };
+            let mut farthest = 0.0f64;
+            for use_record in other.loops.iter().flat_map(|loop_record| &loop_record.coedges) {
+                if let Some(other_edge) = edge_by_id.get(&use_record.edge_id) {
+                    for id in [other_edge.start_vertex_id, other_edge.end_vertex_id] {
+                        if let Some(point) = point_of(id) {
+                            farthest = farthest.max(point.sub(apex).length());
+                        }
+                    }
+                }
+            }
+            let entry = apex_reach.entry(edge.start_vertex_id).or_insert(0.0);
+            *entry = entry.max(farthest + distance);
+        }
+    }
+    if apex_reach.is_empty() {
+        return Ok(reach);
+    }
+    // The trim's uv box, and which side a use runs along.
+    let mut low = Vec2 { x: f64::INFINITY, y: f64::INFINITY };
+    let mut high = Vec2 { x: f64::NEG_INFINITY, y: f64::NEG_INFINITY };
+    for coedge in face.loops.iter().flat_map(|loop_record| &loop_record.coedges) {
+        let [q0, q1] = coedge.pcurve.domain().or_refuse(KernelStage::Refine, "domain")?;
+        for sample in 0..=8 {
+            let uv = coedge.pcurve.evaluate(q0 + (q1 - q0) * sample as f64 / 8.0).or_refuse(KernelStage::Refine, "evaluate")?;
+            low.x = low.x.min(uv.x);
+            low.y = low.y.min(uv.y);
+            high.x = high.x.max(uv.x);
+            high.y = high.y.max(uv.y);
+        }
+    }
+    let band_u = 1e-9 * (high.x - low.x).abs().max(1.0);
+    let band_v = 1e-9 * (high.y - low.y).abs().max(1.0);
+    for coedge in face.loops.iter().flat_map(|loop_record| &loop_record.coedges) {
+        let Some(edge) = edge_by_id.get(&coedge.edge_id) else {
+            continue;
+        };
+        if edge.degenerate {
+            continue;
+        }
+        let wanted = [edge.start_vertex_id, edge.end_vertex_id]
+            .iter()
+            .filter_map(|id| apex_reach.get(id))
+            .fold(0.0f64, |worst, reach| worst.max(*reach));
+        if wanted <= 0.0 {
+            continue;
+        }
+        let Some((mate, mate_use)) = junction_mate(source_faces, face, coedge.edge_id) else {
+            continue;
+        };
+        if opening_set.contains(&mate.id) || !uses_are_tangent(face, coedge, mate, mate_use)? {
+            continue;
+        }
+        let [q0, q1] = coedge.pcurve.domain().or_refuse(KernelStage::Refine, "domain")?;
+        let mut on = [true; 4];
+        for sample in 0..=8 {
+            let uv = coedge.pcurve.evaluate(q0 + (q1 - q0) * sample as f64 / 8.0).or_refuse(KernelStage::Refine, "evaluate")?;
+            on[0] &= (uv.x - low.x).abs() <= band_u;
+            on[1] &= (uv.x - high.x).abs() <= band_u;
+            on[2] &= (uv.y - low.y).abs() <= band_v;
+            on[3] &= (uv.y - high.y).abs() <= band_v;
+        }
+        if let Some(side) = on.iter().position(|hit| *hit) {
+            reach[side] = reach[side].max(wanted);
+        }
+    }
+    Ok(reach)
+}
+
+/// REFLEX-SIDE lane: a curved retained face whose trim is a uv RECTANGLE
+/// strictly inside its surface's domain, with a u-side meeting a retained
+/// neighbour at a REFLEX junction, in an INWARD shell, has its offset carrier
+/// built over the same surface with that u-side moved outward in u, so the
+/// two offsets meet at their mitre. Returns the source with that face so
+/// rebuilt (the sharp-side lane's substitution), or `Ok(None)` where the lane
+/// does not apply.
+///
+/// An inward offset of a reflex junction meets its neighbour's offset past
+/// both source rims, which is why `reflex_extension` grows the carriers. A
+/// plane grows by sliding its net and a ruled carrier along its rulings, but
+/// a curved carrier's u-extension is a no-op. A cylinder unioned into a box
+/// side (the 2026-10-18 report: a 10 box, an r 2.03 cylinder across its +x
+/// face, the top filleted, shelled 0.1 through the bottom) keeps only the
+/// arcs outside the box, each ending on the box face at a reflex vertical
+/// edge: the offset cylinder stopped at that edge's ray, short of the offset
+/// plane, the plane × cylinder pair found no section, and the assembly left
+/// 30 one-use rims (non-integral genus).
+///
+/// The surface there is the whole cylinder, so nothing has to be
+/// extrapolated: the trim's side moves inside the domain and every `(u, v)`
+/// still names the same point. A side the move would carry past the domain
+/// (or across a closed surface's seam) declines. The four uses keep their
+/// order and sense, so `carrier_use_imaging`'s equal-count shortcut still
+/// images a tangent v-side neighbour.
+pub(super) fn reflex_side_widened_source(
+    source: &BrepSolid,
+    face: &FaceRecord,
+    source_faces: &[&FaceRecord],
+    opening_set: &HashSet<u64>,
+    distance: f64,
+    extension: &crate::CarrierExtension,
+) -> Result<Option<BrepSolid>, KernelRefusal> {
+    if distance <= 0.0 || face.loops.len() != 1 || face.loops[0].coedges.len() != 4 {
+        return Ok(None);
+    }
+    if extension.u_min <= 0.0 && extension.u_max <= 0.0 {
+        return Ok(None);
+    }
+    let surface = &face.surface;
+    if surface.is_affine().or_refuse(KernelStage::Refine, "is_affine")? {
+        return Ok(None);
+    }
+    let [u0, u1] = surface.domain_u().or_refuse(KernelStage::Refine, "domain_u")?;
+    let [v0, v1] = surface.domain_v().or_refuse(KernelStage::Refine, "domain_v")?;
+    let band_u = 1e-9 * (u1 - u0).abs().max(1.0);
+    let band_v = 1e-9 * (v1 - v0).abs().max(1.0);
+    // Each use's isoline: (true, u) for a constant-u use, (false, v) for a
+    // constant-v one; anything else is not a rectangle.
+    let mut isolines = Vec::with_capacity(4);
+    for coedge in &face.loops[0].coedges {
+        let [q0, q1] = coedge.pcurve.domain().or_refuse(KernelStage::Refine, "domain")?;
+        let first = coedge.pcurve.evaluate(q0).or_refuse(KernelStage::Refine, "evaluate")?;
+        let (mut on_u, mut on_v) = (true, true);
+        for sample in 1..=8 {
+            let uv = coedge.pcurve.evaluate(q0 + (q1 - q0) * sample as f64 / 8.0).or_refuse(KernelStage::Refine, "evaluate")?;
+            on_u &= (uv.x - first.x).abs() <= band_u;
+            on_v &= (uv.y - first.y).abs() <= band_v;
+        }
+        isolines.push(match (on_u, on_v) {
+            (true, false) => (true, first.x),
+            (false, true) => (false, first.y),
+            _ => return Ok(None),
+        });
+    }
+    let u_sides = isolines.iter().filter(|(along_u, _)| *along_u).map(|(_, at)| *at).collect::<Vec<_>>();
+    let v_sides = isolines.iter().filter(|(along_u, _)| !*along_u).map(|(_, at)| *at).collect::<Vec<_>>();
+    if u_sides.len() != 2 || v_sides.len() != 2 {
+        return Ok(None);
+    }
+    let (ua, ub) = (u_sides[0].min(u_sides[1]), u_sides[0].max(u_sides[1]));
+    let (va, vb) = (v_sides[0].min(v_sides[1]), v_sides[0].max(v_sides[1]));
+    if ub - ua <= band_u || vb - va <= band_v {
+        return Ok(None);
+    }
+    let edge_by_id = source.edges.iter().map(|edge| (edge.id, edge)).collect::<HashMap<_, _>>();
+    // The u-sides to widen: asked to grow, mate retained, every sharp
+    // station of the junction reflex.
+    let mut grow = [0.0f64; 2];
+    for (coedge, (along_u, at)) in face.loops[0].coedges.iter().zip(&isolines) {
+        if !*along_u {
+            continue;
+        }
+        let slot = if (*at - ua).abs() <= band_u { 0 } else { 1 };
+        let asked = if slot == 0 { extension.u_min } else { extension.u_max };
+        if asked <= 0.0 {
+            continue;
+        }
+        let Some(edge) = edge_by_id.get(&coedge.edge_id) else {
+            continue;
+        };
+        if edge.degenerate {
+            continue;
+        }
+        let Some((mate, mate_use)) = junction_mate(source_faces, face, coedge.edge_id) else {
+            continue;
+        };
+        if opening_set.contains(&mate.id) || uses_are_tangent(face, coedge, mate, mate_use)? {
+            continue;
+        }
+        let stations = junction_stations(face, coedge, edge, mate)?;
+        if stations.is_empty() || stations.iter().any(|station| station.is_convex()) {
+            continue;
+        }
+        grow[slot] = asked;
+    }
+    if grow == [0.0, 0.0] {
+        return Ok(None);
+    }
+    const STATIONS: usize = 8;
+    let offsets = crate::OffsetEvaluator::new(
+        "offset_shell",
+        surface,
+        crate::OffsetNormal::Face { same_sense: face.same_sense },
+    );
+    let mut reach = [ua, ub];
+    for slot in 0..2 {
+        let wanted = grow[slot];
+        if wanted <= 0.0 {
+            continue;
+        }
+        let u_end = reach[slot];
+        let sense = if slot == 0 { -1.0 } else { 1.0 };
+        let mut speed = f64::INFINITY;
+        for index in 0..=STATIONS {
+            let v = va + (vb - va) * index as f64 / STATIONS as f64;
+            speed = speed.min(surface.derivatives(u_end, v, 1).or_refuse(KernelStage::Refine, "derivatives")?[1][0].length());
+        }
+        if !(speed > 0.0) {
+            return Ok(None);
+        }
+        // The OFFSET image must travel `wanted` across the strip, the least
+        // over the stations, advancing monotonically at each (a regular
+        // offset, no cusp); the strip must stay inside the domain.
+        let mut delta = wanted / speed;
+        let mut accepted = None;
+        for _ in 0..8 {
+            let far_u = u_end + sense * delta;
+            if far_u < u0 + band_u || far_u > u1 - band_u {
+                return Ok(None);
+            }
+            let mut least = f64::INFINITY;
+            for index in 0..=STATIONS {
+                let v = va + (vb - va) * index as f64 / STATIONS as f64;
+                let start = offsets.at(u_end, v, -distance).or_refuse(KernelStage::Refine, "at")?.point;
+                let far = offsets.at(far_u, v, -distance).or_refuse(KernelStage::Refine, "at")?.point;
+                let direction = far.sub(start);
+                let mut previous = start;
+                for step in 1..=16 {
+                    let point = offsets.at(u_end + sense * delta * step as f64 / 16.0, v, -distance).or_refuse(KernelStage::Refine, "at")?.point;
+                    if point.sub(previous).dot(direction) <= 0.0 {
+                        return Ok(None);
+                    }
+                    previous = point;
+                }
+                least = least.min(direction.length());
+            }
+            if least >= wanted * (1.0 - 1e-9) {
+                accepted = Some(far_u);
+                break;
+            }
+            delta *= (wanted / least.max(wanted * 1e-3)) * 1.05;
+        }
+        let Some(far_u) = accepted else {
+            return Ok(None);
+        };
+        reach[slot] = far_u;
+    }
+    let ua_source = ua;
+    let [ua, ub] = reach;
+    let mut solid = source.clone();
+    let mut next_id = solid
+        .vertices
+        .iter()
+        .map(|vertex| vertex.id)
+        .chain(solid.edges.iter().map(|edge| edge.id))
+        .chain(solid.shells.iter().flat_map(|shell| &shell.faces).flat_map(|face| {
+            face.loops
+                .iter()
+                .flat_map(|loop_record| loop_record.coedges.iter().map(|coedge| coedge.id).chain([loop_record.id]))
+        }))
+        .max()
+        .unwrap_or(0)
+        + 1;
+    let corners = [(ua, va), (ub, va), (ub, vb), (ua, vb)];
+    let mut corner_ids = [0u64; 4];
+    for (slot, (u, v)) in corners.into_iter().enumerate() {
+        solid.vertices.push(VertexRecord { id: next_id, point: surface.evaluate(u, v).or_refuse(KernelStage::Refine, "evaluate")? });
+        corner_ids[slot] = next_id;
+        next_id += 1;
+    }
+    let mut rebuilt = face.clone();
+    for (coedge, (along_u, at)) in rebuilt.loops[0].coedges.iter_mut().zip(&isolines) {
+        let flat = |u: f64, v: f64| Vec3::new(u, v, 0.0);
+        // Each side's isoline in increasing parameter, with its corners and
+        // its parameter range on that isoline.
+        let (curve, start, end, from, to, t0, t1) = if *along_u {
+            let low = (*at - ua_source).abs() <= band_u;
+            let u = if low { ua } else { ub };
+            let (start, end) = if low { (corner_ids[0], corner_ids[3]) } else { (corner_ids[1], corner_ids[2]) };
+            (surface.iso_curve_u(u).or_refuse(KernelStage::Refine, "iso_curve_u")?, start, end, flat(u, va), flat(u, vb), va, vb)
+        } else {
+            let low = (*at - va).abs() <= band_v;
+            let v = if low { va } else { vb };
+            let (start, end) = if low { (corner_ids[0], corner_ids[1]) } else { (corner_ids[3], corner_ids[2]) };
+            (surface.iso_curve_v(v).or_refuse(KernelStage::Refine, "iso_curve_v")?, start, end, flat(ua, v), flat(ub, v), ua, ub)
+        };
+        // The old use's own sense along its isoline.
+        let [q0, q1] = coedge.pcurve.domain().or_refuse(KernelStage::Refine, "domain")?;
+        let (a, b) = (coedge.pcurve.evaluate(q0).or_refuse(KernelStage::Refine, "evaluate")?, coedge.pcurve.evaluate(q1).or_refuse(KernelStage::Refine, "evaluate")?);
+        let increasing = if *along_u { b.y > a.y } else { b.x > a.x };
+        let edge_id = next_id;
+        next_id += 1;
+        solid.edges.push(EdgeRecord {
+            id: edge_id,
+            curve,
+            t0,
+            t1,
+            start_vertex_id: start,
+            end_vertex_id: end,
+            degenerate: false,
+            name: None,
+        });
+        coedge.edge_id = edge_id;
+        coedge.forward = increasing;
+        coedge.pcurve = if increasing { crate::make_line(from, to).or_refuse(KernelStage::Refine, "make_line")? } else { crate::make_line(to, from).or_refuse(KernelStage::Refine, "make_line")? };
+    }
+    for shell in &mut solid.shells {
+        for existing in &mut shell.faces {
+            if existing.id == face.id {
+                *existing = rebuilt.clone();
+            }
+        }
+    }
+    os_debug!(
+        "reflex-side lane: source face {} widened to u = [{ua:.6}, {ub:.6}] for its reflex inward junction(s)",
+        face.id
+    );
+    Ok(Some(solid))
+}
+

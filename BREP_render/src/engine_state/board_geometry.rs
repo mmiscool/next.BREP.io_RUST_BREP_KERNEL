@@ -479,8 +479,9 @@ fn silk_solid(top: bool) -> String {
 const CURATED_RAILS: &[(&[&str], u32)] = &[
     // Ground is black on a test lead, in an ATX loom and in an automotive
     // harness alike. Drawn as a near-black GREY, not `#000`: the viewport
-    // background is `0x0b0d10` and a true black track loses its silhouette
-    // where it crosses the board edge.
+    // background is a dark slate (`0x131b24` since 2026-10-14, `0x0b0d10`
+    // before) and a true black track loses its silhouette where it crosses
+    // the board edge.
     (&["GND", "VSS", "0V"], 0x3a3a40),
     // The positive supply is red by the same three conventions, and ATX's red
     // IS +5 V — `VCC` was a 5 V rail before it was a name, so the supply names

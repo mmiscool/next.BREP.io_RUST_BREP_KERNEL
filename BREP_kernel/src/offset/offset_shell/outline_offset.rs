@@ -840,6 +840,7 @@ pub(super) fn offset_outline_wall(
     }
     Ok(Ok(BrepSolid {
         mass_properties_cache: Default::default(),
+        cells: Default::default(),
         id: source.id,
         vertices,
         edges,
@@ -885,6 +886,101 @@ pub(super) fn walls_trim_the_same_region(
     second: &BrepSolid,
     tolerance: f64,
 ) -> Result<bool, KernelRefusal> {
+    let enabled = !std::env::var("BREP_OFFSET_LINE_WALL_CERT")
+        .is_ok_and(|value| value == "0" || value == "off");
+    walls_trim_the_same_region_with_certificate(first, second, tolerance, enabled)
+}
+
+/// A positive-only certificate for the comparison below. Each affine image
+/// of a linear pcurve is a segment. Distance to another segment is convex,
+/// so covering both endpoints covers every station between them. Check both
+/// directions against the actual edge segments the old comparison projects
+/// onto. A quarter of its tolerance and a roundoff allowance leave ample
+/// room inside the existing bar; uncertain inputs use the old comparison.
+pub(super) fn linear_wall_boundaries_match(first: &BrepSolid, second: &BrepSolid, tolerance: f64) -> bool {
+    type Segments = Vec<[Vec3; 2]>;
+    fn lines(solid: &BrepSolid) -> Option<(Segments, Segments, f64)> {
+        let unit_point = |p: &Vec4| {
+            (p.w == 1.0 && p.x.is_finite() && p.y.is_finite() && p.z.is_finite())
+                .then_some(Vec3::new(p.x, p.y, p.z))
+        };
+        let domain = |knots: &[f64]| {
+            (knots.len() == 4 && knots[0] == knots[1] && knots[2] == knots[3]
+                && knots[0].is_finite() && knots[2].is_finite() && knots[0] < knots[2]
+                && (knots[2] - knots[0]).is_finite()).then(|| [knots[0], knots[2]])
+        };
+        if solid.shells.len() != 1 || solid.shells[0].faces.len() != 1 { return None; }
+        let face = &solid.shells[0].faces[0];
+        let surface = &face.surface;
+        if surface.degree_u != 1 || surface.degree_v != 1 || surface.control_points.len() != 2
+            || surface.control_points.iter().any(|row| row.len() != 2) { return None; }
+        let u = domain(&surface.knots_u)?;
+        let v = domain(&surface.knots_v)?;
+        let p00 = unit_point(&surface.control_points[0][0])?;
+        let p01 = unit_point(&surface.control_points[0][1])?;
+        let p10 = unit_point(&surface.control_points[1][0])?;
+        let p11 = unit_point(&surface.control_points[1][1])?;
+        if p11.sub(p10).sub(p01.sub(p00)).length() != 0.0 { return None; }
+        let mut magnitude = 1.0f64;
+        for p in [p00, p01, p10, p11] {
+            magnitude = magnitude.max(p.x.abs()).max(p.y.abs()).max(p.z.abs());
+        }
+        let mut images = Vec::new();
+        for coedge in face.loops.iter().flat_map(|wire| &wire.coedges) {
+            let curve = &coedge.pcurve;
+            if curve.degree != 1 || curve.control_points.len() != 2
+                || curve.knots.as_slice() != [0.0, 0.0, 1.0, 1.0] { return None; }
+            let mut ends = [Vec3::default(); 2];
+            for (i, control) in curve.control_points.iter().enumerate() {
+                let uv = unit_point(control)?;
+                if uv.z != 0.0 || uv.x < u[0] || uv.x > u[1] || uv.y < v[0] || uv.y > v[1] { return None; }
+                ends[i] = surface.evaluate(uv.x, uv.y).ok()?;
+            }
+            images.push(ends);
+        }
+        let mut edges = Vec::new();
+        for edge in &solid.edges {
+            let curve = &edge.curve;
+            if edge.degenerate || curve.degree != 1 || curve.control_points.len() != 2
+                || curve.knots.as_slice() != [0.0, 0.0, 1.0, 1.0]
+                || !(edge.t0 >= 0.0 && edge.t0 < edge.t1 && edge.t1 <= 1.0) { return None; }
+            let a = unit_point(&curve.control_points[0])?;
+            let b = unit_point(&curve.control_points[1])?;
+            let length = a.sub(b).length();
+            // The generic projector treats curves below 1e-6 as closed.
+            if !length.is_finite() || length <= 1e-6 { return None; }
+            for p in [a, b] { magnitude = magnitude.max(p.x.abs()).max(p.y.abs()).max(p.z.abs()); }
+            edges.push([curve.evaluate(edge.t0).ok()?, curve.evaluate(edge.t1).ok()?]);
+        }
+        if images.is_empty() || edges.is_empty() { return None; }
+        let conditioning = 1.0 + (u[0].abs() + u[1].abs()) / (u[1] - u[0])
+            + (v[0].abs() + v[1].abs()) / (v[1] - v[0]);
+        Some((images, edges, 256.0 * f64::EPSILON * magnitude * conditioning))
+    }
+    if !tolerance.is_finite() || tolerance <= 0.0 { return false; }
+    let (Some((a, a_edges, a_error)), Some((b, b_edges, b_error))) = (lines(first), lines(second)) else { return false; };
+    let allowance = tolerance * 0.25;
+    if !a_error.is_finite() || !b_error.is_finite() || a_error.max(b_error) > allowance { return false; }
+    let distance = |p: Vec3, segment: &[Vec3; 2]| {
+        let along = segment[1].sub(segment[0]);
+        let square = along.length_squared();
+        if !square.is_finite() || square <= 0.0 { return f64::INFINITY; }
+        let fraction = (p.sub(segment[0]).dot(along) / square).clamp(0.0, 1.0);
+        p.sub(segment[0].add(along.scale(fraction))).length()
+    };
+    let covered = |images: &Segments, edges: &Segments| images.iter().all(|image| {
+        edges.iter().any(|edge| image.iter().all(|point| distance(*point, edge) <= allowance))
+    });
+    covered(&a, &b_edges) && covered(&b, &a_edges)
+}
+
+pub(super) fn walls_trim_the_same_region_with_certificate(
+    first: &BrepSolid,
+    second: &BrepSolid,
+    tolerance: f64,
+    enabled: bool,
+) -> Result<bool, KernelRefusal> {
+    if enabled && linear_wall_boundaries_match(first, second, tolerance) { return Ok(true); }
     let stations = |solid: &BrepSolid| -> Result<Vec<Vec3>, KernelRefusal> {
         let face = &solid.shells[0].faces[0];
         let mut points = Vec::new();

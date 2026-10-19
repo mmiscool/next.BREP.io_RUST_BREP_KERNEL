@@ -509,7 +509,7 @@ impl SymbolEditor {
             return Err("Enter a symbol name and reference prefix.".into());
         }
         let mut d = Document::default();
-        d.place(self.symbol.clone(), Point::new(0, 0), 0);
+        d.place_unbound(self.symbol.clone(), Point::new(0, 0), 0);
         d.validate()
     }
     /// The tool buttons, history, and zoom, with a line on the tool in use.
@@ -649,9 +649,9 @@ impl SymbolEditor {
         ui.horizontal(|ui| {
             ui.label("Items");
             ui.small(format!(
-                "{} pins, {} graphics",
-                self.symbol.pins.len(),
-                self.symbol.graphics.len()
+                "{}, {}",
+                crate::count(self.symbol.pins.len(), "pin", "pins"),
+                crate::count(self.symbol.graphics.len(), "graphic", "graphics")
             ));
         });
         // Which rows to mark, read before the list takes the selection
@@ -959,7 +959,7 @@ impl SymbolEditor {
         ui.separator();
         ui.label("Connection points");
         let pins = self.symbol.pins.len();
-        let summary = format!("{} of {pins} pins bound", points.bound.len());
+        let summary = format!("{} of {} bound", points.bound.len(), crate::count(pins, "pin", "pins"));
         // Body size, the warnings above all: they are what this section is
         // for, and at `small` they were the hardest words on the panel to read.
         if points.problems.is_empty() && points.bound.len() == pins {

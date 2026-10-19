@@ -1215,6 +1215,33 @@ fn cell_editor(
     }
 }
 
+/// Where [`value_editor`] leaves the focused text editor's in-progress string
+/// (egui temp data), read once per frame by the app's `__brepFocus` publisher.
+pub fn focused_text_id() -> egui::Id {
+    egui::Id::new("brep-focused-editor-text")
+}
+
+/// The rect of the widget holding keyboard focus, for the app's `__brepFocus`
+/// publisher; `None` while nothing has it.
+///
+/// Read from the pass's widget rects, NOT through `Context::read_response`:
+/// building a `Response` in egui 0.35 surrenders the focus of a widget that is
+/// not hovered on a click frame (`Context::get_response`), so publishing the
+/// focus took it from every widget focused by `request_focus` in the frame of
+/// a click elsewhere — the family table's grid, the eCAD label card's field.
+pub fn focused_rect(ctx: &egui::Context) -> Option<egui::Rect> {
+    let id = ctx.memory(|m| m.focused())?;
+    ctx.viewport(|v| {
+        let prev = v.prev_pass.widgets.get(id).map(|w| w.rect);
+        // A Ui that has not registered its final rect yet reads last pass's,
+        // as `read_response` does.
+        match v.this_pass.widgets.get(id).map(|w| w.rect) {
+            Some(rect) if rect.is_positive() && rect.is_finite() => Some(rect),
+            this => prev.or(this),
+        }
+    })
+}
+
 /// Draw the editor for ONE value of a [`CellKind`] and report the committed
 /// edit, if any. `salt` seeds the per-widget egui ids (an in-progress text
 /// buffer, a combo's open state), so it must be stable for a given value and
@@ -1246,11 +1273,29 @@ pub fn value_editor(
             let stored = display_text(value);
             let mut buffer: String =
                 ui.data(|d| d.get_temp(buffer_id)).unwrap_or_else(|| stored.clone());
-            let edit = ui.add_sized(size, egui::TextEdit::singleline(&mut buffer));
+            // An EXPLICIT widget id, from the caller's salt alone. egui's auto
+            // id for a widget is seeded from its parent `Ui`'s running counter
+            // (`Ui::new_child`: a salted child's `unique_id` still folds in
+            // `next_auto_id_salt`), so an auto-id'd editor is a different
+            // widget whenever anything above the table is added or removed —
+            // the BOM's "Update components" button comes and goes with a store
+            // refresh — and egui drops the focus of a widget that was not
+            // drawn: the user's half-typed cell vanished, Enter included
+            // (verify_plm_bom_attributes.mjs, 2026-10-15/16, under load).
+            let edit = ui.add_sized(
+                size,
+                egui::TextEdit::singleline(&mut buffer).id(salt.with("edit")),
+            );
             let entered = edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
             let mut committed = None;
             if edit.has_focus() || edit.changed() {
                 ui.data_mut(|d| d.insert_temp(buffer_id, buffer.clone()));
+            }
+            if edit.has_focus() {
+                // The in-progress text of THE focused editor, for `__brepFocus`
+                // (app.rs): a driver typing into a cell waits until its string
+                // is here before it presses Enter.
+                ui.data_mut(|d| d.insert_temp(focused_text_id(), buffer.clone()));
             }
             if edit.lost_focus() || entered {
                 ui.data_mut(|d| d.remove::<String>(buffer_id));

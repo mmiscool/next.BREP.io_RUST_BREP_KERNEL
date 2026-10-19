@@ -189,7 +189,8 @@ pub(in crate::blend) fn restrict_third_faces(
         }
         for mate in mates {
             for _ in 0..OBSTACLE_BUDGET {
-                let Some(plan) = plan_restriction(
+                let plan_timing = crate::blend::BlendTimer::start("timing.restriction.plan_ms");
+                let planned = plan_restriction(
                     result,
                     stripe.blend_face,
                     mate,
@@ -197,8 +198,9 @@ pub(in crate::blend) fn restrict_third_faces(
                     stripe.convex,
                     stripe.size,
                     policy,
-                )?
-                else {
+                );
+                plan_timing.stop();
+                let Some(plan) = planned? else {
                     break;
                 };
                 match plan {
@@ -210,21 +212,32 @@ pub(in crate::blend) fn restrict_third_faces(
         // A void that touches NEITHER mate crosses the blend's interior without
         // crossing its rails: found by its EDGES against the blend surface.
         for _ in 0..OBSTACLE_BUDGET {
-            let Some(plan) = plan_void(
+            let void_timing = crate::blend::BlendTimer::start("timing.restriction.void_ms");
+            let planned = plan_void(
                 result,
                 stripe.blend_face,
                 &stripe.mates,
                 stripe.convex,
                 stripe.size,
                 policy,
-            )?
-            else {
+            );
+            void_timing.stop();
+            let Some(plan) = planned? else {
                 break;
             };
             apply_void(result, take_id, plan)?;
         }
     }
     Ok(fragments)
+}
+
+/// The box of a curve's control points: the curve lies inside it.
+fn curve_control_box(curve: &NurbsCurve) -> Result<crate::Aabb, KernelRefusal> {
+    let mut bounds = crate::Aabb::empty();
+    for control in &curve.control_points {
+        bounds.include_point(control.point().or_refuse(KernelStage::Refine, "control_point")?);
+    }
+    Ok(bounds)
 }
 
 /// What one pass of the planner found on a (blend, mate) pair.
@@ -457,12 +470,23 @@ fn plan_restriction(
         // profile cut left) rather than sitting inside it as a hole.  Kept
         // apart, and read only when nothing else crosses the rail.
         let mut own_loop_hits: Vec<(usize, usize, u64, f64, f64, Vec3)> = Vec::new();
+        let crossings_timing = crate::blend::BlendTimer::start("timing.restriction.rail_crossings_ms");
+        // A crossing lies within `band` of both curves, and a NURBS curve lies
+        // in the hull of its control points: two curves whose control boxes do
+        // not meet within the band cross nowhere, and the general intersector
+        // (which tessellates both curves per call, 2.8 ms a pair on the
+        // 2026-10-17 face ring: 247 pairs, 684 ms) is not asked.
+        let rail_box = curve_control_box(&rail.curve)?;
         for (loop_index, position, edge_id) in face_edges(mate) {
             if edge_id == rail_id {
                 continue;
             }
             let other = edge_of(solid, edge_id)
                 .ok_or(KernelRefusal::internal(KernelStage::Refine, "mate_boundary_edge", "blend restriction: a mate boundary edge vanished"))?;
+            if !rail_box.intersects(curve_control_box(&other.curve)?, band) {
+                crate::blend::record_count("count.restriction.rail_crossing_pairs_far", 1);
+                continue;
+            }
             for crossing in intersect_curves(&rail.curve, &other.curve, band).or_refuse(KernelStage::Refine, "intersect_curves")? {
                 let inside_rail = within(crossing.s, rail.t0, rail.t1);
                 let inside_other = within(crossing.t, other.t0, other.t1);
@@ -486,6 +510,8 @@ fn plan_restriction(
                 }
             }
         }
+        crossings_timing.stop();
+        crate::blend::record_count("count.restriction.rail_crossing_pairs", face_edges(mate).len() as u64);
         if hits.is_empty() {
             // The rail crosses ONE edge of its own loop twice: the run of that
             // edge between the crossings is eaten and the mate is cut in two
@@ -1050,7 +1076,7 @@ fn trace_piece(
         traced = spatial.len();
         let parameters = chord_parameters(&spatial)?;
         let degree = 3.min(spatial.len() - 1);
-        let curve = interpolate_curve(&spatial, degree, &parameters).or_refuse(KernelStage::Refine, "interpolate_curve")?;
+        let curve = interpolate_traced(&spatial, degree, &parameters, blend, obstacle)?;
         let [t0, t1] = curve.domain().or_refuse(KernelStage::Refine, "domain")?;
         let on_blend =
             build_pcurve_on_surface_range(&blend.surface, &curve, t0, t1, true, fit_band).or_refuse(KernelStage::Refine, "build_pcurve_on_surface_range")?;
@@ -1442,7 +1468,7 @@ fn solve_trim_curve(
 
         let parameters = chord_parameters(&spatial)?;
         let degree = 3.min(spatial.len() - 1);
-        let trim_curve = interpolate_curve(&spatial, degree, &parameters).or_refuse(KernelStage::Refine, "interpolate_curve")?;
+        let trim_curve = interpolate_traced(&spatial, degree, &parameters, blend, obstacle)?;
         let [t0, t1] = trim_curve.domain().or_refuse(KernelStage::Refine, "domain")?;
         let trim_on_blend = build_pcurve_on_surface_range(
             &blend.surface,
@@ -1540,6 +1566,95 @@ fn solve_trim_curve(
 }
 
 /// Chord-length parameters normalized to [0, 1].
+/// The cubic through a traced piece's points at `parameters`, its two END
+/// TANGENTS committed exactly, the way its end POINTS already are.
+///
+/// A traced piece's ends are three-surface points — rail crossings, or a
+/// closed rim's one seam foot — and the curve through them is the blend ∩
+/// obstacle intersection, whose tangent at a point is `n_blend × n_obstacle`
+/// there.  A free interpolation (natural end conditions through the traced
+/// samples) reproduces the samples to the SSI band but lets its end tangents
+/// swing by the fit's slope error: on the 2026-10-16 report (box, r = 6 pin
+/// through it, r = 17.5 round over the pin's mouth) the mouth's closed rim
+/// came back with its start and end tangents 2.593e-5 rad apart at the pin's
+/// seam foot, where the exact tangent is (1, 0, 0).  A later blend along that
+/// rim solves its vertex sections in the normal plane of each edge's own
+/// tangent, so the two stripes meeting at the seam foot seated balls
+/// `kink × r / sin(dihedral / 2)` apart — 7.06e-6 at r = 0.2, linear in r —
+/// and the network refused the flush join (`1e-6 · (1 + r)`) that a G1 rim
+/// would have joined.
+///
+/// The exact end tangent takes its DIRECTION from the carriers' normals at
+/// the committed end point and its MAGNITUDE from the free fit's end
+/// derivative along that direction (the chord parameterisation's speed), so
+/// only the end spans move and the samples are still met.  Where the carriers
+/// are tangent at an end (the cross product too short to orient) or the
+/// piece is too short for the cubic end-derivative interpolant, the free fit
+/// is kept.  The interpolant is the shared Piegl–Tiller §9.2.2 form,
+/// `fit::interpolate_curve_with_end_tangents` (its knots fixed by lane Y).
+fn interpolate_traced(
+    spatial: &[Vec3],
+    degree: usize,
+    parameters: &[f64],
+    blend: &FaceRecord,
+    obstacle: &FaceRecord,
+) -> Result<NurbsCurve, KernelRefusal> {
+    let free = interpolate_curve(spatial, degree, parameters).or_refuse(KernelStage::Refine, "interpolate_curve")?;
+    if degree < 3 || spatial.len() < 4 || !exact_trace_ends_on() {
+        return Ok(free);
+    }
+    let mut derivatives = [Vec3::default(); 2];
+    for (side, index) in [(0usize, 0usize), (1, spatial.len() - 1)] {
+        let free_derivative = free.derivatives(parameters[index], 1).or_refuse(KernelStage::Refine, "derivatives")?[1];
+        let Some(direction) = intersection_direction(blend, obstacle, spatial[index]) else {
+            return Ok(free);
+        };
+        let along = free_derivative.dot(direction);
+        if !(along.abs() > 0.0) || !along.is_finite() {
+            return Ok(free);
+        }
+        // Oriented the way the piece runs; the magnitude is the free fit's.
+        derivatives[side] = direction.scale(along);
+    }
+    // An end-derivative solve that fails leaves the free fit, which is what
+    // every trace was before and what the fit bands below still measure.
+    Ok(crate::interpolate_curve_with_end_tangents(spatial, parameters, derivatives[0], derivatives[1]).unwrap_or(free))
+}
+
+/// `BREP_BLEND_EXACT_TRACE_ENDS=0` replays the free-end trim fit.
+fn exact_trace_ends_on() -> bool {
+    std::env::var("BREP_BLEND_EXACT_TRACE_ENDS").map_or(true, |value| value != "0")
+}
+
+/// The unit tangent of blend ∩ obstacle at `point`, a point on both carriers:
+/// `n_blend × n_obstacle` there, or `None` where the carriers are tangent (the
+/// cross product shorter than the angular band), the point is not on both, or
+/// a carrier cannot be read there — every `None` keeps the free fit.
+fn intersection_direction(
+    blend: &FaceRecord,
+    obstacle: &FaceRecord,
+    point: Vec3,
+) -> Option<Vec3> {
+    let mut normals = [Vec3::default(); 2];
+    for (slot, face) in [blend, obstacle].into_iter().enumerate() {
+        let Ok(foot) = project_point_to_surface(&face.surface, point) else {
+            return None;
+        };
+        if foot.distance > KernelTolerances::default().pcurve_consistency {
+            return None;
+        }
+        let Ok(normal) = face.surface.normal(foot.u, foot.v) else {
+            return None;
+        };
+        normals[slot] = normal;
+    }
+    let cross = normals[0].cross(normals[1]);
+    if cross.length() <= KernelTolerances::default().angular {
+        return None;
+    }
+    cross.normalized().ok()
+}
+
 fn chord_parameters(points: &[Vec3]) -> Result<Vec<f64>, KernelRefusal> {
     let mut total = 0.0;
     let mut running = vec![0.0];

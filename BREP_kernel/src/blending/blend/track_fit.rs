@@ -246,13 +246,33 @@ fn foot(surface: &NurbsSurface, point: Vec3, seed: Option<[f64; 2]>) -> Result<[
 /// itself — and a seed ON a stationary edge (S_u = 0) cannot leave it, so no
 /// single seed is trusted: a point on its carrier has its true foot nearer
 /// than any stall. A foot on the carrier to rounding ends the search.
+///
+/// On an ANALYTIC carrier every seed's foot is the same closed form: the
+/// seeded projector answers `AnalyticSurface::project` before it reads the
+/// seed, and [`polish`] returns an analytic foot unchanged. Every seed then
+/// gives the same bits, the first is the one kept, and the foot is taken once
+/// (the half torus's stencil sought 58 584 feet for 31 500 points, all
+/// pairs alike; 2026-10-14).
 fn foot_among(surface: &NurbsSurface, point: Vec3, seeds: &[[f64; 2]]) -> Result<[f64; 2], KernelRefusal> {
+    if let (Some(analytic), Some(first)) = (surface.analytic(), seeds.first()) {
+        #[cfg(not(test))]
+        let once = true;
+        if once {
+            if let Some(projection) = analytic.project(surface, point) {
+                // The first seed's own wrap, for its refusals.
+                wrap_closed(surface, *first)?;
+                note_foot_projection();
+                return Ok([projection.u, projection.v]);
+            }
+        }
+    }
     let on_carrier = 1e-12 * (1.0 + point.length());
     let mut best: Option<([f64; 2], f64)> = None;
     for (index, seed) in seeds.iter().enumerate() {
         if seeds[..index].contains(seed) {
             continue;
         }
+        note_foot_projection();
         let found = foot(surface, point, Some(*seed))?;
         let distance = surface.evaluate_extended(found[0], found[1]).or_refuse(KernelStage::Refine, "evaluate_extended")?.sub(point).length();
         if best.map_or(true, |(_, known)| distance < known) {
@@ -263,6 +283,25 @@ fn foot_among(surface: &NurbsSurface, point: Vec3, seeds: &[[f64; 2]]) -> Result
         }
     }
     best.map(|(found, _)| found).ok_or_else(|| KernelRefusal::internal(KernelStage::Refine, "foot_seeds", "blend: a foot with no seed"))
+}
+
+
+thread_local! {
+    static FOOT_PROJECTIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+fn note_foot_projection() {
+    if crate::blend::timing::enabled() {
+        FOOT_PROJECTIONS.with(|count| count.set(count.get() + 1));
+    }
+}
+
+/// Record the seeded projections counted since the last flush under `measure`.
+fn flush_foot_projections(measure: &str) {
+    let count = FOOT_PROJECTIONS.with(|count| count.replace(0));
+    if count > 0 {
+        crate::blend::record_count(measure, count);
+    }
 }
 
 /// Polish the interior feet of a track a caller built with the kernel's
@@ -331,9 +370,20 @@ fn unwrap_near(uv: &mut [f64; 2], near: &[f64; 2], periods: [Option<f64>; 2]) {
     }
 }
 
-/// The parameter lines of `surface`, per direction, across which it is not C2:
-/// interior knots of multiplicity at least the degree, and — in a closed
-/// direction — the seam, where the parameterisation wraps.
+/// The parameter lines of `surface`, per direction, the track breaks at:
+/// interior knots of multiplicity at least [`line_multiplicity`] for that
+/// direction's degree, and — in a closed direction — the seam, where the
+/// parameterisation wraps.
+///
+/// A knot of multiplicity m in a degree-p direction leaves the
+/// parameterisation C^(p-m) there, so it is not C2 once m >= p - 1. As built,
+/// only m >= p was a line: the revolution's double knots at degree 2, and C0
+/// lines. A degree-2 direction with SINGLE knots is C1 at every one of them
+/// all the same -- the second derivative jumps there as at the revolution's
+/// double knot. Unbroken at those lines its support refits converged O(h^2),
+/// climbed to the top rung (2336 sections) and took repair rounds: 6.4 of the
+/// case's 8.6 s (2026-10-14). Breaking at every non-C2 line is the switch
+/// [`c1_knot_lines_on`] (`BREP_BLEND_TRACK_C1_KNOT_LINES`).
 fn knot_lines(surface: &NurbsSurface) -> Result<[Vec<f64>; 2], KernelRefusal> {
     let (closed_u, closed_v) = surface.closed_directions().or_refuse(KernelStage::Refine, "closed_directions")?;
     let lines = |knots: &[f64], degree: usize, closed: bool| -> Vec<f64> {
@@ -343,7 +393,7 @@ fn knot_lines(surface: &NurbsSurface) -> Result<[Vec<f64>; 2], KernelRefusal> {
         while index < knots.len() {
             let value = knots[index];
             let run = knots[index..].iter().take_while(|knot| **knot == value).count();
-            if value > low && value < high && run >= degree.max(1) {
+            if value > low && value < high && run >= line_multiplicity(degree) {
                 lines.push(value);
             }
             index += run;
@@ -358,6 +408,41 @@ fn knot_lines(surface: &NurbsSurface) -> Result<[Vec<f64>; 2], KernelRefusal> {
         lines(&surface.knots_v, surface.degree_v, closed_v),
     ])
 }
+
+/// The least multiplicity of an interior knot [`knot_lines`] breaks a track at
+/// in a direction of `degree`: every line the parameterisation is not C2
+/// across (`degree - 1`, at least 1) on [`c1_knot_lines_on`], only C0 lines
+/// and worse (`degree`, at least 1) off it, as built.
+pub(in crate::blend) fn line_multiplicity(degree: usize) -> usize {
+    if c1_knot_lines_on() {
+        degree.saturating_sub(1).max(1)
+    } else {
+        degree.max(1)
+    }
+}
+
+/// The fitter's contract is unchanged (every fit verified out of sample at
+/// the same floor); the pieces, and so the shipped pcurves, are not the same
+/// bytes, so it lands OFF and is promoted only by its census.
+/// `BREP_BLEND_TRACK_C1_KNOT_LINES=1` forces it on, `=0` off;
+/// `set_c1_knot_lines_for_test` forces either way on a test's thread.
+const C1_KNOT_LINES_DEFAULT: bool = false;
+
+thread_local! {
+    static C1_KNOT_LINES_FOR_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+pub(crate) fn c1_knot_lines_on() -> bool {
+    if let Some(forced) = C1_KNOT_LINES_FOR_TEST.with(|forced| forced.get()) {
+        return forced;
+    }
+    match std::env::var("BREP_BLEND_TRACK_C1_KNOT_LINES").as_deref() {
+        Ok("0") => false,
+        Ok("1") => true,
+        _ => C1_KNOT_LINES_DEFAULT,
+    }
+}
+
 
 /// The fractions, over `[t0, t1]` walked forward or back, where `curve` itself
 /// is not C2: interior knots of multiplicity at least its degree. A
@@ -590,6 +675,19 @@ pub(in crate::blend) fn fit_track_from(
     fit_track_with(surface, track, at, &checks, tolerance, start)
 }
 
+/// [`fit_track_from`] reading its checks through `cache`.
+fn fit_track_from_cached(
+    surface: &NurbsSurface,
+    track: &Track,
+    at: &dyn Fn(f64) -> Result<Vec3, String>,
+    tolerance: f64,
+    start: usize,
+    cache: &mut CheckCache,
+) -> Result<TrackFit, KernelRefusal> {
+    let checks = rung_checks_cached(surface, track, at, Some(cache))?;
+    fit_track_with(surface, track, at, &checks, tolerance, start)
+}
+
 /// What every rung of one track is measured against and joined with: the
 /// out-of-sample midpoint check of each dense interval (the curve's own foot,
 /// projected from the interval's left foot) and the break tangents.
@@ -603,18 +701,77 @@ pub(in crate::blend) fn rung_checks(
     track: &Track,
     at: &dyn Fn(f64) -> Result<Vec3, String>,
 ) -> Result<RungChecks, KernelRefusal> {
+    rung_checks_cached(surface, track, at, None)
+}
+
+/// The carrier points the out-of-sample checks of ONE track fit read, keyed by
+/// the check's curve fraction and the two feet it is sought from (bit for
+/// bit). Each is a pure function of that key (`at`, [`foot_among`] and the
+/// carrier's evaluation), and a local refinement keeps every existing sample's
+/// foot bit for bit, so a check of an interval the refinement did not split
+/// reads the same point again; [`fit_track_locally`] read its 15-point stencil
+/// afresh for every candidate curve on the same track (16 verdicts,
+/// 2026-10-14).
+#[derive(Default)]
+struct CheckCache {
+    points: std::collections::HashMap<[u64; 5], Vec3>,
+    hits: u64,
+}
+
+impl Drop for CheckCache {
+    fn drop(&mut self) {
+        crate::blend::record_count("count.track.check_cache_hits", self.hits);
+    }
+}
+
+/// The carrier point of the curve's own foot at `fraction`, sought from
+/// `seeds` (the interval's two feet), through `cache` when there is one.
+fn check_point(
+    surface: &NurbsSurface,
+    at: &dyn Fn(f64) -> Result<Vec3, String>,
+    fraction: f64,
+    seeds: [[f64; 2]; 2],
+    cache: &mut Option<&mut CheckCache>,
+) -> Result<Vec3, KernelRefusal> {
+    let key = [fraction.to_bits(), seeds[0][0].to_bits(), seeds[0][1].to_bits(), seeds[1][0].to_bits(), seeds[1][1].to_bits()];
+    if let Some(cache) = cache.as_mut() {
+        if let Some(known) = cache.points.get(&key) {
+            let known = *known;
+            cache.hits += 1;
+            return Ok(known);
+        }
+    }
+    let [u, v] = foot_among(surface, at(fraction).or_refuse(KernelStage::Refine, "at")?, &seeds)?;
+    let point = surface.evaluate(u, v).or_refuse(KernelStage::Refine, "evaluate")?;
+    if let Some(cache) = cache.as_mut() {
+        cache.points.insert(key, point);
+    }
+    Ok(point)
+}
+
+
+fn rung_checks_cached(
+    surface: &NurbsSurface,
+    track: &Track,
+    at: &dyn Fn(f64) -> Result<Vec3, String>,
+    mut cache: Option<&mut CheckCache>,
+) -> Result<RungChecks, KernelRefusal> {
+    let timer = crate::blend::BlendTimer::start("timing.track.rung_checks_ms");
+    flush_foot_projections("count.track.feet_elsewhere");
     let last = track.fractions.len() - 1;
     let mut checks: Vec<(f64, Vec3)> = Vec::with_capacity(last);
     for index in 0..last {
         let fraction = 0.5 * (track.fractions[index] + track.fractions[index + 1]);
-        let [u, v] = foot_among(surface, at(fraction).or_refuse(KernelStage::Refine, "at")?, &[track.feet[index], track.feet[index + 1]])?;
-        checks.push((fraction, surface.evaluate(u, v).or_refuse(KernelStage::Refine, "evaluate")?));
+        checks.push((fraction, check_point(surface, at, fraction, [track.feet[index], track.feet[index + 1]], &mut cache)?));
     }
     let tangents: Vec<[[f64; 2]; 2]> = track
         .breaks
         .iter()
         .map(|&index| track_tangent(surface, track, at, index))
         .collect::<Result<_, _>>()?;
+    crate::blend::record_count("count.track.rung_check_points", last as u64);
+    flush_foot_projections("count.track.rung_check_feet");
+    timer.stop();
     Ok(RungChecks { checks, tangents })
 }
 
@@ -627,12 +784,14 @@ fn fit_track_with(
     tolerance: f64,
     start: usize,
 ) -> Result<TrackFit, KernelRefusal> {
+    let _timer = crate::blend::BlendTimer::start("timing.track.ladder_ms");
     let last = track.fractions.len() - 1;
     let mut best: Option<TrackFit> = None;
     let mut sections = start.max(8);
     loop {
         let sections_here = sections.min(last);
         let pieces = ladder_pieces(track, sections_here);
+        crate::blend::record_count("count.track.rungs", 1);
         let fit = measure_rung(surface, track, at, checks, &pieces, sections_here, tolerance)?;
         let miss = fit.miss;
         if best.as_ref().map_or(true, |known| miss < known.miss) {
@@ -752,11 +911,7 @@ fn measure_rung(
             .map(|&i| Vec4::from_point(Vec3::new(track.uv[i][0], track.uv[i][1], 0.0), 1.0))
             .collect();
         let parameters: Vec<f64> = indices.iter().map(|&i| track.fractions[i]).collect();
-        (
-            crate::fit::interpolate_homogeneous(&points, FIT_DEGREE, &parameters)
-                .or_refuse(KernelStage::Refine, "interpolate")?,
-            indices.len(),
-        )
+        (interpolate_track(&points, &parameters)?, indices.len())
     } else {
         fit_in_c1_pieces(track, &checks.tangents, pieces)?
     };
@@ -1246,6 +1401,7 @@ pub(in crate::blend) fn read_shipped_pcurve_memo(
     d1: f64,
     memo: &mut FootMemo,
 ) -> Result<(f64, f64, usize, f64), KernelRefusal> {
+    let _timer = crate::blend::BlendTimer::start("timing.track.shipped_read_ms");
     let mut parameters: Vec<f64> = pcurve.knots.iter().copied().filter(|knot| *knot >= d0 && *knot <= d1).collect();
     parameters.push(d0);
     parameters.push(d1);
@@ -1272,6 +1428,7 @@ pub(in crate::blend) fn read_shipped_pcurve_memo(
             _ => residuals.push(f64::NAN),
         }
     }
+    crate::blend::record_count("count.track.shipped_samples", parameters.len() as u64);
     let (miss, _) = classify_checks(&residuals, f64::INFINITY)?;
     let worst = residuals.iter().zip(&parameters).fold((0.0_f64, d0), |best, (&residual, &t)| if residual > best.0 { (residual, t) } else { best }).1;
     Ok((miss, offset, residuals.len(), worst))
@@ -1410,6 +1567,21 @@ fn stencil_verdict(
     curve: &NurbsCurve,
     tolerance: f64,
 ) -> Result<(f64, Vec<usize>, Option<WorstCheck>, Vec<(f64, f64, f64, f64)>), KernelRefusal> {
+    stencil_verdict_cached(surface, track, at, curve, tolerance, None)
+}
+
+/// [`stencil_verdict`] reading its carrier points through `cache`.
+fn stencil_verdict_cached(
+    surface: &NurbsSurface,
+    track: &Track,
+    at: &dyn Fn(f64) -> Result<Vec3, String>,
+    curve: &NurbsCurve,
+    tolerance: f64,
+    mut cache: Option<&mut CheckCache>,
+) -> Result<(f64, Vec<usize>, Option<WorstCheck>, Vec<(f64, f64, f64, f64)>), KernelRefusal> {
+    let timer = crate::blend::BlendTimer::start("timing.track.stencil_ms");
+    flush_foot_projections("count.track.feet_elsewhere");
+    crate::blend::record_count("count.track.stencil_points", ((track.fractions.len() - 1) * (LOCAL_STENCIL - 1)) as u64);
     let mut per_interval = Vec::with_capacity(track.fractions.len() - 1);
     // Each interval's own (miss, fraction of its worst stencil point, low, high).
     let mut located = Vec::with_capacity(track.fractions.len() - 1);
@@ -1420,8 +1592,7 @@ fn stencil_verdict(
         let mut interval_worst = (0.0_f64, 0.5 * (low + high));
         for j in 1..LOCAL_STENCIL {
             let fraction = low + (high - low) * j as f64 / LOCAL_STENCIL as f64;
-            let [u, v] = foot_among(surface, at(fraction).or_refuse(KernelStage::Refine, "at")?, &[track.feet[index], track.feet[index + 1]])?;
-            let on_carrier = surface.evaluate(u, v).or_refuse(KernelStage::Refine, "evaluate")?;
+            let on_carrier = check_point(surface, at, fraction, [track.feet[index], track.feet[index + 1]], &mut cache)?;
             let uv = curve.evaluate(fraction).or_refuse(KernelStage::Refine, "evaluate")?;
             let distance = pcurve_image(surface, uv.x, uv.y).or_refuse(KernelStage::Refine, "evaluate")?.sub(on_carrier).length();
             if worst.as_ref().map_or(true, |(known, _)| distance > *known) {
@@ -1437,6 +1608,18 @@ fn stencil_verdict(
         located.push((miss, interval_worst.1, low, high));
     }
     let (miss, over) = classify_checks(&per_interval, tolerance)?;
+    flush_foot_projections("count.track.stencil_feet");
+    if std::env::var_os("BREP_DEBUG_TRACK_FIT").is_some() {
+        eprintln!(
+            "TRACK_FIT stencil: {} intervals x {} points on a {} carrier ({} x {} net) in {:.1} ms",
+            track.fractions.len() - 1,
+            LOCAL_STENCIL - 1,
+            if surface.analytic().is_some() { "analytic" } else { "general" },
+            surface.control_points.len(),
+            surface.control_points.first().map_or(0, |row| row.len()),
+            timer.elapsed_ms()
+        );
+    }
     Ok((miss, over, worst.map(|(_, at)| at), located))
 }
 
@@ -1464,14 +1647,15 @@ pub(in crate::blend) fn fit_track_locally(
     rounds: usize,
     max_intervals: usize,
 ) -> Result<(TrackFit, usize), KernelRefusal> {
-    let mut fit = fit_track(surface, track, at, tolerance)?;
+    let mut cache = CheckCache::default();
+    let mut fit = fit_track_from_cached(surface, track, at, tolerance, 8, &mut cache)?;
     if fit.on_floor {
         #[cfg(not(test))]
         let trust_midpoints = false;
         if trust_midpoints {
             return Ok((fit, 0));
         }
-        let (_, over, _, _) = stencil_verdict(surface, track, at, &fit.curve, tolerance)?;
+        let (_, over, _, _) = stencil_verdict_cached(surface, track, at, &fit.curve, tolerance, Some(&mut cache))?;
         if over.is_empty() {
             return Ok((fit, 0));
         }
@@ -1498,7 +1682,7 @@ pub(in crate::blend) fn fit_track_locally(
         } else {
             let (miss, over, worst, located) = match judged.take() {
                 Some(verdict) => verdict,
-                None => stencil_verdict(surface, track, at, &fit.curve, tolerance)?,
+                None => stencil_verdict_cached(surface, track, at, &fit.curve, tolerance, Some(&mut cache))?,
             };
             over_located = over.iter().filter_map(|&index| located.get(index).copied()).collect();
             // The reported miss is the stencil's, so is where it sits
@@ -1547,8 +1731,9 @@ pub(in crate::blend) fn fit_track_locally(
             let challenger = if climb_fails {
                 Err(KernelRefusal::internal(KernelStage::Refine, "climb_control", "blend: control: the climbed rung cannot be read"))
             } else {
-                fit_track_from(surface, track, at, tolerance, climb)
-                    .and_then(|climbed| stencil_verdict(surface, track, at, &climbed.curve, tolerance).map(|verdict| (climbed, verdict)))
+                fit_track_from_cached(surface, track, at, tolerance, climb, &mut cache).and_then(|climbed| {
+                    stencil_verdict_cached(surface, track, at, &climbed.curve, tolerance, Some(&mut cache)).map(|verdict| (climbed, verdict))
+                })
             };
             match challenger {
                 Ok((climbed, verdict)) => {
@@ -1658,13 +1843,13 @@ pub(in crate::blend) fn fit_track_locally(
         // strictly smaller (the ladder on a tie), and any failure to build or
         // read it leaves the ladder standing. Same checks, rounds, ceiling and
         // floor.
-        let checks = rung_checks(surface, track, at)?;
+        let checks = rung_checks_cached(surface, track, at, Some(&mut cache))?;
         let ladder = fit_track_with(surface, track, at, &checks, tolerance, start)?;
         if midpoint_only {
             fit = ladder;
             continue;
         }
-        let ladder_verdict = stencil_verdict(surface, track, at, &ladder.curve, tolerance)?;
+        let ladder_verdict = stencil_verdict_cached(surface, track, at, &ladder.curve, tolerance, Some(&mut cache))?;
         let mut kept = fit.kept.clone();
         kept.extend(track.fractions.iter().copied().filter(|fraction| !before.contains(&fraction.to_bits())));
         #[cfg(not(test))]
@@ -1682,7 +1867,7 @@ pub(in crate::blend) fn fit_track_locally(
                     measure_rung(surface, track, at, &checks, &pieces, sections, tolerance)
                 };
                 let nested = measured.ok()?;
-                let verdict = stencil_verdict(surface, track, at, &nested.curve, tolerance).ok()?;
+                let verdict = stencil_verdict_cached(surface, track, at, &nested.curve, tolerance, Some(&mut cache)).ok()?;
                 Some((nested, verdict))
             })
         };
@@ -1884,6 +2069,94 @@ fn fit_in_c1_pieces(
     Ok((NurbsCurve::new(FIT_DEGREE, knots, control).or_refuse(KernelStage::Refine, "curve_new")?, samples))
 }
 
+/// A square collocation matrix held as its band while every entry set lies in it
+/// ([`crate::fit::CollocationBand`], `degree` either side of the diagonal), and
+/// as the dense matrix from the first entry that does not. Solved by
+/// [`crate::fit::solve_collocation_banded`] or [`crate::fit::solve_collocation`]
+/// respectively, which perform the same operations on the same entries: the
+/// solution is the dense solve's to the bit either way. The dense form allocated
+/// and zeroed (n+1)^2 entries per solve.
+enum BandOrDense {
+    /// The band, its order, and every entry set so far in order (to replay
+    /// into the dense form should a later entry fall outside the band).
+    Band(crate::fit::CollocationBand, usize, Vec<(usize, usize, f64)>),
+    Dense(Vec<Vec<f64>>),
+}
+
+impl BandOrDense {
+    fn new(count: usize, degree: usize) -> Self {
+        BandOrDense::Band(crate::fit::CollocationBand::new(count, degree), count, Vec::new())
+    }
+
+    fn set(&mut self, row: usize, column: usize, value: f64) {
+        match self {
+            BandOrDense::Band(band, count, entries) => {
+                if band.set(row, column, value) {
+                    entries.push((row, column, value));
+                } else {
+                    let mut dense = vec![vec![0.0; *count]; *count];
+                    for &(r, c, v) in entries.iter() {
+                        dense[r][c] = v;
+                    }
+                    dense[row][column] = value;
+                    *self = BandOrDense::Dense(dense);
+                }
+            }
+            BandOrDense::Dense(dense) => dense[row][column] = value,
+        }
+    }
+
+    fn solve(&self, rhs: &[f64], degree: usize) -> Result<Vec<f64>, String> {
+        match self {
+            BandOrDense::Band(band, _, _) => crate::fit::solve_collocation_banded(band, rhs),
+            BandOrDense::Dense(dense) => crate::fit::solve_collocation(dense, rhs, degree),
+        }
+    }
+}
+
+
+/// [`crate::fit::interpolate_homogeneous`] of a track's `points` (uv, weight
+/// one) at FIT_DEGREE, its collocation held as a band ([`BandOrDense`]): the
+/// same knots, basis rows and four axis solves, so the same curve to the bit.
+pub(in crate::blend) fn interpolate_track(points: &[Vec4], parameters: &[f64]) -> Result<NurbsCurve, KernelRefusal> {
+    if points.len() < 2 || parameters.len() != points.len() || parameters.windows(2).any(|pair| pair[1] <= pair[0]) {
+        return crate::fit::interpolate_homogeneous(points, FIT_DEGREE, parameters).or_refuse(KernelStage::Refine, "interpolate");
+    }
+    interpolate_track_band(points, parameters).or_refuse(KernelStage::Refine, "interpolate")
+}
+
+fn interpolate_track_band(points: &[Vec4], parameters: &[f64]) -> Result<NurbsCurve, String> {
+    let n = points.len() - 1;
+    let degree = FIT_DEGREE.min(n);
+    let m = n + degree + 1;
+    let mut knots = vec![0.0; m + 1];
+    for knot in &mut knots[m - degree..=m] {
+        *knot = 1.0;
+    }
+    for j in 1..=n.saturating_sub(degree) {
+        knots[j + degree] = parameters[j..j + degree].iter().sum::<f64>() / degree as f64;
+    }
+    let knot_vector = crate::KnotVector::new(knots.clone(), degree)?;
+    let mut matrix = BandOrDense::new(n + 1, degree);
+    for (row, &parameter) in parameters.iter().enumerate() {
+        let span = knot_vector.find_span(parameter);
+        let basis = knot_vector.basis_functions(span, parameter);
+        for (offset, value) in basis.into_iter().enumerate() {
+            matrix.set(row, span - degree + offset, value);
+        }
+    }
+    let solve_axis = |axis: fn(&Vec4) -> f64| matrix.solve(&points.iter().map(axis).collect::<Vec<_>>(), degree);
+    let xs = solve_axis(|point| point.x)?;
+    let ys = solve_axis(|point| point.y)?;
+    let zs = solve_axis(|point| point.z)?;
+    let ws = solve_axis(|point| point.w)?;
+    NurbsCurve::new(
+        degree,
+        knots,
+        (0..=n).map(|index| Vec4 { x: xs[index], y: ys[index], z: zs[index], w: ws[index] }).collect(),
+    )
+}
+
 /// Cubic interpolation of 2D `points` at `parameters`, clamped over the
 /// parameters' own interval, with an optional prescribed first derivative at
 /// either end (The NURBS Book §9.2.2). Each prescribed derivative adds one
@@ -1921,18 +2194,18 @@ fn interpolate_with_tangents(
     }
     knots.extend(std::iter::repeat(t1).take(degree + 1));
     let knot_vector = crate::KnotVector::new(knots.clone(), degree).or_refuse(KernelStage::Refine, "knot_vector")?;
-    let mut matrix = vec![vec![0.0; controls]; controls];
+    let mut matrix = BandOrDense::new(controls, degree);
     let mut rhs: Vec<[f64; 2]> = vec![[0.0; 2]; controls];
     let mut row = 0usize;
     for (index, &parameter) in parameters.iter().enumerate() {
         if index == 0 {
-            matrix[row][0] = 1.0;
+            matrix.set(row, 0, 1.0);
             rhs[row] = points[0];
             row += 1;
             if let Some(tangent) = start {
                 let scale = degree as f64 / (knots[degree + 1] - t0);
-                matrix[row][0] = -scale;
-                matrix[row][1] = scale;
+                matrix.set(row, 0, -scale);
+                matrix.set(row, 1, scale);
                 rhs[row] = tangent;
                 row += 1;
             }
@@ -1941,25 +2214,23 @@ fn interpolate_with_tangents(
         if index == n {
             if let Some(tangent) = end {
                 let scale = degree as f64 / (t1 - knots[controls - 1]);
-                matrix[row][controls - 2] = -scale;
-                matrix[row][controls - 1] = scale;
+                matrix.set(row, controls - 2, -scale);
+                matrix.set(row, controls - 1, scale);
                 rhs[row] = tangent;
                 row += 1;
             }
-            matrix[row][controls - 1] = 1.0;
+            matrix.set(row, controls - 1, 1.0);
             rhs[row] = points[n];
             continue;
         }
         let span = knot_vector.find_span(parameter);
         for (offset, value) in knot_vector.basis_functions(span, parameter).into_iter().enumerate() {
-            matrix[row][span - degree + offset] = value;
+            matrix.set(row, span - degree + offset, value);
         }
         rhs[row] = points[index];
         row += 1;
     }
-    let solve = |axis: usize| {
-        crate::fit::solve_collocation(&matrix, &rhs.iter().map(|value| value[axis]).collect::<Vec<_>>(), degree)
-    };
+    let solve = |axis: usize| matrix.solve(&rhs.iter().map(|value| value[axis]).collect::<Vec<_>>(), degree);
     let (us, vs) = (
         solve(0).or_refuse(KernelStage::Refine, "collocation")?,
         solve(1).or_refuse(KernelStage::Refine, "collocation")?,

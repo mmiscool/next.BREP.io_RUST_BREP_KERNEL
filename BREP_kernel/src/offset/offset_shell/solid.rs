@@ -17,6 +17,7 @@
 //! radius `|d|`, which is what puts the exact cylinder or torus cap on each
 //! straight or circular edge and the corner ball at each vertex. The blend's
 //! constructions are reused through `fillet_edges`, never rebuilt here.
+use super::debug_enabled;
 use super::pipeline::{offset_body, Body};
 use super::{OffsetFaceRole, OffsetShellFaceImageRecord, OffsetShellResultRecord};
 use crate::classification::PolygonClass;
@@ -237,7 +238,17 @@ pub fn offset_shell_by_boolean(
             "offset_shell: at least one opening face is required",
         ));
     }
-    let body = offset_body(source, opening_face_ids, distance, Body::Whole, "offset_shell_by_boolean")?;
+    let body = offset_body(source, opening_face_ids, distance, Body::Whole, "offset_shell_by_boolean")
+        .or_else(|error| {
+            if !direct_refusal_takes_the_boolean_lane(&error) {
+                return Err(error);
+            }
+            let result = super::joint_offset::build(source, opening_face_ids, distance);
+            if let Err(reason) = &result {
+                os_debug!("joint offset refused: {reason}");
+            }
+            result.map_err(|_| error)
+        })?;
     let (kept, removed) = if distance > 0.0 { (source, &body.solid) } else { (&body.solid, source) };
     let solid = boolean_operation(kept, removed, BooleanOperation::Subtract, &BooleanOptions::default())
         .map_err(|error| {

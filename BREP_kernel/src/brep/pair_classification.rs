@@ -152,7 +152,43 @@ pub struct SurfaceClassifyData {
     samples: Vec<(f64, f64, Vec3, Option<Vec3>)>,
 }
 
+thread_local! {
+    static CLASSIFY_MEMO: std::cell::RefCell<rustc_hash::FxHashMap<[u64; 2], std::rc::Rc<SurfaceClassifyData>>> = Default::default();
+    static CLASSIFY_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+pub(crate) fn classify_reads() -> usize { CLASSIFY_READS.with(std::cell::Cell::get) }
+
+pub(crate) fn clear_classify_memo() {
+    CLASSIFY_MEMO.with(|memo| memo.borrow_mut().clear());
+}
+
 impl SurfaceClassifyData {
+    /// Only geometry and tolerance enter this read. Renumbering a face or
+    /// moving it to the next boolean operand does not require new samples.
+    pub(crate) fn memoized(surface: &NurbsSurface, tolerance: f64) -> Result<std::rc::Rc<Self>, String> {
+        let enabled = std::env::var("BREP_CLASSIFY_MEMO").as_deref() != Ok("0");
+        let mut hash = crate::mass_properties::TwoLane::new();
+        crate::mass_properties::hash_surface(&mut hash, surface);
+        hash.f64(tolerance);
+        let key = hash.finish();
+        if enabled {
+            if let Some(data) = CLASSIFY_MEMO.with(|memo| memo.borrow().get(&key).cloned()) {
+                return Ok(data);
+            }
+        }
+        CLASSIFY_READS.with(|reads| reads.set(reads.get() + 1));
+        let data = std::rc::Rc::new(Self::build(surface, tolerance)?);
+        if enabled {
+            CLASSIFY_MEMO.with(|memo| {
+                let mut memo = memo.borrow_mut();
+                if memo.len() >= 4096 { memo.clear(); }
+                memo.insert(key, data.clone());
+            });
+        }
+        Ok(data)
+    }
+
     pub fn build(surface: &NurbsSurface, model_tolerance: f64) -> Result<Self, String> {
         let samples = surface_samples(surface)?
             .into_iter()
@@ -292,4 +328,5 @@ pub fn classify_surface_pair_cached(
         tangential_only: close_samples > 0 && parallel_close_samples == close_samples,
     })
 }
+
 

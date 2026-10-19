@@ -29,6 +29,7 @@ mod sphere_atlas;
 mod pole_patch;
 mod rectangle;
 mod stride_encode;
+mod face_memo;
 
 use profile::*;
 use triangulate::*;
@@ -42,6 +43,8 @@ use rectangle::*;
 
 pub use face_tess::triangulate_planar_region;
 pub use orient::tessellate_brep_watertight;
+pub use face_memo::clear as clear_face_memo;
+pub(crate) use stride_encode::tessellate_brep_watertight_face_stride_keyed;
 pub use stride_encode::{
     sample_edge_polylines, sample_edges_encoded, tessellate_brep_watertight_face_stride,
     tessellate_brep_watertight_face_stride_with_samples,

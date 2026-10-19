@@ -1,8 +1,118 @@
 use crate::{KernelRefusal, KernelStage, OrRefuse};
 use super::*;
 
-/// General closed-edge rolling-ball fillet or chamfer by direct §6.9
-/// topology surgery.
+/// General closed-edge rolling-ball fillet or chamfer by direct §6.9 topology
+/// surgery. The refusal class of a concave closed rim whose fill overruns the
+/// plane it stands on (lane L, 2026-10-16).
+pub(crate) const CONCAVE_RIM_OVERRUN_WHAT: &str = "concave_rim_overrun";
+
+/// Lane L (2026-10-16): a CONCAVE closed rim standing on a PLANE — the rim one
+/// of the plane's INNER loops (a boss on a plate) — whose fill reaches past
+/// the plane's OUTER loop is not a face consumed up to one preserved far edge:
+/// the fill overruns the plate, and the body owed is that fill clipped by the
+/// plate's neighbouring faces. The edge-preserving construction found four
+/// "far" edges there and said "ambiguous preserved boundary edge". Read
+/// geometrically: the rim sampled, each sample stepped `radius` into the plane
+/// square to the rim (the fill's contact for a boss standing square to the
+/// plane), tested against the outer loop as a polygon in the plane (the chart
+/// clamps; the loop does not).
+fn concave_rim_overrun(
+    solid: &BrepSolid,
+    edge: &EdgeRecord,
+    mates: [(&FaceRecord, usize); 2],
+    radius: f64,
+) -> Result<Option<KernelRefusal>, KernelRefusal> {
+    const RIM_SAMPLES: usize = 64;
+    const LOOP_SAMPLES: usize = 256;
+    if edge.start_vertex_id != edge.end_vertex_id {
+        return Ok(None);
+    }
+    for (index, (face, rim_loop)) in mates.iter().copied().enumerate() {
+        if rim_loop == 0 {
+            continue;
+        }
+        let Some(crate::AnalyticSurface::Plane { origin, u_dir, v_dir, .. }) = face.surface.analytic() else { continue };
+        let wall = mates[1 - index].0;
+        let e1 = u_dir.normalized().or_refuse(KernelStage::Classify, "normalized")?;
+        let normal = u_dir.cross(*v_dir).normalized().or_refuse(KernelStage::Classify, "normalized")?;
+        let e2 = normal.cross(e1);
+        let flat = |p: Vec3| -> (f64, f64) { let d = p.sub(*origin); (d.dot(e1), d.dot(e2)) };
+        // The outer loop and the rim's own loop as polygons in the plane.
+        let polygon = |loop_index: usize| -> Result<Vec<(f64, f64)>, KernelRefusal> {
+            let mut points: Vec<(f64, f64)> = Vec::new();
+            for coedge in &face.loops[loop_index].coedges {
+                let Some(boundary) = solid.edges.iter().find(|candidate| candidate.id == coedge.edge_id) else { continue };
+                for k in 0..LOOP_SAMPLES {
+                    let f = k as f64 / LOOP_SAMPLES as f64;
+                    let t = if coedge.forward { boundary.t0 + (boundary.t1 - boundary.t0) * f } else { boundary.t1 - (boundary.t1 - boundary.t0) * f };
+                    points.push(flat(boundary.curve.evaluate(t).or_refuse(KernelStage::Classify, "evaluate")?));
+                }
+            }
+            Ok(points)
+        };
+        let (outer, rim_polygon) = (polygon(0)?, polygon(rim_loop)?);
+        let within = |points: &[(f64, f64)], x: f64, y: f64| -> bool {
+            let mut odd = false;
+            for k in 0..points.len() {
+                let (ax, ay) = points[k];
+                let (bx, by) = points[(k + 1) % points.len()];
+                if (ay > y) != (by > y) && x < ax + (y - ay) * (bx - ax) / (by - ay) {
+                    odd = !odd;
+                }
+            }
+            odd
+        };
+        // The plate's region about the rim: inside the outer loop, outside the
+        // rim's own loop (where the boss stands).
+        let inside = |x: f64, y: f64| -> bool { within(&outer, x, y) && !within(&rim_polygon, x, y) };
+        // Concave: at a rim sample the wall's OUTWARD normal points into the
+        // plate's region (a boss facing out over its plate); a hole's wall
+        // faces its axis (convex) and is not this class.
+        {
+            let derivatives = edge.curve.derivatives(edge.t0, 1).or_refuse(KernelStage::Classify, "derivatives")?;
+            let (point, tangent) = (derivatives[0], derivatives[1]);
+            let side = normal.cross(tangent).normalized().or_refuse(KernelStage::Classify, "normalized")?;
+            // A twentieth of the radius: well past the sampled loops' chord
+            // sag, well inside the fill's own reach.
+            let probe = radius * 0.05;
+            let (px, py) = flat(point.add(side.scale(probe)));
+            let toward = if inside(px, py) { side } else { side.scale(-1.0) };
+            let foot = crate::project_point_to_surface(&wall.surface, point).or_refuse(KernelStage::Classify, "project_point_to_surface")?;
+            let wall_normal = wall.surface.normal(foot.u, foot.v).or_refuse(KernelStage::Classify, "normal")?;
+            let outward = if wall.same_sense { wall_normal } else { wall_normal.scale(-1.0) };
+            if outward.dot(toward) <= 0.0 {
+                continue;
+            }
+        }
+        let mut overruns = false;
+        for k in 0..RIM_SAMPLES {
+            let t = edge.t0 + (edge.t1 - edge.t0) * (k as f64 + 0.5) / RIM_SAMPLES as f64;
+            let derivatives = edge.curve.derivatives(t, 1).or_refuse(KernelStage::Classify, "derivatives")?;
+            let (point, tangent) = (derivatives[0], derivatives[1]);
+            let Ok(side) = normal.cross(tangent).normalized() else { continue };
+            // Into the plate: of the two in-plane normals to the rim, the one a
+            // small step along which stays inside the outer loop's region.
+            // A twentieth of the radius: well past the sampled loops' chord
+            // sag, well inside the fill's own reach.
+            let probe = radius * 0.05;
+            let toward = if inside(flat(point.add(side.scale(probe))).0, flat(point.add(side.scale(probe))).1) { side } else { side.scale(-1.0) };
+            let contact = flat(point.add(toward.scale(radius)));
+            if !within(&outer, contact.0, contact.1) {
+                overruns = true;
+                break;
+            }
+        }
+        if overruns {
+            return Ok(Some(KernelRefusal::unsupported(KernelStage::Classify, CONCAVE_RIM_OVERRUN_WHAT, format!(
+                "blend: the concave rim fill overruns the face's outer boundary — rolling on rim edge {}, the ball's contact on the plane {} it stands on (radius {radius} from the rim) reaches past that plane's outer loop, so the fill must be clipped by the plane's neighbouring faces, which this lane does not build",
+                edge.id,
+                face.name.clone().unwrap_or_else(|| format!("{}", face.id)),
+            ))));
+        }
+    }
+    Ok(None)
+}
+
 pub fn blend_closed_edge(
     solid: &BrepSolid,
     edge_id: u64,
@@ -18,6 +128,43 @@ pub fn blend_closed_edge(
     }
     blend_closed_edge_impl(solid, edge_id, &|_| radius, Some(radius), chamfer, name)
 }
+
+/// [`blend_closed_edge`] with the closed-rim support refit's KNOT-AWARE retry
+/// (lane L, 2026-10-16): where a support pcurve's uniform track misses the floor,
+/// the fit is retried on a track that also samples the rail's own knots
+/// (`project_piece_pcurve_within_knot_retry`). Only for a caller whose refusal is
+/// TERMINAL for the whole operation — the fillet tool's last rung
+/// (`fillet/tool.rs`, `lcount201_knot_aware_last_rung_20261016`) on a refusal
+/// [`is_pcurve_floor_refusal`] reads: roads that call `blend_closed_edge` per
+/// rung and recover a floor miss themselves (the stadium, half-torus and box
+/// ladders) never see it.
+pub fn blend_closed_edge_knot_aware(
+    solid: &BrepSolid,
+    edge_id: u64,
+    radius: f64,
+    chamfer: bool,
+    name: Option<&str>,
+) -> Result<BrepSolid, KernelRefusal> {
+    let _operation = crate::blend::BlendOperation::enter();
+    if !(radius > 0.0) || !radius.is_finite() {
+        return Err(KernelRefusal::input(KernelStage::Collect, "radius", "blend: radius must be positive"));
+    }
+    KNOT_RETRY.with(|flag| flag.set(true));
+    let built = blend_closed_edge_impl(solid, edge_id, &|_| radius, Some(radius), chamfer, name);
+    KNOT_RETRY.with(|flag| flag.set(false));
+    built
+}
+
+/// A refusal for a support pcurve that does not reach the refinement floor —
+/// read off its CLASS and code (`CHAIN_PCURVE_FLOOR_WHAT`,
+/// `CLOSED_SUPPORT_PCURVE_FLOOR_WHAT`), never its wording.
+pub fn is_pcurve_floor_refusal(refusal: &KernelRefusal) -> bool {
+    matches!(&refusal.class, crate::RefusalClass::NonConvergence { what }
+        if what == crate::blend::chain::CHAIN_PCURVE_FLOOR_WHAT || what == CLOSED_SUPPORT_PCURVE_FLOOR_WHAT)
+}
+
+/// The code of a closed-rim support refit that misses the floor as shipped.
+pub(crate) const CLOSED_SUPPORT_PCURVE_FLOOR_WHAT: &str = "closed_support_pcurve_floor";
 
 /// Variable-radius blend (4.9.5): radius stops as (edge fraction, radius)
 /// pairs, linearly interpolated along the edge parameter and clamped at
@@ -239,13 +386,19 @@ fn blend_closed_edge_impl(
         crate::blend::record_count("count.closed.exact_lane", 1);
     }
     let march_timing = crate::blend::BlendTimer::start("timing.closed.march_ms");
+    let attempt_timing = crate::blend::BlendTimer::start("timing.closed.march.anchored_fallback_ms");
     let marched = match march_stations_with_rail_bar(edge, &first_mate, &second_mate, radius_at, anchor_u, FoldPolicy::Refuse, depth_budget, rail_bar, wall_check) {
-        Ok(stations) => Ok(stations),
+        Ok(stations) => {
+            std::mem::forget(attempt_timing);
+            Ok(stations)
+        }
         Err(failure) => {
             // Post-refinement errors return directly, before either the
             // unanchored retry or the legacy edge-preserving construction.
             let anchored_error = failure.into_initial()?;
             if anchor_u.is_some() {
+                attempt_timing.stop();
+                crate::blend::record_count("count.closed.march.anchor_fallback", 1);
                 if std::env::var("BREP_DEBUG_CLOSED_RAILS").is_ok() {
                     eprintln!("closed initial anchor fallback: edge {}: {anchored_error}", edge.id);
                 }
@@ -275,6 +428,48 @@ fn blend_closed_edge_impl(
     let model_unmet = crate::blend::stations::CLOSED_MODEL_UNMET.with(|slot| slot.take());
     let request_rails = crate::blend::stations::CLOSED_REQUEST_RAILS.with(|slot| slot.take());
     let mut carve_fold = false;
+    // The CARVE LADDER (see below): the stations a folding wall is carved
+    // from, or the refusal that there is no wall accurate enough to carve.
+    // Shared by the march's own fold verdict and by the rows-loop verdict
+    // read after the fit (2026-10-17: `fillet-mouth-over-wall-bore-5p5-r2p2`'s
+    // F2 wall loops at the rim's midpoint without the march's centre-curve
+    // verdict ever firing).
+    let climb_carve_ladder = |error: &KernelRefusal| -> Result<Vec<Station>, KernelRefusal> {
+        let rail_bar = 0.5 * crate::KernelTolerances::for_solid(solid, 1e-7).intersection_fit;
+        let mut climbed: Option<Vec<Station>> = None;
+        let mut last_off = f64::NAN;
+        for depth_budget in MAX_REFINEMENT_DEPTH..=CARVE_MAX_REFINEMENT_DEPTH {
+            let stations = match march_with(FoldPolicy::Carve, depth_budget) {
+                Ok(stations) => stations,
+                // The Carve march did not build: the fold stays the answer.
+                Err(_) => break,
+            };
+            let parameters = station_parameters(&stations);
+            let off = match fit_closed_rows(&stations, &parameters, chamfer) {
+                Ok(rows) => rails_off_closed_carriers(&rows, &stations, &parameters, &first_mate, &second_mate)?,
+                Err(_) => break,
+            };
+            last_off = off;
+            crate::blend::carve::carve_trace(format_args!(
+                "blend closed-edge carve ladder: depth budget {depth_budget} ({} stations) leaves the rails {off:.3e} off their carriers (bar {rail_bar:.3e})",
+                stations.len()
+            ));
+            if off <= rail_bar {
+                climbed = Some(stations);
+                break;
+            }
+        }
+        climbed.ok_or_else(|| {
+            crate::blend::fold::wall_fold_refusal(
+                Vec::new(),
+                format!(
+                    "{} {} fits this edge: the wall folds, and at depth budget {CARVE_MAX_REFINEMENT_DEPTH} — the top of the closed march's carve ladder — its fitted rails still stand {last_off:.3e} off their carriers between stations against a bar of {rail_bar:.3e}, so there is no wall accurate enough to carve ({error})",
+                    crate::blend::WALL_FOLDS,
+                    radius_at(mid_t).abs()
+                ),
+            )
+        })
+    };
     let marched = match marched {
         Err(error)
             if crate::blend::is_wall_fold(&error)
@@ -284,56 +479,17 @@ fn blend_closed_edge_impl(
             crate::blend::carve::carve_trace(format_args!(
                 "blend closed-edge: the wall folds ({error}); re-marching under Carve"
             ));
-            // The CARVE LADDER: the adaptive march's depth budget is raised
-            // rung by rung until the rows fitted through its stations stand
-            // on their carriers between stations to the network's rail bar
-            // (half `intersection_fit`, read at 0.25/0.5/0.75 of every span)
-            // — the same climb the closed chain lane makes per segment
-            // (`carve_ladder`).  Measured on the narrowed mouth-over-wall
-            // variant 2026-10-03: the refusing march's own budget left the
-            // rails 2.7e-4 off their carriers, two decades over the bar.
-            let rail_bar = 0.5 * crate::KernelTolerances::for_solid(solid, 1e-7).intersection_fit;
-            let mut climbed: Option<Vec<Station>> = None;
-            let mut last_off = f64::NAN;
-            for depth_budget in MAX_REFINEMENT_DEPTH..=CARVE_MAX_REFINEMENT_DEPTH {
-                let stations = match march_with(FoldPolicy::Carve, depth_budget) {
-                    Ok(stations) => stations,
-                    // The Carve march did not build: the fold stays the answer.
-                    Err(_) => break,
-                };
-                let parameters = station_parameters(&stations);
-                let off = match fit_closed_rows(&stations, &parameters, chamfer) {
-                    Ok(rows) => rails_off_closed_carriers(&rows, &stations, &parameters, &first_mate, &second_mate)?,
-                    Err(_) => break,
-                };
-                last_off = off;
-                crate::blend::carve::carve_trace(format_args!(
-                    "blend closed-edge carve ladder: depth budget {depth_budget} ({} stations) leaves the rails {off:.3e} off their carriers (bar {rail_bar:.3e})",
-                    stations.len()
-                ));
-                if off <= rail_bar {
-                    climbed = Some(stations);
-                    break;
-                }
-            }
-            match climbed {
-                Some(stations) => {
+            match climb_carve_ladder(&error) {
+                Ok(stations) => {
                     carve_fold = true;
                     Ok(stations)
                 }
-                None => Err(crate::blend::fold::wall_fold_refusal(
-                    Vec::new(),
-                    format!(
-                        "{} {} fits this edge: the wall folds, and at depth budget {CARVE_MAX_REFINEMENT_DEPTH} — the top of the closed march's carve ladder — its fitted rails still stand {last_off:.3e} off their carriers between stations against a bar of {rail_bar:.3e}, so there is no wall accurate enough to carve ({error})",
-                        crate::blend::WALL_FOLDS,
-                        radius_at(mid_t).abs()
-                    ),
-                )),
+                Err(refusal) => Err(refusal),
             }
         }
         other => other,
     };
-    let stations = match marched {
+    let mut stations = match marched {
         Ok(stations) => stations,
         // A wall that FOLDS is refused here for the same reason an escaped
         // march is: the edge-preserving construction would build a blend on the
@@ -352,6 +508,11 @@ fn blend_closed_edge_impl(
             return Err(march_error);
         }
         Err(march_error) => {
+            // Lane L (2026-10-16): a concave rim overrunning its plane is
+            // named before the edge-preserving construction misreads it.
+            if let Some(refusal) = concave_rim_overrun(solid, edge, [(first_face, first_loop), (second_face, second_loop)], radius_at(mid_t))? {
+                return Err(refusal);
+            }
             // A non-converging march often means the rolling ball falls off
             // one face — try the edge-preserving construction (4.9.7).
             return blend_closed_edge_keep(
@@ -419,7 +580,9 @@ fn blend_closed_edge_impl(
     // and the lane declines BY NAME; the ladder falls through to the cutter
     // as before. An exit across a sharp boundary, or onto a tangent neighbour
     // the ball cannot roll onto, keeps the route below unchanged.
+    let exits_timing = crate::blend::BlendTimer::start("timing.closed.march.exits_ms");
     let exits = [support_exits(first_face, false), support_exits(second_face, true)];
+    exits_timing.stop();
     if exits[0] || exits[1] {
         let scale = crate::blend::stations::march_model_scale(&edge.curve, edge.t0, edge.t1, radius_at(mid_t))?;
         match crate::blend::rollover::plan_closed(solid, edge, &stations, [&first_mate, &second_mate], radius_at, scale) {
@@ -443,6 +606,9 @@ fn blend_closed_edge_impl(
                 }
             }
         }
+    }
+    if let Some(refusal) = concave_rim_overrun(solid, edge, [(first_face, first_loop), (second_face, second_loop)], radius_at(mid_t))? {
+        return Err(refusal);
     }
     if exits[1] {
         return blend_closed_edge_keep(
@@ -488,7 +654,7 @@ fn blend_closed_edge_impl(
     march_timing.stop();
     crate::blend::record_count("count.closed.stations", stations.len() as u64);
     let rows_timing = crate::blend::BlendTimer::start("timing.closed.rows_ms");
-    let parameters = station_parameters(&stations);
+    let mut parameters = station_parameters(&stations);
     let exact_rows = exact_closed_revolution_rows(&stations, &first_mate, &second_mate, chamfer);
     crate::blend::record_count(
         if exact_rows.is_some() { "count.rows.exact_revolution" } else { "count.rows.fitted_closed" },
@@ -506,9 +672,47 @@ fn blend_closed_edge_impl(
             // dependent volume (dumps of c5ea8fb80 and 635ef7630, read
             // input-free). Each is refitted to its rail's own projected track
             // at the pcurve floor, by the closed chain's support-piece fitter.
+            let fit_timing = crate::blend::BlendTimer::start("timing.closed.rows.fit_ms");
             let mut rows = fit_closed_rows(&stations, &parameters, chamfer)?;
-            rows.cr_pcurve = refit_closed_support_pcurve(&rows.cr, &rows.cr_pcurve, &first_mate.face.surface)?;
-            rows.cs_pcurve = refit_closed_support_pcurve(&rows.cs, &rows.cs_pcurve, &second_mate.face.surface)?;
+            fit_timing.stop();
+            // THE ROWS-LOOP VERDICT (2026-10-17): the fitted wall itself may
+            // pass back through itself along a row where the march's
+            // centre-curve verdict never fired (`fold::check_rows_loop`;
+            // `fillet-mouth-over-wall-bore-5p5-r2p2`'s F2 wall at the rim's
+            // midpoint). Such a wall is a folding wall, and takes the same
+            // road the march's own fold verdict takes: re-marched under
+            // Carve up the ladder, and its lens carved below.
+            if !carve_fold && !chamfer {
+                if let Err(error) = crate::blend::fold::check_rows_loop(
+                    &rows, &stations, &parameters, None, radius_at(mid_t).abs(), vec![first_face.id, second_face.id], crate::solid_scale(solid),
+                ) {
+                    crate::blend::carve::carve_trace(format_args!(
+                        "blend closed-edge: the fitted rows loop ({error}); re-marching under Carve"
+                    ));
+                    stations = climb_carve_ladder(&error)?;
+                    parameters = station_parameters(&stations);
+                    rows = fit_closed_rows(&stations, &parameters, chamfer)?;
+                    carve_fold = true;
+                }
+            }
+            // Lane G row 2 (behind `closed_trim_read_first_on`): each trim
+            // is first read as shipped at the floor and refitted only on a
+            // miss (`closed_support_trim`); off the switch, the refit as before.
+            let read_first = crate::blend::closed_trim_read_first_on();
+            let refit_timing = crate::blend::BlendTimer::start("timing.closed.rows.refit_first_ms");
+            rows.cr_pcurve = if read_first {
+                closed_support_trim(&rows.cr, &rows.cr_pcurve, &first_mate.face.surface)?
+            } else {
+                refit_closed_support_pcurve(&rows.cr, &rows.cr_pcurve, &first_mate.face.surface)?
+            };
+            refit_timing.stop();
+            let refit_timing = crate::blend::BlendTimer::start("timing.closed.rows.refit_second_ms");
+            rows.cs_pcurve = if read_first {
+                closed_support_trim(&rows.cs, &rows.cs_pcurve, &second_mate.face.surface)?
+            } else {
+                refit_closed_support_pcurve(&rows.cs, &rows.cs_pcurve, &second_mate.face.surface)?
+            };
+            refit_timing.stop();
             rows
         }
     };
@@ -1174,6 +1378,81 @@ fn carve_closed_wall(
     crate::blend::carve::fit_crease(&rows.surface, &carved, policy.pcurve_consistency)
 }
 
+/// Lane G row 2 (2026-10-14, `closed_trim_read_first_on`): a closed rail's
+/// support trim on a PLANE mate is the rail's own control points carried
+/// through the plane's affine chart (an exact image of the rail, the exact
+/// revolution lane's rule for a plane mate's rail, `plane_affine_pcurve`),
+/// read once as shipped at the pcurve floor (`track_fit::read_shipped_pcurve`,
+/// the read the refit itself is judged on, at the rail's own parameter) and
+/// kept when it reads within it (8.98e-15 on the half torus's cut plane);
+/// any other mate, or an image that misses, takes the refit as before. The
+/// shipped contract (every trim read within the floor) is the refit's own;
+/// what changes is the bytes of a plane trim (the refit's control points are
+/// the track fitter's, these are the rail's own), which is why the road is
+/// behind its switch until its census. The march's own interpolated pcurve
+/// was measured as a second candidate and dropped: on the half torus it
+/// reads 8.5e-5 off its rail where the uv track crosses the carrier's knot
+/// lines (the chart is C1 there, a cubic interpolant through the stations is
+/// not), the two reads cost 2.8 ms for nothing, and a rational carrier's
+/// knot lines make that the rule, not the exception.
+fn closed_support_trim(rail: &NurbsCurve, old: &NurbsCurve, surface: &NurbsSurface) -> Result<NurbsCurve, KernelRefusal> {
+    let floor = crate::pcurve::PCURVE_REFINEMENT_TOLERANCE;
+    let [d0, d1] = rail.domain().or_refuse(KernelStage::Refine, "domain")?;
+    let within_floor = |candidate: &NurbsCurve, what: &str| -> bool {
+        let _read_timing = crate::blend::BlendTimer::start("timing.closed.rows.trim_read_ms");
+        let read = crate::blend::track_fit::read_shipped_pcurve(surface, &|t| rail.evaluate(t), candidate, d0, d1);
+        if std::env::var_os("BREP_DEBUG_TRACK_FIT").is_some() {
+            match &read {
+                Ok((miss, standoff, samples, worst)) => eprintln!(
+                    "TRACK_FIT closed-edge support, {what} candidate ({} control points): miss {miss:.3e} at t {worst:.9} ({samples} samples), rail standoff {standoff:.3e}, floor {floor:e}",
+                    candidate.control_points.len()),
+                Err(error) => eprintln!("TRACK_FIT closed-edge support, {what} candidate: unreadable: {error}"),
+            }
+        }
+        read.is_ok_and(|(miss, _, _, _)| miss <= floor)
+    };
+    if let Some(affine) = plane_affine_pcurve(rail, surface) {
+        if within_floor(&affine, "affine plane image") {
+            crate::blend::record_count("count.closed.rows.trim.affine", 1);
+            return Ok(affine);
+        }
+    }
+    crate::blend::record_count("count.closed.rows.trim.refit", 1);
+    refit_closed_support_pcurve(rail, old, surface)
+}
+
+/// The rail's own control points through a PLANE mate's affine chart (the
+/// chart read off the surface's domain corners, as the exact revolution
+/// lane's `plane_pcurve` reads it), on the rail's knots and weights: the
+/// exact image of the rail in (u, v). `None` on any other carrier, or on a
+/// chart too thin to invert.
+fn plane_affine_pcurve(rail: &NurbsCurve, surface: &NurbsSurface) -> Option<NurbsCurve> {
+    if !matches!(surface.analytic(), Some(crate::AnalyticSurface::Plane { .. })) {
+        return None;
+    }
+    let [u0, u1] = surface.domain_u().ok()?;
+    let [v0, v1] = surface.domain_v().ok()?;
+    let origin = surface.evaluate(u0, v0).ok()?;
+    let du = surface.evaluate(u1, v0).ok()?.sub(origin).scale(1.0 / (u1 - u0));
+    let dv = surface.evaluate(u0, v1).ok()?.sub(origin).scale(1.0 / (v1 - v0));
+    let (a, b, c) = (du.dot(du), du.dot(dv), dv.dot(dv));
+    let det = a * c - b * b;
+    let chart_scale = origin.length().max(du.length()).max(dv.length()).max(1.0);
+    if !(det > 1e-24 * chart_scale.powi(4)) {
+        return None;
+    }
+    let mut pcurve = rail.clone();
+    for control in &mut pcurve.control_points {
+        let weight = control.w;
+        let offset = Vec3::new(control.x / weight, control.y / weight, control.z / weight).sub(origin);
+        let (r, s) = (offset.dot(du), offset.dot(dv));
+        control.x = (u0 + (c * r - b * s) / det) * weight;
+        control.y = (v0 + (a * s - b * r) / det) * weight;
+        control.z = 0.0;
+    }
+    Some(pcurve)
+}
+
 /// A support rail's pcurve on its mate `surface` (a closed edge's whole rail,
 /// or an open edge's rail trimmed to its crossing window), fitted to the
 /// rail's own projected track at the pcurve floor
@@ -1193,8 +1472,21 @@ fn carve_closed_wall(
 /// a fit is refitted, at the SAME floor, with its track refined where the
 /// shipped read found the miss, up to `SHIPPED_READ_REPAIRS` times; the floor
 /// never moves, and a fit read within it the first time ships as before.
+///
+/// Its first fit, whose floor miss is TERMINAL on this road, takes the
+/// knot-aware retry (lane L, 2026-10-16); the open surgery's own refit
+/// (`refit_closed_support_pcurve_read`), which answers a miss with its
+/// fallback, does not.
 pub(in crate::blend) fn refit_closed_support_pcurve(rail: &NurbsCurve, old: &NurbsCurve, surface: &NurbsSurface) -> Result<NurbsCurve, KernelRefusal> {
-    refit_closed_support_pcurve_read(rail, old, surface, &mut crate::blend::track_fit::FootMemo::default()).map(|(fitted, _)| fitted)
+    let knot_retry = KNOT_RETRY.with(|flag| flag.get());
+    refit_closed_support_pcurve_read_with(rail, old, surface, &mut crate::blend::track_fit::FootMemo::default(), knot_retry).map(|(fitted, _)| fitted)
+}
+
+thread_local! {
+    /// Set only while [`blend_closed_edge_knot_aware`] or
+    /// [`with_pcurve_knot_retry`] re-runs a blend whose first run was refused
+    /// for a support pcurve off the floor (lane L, 2026-10-16).
+    static KNOT_RETRY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// [`refit_closed_support_pcurve`] handing back the shipped curve's own read
@@ -1210,11 +1502,39 @@ pub(in crate::blend) fn refit_closed_support_pcurve_read(
     surface: &NurbsSurface,
     memo: &mut crate::blend::track_fit::FootMemo,
 ) -> Result<(NurbsCurve, (f64, f64, usize, f64)), KernelRefusal> {
+    // The open surgery's refit takes the knot-aware retry only inside
+    // `with_pcurve_knot_retry` (lane L, 2026-10-16, lCount_229).
+    let knot_retry = KNOT_RETRY.with(|flag| flag.get());
+    refit_closed_support_pcurve_read_with(rail, old, surface, memo, knot_retry)
+}
+
+/// Runs `build` with every support refit taking the knot-aware retry on a
+/// floor miss, restoring the flag after (lane L, 2026-10-16, lCount_229: the
+/// fillet group's network re-run on a pcurve-floor refusal).
+pub fn with_pcurve_knot_retry<T>(build: impl FnOnce() -> T) -> T {
+    let previous = KNOT_RETRY.with(|flag| flag.replace(true));
+    let built = build();
+    KNOT_RETRY.with(|flag| flag.set(previous));
+    built
+}
+
+/// [`refit_closed_support_pcurve_read`], its first fit taking the knot-aware
+/// retry when `knot_retry` (see [`refit_closed_support_pcurve`]).
+fn refit_closed_support_pcurve_read_with(
+    rail: &NurbsCurve,
+    old: &NurbsCurve,
+    surface: &NurbsSurface,
+    memo: &mut crate::blend::track_fit::FootMemo,
+    knot_retry: bool,
+) -> Result<(NurbsCurve, (f64, f64, usize, f64)), KernelRefusal> {
     const SHIPPED_READ_REPAIRS: usize = 3;
     let floor = crate::pcurve::PCURVE_REFINEMENT_TOLERANCE;
     let [d0, d1] = rail.domain().or_refuse(KernelStage::Refine, "domain")?;
     let mut near: Vec<f64> = Vec::new();
-    let (mut fitted, mut read) = fit_and_read_support(rail, old, surface, &near, memo)?;
+    // The FIRST fit's floor miss is terminal here, so it takes the knot-aware
+    // retry (lane L, 2026-10-16, lCount_201); a repair round's miss keeps the
+    // last fit, as before.
+    let (mut fitted, mut read) = fit_and_read_support(rail, old, surface, &near, memo, knot_retry)?;
     for _ in 0..SHIPPED_READ_REPAIRS {
         if read.0 <= floor || !(d1 > d0) {
             break;
@@ -1223,14 +1543,14 @@ pub(in crate::blend) fn refit_closed_support_pcurve_read(
         crate::blend::record_count("count.surgery.refit_repairs", 1);
         // A repair that fails keeps the last fit AND its feet: a failed
         // fit or an unreadable read hands nothing to the memo.
-        match fit_and_read_support(rail, old, surface, &near, memo) {
+        match fit_and_read_support(rail, old, surface, &near, memo, false) {
             Ok(repaired) => (fitted, read) = repaired,
             Err(_) => break,
         }
     }
     let (miss, standoff, samples, _) = read;
     if !(miss <= floor) {
-        return Err(KernelRefusal::non_convergence(KernelStage::Refine, "closed_support_pcurve_floor", format!(
+        return Err(KernelRefusal::non_convergence(KernelStage::Refine, CLOSED_SUPPORT_PCURVE_FLOOR_WHAT, format!(
             "{} a blend's support pcurve, as shipped, misses its rail's track by {miss:.3e} at {samples} samples, \
              against a floor of {floor:.1e}",
             crate::blend::PCURVE_OFF_FLOOR,
@@ -1248,12 +1568,19 @@ fn fit_and_read_support(
     surface: &NurbsSurface,
     near: &[f64],
     memo: &mut crate::blend::track_fit::FootMemo,
+    knot_retry: bool,
 ) -> Result<(NurbsCurve, (f64, f64, usize, f64)), KernelRefusal> {
     let [d0, d1] = rail.domain().or_refuse(KernelStage::Refine, "domain")?;
     // Every foot of the track is sought from the march's own trim `old` at
     // the same rail parameter (`pcurve_guide`), on the branch it runs on.
     let guide = crate::blend::chain::pcurve_guide(old, surface)?;
-    let mut fitted = crate::blend::chain::project_piece_pcurve_within(rail, surface, false, false, Some(&guide), near)?;
+    let track_timing = crate::blend::BlendTimer::start("timing.support_refit.track_ms");
+    let mut fitted = if knot_retry {
+        crate::blend::chain::project_piece_pcurve_within_knot_retry(rail, surface, false, false, Some(&guide), near)?
+    } else {
+        crate::blend::chain::project_piece_pcurve_within(rail, surface, false, false, Some(&guide), near)?
+    };
+    track_timing.stop();
     // The fitter's parameter is the track fraction; the surgery reads the
     // pcurve at the rail's own parameter.
     let [f0, f1] = fitted.domain().or_refuse(KernelStage::Refine, "domain")?;
@@ -1711,7 +2038,7 @@ fn build_surgery(
     // works — and the new branch can never ship a plausible-looking wrong solid
     // the way the un-repaired trim did.
     if repaired {
-        let problems = result.validate();
+        let problems = result.validate_memoised();
         if !problems.is_empty() {
             return Err(KernelRefusal::internal(KernelStage::Validate, "neighbour_trim_closure", format!(
                 "blend: the repaired neighbour trim did not close ({} issue(s), first: {})",

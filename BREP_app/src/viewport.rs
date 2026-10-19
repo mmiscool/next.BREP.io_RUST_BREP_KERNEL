@@ -72,6 +72,9 @@ pub struct Viewport {
     dragging: bool,
     touch: touch::TouchNavigation,
     touch_suppressed: bool,
+    touch_drag_offset: (f64, f64),
+    touch_drawing: bool,
+    chrome_obscured: bool,
     /// True while a transform-gizmo HANDLE drag (armed via the in-viewport center
     /// sphere toggle) is live — the pointer press landed on a handle, so the drag
     /// drives the gizmo (edits the feature's transform) instead of orbiting the camera.
@@ -252,7 +255,11 @@ mod interaction;
 mod labels;
 mod popups;
 mod sheet;
-mod touch;
+pub(crate) mod touch;
+
+impl Viewport {
+    pub(crate) fn set_chrome_obscured(&mut self, obscured: bool) { self.chrome_obscured = obscured; }
+}
 
 pub use popups::{modal_open_last_pass, popup_open_last_pass};
 

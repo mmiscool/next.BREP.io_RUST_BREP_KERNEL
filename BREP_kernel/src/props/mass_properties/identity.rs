@@ -73,7 +73,7 @@ fn mix64(mut z: u64) -> u64 {
 /// does not cost a slow lookup, it serves a WRONG VOLUME silently. splitmix64
 /// per word, twice, is a few ns per station's worth of data against an
 /// integrator that spends 335 ns per station.
-struct TwoLane {
+pub(crate) struct TwoLane {
     state: [u64; 2],
 }
 
@@ -81,12 +81,12 @@ const SEEDS: [u64; 2] = [0x9e37_79b9_7f4a_7c15, 0xc2b2_ae3d_27d4_eb4f];
 const STEPS: [u64; 2] = [0xa076_1d64_78bd_642f, 0xe703_7ed1_a0b4_28db];
 
 impl TwoLane {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self { state: SEEDS }
     }
 
     #[inline]
-    fn u64(&mut self, value: u64) {
+    pub(crate) fn u64(&mut self, value: u64) {
         for lane in 0..2 {
             // Order-sensitive by construction: the state enters the mix, so
             // permuting the words permutes the digest.
@@ -95,12 +95,12 @@ impl TwoLane {
     }
 
     #[inline]
-    fn usize(&mut self, value: usize) {
+    pub(crate) fn usize(&mut self, value: usize) {
         self.u64(value as u64);
     }
 
     #[inline]
-    fn bool(&mut self, value: bool) {
+    pub(crate) fn bool(&mut self, value: bool) {
         self.u64(value as u64);
     }
 
@@ -110,11 +110,11 @@ impl TwoLane {
     /// normalizes a NaN — so hashing the value would let two inputs the
     /// integrator distinguishes share a key.
     #[inline]
-    fn f64(&mut self, value: f64) {
+    pub(crate) fn f64(&mut self, value: f64) {
         self.u64(value.to_bits());
     }
 
-    fn floats(&mut self, values: &[f64]) {
+    pub(crate) fn floats(&mut self, values: &[f64]) {
         // Length first: without it `[a], [b, c]` and `[a, b], [c]` are the
         // same word stream.
         self.usize(values.len());
@@ -130,7 +130,7 @@ impl TwoLane {
         self.f64(point.w);
     }
 
-    fn finish(self) -> [u64; 2] {
+    pub(crate) fn finish(self) -> [u64; 2] {
         [mix64(self.state[0]), mix64(self.state[1])]
     }
 }
@@ -144,7 +144,7 @@ fn hash_curve(lane: &mut TwoLane, curve: &NurbsCurve) {
     }
 }
 
-fn hash_surface(lane: &mut TwoLane, surface: &NurbsSurface) {
+pub(crate) fn hash_surface(lane: &mut TwoLane, surface: &NurbsSurface) {
     lane.usize(surface.degree_u);
     lane.usize(surface.degree_v);
     lane.floats(&surface.knots_u);
@@ -158,7 +158,11 @@ fn hash_surface(lane: &mut TwoLane, surface: &NurbsSurface) {
     }
 }
 
-fn hash_face(lane: &mut TwoLane, face: &FaceRecord) {
+/// Everything the per-face tessellator reads off a face record besides its
+/// coedges' shared edge samples: the carrier, `same_sense`, and per loop and
+/// coedge in order the sense and the pcurve. `watertight_tessellation::face_memo`
+/// keys a face's mesh fragment on this plus the samples' bits.
+pub(crate) fn hash_face(lane: &mut TwoLane, face: &FaceRecord) {
     hash_surface(lane, &face.surface);
     lane.bool(face.same_sense);
     lane.usize(face.loops.len());
@@ -190,6 +194,52 @@ pub(crate) fn coedge_use_identity(
     lane.f64(edge.t1);
     lane.bool(edge.degenerate);
     lane.bool(forward);
+    lane.finish()
+}
+
+/// Inputs of assembly's sampled edge-to-carrier residual. IDs, trims and
+/// tolerance are absent because the reader does not consult them. Preserve
+/// carrier order, represented interval, and every geometric bit.
+pub(crate) fn carrier_residual_identity(
+    curve: &NurbsCurve, t0: f64, t1: f64, surfaces: &[&NurbsSurface],
+) -> [u64; 2] {
+    let mut lane = TwoLane::new();
+    hash_curve(&mut lane, curve);
+    lane.f64(t0);
+    lane.f64(t1);
+    lane.usize(surfaces.len());
+    for surface in surfaces { hash_surface(&mut lane, surface); }
+    lane.finish()
+}
+
+/// `key` with a tolerance folded in: the identity of a reading that is a pure
+/// function of a use's content AND one policy value (the refit's candidacy
+/// standoff, read against `policy.model`). The same content under another
+/// model is another key.
+pub(crate) fn identity_with_model(key: [u64; 2], model: f64) -> [u64; 2] {
+    let mut lane = TwoLane::new();
+    lane.u64(key[0]);
+    lane.u64(key[1]);
+    lane.f64(model);
+    lane.finish()
+}
+
+/// The 128-bit identity of an EDGE's scope claim (`heal::edge_claim_with`):
+/// the identities of the edge's uses in the order the claim is handed them,
+/// the order in which it visits their distinct carriers (`ranks`, the first
+/// use of each carrier in that visiting order) and the model tolerance.
+pub(crate) fn edge_claim_identity(uses: &[[u64; 2]], ranks: &[usize], model: f64) -> [u64; 2] {
+    let mut lane = TwoLane::new();
+    lane.usize(uses.len());
+    for key in uses {
+        lane.u64(key[0]);
+        lane.u64(key[1]);
+    }
+    lane.usize(ranks.len());
+    for &rank in ranks {
+        lane.usize(rank);
+    }
+    lane.f64(model);
     lane.finish()
 }
 

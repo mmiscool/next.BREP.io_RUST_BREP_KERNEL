@@ -454,6 +454,19 @@ fn store(
     let mut notes: Vec<String> = Vec::new();
     if matches!(target, Target::Diagram | Target::Pcb) {
         let editor = if target == Target::Diagram { &mut editors.diagram } else { &mut editors.pcb };
+        // A board is an assembly: a component deleted on either sheet is the
+        // assembly component deleted, in this edit's own undo step. The other
+        // sheet, the board and the harness follow the frame after
+        // (`ecad_parts::follow_occurrences`). A device inside a sub-assembly
+        // is refused, and the sheet put back.
+        let stored = block_of(target).read(&engine.history);
+        if let Err(error) = crate::panels::ecad_parts::delete_gone_occurrences(&mut draft, stored, &editor.document) {
+            let previous = stored.cloned()
+                .and_then(|v| brep_ecad_core::Document::from_value(v).ok())
+                .unwrap_or_else(|| brep_ecad_core::Document::new(editor.document.kind));
+            editor.set_document(previous);
+            return Err(error);
+        }
         let endpoints = engine.wire_harness_report().map(|report| report.endpoints.as_slice()).unwrap_or(&[]);
         match crate::panels::ecad_parts::follow_sheet(&mut draft, block_of(target).key(), &editor.document, endpoints) {
             // A component the assembly cannot place is UNLINKED, not a refusal:
@@ -679,10 +692,15 @@ impl Viewport {
         let status = &self.ecad.status;
         ui.horizontal(|ui| {
             ui.add_space(6.0);
+            // The name and the rest butt together, so the first separator is
+            // the same " · " as the others; it used to sit after the labels'
+            // item gap with two spaces after it ("Schematic ·   Select",
+            // lane U audit item 10).
+            ui.spacing_mut().item_spacing.x = 0.0;
             let (name, rest) = status.text.split_once(" · ").unwrap_or((status.text.as_str(), ""));
             ui.label(egui::RichText::new(name).strong());
             if !rest.is_empty() {
-                ui.label(egui::RichText::new(format!("·  {rest}")).monospace());
+                ui.label(egui::RichText::new(format!(" · {rest}")).monospace());
             }
         });
     }
@@ -1221,7 +1239,9 @@ impl EcadViewport {
                     if stock {
                         ui.label("Stock part for new connections");
                         let field = ui.add(
-                            egui::TextEdit::singleline(&mut editor.stock_part_number).desired_width(160.0),
+                            egui::TextEdit::singleline(&mut editor.stock_part_number)
+                                .hint_text("part number")
+                                .desired_width(160.0),
                         );
                         hits.insert("stock".into(), field.rect);
                     }

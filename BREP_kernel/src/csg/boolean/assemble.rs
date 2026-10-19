@@ -20,6 +20,8 @@ pub(crate) use finalize::{
 };
 pub(super) use finalize::repair_open_assembly_via_heal_chain;
 pub(crate) use pipeline::{assemble_fragments, assemble_open_fragments};
+pub(crate) use inherited::clear_candidate_memo;
+pub(super) use pipeline::assemble_cellular_fragments;
 pub(super) use pipeline::{assemble_fragments_scoped, AssemblyScope};
 pub(super) use edges::{reconstruct_edges_from_carriers, reconstruct_edges_from_carriers_in, restore_edges};
 pub(super) use polish::{polish_triple_junction_vertices, polish_triple_junction_vertices_in};

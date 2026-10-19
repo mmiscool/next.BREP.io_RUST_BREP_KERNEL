@@ -98,7 +98,8 @@ pub use analytic_surface::{
     revolution_structure, AnalyticSurface, RevolutionFrame, RevolutionStructure,
 };
 pub(crate) use analytic_surface::{
-    intersect_analytic_pair_with, ruled_gate, ruled_gate_census, RuledGate,
+    canonical_carriers_enabled, canonicalise_carriers, intersect_analytic_pair_with, ruled_gate,
+    ruled_gate_census, CanonicalReport, CanonicalRewrite, RuledGate,
 };
 #[path = "geometry/sphere_chart.rs"]
 mod sphere_chart;
@@ -114,7 +115,7 @@ pub use solid_codec::{decode_solid, encode_solid, SolidNames, SOLID_CODEC_VERSIO
 #[path = "brep/topology.rs"]
 mod topology;
 pub use topology::{
-    make_box_brep, make_cylinder_brep, make_pyramid_brep, topology_kind, BodyKind, BrepSolid,
+    make_box_brep, make_cylinder_brep, make_pyramid_brep, topology_kind, BodyKind, BrepSolid, CellRecord,
     FaceRecord, IssueKind, KindReport, TopologyKind, ValidationReport,
 };
 #[path = "brep/soundness.rs"]
@@ -122,9 +123,10 @@ mod soundness;
 pub use soundness::{
     face_self_intersections, loop_self_crossings, shell_vector_areas, solid_connectivity,
     solid_euler, solid_self_intersections, ConnectivityReport, CrossingConfirmation, EulerReport,
-    FaceCrossing, FaceFold, FaceVectorArea,
+    CertificateScope, CertifiedFacePair, FaceCrossing, FaceFold, FaceVectorArea,
     LoopCrossing, LoopCrossingReport, SelfIntersectionOptions, SelfIntersectionReport,
-    ClosureReading, ShellConnectivity, ShellVectorArea, VectorAreaReport,
+    ClosureReading, ShellConnectivity, ShellVectorArea, VectorAreaReport, CrossingUndecidedCause, UndecidedCrossing,
+    MAX_LISTED_UNDECIDED,
 };
 #[path = "brep/topology_arena.rs"]
 mod topology_arena;
@@ -183,7 +185,7 @@ pub use mass_properties::{
     curve_arc_length, edge_arc_length, face_area, face_boundary_length, face_volume_contribution,
     face_set_identity, mass_caller, parameter_space_area, solid_edge_length_total,
     solid_mass_properties,
-    solid_mass_properties_full, solid_signed_volume, solid_signed_volume_for_sign, trim_polygons,
+    solid_mass_properties_full, signed_volume_against, solid_signed_volume, solid_signed_volume_for_sign, trim_polygons,
     DensityMassProperties,
     FaceSetIdentity, FullMassProperties, MassCaller, MassProperties, MassPropertiesCache,
 };
@@ -367,6 +369,8 @@ pub use projection::{
 #[path = "intersect/curve_surface_intersection.rs"]
 mod curve_surface_intersection;
 pub use curve_surface_intersection::{intersect_curve_surface, CurveSurfaceIntersection};
+#[path = "intersect/exact_line_surface.rs"]
+mod exact_line_surface;
 #[path = "intersect/curve_curve_intersection.rs"]
 mod curve_curve_intersection;
 pub use curve_curve_intersection::{intersect_curves, CurveCurveIntersection};
@@ -431,7 +435,7 @@ pub use edge_split::{apply_edge_splits, apply_edge_splits_with_map};
 mod fragment;
 pub use fragment::{
     fragment_face, fragment_solid, FaceFragmentRecord, FragmentCoedge, FragmentEdgeSource,
-    FragmentLoop,
+    FragmentLoop, FragmentOrder,
 };
 #[path = "csg/boolean/mod.rs"]
 mod boolean;
@@ -551,7 +555,7 @@ mod face_merge;
 #[allow(dead_code)]
 #[path = "healing/faceted_repair.rs"]
 mod faceted_repair;
-pub use face_merge::{merge_same_surface_faces, merge_same_surface_faces_excluding, merge_same_surface_faces_scoped};
+pub use face_merge::{merge_faces_within, merge_same_surface_faces, merge_same_surface_faces_excluding, merge_same_surface_faces_scoped};
 pub use faceted_repair::{mesh_to_faceted_brep, repair_triangle_soup, MeshRepairReport};
 #[path = "offset/offset_shell.rs"]
 mod offset_shell;

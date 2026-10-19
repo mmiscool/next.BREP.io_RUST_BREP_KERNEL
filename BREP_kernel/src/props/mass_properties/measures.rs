@@ -192,3 +192,49 @@ pub(super) fn face_volume_contribution_about(face: &FaceRecord, reference: Vec3)
     };
     Ok(integral / 3.0)
 }
+
+/// Volume about a local anchor and the three vector-area components, all
+/// divided by three. Their affine combination reads this face about ANY
+/// reference without integrating it again. The multi-integrand paths share
+/// surface evaluations, panels, polygons, winding and correction policy.
+pub(super) fn face_volume_terms_about(face: &FaceRecord, reference: Vec3) -> Result<[f64; 4], String> {
+    if is_affine(&face.surface)? {
+        let signed_area = closed_parameter_space_area(face)? * planar_metric(face)?;
+        let ku = crate::KnotVector::new(face.surface.knots_u.clone(), face.surface.degree_u)?;
+        let kv = crate::KnotVector::new(face.surface.knots_v.clone(), face.surface.degree_v)?;
+        let (u, v) = (ku.domain()[0], kv.domain()[0]);
+        let point = face.surface.evaluate(u, v)?;
+        let normal = face.surface.normal(u, v)?;
+        return Ok([
+            point.sub(reference).dot(normal) * signed_area / 3.0,
+            normal.x * signed_area / 3.0,
+            normal.y * signed_area / 3.0,
+            normal.z * signed_area / 3.0,
+        ]);
+    }
+    let kinds = [Integrand::VolumeAbout(reference), Integrand::NormalX, Integrand::NormalY, Integrand::NormalZ];
+    let gate_started = super::profile::profile_started();
+    let values = if let Some(values) = biperiodic_band_integral(face, &kinds)? {
+        mass_profile(|p| {
+            p.route_biperiodic += 1;
+            p.gate_ms += super::profile::elapsed_ms(gate_started);
+        });
+        values
+    } else if is_untrimmed(face)? {
+        mass_profile(|p| {
+            p.route_untrimmed += 1;
+            p.gate_ms += super::profile::elapsed_ms(gate_started);
+        });
+        let started = super::profile::profile_started();
+        let values = integrate_untrimmed_multi(face, &kinds)?;
+        mass_profile(|p| p.untrimmed_ms += super::profile::elapsed_ms(started));
+        values
+    } else {
+        mass_profile(|p| {
+            p.trimmed_faces += 1;
+            p.gate_ms += super::profile::elapsed_ms(gate_started);
+        });
+        integrate_trimmed_multi(face, &kinds)?
+    };
+    Ok([values[0] / 3.0, values[1] / 3.0, values[2] / 3.0, values[3] / 3.0])
+}

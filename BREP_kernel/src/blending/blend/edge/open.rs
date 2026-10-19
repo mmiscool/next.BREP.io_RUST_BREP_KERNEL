@@ -123,6 +123,11 @@ pub(super) fn blend_open_edge_impl(
             Some(vertex_indices),
             extrusion_direction(edge, &first_mate, &second_mate),
         )?;
+        // The fitted wall itself must not double back along a row
+        // (`fold::check_rows_loop`); terminal, as the march's fold verdicts.
+        crate::blend::fold::check_rows_loop(
+            &rows, &stations, &parameters, Some(vertex_indices), radius_at(0.5 * (edge.t0 + edge.t1)), vec![first_mate.face.id, second_mate.face.id], crate::solid_scale(solid),
+        )?;
         let mut ends = Vec::with_capacity(2);
         let mut in_range = true;
         for (vertex, at_start) in [(edge.start_vertex_id, true), (edge.end_vertex_id, false)] {
@@ -582,6 +587,101 @@ fn interval_at(parameters: &[f64], u: f64) -> Option<(usize, f64)> {
     (to > from).then(|| (interval, ((u - from) / (to - from)).clamp(0.0, 1.0)))
 }
 
+/// Lane R2 row 2a (2026-10-18): `BREP_BLEND_AFFINE_READS=1`/`on` reads the
+/// rails of a straight stripe on a PLANE at their window ends
+/// ([`affine_rail_standoff`], [`exact_planar_trim`]'s read; the default since
+/// its census: 98 + 144 cases identical in every field), `=0`/`off` samples
+/// them as before; `set_affine_reads_for_test` forces it on a test's own
+/// thread.
+const AFFINE_READS_DEFAULT: bool = true;
+
+thread_local! {
+    static AFFINE_READS_FOR_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+pub(in crate::blend) fn affine_reads_on() -> bool {
+    if let Some(forced) = AFFINE_READS_FOR_TEST.with(|forced| forced.get()) {
+        return forced;
+    }
+    match std::env::var("BREP_BLEND_AFFINE_READS").as_deref() {
+        Ok("0") | Ok("off") => false,
+        Ok("1") | Ok("on") => true,
+        _ => AFFINE_READS_DEFAULT,
+    }
+}
+
+
+/// A point of `surface` and its unit normal when the surface is AFFINE in
+/// (u, v), its extension included: a plane (`analytic`) of degree 1 × 1 whose
+/// 2 × 2 net is a parallelogram with equal weights, to `1e-12·(1 + scale)`.
+/// Every point of such a surface, and of its linear extension, lies on the one
+/// plane through the corner with that normal.
+fn affine_plane(surface: &NurbsSurface) -> Option<(Vec3, Vec3)> {
+    let (origin, _, _) = affine_plane_frame(surface)?;
+    // The normal off the net's own corner differences.
+    let net = &surface.control_points;
+    let [p00, p01, p10] = [net[0][0].point().ok()?, net[0][1].point().ok()?, net[1][0].point().ok()?];
+    Some((origin, p10.sub(p00).cross(p01.sub(p00)).normalized().ok()?))
+}
+
+/// [`affine_plane`]'s surface as `S(u, v) = origin + (u − u₀)·s_u + (v − v₀)·s_v`:
+/// the net's corner and the two constant partial derivatives.
+pub(in crate::blend) fn affine_plane_frame(surface: &NurbsSurface) -> Option<(Vec3, Vec3, Vec3)> {
+    if !matches!(surface.analytic(), Some(crate::AnalyticSurface::Plane { .. })) || surface.degree_u != 1 || surface.degree_v != 1 {
+        return None;
+    }
+    let net = &surface.control_points;
+    if net.len() != 2 || net.iter().any(|row| row.len() != 2) {
+        return None;
+    }
+    let weight = net[0][0].w;
+    if !(weight > 0.0) || net.iter().flatten().any(|point| point.w != weight) {
+        return None;
+    }
+    let [p00, p01, p10, p11] = [net[0][0].point().ok()?, net[0][1].point().ok()?, net[1][0].point().ok()?, net[1][1].point().ok()?];
+    let scale = [p00, p01, p10, p11].iter().fold(0.0f64, |worst, point| worst.max(point.length()));
+    if p11.sub(p10).sub(p01.sub(p00)).length() > 1e-12 * (1.0 + scale) {
+        return None;
+    }
+    let [u0, u1] = surface.domain_u().ok()?;
+    let [v0, v1] = surface.domain_v().ok()?;
+    if !(u1 > u0 && v1 > v0) {
+        return None;
+    }
+    Some((p00, p10.sub(p00).scale(1.0 / (u1 - u0)), p01.sub(p00).scale(1.0 / (v1 - v0))))
+}
+
+/// Whether `curve` is AFFINE in its parameter: degree 1, two control points of
+/// equal weight (a `make_line`).
+fn affine_curve(curve: &NurbsCurve) -> bool {
+    curve.degree == 1
+        && curve.control_points.len() == 2
+        && curve.control_points[0].w > 0.0
+        && curve.control_points[0].w == curve.control_points[1].w
+}
+
+/// The worst distance of an affine rail from an affine carrier over `window`,
+/// read at the window's two ends: the signed distance is affine in the rail
+/// parameter, so its magnitude is convex and its maximum is at an end. `None`
+/// when either is not affine (the sampled reader's), or an end will not
+/// evaluate.
+pub(in crate::blend) fn affine_rail_standoff(rail: &NurbsCurve, carrier: &NurbsSurface, window: [f64; 2]) -> Option<f64> {
+    if !affine_curve(rail) {
+        return None;
+    }
+    let (origin, normal) = affine_plane(carrier)?;
+    let mut worst = 0.0f64;
+    for u in window {
+        let point = rail.evaluate(u).ok()?;
+        let off = point.sub(origin).dot(normal).abs();
+        if !off.is_finite() {
+            return None;
+        }
+        worst = worst.max(off);
+    }
+    Some(worst)
+}
+
 /// Each shipped rail's worst distance from its carrier over ITS OWN window
 /// ([`shipped_window`]): both window ends exactly and the quarter points of
 /// every station span inside it, each against the carrier's EXTENSION
@@ -599,8 +699,19 @@ pub(in crate::blend) fn rails_on_shipped_windows(
 ) -> (f64, [usize; 2]) {
     let mut worst = 0.0_f64;
     let mut samples = [0usize; 2];
+    let affine = rows.exact_extrusion && affine_reads_on();
     for (side, (rail, carrier)) in [(&rows.cr, carriers[0]), (&rows.cs, carriers[1])].into_iter().enumerate() {
         let Some([low, high]) = windows[side] else { continue };
+        // An exact extrusion's straight rail on a plane: the ends carry the
+        // worst (`affine_rail_standoff`), the samples between them cannot.
+        if let Some(off) = affine.then(|| affine_rail_standoff(rail, carrier, [low, high])).flatten() {
+            crate::blend::record_count("count.read.affine_rails", 1);
+            samples[side] += 2;
+            if !worst.is_nan() && off > worst {
+                worst = off;
+            }
+            continue;
+        }
         let mut at = vec![low, high];
         for pair in parameters.windows(2) {
             for fraction in [0.25, 0.5, 0.75] {
@@ -1007,9 +1118,45 @@ fn exact_planar_trim(rail: &NurbsCurve, surface: &NurbsSurface, d0: f64, d1: f64
     let line = NurbsCurve::new(1, vec![d0, d0, d1, d1], control).or_refuse(KernelStage::Refine, "new")?;
     feet_timing.stop();
     let read_timing = crate::blend::BlendTimer::start("timing.surgery.trim.exact.read_ms");
-    let read = crate::blend::track_fit::read_shipped_pcurve(surface, &|t| rail.evaluate(t), &line, d0, d1);
+    let read = match affine_reads_on().then(|| affine_trim_read(rail, surface, &line, d0, d1)).flatten() {
+        Some(read) => {
+            crate::blend::record_count("count.read.affine_trims", 1);
+            Ok(read)
+        }
+        None => crate::blend::track_fit::read_shipped_pcurve(surface, &|t| rail.evaluate(t), &line, d0, d1),
+    };
     read_timing.stop();
     Ok(march_trim_stands(&read, crate::pcurve::PCURVE_REFINEMENT_TOLERANCE).then_some(line))
+}
+
+/// [`read_shipped_pcurve`](crate::blend::track_fit::read_shipped_pcurve)'s
+/// `(miss, standoff, samples, worst)` for a degree-1 `pcurve` on an AFFINE
+/// plane against an affine rail, read at `d0` and `d1` only: the pcurve's
+/// image, the rail and the rail's foot on the plane are all affine in the
+/// rail parameter, so the miss (image to foot) and the standoff (rail to foot)
+/// are norms of affine functions, convex, and largest at an end. `None` when
+/// any of the three is not affine, or an end will not evaluate.
+fn affine_trim_read(rail: &NurbsCurve, surface: &NurbsSurface, pcurve: &NurbsCurve, d0: f64, d1: f64) -> Option<(f64, f64, usize, f64)> {
+    if !affine_curve(rail) || !affine_curve(pcurve) {
+        return None;
+    }
+    let (origin, normal) = affine_plane(surface)?;
+    let (mut miss, mut standoff, mut worst) = (0.0f64, 0.0f64, d0);
+    for t in [d0, d1] {
+        let point = rail.evaluate(t).ok()?;
+        let foot = point.sub(normal.scale(point.sub(origin).dot(normal)));
+        let uv = pcurve.evaluate(t).ok()?;
+        let image = crate::blend::track_fit::carrier_point(surface, uv.x, uv.y).ok()?;
+        let (residual, off) = (image.sub(foot).length(), point.sub(foot).length());
+        if !(residual.is_finite() && off.is_finite()) {
+            return None;
+        }
+        if residual > miss {
+            (miss, worst) = (residual, t);
+        }
+        standoff = standoff.max(off);
+    }
+    Some((miss, standoff, 2, worst))
 }
 
 /// Sew ONE stripe into `result`.

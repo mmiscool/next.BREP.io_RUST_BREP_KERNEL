@@ -183,6 +183,61 @@ pub(super) fn insert_seed_points_into_branch(points: &[Vec3], seeds: &[Vec3], to
     refined
 }
 
+/// Whether `point` lies inside BOTH faces' trims — the test every station
+/// of a marched branch is clipped by, exposed so the driver can ask it of a
+/// single pierce point.
+pub(super) fn inside_both_trims(
+    point: Vec3,
+    first: TaggedFace<'_>,
+    second: TaggedFace<'_>,
+) -> Result<bool, KernelRefusal> {
+    inside_both_trims_traced(point, first, second, false)
+}
+
+fn inside_both_trims_traced(
+    point: Vec3,
+    first: TaggedFace<'_>,
+    second: TaggedFace<'_>,
+    debug_clip: bool,
+) -> Result<bool, KernelRefusal> {
+    for face in [first, second] {
+        // The face's CHART, not its carrier: where the trim is drawn past a
+        // closed direction's domain, the carrier's own projection folds the
+        // point back into the domain and the trim's even-odd test then
+        // answers Outside for every point of the overhang the trim covers
+        // (helmet `Face_15`: a section point at u = −0.030 read at 0.970).
+        // On the chart the parameter is the one the loops are drawn in.
+        let projection = project_point_to_surface(face.chart(), point).or_refuse(KernelStage::Intersect, "project_point_to_surface")?;
+        let status = parameter_point_in_face(
+            face.face,
+            Vec2 {
+                x: projection.u,
+                y: projection.v,
+            },
+            1e-6,
+        ).or_refuse(KernelStage::Intersect, "csg.imprint.sections")?;
+        if debug_clip {
+            eprintln!(
+                "clip {}x{}: p=({:.5},{:.5},{:.5}) on face {} uv=({:.5},{:.5}) dist={:.2e} {:?}",
+                first.face.id,
+                second.face.id,
+                point.x,
+                point.y,
+                point.z,
+                face.face.id,
+                projection.u,
+                projection.v,
+                projection.distance,
+                status
+            );
+        }
+        if status == PolygonClass::Outside {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 pub(super) fn clip_branch_to_trims(
     points: &[Vec3],
     first: TaggedFace<'_>,
@@ -198,42 +253,7 @@ pub(super) fn clip_branch_to_trims(
             || value == second.face.id.to_string()
     });
     let inside_both = |point: Vec3| -> Result<bool, KernelRefusal> {
-        for face in [first, second] {
-            // The face's CHART, not its carrier: where the trim is drawn past a
-            // closed direction's domain, the carrier's own projection folds the
-            // point back into the domain and the trim's even-odd test then
-            // answers Outside for every point of the overhang the trim covers
-            // (helmet `Face_15`: a section point at u = −0.030 read at 0.970).
-            // On the chart the parameter is the one the loops are drawn in.
-            let projection = project_point_to_surface(face.chart(), point).or_refuse(KernelStage::Intersect, "project_point_to_surface")?;
-            let status = parameter_point_in_face(
-                face.face,
-                Vec2 {
-                    x: projection.u,
-                    y: projection.v,
-                },
-                1e-6,
-            ).or_refuse(KernelStage::Intersect, "csg.imprint.sections")?;
-            if debug_clip {
-                eprintln!(
-                    "clip {}x{}: p=({:.5},{:.5},{:.5}) on face {} uv=({:.5},{:.5}) dist={:.2e} {:?}",
-                    first.face.id,
-                    second.face.id,
-                    point.x,
-                    point.y,
-                    point.z,
-                    face.face.id,
-                    projection.u,
-                    projection.v,
-                    projection.distance,
-                    status
-                );
-            }
-            if status == PolygonClass::Outside {
-                return Ok(false);
-            }
-        }
-        Ok(true)
+        inside_both_trims_traced(point, first, second, debug_clip)
     };
     let step = (count / 256).max(1);
     let mut keep = vec![false; count];

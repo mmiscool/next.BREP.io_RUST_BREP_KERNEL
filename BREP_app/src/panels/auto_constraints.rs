@@ -185,7 +185,7 @@ impl AutoConstraintsWindow {
             .movable(true)
             .resizable(true)
             .default_size([380.0, 400.0])
-            .default_pos([820.0, 120.0])
+            .default_pos(super::below_chrome(ctx, 820.0, 24.0))
             .show(ctx, |ui| {
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])

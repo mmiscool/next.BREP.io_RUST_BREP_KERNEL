@@ -27,6 +27,15 @@ const NEAR_AXIS_RELATIVE_TOLERANCE: f64 = 1e-4;
 /// stack-resident either way.
 pub(crate) const TENSOR_MAX_BLOCK: usize = 24;
 
+/// A rational B-spline surface.
+///
+/// **Invariant: do not mutate the public fields after the surface has been
+/// evaluated.** The surface memoizes derived data (its analytic carrier, seam
+/// closure, projection grids, validation) the first time it is asked, and
+/// `Clone` copies those caches. Editing `control_points`, `knots_*` or a degree
+/// in place afterwards leaves every later query answering for the OLD
+/// geometry. Build a new value with [`NurbsSurface::new`] instead (lane K2
+/// audit 2026-10-16: no production path does this today; a test fixture did).
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct NurbsSurface {
     pub degree_u: usize,

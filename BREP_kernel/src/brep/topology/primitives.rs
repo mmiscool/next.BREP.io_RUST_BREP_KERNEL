@@ -1,12 +1,25 @@
 use crate::curve::parameter_line;
 use super::*;
 
+// Module-private, owned evidence from the fixed primitive builders below.
+// Consuming it cannot confer trust on a later mutation or on a caller's body.
+// Primitive certificate type: begin
+struct CertifiedPrimitive { solid: BrepSolid }
+// Primitive certificate type: end
+impl CertifiedPrimitive {
+    fn accept(self) -> BrepSolid {
+        crate::analytic_topology::primitive_check_count(true);
+        self.solid
+    }
+}
+
 pub fn make_box_brep(
     corner: Vec3,
     size_x: f64,
     size_y: f64,
     size_z: f64,
 ) -> Result<BrepSolid, String> {
+    let mut profile = crate::loft_topology::ConstructionProfile::new("box");
     if size_x <= 0.0 || size_y <= 0.0 || size_z <= 0.0 {
         return Err("makeBoxSolid: sizes must be positive".into());
     }
@@ -121,6 +134,7 @@ pub fn make_box_brep(
     }
     let solid = BrepSolid {
         mass_properties_cache: Default::default(),
+        cells: Default::default(),
         id: next_topology_id + 1,
         vertices,
         edges,
@@ -131,7 +145,14 @@ pub fn make_box_brep(
         genus: 0,
         kind: crate::BodyKind::Solid,
     };
+    profile.lap("construct");
+    if crate::analytic_topology::primitive_certificate_enabled()
+        && crate::analytic_topology::primitive_domain(corner, &[size_x, size_y, size_z], None) {
+        return Ok(CertifiedPrimitive { solid }.accept());
+    }
+    crate::analytic_topology::primitive_check_count(false);
     let issues = solid.validate();
+    profile.lap("validation");
     if !issues.is_empty() {
         return Err(format!(
             "Rust box builder produced invalid topology: {:?}",
@@ -273,6 +294,7 @@ pub fn make_pyramid_brep(
     drop(make_face);
     let solid = BrepSolid {
         mass_properties_cache: Default::default(),
+        cells: Default::default(),
         id: next_topology_id + 1,
         vertices,
         edges,
@@ -318,6 +340,7 @@ pub fn make_cylinder_brep(
     radius: f64,
     height: f64,
 ) -> Result<BrepSolid, String> {
+    let mut profile = crate::loft_topology::ConstructionProfile::new("cylinder");
     if radius <= 0.0 || height <= 0.0 {
         return Err("makeCylinderSolid: radius and height must be positive".into());
     }
@@ -454,6 +477,7 @@ pub fn make_cylinder_brep(
 
     let solid = BrepSolid {
         mass_properties_cache: Default::default(),
+        cells: Default::default(),
         id: 114,
         vertices,
         edges,
@@ -464,7 +488,14 @@ pub fn make_cylinder_brep(
         genus: 0,
         kind: crate::BodyKind::Solid,
     };
+    profile.lap("construct");
+    if crate::analytic_topology::primitive_certificate_enabled()
+        && crate::analytic_topology::primitive_domain(base, &[radius, height], Some(axis_direction)) {
+        return Ok(CertifiedPrimitive { solid }.accept());
+    }
+    crate::analytic_topology::primitive_check_count(false);
     let issues = solid.validate();
+    profile.lap("validation");
     if !issues.is_empty() {
         return Err(format!(
             "Rust cylinder builder produced invalid topology: {:?}",

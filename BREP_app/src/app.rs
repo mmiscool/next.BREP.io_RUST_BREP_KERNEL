@@ -302,6 +302,24 @@ pub struct BrepApp {
     pub(crate) automation: std::sync::Arc<crate::automation::queue::AutomationQueue>,
 }
 
+/// The caption text size, points (egui's own `Small` is 9). See [`app_style`].
+pub const SMALL_TEXT_SIZE: f32 = 10.5;
+
+/// The app's tweaks over egui's style, applied to both themes at startup.
+pub(crate) fn app_style(style: &mut egui::Style) {
+    // Keep overflow discoverable without hovering or scrolling first, in
+    // both themes and every child UI (including eCAD and plugin panels).
+    // ScrollArea's default VisibleWhenNeeded still hides bars that aren't needed.
+    style.spacing.scroll = egui::style::ScrollStyle::solid();
+    // Captions (`ui.small`, `RichText::small`): egui's 9 pt was too small to
+    // read beside 12.5 pt body text in the Info window, the eCAD inspectors and
+    // the Selection actions summary (lane U audit item 9). 10.5 keeps them
+    // visibly secondary. The toolbar/Ribbon group captions stay at 9
+    // (`ribbon::CHROME_CAPTION_SIZE`) so the chrome keeps its height.
+    style.text_styles.insert(egui::TextStyle::Small, egui::FontId::new(SMALL_TEXT_SIZE, egui::FontFamily::Proportional));
+}
+
+
 impl BrepApp {
     /// The automation queue a host submits commands to.
     #[cfg(feature = "automation")]
@@ -457,12 +475,8 @@ impl BrepApp {
     /// Build the app with host-supplied options: an isolated store (a host
     /// MUST pass one) and whether to start on the seed model.
     pub fn new_with(cc: &eframe::CreationContext<'_>, opts: crate::automation::AppOptions) -> Result<Self, String> {
-        // Keep overflow discoverable without hovering or scrolling first, in
-        // both themes and every child UI (including eCAD and plugin panels).
-        // ScrollArea's default VisibleWhenNeeded still hides bars that aren't needed.
-        cc.egui_ctx.all_styles_mut(|style| {
-            style.spacing.scroll = egui::style::ScrollStyle::solid();
-        });
+        // Solid scroll bars and readable captions, in both themes.
+        cc.egui_ctx.all_styles_mut(app_style);
         let crate::automation::AppOptions { store: opt_store, seed } = opts;
         let render_state = cc
             .wgpu_render_state
@@ -529,7 +543,9 @@ impl BrepApp {
         // through the file dialog, and work that was never saved comes back as
         // the crash-recovery OFFER below — a prompt, never an automatic load.
         let mut docs = Documents::new(engine_factory);
-        let _ = docs.engine_mut().set_history_json(if seed { seed_history_json() } else { crate::document::EMPTY_DOCUMENT.to_string() }.as_str());
+        if seed {
+            let _ = docs.engine_mut().set_history_json(&seed_history_json());
+        }
         docs.engine_mut().zoom_to_fit();
         docs.active_mut().mark_clean();
 
@@ -1129,6 +1145,15 @@ impl BrepApp {
         self.dock.show_pane(kind);
     }
 
+    /// Shared document activation / unsaved-close handling for both presentations.
+    fn apply_document_actions(&mut self, activate: Option<usize>, close: Option<usize>) {
+        if (activate.is_some() || close.is_some()) && self.docs.engine().ref_select_in_form() {
+            self.docs.engine_mut().finish_ref_select();
+        }
+        if let Some(index) = activate { self.docs.activate(index); }
+        if let Some(index) = close { self.file.request_close(&mut self.docs, index); }
+    }
+
     /// The parts-library staleness check and its refresh — the Constraints
     /// header's "Update components (N)" button, reachable as the
     /// `component_update` command. Returns `(outdated, missing, refreshed)`;
@@ -1493,6 +1518,7 @@ impl eframe::App for BrepApp {
             self.applied_ui_scale = self.docs.engine().settings.ui_scale;
         }
         ctx.set_zoom_factor(self.applied_ui_scale);
+        crate::viewport::touch::prepare_browser_input(ui);
 
         // --- history-runner pump ---------------------------------------------
         // Apply any completed background history run BEFORE panels read the scene.
@@ -1581,6 +1607,8 @@ impl eframe::App for BrepApp {
         }
 
         crate::panels::ecad_parts::sync(self.docs.active_mut());
+        // A sheet's Duplicate past the last offered occurrence: another assembly component.
+        crate::panels::ecad_parts::answer_duplicate_requests(self.docs.active_mut());
         let requests = crate::panels::ecad_parts::take_open_requests(self.docs.active_mut());
         for key in requests {
             self.file.open_document(&mut self.docs, self.model_store.as_ref(), &key);
@@ -1629,6 +1657,9 @@ impl eframe::App for BrepApp {
         // reserved above the left panel + central viewport. A clicked File button
         // returns an action the file dialog acts on (open its modal / save / new).
         self.toolbar.read_only = !self.docs.active().access().is_editable();
+        if crate::viewport::touch::compact(&ctx) {
+            self.toolbar.documents = document_tabs::MenuState::from_documents(&self.docs);
+        }
         let doc = self.docs.active_mut();
         let toolbar_outcome = self.toolbar.show(
             ui,
@@ -1639,6 +1670,12 @@ impl eframe::App for BrepApp {
             &mut self.part_properties.open,
             &mut self.info.open,
         );
+        crate::panels::set_chrome_bottom(&ctx, ui.available_rect_before_wrap().top());
+        if toolbar_outcome.toggle_mobile_panels { self.dock.toggle_mobile_drawer(); }
+        if crate::viewport::touch::compact(&ctx) {
+            self.apply_document_actions(toolbar_outcome.documents.activate, toolbar_outcome.documents.close);
+            self.document_tab_hits = toolbar_outcome.documents.hits;
+        }
         if toolbar_outcome.plugins { self.plugins.open = !self.plugins.open; }
         if toolbar_outcome.javascript { self.javascript.open = !self.javascript.open; }
         if let Some(id) = toolbar_outcome.plugin_action {
@@ -1838,7 +1875,19 @@ impl eframe::App for BrepApp {
         // view (`EngineState::ref_select_in_form`).
         let modal_pick = self.docs.engine().ref_select_modal();
 
-        if sketch {
+        let compact = crate::viewport::touch::compact(&ctx);
+        let entity_drawer_id = egui::Id::new("brep-mobile-sketch-entities");
+        let mut entity_drawer_open = sketch && ctx.data(|d| d.get_temp::<bool>(entity_drawer_id)).unwrap_or(false);
+        let mut mobile_sketch_hits: std::collections::HashMap<String, egui::Rect> = std::collections::HashMap::new();
+        if sketch && compact {
+            egui::containers::panel::Panel::top("brep-mobile-sketch-controls").resizable(false).show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    self.mode_bar.card(ui, self.docs.engine_mut());
+                });
+            });
+            self.sketch.clear_list_hits();
+            self.sketch3d.clear_list_hits();
+        } else if sketch {
             // Sketch entity lists (Curves / Points / Constraints) + solver
             // settings — a dedicated left panel, drawn BEFORE the viewport so it
             // reserves the left and the viewport fills the rest.
@@ -1894,12 +1943,35 @@ impl eframe::App for BrepApp {
             ui.ctx().request_repaint_after(std::time::Duration::from_secs_f64(next.max(0.1)));
         }
         if sketch || modal_pick {
+            self.viewport.set_chrome_obscured(compact && entity_drawer_open);
             // Special mode: the viewport fills the remaining central area; no
             // dock, no modeling side panes — and therefore no DOCUMENT TAB
             // STRIP either, which is the guard that keeps a live sketch /
             // reference-pick session from having its document swapped out from
             // under it.
             self.viewport.show(ui, self.docs.engine_mut());
+            if compact && sketch {
+                let view = self.viewport.last_rect().unwrap_or(ui.max_rect());
+                egui::Area::new(egui::Id::new("brep-mobile-sketch-tab"))
+                    .order(egui::Order::Middle).fixed_pos(view.left_top() + egui::vec2(2.0, 4.0)).movable(false)
+                    .show(&ctx, |ui| {
+                        let tab = crate::panels::dock::mobile_tab(ui, "Entities", entity_drawer_open);
+                        mobile_sketch_hits.insert("toggle".into(), tab.rect);
+                        if entity_drawer_open { mobile_sketch_hits.insert("close".into(), tab.rect); }
+                        if tab.clicked() { entity_drawer_open = !entity_drawer_open; ctx.request_repaint(); }
+                    });
+                if entity_drawer_open {
+                    let panel = egui::Rect::from_min_size(view.left_top() + egui::vec2(52.0, 4.0),
+                        egui::vec2((view.width() - 60.0).min(400.0).max(100.0), (view.height() - 8.0).max(100.0)));
+                    crate::panels::dock::mobile_panel(&ctx, entity_drawer_id, panel, |ui| {
+                        if self.docs.engine().sketch3d_mode() {
+                            self.sketch3d.show_entity_lists(ui, self.docs.engine_mut());
+                        } else {
+                            self.sketch.show_entity_lists(ui, self.docs.engine_mut());
+                        }
+                    });
+                }
+            }
             DockState::retract_all(DockContext {
                 docs: &mut self.docs,
                 plugins: &mut self.plugins,
@@ -1965,23 +2037,14 @@ impl eframe::App for BrepApp {
             // A pick runs in ONE document's engine: switching or closing a
             // document commits a form field's pick first, so it is never left
             // running in a document that is no longer on screen.
-            if outcome.document_tabs.activate.is_some() || outcome.document_tabs.close.is_some() {
-                if self.docs.engine().ref_select_in_form() {
-                    self.docs.engine_mut().finish_ref_select();
-                }
-            }
-            if let Some(index) = outcome.document_tabs.activate {
-                self.docs.activate(index);
-            }
-            if let Some(index) = outcome.document_tabs.close {
-                self.file.request_close(&mut self.docs, index);
-            }
-            self.document_tab_hits = outcome.document_tabs.hits;
+            self.apply_document_actions(outcome.document_tabs.activate, outcome.document_tabs.close);
+            if !compact { self.document_tab_hits = outcome.document_tabs.hits; }
             // A structure-tree Edit — or a BOM row's action button, which
             // reports through the same outcome field so there is one arm and
             // not two — expands its feature in the history tree.
             if let Some(focus) = outcome.feature_focus {
                 self.history.focus_feature(focus);
+                if compact { self.dock.show_pane(PaneKind::History); }
             }
             // Structure-tree interaction hooks route through the SAME dispatcher
             // as the context bar (one truth per action); document-level flows
@@ -2085,6 +2148,8 @@ impl eframe::App for BrepApp {
         self.part_properties
             .show(&ctx, self.docs.engine_mut(), &part_title, part_document);
 
+        ctx.data_mut(|d| d.insert_temp(entity_drawer_id, entity_drawer_open));
+
         // --- top-right overlay column: the special-mode EXIT card (Finish/Cancel
         // for reference-selection / sketch mode) stacked ABOVE the selection-driven
         // CONTEXT ACTION rail. Both cards live in ONE ctx-level Area anchored
@@ -2092,7 +2157,15 @@ impl eframe::App for BrepApp {
         // renderer whether it is showing modeling actions or sketch actions
         // (`panels::action_rail`). A modeling create/edit action returns a feature
         // id to expand in the history tree.
-        {
+        #[cfg(all(feature = "automation", target_arch = "wasm32"))]
+        crate::automation::registry::publish("__brepMobileActions", "compact action menu button rectangle", "{}");
+        if compact && (entity_drawer_open || (!sketch && self.dock.mobile_drawer_open())) {
+            crate::panels::action_rail::close_mobile_actions(&ctx);
+            self.mode_bar.clear_hits();
+            self.sketch.clear_context_hits();
+            self.sketch3d.clear_context_hits();
+            self.context_bar.clear_view();
+        } else {
             let mut focus: Option<String> = None;
             let mut info_targets: Vec<String> = Vec::new();
             let mut plugin_action = None;
@@ -2115,23 +2188,53 @@ impl eframe::App for BrepApp {
                     // 0. The family-row preview's card: which row, and Exit.
                     self.family_table.preview_card(ui, self.docs.engine_mut());
                     // 1. Exit controls for whatever special mode is active.
-                    self.mode_bar.card(ui, self.docs.engine_mut());
+                    if !(compact && sketch) { self.mode_bar.card(ui, self.docs.engine_mut()); }
                     // 2. Context actions: sketch actions in sketch mode, else the
                     // modeling selection actions. Same rail, mode-appropriate items.
+                    let has_actions = if self.docs.engine().sketch_mode() { self.docs.engine().sketch_selection_count() > 0 }
+                        else if self.docs.engine().sketch3d_mode() { self.docs.engine().sketch3d_selection_count() > 0 }
+                        else { self.docs.engine().has_selection() || self.docs.engine().selected_constraint().is_some() };
+                    let mut draw_actions = |ui: &mut egui::Ui| {
                     if self.docs.engine().sketch_mode() {
                         self.sketch.context_card(ui, self.docs.engine_mut());
                     } else if self.docs.engine().sketch3d_mode() {
                         self.sketch3d.context_card(ui, self.docs.engine_mut());
                     } else {
+                        // Room down to the ViewCube's top, from wherever the
+                        // cards above left the cursor.
+                        self.context_bar.max_height = if compact { None } else { self.viewport.last_rect().and_then(|view| {
+                            let cube: serde_json::Value =
+                                serde_json::from_str(&self.docs.engine().viewcube_rect_json()).ok()?;
+                            let (top, h) = (cube["y"].as_f64()? as f32, cube["h"].as_f64()? as f32);
+                            (h > 0.0).then(|| view.top() + top - 8.0 - ui.cursor().top())
+                        }) };
                         let outcome = self.context_bar.card(ui, self.docs.engine_mut());
                         focus = outcome.focus;
                         info_targets = outcome.info_targets;
                         plugin_action = outcome.plugin_action;
                         component_request = outcome.component;
                     }
+                    };
+                    if compact {
+                        if has_actions {
+                            ui.set_min_width(110.0);
+                            let button = ui.add_sized([110.0, 44.0], egui::Button::new("Actions"));
+                            if button.clicked() { crate::panels::action_rail::open_mobile_actions(ui.ctx()); }
+                            draw_actions(ui);
+                            #[cfg(all(feature = "automation", target_arch = "wasm32"))]
+                            crate::automation::registry::publish("__brepMobileActions", "shared action chooser and entry rectangles",
+                                &crate::panels::action_rail::mobile_actions_json(ui.ctx(), button.rect));
+                        } else {
+                            crate::panels::action_rail::close_mobile_actions(ui.ctx());
+                            self.sketch.clear_context_hits();
+                            self.sketch3d.clear_context_hits();
+                            self.context_bar.clear_view();
+                        }
+                    } else { draw_actions(ui); }
                 });
             if let Some(focus) = focus {
                 self.history.focus_feature(focus);
+                if compact { self.dock.show_pane(PaneKind::History); }
             }
             // The Info action returns one target per selected entity — open (or, on
             // dedup, keep) a pinned Info window for each. Drawn below.
@@ -2150,6 +2253,8 @@ impl eframe::App for BrepApp {
                 None => {}
             }
         }
+
+        if compact { crate::panels::action_rail::show_mobile_actions(&ctx); }
 
         // --- THE DIALOG DOOR: every dynamically generated dialog that opened
         // this frame makes its host pane's tab current.
@@ -2229,6 +2334,20 @@ impl eframe::App for BrepApp {
         if crate::automation::registry::enabled() {
             let _publish_span = crate::perf::span(crate::perf::Phase::Publish);
             let ppp = ui.ctx().pixels_per_point();
+            // Keyboard focus, for a driver typing into a widget by its rect: the
+            // frame counter says a click has been drawn, `rect` is the widget
+            // egui gave the focus to (null while nothing has it). A typed
+            // string lands only in a focused field, so a verifier waits on this
+            // rather than on time (BREP_app/web/verify_plm_helpers.mjs).
+            let focused = crate::column_tree::focused_rect(ui.ctx());
+            // The focused value editor's text, taken (not left) so a frame
+            // with no focused editor publishes null.
+            let text: Option<String> = ui.ctx().data_mut(|d| d.remove_temp::<String>(crate::column_tree::focused_text_id())).filter(|_| focused.is_some());
+            crate::automation::registry::publish("__brepFocus", "keyboard focus {frame, rect:[x,y,w,h]|null (the focused widget), text:string|null (a value editor's in-progress string)}", &serde_json::json!({
+                "frame": ui.ctx().cumulative_frame_nr(),
+                "rect": focused.map(|r| [r.min.x, r.min.y, r.width(), r.height()]),
+                "text": text,
+            }).to_string());
             crate::automation::registry::publish("__brepCamera", "camera state: kind, eye, target, up, near/far, projection block, worldPerPixel", &self.docs.engine().camera_state_json());
             crate::automation::registry::publish("__brepSettings", "render and UI settings", &self.docs.engine().settings_json());
             crate::automation::registry::publish("__brepSolidColors", "per-solid colour overrides", &self.docs.engine().solid_color_overrides_json());
@@ -2368,6 +2487,13 @@ impl eframe::App for BrepApp {
             crate::automation::registry::publish("__brepRecoveryHit", "recovery prompt widget rects", &self.recovery.hits_json());
             crate::automation::registry::publish("__brepComponentMove", "assembly component move state", &self.docs.engine().component_move_json());
             crate::automation::registry::publish("__brepSketch", "sketch mode state (session, tool, selection, constraints)", &self.sketch.published_json(self.docs.engine()));
+            #[cfg(target_arch = "wasm32")]
+            crate::automation::registry::publish("__brepMobileDock", "compact dock drawer controls", &self.dock.mobile_state_json());
+            #[cfg(target_arch = "wasm32")]
+            crate::automation::registry::publish("__brepMobileSketch", "compact sketch entity drawer controls", &serde_json::json!({
+                "compact": compact, "open": entity_drawer_open,
+                "rects": serde_json::from_str::<serde_json::Value>(&crate::automation::hit_rects::hits_json(mobile_sketch_hits.iter())).unwrap_or_default(),
+            }).to_string());
             crate::automation::registry::publish("__brepSketchHit", "sketch-mode overlay widget rects: the SKETCH ACTIONS card (constraint:glyph fix construction cleanup delete) \u{2014} empty out of sketch mode. The draw tools are NOT here: they are workbench buttons in the toolbar row (toolbar/workbench:btn:sketch.tool.* and sketch.autoconstrain)", &self.sketch.hits_json(self.docs.engine()));
             crate::automation::registry::publish("__brepSketchListHit", "sketch entity-list widget rects: section:* geometry:id point:id constraint:id del:kind:id panel:clip (empty out of sketch mode)", &self.sketch.list_hits_json(self.docs.engine()));
             crate::automation::registry::publish("__brepSketch3d", "3D sketch mode state: {sketch3dMode, featureId, dof, status, conflicting, tool, workPlane, workPlaneAnchor, pointCount, geometryCount, constraintCount, pendingLen, selection, applicableConstraints, dimensions, externalRefs, lastHit, canUndo, canRedo, entities}", &self.sketch3d.published_json(self.docs.engine()));
@@ -2426,6 +2552,9 @@ impl eframe::App for BrepApp {
         // registry and layout.
         #[cfg(feature = "automation")]
         self.drain_reads(&ctx);
+
+        #[cfg(target_arch = "wasm32")]
+        crate::viewport::touch::publish_editor(&ctx);
 
         // NOTE: the 3D viewport is no longer drawn here — it is a dock tile drawn
         // earlier this frame (normal mode) or drawn directly in the sketch /

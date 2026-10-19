@@ -26,7 +26,8 @@ pub use math::Vec3;
 pub use mesh::{AnalyzedMesh, Mesh, MeshAnalysisOptions, SourceMetadata, TriangleData};
 pub use options::{RecognitionOptions, SamplingMode};
 pub use recognize::{
-    recognize_surfaces, recognize_surfaces_with_unresolved, reconstruct_analyzed,
+    recognize_surfaces, recognize_surfaces_with_attempt_budget, recognize_surfaces_with_candidates,
+    recognize_surfaces_with_unresolved, reconstruct_analyzed, ComponentCandidate, RecognitionWork,
     reconstruct_surface, reconstruct_surface_from_vertices,
 };
 pub use surface::{

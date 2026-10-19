@@ -226,6 +226,13 @@ pub fn intersect_curve_surface(
     surface: &NurbsSurface,
     tolerance: f64,
 ) -> Result<Vec<CurveSurfaceIntersection>, String> {
+    let seeds = sampled_seeds(curve, surface, tolerance)?;
+    intersect_curve_surface_from_seeds(curve, surface, tolerance, seeds)
+}
+
+/// The general search's Newton seeds: the midpoint of every sample segment
+/// of the curve whose box meets the surface's box and one of its span boxes.
+fn sampled_seeds(curve: &NurbsCurve, surface: &NurbsSurface, tolerance: f64) -> Result<Vec<f64>, String> {
     let [t0, t1] = curve.domain()?;
     let surface_box = surface_bounds(surface)?.expanded(tolerance * 10.0);
     let sample_count =
@@ -245,6 +252,21 @@ pub fn intersect_curve_surface(
             seeds.push((pair[0].0 + pair[1].0) * 0.5);
         }
     }
+    Ok(seeds)
+}
+
+/// [`intersect_curve_surface`] from the caller's own Newton seeds (curve
+/// parameters): the same Newton, gap filter, duplicate guard and tangency
+/// reading as the general search, only the seeds differ. The classifier's
+/// exact ray lane (`crate::exact_line_surface`) seeds it with the closed-form
+/// roots of a straight segment against an analytic carrier.
+pub(crate) fn intersect_curve_surface_from_seeds(
+    curve: &NurbsCurve,
+    surface: &NurbsSurface,
+    tolerance: f64,
+    seeds: Vec<f64>,
+) -> Result<Vec<CurveSurfaceIntersection>, String> {
+    let [t0, t1] = curve.domain()?;
     let mut results: Vec<CurveSurfaceIntersection> = Vec::new();
     for seed in seeds {
         let [t, u, v] = newton_curve_surface(curve, surface, seed)?;

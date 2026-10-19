@@ -220,22 +220,62 @@ fn arc_circle_support(
     Ok(Some((center, normal, radius)))
 }
 
+/// Merge lanes a caller opts into beyond what the solid-wide merge does.
+///
+/// The solid-wide merge runs after every boolean and keeps every face it does
+/// not have to join: the default (all off) is exactly its behaviour. A caller
+/// joining faces the USER selected together (Push Face on the halves of an
+/// imported bore) asks for more: those faces are one region of one carrier by
+/// the user's own reading, and a face the merge leaves split is a face the
+/// edit cannot move.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct MergeLanes<'a> {
+    /// Admit a CONE (a ruled revolution whose two boundary circles differ in
+    /// radius) wherever the cylinder lanes run. Only the full-turn lane builds
+    /// its carrier from the radius at each end; the partial-turn lane stays
+    /// cylinder-only.
+    pub cones: bool,
+    /// Let the full-turn lane seam a ring closed by two half-turn patches on
+    /// a SHARED axial edge (the halves of a bore written as two faces). The
+    /// solid-wide merge keeps such pairs apart (see `merge_cylinder_full_turn`).
+    pub shared_seam_ring: bool,
+    /// Among equally ranked seam candidates, prefer an axial edge ending at one
+    /// of these vertices: the seam a coaxial neighbour of the same selection
+    /// already kept, so the rim the two faces share meets both seams at ONE
+    /// vertex and closes into one circle.
+    pub seam_vertices: Option<&'a HashSet<u64>>,
+}
+
 struct CylinderSupport {
     origin: Vec3,
     axis: Vec3,
+    /// The radius at `origin`.
     radius: f64,
+    /// dρ per unit of axial travel along `axis`: zero for a cylinder, the
+    /// cone's slope for a cone (admitted only under `MergeLanes::cones`).
+    slope: f64,
     /// +1 when the face's outward normal points radially away from the
     /// axis, -1 when it points inward.
     outward_radial_sign: f64,
 }
 
+impl CylinderSupport {
+    /// The carrier's radius `axial` along `axis` from `origin`.
+    fn radius_at(&self, axial: f64) -> f64 {
+        self.radius + self.slope * axial
+    }
+}
+
 /// Detect a ruled cylinder patch: quadratic circular arc in one parameter
 /// direction, linear in the other, both boundary arcs sharing an axis and
 /// radius. Covers extruded arcs, revolved axis-parallel lines, and
-/// primitive cylinder walls regardless of parameterization.
+/// primitive cylinder walls regardless of parameterization. With
+/// `allow_cone`, two coaxial boundary arcs of DIFFERENT radii are a cone
+/// patch, admitted when the patch's midpoint lies on the cone they span.
 fn ruled_cylinder_support(
     face: &FaceRecord,
     tolerance: f64,
+    allow_cone: bool,
 ) -> Result<Option<CylinderSupport>, KernelRefusal> {
     let surface = &face.surface;
     let debug = std::env::var("BREP_DEBUG_MERGE").is_ok();
@@ -295,7 +335,8 @@ fn ruled_cylinder_support(
         }
         return Ok(None);
     };
-    if (radius0 - radius1).abs() > circle_tolerance {
+    let is_cone = (radius0 - radius1).abs() > circle_tolerance;
+    if is_cone && !allow_cone {
         if debug {
             eprintln!(
                 "  support face {}: radii differ {} vs {}",
@@ -333,8 +374,26 @@ fn ruled_cylinder_support(
         Ok(radial) => radial,
         Err(_) => return Ok(None),
     };
+    let slope = if is_cone {
+        (radius1 - radius0) / axial.length()
+    } else {
+        0.0
+    };
+    if is_cone {
+        // A twisted ruling between the two circles is a hyperboloid, not a
+        // cone: the patch's own midpoint must sit on the cone they span.
+        let axial_mid = midpoint.sub(center0).dot(axis);
+        let off = (midpoint.sub(foot).length() - (radius0 + slope * axial_mid)).abs();
+        if off > circle_tolerance {
+            if debug {
+                eprintln!("  support face {}: midpoint {off:.3e} off the spanned cone", face.id);
+            }
+            return Ok(None);
+        }
+    }
     let alignment = outward.dot(radial);
-    if alignment.abs() < 0.9 {
+    // A cone's normal leans off the radial by its half-angle.
+    if alignment.abs() < 0.9 / (1.0 + slope * slope).sqrt() {
         if debug {
             eprintln!(
                 "  support face {}: outward not radial ({alignment})",
@@ -347,6 +406,7 @@ fn ruled_cylinder_support(
         origin: center0,
         axis,
         radius: radius0,
+        slope,
         outward_radial_sign: alignment.signum(),
     }))
 }
@@ -355,9 +415,10 @@ fn cosurface_cylinder_pair(
     first: &FaceRecord,
     second: &FaceRecord,
     tolerance: f64,
+    lanes: MergeLanes<'_>,
 ) -> Result<Option<CylinderSupport>, KernelRefusal> {
     let debug = std::env::var("BREP_DEBUG_MERGE").is_ok();
-    let Some(support_a) = ruled_cylinder_support(first, tolerance)? else {
+    let Some(support_a) = ruled_cylinder_support(first, tolerance, lanes.cones)? else {
         if debug {
             eprintln!(
                 "merge {}x{}: first not a ruled cylinder",
@@ -366,7 +427,7 @@ fn cosurface_cylinder_pair(
         }
         return Ok(None);
     };
-    let Some(support_b) = ruled_cylinder_support(second, tolerance)? else {
+    let Some(support_b) = ruled_cylinder_support(second, tolerance, lanes.cones)? else {
         if debug {
             eprintln!(
                 "merge {}x{}: second not a ruled cylinder",
@@ -380,8 +441,24 @@ fn cosurface_cylinder_pair(
         .max(support_b.origin.length())
         .max(support_a.radius);
     let band = (tolerance * 100.0).max(1e-7 * scale);
+    // Both radii read at A's origin and one radius-length further along A's
+    // axis: equal for two cylinders of one radius, and for two patches of
+    // one cone (whose slopes agree once B's axis is turned to A's).
+    let radius_mismatch = {
+        let station = support_a.radius.max(1.0);
+        let b_axial = |axial_on_a: f64| {
+            support_a
+                .origin
+                .add(support_a.axis.scale(axial_on_a))
+                .sub(support_b.origin)
+                .dot(support_b.axis)
+        };
+        (support_a.radius - support_b.radius_at(b_axial(0.0)))
+            .abs()
+            .max((support_a.radius_at(station) - support_b.radius_at(b_axial(station))).abs())
+    };
     if support_a.axis.dot(support_b.axis).abs() < 1.0 - 1e-7
-        || (support_a.radius - support_b.radius).abs() > band
+        || radius_mismatch > band
         || support_a.outward_radial_sign != support_b.outward_radial_sign
     {
         if debug {
@@ -390,7 +467,7 @@ fn cosurface_cylinder_pair(
                 first.id,
                 second.id,
                 support_a.axis.dot(support_b.axis),
-                (support_a.radius - support_b.radius).abs(),
+                radius_mismatch,
                 support_a.outward_radial_sign,
                 support_b.outward_radial_sign
             );
@@ -855,6 +932,146 @@ impl SharedParameterSpace<'_> {
     }
 }
 
+fn shared_trim_certificate_enabled() -> bool {
+    std::env::var("BREP_FACE_MERGE_TRIM_CERT").as_deref() != Ok("0")
+}
+
+/// Prove closure of the complete boundary isocurves. Clamping makes these
+/// the first/last control rows; their common positive rational basis bounds
+/// the entire difference by the largest paired control-point displacement.
+fn closed_control_boundary(surface: &NurbsSurface, along_u: bool, weld: f64) -> bool {
+    let (degree, knots, lo, hi) = if along_u {
+        let Ok([lo,hi]) = surface.domain_u() else { return false; };
+        (surface.degree_u, &surface.knots_u, lo, hi)
+    } else {
+        let Ok([lo,hi]) = surface.domain_v() else { return false; };
+        (surface.degree_v, &surface.knots_v, lo, hi)
+    };
+    if knots.len() < 2*(degree+1)
+        || !knots[..=degree].iter().all(|k| *k == lo)
+        || !knots[knots.len()-degree-1..].iter().all(|k| *k == hi)
+    { return false; }
+    let agree = |a: Vec4, b: Vec4| {
+        if a.w <= 0.0 || !a.w.is_finite() || a.w != b.w { return false; }
+        let (Ok(a), Ok(b)) = (a.point(), b.point()) else { return false; };
+        a.sub(b).length() <= weld
+    };
+    if along_u {
+        let (Some(first), Some(last)) = (surface.control_points.first(), surface.control_points.last()) else { return false; };
+        first.len() == last.len() && first.iter().zip(last).all(|(a,b)| agree(*a,*b))
+    } else {
+        surface.control_points.iter().all(|row| match (row.first(), row.last()) {
+            (Some(a), Some(b)) => agree(*a,*b),
+            _ => false,
+        })
+    }
+}
+
+/// Linear pcurves on affine boundary isocurves compose to polylines.
+/// Matched positive-weight polygon controls therefore bound the COMPLETE
+/// paired images by their largest 3D displacement, even when the other UV
+/// coordinate differs by roundoff. No UV band or station sample is used.
+fn affine_boundary_trim_pair(
+    surface: &NurbsSurface,
+    along_u: bool,
+    first_at_low: bool,
+    first: &NurbsCurve,
+    reverse: &NurbsCurve,
+    weld: f64,
+) -> bool {
+    let (degree, knots, bounds) = if along_u {
+        (surface.degree_v, &surface.knots_v, surface.domain_v())
+    } else {
+        (surface.degree_u, &surface.knots_u, surface.domain_u())
+    };
+    let Ok([lo,hi]) = bounds else { return false; };
+    if degree != 1 || knots.as_slice() != [lo,lo,hi,hi] || hi <= lo { return false; }
+    let ends = if along_u {
+        let (Some(a),Some(b)) = (surface.control_points.first(),surface.control_points.last()) else { return false; };
+        if a.len()!=2 || b.len()!=2 { return false; }
+        [a[0],a[1],b[0],b[1]]
+    } else {
+        if surface.control_points.len()!=2 { return false; }
+        let (a,b) = (&surface.control_points[0],&surface.control_points[1]);
+        let (Some(a0),Some(a1),Some(b0),Some(b1)) = (a.first(),a.last(),b.first(),b.last()) else { return false; };
+        [*a0,*b0,*a1,*b1]
+    };
+    if ends[0].w<=0.0 || ends[0].w!=ends[1].w || ends[2].w<=0.0 || ends[2].w!=ends[3].w {
+        return false;
+    }
+    let (Ok(a0),Ok(a1),Ok(b0),Ok(b1)) = (ends[0].point(),ends[1].point(),ends[2].point(),ends[3].point()) else { return false; };
+    let (a0,a1,b0,b1) = if first_at_low { (a0,a1,b0,b1) } else { (b0,b1,a0,a1) };
+    let image = |p: &Vec4, a: Vec3, b: Vec3| {
+        let t = if along_u { p.y/p.w } else { p.x/p.w };
+        a.add(b.sub(a).scale((t-lo)/(hi-lo)))
+    };
+    first.control_points.iter().zip(&reverse.control_points).all(|(a,b)| {
+        let distance = image(a,a0,a1).sub(image(b,b0,b1)).length();
+        distance.is_finite() && distance <= weld
+    })
+}
+
+/// Prove that a retained shared pair is a periodic seam over its whole
+/// trim. Positive common rational bases match the other parameter, or
+/// affine boundary images bound matched linear polygons. Every periodic
+/// coordinate control lies on opposite closed domain sides.
+/// This qualifies retention after the existing coincidence check fails. It
+/// does not change cancellation policy or widen a UV band. Work is linear
+/// in the existing control arrays, with no sampling or refinement search.
+fn periodic_shared_trim(
+    space: &SharedParameterSpace,
+    first: &CoedgeRecord,
+    second: &CoedgeRecord,
+) -> bool {
+    if first.forward == second.forward { return false; }
+    let Ok(reverse) = second.pcurve.reversed() else { return false; };
+    let curve = &first.pcurve;
+    if curve.degree != reverse.degree || curve.control_points.len() != reverse.control_points.len()
+        || curve.control_points.is_empty()
+    { return false; }
+    let polygon = |c: &NurbsCurve| {
+        c.degree == 1 && c.knots.len() == c.control_points.len()+2
+            && c.knots[0] == c.knots[1]
+            && c.knots[c.knots.len()-1] == c.knots[c.knots.len()-2]
+            && c.knots[1..c.knots.len()-1].windows(2).all(|k| k[1] > k[0])
+    };
+    let polygon = polygon(curve) && polygon(&reverse);
+    if (!polygon && curve.knots != reverse.knots)
+        || !curve.control_points.iter().zip(&reverse.control_points).all(|(a,b)| {
+            [a,b].iter().all(|p| p.w > 0.0 && p.w.is_finite()
+                && (p.x/p.w).is_finite() && (p.y/p.w).is_finite())
+                && (polygon || a.w == b.w)
+        })
+    { return false; }
+    let coordinate = |p: &Vec4, u: bool| if u { p.x/p.w } else { p.y/p.w };
+    let same_coordinate = |u: bool| curve.control_points.iter().zip(&reverse.control_points)
+        .all(|(a,b)| if polygon { coordinate(a,u) == coordinate(b,u) }
+            else if u { a.x == b.x } else { a.y == b.y });
+    for u in [true,false] {
+        let bounds = if u { space.surface.domain_u() } else { space.surface.domain_v() };
+        let Ok([lo,hi]) = bounds else { continue; };
+        let other_bounds = if u { space.surface.domain_v() } else { space.surface.domain_u() };
+        let Ok([other_lo,other_hi]) = other_bounds else { continue; };
+        // The closed-boundary control bound applies on its active domain.
+        // Positive pcurve hulls must stay inside it; extrapolated traces
+        // need a different proof and keep their existing face partition.
+        if !curve.control_points.iter().chain(&reverse.control_points)
+            .all(|p| coordinate(p,!u) >= other_lo && coordinate(p,!u) <= other_hi)
+        { continue; }
+        let opposite = [(lo,hi),(hi,lo)].iter().any(|(a,b)|
+            curve.control_points.iter().all(|p| coordinate(p,u) == *a)
+                && reverse.control_points.iter().all(|p| coordinate(p,u) == *b));
+        if opposite && closed_control_boundary(space.surface, u, space.weld)
+            && (same_coordinate(!u) || (polygon && affine_boundary_trim_pair(
+                space.surface, u, coordinate(&curve.control_points[0],u)==lo,
+                curve, &reverse, space.weld)))
+        {
+            return true;
+        }
+    }
+    false
+}
+
 /// A coedge's pcurve at its start, middle and end. The pcurve runs in the
 /// coedge's own direction, so its domain start is where the traversal starts.
 fn pcurve_stations(coedge: &CoedgeRecord) -> Option<[Vec3; 3]> {
@@ -1006,7 +1223,7 @@ pub(crate) fn faces_are_cosurface(
     if coplanar_with_same_outward_normal(first, second, tolerance)? {
         return Ok(true);
     }
-    if cosurface_cylinder_pair(first, second, tolerance)?.is_some() {
+    if cosurface_cylinder_pair(first, second, tolerance, MergeLanes::default())?.is_some() {
         return Ok(true);
     }
     Ok(coextrusion_pair(first, second, tolerance)?.is_some())
@@ -1113,6 +1330,25 @@ fn try_merge_pair(
     tolerance: f64,
     same_carrier_area_tolerance_ratio: f64,
 ) -> Result<Option<FaceRecord>, KernelRefusal> {
+    try_merge_pair_lanes(
+        older,
+        newer,
+        edges,
+        tolerance,
+        same_carrier_area_tolerance_ratio,
+        MergeLanes::default(),
+    )
+}
+
+/// [`try_merge_pair`] with the opt-in [`MergeLanes`].
+fn try_merge_pair_lanes(
+    older: &FaceRecord,
+    newer: &FaceRecord,
+    edges: &HashMap<u64, &EdgeRecord>,
+    tolerance: f64,
+    same_carrier_area_tolerance_ratio: f64,
+    lanes: MergeLanes<'_>,
+) -> Result<Option<FaceRecord>, KernelRefusal> {
     let same_carrier = older.same_sense == newer.same_sense
         && same_surface(&older.surface, &newer.surface, tolerance);
     // Oppositely oriented planar patches can form a folded, zero-thickness
@@ -1133,7 +1369,7 @@ fn try_merge_pair(
     let coplanar_planar =
         !same_carrier && coplanar_with_same_outward_normal(older, newer, tolerance)?;
     let cosurface_cylinder = if !same_carrier && !coplanar_planar {
-        cosurface_cylinder_pair(older, newer, tolerance)?
+        cosurface_cylinder_pair(older, newer, tolerance, lanes)?
     } else {
         None
     };
@@ -1191,8 +1427,16 @@ fn try_merge_pair(
                         && space.coincide(here[1], there[1])
                         && space.coincide(here[2], there[0]);
                     if !retraced {
+                        // A noncoincident pair may be retained only as a
+                        // proved periodic seam. An interior partition stays
+                        // between faces; retaining it here creates a slit.
+                        if shared_trim_certificate_enabled()
+                            && !periodic_shared_trim(space, first, second)
+                        { decline!(older, newer); }
                         continue;
                     }
+                } else if shared_trim_certificate_enabled() {
+                    decline!(older, newer);
                 }
             }
             shared_older.insert(first.id);
@@ -1256,7 +1500,7 @@ fn try_merge_pair(
         // full-turn lane walks in the merged carrier's own parameter space.
         if let Some(support) = &cosurface_cylinder {
             if let Some(merged) =
-                merge_cylinder_full_turn(older, newer, edges, tolerance, support, &shared_edges)?
+                merge_cylinder_full_turn(older, newer, edges, tolerance, support, &shared_edges, lanes)?
             {
                 return Ok(Some(merged));
             }
@@ -1335,6 +1579,11 @@ fn try_merge_pair(
         // wraps the full turn) the full-turn lane reads again on a closed
         // carrier seamed along an existing axial edge.
         'partial_turn: {
+            // The partial-turn carrier is built at one radius: a cone goes
+            // straight to the full-turn lane, which reads it per end.
+            if support.slope != 0.0 {
+                fall_through!(older, newer, 'partial_turn);
+            }
             // Build one revolution carrier covering both patches: seam at the
             // largest angular gap so the merged region never crosses it, then
             // reproject every loop onto the shared cylinder.
@@ -1481,7 +1730,7 @@ fn try_merge_pair(
             return Ok(Some(merged));
         }
         if let Some(merged) =
-            merge_cylinder_full_turn(older, newer, edges, tolerance, support, &shared_edges)?
+            merge_cylinder_full_turn(older, newer, edges, tolerance, support, &shared_edges, lanes)?
         {
             return Ok(Some(merged));
         }
@@ -1735,6 +1984,7 @@ fn merge_cylinder_full_turn(
     tolerance: f64,
     support: &CylinderSupport,
     shared_edges: &HashSet<u64>,
+    lanes: MergeLanes<'_>,
 ) -> Result<Option<FaceRecord>, KernelRefusal> {
     let debug = std::env::var("BREP_DEBUG_MERGE").is_ok();
     // `BREP_FULL_TURN_MERGE=0` hatches the lane off, for attribution only.
@@ -1767,7 +2017,10 @@ fn merge_cylinder_full_turn(
     let y_reference = support.axis.cross(x_reference);
     let scale = 1.0f64.max(support.origin.length()).max(support.radius);
     let band = (tolerance * 100.0).max(1e-7 * scale);
-    let angular_band = band / support.radius;
+    // The smallest radius the patches reach bounds the angle `band` subtends
+    // (a cylinder's one radius; a cone's radius at its narrow end, read once
+    // the axial range is known below and checked positive there).
+    let mut angular_band = band / support.radius;
 
     // Each use's stations: axial coordinate and angle at nine samples, plus
     // the station of its start and end in traversal order.
@@ -1808,6 +2061,15 @@ fn merge_cylinder_full_turn(
     if axial_range[1] - axial_range[0] <= tolerance {
         return Ok(None);
     }
+    if support.slope != 0.0 {
+        let narrow = support
+            .radius_at(axial_range[0])
+            .min(support.radius_at(axial_range[1]));
+        if narrow <= band {
+            return Ok(None);
+        }
+        angular_band = band / narrow;
+    }
     // An edge is an axial line at angle `theta` when every sample reads that
     // angle: a straight generatrix of the shared cylinder.
     let axial_angle = |stations: &[Station]| -> Option<f64> {
@@ -1829,6 +2091,8 @@ fn merge_cylinder_full_turn(
     // one face) before a shared pair; a line used once bounds the region on
     // one side only and cannot seam a wrap by itself.
     let mut candidates: Vec<(u8, f64)> = Vec::new();
+    // Candidate angles whose edge ends at a vertex `lanes.seam_vertices` names.
+    let mut preferred: Vec<f64> = Vec::new();
     for (index, (side, coedge)) in uses.iter().enumerate() {
         if use_count.get(&coedge.edge_id).copied() != Some(2) {
             continue;
@@ -1845,6 +2109,12 @@ fn merge_cylinder_full_turn(
                     && other.forward != coedge.forward
             });
         let rank = if own_seam { 0 } else { 1 };
+        if let Some(vertices) = lanes.seam_vertices {
+            let edge = edges[&coedge.edge_id];
+            if vertices.contains(&edge.start_vertex_id) || vertices.contains(&edge.end_vertex_id) {
+                preferred.push(theta);
+            }
+        }
         if !candidates
             .iter()
             .any(|(_, known)| angle_difference(*known, theta).abs() <= angular_band)
@@ -1857,7 +2127,18 @@ fn merge_cylinder_full_turn(
             known.0 = known.0.min(rank);
         }
     }
-    candidates.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.total_cmp(&b.1)));
+    let is_preferred = |theta: f64| {
+        preferred
+            .iter()
+            .any(|known| angle_difference(*known, theta).abs() <= angular_band)
+    };
+    // `false` sorts first: a preferred seam leads its rank. With no
+    // preference every key is `true` and the order is the plain one.
+    candidates.sort_by(|a, b| {
+        a.0.cmp(&b.0)
+            .then(is_preferred(b.1).cmp(&is_preferred(a.1)))
+            .then(a.1.total_cmp(&b.1))
+    });
     if debug {
         eprintln!(
             "merge {}x{}: full-turn lane, {} seam candidate(s) {:?}",
@@ -1870,7 +2151,11 @@ fn merge_cylinder_full_turn(
     // A shared pair alone (rank 1) is two half patches closing a ring between
     // them: neither face wraps, and the merged face would carry a seam no
     // input face had. Those pairs stay as assembled (see the doc comment).
-    candidates.retain(|(rank, _)| *rank == 0);
+    // A caller that opted into `shared_seam_ring` is joining faces the user
+    // named as one region; there the shared pair seams the ring.
+    if !lanes.shared_seam_ring {
+        candidates.retain(|(rank, _)| *rank == 0);
+    }
     if candidates.is_empty() {
         if debug {
             eprintln!(
@@ -1906,11 +2191,11 @@ fn merge_cylinder_full_turn(
             support
                 .origin
                 .add(support.axis.scale(axial_range[0]))
-                .add(start_direction.scale(support.radius)),
+                .add(start_direction.scale(support.radius_at(axial_range[0]))),
             support
                 .origin
                 .add(support.axis.scale(axial_range[1]))
-                .add(start_direction.scale(support.radius)),
+                .add(start_direction.scale(support.radius_at(axial_range[1]))),
         )
         .or_refuse(KernelStage::Sew, "healing.face_merge")?;
         let surface = make_revolution(
@@ -2591,6 +2876,131 @@ pub(crate) fn absorb_faces_into_carriers(
         }
     }
     finish_merge(solid, result, true, None)
+}
+
+/// Merge edge-adjacent faces of `group` that ride the same carrier — the
+/// pairs [`merge_same_surface_faces`] would merge, at the same `tolerance`,
+/// plus two lanes only a user's selection opts into: cone patches, and two
+/// half-turn patches closing a ring on a shared axial edge (see
+/// `MergeLanes`) — and nothing else: a face outside `group` is never touched,
+/// however cosurface with a neighbour.
+///
+/// Cancelling a shared edge leaves its end vertices between two pieces of one
+/// rim (the two half circles a split bore's halves each bounded); those
+/// pieces are joined into one edge where they continue each other exactly
+/// (`merge_curve_continuation_edges_at`, at those vertices only), so the merged
+/// face carries the closed rims a face built whole carries.
+///
+/// The surviving face of each merged pair is the one in the lower shell slot;
+/// it keeps its id and name. Returns the merged solid and, for every face id
+/// of `group` (sorted, deduplicated), the pair `(face, carrier)` naming the
+/// face that now carries it (itself when it did not merge). The result passes
+/// the validating merge's Euler and `validate()` checks, scoped to the merged
+/// faces, or the call refuses.
+///
+/// Push Face uses it to treat the halves of a split carrier the user selected
+/// together (an imported bore written as two half cylinders) as the one face
+/// the push moves: a half pushed alone can never meet its unmoved sibling.
+pub fn merge_faces_within(
+    solid: &BrepSolid,
+    tolerance: f64,
+    group: &[u64],
+) -> Result<(BrepSolid, Vec<(u64, u64)>), KernelRefusal> {
+    let group: HashSet<u64> = group.iter().copied().collect();
+    let mut carried_by: Vec<(u64, u64)> = group.iter().map(|id| (*id, *id)).collect();
+    carried_by.sort_unstable();
+    let mut result = solid.clone();
+    let edges = result
+        .edges
+        .iter()
+        .map(|edge| (edge.id, edge))
+        .collect::<HashMap<_, _>>();
+    let edge_ids = |face: &FaceRecord| -> HashSet<u64> {
+        face.loops
+            .iter()
+            .flat_map(|loop_record| &loop_record.coedges)
+            .map(|coedge| coedge.edge_id)
+            .filter(|edge_id| !edges[edge_id].degenerate)
+            .collect()
+    };
+    let mut merged_ids: HashSet<u64> = HashSet::default();
+    let mut cancelled_edges: HashSet<u64> = HashSet::default();
+    // End vertices of the shared edges merged faces kept as their seams.
+    let mut seam_vertices: HashSet<u64> = HashSet::default();
+    for shell in &mut result.shells {
+        'merge: loop {
+            // Only the group's own slots are read: a 1 200-face import pays
+            // for its four selected faces, not for every pair of the shell.
+            let slots: Vec<usize> = (0..shell.faces.len())
+                .filter(|slot| group.contains(&shell.faces[*slot].id))
+                .collect();
+            for (index, &lower) in slots.iter().enumerate() {
+                let lower_edges = edge_ids(&shell.faces[lower]);
+                for &higher in &slots[index + 1..] {
+                    let higher_edges = edge_ids(&shell.faces[higher]);
+                    if higher_edges.is_disjoint(&lower_edges) {
+                        continue;
+                    }
+                    let lanes = MergeLanes {
+                        cones: true,
+                        shared_seam_ring: true,
+                        seam_vertices: Some(&seam_vertices),
+                    };
+                    let Some(mut merged) = try_merge_pair_lanes(
+                        &shell.faces[lower],
+                        &shell.faces[higher],
+                        &edges,
+                        tolerance,
+                        1e-7,
+                        lanes,
+                    )?
+                    else {
+                        continue;
+                    };
+                    let survivor = shell.faces[lower].id;
+                    let absorbed = shell.faces[higher].id;
+                    merged.id = survivor;
+                    merged.name = shell.faces[lower].name.clone();
+                    let kept = edge_ids(&merged);
+                    for edge_id in lower_edges.intersection(&higher_edges) {
+                        if kept.contains(edge_id) {
+                            let edge = edges[edge_id];
+                            seam_vertices.insert(edge.start_vertex_id);
+                            seam_vertices.insert(edge.end_vertex_id);
+                        } else {
+                            cancelled_edges.insert(*edge_id);
+                        }
+                    }
+                    for (_, carrier) in carried_by.iter_mut() {
+                        if *carrier == absorbed {
+                            *carrier = survivor;
+                        }
+                    }
+                    merged_ids.insert(survivor);
+                    shell.faces[lower] = merged;
+                    shell.faces.remove(higher);
+                    continue 'merge;
+                }
+            }
+            break;
+        }
+    }
+    if merged_ids.is_empty() {
+        return Ok((result, carried_by));
+    }
+    let joints: HashSet<u64> = cancelled_edges
+        .iter()
+        .flat_map(|edge_id| {
+            let edge = edges[edge_id];
+            [edge.start_vertex_id, edge.end_vertex_id]
+        })
+        .collect();
+    let result = finish_merge(solid, result, true, Some(&merged_ids))?;
+    if joints.is_empty() {
+        return Ok((result, carried_by));
+    }
+    let result = crate::coalesce::merge_curve_continuation_edges_at(&result, tolerance, &joints)?;
+    Ok((result, carried_by))
 }
 
 /// The tail every merge shares: drop the edges and vertices no face uses any

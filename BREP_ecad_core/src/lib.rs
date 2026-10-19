@@ -689,7 +689,18 @@ impl Document {
             },
         }
     }
-    pub fn place(&mut self, mut symbol: Symbol, at: Point, rotation: u8) -> Uuid {
+    /// Put a symbol on the sheet with NO part and NO assembly occurrence behind it.
+    ///
+    /// A BREP sheet is one view of an assembly: every valued component on it is an
+    /// assembly component, and the one way to put one down is
+    /// [`Document::place_assembly_component`], after the part has been added to the
+    /// assembly. This primitive is left public for the two things that are NOT
+    /// assembly components — a power symbol, which names a net
+    /// ([`Document::place_power_symbol`]), and an editor's preview sheet — and for
+    /// tests that build a sheet shape directly. No editor door reaches it for a
+    /// valued part: a saved component with a part and no occurrence is the LEGACY
+    /// shape, which the host binds to an assembly component on open.
+    pub fn place_unbound(&mut self, mut symbol: Symbol, at: Point, rotation: u8) -> Uuid {
         // A part saved before gates existed places as gates too.
         symbol.migrate_legacy_units();
         let mut n = 1;
@@ -737,25 +748,60 @@ impl Document {
         }
         id
     }
-    /// A free wire. Wiring diagrams have none; their wires come from [`Document::connect`].
-    /// Place a part: its symbol and pads are copied into the document, and the component
-    /// remembers which part and which version they came from. `reference` is the label
-    /// the host gives it, or the next free one when it has none.
-    pub fn place_part(
+    /// Put a power symbol on the sheet: a `#PWR` symbol that names a net
+    /// ([`Symbol::power_net`]) and is no part — it has no footprint, no BOM line
+    /// and no assembly occurrence. Refused for any other symbol: a valued part
+    /// goes on a sheet through [`Document::place_assembly_component`] alone.
+    pub fn place_power_symbol(&mut self, symbol: Symbol, at: Point, rotation: u8) -> Result<Uuid, String> {
+        if symbol.power_net.is_none() {
+            return Err(format!(
+                "{} is not a power symbol: a part goes on the sheet as an assembly component, \
+                 added with Add component",
+                symbol.library_id
+            ));
+        }
+        Ok(self.place_unbound(symbol, at, rotation))
+    }
+    /// Place an ASSEMBLY COMPONENT on the sheet. `occurrence` is the assembly
+    /// occurrence the component IS (`ACOMP3`, or `ACOMP7:ACOMP1` for a device
+    /// inside a sub-assembly): the symbol and pads of its part are copied into
+    /// the document, and the component records the occurrence with the part's
+    /// key and version (`part.key`, `part.signature`; `part.instance` is
+    /// overwritten with `occurrence`). `reference` is the label the host gives
+    /// it — its reference designator — or the next free one when it has none.
+    ///
+    /// This is the ONE way a valued component reaches a sheet. It takes the
+    /// occurrence as a required argument so that a sheet component without an
+    /// assembly component behind it cannot be written: a board is an assembly,
+    /// and its footprints are the assembly's components seen from above. An
+    /// occurrence already on the sheet is refused — one component per occurrence.
+    pub fn place_assembly_component(
         &mut self,
-        part: PartSource,
+        occurrence: &str,
+        mut part: PartSource,
         symbol: Symbol,
         pads: Option<board::Footprint>,
         reference: Option<String>,
         at: Point,
         rotation: u8,
     ) -> Result<Uuid, String> {
-        if let Some(instance) = &part.instance {
-            if self.components.iter().any(|c| c.part.as_ref().and_then(|p| p.instance.as_ref()) == Some(instance)) {
-                return Err("This native assembly instance is already placed".into());
-            }
+        let occurrence = occurrence.trim();
+        if occurrence.is_empty() {
+            return Err("A sheet component is an assembly component: add the part to the assembly first".into());
         }
-        let id = self.place(symbol, at, rotation);
+        if self.components.iter().any(|c| c.part.as_ref().and_then(|p| p.instance.as_deref()) == Some(occurrence)) {
+            return Err("This native assembly instance is already placed".into());
+        }
+        // A power symbol names a net; it has no footprint, no BOM line and no
+        // part, so it can never carry a part source or an occurrence.
+        if let Some(net) = &symbol.power_net {
+            return Err(format!(
+                "{} is a power symbol for net {net}: it names a net and is no assembly component",
+                symbol.library_id
+            ));
+        }
+        part.instance = Some(occurrence.to_owned());
+        let id = self.place_unbound(symbol, at, rotation);
         if let Some(reference) = reference {
             self.set_reference(id, &reference).inspect_err(|_| {
                 self.delete_component(id);
@@ -946,7 +992,7 @@ impl Document {
     /// sits, what it is called, and every wire landing on a pin it still has.
     ///
     /// A device already placed on this sheet is refused, as
-    /// [`Document::place_part`] refuses one.
+    /// [`Document::place_assembly_component`] refuses one.
     pub fn relink(
         &mut self,
         component: Uuid,

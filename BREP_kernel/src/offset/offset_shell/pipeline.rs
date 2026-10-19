@@ -22,6 +22,7 @@ fn coheres_face_normals(solid: &mut BrepSolid) -> Result<(), KernelRefusal> {
     for shell_index in 0..solid.shells.len() {
         let single = BrepSolid {
             mass_properties_cache: Default::default(),
+            cells: Default::default(),
             id: solid.id,
             vertices: solid.vertices.clone(),
             edges: solid.edges.clone(),
@@ -29,7 +30,13 @@ fn coheres_face_normals(solid: &mut BrepSolid) -> Result<(), KernelRefusal> {
             genus: 0,
             kind: crate::BodyKind::Solid,
         };
-        if crate::solid_signed_volume(&single).or_refuse(KernelStage::Sew, "solid_signed_volume")? < 0.0 {
+        // Read for its SIGN only, through the per-face term memo
+        // (`solid_signed_volume_for_sign`: the verdict against the bar is the
+        // exact integral's, and a face read about the same reference before —
+        // the next feature's push, the boolean assembler's own check — is
+        // served its term). The exact read here cost 0.26 s on the shelled-box
+        // report's 34-face shell, 42 of its faces fitted.
+        if crate::signed_volume_against(&single, 0.0).or_refuse(KernelStage::Sew, "solid_signed_volume")? < 0.0 {
             flip_shell_faces(&mut solid.shells[shell_index])?;
         }
     }
@@ -447,6 +454,15 @@ fn offset_shell_impl(
         return Err(refusals::no_retained_face().into());
     }
     let mut carriers = Vec::new();
+    let mut open_section_reach = false;
+    if distance < 0.0 && std::env::var("BREP_OFFSET_OPEN_SECTION_REACH").as_deref() != Ok("0") {
+        for face in &source_faces {
+            if retained.contains(&face.id) && open_profile_has_construction_headroom(face)? {
+                open_section_reach = true;
+                break;
+            }
+        }
+    }
     // Faces whose folded part was carved away, by source face id. Later stages
     // that read a retained face's TRIM — the apex-cap scan below is the one —
     // must read the carved trim, not the one the source still carries.
@@ -455,7 +471,7 @@ fn offset_shell_impl(
     for face_id in &retained {
         let face = source_faces.iter().find(|face| face.id == *face_id).unwrap();
         profile::lap(&mut clock, profile::CARRIER_TRIM);
-        let collapsed = offset_support_collapsed(face, distance)?;
+        let collapsed = profile::detail("offset_support_collapsed", || offset_support_collapsed(face, distance))?;
         profile::lap(&mut clock, profile::CARRIER_REGULARITY);
         if collapsed {
             os_debug!("omitting collapsed offset support for source face {face_id}");
@@ -502,10 +518,25 @@ fn offset_shell_impl(
         // by nothing across a smooth junction into a retained neighbour —
         // see `outward_carrier_extension`. A reflex junction needs no
         // outward growth at all (those offsets cross inside the trims).
+        let mut curved_reach = None;
         let extension = if distance < 0.0 {
             outward_carrier_extension(source, face, &source_faces, &opening_set, distance.abs())?
         } else {
             let mut inward = crate::CarrierExtension::uniform(reflex_extension.unwrap_or(0.0));
+            if reflex_extension.is_some() {
+                let [u_min, u_max, v_min, v_max] =
+                    apex_corner_reach(source, face, &source_faces, &opening_set, distance)?;
+                if u_min.max(u_max).max(v_min).max(v_max) > 0.0 {
+                    inward.u_min = inward.u_min.max(u_min);
+                    inward.u_max = inward.u_max.max(u_max);
+                    inward.v_min = inward.v_min.max(v_min);
+                    inward.v_max = inward.v_max.max(v_max);
+                    os_debug!(
+                        "carrier for src face {face_id}: apex corner reach u=({:.4},{:.4}) v=({:.4},{:.4})",
+                        inward.u_min, inward.u_max, inward.v_min, inward.v_max,
+                    );
+                }
+            }
             // An INWARD carrier that falls short of the planar opening it meets
             // is grown until it crosses that plane, so the imprint cuts the
             // skin there instead of leaving a rim for the ruled weld to cork
@@ -538,10 +569,15 @@ fn offset_shell_impl(
             if let Some((opening, gap)) =
                 offset_falls_short_of_curved_opening(source, face, &source_faces, &opening_set, distance)?
             {
-                return Err(KernelRefusal::unsupported(KernelStage::Refine, "offset_shell_curved_opening_short", format!(
-                    "offset_shell: the offset skin of source face {face_id} stops {gap:.3e} short of \
-                     curved opening face {opening}; only a planar opening's skin is grown to meet it"
-                )));
+                if std::env::var("BREP_OFFSET_CURVED_REACH").as_deref() != Ok("0") {
+                    curved_reach = curved_opening_reach_source(source, face, distance)?;
+                }
+                if curved_reach.is_none() {
+                    return Err(KernelRefusal::unsupported(KernelStage::Refine, "offset_shell_curved_opening_short", format!(
+                        "offset_shell: the offset skin of source face {face_id} stops {gap:.3e} short of \
+                         curved opening face {opening}; only a planar opening's skin is grown to meet it"
+                    )));
+                }
             }
             inward
         };
@@ -567,27 +603,33 @@ fn offset_shell_impl(
         // inverted patch in it welds into a shell that validates and bounds the
         // wrong solid.
         profile::lap(&mut clock, profile::CARRIER_TRIM);
-        let carved = carve_folded_support(source, face, distance)?;
+        let carved = profile::detail("carve_folded_support", || carve_folded_support(source, face, distance))?;
         profile::lap(&mut clock, profile::CARRIER_REGULARITY);
         // A CUT RIM — the face's rim with a planar opening running across
         // its surface rather than along a v end — has the trim rebuilt over
         // the surface's full rectangle so the opening plane truncates the
         // offset skin (`cut_rim_full_rectangle_source`); like the carve, a
         // substitute source the carrier is built over.
-        let cut_rim = if carved.is_none() {
+        let cut_rim = if carved.is_none() && curved_reach.is_none() {
             cut_rim_full_rectangle_source(source, face, &source_faces, &opening_set, distance)?
         } else {
             None
         };
         // A curved face's SHARP outward u-side: the carrier is built over the
         // surface continued past it, so it reaches the mitre with its sharp
-        // neighbour's offset (`sharp_side_continued_source`).
-        let sharp_side = if carved.is_none() && cut_rim.is_none() {
-            sharp_side_continued_source(source, face, &source_faces, &opening_set, distance, &extension)?
+        // neighbour's offset (`sharp_side_continued_source`). Its INWARD
+        // reflex u-side widens the trim inside the surface's own domain
+        // instead (`reflex_side_widened_source`).
+        let sharp_side = if carved.is_none() && cut_rim.is_none() && curved_reach.is_none() {
+            match sharp_side_continued_source(source, face, &source_faces, &opening_set, distance, &extension)? {
+                Some(continued) => Some(continued),
+                None => reflex_side_widened_source(source, face, &source_faces, &opening_set, distance, &extension)?,
+            }
         } else {
             None
         };
         let carrier_source = match (&carved, &cut_rim) {
+            (None, None) if curved_reach.is_some() => curved_reach.as_ref().unwrap(),
             (None, None) if sharp_side.is_some() => sharp_side.as_ref().unwrap(),
             (None, Some(rebuilt)) => rebuilt,
             (Some(carved), _) => {
@@ -665,6 +707,12 @@ fn offset_shell_impl(
             && outline_has_free_element(source, face)?
         {
             carrier = full_rectangle_face(&carrier, &carrier.shells[0].faces[0])?;
+        }
+        if open_section_reach {
+            if let Some(continued) = open_section_construction(source, face, &carrier, &extension, distance)? {
+                carrier = continued;
+                os_debug!("carrier for src face {face_id}: open section uses its natural construction rectangle");
+            }
         }
         // The rim a shadowed support's removal VACATED in this carrier's trim:
         // a slot narrower than 2|d| that runs out through this face leaves a
@@ -807,7 +855,7 @@ fn offset_shell_impl(
                 continue;
             }
             let face = source_by_id_lookup(&source_faces, *face_id).unwrap();
-            if let Some(fold) = outward_fold_the_carve_missed(face, distance)? {
+            if let Some(fold) = profile::detail("outward_fold_the_carve_missed", || outward_fold_the_carve_missed(face, distance))? {
                 return Err(KernelRefusal::unsupported(KernelStage::Refine, "offset_shell_outward_fold_band", format!(
                     "offset_shell: the outward offset of source face {face_id} folds where the carve \
                      saw no fold (area factor {:.3e} at u={:.6}, v={:.6}); a fold band that thin is \
@@ -969,17 +1017,17 @@ fn offset_shell_impl(
                 // rather than assembling an open rim.
                 let mut scaled = carrier_solid(source, *face_id, 0.0, pad)?;
                 drop_wall_interior_loops(&mut scaled)?;
-                let mut wall = match offset_outline_wall(source, source_face, pad)? {
+                let mut wall = match profile::detail("offset_outline_wall", || offset_outline_wall(source, source_face, pad))? {
                     Ok(outline) => {
                         // Where the scaled wall already trims the offset
                         // outline's own region — a rectangle filling its patch,
                         // a circle centred on it — it is kept, so no shell that
                         // was right before is rebuilt on a different patch.
-                        let same = walls_trim_the_same_region(
+                        let same = profile::detail("walls_trim_the_same_region", || walls_trim_the_same_region(
                             &outline,
                             &scaled,
                             1e-9f64.max(crate::solid_scale(source) * 1e-11),
-                        )?;
+                        ))?;
                         if same {
                             os_debug!("wall for opening face {face_id}: scaled, which IS its outline offset");
                             scaled
@@ -1916,11 +1964,22 @@ fn offset_shell_impl(
                     shadowed_points.push((fragment.test_point, carrier.source_face_id));
                 }
             }
-            let on_skin = readings
+            let mut on_skin = readings
                 .iter()
                 .zip(&adrift)
                 .map(|(reading, adrift)| matches!(reading, SkinReading::On) && !adrift)
                 .collect::<Vec<_>>();
+            if open_section_reach {
+                if let Some(ends) = open_profile_end_neighbours(index, &carriers, &source_faces)? {
+                    // A continued variable profile can approach its original
+                    // end cap inside the distance band. Its sharp boundary is
+                    // the section with the OFFSET end plane, not that old cap.
+                    for (keep, fragment) in on_skin.iter_mut().zip(&fragments_by_carrier[index]) {
+                        *keep = !outside_continued_neighbours(fragment.test_point, &ends, &carriers, tolerance)?;
+                    }
+                    os_debug!("  select[{index}] open profile kept {} central regions", on_skin.iter().filter(|keep| **keep).count());
+                }
+            }
             // A synthetic apex sphere has no source-face seed of its own to
             // fall back to. When its whole cap is hidden by retained offsets,
             // keep its cuts but contribute no skin. Otherwise the fallback
@@ -1981,7 +2040,18 @@ fn offset_shell_impl(
             // own, and the selection below answers each region's seed. An
             // ordinary face has the one seed and the one answer it always had.
             let mut region_skins = Vec::new();
-            for &seed in &seeds {
+            let continued_neighbours = if distance > 0.0 {
+                continued_sphere_neighbours(index, &carriers, &source_faces, scale)?
+            } else { None };
+            if let Some(neighbours) = &continued_neighbours {
+                for fragment in &classified {
+                    if outside_continued_neighbours(fragment.test_point, neighbours, &carriers, tolerance)? {
+                        region_skins.push(fragment.clone());
+                    }
+                }
+                os_debug!("  select[{index}] continued sphere kept {} regions", region_skins.len());
+            }
+            for &seed in seeds.iter().filter(|_| continued_neighbours.is_none()) {
                 os_debug!("  select[{index}] seed=({:.4},{:.4})", seed.x, seed.y);
                 let seeded = viable
                     .iter()
@@ -2545,22 +2615,22 @@ fn offset_shell_impl(
     );
     selected.extend(chosen_offsets);
     selected.extend(chosen_walls);
-    let mut solid = assemble_open_fragments(
+    let mut solid = profile::detail("assemble_open_fragments", || assemble_open_fragments(
         selected,
         &assembly_sources,
         &imprint,
         2e-3f64.max(scale * 5e-5),
-    )?;
+    ))?;
     os_debug!("stage: assembled open fragments {:.3}s", stage_clock.elapsed().as_secs_f64());
-    orient_open_solid_faces(&mut solid)?;
+    profile::detail("orient_open_solid_faces", || orient_open_solid_faces(&mut solid))?;
     os_debug!("stage: oriented {:.3}s", stage_clock.elapsed().as_secs_f64());
-    let connector_images = complete_sharp_offset_connectors(
+    let connector_images = profile::detail("complete_sharp_offset_connectors", || complete_sharp_offset_connectors(
         &mut solid,
         source,
         &face_images,
         distance,
         2e-3f64.max(scale * 5e-5),
-    )?;
+    ))?;
     os_debug!(
         "sharp connector completion added {} faces ({:.3}s)",
         connector_images.len(),
@@ -2584,28 +2654,28 @@ fn offset_shell_impl(
         solid.shells.retain(|shell| !shell.faces.is_empty());
     }
     face_images.extend(connector_images);
-    orient_open_solid_faces(&mut solid)?;
+    profile::detail("orient_open_solid_faces", || orient_open_solid_faces(&mut solid))?;
     // Weld curved-face offset rims that the wall fragmentation left orphaned
     // into their coplanar opening cap (cylinder / straight-hole shells). This
     // is the seam-rim consistency step the offset pipeline previously lacked.
-    let welded_rims = weld_coplanar_orphan_rims(&mut solid, 2e-3f64.max(scale * 5e-5))?;
+    let welded_rims = profile::detail("weld_coplanar_orphan_rims", || weld_coplanar_orphan_rims(&mut solid, 2e-3f64.max(scale * 5e-5)))?;
     os_debug!("welded {welded_rims} coplanar orphan rims into opening caps");
     // A rim that is not a circle: a free-form or non-iso rim whose offset image
     // falls short of the opening. It runs after every earlier weld because it
     // only ever sees rims none of them closed.
-    let rim_band = weld_free_form_rim_bands(
+    let rim_band = profile::detail("weld_free_form_rim_bands", || weld_free_form_rim_bands(
         &mut solid,
         &mut face_images,
         &carriers,
         source,
         2e-3f64.max(scale * 5e-5),
-    )?;
+    ))?;
     let rim_bands = rim_band.welded;
     os_debug!("welded {rim_bands} free-form rim bands");
     // Weld leftover coaxial coplanar rim PAIRS (a through-hole's exposed wall
     // thickness at each opening) into new planar annulus faces.
     let pair_rims =
-        weld_coplanar_rim_pair_annuli(&mut solid, &mut face_images, 2e-3f64.max(scale * 5e-5))?;
+        profile::detail("weld_coplanar_rim_pair_annuli", || weld_coplanar_rim_pair_annuli(&mut solid, &mut face_images, 2e-3f64.max(scale * 5e-5)))?;
     os_debug!("welded {pair_rims} coplanar rim pairs into annulus walls");
     if debug_enabled() {
         for (shell_index, shell) in solid.shells.iter().enumerate() {
@@ -2649,7 +2719,7 @@ fn offset_shell_impl(
     // Unify geometric duplicate arc records BEFORE completion: a ring that is
     // already covered by both its faces (frustum + apex cap) must not read as
     // an open boundary, or completion papers over it with duplicate faces.
-    let duplicate_welds = weld_duplicate_one_use_arcs(&mut solid, completion_tolerance)?;
+    let duplicate_welds = profile::detail("weld_duplicate_one_use_arcs", || weld_duplicate_one_use_arcs(&mut solid, completion_tolerance))?;
     os_debug!("welded {duplicate_welds} duplicate one-use boundary arcs");
     if debug_enabled() {
         let mut use_counts = HashMap::<u64, usize>::default();
@@ -2672,34 +2742,34 @@ fn offset_shell_impl(
                 .sum::<usize>()
         );
     }
-    let completed_images = complete_opening_boundary_cycles(
+    let completed_images = profile::detail("complete_opening_boundary_cycles", || complete_opening_boundary_cycles(
         &mut solid,
         &completion_carriers,
         &face_images,
         completion_tolerance,
-    )?;
+    ))?;
     os_debug!("completion added {} faces", completed_images.len());
     face_images.extend(completed_images);
-    let solid = merge_same_surface_faces_open(&solid, (1e-7f64).max(scale * 1e-9))?;
+    let solid = profile::detail("merge_same_surface_faces_open", || merge_same_surface_faces_open(&solid, (1e-7f64).max(scale * 1e-9)))?;
     let assembly_tolerance = 2e-3f64.max(scale * 5e-5);
     // No faceted fallback here: an offset shell must be made of real analytic
     // surfaces. Failing loudly beats silently returning a tessellated BREP
     // with destroyed face provenance.
     // A shell the rim band lane recognized but could not close fails here as it
     // always did; the refusal now carries the lane's reason.
-    let mut solid = finalize_assembled_solid(solid, assembly_tolerance).map_err(|error| {
+    let mut solid = profile::detail("finalize_assembled_solid", || finalize_assembled_solid(solid, assembly_tolerance)).map_err(|error| {
         match &rim_band.decline {
             Some(reason) => error.with_message(|message| format!("{message}; offset_shell: {reason}")),
             None => error,
         }
     })?;
-    crate::offset_retrim::reconstruct_analytic_shell(&mut solid)?;
+    profile::detail("reconstruct_analytic_shell", || crate::offset_retrim::reconstruct_analytic_shell(&mut solid))?;
     if rim_bands + pair_rims > 0 || !inward_extended_walls.is_empty() {
         // Rim welds and extended reflex walls join independently-oriented skins;
         // put the whole finalized manifold on one normal convention so the
         // shell reports its exact wall volume (coplanar-only shells keep
         // their assembled sense).
-        coheres_face_normals(&mut solid)?;
+        profile::detail("coheres_face_normals", || coheres_face_normals(&mut solid))?;
     }
     let solid = solid;
     profile::lap(&mut clock, profile::ASSEMBLY);
@@ -2863,7 +2933,7 @@ fn offset_shell_impl(
             }
         }
     }
-    let solid = super::acceptance::accept_offset_result(solid)?;
+    let solid = profile::detail("accept_offset_result", || super::acceptance::accept_offset_result(solid))?;
     profile::lap(&mut clock, profile::ACCEPTANCE);
     Ok(OffsetShellResultRecord { solid, face_images })
 }

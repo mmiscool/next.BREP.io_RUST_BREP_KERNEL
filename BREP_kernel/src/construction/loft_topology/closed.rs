@@ -297,6 +297,7 @@ pub(crate) fn loft_profile_brep_closed_shifted(
 
     let mut solid = BrepSolid {
         mass_properties_cache: Default::default(),
+        cells: Default::default(),
         id: next_id,
         vertices,
         edges,

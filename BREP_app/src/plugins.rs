@@ -420,14 +420,16 @@ impl PluginsPanel {
 
     pub fn show(&mut self, ctx: &egui::Context, engine: &mut EngineState, store: &dyn ModelStore) {
         let mut open = self.open;
-        egui::Window::new("Plugins").open(&mut open).default_width(560.0).show(ctx, |ui| {
+        egui::Window::new("Plugins").open(&mut open).default_width(560.0).default_pos(crate::panels::below_chrome(ctx, 400.0, 0.0)).show(ctx, |ui| {
             ui.label("Install trusted JavaScript package bundles. Code runs with the CAD host API; installation is separate from opening a document.");
             if let Some(error) = &self.error { ui.colored_label(egui::Color32::LIGHT_RED, error); }
             if let Some(message) = &self.message { ui.label(message); }
             if engine.plugin_installation_status()["state"] == "pending" { ui.spinner(); ui.label("Validating package registrations…"); }
             for error in engine.plugin_catalogue()["errors"].as_array().into_iter().flatten() { if let Some(error) = error.as_str() { ui.colored_label(egui::Color32::LIGHT_RED, error); } }
             ui.horizontal(|ui| {
-                ui.text_edit_singleline(&mut self.url);
+                // Labelled like the local path row below it; the field said nothing (lane U item 15).
+                ui.label("Package URL");
+                ui.add(egui::TextEdit::singleline(&mut self.url).hint_text("https://… or a github.com repository"));
                 if ui.add_enabled(self.download.is_none(), egui::Button::new("Install URL / GitHub")).clicked() {
                     match acquisition(&self.url) {
                         Ok(Acquisition::Direct(source)) => self.download = Some(Download { rx: crate::http::fetch_bytes(ctx, source.clone()), source, github: None }),

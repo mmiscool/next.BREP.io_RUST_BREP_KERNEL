@@ -73,7 +73,7 @@
 //! the curvature direction IS inside the arc and the factor is
 //! `ρ/(R + ρ) < 1`; on a bore floor's it is outside it altogether.
 
-use crate::{KernelRefusal, KernelStage, RefusalClass, SoundnessDefect, Vec3};
+use crate::{KernelRefusal, KernelStage, OrRefuse, RefusalClass, SoundnessDefect, Vec3};
 
 /// `BREP_BLEND_STATION_TRACE=1` also prints what the fold probe could not
 /// measure. A skipped station is not a clean station: on a carrier that is a
@@ -642,4 +642,126 @@ pub(super) fn check_wall_fold(
         worst.factor,
     ),
     ))
+}
+
+/// `BREP_BLEND_ROWS_LOOP_CHECK=0` skips [`check_rows_loop`] (a census hatch;
+/// unset or anything else runs it). Read once.
+fn rows_loop_check_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("BREP_BLEND_ROWS_LOOP_CHECK").as_deref() != Ok("0"))
+}
+
+/// Sub-steps of each station interval and samples across the section the
+/// rows-loop check reads.
+const ROWS_LOOP_SUBSTEPS: usize = 4;
+const ROWS_LOOP_SECTION_SAMPLES: usize = 16;
+
+/// Does the FITTED wall pass back through itself along a row?
+///
+/// The two verdicts above read the ball's centre curve and the mates'
+/// curvature — the canal surface's own folds. This one reads the surface the
+/// march actually ships, by construction rather than by sampling a mesh:
+/// between two consecutive stations the ball advances from one centre to the
+/// next, and every point of the wall's section must advance with it. A row
+/// point that moves AGAINST that advance — `(S(u_b, v) - S(u_a, v)) · m < 0`
+/// with `m` the unit centre advance, over sub-steps of the interval and
+/// samples across the section — is a row doubling back: the surface carries
+/// two parameters on one point there, which is the fold the soundness scan
+/// convicts a built face of (`face_self_intersections`) when its mesh
+/// happens to cross itself. On `fillet-mouth-over-wall-bore-5p5-r2p2` (r = 2.2
+/// on the rim where an r = 18 round meets the bore) the F2 wall's row at
+/// v = 0.156 runs x = 10.000 → 9.974 → 10.000 → 10.026 → 10.000 across the
+/// rim's midpoint, a 2.6e-2-wide loop that the 512-sample rim mesh never
+/// crossed and a 40-sample one did (2026-10-17). Asked after every open-rows
+/// fit except the exact extrusion's (a translate of one section cannot
+/// loop); the bar is `1e-7 (1 + scale)` on the backward motion, three decades
+/// above the fit's own residual. Terminal, like the verdicts above: the
+/// shape is wrong, not the lane. `span` is the pair of station indices the
+/// blend actually spans (the march's two snapped end stations); only the
+/// intervals between them are read, `None` reading them all.
+pub(super) fn check_rows_loop(
+    rows: &super::stations::FittedRows,
+    stations: &[super::stations::Station],
+    parameters: &[f64],
+    span: Option<[usize; 2]>,
+    radius: f64,
+    faces: Vec<u64>,
+    scale: f64,
+) -> Result<(), KernelRefusal> {
+    if !rows_loop_check_enabled() || rows.exact_extrusion || stations.len() < 2 || parameters.len() != stations.len() {
+        return Ok(());
+    }
+    // Only the intervals INSIDE the blend's own span are read, exactly as the
+    // march's own fold probes read only the stations between the two snapped
+    // end stations (`march_open_stations_core`): the march overshoots both
+    // ends on extended evaluation, and past a carrier's real extent the fitted
+    // rows may turn any way at all. On the 2026-10-17 shell report (a 0.5
+    // round on the torus|pad edge of a shelled box, in a group with the
+    // torus|column edge) the network's flush join stops the stripe where its
+    // pad contact crosses the pad's own rail onto the column, and the
+    // stations marched PAST that stop seat the ball on the pad's extrapolated
+    // arc, which folds back; reading them refused a wall whose shipped span
+    // was clean. `None` reads every interval (a closed loop has no ends).
+    let (low, high) = match span {
+        Some([a, b]) => (a.min(b), a.max(b)),
+        None => (0, stations.len() - 1),
+    };
+    let high = high.min(stations.len() - 1);
+    let [u0, u1] = rows.surface.domain_u().or_refuse(KernelStage::Refine, "domain")?;
+    let [v0, v1] = rows.surface.domain_v().or_refuse(KernelStage::Refine, "domain")?;
+    let (p_first, p_last) = (parameters[0], parameters[parameters.len() - 1]);
+    if !(p_last > p_first) {
+        return Ok(());
+    }
+    let to_u = |p: f64| u0 + (u1 - u0) * (p - p_first) / (p_last - p_first);
+    let bar = 1.0e-7 * (1.0 + scale);
+    let debug = std::env::var_os("BREP_DEBUG_ROWS_LOOP").is_some();
+    let mut least = f64::INFINITY;
+    for index in low..high {
+        let advance = stations[index + 1].center.sub(stations[index].center);
+        let length = advance.length();
+        if !(length > bar) {
+            continue;
+        }
+        let m = advance.scale(1.0 / length);
+        let (pa, pb) = (parameters[index], parameters[index + 1]);
+        for sub in 0..ROWS_LOOP_SUBSTEPS {
+            let qa = pa + (pb - pa) * sub as f64 / ROWS_LOOP_SUBSTEPS as f64;
+            let qb = pa + (pb - pa) * (sub + 1) as f64 / ROWS_LOOP_SUBSTEPS as f64;
+            for k in 0..=ROWS_LOOP_SECTION_SAMPLES {
+                let v = v0 + (v1 - v0) * k as f64 / ROWS_LOOP_SECTION_SAMPLES as f64;
+                let a = rows.surface.evaluate(to_u(qa), v).or_refuse(KernelStage::Refine, "evaluate")?;
+                let b = rows.surface.evaluate(to_u(qb), v).or_refuse(KernelStage::Refine, "evaluate")?;
+                let along = b.sub(a).dot(m);
+                least = least.min(along);
+                if along < -bar {
+                    return Err(wall_fold_refusal(
+                        faces,
+                        format!(
+                            "{WALL_FOLDS} {radius:.6} stands on this edge: its fitted rows pass back through \
+                             themselves between stations {index} and {} (row parameter {qa:.6}..{qb:.6}, \
+                             section parameter {v:.6}) — the row moves {:.3e} against the ball's advance, \
+                             so the wall carries two parameters on one point there",
+                            index + 1,
+                            -along
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+    if debug {
+        eprintln!(
+            "rows-loop check: {} stations, radius {radius:.6}, least advance {least:.3e} against bar {bar:.3e}, u [{u0:.6}, {u1:.6}] v [{v0:.6}, {v1:.6}]",
+            stations.len()
+        );
+    }
+    Ok(())
+}
+
+/// A fold of a FINISHED blend wall, read off its own iso-lines after the
+/// surgery (`fillet/analyze.rs::check_blend_wall_loops`); minted here so it
+/// is the one class every fold of a wall carries.
+pub(crate) fn wall_loop_refusal(face: u64, message: String) -> KernelRefusal {
+    wall_fold_refusal(vec![face], message)
 }

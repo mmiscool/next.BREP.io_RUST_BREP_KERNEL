@@ -26,7 +26,7 @@
 //!             knots_v..., n_rows, n_columns, (x, y, z, w)... row-major]
 
 use crate::topology::{
-    BodyKind, BrepSolid, CoedgeRecord, EdgeRecord, FaceRecord, LoopRecord, ShellRecord,
+    BodyKind, BrepSolid, CellRecord, CoedgeRecord, EdgeRecord, FaceRecord, LoopRecord, ShellRecord,
     VertexRecord,
 };
 use crate::{NurbsCurve, NurbsSurface, Vec3, Vec4};
@@ -88,6 +88,9 @@ fn push_surface(data: &mut Vec<f64>, surface: &NurbsSurface) {
 }
 
 pub fn encode_solid(solid: &BrepSolid) -> Result<(Vec<f64>, SolidNames), String> {
+    if !solid.cells.is_empty() && solid.kind != BodyKind::Cellular {
+        return Err("solid codec: cells require declared Cellular kind".into());
+    }
     let mut names = SolidNames::default();
     let mut data = Vec::with_capacity(4096);
     if solid.kind.is_solid() {
@@ -149,6 +152,18 @@ pub fn encode_solid(solid: &BrepSolid) -> Result<(Vec<f64>, SolidNames), String>
             }
             if let Some(name) = &face.name {
                 names.faces.insert(face.id, name.clone());
+            }
+        }
+    }
+    // Optional region trailer on a declared Cellular 1.1 image only.
+    // Cell-less 1.0/1.1 images retain their exact layout and version.
+    if !solid.cells.is_empty() {
+        data.push(solid.cells.len() as f64);
+        for cell in &solid.cells {
+            data.extend_from_slice(&[id_to_f64(cell.id)?, if cell.void { 1.0 } else { 0.0 },
+                cell.faces.len() as f64]);
+            for &(face, forward) in &cell.faces {
+                data.extend_from_slice(&[id_to_f64(face)?, if forward { 1.0 } else { 0.0 }]);
             }
         }
     }
@@ -349,6 +364,34 @@ pub fn decode_solid(data: &[f64], names: &SolidNames) -> Result<BrepSolid, Strin
             faces,
         });
     }
+    let mut cells = Vec::new();
+    if kind == BodyKind::Cellular && reader.cursor < data.len() {
+        let count = reader.next_usize()?;
+        if count == 0 || count > (data.len()-reader.cursor)/3 {
+            return Err("solid codec: invalid cell count".into());
+        }
+        for _ in 0..count {
+            let id = reader.next_id()?;
+            let void = match reader.next()? {
+                0.0 => false, 1.0 => true,
+                _ => return Err("solid codec: invalid cell void flag".into()),
+            };
+            let face_count = reader.next_usize()?;
+            if face_count > (data.len()-reader.cursor)/2 {
+                return Err("solid codec: truncated cell faces".into());
+            }
+            let mut faces = Vec::with_capacity(face_count);
+            for _ in 0..face_count {
+                let face = reader.next_id()?;
+                let forward = match reader.next()? {
+                    0.0 => false, 1.0 => true,
+                    _ => return Err("solid codec: invalid cell face sense".into()),
+                };
+                faces.push((face, forward));
+            }
+            cells.push(CellRecord { id, faces, void });
+        }
+    }
     if reader.cursor != data.len() {
         return Err("solid codec: trailing data".into());
     }
@@ -360,6 +403,7 @@ pub fn decode_solid(data: &[f64], names: &SolidNames) -> Result<BrepSolid, Strin
         shells,
         genus,
         kind,
+        cells,
     })
 }
 

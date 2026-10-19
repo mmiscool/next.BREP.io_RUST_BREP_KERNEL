@@ -223,9 +223,8 @@ fn tabs(ctx: &Ctx<'_>) -> Tabs {
 
 fn doc_new(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
     let _: NoArgs = parse_args(args)?;
-    let mut engine = ctx.app.docs.spawn_engine();
-    let _ = engine.set_history_json(crate::document::EMPTY_DOCUMENT);
-    let index = ctx.app.docs.open_document(Document::new(engine));
+    let doc = Document::fresh(ctx.app.docs.spawn_engine(), crate::document_class::DocumentClass::Normal);
+    let index = ctx.app.docs.open_document(doc);
     Ok(Outcome::Done(json!({ "index": index })))
 }
 
@@ -482,7 +481,7 @@ pub(crate) fn base64_decode(s: &str) -> Result<Vec<u8>, String> {
 }
 
 pub static COMMANDS: &[CommandSpec] = &[
-    CommandSpec { name: "doc_new", group: "document", doc: "Open a new, empty document as a tab and make it active.", phase: Phase::Mutate, annotations: Annotations::MUTATE, args_schema: schema_of::<NoArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(doc_new) },
+    CommandSpec { name: "doc_new", group: "document", doc: "Open a new document as a tab and make it active. Parts start with a datum (D) and its XY/XZ/YZ reference planes.", phase: Phase::Mutate, annotations: Annotations::MUTATE, args_schema: schema_of::<NoArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(doc_new) },
     CommandSpec { name: "doc_load", group: "document", doc: "Open a `.nbrep` document (passed as text) in a new tab, run its history and fit the camera. Returns the run report.", phase: Phase::Mutate, annotations: Annotations::MUTATE, args_schema: schema_of::<LoadArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(doc_load) },
     CommandSpec { name: "doc_json", group: "document", doc: "The active document as `.nbrep` (the history request with metadata).", phase: Phase::Read, annotations: Annotations::READ, args_schema: schema_of::<NoArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(doc_json) },
     CommandSpec { name: "doc_import", group: "document", doc: "Append an Import 3D Model feature from STEP / IGES text or STL / OBJ / 3MF bytes (base64). STL, OBJ and 3MF go through mesh reconstruction on the runner; a 3MF is read to the 3MF core specification and its build instances are flattened first.", phase: Phase::Mutate, annotations: Annotations::MUTATE, args_schema: schema_of::<ImportArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(doc_import) },

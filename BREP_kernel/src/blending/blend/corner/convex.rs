@@ -111,6 +111,26 @@ pub fn round_convex_corner(
             }
         }
     }
+    // A STEP face in a wall's own plane, facing the other way, is not a wall
+    // of this corner: the walls of one convex corner bound ONE material
+    // wedge, so no two of them are antiparallel. The 2026-10-17 slab report
+    // (`tests/suites/inbox_20261017_fillet_slab_corner_sphere.rs`): the
+    // r = 0.8 round of a slab's short end-face edge exposes, in the end
+    // face's plane y = 10, the box material standing behind the slab, as a
+    // planar face facing −y 2.4 (3·r) from the corner — inside the 6·r
+    // window above. The scan then read four normals (+z, −x, +y, −y), the
+    // least-squares ball had no root, and `round_general_star` refused a
+    // three-wall corner, so the corner stayed as the flat-capped edge rounds.
+    // Prune by the same proof the curved-wall root uses: drop one member of
+    // each antiparallel pair, in every combination, and keep the one triple
+    // whose three tangent vertices `C + r·nᵢ` the edge rounds left behind.
+    // No antiparallel pair, a triple already, or no / several proven triples
+    // leave the scan as it was.
+    if normals.len() > 3 {
+        if let Some(walls) = prune_step_walls(&result, corner, radius, &normals) {
+            normals = walls;
+        }
+    }
     // CURVED-WALL star corners (§6.9.7): one wall is a CYLINDER through the
     // corner (e.g. a bulged prism wall meeting two planes at a vertex).  The
     // corner-ball construction generalizes cleanly — C sits at distance r
@@ -590,11 +610,55 @@ pub fn round_convex_corner(
     let corner_scope = corner.sub(c).length() + 2.0 * radius;
     let corner_dir = corner.sub(c);
     let near_side_limit = -0.5 * radius * corner_dir.length();
+    // The NOTCH of a trihedral corner: the corner side of the three fillets'
+    // tangent-circle planes (through C, normal nᵢ × nⱼ, oriented toward the
+    // corner — the plane the per-fillet rebuild below cuts each wall at). A
+    // planar face in a WALL's own plane (through the corner) with a vertex
+    // past any of them is that wall's remnant beyond its contact lines, not
+    // notch junk, however small and close: the 2026-10-17 slab report's end
+    // face kept 0.95 of area between two r = 0.8 rounds and an r = 5 arc,
+    // every vertex inside the scope ball and the near-side limit, and was
+    // swallowed as a cap — four open edges, and the corner stayed flat. The
+    // tangent points sit ON two planes and strictly inside the third (the
+    // triple product fixes the sign), so a wall remnant inside the notch —
+    // the first round's bulkhead quarter-disc in the x = 0 wall — is still
+    // removed. N > 3 stars keep the scope rules alone.
+    let notch_axes: Vec<Vec3> = if n_faces == 3 {
+        [(0usize, 1usize), (1, 2), (0, 2)]
+            .into_iter()
+            .filter_map(|(i, j)| normals[i].cross(normals[j]).normalized().ok())
+            .map(|axis| if corner_dir.dot(axis) < 0.0 { axis.scale(-1.0) } else { axis })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let wall_remnant = |face: &FaceRecord| -> bool {
+        if notch_axes.is_empty() {
+            return false;
+        }
+        let Some(crate::AnalyticSurface::Plane { origin, u_dir, v_dir, .. }) = face.surface.analytic() else {
+            return false;
+        };
+        let Ok(n) = u_dir.cross(*v_dir).normalized() else {
+            return false;
+        };
+        if n.dot(corner.sub(*origin)).abs() > 1e-6 {
+            return false;
+        }
+        face.loops.iter().flat_map(|l| &l.coedges).any(|co| {
+            coedge_ends_3d(co)
+                .map(|(a, b)| {
+                    notch_axes.iter().any(|axis| a.sub(c).dot(*axis) < -plane_tol || b.sub(c).dot(*axis) < -plane_tol)
+                })
+                .unwrap_or(false)
+        })
+    };
     let candidate_cap = |face: &FaceRecord| -> bool {
         matches!(
             face.surface.analytic(),
             Some(crate::AnalyticSurface::Plane { .. })
-        ) && face.loops.iter().flat_map(|l| &l.coedges).all(|co| {
+        ) && !wall_remnant(face)
+            && face.loops.iter().flat_map(|l| &l.coedges).all(|co| {
             coedge_ends_3d(co)
                 .map(|(a, b)| {
                     a.sub(c).length() <= corner_scope
@@ -960,4 +1024,52 @@ pub fn round_convex_corner(
         ));
     }
     Ok(result)
+}
+
+/// The three walls among `normals` (more than three outward plane normals
+/// through the corner, at least one antiparallel pair) proven by their
+/// tangent vertices: for every way of dropping one member of each
+/// antiparallel pair that leaves exactly three normals, the ball at distance
+/// `r` inside all three planes (`offset_plane_triple`) must have its three
+/// tangent points `C + r·nᵢ` as vertices of `solid` (to 1e-6). `Some` only
+/// when exactly one such triple exists; a scan without an antiparallel pair,
+/// or with none or several proven triples, is `None` and left alone.
+fn prune_step_walls(solid: &BrepSolid, corner: Vec3, radius: f64, normals: &[Vec3]) -> Option<Vec<Vec3>> {
+    let mut pairs: Vec<(usize, usize)> = Vec::new();
+    for i in 0..normals.len() {
+        for j in (i + 1)..normals.len() {
+            if normals[i].dot(normals[j]) < -(1.0 - 1e-6)
+                && !pairs.iter().any(|(a, b)| *a == i || *b == i || *a == j || *b == j)
+            {
+                pairs.push((i, j));
+            }
+        }
+    }
+    if pairs.is_empty() || normals.len() - pairs.len() != 3 {
+        return None;
+    }
+    let has_vertex = |ideal: Vec3| solid.vertices.iter().any(|v| v.point.sub(ideal).length() < 1e-6);
+    let mut proven: Vec<Vec<Vec3>> = Vec::new();
+    for choice in 0..(1usize << pairs.len()) {
+        let dropped: Vec<usize> = pairs
+            .iter()
+            .enumerate()
+            .map(|(k, (i, j))| if choice & (1 << k) == 0 { *j } else { *i })
+            .collect();
+        let kept: Vec<Vec3> = (0..normals.len()).filter(|i| !dropped.contains(i)).map(|i| normals[i]).collect();
+        if kept.len() != 3 {
+            continue;
+        }
+        let Ok(centre) = offset_plane_triple(corner, [kept[0], kept[1], kept[2]], [-radius; 3]) else {
+            continue;
+        };
+        if kept.iter().all(|n| has_vertex(centre.add(n.scale(radius)))) {
+            proven.push(kept);
+        }
+    }
+    if proven.len() == 1 {
+        proven.pop()
+    } else {
+        None
+    }
 }

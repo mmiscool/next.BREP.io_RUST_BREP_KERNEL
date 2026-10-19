@@ -1,6 +1,6 @@
 [package]
 name = "BREP_kernel"
-version = "0.9.0"
+version = "0.10.0"
 edition = "2021"
 license-file = "LICENSE.md"
 description = "A boundary representation (BREP) geometry kernel for building CAD applications."
@@ -42,7 +42,7 @@ overflow-checks = false # no arithmetic overflow checks in hot paths
 [dependencies]
 # Robust single-region surface fitting for the Refit Faces edit (the same
 # RANSAC + least-squares pass the mesh import runs). A geometry leaf: no cycle.
-BREP_RANSAC = { version = "0.1.4", path = "../BREP_RANSAC" }
+BREP_RANSAC = { version = "0.1.5", path = "../BREP_RANSAC" }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 slotmap = "1"

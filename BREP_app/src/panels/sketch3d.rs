@@ -37,6 +37,8 @@ pub struct Sketch3dPanel {
 }
 
 impl Sketch3dPanel {
+    pub(crate) fn clear_context_hits(&mut self) { self.ctx_hits.clear(); }
+    pub(crate) fn clear_list_hits(&mut self) { self.list_hits.clear(); }
     pub fn new() -> Self {
         Self::default()
     }
@@ -131,11 +133,15 @@ impl Sketch3dPanel {
         ));
 
         let subtitle = format!("{} selected", state.sketch3d_selection_count());
-        let clicked = egui::Frame::popup(ui.style())
+        let clicked = if crate::viewport::touch::compact(ui.ctx()) {
+            action_rail(ui, Some("3D sketch actions"), Some(&subtitle), &items, &mut self.ctx_hits)
+        } else {
+            egui::Frame::popup(ui.style())
             .show(ui, |ui| {
                 action_rail(ui, Some("3D sketch actions"), Some(&subtitle), &items, &mut self.ctx_hits)
             })
-            .inner;
+            .inner
+        };
 
         match clicked.as_deref() {
             Some(key) if key.starts_with("constraint:") => {

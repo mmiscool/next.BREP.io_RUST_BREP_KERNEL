@@ -13,7 +13,7 @@
 //! test host), which is what the tools' docs say.
 use crate::automation::command::{Envelope as AppEnvelope, Reply as AppReply};
 use crate::automation::queue::AutomationQueue;
-use brep_mcp_core::host::{Backend, Envelope, HostInfo, HostRequest, Reply};
+use brep_mcp_core::host::{Backend, Envelope, HostInfo, HostRequest, NativePlatform, Reply};
 use brep_mcp_core::server::BrepServer;
 use serde_json::{json, Value};
 use std::net::TcpListener;
@@ -322,7 +322,7 @@ pub fn start(queue: Arc<AutomationQueue>, adapter: String, launch: Launch) -> Re
                     height: 0.0,
                     ppp: 1.0,
                 };
-                let server = BrepServer::new(launch.session_root, Backend::Attached { tx, info });
+                let server = BrepServer::new(launch.session_root, Backend::Attached { tx, info, platform: Arc::new(NativePlatform) });
                 // Attach now: the first `tools/list` must already carry the
                 // app's commands (the HTTP transport may answer statelessly).
                 match server.attach(true).await {

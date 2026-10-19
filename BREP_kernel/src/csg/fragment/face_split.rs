@@ -284,6 +284,7 @@ fn fragment_face_stages(
         .copied()
         .unwrap_or(&[]);
     if piece_ids.is_empty() {
+        profile.uncut_probe_faces += 1;
         let u = KnotVector::new(face.surface.knots_u.clone(), face.surface.degree_u).or_refuse(KernelStage::Fragment, "new")?.domain();
         let v = KnotVector::new(face.surface.knots_v.clone(), face.surface.degree_v).or_refuse(KernelStage::Fragment, "new")?.domain();
         let uv = Vec2 {
@@ -330,6 +331,7 @@ fn fragment_face_stages(
                 test_point: face.surface.evaluate(uv.x, uv.y).or_refuse(KernelStage::Fragment, "evaluate")?,
                 test_uv: uv,
                 extra_test_points,
+                order: None,
             }];
             profile.untouched += profile.lap(lap_start);
             return Ok(untouched);
@@ -734,11 +736,11 @@ fn fragment_face_arranged(
             .windows(2)
             .map(|pair| (pair[0], pair[1]))
             .collect::<Vec<_>>();
-        for pair in points.windows(2) {
+        for (segment_index, pair) in points.windows(2).enumerate() {
             segments.push(Segment2 {
                 a: pair[0],
                 b: pair[1],
-                tag: json!({ "chain": chain_index }),
+                tag: json!({ "chain": chain_index, "seg": segment_index }),
             });
         }
         chains.push(Chain {
@@ -1398,7 +1400,7 @@ fn fragment_face_arranged(
             segments.push(Segment2 {
                 a,
                 b,
-                tag: json!({ "chain": chain_index }),
+                tag: json!({ "chain": chain_index, "seg": 0 }),
             });
             chains.push(Chain {
                 source,
@@ -2128,18 +2130,20 @@ fn fragment_face_arranged(
             chains[ci].count = new_segments.len();
             chains[ci].segments = new_segments.clone();
             segments.retain(|s| s.tag["chain"].as_u64() != Some(ci as u64));
-            for (a, b) in new_segments {
+            for (segment_index, (a, b)) in new_segments.into_iter().enumerate() {
                 segments.push(Segment2 {
                     a,
                     b,
-                    tag: json!({ "chain": ci }),
+                    tag: json!({ "chain": ci, "seg": segment_index }),
                 });
             }
         }
     }
     profile.dedup_bridge += profile.lap(lap_start);
+    profile.arranged_faces += 1;
     let regions = arrange_segments(&segments, arrangement_tolerance).or_refuse(KernelStage::Fragment, "arrange_segments")?;
     profile.arrange += profile.lap(lap_start);
+    profile.region_faces += 1;
     // Orient every rebuilt loop the way the SOURCE face's own loops are
     // oriented, rather than assuming `same_sense` predicts it. The two agree on
     // every face whose chart is right-handed against its normal, so this is a
@@ -2163,6 +2167,10 @@ fn fragment_face_arranged(
     }
     let mut fragments = Vec::new();
     for region in regions {
+        let order = FragmentOrder {
+            area: region.outer_area,
+            key: super::loops::region_topology_key(&region.outer, &region.holes),
+        };
         let mut region_lap = profile.enabled.then(Instant::now);
         let arranged: Vec<Vec2> = interior_points(&region.outer, &region.holes, region.area, 3);
         let interior_ms = profile.lap(&mut region_lap).as_secs_f64() * 1000.0;
@@ -2275,6 +2283,7 @@ fn fragment_face_arranged(
             test_point: face.surface.evaluate(test_uv.x, test_uv.y).or_refuse(KernelStage::Fragment, "evaluate")?,
             test_uv,
             extra_test_points,
+            order: Some(order),
         });
     }
 
@@ -2448,6 +2457,7 @@ fn fragment_face_arranged(
                 test_point: face.surface.evaluate(uv.x, uv.y).or_refuse(KernelStage::Fragment, "evaluate")?,
                 test_uv: uv,
                 extra_test_points,
+                order: None,
             });
         }
     }
@@ -2460,13 +2470,103 @@ pub fn fragment_solid(
     operand: u8,
     imprint: &ImprintResultRecord,
 ) -> Result<Vec<FaceFragmentRecord>, KernelRefusal> {
+    fragment_solid_against(solid, operand, imprint, None)
+}
+
+/// A positive rational carrier is enclosed by its control hull. Unknown or
+/// non-finite weights/points cannot certify separation and keep the full path.
+pub(crate) fn bounded_carriers(solid: &BrepSolid) -> bool {
+    solid.shells.iter().flat_map(|s| &s.faces).all(|face| bounded_carrier(face))
+}
+
+fn bounded_carrier(face: &FaceRecord) -> bool {
+    let (Ok(u), Ok(v)) = (face.surface.domain_u(), face.surface.domain_v()) else { return false };
+    let positive_finite = |p: &crate::Vec4| {
+        p.w > 0.0 && p.w.is_finite() && p.point().is_ok_and(|v|
+            v.x.is_finite() && v.y.is_finite() && v.z.is_finite())
+    };
+    // Extended trims may live outside the carrier hull. Positive pcurve
+    // controls within both knot domains certify the whole trim stays inside;
+    // otherwise retain the existing extension/seam handling, without epsilon.
+    face.surface.control_points.iter().flatten().all(positive_finite)
+        && face.loops.iter().flat_map(|lp| &lp.coedges).all(|coedge| {
+            coedge.pcurve.control_points.iter().all(|p| {
+                positive_finite(p) && p.point().is_ok_and(|p|
+                    p.x >= u[0] && p.x <= u[1] && p.y >= v[0] && p.y <= v[1])
+            })
+        })
+}
+
+/// Exact control-hull separation, including the extended-trim guard.
+pub(crate) fn face_separated(face: &FaceRecord, bounds: crate::Aabb, band: f64) -> bool {
+    bounded_carrier(face) && crate::Aabb::from_surface_controls(&face.surface)
+        .is_ok_and(|own| !own.intersects(bounds, band))
+}
+
+/// A boundary witness suffices when the ENTIRE carrier is separated from the
+/// other operand: every point of the face has the same Outside classification.
+/// Keep the authored loops exactly; no interior-point search or arrangement
+/// is needed to decide material against an operand outside this carrier box.
+fn separated_fragment(face: &FaceRecord, operand: u8) -> Option<FaceFragmentRecord> {
+    let coedge = face.loops.first()?.coedges.first()?;
+    let [a, b] = coedge.pcurve.domain().ok()?;
+    let point = coedge.pcurve.evaluate(a + (b - a) * 0.5).ok()?;
+    let uv = Vec2 { x: point.x, y: point.y };
+    let test_point = face.surface.evaluate(uv.x, uv.y).ok()?;
+    Some(FaceFragmentRecord {
+        operand, source_face_id: face.id, surface: face.surface.clone(),
+        same_sense: face.same_sense,
+        loops: face.loops.iter().map(|lp| FragmentLoop {
+            coedges: lp.coedges.iter().map(|coedge| FragmentCoedge {
+                source: FragmentEdgeSource::Boundary { operand, edge_id: coedge.edge_id },
+                forward: coedge.forward, pcurve: coedge.pcurve.clone(),
+            }).collect(),
+        }).collect(),
+        test_point, test_uv: uv, extra_test_points: Vec::new(), order: None,
+    })
+}
+
+pub(crate) fn fragment_solid_against(
+    solid: &BrepSolid,
+    operand: u8,
+    imprint: &ImprintResultRecord,
+    other: Option<(crate::Aabb, f64)>,
+) -> Result<Vec<FaceFragmentRecord>, KernelRefusal> {
+    let mut profile = FragmentProfile::new();
+    let result = fragment_solid_profiled(solid, operand, imprint, other, &mut profile);
+    profile.report(operand);
+    result
+}
+
+pub(super) fn fragment_solid_profiled(
+    solid: &BrepSolid,
+    operand: u8,
+    imprint: &ImprintResultRecord,
+    other: Option<(crate::Aabb, f64)>,
+    profile: &mut FragmentProfile,
+) -> Result<Vec<FaceFragmentRecord>, KernelRefusal> {
     let index = FragmentIndex::build(imprint);
     let mut fragments = Vec::new();
-    let mut profile = FragmentProfile::new();
     for face in solid.shells.iter().flat_map(|shell| shell.faces.iter()) {
-        fragments.extend(fragment_face_indexed(solid, operand, face, &index, &mut profile)?);
+        let far = other.is_some_and(|(bounds, band)| face_separated(face, bounds, band));
+        if !far { profile.box_candidates += 1; }
+        let has_pieces = index.by_face.get(&(operand, face.id)).is_some_and(|ids| !ids.is_empty());
+        let cosurface = index.cosurface_pairs.iter().any(|(key, _)| key.operand == operand && key.face_id == face.id);
+        if far && !has_pieces && !cosurface && std::env::var("BREP_FRAGMENT_SCOPE").as_deref() != Ok("0") {
+            if let Some(fragment) = separated_fragment(face, operand) {
+                profile.separated_faces += 1;
+                profile.face_done(face.id, None);
+                fragments.push(fragment);
+                continue;
+            }
+        }
+        let before = (profile.arranged_faces, profile.region_faces);
+        fragments.extend(fragment_face_indexed(solid, operand, face, &index, profile)?);
+        if far {
+            profile.far_arranged += profile.arranged_faces - before.0;
+            profile.far_regions += profile.region_faces - before.1;
+        }
     }
-    profile.report(operand);
     Ok(fragments)
 }
 

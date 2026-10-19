@@ -36,6 +36,7 @@ pub(super) fn standalone_face(solid: &BrepSolid, face_id: u64) -> Result<BrepSol
         .collect();
     Ok(BrepSolid {
         mass_properties_cache: Default::default(),
+        cells: Default::default(),
         id: solid.id,
         vertices,
         edges,
@@ -55,6 +56,13 @@ pub(super) fn standalone_face(solid: &BrepSolid, face_id: u64) -> Result<BrepSol
 /// Keep the source face itself for the outer skin and distance classification.
 pub(super) fn offset_support_collapsed(face: &FaceRecord, distance: f64) -> Result<bool, KernelRefusal> {
     use crate::AnalyticSurface;
+    // Existing analytic carriers keep their established radius-collapse bar.
+    // Only the newly recognized chart uses the generic scan's fold factor.
+    if face.surface.analytic().is_none() {
+        if let Some(factor) = certified_sphere_offset_factor(face, distance)? {
+            return Ok(factor <= COLLAPSE_FACTOR);
+        }
+    }
     let (center, axis, radius) = match face.surface.analytic() {
         Some(AnalyticSurface::Sphere { frame, radius }) => (frame.origin, None, *radius),
         Some(AnalyticSurface::RuledRevolution {
@@ -94,6 +102,35 @@ pub(super) fn offset_support_collapsed(face: &FaceRecord, distance: f64) -> Resu
 /// which is why both read it through the shared scan; the fitted supports this
 /// lane sees carry curvature noise far under that.
 pub(super) const COLLAPSE_FACTOR: f64 = 1e-6;
+
+/// A proved sphere has constant principal curvature even where its chart
+/// collapses to a pole. The native 814 chart transposes the usual sphere:
+/// generic curvature at its explicit pole coedge reads O(1e15) from roundoff,
+/// inventing a discontinuous fold locus on a sphere of radius 37.31.
+/// Recognize the same net in either chart and calibrate its radius change at
+/// a regular station with the shared outward-normal evaluator. No fold
+/// threshold or non-spherical scan changes.
+fn certified_sphere_offset_factor(face: &FaceRecord, distance: f64) -> Result<Option<f64>, KernelRefusal> {
+    if std::env::var("BREP_OFFSET_FOLD_CHART").as_deref() == Ok("0") {
+        return Ok(None);
+    }
+    let mut geometry = face.surface.analytic().and_then(|shape| shape.sphere_geometry());
+    if geometry.is_none() && face.surface.degree_u == 2 && face.surface.degree_v == 2 {
+        let transposed = crate::offset::transpose_offset_surface(&face.surface)?;
+        geometry = transposed.analytic().and_then(|shape| shape.sphere_geometry());
+    }
+    let Some((center, radius)) = geometry else { return Ok(None); };
+    let [u0,u1] = face.surface.domain_u().or_refuse(KernelStage::Refine, "domain_u")?;
+    let [v0,v1] = face.surface.domain_v().or_refuse(KernelStage::Refine, "domain_v")?;
+    let sample = crate::OffsetEvaluator::new("offset_shell", &face.surface,
+        crate::OffsetNormal::FaceStable { same_sense: face.same_sense })
+        .at((u0+u1)*0.5, (v0+v1)*0.5, -distance).or_refuse(KernelStage::Refine, "at")?;
+    let alignment = sample.normal.dot(sample.source.sub(center)) / radius;
+    if alignment.abs() < 0.5 { return Ok(None); }
+    let factor = 1.0 - distance * alignment.signum() / radius;
+    os_debug!("certified sphere factor face {}: {factor:.12} radius={radius:.12}", face.id);
+    Ok(Some(factor))
+}
 
 /// The displacement along the parametrization normal `Su × Sv` that offset
 /// shell's signed `distance` means for this face.
@@ -268,6 +305,9 @@ pub(super) fn carve_folded_support(
     distance: f64,
 ) -> Result<Option<CarvedSupport>, KernelRefusal> {
     if distance == 0.0 || face.surface.is_affine().or_refuse(KernelStage::Refine, "is_affine")? {
+        return Ok(None);
+    }
+    if certified_sphere_offset_factor(face, distance)?.is_some_and(|factor| factor > COLLAPSE_FACTOR) {
         return Ok(None);
     }
     let loops = face
@@ -634,6 +674,7 @@ pub(super) fn carrier_solid_sided_lane(
     Ok((
         BrepSolid {
             mass_properties_cache: Default::default(),
+            cells: Default::default(),
             id: 1,
             vertices: carrier.vertices,
             edges: carrier.edges,
@@ -896,7 +937,7 @@ fn skin_distance_to_trimmed_face(
 
 /// Distance from a point to a TRIMMED face: surface projection when it lands
 /// inside the trim, otherwise the nearest point on the face's boundary edges.
-fn distance_to_trimmed_face(
+pub(super) fn distance_to_trimmed_face(
     face: &FaceRecord,
     edges: &[&EdgeRecord],
     point: Vec3,

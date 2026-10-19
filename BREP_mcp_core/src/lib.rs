@@ -29,15 +29,28 @@
 //! - [`host`]    — the host protocol: envelopes, replies, the backend seam.
 //! - [`session`] — one app instance under one host, its directory and recorder.
 //! - [`plm_fixture`] — a real `brep-plm serve` a script runs against (`plm`).
+//!
+//! Feature `server` (default) is the server: the protocol, the transports,
+//! the runner, the generated docs, the PLM fixture, and the native
+//! [`host::Platform`]. Without it the crate is the tool set over the host
+//! protocol alone, for a host that supplies its own platform — the browser
+//! build of the app (`BREP_app/src/webmcp.rs`), which compiles this for
+//! wasm32 so a page serves the same tools the desktop does.
+#[cfg(feature = "server")]
 pub mod generate;
 pub mod host;
+#[cfg(feature = "server")]
 pub mod http;
 pub mod image;
+#[cfg(feature = "server")]
 pub mod plm_fixture;
+#[cfg(feature = "server")]
 pub mod render_mesh;
+#[cfg(feature = "server")]
 pub mod runner;
 pub mod schema;
 pub mod script;
+#[cfg(feature = "server")]
 pub mod server;
 pub mod session;
 pub mod tools;

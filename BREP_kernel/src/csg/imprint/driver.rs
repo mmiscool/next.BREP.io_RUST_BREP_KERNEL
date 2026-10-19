@@ -1282,6 +1282,25 @@ pub(crate) fn build_carrier_imprints(
     build_imprints_impl(solid_a, solid_b, options, true, super::pcurve_cache::enabled())
 }
 
+/// `BREP_IMPRINT_PLANE_POINT_SKIP` (lane X row 5): skip the march for two
+/// exact parallelogram faces whose contact is one point
+/// ([`super::support::planar_point_contact`]) once their seeds are accepted.
+/// On by default; `0`/`off` disables it.
+pub(super) fn plane_point_skip_enabled() -> bool {
+    let enabled = !matches!(std::env::var("BREP_IMPRINT_PLANE_POINT_SKIP").as_deref(), Ok("0") | Ok("off"));
+    enabled
+}
+
+thread_local! {
+    static PLANE_POINT_SKIPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Pairs skipped by [`plane_point_skip_enabled`] on this thread since the last call.
+pub(super) fn take_plane_point_skips() -> u64 {
+    PLANE_POINT_SKIPS.with(|count| count.replace(0))
+}
+
+
 pub(super) fn build_imprints_impl(
     solid_a: &BrepSolid,
     solid_b: &BrepSolid,
@@ -1289,7 +1308,11 @@ pub(super) fn build_imprints_impl(
     open_carriers: bool,
     pcurve_cache: bool,
 ) -> Result<ImprintResultRecord, KernelRefusal> {
+    let classify_before = crate::pair_classification::classify_reads();
+    let setup_started = std::env::var_os("BREP_PROFILE").is_some().then(Instant::now);
     let _pcurve_cache = super::pcurve_cache::FitCacheScope::open(pcurve_cache);
+    let reuse_whole_miss = open_carriers &&
+        std::env::var("BREP_OFFSET_IMPRINT_READINGS").map_or(true, |v| v != "0" && v != "off");
     let mut section_evidence = false;
     let edges = edge_map(solid_a, solid_b);
     let mut builder = ImprintBuilder {
@@ -1384,11 +1407,11 @@ pub(super) fn build_imprints_impl(
     // reused across every pair the face participates in.
     let first_classify = first_faces
         .iter()
-        .map(|tagged| SurfaceClassifyData::build(&tagged.face.surface, options.tolerance))
+        .map(|tagged| SurfaceClassifyData::memoized(&tagged.face.surface, options.tolerance))
         .collect::<Result<Vec<_>, _>>().or_refuse(KernelStage::Intersect, "csg.imprint.driver")?;
     let second_classify = second_faces
         .iter()
-        .map(|tagged| SurfaceClassifyData::build(&tagged.face.surface, options.tolerance))
+        .map(|tagged| SurfaceClassifyData::memoized(&tagged.face.surface, options.tolerance))
         .collect::<Result<Vec<_>, _>>().or_refuse(KernelStage::Intersect, "csg.imprint.driver")?;
     let mut face_edge_lists: HashMap<FaceKey, Vec<&EdgeRecord>> = HashMap::default();
     for tagged in first_faces.iter().chain(second_faces.iter()) {
@@ -1410,6 +1433,7 @@ pub(super) fn build_imprints_impl(
             None => edge_subcurve(edge),
         }
     };
+    if let Some(started) = setup_started { eprintln!("imprint.setup ms={:.3} faces={} classify_reads={}", started.elapsed().as_secs_f64()*1000.0, first_faces.len()+second_faces.len(), crate::pair_classification::classify_reads()-classify_before); }
     let mut profile = ImprintProfile::new();
     let mut march_swap_rescues = 0_u64;
     let mut clip_swap_rescues = 0_u64;
@@ -1454,6 +1478,10 @@ pub(super) fn build_imprints_impl(
             // that cannot get through a node must refuse in the tangent-node
             // class naming the node, not leak its own step-budget message.
             let mut tangent_node: Option<Vec3> = None;
+            // The pair's branches came from the sub-gate re-march below: a
+            // run end that stalls in the tangency band then lands on a trim
+            // edge the carriers share exactly as a tangent-node pair's does.
+            let mut grazing_march = false;
             let mut lap_start = None;
             profile.lap(&mut lap_start);
             let pair_classification = classify_surface_pair_cached(
@@ -1552,10 +1580,19 @@ pub(super) fn build_imprints_impl(
                     let seam = source.face.loops.iter().flat_map(|loop_record| &loop_record.coedges)
                         .filter(|coedge| coedge.edge_id == edge.id).count() >= 2;
                     if spans.is_empty() && exact_section && !seam {
-                        for span in curve_spans_on_face(
-                            curve, target.face, &face_edge_lists[&target.key()],
-                            options.tolerance, false,
-                        )? {
+                        // The whole-only call above returned empty: its exact
+                        // curve/carrier reading was false. Nothing has mutated.
+                        let partial = if reuse_whole_miss {
+                            profile.whole_reading_reuses += 1;
+                            curve_spans_after_whole_miss(
+                                curve, target.face, &face_edge_lists[&target.key()], options.tolerance,
+                            )?
+                        } else {
+                            curve_spans_on_face(
+                                curve, target.face, &face_edge_lists[&target.key()], options.tolerance, false,
+                            )?
+                        };
+                        for span in partial {
                             deferred_boundary_spans.push((span, first, second, target));
                         }
                     }
@@ -1873,6 +1910,12 @@ pub(super) fn build_imprints_impl(
             // interval. It cannot tolerate a section fit that misses either
             // crossing, even when a coarse whole-model distance looks small.
             let mut paired_grazing_crossings = false;
+            // Every hit the seed gate rejected, for the whole pair: the
+            // point, its `|tan·n|`, the edge (its operand, its id) and the
+            // parameter on it, and whether that edge belongs to `first`.
+            // Read only when the march comes back empty, below, where the
+            // genuine crossings among them are told from lies-on samples.
+            let mut grazing_hits: Vec<(Vec3, f64, u8, u64, f64, bool)> = Vec::new();
             for (face, other_march, other) in
                 [(first, second_march, second), (second, first_march, first)]
             {
@@ -1881,6 +1924,41 @@ pub(super) fn build_imprints_impl(
                         continue;
                     }
                     let mut grazing_crossings: Vec<Vec3> = Vec::new();
+                    // LIES-ON SKIP (2026-10-17, the shelled-box report's
+                    // offset bore against the offset blend walls): an edge
+                    // that LIES ON the other carrier — the test the exchange
+                    // stage above already trusted to hand the whole edge over
+                    // as a shared span — returns a hit per sample from
+                    // `intersect_curve_surface`, every one grazing (|tan.n| = 0
+                    // on a curve in the surface) and every one rejected: three
+                    // such edges answered 8 580 of that pair's 8 586 seed hits
+                    // at 0.36 s. Such an edge contributes no seed, no tangency
+                    // minimum and no section evidence; its one effect is the
+                    // paired-grazing flag, set when two of its grazing points
+                    // sit more than the weld apart, which is reproduced here
+                    // from the edge's own extent. `BREP_IMPRINT_LIES_ON_SEED_SKIP=0`
+                    // runs the solve as before.
+                    if lies_on_seed_skip_enabled() {
+                        let subcurve = cached_subcurve(face.operand, edge)?;
+                        if super::support::curve_lies_on_surface(&subcurve, other_march, options.tolerance)? {
+                            let [start, end] = subcurve.domain().or_refuse(KernelStage::Intersect, "domain")?;
+                            let mut probes = Vec::with_capacity(5);
+                            for fraction in [0.0, 0.25, 0.5, 0.75, 1.0] {
+                                probes.push(subcurve.evaluate(start + (end - start) * fraction).or_refuse(KernelStage::Intersect, "evaluate")?);
+                            }
+                            let weld = assembler_weld(options.tolerance);
+                            if probes.iter().any(|a| probes.iter().any(|b| a.sub(*b).length() > weld)) {
+                                paired_grazing_crossings = true;
+                            }
+                            if debug_pairs {
+                                eprintln!(
+                                    "pair {}x{}: seed edge {} lies on the other carrier — seed solve skipped",
+                                    first.face.id, second.face.id, edge.id
+                                );
+                            }
+                            continue;
+                        }
+                    }
                     for hit in intersect_curve_surface(&edge.curve, other_march, options.tolerance).or_refuse(KernelStage::Intersect, "intersect_curve_surface")?
                     {
                         if hit.t < edge.t0 - 1e-9 || hit.t > edge.t1 + 1e-9 {
@@ -1951,11 +2029,34 @@ pub(super) fn build_imprints_impl(
                                 paired_grazing_crossings = true;
                             }
                             grazing_crossings.push(hit.point);
+                            grazing_hits.push((
+                                hit.point,
+                                tangent.dot(normal).abs(),
+                                face.operand,
+                                edge.id,
+                                hit.t,
+                                face.operand == first.operand && face.face.id == first.face.id,
+                            ));
                         }
                     }
                 }
             }
             profile.seeds += profile.lap(&mut lap_start);
+            // POINT CONTACT (`BREP_IMPRINT_PLANE_POINT_SKIP`, lane X row 5):
+            // two exact parallelograms meeting at one point have no section
+            // curve. Once a seed is accepted the pair's contact evidence is
+            // already recorded and the march could only trace that point, so
+            // it is skipped; an unseeded pair still marches.
+            if !seed_points.is_empty()
+                && plane_point_skip_enabled()
+                && super::support::planar_point_contact(&first.face.surface, &second.face.surface, options.tolerance) == Some(true)
+            {
+                PLANE_POINT_SKIPS.with(|count| count.set(count.get() + 1));
+                if debug_pairs {
+                    eprintln!("pair {}x{}: planar point contact, march skipped", first.face.id, second.face.id);
+                }
+                continue;
+            }
             profile.marched_pairs += 1;
             if debug_pairs {
                 eprintln!(
@@ -2198,6 +2299,179 @@ pub(super) fn build_imprints_impl(
                     branches.iter().map(|b| b.points.len()).collect::<Vec<_>>()
                 );
             }
+            // GRAZING PIERCE, NO SECTION (2026-10-17, the revolve-into-bore
+            // report). A trim edge of one face pierces the other carrier at
+            // an angle below the seed gate, inside BOTH trims, and the pair
+            // marched nothing: the pierce proves a section crosses the faces
+            // there, the empty march says the crossing is too near tangency
+            // for the marcher's start gate to admit (the -4° revolve of a
+            // bored box's top face about its back edge, unioned back: the
+            // torus hole wall continues the bore tangentially along their
+            // shared rim and crosses it again at 0.002 rad — a third-order
+            // contact, `boolean::attribute_to_tangent_node`). Nothing is
+            // imprinted here; the contact is RECORDED, with the faces across
+            // the pierced edges, so a tear downstream of it is attributed to
+            // the contact in the tangent-node class — which declines the
+            // perturbation ladder — instead of leaking as an anonymous
+            // open-edge arrangement and burning the ladder's rungs (12.5 s
+            // on the report, every rung refused by its mirror). A pair whose
+            // pierce the trims do not both contain is left alone, as is one
+            // with an accepted seed: those pairs the march could and should
+            // have answered. `BREP_GRAZING_PIERCE_RECORD=0` is the hatch.
+            if branches.is_empty()
+                && seed_points.is_empty()
+                && !grazing_hits.is_empty()
+                && options.tangent_curve_lane
+                && std::env::var("BREP_GRAZING_PIERCE_RECORD").as_deref() != Ok("0")
+            {
+                let mut inside: Vec<(Vec3, f64, u8, u64)> = Vec::new();
+                for &(point, tangency, operand, edge_id, t, on_first) in &grazing_hits {
+                    // A pierce, not a lies-on sample: the edge must CROSS the
+                    // carrier at the hit (a rim lying on the other carrier
+                    // reads |tan·n| = 0 at every sample and never changes
+                    // side) — and inside both trims.
+                    let (owner, other_march) = if on_first { (first, second_march) } else { (second, first_march) };
+                    let Some(edge) = face_edge_lists[&owner.key()].iter().find(|edge| edge.id == edge_id) else {
+                        continue;
+                    };
+                    let crosses = edge_crosses_carrier(edge, t, other_march, options.tolerance)?;
+                    let contained = crosses && inside_both_trims(point, first, second)?;
+                    if debug_pairs && crosses {
+                        eprintln!(
+                            "pair {}x{}: grazing pierce op={operand} edge={edge_id} ({:.6},{:.6},{:.6}) |tan.n|={tangency:.4} inside both trims: {contained}",
+                            first.face.id, second.face.id, point.x, point.y, point.z
+                        );
+                    }
+                    if contained {
+                        inside.push((point, tangency, operand, edge_id));
+                    }
+                }
+                // SUB-GATE RE-MARCH (2026-10-17, the same report, second
+                // half). The pierces are PROVEN section points, so the march
+                // is retried from them alone, admitted below the marcher's
+                // start gate: the crossing is resolvable while its lateral
+                // uncertainty `tol / α` fits inside the tangency band's
+                // half-width `√(2 R tol)`, i.e. `α ≥ √(tol / 2R)`, and no
+                // carrier is curved tighter than the model, so the bound is
+                // taken at `R = scale`. Grid starts stay gated (their
+                // tangency-band runaway is the gate's reason). A branch that
+                // comes back is imprinted exactly as a marched one; only when
+                // none does is the contact recorded for the attribution. The
+                // retry is fail-soft like the swap rescue: an Err keeps the
+                // empty forward result. Hatch: BREP_GRAZING_SEED_MARCH=0.
+                if !inside.is_empty() && std::env::var("BREP_GRAZING_SEED_MARCH").as_deref() != Ok("0") {
+                    let bound = (options.tolerance / (2.0 * builder.scale.max(options.tolerance))).sqrt();
+                    let pierces: Vec<Vec3> = inside.iter().map(|(point, _, _, _)| *point).collect();
+                    let rescued = intersect_surfaces(
+                        first_march,
+                        second_march,
+                        &SurfaceIntersectionOptions {
+                            tolerance: options.tolerance,
+                            maximum_step: march_maximum_step(
+                                &pair_classification,
+                                options.maximum_ssi_step,
+                                builder.scale,
+                            ),
+                            seed_points: pierces.clone(),
+                            seed_only: true,
+                            seed_start_cross: Some(bound),
+                            span_budget: march_span_budget,
+                            ordered_starts,
+                            consume_starts,
+                            tree_seeds,
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap_or_default();
+                    if debug_pairs {
+                        eprintln!(
+                            "pair {}x{}: SUB-GATE MARCH from {} pierce(s) at bound {bound:.3e} -> {} branches, pts {:?}",
+                            first.face.id,
+                            second.face.id,
+                            pierces.len(),
+                            rescued.len(),
+                            rescued.iter().map(|b| b.points.len()).collect::<Vec<_>>()
+                        );
+                    }
+                    if !rescued.is_empty() {
+                        branches = rescued;
+                        grazing_march = true;
+                        // The pierces are the branches' exact trim crossings,
+                        // inserted below like any accepted seed.
+                        seed_points.extend(pierces);
+                        inside.clear();
+                    }
+                }
+                if !inside.is_empty() {
+                    if debug_pairs {
+                        eprintln!(
+                            "pair {}x{}: {} grazing pierce(s) inside both trims and no marched branch: {}",
+                            first.face.id,
+                            second.face.id,
+                            inside.len(),
+                            inside
+                                .iter()
+                                .map(|(point, tangency, operand, edge)| format!(
+                                    "op={operand} edge={edge} ({:.6},{:.6},{:.6}) |tan.n|={tangency:.4}",
+                                    point.x, point.y, point.z
+                                ))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        );
+                    }
+                    // The extended contact the lane can name, when it finds
+                    // one (the shared rim here); else the record stands on
+                    // the pierces alone.
+                    let mut section = match tangent_curve_section(
+                        first, second, options, &first_faces, &second_faces, &face_edge_lists, debug_pairs,
+                    )? {
+                        Some((section, _run)) => section,
+                        None => TangentSectionRecord {
+                            first: first.key(),
+                            second: second.key(),
+                            start: inside[0].0,
+                            end: inside[inside.len() - 1].0,
+                            length: 0.0,
+                            closed: false,
+                            stations: 0,
+                            planar: false,
+                            faces: vec![first.key(), second.key()],
+                            piece_ids: Vec::new(),
+                            grazing: Vec::new(),
+                        },
+                    };
+                    // The faces across each pierced edge: the pierce is where
+                    // the missing section meets that edge, so those faces are
+                    // the ones a tear downstream of it will name.
+                    for (_, _, operand, edge_id) in &inside {
+                        let siblings = if *operand == first.operand { &first_faces } else { &second_faces };
+                        for sibling in siblings.iter() {
+                            let shares = sibling
+                                .face
+                                .loops
+                                .iter()
+                                .flat_map(|loop_record| &loop_record.coedges)
+                                .any(|coedge| coedge.edge_id == *edge_id);
+                            if shares && !section.faces.contains(&sibling.key()) {
+                                section.faces.push(sibling.key());
+                            }
+                        }
+                    }
+                    section.grazing = inside.iter().map(|(point, tangency, _, _)| (*point, *tangency)).collect();
+                    tangent_sections.push(section);
+                }
+            }
+            if profile.enabled {
+                // Net metadata only: observing carriers must not warm their
+                // recognition/projection caches before the section fitter.
+                eprintln!("imprint.march_pair first={:?} second={:?} ids={}x{} degrees={}x{}/{}x{} nets={}x{}/{}x{} stations={:?}",
+                    first.face.name, second.face.name, first.face.id, second.face.id,
+                    first.face.surface.degree_u, first.face.surface.degree_v,
+                    second.face.surface.degree_u, second.face.surface.degree_v,
+                    first.face.surface.control_points.len(), first.face.surface.control_points.first().map_or(0, Vec::len),
+                    second.face.surface.control_points.len(), second.face.surface.control_points.first().map_or(0, Vec::len),
+                    branches.iter().map(|branch| branch.points.len()).collect::<Vec<_>>());
+            }
             for branch in branches {
                 // The pierce seeds are the section's exact trim-crossing
                 // points — insert them so no trim interval shorter than the
@@ -2205,7 +2479,40 @@ pub(super) fn build_imprints_impl(
                 let refined_points =
                     insert_seed_points_into_branch(&branch.points, &seed_points, options.tolerance);
                 let clip_started = profile.enabled.then(Instant::now);
-                let runs = clip_branch_to_trims(&refined_points, first, second)?;
+                let mut runs = clip_branch_to_trims(&refined_points, first, second)?;
+                // TANGENT-RIM LANDING: a run the march stalled short of a trim
+                // edge the two carriers are tangent along ends ON that edge
+                // (see `land_run_ends_on_tangent_rim`).
+                // Reached for the pairs whose march can stall short: one
+                // carrying an admitted node, one marched from sub-gate
+                // pierces, or one the classifier read as near-tangent (the
+                // −10° sibling: no node admitted, an ordinary march that
+                // stops 4e-5 short of the rim it is tangent along).
+                if tangent_node.is_some()
+                    || grazing_march
+                    || pair_classification.relation == SurfacePairRelation::NearTangent
+                {
+                    for run in runs.iter_mut() {
+                        for (operand, edge_id, parameter, from, to) in land_run_ends_on_tangent_rim(
+                            run,
+                            tangent_node,
+                            first,
+                            second,
+                            &face_edge_lists,
+                            options.tolerance,
+                        )? {
+                            if debug_pairs {
+                                eprintln!(
+                                    "pair {}x{}: tangent-rim landing: run end ({:.6},{:.6},{:.6}) -> \
+                                     ({:.6},{:.6},{:.6}) on operand {operand} edge {edge_id} at t={parameter:.6}",
+                                    first.face.id, second.face.id, from.x, from.y, from.z, to.x, to.y, to.z
+                                );
+                            }
+                            let edge = builder.edges[&(operand, edge_id)];
+                            builder.add_edge_split(operand, edge, parameter)?;
+                        }
+                    }
+                }
                 if debug_pairs {
                     let dups = |points: &[Vec3]| points.windows(2).enumerate().filter(|(_, pair)| pair[1].sub(pair[0]).length() <= options.tolerance).map(|(i, pair)| format!("{i}:{:.2e}", pair[1].sub(pair[0]).length())).collect::<Vec<_>>();
                     eprintln!(
@@ -2505,6 +2812,10 @@ pub(super) fn build_imprints_impl(
         profile.pairs_fits = scope.close().fits;
     }
     profile.report();
+    let hull_culls = super::builder::take_hull_culls();
+    if profile.enabled && super::builder::hull_cull_enabled() {
+        eprintln!("imprint.hull_culls edges={hull_culls}");
+    }
     // SELF-TOUCH SPLIT: a face whose loops touch at an edge interior (a hole
     // tangent to a fillet setback) gets a vertex minted at the touch on BOTH
     // edges, so the fragment arrangement's pinch resolution assembles — see
@@ -2807,6 +3118,21 @@ pub(super) fn build_imprints_impl(
             .join(" ");
         eprintln!("imprint.stage_fits {fits}");
     }
+    if let Ok(path) = std::env::var("BREP_IMPRINT_SECTION_CENSUS") {
+        use std::io::Write;
+        // A private observation of the complete imprint, including section
+        // curves, pcurves and junctions. Canonicalize only the set-valued
+        // barrier list on a COPY; leave every returned record untouched.
+        let mut observed = result.clone();
+        observed.barrier_edges.sort_unstable();
+        let bytes = serde_json::to_vec(&observed).expect("serialize imprint census");
+        let digest = bytes.iter().fold(0xcbf29ce484222325_u64,
+            |hash, byte| (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3));
+        let mut file = std::fs::OpenOptions::new().create(true).append(true).open(path)
+            .expect("open imprint section census");
+        writeln!(file, "imprint.sections digest={digest:016x} bytes={} pieces={} vertices={}",
+            bytes.len(), observed.pieces.len(), observed.vertices.len()).expect("append imprint section census");
+    }
     Ok(result)
 }
 
@@ -2890,6 +3216,233 @@ fn report_graze_contacts(
     Ok(())
 }
 
+/// Does `edge` CROSS `carrier` at parameter `t` — leave one side of the
+/// surface for the other — rather than touch it or lie on it? Read from the
+/// signed distance of the edge to the carrier a step either side of `t`
+/// (one hundredth of the edge's live window): a crossing changes sign with
+/// both readings clear of the tolerance; a lies-on edge reads zero on both
+/// sides and a kiss reads one sign on both. A hit at the edge's end has no
+/// far side and is not a crossing. The signed distance is read against the
+/// carrier itself (projection), never against the tangent plane at the hit,
+/// where a curve lying ON a curved carrier would read a same-signed sagitta
+/// on both sides that outweighs a grazing crossing's first-order departure.
+/// A CLOSED edge (a cap's rim circle) has no end: a hit within a step of its
+/// seam reads its far side across the seam (the G1 elbow's arm cap pierces
+/// the lower torus half at t = 0.0037 of its rim circle).
+fn edge_crosses_carrier(
+    edge: &EdgeRecord,
+    t: f64,
+    carrier: &NurbsSurface,
+    tolerance: f64,
+) -> Result<bool, KernelRefusal> {
+    let window = edge.t1 - edge.t0;
+    if !(window > 0.0) {
+        return Ok(false);
+    }
+    let delta = window * 1e-2;
+    let (mut before, mut after) = (t - delta, t + delta);
+    if before < edge.t0 || after > edge.t1 {
+        let start = edge.curve.evaluate(edge.t0).or_refuse(KernelStage::Intersect, "evaluate")?;
+        let end = edge.curve.evaluate(edge.t1).or_refuse(KernelStage::Intersect, "evaluate")?;
+        if start.sub(end).length() > tolerance {
+            return Ok(false);
+        }
+        if before < edge.t0 {
+            before += window;
+        }
+        if after > edge.t1 {
+            after -= window;
+        }
+    }
+    let mut readings = [0.0f64; 2];
+    for (slot, parameter) in [before, after].into_iter().enumerate() {
+        let point = edge.curve.evaluate(parameter).or_refuse(KernelStage::Intersect, "evaluate")?;
+        let projection = project_point_to_surface(carrier, point).or_refuse(KernelStage::Intersect, "project_point_to_surface")?;
+        let normal = match carrier.normal(projection.u, projection.v) {
+            Ok(normal) => normal,
+            Err(_) => return Ok(false),
+        };
+        readings[slot] = point.sub(projection.point).dot(normal);
+    }
+    let clear = tolerance * 10.0;
+    Ok(readings[0] * readings[1] < 0.0 && readings[0].abs() > clear && readings[1].abs() > clear)
+}
+
+
+/// `BREP_IMPRINT_LIES_ON_SEED_SKIP=0` runs the seed solve on an edge that lies
+/// on the other carrier as before (see the seed loop); unset or anything else
+/// skips it. Read once.
+fn lies_on_seed_skip_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("BREP_IMPRINT_LIES_ON_SEED_SKIP").as_deref() != Ok("0"))
+}
+
+/// TANGENT-RIM LANDING (hosted report 2026-10-17, "boolean fails": a box
+/// with a bore, its top face revolved 25° about a top edge and subtracted).
+///
+/// The revolve turns the profile's hole into a torus whose start rim IS the
+/// bore's top rim, so the bore cylinder and the torus are tangent along that
+/// whole circle — a shared TRIM EDGE of both faces, not an interior contact —
+/// and inside the trims they cross along two transverse branches that leave
+/// the rim at the two points where the torus's revolution-direction curvature
+/// vanishes against the cylinder's. The classifier admits those as isolated
+/// nodes (`tangent_contact.rs`: a third-order cusp reads as a saddle at every
+/// stopping rule) and the branch is marched — but the marcher's step direction
+/// `n_a × n_b` collapses as it nears the node, so the trace STALLS a few 1e-5
+/// short of the rim instead of running past the trim with its usual slack.
+/// Measured: the run ends 6.95e-5 and 1.17e-4 below y = 20, which on the
+/// cylinder's 30-tall chart is 2.3e-6 and 3.9e-6 — just over the arrangement's
+/// 1.4e-6 band — so the cut never reaches the boundary, the cylinder face is
+/// not split, and six edges stand one-use (the torus faces, whose pcurve is
+/// clamped at the rim's domain wall, DID split there, which is the asymmetry
+/// the one-use count reads). The exact `A − B` is a manifold solid (two
+/// slivers of box material inside the torus tube pinching to a zero-dihedral
+/// edge along the rim), so the refusal was wrong, not the model.
+///
+/// A transverse section cannot end strictly inside both trims; a run end that
+/// stops within the on-boundary clearance (`polish_endpoint`'s band) of a trim
+/// edge which lies on BOTH carriers at the foot of that stop has merely been
+/// truncated, and the foot — on the edge, hence on both carriers exactly — is
+/// where the exact section continues to. Land the end there and split the
+/// edge at it, so the ordinary machinery (pcurve projection, the arrangement's
+/// boundary split, the assembler's vertex weld) takes the junction from here.
+/// Reach: pairs carrying an admitted tangent node (the only place the march
+/// stalls short — elsewhere it overshoots the trim), a foot within
+/// `1e-2·(1 + |foot|)` of that node, and an end not already on the edge. The
+/// moved sample is the run's own last station, so the section polyline keeps
+/// every marched point and the landing segment is at most the clearance long.
+/// Returns the splits to register, one per edge sharing the landing point:
+/// `(operand, edge id, parameter, from, to)`.
+///
+/// Without an admitted node (`node` is `None`: the pair was marched from
+/// sub-gate pierces, or its branch simply ran into a tangency — the −10°
+/// sibling of the revolve-into-bore report, a near-tangent pair with no node
+/// admitted whose ordinary march stalled 4e-5 and 2.4e-4 short of its rim),
+/// the certificate is the run end itself: it must sit where the carriers are
+/// TANGENT (`|n_a × n_b|` under the seed gate), which is the only place a
+/// march stalls short. With or without a node the reach is `1e-2 (1 +
+/// |point|)`, and a gap beyond the plain clearance is earned sample by
+/// sample: the straight landing segment must stay within the on-boundary
+/// clearance of BOTH carriers at every sample — a section through a tangency
+/// band is within tolerance of both carriers all the way to the rim, so a
+/// segment that leaves either is not the missing stretch (the −20° sibling's
+/// 7x6 end stops 3e-4 short, over the plain clearance of 2.1e-4). A gap
+/// within the plain clearance lands exactly as before.
+fn land_run_ends_on_tangent_rim(
+    run: &mut [Vec3],
+    node: Option<Vec3>,
+    first: TaggedFace<'_>,
+    second: TaggedFace<'_>,
+    face_edge_lists: &HashMap<FaceKey, Vec<&EdgeRecord>>,
+    tolerance: f64,
+) -> Result<Vec<(u8, u64, f64, Vec3, Vec3)>, KernelRefusal> {
+    let mut landings = Vec::new();
+    if run.len() < 2 || std::env::var("BREP_TANGENT_RIM_LANDING").as_deref() == Ok("0") {
+        return Ok(landings);
+    }
+    for index in [0, run.len() - 1] {
+        let point = run[index];
+        let clearance = (tolerance * 100.0).max(1e-6) * (1.0 + point.length());
+        // No node: the end must stand in the tangency band, and the reach
+        // beyond the plain clearance is earned sample by sample below.
+        let stalled = match node {
+            Some(_) => true,
+            None => pair_normals_parallel_at(first, second, point)?,
+        };
+        if !stalled {
+            continue;
+        }
+        let reach = 1e-2 * (1.0 + point.length());
+        // Every qualifying foot over both faces' trim edges; the nearest is
+        // where the end lands, and every edge whose foot coincides with it
+        // (the two operands' copies of the shared rim) is split there, so
+        // neither side depends on its pcurve happening to clamp at a domain
+        // wall for its vertex.
+        let mut feet: Vec<(f64, u8, u64, f64, Vec3)> = Vec::new();
+        for face in [first, second] {
+            let Some(edges) = face_edge_lists.get(&face.key()) else {
+                continue;
+            };
+            for edge in edges {
+                if edge.degenerate {
+                    continue;
+                }
+                let projection = project_point_to_curve(&edge.curve, point)
+                    .or_refuse(KernelStage::Intersect, "project_point_to_curve")?;
+                let parameter = projection.u.clamp(edge.t0.min(edge.t1), edge.t0.max(edge.t1));
+                let foot = edge.curve.evaluate(parameter).or_refuse(KernelStage::Intersect, "evaluate")?;
+                let gap = foot.sub(point).length();
+                if gap <= tolerance || gap > reach {
+                    continue;
+                }
+                if let Some(node) = node {
+                    if foot.sub(node).length() > 1e-2 * (1.0 + foot.length()) {
+                        continue;
+                    }
+                }
+                if gap > clearance
+                    && !landing_segment_within(&first.face.surface, &second.face.surface, point, foot, clearance)
+                {
+                    continue;
+                }
+                // The edge must ride BOTH carriers at the foot: that is what
+                // makes the foot a point of the section.
+                let on_both = [first, second].iter().all(|face| {
+                    project_point_to_surface(&face.face.surface, foot)
+                        .map(|projection| projection.distance <= clearance)
+                        .unwrap_or(false)
+                });
+                if !on_both {
+                    continue;
+                }
+                feet.push((gap, face.operand, edge.id, parameter, foot));
+            }
+        }
+        let Some(&(_, _, _, _, landing)) = feet.iter().min_by(|a, b| a.0.total_cmp(&b.0)) else {
+            continue;
+        };
+        for (_, operand, edge_id, parameter, foot) in feet {
+            if foot.sub(landing).length() <= tolerance * 10.0 {
+                landings.push((operand, edge_id, parameter, point, landing));
+            }
+        }
+        run[index] = landing;
+    }
+    Ok(landings)
+}
+/// The widened landing's certificate: is the straight segment from the
+/// stalled run end `from` to the foot `to` within `clearance` of BOTH
+/// carriers at every interior sample?
+///
+/// Why this is a construction guarantee and not a reading: the foot is on a
+/// trim edge that rides both carriers (checked by the caller), so it is a
+/// point of the carriers' intersection set to within the clearance. The run
+/// end is a marched station, on both carriers to the corrector's residual.
+/// A segment whose every sample is within the clearance of both carriers is
+/// a chord of the band where the two carriers are within tolerance of each
+/// other — exactly the set a section through a tangency is confined to —
+/// and the section polyline's last chord is held to the same deviation every
+/// marched chord is. A segment that leaves either carrier mid-way (a chord
+/// across a curved rim: its sagitta clears the clearance by orders) is NOT
+/// the missing stretch, whatever its ends read, and is refused here.
+fn landing_segment_within(
+    first: &NurbsSurface,
+    second: &NurbsSurface,
+    from: Vec3,
+    to: Vec3,
+    clearance: f64,
+) -> bool {
+    const SAMPLES: usize = 8;
+    (1..SAMPLES).all(|k| {
+        let sample = from.add(to.sub(from).scale(k as f64 / SAMPLES as f64));
+        [first, second].iter().all(|surface| {
+            project_point_to_surface(surface, sample)
+                .map(|projection| projection.distance <= clearance)
+                .unwrap_or(false)
+        })
+    })
+}
+
 /// Are the two carriers TANGENT (normals parallel) where they both pass through
 /// `point`?
 ///
@@ -2925,6 +3478,7 @@ fn tangent_curve_section(
     face_edge_lists: &HashMap<FaceKey, Vec<&EdgeRecord>>,
     debug_pairs: bool,
 ) -> Result<Option<(TangentSectionRecord, Vec<Vec3>)>, KernelRefusal> {
+    let _clock = ImprintSubphaseClock::new("tangent_section");
     let Some(contact) =
         crate::find_tangent_contact(&first.face.surface, &second.face.surface, options.tolerance)
             .or_refuse(KernelStage::Intersect, "find_tangent_contact")?
@@ -2958,6 +3512,7 @@ fn tangent_curve_section(
                 planar: false,
                 faces: vec![first.key(), second.key()],
                 piece_ids: Vec::new(),
+                grazing: Vec::new(),
             },
             Vec::new(),
         )));
@@ -3055,6 +3610,7 @@ fn tangent_curve_section(
             planar: true,
             faces,
             piece_ids: Vec::new(),
+            grazing: Vec::new(),
         },
         run,
     )))
@@ -3377,3 +3933,4 @@ fn pair_normals_parallel_at(
     }
     Ok(normals[0].cross(normals[1]).length() <= crate::TRANSVERSE_SEED_CROSS)
 }
+

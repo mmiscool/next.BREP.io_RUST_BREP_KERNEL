@@ -160,6 +160,7 @@ fn run() -> Result<(), (u8, String)> {
                 "source_corner_vertices": imported.source_vertex_count,
                 "welded_vertices": imported.welded_vertex_count,
                 "weld_tolerance": imported.weld_tolerance,
+                "dropped_facets": imported.dropped_facets.iter().map(|d| json!({"facet": d.facet, "reason": d.to_string()})).collect::<Vec<_>>(),
                 "interpreted_unit": cli.unit,
             },
             "output": {
@@ -502,6 +503,13 @@ fn print_report(
         imported.source_vertex_count, imported.welded_vertex_count
     );
     println!("  Weld tolerance:     {:.6e}", imported.weld_tolerance);
+    if !imported.dropped_facets.is_empty() {
+        println!(
+            "  Dropped facets:     {} with no area: {}",
+            imported.dropped_facets.len(),
+            imported.dropped_facets.iter().take(8).map(ToString::to_string).collect::<Vec<_>>().join("; ")
+        );
+    }
     println!(
         "  Recognition dist.:  requested {:.6e} | source floor {:.6e} | effective {:.6e}",
         report.requested_distance_tolerance,

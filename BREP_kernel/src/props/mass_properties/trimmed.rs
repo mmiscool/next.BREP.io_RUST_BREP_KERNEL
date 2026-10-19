@@ -165,10 +165,11 @@ pub(super) fn integrate_trimmed_multi_with(
         // pcurve fitter keeps closed directions unwrapped rather than clamping
         // straddling geometry onto the seam). Integrate such a run on the tiled
         // covering grid so the wrapped sliver past the boundary is counted.
-        let straddles = unwrapped.iter().flat_map(|p| p.points.iter()).any(|point| {
-            (closed_u && (point[0] < u0 - 1e-9 || point[0] > u1 + 1e-9))
-                || (closed_v && (point[1] < v0 - 1e-9 || point[1] > v1 + 1e-9))
-        });
+        // A trim may also run past an OPEN end of the carrier (an EXTEND
+        // landing trims onto the carrier's extension, which `validate` reads
+        // through `evaluate_extended`); the covering-plane path integrates
+        // that strip on the same extension instead of clipping it away.
+        let straddles = runs_past_domain(face, &unwrapped, domain)?;
         mass_profile(|p| if straddles { p.route_straddle += 1 } else { p.route_periodic_raw += 1 });
         return integrate_trimmed_polys(face, kinds, &unwrapped, straddles, domain);
     }
@@ -178,7 +179,23 @@ pub(super) fn integrate_trimmed_multi_with(
         p.route_raw += 1;
         p.polygons_ms += super::profile::elapsed_ms(polygons_started);
     });
-    integrate_trimmed_polys(face, kinds, &raw, false, domain)
+    let extended = runs_past_domain(face, &raw, domain)?;
+    integrate_trimmed_polys(face, kinds, &raw, extended, domain)
+}
+
+/// Whether any trim point lies past the carrier's domain, in any direction:
+/// the region it bounds is then integrated on the extension `validate`
+/// accepts (`deriv1_extended`), never clipped to the domain.
+/// `BREP_MASS_OPEN_EXTENSION=0` restores the earlier reading (only a closed
+/// direction's straddle counted) for an A/B census.
+fn runs_past_domain(face: &FaceRecord, polygons: &[TrimPolygon], [u0, u1, v0, v1]: [f64; 4]) -> Result<bool, String> {
+    static OPEN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let open = *OPEN.get_or_init(|| std::env::var("BREP_MASS_OPEN_EXTENSION").as_deref() != Ok("0"));
+    let (closed_u, closed_v) = face.surface.closed_directions()?;
+    Ok(polygons.iter().flat_map(|p| p.points.iter()).any(|point| {
+        ((open || closed_u) && (point[0] < u0 - 1e-9 || point[0] > u1 + 1e-9))
+            || ((open || closed_v) && (point[1] < v0 - 1e-9 || point[1] > v1 + 1e-9))
+    }))
 }
 
 /// Integrate every `kind` over the trim `polygons` by the conforming

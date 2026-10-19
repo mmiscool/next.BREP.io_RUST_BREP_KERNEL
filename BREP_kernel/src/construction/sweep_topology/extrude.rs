@@ -44,6 +44,7 @@ pub fn extrude_profile_brep(
     direction: Vec3,
     distance: f64,
 ) -> Result<BrepSolid, KernelRefusal> {
+    let mut profile = crate::loft_topology::ConstructionProfile::new("extrude");
     if input_curves.len() < 2 {
         return Err(KernelRefusal::input(
             KernelStage::Collect,
@@ -130,6 +131,7 @@ pub fn extrude_profile_brep(
             .collect::<Result<_, _>>().or_refuse(KernelStage::Fragment, "collect")?;
     }
 
+    profile.lap("profile");
     let count = curves.len();
     let points: Vec<Vec3> = curves
         .iter()
@@ -184,6 +186,7 @@ pub fn extrude_profile_brep(
         });
     }
 
+    profile.lap("edges");
     let mut next_id = 1000_u64;
     let mut faces = Vec::with_capacity(count + 2);
     for (index, curve) in curves.iter().enumerate() {
@@ -302,6 +305,7 @@ pub fn extrude_profile_brep(
 
     let solid = BrepSolid {
         mass_properties_cache: Default::default(),
+        cells: Default::default(),
         id: next_id + 1,
         vertices,
         edges,
@@ -309,7 +313,9 @@ pub fn extrude_profile_brep(
         genus: 0,
         kind: crate::BodyKind::Solid,
     };
+    profile.lap("topology_surface_pcurves");
     let issues = solid.validate();
+    profile.lap("validation");
     if issues.is_empty() {
         Ok(solid)
     } else {

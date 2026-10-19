@@ -1163,10 +1163,13 @@ impl Editor {
                 if present {
                     continue;
                 }
+                // The host offers occurrences; a card without one is nothing a
+                // sheet seats (see `Editor::place_here`).
+                let Some(occurrence) = part.source.instance.clone() else { continue };
                 let at = d.open_spot(&part.symbol);
-                if let Err(refusal) =
-                    d.place_part(part.source, part.symbol, part.pads, part.reference, at, 0)
-                {
+                if let Err(refusal) = d.place_assembly_component(
+                    &occurrence, part.source, part.symbol, part.pads, part.reference, at, 0,
+                ) {
                     refused.push(refusal);
                 }
             }
@@ -1806,9 +1809,9 @@ impl Editor {
             };
             ui.add(egui::ProgressBar::new(fraction).show_percentage());
             ui.label(format!(
-                "{settled} of {} nets · {} rip-ups · {:.2} mm grid",
-                progress.total_nets,
-                progress.rip_ups,
+                "{settled} of {} · {} · {:.2} mm grid",
+                crate::count(progress.total_nets, "net", "nets"),
+                crate::count(progress.rip_ups, "rip-up", "rip-ups"),
                 mm(job.pitch())
             ));
             if progress.removing_vias {
@@ -2285,8 +2288,8 @@ impl Editor {
             .map_or_else(Default::default, |c| (c.reference.clone(), c.value.clone()));
         ui.label(egui::RichText::new(format!("{reference} · {value}")).color(accent(ui)));
         ui.small(format!(
-            "{} pads · {:.2}, {:.2} mm · {}° · {}",
-            placement.footprint.pads.len(),
+            "{} · {:.2}, {:.2} mm · {}° · {}",
+            crate::count(placement.footprint.pads.len(), "pad", "pads"),
             mm(placement.at.x),
             mm(placement.at.y),
             u16::from(placement.rotation) * 90,

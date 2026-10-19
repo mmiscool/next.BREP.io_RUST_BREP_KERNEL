@@ -101,9 +101,20 @@ pub struct ContextBarPanel {
     shown_component_actions: Vec<String>,
     /// The single component the actions target this frame (its ACOMP id).
     shown_component_target: Option<String>,
+    /// The tallest the card may draw, in points, set by the shell each frame:
+    /// down to the ViewCube's top, so a long rail scrolls instead of covering
+    /// the cube (lane U audit item 2: at 1280x800 a face selection's 22 rows
+    /// hid it). `None` = unbounded.
+    pub max_height: Option<f32>,
 }
 
 impl ContextBarPanel {
+    pub(crate) fn clear_view(&mut self) {
+        self.hits.clear();
+        self.shown_actions.clear(); self.shown_features.clear();
+        self.shown_constraints.clear(); self.shown_pmi.clear();
+        self.shown_component_actions.clear(); self.shown_component_target = None;
+    }
     pub fn new() -> Self {
         Self::default()
     }
@@ -284,17 +295,34 @@ impl ContextBarPanel {
                 items.push(ActionItem::new(format!("plugin:{id}"), action["ribbonPath"].as_str().and_then(|p| p.rsplit('/').next()).or(action["label"].as_str()).unwrap_or(id), "Open plugin action form"));
             }
         }
-        let clicked = egui::Frame::popup(ui.style())
+        let max_height = self.max_height;
+        let clicked = if crate::viewport::touch::compact(ui.ctx()) {
+            action_rail(ui, Some("Selection actions"), Some(&summary), &items, &mut self.hits)
+        } else {
+            egui::Frame::popup(ui.style())
             .show(ui, |ui| {
-                action_rail(
-                    ui,
-                    Some("Selection actions"),
-                    Some(&summary),
-                    &items,
-                    &mut self.hits,
-                )
+                let Some(limit) = max_height else {
+                    return action_rail(ui, Some("Selection actions"), Some(&summary), &items, &mut self.hits);
+                };
+                // The frame's own margins come off the limit; a rail that fits
+                // draws exactly as it does unbounded (the scroll area adds no
+                // offset), and one that does not scrolls, publishing its visible
+                // region as `panel:clip`.
+                let limit = (limit - ui.style().spacing.menu_margin.sum().y).max(4.0 * ui.spacing().interact_size.y);
+                let scroll = egui::ScrollArea::vertical()
+                    .id_salt("context-bar-rail")
+                    .max_height(limit)
+                    // An Area's ui is only as tall as last frame's content, which
+                    // would leave a scrolling rail at egui's 64-pt minimum.
+                    .min_scrolled_height(limit)
+                    .show(ui, |ui| action_rail(ui, Some("Selection actions"), Some(&summary), &items, &mut self.hits));
+                if scroll.content_size.y > scroll.inner_rect.height() + 0.5 {
+                    self.hits.insert("panel:clip".into(), scroll.inner_rect);
+                }
+                scroll.inner
             })
-            .inner;
+            .inner
+        };
 
         // --- apply the intent (one engine mutation per frame) -----------------
         let mut outcome = ContextOutcome::default();
@@ -1059,6 +1087,7 @@ fn feature_index(state: &EngineState, id: &str) -> Option<usize> {
 
 /// The hit keys this panel publishes (see `automation::hit_keys`).
 pub static HIT_KEYS: &[HitKeyDoc] = &[
+    HitKeyDoc { panel: "context", prefix: "panel:clip", meaning: "the action rail's visible region, published only while the rail is taller than the room above the ViewCube and scrolls", command: None },
     HitKeyDoc { panel: "context", prefix: "plugin:", meaning: "open a plugin action form for current selection", command: Some("plugin_action") },
     // The generic actions were published from the day the bar was built and
     // documented by nobody, so `hit_keys_check` reported four undocumented keys

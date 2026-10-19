@@ -409,13 +409,30 @@ pub fn offset_surface_measured_sided(
     extension: &CarrierExtension,
     band: f64,
 ) -> Result<MeasuredOffsetSurface, KernelRefusal> {
-    let (surface, lane, extended) = offset_surface_constructed(face, distance, extension)?;
+    offset_surface_measured_sided_mode(face, distance, extension, band,
+        std::env::var("BREP_OFFSET_SPHERE_READING").map_or(true, |v| v != "0" && v != "off"))
+}
+
+fn offset_surface_measured_sided_mode(
+    face: &FaceRecord, distance: f64, extension: &CarrierExtension, band: f64, reuse: bool,
+) -> Result<MeasuredOffsetSurface, KernelRefusal> {
+    let mut sphere_reading = None;
+    let (surface, lane, extended) = offset_surface_constructed(face, distance, extension, &mut sphere_reading)?;
     let fit = match lane {
         OffsetSurfaceLane::Affine => Some(MeasuredTolerance::exact(band)),
         // `Analytic` is exact by construction and already verified against the
         // pointwise offset before it was returned — but it is measured here
         // like a fit anyway, so the record carries the number instead of the
         // claim. It reads ~1e-13 where `Fit` reads ~1e-6.
+        OffsetSurfaceLane::Analytic if reuse && sphere_reading.is_some() => {
+            // The construction already read this exact source/result pair on
+            // the same grid. Only the report band differs; it is not a grid
+            // input. Retain the measured deviation, never substitute zero.
+            if std::env::var_os("BREP_PROFILE").is_some() {
+                eprintln!("offset.sphere_reading.profile reused=1");
+            }
+            Some(MeasuredTolerance::new(sphere_reading.unwrap(), band))
+        }
         OffsetSurfaceLane::Analytic | OffsetSurfaceLane::Fit => {
             Some(measure_surface_fit_against_pointwise_offset(
                 extended.as_ref().unwrap_or(&face.surface),
@@ -458,7 +475,7 @@ pub fn offset_surface_measured_sided(
 /// looks spherical — stays on the fit lane, unchanged. This lane widens nothing
 /// on its own: cylinders, cones and tori want a scaling about an axis or a
 /// spine rather than a point, which is a different construction.
-fn sphere_offset_surface(face: &FaceRecord, distance: f64) -> Result<Option<NurbsSurface>, KernelRefusal> {
+fn sphere_offset_surface(face: &FaceRecord, distance: f64, reading: &mut Option<f64>) -> Result<Option<NurbsSurface>, KernelRefusal> {
     // Escape hatch, the same shape as `BREP_NO_SPHERE_CHARTS`: it makes the
     // closed form and the collocation fit two cells of one binary, so a
     // measurement can separate this lane's effect from everything else.
@@ -534,14 +551,17 @@ fn sphere_offset_surface(face: &FaceRecord, distance: f64) -> Result<Option<Nurb
     // The claim, tested. A net that does not land on the pointwise offset
     // everywhere is not this lane's surface, whatever it was recognized as —
     // and a measurement that could not be taken is not a pass.
-    match measure_surface_fit_against_pointwise_offset(
+    match crate::offset_measure::sphere_fit_reading(
         source,
         face.same_sense,
         &surface,
         distance,
         1e-9 * scale,
     ) {
-        Ok(measured) if measured.within_band() => Ok(Some(surface)),
+        Ok(measured) if measured.within_band() => {
+            *reading = Some(measured.deviation());
+            Ok(Some(surface))
+        },
         _ => Ok(None),
     }
 }
@@ -743,19 +763,63 @@ pub(crate) fn offset_surface_with_lane(
     distance: f64,
     extension: &CarrierExtension,
 ) -> Result<(NurbsSurface, OffsetSurfaceLane), KernelRefusal> {
-    offset_surface_constructed(face, distance, extension).map(|(surface, lane, _)| (surface, lane))
+    offset_surface_constructed(face, distance, extension, &mut None).map(|(surface, lane, _)| (surface, lane))
 }
 
 /// [`offset_surface_with_lane`], plus the surface the carrier is the pointwise
 /// offset OF when that is not the face's own: the source extended along its
 /// rulings, for a ruled extension (see the RULED EXTENSION block).
+pub(crate) fn transpose_offset_surface(surface: &NurbsSurface) -> Result<NurbsSurface, KernelRefusal> {
+    let controls = (0..surface.control_points[0].len())
+        .map(|column| surface.control_points.iter().map(|row| row[column]).collect())
+        .collect();
+    NurbsSurface::new(surface.degree_v, surface.degree_u, surface.knots_v.clone(),
+        surface.knots_u.clone(), controls).or_refuse(KernelStage::Refine, "offset_transpose")
+}
+
 fn offset_surface_constructed(
     face: &FaceRecord,
     distance: f64,
     extension: &CarrierExtension,
+    sphere_reading: &mut Option<f64>,
 ) -> Result<(NurbsSurface, OffsetSurfaceLane, Option<NurbsSurface>), KernelRefusal> {
     let source = &face.surface;
     let extension_active = extension.is_active();
+    // Imported cones can put the ruling in u. Normalize that chart for the
+    // existing exact ruling/pinch construction, then restore the caller's UV.
+    // Transposition reverses Su x Sv, so the face sense reverses with it.
+    // The recognizer must prove a ruled revolution; arbitrary lofts keep
+    // their existing evaluator and fit semantics.
+    let normalize_ruling = std::env::var("BREP_OFFSET_FIT_RESIDUAL").as_deref() != Ok("0")
+        && source.degree_u == 1 && source.control_points.len() == 2;
+    let normalize_sphere = std::env::var("BREP_OFFSET_FOLD_CHART").as_deref() != Ok("0")
+        && source.degree_u == 2 && source.degree_v == 2 && source.analytic().is_none();
+    if normalize_ruling || normalize_sphere {
+        let transposed = transpose_offset_surface(source)?;
+        let ruled = normalize_ruling && matches!(transposed.analytic(), Some(crate::AnalyticSurface::RuledRevolution { .. }));
+        let spherical = normalize_sphere && transposed.analytic().and_then(|shape| shape.sphere_geometry()).is_some();
+        if ruled || spherical {
+            let mut turned = face.clone();
+            turned.surface = transposed;
+            turned.same_sense = !turned.same_sense;
+            for coedge in turned.loops.iter_mut().flat_map(|lp| &mut lp.coedges) {
+                let controls = coedge.pcurve.control_points.iter().map(|point| {
+                    let mut swapped = *point;
+                    std::mem::swap(&mut swapped.x, &mut swapped.y);
+                    swapped
+                }).collect();
+                coedge.pcurve = NurbsCurve::new(coedge.pcurve.degree,
+                    coedge.pcurve.knots.clone(), controls).or_refuse(KernelStage::Refine, "offset_transpose_pcurve")?;
+            }
+            let turned_extension = CarrierExtension {
+                u_min: extension.v_min, u_max: extension.v_max,
+                v_min: extension.u_min, v_max: extension.u_max,
+            };
+            let (surface, lane, extended) = offset_surface_constructed(&turned, distance, &turned_extension, &mut None)?;
+            return Ok((transpose_offset_surface(&surface)?, lane,
+                extended.as_ref().map(transpose_offset_surface).transpose()?));
+        }
+    }
     if source.is_affine().or_refuse(KernelStage::Refine, "is_affine")? {
         let ([u0, u1], [v0, v1]) = domains(source)?;
         let normal = stable_face_normal(face, (u0 + u1) / 2.0, (v0 + v1) / 2.0)?;
@@ -839,7 +903,7 @@ fn offset_surface_constructed(
     // under `parameters_v.len() == 2`, and a sphere's meridian is a degree-2
     // net of five controls. Taking this lane under an active extension keeps
     // exactly the behaviour the fit had — no growth — and only sharpens it.
-    if let Some(surface) = sphere_offset_surface(face, distance)? {
+    if let Some(surface) = sphere_offset_surface(face, distance, sphere_reading)? {
         return Ok((surface, OffsetSurfaceLane::Analytic, None));
     }
     // The same holds for a revolved ARC: its generatrix has three or more
@@ -1295,16 +1359,31 @@ const OFFSET_FIT_MAX_CONTROLS_TENSOR: usize = 900;
 /// read at the MIDPOINTS between consecutive Greville parameters, where the fit
 /// interpolates nothing: along u (u midpoints on the v Greville rows), along v,
 /// and between both.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct OffsetFitDeviation {
     along_u: f64,
     along_v: f64,
     between: f64,
+    u_sites: Vec<(f64, f64)>,
+    v_sites: Vec<(f64, f64)>,
+    between_uv: (f64, f64),
 }
 
 impl OffsetFitDeviation {
     fn worst(&self) -> f64 {
         self.along_u.max(self.along_v).max(self.between)
+    }
+
+    fn refinement_sites(&self, bar: f64) -> (Vec<f64>, Vec<f64>) {
+        let mut u = self.u_sites.iter().filter(|(_, miss)| *miss > bar)
+            .map(|(parameter, _)| *parameter).collect::<Vec<_>>();
+        let mut v = self.v_sites.iter().filter(|(_, miss)| *miss > bar)
+            .map(|(parameter, _)| *parameter).collect::<Vec<_>>();
+        if u.is_empty() && v.is_empty() && self.between > bar {
+            u.push(self.between_uv.0);
+            v.push(self.between_uv.1);
+        }
+        (u, v)
     }
 }
 
@@ -1324,6 +1403,7 @@ fn offset_fit_deviation(
     let parameters_u = greville_parameters(&KnotVector::new(fitted.knots_u.clone(), fitted.degree_u).or_refuse(KernelStage::Refine, "new")?);
     let parameters_v = greville_parameters(&KnotVector::new(fitted.knots_v.clone(), fitted.degree_v).or_refuse(KernelStage::Refine, "new")?);
     let (middle_u, middle_v) = (greville_midpoints(&parameters_u), greville_midpoints(&parameters_v));
+    let residual_locus = std::env::var("BREP_OFFSET_FIT_RESIDUAL").as_deref() != Ok("0");
     let gap = |u: f64, v: f64| -> Result<f64, KernelRefusal> {
         Ok(fitted.evaluate(u, v).or_refuse(KernelStage::Refine, "evaluate")?.sub(evaluator.at(u, v, -distance).or_refuse(KernelStage::Refine, "at")?.point).length())
     };
@@ -1331,18 +1411,29 @@ fn offset_fit_deviation(
         along_u: 0.0,
         along_v: 0.0,
         between: 0.0,
+        u_sites: Vec::new(),
+        v_sites: if residual_locus { middle_v.iter().map(|&v| (v, 0.0)).collect() } else { Vec::new() },
+        between_uv: (0.0, 0.0),
     };
     for &u in &middle_u {
+        let mut along = 0.0f64;
         for &v in &parameters_v {
-            deviation.along_u = deviation.along_u.max(gap(u, v)?);
+            let miss = gap(u, v)?;
+            along = along.max(miss);
+            deviation.along_u = deviation.along_u.max(miss);
         }
+        if residual_locus { deviation.u_sites.push((u, along)); }
         for &v in &middle_v {
-            deviation.between = deviation.between.max(gap(u, v)?);
+            let miss = gap(u, v)?;
+            if miss > deviation.between { deviation.between_uv = (u, v); }
+            deviation.between = deviation.between.max(miss);
         }
     }
     for &u in &parameters_u {
-        for &v in &middle_v {
-            deviation.along_v = deviation.along_v.max(gap(u, v)?);
+        for (index, &v) in middle_v.iter().enumerate() {
+            let miss = gap(u, v)?;
+            deviation.along_v = deviation.along_v.max(miss);
+            if residual_locus { deviation.v_sites[index].1 = deviation.v_sites[index].1.max(miss); }
         }
     }
     Ok(deviation)
@@ -1442,8 +1533,21 @@ fn halve_knot_spans(surface: &NurbsSurface, in_u: bool, in_v: bool) -> Result<Nu
             .map(|pair| 0.5 * (pair[0] + pair[1]))
             .collect()
     }
-    let refine = |degree: usize, knots: &[f64], net: Vec<Vec<Vec4>>| -> Result<(Vec<f64>, Vec<Vec<Vec4>>), KernelRefusal> {
-        let inserted = midpoints(knots, degree);
+    insert_offset_fit_knots(surface,
+        &if in_u { midpoints(&surface.knots_u, surface.degree_u) } else { Vec::new() },
+        &if in_v { midpoints(&surface.knots_v, surface.degree_v) } else { Vec::new() })
+}
+
+/// Insert the fit's measured residual coordinates, rather than relocating
+/// every collocation node by blindly halving all spans. In particular a
+/// quadratic's first midpoint insertion loses its old central Greville node;
+/// inserting the two residual lobes preserves that node and resolves them.
+fn insert_offset_fit_knots(surface: &NurbsSurface, u: &[f64], v: &[f64]) -> Result<NurbsSurface, KernelRefusal> {
+    let refine = |degree: usize, knots: &[f64], net: Vec<Vec<Vec4>>, inserted: &[f64]| -> Result<(Vec<f64>, Vec<Vec<Vec4>>), KernelRefusal> {
+        let mut inserted = inserted.to_vec();
+        inserted.sort_by(f64::total_cmp);
+        inserted.dedup_by(|a, b| (*a - *b).abs() <= 1e-12);
+        inserted.retain(|parameter| knots.iter().filter(|knot| (**knot - *parameter).abs() <= 1e-12).count() < degree);
         let mut refined_knots = knots.to_vec();
         let mut rows = Vec::with_capacity(net.len());
         for row in net {
@@ -1459,18 +1563,18 @@ fn halve_knot_spans(surface: &NurbsSurface, in_u: bool, in_v: bool) -> Result<Nu
     let mut knots_u = surface.knots_u.clone();
     let mut knots_v = surface.knots_v.clone();
     let mut net = surface.control_points.clone();
-    if in_v {
-        let (knots, rows) = refine(surface.degree_v, &knots_v, net)?;
+    if !v.is_empty() {
+        let (knots, rows) = refine(surface.degree_v, &knots_v, net, v)?;
         knots_v = knots;
         net = rows;
     }
-    if in_u {
+    if !u.is_empty() {
         // Transpose so each u column is a curve, refine, transpose back.
         let count_v = net[0].len();
         let columns = (0..count_v)
             .map(|column| net.iter().map(|row| row[column]).collect::<Vec<_>>())
             .collect::<Vec<_>>();
-        let (knots, refined) = refine(surface.degree_u, &knots_u, columns)?;
+        let (knots, refined) = refine(surface.degree_u, &knots_u, columns, u)?;
         knots_u = knots;
         let count_u = refined[0].len();
         net = (0..count_u)
@@ -1536,9 +1640,10 @@ fn refine_offset_fit(
         return Ok(fitted);
     };
     let mut best = fitted;
-    let mut best_deviation = initial;
+    let mut best_deviation = initial.clone();
     let mut refined_source = source.clone();
     let mut rounds = 0usize;
+    let mut residual_mode = false;
     let mut stop = "under bar";
     if enabled {
         while best_deviation.worst() > bar {
@@ -1564,7 +1669,13 @@ fn refine_offset_fit(
             };
             let raised = raised.unwrap_or_else(|| refined_source.clone());
             let candidate_source = if halve_u || halve_v {
-                halve_knot_spans(&raised, halve_u, halve_v)?
+                if residual_mode {
+                    let (u, v) = best_deviation.refinement_sites(bar);
+                    insert_offset_fit_knots(&raised,
+                        if halve_u { &u } else { &[] }, if halve_v { &v } else { &[] })?
+                } else {
+                    halve_knot_spans(&raised, halve_u, halve_v)?
+                }
             } else {
                 raised
             };
@@ -1613,6 +1724,16 @@ fn refine_offset_fit(
             };
             rounds += 1;
             if deviation.worst() >= best_deviation.worst() {
+                // Keep every improving uniform round on its existing path.
+                // Only a measured stall switches the next attempt to the
+                // residual locus, starting again from the best accepted net.
+                // The rejected candidate never replaces that best fit.
+                if !residual_mode && best_deviation.worst() > offset_construction_band(scale)
+                    && std::env::var("BREP_OFFSET_FIT_RESIDUAL").as_deref() != Ok("0")
+                {
+                    residual_mode = true;
+                    continue;
+                }
                 stop = "stopped improving";
                 break;
             }
@@ -1999,20 +2120,39 @@ pub struct OffsetFaceCarrier {
     pub lane: OffsetSurfaceLane,
 }
 
+/// The carrier vertex imaging `source_id` at `point`. A source vertex
+/// normally has ONE image, claimed by the first edge to reach it. An APEX
+/// does not: the offset of a corner blend's apex (a partial surface of
+/// revolution about a reflex edge, its degenerate edge spanning the turn) is
+/// an open ARC of radius |d|, and the two meridian edges into the apex end at
+/// the arc's two ends. Handing every edge the first image collapsed that arc
+/// onto one vertex while its curve still ran 1.7·d to the other end — a loop
+/// that closes in ids and not in space, which the assembly could only leave
+/// open (the 2026-10-18 shell report). An image farther than `split` from
+/// every image already claimed is a vertex of its own.
 fn claim_vertex_image(
     source_id: u64,
     point: Vec3,
-    vertex_images: &mut HashMap<u64, u64>,
+    split: f64,
+    vertex_images: &mut HashMap<u64, Vec<u64>>,
     vertices: &mut Vec<VertexRecord>,
     next_id: &mut u64,
 ) -> u64 {
-    if let Some(id) = vertex_images.get(&source_id) {
-        return *id;
+    if let Some(ids) = vertex_images.get(&source_id) {
+        let near = ids.iter().copied().find(|id| {
+            vertices
+                .iter()
+                .find(|vertex| vertex.id == *id)
+                .is_some_and(|vertex| vertex.point.sub(point).length() <= split)
+        });
+        if let Some(id) = near {
+            return id;
+        }
     }
     let id = *next_id;
     *next_id += 1;
     vertices.push(VertexRecord { id, point });
-    vertex_images.insert(source_id, id);
+    vertex_images.entry(source_id).or_default().push(id);
     id
 }
 
@@ -2211,6 +2351,10 @@ fn offset_face_carrier_impl(
         .collect::<HashMap<_, _>>();
     let mut vertices = Vec::new();
     let mut vertex_images = HashMap::default();
+    // Two images of one source vertex this far apart are two vertices (an
+    // apex's arc, `claim_vertex_image`); fitting noise at a pole stays far
+    // below it.
+    let vertex_split = (distance.abs() * 0.1).max(band);
     let mut edges = Vec::new();
     let mut edge_images = HashMap::default();
     let mut loops = Vec::new();
@@ -2288,7 +2432,9 @@ fn offset_face_carrier_impl(
                         // vertex identifies which way this coedge runs.
                         (
                             *edge_id,
-                            vertex_images.get(&source_start) == Some(edge_start_vertex_id),
+                            vertex_images
+                                .get(&source_start)
+                                .is_some_and(|ids: &Vec<u64>| ids.contains(edge_start_vertex_id)),
                         )
                     }
                 } else {
@@ -2314,6 +2460,7 @@ fn offset_face_carrier_impl(
                     let start_vertex_id = claim_vertex_image(
                         source_start,
                         points[0],
+                        vertex_split,
                         &mut vertex_images,
                         &mut vertices,
                         &mut next_id,
@@ -2321,6 +2468,7 @@ fn offset_face_carrier_impl(
                     let end_vertex_id = claim_vertex_image(
                         source_end,
                         points[points.len() - 1],
+                        vertex_split,
                         &mut vertex_images,
                         &mut vertices,
                         &mut next_id,
@@ -2402,4 +2550,5 @@ fn offset_face_carrier_impl(
         lane,
     })
 }
+
 

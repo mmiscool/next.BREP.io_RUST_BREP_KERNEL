@@ -626,7 +626,13 @@ fn mesh_chart(
     for (slot, (uv, _)) in points.iter().enumerate() {
         let handle = triangulation
             .insert(AtlasPoint {
-                position: Point2::new(uv[0], uv[1]),
+                // A chart coordinate within 2^-142 of zero but not zero is
+                // one spade refuses as `TooSmall` (the box fillet's exact
+                // octants carried one, 2026-10-18); it is zero to the chart's
+                // own precision, so it is inserted as zero. Every coordinate
+                // spade accepts passes unchanged, so no chart that inserted
+                // before moves.
+                position: spade::mitigate_underflow(Point2::new(uv[0], uv[1])),
                 authored: slot,
             })
             .map_err(|error| format!("sphere atlas: chart insert failed: {error:?}"))?;

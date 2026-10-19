@@ -5,6 +5,46 @@ impl BrepSolid {
         self.validate_with_tolerances(&KernelTolerances::for_solid(self, 1e-7))
     }
 
+    /// [`validate`](Self::validate) with its CLEAN verdicts memoised by the
+    /// body's content (lane R1 row 3, lane B's B3). A rim built by the
+    /// closed-rim lane is validated by the surgery's repaired-branch check, by
+    /// the group lane and by the pipeline's exit acceptance; `validate` is a
+    /// pure function of the body, so a body whose serialised record read clean
+    /// once reads clean again. The key is two independent 64-bit hashes of the
+    /// serialisation, so ANY mutation (a moved control point, a re-trimmed
+    /// coedge, a renamed face) is validated afresh — the key is the content,
+    /// never an address. A body with issues is validated every time. The memo
+    /// is thread-local, bounded, and emptied by [`BrepSolid::clear_validate_memo`] at
+    /// each fillet operation's entry. On by default (promoted 2026-10-18 on
+    /// the 98 + 144 census; `BREP_VALIDATE_MEMO=0` validates every time); counted as
+    /// `count.validate.memo_hit` / `count.validate.memo_miss`.
+    pub(crate) fn validate_memoised(&self) -> Vec<ValidationIssue> {
+        if !validate_memo_on() {
+            return self.validate();
+        }
+        let key_timing = crate::blend::BlendTimer::start("timing.validate.memo_key_ms");
+        let Some(key) = self.validate_memo_key() else {
+            return self.validate();
+        };
+        key_timing.stop();
+        if VALIDATED_CLEAN.with(|clean| clean.borrow().contains(&key)) {
+            crate::blend::record_count("count.validate.memo_hit", 1);
+            return Vec::new();
+        }
+        crate::blend::record_count("count.validate.memo_miss", 1);
+        let issues = self.validate();
+        if issues.is_empty() {
+            VALIDATED_CLEAN.with(|clean| {
+                let mut clean = clean.borrow_mut();
+                if clean.len() >= VALIDATED_CLEAN_CAP {
+                    clean.clear();
+                }
+                clean.insert(key);
+            });
+        }
+        issues
+    }
+
     pub fn validate_with_tolerances(&self, tolerances: &KernelTolerances) -> Vec<ValidationIssue> {
         self.validate_detailed(tolerances).issues
     }
@@ -213,7 +253,7 @@ impl BrepSolid {
                                 continue;
                             }
                         };
-                        match coedge_error_floored(
+                        match memoized_coedge_error(
                             surface,
                             &pcurve,
                             &curve,
@@ -320,6 +360,17 @@ impl BrepSolid {
                         edge.id, uses,
                     )));
                 }
+            // Non-manifold plan 1.2: only a DECLARED Sheet admits a lamina
+            // edge. Unreferenced edges and three-or-more uses still fail;
+            // shared edges keep the existing opposite-sense rule below.
+            } else if self.kind == BodyKind::Sheet && uses.len() == 1 {
+            } else if self.kind == BodyKind::Cellular {
+                // Region closure and radial senses are checked per declared
+                // cell below. A shared wall can give three global face uses.
+                if uses.len() < 2 {
+                    issues.push(ValidationIssue::error_kind(IssueKind::OpenEdge,
+                        format!("Cellular edge {} used {} times (expected at least 2)", edge.id, uses.len())));
+                }
             } else if uses.len() != 2 {
                 let kind = if uses.len() < 2 { IssueKind::OpenEdge } else { IssueKind::OverUsedEdge };
                 issues.push(ValidationIssue::error_kind(kind, format!(
@@ -418,7 +469,9 @@ impl BrepSolid {
             .iter()
             .filter(|edge| !edge.degenerate)
             .all(|edge| edge_uses.get(&edge.id).map(Vec::len) == Some(2));
-        if closed && actual != expected {
+        // Non-manifold plan 1.2: a Sheet does not declare a solid genus,
+        // including when its particular set of faces happens to be closed.
+        if !matches!(self.kind, BodyKind::Sheet | BodyKind::Cellular) && closed && actual != expected {
             // OCC-style models carry COINCIDENT PARALLEL edges: two
             // ref-distinct edges riding one geometric locus between the same
             // vertices (a wall split exactly where an adjoining ring meets
@@ -437,10 +490,122 @@ impl BrepSolid {
                 )));
             }
         }
+        if self.kind == BodyKind::Cellular {
+            self.validate_cells(&edges, &mut issues);
+        }
         ValidationReport {
             issues,
             wire_warnings,
             max_pcurve_error,
+        }
+    }
+
+    // Plan 2.1: this is reached only for a DECLARED Cellular body. All
+    // geometry/identity checks above still run; no Solid/Sheet rule changes.
+    fn validate_cells(&self, edges: &HashMap<u64, &EdgeRecord>, issues: &mut Vec<ValidationIssue>) {
+        if self.cells.is_empty() {
+            issues.push(ValidationIssue::error("Cellular body has no declared cells"));
+            return;
+        }
+        let faces: HashMap<_, _> = self.shells.iter().flat_map(|s| &s.faces).map(|f| (f.id, f)).collect();
+        let mut cell_ids = HashSet::default();
+        let mut owners: HashMap<u64, Vec<bool>> = HashMap::default();
+        // A wall contributes one directed use for EACH incident region.
+        let mut fans: HashMap<u64, Vec<(&FaceRecord, bool, &CoedgeRecord)>> = HashMap::default();
+        for cell in &self.cells {
+            if !cell_ids.insert(cell.id) {
+                issues.push(ValidationIssue::error(format!("duplicate cell id {}", cell.id)));
+            }
+            if cell.faces.is_empty() {
+                issues.push(ValidationIssue::error(format!("cell {} has no faces", cell.id)));
+            }
+            let mut seen = HashSet::default();
+            let mut uses: HashMap<u64, Vec<bool>> = HashMap::default();
+            let mut holes = 0i64;
+            for &(id, forward) in &cell.faces {
+                if !seen.insert(id) {
+                    issues.push(ValidationIssue::error(format!("cell {} repeats face {id}", cell.id)));
+                    continue;
+                }
+                let Some(&face) = faces.get(&id) else {
+                    issues.push(ValidationIssue::error(format!("cell {} references missing face {id}", cell.id)));
+                    continue;
+                };
+                owners.entry(id).or_default().push(forward);
+                holes += face.loops.iter().filter(|record| !record.coedges.is_empty()
+                    && record.coedges.iter().any(|c| edges.get(&c.edge_id).is_some_and(|e| !e.degenerate)))
+                    .count().saturating_sub(1) as i64;
+                for coedge in face.loops.iter().flat_map(|l| &l.coedges) {
+                    uses.entry(coedge.edge_id).or_default().push(coedge.forward == forward);
+                    fans.entry(coedge.edge_id).or_default().push((face, forward, coedge));
+                }
+            }
+            let mut vertices = HashSet::default();
+            let mut edge_count = 0i64;
+            for (id, senses) in &uses {
+                let Some(&edge) = edges.get(id) else { continue; };
+                let opposite = senses.len() == 2 && senses[0] != senses[1];
+                if !(opposite || (edge.degenerate && senses.len() == 1)) {
+                    issues.push(ValidationIssue::error(format!(
+                        "cell {} edge {id} is not closed with opposite senses: {senses:?}", cell.id)));
+                }
+                if !edge.degenerate {
+                    edge_count += 1;
+                    vertices.extend([edge.start_vertex_id, edge.end_vertex_id]);
+                }
+            }
+            let chi = vertices.len() as i64 - edge_count + seen.len() as i64 - holes;
+            if chi % 2 != 0 {
+                issues.push(ValidationIssue::error_kind(IssueKind::GenusMismatch,
+                    format!("cell {} has odd Euler characteristic {chi}", cell.id)));
+            }
+        }
+        for id in faces.keys() {
+            let senses = owners.get(id).map(Vec::as_slice).unwrap_or(&[]);
+            if senses.is_empty() || senses.len() > 2 || (senses.len() == 2 && senses[0] == senses[1]) {
+                issues.push(ValidationIssue::error(format!(
+                    "face {id} has invalid cell ownership senses {senses:?}")));
+            }
+        }
+        for (id, uses) in fans {
+            let Some(&edge) = edges.get(&id) else { continue; };
+            if edge.degenerate || uses.len() <= 2 { continue; }
+            for fraction in [0.25, 0.5, 0.75] {
+                let reading = (|| -> Result<Vec<(f64, bool)>, String> {
+                    let t = edge.t0 + (edge.t1-edge.t0)*fraction;
+                    let derivatives = edge.curve.derivatives(t, 1)?;
+                    let tangent = derivatives[1].scale(if edge.t1 >= edge.t0 { 1.0 } else { -1.0 }).normalized()?;
+                    let axis = tangent.perpendicular()?;
+                    let other = tangent.cross(axis);
+                    let mut radial = Vec::new();
+                    for &(face, forward, coedge) in &uses {
+                        let uv = crate::project_point_to_surface(&face.surface, derivatives[0])?;
+                        let normal = face.surface.normal(uv.u, uv.v)?
+                            .scale(if face.same_sense { 1.0 } else { -1.0 });
+                        // Order face HALF-planes about the edge: coplanar
+                        // faces on opposite sides have equal normals but
+                        // opposite inward rays. A shared wall contributes
+                        // the same ray twice, with opposite cell senses.
+                        let ray = normal.cross(tangent.scale(if coedge.forward { 1.0 } else { -1.0 }));
+                        let (x,y) = (ray.dot(axis), ray.dot(other));
+                        if !x.is_finite() || !y.is_finite() || x*x+y*y < 1e-20 {
+                            return Err("undefined radial face tangent".into());
+                        }
+                        radial.push((y.atan2(x), coedge.forward == forward));
+                    }
+                    // At a shared-wall ray, close the preceding region
+                    // before opening the following one (true then false).
+                    radial.sort_by(|a,b| a.0.total_cmp(&b.0).then_with(|| b.1.cmp(&a.1)));
+                    Ok(radial)
+                })();
+                match reading {
+                    Ok(radial) if radial.iter().enumerate().all(|(i, a)| a.1 != radial[(i+1)%radial.len()].1) => {},
+                    Ok(_) => { issues.push(ValidationIssue::error(format!(
+                        "Cellular edge {id} radial cell senses do not alternate at {fraction}"))); break; },
+                    Err(error) => { issues.push(ValidationIssue::error(format!(
+                        "Cellular edge {id} radial cell fan cannot be read: {error}"))); break; },
+                }
+            }
         }
     }
 
@@ -670,6 +835,297 @@ pub(crate) fn adaptive_coedge_error(
 /// gains an edge and a vertex at its crotch ((5, 9, 6) against (5, 8, 5),
 /// `tests/suites/tangent_node_assembly.rs`, 2026-09-26) — a consumer that
 /// depends on its instrument's coarseness, named for its own slice.
+thread_local! {
+    static COEDGE_MEMO: std::cell::RefCell<Option<HashMap<Vec<u64>, Result<f64, String>>>> =
+        const { std::cell::RefCell::new(None) };
+    /// Reads served from the memo and reads computed, in the open scope.
+    static COEDGE_MEMO_COUNTS: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+/// `BREP_VALIDATE_COEDGE_MEMO` (lane X): while a [`CoedgeMemoScope`] is open,
+/// `validate` reads each coedge's geometry check once per distinct input.
+/// [`coedge_error_floored`] is a pure function of the carrier, the pcurve, the
+/// edge curve, the edge's `[t0, t1]`, the sense and the band (validate builds
+/// all three NURBS fresh, so no recognition cache reaches it), and the key is
+/// every one of those inputs bit for bit, compared in full on a hit: a repeat
+/// returns exactly what re-reading would. A boolean validates its result three
+/// times (assembly, face merge, the closing check) and most coedges arrive at
+/// the later two unchanged. On by default; `0`/`off` disables it.
+pub(crate) fn coedge_memo_enabled() -> bool {
+    let enabled = !matches!(std::env::var("BREP_VALIDATE_COEDGE_MEMO").as_deref(), Ok("0") | Ok("off"));
+    enabled
+}
+
+
+/// The memo's lifetime: one operation. Nested scopes share the outer one.
+pub(crate) struct CoedgeMemoScope {
+    opened: bool,
+}
+
+impl CoedgeMemoScope {
+    pub(crate) fn open(enabled: bool) -> Self {
+        let opened = enabled
+            && COEDGE_MEMO.with(|memo| {
+                let mut memo = memo.borrow_mut();
+                if memo.is_some() {
+                    return false;
+                }
+                *memo = Some(HashMap::default());
+                COEDGE_MEMO_COUNTS.with(|counts| counts.set((0, 0)));
+                true
+            });
+        CoedgeMemoScope { opened }
+    }
+}
+
+impl Drop for CoedgeMemoScope {
+    fn drop(&mut self) {
+        if self.opened {
+            COEDGE_MEMO.with(|memo| *memo.borrow_mut() = None);
+            let (hits, misses) = COEDGE_MEMO_COUNTS.with(|counts| counts.get());
+            if std::env::var_os("BREP_PROFILE").is_some() {
+                eprintln!("validate.coedge_memo hits={hits} misses={misses}");
+            }
+        }
+    }
+}
+
+fn coedge_memo_key(
+    surface: &NurbsSurface,
+    pcurve: &NurbsCurve,
+    curve: &NurbsCurve,
+    edge: &EdgeRecord,
+    forward: bool,
+    tolerance: f64,
+) -> Vec<u64> {
+    let mut key = Vec::with_capacity(
+        16 + surface.knots_u.len() + surface.knots_v.len() + 4 * surface.control_points.iter().map(Vec::len).sum::<usize>()
+            + pcurve.knots.len() + 4 * pcurve.control_points.len() + curve.knots.len() + 4 * curve.control_points.len(),
+    );
+    let push_point = |key: &mut Vec<u64>, point: &crate::Vec4| key.extend([point.x.to_bits(), point.y.to_bits(), point.z.to_bits(), point.w.to_bits()]);
+    key.extend([edge.t0.to_bits(), edge.t1.to_bits(), forward as u64, tolerance.to_bits()]);
+    key.extend([surface.degree_u as u64, surface.degree_v as u64, surface.knots_u.len() as u64, surface.knots_v.len() as u64, surface.control_points.len() as u64]);
+    key.extend(surface.knots_u.iter().chain(&surface.knots_v).map(|knot| knot.to_bits()));
+    for row in &surface.control_points {
+        key.push(row.len() as u64);
+        for point in row {
+            push_point(&mut key, point);
+        }
+    }
+    for nurbs in [pcurve, curve] {
+        key.extend([nurbs.degree as u64, nurbs.knots.len() as u64, nurbs.control_points.len() as u64]);
+        key.extend(nurbs.knots.iter().map(|knot| knot.to_bits()));
+        for point in &nurbs.control_points {
+            push_point(&mut key, point);
+        }
+    }
+    key
+}
+
+/// `BREP_VALIDATE_EXACT_LINES` (lane X): `validate` reads a line coedge on a
+/// plane exactly instead of sampling it. On by default; `0`/`off` disables it.
+/// Only `validate`'s own per-coedge read takes it: every other caller of
+/// [`coedge_error_floored`] / [`adaptive_coedge_error`] keeps the sampler.
+pub(crate) fn exact_lines_enabled() -> bool {
+    let enabled = !matches!(std::env::var("BREP_VALIDATE_EXACT_LINES").as_deref(), Ok("0") | Ok("off"));
+    enabled
+}
+
+
+/// The coedge error of a line edge on a plane, exactly, when the coedge's 3-D
+/// curve and its pcurve image are one line BY CONSTRUCTION; `None` sends the
+/// coedge to the sampler. The admitted class: an edge curve of degree 1 with
+/// two control points of equal weight (linear in `t`); a pcurve of degree 1
+/// with two control points of equal weight (linear in its parameter) whose
+/// ends lie in the carrier's domain; a carrier of degree 1×1 on a 2×2 net of
+/// equal weights whose parallelogram defect is exactly zero (an affine map,
+/// no bilinear term). The sampler compares `S(q(q0 + f·Δq))` with
+/// `c(t0 + f·Δt)` at fractions `f` of `[0, 1]`; for this class both are affine
+/// in `f`, so their difference is too and its largest norm on `[0, 1]` is at
+/// an end: the answer is the larger endpoint gap, read by the sampler's own
+/// `coedge_sample`. That is the true error; the sampler's reading adds only
+/// interior rounding (a box face's ~4e-15 becomes the endpoints' gap, 0 there).
+pub(crate) fn exact_line_on_plane_error(
+    surface: &NurbsSurface,
+    pcurve: &NurbsCurve,
+    curve: &NurbsCurve,
+    edge: &EdgeRecord,
+    forward: bool,
+) -> Option<f64> {
+    let linear = |nurbs: &NurbsCurve| {
+        nurbs.degree == 1
+            && nurbs.control_points.len() == 2
+            && nurbs.knots.len() == 4
+            && nurbs.control_points[0].w == nurbs.control_points[1].w
+            && nurbs.control_points[0].w > 0.0
+    };
+    if !linear(pcurve) || !linear(curve) {
+        return None;
+    }
+    if surface.degree_u != 1
+        || surface.degree_v != 1
+        || surface.knots_u.len() != 4
+        || surface.knots_v.len() != 4
+        || surface.control_points.len() != 2
+        || surface.control_points.iter().any(|row| row.len() != 2)
+    {
+        return None;
+    }
+    let weight = surface.control_points[0][0].w;
+    if !(weight > 0.0) || surface.control_points.iter().flatten().any(|control| control.w != weight) {
+        return None;
+    }
+    let corner = |i: usize, j: usize| surface.control_points[i][j].point().ok();
+    let (p00, p01, p10, p11) = (corner(0, 0)?, corner(0, 1)?, corner(1, 0)?, corner(1, 1)?);
+    let defect = p11.sub(p10).sub(p01.sub(p00));
+    if defect.x != 0.0 || defect.y != 0.0 || defect.z != 0.0 {
+        return None;
+    }
+    let ([u0, u1], [v0, v1]) = (surface.domain_u().ok()?, surface.domain_v().ok()?);
+    let [q0, q1] = pcurve.domain().ok()?;
+    for q in [q0, q1] {
+        let uv = pcurve.evaluate(q).ok()?;
+        if !(uv.x >= u0 && uv.x <= u1 && uv.y >= v0 && uv.y <= v1) {
+            return None;
+        }
+    }
+    let [c0, c1] = curve.domain().ok()?;
+    let (low, high) = (edge.t0.min(edge.t1), edge.t0.max(edge.t1));
+    if !(low >= c0 && high <= c1) {
+        return None;
+    }
+    let start = coedge_sample(surface, pcurve, curve, edge, forward, 0.0).ok()?.0;
+    let end = coedge_sample(surface, pcurve, curve, edge, forward, 1.0).ok()?.0;
+    Some(start.max(end))
+}
+
+/// Lane R1 (granted 2026-10-18): the closed-form coedge reading of an
+/// iso-parameter line. On by default (promoted 2026-10-18 on the 98 + 144
+/// census); `BREP_VALIDATE_EXACT_ISO=0` (or `off`) sends it to the sampler.
+pub(crate) fn exact_iso_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !matches!(std::env::var("BREP_VALIDATE_EXACT_ISO").as_deref(), Ok("0") | Ok("off")))
+}
+
+
+/// The coedge error of an ISO-PARAMETER line, bounded in closed form; `None`
+/// sends the coedge to the sampler. The admitted class: a pcurve of degree 1
+/// with two control points of equal weight (linear in its parameter) along
+/// one iso line of the carrier (`v = c` or `u = c`, the two ends' coordinate
+/// equal bit for bit) inside the carrier's domain; an edge curve equal to the
+/// carrier's own iso curve there (`iso_curve_v(c)` / `iso_curve_u(c)`
+/// rebuilt: degree, knots and weights bit for bit, control points within
+/// `1e-12` of the net's size) whose parameter range IS the pcurve's range of
+/// the free coordinate, in the coedge's sense. Then the sampler's two points
+/// at every fraction are the carrier and the edge curve at one parameter:
+/// with the same basis and weights their difference is a convex combination
+/// of the control points' differences, so the error is at most the largest
+/// of those, and at least the ends' gaps — the answer is the larger of the
+/// two (`coedge_sample` reads the ends). That bounds the true error; the
+/// sampler's own reading adds only the interior rounding of evaluating one
+/// point two ways (2e-15 on a rim fillet's rail), as for
+/// [`exact_line_on_plane_error`].
+pub(crate) fn exact_iso_line_error(
+    surface: &NurbsSurface,
+    pcurve: &NurbsCurve,
+    curve: &NurbsCurve,
+    edge: &EdgeRecord,
+    forward: bool,
+) -> Option<f64> {
+    if pcurve.degree != 1
+        || pcurve.control_points.len() != 2
+        || pcurve.knots.len() != 4
+        || pcurve.control_points[0].w != pcurve.control_points[1].w
+        || !(pcurve.control_points[0].w > 0.0)
+    {
+        return None;
+    }
+    let [q0, q1] = pcurve.domain().ok()?;
+    let (a, b) = (pcurve.evaluate(q0).ok()?, pcurve.evaluate(q1).ok()?);
+    let ([u0, u1], [v0, v1]) = (surface.domain_u().ok()?, surface.domain_v().ok()?);
+    for uv in [a, b] {
+        if !(uv.x >= u0 && uv.x <= u1 && uv.y >= v0 && uv.y <= v1) {
+            return None;
+        }
+    }
+    // Which coordinate is fixed, and the free one's range along the pcurve.
+    let (iso, from, to) = if a.y.to_bits() == b.y.to_bits() && a.x != b.x {
+        (surface.iso_curve_v(a.y).ok()?, a.x, b.x)
+    } else if a.x.to_bits() == b.x.to_bits() && a.y != b.y {
+        (surface.iso_curve_u(a.x).ok()?, a.y, b.y)
+    } else {
+        return None;
+    };
+    // The edge's parameter at fraction f must be the free coordinate there.
+    let (start, end) = if forward { (edge.t0, edge.t1) } else { (edge.t1, edge.t0) };
+    if start.to_bits() != from.to_bits() || end.to_bits() != to.to_bits() {
+        return None;
+    }
+    if iso.degree != curve.degree
+        || iso.knots.len() != curve.knots.len()
+        || iso.knots.iter().zip(&curve.knots).any(|(x, y)| x.to_bits() != y.to_bits())
+        || iso.control_points.len() != curve.control_points.len()
+    {
+        return None;
+    }
+    let size = iso
+        .control_points
+        .iter()
+        .filter_map(|c| c.point().ok())
+        .fold(0f64, |m, q| m.max(q.x.abs()).max(q.y.abs()).max(q.z.abs()));
+    let mut deviation = 0f64;
+    for (p, q) in iso.control_points.iter().zip(&curve.control_points) {
+        if p.w.to_bits() != q.w.to_bits() || !(p.w > 0.0) {
+            return None;
+        }
+        deviation = deviation.max(p.point().ok()?.sub(q.point().ok()?).length());
+    }
+    if !(deviation <= 1e-12 * size.max(1.0)) {
+        return None;
+    }
+    let start_gap = coedge_sample(surface, pcurve, curve, edge, forward, 0.0).ok()?.0;
+    let end_gap = coedge_sample(surface, pcurve, curve, edge, forward, 1.0).ok()?.0;
+    Some(start_gap.max(end_gap).max(deviation))
+}
+
+/// [`coedge_error_floored`] through the operation's memo when one is open.
+fn memoized_coedge_error(
+    surface: &NurbsSurface,
+    pcurve: &NurbsCurve,
+    curve: &NurbsCurve,
+    edge: &EdgeRecord,
+    forward: bool,
+    tolerance: f64,
+) -> Result<f64, String> {
+    if exact_lines_enabled() {
+        if let Some(error) = exact_line_on_plane_error(surface, pcurve, curve, edge, forward) {
+            return Ok(error);
+        }
+    }
+    if exact_iso_enabled() {
+        if let Some(error) = exact_iso_line_error(surface, pcurve, curve, edge, forward) {
+            crate::blend::record_count("count.validate.exact_iso", 1);
+            return Ok(error);
+        }
+    }
+    if COEDGE_MEMO.with(|memo| memo.borrow().is_none()) {
+        return coedge_error_floored(surface, pcurve, curve, edge, forward, tolerance);
+    }
+    let key = coedge_memo_key(surface, pcurve, curve, edge, forward, tolerance);
+    if let Some(hit) = COEDGE_MEMO.with(|memo| memo.borrow().as_ref().and_then(|map| map.get(&key).cloned())) {
+        COEDGE_MEMO_COUNTS.with(|counts| counts.set((counts.get().0 + 1, counts.get().1)));
+        return hit;
+    }
+    COEDGE_MEMO_COUNTS.with(|counts| counts.set((counts.get().0, counts.get().1 + 1)));
+    let read = coedge_error_floored(surface, pcurve, curve, edge, forward, tolerance);
+    COEDGE_MEMO.with(|memo| {
+        if let Some(map) = memo.borrow_mut().as_mut() {
+            map.insert(key, read.clone());
+        }
+    });
+    read
+}
+
 pub(crate) fn coedge_error_floored(
     surface: &NurbsSurface,
     pcurve: &NurbsCurve,
@@ -873,3 +1329,108 @@ fn validate_uv_wire(
     }
     None
 }
+
+/// Bound on the clean-verdict memo; the set is emptied when it would pass it.
+const VALIDATED_CLEAN_CAP: usize = 4096;
+
+thread_local! {
+    static VALIDATED_CLEAN: std::cell::RefCell<rustc_hash::FxHashSet<(u64, u64)>> =
+        std::cell::RefCell::new(rustc_hash::FxHashSet::default());
+}
+
+impl BrepSolid {
+    /// Empty the clean-verdict memo of [`BrepSolid::validate_memoised`]:
+    /// called at a fillet operation's entry, so each operation pays for the
+    /// first read of every body it validates.
+    pub(crate) fn clear_validate_memo() {
+        VALIDATED_CLEAN.with(|clean| clean.borrow_mut().clear());
+    }
+
+    /// The body's memo key: the 128-bit two-lane content hash
+    /// (`mass_properties::TwoLane`, bit-exact on every float) over EVERY
+    /// field the body serialises — ids, names, kind, genus, vertices, edges,
+    /// shells, faces, loops, coedges, cells — so any mutation is a new key.
+    /// (A JSON serialisation of the body read the same content at ~10× the
+    /// cost: float formatting.)
+    pub(crate) fn validate_memo_key(&self) -> Option<(u64, u64)> {
+        use crate::mass_properties::TwoLane;
+        fn curve(lane: &mut TwoLane, curve: &crate::NurbsCurve) {
+            lane.usize(curve.degree);
+            lane.floats(&curve.knots);
+            lane.usize(curve.control_points.len());
+            for point in &curve.control_points {
+                lane.floats(&[point.x, point.y, point.z, point.w]);
+            }
+        }
+        fn name(lane: &mut TwoLane, name: &Option<String>) {
+            lane.bool(name.is_some());
+            if let Some(name) = name {
+                lane.usize(name.len());
+                for byte in name.bytes() {
+                    lane.u64(u64::from(byte));
+                }
+            }
+        }
+        let mut lane = TwoLane::new();
+        lane.u64(self.id);
+        lane.u64(self.genus as u64);
+        lane.usize(self.kind as usize);
+        lane.usize(self.vertices.len());
+        for vertex in &self.vertices {
+            lane.u64(vertex.id);
+            lane.floats(&[vertex.point.x, vertex.point.y, vertex.point.z]);
+        }
+        lane.usize(self.edges.len());
+        for edge in &self.edges {
+            lane.u64(edge.id);
+            curve(&mut lane, &edge.curve);
+            lane.floats(&[edge.t0, edge.t1]);
+            lane.u64(edge.start_vertex_id);
+            lane.u64(edge.end_vertex_id);
+            lane.bool(edge.degenerate);
+            name(&mut lane, &edge.name);
+        }
+        lane.usize(self.shells.len());
+        for shell in &self.shells {
+            lane.u64(shell.id);
+            lane.usize(shell.faces.len());
+            for face in &shell.faces {
+                lane.u64(face.id);
+                crate::mass_properties::hash_surface(&mut lane, &face.surface);
+                lane.bool(face.same_sense);
+                name(&mut lane, &face.name);
+                lane.usize(face.loops.len());
+                for loop_record in &face.loops {
+                    lane.u64(loop_record.id);
+                    lane.usize(loop_record.coedges.len());
+                    for coedge in &loop_record.coedges {
+                        lane.u64(coedge.id);
+                        lane.u64(coedge.edge_id);
+                        lane.bool(coedge.forward);
+                        curve(&mut lane, &coedge.pcurve);
+                    }
+                }
+            }
+        }
+        lane.usize(self.cells.len());
+        for cell in &self.cells {
+            lane.u64(cell.id);
+            lane.bool(cell.void);
+            lane.usize(cell.faces.len());
+            for (face, sense) in &cell.faces {
+                lane.u64(*face);
+                lane.bool(*sense);
+            }
+        }
+        let [a, b] = lane.finish();
+        Some((a, b))
+    }
+
+}
+
+fn validate_memo_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !matches!(std::env::var("BREP_VALIDATE_MEMO").as_deref(), Ok("0") | Ok("off")))
+}
+
+

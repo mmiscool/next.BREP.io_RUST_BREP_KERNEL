@@ -526,6 +526,7 @@ fn build_faceted_brep(points: &[Vec3], triangles: &[[usize; 3]]) -> Result<BrepS
     }
     let mut result = BrepSolid {
         mass_properties_cache: Default::default(),
+        cells: Default::default(),
         id: next_id + 1,
         vertices,
         edges,

@@ -44,6 +44,7 @@ fn embedded(path: &str, mime: &'static str) -> Response {
         "workflows.js" => include_bytes!("../../web/workflows.js"),
         "setup.js" => include_bytes!("../../web/setup.js"),
         "app.js" => include_bytes!("../../web/app.js"),
+        "webmcp.js" => include_bytes!("../../web/webmcp.js"),
         "split-panes.js" => include_bytes!("../../web/split-panes.js"),
         "style.css" => include_bytes!("../../web/style.css"),
         "native-import.js" => include_bytes!("../../web/native-import.js"),

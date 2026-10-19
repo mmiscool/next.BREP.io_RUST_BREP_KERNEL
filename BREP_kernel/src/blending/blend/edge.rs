@@ -8,7 +8,7 @@ mod keep;
 mod open;
 mod support;
 
-pub use closed::{blend_closed_edge, blend_edge_variable};
+pub use closed::{blend_closed_edge, blend_closed_edge_knot_aware, blend_edge_variable, is_pcurve_floor_refusal, with_pcurve_knot_retry};
 pub use open::blend_open_edge;
 
 pub(super) use keep::{blend_closed_edge_keep, fit_preserved_pcurve, KeepStation};
@@ -21,7 +21,8 @@ pub(super) use support::{locate_end_corner, resolve_free_end, splice_end_corner,
 pub(super) use support::trim_parameter_at_point;
 pub(super) use closed::{refit_closed_support_pcurve, replace_rim_in_face, trim_seam_edges};
 pub(crate) use support::{
-    consumed_band, is_consumed_snap, is_rail_collapse, RAIL_COLLAPSE_UNSUPPORTED, RAIL_COLLAPSE_WHAT,
+    consumed_band, is_consumed_snap, is_rail_collapse, END_TANGENT_CONTINUATION_WHAT, RAIL_COLLAPSE_UNSUPPORTED,
+    RAIL_COLLAPSE_WHAT,
 };
 pub(super) use support::BLEND_WIDER_THAN_FACE;
 pub(super) use support::check_snap_closure;
@@ -31,7 +32,7 @@ pub(super) use open::{
     OPEN_WALL_CENTRES,
 };
 pub(super) use support::{
-    extrusion_direction, fit_open_rows, fit_rows_breaking, interpolate_piece, march_open_stations,
+    extrusion_direction, fit_open_rows, fit_open_rows_breaking_at, fit_rows_breaking, interpolate_piece, march_open_stations,
     march_open_stations_core, march_open_stations_ending, open_station_parameters, pole_end, rails_off_carriers,
     vertex_stations, OpenDenseCentres,
 };

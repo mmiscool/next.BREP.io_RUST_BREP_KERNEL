@@ -330,6 +330,7 @@ impl BoundaryIndex {
 /// the scan would have tested that could possibly answer yes is still tested,
 /// with the identical predicate: the boolean is the same.
 pub(in crate::watertight_tessellation) struct ProtectedSegments {
+    rectangle: Option<([f64; 4], f64)>,
     pairs: Vec<(usize, usize)>,
     boxes: Vec<[f64; 4]>,
     origin: [f64; 2],
@@ -371,6 +372,28 @@ impl ProtectedSegments {
             lo = [0.0, 0.0];
             hi = [0.0, 0.0];
         }
+        let rectangle = if !pairs.is_empty() && lo.iter().chain(&hi).all(|x| x.is_finite()) {
+            let corners = [[lo[0], lo[1]], [lo[0], hi[1]], [hi[0], lo[1]], [hi[0], hi[1]]];
+            let mut required = 0.0f64;
+            for &(first, second) in &pairs {
+                let a = uv_of(first);
+                let b = uv_of(second);
+                let readings = corners.map(|p| triangle_area(a, b, p));
+                if readings.iter().any(|x| !x.is_finite()) {
+                    required = f64::INFINITY;
+                    break;
+                }
+                let minimum = readings.iter().copied().fold(f64::INFINITY, f64::min);
+                let maximum = readings.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                required = required.max((-minimum).min(maximum).max(0.0));
+                if required > 1e-14 { break; }
+            }
+            // The flipper's existing epsilon is 1e-14. This is a proof about
+            // that predicate, never a relaxed geometric or trim tolerance.
+            (required <= 1e-14).then_some(([lo[0], lo[1], hi[0], hi[1]], required))
+        } else {
+            None
+        };
         let target = (boxes.len() as f64).sqrt().ceil().clamp(1.0, MAX_AXIS_BUCKETS);
         let mut cell = [0.0f64; 2];
         let mut dims = [1usize; 2];
@@ -423,6 +446,7 @@ impl ProtectedSegments {
             }
         }
         Self {
+            rectangle,
             pairs,
             boxes,
             origin: lo,
@@ -448,6 +472,20 @@ impl ProtectedSegments {
         epsilon: f64,
     ) -> bool {
         let (p, q) = (uv_of(c), uv_of(d));
+        if let Some(([x0, y0, x1, y1], required)) = self.rectangle {
+            // With the segment fixed, the ORIGINAL floating-point orientation
+            // expression is monotone in each coordinate of the query point:
+            // subtract a constant, multiply by a fixed signed factor, subtract
+            // the other product, then multiply by 0.5. Its exact floating-point
+            // extrema over this box therefore occur at the four corners.
+            // For each segment either its minimum is >= -epsilon or its maximum
+            // is <= epsilon. Thus two points inside cannot have the two strict
+            // opposite signs that segments_properly_cross requires. Nearly
+            // rectangular UV rims can qualify without snapping a single word.
+            if epsilon >= required && [p, q].iter().all(|v| v[0] >= x0 && v[0] <= x1 && v[1] >= y0 && v[1] <= y1) {
+                return false;
+            }
+        }
         // Query box grown by a whole cell: a candidate lost to rounding in the
         // bucketing is a wrong answer, a candidate gained is only a test.
         let query = [
@@ -504,3 +542,5 @@ impl ProtectedSegments {
         hit
     }
 }
+
+

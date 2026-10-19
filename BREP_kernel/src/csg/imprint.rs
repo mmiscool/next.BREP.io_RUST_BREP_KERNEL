@@ -25,6 +25,7 @@ struct ImprintProfile {
     enabled: bool,
     pairs: u64,
     marched_pairs: u64,
+    whole_reading_reuses: u64,
     classify: Duration,
     cosurface: Duration,
     lies_on: Duration,
@@ -75,6 +76,7 @@ impl ImprintProfile {
         if !self.enabled {
             return;
         }
+        eprintln!("imprint.whole_reading_reuses count={}", self.whole_reading_reuses);
         let ms = |d: Duration| d.as_secs_f64() * 1_000.0;
         eprintln!(
             "imprint.profile pairs={} marched={} classify={:.2} cosurface={:.2} lies_on={:.2} planar_iso={:.2} analytic={:.2} seeds={:.2} march={:.2} clip_fit={:.2} process_curve={:.2}",
@@ -108,6 +110,25 @@ impl ImprintProfile {
             self.exact_iso_sections,
             self.exact_iso_declined,
         );
+    }
+}
+
+/// Coarse observation of optional contact/graph calls, including early
+/// declines. It owns no geometry and does not change caller diagnostics.
+struct ImprintSubphaseClock {
+    started: Option<Instant>,
+    label: &'static str,
+}
+impl ImprintSubphaseClock {
+    fn new(label: &'static str) -> Self {
+        Self { started: std::env::var_os("BREP_PROFILE").is_some().then(Instant::now), label }
+    }
+}
+impl Drop for ImprintSubphaseClock {
+    fn drop(&mut self) {
+        if let Some(started) = self.started {
+            eprintln!("imprint.subphase label={} ms={:.3}", self.label, started.elapsed().as_secs_f64() * 1000.0);
+        }
     }
 }
 
@@ -450,6 +471,35 @@ pub struct TangentSectionRecord {
     /// Appended at the end of the struct (2026-10-11).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub piece_ids: Vec<u64>,
+    /// GRAZING PIERCES WITHOUT A SECTION (2026-10-17, the revolve-into-bore
+    /// report): a trim edge of one face pierces the other carrier INSIDE both
+    /// trims, but at an angle below the seed gate, and the march found no
+    /// branch for the pair. The pierce proves a section crosses the faces
+    /// there; the empty march says the crossing is too near tangency to walk
+    /// (a third-order contact: the branch is born tangent to a contact curve
+    /// on a shared boundary, `boolean::attribute_to_tangent_node`). Each
+    /// entry is the pierce point and its `|edge_tangent · normal|`. Such a
+    /// record is attribution only — nothing is imprinted — and names the
+    /// contact when the assembly tears downstream of it. Appended at the end
+    /// of the struct.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub grazing: Vec<(Vec3, f64)>,
+}
+
+impl TangentSectionRecord {
+    /// A record standing on its grazing pierces ALONE — the lane found no
+    /// contact to name, so the driver set its ends to the pierces (its
+    /// `start` IS the first pierce, bit for bit, and nothing was traced). The
+    /// boolean's attribution reads such a record only as a fallback: a
+    /// contact the lane found, or a tangent node the imprint classified, is
+    /// the nearer cause and keeps its own wording.
+    pub fn pierce_only(&self) -> bool {
+        self.stations == 0
+            && self
+                .grazing
+                .first()
+                .is_some_and(|(point, _)| point.sub(self.start).length() == 0.0)
+    }
 }
 
 #[path = "imprint/ruled_torus.rs"]

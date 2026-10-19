@@ -121,8 +121,14 @@ section (the project licence, the third-party notices, and an inventory of
 every crate the application ships, with the font notices that must accompany
 the embedded fonts).
 
-The native default `mcp` feature embeds `BREP_mcp_core`; the wasm build uses
-its automation layer without the native server dependencies. The crate ships
+The default `mcp` feature embeds `BREP_mcp_core`: natively the whole server
+(`brep-app --mcp`); on the web the core without its `server` feature — the
+tool set alone, hosted by `src/webmcp.rs` over the page's own platform (the
+document store as the file system, blob URLs as the kept screenshots,
+downloads as exports) and registered as
+[WebMCP](https://webmachinelearning.github.io/webmcp/) tools on
+`document.modelContext` (installed by the page from `web/webmcp.js` after
+`start`), so a browser's own agent gets the same tools a desktop one does. The crate ships
 `LICENSE.md` (the Autodrop3d licence, `license-file` in the manifest) and
 `THIRD-PARTY-NOTICES.md`, which covers the four bundled font faces; a native
 binary distributed on its own needs both files beside it.

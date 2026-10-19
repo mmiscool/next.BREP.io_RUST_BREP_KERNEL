@@ -584,6 +584,7 @@ impl ControlCage {
         let seam = surface.iso_curve_u(0.0)?;
         let solid = BrepSolid {
             mass_properties_cache: Default::default(),
+            cells: Default::default(),
             id: 120,
             vertices: vec![
                 VertexRecord { id: 1, point: south },

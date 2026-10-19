@@ -290,6 +290,7 @@ impl TopologyArena {
             .collect::<Result<Vec<_>, String>>()?;
         Ok(BrepSolid {
             mass_properties_cache: Default::default(),
+            cells: Default::default(),
             id: self.wire_solid_id,
             vertices,
             edges,

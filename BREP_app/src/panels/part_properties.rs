@@ -96,7 +96,7 @@ impl PartPropertiesPanel {
             .default_size([340.0, 420.0])
             // Offset from the Settings window's own default rest position, so
             // opening both does not stack them pixel-for-pixel.
-            .default_pos([660.0, 96.0])
+            .default_pos(super::below_chrome(ctx, 660.0, 40.0))
             .show(ctx, |ui| self.body(ui, state, title, document));
         self.open = open;
 

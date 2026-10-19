@@ -56,6 +56,11 @@ pub fn solid_mass_properties(solid: &BrepSolid) -> Result<MassProperties, String
     let token = super::profile::begin("solid_mass_properties");
     let result = solid_mass_properties_cached(solid);
     super::profile::end(token);
+    if result.is_ok() && sign_terms_oracle_enabled() && solid.kind == crate::BodyKind::Solid
+        && !solid.shells.is_empty() && solid.shells.iter().all(|shell| !shell.faces.is_empty())
+    {
+        verify_solid_sign_terms(solid)?;
+    }
     if let (Some(dump), Ok(properties)) = (super::profile::identity_dump(), result.as_ref()) {
         super::profile::emit_identity(
             dump,
@@ -196,6 +201,9 @@ pub fn solid_signed_volume(solid: &BrepSolid) -> Result<f64, String> {
         solid_signed_volume_uncached(solid)
     };
     super::profile::end(token);
+    if result.is_ok() && sign_terms_oracle_enabled() && solid.kind == crate::BodyKind::Solid {
+        verify_solid_sign_terms(solid)?;
+    }
     if let (Some(dump), Ok(volume)) = (super::profile::identity_dump(), result.as_ref()) {
         super::profile::emit_identity(dump, "solid_signed_volume", solid, &[("signed_bits", *volume)]);
     }
@@ -209,6 +217,20 @@ pub fn solid_signed_volume(solid: &BrepSolid) -> Result<f64, String> {
 /// safety margin, not a measured error.
 const SIGN_READING_MARGIN: f64 = 1e-6;
 
+/// [`solid_signed_volume_for_sign`] for a caller that compares the result with
+/// `bar` and nothing else (the boolean assembly's closed tail, the shell's
+/// orientation, the direct edit's inversion check — 2026-10-17): the memoised
+/// sign reading, whose verdict against the bar is the exact integral's.
+/// `BREP_SIGN_READERS_EXACT=1` restores the exact read at those call sites,
+/// for an on/off census. Read once.
+pub fn signed_volume_against(solid: &BrepSolid, bar: f64) -> Result<f64, String> {
+    static EXACT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *EXACT.get_or_init(|| std::env::var("BREP_SIGN_READERS_EXACT").as_deref() == Ok("1")) {
+        return solid_signed_volume(solid);
+    }
+    solid_signed_volume_for_sign(solid, bar)
+}
+
 /// [`solid_signed_volume`] read for its SIGN against `bar`, as the boolean's
 /// assembly reads it (`volume <= tolerance³` refuses an inverted shell).
 ///
@@ -217,8 +239,9 @@ const SIGN_READING_MARGIN: f64 = 1e-6;
 /// straight line in uv (a bore's rims, 85 % of the plate case's 105 ms check:
 /// 256 chords per wall half, 442 368 correction stations in all) the sliver
 /// has no area and the correction is zero to rounding, so this reading skips
-/// it (`trimmed::with_straight_corrections_skipped`). Every other chord, face
-/// and route reads exactly as `solid_signed_volume` does; nothing is cached.
+/// it (`trimmed::with_straight_corrections_skipped`). Face volume and vector
+/// area terms are integrated together and retained by content, then evaluated
+/// about the same shell reference as `solid_signed_volume`.
 ///
 /// Native two-sphere supports with the certified trim scope can return a
 /// positive lower bound; `BREP_SPHERE_SIGN_BOUND=0|off` keeps the old path. Only a
@@ -234,7 +257,11 @@ pub fn solid_signed_volume_for_sign(solid: &BrepSolid, bar: f64) -> Result<f64, 
         Err(std::env::VarError::NotPresent) => true,
         Err(_) => false,
     };
-    solid_signed_volume_for_sign_with_bound(solid, bar, enabled)
+    let result = solid_signed_volume_for_sign_with_bound(solid, bar, enabled);
+    if result.is_ok() && sign_terms_oracle_enabled() {
+        verify_solid_sign_terms(solid)?;
+    }
+    result
 }
 
 pub(super) fn solid_signed_volume_for_sign_with_bound(solid: &BrepSolid, bar: f64, enabled: bool) -> Result<f64, String> {
@@ -249,15 +276,7 @@ pub(super) fn solid_signed_volume_for_sign_with_bound(solid: &BrepSolid, bar: f6
         }
     }
     let token = super::profile::begin("solid_signed_volume_for_sign");
-    let outcome = super::trimmed::with_straight_corrections_skipped(|| {
-        let (mut reading, mut magnitude) = (0.0, 0.0);
-        for shell in &solid.shells {
-            let (volume, faces) = shell_volume_sign_reading(shell)?;
-            reading += volume;
-            magnitude += faces;
-        }
-        Ok::<(f64, f64), String>((reading, magnitude))
-    });
+    let outcome = solid_sign_terms_reading(solid);
     super::profile::end(token);
     let (reading, magnitude) = outcome?;
     if (reading - bar).abs() > SIGN_READING_MARGIN * magnitude {
@@ -266,10 +285,50 @@ pub(super) fn solid_signed_volume_for_sign_with_bound(solid: &BrepSolid, bar: f6
     solid_signed_volume(solid)
 }
 
+/// Retain the exact path's shell references and compensated face order.
+/// Each face's volume flux is affine in the reference: retain its local
+/// volume and vector area, then translate the term to the shell reference.
+/// Unchanged faces survive both id renumbering and a moving shell reference.
+fn solid_sign_terms_reading(solid: &BrepSolid) -> Result<(f64, f64), String> {
+    super::trimmed::with_straight_corrections_skipped(|| {
+        let (mut reading, mut magnitude) = (0.0, 0.0);
+        for (shell_index, shell) in solid.shells.iter().enumerate() {
+            let (volume, faces) = shell_volume_sign_reading(shell, shell_index)?;
+            reading += volume;
+            magnitude += faces;
+        }
+        Ok((reading, magnitude))
+    })
+}
+
+fn sign_terms_oracle_enabled() -> bool {
+    std::env::var("BREP_SIGN_TERMS_ORACLE").as_deref() == Ok("1")
+}
+
+/// Diagnostic census only; the shipped reading and the sphere certificate
+/// stay unchanged. The cold oracle never uses the mass cache or reading memo.
+fn verify_solid_sign_terms(solid: &BrepSolid) -> Result<(), String> {
+    let token = super::profile::begin("solid_sign_terms_oracle");
+    let reading = solid_sign_terms_reading(solid).map(|pair| pair.0);
+    super::profile::end(token);
+    check_sign_terms(solid, reading?)
+}
+
+pub(super) fn check_sign_terms(solid: &BrepSolid, reading: f64) -> Result<(), String> {
+    let exact = solid_signed_volume_uncached(solid)?;
+    let error = (reading - exact).abs();
+    let bar = 1e-9 * exact.abs();
+    if !reading.is_finite() || !exact.is_finite() || error > bar {
+        return Err(format!("sign terms oracle: retained {reading:.17e}, whole-body {exact:.17e}, error {error:.3e} exceeds {bar:.3e}"));
+    }
+    super::profile::emit_sign_oracle(solid, reading, exact)?;
+    Ok(())
+}
+
 /// [`shell_signed_volume`]'s sum under the caller's correction policy, with
 /// the sum of the face contributions' magnitudes beside it (the scale the
 /// sign reading's margin is read against).
-fn shell_volume_sign_reading(shell: &ShellRecord) -> Result<(f64, f64), String> {
+fn shell_volume_sign_reading(shell: &ShellRecord, shell_index: usize) -> Result<(f64, f64), String> {
     let reference = shell_volume_reference(shell)?;
     if std::env::var_os("BREP_PROFILE").is_some() {
         eprintln!(
@@ -285,23 +344,26 @@ fn shell_volume_sign_reading(shell: &ShellRecord) -> Result<(f64, f64), String> 
         mass_profile(|p| p.faces += 1);
         let line_before = face_lines.then(super::profile::snapshot);
         let line_started = face_lines.then(Instant::now);
-        // A pure function of the face's content and the reference, served
-        // from the reading memo when this face was read about this reference
-        // before (`reading_memo.rs`). The stored term is the one read under
-        // `with_straight_corrections_skipped` — this function is that
-        // policy's only caller, which is what makes a key without the policy
-        // sound; a reader of the exact path must not share this memo. A
-        // failed reading is stored as `None` and recomputed below, so its
-        // error still propagates.
-        let contribution = match crate::reading_memo::memoized(
-            crate::reading_memo::Reading::SignContribution,
-            super::identity::face_contribution_identity(face, reference),
-            || face_volume_contribution_about(face, reference).ok(),
-        ) {
-            Some(contribution) => contribution,
-            None => face_volume_contribution_about(face, reference)?,
+        // V_f(r) = V_f(a) + (a-r) · A_f / 3. Integrate both terms at
+        // the SAME quadrature stations, including trim corrections. Using a
+        // boundary-only vector area would miss the integrator's numerical
+        // residual and could change the sign reading on inherited trims.
+        // Anchor each face locally for accuracy far from the world origin.
+        let local = face_volume_reference(face).unwrap_or(reference);
+        let hash_started = super::profile::profile_started();
+        let identity = super::identity::face_contribution_identity(face, local);
+        let hash_ms = super::profile::elapsed_ms(hash_started);
+        let mut reread = false;
+        let terms = match crate::reading_memo::memoized_sign_terms(identity, || {
+            reread = true;
+            face_volume_terms_about(face, local).ok()
+        }) {
+            Some(terms) => terms,
+            None => face_volume_terms_about(face, local)?,
         };
-        emit_face_line("shell_volume_sign_reading", 0, face_index, face, line_before, line_started);
+        let contribution = terms[0] + local.sub(reference).dot(Vec3::new(terms[1], terms[2], terms[3]));
+        super::profile::sign_face(shell_index, face, reread, hash_ms);
+        emit_face_line("shell_volume_sign_reading", shell_index, face_index, face, line_before, line_started);
         magnitude += contribution.abs();
         let next = volume + contribution;
         if volume.abs() >= contribution.abs() {
@@ -323,43 +385,47 @@ fn solid_signed_volume_uncached(solid: &BrepSolid) -> Result<f64, String> {
 }
 
 pub(super) fn shell_volume_reference(shell: &ShellRecord) -> Result<Vec3, String> {
+    shell.faces.iter().find_map(face_volume_reference)
+        .ok_or_else(|| "mass_properties: shell has no finite geometric reference".to_string())
+}
+
+/// One finite authored point, with the same fallbacks as the exact integral.
+fn face_volume_reference(face: &FaceRecord) -> Option<Vec3> {
     let finite = |point: Vec3| point.x.is_finite() && point.y.is_finite() && point.z.is_finite();
-    for face in &shell.faces {
-        if let Some(coedge) = face
-            .loops
-            .first()
-            .and_then(|loop_record| loop_record.coedges.first())
-        {
-            if let Ok(domain) = coedge.pcurve.domain() {
-                if let Ok(uv) = coedge.pcurve.evaluate(domain[0]) {
-                    if let Ok(point) = face.surface.evaluate(uv.x, uv.y) {
-                        if finite(point) {
-                            return Ok(point);
-                        }
-                    }
-                }
-            }
-        }
-        if let Ok((u_breaks, v_breaks)) = surface_breaks(&face.surface) {
-            let u = 0.5 * (u_breaks[0] + u_breaks[u_breaks.len() - 1]);
-            let v = 0.5 * (v_breaks[0] + v_breaks[v_breaks.len() - 1]);
-            if let Ok(point) = face.surface.evaluate(u, v) {
-                if finite(point) {
-                    return Ok(point);
-                }
-            }
-        }
-        for row in &face.surface.control_points {
-            for control in row {
-                if let Ok(point) = control.point() {
+    if let Some(coedge) = face
+        .loops
+        .first()
+        .and_then(|loop_record| loop_record.coedges.first())
+    {
+        if let Ok(domain) = coedge.pcurve.domain() {
+            if let Ok(uv) = coedge.pcurve.evaluate(domain[0]) {
+                if let Ok(point) = face.surface.evaluate(uv.x, uv.y) {
                     if finite(point) {
-                        return Ok(point);
+                        return Some(point);
                     }
                 }
             }
         }
     }
-    Err("mass_properties: shell has no finite geometric reference".to_string())
+    if let Ok((u_breaks, v_breaks)) = surface_breaks(&face.surface) {
+        let u = 0.5 * (u_breaks[0] + u_breaks[u_breaks.len() - 1]);
+        let v = 0.5 * (v_breaks[0] + v_breaks[v_breaks.len() - 1]);
+        if let Ok(point) = face.surface.evaluate(u, v) {
+            if finite(point) {
+                return Some(point);
+            }
+        }
+    }
+    for row in &face.surface.control_points {
+        for control in row {
+            if let Ok(point) = control.point() {
+                if finite(point) {
+                    return Some(point);
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Exact signed volume of one closed shell. Multi-shell tessellation uses this
@@ -684,4 +750,5 @@ fn solid_mass_properties_full_moments(
         principal_axes,
     })
 }
+
 

@@ -437,12 +437,21 @@ fn transverse_at(
     second: SurfaceInfo<'_>,
     point: IntersectionPoint,
 ) -> bool {
+    crossing_at(first, second, point) >= TRANSVERSE_START_CROSS
+}
+
+/// `|n_a × n_b|` at `point`; zero where either carrier has no normal there.
+fn crossing_at(
+    first: SurfaceInfo<'_>,
+    second: SurfaceInfo<'_>,
+    point: IntersectionPoint,
+) -> f64 {
     match (
         first.surface.normal(point.ua, point.va),
         second.surface.normal(point.ub, point.vb),
     ) {
-        (Ok(a), Ok(b)) => a.cross(b).length() >= TRANSVERSE_START_CROSS,
-        _ => false,
+        (Ok(a), Ok(b)) => a.cross(b).length(),
+        _ => 0.0,
     }
 }
 
@@ -1127,6 +1136,23 @@ pub struct SurfaceIntersectionOptions {
     /// The transverse gate stays. Off, the default, grids as before.
     #[serde(default)]
     pub tree_seeds: bool,
+    /// SUB-GATE STARTS (2026-10-17, the revolve-into-bore report): the
+    /// `|n_a × n_b|` an EXPLICIT seed is admitted at, in place of
+    /// [`TRANSVERSE_START_CROSS`]. Grid and tree starts keep the gate: the
+    /// tangency-band runaway it exists for is theirs (a refined start inside
+    /// a band is a point no transverse curve passes through). An explicit
+    /// seed the caller has PROVEN to lie on a crossing — a trim edge of one
+    /// face that leaves one side of the other carrier for the other at the
+    /// seed — is a point of a transverse section whatever the angle, and the
+    /// march from it is sound down to where the corrector can still tell the
+    /// section from the tangency band: the lateral uncertainty `tol / α` of
+    /// a crossing at angle `α` against the band's half-width `√(2 R tol)`
+    /// across a contact of curvature radius `R`, so `α ≥ √(tol / 2R)`; the
+    /// caller derives the bound from its own tolerance and scale. A seed
+    /// below it is dropped exactly as before. `None`, the default, keeps the
+    /// gate byte for byte.
+    #[serde(default)]
+    pub seed_start_cross: Option<f64>,
 }
 
 fn default_tolerance() -> f64 {
@@ -1153,6 +1179,7 @@ impl Default for SurfaceIntersectionOptions {
             ordered_starts: false,
             consume_starts: false,
             tree_seeds: false,
+            seed_start_cross: None,
         }
     }
 }
@@ -1252,7 +1279,13 @@ pub fn intersect_surfaces(
         else {
             continue;
         };
-        if !transverse_at(first, second, refined) {
+        // The seed's own gate: the caller's sub-gate bound where it vouches
+        // for the seed, the transversality gate otherwise.
+        let admitted = match options.seed_start_cross {
+            Some(bound) => crossing_at(first, second, refined) >= bound.min(TRANSVERSE_START_CROSS),
+            None => transverse_at(first, second, refined),
+        };
+        if !admitted {
             continue;
         }
         starts.push(refined);
