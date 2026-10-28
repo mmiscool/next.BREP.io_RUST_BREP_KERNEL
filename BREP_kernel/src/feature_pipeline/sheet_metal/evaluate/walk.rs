@@ -172,7 +172,29 @@ pub fn evaluate(tree: &SheetTree, fold: f64) -> Result<BrepSolid, String> {
     // lines stay real BREP edges (see [`strip_flat`] for the naming contract).
     // Folded (fold ≠ 0): merge as before — the coplanar plate/wedge interfaces
     // are construction seams, not annotations.
-    let mut solid = union_all(parts, fold.abs() >= 1e-9)?;
+    // Adjacent bends share the already-trimmed plate corner. If sequential
+    // assembly cannot join that contact, assemble all of its interfaces in
+    // one arrangement, before intermediate edge coalescing changes a rim's
+    // parameterization. Existing successful assemblies keep their topology.
+    let joint_parts = (fold.abs() >= 1e-9 && has_adjacent_bends(&tree.root))
+        .then(|| parts.clone());
+    let mut solid = match union_all(parts, fold.abs() >= 1e-9) {
+        Ok(solid) => solid,
+        Err(error) => match joint_parts {
+            // The same options as the sequential path: a side wall, bend end
+            // cap, cutout wall or collar wall stays its own face on EVERY
+            // assembly route (owner 2026-10-27 — the fallback under default
+            // options fused the plate's remaining walls into the flange end
+            // caps at t = 1 while t = 7.5, assembled sequentially, kept them).
+            Some(parts) => crate::boolean_operation_nary_with_options(
+                &parts,
+                BooleanOperation::Union,
+                &folded_union_options(true),
+            )
+            .map_err(|_| error)?,
+            None => return Err(error),
+        },
+    };
     // Name every plate/bend edge `{faceA}|{faceB}[n]` (sorted face names + a
     // per-pair counter) so the SM body's edges become pickable by name — the app
     // resolves an edge selection strictly by its scene name. In particular a
@@ -187,6 +209,15 @@ pub fn evaluate(tree: &SheetTree, fold: f64) -> Result<BrepSolid, String> {
     // unfold's output stays byte-identical.
     crate::feature_pipeline::features::common::stamp_derived_edge_names(&mut solid);
     Ok(solid)
+}
+
+fn has_adjacent_bends(flat: &Flat) -> bool {
+    let n = flat.edges.len();
+    flat.edges.iter().enumerate().any(|(i, edge)| {
+        edge.bend.as_ref().is_some_and(|bend| {
+            flat.edges[(i + 1) % n].bend.is_some() || has_adjacent_bends(&bend.child)
+        })
+    })
 }
 
 /// Refuse (loudly, before any geometry) a bend anchored on a CURVED outline
@@ -299,12 +330,10 @@ fn emit_hole_bend(
     }
 }
 
-/// Union every part into one solid (base ∪ wedge ∪ child ∪ …). Empty/degenerate
-/// parts are skipped. `merge_coplanar` merges the coplanar plate/bend interface
-/// faces (the folded body); the flat pattern passes `false` so the bend BAND
-/// faces — same plane as the plates on purpose — keep their identity.
-fn union_all(parts: Vec<BrepSolid>, merge_coplanar: bool) -> Result<BrepSolid, String> {
-    let options = BooleanOptions {
+/// The boolean options of every folded-body assembly route — the sequential
+/// [`union_all`] and the one-arrangement fallback for adjacent bends alike.
+fn folded_union_options(merge_coplanar: bool) -> BooleanOptions {
+    BooleanOptions {
         merge_coplanar_faces: merge_coplanar,
         // Keep every PLANAR thickness/wall face per outline segment even when the
         // folded body coalesces coplanar faces: the big top/bottom plate faces
@@ -324,7 +353,15 @@ fn union_all(parts: Vec<BrepSolid>, merge_coplanar: bool) -> Result<BrepSolid, S
             ":wall:".to_string(),
         ],
         ..BooleanOptions::default()
-    };
+    }
+}
+
+/// Union every part into one solid (base ∪ wedge ∪ child ∪ …). Empty/degenerate
+/// parts are skipped. `merge_coplanar` merges the coplanar plate/bend interface
+/// faces (the folded body); the flat pattern passes `false` so the bend BAND
+/// faces — same plane as the plates on purpose — keep their identity.
+fn union_all(parts: Vec<BrepSolid>, merge_coplanar: bool) -> Result<BrepSolid, String> {
+    let options = folded_union_options(merge_coplanar);
     let mut current: Option<BrepSolid> = None;
     for part in parts {
         if part.shells.is_empty() {

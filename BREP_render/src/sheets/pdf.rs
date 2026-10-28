@@ -36,9 +36,9 @@
 //!
 //! PDF's origin is the page's BOTTOM-left with y running UP; a sheet is measured
 //! from the TOP-left with y running down. Every coordinate therefore goes
-//! through [`point`], which flips y about the page height — and a text run's
+//! through `point`, which flips y about the page height — and a text run's
 //! rotation flips with it, which is why the text matrix turns by the NEGATIVE of
-//! the drawing's angle ([`text_matrix`]).
+//! the drawing's angle (`text_matrix`).
 //!
 //! # What the PDF cannot carry that the SVG does
 //!
@@ -87,7 +87,7 @@
 
 use super::frame::FrameDrawing;
 use super::project::{SheetDrawing, SheetText, ViewDrawing};
-use super::svg::{ANNOTATION_WIDTH, CAP_PER_EM, EDGE_WIDTH, FRAME_WIDTH};
+use super::svg::{ANNOTATION_WIDTH, CAP_PER_EM, EDGE_WIDTH, FRAME_WIDTH, HIGHLIGHT_RGB, HIGHLIGHT_WIDTH_FACTOR};
 
 /// PDF user-space units per millimetre — a point is 1/72 of an inch.
 pub const PT_PER_MM: f64 = 72.0 / 25.4;
@@ -324,6 +324,15 @@ fn view_marks(view: &ViewDrawing, h: f64, out: &mut String) {
             out.push_str(&path(run, h));
         }
     }
+    if !view.highlighted.is_empty() {
+        // The highlight stroke, then back to black for everything after it.
+        let [r, g, b] = HIGHLIGHT_RGB;
+        out.push_str(&format!("{r:.4} {g:.4} {b:.4} RG\n{:.4} w\n", EDGE_WIDTH * HIGHLIGHT_WIDTH_FACTOR * PT_PER_MM));
+        for run in &view.highlighted {
+            out.push_str(&path(run, h));
+        }
+        out.push_str("0 0 0 RG\n");
+    }
     // The SECTION's hatch and caption, and the section LINES this placement
     // carries — the SVG's own layering, so the two files read alike.
     if let Some(section) = &view.section {
@@ -523,6 +532,26 @@ fn winansi(ch: char) -> Option<u8> {
 /// WinAnsi decoded, so a `⌀` the writer substituted reads `Ø` and a U+2212 a
 /// hyphen, which is what the file says. What the export door reports ABOUT the
 /// file, so a script can assert the drawing's text without a PDF reader.
+/// The Info dictionary's `/HiddenLine` read back from the bytes: `analytic`,
+/// or `mesh: ` and the placements the mesh approximation drew (`None` when
+/// the file has no such entry).
+pub fn hidden_line_of(pdf: &[u8]) -> Option<String> {
+    let key = b"/HiddenLine (";
+    let start = pdf.windows(key.len()).position(|w| w == key)? + key.len();
+    let mut out = Vec::new();
+    let mut i = start;
+    while i < pdf.len() && pdf[i] != b')' {
+        if pdf[i] == b'\\' && i + 1 < pdf.len() {
+            out.push(pdf[i + 1]);
+            i += 2;
+        } else {
+            out.push(pdf[i]);
+            i += 1;
+        }
+    }
+    Some(out.iter().map(|byte| from_winansi(*byte)).collect())
+}
+
 pub fn text_strings(pdf: &[u8]) -> Vec<String> {
     let mut out = Vec::new();
     let mut at = 0;

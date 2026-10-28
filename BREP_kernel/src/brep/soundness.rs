@@ -981,6 +981,30 @@ fn solid_self_intersections_with_pair_certificates(
     collect_census: bool,
     certify_pairs: bool,
 ) -> Result<SelfIntersectionReport, String> {
+    let key = if collect_census || fold_trace_enabled() || pierce_trace_enabled() {
+        None
+    } else {
+        network_acceptance_memo::scan_key(solid, options, certify_pairs)
+    };
+    if let Some(report) = key.and_then(network_acceptance_memo::lookup) {
+        return Ok(report);
+    }
+    if key.is_some() { network_acceptance_memo::note_read(); }
+    let report = solid_self_intersections_uncached(solid, options, collect_census, certify_pairs)?;
+    if let Some(key) = key {
+        if !report.is_flagged() && !report.truncated && report.undecided == 0 && report.fold_undecided == 0 {
+            network_acceptance_memo::store(key, report.clone());
+        }
+    }
+    Ok(report)
+}
+
+fn solid_self_intersections_uncached(
+    solid: &BrepSolid,
+    options: SelfIntersectionOptions,
+    collect_census: bool,
+    certify_pairs: bool,
+) -> Result<SelfIntersectionReport, String> {
     let mut report = empty_intersection_report(options);
     if !(options.chord_tolerance > 0.0) || !options.chord_tolerance.is_finite() {
         return Err("solid_self_intersections: chord tolerance must be positive".into());
@@ -2010,9 +2034,9 @@ fn straddle_material(
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[non_exhaustive]
 pub enum CrossingConfirmation {
-    /// [`straddle`]: the triangles' OWN CORNERS, in both directions.
+    /// `straddle`: the triangles' OWN CORNERS, in both directions.
     Corners,
-    /// [`pierce_straddle`]: an edge of one triangle through the other's
+    /// `pierce_straddle`: an edge of one triangle through the other's
     /// interior, with the samples taken at the pierce.
     Pierce,
     /// Neither of those decided it; the carriers did (`resolve.rs`): a point
@@ -3452,7 +3476,7 @@ fn vector_area_span_budget() -> usize {
 /// corpus that was not a slow scan but a stopped one — one imported solid
 /// held the sweep for eight minutes.
 ///
-/// 1e-11 is a ten-thousandth of [`PCURVE_REFINEMENT_TOLERANCE`], the same
+/// 1e-11 is a ten-thousandth of [`crate::PCURVE_REFINEMENT_TOLERANCE`], the same
 /// per-unit-of-length currency the bar is quoted in, so the whole shell's
 /// quadrature error is bounded by `bar / 5000` (a shell's boundary is twice
 /// its edge length) whatever its geometry does — and the bound is on the
@@ -3616,7 +3640,7 @@ pub struct ShellVectorArea {
     /// integrand the bisection cannot resolve — a kink rather than a curve —
     /// and the cost is the symptom.
     pub spans_at_depth_limit: usize,
-    /// The scan ABANDONED this shell on [`VECTOR_AREA_SPAN_BUDGET`] with
+    /// The scan ABANDONED this shell on `VECTOR_AREA_SPAN_BUDGET` with
     /// whole faces still unread.
     ///
     /// Its `trim_residual` is then a PARTIAL SUM over the faces that were
@@ -4055,7 +4079,7 @@ where
 /// term is `δ²`-small. Summing over a closed shell, whose faces walk every
 /// edge twice, the strict bound is `2δ · Σ|e|`.
 ///
-/// `δ` is [`PCURVE_REFINEMENT_TOLERANCE`], 1e-7 — the 3D distance
+/// `δ` is [`crate::PCURVE_REFINEMENT_TOLERANCE`], 1e-7 — the 3D distance
 /// `fit_pcurve_on_surface` refines a trim to, and the floor under every mass
 /// property. The bar this module applies is the TIGHTER
 /// `δ · Σ|e|` — half the strict bound — because the worst case it drops is a
@@ -4463,3 +4487,90 @@ fn shell_vector_areas_scan(solid: &BrepSolid, span_budget: usize, advice: &str) 
     }
     report
 }
+
+/// Completed acceptance readings, keyed by every serialized body field and
+/// policy input. Cold misses run the original reader. Entries contain no body
+/// references; the bounded per-thread store can safely outlive a document.
+/// Test builds opt in per thread so unrelated fault-injection tests cannot
+/// accidentally consume an earlier clean reading instead of their injection.
+pub(crate) mod network_acceptance_memo {
+    use super::{BrepSolid, SelfIntersectionOptions, SelfIntersectionReport};
+    use crate::mass_properties::TwoLane;
+    use std::cell::{Cell, RefCell};
+    use rustc_hash::FxHashMap;
+
+    const DEFAULT: bool = true;
+    const CAPACITY: usize = 32;
+    thread_local! {
+        static REPORTS: RefCell<FxHashMap<[u64; 2], SelfIntersectionReport>> = RefCell::new(FxHashMap::default());
+        static HITS: Cell<u64> = const { Cell::new(0) };
+        static READS: Cell<u64> = const { Cell::new(0) };
+    }
+
+    fn enabled() -> bool {
+        if cfg!(target_arch = "wasm32") { return DEFAULT; }
+        match std::env::var("BREP_NETWORK_ACCEPTANCE_MEMO").as_deref() {
+            Ok("1") | Ok("on") => true,
+            Ok("0") | Ok("off") => false,
+            _ => DEFAULT,
+        }
+    }
+
+    /// Includes all BREP environment inputs, even diagnostic policy overrides,
+    /// plus the classifier's thread-local policy switches. Byte encoding also
+    /// distinguishes non-UTF8 values. Option/body floats are hashed as bits.
+    pub(crate) fn policy() -> Option<[u64; 2]> {
+        if !enabled() { return None; }
+        let mut hash = TwoLane::new();
+        hash.f64(crate::classification::lane_switches());
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let mut variables: Vec<_> = std::env::vars_os().filter(|(name, _)| name.as_encoded_bytes().starts_with(b"BREP_")).collect();
+            variables.sort();
+            hash.usize(variables.len());
+            for (name, value) in variables {
+                for bytes in [name.as_encoded_bytes(), value.as_encoded_bytes()] {
+                    hash.usize(bytes.len());
+                    for &byte in bytes { hash.u64(u64::from(byte)); }
+                }
+            }
+        }
+        Some(hash.finish())
+    }
+
+    pub(super) fn scan_key(body: &BrepSolid, options: SelfIntersectionOptions, certify_pairs: bool) -> Option<[u64; 2]> {
+        let policy = policy()?;
+        let (a, b) = body.validate_memo_key()?;
+        let mut hash = TwoLane::new();
+        for word in [a, b, policy[0], policy[1]] { hash.u64(word); }
+        hash.f64(options.chord_tolerance);
+        hash.f64(options.straddle_band);
+        hash.f64(options.min_crossing_length);
+        hash.f64(options.weld);
+        hash.usize(options.max_triangles);
+        hash.bool(certify_pairs);
+        Some(hash.finish())
+    }
+
+    pub(super) fn lookup(key: [u64; 2]) -> Option<SelfIntersectionReport> {
+        let report = REPORTS.with(|reports| reports.borrow().get(&key).cloned());
+        if report.is_some() {
+            HITS.with(|hits| hits.set(hits.get() + 1));
+            crate::blend::record_count("count.soundness.report_memo_hits", 1);
+        }
+        report
+    }
+    pub(super) fn note_read() {
+        READS.with(|reads| reads.set(reads.get() + 1));
+        crate::blend::record_count("count.soundness.report_memo_reads", 1);
+    }
+    pub(super) fn store(key: [u64; 2], report: SelfIntersectionReport) {
+        REPORTS.with(|reports| {
+            let mut reports = reports.borrow_mut();
+            if reports.len() >= CAPACITY { reports.clear(); }
+            reports.insert(key, report);
+        });
+    }
+
+}
+

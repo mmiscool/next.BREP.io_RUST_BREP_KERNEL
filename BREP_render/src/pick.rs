@@ -92,6 +92,40 @@ impl Default for PickOptions {
     }
 }
 
+/// The view depth of the nearest FACE of `scene` under CSS-pixel `(x, y)`, if
+/// any: what a translucent context scene puts in front of the clicked point.
+pub fn nearest_face_depth(scene: &RenderScene, camera: &ViewCamera, x: f64, y: f64, options: &PickOptions) -> Option<f64> {
+    pick(scene, camera, x, y, options)
+        .into_iter()
+        .filter(|candidate| candidate.kind == PickKind::Face)
+        .map(|candidate| candidate.depth)
+        .min_by(f64::total_cmp)
+}
+
+/// [`pick`] in `scene`, without what `context` hides: a candidate deeper than
+/// the nearest context face under the cursor is behind that face. A context
+/// drawn translucent (a Work part's surrounding assembly) is still in front, so
+/// a click on it is not a click on the part behind it. Touching faces (a mating
+/// face flush with the context) stay pickable.
+pub fn pick_unoccluded(
+    scene: &RenderScene,
+    context: &RenderScene,
+    camera: &ViewCamera,
+    x: f64,
+    y: f64,
+    options: &PickOptions,
+) -> Vec<PickCandidate> {
+    let mut hits = pick(scene, camera, x, y, options);
+    if context.solids().is_empty() {
+        return hits;
+    }
+    if let Some(front) = nearest_face_depth(context, camera, x, y, options) {
+        let tolerance = 1e-6 * front.abs().max(1.0) + 1e-4;
+        hits.retain(|candidate| candidate.depth <= front + tolerance);
+    }
+    hits
+}
+
 /// Rank candidates under CSS-pixel `(x, y)`. Ordered by the priority chain
 /// then depth; a SOLID entry per hit solid is appended at the end (the earlier
 /// "extras" behavior).
@@ -138,6 +172,7 @@ pub fn pick(
     hits.truncate(MAX_CANDIDATES);
 
     // Append one SOLID candidate per hit solid, ordered by first (best) hit.
+    // A section cap's SOLID hit is one of them, not a second entry.
     let mut solids_seen: Vec<String> = Vec::new();
     let mut solid_entries: Vec<PickCandidate> = Vec::new();
     for hit in &hits {
@@ -154,6 +189,7 @@ pub fn pick(
             position: hit.position,
         });
     }
+    hits.retain(|hit| hit.kind != PickKind::Solid);
     hits.extend(solid_entries);
     hits
 }
@@ -201,6 +237,8 @@ fn pick_faces(
     }
     let positions = &solid.mesh.positions;
     let indices = &solid.mesh.indices;
+    let first_hit = out.len();
+    let mut cap_depth: Option<f64> = None;
     for (index, face) in solid.faces.iter().enumerate() {
         // Per-entity visibility (the scene tree's face checkboxes): a hidden
         // face isn't rendered, so it must not be hoverable/pickable either.
@@ -243,14 +281,42 @@ fn pick_faces(
             }
         }
         if let Some((_, point)) = best {
+            let depth = view_depth(camera, forward, point);
+            // A section cap is the cut of the solid, not a face of it: a
+            // SOLID hit.
+            if face.kind == crate::scene::FaceKind::SectionCap {
+                cap_depth = Some(cap_depth.map_or(depth, |d| d.min(depth)));
+                out.push(PickCandidate {
+                    kind: PickKind::Solid,
+                    name: solid.name.clone(),
+                    solid: solid.name.clone(),
+                    depth,
+                    screen_dist: 0.0,
+                    position: point,
+                });
+                continue;
+            }
             out.push(PickCandidate {
                 kind: PickKind::Face,
                 name: face.name.clone(),
                 solid: solid.name.clone(),
-                depth: view_depth(camera, forward, point),
+                depth,
                 screen_dist: 0.0,
                 position: point,
             });
+        }
+    }
+    // The cap closes the cut: this solid's faces behind it are not under the
+    // cursor (a click on the cut must not pick the inside of the far wall).
+    if let Some(cap) = cap_depth {
+        let tolerance = 1e-6 * cap.abs().max(1.0);
+        let mut index = first_hit;
+        while index < out.len() {
+            if out[index].kind == PickKind::Face && out[index].depth > cap + tolerance {
+                out.remove(index);
+            } else {
+                index += 1;
+            }
         }
     }
 }

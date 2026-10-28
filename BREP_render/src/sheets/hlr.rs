@@ -11,11 +11,11 @@
 //!    fitted surface the zero set of `n(u, v) · d` traced over the face's
 //!    parameter box and solved onto the surface through its own evaluator.
 //!    Each silhouette is trimmed to its face. An edge is INKED when its two
-//!    faces meet at a crease past [`EDGE_ANGLE_DEG`](super::project::EDGE_ANGLE_DEG)
+//!    faces meet at a crease past [`EDGE_ANGLE_DEG`]
 //!    (the rule the mesh pass used, read here off the exact normals), when it
 //!    is a TANGENT LINE — a smooth edge between two surfaces, a round's or a
 //!    blend's, told from a split of one surface by the jump in curvature
-//!    across it ([`one_surface`]) — when it bounds only one face, or when more
+//!    across it (`one_surface`) — when it bounds only one face, or when more
 //!    than two share it; a smooth edge between two fragments of one surface
 //!    is kept as a SPLITTER only, and a seam (one face on both sides) is
 //!    neither.
@@ -77,7 +77,7 @@ use super::PlacedView;
 
 /// How far a sampled paper polyline may sit off its exact curve, paper
 /// millimetres. The comparand is the model line's own stroke,
-/// [`EDGE_WIDTH`](super::svg::EDGE_WIDTH) = 0.35 mm: seventy times finer, so
+/// `EDGE_WIDTH` = 0.35 mm: seventy times finer, so
 /// no printed or zoomed drawing can show the chord.
 pub const CHORD_MM: f64 = 0.005;
 
@@ -119,11 +119,51 @@ pub enum Clip<'a> {
     /// A SECTION: the half-space at or beyond the cutting plane, which is the
     /// view's own target plane (depth zero, the camera looking along its
     /// normal). `cap` is the cut region on the paper — the exact section
-    /// curves — which hides everything behind it.
-    Beyond { cap: &'a [Vec<[f64; 2]>] },
+    /// curves — which hides everything behind it. `whole`, per solid (by
+    /// index; absent is false), marks a solid the section leaves whole — a
+    /// shaft, a fastener: drawn on both sides of the plane, hiding from both,
+    /// and contributing nothing to the cut. `half`, a HALF section's second
+    /// plane, keeps everything on its side whole as well (and `cap` is then
+    /// closed along its line).
+    Beyond { cap: &'a [Vec<[f64; 2]>], whole: &'a [bool], half: Option<HalfLine> },
     /// A DETAIL: the cylinder of MODEL radius `radius` along the viewing
     /// direction through the view's target.
     Circle { radius: f64 },
+}
+
+impl Clip<'_> {
+    /// Whether solid `index` is drawn whole under this clip.
+    fn whole(&self, index: usize) -> bool {
+        matches!(self, Clip::Beyond { whole, .. } if whole.get(index) == Some(&true))
+    }
+
+    /// A section's margin at view point `view`, model units: negative where
+    /// the cut removes material — in front of the cutting plane and, for a
+    /// half section, on the removed side of its second plane too.
+    fn margin(&self, view: [f64; 3]) -> f64 {
+        match self {
+            Clip::Beyond { half: Some(half), .. } => view[2].max(half.at(view)),
+            _ => view[2],
+        }
+    }
+}
+
+/// A HALF section's second plane, perpendicular to the cutting plane and so
+/// edge-on to the section view: a line on the paper. In view units, `normal`
+/// is its unit normal in the view's `(right, up)` and `offset` its distance
+/// from the view's target; the side the normal points to is kept whole.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct HalfLine {
+    pub normal: [f64; 2],
+    pub offset: f64,
+}
+
+impl HalfLine {
+    /// Signed distance of view point `view` from the line, positive on the
+    /// side kept whole.
+    pub fn at(&self, view: [f64; 3]) -> f64 {
+        view[0] * self.normal[0] + view[1] * self.normal[1] - self.offset
+    }
 }
 
 /// The floors of one placement, see the module docs.
@@ -414,6 +454,8 @@ struct Candidate<'a> {
     ends: Option<(VertexKey, VertexKey)>,
     /// Paper box of the samples.
     bounds: [f64; 4],
+    /// Its solid is left whole by the section ([`Clip::Beyond`]).
+    whole: bool,
 }
 
 fn bounds_of(paper: &[[f64; 2]]) -> [f64; 4] {
@@ -598,6 +640,7 @@ fn edge_candidates<'a>(
             edge: Some((solid_index, edge.id)),
             ends: Some(((solid_index, edge.start_vertex_id), (solid_index, edge.end_vertex_id))),
             bounds,
+            whole: false,
         });
     }
     out
@@ -632,7 +675,7 @@ fn trim_box(face: &FaceRecord) -> Option<[f64; 4]> {
 }
 
 /// What a pass learns about every trim of one solid that no camera, scale or
-/// clip changes: each face's [`TrimTests`], `[shell][face]`. The projection
+/// clip changes: each face's `TrimTests`, `[shell][face]`. The projection
 /// cache keeps one per solid it draws ([`crate::sheets::project`]), so a
 /// re-projection — another scale, a section or a detail of the same part —
 /// asks nothing a previous one built.
@@ -1226,6 +1269,7 @@ fn silhouette_candidates<'a>(
                 edge: None,
                 ends: None,
                 bounds,
+                whole: false,
             });
         }
     }
@@ -1415,6 +1459,8 @@ fn trace_silhouette(face: &FaceRecord, dir: Vec3) -> Vec<Vec<[f64; 2]>> {
 struct Occluder<'a> {
     cover: Cover<'a>,
     bounds: [f64; 4],
+    /// Its solid is left whole by the section: it hides from the removed side too.
+    whole: bool,
 }
 
 /// What an [`Occluder`] is.
@@ -1632,7 +1678,7 @@ impl Scene<'_> {
     fn hidden(&self, p: Vec3, hint: &mut Option<usize>) -> bool {
         let (paper, view) = project(&self.frame, self.placed, p);
         let bar = self.floors.bar;
-        if let Clip::Beyond { cap } = self.clip {
+        if let Clip::Beyond { cap, .. } = self.clip {
             if view[2] > bar && inside_region(cap, paper) {
                 return true;
             }
@@ -1640,9 +1686,14 @@ impl Scene<'_> {
         let forward = v3(self.frame.forward);
         // A hit in front of the piece by more than the depth floor, and (in a
         // section) not in the material the cut removed.
-        let in_front = |hit: Vec3| {
+        // A face of a solid the section leaves whole hides from the removed side too.
+        let in_front = |hit: Vec3, whole: bool| {
             let depth = dot3(sub3(a3(hit), self.frame.target), self.frame.forward);
-            depth <= view[2] - bar && !(matches!(self.clip, Clip::Beyond { .. }) && depth < -bar)
+            depth <= view[2] - bar
+                && !(matches!(self.clip, Clip::Beyond { .. })
+                    && !whole
+                    && depth < -bar
+                    && self.clip.margin(self.frame.to_view(a3(hit))) < -bar)
         };
         // The ray toward the eye against a flat carrier through `origin`.
         let plane_hit = |origin: Vec3, normal: Vec3| -> Option<Vec3> {
@@ -1658,7 +1709,7 @@ impl Scene<'_> {
         // every face the piece is asked of, so it is made once.
         let reach = view[2] - self.near;
         let ray = std::cell::OnceCell::new();
-        let curved_hides = |face: &FaceRecord, tests: &TrimTests| -> bool {
+        let curved_hides = |face: &FaceRecord, tests: &TrimTests, whole: bool| -> bool {
             if reach <= bar {
                 return false;
             }
@@ -1671,7 +1722,7 @@ impl Scene<'_> {
             hits.is_ok_and(|hits| {
                 hits.into_iter()
                     .filter(|hit| !hit.tangential)
-                    .any(|hit| in_front(hit.point) && in_face(face, Some(tests), [hit.u, hit.v], bar))
+                    .any(|hit| in_front(hit.point, whole) && in_face(face, Some(tests), [hit.u, hit.v], bar))
             })
         };
         // A flat face's one hit, in front of the piece, asked of the trim test.
@@ -1699,7 +1750,7 @@ impl Scene<'_> {
             }
             let hides = match &occluder.cover {
                 Cover::Triangle { corners, normal } => {
-                    plane_hit(corners[0], *normal).is_some_and(|hit| in_front(hit) && in_triangle(corners, *normal, hit, bar))
+                    plane_hit(corners[0], *normal).is_some_and(|hit| in_front(hit, occluder.whole) && in_triangle(corners, *normal, hit, bar))
                 }
                 Cover::Face { face, plane, spans, tests, trim } => {
                     if !spans.iter().any(|span| span.near <= view[2] - bar && span.holds(paper, pad)) {
@@ -1708,7 +1759,7 @@ impl Scene<'_> {
                     let asked_first = Some(index) == first;
                     match plane {
                         Some((origin, normal)) => {
-                            let Some(hit) = plane_hit(*origin, *normal).filter(|hit| in_front(*hit)) else { continue };
+                            let Some(hit) = plane_hit(*origin, *normal).filter(|hit| in_front(*hit, occluder.whole)) else { continue };
                             if trim.as_ref().and_then(|trim| trim.covers(paper)) == Some(true) {
                                 true
                             } else if asked_first {
@@ -1718,7 +1769,7 @@ impl Scene<'_> {
                                 continue;
                             }
                         }
-                        None if asked_first => curved_hides(face, tests),
+                        None if asked_first => curved_hides(face, tests, occluder.whole),
                         None => {
                             curved.push(index);
                             continue;
@@ -1737,7 +1788,7 @@ impl Scene<'_> {
         };
         let hider = curved
             .into_iter()
-            .find(|&index| face_of(index).is_some_and(|(face, tests)| curved_hides(face, tests)))
+            .find(|&index| face_of(index).is_some_and(|(face, tests)| curved_hides(face, tests, self.occluders[index].whole)))
             .or_else(|| {
                 flat.into_iter()
                     .find(|&(index, hit)| face_of(index).is_some_and(|(face, tests)| flat_hides(face, tests, hit)))
@@ -1841,8 +1892,8 @@ pub fn visible_edges_with(
                 }
             }
         }
-        candidates.extend(edges);
-        candidates.extend(silhouettes);
+        let whole = clip.whole(solid_index);
+        candidates.extend(edges.into_iter().chain(silhouettes).map(|c| Candidate { whole, ..c }));
     }
     let mut occluders: Vec<Occluder> = Vec::new();
     let mut near = f64::INFINITY;
@@ -1877,7 +1928,7 @@ pub fn visible_edges_with(
                 };
                 let trim = paper_trims.remove(&(solid_index, shell_index, face_index)).flatten();
                 let tests = &trims[solid_index].faces[shell_index][face_index];
-                occluders.push(Occluder { cover: Cover::Face { face, plane, spans, tests, trim }, bounds });
+                occluders.push(Occluder { cover: Cover::Face { face, plane, spans, tests, trim }, bounds, whole: clip.whole(solid_index) });
             }
         }
     }
@@ -2008,12 +2059,13 @@ pub fn visible_mesh_lines(meshes: &[MeshSolid], frame: &ViewFrame, placed: &Plac
             if let Some(candidate) = polyline_candidate(chain, false, frame, placed) {
                 candidates.push(Candidate {
                     ends: edge.ends.map(|(start, end)| ((solid_index, start), (solid_index, end))),
+                    whole: clip.whole(solid_index),
                     ..candidate
                 });
             }
         }
         for chain in welded.silhouettes() {
-            candidates.extend(polyline_candidate(chain, true, frame, placed));
+            candidates.extend(polyline_candidate(chain, true, frame, placed).map(|c| Candidate { whole: clip.whole(solid_index), ..c }));
         }
         for triangle in &mesh.triangles {
             let Some(corners) = triangle.iter().map(|&i| points.get(i as usize).copied()).collect::<Option<Vec<Vec3>>>() else {
@@ -2030,7 +2082,7 @@ pub fn visible_mesh_lines(meshes: &[MeshSolid], frame: &ViewFrame, placed: &Plac
                 near = near.min(view[2]);
             }
             extent = [extent[0].min(bounds[0]), extent[1].min(bounds[1]), extent[2].max(bounds[2]), extent[3].max(bounds[3])];
-            occluders.push(Occluder { cover: Cover::Triangle { corners, normal }, bounds });
+            occluders.push(Occluder { cover: Cover::Triangle { corners, normal }, bounds, whole: clip.whole(solid_index) });
         }
     }
     decide(candidates, occluders, extent, near, frame, placed, clip)
@@ -2050,7 +2102,7 @@ fn polyline_candidate<'a>(chain: Vec<Vec3>, silhouette: bool, frame: &ViewFrame,
         return None;
     }
     let bounds = bounds_of(&samples.paper);
-    Some(Candidate { carrier, samples, inked: true, silhouette, edge: None, ends: None, bounds })
+    Some(Candidate { carrier, samples, inked: true, silhouette, edge: None, ends: None, bounds, whole: false })
 }
 
 /// A display mesh welded by its exact coordinates — the tessellator writes a
@@ -2234,15 +2286,15 @@ fn split_parameters(candidates: &[Candidate], scene: &Scene) -> Vec<Vec<f64>> {
             }
         }
     }
-    // The clip's own boundary.
+    // The clip's own boundary (a solid the section leaves whole crosses it uncut).
     for (ci, c) in candidates.iter().enumerate() {
-        if !c.inked {
+        if !c.inked || c.whole {
             continue;
         }
         let side = |view: [f64; 3]| -> f64 {
             match scene.clip {
                 Clip::Whole => 1.0,
-                Clip::Beyond { .. } => view[2],
+                Clip::Beyond { .. } => scene.clip.margin(view),
                 Clip::Circle { radius } => radius - (view[0] * view[0] + view[1] * view[1]).sqrt(),
             }
         };
@@ -2313,7 +2365,7 @@ fn pieces_of(candidate: &Candidate, splits: &[f64], scene: &Scene) -> Vec<Piece>
         let view = scene.frame.to_view(a3(mid));
         let kept = match scene.clip {
             Clip::Whole => true,
-            Clip::Beyond { .. } => view[2] >= -scene.floors.bar,
+            Clip::Beyond { .. } => candidate.whole || scene.clip.margin(view) >= -scene.floors.bar,
             Clip::Circle { radius } => (view[0] * view[0] + view[1] * view[1]).sqrt() <= radius + scene.floors.bar,
         };
         let visible = kept && !scene.hidden(mid, &mut hint);

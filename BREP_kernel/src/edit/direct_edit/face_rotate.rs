@@ -783,7 +783,7 @@ fn rotated_rim_section(
 /// # Regimes
 ///
 /// **Rigid** — every fixed carrier a boundary vertex touches is invariant under
-/// the rotation ([`carrier_invariant_under`]). The corner rides by `R`, the
+/// the rotation (`carrier_invariant_under`). The corner rides by `R`, the
 /// edges map by `R` exactly, and the fixed faces re-trim around them. This is
 /// what makes a cylindrical wall spun about its own axis a no-op that BUILDS.
 ///

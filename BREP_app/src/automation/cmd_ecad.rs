@@ -62,7 +62,7 @@ fn run<T: 'static>(
 
 fn ecad_action(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
     let a: EcadActionArgs = parse_args(args)?;
-    let doc = ctx.app.docs.active_mut();
+    let doc = ctx.app.docs.view_mut();
     let workbench = doc.engine.settings.workbench.clone();
     let Some(target) = Target::of_workbench(&workbench) else {
         return Err(format!(
@@ -101,7 +101,7 @@ fn ecad_action(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
 
 fn ecad_state(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
     let _: NoArgs = parse_args(args)?;
-    let doc = ctx.app.docs.active();
+    let doc = ctx.app.docs.view();
     let Some(target) = Target::of_workbench(&doc.engine.settings.workbench) else {
         return Ok(Outcome::Done(json!({ "target": null })));
     };

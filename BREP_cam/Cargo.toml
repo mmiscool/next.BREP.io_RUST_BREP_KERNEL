@@ -1,0 +1,61 @@
+[package]
+name = "BREP_cam"
+version = "0.1.0"
+edition = "2021"
+license-file = "LICENSE.md"
+repository = "https://github.com/mmiscool/next.BREP.io_RUST_BREP_KERNEL"
+description = "CAM toolpath engine contracts and geometric core for the BREP CAD kernel: setups, tools, operations, typed motion streams, cutter profiles, mesh snapshots and triangle spatial indexing"
+readme = "README.md"
+keywords = ["cad", "cam", "toolpath", "milling", "geometry"]
+categories = ["algorithms", "graphics", "mathematics"]
+# The `!` entries are a backstop: test code never ships. The publish snapshot
+# `cargo package` of this manifest from shipping test files.
+include = [
+    "src/**",
+    "posts/**",
+    "data/**",
+    "Cargo.toml",
+    "README.md",
+    "LICENSE.md",
+    "!src/**/tests/**",
+    "!**/tests.rs",
+    "!**/*_tests.rs",
+    "!**/test_support.rs",
+    "!**/testdata/**",
+]
+
+[lib]
+name = "brep_cam"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+# The kernel is OPTIONAL: only `kernel_adapter` (BREP body -> mesh snapshot)
+# needs it, so every other CAM build and test compiles serde and this crate
+# alone. Linked WITHOUT default features, as the wasm app does.
+brep_kernel = { package = "BREP_kernel", version = "0.11.0", path = "../BREP_kernel", default-features = false, optional = true }
+# Lane C4: the program stream is handed to post-processor scripts as JSON.
+# Preserve every finite f64 bit pattern when native documents are re-imported.
+serde_json = { version = "1", features = ["float_roundtrip"] }
+# Lane C4: post-processor scripts run on the shared Boa interpreter (feature
+# `post-runtime`); the types and the built-in post sources need no engine.
+brep-script-core = { package = "BREP_script_core", version = "0.1.2", path = "../BREP_script_core", optional = true }
+# Feature `parallel`: contact solves (push-cutter fibers, adaptive drop-path
+# spans) on rayon's pool, results assembled in input order — byte-identical to
+# the serial build. Same pattern and version as BREP_kernel's `parallel`; the
+# default (and the wasm) build does not pull rayon.
+rayon = { version = "1", optional = true }
+
+[features]
+default = []
+# Enables `kernel_adapter`: tessellate BREP bodies into mesh snapshots.
+kernel = ["dep:brep_kernel"]
+# Run post-processor scripts (Boa). `./build.sh test-cam` tests with it on.
+post-runtime = ["dep:brep-script-core"]
+# Contact solves on rayon (native; see the dependency note). Output is
+# byte-identical with and without it.
+parallel = ["dep:rayon"]
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

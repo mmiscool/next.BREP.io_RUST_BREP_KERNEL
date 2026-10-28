@@ -851,10 +851,11 @@ pub(in crate::blend) fn march_open_stations_core(
     }
     let _assemble_timing = crate::blend::BlendTimer::start("timing.march.assemble_ms");
     let mut stations = Vec::with_capacity(station_count + 1);
+    let reuse_normals = assembly_normals_reuse_on();
     for (index, uv) in solutions.iter().enumerate() {
         let t = station_t(index);
         let (section_point, section_tangent) = section_frame(t)?;
-        let (_, p1, p2, center) = tangency_residual(
+        let state = crate::blend::stations::tangency_state(
             surface1,
             surface2,
             rho_at(t),
@@ -862,8 +863,16 @@ pub(in crate::blend) fn march_open_stations_core(
             section_point,
             section_tangent,
         )?;
-        let n1 = raw_normal(surface1, uv[0], uv[1])?;
-        let n2 = raw_normal(surface2, uv[2], uv[3])?;
+        let (p1, p2, center) = (state.p1, state.p2, state.center);
+        // Raw offset evaluation already used deriv1_extended and
+        // raw_unit_normal at these exact arguments. Retain those bits.
+        let (n1, n2) = if reuse_normals {
+            crate::blend::record_count("count.march.assembly_normal_reused", 2);
+            (state.n1, state.n2)
+        } else {
+            crate::blend::record_count("count.march.assembly_normal_reread", 2);
+            (raw_normal(surface1, uv[0], uv[1])?, raw_normal(surface2, uv[2], uv[3])?)
+        };
         let cos_alpha = signs[0] * signs[1] * n1.dot(n2);
         let weight = ((1.0 + cos_alpha) * 0.5).max(0.0).sqrt();
         if weight <= 1e-6 {
@@ -892,6 +901,11 @@ pub(in crate::blend) fn march_open_stations_core(
         });
     }
     Ok((stations, vertex_indices, refinement, dense_centres))
+}
+
+
+fn assembly_normals_reuse_on() -> bool {
+    std::env::var("BREP_NETWORK_ASSEMBLY_NORMALS").map_or(true, |value| value != "0" && value != "off")
 }
 
 fn ts_first(ts: &[f64]) -> f64 {
@@ -2547,6 +2561,7 @@ pub(in crate::blend) fn resolve_free_end(
                 clamp01(cr_parameter),
                 clamp01(cs_parameter),
                 exact_ends,
+                transverse_ladder_on().then(|| shell_closure_bar(solid, first_face.id)),
             )?
         }
     };
@@ -3884,7 +3899,7 @@ pub(in crate::blend) fn transverse_curve(
     cr_parameter: f64,
     cs_parameter: f64,
 ) -> Result<(NurbsCurve, NurbsCurve, NurbsCurve), KernelRefusal> {
-    transverse_curve_with_ends(rows, end_face, cr_parameter, cs_parameter, [false, false])
+    transverse_curve_with_ends(rows, end_face, cr_parameter, cs_parameter, [false, false], None)
 }
 
 /// [`transverse_curve`], with the z = 0 (cr) and z = 1 (cs) ends EXACT where
@@ -3900,6 +3915,7 @@ pub(in crate::blend) fn transverse_curve_with_ends(
     cr_parameter: f64,
     cs_parameter: f64,
     exact_ends: [bool; 2],
+    shell_bar: Option<f64>,
 ) -> Result<(NurbsCurve, NurbsCurve, NurbsCurve), KernelRefusal> {
     // A LADDER on the section count (lane R2, 2026-10-18). The edge and its
     // two pcurves are fitted through the same samples, each on its own: they
@@ -3908,25 +3924,34 @@ pub(in crate::blend) fn transverse_curve_with_ends(
     // v6, whose rail meets its boundary on that boundary's extension: the
     // blend pcurve's image stood 1.449e-3 off the edge between its first two
     // samples, and the shell's closure read 0.0377 against a bar of 0.0036).
-    // The 16-section build is kept, bit for bit, whenever both pcurves'
-    // images stand within the pcurve floor of the edge at four points per
-    // section; otherwise the sections double, at most to 256, and the closest
-    // build is kept.
+    // What the shell can afford is its closure bar (`shell_vector_areas`:
+    // PCURVE_REFINEMENT_TOLERANCE x the shell's edge length, `shell_bar`,
+    // read on the shell being blended). The sliver between the section edge
+    // and its blend pcurve's image is this edge's share of the shell's
+    // residual (`transverse_sliver`; lCount_224's 0.0364 against a residual
+    // of 0.0377), so the 16-section build is kept, bit for bit, whenever its
+    // sliver stands within that bar; otherwise the sections double, at most
+    // to 256, until it does, and the smallest sliver is kept. A pointwise
+    // stop at the pcurve floor climbed on every free end and moved bodies
+    // whose shells were inside their bars (2026-10-18 batch 4).
     const FIRST_SECTIONS: usize = 16;
     const MAX_SECTIONS: usize = 256;
-    if !transverse_ladder_on() {
+    let Some(shell_bar) = shell_bar.filter(|_| transverse_ladder_on()) else {
         return transverse_curve_sections(rows, end_face, cr_parameter, cs_parameter, exact_ends, FIRST_SECTIONS);
-    }
+    };
     let mut sections = FIRST_SECTIONS;
     let mut best: Option<((NurbsCurve, NurbsCurve, NurbsCurve), f64)> = None;
     loop {
         let built = transverse_curve_sections(rows, end_face, cr_parameter, cs_parameter, exact_ends, sections)?;
-        let miss = transverse_pcurve_miss(rows, &built, 4 * sections)?;
+        let (sliver, length) = transverse_sliver(rows, &built, 4 * sections);
+        // An unreadable sliver is read as over the bar: the ladder climbs,
+        // and keeps the first build if no rung reads.
+        let sliver = if sliver.is_finite() { sliver } else { f64::INFINITY };
         if std::env::var("BREP_DEBUG_TRANSVERSE_FIT").is_ok() {
-            let (sliver, length) = transverse_sliver(rows, &built, 4 * sections);
+            let miss = transverse_pcurve_miss(rows, &built, 4 * sections)?;
             eprintln!(
                 "transverse ladder: end face {:?}, exact ends {exact_ends:?}, {sections} sections, pcurve images {miss:.3e} off the edge; \
-                 sliver vector area {sliver:.3e} over length {length:.3e} ({:.3e} per length)",
+                 sliver vector area {sliver:.3e} over length {length:.3e} ({:.3e} per length); shell bar {shell_bar:.3e}",
                 end_face.name,
                 sliver / length
             );
@@ -3934,9 +3959,9 @@ pub(in crate::blend) fn transverse_curve_with_ends(
         if sections > FIRST_SECTIONS {
             crate::blend::record_count("count.transverse.refined_rungs", 1);
         }
-        let done = miss <= crate::pcurve::PCURVE_REFINEMENT_TOLERANCE || sections >= MAX_SECTIONS;
-        if best.as_ref().map_or(true, |(_, known)| miss < *known) {
-            best = Some((built, miss));
+        let done = sliver <= shell_bar || sections >= MAX_SECTIONS;
+        if best.as_ref().map_or(true, |(_, known)| sliver < *known) {
+            best = Some((built, sliver));
         }
         if done {
             break;
@@ -3947,9 +3972,11 @@ pub(in crate::blend) fn transverse_curve_with_ends(
 }
 
 /// `BREP_BLEND_TRANSVERSE_LADDER=1`/`on` climbs [`transverse_curve_with_ends`]'s
-/// section ladder, `=0`/`off` (the default) builds 16 sections as before;
-/// `set_transverse_ladder_for_test` forces it on a test's own thread.
-const TRANSVERSE_LADDER_DEFAULT: bool = false;
+/// section ladder at a free end until the section's sliver stands within its
+/// shell's closure bar (the default since its census at 9a785b754); `=0`/`off`
+/// builds 16 sections as before; `set_transverse_ladder_for_test` forces it on
+/// a test's own thread.
+const TRANSVERSE_LADDER_DEFAULT: bool = true;
 
 thread_local! {
     static TRANSVERSE_LADDER_FOR_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
@@ -3996,10 +4023,40 @@ fn transverse_pcurve_miss(
     Ok(worst)
 }
 
-/// BREP_DEBUG_TRANSVERSE_FIT only: the vector area of the sliver between the
-/// section edge and its blend pcurve's image, `|∫ (image − edge) × dedge|`,
-/// and the edge's length — the shell closure's per-edge share, which its bar
-/// reads per length.
+/// The closure bar of the shell holding `face` in `solid`, as
+/// `shell_vector_areas` sets it: PCURVE_REFINEMENT_TOLERANCE times the
+/// shell's edge length (each non-degenerate edge once), the length read as
+/// a 64-chord polyline per edge (never longer than the arc, so the bar is
+/// never larger than the shell's own).
+fn shell_closure_bar(solid: &BrepSolid, face: u64) -> f64 {
+    let Some(shell) = solid.shells.iter().find(|shell| shell.faces.iter().any(|record| record.id == face)) else {
+        return 0.0;
+    };
+    let mut edges: Vec<u64> = shell
+        .faces
+        .iter()
+        .flat_map(|record| record.loops.iter().flat_map(|face_loop| face_loop.coedges.iter().map(|coedge| coedge.edge_id)))
+        .collect();
+    edges.sort_unstable();
+    edges.dedup();
+    let length: f64 = edges
+        .iter()
+        .filter_map(|id| solid.edges.iter().find(|edge| edge.id == *id && !edge.degenerate))
+        .map(|edge| {
+            let points: Vec<Option<Vec3>> =
+                (0..=64).map(|k| edge.curve.evaluate(edge.t0 + (edge.t1 - edge.t0) * k as f64 / 64.0).ok()).collect();
+            points.windows(2).map(|pair| match (pair[0], pair[1]) {
+                (Some(a), Some(b)) => b.sub(a).length(),
+                _ => 0.0,
+            }).sum::<f64>()
+        })
+        .sum();
+    crate::pcurve::PCURVE_REFINEMENT_TOLERANCE * length
+}
+
+/// The vector area of the sliver between the section edge and its blend
+/// pcurve's image, `|∫ (image − edge) × dedge|`, and the edge's length — the
+/// edge's share of its shell's closure residual (NaN when unreadable).
 fn transverse_sliver(rows: &FittedRows, built: &(NurbsCurve, NurbsCurve, NurbsCurve), samples: usize) -> (f64, f64) {
     let (curve, blend_pcurve, _) = built;
     let (mut area, mut length) = (Vec3::new(0.0, 0.0, 0.0), 0.0);
@@ -4125,7 +4182,18 @@ fn transverse_curve_sections(
             let d = end_face.surface.derivatives_extended(u, v, 1).or_refuse(KernelStage::Refine, "derivatives_extended")?;
             let (su, sv) = (d[1][0], d[0][1]);
             let end_normal = su.cross(sv).normalized().or_refuse(KernelStage::Refine, "normalized")?;
-            let mut direction = wall.cross(end_normal).normalized().or_refuse(KernelStage::Refine, "normalized")?;
+            // Parallel normals at a cusp do not define a transverse end.
+            // The network still gets its tapered-runout attempt. If that
+            // cannot fit either, preserve this classification rather than
+            // spending minutes composing cutters over the same support.
+            let mut direction = wall.cross(end_normal).normalized().map_err(|_| {
+                KernelRefusal::unsupported(
+                    KernelStage::Refine,
+                    super::super::TANGENTIAL_TRANSVERSE_END,
+                    "blend: the end is tangent to the neighbouring face and its tapered runout \
+                     cannot fit at this radius; reduce the radius or change the edge selection",
+                )
+            })?;
             if direction.dot(free_d3) < 0.0 {
                 direction = direction.scale(-1.0);
             }
@@ -4780,5 +4848,6 @@ fn extend_edge_on_carriers(
     }
     Ok(())
 }
+
 
 

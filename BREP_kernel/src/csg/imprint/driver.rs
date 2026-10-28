@@ -415,7 +415,7 @@ pub(crate) fn take_rescue_firings() -> (u64, u64) {
 /// imprint runs. `BREP_MARCH_STARTS`: `0`/`off`; `order` (A3's ordering
 /// alone); `snap` (the ordering with run-through starts consumed); `tree`
 /// (A4 alone); `order+tree`; anything else all three.
-fn march_starts(options: &ImprintOptions) -> (bool, bool, bool) {
+fn march_starts(options: &ImprintOptions, carrier_tree_seeds: bool) -> (bool, bool, bool) {
     match std::env::var("BREP_MARCH_STARTS").as_deref() {
         Ok("0") | Ok("off") => (false, false, false),
         Ok("order") => (true, false, false),
@@ -423,7 +423,7 @@ fn march_starts(options: &ImprintOptions) -> (bool, bool, bool) {
         Ok("tree") => (false, false, true),
         Ok("order+tree") => (true, false, true),
         Ok(_) => (true, true, true),
-        Err(_) => (options.march_starts, options.march_starts, options.march_starts),
+        Err(_) => (options.march_starts, options.march_starts, options.march_starts || carrier_tree_seeds),
     }
 }
 
@@ -1278,8 +1278,28 @@ pub(crate) fn build_carrier_imprints(
     solid_a: &BrepSolid,
     solid_b: &BrepSolid,
     options: &ImprintOptions,
+    tree_seeds: bool,
 ) -> Result<ImprintResultRecord, KernelRefusal> {
-    build_imprints_impl(solid_a, solid_b, options, true, super::pcurve_cache::enabled())
+    build_imprints_with_carrier_seeds(
+        solid_a, solid_b, options, true, super::pcurve_cache::enabled(), tree_seeds, None,
+    )
+}
+
+/// Lane P3b row 6 (2026-10-26): imprint the faces of ONE open sheet solid
+/// against each other in a single call. `solid` is both operands (operand 0
+/// and 1 tag the same faces); a face pair is processed once, as
+/// (first index, second index) in the solid's face order with first < second,
+/// and only when `admit(first, second)` says so. Every post-pass then runs
+/// once over the whole piece set instead of once per pair.
+pub(crate) fn build_carrier_imprints_within(
+    solid: &BrepSolid,
+    admit: &dyn Fn(usize, usize) -> bool,
+    options: &ImprintOptions,
+    tree_seeds: bool,
+) -> Result<ImprintResultRecord, KernelRefusal> {
+    build_imprints_with_carrier_seeds(
+        solid, solid, options, true, super::pcurve_cache::enabled(), tree_seeds, Some(admit),
+    )
 }
 
 /// `BREP_IMPRINT_PLANE_POINT_SKIP` (lane X row 5): skip the march for two
@@ -1308,9 +1328,28 @@ pub(super) fn build_imprints_impl(
     open_carriers: bool,
     pcurve_cache: bool,
 ) -> Result<ImprintResultRecord, KernelRefusal> {
+    build_imprints_with_carrier_seeds(solid_a, solid_b, options, open_carriers, pcurve_cache, false, None)
+}
+
+// A carved offset can have a narrow transverse section beside its fold.
+// Seed its knot spans without enabling ordered/consumed starts on other paths.
+fn build_imprints_with_carrier_seeds(
+    solid_a: &BrepSolid,
+    solid_b: &BrepSolid,
+    options: &ImprintOptions,
+    open_carriers: bool,
+    pcurve_cache: bool,
+    carrier_tree_seeds: bool,
+    // `Some`: `solid_a` IS `solid_b` and only face pairs (first < second) the
+    // predicate admits are processed ([`build_carrier_imprints_within`]).
+    self_pairs: Option<&dyn Fn(usize, usize) -> bool>,
+) -> Result<ImprintResultRecord, KernelRefusal> {
+    let _profile_sink = ProfileSink::open();
     let classify_before = crate::pair_classification::classify_reads();
-    let setup_started = std::env::var_os("BREP_PROFILE").is_some().then(Instant::now);
+    let setup_started = profile_enabled().then(Instant::now);
+    let windows_before = window_reads();
     let _pcurve_cache = super::pcurve_cache::FitCacheScope::open(pcurve_cache);
+    let _intersection_cache = super::intersection_cache::Scope::open();
     let reuse_whole_miss = open_carriers &&
         std::env::var("BREP_OFFSET_IMPRINT_READINGS").map_or(true, |v| v != "0" && v != "off");
     let mut section_evidence = false;
@@ -1335,7 +1374,7 @@ pub(super) fn build_imprints_impl(
     };
     let hermite_lane = hermite_sections(options);
     let exact_iso = exact_iso_pcurves(options);
-    let (ordered_starts, consume_starts, tree_seeds) = march_starts(options);
+    let (ordered_starts, consume_starts, tree_seeds) = march_starts(options, carrier_tree_seeds);
     builder.exact_pcurve_check = exact_iso == ExactIsoPcurves::Check;
     // The Hermite lane needs the march's span test; with no budget asked for
     // it carries the one the catalogue names, the pair's `intersection_fit`.
@@ -1354,11 +1393,11 @@ pub(super) fn build_imprints_impl(
     // containment, the sections' pcurves, a seed's normal — is read there.
     let first_restricted: Vec<Option<MarchWindow>> = first_faces
         .iter()
-        .map(|tagged| restricted_carrier(tagged.face))
+        .map(|tagged| restricted_carrier_memoized(tagged.face))
         .collect();
     let second_restricted: Vec<Option<MarchWindow>> = second_faces
         .iter()
-        .map(|tagged| restricted_carrier(tagged.face))
+        .map(|tagged| restricted_carrier_memoized(tagged.face))
         .collect();
     for (tagged, window) in first_faces.iter_mut().zip(&first_restricted) {
         tagged.lifted = window.as_ref().filter(|window| window.lifted).map(|window| &window.surface);
@@ -1433,7 +1472,7 @@ pub(super) fn build_imprints_impl(
             None => edge_subcurve(edge),
         }
     };
-    if let Some(started) = setup_started { eprintln!("imprint.setup ms={:.3} faces={} classify_reads={}", started.elapsed().as_secs_f64()*1000.0, first_faces.len()+second_faces.len(), crate::pair_classification::classify_reads()-classify_before); }
+    if let Some(started) = setup_started { profile_line!("imprint.setup ms={:.3} faces={} classify_reads={} windows_built={}", started.elapsed().as_secs_f64()*1000.0, first_faces.len()+second_faces.len(), crate::pair_classification::classify_reads()-classify_before, window_reads()-windows_before); }
     let mut profile = ImprintProfile::new();
     let mut march_swap_rescues = 0_u64;
     let mut clip_swap_rescues = 0_u64;
@@ -1470,6 +1509,11 @@ pub(super) fn build_imprints_impl(
             );
         }
         for &second_index in &paired {
+            if let Some(admit) = self_pairs {
+                if second_index <= first_index || !admit(first_index, second_index) {
+                    continue;
+                }
+            }
             let second = second_faces[second_index];
             profile.pairs += 1;
             // Set when this pair's section passes through an isolated TANGENT
@@ -2814,7 +2858,22 @@ pub(super) fn build_imprints_impl(
     profile.report();
     let hull_culls = super::builder::take_hull_culls();
     if profile.enabled && super::builder::hull_cull_enabled() {
-        eprintln!("imprint.hull_culls edges={hull_culls}");
+        profile_line!("imprint.hull_culls edges={hull_culls}");
+    }
+    // The row counters are drained only when they are printed, so a test
+    // reading them after a whole operation sees every call's count.
+    if profile.enabled && super::builder::pierce_cull_enabled() {
+        profile_line!("imprint.pierce_culls edges={}", super::builder::take_pierce_culls());
+    }
+    if profile.enabled {
+        let overlap_hull_skips = super::sections::take_overlap_hull_skips();
+        if overlap_hull_skips > 0 {
+            profile_line!("imprint.overlap_hull_skips stations={overlap_hull_skips}");
+        }
+        let exchange_hull_skips = super::builder::take_exchange_hull_skips();
+        if exchange_hull_skips > 0 {
+            profile_line!("imprint.exchange_hull_skips answered={exchange_hull_skips}");
+        }
     }
     // SELF-TOUCH SPLIT: a face whose loops touch at an edge interior (a hole
     // tangent to a fillet setback) gets a vertex minted at the touch on BOTH
@@ -2841,8 +2900,12 @@ pub(super) fn build_imprints_impl(
     };
     lap("pairs", &mut tail_lap, &mut tail_fits, &mut tail_ms);
     if std::env::var("BREP_SELF_TOUCH_SPLIT").as_deref() != Ok("0") {
+        let scans_before = super::self_touch::touch_scans();
         builder.split_self_touching_loops(&first_faces, &face_edge_lists, &cached_subcurve)?;
         builder.split_self_touching_loops(&second_faces, &face_edge_lists, &cached_subcurve)?;
+        if profile.enabled {
+            profile_line!("imprint.self_touch faces={} scanned={}", first_faces.len() + second_faces.len(), super::self_touch::touch_scans() - scans_before);
+        }
     }
     // PIECE-ENDPOINT EXCHANGE post-pass: with every pair's process_curve
     // done, the piece set is final for the ridden-edge class — imprint each
@@ -2928,19 +2991,18 @@ pub(super) fn build_imprints_impl(
     };
     RESCUE_FIRINGS.with(|cell| cell.set((march_swap_rescues, clip_swap_rescues)));
     if profile.enabled {
-        eprintln!("imprint.rescues march_swap={march_swap_rescues} clip_swap={clip_swap_rescues}");
+        profile_line!("imprint.rescues march_swap={march_swap_rescues} clip_swap={clip_swap_rescues}");
     }
-    // COINCIDENT-PIECE MERGE (problemInbox equator-tangent, and the generic
-    // one-circle-from-many-pairs class): the SAME section curve can be minted
-    // by several pairs — a cosurface boundary-edge copy (the cylinder cap
-    // ring lying ON the inscribed sphere) AND the cap-plane's analytic
-    // section ring are one circle minted twice, each carrying only its own
-    // pair's supports/pcurves. Assembly then builds duplicate edges that
-    // cannot both be two-use → one-use strands. Merge pieces whose curves
-    // coincide along their whole span (bidirectional max deviation within
-    // the weld band): keep the first, union the supports/pcurves/by_face
-    // registrations of the rest into it. Escape hatch:
-    // BREP_COINCIDENT_PIECE_MERGE=0.
+    // COINCIDENT-PIECE MERGE (and the generic one-circle-from-many-pairs
+    // class): the SAME section curve can be minted by several pairs — a
+    // cosurface boundary-edge copy (the cylinder cap ring lying ON the
+    // inscribed sphere) AND the cap-plane's analytic section ring are one
+    // circle minted twice, each carrying only its own pair's
+    // supports/pcurves. Assembly then builds duplicate edges that cannot both
+    // be two-use → one-use strands. Merge pieces whose curves coincide along
+    // their whole span (bidirectional max deviation within the weld band):
+    // keep the first, union the supports/pcurves/by_face registrations of the
+    // rest into it. Escape hatch: BREP_COINCIDENT_PIECE_MERGE=0.
     lap("collect", &mut tail_lap, &mut tail_fits, &mut tail_ms);
     if std::env::var("BREP_COINCIDENT_PIECE_MERGE").as_deref() != Ok("0") {
         let weld = assembler_weld(options.tolerance).max(options.tolerance * 10.0);
@@ -3064,6 +3126,10 @@ pub(super) fn build_imprints_impl(
         &emitted_pcurves,
         &junction_evidence,
         junction_combine_mode(options),
+        // The composite one-call carrier imprint keeps the per-pair contract:
+        // no residual-evidence vertex merge across its admitted pairs (see
+        // the parameter doc on `canonicalize_imprint_junctions`).
+        self_pairs.is_none(),
     )?;
     lap("canonicalize", &mut tail_lap, &mut tail_fits, &mut tail_ms);
     // ONE RIM, ONE EDGE: with vertex identity final, dissolve the section
@@ -3110,13 +3176,21 @@ pub(super) fn build_imprints_impl(
             .map(|(name, ms, _)| format!("{name}={ms:.2}"))
             .collect::<Vec<_>>()
             .join(" ");
-        eprintln!("imprint.stages {line}");
+        profile_line!("imprint.stages {line}");
+        let split = imprint_split_take();
+        let ms = |d: Duration| d.as_secs_f64() * 1_000.0;
+        profile_line!(
+            "imprint.split pierce={:.3} pierce_edges={} overlap={:.3} overlap_edges={} crossing={:.3} crossing_edges={} recover={:.3} recover_pierces={} lies_whole={:.3} lies_whole_calls={} lies_whole_hits={} lies_span={:.3} lies_span_calls={} reuse_edges={}",
+            ms(split.pierce), split.pierce_edges, ms(split.overlap), split.overlap_edges, ms(split.crossing), split.crossing_edges,
+            ms(split.recover), split.recover_pierces, ms(split.lies_whole), split.lies_whole_calls, split.lies_whole_hits,
+            ms(split.lies_span), split.lies_span_calls, split.reuse_edges,
+        );
         let fits = tail_ms
             .iter()
             .map(|(name, _, fits)| format!("{name}={fits}"))
             .collect::<Vec<_>>()
             .join(" ");
-        eprintln!("imprint.stage_fits {fits}");
+        profile_line!("imprint.stage_fits {fits}");
     }
     if let Ok(path) = std::env::var("BREP_IMPRINT_SECTION_CENSUS") {
         use std::io::Write;

@@ -611,6 +611,7 @@ impl EngineState {
             self.transform_gizmo.feature_id = None;
             self.transform_gizmo.mode = GizmoMode::None;
             let _ = self.widgets.set_transform_json("null");
+            self.dirty = true;
         }
         self.history.set_feature_persistent_field(index, "spline", serde_json::json!({ "points": points }));
     }

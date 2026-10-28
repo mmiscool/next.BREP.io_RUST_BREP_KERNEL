@@ -144,6 +144,24 @@ impl EngineState {
         // The solver stores a radius for radial dims; a diameter input halves.
         let solver_value = if is_diameter { displayed * 0.5 } else { displayed };
 
+        // A zero/negative radial dimension collapses the circle or arc. Validate
+        // evaluated expressions too, before touching the constraint or undo stack.
+        let constraint = edit.session.doc.constraints.iter()
+            .find(|c| c.raw.get("id").map(id_key) == Some(key.clone()))
+            .expect("constraint was located above");
+        let controls_radius = constraint.ctype() == Some("⟺")
+            && edit.session.doc.geometries.iter().any(|g| {
+                matches!(g.geom_type.as_str(), "circle" | "arc")
+                    && g.points.len() >= 2
+                    && constraint.points().len() == 2
+                    && ((constraint.points()[0] == g.points[0] && constraint.points()[1] == g.points[1])
+                        || (constraint.points()[0] == g.points[1] && constraint.points()[1] == g.points[0]))
+            });
+        if (controls_radius || matches!(dimension_mode(constraint), "radius" | "diameter"))
+            && solver_value <= 1e-5 {
+            return false;
+        }
+
         // Validation passed → the value WILL change; snapshot for undo now (S6a).
         edit.record_undo();
 
@@ -328,7 +346,7 @@ impl EngineState {
         self.sketch_undo_redo(true)
     }
 
-    /// Redo the last undone sketch edit (S6a) — the inverse of [`sketch_undo`].
+    /// Redo the last undone sketch edit (S6a) — the inverse of [`sketch_undo`](Self::sketch_undo).
     /// Returns whether anything was redone.
     pub fn sketch_redo(&mut self) -> bool {
         self.sketch_undo_redo(false)
@@ -581,12 +599,24 @@ impl EngineState {
 
     /// Link (as a construction reference) the 3D solid edge under CSS-pixel `(x, y)`
     /// into the active sketch (S6b-2). Ranks the pixel through the modeling picker,
-    /// takes the top EDGE candidate, and delegates to [`sketch_link_edge`]. Returns
+    /// takes the top EDGE candidate, and delegates to [`sketch_link_edge`](Self::sketch_link_edge). Returns
     /// whether a link was made / updated. A no-op returning `false` when not in sketch
     /// mode or no scene edge is under the cursor.
     pub fn sketch_pick_edge_at(&mut self, x: f64, y: f64) -> bool {
         if self.sketch_edit.is_none() {
             return false;
+        }
+        // A Work part's context edge in front is COPIED (it is not the part's
+        // to link); an edge of the part's own, nearer or flush, is linked.
+        if let Some(context) = self.context_edge_at(x, y) {
+            let tolerance = 1e-6 * context.depth.abs().max(1.0) + 1e-4;
+            let own_in_front = pick::pick_unoccluded(&self.scene, &self.context_scene, &self.camera, x, y, &self.pick_options())
+                .into_iter()
+                .find(|candidate| candidate.kind == pick::PickKind::Edge)
+                .is_some_and(|own| own.depth <= context.depth + tolerance);
+            if !own_in_front {
+                return self.sketch_copy_context_edge(&context);
+            }
         }
         let Some(edge_name) = self.sketch_top_edge_name(x, y) else {
             return false;
@@ -765,7 +795,7 @@ impl EngineState {
 
     /// Begin a freehand stroke at plane `(u, v)` (the headless-testable core): snapshot
     /// for undo (S6a), clear any prior stroke, and seed it with the start sample. The
-    /// undo snapshot is popped in [`sketch_handdraw_end`] if the stroke produces nothing.
+    /// undo snapshot is popped in [`sketch_handdraw_end`](Self::sketch_handdraw_end) if the stroke produces nothing.
     /// No-op when not in sketch mode.
     pub fn sketch_handdraw_begin_uv(&mut self, u: f64, v: f64) {
         if let Some(edit) = self.sketch_edit.as_mut() {
@@ -839,3 +869,140 @@ impl EngineState {
     }
 }
 
+
+// ---- Angle measure cycling ----------------------------------------------------
+//
+// An `∠` constraint reads its angle from the ORDER of its four points: the solver
+// measures `direction(p0→p1) − direction(p2→p3)` in [0, 360). Reversing one line
+// adds 180°, swapping the two lines negates the reading, so the four sectors
+// around the lines' intersection (θ, 180−θ, θ, 180−θ) are four point orderings of
+// the same record. The order is what the document persists, so a chosen measure
+// survives solves and saves, and a sketch that predates the toggle reads exactly
+// as it did.
+impl EngineState {
+    /// The id of the ONE selected `∠` constraint when the sketch selection is
+    /// exactly that constraint and nothing else — the condition under which the
+    /// Sketch actions card offers "Angle measure". `None` otherwise / not in sketch
+    /// mode.
+    pub fn sketch_selected_angle_constraint(&self) -> Option<serde_json::Value> {
+        use crate::sketch::doc::id_key;
+        let edit = self.sketch_edit.as_ref()?;
+        if edit.session.selection.len() != 1 {
+            return None;
+        }
+        let r = &edit.session.selection[0];
+        if r.get("kind").and_then(serde_json::Value::as_str) != Some("constraint") {
+            return None;
+        }
+        let id = r.get("id")?;
+        let key = id_key(id);
+        let c = edit
+            .session
+            .doc
+            .constraints
+            .iter()
+            .find(|c| c.raw.get("id").map(id_key) == Some(key.clone()))?;
+        (c.ctype() == Some("∠") && c.points().len() >= 4).then(|| id.clone())
+    }
+
+    /// Cycle the selected `∠` constraint to the NEXT way of measuring the angle
+    /// between its two lines, without moving any geometry:
+    ///
+    /// * a convex reading (≤ 180°) steps to the adjacent sector counter-clockwise
+    ///   around the intersection — points `[p0,p1,p2,p3]` become `[p3,p2,p0,p1]`
+    ///   and the value becomes `180 − value`, so 167° flips to its 13°
+    ///   supplement, then 167°, 13°, and back to the start after four steps;
+    /// * a reflex reading (> 180°) first comes back to the SAME sector measured
+    ///   the short way — the lines swap (`[p2,p3,p0,p1]`) and the value becomes
+    ///   `360 − value` — after which the steps above apply.
+    ///
+    /// The value is transformed, never re-measured, so a conflicting constraint
+    /// keeps the intent it had; an expression dimension keeps its expression,
+    /// wrapped as `180 - (…)` / `360 - (…)`. An unset value (`valueNeedsSetup`) is
+    /// seeded from the geometry first. Records an undo step, re-solves, refreshes
+    /// the overlay and marks the document dirty. Returns whether a constraint
+    /// changed; `false` unless exactly one `∠` constraint is selected.
+    pub fn sketch_cycle_angle_measure(&mut self) -> bool {
+        use crate::sketch::doc::id_key;
+
+        let Some(id) = self.sketch_selected_angle_constraint() else {
+            return false;
+        };
+        let key = id_key(&id);
+        let Some(edit) = self.sketch_edit.as_mut() else {
+            return false;
+        };
+        // Measure the current reading first (the seed for an unset value), with
+        // the doc borrowed immutably.
+        let measured = {
+            let doc = &edit.session.doc;
+            let Some(c) = doc
+                .constraints
+                .iter()
+                .find(|c| c.raw.get("id").map(id_key) == Some(key.clone()))
+            else {
+                return false;
+            };
+            let pts = c.points();
+            let coord = |v: &serde_json::Value| doc.point(v).map(|p| (p.x, p.y));
+            let (Some(p0), Some(p1), Some(p2), Some(p3)) =
+                (coord(&pts[0]), coord(&pts[1]), coord(&pts[2]), coord(&pts[3]))
+            else {
+                return false;
+            };
+            let dir = |a: (f64, f64), b: (f64, f64)| (b.1 - a.1).atan2(b.0 - a.0).to_degrees();
+            (dir(p0, p1) - dir(p2, p3)).rem_euclid(360.0)
+        };
+
+        edit.record_undo();
+        let doc = &mut edit.session.doc;
+        let Some(c) = doc
+            .constraints
+            .iter_mut()
+            .find(|c| c.raw.get("id").map(id_key) == Some(key.clone()))
+        else {
+            return false;
+        };
+        let pts: Vec<serde_json::Value> = c.points().to_vec();
+        let value = c
+            .raw
+            .get("value")
+            .and_then(serde_json::Value::as_f64)
+            .filter(|v| v.is_finite())
+            .map(|v| v.rem_euclid(360.0))
+            .unwrap_or_else(|| (measured * 1e4).round() / 1e4);
+        let reflex = value > 180.0;
+        let (order, pivot): (Vec<serde_json::Value>, f64) = if reflex {
+            (vec![pts[2].clone(), pts[3].clone(), pts[0].clone(), pts[1].clone()], 360.0)
+        } else {
+            (vec![pts[3].clone(), pts[2].clone(), pts[0].clone(), pts[1].clone()], 180.0)
+        };
+        let next = ((pivot - value).rem_euclid(360.0) * 1e4).round() / 1e4;
+        c.raw.insert("points".to_string(), serde_json::Value::Array(order));
+        c.raw.insert("value".to_string(), serde_json::json!(next));
+        c.raw.insert("valueNeedsSetup".to_string(), serde_json::Value::Bool(false));
+        if let Some(expr) = c
+            .raw
+            .get("valueExpr")
+            .and_then(serde_json::Value::as_str)
+            .filter(|s| !s.trim().is_empty())
+            .map(str::to_string)
+        {
+            c.raw.insert(
+                "valueExpr".to_string(),
+                serde_json::Value::String(format!("{pivot} - ({expr})")),
+            );
+        }
+        // The solver's per-constraint caches are slot-wise; a reordered record must
+        // not carry the old slots' signature or solve value.
+        c.raw.remove("previousPointValues");
+        c.raw.remove("_previousSolveValue");
+        c.raw.remove("status");
+        c.raw.remove("error");
+
+        self.resolve_active_sketch("angle-measure");
+        self.refresh_sketch_overlay();
+        self.dirty = true;
+        true
+    }
+}

@@ -1,6 +1,6 @@
 [package]
 name = "BREP_docs"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2021"
 license-file = "LICENSE.md"
 description = "The static HTML help-site generator for the BREP CAD application: renders a BREP source tree's user docs, icons and licence notices into a searchable site."

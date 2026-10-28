@@ -321,7 +321,7 @@ impl SymbolEditor {
     /// The NUMBER of the selected pin, or `None` when the selection is a graphic
     /// or empty. The identity a host joins on: a pin's number is what a pad
     /// matches and what a part's connection point is named, so this is the
-    /// whole of the selection a host outside eCAD can act on. [`Item`] itself
+    /// whole of the selection a host outside eCAD can act on. `Item` itself
     /// stays private — it indexes this editor's own lists.
     pub fn selected_pin(&self) -> Option<&str> {
         match self.selected {
@@ -404,10 +404,10 @@ impl SymbolEditor {
             self.selected = Some(Item::Pin(next));
         }
     }
-    /// Where each pin is drawn, `pin:<number>` ([`pin_key`]), in screen points
+    /// Where each pin is drawn, `pin:<number>` (`pin_key`), in screen points
     /// on the `canvas` [`Self::show`] was given — the mapping the canvas paints
     /// with — and then the Inspector's widgets, `inspector:<thing>`, where
-    /// [`Self::properties`] last drew them ([`InspectorHits`]).
+    /// [`Self::properties`] last drew them (`InspectorHits`).
     pub fn hits(&self, canvas: Rect) -> Vec<(String, Rect)> {
         let center = canvas.center() + self.pan;
         let screen = |p: Point| on_canvas(center, self.zoom, p);

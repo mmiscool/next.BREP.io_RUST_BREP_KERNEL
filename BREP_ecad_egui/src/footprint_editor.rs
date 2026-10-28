@@ -319,7 +319,7 @@ impl FootprintEditor {
     }
     /// The NUMBER of the selected pad, or `None` when the selection is silk or
     /// empty. The symbol-wide identity a host joins on, exactly as
-    /// [`SymbolEditor::selected_pin`] is; [`Item`] stays private.
+    /// [`SymbolEditor::selected_pin`] is; `Item` stays private.
     pub fn selected_pad(&self) -> Option<&str> {
         match self.selected {
             Some(Item::Pad(index)) => {
@@ -353,7 +353,7 @@ impl FootprintEditor {
             None => false,
         }
     }
-    /// Where each pad is drawn, `pad:<number>` ([`pad_key`]: a mechanical
+    /// Where each pad is drawn, `pad:<number>` (`pad_key`: a mechanical
     /// pad's is `unnumbered-pad:<index>`), and each silkscreen line,
     /// `silk:<index>` (a small rect on the middle of its longest segment, as a
     /// sheet wire's is), in screen points on the `canvas` [`Self::show`] was

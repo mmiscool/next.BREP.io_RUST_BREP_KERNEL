@@ -29,6 +29,16 @@ pub async fn kicad_libraries(State(db): State<Shared>, headers: HeaderMap) -> Re
     Ok(Json(blocking(move || kicad::libraries(&db)).await?))
 }
 
+/// Name the server's own KiCad folders for a server that cannot clone them.
+pub async fn kicad_folders(
+    State(db): State<Shared>,
+    headers: HeaderMap,
+    Json(request): Json<kicad::FoldersRequest>,
+) -> Result<Json<Value>, Error> {
+    require_admin(&db, &headers)?;
+    Ok(Json(blocking(move || kicad::set_folders(&db, &request)).await?))
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TaxonomyRequest { pub category: String }

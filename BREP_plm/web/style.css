@@ -746,6 +746,10 @@ th { text-transform: none; letter-spacing: normal; }
 .import-table input, .import-table select { min-width: 135px; max-width: 240px; width: 100%; }
 .import-table small { display: block; max-width: 260px; overflow-wrap: anywhere; color: var(--muted); padding-top: 5px; }
 #ni-result-rows li { margin: 8px 0; overflow-wrap: anywhere; }
+.import-tree, .import-tree ul { list-style: none; margin: 4px 0; padding-left: 18px; overflow-wrap: anywhere; }
+.import-tree { padding-left: 0; }
+.import-tree small { color: var(--muted); }
+#ni-conflict-rows li { margin: 6px 0; overflow-wrap: anywhere; }
 
 /* Responsive selection/detail workbench. Home is the user's navigation tree;
    there is no second, permanent navigation rail. */
@@ -987,6 +991,27 @@ input, select, textarea { min-width: 0; max-width: 100%; }
 @media (max-width: 600px) { .bom-column-picker { grid-template-columns: minmax(0,1fr); } .bom-column-transfer { display: flex; } }
 
 table.bom th { overflow-wrap: normal; word-break: normal; }
+/* An editable BOM cell keeps room for its value; the table scrolls sideways instead. */
+table.bom [data-bom-field]:not([type=checkbox]) { min-width: 9rem; }
+/* On a phone the BOM controls must not push the table below the fold: one
+   tight wrap for the toolbar, the depth controls left to a wider screen, and
+   the save hint in small type. */
+@media (max-width: 640px) {
+  #tab-bom > .toolbar { margin: 6px 0; gap: 6px 12px; }
+  #tab-bom > .bom-tree-controls:empty { display: none; }
+  #tab-bom > .toolbar .spacer { display: none; }
+  .bom-tree-controls label.inline-select, .bom-tree-controls [data-bom-expand-to] { display: none; }
+  #bom-edit-status { margin: 4px 0; font-size: 12px; }
+  #bom-edit-status:empty { display: none; }
+}
+/* Phone tap targets: every control at least 24x24 CSS px (WCAG 2.5.8). A
+   box inside its label is tapped through the label and keeps its size. */
+@media (max-width: 640px) {
+  .view input:is([type=checkbox], [type=radio]):not(label input) { width: 24px; min-width: 24px; height: 24px; margin: 0; flex: none; }
+  .view td a[href], .view a.back { display: inline-block; padding: 3px 0; min-height: 24px; }
+  .bom-warning-icon { min-width: 28px; min-height: 28px; }
+  .view input[type=file] { min-height: 32px; }
+}
 #bc-form { width: 100%; max-width: none; }
 #bc-form > label:first-child { max-width: 480px; }
 #bc-form > .admin-only:not([hidden]) { display: flex; align-items: center; gap: 8px; }
@@ -1191,3 +1216,22 @@ body.resizing-panes, body.resizing-panes * { cursor: col-resize !important; user
 }
 
 .wf-run-chart { height:auto; max-height:none; overflow:visible; }
+
+/* The desktop sign-in confirm card (/desktop-link). */
+.desktop-link-code { font-family: ui-monospace, monospace; font-size: 22px; letter-spacing: 0.2em; }
+#desktop-link .actions { display: flex; gap: 10px; }
+#desktop-link-result.ok { color: var(--ink); font-weight: 600; }
+#desktop-link-result:empty { display: none; }
+#desktop-link .error { margin: 0; }
+
+/* -- manufacturing: tools library and the jobs floor queue ---------------- */
+
+.tool-picture { width: 48px; height: 48px; object-fit: contain; display: block; }
+.jobs-list { display: grid; gap: 10px; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); }
+.job-card { text-align: left; padding: 14px; min-height: 64px; background: var(--panel); color: var(--ink); border: 1px solid var(--line); border-radius: var(--radius); }
+.job-steps { padding-left: 1.4em; display: grid; gap: 10px; }
+.job-steps li { padding: 10px 12px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--panel); }
+.job-steps li.signed { opacity: .75; }
+.job-steps li.current { border-color: var(--accent); }
+.job-sign { display: grid; gap: 8px; margin-top: 8px; }
+.job-sign button { min-height: 44px; }

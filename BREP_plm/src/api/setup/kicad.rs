@@ -6,56 +6,206 @@ use crate::{
     model::{DocumentClass, Lifecycle, Origin, User},
     Error,
 };
-use brep_ecad_core::{kicad, Symbol};
+use brep_ecad_core::{
+    kicad,
+    kicad_git::{self, Repo, TAG},
+    Symbol,
+};
+use serde::Deserialize;
 use serde_json::{json, Value};
-use std::{collections::HashMap, io::Read};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+    sync::{atomic::AtomicBool, Mutex},
+};
 
-const TAG: &str = "9.0.9.1";
 const LIMIT: u64 = 32 * 1024 * 1024;
 
 fn valid_library(name: &str) -> bool {
     !name.is_empty() && name.len() <= 100 && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
-/// Discover every top-level symbol library at the same pinned release used
-/// for assets. Pagination is exhausted; no hand-picked library subset.
-pub(super) fn libraries(db: &Db) -> Result<Value, Error> {
-    let cache = db.root().join("kicad-cache").join(TAG).join("symbol-library-index.json");
-    let names: Vec<String> = if cache.is_file() {
-        let bytes = std::fs::read(&cache).map_err(Error::internal)?;
-        if bytes.len() as u64 > LIMIT { return Err(Error::bad_request("KiCad index exceeds download limit")); }
-        serde_json::from_slice(&bytes).map_err(|e| Error::bad_request(e.to_string()))?
-    } else {
-        let agent = ureq::AgentBuilder::new().timeout(std::time::Duration::from_secs(90)).build();
-        let mut names = Vec::new();
-        for page in 1..=100 {
-            let url = format!("https://gitlab.com/api/v4/projects/kicad%2Flibraries%2Fkicad-symbols/repository/tree?ref={TAG}&per_page=100&page={page}");
-            let response = agent.get(&url).call().map_err(|e| Error::bad_request(format!("KiCad library discovery failed: {e}; retry")))?;
-            let mut bytes = Vec::new();
-            response.into_reader().take(LIMIT + 1).read_to_end(&mut bytes).map_err(Error::internal)?;
-            if bytes.len() as u64 > LIMIT { return Err(Error::bad_request("KiCad index exceeds download limit")); }
-            let entries: Vec<Value> = serde_json::from_slice(&bytes).map_err(|e| Error::bad_request(e.to_string()))?;
-            for entry in &entries {
-                if entry["type"] == "blob" {
-                    if let Some(name) = entry["path"].as_str().and_then(|p| p.strip_suffix(".kicad_sym")) {
-                        if !valid_library(name) { return Err(Error::bad_request(format!("Unsupported upstream library name: {name}"))); }
-                        names.push(name.to_string());
-                    }
-                }
-            }
-            if entries.len() < 100 { break; }
-            if page == 100 { return Err(Error::bad_request("KiCad index pagination exceeds limit; no partial list was imported")); }
+/// Where this server keeps KiCad's three repositories at [`TAG`]: one shallow
+/// clone each, named by project. A folder there is always a whole checkout
+/// ([`kicad_git::clone`] renames it into place only when git has finished).
+fn clone_root(db: &Db) -> PathBuf {
+    db.root().join("kicad-libraries").join(TAG)
+}
+
+/// Folders an administrator named instead, for a server that cannot run git
+/// or reach GitLab: a KiCad install's `symbols`, `footprints` and `3dmodels`.
+fn folders_file(db: &Db) -> PathBuf {
+    db.root().join("kicad-libraries").join(format!("{TAG}-folders.json"))
+}
+
+/// The three folders an import reads, by repository.
+#[derive(Clone)]
+struct Source {
+    dirs: [PathBuf; 3],
+    from: &'static str,
+}
+impl Source {
+    fn dir(&self, repo: Repo) -> &Path {
+        &self.dirs[Repo::ALL.iter().position(|r| *r == repo).unwrap()]
+    }
+}
+
+/// A clone running in the background, or the last one that failed.
+#[derive(Default)]
+struct Cloning {
+    running: bool,
+    line: String,
+    error: Option<String>,
+}
+
+/// Per server data folder, so two stores in one process (the suite) never
+/// share a clone's state.
+static CLONES: std::sync::LazyLock<Mutex<HashMap<PathBuf, Cloning>>> = std::sync::LazyLock::new(Default::default);
+
+/// The admin's folders when named, else the clones once all three are there.
+fn ready(db: &Db) -> Result<Option<Source>, Error> {
+    let file = folders_file(db);
+    if file.is_file() {
+        let saved: Value = serde_json::from_slice(&std::fs::read(&file).map_err(Error::internal)?).map_err(Error::internal)?;
+        let dirs = Repo::ALL.map(|repo| PathBuf::from(saved[repo.install_folder()].as_str().unwrap_or_default()));
+        if let Some(missing) = dirs.iter().find(|dir| !dir.is_dir()) {
+            return Err(Error::bad_request(format!(
+                "the KiCad folder {} named in setup no longer exists; name the folders again",
+                missing.display()
+            )));
         }
-        names.sort(); names.dedup();
-        if names.is_empty() { return Err(Error::bad_request("KiCad returned no symbol libraries")); }
-        std::fs::create_dir_all(cache.parent().unwrap()).map_err(Error::internal)?;
-        let temporary = cache.with_extension(format!("{}.tmp", crate::auth::new_id()));
-        std::fs::write(&temporary, serde_json::to_vec(&names).map_err(Error::internal)?).map_err(Error::internal)?;
-        std::fs::rename(&temporary, &cache).map_err(Error::internal)?;
-        names
+        return Ok(Some(Source { dirs, from: "folders" }));
+    }
+    let root = clone_root(db);
+    let dirs = Repo::ALL.map(|repo| root.join(repo.project()));
+    Ok(dirs.iter().all(|dir| dir.is_dir()).then_some(Source { dirs, from: "clone" }))
+}
+
+/// Start cloning whatever of the three is missing, unless a clone is already
+/// running for this server. The clone runs on its own thread: the models are
+/// gigabytes, far longer than any request may wait.
+fn start_clone(db: &Db, base: &str) {
+    let root = clone_root(db);
+    {
+        let mut clones = CLONES.lock().unwrap();
+        let state = clones.entry(root.clone()).or_default();
+        if state.running {
+            return;
+        }
+        *state = Cloning { running: true, line: "starting git".into(), error: None };
+    }
+    let base = base.to_owned();
+    std::thread::spawn(move || {
+        let never = AtomicBool::new(false);
+        let mut result = kicad_git::git_version().map(|_| ());
+        for repo in Repo::ALL {
+            if result.is_err() {
+                break;
+            }
+            let mut report = |line: &str| {
+                if let Some(state) = CLONES.lock().unwrap().get_mut(&root) {
+                    state.line = format!("{}: {line}", repo.project());
+                }
+            };
+            result = kicad_git::clone(&repo.url(&base), TAG, &root.join(repo.project()), &mut report, &never).map(|_| ());
+        }
+        let mut clones = CLONES.lock().unwrap();
+        let state = clones.entry(root).or_default();
+        state.running = false;
+        state.error = result.err();
+    });
+}
+
+/// Where the libraries stand: `ready` with every top-level symbol library,
+/// `cloning` with git's latest progress line, or `failed` with why. A call
+/// that finds neither the libraries nor a clone running starts one, so the
+/// wizard polls this until it answers `ready`; a failure is reported once and
+/// the next call tries again.
+pub(super) fn libraries(db: &Db) -> Result<Value, Error> {
+    libraries_from(db, clone_base().as_deref())
+}
+
+/// Where this server clones from: GitLab, or `BREP_PLM_KICAD_GIT_BASE` when
+/// set. `off` there turns cloning off, so a server that has neither a clone
+/// nor named folders answers `failed` at once; every test harness sets it, so
+/// no suite starts a 5.6 GB download from GitLab.
+fn clone_base() -> Option<String> {
+    match std::env::var("BREP_PLM_KICAD_GIT_BASE") {
+        Ok(base) if base.trim() == "off" => None,
+        Ok(base) if !base.trim().is_empty() => Some(base.trim().to_owned()),
+        _ => Some(kicad_git::BASE_URL.to_owned()),
+    }
+}
+
+/// [`libraries`], cloning from `base` (a local repository in the suite), or
+/// not at all when `base` is `None`.
+fn libraries_from(db: &Db, base: Option<&str>) -> Result<Value, Error> {
+    if let Some(source) = ready(db)? {
+        let names = kicad_git::symbol_libraries(source.dir(Repo::Symbols)).map_err(Error::bad_request)?;
+        let names: Vec<String> = names.into_iter().filter(|name| valid_library(name)).collect();
+        if names.is_empty() {
+            return Err(Error::bad_request("the KiCad symbols folder holds no symbol libraries"));
+        }
+        return Ok(json!({"status":"ready","release":TAG,"source":source.from,"libraries":names}));
+    }
+    let root = clone_root(db);
+    {
+        let mut clones = CLONES.lock().unwrap();
+        if let Some(state) = clones.get_mut(&root) {
+            if state.running {
+                return Ok(json!({"status":"cloning","release":TAG,"line":state.line}));
+            }
+            if let Some(error) = state.error.take() {
+                return Ok(json!({"status":"failed","release":TAG,"error":error,"folder":root}));
+            }
+        }
+    }
+    let Some(base) = base else {
+        return Ok(json!({"status":"failed","release":TAG,"folder":root,
+            "error":"this server is set not to clone KiCad's libraries (BREP_PLM_KICAD_GIT_BASE=off)"}));
     };
-    if names.is_empty() || names.iter().any(|n| !valid_library(n)) { return Err(Error::bad_request("Invalid cached KiCad library index")); }
-    Ok(json!({"release":TAG,"libraries":names}))
+    start_clone(db, base);
+    Ok(json!({"status":"cloning","release":TAG,"line":"starting git"}))
+}
+
+/// Name the server's own KiCad folders instead of cloning, or with every
+/// field empty, forget them; the next [`libraries`] clones again.
+pub(super) fn set_folders(db: &Db, folders: &FoldersRequest) -> Result<Value, Error> {
+    let file = folders_file(db);
+    let named = [&folders.symbols, &folders.footprints, &folders.models];
+    if named.iter().all(|f| f.trim().is_empty()) {
+        if file.is_file() {
+            std::fs::remove_file(&file).map_err(Error::internal)?;
+        }
+        return Ok(json!({"status":"cleared","release":TAG}));
+    }
+    let mut saved = serde_json::Map::new();
+    for (repo, folder) in Repo::ALL.into_iter().zip(named) {
+        let path = PathBuf::from(folder.trim());
+        if !path.is_absolute() || !path.is_dir() {
+            return Err(Error::bad_request(format!(
+                "the KiCad {} folder must be an existing folder on the server, given as a full path",
+                repo.install_folder()
+            )));
+        }
+        saved.insert(repo.install_folder().into(), json!(path));
+    }
+    std::fs::create_dir_all(file.parent().unwrap()).map_err(Error::internal)?;
+    let temporary = file.with_extension(format!("{}.tmp", crate::auth::new_id()));
+    std::fs::write(&temporary, serde_json::to_vec(&saved).map_err(Error::internal)?).map_err(Error::internal)?;
+    std::fs::rename(&temporary, &file).map_err(Error::internal)?;
+    libraries(db)
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FoldersRequest {
+    #[serde(default)]
+    pub symbols: String,
+    #[serde(default)]
+    pub footprints: String,
+    #[serde(default)]
+    pub models: String,
 }
 
 /// Reclassify current imports without touching any document, revision or
@@ -85,18 +235,6 @@ pub(super) fn repair_taxonomy(db: &Db, root: &str) -> Result<Value, Error> {
     Ok(json!({"parts":parts.len(),"reclassified":changed,"release":TAG}))
 }
 
-fn encode(value: &str) -> String {
-    value
-        .bytes()
-        .map(|b| match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                (b as char).to_string()
-            }
-            _ => format!("%{b:02X}"),
-        })
-        .collect()
-}
-
 fn safe_path(path: &str) -> Result<(), String> {
     if path.is_empty()
         || path.len() > 1000
@@ -112,69 +250,33 @@ fn safe_path(path: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// URLs and repository names are fixed here; upstream model paths cannot turn
-/// the import into arbitrary HTTP requests or escape the on-disk cache.
-struct Files<'a> {
-    db: &'a Db,
-    agent: ureq::Agent,
+/// Reads from the three folders only; upstream model paths cannot escape them.
+struct Files {
+    source: Source,
     results: HashMap<String, Result<Option<String>, String>>,
 }
-impl Files<'_> {
-    fn read(&mut self, repo: &str, path: &str) -> Result<Option<String>, String> {
+impl Files {
+    fn read(&mut self, repo: Repo, path: &str) -> Result<Option<String>, String> {
         safe_path(path)?;
-        let key = format!("{repo}/{path}");
+        let key = format!("{}/{path}", repo.project());
         if let Some(result) = self.results.get(&key) {
             return result.clone();
         }
-        let result = self.fetch(repo, path);
+        let result = self.load(repo, path);
         self.results.insert(key, result.clone());
         result
     }
-    fn fetch(&self, repo: &str, path: &str) -> Result<Option<String>, String> {
-        let cached = self
-            .db
-            .root()
-            .join("kicad-cache")
-            .join(TAG)
-            .join(repo)
-            .join(path);
-        if cached.is_file() {
-            let bytes = std::fs::read(&cached).map_err(|e| e.to_string())?;
-            if bytes.len() as u64 > LIMIT {
-                return Err("cached KiCad file exceeds 32 MiB".into());
-            }
-            return String::from_utf8(bytes)
-                .map(Some)
-                .map_err(|e| e.to_string());
+    fn load(&self, repo: Repo, path: &str) -> Result<Option<String>, String> {
+        let file = self.source.dir(repo).join(path);
+        if !file.is_file() {
+            return Ok(None);
         }
-        let url = format!("https://gitlab.com/api/v4/projects/kicad%2Flibraries%2F{repo}/repository/files/{}/raw?ref={TAG}", encode(path));
-        let response = match self.agent.get(&url).call() {
-            Ok(response) => response,
-            Err(ureq::Error::Status(404, _)) => return Ok(None),
-            Err(error) => {
-                return Err(format!(
-                    "KiCad download failed ({path}): {error}; retry the import"
-                ))
-            }
-        };
-        let mut bytes = Vec::new();
-        response
-            .into_reader()
-            .take(LIMIT + 1)
-            .read_to_end(&mut bytes)
-            .map_err(|e| e.to_string())?;
-        if bytes.len() as u64 > LIMIT {
+        let length = std::fs::metadata(&file).map_err(|e| e.to_string())?.len();
+        if length > LIMIT {
             return Err(format!("KiCad file exceeds 32 MiB: {path}"));
         }
-        let text = String::from_utf8(bytes).map_err(|e| e.to_string())?;
-        std::fs::create_dir_all(cached.parent().unwrap()).map_err(|e| e.to_string())?;
-        let temporary = cached.with_extension(format!("{}.tmp", crate::auth::new_id()));
-        std::fs::write(&temporary, &text).map_err(|e| e.to_string())?;
-        if let Err(error) = std::fs::rename(&temporary, &cached) {
-            let _ = std::fs::remove_file(&temporary);
-            return Err(error.to_string());
-        }
-        Ok(Some(text))
+        let bytes = std::fs::read(&file).map_err(|e| format!("{path}: {e}"))?;
+        String::from_utf8(bytes).map(Some).map_err(|e| format!("{path}: {e}"))
     }
 }
 
@@ -459,15 +561,12 @@ pub(super) fn import(db: &Db, user: &User, request: &ImportRequest) -> Result<Va
             "enter a KiCad library name, such as Device or Timer",
         ));
     }
-    let mut files = Files {
-        db,
-        agent: ureq::AgentBuilder::new()
-            .timeout(std::time::Duration::from_secs(90))
-            .build(),
-        results: HashMap::new(),
-    };
+    let source = ready(db)?.ok_or_else(|| {
+        Error::bad_request("KiCad's libraries are not cloned yet; open the KiCad step of setup and wait for the clone")
+    })?;
+    let mut files = Files { source, results: HashMap::new() };
     let text = files
-        .read("kicad-symbols", &format!("{library}.kicad_sym"))
+        .read(Repo::Symbols, &format!("{library}.kicad_sym"))
         .map_err(Error::bad_request)?
         .ok_or_else(|| Error::bad_request("KiCad symbol library not found"))?;
     let report = kicad::import_library(&text, library).map_err(Error::bad_request)?;
@@ -497,7 +596,7 @@ pub(super) fn import(db: &Db, user: &User, request: &ImportRequest) -> Result<Va
             }
             let path = format!("{library}.pretty/{name}.kicad_mod");
             let text = files
-                .read("kicad-footprints", &path)?
+                .read(Repo::Footprints, &path)?
                 .ok_or_else(|| format!("assigned footprint not found: {library}:{name}"))?;
             let (footprint, notes) = kicad::import_footprint(&text)?;
             warnings.extend(
@@ -533,7 +632,7 @@ pub(super) fn import(db: &Db, user: &User, request: &ImportRequest) -> Result<Va
                         .entry(key)
                         .or_insert_with(|| {
                             let text = files
-                                .read("kicad-packages3D", &path)?
+                                .read(Repo::Models, &path)?
                                 .ok_or_else(|| format!("STEP model not found: {path}"))?;
                             feature(&text, model, &path, &id)
                         })

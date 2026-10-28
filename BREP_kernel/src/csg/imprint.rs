@@ -7,7 +7,7 @@ use crate::tolerance::{
 use crate::topology::{BrepSolid, EdgeRecord, FaceRecord};
 use crate::{
     build_pcurve_on_surface, classify_surface_pair_cached,
-    fit_polyline, fit_polyline_of_degree, intersect_curve_surface, PolylineFit,
+    fit_polyline, fit_polyline_of_degree, PolylineFit,
     intersect_curves, intersect_surfaces, intersect_surfaces_supplemental, project_point_to_curve,
     project_point_to_surface, project_point_to_surface_seeded, KnotVector, NurbsCurve, NurbsSurface,
     SurfaceClassifyData,
@@ -17,6 +17,62 @@ use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use web_time::Instant;
+
+// Lane P3b row 3 (2026-10-26): the profile lines of one operation are
+// gathered in a thread-local buffer and written to stderr ONCE when the
+// outermost `ProfileSink` closes, instead of one unbuffered write per line
+// (the `bench-occ` comparator timed our driver with `BREP_PROFILE=1` until
+// row 5, and an outward box shell emitted ~435 lines). Line content is
+// unchanged; lines emitted outside any open sink go straight to stderr.
+thread_local! {
+    static PROFILE_SINK: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+#[doc(hidden)]
+pub(crate) fn profile_emit(args: std::fmt::Arguments<'_>) {
+    use std::fmt::Write;
+    PROFILE_SINK.with(|sink| {
+        let mut sink = sink.borrow_mut();
+        match sink.as_mut() {
+            Some(buffer) => {
+                let _ = buffer.write_fmt(args);
+                buffer.push('\n');
+            }
+            None => eprintln!("{args}"),
+        }
+    });
+}
+/// `eprintln!` for a `BREP_PROFILE` line: buffered while a [`ProfileSink`] is open.
+macro_rules! profile_line {
+    ($($arg:tt)*) => { $crate::imprint::profile_emit(format_args!($($arg)*)) };
+}
+/// Opens the operation's line buffer when `BREP_PROFILE` is set and no sink
+/// is open on this thread (a nested operation writes into its parent's);
+/// dropping the outermost sink writes the buffer in one call.
+pub(crate) struct ProfileSink;
+impl ProfileSink {
+    pub(crate) fn open() -> Option<Self> {
+        if !profile_enabled() {
+            return None;
+        }
+        PROFILE_SINK.with(|sink| {
+            let mut sink = sink.borrow_mut();
+            if sink.is_some() {
+                return None;
+            }
+            *sink = Some(String::with_capacity(16 * 1024));
+            Some(Self)
+        })
+    }
+}
+impl Drop for ProfileSink {
+    fn drop(&mut self) {
+        if let Some(buffer) = PROFILE_SINK.with(|sink| sink.borrow_mut().take()) {
+            if !buffer.is_empty() {
+                eprint!("{buffer}");
+            }
+        }
+    }
+}
 
 /// Per-step wall-clock accumulators for `build_imprints`, printed to stderr
 /// when `BREP_PROFILE` is set. Native-only in practice (no env vars in wasm).
@@ -57,7 +113,7 @@ struct ImprintProfile {
 impl ImprintProfile {
     fn new() -> Self {
         Self {
-            enabled: std::env::var("BREP_PROFILE").is_ok(),
+            enabled: profile_enabled(),
             ..Self::default()
         }
     }
@@ -76,9 +132,9 @@ impl ImprintProfile {
         if !self.enabled {
             return;
         }
-        eprintln!("imprint.whole_reading_reuses count={}", self.whole_reading_reuses);
+        profile_line!("imprint.whole_reading_reuses count={}", self.whole_reading_reuses);
         let ms = |d: Duration| d.as_secs_f64() * 1_000.0;
-        eprintln!(
+        profile_line!(
             "imprint.profile pairs={} marched={} classify={:.2} cosurface={:.2} lies_on={:.2} planar_iso={:.2} analytic={:.2} seeds={:.2} march={:.2} clip_fit={:.2} process_curve={:.2}",
             self.pairs,
             self.marched_pairs,
@@ -92,7 +148,7 @@ impl ImprintProfile {
             ms(self.clip_and_fit),
             ms(self.process_curve),
         );
-        eprintln!(
+        profile_line!(
             "imprint.clip_fit rescue_march={:.2} clip={:.2} shared_boundary={:.2} fit={:.2} process={:.2} hermite={:.2} hermite_runs={} fit_runs={}",
             ms(self.rescue_march),
             ms(self.clip),
@@ -103,7 +159,7 @@ impl ImprintProfile {
             self.hermite_runs,
             self.fit_runs,
         );
-        eprintln!(
+        profile_line!(
             "imprint.fits pairs={} exact_lanes={} exact_iso_sections={} exact_iso_declined={}",
             self.pairs_fits,
             self.exact_lane_fits,
@@ -111,6 +167,48 @@ impl ImprintProfile {
             self.exact_iso_declined,
         );
     }
+}
+
+/// Lane P3b row 0 (2026-10-26): where `process_curve`'s crossing loop, the
+/// lies-on span search and the boundary-reuse pass spend their time, read only
+/// under `BREP_PROFILE` and printed once per `build_imprints` as
+/// `imprint.split`. Thread-local because the builder and the support
+/// functions have no profile handle; `take` drains it for the report.
+#[derive(Default, Clone, Copy)]
+pub(crate) struct ImprintSplit {
+    pub pierce: Duration,
+    pub pierce_edges: u64,
+    pub overlap: Duration,
+    pub overlap_edges: u64,
+    pub crossing: Duration,
+    pub crossing_edges: u64,
+    pub recover: Duration,
+    pub recover_pierces: u64,
+    pub lies_whole: Duration,
+    pub lies_whole_calls: u64,
+    pub lies_whole_hits: u64,
+    pub lies_span: Duration,
+    pub lies_span_calls: u64,
+    pub reuse_edges: u64,
+}
+thread_local! {
+    static IMPRINT_SPLIT: std::cell::Cell<ImprintSplit> = const { std::cell::Cell::new(ImprintSplit {
+        pierce: Duration::ZERO, pierce_edges: 0, overlap: Duration::ZERO, overlap_edges: 0,
+        crossing: Duration::ZERO, crossing_edges: 0, recover: Duration::ZERO, recover_pierces: 0,
+        lies_whole: Duration::ZERO, lies_whole_calls: 0, lies_whole_hits: 0,
+        lies_span: Duration::ZERO, lies_span_calls: 0, reuse_edges: 0,
+    }) };
+}
+/// Whether `BREP_PROFILE` is set, read once per process (no test toggles it).
+pub(crate) fn profile_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("BREP_PROFILE").is_some())
+}
+pub(crate) fn imprint_split_add(update: impl FnOnce(&mut ImprintSplit)) {
+    IMPRINT_SPLIT.with(|cell| { let mut split = cell.get(); update(&mut split); cell.set(split); });
+}
+pub(crate) fn imprint_split_take() -> ImprintSplit {
+    IMPRINT_SPLIT.with(|cell| cell.replace(ImprintSplit::default()))
 }
 
 /// Coarse observation of optional contact/graph calls, including early
@@ -121,13 +219,13 @@ struct ImprintSubphaseClock {
 }
 impl ImprintSubphaseClock {
     fn new(label: &'static str) -> Self {
-        Self { started: std::env::var_os("BREP_PROFILE").is_some().then(Instant::now), label }
+        Self { started: profile_enabled().then(Instant::now), label }
     }
 }
 impl Drop for ImprintSubphaseClock {
     fn drop(&mut self) {
         if let Some(started) = self.started {
-            eprintln!("imprint.subphase label={} ms={:.3}", self.label, started.elapsed().as_secs_f64() * 1000.0);
+            profile_line!("imprint.subphase label={} ms={:.3}", self.label, started.elapsed().as_secs_f64() * 1000.0);
         }
     }
 }
@@ -548,10 +646,16 @@ pub(crate) fn planar_carrier_section(
 use tangent_contact::classify_tangent_contact;
 
 pub use driver::build_imprints;
-pub(crate) use driver::{build_carrier_imprints, take_rescue_firings};
+pub(crate) use driver::{build_carrier_imprints, build_carrier_imprints_within, take_rescue_firings};
 pub(crate) use self_touch::self_touch_edge_splits;
+pub(crate) use support::clear_window_memo;
+pub(crate) use self_touch::clear_touch_memo;
 
 
 #[path = "imprint/pcurve_cache.rs"]
 mod pcurve_cache;
 use pcurve_cache::cached_build_pcurve as build_pcurve_on_surface_marched;
+
+#[path = "imprint/intersection_cache.rs"]
+mod intersection_cache;
+use intersection_cache::intersect as intersect_curve_surface;

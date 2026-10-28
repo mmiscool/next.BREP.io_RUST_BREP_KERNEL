@@ -4,9 +4,9 @@
 //!
 //! One `.tar.gz` holding, under a `manifest.json` that comes first:
 //!
-//! - `plm.sqlite` — a snapshot of the metadata and the audit log, taken with
-//!   SQLite's `VACUUM INTO`, which reads one consistent transaction while the
-//!   server keeps writing;
+//! - `plm.sqlite` — a snapshot of the metadata and the audit log: SQLite's
+//!   backup of one read transaction, which the server's writes do not wait
+//!   for (WAL);
 //! - `models/<part>/<revision>.json` — the document of every revision the snapshot records a hash for;
 //! - `blobs/…` — every attachment the snapshot references, and every version
 //!   of every workspace file;
@@ -35,9 +35,11 @@
 //! moment later — a state the store passes through anyway between a CAD save
 //! and its next. The manifest lists each such file under `adjusted`.
 //!
-//! The server's own backups (the Backups page, `--backup-dir`) take the
-//! snapshot and the drafts' documents under the store's read lock instead:
-//! writes wait those milliseconds, and nothing is ever retried or adjusted.
+//! The server's own backups (the Backups page, `--backup-dir`) open that
+//! transaction, read what it references and copy the drafts' documents under
+//! the store's read lock instead: writes wait for that (not for the copy of
+//! the store, which follows from the same transaction), and nothing is
+//! adjusted.
 //!
 //! # A restore
 //!
@@ -171,11 +173,8 @@ struct Wanted {
     schema_version: i64,
 }
 
-/// Read what the snapshot references, through a read-only connection so the
-/// snapshot file is archived exactly as `VACUUM INTO` wrote it.
-fn wanted(snapshot: &Path) -> io::Result<Wanted> {
-    use rusqlite::{Connection, OpenFlags};
-    let conn = Connection::open_with_flags(snapshot, OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(other_sql)?;
+/// Read what the snapshot `conn` reads references.
+fn wanted(conn: &rusqlite::Connection) -> io::Result<Wanted> {
     let mut drafts = BTreeMap::new();
     let mut frozen = BTreeMap::new();
     let mut blobs = BTreeSet::new();
@@ -187,9 +186,12 @@ fn wanted(snapshot: &Path) -> io::Result<Wanted> {
                 }
             }
         }
-        // A revision's thumbnail (P9) is a blob like an attachment.
-        if let Some(sha) = body.pointer("/thumbnail/sha256").and_then(Value::as_str) {
-            blobs.insert(sha.to_string());
+        // A revision's thumbnail (P9) and an instructions revision's player
+        // data are blobs like an attachment.
+        for pointer in ["/thumbnail/sha256", "/player/sha256"] {
+            if let Some(sha) = body.pointer(pointer).and_then(Value::as_str) {
+                blobs.insert(sha.to_string());
+            }
         }
     };
     {
@@ -223,6 +225,21 @@ fn wanted(snapshot: &Path) -> io::Result<Wanted> {
         let body: Value = serde_json::from_str(&body.map_err(other_sql)?).map_err(other)?;
         for v in body.get("versions").and_then(Value::as_array).into_iter().flatten() {
             if let Some(sha) = v.get("sha256").and_then(Value::as_str) {
+                blobs.insert(sha.to_string());
+            }
+        }
+    }
+    // The tools library's pictures: the library is a state list kept whole
+    // in `meta` ([`crate::tools`]).
+    let tools: Option<String> = conn
+        .query_row("SELECT value FROM meta WHERE key = 'state.tools'", [], |r| r.get(0))
+        .map(Some)
+        .or_else(|error| if error == rusqlite::Error::QueryReturnedNoRows { Ok(None) } else { Err(error) })
+        .map_err(other_sql)?;
+    if let Some(tools) = tools {
+        let tools: Value = serde_json::from_str(&tools).map_err(other)?;
+        for tool in tools.as_array().into_iter().flatten() {
+            if let Some(sha) = tool.pointer("/picture/sha256").and_then(Value::as_str) {
                 blobs.insert(sha.to_string());
             }
         }
@@ -338,23 +355,28 @@ fn attempt(data: &Path, scripts: &Path, stage: &Path, hold: Hold<'_>, adjust: bo
     fs::create_dir_all(stage)?;
     let snapshot = stage.join(crate::db::SQLITE_FILE);
     let mut files = Vec::new();
-    let mut found: Option<Wanted> = None;
     let mut adjusted: Vec<String> = Vec::new();
-    // The part that must agree with itself: the snapshot, and the documents
-    // that can still change. Back to back, and under the store's lock when
-    // the caller has one, so the window a write can fall into is a few files.
+    use rusqlite::{Connection, OpenFlags};
+    let source = data.join(crate::db::SQLITE_FILE);
+    if !source.exists() {
+        return Err(other(format!("{} has no {}", data.display(), crate::db::SQLITE_FILE)));
+    }
+    let conn = Connection::open_with_flags(&source, OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(other_sql)?;
+    conn.busy_timeout(std::time::Duration::from_secs(30)).map_err(other_sql)?;
+    let mut moved: Vec<(String, Option<(u64, String)>)> = Vec::new();
+    // The part that must agree with itself: the store as one read
+    // transaction sees it, and the documents that can still change. Under the
+    // store's lock when the caller has one: the transaction is opened, read
+    // for what it references, and the drafts copied. The store itself is
+    // copied out of the same transaction after writes go on again (WAL: they
+    // do not wait for a reader, and the reader keeps its moment), and last,
+    // so the blobs are copied as soon after the lock as they always were (a
+    // blob deleted in between makes the backup retake). Writes used to wait
+    // for a VACUUM INTO of the whole store, seconds on a large one.
+    let mut found: Option<Wanted> = None;
     let first = hold(&mut || {
-        use rusqlite::{Connection, OpenFlags};
-        let source = data.join(crate::db::SQLITE_FILE);
-        if !source.exists() {
-            return Err(other(format!("{} has no {}", data.display(), crate::db::SQLITE_FILE)));
-        }
-        let conn = Connection::open_with_flags(&source, OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(other_sql)?;
-        conn.busy_timeout(std::time::Duration::from_secs(30)).map_err(other_sql)?;
-        conn.execute("VACUUM INTO ?1", [snapshot.to_string_lossy().as_ref()]).map_err(other_sql)?;
-        drop(conn);
-        let wanted = wanted(&snapshot)?;
-        let mut moved: Vec<(String, Option<(u64, String)>)> = Vec::new();
+        conn.execute_batch("BEGIN").map_err(other_sql)?;
+        let wanted = wanted(&conn)?;
         for (path, expected) in &wanted.drafts {
             match copy_hashed(&data.join(path), &stage.join(path))? {
                 None if adjust => moved.push((path.clone(), None)),
@@ -368,10 +390,6 @@ fn attempt(data: &Path, scripts: &Path, stage: &Path, hold: Hold<'_>, adjust: bo
                 }
                 Some((size, sha256)) => files.push(FileEntry { path: path.clone(), size, sha256 }),
             }
-        }
-        if !moved.is_empty() {
-            adjust_snapshot(&snapshot, &moved)?;
-            adjusted = moved.into_iter().map(|(p, _)| p).collect();
         }
         found = Some(wanted);
         Ok(Attempt::Done(Manifest {
@@ -387,11 +405,10 @@ fn attempt(data: &Path, scripts: &Path, stage: &Path, hold: Hold<'_>, adjust: bo
         }))
     })?;
     if let Attempt::Retry(why) = first {
+        let _ = conn.execute_batch("ROLLBACK");
         return Ok(Attempt::Retry(why));
     }
-    let wanted = found.expect("the first step read the snapshot");
-    let (size, sha256) = hash_file(&snapshot)?;
-    files.insert(0, FileEntry { path: crate::db::SQLITE_FILE.to_string(), size, sha256 });
+    let wanted = found.expect("the held step read the snapshot");
 
     // Frozen documents and blobs never change once written, so they can be
     // copied with writes going on. A blob can only DISAPPEAR (its last
@@ -416,6 +433,24 @@ fn attempt(data: &Path, scripts: &Path, stage: &Path, hold: Hold<'_>, adjust: bo
             Some((size, sha256)) => files.push(FileEntry { path, size, sha256 }),
         }
     }
+    {
+        // One step: a stepped backup restarts whenever another connection
+        // writes, which on a busy store need never end.
+        let mut copy = Connection::open(&snapshot).map_err(other_sql)?;
+        let backup = rusqlite::backup::Backup::new(&conn, &mut copy).map_err(other_sql)?;
+        backup.step(-1).map_err(other_sql)?;
+        drop(backup);
+        // The copy carries the store's WAL mode: make it one whole file.
+        copy.pragma_update(None, "journal_mode", "DELETE").map_err(other_sql)?;
+    }
+    conn.execute_batch("COMMIT").map_err(other_sql)?;
+    drop(conn);
+    if !moved.is_empty() {
+        adjust_snapshot(&snapshot, &moved)?;
+        adjusted = moved.into_iter().map(|(p, _)| p).collect();
+    }
+    let (size, sha256) = hash_file(&snapshot)?;
+    files.insert(0, FileEntry { path: crate::db::SQLITE_FILE.to_string(), size, sha256 });
     for relative in walk(scripts)? {
         let path = format!("scripts/{relative}");
         if let Some((size, sha256)) = copy_hashed(&scripts.join(&relative), &stage.join(&path))? {
@@ -973,7 +1008,12 @@ impl crate::db::Db {
     /// few milliseconds, and the backup never has to be retaken for them.
     pub fn backup_into(&self, out: &Path) -> io::Result<Manifest> {
         let hold = |f: &mut dyn FnMut() -> io::Result<Attempt>| self.read(|_| f());
-        backup_held(self.root(), Some(self.scripts().dir()), out, &hold)
+        // A blob whose last reference goes while this runs keeps its file
+        // until the copy is done: the snapshot may reference it.
+        let blobs = crate::attach::BlobsHeld::new(self.root());
+        let manifest = backup_held(self.root(), Some(self.scripts().dir()), out, &hold);
+        blobs.release(self).map_err(other)?;
+        manifest
     }
 
     /// Take a backup into a temporary file for a download. The caller streams

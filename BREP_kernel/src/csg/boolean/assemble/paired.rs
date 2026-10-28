@@ -1404,7 +1404,7 @@ pub(super) fn reconstruct(solid: &mut BrepSolid, bar: f64, scope: Option<&HashSe
     let skip_empty = !matches!(std::env::var("BREP_PAIRED_EMPTY").as_deref(), Ok("0") | Ok("off"));
     let mut scans = 0;
     let result = reconstruct_impl(solid, bar, scope, skip_empty, &mut scans);
-    if std::env::var_os("BREP_PROFILE").is_some() {
+    if crate::imprint::profile_enabled() {
         eprintln!("assemble.paired.profile containment_scans={scans} skip_empty={skip_empty}");
     }
     if tracing {

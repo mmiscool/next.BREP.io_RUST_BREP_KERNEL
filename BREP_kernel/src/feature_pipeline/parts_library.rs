@@ -60,6 +60,7 @@ use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 
+use crate::feature_pipeline::component::NestedConstraint;
 use crate::feature_pipeline::{
     execute_feature, scene_metadata, sheet_metal, Env, FeatureDescriptor, HistoryRequest,
     PortRecord, SceneMap,
@@ -110,13 +111,101 @@ pub struct PartsLibraryEntry {
     pub ports: BTreeMap<String, PortRecord>,
     #[serde(skip)]
     pub dirty: bool,
+    /// The statuses of the part's own assembly constraints and of every
+    /// sub-assembly below it, from the run that made `snapshot` (see
+    /// `NestedConstraint`). `None` means no run has happened in this session:
+    /// the rows are not saved, so an entry whose document carries constraints
+    /// is rebuilt once after a load (`needs_constraint_rows`) — the parent
+    /// must report how its sub-assembly's mates ended, not assume they solved.
+    #[serde(skip)]
+    pub nested_constraints: Option<Vec<NestedConstraint>>,
+    /// The solved occurrence poses of the same run, part-local frame (see
+    /// [`crate::feature_pipeline::ComponentRecord::nested_poses`]); kept and
+    /// cleared with `nested_constraints`.
+    #[serde(skip)]
+    pub nested_poses: BTreeMap<String, crate::AffineTransform>,
+    /// `nested_constraints` and `nested_poses` as SAVED beside the snapshot
+    /// (`SavedRows`): a loaded entry adopts them only under the snapshot's
+    /// own rule, so reopening a saved assembly takes the snapshot lane instead
+    /// of rebuilding every sub-assembly with mates to learn its rows again.
+    #[serde(rename = "nestedRows", default, skip_serializing_if = "Option::is_none")]
+    pub nested_rows: Option<SavedRows>,
     /// Stable content hash of `document`, precomputed at insert/refresh/ingest
     /// so the per-feature cache hook never re-hashes a large document.
     #[serde(skip)]
     pub doc_hash: u64,
 }
 
+/// The constraint rows and solved poses of the run that made an entry's
+/// snapshot, saved with it. Valid exactly when the snapshot is: the same
+/// `producer` (the kernel build that ran it, as `snapshot_producer`) and the
+/// same `document` (the stable hash, hex, of the entry's document then). An
+/// entry whose document was edited since, or that a different build snapshot,
+/// rebuilds as before. Additive and defaulted: an older file has none and
+/// rebuilds once, as before; an older build ignores the field.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct SavedRows {
+    pub producer: String,
+    pub document: String,
+    #[serde(default)]
+    pub constraints: Vec<NestedConstraint>,
+    /// Occurrence path -> part-local pose, row-major 4x4, each element as
+    /// its IEEE bits in hex: the parse here is not round-trip exact
+    /// (`serde_json` without `float_roundtrip` can land a 17-digit value one
+    /// ulp off), and a pose must come back bit for bit.
+    #[serde(default)]
+    pub poses: BTreeMap<String, Vec<String>>,
+}
+
+fn document_stamp(document: &serde_json::Value) -> String {
+    format!("{:016x}", stable_json_hash(document))
+}
+
 impl PartsLibraryEntry {
+    /// The rows of the run that just made this entry's snapshot, to save.
+    fn save_rows(&mut self) {
+        self.nested_rows = self.nested_constraints.as_ref().map(|constraints| SavedRows {
+            producer: self.snapshot_producer.clone(),
+            document: document_stamp(&self.document),
+            constraints: constraints.clone(),
+            poses: self
+                .nested_poses
+                .iter()
+                .map(|(path, pose)| (path.clone(), pose.elements.iter().map(|e| format!("{:016x}", e.to_bits())).collect()))
+                .collect(),
+        });
+    }
+
+    /// Take the saved rows of a loaded entry when they are still its
+    /// snapshot's: same producer as the snapshot and as this build, and the
+    /// document they were taken from.
+    fn adopt_saved_rows(&mut self) {
+        if self.nested_constraints.is_some() || self.snapshot.is_empty() {
+            return;
+        }
+        let Some(rows) = &self.nested_rows else { return };
+        // An unstamped build cannot tell one solver from another: rows it
+        // saved are rebuilt rather than trusted.
+        let same_build = !rows.producer.is_empty()
+            && rows.producer == self.snapshot_producer
+            && kernel_source_stamp().is_none_or(|stamp| stamp == rows.producer);
+        // `doc_hash` is the stable hash of `document`: every load door sets
+        // it just before adopting.
+        if !same_build || rows.document != format!("{:016x}", self.doc_hash) {
+            return;
+        }
+        let mut poses = BTreeMap::new();
+        for (path, hex) in &rows.poses {
+            let bits: Option<Vec<f64>> =
+                hex.iter().map(|h| u64::from_str_radix(h, 16).ok().map(f64::from_bits)).collect();
+            let Some(Ok(elements)) = bits.map(|b| <[f64; 16]>::try_from(b)) else { return };
+            let Ok(pose) = crate::AffineTransform::new(elements) else { return };
+            poses.insert(path.clone(), pose);
+        }
+        self.nested_constraints = Some(rows.constraints.clone());
+        self.nested_poses = poses;
+    }
+
     /// Invalidate derived data when the document builds a different part.
     /// `dirty` alone cannot carry this across a save or runner transfer: it is
     /// serde-skipped, and a fresh receiver has no previous document to compare.
@@ -126,6 +215,9 @@ impl PartsLibraryEntry {
         self.snapshot_producer.clear();
         self.ports.clear();
         self.dirty = true;
+        self.nested_constraints = None;
+        self.nested_poses.clear();
+        self.nested_rows = None;
     }
 }
 
@@ -136,7 +228,7 @@ pub type PartsLibraryMap = BTreeMap<String, PartsLibraryEntry>;
 /// of the kernel source that `build.rs` computes. `None` when the build could
 /// not compute it, which disables stale-snapshot invalidation rather than
 /// making every snapshot look stale on every run.
-pub(crate) fn kernel_source_stamp() -> Option<&'static str> {
+pub fn kernel_source_stamp() -> Option<&'static str> {
     option_env!("BREP_KERNEL_SOURCE_HASH")
 }
 
@@ -164,7 +256,7 @@ fn bump_revision() {
     REVISION.with(|revision| revision.set(revision.get().wrapping_add(1)));
 }
 
-/// The ROOT store's current revision (see [`REVISION`]). Two reads that differ
+/// The ROOT store's current revision (see `REVISION`). Two reads that differ
 /// mean the library changed in between; two that agree mean it did not.
 pub fn parts_library_revision() -> u64 {
     REVISION.with(std::cell::Cell::get)
@@ -228,12 +320,15 @@ pub(crate) fn active_entry(part_name: &str) -> Option<PartsLibraryEntry> {
 /// library only — the parent entry's embedded document is NOT rewritten (its
 /// re-snapshot bakes the healed geometry anyway; the stale inner snapshot heals
 /// again on the next full sub-document run).
-pub(crate) fn heal_entry(part_name: &str, snapshot: String, ports: BTreeMap<String, PortRecord>) {
+pub(crate) fn heal_entry(part_name: &str, rebuilt: &RebuiltPart) {
     let heal = |map: &mut PartsLibraryMap| {
         if let Some(entry) = map.get_mut(part_name) {
-            entry.snapshot = snapshot.clone();
+            entry.snapshot = rebuilt.snapshot.clone();
             entry.snapshot_producer = kernel_source_stamp().unwrap_or_default().to_string();
-            entry.ports = ports.clone();
+            entry.ports = rebuilt.ports.clone();
+            entry.nested_constraints = Some(rebuilt.nested_constraints.clone());
+            entry.nested_poses = rebuilt.nested_poses.clone();
+            entry.save_rows();
             entry.dirty = false;
         }
     };
@@ -301,6 +396,7 @@ pub(crate) fn ingest(request_map: &PartsLibraryMap) {
             entry.doc_hash = stable_json_hash(&entry.document);
             // A document saved before parts carried their ports heals once.
             entry.dirty = needs_port_heal(&entry);
+            entry.adopt_saved_rows();
             root.insert(name.clone(), entry);
             seeded = true;
         }
@@ -316,6 +412,32 @@ pub(crate) fn ingest(request_map: &PartsLibraryMap) {
 /// carries no records, i.e. it was captured before they existed.
 fn needs_port_heal(entry: &PartsLibraryEntry) -> bool {
     entry.ports.is_empty() && document_declares_ports(&entry.document)
+}
+
+/// Whether an entry must be rebuilt for its constraint rows: its document — or
+/// a sub-assembly it embeds — carries assembly constraints, and no run in this
+/// session has reported them ([`PartsLibraryEntry::nested_constraints`]).
+pub(crate) fn needs_constraint_rows(entry: &PartsLibraryEntry) -> bool {
+    entry.nested_constraints.is_none() && document_has_constraints(&entry.document)
+}
+
+/// Whether `document`, or a library entry it embeds at any depth, has a
+/// non-empty `assembly.constraints` list.
+fn document_has_constraints(document: &serde_json::Value) -> bool {
+    let own = document
+        .get("assembly")
+        .and_then(|block| block.get("constraints"))
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|constraints| !constraints.is_empty());
+    own || document
+        .get("partsLibrary")
+        .and_then(serde_json::Value::as_object)
+        .is_some_and(|library| {
+            library
+                .values()
+                .filter_map(|entry| entry.get("document"))
+                .any(document_has_constraints)
+        })
 }
 
 /// Whether `document` — or a library entry it embeds — declares a connection
@@ -351,7 +473,7 @@ fn identity(entry: &PartsLibraryEntry) -> (&str, &str, u64) {
 /// owns its own thread-local store, and the per-run request no longer carries
 /// the block, so this is how a background thread/worker learns the library).
 ///
-/// Unlike [`ingest`] (fill-only, resident-wins) this makes the store MATCH
+/// Unlike `ingest` (fill-only, resident-wins) this makes the store MATCH
 /// `incoming` BY CONTENT IDENTITY, which is what a cache channel needs:
 ///
 /// * a name missing from the store is inserted (stamped + hashed like ingest);
@@ -379,14 +501,21 @@ pub fn install_parts_library(incoming: &PartsLibraryMap) -> bool {
             keep
         });
         for (name, entry) in incoming {
-            let mut entry = entry.clone();
-            stamp_document_loop_ids(&mut entry.document);
-            entry.doc_hash = stable_json_hash(&entry.document);
+            let mut document = entry.document.clone();
+            stamp_document_loop_ids(&mut document);
+            let doc_hash = stable_json_hash(&document);
+            // Same part: keep the RESIDENT copy — it may carry a heal this
+            // side derived and the sender never saw. Decided on the document
+            // alone, so a kept entry is neither cloned nor derived.
+            if root.get(name).is_some_and(|resident| {
+                identity(resident) == (entry.source_key.as_str(), entry.source_signature.as_str(), doc_hash)
+            }) {
+                continue;
+            }
+            let mut entry = PartsLibraryEntry { document, doc_hash, ..entry.clone() };
             entry.dirty = needs_port_heal(&entry);
+            entry.adopt_saved_rows();
             match root.get(name) {
-                // Same part: keep the RESIDENT copy — it may carry a heal this
-                // side derived and the sender never saw.
-                Some(resident) if identity(resident) == identity(&entry) => continue,
                 // A new version that builds the same (a symbol, pads or BOM
                 // attribute edit): take its document and signature, but the
                 // resident snapshot and ports still describe it — keep them, and
@@ -395,6 +524,13 @@ pub fn install_parts_library(incoming: &PartsLibraryMap) -> bool {
                     entry.snapshot = resident.snapshot.clone();
                     entry.snapshot_producer = resident.snapshot_producer.clone();
                     entry.ports = resident.ports.clone();
+                    // The resident's rows, else the ones this entry just adopted.
+                    if resident.nested_constraints.is_some() {
+                        entry.nested_constraints = resident.nested_constraints.clone();
+                        entry.nested_poses = resident.nested_poses.clone();
+                    }
+                    // The same build of a new document: the rows still describe it.
+                    entry.save_rows();
                     entry.dirty = resident.dirty || needs_port_heal(&entry);
                 }
                 // Genuinely different content: replace, and force the self-heal
@@ -568,8 +704,16 @@ fn run_isolated_document(
 /// The feature walk of [`run_isolated_document`], separated so the library
 /// stack push/pop brackets every exit path.
 /// What an isolated part run yields: the surviving solids (part-local names,
-/// history order) and the part's ports (part-local ids, part-local pose).
-type IsolatedRun = (Vec<(String, BrepSolid)>, BTreeMap<String, PortRecord>);
+/// history order), the part's ports (part-local ids, part-local pose) and the
+/// statuses of its assembly constraints (part-local ids, every level below
+/// included) and the solved pose of every occurrence it places, at any depth
+/// (part-local frame).
+type IsolatedRun = (
+    Vec<(String, BrepSolid)>,
+    BTreeMap<String, PortRecord>,
+    Vec<NestedConstraint>,
+    BTreeMap<String, crate::AffineTransform>,
+);
 
 fn run_isolated_features(
     request: &HistoryRequest,
@@ -613,6 +757,39 @@ fn run_isolated_features(
             break;
         }
         results.push(result);
+    }
+
+    // A sub-assembly is RIGID to its parent: its own constraints solve here,
+    // inside its own run, so the snapshot bakes the solved poses and the
+    // parent's mates then place it as one body (the NX / SolidWorks default).
+    // Same lifecycle `execute_history` runs, NOT its `finish_history_run`,
+    // which would replace the live assembly session in the middle of the
+    // parent's run. It re-poses members under their existing handles, so it
+    // has to run before the survivors are cloned out of the registry, and
+    // before the ports tail so the declared points follow the solved poses.
+    let mut nested_constraints = Vec::new();
+    let mut nested_poses = BTreeMap::new();
+    if error.is_none() {
+        if let Some(state) = request.assembly.as_ref().filter(|state| !state.constraints.is_empty()) {
+            let mut state = state.clone();
+            crate::feature_pipeline::assembly::lifecycle::run_constraints(&mut state, &mut scene, &env);
+            nested_constraints.extend(state.constraints.iter().map(NestedConstraint::from_entry));
+        }
+        // Every level below arrives on the component records, namespaced by
+        // the ACOMP that placed it.
+        for record in scene.components.values() {
+            nested_constraints.extend(record.nested_constraints.iter().cloned());
+            // Where every occurrence ended up, in THIS document's frame: the
+            // solved record pose, and each deeper occurrence composed onto it.
+            nested_poses.insert(record.id.clone(), record.transform);
+            // (No `?`: the registered handles are freed below on every path;
+            // both poses are rigid, so the compose cannot fail.)
+            for (path, pose) in &record.nested_poses {
+                if let Ok(posed) = crate::feature_pipeline::component::compose(&record.transform, pose) {
+                    nested_poses.insert(crate::feature_pipeline::component::namespaced(&record.id, path), posed);
+                }
+            }
+        }
     }
 
     // Survivors: added solids still scene-resident under their own name, in
@@ -680,7 +857,7 @@ fn run_isolated_features(
         // solid. A generic empty modeling document remains an error.
         None if members.is_empty() && !electronics_part =>
             Err("embedded part document produced no solids".into()),
-        None => Ok((members, ports)),
+        None => Ok((members, ports, nested_constraints, nested_poses)),
     }
 }
 
@@ -692,16 +869,91 @@ fn run_isolated_features(
 pub(crate) fn rebuild_snapshot(
     document: &serde_json::Value,
 ) -> Result<(String, BTreeMap<String, PortRecord>), String> {
+    rebuild_part(document).map(|rebuilt| (rebuilt.snapshot, rebuilt.ports))
+}
+
+/// What [`rebuild_part`] makes of a part document: the snapshot, the ports and
+/// the constraint rows of the one run, which the library entry keeps together.
+#[derive(Debug, Clone)]
+pub(crate) struct RebuiltPart {
+    pub snapshot: String,
+    pub ports: BTreeMap<String, PortRecord>,
+    pub nested_constraints: Vec<NestedConstraint>,
+    pub nested_poses: BTreeMap<String, crate::AffineTransform>,
+}
+
+/// How many rebuilt documents [`rebuild_part`] keeps.
+const REBUILT_MEMO_LEN: usize = 32;
+
+thread_local! {
+    /// Documents [`rebuild_part`] executed on this thread, most recent first,
+    /// with what they built: `(content hash, the document, the result)`. One
+    /// definition placed by several sub-assemblies (on l500 every module
+    /// places the same cells) is a copy per placing library, identical in
+    /// content: an edit used to rebuild it once per copy. A hit needs the
+    /// SAME document, compared in full, so a stale hit is impossible; the
+    /// isolated run reads nothing else (its own library rides inside the
+    /// document, and the scene-metadata store is bracketed around it). The
+    /// one outside input is the plugin provider, so a document that uses
+    /// extensions is never kept: it replays against the active provider.
+    static REBUILT: RefCell<Vec<(u64, serde_json::Value, RebuiltPart)>> = const { RefCell::new(Vec::new()) };
+}
+
+
+/// Forget every memoized rebuild (with the history cache).
+pub(crate) fn clear_rebuilt_memo() {
+    REBUILT.with(|memo| memo.borrow_mut().clear());
+}
+
+/// [`rebuild_snapshot`] with the run's constraint rows and solved poses.
+pub(crate) fn rebuild_part(document: &serde_json::Value) -> Result<RebuiltPart, String> {
+    let hash = stable_json_hash(document);
+    let memoized = !super::extension::document_uses_extensions(document);
+    let hit = REBUILT.with(|memo| {
+        let mut memo = memo.borrow_mut();
+        let index = memo.iter().position(|(h, d, _)| memoized && *h == hash && d == document)?;
+        let entry = memo.remove(index);
+        let rebuilt = entry.2.clone();
+        memo.insert(0, entry);
+        Some(rebuilt)
+    });
+    if let Some(rebuilt) = hit {
+        return Ok(rebuilt);
+    }
+    let outcome = rebuild_part_uncached(document);
+    match &outcome {
+        Ok(rebuilt) if memoized => REBUILT.with(|memo| {
+            let mut memo = memo.borrow_mut();
+            memo.insert(0, (hash, document.clone(), rebuilt.clone()));
+            memo.truncate(REBUILT_MEMO_LEN);
+        }),
+        _ => {}
+    }
+    outcome
+}
+
+fn rebuild_part_uncached(document: &serde_json::Value) -> Result<RebuiltPart, String> {
     let saved = scene_metadata::take_store();
-    let outcome = run_isolated_document(document, None).and_then(|(members, ports)| {
+    let outcome = run_isolated_document(document, None).and_then(|(members, ports, nested_constraints, nested_poses)| {
         let refs: Vec<(&str, &BrepSolid)> = members
             .iter()
             .map(|(name, solid)| (name.as_str(), solid))
             .collect();
-        crate::snapshot_solids(&refs).map(|snapshot| (snapshot, ports))
+        crate::snapshot_solids(&refs).map(|snapshot| RebuiltPart {
+            snapshot,
+            ports,
+            nested_constraints,
+            nested_poses,
+        })
     });
     scene_metadata::restore_store(saved);
     outcome
+}
+
+/// Whether an isolated part run is in progress (a library is pushed). Its
+/// component ids are the SUB-document's, and collide with the parent's.
+pub(crate) fn in_isolated_run() -> bool {
+    STACK.with(|stack| !stack.borrow().is_empty())
 }
 
 /// An embedded part document's OWN PMI, resolved against the geometry the
@@ -835,9 +1087,9 @@ pub fn add_part_to_library_impl(
     // Stamp BEFORE the hash and the snapshot so both describe the stored form —
     // a later re-stamp then finds nothing to change and cannot dirty the entry.
     stamp_document_loop_ids(&mut document);
-    let (snapshot, ports) = rebuild_snapshot(&document)
+    let RebuiltPart { snapshot, ports, nested_constraints, nested_poses } = rebuild_part(&document)
         .map_err(|error| format!("add_part_to_library: {error}"))?;
-    let entry = PartsLibraryEntry {
+    let mut entry = PartsLibraryEntry {
         source_key: source_key.to_string(),
         source_signature: source_signature.to_string(),
         doc_hash: stable_json_hash(&document),
@@ -846,7 +1098,11 @@ pub fn add_part_to_library_impl(
         snapshot_producer: kernel_source_stamp().unwrap_or_default().to_string(),
         ports,
         dirty: false,
+        nested_constraints: Some(nested_constraints),
+        nested_poses,
+        nested_rows: None,
     };
+    entry.save_rows();
     let final_name = ROOT.with(|root| {
         let mut root = root.borrow_mut();
         let final_name = unique_name(&root, requested);
@@ -900,6 +1156,10 @@ pub fn refresh_library_entry_impl(
         entry.document = document;
         if rebuild {
             entry.invalidate_snapshot();
+        } else {
+            // The same build: the snapshot and its rows still describe the new
+            // document, so the saved rows follow it (else a reopen refuses them).
+            entry.save_rows();
         }
         Ok(())
     })?;
@@ -910,7 +1170,7 @@ pub fn refresh_library_entry_impl(
 /// Whether two part documents build the same solids and ports, so that one's
 /// snapshot serves the other.
 ///
-/// A snapshot is what [`run_isolated_document`] makes of a document: the
+/// A snapshot is what `run_isolated_document` makes of a document: the
 /// document read as a [`HistoryRequest`] with its editor stop points cleared.
 /// Everything that request does not read — the eCAD `symbol` and `pads`
 /// blocks, the BOM `partAttributes`, drawing `sheets` — cannot change what the
@@ -930,6 +1190,51 @@ pub fn same_build(a: &serde_json::Value, b: &serde_json::Value) -> bool {
     same_stamped_build(&stamped(a), &stamped(b))
 }
 
+/// The rows rule of [`refresh_library_entry_impl`] for a door that rewrites an
+/// entry's `document` in the `partsLibrary` block itself (the app's Update
+/// components): that block is what Save writes. Rows taken from `old` follow
+/// the same build of `new`; any other rows are dropped, as no reopen could
+/// take them.
+pub fn follow_saved_rows(entry: &mut serde_json::Value, old: &serde_json::Value, new: &serde_json::Value) {
+    follow_rows(entry, old, new, || same_build(old, new));
+}
+
+/// [`follow_saved_rows`] for a caller that has already asked
+/// [`same_build`]`(old, new)`: it is not asked again (each asks parses both
+/// whole documents as requests, ~5 ms for an l500 module).
+pub fn follow_saved_rows_known(
+    entry: &mut serde_json::Value,
+    old: &serde_json::Value,
+    new: &serde_json::Value,
+    same_build: bool,
+) {
+    follow_rows(entry, old, new, || same_build);
+}
+
+fn follow_rows(
+    entry: &mut serde_json::Value,
+    old: &serde_json::Value,
+    new: &serde_json::Value,
+    same_build: impl FnOnce() -> bool,
+) {
+    let stamp = |document: &serde_json::Value| {
+        let mut document = document.clone();
+        stamp_document_loop_ids(&mut document);
+        document_stamp(&document)
+    };
+    let Some(object) = entry.as_object_mut() else { return };
+    let taken_from_old = object
+        .get("nestedRows")
+        .and_then(|rows| rows.get("document"))
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|document| document == stamp(old));
+    if taken_from_old && same_build() {
+        object["nestedRows"]["document"] = serde_json::Value::String(stamp(new));
+    } else {
+        object.remove("nestedRows");
+    }
+}
+
 /// [`same_build`] for two documents a library door has already stamped.
 fn same_stamped_build(a: &serde_json::Value, b: &serde_json::Value) -> bool {
     matches!((build_identity(a), build_identity(b)), (Some(a), Some(b)) if a == b)
@@ -938,7 +1243,7 @@ fn same_stamped_build(a: &serde_json::Value, b: &serde_json::Value) -> bool {
 /// The hash of `document` as [`run_isolated_document`] reads it; `None` when it
 /// does not read as a request.
 fn build_identity(document: &serde_json::Value) -> Option<u64> {
-    let mut request: HistoryRequest = serde_json::from_value(document.clone()).ok()?;
+    let mut request = <HistoryRequest as serde::Deserialize>::deserialize(document).ok()?;
     request.stop_at_id = None;
     request.stop_before_id = None;
     Some(stable_json_hash(&serde_json::to_value(&request).ok()?))
@@ -953,4 +1258,5 @@ pub fn parts_library_json() -> String {
         serde_json::to_string(&*root.borrow()).unwrap_or_else(|_| "{}".to_string())
     })
 }
+
 

@@ -1,0 +1,424 @@
+{
+  "format": "brep-techdb",
+  "version": 1,
+  "name": "Default 2.5D milling technology",
+  "units": "millimeters",
+  "faceAllowance": 2.0,
+  "openPocketOverhang": 1.0,
+  "materialFactors": {
+    "alloySteel": {
+      "stepover": 0.7,
+      "stepDown": 0.5
+    },
+    "aluminium": {
+      "stepover": 1.0,
+      "stepDown": 1.0
+    },
+    "brass": {
+      "stepover": 1.0,
+      "stepDown": 0.9
+    },
+    "castIron": {
+      "stepover": 0.8,
+      "stepDown": 0.6
+    },
+    "mdf": {
+      "stepover": 1.0,
+      "stepDown": 1.2
+    },
+    "mildSteel": {
+      "stepover": 0.8,
+      "stepDown": 0.6
+    },
+    "plastics": {
+      "stepover": 1.0,
+      "stepDown": 1.0
+    },
+    "stainlessSteel": {
+      "stepover": 0.6,
+      "stepDown": 0.4
+    },
+    "titanium": {
+      "stepover": 0.5,
+      "stepDown": 0.3
+    },
+    "wood": {
+      "stepover": 1.0,
+      "stepDown": 1.2
+    }
+  },
+  "rules": [
+    {
+      "feature": "face",
+      "operations": [
+        {
+          "name": "face",
+          "strategy": "face",
+          "role": "face",
+          "tool": {
+            "kinds": [
+              "face-mill",
+              "flat"
+            ],
+            "fit": "largest"
+          },
+          "stepover": 0.6,
+          "stepDown": 0.1,
+          "stockToLeave": {
+            "radial": 0.0,
+            "axial": 0.0
+          },
+          "finishingPasses": 0,
+          "roughingPasses": 0,
+          "lead": 0.0,
+          "ramp": "plunge",
+          "extension": 1.0,
+          "zigZag": true,
+          "tipOffset": 0.0,
+          "tolerance": 0.01
+        }
+      ]
+    },
+    {
+      "feature": "pocket",
+      "operations": [
+        {
+          "name": "rough",
+          "strategy": "pocket2D",
+          "role": "rough",
+          "tool": {
+            "kinds": [
+              "flat"
+            ],
+            "fit": "largestFitting"
+          },
+          "stepover": 0.45,
+          "stepDown": 0.5,
+          "stockToLeave": {
+            "radial": 0.3,
+            "axial": 0.2
+          },
+          "finishingPasses": 0,
+          "roughingPasses": 0,
+          "lead": 0.0,
+          "ramp": "helix",
+          "extension": 0.0,
+          "zigZag": true,
+          "tipOffset": 0.0,
+          "tolerance": 0.01
+        },
+        {
+          "name": "finish-floor",
+          "strategy": "pocket2D",
+          "role": "finish",
+          "tool": {
+            "kinds": [
+              "flat"
+            ],
+            "fit": "largestFitting"
+          },
+          "stepover": 0.7,
+          "stepDown": 0.0,
+          "stockToLeave": {
+            "radial": 0.3,
+            "axial": 0.0
+          },
+          "finishingPasses": 0,
+          "roughingPasses": 0,
+          "lead": 0.0,
+          "ramp": "helix",
+          "extension": 0.0,
+          "zigZag": true,
+          "tipOffset": 0.0,
+          "tolerance": 0.01
+        },
+        {
+          "name": "finish-walls",
+          "strategy": "contour2D",
+          "role": "finish",
+          "tool": {
+            "kinds": [
+              "flat"
+            ],
+            "fit": "largestFitting"
+          },
+          "stepover": 0.5,
+          "stepDown": 1.0,
+          "stockToLeave": {
+            "radial": 0.0,
+            "axial": 0.0
+          },
+          "finishingPasses": 1,
+          "roughingPasses": 0,
+          "lead": 0.5,
+          "ramp": "plunge",
+          "extension": 0.0,
+          "zigZag": true,
+          "tipOffset": 0.0,
+          "tolerance": 0.01
+        }
+      ]
+    },
+    {
+      "feature": "open-pocket",
+      "operations": [
+        {
+          "name": "rough",
+          "strategy": "pocket2D",
+          "role": "rough",
+          "tool": {
+            "kinds": [
+              "flat"
+            ],
+            "fit": "largestFitting"
+          },
+          "stepover": 0.45,
+          "stepDown": 0.5,
+          "stockToLeave": {
+            "radial": 0.3,
+            "axial": 0.2
+          },
+          "finishingPasses": 0,
+          "roughingPasses": 0,
+          "lead": 0.0,
+          "ramp": "helix",
+          "extension": 0.0,
+          "zigZag": true,
+          "tipOffset": 0.0,
+          "tolerance": 0.01
+        },
+        {
+          "name": "finish-floor",
+          "strategy": "pocket2D",
+          "role": "finish",
+          "tool": {
+            "kinds": [
+              "flat"
+            ],
+            "fit": "largestFitting"
+          },
+          "stepover": 0.7,
+          "stepDown": 0.0,
+          "stockToLeave": {
+            "radial": 0.0,
+            "axial": 0.0
+          },
+          "finishingPasses": 0,
+          "roughingPasses": 0,
+          "lead": 0.0,
+          "ramp": "helix",
+          "extension": 0.0,
+          "zigZag": true,
+          "tipOffset": 0.0,
+          "tolerance": 0.01
+        }
+      ]
+    },
+    {
+      "feature": "step",
+      "operations": [
+        {
+          "name": "rough",
+          "strategy": "pocket2D",
+          "role": "rough",
+          "tool": {
+            "kinds": [
+              "flat"
+            ],
+            "fit": "largestFitting"
+          },
+          "stepover": 0.45,
+          "stepDown": 0.5,
+          "stockToLeave": {
+            "radial": 0.3,
+            "axial": 0.2
+          },
+          "finishingPasses": 0,
+          "roughingPasses": 0,
+          "lead": 0.0,
+          "ramp": "helix",
+          "extension": 0.0,
+          "zigZag": true,
+          "tipOffset": 0.0,
+          "tolerance": 0.01
+        },
+        {
+          "name": "finish-floor",
+          "strategy": "pocket2D",
+          "role": "finish",
+          "tool": {
+            "kinds": [
+              "flat"
+            ],
+            "fit": "largestFitting"
+          },
+          "stepover": 0.7,
+          "stepDown": 0.0,
+          "stockToLeave": {
+            "radial": 0.0,
+            "axial": 0.0
+          },
+          "finishingPasses": 0,
+          "roughingPasses": 0,
+          "lead": 0.0,
+          "ramp": "helix",
+          "extension": 0.0,
+          "zigZag": true,
+          "tipOffset": 0.0,
+          "tolerance": 0.01
+        }
+      ]
+    },
+    {
+      "feature": "slot",
+      "operations": [
+        {
+          "name": "slot",
+          "strategy": "slot",
+          "role": "rough",
+          "tool": {
+            "kinds": [
+              "flat"
+            ],
+            "fit": "largestFitting"
+          },
+          "stepover": 0.45,
+          "stepDown": 0.4,
+          "stockToLeave": {
+            "radial": 0.0,
+            "axial": 0.0
+          },
+          "finishingPasses": 0,
+          "roughingPasses": 0,
+          "lead": 0.0,
+          "ramp": "plunge",
+          "extension": 0.0,
+          "zigZag": true,
+          "tipOffset": 0.0,
+          "tolerance": 0.01
+        }
+      ]
+    },
+    {
+      "feature": "boss",
+      "operations": [
+        {
+          "name": "finish-walls",
+          "strategy": "contour2D",
+          "role": "finish",
+          "tool": {
+            "kinds": [
+              "flat"
+            ],
+            "fit": "largest"
+          },
+          "stepover": 0.5,
+          "stepDown": 1.0,
+          "stockToLeave": {
+            "radial": 0.0,
+            "axial": 0.0
+          },
+          "finishingPasses": 1,
+          "roughingPasses": 0,
+          "lead": 0.5,
+          "ramp": "plunge",
+          "extension": 0.0,
+          "zigZag": true,
+          "tipOffset": 0.0,
+          "tolerance": 0.01
+        }
+      ]
+    },
+    {
+      "feature": "hole",
+      "operations": [
+        {
+          "name": "drill",
+          "strategy": "drill",
+          "role": "drill",
+          "tool": {
+            "kinds": [
+              "drill"
+            ],
+            "fit": "exactDiameter"
+          },
+          "stepover": 0.0,
+          "stepDown": 0.0,
+          "stockToLeave": {
+            "radial": 0.0,
+            "axial": 0.0
+          },
+          "finishingPasses": 0,
+          "roughingPasses": 0,
+          "lead": 0.0,
+          "ramp": "plunge",
+          "extension": 0.0,
+          "zigZag": true,
+          "tipOffset": 0.0,
+          "tolerance": 0.05
+        }
+      ]
+    },
+    {
+      "feature": "chamfer",
+      "operations": [
+        {
+          "name": "chamfer",
+          "strategy": "chamfer2D",
+          "role": "chamfer",
+          "tool": {
+            "kinds": [
+              "chamfer"
+            ],
+            "fit": "largestFitting"
+          },
+          "stepover": 0.0,
+          "stepDown": 0.0,
+          "stockToLeave": {
+            "radial": 0.0,
+            "axial": 0.0
+          },
+          "finishingPasses": 0,
+          "roughingPasses": 0,
+          "lead": 0.3,
+          "ramp": "plunge",
+          "extension": 0.0,
+          "zigZag": true,
+          "tipOffset": 0.5,
+          "tolerance": 0.01
+        }
+      ]
+    },
+    {
+      "feature": "outer-profile",
+      "operations": [
+        {
+          "name": "profile",
+          "strategy": "contour2D",
+          "role": "rough",
+          "tool": {
+            "kinds": [
+              "flat"
+            ],
+            "fit": "largest"
+          },
+          "stepover": 0.5,
+          "stepDown": 0.5,
+          "stockToLeave": {
+            "radial": 0.0,
+            "axial": 0.0
+          },
+          "finishingPasses": 1,
+          "roughingPasses": 0,
+          "lead": 0.0,
+          "ramp": "plunge",
+          "extension": 0.0,
+          "zigZag": true,
+          "tipOffset": 0.0,
+          "tolerance": 0.01,
+          "breakThrough": 0.1
+        }
+      ]
+    }
+  ]
+}

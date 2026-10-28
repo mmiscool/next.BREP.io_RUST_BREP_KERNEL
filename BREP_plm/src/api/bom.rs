@@ -6,7 +6,7 @@
 //! app will write the uses list through the same `PUT` the web page uses.
 
 use axum::extract::{Path, Query, State};
-use axum::http::{header, HeaderMap};
+use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::Deserialize;
@@ -118,7 +118,28 @@ pub async fn get_bom(
         )
             .into_response());
     }
-    Ok(Json(result).into_response())
+    // The ETag is the body's own hash: it moves with anything the BOM view
+    // shows (its lines, their attributes and revision states) and with
+    // nothing else. The web view's 5 s poll sends it back, and an unchanged
+    // BOM costs a 304 instead of megabytes to fetch, parse and compare.
+    let body = serde_json::to_vec(&result).map_err(Error::internal)?;
+    let etag = body_etag(&body);
+    let cache = (header::CACHE_CONTROL, "private, no-cache".to_string());
+    if headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|sent| sent.split(',').any(|tag| tag.trim() == etag || tag.trim() == "*"))
+    {
+        return Ok((StatusCode::NOT_MODIFIED, [(header::ETAG, etag), cache]).into_response());
+    }
+    Ok(([(header::CONTENT_TYPE, "application/json".to_string()), (header::ETAG, etag), cache], body).into_response())
+}
+
+/// A strong ETag naming `body`'s bytes.
+fn body_etag(body: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(body);
+    format!("\"bom-{}\"", digest[..12].iter().map(|b| format!("{b:02x}")).collect::<String>())
 }
 
 #[derive(Debug, Deserialize)]

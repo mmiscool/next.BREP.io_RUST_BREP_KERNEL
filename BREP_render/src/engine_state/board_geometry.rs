@@ -434,6 +434,14 @@ fn grown(shape: Shape, grow: i32) -> Shape {
 /// is wound the other here. `None` for an outline that is not a polygon.
 fn oriented_outline(board: &Board) -> Option<Vec<[f64; 2]>> {
     let mut outline: Vec<[f64; 2]> = board.outline.iter().copied().map(xy).collect();
+    // Board documents may explicitly close their polygon, or repeat a point
+    // between segments. Our loops close implicitly. Repeated vertices block
+    // ear clipping (the duplicate lies on an ear) and create zero-length walls.
+    // Normalize here so caps, walls, and display edges use the same boundary.
+    outline.dedup();
+    if outline.len() > 1 && outline.first() == outline.last() {
+        outline.pop();
+    }
     if outline.len() < 3 {
         return None;
     }

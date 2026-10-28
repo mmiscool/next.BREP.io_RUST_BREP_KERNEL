@@ -1401,7 +1401,7 @@ pub(crate) fn finish_step_file(
 /// The full single-product writer: each body carries its SCENE NAME
 /// (`MANIFOLD_SOLID_BREP` name — and the key the PMI references resolve
 /// through), and an optional PMI block is written as AP242 semantic
-/// representation + polyline presentation + saved views ([`pmi`]).
+/// representation + polyline presentation + saved views (`pmi`).
 ///
 /// This is the FLAT lane: one `PRODUCT`, every body in it, no assembly
 /// structure. A document with components goes through

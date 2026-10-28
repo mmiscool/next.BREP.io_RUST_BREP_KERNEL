@@ -91,7 +91,7 @@ impl Ray {
         p.sub(self.at(t)).length()
     }
 
-    /// Closest approach between this ray and a world segment [a,b]; returns the
+    /// Closest approach between this ray and a world segment `[a,b]`; returns the
     /// minimum distance (for edge/axis-handle picking).
     pub fn distance_to_segment(&self, a: Vec3, b: Vec3) -> f32 {
         // Ray r(s)=o+s*d, segment p(t)=a+t*(b-a), t in [0,1]. Minimize.

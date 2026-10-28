@@ -113,6 +113,13 @@ impl Autosave {
         None
     }
 
+    /// Write what is unsaved now, not after the debounce: the app is closing,
+    /// and the next start offers it back.
+    pub fn flush(&mut self, docs: &Documents, store: &dyn ModelStore) {
+        self.write(docs, store);
+        self.armed_at = None;
+    }
+
     /// The prompt resolved (restore or discard removed the blob): the store is
     /// known empty, so the next dirty document is a fresh write.
     pub fn note_cleared(&mut self) {

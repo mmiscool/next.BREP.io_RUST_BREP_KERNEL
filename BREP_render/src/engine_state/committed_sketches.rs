@@ -204,8 +204,8 @@ impl EngineState {
     }
 
     /// (Re)build the persistent committed-sketch SHEET SOLIDS. For every committed
-    /// sketch that should show — [`committed_sketch_ids`](Self::committed_sketch_ids)
-    /// minus [`hidden_sketches`] — synthesize its display from the run's solved
+    /// sketch that should show — `committed_sketch_ids`
+    /// minus `hidden_sketches` — synthesize its display from the run's solved
     /// profile AND its own model segments, and insert it as a scene solid (keyed by
     /// the sketch id, dim-cyan, flagged `is_sketch`); remove any sheet inserted on
     /// the PREVIOUS refresh but not this one (rolled back, deleted, hidden, or
@@ -300,13 +300,13 @@ impl EngineState {
     }
 
     /// Whether the committed sketch `id`'s persistent overlay is shown (absent from
-    /// [`hidden_sketches`] = visible).
+    /// `hidden_sketches` = visible).
     pub fn sketch_visible(&self, id: &str) -> bool {
         !self.hidden_sketches.contains(id)
     }
 
     /// Show/hide the committed sketch `id`'s persistent overlay (the Scene-tree
-    /// checkbox). Toggles [`hidden_sketches`], rebuilds the committed overlays (so the
+    /// checkbox). Toggles `hidden_sketches`, rebuilds the committed overlays (so the
     /// group is fed or cleared immediately), and marks dirty.
     pub fn set_sketch_visible(&mut self, id: &str, visible: bool) {
         if visible {

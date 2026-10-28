@@ -29,13 +29,14 @@
 //! Name fidelity (contract rule 2): the result
 //! reuses the TARGET solid's name (`result.name = targetSolid.name`) and the
 //! target goes in `removed`; the healed solid keeps every OTHER face's name (only
-//! the deleted face's name disappears). Names are collected, never
-//! re-stamped — `delete_faces_and_heal` preserves the survivors' ids and names.
+//! the deleted face's name disappears). `delete_faces_and_heal` preserves the
+//! survivors' face ids and names. Edge names are derived again from the healed
+//! adjacency, including newly created edges and edges whose neighbours changed.
 
 use std::collections::HashSet;
 
 use crate::feature_pipeline::features::common;
-use crate::feature_pipeline::{AddedSolid, FeatureContext, FeatureRefusal, FeatureResult};
+use crate::feature_pipeline::{FeatureContext, FeatureRefusal, FeatureResult};
 use crate::delete_faces_and_heal;
 
 pub fn execute(ctx: &FeatureContext) -> FeatureResult {
@@ -101,17 +102,10 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, FeatureRefusal> {
     let solid = crate::with_registered_solid_str(target_handle, |solid| Ok(solid.clone()))?;
     let solid = delete_faces_and_heal(&solid, &face_ids)?;
 
-    // Collect the healed survivors' names (the deleted face's name is gone).
-    let face_names = common::collect_face_names(&solid);
-    let edge_names = common::collect_edge_names(&solid);
-    let handle = crate::register_solid_value(solid);
-    result.added.push(AddedSolid {
-        handle,
-        name: target_name.clone(),
-        face_names,
-        edge_names,
-        ..AddedSolid::default()
-    });
+    // Healing creates unnamed edges and can change a surviving edge's face
+    // pair. Publish through the usual naming path so every topology edge gets
+    // its current derived name and the scene can resolve those names/groups.
+    result.added.push(common::register_added(solid, &target_name));
     // The target is consumed; the loop reuses its name for the result.
     result.removed.push(target_name);
     Ok(result)

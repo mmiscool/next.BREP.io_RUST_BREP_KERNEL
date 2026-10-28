@@ -8,6 +8,12 @@
 //! Copies are named `${featureID}_${i+1}` and their faces gain `::${featureID}_${i+1}`.
 //! NONE keeps separate copies and the source. UNION combines each source with
 //! its copies into `${sourceName}::UNION` and removes the source.
+//!
+//! `suppressed` lists instance numbers (2 = the first copy) that make no
+//! geometry. A number is the instance's place in the pattern, so it keeps
+//! meaning the same placement when the count changes; a number past the count
+//! is dormant and applies again when the count grows back. Instance 1 is the
+//! source itself and cannot be suppressed here (a note says so).
 
 use crate::feature_pipeline::features::common;
 use crate::feature_pipeline::{AddedSolid, FeatureContext, FeatureResult};
@@ -57,6 +63,12 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, String> {
     };
 
     let feature_id = feature_id(ctx);
+    let suppressed = suppressed_instances(ctx);
+    if suppressed.contains(&1) {
+        result.notes.push(format!(
+            "{feature_id}: instance 1 is the source and cannot be suppressed; suppress or hide the source instead"
+        ));
+    }
 
     // Build EVERYTHING as owned `BrepSolid`s first; register handles only once the
     // whole feature has succeeded, so an error mid-build leaks nothing.
@@ -67,6 +79,9 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, String> {
         for (offset, matrix) in matrices.iter().enumerate() {
             // matrices[0] is i=1 → placement index i+1 = 2, matrices[1] → 3, …
             let index = offset + 2;
+            if suppressed.contains(&(index as i64)) {
+                continue;
+            }
             let name = format!("{feature_id}_{index}");
             let transform = AffineTransform::new(*matrix)?;
             let mut solid =
@@ -123,7 +138,7 @@ fn feature_id(ctx: &FeatureContext) -> String {
 
 /// The per-instance placement matrices for `i = 1 ..= count-1`. `Ok(None)` when a
 /// named reference did not resolve (`result.unresolved` populated → the caller repairs).
-fn compute_matrices(
+pub(crate) fn compute_matrices(
     ctx: &FeatureContext,
     mode_is_linear: bool,
     count: i64,
@@ -335,7 +350,7 @@ fn union_all(base: BrepSolid, clones: Vec<BrepSolid>) -> Result<BrepSolid, Strin
 
 /// `count = Math.max(1, (inputParams.count | 0))` — truncate toward zero, clamp to
 /// ≥ 1 (a missing/non-numeric count → `0 | 0` → 1).
-fn read_count(ctx: &FeatureContext) -> i64 {
+pub(crate) fn read_count(ctx: &FeatureContext) -> i64 {
     let raw = match ctx.param("count") {
         Some(serde_json::Value::Number(number)) => number.as_f64().unwrap_or(0.0),
         Some(serde_json::Value::String(source)) => ctx.env.eval(source).unwrap_or(0.0),
@@ -343,6 +358,39 @@ fn read_count(ctx: &FeatureContext) -> i64 {
     };
     let truncated = if raw.is_finite() { raw.trunc() as i64 } else { 0 };
     truncated.max(1)
+}
+
+/// The `suppressed` instance numbers: a list of numbers, or a string of them
+/// separated by commas or spaces (`"3, 5"`). Anything else is ignored.
+pub fn suppressed_instances(ctx: &FeatureContext) -> std::collections::BTreeSet<i64> {
+    parse_suppressed(ctx.param("suppressed"))
+}
+
+pub fn parse_suppressed(value: Option<&serde_json::Value>) -> std::collections::BTreeSet<i64> {
+    let mut out = std::collections::BTreeSet::new();
+    match value {
+        Some(serde_json::Value::Array(items)) => {
+            for item in items {
+                if let Some(n) = item.as_i64().or_else(|| item.as_str().and_then(|s| s.trim().parse().ok())) {
+                    out.insert(n);
+                }
+            }
+        }
+        Some(serde_json::Value::String(text)) => {
+            for part in text.split(|c: char| c == ',' || c.is_whitespace()) {
+                if let Ok(n) = part.trim().parse::<i64>() {
+                    out.insert(n);
+                }
+            }
+        }
+        Some(serde_json::Value::Number(n)) => {
+            if let Some(n) = n.as_i64() {
+                out.insert(n);
+            }
+        }
+        _ => {}
+    }
+    out
 }
 
 /// `Number(totalAngleDeg) || 360` — 0 / non-finite → 360.
@@ -566,6 +614,12 @@ pub fn schema() -> serde_json::Value {
             ],
             "default_value": "NONE",
             "hint": "Optionally union instances together"
+        },
+        "suppressed": {
+            "type": "string",
+            "default_value": "",
+            "label": "Suppressed instances",
+            "hint": "Instance numbers that make no geometry, e.g. 3, 5 (1 is the source)"
         }
     }
 })

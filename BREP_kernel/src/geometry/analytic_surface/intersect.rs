@@ -349,7 +349,7 @@ fn degenerate_apex_frustum(rho0: f64, rho1: f64, height: f64) -> bool {
 
 /// The EXACT arc of `plane ∩ ruled revolution` spanning a given AZIMUTH range
 /// about the carrier's own frame — the arc-restricted, seam-anchorable form of
-/// the full sections [`intersect_plane_quadric`] returns.
+/// the full sections `intersect_plane_quadric` returns.
 ///
 /// ADDITION, not a change: `intersect_plane_quadric` is untouched and still
 /// answers every pair it answered before, bit for bit. This function exists

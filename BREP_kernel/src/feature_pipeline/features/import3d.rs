@@ -210,6 +210,13 @@ fn restore_native_bodies(ctx: &FeatureContext, payload: &str) -> Result<FeatureR
                 eprintln!("import3d.canonical_carriers solid={} rewritten={:?}", solid.name, report.rewritten);
             }
         }
+        // A payload encoded straight from `snapshot_solids` (not through
+        // `native_import_payload`) can carry faces the import never named;
+        // those get the import's positional convention under the stored body
+        // name, deterministically from the frozen payload, so picks and CAM
+        // targets resolve and stay the same across save and reopen. Every
+        // name the payload does carry stays verbatim.
+        name_unnamed_native_faces(&mut body, &solid.name);
         result.added.push(register_verbatim(body, &solid.name));
     }
     // Overwriting: the payload's records ARE the part's metadata. The pipeline's
@@ -220,6 +227,32 @@ fn restore_native_bodies(ctx: &FeatureContext, payload: &str) -> Result<FeatureR
         scene_metadata::merge_record(&name, &record, true);
     }
     Ok(result)
+}
+
+/// Name every face of a restored native body that arrived unnamed
+/// `{body}_Face_{f}` (shell / face order, the import's positional fallback),
+/// then re-derive the TOPOLOGY edge names (`{faceA}|{faceB}[n]`, or none) so
+/// the edges along them are named too; an edge the payload named otherwise is
+/// kept. A body whose faces and edges are all named is untouched. Returns
+/// whether anything was named.
+fn name_unnamed_native_faces(solid: &mut BrepSolid, body_name: &str) -> bool {
+    let unnamed = |name: &Option<String>| name.as_deref().is_none_or(|n| n.trim().is_empty());
+    let mut named_any = false;
+    let mut face_index = 0usize;
+    for shell in &mut solid.shells {
+        for face in &mut shell.faces {
+            if unnamed(&face.name) {
+                face.name = Some(format!("{body_name}_Face_{face_index}"));
+                named_any = true;
+            }
+            face_index += 1;
+        }
+    }
+    let edges_unnamed = solid.edges.iter().any(|e| !e.degenerate && unnamed(&e.name));
+    if named_any || edges_unnamed {
+        common::stamp_derived_edge_names(solid);
+    }
+    named_any || edges_unnamed
 }
 
 /// [`common::register_added`] WITHOUT its two name-deriving passes: collect the
@@ -377,7 +410,7 @@ pub(crate) fn imported_solid_names(count: usize, feature_name: &str) -> Vec<Stri
 /// lane is the first caller).
 ///
 /// The two passes after the stamping are `register_added`'s name-FINALIZING half
-/// ([`common::ensure_unique_face_names`] + [`common::stamp_derived_edge_names`]),
+/// (`common::ensure_unique_face_names` + `common::stamp_derived_edge_names`),
 /// applied HERE rather than at restore time: the `nativeBrep` lane registers
 /// verbatim, so whatever the payload carries IS the final name set. Without them
 /// a payload's edge names would be the importer's raw ones while the `stepText`

@@ -444,6 +444,9 @@ pub struct WorkspaceOutcome {
     /// Open this document (`part/<part>/rev/<revision>`): a link was activated, or
     /// Open by number was pressed.
     pub open: Option<String>,
+    /// The folder `(id, name)` a link was opened from (`None` at the top, and
+    /// for Open by number): new PLM items the document's Save makes go there.
+    pub open_folder: Option<(String, String)>,
     /// A file's bytes, to save where the user chooses: (file name, bytes).
     pub downloaded: Option<(String, Vec<u8>)>,
     /// The pinned folders changed: save this list to `@pinned` ([`save_pins`]).
@@ -687,7 +690,10 @@ impl WorkspaceBrowser {
                     entry.name, link.number
                 ))
             }
-            ("link", Some(link)) => outcome.open = Some(link.document_key.clone()),
+            ("link", Some(link)) => {
+                outcome.open = Some(link.document_key.clone());
+                outcome.open_folder = self.path.last().cloned();
+            }
             ("file", _) => self.download(plm, entry, 0),
             _ => {}
         }
@@ -799,11 +805,26 @@ impl WorkspaceBrowser {
     /// (drafts included). With `open`, open it once found — or the revision the user
     /// typed, if they typed one.
     pub fn look_up(&mut self, plm: &dyn Workspaces, open: bool) {
+        // A lookup already asked to open (Open pressed) stays an opening one:
+        // the Part field reports losing focus on the frame AFTER the click.
+        let open = open || self.lookup_pending.as_ref().is_some_and(|(opening, _)| *opening);
         self.problem = None;
         self.lookup_pending = Some((open, Pending::new(plm.lookup(&self.open_part))));
     }
 
     /// Open the revision in the Revision field of the part looked up.
+    /// What went wrong, as the browser shows it: the server not answering is
+    /// one plain sentence, not the transport's words.
+    pub fn problem_text(&self) -> Option<String> {
+        self.problem.as_deref().map(|problem| {
+            if problem.starts_with("the PLM server did not answer") {
+                "The PLM server is not reachable. Your open tabs are kept; try again (Reload) when it is back.".to_string()
+            } else {
+                problem.to_string()
+            }
+        })
+    }
+
     pub fn open_by_number(&mut self, plm: &dyn Workspaces, outcome: &mut WorkspaceOutcome) {
         let looked_up = self.open_lookup.as_ref().filter(|p| {
             let typed = self.open_part.trim();
@@ -1004,7 +1025,7 @@ impl WorkspaceBrowser {
             self.make_row(ui, plm, prefix);
         }
         outcome.pick_file = std::mem::take(&mut self.pick_asked);
-        if let Some(problem) = &self.problem {
+        if let Some(problem) = self.problem_text() {
             ui.colored_label(ui.visuals().error_fg_color, problem);
         } else if let Some(notice) = &self.notice {
             ui.label(egui::RichText::new(notice).weak());
@@ -1156,8 +1177,11 @@ impl WorkspaceBrowser {
         }
     }
 
+    /// The folder's rows. Only the rows in view are laid out (a folder of
+    /// 2000 links cost ~35 ms a frame drawing every row); the rest publish
+    /// their hit keys where they sit, so a click on one scrolls it in.
     fn rows(&mut self, ui: &mut egui::Ui, plm: &dyn Workspaces, prefix: &str, outcome: &mut WorkspaceOutcome) {
-        let Some(entries) = self.entries.clone() else {
+        let Some(entries) = self.entries.take() else {
             ui.label(egui::RichText::new("Reading the workspace…").weak());
             return;
         };
@@ -1166,8 +1190,20 @@ impl WorkspaceBrowser {
             ui.label(egui::RichText::new(empty).weak());
         }
         let mut activated: Option<Entry> = None;
-        egui::ScrollArea::vertical().id_salt((prefix, "ws-rows")).max_height(260.0).show(ui, |ui| {
-            for entry in &entries {
+        let mut clicked: Option<String> = None;
+        let row_height = crate::plm::thumbnail_view::SIDE;
+        let pitch = row_height + ui.spacing().item_spacing.y;
+        egui::ScrollArea::vertical().id_salt((prefix, "ws-rows")).max_height(260.0).show_rows(ui, row_height, entries.len(), |ui, shown| {
+            let top = ui.cursor().top() - shown.start as f32 * pitch;
+            let (left, width) = (ui.cursor().left(), ui.available_width());
+            for (index, entry) in entries.iter().enumerate() {
+                if shown.contains(&index) {
+                    continue;
+                }
+                let rect = egui::Rect::from_min_size(egui::pos2(left, top + index as f32 * pitch), egui::vec2(width, row_height));
+                self.hits.insert(format!("{prefix}ws:entry:{}", entry.name), rect);
+            }
+            for entry in &entries[shown] {
                 ui.push_id(&entry.id, |ui| {
                 let selected = self.selected.as_deref() == Some(entry.id.as_str());
                 let text = format!("{} {}   {}", icon(entry), entry.name, entry.detail());
@@ -1182,7 +1218,7 @@ impl WorkspaceBrowser {
                 self.hit(prefix, &format!("entry:{}", entry.name), &row);
                 // Click selects, double click opens (every tree in this app).
                 if row.clicked() {
-                    self.select_named(&entry.name);
+                    clicked = Some(entry.name.clone());
                 }
                 if row.double_clicked() {
                     activated = Some(entry.clone());
@@ -1190,6 +1226,12 @@ impl WorkspaceBrowser {
                 });
             }
         });
+        if self.entries.is_none() {
+            self.entries = Some(entries);
+        }
+        if let Some(name) = clicked {
+            self.select_named(&name);
+        }
         if let Some(entry) = activated {
             self.activate(plm, &entry, outcome);
         }

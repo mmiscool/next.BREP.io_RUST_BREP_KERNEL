@@ -21,8 +21,26 @@ const statusEnabled = state => lifecycleOptions.find(s => s.state === state)?.en
 // changes anything sends it back; the server refuses one that does not.
 let csrfToken = '';
 
+// The last few API calls, for the long-task record below: a long task with
+// no script in it is the browser laying out what a response just drew.
+const recentApi = [];
+
 async function api(method, path, body) {
-  const options = { method, headers: {}, credentials: 'same-origin' };
+  const call = { method, path: path.split('?')[0], at: Math.round(performance.now()), ms: null, bytes: null };
+  recentApi.push(call); if (recentApi.length > 8) recentApi.shift();
+  try { return (await apiCall(method, path, body, call)).payload; } finally { call.ms = Math.round(performance.now() - call.at); }
+}
+
+// A GET that sends back the ETag it was last answered with: `{payload, tag}`,
+// or `{notModified: true, tag}` when the server says nothing moved.
+async function apiTagged(path, tag) {
+  const call = { method: 'GET', path: path.split('?')[0], at: Math.round(performance.now()), ms: null, bytes: null };
+  recentApi.push(call); if (recentApi.length > 8) recentApi.shift();
+  try { return await apiCall('GET', path, undefined, call, tag ? { 'If-None-Match': tag } : {}); } finally { call.ms = Math.round(performance.now() - call.at); }
+}
+
+async function apiCall(method, path, body, call, headers = {}) {
+  const options = { method, headers: { ...headers }, credentials: 'same-origin' };
   if (method !== 'GET' && csrfToken) options.headers['X-CSRF-Token'] = csrfToken;
   if (body !== undefined) {
     if (typeof body === 'string') {
@@ -34,8 +52,11 @@ async function api(method, path, body) {
     }
   }
   const response = await fetch(path, options);
-  if (response.status === 204) return null;
+  const tag = response.headers.get('ETag') || '';
+  if (response.status === 304) return { notModified: true, tag };
+  if (response.status === 204) return { payload: null, tag };
   const text = await response.text();
+  call.bytes = text.length;
   let payload = null;
   if (text) {
     try { payload = JSON.parse(text); } catch { payload = text; }
@@ -44,8 +65,37 @@ async function api(method, path, body) {
     const message = payload && payload.error ? payload.error : `${response.status} ${response.statusText}`;
     throw new Error(message);
   }
-  return payload;
+  return { payload, tag };
 }
+
+// A main-thread task of a second or more names itself: what it overlapped, and
+// what was on screen. Kept in `window.__plmLongTasks` (newest last) and
+// written to the console, so the next one is a record, not a guess.
+const LONG_TASK_RECORD_MS = 1000;
+window.__plmLongTasks = [];
+try {
+  new PerformanceObserver((list) => {
+    for (const task of list.getEntries()) {
+      if (task.duration < LONG_TASK_RECORD_MS) continue;
+      const record = {
+        ms: Math.round(task.duration),
+        at: Math.round(task.startTime),
+        attribution: (task.attribution || []).map((a) => [a.containerType, a.containerName, a.containerSrc, a.name].filter(Boolean).join(' ')),
+        route: location.hash,
+        tab: typeof objectTab === 'undefined' ? '' : objectTab,
+        structureTab: typeof structure === 'undefined' ? '' : structure.tab,
+        bomRows: document.querySelectorAll('#bom-rows tr').length,
+        nodes: document.getElementsByTagName('*').length,
+        hidden: document.hidden,
+        dialog: document.querySelector('dialog[open]')?.id || '',
+        api: recentApi.filter((c) => c.at <= task.startTime + task.duration).map((c) => `${c.method} ${c.path} at ${c.at} ${c.ms ?? '…'} ms ${c.bytes ?? '?'} B`),
+      };
+      window.__plmLongTasks.push(record);
+      if (window.__plmLongTasks.length > 20) window.__plmLongTasks.shift();
+      console.warn(`[plm long task] ${record.ms} ms on ${record.route} (${record.tab}/${record.structureTab}, ${record.bomRows} BOM rows, ${record.nodes} elements)`, record);
+    }
+  }).observe({ type: 'longtask', buffered: true });
+} catch { /* no Long Tasks API: nothing to record */ }
 
 function banner(message) {
   const el = $('banner');
@@ -121,11 +171,11 @@ const bytes = (n) => (n ? `${n.toLocaleString()} B` : '—');
 
 // ------------------------------------------------------------------- routing
 
-const VIEWS = ['workflows', 'workflow-editor', 'workflow-run', 'setup', 'file', 'empty', 'native-import', 'parts', 'workspace', 'part', 'reviews', 'catalog', 'sourcing', 'bake', 'bom-columns', 'occurrence-fields', 'types', 'users', 'scripts', 'settings', 'account', 'security', 'audit', 'backups'];
+const VIEWS = ['workflows', 'workflow-editor', 'workflow-run', 'setup', 'file', 'empty', 'native-import', 'parts', 'workspace', 'part', 'reviews', 'catalog', 'sourcing', 'tools', 'jobs', 'bake', 'bom-columns', 'occurrence-fields', 'types', 'users', 'scripts', 'settings', 'account', 'security', 'audit', 'backups'];
 
 let visiblePage = null;
 function show(view) {
-  const names = { workflows: 'Workflows', 'workflow-editor': 'Workflow editor', 'workflow-run': 'Workflow process', setup: 'Server setup', 'native-import': 'Import native files', parts: 'Parts', part: currentPart?.number || 'Part', workspace: 'Home', reviews: 'Review inbox', catalog: 'Classification', sourcing: 'Sourcing', bake: 'Bake queue', 'bom-columns':'BOM column configurations', 'occurrence-fields':'Occurrence fields', types: 'Part types', users: 'Users', scripts: 'Scripts', settings: 'Settings', account: 'My account', security: 'Security', audit: 'Audit', backups: 'Backups' };
+  const names = { workflows: 'Workflows', 'workflow-editor': 'Workflow editor', 'workflow-run': 'Workflow process', setup: 'Server setup', 'native-import': 'Import native files', tools: 'Tools library', jobs: 'Jobs', parts: 'Parts', part: currentPart?.number || 'Part', workspace: 'Home', reviews: 'Review inbox', catalog: 'Classification', sourcing: 'Sourcing', bake: 'Bake queue', 'bom-columns':'BOM column configurations', 'occurrence-fields':'Occurrence fields', types: 'Part types', users: 'Users', scripts: 'Scripts', settings: 'Settings', account: 'My account', security: 'Security', audit: 'Audit', backups: 'Backups' };
   visiblePage = {view, title:names[view] || view};
   for(const menu of document.querySelectorAll('.top-nav details[open]'))menu.open=false;
   $('shell-status').textContent = names[view] || 'Ready';
@@ -184,6 +234,12 @@ async function renderRoute(hash) {
     } else if (section === 'sourcing') {
       await renderCompanies();
       show('sourcing');
+    } else if (section === 'tools') {
+      await renderTools();
+      show('tools');
+    } else if (section === 'jobs') {
+      await renderJobs(id ? decodeURIComponent(id) : null);
+      show('jobs');
     } else if (section === 'bake') {
       await renderBake();
       show('bake');
@@ -305,6 +361,69 @@ document.addEventListener('click', (event) => {
 
 // -------------------------------------------------------------------- signin
 
+// The desktop app's browser sign-in: BREP opened /desktop-link?token=…. The
+// token is taken out of the address bar at once (kept for this tab only, so a
+// sign-in or a reload keeps it), and nothing is approved until the person
+// clicks Approve: a link someone else sent must not connect their app.
+const DESKTOP_LINK_KEY = 'brep-desktop-link';
+const desktopLinking = location.pathname === '/desktop-link';
+const desktopLinkToken = (() => {
+  if (!desktopLinking) return '';
+  const fromUrl = new URLSearchParams(location.search).get('token') || '';
+  try {
+    if (fromUrl) sessionStorage.setItem(DESKTOP_LINK_KEY, fromUrl);
+    else return sessionStorage.getItem(DESKTOP_LINK_KEY) || '';
+  } catch { /* No storage: the token lives in this page only. */ }
+  if (fromUrl) history.replaceState(null, '', '/desktop-link');
+  return fromUrl;
+})();
+
+function desktopLinkDone(message, ok) {
+  try { sessionStorage.removeItem(DESKTOP_LINK_KEY); } catch { /* Nothing kept. */ }
+  $('desktop-link-ask').hidden = true;
+  $('desktop-link-result').textContent = message;
+  $('desktop-link-result').className = ok ? 'ok' : 'error';
+}
+
+async function showDesktopLink() {
+  $('desktop-link').hidden = false;
+  $('desktop-link-ask').hidden = true;
+  $('desktop-link-result').textContent = '';
+  if (!desktopLinkToken) {
+    desktopLinkDone('This page needs the link BREP opened. Start the sign-in again from BREP.', false);
+    return;
+  }
+  let link;
+  try {
+    link = await api('POST', '/api/desktop/link/inspect', { token: desktopLinkToken });
+  } catch (error) {
+    desktopLinkDone(error.message, false);
+    return;
+  }
+  const machine = [link.host || 'a computer', link.os && `(${link.os})`].filter(Boolean).join(' ');
+  $('desktop-link-text').textContent = `Connect BREP desktop on ${machine} as ${me.username}?`;
+  $('desktop-link-code').textContent = link.code;
+  $('desktop-link-origin').textContent = link.ip ? `Asked from ${link.ip}.` : '';
+  $('desktop-link-ask').hidden = false;
+}
+
+async function decideDesktopLink(approve) {
+  for (const id of ['desktop-link-approve', 'desktop-link-deny']) $(id).disabled = true;
+  try {
+    await api('POST', `/api/desktop/link/${approve ? 'approve' : 'deny'}`, { token: desktopLinkToken });
+    desktopLinkDone(approve
+      ? 'BREP desktop is connected. You can return to BREP.'
+      : 'Refused: BREP desktop was not connected. You can close this page.', approve);
+  } catch (error) {
+    desktopLinkDone(error.message, false);
+  } finally {
+    for (const id of ['desktop-link-approve', 'desktop-link-deny']) $(id).disabled = false;
+  }
+}
+
+$('desktop-link-approve').addEventListener('click', () => decideDesktopLink(true));
+$('desktop-link-deny').addEventListener('click', () => decideDesktopLink(false));
+
 async function boot() {
   try {
     me = await api('GET', '/api/me');
@@ -313,9 +432,14 @@ async function boot() {
     me = null;
     csrfToken = '';
   }
+  $('login-purpose').hidden = !desktopLinking;
   $('signin').hidden = !!me;
-  $('shell').hidden = !me;
+  $('shell').hidden = !me || desktopLinking;
   if (!me) return;
+  if (desktopLinking) {
+    await showDesktopLink();
+    return;
+  }
 
   const cadReturn = new URLSearchParams(location.search).get('cad');
   if (cadReturn) {
@@ -594,7 +718,7 @@ for(const [id,step] of [['parts-batch-prev',-50],['parts-batch-next',50]]) {
 }
 setInterval(refreshPartsBatch,5000);
 
-const OBJECT_TABS = [['summary', 'Summary'], ['revisions', 'Revisions'], ['structure', 'Structure'], ['review', 'Review'], ['attachments', 'Attachments'], ['sourcing', 'Sourcing'], ['history', 'History']];
+const OBJECT_TABS = [['summary', 'Summary'], ['revisions', 'Revisions'], ['structure', 'Structure'], ['instructions', 'Instructions'], ['review', 'Review'], ['attachments', 'Attachments'], ['sourcing', 'Sourcing'], ['history', 'History']];
 let objectTab = 'summary';
 $('object-tabs').innerHTML = OBJECT_TABS.map(([id, label]) => `<button type="button" role="tab" id="object-tab-${id}" data-object-tab="${id}" aria-controls="object-panel-${id}" aria-selected="false">${label}</button>`).join('');
 for (const [id] of OBJECT_TABS) {
@@ -698,6 +822,7 @@ async function loadPartPanel(tab, state=partPanels) {
       case 'attachments': await renderAttachments(detail);break;
       case 'review': await renderReview(detail);break;
       case 'history': await renderHistory(detail);break;
+      case 'instructions': await renderInstructions(detail);break;
       case 'sourcing': renderSourcing(detail);break;
     }
     state.loaded.add(tab);
@@ -787,6 +912,12 @@ function actions(rev) {
   const rid = escape(rev.id);
   const cad = openInCadButton(currentPart.id, rev.id);
   if (cad) out.push(cad);
+  // An ordinary part's motion study, published at a save from the CAD app:
+  // the player page the PLM serves (instructions have their own section).
+  const full = (currentPart.revisions || []).find((r) => r.id === rev.id);
+  if (full?.player && currentPart.document_class !== 'instructions') {
+    out.push(`<a class="button link" href="/motion/${encodeURIComponent(currentPart.number)}/${encodeURIComponent(rev.id)}" target="_blank" rel="noopener">Open motion player</a>`);
+  }
   out.push(`<a class="button link" href="#/workflows/${encodeURIComponent(currentPart.id)}/${encodeURIComponent(rev.id)}">Start workflow</a>`);
   if (rev.editable) {
     if (!rev.locked_by && me.can_author) out.push(`<button class="link" data-do="checkout" data-rev="${rid}">Check out</button>`);
@@ -808,6 +939,11 @@ function actions(rev) {
   }
   if (advanced.length) out.push(`<details class="revision-advanced"><summary>Advanced</summary>${advanced.join(' ')}</details>`);
   return out.join(' ');
+}
+
+// A revision of the part on the page, as people read it.
+function revisionLabel(revisionId) {
+  return currentPart.revisions.find((r) => r.id === revisionId)?.label || revisionId;
 }
 
 function onRevisionAction(action, revisionId) {
@@ -833,11 +969,11 @@ function onRevisionAction(action, revisionId) {
         showWarnings(await api('POST', `${base}/state`, { to: 'draft' }));
         break;
       case 'obsolete':
-        if (!confirm('Mark this revision obsolete?')) return;
-        await api('POST', `${base}/state`, { to: 'obsolete' });
+        if (!confirm(await UsedBy.ask(api, part, revisionId, revisionLabel(revisionId), 'obsolete'))) return;
+        showWarnings(await api('POST', `${base}/state`, { to: 'obsolete' }));
         break;
       case 'delete':
-        if (!confirm('Delete this draft revision and its document?')) return;
+        if (!confirm(await UsedBy.ask(api, part, revisionId, revisionLabel(revisionId), 'delete'))) return;
         await api('DELETE', base);
         break;
       case 'edit':
@@ -1687,6 +1823,125 @@ function companyRows(list, key) {
     </tr>`).join('');
 }
 
+// ----------------------------------------------------------------- tools
+
+async function renderTools() {
+  const tools = await api('GET', `/api/tools${$('tools-retired').checked ? '?retired=true' : ''}`);
+  $('tools-empty').hidden = tools.length > 0;
+  $('tools-rows').innerHTML = tools.map((tool) => `<tr data-tool="${escape(tool.id)}"${tool.retired ? ' class="muted"' : ''}>
+    <td>${tool.picture_url ? `<img class="tool-picture" src="${escape(tool.picture_url)}" alt="" loading="lazy">` : ''}</td>
+    <td>${escape(tool.name)}<span class="attrs-line">${escape(tool.id)}${tool.retired ? ' · retired' : ''}</span></td>
+    <td>${escape(tool.kind)}</td><td>${escape(tool.spec)}</td>
+    <td class="author-only"><button type="button" class="link" data-tool-edit>Edit</button>
+      <button type="button" class="link" data-tool-retire>${tool.retired ? 'Restore' : 'Retire'}</button>
+      <label class="link">Picture<input type="file" accept="image/png,image/jpeg,image/webp" data-tool-picture hidden></label></td></tr>`).join('');
+  for (const row of $('tools-rows').querySelectorAll('tr')) {
+    const id = row.dataset.tool, tool = tools.find((t) => t.id === id);
+    row.querySelector('[data-tool-retire]').onclick = () => act(async () => { await api('PATCH', `/api/tools/${id}`, { retired: !tool.retired }); await renderTools(); });
+    row.querySelector('[data-tool-edit]').onclick = () => act(async () => {
+      const name = prompt('Tool name', tool.name); if (name === null) return;
+      const spec = prompt('Spec', tool.spec); if (spec === null) return;
+      await api('PATCH', `/api/tools/${id}`, { name, spec }); await renderTools();
+    });
+    row.querySelector('[data-tool-picture]').onchange = (event) => act(async () => {
+      const file = event.target.files[0]; if (!file) return;
+      const response = await fetch(`/api/tools/${id}/picture`, { method: 'PUT', body: file, credentials: 'same-origin', headers: { 'Content-Type': file.type, 'X-CSRF-Token': csrfToken } });
+      if (!response.ok) throw new Error(await response.text());
+      await renderTools();
+    });
+  }
+}
+$('tools-retired').addEventListener('change', () => act(renderTools));
+$('tool-add').addEventListener('submit', (event) => {
+  event.preventDefault();
+  const form = event.target;
+  act(async () => {
+    await api('POST', '/api/tools', { name: form.elements.name.value, kind: form.elements.kind.value, spec: form.elements.spec.value });
+    form.reset(); await renderTools();
+  });
+});
+
+// ----------------------------------------------------------------- jobs floor queue
+
+// The queue polls what moved since its last answer, so a tablet on the
+// floor sees another's sign-off without reloading.
+const jobsView = { jobs: new Map(), seq: 0, open: null, timer: null };
+const canSign = () => (me?.groups || []).some((g) => ['operator', 'author', 'admin'].includes(g));
+
+async function renderJobs(open) {
+  const queue = await api('GET', '/api/jobs');
+  jobsView.jobs = new Map(queue.jobs.map((job) => [job.id, job]));
+  jobsView.seq = queue.seq;
+  jobsView.open = open;
+  if (open && !jobsView.jobs.has(open)) jobsView.jobs.set(open, await api('GET', `/api/jobs/${encodeURIComponent(open)}`));
+  paintJobs();
+  clearInterval(jobsView.timer);
+  jobsView.timer = setInterval(pollJobs, 5000);
+}
+
+async function pollJobs() {
+  if (visiblePage?.view !== 'jobs' || document.hidden) return;
+  try {
+    const moved = await api('GET', `/api/jobs?since=${jobsView.seq}`);
+    if (!moved.jobs.length) return;
+    for (const job of moved.jobs) jobsView.jobs.set(job.id, job);
+    jobsView.seq = moved.seq;
+    paintJobs();
+  } catch {}
+}
+
+function signedCount(job) { return job.steps.filter((s) => s.signed_at).length; }
+
+function paintJobs() {
+  const live = [...jobsView.jobs.values()].filter((j) => j.status === 'queued' || j.status === 'in_progress').sort((a, b) => a.position - b.position || a.id.localeCompare(b.id));
+  $('jobs-empty').hidden = live.length > 0;
+  $('jobs-list').innerHTML = live.map((job) => {
+    const next = job.steps.find((s) => !s.signed_at);
+    return `<button type="button" class="job-card" data-job="${escape(job.id)}"><strong>${escape(job.id)}</strong> ${escape(job.instructions.part)} rev ${escape(job.instructions.revision)}${job.serial ? ` · ${escape(job.serial)}` : ''}
+      <span class="attrs-line">${escape(job.status.replace('_', ' '))} · ${signedCount(job)} of ${job.steps.length} steps${next ? ` · next: ${escape(next.title || next.step)}` : ''}</span></button>`;
+  }).join('');
+  for (const card of $('jobs-list').querySelectorAll('[data-job]')) card.onclick = () => { location.hash = `#/jobs/${encodeURIComponent(card.dataset.job)}`; };
+  const job = jobsView.open && jobsView.jobs.get(jobsView.open);
+  $('job-detail').hidden = !job;
+  $('jobs-list').hidden = !!job;
+  $('job-add').hidden = !!job || !me?.can_author;
+  if (!job) return;
+  $('job-title').textContent = `${job.id}${job.serial ? ` · ${job.serial}` : ''}`;
+  $('job-meta').textContent = `${job.instructions.part} rev ${job.instructions.revision} for ${job.assembly.part} rev ${job.assembly.revision} · ${job.status.replace('_', ' ')} · ${signedCount(job)} of ${job.steps.length} steps signed`;
+  const next = job.steps.findIndex((s) => !s.signed_at);
+  $('job-steps').innerHTML = job.steps.map((step, i) => {
+    const inputs = i === next && canSign() && job.status !== 'cancelled'
+      ? step.adds.filter((a) => a.serial_tracked).flatMap((add) => add.occurrences.map((occurrence) => `<label>Serial of ${escape(add.part)} at ${escape(occurrence)} <input data-serial="${escape(occurrence)}" required autocomplete="off"></label>`)).join('')
+        + `<label>Note <input data-note autocomplete="off"></label><button type="button" data-sign>Sign step</button>`
+      : '';
+    const signed = step.signed_at ? `<span class="attrs-line">Signed ${new Date(step.signed_at * 1000).toLocaleString()}${step.serials.length ? ` · serials ${step.serials.map((s) => escape(s.serial)).join(', ')}` : ''}${step.note ? ` · ${escape(step.note)}` : ''}</span>${me?.can_checkin ? '<button type="button" class="link" data-reopen>Reopen</button>' : ''}` : (step.note ? `<span class="attrs-line">${escape(step.note)}</span>` : '');
+    return `<li data-step="${escape(step.step)}" class="${step.signed_at ? 'signed' : i === next ? 'current' : ''}"><strong>${escape(step.title || step.step)}</strong>${signed}${inputs ? `<div class="job-sign">${inputs}</div>` : ''}</li>`;
+  }).join('');
+  for (const li of $('job-steps').querySelectorAll('li')) {
+    const step = li.dataset.step;
+    li.querySelector('[data-sign]')?.addEventListener('click', () => act(async () => {
+      const serials = [...li.querySelectorAll('[data-serial]')].map((input) => ({ occurrence: input.dataset.serial, serial: input.value }));
+      await api('POST', `/api/jobs/${encodeURIComponent(job.id)}/steps/${encodeURIComponent(step)}/signoff`, { serials, note: li.querySelector('[data-note]').value });
+      jobsView.jobs.set(job.id, await api('GET', `/api/jobs/${encodeURIComponent(job.id)}`));
+      paintJobs();
+    }));
+    li.querySelector('[data-reopen]')?.addEventListener('click', () => act(async () => {
+      const reason = prompt('Why is this step reopened? It and every later step are signed again.'); if (!reason) return;
+      jobsView.jobs.set(job.id, await api('POST', `/api/jobs/${encodeURIComponent(job.id)}/steps/${encodeURIComponent(step)}/reopen`, { reason }));
+      paintJobs();
+    }));
+  }
+}
+$('job-close').addEventListener('click', () => { location.hash = '#/jobs'; });
+$('job-add').addEventListener('submit', (event) => {
+  event.preventDefault();
+  const form = event.target;
+  act(async () => {
+    await api('POST', '/api/jobs', { instructions: form.elements.instructions.value.trim(), revision: form.elements.revision.value.trim(), serial: form.elements.serial.value.trim(), quantity: Number(form.elements.quantity.value) || 1 });
+    form.reset(); await renderJobs(null);
+  });
+});
+
 async function renderCompanies() {
   await loadCompanies();
   $('manufacturer-rows').innerHTML = companyRows(companies.manufacturers, 'manufacturers');
@@ -2361,6 +2616,7 @@ function showTab(tab) {
     button.setAttribute('aria-selected', String(button.dataset.tab === tab));
   }
   for (const name of ['bom', 'uses', 'diff']) $(`tab-${name}`).hidden = name !== tab;
+  if (tab === 'uses' && structure.usesUnpainted) paintUsesRows();
 }
 
 for (const button of document.querySelectorAll('#bom-panel .tab')) {
@@ -2374,12 +2630,22 @@ $('bom-revision').addEventListener('change', () => act(async () => {
 $('bom-view').addEventListener('change', () => act(loadBom));
 
 let bomReadSerial=0;
+// The last BOM read by loadBom: its URL, ETag and body, for the poll's 304.
+let bomTagged={url:'',tag:'',bom:null};
 async function loadBom({background=false}={}) {
   const serial=++bomReadSerial;
   const flat = $('bom-view').value === 'flat';
   const query = `levels=0&flat=${flat}&occurrences=true`;
   const base = `${revUrl(structure.revision)}/bom`;
-  const bom = await api('GET', `${base}?${query}`);
+  // The poll sends back the ETag of the BOM it drew: an unchanged BOM is a
+  // 304 with no body, not megabytes to fetch, parse and compare.
+  const url = `${base}?${query}`;
+  const kept = background && bomTagged.url === url && bomTagged.bom ? bomTagged : null;
+  const answer = await apiTagged(url, kept?.tag);
+  let bom, tag;
+  if (answer.notModified && kept) ({ bom, tag } = kept);
+  else if (answer.notModified) throw new Error('The BOM could not be read again.');
+  else { bom = answer.payload; tag = answer.tag; bomTagged = { url, tag, bom }; }
   if(serial!==bomReadSerial)return;
   $('bom-csv').href = `${base}?${query}&format=csv`;
   const empty = bom.lines.length === 0;
@@ -2388,7 +2654,7 @@ async function loadBom({background=false}={}) {
   $('bom-csv').hidden = empty;
   $('bom-totals').hidden = empty;
 
-  await drawConfiguredBom(bom,serial,background);
+  await drawConfiguredBom(bom,serial,background,tag);
   if(serial!==bomReadSerial)return;
   const totals = bom.totals.map((t) => `${escape(t.currency || '(no currency)')} ${money(t.total)}`).join(' · ');
   $('bom-totals').innerHTML = `Total: ${totals || '—'}`
@@ -2453,6 +2719,16 @@ function renderUses() {
   $('uses-save').hidden = !editable;
   $('uses-revert').hidden = !editable;
   $('uses-empty').hidden = structure.lines.length > 0;
+  // The rows wait for their tab: a 2,000-line list is 10,000 inputs the
+  // Structure view would otherwise build behind the BOM it opens on.
+  if ($('tab-uses').hidden) structure.usesUnpainted = true;
+  else paintUsesRows();
+  syncUsesStatus();
+}
+
+function paintUsesRows() {
+  structure.usesUnpainted = false;
+  const editable = usesEditable();
   const off = editable ? '' : ' disabled';
   $('uses-rows').innerHTML = structure.lines.map((l, i) => `
     <tr>
@@ -2465,7 +2741,6 @@ function renderUses() {
       <td><input class="ref" data-i="${i}" data-f="reference" value="${escape(l.reference)}" aria-label="Reference designators"${off}></td>
       <td class="actions">${editable ? `<button type="button" class="link" data-remove="${i}">Remove</button>` : ''}</td>
     </tr>`).join('');
-  syncUsesStatus();
 }
 
 function syncUsesStatus() {
@@ -2571,6 +2846,12 @@ async function loadDiff() {
 $('wu-revision').addEventListener('change', () => act(loadWhereUsed));
 $('wu-levels').addEventListener('change', () => act(loadWhereUsed));
 
+// Where-used draws its first rows when a part is used everywhere, as the BOM
+// does (BOM_SHOWN_FIRST): 2,000 lines took the browser close to a second.
+const whereUsedView = { key: '', showAll: false, used: null };
+
+$('wu-show-all').addEventListener('click', () => { whereUsedView.showAll = true; paintWhereUsed(); });
+
 async function loadWhereUsed() {
   const revision = $('wu-revision').value;
   const levels = $('wu-levels').value;
@@ -2580,7 +2861,20 @@ async function loadWhereUsed() {
     ? `Nothing uses rev ${used.revision_label} of this part.`
     : 'Nothing uses this part.';
   $('wu-wrap').hidden = used.lines.length === 0;
-  $('wu-rows').innerHTML = used.lines.map((l) => `
+  const key = `${currentPart.id}/${revision}/${levels}`;
+  if (whereUsedView.key !== key) { whereUsedView.key = key; whereUsedView.showAll = false; }
+  whereUsedView.used = used;
+  paintWhereUsed();
+}
+
+function paintWhereUsed() {
+  const used = whereUsedView.used;
+  const capped = !whereUsedView.showAll && used.lines.length > BOM_COLLAPSED_OVER;
+  const lines = capped ? used.lines.slice(0, BOM_SHOWN_FIRST) : used.lines;
+  $('wu-limit').hidden = !capped;
+  $('wu-limit-note').textContent = capped ? `Showing the first ${BOM_SHOWN_FIRST.toLocaleString()} of ${used.lines.length.toLocaleString()} lines: drawing them all is slow.` : '';
+  $('wu-show-all').textContent = `Show all ${used.lines.length.toLocaleString()} lines`;
+  $('wu-rows').innerHTML = lines.map((l) => `
     <tr class="${l.current ? '' : 'muted'}">
       <td>${'\u00a0\u00a0\u00a0'.repeat(l.level - 1)}<a href="#/part/${encodeURIComponent(l.part_id)}">${escape(l.number)}</a>
         <span class="muted">${escape(l.name)}</span>${l.top ? ' <span class="badge">top</span>' : ''}</td>
@@ -2754,6 +3048,9 @@ $('att-revision').addEventListener('change', () => {
   act(loadAttachments);
 });
 
+// The largest image attachment drawn as its own thumbnail in the list.
+const ATTACHMENT_THUMB_MAX = 256 * 1024;
+
 const fileSize = (n) => (n >= 1048576 ? `${(n / 1048576).toFixed(1)} MB` : n >= 1024 ? `${Math.round(n / 1024)} KB` : `${n} B`);
 
 async function loadAttachments() {
@@ -2772,8 +3069,11 @@ async function loadAttachments() {
   $('att-wrap').hidden = rows.length === 0;
   $('att-rows').innerHTML = rows.map((a) => {
     const href = `/api/attachments/${encodeURIComponent(a.id)}`;
-    const thumb = a.inline && a.media_type.startsWith('image/')
-      ? `<img class="thumb" src="${href}?inline=true" alt="">` : '';
+    // The thumbnail IS the file: a small image is drawn (when it scrolls
+    // into view), a large one waits for Preview. Forty photos were 97 MB
+    // fetched every time the tab opened.
+    const thumb = a.inline && a.media_type.startsWith('image/') && a.size <= ATTACHMENT_THUMB_MAX
+      ? `<img class="thumb" src="${href}?inline=true" alt="" loading="lazy" decoding="async">` : '';
     const view = a.inline
       ? (a.media_type.startsWith('image/')
         ? `<button type="button" class="link" data-preview="${escape(a.id)}">Preview</button>`
@@ -2925,10 +3225,29 @@ function tokenRow(t, showOwner) {
     </tr>`;
 }
 
+// A Linked desktop: an API token a browser sign-in made for a desktop app
+// (`desktop` names the computer that asked).
+function desktopRow(t, showOwner) {
+  const d = t.desktop || {};
+  return `
+    <tr>
+      ${showOwner ? `<td class="mono">${escape(t.username)}</td>` : ''}
+      <td>${escape(d.host || 'unnamed computer')}</td>
+      <td>${escape(d.os || '')}</td>
+      <td class="mono">${escape(d.app_version || '')}</td>
+      <td>${escape(when(t.created_at))}</td>
+      <td>${escape(when(t.last_used_at))}</td>
+      <td class="actions"><button class="link danger" data-token="${escape(t.id)}" data-desktop="${escape(d.host || 'this desktop app')}">Revoke</button></td>
+    </tr>`;
+}
+
 function wireRevoke(container, after) {
   for (const button of container.querySelectorAll('button[data-token]')) {
     button.addEventListener('click', () => act(async () => {
-      if (!confirm(`Revoke the token "${button.dataset.name}"? Anything using it stops working at once.`)) return;
+      const question = button.dataset.desktop
+        ? `Sign out the BREP desktop app on ${button.dataset.desktop}? It asks to sign in again at its next request.`
+        : `Revoke the token "${button.dataset.name}"? Anything using it stops working at once.`;
+      if (!confirm(question)) return;
       await api('DELETE', `/api/tokens/${button.dataset.token}`);
       await after();
     }));
@@ -2937,7 +3256,12 @@ function wireRevoke(container, after) {
 
 async function renderAccount() {
   $('account-who').textContent = `Signed in as ${me.username}${me.display_name ? ` (${me.display_name})` : ''}.`;
-  const tokens = await api('GET', '/api/tokens');
+  const all = await api('GET', '/api/tokens');
+  const desktops = all.filter((t) => t.desktop);
+  const tokens = all.filter((t) => !t.desktop);
+  $('desktop-rows').innerHTML = desktops.map((t) => desktopRow(t, false)).join('');
+  $('desktops-empty').hidden = desktops.length > 0;
+  wireRevoke($('desktop-rows'), renderAccount);
   $('token-rows').innerHTML = tokens.map((t) => tokenRow(t, false)).join('');
   $('tokens-empty').hidden = tokens.length > 0;
   wireRevoke($('token-rows'), renderAccount);
@@ -2999,10 +3323,15 @@ $('token-done').addEventListener('click', () => {
 // ---------------------------------------------------------------- security
 
 async function renderSecurity() {
-  const [lockouts, tokens] = await Promise.all([
+  const [lockouts, all] = await Promise.all([
     api('GET', '/api/security/lockouts'),
     api('GET', '/api/tokens?all=true'),
   ]);
+  const desktops = all.filter((t) => t.desktop);
+  const tokens = all.filter((t) => !t.desktop);
+  $('all-desktop-rows').innerHTML = desktops.map((t) => desktopRow(t, true)).join('');
+  $('all-desktops-empty').hidden = desktops.length > 0;
+  wireRevoke($('all-desktop-rows'), renderSecurity);
   $('lockout-rows').innerHTML = lockouts.map((l) => `
     <tr>
       <td>${l.kind === 'user' ? 'Username' : 'Address'}</td>
@@ -3111,6 +3440,53 @@ async function pageAudit({ base, params, rows, empty, more, showTarget, append }
 
 // The part page's History panel.
 let historyPart = null;
+
+// Manufacturing instructions: on instructions, the assembly each revision
+// instructs; on anything else, the instructions that instruct it (stale once
+// the assembly has a newer revision than the one instructed).
+async function renderInstructions(detail) {
+  const own = detail.document_class === 'instructions';
+  $('instructions-own').hidden = !own;
+  $('instructions-by').hidden = own;
+  if (own) {
+    const rows = detail.revision_views.map((revision) => {
+      const full = detail.revisions.find((r) => r.id === revision.id);
+      const target = full?.instructs;
+      const player = `/instructions/${encodeURIComponent(detail.number)}/${encodeURIComponent(revision.id)}`;
+      const share = full?.lifecycle === 'released' && me?.can_author ? ` <button type="button" class="link" data-share="${escape(revision.id)}">Customer link</button>` : '';
+      return `<tr><td>${escape(revision.label)}</td><td>${target ? `<a href="#/part/${encodeURIComponent(target.part)}">${escape(target.part)}</a> rev ${escape(target.revision)}` : '<span class="muted">No PLM assembly</span>'}</td>
+        <td>${full?.player ? `<a href="${player}" target="_blank" rel="noopener">Open player</a> · <a href="${player}?mode=customer" target="_blank" rel="noopener">customer view</a>${share}` : '<span class="muted">Saved from the CAD app, the player follows</span>'}<span class="attrs-line" data-share-out="${escape(revision.id)}"></span>${share ? `<ul class="plain share-list" data-share-list="${escape(revision.id)}"></ul>` : ''}</td></tr>`;
+    });
+    $('instructions-own-rows').innerHTML = rows.join('');
+    const sharesUrl = (rev) => `/api/parts/${encodeURIComponent(detail.id)}/revisions/${encodeURIComponent(rev)}/shares`;
+    // Each released revision's customer links, each revocable. The token is
+    // never listed: only the label and who made it.
+    const paintShares = async (rev) => {
+      const out = $('instructions-own-rows').querySelector(`[data-share-list="${CSS.escape(rev)}"]`);
+      if (!out) return;
+      const shares = await api('GET', sharesUrl(rev));
+      out.innerHTML = shares.map((share) => `<li data-share-id="${escape(share.id)}">${escape(share.label || 'Customer link')} <span class="muted">by ${escape(share.created_by)}, ${new Date(share.created_at * 1000).toLocaleDateString()}</span> <button type="button" class="link" data-revoke>Revoke</button></li>`).join('');
+      for (const item of out.querySelectorAll('[data-share-id]')) item.querySelector('[data-revoke]').onclick = () => act(async () => {
+        if (!confirm(`Revoke "${item.firstChild.textContent.trim()}"? The link stops working at once.`)) return;
+        await api('DELETE', `${sharesUrl(rev)}/${encodeURIComponent(item.dataset.shareId)}`);
+        await paintShares(rev);
+      });
+    };
+    for (const button of $('instructions-own-rows').querySelectorAll('[data-share]')) {
+      button.onclick = () => act(async () => {
+        const label = prompt('Who is this customer link for? (shown in the list, not to them)'); if (label === null) return;
+        const made = await api('POST', sharesUrl(button.dataset.share), { label });
+        $('instructions-own-rows').querySelector(`[data-share-out="${CSS.escape(button.dataset.share)}"]`).textContent = `Link (shown once): ${location.origin}${made.url}`;
+        await paintShares(button.dataset.share);
+      });
+      await paintShares(button.dataset.share);
+    }
+    return;
+  }
+  const rows = await api('GET', `/api/parts/${encodeURIComponent(detail.id)}/instructions`);
+  $('instructions-empty').hidden = rows.length > 0;
+  $('instructions-rows').innerHTML = rows.map((row) => `<tr><td><a href="#/part/${encodeURIComponent(row.part)}">${escape(row.number)}</a> ${escape(row.name)}</td><td>${escape(row.label)}</td><td>${escape(row.state)}</td><td>${escape(row.target_label)}${row.stale ? ' <span class="flag-chip">newer assembly revision</span>' : ''}</td></tr>`).join('');
+}
 
 async function renderHistory(detail, append = false) {
   historyPart = detail.id;
@@ -3607,7 +3983,7 @@ function niRenderRows() {
   $('ni-mapping-step').hidden = false;
   $('ni-rows').innerHTML = nativeWizard.rows.map((row, i) => {
     const creating = row.action === 'create', counter = niType(row)?.mode.kind === 'counter';
-    return `<tr data-import-row="${i}"><td><input data-field="name" aria-label="Name for ${escape(row.name)}" value="${escape(row.name)}"><small>${row.assembly ? 'Assembly' : 'Part'} · ${escape(row.id)}${row.root ? ' · uploaded file' : ' · embedded'}</small></td>
+    return `<tr data-import-row="${i}"><td><input data-field="name" aria-label="Name for ${escape(row.name)}" value="${escape(row.name)}"><small>${row.assembly ? 'Assembly' : 'Part'} · ${escape(row.id)}${row.root ? ' · uploaded file' : ' · embedded'}${row.unchanged ? ' · unchanged' : ''}${row.note ? ` · ${escape(row.note)}` : ''}</small></td>
       <td><select data-field="action" aria-label="Action for ${escape(row.name)}">${[['create','Create part'],['revise','Create new revision'],['replace','Replace editable draft'],['reuse','Reuse existing revision']].map(([v,t]) => `<option value="${v}" ${row.action === v ? 'selected' : ''}>${t}</option>`).join('')}</select></td>
       <td><select data-field="part_type" aria-label="Part type for ${escape(row.name)}" ${creating ? '' : 'disabled'}>${nativeWizard.types.map(t => `<option value="${escape(t.id)}" ${row.part_type === t.id ? 'selected' : ''}>${escape(t.name)}</option>`).join('')}</select><small>${creating ? escape(niNumbering(row)) : 'Existing part keeps its type and number'}</small></td>
       <td><input data-field="${creating ? 'number' : 'part'}" aria-label="${creating ? 'Number' : 'Existing part'} for ${escape(row.name)}" value="${escape(creating ? row.number : row.part)}" ${creating && counter ? 'disabled placeholder="Assigned on import"' : ''}>${creating ? '' : '<button type="button" data-target-lookup class="ghost">Load revisions</button>'}</td>
@@ -3628,27 +4004,51 @@ async function niReadFiles(list) {
     try { documents.push({ name: file.webkitRelativePath || file.name, document: JSON.parse(await file.text()) }); }
     catch { throw new Error(`${file.name}: this is not valid native JSON`); }
   }
-  if (!$('ni-namespace').value.trim()) $('ni-namespace').value = NativeImport.path(documents[0].name).split('/')[0];
-  const plan = NativeImport.plan(documents);
+  nativeWizard.documents = documents; nativeWizard.choices = {};
+  await niPlan();
+}
+// Plan the chosen files and propose an action per item from what the server
+// already holds. Re-run when a conflict answer or the import set changes.
+async function niPlan() {
+  const documents = nativeWizard.documents;
+  const plan = NativeImport.plan(documents, nativeWizard.choices);
   if (plan.errors.length) { $('ni-file-summary').textContent = 'Files need attention.'; throw new Error(plan.errors.join('\n')); }
   const types = nativeWizard.types;
   if (!types.length) throw new Error('Create a part type before importing models.');
+  // The root assembly names the set by default, so a file and its folder import alike.
+  if (!$('ni-namespace').value.trim()) $('ni-namespace').value = plan.tree[0]?.name || NativeImport.path(documents[0].name).split('/').pop();
+  const namespace = $('ni-namespace').value;
   for (const row of plan.rows) {
     row.action = 'create'; row.number = ''; row.part = ''; row.revision = '';
     row.part_type = (types.find(t => t.id === (row.assembly ? 'assembly' : 'component')) || types[0]).id;
-    const matches = (await api('GET', `/api/parts?external_ref=${encodeURIComponent(NativeImport.externalRef($('ni-namespace').value, row.id))}&limit=2`)).parts;
-    if (matches.length === 1) {
-      const p = await api('GET', `/api/parts/${encodeURIComponent(matches[0].id)}`);
-      row.part = p.number; row.part_type = p.part_type; row.available = p.revision_views;
-      const rev = p.revision_views.at(-1);
-      row.revision = rev?.id || '';
-      row.action = rev?.editable && !rev.locked_by ? 'replace' : p.revision_views.some(r => r.editable) ? 'reuse' : 'revise';
-    }
+    row.external_ref = NativeImport.externalRef(namespace, row.id);
   }
-  nativeWizard.rows = plan.rows;
-  $('ni-file-summary').textContent = `${files.length} file(s), ${plan.rows.length} distinct parts and assemblies, ${plan.rows.reduce((n,r) => n + Object.keys(r.dependencies).length, 0)} component links.`;
+  await NativeImport.propose(plan.rows, api);
+  nativeWizard.rows = plan.rows; nativeWizard.plan = plan;
+  const unchanged = plan.rows.filter(r => r.unchanged).length;
+  $('ni-file-summary').textContent = `${documents.length} file(s), ${plan.rows.length} distinct parts and assemblies, ${plan.rows.reduce((n,r) => n + Object.keys(r.dependencies).length, 0)} component links${unchanged ? `, ${unchanged} unchanged since the last import` : ''}.`;
+  niRenderPlan(plan);
   niRenderRows();
 }
+function niRenderPlan(plan) {
+  const branch = (node, trail) => {
+    const here = trail ? `${trail}/${node.name}` : node.name;
+    const label = trail ? `${node.name} ×${node.quantity}` : node.name;
+    return `<li data-tree-node="${escape(trail ? `${here} ×${node.quantity}` : here)}">${escape(label)}${node.existing ? ' <small>existing PLM revision</small>' : ''}${node.children.length ? `<ul>${node.children.map(c => branch(c, here)).join('')}</ul>` : ''}</li>`;
+  };
+  $('ni-tree').innerHTML = plan.tree.map(node => branch(node, '')).join('');
+  $('ni-conflicts').hidden = !plan.conflicts.length;
+  $('ni-conflict-rows').innerHTML = plan.conflicts.map(c => `<li data-conflict="${escape(c.id)}">${escape(c.message)} <label class="inline">Use <select data-conflict-choice aria-label="Copy of ${escape(c.name)} to import">${c.options.map(o => `<option value="${escape(o.value)}" ${o.value === c.choice ? 'selected' : ''}>${escape(o.label)}</option>`).join('')}</select></label></li>`).join('');
+}
+$('ni-conflict-rows').addEventListener('change', event => {
+  const item = event.target.closest('[data-conflict]');
+  if (!item || nativeWizard.running || nativeWizard.busy) return;
+  nativeWizard.choices[item.dataset.conflict] = event.target.value;
+  niAct(niPlan);
+});
+$('ni-namespace').addEventListener('change', () => {
+  if (nativeWizard.documents?.length && !nativeWizard.job && $('ni-review-step').hidden) niAct(niPlan);
+});
 for (const id of ['ni-files', 'ni-folder']) $(id).addEventListener('change', event => niAct(() => niReadFiles(event.target.files)));
 $('ni-rows').addEventListener('change', event => {
   const tr = event.target.closest('[data-import-row]'), field = event.target.dataset.field;
@@ -3657,7 +4057,10 @@ $('ni-rows').addEventListener('change', event => {
   row[field] = event.target.value;
   if (field === 'part') { row.available = []; row.revision = ''; }
   if (field === 'part_type') row.number = '';
+  if (field === 'action') row.userAction = true;
   if (['action','part_type'].includes(field)) niRenderRows();
+  // What this row now places changes what its parents would write.
+  if (['action','revision','part'].includes(field)) niAct(async () => { await NativeImport.repropose(nativeWizard.rows, api, row.id); niRenderRows(); });
 });
 $('ni-rows').addEventListener('click', event => {
   if (!event.target.closest('[data-target-lookup]')) return;
@@ -3695,7 +4098,7 @@ $('ni-review').addEventListener('click', () => niAct(async () => {
   if (new Set(numbers).size !== numbers.length) throw new Error('Two new parts have the same number.');
   await api('POST', '/api/import/validate', nativeWizard.rows.filter(r => r.action === 'create').map(r => ({part_type: r.part_type, number: r.number})));
   await NativeImport.inspect(nativeWizard.rows, api);
-  $('ni-review-rows').innerHTML = nativeWizard.rows.map(row => `<tr><td>${escape(row.name)}<br><small>${escape(row.id)}</small></td><td>${escape({create:'Create part',revise:'Create new revision',replace:'REPLACE draft document and BOM',reuse:'Reuse without changes'}[row.action])}</td><td>${escape(row.reviewed?.number || row.number || niNumbering(row))}</td><td>${escape(row.action === 'create' ? 'First revision' : row.action === 'revise' ? 'New revision' : row.reviewed.label)}</td></tr>`).join('');
+  $('ni-review-rows').innerHTML = nativeWizard.rows.map(row => `<tr><td>${escape(row.name)}<br><small>${escape(row.id)}</small></td><td>${escape({create:'Create part',revise:'Create new revision',replace:'REPLACE draft document and BOM',reuse:'Reuse without changes'}[row.action])}${row.unchanged ? ' (unchanged)' : ''}${row.note ? `<br><small>${escape(row.note)}</small>` : ''}</td><td>${escape(row.reviewed?.number || row.number || niNumbering(row))}</td><td>${escape(row.action === 'create' ? 'First revision' : row.action === 'revise' ? 'New revision' : row.reviewed.label)}</td></tr>`).join('');
   $('ni-review-summary').textContent = `${nativeWizard.rows.length} items: ${nativeWizard.rows.filter(r=>r.action==='create').length} new parts, ${nativeWizard.rows.filter(r=>r.action==='revise').length} new revisions, ${nativeWizard.rows.filter(r=>r.action==='replace').length} draft replacements, ${nativeWizard.rows.filter(r=>r.action==='reuse').length} reused revisions.`;
   $('ni-review-step').hidden = false; $('ni-files-step').disabled = true; $('ni-mapping-fields').disabled = true;
   $('ni-confirm').checked = false; $('ni-run').disabled = true;
@@ -3742,7 +4145,8 @@ $('ni-reset').addEventListener('click', () => niAct(async () => {
   await importStorage('delete'); nativeWizard.job = null; nativeWizard.rows = [];
   for (const id of ['ni-results','ni-mapping-step','ni-review-step']) $(id).hidden = true;
   $('ni-files-step').disabled = false; $('ni-mapping-fields').disabled = false;
-  $('ni-rows').replaceChildren();
+  $('ni-rows').replaceChildren(); $('ni-tree').replaceChildren(); $('ni-conflict-rows').replaceChildren(); $('ni-conflicts').hidden = true;
+  nativeWizard.documents = null; nativeWizard.choices = {};
   $('ni-files').value = ''; $('ni-folder').value = ''; $('ni-file-summary').textContent = 'No files selected.'; $('ni-status').textContent = '';
 }));
 window.addEventListener('beforeunload', event => { if (nativeWizard.running) { event.preventDefault(); event.returnValue = ''; } });
@@ -3980,8 +4384,12 @@ async function loadRevisionFields(detail=currentPart){
 }
 $('revision-field-revision').addEventListener('change',()=>act(()=>loadRevisionFields()));
 const bomAttributeView={show:false};
-async function drawConfiguredBom(bom,serial,background=false){
-  await drawBomAttributes({background,bom,head:$('bom-head'),rows:$('bom-rows'),selection:$('bom-layout'),editButton:$('bom-edit-attributes'),status:$('bom-edit-status'),treeControls:$('bom-tree-controls'),view:bomAttributeView,reload:loadBom,isCurrent:()=>serial===bomReadSerial});
+// An indented BOM with more lines than this opens collapsed to its first level.
+const BOM_COLLAPSED_OVER=1000;
+// ... and draws this many of its rows until Show all.
+const BOM_SHOWN_FIRST=500;
+async function drawConfiguredBom(bom,serial,background=false,tag=''){
+  await drawBomAttributes({background,bom,tag,head:$('bom-head'),rows:$('bom-rows'),selection:$('bom-layout'),editButton:$('bom-edit-attributes'),status:$('bom-edit-status'),treeControls:$('bom-tree-controls'),view:bomAttributeView,reload:loadBom,isCurrent:()=>serial===bomReadSerial});
 }
 // Every PLM BOM uses this editor, including Home, Parts and review detail panes.
 // Edits whose PATCH is still in flight (every pane). The 5 s metadata poll
@@ -3990,9 +4398,15 @@ async function drawConfiguredBom(bom,serial,background=false){
 // than the poll interval never wrote 'Attributes saved.' (the server had the
 // value; the user only saw the hint).
 let bomEditsInFlight=0;
-async function drawBomAttributes({bom,head,rows,selection,editButton,status,treeControls,view,reload,isCurrent,background=false}){
+async function drawBomAttributes({bom,tag='',head,rows,selection,editButton,status,treeControls,view,reload,isCurrent,background=false}){
   const config=await api('GET','/api/bom/configuration');
   if(!isCurrent())return;
+  // The 5 s poll redraws only what moved: repainting an unchanged 4,000-line
+  // BOM froze the page for half a second every poll.
+  // With the server's ETag the BOM is named by it: no stringify of megabytes.
+  const drawn=JSON.stringify([tag?`${bom.part_id}/${bom.revision_id} ${tag}`:bom,config,view.show,me.can_author]);
+  if(background&&view.drawn===drawn&&rows.isConnected)return;
+  view.drawn=drawn;
   selection.innerHTML='<option value="">Default</option>'+config.layouts.map(l=>`<option value="${escape(l.id)}">${escape(l.name)} (${l.owner?'Personal':'Shared'})</option>`).join('');
   selection.value=config.selected||'';
   selection.onchange=()=>act(async()=>{await api('PUT','/api/bom/selection',{id:selection.value});view.show=false;await reload();});
@@ -4014,11 +4428,29 @@ async function drawBomAttributes({bom,head,rows,selection,editButton,status,tree
     if(!siblings.has(parent))siblings.set(parent,[]);siblings.get(parent).push(line.position);
   }
   for(const children of siblings.values())lastSibling.add(children.at(-1));
+  // A large indented BOM opens on its first level: drawing all of a 4,000-line
+  // tree took the browser over 3 s of layout. Expand all still draws every line.
+  if(!bom.flat&&view.collapseFor!==treeKey){
+    view.collapseFor=treeKey;
+    view.autoCollapsed=bom.lines.length>BOM_COLLAPSED_OVER;
+    if(view.autoCollapsed)view.collapsed=new Set(branches);
+  }
+  // And whatever it shows, a BOM over that size draws its first rows only
+  // (a single level of 2,000 has nothing to collapse): Show all, or Expand
+  // all, draws the rest. The poll's repaints keep the choice.
+  if(view.capFor!==treeKey){view.capFor=treeKey;view.showAll=bom.lines.length<=BOM_COLLAPSED_OVER;}
   rows.closest('table').setAttribute('role',bom.flat?'table':'treegrid');
   treeControls.hidden=bom.flat;
   const maxDepth=bom.lines.reduce((depth,line)=>Math.max(depth,line.level),1);
   treeControls.innerHTML=`<button type="button" class="ghost" data-bom-expand-all>Expand all</button><button type="button" class="ghost" data-bom-collapse-all>Collapse all</button><label class="inline-select">Depth <select data-bom-expand-depth>${Array.from({length:maxDepth},(_,i)=>`<option value="${i+1}" ${Number(view.expandDepth||1)===i+1?'selected':''}>${i+1}</option>`).join('')}</select></label><button type="button" class="ghost" data-bom-expand-to>Expand to depth</button>`;
-  treeControls.querySelector('[data-bom-expand-all]').onclick=()=>{view.collapsed.clear();paint();};
+  // The note and Show all sit beside the tree controls, not in them: the flat
+  // view hides the tree controls and is capped too.
+  let limit=treeControls.nextElementSibling;
+  if(!limit?.matches('[data-bom-limit]')){limit=document.createElement('div');limit.className='toolbar bom-limit';limit.dataset.bomLimit='';treeControls.after(limit);}
+  const lines=bom.lines.length.toLocaleString();
+  limit.innerHTML=`<span class="muted" data-bom-collapsed-note hidden>Opened collapsed to the first level: this BOM has ${lines} lines, and drawing them all is slow. Expand all shows every line.</span><span class="muted" data-bom-capped-note hidden></span><button type="button" class="ghost" data-bom-show-all hidden></button>`;
+  limit.querySelector('[data-bom-show-all]').onclick=()=>{view.showAll=true;paint();};
+  treeControls.querySelector('[data-bom-expand-all]').onclick=()=>{view.collapsed.clear();view.showAll=true;paint();};
   treeControls.querySelector('[data-bom-collapse-all]').onclick=()=>{view.collapsed=new Set(branches);paint();};
   treeControls.querySelector('[data-bom-expand-depth]').onchange=event=>{view.expandDepth=Number(event.target.value);};
   treeControls.querySelector('[data-bom-expand-to]').onclick=()=>{
@@ -4035,9 +4467,20 @@ async function drawBomAttributes({bom,head,rows,selection,editButton,status,tree
   head.innerHTML=`<tr>${hasWarnings?'<th class="bom-warning-column" aria-label="Warnings"></th>':''}${bom.flat?'':'<th>Part</th>'}${fields.map(f=>`<th>${escape(f.name)}${f.unit?` (${escape(f.unit)})`:''}</th>`).join('')}</tr>`;
   const valueOf=(line,f)=>f.scope==='part'?(f.part_type===line.part_type?line.part_values[f.key]:null):f.scope==='occurrence'?(f.id.startsWith('builtin.')?line[f.key]:line.occurrence_attributes[f.key]):line[f.key];
   function paint(){
+  // `i` stays the index into bom.lines: a row left out by the collapse or the
+  // cap is an empty string, as a collapsed one always was.
+  let shown=0,visible=0;
+  const hidden=line=>!bom.flat&&line.position.split('.').slice(0,-1).some((_,j,parts)=>view.collapsed.has(line.position.split('.').slice(0,j+1).join('.')));
+  for(const line of bom.lines)if(!hidden(line))visible++;
+  const capped=!view.showAll&&visible>BOM_SHOWN_FIRST;
+  limit.querySelector('[data-bom-collapsed-note]').hidden=bom.flat||!(view.autoCollapsed&&view.collapsed.size>0);
+  limit.querySelector('[data-bom-capped-note]').hidden=!capped;
+  limit.querySelector('[data-bom-capped-note]').textContent=capped?`Showing the first ${BOM_SHOWN_FIRST.toLocaleString()} of ${visible.toLocaleString()} rows: this BOM has ${lines} lines, and drawing them all is slow.`:'';
+  limit.querySelector('[data-bom-show-all]').hidden=!capped;
+  limit.querySelector('[data-bom-show-all]').textContent=`Show all ${visible.toLocaleString()} rows`;
   rows.innerHTML=bom.lines.map((line,i)=>{
-    const ancestors=line.position.split('.').slice(0,-1).map((_,j)=>line.position.split('.').slice(0,j+1).join('.'));
-    if(!bom.flat&&ancestors.some(parent=>view.collapsed.has(parent)))return '';
+    if(hidden(line))return '';
+    if(capped&&++shown>BOM_SHOWN_FIRST)return '';
     return `<tr data-bom-position="${escape(line.position)}" ${bom.flat?'':`aria-level="${line.level}" ${branches.has(line.position)?`aria-expanded="${!view.collapsed.has(line.position)}"`:''}`}>${hasWarnings?`<td class="bom-warning-column">${line.warnings?.length?`<button type="button" class="bom-warning-icon" data-bom-warning="${i}" title="${escape(line.warnings.join('\n'))}" aria-label="Warnings for ${escape(line.number)} rev ${escape(line.revision_label)}">⚠</button>`:''}</td>`:''}${bom.flat?'':treeCell(line)}${fields.map(f=>{
     const value=valueOf(line,f),applicable=f.edit?.resource==='part'||(f.scope==='part'?f.part_type===line.part_type:line.occurrence_ids.length>0);
     if(f.editable&&applicable&&me.can_author)return `<td>${fieldValueEditor(f,value,false,`data-bom-row="${i}" data-bom-field="${escape(f.id)}"`)}</td>`;

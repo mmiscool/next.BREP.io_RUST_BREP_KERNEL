@@ -472,10 +472,15 @@ fn info_tab(ui: &mut egui::Ui, state: &mut EngineState, name: &str) {
                     grid_row(ui, "Surface type", getstr(&info, "surfaceType"));
                     grid_row(ui, "Area (mm\u{00b2})", num(getf(&info, "area")));
                     grid_row(ui, "Edge length total (mm)", num(getf(&info, "edgeLengthTotal")));
+                    dimension_rows(ui, &info);
                 }
                 "edge" => {
                     grid_row(ui, "Solid", getstr(&info, "solid"));
                     grid_row(ui, "Length (mm)", num(getf(&info, "length")));
+                    if info.get("curveType").is_some() {
+                        grid_row(ui, "Curve type", getstr(&info, "curveType"));
+                    }
+                    dimension_rows(ui, &info);
                 }
                 _ => {}
             }
@@ -483,6 +488,25 @@ fn info_tab(ui: &mut egui::Ui, state: &mut EngineState, name: &str) {
 
     ui.add_space(6.0);
     ui.weak("Read-only. Set `density` on the Metadata tab to drive a solid's weight.");
+}
+
+/// The carrier's dimensions the measurement carried, each row only when its
+/// key is present: a cylinder's or circular edge's radius and diameter, a
+/// cone's half-angle, a sphere's radius, a torus's two radii, an arc's sweep.
+fn dimension_rows(ui: &mut egui::Ui, info: &Value) {
+    const ROWS: [(&str, &str); 6] = [
+        ("radius", "Radius (mm)"),
+        ("diameter", "Diameter (mm)"),
+        ("halfAngleDeg", "Half-angle (\u{00b0})"),
+        ("majorRadius", "Major radius (mm)"),
+        ("minorRadius", "Minor radius (mm)"),
+        ("sweepDeg", "Sweep (\u{00b0})"),
+    ];
+    for (key, label) in ROWS {
+        if let Some(value) = info.get(key).and_then(Value::as_f64) {
+            grid_row(ui, label, num(value));
+        }
+    }
 }
 
 /// The `creatingFeature` provenance as `id (type)`, or `—` when the object has no

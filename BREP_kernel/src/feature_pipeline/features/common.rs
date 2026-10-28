@@ -749,6 +749,11 @@ fn sample_edge_midpoint(solid: &BrepSolid, edge_id: u64) -> Result<Vec3, String>
 
 /// Boundary edge ids of a face (its loops' coedges), deduped, skipping DEGENERATE
 /// (pole) edges — "fillet a face" means "fillet all its real shared edges".
+///
+/// The SEAM of a cylindrical or conical face (an edge both of whose coedges lie
+/// on that face) is skipped too: the surface runs on smoothly across it, so
+/// there is no corner to blend, and picking the side of a cylinder means its
+/// rims. Only the face expansion skips it; a seam picked as an edge is kept.
 fn face_boundary_edges(solid: &BrepSolid, face_id: u64) -> Result<Vec<u64>, String> {
     let face = solid
         .shells
@@ -756,10 +761,26 @@ fn face_boundary_edges(solid: &BrepSolid, face_id: u64) -> Result<Vec<u64>, Stri
         .flat_map(|shell| &shell.faces)
         .find(|face| face.id == face_id)
         .ok_or_else(|| format!("dressup: face {face_id} not found on target solid"))?;
+    let ruled_revolution = matches!(
+        face.surface.analytic(),
+        Some(crate::AnalyticSurface::RuledRevolution { .. })
+    );
+    let mut seams = FxHashSet::default();
+    if ruled_revolution {
+        let mut uses = FxHashSet::default();
+        for coedge in face.loops.iter().flat_map(|loop_record| &loop_record.coedges) {
+            if !uses.insert(coedge.edge_id) {
+                seams.insert(coedge.edge_id);
+            }
+        }
+    }
     let mut ids = Vec::new();
     let mut seen = FxHashSet::default();
     for loop_record in &face.loops {
         for coedge in &loop_record.coedges {
+            if seams.contains(&coedge.edge_id) {
+                continue;
+            }
             let degenerate = solid
                 .edges
                 .iter()
@@ -897,8 +918,13 @@ pub fn resolve_blend_selection(ctx: &FeatureContext) -> Result<BlendSelection, S
 /// kernel blends such a chain whole. So a walk starts only from a selected
 /// end where the continuation's mates are not both on the selected edge's
 /// own carriers: an end at a mere split of the same two surfaces caps
-/// cleanly and is left as selected. The fillet feature reads this only after
-/// the plain selection has refused, as a one-time fallback.
+/// cleanly and is left as selected — unless nothing else meets that vertex.
+/// There the two edges are one curve the boolean split (report 93aa19e7,
+/// 2026-10-25: a sculpted cap's rim in pieces 0.27 and 22.85 long, the user
+/// picking the short one), both mates' next boundary edge is the same edge,
+/// and no cap can be built (`shared_end_boundary`); the chain is walked on.
+/// The fillet feature reads this only after the plain selection has refused,
+/// as a one-time fallback.
 pub fn open_tangent_chain_extension(solid: &BrepSolid, selected: &[u64]) -> Result<Vec<(u64, Vec3, String)>, String> {
     let tangent_at = |edge: &crate::topology::EdgeRecord, vertex: u64| -> Result<Vec3, String> {
         // The tangent pointing AWAY from `vertex`, into the edge.
@@ -921,6 +947,21 @@ pub fn open_tangent_chain_extension(solid: &BrepSolid, selected: &[u64]) -> Resu
         !carriers(to)
             .iter()
             .all(|next| own.iter().any(|surface| crate::face_merge::same_surface(surface, next, 1e-9)))
+    };
+    // Only the chain's two edges meet `vertex` (a periodic face's seam, used
+    // twice by its one face, does not count): a split of one curve.
+    let seam = |edge_id: u64| -> bool {
+        solid.shells.iter().flat_map(|shell| &shell.faces).any(|face| {
+            face.loops.iter().flat_map(|lp| &lp.coedges).filter(|coedge| coedge.edge_id == edge_id).count() == 2
+        })
+    };
+    let mere_split = |vertex: u64| -> bool {
+        solid
+            .edges
+            .iter()
+            .filter(|edge| !edge.degenerate && (edge.start_vertex_id == vertex || edge.end_vertex_id == vertex) && !seam(edge.id))
+            .count()
+            == 2
     };
     let mut taken: FxHashSet<u64> = selected.iter().copied().collect();
     let mut added = Vec::new();
@@ -952,7 +993,7 @@ pub fn open_tangent_chain_extension(solid: &BrepSolid, selected: &[u64]) -> Resu
                     }
                 }
                 let Some(next) = next.filter(|_| count == 1) else { break };
-                if current.id == seed && !changes_carrier(seed, next.id) {
+                if current.id == seed && !changes_carrier(seed, next.id) && !mere_split(vertex) {
                     break;
                 }
                 if !taken.insert(next.id) {
@@ -2197,5 +2238,6 @@ pub(super) fn optional_boolean_schema() -> serde_json::Value {
         "hint": "Optional boolean operation with selected solids"
     })
 }
+
 
 

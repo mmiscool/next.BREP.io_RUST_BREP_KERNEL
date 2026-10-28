@@ -93,6 +93,7 @@ pub static FEATURE_APPLICABILITY: &[(&str, fn(&SelectionProbe) -> bool)] = &[
     ("SM.CF", super::features::sheet_metal_contour_flange::context_applicable),
     ("SM.F", super::features::sheet_metal_flange::context_applicable),
     ("SM.HEM", super::features::sheet_metal_hem::context_applicable),
+    ("SM.CLOSED_CORNER", super::features::sheet_metal_closed_corner::context_applicable),
     ("SM.FILLET", super::features::sheet_metal_corner::context_applicable),
     ("SM.CHAMFER", super::features::sheet_metal_corner::context_applicable),
     ("SM.CUTOUT", super::features::sheet_metal_cutout::context_applicable),
@@ -108,6 +109,7 @@ pub static FEATURE_APPLICABILITY: &[(&str, fn(&SelectionProbe) -> bool)] = &[
     ("XFORM", super::features::transform::context_applicable),
     ("PATTERN", super::features::pattern::context_applicable),
     ("ACOMP", super::features::assembly_component::context_applicable),
+    ("APAT", super::features::assembly_pattern::context_applicable),
 ];
 
 /// Run feature `type_id`'s applicability predicate. Unknown type → `false`

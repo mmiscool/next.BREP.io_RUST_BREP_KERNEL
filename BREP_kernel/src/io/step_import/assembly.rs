@@ -95,7 +95,7 @@ pub struct StepOccurrence {
     pub parent: usize,
     /// Index into [`StepAssembly::products`].
     pub child: usize,
-    /// The instance label ("bolt-3") — see [`edge_designator`] for which of a
+    /// The instance label ("bolt-3") — see `edge_designator` for which of a
     /// NAUO's several label attributes wins, and what a mapped item contributes.
     pub designator: String,
     /// child-local → parent-local, row-major affine, translations in MILLIMETRES
@@ -125,7 +125,7 @@ pub struct StepAssembly {
     /// consumer starts composing world transforms.
     pub roots: Vec<usize>,
     /// The first thing that did not come in: a body that failed to reconstruct,
-    /// or a mapping that was refused ([`StepMappedItemError`]). A refused mapping
+    /// or a mapping that was refused (`StepMappedItemError`). A refused mapping
     /// is NOT counted in any product's `failed_bodies`, which counts bodies that
     /// failed to BUILD — a placement we cannot express is a different thing, and
     /// the geometry under it built perfectly well.
@@ -159,7 +159,7 @@ pub struct StepAssembly {
 /// `Ok(None)` when the file carries no assembly structure worth using — no
 /// structure edges at all (neither NAUO nor mapped item), or none that the walk
 /// reaches a built body through. That is the same condition on which
-/// [`collect_step_solids`] abandons the assembly branch, so a caller can treat
+/// `collect_step_solids` abandons the assembly branch, so a caller can treat
 /// `None` as "fall back to the flat lane" and get exactly today's behaviour.
 ///
 /// `Err` only for a file that is not Part 21 or does not parse — a broken

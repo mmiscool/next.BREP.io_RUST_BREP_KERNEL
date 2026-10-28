@@ -624,6 +624,65 @@ pub fn append_plain_leader(
     *colors = tb.colors;
 }
 
+/// The free-motion glyph at a selected assembly component (what its mates
+/// leave it): a double-headed arrow through `center` per free slide, and per
+/// free rotation a rod along the axis line (through its point nearest
+/// `center`) with a curled arrow turning about it. Screen-constant sizes,
+/// world-space triangles in the overlay `tris` shape.
+pub fn freedom_glyph_buffers(
+    center: [f64; 3],
+    slides: &[[f64; 3]],
+    axes: &[([f64; 3], [f64; 3])],
+    world_per_pixel: f64,
+) -> (Vec<f32>, Vec<f32>) {
+    let mut tb = TriBuf::default();
+    let rod = SHAFT_RAD_PX * world_per_pixel;
+    let cone_len = CONE_LEN_PX * world_per_pixel;
+    let cone_rad = CONE_RAD_PX * world_per_pixel;
+    let half = GLYPH_SLIDE_HALF_PX * world_per_pixel;
+    for slide in slides {
+        let d = normalize_or(*slide, [1.0, 0.0, 0.0]);
+        let tip = |k: f64| [center[0] + d[0] * k, center[1] + d[1] * k, center[2] + d[2] * k];
+        push_tube(&mut tb, tip(-(half - cone_len)), tip(half - cone_len), rod, SLIDE_RGB);
+        push_cone(&mut tb, tip(half - cone_len), tip(half), cone_rad, SLIDE_RGB);
+        push_cone(&mut tb, tip(-(half - cone_len)), tip(-half), cone_rad, SLIDE_RGB);
+    }
+    for (point, direction) in axes {
+        let d = normalize_or(*direction, [0.0, 0.0, 1.0]);
+        // The axis line where it passes the component.
+        let foot = closest_point_on_line(center, *point, d);
+        let along = |k: f64| [foot[0] + d[0] * k, foot[1] + d[1] * k, foot[2] + d[2] * k];
+        let reach = GLYPH_AXIS_HALF_PX * world_per_pixel;
+        push_tube(&mut tb, along(-reach), along(reach), ANGLE_RAY_RAD_PX * world_per_pixel, TURN_RGB);
+        // A 270° curl about the axis, ending in an arrowhead.
+        let (u, v) = axis_basis(d);
+        let radius = GLYPH_CURL_RAD_PX * world_per_pixel;
+        let at = |angle: f64| {
+            let (c, s) = (angle.cos() * radius, angle.sin() * radius);
+            [foot[0] + u[0] * c + v[0] * s, foot[1] + u[1] * c + v[1] * s, foot[2] + u[2] * c + v[2] * s]
+        };
+        let sweep = 1.5 * std::f64::consts::PI;
+        let steps = 18;
+        for i in 0..steps {
+            let a0 = sweep * i as f64 / steps as f64;
+            let a1 = sweep * (i + 1) as f64 / steps as f64;
+            push_tube(&mut tb, at(a0), at(a1), rod, TURN_RGB);
+        }
+        let end = at(sweep);
+        let tangent = normalize_or(sub3(at(sweep), at(sweep - 0.05)), u);
+        let head = [end[0] + tangent[0] * cone_len, end[1] + tangent[1] * cone_len, end[2] + tangent[2] * cone_len];
+        push_cone(&mut tb, end, head, cone_rad, TURN_RGB);
+    }
+    (tb.positions, tb.colors)
+}
+
+/// Free-motion glyph colors and sizes (screen px).
+const SLIDE_RGB: [f32; 3] = [0.255, 0.624, 0.949];
+const TURN_RGB: [f32; 3] = [0.804, 0.380, 0.886];
+const GLYPH_SLIDE_HALF_PX: f64 = 48.0;
+const GLYPH_AXIS_HALF_PX: f64 = 60.0;
+const GLYPH_CURL_RAD_PX: f64 = 20.0;
+
 /// A flat triangle-soup accumulator (positions + per-vertex rgb colors).
 #[derive(Default)]
 struct TriBuf {

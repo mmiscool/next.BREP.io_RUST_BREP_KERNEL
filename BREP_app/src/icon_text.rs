@@ -82,7 +82,7 @@ pub fn image(icon: &'static icons::Icon, height: f32) -> egui::Image<'static> {
 ///
 /// ```ignore
 /// let button = icon_text::icon_button(ui, "✎").small();
-/// if ui.add(button).clicked() { … }
+/// if ui.add(button).clicked() { /* handle the click */ }
 /// ```
 pub fn icon_button<'a>(ui: &egui::Ui, label: &'a str) -> egui::Button<'a> {
     icon_button_colored(ui, label, None)

@@ -121,7 +121,7 @@ fn workbench_button(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
     // not allow yet): that is refused with the reason, never run as a silent
     // no-op. A MENU button is not pressed itself — its entries are. The gate
     // is `workbench::press_refusal`, where it is tested against each kind.
-    let doc = ctx.app.docs.active();
+    let doc = ctx.app.docs.view();
     let state = crate::workbench::ButtonState { engine: &doc.engine, ecad: Some(&doc.ecad) };
     if let Some(refusal) = crate::workbench::press_refusal(&a.id, &state) {
         return Err(refusal);
@@ -135,7 +135,7 @@ fn workbench_button(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
 fn describe_workbenches(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
     let _: NoArgs = parse_args(args)?;
     let active = ctx.app.docs.engine().settings.workbench.clone();
-    let doc = ctx.app.docs.active();
+    let doc = ctx.app.docs.view();
     let state = crate::workbench::ButtonState { engine: &doc.engine, ecad: Some(&doc.ecad) };
     let offered: Vec<&crate::workbench::WorkbenchButton> = crate::workbench::offered_buttons(&active, &state)
         .into_iter()
@@ -199,7 +199,8 @@ fn show_pane(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
     // back to a visible one. So say so instead of reporting success for nothing.
     let workbench = ctx.app.docs.engine().settings.workbench.clone();
     let panels = crate::workbench::ButtonState::of(ctx.app.docs.engine());
-    if !kind.visible_under_workbench(&workbench, &panels) {
+    let forced = kind == crate::panels::dock::PaneKind::Bom && ctx.app.docs.work_part_in_place();
+    if !forced && !kind.visible_under_workbench(&workbench, &panels) {
         // Two ways to be hidden, and they want different answers: a CLAIMED
         // pane needs another workbench, a CONDITIONAL one needs a different
         // document. Telling a caller to switch workbench for the Qualify pane

@@ -21,7 +21,7 @@ pub static HIT_KEYS: &[HitKeyDoc] = &[
     HitKeyDoc { panel: "javascript", prefix: "cancel", meaning: "cancel the running script", command: None },
     HitKeyDoc { panel: "javascript", prefix: "save", meaning: "save the source as the local draft", command: None },
     HitKeyDoc { panel: "javascript", prefix: "open", meaning: "open a .js file into the editor (native; file-interchange stores only)", command: None },
-    HitKeyDoc { panel: "javascript", prefix: "export", meaning: "export the source as script.js (native; file-interchange stores only)", command: None },
+    HitKeyDoc { panel: "javascript", prefix: "export", meaning: "export the source as script.js through the file dialog's export door: the Save-file chooser on desktop, a download in the browser", command: None },
     HitKeyDoc { panel: "javascript", prefix: "help", meaning: "the CAD API and examples collapsing header", command: None },
     HitKeyDoc { panel: "javascript", prefix: "example", meaning: "load the box example into the editor (inside `help`)", command: None },
     HitKeyDoc { panel: "javascript", prefix: "source", meaning: "the source editor's scroll region (the free space of the window: it grows with the window)", command: None },
@@ -48,6 +48,9 @@ pub struct JavaScriptEditor {
     rect: Option<egui::Rect>,
     /// The surface the window may fill (`ctx.content_rect()`), for the host.
     surface: egui::Rect,
+    /// "Export .js…" asked: the shell hands these to the file dialog's export
+    /// door ([`Self::take_save_requests`]), which on desktop asks where.
+    exports: Vec<crate::panels::file::SaveRequest>,
 }
 
 
@@ -70,6 +73,7 @@ impl JavaScriptEditor {
             pending: None,
             importing: false,
             hits: HashMap::new(),
+            exports: Vec::new(),
             rect: None,
             surface: egui::Rect::NOTHING,
         }
@@ -141,6 +145,12 @@ impl JavaScriptEditor {
         }
     }
 
+    /// The files "Export .js…" asked to save, once: the shell hands them to
+    /// [`crate::panels::file::FileDialog::request_save_file`].
+    pub fn take_save_requests(&mut self) -> Vec<crate::panels::file::SaveRequest> {
+        std::mem::take(&mut self.exports)
+    }
+
     pub fn show(&mut self, ctx: &egui::Context, docs: &mut Documents, store: &dyn ModelStore) {
         self.hits.clear();
         self.rect = None;
@@ -184,6 +194,11 @@ impl JavaScriptEditor {
                         Ok(()) => "Draft saved.".into(), Err(e) => format!("Cannot save draft: {e}"),
                     };
                 }
+                // Open .js… drives the browser's file input, so only where
+                // there is one. Export leaves through the file dialog's export
+                // door on every platform (the Save-file chooser on desktop),
+                // so it is always offered: gated with Open, desktop had no
+                // way to export a script at all.
                 if store.supports_file_interchange() {
                     let open = ui.add_enabled(!self.importing, egui::Button::new("Open .js…"));
                     self.hit("open", &open);
@@ -192,11 +207,11 @@ impl JavaScriptEditor {
                             Ok(()) => self.importing = true, Err(e) => self.output = e,
                         }
                     }
-                    let export = ui.button("Export .js…");
-                    self.hit("export", &export);
-                    if export.clicked() {
-                        if let Err(e) = store.export_file_named("script.js", &self.source) { self.output = e; }
-                    }
+                }
+                let export = ui.button("Export .js…");
+                self.hit("export", &export);
+                if export.clicked() {
+                    self.exports.push(crate::panels::file::SaveRequest::text("Export the script", "script.js", self.source.clone()));
                 }
             });
             let help = ui.collapsing("CAD API and examples", |ui| {

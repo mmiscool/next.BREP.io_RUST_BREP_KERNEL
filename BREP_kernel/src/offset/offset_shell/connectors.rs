@@ -738,7 +738,10 @@ pub(super) fn complete_opening_boundary_cycles(
                 local.remove(&current.edge.id);
                 false
             }
-            let mut local = HashSet::default();
+            // A boundary use can close only one missing face. Previously a
+            // later seed could traverse an earlier cycle's edges again,
+            // generating overlapping completion faces and three-use edges.
+            let mut local = traced.clone();
             let mut path = Vec::new();
             if search_cycle(
                 &on_carrier,

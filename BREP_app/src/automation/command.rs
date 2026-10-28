@@ -156,9 +156,18 @@ pub fn registry() -> Vec<&'static CommandSpec> {
         cmd_pmi::COMMANDS,
         cmd_sheets::COMMANDS,
         cmd_wire_harness::COMMANDS,
+        cmd_cam::COMMANDS,
+        cmd_exploded::COMMANDS,
+        cmd_instructions::COMMANDS,
+        cmd_instructions_motion::COMMANDS,
+        cmd_simulation::COMMANDS,
+        cmd_simulation_play::COMMANDS,
+        cmd_cam_sim::COMMANDS,
         cmd_ecad::COMMANDS,
         #[cfg(not(target_arch = "wasm32"))]
         cmd_plm::COMMANDS,
+        #[cfg(not(target_arch = "wasm32"))]
+        cmd_kicad::COMMANDS,
     ];
     sets.iter().flat_map(|s| s.iter()).collect()
 }

@@ -36,7 +36,7 @@
 //!
 //! # The tail
 //!
-//! [`finish_history_run`] runs after the wire-harness tail on every run and
+//! `finish_history_run` runs after the wire-harness tail on every run and
 //! resolves EVERY view's annotations (a few name lookups each) into a
 //! [`PmiReport`]: per annotation the status, the display text (value +
 //! tolerance block, kernel-formatted so the viewport and the STEP file agree),
@@ -49,7 +49,7 @@
 //!
 //! # Measurement contracts (kernel queries only)
 //!
-//! Every value is read from the exact BREP through [`crate::assembly_resolve`]
+//! Every value is read from the exact BREP through `crate::assembly_resolve`
 //! (planes, carrier lines, circles, axes, points) — never from tessellation.
 //! Linear: point–point, point–line (perpendicular), line–line (carrier lines:
 //! parallel spacing or closest points), point–plane, parallel plane spacing,
@@ -174,29 +174,164 @@ pub struct PmiDisplay {
     pub section: Option<PmiSection>,
 }
 
-/// A display-only half-space through the captured camera target plus an offset.
+/// A display-only half-space through `origin` plus an offset along the normal.
+///
+/// `origin` (and, for the `View` axis, `normal`) is frozen from the captured
+/// camera when the section is set, so re-capturing the camera does not move
+/// the cut. A section saved before they existed reads the camera instead.
+/// The `Plane` axis takes both from `plane`, a planar face or reference plane
+/// the run resolves each time (see [`PmiViewReport::section_plane`]).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PmiSection {
     pub axis: String,
     pub offset: f64,
     #[serde(default)]
     pub flip: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<[f64; 3]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub normal: Option<[f64; 3]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plane: Option<String>,
+    /// Solids and components the cut leaves whole (shafts, fasteners): a
+    /// solid's scene name, or a component id standing for all its solids.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exclude: Vec<String>,
+    /// Further cutting planes. Material is removed only where EVERY plane
+    /// removes it: one more plane makes a half section (a quarter cut away),
+    /// two more a corner cut away. Each is an axis through the section's
+    /// origin, offset along its normal.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub planes: Vec<PmiSectionPlane>,
+}
+
+/// One further plane of a [`PmiSection`]: `X`, `Y`, `Z` or `View` (the
+/// captured camera's direction, frozen in `normal` when set), `offset` along
+/// it from the section's origin, `flip` keeping the other side.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PmiSectionPlane {
+    pub axis: String,
+    #[serde(default)]
+    pub offset: f64,
+    #[serde(default)]
+    pub flip: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub normal: Option<[f64; 3]>,
+}
+
+impl PmiSectionPlane {
+    /// The unflipped normal: the axis's, else (`View`) the frozen one, else
+    /// the camera's view direction. `None` for an unknown axis.
+    pub fn axis_normal(&self, camera: Option<&PmiCamera>) -> Option<[f64; 3]> {
+        match self.axis.as_str() {
+            "X" => Some([1., 0., 0.]),
+            "Y" => Some([0., 1., 0.]),
+            "Z" => Some([0., 0., 1.]),
+            "View" => self.normal.or_else(|| camera.map(PmiCamera::view_direction)),
+            _ => None,
+        }
+    }
+}
+impl PmiSection {
+    /// Whether the solid named `solid` is left uncut: it is listed, or it
+    /// belongs to a listed component (`ACOMP1` covers `ACOMP1:Part` and a
+    /// nested `ACOMP1:ACOMP2:Part`).
+    pub fn excludes(&self, solid: &str) -> bool {
+        self.exclude.iter().any(|entry| {
+            let entry = entry.trim();
+            !entry.is_empty() && (solid == entry || solid.strip_prefix(entry).is_some_and(|rest| rest.starts_with(':')))
+        })
+    }
+
+    /// The unflipped normal: the axis's, else (`View`) the frozen one, else
+    /// the camera's view direction.
+    pub fn axis_normal(&self, camera: Option<&PmiCamera>) -> Option<[f64; 3]> {
+        match self.axis.as_str() {
+            "X" => Some([1., 0., 0.]),
+            "Y" => Some([0., 1., 0.]),
+            "Z" => Some([0., 0., 1.]),
+            "Plane" => self.normal,
+            _ => self.normal.or_else(|| camera.map(PmiCamera::view_direction)),
+        }
+    }
+
+    /// Fill a missing `origin` / `View` normal from `camera`, so the plane
+    /// stops depending on it.
+    pub fn freeze(&mut self, camera: Option<&PmiCamera>) {
+        if self.axis == "Plane" {
+            // Resolved from `plane` on every run, never from the camera.
+            self.origin = None;
+            self.normal = None;
+            return;
+        }
+        self.plane = None;
+        let Some(camera) = camera else { return };
+        for plane in &mut self.planes {
+            if plane.axis == "View" {
+                plane.normal.get_or_insert(camera.view_direction());
+            } else {
+                plane.normal = None;
+            }
+        }
+        self.origin.get_or_insert(camera.target);
+        if self.axis == "View" {
+            self.normal.get_or_insert(camera.view_direction());
+        } else {
+            self.normal = None;
+        }
+    }
 }
 impl PmiView {
     pub fn section_plane(&self) -> Option<([f64; 3], [f64; 3])> {
         let section = self.display.section.as_ref()?;
-        let camera = self.camera.as_ref()?;
-        let mut normal = match section.axis.as_str() {
-            "X" => [1., 0., 0.],
-            "Y" => [0., 1., 0.],
-            "Z" => [0., 0., 1.],
-            _ => camera.view_direction(),
-        };
-        let point = std::array::from_fn(|i| camera.target[i] + normal[i] * section.offset);
+        let camera = self.camera.as_ref();
+        let mut normal = section.axis_normal(camera)?;
+        let origin = section.origin.or_else(|| camera.filter(|_| section.axis != "Plane").map(|c| c.target))?;
+        let point = std::array::from_fn(|i| origin[i] + normal[i] * section.offset);
         if section.flip {
             normal = normal.map(|v| -v);
         }
         Some((point, normal))
+    }
+
+    /// [`Self::section_plane`], taking a `Plane` section's plane from the
+    /// view's last report (the document stores only the reference's name).
+    pub fn section_plane_in(&self, report: Option<&PmiViewReport>) -> Option<([f64; 3], [f64; 3])> {
+        match self.display.section.as_ref() {
+            Some(section) if section.axis == "Plane" => report.and_then(|report| report.section_plane),
+            _ => self.section_plane(),
+        }
+    }
+
+    /// Every cutting plane of the view's section, `(point, kept-side
+    /// normal)`, the first being [`Self::section_plane_in`]'s: empty without
+    /// a section (or when its first plane does not resolve). A further plane
+    /// goes through the section's origin (else the camera target, else the
+    /// first plane's point) plus its offset; an unknown axis is skipped.
+    pub fn section_planes_in(&self, report: Option<&PmiViewReport>) -> Vec<([f64; 3], [f64; 3])> {
+        self.section_plane_in(report).map_or_else(Vec::new, |first| self.with_further_planes(first))
+    }
+
+    /// [`Self::section_planes_in`] from [`Self::section_plane`] (a `Plane`
+    /// section resolved into the view itself, as the run does).
+    pub fn section_planes(&self) -> Vec<([f64; 3], [f64; 3])> {
+        self.section_plane().map_or_else(Vec::new, |first| self.with_further_planes(first))
+    }
+
+    fn with_further_planes(&self, first: ([f64; 3], [f64; 3])) -> Vec<([f64; 3], [f64; 3])> {
+        let mut planes = vec![first];
+        let Some(section) = self.display.section.as_ref() else { return planes };
+        let camera = self.camera.as_ref();
+        let origin = section.origin.or_else(|| camera.filter(|_| section.axis != "Plane").map(|c| c.target)).unwrap_or(first.0);
+        for plane in &section.planes {
+            let Some(mut normal) = plane.axis_normal(camera) else { continue };
+            let point = std::array::from_fn(|i| origin[i] + normal[i] * plane.offset);
+            if plane.flip {
+                normal = normal.map(|v| -v);
+            }
+            planes.push((point, normal));
+        }
+        planes
     }
 }
 
@@ -480,6 +615,13 @@ impl PmiReport {
 pub struct PmiViewReport {
     pub id: String,
     pub annotations: Vec<PmiAnnotationReport>,
+    /// A `Plane` section's cutting plane `(point, kept-side normal)`, resolved
+    /// from its reference by this run.
+    #[serde(default, rename = "sectionPlane", skip_serializing_if = "Option::is_none")]
+    pub section_plane: Option<([f64; 3], [f64; 3])>,
+    /// Why a `Plane` section's reference did not resolve (no cut is shown).
+    #[serde(default, rename = "sectionError", skip_serializing_if = "String::is_empty")]
+    pub section_error: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -776,6 +918,8 @@ pub struct PmiContext<'a> {
     pub scene: &'a SceneMap,
     pub request: &'a HistoryRequest,
     pub env: &'a Env,
+    /// The PMI block being resolved, its `Plane` sections already resolved.
+    pub state: &'a PmiState,
     /// The part-level datum registry (letter → annotation id).
     pub datums: BTreeMap<String, String>,
 }
@@ -815,26 +959,137 @@ pub fn resolve_state(
     for (letter, id) in state.datum_letters() {
         datums.entry(letter).or_insert(id);
     }
+    // A section on a picked plane resolves against this scene; the
+    // annotations (balloons included) then see it as a fixed plane.
+    let mut state = state.clone();
+    let mut section_errors: BTreeMap<String, String> = BTreeMap::new();
+    for view in &mut state.views {
+        if let Err(error) = resolve_section_plane(view, scene) {
+            section_errors.insert(view.id.clone(), error);
+        }
+    }
+    let state = &state;
     let context = PmiContext {
         scene,
         request,
         env,
+        state,
         datums,
     };
     PmiReport {
         views: state
             .views
             .iter()
-            .map(|view| PmiViewReport {
-                id: view.id.clone(),
-                annotations: view
-                    .annotations
-                    .iter()
-                    .map(|annotation| resolve_annotation(annotation, &context, view.camera.as_ref()))
-                    .collect(),
+            .map(|view| {
+                let section = section_half_space(view);
+                let exempt = |reference: &str| {
+                    let section = view.display.section.as_ref();
+                    section.is_some_and(|section| reference_solid(scene, reference).is_some_and(|solid| section.excludes(&solid)))
+                };
+                PmiViewReport {
+                    section_plane: view.display.section.as_ref().filter(|s| s.axis == "Plane").and_then(|_| view.section_plane()),
+                    section_error: section_errors.remove(&view.id).unwrap_or_default(),
+                    id: view.id.clone(),
+                    annotations: view
+                        .annotations
+                        .iter()
+                        .map(|annotation| {
+                            let report = resolve_annotation(annotation, &context, view.camera.as_ref());
+                            match &section {
+                                Some(section) => sectioned_away(report, section, &exempt),
+                                None => report,
+                            }
+                        })
+                        .collect(),
+                }
             })
             .collect(),
     }
+}
+
+/// Fill a `Plane` section's origin and normal from its reference: a planar
+/// face or a reference plane (datum or sketch plane) of `scene`.
+fn resolve_section_plane(view: &mut PmiView, scene: &SceneMap) -> Result<(), String> {
+    let Some(section) = view.display.section.as_mut().filter(|s| s.axis == "Plane") else {
+        return Ok(());
+    };
+    let name = section.plane.clone().unwrap_or_default();
+    if name.trim().is_empty() {
+        return Err("pick a planar face or a datum plane to cut on".into());
+    }
+    match resolve::resolve_reference(scene, &name) {
+        Ok(crate::SelectionGeometry::Plane { origin, normal }) => {
+            section.origin = Some(resolve::a3(origin));
+            section.normal = Some(resolve::a3(normal));
+            Ok(())
+        }
+        Ok(_) => Err(format!("section plane '{name}' is not planar: pick a planar face or a datum plane")),
+        Err(error) => Err(format!("section plane '{name}': {error}")),
+    }
+}
+
+/// The half-space a sectioned view keeps, for checking where its
+/// annotations land. `None` without a section, and for a view that explodes
+/// anything: its annotations measure the modeling pose while the cut is made
+/// on the exploded display, so the two cannot be compared.
+fn section_half_space(view: &PmiView) -> Option<anchor::HalfSpace> {
+    if view.annotations.iter().any(|a| a.enabled && a.kind == "explode") {
+        return None;
+    }
+    anchor::HalfSpace::of(&view.section_planes())
+}
+
+/// A resolved annotation whose measured points lie on the side the view's
+/// section removes would be drawn on nothing; it is reported as an error,
+/// its chip kept where its label is, the way a balloon on a removed part is.
+/// Balloons check their own anchors, radial and angular annotations measure
+/// through their centre or vertex (often off the part), and notes float.
+/// A point on a solid the section leaves whole (`exempt`, by reference) is
+/// drawn whatever side it is on.
+fn sectioned_away(mut report: PmiAnnotationReport, section: &anchor::HalfSpace, exempt: &dyn Fn(&str) -> bool) -> PmiAnnotationReport {
+    if report.status != PmiStatus::Ok {
+        return report;
+    }
+    let points: Vec<[f64; 3]> = match &report.geometry {
+        PmiGeometry::Linear { a, b, component: None } => vec![*a, *b],
+        // An aligned dimension's second point is the projected corner, not geometry.
+        PmiGeometry::Linear { a, component: Some(_), .. } => vec![*a],
+        PmiGeometry::Leader { targets, balloon: false, .. } => targets.clone(),
+        PmiGeometry::Hole { anchor, .. } | PmiGeometry::Datum { anchor, .. } | PmiGeometry::Fcf { anchor, .. } => vec![*anchor],
+        _ => return report,
+    };
+    // Each point's own reference where they pair one to one (a dimension's
+    // two targets, a leader's targets); otherwise all of them must be exempt.
+    let references = &report.references;
+    let point_exempt = |index: usize| match references.len() == points.len() {
+        true => exempt(&references[index]),
+        false => !references.is_empty() && references.iter().all(|reference| exempt(reference)),
+    };
+    if points.iter().enumerate().all(|(index, point)| point_exempt(index) || section.keeps(*point, 1e-6)) {
+        return report;
+    }
+    report.status = PmiStatus::Error;
+    report.message = "it is on geometry the section removes in this view: move the section, Reverse it, or re-attach the annotation".into();
+    report.text = String::new();
+    report.value = None;
+    report.geometry = PmiGeometry::None;
+    report.plane = None;
+    report
+}
+
+/// The scene name of the solid a reference lies on: a vertex ref's solid, a
+/// face's or an edge's owner, or the solid itself.
+fn reference_solid(scene: &SceneMap, reference: &str) -> Option<String> {
+    let reference = reference.trim();
+    if let Some((solid, _)) = reference.split_once('@') {
+        return Some(solid.to_string());
+    }
+    let handle = scene
+        .resolve_face(reference)
+        .map(|face| face.handle)
+        .or_else(|| scene.resolve_edge(reference).map(|edge| edge.handle))
+        .or_else(|| scene.resolve_solid(reference))?;
+    scene.solids.iter().find(|(_, h)| **h == handle).map(|(name, _)| name.clone())
 }
 
 /// Resolve one annotation through its type's resolver into a report row:

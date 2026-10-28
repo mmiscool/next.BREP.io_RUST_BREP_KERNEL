@@ -50,6 +50,11 @@ pub enum ExportFormat {
     /// Binary glTF 2.0 of the display mesh. A BINARY format, so it comes back
     /// in `base64` rather than `text`.
     Glb,
+    /// A 3MF package of the display mesh, one object per body with the
+    /// document's colours as base materials. Binary (a ZIP), so `base64`.
+    /// Named for the extension, as the import format is.
+    #[serde(rename = "3mf")]
+    ThreeMf,
     /// Sheet-metal flat pattern.
     Dxf,
     Svg,
@@ -136,7 +141,7 @@ pub struct Exported {
     pub text: String,
     /// The file's length in bytes, whichever field carries it.
     pub bytes: usize,
-    /// The file's bytes, base64, for a BINARY format (`glb`). Absent otherwise,
+    /// The file's bytes, base64, for a BINARY format (`glb`, `3mf`). Absent otherwise,
     /// which is how a caller tells the two apart without knowing the format.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub base64: Option<String>,
@@ -236,16 +241,18 @@ fn doc_load(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
     if let Some(class) = a.name.as_deref().and_then(crate::document_class::DocumentClass::of_name) {
         crate::document_class::set_document_class(&mut engine, class);
     }
+    // `Document::new` takes the clean baseline, as File > Open's does.
     let mut doc = Document::new(engine);
     doc.set_name(a.name.clone());
-    doc.mark_clean();
     let index = ctx.app.docs.open_document(doc);
     Ok(Outcome::Done(json!({ "index": index, "name": a.name, "report": parse(&report) })))
 }
 
 fn doc_json(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
     let _: NoArgs = parse_args(args)?;
-    let text = ctx.app.docs.engine().history_request_json();
+    // The TAB's document (the assembly while a Work part is edited in place;
+    // pushes are live and `wait_idle` waits for them, so it is current).
+    let text = ctx.app.docs.tab_engine().history_request_json();
     Ok(Outcome::Done(json!({ "document": parse(&text), "bytes": text.len() })))
 }
 
@@ -297,6 +304,9 @@ fn doc_export(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
     let binary: Option<(&str, Vec<u8>, Option<usize>)> = match a.format {
         ExportFormat::Glb => {
             Some(("glb", ctx.app.docs.engine().export_glb_bytes(&document_name)?, None))
+        }
+        ExportFormat::ThreeMf => {
+            Some(("3mf", ctx.app.docs.engine().export_3mf_bytes(&document_name)?, None))
         }
         ExportFormat::SheetPdf => {
             let engine = ctx.app.docs.engine_mut();
@@ -386,7 +396,7 @@ fn doc_export(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
         ExportFormat::KicadNetlist => {
             ("kicad_netlist", crate::panels::fabrication_export::text(engine, crate::panels::fabrication_export::Output::Netlist, &document_name)?)
         }
-        ExportFormat::Glb | ExportFormat::SheetPdf | ExportFormat::SheetPdf3d | ExportFormat::Fabrication => {
+        ExportFormat::Glb | ExportFormat::ThreeMf | ExportFormat::SheetPdf | ExportFormat::SheetPdf3d | ExportFormat::Fabrication => {
             unreachable!("the binary lane returned above")
         }
     };
@@ -420,6 +430,15 @@ fn doc_close(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
     }
     ctx.app.docs.close(a.index);
     serde_json::to_value(tabs(ctx)).map(Outcome::Done).map_err(|e| e.to_string())
+}
+
+/// Close the app as its window's close button does: unsaved work is written
+/// for recovery, and the close waits for the store's writes to land
+/// (`__brepClosing`; the headless host itself stays up).
+fn app_close(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
+    let _: NoArgs = parse_args(args)?;
+    ctx.app.close_asked = true;
+    Ok(Outcome::Done(json!({})))
 }
 
 fn doc_mark_clean(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
@@ -481,11 +500,12 @@ pub(crate) fn base64_decode(s: &str) -> Result<Vec<u8>, String> {
 }
 
 pub static COMMANDS: &[CommandSpec] = &[
+    CommandSpec { name: "app_close", group: "document", doc: "Close the app as its window's close button does: unsaved documents are written for recovery at once (the next start offers them), and the close waits until the store's writes (a Save just made, the recovery blob) have landed, at most 30 s. Watch `__brepClosing` {closing, closed, pending}; the headless host stays up, so follow with session_restart.", phase: Phase::Mutate, annotations: Annotations::MUTATE, args_schema: schema_of::<NoArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(app_close) },
     CommandSpec { name: "doc_new", group: "document", doc: "Open a new document as a tab and make it active. Parts start with a datum (D) and its XY/XZ/YZ reference planes.", phase: Phase::Mutate, annotations: Annotations::MUTATE, args_schema: schema_of::<NoArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(doc_new) },
     CommandSpec { name: "doc_load", group: "document", doc: "Open a `.nbrep` document (passed as text) in a new tab, run its history and fit the camera. Returns the run report.", phase: Phase::Mutate, annotations: Annotations::MUTATE, args_schema: schema_of::<LoadArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(doc_load) },
     CommandSpec { name: "doc_json", group: "document", doc: "The active document as `.nbrep` (the history request with metadata).", phase: Phase::Read, annotations: Annotations::READ, args_schema: schema_of::<NoArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(doc_json) },
     CommandSpec { name: "doc_import", group: "document", doc: "Append an Import 3D Model feature from STEP / IGES text or STL / OBJ / 3MF bytes (base64). STL, OBJ and 3MF go through mesh reconstruction on the runner; a 3MF is read to the 3MF core specification and its build instances are flattened first.", phase: Phase::Mutate, annotations: Annotations::MUTATE, args_schema: schema_of::<ImportArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(doc_import) },
-    CommandSpec { name: "doc_export", group: "document", doc: "Export the active document: brep (native JSON), step, stl, obj, iges, the sheet-metal flat pattern as dxf / svg, or the open drawing sheet as sheet_svg, all as `text`; glb (binary glTF 2.0 of the display mesh) and EVERY drawing sheet as sheet_pdf (one PDF, a page per sheet in sheet order, with the count in `pages`) and the same set with the live 3D model as sheet_pdf_3d (PDF 1.7: a 3D box over every placement marked `threeD` and a last page given over to the model, read back in `model3d`) as `base64`. The two sheet formats also answer `texts`: every text string the file shows, read back from the bytes written. For a document whose PCB board has parts: fabrication (one zip of Gerber X2 layers, Excellon drills, the pick-and-place and parts-BOM CSVs and a README) as `base64`, with its `files` read back from the archive's directory, `readBack` (top/bottom copper flashes, plated/unplated drill hits, the outline's size in mm and the CSVs' row counts, counted from the files) and `warnings`; and the CSVs alone as pick_place_csv (JLCPCB CPL columns) and ecad_bom_csv (JLCPCB BOM columns), as `text` with their data `rows`. For a document whose PCB schematic has parts: kicad_netlist, its KiCad netlist (`.net`, export version \"E\": the parts and every net with its pins, under the Connectivity panel's net names) as `text`.", phase: Phase::Read, annotations: Annotations::READ, args_schema: schema_of::<ExportArgs>, result_schema: schema_of::<Exported>, handler: Handler::App(doc_export) },
+    CommandSpec { name: "doc_export", group: "document", doc: "Export the active document: brep (native JSON), step, stl, obj, iges, the sheet-metal flat pattern as dxf / svg, or the open drawing sheet as sheet_svg, all as `text`; glb (binary glTF 2.0 of the display mesh), 3mf (a 3MF package of the display mesh: one object per body, the document's colours as base materials) and EVERY drawing sheet as sheet_pdf (one PDF, a page per sheet in sheet order, with the count in `pages`) and the same set with the live 3D model as sheet_pdf_3d (PDF 1.7: a 3D box over every placement marked `threeD` and a last page given over to the model, read back in `model3d`) as `base64`. The two sheet formats also answer `texts`: every text string the file shows, read back from the bytes written. For a document whose PCB board has parts: fabrication (one zip of Gerber X2 layers, Excellon drills, the pick-and-place and parts-BOM CSVs and a README) as `base64`, with its `files` read back from the archive's directory, `readBack` (top/bottom copper flashes, plated/unplated drill hits, the outline's size in mm and the CSVs' row counts, counted from the files) and `warnings`; and the CSVs alone as pick_place_csv (JLCPCB CPL columns) and ecad_bom_csv (JLCPCB BOM columns), as `text` with their data `rows`. For a document whose PCB schematic has parts: kicad_netlist, its KiCad netlist (`.net`, export version \"E\": the parts and every net with its pins, under the Connectivity panel's net names) as `text`.", phase: Phase::Read, annotations: Annotations::READ, args_schema: schema_of::<ExportArgs>, result_schema: schema_of::<Exported>, handler: Handler::App(doc_export) },
     CommandSpec { name: "part_attributes_get", group: "document", doc: "The active document's own BOM part attributes (`partAttributes`) — the record the toolbar's Part Properties dialog edits, and the one an assembly's BOM reads off this part.", phase: Phase::Read, annotations: Annotations::READ, args_schema: schema_of::<NoArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(part_attributes_get) },
     CommandSpec { name: "part_attribute_set", group: "document", doc: "Write ONE of the active document's own BOM part attributes (Part_Number, Material, Mass, or any custom field); a null or empty value removes it. One undo step per field.", phase: Phase::Mutate, annotations: Annotations::MUTATE, args_schema: schema_of::<PartAttributeArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(part_attribute_set) },
     CommandSpec { name: "docs_list", group: "document", doc: "The open document tabs and which is active.", phase: Phase::Read, annotations: Annotations::READ, args_schema: schema_of::<NoArgs>, result_schema: schema_of::<Tabs>, handler: Handler::App(docs_list) },

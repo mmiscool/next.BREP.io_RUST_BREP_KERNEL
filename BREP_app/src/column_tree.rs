@@ -182,6 +182,9 @@ pub struct RowNode {
     /// this document).
     pub actions: Vec<RowAction>,
     pub children: Vec<RowNode>,
+    /// Cells of an editable row that are shown read-only, by column key, with
+    /// the reason as their hover text (an edit that would be ambiguous here).
+    pub locked: HashMap<String, String>,
 }
 
 impl RowNode {
@@ -270,6 +273,11 @@ pub struct ColumnTreeSpec<'a> {
     /// Prefix for every published hit key. `""` for a consumer that shows one
     /// tree at a time.
     pub hits_prefix: &'a str,
+    /// Rows can be dragged by their band: [`ColumnTreeOut::dragging`] names
+    /// the row under the pointer's drag, for the consumer to hand to egui's
+    /// drag and drop. A click still selects. Off by default: the band then
+    /// senses clicks alone.
+    pub drag_rows: bool,
 }
 
 /// What the user did in one drawn frame.
@@ -299,6 +307,9 @@ pub struct ColumnTreeOut {
     /// The layout was changed by the user (reorder / resize / hide / sort) —
     /// the caller persists it.
     pub layout_changed: bool,
+    /// The row whose band is being dragged this frame (only with
+    /// [`ColumnTreeSpec::drag_rows`]).
+    pub dragging: Option<String>,
 }
 
 /// Draw ONE complete column tree and return what the user did.
@@ -312,6 +323,7 @@ pub struct ColumnTreeOut {
 /// | `grip:{key}` | a heading's resize divider |
 /// | `row:{row id}` | the row's click band (of the pane holding column 0) |
 /// | `box:{row id}` | the first column's collapse box |
+/// | `label:{row id}` | the first column's name, the drag handle (only with [`ColumnTreeSpec::drag_rows`]) |
 /// | `cell:{row id}:{col key}` | one cell's editor |
 /// | `menu:{row id}` | the row's action-menu trigger cell |
 /// | `menuitem:{row id}:{action id}` | one entry of the OPEN action menu |
@@ -534,6 +546,7 @@ fn draw_pane(
             expanded: true,
             actions: Vec::new(),
             children: Vec::new(),
+            locked: HashMap::new(),
         };
         draw_row(
             ui, spec, columns, widths, offset, band, &root, &[], true, true, hits, out, pending,
@@ -919,6 +932,20 @@ fn draw_row(
     pending: &mut Option<MenuOpen>,
 ) {
     let height = ui.spacing().interact_size.y;
+    // A row wholly outside the clip (scrolled past) takes its height and
+    // nothing else: every part of it below — the hover, the published rect,
+    // the menu trigger, the cells — is already skipped for a band that misses
+    // the clip, so this only drops the per-row work a 500-row tree paid on
+    // every frame for rows nobody can see. Two rows either side are still
+    // drawn: Tab moves focus to the next REGISTERED widget and scrolls it
+    // into view, so the row just past the edge must exist to be reached.
+    // Only against a real clip: an unbounded one (infinite or NaN) skips nothing.
+    let clip = ui.clip_rect();
+    let next = egui::Rect::from_min_size(ui.cursor().min, egui::vec2(band_width, height));
+    if clip.is_finite() && next.is_finite() && !next.intersects(clip.expand2(egui::vec2(0.0, 2.0 * height))) {
+        ui.allocate_space(egui::vec2(band_width, height));
+        return;
+    }
     // THE ROW BAND — the row's click target, allocated BEFORE the cells. A row
     // is picked by clicking anywhere along it, not only on the text in its
     // first column: in the shipped BOM that text was 40 pt of a 900 pt row, so
@@ -930,8 +957,11 @@ fn draw_row(
     // It does NOT take the keyboard focus: the row's Tab stop is the band
     // inside `tree::node` (drawn once, in whichever pane holds column 0), so a
     // frozen table does not give one row two stops.
-    let (band, band_resp) =
-        ui.allocate_exact_size(egui::vec2(band_width, height), egui::Sense::CLICK);
+    let sense = if spec.drag_rows { egui::Sense::click_and_drag() } else { egui::Sense::CLICK };
+    let (band, band_resp) = ui.allocate_exact_size(egui::vec2(band_width, height), sense);
+    if !root && spec.drag_rows && band_resp.dragged() {
+        out.dragging = Some(row.id.clone());
+    }
     let clip = ui.clip_rect();
 
     // TRIGGER 2 — a right-click ANYWHERE on the row. Read off the raw pointer
@@ -1032,7 +1062,10 @@ fn draw_row(
                 label: &label,
                 selected: row.selected,
                 highlighted: false,
-                draggable: false,
+                // With row drags on, the name is the handle a drag is surest
+                // to start from: a cell editor under the band's centre would
+                // take the drag for itself (a text cell selects its text).
+                draggable: spec.drag_rows && !root,
                 tint: None,
             };
             if root {
@@ -1041,6 +1074,12 @@ fn draw_row(
             }
             let resp = tree::node(&mut child, tree_row, |_| {});
             publish(hits, spec, &format!("box:{}", row.id), resp.box_rect);
+            if !root && spec.drag_rows {
+                publish(hits, spec, &format!("label:{}", row.id), resp.label.rect);
+                if resp.label.dragged() {
+                    out.dragging = Some(row.id.clone());
+                }
+            }
             if resp.toggled {
                 out.toggled = Some(row.id.clone());
             }
@@ -1192,13 +1231,18 @@ fn cell_editor(
             }
             box_.rect
         }
-        _ if !row.editable => ui
-            .add(
+        _ if !row.editable || row.locked.contains_key(&column.key) => {
+            let label = ui.add(
                 egui::Label::new(egui::RichText::new(display_text(value)).weak())
                     .selectable(false)
                     .truncate(),
-            )
-            .rect,
+            );
+            let rect = label.rect;
+            if let Some(reason) = row.locked.get(&column.key) {
+                label.on_hover_text(reason);
+            }
+            rect
+        }
         CellKind::Text | CellKind::Numeric { .. } | CellKind::Choice { .. } => {
             // The VALUE editors are shared (see [`value_editor`]) — the table
             // and the part-properties dialog must agree on what editing a
@@ -1247,13 +1291,13 @@ pub fn focused_rect(ctx: &egui::Context) -> Option<egui::Rect> {
 /// buffer, a combo's open state), so it must be stable for a given value and
 /// distinct between values; `size` is the space to fill.
 ///
-/// Split out of [`cell_editor`] so a consumer that is NOT a table can use the
+/// Split out of `cell_editor` so a consumer that is NOT a table can use the
 /// same editors: the part-properties dialog edits the same BOM attribute
 /// records the BOM table's cells do, and a `Choice` that could be cleared in
 /// one place but not the other, or a text field that committed per keystroke
 /// in one and on focus-loss in the other, would be one attribute with two
 /// behaviours. The kinds that only make sense inside a table row (`Button`,
-/// `Actions`, `Badges`, `Toggle`) stay in [`cell_editor`]; asking for one here
+/// `Actions`, `Badges`, `Toggle`) stay in `cell_editor`; asking for one here
 /// draws the value read-only.
 pub fn value_editor(
     ui: &mut egui::Ui,

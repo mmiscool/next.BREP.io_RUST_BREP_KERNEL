@@ -114,7 +114,7 @@ pub fn state_md(reg: &Registries) -> String {
     out.push_str("\n# State registry\n\nEvery blob the app publishes per frame in a DEFAULT session (`state_get`, `brep://state/{name}`).\n\nA panel that publishes only while it is open is absent here — the BOM, assembly-tree and constraints panes and the import-preview dialog. Open the panel in a live session and read `state_list` for those. (The settings window is NOT one of them any more: since 2026-09-13 it publishes an EMPTY `__brepSettingsHit` while closed, because a blob left behind by the last open frame reads back as a window that is still on screen.)\n\n| name | schema | doc |\n|---|---|---|\n");
     for e in reg.state.as_array().into_iter().flatten() {
         let typed = if e["typed"].as_bool().unwrap_or(false) { "derived" } else { "by example" };
-        out.push_str(&format!("| `{}` | {} | {} |\n", e["name"].as_str().unwrap_or("?"), typed, e["doc"].as_str().unwrap_or("")));
+        out.push_str(&format!("| `{}` | {} | {} |\n", e["name"].as_str().unwrap_or("?"), typed, e["doc"].as_str().unwrap_or("").replace('|', "\\|")));
     }
     out
 }
@@ -146,7 +146,7 @@ pub fn widgets_md(reg: &Registries) -> String {
             out.push_str(&format!(
                 "| `{}` | {} | {command} |\n",
                 d["prefix"].as_str().unwrap_or(""),
-                d["meaning"].as_str().unwrap_or("")
+                d["meaning"].as_str().unwrap_or("").replace('|', "\\|")
             ));
         }
     }

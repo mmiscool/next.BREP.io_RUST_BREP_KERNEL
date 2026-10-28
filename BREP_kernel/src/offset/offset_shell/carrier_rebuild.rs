@@ -2333,6 +2333,64 @@ pub(super) fn fallshort_opening_reach(
     Ok(best)
 }
 
+/// Grow an inward affine carrier past a planar opening. Translating an
+/// oblique plane also translates its rim off the opening: a 45-degree
+/// chamfer offset by d stops d/sqrt(2) short. Its skin must continue along
+/// the plane until the opening can imprint it, just as a ruled carrier does.
+/// Return the uniform control-net extension needed along either plane axis.
+pub(super) fn planar_opening_reach(
+    face: &FaceRecord,
+    source_faces: &[&FaceRecord],
+    opening_set: &HashSet<u64>,
+    distance: f64,
+) -> Result<Option<f64>, KernelRefusal> {
+    if distance <= 0.0 || !face.surface.is_affine().or_refuse(KernelStage::Refine, "is_affine")? {
+        return Ok(None);
+    }
+    let surface = &face.surface;
+    let [u0, u1] = surface.domain_u().or_refuse(KernelStage::Refine, "domain_u")?;
+    let [v0, v1] = surface.domain_v().or_refuse(KernelStage::Refine, "domain_v")?;
+    let normal = face_normal(face, (u0 + u1) * 0.5, (v0 + v1) * 0.5)?;
+    let origin = surface.evaluate(u0, v0).or_refuse(KernelStage::Refine, "evaluate")?;
+    let axis_u = surface.evaluate(u1, v0).or_refuse(KernelStage::Refine, "evaluate")?
+        .sub(origin).normalized().or_refuse(KernelStage::Refine, "normalized")?;
+    let axis_v = surface.evaluate(u0, v1).or_refuse(KernelStage::Refine, "evaluate")?
+        .sub(origin).normalized().or_refuse(KernelStage::Refine, "normalized")?;
+    let skew = axis_u.dot(axis_v);
+    let determinant = 1.0 - skew * skew;
+    if determinant <= 1e-12 {
+        return Ok(None);
+    }
+    let mut best = 0.0f64;
+    for coedge in face.loops.iter().flat_map(|wire| &wire.coedges) {
+        let Some((opening, mate)) = junction_mate(source_faces, face, coedge.edge_id)
+            .filter(|(mate, _)| opening_set.contains(&mate.id))
+        else { continue; };
+        if !surface_is_planar(&opening.surface, 1e-7)? {
+            continue;
+        }
+        let [t0, t1] = mate.pcurve.domain().or_refuse(KernelStage::Refine, "domain")?;
+        let uv = mate.pcurve.evaluate((t0 + t1) * 0.5).or_refuse(KernelStage::Refine, "evaluate")?;
+        let opening_normal = face_normal(opening, uv.x, uv.y)?;
+        let cosine = normal.dot(opening_normal);
+        // Perpendicular faces keep their rim on the opening; a negative
+        // cosine moves it through the opening already. Parallel supports
+        // have no finite intersection line to extend to.
+        let sine_squared = 1.0 - cosine * cosine;
+        if cosine <= 1e-9 || sine_squared <= 1e-12 {
+            continue;
+        }
+        let travel = opening_normal.sub(normal.scale(cosine))
+            .scale(distance * cosine / sine_squared);
+        // Resolve travel in the carrier's own axes, which need not be
+        // orthogonal. The plane extender measures each side in world units.
+        let along_u = (travel.dot(axis_u) - skew * travel.dot(axis_v)) / determinant;
+        let along_v = (travel.dot(axis_v) - skew * travel.dot(axis_u)) / determinant;
+        best = best.max(along_u.abs()).max(along_v.abs());
+    }
+    Ok((best > 0.0).then_some(best))
+}
+
 /// A retained face whose INWARD offset skin stops short of a CURVED opening it
 /// meets: `Some((opening face, the gap))`.
 ///

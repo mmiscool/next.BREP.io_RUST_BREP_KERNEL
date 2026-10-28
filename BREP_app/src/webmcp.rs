@@ -28,7 +28,7 @@
 //! Export dialog's would.
 //!
 //! The split with `web/webmcp.js`: everything about the tools is Rust — the
-//! list ([`tool_list`]), the direct tier ([`DIRECT`], [`compact`]), the
+//! list ([`tool_list`](crate::webmcp::tool_list)), the direct tier ([`DIRECT`](crate::webmcp::DIRECT), [`compact`](crate::webmcp::compact)), the
 //! invocation. The JS file only registers what the list says with whichever
 //! `modelContext` object the browser provides, and turns a reply's PNGs into
 //! blob URLs. The browser API is still moving (it was `navigator.modelContext`
@@ -40,7 +40,7 @@
 //! supported limits" (observed 2026-10-14 with the full set; the limit is
 //! undocumented, and published accounts land at about 22 tools with
 //! descriptions under 1,500 characters). So the page registers two tiers:
-//! [`DIRECT`], a small set of the everyday tools with [`compact`] descriptions
+//! [`DIRECT`](crate::webmcp::DIRECT), a small set of the everyday tools with [`compact`](crate::webmcp::compact) descriptions
 //! and schemas, and three gateway tools — `brep_tools` lists every tool,
 //! `brep_tool` returns one's full description and schema, `brep_call` invokes
 //! any of them — through which the rest is reachable, in full, with the same

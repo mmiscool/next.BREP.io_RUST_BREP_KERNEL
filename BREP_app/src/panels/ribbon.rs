@@ -153,8 +153,13 @@ pub fn draw_command(
         "{tip}\n{}",
         command.disabled_reason.as_deref().unwrap_or("")
     ));
-    if !menu || ui.is_rect_visible(response.rect) {
+    // A menu row cut by its scrolling menu's edge publishes only its visible
+    // part: the full rect's center can lie outside the viewport, where a click
+    // at the published center hits nothing.
+    if !menu {
         hits.insert(hit_key(command), response.rect);
+    } else if ui.is_rect_visible(response.rect) {
+        hits.insert(hit_key(command), response.rect.intersect(ui.clip_rect()));
     }
     let mut target = None;
     if !command.menu.is_empty() {

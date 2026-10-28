@@ -93,7 +93,7 @@ pub struct BrepSolid {
     pub cells: Vec<CellRecord>,
 }
 
-/// The closed kind of a [`ValidationIssue`]. Only the kinds a dispatcher
+/// The closed kind of a `ValidationIssue`. Only the kinds a dispatcher
 /// needs are minted (the boolean's endpoint-gap repair lane keys on
 /// `CurveVertexGap`); everything else is `Other` and carries its message as
 /// the payload. A dispatcher matches the kind, never the message text.

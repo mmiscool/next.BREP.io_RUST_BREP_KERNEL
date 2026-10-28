@@ -202,14 +202,13 @@ pub(super) fn intersect_coaxial_revolutions(
     let mut seen: Vec<(f64, f64)> = Vec::new();
     let mut curves = Vec::new();
     for hit in hits {
-        // TANGENT-CONTACT SKIP (problemInbox equator-tangent: sphere r=R
-        // inscribed in a cylinder r=R): a meridian hit whose curve tangent
-        // lies IN the other surface (hit.tangential — computed exactly by
-        // the curve×surface intersector, no projector involved) sweeps a
-        // CONTACT circle where the coaxial surfaces touch without crossing.
-        // Minting it duplicates the true section ring (the cap-plane circle)
-        // and strands one-use edges at assembly. A transversal meridian
-        // crossing keeps tangential=false and is unaffected. Escape hatch:
+        // TANGENT-CONTACT SKIP: a meridian hit whose curve tangent lies IN
+        // the other surface (hit.tangential — computed exactly by the
+        // curve×surface intersector, no projector involved) sweeps a CONTACT
+        // circle where the coaxial surfaces touch without crossing. Minting
+        // it duplicates the true section ring (the cap-plane circle) and
+        // strands one-use edges at assembly. A transversal meridian crossing
+        // keeps tangential=false and is unaffected. Escape hatch:
         // BREP_COAXIAL_TANGENT_SKIP=0.
         if hit.tangential
             && std::env::var("BREP_COAXIAL_TANGENT_SKIP").as_deref() != Ok("0")

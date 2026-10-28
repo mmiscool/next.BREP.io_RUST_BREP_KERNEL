@@ -14,12 +14,12 @@
 //! arithmetic coder with static (uniform) and dynamic (adaptive) contexts.
 //! Until the first compressed value, an uncompressed U8 leaves the coder in its
 //! initial state and is emitted as its own eight bits, so a block holding only
-//! uncompressed fields is plain little-endian bytes. [`BitWriter`] follows the
+//! uncompressed fields is plain little-endian bytes. `BitWriter` follows the
 //! Intel reference implementation (`CIFXBitStreamX`, Apache-2.0) operation for
 //! operation — the order of the renormalisation steps, when a histogram
 //! halves, which contexts a field shares — because the reader on the other end
 //! of a PDF is descended from that code, and an arithmetic coder that is
-//! "equivalent" but not identical decodes to garbage. [`BitReader`] is the
+//! "equivalent" but not identical decodes to garbage. `BitReader` is the
 //! matching decoder, kept for the round-trip tests.
 //!
 //! # The file

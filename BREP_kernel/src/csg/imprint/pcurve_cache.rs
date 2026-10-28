@@ -45,10 +45,10 @@ impl Drop for FitCacheScope {
             let mut stack = stack.borrow_mut();
             debug_assert_eq!(stack.len(), self.depth + 1);
             if let Some(Some(cache)) = stack.pop() {
-                if std::env::var_os("BREP_PROFILE").is_some() {
-                    eprintln!("imprint.pcurve_cache requests={} hits={} evaluations={} retained={}",
+                if profile_enabled() {
+                    profile_line!("imprint.pcurve_cache requests={} hits={} evaluations={} retained={}",
                         cache.requests, cache.hits, cache.evaluations, cache.fits.len());
-                    eprintln!("imprint.pcurve_cache_time key={:.3} lookup={:.3} fit={:.3} replay={:.3}",
+                    profile_line!("imprint.pcurve_cache_time key={:.3} lookup={:.3} fit={:.3} replay={:.3}",
                         cache.key_time.as_secs_f64() * 1000.0, cache.lookup_time.as_secs_f64() * 1000.0,
                         cache.fit_time.as_secs_f64() * 1000.0, cache.replay_time.as_secs_f64() * 1000.0);
                 }
@@ -90,7 +90,7 @@ pub(super) fn cached_build_pcurve(surface: &NurbsSurface, curve: &NurbsCurve) ->
     if !active {
         return crate::build_pcurve_on_surface_marched(surface, curve);
     }
-    let profiling = std::env::var_os("BREP_PROFILE").is_some();
+    let profiling = profile_enabled();
     let mut clock = profiling.then(Instant::now);
     let mut lap = || {
         let now = profiling.then(Instant::now);

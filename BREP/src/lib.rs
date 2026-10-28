@@ -7,10 +7,10 @@
 //! | Module      | Feature    | Backing crate  |
 //! |-------------|------------|----------------|
 //! | [`kernel`]  | *(always)* | `BREP_kernel`  |
-//! | [`gizmos`]  | `gizmos`   | `BREP_gizmos`  |
-//! | [`render`]  | `render`   | `BREP_render`  |
-//! | [`app`]     | `app`      | `BREP_app`     |
-//! | [`reconstruction`] | `reconstruction` | `BREP_reconstruction` |
+//! | `gizmos`  | `gizmos`   | `BREP_gizmos`  |
+//! | `render`  | `render`   | `BREP_render`  |
+//! | `app`     | `app`      | `BREP_app`     |
+//! | `reconstruction` | `reconstruction` | `BREP_reconstruction` |
 //!
 //! `full` turns everything on; `parallel` forwards to the kernel's rayon
 //! tessellation.

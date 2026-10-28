@@ -80,7 +80,7 @@ impl GroupState {
 
 /// The hidden-entity sets of ONE solid (empty = all visible). Indices are into
 /// the owning [`SolidDisplay`]'s `faces` / `edges` / `vertices`.
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct EntityVisibility {
     hidden_faces: HashSet<usize>,
     hidden_edges: HashSet<usize>,

@@ -247,7 +247,10 @@ impl History {
         // cannot collide with an existing id. This holds because no shortName ends
         // in a digit (verified — even `IMPORT3D` ends in `D`), so an id's trailing
         // digits ARE its numeric suffix and `counter+1` strictly exceeds them all.
-        history.feature_counter = stored.unwrap_or_else(|| history.max_id_suffix());
+        // A STORED counter is floored the same way: a document whose counter is
+        // behind its own ids (hand-written, or saved by an older build) would
+        // otherwise mint an id it already has, which the append now refuses.
+        history.feature_counter = stored.unwrap_or(0).max(history.max_id_suffix());
         Ok(history)
     }
 
@@ -303,7 +306,7 @@ impl History {
     /// by grace", "not checked out"). Rolling ([`Self::set_rollback`]) is view
     /// state and stays free, and so does reading.
     ///
-    /// The three writes that do not pass [`Self::document_mut`] — the parts
+    /// The three writes that do not pass `Self::document_mut` — the parts
     /// library, the feature counter and the undo/redo stacks — check the lock
     /// themselves; `a_locked_history_keeps_its_saved_bytes` calls every
     /// mutator and pins the invariant.
@@ -655,6 +658,22 @@ impl History {
         document.to_string()
     }
 
+    /// [`Self::request_json`] as a value, for a caller that edits it: the
+    /// same document, never printed and parsed back (an assembly's library
+    /// is megabytes).
+    pub fn request_value(&self) -> Value {
+        let mut document = self.document().clone();
+        if let Some(obj) = document.as_object_mut() {
+            if self.feature_counter != 0 {
+                obj.insert("featureCounter".into(), Value::from(self.feature_counter));
+            }
+            if self.parts_library.as_object().is_some_and(|map| !map.is_empty()) {
+                obj.insert("partsLibrary".into(), (*self.parts_library).clone());
+            }
+        }
+        document
+    }
+
     /// The document WITHOUT the parts-library block — for the kernel round
     /// trips that never read it. The assembly pose fold
     /// (`assembly_apply_document_json`) only rewrites the `assembly` block and
@@ -802,8 +821,20 @@ impl History {
             self.refused += 1;
             return Err(error);
         }
-        let mut document: Value = serde_json::from_str(document_json)
+        let document: Value = serde_json::from_str(document_json)
             .map_err(|error| format!("adopt document parse: {error}"))?;
+        self.adopt_document_value(document)
+    }
+
+    /// [`Self::adopt_document`] for a caller that already holds the parsed
+    /// document: an assembly's parts library is megabytes, and printing it only
+    /// to parse it back was most of an Update Components commit at 500 parts.
+    pub fn adopt_document_value(&mut self, mut document: Value) -> Result<(), String> {
+        if let Some(reason) = &self.lock {
+            let error = format!("the document is read-only: {reason}");
+            self.refused += 1;
+            return Err(error);
+        }
         if !document.is_object() {
             return Err("adopt document: not a JSON object".into());
         }
@@ -839,7 +870,16 @@ impl History {
             return Err("adopt document: not a JSON object".into());
         }
         self.checkpoint(None);
-        self.adopt_document(document_json)
+        self.adopt_document_value(probe)
+    }
+
+    /// [`Self::adopt_document_checkpointed`] for an already parsed document.
+    pub fn adopt_document_value_checkpointed(&mut self, document: Value) -> Result<(), String> {
+        if !document.is_object() {
+            return Err("adopt document: not a JSON object".into());
+        }
+        self.checkpoint(None);
+        self.adopt_document_value(document)
     }
 
     /// Replace the document's `partsLibrary` block (the assemblies parts
@@ -888,6 +928,20 @@ impl History {
         &self.parts_library
     }
 
+    /// Top-level block `key` of the document as it stood before the NEWEST
+    /// undoable edit (`None` with nothing to undo, or when that document had
+    /// no such block): what a caller reads to tell whether the newest step is
+    /// the one it means to take back.
+    pub fn undo_top_block(&self, key: &str) -> Option<&Value> {
+        self.undo_stack.last().and_then(|snapshot| snapshot.request.get(key))
+    }
+
+    /// The `partsLibrary` block as it stood before each undoable edit, newest
+    /// first: where a caller finds a library entry as it was when it appeared.
+    pub fn undo_parts_libraries(&self) -> impl Iterator<Item = &Value> + '_ {
+        self.undo_stack.iter().rev().map(|snapshot| snapshot.parts_library.as_ref())
+    }
+
     /// The document's `assembly` block (`{constraints, idCounter}`), if any.
     pub fn assembly_block(&self) -> Option<&Value> {
         self.document().get("assembly")
@@ -926,7 +980,7 @@ impl History {
                     object.insert("wireHarness".into(), block);
                 }
                 None => {
-                    object.remove("wireHarness");
+                    object.shift_remove("wireHarness");
                 }
             }
         }
@@ -967,7 +1021,7 @@ impl History {
                     object.insert("pmi".into(), block);
                 }
                 None => {
-                    object.remove("pmi");
+                    object.shift_remove("pmi");
                 }
             }
         }
@@ -977,6 +1031,56 @@ impl History {
     /// same key starts a fresh undo entry.
     pub fn break_coalescing(&mut self) {
         self.last_edit_key = None;
+    }
+}
+
+// ============================================================================
+// CAM block accessors (the CAM workbench slice). A SEPARATE `impl` block,
+// purely additive over the history API, on the PMI block's pattern.
+//
+// `cam` is a top-level document key like `pmi` and `sheets`: the user's
+// setups, tools, operations and post settings. The kernel never reads it and
+// `HistoryRequest` has no field for it — the document's unknown-key
+// pass-through ([`Self::request_json`] serializes the raw document) is what
+// round-trips it through save, load and undo. Derived data (toolpaths, mesh
+// snapshots, stock states) is never written here: it is regenerated.
+// ============================================================================
+impl History {
+    /// The document's `cam` block (`{setups, tools, operations, ncPrograms,
+    /// idCounter}`), if any.
+    pub fn cam_block(&self) -> Option<&Value> {
+        self.document().get("cam")
+    }
+
+    /// Replace (or, with `None`, remove) the `cam` block as a USER edit:
+    /// snapshotted for undo. `coalesce_key` groups a run of rapid same-target
+    /// edits (typing in one field of one operation: `cam:op:{id}:{field}`)
+    /// into ONE undo entry; `None` makes the edit its own step (a setup, tool
+    /// or operation add / delete, a pick committed).
+    pub fn set_cam_block(&mut self, block: Option<Value>, coalesce_key: Option<&str>) {
+        let coalesce_key = coalesce_key.map(|change| format!("cam:{change}"));
+        self.checkpoint(coalesce_key.as_deref());
+        self.put_cam_block(block);
+    }
+
+    /// Replace the `cam` block WITHOUT an undo checkpoint — for a write that
+    /// belongs to the checkpoint just taken (an import lifting a file's CAM
+    /// data beside the feature it added, so one undo removes both).
+    pub fn set_cam_block_no_undo(&mut self, block: Option<Value>) {
+        self.put_cam_block(block);
+    }
+
+    fn put_cam_block(&mut self, block: Option<Value>) {
+        if let Some(object) = self.document_mut().as_object_mut() {
+            match block {
+                Some(block) => {
+                    object.insert("cam".into(), block);
+                }
+                None => {
+                    object.shift_remove("cam");
+                }
+            }
+        }
     }
 }
 
@@ -1008,7 +1112,7 @@ impl History {
                     object.insert(crate::sheets::SHEETS.into(), block);
                 }
                 None => {
-                    object.remove(crate::sheets::SHEETS);
+                    object.shift_remove(crate::sheets::SHEETS);
                 }
             }
         }
@@ -1044,7 +1148,7 @@ impl History {
                     object.insert(crate::engine_state::PART_ATTRIBUTES.into(), block);
                 }
                 None => {
-                    object.remove(crate::engine_state::PART_ATTRIBUTES);
+                    object.shift_remove(crate::engine_state::PART_ATTRIBUTES);
                 }
             }
         }
@@ -1329,27 +1433,27 @@ impl History {
     }
 
     /// Replace (or, with `None`, remove) the `diagram` block as a USER edit.
-    /// See [`Self::set_ecad_block`] for `coalesce_key`.
+    /// See `Self::set_ecad_block` for `coalesce_key`.
     pub fn set_diagram_block(&mut self, block: Option<Value>, coalesce_key: Option<&str>) {
         self.set_ecad_block(DIAGRAM, block, coalesce_key);
     }
 
     /// Replace (or, with `None`, remove) the `pcb` block as a USER edit.
-    /// See [`Self::set_ecad_block`] for `coalesce_key`.
+    /// See `Self::set_ecad_block` for `coalesce_key`.
     pub fn set_pcb_block(&mut self, block: Option<Value>, coalesce_key: Option<&str>) {
         self.set_ecad_block(PCB, block, coalesce_key);
     }
 
     /// Replace (or, with `None`, remove) the `symbol` block as a USER edit,
     /// and follow it to the part's ports in the same undo step (see
-    /// [`Self::follow_pins`]). See [`Self::set_ecad_block`] for `coalesce_key`.
+    /// `Self::follow_pins`). See `Self::set_ecad_block` for `coalesce_key`.
     pub fn set_symbol_block(&mut self, block: Option<Value>, coalesce_key: Option<&str>) {
         self.set_ecad_block(SYMBOL, block, coalesce_key);
         self.follow_pins(None);
     }
 
     /// Replace (or, with `None`, remove) the `pads` block as a USER edit.
-    /// See [`Self::set_ecad_block`] for `coalesce_key`.
+    /// See `Self::set_ecad_block` for `coalesce_key`.
     pub fn set_pads_block(&mut self, block: Option<Value>, coalesce_key: Option<&str>) {
         self.set_ecad_block(PADS, block, coalesce_key);
     }
@@ -1378,7 +1482,7 @@ impl History {
 
     /// Replace (or, with `None`, remove) the `ports` block as a USER edit, and
     /// follow it to the part's pins in the same undo step (see
-    /// [`Self::follow_ports`]).
+    /// `Self::follow_ports`).
     pub fn set_ports_block(&mut self, block: Option<Value>, coalesce_key: Option<&str>) {
         self.set_ecad_block(PORTS, block, coalesce_key);
         self.follow_ports();
@@ -1412,7 +1516,7 @@ impl History {
                     object.insert(key.into(), block);
                 }
                 None => {
-                    object.remove(key);
+                    object.shift_remove(key);
                 }
             }
         }
@@ -1588,7 +1692,10 @@ impl History {
                     object.insert(key.to_string(), block);
                 }
                 None => {
-                    object.remove(key);
+                    // `shift_remove`: with `preserve_order`, `remove` moves the
+                    // last key into the gap, and the reordered document then
+                    // reads as an unsaved change.
+                    object.shift_remove(key);
                 }
             }
         }

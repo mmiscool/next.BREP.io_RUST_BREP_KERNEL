@@ -31,7 +31,7 @@ pub(crate) mod parts_library;
 pub use parts_library::{
     add_part_to_library, add_part_to_library_impl, install_parts_library, missing_library_parts,
     parts_library_json, parts_library_map, parts_library_revision, refresh_library_entry,
-    refresh_library_entry_impl, same_build,
+    refresh_library_entry_impl, same_build, follow_saved_rows, follow_saved_rows_known, kernel_source_stamp,
     PartsLibraryEntry, PartsLibraryMap, stable_json_hash,
 };
 // Assembly constraint state + lifecycle: the `assembly` history block, the
@@ -62,6 +62,15 @@ pub(crate) use features::transform::bbox_center as transform_bbox_center;
 // stores into `pivot` when a face selection is committed, computed by the same
 // resolution and centre the feature falls back to for a null pivot.
 pub use features::transform_face::face_transform_pivot;
+/// A Pattern Component instance id (`APAT1.ACOMP3.i4`) as `(pattern, seed, n)`.
+pub fn pattern_component_instance(id: &str) -> Option<(String, String, i64)> {
+    features::assembly_pattern::parse_instance_id(id).map(|(p, s, n)| (p.to_string(), s.to_string(), n))
+}
+
+/// The part Pattern's `suppressed` instance numbers, as the feature reads them.
+pub fn pattern_parse_suppressed(value: Option<&serde_json::Value>) -> Vec<i64> {
+    features::pattern::parse_suppressed(value).into_iter().collect()
+}
 // The native IMPORT3D payload encoder: finished solids → an `io/snapshot`
 // payload carrying IMPORT3D's own names, ready to become an
 // `inputParams.nativeBrep` part document. Lives WITH the feature that reads it
@@ -350,7 +359,7 @@ pub struct FeatureResult {
     pub reused: bool,
     /// Sketch profiles this feature produced (a SKETCH feature emits one under
     /// its name; solid features emit none). INTERNAL side-channel: `#[serde(skip)]`
-    /// so it never crosses the wasm boundary to the caller — [`SceneMap::apply`] ingests it
+    /// so it never crosses the wasm boundary to the caller — `SceneMap::apply` ingests it
     /// into `scene.profiles` for downstream profile-consumers (extrude/revolve/…).
     #[serde(skip)]
     pub profiles: Vec<(String, SketchProfile)>,
@@ -884,7 +893,12 @@ pub struct SceneMap {
     /// lives in component.rs. Empty in every componentless scene — nothing in
     /// the ordinary modeling path reads or writes it.
     pub components: component::ComponentMap,
-    /// Naming-contract guard (accumulated across [`SceneMap::apply`] calls): one
+    /// The occurrences of FLEXIBLE sub-assembly instances (`ACOMP1:ACOMP2`),
+    /// registered by the constraint run (`assembly::flexible`) as bodies the
+    /// solver moves individually. Not components: the tree and BOM never see
+    /// them; their solids stay members of the placing instance too.
+    pub occurrences: component::ComponentMap,
+    /// Naming-contract guard (accumulated across `SceneMap::apply` calls): one
     /// message per detected cross-solid name COLLISION — an added solid's face /
     /// edge name that already maps to a DIFFERENT still-resident solid. Two live
     /// solids must never share a face/edge name (the SceneMap is a global
@@ -1072,6 +1086,8 @@ impl SceneMap {
             // as plain solid removal). Feature ids never collide with solid
             // names, so this is a no-op for every ordinary removal.
             if let Some(record) = self.components.remove(name) {
+                let prefix = format!("{}:", record.id);
+                self.occurrences.retain(|id, _| !id.starts_with(&prefix));
                 for member in &record.solids {
                     if let Some(handle) = self.solids.remove(member) {
                         self.faces.retain(|_, face| face.handle != handle);
@@ -1134,6 +1150,9 @@ impl SceneMap {
         }
         // Ingest any component records (ACOMP features).
         for record in &result.components {
+            // A re-placed flexible instance re-expands from its fresh pose.
+            let prefix = format!("{}:", record.id);
+            self.occurrences.retain(|id, _| !id.starts_with(&prefix));
             self.components.insert(record.id.clone(), record.clone());
         }
         // Insert the added solids' names FIRST so the resident-handle set is
@@ -1517,6 +1536,7 @@ pub(crate) fn execute_feature_with_later(
         "SM.CF" => features::sheet_metal_contour_flange::execute(&ctx),
         "SM.F" => features::sheet_metal_flange::execute(&ctx),
         "SM.HEM" => features::sheet_metal_hem::execute(&ctx),
+        "SM.CLOSED_CORNER" => features::sheet_metal_closed_corner::execute(&ctx),
         "SM.FILLET" => features::sheet_metal_corner::execute_fillet(&ctx),
         "SM.CHAMFER" => features::sheet_metal_corner::execute_chamfer(&ctx),
         "SM.CUTOUT" => features::sheet_metal_cutout::execute(&ctx),
@@ -1525,6 +1545,8 @@ pub(crate) fn execute_feature_with_later(
         //     literals in sync with `parts_library::is_acomp_type` (the
         //     fingerprint-mix + GC hooks key on the same strings). ---
         "ACOMP" | "ASSEMBLY COMPONENT" => features::assembly_component::execute(&ctx),
+        // Pattern Component: instances of placed components that follow a seed.
+        "APAT" | "PATTERN COMPONENT" => features::assembly_pattern::execute(&ctx),
         // --- Construction geometry that registers named plane frames (headless
         //     sketch-plane resolution) ---
         "D" | "DATUM" | "DATIUM" => features::datum::execute(&ctx),
@@ -1602,6 +1624,16 @@ thread_local! {
 /// In-place component motion invalidates the cached producer, but must not
 /// free its handles until the next rebuild (the current scene still uses them).
 fn mark_component_cache_posed(id: &str) {
+    // A sub-assembly's own solve runs inside an isolated part run, whose
+    // component ids (`ACOMP1`, …) are the SUB-document's and name different
+    // features of the parent's cache: marking them would force the parent's
+    // unrelated ACOMPs to re-run. The isolated run never caches, so there is
+    // nothing of its own to mark.
+    if parts_library::in_isolated_run() {
+        return;
+    }
+    // A pattern instance (`APAT1.ACOMP3.i2`) is cached under its pattern.
+    let id = id.split('.').next().unwrap_or(id);
     HISTORY_CACHE.with(|cache| {
         if let Some(entry) = cache.borrow_mut().get_mut(id) {
             entry.posed_externally = true;
@@ -1629,6 +1661,8 @@ pub fn clear_history_cache() {
         cache.clear();
     });
     sheet_metal::clear_trees();
+    // Memoized part rebuilds (the self-heal / insert lane).
+    parts_library::clear_rebuilt_memo();
     // The per-coedge reading memo the boolean's operand preparation keeps.
     crate::reading_memo::clear();
     // The per-face mesh fragments the soundness scan and the display share.

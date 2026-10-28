@@ -355,7 +355,7 @@ pub const COINCIDENCE_DISTANCE_FLOOR: f64 = 1e-6;
 ///   of magnitude get the same scale if they sit the same distance out.
 /// * It is **translation-VARIANT**, so results are not reproducible under a rigid
 ///   move: the same fillet at the origin and translated far away produced
-///   different volumes, and eventually a broken result.  [`merge_scale`] records
+///   different volumes, and eventually a broken result.  `merge_scale` records
 ///   that exact failure for the imprint vertex-merge band, which was fixed the
 ///   same way.
 ///

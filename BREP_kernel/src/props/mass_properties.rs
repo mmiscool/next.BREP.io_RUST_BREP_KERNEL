@@ -204,4 +204,4 @@ pub use solid_props::{
 pub(crate) use solid_props::shell_signed_volume;
 pub use polygons::trim_polygons;
 pub use identity::{face_set_identity, FaceSetIdentity};
-pub(crate) use identity::{carrier_residual_identity, coedge_use_identity, edge_claim_identity, face_contribution_identity, hash_face, hash_surface, identity_with_model, TwoLane};
+pub(crate) use identity::{carrier_residual_identity, coedge_use_identity, edge_claim_identity, face_contribution_identity, hash_curve, hash_face, hash_surface, identity_with_model, TwoLane};

@@ -47,6 +47,8 @@ impl EngineState {
     /// vertices (hover is left untouched). Bumps the emphasis generation + marks
     /// dirty only when something was actually cleared. Returns whether it changed.
     pub fn clear_selection(&mut self) -> bool {
+        // The Work part's context selection clears with the rest.
+        let had_context = self.select_context(None);
         // The viewport-selected CONSTRAINT (label click) clears with the rest.
         let had_constraint = self.selected_constraint.is_some();
         self.constraint_deselect();
@@ -61,7 +63,8 @@ impl EngineState {
         let had_pmi = self.pmi_selected_view.take().is_some() || had_pmi_annotation;
         let had_sheet = self.sheet_selected_object.take().is_some();
         let had_datums = !self.emphasis.selected_datums.is_empty();
-        let had = had_constraint
+        let had = had_context
+            || had_constraint
             || had_feature
             || had_pmi
             || had_sheet
@@ -189,7 +192,7 @@ impl EngineState {
     /// FILTER admits — replacing the current selection (a plain viewport click).
     /// A miss (or a click when the filter admits nothing) clears the selection.
     /// Marks dirty when the selection changed; returns whether something was
-    /// selected. The by-kind honoring lives in [`select_filtered_at`] in the
+    /// selected. The by-kind honoring lives in [`select_filtered_at`](Self::select_filtered_at) in the
     /// appended selection-filter impl block (kept separate so concurrent edits to
     /// this primary block don't conflict).
     pub fn select_top_at(&mut self, x: f64, y: f64) -> bool {
@@ -200,8 +203,7 @@ impl EngineState {
     /// `{ solids:[..], faces:[..], edges:[..], vertices: n }` — lets a UI / the
     /// headed verifier read selection state (e.g. assert Esc cleared it).
     ///
-    /// Each array is in PICK ORDER, oldest first ([`OrderedNames`](crate::style::
-    /// OrderedNames)): the first name in `faces` is the face that was picked
+    /// Each array is in PICK ORDER, oldest first ([`OrderedNames`](crate::style::OrderedNames)): the first name in `faces` is the face that was picked
     /// first, and a face toggled off and on again is last. That is the order
     /// every seeder reads — the assembly constraint's `elements` (whose first
     /// element is the Distance BASE face), the context bar's reference pre-fill,
@@ -340,6 +342,19 @@ impl EngineState {
         // A SHEET pick is an anchor on the paper, never a 3D hit: the sheet
         // viewport feeds `ref_select_pick_sheet_anchor` instead.
         if target == RefSelectTarget::Sheet {
+            return;
+        }
+        // A Work part's CONTEXT is not the part's to reference: say so, and
+        // say what to do instead, rather than store a name its kernel cannot
+        // resolve. (An instructions pick names the ghosts in that layer on
+        // purpose: `pick_candidates_at` lists them for it.)
+        let instructions_pick = matches!(target, RefSelectTarget::Instructions { .. });
+        if let Some(hit) = self.context_hit_at(x, y).filter(|_| !instructions_pick) {
+            self.push_notice(format!(
+                "'{}' is another part of the assembly: a feature cannot reference it (it would not follow that part). \
+                 Make a datum on it, or copy its edges into a sketch, and use that.",
+                hit.solid
+            ));
             return;
         }
         // The field's RAW kind strings drive the pick (`pick_top_at` reads
@@ -515,6 +530,34 @@ impl EngineState {
             self.end_ref_select(state.restore_index);
             return;
         }
+        // A CAM record's field commits into the `cam` block; nothing rolled
+        // and no run is needed, so the tail is the highlight and the filter
+        // going back to their defaults.
+        if state.target == RefSelectTarget::Cam {
+            let _ = self.emphasis.apply_json("{}");
+            self.selection_filter = SelectionFilter::default();
+            if let Err(error) = self.cam_commit_refs(&state.path, &state.names, state.multiple) {
+                self.push_notice(format!("CAM: {error}"));
+            }
+            self.dirty = true;
+            return;
+        }
+        // An INSTRUCTIONS step's occurrence field commits into the
+        // instructions block (one undo step through `instructions_edit`);
+        // nothing rolled and no run is needed, so the tail is the highlight
+        // and the filter going back to their defaults.
+        if let RefSelectTarget::Instructions { field } = state.target {
+            let _ = self.emphasis.apply_json("{}");
+            self.clear_ghost_lights();
+            self.selection_filter = SelectionFilter::default();
+            if let Some(solid) = state.names.first() {
+                if let Err(error) = self.instructions_commit_ref(&state.feature_id, field, solid) {
+                    self.push_notice(format!("Instructions: {error}"));
+                }
+            }
+            self.dirty = true;
+            return;
+        }
         // A SHEET object's field commits into the `sheets` block, and a sheet
         // edit never re-runs the history — so its tail is its own: no roll to
         // restore, no rebuild, just the modal gone.
@@ -548,6 +591,18 @@ impl EngineState {
             self.end_ref_select(state.restore_index);
             return;
         }
+        // A motion-study CLIP's parts commit into the `simulation` block
+        // through the study patch lane; nothing rolled and nothing re-runs,
+        // so the tail is the CAM one: highlight and filter back to default.
+        if state.target == RefSelectTarget::Simulation {
+            let _ = self.emphasis.apply_json("{}");
+            self.selection_filter = SelectionFilter::default();
+            if let Err(error) = self.simulation_commit_refs(&state.feature_id, &state.path, &state.names) {
+                self.push_notice(format!("Simulation: {error}"));
+            }
+            self.dirty = true;
+            return;
+        }
         if let Some(index) = self.history.index_of(&state.feature_id) {
             let mut params = self
                 .history
@@ -570,6 +625,19 @@ impl EngineState {
             self.history.set_feature_params(index, params);
         }
         self.end_ref_select(state.restore_index);
+    }
+
+    /// The ghosts a running instructions pick lights whole (`Self::sync_ref_select_emphasis`).
+    pub fn ref_select_ghosts_lit(&self) -> Vec<String> {
+        self.context_pick_lit.clone()
+    }
+
+    /// Put the ghosts' lights out (a pick ending).
+    fn clear_ghost_lights(&mut self) {
+        if !self.context_pick_lit.is_empty() {
+            self.context_pick_lit.clear();
+            self.sync_context_highlight();
+        }
     }
 
     /// Cancel: discard the running selection, clear the highlight, restore the
@@ -609,6 +677,9 @@ impl EngineState {
                     | RefSelectTarget::AssemblyConstraint
                     | RefSelectTarget::Pmi
                     | RefSelectTarget::Sheet
+                    | RefSelectTarget::Cam
+                    | RefSelectTarget::Instructions { .. }
+                    | RefSelectTarget::Simulation
             )
         })
     }
@@ -678,6 +749,10 @@ impl EngineState {
     /// never clobbers the filter.
     fn end_ref_select(&mut self, restore_index: usize) {
         let _ = self.emphasis.apply_json("{}");
+        self.clear_ghost_lights();
+        // The rerun below marks the frame only when it lands, which on the
+        // background runner is later; the cleared highlight is shown now.
+        self.dirty = true;
         self.selection_filter = SelectionFilter::default();
         self.history.set_rollback(restore_index);
         self.rerun_history();
@@ -731,6 +806,19 @@ impl EngineState {
             None => "{}".to_string(),
         };
         let _ = self.emphasis.apply_json(&json);
+        // An instructions pick's names can be GHOSTS (the parts earlier steps
+        // placed, drawn in the context layer with their solid hidden): those
+        // light through the context highlight, whole.
+        let ghosts: Vec<String> = match &self.ref_select {
+            Some(state) if matches!(state.target, RefSelectTarget::Instructions { .. }) => {
+                state.names.iter().filter(|name| self.context_scene.solid(name).is_some()).cloned().collect()
+            }
+            _ => Vec::new(),
+        };
+        if self.context_pick_lit != ghosts {
+            self.context_pick_lit = ghosts;
+            self.sync_context_highlight();
+        }
         // A picked construction PLANE/DATUM highlights through the datum-plane
         // WIDGET, whose accent is baked at feed time (`refresh_construction_datums`
         // reads `emphasis.selected_datums`) — so a plain `apply_json` does not
@@ -772,7 +860,7 @@ impl EngineState {
     /// The ONE candidate under CSS-pixel `(x, y)` that the hover highlight lights
     /// and a plain click takes: the filter-admitted candidate FIRST IN THE
     /// RAYCAST by depth, the shared kind order breaking ties inside the nearest
-    /// depth layer ([`front_layer_winner`](super::plane_pick::front_layer_winner)).
+    /// depth layer (`front_layer_winner`).
     /// `None` on a miss, or when the filter admits nothing.
     ///
     /// Built from [`candidates_filtered_at`](Self::candidates_filtered_at), so
@@ -826,16 +914,26 @@ impl EngineState {
     /// The highlight is the promise the click keeps: both resolve through the one
     /// query above, so what lights up is what a plain click selects.
     pub fn hover_at(&mut self, x: f64, y: f64) -> bool {
-        match self.nearest_candidate_at(x, y) {
+        // A Work part's context face in front lights as context hover; for
+        // the sketch pickEdges tool, the context edge it would copy.
+        let context = if self.sketch_active_tool() == Some("pickEdges") {
+            self.context_edge_at(x, y)
+        } else {
+            self.context_hit_at(x, y)
+        };
+        let context_changed = self.hover_context(context);
+        let changed = match self.nearest_candidate_at(x, y) {
             Some(hit) => {
                 if self.hover_is(&hit) {
-                    return false; // unchanged — keep the frame clean.
+                    false // unchanged — keep the frame clean.
+                } else {
+                    self.set_hover_to_candidate(&hit);
+                    true
                 }
-                self.set_hover_to_candidate(&hit);
-                true
             }
             None => self.clear_hover(),
-        }
+        };
+        changed || context_changed
     }
 
     /// Whether ANY hover highlight is lit right now. The viewport's dwell clock
@@ -900,7 +998,7 @@ impl EngineState {
     /// TOGGLE the admitted pick under CSS-pixel `(x, y)` — the NEAREST by depth,
     /// the one the hover highlight is showing — in the current
     /// selection (a **Ctrl/Cmd+click**): add it if absent, remove it if present,
-    /// leaving the rest of the selection intact (unlike [`select_top_at`], which
+    /// leaving the rest of the selection intact (unlike [`select_top_at`](Self::select_top_at), which
     /// REPLACES). With the COMPONENT filter on, a hit on component geometry
     /// toggles the whole component (all member solids as one unit). A miss — or
     /// a filter admitting nothing — leaves the selection untouched (additive

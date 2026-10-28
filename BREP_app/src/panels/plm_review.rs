@@ -2,25 +2,25 @@
 //!
 //! What a PLM's review process looks like from the CAD app:
 //!
-//! * **A revision's review** ([`ReviewPanel`] on a [`Subject::Revision`]): the
+//! * **A revision's review** ([`ReviewPanel`](crate::panels::plm_review::ReviewPanel) on a [`Subject::Revision`](crate::panels::plm_review::Subject::Revision)): the
 //!   live round — who must decide, who has, how many approvals it has of how
 //!   many it needs, when it is due — its history and its comments. A draft
 //!   with no live round offers **Submit for review** with extra reviewers, a
 //!   due date and a note. A reviewer who may decide gets **Approve** and
 //!   **Reject** with a comment. Anyone who may comment can.
-//! * **The inbox badge** ([`InboxBadge`]): `GET /api/inbox`'s `count`, asked
-//!   again every [`INBOX_POLL_SECS`], beside the PLM connection indicator. It
+//! * **The inbox badge** ([`InboxBadge`](crate::panels::plm_review::InboxBadge)): `GET /api/inbox`'s `count`, asked
+//!   again every [`INBOX_POLL_SECS`](crate::panels::plm_review::INBOX_POLL_SECS), beside the PLM connection indicator. It
 //!   opens a list of what waits on the user and what they submitted; a row
 //!   opens its review round.
-//! * **A save during review warns** ([`save_warning`], D8) and saves.
+//! * **A save during review warns** ([`save_warning`](crate::panels::plm_review::save_warning), D8) and saves.
 //!
 //! Every refusal is shown in the server's own words, as every PLM refusal is:
 //! a release the review gate refuses ("… needs 1 approval(s) before it can
 //! release …") is the lifecycle panel's Release answering `409`, and needs
 //! nothing of its own.
 //!
-//! Everything goes through [`PlmReview`], which S1's client implements
-//! ([`PlmReviewClient`]). Each request's future is held and polled every frame
+//! Everything goes through [`PlmReview`](crate::panels::plm_review::PlmReview), which S1's client implements
+//! ([`PlmReviewClient`](crate::panels::plm_review::PlmReviewClient)). Each request's future is held and polled every frame
 //! with a waker that repaints, as S7's panel does. Nothing here is constructed
 //! without a server.
 
@@ -346,7 +346,7 @@ impl PlmReviewEvent {
         use crate::panels::plm::PanelEvent;
         match event {
             PanelEvent::OpenReview { part, revision } => Some(Self::OpenReview { part: part.clone(), revision: revision.clone() }),
-            PanelEvent::Access(_) | PanelEvent::Open(_) => None,
+            PanelEvent::Access(_) | PanelEvent::Open(_) | PanelEvent::Moved(_) => None,
         }
     }
 }

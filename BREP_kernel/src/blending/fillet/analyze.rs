@@ -538,8 +538,18 @@ pub(crate) fn scan_dihedral(
         flip_fraction: None,
     };
     let mut first_sense: Option<bool> = None;
-    for step in 0..=SAMPLES {
-        let fraction = step as f64 / SAMPLES as f64;
+    // Stations sit at the midpoints of `SAMPLES` equal sub-spans, strictly
+    // inside the edge. The two end points are not stations on purpose: on a
+    // closed rim whose wall face is creased along its own seam (an extruded
+    // profile with a C0 corner at its closing point), the end station
+    // projects onto the face at the corner itself, where the
+    // surface has two one-sided normals and `face_plane_normal` returns the
+    // seam's far-side one while the tangent is the near-side limit; that one
+    // station read 270° on a rim that is 90° everywhere and named the edge
+    // MIXED. The dihedral angle at a crease point is undefined, not mixed; the
+    // scan reads the edge, not its ends.
+    for step in 0..SAMPLES {
+        let fraction = (step as f64 + 0.5) / SAMPLES as f64;
         let t = edge.t0 + span * fraction;
         let Ok(point) = edge.curve.evaluate(t) else {
             continue;
@@ -607,7 +617,7 @@ pub(crate) fn scan_dihedral(
             format!(
                 "dihedral scan: only {} of {} stations on edge {edge_id} could be evaluated",
                 profile.samples,
-                SAMPLES + 1
+                SAMPLES
             ),
         ));
     }
@@ -1120,6 +1130,35 @@ fn support_extent(
     let Some(refusal) = first_refusal else {
         return Ok(SupportExtent::Fits);
     };
+    // A support that narrows to a CUSP at an end of the edge runs out under
+    // the ball near that end by construction, and the network tapers the
+    // round to zero at the tip there (`blend/taper_runout.rs`; report
+    // b46db89a's sliver, cusped at both ends of a concave arc). Every overrun
+    // station on such a support, on that end's half of the edge, is the
+    // taper's; any other overrun still answers as below. CONCAVE edges only:
+    // a convex edge's overrun has its own admission below, and its cusped
+    // ends keep the free end when no taper is planned (the network refuses a
+    // concave one instead, `blend/network.rs`).
+    if !cross.convex && crate::blend::taper_runout::taper_runout_on() && crate::blend::relief::relief_enabled() {
+        if let Some(edge) = solid.edges.iter().find(|edge| edge.id == edge_id) {
+            let tapered = (0..=SAMPLES).all(|step| {
+                let bits = overrun_faces[step];
+                if bits == 0 {
+                    return true;
+                }
+                if 2 * step == SAMPLES {
+                    return false;
+                }
+                let vertex = if 2 * step < SAMPLES { edge.start_vertex_id } else { edge.end_vertex_id };
+                (0..2).filter(|support| bits & (1 << support) != 0).all(|support| {
+                    crate::blend::taper_runout::cusped_at(solid, edge, faces[support], vertex)
+                })
+            });
+            if tapered {
+                return Ok(SupportExtent::Fits);
+            }
+        }
+    }
     if cross.convex {
         return if overrun.contains(&2) { Err(refusal) } else { Ok(SupportExtent::Fits) };
     }
@@ -1431,6 +1470,59 @@ pub(super) fn check_blend_interference(
     entry: &str,
 ) -> Result<(), KernelRefusal> {
     let _timing = crate::blend::BlendTimer::start("timing.interference_ms");
+    let key = interference_memo_key(original, result, edge_ids, entry);
+    if key.is_some_and(|key| INTERFERENCE_MEMO.with(|memo| memo.borrow().contains(&key))) {
+        INTERFERENCE_HITS.with(|hits| hits.set(hits.get() + 1));
+        crate::blend::record_count("count.interference.memo_hits", 1);
+        return Ok(());
+    }
+    if key.is_some() {
+        INTERFERENCE_READS.with(|reads| reads.set(reads.get() + 1));
+        crate::blend::record_count("count.interference.memo_reads", 1);
+    }
+    let mut complete = true;
+    let verdict = check_blend_interference_uncached(original, result, edge_ids, entry, &mut complete);
+    if verdict.is_ok() && complete {
+        if let Some(key) = key {
+            INTERFERENCE_MEMO.with(|memo| {
+                let mut memo = memo.borrow_mut();
+                if memo.len() >= 32 { memo.clear(); }
+                memo.insert(key);
+            });
+        }
+    }
+    verdict
+}
+
+// Successful readings only, keyed on complete input content and selection.
+// A changed original, fitted result, policy or selected edge cannot reuse it.
+thread_local! {
+    static INTERFERENCE_MEMO: std::cell::RefCell<rustc_hash::FxHashSet<[u64; 2]>> = std::cell::RefCell::new(rustc_hash::FxHashSet::default());
+    static INTERFERENCE_HITS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static INTERFERENCE_READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+fn interference_memo_key(original: &BrepSolid, result: &BrepSolid, edges: &[u64], entry: &str) -> Option<[u64; 2]> {
+    let policy = crate::soundness::network_acceptance_memo::policy()?;
+    let (a, b) = original.validate_memo_key()?;
+    let (c, d) = result.validate_memo_key()?;
+    let mut hash = crate::mass_properties::TwoLane::new();
+    for word in [a, b, c, d, policy[0], policy[1]] { hash.u64(word); }
+    hash.usize(edges.len());
+    for &edge in edges { hash.u64(edge); }
+    hash.usize(entry.len());
+    for byte in entry.bytes() { hash.u64(u64::from(byte)); }
+    Some(hash.finish())
+}
+
+
+fn check_blend_interference_uncached(
+    original: &BrepSolid,
+    result: &BrepSolid,
+    edge_ids: &[u64],
+    entry: &str,
+    complete: &mut bool,
+) -> Result<(), KernelRefusal> {
     // The classifier's own counters (builds, band projections, rays) for the
     // scan, printed under `BREP_PROFILE` as `classify.profile blend.interference.*`.
     crate::classification::classify_profile_begin();
@@ -1442,15 +1534,18 @@ pub(super) fn check_blend_interference(
     let original_invalid = !original.validate_memoised().is_empty();
     validate_timing.stop();
     if original_invalid {
+        *complete = false;
         return Ok(());
     }
     // Which side of the original boundary the new faces may NOT be on.
     let (mut any_convex, mut any_concave) = (false, false);
     for &edge_id in edge_ids {
         let Ok(profile) = scan_dihedral(original, edge_id) else {
+            *complete = false;
             return Ok(());
         };
         if profile.is_mixed() {
+            *complete = false;
             return Ok(());
         }
         any_convex |= profile.any_convex;
@@ -1571,6 +1666,7 @@ pub(super) fn check_blend_interference(
         for step in 1..EDGE_SAMPLES {
             let t = edge.t0 + (edge.t1 - edge.t0) * step as f64 / EDGE_SAMPLES as f64;
             let Ok(point) = edge.curve.evaluate(t) else {
+                *complete = false;
                 continue;
             };
             sampled += 1;
@@ -1582,6 +1678,7 @@ pub(super) fn check_blend_interference(
                         // A classifier error at a sample counts as no violation
                         // (integrator finding 2026-10-17): counted so it is seen.
                         crate::blend::record_count("count.interference.classify_err", 1);
+                        *complete = false;
                         continue;
                     };
                     classification.class
@@ -1629,9 +1726,12 @@ pub(super) fn check_blend_interference(
         let band_at = |uv: Vec2| Ok(face_sample_uv_band(face, uv.x, uv.y, policy.model));
         for (uv, class) in face_grid_classes(face, GRID, &band_at) {
             let Some(Ok(PolygonClass::Inside)) = class else {
+                // None is the grid's proved-outside region, not an error.
+                if matches!(class, Some(Err(_))) { *complete = false; }
                 continue;
             };
             let Ok(point) = face.surface.evaluate(uv.x, uv.y) else {
+                *complete = false;
                 continue;
             };
             sampled += 1;
@@ -1641,6 +1741,7 @@ pub(super) fn check_blend_interference(
                 None => {
                     let Ok(classification) = classifier.classify(point) else {
                         crate::blend::record_count("count.interference.classify_err", 1);
+                        *complete = false;
                         continue;
                     };
                     classification.class
@@ -1828,6 +1929,36 @@ fn nearest_face_analytic_only() -> bool {
 /// convexity vote, whose probes sit between the mates of a blend: a wall
 /// sample's nearest boundary point is on a mate, and the ray classifier
 /// spent 18–36 µs per sample confirming it with two agreeing rays.
+/// Lane R1 (2026-10-18, smFilletTest_lCount_235): [`NearestFaceSide`]'s
+/// exterior-face boundary read cuts each edge to its range even where the
+/// range starts or ends at its curve's own domain end (`split` refuses those),
+/// and answers On only from edges so cut — the uncut whole curve, read before
+/// this, passed through a chamfered-away station along the old edge's line and
+/// answered On where the ray reads Out. On by default (promoted 2026-10-19:
+/// 98 + 144 census 0 differ); `BREP_NEAREST_SIDE_EDGE_PIECE=0` (or `off`)
+/// restores the uncut read.
+pub(crate) fn nearest_side_edge_piece_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !matches!(std::env::var("BREP_NEAREST_SIDE_EDGE_PIECE").as_deref(), Ok("0") | Ok("off")))
+}
+
+
+/// `curve` cut to `[low, high]`: no cut at an end that is the domain's own
+/// (within the knot identity `split` itself uses), the curve itself when both
+/// are; `None` when a cut fails or the range is not inside the domain.
+pub(crate) fn edge_piece(curve: &NurbsCurve, low: f64, high: f64) -> Option<NurbsCurve> {
+    let [start, end] = curve.domain().ok()?;
+    let slack = 1e-12 * (end - start).abs().max(1.0);
+    if !(low >= start - slack && high <= end + slack && high > low) {
+        return None;
+    }
+    let tail = if low <= start + slack { curve.clone() } else { curve.split(low).ok()?.1 };
+    if high >= end - slack {
+        return Some(tail);
+    }
+    tail.split(high).ok().map(|(piece, _)| piece)
+}
+
 pub(crate) struct NearestFaceSide<'a> {
     solid: &'a BrepSolid,
     faces: Vec<&'a FaceRecord>,
@@ -1942,6 +2073,11 @@ impl<'a> NearestFaceSide<'a> {
             // read is not rigorous; otherwise `Q` stays the nearest.
             let face = self.faces[exterior_index];
             let mut boundary = f64::INFINITY;
+            // Whether `boundary` is the distance to the edges THEMSELVES (each
+            // cut to its range) or only a lower bound from an uncut whole curve:
+            // a bound may decline (below), never answer On.
+            let mut boundary_exact = true;
+            let piece_fix = nearest_side_edge_piece_on();
             for loop_record in &face.loops {
                 for coedge in &loop_record.coedges {
                     let Some(edge) = self.solid.edges.iter().find(|edge| edge.id == coedge.edge_id) else {
@@ -1951,12 +2087,25 @@ impl<'a> NearestFaceSide<'a> {
                     // (`split` at both ends); the whole curve, a bound no larger
                     // than the edge's, where it cannot.
                     let (low, high) = (edge.t0.min(edge.t1), edge.t0.max(edge.t1));
-                    let piece = edge
-                        .curve
-                        .split(low)
-                        .and_then(|(_, rest)| rest.split(high))
-                        .map(|(piece, _)| piece)
-                        .unwrap_or_else(|_| edge.curve.clone());
+                    let piece = if piece_fix {
+                        // `split` refuses a parameter at either end of the
+                        // domain: an end the edge shares with its curve needs
+                        // no cut.
+                        match edge_piece(&edge.curve, low, high) {
+                            Some(piece) => piece,
+                            None => {
+                                boundary_exact = false;
+                                edge.curve.clone()
+                            }
+                        }
+                    } else {
+                        edge
+                            .curve
+                            .split(low)
+                            .and_then(|(_, rest)| rest.split(high))
+                            .map(|(piece, _)| piece)
+                            .unwrap_or_else(|_| edge.curve.clone())
+                    };
                     let projection = crate::project_point_to_curve(&piece, point).map_err(|_| "a boundary curve projection failed")?;
                     if !projection.distance.is_finite() {
                         return Err("a boundary curve projection read a non-finite distance");
@@ -1965,6 +2114,10 @@ impl<'a> NearestFaceSide<'a> {
                 }
             }
             if !(boundary > self.on_band) {
+                if !boundary_exact {
+                    // Only a whole curve's distance: the edge itself may be far.
+                    return Err("an exterior face's boundary edge could not be cut to its range");
+                }
                 // The point is within the On band of that face's boundary, so of
                 // the face: the classifier reads On there.
                 return Ok(PointClass::On);
@@ -2288,4 +2441,6 @@ pub(super) fn check_blend_wall_loops(result: &BrepSolid, entry: &str) -> Result<
     }
     Ok(())
 }
+
+
 

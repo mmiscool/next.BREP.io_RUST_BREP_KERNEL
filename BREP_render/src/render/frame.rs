@@ -11,6 +11,18 @@ impl RenderCore {
         params: &FrameParams,
         resolve_view: &wgpu::TextureView,
     ) {
+        self.render_to_view_with_context(gpu_scene, scene, params, resolve_view, None);
+    }
+
+    /// Draw optional, non-pickable assembly context after the opaque work part.
+    pub fn render_to_view_with_context(
+        &mut self,
+        gpu_scene: &mut GpuScene,
+        scene: &RenderScene,
+        params: &FrameParams,
+        resolve_view: &wgpu::TextureView,
+        context: Option<(&GpuScene, &RenderScene)>,
+    ) {
         let width = params.width.max(1);
         let height = params.height.max(1);
         self.ensure_targets(width, height);
@@ -55,6 +67,8 @@ impl RenderCore {
 
         // Refresh emphasis boundary buffers.
         let has_emphasis = !params.emphasis.is_empty();
+        // A solid a transparency clip made see-through draws in the blended pass.
+        let translucent = |solid: &SolidDisplay| solid.opacity.is_some_and(|opacity| opacity < 1.0);
         for solid in scene.solids() {
             if let Some(gpu_solid) = gpu_scene.solids.get_mut(&solid.name) {
                 self.sync_boundary(gpu_solid, solid, params.emphasis);
@@ -98,6 +112,9 @@ impl RenderCore {
                 multiview_mask: None,
             });
             pass.set_bind_group(0, &self.globals_bind, &[]);
+            // The solid pipelines' group 2: a solid's pose, set beside each
+            // solid's buffers; identity for anything else they draw.
+            pass.set_bind_group(2, &self.identity_model.bind, &[0]);
 
             let visible_solids: Vec<(&SolidDisplay, &GpuSolid)> = gpu_scene
                 .order
@@ -123,6 +140,7 @@ impl RenderCore {
                     if gpu_solid.wire_index_count == 0 {
                         continue;
                     }
+                    bind_pose(&mut pass, gpu_scene.models.as_ref(), &self.identity_model, gpu_solid.model_slot);
                     pass.set_vertex_buffer(0, gpu_solid.vertex_buf.slice(..));
                     pass.set_index_buffer(
                         gpu_solid.wire_index_buf.slice(..),
@@ -181,9 +199,10 @@ impl RenderCore {
             if !params.settings.wireframe && params.settings.show_faces {
                 pass.set_pipeline(&self.mesh_pipeline);
                 for (solid, gpu_solid) in &visible_solids {
-                    if solid.mesh.indices.is_empty() {
+                    if solid.mesh.indices.is_empty() || translucent(solid) {
                         continue;
                     }
+                    bind_pose(&mut pass, gpu_scene.models.as_ref(), &self.identity_model, gpu_solid.model_slot);
                     pass.set_vertex_buffer(0, gpu_solid.vertex_buf.slice(..));
                     pass.set_index_buffer(gpu_solid.index_buf.slice(..), wgpu::IndexFormat::Uint32);
                     // Fast path: no emphasis AND no hidden faces → one whole-mesh
@@ -275,6 +294,7 @@ impl RenderCore {
                     if gpu_solid.occludable_edge_instances == 0 {
                         continue;
                     }
+                    bind_pose(&mut pass, gpu_scene.models.as_ref(), &self.identity_model, gpu_solid.model_slot);
                     pass.set_vertex_buffer(0, edge_buf.slice(..));
                     if solid.visibility.any_edge_hidden() {
                         // Single style already bound: draw only visible edges.
@@ -296,6 +316,7 @@ impl RenderCore {
                     if gpu_solid.edge_instances == 0 {
                         continue;
                     }
+                    bind_pose(&mut pass, gpu_scene.models.as_ref(), &self.identity_model, gpu_solid.model_slot);
                     pass.set_vertex_buffer(0, edge_buf.slice(..));
                     let any_edge_hidden = solid.visibility.any_edge_hidden();
                     // The real edges are a prefix of the buffer and the AUX
@@ -385,6 +406,7 @@ impl RenderCore {
                     if boundary.count == 0 {
                         continue;
                     }
+                    pass.set_bind_group(2, &self.identity_model.bind, &[0]);
                     pass.set_vertex_buffer(0, buf.slice(..));
                     pass.draw(0..6, 0..boundary.count);
                 }
@@ -406,6 +428,7 @@ impl RenderCore {
                     if solid.visibility.all_vertices_hidden(solid.vertices.len()) {
                         continue;
                     }
+                    bind_pose(&mut pass, gpu_scene.models.as_ref(), &self.identity_model, gpu_solid.model_slot);
                     pass.set_vertex_buffer(0, point_buf.slice(..));
                     let any_vertex_hidden = solid.visibility.any_vertex_hidden();
                     if has_emphasis || any_vertex_hidden {
@@ -466,6 +489,7 @@ impl RenderCore {
             if draw_axes {
                 if let Some(axis_buf) = &gpu_scene.axis_buf {
                     pass.set_pipeline(&self.edge_visible_pipeline);
+                    pass.set_bind_group(2, &self.identity_model.bind, &[0]);
                     pass.set_vertex_buffer(0, axis_buf.slice(..));
                     for (index, style) in [
                         &self.styles.axis_x,
@@ -479,6 +503,78 @@ impl RenderCore {
                         let i = index as u32;
                         pass.draw(0..6, i..i + 1);
                     }
+                }
+            }
+            // Translucent solids (a motion study's transparency clip): after
+            // every opaque thing, through the blended context pipeline (depth
+            // test on, depth write off), each with its own base style, whose
+            // alpha `face_base_color` took from the display's opacity.
+            if !params.settings.wireframe && params.settings.show_faces {
+                let mut any = false;
+                for (solid, gpu_solid) in visible_solids.iter().filter(|(solid, _)| translucent(solid) && !solid.mesh.indices.is_empty()) {
+                    if !any {
+                        pass.set_pipeline(&self.context_pipeline);
+                        any = true;
+                    }
+                    bind_pose(&mut pass, gpu_scene.models.as_ref(), &self.identity_model, gpu_solid.model_slot);
+                    pass.set_vertex_buffer(0, gpu_solid.vertex_buf.slice(..));
+                    pass.set_index_buffer(gpu_solid.index_buf.slice(..), wgpu::IndexFormat::Uint32);
+                    pass.set_bind_group(1, &gpu_solid.base_style.bind, &[]);
+                    if !solid.visibility.any_face_hidden() {
+                        pass.draw_indexed(0..solid.mesh.indices.len() as u32, 0, 0..1);
+                        continue;
+                    }
+                    for (index, face) in gpu_solid.faces.iter().enumerate() {
+                        if solid.visibility.is_face_visible(index) {
+                            pass.draw_indexed(face.first_index..face.first_index + face.index_count, 0, 0..1);
+                        }
+                    }
+                }
+            }
+            if let Some((gpu_context, context_scene)) = context {
+                // Blend without depth writes: surroundings must not hide the
+                // editable geometry. Keep the work part's depth buffer intact.
+                self.context_style.write(&self.queue, context_scene.tint.unwrap_or(super::WORK_PART_CONTEXT_RGBA), [0.0; 4]);
+                pass.set_pipeline(&self.context_pipeline);
+                pass.set_bind_group(1, &self.context_style.bind, &[]);
+                for solid in context_scene.solids().iter().filter(|solid| solid.visible) {
+                    let Some(gpu) = gpu_context.solids.get(&solid.name) else { continue };
+                    bind_pose(&mut pass, gpu_context.models.as_ref(), &self.identity_model, gpu.model_slot);
+                    pass.set_vertex_buffer(0, gpu.vertex_buf.slice(..));
+                    pass.set_index_buffer(gpu.index_buf.slice(..), wgpu::IndexFormat::Uint32);
+                    if !solid.visibility.any_face_hidden() {
+                        pass.draw_indexed(0..solid.mesh.indices.len() as u32, 0, 0..1);
+                        continue;
+                    }
+                    for (index, face) in gpu.faces.iter().enumerate() {
+                        if solid.visibility.is_face_visible(index) {
+                            pass.draw_indexed(face.first_index..face.first_index + face.index_count, 0, 0..1);
+                        }
+                    }
+                }
+                // The context face picked or hovered, over its translucent self;
+                // or the context edge a sketch would copy, as a lit edge.
+                for (solid_name, face_name, selected) in &context_scene.highlight {
+                    let Some(solid) = context_scene.solid(solid_name) else { continue };
+                    let Some(gpu) = gpu_context.solids.get(solid_name) else { continue };
+                    let Some(index) = solid.faces.iter().position(|face| &face.name == face_name) else {
+                        let edge = solid.edges.iter().position(|edge| &edge.name == face_name);
+                        let (Some(index), Some(edge_buf)) = (edge, &gpu.edge_buf) else { continue };
+                        let Some(range) = gpu.edges.get(index) else { continue };
+                        pass.set_pipeline(&self.edge_visible_pipeline);
+                        pass.set_bind_group(1, if *selected { &self.styles.edge_selected.bind } else { &self.styles.edge_hovered.bind }, &[]);
+                        bind_pose(&mut pass, gpu_context.models.as_ref(), &self.identity_model, gpu.model_slot);
+                        pass.set_vertex_buffer(0, edge_buf.slice(..));
+                        pass.draw(0..6, range.first_instance..range.first_instance + range.instance_count);
+                        pass.set_pipeline(&self.context_pipeline);
+                        continue;
+                    };
+                    let Some(range) = gpu.faces.get(index) else { continue };
+                    pass.set_bind_group(1, if *selected { &self.context_selected.bind } else { &self.context_hovered.bind }, &[]);
+                    bind_pose(&mut pass, gpu_context.models.as_ref(), &self.identity_model, gpu.model_slot);
+                    pass.set_vertex_buffer(0, gpu.vertex_buf.slice(..));
+                    pass.set_index_buffer(gpu.index_buf.slice(..), wgpu::IndexFormat::Uint32);
+                    pass.draw_indexed(range.first_index..range.first_index + range.index_count, 0, 0..1);
                 }
             }
         }
@@ -642,14 +738,48 @@ impl RenderCore {
         height: u32,
     ) -> Result<Vec<u8>, String> {
         let settings = RenderSettings::artifact();
-        let emphasis = Emphasis::default();
         let mut gpu_scene = self.upload_scene_with(scene, &settings);
+        self.render_gpu_scene_to_png(&mut gpu_scene, scene, camera, width, height)
+    }
+
+    /// [`Self::render_to_png`] from buffers the caller already holds (synced
+    /// with [`RenderSettings::artifact`]): what the viewport's retained GPU
+    /// scene would draw.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn render_gpu_scene_to_png(
+        &mut self,
+        gpu_scene: &mut GpuScene,
+        scene: &RenderScene,
+        camera: &Camera,
+        width: u32,
+        height: u32,
+    ) -> Result<Vec<u8>, String> {
+        let settings = RenderSettings::artifact();
+        let rgb = self.render_gpu_scene_to_rgb(gpu_scene, scene, camera, width, height, &settings)?;
+        encode_png(&rgb, width, height)
+    }
+
+    /// Draw `scene` through `gpu_scene` (synced or uploaded by the caller) at
+    /// `width`×`height` under `settings` and read the frame back as packed
+    /// RGB, top row first: what a motion study's video export encodes frame
+    /// by frame with the viewport's own render core and the user's settings.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn render_gpu_scene_to_rgb(
+        &mut self,
+        gpu_scene: &mut GpuScene,
+        scene: &RenderScene,
+        camera: &Camera,
+        width: u32,
+        height: u32,
+        settings: &RenderSettings,
+    ) -> Result<Vec<u8>, String> {
+        let emphasis = Emphasis::default();
         let params = FrameParams {
             camera,
             width,
             height,
             dpr: 1.0,
-            settings: &settings,
+            settings,
             emphasis: &emphasis,
             world_per_pixel: 0.0,
             overlay: None,
@@ -669,7 +799,7 @@ impl RenderCore {
             view_formats: &[],
         });
         let resolve_view = resolve.create_view(&Default::default());
-        self.render_to_view(&mut gpu_scene, scene, &params, &resolve_view);
+        self.render_to_view(gpu_scene, scene, &params, &resolve_view);
 
         // Readback: rows padded to 256 bytes per wgpu's copy alignment.
         let bytes_per_row = (width * 4).div_ceil(256) * 256;
@@ -731,8 +861,7 @@ impl RenderCore {
         }
         drop(data);
         readback.unmap();
-
-        encode_png(&rgb, width, height)
+        Ok(rgb)
     }
 }
 
@@ -815,4 +944,13 @@ fn overlay_line_insts(ov: &brep_gizmos::Overlay) -> Vec<OverlayLineInstance> {
             color: pair[0].color,
         })
         .collect()
+}
+
+/// Bind a solid's pose: its slot of the scene's pose buffer (identity when
+/// the scene holds none yet).
+fn bind_pose(pass: &mut wgpu::RenderPass<'_>, models: Option<&ModelArena>, identity: &IdentityModel, slot: u32) {
+    match models {
+        Some(models) => pass.set_bind_group(2, &models.bind, &[ModelArena::offset(slot)]),
+        None => pass.set_bind_group(2, &identity.bind, &[0]),
+    }
 }

@@ -435,6 +435,9 @@ fn provenance(
 
 #[derive(Debug, Deserialize)]
 pub struct NewPart {
+    /// Required, except for instructions, which default to their own type
+    /// ([`crate::db::Db::instructions_part_type`]).
+    #[serde(default)]
     pub part_type: String,
     pub name: String,
     #[serde(default)]
@@ -483,12 +486,18 @@ pub async fn create_part(
     let user = require_author(&db, &headers)?;
     let document_class = DocumentClass::parse(&body.document_class).ok_or_else(|| {
         Error::bad_request(format!(
-            "'{}' is not a document class — normal, family or template",
+            "'{}' is not a document class — normal, family, template or instructions",
             body.document_class
         ))
     })?;
+    let part_type = if document_class == DocumentClass::Instructions && body.part_type.trim().is_empty() {
+        let db = db.clone();
+        blocking(move || db.instructions_part_type()).await?
+    } else {
+        body.part_type
+    };
     let spec = PartSpec {
-        part_type: body.part_type,
+        part_type,
         number: body.number,
         name: body.name,
         description: body.description,

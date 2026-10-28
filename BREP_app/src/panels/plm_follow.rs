@@ -18,11 +18,15 @@
 //!
 //! The first answer only records where the feed stands: nothing is re-read
 //! for what happened before the session looked.
-use crate::plm::client::{Changes, PlmClient};
+use crate::plm::client::{Changes, PlmClient, PlmError};
 use crate::plm::PlmFuture;
 use std::future::Future;
 use std::rc::Rc;
 use std::task::{Context, Poll, Waker};
+
+/// What a feed error starts with when the server refused the credential
+/// (`401`: revoked, expired, signed out), not the network.
+pub const SIGNED_OUT: &str = "signed out: ";
 
 /// How often the pane asks whether anything changed, in seconds.
 pub const FOLLOW_SECS: f64 = 5.0;
@@ -38,7 +42,12 @@ impl PlmFeed for Rc<PlmClient> {
         let client = self.clone();
         // The inherent method, by path: on an `Rc<PlmClient>`, `client.changes`
         // would resolve to THIS trait method again, forever.
-        Box::pin(async move { PlmClient::changes(&client, since).await.map_err(|e| e.to_string()) })
+        Box::pin(async move {
+            PlmClient::changes(&client, since).await.map_err(|e| match e {
+                PlmError::SignIn(why) => format!("{SIGNED_OUT}{why}"),
+                e => e.to_string(),
+            })
+        })
     }
 }
 
@@ -62,6 +71,37 @@ pub struct Follower {
     pub requests: u64,
     /// Times the feed said something moved.
     pub moves: u64,
+    /// Where the last feed question left the session: answered, unanswered
+    /// (the server is down or the network is gone), or refused (the sign-in
+    /// ended on the server). The pane says each change once.
+    reach: Standing,
+    /// A change of [`Self::reach`] the pane has not told yet.
+    told: Option<Reach>,
+    /// A Save's write found the server unreachable since the last answer
+    /// ([`Self::note_unreachable`]).
+    missed_write: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+enum Standing {
+    #[default]
+    Answered,
+    Unanswered,
+    Refused,
+}
+
+/// What the feed's answers say about reaching the server since last asked.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Reach {
+    /// The first unanswered question after answers.
+    Lost,
+    /// The first answer after unanswered questions.
+    Back,
+    /// The server refused the session's credential: revoked under Linked
+    /// desktops, expired, or signed out elsewhere.
+    SignedOut,
+    /// The first answer after the credential was refused: signed in again.
+    SignedIn,
 }
 
 impl Follower {
@@ -92,6 +132,7 @@ impl Follower {
             let mut cx = Context::from_waker(Waker::noop());
             if let Poll::Ready(answer) = request.as_mut().poll(&mut cx) {
                 self.request = None;
+                self.reached(answer.as_ref().map(|_| ()).map_err(String::as_str));
                 if let Ok(changes) = answer {
                     // A stale answer means the log was trimmed past us: the
                     // keys are incomplete, but something certainly moved.
@@ -115,12 +156,57 @@ impl Follower {
         moved
     }
 
+    /// Note one question's fate: a change of reachability is kept for
+    /// [`Self::take_reach`].
+    fn reached(&mut self, answer: Result<(), &str>) {
+        let now = match answer {
+            Ok(()) => Standing::Answered,
+            Err(why) if why.starts_with(SIGNED_OUT) => Standing::Refused,
+            Err(_) => Standing::Unanswered,
+        };
+        let was = std::mem::replace(&mut self.reach, now);
+        // A write the server missed while every question of ours was
+        // answered: the next answer is the news. A question missed meanwhile
+        // takes over (lost, then back, as for any outage).
+        if std::mem::take(&mut self.missed_write) && was == Standing::Answered && now == Standing::Answered {
+            self.told = Some(Reach::Back);
+            return;
+        }
+        let news = match (was, now) {
+            (a, b) if a == b => return,
+            (_, Standing::Unanswered) => Reach::Lost,
+            (_, Standing::Refused) => Reach::SignedOut,
+            (Standing::Refused, Standing::Answered) => Reach::SignedIn,
+            (_, Standing::Answered) => Reach::Back,
+        };
+        // Lost then back (or signed out, then in) before the pane looked:
+        // nothing to tell.
+        self.told = match (self.told, news) {
+            (Some(Reach::Lost), Reach::Back) | (Some(Reach::SignedOut), Reach::SignedIn) => None,
+            _ => Some(news),
+        };
+    }
+
+    /// A write found the server unreachable (and its failure was told): the
+    /// next answer is news, 'reachable again', though no question of the
+    /// follower's went unanswered. Says nothing itself.
+    pub fn note_unreachable(&mut self) {
+        self.missed_write = true;
+    }
+
+    /// The server stopped answering or answers again, or the sign-in ended
+    /// or was made again, since the last call.
+    pub fn take_reach(&mut self) -> Option<Reach> {
+        self.told.take()
+    }
+
     /// Take an answer that resolved as it was asked.
     fn tick_answer(&mut self) -> Option<Moved> {
         let request = self.request.as_mut()?;
         let mut cx = Context::from_waker(Waker::noop());
         let Poll::Ready(answer) = request.as_mut().poll(&mut cx) else { return None };
         self.request = None;
+        self.reached(answer.as_ref().map(|_| ()).map_err(String::as_str));
         let changes = answer.ok()?;
         let moved = self.seen.is_some_and(|seen| seen != changes.seq || changes.stale);
         self.seen = Some(changes.seq);

@@ -113,7 +113,7 @@ fn assemble_fragments_impl(
     };
     let mut faces = Vec::new();
     let mut used_face_names = HashSet::<String>::default();
-    let profile = std::env::var("BREP_PROFILE").is_ok();
+    let profile = crate::imprint::profile_enabled();
     let stage_started = Instant::now();
     // id-index over the immutable operands + imprint, built once. Replaces the
     // per-coedge linear scans of solid.edges/vertices/faces during assembly.

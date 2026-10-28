@@ -11,13 +11,13 @@ impl EngineState {
     /// [`pick_candidates_at`](Self::pick_candidates_at) — that is what the
     /// selection paths and the app's pick-list popup consume.
     pub fn pick_json(&self, x: f64, y: f64) -> String {
-        let candidates = pick::pick(&self.scene, &self.camera, x, y, &self.pick_options());
+        let candidates = pick::pick_unoccluded(&self.scene, &self.context_scene, &self.camera, x, y, &self.pick_options());
         pick::candidates_to_json(&candidates)
     }
 
     /// The single best candidate under `(x, y)` (hover), or `null`.
     pub fn hover_json(&self, x: f64, y: f64) -> String {
-        let candidates = pick::pick(&self.scene, &self.camera, x, y, &self.pick_options());
+        let candidates = pick::pick_unoccluded(&self.scene, &self.context_scene, &self.camera, x, y, &self.pick_options());
         match candidates.first() {
             Some(best) => pick::candidates_to_json(std::slice::from_ref(best))
                 .strip_prefix('[')
@@ -90,7 +90,7 @@ impl EngineState {
     }
 
     /// The FULL current settings as JSON (the round-trip counterpart of
-    /// [`apply_settings_json`]): the schema-driven form seeds its widgets from
+    /// [`apply_settings_json`](Self::apply_settings_json)): the schema-driven form seeds its widgets from
     /// this and the storage seam persists it.
     pub fn settings_json(&self) -> String {
         // Projection is live CAMERA state surfaced to the settings layer as a boolean
@@ -144,6 +144,14 @@ impl EngineState {
             // and re-seated from the KEPT display, so the hide has to reach
             // that copy or it lasts only until the next feature edit.
             self.remember_board_visibility(name, visible);
+            // The user's hide or show outlasts the active view's poses and
+            // section: the un-posed original carries it (sheets read it, the
+            // restore writes it back), and the section no longer owns it.
+            if let Some(original) = self.pmi_explode_originals.get_mut(name).filter(|original| original.visible != visible) {
+                original.visible = visible;
+                self.pmi_unposed_visibility += 1;
+            }
+            self.pmi_section_hidden.retain(|hidden| hidden != name);
             self.dirty = true;
             // A balloon on this body loses or regains its leader at once.
             if self.pmi_active_view.is_some() {
@@ -172,6 +180,7 @@ impl EngineState {
     /// `&mut self.camera`).
     pub fn depth_range_bbox(&self) -> crate::camera::Aabb {
         let mut bbox = self.scene.bbox();
+        bbox.union(&self.context_scene.bbox());
         bbox.union(&self.widgets.overlay_groups_bbox());
         bbox
     }
@@ -445,7 +454,7 @@ impl EngineState {
     /// only for the owner that set the hover, so panes that are on screen together
     /// in a split dock cannot end each other's highlight.
     ///
-    /// The name is resolved by [`resolve_entity_name`](Self::resolve_entity_name),
+    /// The name is resolved by `resolve_entity_name`,
     /// which also covers the row whose entity the feature CONSUMED — an open
     /// fillet form is rolled to the fillet, so its `Edges` rows name edges that no
     /// longer exist and the blend faces the kernel built from them are lit

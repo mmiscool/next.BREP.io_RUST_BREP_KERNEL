@@ -130,7 +130,7 @@ pub(super) fn wall_fold_refusal(faces: Vec<u64>, message: String) -> KernelRefus
 /// `O((chord/R)²)`: on the 2026-09-02 collar this step puts the chord near
 /// 2e-2 against a radius of 1.5, so the curvature is right to about 1e-4
 /// relative — three decades below the margin the verdict turns on.
-const PROBE_FRACTION: f64 = 5.0e-4;
+pub(super) const PROBE_FRACTION: f64 = 5.0e-4;
 
 /// Sub-samples spent refining around the tightest station. The factor is a
 /// smooth function of the edge parameter with one dominant peak per bend, and
@@ -644,6 +644,69 @@ pub(super) fn check_wall_fold(
     ))
 }
 
+/// What the local radius relief (`blend/relief.rs`) reads of a constant
+/// ball at one station: [`fold_number`].
+#[derive(Clone, Copy, Debug)]
+pub(super) struct FoldReading {
+    /// The larger of the wall's fold factor and each mate's `ρ κ_n` along its
+    /// contact's track — the two readings [`check_wall_fold`] refuses on, as
+    /// a number rather than a verdict. One is the fold.
+    pub(super) number: f64,
+    /// The ball centre curve's curvature vector here (zero where the probe
+    /// could not read it).
+    pub(super) turn: Vec3,
+    /// The sections [`PROBE_FRACTION`] of the span either side: their two
+    /// contacts and their ball centre.
+    pub(super) sections: [([Vec3; 2], Vec3); 2],
+}
+
+/// Read a constant ball of `radius` at edge parameter `t` ([`FoldReading`]).
+/// `None` when the probe cannot measure the station (a solve that failed, a
+/// step that hopped a seam).
+///
+/// The number alone does not see every fold. Where a contact runs INSIDE a
+/// convex turn of its face's outline (report 5e49bb42's cap, an r 0.93 turn)
+/// the centre curve is that turn offset inward: it tightens as the ball grows
+/// and passes through a cusp into a swallowtail, while the section arc never
+/// faces its curvature vector. The fold factor reads zero to the cusp and
+/// past it, and the fitted rows loop on the way (r 1.2 refuses there): the
+/// contact on the cap stands further in than the centre and its rail cusps
+/// first. So the reading also hands back the probe's two neighbouring
+/// sections, whose every point must advance with the ball, as
+/// [`check_rows_loop`] asks of the fitted rows.
+pub(super) fn fold_number(
+    radius: f64,
+    span: f64,
+    t: f64,
+    seed: [f64; 4],
+    solve: SolveCentre<'_>,
+    surfaces: [&crate::NurbsSurface; 2],
+    scale: f64,
+) -> Option<FoldReading> {
+    let probed = probe(radius, span, t, seed, solve)?;
+    let turn = curvature_vector(probed.before.1, probed.centre, probed.after.1).unwrap_or_default();
+    let factor = sample(radius, t, &probed).map(|sample| sample.factor);
+    let mut worst = factor.unwrap_or(0.0);
+    let mut rails = [None; 2];
+    for side in 0..2 {
+        let Ok(travel) = probed.after.0[side].sub(probed.before.0[side]).normalized() else {
+            continue;
+        };
+        let uv = [probed.uv[2 * side], probed.uv[2 * side + 1]];
+        if let Some(curvature) = rail_curvature(surfaces[side], uv, probed.contacts[side], probed.centre, travel, scale) {
+            rails[side] = Some(radius * curvature);
+            worst = worst.max(radius * curvature);
+        }
+    }
+    if std::env::var("BREP_DEBUG_RELIEF").is_ok() {
+        eprintln!(
+            "  fold number at t {t:.6} r {radius:.5}: factor {factor:?} centre turn radius {:.6} rails {rails:?}",
+            1.0 / turn.length()
+        );
+    }
+    Some(FoldReading { number: worst, turn, sections: [probed.before, probed.after] })
+}
+
 /// `BREP_BLEND_ROWS_LOOP_CHECK=0` skips [`check_rows_loop`] (a census hatch;
 /// unset or anything else runs it). Read once.
 fn rows_loop_check_enabled() -> bool {
@@ -735,6 +798,14 @@ pub(super) fn check_rows_loop(
                 let along = b.sub(a).dot(m);
                 least = least.min(along);
                 if along < -bar {
+                    if debug {
+                        eprintln!(
+                            "rows-loop check: loop at ({:.6}, {:.6}, {:.6}) between station centres ({:.6}, {:.6}, {:.6}) and ({:.6}, {:.6}, {:.6})",
+                            a.x, a.y, a.z,
+                            stations[index].center.x, stations[index].center.y, stations[index].center.z,
+                            stations[index + 1].center.x, stations[index + 1].center.y, stations[index + 1].center.z
+                        );
+                    }
                     return Err(wall_fold_refusal(
                         faces,
                         format!(

@@ -38,7 +38,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::feature_pipeline::component::{self, create_component};
+use crate::feature_pipeline::component::{self, create_component, NestedConstraint};
 use crate::feature_pipeline::features::common;
 use crate::feature_pipeline::ports;
 use crate::feature_pipeline::{
@@ -111,14 +111,27 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, String> {
     // the STALE lane (a snapshot from another kernel build is rebuilt).
     let stale = !entry.dirty
         && parts_library::kernel_source_stamp().is_some_and(|stamp| entry.snapshot_producer != stamp);
+    // A sub-assembly whose constraint rows this session has not seen (a loaded
+    // document: the rows are not saved) is rebuilt too, so the parent can say
+    // how the sub-assembly's own mates ended — and an old snapshot that baked
+    // them unsolved is re-solved.
     let mut note: Option<String> = None;
-    let (restored, ports): (RestoredSnapshot, BTreeMap<String, PortRecord>) = if entry.dirty || crate::feature_pipeline::extension::document_uses_extensions(&entry.document) {
+    let (restored, ports, nested, nested_poses): Decoded = if entry.dirty
+        || crate::feature_pipeline::extension::document_uses_extensions(&entry.document)
+    {
         heal(&part_name, &entry.document)?
     } else if stale {
-        rebuild_stale(&part_name, &entry, &mut note)?
+        rebuild_stale(&part_name, &entry, Rebuild::Stale, &mut note)?
+    } else if parts_library::needs_constraint_rows(&entry) {
+        rebuild_stale(&part_name, &entry, Rebuild::ConstraintRows, &mut note)?
     } else {
         match restore_solids(&entry.snapshot) {
-            Ok(snapshot) => (snapshot, entry.ports.clone()),
+            Ok(snapshot) => (
+                snapshot,
+                entry.ports.clone(),
+                entry.nested_constraints.clone().unwrap_or_default(),
+                entry.nested_poses.clone(),
+            ),
             Err(_) => heal(&part_name, &entry.document)?,
         }
     };
@@ -136,6 +149,38 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, String> {
         create_component(&ctx.id, &part_name, fixed, source, transform, members)?;
     // The part's ports ride along, namespaced and posed like its members.
     let posed_ports = component::attach_component_ports(&mut record, &ports);
+    // A sub-assembly's constraint rows, under this instance's namespace: every
+    // one rides the record (the parent's assembly report lists them), and one
+    // that did not end satisfied is noted here, never dropped.
+    record.nested_constraints = nested.iter().map(|row| row.namespaced(&ctx.id)).collect();
+    // Where the sub-assembly's own solve put its occurrences (part-local).
+    record.nested_poses = nested_poses;
+    // A FLEXIBLE instance lends its occurrences to the parent's solve
+    // (`assembly::flexible`); rigid is the default.
+    match ctx.param("flexible") {
+        None | Some(serde_json::Value::Null) | Some(serde_json::Value::Bool(false)) => {}
+        Some(serde_json::Value::Bool(true)) => {
+            let mut spec = flexible_spec(ctx.param("flexiblePoses"), &entry.document);
+            for (path, fixed) in ctx.param("flexibleFixed").and_then(|map| map.as_object()).into_iter().flatten() {
+                if let Some(fixed) = fixed.as_bool() {
+                    spec.fixed.insert(path.clone(), fixed);
+                }
+            }
+            record.flexible = Some(spec);
+        }
+        Some(other) => return Err(format!("param `flexible` must be a boolean, found {other}")),
+    }
+    let nested_notes: Vec<String> = record
+        .nested_constraints
+        .iter()
+        .filter(|row| row.is_failure())
+        .map(|row| {
+            format!(
+                "sub-assembly '{part_name}': constraint {} ({}) is {}: {}",
+                row.id, row.constraint_type, row.status, row.message
+            )
+        })
+        .collect();
 
     // Stamp the part's captured metadata under the namespaced names.
     for (name, mut metadata_record) in restored.metadata {
@@ -149,6 +194,7 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, String> {
     result.added = added;
     result.components = vec![record];
     result.notes.extend(note);
+    result.notes.extend(nested_notes);
     for (id, posed) in posed_ports {
         ports::publish_port(&mut result, &id, posed)?;
     }
@@ -158,18 +204,24 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, String> {
 /// The self-heal lane: re-execute the entry's embedded document in isolation,
 /// write the fresh snapshot back into the ACTIVE library entry, and decode it —
 /// from here on the caller proceeds exactly as the fast lane.
-fn heal(
-    part_name: &str,
-    document: &serde_json::Value,
-) -> Result<(RestoredSnapshot, BTreeMap<String, PortRecord>), String> {
-    let (payload, ports) = parts_library::rebuild_snapshot(document).map_err(|error| {
+fn heal(part_name: &str, document: &serde_json::Value) -> Result<Decoded, String> {
+    let rebuilt = parts_library::rebuild_part(document).map_err(|error| {
         format!("part '{part_name}': re-executing its document failed: {error}")
     })?;
-    let restored = restore_solids(&payload)
+    let restored = restore_solids(&rebuilt.snapshot)
         .map_err(|error| format!("part '{part_name}': rebuilt snapshot did not decode: {error}"))?;
-    parts_library::heal_entry(part_name, payload, ports.clone());
-    Ok((restored, ports))
+    parts_library::heal_entry(part_name, &rebuilt);
+    Ok((restored, rebuilt.ports, rebuilt.nested_constraints, rebuilt.nested_poses))
 }
+
+/// A decoded part: its solids and metadata, its ports, its constraint rows and
+/// its solved occurrence poses.
+type Decoded = (
+    RestoredSnapshot,
+    BTreeMap<String, PortRecord>,
+    Vec<NestedConstraint>,
+    BTreeMap<String, crate::AffineTransform>,
+);
 
 /// The STALE lane: rebuild a part whose snapshot another kernel build made.
 ///
@@ -181,33 +233,62 @@ fn heal(
 fn rebuild_stale(
     part_name: &str,
     entry: &parts_library::PartsLibraryEntry,
+    why: Rebuild,
     note: &mut Option<String>,
-) -> Result<(RestoredSnapshot, BTreeMap<String, PortRecord>), String> {
+) -> Result<Decoded, String> {
     let stored = restore_solids(&entry.snapshot);
     match heal(part_name, &entry.document) {
-        Ok((rebuilt, ports)) => {
+        Ok((rebuilt, ports, nested, nested_poses)) => {
             let change = match &stored {
                 Ok(stored) => describe_change(stored, &rebuilt),
                 Err(_) => None,
             };
             if let Some(change) = change {
                 *note = Some(format!(
-                    "part '{part_name}' was rebuilt from its document because its stored \
-                     snapshot was made by a different kernel build; {change}"
+                    "part '{part_name}' was rebuilt from its document because {}; {change}",
+                    why.reason()
                 ));
             }
-            Ok((rebuilt, ports))
+            Ok((rebuilt, ports, nested, nested_poses))
         }
         Err(error) => match stored {
             Ok(stored) => {
                 *note = Some(format!(
-                    "part '{part_name}': its stored snapshot was made by a different kernel \
-                     build and rebuilding it failed, so the stored snapshot is used ({error})"
+                    "part '{part_name}': {} and rebuilding it failed, so the stored snapshot \
+                     is used ({error})",
+                    why.reason()
                 ));
-                Ok((stored, entry.ports.clone()))
+                Ok((
+                    stored,
+                    entry.ports.clone(),
+                    entry.nested_constraints.clone().unwrap_or_default(),
+                    entry.nested_poses.clone(),
+                ))
             }
             Err(_) => Err(error),
         },
+    }
+}
+
+/// Why [`rebuild_stale`] rebuilds a part whose snapshot still decodes.
+#[derive(Clone, Copy)]
+enum Rebuild {
+    /// The snapshot was made by another kernel build.
+    Stale,
+    /// The part is an assembly whose constraint statuses this session has not
+    /// seen; the rebuild solves them (rows are not saved with the snapshot).
+    ConstraintRows,
+}
+
+impl Rebuild {
+    fn reason(self) -> &'static str {
+        match self {
+            Rebuild::Stale => "its stored snapshot was made by a different kernel build",
+            Rebuild::ConstraintRows => {
+                "its sub-assembly constraints are solved inside it and had not been evaluated \
+                 in this session"
+            }
+        }
     }
 }
 
@@ -304,8 +385,96 @@ pub fn schema() -> serde_json::Value {
                 "default_value": false,
                 "label": "Fixed",
                 "hint": "grounded — the solver never moves it; the first component of an empty assembly is auto-fixed when unset"
+            },
+            "flexible": {
+                "type": "boolean",
+                "default_value": false,
+                "label": "Flexible",
+                "hint": "a sub-assembly's own mates solve under this assembly's, per instance (its parts can move); off = one rigid body"
             }
         }
     })
+}
+
+/// A `{translate, rotateEulerDeg}` pose param (numbers; anything else reads 0)
+/// as a rigid transform — the shape the solver write-back persists.
+fn pose_param_transform(value: &serde_json::Value) -> Option<AffineTransform> {
+    let vec3 = |key: &str| -> [f64; 3] {
+        let mut out = [0.0; 3];
+        if let Some(items) = value.get(key).and_then(|v| v.as_array()) {
+            for (slot, item) in out.iter_mut().zip(items) {
+                *slot = item.as_f64().unwrap_or(0.0);
+            }
+        }
+        out
+    };
+    let (translate, rotate) = (vec3("translate"), vec3("rotateEulerDeg"));
+    let matrix = common::compose_trs_matrix(
+        translate,
+        [rotate[0].to_radians(), rotate[1].to_radians(), rotate[2].to_radians()],
+        [1.0, 1.0, 1.0],
+        [0.0, 0.0, 0.0],
+    );
+    AffineTransform::new(matrix).ok()
+}
+
+/// What a flexible instance tells the parent's solve: the child document's own
+/// constraints, which of its occurrences it grounds (an `isFixed` ACOMP, the
+/// auto-grounded first one, or a Fixed constraint's target), where it authors
+/// each occurrence, and this instance's persisted occurrence poses.
+fn flexible_spec(seeds: Option<&serde_json::Value>, document: &serde_json::Value) -> component::FlexibleSpec {
+    let mut spec = component::FlexibleSpec::default();
+    let constraints = document
+        .get("assembly")
+        .and_then(|assembly| assembly.get("constraints"))
+        .and_then(|list| list.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let mut first = true;
+    for feature in document.get("features").and_then(|f| f.as_array()).into_iter().flatten() {
+        if !feature.get("type").and_then(|t| t.as_str()).is_some_and(|t| matches!(t, "ACOMP" | "ASSEMBLY COMPONENT")) {
+            continue;
+        }
+        let params = feature.get("inputParams").cloned().unwrap_or_default();
+        let Some(id) = params.get("id").and_then(|id| id.as_str()) else { continue };
+        let grounded = match params.get("isFixed") {
+            Some(serde_json::Value::Bool(flag)) => *flag,
+            _ => first,
+        };
+        first = false;
+        if grounded {
+            spec.grounded.insert(id.to_string());
+        }
+        if let Some(transform) = params.get("transform").and_then(pose_param_transform) {
+            spec.authored.insert(id.to_string(), transform);
+        }
+        // An occurrence the child itself places flexible lends its own
+        // occurrences too, from the child's copy of its document.
+        if params.get("flexible") == Some(&serde_json::Value::Bool(true)) {
+            let part = params.get("partName").and_then(|name| name.as_str()).unwrap_or_default();
+            if let Some(inner) = document.pointer(&format!("/partsLibrary/{}/document", part.replace('~', "~0").replace('/', "~1"))) {
+                spec.nested.insert(id.to_string(), flexible_spec(None, inner));
+            }
+        }
+    }
+    for constraint in &constraints {
+        if constraint.get("type").and_then(|t| t.as_str()) != Some("fixed") {
+            continue;
+        }
+        let elements = constraint.pointer("/inputParams/elements").and_then(|e| e.as_array());
+        for element in elements.into_iter().flatten().filter_map(|e| e.as_str()) {
+            let owner = element.split(':').next().unwrap_or(element);
+            spec.grounded.insert(owner.to_string());
+        }
+    }
+    spec.constraints = constraints;
+    if let Some(seeds) = seeds.and_then(|seeds| seeds.as_object()) {
+        for (path, pose) in seeds {
+            if let Some(transform) = pose_param_transform(pose) {
+                spec.seeds.insert(path.clone(), transform);
+            }
+        }
+    }
+    spec
 }
 

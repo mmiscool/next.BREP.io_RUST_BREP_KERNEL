@@ -75,8 +75,9 @@ fn world_dir(poses: &[Pose], ld: LocalDir) -> Vec3 {
 /// One residual atom contributing rows to the stacked residual vector.
 /// `rows()` is the number of scalar rows emitted; `eff_rows()` is the atom's
 /// theoretical rank at a solution (a 3-row unit-direction block can only ever
-/// remove 2 DOF), used for redundancy accounting.
-#[derive(Clone, Copy, Debug)]
+/// remove 2 DOF), used for redundancy accounting. Not `Copy`: a curve atom
+/// shares its sampled curve.
+#[derive(Clone, Debug)]
 pub(super) enum Atom {
     /// wa − wb (3 rows, eff 3).
     PointsCoincide(LocalPoint, LocalPoint),
@@ -107,6 +108,156 @@ pub(super) enum Atom {
     /// lines collinear), avoiding the ‖·‖ − 0 kink a scalar residual would
     /// have at the solution.
     LineLineTouch(LocalPoint, LocalDir, LocalPoint, LocalDir),
+    /// A limit row (1 row, eff 0): zero while `measure` is inside
+    /// `[lo, hi]`, else the signed distance to the nearer end. A circular
+    /// measure (`DirAngle`, radians) runs from `lo` counter-clockwise to `hi`.
+    Limit(Measure, f64, f64),
+    /// Mirror atoms: the trailing `(LocalPoint, LocalDir)` is the mirror plane
+    /// (origin, unit normal) and `R` reflects across it.
+    /// R(pa) − pb (3 rows, eff 3).
+    SymPoints(LocalPoint, LocalPoint, LocalPoint, LocalDir),
+    /// R(da) − db for directions (3 rows, eff 2).
+    SymDirMatch(LocalDir, LocalDir, LocalDir),
+    /// R(da) × db — mirrored directions parallel in either sense (3 rows,
+    /// eff 2).
+    SymDirCross(LocalDir, LocalDir, LocalDir),
+    /// (pb − R(oa))·R(na): point B on plane A's mirror image (1 row).
+    SymPointOnPlane(LocalPoint, LocalPoint, LocalDir, LocalPoint, LocalDir),
+    /// The part of R(oa) − ob across line B (`ob`, `db`): A's mirrored axis
+    /// point on B's line (3 rows, eff 2).
+    SymAxisLateral(LocalPoint, LocalPoint, LocalDir, LocalPoint, LocalDir),
+    /// `ka·θa + kb·θb` for two spins (1 row) — the gear coupling.
+    GearPhase(Spin, Spin, f64, f64),
+    /// Rack travel minus `k·θ` (1 row): `(rack point − world point)·rack
+    /// direction − k·θ(pinion)`.
+    RackTravel(Spin, LocalPoint, LocalDir, Vec3, f64),
+    /// Screw advance (1 row): `((pb − oa)·da − offset0) − k·wrap(θ − angle0)`
+    /// with `θ` the angle about `da` from A's reference to B's:
+    /// `(oa, da, ref_a, ref_b, pb, angle0, offset0, k)`.
+    ScrewAdvance(LocalPoint, LocalDir, LocalDir, LocalDir, LocalPoint, f64, f64, f64),
+    /// World `p − C(t*)` for the curve's closest point (3 rows, eff 2).
+    PointOnCurve(LocalPoint, CurveRef),
+    /// The axis line `(point, direction)` through the curve: the part of
+    /// `p − C(t*)` across the axis, `t*` the closest curve point to the
+    /// axis's crossing of the curve's plane (3 rows, eff 2).
+    AxisOnCurve(LocalPoint, LocalDir, CurveRef),
+    /// Where the closest point sits along the curve, minus a target fraction
+    /// (1 row): `(point, projection axis, curve, target, reverse)` — with an
+    /// axis, the point is first slid along it onto the curve's plane.
+    CurveAlong(LocalPoint, Option<LocalDir>, CurveRef, f64, bool),
+    /// Cam contact (1 row): `(follower centre, roller axis, profile, profile
+    /// normal, radius, side)` — the signed in-plane distance from the
+    /// follower to the profile on `side`, minus the radius.
+    CamContact(LocalPoint, Option<LocalDir>, CurveRef, LocalDir, f64, f64),
+}
+
+/// A body's spin about its own axis, read against a fixed WORLD reference
+/// direction: `(local reference ⟂ axis, local axis, world reference)`.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct Spin {
+    pub(super) reference: LocalDir,
+    pub(super) axis: LocalDir,
+    pub(super) world: Vec3,
+}
+
+impl Spin {
+    fn angle(&self, poses: &[Pose]) -> f64 {
+        signed_angle(self.world, world_dir(poses, self.reference), world_dir(poses, self.axis))
+    }
+}
+
+/// The signed angle about unit `n` from `from` to `to` (both projected ⟂ n).
+pub(super) fn signed_angle(from: Vec3, to: Vec3, n: Vec3) -> f64 {
+    let from = from.sub(n.scale(from.dot(n)));
+    let to = to.sub(n.scale(to.dot(n)));
+    n.dot(from.cross(to)).atan2(from.dot(to))
+}
+
+/// Wrap an angle into (−π, π].
+fn wrap_angle(angle: f64) -> f64 {
+    angle.sin().atan2(angle.cos())
+}
+
+/// Reflect a world point across the plane through `o` with unit normal `n`.
+fn mirror_point(p: Vec3, o: Vec3, n: Vec3) -> Vec3 {
+    p.sub(n.scale(2.0 * p.sub(o).dot(n)))
+}
+
+/// Reflect a world direction across a plane with unit normal `n`.
+fn mirror_dir(d: Vec3, n: Vec3) -> Vec3 {
+    d.sub(n.scale(2.0 * d.dot(n)))
+}
+
+/// The quantity a limit row reads: a one-row atom with its target removed.
+/// `DirDot` reads the cosine, `DirAngle` the wrapped signed angle (radians).
+#[derive(Clone, Copy, Debug)]
+pub(super) enum Measure {
+    PointOnPlane(LocalPoint, LocalPoint, LocalDir),
+    DirDot(LocalDir, LocalDir),
+    DirAngle(LocalDir, LocalDir, LocalDir),
+    PointDistance(LocalPoint, LocalPoint),
+    PointLineDistance(LocalPoint, LocalPoint, LocalDir),
+    LineLineDistance(LocalPoint, LocalDir, LocalPoint, LocalDir),
+}
+
+impl Measure {
+    /// The measure of a target-carrying atom (the zero-target degradations
+    /// map back to the distance they stand for); `None` for an atom that
+    /// measures nothing.
+    pub(super) fn of(atom: &Atom) -> Option<Self> {
+        Some(match *atom {
+            Atom::PointOnPlane(p, o, n, _) => Measure::PointOnPlane(p, o, n),
+            Atom::DirDot(a, b, _) => Measure::DirDot(a, b),
+            Atom::DirAngle(a, b, axis, _) => Measure::DirAngle(a, b, axis),
+            Atom::PointDistance(a, b, _) | Atom::PointsCoincide(a, b) => Measure::PointDistance(a, b),
+            Atom::PointLineDistance(p, o, d, _) | Atom::AxisLateral(p, o, d) => {
+                Measure::PointLineDistance(p, o, d)
+            }
+            Atom::LineLineDistance(oa, da, ob, db, _) | Atom::LineLineTouch(oa, da, ob, db) => {
+                Measure::LineLineDistance(oa, da, ob, db)
+            }
+            _ => return None,
+        })
+    }
+
+    fn circular(&self) -> bool {
+        matches!(self, Measure::DirAngle(..))
+    }
+
+    fn value(&self, poses: &[Pose]) -> f64 {
+        let atom = match *self {
+            Measure::PointOnPlane(p, o, n) => Atom::PointOnPlane(p, o, n, 0.0),
+            Measure::DirDot(a, b) => Atom::DirDot(a, b, 0.0),
+            Measure::DirAngle(a, b, axis) => Atom::DirAngle(a, b, axis, 0.0),
+            Measure::PointDistance(a, b) => Atom::PointDistance(a, b, 0.0),
+            Measure::PointLineDistance(p, o, d) => Atom::PointLineDistance(p, o, d, 0.0),
+            Measure::LineLineDistance(oa, da, ob, db) => Atom::LineLineDistance(oa, da, ob, db, 0.0),
+        };
+        let mut out = Vec::with_capacity(1);
+        atom.eval(poses, &mut out);
+        out[0]
+    }
+}
+
+/// The limit row for measured value `m` against `[lo, hi]`.
+pub(super) fn limit_residual(m: f64, lo: f64, hi: f64, circular: bool) -> f64 {
+    if circular {
+        let turn = std::f64::consts::TAU;
+        let rel = (m - lo).rem_euclid(turn);
+        let span = (hi - lo).rem_euclid(turn);
+        if rel <= span {
+            return 0.0;
+        }
+        let past_hi = rel - span;
+        let short_of_lo = turn - rel;
+        if past_hi <= short_of_lo { past_hi } else { -short_of_lo }
+    } else if m < lo {
+        m - lo
+    } else if m > hi {
+        m - hi
+    } else {
+        0.0
+    }
 }
 
 /// C1 skew weight for the line-line parallel-degeneracy switch: 0 at
@@ -161,20 +312,45 @@ impl Atom {
             | Atom::DirMatch(..)
             | Atom::DirCross(..)
             | Atom::AxisLateral(..)
-            | Atom::LineLineTouch(..) => 3,
+            | Atom::LineLineTouch(..)
+            | Atom::SymPoints(..)
+            | Atom::SymDirMatch(..)
+            | Atom::SymDirCross(..)
+            | Atom::SymAxisLateral(..)
+            | Atom::PointOnCurve(..)
+            | Atom::AxisOnCurve(..) => 3,
             Atom::PointOnPlane(..)
             | Atom::DirDot(..)
             | Atom::DirAngle(..)
             | Atom::PointDistance(..)
             | Atom::PointLineDistance(..)
-            | Atom::LineLineDistance(..) => 1,
+            | Atom::LineLineDistance(..)
+            | Atom::Limit(..)
+            | Atom::SymPointOnPlane(..)
+            | Atom::GearPhase(..)
+            | Atom::RackTravel(..)
+            | Atom::ScrewAdvance(..)
+            | Atom::CurveAlong(..)
+            | Atom::CamContact(..) => 1,
         }
     }
 
     pub(super) fn eff_rows(&self) -> usize {
         match self {
-            Atom::PointsCoincide(..) => 3,
-            Atom::DirMatch(..) | Atom::DirCross(..) | Atom::AxisLateral(..) => 2,
+            Atom::PointsCoincide(..) | Atom::SymPoints(..) => 3,
+            Atom::DirMatch(..)
+            | Atom::DirCross(..)
+            | Atom::AxisLateral(..)
+            | Atom::SymDirMatch(..)
+            | Atom::SymDirCross(..)
+            | Atom::SymAxisLateral(..)
+            | Atom::PointOnCurve(..)
+            | Atom::AxisOnCurve(..) => 2,
+            Atom::CurveAlong(..) | Atom::CamContact(..) => 1,
+            Atom::SymPointOnPlane(..)
+            | Atom::GearPhase(..)
+            | Atom::RackTravel(..)
+            | Atom::ScrewAdvance(..) => 1,
             // A satisfied touch removes 1 DOF at a skew intersection but 2 at
             // a collinear solution; report the minimum so a satisfied mate
             // never fabricates an "over" (redundancy) diagnosis.
@@ -185,6 +361,9 @@ impl Atom {
             | Atom::PointLineDistance(..)
             | Atom::LineLineDistance(..)
             | Atom::LineLineTouch(..) => 1,
+            // Inside its range a limit binds nothing; at an end it binds what
+            // its measure binds, which the rank sees without being counted.
+            Atom::Limit(..) => 0,
         }
     }
 
@@ -274,6 +453,56 @@ impl Atom {
                     f.v
                 };
                 out.extend([r.x, r.y, r.z]);
+            }
+            Atom::Limit(measure, lo, hi) => {
+                out.push(limit_residual(measure.value(poses), lo, hi, measure.circular()));
+            }
+            Atom::SymPoints(a, b, o, n) => {
+                let r = mirror_point(world_point(poses, a), world_point(poses, o), world_dir(poses, n))
+                    .sub(world_point(poses, b));
+                out.extend([r.x, r.y, r.z]);
+            }
+            Atom::SymDirMatch(a, b, n) => {
+                let r = mirror_dir(world_dir(poses, a), world_dir(poses, n)).sub(world_dir(poses, b));
+                out.extend([r.x, r.y, r.z]);
+            }
+            Atom::SymDirCross(a, b, n) => {
+                let r = mirror_dir(world_dir(poses, a), world_dir(poses, n)).cross(world_dir(poses, b));
+                out.extend([r.x, r.y, r.z]);
+            }
+            Atom::SymPointOnPlane(pb, oa, na, o, n) => {
+                let (wo, wn) = (world_point(poses, o), world_dir(poses, n));
+                let origin = mirror_point(world_point(poses, oa), wo, wn);
+                let normal = mirror_dir(world_dir(poses, na), wn);
+                out.push(world_point(poses, pb).sub(origin).dot(normal));
+            }
+            Atom::GearPhase(a, b, ka, kb) => {
+                out.push(ka * a.angle(poses) + kb * b.angle(poses));
+            }
+            Atom::RackTravel(pinion, p, d, origin, k) => {
+                let travel = world_point(poses, p).sub(origin).dot(world_dir(poses, d));
+                out.push(travel - k * pinion.angle(poses));
+            }
+            Atom::ScrewAdvance(oa, da, ref_a, ref_b, pb, angle0, offset0, k) => {
+                let n = world_dir(poses, da);
+                let height = world_point(poses, pb).sub(world_point(poses, oa)).dot(n);
+                let turn = signed_angle(world_dir(poses, ref_a), world_dir(poses, ref_b), n);
+                out.push((height - offset0) - k * wrap_angle(turn - angle0));
+            }
+            Atom::PointOnCurve(p, ref curve) => eval_point_on_curve(poses, p, curve, out),
+            Atom::AxisOnCurve(p, d, ref curve) => eval_axis_on_curve(poses, p, d, curve, out),
+            Atom::CamContact(p, axis, ref curve, normal, radius, side) => {
+                eval_cam_contact(poses, p, axis, curve, normal, radius, side, out)
+            }
+            Atom::CurveAlong(p, d, ref curve, target, reverse) => {
+                eval_curve_along(poses, p, d, curve, target, reverse, out)
+            }
+            Atom::SymAxisLateral(oa, ob, db, o, n) => {
+                let v = mirror_point(world_point(poses, oa), world_point(poses, o), world_dir(poses, n))
+                    .sub(world_point(poses, ob));
+                let d = world_dir(poses, db);
+                let lateral = v.sub(d.scale(d.dot(v)));
+                out.extend([lateral.x, lateral.y, lateral.z]);
             }
         }
     }

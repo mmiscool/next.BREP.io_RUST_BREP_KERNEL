@@ -462,6 +462,12 @@ impl EngineState {
                 return Err(format!("unknown base plane '{other}' (expected XY|XZ|YZ)"));
             }
         };
+        self.new_sketch_on(plane, frame)
+    }
+
+    /// A new sketch on the named `plane` (a base plane, or a datum's
+    /// `<id>:XY`), its basis seeded with `frame`; enters sketch mode.
+    pub fn new_sketch_on(&mut self, plane: &str, frame: crate::sketch::PlaneFrame) -> Result<String, String> {
         let id = self
             .history
             .next_feature_id(&crate::features::feature_short_name("S"));

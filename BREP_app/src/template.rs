@@ -219,6 +219,9 @@ pub fn spin_out(
     object.remove(crate::document_class::DOCUMENT_CLASS_KEY);
     object.remove(crate::family_table::FAMILY_TABLE_KEY);
     object.remove(crate::family_table::FAMILY_SOURCE_KEY);
+    // A new document from a template is no relative of the template's own
+    // origin (two parts from one template are unrelated parts).
+    object.remove(brep_render::engine_state::replace_component::DERIVED_FROM_KEY);
     let source = TemplateSource {
         template: template_file.to_string(),
         content_hash: template_hash(template),

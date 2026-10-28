@@ -697,10 +697,18 @@ pub(in crate::blend) fn rails_on_shipped_windows(
     carriers: [&NurbsSurface; 2],
     windows: [Option<[f64; 2]>; 2],
 ) -> (f64, [usize; 2]) {
+    read_rail_windows([&rows.cr, &rows.cs], parameters, stations, carriers, windows,
+        rows.exact_extrusion && affine_reads_on(), None)
+}
+
+fn read_rail_windows(
+    rails: [&NurbsCurve; 2], parameters: &[f64], stations: &[Station],
+    carriers: [&NurbsSurface; 2], windows: [Option<[f64; 2]>; 2], affine: bool,
+    mut memo: Option<&mut RailFeet>,
+) -> (f64, [usize; 2]) {
     let mut worst = 0.0_f64;
     let mut samples = [0usize; 2];
-    let affine = rows.exact_extrusion && affine_reads_on();
-    for (side, (rail, carrier)) in [(&rows.cr, carriers[0]), (&rows.cs, carriers[1])].into_iter().enumerate() {
+    for (side, (rail, carrier)) in [(rails[0], carriers[0]), (rails[1], carriers[1])].into_iter().enumerate() {
         let Some([low, high]) = windows[side] else { continue };
         // An exact extrusion's straight rail on a plane: the ends carry the
         // worst (`affine_rail_standoff`), the samples between them cannot.
@@ -722,6 +730,16 @@ pub(in crate::blend) fn rails_on_shipped_windows(
             }
         }
         for u in at {
+            let cached = memo.as_ref().and_then(|memo| memo.values[side].get(&u.to_bits()).copied());
+            let off = if let Some(off) = cached {
+                if let Some(memo) = memo.as_mut() { memo.hits += 1; }
+                crate::blend::record_count("count.read.rail_foot_reused", 1);
+                off
+            } else {
+            if let Some(memo) = memo.as_mut() {
+                memo.reads += 1;
+                crate::blend::record_count("count.read.rail_foot_fresh", 1);
+            }
             let off = interval_at(parameters, u)
                 .and_then(|(interval, fraction)| {
                     let (left, right) = (&stations[interval], &stations[interval + 1]);
@@ -732,6 +750,11 @@ pub(in crate::blend) fn rails_on_shipped_windows(
                 })
                 .filter(|off| off.is_finite())
                 .unwrap_or(f64::NAN);
+            if off.is_finite() {
+                if let Some(memo) = memo.as_mut() { memo.values[side].insert(u.to_bits(), off); }
+            }
+            off
+            };
             samples[side] += 1;
             if !worst.is_nan() && (off.is_nan() || off > worst) {
                 worst = off;
@@ -739,6 +762,49 @@ pub(in crate::blend) fn rails_on_shipped_windows(
         }
     }
     (worst, samples)
+}
+
+/// A construction-local rail reader. It owns an immutable snapshot of every
+/// input to a foot reading; only the requested windows can change. Native
+/// parameter bits identify a sample, so nearby endpoints never share a foot.
+/// The network keeps this reader from its chosen rung through shipped-window
+/// acceptance, then drops it. Failed/nonfinite feet are never reused.
+pub(in crate::blend) struct RailWindowReader {
+    rails: [NurbsCurve; 2],
+    carriers: [NurbsSurface; 2],
+    parameters: Vec<f64>,
+    stations: Vec<Station>,
+    affine: bool,
+    feet: RailFeet,
+}
+
+#[derive(Default)]
+struct RailFeet {
+    values: [rustc_hash::FxHashMap<u64, f64>; 2],
+    reads: u64,
+    hits: u64,
+}
+
+impl RailWindowReader {
+    pub(in crate::blend) fn new(rows: &FittedRows, parameters: &[f64], stations: &[Station], carriers: [&NurbsSurface; 2]) -> Self {
+        Self {
+            rails: [rows.cr.clone(), rows.cs.clone()],
+            carriers: [carriers[0].clone(), carriers[1].clone()],
+            parameters: parameters.to_vec(), stations: stations.to_vec(),
+            affine: rows.exact_extrusion && affine_reads_on(), feet: RailFeet::default(),
+        }
+    }
+
+    pub(in crate::blend) fn read(&mut self, windows: [Option<[f64; 2]>; 2]) -> (f64, [usize; 2]) {
+        read_rail_windows([&self.rails[0], &self.rails[1]], &self.parameters, &self.stations,
+            [&self.carriers[0], &self.carriers[1]], windows, self.affine, Some(&mut self.feet))
+    }
+}
+
+pub(in crate::blend) fn network_rail_reuse_on() -> bool {
+    // The private halving diagnostic compares every requested foot against
+    // its reference algorithm, including repeats. Preserve that coverage.
+    std::env::var("BREP_NETWORK_RAIL_REUSE").map_or(true, |value| value != "0" && value != "off")
 }
 
 /// The JUNCTION stencil across the station between interval `left` and
@@ -2287,4 +2353,5 @@ pub(in crate::blend) fn prune_orphan_vertices(result: &mut BrepSolid) {
 fn cs_blend_pcurve_reversed(cs_domain: &[f64; 2]) -> Result<NurbsCurve, KernelRefusal> {
     crate::sweep_topology::parameter_line(cs_domain[1], 1.0, cs_domain[0], 1.0).or_refuse(KernelStage::Refine, "parameter_line")
 }
+
 

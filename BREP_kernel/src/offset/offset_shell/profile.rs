@@ -95,18 +95,18 @@ pub(super) fn snapshot() -> ShellTimings {
 /// Callee timings stay on stderr, leaving the diagnostic measurement schema
 /// unchanged. These are nested within the existing pipeline phase timers.
 pub(super) fn detail<T>(callee: &'static str, call: impl FnOnce() -> T) -> T {
-    if std::env::var("BREP_PROFILE").is_err() {
+    if !crate::imprint::profile_enabled() {
         return call();
     }
     let started = Instant::now();
     let result = call();
-    eprintln!("offset_detail.profile callee={callee} ms={:.3}", started.elapsed().as_secs_f64() * 1_000.0);
+    crate::imprint::profile_emit(format_args!("offset_detail.profile callee={callee} ms={:.3}", started.elapsed().as_secs_f64() * 1_000.0));
     result
 }
 
 /// The stderr line, when `BREP_PROFILE` is set.
 pub(super) fn report(entry: &str) {
-    if std::env::var("BREP_PROFILE").is_err() {
+    if !crate::imprint::profile_enabled() {
         return;
     }
     let timings = snapshot();
@@ -122,8 +122,8 @@ pub(super) fn report(entry: &str) {
         .map(|(phase, count)| format!("{}={count}", phase.trim_start_matches("carrier_")))
         .collect::<Vec<_>>()
         .join(",");
-    eprintln!(
+    crate::imprint::profile_emit(format_args!(
         "{entry}.profile attempts={} carriers[{carriers}] {phases}",
         timings.attempts
-    );
+    ));
 }

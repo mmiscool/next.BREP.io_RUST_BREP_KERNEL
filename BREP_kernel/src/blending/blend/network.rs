@@ -84,6 +84,7 @@ struct StripeRung {
     stations: Vec<Station>,
     dense: OpenDenseCentres,
     reading: OpenRungReading,
+    rail_reader: Option<std::cell::RefCell<super::edge::RailWindowReader>>,
 }
 
 /// A stripe's measurement: the shipped rung's parameters, stations and dense
@@ -98,6 +99,7 @@ struct StripeMeasure {
     dense: OpenDenseCentres,
     ladder_accepted: bool,
     ladder_reading: OpenRungReading,
+    rail_reader: Option<std::cell::RefCell<super::edge::RailWindowReader>>,
     unmet: Option<crate::BudgetReason>,
     request_rungs: usize,
     stationary_end: bool,
@@ -834,6 +836,10 @@ pub(crate) fn blend_star_network_laws(
     result
 }
 
+/// The refusal code of a stripe pinched between a corner setback and the
+/// station where its taper to a cusp reaches the full radius.
+pub(crate) const STRIPE_PINCH_TAPER_WHAT: &str = "stripe_pinch_taper";
+
 fn blend_star_network_building(
     solid: &BrepSolid,
     edge_ids: &[u64],
@@ -994,13 +1000,25 @@ fn blend_star_network_building(
                 if unequal.is_some() {
                     return Err(refuse_unequal("a flush join at two radii is a step, not a corner, and is not in this lane"));
                 }
-                if tapered_here {
+                if tapered_here && !super::relief::tapered_flush_join_on() {
                     return Err(KernelRefusal::unsupported(KernelStage::Classify, "tapered_flush_join", format!(
                         "blend network: a tapered stripe runs through the smooth vertex {vertex_id}; \
                          a flush join at a varying radius is not in this lane"
                     )));
                 }
-                match flush_join(solid, &mates[a], &mates[b], *vertex_id, point, scale) {
+                // The join is ONE ball on both sides, at the stripes' common
+                // END radius here (checked equal above): a tapered stripe's
+                // mates carry its midpoint radius, so the join is solved on
+                // mates re-signed at the end radius (2026-10-21, the local
+                // radius relief, whose ramps cross the smooth vertices of a
+                // face's outline).
+                let at_end = |index: usize| {
+                    let (edge, first, second) = &mates[index];
+                    let end = laws[index].end(edge.start_vertex_id == *vertex_id);
+                    (*edge, mate_at_radius(first, end), mate_at_radius(second, end))
+                };
+                let (join_a, join_b) = (at_end(a), at_end(b));
+                match flush_join(solid, &join_a, &join_b, *vertex_id, point, scale) {
                     Ok(join) => {
                         if std::env::var("BREP_DEBUG_NETWORK").is_ok() {
                             match &join {
@@ -1533,11 +1551,20 @@ fn blend_star_network_building(
                 pole_end(edge, &first_end, &second_end, slot == 0, corner_station_bar(scale, end_radius[slot]))
                     .unwrap_or(false);
         }
+        // A tapered stripe that stops at a flush join with its own two faces
+        // (the vertex section) needs nothing past it, and past it the
+        // edge's straight extension may leave the carrier it curls along: on
+        // report 5e49bb42's cap rim the relieved stripe's overshoot stations
+        // stopped converging 1.8 mm past the vertex. Such an end may stop at
+        // its last converged station; the rails must still reach the join
+        // (`corner_rails_reach`, read as the end's settlement below).
+        let tapered_flush = law.constant().is_none() && super::relief::tapered_flush_join_on();
         let bounded_ends = [edge.start_vertex_id, edge.end_vertex_id].map(|vertex| {
-            !corners.iter().any(|(id, _, _)| *id == vertex)
-                && solid.edges.iter().any(|boundary| {
-                    boundary.degenerate && boundary.start_vertex_id == vertex
-                })
+            match corners.iter().find(|(id, _, _)| *id == vertex) {
+                Some((_, _, VertexKind::Flush { join: None })) => tapered_flush,
+                Some(_) => false,
+                None => solid.edges.iter().any(|boundary| boundary.degenerate && boundary.start_vertex_id == vertex),
+            }
         });
         let rail_bar = 0.5 * crate::KernelTolerances::for_solid(solid, 1e-7).intersection_fit;
         // The ladder this stripe climbs: the shared rungs, and past them the
@@ -1567,6 +1594,11 @@ fn blend_star_network_building(
                 .fold(0.0f64, f64::max)
         };
         let ladder = concave_corner_ladder(edge, &corners, flush_reach);
+        // A rung below the reach the ends ask for (`ladder_reach`) cannot
+        // carry the rows to them: with `short_rungs_deferred_on` the ladder
+        // marches the rungs that can first, and the short ones only when none
+        // of those settles (`count.march.short_rungs_deferred` / `_run`).
+        let needed_reach = ladder_reach(edge, &corners, flush_reach);
         // The rung's MEASUREMENT, as the open edge's (C3): rails positive and
         // finite inside the rail bar on samples of both rails, and -- a FILLET
         // only (the network's one scalar radius is constant by construction;
@@ -1633,7 +1665,24 @@ fn blend_star_network_building(
             request_rungs += 1;
         }
         chosen = None;
-        for &overshoot in &ladder {
+        // (overshoot, deferred): in ladder order, or with the short rungs
+        // after the rest. A short rung that runs keeps its precedence: the
+        // first rung that fits is the one shipped when none settles, and the
+        // last error the one reported when none fits.
+        let order: Vec<(f64, bool)> = if short_rungs_deferred_on() {
+            let reaching = ladder.iter().filter(|overshoot| **overshoot >= needed_reach).map(|overshoot| (*overshoot, false));
+            let short: Vec<(f64, bool)> =
+                ladder.iter().filter(|overshoot| **overshoot < needed_reach).map(|overshoot| (*overshoot, true)).collect();
+            super::record_count("count.march.short_rungs_deferred", short.len() as u64);
+            reaching.chain(short).collect()
+        } else {
+            ladder.iter().map(|overshoot| (*overshoot, false)).collect()
+        };
+        let (mut deferred_taken, mut reaching_error) = (false, false);
+        for &(overshoot, deferred) in &order {
+            if deferred {
+                super::record_count("count.march.short_rungs_run", 1);
+            }
             let march_timing = super::BlendTimer::start("timing.march_ms");
             let rung_measure: &'static str = match station_count {
                 64 => "timing.march.stations_64_ms",
@@ -1646,18 +1695,30 @@ fn blend_star_network_building(
             // or fold probe (tautologies on an extrusion; the revolution lane
             // declines a wall that could fold before the rows are built).
             let probes_off = exact_lane || revolution.is_some();
-            let marched = march_open_stations_core(
-                edge, first, second, &radius_at, overshoot, ends, station_count, poles, bounded_ends,
-                if probes_off { None } else { super::station_refinement_on().then_some(rail_bar) },
-                if wall_check && !probes_off { OPEN_WALL_CENTRES } else { 0 },
-                !probes_off,
-            );
+            let certified = if exact_lane && !chamfer && poles == [false, false] && bounded_ends == [false, false] {
+                super::stations::analytic_network::construct(edge, first, second, wall_radius, overshoot, ends)
+            } else { None };
+            let mut certified_rows = None;
+            let mut certified_parameters = None;
+            let marched = if let Some(certified) = certified {
+                certified_rows = Some(certified.rows);
+                certified_parameters = Some(certified.parameters);
+                Ok((certified.stations, certified.vertex_indices, StationRefinement::default(),
+                    OpenDenseCentres { station_ts: certified.station_ts, ..OpenDenseCentres::default() }))
+            } else {
+                march_open_stations_core(
+                    edge, first, second, &radius_at, overshoot, ends, station_count, poles, bounded_ends,
+                    if probes_off { None } else { super::station_refinement_on().then_some(rail_bar) },
+                    if wall_check && !probes_off { OPEN_WALL_CENTRES } else { 0 },
+                    !probes_off,
+                )
+            };
             let march_ms = march_timing.stop();
             rung_timing.stop();
             match marched {
                 Ok((stations, vertex_indices, refinement, dense)) => {
                     let mut stations = stations;
-                    let mut parameters = station_parameters(&stations);
+                    let mut parameters = certified_parameters.take().unwrap_or_else(|| station_parameters(&stations));
                     // A boundary station (`StationRefinement::boundary_inserted`)
                     // whose chord parameter does not increase on a neighbour's
                     // is one the rows fit would refuse ("parameters must be
@@ -1702,7 +1763,10 @@ fn blend_star_network_building(
                     boundary_breaks.sort_unstable();
                     boundary_breaks.dedup();
                     let fit_timing = super::BlendTimer::start("timing.rows_fit_ms");
-                    let fitted = if let Some(axis) = revolution {
+                    let fitted = if let Some(rows) = certified_rows.take() {
+                        super::fold::check_rows_loop(&rows, &stations, &parameters, Some(vertex_indices), radius,
+                            vec![first.face.id, second.face.id], scale).map(|_| rows)
+                    } else if let Some(axis) = revolution {
                         match exact_revolution_rows(&stations, vertex_indices, chamfer, axis, wall_radius.unwrap_or(radius), first, second) {
                             Ok(ExactRevolution { rows, parameters: exact_parameters, stations: exact_stations }) => {
                                 parameters = exact_parameters;
@@ -1811,9 +1875,10 @@ fn blend_star_network_building(
                             }
                             let bounded_reached = (0..2)
                                 .all(|slot| !bounded_ends[slot] || settled_ends[slot]);
-                            if (chosen.is_none() || settled) && bounded_reached
+                            if (chosen.is_none() || settled || (deferred && !deferred_taken)) && bounded_reached
                             {
                                 chosen = Some((rows, parameters.clone(), refinement, stations, vertex_indices, dense));
+                                deferred_taken |= deferred;
                             }
                             if settled {
                                 break;
@@ -1823,10 +1888,20 @@ fn blend_star_network_building(
                         // fold verdict is on the open lane: the ladder's next
                         // rung fits the same looping wall.
                         Err(error) if super::fold::is_wall_fold(&error) => return Err(error),
-                        Err(error) => last_error = Some(error),
+                        Err(error) => {
+                            if !(deferred && reaching_error) {
+                                last_error = Some(error);
+                            }
+                            reaching_error |= !deferred;
+                        }
                     }
                 }
-                Err(error) => last_error = Some(error),
+                Err(error) => {
+                    if !(deferred && reaching_error) {
+                        last_error = Some(error);
+                    }
+                    reaching_error |= !deferred;
+                }
             }
         }
         let Some((rows, parameters, refinement, stations, vertex_indices, dense)) = chosen.take() else {
@@ -1860,8 +1935,12 @@ fn blend_star_network_building(
         };
         let reading_timing = super::BlendTimer::start("timing.rung_reading_ms");
         let rails_timing = super::BlendTimer::start("timing.rung_reading.rails_ms");
-        let (rails, rail_samples) =
-            rails_on_shipped_windows(&rows, &parameters, &stations, [&first.face.surface, &second.face.surface], [window, window]);
+        let rail_reader = super::edge::network_rail_reuse_on().then(|| std::cell::RefCell::new(
+            super::edge::RailWindowReader::new(&rows, &parameters, &stations, [&first.face.surface, &second.face.surface])));
+        let (rails, rail_samples) = match rail_reader.as_ref() {
+            Some(reader) => reader.borrow_mut().read([window, window]),
+            None => rails_on_shipped_windows(&rows, &parameters, &stations, [&first.face.surface, &second.face.surface], [window, window]),
+        };
         rails_timing.stop();
         let walls_timing = super::BlendTimer::start("timing.rung_reading.walls_ms");
         let walls_why = match (wall_check, window) {
@@ -1908,7 +1987,7 @@ fn blend_star_network_building(
             );
         }
         let accepted_now = accepts(&reading);
-        let rung = StripeRung { rows, parameters, stations, dense, reading };
+        let rung = StripeRung { rows, parameters, stations, dense, reading, rail_reader };
         if accepted.is_none() {
             if accepted_now {
                 let met = !wall_check || meets_model(&rung.reading);
@@ -1982,7 +2061,7 @@ fn blend_star_network_building(
                 return Err(KernelRefusal::internal(KernelStage::Refine, "network_ladder", "blend network: the stripe ladder ended without a rung"));
             }
         };
-        let StripeRung { rows, parameters, stations, dense, reading } = rung;
+        let StripeRung { rows, parameters, stations, dense, reading, rail_reader } = rung;
         super::record_count("count.stations_shipped", parameters.len() as u64);
         super::record_count("count.request_rungs", request_rungs as u64);
         if !ladder_accepted {
@@ -2011,6 +2090,7 @@ fn blend_star_network_building(
                 dense,
                 ladder_accepted,
                 ladder_reading: reading,
+                rail_reader,
                 unmet,
                 request_rungs,
                 stationary_end,
@@ -3519,6 +3599,9 @@ fn blend_star_network_building(
     }
 
     let mut pending_caps: Vec<PendingCap> = Vec::new();
+    let mut pending_tapers: Vec<super::taper_runout::PendingTaper> = Vec::new();
+    // The (stripe index) of every end planned as a taper to a cusp.
+    let mut taper_ends: Vec<usize> = Vec::new();
 
     flush_timing.stop();
     let free_ends_timing = super::BlendTimer::start("timing.end_plans.free_ends_ms");
@@ -3546,6 +3629,62 @@ fn blend_star_network_building(
                 )?));
                 continue;
             }
+            // On a CONCAVE edge, a mate CUSPED at this vertex (lane R7's
+            // class) tapers to its tip before the free end is asked: the free
+            // end can find a crossing there (report b46db89a's sliver, whose
+            // contact meets the sliver's straight boundary) and ship a wall
+            // that overhangs the cusp into air. A convex edge keeps R7's
+            // order, the taper only where the free end refuses: asked first,
+            // the face ring's convex ends planned tapers from outside their
+            // edge (t −1.34, 1.11) where the free end builds
+            // (`fillet::tests::face_ring_fillet_builds_the_full_ring`).
+            let concave = (stripe.first.rho > 0.0) == stripe.first.face.same_sense;
+            if concave && super::relief::relief_enabled() {
+                if let Some(plan) = super::taper_runout::plan_taper_end(
+                    solid,
+                    &mut result,
+                    &mut take_id,
+                    stripe.edge,
+                    &stripe.first,
+                    &stripe.second,
+                    &stripe.rows,
+                    stripe.law.constant(),
+                    chamfer,
+                    stripe.walk_first_to_second(at_start),
+                    stripe.name.as_deref(),
+                    vertex,
+                    &mut pending_tapers,
+                )? {
+                    let support = [stripe.first.face, stripe.second.face]
+                        .into_iter()
+                        .find(|face| super::taper_runout::cusped_at(solid, stripe.edge, face, vertex))
+                        .map(|face| face.name.clone().unwrap_or_else(|| format!("face #{}", face.id)))
+                        .unwrap_or_default();
+                    super::record_blend_note(format!(
+                        "radius tapered to zero at the tip where `{support}` narrows to a point (edge {})",
+                        stripe.name.clone().unwrap_or_else(|| format!("#{}", stripe.edge.id))
+                    ));
+                    taper_ends.push(index);
+                    end_plans[index][slot] = Some(EndPlan::Cap(plan));
+                    continue;
+                }
+                // The support check admits a CONCAVE edge's cusped tip as the
+                // taper's (`fillet/analyze.rs::support_extent`); a free end
+                // there would ship the wall the check exists to refuse. A
+                // convex edge's cusped end keeps the free end, as before
+                // (`fillet::tests::face_ring_fillet_builds_the_full_ring`:
+                // its taper misses B by 8.8e-7 and the free end builds).
+                let cusped = [stripe.first.face, stripe.second.face]
+                    .into_iter()
+                    .any(|face| super::taper_runout::cusped_at(solid, stripe.edge, face, vertex));
+                if cusped && stripe.law.constant().is_some() && !chamfer {
+                    return Err(KernelRefusal::unsupported(KernelStage::Classify, "taper_runout_unplanned", format!(
+                        "blend network: a mate of edge {} narrows to a cusp at vertex {vertex}, and the round's \
+                         taper to that tip could not be planned",
+                        stripe.edge.id
+                    )));
+                }
+            }
             match resolve_free_end(
                 solid,
                 stripe.edge.id,
@@ -3560,6 +3699,44 @@ fn blend_star_network_building(
                     end_plans[index][slot] = Some(EndPlan::Free(end));
                 }
                 Err(free_error) => {
+                    // A mate CUSPED here while the other mate's boundary runs
+                    // on along the edge (report 80c5d9d1's F10, the straight
+                    // edge of a sliver whose far side F9's tapered round
+                    // took: the sliver ends at the round's hairline end, and
+                    // the box top's boundary continues past it to the tip)
+                    // tapers to the cusp; the tangent cap below would close
+                    // the round on a planar web under the overhang.
+                    let cusped = [stripe.first.face, stripe.second.face]
+                        .into_iter()
+                        .any(|face| super::taper_runout::cusped_at(solid, stripe.edge, face, vertex));
+                    if cusped {
+                        // Not planned (or refused): the end is asked as
+                        // before, with whatever a refused plan added undone.
+                        let marks = (result.vertices.len(), result.edges.len(), pending_tapers.len());
+                        let planned = super::taper_runout::plan_taper_end(
+                            solid,
+                            &mut result,
+                            &mut take_id,
+                            stripe.edge,
+                            &stripe.first,
+                            &stripe.second,
+                            &stripe.rows,
+                            stripe.law.constant(),
+                            chamfer,
+                            stripe.walk_first_to_second(at_start),
+                            stripe.name.as_deref(),
+                            vertex,
+                            &mut pending_tapers,
+                        );
+                        if let Ok(Some(plan)) = planned {
+                            taper_ends.push(index);
+                            end_plans[index][slot] = Some(EndPlan::Cap(plan));
+                            continue;
+                        }
+                        result.vertices.truncate(marks.0);
+                        result.edges.truncate(marks.1);
+                        pending_tapers.truncate(marks.2);
+                    }
                     // A nearly tangent line/arc junction can have no free-end
                     // crossing, or put it beyond the marched rows. Retry those
                     // failures with a vertex section only within a small
@@ -3590,7 +3767,31 @@ fn blend_star_network_building(
                                 .then_some((boundary, tangent))
                         });
                     let Some((boundary, tangent)) = continuing else {
-                        return Err(free_error);
+                        // Lane R7: an end the free end and the cap both
+                        // refuse, where a mate is cusped at this vertex, ends
+                        // on a tapered runout (`taper_runout.rs`).
+                        match super::taper_runout::plan_taper_end(
+                            solid,
+                            &mut result,
+                            &mut take_id,
+                            stripe.edge,
+                            &stripe.first,
+                            &stripe.second,
+                            &stripe.rows,
+                            stripe.law.constant(),
+                            chamfer,
+                            stripe.walk_first_to_second(at_start),
+                            stripe.name.as_deref(),
+                            vertex,
+                            &mut pending_tapers,
+                        )? {
+                            Some(plan) => {
+                                taper_ends.push(index);
+                                end_plans[index][slot] = Some(EndPlan::Cap(plan));
+                                continue;
+                            }
+                            None => return Err(free_error),
+                        }
                     };
                     // Before the tangent reads took the one-sided limit, a
                     // stationary edge here read as "does not continue" and
@@ -3687,11 +3888,23 @@ fn blend_star_network_building(
         ] {
             let strip = row.evaluate(finish).or_refuse(KernelStage::Refine, "evaluate")?.sub(row.evaluate(start).or_refuse(KernelStage::Refine, "evaluate")?).length();
             if finish <= start && strip > band {
-                return Err(KernelRefusal::unsupported(KernelStage::Refine, "stripe_pinch", format!(
+                // An end planned as a TAPER to a cusp (`taper_runout.rs`)
+                // stops where the width reaches 2R; a setback past it means
+                // the round has no constant run, which the group answers by
+                // building at a smaller radius (`fillet/edges.rs`, report
+                // 80c5d9d1's F10: r 1 on a sliver at most 2 wide within 0.9
+                // of its square corner).
+                let tapered = taper_ends.contains(&index);
+                let what = if tapered { STRIPE_PINCH_TAPER_WHAT } else { "stripe_pinch" };
+                let why = if tapered {
+                    "the round's taper to its tip reaches the full radius only inside the corner setback"
+                } else {
+                    "the blend strip pinches out and pinch splitting is not implemented"
+                };
+                return Err(KernelRefusal::unsupported(KernelStage::Refine, what, format!(
                     "blend network: edge {} is shorter than the two corner setbacks that meet \
                      on it (its {which} rail would run from {start:.6} to {finish:.6}, stops \
-                     {strip:.3e} past each other against a band of {band:.3e}); the blend strip \
-                     pinches out and pinch splitting is not implemented",
+                     {strip:.3e} past each other against a band of {band:.3e}); {why}",
                     stripe.edge.id
                 )));
             }
@@ -4239,6 +4452,7 @@ fn blend_star_network_building(
     for cap in pending_caps {
         sew_cap(&mut result, &mut take_id, cap)?;
     }
+    super::taper_runout::sew_taper_ends(&mut result, &mut take_id, pending_tapers)?;
     // A miter at a revolved pole cuts away its degenerate boundary as well
     // as the two selected edges. The replacement rails already meet at their
     // new rim; retaining the old point edge would reopen that face's loop.
@@ -4526,13 +4740,16 @@ fn shipped_wall_report(
     let rail_bar = 0.5 * tolerances.intersection_fit;
     let (wall_bar, model) = (tolerances.intersection_fit, tolerances.model);
     let rails_timing = super::BlendTimer::start("timing.surgery.wall_report.rails_ms");
-    let (rails, rail_samples) = rails_on_shipped_windows(
+    let (rails, rail_samples) = match measure.rail_reader.as_ref() {
+        Some(reader) => reader.borrow_mut().read(windows),
+        None => rails_on_shipped_windows(
         &stripe.rows,
         &measure.parameters,
         &measure.stations,
         [&stripe.first.face.surface, &stripe.second.face.surface],
         windows,
-    );
+    ),
+    };
     rails_timing.stop();
     // The wall over the envelope of what ships (a collapsed rail ships no
     // span of its own); with an unread rail, or nothing to envelope, no wall
@@ -5099,6 +5316,39 @@ fn concave_corner_reach(
     Some(beyond / speed / span)
 }
 
+/// The overshoot (as a fraction of the edge's span) that carries the rows
+/// past every stop the ends ask for: a concave corner's ball, or a flush
+/// join's seam ball (`flush_reach`, read off the stripe's `ends`).
+fn ladder_reach(edge: &EdgeRecord, corners: &[(u64, Vec<usize>, VertexKind<'_>)], flush_reach: f64) -> f64 {
+    [(edge.start_vertex_id, true), (edge.end_vertex_id, false)]
+        .into_iter()
+        .filter_map(|(vertex, at_start)| concave_corner_reach(edge, corners, vertex, at_start))
+        .fold(flush_reach.max(0.0), f64::max)
+}
+
+/// Lane R2 row 6 (2026-10-18): `BREP_BLEND_SHORT_RUNGS=1`/`on` defers the
+/// overshoot rungs below [`ladder_reach`] until the rungs that reach have
+/// failed to settle (the default since its census at 5aadf921e); `=0`/`off`
+/// climbs the ladder in order; `set_short_rungs_deferred_for_test` forces it
+/// on a test's own thread.
+const SHORT_RUNGS_DEFERRED_DEFAULT: bool = true;
+
+thread_local! {
+    static SHORT_RUNGS_DEFERRED_FOR_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+pub(in crate::blend) fn short_rungs_deferred_on() -> bool {
+    if let Some(forced) = SHORT_RUNGS_DEFERRED_FOR_TEST.with(|forced| forced.get()) {
+        return forced;
+    }
+    match std::env::var("BREP_BLEND_SHORT_RUNGS").as_deref() {
+        Ok("0") | Ok("off") => false,
+        Ok("1") | Ok("on") => true,
+        _ => SHORT_RUNGS_DEFERRED_DEFAULT,
+    }
+}
+
+
 /// The overshoot ladder for one stripe of the network: [`OVERSHOOTS`], and
 /// past its last rung the rungs a concave corner at either end needs
 /// ([`concave_corner_reach`]) or a flush join's seam-ball stop needs
@@ -5114,13 +5364,7 @@ fn concave_corner_ladder(
     flush_reach: f64,
 ) -> Vec<f64> {
     let mut ladder = OVERSHOOTS.to_vec();
-    // The overshoot (as a fraction of the edge's span) that carries the rows
-    // past every stop the ends ask for: a concave corner's ball, or a flush
-    // join's seam ball (`flush_reach`, read off the stripe's `ends`).
-    let needed = [(edge.start_vertex_id, true), (edge.end_vertex_id, false)]
-        .into_iter()
-        .filter_map(|(vertex, at_start)| concave_corner_reach(edge, corners, vertex, at_start))
-        .fold(flush_reach.max(0.0), f64::max);
+    let needed = ladder_reach(edge, corners, flush_reach);
     let top = *OVERSHOOTS.last().unwrap_or(&0.0);
     for factor in [1.25, 2.0] {
         let rung = needed * factor;

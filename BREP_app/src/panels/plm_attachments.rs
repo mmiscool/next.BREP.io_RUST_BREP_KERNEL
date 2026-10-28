@@ -539,11 +539,11 @@ impl AttachmentsSection {
         })
     }
 
-    /// Once a frame, with the documents and the store: drop the panels of
-    /// closed documents, make the exports asked for and stage them, and save
-    /// what was downloaded through the store's export lane (a browser
-    /// download; `<root>/models` natively).
-    pub fn sync(&mut self, store: &dyn crate::store::ModelStore, docs: &mut crate::document::Documents) {
+    /// Once a frame, with the documents: drop the panels of closed documents,
+    /// make the exports asked for and stage them, and hand back what was
+    /// downloaded as save requests for the file dialog's export door (a
+    /// browser download; the Save-file chooser natively).
+    pub fn sync(&mut self, docs: &mut crate::document::Documents) -> Vec<crate::panels::file::SaveRequest> {
         let open: Vec<u64> = docs.iter().map(|d| d.id()).collect();
         self.panels.retain(|id, _| open.contains(id));
         for (id, stem, export) in std::mem::take(&mut self.exports) {
@@ -562,12 +562,10 @@ impl AttachmentsSection {
                 (Err(error), _) => self.status = Some(format!("could not export: {error}")),
             }
         }
-        for (attachment, bytes) in std::mem::take(&mut self.downloads) {
-            self.status = Some(match store.export_file_named_bytes(&attachment.name, &bytes) {
-                Ok(()) => format!("saved {} ({})", attachment.name, human_size(bytes.len() as u64)),
-                Err(error) => format!("could not save {}: {error}", attachment.name),
-            });
-        }
+        std::mem::take(&mut self.downloads)
+            .into_iter()
+            .map(|(attachment, bytes)| crate::panels::file::SaveRequest::bytes("Save the attachment", attachment.name, bytes))
+            .collect()
     }
 
     /// Draw the section for `doc` (the active document, if it is a PLM

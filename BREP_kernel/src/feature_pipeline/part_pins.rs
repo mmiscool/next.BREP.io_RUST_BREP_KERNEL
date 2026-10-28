@@ -16,9 +16,9 @@
 //!
 //! A part may declare SEVERAL port groups, and `J1.VCC` and `J2.VCC` are both
 //! "point VCC". The symbol says which one a pin means: eCAD's `Symbol` carries
-//! `unit_count` and each [`Pin`](brep_ecad_core::Pin) carries its `unit`, which
+//! `unit_count` and each `brep_ecad_core::Pin` carries its `unit`, which
 //! is KiCad's own model for a multi-unit device. ONE UNIT MAPS TO ONE PORT
-//! GROUP ([`ports::unit_map`], [`unit_groups`]), so pin `1` of unit 1 is `J1.1`
+//! GROUP ([`ports::unit_map`], [`unit_groups`](crate::feature_pipeline::part_pins::unit_groups)), so pin `1` of unit 1 is `J1.1`
 //! and pin `1` of unit 2 is `J2.1`. Two identical 8-pin headers on one part are
 //! then ordinary rather than a collision, and the pin labels stay short.
 //!
@@ -29,15 +29,15 @@
 //! symbol is only its pressure sensor — takes no pins and is left alone.
 //!
 //! A part that declares no ports at all reads as "unit 1 is the group a new pin
-//! creates" ([`DEFAULT_PORT_NAME`]), which is the KiCad import's case.
+//! creates" ([`DEFAULT_PORT_NAME`](crate::feature_pipeline::part_pins::DEFAULT_PORT_NAME)), which is the KiCad import's case.
 //!
 //! WAYPOINTS never enter here. A waypoint is a history feature and a
 //! pass-through, never a cable end, so it has no pin and cannot be named by one.
 //!
 //! # Where the set lives
 //!
-//! A part document keeps its symbol and pads as the top-level [`SYMBOL_BLOCK`]
-//! and [`PADS_BLOCK`] (eCAD's `Symbol` and `Footprint` JSON), and its connection
+//! A part document keeps its symbol and pads as the top-level [`SYMBOL_BLOCK`](crate::feature_pipeline::part_pins::SYMBOL_BLOCK)
+//! and [`PADS_BLOCK`](crate::feature_pipeline::part_pins::PADS_BLOCK) (eCAD's `Symbol` and `Footprint` JSON), and its connection
 //! points as the `ports` block. The binding stores nothing of its own.
 //!
 //! The binding applies once a part carries a symbol. A 3D-only part keeps its
@@ -59,14 +59,14 @@
 //! it, and the next keystroke is diffed from the same base again.
 //!
 //! Resolution is where a name must name exactly one point.
-//! [`resolve_component_pin`] and [`resolve_part_pin`] REFUSE a missing or
+//! [`resolve_component_pin`](crate::feature_pipeline::part_pins::resolve_component_pin) and [`resolve_part_pin`](crate::feature_pipeline::part_pins::resolve_part_pin) REFUSE a missing or
 //! repeated name by name; each takes an optional port group, which is how a
 //! caller that knows the unit narrows two identical headers to one.
 //!
-//! [`resolve_component_pin`] names the device by its OCCURRENCE CHAIN, not by
+//! [`resolve_component_pin`](crate::feature_pipeline::part_pins::resolve_component_pin) names the device by its OCCURRENCE CHAIN, not by
 //! one ACOMP id: a wiring diagram reaches a device nested at any depth
 //! (`ACOMP7:ACOMP1`), and the endpoint's own address is what says where it sits
-//! ([`endpoint_occurrence`]).
+//! ([`endpoint_occurrence`](crate::feature_pipeline::part_pins::endpoint_occurrence)).
 
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -511,7 +511,7 @@ pub enum PinPointChange {
     PinRemoved { pin: String },
     PadsRenumbered { from: String, to: String, count: usize },
     /// A pad was NOT renumbered because several units carry the old label, so
-    /// the footprint cannot say which pin's pad it is (see [`renumber_pads`]).
+    /// the footprint cannot say which pin's pad it is (see `renumber_pads`).
     PadsAmbiguous { from: String, to: String, units: Vec<u32> },
 }
 
@@ -520,7 +520,7 @@ pub enum PinPointChange {
 ///
 /// Each UNIT is diffed against its own port group. Within a unit, pins are
 /// matched by label first; a label in both lists is the same pin. What remains
-/// pairs up in place (see [`diff_labels`]): a label that left and one that
+/// pairs up in place (see `diff_labels`): a label that left and one that
 /// arrived between the same two unchanged pins is a RENAME, and its point is
 /// renamed. A label that only left removes its point. A label that only arrived
 /// pairs with a point of that group already carrying it, or gets a new point in

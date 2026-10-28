@@ -27,10 +27,10 @@
 //! paper, carry the selection) and a double click opens its form.
 //!
 //! Every row's menu is ALSO the right-click menu of its object on the paper
-//! (`viewport/sheet.rs`), bare paper opening the sheet's: [`object_actions`]
-//! is the one list and [`run_row_action`] the one dispatch, so the two cannot
+//! (`viewport/sheet.rs`), bare paper opening the sheet's: `object_actions`
+//! is the one list and `run_row_action` the one dispatch, so the two cannot
 //! drift. The Delete key removes the selected held object through its menu's
-//! destructive entry ([`delete_held_object`], driven by the app shell).
+//! destructive entry (`delete_held_object`, driven by the app shell).
 //!
 //! A SHEET DIMENSION row sits under the placements of the same sheet — a
 //! dimension belongs to the PAPER, not to any one placement, so it is a child
@@ -707,6 +707,7 @@ impl SheetsPanel {
             root_cells: None,
             empty_hint: Some("(no sheets — Add sheet to start a drawing)"),
             hits_prefix: "sheets:",
+            drag_rows: false,
         };
         let out = column_tree::column_tree(ui, &spec, &mut self.layout, &rows, Some(&mut self.hits));
 

@@ -27,6 +27,12 @@ use super::project::{AnnotationDrawing, SheetDrawing, SheetText, ViewDrawing};
 pub(super) const EDGE_WIDTH: f64 = 0.35;
 /// Annotation stroke width, millimetres.
 pub(super) const ANNOTATION_WIDTH: f64 = 0.18;
+/// The HIGHLIGHT stroke ([`super::project::ViewDrawing::highlighted`]): the
+/// instructions' orange, and heavier than a model edge so it still stands out
+/// printed in black.
+pub(super) const HIGHLIGHT_RGB: [f64; 3] = [0.85, 0.40, 0.0];
+pub(super) const HIGHLIGHT_STROKE: &str = "#d96600";
+pub(super) const HIGHLIGHT_WIDTH_FACTOR: f64 = 1.6;
 /// The border and title-block stroke width, millimetres.
 pub(super) const FRAME_WIDTH: f64 = 0.5;
 /// A text run's CAP height as a fraction of the font's em. The layout sizes a
@@ -112,6 +118,16 @@ fn view_group(view: &ViewDrawing) -> String {
             "<g class=\"model\" fill=\"none\" stroke=\"#000000\" stroke-width=\"{EDGE_WIDTH:.6}\" stroke-linecap=\"round\" stroke-linejoin=\"round\">\n"
         ));
         for run in &view.edges {
+            out.push_str(&format!("<path d=\"{}\" />\n", path_data(run)));
+        }
+        out.push_str("</g>\n");
+    }
+    if !view.highlighted.is_empty() {
+        out.push_str(&format!(
+            "<g class=\"model-highlighted\" fill=\"none\" stroke=\"{HIGHLIGHT_STROKE}\" stroke-width=\"{:.6}\" stroke-linecap=\"round\" stroke-linejoin=\"round\">\n",
+            EDGE_WIDTH * HIGHLIGHT_WIDTH_FACTOR
+        ));
+        for run in &view.highlighted {
             out.push_str(&format!("<path d=\"{}\" />\n", path_data(run)));
         }
         out.push_str("</g>\n");
@@ -354,6 +370,13 @@ fn path_data(points: &[[f64; 2]]) -> String {
 /// `<text>` element's content read back from the file, entities undone. What
 /// the export door reports ABOUT the file, so a script can assert the drawing's
 /// text without an XML reader.
+/// Every placed view's `data-hidden-line` read back from the SVG, in view
+/// order: `analytic` or `mesh` per view.
+pub fn hidden_lines(svg: &str) -> Vec<String> {
+    let key = "data-hidden-line=\"";
+    svg.split(key).skip(1).filter_map(|rest| rest.split('"').next().map(str::to_string)).collect()
+}
+
 pub fn text_strings(svg: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut rest = svg;

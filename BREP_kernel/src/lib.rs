@@ -189,6 +189,9 @@ pub use mass_properties::{
     DensityMassProperties,
     FaceSetIdentity, FullMassProperties, MassCaller, MassProperties, MassPropertiesCache,
 };
+#[path = "props/carrier_dimensions.rs"]
+mod carrier_dimensions;
+pub use carrier_dimensions::{curve_carrier_dimensions, surface_carrier_dimensions, CarrierDimensions};
 #[path = "meshing/tessellation.rs"]
 mod tessellation;
 pub use tessellation::{tessellate_brep, tessellate_face, TessellationOptions};
@@ -279,6 +282,8 @@ pub use feature_pipeline::features::sketch3d::{
 };
 // Sheet-metal flat-pattern (unfold) → 2D vector export, keyed by resident handle.
 pub use feature_pipeline::{flat_pattern_dxf, flat_pattern_svg, is_sheet_metal_handle};
+// The part Pattern's per-instance suppression list.
+pub use feature_pipeline::{pattern_component_instance, pattern_parse_suppressed};
 // Native IMPORT3D payload: finished solids → the `io/snapshot` container with
 // IMPORT3D's naming stamped on, i.e. the `inputParams.nativeBrep` an import lane
 // bakes into a part document (`features/import3d.rs` reads it back verbatim).
@@ -294,25 +299,27 @@ pub use feature_pipeline::scene_metadata_colors_json;
 pub use feature_pipeline::{
     add_part_to_library, add_part_to_library_impl, install_parts_library, missing_library_parts,
     parts_library_json, parts_library_map, parts_library_revision, refresh_library_entry,
-    refresh_library_entry_impl, same_build, stable_json_hash, PartsLibraryEntry, PartsLibraryMap,
+    refresh_library_entry_impl, same_build, follow_saved_rows, follow_saved_rows_known, kernel_source_stamp, stable_json_hash, PartsLibraryEntry, PartsLibraryMap,
 };
 // Assembly constraint state + exported ABI (state/statuses/DOF/overlay reads,
 // constraint CRUD with auto-solve, the document pose/isFixed write-back fold).
 pub use feature_pipeline::assembly::{
     assembly_add_constraint_json, assembly_apply_document_json,
-    assembly_apply_inferred_constraints_json, assembly_dof_json,
+    assembly_apply_inferred_constraints_json, assembly_component_entities_json, assembly_dof_json,
     assembly_infer_constraints_json, assembly_inferable_types_json,
     assembly_move_constraint_json, assembly_overlay_json, assembly_pose_updates_json,
-    assembly_remove_constraint_json, assembly_run_solve_json,
+    assembly_drag_solve_json, assembly_frame_solve_json, assembly_remove_constraint_json, assembly_resolve_refs_json,
+    assembly_run_solve_json,
     assembly_set_constraint_enabled_json, assembly_set_constraint_open_json,
     assembly_state_json, assembly_statuses_json, assembly_update_constraint_json,
-    constraint_schema_catalogue,
+    constraint_hidden_params, constraint_schema_catalogue,
     // The native doors: the same mutations with their errors as text. A native
     // caller must use these — a `JsValue` error aborts a native build.
     assembly_add_constraint_impl, assembly_apply_document_impl, assembly_move_constraint_impl,
-    assembly_remove_constraint_impl, assembly_run_solve_impl,
+    assembly_drag_solve_impl, assembly_frame_solve_impl, assembly_flip_plan_json, assembly_rebase_mechanical_impl, assembly_remove_constraint_impl, assembly_run_solve_impl,
     assembly_set_constraint_enabled_impl, assembly_set_constraint_open_impl,
     assembly_update_constraint_impl,
+    assembly_session_export, assembly_session_import, assembly_session_serial, RetiredSession, SessionTransfer,
 };
 pub use feature_pipeline::{AssemblyState, ConstraintEntry};
 // The ONE matrix → `{translate, rotateEulerDeg}` (intrinsic XYZ, degrees) pose
@@ -440,7 +447,7 @@ pub use fragment::{
 #[path = "csg/boolean/mod.rs"]
 mod boolean;
 pub use boolean::{
-    boolean_operation, boolean_operation_nary, boolean_operation_with_diagnostics, boolean_operation_with_diagnostics_at_offset, boolean_split_operands,
+    boolean_operation, boolean_operation_nary, boolean_operation_nary_with_options, boolean_operation_with_diagnostics, boolean_operation_with_diagnostics_at_offset, boolean_split_operands,
     BooleanOperation, BooleanOptions,
 };
 #[path = "csg/oracle.rs"]
@@ -614,7 +621,8 @@ pub use mesh_io::{
 #[path = "io/three_mf/mod.rs"]
 mod three_mf;
 pub use three_mf::{
-    read_3mf, ThreeMfError, ThreeMfInstance, ThreeMfMesh, ThreeMfReadResult, ThreeMfUnit,
+    read_3mf, write_3mf, ThreeMfError, ThreeMfInstance, ThreeMfMesh, ThreeMfReadResult,
+    ThreeMfSolid, ThreeMfUnit, ThreeMfWriteReport,
 };
 // Binary glTF 2.0 of the DISPLAY mesh — tessellated exchange for viewers, with
 // the axis convention and the unit carried by the root node's transform and the
@@ -642,8 +650,9 @@ pub use sketch_solver::{
 #[path = "solvers/assembly_solver.rs"]
 mod assembly_solver;
 pub use assembly_solver::{
-    solve_assembly, AssemblyBody, AssemblyMate, AssemblySolution, AssemblySolveOptions, BodyPose,
-    MateAlign, MateAxis, MateKind, MatePlane, MateResidualReport, SolveStrategy,
+    solve_assembly, AssemblyBody, AssemblyMate, AssemblySolution, AssemblySolveOptions, BodyFreedom, BodyPose,
+    LinearAlgebra, MateAlign, MateAxis, MateCurve, MateKind, MatePlane, MateResidualReport,
+    SolveStrategy, SymmetricElement,
 };
 // Assembly selection resolution: a namespaced selection ref resolved to an
 // analytic frame (plane/axis/sphere/circle/line/point) read from the exact

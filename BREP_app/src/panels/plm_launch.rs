@@ -214,6 +214,7 @@ impl Launch {
                     let class = match part.document_class.as_str() {
                         "family" => crate::document_class::DocumentClass::Family,
                         "template" => crate::document_class::DocumentClass::Template,
+                        "instructions" => crate::document_class::DocumentClass::Instructions,
                         _ => crate::document_class::DocumentClass::Normal,
                     };
                     let mut doc = Document::fresh(engine, class);

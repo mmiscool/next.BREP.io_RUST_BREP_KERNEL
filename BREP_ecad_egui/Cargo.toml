@@ -29,7 +29,7 @@ include = [
 name = "brep_ecad_egui"
 
 [dependencies]
-BREP_ecad_core = { version = "0.3.0", path = "../BREP_ecad_core" }
+BREP_ecad_core = { version = "0.3.1", path = "../BREP_ecad_core" }
 egui = "0.35"
 
 [profile.dev.package.BREP_ecad_core]

@@ -55,6 +55,11 @@ pub const FEATURES: &[&str] = &[
     // part type), origin on POST /api/parts/:id/revisions, and
     // ?external_ref= / ?part_type= with external_ref and latest_* on rows.
     "external-ref",
+    // S5 derived: PUT /api/store/doc/*key sets the revision's uses list from
+    // the document in the same write (the CAD app's PUT …/uses body), and its
+    // answer says `uses_refused` when it could not; a client seeing this name
+    // sends no PUT …/uses after a document. The route stays for older clients.
+    "derived-uses",
 ];
 
 /// `MAJOR.MINOR.PATCH` as numbers. A pre-release or build suffix

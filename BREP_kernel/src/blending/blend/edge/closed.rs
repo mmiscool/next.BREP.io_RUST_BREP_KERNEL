@@ -387,7 +387,14 @@ fn blend_closed_edge_impl(
     }
     let march_timing = crate::blend::BlendTimer::start("timing.closed.march_ms");
     let attempt_timing = crate::blend::BlendTimer::start("timing.closed.march.anchored_fallback_ms");
-    let marched = match march_stations_with_rail_bar(edge, &first_mate, &second_mate, radius_at, anchor_u, FoldPolicy::Refuse, depth_budget, rail_bar, wall_check) {
+    let analytic = crate::blend::stations::analytic_rim::construct(
+        edge, &first_mate, &second_mate, constant, chamfer, anchor_u,
+    );
+    let (analytic_stations, analytic_rows) = match analytic {
+        Some((stations, rows)) => (Some(stations), Some(rows)),
+        None => (None, None),
+    };
+    let marched = match analytic_stations.map(Ok).unwrap_or_else(|| march_stations_with_rail_bar(edge, &first_mate, &second_mate, radius_at, anchor_u, FoldPolicy::Refuse, depth_budget, rail_bar, wall_check)) {
         Ok(stations) => {
             std::mem::forget(attempt_timing);
             Ok(stations)
@@ -655,7 +662,7 @@ fn blend_closed_edge_impl(
     crate::blend::record_count("count.closed.stations", stations.len() as u64);
     let rows_timing = crate::blend::BlendTimer::start("timing.closed.rows_ms");
     let mut parameters = station_parameters(&stations);
-    let exact_rows = exact_closed_revolution_rows(&stations, &first_mate, &second_mate, chamfer);
+    let exact_rows = analytic_rows.map(Ok).or_else(|| exact_closed_revolution_rows(&stations, &first_mate, &second_mate, chamfer));
     crate::blend::record_count(
         if exact_rows.is_some() { "count.rows.exact_revolution" } else { "count.rows.fitted_closed" },
         1,

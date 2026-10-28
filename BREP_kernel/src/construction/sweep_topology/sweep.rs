@@ -20,7 +20,7 @@ use super::stations::{
 /// Guards return a clear `Err` on an open/non-planar profile, a degenerate
 /// path tangent, or a loft failure. A path that bends TIGHTER than the section
 /// reaches is refused by name before the loft (`ρκ ≥ 1`, §4c of
-/// [`sweep_sections_through_samples`]); it used to be out of scope and the
+/// `sweep_sections_through_samples`); it used to be out of scope and the
 /// caller's problem, and what the caller got instead was a wall that passed
 /// through itself.
 pub fn sweep_profile_along_path(
@@ -319,7 +319,7 @@ pub fn sweep_profile_twisted_anchored(
 ///
 /// A CORNER (a joint past [`MAX_JOINT_TANGENT_BREAK`]) selects the MITRE lane
 /// when every segment is straight — see `sweep_topology/miter.rs` for the
-/// construction and [`CornerPolicy`] for why this entry mitres while
+/// construction and `CornerPolicy` for why this entry mitres while
 /// [`sweep_profile_along_chain_with_stations`] refuses. A CLOSED cornered
 /// polyline is a picture FRAME: its closing joint is a mitre like the rest and
 /// the result has no caps. A corner at a CURVED segment is refused by name.

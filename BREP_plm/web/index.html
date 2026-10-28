@@ -11,6 +11,7 @@
 <div id="signin" class="signin" hidden>
   <form class="card" id="login-form">
     <h1>BREP PLM</h1>
+    <p id="login-purpose" class="muted" hidden>Sign in to connect BREP desktop to this PLM.</p>
     <label>Username <input id="login-user" autocomplete="username" required></label>
     <label>Password <input id="login-pass" type="password" autocomplete="current-password" required></label>
     <button type="submit">Sign in</button>
@@ -18,12 +19,27 @@
   </form>
 </div>
 
+<div id="desktop-link" class="signin" hidden>
+  <section class="card" aria-labelledby="desktop-link-title">
+    <h1 id="desktop-link-title">Connect BREP desktop</h1>
+    <div id="desktop-link-ask">
+      <p id="desktop-link-text"></p>
+      <p>Code <strong id="desktop-link-code" class="desktop-link-code"></strong></p>
+      <p class="muted" id="desktop-link-origin"></p>
+      <p class="muted">Approve only if BREP on your computer shows this same code and you just asked it to sign in.</p>
+      <div class="actions"><button type="button" id="desktop-link-approve">Approve</button><button type="button" id="desktop-link-deny" class="ghost">Deny</button></div>
+    </div>
+    <p id="desktop-link-result" role="status"></p>
+    <p><a href="/" id="desktop-link-home">Go to the PLM</a></p>
+  </section>
+</div>
+
 <div id="shell" hidden>
   <header class="application-header">
     <div class="titlebar"><strong><span class="app-mark" aria-hidden="true">B</span> BREP PLM</strong>
     <nav class="top-nav" aria-label="PLM navigation">
-      <a href="#/workspace">Home</a><a href="#/parts">Parts</a><a href="#/reviews">Inbox <span id="inbox-badge" class="count" hidden></span></a><a href="#/workflows">Workflows</a>
-      <details class="command-menu"><summary>More</summary><div><a href="#/native-import" class="author-only">Import native files</a><button id="menu-new-part" class="author-only">New part…</button><a href="#/catalog">Classification</a><a href="#/sourcing">Sourcing</a><a href="#/bake">Bake queue</a><a href="#/bom-columns">BOM column configurations</a></div></details>
+      <a href="#/workspace">Home</a><a href="#/parts">Parts</a><a href="#/reviews">Inbox <span id="inbox-badge" class="count" hidden></span></a><a href="#/workflows">Workflows</a><a href="#/jobs">Jobs</a>
+      <details class="command-menu"><summary>More</summary><div><a href="#/native-import" class="author-only">Import native files</a><button id="menu-new-part" class="author-only">New part…</button><a href="#/catalog">Classification</a><a href="#/sourcing">Sourcing</a><a href="#/tools">Tools library</a><a href="#/bake">Bake queue</a><a href="#/bom-columns">BOM column configurations</a></div></details>
       <span class="spacer"></span><button id="shell-back" class="ghost" aria-label="Go back">←</button><button id="shell-refresh" class="ghost" aria-label="Refresh current view">↻</button>
     </nav>
 <details class="command-menu user-menu" id="user-menu">
@@ -121,8 +137,11 @@
       <p>Choose a type for each new part to use its numbering scheme. Existing parts keep their type and number. Replacing a draft updates its document and BOM; creating a revision preserves the old revision.</p>
       <fieldset id="ni-mapping-fields">
         <div class="toolbar"><label class="inline">Default type <select id="ni-default-type"></select></label><button id="ni-apply-type" type="button" class="ghost">Apply to all new parts</button></div>
+        <h3>Planned structure</h3>
+        <ul id="ni-tree" class="import-tree" aria-label="Planned assembly structure"></ul>
+        <div id="ni-conflicts" class="notice" hidden><p>Some components have more than one copy. The default is shown; choose another copy to import it instead.</p><ul id="ni-conflict-rows"></ul></div>
         <div class="table-wrap"><table class="import-table"><thead><tr><th>File / name</th><th>Action</th><th>Part type / numbering</th><th>Number or existing target</th><th>Revision</th></tr></thead><tbody id="ni-rows"></tbody></table></div>
-        <p class="muted">Counter numbers are estimates until import. Missing files, inconsistent embedded copies, and circular assemblies must be resolved before continuing.</p>
+        <p class="muted">Counter numbers are estimates until import. Missing files and circular assemblies must be resolved before continuing. Parts embedded only inside an assembly become parts of their own; the same part embedded in several assemblies becomes one part.</p>
         <button id="ni-review" type="button">Review import</button>
       </fieldset>
     </section>
@@ -435,6 +454,7 @@
             <option value="0" selected>Up to the top</option>
           </select></label>
       </div>
+      <div class="toolbar" id="wu-limit" hidden><span class="muted" id="wu-limit-note"></span><button type="button" class="ghost" id="wu-show-all"></button></div>
       <div class="table-wrap" id="wu-wrap">
         <table>
           <thead><tr><th>Used by</th><th>Rev</th><th>State</th><th>Uses rev</th><th>Qty</th><th>Find</th></tr></thead>
@@ -442,6 +462,18 @@
         </table>
       </div>
       <p id="wu-empty" class="muted" hidden>Nothing uses this part.</p>
+    </section>
+
+    <section id="instructions-panel" class="details object-panel" data-object-panel="instructions">
+      <h2>Instructions</h2>
+      <div id="instructions-own" hidden>
+        <p class="muted">The assembly revision each revision of these instructions is for.</p>
+        <div class="table-wrap"><table><thead><tr><th>Rev</th><th>Instructs</th><th>Player</th></tr></thead><tbody id="instructions-own-rows"></tbody></table></div>
+      </div>
+      <div id="instructions-by">
+        <p id="instructions-empty" class="muted">No manufacturing instructions are written for this part.</p>
+        <div class="table-wrap"><table><thead><tr><th>Instructions</th><th>Rev</th><th>State</th><th>For rev</th></tr></thead><tbody id="instructions-rows"></tbody></table></div>
+      </div>
     </section>
 
     <section id="history-panel" class="details object-panel" data-object-panel="history">
@@ -625,6 +657,7 @@
       <fieldset>
         <legend>Groups</legend>
         <label class="inline"><input type="checkbox" value="viewer" checked> viewer</label>
+        <label class="inline"><input type="checkbox" value="operator"> operator</label>
         <label class="inline"><input type="checkbox" value="author"> author</label>
         <label class="inline"><input type="checkbox" value="checkin"> checkin</label>
         <label class="inline"><input type="checkbox" value="admin"> admin</label>
@@ -683,6 +716,46 @@
   </main>
 
   <!-- Sourcing: manufacturers and suppliers -->
+  <main id="view-tools" class="view" hidden>
+    <h1>Tools library</h1>
+    <p class="muted">The tools manufacturing instructions name in their steps. A step keeps its own copy of a
+      tool's name and spec; a tool is retired, never deleted, so instructions that name it still read right.</p>
+    <div class="toolbar"><label class="check"><input type="checkbox" id="tools-retired"> Show retired tools</label></div>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Picture</th><th>Tool</th><th>Kind</th><th>Spec</th><th class="author-only">Actions</th></tr></thead>
+        <tbody id="tools-rows"></tbody>
+      </table>
+    </div>
+    <p class="empty" id="tools-empty" hidden>No tools yet.</p>
+    <form id="tool-add" class="toolbar author-only">
+      <input name="name" placeholder="Tool name" aria-label="Tool name" required>
+      <input name="kind" placeholder="Kind (Torque wrench)" aria-label="Kind">
+      <input name="spec" placeholder="Spec" aria-label="Spec">
+      <button type="submit">Add tool</button>
+    </form>
+  </main>
+
+  <main id="view-jobs" class="view" hidden>
+    <h1>Jobs</h1>
+    <p class="muted">The floor queue: each job builds one unit from released manufacturing instructions. Steps are
+      signed in order, and the step that adds a serial-tracked part records its serials.</p>
+    <form id="job-add" class="toolbar author-only">
+      <input name="instructions" placeholder="Instructions number" aria-label="Instructions number" required>
+      <input name="revision" placeholder="Rev" aria-label="Instructions revision" required class="tiny">
+      <input name="serial" placeholder="Unit serial" aria-label="Unit serial">
+      <input name="quantity" type="number" min="1" max="500" value="1" aria-label="How many jobs" class="tiny">
+      <button type="submit">Queue</button>
+    </form>
+    <div id="jobs-list" class="jobs-list"></div>
+    <p class="empty" id="jobs-empty" hidden>Nothing is queued.</p>
+    <section id="job-detail" class="details" hidden>
+      <div class="toolbar"><h2 id="job-title"></h2><span class="spacer"></span><button type="button" class="ghost" id="job-close">Back to the queue</button></div>
+      <p id="job-meta" class="muted"></p>
+      <ol id="job-steps" class="job-steps"></ol>
+    </section>
+  </main>
+
   <main id="view-sourcing" class="view split-view-wide" hidden>
     <h1>Sourcing</h1>
     <p class="muted">Manufacturers make parts and suppliers sell them. On a part, each
@@ -955,6 +1028,18 @@
       </section>
     </div>
 
+    <h2>Linked desktops</h2>
+    <p class="muted">Each BREP desktop app you signed in through this browser ("Sign in with
+      your browser"). Revoke one and that app is signed out at its next request: it asks to
+      sign in again, and its open work stays in its tabs.</p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Computer</th><th>System</th><th>App</th><th>Linked</th><th>Last used</th><th></th></tr></thead>
+        <tbody id="desktop-rows"></tbody>
+      </table>
+    </div>
+    <p class="empty" id="desktops-empty" hidden>No desktop app is linked to your account.</p>
+
     <h2>API tokens</h2>
     <p class="muted">A token lets something that is not a browser sign in as you: the CAD
       app, a bake worker, or your own scripts. It sends
@@ -1041,6 +1126,15 @@
     </div>
     <p class="empty" id="lockouts-empty" hidden>No failed sign-ins in the last hour.</p>
     <div class="toolbar"><button id="lockouts-clear" class="ghost">Clear all</button></div>
+
+    <h2>Every linked desktop</h2>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>User</th><th>Computer</th><th>System</th><th>App</th><th>Linked</th><th>Last used</th><th></th></tr></thead>
+        <tbody id="all-desktop-rows"></tbody>
+      </table>
+    </div>
+    <p class="empty" id="all-desktops-empty" hidden>No desktop app is linked.</p>
 
     <h2>Every API token</h2>
     <div class="table-wrap">
@@ -1287,6 +1381,8 @@
 
 <dialog id="fields-dialog"><form id="fields-form"><h2 id="fields-title"></h2><p>Values belong to the revision or assembly occurrence. Removing a definition preserves existing values.</p><div id="fields-editor"></div><button type="button" id="fields-add">Add field</button><div class="toolbar"><button type="submit">Save fields</button><button type="button" id="fields-cancel">Cancel</button></div></form></dialog>
 <script src="/native-import.js"></script>
+<script src="/release-children.js"></script>
+<script src="/used-by.js"></script>
 <script src="/workbench.js"></script>
 <script src="/file-documents.js"></script>
 <script src="/open-pages.js"></script>

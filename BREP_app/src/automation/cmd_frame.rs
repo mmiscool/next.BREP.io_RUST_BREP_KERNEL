@@ -20,8 +20,9 @@ pub struct PendingWork {
     pub step_probes: bool,
     /// A drawing sheet's request for solid topology is in flight.
     pub topology: bool,
-    /// A drawing sheet's exact hidden-line pass is on the runner (or waiting
-    /// for it); its placement draws the mesh approximation until it lands.
+    /// A drawing sheet's exact hidden-line pass or an instructions PDF export
+    /// is still being prepared. Sheet previews draw a mesh approximation;
+    /// PDF export waits for exact lines before delivering the file.
     pub projection: bool,
     /// A write the store accepted is still on its way to where it persists:
     /// a write-behind store's pending writes (the PLM, the browser's
@@ -64,12 +65,14 @@ pub struct FrameInfo {
 pub fn frame_info(ctx: &Ctx<'_>) -> FrameInfo {
     let engine = ctx.app.docs.engine();
     let pending = PendingWork {
-        run: engine.run_pending(),
+        // A Work part edited in context is idle only once its assembly has
+        // taken the latest part state and re-run.
+        run: engine.run_pending() || ctx.app.docs.work_part_settling(),
         queries: engine.queries_pending(),
         mesh_imports: engine.mesh_imports_pending(),
         step_probes: engine.step_probes_pending(),
         topology: engine.topology_pending(),
-        projection: engine.sheet_lines_pending(),
+        projection: engine.sheet_lines_pending() || ctx.app.instructions_pdf_pending(),
         store_writes: ctx.app.model_store().pending_writes() > 0 || store_mirror_in_flight(),
         plm_requests: plm_requests_in_flight() || ctx.app.plm.busy() || ctx.app.toolbar.inbox().busy(),
     };

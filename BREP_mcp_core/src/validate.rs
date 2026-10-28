@@ -45,6 +45,17 @@ pub fn merge_params(defaults: &Value, params: &Value) -> Value {
     Value::Object(out)
 }
 
+/// The part of `merged` a patch owes validation for: every schema key, plus
+/// any key the patch names. A key the feature already stores outside its
+/// schema and the patch leaves alone (an assembly occurrence's app-written
+/// `bom` attributes) is carried through unchanged, not rejected as unknown.
+pub fn patched_view(entry: &Value, merged: &Value, patch: &Value) -> Value {
+    let spec = entry.get("inputParamsSchema").and_then(Value::as_object);
+    let mut out = merged.as_object().cloned().unwrap_or_default();
+    out.retain(|k, _| spec.is_some_and(|s| s.contains_key(k)) || patch.get(k).is_some());
+    Value::Object(out)
+}
+
 /// Validate `params` (a full `inputParams` object) against the catalogue entry
 /// for `feature_type`. `known_names`, when given, is the set of reference
 /// names that exist in the scene; a reference outside it is a warning.

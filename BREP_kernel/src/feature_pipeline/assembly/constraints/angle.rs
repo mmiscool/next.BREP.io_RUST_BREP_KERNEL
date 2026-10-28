@@ -1,13 +1,14 @@
 //! Angle (`ANGL`) — hold two direction-bearing elements at a target angle.
-//! The stored param is the DISPLAY angle (exterior-remapped when the
-//! toggle is on); a new constraint adopts the current orientation on first
-//! solve, in that same display convention.
+//! The stored param is the DISPLAY angle (exterior-remapped when the toggle
+//! is on); a new constraint created without an `angle` adopts the current
+//! orientation on first solve, in that same display convention; one created
+//! with it turns there.
 
 use super::super::mapping::{
     first_solve_target, mate, require_direction, ConstraintFailure, MappedConstraint,
     ResolvedElement,
 };
-use super::{elements_field, id_field, pair_applicable, schema_entry, ConstraintTypeDef};
+use super::{elements_field, id_field, limit_fields, pair_applicable, schema_entry, ConstraintTypeDef};
 use crate::assembly_resolve::linear;
 use crate::feature_pipeline::assembly::ConstraintEntry;
 use crate::feature_pipeline::{Env, SelectionProbe};
@@ -31,9 +32,7 @@ fn applicable(probe: &SelectionProbe) -> bool {
 }
 
 pub(super) fn schema() -> serde_json::Value {
-    schema_entry(
-        &DEF,
-        serde_json::json!({
+    let mut params = serde_json::json!({
             "id": id_field(),
             "elements": elements_field(&["FACE", "EDGE"], 2, 2,
                 "Select two direction-bearing elements to hold at an angle"),
@@ -41,15 +40,18 @@ pub(super) fn schema() -> serde_json::Value {
                 "type": "number",
                 "step": 1,
                 "default_value": 90,
-                "hint": "Signed target angle in degrees, including 0–360 (a new constraint adopts the current orientation)"
+                "hint": "Signed target angle in degrees, including 0–360 (a new constraint given no value adopts the current orientation)"
             },
             "exteriorAngle": {
                 "type": "boolean",
                 "default_value": false,
                 "hint": "Measure the exterior (supplementary) angle instead"
             },
-        }),
-    )
+        });
+    for (key, field) in limit_fields("degrees", 1.0, 90.0) {
+        params[key] = field;
+    }
+    schema_entry(&DEF, params)
 }
 
 pub(in crate::feature_pipeline::assembly) fn map(
@@ -102,7 +104,7 @@ pub(in crate::feature_pipeline::assembly) fn map(
         .number("angle", env, 90.0)
         .map_err(|error| ConstraintFailure::new("error", error))?;
     // The stored param is the DISPLAY angle (exterior-remapped when the toggle
-    // is on); first solve adopts the current orientation in that same display
+    // is on); first solve, given no angle, adopts the current orientation in that same display
     // convention, so the dialog shows what the user assembled.
     let current_display = if exterior { 180.0 - measured } else { measured };
     let (display_target, pending) = first_solve_target(

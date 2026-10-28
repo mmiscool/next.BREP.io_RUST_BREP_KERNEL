@@ -254,6 +254,10 @@ fn foot(surface: &NurbsSurface, point: Vec3, seed: Option<[f64; 2]>) -> Result<[
 /// (the half torus's stencil sought 58 584 feet for 31 500 points, all
 /// pairs alike; 2026-10-14).
 fn foot_among(surface: &NurbsSurface, point: Vec3, seeds: &[[f64; 2]]) -> Result<[f64; 2], KernelRefusal> {
+    foot_among_with_point(surface, point, seeds, None)
+}
+
+fn foot_among_with_point(surface: &NurbsSurface, point: Vec3, seeds: &[[f64; 2]], retained: Option<&mut Option<Vec3>>) -> Result<[f64; 2], KernelRefusal> {
     if let (Some(analytic), Some(first)) = (surface.analytic(), seeds.first()) {
         #[cfg(not(test))]
         let once = true;
@@ -262,6 +266,7 @@ fn foot_among(surface: &NurbsSurface, point: Vec3, seeds: &[[f64; 2]]) -> Result
                 // The first seed's own wrap, for its refusals.
                 wrap_closed(surface, *first)?;
                 note_foot_projection();
+                if let Some(retained) = retained { *retained = Some(projection.point); }
                 return Ok([projection.u, projection.v]);
             }
         }
@@ -715,13 +720,20 @@ pub(in crate::blend) fn rung_checks(
 #[derive(Default)]
 struct CheckCache {
     points: std::collections::HashMap<[u64; 5], Vec3>,
+    analytic_readings: u64,
     hits: u64,
 }
 
 impl Drop for CheckCache {
     fn drop(&mut self) {
         crate::blend::record_count("count.track.check_cache_hits", self.hits);
+        crate::blend::record_count("count.track.analytic_check_points_reused", self.analytic_readings);
     }
+}
+
+fn analytic_check_reuse_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("BREP_TRACK_ANALYTIC_CHECK_REUSE").ok().as_deref() == Some("1"))
 }
 
 /// The carrier point of the curve's own foot at `fraction`, sought from
@@ -741,10 +753,23 @@ fn check_point(
             return Ok(known);
         }
     }
-    let [u, v] = foot_among(surface, at(fraction).or_refuse(KernelStage::Refine, "at")?, &seeds)?;
-    let point = surface.evaluate(u, v).or_refuse(KernelStage::Refine, "evaluate")?;
+    let reuse = analytic_check_reuse_on();
+    let mut retained = None;
+    let source = at(fraction).or_refuse(KernelStage::Refine, "at")?;
+    let [u, v] = if reuse {
+        foot_among_with_point(surface, source, &seeds, Some(&mut retained))?
+    } else {
+        foot_among(surface, source, &seeds)?
+    };
+    let point = match retained {
+        Some(point) => point,
+        None => surface.evaluate(u, v).or_refuse(KernelStage::Refine, "evaluate")?,
+    };
     if let Some(cache) = cache.as_mut() {
         cache.points.insert(key, point);
+        if retained.is_some() {
+            cache.analytic_readings += 1;
+        }
     }
     Ok(point)
 }
@@ -1580,6 +1605,11 @@ fn stencil_verdict_cached(
     mut cache: Option<&mut CheckCache>,
 ) -> Result<(f64, Vec<usize>, Option<WorstCheck>, Vec<(f64, f64, f64, f64)>), KernelRefusal> {
     let timer = crate::blend::BlendTimer::start("timing.track.stencil_ms");
+    // Opt-in attribution only: clock reads are excluded from normal profiling.
+    let profile_image = crate::blend::timing::enabled()
+        && std::env::var("BREP_PROFILE_TRACK_IMAGE").ok().as_deref() == Some("1");
+    let mut image_elapsed = std::time::Duration::ZERO;
+    let mut image_count = 0u64;
     flush_foot_projections("count.track.feet_elsewhere");
     crate::blend::record_count("count.track.stencil_points", ((track.fractions.len() - 1) * (LOCAL_STENCIL - 1)) as u64);
     let mut per_interval = Vec::with_capacity(track.fractions.len() - 1);
@@ -1594,7 +1624,13 @@ fn stencil_verdict_cached(
             let fraction = low + (high - low) * j as f64 / LOCAL_STENCIL as f64;
             let on_carrier = check_point(surface, at, fraction, [track.feet[index], track.feet[index + 1]], &mut cache)?;
             let uv = curve.evaluate(fraction).or_refuse(KernelStage::Refine, "evaluate")?;
-            let distance = pcurve_image(surface, uv.x, uv.y).or_refuse(KernelStage::Refine, "evaluate")?.sub(on_carrier).length();
+            let image_started = profile_image.then(web_time::Instant::now);
+            let image = pcurve_image(surface, uv.x, uv.y).or_refuse(KernelStage::Refine, "evaluate")?;
+            if let Some(started) = image_started {
+                image_elapsed += started.elapsed();
+                image_count += 1;
+            }
+            let distance = image.sub(on_carrier).length();
             if worst.as_ref().map_or(true, |(known, _)| distance > *known) {
                 worst = Some((distance, WorstCheck { fraction, interval: index, bracket: [low, high] }));
             }
@@ -1608,6 +1644,10 @@ fn stencil_verdict_cached(
         located.push((miss, interval_worst.1, low, high));
     }
     let (miss, over) = classify_checks(&per_interval, tolerance)?;
+    if profile_image {
+        crate::blend::timing::record_ms("timing.track.stencil.image_ms", image_elapsed.as_secs_f64() * 1000.0);
+        crate::blend::record_count("count.track.stencil.image", image_count);
+    }
     flush_foot_projections("count.track.stencil_feet");
     if std::env::var_os("BREP_DEBUG_TRACK_FIT").is_some() {
         eprintln!(
@@ -2250,3 +2290,4 @@ fn interpolate_with_tangents(
 fn inserted_at(fractions: &[f64], fraction: f64) -> bool {
     fractions.iter().any(|known| (known - fraction).abs() <= 1e-15)
 }
+

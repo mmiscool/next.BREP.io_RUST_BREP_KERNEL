@@ -295,6 +295,11 @@ impl BrepSolid {
                         )));
                     }
                 }
+                if let Some(surface) = &surface {
+                    if let Some(error) = validate_periodic_boundary_winding(surface, face, tolerances) {
+                        issues.push(ValidationIssue::error(format!("face {}: {error}", face.id)));
+                    }
+                }
             }
         }
 
@@ -826,15 +831,6 @@ pub(crate) fn adaptive_coedge_error(
     Ok(maximum)
 }
 
-/// [`adaptive_coedge_error`] with the band-free floor: the midpoint of every
-/// knot span of the pcurve and of the edge curve, read whatever the band. This
-/// is what `validate` and the offset family's measured tolerance read. The
-/// boolean's repair decisions (`csg/boolean/assemble/finalize.rs`,
-/// `refusal_welds.rs`) and the healing coalesce keep the band-steered reading
-/// above: read through the floor, the zero-clearance ball-and-stick joint
-/// gains an edge and a vertex at its crotch ((5, 9, 6) against (5, 8, 5),
-/// `tests/suites/tangent_node_assembly.rs`, 2026-09-26) — a consumer that
-/// depends on its instrument's coarseness, named for its own slice.
 thread_local! {
     static COEDGE_MEMO: std::cell::RefCell<Option<HashMap<Vec<u64>, Result<f64, String>>>> =
         const { std::cell::RefCell::new(None) };
@@ -1126,6 +1122,15 @@ fn memoized_coedge_error(
     read
 }
 
+/// [`adaptive_coedge_error`] with the band-free floor: the midpoint of every
+/// knot span of the pcurve and of the edge curve, read whatever the band. This
+/// is what `validate` and the offset family's measured tolerance read. The
+/// boolean's repair decisions (`csg/boolean/assemble/finalize.rs`,
+/// `refusal_welds.rs`) and the healing coalesce keep the band-steered reading
+/// above: read through the floor, the zero-clearance ball-and-stick joint
+/// gains an edge and a vertex at its crotch ((5, 9, 6) against (5, 8, 5),
+/// `tests/suites/tangent_node_assembly.rs`, 2026-09-26) — a consumer that
+/// depends on its instrument's coarseness, named for its own slice.
 pub(crate) fn coedge_error_floored(
     surface: &NurbsSurface,
     pcurve: &NurbsCurve,
@@ -1221,6 +1226,44 @@ fn segments_cross(a: Vec2, b: Vec2, c: Vec2, d: Vec2, tolerance: f64) -> bool {
     let t = cross(ac, cd) / denominator;
     let u = cross(ac, ab) / denominator;
     t > tolerance && t < 1.0 - tolerance && u > tolerance && u < 1.0 - tolerance
+}
+
+/// On a cylinder or a cone/frustum without a pole, the oriented boundary of
+/// a finite face has zero total winding around the periodic direction. Checking
+/// each loop separately cannot detect two full rims running the same way: both
+/// close in 3D, and a constant-height rim has no signed area in the UV plane.
+/// Sum pcurve displacements, not the jumps between their parameter branches;
+/// those jumps are implicit seams and do not belong to the boundary traversal.
+fn validate_periodic_boundary_winding(
+    surface: &NurbsSurface,
+    face: &FaceRecord,
+    tolerances: &KernelTolerances,
+) -> Option<String> {
+    let Some(crate::AnalyticSurface::RuledRevolution { rho0, rho1, .. }) = surface.analytic() else {
+        return None;
+    };
+    // A cap enclosing a pole can legitimately have a single winding rim.
+    // Spheres, tori, and general surfaces are outside this nonsingular-wall check.
+    if rho0 * rho1 <= 0.0 || rho0.abs().min(rho1.abs()) <= tolerances.model {
+        return None;
+    }
+    let [u0, u1] = surface.domain_u().ok()?;
+    let period = u1 - u0;
+    if period <= 0.0 { return None; }
+    let mut displacement = 0.0;
+    for coedge in face.loops.iter().flat_map(|lp| &lp.coedges) {
+        let [t0, t1] = coedge.pcurve.domain().ok()?;
+        let start = coedge.pcurve.evaluate(t0).ok()?;
+        let end = coedge.pcurve.evaluate(t1).ok()?;
+        displacement += end.x - start.x;
+    }
+    let winding = displacement / period;
+    // Valid endpoint matches make this an integer, up to projection error.
+    // Half a turn separates zero from a genuine nonzero winding without
+    // promoting tiny accumulated endpoint residuals into topology failures.
+    (winding.abs() > 0.5).then(|| format!(
+        "nonzero periodic boundary winding ({winding:.6} turns) on a nonsingular revolution wall"
+    ))
 }
 
 fn validate_uv_wire(

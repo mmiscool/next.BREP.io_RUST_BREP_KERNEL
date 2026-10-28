@@ -5,11 +5,11 @@
 //!
 //! The fill of a zone on layer `L` for net `N` is the zone's polygon
 //!
-//! * inside the board outline by at least [`DesignRules::edge_clearance`];
+//! * inside the board outline by at least [`DesignRules::edge_clearance`](crate::board::DesignRules::edge_clearance);
 //! * minus a clearance round every piece of copper on `L` that is NOT on `N` —
 //!   pads, tracks and vias of other nets, and copper that carries no net at all
 //!   (an unrouted stub, a mechanical pad). The clearance is the larger of `N`'s net
-//!   class's and that copper's ([`DesignRules::clearance_between`]; netless copper
+//!   class's and that copper's ([`DesignRules::clearance_between`](crate::board::DesignRules::clearance_between); netless copper
 //!   is Default);
 //! * minus the whole outline of every EARLIER zone on `L` of another net, grown by
 //!   the larger of the two nets' class clearances: zones are filled in the order they were drawn and the first

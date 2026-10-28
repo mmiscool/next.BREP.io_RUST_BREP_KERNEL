@@ -55,6 +55,65 @@ pub fn document_signature(doc_json: &str) -> String {
     format!("{hash:016x}")
 }
 
+/// A nested occurrence's Fix/Float as the assembly solve reads it.
+///
+/// `top_params` is the top-level instance's `inputParams`, `rest` the
+/// occurrence's path inside it (`ACOMP2`, `ACOMP1:ACOMP2`) and `document` the
+/// definition that instance places. Only an occurrence the solve moves can be
+/// fixed or freed here: every instance above it must be flexible (a rigid
+/// sub-assembly moves as one body, its parts never move on their own). The
+/// state is the instance's own `flexibleFixed[rest]`, else the grounding of
+/// the definition that places it (an explicit `isFixed`, else the first
+/// component, else a Fixed constraint's target), as `assembly::flexible`
+/// decides it.
+pub fn nested_fixed_state(top_params: &Value, rest: &str, document: &Value) -> Result<bool, String> {
+    let acomp = |document: &'_ Value, id: &str| -> Option<Value> {
+        document["features"].as_array()?.iter().find(|f| {
+            matches!(f["type"].as_str(), Some("ACOMP" | "ASSEMBLY COMPONENT")) && f["inputParams"]["id"].as_str() == Some(id)
+        }).cloned()
+    };
+    let rigid = |name: &str| {
+        format!("'{name}' is a rigid sub-assembly: it moves as one body, so its parts are not fixed or freed here. Tick Flexible on it, or edit it as the Work part")
+    };
+    let segments: Vec<&str> = rest.split(':').collect();
+    let (last, above) = segments.split_last().ok_or("empty occurrence path")?;
+    let top_name = top_params["partName"].as_str().unwrap_or_default();
+    if top_params["flexible"] != Value::Bool(true) {
+        return Err(rigid(top_name));
+    }
+    let mut document = document;
+    for id in above {
+        let feature = acomp(document, id).ok_or_else(|| format!("component '{id}' is missing"))?;
+        let name = feature["inputParams"]["partName"].as_str().unwrap_or_default().to_string();
+        if feature["inputParams"]["flexible"] != Value::Bool(true) {
+            return Err(rigid(&name));
+        }
+        document = &document["partsLibrary"][&name]["document"];
+    }
+    acomp(document, last).ok_or_else(|| format!("component '{last}' is missing"))?;
+    if let Some(fixed) = top_params["flexibleFixed"][rest].as_bool() {
+        return Ok(fixed);
+    }
+    let components: Vec<&Value> = document["features"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|f| matches!(f["type"].as_str(), Some("ACOMP" | "ASSEMBLY COMPONENT")))
+        .collect();
+    let feature = components.iter().find(|f| f["inputParams"]["id"].as_str() == Some(last));
+    if let Some(fixed) = feature.and_then(|f| f["inputParams"]["isFixed"].as_bool()) {
+        return Ok(fixed);
+    }
+    if components.first().and_then(|f| f["inputParams"]["id"].as_str()) == Some(last) {
+        return Ok(true);
+    }
+    let fixed_by_constraint = document["assembly"]["constraints"].as_array().into_iter().flatten().any(|c| {
+        c["type"].as_str() == Some("fixed")
+            && c["inputParams"]["elements"].as_array().into_iter().flatten().filter_map(Value::as_str).any(|e| e.split(':').next() == Some(*last))
+    });
+    Ok(fixed_by_constraint)
+}
+
 /// Rigid inverse `[Rᵀ | −Rᵀ·t]` of a component pose — used to express a picked
 /// WORLD point in COMPONENT-LOCAL coordinates (the vertex-ref contract).
 fn rigid_inverse_point(transform: &brep_kernel::AffineTransform, world: [f64; 3]) -> [f64; 3] {
@@ -142,7 +201,7 @@ impl EngineState {
     /// The parts-library entry names currently resident (insert-flow "existing
     /// entries first" list). The main-side store, seeded by document ingest and
     /// kept current by the runs that heal or GC it (`apply_run_output` installs
-    /// the store a run moved), and grown by [`insert_component`].
+    /// the store a run moved), and grown by [`insert_component`](Self::insert_component).
     pub fn parts_library_names(&mut self) -> Vec<String> {
         serde_json::from_str::<Value>(&brep_kernel::parts_library_json())
             .ok()
@@ -214,13 +273,44 @@ impl EngineState {
     /// not per run, which is the whole difference from the old `sync_assembly`.
     /// Cheap no-op when the session is already current, and for a componentless
     /// document (nothing to solve).
+    ///
+    /// The runner's own session comes first: an owned copy of it
+    /// ([`crate::runner::HistoryRunner::session_for_main`]), imported when it is
+    /// the session of the run applied here, and only while no newer run is in
+    /// flight. Otherwise, and on any refusal, the history is replayed here as
+    /// before.
     pub(crate) fn ensure_assembly_session(&mut self) {
-        if self.assembly_session_generation == Some(self.applied_generation) {
+        if self.assembly_session_generation == Some(self.applied_generation)
+            && self.assembly_session_serial == brep_kernel::assembly_session_serial()
+        {
             return;
         }
         if !self.history_has_assembly() {
             return;
         }
+        if self.session_transfer && !self.run_pending() {
+            let mut _trace = crate::run_trace::span("assembly_session_import");
+            match self.runner.session_for_main(self.applied_generation) {
+                crate::runner::SessionOnMain::Resident => {
+                    self.session_imports += 1;
+                    self.mark_session_current();
+                    return;
+                }
+                crate::runner::SessionOnMain::Copied(transfer) => {
+                    let retired = brep_kernel::assembly_session_import(transfer);
+                    // Dropping the replaced copy costs milliseconds: not here.
+                    #[cfg(not(target_arch = "wasm32"))]
+                    std::thread::spawn(move || drop(retired));
+                    #[cfg(target_arch = "wasm32")]
+                    drop(retired);
+                    self.session_imports += 1;
+                    self.mark_session_current();
+                    return;
+                }
+                crate::runner::SessionOnMain::Unavailable => {}
+            }
+        }
+        self.session_replays += 1;
         let request: brep_kernel::HistoryRequest =
             match serde_json::from_value(self.run_request_value()) {
                 Ok(request) => request,
@@ -231,7 +321,21 @@ impl EngineState {
         if let Some(trace) = _trace.as_mut() {
             trace.result(&result);
         }
+        self.mark_session_current();
+    }
+
+    fn mark_session_current(&mut self) {
         self.assembly_session_generation = Some(self.applied_generation);
+        self.assembly_session_serial = brep_kernel::assembly_session_serial();
+    }
+
+    /// Drop the main-side session's currency stamp, so the next
+    /// `Self::ensure_assembly_session` replays this document. The kernel
+    /// session is one per thread, shared by every open document: a caller that
+    /// may have let another document replay (or changed the kernel's parts
+    /// library) since this one's last replay calls this first.
+    pub fn forget_assembly_session(&mut self) {
+        self.assembly_session_generation = None;
     }
 
     /// Re-read the main-side session into [`Self::assembly_sync`] after a
@@ -519,6 +623,33 @@ impl EngineState {
     /// visible); later instances write `false`. Returns the new feature id
     /// (`ACOMP<digits>` — the history's global counter mints that exact form).
     pub fn insert_component(&mut self, insert: ComponentInsert<'_>) -> Result<String, String> {
+        let part_name = self.resolve_component_insert(insert)?;
+        let first = !(0..self.history.len()).any(|index| {
+            matches!(
+                self.history.feature_type(index).as_deref(),
+                Some("ACOMP") | Some("ASSEMBLY COMPONENT")
+            )
+        });
+        let id = self.history.next_feature_id("ACOMP");
+        let feature = serde_json::json!({
+            "type": "ACOMP",
+            "inputParams": {
+                "id": id,
+                "partName": part_name,
+                "transform": { "translate": [0, 0, 0], "rotateEulerDeg": [0, 0, 0] },
+                "isFixed": first,
+            },
+            "persistentData": {}
+        });
+        self.add_feature(&feature.to_string())?;
+        Ok(id)
+    }
+
+    /// The parts-library entry an insert (or a replace) names: an existing
+    /// entry as is, or a new payload added (deduplicated by
+    /// sourceKey+signature) — with the document's `partsLibrary` block
+    /// refreshed so the next run ingests it. Returns the EFFECTIVE entry name.
+    pub(crate) fn resolve_component_insert(&mut self, insert: ComponentInsert<'_>) -> Result<String, String> {
         let part_name = match insert {
             ComponentInsert::Existing { part_name } => part_name.to_string(),
             ComponentInsert::New {
@@ -547,30 +678,31 @@ impl EngineState {
         if let Ok(library) = serde_json::from_str::<Value>(&brep_kernel::parts_library_json()) {
             self.history.set_parts_library(library);
         }
-        let first = !(0..self.history.len()).any(|index| {
-            matches!(
-                self.history.feature_type(index).as_deref(),
-                Some("ACOMP") | Some("ASSEMBLY COMPONENT")
-            )
-        });
-        let id = self.history.next_feature_id("ACOMP");
-        let feature = serde_json::json!({
-            "type": "ACOMP",
-            "inputParams": {
-                "id": id,
-                "partName": part_name,
-                "transform": { "translate": [0, 0, 0], "rotateEulerDeg": [0, 0, 0] },
-                "isFixed": first,
-            },
-            "persistentData": {}
-        });
-        self.add_feature(&feature.to_string())?;
-        Ok(id)
+        Ok(part_name)
     }
 
     /// Fix/Unfix a component: toggles the OWNING ACOMP feature's
-    /// `inputParams.isFixed` (one truth, one undo lane) and re-runs.
+    /// `inputParams.isFixed` (one truth, one undo lane) and re-runs. A nested
+    /// occurrence (`ACOMP1:ACOMP2`) is fixed or freed on the top instance that
+    /// lends it (`inputParams.flexibleFixed`, by instance-local path), never in
+    /// the sub-assembly's document; [`nested_fixed_state`] says when that is
+    /// not possible.
     pub fn set_component_fixed(&mut self, component_id: &str, fixed: bool) -> Result<(), String> {
+        if let Some((top, rest)) = component_id.split_once(':') {
+            self.occurrence_fixed(component_id)?;
+            let index = self.history.index_of(top).ok_or_else(|| format!("no component feature '{top}'"))?;
+            let mut params = self.history.feature_params(index).unwrap_or_else(|| serde_json::json!({}));
+            let Some(map) = params.as_object_mut() else {
+                return Err(format!("component '{top}': malformed inputParams"));
+            };
+            let overrides = map.entry("flexibleFixed").or_insert_with(|| serde_json::json!({}));
+            if !overrides.is_object() {
+                *overrides = serde_json::json!({});
+            }
+            overrides[rest] = Value::Bool(fixed);
+            self.update_feature_params(top, &params.to_string())?;
+            return Ok(());
+        }
         let index = self
             .history
             .index_of(component_id)
@@ -586,6 +718,16 @@ impl EngineState {
         }
         self.update_feature_params(component_id, &params.to_string())?;
         Ok(())
+    }
+
+    /// Whether a nested occurrence (`ACOMP1:ACOMP2`) is fixed, or why it
+    /// cannot be fixed or freed from this assembly ([`nested_fixed_state`]).
+    pub fn occurrence_fixed(&self, path: &str) -> Result<bool, String> {
+        let (top, rest) = path.split_once(':').ok_or_else(|| format!("'{path}' is not a nested occurrence"))?;
+        let index = self.history.index_of(top).ok_or_else(|| format!("no component feature '{top}'"))?;
+        let params = self.history.feature_params(index).unwrap_or_default();
+        let part = params["partName"].as_str().unwrap_or_default();
+        nested_fixed_state(&params, rest, &self.history.parts_library()[part]["document"])
     }
 
     /// Select a component in the viewport: emphasis over exactly its member
@@ -632,11 +774,20 @@ impl EngineState {
     /// member solids (the interference window's row click highlights both
     /// participants of a pair through this).
     pub fn select_components(&mut self, component_ids: &[String]) {
+        // An id may be a nested occurrence (`ACOMP2:ACOMP1`): the solids of
+        // its top component under that path.
         let members: Vec<String> = self
             .assembly_components
             .iter()
-            .filter(|record| component_ids.iter().any(|id| id == &record.id))
-            .flat_map(|record| record.solids.iter().cloned())
+            .flat_map(|record| {
+                record.solids.iter().filter(move |solid| {
+                    component_ids.iter().any(|id| {
+                        id == &record.id
+                            || (id.split(':').next() == Some(record.id.as_str()) && solid.starts_with(&format!("{id}:")))
+                    })
+                })
+            })
+            .cloned()
             .collect();
         let json = serde_json::json!({ "selected": { "solids": members } }).to_string();
         let _ = self.emphasis.apply_json(&json);
@@ -647,7 +798,7 @@ impl EngineState {
 
     /// Enter the modal reference picker for an ASSEMBLY CONSTRAINT's
     /// `elements`-style field (same widget, different commit target — Finish
-    /// routes through [`Self::assembly_update_constraint_no_rerun`] instead of
+    /// routes through `Self::assembly_update_constraint_no_rerun` instead of
     /// feature params). No roll-to-before: constraints pick against the FULL
     /// assembly.
     pub fn begin_ref_select_for_constraint(

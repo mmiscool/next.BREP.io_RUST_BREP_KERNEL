@@ -102,7 +102,7 @@ pub struct MeasureQuery {
 pub struct MeasureReply {
     /// The request id this answers.
     pub id: u64,
-    /// The measurement JSON fragment (see [`measure_json`]).
+    /// The measurement JSON fragment (see `measure_json`).
     pub result: String,
 }
 
@@ -175,6 +175,508 @@ fn sheet_lines_reply(request: SheetLinesRequest) -> SheetLinesReply {
         id: request.id,
         lines: crate::sheets::project::run_lines_job(&request.job),
         key: request.job.key,
+    }
+}
+
+/// ONE CAM operation's generation, off the UI thread (the CAM workbench's
+/// Generate). The job carries everything the generator reads as plain data:
+/// the operation, its setup and the document's tools (the shared model, by
+/// value), and the resident solids it machines by `(name, handle)`, which
+/// the runner clones out of its registry and tessellates through the CAM
+/// kernel adapter. The main side submits ONE operation per job and the next
+/// when its reply lands, so a cancel between operations is immediate on
+/// every platform; inside a job the native thread's cancel flag ends it at
+/// the generator's next work chunk, and the browser worker — which cannot
+/// read a message while it is inside a job — finishes the operation, whose
+/// reply the main side then drops as cancelled. A document `Reset` drops
+/// nothing here: the job holds no parked state across commands.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CamJob {
+    /// Monotonic job id (main pairs the reply and the progress back by it).
+    pub id: u64,
+    pub operation: brep_cam::model::Operation,
+    pub setup: brep_cam::model::Setup,
+    pub tools: Vec<brep_cam::model::Tool>,
+    /// The bodies the setup machines or protects: `(solid name, resident handle)`.
+    pub solids: Vec<(String, u32)>,
+    /// The chordal tolerance the bodies are tessellated at, in model units.
+    pub chord_tolerance: f64,
+    /// Work units per progress / cancel check (the generator's chunk).
+    pub budget_chunk: u64,
+    /// The sketch curves the operation's chains name, `(sketch id, geometry
+    /// id, curve)` in model space, from the last history run (the runner's
+    /// registry holds solids, not sketches).
+    #[serde(default)]
+    pub chain_curves: Vec<(String, String, brep_kernel::NurbsCurve)>,
+    /// The sketch profiles the operation's chains name, `(sketch id, profile)`.
+    #[serde(default)]
+    pub chain_profiles: Vec<(String, brep_kernel::SketchProfile)>,
+    /// The setup's machine, resolved (its id is `setup.machine`): the
+    /// generator's kinematics context for rotary-capable strategies.
+    #[serde(default)]
+    pub machine: Option<brep_cam::model::Machine>,
+    /// Exact automatically programmed geometry and associative feature identity.
+    #[serde(default)]
+    pub autoprogram: Option<brep_cam::autoprogram::binding::Binding>,
+    /// The setup's operations BEFORE this one, in program order, each with
+    /// its current toolpath (`None`: not generated, failed or stale): the
+    /// runner replays them into the stock this operation starts from (lane C7).
+    #[serde(default)]
+    pub earlier: Vec<(brep_cam::model::Operation, Option<brep_cam::model::Toolpath>)>,
+    /// The setups this one continues from (`Stock::FromRest`), oldest first.
+    #[serde(default)]
+    pub previous_setups: Vec<brep_cam::SetupHistory>,
+    /// A multi-axis finish's designated three-axis source, generated and
+    /// current (lane C17): the generator tilts this path.
+    #[serde(default)]
+    pub source: Option<brep_cam::program::OperationInput>,
+    /// The designated source's definition when it has no current result: the
+    /// worker generates it on this job's bodies first.
+    #[serde(default)]
+    pub source_operation: Option<brep_cam::model::Operation>,
+}
+
+/// A completed [`CamJob`]: the toolpath, or why the operation could not be
+/// generated (the generator's own words), and how much work it took.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CamReply {
+    /// Certified setup-Z meridian, carried with the generated result for axial replay.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turning_profile: Option<brep_cam::turning::profile::TurningProfile>,
+    /// The stock the operation's setup starts from, as this job resolved it
+    /// (the simulation loads it; absent when the job built no pre-operation stock).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub setup_start: Option<brep_cam::SetupStart>,
+    pub id: u64,
+    pub operation: String,
+    pub toolpath: Result<brep_cam::model::Toolpath, String>,
+    pub work_units: u64,
+    /// Whether the job ended on the cancel flag rather than on its own.
+    pub cancelled: bool,
+}
+
+/// A generation's progress, posted from inside the job at its stage and
+/// chunk boundaries.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CamProgress {
+    pub id: u64,
+    pub operation: String,
+    pub phase: String,
+    pub message: String,
+    pub current: u64,
+    pub total: u64,
+}
+
+/// A CAM SIMULATION request (lane C17b). The runner keeps ONE simulation
+/// session resident (its stock and checkpoints live runner-side; a thread
+/// local, so the native thread and the wasm worker hold it the same way);
+/// the main side loads it once and then asks it to advance in bounded
+/// chunks, so a cancel between chunks is immediate on every platform and a
+/// chunk stops between two motions on the native thread.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub enum CamSimRequest {
+    /// Make `stock` the session's stock over `timeline`, each range cut by its cutter.
+    Load {
+        timeline: brep_cam::multiaxis::sim::Timeline,
+        stock: brep_cam::multiaxis::sim::StockModel,
+        ranges: Vec<brep_cam::multiaxis::sim::RangeCutter>,
+        options: brep_cam::multiaxis::sim::DriverOptions,
+        /// The machine whose chain applies rotary positioning (C7's
+        /// `*_on_machine`); none refuses any nonzero rotary word.
+        #[serde(default)]
+        machine: Option<brep_cam::model::Machine>,
+    },
+    /// Advance (or rewind and replay) toward `target` applied motions, at
+    /// most `budget` motions. `stock: true` returns the stock whenever its
+    /// version differs from `known_version` (the one the caller holds), so
+    /// a chunk whose reply the caller dropped is still made good.
+    Advance { target: usize, budget: usize, stock: bool, known_version: u64 },
+    /// Forget the session.
+    Drop,
+}
+
+/// One simulation command, paired back by `(session, seq)`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CamSimJob {
+    pub session: u64,
+    pub seq: u64,
+    pub request: CamSimRequest,
+}
+
+/// The session's state after a [`CamSimJob`].
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CamSimReply {
+    pub session: u64,
+    pub seq: u64,
+    pub applied: usize,
+    pub version: u64,
+    pub removed_volume: f64,
+    pub stock_volume: f64,
+    pub unsupported: Vec<usize>,
+    pub warnings: Vec<(usize, brep_cam::model::Diagnostic)>,
+    /// The stock, when asked and it changed since the job started.
+    pub stock: Option<brep_cam::multiaxis::sim::StockModel>,
+    /// The target was reached (`false`: the budget ran out or it stopped).
+    pub reached: bool,
+    /// The chunk stopped on the cancel flag (between two motions).
+    pub cancelled: bool,
+    pub error: Option<String>,
+}
+
+/// A simulation chunk's progress, posted between motions.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CamSimProgress {
+    pub session: u64,
+    pub seq: u64,
+    pub applied: usize,
+    pub target: usize,
+}
+
+/// The runner-side simulation session.
+struct CamSimSession {
+    session: u64,
+    timeline: brep_cam::multiaxis::sim::Timeline,
+    ranges: Vec<brep_cam::multiaxis::sim::RangeCutter>,
+    driver: brep_cam::multiaxis::sim::SimDriver,
+}
+
+thread_local! {
+    static CAM_SIM: std::cell::RefCell<Option<CamSimSession>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Forget the resident simulation (a document switch).
+fn cam_sim_clear() {
+    CAM_SIM.with(|c| *c.borrow_mut() = None);
+}
+
+thread_local! {
+    /// Pre-operation stock states of this document session (lane C7): a
+    /// regenerated operation replays only from the longest unchanged prefix.
+    static PRE_OP_STOCK: std::cell::RefCell<brep_cam::PreOpStockCache> = std::cell::RefCell::new(brep_cam::PreOpStockCache::new(16));
+}
+
+/// Forget the pre-operation stock states (a document switch).
+fn pre_op_stock_clear() {
+    PRE_OP_STOCK.with(|c| c.borrow_mut().clear());
+}
+
+fn cam_sim_reply(job: CamSimJob, post: &mut dyn FnMut(Reply) -> bool) -> CamSimReply {
+    let (session, seq) = (job.session, job.seq);
+    let empty = |error: Option<String>| CamSimReply {
+        session,
+        seq,
+        applied: 0,
+        version: 0,
+        removed_volume: 0.0,
+        stock_volume: 0.0,
+        unsupported: Vec::new(),
+        warnings: Vec::new(),
+        stock: None,
+        reached: false,
+        cancelled: false,
+        error,
+    };
+    match job.request {
+        CamSimRequest::Drop => {
+            cam_sim_clear();
+            empty(None)
+        }
+        CamSimRequest::Load { timeline, stock, ranges, options, machine } => match brep_cam::multiaxis::sim::SimDriver::new(stock, options) {
+            Ok(driver) => {
+                let driver = driver.with_chain(brep_cam::multiaxis::sim::sim_chain(machine.as_ref()));
+                let reply = CamSimReply {
+                    applied: driver.applied,
+                    version: driver.version,
+                    stock_volume: driver.stock.volume(),
+                    reached: true,
+                    ..empty(None)
+                };
+                CAM_SIM.with(|c| *c.borrow_mut() = Some(CamSimSession { session, timeline, ranges, driver }));
+                reply
+            }
+            Err(e) => empty(Some(e.to_string())),
+        },
+        CamSimRequest::Advance { target, budget, stock, known_version } => CAM_SIM.with(|c| {
+            let mut guard = c.borrow_mut();
+            let Some(sim) = guard.as_mut().filter(|s| s.session == session) else {
+                return empty(Some("no simulation session is loaded on the runner".into()));
+            };
+            let mut cancelled = false;
+            let tolerance = brep_cam::Tolerance::default();
+            let outcome = sim.driver.advance_ranges(&sim.timeline, &sim.ranges, target, budget, &tolerance, &mut |applied| {
+                let keep = post(Reply::CamSimProgress(CamSimProgress { session, seq, applied, target }));
+                if !keep {
+                    cancelled = true;
+                }
+                keep
+            });
+            let d = &sim.driver;
+            let (reached, error) = match outcome {
+                Ok(o) => (o == brep_cam::multiaxis::sim::AdvanceOutcome::Reached, None),
+                Err(e) => (false, Some(e.to_string())),
+            };
+            CamSimReply {
+                session,
+                seq,
+                applied: d.applied,
+                version: d.version,
+                removed_volume: d.removed_volume,
+                stock_volume: d.stock.volume(),
+                unsupported: d.unsupported.clone(),
+                warnings: d.warnings.clone(),
+                stock: (stock && d.version != known_version).then(|| d.stock.clone()),
+                reached,
+                cancelled,
+                error,
+            }
+        }),
+    }
+}
+
+/// A progress sink that posts through the driver's reply channel and turns
+/// a driver that says "stop" into the generator's cancel.
+struct CamSink<'a> {
+    id: u64,
+    operation: String,
+    token: brep_cam::CancelToken,
+    post: &'a mut dyn FnMut(Reply) -> bool,
+}
+
+impl brep_cam::ProgressSink for CamSink<'_> {
+    fn progress(&mut self, progress: &brep_cam::Progress) {
+        if std::env::var_os("BREP_CAM_DEBUG").is_some() {
+            eprintln!("cam job {} progress: {} {}/{}", self.operation, progress.phase, progress.current, progress.total);
+        }
+        let keep_going = (self.post)(Reply::CamProgress(CamProgress {
+            id: self.id,
+            operation: self.operation.clone(),
+            phase: progress.phase.clone(),
+            message: progress.message.clone(),
+            current: progress.current,
+            total: progress.total,
+        }));
+        if !keep_going {
+            if std::env::var_os("BREP_CAM_DEBUG").is_some() {
+                eprintln!("cam job {}: the driver said stop; cancelling", self.operation);
+            }
+            self.token.cancel();
+        }
+    }
+}
+
+/// The most triangles a CAM job's part mesh may have (the triangle index and
+/// the drop-cutter queries scale with it).
+pub const CAM_TRIANGLE_BUDGET: usize = 4_000_000;
+
+/// Run one CAM job against the resident registry of this thread.
+fn cam_generate_reply(job: CamJob, post: &mut dyn FnMut(Reply) -> bool) -> CamReply {
+    use brep_cam::kernel_adapter::{machine_snapshot, revolved_faces, BodyInput};
+    use brep_cam::{Runner, Tolerance, TreeIndex, TreeOptions, WorkBudget};
+    let operation = job.operation.id.as_str().to_string();
+    let token = brep_cam::CancelToken::new();
+    let mut sink = CamSink { id: job.id, operation: operation.clone(), token: token.clone(), post };
+    let mut certified_turning_profile = None;
+    let mut setup_start = None;
+    let mut outcome = || -> Result<(brep_cam::model::Toolpath, u64), String> {
+        // The resident bodies, cloned out of the registry by handle.
+        let mut bodies: Vec<(String, brep_kernel::BrepSolid)> = Vec::new();
+        for (name, handle) in &job.solids {
+            let solid = brep_kernel::registered_solid_clone(*handle)
+                .map_err(|e| format!("body `{name}` is not resident on the runner ({e}); run the history again"))?;
+            bodies.push((name.clone(), solid));
+        }
+        let diagonal = bodies
+            .iter()
+            .filter_map(|(_, s)| brep_cam::kernel_adapter::body_bounds(s, job.chord_tolerance).ok())
+            .fold(brep_cam::model::Bounds3::empty(), |acc, b| acc.union(&b))
+            .diagonal();
+        let tolerance = if diagonal.is_finite() && diagonal > 0.0 { Tolerance::scaled_for_diagonal(diagonal) } else { Tolerance::default() };
+        // The snapshot holds the SETUP's bodies and the operation's own: an
+        // operation's target or protected body outside the setup's list is
+        // still machined or avoided, so it joins the snapshot here.
+        let mut snapshot_setup = job.setup.clone();
+        for name in &job.operation.targets.target_solids {
+            if !snapshot_setup.targets.iter().any(|t| &t.solid == name) {
+                snapshot_setup.targets.push(brep_cam::model::TargetRef { solid: name.clone(), face: None });
+            }
+        }
+        for name in &job.operation.targets.protected_solids {
+            let listed = snapshot_setup.targets.iter().chain(snapshot_setup.protected.iter()).any(|t| &t.solid == name);
+            if !listed {
+                snapshot_setup.protected.push(brep_cam::model::TargetRef { solid: name.clone(), face: None });
+            }
+        }
+        let (mesh, unresolved) = machine_snapshot(&snapshot_setup, job.chord_tolerance, tolerance, |name| bodies.iter().find(|(n, _)| n == name).map(|(_, s)| s))
+            .map_err(|e| format!("{e}"))?;
+        if !unresolved.is_empty() {
+            return Err(format!("the setup names bodies the model does not have: {}", unresolved.join(", ")));
+        }
+        if std::env::var_os("BREP_CAM_DEBUG").is_some() {
+            eprintln!("cam job {}: {} bodies, snapshot {} faces / {} triangles, bounds {:?}", operation, bodies.len(), mesh.faces.len(), mesh.triangles.len(), mesh.bounds);
+        }
+        // The mesh is tessellated at the operation's own tolerance (a quarter
+        // of it); a part that needs more triangles than the generators can
+        // carry is refused by name, never coarsened behind the user's back.
+        if mesh.triangles.len() > CAM_TRIANGLE_BUDGET {
+            return Err(format!(
+                "the part mesh needs {} triangles at a chord of {}, over the budget of {CAM_TRIANGLE_BUDGET}; raise the operation's tolerance or machine fewer bodies at once",
+                mesh.triangles.len(),
+                job.chord_tolerance
+            ));
+        }
+        let index = TreeIndex::build(&mesh, TreeOptions::default());
+        let mut runner = Runner::new(token.clone(), &mut sink, WorkBudget::new(job.budget_chunk.max(1))).with_operation(operation.clone());
+        // Drilling reads the recognised holes of the target bodies.
+        let holes = if matches!(job.operation.strategy, brep_cam::model::Strategy::Drill(_)) {
+            let mut carriers = Vec::new();
+            for (name, solid) in &bodies {
+                if job.setup.targets.iter().any(|t| t.solid == *name) || job.operation.targets.target_solids.contains(name) {
+                    let body = BodyInput { name, solid, protected_only: false };
+                    carriers.extend(revolved_faces(&body, &job.setup));
+                }
+            }
+            brep_cam::holes::recognize(&carriers, &mesh, tolerance, &mut runner).map_err(|e| e.to_string())?.holes
+        } else {
+            Vec::new()
+        };
+        // Frozen geometry is valid only for the exact bodies it was planned
+        // against. A body edit re-recognises by face identity and XY dimensions,
+        // preserving depth associativity without choosing a different feature.
+        let mut effective_operation = job.operation.clone();
+        let mut automatic_geometry = None;
+        let mut rebound = false;
+        if let Some(binding) = &job.autoprogram {
+            let tool = job.tools.iter().find(|t| t.id == job.operation.tool).ok_or("automatic programming tool is missing")?;
+            binding.validate_inputs(&job.operation, &job.setup, tool)?;
+            let fingerprints: std::collections::BTreeMap<_, _> = bodies.iter().map(|(name, solid)| (name.clone(), crate::scene::brep_fingerprint(solid))).collect();
+            if fingerprints == binding.body_fingerprints {
+                automatic_geometry = Some(binding.geometry.clone());
+            } else {
+                let recognized = brep_cam::autoprogram::binding::recognize_bodies(&bodies, &job.setup, &mesh, job.chord_tolerance, tolerance, &mut runner).map_err(|e| e.to_string())?;
+                let model_bounds = bodies.iter().filter(|(name, _)| job.setup.targets.iter().any(|t| &t.solid == name))
+                    .filter_map(|(_, s)| brep_cam::kernel_adapter::body_bounds(s, job.chord_tolerance).ok())
+                    .fold(brep_cam::model::Bounds3::empty(), |a, b| a.union(&b));
+                let stock_bounds = match &job.setup.stock {
+                    brep_cam::model::Stock::FromSolid { solid } => bodies.iter().find(|(name, _)| name == solid).and_then(|(_, body)| brep_cam::kernel_adapter::body_bounds(body, job.chord_tolerance).ok()),
+                    _ => job.setup.stock.model_bounds(&model_bounds),
+                };
+                let stock_top = stock_bounds.map(|b| job.setup.model_to_machine.apply_bounds(&b).max.z);
+                let (op, geometry) = binding.rebind_with_mesh(&recognized, &mesh, &job.operation, &job.setup, &job.tools, job.machine.as_ref(), stock_top, tolerance)?;
+                effective_operation = op;
+                automatic_geometry = Some(geometry);
+                rebound = true;
+            }
+        }
+        let resolved_planar = match &automatic_geometry { Some(brep_cam::autoprogram::OperationGeometry::Planar(p)) => Some((&effective_operation.id, p)), _ => None };
+        let holes = match &automatic_geometry { Some(brep_cam::autoprogram::OperationGeometry::Holes(h)) => h.as_slice(), _ => holes.as_slice() };
+        // Lane C7: the stock as it stands before this operation (the setup's
+        // earlier operations replayed; a FromRest setup carried from the one it
+        // continues from). Unavailable: a named warning on the operation, and the
+        // linkers keep above the conservative material top. Never the raw stock.
+        let mut pre_op_warning = None;
+        // Automatic axial live contouring uses conservative planar links and
+        // does not consume the milling stock cache. Replaying a preceding
+        // turning operation into that cache is both unused and inappropriate.
+        let live_contour = matches!(job.operation.strategy, brep_cam::Strategy::Contour2D(_) | brep_cam::Strategy::Trace(_))
+            && job.operation.live_tool.unwrap_or(true)
+            && job.machine.as_ref().is_some_and(|m| matches!(m.kind, brep_cam::MachineKind::MillTurn { .. }));
+        let pre_op = if !live_contour && brep_cam::uses_pre_op_stock(&job.operation.strategy, job.machine.as_ref()) {
+            let fallback = job.operation.targets.target_solids.clone();
+            let request = brep_cam::JobStock {
+                setup: &job.setup,
+                machine: job.machine.as_ref(),
+                tools: &job.tools,
+                mesh: &mesh,
+                fallback_targets: &fallback,
+                earlier: &job.earlier,
+                previous: &job.previous_setups,
+                tolerance,
+            };
+            match PRE_OP_STOCK.with(|c| brep_cam::job_stock(&mut c.borrow_mut(), &request, &mut runner)) {
+                Ok(result) => Some(result),
+                Err(brep_cam::PreOpStockError::Cancelled) => return Err("cancelled".to_string()),
+                Err(error) => {
+                    pre_op_warning = Some(brep_cam::unavailable_warning(&error));
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let input = brep_cam::dispatch::GenerateInput {
+            operation: &effective_operation,
+            setup: &job.setup,
+            tools: &job.tools,
+            mesh: &mesh,
+            index: Some(&index),
+            tolerance,
+            holes,
+        };
+        // Picked chains resolve by identity against the bodies, sketch curves
+        // and profiles the job carries (C20's KernelChainGeometry).
+        let solid_refs: Vec<(&str, &brep_kernel::BrepSolid)> = bodies.iter().map(|(n, s)| (n.as_str(), s)).collect();
+        let curve_refs: Vec<(&str, &str, &brep_kernel::NurbsCurve)> = job.chain_curves.iter().map(|(s, g, c)| (s.as_str(), g.as_str(), c)).collect();
+        let profile_refs: Vec<(&str, &brep_kernel::SketchProfile)> = job.chain_profiles.iter().map(|(s, p)| (s.as_str(), p)).collect();
+        let chain_geometry = brep_cam::dispatch::chains::KernelChainGeometry { solids: &solid_refs, curves: &curve_refs, profiles: &profile_refs };
+        let is_turning = matches!(job.operation.strategy, brep_cam::Strategy::TurnFace(_) | brep_cam::Strategy::TurnProfile(_));
+        let mut turning_carriers = Vec::new();
+        let turning_tool = if is_turning {
+            let tool = job.tools.iter().find(|t| t.id == job.operation.tool).ok_or("turning tool is missing")?;
+            if tool.turning_geometry.is_none() { return Err(format!("tool {} has no insert geometry", tool.id)); }
+            if job.setup.turning_stick_out.is_none() { return Err("setup has no stick-out".into()); }
+            let targets: std::collections::BTreeSet<_> = job.setup.targets.iter().map(|t| t.solid.as_str()).collect();
+            if targets.len() != 1 || job.operation.targets.target_solids.iter().any(|n| !targets.contains(n.as_str())) {
+                return Err("turning requires one exact setup solid and matching operation targets".into());
+            }
+            let name = *targets.iter().next().unwrap();
+            let solid = bodies.iter().find(|(n, _)| n == name).map(|(_, s)| s).ok_or("turning setup solid is missing")?;
+            if !job.machine.as_ref().is_some_and(|m| matches!(m.kind, brep_cam::MachineKind::Lathe | brep_cam::MachineKind::MillTurn { .. })) {
+                return Err("turning envelope requires a defined lathe spindle axis".into());
+            }
+            certified_turning_profile = Some(match brep_cam::kernel_adapter::turning_faces(&BodyInput { name, solid, protected_only: false }, &job.setup, tolerance) {
+                Ok(carriers) => {
+                    turning_carriers = carriers;
+                    brep_cam::turning::profile::extract(&turning_carriers, &mesh, job.operation.tolerance * 0.125, &mut runner)
+                }
+                Err(_) => brep_cam::turning::envelope::extract(&mesh, job.chord_tolerance, &mut runner),
+            }.map_err(|e| e.to_string())?);
+            Some(tool)
+        } else { None };
+        let turning = turning_tool.map(|tool| brep_cam::dispatch::TurningInput {
+            tool_id: &tool.id, tool_geometry: tool.turning_geometry.as_ref().unwrap(),
+            carriers: &turning_carriers, profile: certified_turning_profile.as_ref(), contour: None,
+            stick_out: job.setup.turning_stick_out.unwrap(), groove_center_z: None, thread_radius: None,
+        });
+        let context = brep_cam::dispatch::GenerateContext {
+            turning: turning.as_ref(),
+            chain_geometry: Some(&chain_geometry),
+            machine: job.machine.as_ref(),
+            resolved_planar,
+            rest_stock: pre_op.as_ref().map(|r| &r.stock.grid),
+            pre_op_stock: pre_op.as_ref().map(|r| &r.stock.envelope),
+            source: job.source.as_ref(),
+            source_operation: job.source_operation.as_ref(),
+            ..Default::default()
+        };
+        let mut path = brep_cam::dispatch::generate_with_context(&input, &context, &mut runner).map_err(|e| e.to_string())?;
+        if rebound { path.report.warn(brep_cam::model::Diagnostic::new("autoprogram-re-recognised", "re-recognised after model change")); }
+        if let Some(warning) = pre_op_warning {
+            // First, so a reader finds it at warnings[0] whenever it is there.
+            path.report.warn(warning);
+            path.report.warnings.rotate_right(1);
+        }
+        if let Some(result) = pre_op {
+            path.report.approximations.extend(result.limits);
+            setup_start = Some(result.start);
+        }
+        Ok((path, runner.budget().used()))
+    };
+    match outcome() {
+        Ok((toolpath, work_units)) => CamReply { turning_profile: certified_turning_profile, setup_start, id: job.id, operation, toolpath: Ok(toolpath), work_units, cancelled: false },
+        Err(message) => {
+            let cancelled = token.is_cancelled();
+            CamReply { turning_profile: None, setup_start: None, id: job.id, operation, toolpath: Err(if cancelled { "cancelled".to_string() } else { message }), work_units: 0, cancelled }
+        }
     }
 }
 
@@ -251,7 +753,25 @@ pub struct PluginActionReply {
 /// runner so the warm registry answers them, never the cold main-side one). The
 /// Inline impl runs everything synchronously; a later thread/worker impl defers
 /// the work and surfaces the replies through the same poll idiom.
+/// Where the main thread gets the assembly session of the run it applied
+/// ([`HistoryRunner::session_for_main`]).
+pub enum SessionOnMain {
+    /// The run executed on the main thread and its session is still the
+    /// thread's: nothing to do.
+    Resident,
+    /// An owned copy from the runner's thread, to import.
+    Copied(brep_kernel::SessionTransfer),
+    /// Not available (busy, replaced, or a runner that cannot copy): replay.
+    Unavailable,
+}
+
 pub trait HistoryRunner {
+    /// The assembly session the run of `generation` left, for the main
+    /// thread's constraint actions. Blocking, but bounded. The default cannot
+    /// provide one, and the caller replays the history instead.
+    fn session_for_main(&mut self, _generation: u64) -> SessionOnMain {
+        SessionOnMain::Unavailable
+    }
     fn submit_plugin_install(&mut self, _request: PluginInstallRequest) -> bool { false }
     fn poll_plugin_install(&mut self) -> Option<PluginInstallReply> { None }
     /// Trusted installed content, separate from saved document dependency pins.
@@ -288,6 +808,15 @@ pub trait HistoryRunner {
     fn poll_topology(&mut self) -> Option<TopologyReply> {
         None
     }
+    /// BLOCK up to `timeout` until a topology reply is ready to poll: `true`
+    /// when one is. An export that needs the exact solids waits this way on a
+    /// runner with a thread of its own; the default cannot wait (a worker
+    /// answers through the page's event loop, which a blocked page never
+    /// turns), so the export draws the mesh approximation and the file says
+    /// so.
+    fn wait_topology(&mut self, _timeout: std::time::Duration) -> bool {
+        false
+    }
     /// Submit a sheet placement's exact pass (see [`SheetLinesRequest`]).
     /// `false` when this runner cannot run one — the engine then runs it on
     /// its own thread, as every projection did before the pass moved off it.
@@ -298,6 +827,42 @@ pub trait HistoryRunner {
     fn poll_sheet_lines(&mut self) -> Option<SheetLinesReply> {
         None
     }
+    /// Submit ONE CAM operation's generation (see [`CamJob`]); `false` when
+    /// this runner cannot run it.
+    fn submit_cam(&mut self, _job: CamJob) -> bool {
+        false
+    }
+    fn poll_cam(&mut self) -> Option<CamReply> {
+        None
+    }
+    fn poll_cam_progress(&mut self) -> Option<CamProgress> {
+        None
+    }
+    /// Cancel the CAM job in flight at its next work chunk, where the driver
+    /// can reach it (the native thread); a driver that cannot lets the job
+    /// finish and the main side drops its reply.
+    fn cancel_cam(&mut self) {}
+    /// TEST HOLD (automation only): while `hold`, finished CAM replies are
+    /// kept back from `poll_cam`, so a job stays in flight on the main side
+    /// however fast it ran — the one way a script can meet it with a cancel
+    /// every time. Releasing delivers what was kept, in order. A driver
+    /// without the hold ignores it.
+    fn hold_cam_replies(&mut self, _hold: bool) {}
+    /// Submit ONE CAM simulation command (see [`CamSimJob`]); `false` when
+    /// this runner cannot simulate (the caller then simulates inline).
+    fn submit_cam_sim(&mut self, _job: CamSimJob) -> bool {
+        false
+    }
+    fn poll_cam_sim(&mut self) -> Option<CamSimReply> {
+        None
+    }
+    fn poll_cam_sim_progress(&mut self) -> Option<CamSimProgress> {
+        None
+    }
+    /// Stop the simulation chunk in flight between two motions where the
+    /// driver can reach it (the native thread); elsewhere the chunk finishes
+    /// and the caller drops its reply.
+    fn cancel_cam_sim(&mut self) {}
     /// Drop the delta baseline (document switch → full rebuild).
     fn reset(&mut self);
 
@@ -324,6 +889,13 @@ pub trait HistoryRunner {
     /// caller's store.
     fn poll_library_request(&mut self) -> bool {
         false
+    }
+
+    /// Whether a run reply (or a refusal asking for the parts library) is
+    /// waiting for [`poll_run`](Self::poll_run): a caller may skip what only a
+    /// landing needs while this is false. `true` when the runner cannot tell.
+    fn run_reply_waiting(&mut self) -> bool {
+        true
     }
 
     /// Non-blocking: the MOST RECENT progress report of the in-flight run, with
@@ -383,27 +955,61 @@ fn measure_json(runner: &crate::pipeline::SceneRunner, query: &MeasureQuery) -> 
             }
         }
         MeasureKind::Face => match brep_kernel::face_measurements_native(handle, &query.entity) {
-            Ok((area, edge_total, surface_type)) => serde_json::json!({
-                "ok": true,
-                "kind": "face",
-                "solid": query.owner,
-                "surfaceType": surface_type,
-                "area": area,
-                "edgeLengthTotal": edge_total,
-            })
-            .to_string(),
+            Ok((area, edge_total, surface_type)) => {
+                let dimensions =
+                    brep_kernel::face_carrier_dimensions_native(handle, &query.entity)
+                        .ok()
+                        .flatten();
+                // A partial revolution of a straight line is a "Surface of
+                // revolution" to the kernel and a cylinder to the user.
+                let surface_type = dimensions.as_ref().map_or(surface_type, |d| d.label);
+                let mut fragment = serde_json::json!({
+                    "ok": true,
+                    "kind": "face",
+                    "solid": query.owner,
+                    "surfaceType": surface_type,
+                    "area": area,
+                    "edgeLengthTotal": edge_total,
+                });
+                insert_dimensions(&mut fragment, dimensions.as_ref());
+                fragment.to_string()
+            }
             Err(error) => serde_json::json!({ "ok": false, "message": error }).to_string(),
         },
         MeasureKind::Edge => match brep_kernel::edge_length_native(handle, &query.entity) {
-            Ok(length) => serde_json::json!({
-                "ok": true,
-                "kind": "edge",
-                "solid": query.owner,
-                "length": length,
-            })
-            .to_string(),
+            Ok(length) => {
+                let dimensions =
+                    brep_kernel::edge_carrier_dimensions_native(handle, &query.entity)
+                        .ok()
+                        .flatten();
+                let mut fragment = serde_json::json!({
+                    "ok": true,
+                    "kind": "edge",
+                    "solid": query.owner,
+                    "length": length,
+                });
+                if let Some(dimensions) = &dimensions {
+                    fragment["curveType"] = serde_json::Value::from(dimensions.label);
+                }
+                insert_dimensions(&mut fragment, dimensions.as_ref());
+                fragment.to_string()
+            }
             Err(error) => serde_json::json!({ "ok": false, "message": error }).to_string(),
         },
+    }
+}
+
+/// Add a carrier's named dimensions (`radius`, `diameter`, `halfAngleDeg`,
+/// `majorRadius`, `minorRadius`, `sweepDeg`) to an object-info fragment.
+fn insert_dimensions(
+    fragment: &mut serde_json::Value,
+    dimensions: Option<&brep_kernel::CarrierDimensions>,
+) {
+    let (Some(dimensions), Some(object)) = (dimensions, fragment.as_object_mut()) else {
+        return;
+    };
+    for (key, value) in &dimensions.values {
+        object.insert((*key).to_string(), serde_json::Value::from(*value));
     }
 }
 
@@ -465,8 +1071,22 @@ impl HistoryRunner for InlineRunner {
     }
 
     fn submit_run(&mut self, request: brep_kernel::HistoryRequest, generation: u64) {
+        let serial = brep_kernel::assembly_session_serial();
         let output = self.runner.run(&request);
+        let after = brep_kernel::assembly_session_serial();
+        self.runner.session_of = (after != serial).then_some((generation, after));
         self.pending.push_back(RunReply { generation, output });
+    }
+
+    /// The run executed on this (the caller's) thread: its session is already
+    /// here unless something has replaced it since.
+    fn session_for_main(&mut self, generation: u64) -> SessionOnMain {
+        match self.runner.session_of {
+            Some((ran, serial)) if ran == generation && serial == brep_kernel::assembly_session_serial() => {
+                SessionOnMain::Resident
+            }
+            _ => SessionOnMain::Unavailable,
+        }
     }
 
     /// Nothing to send: Inline runs on the CALLER's thread against the CALLER's
@@ -574,7 +1194,7 @@ pub enum Command {
     /// browser's main thread once per edit is what froze the UI.
     ///
     /// Deliberately its OWN command rather than an optional field on `Run`:
-    /// both drivers COALESCE consecutive runs (see [`thread_main`] and
+    /// both drivers COALESCE consecutive runs (see `thread_main` and
     /// `WorkerRunner::submit_run`), so a library riding on a run could be
     /// dropped with it. A `SetPartsLibrary` is never coalesced away, and the
     /// stream is ordered, so it always lands before the run that needs it.
@@ -587,7 +1207,15 @@ pub enum Command {
     StepProbe(StepProbeRequest),
     Topology(TopologyRequest),
     SheetLines(SheetLinesRequest),
+    /// Generate ONE CAM operation (never coalesced: every job answers).
+    CamGenerate(CamJob),
+    /// One CAM simulation command (never coalesced: every job answers).
+    CamSimulate(CamSimJob),
     Reset,
+    /// Copy the assembly session the run of `generation` left here (native
+    /// thread only: the copy holds kernel solids and never crosses a worker).
+    #[serde(skip)]
+    ExportSession { generation: u64 },
 }
 
 /// A reply sent runner → main; the main side demuxes it into per-kind buffers.
@@ -601,6 +1229,12 @@ pub enum Reply {
     StepProbe(StepProbeReply),
     Topology(TopologyReply),
     SheetLines(SheetLinesReply),
+    CamGenerate(CamReply),
+    /// A CAM job's progress, posted from inside the job.
+    CamProgress(CamProgress),
+    CamSimulate(CamSimReply),
+    /// A simulation chunk's progress, posted between motions.
+    CamSimProgress(CamSimProgress),
     /// The runner REFUSED a run because its resident parts library could not
     /// serve it (a part the request references is missing, or the run was
     /// stamped for a different library revision). No geometry was touched; the
@@ -612,6 +1246,9 @@ pub enum Reply {
     /// [`RunProgress`]). Posted from INSIDE `process_command`, before its
     /// `Reply::Run`; the main side keeps only the latest.
     Progress(RunProgress),
+    /// The answer to `Command::ExportSession` (native thread only).
+    #[serde(skip)]
+    SessionExport { generation: u64, transfer: Option<brep_kernel::SessionTransfer> },
 }
 
 /// The probe itself — the one parse of a structured STEP import (see
@@ -626,13 +1263,16 @@ fn probe_step(request: StepProbeRequest) -> StepProbeReply {
 fn reconstruct_mesh(request: MeshImportRequest) -> MeshImportReply {
     let result = (|| {
         use brep_reconstruction::stl_conversion::{
-            binary_stl_coordinate_precision_tolerance, convert_stl_mesh_to_step,
+            binary_stl_coordinate_precision_tolerance, convert_stl_mesh_to_step_with_colors,
         };
         use brep_reconstruction::{Mesh, Vec3};
 
         // A 3MF build's placements, kept only to name each body afterwards.
         let mut instances = Vec::new();
         let mut reader_messages = Vec::new();
+        // A 3MF's per-triangle colours (its base materials), parallel to the
+        // soup's triangles; empty for STL and OBJ, which carry none.
+        let mut triangle_colors: Vec<Option<[u8; 3]>> = Vec::new();
         let (mesh, positions, indices, coordinate_precision_tolerance) = match request.format {
             MeshImportFormat::Stl => {
                 use brep_reconstruction::stl::{parse_stl_bytes, StlFormat, StlReadOptions};
@@ -704,6 +1344,7 @@ fn reconstruct_mesh(request: MeshImportRequest) -> MeshImportReply {
                 let model = brep_kernel::read_3mf(&request.bytes)
                     .map_err(|error| format!("3MF import failed: {error}"))?;
                 instances = model.instances;
+                triangle_colors = model.triangle_colors;
                 let vertices = model
                     .positions
                     .chunks_exact(3)
@@ -725,10 +1366,11 @@ fn reconstruct_mesh(request: MeshImportRequest) -> MeshImportReply {
         let mut options = request.options;
         options.coordinate_precision_tolerance = options.coordinate_precision_tolerance
             .max(coordinate_precision_tolerance);
-        convert_stl_mesh_to_step(
+        convert_stl_mesh_to_step_with_colors(
             &mesh,
             &positions,
             Some(&indices),
+            (!triangle_colors.is_empty()).then_some(triangle_colors.as_slice()),
             &options,
             "Imported mesh",
             "MM",
@@ -799,7 +1441,7 @@ pub(crate) fn refused_bodies_notice(
 }
 
 /// Execute ONE [`Command`] against `runner` and return the [`Reply`] it produces,
-/// if any. The shared step both async drivers run: the native [`thread_main`]
+/// if any. The shared step both async drivers run: the native `thread_main`
 /// calls it for each (post-coalescing) command on the runner thread; the wasm
 /// `WorkerRunner`'s `worker_entry` calls it per `postMessage` on the worker.
 /// `Run` → a [`Reply::Run`]; `Query` → a [`Reply::Query`]; `Reset` drops the delta
@@ -813,7 +1455,7 @@ pub(crate) fn refused_bodies_notice(
 pub fn process_command(
     runner: &mut crate::pipeline::SceneRunner,
     command: Command,
-    progress: &mut dyn FnMut(RunProgress) -> bool,
+    progress: &mut dyn FnMut(Reply) -> bool,
 ) -> Option<Reply> {
     match command {
         Command::ValidatePlugins(request) => Some(Reply::ValidatedPlugins(validate_plugins(request))),
@@ -860,15 +1502,18 @@ pub fn process_command(
                 runner.parts_library_revision = None;
                 return Some(Reply::NeedPartsLibrary);
             }
+            let serial = brep_kernel::assembly_session_serial();
             let output = runner.run_observed(&request, &mut |event| {
-                progress(RunProgress {
+                progress(Reply::Progress(RunProgress {
                     generation,
                     index: event.index,
                     total: event.total,
                     feature_id: event.id.to_string(),
                     feature_type: event.feature_type.to_string(),
-                })
+                }))
             });
+            let after = brep_kernel::assembly_session_serial();
+            runner.session_of = (after != serial).then_some((generation, after));
             Some(Reply::Run(RunReply { generation, output }))
         }
         Command::SetPartsLibrary { library, revision } => {
@@ -885,6 +1530,8 @@ pub fn process_command(
         Command::StepProbe(request) => Some(Reply::StepProbe(probe_step(request))),
         Command::Topology(request) => Some(Reply::Topology(topology_reply(request))),
         Command::SheetLines(request) => Some(Reply::SheetLines(sheet_lines_reply(request))),
+        Command::CamGenerate(job) => Some(Reply::CamGenerate(cam_generate_reply(job, progress))),
+        Command::CamSimulate(job) => Some(Reply::CamSimulate(cam_sim_reply(job, progress))),
         Command::Reset => {
             // A document switch: drop the delta baseline AND this runner's OWN kernel
             // history cache (the resident registry lives here, not on main), mirroring
@@ -892,7 +1539,12 @@ pub fn process_command(
             // the old model's handles are freed.
             runner.reset();
             brep_kernel::clear_history_cache();
+            cam_sim_clear();
+            pre_op_stock_clear();
             None
+        }
+        Command::ExportSession { generation } => {
+            Some(Reply::SessionExport { generation, transfer: runner.export_session(generation) })
         }
     }
 }
@@ -927,6 +1579,17 @@ pub struct ThreadRunner {
     step_probe_buf: std::collections::VecDeque<StepProbeReply>,
     topology_buf: std::collections::VecDeque<TopologyReply>,
     sheet_lines_buf: std::collections::VecDeque<SheetLinesReply>,
+    cam_buf: std::collections::VecDeque<CamReply>,
+    /// [`HistoryRunner::hold_cam_replies`]: `poll_cam` answers `None` while set.
+    cam_hold: bool,
+    cam_progress_buf: std::collections::VecDeque<CamProgress>,
+    /// Set by [`HistoryRunner::cancel_cam`]; the thread reads it on every CAM
+    /// progress post and the running job cancels at its next chunk.
+    cam_cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    cam_sim_buf: std::collections::VecDeque<CamSimReply>,
+    cam_sim_progress_buf: std::collections::VecDeque<CamSimProgress>,
+    /// Set by [`HistoryRunner::cancel_cam_sim`]; read between two motions.
+    cam_sim_cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
     plugin_action_buf: std::collections::VecDeque<PluginActionReply>,
     plugin_install_buf: std::collections::VecDeque<PluginInstallReply>,
     sent_plugin_revision: Option<u64>,
@@ -953,9 +1616,13 @@ impl ThreadRunner {
         let (reply_tx, rx) = std::sync::mpsc::channel::<Reply>();
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let thread_stop = stop.clone();
+        let cam_cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let thread_cam_cancel = cam_cancel.clone();
+        let cam_sim_cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let thread_cam_sim_cancel = cam_sim_cancel.clone();
         let handle = std::thread::Builder::new()
             .name("brep-history-runner".to_string())
-            .spawn(move || thread_main(cmd_rx, reply_tx, thread_stop))
+            .spawn(move || thread_main(cmd_rx, reply_tx, thread_stop, thread_cam_cancel, thread_cam_sim_cancel))
             .expect("spawn brep-history-runner thread");
         Self {
             tx: Some(tx),
@@ -967,6 +1634,13 @@ impl ThreadRunner {
             step_probe_buf: std::collections::VecDeque::new(),
             topology_buf: std::collections::VecDeque::new(),
             sheet_lines_buf: std::collections::VecDeque::new(),
+            cam_buf: std::collections::VecDeque::new(),
+            cam_hold: false,
+            cam_progress_buf: std::collections::VecDeque::new(),
+            cam_cancel,
+            cam_sim_buf: std::collections::VecDeque::new(),
+            cam_sim_progress_buf: std::collections::VecDeque::new(),
+            cam_sim_cancel,
             plugin_action_buf: std::collections::VecDeque::new(),
             plugin_install_buf: std::collections::VecDeque::new(),
             sent_plugin_revision: None,
@@ -981,28 +1655,45 @@ impl ThreadRunner {
     /// buffers (so a `poll_run` never swallows a query reply and vice versa).
     fn drain(&mut self) {
         while let Ok(reply) = self.rx.try_recv() {
-            match reply {
-                Reply::ValidatedPlugins(reply) => self.plugin_install_buf.push_back(reply),
-                Reply::PluginAction(reply) => self.plugin_action_buf.push_back(reply),
-                Reply::Run(run) => self.run_buf.push_back(run),
-                Reply::Query(query) => self.query_buf.push_back(query),
-                Reply::MeshImport(reply) => self.mesh_import_buf.push_back(reply),
-                Reply::StepProbe(reply) => self.step_probe_buf.push_back(reply),
-                Reply::Topology(reply) => self.topology_buf.push_back(reply),
-                Reply::SheetLines(reply) => self.sheet_lines_buf.push_back(reply),
-                Reply::Progress(progress) => self.progress_buf.push_back(progress),
-                Reply::NeedPartsLibrary => {
-                    // The thread dropped (or never had) the library this run
-                    // needs. Forget what we believe it holds so the next
-                    // `sync_parts_library` re-installs, and flag the refused
-                    // run for the caller to re-submit.
-                    self.sent_library_revision = None;
-                    self.library_requested = true;
-                }
-            }
+            self.file(reply);
         }
     }
+
+    /// Demux one reply into its buffer. A session export is handed back (only
+    /// [`HistoryRunner::session_for_main`] waits for one; a late one is dropped).
+    fn file(&mut self, reply: Reply) -> Option<(u64, Option<brep_kernel::SessionTransfer>)> {
+        match reply {
+            Reply::SessionExport { generation, transfer } => return Some((generation, transfer)),
+            Reply::ValidatedPlugins(reply) => self.plugin_install_buf.push_back(reply),
+            Reply::PluginAction(reply) => self.plugin_action_buf.push_back(reply),
+            Reply::Run(run) => self.run_buf.push_back(run),
+            Reply::Query(query) => self.query_buf.push_back(query),
+            Reply::MeshImport(reply) => self.mesh_import_buf.push_back(reply),
+            Reply::StepProbe(reply) => self.step_probe_buf.push_back(reply),
+            Reply::Topology(reply) => self.topology_buf.push_back(reply),
+            Reply::SheetLines(reply) => self.sheet_lines_buf.push_back(reply),
+            Reply::CamGenerate(reply) => self.cam_buf.push_back(reply),
+            Reply::CamProgress(progress) => self.cam_progress_buf.push_back(progress),
+            Reply::CamSimulate(reply) => self.cam_sim_buf.push_back(reply),
+            Reply::CamSimProgress(progress) => self.cam_sim_progress_buf.push_back(progress),
+            Reply::Progress(progress) => self.progress_buf.push_back(progress),
+            Reply::NeedPartsLibrary => {
+                // The thread dropped (or never had) the library this run
+                // needs. Forget what we believe it holds so the next
+                // `sync_parts_library` re-installs, and flag the refused
+                // run for the caller to re-submit.
+                self.sent_library_revision = None;
+                self.library_requested = true;
+            }
+        }
+        None
+    }
 }
+
+/// How long the main thread waits for the runner's session copy before it
+/// replays the history instead (the copy of l500 takes ~8 ms).
+#[cfg(not(target_arch = "wasm32"))]
+const SESSION_EXPORT_WAIT: std::time::Duration = std::time::Duration::from_millis(250);
 
 #[cfg(not(target_arch = "wasm32"))]
 impl Default for ThreadRunner {
@@ -1029,6 +1720,8 @@ fn thread_main(
     cmd_rx: std::sync::mpsc::Receiver<Command>,
     reply_tx: std::sync::mpsc::Sender<Reply>,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    cam_cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    cam_sim_cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) {
     let mut runner = crate::pipeline::SceneRunner::new();
     while let Ok(first) = cmd_rx.recv() {
@@ -1062,11 +1755,20 @@ fn thread_main(
             if !run_here[i] {
                 continue;
             }
-            let mut progress = |report: RunProgress| {
+            // A CAM job's progress post also reads the cancel flag: `false`
+            // back to the job is its cancel (see `CamSink`).
+            let is_cam = matches!(command, Command::CamGenerate(_));
+            if is_cam {
+                cam_cancel.store(false, std::sync::atomic::Ordering::SeqCst);
+            }
+            let is_sim = matches!(command, Command::CamSimulate(_));
+            let mut progress = |reply: Reply| {
                 // A lost receiver means the main side abandoned this thread:
                 // stop at this boundary rather than finishing for nobody.
-                reply_tx.send(Reply::Progress(report)).is_ok()
+                reply_tx.send(reply).is_ok()
                     && !stop.load(std::sync::atomic::Ordering::Relaxed)
+                    && !(is_cam && cam_cancel.load(std::sync::atomic::Ordering::SeqCst))
+                    && !(is_sim && cam_sim_cancel.load(std::sync::atomic::Ordering::SeqCst))
             };
             if let Some(reply) = process_command(&mut runner, command, &mut progress) {
                 if reply_tx.send(reply).is_err() {
@@ -1079,6 +1781,23 @@ fn thread_main(
 
 #[cfg(not(target_arch = "wasm32"))]
 impl HistoryRunner for ThreadRunner {
+    fn session_for_main(&mut self, generation: u64) -> SessionOnMain {
+        let Some(tx) = &self.tx else { return SessionOnMain::Unavailable };
+        if tx.send(Command::ExportSession { generation }).is_err() {
+            return SessionOnMain::Unavailable;
+        }
+        let deadline = std::time::Instant::now() + SESSION_EXPORT_WAIT;
+        loop {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            let Ok(reply) = self.rx.recv_timeout(left) else { return SessionOnMain::Unavailable };
+            if let Some((answered, transfer)) = self.file(reply) {
+                if answered != generation {
+                    continue; // a late answer to an earlier ask
+                }
+                return transfer.map_or(SessionOnMain::Unavailable, SessionOnMain::Copied);
+            }
+        }
+    }
     fn submit_plugin_install(&mut self, request: PluginInstallRequest) -> bool {
         self.tx.as_ref().is_some_and(|tx| tx.send(Command::ValidatePlugins(request)).is_ok())
     }
@@ -1140,6 +1859,11 @@ impl HistoryRunner for ThreadRunner {
         self.run_buf.pop_front()
     }
 
+    fn run_reply_waiting(&mut self) -> bool {
+        self.drain();
+        !self.run_buf.is_empty() || self.library_requested
+    }
+
     fn submit_query(&mut self, query: MeasureQuery) {
         if let Some(tx) = &self.tx {
             let _ = tx.send(Command::Query(query));
@@ -1184,6 +1908,24 @@ impl HistoryRunner for ThreadRunner {
         self.topology_buf.pop_front()
     }
 
+    fn wait_topology(&mut self, timeout: std::time::Duration) -> bool {
+        self.drain();
+        let deadline = std::time::Instant::now() + timeout;
+        while self.topology_buf.is_empty() {
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            match self.rx.recv_timeout(deadline - now) {
+                Ok(reply) => {
+                    self.file(reply);
+                }
+                Err(_) => return false,
+            }
+        }
+        true
+    }
+
     fn submit_sheet_lines(&mut self, request: SheetLinesRequest) -> bool {
         match &self.tx {
             Some(tx) => tx.send(Command::SheetLines(request)).is_ok(),
@@ -1194,6 +1936,62 @@ impl HistoryRunner for ThreadRunner {
     fn poll_sheet_lines(&mut self) -> Option<SheetLinesReply> {
         self.drain();
         self.sheet_lines_buf.pop_front()
+    }
+
+    fn submit_cam(&mut self, job: CamJob) -> bool {
+        self.cam_cancel.store(false, std::sync::atomic::Ordering::SeqCst);
+        match &self.tx {
+            Some(tx) => tx.send(Command::CamGenerate(job)).is_ok(),
+            None => false,
+        }
+    }
+
+    fn poll_cam(&mut self) -> Option<CamReply> {
+        self.drain();
+        if self.cam_hold {
+            return None;
+        }
+        self.cam_buf.pop_front()
+    }
+
+    fn hold_cam_replies(&mut self, hold: bool) {
+        self.cam_hold = hold;
+    }
+
+    fn poll_cam_progress(&mut self) -> Option<CamProgress> {
+        self.drain();
+        let latest = self.cam_progress_buf.pop_back();
+        self.cam_progress_buf.clear();
+        latest
+    }
+
+    fn cancel_cam(&mut self) {
+        self.cam_cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn submit_cam_sim(&mut self, job: CamSimJob) -> bool {
+        // A cancel raised for an earlier chunk must not stop this one.
+        self.cam_sim_cancel.store(false, std::sync::atomic::Ordering::SeqCst);
+        match &self.tx {
+            Some(tx) => tx.send(Command::CamSimulate(job)).is_ok(),
+            None => false,
+        }
+    }
+
+    fn poll_cam_sim(&mut self) -> Option<CamSimReply> {
+        self.drain();
+        self.cam_sim_buf.pop_front()
+    }
+
+    fn poll_cam_sim_progress(&mut self) -> Option<CamSimProgress> {
+        self.drain();
+        let latest = self.cam_sim_progress_buf.pop_back();
+        self.cam_sim_progress_buf.clear();
+        latest
+    }
+
+    fn cancel_cam_sim(&mut self) {
+        self.cam_sim_cancel.store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     fn poll_progress(&mut self) -> Option<RunProgress> {

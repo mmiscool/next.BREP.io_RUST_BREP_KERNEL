@@ -1390,6 +1390,7 @@ pub fn document_tools(slot: SessionSlot) -> Vec<ToolSpec> {
     let save_slot = slot.clone();
     let import_slot = slot.clone();
     let export_slot = slot.clone();
+    let post_slot = slot.clone();
     vec![
         ToolSpec::new(
             "document_open",
@@ -1463,8 +1464,8 @@ pub fn document_tools(slot: SessionSlot) -> Vec<ToolSpec> {
         ToolSpec::new(
             "document_export",
             "document",
-            "Export the active document to a file (a filesystem path natively; in the browser a download under that name, where the Export dialog's goes): brep (native JSON), step, stl, obj, iges, glb (binary glTF 2.0 of the display mesh), the sheet-metal flat pattern as dxf / svg, the open drawing sheet as sheet_svg, every drawing sheet as sheet_pdf (one PDF, a page per sheet in sheet order), or that drawing set with the live 3D model as sheet_pdf_3d (a 3D box over every placement marked `threeD`, and a last page given over to the model), or, for a document whose PCB board has parts, its manufacturing files: fabrication (a zip of Gerber X2 layers, Excellon drills, pick-and-place and parts-BOM CSVs and a README), pick_place_csv or ecad_bom_csv. The reply carries the file's size and first bytes, for the sheet formats `texts`: every text string the file shows, read back from what was written, and for sheet_pdf_3d `model3d`: its 3D boxes, views, view buttons and U3D size, read back likewise, and for fabrication `files` (each file in the zip), `readBack` (copper flashes, drill hits, outline size and CSV rows, counted from the files) and `warnings`; the CSVs answer `rows`.",
-            object_schema(json!({ "format": { "type": "string", "enum": ["brep", "step", "stl", "obj", "iges", "glb", "dxf", "svg", "sheet_svg", "sheet_pdf", "sheet_pdf_3d", "fabrication", "pick_place_csv", "ecad_bom_csv"] }, "path": { "type": "string" } }), &["format", "path"]),
+            "Export the active document to a file (a filesystem path natively; in the browser a download under that name, where the Export dialog's goes): brep (native JSON), step, stl, obj, iges, glb (binary glTF 2.0 of the display mesh), 3mf (a 3MF package of the display mesh, one object per body with the model's colours as base materials), the sheet-metal flat pattern as dxf / svg, the open drawing sheet as sheet_svg, every drawing sheet as sheet_pdf (one PDF, a page per sheet in sheet order), or that drawing set with the live 3D model as sheet_pdf_3d (a 3D box over every placement marked `threeD`, and a last page given over to the model), or, for a document whose PCB board has parts, its manufacturing files: fabrication (a zip of Gerber X2 layers, Excellon drills, pick-and-place and parts-BOM CSVs and a README), pick_place_csv or ecad_bom_csv. The reply carries the file's size and first bytes, for the sheet formats `texts`: every text string the file shows, read back from what was written, and for sheet_pdf_3d `model3d`: its 3D boxes, views, view buttons and U3D size, read back likewise, and for fabrication `files` (each file in the zip), `readBack` (copper flashes, drill hits, outline size and CSV rows, counted from the files) and `warnings`; the CSVs answer `rows`.",
+            object_schema(json!({ "format": { "type": "string", "enum": ["brep", "step", "stl", "obj", "iges", "glb", "3mf", "dxf", "svg", "sheet_svg", "sheet_pdf", "sheet_pdf_3d", "fabrication", "pick_place_csv", "ecad_bom_csv"] }, "path": { "type": "string" } }), &["format", "path"]),
             Annotations { read_only: false, destructive: false, idempotent: true, waits: false },
             move |args| {
                 let slot = export_slot.clone();
@@ -1473,7 +1474,7 @@ pub fn document_tools(slot: SessionSlot) -> Vec<ToolSpec> {
                     let path = s(&args, "path").ok_or("missing `path`")?;
                     let format = s(&args, "format").ok_or("missing `format`")?;
                     let r = session.host.call_ok("doc_export", json!({ "format": format })).await?.result.unwrap_or(Value::Null);
-                    // A BINARY format (glb) answers in `base64` and leaves
+                    // A BINARY format (glb, 3mf, a PDF) answers in `base64` and leaves
                     // `text` empty; everything else answers in `text`. The
                     // FIELD says which, so no format list has to be kept here.
                     let bytes = match r["base64"].as_str() {
@@ -1499,6 +1500,29 @@ pub fn document_tools(slot: SessionSlot) -> Vec<ToolSpec> {
                             }
                         }
                     }
+                    Ok(ToolOutput::json(out))
+                })
+            },
+        ),
+        ToolSpec::new(
+            "cam_post",
+            "cam",
+            "Post NC program `id` (the CAM pane's Post on its row) through its post and, with `path`, write the NC file there (a filesystem path natively; in the browser a download under that name, where the pane's Save goes). The operations are posted in the program's order, each generated and current. Returns `text`, `fileName` (where the pane would save it), `post`, `operations`, `warnings`, `lines`, and with `path` the `path` written and its `bytes`.",
+            object_schema(json!({ "id": { "type": "string" }, "path": { "type": "string" } }), &["id"]),
+            Annotations { read_only: false, destructive: false, idempotent: true, waits: false },
+            move |args| {
+                let slot = post_slot.clone();
+                Box::pin(async move {
+                    let session = current(&slot).await?;
+                    let id = s(&args, "id").ok_or("missing `id`")?;
+                    let mut out = session.host.call_ok("cam_post_text", json!({ "id": id })).await?.result.unwrap_or(Value::Null);
+                    if let Some(path) = s(&args, "path") {
+                        let bytes = out["text"].as_str().unwrap_or("").as_bytes().to_vec();
+                        let written = session.host.platform.write_file(path, bytes.clone(), true).await?;
+                        out["path"] = json!(written);
+                        out["bytes"] = json!(bytes.len());
+                    }
+                    session.record("cam_post", &args, true, json!({}));
                     Ok(ToolOutput::json(out))
                 })
             },
@@ -1746,7 +1770,8 @@ pub fn feature_tools(slot: SessionSlot) -> Vec<ToolSpec> {
                     let merged = validate::merge_params(&cur["inputParams"], args.get("patch").unwrap_or(&json!({})));
                     let known = known_names(&session).await;
                     let entry = super::session_feature_entry(&session, &ty).await?;
-                    let v = validate::validate_entry(&entry, &merged, known.as_ref());
+                    let checked = validate::patched_view(&entry, &merged, args.get("patch").unwrap_or(&json!({})));
+                    let v = validate::validate_entry(&entry, &checked, known.as_ref());
                     if !v.ok() {
                         return Err(format!("invalid parameters for {ty}: {}", v.errors.join("; ")));
                     }

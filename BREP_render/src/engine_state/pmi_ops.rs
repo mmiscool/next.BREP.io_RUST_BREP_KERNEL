@@ -56,13 +56,77 @@ pub fn pmi_view_schema() -> serde_json::Value {
             "textSizePt": { "type": "number", "label": "Text size (pt)", "default_value": brep_kernel::PmiDisplay::default().text_size_pt },
             "wireframe": { "type": "boolean", "label": "Wireframe", "default_value": false },
             "sectionEnabled": { "type": "boolean", "label": "Section view", "default_value": false },
-            "sectionAxis": { "type": "options", "label": "Section normal", "options": ["View", "X", "Y", "Z"], "default_value": "View" },
+            "sectionAxis": { "type": "options", "label": "Section normal", "options": ["View", "X", "Y", "Z", "Plane"], "default_value": "View" },
+            "sectionPlane": {
+                "type": "reference_selection", "label": "Section plane", "selectionFilter": ["FACE", "PLANE"], "multiple": false,
+                "minSelections": 0, "maxSelections": 1, "default_value": null,
+                "hint": "A planar face, datum plane or sketch plane to cut on (Section normal: Plane); the offset moves the cut along its normal"
+            },
             "sectionOffset": { "type": "number", "label": "Section offset (mm)", "default_value": 0.0 },
             "sectionFlip": { "type": "boolean", "label": "Reverse section", "default_value": false },
+            "halfAxis": {
+                "type": "options", "label": "Half section", "options": ["None", "View", "X", "Y", "Z"], "default_value": "None",
+                "hint": "A second plane through the section's origin: material is removed only where both planes remove it (a quarter cut away)"
+            },
+            "halfOffset": { "type": "number", "label": "Half section offset (mm)", "default_value": 0.0 },
+            "halfFlip": { "type": "boolean", "label": "Reverse half section", "default_value": false },
+            "sectionExclude": {
+                "type": "reference_selection", "label": "Not cut", "selectionFilter": ["SOLID", "COMPONENT"], "multiple": true,
+                "minSelections": 0, "maxSelections": 64, "default_value": [],
+                "hint": "Solids or components the section leaves whole, such as shafts and fasteners"
+            },
             "updateCamera": { "type": "button", "label": "Update camera from the viewport" },
             "updateVisibility": { "type": "button", "label": "Update visibility from the scene" }
         }
     })
+}
+
+/// The further planes a view's section edit asks for: a whole `sectionPlanes`
+/// list replaces them, then the form's `half*` rows set (or, `None`, drop)
+/// the first; what neither names is kept. A frozen `View` normal is kept for
+/// a plane that stays `View`.
+fn section_planes_from(
+    params: &serde_json::Value,
+    prior: Option<&brep_kernel::feature_pipeline::pmi::PmiSection>,
+) -> Result<Vec<brep_kernel::feature_pipeline::pmi::PmiSectionPlane>, String> {
+    use brep_kernel::feature_pipeline::pmi::PmiSectionPlane;
+    let prior_planes = prior.map(|s| s.planes.clone()).unwrap_or_default();
+    let valid = |plane: &PmiSectionPlane| ["View", "X", "Y", "Z"].contains(&plane.axis.as_str()) && plane.offset.is_finite();
+    let mut planes = match params.get("sectionPlanes") {
+        Some(serde_json::Value::Null) => Vec::new(),
+        Some(list) => {
+            let planes: Vec<PmiSectionPlane> = serde_json::from_value(list.clone()).map_err(|e| format!("invalid section planes: {e}"))?;
+            if !planes.iter().all(valid) {
+                return Err("invalid section plane".into());
+            }
+            planes
+        }
+        None => prior_planes,
+    };
+    if let Some(axis) = params.get("halfAxis").and_then(serde_json::Value::as_str) {
+        if axis == "None" {
+            if !planes.is_empty() {
+                planes.remove(0);
+            }
+        } else {
+            let before = planes.first();
+            let plane = PmiSectionPlane {
+                axis: axis.to_string(),
+                offset: params.get("halfOffset").and_then(serde_json::Value::as_f64).or(before.map(|p| p.offset)).unwrap_or(0.),
+                flip: params.get("halfFlip").and_then(serde_json::Value::as_bool).or(before.map(|p| p.flip)).unwrap_or(false),
+                normal: before.filter(|p| p.axis == axis).and_then(|p| p.normal),
+            };
+            if !valid(&plane) {
+                return Err("invalid section plane".into());
+            }
+            match planes.first_mut() {
+                Some(first) => *first = plane,
+                None => planes.push(plane),
+            }
+        }
+    }
+    // A View plane with no normal takes the captured direction in `freeze`.
+    Ok(planes)
 }
 
 /// A view's current values in [`pmi_view_schema`]'s shape — the form's seed.
@@ -75,6 +139,11 @@ pub fn pmi_view_params(view: &brep_kernel::PmiView) -> serde_json::Value {
         "sectionAxis": view.display.section.as_ref().map(|s| s.axis.as_str()).unwrap_or("View"),
         "sectionOffset": view.display.section.as_ref().map(|s| s.offset).unwrap_or(0.),
         "sectionFlip": view.display.section.as_ref().is_some_and(|s| s.flip),
+        "sectionPlane": view.display.section.as_ref().and_then(|s| s.plane.as_deref()).unwrap_or(""),
+        "sectionExclude": view.display.section.as_ref().map(|s| s.exclude.clone()).unwrap_or_default(),
+        "halfAxis": view.display.section.as_ref().and_then(|s| s.planes.first()).map(|p| p.axis.as_str()).unwrap_or("None"),
+        "halfOffset": view.display.section.as_ref().and_then(|s| s.planes.first()).map(|p| p.offset).unwrap_or(0.),
+        "halfFlip": view.display.section.as_ref().and_then(|s| s.planes.first()).is_some_and(|p| p.flip),
     })
 }
 
@@ -98,6 +167,22 @@ impl EngineState {
             .pmi_block()
             .and_then(|block| serde_json::from_value(block.clone()).ok())
             .unwrap_or_default()
+    }
+
+    /// [`Self::pmi_state`] parsed once per history revision and shared: what
+    /// a frame reads (an animation frame's section check and overlay), where
+    /// parsing the whole block each time cost ~14 ms a parse on a 500-step
+    /// view.
+    pub fn pmi_state_shared(&self) -> std::rc::Rc<PmiState> {
+        let revision = self.history.revision();
+        if let Some((at, state)) = self.pmi_state_cache.borrow().as_ref() {
+            if *at == revision {
+                return state.clone();
+            }
+        }
+        let state = std::rc::Rc::new(self.pmi_state());
+        *self.pmi_state_cache.borrow_mut() = Some((revision, state.clone()));
+        state
     }
 
     /// The PMI report of the last APPLIED run.
@@ -157,15 +242,16 @@ impl EngineState {
     }
 
     /// The annotation selected in the PMI tree (or opened), while it exists.
+    /// Asked every frame (the tree's highlight), so it reads the shared parse.
     pub fn pmi_selected_annotation(&self) -> Option<&str> {
         let id = self.pmi_selected_annotation.as_deref()?;
-        self.pmi_state().find_annotation(id).is_some().then_some(id)
+        self.pmi_state_shared().find_annotation(id).is_some().then_some(id)
     }
 
     /// The view selected in the PMI tree (or opened), while it exists.
     pub fn pmi_selected_view(&self) -> Option<&str> {
         let id = self.pmi_selected_view.as_deref()?;
-        self.pmi_state().find_view(id).is_some().then_some(id)
+        self.pmi_state_shared().find_view(id).is_some().then_some(id)
     }
 
     /// Whether the PMI workbench remembered a modeling state (it is "entered").
@@ -197,7 +283,7 @@ impl EngineState {
     /// Write `state` as the document's block (checkpointed) and re-run the
     /// history so the tail resolves it. An empty block is removed so a part
     /// that never had PMI saves byte-identically.
-    fn write_pmi_state(&mut self, state: PmiState) -> String {
+    pub(super) fn write_pmi_state(&mut self, state: PmiState) -> String {
         let block = if state.is_empty() { None } else { serde_json::to_value(&state).ok() };
         self.history.set_pmi_block(block, None);
         self.rerun_history()
@@ -206,7 +292,7 @@ impl EngineState {
     // --- views ---------------------------------------------------------------
 
     /// The current camera as a snapshot.
-    fn snapshot_camera(&self) -> PmiCamera {
+    pub(super) fn snapshot_camera(&self) -> PmiCamera {
         let camera = &self.camera;
         PmiCamera {
             eye: camera.eye,
@@ -303,9 +389,26 @@ impl EngineState {
     /// Re-capture a view's camera from the current camera (the explicit
     /// Update Camera action — orbiting never rewrites a snapshot silently).
     pub fn pmi_update_view_camera(&mut self, id: &str) -> Result<(), String> {
+        // A step's view: the capture is the step's author camera, kept
+        // through the step edits that regenerate a generated one. The step
+        // stays shown as the user had it (the capture rebuilds the views,
+        // which puts every view away).
+        if let Some(step) = self.instructions_step_of_view(id) {
+            let shown = self.instructions_shown_step().as_deref() == Some(step.as_str());
+            self.instructions_capture_camera(&step)?;
+            if shown {
+                self.instructions_show_step(&step)?;
+            }
+            return Ok(());
+        }
         let mut state = self.pmi_state();
         let camera = self.snapshot_camera();
         let view = state.find_view_mut(id).ok_or_else(|| format!("no PMI view '{id}'"))?;
+        // A section saved before its plane was stored is anchored on the OLD
+        // camera first, so the cut stays where it was.
+        if let Some(section) = view.display.section.as_mut() {
+            section.freeze(view.camera.as_ref());
+        }
         view.camera = Some(camera);
         self.write_pmi_state(state);
         Ok(())
@@ -349,8 +452,37 @@ impl EngineState {
             let section = if params["sectionEnabled"].as_bool().unwrap_or(false) {
                 let axis = params["sectionAxis"].as_str().unwrap_or("View");
                 let offset = params["sectionOffset"].as_f64().unwrap_or(0.);
-                if !["View", "X", "Y", "Z"].contains(&axis) || !offset.is_finite() { return Err("invalid section plane".into()); }
-                Some(brep_kernel::feature_pipeline::pmi::PmiSection { axis: axis.into(), offset, flip: params["sectionFlip"].as_bool().unwrap_or(false) })
+                if !["View", "X", "Y", "Z", "Plane"].contains(&axis) || !offset.is_finite() { return Err("invalid section plane".into()); }
+                // The plane keeps the anchor it was set on: a re-captured
+                // camera must not move the cut. A newly chosen View axis takes
+                // the captured direction.
+                let prior = view.display.section.as_ref();
+                let mut section = brep_kernel::feature_pipeline::pmi::PmiSection {
+                    axis: axis.into(),
+                    offset,
+                    flip: params["sectionFlip"].as_bool().unwrap_or(false),
+                    origin: prior.and_then(|s| s.origin),
+                    normal: prior.filter(|s| s.axis == axis).and_then(|s| s.normal),
+                    // The picked face or plane (`Plane`): the run resolves it.
+                    plane: match params.get("sectionPlane") {
+                        Some(serde_json::Value::String(name)) => Some(name.trim().to_string()).filter(|name| !name.is_empty()),
+                        Some(serde_json::Value::Null) => None,
+                        _ => prior.and_then(|s| s.plane.clone()),
+                    },
+                    exclude: match params.get("sectionExclude") {
+                        Some(serde_json::Value::Array(names)) => names
+                            .iter()
+                            .filter_map(serde_json::Value::as_str)
+                            .map(|name| name.trim().to_string())
+                            .filter(|name| !name.is_empty())
+                            .collect(),
+                        Some(serde_json::Value::Null) => Vec::new(),
+                        _ => prior.map(|s| s.exclude.clone()).unwrap_or_default(),
+                    },
+                    planes: section_planes_from(&params, prior)?,
+                };
+                section.freeze(view.camera.as_ref());
+                Some(section)
             } else { None };
             (section != view.display.section).then_some(section)
         } else { None };
@@ -359,6 +491,52 @@ impl EngineState {
         }
         let patch = PmiViewPatch { name, text_size_pt, wireframe, hidden: None, section };
         self.patch_pmi_view(id, &patch, Some(&format!("pmi:view:{id}")))
+    }
+
+    /// Set view `id`'s section the way its form's section rows do, as ONE
+    /// undo step: `enabled` turns it on or off, and each field left `None`
+    /// keeps what the section has (or the form's default: `View`, offset 0,
+    /// not reversed, no plane, nothing left whole, no further planes).
+    /// `planes` replaces the further planes (a half or corner cut away;
+    /// empty: none). The plane is anchored as the form anchors it
+    /// ([`Self::pmi_update_view`]).
+    #[allow(clippy::too_many_arguments)]
+    pub fn pmi_set_view_section(
+        &mut self,
+        id: &str,
+        enabled: bool,
+        axis: Option<&str>,
+        offset: Option<f64>,
+        flip: Option<bool>,
+        plane: Option<&str>,
+        exclude: Option<Vec<String>>,
+        planes: Option<Vec<brep_kernel::feature_pipeline::pmi::PmiSectionPlane>>,
+    ) -> Result<(), String> {
+        let state = self.pmi_state();
+        let view = state.find_view(id).ok_or_else(|| format!("no PMI view '{id}'"))?;
+        let prior = view.display.section.as_ref();
+        // A plane named with no axis cuts on that plane, as picking one in
+        // the form does.
+        let axis = axis.or_else(|| plane.filter(|plane| !plane.trim().is_empty()).map(|_| "Plane"));
+        let mut params = serde_json::json!({
+            "sectionEnabled": enabled,
+            "sectionAxis": axis.map(str::to_string).or_else(|| prior.map(|s| s.axis.clone())).unwrap_or_else(|| "View".into()),
+            "sectionOffset": offset.or_else(|| prior.map(|s| s.offset)).unwrap_or(0.),
+            "sectionFlip": flip.or_else(|| prior.map(|s| s.flip)).unwrap_or(false),
+        });
+        if let Some(plane) = plane {
+            params["sectionPlane"] = plane.into();
+        }
+        if let Some(exclude) = exclude {
+            params["sectionExclude"] = exclude.into();
+        }
+        if let Some(planes) = planes {
+            params["sectionPlanes"] = serde_json::to_value(planes).map_err(|e| e.to_string())?;
+        }
+        self.history.break_coalescing();
+        let result = self.pmi_update_view(id, &params.to_string());
+        self.history.break_coalescing();
+        result
     }
 
     /// Open view `id`'s dialog (`None` closes it). Opening activates the view,
@@ -446,8 +624,19 @@ impl EngineState {
     fn apply_view_display(&mut self, display: &PmiDisplay) {
         let names: Vec<String> = self.scene.solids().iter().map(|s| s.name.clone()).collect();
         for name in names {
-            let visible = !display.hidden.contains(&name);
-            self.scene.set_visible(&name, visible);
+            let hidden = display.hidden.contains(&name);
+            if let Some(original) = self.pmi_explode_originals.get_mut(&name).filter(|original| original.visible == hidden) {
+                original.visible = !hidden;
+                self.pmi_unposed_visibility += 1;
+            }
+            if hidden {
+                // Hidden by the view: restoring the section must not show it.
+                self.pmi_section_hidden.retain(|hidden| *hidden != name);
+                self.scene.set_visible(&name, false);
+            } else if !self.pmi_section_hidden.contains(&name) {
+                // A solid the section removes whole stays hidden.
+                self.scene.set_visible(&name, true);
+            }
         }
         if self.settings.wireframe != display.wireframe {
             self.settings.wireframe = display.wireframe;
@@ -474,6 +663,10 @@ impl EngineState {
         if self.pmi_modeling.is_none() {
             self.pmi_remember_modeling();
         }
+        if self.pmi_active_view.as_deref() != Some(id) {
+            // A view activated afresh shows every explode step at full.
+            self.explode_playback = Default::default();
+        }
         self.pmi_active_view = Some(id.to_string());
         if let Some(camera) = &view.camera {
             let (kind, scale) = match camera.projection {
@@ -489,6 +682,7 @@ impl EngineState {
         }
         self.apply_view_display(&view.display);
         self.pmi_apply_explode();
+        self.instructions_refresh_ghosts();
         if let Some(open) = &self.pmi_open_annotation {
             if !view.annotations.iter().any(|a| a.id() == open) {
                 self.pmi_open_annotation = None;
@@ -504,6 +698,8 @@ impl EngineState {
         if self.pmi_active_view.take().is_none() {
             return;
         }
+        // Instructions' ghosts go before the modeling visibility comes back.
+        self.instructions_refresh_ghosts();
         if self.pmi_state().find_annotation(&self.transform_armed_feature()).is_some() { self.disarm_transform(); }
         self.pmi_restore_explode();
         if let Some(snapshot) = self.pmi_modeling.clone() {
@@ -525,7 +721,7 @@ impl EngineState {
     }
 
     /// Keep the arcball controls in step with a camera written wholesale.
-    fn controls_sync_after_camera_apply(&mut self) {
+    pub(super) fn controls_sync_after_camera_apply(&mut self) {
         // The controls read the camera each frame (orbit deltas are applied
         // onto `self.camera`), so writing the camera is enough; a fresh depth
         // fit happens on the next render. Nothing else to sync.
@@ -537,52 +733,122 @@ impl EngineState {
     /// Pose the active view's explode targets on the CURRENT displays,
     /// keeping the un-posed copies for the restore.
     pub(crate) fn pmi_apply_explode(&mut self) {
-        self.pmi_restore_explode();
         let Some(active) = self.pmi_active_view.clone() else {
+            self.pmi_restore_explode();
             return;
         };
-        let Some(report) = self.pmi_report.as_ref() else {
-            return;
-        };
-        let Some(view) = report.view(&active) else {
-            return;
-        };
-        let poses: Vec<(Vec<String>, [f64; 3], [f64; 3], [f64; 3], [f64; 3])> = view
-            .annotations
-            .iter()
-            .filter(|row| row.enabled && row.status == PmiStatus::Ok)
-            .filter_map(|row| match &row.geometry {
-                PmiGeometry::Explode { solids, translate, rotate_deg, scale, center, .. } => {
-                    Some((solids.clone(), *translate, *rotate_deg, *scale, *center))
-                }
-                _ => None,
+        let report = self.pmi_report.as_ref().and_then(|report| report.view(&active));
+        let state = self.pmi_state_shared();
+        let view = state.find_view(&active);
+        // Every plane of the section: material goes only where all remove it.
+        let planes = view.map(|v| v.section_planes_in(report)).unwrap_or_default();
+        let section = (!planes.is_empty()).then_some(());
+        let exclude = view.and_then(|v| v.display.section.clone());
+        let poses: Vec<(Vec<String>, [f64; 3], [f64; 3], [f64; 3], [f64; 3])> = report
+            .map(|view| {
+                view.annotations
+                    .iter()
+                    .filter(|row| row.enabled && row.status == PmiStatus::Ok)
+                    .filter(|row| matches!(row.geometry, PmiGeometry::Explode { .. }))
+                    .enumerate()
+                    // Each step at its playback fraction (`exploded_ops`; 1 unless animating).
+                    .filter_map(|(step, row)| match super::exploded_ops::explode_at(&row.geometry, self.explode_fraction(step)) {
+                        PmiGeometry::Explode { solids, translate, rotate_deg, scale, center, .. } => {
+                            Some((solids, translate, rotate_deg, scale, center))
+                        }
+                        _ => None,
+                    })
+                    .collect()
             })
-            .collect();
+            .unwrap_or_default();
+        // An instructions step's insertion: its arrowed parts on their way home.
+        let mut poses = poses;
+        poses.extend(self.instructions_insertion_poses());
+        if section.is_none() && self.pmi_section_hidden.is_empty() && !self.pmi_explode_originals.is_empty() {
+            // Posed again (an animation frame): a display already posed is
+            // reset from its original's geometry, copied into the buffers it
+            // holds, rather than restored and cloned whole again (every frame,
+            // every moving solid: ~500 on a deep l500 view). A section changes
+            // the meshes themselves, so a sectioned view takes the full way.
+            let wanted: std::collections::HashSet<&String> = poses.iter().flat_map(|pose| pose.0.iter()).collect();
+            let stale: Vec<String> = self.pmi_explode_originals.keys().filter(|name| !wanted.contains(name)).cloned().collect();
+            for name in stale {
+                if let (Some(original), Some(display)) = (self.pmi_explode_originals.remove(&name), self.scene.solid_mut(&name)) {
+                    *display = original;
+                }
+            }
+            for name in wanted {
+                match self.pmi_explode_originals.get(name) {
+                    Some(original) => {
+                        if let Some(display) = self.scene.solid_mut(name) {
+                            reset_posed_geometry(display, original);
+                        }
+                    }
+                    None => {
+                        if let Some(display) = self.scene.solid(name) {
+                            self.pmi_explode_originals.insert(name.clone(), display.clone());
+                        }
+                    }
+                }
+            }
+        } else {
+            self.pmi_restore_explode();
+            for (solids, ..) in &poses {
+                for name in solids {
+                    let Some(display) = self.scene.solid(name) else { continue };
+                    self.pmi_explode_originals.entry(name.clone()).or_insert_with(|| display.clone());
+                }
+            }
+        }
         for (solids, translate, rotate_deg, scale, center) in poses {
             for name in solids {
-                let Some(display) = self.scene.solid(&name) else { continue };
-                self.pmi_explode_originals
-                    .entry(name.clone())
-                    .or_insert_with(|| display.clone());
                 if let Some(display) = self.scene.solid_mut(&name) {
                     transform_display(display, center, translate, rotate_deg, scale);
                 }
             }
         }
-        if let Some((point, normal)) = self.pmi_state().find_view(&active).and_then(|v| v.section_plane()) {
-            let names: Vec<String> = self.scene.solids().iter().map(|s| s.name.clone()).collect();
-            for name in names {
-                if let Some(display) = self.scene.solid(&name) { self.pmi_explode_originals.entry(name.clone()).or_insert_with(|| display.clone()); }
-                if let Some(display) = self.scene.solid_mut(&name) { super::pmi_section::clip_display(display, point, normal); }
+        if section.is_some() {
+            use super::pmi_section::{side_of_all, Side};
+            // A solid wholly on the kept side is left exactly as it is (no
+            // copy, no new revision: the GPU keeps its buffers); one wholly
+            // removed is hidden, which keeps its revision too, and its
+            // un-hidden original is kept so sheets and the 3D PDF still draw
+            // it. Only what the plane crosses is clipped, capped and
+            // re-uploaded.
+            // A solid the section excludes (a shaft, a fastener) stays whole.
+            let names: Vec<(String, Side)> = self
+                .scene
+                .solids()
+                .iter()
+                .map(|s| (s.name.clone(), if exclude.as_ref().is_some_and(|cut| cut.excludes(&s.name)) { Side::Kept } else { side_of_all(s, &planes) }))
+                .collect();
+            for (name, side) in names {
+                match side {
+                    Side::Kept => {}
+                    Side::Removed => {
+                        if let Some(display) = self.scene.solid(&name).filter(|display| display.visible) {
+                            self.pmi_explode_originals.entry(name.clone()).or_insert_with(|| display.clone());
+                            self.scene.set_visible(&name, false);
+                            self.pmi_section_hidden.push(name);
+                        }
+                    }
+                    Side::Cut => {
+                        if let Some(display) = self.scene.solid(&name) { self.pmi_explode_originals.entry(name.clone()).or_insert_with(|| display.clone()); }
+                        if let Some(display) = self.scene.solid_mut(&name) { super::pmi_section::clip_display_all(display, &planes); }
+                    }
+                }
             }
         }
-        if !self.pmi_explode_originals.is_empty() {
+        if !self.pmi_explode_originals.is_empty() || !self.pmi_section_hidden.is_empty() {
             self.dirty = true;
         }
     }
 
     /// Put every exploded display back exactly.
     pub(crate) fn pmi_restore_explode(&mut self) {
+        for name in std::mem::take(&mut self.pmi_section_hidden) {
+            self.scene.set_visible(&name, true);
+        }
         let originals = std::mem::take(&mut self.pmi_explode_originals);
         for (name, original) in originals {
             if let Some(display) = self.scene.solid_mut(&name) {
@@ -611,6 +877,7 @@ impl EngineState {
                 self.pmi_apply_explode();
             }
         }
+        self.instructions_refresh_ghosts();
         if let Some(open) = &self.pmi_open_annotation {
             if self.pmi_state().find_annotation(open).is_none() {
                 self.pmi_open_annotation = None;
@@ -779,7 +1046,7 @@ impl EngineState {
 
     /// Open one annotation's form (engine memory; `None` closes). Opening an
     /// annotation of another view activates that view. An open COUNTS
-    /// ([`Self::open_pmi_annotation`]) — including a re-open of the annotation
+    /// (`Self::open_pmi_annotation`) — including a re-open of the annotation
     /// already open, which is a viewport label double click on the form the user
     /// cannot see; an id that resolves to no annotation opens nothing and
     /// counts nothing.
@@ -808,7 +1075,7 @@ impl EngineState {
     /// Move an annotation's label (world). Coalesced per annotation into ONE
     /// undo step, and NEVER a re-run: the cached report is patched in place
     /// and the overlay re-baked. A balloon's arrow head is re-derived from
-    /// the moved bubble ([`Self::pmi_reproject_balloon_head`]).
+    /// the moved bubble (`Self::pmi_reproject_balloon_head`).
     pub fn pmi_set_label_world(&mut self, id: &str, world: [f64; 3]) -> Result<(), String> {
         let mut state = self.pmi_state();
         let annotation = state.find_annotation_mut(id).ok_or_else(|| format!("no PMI annotation '{id}'"))?;
@@ -860,8 +1127,8 @@ impl EngineState {
 
     /// One re-projection attempt: `None` when done (or not a balloon), else
     /// the occurrence solids the scene does not hold.
-    fn pmi_balloon_head_now(&mut self, id: &str) -> Option<Vec<String>> {
-        let (anchor, bubble) = self
+    pub(super) fn pmi_balloon_head_now(&mut self, id: &str) -> Option<Vec<String>> {
+        let (mut anchor, bubble) = self
             .pmi_report
             .as_ref()
             .and_then(|report| report.annotation(id))
@@ -869,6 +1136,7 @@ impl EngineState {
                 PmiGeometry::Leader { balloon: true, anchor: Some(anchor), .. } => Some((anchor.clone(), row.label_world)),
                 _ => None,
             })?;
+        anchor.camera = Some(self.snapshot_camera());
         let mut missing = Vec::new();
         let head = brep_kernel::pmi_balloon_head(&anchor, bubble, |name| self.scene.exact_solid(name), &mut missing);
         if !missing.is_empty() {
@@ -878,7 +1146,8 @@ impl EngineState {
         // projection error keeps the kernel's head rather than a wrong one.
         if let Ok(Some(head)) = head {
             if let Some(row) = self.pmi_report.as_mut().and_then(|report| report.annotation_mut(id)) {
-                if let PmiGeometry::Leader { targets, .. } = &mut row.geometry {
+                if let PmiGeometry::Leader { targets, anchor: recipe, .. } = &mut row.geometry {
+                    *recipe = Some(anchor);
                     if let Some(first) = targets.first_mut() {
                         *first = head;
                     }
@@ -892,11 +1161,14 @@ impl EngineState {
     /// the pick ray crosses the plane through the current label perpendicular
     /// to the viewing direction (so a drag never changes the label's depth).
     pub fn pmi_label_drag_to(&mut self, id: &str, x: f64, y: f64) {
+        // Part-way through explode playback the chip is drawn where its body
+        // is now: the drag runs there, and is stored back in the run's frame.
+        let playback = self.explode_playback_poses();
         let Some((current, plane)) = self
             .pmi_report
             .as_ref()
             .and_then(|r| r.annotation(id))
-            .map(|r| (r.label_world, r.plane))
+            .map(|r| (playback.as_ref().map_or(r.label_world, |poses| poses.shown(r, r.label_world)), r.plane))
         else {
             return;
         };
@@ -914,6 +1186,10 @@ impl EngineState {
         });
         let Some(world) = plane.hit(ray.origin, ray.dir) else {
             return;
+        };
+        let world = match (&playback, self.pmi_report.as_ref().and_then(|r| r.annotation(id))) {
+            (Some(poses), Some(row)) => poses.full(row, world),
+            _ => world,
         };
         let _ = self.pmi_set_label_world(id, world);
     }
@@ -1051,9 +1327,72 @@ impl EngineState {
         self.sync_ref_select_emphasis();
     }
 
+    // --- explode editing before the pick commits ------------------------------
+
+    /// The names an open explode step is about to move: the reference pick
+    /// running on its `targets` field while one runs (the picker holds the
+    /// part until Done commits it), else the step's committed targets.
+    fn explode_target_names(&self, id: &str, annotation: &PmiAnnotation) -> Vec<String> {
+        if let Some(field) = self.ref_select_field() {
+            if field.target == RefSelectTarget::Pmi && field.subject == id && field.path == ["targets"] {
+                return field.names;
+            }
+        }
+        annotation.references("targets")
+    }
+
+    /// The world bbox centre of the scene solids `names` name: a solid by its
+    /// name, a component by every solid inside it (`ACOMP2` → `ACOMP2:…`).
+    /// `None` when none of them is in the scene.
+    fn scene_names_center(&self, names: &[String]) -> Option<[f64; 3]> {
+        let mut low = [f64::INFINITY; 3];
+        let mut high = [f64::NEG_INFINITY; 3];
+        let mut any = false;
+        for name in names {
+            let prefix = format!("{name}:");
+            for solid in self.scene.solids() {
+                if solid.name == *name || solid.name.starts_with(&prefix) {
+                    for axis in 0..3 {
+                        low[axis] = low[axis].min(solid.bbox.min[axis]);
+                        high[axis] = high[axis].max(solid.bbox.max[axis]);
+                    }
+                    any = true;
+                }
+            }
+        }
+        any.then(|| std::array::from_fn(|axis| (low[axis] + high[axis]) * 0.5))
+    }
+
+    /// Where an open explode step's gizmo stands BEFORE the kernel has laid
+    /// the step out — the owner (2026-10-26) picked a part for a new explode
+    /// and saw no transform controls: a reference pick commits at Done, and
+    /// until then the step had nothing to stand on. This is the centre of
+    /// what the step is about to move (the running pick's names, else its
+    /// committed targets), the same bbox centre the kernel's layout uses.
+    /// `None` with nothing to move yet, or when the step is not in the
+    /// active view. Once the run lays the step out, the report's centre is
+    /// the one the gizmo and a drag use.
+    pub(super) fn pmi_explode_live_center(&self, id: &str) -> Option<[f64; 3]> {
+        let state = self.pmi_state_shared();
+        let (view, annotation) = state.find_annotation(id)?;
+        if annotation.kind != "explode" || self.pmi_active_view.as_deref() != Some(view.id.as_str()) {
+            return None;
+        }
+        let names = self.explode_target_names(id, annotation);
+        self.scene_names_center(&names)
+    }
+
     /// Commit a finished PMI ref-select into the annotation's params (fold
     /// only — the caller's shared tail re-runs).
     pub(crate) fn pmi_commit_refs(&mut self, id: &str, path: &[String], names: &[String], multiple: bool) {
+        if self.pmi_state().find_view(id).is_some() {
+            match path.first().map(String::as_str) {
+                Some("sectionExclude") => self.pmi_commit_section_exclude(id, names),
+                _ => self.pmi_commit_section_plane(id, names.first().map(String::as_str).unwrap_or("")),
+            }
+            self.history.break_coalescing();
+            return;
+        }
         let state = self.pmi_state();
         let Some((_, annotation)) = state.find_annotation(id) else {
             self.push_notice(format!("unknown PMI annotation '{id}'"));
@@ -1073,6 +1412,43 @@ impl EngineState {
         // the same annotation's params is its own undo step, so picking an
         // anchor and then clearing it in the form undo one at a time.
         self.history.break_coalescing();
+    }
+
+    /// Commit a view form's **Section plane** pick (fold only, like
+    /// [`Self::pmi_commit_refs`]): picking a face or plane makes the section
+    /// cut on it — the section turns on with the `Plane` normal.
+    fn pmi_commit_section_plane(&mut self, id: &str, name: &str) {
+        let mut state = self.pmi_state();
+        let Some(view) = state.find_view_mut(id) else { return };
+        let section = view.display.section.get_or_insert_with(|| brep_kernel::feature_pipeline::pmi::PmiSection {
+            axis: "Plane".into(),
+            offset: 0.,
+            flip: false,
+            origin: None,
+            normal: None,
+            plane: None,
+            exclude: Vec::new(),
+            planes: Vec::new(),
+        });
+        section.axis = "Plane".into();
+        section.plane = Some(name.trim().to_string()).filter(|name| !name.is_empty());
+        section.freeze(None);
+        let block = serde_json::to_value(&state).ok();
+        // Its own undo step, not folded into the form's edits before it.
+        self.history.break_coalescing();
+        self.history.set_pmi_block(block, Some(&format!("pmi:view:{id}")));
+    }
+
+    /// Commit a view form's **Not cut** picks (fold only, like
+    /// [`Self::pmi_commit_section_plane`]): the solids and components the
+    /// section leaves whole. Nothing to commit on a view without a section.
+    fn pmi_commit_section_exclude(&mut self, id: &str, names: &[String]) {
+        let mut state = self.pmi_state();
+        let Some(section) = state.find_view_mut(id).and_then(|view| view.display.section.as_mut()) else { return };
+        section.exclude = names.iter().map(|name| name.trim().to_string()).filter(|name| !name.is_empty()).collect();
+        let block = serde_json::to_value(&state).ok();
+        self.history.break_coalescing();
+        self.history.set_pmi_block(block, Some(&format!("pmi:view:{id}")));
     }
 
     // --- import -------------------------------------------------------------------
@@ -1109,6 +1485,53 @@ impl EngineState {
 
 /// Pose a display in place: `p' = R((p − c) ∘ s) + c + t` on the mesh, the
 /// edge polylines and the vertices; normals rotate; the bbox is rebuilt.
+/// `p ↦ R((p − c) ∘ s) + c + t` as a column-major 4×4, its rotation read off
+/// the very rotation the vertices are turned by.
+fn pose_matrix(center: [f64; 3], translate: [f64; 3], rotate: &dyn Fn([f64; 3]) -> [f64; 3], scale: [f64; 3]) -> [f32; 16] {
+    let columns = [rotate([1.0, 0.0, 0.0]), rotate([0.0, 1.0, 0.0]), rotate([0.0, 0.0, 1.0])];
+    let linear: [[f64; 3]; 3] = std::array::from_fn(|j| columns[j].map(|v| v * scale[j]));
+    let shifted: [f64; 3] = std::array::from_fn(|i| center[i] + translate[i] - (0..3).map(|j| linear[j][i] * center[j]).sum::<f64>());
+    let mut m = [0.0f32; 16];
+    for j in 0..3 {
+        for i in 0..3 {
+            m[j * 4 + i] = linear[j][i] as f32;
+        }
+    }
+    m[12] = shifted[0] as f32;
+    m[13] = shifted[1] as f32;
+    m[14] = shifted[2] as f32;
+    m[15] = 1.0;
+    m
+}
+
+/// `a · b`, column-major 4×4.
+fn mat4_mul(a: &[f32; 16], b: &[f32; 16]) -> [f32; 16] {
+    std::array::from_fn(|k| {
+        let (col, row) = (k / 4, k % 4);
+        (0..4).map(|n| a[n * 4 + row] * b[col * 4 + n]).sum()
+    })
+}
+
+/// Put a posed display's geometry back to its original's, copying into the
+/// buffers it already holds: what a pose moves (positions, normals, edge
+/// polylines, vertices, the box) and the revisions it set.
+fn reset_posed_geometry(display: &mut crate::scene::SolidDisplay, original: &crate::scene::SolidDisplay) {
+    display.mesh.positions.clone_from(&original.mesh.positions);
+    display.mesh.normals.clone_from(&original.mesh.normals);
+    if display.edges.len() == original.edges.len() {
+        for (edge, from) in display.edges.iter_mut().zip(&original.edges) {
+            edge.polyline.clone_from(&from.polyline);
+        }
+    } else {
+        display.edges.clone_from(&original.edges);
+    }
+    display.vertices.clone_from(&original.vertices);
+    display.bbox = original.bbox;
+    display.revision = original.revision;
+    display.shape_revision = original.shape_revision;
+    display.pose = original.pose;
+}
+
 pub(super) fn transform_display(
     display: &mut crate::scene::SolidDisplay,
     center: [f64; 3],
@@ -1116,8 +1539,27 @@ pub(super) fn transform_display(
     rotate_deg: [f64; 3],
     scale: [f64; 3],
 ) {
+    // The same mesh posed: the renderer rewrites its positions in the buffers
+    // it holds (`sync_scene`'s pose path) instead of rebuilding the solid on
+    // every frame an exploded view animates (l500: p95 81 ms a frame). A
+    // section clip, which changes the mesh, resets this itself.
+    // The kernel's explode rotation is in degrees (as every `rotationEuler`;
+    // its balloon anchors convert the same way); the rotation takes radians.
+    let rotate_rad = rotate_deg.map(f64::to_radians);
+    let rotate = |v: [f64; 3]| super::rotate_euler_xyz_f64(v, rotate_rad);
+    // The pose as a matrix over the shape's own geometry: this one, composed
+    // with any pose already on it. A display moved some other way (a drag)
+    // has no shape geometry to compose over, and keeps none.
+    let step = pose_matrix(center, translate, &rotate, scale);
+    display.pose = if display.shape_revision == 0 {
+        Some(step)
+    } else {
+        display.pose.map(|before| mat4_mul(&step, &before))
+    };
+    if display.shape_revision == 0 {
+        display.shape_revision = display.revision;
+    }
     display.revision = crate::scene::next_revision();
-    let rotate = |v: [f64; 3]| super::rotate_euler_xyz_f64(v, rotate_deg);
     let pose = |p: [f64; 3]| -> [f64; 3] {
         let local = [(p[0] - center[0]) * scale[0], (p[1] - center[1]) * scale[1], (p[2] - center[2]) * scale[2]];
         let rotated = rotate(local);

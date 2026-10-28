@@ -1394,7 +1394,7 @@ impl Db {
     /// Extend a claimed job's lease: the claim holder says "still baking", and
     /// the claim runs [`BAKE_LEASE`] from now. A long bake renews every so
     /// often instead of being handed to another worker at 15 minutes. Only the
-    /// holder may renew ([`held_by`]): a job another worker took over after
+    /// holder may renew (`held_by`): a job another worker took over after
     /// the lease lapsed, or one nobody has claimed, is refused by name.
     pub fn renew_bake(&self, worker: &User, id: &str) -> Result<BakeJob, Error> {
         let worker_id = worker.id.clone();

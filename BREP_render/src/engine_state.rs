@@ -41,6 +41,20 @@ pub(crate) struct DialogHover {
 
 pub struct EngineState {
     pub scene: RenderScene,
+    /// Display-only assembly surroundings in the active work part frame. Never picked or saved.
+    pub context_scene: RenderScene,
+    /// The Work part CONTEXT face clicked / hovered ([`Self::context_hit_at`]):
+    /// kept apart from [`Self::emphasis`], so no selection consumer (feature
+    /// prefill, references, plugins, metadata) ever sees a name the part's own
+    /// kernel cannot resolve.
+    pub(crate) context_selected: Option<crate::pick::PickCandidate>,
+    pub(crate) context_hovered: Option<crate::pick::PickCandidate>,
+    /// Ghosts (context solids) lit WHOLE by a running instructions occurrence
+    /// pick whose names they are (`sync_ref_select_emphasis`): every face of
+    /// each goes into the context highlight. Cleared when the pick ends.
+    pub(crate) context_pick_lit: Vec<String>,
+    /// How the context is shown: kept across context rebuilds and Work parts.
+    pub(crate) context_display: crate::engine_state::context_pick::ContextDisplay,
     pub camera: ViewCamera,
     pub controls: ArcballControls,
     pub settings: RenderSettings,
@@ -250,6 +264,23 @@ pub struct EngineState {
     /// The un-exploded displays of the solids the active view's explode
     /// annotations posed, for an exact restore.
     pub(crate) pmi_explode_originals: std::collections::HashMap<String, crate::scene::SolidDisplay>,
+    /// How far the active view's explode steps are shown, and any Explode /
+    /// Collapse animation (`exploded_ops`). Display state, never saved.
+    pub(crate) explode_playback: exploded_ops::ExplodePlayback,
+    /// The motion study being played or scrubbed and its bake
+    /// (`simulation_play`). Display state, never saved.
+    pub(crate) simulation_play: Option<simulation_play::SimulationPlayback>,
+    /// Solids the active view's section removes whole: hidden (no copy, no
+    /// re-upload) rather than clipped, and shown again on restore.
+    pub(crate) pmi_section_hidden: Vec<String>,
+    /// Bumped when an un-posed original's `visible` changes (a user or view
+    /// hide while the active view poses or sections that solid): sheets
+    /// draw from the originals, so their cache key carries it.
+    pub(crate) pmi_unposed_visibility: u64,
+    /// The `pmi` block parsed, keyed by the history revision it was parsed
+    /// at ([`Self::pmi_state_shared`]): every write to the saved document,
+    /// undo and redo included, moves that revision.
+    pub(crate) pmi_state_cache: std::cell::RefCell<Option<(u64, std::rc::Rc<brep_kernel::PmiState>)>>,
     /// A balloon whose dragged bubble could not be re-projected yet because
     /// the scene did not hold its occurrence's exact solids: re-derived when
     /// the topology reply lands (`pmi_refresh_stale_balloon`).
@@ -291,6 +322,8 @@ pub struct EngineState {
     /// the history panel makes while an SP form is open is a no-op until one
     /// of those moves. See `spline_edit.rs`.
     spline_overlay_key: Option<(String, Option<usize>, u64)>,
+    /// The CAM workbench's generation queue and results (`cam_ops.rs`).
+    pub cam: cam_ops::CamGeneration,
     /// Whether the ports placed components carry (`ACOMP1:PORT1`) draw their
     /// sheets. The app sets it from the active workbench — one that shows the
     /// Wire Harness panel; a document's own PORT features always draw.
@@ -372,6 +405,16 @@ pub struct EngineState {
     /// leaves the run no longer pending. Under the synchronous Inline runner the run
     /// applies inside the submitting call's own `pump`, so the fit is still immediate.
     pending_fit: bool,
+    /// The instructions wizard waits for the run that places the wrapper:
+    /// its step views read the solids that run makes. [`pump`](Self::pump)
+    /// runs it once no run is pending.
+    instructions_wizard_pending: bool,
+    /// A re-target folded new steps in: their views wait for the run that
+    /// builds the new revision's solids, like the wizard's.
+    instructions_views_pending: bool,
+    /// The in-app player's insertion motion: the shown step's arrowed parts
+    /// moving home ([`instructions_ops::Insertion`]).
+    pub(crate) instructions_insertion: Option<instructions_ops::Insertion>,
     /// EAGER provenance `name → creating-feature id` for the current resident
     /// solids, shipped with each run ([`crate::pipeline::RunOutput::provenance`]) and
     /// replaced wholesale in [`apply_run_output`](Self::apply_run_output). Answers
@@ -430,6 +473,19 @@ pub struct EngineState {
     /// — its solve runs against the resident geometry of the thread that asks —
     /// so only `ensure_assembly_session` sets this. See `assembly_ops`.
     pub(crate) assembly_session_generation: Option<u64>,
+    /// The kernel's session serial when this document's session was put in
+    /// place: the kernel session is one per thread, shared by every open
+    /// document, so a moved serial means another one replaced it.
+    pub(crate) assembly_session_serial: u64,
+    /// Take the runner's session copy instead of replaying (tests switch it
+    /// off to compare the two lanes), and how often each lane served.
+    pub(crate) session_transfer: bool,
+    pub(crate) session_imports: u64,
+    pub(crate) session_replays: u64,
+    /// A component replace whose run has not landed yet (see
+    /// `replace_component`), and the last finished replace's report.
+    pub(crate) replace_pending: Option<replace_component::PendingReplace>,
+    pub(crate) last_replace_report: Option<serde_json::Value>,
     /// Every output name the last applied run CONSUMED
     /// ([`crate::pipeline::RunOutput::consumed`]) — what the committed-sketch
     /// refresh hides a consumed sketch by, and what it used to re-execute the
@@ -459,6 +515,10 @@ pub struct EngineState {
     /// (screen-constant arc/rod sizing): `ensure_constraint_overlay_current`
     /// re-bakes when the camera zoom moves it materially. `0.0` = never baked.
     constraint_overlay_wpp: f64,
+    /// What the free-motion glyph group was last baked from (component,
+    /// its freedom row, centre), and at which `world_per_pixel`.
+    freedom_glyph_key: Option<String>,
+    freedom_glyph_wpp: f64,
     /// The `world_per_pixel` the FEATURE-DIMENSION gizmo group
     /// (`feature-dim-leaders`) was last baked at. The leaders' rod/cone/origin
     /// sphere — and the angular arc's whole world RADIUS — are
@@ -596,6 +656,35 @@ pub enum RefSelectTarget {
     /// centre or rim: `feature_id` is the object id, the picks are ANCHORS
     /// clicked on the open sheet's paper (`sheet_ops.rs`), and nothing rolls.
     Sheet,
+    /// A CAM record's reference field (a setup's orientation picks and
+    /// bodies, an operation's targets): `feature_id` is the record id and
+    /// `path` addresses the field from the `cam` block's ROOT, a `#<id>`
+    /// segment selecting the array element with that id
+    /// (`["setups", "#SETUP1", "targets"]`). Finish writes it through
+    /// `cam_ops::cam_commit_refs`, and nothing rolls: CAM references name the
+    /// finished model, which is what is on screen.
+    Cam,
+    /// A manufacturing-instructions step's OCCURRENCE field — an insertion
+    /// arrow's part or a callout's: `feature_id` is the step id and `field`
+    /// says which row. The pick is a SOLID of the placed assembly; Finish
+    /// derives the occurrence (the solid's name without its member) and writes
+    /// it through `instructions_ops::instructions_commit_ref`, one undo step,
+    /// and nothing rolls.
+    Instructions { field: InstructionsRefField },
+    /// A motion-study CLIP's parts field: `feature_id` is the clip id and
+    /// `path` its list field (`["occurrences"]`). Finish writes the picked
+    /// names, as the components that hold them, through
+    /// `simulation_refs::simulation_commit_refs`; nothing rolls.
+    Simulation,
+}
+
+/// Which occurrence field of a step a pick fills ([`RefSelectTarget::Instructions`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstructionsRefField {
+    /// The part insertion arrow `index` animates (one of the step's own adds).
+    Arrow(usize),
+    /// The part callout `index` points at (any part of the assembly).
+    Callout(usize),
 }
 
 /// The modal state of the reference-selection widget while it is ACTIVE: which
@@ -648,6 +737,11 @@ impl Default for EngineState {
     fn default() -> Self {
         Self {
             scene: RenderScene::new(),
+            context_scene: RenderScene::new(),
+            context_selected: None,
+            context_hovered: None,
+            context_pick_lit: Vec::new(),
+            context_display: Default::default(),
             camera: ViewCamera::default(),
             controls: ArcballControls::new(),
             settings: RenderSettings::default(),
@@ -701,11 +795,17 @@ impl Default for EngineState {
             pmi_dialog_opens: 0,
             pmi_modeling: None,
             pmi_explode_originals: std::collections::HashMap::new(),
+            explode_playback: Default::default(),
+            simulation_play: None,
+            pmi_section_hidden: Vec::new(),
+            pmi_unposed_visibility: 0,
+            pmi_state_cache: Default::default(),
             pmi_balloon_stale: None,
             pmi_overlay_key: None,
             pmi_hovered: None,
             pmi_label_hover_active: false,
             spline_overlay_key: None,
+            cam: cam_ops::CamGeneration::default(),
             component_ports_visible: false,
             spline_edit_feature: None,
             spline_anchor_picked: None,
@@ -727,6 +827,9 @@ impl Default for EngineState {
             runs_replied: 0,
             superseded_displays: HashMap::new(),
             pending_fit: false,
+            instructions_wizard_pending: false,
+            instructions_views_pending: false,
+            instructions_insertion: None,
             provenance: std::collections::HashMap::new(),
             entity_origin: std::collections::HashMap::new(),
             info_cache: std::collections::HashMap::new(),
@@ -741,12 +844,20 @@ impl Default for EngineState {
             assembly_components: Vec::new(),
             assembly_sync: None,
             assembly_session_generation: None,
+            assembly_session_serial: 0,
+            session_transfer: true,
+            session_imports: 0,
+            session_replays: 0,
+            replace_pending: None,
+            last_replace_report: None,
             consumed_names: std::collections::HashSet::new(),
             library_resync: false,
             sketch_links_released: false,
             constraint_overlays: Vec::new(),
             constraint_drag: None,
             constraint_overlay_wpp: 0.0,
+            freedom_glyph_key: None,
+            freedom_glyph_wpp: 0.0,
             feature_dim_overlay_wpp: 0.0,
             sketch_overlay_wpp: 0.0,
             constraint_hovered: None,
@@ -806,11 +917,16 @@ pub(crate) fn overlay_wpp_stale(baked: f64, now: f64) -> bool {
 /// constraint flavor of the reference picker, and `document_signature` — the
 /// ONE parts-library `sourceSignature` hash every writer shares.
 mod assembly_ops;
+mod context_pick;
 /// Assembly-constraint viewport overlays: overlay refresh from the kernel
 /// session, the grabbable distance/angle handle pick + drag preview +
 /// `assembly_update_constraint_json` commit, movedSolids re-tessellation, the
 /// drag-path document fold, label feed + element hover, and tests.
 mod assembly_overlay;
+/// Replace component (swap an occurrence's part, keep its mates by name when
+/// the parts share lineage; mark the rest unresolved) — `replace_components`,
+/// the report, repair, and the Save As lineage stamp.
+pub mod replace_component;
 /// BOM export: the `{partName, sourceKey, quantity}` parts list off the
 /// main-side parts library + live component projection, serialized as CSV /
 /// JSON for the file dialog's Export modal.
@@ -832,6 +948,8 @@ mod committed_sketches;
 /// the member-bbox center, fixed-refusal, free-move drag with the pose commit
 /// (and re-solve) on release. See `ComponentMoveArm`.
 mod component_move;
+/// Flip a constraint to its other solution (one undo step, a seeded pose).
+mod assembly_flip;
 /// Assembly COMPONENT read surface: the app-side component projection derived
 /// from the history's ACOMP features + the scene's namespaced solid names
 /// (`component_of_solid` / `component_info` / `component_bbox_center`), and its
@@ -919,10 +1037,38 @@ pub use selection_ux::RefSelectField;
 mod wire_bom;
 mod pmi_ops;
 mod pmi_section;
+// Assembly exploded views: PMI views whose explode rows are ordered steps.
+mod exploded_ops;
+pub use exploded_ops::{ExplodePlayback, ExplodeStep, ExplodedView};
+// Manufacturing instructions: the wrapper assembly, the wizard, step views and the player.
+mod instructions_ops;
+pub use instructions_ops::{Insertion, PlayTo};
+// Motion studies: the simulation block, motors and clips.
+mod simulation_ops;
+pub use simulation_ops::MotorMate;
+// Motion-study playback: bake the frames through the kernel, pose the displays.
+mod simulation_play;
+pub use simulation_play::{BakedFrame, SimulationPlayback};
+// Motion-study player data: the study's frames for the instructions player
+// template (the offline .html, and what the PLM serves).
+mod simulation_player;
+pub use simulation_player::assembly_signature;
+// A clip's parts picked in the viewport: the reference-selection lane of
+// the Simulation pane's forms.
+mod simulation_refs;
+// A study's published motion on a manufacturing-instructions step.
+mod instructions_motion;
+pub use instructions_motion::PublishedMotion;
+// Their printed PDF, per-step PNG and SVG, and the print settings.
+mod instructions_export;
+pub use instructions_export::IMAGE_PX as INSTRUCTIONS_IMAGE_PX;
+pub use instructions_export::{TOPOLOGY_WAIT, InstructionsPdfExport};
+pub mod cam_ops;
 pub use pmi_ops::{pmi_view_params, pmi_view_schema, world_vertex_ref, PmiModelingSnapshot, PmiViewPatch};
 // Drawing sheets: the `sheets` block, the open sheet and the projection cache.
 mod sheet_ops;
 pub(crate) mod pmi_overlay;
+pub use pmi_overlay::PmiLabel;
 /// The 3D spline-anchor editor: the resolved anchor list, the value edits
 /// (position / distances / flip / side / add / remove / reorder / detach),
 /// the anchor flavour of the transform gizmo, the port-attach flavour of the
@@ -935,15 +1081,15 @@ mod spline_edit;
 mod cage_edit;
 
 // Re-exports preserving the original `engine_state::*` public surface.
-pub use assembly_ops::{document_signature, ComponentInsert};
+pub use assembly_ops::{document_signature, nested_fixed_state, ComponentInsert};
 pub use board_geometry::{
     default_color as board_default_color, BoardBuild, BOARD_SOLID_PREFIX, SUBSTRATE_SOLID,
     VIAS_SOLID,
 };
-pub use bom::PART_ATTRIBUTES;
-pub use component_move::ComponentMoveArm;
+pub use bom::{OCCURRENCE_ATTRIBUTES, PART_ATTRIBUTES};
+pub use component_move::{ComponentMoveArm, TypedMove};
 pub use components::ComponentInfo;
-pub use interference::{InterferencePair, InterferenceReport};
+pub use interference::{ClearancePair, InterferencePair, InterferenceReport, INTERFERENCE_OVERLAY_GROUP};
 pub use model_io::{
     EmbeddedOnly, PartSink, StepAssemblyImport, StepAssemblyProbe, StepAssemblyReport,
 };
@@ -956,6 +1102,7 @@ pub use spline_edit::SplineAnchorRow;
 pub use cage_edit::{CageArm, CageSelect, CageSummary, CAGE_PICK_RADIUS_PX};
 pub use transform_gizmo::{GizmoMode, TransformArm};
 pub(crate) use transform_gizmo::rotate_euler_xyz_f64;
+
 
 
 

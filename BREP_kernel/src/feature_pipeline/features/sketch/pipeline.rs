@@ -279,7 +279,12 @@ fn build(ctx: &FeatureContext) -> Result<SketchOutput, String> {
                     };
                     let radius = (rim[0] - center[0]).hypot(rim[1] - center[1]);
                     if radius <= JOIN_TOL {
-                        return Err("sketch: degenerate circle (zero radius)".into());
+                        // Older sketch tools could snap the rim back onto the
+                        // center (including reusing the same point id). Such a
+                        // circle contributes no boundary; retain the rest of the
+                        // sketch instead of failing the whole feature. Keep its
+                        // points/constraints intact for editing and references.
+                        continue;
                     }
                     whole_loops.push(circle_loop(center, radius, edge_name, segment_ids));
                 }

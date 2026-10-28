@@ -65,6 +65,11 @@ pub(super) fn expand_mates(
         if mate.body_a == mate.body_b {
             return Err(format!("{name}: body_a and body_b must differ"));
         }
+        if let Some(c) = mate.body_c {
+            if c >= bodies.len() {
+                return Err(format!("{name}: body_c out of range ({c}, {} bodies)", bodies.len()));
+            }
+        }
         let ba = mate.body_a;
         let bb = mate.body_b;
         let before = atoms.len();
@@ -307,6 +312,89 @@ pub(super) fn expand_mates(
                     r.abs(),
                 ));
             }
+            MateKind::Symmetric { element_a, element_b, plane_c } => {
+                let bc = mate
+                    .body_c
+                    .ok_or_else(|| format!("{name}: a symmetric mate needs body_c (the mirror's body)"))?;
+                let o = LocalPoint { body: bc, p: finite_point(plane_c.origin, "plane_c.origin", &name)? };
+                let n = LocalDir { body: bc, d: unit_dir(plane_c.normal, "plane_c.normal", &name)? };
+                match (element_a, element_b) {
+                    (SymmetricElement::Point { point: pa }, SymmetricElement::Point { point: pb }) => {
+                        let pa = LocalPoint { body: ba, p: finite_point(*pa, "element_a.point", &name)? };
+                        let pb = LocalPoint { body: bb, p: finite_point(*pb, "element_b.point", &name)? };
+                        atoms.push(Atom::SymPoints(pa, pb, o, n));
+                    }
+                    (SymmetricElement::Plane { plane: pa }, SymmetricElement::Plane { plane: pb }) => {
+                        let oa = LocalPoint { body: ba, p: finite_point(pa.origin, "element_a.origin", &name)? };
+                        let na = LocalDir { body: ba, d: unit_dir(pa.normal, "element_a.normal", &name)? };
+                        let ob = LocalPoint { body: bb, p: finite_point(pb.origin, "element_b.origin", &name)? };
+                        let nb = LocalDir { body: bb, d: unit_dir(pb.normal, "element_b.normal", &name)? };
+                        atoms.push(Atom::SymDirMatch(na, nb, n));
+                        atoms.push(Atom::SymPointOnPlane(ob, oa, na, o, n));
+                    }
+                    (SymmetricElement::Axis { axis: xa }, SymmetricElement::Axis { axis: xb }) => {
+                        let oa = LocalPoint { body: ba, p: finite_point(xa.origin, "element_a.origin", &name)? };
+                        let da = LocalDir { body: ba, d: unit_dir(xa.direction, "element_a.direction", &name)? };
+                        let ob = LocalPoint { body: bb, p: finite_point(xb.origin, "element_b.origin", &name)? };
+                        let db = LocalDir { body: bb, d: unit_dir(xb.direction, "element_b.direction", &name)? };
+                        atoms.push(Atom::SymDirCross(da, db, n));
+                        atoms.push(Atom::SymAxisLateral(oa, ob, db, o, n));
+                    }
+                    _ => {
+                        return Err(format!(
+                            "{name}: a symmetric mate pairs like elements (two points, two planes or two axes)"
+                        ))
+                    }
+                }
+            }
+            MateKind::Gear { axis_a, ref_a, world_ref_a, axis_b, ref_b, world_ref_b, ratio, reverse } => {
+                let ratio = finite_scalar(*ratio, "ratio", &name)?;
+                let a = spin(ba, axis_a, *ref_a, *world_ref_a, "a", &name)?;
+                let b = spin(bb, axis_b, *ref_b, *world_ref_b, "b", &name)?;
+                atoms.push(Atom::GearPhase(a, b, ratio, if *reverse { -1.0 } else { 1.0 }));
+            }
+            MateKind::RackPinion {
+                pinion_axis,
+                pinion_ref,
+                world_pinion_ref,
+                rack_point,
+                rack_direction,
+                world_rack_point,
+                distance_per_revolution,
+                reverse,
+            } => {
+                let pinion = spin(ba, pinion_axis, *pinion_ref, *world_pinion_ref, "pinion", &name)?;
+                let p = LocalPoint { body: bb, p: finite_point(*rack_point, "rack_point", &name)? };
+                let d = LocalDir { body: bb, d: unit_dir(*rack_direction, "rack_direction", &name)? };
+                let origin = finite_point(*world_rack_point, "world_rack_point", &name)?;
+                let per_turn = finite_scalar(*distance_per_revolution, "distance_per_revolution", &name)?;
+                let k = per_turn / std::f64::consts::TAU * if *reverse { -1.0 } else { 1.0 };
+                atoms.push(Atom::RackTravel(pinion, p, d, origin, k));
+            }
+            MateKind::Screw { axis_a, ref_a, ref_b, point_b, pitch, reverse, angle0, offset0 } => {
+                let oa = LocalPoint { body: ba, p: finite_point(axis_a.origin, "axis_a.origin", &name)? };
+                let da = LocalDir { body: ba, d: unit_dir(axis_a.direction, "axis_a.direction", &name)? };
+                let ra = LocalDir { body: ba, d: unit_dir(*ref_a, "ref_a", &name)? };
+                let rb = LocalDir { body: bb, d: unit_dir(*ref_b, "ref_b", &name)? };
+                let pb = LocalPoint { body: bb, p: finite_point(*point_b, "point_b", &name)? };
+                let pitch = finite_scalar(*pitch, "pitch", &name)?;
+                let k = pitch / std::f64::consts::TAU * if *reverse { -1.0 } else { 1.0 };
+                atoms.push(Atom::ScrewAdvance(
+                    oa,
+                    da,
+                    ra,
+                    rb,
+                    pb,
+                    finite_scalar(*angle0, "angle0", &name)?,
+                    finite_scalar(*offset0, "offset0", &name)?,
+                    k,
+                ));
+            }
+            MateKind::Limit { mate: inner, min, max } => {
+                let min = finite_scalar(*min, "min", &name)?;
+                let max = finite_scalar(*max, "max", &name)?;
+                atoms.extend(limit_atoms(bodies, ba, bb, inner, min, max, &name)?);
+            }
             MateKind::TangentCylinderPlane {
                 axis_a,
                 radius,
@@ -331,10 +419,220 @@ pub(super) fn expand_mates(
                     r.abs(),
                 ));
             }
+            MateKind::PointOnCurve { point_a, curve_b, along, reverse } => {
+                let pa = finite_point(*point_a, "point_a", &name)?;
+                let curve = CurveRef { body: bb, curve: std::sync::Arc::new(SampledCurve::new(curve_b, &name)?) };
+                let lp = LocalPoint { body: ba, p: pa };
+                atoms.push(Atom::PointOnCurve(lp, curve.clone()));
+                if let Some(percent) = along {
+                    let percent = finite_scalar(*percent, "along", &name)?;
+                    atoms.push(Atom::CurveAlong(lp, None, curve, percent / 100.0, *reverse));
+                }
+            }
+            MateKind::Slot { axis_a, curve_b, normal_b, along, reverse } => {
+                let oa = finite_point(axis_a.origin, "axis_a.origin", &name)?;
+                let da = unit_dir(axis_a.direction, "axis_a.direction", &name)?;
+                let nb = unit_dir(*normal_b, "normal_b", &name)?;
+                let curve = CurveRef { body: bb, curve: std::sync::Arc::new(SampledCurve::new(curve_b, &name)?) };
+                let (lp, ld) = (LocalPoint { body: ba, p: oa }, LocalDir { body: ba, d: da });
+                atoms.push(Atom::DirCross(ld, LocalDir { body: bb, d: nb }));
+                atoms.push(Atom::AxisOnCurve(lp, ld, curve.clone()));
+                if let Some(percent) = along {
+                    let percent = finite_scalar(*percent, "along", &name)?;
+                    atoms.push(Atom::CurveAlong(lp, Some(ld), curve, percent / 100.0, *reverse));
+                }
+            }
+            MateKind::Cam { center_a, axis_a, radius, profile_b, normal_b, flip } => {
+                let ca = finite_point(*center_a, "center_a", &name)?;
+                let nb = unit_dir(*normal_b, "normal_b", &name)?;
+                let r = finite_scalar(*radius, "radius", &name)?.abs();
+                let sampled = SampledCurve::new(profile_b, &name)?;
+                let start = sampled.start();
+                // Outside a closed profile is to the right of its direction
+                // when it runs counter-clockwise about the normal.
+                let side = sampled.orientation(nb) * if *flip { -1.0 } else { 1.0 };
+                let curve = CurveRef { body: bb, curve: std::sync::Arc::new(sampled) };
+                let (lp, ln) = (LocalPoint { body: ba, p: ca }, LocalDir { body: bb, d: nb });
+                let axis = match axis_a {
+                    Some(direction) => {
+                        let da = unit_dir(*direction, "axis_a", &name)?;
+                        let ld = LocalDir { body: ba, d: da };
+                        atoms.push(Atom::DirCross(ld, ln));
+                        Some(ld)
+                    }
+                    None => {
+                        atoms.push(Atom::PointOnPlane(lp, LocalPoint { body: bb, p: start }, ln, 0.0));
+                        None
+                    }
+                };
+                atoms.push(Atom::CamContact(lp, axis, curve, ln, r, side));
+            }
         }
         for _ in before..atoms.len() {
             atom_mate.push(mi);
         }
     }
     Ok((atoms, atom_mate))
+}
+
+/// Expand a limit mate: `inner`'s rows with its measure (always the LAST atom
+/// a measuring kind emits) replaced by the limit row. Angles convert to the
+/// measure's own units — the cosine for `Angle` (which reverses the ends),
+/// radians for `DirectedAngle`.
+fn limit_atoms(
+    bodies: &[AssemblyBody],
+    ba: usize,
+    bb: usize,
+    inner: &MateKind,
+    min: f64,
+    max: f64,
+    name: &str,
+) -> Result<Vec<Atom>, String> {
+    let (lo, hi) = match inner {
+        MateKind::Angle { .. } => {
+            if min > max {
+                return Err(format!("{name}: limit min must not exceed max"));
+            }
+            (max.to_radians().cos(), min.to_radians().cos())
+        }
+        MateKind::DirectedAngle { .. } => (min.to_radians(), max.to_radians()),
+        MateKind::DistancePointPoint { .. }
+        | MateKind::DistancePointPlane { .. }
+        | MateKind::DistancePlanePlane { .. }
+        | MateKind::DistancePointLine { .. }
+        | MateKind::DistanceLineLine { .. } => {
+            if min > max {
+                return Err(format!("{name}: limit min must not exceed max"));
+            }
+            (min, max)
+        }
+        _ => return Err(format!("{name}: only a distance or angle mate can be limited")),
+    };
+    let single = AssemblyMate { id: Some(name.to_string()), body_a: ba, body_b: bb, body_c: None, kind: inner.clone() };
+    let (mut atoms, _) = expand_mates(bodies, std::slice::from_ref(&single))?;
+    let measure = atoms
+        .pop()
+        .as_ref()
+        .and_then(Measure::of)
+        .ok_or_else(|| format!("{name}: the limited mate measures nothing"))?;
+    atoms.push(Atom::Limit(measure, lo, hi));
+    Ok(atoms)
+}
+
+/// A spin atom side: `axis` and the local reference ⟂ it on `body`, read
+/// against the world reference `world`.
+fn spin(body: usize, axis: &MateAxis, reference: [f64; 3], world: [f64; 3], side: &str, name: &str) -> Result<Spin, String> {
+    let n = unit_dir(axis.direction, &format!("{side} axis direction"), name)?;
+    let r = finite_point(reference, &format!("{side} reference"), name)?;
+    let r = r.sub(n.scale(r.dot(n)));
+    if !(r.length() > ASM_DIR_EPS) {
+        return Err(format!("{name}: the {side} reference must not lie along its axis"));
+    }
+    let world = finite_point(world, &format!("{side} world reference"), name)?;
+    Ok(Spin { reference: LocalDir { body, d: r.scale(1.0 / r.length()) }, axis: LocalDir { body, d: n }, world })
+}
+
+impl MateKind {
+    /// Re-capture a mechanical mate's references so it holds exactly the
+    /// poses given (`(rotation [w,x,y,z], translation)` of body A and body B):
+    /// the gear's and the pinion's world reference directions, the rack's
+    /// world point, the screw's angle and offset. Every other kind is left
+    /// alone. Mapping calls this at the current poses, so a new mate moves
+    /// nothing; a live drag calls it at the last good poses, so each frame
+    /// couples only the motion since then and never wraps a spin.
+    /// A mechanical mate's captured references as plain numbers (the world
+    /// reference directions / point, or the screw's angle and offset), for
+    /// persisting across runs; `None` for every other kind.
+    pub fn references(&self) -> Option<Vec<f64>> {
+        match self {
+            MateKind::Gear { world_ref_a, world_ref_b, .. } => Some([&world_ref_a[..], &world_ref_b[..]].concat()),
+            MateKind::RackPinion { world_pinion_ref, world_rack_point, .. } => {
+                Some([&world_pinion_ref[..], &world_rack_point[..]].concat())
+            }
+            // The nut's reference direction travels with the angle it was
+            // captured against: the mapping derives `ref_b` from the poses at
+            // map time, so a later run would pair a fresh `ref_b` with an old
+            // `angle0` and read the screw as turned.
+            MateKind::Screw { ref_b, angle0, offset0, .. } => Some(vec![*angle0, *offset0, ref_b[0], ref_b[1], ref_b[2]]),
+            _ => None,
+        }
+    }
+
+    /// Restore references saved by [`MateKind::references`]; `false` (and no
+    /// change) when the kind or the count does not match.
+    pub fn set_references(&mut self, values: &[f64]) -> bool {
+        let triple = |v: &[f64]| [v[0], v[1], v[2]];
+        match self {
+            MateKind::Gear { world_ref_a, world_ref_b, .. } if values.len() == 6 => {
+                *world_ref_a = triple(&values[0..3]);
+                *world_ref_b = triple(&values[3..6]);
+                true
+            }
+            MateKind::RackPinion { world_pinion_ref, world_rack_point, .. } if values.len() == 6 => {
+                *world_pinion_ref = triple(&values[0..3]);
+                *world_rack_point = triple(&values[3..6]);
+                true
+            }
+            // Two values: saved before `ref_b` was persisted; the mapped
+            // `ref_b` stands.
+            MateKind::Screw { ref_b, angle0, offset0, .. } if values.len() == 2 || values.len() == 5 => {
+                *angle0 = values[0];
+                *offset0 = values[1];
+                if values.len() == 5 {
+                    *ref_b = triple(&values[2..5]);
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Which side of a gear or rack-and-pinion moved since its references
+    /// were captured, when exactly one did: `Some(true)` for body A, `Some(false)`
+    /// for body B. A typed edit of one gear makes that gear the driver.
+    pub fn driver(&self, pose_a: ([f64; 4], [f64; 3]), pose_b: ([f64; 4], [f64; 3])) -> Option<bool> {
+        let rotate = |pose: ([f64; 4], [f64; 3]), v: [f64; 3]| quat_rotate(pose.0, vec3(v));
+        let place = |pose: ([f64; 4], [f64; 3]), p: [f64; 3]| rotate(pose, p).add(vec3(pose.1));
+        let unit = |v: Vec3| v.scale(1.0 / v.length().max(ASM_DIR_EPS));
+        let (moved_a, moved_b) = match self {
+            MateKind::Gear { axis_a, ref_a, world_ref_a, axis_b, ref_b, world_ref_b, .. } => (
+                signed_angle(vec3(*world_ref_a), rotate(pose_a, *ref_a), unit(rotate(pose_a, axis_a.direction))).abs(),
+                signed_angle(vec3(*world_ref_b), rotate(pose_b, *ref_b), unit(rotate(pose_b, axis_b.direction))).abs(),
+            ),
+            MateKind::RackPinion { pinion_axis, pinion_ref, world_pinion_ref, rack_point, world_rack_point, .. } => (
+                signed_angle(vec3(*world_pinion_ref), rotate(pose_a, *pinion_ref), unit(rotate(pose_a, pinion_axis.direction))).abs(),
+                place(pose_b, *rack_point).sub(vec3(*world_rack_point)).length(),
+            ),
+            _ => return None,
+        };
+        const STILL: f64 = 1e-9;
+        match (moved_a > STILL, moved_b > STILL) {
+            (true, false) => Some(true),
+            (false, true) => Some(false),
+            _ => None,
+        }
+    }
+
+    pub fn rebase(&mut self, pose_a: ([f64; 4], [f64; 3]), pose_b: ([f64; 4], [f64; 3])) {
+        let rotate = |pose: ([f64; 4], [f64; 3]), v: [f64; 3]| quat_rotate(pose.0, vec3(v));
+        let place = |pose: ([f64; 4], [f64; 3]), p: [f64; 3]| rotate(pose, p).add(vec3(pose.1));
+        let triple = |v: Vec3| [v.x, v.y, v.z];
+        match self {
+            MateKind::Gear { ref_a, world_ref_a, ref_b, world_ref_b, .. } => {
+                *world_ref_a = triple(rotate(pose_a, *ref_a));
+                *world_ref_b = triple(rotate(pose_b, *ref_b));
+            }
+            MateKind::RackPinion { pinion_ref, world_pinion_ref, rack_point, world_rack_point, .. } => {
+                *world_pinion_ref = triple(rotate(pose_a, *pinion_ref));
+                *world_rack_point = triple(place(pose_b, *rack_point));
+            }
+            MateKind::Screw { axis_a, ref_a, ref_b, point_b, angle0, offset0, .. } => {
+                let n = rotate(pose_a, axis_a.direction);
+                let n = n.scale(1.0 / n.length().max(ASM_DIR_EPS));
+                *angle0 = signed_angle(rotate(pose_a, *ref_a), rotate(pose_b, *ref_b), n);
+                *offset0 = place(pose_b, *point_b).sub(place(pose_a, axis_a.origin)).dot(n);
+            }
+            _ => {}
+        }
+    }
 }

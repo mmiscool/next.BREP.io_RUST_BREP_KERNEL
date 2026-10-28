@@ -39,6 +39,9 @@ struct Fetched {
 /// An attribute edit waiting for the server.
 struct Patch {
     part_name: String,
+    /// A NESTED line's definition (`names`, `sourceKey`): on the server's
+    /// yes every copy of it takes the value, not a top-level entry.
+    nested: Option<(Vec<String>, Option<String>)>,
     occurrence_ids: Option<Vec<String>>,
     field: String,
     value: Value,
@@ -58,10 +61,7 @@ pub struct PlmBomView {
 }
 
 fn spawn(task: impl std::future::Future<Output = ()> + 'static) {
-    #[cfg(target_arch = "wasm32")]
-    wasm_bindgen_futures::spawn_local(task);
-    #[cfg(not(target_arch = "wasm32"))]
-    crate::plm::native::spawn(task);
+    crate::store::spawn_waking(task);
 }
 
 impl PlmBomView {
@@ -106,26 +106,34 @@ impl PlmBomView {
             let got = bom::patch_attribute(&client, &part_id, &key, &sent).await;
             *into.borrow_mut() = Some(got);
         });
-        self.patches.push(Patch { part_name: part_name.to_string(), occurrence_ids: None, field: field.to_string(), value, slot });
+        self.patches.push(Patch { part_name: part_name.to_string(), nested: None, occurrence_ids: None, field: field.to_string(), value, slot });
     }
 
     pub fn queue_part_record_patch(&mut self,client:&Rc<PlmClient>,part:&str,part_name:&str,key:&str,cad_field:&str,value:Value){
         let slot:Slot<Result<(),PlmError>>=Rc::default();
         let (into,client,path,sent)=(slot.clone(),client.clone(),crate::plm::identity::part_path(part),json!({key:value.clone()}));
         spawn(async move{*into.borrow_mut()=Some(client.call("PATCH",&path,Some(sent.to_string().into_bytes())).await.map(|_|()));});
-        self.patches.push(Patch{part_name:part_name.into(),occurrence_ids:None,field:cad_field.into(),value,slot});
+        self.patches.push(Patch{part_name:part_name.into(),nested:None,occurrence_ids:None,field:cad_field.into(),value,slot});
     }
     pub fn queue_revision_patch(&mut self,client:&Rc<PlmClient>,part:&str,revision:&str,part_name:&str,field:&str,value:Value){
         let slot:Slot<Result<(),PlmError>>=Rc::default();
         let (into,client,path,sent)=(slot.clone(),client.clone(),format!("{}/attributes",crate::plm::identity::revision_path(part,revision)),json!({"attributes":{field:value.clone()}}));
         spawn(async move{*into.borrow_mut()=Some(client.call("PATCH",&path,Some(sent.to_string().into_bytes())).await.map(|_|()));});
-        self.patches.push(Patch{part_name:part_name.into(),occurrence_ids:None,field:field.into(),value,slot});
+        self.patches.push(Patch{part_name:part_name.into(),nested:None,occurrence_ids:None,field:field.into(),value,slot});
     }
     pub fn queue_occurrence_patch(&mut self,client:&Rc<PlmClient>,part:&str,revision:&str,ids:&[String],field:&str,value:Value,local:bool){
         let slot:Slot<Result<(),PlmError>>=Rc::default();
         let (into,client,path,sent)=(slot.clone(),client.clone(),format!("{}/occurrences",crate::plm::identity::revision_path(part,revision)),json!({"ids":ids,"attributes":{field:value.clone()}}));
         spawn(async move{*into.borrow_mut()=Some(client.call("PATCH",&path,Some(sent.to_string().into_bytes())).await.map(|_|()));});
-        self.patches.push(Patch{part_name:part.into(),occurrence_ids:Some(if local{ids.to_vec()}else{Vec::new()}),field:field.into(),value,slot});
+        self.patches.push(Patch{part_name:part.into(),nested:None,occurrence_ids:Some(if local{ids.to_vec()}else{Vec::new()}),field:field.into(),value,slot});
+    }
+
+    /// The patch just queued is for a NESTED line (`super::bom::nested`):
+    /// the server's yes writes every copy of the definition at `names`.
+    pub fn nest_last(&mut self, names: &[String], source: Option<&str>) {
+        if let Some(patch) = self.patches.last_mut() {
+            patch.nested = Some((names.to_vec(), source.map(str::to_string)));
+        }
     }
 
     /// Apply the edits the server accepted, in the order they were made, and
@@ -135,7 +143,7 @@ impl PlmBomView {
             let Some(result) = first.slot.borrow_mut().take() else { break };
             let patch = self.patches.remove(0);
             match result {
-                Ok(()) => match if let Some(ids)=&patch.occurrence_ids {if ids.is_empty(){Ok(())}else{state.set_occurrence_attribute(ids,&patch.field,patch.value.clone())}} else if patch.part_name.is_empty(){Ok(())}else{state.set_part_attribute(&patch.part_name, &patch.field, patch.value.clone())} {
+                Ok(()) => match if let Some((names,source))=&patch.nested {super::bom::nested::set_part_attribute(state,names,source.as_deref(),&patch.field,patch.value.clone())} else if let Some(ids)=&patch.occurrence_ids {if ids.is_empty(){Ok(())}else{state.set_occurrence_attribute(ids,&patch.field,patch.value.clone())}} else if patch.part_name.is_empty(){Ok(())}else{state.set_part_attribute(&patch.part_name, &patch.field, patch.value.clone())} {
                     Ok(()) => {
                         self.last_edit = Some(Ok(format!("{} of {} saved on the PLM", patch.field, patch.part_name)));
                         // A new server value moves the BOM: fetch again.

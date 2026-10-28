@@ -60,7 +60,7 @@ pub struct PartPropertiesPanel {
 impl PartPropertiesPanel {
     pub fn configure_plm(&mut self,client:Option<std::rc::Rc<crate::plm::client::PlmClient>>,document:Option<&str>){
         self.plm_target=client.zip(document.filter(|key|crate::plm::bom::revision_of_document(key).is_some()).map(str::to_string));
-        if self.open {if let Some((client,key))=&self.plm_target{self.configuration.ensure(client,vec![key.clone()]);}}
+        if self.open {if let Some((client,key))=&self.plm_target{self.configuration.ensure(client,vec![key.clone()],0);}}
     }
     pub fn new() -> Self {
         Self::default()

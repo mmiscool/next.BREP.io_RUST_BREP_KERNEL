@@ -559,3 +559,725 @@ impl RepointCheck {
     }
 }
 
+// --- cached copies, refreshed on open ----------------------------------------------------
+
+/// The other check on open: an assembly's embedded copies of PLM parts are a
+/// cache of their revisions ([`crate::plm::cached_copies`]). Each PLM document
+/// is compared once, when it opens; the copies older than their revisions are
+/// replaced as part of the open ([`crate::document::Document::absorb_open_write`]:
+/// not an unsaved change), with one notice naming them.
+///
+/// And while it is open: when the change feed names a revision an open
+/// document embeds, at any depth ([`Self::moved`]), it is compared again. The
+/// copies the user has not edited follow their revisions, through the chain
+/// (a part saved elsewhere refreshes the sub that holds it), in the document
+/// and its clean baseline alike, so the refresh is no unsaved change of its
+/// own. A copy the user edited is never replaced unasked: the pane asks, Keep
+/// my edits (the default) or Take their version. Never while a write of ours
+/// is in flight: the feed names our own keys before their writes land.
+#[derive(Default)]
+pub struct CachedCopyCheck {
+    checked: std::collections::HashSet<u64>,
+    /// Each read in flight: the revisions read, or taken from unchanged copies.
+    pending: HashMap<u64, Pending<HashMap<String, serde_json::Value>>>,
+    /// The revisions each open took from its copies instead of reading
+    /// (state, for automation).
+    unread: HashMap<u64, usize>,
+    /// The copies each document had refreshed, by document id.
+    refreshed: HashMap<u64, Vec<String>>,
+    /// Documents due a live check, with the revisions the feed named
+    /// (empty: it could not say which).
+    due: HashMap<u64, Vec<String>>,
+    /// Documents whose read in flight is a live check, as `due`.
+    live: HashMap<u64, Vec<String>>,
+    /// Edited copies whose revisions moved, while the pane asks: the copies'
+    /// paths and the revisions read.
+    asking: HashMap<u64, (Vec<String>, HashMap<String, serde_json::Value>)>,
+    /// Revisions whose change the user chose not to take, per document: the
+    /// revision's text when they did, so only a further change asks again.
+    kept: HashMap<u64, HashMap<String, String>>,
+    /// Live refreshes since the session began (state, for automation).
+    updated: u64,
+    /// Documents re-checked after a reload ([`Self::recheck`]): their open
+    /// already said what it refreshed and what is kept, so this check is quiet.
+    quiet: std::collections::HashSet<u64>,
+}
+
+impl CachedCopyCheck {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Once a frame: start a read of the revisions each newly opened PLM
+    /// document's copies name, and apply the answers.
+    pub fn sync(&mut self, client: &Rc<PlmClient>, store: &dyn ModelStore, docs: &mut crate::document::Documents, waker: &Waker, writing: bool) {
+        let open: Vec<u64> = docs.iter().map(|d| d.id()).collect();
+        self.checked.retain(|id| open.contains(id));
+        self.pending.retain(|id, _| open.contains(id));
+        self.unread.retain(|id, _| open.contains(id));
+        self.refreshed.retain(|id, _| open.contains(id));
+        self.due.retain(|id, _| open.contains(id));
+        self.live.retain(|id, _| open.contains(id));
+        self.asking.retain(|id, _| open.contains(id));
+        self.kept.retain(|id, _| open.contains(id));
+        self.quiet.retain(|id| open.contains(id));
+        if !writing {
+            for (id, keys) in std::mem::take(&mut self.due) {
+                if self.pending.contains_key(&id) {
+                    self.due.insert(id, keys);
+                } else {
+                    self.checked.remove(&id);
+                    self.live.insert(id, keys);
+                }
+            }
+        }
+        for doc in docs.iter() {
+            if self.checked.contains(&doc.id()) || doc.name().and_then(revision_key_of).is_none() {
+                continue;
+            }
+            self.checked.insert(doc.id());
+            // Restored from crash recovery: its copies hold the user's unsaved
+            // edits, which a refresh from the revisions would throw away (and
+            // take into the clean baseline, so the tab read saved). The Save
+            // writes them; the follower still reports what others change.
+            if doc.is_recovered() {
+                continue;
+            }
+            let Ok(document) = serde_json::from_str::<serde_json::Value>(&doc.engine.history_request_json()) else {
+                continue;
+            };
+            if !document["partsLibrary"].as_object().is_some_and(|l| !l.is_empty()) {
+                continue;
+            }
+            // Copies that are their revisions' stored bytes, as the index
+            // lists them, stand in for them. Not those of the revisions the feed just
+            // named: the held index may not have their new rows yet.
+            let mut unchanged = crate::plm::cached_copies::unchanged(&document, &|key| {
+                store.plm_revision(key).map(|entry| entry.content_hash)
+            });
+            // Except the ones the feed named for our own save: the index row
+            // holds what the server answered for our write, so a copy with
+            // those bytes is the revision (another writer since would have
+            // given the row a newer hash, and it is read).
+            match self.live.get(&doc.id()) {
+                Some(named) if named.is_empty() => unchanged.clear(),
+                Some(named) => unchanged.retain(|key, _| !named.contains(key) || store.plm_written_by_us(key)),
+                None => {}
+            }
+            self.unread.insert(doc.id(), unchanged.len());
+            let client = client.clone();
+            self.pending.insert(
+                doc.id(),
+                Pending::new(Box::pin(async move { Ok(crate::plm::cached_copies::fetch_changed(&client, &document, unchanged).await) })),
+            );
+        }
+        let answered: Vec<(u64, Result<HashMap<String, serde_json::Value>, String>)> = self
+            .pending
+            .iter_mut()
+            .filter_map(|(id, pending)| pending.poll(waker).map(|answer| (*id, answer)))
+            .collect();
+        for (id, answer) in answered {
+            self.pending.remove(&id);
+            if let Some(moved) = self.live.remove(&id) {
+                if writing {
+                    // Read while a write of ours was going out: it may predate it.
+                    self.due.insert(id, moved);
+                    continue;
+                }
+                if let (Ok(sources), Some(doc)) = (answer, docs.iter_mut().find(|d| d.id() == id)) {
+                    if let Some(paths) = self.follow(doc, &sources) {
+                        self.asking.insert(id, (paths, sources));
+                    }
+                }
+                continue;
+            }
+            let (Ok(sources), Some(doc)) = (answer, docs.iter_mut().find(|d| d.id() == id)) else {
+                continue;
+            };
+            // Refreshed against the document as it is NOW: the user may have
+            // edited it while the revisions were being read.
+            let Ok(mut document) = serde_json::from_str::<serde_json::Value>(&doc.engine.history_request_json()) else {
+                continue;
+            };
+            let before = document.clone();
+            let quiet = self.quiet.remove(&id);
+            // Copies a Save could not write keep the user's change: say so, and
+            // what to do, every time the document opens.
+            for (key, why) in crate::document::owned_save::unsaved_edits(&document).into_iter().filter(|_| !quiet) {
+                let name = crate::document::owned_save::first_copy(&document, &key, &mut Vec::new())
+                    .map_or_else(|| key.clone(), |(names, _)| names.join("/"));
+                doc.engine.push_notice(format!(
+                    "{name} has changes that are not saved to its PLM item yet ({why}): {}. They are kept in this assembly until then",
+                    crate::plm::cached_copies::way_forward(&why)
+                ));
+            }
+            let replaced = crate::plm::cached_copies::refresh(&mut document, &sources);
+            if replaced.is_empty() {
+                continue;
+            }
+            let key = doc.edit_key();
+            match doc.engine.edit_document_json(&document.to_string()) {
+                // Taken as part of the open, not as an edit: the refresh adds
+                // no unsaved change of its own (the tab is as dirty as the same
+                // open with current copies). Nothing is written to the PLM.
+                Ok(_) => {
+                    doc.absorb_open_write(&before, &document, key);
+                    // The refreshed copies re-heal on the run this edit causes.
+                    doc.arm_open_settle();
+                    if !quiet { doc.engine.push_notice(format!(
+                        "Updated {} from {} PLM revision{}: the copies saved in this assembly were older",
+                        replaced.join(", "),
+                        if replaced.len() == 1 { "its" } else { "their" },
+                        if replaced.len() == 1 { "" } else { "s" }
+                    )); }
+                }
+                Err(problem) => doc.engine.push_notice(format!("Could not update {} from the PLM: {problem}", replaced.join(", "))),
+            }
+            self.refreshed.insert(id, replaced);
+        }
+    }
+
+    /// Tab `id` was reloaded from its stored document: compare its copies
+    /// again, as on open (the earlier check's refresh went with the reload).
+    pub fn recheck(&mut self, id: u64) {
+        self.quiet.insert(id);
+        self.checked.remove(&id);
+        self.pending.remove(&id);
+        self.refreshed.remove(&id);
+        self.live.remove(&id);
+    }
+
+    /// The feed moved: every open document that embeds a revision it named
+    /// (every checked one when it could not say which) is due a live check.
+    pub fn moved(&mut self, docs: &crate::document::Documents, keys: &[String], stale: bool) {
+        let named: std::collections::BTreeSet<String> = keys.iter().filter_map(|k| revision_key_of(k)).collect();
+        for doc in docs.iter() {
+            if !self.checked.contains(&doc.id()) {
+                continue;
+            }
+            let Ok(document) = serde_json::from_str::<serde_json::Value>(&doc.engine.history_request_json()) else {
+                continue;
+            };
+            let embedded = crate::plm::cached_copies::revision_keys(&document);
+            let hit: Vec<String> = embedded.into_iter().filter(|k| named.contains(k)).collect();
+            if stale || !hit.is_empty() {
+                self.due.entry(doc.id()).or_default().extend(hit);
+            }
+        }
+    }
+
+    /// A live check answered: refresh what the user has not edited, in the
+    /// document and its baseline alike. The paths of edited copies whose
+    /// revisions moved, when there are any, for the pane to ask about.
+    fn follow(&mut self, doc: &mut crate::document::Document, sources: &HashMap<String, serde_json::Value>) -> Option<Vec<String>> {
+        use crate::plm::cached_copies::{moved_revisions, paths_of, refresh_except};
+        // A tab never saved (restored after a crash) has no baseline to tell
+        // the user's edits by: it is left as it is.
+        let mut baseline = doc.saved_document()?;
+        // The history's own document: `history_request_json` adds the session's
+        // workbench and thumbnail, which an edit written back would stamp into
+        // the history (and from there into the clean baseline).
+        let mut current: serde_json::Value = serde_json::from_str(&doc.engine.history.request_json()).ok()?;
+        let edited: std::collections::BTreeSet<String> = crate::document::owned_save::owned_changes(&baseline, &current)
+            .writes
+            .into_iter()
+            .filter_map(|w| revision_key_of(&w.key))
+            .collect();
+        // What changed on the PLM since the tab was last clean, by part (the
+        // washer, not the subs that hold it); the edited ones among them are asked about.
+        let moved = moved_revisions(&baseline, sources);
+        let changed = paths_of(&current, &moved);
+        let kept = self.kept.get(&doc.id());
+        let ask: std::collections::BTreeSet<String> = moved
+            .intersection(&edited)
+            .filter(|key| kept.and_then(|k| k.get(*key)) != sources.get(*key).map(|s| s.to_string()).as_ref())
+            .cloned()
+            .collect();
+        let asked = paths_of(&current, &ask);
+        let replaced = refresh_except(&mut current, sources, &edited);
+        if !replaced.is_empty() {
+            refresh_except(&mut baseline, sources, &edited);
+            let clean = !doc.is_dirty();
+            let key = doc.edit_key();
+            match doc.engine.edit_document_json(&current.to_string()) {
+                Ok(_) => {
+                    doc.rebase_saved_document(&baseline, key);
+                    if clean {
+                        // The refreshed copies re-heal on the run this edit
+                        // causes; in a clean tab that run is not the user's.
+                        doc.arm_open_settle();
+                    }
+                    self.updated += 1;
+                    let what = if changed.is_empty() { replaced.join(", ") } else { changed.join(", ") };
+                    doc.engine.push_notice(format!(
+                        "{what} changed on the PLM (saved by another client): updated {} in this assembly",
+                        replaced.join(", ")
+                    ));
+                }
+                Err(problem) => doc.engine.push_notice(format!("Could not update {} from the PLM: {problem}", replaced.join(", "))),
+            }
+        }
+        (!asked.is_empty()).then_some(asked)
+    }
+
+    /// The edited copies the pane asks about for document `id`.
+    pub fn asking(&self, id: u64) -> Option<&[String]> {
+        self.asking.get(&id).map(|(paths, _)| paths.as_slice())
+    }
+
+    /// The answer for document `id`: `true` takes their version of the edited
+    /// copies (the edits in them are discarded), `false` keeps the edits
+    /// (asked again only when the PLM moves again).
+    pub fn answer(&mut self, docs: &mut crate::document::Documents, id: u64, take_theirs: bool) {
+        let Some((paths, sources)) = self.asking.remove(&id) else { return };
+        if !take_theirs {
+            let kept = self.kept.entry(id).or_default();
+            for (key, source) in &sources {
+                kept.insert(key.clone(), source.to_string());
+            }
+            return;
+        }
+        let Some(doc) = docs.iter_mut().find(|d| d.id() == id) else { return };
+        let (Some(mut baseline), Ok(mut current)) =
+            (doc.saved_document(), serde_json::from_str::<serde_json::Value>(&doc.engine.history.request_json()))
+        else {
+            return;
+        };
+        let replaced = crate::plm::cached_copies::refresh(&mut current, &sources);
+        if replaced.is_empty() {
+            return;
+        }
+        crate::plm::cached_copies::refresh(&mut baseline, &sources);
+        let key = doc.edit_key();
+        match doc.engine.edit_document_json(&current.to_string()) {
+            Ok(_) => {
+                doc.rebase_saved_document(&baseline, key);
+                if !doc.is_dirty() {
+                    // The discarded edits were the only ones: the run this edit
+                    // causes re-heals the copies, which is not the user's change.
+                    doc.arm_open_settle();
+                }
+                // An edit whose mates moved other components: those poses
+                // re-solve back, but not to the same bits. Once they have, and
+                // nothing else differs, the tab is clean again.
+                doc.arm_converge();
+                self.updated += 1;
+                doc.engine.push_notice(format!(
+                    "{} now {} the other client's version; your edits there were discarded",
+                    paths.join(", "),
+                    if paths.len() == 1 { "shows" } else { "show" }
+                ));
+            }
+            Err(problem) => doc.engine.push_notice(format!("Could not update {} from the PLM: {problem}", replaced.join(", "))),
+        }
+    }
+
+    pub fn busy(&self) -> bool {
+        !self.pending.is_empty()
+    }
+
+    /// Live state for automation: refreshes so far, and the copies asked about.
+    pub fn live_json(&self, id: u64) -> serde_json::Value {
+        serde_json::json!({
+            "updated": self.updated,
+            "due": self.due.contains_key(&id) || self.live.contains_key(&id),
+            "asking": self.asking(id).unwrap_or(&[]),
+        })
+    }
+
+    /// The copies document `id` had refreshed when it opened.
+    pub fn refreshed(&self, id: u64) -> &[String] {
+        self.refreshed.get(&id).map_or(&[], Vec::as_slice)
+    }
+
+    /// How many revisions document `id`'s last check took from its copies
+    /// instead of reading them.
+    pub fn unread(&self, id: u64) -> usize {
+        self.unread.get(&id).copied().unwrap_or(0)
+    }
+}
+
+// --- copies pinned to a superseded revision -------------------------------------------
+
+/// One embedded revision that is no longer current, and the release that is.
+#[derive(Debug, Clone)]
+pub struct Superseded {
+    /// The pinned revision's store key, and the current release's.
+    pub key: String,
+    pub current_key: String,
+    pub number: String,
+    pub from: String,
+    pub lifecycle: String,
+    pub to: String,
+    /// The current release's document, for the update.
+    text: String,
+    /// Where it is placed, as library paths (`sub-b/plate`).
+    pub paths: Vec<String>,
+}
+
+/// The check on open for copies pinned to a superseded or obsolete revision
+/// (`plm::superseded`). Once per open, off its critical path: the pinned
+/// revisions' lifecycles come from the store index the session already holds
+/// (no request); only a part that IS superseded is read, once however often
+/// it is placed, for its current release and that release's document. One
+/// notice names what is stale. The pane offers Update only where the document
+/// may change (a draft no one else holds); a released assembly, or one held by
+/// someone else, pins its revisions by design and is only told.
+#[derive(Default)]
+pub struct SupersededCheck {
+    checked: std::collections::HashSet<u64>,
+    /// Frames spent waiting for the index to hold every pinned revision.
+    waits: HashMap<u64, u32>,
+    pending: HashMap<u64, Pending<Vec<Superseded>>>,
+    found: HashMap<u64, Vec<Superseded>>,
+    /// Documents whose Update question is still open.
+    asking: std::collections::HashSet<u64>,
+    updated: u64,
+    /// Revision reads made, for the cost report (state).
+    reads: u64,
+    /// Why a document keeps its revisions (released, held by someone), for the pane.
+    keeps: HashMap<u64, String>,
+    /// "Make a new revision using B", by the document it was asked from.
+    creating: HashMap<u64, Pending<(String, String)>>,
+    /// New revisions the user made to move on: updated as soon as their own
+    /// check finds the stale copies (the user already chose), as store keys.
+    auto: std::collections::HashSet<String>,
+    /// Made revisions to open, with the document they came from.
+    opened: Vec<(u64, String)>,
+    /// The revisions each checked document pins, with whether each read
+    /// superseded at its check: one that turns superseded (or obsolete) while
+    /// the document is open checks it again, so the user is told without
+    /// reopening it.
+    pinned: HashMap<u64, Vec<(String, bool)>>,
+}
+
+/// How many frames the check waits for the index to hold every revision a
+/// document names before checking with what it has (~10 s at 50 ms).
+const INDEX_WAIT_FRAMES: u32 = 200;
+
+impl SupersededCheck {
+    pub fn sync(&mut self, client: &Rc<PlmClient>, store: &dyn ModelStore, docs: &mut crate::document::Documents, waker: &Waker) {
+        use crate::plm::superseded::{current_release, is_superseded, pinned_keys};
+        let open: Vec<u64> = docs.iter().map(|d| d.id()).collect();
+        self.checked.retain(|id| open.contains(id));
+        self.waits.retain(|id, _| open.contains(id));
+        self.pending.retain(|id, _| open.contains(id));
+        self.found.retain(|id, _| open.contains(id));
+        self.asking.retain(|id| open.contains(id));
+        self.keeps.retain(|id, _| open.contains(id));
+        self.creating.retain(|id, _| open.contains(id));
+        self.pinned.retain(|id, _| open.contains(id));
+        // A newer revision released (or one retired) since the check: once
+        // the change feed has the pinned row's new lifecycle, check again.
+        let moved: Vec<u64> = self
+            .pinned
+            .iter()
+            .filter(|(id, keys)| {
+                !self.pending.contains_key(id)
+                    && keys.iter().any(|(key, was)| !was && store.plm_revision(key).is_some_and(|e| is_superseded(&e.lifecycle)))
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        for id in moved {
+            self.pinned.remove(&id);
+            self.checked.remove(&id);
+            self.waits.remove(&id);
+        }
+        let made: Vec<(u64, Result<(String, String), String>)> =
+            self.creating.iter_mut().filter_map(|(id, pending)| pending.poll(waker).map(|answer| (*id, answer))).collect();
+        for (id, answer) in made {
+            self.creating.remove(&id);
+            let Some(doc) = docs.iter_mut().find(|d| d.id() == id) else { continue };
+            match answer {
+                Ok((key, text)) => {
+                    // The store mirror learns the new revision before it is opened
+                    // (as Save As → new revision does), or the open reads it absent.
+                    store.remember_saved_document(&store.canonical_identity(&key), &text);
+                    store.refresh_plm_index(std::slice::from_ref(&key), false);
+                    if let Some(key) = revision_key_of(&key) {
+                        self.auto.insert(key.clone());
+                        self.opened.push((id, key));
+                    }
+                    doc.engine.push_notice_as(
+                        brep_render::engine_state::NoticeSeverity::Info,
+                        "Made a new revision of this assembly, checked out to you: opening it with the current revisions",
+                    );
+                }
+                Err(problem) => doc.engine.push_notice(format!("Could not make a new revision of this assembly: {problem}")),
+            }
+        }
+        let mut apply_now = Vec::new();
+        for doc in docs.iter() {
+            let id = doc.id();
+            if self.checked.contains(&id) || self.pending.contains_key(&id) || doc.name().and_then(revision_key_of).is_none() {
+                continue;
+            }
+            let Ok(document) = serde_json::from_str::<serde_json::Value>(&doc.engine.history.request_json()) else { continue };
+            let keys = pinned_keys(&document);
+            let entries: Vec<(String, Option<crate::plm::client::IndexEntry>)> =
+                keys.into_iter().map(|k| { let e = store.plm_revision(&k); (k, e) }).collect();
+            if entries.iter().any(|(_, e)| e.is_none()) {
+                let waited = self.waits.entry(id).or_default();
+                *waited += 1;
+                if *waited < INDEX_WAIT_FRAMES {
+                    continue;
+                }
+            }
+            self.checked.insert(id);
+            self.pinned.insert(
+                id,
+                entries.iter().map(|(key, entry)| (key.clone(), entry.as_ref().is_some_and(|e| is_superseded(&e.lifecycle)))).collect(),
+            );
+            // Stale revisions, grouped by part: each part is read once.
+            let mut by_part: std::collections::BTreeMap<String, Vec<(String, crate::plm::client::IndexEntry)>> = Default::default();
+            for (key, entry) in entries {
+                if let Some(entry) = entry.filter(|e| is_superseded(&e.lifecycle)) {
+                    by_part.entry(entry.part_id.clone()).or_default().push((key, entry));
+                }
+            }
+            if by_part.is_empty() {
+                continue;
+            }
+            self.reads += 2 * by_part.len() as u64;
+            let client = client.clone();
+            self.pending.insert(
+                id,
+                Pending::new(Box::pin(async move {
+                    let mut out = Vec::new();
+                    for (part, stale) in by_part {
+                        let path = format!("/api/parts/{}", crate::plm::identity::segment(&part));
+                        let answer = client.call("GET", &path, None).await.map_err(|e| e.to_string())?;
+                        let view: serde_json::Value = serde_json::from_slice(&answer.body).map_err(|e| e.to_string())?;
+                        let Some((revision, label)) = current_release(&view) else {
+                            // Nothing of it is released now: no update to
+                            // offer, but the user is told (`current_key` empty).
+                            for (key, entry) in stale {
+                                out.push(Superseded {
+                                    key,
+                                    current_key: String::new(),
+                                    number: entry.part_number.clone(),
+                                    from: entry.revision_label.clone(),
+                                    lifecycle: entry.lifecycle.clone(),
+                                    to: String::new(),
+                                    text: String::new(),
+                                    paths: Vec::new(),
+                                });
+                            }
+                            continue;
+                        };
+                        let current_key = crate::plm::identity::document_key(&part, &revision);
+                        let Some(bytes) = client.get_document(&current_key).await.map_err(|e| e.to_string())? else { continue };
+                        let text = String::from_utf8(bytes).map_err(|e| e.to_string())?;
+                        for (key, entry) in stale {
+                            if key == current_key {
+                                continue;
+                            }
+                            out.push(Superseded {
+                                key,
+                                current_key: current_key.clone(),
+                                number: entry.part_number.clone(),
+                                from: entry.revision_label.clone(),
+                                lifecycle: entry.lifecycle.clone(),
+                                to: label.clone(),
+                                text: text.clone(),
+                                paths: Vec::new(),
+                            });
+                        }
+                    }
+                    Ok(out)
+                })),
+            );
+        }
+        let answered: Vec<(u64, Result<Vec<Superseded>, String>)> =
+            self.pending.iter_mut().filter_map(|(id, pending)| pending.poll(waker).map(|answer| (*id, answer))).collect();
+        for (id, answer) in answered {
+            self.pending.remove(&id);
+            let Some(doc) = docs.iter_mut().find(|d| d.id() == id) else { continue };
+            let mut found = match answer {
+                Ok(found) => found,
+                Err(problem) => {
+                    doc.engine.push_notice(format!("Could not check this assembly's PLM revisions: {problem}"));
+                    continue;
+                }
+            };
+            let Ok(document) = serde_json::from_str::<serde_json::Value>(&doc.engine.history.request_json()) else { continue };
+            // Named by where they are PLACED: an entry no occurrence shows (a
+            // Replace inside a sub-assembly leaves the old one behind) is not used.
+            for item in &mut found {
+                let mut names: Vec<String> = Vec::new();
+                for placement in crate::plm::superseded::occurrences_of(&document, &item.key) {
+                    let name = placement.name();
+                    if !names.contains(&name) {
+                        names.push(name);
+                    }
+                }
+                item.paths = names;
+            }
+            found.retain(|item| !item.paths.is_empty());
+            // A part with no released revision has nothing to update to.
+            let (retired, rest): (Vec<Superseded>, Vec<Superseded>) = found.into_iter().partition(|item| item.current_key.is_empty());
+            found = rest;
+            for item in &retired {
+                doc.engine.push_notice_as(
+                    brep_render::engine_state::NoticeSeverity::Warning,
+                    format!(
+                        "{}: {} uses {} rev {}, and no revision of it is released now: replace it with another part, or have a revision of it released",
+                        item.paths.join(", "),
+                        item.number,
+                        item.lifecycle,
+                        item.from
+                    ),
+                );
+            }
+            if found.is_empty() {
+                continue;
+            }
+            // Only a draft no one else holds may change; a released assembly
+            // (or one in review, or held by someone else) keeps its revisions
+            // by design and is told how to move on.
+            let own_key = doc.name().and_then(revision_key_of);
+            // A revision this check made (a draft, checked out to this user) may
+            // not be in the index yet: it is editable, and the user chose it.
+            let made_here = own_key.as_ref().is_some_and(|k| self.auto.contains(k));
+            let own = own_key.as_ref().and_then(|key| store.plm_revision(key));
+            let keeps = match &own {
+                _ if made_here => None,
+                Some(e) if e.lifecycle == "draft" && (e.locked_by.is_none() || e.locked_by_me) => None,
+                Some(e) if e.lifecycle == "draft" => Some(format!("it is checked out by {}", e.locked_by.clone().unwrap_or_default())),
+                Some(e) => Some(format!("it is {}", e.lifecycle)),
+                None => Some("its PLM revision could not be read".to_string()),
+            };
+            for item in &found {
+                let tail = keeps.as_ref().map_or(String::new(), |why| {
+                    format!(". This assembly keeps rev {} ({why}); make a new revision of it to use rev {}", item.from, item.to)
+                });
+                doc.engine.push_notice_as(
+                    brep_render::engine_state::NoticeSeverity::Warning,
+                    format!("{}: {} uses {} rev {}; {} is current{tail}", item.paths.join(", "), item.number, item.lifecycle, item.from, item.to),
+                );
+            }
+            match &keeps {
+                // A revision the user made to move on: no second question.
+                None if own_key.as_ref().is_some_and(|k| self.auto.remove(k)) => apply_now.push(id),
+                None => {
+                    self.asking.insert(id);
+                }
+                Some(why) => {
+                    self.keeps.insert(id, why.clone());
+                }
+            }
+            self.found.insert(id, found);
+        }
+        for id in apply_now {
+            self.answer(docs, store, id, true);
+        }
+    }
+
+    /// Why document `id` keeps its stale revisions (it is released, or held by
+    /// someone else), when it does.
+    pub fn keeps(&self, id: u64) -> Option<&str> {
+        self.keeps.get(&id).map(String::as_str).filter(|_| !self.found(id).is_empty())
+    }
+
+    pub fn creating(&self, id: u64) -> bool {
+        self.creating.contains_key(&id)
+    }
+
+    /// The opt-in way on from a document that keeps its revisions: make its
+    /// next revision (a draft, checked out to this user) holding the document
+    /// as it is, open it, and update the stale copies there; the user saves it.
+    pub fn make_new_revision(&mut self, client: &Rc<PlmClient>, docs: &crate::document::Documents, id: u64) {
+        if self.creating.contains_key(&id) {
+            return;
+        }
+        let Some(doc) = docs.iter().find(|d| d.id() == id) else { return };
+        let Some((part, _)) = doc.name().and_then(crate::panels::plm_host::revision_of) else { return };
+        let text = doc.engine.history_request_json();
+        let client = client.clone();
+        self.creating.insert(
+            id,
+            Pending::new(Box::pin(async move {
+                let key = crate::panels::plm_parts::save_as_new_revision(&client, &part, "", &text).await?;
+                Ok((key, text))
+            })),
+        );
+    }
+
+    /// The revisions made since the last call, to open, with the document each came from.
+    pub fn take_opened(&mut self) -> Vec<(u64, String)> {
+        std::mem::take(&mut self.opened)
+    }
+
+    /// The stale revisions found in document `id`.
+    pub fn found(&self, id: u64) -> &[Superseded] {
+        self.found.get(&id).map_or(&[], Vec::as_slice)
+    }
+
+    pub fn asking(&self, id: u64) -> bool {
+        self.asking.contains(&id) && !self.found(id).is_empty()
+    }
+
+    /// The answer for document `id`: `true` replaces every stale placement with
+    /// the current release (top-level ones through Replace, ones inside a
+    /// sub-assembly through its definition, so mates are kept as Replace keeps
+    /// them); `false` leaves it (the mark stays).
+    pub fn answer(&mut self, docs: &mut crate::document::Documents, store: &dyn ModelStore, id: u64, update: bool) {
+        use crate::panels::replace_component::{replace, replace_nested, ReplaceSource};
+        self.asking.remove(&id);
+        if !update {
+            return;
+        }
+        let Some(found) = self.found.remove(&id) else { return };
+        let Some(doc) = docs.iter_mut().find(|d| d.id() == id) else { return };
+        for item in &found {
+            store.remember_saved_document(&store.canonical_identity(&item.current_key), &item.text);
+            let Ok(document) = serde_json::from_str::<serde_json::Value>(&doc.engine.history.request_json()) else { continue };
+            let placements = crate::plm::superseded::occurrences_of(&document, &item.key);
+            let source = ReplaceSource::Stored(item.current_key.clone());
+            let top: Vec<String> = placements.iter().filter(|p| p.owners.is_empty()).map(|p| p.path.clone()).collect();
+            let mut result = Ok(());
+            if !top.is_empty() {
+                result = replace(&mut doc.engine, store, &top, &source).map(|_| ());
+            }
+            // Inside sub-assemblies: each defining chain once (it edits the
+            // definition, which every placement of that sub-assembly shows).
+            let mut chains: Vec<&Vec<String>> = Vec::new();
+            for placement in placements.iter().filter(|p| !p.owners.is_empty()) {
+                if result.is_err() || chains.contains(&&placement.owners) {
+                    continue;
+                }
+                chains.push(&placement.owners);
+                result = replace_nested(&mut doc.engine, store, &placement.path, &source, true).map(|_| ());
+            }
+            match result {
+                Ok(()) => {
+                    self.updated += 1;
+                    doc.engine.push_notice_as(
+                        brep_render::engine_state::NoticeSeverity::Info,
+                        format!("{}: {} updated from rev {} to rev {}", item.paths.join(", "), item.number, item.from, item.to),
+                    );
+                }
+                Err(problem) => doc.engine.push_notice(format!("{}: could not update {} to rev {}: {problem}", item.paths.join(", "), item.number, item.to)),
+            }
+        }
+    }
+
+    pub fn busy(&self) -> bool {
+        !self.pending.is_empty() || !self.creating.is_empty()
+    }
+
+    pub fn state_json(&self, id: u64) -> serde_json::Value {
+        serde_json::json!({
+            "checked": self.checked.contains(&id) && !self.pending.contains_key(&id),
+            "superseded": self.found(id).iter().map(|s| serde_json::json!({
+                "paths": s.paths, "number": s.number, "from": s.from, "lifecycle": s.lifecycle, "to": s.to,
+            })).collect::<Vec<_>>(),
+            "asking": self.asking(id),
+            "keeps": self.keeps(id),
+            "creating": self.creating(id),
+            "updated": self.updated,
+            "reads": self.reads,
+        })
+    }
+}
+

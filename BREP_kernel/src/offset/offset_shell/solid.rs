@@ -221,10 +221,10 @@ fn outward_normal_at(face: &FaceRecord, point: Vec3) -> Result<Vec3, KernelRefus
 /// (positive inward).
 ///
 /// This is the lane `offset_shell` falls back to when its direct construction
-/// refuses by one of its own names ([`direct_refusal_takes_the_boolean_lane`]);
+/// refuses by one of its own names (`direct_refusal_takes_the_boolean_lane`);
 /// it is public so the two can be compared on any fixture. The result's
 /// `face_images` are read back from the operands by surface
-/// ([`provenance_by_surface`]): `Offset` for a face of the body's skins,
+/// (`provenance_by_surface`): `Offset` for a face of the body's skins,
 /// `Wall` for a held opening face, `Source` for a face of the source.
 pub fn offset_shell_by_boolean(
     source: &BrepSolid,

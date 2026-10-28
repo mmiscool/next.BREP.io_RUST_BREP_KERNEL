@@ -41,7 +41,7 @@ pub fn parse_css_hex(value: &str) -> Option<[f32; 3]> {
 
 /// The sketcher's overlay palette as plain `0xRRGGBB` hex — the ONE place the
 /// default color literals live. [`RenderSettings`] stores each of these as an
-/// editable [`Rgba`] field (defaults derived from here via [`hex`]) and hands the
+/// editable [`Rgba`] field (defaults derived from here via `hex`) and hands the
 /// sketch tessellation/overlay builders a live `SketchColors` view via
 /// [`RenderSettings::sketch_colors`], so the sketch renderer reads its colors from
 /// the display settings just like faces/edges/vertices do — no scattered constants.
@@ -170,12 +170,15 @@ pub struct RenderSettings {
     /// following the OS light/dark preference.
     pub theme: ThemeMode,
     /// Global UI size scale applied to the whole egui chrome via
-    /// [`egui::Context::set_zoom_factor`]. 1.0 = native size; composes with the
+    /// `egui::Context::set_zoom_factor`. 1.0 = native size; composes with the
     /// device pixel ratio. Clamped to `[0.5, 3.0]`.
     pub ui_scale: f32,
     /// Skip the startup recovery offer without restoring documents automatically.
     /// Autosaving remains enabled for the current session.
     pub disable_recovery_prompt: bool,
+    /// Open on an empty document instead of the example model (the Box / Pin /
+    /// Cut seed) when the application starts.
+    pub disable_startup_model: bool,
     /// Size multiplier for the floating TEXT LABELS the app overlays on the 3D
     /// model — the dimension-gizmo value chips (sketch + feature dimensions), the
     /// assembly-constraint chips, and the transform gizmo's axis letters. 1.0 = the
@@ -275,7 +278,7 @@ pub struct RenderSettings {
     /// On-screen edge length of the always-on corner ViewCube, in CSS px. Drives
     /// BOTH the rendered mini-camera viewport AND the hit-test corner rect (they
     /// read the same value), so the cube and its clickable region scale together.
-    /// Defaults to [`ViewCube::DEFAULT_SIZE_PX`], so the cube is unchanged until edited.
+    /// Defaults to [`ViewCube::DEFAULT_SIZE_PX`](brep_gizmos::view_cube::ViewCube::DEFAULT_SIZE_PX), so the cube is unchanged until edited.
     pub viewcube_size_px: f32,
     pub pick_double_sided: bool,
     /// How a plain viewport click builds a multi-selection (see [`MultiSelectMode`]).
@@ -343,6 +346,7 @@ impl Default for RenderSettings {
             // 1.0 = native UI size (no zoom); scales the whole egui chrome.
             ui_scale: 1.0,
             disable_recovery_prompt: false,
+            disable_startup_model: false,
             // 1.0 = the labels' native monospace size (no scaling).
             label_scale: 1.0,
             // Debug grab-handle outlines are off by default (a diagnostic aid).
@@ -517,6 +521,9 @@ impl RenderSettings {
         if let Some(v) = value.get("disableRecoveryPrompt").and_then(|v| v.as_bool()) {
             self.disable_recovery_prompt = v;
         }
+        if let Some(v) = value.get("disableStartupModel").and_then(|v| v.as_bool()) {
+            self.disable_startup_model = v;
+        }
         // Model-overlay label size. Clamped to the SAME [0.25, 3.0] domain the
         // settings slider offers, so a persisted value never silently re-clamps on
         // reload (the `viewcubeSizePx` rule).
@@ -609,7 +616,7 @@ impl RenderSettings {
     }
 
     /// Serialize EVERY setting to the SAME camelCase / CSS-hex shape
-    /// [`apply_json`] reads, so `s.apply_json(&s.to_json())` is the identity.
+    /// [`apply_json`](Self::apply_json) reads, so `s.apply_json(&s.to_json())` is the identity.
     /// This is the counterpart the settings schema serializes/persists through
     /// (there was previously no serializer, only the partial-override reader).
     pub fn to_json(&self) -> String {
@@ -621,6 +628,7 @@ impl RenderSettings {
             },
             "uiScale": self.ui_scale as f64,
             "disableRecoveryPrompt": self.disable_recovery_prompt,
+            "disableStartupModel": self.disable_startup_model,
             "labelScale": self.label_scale as f64,
             "debugGrabHandles": self.debug_grab_handles,
             "background": rgb_to_css_hex(self.background),
@@ -675,7 +683,7 @@ impl RenderSettings {
     /// overlay builders read their colors from THIS (via
     /// [`crate::sketch::SketchSession::colors`]) so the display settings are the one
     /// source of truth. Each `Rgba` is quantized back to `0xRRGGBB` the SAME way
-    /// [`rgb_to_css_hex`] serializes it, so a default settings value round-trips to
+    /// `rgb_to_css_hex` serializes it, so a default settings value round-trips to
     /// the default `SketchColors` byte-exact.
     pub fn sketch_colors(&self) -> SketchColors {
         SketchColors {
@@ -696,7 +704,7 @@ impl RenderSettings {
     /// The settings schema WITH the current value baked into each field, as JSON
     /// — mirrors the kernel's `feature_schemas_json` export so a UI shell (egui
     /// here, a later `brep-ui` crate) can generate the whole form from data. The
-    /// `value` of each field is pulled live from [`to_json`], so the export
+    /// `value` of each field is pulled live from [`to_json`](Self::to_json), so the export
     /// always reflects the current settings.
     pub fn settings_schema_json(&self) -> String {
         let current: serde_json::Value =
@@ -945,6 +953,12 @@ pub fn settings_schema() -> Vec<SettingsField> {
             "Startup",
             FieldKind::Bool,
         ),
+        f(
+            "disableStartupModel",
+            "Start with an empty document (no example model)",
+            "Startup",
+            FieldKind::Bool,
+        ),
         // --- Scene ---------------------------------------------------------
         f("background", "Background", "Scene", FieldKind::Color),
         f(
@@ -1063,7 +1077,7 @@ pub struct VertexRef {
 /// That is not cosmetic: an assembly Distance takes element 0 as its BASE face,
 /// whose outward normal gives the value its sign and the arrow its direction,
 /// so the same two picks could seed opposite constraints in two runs. Every
-/// reader of the selection — [`EngineState::selection_json`], the context bar's
+/// reader of the selection — [`EngineState::selection_json`](crate::engine_state::EngineState::selection_json), the context bar's
 /// feature offers, the constraint seeder — now sees the picks in the order they
 /// were made.
 ///

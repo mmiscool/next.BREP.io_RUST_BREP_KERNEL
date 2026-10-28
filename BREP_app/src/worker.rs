@@ -18,7 +18,7 @@ use std::rc::Rc;
 
 use brep_render::brep_kernel::HistoryRequest;
 use brep_render::runner::{
-    Command, HistoryRunner, MeasureQuery, MeasureReply, MeshImportReply, MeshImportRequest, Reply,
+    CamJob, CamProgress, CamReply, CamSimJob, CamSimProgress, CamSimReply, Command, HistoryRunner, MeasureQuery, MeasureReply, MeshImportReply, MeshImportRequest, Reply,
     RunProgress, RunReply, SheetLinesReply, SheetLinesRequest, StepProbeReply, StepProbeRequest,
     TopologyReply, TopologyRequest, PluginActionRequest, PluginActionReply, PluginInstallRequest, PluginInstallReply,
 };
@@ -51,6 +51,11 @@ pub struct WorkerRunner {
     topology_buf: VecDeque<TopologyReply>,
     /// Answered sheet exact passes awaiting the engine pump.
     sheet_lines_buf: VecDeque<SheetLinesReply>,
+    /// Completed CAM generations and their progress awaiting the engine pump.
+    cam_buf: VecDeque<CamReply>,
+    cam_progress_buf: VecDeque<CamProgress>,
+    cam_sim_buf: VecDeque<CamSimReply>,
+    cam_sim_progress_buf: VecDeque<CamSimProgress>,
     /// Progress reports of the in-flight run, oldest first (`poll_progress`
     /// keeps the newest).
     progress_buf: VecDeque<RunProgress>,
@@ -105,6 +110,10 @@ impl WorkerRunner {
             step_probe_buf: VecDeque::new(),
             topology_buf: VecDeque::new(),
             sheet_lines_buf: VecDeque::new(),
+            cam_buf: VecDeque::new(),
+            cam_progress_buf: VecDeque::new(),
+            cam_sim_buf: VecDeque::new(),
+            cam_sim_progress_buf: VecDeque::new(),
             progress_buf: VecDeque::new(),
             in_flight: false,
             pending_run: None,
@@ -163,7 +172,13 @@ impl WorkerRunner {
                 Reply::StepProbe(reply) => self.step_probe_buf.push_back(reply),
                 Reply::Topology(reply) => self.topology_buf.push_back(reply),
                 Reply::SheetLines(reply) => self.sheet_lines_buf.push_back(reply),
+                Reply::CamGenerate(reply) => self.cam_buf.push_back(reply),
+                Reply::CamProgress(progress) => self.cam_progress_buf.push_back(progress),
+                Reply::CamSimulate(reply) => self.cam_sim_buf.push_back(reply),
+                Reply::CamSimProgress(progress) => self.cam_sim_progress_buf.push_back(progress),
                 Reply::Progress(progress) => self.progress_buf.push_back(progress),
+                // Never posted by a worker (the copy holds kernel solids).
+                Reply::SessionExport { .. } => {}
                 Reply::NeedPartsLibrary => {
                     // The worker dropped (or never had) the library this run
                     // needs and did NOT run. Clear the in-flight flag (no run
@@ -347,6 +362,50 @@ impl HistoryRunner for WorkerRunner {
         self.sheet_lines_buf.pop_front()
     }
 
+    fn submit_cam(&mut self, job: CamJob) -> bool {
+        // One operation per job; the engine submits the next when this one
+        // answers, so a cancel between operations never reaches the worker.
+        self.post(&Command::CamGenerate(job)).is_ok()
+    }
+
+    fn poll_cam(&mut self) -> Option<CamReply> {
+        self.drain();
+        self.cam_buf.pop_front()
+    }
+
+    fn poll_cam_progress(&mut self) -> Option<CamProgress> {
+        self.drain();
+        let latest = self.cam_progress_buf.pop_back();
+        self.cam_progress_buf.clear();
+        latest
+    }
+
+    fn submit_cam_sim(&mut self, job: CamSimJob) -> bool {
+        // Bounded chunks: the main side submits the next when this one
+        // answers, so a cancel between chunks is immediate in the browser.
+        self.post(&Command::CamSimulate(job)).is_ok()
+    }
+
+    fn poll_cam_sim(&mut self) -> Option<CamSimReply> {
+        self.drain();
+        self.cam_sim_buf.pop_front()
+    }
+
+    fn poll_cam_sim_progress(&mut self) -> Option<CamSimProgress> {
+        self.drain();
+        let latest = self.cam_sim_progress_buf.pop_back();
+        self.cam_sim_progress_buf.clear();
+        latest
+    }
+
+    // `cancel_cam_sim` keeps the trait's default for the same reason as
+    // `cancel_cam`: a chunk in flight finishes and its reply is dropped.
+
+    // `cancel_cam` keeps the trait's default: a worker inside a synchronous
+    // job cannot read a message, so the job finishes and the engine drops its
+    // reply (the cancel is immediate between operations, which is where the
+    // engine submits them).
+
     fn poll_progress(&mut self) -> Option<RunProgress> {
         self.drain();
         let latest = self.progress_buf.pop_back();
@@ -455,9 +514,8 @@ pub fn worker_entry() {
             // is delivered to the main thread while the worker stays busy, so
             // the UI can name the feature it is waiting on. Never asks the
             // run to stop — cancel terminates this worker instead.
-            let mut progress = |report: RunProgress| {
-                let json = serde_json::to_string(&Reply::Progress(report))
-                    .expect("serialize worker progress");
+            let mut progress = |reply: Reply| {
+                let json = serde_json::to_string(&reply).expect("serialize worker progress");
                 let _ = scope_reply.post_message(&JsValue::from_str(&json));
                 true
             };

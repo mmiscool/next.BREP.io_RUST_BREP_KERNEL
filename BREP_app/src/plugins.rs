@@ -116,6 +116,9 @@ pub struct PluginsPanel {
     synced: std::collections::HashMap<u64, String>,
     pub(crate) active_document: u64,
     pending_install: Option<(u64, u64, Vec<InstalledBundle>)>,
+    /// A package's Export asked: the shell hands these to the file dialog's
+    /// export door ([`Self::take_save_requests`]), which on desktop asks where.
+    exports: Vec<crate::panels::file::SaveRequest>,
 }
 struct ActionForm {
     id: String,
@@ -158,6 +161,7 @@ impl PluginsPanel {
             synced: Default::default(),
             active_document: 0,
             pending_install: None,
+            exports: Vec::new(),
         }
     }
 
@@ -418,6 +422,12 @@ impl PluginsPanel {
         }
     }
 
+    /// The bundles Export asked to save, once: the shell hands them to
+    /// [`crate::panels::file::FileDialog::request_save_file`].
+    pub fn take_save_requests(&mut self) -> Vec<crate::panels::file::SaveRequest> {
+        std::mem::take(&mut self.exports)
+    }
+
     pub fn show(&mut self, ctx: &egui::Context, engine: &mut EngineState, store: &dyn ModelStore) {
         let mut open = self.open;
         egui::Window::new("Plugins").open(&mut open).default_width(560.0).default_pos(crate::panels::below_chrome(ctx, 400.0, 0.0)).show(ctx, |ui| {
@@ -458,7 +468,7 @@ impl PluginsPanel {
                         if ui.button("Use in document").clicked() { if let Err(e) = engine.select_plugin(&package.id, &package.digest) { self.error = Some(e); } }
                         if ui.button("Migrate document").clicked() { if let Err(e) = engine.migrate_plugin(&package.id, &package.digest) { self.error = Some(e); } }
                         if ui.button("Reload stored bytes").clicked() { if let Err(e) = self.queue_install(engine, installed.clone()) { self.error = Some(e); } }
-                        if ui.button("Export").clicked() { if let Err(e) = store.export_file_named(&format!("{}-{}.brep-plugin.json", package.id.replace('/', "_"), package.version), &package.bytes) { self.error = Some(e); } }
+                        if ui.button("Export").clicked() { self.exports.push(crate::panels::file::SaveRequest::text("Export the plugin bundle", format!("{}-{}.brep-plugin.json", package.id.replace('/', "_"), package.version), package.bytes.clone())); }
                         if ui.button("Remove").clicked() { self.change(engine, store, package, None); }
                     });
                 });

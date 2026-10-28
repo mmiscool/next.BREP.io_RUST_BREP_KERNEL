@@ -4,9 +4,9 @@
 //!
 //! Two callers ride it: the update-components batch
 //! ([`crate::panels::update_components`]), which pulls a changed source file
-//! into every instance, and the BOM's part-attribute edits
-//! ([`crate::panels::bom`]), which change a part document in place and must
-//! reach that part's file. A second copy of either rule is exactly the drift
+//! into every instance, and the assembly's Save
+//! ([`crate::document::owned_save`]), which writes every part and
+//! sub-assembly the assembly changed back to its own file. A second copy of either rule is exactly the drift
 //! this module exists to prevent.
 //!
 //! # The refresh lane — document transport, not a UI-side kernel call
@@ -26,14 +26,14 @@
 //!
 //! # WRITE-THROUGH — saving an edited part back to its SOURCE file
 //!
-//! Changing a part document in the assembly is an IN-MEMORY update; on its own
-//! it persists only if the user then saves the ASSEMBLY, leaving the part's
+//! Changing a part document in the assembly is an IN-MEMORY update; without
+//! this lane it would persist only in the ASSEMBLY, leaving the part's
 //! `.nbrep` silently behind (and — because [`crate::panels::update_components`]
 //! compares the store's content against the entry's `sourceSignature` — badging
 //! the component "outdated" against a file it is actually NEWER than).
-//! [`write_through`] writes the edited part document back to the `sourceKey` it
+//! `write_through` writes the edited part document back to the `sourceKey` it
 //! came from, so the entry's signature and the file agree and the badge stays
-//! dark. Six lanes:
+//! dark. Seven lanes (each reported as a `WriteOutcome`):
 //!
 //! * **embedded-only** (`sourceKey: ""`): no file exists to write back to.
 //!   Skipped SILENTLY. This used to be EVERY STEP-imported part; a STEP import
@@ -58,6 +58,8 @@
 //!   backend's error. (A WRITE-BEHIND backend can also fail LATER; that lands
 //!   in `ModelStore::take_persistence_errors`, which the shell already drains
 //!   into the toast overlay every frame.)
+//! * **already there**: the file already holds the edit (it was saved from
+//!   its own tab): nothing is written and nothing is said.
 //! * **written**: a notice naming the part AND the file, so the side effect on
 //!   a document shared by other assemblies is visible rather than hidden.
 
@@ -95,12 +97,43 @@ pub fn refresh_library_entry(
 ) -> Result<Vec<String>, String> {
     let document: serde_json::Value = serde_json::from_str(document_json)
         .map_err(|error| format!("part document unreadable: {error}"))?;
+    refresh_library_entry_value(assembly, part_name, document)
+}
+
+/// [`refresh_library_entry`] for a caller that holds the document as a value
+/// (a Work part push re-signs every sub-assembly above the edited part).
+/// Nothing is printed or parsed again, and an assembly with no eCAD sheet is
+/// edited in place: there is no sheet snapshot to follow, so neither the
+/// copy of the whole assembly nor the device walk is needed. (On l500 a push
+/// re-signed 5 modules: 5 copies of the assembly and their device walks,
+/// ~100 ms of every Work part edit.)
+pub fn refresh_library_entry_value(
+    assembly: &mut serde_json::Value,
+    part_name: &str,
+    document: serde_json::Value,
+) -> Result<Vec<String>, String> {
     if !document.is_object() {
         return Err("part document unreadable: not a JSON object".to_string());
     }
+    let signature = format!("{:016x}", brep_render::brep_kernel::stable_json_hash(&document));
+    let sheets = ["diagram", "pcb"].iter().any(|block| assembly.get(*block).is_some_and(|v| !v.is_null()));
+    if !sheets {
+        let entry = match assembly["partsLibrary"].get_mut(part_name) {
+            Some(entry) if entry.is_object() => entry,
+            _ => return Err(format!("no parts-library entry '{part_name}'")),
+        };
+        let old = std::mem::take(&mut entry["document"]);
+        let rebuild = !brep_render::brep_kernel::same_build(&old, &document);
+        brep_render::brep_kernel::follow_saved_rows_known(entry, &old, &document, !rebuild);
+        entry["document"] = document;
+        entry["sourceSignature"] = serde_json::Value::String(signature);
+        if rebuild {
+            entry["snapshot"] = serde_json::Value::String(String::new());
+        }
+        return Ok(Vec::new());
+    }
     let mut draft = assembly.clone();
     let old = draft["partsLibrary"][part_name]["document"].clone();
-    let signature = document_signature(document_json);
     // The entry goes in FIRST: the snapshot refresh walks the assembly to find
     // what version each component's own device now carries, and at depth that
     // device lives inside this very entry. A walk of the pre-edit tree would
@@ -108,6 +141,8 @@ pub fn refresh_library_entry(
     match draft["partsLibrary"].get_mut(part_name) {
         Some(entry) if entry.is_object() => {
             let rebuild = !brep_render::brep_kernel::same_build(&old, &document);
+            // Save writes this block: its saved rows follow a same build.
+            brep_render::brep_kernel::follow_saved_rows_known(entry, &old, &document, !rebuild);
             entry["document"] = document;
             entry["sourceSignature"] = serde_json::Value::String(signature);
             if rebuild {
@@ -151,11 +186,11 @@ pub(crate) fn write_through(
     part_name: &str,
     target: Option<&(String, String)>,
     edited: &str,
-) {
+) -> WriteOutcome {
     // Embedded-only (no source document): no write, no notice — nothing changed
     // for it, so nothing to report.
     let Some((source_key, inserted_signature)) = target else {
-        return;
+        return WriteOutcome::Unchanged;
     };
     let current = crate::store::read_now(store, source_key);
     let crate::store::ReadNow::Ready(current) = current else {
@@ -166,13 +201,13 @@ pub(crate) fn write_through(
                 "Source '{source_key}' is still loading — '{part_name}' updated in this document only; \
                  edit it again once it has loaded to write the part"
             ));
-            return;
+            return WriteOutcome::Refused("still loading".into());
         }
         state.push_notice_as(NoticeSeverity::Warning, format!(
             "Source '{source_key}' is no longer in storage — \
              '{part_name}' updated in this document only, the file was NOT written"
         ));
-        return;
+        return WriteOutcome::Refused("no longer in storage".into());
     };
     // A FAMILY MEMBER is the family's output: writing an edit into it is a
     // hand edit the next Generate would silently undo, so it is refused here
@@ -187,22 +222,54 @@ pub(crate) fn write_through(
              '{part_name}' updated in this document only (change the family, or save the part as a new part)",
             source.part_number, source.family
         ));
-        return;
+        return WriteOutcome::Refused(format!("member of the family '{}'", source.family));
     }
-    if document_signature(&current) != *inserted_signature {
+    let on_disk = document_signature(&current);
+    // This session's own last write of it never reached the store: what the
+    // store shows is either that write or the older document, never someone
+    // else's newer one, so write it again.
+    let ours = store.write_failed(source_key);
+    // The file already holds the edit (saved from its own tab): nothing to do.
+    if on_disk == document_signature(edited) && !ours {
+        return WriteOutcome::Unchanged;
+    }
+    if on_disk != *inserted_signature && !ours {
         state.push_notice_as(NoticeSeverity::Warning, format!(
             "Source '{source_key}' changed since this document last synced '{part_name}' — \
              NOT overwritten; your edit is held here (Update Components takes the file's version instead)"
         ));
-        return;
+        return WriteOutcome::Refused("changed on disk since this assembly loaded it".into());
     }
-    match store.write(source_key, edited) {
-        Ok(()) => state.push_notice_as(NoticeSeverity::Info, format!("Saved '{part_name}' to '{source_key}'")),
-        Err(error) => state.push_notice(format!(
-            "Could not save '{source_key}': {error} — \
-             '{part_name}' updated in this document only"
-        )),
+    // A retry of this session's failed write goes only over the document that
+    // write was based on: the server refuses it if someone saved a newer one
+    // meanwhile (the failure then says who, and the next Save asks).
+    let written = match store.failed_write_base(source_key).filter(|base| ours && !base.is_empty()) {
+        Some(base) => store.write_if(source_key, edited, &base),
+        None => store.write(source_key, edited),
+    };
+    match written {
+        Ok(()) => {
+            state.push_notice_as(NoticeSeverity::Info, crate::document::owned_save::saved_notice(part_name, source_key));
+            WriteOutcome::Written
+        }
+        Err(error) => {
+            state.push_notice(format!(
+                "Could not save '{source_key}': {error} — \
+                 '{part_name}' updated in this document only"
+            ));
+            WriteOutcome::Refused(format!("write failed: {error}"))
+        }
     }
+}
+
+/// What [`write_through`] did with one source document.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum WriteOutcome {
+    Written,
+    /// Nothing to write: embedded-only, or the file already holds the edit.
+    Unchanged,
+    /// Not written; the edit stays in the assembly. The short reason.
+    Refused(String),
 }
 
 /// The ONE signature fn, re-exported from its engine-altitude home

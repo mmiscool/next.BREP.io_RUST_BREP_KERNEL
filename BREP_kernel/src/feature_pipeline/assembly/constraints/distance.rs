@@ -13,15 +13,15 @@
 //! Measurement classification: planes stay planes; straight edges and
 //! cylindrical/conical faces measure on their INFINITE carrier lines; circular
 //! edges and spheres from their CENTERS; vertices and whole components from
-//! their points. A new constraint adopts the current (signed) separation on
-//! first solve.
+//! their points. A new constraint created without a `distance` adopts the
+//! current (signed) separation on first solve; one created with it drives there.
 
 use super::super::mapping::{
     effective_align, first_solve_target, line_line_distance, local_point, mate,
     point_line_distance, require_axis, require_direction, require_plane, ConstraintFailure,
     MappedConstraint, ResolvedElement,
 };
-use super::{elements_field, id_field, pair_applicable, schema_entry, ConstraintTypeDef};
+use super::{elements_field, id_field, limit_fields, pair_applicable, schema_entry, ConstraintTypeDef};
 use crate::feature_pipeline::assembly::ConstraintEntry;
 use crate::feature_pipeline::{Env, SelectionProbe};
 use crate::{MateKind, SelectionGeometry, Vec3};
@@ -44,7 +44,7 @@ fn applicable(probe: &SelectionProbe) -> bool {
 }
 
 pub(super) fn schema() -> serde_json::Value {
-    schema_entry(&DEF, serde_json::json!({
+    let mut params = serde_json::json!({
         "id": id_field(),
         "elements": elements_field(&["FACE", "VERTEX", "EDGE"], 2, 2,
             "Select two elements to hold at a distance"),
@@ -52,14 +52,18 @@ pub(super) fn schema() -> serde_json::Value {
             "type": "number",
             "step": 0.1,
             "default_value": 0,
-            "hint": "Signed target: offset along the base face's outward normal (negative = the opposite side); pairings without a face use the magnitude. A new constraint adopts the current separation"
+            "hint": "Signed target: offset along the base face's outward normal (negative = the opposite side); pairings without a face use the magnitude. A new constraint given no value adopts the current separation"
         },
         "opposeNormals": {
             "type": "boolean",
             "default_value": false,
             "hint": "Face-face mode: flip the second face's normal before alignment"
         },
-    }))
+    });
+    for (key, field) in limit_fields("mm", 0.1, 10.0) {
+        params[key] = field;
+    }
+    schema_entry(&DEF, params)
 }
 
 pub(in crate::feature_pipeline::assembly) fn map(
@@ -100,8 +104,9 @@ pub(in crate::feature_pipeline::assembly) fn map(
         // FACE/FACE: the SIGNED offset of plane B along plane A's outward
         // normal — `d = (P_b − P_a)·n̂_a`, exactly what the mate's residual
         // measures, so the authored target maps through verbatim (negative =
-        // plane B behind face A). First solve adopts the current SIGNED
-        // separation — honest about the side, and satisfied without motion.
+        // plane B behind face A). First solve, given no `distance`, adopts the
+        // current SIGNED separation — honest about the side, and satisfied
+        // without motion; a `distance` given at creation drives.
         (Side::Plane, Side::Plane) => {
             let (wa, _) = require_direction(a)?;
             let (wb, _) = require_direction(b)?;

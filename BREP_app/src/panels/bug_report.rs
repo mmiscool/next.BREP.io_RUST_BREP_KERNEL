@@ -8,7 +8,7 @@
 //!   * a user **description** (+ an optional email), and
 //!   * the session's **diagnostics** — which renderer is actually in use and
 //!     what it is running on, appended to the description (see
-//!     [`compose_description`] for why they travel inside that field),
+//!     `compose_description` for why they travel inside that field),
 //! then POSTs them to the public reports endpoint (`next.brep.io/api/report`).
 //! ONE code path runs on both native and wasm.
 //!
@@ -18,9 +18,9 @@
 //! frame — see [`crate::viewport`]). We must not let the dialog appear in that
 //! frame, so the flow is a small state machine:
 //!   1. Button click → snapshot the model, send `ViewportCommand::Screenshot`,
-//!      enter [`Phase::Capturing`]. The dialog is NOT drawn while capturing.
+//!      enter `Phase::Capturing`. The dialog is NOT drawn while capturing.
 //!   2. A later frame delivers `Event::Screenshot`; we encode it to PNG, build a
-//!      preview thumbnail, and enter [`Phase::Editing`] — only NOW is the dialog
+//!      preview thumbnail, and enter `Phase::Editing` — only NOW is the dialog
 //!      drawn, so the captured frame(s) never contain it.
 //!   3. Submit builds a small multipart body by hand (no extra deps) and fires
 //!      it through `ehttp`; the reply marshals back over an mpsc channel +
@@ -186,7 +186,7 @@ impl BugReportPanel {
     }
 
     /// Draw + drive the flow. Called once per frame at ctx level (like the file
-    /// dialog). Idempotent while [`Phase::Idle`].
+    /// dialog). Idempotent while `Phase::Idle`.
     pub fn show(&mut self, ctx: &egui::Context, state: &mut EngineState) {
         self.hits.clear();
 
@@ -711,7 +711,7 @@ fn push_file_field(
 
 /// The hit keys this panel publishes (see `automation::hit_keys`).
 pub static HIT_KEYS: &[HitKeyDoc] = &[
-    HitKeyDoc { panel: "bug", prefix: "markup:", meaning: "screenshot markup toggle, pen/arrow/rectangle tools, image drawing area, undo and clear", command: None },
+    HitKeyDoc { panel: "bug", prefix: "markup:", meaning: "screenshot markup toggle, markup:tool (the pen/arrow/rectangle dropdown; its open entries markup:tool#pen, #arrow, #rectangle), image drawing area, undo and clear", command: None },
     HitKeyDoc { panel: "bug", prefix: "field:description", meaning: "the description field (its visible part; right-click opens its Cut / Copy / Paste menu)", command: None },
     HitKeyDoc { panel: "bug", prefix: "menu:cut", meaning: "cut the description's selection, from its right-click menu (native; disabled in the browser)", command: None },
     HitKeyDoc { panel: "bug", prefix: "menu:copy", meaning: "copy the description's selection, from its right-click menu (native; disabled in the browser)", command: None },

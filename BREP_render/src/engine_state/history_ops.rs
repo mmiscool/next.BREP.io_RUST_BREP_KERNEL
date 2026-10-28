@@ -8,7 +8,7 @@ impl EngineState {
     /// report JSON (`{featureErrors, unresolved, displayErrors}`). Marks dirty.
     ///
     /// A SCENE-ONLY one-shot: it does not touch the engine-owned history document
-    /// and does not run the [`Self::finish_apply`] tail, so it also does not paint
+    /// and does not run the `Self::finish_apply` tail, so it also does not paint
     /// model colours. Callers that need those use [`Self::set_history_json`].
     pub fn run_history_json(&mut self, request_json: &str) -> Result<String, String> {
         let request: HistoryRequest = serde_json::from_str(request_json)
@@ -105,12 +105,25 @@ impl EngineState {
     }
 
     /// Drain every completed run reply and APPLY it — the POLL/APPLY half of the
-    /// M2a seam. Called from [`rerun_history`](Self::rerun_history) for the Inline
+    /// M2a seam. Called from `rerun_history` for the Inline
     /// runner's immediate apply, and once per frame from the app so a future async
     /// runner's completed runs land on the main thread. A reply older than
     /// [`applied_generation`](Self::applied_generation) (a newer run that finished
     /// first) is dropped.
     pub fn pump(&mut self) {
+        self.pump_with(false);
+    }
+
+    /// [`pump`](Self::pump) leaving a run reply, and a refusal asking for the
+    /// parts library, for a later pump: everything else drains. For a
+    /// background document whose library is not installed this frame (see
+    /// [`run_landing`](Self::run_landing)); a reply that arrives meanwhile
+    /// waits for the next frame, which installs the library first.
+    pub fn pump_holding_runs(&mut self) {
+        self.pump_with(true);
+    }
+
+    fn pump_with(&mut self, hold_runs: bool) {
         self.pump_plugin_installations();
         // The runner REFUSED a run because its resident parts library could not
         // serve it (see `Reply::NeedPartsLibrary`). It has already forgotten
@@ -124,7 +137,7 @@ impl EngineState {
         // guard beats relying on that). The guard is tested FIRST because
         // `poll_library_request` CONSUMES the flag — polling it while a resync
         // is already in flight would swallow a second refusal.
-        if !self.library_resync && self.runner.poll_library_request() {
+        if !hold_runs && !self.library_resync && self.runner.poll_library_request() {
             self.library_resync = true;
             self.rerun_history();
             self.library_resync = false;
@@ -198,7 +211,7 @@ impl EngineState {
             }
         }
         self.pump_plugin_callbacks();
-        while let Some(reply) = self.runner.poll_run() {
+        while let Some(reply) = if hold_runs { None } else { self.runner.poll_run() } {
             self.runs_replied += 1;
             if reply.generation >= self.run_generation && self.accept_plugin_run(&reply) {
                 self.applied_generation = reply.generation;
@@ -222,6 +235,10 @@ impl EngineState {
         if std::mem::take(&mut self.sketch_links_released) {
             self.rerun_history();
         }
+        // A component replace classifies its mates once its run has landed.
+        if self.replace_pending.is_some() {
+            self.finish_component_replace();
+        }
         if !self.run_pending() {
             self.run_progress = None;
         }
@@ -233,12 +250,26 @@ impl EngineState {
             self.pending_fit = false;
             self.zoom_to_fit();
         }
+        if self.instructions_wizard_pending && !self.run_pending() {
+            self.instructions_wizard_pending = false;
+            if let Err(error) = self.instructions_run_wizard() {
+                self.push_notice(format!("The instructions wizard could not run: {error}"));
+            }
+        }
+        if self.instructions_views_pending && !self.run_pending() {
+            self.instructions_views_pending = false;
+            if let Err(error) = self.instructions_refresh_views() {
+                self.push_notice(format!("The re-targeted steps' views could not be made: {error}"));
+            }
+        }
         // Drain any completed measurement replies too (a background runner surfaces
         // them a frame after selection); for Inline this is a no-op each frame since
         // `object_info_json` already pumped its own query same-call.
         self.pump_queries();
         self.pump_topology();
         self.pump_sheet_lines();
+        // The CAM generation queue: progress and replies, then the next job.
+        self.cam_pump();
     }
 
     /// Ask the runner for the B-rep topology of the displayed solids `names`
@@ -307,6 +338,14 @@ impl EngineState {
     /// thread or browser worker.
     pub fn mesh_imports_pending(&self) -> bool {
         !self.pending_mesh_imports.is_empty()
+    }
+
+    /// Whether the run in flight has something to land this frame: its reply,
+    /// a refusal to re-submit, or plugin work (which is not told apart). A
+    /// background document's [`pump`](Self::pump) needs its own parts
+    /// library installed only then.
+    pub fn run_landing(&mut self) -> bool {
+        self.run_pending() && (self.plugin_work_pending() || self.runner.run_reply_waiting())
     }
 
     /// Whether a submitted run has not yet been applied (`run_generation !=
@@ -384,6 +423,8 @@ impl EngineState {
         let dropped_probes = self.pending_step_probes.len();
         self.pending_step_probes.clear();
         self.pending_fit = false;
+        self.instructions_wizard_pending = false;
+        self.instructions_views_pending = false;
         self.library_resync = false;
         self.sketch_links_released = false;
         self.cancelled_run = Some(stalled_on.clone().unwrap_or_default());
@@ -481,8 +522,12 @@ impl EngineState {
         let _ = moved_solids;
         // Un-pose the active PMI view's exploded displays BEFORE the reconcile
         // keeps them, so the re-pose after apply starts from the modeling
-        // pose and never compounds.
+        // pose and never compounds. A live component drag's poses go first
+        // (they were applied last).
+        self.component_live_restore();
         self.pmi_restore_explode();
+        // A motion study's posed frame goes too (re-posed after apply).
+        self.simulation_restore_displays();
 
         // The names this run consumed, for the committed-sketch refresh in the
         // tail below — the runner folded them, so the UI thread does not execute
@@ -523,9 +568,7 @@ impl EngineState {
         // run's request simply carries the solved pose (a no-motion solve emits
         // no updates, so fingerprints never churn).
         for (id, pose) in assembly_poses {
-            let expression_driven = self.history.index_of(&id).and_then(|i| self.history.feature_params(i))
-                .is_some_and(|p| super::batch::contains_expression(&p["transform"]));
-            if !expression_driven { self.history.fold_param_no_undo(&id, "transform", pose); }
+            self.fold_assembly_pose(&id, pose);
         }
         for (id, fixed) in assembly_fixed {
             self.history
@@ -795,6 +838,9 @@ impl EngineState {
         // PMI: re-pose the active view's exploded solids on the fresh displays
         // and re-bake its annotation overlay from the run's report.
         self.pmi_after_apply();
+        // A motion study being played or scrubbed: its frame back on the
+        // fresh displays (or a re-bake if the document moved).
+        self.simulation_after_apply();
         // Re-derive every display colour from the metadata store, LAST — after
         // the sketch sheets, the datum overlays and the assembly sync have all
         // settled the scene, so no display inserted above is missed. This is why
@@ -833,6 +879,8 @@ impl EngineState {
     ///   that blob stays the user's boot preference; a document's workbench is
     ///   session-scoped (the next explicit dropdown change persists as usual).
     pub fn set_history_json(&mut self, request_json: &str) -> Result<String, String> {
+        // A new document: its toolpaths are not this one's.
+        self.cam.clear();
         // A locked history (a PLM revision this user may not change) is not
         // replaced either: a fresh `History` would arrive unlocked, which is the
         // one door `History::lock` cannot hold by itself. Opening another
@@ -874,6 +922,9 @@ impl EngineState {
         // The open sheet, the open sheet form and the projection cache all
         // name objects of the document being replaced.
         self.forget_sheets();
+        // A motion study being played or scrubbed names that document's
+        // studies and solids: its bake and posed displays go with it.
+        self.simulation_forget_playback();
         // A preview belongs to the document being replaced.
         self.expression_preview = None;
         let mut document: serde_json::Value = serde_json::from_str(request_json)
@@ -944,9 +995,13 @@ impl EngineState {
     ///   consistent with the `metadata` precedent, and semantically true now
     ///   that the workbench is part of the saved file.
     pub fn history_request_json(&self) -> String {
-        let mut document: serde_json::Value =
-            serde_json::from_str(&self.history.request_json())
-                .unwrap_or_else(|_| serde_json::json!({}));
+        self.history_request_value().to_string()
+    }
+
+    /// [`Self::history_request_json`] as a value, for a caller that edits the
+    /// document (Update components): nothing is printed or parsed.
+    pub fn history_request_value(&self) -> serde_json::Value {
+        let mut document = self.history.request_value();
         if let Some(object) = document.as_object_mut() {
             if !self.metadata.is_empty() {
                 object.insert("metadata".into(), self.metadata.to_json());
@@ -957,7 +1012,7 @@ impl EngineState {
                 serde_json::Value::String(self.settings.workbench.clone()),
             );
         }
-        document.to_string()
+        document
     }
 
     /// Cache the small portable PNG by scene content, not by camera position.
@@ -1054,11 +1109,36 @@ impl EngineState {
 
     /// Adopt an edited document as one undo step and rebuild through the normal
     /// runner, preserving the tab's scene settings and history stack.
+    ///
+    /// Callers edit what [`Self::history_request_json`] gave them, which carries
+    /// the session's `workbench` and `thumbnail`. Those are lifted off, as a load
+    /// lifts them ([`Self::set_history_json`]): a copy kept inside the history
+    /// goes stale at the next workbench switch or render and reads as an unsaved
+    /// change of the document (and a stamped thumbnail made a freshly refreshed
+    /// tab read dirty, which hid a reload that threw the refresh away).
     pub fn edit_document_json(&mut self, document: &str) -> Result<String, String> {
         let value: serde_json::Value = serde_json::from_str(document).map_err(|e| e.to_string())?;
-        let library = value.get("partsLibrary").map(|v| serde_json::from_value(v.clone()))
+        self.edit_document(value)
+    }
+
+    /// [`Self::edit_document_json`] for a caller that holds the document as a
+    /// value: nothing is printed or parsed again (at 500 parts the library's
+    /// text round trips were most of an Update Components commit).
+    pub fn edit_document(&mut self, mut value: serde_json::Value) -> Result<String, String> {
+        use serde::Deserialize;
+        let library = value.get("partsLibrary").map(brep_kernel::PartsLibraryMap::deserialize)
             .transpose().map_err(|e| format!("parts library: {e}"))?;
-        self.history.adopt_document_checkpointed(document)?;
+        if let Some(object) = value.as_object_mut() {
+            object.remove("workbench");
+            object.remove("thumbnail");
+        }
+        // Instructions taking a new state of their assembly re-target in the
+        // same undo step (refused while one waits for approval).
+        let retargeted = self.is_instructions() && self.instructions_fold_retarget(&mut value)?;
+        self.history.adopt_document_value_checkpointed(value)?;
+        if retargeted {
+            self.instructions_views_pending = true;
+        }
         // The runner's library channel reads the resident store. Updating only
         // History left it serving the old snapshot after Update Components.
         if let Some(library) = library {
@@ -1095,6 +1175,58 @@ impl EngineState {
         self.stamp_face_transform_pivot(index, &mut params);
         self.history.set_feature_params(index, params);
         Ok(self.rerun_history())
+    }
+
+    /// The pattern instance `name` (a copy solid, or a face/edge of one)
+    /// belongs to: `(pattern feature id, instance number)`. For a part Pattern
+    /// the numbers are the kernel's copy suffixes (`PAT1_3` is instance 3; the
+    /// source is 1); for a Pattern Component, the instance component's own
+    /// number (`APAT1.ACOMP3.i3:Part`, or the bare component id).
+    pub fn pattern_instance_of(&self, name: &str) -> Option<(String, i64)> {
+        let component = name.split(':').next().unwrap_or(name);
+        if let Some((pattern, _seed, n)) = brep_kernel::pattern_component_instance(component) {
+            return Some((pattern, n));
+        }
+        let (id, ty) = self.creating_feature(name)?;
+        if ty != "PATTERN" {
+            return None;
+        }
+        let tag = format!("{id}_");
+        let number = name
+            .strip_prefix(&tag)
+            .or_else(|| name.rsplit_once(&format!("::{tag}")).map(|(_, rest)| rest))?;
+        let digits: String = number.chars().take_while(char::is_ascii_digit).collect();
+        digits.parse().ok().map(|n| (id, n))
+    }
+
+    /// The Pattern feature `id`'s suppressed instance numbers.
+    pub fn pattern_suppressed(&self, id: &str) -> Vec<i64> {
+        let params = self.history.index_of(id).and_then(|index| self.history.feature_params(index));
+        brep_kernel::pattern_parse_suppressed(params.as_ref().and_then(|p| p.get("suppressed")))
+    }
+
+    /// Suppress (or unsuppress) instance `number` of the Pattern feature `id`:
+    /// one parameter edit, one undo step. `None` for `number` with
+    /// `suppressed == false` unsuppresses every instance.
+    pub fn pattern_set_suppressed(&mut self, id: &str, number: Option<i64>, suppressed: bool) -> Result<(), String> {
+        let index = self.history.index_of(id).ok_or_else(|| format!("no feature with id '{id}'"))?;
+        if number == Some(1) && suppressed {
+            return Err(format!(
+                "instance 1 of {id} is its source (for a Pattern Component, the seed): hide or suppress the source instead"
+            ));
+        }
+        let mut list = self.pattern_suppressed(id);
+        match (number, suppressed) {
+            (Some(n), true) if !list.contains(&n) => list.push(n),
+            (Some(n), false) => list.retain(|&m| m != n),
+            (None, false) => list.clear(),
+            _ => return Ok(()),
+        }
+        list.sort_unstable();
+        let mut params = self.history.feature_params(index).unwrap_or_else(|| serde_json::json!({}));
+        let text = list.iter().map(i64::to_string).collect::<Vec<_>>().join(", ");
+        params["suppressed"] = serde_json::Value::String(text);
+        self.update_feature_params(id, &params.to_string()).map(|_| ())
     }
 
     /// Replace the `inputParams` of MANY features as ONE model edit — the
@@ -1137,6 +1269,7 @@ impl EngineState {
     pub fn add_feature(&mut self, feature_json: &str) -> Result<String, String> {
         let feature: serde_json::Value =
             serde_json::from_str(feature_json).map_err(|e| format!("feature parse: {e}"))?;
+        self.refuse_duplicate_ids(std::slice::from_ref(&feature))?;
         if !self.append_plugin_features(std::slice::from_ref(&feature))? {
             self.history.push_feature(feature);
         }
@@ -1164,6 +1297,9 @@ impl EngineState {
         if features.is_empty() {
             return self.history_report.clone();
         }
+        if let Err(error) = self.refuse_duplicate_ids(features) {
+            return serde_json::json!({"error":error}).to_string();
+        }
         match self.append_plugin_features(features) {
             Ok(true) => {},
             Ok(false) => self.history.push_features(features.to_vec()),
@@ -1172,6 +1308,32 @@ impl EngineState {
         let last = self.history.len().saturating_sub(1);
         self.history.set_rollback(last);
         self.rerun_history()
+    }
+
+    /// A feature id names its solid, its faces and every reference to it, so it
+    /// is unique in the history: an appended feature whose `inputParams.id` is
+    /// already used — by the history or by an earlier feature of the same
+    /// append — is refused, naming the id. (Two features sharing an id made the
+    /// name resolve to one solid in the kernel and to the other in the display
+    /// and the measurements, depending on which run produced it.)
+    fn refuse_duplicate_ids(&self, features: &[serde_json::Value]) -> Result<(), String> {
+        let mut seen: Vec<&str> = Vec::new();
+        for feature in features {
+            let Some(id) = feature.get("inputParams").and_then(|p| p.get("id")).and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            if id.is_empty() {
+                continue;
+            }
+            if let Some(index) = self.history.index_of(id) {
+                return Err(format!("feature id `{id}` is already used by feature {index}; choose another id (or omit it to have one assigned)"));
+            }
+            if seen.contains(&id) {
+                return Err(format!("feature id `{id}` is given twice in one append"));
+            }
+            seen.push(id);
+        }
+        Ok(())
     }
 
     /// Delete the feature with id `id` (no-op if absent) and re-run, clamping the
@@ -1244,6 +1406,18 @@ impl EngineState {
         } else {
             self.history_report.clone()
         }
+    }
+
+    /// [`Self::undo`] without its run, for a caller that edits the document
+    /// straight after (the Work part replacing a coalesced step): that edit's
+    /// run is the one the document needs, and an undo run before it would be
+    /// executed and thrown away. Whether there was a step to undo.
+    pub fn undo_before_edit(&mut self) -> bool {
+        let undone = self.history.undo();
+        if undone {
+            self.reinstall_rewound_parts_library();
+        }
+        undone
     }
 
     /// Redo the last undone model mutation (symmetric with [`Self::undo`]).
@@ -1494,3 +1668,28 @@ fn fulfilment_map(report: &crate::pipeline::SceneBuildReport) -> serde_json::Map
         })
         .collect()
 }
+
+impl EngineState {
+    /// Adopt one solver pose write-back without an undo entry: a component's
+    /// pose into its ACOMP `transform` (unless expressions drive it); a
+    /// flexible sub-assembly occurrence's (`ACOMP1:ACOMP2`, part-local) into
+    /// its instance's `flexiblePoses`, never the child document.
+    pub(crate) fn fold_assembly_pose(&mut self, id: &str, pose: serde_json::Value) {
+        if let Some((owner, path)) = id.split_once(':') {
+            let Some(index) = self.history.index_of(owner) else { return };
+            let mut poses = self
+                .history
+                .feature_params(index)
+                .and_then(|params| params.get("flexiblePoses").cloned())
+                .filter(serde_json::Value::is_object)
+                .unwrap_or_else(|| serde_json::json!({}));
+            poses[path] = pose;
+            self.history.fold_param_no_undo(owner, "flexiblePoses", poses);
+            return;
+        }
+        let expression_driven = self.history.index_of(id).and_then(|i| self.history.feature_params(i))
+            .is_some_and(|p| super::batch::contains_expression(&p["transform"]));
+        if !expression_driven { self.history.fold_param_no_undo(id, "transform", pose); }
+    }
+}
+

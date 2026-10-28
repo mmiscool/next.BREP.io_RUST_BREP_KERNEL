@@ -1,0 +1,3 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:brep="https://brep.io/icons" viewBox="0 0 24 24" brep:glyph-name="icon_workbench_instructions" brep:unicode="E0CC">
+  <path d="M4 3H17L20 6V21H4Z" fill="#e2e8f0"/><path d="M17 3V6H20" fill="none" stroke="#94a3b8" stroke-width="1"/><circle cx="8" cy="8" r="2.6" fill="#f59e0b"/><path d="M7.3 6.8H8.5V9.6" fill="none" stroke="#fff" stroke-width="1.1"/><path d="M12 7H17M12 9.5H16" fill="none" stroke="#64748b" stroke-width="1.2"/><path d="M8 13L12 11L16 13V17.5L12 19.5L8 17.5Z" fill="#60a5fa"/><path d="M8 13L12 15L16 13M12 15V19.5" fill="none" stroke="#1e3a8a" stroke-width="0.9"/>
+</svg>

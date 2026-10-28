@@ -88,6 +88,10 @@ mod mates;
 mod numerics;
 #[path = "assembly_solver/decompose.rs"]
 mod decompose;
+#[path = "assembly_solver/sparse.rs"]
+mod sparse;
+#[path = "assembly_solver/curve_mates.rs"]
+mod curve_mates;
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -95,12 +99,15 @@ mod decompose;
 
 
 use atoms::*;
+use curve_mates::*;
 use mates::*;
 use numerics::*;
+use sparse::*;
 use types::*;
 
 pub use decompose::solve_assembly;
 pub use types::{
-    AssemblyBody, AssemblyMate, AssemblySolution, AssemblySolveOptions, BodyPose, MateAlign,
-    MateAxis, MateKind, MatePlane, MateResidualReport, SolveStepReport, SolveStrategy,
+    AssemblyBody, AssemblyMate, AssemblySolution, AssemblySolveOptions, BodyFreedom, BodyPose, MateAlign,
+    LinearAlgebra, MateAxis, MateCurve, MateKind, MatePlane, MateResidualReport, SolveStepReport,
+    SolveStrategy, SymmetricElement,
 };

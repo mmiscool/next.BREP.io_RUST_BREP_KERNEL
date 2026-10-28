@@ -72,7 +72,7 @@ pub fn clear() {
 ///
 /// A value EQUAL to the one already published costs a comparison and stops
 /// there: no copy into the stored blob, and — the expensive half — no new JS
-/// string. See [`Registry::insert`].
+/// string. See `Registry::insert`.
 pub fn publish(name: &str, doc: &'static str, json: &str) {
     if lock().insert(name, doc, json, None) {
         mirror_to_js(name, json);

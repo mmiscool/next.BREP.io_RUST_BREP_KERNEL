@@ -48,7 +48,7 @@ use crate::{transform_brep, AffineTransform, BrepSolid};
 
 /// One scene component: an ACOMP instance's identity, pose, and member solids.
 /// Rides the [`crate::feature_pipeline::FeatureResult`] `components` side-channel
-/// into [`SceneMap::apply`], exactly like profiles/frames — the scene's component
+/// into `SceneMap::apply`, exactly like profiles/frames — the scene's component
 /// set is rebuilt from feature results every history run (a projected view,
 /// never an owning data structure).
 #[derive(Debug, Clone)]
@@ -72,6 +72,115 @@ pub struct ComponentRecord {
     /// wire-harness entities a placed part carries. Their records live in
     /// [`SceneMap::ports`]; the re-pose lane moves them with the members.
     pub ports: Vec<String>,
+    /// A sub-assembly's own constraint statuses (and those of every level
+    /// below it), namespaced with this component's id — solved inside the
+    /// sub-assembly's run, reported by the parent's (see `NestedConstraint`).
+    pub nested_constraints: Vec<NestedConstraint>,
+    /// A sub-assembly's SOLVED occurrence poses: occurrence path below this
+    /// component (`ACOMP2`, `ACOMP2:ACOMP1`, …) → its pose in this component's
+    /// part-local frame. Its own solve can move an occurrence away from the
+    /// transform its document authors, so anything that needs where a nested
+    /// occurrence actually sits composes `transform` with this, never the
+    /// authored transform. Empty for a part (and for a sub-assembly built from
+    /// a snapshot before its first solve this session).
+    pub nested_poses: BTreeMap<String, AffineTransform>,
+    /// An instance of a Pattern Component (`APAT`): which seed it follows and
+    /// how. `None` for every ACOMP-placed component.
+    pub pattern: Option<PatternFollow>,
+    /// Set on a FLEXIBLE sub-assembly instance (`inputParams.flexible`): what
+    /// the parent's solve needs to move its occurrences individually. `None`
+    /// = rigid, the default.
+    pub flexible: Option<FlexibleSpec>,
+}
+
+/// How a pattern instance follows its seed: its pose is `delta · seed pose`
+/// (`T · delta · T⁻¹ · seed pose` with `T` the driver's pose, in HOLES mode).
+#[derive(Debug, Clone)]
+pub struct PatternFollow {
+    /// The `APAT` feature that emitted it.
+    pub pattern_id: String,
+    /// The seed component it follows.
+    pub seed: String,
+    /// The instance's offset from the seed, in assembly space.
+    pub delta: AffineTransform,
+    /// Its place in the pattern (the seed is 1), or its hole's key.
+    pub key: i64,
+    /// HOLES mode: the component whose hole it follows. `delta` is then in
+    /// that component's frame and applies through its solved pose.
+    pub driver: Option<String>,
+}
+
+/// A flexible sub-assembly instance, as the parent's constraint run reads it
+/// (`assembly::flexible`): the child document's own constraints (raw, its
+/// namespace), which of its occurrences stay with the instance's frame, where
+/// the child authors each occurrence, and the per-instance solved poses the
+/// placing feature persists. All poses are part-local (the instance frame).
+/// `nested` holds the same for each occurrence the child itself places
+/// flexible (keyed by its id in the child), at any depth; only the top spec
+/// carries seeds and `fixed`, keyed by the full occurrence path
+/// (`ACOMP1:ACOMP2`). `fixed` is this instance's own Fix/Float of an
+/// occurrence (`inputParams.flexibleFixed`): it wins over the child's
+/// grounding, and a fixed occurrence is a grounded body where it stands.
+#[derive(Debug, Clone, Default)]
+pub struct FlexibleSpec {
+    pub constraints: Vec<serde_json::Value>,
+    pub grounded: std::collections::BTreeSet<String>,
+    pub authored: BTreeMap<String, AffineTransform>,
+    pub seeds: BTreeMap<String, AffineTransform>,
+    pub fixed: BTreeMap<String, bool>,
+    pub nested: BTreeMap<String, FlexibleSpec>,
+}
+
+/// One constraint of a NESTED sub-assembly as its parent reports it.
+///
+/// A sub-assembly is rigid: its own constraints solve inside its own run (the
+/// isolated document run that makes its snapshot), and the parent's mates then
+/// place it as one body. The parent never re-solves these, but it must still
+/// say how they ended, so the row rides the component record. `id` carries the
+/// namespace of every level it passed (`ACOMP1:ACOMP2:CONC1`).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct NestedConstraint {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub constraint_type: String,
+    pub enabled: bool,
+    pub status: String,
+    pub message: String,
+    pub satisfied: bool,
+}
+
+impl NestedConstraint {
+    /// The row for one constraint the run just settled.
+    pub fn from_entry(entry: &crate::feature_pipeline::assembly::ConstraintEntry) -> Self {
+        Self {
+            id: entry.id().to_string(),
+            constraint_type: entry.constraint_type.clone(),
+            enabled: entry.enabled,
+            status: entry.status().to_string(),
+            message: entry
+                .persistent("message")
+                .and_then(|value| value.as_str())
+                .unwrap_or("")
+                .to_string(),
+            satisfied: entry
+                .persistent("satisfied")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false),
+        }
+    }
+
+    /// The same row one level up, under the placing component's id.
+    pub fn namespaced(&self, component_id: &str) -> Self {
+        Self {
+            id: namespaced(component_id, &self.id),
+            ..self.clone()
+        }
+    }
+
+    /// Whether the parent should be told: enabled and not satisfied.
+    pub fn is_failure(&self) -> bool {
+        self.enabled && !self.satisfied
+    }
 }
 
 /// The scene's component set, keyed by owning feature id. `BTreeMap` so
@@ -144,7 +253,7 @@ fn require_rigid(transform: &AffineTransform) -> Result<(), String> {
 }
 
 /// Row-major product `a · b` (apply `b` first, then `a`).
-fn compose(a: &AffineTransform, b: &AffineTransform) -> Result<AffineTransform, String> {
+pub(crate) fn compose(a: &AffineTransform, b: &AffineTransform) -> Result<AffineTransform, String> {
     let (ma, mb) = (&a.elements, &b.elements);
     let mut out = [0.0f64; 16];
     for row in 0..4 {
@@ -220,6 +329,10 @@ pub fn create_component(
             source,
             solids,
             ports: Vec::new(),
+            nested_constraints: Vec::new(),
+            nested_poses: BTreeMap::new(),
+            pattern: None,
+            flexible: None,
         },
         added,
     ))
@@ -282,8 +395,7 @@ pub fn update_component_transform(
 ) -> Result<(), String> {
     require_rigid(&new_transform)?;
     let record = scene
-        .components
-        .get(id)
+        .resolve_component(id)
         .ok_or_else(|| format!("unknown component '{id}'"))?;
     let delta = compose(&new_transform, &record.transform.rigid_inverse()?)?;
     let port_ids = record.ports.clone();
@@ -307,12 +419,30 @@ pub fn update_component_transform(
     for (handle, body) in posed {
         crate::replace_registered_solid(handle, body)?;
     }
-    scene
-        .components
-        .get_mut(id)
-        .expect("record fetched above")
-        .transform = new_transform;
-    super::mark_component_cache_posed(id);
+    if let Some(record) = scene.components.get_mut(id) {
+        record.transform = new_transform;
+        // A flexible instance's occurrences are among its members: they moved
+        // with it, so their frames follow.
+        let prefix = format!("{id}:");
+        for occurrence in scene.occurrences.values_mut().filter(|o| o.id.starts_with(&prefix)) {
+            occurrence.transform = compose(&delta, &occurrence.transform)?;
+        }
+        super::mark_component_cache_posed(id);
+    } else if scene.occurrences.contains_key(id) {
+        // A flexible occurrence placed inside a flexible occurrence moved
+        // with it too.
+        let prefix = format!("{id}:");
+        for occurrence in scene.occurrences.values_mut() {
+            if occurrence.id == id {
+                occurrence.transform = new_transform;
+            } else if occurrence.id.starts_with(&prefix) {
+                occurrence.transform = compose(&delta, &occurrence.transform)?;
+            }
+        }
+        // The placing feature's cache entry owns the occurrence's solids.
+        let owner = id.split(':').next().unwrap_or(id).to_string();
+        super::mark_component_cache_posed(&owner);
+    }
 
     // The component's ports (and their published entities) follow the members,
     // so a solve that moves a part moves the harness network it carries.
@@ -388,6 +518,8 @@ pub fn enforce_reference_fence(
             | "PLANE"
             | "ACOMP"
             | "ASSEMBLY COMPONENT"
+            | "APAT"
+            | "PATTERN COMPONENT"
             | "WP"
             | "WAYPOINT"
             | "SP"
@@ -433,7 +565,7 @@ impl SceneMap {
     /// Contract surface for the Wave-2 constraint/selection lanes.
     #[allow(dead_code)]
     pub fn resolve_component(&self, id: &str) -> Option<&ComponentRecord> {
-        self.components.get(id)
+        self.components.get(id).or_else(|| self.occurrences.get(id))
     }
 
     /// The component owning an entity name, if any: the BARE component id itself
@@ -443,7 +575,17 @@ impl SceneMap {
     /// the registered component set, never syntactically — authored names like
     /// `S1:PROFILE` have a first segment that is a sketch id, not a component id.
     pub fn owning_component(&self, name: &str) -> Option<&ComponentRecord> {
-        if let Some(record) = self.components.get(name) {
+        if let Some(record) = self.resolve_component(name) {
+            return Some(record);
+        }
+        // A flexible instance's occurrence owns its own geometry (the deepest
+        // registered prefix wins over the instance).
+        if let Some(record) = self
+            .occurrences
+            .values()
+            .filter(|record| name.starts_with(&format!("{}:", record.id)))
+            .max_by_key(|record| record.id.len())
+        {
             return Some(record);
         }
         let (prefix, _) = name.split_once(':')?;
@@ -452,7 +594,7 @@ impl SceneMap {
 
     /// The feature-fence predicate: does this entity name belong to a component?
     /// Cheap (one map probe + one prefix probe); the dispatch fence
-    /// ([`enforce_reference_fence`]) uses it to REJECT component geometry as
+    /// (`enforce_reference_fence`) uses it to REJECT component geometry as
     /// modeling-feature input.
     pub fn is_component_owned(&self, name: &str) -> bool {
         self.owning_component(name).is_some()
@@ -470,7 +612,7 @@ impl SceneMap {
     /// case for an intact scene) is skipped.
     #[allow(dead_code)]
     pub fn component_solids(&self, id: &str) -> Vec<(String, u32)> {
-        let Some(record) = self.components.get(id) else {
+        let Some(record) = self.resolve_component(id) else {
             return Vec::new();
         };
         record
@@ -480,10 +622,29 @@ impl SceneMap {
             .collect()
     }
 
+    /// The member solids of an occurrence path: a component's (or a flexible
+    /// occurrence's) own record, else every solid named under the path, which
+    /// is how a placement inside a rigid sub-assembly is reached
+    /// (`ACOMP1:ACOMP2` → `ACOMP1:ACOMP2:Pin`), in name order.
+    pub fn occurrence_solids(&self, path: &str) -> Vec<(String, u32)> {
+        if self.resolve_component(path).is_some() {
+            return self.component_solids(path);
+        }
+        let prefix = format!("{path}:");
+        let mut solids: Vec<(String, u32)> = self
+            .solids
+            .iter()
+            .filter(|(name, _)| name.starts_with(&prefix))
+            .map(|(name, &handle)| (name.clone(), handle))
+            .collect();
+        solids.sort();
+        solids
+    }
+
     /// A component's grounded flag (`None` for an unknown id).
     #[allow(dead_code)]
     pub fn component_fixed(&self, id: &str) -> Option<bool> {
-        self.components.get(id).map(|record| record.fixed)
+        self.resolve_component(id).map(|record| record.fixed)
     }
 
     /// Set a component's grounded flag. Scene-view state only — the
@@ -492,7 +653,7 @@ impl SceneMap {
     /// sync between runs). Returns false for an unknown id.
     #[allow(dead_code)]
     pub fn set_component_fixed(&mut self, id: &str, fixed: bool) -> bool {
-        match self.components.get_mut(id) {
+        match self.components.get_mut(id).or(self.occurrences.get_mut(id)) {
             Some(record) => {
                 record.fixed = fixed;
                 true

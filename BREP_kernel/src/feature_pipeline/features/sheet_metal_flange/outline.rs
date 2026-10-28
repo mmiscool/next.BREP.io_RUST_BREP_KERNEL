@@ -104,6 +104,40 @@ pub(super) fn graft_outline_group(
         }
     }
 
+    // A neighbouring flange from an earlier feature already owns its fold
+    // line. Intersect the NEW shifted line with that live line, then shorten
+    // the old bend and its plain wall together. Applying the new inset to both
+    // lines would shift the earlier flange a second time.
+    let mut existing = Vec::new();
+    for r in &mut resolved {
+        for at_start in [true, false] {
+            let neighbour = if at_start { (r.index + n - 1) % n } else { (r.index + 1) % n };
+            let Some(bend) = &flat.edges[neighbour].bend else { continue };
+            if geometry.corner != CornerType::Open || geometry.shift <= GEOM_EPS
+                || geometry.signed_angle.abs() > 90.0 + GEOM_EPS
+                || bend.angle_deg.abs() > 90.0 + GEOM_EPS
+                || (if at_start { geometry.setback_start } else { geometry.setback_end }) > GEOM_EPS
+            { continue; }
+            let a = flat.outline[neighbour];
+            let b = flat.outline[(neighbour + 1) % n];
+            let length = (b[0] - a[0]).hypot(b[1] - a[1]);
+            if !plain_open_wall(&bend.child, length) { continue; }
+            let t = [(b[0] - a[0]) / length, (b[1] - a[1]) / length];
+            let cross = r.t[0] * t[1] - r.t[1] * t[0];
+            let turn = if at_start { -cross } else { cross };
+            if turn <= GEOM_EPS || r.t[0] * t[0] + r.t[1] * t[1] < -GEOM_EPS { continue; }
+            let p = [r.a[0] + r.m[0] * geometry.shift, r.a[1] + r.m[1] * geometry.shift];
+            let s = ((a[0] - p[0]) * t[1] - (a[1] - p[1]) * t[0]) / cross;
+            let c = [p[0] + r.t[0] * s, p[1] + r.t[1] * s];
+            let op = Some(CornerOp { c, s_c: s, wall: WallEnd::Flat });
+            if at_start { r.corner_start = op; } else { r.corner_end = op; }
+            let id = flat.edges[neighbour].id.clone();
+            if !existing.iter().any(|(seen, _, _)| seen == &id) {
+                existing.push((id, a, b));
+            }
+        }
+    }
+
     // Effective band spans: corner trims combine with user setbacks (the
     // longer setback wins; without a user setback the corner point rules so a
     // negative shift can EXTEND the band out to the corner intersection).
@@ -162,6 +196,22 @@ pub(super) fn graft_outline_group(
         });
     }
 
+    for (id, a, b) in existing {
+        let index = flat.edges.iter().position(|edge| edge.id == id).expect("existing hinge survives");
+        let p = flat.outline[index];
+        let q = flat.outline[(index + 1) % flat.outline.len()];
+        let length = (b[0] - a[0]).hypot(b[1] - a[1]);
+        let t = [(b[0] - a[0]) / length, (b[1] - a[1]) / length];
+        let start = (p[0] - a[0]) * t[0] + (p[1] - a[1]) * t[1];
+        let end = (q[0] - a[0]) * t[0] + (q[1] - a[1]) * t[1];
+        if start < -GEOM_EPS || end > length + GEOM_EPS || end - start <= MIN_SPAN {
+            return Err(format!("sheet-metal flange: corner trim consumes or extends the existing flange `{id}`"));
+        }
+        let child = &mut flat.edges[index].bend.as_mut().expect("existing bend survives").child;
+        child.outline[2][1] = end - start;
+        child.outline[3][1] = end - start;
+    }
+
     // Joint validity: the reshaped outline must stay simple. (Checked once,
     // after ALL picks — mid-sequence states are legitimately transient.)
     let treated = resolved
@@ -187,6 +237,17 @@ pub(super) fn graft_outline_group(
         }
     }
     Ok(())
+}
+
+// Only a plain open wall can be shortened by moving its two end vertices.
+// Decorated walls retain the existing refusal instead of losing a cut or bend.
+fn plain_open_wall(flat: &Flat, span: f64) -> bool {
+    flat.outline.len() == 4 && flat.holes.is_empty() && flat.hole_bends.is_empty()
+        && flat.outline_curves.is_empty() && flat.edges.iter().all(|edge| edge.bend.is_none())
+        && flat.outline[0][0].abs() <= GEOM_EPS && flat.outline[3][0].abs() <= GEOM_EPS
+        && flat.outline[1][0] > GEOM_EPS && (flat.outline[2][0] - flat.outline[1][0]).abs() <= GEOM_EPS
+        && flat.outline[0][1].abs() <= GEOM_EPS && flat.outline[1][1].abs() <= GEOM_EPS
+        && (flat.outline[2][1] - span).abs() <= GEOM_EPS && (flat.outline[3][1] - span).abs() <= GEOM_EPS
 }
 
 /// Wire the corner treatment between pick `p` (edge ENDS at the shared vertex)

@@ -16,7 +16,7 @@
 //!
 //! Everything here talks to the server through futures the pane polls once per
 //! frame, as the lifecycle panel does, so the web build works the same. With no
-//! PLM none of it exists: [`PlmFamily::sync`] is given no client, and every
+//! PLM none of it exists: [`PlmFamily::sync`](crate::panels::plm_family::PlmFamily::sync) is given no client, and every
 //! method is a no-op.
 
 use std::rc::Rc;

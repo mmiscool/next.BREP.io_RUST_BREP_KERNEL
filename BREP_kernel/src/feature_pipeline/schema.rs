@@ -49,6 +49,7 @@ pub fn feature_schema_catalogue() -> serde_json::Value {
             super::features::sheet_metal_contour_flange::schema(),
             super::features::sheet_metal_flange::schema(),
             super::features::sheet_metal_hem::schema(),
+            super::features::sheet_metal_closed_corner::schema(),
             super::features::sheet_metal_corner::schema_fillet(),
             super::features::sheet_metal_corner::schema_chamfer(),
             super::features::sheet_metal_cutout::schema(),
@@ -63,7 +64,8 @@ pub fn feature_schema_catalogue() -> serde_json::Value {
             super::features::tube::schema(),
             super::features::transform::schema(),
             super::features::pattern::schema(),
-            super::features::assembly_component::schema()
+            super::features::assembly_component::schema(),
+            super::features::assembly_pattern::schema()
         ]
     })
 }
@@ -90,6 +92,7 @@ pub fn feature_schemas_json() -> String {
 pub fn feature_hidden_params(feature_type: &str, values: &serde_json::Value) -> Vec<String> {
     let keys: Vec<&'static str> = match feature_type {
         "H" => super::features::hole::hidden_params(values),
+        "SM.CLOSED_CORNER" => super::features::sheet_metal_closed_corner::hidden_params(values),
         _ => Vec::new(),
     };
     keys.into_iter().map(str::to_owned).collect()

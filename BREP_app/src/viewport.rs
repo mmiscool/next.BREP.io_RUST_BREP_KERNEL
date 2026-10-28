@@ -7,7 +7,7 @@
 //!   texture (its own MSAA + full-target clear), on eframe's SHARED wgpu
 //!   device/queue.
 //! * That offscreen texture is composited into egui's own frame via an
-//!   `egui_wgpu` paint callback ([`ViewportCallback`]/[`ViewportPaint`]) — a
+//!   `egui_wgpu` paint callback (`ViewportCallback`/`ViewportPaint`) — a
 //!   fullscreen-triangle blit into egui's render pass, at the viewport rect egui
 //!   scissors for us — so the 3D and the egui UI share one wgpu frame.
 //! * Pointer / wheel / ViewCube over the viewport route into `EngineState`
@@ -62,12 +62,21 @@ pub struct Viewport {
     /// The engine's wgpu render core, built from eframe's device/queue/format.
     core: RenderCore,
     gpu_scene: GpuScene,
+    context_gpu_scene: GpuScene,
     /// egui's renderer, so we can push `ViewportPaint` into its callback map.
     egui_renderer: Arc<egui::mutex::RwLock<egui_wgpu::Renderer>>,
     blit_layout: wgpu::BindGroupLayout,
     blit_sampler: wgpu::Sampler,
     blit_pipeline: wgpu::RenderPipeline,
     offscreen: Option<Offscreen>,
+    /// Render on the next frame although the engine is not dirty: the
+    /// offscreen texture was rebuilt (a new physical size, which a
+    /// pixels-per-point change makes at the same logical size) or the GPU
+    /// scene was dropped (`forget_document`).
+    force_render: bool,
+    /// The render inputs of the last rendered frame, for the stale-frame check.
+    #[cfg(feature = "automation")]
+    rendered_inputs: Option<[(&'static str, u64); 5]>,
     /// True while a camera drag (orbit/pan) started over the viewport is live.
     dragging: bool,
     touch: touch::TouchNavigation,
@@ -176,6 +185,18 @@ pub struct Viewport {
     /// to and the screen point it opened at. Its entries are the annotation's
     /// PMI tree row menu.
     pmi_label_menu: Option<(String, egui::Pos2)>,
+    /// A component's open RIGHT-CLICK menu: the ACOMP id and where it opened.
+    component_menu: Option<(String, egui::Pos2)>,
+    /// Its entry rects (`componentmenu/menuitem:<id>:<action>`).
+    component_menu_hits: std::collections::HashMap<String, egui::Rect>,
+    /// The last viewport right-click as the component menu read it (what the
+    /// pointer hit, which component owns it) — `__brepComponentMenu`.
+    component_menu_probe: serde_json::Value,
+    /// A document-level flow the menu asked for (Edit Part, Replace…), taken
+    /// by the shell after the frame ([`Self::take_component_request`]).
+    component_request: Option<crate::panels::component_actions::ComponentActionRequest>,
+    /// Empty space double-clicked this frame ([`Self::take_empty_double_click`]).
+    empty_double_click: bool,
     /// That menu's entries this frame, `menuitem:<annotation id>:<action id>`
     /// — the `__brepPmiMenuHit` verifier global.
     pmi_menu_hits: std::collections::HashMap<String, egui::Rect>,
@@ -186,6 +207,18 @@ pub struct Viewport {
     /// editor here (`ecad.rs`). The editors themselves, and their views, live
     /// on the document.
     ecad: ecad::EcadViewport,
+    /// The Move gizmo's typed-value card (`move_card.rs`): its fields and rects.
+    move_card: move_card::MoveCard,
+    /// The constraint chips drawn LAST frame, `(constraint id, screen rect)`:
+    /// a chip's menu closes with it, and the rects are the
+    /// `__brepConstraintLabelHit` verifier global.
+    constraint_chips_drawn: Vec<(String, egui::Rect)>,
+    /// The open RIGHT-CLICK menu of a constraint chip: the constraint and the
+    /// screen point it opened at.
+    constraint_label_menu: Option<(String, egui::Pos2)>,
+    /// That menu's entries this frame, `menuitem:<constraint id>:<action id>`
+    /// — the `__brepConstraintMenuHit` verifier global.
+    constraint_menu_hits: std::collections::HashMap<String, egui::Rect>,
 }
 
 impl Viewport {
@@ -200,8 +233,20 @@ impl Viewport {
     /// re-upload on the switch is the right price. The transients after it
     /// (pick popup, open dimension editors, in-flight drags) all name entities
     /// of the document that is going away.
+    /// Draw the engine's scene at `width`×`height` under its own settings and
+    /// read the frame back as packed RGB (top row first): a motion study's
+    /// export frame. The GPU scene is the viewport's own, synced to the scene
+    /// as it stands, so a posed frame costs its pose upload and the draw.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn render_rgb(&mut self, state: &EngineState, camera: &brep_render::camera::Camera, width: u32, height: u32) -> Result<Vec<u8>, String> {
+        self.core.sync_scene(&mut self.gpu_scene, &state.scene, &state.settings, state.settings_generation);
+        self.core.render_gpu_scene_to_rgb(&mut self.gpu_scene, &state.scene, camera, width, height, &state.settings)
+    }
+
     pub fn forget_document(&mut self) {
         self.gpu_scene = GpuScene::default();
+        self.context_gpu_scene = GpuScene::default();
+        self.force_render = true;
         self.close_candidate_popup();
         self.candidate_hits.clear();
         self.editing_dim = None;
@@ -212,8 +257,14 @@ impl Viewport {
         self.pmi_label_hits.clear();
         self.pmi_label_menu = None;
         self.pmi_menu_hits.clear();
+        self.component_menu = None;
+        self.component_menu_hits.clear();
         self.sheet.forget();
         self.ecad = ecad::EcadViewport::default();
+        self.move_card = move_card::MoveCard::default();
+        self.constraint_chips_drawn.clear();
+        self.constraint_label_menu = None;
+        self.constraint_menu_hits.clear();
         self.dragging = false;
         self.gizmo_dragging = false;
         self.component_gizmo_dragging = false;
@@ -253,6 +304,7 @@ mod blit;
 pub(crate) mod ecad;
 mod interaction;
 mod labels;
+mod move_card;
 mod popups;
 mod sheet;
 pub(crate) mod touch;
@@ -267,8 +319,13 @@ pub use popups::{modal_open_last_pass, popup_open_last_pass};
 pub static HIT_KEYS: &[crate::automation::hit_keys::HitKeyDoc] = &[
     crate::automation::hit_keys::HitKeyDoc { panel: "cage", prefix: "point:", meaning: "one zero-size rect per CONTROL POINT of the NURBS Solid whose form is open (cage/point:<index> — 0 the bottom pole, then every ring bottom-up, the top pole last), in SCREEN points, at the dot the viewport draws for it. A click SELECTS the point and arms the move/rotate gizmo at the selection's centre; with Shift / Ctrl held (`modifiers_set`) it TOGGLES the point into the selection, so several points move as one. The form's Cage section (`history/cage:`) grows the selection to whole rings and columns and inserts new loops beside it", command: None },
     crate::automation::hit_keys::HitKeyDoc { panel: "candidate", prefix: "", meaning: "one rect per entry of the open pick-candidate popup, keyed by the entry's index \u{2014} the same index `__brepCandidates` carries. `click_widget candidate/<i>` picks that entry (replace, or toggle in Click-toggles mode / with Ctrl held), which is how a script chooses between overlapping faces without a coordinate", command: None },
-    crate::automation::hit_keys::HitKeyDoc { panel: "pmilabel", prefix: "", meaning: "one rect per PMI label chip, keyed by annotation id \u{2014} a click SELECTS the annotation, a double click opens its form, a drag moves the label, and a RIGHT-click selects it and opens its menu (`pmimenu/menuitem:`)", command: None },
+    crate::automation::hit_keys::HitKeyDoc { panel: "pmilabel", prefix: "", meaning: "one rect per PMI label chip, keyed by annotation id \u{2014} a click SELECTS the annotation (while a reference pick runs, the click goes to the pick under the chip instead, as if the chip were not there), a double click opens its form, a drag moves the label, and a RIGHT-click selects it and opens its menu (`pmimenu/menuitem:`)", command: None },
+    crate::automation::hit_keys::HitKeyDoc { panel: "componentmenu", prefix: "menuitem:", meaning: "one rect per entry of a component's open RIGHT-CLICK menu in the 3D view (componentmenu/menuitem:<ACOMP id>:<action id>) \u{2014} a right-click on any face of an assembly component selects that component and opens the same component actions the context bar and the BOM row menu offer (move, move-copy, open-part, replace, toggle-fixed, delete)", command: None },
     crate::automation::hit_keys::HitKeyDoc { panel: "pmimenu", prefix: "menuitem:", meaning: "one rect per entry of a PMI label chip's open RIGHT-CLICK menu (pmimenu/menuitem:<annotation id>:<action id>) \u{2014} the same entries, and the same dispatch, as that annotation's PMI tree row menu (`pmi/menuitem:`): edit, move-up, move-down, delete", command: None },
+    crate::automation::hit_keys::HitKeyDoc { panel: "constraintlabel", prefix: "", meaning: "one rect per assembly-constraint chip drawn in the 3D view, keyed by constraint id \u{2014} a click selects the constraint and opens its form (while a reference pick runs, the click goes to the pick under the chip instead, as if the chip were not there); a RIGHT-click selects it and opens its menu (`constraintmenu/menuitem:`)", command: None },
+    crate::automation::hit_keys::HitKeyDoc { panel: "constraintmenu", prefix: "menuitem:", meaning: "one entry of an assembly-constraint chip's open RIGHT-CLICK menu (constraintmenu/menuitem:<constraint id>:<flip|edit|suppress|delete>) \u{2014} a right-click on a chip selects that constraint and opens the same entries, run through the same dispatch, as its Constraints panel row's menu (`assemblyconstraints/acon:menuitem:`)", command: None },
+    crate::automation::hit_keys::HitKeyDoc { panel: "movecard", prefix: "card", meaning: "the Move gizmo's typed-value card, in the viewport's top-left corner, drawn while the component Move gizmo is armed (one component or a group) \u{2014} what it did last is `__brepComponentMove.typed`", command: None },
+    crate::automation::hit_keys::HitKeyDoc { panel: "movecard", prefix: "field:", meaning: "one text field per motion on the Move card: movecard/field:x, field:y, field:z (mm along the gizmo's axes) and field:rx, field:ry, field:rz (degrees about them; a group's axes are the world's). Click one, type a value and press Enter: it moves by exactly that much, solved against the mates, in one undo step, and the field clears. When the mates allow only part of it, that part is applied and the card's last line names the constraint that stopped the rest; when they allow none, nothing moves and a notice names it", command: None },
     // The SHEET mode's own widgets — the third VIEWPORT-hosted widget panel,
     // in screen points with no `panel:clip` (see `viewport/sheet.rs`).
     crate::automation::hit_keys::HitKeyDoc { panel: "sheet", prefix: "paper", meaning: "the open sheet's PAPER rect in screen points \u{2014} a drag on it pans the sheet view", command: None },
@@ -293,7 +350,7 @@ pub static HIT_KEYS: &[crate::automation::hit_keys::HitKeyDoc] = &[
     crate::automation::hit_keys::HitKeyDoc { panel: "ecad", prefix: "junction:", meaning: "one small rect per junction dot on the eCAD sheet, by index", command: None },
     crate::automation::hit_keys::HitKeyDoc { panel: "ecad", prefix: "no_connect:", meaning: "one small rect per no-connect cross on the eCAD sheet, keyed by the pin it marks (ecad/no_connect:R1.2) and centred on that pin's tip \u{2014} where a click with the No-connect tool takes the mark off", command: None },
     crate::automation::hit_keys::HitKeyDoc { panel: "ecad", prefix: "power_flag:", meaning: "one small rect per power flag (PWR_FLAG) on the eCAD sheet, keyed by the pin it is on (ecad/power_flag:U1.4) and centred on that pin's tip \u{2014} where a click with the Power flag tool takes the flag off", command: None },
-    crate::automation::hit_keys::HitKeyDoc { panel: "ecad", prefix: "power_net", meaning: "the tool card's Power net field, published while the Power symbol tool is armed in the PCB sheet editor, with power_net:GND, power_net:VCC, power_net:+3V3 and power_net:+5V on the four picks above it \u{2014} the net the next power symbol placed is for", command: None },
+    crate::automation::hit_keys::HitKeyDoc { panel: "ecad", prefix: "power_net", meaning: "the tool card's Power net field, published while the Power symbol tool is armed in the PCB sheet editor, with power_net:preset above it: one dropdown of the four usual nets (GND, VCC, +3V3, +5V; its open entries power_net:preset#<name>) \u{2014} the net the next power symbol joins", command: None },
     crate::automation::hit_keys::HitKeyDoc { panel: "ecad", prefix: "part:", meaning: "on the PCB board view, one rect per placed part's courtyard, keyed by its reference (ecad/part:R1) \u{2014} a click selects it, a drag moves it", command: None },
     crate::automation::hit_keys::HitKeyDoc { panel: "ecad", prefix: "track:", meaning: "on the PCB board view, one small rect per track by index, centred on the middle of its longest segment (a drag there slides that segment), and `track:{i}.corner:{j}` on each interior corner j of it (a drag there moves that corner)", command: None },
     crate::automation::hit_keys::HitKeyDoc { panel: "ecad", prefix: "via:", meaning: "on the PCB board view, one rect per via by index", command: None },

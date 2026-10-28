@@ -1,0 +1,991 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Instructions</title>
+<style{{NONCE}}>
+:root { --bg:#131b24; --panel:#1b2631; --line:#324452; --text:#e6edf3; --dim:#9fb0bf; --accent:#ff9a1f; --caution:#e5534b; --note:#4c9ee8; --check:#3fb950; }
+* { box-sizing:border-box; }
+html, body { margin:0; height:100%; background:var(--bg); color:var(--text); font:16px/1.4 system-ui, sans-serif; }
+#app { display:grid; grid-template-rows:auto 1fr auto; height:100%; }
+header { display:flex; align-items:center; gap:12px; padding:8px 16px; border-bottom:1px solid var(--line); }
+header h1 { font-size:18px; margin:0; flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+header .sub { color:var(--dim); font-size:14px; }
+main { display:grid; grid-template-columns:260px 1fr 340px; min-height:0; }
+body.customer main { grid-template-columns:1fr 280px; }
+body.customer #checklist { display:none; }
+#checklist, #details { overflow:auto; padding:12px; border-right:1px solid var(--line); background:var(--panel); }
+#details { border-right:0; border-left:1px solid var(--line); }
+#viewport { position:relative; min-width:0; min-height:0; touch-action:none; }
+#viewport canvas, #viewport img { position:absolute; inset:0; width:100%; height:100%; object-fit:contain; }
+#chapter { color:var(--dim); font-size:13px; text-transform:uppercase; letter-spacing:.05em; }
+#title { font-size:22px; margin:4px 0 12px; }
+.check { display:flex; gap:8px; align-items:center; padding:10px 8px; border-radius:8px; cursor:pointer; min-height:44px; }
+.check.current { background:#26394a; }
+.check .box { width:22px; height:22px; border:2px solid var(--dim); border-radius:5px; flex:none; display:grid; place-items:center; }
+.check.done .box { background:var(--check); border-color:var(--check); }
+.check.done .box::after { content:"\2713"; color:#000; font-weight:bold; }
+.check.d1 { padding-left:22px; } .check.d2 { padding-left:38px; } .check.d3 { padding-left:54px; }
+.adds { display:grid; gap:8px; }
+.add { display:flex; gap:10px; align-items:center; background:#22303c; border-radius:8px; padding:6px; }
+.add img { width:56px; height:56px; background:#0e141b; border-radius:6px; }
+.add .find { min-width:28px; height:28px; border-radius:50%; border:2px solid var(--accent); display:grid; place-items:center; font-size:13px; }
+.qty { color:var(--accent); font-weight:600; }
+.section { margin-top:14px; }
+.section h3 { font-size:13px; color:var(--dim); margin:0 0 6px; text-transform:uppercase; }
+.callout { border-left:4px solid var(--note); padding:6px 10px; margin:6px 0; background:#22303c; border-radius:0 6px 6px 0; }
+.callout.caution { border-color:var(--caution); }
+.callout.check { border-color:var(--check); }
+.callout b { margin-right:6px; }
+footer { display:flex; gap:12px; padding:10px 16px; border-top:1px solid var(--line); align-items:center; }
+footer .count { flex:1; text-align:center; color:var(--dim); }
+button { font:inherit; color:var(--text); background:#2b3d4e; border:1px solid var(--line); border-radius:10px; padding:10px 22px; min-height:48px; cursor:pointer; }
+button.primary { background:var(--accent); color:#111; border-color:var(--accent); font-weight:600; }
+button:disabled { opacity:.4; cursor:default; }
+#signoff { margin-top:16px; display:grid; gap:8px; }
+#signoff input { font:inherit; padding:10px; border-radius:8px; border:1px solid var(--line); background:#0e141b; color:var(--text); min-height:44px; }
+#message { color:var(--caution); min-height:1.4em; }
+#signed { color:var(--check); }
+body.customer #notes { display:none; }
+#tools .tool { display:flex; align-items:center; gap:10px; margin:4px 0; }
+#tools .tool img { width:64px; height:64px; object-fit:contain; border-radius:6px; background:#fff; }
+/* A motion study's player: the view and a timeline, no steps. */
+body.motion main { grid-template-columns:1fr; }
+body.motion #checklist, body.motion #details, body.motion footer { display:none; }
+#timeline { display:none; padding:10px 16px; border-top:1px solid var(--line); align-items:center; gap:12px; position:relative; }
+body.motion #timeline, body.step-motion #timeline { display:flex; }
+#timeline input[type=range] { flex:1; min-height:32px; }
+#timeline .time { min-width:9em; text-align:right; color:var(--dim); font-variant-numeric:tabular-nums; }
+#timeline .marks { position:absolute; left:112px; right:11em; top:4px; height:4px; pointer-events:none; }
+#timeline .marks span { position:absolute; top:0; width:2px; height:4px; background:var(--caution); }
+#timeline .clash { color:var(--caution); min-width:7em; }
+@media (max-width: 900px) {
+  main, body.customer main { grid-template-columns:1fr; grid-template-rows:45vh auto; }
+  #checklist { display:none; }
+  #details { border-left:0; border-top:1px solid var(--line); }
+}
+</style>
+</head>
+<body>
+<script type="application/json" id="mi-config">{{CONFIG}}</script>
+<script type="application/json" id="mi-data">{{DATA}}</script>
+<div id="app">
+  <header><h1 id="doc-title">Instructions</h1><span class="sub" id="doc-sub"></span></header>
+  <main>
+    <nav id="checklist" aria-label="Steps"></nav>
+    <div id="viewport"><canvas id="canvas"></canvas></div>
+    <section id="details">
+      <div id="chapter"></div>
+      <h2 id="title"></h2>
+      <div class="adds" id="adds"></div>
+      <div class="section" id="tools-section"><h3>Tools</h3><div id="tools"></div></div>
+      <div class="section" id="torque-section"><h3>Torque</h3><div id="torque"></div></div>
+      <div class="section" id="callouts"></div>
+      <div class="section" id="notes"></div>
+      <div id="signoff"></div>
+    </section>
+  </main>
+  <footer>
+    <button id="back">&#9664; Back</button>
+    <button id="replay" title="Play the insertion again">&#8635;</button>
+    <span class="count" id="count"></span>
+    <button id="next" class="primary">Next &#9654;</button>
+  </footer>
+  <div id="timeline">
+    <button id="motion-play" class="primary" title="Play / pause">&#9654;</button>
+    <div class="marks" id="motion-marks"></div>
+    <input id="motion-scrub" type="range" min="0" max="0" value="0" step="1" aria-label="Time">
+    <span class="clash" id="motion-clash"></span>
+    <span class="time" id="motion-time"></span>
+  </div>
+</div>
+<script{{NONCE}}>
+(function () {
+  'use strict';
+  var config = JSON.parse(document.getElementById('mi-config').textContent || '{}');
+  var mode = config.mode === 'customer' ? 'customer' : 'shop';
+  document.body.className = mode;
+  var $ = function (id) { return document.getElementById(id); };
+  var el = function (tag, cls, text) {
+    var e = document.createElement(tag);
+    if (cls) e.className = cls;
+    if (text !== undefined && text !== null) e.textContent = String(text);
+    return e;
+  };
+  // Pictures from data: only data:image URLs and same-site tool pictures.
+  var safeImage = function (url) {
+    if (typeof url !== 'string') return null;
+    if (/^data:image\/(png|jpeg|webp);base64,[A-Za-z0-9+\/=]+$/.test(url)) return url;
+    if (/^\/api\/tools\/[A-Za-z0-9_-]+\/picture$/.test(url)) return url;
+    return null;
+  };
+
+  var data = null, steps = [], current = 0, done = {}, job = null, offline = false;
+
+  function load() {
+    var inline = JSON.parse($('mi-data').textContent || 'null');
+    if (inline) { offline = true; return Promise.resolve(inline); }
+    if (!config.dataUrl) return Promise.reject(new Error('no instructions data'));
+    return fetch(config.dataUrl, { credentials: 'same-origin' }).then(function (r) {
+      if (!r.ok) throw new Error('instructions data: HTTP ' + r.status);
+      return r.json();
+    });
+  }
+
+  // ---------- 3D ----------
+  var canvas = $('canvas'), gl = null, gl2 = false, prog = null, lines = null, meshes = [], view = null;
+  // The edge colour the step pictures draw (BREP_render thumbnail.rs).
+  var EDGE = [0.10, 0.11, 0.13], showEdges = true;
+  // The camera is the app's ViewCamera (BREP_render view.rs): an eye, a
+  // target, a free up vector, and an orthographic half height or a
+  // perspective field of view. The step's bounding radius sizes the depth
+  // range; `minHalfWidth` keeps a step captured in a wider window in sight.
+  var cam = { eye: [6, 4.5, 6.6], target: [0, 0, 0], up: [0, 1, 0], half: 5, minHalfWidth: 0, ortho: false, fov: 35, radius: 1 };
+  var anim = { start: 0, running: false };
+  var DURATION = 900;
+
+  function decode(b64, Type) {
+    var s = atob(b64), bytes = new Uint8Array(s.length);
+    for (var i = 0; i < s.length; i++) bytes[i] = s.charCodeAt(i);
+    return new Type(bytes.buffer);
+  }
+
+  function initGL() {
+    gl = canvas.getContext('webgl2', { antialias: true });
+    gl2 = !!gl;
+    if (!gl) {
+      gl = canvas.getContext('webgl', { antialias: true }) || canvas.getContext('experimental-webgl');
+      if (gl && !gl.getExtension('OES_element_index_uint')) gl = null;
+    }
+    if (!gl) return false;
+    var vs = 'attribute vec3 p; attribute vec3 n; uniform mat4 mvp; uniform mat4 model; varying vec3 vn;' +
+      'void main(){ vn = (model * vec4(n, 0.0)).xyz; gl_Position = mvp * vec4(p, 1.0); }';
+    var fs = 'precision mediump float; varying vec3 vn; uniform vec4 color;' +
+      'void main(){ vec3 l = normalize(vec3(0.4, 0.7, 0.6)); float d = abs(dot(normalize(vn), l));' +
+      ' gl_FragColor = vec4(color.rgb * (0.35 + 0.65 * d), color.a); }';
+    var compile = function (type, src) {
+      var s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s);
+      if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s));
+      return s;
+    };
+    prog = gl.createProgram();
+    gl.attachShader(prog, compile(gl.VERTEX_SHADER, vs));
+    gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, fs));
+    gl.linkProgram(prog);
+    if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(prog));
+    prog.p = gl.getAttribLocation(prog, 'p');
+    prog.n = gl.getAttribLocation(prog, 'n');
+    prog.mvp = gl.getUniformLocation(prog, 'mvp');
+    prog.model = gl.getUniformLocation(prog, 'model');
+    prog.color = gl.getUniformLocation(prog, 'color');
+    var lvs = 'attribute vec3 p; uniform mat4 mvp; void main(){ gl_Position = mvp * vec4(p, 1.0); }';
+    var lfs = 'precision mediump float; uniform vec4 color; void main(){ gl_FragColor = color; }';
+    lines = gl.createProgram();
+    gl.attachShader(lines, compile(gl.VERTEX_SHADER, lvs));
+    gl.attachShader(lines, compile(gl.FRAGMENT_SHADER, lfs));
+    gl.linkProgram(lines);
+    if (!gl.getProgramParameter(lines, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(lines));
+    lines.p = gl.getAttribLocation(lines, 'p');
+    lines.mvp = gl.getUniformLocation(lines, 'mvp');
+    lines.color = gl.getUniformLocation(lines, 'color');
+    meshes = data.meshes.map(function (m) {
+      var pos = decode(m.positions, Float32Array), nor = decode(m.normals, Float32Array), idx = decode(m.indices, Uint32Array);
+      var seg = m.edges ? decode(m.edges, Float32Array) : new Float32Array(0);
+      var buf = function (target, arr) { var b = gl.createBuffer(); gl.bindBuffer(target, b); gl.bufferData(target, arr, gl.STATIC_DRAW); return b; };
+      var lo = [Infinity, Infinity, Infinity], hi = [-Infinity, -Infinity, -Infinity];
+      for (var i = 0; i < pos.length; i += 3) for (var k = 0; k < 3; k++) { lo[k] = Math.min(lo[k], pos[i + k]); hi[k] = Math.max(hi[k], pos[i + k]); }
+      return { p: buf(gl.ARRAY_BUFFER, pos), n: buf(gl.ARRAY_BUFFER, nor), i: buf(gl.ELEMENT_ARRAY_BUFFER, idx), count: idx.length, lo: lo, hi: hi,
+        e: seg.length ? buf(gl.ARRAY_BUFFER, seg) : null, edgeCount: seg.length / 3 };
+    });
+    return true;
+  }
+
+  function mul(a, b) {
+    var o = new Float32Array(16);
+    for (var c = 0; c < 4; c++) for (var r = 0; r < 4; r++) {
+      var s = 0; for (var k = 0; k < 4; k++) s += a[k * 4 + r] * b[c * 4 + k]; o[c * 4 + r] = s;
+    }
+    return o;
+  }
+  function sub(a, b) { return [a[0] - b[0], a[1] - b[1], a[2] - b[2]]; }
+  function cross(a, b) { return [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]]; }
+  function norm(a) { var l = Math.hypot(a[0], a[1], a[2]) || 1; return [a[0] / l, a[1] / l, a[2] / l]; }
+  function dot(a, b) { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]; }
+  function lookAt(eye, at, up) {
+    var z = norm(sub(eye, at)), x = norm(cross(up, z)), y = cross(z, x);
+    return new Float32Array([x[0], y[0], z[0], 0, x[1], y[1], z[1], 0, x[2], y[2], z[2], 0, -dot(x, eye), -dot(y, eye), -dot(z, eye), 1]);
+  }
+  function perspective(fov, aspect, near, far) {
+    var f = 1 / Math.tan(fov * Math.PI / 360);
+    return new Float32Array([f / aspect, 0, 0, 0, 0, f, 0, 0, 0, 0, (far + near) / (near - far), -1, 0, 0, 2 * far * near / (near - far), 0]);
+  }
+  function ortho(h, aspect, near, far) {
+    var w = h * aspect;
+    return new Float32Array([1 / w, 0, 0, 0, 0, 1 / h, 0, 0, 0, 0, -2 / (far - near), 0, 0, 0, -(far + near) / (far - near), 1]);
+  }
+  function scale(a, k) { return [a[0] * k, a[1] * k, a[2] * k]; }
+  function add(a, b) { return [a[0] + b[0], a[1] + b[1], a[2] + b[2]]; }
+  // `v` turned by `angle` about the unit `axis` (Rodrigues).
+  function rotate(v, axis, angle) {
+    var c = Math.cos(angle), s = Math.sin(angle);
+    return add(add(scale(v, c), scale(cross(axis, v), s)), scale(axis, dot(axis, v) * (1 - c)));
+  }
+  // The screen's up for a direction and a world up (true up = right x forward).
+  function screenUp(dir, up) {
+    var right = cross(up, dir);
+    if (Math.hypot(right[0], right[1], right[2]) < 1e-9) right = cross([0, 0, 1], dir);
+    if (Math.hypot(right[0], right[1], right[2]) < 1e-9) right = cross([0, 1, 0], dir);
+    return norm(cross(dir, norm(right)));
+  }
+  function translation(t) { return new Float32Array([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, t[0], t[1], t[2], 1]); }
+
+  // The bounds of the nodes a step shows, in world space.
+  function bounds(indices) {
+    var lo = [Infinity, Infinity, Infinity], hi = [-Infinity, -Infinity, -Infinity];
+    indices.forEach(function (i) {
+      var node = data.nodes[i], m = meshes[node.mesh], M = node.matrix;
+      if (!m) return; // no WebGL: nothing uploaded, nothing to frame
+      for (var c = 0; c < 8; c++) {
+        var p = [(c & 1) ? m.hi[0] : m.lo[0], (c & 2) ? m.hi[1] : m.lo[1], (c & 4) ? m.hi[2] : m.lo[2]];
+        for (var k = 0; k < 3; k++) {
+          var v = M[k] * p[0] + M[4 + k] * p[1] + M[8 + k] * p[2] + M[12 + k];
+          lo[k] = Math.min(lo[k], v); hi[k] = Math.max(hi[k], v);
+        }
+      }
+    });
+    return isFinite(lo[0]) ? { lo: lo, hi: hi } : { lo: [-1, -1, -1], hi: [1, 1, 1] };
+  }
+
+  function frameStep(step) {
+    // A step with a motion draws every node (the frames may move parts a
+    // later step places), so it frames the whole assembly; any other step
+    // frames what it has placed and adds.
+    var framed = step.motion && step.motion.frames && step.motion.frames.length ? data.nodes.map(function (_, i) { return i; }) : step.placed.concat(step.adding);
+    var b = bounds(framed);
+    var center = [0, 1, 2].map(function (k) { return (b.lo[k] + b.hi[k]) / 2; });
+    var radius = Math.max(1e-6, Math.hypot(b.hi[0] - b.lo[0], b.hi[1] - b.lo[1], b.hi[2] - b.lo[2]) / 2);
+    var view = step.camera, dir, dist;
+    cam.radius = radius;
+    // A camera captured in a wider window than this one keeps the step's
+    // parts in sight across, not only its height.
+    cam.minHalfWidth = radius * 1.05;
+    if (view) {
+      var d = sub(view.eye, view.target), len = Math.hypot(d[0], d[1], d[2]);
+      cam.target = view.target.slice();
+      dir = len > 1e-12 ? scale(d, 1 / len) : [0, 0, 1];
+      cam.up = screenUp(dir, norm(view.up));
+      cam.ortho = !view.fovDeg;
+      cam.fov = view.fovDeg || 35;
+      cam.half = view.halfHeight || radius * 1.2;
+      // An orthographic eye stands well clear of the parts it frames.
+      dist = cam.ortho ? Math.max(len, radius * 4) : (len || radius * 3);
+    } else {
+      cam.target = center;
+      dir = norm([0.6, 0.45, 0.66]);
+      cam.up = screenUp(dir, [0, 1, 0]);
+      cam.ortho = false;
+      cam.half = radius * 1.2;
+      dist = radius / Math.tan(cam.fov * Math.PI / 360) * 1.25;
+    }
+    cam.eye = add(cam.target, scale(dir, dist));
+  }
+
+  function draw(now) {
+    if (!gl || !steps.length) return;
+    var step = steps[current];
+    var w = canvas.clientWidth * devicePixelRatio | 0, h = canvas.clientHeight * devicePixelRatio | 0;
+    if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; }
+    gl.viewport(0, 0, w, h);
+    gl.clearColor(0.075, 0.106, 0.141, 1);
+    gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+    gl.enable(gl.DEPTH_TEST);
+    gl.useProgram(prog);
+    var dist = distance(), aspect = w / Math.max(1, h), far = dist + cam.radius * 8, near = Math.max(dist / 1000, 1e-4);
+    var proj = cam.ortho ? ortho(effectiveHalf(), aspect, -far, far) : perspective(cam.fov, aspect, near, far);
+    var vp = mul(proj, lookAt(cam.eye, cam.target, cam.up));
+    var t = anim.running ? Math.min(1, (now - anim.start) / DURATION) : 1;
+    var ease = 1 - Math.pow(1 - t, 3);
+    // The step's motion (a study's published frames), when it has one: its
+    // frame poses the nodes in place of the insertion slide and the view's
+    // explode poses.
+    if (motion && mplaying) {
+      mclock += Math.max(0, (now - mlast) / 1000); mlast = now;
+      var at = Math.round(mclock * motion.fps);
+      if (at >= motion.frames.length) { at = motion.frames.length - 1; mplaying = false; mclock = at / motion.fps; }
+      if (at !== mframe) { mframe = at; motionShow(); }
+    }
+    var mf = motion ? motion.frames[mframe] : null;
+    var poses = mf ? (mf.poses || {}) : {}, hidden = mf ? (mf.hidden || []) : [], opacity = mf ? (mf.opacity || {}) : {};
+    var offsets = {}, explode = {};
+    if (!mf) {
+      (step.insertion || []).forEach(function (ins) { offsets[ins.node] = ins.offset; });
+      // The step view's explode poses, after the node's own placement.
+      (step.poses || []).forEach(function (pose) { explode[pose.node] = new Float32Array(pose.matrix); });
+    }
+    var modelOf = function (i) {
+      var node = data.nodes[i], model = new Float32Array(node.matrix);
+      var ex = explode[i];
+      if (ex) model = mul(ex, model);
+      var off = offsets[i];
+      if (off) model = mul(translation([off[0] * (1 - ease), off[1] * (1 - ease), off[2] * (1 - ease)]), model);
+      if (mf) { var pose = motionPoseFor(node.occurrence, poses); if (pose) model = mul(new Float32Array(pose), model); }
+      return model;
+    };
+    var shown = function (i) { return !mf || !motionHas(data.nodes[i].occurrence, hidden); };
+    var fade = function (i) { var a = mf ? motionPoseFor(data.nodes[i].occurrence, opacity) : null; return a === null ? 1 : a; };
+    // With a motion every other node is drawn ghosted: the clip may move
+    // parts a later step places.
+    var adding = step.adding.filter(shown);
+    var inAdding = {};
+    step.adding.forEach(function (i) { inAdding[i] = true; });
+    var placed = (mf ? data.nodes.map(function (_, i) { return i; }).filter(function (i) { return !inAdding[i]; }) : step.placed).filter(shown);
+    var drawNode = function (i, color) {
+      var m = meshes[data.nodes[i].mesh], model = modelOf(i);
+      gl.uniformMatrix4fv(prog.mvp, false, mul(vp, model));
+      gl.uniformMatrix4fv(prog.model, false, model);
+      gl.uniform4fv(prog.color, color);
+      gl.bindBuffer(gl.ARRAY_BUFFER, m.p); gl.enableVertexAttribArray(prog.p); gl.vertexAttribPointer(prog.p, 3, gl.FLOAT, false, 0, 0);
+      gl.bindBuffer(gl.ARRAY_BUFFER, m.n); gl.enableVertexAttribArray(prog.n); gl.vertexAttribPointer(prog.n, 3, gl.FLOAT, false, 0, 0);
+      gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, m.i);
+      gl.drawElements(gl.TRIANGLES, m.count, gl.UNSIGNED_INT, 0);
+    };
+    // The edges over the faces, as the viewport draws them: the faces are
+    // pushed back a little so a line on a face is not lost in it.
+    var drawEdges = function (i, alpha) {
+      var m = meshes[data.nodes[i].mesh];
+      if (!m.e) return;
+      gl.uniformMatrix4fv(lines.mvp, false, mul(vp, modelOf(i)));
+      gl.uniform4fv(lines.color, [EDGE[0], EDGE[1], EDGE[2], alpha]);
+      gl.bindBuffer(gl.ARRAY_BUFFER, m.e); gl.enableVertexAttribArray(lines.p); gl.vertexAttribPointer(lines.p, 3, gl.FLOAT, false, 0, 0);
+      gl.drawArrays(gl.LINES, 0, m.edgeCount);
+    };
+    gl.enable(gl.POLYGON_OFFSET_FILL);
+    gl.polygonOffset(1, 1);
+    gl.disable(gl.BLEND);
+    gl.depthMask(true);
+    adding.forEach(function (i) { if (fade(i) >= 1) drawNode(i, [1.0, 0.6, 0.12, 1]); });
+    gl.enable(gl.BLEND);
+    gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+    gl.depthMask(false);
+    adding.forEach(function (i) { var a = fade(i); if (a < 1) drawNode(i, [1.0, 0.6, 0.12, a]); });
+    placed.forEach(function (i) {
+      var c = data.nodes[i].color;
+      drawNode(i, [c[0] * 0.5 + 0.25, c[1] * 0.5 + 0.25, c[2] * 0.5 + 0.25, 0.35 * fade(i)]);
+    });
+    gl.depthMask(true);
+    gl.disable(gl.POLYGON_OFFSET_FILL);
+    if (showEdges) {
+      gl.useProgram(lines);
+      gl.disableVertexAttribArray(prog.n);
+      adding.forEach(function (i) { drawEdges(i, fade(i)); });
+      gl.depthMask(false);
+      placed.forEach(function (i) { drawEdges(i, 0.35 * fade(i)); });
+      gl.depthMask(true);
+    }
+    if (t < 1 || (motion && mplaying)) requestAnimationFrame(draw); else anim.running = false;
+  }
+  function redraw() { requestAnimationFrame(motion && !motionInStep ? drawMotion : draw); }
+  // Replay: the step's motion from its first frame, else the insertion slide.
+  function play() {
+    if (motion && motionInStep) { motionSeek(0); motionPlay(); return; }
+    anim.start = performance.now(); anim.running = true; redraw();
+  }
+
+  // ---------- A motion study (data.motion, no steps) ----------
+  // The frames play on a timeline; each node draws under the frame's pose for
+  // its occurrence (a node's occurrence is its solid under the posed one),
+  // hidden or faded as the frame says, red-tinted when it clashes, and the
+  // camera follows a frame that carries one.
+  // `motionInStep`: the motion is a step's (data.steps[current].motion), drawn
+  // by draw() with the step's highlight and ghosts; else the page is a study's.
+  var motion = null, mframe = 0, mplaying = false, mclock = 0, mlast = 0, motionInStep = false, timelineBound = false;
+  function motionPoseFor(occurrence, map) {
+    var best = null, bestLen = -1;
+    for (var key in map) {
+      if ((occurrence === key || occurrence.indexOf(key + ':') === 0) && key.length > bestLen) { best = map[key]; bestLen = key.length; }
+    }
+    return best;
+  }
+  function motionHas(occurrence, list) {
+    for (var i = 0; i < list.length; i++) {
+      var key = list[i];
+      if (occurrence === key || occurrence.indexOf(key + ':') === 0) return true;
+    }
+    return false;
+  }
+  // The camera for a frame: the frame's own when it carries one, else the
+  // whole assembly framed from the default direction (as a step without a
+  // camera is).
+  function motionCamera(view) {
+    var all = data.nodes.map(function (_, i) { return i; });
+    var b = bounds(all);
+    var center = [0, 1, 2].map(function (k) { return (b.lo[k] + b.hi[k]) / 2; });
+    var radius = Math.max(1e-6, Math.hypot(b.hi[0] - b.lo[0], b.hi[1] - b.lo[1], b.hi[2] - b.lo[2]) / 2);
+    var dir, dist;
+    cam.radius = radius;
+    cam.minHalfWidth = radius * 1.05;
+    if (view) {
+      var d = sub(view.eye, view.target), len = Math.hypot(d[0], d[1], d[2]);
+      cam.target = view.target.slice();
+      dir = len > 1e-12 ? scale(d, 1 / len) : [0, 0, 1];
+      cam.up = screenUp(dir, norm(view.up));
+      cam.ortho = !view.fovDeg;
+      cam.fov = view.fovDeg || 35;
+      cam.half = view.halfHeight || radius * 1.2;
+      dist = cam.ortho ? Math.max(len, radius * 4) : (len || radius * 3);
+    } else {
+      cam.target = center;
+      dir = norm([0.6, 0.45, 0.66]);
+      cam.up = screenUp(dir, [0, 0, 1]);
+      cam.ortho = false;
+      cam.half = radius * 1.2;
+      dist = radius / Math.tan(cam.fov * Math.PI / 360) * 1.25;
+    }
+    cam.eye = add(cam.target, scale(dir, dist));
+  }
+  function drawMotion(now) {
+    if (!gl || !motion) return;
+    if (mplaying) {
+      mclock += Math.max(0, (now - mlast) / 1000); mlast = now;
+      var at = Math.round(mclock * motion.fps);
+      if (at >= motion.frames.length) { at = motion.frames.length - 1; mplaying = false; mclock = at / motion.fps; }
+      if (at !== mframe) { mframe = at; motionShow(); }
+    }
+    var frame = motion.frames[mframe];
+    var w = canvas.clientWidth * devicePixelRatio | 0, h = canvas.clientHeight * devicePixelRatio | 0;
+    if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; }
+    gl.viewport(0, 0, w, h);
+    gl.clearColor(0.075, 0.106, 0.141, 1);
+    gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+    gl.enable(gl.DEPTH_TEST);
+    gl.useProgram(prog);
+    var dist = distance(), aspect = w / Math.max(1, h), far = dist + cam.radius * 8, near = Math.max(dist / 1000, 1e-4);
+    var proj = cam.ortho ? ortho(effectiveHalf(), aspect, -far, far) : perspective(cam.fov, aspect, near, far);
+    var vp = mul(proj, lookAt(cam.eye, cam.target, cam.up));
+    var poses = frame.poses || {}, hidden = frame.hidden || [], opacity = frame.opacity || {}, clashing = frame.clashing || [];
+    var modelOf = function (i) {
+      var node = data.nodes[i], model = new Float32Array(node.matrix);
+      var pose = motionPoseFor(node.occurrence, poses);
+      return pose ? mul(new Float32Array(pose), model) : model;
+    };
+    var drawOne = function (i, alpha) {
+      var node = data.nodes[i], m = meshes[node.mesh];
+      if (!m) return;
+      var model = modelOf(i), c = node.color;
+      if (motionHas(node.occurrence, clashing)) c = [c[0] * 0.3 + 0.65, c[1] * 0.3 + 0.1, c[2] * 0.3 + 0.1];
+      gl.uniformMatrix4fv(prog.mvp, false, mul(vp, model));
+      gl.uniformMatrix4fv(prog.model, false, model);
+      gl.uniform4fv(prog.color, [c[0], c[1], c[2], alpha]);
+      gl.bindBuffer(gl.ARRAY_BUFFER, m.p); gl.enableVertexAttribArray(prog.p); gl.vertexAttribPointer(prog.p, 3, gl.FLOAT, false, 0, 0);
+      gl.bindBuffer(gl.ARRAY_BUFFER, m.n); gl.enableVertexAttribArray(prog.n); gl.vertexAttribPointer(prog.n, 3, gl.FLOAT, false, 0, 0);
+      gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, m.i);
+      gl.drawElements(gl.TRIANGLES, m.count, gl.UNSIGNED_INT, 0);
+    };
+    var drawEdgesOf = function (i, alpha) {
+      var m = meshes[data.nodes[i].mesh];
+      if (!m || !m.e) return;
+      gl.uniformMatrix4fv(lines.mvp, false, mul(vp, modelOf(i)));
+      gl.uniform4fv(lines.color, [EDGE[0], EDGE[1], EDGE[2], alpha]);
+      gl.bindBuffer(gl.ARRAY_BUFFER, m.e); gl.enableVertexAttribArray(lines.p); gl.vertexAttribPointer(lines.p, 3, gl.FLOAT, false, 0, 0);
+      gl.drawArrays(gl.LINES, 0, m.edgeCount);
+    };
+    var solid = [], faded = [];
+    data.nodes.forEach(function (node, i) {
+      if (motionHas(node.occurrence, hidden)) return;
+      var a = motionPoseFor(node.occurrence, opacity);
+      if (a !== null && a < 1) faded.push([i, a]); else solid.push(i);
+    });
+    gl.enable(gl.POLYGON_OFFSET_FILL);
+    gl.polygonOffset(1, 1);
+    gl.disable(gl.BLEND);
+    gl.depthMask(true);
+    solid.forEach(function (i) { drawOne(i, 1); });
+    if (faded.length) {
+      gl.enable(gl.BLEND);
+      gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+      gl.depthMask(false);
+      faded.forEach(function (f) { drawOne(f[0], f[1]); });
+      gl.depthMask(true);
+    }
+    gl.disable(gl.POLYGON_OFFSET_FILL);
+    if (showEdges && lines) {
+      gl.useProgram(lines);
+      gl.disableVertexAttribArray(prog.n);
+      solid.forEach(function (i) { drawEdgesOf(i, 1); });
+      gl.depthMask(false);
+      faded.forEach(function (f) { drawEdgesOf(f[0], f[1]); });
+      gl.depthMask(true);
+    }
+    if (mplaying) requestAnimationFrame(drawMotion);
+  }
+  function motionShow() {
+    var frame = motion.frames[mframe];
+    $('motion-scrub').value = String(mframe);
+    $('motion-time').textContent = frame.time.toFixed(2) + ' s · ' + (mframe + 1) + '/' + motion.frames.length;
+    $('motion-clash').textContent = frame.clashing && frame.clashing.length ? 'Interference' : '';
+    $('motion-play').textContent = mplaying ? '\u2759\u2759' : '\u25B6';
+    if (frame.camera && !motionInStep) motionCamera(frame.camera);
+  }
+  function motionSeek(i) {
+    if (!motion) return;
+    mframe = Math.max(0, Math.min(motion.frames.length - 1, i | 0));
+    mclock = mframe / motion.fps;
+    motionShow();
+    redraw();
+  }
+  function motionPlay() {
+    if (!motion) return;
+    if (mframe >= motion.frames.length - 1) { mframe = 0; mclock = 0; }
+    mplaying = true; mlast = performance.now(); motionShow(); redraw();
+  }
+  function motionPause() { mplaying = false; motionShow(); redraw(); }
+  function bindTimeline() {
+    var scrub = $('motion-scrub');
+    scrub.max = String(motion.frames.length - 1);
+    if (!timelineBound) {
+      timelineBound = true;
+      // Read the slider before pausing: pausing redraws the slider at the frame shown.
+      scrub.addEventListener('input', function () { var at = parseInt(scrub.value, 10); mplaying = false; motionSeek(at); });
+      $('motion-play').addEventListener('click', function () { if (mplaying) motionPause(); else motionPlay(); });
+    }
+    var marks = $('motion-marks');
+    marks.textContent = '';
+    motion.frames.forEach(function (frame, i) {
+      if (!frame.clashing || !frame.clashing.length) return;
+      var mark = el('span');
+      mark.style.left = (motion.frames.length > 1 ? (100 * i / (motion.frames.length - 1)) : 0) + '%';
+      marks.appendChild(mark);
+    });
+  }
+  // A step's motion, when the step has one: the timeline shows under the
+  // view and the frames pose the step's drawing; go() plays it from frame 0.
+  function setStepMotion(step) {
+    var next = step && step.motion && step.motion.frames && step.motion.frames.length ? step.motion : null;
+    mplaying = false; mframe = 0; mclock = 0;
+    motion = next;
+    motionInStep = !!next;
+    document.body.classList.toggle('step-motion', motionInStep);
+    if (next) { bindTimeline(); motionShow(); }
+  }
+  function startMotion() {
+    motion = data.motion;
+    document.body.classList.add('motion');
+    $('title').textContent = '';
+    bindTimeline();
+    document.addEventListener('keydown', function (e) {
+      if (e.target && e.target.tagName === 'INPUT') return;
+      if (e.key === ' ') { e.preventDefault(); if (mplaying) motionPause(); else motionPlay(); }
+      if (e.key === 'ArrowRight') { motionPause(); motionSeek(mframe + 1); }
+      if (e.key === 'ArrowLeft') { motionPause(); motionSeek(mframe - 1); }
+    });
+    var first = motion.frames[0];
+    motionCamera(first.camera || null);
+    motionSeek(0);
+  }
+
+  // The camera as the app's viewport reports it (BREP_render view.rs): its
+  // size in CSS px, its basis, the world units one pixel spans on the focus
+  // plane, and a world point's place on the screen.
+  function camWidth() { return Math.max(1, canvas.clientWidth); }
+  function camHeight() { return Math.max(1, canvas.clientHeight); }
+  function effectiveHalf() { return Math.max(cam.half, cam.minHalfWidth / (camWidth() / camHeight())); }
+  function distance() { return Math.max(1e-9, Math.hypot(cam.eye[0] - cam.target[0], cam.eye[1] - cam.target[1], cam.eye[2] - cam.target[2])); }
+  function basis() {
+    var forward = norm(sub(cam.target, cam.eye)), right = norm(cross(forward, cam.up));
+    return { right: right, up: cross(right, forward), forward: forward };
+  }
+  function worldPerPixel() {
+    return cam.ortho ? 2 * effectiveHalf() / camHeight() : 2 * Math.tan(cam.fov * Math.PI / 360) * distance() / camHeight();
+  }
+  function project(world) {
+    var b = basis(), rel = sub(world, cam.eye), vx = dot(rel, b.right), vy = dot(rel, b.up), depth = dot(rel, b.forward);
+    var aspect = camWidth() / camHeight();
+    if (cam.ortho) {
+      var hh = effectiveHalf(), hw = hh * aspect;
+      return [(vx / hw * 0.5 + 0.5) * camWidth(), (0.5 - vy / hh * 0.5) * camHeight(), depth];
+    }
+    var ph = Math.tan(cam.fov * Math.PI / 360), pw = ph * aspect, d = Math.max(depth, 1e-9);
+    return [(vx / (pw * d) * 0.5 + 0.5) * camWidth(), (0.5 - vy / (ph * d) * 0.5) * camHeight(), depth];
+  }
+  // The world point on the focus plane (through the target) under a CSS px.
+  function focusPointAt(cx, cy) {
+    var b = basis(), wpp = worldPerPixel();
+    return add(cam.target, add(scale(b.right, (cx - camWidth() * 0.5) * wpp), scale(b.up, -(cy - camHeight() * 0.5) * wpp)));
+  }
+
+  // The app's viewport controls (BREP_render controls.rs), the same maths and
+  // constants: a left drag is a free trackball rotate about the target, a
+  // middle or right drag pans the scene with the cursor, the wheel zooms by
+  // 1.08 per 70 points toward the cursor, and two fingers pinch and pan at
+  // once. Positions are CSS px from the canvas's top-left corner.
+  var ZOOM_PER_NOTCH = 1.08, WHEEL_POINTS_PER_NOTCH = 70, MAX_WHEEL_NOTCHES_PER_EVENT = 3;
+  var MIN_ORTHO_HALF_HEIGHT = 1e-9, MIN_PERSP_DISTANCE = 1e-6;
+  // Zoom by `factor` (> 1 zooms out) keeping the focus-plane point under the
+  // cursor where it is.
+  function zoomToward(factor, cx, cy) {
+    var b = basis(), wpp = worldPerPixel();
+    var off = add(scale(b.right, (cx - camWidth() * 0.5) * wpp), scale(b.up, -(cy - camHeight() * 0.5) * wpp));
+    if (cam.ortho) {
+      var old = effectiveHalf(), f = Math.max(old * factor, MIN_ORTHO_HALF_HEIGHT) / old;
+      cam.half *= f;
+      cam.minHalfWidth *= f;
+      var shift = scale(off, 1 - f);
+      cam.target = add(cam.target, shift);
+      cam.eye = add(cam.eye, shift);
+    } else {
+      var at = add(cam.target, off);
+      var nt = add(at, scale(sub(cam.target, at), factor)), ne = add(at, scale(sub(cam.eye, at), factor));
+      var dir = sub(ne, nt), dist = Math.max(Math.hypot(dir[0], dir[1], dir[2]), MIN_PERSP_DISTANCE);
+      cam.target = nt;
+      cam.eye = add(nt, scale(norm(dir), dist));
+    }
+  }
+  // Pan by a screen delta: the scene follows the cursor.
+  function pan(dx, dy) {
+    var b = basis(), wpp = worldPerPixel();
+    var offset = add(scale(b.right, -dx * wpp), scale(b.up, dy * wpp));
+    cam.eye = add(cam.eye, offset);
+    cam.target = add(cam.target, offset);
+  }
+  // A cursor on the virtual trackball: Shoemake's sphere with a hyperbolic
+  // skirt past its edge, in camera space.
+  function trackballPoint(x, y) {
+    var radius = 0.5 * Math.max(1, Math.min(camWidth(), camHeight())) * 0.75;
+    var px = x - camWidth() * 0.5, py = camHeight() * 0.5 - y, r2 = radius * radius, d2 = px * px + py * py;
+    var pz = d2 <= r2 * 0.5 ? Math.sqrt(r2 - d2) : r2 * 0.5 / Math.sqrt(d2);
+    return norm([px, py, pz]);
+  }
+  // Trackball rotate from one cursor to the next: the eye and the up vector
+  // turn about the target, with no up-axis lock.
+  function rotateArcball(from, to) {
+    var v0 = trackballPoint(from[0], from[1]), v1 = trackballPoint(to[0], to[1]);
+    var axisCam = cross(v0, v1), axisLen = Math.hypot(axisCam[0], axisCam[1], axisCam[2]);
+    if (axisLen < 1e-12) return;
+    var angle = Math.acos(Math.max(-1, Math.min(1, dot(v0, v1))));
+    if (Math.abs(angle) < 1e-12) return;
+    var b = basis();
+    axisCam = scale(axisCam, 1 / axisLen);
+    var axis = norm(add(add(scale(b.right, axisCam[0]), scale(b.up, axisCam[1])), scale(b.forward, -axisCam[2])));
+    cam.eye = add(cam.target, rotate(sub(cam.eye, cam.target), axis, -angle));
+    cam.up = norm(rotate(cam.up, axis, -angle));
+  }
+  // Two fingers: zoom about the previous midpoint by the distance ratio, then
+  // carry that point to the new midpoint.
+  function touchNavigation(from, to, k) {
+    if (!(k > 0) || !isFinite(k) || (from[0] === to[0] && from[1] === to[1] && k === 1)) return false;
+    zoomToward(1 / k, from[0], from[1]);
+    pan(to[0] - from[0], to[1] - from[1]);
+    return true;
+  }
+
+  // Input, routed as the app's viewport routes it (BREP_app viewport/touch.rs):
+  // a mouse or a single finger drives a gesture by button (left rotates,
+  // middle or right pans); the second finger captures navigation for both
+  // until every finger lifts, so a leftover finger never becomes an orbit.
+  var gesture = 'none', last = [0, 0], touches = {}, captured = false;
+  function local(e) { var r = canvas.getBoundingClientRect(); return [e.clientX - r.left, e.clientY - r.top]; }
+  function pair() {
+    var ids = Object.keys(touches);
+    if (ids.length !== 2) return null;
+    var a = touches[ids[0]], b = touches[ids[1]];
+    return { mid: [(a[0] + b[0]) * 0.5, (a[1] + b[1]) * 0.5], span: Math.hypot(a[0] - b[0], a[1] - b[1]) };
+  }
+  canvas.addEventListener('pointerdown', function (e) {
+    try { canvas.setPointerCapture(e.pointerId); } catch (err) { /* a synthetic pointer */ }
+    if (e.pointerType === 'touch') {
+      touches[e.pointerId] = local(e);
+      if (pair()) { captured = true; gesture = 'none'; }
+    }
+    if (captured) return;
+    gesture = e.button === 0 ? 'rotate' : (e.button === 1 || e.button === 2) ? 'pan' : 'none';
+    last = local(e);
+  });
+  function release(e) {
+    delete touches[e.pointerId];
+    if (!Object.keys(touches).length) captured = false;
+    gesture = 'none';
+  }
+  canvas.addEventListener('pointerup', release);
+  canvas.addEventListener('pointercancel', release);
+  canvas.addEventListener('pointermove', function (e) {
+    var changed = false;
+    if (e.pointerType === 'touch' && touches[e.pointerId]) {
+      var before = pair();
+      touches[e.pointerId] = local(e);
+      var after = pair();
+      if (captured && before && after) {
+        // Nearly coincident fingers have no reliable scale: keep panning.
+        var k = before.span >= 4 && after.span >= 4 ? after.span / before.span : 1;
+        changed = touchNavigation(before.mid, after.mid, k);
+      }
+    } else if (gesture !== 'none' && !captured) {
+      var now = local(e);
+      if (now[0] !== last[0] || now[1] !== last[1]) {
+        if (gesture === 'rotate') rotateArcball(last, now); else pan(now[0] - last[0], now[1] - last[1]);
+        last = now;
+        changed = true;
+      }
+    }
+    if (changed) redraw();
+  });
+  canvas.addEventListener('contextmenu', function (e) { e.preventDefault(); });
+  canvas.addEventListener('wheel', function (e) {
+    e.preventDefault();
+    // Browser deltas to points as the app's bridge does: lines are 40 points,
+    // pages 20 lines; then a fractional notch count and an exponential step.
+    var points = e.deltaY * (e.deltaMode === 1 ? 40 : e.deltaMode === 2 ? 800 : 1);
+    if (!points) return;
+    var notches = Math.max(-MAX_WHEEL_NOTCHES_PER_EVENT, Math.min(MAX_WHEEL_NOTCHES_PER_EVENT, points / WHEEL_POINTS_PER_NOTCH));
+    var p = local(e);
+    zoomToward(Math.pow(ZOOM_PER_NOTCH, notches), p[0], p[1]);
+    redraw();
+  }, { passive: false });
+  window.addEventListener('resize', redraw);
+
+  // ---------- Steps ----------
+  // The data lists the steps flat in reading order (a step's children before
+  // it), each with its parent's id and depth. Data from before the step tree
+  // carried chapters of steps: flattened the same way, every step at the top.
+  function flatten() {
+    steps = data.steps ? data.steps.slice() : [];
+    if (!data.steps && data.chapters) {
+      data.chapters.forEach(function (chapter) {
+        chapter.steps.forEach(function (step) { step.chapter = chapter.title; steps.push(step); });
+      });
+    }
+    var byId = {};
+    steps.forEach(function (step) { byId[step.id] = step; });
+    steps.forEach(function (step) {
+      step.depth = step.depth || 0;
+      var parent = step.parent ? byId[step.parent] : null;
+      step.group = parent ? parent.title : (step.chapter || '');
+    });
+  }
+
+  function renderChecklist() {
+    var list = $('checklist');
+    list.textContent = '';
+    steps.forEach(function (step, i) {
+      var row = el('div', 'check d' + Math.min(step.depth, 3) + (i === current ? ' current' : '') + (done[step.id] ? ' done' : ''));
+      row.setAttribute('data-step', step.id);
+      row.appendChild(el('span', 'box'));
+      row.appendChild(el('span', '', step.number + '. ' + step.title));
+      row.addEventListener('click', function () { go(i); });
+      list.appendChild(row);
+    });
+  }
+
+  function renderStep() {
+    var step = steps[current];
+    $('chapter').textContent = step.group;
+    $('title').textContent = step.number + '. ' + step.title;
+    $('count').textContent = 'Step ' + (current + 1) + ' of ' + steps.length;
+    $('back').disabled = current === 0;
+    $('next').disabled = current === steps.length - 1;
+    var adds = $('adds');
+    adds.textContent = '';
+    step.adds.forEach(function (add) {
+      var row = el('div', 'add');
+      var pic = safeImage(add.thumbnail);
+      if (pic) { var img = el('img'); img.alt = ''; img.src = pic; row.appendChild(img); }
+      if (add.findNumber) row.appendChild(el('span', 'find', add.findNumber));
+      var label = el('span');
+      label.appendChild(el('span', 'qty', add.quantity + '× '));
+      label.appendChild(document.createTextNode(add.name || add.part));
+      row.appendChild(label);
+      adds.appendChild(row);
+    });
+    var tools = $('tools');
+    tools.textContent = '';
+    // A tool's picture from the library (customer mode shows the tools for
+    // their pictures: name and picture, no spec); an offline page has only
+    // the inlined ones, and a picture that fails to load is taken out.
+    (step.tools || []).forEach(function (tool) {
+      var row = el('div', 'tool');
+      var url = tool.toolId && data.toolPictures ? safeImage(data.toolPictures[tool.toolId]) : null;
+      if (url && offline && url.indexOf('data:') !== 0) url = null;
+      if (url) {
+        var img = el('img');
+        img.alt = tool.name;
+        img.onerror = function () { if (img.parentNode) img.parentNode.removeChild(img); };
+        img.src = url;
+        row.appendChild(img);
+      }
+      row.appendChild(el('span', '', mode === 'customer' || !tool.spec ? tool.name : tool.name + ' — ' + tool.spec));
+      tools.appendChild(row);
+    });
+    $('tools-section').hidden = !(step.tools && step.tools.length);
+    $('torque').textContent = step.torque || '';
+    $('torque-section').hidden = !step.torque;
+    var callouts = $('callouts');
+    callouts.textContent = '';
+    (step.callouts || []).forEach(function (c) {
+      if (mode === 'customer' && c.kind !== 'caution') return;
+      var box = el('div', 'callout ' + (c.kind === 'caution' || c.kind === 'check' ? c.kind : 'note'));
+      box.appendChild(el('b', '', c.kind === 'caution' ? 'Caution' : c.kind === 'check' ? 'Check' : 'Note'));
+      box.appendChild(document.createTextNode(c.text));
+      callouts.appendChild(box);
+    });
+    $('notes').textContent = step.notes || '';
+    renderSignoff(step);
+    if (mode === 'shop') renderChecklist();
+    var fallback = $('fallback');
+    if (!gl) {
+      var pic2 = safeImage(step.image);
+      if (pic2) {
+        if (!fallback) { fallback = el('img'); fallback.id = 'fallback'; fallback.alt = step.title; $('viewport').appendChild(fallback); }
+        fallback.src = pic2;
+      }
+    }
+  }
+
+  function renderSignoff(step) {
+    var box = $('signoff');
+    box.textContent = '';
+    if (mode !== 'shop' || !step.signoff) return;
+    var signedRecord = job && job.steps ? job.steps.filter(function (s) { return s.step === step.id && s.signed_by; })[0] : null;
+    if (signedRecord) {
+      box.appendChild(el('div', '', 'Signed by ' + signedRecord.signed_by + ' at ' + signedRecord.signed_at)).id = 'signed';
+      return;
+    }
+    if (done[step.id] && !config.job) {
+      box.appendChild(el('div', '', 'Checked')).id = 'signed';
+      var undo = el('button', '', 'Uncheck');
+      undo.addEventListener('click', function () { delete done[step.id]; renderStep(); });
+      box.appendChild(undo);
+      return;
+    }
+    var inputs = [];
+    if (config.job) {
+      step.adds.forEach(function (add) {
+        if (!add.serialTracked) return;
+        add.occurrences.forEach(function (occ, k) {
+          var input = el('input');
+          input.placeholder = 'Serial: ' + (add.name || add.part) + (add.quantity > 1 ? ' #' + (k + 1) : '');
+          input.setAttribute('data-occurrence', occ);
+          input.setAttribute('data-part', add.part);
+          inputs.push(input);
+          box.appendChild(input);
+        });
+      });
+    }
+    var button = el('button', 'primary', config.job ? 'Sign off step' : 'Mark step done');
+    button.id = 'signoff-button';
+    var message = el('div', '', '');
+    message.id = 'message';
+    button.addEventListener('click', function () {
+      if (!config.job) { done[step.id] = true; renderStep(); return; }
+      var serials = inputs.map(function (i) { return { occurrence: i.getAttribute('data-occurrence'), part: i.getAttribute('data-part'), serial: i.value.trim() }; });
+      if (serials.some(function (s) { return !s.serial; })) { message.textContent = 'Enter every serial number first.'; return; }
+      button.disabled = true;
+      signoff(step.id, serials).then(function () { button.disabled = false; renderStep(); }, function (err) {
+        button.disabled = false;
+        message.textContent = err.message;
+      });
+    });
+    box.appendChild(button);
+    box.appendChild(message);
+  }
+
+  // ---------- Jobs floor (served by the PLM, shop mode with a job) ----------
+  var csrf = '';
+  function api(method, path, body) {
+    var headers = { 'Accept': 'application/json' };
+    if (body !== undefined) headers['Content-Type'] = 'application/json';
+    if (method !== 'GET' && csrf) headers['X-CSRF-Token'] = csrf;
+    return fetch(path, { method: method, headers: headers, credentials: 'same-origin', body: body === undefined ? undefined : JSON.stringify(body) })
+      .then(function (r) {
+        return r.text().then(function (text) {
+          var json = null;
+          try { json = text ? JSON.parse(text) : null; } catch (e) { json = null; }
+          if (!r.ok) throw new Error((json && (json.error || json.message)) || ('HTTP ' + r.status));
+          return json;
+        });
+      });
+  }
+  function loadJob() {
+    var id = encodeURIComponent(config.job);
+    return api('GET', '/api/me').then(function (me) { csrf = (me && me.csrf) || ''; })
+      .then(function () { return api('GET', '/api/jobs/' + id); })
+      .then(function (j) {
+        job = j;
+        (j.steps || []).forEach(function (s) { if (s.signed_by) done[s.step] = true; });
+      });
+  }
+  function signoff(stepId, serials) {
+    var path = '/api/jobs/' + encodeURIComponent(config.job) + '/steps/' + encodeURIComponent(stepId) + '/signoff';
+    return api('POST', path, { serials: serials }).then(function (record) {
+      done[stepId] = true;
+      if (job) {
+        var row = (job.steps || []).filter(function (s) { return s.step === stepId; })[0];
+        if (row && record) { row.signed_by = record.signed_by; row.signed_at = record.signed_at; }
+      }
+    });
+  }
+
+  function go(i) {
+    if (i < 0 || i >= steps.length) return;
+    current = i;
+    frameStep(steps[current]);
+    renderStep();
+    setStepMotion(steps[current]);
+    play();
+  }
+
+  $('back').addEventListener('click', function () { go(current - 1); });
+  $('next').addEventListener('click', function () { go(current + 1); });
+  $('replay').addEventListener('click', play);
+  document.addEventListener('keydown', function (e) {
+    if (e.target && e.target.tagName === 'INPUT') return;
+    if (e.key === 'ArrowRight' || e.key === 'PageDown') go(current + 1);
+    if (e.key === 'ArrowLeft' || e.key === 'PageUp') go(current - 1);
+    if (e.key === ' ' && motion && motionInStep) { e.preventDefault(); if (mplaying) motionPause(); else motionPlay(); }
+  });
+
+  // For automation: the player's state, read-only.
+  // For automation: a motion study's player, read-only state plus seek/play.
+  window.brepMotion = {
+    state: function () {
+      if (!motion) return null;
+      var frame = motion.frames[mframe];
+      return { frame: mframe, frames: motion.frames.length, time: frame.time, playing: mplaying, fps: motion.fps, hidden: frame.hidden || [], clashing: frame.clashing || [], camera: !!frame.camera, webgl: !!gl,
+        step: motionInStep && steps[current] ? steps[current].id : null };
+    },
+    seek: motionSeek, play: motionPlay, pause: motionPause
+  };
+  window.brepInstructions = {
+    state: function () {
+      return { mode: mode, step: steps[current] ? steps[current].id : null, index: current, steps: steps.length, done: Object.keys(done), webgl: !!gl, webgl2: gl2, animating: anim.running,
+        edges: meshes.filter(function (m) { return m.edgeCount > 0; }).length };
+    },
+    go: go,
+    camera: function () {
+      return { eye: cam.eye.slice(), target: cam.target.slice(), up: basis().up, ortho: cam.ortho, halfHeight: effectiveHalf(), fovDeg: cam.fov,
+        width: camWidth(), height: camHeight(), worldPerPixel: worldPerPixel() };
+    },
+    project: project,
+    focusPointAt: focusPointAt,
+    // For automation: draw the edges or not (the verifier compares the two).
+    edges: function (on) { showEdges = !!on; redraw(); }
+  };
+
+  load().then(function (d) {
+    data = d;
+    $('doc-title').textContent = data.title || 'Instructions';
+    document.title = data.title || 'Instructions';
+    $('doc-sub').textContent = data.subtitle || '';
+    flatten();
+    try { initGL(); } catch (e) { gl = null; }
+    if (!steps.length && data.motion && data.motion.frames && data.motion.frames.length) { startMotion(); return; }
+    if (!steps.length) { $('title').textContent = 'No steps'; return; }
+    var ready = (mode === 'shop' && config.job) ? loadJob().catch(function (err) { $('doc-sub').textContent = 'Job: ' + err.message; }) : Promise.resolve();
+    return ready.then(function () { go(0); });
+  }).catch(function (err) {
+    $('title').textContent = 'Could not load the instructions';
+    $('notes').textContent = err.message;
+  });
+})();
+</script>
+</body>
+</html>

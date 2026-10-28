@@ -3,7 +3,7 @@
 const __pluginHost = (() => {
  const nativeGeometry=globalThis.__geometry;delete globalThis.__geometry;
  const NativeWeakMap=WeakMap, hasHandle=Function.prototype.call.bind(WeakMap.prototype.has), getHandle=Function.prototype.call.bind(WeakMap.prototype.get), setHandle=Function.prototype.call.bind(WeakMap.prototype.set);
- const features=[], actions=[], workbenches=[], panels=[], annotations=[];
+ const features=[], actions=[], workbenches=[], panels=[], annotations=[], posts=[];
  const callbacks=new Map(); let sealed=false;
  const jsonSafe=(v,seen=new Set())=>{if(typeof v==='number'&&!Number.isFinite(v))throw Error('nonfinite JSON value');if(typeof v==='function'||typeof v==='symbol'||typeof v==='bigint'||v===undefined)throw Error('non-JSON value');if(v&&typeof v==='object'){if(seen.has(v))throw Error('cyclic JSON value');seen.add(v);for(const x of Object.values(v))jsonSafe(x,seen);seen.delete(v);}return v;};
  const sync=v=>{if(v && (typeof v.then==='function'))throw Error('Promise/thenable results unsupported');return v;};
@@ -16,8 +16,8 @@ const __pluginHost = (() => {
   const metadata={};for(const k of Object.keys(d)){if(k!==fn){if(typeof d[k]==='function')throw Error('unsupported callback '+k);metadata[k]=d[k];}}
   list.push(metadata);
  };
- const app=Object.freeze({registerFeature:d=>register('feature',features,d,'execute'),registerAction:d=>register('action',actions,d,'run'),registerWorkbench:d=>register('workbench',workbenches,d),registerPanel:d=>register('panel',panels,d),registerAnnotation:d=>register('annotation',annotations,d,'execute'),addSidePanel:d=>register('panel',panels,d),addToolbarButton:d=>register('action',actions,d,'run')});
- const metadata=()=>jsonSafe({features,actions,workbenches,panels,annotations});
+ const app=Object.freeze({registerFeature:d=>register('feature',features,d,'execute'),registerAction:d=>register('action',actions,d,'run'),registerWorkbench:d=>register('workbench',workbenches,d),registerPanel:d=>register('panel',panels,d),registerAnnotation:d=>register('annotation',annotations,d,'execute'),registerPost:d=>register('post',posts,d),addSidePanel:d=>register('panel',panels,d),addToolbarButton:d=>register('action',actions,d,'run')});
+ const metadata=()=>jsonSafe({features,actions,workbenches,panels,annotations,posts});
  const invoke=(kind,id,input)=>{
   const def=callbacks.get(id);if(!def||def.kind!==kind)throw Error('registration unavailable '+id);
   if(kind==='annotation') {

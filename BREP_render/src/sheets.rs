@@ -38,6 +38,7 @@ pub mod hlr;
 pub mod ordinate;
 pub mod pdf;
 pub mod pdf3d;
+pub mod print;
 pub mod project;
 pub mod svg;
 pub mod u3d;
@@ -361,6 +362,15 @@ impl SectionCut {
     ];
 }
 
+/// The first of [`SectionCut::LETTERS`] not in `taken`; past `Z`, the last.
+fn first_free_letter(taken: &[String]) -> String {
+    SectionCut::LETTERS
+        .iter()
+        .map(|letter| letter.to_string())
+        .find(|letter| !taken.iter().any(|used| used == letter))
+        .unwrap_or_else(|| SectionCut::LETTERS[SectionCut::LETTERS.len() - 1].to_string())
+}
+
 fn default_scale() -> f64 {
     DEFAULT_SCALE
 }
@@ -407,23 +417,46 @@ impl Sheet {
     /// with a `SECTION A—A` and a `DETAIL A` names two different views with
     /// one letter. A sheet past `Z` reuses the last one rather than refusing
     /// the view: two views sharing a letter is a drawing-office mistake, not a
-    /// broken document, and the form is where it is corrected.
-    pub fn next_view_letter(&self) -> String {
-        let taken: Vec<&str> = self
-            .views
+    /// broken document, and the form is where it is corrected. `views` are
+    /// the document's PMI views: a placement of a SECTIONED saved view holds
+    /// a letter too ([`Self::view_letters`]).
+    pub fn next_view_letter(&self, views: &[brep_kernel::PmiView]) -> String {
+        let taken: Vec<String> = self.view_letters(views).into_iter().flatten().collect();
+        first_free_letter(&taken)
+    }
+
+    /// Each placement's letter, in placement order. A section or a detail
+    /// carries its own. A plain placement of a saved view that is itself
+    /// SECTIONED (its PMI view's display has a section) is captioned
+    /// `SECTION A—A` too, and takes the first letter nothing stored holds and
+    /// no earlier such placement took — so it is the same letter every time
+    /// the sheet is drawn, and a section or detail added later skips it.
+    pub fn view_letters(&self, views: &[brep_kernel::PmiView]) -> Vec<Option<String>> {
+        let stored = |placed: &PlacedView| {
+            placed
+                .section
+                .as_ref()
+                .map(|cut| cut.label.clone())
+                .or_else(|| placed.detail.as_ref().map(|circle| circle.label.clone()))
+        };
+        let mut taken: Vec<String> = self.views.iter().filter_map(stored).collect();
+        self.views
             .iter()
-            .filter_map(|view| {
-                view.section
-                    .as_ref()
-                    .map(|cut| cut.label.as_str())
-                    .or_else(|| view.detail.as_ref().map(|circle| circle.label.as_str()))
+            .map(|placed| {
+                if let Some(letter) = stored(placed) {
+                    return Some(letter);
+                }
+                let sectioned = views
+                    .iter()
+                    .find(|view| view.id == placed.view)
+                    .is_some_and(|view| view.display.section.is_some());
+                sectioned.then(|| {
+                    let letter = first_free_letter(&taken);
+                    taken.push(letter.clone());
+                    letter
+                })
             })
-            .collect();
-        SectionCut::LETTERS
-            .iter()
-            .map(|letter| letter.to_string())
-            .find(|letter| !taken.iter().any(|used| used == letter))
-            .unwrap_or_else(|| SectionCut::LETTERS[SectionCut::LETTERS.len() - 1].to_string())
+            .collect()
     }
 }
 

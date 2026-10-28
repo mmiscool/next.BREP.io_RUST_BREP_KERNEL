@@ -23,7 +23,7 @@ pub struct HeadlessConfig {
     /// Frames to step while waiting for one command's reply before giving up.
     pub max_steps: u32,
     /// HANG GUARD on the seed history landing before the first command
-    /// ([`settle`]). Generous on purpose and with NO performance meaning:
+    /// (`settle`). Generous on purpose and with NO performance meaning:
     /// nothing about the app is asserted by how long the seed takes, only that
     /// it finishes at all. Sixty seconds to match the other liveness guards in
     /// the UI-side suites.
@@ -216,19 +216,77 @@ pub fn spawn(cfg: impl Into<HeadlessConfig>) -> Result<HostHandle, String> {
 /// than in the image compositor.
 type App = Harness<'static, Annotated>;
 
+/// The text face every headless session draws with — the face the scripts'
+/// pinned layouts were recorded in. A family name, resolved through fontconfig
+/// (the repo ships no font file); [`SCRIPT_FONT_FILE`] is how its file is
+/// recognised when fontconfig substitutes another.
+const SCRIPT_FONT: &str = "DejaVu Sans Mono";
+const SCRIPT_FONT_FILE: &str = "DejaVuSansMono";
+
+/// `BREP_MCP_ADAPTER=gpu`: render on a hardware GPU, for MEASUREMENT runs only
+/// (playback timings on a machine that has one). kittest's own setup ranks a
+/// CPU rasteriser first, so screenshots come out the same on every machine, and
+/// the gated test-mcp keeps it: its baselines were recorded that way. This
+/// ranks discrete over integrated over any other GPU and falls back to the CPU
+/// adapter with a notice. The adapter used is in `__brepDiagnostics`, which a
+/// timing record quotes.
+fn gpu_setup() -> Option<eframe::egui_wgpu::WgpuSetup> {
+    use eframe::egui_wgpu::{wgpu, WgpuSetup};
+    match std::env::var("BREP_MCP_ADAPTER").ok()?.to_ascii_lowercase().as_str() {
+        "gpu" => {}
+        "" | "cpu" => return None,
+        other => {
+            eprintln!("brep-mcp: BREP_MCP_ADAPTER={other} is not gpu or cpu; using the CPU adapter");
+            return None;
+        }
+    }
+    let mut setup = egui_kittest::wgpu::default_wgpu_setup();
+    if let WgpuSetup::CreateNew(create) = &mut setup {
+        create.native_adapter_selector = Some(Arc::new(|adapters, _surface| {
+            let rank = |a: &&wgpu::Adapter| match a.get_info().device_type {
+                wgpu::DeviceType::DiscreteGpu => 0,
+                wgpu::DeviceType::IntegratedGpu => 1,
+                wgpu::DeviceType::Other | wgpu::DeviceType::VirtualGpu => 2,
+                wgpu::DeviceType::Cpu => 3,
+            };
+            let mut ranked: Vec<&wgpu::Adapter> = adapters.iter().collect();
+            ranked.sort_by_key(rank);
+            let chosen = ranked.first().map(|a| (*a).clone()).ok_or_else(|| "No adapter found".to_owned())?;
+            if chosen.get_info().device_type == wgpu::DeviceType::Cpu {
+                eprintln!("brep-mcp: BREP_MCP_ADAPTER=gpu but no GPU adapter is available; using {}", chosen.get_info().name);
+            }
+            Ok(chosen)
+        }));
+    }
+    Some(setup)
+}
+
 fn build(cfg: &HeadlessConfig) -> Result<(App, HostInfo), String> {
     std::fs::create_dir_all(&cfg.store_dir).map_err(|e| format!("store dir {}: {e}", cfg.store_dir.display()))?;
     let store_dir = cfg.store_dir.clone();
     let seed = cfg.seed;
     let adapter = Arc::new(Mutex::new(String::new()));
     let adapter_out = adapter.clone();
-    let harness = Harness::builder()
+    let builder = Harness::builder()
         .with_size(egui::vec2(cfg.width, cfg.height))
         .with_pixels_per_point(cfg.ppp)
-        .with_step_dt(1.0 / 60.0)
-        .wgpu()
+        .with_step_dt(1.0 / 60.0);
+    let builder = match gpu_setup() {
+        Some(setup) => builder.wgpu_setup(setup),
+        None => builder.wgpu(),
+    };
+    let harness = builder
         .build_eframe(move |cc| {
-            brep_app::fonts::install(&cc.egui_ctx);
+            // One named face, never whatever the machine answers for
+            // `monospace`: the scripts' recorded chrome/camera values were
+            // recorded with it and must hold on every host.
+            let font = brep_app::fonts::install_matching(&cc.egui_ctx, SCRIPT_FONT);
+            if !font.as_deref().is_some_and(|path| path.contains(SCRIPT_FONT_FILE)) {
+                eprintln!(
+                    "brep-mcp: fontconfig has no {SCRIPT_FONT} (got {font:?}); \
+                     script layouts will not match their recorded values"
+                );
+            }
             let store = brep_app::store::native_store_at(store_dir.clone());
             let app = BrepApp::new_with(cc, AppOptions { store: Some(store), seed })
                 .expect("BrepApp::new_with under kittest");
@@ -262,7 +320,7 @@ fn step(harness: &mut App, queue: &Arc<brep_app::automation::queue::AutomationQu
     }
 }
 
-/// Why a [`settle`] never reached the idle contract.
+/// Why a `settle` never reached the idle contract.
 ///
 /// It exists because the two ways of not settling used to be spelled the same
 /// as settling: the function returned `()`, the deadline simply ended the loop
@@ -275,7 +333,7 @@ pub enum SettleError {
     /// of the app is stuck, and an EMPTY list says the app had gone idle but
     /// not for the two consecutive frames the contract asks for.
     DeadlineExpired { limit: Duration, frames: u32, pending: Vec<&'static str> },
-    /// A frame failed (the app panicked); the message is [`step`]'s.
+    /// A frame failed (the app panicked); the message is `step`'s.
     StepFailed(String),
 }
 

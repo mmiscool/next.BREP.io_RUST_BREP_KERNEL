@@ -10,8 +10,8 @@
 //! how to configure Claude Code or Codex for it.
 //!
 //! `--kicad-library` is the one flag that opens a DIFFERENT window: the minimal
-//! KiCad importer (`panels/kicad_library.rs`), which downloads KiCad's own
-//! libraries or reads the install on this machine, and writes each part it
+//! KiCad importer (`panels/kicad_library.rs`), which clones KiCad's own
+//! libraries with git or reads the install on this machine, and writes each part it
 //! imports into the model store as a document. No viewport, no workbench —
 //! which is also why it runs where the CAD window might not.
 //!
@@ -27,7 +27,7 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 #[cfg(not(target_arch = "wasm32"))]
-const USAGE: &str = "usage: brep-app [FILE] [--mcp] [--mcp-port PORT] [--session-root DIR]
+const USAGE: &str = "usage: brep-app [FILE] [--mcp] [--mcp-port PORT] [--session-root DIR] [--plm-url URL] [--plm-token-file FILE]
        brep-app --kicad-library
        brep-app --install-file-associations | --uninstall-file-associations
        brep-app --plm-configure URL [--plm-token-file FILE] | --plm-forget | --plm-show | --plm-check
@@ -39,8 +39,8 @@ const USAGE: &str = "usage: brep-app [FILE] [--mcp] [--mcp-port PORT] [--session
   --mcp               embed the MCP server: agents drive this window over http://127.0.0.1:PORT/mcp
   --mcp-port PORT     the port to listen on (default 8765)
   --session-root DIR  where MCP sessions keep screenshots and call logs (default: the OS temp dir)
-  --kicad-library     open the KiCad importer instead of the CAD window: download
-                      KiCad's symbol, footprint and 3D-model libraries, or import
+  --kicad-library     open the KiCad importer instead of the CAD window: clone
+                      KiCad's symbol, footprint and 3D-model libraries (git), or import
                       parts from the KiCad installed here, saving each as a document
   --install-file-associations
                       make THIS executable the opener for .nbrep, .fbrep and

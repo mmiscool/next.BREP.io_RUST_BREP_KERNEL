@@ -275,6 +275,20 @@ impl NurbsSurface {
         let v = knot_clamp(&self.knots_v, self.degree_v, v);
         let span_u = knot_find_span(&self.knots_u, self.degree_u, u);
         let span_v = knot_find_span(&self.knots_v, self.degree_v, v);
+        // Recognition evaluates points itself. Inspect only an initialized cache:
+        // asking analytic() here would recursively initialize that same cache.
+        if analytic_point_on() && matches!((self.degree_u, self.degree_v), (1, 1) | (2, 1) | (1, 2) | (2, 2))
+            && matches!(self.analytic.get().and_then(|carrier| carrier.as_ref()),
+                Some(crate::AnalyticSurface::Plane { .. } | crate::AnalyticSurface::RuledRevolution { .. }
+                    | crate::AnalyticSurface::Sphere { .. } | crate::AnalyticSurface::Torus { .. })) {
+            return Ok(match (self.degree_u, self.degree_v) {
+                (1, 1) => self.analytic_point_small::<1, 1>(u, v, span_u, span_v),
+                (2, 1) => self.analytic_point_small::<2, 1>(u, v, span_u, span_v),
+                (1, 2) => self.analytic_point_small::<1, 2>(u, v, span_u, span_v),
+                (2, 2) => self.analytic_point_small::<2, 2>(u, v, span_u, span_v),
+                _ => unreachable!(),
+            });
+        }
         let mut basis_u = [0.0f64; MAX_STACK_ORDER];
         let mut basis_v = [0.0f64; MAX_STACK_ORDER];
         basis_functions_into(&self.knots_u, self.degree_u, span_u, u, &mut basis_u);
@@ -292,6 +306,41 @@ impl NurbsSurface {
             }
         }
         Ok(point)
+    }
+
+    /// The stored rational net, with the general evaluator's arithmetic order.
+    /// Const degrees shrink the scratch arrays and specialize the short loops;
+    /// this is not a trigonometric replacement of the rational parameterization.
+    fn analytic_point_small<const DU: usize, const DV: usize>(&self, u: f64, v: f64, span_u: usize, span_v: usize) -> Vec4 {
+        fn basis<const D: usize>(knots: &[f64], span: usize, parameter: f64) -> [f64; 3] {
+            let mut values = [0.0; 3];
+            let mut left = [0.0; 3];
+            let mut right = [0.0; 3];
+            values[0] = 1.0;
+            for j in 1..=D {
+                left[j] = parameter - knots[span + 1 - j];
+                right[j] = knots[span + j] - parameter;
+                let mut saved = 0.0;
+                for r in 0..j {
+                    let denominator = right[r + 1] + left[j - r];
+                    let temporary = if denominator.abs() <= EPS { 0.0 } else { values[r] / denominator };
+                    values[r] = saved + right[r + 1] * temporary;
+                    saved = left[j - r] * temporary;
+                }
+                values[j] = saved;
+            }
+            values
+        }
+        let basis_u = basis::<DU>(&self.knots_u, span_u, u);
+        let basis_v = basis::<DV>(&self.knots_v, span_v, v);
+        let mut point = Vec4 { x: 0.0, y: 0.0, z: 0.0, w: 0.0 };
+        for (i, value_u) in basis_u[..=DU].iter().enumerate() {
+            let row = &self.control_points[span_u - DU + i];
+            for (j, value_v) in basis_v[..=DV].iter().enumerate() {
+                point = point.add(row[span_v - DV + j].scale(value_u * value_v));
+            }
+        }
+        point
     }
 
     fn evaluate_homogeneous_heap(&self, u: f64, v: f64) -> Result<Vec4, String> {
@@ -780,6 +829,48 @@ impl NurbsSurface {
         Ok((g[0][0], g[1][0], g[0][1]))
     }
 
+    /// First-order rational recurrence with only its three live sums. The
+    /// control summation and dehomogenization keep derivatives_small's order.
+    /// Caller retains the existing wrapping, extension and refusal paths.
+    fn analytic_deriv1_small<const DEGREE_U: usize, const DEGREE_V: usize>(&self, u: f64, v: f64) -> Result<(Vec3, Vec3, Vec3), String> {
+        self.ensure_valid()?;
+        let du = DEGREE_U.min(1);
+        let dv = DEGREE_V.min(1);
+        let u = knot_clamp(&self.knots_u, DEGREE_U, u);
+        let v = knot_clamp(&self.knots_v, DEGREE_V, v);
+        let span_u = knot_find_span(&self.knots_u, DEGREE_U, u);
+        let span_v = knot_find_span(&self.knots_v, DEGREE_V, v);
+        let mut basis_u = [[0.0; MAX_STACK_ORDER]; 2];
+        let mut basis_v = [[0.0; MAX_STACK_ORDER]; 2];
+        basis_derivatives_into(&self.knots_u, DEGREE_U, span_u, u, du, &mut basis_u[..=du]);
+        basis_derivatives_into(&self.knots_v, DEGREE_V, span_v, v, dv, &mut basis_v[..=dv]);
+        let zero = Vec4 { x: 0.0, y: 0.0, z: 0.0, w: 0.0 };
+        let sum = |k: usize, l: usize| {
+            let mut value = zero;
+            for i in 0..=DEGREE_U {
+                let row = &self.control_points[span_u - DEGREE_U + i];
+                for j in 0..=DEGREE_V {
+                    value = value.add(row[span_v - DEGREE_V + j].scale(basis_u[k][i] * basis_v[l][j]));
+                }
+            }
+            value
+        };
+        let h00 = sum(0, 0);
+        let h01 = if dv == 1 { sum(0, 1) } else { zero };
+        let h10 = if du == 1 { sum(1, 0) } else { zero };
+        if h00.w.abs() <= EPS { return Err("NurbsSurface: zero evaluated weight".into()); }
+        let inverse = 1.0 / h00.w;
+        let point = Vec3::new(h00.x, h00.y, h00.z).scale(inverse);
+        let partial_v = if dv == 1 {
+            Vec3::new(h01.x, h01.y, h01.z).sub(point.scale(1.0 * h01.w)).scale(inverse)
+        } else { Vec3::default() };
+        let partial_u = if du == 1 {
+            Vec3::new(h10.x, h10.y, h10.z).sub(point.scale(1.0 * h10.w))
+                .sub(Vec3::default().scale(1.0)).scale(inverse)
+        } else { Vec3::default() };
+        Ok((point, partial_u, partial_v))
+    }
+
     /// Allocation-free `(S, S_u, S_v)` twin of `derivatives_extended(u, v, 1)`.
     ///
     /// Mirrors the exact C¹ ruled/bilinear extension arithmetic of
@@ -814,6 +905,18 @@ impl NurbsSurface {
             0.0
         };
         if du_out == 0.0 && dv_out == 0.0 {
+            if analytic_deriv1_on() && matches!((self.degree_u, self.degree_v), (1, 1) | (2, 1) | (1, 2) | (2, 2))
+                && matches!(self.analytic(), Some(crate::AnalyticSurface::Plane { .. }
+                    | crate::AnalyticSurface::RuledRevolution { .. } | crate::AnalyticSurface::Sphere { .. }
+                    | crate::AnalyticSurface::Torus { .. })) {
+                return match (self.degree_u, self.degree_v) {
+                    (1, 1) => self.analytic_deriv1_small::<1, 1>(uu, vv),
+                    (2, 1) => self.analytic_deriv1_small::<2, 1>(uu, vv),
+                    (1, 2) => self.analytic_deriv1_small::<1, 2>(uu, vv),
+                    (2, 2) => self.analytic_deriv1_small::<2, 2>(uu, vv),
+                    _ => unreachable!(),
+                };
+            }
             let g = self.derivatives_small(uu, vv, 1)?;
             return Ok((g[0][0], g[1][0], g[0][1]));
         }
@@ -1510,3 +1613,16 @@ fn normalized(parameters: &[f64]) -> Vec<f64> {
 }
 
 
+
+
+fn analytic_deriv1_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("BREP_ANALYTIC_DERIV1").ok().as_deref() != Some("0"))
+}
+
+
+/// Default-off until the evaluator's bitwise and complete-body gates qualify it.
+fn analytic_point_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("BREP_ANALYTIC_POINT").ok().as_deref() == Some("1"))
+}

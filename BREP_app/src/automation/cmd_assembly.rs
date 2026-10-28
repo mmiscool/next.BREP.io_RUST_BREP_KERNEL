@@ -61,6 +61,53 @@ pub struct ComponentInsertArgs {
 
 #[derive(Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
+pub struct ReplaceComponentArgs {
+    /// The ACOMP feature id of the occurrence to replace, or a NESTED
+    /// occurrence path (`ACOMP3:ACOMP1`) for a part inside a sub-assembly, or a
+    /// Pattern Component instance (`APAT1.ACOMP2.i3`): its seed is replaced, and
+    /// with it every instance (the report says so).
+    pub id: String,
+    /// Replace every occurrence that shows the same part (one undo step);
+    /// for a nested path, every placement of it in that sub-assembly.
+    #[serde(default, rename = "allInstances")]
+    pub all_instances: bool,
+    /// The replacement as a stored part document (its store name, as
+    /// `component_insert`'s file flow names it). Give this or `partName`.
+    #[serde(default)]
+    pub source: Option<String>,
+    /// The replacement as a parts-library entry the assembly already carries.
+    #[serde(default, rename = "partName")]
+    pub part_name: Option<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ReplaceRepair {
+    /// The constraint id.
+    pub id: String,
+    /// The unresolved reference (as the report lists it).
+    pub from: String,
+    /// The entity to use instead (a namespaced ref; equal to `from` confirms
+    /// the same-name match).
+    pub to: String,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ReplaceRepairArgs {
+    pub repairs: Vec<ReplaceRepair>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ReplaceAcceptArgs {
+    /// Constraint ids whose pre-ticked suggestions to accept (omit for all).
+    #[serde(default)]
+    pub ids: Vec<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ComponentFixedArgs {
     /// The owning ACOMP feature id.
     pub id: String,
@@ -279,6 +326,74 @@ fn component_insert(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
     serde_json::to_value(ComponentAdded { id }).map(Outcome::Done).map_err(|e| e.to_string())
 }
 
+fn assembly_replace_component(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
+    let a: ReplaceComponentArgs = parse_args(args)?;
+    // A Work part edited in context is finished first, as the menu does.
+    let (_, docs, _) = ctx.app.file_docs_store();
+    crate::panels::replace_component::finish_work_part_for_replace(docs)?;
+    require_assembly(ctx)?;
+    let source = match (a.source, a.part_name) {
+        (Some(source), None) => crate::panels::replace_component::ReplaceSource::Stored(source),
+        (None, Some(part)) => crate::panels::replace_component::ReplaceSource::Library(part),
+        _ => return Err("give exactly one of `source` (a stored part) or `partName` (a library entry)".into()),
+    };
+    let (_, docs, store) = ctx.app.file_docs_store();
+    let engine = docs.engine_mut();
+    if a.id.contains(':') {
+        // A part inside a sub-assembly, by its occurrence path.
+        let part = crate::panels::replace_component::replace_nested(engine, store, &a.id, &source, a.all_instances)?;
+        return Ok(Outcome::Done(json!({ "partName": part, "components": [a.id], "report": engine.replace_report() })));
+    }
+    // A Pattern Component instance stands for its seed (the engine replaces
+    // the seed and notes why): every instance of the SEED's part.
+    let ids = if a.all_instances {
+        let seed = brep_render::brep_kernel::pattern_component_instance(&a.id).map_or(a.id.clone(), |(_, seed, _)| seed);
+        let mut ids = crate::panels::replace_component::instances_of(engine, &seed);
+        if seed != a.id {
+            ids.insert(0, a.id.clone());
+        }
+        ids
+    } else {
+        vec![a.id.clone()]
+    };
+    let part = crate::panels::replace_component::replace(engine, store, &ids, &source)?;
+    Ok(Outcome::Done(json!({ "partName": part, "components": ids, "report": engine.replace_report() })))
+}
+
+fn assembly_replace_report(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
+    let _: NoArgs = parse_args(args)?;
+    let engine = ctx.app.docs.engine_mut();
+    Ok(Outcome::Done(json!({
+        "report": engine.replace_report(),
+        "unresolved": crate::panels::replace_component::held_mates(engine),
+    })))
+}
+
+fn assembly_replace_repair(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
+    let a: ReplaceRepairArgs = parse_args(args)?;
+    require_assembly(ctx)?;
+    let repairs: Vec<(String, String, String)> = a.repairs.into_iter().map(|r| (r.id, r.from, r.to)).collect();
+    let engine = ctx.app.docs.engine_mut();
+    crate::panels::replace_component::repair(engine, &repairs)?;
+    Ok(Outcome::Done(json!({ "unresolved": crate::panels::replace_component::held_mates(engine) })))
+}
+
+fn assembly_replace_accept(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
+    let a: ReplaceAcceptArgs = parse_args(args)?;
+    require_assembly(ctx)?;
+    let engine = ctx.app.docs.engine_mut();
+    let accepted = crate::panels::replace_component::accept_suggestions(engine, &a.ids)?;
+    Ok(Outcome::Done(json!({ "accepted": accepted, "unresolved": crate::panels::replace_component::held_mates(engine) })))
+}
+
+fn assembly_replace_delete(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
+    let a: ConstraintIdArgs = parse_args(args)?;
+    require_assembly(ctx)?;
+    let engine = ctx.app.docs.engine_mut();
+    crate::panels::replace_component::delete_held(engine, &a.id)?;
+    Ok(Outcome::Done(json!({ "unresolved": crate::panels::replace_component::held_mates(engine) })))
+}
+
 fn component_info(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
     let a: ComponentIdArgs = parse_args(args)?;
     let info = ctx
@@ -330,14 +445,17 @@ fn component_select(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
 #[serde(deny_unknown_fields)]
 pub struct InterferenceArgs {
     pub components: Option<Vec<String>>,
-    /// Maximum component pairs per page, from 1 to 4096 (default 64).
+    /// Maximum component pairs per page, from 1 to 4096 (default 4096).
     pub budget: Option<usize>,
     pub continuation_token: Option<String>,
+    /// Near-miss threshold in mm (default 0 = off): non-interfering pairs
+    /// within it report `minDistance` (display tessellation) and `nearMiss`.
+    pub clearance_mm: Option<f64>,
 }
 
 fn interference_check(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
     let a: InterferenceArgs = parse_args(args)?;
-    ctx.app.docs.engine_mut().interference_page(a.components, a.budget.unwrap_or(64), a.continuation_token).map(Outcome::Done)
+    ctx.app.docs.engine_mut().interference_page(a.components, a.budget.unwrap_or(4096), a.continuation_token, a.clearance_mm).map(Outcome::Done)
 }
 
 fn assembly_inferable_types(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
@@ -403,10 +521,15 @@ pub static COMMANDS: &[CommandSpec] = &[
     CommandSpec { name: "assembly_solve", group: "assembly", doc: "Run the constraint solver now (the manual Solve the panel offers when auto-solve is off) and return the statuses and remaining DOF.", phase: Phase::Mutate, annotations: Annotations::MUTATE, args_schema: schema_of::<NoArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(assembly_solve) },
     CommandSpec { name: "assembly_parts_library", group: "assembly", doc: "The document's parts-library entry names — what `component_insert` places.", phase: Phase::Read, annotations: Annotations::READ, args_schema: schema_of::<NoArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(assembly_parts_library) },
     CommandSpec { name: "component_insert", group: "assembly", doc: "Place another instance of a parts-library entry: appends an ACOMP feature with an identity transform and runs it. The document's FIRST component is grounded. Returns the feature id; move it with `feature_set_params` on its `transform`.", phase: Phase::Mutate, annotations: Annotations::MUTATE, args_schema: schema_of::<ComponentInsertArgs>, result_schema: schema_of::<ComponentAdded>, handler: Handler::App(component_insert) },
+    CommandSpec { name: "assembly_replace_component", group: "assembly", doc: "Replace the part an occurrence shows (or, with `allInstances`, every occurrence of that part) with a stored part (`source`) or a library entry (`partName`), keeping the occurrence's id, pose and attributes. One undo step. Mates are re-resolved by face name only when the parts share lineage (same family, or one saved from the other); otherwise, or when a name is missing or changed type, the mate is kept DISABLED with a `replace` marker and a suggestion. `report` is null until the run lands: read it with `assembly_replace_report`.", phase: Phase::Mutate, annotations: Annotations::MUTATE, args_schema: schema_of::<ReplaceComponentArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(assembly_replace_component) },
+    CommandSpec { name: "assembly_replace_report", group: "assembly", doc: "The last replace's report (`{components, from, to, lineage, kept, unresolved, notes}`) and every mate still carrying a replace marker at ANY depth (`unresolved`; a sub-assembly's mate is listed as `<occurrence path>:<id>` with namespaced refs; markers survive save/reopen).", phase: Phase::Read, annotations: Annotations::READ, args_schema: schema_of::<NoArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(assembly_replace_report) },
+    CommandSpec { name: "assembly_replace_repair", group: "assembly", doc: "Point held mate references at picked entities, one undo step, at any depth (ids and refs as `assembly_replace_report` lists them; a sub-assembly's mate takes a ref inside that sub-assembly). A mate with nothing left held is re-enabled (if it was enabled before the replace) and loses its marker. Delete one with `assembly_replace_delete`.", phase: Phase::Mutate, annotations: Annotations::MUTATE, args_schema: schema_of::<ReplaceRepairArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(assembly_replace_repair) },
+    CommandSpec { name: "assembly_replace_delete", group: "assembly", doc: "Delete a mate a replace is holding, at any depth: a top-level id (`CONC1`) or a sub-assembly's mate by its occurrence path (`ACOMP1:CONC1`, which edits that sub-assembly's definition). One undo step.", phase: Phase::Mutate, annotations: Annotations::MUTATE, args_schema: schema_of::<ConstraintIdArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(assembly_replace_delete) },
+    CommandSpec { name: "assembly_replace_accept", group: "assembly", doc: "Accept the PRE-TICKED suggestions (the entity whose geometry is the old one's) of the given held mates, or of every held mate at every depth, as one undo step.", phase: Phase::Mutate, annotations: Annotations::MUTATE, args_schema: schema_of::<ReplaceAcceptArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(assembly_replace_accept) },
     CommandSpec { name: "component_info", group: "assembly", doc: "One component instance with authored expressions, requested and solver-adjusted evaluated placement matrices, frame/units, evaluation status, attributes and member names. Numeric legacy fields describe evaluated geometry; failed or pending placement is null.", phase: Phase::Read, annotations: Annotations::READ, args_schema: schema_of::<ComponentIdArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(component_info) },
     CommandSpec { name: "component_set_fixed", group: "assembly", doc: "Ground or unground a component (its ACOMP `isFixed`) and re-run.", phase: Phase::Mutate, annotations: Annotations::MUTATE, args_schema: schema_of::<ComponentFixedArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(component_set_fixed) },
     CommandSpec { name: "component_select", group: "assembly", doc: "Select exactly these component instances (their member solids) — the selection a constraint's reference pick reads.", phase: Phase::Mutate, annotations: Annotations::MUTATE_NOWAIT, args_schema: schema_of::<ComponentSelectArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(component_select) },
-    CommandSpec { name: "interference_check", group: "assembly", doc: "Check component pairs with an explicit pair budget and revision-bound continuation. Only allClear=true establishes complete clearance; zero-volume contact candidates remain unverified without a distance witness.", phase: Phase::Read, annotations: Annotations::READ, args_schema: schema_of::<InterferenceArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(interference_check) },
+    CommandSpec { name: "interference_check", group: "assembly", doc: "Check component pairs with an explicit pair budget and revision-bound continuation; clearance_mm adds a near-miss gap check (nearMisses, minDistance). Only allClear=true establishes complete clearance; zero-volume contact candidates remain unverified without a distance witness.", phase: Phase::Read, annotations: Annotations::READ, args_schema: schema_of::<InterferenceArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(interference_check) },
     CommandSpec { name: "assembly_inferable_types", group: "assembly", doc: "The constraint types automatic inference can produce, each with what placement it reads as that constraint — the rows the Auto Constraints dialog lists.", phase: Phase::Read, annotations: Annotations::READ, args_schema: schema_of::<NoArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(assembly_inferable_types) },
     CommandSpec { name: "assembly_infer_constraints", group: "assembly", doc: "Read the components' current placement as constraints WITHOUT creating any: the candidates (type, elements, the measurement each was read from) plus what was skipped. The look-before-you-leap half of Auto Constraints — an imported STEP assembly is fully posed and completely unconstrained, and this says what would hold it there.", phase: Phase::Read, annotations: Annotations::READ, args_schema: schema_of::<InferConstraintsArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(assembly_infer_constraints) },
     CommandSpec { name: "assembly_apply_inferred_constraints", group: "assembly", doc: "Create every constraint `assembly_infer_constraints` accepts and solve the batch as ONE undo step. Pairs that already carry a constraint are left alone, so running it twice creates nothing the second time.", phase: Phase::Mutate, annotations: Annotations::MUTATE, args_schema: schema_of::<InferConstraintsArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(assembly_apply_inferred_constraints) },

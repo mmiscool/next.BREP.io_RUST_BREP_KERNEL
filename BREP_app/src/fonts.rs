@@ -35,11 +35,23 @@ use eframe::egui;
 pub fn install(ctx: &egui::Context) {
     // Base text = OS monospace when we can read it; otherwise egui's bundled
     // defaults (wasm, or a native machine without fontconfig).
-    let fonts = match os_monospace() {
-        Some((bytes, index)) => os_mono_defs(bytes, index),
-        None => egui::FontDefinitions::default(),
+    install_matching(ctx, "monospace");
+}
+
+/// Install the OS font fontconfig matches for `pattern` (a family name or
+/// `monospace`) as the only text font, or egui's bundled defaults when none
+/// can be read. Returns the font file used. The headless MCP host names one
+/// family here instead of `monospace`: script expectations pin chrome and
+/// camera framing in points, and machines answer `monospace` with different
+/// faces (DejaVu Sans Mono on one, Noto Sans Mono on another), which moves
+/// them by a few points.
+pub fn install_matching(ctx: &egui::Context, pattern: &str) -> Option<String> {
+    let (fonts, path) = match font_matching(pattern) {
+        Some((bytes, index, path)) => (os_mono_defs(bytes, index), Some(path)),
+        None => (egui::FontDefinitions::default(), None),
     };
     ctx.set_fonts(fonts);
+    path
 }
 
 /// A minimal `FontDefinitions` whose ONLY text font is the OS monospace — no
@@ -55,13 +67,13 @@ fn os_mono_defs(bytes: Vec<u8>, index: u32) -> egui::FontDefinitions {
     fonts
 }
 
-/// Locate and read the OS default monospace font (path + collection index).
-/// Native only, via fontconfig's `fc-match`; returns `None` on any failure so
-/// the caller falls back to egui's bundled defaults.
+/// Locate and read the OS font fontconfig matches for `pattern` (bytes,
+/// collection index, path). Native only, via fontconfig's `fc-match`; returns
+/// `None` on any failure so the caller falls back to egui's bundled defaults.
 #[cfg(not(target_arch = "wasm32"))]
-fn os_monospace() -> Option<(Vec<u8>, u32)> {
+fn font_matching(pattern: &str) -> Option<(Vec<u8>, u32, String)> {
     let out = std::process::Command::new("fc-match")
-        .args(["--format=%{file}\n%{index}", "monospace"])
+        .args(["--format=%{file}\n%{index}", pattern])
         .output()
         .ok()?;
     if !out.status.success() {
@@ -75,11 +87,11 @@ fn os_monospace() -> Option<(Vec<u8>, u32)> {
     }
     let index = lines.next().and_then(|l| l.trim().parse().ok()).unwrap_or(0);
     let bytes = std::fs::read(path).ok()?; // read failure => None => default fallback
-    Some((bytes, index))
+    Some((bytes, index, path.to_string()))
 }
 
 /// wasm has no OS font access — always fall back to egui's bundled defaults.
 #[cfg(target_arch = "wasm32")]
-fn os_monospace() -> Option<(Vec<u8>, u32)> {
+fn font_matching(_pattern: &str) -> Option<(Vec<u8>, u32, String)> {
     None
 }

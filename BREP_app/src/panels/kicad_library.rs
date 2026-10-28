@@ -8,33 +8,33 @@
 //!
 //! # Two sources, one chain
 //!
-//! * **Download** — KiCad's own libraries, fetched file by file from GitLab at
-//!   a pinned 9.x tag ([`super::kicad_remote`]) into a cache laid out like a
-//!   KiCad install.
+//! * **Clone** — KiCad's own three library repositories, cloned with git at a
+//!   pinned 9.x tag ([`brep_ecad_core::kicad_git`]) into folders laid out like a
+//!   KiCad install, then read exactly as an install is. When git is missing or
+//!   GitLab cannot be reached the window says so and switches to the install
+//!   source, whose three folder fields are where the user names their own.
 //! * **Your KiCad install** — the folders already on this machine, found the
 //!   way the in-app dialog finds them ([`KicadLibrary::load`]).
 //!
 //! Both end in the SAME call: `part_from_symbol` follows the symbol to its
-//! footprint to its `.step`, and [`import_part`] writes the IMPORT3D feature,
+//! footprint to its `.step`, and [`import_part`](crate::panels::kicad_import::import_part) writes the IMPORT3D feature,
 //! the `symbol` and `pads` blocks and the `Pins` port group. The only
-//! difference is which [`KicadFiles`] answers, so a message about a missing
-//! model reads identically whether the file was missing from a disk or from a
-//! repository.
+//! difference is which folders it reads.
 //!
 //! # One part, or all of them
 //!
-//! The download source also offers a BULK import: every symbol of one library,
+//! Either source also offers a BULK import: every symbol of one library,
 //! of the libraries the search box matches, or of all 223. That is
 //! [`super::kicad_bulk`] on a worker thread, reported here as a progress bar and
 //! stopped by a button, and it can be stopped and restarted as often as the user
-//! likes — what it finished is written to a ledger beside the cache, and a later
-//! run skips it without downloading or converting it again.
+//! likes — what it finished is written to a ledger beside the clones, and a
+//! later run skips it without converting it again.
 //!
 //! # Its own state machine
 //!
 //! The in-app dialog ([`super::kicad_import::KicadImport`]) is driven by the
-//! file explorer and reads the chain on the UI thread, which a download cannot
-//! do. This window therefore keeps its own [`Stage`], reads every part on a
+//! file explorer and reads the chain on the UI thread, which a clone and a
+//! library's worth of STEP parsing cannot share. This window therefore keeps its own [`Stage`], reads every part on a
 //! worker ([`read_part`]) and reuses the dialog's chain, notes and review
 //! wording rather than its staging. The stage transitions are plain methods
 //! with no egui in them, so the suite drives the whole window headless.
@@ -45,25 +45,43 @@ use super::kicad_bulk::{
     AppStoreWriter, BulkRun, Ledger, PartWriter, Progress, StoreWriter, Sweep,
 };
 use super::kicad_import::{
-    read_symbol_library, DiskFiles, Folder, FootprintChoice, Imported, KicadFiles, KicadLibrary,
-    KicadPart,
-};
-use super::kicad_remote::{
-    default_cache_root, http_fetcher, parse_tree, read_part, symbol_libraries, Fetcher, PartReader,
-    PartSource, RemoteFiles, Repo, DEFAULT_TAG,
+    part_from_symbol, read_symbol_library, DiskFiles, Folder, FootprintChoice, Imported, KicadFiles,
+    KicadLibrary, KicadPart,
 };
 use crate::store::{default_model_store, ModelStore};
+use brep_ecad_core::kicad_git::{self, Repo};
 use brep_ecad_core::Symbol;
 use eframe::egui;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+
+/// The release a clone reads; the window's tag field starts here.
+pub const DEFAULT_TAG: &str = kicad_git::TAG;
+
+/// Where clones and the bulk ledger live when the user names no folder: beside
+/// the app's own state (the model store's `<config>/brep-app`), so they
+/// survive a session — `%APPDATA%` on Windows.
+pub fn default_cache_root() -> PathBuf {
+    crate::plm::config::app_config_dir().join("kicad-library")
+}
+
+/// The `*.kicad_sym` library names among `names`, without their extension,
+/// sorted.
+pub fn symbol_libraries(names: &[String]) -> Vec<String> {
+    let mut found: Vec<String> = names
+        .iter()
+        .filter_map(|name| name.strip_suffix(".kicad_sym"))
+        .map(str::to_owned)
+        .collect();
+    found.sort();
+    found
+}
 
 /// The variables KiCad names its SYMBOL folder by, newest first. The importer's
 /// own library record holds footprints and 3D models only, because a symbol
 /// reaches it as a file the user opened; this window lists a folder of them, so
 /// it needs the third one.
-/// The API's page cap, and so the size of a page that has another after it.
-const PAGE: usize = 100;
-
 const SYMBOL_VARS: &[&str] = &[
     "KICAD9_SYMBOL_DIR",
     "KICAD8_SYMBOL_DIR",
@@ -153,6 +171,91 @@ impl PartSource for LocalSource {
     }
 }
 
+/// Where one import's files come from, for [`read_part`].
+pub trait PartSource: KicadFiles + Send + 'static {
+    /// The folders the chain follows a footprint and a model through.
+    fn library(&self) -> KicadLibrary;
+}
+
+/// A part being read off the UI thread: the chain and the STEP parse.
+pub struct PartReader {
+    answer: std::sync::mpsc::Receiver<KicadPart>,
+}
+
+impl PartReader {
+    /// The answer, once the worker has one. `None` while it works; a worker
+    /// that died without one answers with a note rather than hanging.
+    pub fn take(&self) -> Option<KicadPart> {
+        match self.answer.try_recv() {
+            Ok(answer) => Some(answer),
+            Err(std::sync::mpsc::TryRecvError::Empty) => None,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => Some(KicadPart {
+                notes: vec!["the part reader stopped without an answer".into()],
+                ..KicadPart::default()
+            }),
+        }
+    }
+}
+
+/// Follow `symbol`'s chain through `source` on a worker thread: the footprint,
+/// the 3D model, and the model's STEP parsed (529 ms for a real SOIC-8).
+pub fn read_part(symbol: Symbol, choice: FootprintChoice, source: impl PartSource) -> PartReader {
+    let (send, answer) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let library = source.library();
+        let part = part_from_symbol(symbol, &choice, &library, &source).parsed();
+        // A window closed meanwhile has dropped the receiver; nobody waits.
+        let _ = send.send(part);
+    });
+    PartReader { answer }
+}
+
+/// KiCad's three repositories being cloned on a worker.
+pub struct CloneRun {
+    updates: std::sync::mpsc::Receiver<CloneUpdate>,
+    cancel: Arc<AtomicBool>,
+    /// git's latest progress line.
+    pub line: String,
+}
+
+enum CloneUpdate {
+    Line(String),
+    Done(Result<(), String>),
+}
+
+impl CloneRun {
+    /// Clone each of the three that is not under `root` yet, from `base`.
+    fn start(base: String, tag: String, root: PathBuf) -> Self {
+        let (send, updates) = std::sync::mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&cancel);
+        std::thread::spawn(move || {
+            let mut result = kicad_git::git_version().map(|_| ());
+            for repo in Repo::ALL {
+                if result.is_err() {
+                    break;
+                }
+                let mut report = |line: &str| {
+                    let _ = send.send(CloneUpdate::Line(format!("{}: {line}", repo.project())));
+                };
+                let dest = root.join(repo.install_folder());
+                result = kicad_git::clone(&repo.url(&base), &tag, &dest, &mut report, &flag).map(|_| ());
+            }
+            let _ = send.send(CloneUpdate::Done(result));
+        });
+        Self { updates, cancel, line: "starting git".into() }
+    }
+
+    /// Stop git; the repository in hand is removed, those already cloned stay.
+    pub fn stop(&self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
+
+    pub fn stopping(&self) -> bool {
+        self.cancel.load(Ordering::Relaxed)
+    }
+}
+
 // ============================================================================
 // The window's state
 // ============================================================================
@@ -160,7 +263,7 @@ impl PartSource for LocalSource {
 /// Which source the window is reading.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Source {
-    /// KiCad's repositories, at [`DEFAULT_TAG`].
+    /// KiCad's repositories, cloned at the window's tag.
     Download,
     /// This machine's KiCad install.
     Install,
@@ -169,7 +272,7 @@ pub enum Source {
 impl Source {
     fn label(self) -> &'static str {
         match self {
-            Source::Download => "Download KiCad's library",
+            Source::Download => "Clone KiCad's library",
             Source::Install => "Use my KiCad install",
         }
     }
@@ -188,7 +291,7 @@ pub enum Stage {
     /// A symbol chosen and its chain being read, on a worker.
     Reading { symbol: String },
     /// A part read: review it and save it.
-    Review { part: Box<KicadPart>, warnings: Vec<String>, downloaded: Vec<String> },
+    Review { part: Box<KicadPart>, warnings: Vec<String> },
     /// Every symbol of one or more libraries being imported, on a worker.
     Bulk,
 }
@@ -201,18 +304,16 @@ pub struct KicadLibraryWindow {
     symbols_dir: String,
     footprints_dir: String,
     models_dir: String,
-    /// The download's cache root and tag, editable.
+    /// Where clones and the bulk ledger go, and the release cloned; editable.
+    /// The clones are `<cache_dir>/<tag>/{symbols,footprints,3dmodels}`.
     cache_dir: String,
     tag: String,
+    /// Where the clone source clones from; the suite names a local repository.
+    clone_base: String,
     /// The library names of the chosen source, once listed.
     libraries: Vec<String>,
-    /// The listing in flight, for the download source.
-    index: Option<std::sync::mpsc::Receiver<Result<String, String>>>,
-    /// Which page of that listing it is. KiCad 9.0.9.1 has 233 entries at the
-    /// root of the symbols repository and the API caps a page at 100, so the
-    /// list is only complete after the third — a listing that stopped at the
-    /// first would silently be missing two thirds of the libraries.
-    index_page: u32,
+    /// The clone in flight.
+    pub cloning: Option<CloneRun>,
     /// The chain in flight.
     reader: Option<PartReader>,
     /// The symbol library in flight.
@@ -236,9 +337,6 @@ pub struct KicadLibraryWindow {
     /// the library list. Recomputed when a source is chosen and when a sweep
     /// stops, not every frame: it is a file read.
     ledger_line: String,
-    /// How a sweep fetches. The app's is `http_fetcher`; the suite substitutes a
-    /// stub so a whole sweep runs with no network.
-    new_fetcher: Arc<dyn Fn() -> Fetcher + Send + Sync>,
     /// Where a sweep writes. The app's is the ordinary model store, built inside
     /// the worker; the suite substitutes an in-memory one so a sweep never
     /// touches the user's documents.
@@ -264,9 +362,9 @@ impl KicadLibraryWindow {
             models_dir: library.models.path.clone(),
             cache_dir: default_cache_root().to_string_lossy().into_owned(),
             tag: DEFAULT_TAG.into(),
+            clone_base: kicad_git::BASE_URL.into(),
             libraries: Vec::new(),
-            index: None,
-            index_page: 0,
+            cloning: None,
             reader: None,
             library_reader: None,
             search: String::new(),
@@ -278,37 +376,55 @@ impl KicadLibraryWindow {
             bulk: None,
             force_reimport: false,
             ledger_line: String::new(),
-            new_fetcher: Arc::new(http_fetcher),
             new_writer: Arc::new(|| Box::new(AppStoreWriter)),
         }
     }
 
-    /// Point a sweep at another fetcher and another place to write — the seam the
-    /// suite drives a whole sweep through, with no network and no documents in
-    /// the user's config folder.
-    pub fn sweep_through(
-        &mut self,
-        fetch: Arc<dyn Fn() -> Fetcher + Send + Sync>,
-        write: Arc<dyn Fn() -> Box<dyn PartWriter + Send> + Send + Sync>,
-    ) {
-        self.new_fetcher = fetch;
+    /// Point a sweep at another place to write — the seam the suite drives a
+    /// whole sweep through, with no documents in the user's config folder.
+    pub fn sweep_through(&mut self, write: Arc<dyn Fn() -> Box<dyn PartWriter + Send> + Send + Sync>) {
         self.new_writer = write;
     }
 
-    /// The install's folders as the chain wants them.
-    fn install_library(&self) -> KicadLibrary {
-        let folder = |path: &str| Folder { path: path.to_owned(), from: format!("your KiCad install ({path})") };
-        KicadLibrary { footprints: folder(&self.footprints_dir), models: folder(&self.models_dir) }
+    /// Clone from `base` and into `cache_dir` instead — the suite's local
+    /// repositories and temp folder.
+    pub fn clone_from(&mut self, base: &str, cache_dir: &Path) {
+        self.clone_base = base.to_owned();
+        self.cache_dir = cache_dir.to_string_lossy().into_owned();
     }
 
-    /// A fresh cache over the download source's folders.
-    fn remote(&self) -> RemoteFiles {
-        RemoteFiles::new(&self.cache_dir, &self.tag, http_fetcher())
+    /// Where the clones of the window's tag are.
+    fn clone_root(&self) -> PathBuf {
+        Path::new(&self.cache_dir).join(&self.tag)
+    }
+
+    /// The symbols, footprints and 3D-model folders the chosen source reads.
+    fn folders(&self) -> (String, String, String) {
+        match self.source {
+            Source::Install => (self.symbols_dir.clone(), self.footprints_dir.clone(), self.models_dir.clone()),
+            Source::Download => {
+                let root = self.clone_root();
+                let [symbols, footprints, models] =
+                    Repo::ALL.map(|repo| root.join(repo.install_folder()).to_string_lossy().into_owned());
+                (symbols, footprints, models)
+            }
+        }
+    }
+
+    /// The chosen source's folders as the chain wants them.
+    fn library(&self) -> KicadLibrary {
+        let (_, footprints, models) = self.folders();
+        let from = match self.source {
+            Source::Install => "your KiCad install",
+            Source::Download => "the clone of KiCad's library",
+        };
+        let folder = |path: String| Folder { from: format!("{from} ({path})"), path };
+        KicadLibrary { footprints: folder(footprints), models: folder(models) }
     }
 
     /// Choose a source and list its symbol libraries. The install lists a
-    /// folder here and now; the download asks GitLab and answers in a later
-    /// frame.
+    /// folder here and now; the clone source lists its clone, cloning it first
+    /// on a worker when it is not there yet.
     pub fn choose(&mut self, source: Source, ctx: Option<&egui::Context>) {
         self.source = source;
         self.stage = Stage::Libraries;
@@ -319,7 +435,6 @@ impl KicadLibraryWindow {
         // one's names; a chain landing after it would put the window in a
         // Review of a part nobody asked for any more. Dropping the receiver is
         // the "nobody waits" case the workers already expect.
-        self.index = None;
         self.reader = None;
         self.library_reader = None;
         // A sweep is NOT dropped here: it owns no stage of its own to be
@@ -328,81 +443,84 @@ impl KicadLibraryWindow {
         // something should not silently lose an hour of importing. Its progress
         // keeps arriving and `Stage::Bulk` is still reachable.
         self.refresh_ledger_line();
-        match source {
-            Source::Install => {
-                self.libraries = local_symbol_libraries(&self.symbols_dir, &DiskFiles);
-                self.status = if self.libraries.is_empty() {
-                    format!("no .kicad_sym library in {}", self.symbols_dir)
-                } else {
-                    format!("{} symbol libraries in {}", self.libraries.len(), self.symbols_dir)
-                };
+        let cloned = Repo::ALL.iter().all(|repo| self.clone_root().join(repo.install_folder()).is_dir());
+        if source == Source::Download && !cloned {
+            if self.cloning.is_none() {
+                self.cloning = Some(CloneRun::start(self.clone_base.clone(), self.tag.clone(), self.clone_root()));
             }
-            Source::Download => {
-                self.status = format!("listing KiCad {}'s symbol libraries\u{2026}", self.tag);
-                self.index_page = 0;
-                self.next_index_page(ctx);
+            self.status = format!(
+                "cloning KiCad {}'s libraries into {} with git (about 5.6 GB, once)\u{2026}",
+                self.tag,
+                self.clone_root().display()
+            );
+            if let Some(ctx) = ctx {
+                ctx.request_repaint_after(std::time::Duration::from_millis(100));
             }
+            return;
         }
+        self.list_libraries();
     }
 
-    /// Ask for the page after the last one taken.
-    fn next_index_page(&mut self, ctx: Option<&egui::Context>) {
-        self.index_page += 1;
-        let url = super::kicad_remote::tree_url(Repo::Symbols, &self.tag, "", self.index_page);
-        self.index = ctx.map(|ctx| crate::http::fetch_text(ctx, url));
+    /// List the chosen source's symbol folder.
+    fn list_libraries(&mut self) {
+        let (symbols, _, _) = self.folders();
+        self.libraries = local_symbol_libraries(&symbols, &DiskFiles);
+        self.status = if self.libraries.is_empty() {
+            format!("no .kicad_sym library in {symbols}")
+        } else {
+            format!("{} symbol libraries in {symbols} (type to search)", self.libraries.len())
+        };
     }
 
-    /// One page of the download's listing arrived. A FULL page means another
-    /// follows; a short one ends the walk. Split out so the suite hands it a
-    /// body without a network.
-    pub fn take_index(&mut self, body: Result<String, String>, ctx: Option<&egui::Context>) {
-        self.index = None;
-        match body.and_then(|body| parse_tree(&body)) {
-            Ok(names) => {
-                let more = names.len() >= PAGE;
-                self.libraries.extend(symbol_libraries(&names));
-                self.libraries.sort();
-                if more && self.index_page < 64 {
-                    self.status = format!(
-                        "listing KiCad {}'s symbol libraries\u{2026} {} so far",
-                        self.tag,
-                        self.libraries.len()
-                    );
-                    self.next_index_page(ctx);
-                } else {
-                    self.status = format!(
-                        "{} symbol libraries in KiCad {} (type to search)",
-                        self.libraries.len(),
-                        self.tag
-                    );
+    /// The clone's news, once per frame: git's progress, then either the
+    /// library list or why it failed — and the folder fields to fill instead.
+    fn poll_clone(&mut self) {
+        let Some(run) = &mut self.cloning else {
+            return;
+        };
+        let mut done = None;
+        let mut gone = false;
+        loop {
+            match run.updates.try_recv() {
+                Ok(CloneUpdate::Line(line)) => run.line = line,
+                Ok(CloneUpdate::Done(result)) => done = Some(result),
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    gone = true;
+                    break;
                 }
             }
-            Err(error) => self.status = format!("the library list was not read: {error}"),
+        }
+        let done = match done {
+            Some(done) => done,
+            None if gone => Err("the clone stopped without saying why".into()),
+            None => return,
+        };
+        self.cloning = None;
+        match done {
+            Ok(()) if self.source == Source::Download => self.list_libraries(),
+            Ok(()) => self.status = format!("KiCad {}'s libraries are cloned", self.tag),
+            Err(error) => {
+                self.source = Source::Install;
+                self.stage = Stage::Choose;
+                self.status = format!(
+                    "KiCad's libraries were not cloned: {error}. Install git, or name the folders of \
+                     a KiCad library on this machine above and choose \"{}\".",
+                    Source::Install.label()
+                );
+            }
         }
     }
 
-    /// Read one symbol library on a worker: from the install's folder, or
-    /// downloaded into the cache. See [`LibraryReader`] for why this is not
-    /// done in the frame.
+    /// Read one symbol library on a worker. See `LibraryReader` for why this
+    /// is not done in the frame.
     pub fn open_library(&mut self, library: &str) {
         let file = format!("{library}.kicad_sym");
-        let bytes: Box<dyn FnOnce() -> Result<Vec<u8>, String> + Send> = match self.source {
-            Source::Install => {
-                let path = std::path::Path::new(&self.symbols_dir).join(&file);
-                Box::new(move || std::fs::read(&path).map_err(|error| format!("{}: {error}", path.display())))
-            }
-            Source::Download => {
-                let (root, tag, wanted) = (self.cache_dir.clone(), self.tag.clone(), file.clone());
-                Box::new(move || {
-                    let remote = RemoteFiles::new(root, tag, http_fetcher());
-                    remote.prepare().and_then(|()| remote.fetch_file(Repo::Symbols, &wanted))
-                })
-            }
-        };
+        let path = Path::new(&self.folders().0).join(&file);
         let (send, answer) = std::sync::mpsc::channel();
-        let named = file.clone();
         std::thread::spawn(move || {
-            let _ = send.send(bytes().and_then(|bytes| read_symbol_library(&named, &bytes)));
+            let read = std::fs::read(&path).map_err(|error| format!("{}: {error}", path.display()));
+            let _ = send.send(read.and_then(|bytes| read_symbol_library(&file, &bytes)));
         });
         self.library_reader = Some(LibraryReader { answer, library: library.to_owned() });
         self.status = format!("reading {library}\u{2026}");
@@ -410,8 +528,7 @@ impl KicadLibraryWindow {
     }
 
     /// Follow one symbol's chain on a worker. A symbol that names no footprint
-    /// imports with its symbol alone: this window offers no footprint chooser,
-    /// because the download's would be one repository listing per library.
+    /// imports with its symbol alone: this window offers no footprint chooser.
     pub fn read_symbol(&mut self, symbol: Symbol) {
         let name = symbol.library_id.clone();
         self.pending_warnings = match &self.stage {
@@ -420,14 +537,7 @@ impl KicadLibraryWindow {
         };
         self.document = document_name(&name);
         self.status = format!("reading {name}\u{2026}");
-        self.reader = Some(match self.source {
-            Source::Install => read_part(symbol, FootprintChoice::Named, LocalSource::new(self.install_library())),
-            Source::Download => {
-                let remote = self.remote();
-                let _ = remote.prepare();
-                read_part(symbol, FootprintChoice::Named, remote)
-            }
-        });
+        self.reader = Some(read_part(symbol, FootprintChoice::Named, LocalSource::new(self.library())));
         self.stage = Stage::Reading { symbol: name };
     }
 
@@ -450,9 +560,10 @@ impl KicadLibraryWindow {
                 self.refresh_ledger_line();
             }
         }
-        if let Some(index) = &self.index {
-            if let Ok(body) = index.try_recv() {
-                self.take_index(body, ctx);
+        if self.cloning.is_some() {
+            self.poll_clone();
+            if let (Some(ctx), Some(_)) = (ctx, &self.cloning) {
+                ctx.request_repaint_after(std::time::Duration::from_millis(250));
             }
         }
         if let Some(reader) = &self.library_reader {
@@ -485,15 +596,11 @@ impl KicadLibraryWindow {
             return;
         };
         match reader.take() {
-            Some((part, downloaded)) => {
+            Some(part) => {
                 self.reader = None;
-                self.status = if downloaded.is_empty() {
-                    "read".into()
-                } else {
-                    format!("downloaded {} files", downloaded.len())
-                };
+                self.status = "read".into();
                 let warnings = std::mem::take(&mut self.pending_warnings);
-                self.stage = Stage::Review { part: Box::new(part), warnings, downloaded };
+                self.stage = Stage::Review { part: Box::new(part), warnings };
             }
             None => {
                 if let Some(ctx) = ctx {
@@ -541,10 +648,6 @@ impl KicadLibraryWindow {
     /// The ledger's own summary for the tag and cache folder now named, read off
     /// disk. Empty when nothing has ever been swept into this folder.
     pub fn refresh_ledger_line(&mut self) {
-        if self.source != Source::Download {
-            self.ledger_line.clear();
-            return;
-        }
         let ledger = Ledger::read(std::path::Path::new(&self.cache_dir), &self.tag);
         let (done, retry) = ledger.counts();
         if done == 0 && retry == 0 {
@@ -582,13 +685,15 @@ impl KicadLibraryWindow {
             return;
         }
         let plan = Sweep {
-            cache_root: std::path::PathBuf::from(&self.cache_dir),
+            cache_root: PathBuf::from(&self.cache_dir),
             tag: self.tag.clone(),
+            symbols_dir: PathBuf::from(self.folders().0),
+            library: self.library(),
             libraries,
             force: self.force_reimport,
         };
         let wanted = plan.libraries.len();
-        match super::kicad_bulk::start(plan, (self.new_fetcher)(), (self.new_writer)()) {
+        match super::kicad_bulk::start(plan, Box::new(DiskFiles), (self.new_writer)()) {
             Ok(run) => {
                 self.status = format!(
                     "importing {wanted} librar{} into {}; {} parts already done{}",
@@ -649,29 +754,47 @@ impl eframe::App for KicadLibraryWindow {
 impl KicadLibraryWindow {
     /// The two paths, and the folders whichever one is chosen reads.
     fn show_source(&mut self, ui: &mut egui::Ui) {
+        // The two sources as one dropdown (the form's enum field): nothing
+        // shown until one is chosen.
         let mut chosen = None;
         ui.horizontal(|ui| {
-            for source in [Source::Download, Source::Install] {
-                let picked = self.source == source && !matches!(self.stage, Stage::Choose);
-                if ui.selectable_label(picked, source.label()).clicked() {
-                    chosen = Some(source);
-                }
+            ui.label("Library");
+            let choices = [
+                (Some(Source::Download), "download", Source::Download.label()),
+                (Some(Source::Install), "install", Source::Install.label()),
+            ];
+            let mut picked = (!matches!(self.stage, Stage::Choose)).then_some(self.source);
+            let (changed, _) = crate::form::enum_dropdown(ui, "library:source", &choices, &mut picked, None, None);
+            if changed {
+                chosen = picked;
             }
         });
         match self.source {
             Source::Download => {
+                let idle = self.cloning.is_none();
                 egui::Grid::new("kicad-library-remote").num_columns(2).show(ui, |ui| {
                     ui.label("KiCad release");
-                    ui.text_edit_singleline(&mut self.tag);
+                    ui.add_enabled(idle, egui::TextEdit::singleline(&mut self.tag));
                     ui.end_row();
-                    ui.label("Downloaded to");
-                    ui.text_edit_singleline(&mut self.cache_dir);
+                    ui.label("Cloned into");
+                    ui.add_enabled(idle, egui::TextEdit::singleline(&mut self.cache_dir));
                     ui.end_row();
                 });
                 ui.weak(
-                    "Symbols, footprints and 3D models come from KiCad's own repositories, \
-                     one file per part, into a folder laid out like a KiCad install.",
+                    "Symbols, footprints and 3D models are cloned with git from KiCad's own \
+                     repositories, once (about 5.6 GB), into folders laid out like a KiCad install. \
+                     git must be installed; without it, use your own KiCad folders instead.",
                 );
+                if let Some(run) = &self.cloning {
+                    let stopping = run.stopping();
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(&run.line);
+                        if ui.add_enabled(!stopping, egui::Button::new("Stop")).clicked() {
+                            run.stop();
+                        }
+                    });
+                }
             }
             Source::Install => {
                 egui::Grid::new("kicad-library-local").num_columns(2).show(ui, |ui| {
@@ -699,7 +822,7 @@ impl KicadLibraryWindow {
         let mut sweep = None;
         // The bulk controls and the search field are drawn BEFORE the match, which
         // borrows the stage: both need `&mut self`.
-        if matches!(self.stage, Stage::Libraries) && self.source == Source::Download {
+        if matches!(self.stage, Stage::Libraries) && !self.libraries.is_empty() {
             sweep = self.show_bulk_controls(ui);
             ui.separator();
         }
@@ -711,7 +834,6 @@ impl KicadLibraryWindow {
                 ui.weak("Choose a source above.");
             }
             Stage::Libraries => {
-                let bulk = self.source == Source::Download;
                 for name in self.matching() {
                     ui.horizontal(|ui| {
                         if ui.selectable_label(false, &name).clicked() {
@@ -720,7 +842,7 @@ impl KicadLibraryWindow {
                         // One library is how a user samples a sweep before
                         // committing to all 165 of them, and it is the only
                         // size of sweep that has been measured end to end.
-                        if bulk && ui.small_button("import all of it").clicked() {
+                        if ui.small_button("import all of it").clicked() {
                             sweep = Some(vec![name.clone()]);
                         }
                     });
@@ -757,8 +879,8 @@ impl KicadLibraryWindow {
                     ui.label(format!("reading {symbol} and its 3D model\u{2026}"));
                 });
             }
-            Stage::Review { part, warnings, downloaded } => {
-                show_review(ui, part, warnings, downloaded);
+            Stage::Review { part, warnings } => {
+                show_review(ui, part, warnings);
             }
             Stage::Bulk => {
                 if let Some(run) = &self.bulk {
@@ -846,8 +968,7 @@ impl KicadLibraryWindow {
         ui.weak(&self.ledger_line);
         ui.weak(
             "An import can be stopped and started again as often as you like: what it finished \
-             is written down, and a later run skips it without downloading or converting it \
-             again. A part with no footprint or no 3D model still becomes a part, and says so.",
+             is written down, and a later run skips it without converting it again. A part with no footprint or no 3D model still becomes a part, and says so.",
         );
         wanted
     }
@@ -855,7 +976,7 @@ impl KicadLibraryWindow {
 
 /// The progress of a sweep: two bars, because the only honest denominator is
 /// libraries — how many symbols a library holds is unknown until its
-/// `.kicad_sym` has been downloaded and parsed.
+/// `.kicad_sym` has been parsed.
 fn show_sweep(ui: &mut egui::Ui, run: &BulkRun) {
     let progress = &run.progress;
     ui.add(egui::ProgressBar::new(progress.fraction()).show_percentage());
@@ -878,7 +999,6 @@ fn show_sweep(ui: &mut egui::Ui, run: &BulkRun) {
             ("Imported", progress.imported.to_string()),
             ("Already done", progress.skipped.to_string()),
             ("Failed, to retry later", progress.failed.to_string()),
-            ("Downloaded", format!("{} files, {:.1} MB", progress.files, progress.bytes as f64 / 1_048_576.0)),
             ("Recorded in", run.ledger.display().to_string()),
         ] {
             ui.label(label);
@@ -908,7 +1028,7 @@ fn show_sweep(ui: &mut egui::Ui, run: &BulkRun) {
 }
 
 /// What the save will write, and every note the chain left.
-fn show_review(ui: &mut egui::Ui, part: &KicadPart, warnings: &[String], downloaded: &[String]) {
+fn show_review(ui: &mut egui::Ui, part: &KicadPart, warnings: &[String]) {
     egui::Grid::new("kicad-library-review").num_columns(2).show(ui, |ui| {
         ui.label("Symbol");
         ui.label(
@@ -937,11 +1057,6 @@ fn show_review(ui: &mut egui::Ui, part: &KicadPart, warnings: &[String], downloa
                 symbol.pins.len(),
                 if part.footprint.is_some() { "each at its pin's pad" } else { "at the part origin" }
             ));
-            ui.end_row();
-        }
-        if !downloaded.is_empty() {
-            ui.label("Downloaded");
-            ui.label(downloaded.join("\n"));
             ui.end_row();
         }
     });

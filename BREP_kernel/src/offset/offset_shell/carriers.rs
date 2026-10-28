@@ -297,12 +297,34 @@ pub(super) struct CarvedSupport {
     /// How many pcurves of the kept loops are pieces of the fold locus: the new
     /// boundary, the rim the neighbours have to be re-solved against.
     pub(super) fold_boundary: usize,
+    /// A finite cusp admitted only because retained planes bury its image.
+    pub(super) shielded_cusp: bool,
 }
 
 pub(super) fn carve_folded_support(
     source: &BrepSolid,
     face: &FaceRecord,
     distance: f64,
+) -> Result<Option<CarvedSupport>, KernelRefusal> {
+    carve_folded_support_impl(source, face, distance, None)
+}
+
+/// A shell can also discard a cusp buried behind retained planar offsets.
+/// Opening faces cannot shield it: their planes do not bound the cavity.
+pub(super) fn carve_shell_support(
+    source: &BrepSolid,
+    face: &FaceRecord,
+    distance: f64,
+    openings: &[u64],
+) -> Result<Option<CarvedSupport>, KernelRefusal> {
+    carve_folded_support_impl(source, face, distance, Some(openings))
+}
+
+fn carve_folded_support_impl(
+    source: &BrepSolid,
+    face: &FaceRecord,
+    distance: f64,
+    openings: Option<&[u64]>,
 ) -> Result<Option<CarvedSupport>, KernelRefusal> {
     if distance == 0.0 || face.surface.is_affine().or_refuse(KernelStage::Refine, "is_affine")? {
         return Ok(None);
@@ -452,7 +474,15 @@ pub(super) fn carve_folded_support(
     // record): every support any lib fixture or case row carves in this lane is
     // a pinch.
     let (fold_image_extent, fold_image_bar) = fold_image_extent(source, face, &carved.kept[0], distance)?;
-    if fold_image_extent > fold_image_bar {
+    let shielded = if fold_image_extent > fold_image_bar && distance > 0.0 {
+        match openings {
+            Some(openings) => fold_image_shielded(source, face, &carved.kept[0], distance, openings)?,
+            None => false,
+        }
+    } else {
+        false
+    };
+    if fold_image_extent > fold_image_bar && !shielded {
         return Err(KernelRefusal::unsupported(KernelStage::Refine, "offset_shell_cusp", format!(
             "offset_shell: the offset of source face {} folds across part of its trim, and the \
              fold locus that bounds the kept part is not a PINCH — its offset image spans \
@@ -535,6 +565,12 @@ pub(super) fn carve_folded_support(
 
     let mut carved_face = face.clone();
     carved_face.loops = new_loops;
+    if shielded {
+        // The discarded taper tip is singular. Fitting over that unused tip
+        // can stop refinement before the retained sheet meets its fit bar.
+        // Exact knot splits restrict the support without changing its UV map.
+        carved_face.surface = support_over_trim(&carved_face)?;
+    }
     for shell in &mut solid.shells {
         for existing in &mut shell.faces {
             if existing.id == face.id {
@@ -547,7 +583,111 @@ pub(super) fn carve_folded_support(
         face: carved_face,
         kept_fraction: carved.kept_fraction,
         fold_boundary,
+        shielded_cusp: shielded,
     }))
+}
+
+fn support_over_trim(face: &FaceRecord) -> Result<NurbsSurface, KernelRefusal> {
+    let surface = &face.surface;
+    let [u0, u1] = surface.domain_u().or_refuse(KernelStage::Refine, "domain_u")?;
+    let [v0, v1] = surface.domain_v().or_refuse(KernelStage::Refine, "domain_v")?;
+    // Positive-weight pcurves lie in their control hull. Unlike a sampled box,
+    // this cannot crop a curved trim's extremum between sample stations.
+    let mut bounds = [u1, u0, v1, v0];
+    for coedge in face.loops.iter().flat_map(|lp| &lp.coedges) {
+        for control in &coedge.pcurve.control_points {
+            let uv = control.point().or_refuse(KernelStage::Refine, "point")?;
+            bounds[0] = bounds[0].min(uv.x);
+            bounds[1] = bounds[1].max(uv.x);
+            bounds[2] = bounds[2].min(uv.y);
+            bounds[3] = bounds[3].max(uv.y);
+        }
+    }
+    let restrict = |mut curve: NurbsCurve, low: f64, high: f64| -> Result<NurbsCurve, KernelRefusal> {
+        let [a, b] = curve.domain().or_refuse(KernelStage::Refine, "domain")?;
+        let band = (b - a) * 1e-12;
+        if high < b - band {
+            curve = curve.split(high.max(a)).or_refuse(KernelStage::Refine, "split")?.0;
+        }
+        if low > a + band {
+            curve = curve.split(low.min(b)).or_refuse(KernelStage::Refine, "split")?.1;
+        }
+        Ok(curve)
+    };
+    let columns = (0..surface.control_points[0].len()).map(|j| {
+        let curve = NurbsCurve::new(surface.degree_u, surface.knots_u.clone(),
+            surface.control_points.iter().map(|row| row[j]).collect())
+            .or_refuse(KernelStage::Refine, "new")?;
+        restrict(curve, bounds[0], bounds[1])
+    }).collect::<Result<Vec<_>, KernelRefusal>>()?;
+    let rows = (0..columns[0].control_points.len()).map(|i| {
+        let curve = NurbsCurve::new(surface.degree_v, surface.knots_v.clone(),
+            columns.iter().map(|column| column.control_points[i]).collect())
+            .or_refuse(KernelStage::Refine, "new")?;
+        restrict(curve, bounds[2], bounds[3])
+    }).collect::<Result<Vec<_>, KernelRefusal>>()?;
+    NurbsSurface::new(surface.degree_u, surface.degree_v, columns[0].knots.clone(),
+        rows[0].knots.clone(), rows.into_iter().map(|row| row.control_points).collect())
+        .or_refuse(KernelStage::Refine, "new")
+}
+
+/// A convex cusp is not a cavity boundary when retained planar neighbors cover its
+/// entire image. Their offset carriers cut the regular sheet before the cusp;
+/// the ordinary imprint and skin selection must still close and validate it.
+/// Read the same miter metric as that selection, including the planes' trims.
+/// A tangent endpoint may lie on an offset plane, but the interior must also
+/// contain a measurably covered sample. An exposed cusp still refuses.
+fn fold_image_shielded(
+    source: &BrepSolid,
+    face: &FaceRecord,
+    kept: &[crate::offset_carve::CarvedLoop],
+    distance: f64,
+    openings: &[u64],
+) -> Result<bool, KernelRefusal> {
+    let planes = source.shells.iter().flat_map(|shell| &shell.faces)
+        .filter(|other| other.id != face.id && !openings.contains(&other.id))
+        .filter(|other| other.surface.is_affine().unwrap_or(false))
+        .map(|other| {
+            let edges = source.edges.iter().filter(|edge| other.loops.iter()
+                .flat_map(|lp| &lp.coedges).any(|coedge| coedge.edge_id == edge.id)).collect::<Vec<_>>();
+            (other, edges)
+        }).collect::<Vec<_>>();
+    let tolerance = KernelTolerances::for_solid(source, 1e-7).model;
+    let displacement = shell_displacement(face, distance);
+    let mut covered = false;
+    for lp in kept {
+        for (curve, origin) in lp.pcurves.iter().zip(&lp.origin) {
+            if origin.is_some() { continue; }
+            let [a, b] = curve.domain().or_refuse(KernelStage::Refine, "domain")?;
+            for index in 0..=64 {
+                let uv = curve.evaluate(a + (b-a) * index as f64 / 64.0)
+                    .or_refuse(KernelStage::Refine, "evaluate")?;
+                // This path handles a convex taper. Keep saddle folds on the
+                // existing refusal path; their other sheet needs its own
+                // intersection construction and qualification.
+                let (low, high) = face.surface.principal_curvatures(uv.x, uv.y)
+                    .or_refuse(KernelStage::Refine, "principal_curvatures")?;
+                let outward_max = if face.same_sense { high } else { -low };
+                if !outward_max.is_finite() || distance * outward_max > COLLAPSE_FACTOR {
+                    return Ok(false);
+                }
+                let point = face.surface.evaluate(uv.x, uv.y)
+                    .or_refuse(KernelStage::Refine, "evaluate")?
+                    .add(face.surface.normal(uv.x, uv.y)
+                        .or_refuse(KernelStage::Refine, "normal")?.scale(displacement));
+                let mut nearest = f64::INFINITY;
+                for (plane, edges) in &planes {
+                    if let Some(separation) = miter_distance_to_trimmed_face(plane, edges, point)? {
+                        nearest = nearest.min(separation);
+                    }
+                }
+                os_debug!("fold shielding face {} sample {index}: {nearest:.12} / {distance:.12}", face.id);
+                if nearest > distance + tolerance { return Ok(false); }
+                covered |= nearest < distance - tolerance;
+            }
+        }
+    }
+    Ok(covered)
 }
 
 /// The largest 3D extent the POINTWISE offset gives any fold-locus pcurve of a
@@ -1766,3 +1906,207 @@ pub(super) fn fragment_has_sustained_source_contact(
     Ok(false)
 }
 
+
+/// Lane P3b row 6: one open sheet solid holding every imprint operand of a
+/// shell (the carriers, then the retained source faces the walls are cut
+/// against), with face, loop, coedge, edge and vertex ids renumbered per
+/// member so nothing collides, and the lookups that map a composite face or
+/// edge id back to its operand tag and original id.
+pub(super) struct CompositeOperands {
+    pub solid: BrepSolid,
+    /// Composite face id -> (operand, original face id).
+    pub faces: HashMap<u64, (u8, u64)>,
+    /// Composite edge id -> (operand, original edge id).
+    pub edges: HashMap<u64, (u8, u64)>,
+    /// Each member's face index in the composite's face order.
+    pub face_index: Vec<usize>,
+}
+
+const COMPOSITE_STRIDE: u64 = 1 << 32;
+
+pub(super) fn compose_imprint_operands(members: &[(u8, &BrepSolid)]) -> CompositeOperands {
+    let mut faces_out = Vec::new();
+    let mut edges_out = Vec::new();
+    let mut vertices_out = Vec::new();
+    let mut faces = HashMap::default();
+    let mut edges = HashMap::default();
+    let mut face_index = Vec::with_capacity(members.len());
+    for (member, (operand, solid)) in members.iter().enumerate() {
+        let offset = (member as u64 + 1) * COMPOSITE_STRIDE;
+        for vertex in &solid.vertices {
+            vertices_out.push(VertexRecord { id: vertex.id + offset, ..vertex.clone() });
+        }
+        for edge in &solid.edges {
+            edges.insert(edge.id + offset, (*operand, edge.id));
+            edges_out.push(EdgeRecord {
+                id: edge.id + offset,
+                start_vertex_id: edge.start_vertex_id + offset,
+                end_vertex_id: edge.end_vertex_id + offset,
+                ..edge.clone()
+            });
+        }
+        face_index.push(faces_out.len());
+        for face in solid.shells.iter().flat_map(|shell| &shell.faces) {
+            faces.insert(face.id + offset, (*operand, face.id));
+            let mut copy = face.clone();
+            copy.id += offset;
+            for loop_record in &mut copy.loops {
+                loop_record.id += offset;
+                for coedge in &mut loop_record.coedges {
+                    coedge.id += offset;
+                    coedge.edge_id += offset;
+                }
+            }
+            faces_out.push(copy);
+        }
+    }
+    CompositeOperands {
+        solid: BrepSolid {
+            mass_properties_cache: Default::default(),
+            cells: Default::default(),
+            id: 1,
+            vertices: vertices_out,
+            edges: edges_out,
+            shells: vec![ShellRecord { id: 1, faces: faces_out }],
+            genus: 0,
+            kind: crate::BodyKind::Solid,
+        },
+        faces,
+        edges,
+        face_index,
+    }
+}
+
+/// The composite's imprint record in the shell's operand space: every
+/// `FaceKey`, pcurve, edge split and barrier edge keyed by (operand,
+/// original id); entries that fold onto the same key (a source edge shared by
+/// two retained faces, a face tagged as operand 0 in one pair and 1 in
+/// another) are merged the way `merge_pair_imprint` merges them across pairs.
+/// Piece and vertex ids are the driver's own and stay unique.
+/// `tolerance` / `scale`: the shell's own, for the cross-pair vertex identity
+/// below (offset-shell lane 2026-10-27). The per-pair path never shared a
+/// vertex between two pair calls except through [`merge_vertex`]: a positional
+/// merge at `tolerance.max(1e-5) * merge_scale(scale)` that keeps the first
+/// point and moves no curve end. The composite's builder registry is tighter
+/// (`tolerance * 10 * merge_scale`), so the per-pair band is applied here to
+/// the translated record — the slot one hair under twice the distance needs
+/// its two wall-offset junctions 1e-4 apart to be one vertex, exactly as the
+/// per-pair merge made them — while the driver's residual-evidence merge,
+/// which reached 9.5e-4 across pairs and broke the successive-fillet shell,
+/// is off for the composite call (`canonicalize_imprint_junctions`).
+pub(super) fn translate_composite_imprint(
+    record: ImprintResultRecord,
+    composite: &CompositeOperands,
+    tolerance: f64,
+    scale: f64,
+) -> Result<ImprintResultRecord, KernelRefusal> {
+    let face = |key: &FaceKey| -> Result<FaceKey, KernelRefusal> {
+        let (operand, face_id) = *composite.faces.get(&key.face_id).ok_or_else(|| {
+            KernelRefusal::internal(KernelStage::Intersect, "offset_shell.composite", format!("composite face {} unknown", key.face_id))
+        })?;
+        Ok(FaceKey { operand, face_id })
+    };
+    let edge = |operand_edge: u64| -> Result<(u8, u64), KernelRefusal> {
+        composite.edges.get(&operand_edge).copied().ok_or_else(|| {
+            KernelRefusal::internal(KernelStage::Intersect, "offset_shell.composite", format!("composite edge {operand_edge} unknown"))
+        })
+    };
+    let mut out = empty_imprint();
+    out.vertices = record.vertices;
+    out.tangent_nodes = record.tangent_nodes;
+    out.section_evidence = record.section_evidence;
+    out.tangent_sections = record.tangent_sections;
+    for piece in record.pieces {
+        let mut pcurves = Vec::with_capacity(piece.pcurves.len());
+        for pcurve in piece.pcurves {
+            let key = face(&FaceKey { operand: pcurve.operand, face_id: pcurve.face_id })?;
+            pcurves.push(FacePcurve { operand: key.operand, face_id: key.face_id, pcurve: pcurve.pcurve });
+        }
+        let shared_edge = match piece.shared_edge {
+            Some((_, edge_id, aligned)) => {
+                let (operand, original) = edge(edge_id)?;
+                Some((operand, original, aligned))
+            }
+            None => None,
+        };
+        out.pieces.push(ImprintPieceRecord {
+            id: piece.id,
+            curve: piece.curve,
+            t0: piece.t0,
+            t1: piece.t1,
+            start_vertex_id: piece.start_vertex_id,
+            end_vertex_id: piece.end_vertex_id,
+            pcurves,
+            support_faces: [face(&piece.support_faces[0])?, face(&piece.support_faces[1])?],
+            shared_edge,
+        });
+    }
+    for by_face in record.by_face {
+        let key = face(&FaceKey { operand: by_face.operand, face_id: by_face.face_id })?;
+        let entry = if let Some(entry) = out
+            .by_face
+            .iter_mut()
+            .find(|entry| entry.operand == key.operand && entry.face_id == key.face_id)
+        {
+            entry
+        } else {
+            out.by_face.push(FaceImprints { operand: key.operand, face_id: key.face_id, piece_ids: Vec::new() });
+            out.by_face.last_mut().unwrap()
+        };
+        for id in by_face.piece_ids {
+            if !entry.piece_ids.contains(&id) {
+                entry.piece_ids.push(id);
+            }
+        }
+    }
+    for split in record.edge_splits {
+        let (operand, edge_id) = edge(split.edge_id)?;
+        if let Some(existing) = out
+            .edge_splits
+            .iter_mut()
+            .find(|entry| entry.operand == operand && entry.edge_id == edge_id)
+        {
+            for parameter in split.parameters {
+                if !existing.parameters.iter().any(|value| (*value - parameter).abs() <= 1e-8) {
+                    existing.parameters.push(parameter);
+                }
+            }
+        } else {
+            out.edge_splits.push(EdgeSplitRecord { operand, edge_id, parameters: split.parameters });
+        }
+    }
+    for (_, edge_id) in record.barrier_edges {
+        let key = edge(edge_id)?;
+        if !out.barrier_edges.contains(&key) {
+            out.barrier_edges.push(key);
+        }
+    }
+    for (first, second) in record.cosurface_pairs {
+        out.cosurface_pairs.push((face(&first)?, face(&second)?));
+    }
+    // The per-pair cross-pair vertex identity (see the doc above): a greedy
+    // positional registry in the driver's minting order, first point kept.
+    let merge = tolerance.max(1e-5) * crate::tolerance::merge_scale(scale);
+    let mut kept: Vec<ImprintVertex> = Vec::with_capacity(out.vertices.len());
+    let mut remap: HashMap<u64, u64> = HashMap::default();
+    for vertex in &out.vertices {
+        match kept.iter().find(|candidate| candidate.point.sub(vertex.point).length() <= merge) {
+            Some(candidate) => {
+                remap.insert(vertex.id, candidate.id);
+            }
+            None => kept.push(ImprintVertex { id: vertex.id, point: vertex.point }),
+        }
+    }
+    if !remap.is_empty() {
+        out.vertices = kept;
+        for piece in &mut out.pieces {
+            if let Some(id) = remap.get(&piece.start_vertex_id) {
+                piece.start_vertex_id = *id;
+            }
+            if let Some(id) = remap.get(&piece.end_vertex_id) {
+                piece.end_vertex_id = *id;
+            }
+        }
+    }
+    Ok(out)
+}

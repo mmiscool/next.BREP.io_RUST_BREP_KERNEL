@@ -1,0 +1,30 @@
+[package]
+name = "BREP_instructions"
+version = "0.1.0"
+edition = "2021"
+license-file = "LICENSE.md"
+repository = "https://github.com/mmiscool/next.BREP.io_RUST_BREP_KERNEL"
+description = "Manufacturing instructions for BREP assemblies: the instructions document model, the step-order wizard, step editing, re-targeting to a new assembly revision, page layout and the self-contained HTML player"
+readme = "README.md"
+keywords = ["cad", "assembly", "instructions", "manufacturing"]
+categories = ["data-structures", "visualization"]
+# The `!` entries are a backstop: test code never ships.
+include = [
+    "src/**",
+    "player/**",
+    "Cargo.toml",
+    "README.md",
+    "LICENSE.md",
+    "!src/**/tests/**",
+    "!**/tests.rs",
+    "!**/*_tests.rs",
+    "!**/test_support.rs",
+    "!**/testdata/**",
+]
+
+[lib]
+name = "brep_instructions"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

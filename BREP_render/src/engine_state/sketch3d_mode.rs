@@ -516,7 +516,7 @@ impl EngineState {
                 return entity.get("id").cloned().map(Sketch3dCursorHit::SketchPoint);
             }
         }
-        for candidate in crate::pick::pick(&self.scene, &self.camera, x, y, &self.pick_options()) {
+        for candidate in crate::pick::pick_unoccluded(&self.scene, &self.context_scene, &self.camera, x, y, &self.pick_options()) {
             let Some(solid) = self.scene.solids().iter().find(|s| s.name == candidate.solid) else {
                 continue;
             };

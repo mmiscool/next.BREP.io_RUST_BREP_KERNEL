@@ -39,6 +39,14 @@ impl UnionFind {
     }
 }
 
+/// Every body a mate reaches: its two sides and, for a symmetric mate, the
+/// mirror's body when that is a third one.
+fn mate_bodies(mate: &AssemblyMate) -> impl Iterator<Item = usize> {
+    let (a, b) = (mate.body_a, mate.body_b);
+    let third = mate.body_c.filter(|&c| c != a && c != b);
+    [a, b].into_iter().chain(third)
+}
+
 struct DecompOutcome {
     steps: Vec<SolveStepReport>,
     run: LmRun,
@@ -64,8 +72,9 @@ fn solve_decomposed(
     }
     let mut incident: Vec<Vec<usize>> = vec![Vec::new(); nb];
     for (mi, mate) in mates.iter().enumerate() {
-        incident[mate.body_a].push(mi);
-        incident[mate.body_b].push(mi);
+        for body in mate_bodies(mate) {
+            incident[body].push(mi);
+        }
     }
 
     // Live decomposition nodes: a singleton per movable body, contracted into
@@ -83,7 +92,7 @@ fn solve_decomposed(
     let atoms_of = |mate_set: &[usize]| -> Vec<Atom> {
         mate_set
             .iter()
-            .flat_map(|&mi| mate_atoms[mi].iter().map(|&ai| prep.atoms[ai]))
+            .flat_map(|&mi| mate_atoms[mi].iter().map(|&ai| prep.atoms[ai].clone()))
             .collect()
     };
 
@@ -108,17 +117,16 @@ fn solve_decomposed(
                 // Partition this node's external mates by the other side.
                 let mut to_solved: Vec<usize> = Vec::new();
                 let mut deferred = false;
+                // A mate's other bodies are every body it reaches outside
+                // this node (a symmetric mate's mirror included): it counts
+                // toward the solved side only when ALL of them are solved.
                 for &b in members {
                     for &mi in &incident[b] {
-                        let other = if mates[mi].body_a == b {
-                            mates[mi].body_b
-                        } else {
-                            mates[mi].body_a
-                        };
-                        if node_of[other] == Some(ni) {
+                        let mut outside = mate_bodies(&mates[mi]).filter(|&other| node_of[other] != Some(ni)).peekable();
+                        if outside.peek().is_none() {
                             continue; // Internal to the node.
                         }
-                        if solved[other] {
+                        if outside.all(|other| solved[other]) {
                             to_solved.push(mi);
                         } else {
                             deferred = true;
@@ -169,6 +177,7 @@ fn solve_decomposed(
                     prep.scale,
                     prep.tight,
                     max_iterations,
+                    prep.linear,
                 )?;
                 let iters = sub.iterations;
                 run.absorb(sub);
@@ -211,6 +220,10 @@ fn solve_decomposed(
             std::collections::BTreeMap::new();
         for (mi, mate) in mates.iter().enumerate() {
             let (a, b) = (mate.body_a, mate.body_b);
+            // Pairs only: a mate reaching a third body binds no PAIR.
+            if mate_bodies(mate).count() > 2 {
+                continue;
+            }
             if !solved[a] && !solved[b] && lone(a, &nodes, &node_of) && lone(b, &nodes, &node_of) {
                 pair_mates.entry((a.min(b), a.max(b))).or_default().push(mi);
             }
@@ -250,9 +263,7 @@ fn solve_decomposed(
                 let mut internal: Vec<usize> = comp
                     .iter()
                     .flat_map(|&b| incident[b].iter().copied())
-                    .filter(|&mi| {
-                        comp.contains(&mates[mi].body_a) && comp.contains(&mates[mi].body_b)
-                    })
+                    .filter(|&mi| mate_bodies(&mates[mi]).all(|body| comp.contains(&body)))
                     .collect();
                 internal.sort_unstable();
                 internal.dedup();
@@ -265,6 +276,7 @@ fn solve_decomposed(
                     prep.scale,
                     prep.tight,
                     max_iterations,
+                    prep.linear,
                 )?;
                 let sub_iters = sub.iterations;
                 run.absorb(sub);
@@ -318,7 +330,7 @@ fn solve_decomposed(
         // remaining bodies and every not-yet-applied mate.
         let remaining: Vec<usize> = (0..nb).filter(|&b| node_of[b].is_some()).collect();
         let mate_set: Vec<usize> = (0..mates.len())
-            .filter(|&mi| !solved[mates[mi].body_a] || !solved[mates[mi].body_b])
+            .filter(|&mi| mate_bodies(&mates[mi]).any(|body| !solved[body]))
             .collect();
         let atoms = atoms_of(&mate_set);
         let groups = singleton_groups(&remaining);
@@ -329,6 +341,7 @@ fn solve_decomposed(
             prep.scale,
             prep.tight,
             max_iterations,
+            prep.linear,
         )?;
         let iters = sub.iterations;
         run.absorb(sub);
@@ -369,6 +382,63 @@ pub fn solve_assembly(
     mates: &[AssemblyMate],
     options: &AssemblySolveOptions,
 ) -> Result<AssemblySolution, String> {
+    let result = solve_with(bodies, mates, options);
+    // The sparse/dense A/B over the test corpus: a test run with
+    // BREP_ASSEMBLY_AB set re-solves every sparse solve densely and compares.
+    // Compiled out of every non-test build (`cfg!(test)` is a constant).
+    if cfg!(test) && options.linear_algebra == LinearAlgebra::Sparse && std::env::var_os("BREP_ASSEMBLY_AB").is_some() {
+        let dense = solve_with(bodies, mates, &AssemblySolveOptions { linear_algebra: LinearAlgebra::Dense, ..*options });
+        if let Err(difference) = compare_solutions(&result, &dense) {
+            panic!("sparse/dense A/B: {difference}");
+        }
+    }
+    result
+}
+
+/// The A/B acceptance: both fail, or both succeed with poses within 1e-9 mm
+/// and 1e-9 rad and the same iteration count or the same status. Along a FREE
+/// direction (`dof > 0`) the damped step is the gradient's roundoff divided by
+/// a tiny λ, so the two factorizations may come to rest at different, equally
+/// valid points: there the bar is 1e-6 and the drift is printed (`AB-DRIFT`).
+fn compare_solutions(
+    sparse: &Result<AssemblySolution, String>,
+    dense: &Result<AssemblySolution, String>,
+) -> Result<(), String> {
+    match (sparse, dense) {
+        (Err(_), Err(_)) => Ok(()),
+        (Ok(_), Err(error)) => Err(format!("sparse solved, dense failed: {error}")),
+        (Err(error), Ok(_)) => Err(format!("dense solved, sparse failed: {error}")),
+        (Ok(a), Ok(b)) => {
+            for (pa, pb) in a.poses.iter().zip(&b.poses) {
+                let dt = (0..3).map(|i| (pa.translation[i] - pb.translation[i]).abs()).fold(0.0, f64::max);
+                // The angle of qa·qb⁻¹: twice the norm of its vector part.
+                let (qa, qb) = (pa.rotation, pb.rotation);
+                let rel = quat_mul(qa, [qb[0], -qb[1], -qb[2], -qb[3]]);
+                let angle = 2.0 * (rel[1] * rel[1] + rel[2] * rel[2] + rel[3] * rel[3]).sqrt();
+                let bar = if a.dof > 0 { 1e-6 } else { 1e-9 };
+                if dt > bar || angle > bar {
+                    return Err(format!("body {}: translation {dt:.3e}, rotation {angle:.3e} (dof {})", pa.id, a.dof));
+                }
+                if dt > 1e-9 || angle > 1e-9 {
+                    eprintln!("AB-DRIFT body {} dof {}: translation {dt:.3e}, rotation {angle:.3e}", pa.id, a.dof);
+                }
+            }
+            if a.iterations != b.iterations && a.status != b.status {
+                return Err(format!(
+                    "iterations {} vs {} and status {} vs {}",
+                    a.iterations, b.iterations, a.status, b.status
+                ));
+            }
+            Ok(())
+        }
+    }
+}
+
+fn solve_with(
+    bodies: &[AssemblyBody],
+    mates: &[AssemblyMate],
+    options: &AssemblySolveOptions,
+) -> Result<AssemblySolution, String> {
     if !(options.tolerance.is_finite() && options.tolerance > 0.0) {
         return Err("options.tolerance must be finite and positive".into());
     }
@@ -384,9 +454,13 @@ pub fn solve_assembly(
             prep.scale,
             prep.tight,
             options.max_iterations,
+            prep.linear,
         )
     };
 
+    // A mate reaching a third body (a symmetric mate's mirror) takes part in
+    // the decomposition: peeling waits for all of its bodies, and only the
+    // cluster detection, which binds pairs, leaves it out.
     if options.strategy == SolveStrategy::Monolithic {
         let mut poses = prep.base.clone();
         let run = run_monolithic(&mut poses)?;
@@ -429,18 +503,102 @@ pub fn solve_assembly(
     let sub = run_monolithic(&mut poses)?;
     let iters = sub.iterations;
     run.absorb(sub);
+    let mut method = "monolithic_fallback";
+    if let Some((flipped, sub)) = flip_restart(mates, &prep, &poses, &run_monolithic) {
+        run.absorb(sub);
+        poses = flipped;
+        method = "flip_restart";
+    }
     let steps = vec![SolveStepReport {
         bodies: movable_ids,
-        method: "monolithic_fallback".into(),
+        method: method.into(),
         iterations: iters,
     }];
-    finalize(
-        bodies,
-        mates,
-        &prep,
-        &poses,
-        run,
-        "monolithic_fallback",
-        steps,
-    )
+    finalize(bodies, mates, &prep, &poses, run, method, steps)
+}
+
+/// The most bodies a failed solve is restarted for, turned over.
+const FLIP_RESTART_BODIES: usize = 4;
+/// Above this many movable bodies a failed solve is not restarted: each
+/// restart is a whole monolithic solve.
+const FLIP_RESTART_MAX_MOVABLE: usize = 64;
+
+/// Two starts the solve cannot leave, because the residual has no gradient
+/// there:
+/// - a mate asked to FLIP (a Touch Align or Concentric reversed, a
+///   Distance's normals opposed) starts exactly antiparallel to its goal
+///   ("did not converge", residual 2);
+/// - a Distance between coaxial cylinders starts where the separation
+///   direction is undefined (residual = the whole distance).
+/// When `solved` still misses the tolerance, each movable body of the
+/// failing mates is restarted from the ORIGINAL poses, turned half a turn
+/// about each world axis through its origin, or nudged a thousandth of the
+/// model's size along each world axis; of the restarts that converge, the
+/// one that moves the bodies least is kept. `None` when none does (a real
+/// conflict), or when the solve converged in the first place.
+fn flip_restart(
+    mates: &[AssemblyMate],
+    prep: &Prepared,
+    solved: &[Pose],
+    run_monolithic: &dyn Fn(&mut Vec<Pose>) -> Result<LmRun, String>,
+) -> Option<(Vec<Pose>, LmRun)> {
+    if prep.movable.len() > FLIP_RESTART_MAX_MOVABLE {
+        return None;
+    }
+    let residuals = |poses: &[Pose]| -> Vec<f64> {
+        let (mut scratch, mut r) = (Vec::new(), Vec::new());
+        eval_residuals(&prep.atoms, poses, &[], &[], &mut scratch, &mut r);
+        r
+    };
+    let converged = |poses: &[Pose]| residuals(poses).iter().all(|x| x.is_finite() && x.abs() <= prep.tight);
+    let r = residuals(solved);
+    let mut per_mate = vec![0.0f64; mates.len()];
+    for (row, &mi) in prep.row_mate.iter().enumerate() {
+        per_mate[mi] = per_mate[mi].max(r[row].abs());
+    }
+    let mut failing: Vec<usize> = (0..mates.len()).filter(|&mi| per_mate[mi] > prep.tight).collect();
+    if failing.is_empty() {
+        return None;
+    }
+    failing.sort_by(|&a, &b| per_mate[b].total_cmp(&per_mate[a]));
+    let mut candidates: Vec<usize> = Vec::new();
+    for &mi in &failing {
+        for body in mate_bodies(&mates[mi]) {
+            if prep.movable.contains(&body) && !candidates.contains(&body) {
+                candidates.push(body);
+            }
+        }
+    }
+    candidates.truncate(FLIP_RESTART_BODIES);
+    let moved = |poses: &[Pose]| -> f64 {
+        poses.iter().zip(&prep.base).map(|(p, b)| p.t.sub(b.t).length()).sum()
+    };
+    for body in candidates {
+        let mut best: Option<(f64, Vec<Pose>, LmRun)> = None;
+        let nudge = 1e-3 * prep.scale.max(1e-9);
+        let starts = [
+            ([0.0, 1.0, 0.0, 0.0], [0.0; 3]),
+            ([0.0, 0.0, 1.0, 0.0], [0.0; 3]),
+            ([0.0, 0.0, 0.0, 1.0], [0.0; 3]),
+            ([1.0, 0.0, 0.0, 0.0], [nudge, 0.0, 0.0]),
+            ([1.0, 0.0, 0.0, 0.0], [0.0, nudge, 0.0]),
+            ([1.0, 0.0, 0.0, 0.0], [0.0, 0.0, nudge]),
+        ];
+        for (turn, shift) in starts {
+            let mut poses = prep.base.clone();
+            poses[body].q = quat_mul(turn, poses[body].q);
+            poses[body].t = poses[body].t.add(crate::Vec3::new(shift[0], shift[1], shift[2]));
+            let Ok(run) = run_monolithic(&mut poses) else { continue };
+            if converged(&poses) {
+                let cost = moved(&poses);
+                if best.as_ref().is_none_or(|(c, _, _)| cost < *c - 1e-9) {
+                    best = Some((cost, poses, run));
+                }
+            }
+        }
+        if let Some((_, poses, run)) = best {
+            return Some((poses, run));
+        }
+    }
+    None
 }

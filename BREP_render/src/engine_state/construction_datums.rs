@@ -72,7 +72,7 @@ impl EngineState {
     }
 
     /// (Re)build the persistent construction datum/plane overlays. Feeds every D/P
-    /// frame the last run resolved (minus [`hidden_datums`]) to the datum-plane
+    /// frame the last run resolved (minus `hidden_datums`) to the datum-plane
     /// widget channel as a screen-constant NAMED plane in the calm datum color — or
     /// the selection accent when it is in `emphasis.selected_datums` / hovered when
     /// it is in `emphasis.hovered_datums` (hover wins, the `EmphasisState` order).
@@ -124,13 +124,13 @@ impl EngineState {
     }
 
     /// Whether the construction datum/plane `name`'s plane is shown (absent from
-    /// [`hidden_datums`] = visible).
+    /// `hidden_datums` = visible).
     pub fn datum_visible(&self, name: &str) -> bool {
         !self.hidden_datums.contains(name)
     }
 
     /// Show/hide the construction datum/plane `name`'s plane (the Scene-tree
-    /// checkbox). Toggles [`hidden_datums`] and re-feeds the datum planes so the
+    /// checkbox). Toggles `hidden_datums` and re-feeds the datum planes so the
     /// plane appears/disappears immediately.
     pub fn set_datum_visible(&mut self, name: &str, visible: bool) {
         if visible {

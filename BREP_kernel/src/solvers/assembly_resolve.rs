@@ -311,11 +311,13 @@ pub fn split_component_namespace(name: &str) -> (Vec<&str>, &str) {
 }
 
 /// `ACOMP<digits>` — an ACOMP feature id, i.e. a whole-component selection or
-/// one namespace segment of a nested chain.
+/// one namespace segment of a nested chain — or a Pattern Component instance
+/// id (`APAT1.ACOMP3.i4`), which namespaces its geometry the same way.
 pub fn is_component_reference(name: &str) -> bool {
     name.strip_prefix("ACOMP")
         .map(|digits| !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit()))
         .unwrap_or(false)
+        || crate::feature_pipeline::features::assembly_pattern::parse_instance_id(name).is_some()
 }
 
 // ---------------------------------------------------------------------------

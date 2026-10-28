@@ -2,7 +2,7 @@
 //!
 //! The arrow head lands ON the occurrence as the owning view DISPLAYS it: by
 //! default at the point of its visible, posed, un-sectioned surface nearest
-//! the bubble, or — with the optional `anchor` reference — on a picked edge
+//! the bubble in screen space, or — with the optional `anchor` reference — on a picked edge
 //! (nearest the bubble) or exactly at a picked vertex. A target the view
 //! cannot show (every member hidden, or sectioned away; an anchor on a
 //! hidden member or on the cut-away side) is an error row with no leader,
@@ -12,9 +12,9 @@
 //! dragged.
 use std::collections::BTreeMap;
 
-use super::{id_field, params, reference_field, schema_entry, PmiTypeDef};
+use super::{id_field, params, reference_field, schema_entry, string_field, PmiTypeDef};
 use crate::feature_pipeline::pmi::anchor::{
-    nearest_displayed_point, nearest_displayed_point_on_edge, pose_apply, pose_unapply, BalloonAnchor,
+    nearest_screen_point, head_distance, nearest_displayed_point_on_edge, pose_apply, pose_unapply, BalloonAnchor,
     BalloonAnchorMode, HalfSpace, HeadScope, PmiPose, SolidPoses,
 };
 use crate::feature_pipeline::pmi::resolve::{a3, solid_bbox, v3};
@@ -56,20 +56,24 @@ fn schema() -> serde_json::Value {
                     false,
                     0,
                     1,
-                    "Optional: a vertex or an edge of the component the arrow head lands on; empty puts it on the nearest point of the surface",
+                    "Optional: a vertex or an edge of the component the arrow head lands on; empty puts it on the nearest point of the surface in screen space",
+                ),
+            ),
+            (
+                "occurrence",
+                string_field(
+                    "Occurrence",
+                    "",
+                    "Optional: a placement inside a sub-assembly (ACOMP1:ACOMP3) to balloon instead of the top-level component; its Find Number is the one its sub-assembly gives it",
                 ),
             ),
         ]),
     )
 }
 
-/// The view the annotation belongs to, from the request's PMI block.
+/// The view the annotation belongs to, from the PMI block being resolved.
 fn owning_view<'a>(annotation: &PmiAnnotation, context: &'a PmiContext<'_>) -> Option<&'a PmiView> {
-    context
-        .request
-        .pmi
-        .as_ref()
-        .and_then(|pmi| pmi.find_annotation(annotation.id()).map(|(view, _)| view))
+    context.state.find_annotation(annotation.id()).map(|(view, _)| view)
 }
 
 /// The explode stages the owning view displays each of `solids` through:
@@ -109,10 +113,10 @@ fn explode_stages(view: Option<&PmiView>, context: &PmiContext<'_>, solids: &[St
     stages
 }
 
-/// The view's section half-space, kept where the display clip keeps.
+/// The view's section half-space (all its planes), kept where the display
+/// clip keeps.
 fn section_of(view: Option<&PmiView>) -> Option<HalfSpace> {
-    view.and_then(PmiView::section_plane)
-        .map(|(point, normal)| HalfSpace { point, normal })
+    HalfSpace::of(&view?.section_planes())
 }
 
 /// Parse a `{solid}@x,y,z` vertex reference.
@@ -137,6 +141,8 @@ struct Occurrence {
     visible: Vec<(String, u32)>,
     stages: BTreeMap<String, Vec<PmiPose>>,
     section: Option<HalfSpace>,
+    /// Members the view's section leaves whole: never sectioned away.
+    exempt: Vec<String>,
     /// The bubble a balloon without a stored one gets: off the displayed
     /// box's +X+Y corner at mid height, outside the body.
     default_label: [f64; 3],
@@ -154,8 +160,22 @@ fn occurrence(annotation: &PmiAnnotation, context: &PmiContext<'_>) -> Result<Oc
         .scene
         .owning_component(target)
         .ok_or("select geometry belonging to an assembly component")?;
-    let id = component.id.clone();
-    let members = context.scene.component_solids(&id);
+    let (id, members) = match nested_path(annotation) {
+        Some(path) => {
+            if !path.starts_with(&format!("{}:", component.id)) {
+                return Err(format!("occurrence '{path}' is not inside component {}", component.id));
+            }
+            let members = context.scene.occurrence_solids(path);
+            if members.is_empty() {
+                return Err(format!("occurrence '{path}' no longer exists"));
+            }
+            if !target.starts_with(&format!("{path}:")) && target != path {
+                return Err(format!("the target is not part of occurrence '{path}'"));
+            }
+            (path.to_string(), members)
+        }
+        None => (component.id.clone(), context.scene.component_solids(&component.id)),
+    };
     if members.is_empty() {
         return Err("component has no geometry".into());
     }
@@ -163,6 +183,10 @@ fn occurrence(annotation: &PmiAnnotation, context: &PmiContext<'_>) -> Result<Oc
     let names: Vec<String> = members.iter().map(|(name, _)| name.clone()).collect();
     let stages = explode_stages(view, context, &names);
     let section = section_of(view);
+    let exempt: Vec<String> = match view.and_then(|view| view.display.section.as_ref()) {
+        Some(cut) => names.iter().filter(|name| cut.excludes(name)).cloned().collect(),
+        None => Vec::new(),
+    };
     let hidden: &[String] = view.map_or(&[], |view| view.display.hidden.as_slice());
     let visible: Vec<(String, u32)> = members
         .iter()
@@ -197,8 +221,53 @@ fn occurrence(annotation: &PmiAnnotation, context: &PmiContext<'_>) -> Result<Oc
         visible,
         stages,
         section,
+        exempt,
         default_label,
     })
+}
+
+/// The nested occurrence path a balloon names, when it names one.
+fn nested_path(annotation: &PmiAnnotation) -> Option<&str> {
+    annotation
+        .params
+        .get("occurrence")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+}
+
+/// The `bom` record of the placement `path` names: the top-level component's
+/// own for one segment, else the placing component's inside the owning
+/// sub-assembly's definition, walked down the parts libraries.
+fn placement_bom(context: &PmiContext<'_>, path: &str) -> Result<serde_json::Value, String> {
+    let mut segments = path.split(':');
+    let first = segments.next().unwrap_or_default();
+    let mut params = context
+        .request
+        .features
+        .iter()
+        .find(|f| f.input_params["id"].as_str() == Some(first))
+        .map(|f| f.input_params.clone())
+        .ok_or("component no longer exists")?;
+    // `None` is the open document's own library.
+    let mut library: Option<serde_json::Value> = None;
+    for segment in segments {
+        let part = params["partName"].as_str().unwrap_or_default().to_string();
+        let document = match &library {
+            None => crate::feature_pipeline::parts_library::active_entry(&part)
+                .map(|entry| entry.document)
+                .or_else(|| context.request.parts_library.get(&part).map(|entry| entry.document.clone())),
+            Some(library) => library.get(&part).map(|entry| entry["document"].clone()),
+        }
+        .ok_or_else(|| format!("occurrence '{path}': part '{part}' is not in the parts library"))?;
+        params = document["features"]
+            .as_array()
+            .and_then(|features| features.iter().find(|f| f["inputParams"]["id"].as_str() == Some(segment)))
+            .map(|f| f["inputParams"].clone())
+            .ok_or_else(|| format!("occurrence '{path}' no longer exists"))?;
+        library = Some(document["partsLibrary"].clone());
+    }
+    Ok(params["bom"].clone())
 }
 
 /// Where an error row's chip sits for a balloon without a stored bubble:
@@ -211,14 +280,8 @@ pub fn error_bubble(annotation: &PmiAnnotation, context: &PmiContext<'_>) -> Opt
 fn resolve(annotation: &PmiAnnotation, context: &PmiContext<'_>) -> Result<Resolved, String> {
     let targets = annotation.references("target");
     let occurrence = occurrence(annotation, context)?;
-    let params = context
-        .request
-        .features
-        .iter()
-        .find(|f| f.input_params["id"].as_str() == Some(occurrence.id.as_str()))
-        .map(|f| &f.input_params)
-        .ok_or("component no longer exists")?;
-    let find = &params["bom"]["Find_Number"];
+    let bom = placement_bom(context, &occurrence.id)?;
+    let find = &bom["Find_Number"];
     let text = match find {
         serde_json::Value::String(s) => s.trim().to_owned(),
         serde_json::Value::Number(n) => n.to_string(),
@@ -234,10 +297,11 @@ fn resolve(annotation: &PmiAnnotation, context: &PmiContext<'_>) -> Result<Resol
     let default_label = occurrence.default_label;
     // The bubble the head is derived from, in the displayed frame.
     let bubble = annotation.label_world.unwrap_or(default_label);
+    let camera = owning_view(annotation, context).and_then(|view| view.camera.as_ref());
     let stages_of = |name: &str| occurrence.stages.get(name).map_or(&[][..], Vec::as_slice);
     let scope_of = |name: &str| HeadScope {
         stages: stages_of(name),
-        section: occurrence.section.as_ref(),
+        section: occurrence.section.as_ref().filter(|_| !occurrence.exempt.iter().any(|exempt| exempt == name)),
     };
     // The anchor: nothing (the surface), a vertex ref, or an edge name — on
     // this occurrence, and on a member the view shows.
@@ -248,6 +312,7 @@ fn resolve(annotation: &PmiAnnotation, context: &PmiContext<'_>) -> Result<Resol
     let owner_of = |name: &str| -> Result<(), String> {
         match context.scene.owning_component(name) {
             Some(owner) if owner.id == component_id => Ok(()),
+            _ if component_id.contains(':') && name.starts_with(&format!("{component_id}:")) => Ok(()),
             _ => Err(format!("anchor '{name}' is not on component {component_id}")),
         }
     };
@@ -263,9 +328,9 @@ fn resolve(annotation: &PmiAnnotation, context: &PmiContext<'_>) -> Result<Resol
             let mut best: Option<(f64, [f64; 3])> = None;
             for (name, handle) in &occurrence.visible {
                 let scope = scope_of(name);
-                let candidate = crate::with_registered_solid_str(*handle, |solid| nearest_displayed_point(solid, scope, bubble))?;
+                let candidate = crate::with_registered_solid_str(*handle, |solid| nearest_screen_point(solid, scope, bubble, camera))?;
                 if let Some(display) = candidate {
-                    let d2 = (0..3).map(|i| (display[i] - bubble[i]).powi(2)).sum::<f64>();
+                    let d2 = head_distance(camera, display, bubble);
                     if best.is_none_or(|(b, _)| d2 < b) {
                         best = Some((d2, display));
                     }
@@ -295,7 +360,8 @@ fn resolve(annotation: &PmiAnnotation, context: &PmiContext<'_>) -> Result<Resol
                 return Err(format!("anchor '{name}' is not a vertex"));
             };
             let head = pose_apply(stages, a3(position));
-            if occurrence.section.is_some_and(|section| !section.keeps(head, 1e-7)) {
+            let exempt = occurrence.exempt.iter().any(|exempt| exempt == solid_name);
+            if !exempt && occurrence.section.as_ref().is_some_and(|section| !section.keeps(head, 1e-7)) {
                 return Err(format!("anchor '{name}' is sectioned away in this view"));
             }
             (head, BalloonAnchorMode::Point)
@@ -352,10 +418,12 @@ fn resolve(annotation: &PmiAnnotation, context: &PmiContext<'_>) -> Result<Resol
             dot: false,
             balloon: true,
             anchor: Some(BalloonAnchor {
+                camera: camera.cloned(),
                 solids,
                 mode,
                 poses,
-                section: occurrence.section,
+                // A component the cut leaves whole re-projects uncut.
+                section: occurrence.section.clone().filter(|_| occurrence.exempt.len() < occurrence.members.len()),
             }),
         },
         default_label,

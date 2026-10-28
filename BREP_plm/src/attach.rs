@@ -248,7 +248,8 @@ pub fn attachment_writable(state: &State, user: &User, found: &Located) -> Resul
 
 /// Every blob the store references: attachments, revision thumbnails
 /// ([`crate::thumbnail`]), and every version of every workspace file
-/// ([`crate::workspace`]).
+/// ([`crate::workspace`]), instructions player data ([`crate::player`]), and
+/// the tools library's pictures ([`crate::tools`]).
 pub fn referenced(state: &State) -> BTreeSet<String> {
     let mut out = BTreeSet::new();
     for part in state.parts.iter() {
@@ -256,19 +257,70 @@ pub fn referenced(state: &State) -> BTreeSet<String> {
         for revision in &part.revisions {
             out.extend(revision.attachments.iter().map(|a| a.sha256.clone()));
             out.extend(revision.thumbnail.iter().map(|t| t.sha256.clone()));
+            out.extend(revision.player.iter().map(|p| p.sha256.clone()));
         }
     }
     for entry in state.workspace.iter() {
         out.extend(entry.versions.iter().map(|v| v.sha256.clone()));
     }
+    out.extend(crate::tools::pictures(state).map(str::to_string));
     out
+}
+
+/// The stores whose own backup is copying their blobs now, each with the
+/// blobs whose last reference went meanwhile: their files stay until the
+/// backup ends ([`BlobsHeld`]), so a backup never loses a blob its snapshot
+/// references. Keyed by the store's root: several stores share a process in
+/// the tests.
+static HELD: std::sync::Mutex<Vec<(std::path::PathBuf, Vec<String>)>> = std::sync::Mutex::new(Vec::new());
+
+/// Blob removals of the store at a root held while it lives; the held ones
+/// are made by [`BlobsHeld::release`].
+pub struct BlobsHeld(std::path::PathBuf);
+
+impl BlobsHeld {
+    pub fn new(root: &Path) -> Self {
+        HELD.lock().unwrap_or_else(|e| e.into_inner()).push((root.to_path_buf(), Vec::new()));
+        Self(root.to_path_buf())
+    }
+
+    /// Stop holding, and remove the held blobs that are still unreferenced.
+    /// Under the store's read lock: no change can reference one meanwhile.
+    pub fn release(self, db: &crate::db::Db) -> Result<(), Error> {
+        let held = take_held(&self.0);
+        db.read(|state| held.iter().try_for_each(|sha| remove_if_unreferenced(state, &self.0, sha)))
+    }
+}
+
+impl Drop for BlobsHeld {
+    fn drop(&mut self) {
+        // Released or not, the hold ends with the backup. Files not released
+        // are orphans the start-up sweep removes.
+        take_held(&self.0);
+    }
+}
+
+fn take_held(root: &Path) -> Vec<String> {
+    let mut held = HELD.lock().unwrap_or_else(|e| e.into_inner());
+    match held.iter().position(|(r, _)| r == root) {
+        Some(i) => held.remove(i).1,
+        None => Vec::new(),
+    }
 }
 
 /// Remove the blob `sha256` if nothing in `state` references it any more.
 /// Called inside the write lock by the change that dropped a reference.
+/// While the store's own backup copies blobs, the removal waits for it.
 pub fn remove_if_unreferenced(state: &State, root: &Path, sha256: &str) -> Result<(), Error> {
     if !is_sha256(sha256) || referenced(state).contains(sha256) {
         return Ok(());
+    }
+    {
+        let mut held = HELD.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((_, waiting)) = held.iter_mut().find(|(r, _)| r == root) {
+            waiting.push(sha256.to_string());
+            return Ok(());
+        }
     }
     match std::fs::remove_file(blob_path(root, sha256)) {
         Err(error) if error.kind() != io::ErrorKind::NotFound => Err(Error::internal(error)),

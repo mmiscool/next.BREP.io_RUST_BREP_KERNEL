@@ -298,9 +298,83 @@ impl CarrierExtension {
     }
 }
 
+/// Lane R2 row 9 (2026-10-19): `BREP_OFFSET_EXACT_TRIM_BOX=1`/`on` closes
+/// [`trim_domain_fractions`]' sampled box on each pcurve's true extremes
+/// ([`refine_trim_extreme`]; the default since its census at 9183d81d4);
+/// `=0`/`off` keeps the 25-sample box; `set_exact_trim_box_for_test` forces
+/// it on a test's own thread.
+///
+/// The slide is solved for that box, so a box short of the trim slides the
+/// net unevenly and the cloned pcurves leave their edges.
+const EXACT_TRIM_BOX_DEFAULT: bool = true;
+
+thread_local! {
+    static EXACT_TRIM_BOX_FOR_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+fn exact_trim_box_on() -> bool {
+    if let Some(forced) = EXACT_TRIM_BOX_FOR_TEST.with(|forced| forced.get()) {
+        return forced;
+    }
+    match std::env::var("BREP_OFFSET_EXACT_TRIM_BOX").as_deref() {
+        Ok("0") | Ok("off") => false,
+        Ok("1") | Ok("on") => true,
+        _ => EXACT_TRIM_BOX_DEFAULT,
+    }
+}
+
+
+/// Golden-section steps [`refine_trim_extreme`] takes: the bracket shrinks to
+/// 0.618^64 ≈ 4e-14 of two sample spacings, past where the extreme's value
+/// can still move (it is quadratic in the parameter there).
+const TRIM_EXTREME_STEPS: usize = 64;
+
+/// The extreme of `sign · uv[axis]` (`axis` 0 is u, 1 is v) over one pcurve,
+/// returned as the coordinate itself. Bracketed by the pcurve's best sample
+/// and that sample's two neighbours, and closed by a golden-section search of
+/// a fixed [`TRIM_EXTREME_STEPS`] steps; never worse than the best sample.
+/// On an arc the bracketed piece is unimodal, so this is its true extreme.
+/// A line's extremes are its ends, which are samples, so the caller does not
+/// search one (an interior read of a straight trim can land an ulp past its
+/// end).
+fn refine_trim_extreme(
+    pcurve: &NurbsCurve,
+    samples: &[(f64, Vec3)],
+    axis: usize,
+    sign: f64,
+) -> Result<f64, KernelRefusal> {
+    let read = |uv: Vec3| sign * if axis == 0 { uv.x } else { uv.y };
+    let at = |parameter: f64| -> Result<f64, KernelRefusal> {
+        Ok(read(pcurve.evaluate(parameter).or_refuse(KernelStage::Refine, "evaluate")?))
+    };
+    let best = (0..samples.len())
+        .max_by(|&a, &b| read(samples[a].1).total_cmp(&read(samples[b].1)))
+        .expect("a pcurve has samples");
+    let mut found = read(samples[best].1);
+    let (mut a, mut b) = (samples[best.saturating_sub(1)].0, samples[(best + 1).min(samples.len() - 1)].0);
+    const GOLDEN: f64 = 0.618_033_988_749_894_9;
+    let mut c = b - GOLDEN * (b - a);
+    let mut d = a + GOLDEN * (b - a);
+    let (mut fc, mut fd) = (at(c)?, at(d)?);
+    for _ in 0..TRIM_EXTREME_STEPS {
+        found = found.max(fc).max(fd);
+        if fc >= fd {
+            (b, d, fd) = (d, c, fc);
+            c = b - GOLDEN * (b - a);
+            fc = at(c)?;
+        } else {
+            (a, c, fc) = (c, d, fd);
+            d = a + GOLDEN * (b - a);
+            fd = at(d)?;
+        }
+    }
+    Ok(sign * found.max(fc).max(fd))
+}
+
 /// The trim's uv bounding box as FRACTIONS of the surface domain:
 /// `([ta_u, tb_u], [ta_v, tb_v])`, each in `[0, 1]`. Sampled over every
-/// coedge pcurve of every loop.
+/// coedge pcurve of every loop, and closed on the pcurves' true extremes
+/// under `BREP_OFFSET_EXACT_TRIM_BOX`.
 fn trim_domain_fractions(
     face: &FaceRecord,
     [u0, u1]: [f64; 2],
@@ -320,14 +394,23 @@ fn trim_domain_fractions(
         .flat_map(|loop_record| &loop_record.coedges)
     {
         let [p0, p1] = coedge.pcurve.domain().or_refuse(KernelStage::Refine, "domain")?;
+        let mut samples = Vec::with_capacity(25);
         for sample in 0..=24 {
+            let parameter = p0 + (p1 - p0) * sample as f64 / 24.0;
             let uv = coedge
                 .pcurve
-                .evaluate(p0 + (p1 - p0) * sample as f64 / 24.0).or_refuse(KernelStage::Refine, "evaluate")?;
+                .evaluate(parameter).or_refuse(KernelStage::Refine, "evaluate")?;
             low.x = low.x.min(uv.x);
             low.y = low.y.min(uv.y);
             high.x = high.x.max(uv.x);
             high.y = high.y.max(uv.y);
+            samples.push((parameter, uv));
+        }
+        if coedge.pcurve.degree > 1 && exact_trim_box_on() {
+            low.x = low.x.min(refine_trim_extreme(&coedge.pcurve, &samples, 0, -1.0)?);
+            high.x = high.x.max(refine_trim_extreme(&coedge.pcurve, &samples, 0, 1.0)?);
+            low.y = low.y.min(refine_trim_extreme(&coedge.pcurve, &samples, 1, -1.0)?);
+            high.y = high.y.max(refine_trim_extreme(&coedge.pcurve, &samples, 1, 1.0)?);
         }
     }
     let fraction = |value: f64, start: f64, end: f64| {
@@ -1724,6 +1807,19 @@ fn refine_offset_fit(
             };
             rounds += 1;
             if deviation.worst() >= best_deviation.worst() {
+                // One midpoint split of a quadratic Bezier adds no freedom
+                // to its symmetric cross-section: the C1 halves still form
+                // one symmetric quadratic. Its shifted interpolation nodes
+                // can make this round worse even though the next subdivision
+                // improves substantially. Try that next subdivision once,
+                // keeping the previous fit until an improvement is measured.
+                let first_quadratic_split = rounds == 1
+                    && ((halve_u && source.degree_u == 2 && source.knots_u.len() == 6)
+                        || (halve_v && source.degree_v == 2 && source.knots_v.len() == 6));
+                if first_quadratic_split {
+                    refined_source = candidate_source;
+                    continue;
+                }
                 // Keep every improving uniform round on its existing path.
                 // Only a measured stall switches the next attempt to the
                 // residual locus, starting again from the best accepted net.

@@ -25,6 +25,7 @@ mod edge;
 mod fold;
 mod miter;
 mod network;
+pub(crate) use network::STRIPE_PINCH_TAPER_WHAT;
 mod planar_chart;
 mod restrict;
 pub(super) mod rollover;
@@ -33,6 +34,15 @@ pub(crate) mod runout;
 mod stations;
 mod rows;
 mod track_fit;
+
+/// A transverse end with parallel normals needs a tapered runout, not cutter
+/// composition. The network tries that runout before propagating this refusal.
+pub(crate) const TANGENTIAL_TRANSVERSE_END: &str = "tangential_transverse_end";
+
+pub(crate) fn is_tangential_transverse_end(refusal: &crate::KernelRefusal) -> bool {
+    matches!(&refusal.class, crate::RefusalClass::UnsupportedGeometry { what }
+        if what == TANGENTIAL_TRANSVERSE_END)
+}
 
 thread_local! {
     static REFINE_OFF_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -787,7 +797,7 @@ pub(crate) fn selection_mates<'a>(
 }
 
 pub(crate) use runout::{build_runout_walls, plan_runout, take_runout_reports, RunoutPlan, RunoutWallReport};
-pub(crate) use fold::{is_wall_fold, wall_loop_refusal, WALL_FOLDS};
+pub(crate) use fold::{is_rail_fold, is_wall_fold, wall_loop_refusal, WALL_FOLDS};
 pub(crate) use stations::is_ball_off_carrier;
 // Lane D 2026-10-14 (appended): the inside-corner classification's name and
 // its opt-in miter switch, read by the runout composition and its tests.
@@ -864,3 +874,10 @@ pub(crate) fn closed_wall_predict_on() -> bool {
 pub(crate) use corner::{open_mixed_corner_on, round_mixed_concave_open_corner};
 // BREP lane L: end keyway_floor_open_mixed_corner_20261014
 
+
+// Lane R7 (2026-10-19): the tapered cusp runout; `BREP_BLEND_TAPER_RUNOUT`.
+pub(crate) mod taper_runout;
+
+// 2026-10-21: the local radius relief of a folding constant fillet;
+// `BREP_BLEND_RADIUS_RELIEF`.
+pub(crate) mod relief;

@@ -21,9 +21,9 @@
 //! surfaces as a status line and the dialog stays usable.
 //!
 //! ## Testability
-//! The request/response SHAPE lives in free functions ([`search_url`],
-//! [`parse_search_response`], [`step_filename_stem`], [`build_part_document`])
-//! and the store-write + component-add lives in [`StepPartsPanel::import_step_text`],
+//! The request/response SHAPE lives in free functions (`search_url`,
+//! `parse_search_response`, `step_filename_stem`, `build_part_document`)
+//! and the store-write + component-add lives in `StepPartsPanel::import_step_text`,
 //! all unit-tested with injected data — no network in the test suite.
 
 use crate::http::{fetch_bytes, fetch_text};

@@ -45,11 +45,26 @@ impl EngineState {
     pub fn component_of_solid(&self, solid_name: &str) -> Option<String> {
         let (chain, _local) = brep_kernel::split_component_namespace(solid_name);
         let head = *chain.first()?;
+        // A Pattern Component instance is a component its pattern emits.
+        if brep_kernel::pattern_component_instance(head).is_some() {
+            return self.assembly_components().iter().any(|c| c.id == head).then(|| head.to_string());
+        }
         let index = self.history.index_of(head)?;
         self.history
             .feature_type(index)
             .filter(|ty| is_acomp_feature_type(ty))
             .map(|_| head.to_string())
+    }
+
+    /// The owning top-level occurrence of every selected vertex (vertices
+    /// carry no names, so the app's selection read cannot resolve them), or
+    /// `None` when any selected vertex is not component geometry.
+    pub fn selected_vertex_components(&self) -> Option<Vec<String>> {
+        self.emphasis
+            .selected_vertices
+            .iter()
+            .map(|vertex| self.component_of_solid(&vertex.solid))
+            .collect()
     }
 
     /// Every ACOMP feature id in history order (the structure tree's row order).
@@ -112,13 +127,31 @@ impl EngineState {
         (!bbox.is_empty()).then(|| bbox.center())
     }
 
+    /// The member solids of a placed component or of a Pattern Component
+    /// instance (which has no feature of its own).
+    pub fn component_members(&self, id: &str) -> Vec<String> {
+        match self.component_info(id) {
+            Some(info) => info.members,
+            None => self.member_solid_names(id),
+        }
+    }
+
+    /// Every Pattern Component instance the last run placed, in run order.
+    pub fn pattern_instance_ids(&self) -> Vec<String> {
+        self.assembly_components()
+            .iter()
+            .filter(|c| brep_kernel::pattern_component_instance(&c.id).is_some())
+            .map(|c| c.id.clone())
+            .collect()
+    }
+
     /// The member solid names of ACOMP `feature_id`, in display-scene order.
     /// The caller has already resolved `feature_id` to an ACOMP feature of
     /// THIS document, so ownership is the outermost namespace segment alone —
     /// no per-solid history lookup. Routing every solid through
     /// [`Self::component_of_solid`] (a linear `index_of` scan each) made this
     /// O(solids × features); the BOM paid it once per row per frame.
-    fn member_solid_names(&self, feature_id: &str) -> Vec<String> {
+    pub(super) fn member_solid_names(&self, feature_id: &str) -> Vec<String> {
         self.scene
             .solids()
             .iter()
@@ -131,7 +164,7 @@ impl EngineState {
 /// Whether `solid_name`'s OUTERMOST `ACOMP<digits>:` segment is `feature_id`.
 /// A nested chain's inner segments belong to the sub-assembly's own document,
 /// exactly as [`EngineState::component_of_solid`] reads them.
-fn owned_by(solid_name: &str, feature_id: &str) -> bool {
+pub(super) fn owned_by(solid_name: &str, feature_id: &str) -> bool {
     let (chain, _local) = brep_kernel::split_component_namespace(solid_name);
     chain.first().copied() == Some(feature_id)
 }

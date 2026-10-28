@@ -263,6 +263,7 @@ globalThis.Workbench = (() => {
     if(rev.locked_by_me)primary+=action('checkin','Check in');
     if(me.can_author&&rev.lifecycle==='draft')primary+=action('submit','Request approval');
     if(me.can_checkin&&rev.editable&&!rev.locked_by)primary+=action('release','Release');
+    if(me.can_author&&raw?.uses)primary+=action('checkin-all','Check in with its children');
     return `<div class="detail-heading"><span data-model-preview>${thumb(['revision','model'].includes(node.kind)?rev.thumbnail?.url:detail.thumbnail_url,'lg')}</span><div><h2>${escape(detail.number)}</h2><p>${escape(detail.name)}</p></div></div><p>${escape(detail.description || '')}</p>
       <div class="revision-heading"><strong>Revision ${escape(rev.label)}</strong>${stateChip(rev.lifecycle)}</div>
       ${pairs([['Type',detail.part_type],['Category',detail.category_path || detail.category],['Contains 3D geometry',(raw?.has_geometry ?? detail.has_geometry) ? 'Yes' : 'No'],['Has thumbnail',(raw?.has_thumbnail ?? detail.has_thumbnail) ? 'Yes' : 'No'],['Checked out by',rev.locked_by || 'Not checked out'],...attributes])}
@@ -336,7 +337,8 @@ globalThis.Workbench = (() => {
     else if(name==='restore')await api('POST',`/api/workspace/entries/${enc(node.entry.id)}/versions/${button.dataset.version}/restore`);
     else if(name==='promote')await api('POST',`/api/workspace/entries/${enc(node.entry.id)}/promote`,{part:area.querySelector('[data-promote-part]').value.trim(),revision:area.querySelector('[data-promote-revision]').value.trim(),kind:'other'});
     else if(name==='checkout'||name==='checkin')await api('POST',`${base}/${name}`,name==='checkout'?{client_id:'web'}:{force:false});
-    else if(name==='release'){if(!confirm(`Release revision ${rev.label}? Its document becomes immutable.`))return;showWarnings(await api('POST',`${base}/state`,{to:'released'}));}
+    else if(name==='release'){await releaseWithChildren(detail,rev,base);}
+    else if(name==='checkin-all'){await checkinWithChildren(detail,rev);}
     else if(name==='submit'){currentPart=detail;await openSubmit(rev.id);return;}
     else if(name==='approve'||name==='reject') {
       const comment=area.querySelector('[data-review-comment]')?.value || '';
@@ -359,6 +361,56 @@ globalThis.Workbench = (() => {
       await reload();return;
     }
     await refresh(mode);
+  }
+  // One prompt for an assembly and the parts it uses (release-children.js does
+  // the planning and the running): `answers` are [value, label] pairs, the
+  // first one the default (focused; Enter takes it).
+  function childrenDialog(title,intro,lines,answers) {
+    let dialog=document.querySelector('[data-children-dialog]');
+    if(!dialog){dialog=document.createElement('dialog');dialog.dataset.childrenDialog='';dialog.className='children-dialog';document.body.append(dialog);}
+    dialog.innerHTML=`<form method="dialog"><h2>${escape(title)}</h2><p data-children-intro>${escape(intro)}</p>${lines.length?`<ul data-children-list>${lines.map(line=>`<li data-child-row>${escape(line)}</li>`).join('')}</ul>`:''}<div class="toolbar">${answers.map(([value,label],i)=>`<button value="${escape(value)}" data-children-answer="${escape(value)}"${i===0?' autofocus':''}>${escape(label)}</button>`).join('')}</div></form>`;
+    return new Promise(resolve=>{dialog.addEventListener('close',()=>resolve(dialog.returnValue||answers[answers.length-1][0]),{once:true});dialog.showModal();});
+  }
+  const stepWords={checkin:'checked in',release:'released',submit:'submitted for review'};
+  const named=item=>`${item.number}${item.label?` rev ${item.label}`:''}`;
+  // Run `items`; on a failure say exactly what was and was not done and offer
+  // a Retry of the rest. `true` when every step ran.
+  async function runChildren(title,items) {
+    let pending=items,done=[];
+    for(;;){
+      const result=await ReleaseChildren.run(api,pending);
+      done=done.concat(result.done);
+      if(!result.failed)return {ok:true,done,left:result.left};
+      const lines=[...done.map(d=>`Done: ${named(d.item)} ${stepWords[d.step]}`),`FAILED: ${named(result.failed.item)} not ${stepWords[result.failed.step]}: ${result.failed.error}`,...result.remaining.flatMap((item,i)=>(i===0?item.steps.slice(1):item.steps).map(step=>`Not done: ${named(item)} not ${stepWords[step]}`))];
+      if(await childrenDialog(title,'Stopped at a failure. Nothing after it was attempted.',lines,[['retry','Retry the rest'],['close','Close']])!=='retry')return {ok:false,done,left:result.left};
+      pending=result.remaining;
+    }
+  }
+  async function releaseWithChildren(detail,rev,base) {
+    const title=`Release ${detail.number} rev ${rev.label}`;
+    const {items}=await ReleaseChildren.plan(api,detail.id,rev.id,'release');
+    if(!items.length){if(!confirm(`Release revision ${rev.label}? Its document becomes immutable.`))return;showWarnings(await api('POST',`${base}/state`,{to:'released'}));return;}
+    const answer=await childrenDialog(title,`${items.length} part${items.length===1?' it uses is':'s it uses are'} not released. Release them too, deepest first, then this one? A part that needs approval is submitted for review, not released. Released documents become immutable.`,items.map(ReleaseChildren.describe),[['all','Release them too'],['self','This one only'],['cancel','Cancel']]);
+    if(answer==='cancel')return;
+    if(answer==='self'){showWarnings(await api('POST',`${base}/state`,{to:'released'}));return;}
+    const outcome=await runChildren(title,items);
+    if(!outcome.ok)return;
+    const notReleased=items.filter(item=>!item.steps.includes('release'));
+    if(notReleased.length){
+      await childrenDialog(title,`${detail.number} rev ${rev.label} was NOT released: ${notReleased.length===1?'one part it uses is':`${notReleased.length} parts it uses are`} not released yet. Release it once they are.`,[...outcome.done.map(d=>`Done: ${named(d.item)} ${stepWords[d.step]}`),...notReleased.map(item=>`Not released: ${ReleaseChildren.describe(item)}`)],[['close','Close']]);
+      return;
+    }
+    showWarnings(await api('POST',`${base}/state`,{to:'released'}));
+    await childrenDialog(title,`Released ${detail.number} rev ${rev.label} and the parts it uses.`,outcome.done.map(d=>`Done: ${named(d.item)} ${stepWords[d.step]}`),[['close','Close']]);
+  }
+  async function checkinWithChildren(detail,rev) {
+    const title=`Check in ${detail.number} rev ${rev.label} with its children`;
+    const {items}=await ReleaseChildren.plan(api,detail.id,rev.id,'checkin');
+    if(rev.locked_by_me)items.push({part:detail.id,revision:rev.id,number:detail.number,label:rev.label,lifecycle:rev.lifecycle,lockedByMe:true,lockedBy:rev.locked_by,steps:['checkin'],route:'checkin',note:''});
+    if(!items.length){await childrenDialog(title,'Nothing here is checked out to you.',[],[['close','Close']]);return;}
+    if(await childrenDialog(title,`Check in ${items.length===1?'this part':`these ${items.length} parts`}, deepest first?`,items.map(ReleaseChildren.describe),[['all','Check in'],['cancel','Cancel']])!=='all')return;
+    const outcome=await runChildren(title,items);
+    if(outcome.ok)await childrenDialog(title,`Checked in ${outcome.done.length} part${outcome.done.length===1?'':'s'}.`,outcome.done.map(d=>`Done: ${named(d.item)} ${stepWords[d.step]}`),[['close','Close']]);
   }
   function bomHtml() {
     return `<section class="selection-bom"><h3>BOM structure</h3><div class="toolbar"><label class="inline-select">Columns <select data-bom-layout></select></label><button type="button" class="ghost author-only" data-bom-edit-attributes aria-pressed="false">Edit attributes</button><a class="button-link" href="#/bom-columns">Configure columns…</a></div><div class="toolbar bom-tree-controls" data-bom-tree-controls></div><p class="muted" data-bom-status role="status"></p><div class="bom-scroll"><table class="bom"><thead></thead><tbody></tbody></table></div><p class="muted" data-bom-empty hidden>No components.</p></section>`;

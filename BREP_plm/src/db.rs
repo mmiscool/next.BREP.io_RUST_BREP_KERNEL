@@ -78,6 +78,21 @@ pub struct Change {
 /// contains.
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct State {
+    /// The tools library ([`crate::tools`]), and the last tool number handed out.
+    #[serde(default)]
+    pub tools: Vec<crate::tools::Tool>,
+    #[serde(default)]
+    pub next_tool: u64,
+    /// The jobs floor queue ([`crate::jobs`]), journaled like sessions: a
+    /// floor signs a step a minute, and a list kept in the state's other
+    /// fields cost every write on the server O(every job) — 0.56 s at 1,000
+    /// jobs of 30 steps. One `meta` row per job (`job:<id>`).
+    // Stored separately from the metadata snapshot and restored after decoding it.
+    #[serde(default)]
+    pub jobs: crate::journal::Journaled<crate::jobs::Job>,
+    /// The last job number handed out.
+    #[serde(default)]
+    pub next_job: u64,
     pub workflows: Vec<crate::workflow::Definition>,
     pub workflow_runs: Vec<crate::workflow::Run>,
     pub bom_configuration: crate::bom_config::Configuration,
@@ -303,6 +318,7 @@ impl Db {
                 all_parts: &state.parts,
                 workspace: Vec::new(),
                 sessions: Vec::new(),
+                jobs: Vec::new(),
             };
             sql.write(&change, Vec::new()).map_err(io::Error::other)?;
         }
@@ -396,18 +412,21 @@ impl Db {
         state.parts.begin();
         state.workspace.begin();
         state.sessions.begin();
+        state.jobs.begin();
         state.seq += 1;
         match f(&mut state) {
             Ok(value) => {
                 let touched = state.parts.commit();
                 let entries = state.workspace.commit();
                 let sessions = state.sessions.commit();
-                match self.persist(&mut state, &before, &touched, &entries, &sessions) {
+                let jobs = state.jobs.commit();
+                match self.persist(&mut state, &before, &touched, &entries, &sessions, &jobs) {
                     Ok(()) => Ok(value),
                     Err(error) => {
                         state.parts.undo(touched);
                         state.workspace.undo(entries);
                         state.sessions.undo(sessions);
+                        state.jobs.undo(jobs);
                         restore_small(&mut state, &before)?;
                         Err(error)
                     }
@@ -417,6 +436,7 @@ impl Db {
                 state.parts.rollback();
                 state.workspace.rollback();
                 state.sessions.rollback();
+                state.jobs.rollback();
                 restore_small(&mut state, &before)?;
                 Err(error)
             }
@@ -431,6 +451,7 @@ impl Db {
         touched: &[crate::table::Touched],
         entries: &[crate::journal::Touched<crate::model::WorkspaceEntry>],
         sessions: &[crate::journal::Touched<Session>],
+        jobs: &[crate::journal::Touched<crate::jobs::Job>],
     ) -> Result<(), Error> {
         let after = sql::small_value(state);
         // A part a change borrowed mutably but did not actually change is
@@ -456,6 +477,7 @@ impl Db {
         // what actually changed, is written and audited.
         let (old_entries, new_entries, workspace) = journal_rows(&state.workspace, entries)?;
         let (old_sessions, new_sessions, session_rows) = journal_rows(&state.sessions, sessions)?;
+        let (old_jobs, new_jobs, job_rows) = journal_rows(&state.jobs, jobs)?;
         let mut old = before.clone();
         let mut new = after.clone();
         if let (Some(o), Some(n)) = (old.as_object_mut(), new.as_object_mut()) {
@@ -465,6 +487,8 @@ impl Db {
             n.insert("workspace".into(), Value::Array(new_entries));
             o.insert("sessions".into(), Value::Array(old_sessions));
             n.insert("sessions".into(), Value::Array(new_sessions));
+            o.insert("jobs".into(), Value::Array(old_jobs));
+            n.insert("jobs".into(), Value::Array(new_jobs));
         }
         let events = audit::refine(audit::diff(&old, &new, &audit::current_actor(), now(), state.seq));
         // A part's search row holds its category's PATH ("Fasteners /
@@ -497,6 +521,7 @@ impl Db {
             all_parts: &state.parts,
             workspace,
             sessions: session_rows,
+            jobs: job_rows,
         };
         self.sql.write(&change, events).map(|_| ()).map_err(|error| {
             if sql::is_constraint(&error) {
@@ -567,17 +592,37 @@ impl Db {
     /// the two leaves a document whose hash is not yet recorded, rather than a
     /// recorded hash for bytes that do not exist.
     pub fn write_document(&self, part_id: &str, revision_id: &str, body: &str) -> Result<u64, Error> {
-        self.write_document_inner(part_id, revision_id, body, None)
+        self.write_document_inner(part_id, revision_id, body, None, None).map(|(seq, _)| seq)
+    }
+
+    /// [`Self::write_document`] (or [`Self::write_document_if`] with
+    /// `if_match`), answering also why the document's uses list was NOT
+    /// derived from it, when it was not (S5 derived, `derived-uses`): an
+    /// occurrence that places no PLM revision, or a list the uses rules
+    /// refuse. The document is written either way, as it was when the CAD app
+    /// published the list in a request of its own.
+    pub fn write_document_deriving(&self, part_id: &str, revision_id: &str, body: &str, if_match: Option<&str>) -> Result<(u64, Option<String>), Error> {
+        self.write_document_inner(part_id, revision_id, body, None, if_match)
+    }
+
+    /// [`Self::write_document`] only if the revision still holds the document
+    /// whose content hash is `expected` (an `If-Match` write): checked under
+    /// the write lock, so a save made meanwhile (another client of the same
+    /// user, another session) is never overwritten by a write based on the
+    /// older document. A mismatch is `409`, naming when it changed and who
+    /// holds it now.
+    pub fn write_document_if(&self, part_id: &str, revision_id: &str, body: &str, expected: &str) -> Result<u64, Error> {
+        self.write_document_inner(part_id, revision_id, body, None, Some(expected)).map(|(seq, _)| seq)
     }
 
     /// Import a reviewed document and its structure together. The expected
     /// hash and checkout are checked under the write lock, so another save or
     /// a broken checkout cannot silently replace the document reviewed by the user.
     pub fn write_import_document(&self, user: &User, part_id: &str, revision_id: &str, expected_hash: &str, body: &str, uses: &Value) -> Result<u64, Error> {
-        self.write_document_inner(part_id, revision_id, body, Some((user, expected_hash, uses)))
+        self.write_document_inner(part_id, revision_id, body, Some((user, expected_hash, uses)), None).map(|(seq, _)| seq)
     }
 
-    fn write_document_inner(&self, part_id: &str, revision_id: &str, body: &str, import: Option<(&User, &str, &Value)>) -> Result<u64, Error> {
+    fn write_document_inner(&self, part_id: &str, revision_id: &str, body: &str, import: Option<(&User, &str, &Value)>, if_match: Option<&str>) -> Result<(u64, Option<String>), Error> {
         let key = crate::identity::document_key(part_id, revision_id);
         let path = self.document_path(&key)?;
         let hash = auth::content_hash(body);
@@ -593,10 +638,56 @@ impl Db {
                 }
                 Some(bom::check_uses(state, part_id, uses)?)
             } else { None };
+            if let Some(expected) = if_match {
+                let part = state.part(part_id).ok_or_else(|| Error::not_found("part"))?;
+                let revision = part.revision(revision_id).ok_or_else(|| Error::not_found("revision"))?;
+                if revision.content_hash != expected {
+                    let holder = revision
+                        .lock
+                        .as_ref()
+                        .and_then(|lock| state.user(&lock.user_id))
+                        .map_or_else(String::new, |user| format!(", checked out by {}", user.username));
+                    return Err(Error::conflict(format!(
+                        "{} rev {} was saved again on the PLM (at {:02}:{:02} UTC{holder}) after the document this save was based on: not overwritten",
+                        part.number,
+                        revision.label,
+                        revision.modified_at % 86_400 / 3_600,
+                        revision.modified_at % 3_600 / 60,
+                    )));
+                }
+            }
+            // S5 derived: the uses list follows the document, in this same
+            // write (an import brings its reviewed list instead). A list the
+            // rules refuse leaves the old one and says why; the document is
+            // written all the same.
+            let mut uses_refused = None;
+            // Instructions place their assembly as one wrapper component: that
+            // is what they instruct, not something they are built from, so
+            // they publish no uses list (and no occurrences) from it.
+            let instructions = state.part(part_id).is_some_and(|p| p.document_class == DocumentClass::Instructions);
+            let instructs = if instructions { serde_json::from_str::<Value>(body).ok().and_then(|d| instructs_of(state, &d)) } else { None };
+            let derived_uses = if imported_uses.is_some() || instructions {
+                None
+            } else {
+                match serde_json::from_str::<Value>(body).ok().as_ref().and_then(crate::bom_config::document_uses) {
+                    None => None,
+                    Some(Err(why)) => {
+                        uses_refused = Some(why);
+                        None
+                    }
+                    Some(Ok(list)) => match bom::check_uses(state, part_id, &list) {
+                        Ok(uses) => Some(uses),
+                        Err(error) => {
+                            uses_refused = Some(format!("the uses list was not published: {}", error.message));
+                            None
+                        }
+                    },
+                }
+            };
             let current = state.part(part_id).ok_or_else(|| Error::not_found("part"))?;
             let defs = state.bom_configuration.part_fields.get(&current.part_type).cloned().unwrap_or_default();
             let mut canonical = current.revision(revision_id).ok_or_else(|| Error::not_found("revision"))?.clone();
-            if let Ok(document) = serde_json::from_str::<Value>(body) {
+            if let Some(document) = serde_json::from_str::<Value>(body).ok().filter(|_| !instructions) {
                 if let Some(occurrences) = crate::bom_config::document_occurrences(&document) {
                     if let Some(occurrences) = crate::bom_config::capture_occurrences(state, part_id, revision_id, &json!({"occurrences":occurrences}))? {
                         canonical.occurrences = occurrences;
@@ -650,8 +741,12 @@ impl Db {
             revision.occurrences = canonical.occurrences;
             write_atomic(&path, body).map_err(Error::internal)?;
             if let Some(thumbnail) = thumbnail { revision.thumbnail = Some(thumbnail); }
-            if let Some(uses) = imported_uses {
+            if let Some(uses) = imported_uses.or(derived_uses) {
                 revision.uses = uses;
+                crate::bom_config::synchronize_uses(revision);
+            }
+            if instructions {
+                revision.instructs = instructs;
             }
             revision.has_geometry = has_geometry;
             revision.geometry_content_hash = hash.clone();
@@ -675,7 +770,7 @@ impl Db {
             if embedded.is_some() {
                 if let Some(old) = old_thumbnail { crate::attach::remove_if_unreferenced(state, self.root(), &old)?; }
             }
-            Ok(state.seq)
+            Ok((state.seq, uses_refused))
         })
     }
 
@@ -762,10 +857,12 @@ fn restore_small(state: &mut State, before: &Value) -> Result<(), Error> {
     let parts = std::mem::take(&mut state.parts);
     let workspace = std::mem::take(&mut state.workspace);
     let sessions = std::mem::take(&mut state.sessions);
+    let jobs = std::mem::take(&mut state.jobs);
     *state = serde_json::from_value(before.clone()).map_err(Error::internal)?;
     state.parts = parts;
     state.workspace = workspace;
     state.sessions = sessions;
+    state.jobs = jobs;
     Ok(())
 }
 
@@ -812,6 +909,36 @@ impl Db {
     /// that the type's mode did not change meanwhile, and that the number and
     /// label are still free. Two concurrent creates that a script gave the
     /// same number therefore end as one part and one refusal, never two parts.
+    /// The part type instructions are numbered in when a request names none:
+    /// `instructions` (`MI` and 9 digits), made the first time it is needed.
+    /// An admin may rename it or change its numbering like any other type.
+    pub fn instructions_part_type(&self) -> Result<String, Error> {
+        const ID: &str = "instructions";
+        if self.read(|state| state.part_type(ID).is_some()) {
+            return Ok(ID.into());
+        }
+        self.mutate(|state| {
+            if state.part_type(ID).is_none() {
+                if let Some(clash) = state.part_types.iter().find(|t| t.mode == NumberMode::Counter && t.prefix.eq_ignore_ascii_case("MI")) {
+                    return Err(Error::conflict(format!(
+                        "part type '{}' already numbers with MI: create a part type for instructions and name it",
+                        clash.id
+                    )));
+                }
+                state.part_types.push(PartType {
+                    id: ID.into(),
+                    name: "Instructions".into(),
+                    prefix: "MI".into(),
+                    digits: 9,
+                    next: 1,
+                    created_at: now(),
+                    mode: NumberMode::Counter,
+                });
+            }
+            Ok(ID.into())
+        })
+    }
+
     pub fn create_part_with(&self, author: &User, spec: &PartSpec) -> Result<Part, Error> {
         check_origin(spec.origin)?;
         let external_ref = spec.external_ref.trim().to_string();
@@ -1152,6 +1279,8 @@ impl Db {
                 .and_then(|id| part.revision(id))
                 .map(|r| r.uses.clone())
                 .unwrap_or_default();
+            // As does what instructions instruct.
+            revision.instructs = carried_revision.as_deref().and_then(|id| part.revision(id)).and_then(|r| r.instructs.clone());
             // So do its files: new references to the same blobs, so removing
             // one from the new revision never touches the old one.
             revision.attachments = carried_revision
@@ -1952,6 +2081,11 @@ impl Db {
         if to == Lifecycle::Released && !user.can_checkin() {
             return Err(Error::forbidden("releasing needs the check-in group"));
         }
+        // Retiring a released revision from every new use is the release
+        // authority's decision too.
+        if to == Lifecycle::Obsolete && !user.can_checkin() {
+            return Err(Error::forbidden("making a revision obsolete needs the check-in group"));
+        }
         // Submitting for review and pulling back from it are an author's work.
         if matches!(to, Lifecycle::InReview | Lifecycle::Draft) && !user.can_author() {
             return Err(Error::forbidden("submitting for review, or withdrawing, needs the author group"));
@@ -1992,7 +2126,15 @@ impl Db {
             seen_hash = Some(revision.content_hash.clone());
         }
 
+        // Who uses the revision as it stands, for the warning an obsolete
+        // revision answers with (it is still used; nothing refuses).
+        let users = if to == Lifecycle::Obsolete {
+            self.read(|state| used_by_now(state, part_id, revision_id))
+        } else {
+            Vec::new()
+        };
         let user_id = user.id.clone();
+        let root = self.root().to_path_buf();
         self.mutate(move |state| {
             lifecycle::check_enabled(&state.settings, to)?;
             if to == Lifecycle::Released { crate::workflow::release_gate(state,part_id,revision_id,workflow_run)?; }
@@ -2009,6 +2151,7 @@ impl Db {
                 let field_problems = crate::bom_config::release_problems(state, part, revision);
                 if !field_problems.is_empty() { return Err(Error::conflict(field_problems.join("; "))); }
                 children_gate(state, part, revision)?;
+                instructions_gate(state, &root, part, revision)?;
                 review_gate(state, part, revision)?;
             }
             let (_, revision) = find_revision_mut(state, part_id, revision_id)?;
@@ -2063,6 +2206,12 @@ impl Db {
         let mut warnings = Vec::new();
         if to == Lifecycle::Draft {
             warnings.extend(self.review_withdrawn(user, part_id, revision_id));
+        }
+        if !users.is_empty() {
+            warnings.push(format!(
+                "obsolete, but still used by {}: their BOMs flag it until they are revised to use another revision",
+                named_list(&users)
+            ));
         }
         if to == Lifecycle::Released {
             let (part, revision) = self.snapshot(part_id, revision_id)?;
@@ -2131,9 +2280,12 @@ impl Db {
             }
             // A revision another list pins cannot go: that list would name
             // nothing.
-            if let Some((parent, rev)) = pinned_by(state, part_id, revision_id) {
+            let pinners = pinned_by(state, part_id, revision_id);
+            if !pinners.is_empty() {
+                let lists = if pinners.len() == 1 { "that list" } else { "those lists" };
                 return Err(Error::conflict(format!(
-                    "this revision is used by {parent} rev {rev} — remove it from that list first"
+                    "this revision is used by {} — remove it from {lists} first",
+                    named_list(&pinners)
                 )));
             }
             let part = state.parts.get_mut(&part_id)
@@ -2327,6 +2479,48 @@ fn review_gate(state: &State, part: &Part, revision: &Revision) -> Result<(), Er
     crate::review::release_gate(revision, &rule, &part.number)
 }
 
+/// The assembly revision an instructions document instructs: its
+/// `instructions.target.sourceKey`, when that names a PLM revision that exists
+/// and is not itself instructions. A local file's key is no reference.
+pub fn instructs_of(state: &State, document: &Value) -> Option<crate::model::Instructs> {
+    let key = document.pointer("/instructions/target/sourceKey")?.as_str()?;
+    let (number, label) = crate::identity::split_key(key)?;
+    let part = state.part(&number).filter(|p| p.document_class != DocumentClass::Instructions)?;
+    let revision = part.revision(&label)?;
+    Some(crate::model::Instructs { part: part.id.clone(), revision: revision.id.clone() })
+}
+
+/// Instructions release for a released assembly revision, only once the
+/// author approved a re-target (the document's `instructions.retarget` is
+/// clear), and only with current player data: made by the CAD app from the
+/// document the revision holds ([`crate::player`]), so the released player
+/// shows what was released.
+fn instructions_gate(state: &State, root: &Path, part: &Part, revision: &Revision) -> Result<(), Error> {
+    if part.document_class != DocumentClass::Instructions {
+        return Ok(());
+    }
+    let refuse = |why: String| Err(Error::conflict(format!("{} rev {} cannot release: {why}", part.number, revision.label)));
+    let Some(target) = &revision.instructs else {
+        return refuse("its document instructs no PLM assembly revision".into());
+    };
+    let Some((assembly, assembly_revision)) = state.part(&target.part).and_then(|p| Some((p, p.revision(&target.revision)?))) else {
+        return refuse("the assembly revision it instructs is gone".into());
+    };
+    if assembly_revision.lifecycle != Lifecycle::Released {
+        return refuse(format!("{} rev {} is {}, not released", assembly.number, assembly_revision.label, assembly_revision.lifecycle.as_str()));
+    }
+    let document = fs::read_to_string(root.join(crate::identity::model_path(&part.id, &revision.id)))
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok());
+    if document.as_ref().and_then(|d| d.pointer("/instructions/retarget")).is_some_and(|r| !r.is_null()) {
+        return refuse(format!("its re-target to {} rev {} is not approved yet", assembly.number, assembly_revision.label));
+    }
+    if revision.player.as_ref().is_none_or(|player| player.content_hash != revision.content_hash) {
+        return refuse("it has no current player data: open it in the CAD app and save it there".into());
+    }
+    Ok(())
+}
+
 fn children_gate(state: &State, part: &Part, revision: &Revision) -> Result<(), Error> {
     if !state.settings.require_released_children {
         return Ok(());
@@ -2345,16 +2539,47 @@ fn children_gate(state: &State, part: &Part, revision: &Revision) -> Result<(), 
 
 /// The first revision whose uses list pins `revision_id` of `part_id`, as
 /// "number" and "label".
-fn pinned_by(state: &State, part_id: &str, revision_id: &str) -> Option<(String, String)> {
-    state.parts.iter().find_map(|parent| {
-        parent.revisions.iter().find_map(|rev| {
-            rev.uses
-                .iter()
-                .any(|u| u.part == part_id && u.revision == revision_id)
-                .then(|| (parent.number.clone(), rev.label.clone()))
+fn pinned_by(state: &State, part_id: &str, revision_id: &str) -> Vec<String> {
+    state
+        .parts
+        .iter()
+        .flat_map(|parent| {
+            parent.revisions.iter().filter_map(move |rev| {
+                rev.uses
+                    .iter()
+                    .any(|u| u.part == part_id && u.revision == revision_id)
+                    .then(|| format!("{} rev {}", parent.number, rev.label))
+            })
         })
-    })
+        .collect()
 }
+
+/// The direct users of `revision_id` of `part_id` (pinned, or floating to it
+/// now), each as `<number> rev <label> (<state>)`, in store order, each once.
+fn used_by_now(state: &State, part_id: &str, revision_id: &str) -> Vec<String> {
+    let Some(part) = state.part(part_id) else { return Vec::new() };
+    let Some(revision) = part.revision(revision_id) else { return Vec::new() };
+    let mut out: Vec<String> = Vec::new();
+    for line in bom::where_used(state, part, Some(revision), 1).lines {
+        let name = format!("{} rev {} ({})", line.number, line.revision_label, line.state);
+        if !out.contains(&name) {
+            out.push(name);
+        }
+    }
+    out
+}
+
+/// `names` for a sentence: at most [`NAMED_AT_MOST`], then how many more.
+pub(crate) fn named_list(names: &[String]) -> String {
+    let shown = names.iter().take(NAMED_AT_MOST).cloned().collect::<Vec<_>>().join(", ");
+    match names.len().saturating_sub(NAMED_AT_MOST) {
+        0 => shown,
+        more => format!("{shown} and {more} more"),
+    }
+}
+
+/// How many users a refusal or warning names before "and N more".
+const NAMED_AT_MOST: usize = 10;
 
 /// The two conditions a revision's document and uses list are written under,
 /// checked together so the refusal says which one failed: the revision is in

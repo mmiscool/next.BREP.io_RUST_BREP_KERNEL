@@ -27,6 +27,7 @@
 //! as cavities when an enclosing component is present.
 
 mod cavities;
+mod colors;
 mod degenerate_coverage;
 mod feature_fragments;
 mod primitive_gate;
@@ -512,6 +513,38 @@ pub fn convert_stl_mesh_to_step(
     unit: &str,
     timestamp: &str,
 ) -> Result<StlConversionOutput, StlConversionError> {
+    convert_stl_mesh_to_step_with_colors(
+        mesh,
+        source_positions,
+        source_indices,
+        None,
+        options,
+        part_name,
+        unit,
+        timestamp,
+    )
+}
+
+/// [`convert_stl_mesh_to_step`] with the source triangles' COLOURS carried
+/// onto the reconstructed bodies and faces as the STEP document's presentation
+/// styles. `triangle_colors`, when given, is parallel to `mesh.triangles`
+/// (8-bit sRGB, `None` for an uncoloured triangle — a 3MF's base materials, see
+/// `brep_kernel::ThreeMfReadResult::triangle_colors`); each body takes the
+/// colour most of its triangles carry and a face whose own plurality differs is
+/// styled on its own, matched by geometry since the triangles themselves do
+/// not survive (`stl_conversion/colors.rs`). `None`, or a slice with no colour
+/// in it, is exactly [`convert_stl_mesh_to_step`].
+#[allow(clippy::too_many_arguments)]
+pub fn convert_stl_mesh_to_step_with_colors(
+    mesh: &Mesh,
+    source_positions: &[f64],
+    source_indices: Option<&[u32]>,
+    triangle_colors: Option<&[Option<[u8; 3]>]>,
+    options: &StlConversionOptions,
+    part_name: &str,
+    unit: &str,
+    timestamp: &str,
+) -> Result<StlConversionOutput, StlConversionError> {
     let total_started = Instant::now();
     validate_source_buffers(mesh, source_positions, source_indices)?;
     if !options.coordinate_precision_tolerance.is_finite()
@@ -580,10 +613,38 @@ pub fn convert_stl_mesh_to_step(
         }));
     }
 
-    let (solids, cavity_messages) = cavities::assemble(mesh, &components, solids, &component_ids)?;
+    let (mut solids, cavity_messages) = cavities::assemble(mesh, &components, solids, &component_ids)?;
     let export_started = Instant::now();
-    let step_text = export_step(&solids, part_name, unit, timestamp)
-        .map_err(|error| StlConversionError(format!("STEP export failed: {error}")))?;
+    // Colours, when the source has any: decided by geometry against the
+    // finished solids, then written as presentation styles keyed by the body
+    // and face names the pass assigns.
+    let colored = triangle_colors.filter(|colors| colors.iter().any(Option::is_some));
+    let mut color_message = None;
+    let step_text = match colored {
+        Some(triangle_colors) => {
+            let assignment = colors::assign(mesh, triangle_colors, &mut solids, part_name)?;
+            let named: Vec<(String, &brep_kernel::BrepSolid)> =
+                assignment.body_names.iter().cloned().zip(solids.iter()).collect();
+            color_message = Some(format!(
+                "source colours: {} of {} bodies and {} faces styled; {} coloured source triangles matched no face",
+                assignment.bodies,
+                solids.len(),
+                assignment.faces,
+                assignment.unmatched
+            ));
+            brep_kernel::export_step_report_named(
+                &named,
+                part_name,
+                unit,
+                timestamp,
+                None,
+                Some(&assignment.colors),
+            )
+            .map(|report| report.text)
+        }
+        None => export_step(&solids, part_name, unit, timestamp),
+    }
+    .map_err(|error| StlConversionError(format!("STEP export failed: {error}")))?;
     let step_export_seconds = export_started.elapsed().as_secs_f64();
 
     let validation_started = Instant::now();
@@ -617,6 +678,7 @@ pub fn convert_stl_mesh_to_step(
 
     let mut report = aggregate_report(&components, details, count, options);
     report.messages.extend(cavity_messages);
+    report.messages.extend(color_message);
     report.messages.push(format!(
         "STEP manifold audit and round-trip import passed for {} solid(s)",
         imported.len()

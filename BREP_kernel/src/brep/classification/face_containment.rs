@@ -2063,30 +2063,30 @@ fn lane_from<'a>(
 /// The lanes are tried in this order, and a face is in the first whose gates it
 /// passes (each comparand is in the carrier's parameters unless stated):
 ///
-/// 1. [`SeamBand`](Self::SeamBand): `closed_directions() == (true, true)`, and
+/// 1. [`SeamBand`](ContainmentLane::SeamBand): `closed_directions() == (true, true)`, and
 ///    the seam-band preparation reads the face — every loop a collapsed
 ///    puncture (its trace within `1e-3` of the domain span in u and in v), one
 ///    seam-crossing loop unwrapped (unless [`SEAM_BAND_MERGED_SWITCH`]), two
 ///    loops the seam-band analysis reassembles, or two clean full-wrap rims (a
 ///    periodic extent of at least `0.6` period and a cross extent of at most
 ///    `0.05` of the cross span each).
-/// 2. [`SphereCap`](Self::SphereCap): an analytic sphere closed in exactly u
+/// 2. [`SphereCap`](ContainmentLane::SphereCap): an analytic sphere closed in exactly u
 ///    with two loops, each winding one period to within `0.05` period and the
 ///    two opposite, one flat (a v extent within `1e-6` of the v span) at a pole
 ///    (within `1e-6` of the v span of a v end).
-/// 3. [`WrappedHorizon`](Self::WrappedHorizon): closed in exactly u, at least
+/// 3. [`WrappedHorizon`](ContainmentLane::WrappedHorizon): closed in exactly u, at least
 ///    one loop, neither [`HORIZON_CONTAINMENT_SWITCH`] nor (for one or two
 ///    loops) [`HORIZON_SINGLE_LOOP_SWITCH`], some loop of three or more samples
 ///    stepping over the seam (a sample-to-sample u step more than a quarter
 ///    period from its period-folded value), and no loop winding the period (its
 ///    unwrapped first and last samples more than a quarter period apart).
-/// 4. [`CoveringRimStrip`](Self::CoveringRimStrip): closed in exactly u, two
+/// 4. [`CoveringRimStrip`](ContainmentLane::CoveringRimStrip): closed in exactly u, two
 ///    loops, not [`COVERING_RIM_STRIP_SWITCH`], a sample beyond the u domain by
 ///    more than `1e-3` period, each loop travelling one period to within `2e-2`
 ///    period and closing in v to within `1e-3` of the v span, opposite
 ///    directions, v hulls apart by more than `1e-6` of the v span, and the lower
 ///    rim travelling +u exactly when the face is `same_sense`.
-/// 5. [`Generic`](Self::Generic): everything else.
+/// 5. [`Generic`](ContainmentLane::Generic): everything else.
 ///
 /// Sampling is [`trim_sample_count`] chords per pcurve at [`trim_station`]
 /// (the seam band: 24). `Err` is the error the face's first query would

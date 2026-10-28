@@ -8,9 +8,9 @@
 //! 1. Each row is checked here first, with the same checks the file lane runs:
 //!    a part number that cannot be one, a number used twice, and values that do
 //!    not evaluate. Those rows are reported and never sent.
-//! 2. Each remaining member is built ([`member_document`]), stamped with the
+//! 2. Each remaining member is built ([`member_document`](crate::family_table::member_document)), stamped with the
 //!    family's file name AS THE SERVER NAMES IT (`<family number>.fbrep`), and
-//!    baked on an engine of its own ([`bake_document`]). A member whose features
+//!    baked on an engine of its own ([`bake_document`](crate::plm::bake::bake_document)). A member whose features
 //!    do not build is reported with the engine's sentence and never sent.
 //! 3. The rest go to `POST /api/parts/:family/generate` as documents, with each
 //!    row's revision label: on a PLM the table's revision column is the revision
@@ -25,7 +25,7 @@
 //! app wrote into the document. So a second unchanged Generate proves the
 //! server's fingerprints are stable and that the saved family is the one the
 //! app generated from. That the app's stamp and the server's stamp agree is a
-//! separate fact, and [`stamp_agrees`] is how a caller checks it.
+//! separate fact, and [`stamp_agrees`](crate::plm::family::stamp_agrees) is how a caller checks it.
 //!
 //! The server generates from the family revision's SAVED document. A family
 //! with unsaved edits would generate from something the user is not looking at,

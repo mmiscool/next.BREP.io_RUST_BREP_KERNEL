@@ -1382,6 +1382,14 @@ pub(super) fn outline_offset_carrier(
 /// Whether the face's outer outline has an edge that is neither a line nor a
 /// circular arc.
 pub(super) fn outline_has_free_element(source: &BrepSolid, face: &FaceRecord) -> Result<bool, KernelRefusal> {
+    outline_has_curved_element_impl(source, face, false)
+}
+
+pub(super) fn outline_has_curved_element(source: &BrepSolid, face: &FaceRecord) -> Result<bool, KernelRefusal> {
+    outline_has_curved_element_impl(source, face, true)
+}
+
+fn outline_has_curved_element_impl(source: &BrepSolid, face: &FaceRecord, include_arcs: bool) -> Result<bool, KernelRefusal> {
     let tolerance = 1e-6 * crate::solid_scale(source).max(1.0);
     let frame = PlaneFrame::new(&face.surface)?;
     let vertex_by_id = source.vertices.iter().map(|vertex| (vertex.id, vertex.point)).collect::<HashMap<_, _>>();
@@ -1400,8 +1408,10 @@ pub(super) fn outline_has_free_element(source: &BrepSolid, face: &FaceRecord) ->
         let (Some(start), Some(end)) = (vertex_by_id.get(&start_id), vertex_by_id.get(&end_id)) else {
             continue;
         };
-        if let Ok(Element::Free { .. }) = classify_edge(&frame, edge, coedge.forward, *start, *end, tolerance)? {
-            return Ok(true);
+        if let Ok(element) = classify_edge(&frame, edge, coedge.forward, *start, *end, tolerance)? {
+            if matches!(&element, Element::Free { .. }) || (include_arcs && matches!(&element, Element::Arc { .. })) {
+                return Ok(true);
+            }
         }
     }
     Ok(false)

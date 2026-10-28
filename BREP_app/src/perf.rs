@@ -16,7 +16,7 @@
 //! `viewport::blit`) that do not share a `&mut` path, so the record lives here
 //! as a static — the same shape [`crate::automation::registry`] uses, for the
 //! same reason. A phase may be entered SEVERAL times in one frame (the registry
-//! publishes from three places); each entry accumulates, and [`tick`] — called
+//! publishes from three places); each entry accumulates, and `tick` — called
 //! once at the top of the frame — banks the frame's totals into the rolling
 //! window. So every reported phase is "ms per frame", never "ms per call".
 //!
@@ -200,12 +200,23 @@ pub fn json() -> String {
         out.push_str(&format!("{:.3}", stats.max));
         out.push('}');
     };
+    out.push_str(",\"staleFrames\":");
+    out.push_str(&STALE_FRAMES.load(std::sync::atomic::Ordering::Relaxed).to_string());
     push(&mut out, "dt", perf.dt.stats());
     for (index, name) in NAMES.iter().enumerate() {
         push(&mut out, name, perf.rings[index].stats());
     }
     out.push('}');
     out
+}
+
+/// Frames the viewport did not render although their render inputs had
+/// changed (automation builds; see `Viewport::check_stale_frame`). Never reset:
+/// the MCP test runner reads it before and after each script.
+static STALE_FRAMES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub fn note_stale_frame() {
+    STALE_FRAMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Drop every sample, keeping the frame counter's meaning ("frames banked")

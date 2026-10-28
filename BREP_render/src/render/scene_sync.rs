@@ -5,8 +5,18 @@ const AUX_EDGE_WIDTH_PX: f32 = 1.0;
 
 impl RenderCore {
     /// The base face color of one solid under the active settings, in LINEAR
-    /// space (converted with f64 precision so artifact bytes stay stable).
+    /// space (converted with f64 precision so artifact bytes stay stable); a
+    /// display with an `opacity` carries it as the alpha (the blended pass
+    /// reads it, the opaque pass skips such a solid).
     fn face_base_color(solid: &SolidDisplay, settings: &RenderSettings) -> Rgba {
+        let mut color = Self::face_base_color_opaque(solid, settings);
+        if let Some(opacity) = solid.opacity {
+            color[3] = opacity.clamp(0.0, 1.0);
+        }
+        color
+    }
+
+    fn face_base_color_opaque(solid: &SolidDisplay, settings: &RenderSettings) -> Rgba {
         if let Some(rgb) = solid.color_override {
             return Self::opaque_linear(rgb);
         }
@@ -89,20 +99,89 @@ impl RenderCore {
         (styles, per_face)
     }
 
-    fn upload_solid(&self, solid: &SolidDisplay, settings: &RenderSettings) -> GpuSolid {
-        let vertices: Vec<MeshVertex> = solid
+    /// The vertex buffer's contents: positions and normals.
+    fn mesh_vertices(solid: &SolidDisplay) -> Vec<MeshVertex> {
+        solid
             .mesh
             .positions
             .iter()
             .zip(&solid.mesh.normals)
             .map(|(&position, &normal)| MeshVertex { position, normal })
-            .collect();
+            .collect()
+    }
+
+    /// The edge buffer's contents (one instance per polyline segment) and each
+    /// edge's instance range.
+    fn edge_segments(solid: &SolidDisplay) -> (Vec<EdgeInstance>, Vec<EdgeRange>) {
+        let mut segments: Vec<EdgeInstance> = Vec::new();
+        let mut edges = Vec::with_capacity(solid.edges.len());
+        for edge in &solid.edges {
+            let first_instance = segments.len() as u32;
+            for pair in edge.polyline.windows(2) {
+                segments.push(EdgeInstance {
+                    p0: pair[0],
+                    p1: pair[1],
+                });
+            }
+            edges.push(EdgeRange {
+                first_instance,
+                instance_count: segments.len() as u32 - first_instance,
+            });
+        }
+        (segments, edges)
+    }
+
+    /// The point buffer's contents: one instance per vertex.
+    fn point_instances(solid: &SolidDisplay) -> Vec<PointInstance> {
+        solid
+            .vertices
+            .iter()
+            .map(|v| PointInstance {
+                center: [
+                    v.position[0] as f32,
+                    v.position[1] as f32,
+                    v.position[2] as f32,
+                ],
+            })
+            .collect()
+    }
+
+    /// Re-pose a solid whose buffers hold the same SHAPE (a rigid move): rewrite
+    /// its vertex, edge and point buffers in place. `false` (nothing written)
+    /// when any count differs, so the caller rebuilds instead.
+    fn repose_solid(&self, existing: &GpuSolid, solid: &SolidDisplay) -> bool {
+        let vertices = Self::mesh_vertices(solid);
+        let (segments, edges) = Self::edge_segments(solid);
+        let points = Self::point_instances(solid);
+        let same = vertices.len() as u32 == existing.vertex_count
+            && segments.len() as u32 == existing.edge_instances
+            && edges.len() == existing.edges.len()
+            && points.len() as u32 == existing.point_count
+            && solid.faces.len() == existing.faces.len()
+            && existing.edge_buf.is_some() == !segments.is_empty()
+            && existing.point_buf.is_some() == !points.is_empty();
+        if !same {
+            return false;
+        }
+        self.queue.write_buffer(&existing.vertex_buf, 0, bytemuck::cast_slice(&vertices));
+        if let Some(buf) = &existing.edge_buf {
+            self.queue.write_buffer(buf, 0, bytemuck::cast_slice(&segments));
+        }
+        if let Some(buf) = &existing.point_buf {
+            self.queue.write_buffer(buf, 0, bytemuck::cast_slice(&points));
+        }
+        true
+    }
+
+    fn upload_solid(&self, solid: &SolidDisplay, settings: &RenderSettings) -> GpuSolid {
+        let vertices = Self::mesh_vertices(solid);
         let vertex_buf = self
             .device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some(solid.name.as_str()),
                 contents: bytemuck::cast_slice(&vertices),
-                usage: wgpu::BufferUsages::VERTEX,
+                // COPY_DST: a rigid re-pose rewrites it in place.
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             });
         let index_buf = self
             .device
@@ -193,21 +272,7 @@ impl RenderCore {
             })
             .collect();
 
-        let mut segments: Vec<EdgeInstance> = Vec::new();
-        let mut edges = Vec::with_capacity(solid.edges.len());
-        for edge in &solid.edges {
-            let first_instance = segments.len() as u32;
-            for pair in edge.polyline.windows(2) {
-                segments.push(EdgeInstance {
-                    p0: pair[0],
-                    p1: pair[1],
-                });
-            }
-            edges.push(EdgeRange {
-                first_instance,
-                instance_count: segments.len() as u32 - first_instance,
-            });
-        }
+        let (segments, edges) = Self::edge_segments(solid);
         let occludable_edge_instances = solid
             .edges
             .iter()
@@ -219,27 +284,17 @@ impl RenderCore {
                 .create_buffer_init(&wgpu::util::BufferInitDescriptor {
                     label: Some(solid.name.as_str()),
                     contents: bytemuck::cast_slice(&segments),
-                    usage: wgpu::BufferUsages::VERTEX,
+                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
                 })
         });
 
-        let points: Vec<PointInstance> = solid
-            .vertices
-            .iter()
-            .map(|v| PointInstance {
-                center: [
-                    v.position[0] as f32,
-                    v.position[1] as f32,
-                    v.position[2] as f32,
-                ],
-            })
-            .collect();
+        let points = Self::point_instances(solid);
         let point_buf = (!points.is_empty()).then(|| {
             self.device
                 .create_buffer_init(&wgpu::util::BufferInitDescriptor {
                     label: Some(solid.name.as_str()),
                     contents: bytemuck::cast_slice(&points),
-                    usage: wgpu::BufferUsages::VERTEX,
+                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
                 })
         });
 
@@ -252,6 +307,8 @@ impl RenderCore {
 
         GpuSolid {
             revision: solid.revision,
+            shape: Self::shape_of(solid),
+            vertex_count: vertices.len() as u32,
             face_styles,
             vertex_buf,
             index_buf,
@@ -266,6 +323,11 @@ impl RenderCore {
             point_count: points.len() as u32,
             base_style,
             boundary: None,
+            // Its pose slot is given by the sync. Uploaded as it is shown,
+            // so drawn through no pose; its buffers hold its shape's own
+            // geometry only when it is not a pose itself.
+            model_slot: 0,
+            holds_shape: solid.shape_revision == 0,
         }
     }
 
@@ -280,6 +342,7 @@ impl RenderCore {
         settings_generation: u64,
     ) {
         gpu.order.clear();
+        let models = gpu.models.get_or_insert_with(|| ModelArena::new(&self.device, &self.model_layout, scene.solids().len() as u32));
         let mut seen: Vec<&str> = Vec::with_capacity(scene.solids().len());
         for solid in scene.solids() {
             gpu.order.push(solid.name.clone());
@@ -288,37 +351,88 @@ impl RenderCore {
             match gpu.solids.get_mut(&solid.name) {
                 Some(existing) if existing.revision == solid.revision => {
                     if refresh_style {
-                        let params = Self::style_params(settings);
-                        existing.base_style.write(
-                            &self.queue,
-                            Self::face_base_color(solid, settings),
-                            params,
-                        );
-                        // The per-face palette carries the same shading params,
-                        // so it restyles with the base or flat shading would
-                        // stop applying to individually coloured faces.
-                        let mut seen: Vec<[f32; 3]> = Vec::new();
-                        for face in &solid.faces {
-                            let Some(rgb) = face.color_override else { continue };
-                            if seen.contains(&rgb) {
-                                continue;
-                            }
-                            if let Some(style) = existing.face_styles.get(seen.len()) {
-                                style.write(&self.queue, Self::opaque_linear(rgb), params);
-                            }
-                            seen.push(rgb);
-                        }
+                        self.restyle(existing, solid, settings);
+                    }
+                }
+                // The shape whose geometry the buffers hold, shown through a
+                // pose (an exploded view's step) or as it is: one matrix
+                // write, nothing of the mesh rewritten.
+                Some(existing)
+                    if existing.holds_shape
+                        && existing.shape == Self::shape_of(solid)
+                        && (solid.pose.is_some() || solid.shape_revision == 0) =>
+                {
+                    models.set(existing.model_slot, solid.pose.as_ref());
+                    existing.revision = solid.revision;
+                    gpu.pose_writes += 1;
+                    if refresh_style {
+                        self.restyle(existing, solid, settings);
+                    }
+                }
+                // The same shape moved rigidly (a live drag frame, its
+                // restore): rewrite positions in place, rebuild nothing.
+                Some(existing) if existing.shape == Self::shape_of(solid) && self.repose_solid(existing, solid) => {
+                    // The buffers now hold this pose itself, drawn as it is.
+                    models.set(existing.model_slot, None);
+                    existing.holds_shape = false;
+                    existing.revision = solid.revision;
+                    gpu.reposes += 1;
+                    if refresh_style {
+                        self.restyle(existing, solid, settings);
                     }
                 }
                 _ => {
-                    let uploaded = self.upload_solid(solid, settings);
+                    let mut uploaded = self.upload_solid(solid, settings);
+                    match gpu.solids.get(&solid.name) {
+                        Some(replaced) => uploaded.model_slot = replaced.model_slot,
+                        None => uploaded.model_slot = models.alloc(),
+                    }
+                    models.set(uploaded.model_slot, None);
                     gpu.solids.insert(solid.name.clone(), uploaded);
                     gpu.uploads += 1;
                 }
             }
         }
-        gpu.solids.retain(|name, _| seen.contains(&name.as_str()));
+        let seen: std::collections::HashSet<&str> = seen.into_iter().collect();
+        gpu.solids.retain(|name, solid| {
+            let keep = seen.contains(name.as_str());
+            if !keep {
+                models.release(solid.model_slot);
+            }
+            keep
+        });
+        models.flush(&self.device, &self.queue, &self.model_layout);
         gpu.settings_generation = settings_generation;
+    }
+
+    /// The shape a display's buffers would hold: its `shape_revision` when it
+    /// is a rigid move of another revision, else its own revision.
+    fn shape_of(solid: &SolidDisplay) -> u64 {
+        if solid.shape_revision != 0 {
+            solid.shape_revision
+        } else {
+            solid.revision
+        }
+    }
+
+    /// Rewrite a held solid's base and per-face styles for new settings.
+    fn restyle(&self, existing: &GpuSolid, solid: &SolidDisplay, settings: &RenderSettings) {
+        let params = Self::style_params(settings);
+        existing.base_style.write(&self.queue, Self::face_base_color(solid, settings), params);
+        // The per-face palette carries the same shading params, so it restyles
+        // with the base or flat shading would stop applying to individually
+        // coloured faces.
+        let mut seen: Vec<[f32; 3]> = Vec::new();
+        for face in &solid.faces {
+            let Some(rgb) = face.color_override else { continue };
+            if seen.contains(&rgb) {
+                continue;
+            }
+            if let Some(style) = existing.face_styles.get(seen.len()) {
+                style.write(&self.queue, Self::opaque_linear(rgb), params);
+            }
+            seen.push(rgb);
+        }
     }
 
     /// Upload a scene from scratch (artifact/one-shot path).
@@ -387,6 +501,10 @@ impl RenderCore {
             .write(q, face(settings.face_selected_color), [flat, 0.0, 0.0, 0.0]);
         s.face_hovered
             .write(q, face(settings.hover_color), [flat, 0.0, 0.0, 0.0]);
+        // A context face picked or hovered: its selection colour, kept see-through.
+        let translucent = |rgba: [f32; 4], alpha: f32| [rgba[0], rgba[1], rgba[2], alpha];
+        self.context_selected.write(q, translucent(settings.face_selected_color, 0.6), [0.0; 4]);
+        self.context_hovered.write(q, translucent(settings.hover_color, 0.45), [0.0; 4]);
         let edge_params = [settings.edge_width_px, EDGE_NUDGE, 0.0, 0.0];
         s.edge_base.write(q, settings.edge_color, edge_params);
         s.edge_selected.write(q, settings.edge_selected_color, edge_params);

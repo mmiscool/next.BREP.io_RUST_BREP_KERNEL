@@ -145,6 +145,49 @@ pub fn field_input(
     field_input_with(ui, field, current, probe, actions, None)
 }
 
+/// ONE dropdown for an enumeration — the form's enum field, for a panel's own
+/// state as much as for a schema field (the owner's rule, 2026-10-27: an
+/// enumeration is a dropdown, never a row of radio or segmented buttons).
+/// `choices` are `(value, id, label)`: the value written to `current` when the
+/// entry is chosen, the id the entry's hit key carries, and the text shown.
+/// The closed combo shows the chosen value's label (nothing when `current`
+/// matches no choice) and is as wide as `width` says (egui's own when `None`,
+/// for a combo that shares its row). `hits`, when given, gets the combo's rect
+/// under `key` and each OPEN entry's rect under `key#id`, the shape every
+/// script clicks a form's enum with (`click_widget key`, then `key#id`).
+/// Returns whether the choice changed and the combo's response.
+pub fn enum_dropdown<T: PartialEq + Clone>(
+    ui: &mut egui::Ui,
+    key: &str,
+    choices: &[(T, &str, &str)],
+    current: &mut T,
+    width: Option<f32>,
+    mut hits: Option<&mut HashMap<String, egui::Rect>>,
+) -> (bool, egui::Response) {
+    let shown = choices
+        .iter()
+        .find(|(value, _, _)| value == current)
+        .map_or_else(String::new, |(_, _, label)| label.to_string());
+    let mut combo = egui::ComboBox::from_id_salt(("form-enum", key));
+    if let Some(width) = width {
+        combo = combo.width(width);
+    }
+    let mut changed = false;
+    let combo = combo.selected_text(shown).show_ui(ui, |ui| {
+        for (value, id, label) in choices {
+            let item = ui.selectable_value(current, value.clone(), *label);
+            changed |= item.changed();
+            if let Some(map) = hits.as_deref_mut() {
+                map.insert(format!("{key}#{id}"), item.rect);
+            }
+        }
+    });
+    if let Some(map) = hits.as_deref_mut() {
+        map.insert(key.to_string(), combo.response.rect);
+    }
+    (changed, combo.response)
+}
+
 /// [`field_input`] for a form that may have a reference pick RUNNING:
 /// `picking` names the focused field (see [`ActivePick`]). Every other field
 /// draws exactly as [`field_input`] draws it.
@@ -180,25 +223,13 @@ pub fn field_input_with(
                 .unwrap_or("")
                 .to_string();
             let mut sel = orig.clone();
-            let mut combo = egui::ComboBox::from_id_salt(("form-enum", field.key()));
-            if !ui.layout().prefer_right_to_left() {
-                combo = combo.width(ui.available_width());
-            }
-            let combo = combo
-                .selected_text(&sel)
-                .show_ui(ui, |ui| {
-                    for v in variants {
-                        let item = ui.selectable_value(&mut sel, v.to_string(), v.as_str());
-                        if let Some(map) = probe.as_deref_mut() {
-                            map.insert(format!("{}#{}", path.join("."), v), item.rect);
-                        }
-                    }
-                });
-            let changed = sel != orig;
+            let choices: Vec<(String, &str, &str)> = variants.iter().map(|v| (v.to_string(), v.as_str(), v.as_str())).collect();
+            let width = (!ui.layout().prefer_right_to_left()).then(|| ui.available_width());
+            let (changed, response) = enum_dropdown(ui, &path.join("."), &choices, &mut sel, width, probe.as_deref_mut());
             if changed {
                 set_at(current, path, Value::String(sel));
             }
-            (changed, combo.response.rect)
+            (changed, response.rect)
         }
         FieldKind::Number { min, max, step } | FieldKind::Range { min, max, step } => {
             let mut v = value_at(current, path).and_then(Value::as_f64).unwrap_or(*min);

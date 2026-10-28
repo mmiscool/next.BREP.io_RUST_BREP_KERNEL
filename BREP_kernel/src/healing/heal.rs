@@ -1137,12 +1137,6 @@ struct EdgeClaim {
     witnessed: usize,
 }
 
-/// The binding scope claim for one EDGE: its unchanged curve against every
-/// incident carrier over ONE station set — the edge's own knots and every
-/// given trim's knots, each trim's fractions turned to the edge's forward
-/// sense, at [`TRIM_REFIT_SCOPE_INTERIOR`] points per span. Every use of the
-/// edge is judged by the same claim, so opposite uses cannot contradict.
-/// Returns what was read, and the decline if the claim fails.
 thread_local! {
     /// Declined edge claims by [`claim_memo_key`]: the same contract as
     /// `reading_memo.rs` (content-keyed, per thread, bounded, cleared with
@@ -1240,6 +1234,13 @@ fn claim_memo_insert_passing(key: [u64; 2], claim: &EdgeClaim) {
     });
 }
 
+/// The binding scope claim for one EDGE: its unchanged curve against every
+/// incident carrier over ONE station set — the edge's own knots and every
+/// given trim's knots, each trim's fractions turned to the edge's forward
+/// sense, at [`TRIM_REFIT_SCOPE_INTERIOR`] points per span. Every use of the
+/// edge is judged by the same claim, so opposite uses cannot contradict.
+/// Returns what was read, and the decline if the claim fails.
+///
 /// A fresh claim with nothing replayed or recorded (the controls' reference).
 #[cfg_attr(not(test), allow(dead_code))]
 fn edge_claim(

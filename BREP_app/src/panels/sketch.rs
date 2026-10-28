@@ -121,8 +121,8 @@ impl SketchPanel {
     }
 
     /// The in-sketch CONTEXT actions — the selection-driven constraint palette
-    /// (applicable constraints + Fix/Unfix + ◐ construction + 🧹 cleanup + 🗑
-    /// delete) — rendered through the SAME shared rail as the modeling context
+    /// (applicable constraints + Fix/Unfix + ◐ construction + ∠ angle measure for
+    /// one selected angle constraint + 🧹 cleanup + 🗑 delete) — rendered through the SAME shared rail as the modeling context
     /// bar ([`super::action_rail`]), so both look and behave identically. The
     /// shell draws it into the top-right overlay, below the mode-exit card. No-op
     /// unless a sketch is being edited AND something is selected.
@@ -159,6 +159,15 @@ impl SketchPanel {
                 "Convert to construction geometry"
             };
             items.push(ActionItem::new("construction", "◐ Construction", tip));
+        }
+        if state.sketch_selected_angle_constraint().is_some() {
+            items.push(ActionItem::new(
+                "angle",
+                "∠ Angle measure",
+                "Measure the angle the other way: step to the next sector between \
+                 the two lines (167° becomes its 13° supplement) without moving \
+                 the geometry",
+            ));
         }
         items.push(ActionItem::new(
             "cleanup",
@@ -197,6 +206,9 @@ impl SketchPanel {
             }
             Some("construction") => {
                 state.sketch_toggle_construction();
+            }
+            Some("angle") => {
+                state.sketch_cycle_angle_measure();
             }
             Some("cleanup") => {
                 state.sketch_cleanup_unused_points();
@@ -496,6 +508,10 @@ fn entity_section(
         if resp.label.hovered() {
             state.sketch_hover_entity(kind, row.id.clone());
         }
+        // A copied edge's note ("copied from <part>, not linked") in full.
+        if let Some((_, note)) = row.label.split_once(" \u{2014} ") {
+            resp.label.clone().on_hover_text(note);
+        }
     }
     // Delete last so it can't invalidate the rows we are still iterating this frame.
     if let Some(id) = to_delete {
@@ -573,6 +589,7 @@ pub static HIT_KEYS: &[HitKeyDoc] = &[
     HitKeyDoc { panel: "sketch", prefix: "constraint:", meaning: "apply the offered sketch constraint to the selection (constraint:glyph, e.g. constraint:⌒)", command: None },
     HitKeyDoc { panel: "sketch", prefix: "fix", meaning: "ground the selected points, or unground them when all are grounded", command: None },
     HitKeyDoc { panel: "sketch", prefix: "construction", meaning: "flip the selection between construction and regular geometry", command: None },
+    HitKeyDoc { panel: "sketch", prefix: "angle", meaning: "with one ∠ constraint selected, measure the angle the next way round (its supplement in the adjacent sector; the value flips to 180 − value, the geometry stays put)", command: None },
     HitKeyDoc { panel: "sketch", prefix: "cleanup", meaning: "remove points no geometry or constraint uses", command: None },
     HitKeyDoc { panel: "sketch", prefix: "delete", meaning: "delete the selected sketch entities", command: None },
     HitKeyDoc { panel: "sketchlist", prefix: "section:", meaning: "collapse or expand an entity-list section (section:Curves / section:Points / section:Constraints)", command: None },

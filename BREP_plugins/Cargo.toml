@@ -1,6 +1,6 @@
 [package]
 name = "BREP_plugins"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2021"
 license-file = "LICENSE.md"
 description = "Pinned JavaScript CAD package runtime"
@@ -11,7 +11,7 @@ include = ["src/**/*.rs", "src/host.js", "/Cargo.toml", "/README.md", "/LICENSE.
 [lib]
 name = "brep_plugins"
 [dependencies]
-brep_kernel = { package = "BREP_kernel", version = "0.10.0", path = "../BREP_kernel" }
+brep_kernel = { package = "BREP_kernel", version = "0.11.0", path = "../BREP_kernel" }
 brep_script_core = { package = "BREP_script_core", version = "0.1.2", path = "../BREP_script_core" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

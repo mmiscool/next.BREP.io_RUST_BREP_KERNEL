@@ -39,6 +39,9 @@ pub mod groups {
     pub const AUTHOR: &str = "author";
     /// Read-only.
     pub const VIEWER: &str = "viewer";
+    /// The shop floor: reads, and signs the steps of manufacturing jobs
+    /// ([`crate::jobs`]). Nothing else.
+    pub const OPERATOR: &str = "operator";
     /// A headless CAD worker: may take bake jobs from the queue and write
     /// their results (round 8). Nothing else — a worker account cannot
     /// create parts or release anything.
@@ -160,6 +163,22 @@ pub struct ApiToken {
     /// When it stops working; `None` never expires.
     #[serde(default)]
     pub expires_at: Option<Timestamp>,
+    /// The desktop app a browser sign-in made this token for
+    /// (`/api/desktop/link`), listed under Linked desktops; `None` for a token
+    /// a person made.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub desktop: Option<DesktopDevice>,
+}
+
+/// What a desktop app said about itself when it asked to sign in.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct DesktopDevice {
+    #[serde(default)]
+    pub host: String,
+    #[serde(default)]
+    pub os: String,
+    #[serde(default)]
+    pub app_version: String,
 }
 
 // ===========================================================================
@@ -272,6 +291,9 @@ pub enum DocumentClass {
     Family,
     /// `.tBREP` — a template whose values are driven by expressions.
     Template,
+    /// `.iBREP` — manufacturing instructions for one assembly revision
+    /// ([`Revision::instructs`]), revised on their own schedule.
+    Instructions,
 }
 
 impl DocumentClass {
@@ -280,6 +302,7 @@ impl DocumentClass {
             DocumentClass::Normal => "normal",
             DocumentClass::Family => "family",
             DocumentClass::Template => "template",
+            DocumentClass::Instructions => "instructions",
         }
     }
 
@@ -288,6 +311,7 @@ impl DocumentClass {
             "" | "normal" | "nbrep" => Some(DocumentClass::Normal),
             "family" | "fbrep" => Some(DocumentClass::Family),
             "template" | "tbrep" => Some(DocumentClass::Template),
+            "instructions" | "ibrep" => Some(DocumentClass::Instructions),
             _ => None,
         }
     }
@@ -423,6 +447,53 @@ pub struct Revision {
     /// [`crate::thumbnail::current`] no longer serves it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thumbnail: Option<Thumbnail>,
+    /// An instructions revision's assembly: derived from the document's
+    /// `instructions.target.sourceKey` on every write, never set by a
+    /// request. `None` for every other class, and for instructions whose
+    /// target is not a PLM revision (a local file).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instructs: Option<Instructs>,
+    /// An instructions revision's player data ([`crate::player`]), keyed by
+    /// the document it was made from like a thumbnail.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub player: Option<PlayerArtifact>,
+    /// Customer links to a released instructions revision's player.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub shares: Vec<Share>,
+}
+
+/// The interactive player's data for one instructions revision: a blob of
+/// the attachment store, current while the revision's document is the one
+/// it was made from.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlayerArtifact {
+    pub sha256: String,
+    pub size: u64,
+    /// The revision's `content_hash` when the data was made.
+    pub content_hash: String,
+    pub uploaded_by: String,
+    pub uploaded_at: Timestamp,
+}
+
+/// A customer link (`/s/<token>`) to a released revision's player. The
+/// token is shown once; only its SHA-256 is kept.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Share {
+    /// What the list shows and a revoke names: the first 12 hex of the hash.
+    pub id: String,
+    #[serde(skip_serializing_if = "String::is_empty", default)]
+    pub token_sha256: String,
+    #[serde(default)]
+    pub label: String,
+    pub created_by: String,
+    pub created_at: Timestamp,
+}
+
+/// The assembly revision an instructions revision instructs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Instructs {
+    pub part: String,
+    pub revision: String,
 }
 
 /// A revision's thumbnail: a PNG blob beside the attachments, keyed by the
@@ -540,6 +611,9 @@ impl Revision {
             comments: Vec::new(),
             attachments: Vec::new(),
             thumbnail: None,
+            instructs: None,
+            player: None,
+            shares: Vec::new(),
         }
     }
 

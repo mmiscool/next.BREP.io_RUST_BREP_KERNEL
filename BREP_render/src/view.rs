@@ -242,8 +242,8 @@ impl ViewCamera {
     }
 
     /// The world→clip view-projection as column-major `[col][row]` in f64. This
-    /// is the exact matrix [`resolve`] feeds the GPU, kept in f64 so the
-    /// CSS-pixel projection the host overlays derive from it matches [`project`]
+    /// is the exact matrix [`resolve`](Self::resolve) feeds the GPU, kept in f64 so the
+    /// CSS-pixel projection the host overlays derive from it matches [`project`](Self::project)
     /// to sub-pixel precision. wgpu clip space: x,y in −1..1, z in 0..1.
     pub fn view_proj_cols(&self) -> [[f64; 4]; 4] {
         let (right, up, forward) = self.basis();
@@ -346,7 +346,7 @@ impl ViewCamera {
         out
     }
 
-    /// Inverse of [`view_proj_flat`] (clip→world), column-major, for the host
+    /// Inverse of [`view_proj_flat`](Self::view_proj_flat) (clip→world), column-major, for the host
     /// overlays' screen→world / screen→ray path. Falls back to the identity if
     /// the matrix is singular (never in practice for a valid camera).
     pub fn view_proj_inverse_flat(&self) -> [f64; 16] {

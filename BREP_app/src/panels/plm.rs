@@ -204,7 +204,16 @@ pub fn newest(part: &PartDetail) -> Option<&RevisionView> {
 
 /// Whether the session copy may be saved to `revision`, and if not, why.
 pub fn access_for(revision: &RevisionView) -> Access {
+    access_with(revision, Rights { can_author: true, can_checkin: true })
+}
+
+/// [`access_for`] for a user with `rights`: an account that may not write
+/// is told so, not to check out what it cannot.
+pub fn access_with(revision: &RevisionView, rights: Rights) -> Access {
     let label = &revision.label;
+    if !rights.can_author && !revision.locked_by_me {
+        return Access::read_only(format!("revision {label}: {}", crate::document::owned_save::VIEW_ONLY));
+    }
     if !revision.editable {
         let state = match revision.lifecycle.as_str() {
             "released" => "released",
@@ -379,6 +388,77 @@ pub enum PanelEvent {
     /// Open the review pane on a revision: its submit form, or its round
     /// (`panels::plm_review`, S4).
     OpenReview { part: String, revision: String },
+    /// A re-read the user's own verb did not cause found the shown revision
+    /// (or its part) changed on the PLM: the shell says so once.
+    Moved(Moved),
+}
+
+/// What changed on the PLM under an open revision, by someone or something
+/// other than this pane's own verb.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Moved {
+    /// The user's lock went; `holder` holds it now, if anyone does, and `by`
+    /// says how (read from the part's history).
+    LockLost { holder: Option<String>, by: LockGone },
+    /// Someone else checked it out.
+    CheckedOutBy(String),
+    /// It was frozen (`released`, `obsolete` or `superseded`), `by` whom when
+    /// known.
+    Lifecycle { to: String, by: Option<String> },
+    /// The part was renamed.
+    Renamed(String),
+}
+
+/// How a lock the user held went, as the part's history tells it.
+#[derive(Debug, Clone, PartialEq)]
+pub enum LockGone {
+    /// The history did not say (or could not be read).
+    Unknown,
+    /// The user checked it in (on the web, or from another client).
+    You,
+    /// Someone else broke it.
+    BrokenBy(String),
+}
+
+/// How the lock on `revision_id` last went, from the part's `history`: its
+/// newest check-in or broken lock.
+pub fn lock_gone(history: &[HistoryEvent], revision_id: &str) -> LockGone {
+    let last = history
+        .iter()
+        .filter(|e| e.entity.kind == "revision" && e.entity.id == revision_id && matches!(e.action.as_str(), "checkin" | "break-lock"))
+        .max_by_key(|e| e.id);
+    match last {
+        Some(e) if e.action == "break-lock" && !e.actor.username.is_empty() => LockGone::BrokenBy(e.actor.username.clone()),
+        Some(e) if e.action == "checkin" => LockGone::You,
+        _ => LockGone::Unknown,
+    }
+}
+
+/// What moved between two reads of `revision_id` of a part: `before` and
+/// `after`, in the order the shell announces them.
+pub fn moved(before: &PartDetail, after: &PartDetail, revision_id: &str) -> Vec<Moved> {
+    let mut out = Vec::new();
+    let find = |part: &PartDetail| part.revision_views.iter().find(|r| r.id == revision_id).cloned();
+    if let (Some(old), Some(new)) = (find(before), find(after)) {
+        let frozen = matches!(new.lifecycle.as_str(), "released" | "obsolete" | "superseded");
+        // A frozen revision has no lock to take back: its own notice says
+        // what Save does now, and "check it out again" would be wrong.
+        if !frozen && old.locked_by_me && !new.locked_by_me {
+            out.push(Moved::LockLost { holder: new.locked_by.clone(), by: LockGone::Unknown });
+        } else if !frozen && !new.locked_by_me && new.locked_by.is_some() && new.locked_by != old.locked_by {
+            out.push(Moved::CheckedOutBy(new.locked_by.clone().unwrap_or_default()));
+        }
+        // Only a move that freezes it is news here: a submit for review is
+        // the user's own (the review pane's), and its save warning is D8's.
+        if old.lifecycle != new.lifecycle && frozen {
+            let by = (new.lifecycle == "released").then(|| new.released_by.clone()).flatten();
+            out.push(Moved::Lifecycle { to: new.lifecycle.clone(), by });
+        }
+    }
+    if before.name != after.name && !after.name.is_empty() {
+        out.push(Moved::Renamed(after.name.clone()));
+    }
+    out
 }
 
 /// The lifecycle panel for ONE document opened from the PLM.
@@ -403,6 +483,11 @@ pub struct PlmPanel {
     confirm_new: bool,
     /// Events a press raised without a server call, handed out by the next poll.
     queued: Vec<PanelEvent>,
+    /// The re-read in flight follows this pane's own verb: what it finds
+    /// changed is the user's doing, not news.
+    after_verb: bool,
+    /// A lost lock waiting for the history to say who: the holder now.
+    asking_who: Option<Option<String>>,
 }
 
 impl PlmPanel {
@@ -422,6 +507,8 @@ impl PlmPanel {
             open_newest_after: false,
             confirm_new: false,
             queued: Vec::new(),
+            after_verb: false,
+            asking_who: None,
         };
         panel.work = Some(Work::Part(Pending::new(server.part(part_id))));
         panel
@@ -453,6 +540,11 @@ impl PlmPanel {
 
     /// Keep the revision's actions mounted during read-only background refreshes.
     /// Mutating requests still suppress duplicate actions.
+    /// What the signed-in user may do, as this panel was given it.
+    pub fn rights(&self) -> Rights {
+        self.rights
+    }
+
     pub fn offered(&self) -> Vec<Verb> {
         match (&self.part, self.revision()) {
             (Some(part), Some(revision)) if self.work.is_none() || self.refreshing() => {
@@ -526,12 +618,31 @@ impl PlmPanel {
             Work::Part(pending) => match pending.poll() {
                 None => return events,
                 Some(Ok(part)) => {
+                    if let Some(before) = self.part.as_ref().filter(|_| !std::mem::take(&mut self.after_verb)) {
+                        let changes = moved(before, &part, &self.revision_id);
+                        // The last sentence ("Checked out") is about a state
+                        // that is gone.
+                        if !changes.is_empty() {
+                            self.message = None;
+                        }
+                        for change in changes {
+                            match change {
+                                // Who took it is one history read away.
+                                Moved::LockLost { holder, .. } => self.asking_who = Some(holder),
+                                other => events.push(PanelEvent::Moved(other)),
+                            }
+                        }
+                    }
                     self.part = Some(part);
-                    self.work = None;
+                    self.work = self
+                        .asking_who
+                        .is_some()
+                        .then(|| Work::History(Pending::new(server.history(&self.part_id))));
                 }
                 Some(Err(error)) => {
                     self.message = Some(error);
                     self.work = None;
+                    self.after_verb = false;
                 }
             },
             Work::Verb(verb, pending) => {
@@ -541,6 +652,7 @@ impl PlmPanel {
                     Some(result) => {
                         let new_revision = verb == Verb::NewRevision;
                         self.work = Some(Work::Part(Pending::new(server.part(&self.part_id))));
+                        self.after_verb = true;
                         match result {
                             Ok(sentence) => {
                                 self.message = Some(sentence);
@@ -562,9 +674,20 @@ impl PlmPanel {
                 None => return events,
                 Some(result) => {
                     self.work = None;
+                    let asked = self.asking_who.take();
+                    let by = match &result {
+                        Ok(history) => lock_gone(history, &self.revision_id),
+                        Err(_) => LockGone::Unknown,
+                    };
                     match result {
                         Ok(history) => self.history = Some(history),
-                        Err(error) => self.message = Some(error),
+                        // The read was the notice's, not the user's: its
+                        // failure is not the pane's sentence.
+                        Err(error) if asked.is_none() => self.message = Some(error),
+                        Err(_) => {}
+                    }
+                    if let Some(holder) = asked {
+                        events.push(PanelEvent::Moved(Moved::LockLost { holder, by }));
                     }
                 }
             },
@@ -577,7 +700,7 @@ impl PlmPanel {
             }
         }
         if let Some(revision) = self.revision() {
-            let access = access_for(revision);
+            let access = access_with(revision, self.rights);
             if self.reported.as_ref() != Some(&access) {
                 self.reported = Some(access.clone());
                 events.push(PanelEvent::Access(access));
@@ -639,7 +762,7 @@ impl PlmPanel {
         };
         ui.heading(format!("{} {}", part.number, part.name));
         if let Some(revision) = self.revision() {
-            let access = access_for(revision);
+            let access = access_with(revision, self.rights);
             match &access {
                 Access::Editable => ui.label(format!("Revision {} — checked out by you", revision.label)),
                 Access::ReadOnly { reason } => ui.label(format!("Read-only: {reason}")),

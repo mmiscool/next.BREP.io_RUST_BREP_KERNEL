@@ -26,7 +26,23 @@ impl Destination {
 /// Where a Save As starts: on a PLM revision, a new revision of it; off one,
 /// a new part; and from the family member hand-edit prompt's "Save as a new
 /// part", a NEW PART whatever the document is named — never the generated
-/// member's own revision (integrator ruling 2026-10-03).
+/// member's own revision (integrator ruling 2026-10-03). What the new part's
+/// Name starts as. Not the tab's title: an untitled document's "untitled 2"
+/// (or a revision's "CPART000000001/A") became the first part's name
+/// whenever the user typed into the field rather than replacing it. Empty
+/// for an untitled document (the field says what to type), the part's own
+/// name for a PLM revision, the file's name otherwise.
+fn new_part_name(doc: &crate::document::Document, store: &dyn ModelStore) -> String {
+    let Some(name) = doc.name() else { return String::new() };
+    match crate::panels::plm_host::revision_of(name) {
+        Some((part, revision)) => store
+            .plm_revision(&crate::plm::identity::document_key(&part, &revision))
+            .map(|entry| entry.part_name)
+            .unwrap_or_default(),
+        None => doc.title(),
+    }
+}
+
 fn initial_destination(member_new_part: bool, on_a_revision: bool) -> Destination {
     if member_new_part || !on_a_revision {
         Destination::NewPart
@@ -73,6 +89,9 @@ pub(super) struct SaveAs {
     /// The copy being written carries no family stamp (see
     /// [`copy_document`]); once it lands, the session document drops its own.
     strip_stamp: bool,
+    /// The tab's `derivedFrom` block before this Save As stamped it (`Some`
+    /// only when it did): a failed save puts it back.
+    prior_lineage: Option<Option<serde_json::Value>>,
 }
 
 impl SaveAs {
@@ -231,10 +250,30 @@ impl FileDialog {
                     if self.mode == Mode::SaveAs {
                         self.open = false;
                     }
+                    let document = state.document;
                     self.plm_save_as = None;
+                    // The copy is a revision of its own now: parts it places
+                    // that have no document of their own become PLM items in
+                    // the same Save (never kept only inside the assembly), and
+                    // parts it changed are written to their own items (checked
+                    // out, or a new revision, through the one Save dialog):
+                    // Save As writes only the assembly, and a changed copy left
+                    // unwritten and unmarked is refreshed away at the next open.
+                    let plan = (docs.active_id() == document).then(|| docs.plan_owned_save(store, &name));
+                    if plan.is_some_and(|plan| !plan.promotions.is_empty() || !plan.rows.is_empty()) {
+                        self.save_to(docs, store, name);
+                    }
                     return;
                 }
                 Err(problem) => {
+                    if let Some(prior) = state.prior_lineage.take() {
+                        if let Some(doc) = docs.iter_mut().find(|d| d.id() == state.document) {
+                            doc.engine.history.set_document_block_no_undo(
+                                brep_render::engine_state::replace_component::DERIVED_FROM_KEY,
+                                prior,
+                            );
+                        }
+                    }
                     self.status =
                         format!("Save failed: {problem}. Your session edits are unchanged.")
                 }
@@ -265,7 +304,7 @@ impl FileDialog {
                 document: id,
                 destination: initial_destination(member_new_part, source.is_some()),
                 part: source.map(|(p, _)| p).unwrap_or_default(),
-                name: docs.active().title(),
+                name: new_part_name(docs.active(), store),
                 loading: Some(Pending::new(catalog.part_types())),
                 ..Default::default()
             });
@@ -296,25 +335,31 @@ impl FileDialog {
             ctx.request_repaint_after(std::time::Duration::from_millis(30));
         }
         let mut save = false;
+        // Every destination here writes to the PLM: an account that may not
+        // is told before it fills anything in, and nothing is offered.
+        let viewer = client.can_author() == Some(false);
         let modal = egui::Modal::new(egui::Id::new("brep-file-saveas")).show(ctx, |ui| {
             ui.heading("Save as");
-            ui.add_enabled_ui(!busy, |ui| {
-                for (value, label, key) in [
-                    (
-                        Destination::NewRevision,
-                        "A new revision",
-                        "saveas:new-revision",
-                    ),
-                    (Destination::NewPart, "A new part", "saveas:new-part"),
-                    (
-                        Destination::Existing,
-                        "An existing revision",
-                        "saveas:existing",
-                    ),
-                ] {
-                    let choice = ui.radio_value(&mut state.destination, value, label);
-                    self.hits.insert(key.into(), choice.rect);
-                }
+            if viewer {
+                let note = ui.colored_label(
+                    ui.visuals().warn_fg_color,
+                    format!("Not available: {}. Export keeps a copy as a file.", crate::document::owned_save::VIEW_ONLY),
+                );
+                self.hits.insert("saveas:view-only".into(), note.rect);
+            }
+            ui.add_enabled_ui(!busy && !viewer, |ui| {
+                // The destination as one dropdown (the form's enum field):
+                // saveas:destination, its open entries saveas:destination#new-revision,
+                // #new-part and #existing.
+                ui.horizontal(|ui| {
+                    ui.label("Destination");
+                    let choices = [
+                        (Destination::NewRevision, "new-revision", "A new revision"),
+                        (Destination::NewPart, "new-part", "A new part"),
+                        (Destination::Existing, "existing", "An existing revision"),
+                    ];
+                    crate::form::enum_dropdown(ui, "saveas:destination", &choices, &mut state.destination, None, Some(&mut self.hits));
+                });
                 if state.destination == Destination::NewPart {
                     ui.label("Part type");
                     egui::ComboBox::from_id_salt("saveas:type")
@@ -333,7 +378,8 @@ impl FileDialog {
                         ),
                     ] {
                         ui.label(label);
-                        let r = ui.text_edit_singleline(field);
+                        let hint = if key == "saveas:name" { "the new part's name" } else { "" };
+                        let r = ui.add(egui::TextEdit::singleline(field).hint_text(hint));
                         self.hits.insert(key.into(), r.rect);
                     }
                 } else {
@@ -400,6 +446,27 @@ impl FileDialog {
                 .document_block(family_table::FAMILY_SOURCE_KEY)
                 .is_some();
             state.strip_stamp = stamped && !keeps_identity;
+            // A copy that becomes another part records where it came from
+            // (Replace component trusts face names across that lineage).
+            // Stamped on the tab BEFORE the baseline and the copy are taken,
+            // so both carry it; a failed save restores the tab.
+            if !keeps_identity {
+                let key = brep_render::engine_state::replace_component::DERIVED_FROM_KEY;
+                state.prior_lineage = Some(docs.engine().history.document_block(key).cloned());
+                super::stamp_save_as_lineage(docs, store, "");
+            }
+            // A Save As writes the assembly alone, not the parts it changed:
+            // their copies are marked as holding a change not saved to them
+            // yet, so the copy (and the new revision holding it) says so, no
+            // open refreshes it away, and the Save that follows the Save As
+            // writes them through the one Save dialog.
+            if let Some(current) = docs.active().name().map(str::to_string) {
+                let id = docs.active_id();
+                let plan = docs.plan_owned_save(store, &current);
+                for row in plan.rows.iter().filter(|row| row.write.key != current) {
+                    docs.mark_unsaved_copies(id, &row.write.key, "Save As wrote only the assembly");
+                }
+            }
             // The baseline of what is being saved: without the stamp when the
             // copy is written without it.
             state.signature = Some(if state.strip_stamp {
@@ -407,7 +474,7 @@ impl FileDialog {
             } else {
                 docs.active().save_signature()
             });
-            let document = copy_document(&docs.engine().history_request_json(), state.strip_stamp);
+            let document = copy_document(&docs.tab_engine().history_request_json(), state.strip_stamp);
             state.snapshot = Some(document.clone());
             let other_open = docs
                 .iter()

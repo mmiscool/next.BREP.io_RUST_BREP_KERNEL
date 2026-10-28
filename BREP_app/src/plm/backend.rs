@@ -1,13 +1,13 @@
-//! The PLM as a store backend (plan S1 part 2): three [`StoreBackend`]s over
-//! one signed-in [`PlmClient`], composed by S0's [`KeySpaceRouter`] (D1).
+//! The PLM as a store backend (plan S1 part 2): three `StoreBackend`s over
+//! one signed-in [`PlmClient`], composed by S0's `KeySpaceRouter` (D1).
 //!
-//! - [`DocumentsBackend`] — the store routes. Its index is
+//! - `DocumentsBackend` — the store routes. Its index is
 //!   `GET /api/store/index`, every document `OnDisk` until read; a revision
 //!   with no document yet is not listed, and `204` reads as absent.
-//! - [`PreferencesBackend`] — the user's reserved keys on the server (P5),
+//! - `PreferencesBackend` — the user's reserved keys on the server (P5),
 //!   hydrated whole at sign-in: they are small, and the first frame needs the
 //!   settings and the dock layout.
-//! - [`RecoveryMirror`] — `@recovery` written to the machine FIRST, then
+//! - `RecoveryMirror` — `@recovery` written to the machine FIRST, then
 //!   mirrored to P5 in the background, latest value wins, so a network drop can
 //!   never cost unsaved work and a slow server never holds up the next write.
 //!
@@ -93,9 +93,12 @@ pub(crate) fn served_by_plm(path: &str) -> bool {
 /// The three backends over one signed-in client.
 /// Every save of an assembly revision republishes its uses list (S5's
 /// publisher on the [`SavedHook`]), and every save uploads the picture staged
-/// for it ([`crate::plm::thumbnail`]), after the list.
+/// for it ([`crate::plm::thumbnail`]), after the list, and an instructions
+/// revision's save its player data ([`crate::plm::player_data`]).
 pub(crate) fn compose(client: Rc<PlmClient>, url: &str, username: &str, local: Rc<dyn StoreBackend>) -> Rc<dyn StoreBackend> {
-    let on_saved = crate::plm::thumbnail::chain(crate::plm::uses::publish_on_save(), crate::plm::thumbnail::upload_on_save());
+    use crate::plm::thumbnail::chain;
+    let pictured = chain(crate::plm::uses::publish_on_save(), crate::plm::thumbnail::upload_on_save());
+    let on_saved = chain(pictured, crate::plm::player_data::upload_on_save());
     compose_with(client, url, username, local, Some(on_saved))
 }
 
@@ -198,11 +201,37 @@ struct OrderedIndex {
     clock: u64,
     freshness: BTreeMap<String, u64>,
     full_authority: u64,
+    /// The content hash of each of our own writes that landed, while the
+    /// row still lists it: the change feed names our own keys, and a reader
+    /// need not read back what it just wrote.
+    ours: BTreeMap<String, String>,
 }
 impl OrderedIndex {
     fn issue(&mut self) -> u64 {
         self.clock += 1;
         self.clock
+    }
+    /// A write of ours landed: the row holds what the server answered for it,
+    /// with authority over index answers issued before it. Without this the
+    /// row kept the document before our write until the feed caught up, and
+    /// a retry based on it read our own save as someone else's.
+    fn written(&mut self, key: &str, ack: &super::client::PutAck) {
+        let tick = self.issue();
+        if let Some(row) = self.rows.get_mut(key) {
+            row.content_hash = ack.content_hash.clone();
+            row.size = ack.size;
+            self.freshness.insert(key.to_string(), tick);
+            self.ours.insert(key.to_string(), ack.content_hash.clone());
+        }
+    }
+    /// Our checkout landed: the row reads it as ours, with authority over
+    /// index answers issued before it (as [`Self::written`]).
+    fn checked_out(&mut self, key: &str) {
+        let tick = self.issue();
+        if let Some(row) = self.rows.get_mut(key) {
+            row.locked_by_me = true;
+            self.freshness.insert(key.to_string(), tick);
+        }
     }
     fn reconcile(&mut self, asked: Option<&[String]>, answer: &super::client::StoreIndex, issued: u64) {
         let listed: std::collections::BTreeSet<&str> = answer.entries.iter().map(|e| e.key.as_str()).collect();
@@ -218,9 +247,21 @@ impl OrderedIndex {
         for row in &answer.entries {
             if self.full_authority >= issued || self.freshness.get(&row.key).is_some_and(|&tick| tick >= issued) { continue; }
             self.freshness.insert(row.key.clone(), issued);
+            if self.ours.get(&row.key).is_some_and(|hash| *hash != row.content_hash) {
+                self.ours.remove(&row.key);
+            }
             self.rows.insert(row.key.clone(), row.clone());
         }
         if asked.is_none() { self.full_authority = self.full_authority.max(issued); }
+    }
+}
+
+/// A write a `derived-uses` server took without deriving its uses list: said
+/// as the app's own publish of the list said it (the document IS saved).
+fn uses_refused(ack: &super::client::PutAck) -> Result<(), String> {
+    match &ack.uses_refused {
+        Some(why) => Err(format!("the document was saved, but its parts list was not published: {why}")),
+        None => Ok(()),
     }
 }
 
@@ -238,6 +279,15 @@ impl StoreBackend for DocumentsBackend {
 
     fn plm_revision(&self, key: &str) -> Option<super::client::IndexEntry> {
         self.index.borrow().rows.get(key).cloned()
+    }
+
+    fn note_checked_out(&self, key: &str) {
+        self.index.borrow_mut().checked_out(key);
+    }
+
+    fn plm_written_by_us(&self, key: &str) -> bool {
+        let index = self.index.borrow();
+        index.ours.get(key).is_some_and(|hash| index.rows.get(key).is_some_and(|row| row.content_hash == *hash))
     }
 
     /// The change feed moved: re-read exactly the rows it named (a revision's
@@ -372,13 +422,43 @@ impl StoreBackend for DocumentsBackend {
     fn put(&self, key: &str, value: &str) -> BackendFuture<()> {
         self.backoff.borrow_mut().clear(key);
         let (client, key, value, on_saved) = (self.client.clone(), key.to_string(), value.to_string(), self.on_saved.clone());
+        let index = self.index.clone();
         Box::pin(async move {
             let store_key = document_key(&key)?.to_string();
-            client.put_document(&store_key, value.clone().into_bytes()).await.map_err(|e| e.to_string())?;
-            match on_saved {
+            let ack = client.put_document(&store_key, value.clone().into_bytes()).await.map_err(|e| e.to_string())?;
+            index.borrow_mut().written(&store_key, &ack);
+            let saved = match on_saved {
                 Some(hook) => hook(client, store_key, value).await,
                 None => Ok(()),
-            }
+            };
+            saved.and(uses_refused(&ack))
+        })
+    }
+
+    /// The revision is written only over the document `expected` names
+    /// (`If-Match`); a newer one on the server is refused as changed
+    /// elsewhere, in the server's words (when, and who holds it).
+    fn put_if(&self, key: &str, value: &str, expected: &str) -> BackendFuture<()> {
+        if expected.is_empty() {
+            return self.put(key, value);
+        }
+        self.backoff.borrow_mut().clear(key);
+        let (client, key, value, on_saved) = (self.client.clone(), key.to_string(), value.to_string(), self.on_saved.clone());
+        let expected = expected.to_string();
+        let index = self.index.clone();
+        Box::pin(async move {
+            let store_key = document_key(&key)?.to_string();
+            let ack = match client.put_document_if(&store_key, value.clone().into_bytes(), &expected).await {
+                Ok(ack) => ack,
+                Err(PlmError::Conflict(why)) => return Err(format!("{}{why}", crate::store::mirror_store::CHANGED_ELSEWHERE)),
+                Err(e) => return Err(e.to_string()),
+            };
+            index.borrow_mut().written(&store_key, &ack);
+            let saved = match on_saved {
+                Some(hook) => hook(client, store_key, value).await,
+                None => Ok(()),
+            };
+            saved.and(uses_refused(&ack))
         })
     }
 
@@ -587,9 +667,6 @@ impl RecoveryMirror {
 
 /// Run `task` to completion in the background on the host's executor.
 fn detach(task: impl std::future::Future<Output = ()> + 'static) {
-    #[cfg(target_arch = "wasm32")]
-    wasm_bindgen_futures::spawn_local(task);
-    #[cfg(not(target_arch = "wasm32"))]
-    super::native::spawn(task);
+    crate::store::spawn_waking(task);
 }
 

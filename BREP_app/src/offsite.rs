@@ -12,7 +12,7 @@
 //!   list.
 //! * [`refusal`] answers, for a URL a feature is about to fetch, the sentence
 //!   to show instead: "STEP parts search is unavailable on this server:
-//!   https://api.step.parts is not allowed". [`explain`] maps a failed fetch
+//!   `https://api.step.parts` is not allowed". [`explain`] maps a failed fetch
 //!   to the same sentence, for the one case where the policy arrived after the
 //!   request left.
 //!

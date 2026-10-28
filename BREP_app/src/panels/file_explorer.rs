@@ -550,30 +550,33 @@ impl FileExplorer {
         }); }
 
         let query = self.query.trim().to_ascii_lowercase();
-        let mut visible: Vec<&BrowserEntry> = entries
+        // Each name lowercased ONCE, for the filter and the sort: lowercasing
+        // both names in every comparison was ~130,000 allocations a frame for
+        // a 5,000-part PLM folder, while the dialog sat open.
+        let mut named: Vec<(String, &BrowserEntry)> = entries
             .iter()
-            .filter(|entry| {
+            .filter_map(|entry| {
                 // Dotfiles hide unless toggled on; the filter box applies to files.
                 let hidden = entry.name.starts_with('.');
-                (self.show_hidden || !hidden)
-                    && (entry.is_dir
-                        || query.is_empty()
-                        || entry.name.to_ascii_lowercase().contains(&query))
+                let lower = entry.name.to_ascii_lowercase();
+                ((self.show_hidden || !hidden) && (entry.is_dir || query.is_empty() || lower.contains(&query))).then_some((lower, entry))
             })
             .collect();
         // Directories always first; within each group, by the active column.
         let (key, desc) = (self.sort_key, self.sort_desc);
-        visible.sort_by(|a, b| {
+        named.sort_by(|(a_name, a), (b_name, b)| {
             b.is_dir.cmp(&a.is_dir).then_with(|| {
+                let by_name = || a_name.cmp(b_name);
                 let ord = match key {
-                    SortKey::Name => cmp_name(a, b),
-                    SortKey::Kind => entry_kind(a).cmp(&entry_kind(b)).then_with(|| cmp_name(a, b)),
-                    SortKey::Size => a.size.unwrap_or(0).cmp(&b.size.unwrap_or(0)).then_with(|| cmp_name(a, b)),
-                    SortKey::Date => cmp_opt(a.modified, b.modified).then_with(|| cmp_name(a, b)),
+                    SortKey::Name => by_name(),
+                    SortKey::Kind => entry_kind(a).cmp(&entry_kind(b)).then_with(by_name),
+                    SortKey::Size => a.size.unwrap_or(0).cmp(&b.size.unwrap_or(0)).then_with(by_name),
+                    SortKey::Date => cmp_opt(a.modified, b.modified).then_with(by_name),
                 };
                 if desc { ord.reverse() } else { ord }
             })
         });
+        let visible: Vec<&BrowserEntry> = named.into_iter().map(|(_, entry)| entry).collect();
         self.nav_files = visible
             .iter()
             .filter(|entry| !entry.is_dir)
@@ -885,11 +888,6 @@ fn bottom_panel<R>(
         .inner
 }
 
-/// Case-insensitive name order — the tie-breaker for every column sort.
-fn cmp_name(a: &BrowserEntry, b: &BrowserEntry) -> Ordering {
-    a.name.to_ascii_lowercase().cmp(&b.name.to_ascii_lowercase())
-}
-
 /// Order two optional timestamps, sorting `None` (unknown, e.g. web) last.
 fn cmp_opt(a: Option<f64>, b: Option<f64>) -> Ordering {
     match (a, b) {
@@ -972,8 +970,8 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 }
 
 /// Split a POSIX-ish location into `(label, navigable-path)` breadcrumb segments,
-/// starting at the root. e.g. `/home/user/models` →
-/// `[("/", "/"), ("home", "/home"), ("user", "/home/user"), ("models", "/home/user/models")]`.
+/// starting at the root. e.g. `/home/me/models` →
+/// `[("/", "/"), ("home", "/home"), ("me", "/home/me"), ("models", "/home/me/models")]`.
 fn breadcrumb_segments(location: &str) -> Vec<(String, String)> {
     let mut out = vec![("/".to_string(), "/".to_string())];
     let mut acc = String::new();

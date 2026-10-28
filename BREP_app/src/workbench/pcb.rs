@@ -9,7 +9,7 @@
 //! toolbar would: the schematic's tools in the schematic, the board's on the
 //! board.
 //!
-//! It declares no feature of its own — `includes` is still [`no_features`], so
+//! It declares no feature of its own — `includes` is still `no_features`, so
 //! the creation palette offers nothing here — but it is no longer true that
 //! nothing on this row builds one. After its own buttons the row carries
 //! Assembly's ADD COMPONENT, BORROWED rather than copied ([`super::BORROWED`]): the very button Assembly

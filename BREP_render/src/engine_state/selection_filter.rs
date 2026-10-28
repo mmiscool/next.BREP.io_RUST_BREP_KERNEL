@@ -20,7 +20,7 @@ pub struct SelectionFilter {
     /// synthesized sheet SOLID (`SolidDisplay::is_sketch`), so it arrives from the
     /// ray test as an ordinary [`pick::PickKind::Solid`] candidate — the two share
     /// a `PickKind` and are told apart by that flag, not by the picker (see
-    /// [`EngineState::candidate_admitted`]). Splitting them into two lanes is what
+    /// `EngineState::candidate_admitted`). Splitting them into two lanes is what
     /// lets a `["SKETCH"]` reference field pick a sketch in the viewport while a
     /// `["SOLID"]` one (a boolean target, a mirror body) does not — a sketch sheet
     /// registers no KERNEL solid, so a sketch name in a `SOLID` field could never
@@ -71,7 +71,7 @@ impl Default for SelectionFilter {
 impl SelectionFilter {
     /// The enabled kinds as pick-filter strings, highest pick-priority FIRST
     /// (`VERTEX > EDGE > FACE > PLANE > SOLID`) — the shape
-    /// [`EngineState::pick_top_at`] / [`pick::pick_filtered`] consume.
+    /// `EngineState::pick_top_at` / [`pick::pick_filtered`] consume.
     /// EMPTY when nothing is enabled; the caller MUST treat an empty result as
     /// "select nothing" (NOT the "empty filter = any kind" case).
     pub fn enabled_kinds(&self) -> Vec<String> {
@@ -191,7 +191,7 @@ impl SelectionFilter {
 
 impl EngineState {
     /// The current selection filter (a cheap `Copy`) — a panel reads it to seed
-    /// its toggles, edits the copy, and writes back via [`set_selection_filter`].
+    /// its toggles, edits the copy, and writes back via [`set_selection_filter`](Self::set_selection_filter).
     pub fn selection_filter(&self) -> SelectionFilter {
         self.selection_filter
     }
@@ -223,7 +223,7 @@ impl EngineState {
     }
 
     /// Apply a partial filter JSON (any subset of the keys); absent keys keep
-    /// their current value. The round-trip counterpart of [`selection_filter_json`].
+    /// their current value. The round-trip counterpart of [`selection_filter_json`](Self::selection_filter_json).
     pub fn apply_selection_filter_json(&mut self, json: &str) -> Result<(), String> {
         let value: serde_json::Value = serde_json::from_str(json)
             .map_err(|error| format!("selection filter parse: {error}"))?;
@@ -235,9 +235,9 @@ impl EngineState {
         Ok(())
     }
 
-    /// The filter-honoring plain-click selection (what [`select_top_at`] delegates
+    /// The filter-honoring plain-click selection (what [`select_top_at`](Self::select_top_at) delegates
     /// to): resolve the TOP-priority candidate under `(x, y)` whose kind the filter
-    /// admits (via [`pick_top_at`](Self::pick_top_at) with the enabled kinds —
+    /// admits (via `pick_top_at` with the enabled kinds —
     /// scene entities AND construction plane cards) and select THAT kind, replacing
     /// the current selection. A miss — or a click while the filter
     /// admits nothing — clears the selection. Returns whether something selected.

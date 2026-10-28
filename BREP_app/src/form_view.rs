@@ -438,7 +438,10 @@ fn draw_field(
     // collide when two subjects share a param name — switching between two
     // extrudes mid-edit must not hand one's half-typed `distance` to the other.
     // `make_persistent_id` folds in the ui id-stack only.
-    ui.push_id((spec.title, field.key()), |ui| {
+    // The FULL path, not the last segment: a nested form (CAM's operation
+    // dialog) has `leadIn.kind` and `ramp.kind` on one subject, which would
+    // otherwise share an id. A single-segment path is its key, as before.
+    ui.push_id((spec.title, field.path.join(".")), |ui| {
         let (changed, r) =
             form::field_input_with(ui, field, params, Some(&mut probe), &mut actions, spec.picking);
         out.changed |= changed;

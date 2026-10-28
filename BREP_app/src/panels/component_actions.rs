@@ -28,8 +28,15 @@ pub enum ComponentAction {
     /// and the assembly picks the change up through the outdated badge /
     /// `panels::update_components` once the part is saved.
     OpenPart,
+    /// Make the component's part the Work part, in place in the assembly tab
+    /// (shell-side, like the BOM row's double click).
+    WorkPart,
     /// Fix ⇄ Unfix (writes `isFixed` on the owning ACOMP; re-runs + re-solves).
     ToggleFixed,
+    /// Replace the part this occurrence shows with another (shell-side: the
+    /// chooser lives in the shell). Mates survive by face name when the parts
+    /// share lineage; the rest are held and listed.
+    Replace,
     /// Delete the owning ACOMP feature (the library entry GC's kernel-side when
     /// its last instance goes).
     Delete,
@@ -37,10 +44,12 @@ pub enum ComponentAction {
 
 impl ComponentAction {
     /// Every action, in bar order.
-    pub const ALL: [ComponentAction; 5] = [
+    pub const ALL: [ComponentAction; 7] = [
         ComponentAction::Move,
         ComponentAction::MoveCopy,
         ComponentAction::OpenPart,
+        ComponentAction::WorkPart,
+        ComponentAction::Replace,
         ComponentAction::ToggleFixed,
         ComponentAction::Delete,
     ];
@@ -51,6 +60,8 @@ impl ComponentAction {
             ComponentAction::Move => "move",
             ComponentAction::MoveCopy => "move-copy",
             ComponentAction::OpenPart => "open-part",
+            ComponentAction::WorkPart => "work-part",
+            ComponentAction::Replace => "replace",
             ComponentAction::ToggleFixed => "toggle-fixed",
             ComponentAction::Delete => "delete",
         }
@@ -67,6 +78,8 @@ impl ComponentAction {
             ComponentAction::Move => "\u{2725} Move",
             ComponentAction::MoveCopy => "\u{29C9} Move Copy",
             ComponentAction::OpenPart => "\u{270E} Edit Part",
+            ComponentAction::WorkPart => "\u{25CE} Make Work Part",
+            ComponentAction::Replace => "\u{21C4} Replace\u{2026}",
             ComponentAction::ToggleFixed => {
                 if fixed {
                     "\u{1F513} Unfix"
@@ -86,6 +99,10 @@ impl ComponentAction {
                 "Add another instance of this part and drag it into place with the move gizmo"
             }
             ComponentAction::OpenPart => "Open the part's source document in its own tab",
+            ComponentAction::WorkPart => "Edit this part here, in the context of the assembly",
+            ComponentAction::Replace => {
+                "Show another part here (a family member, a variation, any part); mates keep their faces by name"
+            }
             ComponentAction::ToggleFixed => "Ground / free this instance for the solver",
             ComponentAction::Delete => "Delete this component instance",
         }
@@ -97,6 +114,11 @@ impl ComponentAction {
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum ComponentActionRequest {
     OpenPart { component_id: String },
+    /// Open the Replace component chooser for this occurrence.
+    Replace { component_id: String },
+    /// Make `component_path` the Work part — in place inside the assembly
+    /// tab, or (`in_place: false`) in a tab of its own.
+    WorkPart { component_path: String, in_place: bool },
 }
 
 /// Run `action` on the component owned by ACOMP feature `component_id`.
@@ -118,6 +140,17 @@ pub fn run_component_action(
             // The copy is free even off a fixed source; the engine toasts an
             // unknown id itself.
             let _ = state.component_move_copy(component_id);
+            None
+        }
+        ComponentAction::ToggleFixed if component_id.contains(':') => {
+            // A nested occurrence: fixed or freed on the instance that lends
+            // it; a rigid level above it says why it cannot be.
+            let toggled = state
+                .occurrence_fixed(component_id)
+                .and_then(|fixed| state.set_component_fixed(component_id, !fixed));
+            if let Err(error) = toggled {
+                state.push_notice(error);
+            }
             None
         }
         ComponentAction::ToggleFixed => {
@@ -147,6 +180,13 @@ pub fn run_component_action(
         }
         ComponentAction::OpenPart => Some(ComponentActionRequest::OpenPart {
             component_id: component_id.to_string(),
+        }),
+        ComponentAction::Replace => Some(ComponentActionRequest::Replace {
+            component_id: component_id.to_string(),
+        }),
+        ComponentAction::WorkPart => Some(ComponentActionRequest::WorkPart {
+            component_path: component_id.to_string(),
+            in_place: true,
         }),
     }
 }

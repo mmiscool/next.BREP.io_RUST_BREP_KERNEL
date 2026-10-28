@@ -259,6 +259,7 @@ pub(super) fn seam_lifted_carrier(
 /// says so, because every uv the imprint reads for that face (the clip's
 /// containment, the section's pcurves) must be read in that frame and not in
 /// the carrier's. Escape hatch `BREP_MARCH_SEAM_LIFT=0` restores the clamp.
+#[derive(Clone)]
 pub(super) struct MarchWindow {
     pub(super) surface: NurbsSurface,
     /// The window's frame is the trim's, a period off the carrier's on one
@@ -281,6 +282,60 @@ pub(super) fn chart_of<'a>(
     face: &'a FaceRecord,
 ) -> &'a NurbsSurface {
     charts.get(&key).copied().unwrap_or(&face.surface)
+}
+
+thread_local! {
+    /// [`restricted_carrier`]'s window per face content (`hash_face`: carrier,
+    /// sense, every loop's coedge senses and pcurves) and the two hatches it
+    /// reads. The fillet's cutter composition hands the same body, less a few
+    /// faces, to boolean after boolean: on the sprocket report (1d179b4a) F9's
+    /// 35 imprints rebuilt ~280 unchanged windows each, 1.65 s of its 4.84 s.
+    static WINDOW_MEMO: std::cell::RefCell<HashMap<[u64; 2], Option<MarchWindow>>> = std::cell::RefCell::new(HashMap::default());
+    static WINDOW_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Drop every memoised window (`reading_memo::clear`).
+pub(crate) fn clear_window_memo() {
+    WINDOW_MEMO.with(|memo| memo.borrow_mut().clear());
+}
+
+/// Windows built (memo misses and unmemoised reads) since the thread started.
+pub(super) fn window_reads() -> usize {
+    WINDOW_READS.with(|reads| reads.get())
+}
+
+/// [`restricted_carrier`] served from [`WINDOW_MEMO`] when a face of the same
+/// content was windowed before. Off under `BREP_IMPRINT_WINDOW_MEMO=0` or the
+/// reading memo's own hatch (`BREP_READING_MEMO=0`), and while the overhang
+/// census prints (`BREP_DEBUG_OVERHANG`).
+pub(super) fn restricted_carrier_memoized(face: &FaceRecord) -> Option<MarchWindow> {
+    let enabled = crate::reading_memo::memo_on()
+        && std::env::var("BREP_IMPRINT_WINDOW_MEMO").as_deref() != Ok("0")
+        && std::env::var_os("BREP_DEBUG_OVERHANG").is_none();
+    if !enabled {
+        WINDOW_READS.with(|reads| reads.set(reads.get() + 1));
+        return restricted_carrier(face);
+    }
+    let mut lane = crate::mass_properties::TwoLane::new();
+    crate::mass_properties::hash_face(&mut lane, face);
+    lane.bool(std::env::var("BREP_MARCH_SEAM_LIFT").as_deref() != Ok("0"));
+    lane.bool(std::env::var("BREP_RESTRICT_WRAP_GUARD").as_deref() != Ok("0"));
+    let key = lane.finish();
+    if let Some(window) = WINDOW_MEMO.with(|memo| memo.borrow().get(&key).cloned()) {
+        crate::reading_memo::note(true);
+        return window;
+    }
+    crate::reading_memo::note(false);
+    WINDOW_READS.with(|reads| reads.set(reads.get() + 1));
+    let window = restricted_carrier(face);
+    WINDOW_MEMO.with(|memo| {
+        let mut memo = memo.borrow_mut();
+        if memo.len() >= 4096 {
+            memo.clear();
+        }
+        memo.insert(key, window.clone());
+    });
+    window
 }
 
 pub(super) fn restricted_carrier(face: &FaceRecord) -> Option<MarchWindow> {
@@ -1046,7 +1101,13 @@ pub(super) fn curve_spans_on_face(
     tolerance: f64,
     whole_only: bool,
 ) -> Result<Vec<NurbsCurve>, KernelRefusal> {
-    if curve_lies_on_surface(&curve, &face.surface, tolerance)? {
+    let split_clock = profile_enabled().then(Instant::now);
+    let whole = curve_lies_on_surface(&curve, &face.surface, tolerance)?;
+    if let Some(started) = split_clock {
+        let elapsed = started.elapsed();
+        imprint_split_add(|split| { split.lies_whole += elapsed; split.lies_whole_calls += 1; split.lies_whole_hits += whole as u64; });
+    }
+    if whole {
         return Ok(vec![curve]);
     }
     if whole_only {
@@ -1063,6 +1124,18 @@ pub(super) fn curve_spans_after_whole_miss(
     if std::env::var("BREP_LIES_ON_SPANS").as_deref() == Ok("0") {
         return Ok(Vec::new());
     }
+    let split_clock = profile_enabled().then(Instant::now);
+    let spans = curve_spans_after_whole_miss_impl(curve, face, face_edges, tolerance);
+    if let Some(started) = split_clock {
+        let elapsed = started.elapsed();
+        imprint_split_add(|split| { split.lies_span += elapsed; split.lies_span_calls += 1; });
+    }
+    spans
+}
+
+fn curve_spans_after_whole_miss_impl(
+    curve: NurbsCurve, face: &FaceRecord, face_edges: &[&EdgeRecord], tolerance: f64,
+) -> Result<Vec<NurbsCurve>, KernelRefusal> {
     let hull = |curve: &NurbsCurve| -> Result<Aabb, KernelRefusal> {
         let points = curve
             .control_points
@@ -1934,5 +2007,6 @@ pub(super) fn cosurface_pair(
     }
     Ok(true)
 }
+
 
 

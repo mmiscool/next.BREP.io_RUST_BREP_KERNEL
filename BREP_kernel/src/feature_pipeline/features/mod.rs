@@ -41,6 +41,7 @@ pub mod tube;
 pub mod boolean;
 pub mod mirror;
 pub mod pattern;
+pub mod assembly_pattern;
 pub mod split;
 pub mod transform;
 
@@ -59,6 +60,7 @@ pub mod transform_face;
 // Imported geometry and sheet metal.
 pub mod import3d;
 pub mod sheet_metal_contour_flange;
+pub mod sheet_metal_closed_corner;
 pub mod sheet_metal_corner;
 pub mod sheet_metal_cutout;
 pub mod sheet_metal_flange;

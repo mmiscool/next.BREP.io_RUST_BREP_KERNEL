@@ -52,6 +52,10 @@ impl PlmTransport for EhttpTransport {
             if let Some(waker) = waker {
                 waker.wake();
             }
+            // The panels poll their requests each frame, several with a no-op
+            // waker; the app draws a frame only on input or a request, so an
+            // answer that lands while it is idle must ask for one itself.
+            crate::store::wake_ui();
         });
         Box::pin(Answer { slot })
     }

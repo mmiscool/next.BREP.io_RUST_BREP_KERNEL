@@ -18,7 +18,7 @@
 //! having read nothing but two absent files — the file-based app of today. An
 //! empty variable counts as unset, so `BREP_PLM_URL= brep-app` is the file app.
 //!
-//! [`write`] and [`forget`] are what `brep-app --plm-configure` / `--plm-forget`
+//! [`write()`] and [`forget`] are what `brep-app --plm-configure` / `--plm-forget`
 //! run, so an installer script configures a machine with no prompt and no
 //! hand-written JSON (plan S12).
 

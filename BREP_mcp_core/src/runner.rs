@@ -64,8 +64,7 @@ pub struct RunResult {
     pub video: Option<VideoResult>,
 }
 
-/// The step the runner answers itself, from the script's PLM fixture.
-pub const PLM_REQUEST: &str = "plm_request";
+pub use crate::script::{PLM_REQUEST, PLM_SERVER};
 
 pub struct RunOptions {
     pub out_dir: PathBuf,
@@ -80,6 +79,14 @@ pub struct RunOptions {
     /// The script's PLM server, when it declares one: `plm_request` steps are
     /// answered from it, and `${plm:NAME}` resolves in every step's strings.
     pub plm: Option<std::sync::Arc<crate::plm_fixture::PlmFixture>>,
+}
+
+/// `__brepPerf.staleFrames` when the session's app publishes it (automation
+/// builds carry the check), else None.
+async fn stale_frames(tools: &ToolSet) -> Option<u64> {
+    let get = tools.get("state_get")?;
+    let out = (get.handler)(json!({ "names": ["__brepPerf"] })).await.ok()?;
+    out.json.get("__brepPerf")?.get("staleFrames")?.as_u64()
 }
 
 /// Play `script` through `tools`. Returns the result (also written to
@@ -100,6 +107,7 @@ pub async fn run(script: &Script, tools: &ToolSet, opts: &RunOptions) -> RunResu
     // cannot stand in for it.
     let mut framed = 0usize;
     let mut recording_failed = false;
+    let stale_before = stale_frames(tools).await;
     for (index, step) in script.steps.iter().enumerate() {
         if Instant::now() > deadline {
             steps.push(StepResult {
@@ -206,6 +214,30 @@ pub async fn run(script: &Script, tools: &ToolSet, opts: &RunOptions) -> RunResu
                 break;
             }
         }
+    }
+    // THE STALE-FRAME CHECK: the app counts frames whose render inputs changed
+    // without a render (a producer that forgot to mark the frame dirty). The
+    // count is process-wide, so the script is charged with what it added.
+    match (stale_before, stale_frames(tools).await) {
+        (Some(before), Some(after)) => {
+            eprintln!("stale-frame check: {} {}", script.name, after - before);
+            if after > before {
+                steps.push(StepResult {
+                    index: script.steps.len(),
+                    tool: "stale-frame check".into(),
+                    outcome: Outcome::ExpectationFailed,
+                    elapsed_ms: 0,
+                    failures: vec![format!(
+                        "{} frame(s) changed what the viewport draws without a render (BREP_STALE_FRAME lines on stderr name the inputs)",
+                        after - before
+                    )],
+                    image: None,
+                    diff_ratio: None,
+                });
+                failed_step.get_or_insert(script.steps.len());
+            }
+        }
+        _ => eprintln!("stale-frame check: {} unavailable", script.name),
     }
     let mut video = None;
     if let Some(spec) = &script.video {
@@ -463,9 +495,17 @@ async fn run_step(
     // script's PLM fixture, not by the app, so a script can seed the server
     // and read back what the app wrote. Any HTTP status is a result the step's
     // `expect` reads (`/status`, `/json/...`); only no answer is an error.
-    if step.tool == PLM_REQUEST {
+    if step.tool == PLM_REQUEST || step.tool == PLM_SERVER {
         let outcome = match &opts.plm {
-            None => Err("`plm_request` needs the script to declare `plm`".to_string()),
+            None => Err(format!("`{}` needs the script to declare `plm`", step.tool)),
+            Some(plm) if step.tool == PLM_SERVER => {
+                let plm = plm.clone();
+                let action = step_args["action"].as_str().unwrap_or_default().to_string();
+                match tokio::task::spawn_blocking(move || plm.server(&action)).await {
+                    Ok(answer) => answer,
+                    Err(e) => Err(e.to_string()),
+                }
+            }
             Some(plm) => match serde_json::from_value::<crate::script::PlmCall>(step_args) {
                 Err(e) => Err(format!("plm_request arguments: {e}")),
                 Ok(call) => {
@@ -498,6 +538,13 @@ async fn run_step(
                 res.failures.push(format!("expected the tool to fail with `{pattern}` but it succeeded"));
             }
             (None, None) => {
+                // `bind` here too: this branch returns before the app tools'
+                // bind below, which used to drop a plm_request's bind silently.
+                if let (Some(plm), false) = (&opts.plm, step.bind.is_empty()) {
+                    if let Err(e) = plm.bind(&output.json, &step.bind) {
+                        res.failures.push(e);
+                    }
+                }
                 for e in &expects {
                     if let Err(why) = e.check(&output.json) {
                         res.failures.push(why);

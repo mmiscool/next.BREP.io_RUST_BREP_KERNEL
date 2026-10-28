@@ -15,7 +15,7 @@
 //! | `ui.notify(text)` | a message for the user, kept with the outcome for the host to show |
 //!
 //! There are NO `plm.*` bindings yet. They arrive with the PLM transport (S1),
-//! and every one of them will need a signed-in session; [`PLM_BINDINGS`] names
+//! and every one of them will need a signed-in session; [`PLM_BINDINGS`](crate::scripting::PLM_BINDINGS) names
 //! them so a script can be told which of its calls need a server. Until then a
 //! script that reaches for `plm` finds it undefined, which is also exactly
 //! what it finds with no server connected — the file-only case is the only

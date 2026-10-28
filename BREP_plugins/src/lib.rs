@@ -124,6 +124,18 @@ pub struct AnnotationRegistration {
     pub input_params_schema: Value,
     pub package: PluginPin,
 }
+/// A CAM post-processor a package ships: `module` names the package-local
+/// script (a `post.define({...})` file for BREP_cam's post host). The package
+/// runtime only registers it; the CAM workbench reads the module text and
+/// runs it on BREP_cam's post runtime.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PostRegistration {
+    pub id: String,
+    pub label: String,
+    pub module: String,
+    pub package: PluginPin,
+}
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PanelRegistration {
@@ -169,12 +181,17 @@ pub struct Registry {
     panels: Vec<PanelRegistration>,
     #[serde(default)]
     annotations: Vec<AnnotationRegistration>,
+    #[serde(default)]
+    posts: Vec<PostRegistration>,
     packages: Vec<PluginPin>,
     revision: String,
 }
 impl Registry {
     pub fn panels(&self) -> &[PanelRegistration] {
         &self.panels
+    }
+    pub fn posts(&self) -> &[PostRegistration] {
+        &self.posts
     }
     pub fn annotations(&self) -> &[AnnotationRegistration] {
         &self.annotations
@@ -206,6 +223,7 @@ impl Registry {
             result.workbenches.extend(r.workbenches);
             result.panels.extend(r.panels);
             result.annotations.extend(r.annotations);
+            result.posts.extend(r.posts);
         }
         result.revision = format!("{:x}", Sha256::digest(serde_json::to_vec(&result).unwrap()));
         Ok(result)
@@ -227,6 +245,7 @@ impl Registry {
         r.workbenches.retain(|x| pins.contains(&x.package));
         r.panels.retain(|x| pins.contains(&x.package));
         r.annotations.retain(|x| pins.contains(&x.package));
+        r.posts.retain(|x| pins.contains(&x.package));
         r.revision = format!("{:x}", Sha256::digest(serde_json::to_vec(&r).unwrap()));
         Ok(r)
     }
@@ -316,6 +335,7 @@ impl Runtime {
             .chain(registry.workbenches.iter().map(|r| (&r.id, &r.package)))
             .chain(registry.panels.iter().map(|r| (&r.id, &r.package)))
             .chain(registry.annotations.iter().map(|r| (&r.id, &r.package)))
+            .chain(registry.posts.iter().map(|r| (&r.id, &r.package)))
         {
             if !pins.contains(pin) || !id.starts_with(&format!("{}/", pin.id)) {
                 return Err("validated registry ownership mismatch".into());

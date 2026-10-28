@@ -120,7 +120,7 @@ pub(super) fn coedge_to_vertex(coedge: &CoedgeRecord, edges: &HashMap<u64, EdgeR
 /// a fold or a crossing changes the AREA where it does not change the volume,
 /// so no closed-form oracle downstream notices. [`crate::accept_sound`] is
 /// that floor, and it runs on the way out of the public entry only — the
-/// set driver's chain calls [`delete_face_and_heal_impl`] so a ten-face
+/// set driver's chain calls `delete_face_and_heal_impl` so a ten-face
 /// selection pays for one scan and not ten.
 pub fn delete_face_and_heal(solid: &BrepSolid, face_id: u64) -> Result<BrepSolid, KernelRefusal> {
     crate::accept_sound(delete_face_and_heal_impl(solid, face_id)?, "deleteFace")

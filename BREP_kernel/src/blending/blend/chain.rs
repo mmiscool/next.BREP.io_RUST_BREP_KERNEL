@@ -32,7 +32,7 @@ use open::blend_open_smooth_chain;
 /// The declared wall reading, shared with the closed-edge lane's wall verdict.
 pub(in crate::blend) use closed::{
     centre_path_node, declared_wall_probe, declared_wall_probe_at_why, declared_wall_probe_located, declared_wall_probe_located_why,
-    declared_wall_probe_why,
+    declared_wall_probe_why, PreparedWall,
 };
 /// The support-piece pcurve fitter, shared with the closed-edge lane.
 pub(in crate::blend) use closed::{pcurve_guide, project_piece_pcurve, project_piece_pcurve_within, project_piece_pcurve_within_knot_retry};

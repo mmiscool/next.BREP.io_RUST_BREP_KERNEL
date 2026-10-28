@@ -46,7 +46,7 @@ pub fn fetch(client: Rc<PlmClient>, url: String) -> PlmFuture<Option<Vec<u8>>> {
     })
 }
 
-fn decode(bytes: &[u8]) -> Option<egui::ColorImage> {
+pub(crate) fn decode(bytes: &[u8]) -> Option<egui::ColorImage> {
     if bytes.len() > MAX_BYTES {
         return None;
     }

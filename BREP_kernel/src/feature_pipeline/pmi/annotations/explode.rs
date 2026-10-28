@@ -72,7 +72,7 @@ fn resolve(annotation: &PmiAnnotation, context: &PmiContext<'_>) -> Result<Resol
         if let Some(handle) = context.scene.resolve_solid(target) {
             solids.push((target.clone(), handle));
         } else if crate::is_component_reference(crate::split_component_namespace(target).1) {
-            let members = context.scene.component_solids(target);
+            let members = context.scene.occurrence_solids(target);
             if members.is_empty() {
                 return Err(format!("component '{target}' has no solids"));
             }

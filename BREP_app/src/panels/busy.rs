@@ -124,6 +124,9 @@ pub fn engine_activities(engine: &EngineState, document: u64, title: Option<&str
     if engine.topology_pending() {
         push("topology", of("Loading exact geometry"), false);
     }
+    if crate::plm::tool_pictures::pending() > 0 {
+        push("toolPictures", of("Loading tool pictures"), false);
+    }
     if engine.queries_pending() {
         push("query", of("Measuring"), false);
     }
@@ -203,6 +206,20 @@ impl BusyIndicator {
         } else {
             format!("{}…", activity.label)
         }
+    }
+
+    /// For a frame the status bar is not drawn (a focused reference pick).
+    pub fn clear_hits(&mut self) {
+        self.hits.clear();
+    }
+
+    /// Leave room for the compact selection-filter menu, even with a long label.
+    pub fn show_status_bar(&mut self, ui: &mut egui::Ui) {
+        let busy_width = (ui.available_width() - 100.0).max(0.0);
+        ui.scope(|ui| {
+            ui.set_max_width(busy_width);
+            self.show(ui);
+        });
     }
 
     /// Draw the indicator into a RIGHT-TO-LEFT ui (the status bar's right

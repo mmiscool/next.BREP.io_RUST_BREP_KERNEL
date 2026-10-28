@@ -9,6 +9,10 @@
 //! sprocket report the same uses were fitted and thrown away on every
 //! boolean of F9's cutter composition, 5.6 s of its 32 s.
 //!
+//! The imprint's per-face march windows (`imprint::support::WINDOW_MEMO`,
+//! keyed on the face's content) are cleared here too: the same report's 35
+//! imprints rebuilt ~280 unchanged windows each, 1.65 s of F9.
+//!
 //! The refit's two scope readings — a candidate's standoff from its own
 //! carrier and its edge's claim against every incident carrier — are served
 //! the same way (the claim from `heal::claim_memo`, keyed on every use of the
@@ -191,6 +195,8 @@ pub(crate) fn clear() {
     FOLD_TERMS.with(|memo| { if let Some(memo) = memo.borrow_mut().as_mut() { memo.clear(); } });
     crate::heal::clear_claim_memo();
     crate::boolean::clear_candidate_memo();
+    crate::imprint::clear_window_memo();
+    crate::imprint::clear_touch_memo();
 }
 
 /// `(hits, misses)` since the thread started — for a profile line or a test.

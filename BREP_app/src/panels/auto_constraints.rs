@@ -3,7 +3,7 @@
 //! An imported STEP assembly is fully posed and completely unconstrained: every
 //! part sits where the file put it, and nothing holds it there. This window
 //! reads that placement back as constraint intent — the kernel's inference lane
-//! ([`brep_kernel::feature_pipeline::assembly::infer`], reached through
+//! (`brep_kernel::feature_pipeline::assembly::infer`, reached through
 //! [`EngineState::assembly_infer_constraints`]) — so an import becomes an
 //! editable assembly without re-picking every mate by hand.
 //!

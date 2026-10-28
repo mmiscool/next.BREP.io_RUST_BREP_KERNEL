@@ -16,6 +16,24 @@ pub(super) struct RawMesh {
     pub object_id: u32,
     pub positions: Vec<f64>,
     pub indices: Vec<u32>,
+    /// The object's own `pid`/`pindex`: the property every triangle inherits
+    /// unless it states one.
+    pub object_property: Option<Property>,
+    /// One entry per triangle: its own `pid`/`p1`, or `None` to inherit.
+    /// Resolved against [`ModelDocument::materials`] once the whole part is
+    /// read, since the specification lets a group follow the objects that
+    /// name it.
+    pub properties: Vec<Option<Property>>,
+}
+
+/// A property reference as a triangle or object states it: the group id and
+/// the index into that group. Only a group that is a `<basematerials>` can be
+/// resolved to a colour; a reference into an extension's colour group or
+/// texture stays unresolved.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Property {
+    pub group: u32,
+    pub index: u32,
 }
 
 pub(super) struct Component {
@@ -51,12 +69,33 @@ pub(super) struct ModelDocument {
     pub objects: Vec<Object>,
     pub by_id: FxHashMap<u32, usize>,
     pub items: Vec<Item>,
+    /// Every `<basematerials>` group by id: each `<base>`'s `displaycolor` as
+    /// 8-bit sRGB, or `None` for one that does not spell `#RRGGBB[AA]`.
+    pub materials: FxHashMap<u32, Vec<Option<[u8; 3]>>>,
 }
 
 impl ModelDocument {
     pub fn object(&self, id: u32) -> Option<&Object> {
         self.by_id.get(&id).map(|index| &self.objects[*index])
     }
+
+    /// The colour a property reference names, if it names a base material.
+    pub fn color(&self, property: Option<Property>) -> Option<[u8; 3]> {
+        let property = property?;
+        self.materials.get(&property.group)?.get(property.index as usize).copied().flatten()
+    }
+}
+
+/// `#RRGGBB` or `#RRGGBBAA` (the alpha is dropped), either case. Anything
+/// else — a named colour, a short form — is `None`: the base is kept so the
+/// indices of its neighbours stay right, it just carries no colour.
+pub(super) fn parse_display_color(text: &str) -> Option<[u8; 3]> {
+    let hex = text.trim().strip_prefix('#')?;
+    if hex.len() != 6 && hex.len() != 8 {
+        return None;
+    }
+    let channel = |at: usize| u8::from_str_radix(hex.get(at..at + 2)?, 16).ok();
+    Some([channel(0)?, channel(2)?, channel(4)?])
 }
 
 /// The reader plus the part name every error is reported against.
@@ -126,6 +165,15 @@ impl<'a> ModelParser<'a> {
             Ok(value) => Ok(value),
             _ => self.fail(format!("<{}> has an invalid {name}=\"{text}\"", tag.name)),
         }
+    }
+
+    /// A property reference (`pid` + `pindex`, or `pid` + `p1`): `None` when
+    /// the element states none. A malformed one is `None` too, never a
+    /// refusal — a property is appearance, not geometry.
+    fn property(&self, tag: &StartTag, index_name: &str) -> Option<Property> {
+        let group = tag.attribute("pid")?.trim().parse::<u32>().ok()?;
+        let index = tag.attribute(index_name)?.trim().parse::<u32>().ok()?;
+        Some(Property { group, index })
     }
 
     /// The optional 3x4 `transform`, defaulting to the identity.
@@ -211,6 +259,7 @@ pub(super) fn parse_model(part: &str, text: &str) -> Result<ModelDocument, Three
         objects: Vec::new(),
         by_id: FxHashMap::default(),
         items: Vec::new(),
+        materials: FxHashMap::default(),
     };
     let mut saw_build = false;
     loop {
@@ -261,8 +310,10 @@ fn parse_resources(
                 }
                 match tag.name.as_str() {
                     "object" => parse_object(parser, &tag, document)?,
-                    // <basematerials> and the colour groups are properties, not
-                    // geometry: ignored by design.
+                    // The core specification's one property group. The
+                    // extension's colour groups, textures and composites are
+                    // in another namespace and were skipped above.
+                    "basematerials" => parse_base_materials(parser, &tag, document)?,
                     _ => parser.skip(&tag)?,
                 }
             }
@@ -271,6 +322,39 @@ fn parse_resources(
             Event::Eof => return parser.fail("the part ends inside <resources>"),
         }
     }
+}
+
+/// `<basematerials id>` → its `<base displaycolor>`s, in order. A group with
+/// an unreadable id is skipped (no triangle can name it); a repeated id keeps
+/// the first definition.
+fn parse_base_materials(
+    parser: &mut ModelParser<'_>,
+    group: &StartTag,
+    document: &mut ModelDocument,
+) -> Result<(), ThreeMfError> {
+    let id = group.attribute("id").and_then(|text| text.trim().parse::<u32>().ok());
+    let mut colors = Vec::new();
+    if !group.empty {
+        loop {
+            match parser.next()? {
+                Event::Start(tag) => {
+                    if tag.namespace == CORE_NAMESPACE && tag.name == "base" {
+                        colors.push(tag.attribute("displaycolor").and_then(parse_display_color));
+                        parser.close_leaf(&tag)?;
+                    } else {
+                        parser.skip(&tag)?;
+                    }
+                }
+                Event::End { name } if name == "basematerials" => break,
+                Event::End { .. } => {}
+                Event::Eof => return parser.fail("the part ends inside <basematerials>"),
+            }
+        }
+    }
+    if let Some(id) = id {
+        document.materials.entry(id).or_insert(colors);
+    }
+    Ok(())
 }
 
 fn parse_object(
@@ -282,6 +366,7 @@ fn parse_object(
     if document.by_id.contains_key(&id) {
         return parser.fail(format!("object id {id} is defined twice"));
     }
+    let object_property = parser.property(object, "pindex");
     let model_type = match object.attribute("type") {
         None | Some("model") => true,
         Some("solidsupport" | "support" | "surface" | "other") => false,
@@ -306,7 +391,7 @@ fn parse_object(
                             return parser
                                 .fail(format!("object {id} has more than one geometry element"));
                         }
-                        let mesh = parse_mesh(parser, &tag, id, model_type)?;
+                        let mesh = parse_mesh(parser, &tag, id, model_type, object_property)?;
                         document.meshes.push(mesh);
                         content = Some(ObjectContent::Mesh(document.meshes.len() - 1));
                     }
@@ -345,9 +430,11 @@ fn parse_mesh(
     mesh: &StartTag,
     object_id: u32,
     model_type: bool,
+    object_property: Option<Property>,
 ) -> Result<RawMesh, ThreeMfError> {
     let mut positions = Vec::<f64>::new();
     let mut indices = Vec::<u32>::new();
+    let mut properties = Vec::<Option<Property>>::new();
     if !mesh.empty {
         loop {
             match parser.next()? {
@@ -358,7 +445,9 @@ fn parse_mesh(
                     }
                     match tag.name.as_str() {
                         "vertices" => parse_vertices(parser, &tag, object_id, &mut positions)?,
-                        "triangles" => parse_triangles(parser, &tag, object_id, &mut indices)?,
+                        "triangles" => {
+                            parse_triangles(parser, &tag, object_id, &mut indices, &mut properties)?
+                        }
                         // <beamlattice> is an extension; anything else here is
                         // not geometry the core spec defines.
                         _ => parser.skip(&tag)?,
@@ -397,7 +486,7 @@ fn parse_mesh(
             indices.len() / 3
         ));
     }
-    Ok(RawMesh { object_id, positions, indices })
+    Ok(RawMesh { object_id, positions, indices, object_property, properties })
 }
 
 fn parse_vertices(
@@ -449,6 +538,7 @@ fn parse_triangles(
     triangles: &StartTag,
     object_id: u32,
     indices: &mut Vec<u32>,
+    properties: &mut Vec<Option<Property>>,
 ) -> Result<(), ThreeMfError> {
     if triangles.empty {
         return Ok(());
@@ -472,12 +562,15 @@ fn parse_triangles(
                         ),
                     });
                 }
-                // v1/v2/v3 are the geometry; p1/p2/p3 and pid are material
-                // properties and are ignored by design.
+                // v1/v2/v3 are the geometry. pid/p1 is the triangle's own
+                // property (a base material resolves to a colour; p2/p3 may
+                // only differ for an extension's per-vertex groups, which are
+                // not read); without one the triangle inherits its object's.
                 let v1 = parser.index(&tag, "v1")?;
                 let v2 = parser.index(&tag, "v2")?;
                 let v3 = parser.index(&tag, "v3")?;
                 indices.extend([v1, v2, v3]);
+                properties.push(parser.property(&tag, "p1"));
                 parser.close_leaf(&tag)?;
             }
             Event::End { name } if name == "triangles" => return Ok(()),

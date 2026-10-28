@@ -67,7 +67,7 @@ mod native {
     /// needs no registration.
     ///
     /// A TYPE, not just the one static, so a unit test can count into a tally
-    /// of its own: the process-global [`TALLY`] is also where every history the
+    /// of its own: the process-global `TALLY` is also where every history the
     /// crate's other tests run folds (`pipeline.rs` opens `span("runner")`), and
     /// a test that counted there read another test's run as its own (runner 3
     /// against an expected 2, once in a gate).

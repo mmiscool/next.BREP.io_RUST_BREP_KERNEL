@@ -14,13 +14,23 @@ pub mod transport;
 pub mod adoption;
 pub mod kicad;
 pub mod uses;
+/// Embedded copies of PLM parts as a cache of their revisions (refreshed on open).
+pub mod cached_copies;
+/// Embedded copies pinned to a superseded or obsolete PLM revision.
+pub mod superseded;
 /// The bake worker (S10): open a queued member, build it, report.
 pub mod bake;
 /// Families and templates on a PLM store (S9): Generate, members, spin-out.
 pub mod family;
+/// Parts with no document of their own become items (an assembly's Save).
+pub mod promote;
 /// Revision thumbnails (P9): the picture a save makes and uploads.
 pub mod thumbnail;
+/// The instructions player's data a save of an instructions revision makes
+/// and uploads.
+pub mod player_data;
 pub mod thumbnail_view;
+pub mod tool_pictures;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod native;
 

@@ -510,7 +510,7 @@ pub(in crate::boolean) fn reconstruct_edges_from_carriers_in(
         }
     }
 
-    if std::env::var("BREP_PROFILE").is_ok() {
+    if crate::imprint::profile_enabled() {
         let work = RESIDUAL_WORK.with(|work| work.get());
         eprintln!("assemble.reconstruct.work queries={} readings={} projections={}", RESIDUAL_QUERIES.with(|queries| queries.get()) - queries_before, work.0 - work_before.0, work.1 - work_before.1);
     }

@@ -58,6 +58,13 @@ pub(super) struct ResolvedElement {
     pub world: SelectionGeometry,
     pub local: SelectionGeometry,
     pub transform: AffineTransform,
+    /// An edge selection's carrier over its range, component-LOCAL — what the
+    /// curve mates (path) follow. `None` for anything but an edge.
+    pub curve: Option<crate::MateCurve>,
+    /// The edge is neither straight nor circular: it resolves (as its chord
+    /// midpoint) only so a curve mate can follow it; every other type refuses
+    /// it with `refusal`, as before.
+    pub freeform: Option<ConstraintFailure>,
 }
 
 /// Resolve one selection ref (conventions in the module doc). Every failure is
@@ -72,7 +79,27 @@ pub(super) fn resolve_element(
             "selection '{name}' does not belong to an assembly component — only component geometry participates in constraints"
         ))
     })?;
-    let world = resolve_world_geometry(scene, name, record)?;
+    if let Some(follow) = &record.pattern {
+        return Err(ConstraintFailure::invalid(format!(
+            "'{}' is instance {} of pattern {}: it follows its seed {} and takes no mates of its own — mate {} instead",
+            record.id, follow.key, follow.pattern_id, follow.seed, follow.seed
+        )));
+    }
+    let curve = edge_curve(scene, name, &record.transform)?;
+    let (world, freeform) = match resolve_world_geometry(scene, name, record) {
+        Ok(world) => (world, None),
+        Err(failure) if failure.status == "unsupported-selection" && curve.is_some() => {
+            let chord = curve.as_ref().and_then(|c| {
+                let mid = c.curve.evaluate(0.5 * (c.t0 + c.t1)).ok()?;
+                Some(record.transform.point(mid))
+            });
+            match chord {
+                Some(position) => (SelectionGeometry::Point { position }, Some(failure)),
+                None => return Err(failure),
+            }
+        }
+        Err(failure) => return Err(failure),
+    };
     let inverse = record.transform.rigid_inverse().map_err(|error| {
         ConstraintFailure::new(
             "error",
@@ -83,12 +110,33 @@ pub(super) fn resolve_element(
         ConstraintFailure::new("error", format!("selection '{name}': {error}"))
     })?;
     Ok(ResolvedElement {
+        curve,
+        freeform,
         name: name.to_string(),
         component: record.id.clone(),
         world,
         local,
         transform: record.transform,
     })
+}
+
+/// An edge selection's carrier over its range, in the component's LOCAL
+/// frame; `None` when `name` is not an edge.
+fn edge_curve(
+    scene: &SceneMap,
+    name: &str,
+    transform: &AffineTransform,
+) -> Result<Option<crate::MateCurve>, ConstraintFailure> {
+    let Some(edge) = scene.resolve_edge(name) else { return Ok(None) };
+    let inverse = transform.rigid_inverse().map_err(ConstraintFailure::invalid)?;
+    crate::with_registered_solid_str(edge.handle, |solid| {
+        let Some(record) = solid.edges.iter().find(|record| record.id == edge.edge_id) else {
+            return Ok(None);
+        };
+        let curve = crate::transform_topology::transform_curve(&record.curve, inverse)?;
+        Ok(Some(crate::MateCurve { curve, t0: record.t0, t1: record.t1 }))
+    })
+    .map_err(ConstraintFailure::invalid)
 }
 
 fn resolve_world_geometry(
@@ -241,6 +289,9 @@ fn parse_triple(coords: &str) -> Option<Vec3> {
 pub(super) struct MappedMate {
     pub body_a: String,
     pub body_b: String,
+    /// The third component a three-body mate reads (a symmetric mate's
+    /// mirror plane); `None` for every two-body mate.
+    pub body_c: Option<String>,
     pub kind: MateKind,
 }
 
@@ -291,6 +342,12 @@ pub(super) fn map_constraint(
             ))),
         }
     };
+    // A freeform (spline) edge resolves only for the curve-following types.
+    if !matches!(entry.constraint_type.as_str(), "path" | "cam") {
+        if let Some(refusal) = resolved.iter().find_map(|element| element.freeform.clone()) {
+            return Err(refusal);
+        }
+    }
     match entry.constraint_type.as_str() {
         "coincident" => pair().and_then(|(a, b)| super::constraints::coincident::map(a, b)),
         "touch_align" => {
@@ -303,11 +360,18 @@ pub(super) fn map_constraint(
         }
         "distance" => {
             let (a, b) = pair()?;
-            super::constraints::distance::map(entry, a, b, env)
+            let mut mapped = super::constraints::distance::map(entry, a, b, env)?;
+            super::constraints::apply_limit(entry, &mut mapped, env, |value| value)?;
+            Ok(mapped)
         }
         "angle" => {
             let (a, b) = pair()?;
-            super::constraints::angle::map(entry, a, b, env)
+            let mut mapped = super::constraints::angle::map(entry, a, b, env)?;
+            let exterior = entry.flag("exteriorAngle");
+            super::constraints::apply_limit(entry, &mut mapped, env, |value| {
+                if exterior { 180.0 - value } else { value }
+            })?;
+            Ok(mapped)
         }
         "concentric" => {
             let (a, b) = pair()?;
@@ -316,6 +380,28 @@ pub(super) fn map_constraint(
         "perpendicular" => pair().and_then(|(a, b)| super::constraints::perpendicular::map(a, b)),
         "tangent" => pair().and_then(|(a, b)| super::constraints::tangent::map(a, b)),
         "center" => super::constraints::center::map(entry, resolved),
+        "symmetric" => super::constraints::symmetric::map(resolved),
+        "gear" => {
+            let (a, b) = pair()?;
+            super::constraints::gear::map(entry, a, b, env)
+        }
+        "rack_pinion" => {
+            let (a, b) = pair()?;
+            super::constraints::rack_pinion::map(entry, a, b, env)
+        }
+        "screw" => {
+            let (a, b) = pair()?;
+            super::constraints::screw::map(entry, a, b, env)
+        }
+        "path" => {
+            let (a, b) = pair()?;
+            super::constraints::path::map(entry, a, b, env)
+        }
+        "slot" => super::constraints::slot::map(entry, resolved, env),
+        "cam" => {
+            let (a, b) = pair()?;
+            super::constraints::cam::map(entry, a, b, env)
+        }
         other => Err(ConstraintFailure::new(
             "error",
             format!("Unknown constraint type: {other}"),
@@ -327,6 +413,7 @@ pub(super) fn mate(a: &ResolvedElement, b: &ResolvedElement, kind: MateKind) -> 
     MappedMate {
         body_a: a.component.clone(),
         body_b: b.component.clone(),
+        body_c: None,
         kind,
     }
 }
@@ -430,8 +517,11 @@ pub(super) fn effective_align(
 
 
 /// First-solve initialization: when `flag_key` is not yet set in
-/// `persistentData`, the target ADOPTS the current measurement and both the
-/// param and the flag are queued for commit on solve success.
+/// `persistentData` and the constraint was created WITHOUT `param_key`, the
+/// target ADOPTS the current measurement and both the param and the flag are
+/// queued for commit on solve success. A value given at creation (a script,
+/// the MCP, a dialog) is what was asked for: it drives the parts there, and
+/// only the flag is queued.
 #[allow(clippy::type_complexity)]
 pub(super) fn first_solve_target(
     entry: &ConstraintEntry,
@@ -447,8 +537,11 @@ pub(super) fn first_solve_target(
         .persistent(flag_key)
         .and_then(|value| value.as_bool())
         .unwrap_or(false);
+    let given = entry.input_params.get(param_key).is_some_and(|value| !value.is_null());
     if initialized {
         (configured, (Vec::new(), Vec::new()))
+    } else if given {
+        (configured, (Vec::new(), vec![(flag_key.to_string(), serde_json::Value::Bool(true))]))
     } else {
         (
             current,
@@ -556,6 +649,29 @@ pub(super) fn pose_to_transform(
         2.0 * (x * z - w * y), 2.0 * (y * z + w * x), 1.0 - 2.0 * (x * x + y * y), translation[2],
         0.0, 0.0, 0.0, 1.0,
     ])
+}
+
+/// The read-side half of [`transform_to_pose_params`]: `{translate,
+/// rotateEulerDeg}` composed exactly as the ACOMP feature composes it (literal
+/// numbers only — expressions are the feature's business).
+pub(super) fn pose_params_to_transform(pose: &serde_json::Value) -> Result<AffineTransform, String> {
+    let triple = |key: &str| -> Result<[f64; 3], String> {
+        let values = pose.get(key).and_then(|value| value.as_array());
+        let Some(values) = values else { return Ok([0.0; 3]) };
+        let mut out = [0.0; 3];
+        for (slot, value) in out.iter_mut().zip(values) {
+            *slot = value.as_f64().ok_or_else(|| format!("pose {key}: not a number"))?;
+        }
+        Ok(out)
+    };
+    let translate = triple("translate")?;
+    let degrees = triple("rotateEulerDeg")?;
+    AffineTransform::new(crate::feature_pipeline::features::common::compose_trs_matrix(
+        translate,
+        [degrees[0].to_radians(), degrees[1].to_radians(), degrees[2].to_radians()],
+        [1.0, 1.0, 1.0],
+        [0.0, 0.0, 0.0],
+    ))
 }
 
 /// The generic `inputParams.transform` pose write-back JSON: `{translate,

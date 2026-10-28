@@ -307,6 +307,8 @@ impl Throttle {
 pub struct Security {
     pub config: ServerConfig,
     pub throttle: Throttle,
+    /// Desktop sign-ins waiting for a browser ([`crate::desktop_link`]).
+    pub desktop_links: crate::desktop_link::DesktopLinks,
 }
 
 // ===========================================================================
@@ -361,7 +363,10 @@ pub fn is_mutating(method: &Method) -> bool {
 /// revoke credentials. A leaked token must not be able to make itself a new
 /// one, change its owner's password, or hide by revoking the others.
 pub fn is_credential_route(path: &str) -> bool {
-    path == "/api/tokens"
+    // Deciding a desktop sign-in mints a token for the decider.
+    let desktop_decision = matches!(path, "/api/desktop/link/inspect" | "/api/desktop/link/approve" | "/api/desktop/link/deny");
+    desktop_decision
+        || path == "/api/tokens"
         || path.starts_with("/api/tokens/")
         || path == "/api/me/password"
         || path == "/api/logout-all"

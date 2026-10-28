@@ -7,7 +7,7 @@
 //! Cut points are pinned onto the crossing line or arc/circle, using coincidence
 //! near line endpoints. A surviving arc carries its radius through its endpoints;
 //! the trimmed circle's old radius point need not survive. Unreferenced points
-//! are removed after each trim by [`cleanup_orphan_points`].
+//! are removed after each trim by `cleanup_orphan_points`.
 
 use std::cmp::Ordering;
 use std::collections::HashSet;

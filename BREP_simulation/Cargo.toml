@@ -1,0 +1,29 @@
+[package]
+name = "BREP_simulation"
+version = "0.1.0"
+edition = "2021"
+license-file = "LICENSE.md"
+repository = "https://github.com/mmiscool/next.BREP.io_RUST_BREP_KERNEL"
+description = "Motion studies for BREP assemblies: the study document model, mates as motors, the timeline's clips and sampling a study at a time"
+readme = "README.md"
+keywords = ["cad", "assembly", "simulation", "motion"]
+categories = ["data-structures", "simulation"]
+# The `!` entries are a backstop: test code never ships.
+include = [
+    "src/**",
+    "Cargo.toml",
+    "README.md",
+    "LICENSE.md",
+    "!src/**/tests/**",
+    "!**/tests.rs",
+    "!**/*_tests.rs",
+    "!**/test_support.rs",
+    "!**/testdata/**",
+]
+
+[lib]
+name = "brep_simulation"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

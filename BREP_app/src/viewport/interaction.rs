@@ -33,6 +33,8 @@ pub(super) fn raw_wheel_delta_y(ctx: &egui::Context) -> f32 {
 /// enough to reach on purpose. It only BINDS if a theme drives `tooltip_delay`
 /// below it; at the stock 0.5 s the style's value is what applies.
 const DWELL_FLOOR_SECS: f64 = 0.25;
+/// The info line an instance's component menu opens with (never chosen).
+const PATTERN_INFO: &str = "pattern-info";
 
 /// How long a hover highlight must stand before a plain click opens the PICK
 /// LIST instead of selecting it: egui's OWN `interaction.tooltip_delay` (0.5 s by
@@ -116,6 +118,9 @@ impl Viewport {
 
             // Feed input BEFORE rendering so a change is reflected this frame.
             self.handle_viewport_input(ui, rect, &response, state);
+            // A right-click on a component: select it and open its menu.
+            let request = self.component_menu_request(rect, &response, state);
+            self.show_component_menu(ui.ctx(), state, request);
 
             // Per-frame overlay upkeep, AFTER the input + resize above so a zoom
             // is reflected in the SAME frame it happened. Re-bakes the
@@ -129,11 +134,14 @@ impl Viewport {
                 state.ensure_overlays_current();
             }
 
-            if state.dirty {
+            let render = state.dirty || std::mem::take(&mut self.force_render);
+            if render {
                 self.render_viewport(phys_w, phys_h, ppp, state);
                 // Keep animating while a drag is live / more input pending.
                 ui.ctx().request_repaint();
             }
+            #[cfg(feature = "automation")]
+            self.check_stale_frame(render, phys_w, phys_h, ppp, state);
 
             // Composite the offscreen 3D texture into egui's frame via the
             // wgpu paint callback.
@@ -174,6 +182,8 @@ impl Viewport {
         // NONE of these belong on a sheet: they are 3D-anchored overlays, and
         // the sheet mode already drew everything the paper carries.
         let sheet_open = state.sheet_open().is_some();
+        // Not drawn this frame (a sheet, or chrome over the view): no rects.
+        self.move_card.hits.clear();
         if let Some(rect) = self.last_rect.filter(|_| !sheet_open && !self.chrome_obscured) {
             self.draw_dimension_labels(&ctx, rect, state);
             // Feature-dimension labels (FD-1): the ◎ dimension-gizmo mode draws the
@@ -188,6 +198,9 @@ impl Viewport {
             // the far side of the window. Also the Transform Face PIVOT marker,
             // for the pivot the gizmo has moved off.
             self.draw_transform_readout(&ctx, rect, state);
+            // The Move gizmo's typed-value card, in the top-left corner (never
+            // at the gizmo: it takes presses).
+            self.move_card.draw(&ctx, rect, state);
             // Assembly-constraint labels (§8.4): status-colored chips at each
             // constraint's anchor — hover highlights the referenced geometry,
             // click expands the row in the Assembly Constraints panel.
@@ -235,11 +248,22 @@ impl Viewport {
             // The assembly-constraint overlay labels (id/text/status/color/world/
             // draggable) so the verifier can locate + drag a constraint handle.
             crate::automation::registry::publish("__brepConstraints", "assembly constraint overlay labels", &state.constraint_labels_json());
+            // The free-motion glyph at the selected component (null when none).
+            crate::automation::registry::publish("__brepFreedomGlyph", "free-motion glyph at the selected component {component, center, slides: [[x,y,z]], axes: [{point, direction}]} or null", &state.freedom_glyph_value().to_string());
             // The active PMI view's label chips (id/type/text/status/world) so
             // the verifier can locate, drag and click an annotation.
             crate::automation::registry::publish("__brepPmiLabels", "PMI label chips of the active view", &state.pmi_labels_json());
             crate::automation::registry::publish("__brepPmiLabelHit", "PMI label chip rects {id: [x,y,w,h]}", &self.pmi_label_hits_json());
+            // The Move gizmo's typed-value card — `movecard/card`, `movecard/field:<axis>`.
+            crate::automation::registry::publish("__brepMoveCardHit", "the Move gizmo's typed-value card rects in screen points (card, field:x|y|z|rx|ry|rz) while the component Move gizmo is armed", &crate::automation::hit_rects::hits_json(&self.move_card.hits));
+            crate::automation::registry::publish("__brepComponentMenu", "the component right-click menu: {open: ACOMP id or null, last: the last right-click's hit and owning component}", &serde_json::json!({ "open": self.component_menu.as_ref().map(|(id, _)| id), "last": self.component_menu_probe }).to_string());
+            crate::automation::registry::publish("__brepComponentMenuHit", "open component right-click menu entry rects (menuitem:<ACOMP id>:<action id>)", &crate::automation::hit_rects::hits_json(&self.component_menu_hits));
             // A chip's open right-click menu — `pmimenu/menuitem:<id>:<action>`.
+            // The constraint chips' screen rects — `constraintlabel/<id>`.
+            let chip_hits: std::collections::HashMap<String, egui::Rect> = self.constraint_chips_drawn.iter().cloned().collect();
+            crate::automation::registry::publish("__brepConstraintLabelHit", "assembly-constraint chip rects {id: [x,y,w,h]}", &crate::automation::hit_rects::hits_json(&chip_hits));
+            // A constraint chip's open right-click menu — `constraintmenu/menuitem:<id>:<action>`.
+            crate::automation::registry::publish("__brepConstraintMenuHit", "open assembly-constraint chip right-click menu entry rects (menuitem:<constraint id>:<action id>)", &crate::automation::hit_rects::hits_json(&self.constraint_menu_hits));
             crate::automation::registry::publish("__brepPmiMenuHit", "open PMI label chip right-click menu entry rects (menuitem:<annotation id>:<action id>)", &crate::automation::hit_rects::hits_json(&self.pmi_menu_hits));
             // The armed gizmo's handle rects — `gizmo/…`, the VIEWPORT-hosted
             // widget panel, in SCREEN points like every other hit blob.
@@ -626,6 +650,130 @@ impl Viewport {
         }
     }
 
+    /// A plain RIGHT-click (no drag) on an assembly component's geometry:
+    /// the component under the pointer, selected, and where its menu opens.
+    /// Nothing while a reference pick, a sketch or a gizmo owns the pointer.
+    fn component_menu_request(
+        &mut self,
+        rect: egui::Rect,
+        response: &egui::Response,
+        state: &mut EngineState,
+    ) -> Option<(String, egui::Pos2)> {
+        if !response.secondary_clicked()
+            || state.ref_select_active()
+            || state.sketch_mode()
+            || state.sketch3d_mode()
+        {
+            return None;
+        }
+        let pos = response.interact_pointer_pos()?;
+        let (lx, ly) = ((pos.x - rect.min.x) as f64, (pos.y - rect.min.y) as f64);
+        let hit: serde_json::Value = serde_json::from_str(&state.hover_json(lx, ly)).unwrap_or_default();
+        let component = hit["solid"]
+            .as_str()
+            .or_else(|| hit["name"].as_str())
+            .and_then(|solid| state.component_of_solid(solid));
+        self.component_menu_probe = serde_json::json!({ "at": [pos.x, pos.y], "hit": hit, "component": component });
+        let component = component?;
+        state.select_component(&component);
+        Some((component, pos))
+    }
+
+    /// A component's RIGHT-CLICK menu: [`ComponentAction::ALL`] through the
+    /// one dispatcher the context bar and the BOM rows use. `request` (a
+    /// right-click this frame) is applied after the open menu has drawn, so
+    /// the click that opens a menu is not the one that closes it.
+    ///
+    /// [`ComponentAction::ALL`]: crate::panels::component_actions::ComponentAction::ALL
+    fn show_component_menu(
+        &mut self,
+        ctx: &egui::Context,
+        state: &mut EngineState,
+        request: Option<(String, egui::Pos2)>,
+    ) {
+        use crate::panels::component_actions::{run_component_action, ComponentAction};
+        self.component_menu_hits.clear();
+        let mut chosen: Option<(String, ComponentAction)> = None;
+        if let Some((id, pos)) = self.component_menu.clone() {
+            // A Pattern Component instance has no feature of its own: its menu
+            // says whose copy it is and acts on the SEED, offering what makes
+            // sense from a copy (open the part, replace it; the seed's own
+            // Move / Fix / Delete stay on the seed).
+            let instance = brep_render::brep_kernel::pattern_component_instance(&id);
+            let seed = instance.as_ref().map_or(id.clone(), |(_, seed, _)| seed.clone());
+            match state.component_info(&seed) {
+                Some(info) => {
+                    let mut actions: Vec<crate::column_tree::RowAction> = ComponentAction::ALL
+                        .into_iter()
+                        .filter(|action| {
+                            instance.is_none() || matches!(action, ComponentAction::OpenPart | ComponentAction::Replace)
+                        })
+                        .map(|action| {
+                            let entry = crate::column_tree::RowAction::new(action.id(), action.label(info.fixed))
+                                .tooltip(action.tooltip());
+                            match action {
+                                ComponentAction::Move if info.fixed => {
+                                    entry.disabled("This component is fixed \u{2014} unfix it before moving it")
+                                }
+                                ComponentAction::Delete => entry.separator_above().destructive(),
+                                _ => entry,
+                            }
+                        })
+                        .collect();
+                    if let Some((pattern, seed, n)) = &instance {
+                        let line = format!("Instance {n} of {pattern}: follows {seed}");
+                        actions.insert(
+                            0,
+                            crate::column_tree::RowAction::new(PATTERN_INFO, &line)
+                                .disabled("A pattern copy: these act on its seed, and every copy follows"),
+                        );
+                    }
+                    let hits = &mut self.component_menu_hits;
+                    let (action, still_open) = crate::column_tree::action_menu(
+                        ctx,
+                        egui::LayerId::new(egui::Order::Foreground, egui::Id::new("brep-component-menu-layer")),
+                        egui::Id::new("brep-component-menu"),
+                        pos,
+                        &actions,
+                        |entry, rect| {
+                            hits.insert(format!("menuitem:{id}:{}", entry.id), rect);
+                        },
+                    );
+                    if !still_open {
+                        self.component_menu = None;
+                    }
+                    chosen = action.and_then(|action| ComponentAction::from_id(&action)).map(|action| (id, action));
+                }
+                None => self.component_menu = None,
+            }
+        }
+        if let Some((id, action)) = chosen {
+            // On an instance, Replace keeps the instance id (the chooser opens
+            // on the seed and says why); everything else acts on the seed.
+            let target = match brep_render::brep_kernel::pattern_component_instance(&id) {
+                Some((_, seed, _)) if action != ComponentAction::Replace => seed,
+                _ => id,
+            };
+            if let Some(request) = run_component_action(state, action, &target) {
+                self.component_request = Some(request);
+            }
+        }
+        if let Some(request) = request {
+            self.component_menu = Some(request);
+        }
+    }
+
+    /// Whether empty space was double-clicked this frame (the shell returns
+    /// from a Work part on it).
+    pub fn take_empty_double_click(&mut self) -> bool {
+        std::mem::take(&mut self.empty_double_click)
+    }
+
+    /// The document-level flow the component menu asked for this frame.
+    pub fn take_component_request(&mut self) -> Option<crate::panels::component_actions::ComponentActionRequest> {
+        self.component_request.take()
+    }
+
     /// Route pointer/wheel over the viewport into `EngineState` (mirrors
     /// `desktop.rs`). `rect` is the viewport in egui points; coords fed to the
     /// engine are viewport-local logical px, the space `state.camera` lives in.
@@ -960,16 +1108,28 @@ impl Viewport {
                     // is not (the pick list still ranks it by kind, as before).
                     let toggles =
                         state.settings.multi_select == MultiSelectMode::ClickToggles;
-                    match state.nearest_candidate_at(lx, ly) {
-                        Some(candidate) => {
-                            if toggles {
-                                state.toggle_candidate(&candidate);
-                            } else {
-                                state.select_candidate(&candidate);
+                    // A Work part's context face in front: THE context
+                    // selection, apart from the part's own (it is not the
+                    // part's to reference).
+                    if let Some(context) = state.context_hit_at(lx, ly) {
+                        state.clear_selection();
+                        state.select_context(Some(context));
+                    } else {
+                        match state.nearest_candidate_at(lx, ly) {
+                            Some(candidate) => {
+                                state.select_context(None);
+                                if toggles {
+                                    state.toggle_candidate(&candidate);
+                                } else {
+                                    state.select_candidate(&candidate);
+                                }
                             }
-                        }
-                        None => {
-                            state.clear_selection();
+                            None => {
+                                state.clear_selection();
+                                // A double click on empty space: the shell
+                                // ends a Work part session with it.
+                                self.empty_double_click |= response.double_clicked();
+                            }
                         }
                     }
                     // A click SPENDS the rest that preceded it, exactly as the

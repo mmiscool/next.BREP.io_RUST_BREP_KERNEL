@@ -155,6 +155,7 @@ pub(super) fn invoke(
         }
     }
     let owned = arena.clone();
+    let modules = package.modules.clone();
     let console_logs = Rc::new(RefCell::new(None::<brep_script_core::Logs>));
     let captured_logs = console_logs.clone();
     let output = brep_script_core::modules::with_module(
@@ -202,13 +203,14 @@ pub(super) fn invoke(
             if metadata.to_string().len() > 1024 * 1024 {
                 return Err(error("registration metadata exceeds 1 MiB"));
             }
-            let registry = registry(&metadata, &pin).map_err(error)?;
+            let registry = registry(&metadata, &pin, &modules).map_err(error)?;
             if let Some(expected) = expected {
                 if registry.features != expected.features
                     || registry.actions != expected.actions
                     || registry.workbenches != expected.workbenches
                     || registry.panels != expected.panels
                     || registry.annotations != expected.annotations
+                    || registry.posts != expected.posts
                 {
                     return Err(error("registration metadata changed during invocation"));
                 }
@@ -294,7 +296,7 @@ pub(super) fn invoke(
         Ok((output.0, value, None))
     }
 }
-fn registry(v: &Value, pin: &PluginPin) -> Result<Registry, String> {
+fn registry(v: &Value, pin: &PluginPin, modules: &BTreeMap<String, String>) -> Result<Registry, String> {
     let mut r = Registry::default();
     r.packages.push(pin.clone());
     let mut ids = BTreeSet::new();
@@ -304,6 +306,7 @@ fn registry(v: &Value, pin: &PluginPin) -> Result<Registry, String> {
         ("workbench", &v["workbenches"]),
         ("panel", &v["panels"]),
         ("annotation", &v["annotations"]),
+        ("post", &v["posts"]),
     ] {
         let list = list.as_array().ok_or("invalid registration list")?;
         if list.len() > 256 {
@@ -330,6 +333,7 @@ fn registry(v: &Value, pin: &PluginPin) -> Result<Registry, String> {
                 ][..],
                 "annotation" => &["id", "label", "inputParamsSchema"][..],
                 "panel" => &["id", "label", "controls"][..],
+                "post" => &["id", "label", "module"][..],
                 _ => &["id", "label", "featureTypes", "actions", "panels"][..],
             };
             for key in d.as_object().ok_or("registration must be object")?.keys() {
@@ -450,6 +454,17 @@ fn registry(v: &Value, pin: &PluginPin) -> Result<Registry, String> {
                     input_params_schema: schema,
                     package: pin.clone(),
                 }),
+                "post" => {
+                    let module = d["module"]
+                        .as_str()
+                        .filter(|m| local_path(m))
+                        .ok_or("post registration requires a package-local module path")?
+                        .to_owned();
+                    if !modules.contains_key(&module) {
+                        return Err(format!("post {id} names a module the package does not contain: {module}"));
+                    }
+                    r.posts.push(PostRegistration { id, label, module, package: pin.clone() });
+                }
                 "panel" => r.panels.push(PanelRegistration {
                     id,
                     label,

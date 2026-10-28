@@ -390,7 +390,7 @@ pub(in crate::boolean) fn close_trim_loop_joints_in(
     tolerance: f64,
     scope: Option<&HashSet<u64>>,
 ) -> Result<Vec<ReplacedTrim>, KernelRefusal> {
-    let mut profile = JointProfile::new(std::env::var_os("BREP_PROFILE").is_some());
+    let mut profile = JointProfile::new(crate::imprint::profile_enabled());
     let previous = solid.clone();
     profile.lap("clone");
     let result = close_trim_loop_joints_impl(solid, tolerance, scope, &mut profile);

@@ -376,6 +376,19 @@ fn two_radius_combine(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// `residual_merge`: whether the residual-derived coincident-vertex merge
+/// below may run. A composite one-call carrier imprint
+/// ([`super::build_carrier_imprints_within`], offset-shell lane 2026-10-27)
+/// passes `false`: each of its admitted face pairs was, until the one call,
+/// its own `build_imprints` holding two carriers, and the merge's "≥ 3
+/// distinct incident carriers" gate could never fire inside one pair. Across
+/// pairs it can — the successive-fillet history's corner-patch offset pokes
+/// 1e-3 through two tangent planes, and the two sections' ends 9.5e-4 apart
+/// were merged to one joint vertex, after which the y = 9.8 wall carrier's cut
+/// chain no longer ended where the fragmenter's bridge found it and the wall
+/// never fragmented (O.S10 refused as an unwelded curved rim). Per-pair the
+/// pipeline's positional `merge_vertex` is the only cross-pair identity, and
+/// it never moves a curve end; the composite keeps that contract.
 pub(super) fn canonicalize_imprint_junctions(
     result: &mut ImprintResultRecord,
     solid_a: &BrepSolid,
@@ -385,6 +398,7 @@ pub(super) fn canonicalize_imprint_junctions(
     emitted_pcurves: &HashSet<(u64, FaceKey)>,
     evidence: &JunctionEvidence,
     combine: JunctionCombineMode,
+    residual_merge: bool,
 ) -> Result<(), KernelRefusal> {
     let face_map = faces(solid_a, 0)
         .into_iter()
@@ -405,7 +419,8 @@ pub(super) fn canonicalize_imprint_junctions(
     // `merge_residual_coincident_vertices`). Escape hatch:
     // `BREP_IMPRINT_RESIDUAL_MERGE=0` restores the pre-merge behaviour.
     let raw_extent = raw_solid_extent(solid_a).max(raw_solid_extent(solid_b));
-    if std::env::var("BREP_IMPRINT_RESIDUAL_MERGE").as_deref() != Ok("0")
+    if residual_merge
+        && std::env::var("BREP_IMPRINT_RESIDUAL_MERGE").as_deref() != Ok("0")
         && merge_residual_coincident_vertices(
             result,
             &face_map,

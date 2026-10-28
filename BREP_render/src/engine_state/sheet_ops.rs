@@ -104,7 +104,7 @@ impl SheetLinesWork {
     /// What a projection's exact-lines miss gets: the lines, when the runner
     /// answers at once (an inline runner); pending, while it computes; or the
     /// word to compute them on this thread.
-    fn defer(&mut self, runner: &mut dyn crate::runner::HistoryRunner, job: LinesJob) -> Deferred {
+    pub(super) fn defer(&mut self, runner: &mut dyn crate::runner::HistoryRunner, job: LinesJob) -> Deferred {
         if self.unsupported || self.refused.contains(&job.key) {
             return Deferred::Here;
         }
@@ -380,11 +380,11 @@ impl EngineState {
 
     /// The document's expression sheet, which a PMI dimension's tolerance may
     /// be written in — what a sheet dimension that inherits it reads.
-    fn sheet_env(&self) -> brep_kernel::Env {
+    pub(super) fn sheet_env(&self) -> brep_kernel::Env {
         brep_kernel::Env::build(&self.history.expressions(), &self.history.configurator()).unwrap_or_default()
     }
 
-    /// Land every sheet pass the runner has answered (see [`SheetLinesWork`]).
+    /// Land every sheet pass the runner has answered (see `SheetLinesWork`).
     pub fn pump_sheet_lines(&mut self) {
         self.sheet_lines.pump(self.runner.as_mut());
     }
@@ -412,7 +412,7 @@ impl EngineState {
             return;
         }
         let pmi = self.pmi_state();
-        let names = crate::sheets::project::sheet_solid_names(&self.scene, sheet, &pmi.views);
+        let names = crate::sheets::project::sheet_solid_names(&self.scene, &self.pmi_explode_originals, sheet, &pmi.views);
         self.request_exact_solids(names.iter().map(String::as_str));
     }
 
@@ -435,8 +435,10 @@ impl EngineState {
             // A placement draws the solids VISIBLE in the scene, and hiding one
             // is session state: it writes no history, runs nothing and lands no
             // exact solid, so without this term every term of the key stood
-            // still while the drawing's content changed.
-            self.scene.visibility_revision(),
+            // still while the drawing's content changed. A solid the active
+            // view sections away is drawn from its un-posed original, whose
+            // own hides count too.
+            self.scene.visibility_revision() + self.pmi_unposed_visibility,
             self.sheet_lines.revision,
             format!("{}\u{1f}{}", context.document, context.date),
         )
@@ -1088,7 +1090,7 @@ impl EngineState {
     }
 
     /// Open a sheet or placed view's form in the Sheets pane (`None` closes).
-    /// An open COUNTS ([`Self::open_sheet_object`]) — including a re-open of
+    /// An open COUNTS (`Self::open_sheet_object`) — including a re-open of
     /// the object already open, which is a click on the same dimension on the
     /// paper while the Sheets pane sits behind another tab.
     pub fn sheet_set_object_open(&mut self, id: Option<&str>) {
@@ -1501,7 +1503,7 @@ impl EngineState {
             let sheet = state
                 .find_sheet(&sheet_id)
                 .ok_or_else(|| format!("no sheet '{sheet_id}'"))?;
-            let label = sheet.next_view_letter();
+            let label = sheet.next_view_letter(&self.pmi_state().views);
             let parent = sheet
                 .find_view(source)
                 .ok_or_else(|| format!("no placed view '{source}'"))?;
@@ -1570,7 +1572,7 @@ impl EngineState {
         let sheet = state
             .find_sheet_mut(&sheet_id)
             .ok_or_else(|| format!("no sheet '{sheet_id}'"))?;
-        let label = sheet.next_view_letter();
+        let label = sheet.next_view_letter(&self.pmi_state().views);
         let (w, h) = sheet.millimetres();
         sheet.views.push(PlacedView {
             id: id.clone(),
@@ -1852,7 +1854,7 @@ impl EngineState {
             let sheet = state
                 .find_sheet(&sheet_id)
                 .ok_or_else(|| format!("no sheet '{sheet_id}'"))?;
-            let label = sheet.next_view_letter();
+            let label = sheet.next_view_letter(&self.pmi_state().views);
             let parent = sheet
                 .find_view(source)
                 .ok_or_else(|| format!("no placed view '{source}'"))?;

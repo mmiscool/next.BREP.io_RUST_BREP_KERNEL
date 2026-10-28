@@ -33,7 +33,7 @@ use crate::{BrepSolid, FaceRecord, NurbsCurve, NurbsSurface, Vec4};
 ///
 /// Two hashes are equal when the two solids present the integrator with the
 /// same geometry in the same order. It is a hash, so equality is evidence and
-/// not proof — but see the width note on [`absorb`]: a consumer that serves a
+/// not proof — but see the width note on `absorb`: a consumer that serves a
 /// stored value on a hit is betting on 2^-128, and this file owes that bet a
 /// mixer worth the number.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -135,7 +135,7 @@ impl TwoLane {
     }
 }
 
-fn hash_curve(lane: &mut TwoLane, curve: &NurbsCurve) {
+pub(crate) fn hash_curve(lane: &mut TwoLane, curve: &NurbsCurve) {
     lane.usize(curve.degree);
     lane.floats(&curve.knots);
     lane.usize(curve.control_points.len());

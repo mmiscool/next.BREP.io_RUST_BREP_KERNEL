@@ -207,6 +207,7 @@ struct BoundaryUse {
     edge_id: u64,
     start: u64,
     end: u64,
+    forward: bool,
     /// The neighbouring (unselected) face index across this edge.
     neighbour: usize,
 }
@@ -387,6 +388,7 @@ fn refit_faces_as_one_impl(
                     edge_id: coedge.edge_id,
                     start,
                     end,
+                    forward: coedge.forward,
                     neighbour: outside[0],
                 });
             }
@@ -631,7 +633,7 @@ fn refit_faces_as_one_impl(
             for chain in chains {
                 let curve = chain_curves[flat][0].clone();
                 flat += 1;
-                let points = chain_points(chain, &vertex_by_id);
+                let points = chain_trace_points(chain, &vertex_by_id, &edge_by_id)?;
                 let edge = if chain.closed {
                     if let Some((curve, pcurve, region_forward)) =
                         iso_ring(&surface, &curve, &points, chain_tol)
@@ -1529,6 +1531,46 @@ fn chain_points(chain: &Chain, vertices: &HashMap<u64, Vec3>) -> Vec<Vec3> {
         points.push(vertices[&chain.uses.last().unwrap().end]);
     }
     points
+}
+
+/// Boundary traversal samples for choosing the rebuilt arc's sense and extent.
+/// Endpoints alone lose that information for a full circle made of one or two
+/// curved edges (two semicircles have only two antipodal vertices). Keep the
+/// original vertices for intersection-distance checks, but trace curved edges
+/// here so iso_ring can recognize the ring and start it on the fitted seam.
+/// Straight facet chords contribute only their vertices: their interiors are
+/// deliberately off the analytic carrier being reconstructed.
+fn chain_trace_points(
+    chain: &Chain,
+    vertices: &HashMap<u64, Vec3>,
+    edges: &HashMap<u64, &EdgeRecord>,
+) -> Result<Vec<Vec3>, KernelRefusal> {
+    let mut points = Vec::new();
+    for use_ in &chain.uses {
+        points.push(vertices[&use_.start]);
+        let edge = edges[&use_.edge_id];
+        if edge.curve.degree <= 1 {
+            continue;
+        }
+        let mut parameters = Vec::new();
+        for span in edge.curve.knots.windows(2) {
+            let lo = span[0].max(edge.t0);
+            let hi = span[1].min(edge.t1);
+            if hi <= lo { continue; }
+            for step in 0..4 {
+                let t = lo + (hi - lo) * step as f64 / 4.0;
+                if t > edge.t0 && t < edge.t1 { parameters.push(t); }
+            }
+        }
+        if !use_.forward { parameters.reverse(); }
+        for t in parameters {
+            points.push(edge.curve.evaluate(t).map_err(|e| refuse_input("curve", e))?);
+        }
+    }
+    if !chain.closed {
+        points.push(vertices[&chain.uses.last().unwrap().end]);
+    }
+    Ok(points)
 }
 
 /// The point where two curves meet near `seed`, by alternating projection,

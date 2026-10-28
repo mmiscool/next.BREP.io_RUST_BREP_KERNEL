@@ -53,6 +53,51 @@ pub struct ViewDisplayArgs {
 
 #[derive(Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
+pub struct ViewSectionArgs {
+    pub id: String,
+    /// Turn the section on or off; off removes it and ignores the rest.
+    pub enabled: bool,
+    /// The plane's normal: `View` (the captured camera's direction), `X`, `Y`,
+    /// `Z`, or `Plane` (the face or plane named by `plane`).
+    #[serde(default)]
+    pub axis: Option<String>,
+    /// How far the cut lies from its anchor, mm: the captured camera target,
+    /// or along a `Plane`'s outward normal.
+    #[serde(default)]
+    pub offset: Option<f64>,
+    /// Keep the other side.
+    #[serde(default)]
+    pub flip: Option<bool>,
+    /// A planar face or a datum or sketch plane to cut on, by name; with no
+    /// `axis` it sets `Plane`.
+    #[serde(default)]
+    pub plane: Option<String>,
+    /// Solids or components the cut leaves whole (the form's Not cut).
+    #[serde(default)]
+    pub exclude: Option<Vec<String>>,
+    /// Further planes, replacing the ones the section has (`[]` removes
+    /// them): material is removed only where every plane removes it, so one
+    /// plane more is a half section (a quarter cut away), two a corner cut away.
+    #[serde(default)]
+    pub planes: Option<Vec<SectionPlaneArgs>>,
+}
+
+/// One further plane of a section: an axis through the section's origin.
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SectionPlaneArgs {
+    /// `View`, `X`, `Y` or `Z`.
+    pub axis: String,
+    /// mm from the section's origin, along the axis.
+    #[serde(default)]
+    pub offset: f64,
+    /// Keep the other side of this plane.
+    #[serde(default)]
+    pub flip: bool,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct AddAnnotationArgs {
     /// The view to add to; the active view when absent.
     #[serde(default)]
@@ -174,6 +219,26 @@ fn pmi_set_view_display(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, Strin
     Ok(Outcome::Done(json!({})))
 }
 
+fn pmi_set_view_section(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
+    let a: ViewSectionArgs = parse_args(args)?;
+    ctx.app.docs.engine_mut().pmi_set_view_section(
+        &a.id,
+        a.enabled,
+        a.axis.as_deref(),
+        a.offset,
+        a.flip,
+        a.plane.as_deref(),
+        a.exclude,
+        a.planes.map(|planes| {
+            planes
+                .into_iter()
+                .map(|plane| brep_render::brep_kernel::feature_pipeline::pmi::PmiSectionPlane { axis: plane.axis, offset: plane.offset, flip: plane.flip, normal: None })
+                .collect()
+        }),
+    )?;
+    Ok(Outcome::Done(json!({})))
+}
+
 fn pmi_add_annotation(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
     let a: AddAnnotationArgs = parse_args(args)?;
     let params = serde_json::to_string(&a.params).map_err(|e| e.to_string())?;
@@ -227,6 +292,7 @@ pub static COMMANDS: &[CommandSpec] = &[
     CommandSpec { name: "pmi_update_view_camera", group: "pmi", doc: "Re-capture the live camera into a view (the panel's Update Camera).", phase: Phase::Mutate, annotations: Annotations::MUTATE, args_schema: schema_of::<ViewIdArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(pmi_update_view_camera) },
     CommandSpec { name: "pmi_update_view_visibility", group: "pmi", doc: "Re-capture the live visibility set into a view (the panel's Update Visibility).", phase: Phase::Mutate, annotations: Annotations::MUTATE, args_schema: schema_of::<ViewIdArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(pmi_update_view_visibility) },
     CommandSpec { name: "pmi_set_view_display", group: "pmi", doc: "Patch a view's name, annotation text size, wireframe flag or hidden-solid set; absent fields are unchanged.", phase: Phase::Mutate, annotations: Annotations::MUTATE, args_schema: schema_of::<ViewDisplayArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(pmi_set_view_display) },
+    CommandSpec { name: "pmi_set_view_section", group: "pmi", doc: "Set a view's section as its form's section rows do, as one undo step: on or off, the normal (View, X, Y, Z or Plane), the offset in mm, which side is kept, the face or plane a Plane section cuts on, the solids or components it leaves whole, and further planes (`planes`: a half or corner cut away; material is removed only where every plane removes it). Absent fields keep the section's current value.", phase: Phase::Mutate, annotations: Annotations::MUTATE, args_schema: schema_of::<ViewSectionArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(pmi_set_view_section) },
     CommandSpec { name: "pmi_add_annotation", group: "pmi", doc: "Add an annotation to a view (the active one when `view_id` is absent) with the params its catalogue schema defines; every other key is seeded from the schema default. Returns the annotation id.", phase: Phase::Mutate, annotations: Annotations::MUTATE, args_schema: schema_of::<AddAnnotationArgs>, result_schema: schema_of::<PmiAdded>, handler: Handler::App(pmi_add_annotation) },
     CommandSpec { name: "pmi_update_annotation", group: "pmi", doc: "Replace an annotation's params and re-bake the overlay.", phase: Phase::Mutate, annotations: Annotations::MUTATE, args_schema: schema_of::<UpdateAnnotationArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(pmi_update_annotation) },
     CommandSpec { name: "pmi_remove_annotation", group: "pmi", doc: "Delete one annotation.", phase: Phase::Mutate, annotations: Annotations::DESTRUCTIVE, args_schema: schema_of::<AnnotationIdArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(pmi_remove_annotation) },

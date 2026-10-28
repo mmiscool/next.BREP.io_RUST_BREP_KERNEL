@@ -144,7 +144,7 @@ pub(crate) fn restore_store(saved: HashMap<String, Record_>) {
     });
 }
 
-/// The [`take_store`]/[`restore_store`] bracket as an RAII guard, for
+/// The `take_store`/`restore_store` bracket as an RAII guard, for
 /// OUT-OF-CRATE producers that build a payload against a LIVE document.
 ///
 /// The hazard it exists for: [`crate::snapshot_solids`] captures whatever record

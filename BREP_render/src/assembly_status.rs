@@ -5,7 +5,8 @@
 //!
 //! Colors are the captured palette: grey `#8e8e93` (disabled), green `#30d158`
 //! (satisfied), yellow `#ffd60a` (adjusting / everything indeterminate — also
-//! the default), red `#ff3b30` (blocked / duplicate / error / failed). Exposed
+//! the default), red `#ff3b30` (blocked / duplicate / error / failed), magenta
+//! `#ff2d92` (a named conflict: the minimal set of constraints that fight). Exposed
 //! as plain sRGB byte triples so this stays egui-free (reusable by any painter).
 
 /// The human label for a constraint `persistentData.status` word. Unknown /
@@ -19,6 +20,7 @@ pub fn status_label(status: &str) -> &'static str {
         "pending" | "" => "Pending",
         "duplicate" => "Duplicate",
         "error" => "Error",
+        "conflict" => "Conflict",
         "incomplete" => "Incomplete",
         "invalid-selection" => "Invalid selection",
         "unsupported-selection" | "unimplemented" => "Unimplemented",
@@ -42,6 +44,8 @@ pub fn status_color_rgb(status: &str) -> [u8; 3] {
             [0xff, 0x3b, 0x30]
         }
         "unsupported-selection" | "unimplemented" => [0xff, 0x9f, 0x0a],
+        // A named conflict: magenta, told apart from a plain error at a glance.
+        "conflict" => [0xff, 0x2d, 0x92],
         _ => [0xff, 0xd6, 0x0a],
     }
 }
@@ -61,7 +65,7 @@ pub fn status_severity(status: &str) -> u8 {
     match status {
         "disabled" => 0,
         "satisfied" => 1,
-        "blocked" | "duplicate" | "error" | "apply-failed" => 3,
+        "blocked" | "duplicate" | "error" | "apply-failed" | "conflict" => 3,
         _ => 2,
     }
 }

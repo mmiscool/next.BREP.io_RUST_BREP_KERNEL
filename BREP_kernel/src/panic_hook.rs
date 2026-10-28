@@ -1,7 +1,7 @@
 //! The wasm panic hook: a Rust panic reaches the browser console instead of
 //! the bare `RuntimeError: unreachable` wasm traps produce by default.
 //!
-//! [`set_once`] is what every wasm entry point in the family calls first —
+//! [`set_once`](crate::panic_hook::set_once) is what every wasm entry point in the family calls first —
 //! the kernel's `#[wasm_bindgen]` ABI, `brep_render::Engine::new`, the app's
 //! `start` and its history worker. It replaces the `console_error_panic_hook`
 //! crate, whose whole content this is; the kernel already links `wasm-bindgen`,

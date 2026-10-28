@@ -230,6 +230,12 @@ pub(crate) fn free_registered_solid(handle: u32) {
     });
 }
 
+/// Take a resident solid out of the registry (its handle is gone after), so
+/// the caller decides where it is dropped.
+pub(crate) fn take_registered_solid(handle: u32) -> Option<BrepSolid> {
+    SOLID_REGISTRY.with(|registry| registry.borrow_mut().solids.remove(&handle))
+}
+
 /// Ingest a solid from the flat f64 codec into the resident registry (arena +
 /// validate kept — external / first-crossing ingest). Returns an opaque handle.
 #[wasm_bindgen]

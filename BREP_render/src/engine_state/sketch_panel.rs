@@ -166,10 +166,12 @@ impl EngineState {
                     .join(",");
                 let construction = g.construction();
                 let mark = if construction { " ◐" } else { "" };
+                // A copy of another part's edge says so ("copied from …, not linked").
+                let note = g.extra.get("note").and_then(serde_json::Value::as_str).map(|n| format!(" \u{2014} {n}")).unwrap_or_default();
                 SketchEntityRow {
                     kind: "geometry",
                     id: g.id.clone(),
-                    label: format!("{}:{}{mark} [{pts}]", g.geom_type, id_key(&g.id)),
+                    label: format!("{}:{}{mark} [{pts}]{note}", g.geom_type, id_key(&g.id)),
                     selected: Self::sketch_ref_selected(session, "geometry", &g.id),
                     construction,
                     conflicting: false,
@@ -217,7 +219,7 @@ impl EngineState {
             .collect()
     }
 
-    /// Select an entity BY ref from a list row (mirrors [`sketch_click_at`]): honors the
+    /// Select an entity BY ref from a list row (mirrors [`sketch_click_at`](Self::sketch_click_at)): honors the
     /// SAME "Multi-select" setting — under `ClickToggles` a plain click toggles the row
     /// (no modifier needed); under `CtrlClick` a plain click replaces the
     /// selection and an additive (Ctrl/Cmd) click toggles.

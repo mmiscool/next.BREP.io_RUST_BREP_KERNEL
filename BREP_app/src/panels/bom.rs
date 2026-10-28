@@ -42,9 +42,8 @@
 //! structure tree's row buttons route through) plus this panel's own
 //! "Edit feature" — the `✎` button the menu replaced.
 //!
-//! A click on a component row selects its components, and a DOUBLE click opens
-//! its dialog — the component's feature, as Edit feature does — the one rule
-//! every tree in the app follows.
+//! A click selects components. A double click activates the selected occurrence
+//! as the Work part; Edit feature remains available in the row menu.
 //!
 //! Availability is decided PER ROW here, because only this panel knows what
 //! refuses what: a fixed component will not Move, an embedded-only part has no
@@ -71,14 +70,15 @@
 //! # The write lanes
 //!
 //! * occurrence field → `set_occurrence_attribute(ids, key, value)`.
-//! * part field → `set_part_attribute(part, key, value)`, then the shared
-//!   write-through lane ([`crate::panels::parts_library::write_through`]) so
-//!   the part's file and the entry's signature keep agreeing. There is no
-//!   second write path.
+//! * part field of a part with a document of its own → every copy of that
+//!   part in the assembly, at any depth, takes the attribute
+//!   (`nested::apply_definition`, one undo step). The part's FILE is written
+//!   by the assembly's Save ([`crate::document::owned_save`]), not at edit
+//!   time: an edit undone before Save leaves the file alone.
+//! * part field of an embedded-only part → `set_part_attribute(part, key, value)`.
 
 use crate::automation::hit_keys::HitKeyDoc;
 use crate::column_tree::{self, CellEdit, ColumnLayout, ColumnTreeSpec, RowAction, RowNode};
-use crate::panels::parts_library;
 use crate::panels::component_actions::{
     run_component_action, ComponentAction, ComponentActionRequest,
 };
@@ -92,6 +92,8 @@ use brep_render::engine_state::{EngineState, WireBomLine, WireLengthState};
 use eframe::egui;
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, HashSet};
+
+pub(crate) mod nested;
 
 /// The row menu's own entry: roll to the component's feature and open it in
 /// the history tree. Not a [`ComponentAction`] — the shared set is the
@@ -114,6 +116,10 @@ pub struct BomOutcome {
     /// back by the shared component-action dispatcher exactly as the selection
     /// context bar hands it back.
     pub component: Option<ComponentActionRequest>,
+    /// A `part.` edit on the line that is the Work part being edited in
+    /// place: it belongs to the part's own document (the shell writes it
+    /// there, and the live update carries it into the assembly).
+    pub work_part_attribute: Option<(String, Value)>,
 }
 
 /// One occurrence, flattened out of the engine's projection.
@@ -131,6 +137,7 @@ struct Occurrence {
     outdated: bool,
     /// Worst constraint status referencing this component, if any.
     status: Option<String>,
+    freedom: Option<(usize, usize)>,
     /// Every member solid currently visible.
     visible: bool,
     /// Member scene names, for the visibility toggle.
@@ -157,6 +164,10 @@ pub struct BomPanel {
     packed: bool,
     /// Rows explicitly collapsed, by row id (absent = open).
     collapsed: HashSet<String>,
+    /// Nested lines explicitly opened, by row id (absent = folded): a
+    /// sub-assembly inside a sub-assembly starts folded, and its box or
+    /// Expand all opens it.
+    opened: HashSet<String>,
     /// The Cut margin field's value while it is being dragged or typed. The
     /// margin is written once, when the edit ends — one undo step, not one
     /// per frame of a drag.
@@ -167,6 +178,69 @@ pub struct BomPanel {
     configuration: crate::panels::bom_configuration::BomConfiguration,
     owner_key: Option<String>,
     plm_mode: bool,
+    /// This frame's nested lines, by row id (what their clicks and edits
+    /// resolve through).
+    nested: HashMap<String, nested::NestedLine>,
+    /// The occurrence path of the Work part being edited in place, if any.
+    work_path: Option<String>,
+    /// The nested lines as last built, and what they were built from.
+    nested_cache: NestedCache,
+}
+
+/// The nested lines of the last build, by group, and what they read. On l500
+/// (~550 nested lines) building them was ~4 ms of every frame the BOM showed,
+/// expanded or folded, though between edits nothing they read moves: the
+/// document (its revision), the groups and their chains, the columns, the
+/// selection, the solids' visibility and which lines are open.
+#[derive(Default)]
+struct NestedCache {
+    revision: Option<u64>,
+    groups: Vec<(String, Vec<String>, String, Vec<ChainNode>)>,
+    columns: Vec<bom_columns::BomColumn>,
+    selected: HashSet<String>,
+    solids: Vec<(String, bool)>,
+    opened: HashSet<String>,
+    /// Each group's nested rows, moved into the drawn rows for the frame and
+    /// back out after it.
+    children: Vec<Vec<RowNode>>,
+    /// How many times the lines were built.
+    builds: u64,
+    /// The `__brepBomTree` text, and the build, top-level rows (without their
+    /// children) and Work part it was written from: writing it was another
+    /// ~4 ms of every frame on l500.
+    tree: Option<(u64, Vec<RowNode>, Option<String>, String)>,
+}
+
+/// A row as the tree text reads it, less its children.
+fn same_row(a: &RowNode, b: &RowNode) -> bool {
+    a.id == b.id
+        && a.cells == b.cells
+        && a.editable == b.editable
+        && a.selected == b.selected
+        && a.actions == b.actions
+        && a.locked == b.locked
+}
+
+impl NestedCache {
+    fn holds(
+        &self,
+        revision: u64,
+        groups: &[Group],
+        columns: &[bom_columns::BomColumn],
+        selected: &HashSet<String>,
+        solids: &[(String, bool)],
+        opened: &HashSet<String>,
+    ) -> bool {
+        self.revision == Some(revision)
+            && self.groups.len() == groups.len()
+            && self.groups.iter().zip(groups).all(|((key, ids, part, children), group)| {
+                *key == group.key && *ids == group.ids && *part == group.part_name && *children == group.children
+            })
+            && self.columns == columns
+            && self.selected == *selected
+            && self.solids == solids
+            && self.opened == *opened
+    }
 }
 
 impl Default for BomPanel {
@@ -186,12 +260,23 @@ impl BomPanel {
             // placement list.
             packed: true,
             collapsed: HashSet::new(),
+            opened: HashSet::new(),
             margin_edit: None,
             plm: Default::default(),
             configuration: Default::default(),
             owner_key: None,
             plm_mode: false,
+            nested: HashMap::new(),
+            work_path: None,
+            nested_cache: NestedCache::default(),
         }
+    }
+
+    /// The occurrence path of the Work part edited in place (`None` when the
+    /// assembly is the work context). Its line is marked and its `part.`
+    /// edits go to the part's own document.
+    pub fn set_work_part(&mut self, path: Option<String>) {
+        self.work_path = path;
     }
 
     /// Draw the BOM. Snapshots the projection, draws the column tree, then
@@ -214,11 +299,12 @@ impl BomPanel {
         self.owner_key = plm_target.as_ref().map(|(_,part,rev)|crate::plm::identity::document_key(part,rev));
         self.plm_mode = store.plm_client().is_some();
         if let Some(client) = store.plm_client() {
-            let history: Value = serde_json::from_str(&state.history_request_json()).unwrap_or_default();
-            let mut keys: Vec<String> = history["partsLibrary"].as_object().into_iter().flat_map(|l|l.values()).filter_map(|entry|entry["sourceKey"].as_str().filter(|key|crate::plm::bom::revision_of_document(key).is_some()).map(str::to_string)).collect();
+            // The library in place: serializing the whole document to read its
+            // keys cost a parse of the assembly every frame (~440 KB on l500).
+            let mut keys: Vec<String> = state.history.parts_library().as_object().into_iter().flat_map(|l|l.values()).filter_map(|entry|entry["sourceKey"].as_str().filter(|key|crate::plm::bom::revision_of_document(key).is_some()).map(str::to_string)).collect();
             if let Some(key)=&self.owner_key { keys.push(key.clone()); }
             keys.sort(); keys.dedup();
-            self.configuration.ensure(&client,keys);
+            self.configuration.ensure(&client,keys,store.mutation_generation());
             self.configuration.ui(ui,&client,&mut self.hits);
         }
         // What is actually VISIBLE of this pane. Every other rect below is a
@@ -293,6 +379,7 @@ impl BomPanel {
             self.hits.insert("bom:expand-all".into(), expand.rect);
             if expand.clicked() {
                 self.collapsed.clear();
+                self.opened = collapsible_keys(&groups);
             }
             let collapse = ui
                 .button("Collapse all")
@@ -303,6 +390,7 @@ impl BomPanel {
                 // them, every nested chain node — collapse-all has to fold the
                 // WHOLE tree, at every depth, with no key drift.
                 self.collapsed = collapsible_keys(&groups);
+                self.opened.clear();
             }
             // The cut margin every wire's MF QTY adds to its routed length.
             // Offered once there is a wire to add it to (or a margin already
@@ -361,6 +449,74 @@ impl BomPanel {
                 row
             })
             .collect();
+        // Nested lines, at full depth, with their own selection and cells:
+        // built again only when something they read has moved.
+        {
+            let emphasis = &state.emphasis;
+            let selected: HashSet<String> = emphasis
+                .selected_solids
+                .iter()
+                .chain(emphasis.selected_faces.iter())
+                .chain(emphasis.selected_edges.iter())
+                .cloned()
+                .collect();
+            let solids: Vec<(String, bool)> =
+                state.scene.solids().iter().map(|s| (s.name.clone(), s.visible)).collect();
+            let revision = state.history.revision();
+            let cache = &mut self.nested_cache;
+            if !cache.holds(revision, &groups, &self.parsed.columns, &selected, &solids, &self.opened) {
+                self.nested.clear();
+                let root_parts: Vec<String> = occurrences.iter().map(|o| o.part_name.clone()).collect();
+                let library = state.history.parts_library();
+                let visible_under = nested::visibility_by_prefix(&solids);
+                let top_params: HashMap<String, Value> = groups
+                    .iter()
+                    .flat_map(|group| group.ids.iter())
+                    .filter_map(|id| Some((id.clone(), state.history.feature_params(state.history.index_of(id)?)?)))
+                    .collect();
+                let mut ctx = nested::NestedCtx {
+                    columns: &self.parsed.columns,
+                    selected: &selected,
+                    solids: &solids,
+                    visible_under: &visible_under,
+                    opened: &self.opened,
+                    root_parts: &root_parts,
+                    library,
+                    lines: &mut self.nested,
+                    uses: nested::UseCounts::new(&root_parts, library),
+                    top_params: &top_params,
+                };
+                cache.children = groups
+                    .iter()
+                    .map(|group| {
+                        let entry = &library[&group.part_name];
+                        let source = entry["sourceKey"].as_str().filter(|s| !s.is_empty());
+                        nested::rows(
+                            &mut ctx,
+                            &group.key,
+                            &group.ids,
+                            std::slice::from_ref(&group.part_name),
+                            source,
+                            &group.children,
+                            &entry["document"],
+                        )
+                    })
+                    .collect();
+                cache.revision = Some(revision);
+                cache.groups = groups
+                    .iter()
+                    .map(|g| (g.key.clone(), g.ids.clone(), g.part_name.clone(), g.children.clone()))
+                    .collect();
+                cache.columns = self.parsed.columns.clone();
+                cache.selected = selected;
+                cache.solids = solids;
+                cache.opened = self.opened.clone();
+                cache.builds += 1;
+            }
+            for (row, children) in rows.iter_mut().zip(cache.children.iter_mut()) {
+                row.children = std::mem::take(children);
+            }
+        }
         rows.extend(wires.iter().map(wire_row));
         let mut specs = bom_columns::column_specs(&self.parsed);
         if self.plm_mode {for spec in &mut specs {if let Some(field)=self.configuration.field(&spec.key){spec.label=if field.unit.is_empty(){field.name.clone()}else{format!("{} ({})",field.name,field.unit)};spec.kind=field.cell_kind();}}}
@@ -376,6 +532,7 @@ impl BomPanel {
             root_cells: Some(&root_cells),
             empty_hint: Some("(no components or harness wires — insert a component via Add new feature)"),
             hits_prefix: "",
+            drag_rows: true,
         };
         let out = column_tree::column_tree(
             ui,
@@ -385,33 +542,65 @@ impl BomPanel {
             Some(&mut self.hits),
         );
 
+        // --- a row dragged: its occurrences ride egui's drag and drop, for
+        // the Instructions pane's steps (a nested row stands for the
+        // placements under the wrapper; a top-level row for its ACOMPs).
+        if let Some(row) = &out.dragging {
+            let drag = if let Some(line) = self.nested.get(row) {
+                Some(crate::panels::instructions::PartsDrag { occurrences: line.paths.clone(), part: line.part_name.clone() })
+            } else {
+                groups.iter().find(|g| &g.key == row).map(|g| crate::panels::instructions::PartsDrag { occurrences: g.ids.clone(), part: g.part_name.clone() })
+            };
+            if let Some(drag) = drag {
+                if let Some(pos) = ui.ctx().pointer_interact_pos() {
+                    egui::Area::new(egui::Id::new("bom-drag-tip")).order(egui::Order::Tooltip).fixed_pos(pos + egui::vec2(12.0, 12.0)).show(ui.ctx(), |ui| {
+                        egui::Frame::popup(ui.style()).show(ui, |ui| {
+                            ui.label(format!("{} → a step", drag.part));
+                        });
+                    });
+                }
+                egui::DragAndDrop::set_payload(ui.ctx(), drag);
+            }
+        }
+
         // --- act on what the widget reported ---------------------------------
         if out.layout_changed {
             self.persist_layout(state, store);
         }
         if let Some(id) = &out.toggled {
-            if !self.collapsed.remove(id) {
+            if self.nested.contains_key(id) {
+                if !self.opened.remove(id) {
+                    self.opened.insert(id.clone());
+                }
+            } else if !self.collapsed.remove(id) {
                 self.collapsed.insert(id.clone());
             }
         }
         if let Some(id) = &out.clicked {
-            if let Some(group) = groups.iter().find(|group| group.key == *id) {
-                state.select_components(&group.ids);
+            // Ctrl/Cmd or Shift toggles the line into the selection.
+            let additive = ui.input(|i| i.modifiers.command || i.modifiers.shift);
+            if let Some(line) = self.nested.get(id) {
+                nested::select_paths(state, &line.paths, additive);
+            } else if let Some(group) = groups.iter().find(|group| group.key == *id) {
+                if additive {
+                    nested::select_paths(state, &group.ids, true);
+                } else {
+                    state.select_components(&group.ids);
+                }
             }
         }
-        // A DOUBLE click opens the row's dialog: the component's feature, exactly
-        // as the menu's Edit feature does. A nested sub-assembly row owns no
-        // feature in this document and names no group, so it opens nothing.
+        // Keep occurrence paths as identities; nested rows resolve in their
+        // own documents when the shell starts the Work part session.
         if let Some(id) = &out.double_clicked {
-            if let Some(first) = groups
-                .iter()
-                .find(|group| group.key == *id)
-                .and_then(|group| group.ids.first())
-            {
-                if let Some(index) = state.history.index_of(first) {
-                    state.roll_to(index);
+            if let Some(group) = groups.iter().find(|group| {
+                *id == group.key || id.starts_with(&format!("{}:", group.key))
+            }) {
+                if let Some(first) = group.ids.first() {
+                    outcome.component = Some(ComponentActionRequest::WorkPart {
+                        component_path: format!("{first}{}", &id[group.key.len()..]),
+                        in_place: true,
+                    });
                 }
-                outcome.focus = Some(first.clone());
             }
         }
         // The row menu. Engine-mutating actions run in the SHARED dispatcher
@@ -420,6 +609,39 @@ impl BomPanel {
         // a request for the shell.
         let mut acted = false;
         for click in &out.actions {
+            if click.action == nested::SAVE_PART_AS {
+                if let Some(path) = self.nested.get(&click.row_id).and_then(|line| line.paths.first().cloned()) {
+                    // A nested line: the shell's part flow resolves the path.
+                    outcome.component = Some(ComponentActionRequest::OpenPart { component_id: path });
+                    acted = true;
+                    continue;
+                }
+            }
+            if matches!(click.action.as_str(), nested::MAKE_WORK_PART | nested::OPEN_NEW_TAB) {
+                let path = match self.nested.get(&click.row_id) {
+                    Some(line) => line.paths.first().cloned(),
+                    None => groups
+                        .iter()
+                        .find(|group| group.key == click.row_id)
+                        .and_then(|group| group.ids.first().cloned()),
+                };
+                if let Some(component_path) = path {
+                    outcome.component = Some(ComponentActionRequest::WorkPart {
+                        component_path,
+                        in_place: click.action == nested::MAKE_WORK_PART,
+                    });
+                }
+                acted = true;
+                continue;
+            }
+            // A nested line's Fix/Float acts on its own occurrence path.
+            if click.action == ComponentAction::ToggleFixed.id() {
+                if let Some(path) = self.nested.get(&click.row_id).and_then(|line| line.paths.first().cloned()) {
+                    outcome.component = run_component_action(state, ComponentAction::ToggleFixed, &path);
+                    acted = true;
+                    continue;
+                }
+            }
             let Some(group) = groups.iter().find(|group| group.key == click.row_id) else {
                 continue;
             };
@@ -427,7 +649,10 @@ impl BomPanel {
                 continue;
             };
             acted = true;
-            if click.action == "update-components" {
+            if click.action == nested::SAVE_PART_AS {
+                // The shell's part flow: a file-less part offers its new file.
+                outcome.component = Some(ComponentActionRequest::OpenPart { component_id: first.clone() });
+            } else if click.action == "update-components" {
                 outcome.update_components = true;
             } else if click.action == EDIT_FEATURE {
                 if let Some(index) = state.history.index_of(first) {
@@ -451,7 +676,9 @@ impl BomPanel {
         // the frame and the edit comes back on the next one.
         if !acted {
             if let Some(edit) = out.edits.first() {
-                if edit.column == VISIBLE_KEY {
+                if let Some(line) = self.nested.get(&edit.row_id).cloned() {
+                    self.apply_nested_edit(state, store, &line, edit, &mut outcome);
+                } else if edit.column == VISIBLE_KEY {
                     // Scene state, not a stored attribute: write it straight
                     // through to every member solid the row stands for.
                     let visible = edit.value.as_bool().unwrap_or(true);
@@ -460,6 +687,13 @@ impl BomPanel {
                             state.set_visible(solid, visible);
                         }
                     }
+                } else if self.work_path.is_some()
+                    && edit.column.starts_with("part.")
+                    && groups.iter().find(|g| g.key == edit.row_id).and_then(|g| g.ids.first())
+                        == self.work_path.as_ref()
+                {
+                    let field = edit.column["part.".len()..].to_string();
+                    outcome.work_part_attribute = Some((field, edit.value.clone()));
                 } else {
                     self.apply_edit(state, store, &groups, edit);
                 }
@@ -491,6 +725,45 @@ impl BomPanel {
                 })
                 .collect();
             crate::automation::registry::publish("__brepBom", "BOM groups {key, partName, ids, quantity}", &Value::Array(listing).to_string());
+            let cache = &mut self.nested_cache;
+            let current = cache.tree.as_ref().is_some_and(|(builds, top, work, _)| {
+                *builds == cache.builds
+                    && *work == self.work_path
+                    && top.len() == rows.len()
+                    && top.iter().zip(&rows).all(|(a, b)| same_row(a, b))
+            });
+            if !current {
+                let mut tree = serde_json::Map::new();
+                fn walk(rows: &[RowNode], lines: &HashMap<String, nested::NestedLine>, work: Option<&str>, tree: &mut serde_json::Map<String, Value>) {
+                    for row in rows {
+                        let mut entry = match lines.get(&row.id) {
+                            Some(line) => nested::line_state(row, line),
+                            None => serde_json::json!({
+                                "selected": row.selected, "editable": row.editable,
+                                "cells": row.cells, "locked": row.locked,
+                            }),
+                        };
+                        let path = lines.get(&row.id).and_then(|l| l.paths.first().cloned()).unwrap_or_else(|| row.id.clone());
+                        entry["workPart"] = Value::Bool(work == Some(path.as_str()));
+                        entry["actions"] = row.actions.iter().map(|a| Value::String(a.id.clone())).collect();
+                        // Each entry as the menu draws it: its label, and when it
+                        // is greyed out, why (the tooltip).
+                        entry["menu"] = row
+                            .actions
+                            .iter()
+                            .map(|a| (a.id.clone(), serde_json::json!({ "label": a.label, "enabled": a.enabled, "tooltip": a.tooltip })))
+                            .collect::<serde_json::Map<_, _>>()
+                            .into();
+                        tree.insert(row.id.clone(), entry);
+                        walk(&row.children, lines, work, tree);
+                    }
+                }
+                walk(&rows, &self.nested, self.work_path.as_deref(), &mut tree);
+                let top = rows.iter().map(|row| RowNode { children: Vec::new(), ..row.clone() }).collect();
+                cache.tree = Some((cache.builds, top, self.work_path.clone(), Value::Object(tree).to_string()));
+            }
+            let text = cache.tree.as_ref().map(|(_, _, _, text)| text.as_str()).unwrap_or("{}");
+            crate::automation::registry::publish("__brepBomTree", "every BOM line by row id, nested lines included: selected, editable, cell values, read-only cells with their reason, menu action ids and each entry's {label, enabled, tooltip}, workPart; nested lines also paths/partName/ownerUses", text);
             let wire_listing: Vec<Value> = wires
                 .iter()
                 .map(|line| {
@@ -508,6 +781,9 @@ impl BomPanel {
             crate::automation::registry::publish("__brepBomWires", "BOM wire lines {key, connectionId, stockPartNumber, length, margin, mfQty, status}", &Value::Array(wire_listing).to_string());
             self.publish_plm(plm_target.is_some());
             self.publish_hits();
+        }
+        for (children, row) in self.nested_cache.children.iter_mut().zip(rows.iter_mut()) {
+            *children = std::mem::take(&mut row.children);
         }
 
         outcome
@@ -639,18 +915,105 @@ impl BomPanel {
             selected: group.selected,
             expanded: !self.collapsed.contains(&group.key),
             actions: actions_for(state, group),
-            // Nested components belong to the sub-assembly's own document, so
-            // they show but never take an edit (rigid nesting). Rendered to
-            // FULL depth: a sub-assembly inside a sub-assembly is a real thing
-            // in the model and the list has to be able to show it.
-            children: chain_rows(&group.key, &group.children),
+            // Nested lines are built by the caller (`nested::rows`), at FULL
+            // depth: a sub-assembly inside a sub-assembly is a real thing in
+            // the model and the list has to be able to show it.
+            children: Vec::new(),
+            locked: HashMap::new(),
         }
+    }
+
+    /// Route one cell edit on a NESTED line ([`nested`]).
+    fn apply_nested_edit(
+        &mut self,
+        state: &mut EngineState,
+        store: &dyn ModelStore,
+        line: &nested::NestedLine,
+        edit: &CellEdit,
+        outcome: &mut BomOutcome,
+    ) {
+        if edit.column == VISIBLE_KEY {
+            let visible = edit.value.as_bool().unwrap_or(true);
+            let members: Vec<String> = state
+                .scene
+                .solids()
+                .iter()
+                .filter(|s| line.paths.iter().any(|p| s.name.starts_with(&format!("{p}:"))))
+                .map(|s| s.name.clone())
+                .collect();
+            for solid in members {
+                state.set_visible(&solid, visible);
+            }
+            return;
+        }
+        let Some(column) = self.parsed.columns.iter().find(|c| c.key() == edit.column).cloned() else {
+            return;
+        };
+        if column.scope == Scope::Part && line.paths.first() == self.work_path.as_ref() {
+            outcome.work_part_attribute = Some((column.field.clone(), edit.value.clone()));
+            return;
+        }
+        if column.scope == Scope::Part && self.queue_nested_plm_edit(state, store, line, &column, edit) {
+            return;
+        }
+        if let Err(error) = nested::apply_edit(state, line, &column, edit.value.clone()) {
+            state.push_notice(format!("BOM: {error}"));
+        }
+    }
+
+    /// A part attribute of a NESTED line placed from a PLM revision: the
+    /// same PATCH a top-level line sends, and every copy of the definition
+    /// takes the value once the server accepts it. `false` when the part is
+    /// not the PLM's (the edit is the document's own).
+    fn queue_nested_plm_edit(
+        &mut self,
+        state: &mut EngineState,
+        store: &dyn ModelStore,
+        line: &nested::NestedLine,
+        column: &bom_columns::BomColumn,
+        edit: &CellEdit,
+    ) -> bool {
+        let Some(key) = line.part_source.as_deref() else { return false };
+        let (Some((part, rev)), Some(client)) = (crate::plm::bom::revision_of_document(key), store.plm_client()) else {
+            return false;
+        };
+        let source = Some(key);
+        if self.plm_mode {
+            if let Some(field) = self.configuration.field(&column.key()).cloned() {
+                if !field.editable {
+                    return true;
+                }
+                if let Some(target) = field.edit.as_ref().filter(|target| target.resource == "part") {
+                    self.plm.queue_part_record_patch(&client, &part, &line.part_name, &target.key, &field.cad_field, edit.value.clone());
+                    self.plm.nest_last(&line.part_names, source);
+                    return true;
+                }
+                if field.scope == "part" {
+                    if self.configuration.snapshot(key).is_some_and(|s| s["part_type"].as_str() == field.part_type.as_deref()) {
+                        self.plm.queue_revision_patch(&client, &part, &rev, &line.part_name, &field.key, edit.value.clone());
+                        self.plm.nest_last(&line.part_names, source);
+                    }
+                    return true;
+                }
+            }
+        }
+        if PLM_PART_FIELDS.iter().any(|f| column.field.eq_ignore_ascii_case(f)) {
+            state.push_notice(format!(
+                "BOM: {}'s {} is the PLM's; it is not edited here",
+                line.part_name,
+                column.field.replace('_', " ").to_lowercase()
+            ));
+            return true;
+        }
+        self.plm.queue_patch(&client, &part, &line.part_name, &column.field, edit.value.clone());
+        self.plm.nest_last(&line.part_names, source);
+        true
     }
 
     /// Route ONE cell edit to its store. The column's scope decides which:
     /// occurrence fields fan out across the group's ACOMPs in one undo step,
-    /// part fields go to the part document and then through the shared
-    /// write-through.
+    /// part fields go to every copy of the part document; its file is
+    /// written by the assembly's Save.
     fn apply_edit(
         &mut self,
         state: &mut EngineState,
@@ -706,9 +1069,7 @@ impl BomPanel {
                 }
             }
             Scope::Part => {
-                // The part's `(sourceKey, signature-as-inserted)` must be read
-                // BEFORE the edit re-stamps the signature — that pair is what
-                // the write-through compares the file against.
+                // The part's `sourceKey` (empty for an embedded-only part).
                 let target = state.part_source(&group.part_name).and_then(|(key, sig)| {
                     (!key.is_empty()).then_some((key, sig))
                 });
@@ -728,23 +1089,28 @@ impl BomPanel {
                     self.plm.queue_patch(&client, &part_id, &group.part_name, &column.field, edit.value.clone());
                     return;
                 }
+                // A part with a document of its own: every copy of it in the
+                // assembly (any depth) takes the attribute, and the assembly's
+                // Save writes it to the part's file (`document::owned_save`) —
+                // not now, so an undo before Save leaves the file alone.
+                if let Some((key, _)) = target.as_ref() {
+                    let result = state
+                        .part_document_json(&group.part_name)
+                        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+                        .ok_or_else(|| format!("part '{}': malformed document", group.part_name))
+                        .and_then(|mut document| {
+                            nested::write_record(&mut document, brep_render::engine_state::PART_ATTRIBUTES, &column.field, edit.value.clone());
+                            nested::apply_definition(state, std::slice::from_ref(&group.part_name), Some(key.as_str()), &document)
+                        });
+                    if let Err(error) = result {
+                        state.push_notice(format!("BOM: {error}"));
+                    }
+                    return;
+                }
                 if let Err(error) =
                     state.set_part_attribute(&group.part_name, &column.field, edit.value.clone())
                 {
                     state.push_notice(format!("BOM: {error}"));
-                    return;
-                }
-                // The part document that just changed is saved back to the file
-                // it came from, through the shared write-through lane, so the
-                // entry's signature and the file agree.
-                if let Some(document) = state.part_document_json(&group.part_name) {
-                    parts_library::write_through(
-                        state,
-                        store,
-                        &group.part_name,
-                        target.as_ref(),
-                        &document,
-                    );
                 }
             }
         }
@@ -812,9 +1178,25 @@ fn actions_for(state: &EngineState, group: &Group) -> Vec<RowAction> {
         .part_source(&group.part_name)
         .is_some_and(|(key, _)| !key.is_empty());
 
-    let mut actions = vec![RowAction::new(EDIT_FEATURE, "\u{270E} Edit feature")
-        .tooltip("Roll to this component's feature and open it in the history")];
-    for action in ComponentAction::ALL {
+    let mut actions = vec![
+        RowAction::new(nested::MAKE_WORK_PART, "Make Work Part")
+            .tooltip("Edit this part here, in the context of the assembly (double click)"),
+        RowAction::new(nested::OPEN_NEW_TAB, "Open in new tab")
+            .tooltip("Edit this part in a tab of its own; the assembly updates as you edit"),
+    ];
+    if embedded {
+        actions.push(
+            RowAction::new(nested::SAVE_PART_AS, "Save part as\u{2026}")
+                .tooltip("This part has no file of its own: save it to a new part file you name"),
+        );
+    }
+    actions.extend([
+        RowAction::new(EDIT_FEATURE, "\u{270E} Edit feature")
+            .tooltip("Roll to this component's feature and open it in the history")
+            .separator_above(),
+    ]);
+    // The row already leads with Make Work Part (and its new-tab twin).
+    for action in ComponentAction::ALL.into_iter().filter(|action| *action != ComponentAction::WorkPart) {
         let entry = RowAction::new(action.id(), action.label(fixed)).tooltip(action.tooltip());
         let entry = match action {
             ComponentAction::Move if fixed => {
@@ -878,6 +1260,7 @@ fn wire_row(line: &WireBomLine) -> RowNode {
         expanded: false,
         actions: Vec::new(),
         children: Vec::new(),
+        locked: HashMap::new(),
     }
 }
 
@@ -934,6 +1317,12 @@ fn badges(group: &Group) -> Vec<Value> {
             "action": "update-components",
         }));
     }
+    if let Some((turns, slides)) = group.freedom.filter(|&free| freedom_total(Some(free)) > 0) {
+        out.push(serde_json::json!({
+            "glyph": assembly_components::UNDER_DEFINED_GLYPH,
+            "tooltip": freedom_words(turns, slides),
+        }));
+    }
     if let Some(status) = &group.status {
         out.push(serde_json::json!({
             "glyph": "\u{25CF}",
@@ -944,6 +1333,22 @@ fn badges(group: &Group) -> Vec<Value> {
     out
 }
 
+/// Turns plus slides; `None` (fixed or not analysed) is 0.
+fn freedom_total(freedom: Option<(usize, usize)>) -> usize {
+    freedom.map_or(0, |(turns, slides)| turns + slides)
+}
+
+/// The under-defined badge's tooltip: what the mates still leave free.
+pub(crate) fn freedom_words(turns: usize, slides: usize) -> String {
+    let plural = |count: usize, one: &str, many: &str| match count {
+        0 => None,
+        1 => Some(format!("1 {one}")),
+        n => Some(format!("{n} {many}")),
+    };
+    let parts: Vec<String> = [plural(turns, "turn", "turns"), plural(slides, "slide", "slides")].into_iter().flatten().collect();
+    format!("Under-defined: the mates leave {} free", parts.join(" and "))
+}
+
 /// `Color32` → the `#rrggbb` the widget's badge cell parses. (Constraint
 /// statuses have their own [`brep_render::assembly_status::status_color_hex`];
 /// this is for the badge colours the app owns.)
@@ -951,35 +1356,6 @@ fn color_hex(color: egui::Color32) -> String {
     crate::color::rgb_to_hex([color.r(), color.g(), color.b()])
 }
 
-/// Nested COMPONENT rows for one group, to full depth. Read-only throughout:
-/// these belong to the sub-assembly's own document, so they carry no cells the
-/// BOM may edit and offer no actions in THIS document.
-///
-/// Only `ACOMP<n>` nodes appear. A BOM lists PARTS and the sub-assemblies a
-/// part contains — the bodies inside a part are that part's internals and live
-/// on the Scene tree, not here. Filtering recursively also means a part whose
-/// chain holds nothing but bodies ends up with no children at all, so the
-/// widget draws no collapse box on a row with nothing behind it.
-fn chain_rows(parent: &str, nodes: &[ChainNode]) -> Vec<RowNode> {
-    nodes
-        .iter()
-        .filter(|node| assembly_components::is_acomp_segment(&node.label))
-        .map(|node| {
-            let id = format!("{parent}:{}", node.label);
-            let mut cells = HashMap::new();
-            cells.insert(ITEM_KEY.to_string(), Value::String(node.label.clone()));
-            RowNode {
-                children: chain_rows(&id, &node.children),
-                id,
-                cells,
-                editable: false,
-                selected: false,
-                expanded: false,
-                actions: Vec::new(),
-            }
-        })
-        .collect()
-}
 
 /// Is `candidate` a worse constraint status than `current`? Uses the ONE status
 /// map's severity ordering, so a rolled-up row shows the worst of what it
@@ -1015,6 +1391,8 @@ struct Group {
     outdated: bool,
     /// Worst status across the group's placements.
     status: Option<String>,
+    /// The freest placement's `(turns, slides)` (see `ComponentRow::freedom`).
+    freedom: Option<(usize, usize)>,
     /// Visible only when EVERY member solid of every placement is.
     visible: bool,
     /// Every member solid the row stands for — what the toggle writes to.
@@ -1042,6 +1420,7 @@ fn occurrences_from(state: &mut EngineState, rows: &[ComponentRow]) -> Vec<Occur
             fixed: row.fixed,
             outdated: row.outdated,
             status: row.rollup_status.clone(),
+            freedom: row.freedom,
             visible: row.visible,
             solids: row.solids.clone(),
             children: row.children.clone(),
@@ -1073,6 +1452,7 @@ fn group(occurrences: &[Occurrence], packed: bool, fields: &[String]) -> Vec<Gro
                 fixed: occurrence.fixed,
                 outdated: occurrence.outdated,
                 status: occurrence.status.clone(),
+                freedom: occurrence.freedom,
                 visible: occurrence.visible,
                 solids: occurrence.solids.clone(),
                 children: occurrence.children.clone(),
@@ -1099,6 +1479,9 @@ fn group(occurrences: &[Occurrence], packed: bool, fields: &[String]) -> Vec<Gro
                 group.visible &= occurrence.visible;
                 group.outdated |= occurrence.outdated;
                 group.solids.extend(occurrence.solids.iter().cloned());
+                if freedom_total(occurrence.freedom) > freedom_total(group.freedom) {
+                    group.freedom = occurrence.freedom;
+                }
                 if worse_status(group.status.as_deref(), occurrence.status.as_deref()) {
                     group.status = occurrence.status.clone();
                 }
@@ -1121,6 +1504,7 @@ fn group(occurrences: &[Occurrence], packed: bool, fields: &[String]) -> Vec<Gro
                         fixed: occurrence.fixed,
                         outdated: occurrence.outdated,
                         status: occurrence.status.clone(),
+                        freedom: occurrence.freedom,
                         visible: occurrence.visible,
                         solids: occurrence.solids.clone(),
                         children: occurrence.children.clone(),
@@ -1183,6 +1567,23 @@ fn plm_cells(row: &mut RowNode, state: &EngineState, store: &dyn ModelStore, par
     ] {
         row.cells.insert(format!("part.{field}"), Value::String(value));
     }
+    // A revision no longer current: marked here (from the index, no request);
+    // the PLM pane names the current release and, where the assembly may
+    // change, offers the update (`panels::plm_import::SupersededCheck`).
+    if crate::plm::superseded::is_superseded(&entry.lifecycle) {
+        let badge = serde_json::json!({
+            "glyph": assembly_components::OUTDATED_GLYPH,
+            "color": color_hex(assembly_components::OUTDATED_AMBER),
+            "tooltip": format!("PLM: rev {} is {} — see the PLM pane for the current revision", entry.revision_label, entry.lifecycle),
+            "kind": "superseded",
+        });
+        match row.cells.get_mut(FLAGS_KEY).and_then(Value::as_array_mut) {
+            Some(flags) => flags.push(badge),
+            None => {
+                row.cells.insert(FLAGS_KEY.to_string(), Value::Array(vec![badge]));
+            }
+        }
+    }
 }
 
 /// The store index row of the PLM revision `part_name` was placed from.
@@ -1229,8 +1630,9 @@ pub static HIT_KEYS: &[HitKeyDoc] = &[
     HitKeyDoc { panel: "bom", prefix: "menu:", meaning: "a row's action-menu trigger cell (menu:<row key>) \u{2014} the rightmost column, so it may need the pane scrolled horizontally; a RIGHT-CLICK anywhere on the row opens the same menu", command: None },
     HitKeyDoc { panel: "bom", prefix: "menuitem:", meaning: "one entry of the OPEN row action menu (menuitem:<row key>:<action>, e.g. toggle-fixed, move, delete, edit-feature, open-part) \u{2014} published only while the menu is up", command: Some("component_set_fixed") },
     HitKeyDoc { panel: "bom", prefix: "cell:", meaning: "a table cell (cell:row:column)", command: Some("bom_set_occurrence_attribute") },
-    HitKeyDoc { panel: "bom", prefix: "row:", meaning: "a structure-tree row (row:node key) \u{2014} a click selects its components, a double click opens the component's feature", command: Some("component_select") },
+    HitKeyDoc { panel: "bom", prefix: "row:", meaning: "a structure-tree row (row:node key) \u{2014} a click selects its components, a double click activates the Work part", command: Some("component_select") },
     HitKeyDoc { panel: "bom", prefix: "box:", meaning: "a structure-tree row's expander (box:node key)", command: None },
+    HitKeyDoc { panel: "bom", prefix: "label:", meaning: "a structure-tree row's name cell (label:node key), the drag handle: dragged onto an Instructions step row, the row's occurrences join that step", command: Some("instructions_add_parts") },
     HitKeyDoc { panel: "bom", prefix: "col:", meaning: "a table column header (col:field) — click to sort", command: None },
     HitKeyDoc { panel: "bom", prefix: "grip:", meaning: "a column's resize grip (grip:field)", command: None },
     HitKeyDoc { panel: "bom", prefix: "freeze:divider", meaning: "the frozen-column divider", command: None },

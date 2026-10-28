@@ -212,7 +212,7 @@ const KEYED: &[Keyed] = &[
 /// The state fields with a home of their own; any OTHER top-level field is
 /// kept whole in `meta` under `state.<field>`, so a field a later slice adds
 /// to [`State`] is persisted before anyone gives it a table.
-const OWN_HOME: &[&str] = &["seq", "changes_from", "changes", "settings", "parts", "workspace", "sessions"];
+const OWN_HOME: &[&str] = &["seq", "changes_from", "changes", "settings", "parts", "workspace", "sessions", "jobs"];
 
 /// How long a commit waits for the disk.
 ///
@@ -388,6 +388,7 @@ impl Sql {
         let mut object = Map::new();
         let mut stmt = conn.prepare("SELECT key, value FROM meta")?;
         let mut seen_seq = false;
+        let mut jobs: Vec<crate::jobs::Job> = Vec::new();
         for row in stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))? {
             let (key, value) = row?;
             let parsed: Value = serde_json::from_str(&value).map_err(json_error)?;
@@ -402,6 +403,8 @@ impl Sql {
                 other => {
                     if let Some(field) = other.strip_prefix("state.") {
                         object.insert(field.to_string(), parsed);
+                    } else if other.starts_with("job:") {
+                        jobs.push(serde_json::from_value(parsed).map_err(json_error)?);
                     }
                 }
             }
@@ -429,6 +432,9 @@ impl Sql {
         state.parts = load_parts(&conn)?;
         state.workspace = load_workspace(&conn)?;
         state.sessions = load_sessions(&conn)?;
+        // Jobs are numbered in order (`JOB000001`): by id is creation order.
+        jobs.sort_by(|a, b| a.id.cmp(&b.id));
+        state.jobs = crate::journal::Journaled::from_vec(jobs);
         Ok(Some(state))
     }
 
@@ -451,6 +457,9 @@ impl Sql {
         }
         for (token, session) in &change.sessions {
             write_session(&tx, token, *session)?;
+        }
+        for (id, job) in &change.jobs {
+            write_job(&tx, id, *job)?;
         }
         let events = insert_events(&tx, events)?;
         tx.commit()?;
@@ -668,6 +677,8 @@ pub struct Change<'a> {
     pub workspace: Vec<(String, Option<&'a WorkspaceEntry>)>,
     /// Each session that changed: its token, and what it is now.
     pub sessions: Vec<(String, Option<&'a Session>)>,
+    /// Each job that changed: its id, and what it is now.
+    pub jobs: Vec<(String, Option<&'a crate::jobs::Job>)>,
 }
 
 /// The indexed narrowing of a parts search ([`Sql::candidates`]).
@@ -689,7 +700,7 @@ pub struct Candidates<'a> {
     pub limit: Option<usize>,
 }
 
-/// The state as JSON without its parts, workspaces or sessions: every other
+/// The state as JSON without its parts, workspaces, sessions or jobs: every other
 /// field, whatever it is. Those lists are swapped out for the length of the
 /// serialization, so they are never serialized (they are what grows); each
 /// has its own journal and table.
@@ -697,14 +708,17 @@ pub fn small_value(state: &mut State) -> Value {
     let parts = std::mem::take(&mut state.parts);
     let workspace = std::mem::take(&mut state.workspace);
     let sessions = std::mem::take(&mut state.sessions);
+    let jobs = std::mem::take(&mut state.jobs);
     let mut value = serde_json::to_value(&*state).unwrap_or(Value::Null);
     state.parts = parts;
     state.workspace = workspace;
     state.sessions = sessions;
+    state.jobs = jobs;
     if let Some(object) = value.as_object_mut() {
         object.remove("parts");
         object.remove("workspace");
         object.remove("sessions");
+        object.remove("jobs");
     }
     value
 }
@@ -859,6 +873,24 @@ fn write_session(tx: &Transaction<'_>, token: &str, session: Option<&Session>) -
                  ON CONFLICT(token) DO UPDATE SET user_id = excluded.user_id, body = excluded.body",
             )?
             .execute(params![token, session.user_id, session.created_at as i64, body])?;
+        }
+    }
+    Ok(())
+}
+
+/// Write one job to its `meta` row (`job:<id>`), or delete it (`None`). The
+/// jobs queue has no table of its own: the store opens only its own schema,
+/// and `meta` is a key/value table already there.
+fn write_job(tx: &Transaction<'_>, id: &str, job: Option<&crate::jobs::Job>) -> rusqlite::Result<()> {
+    let key = format!("job:{id}");
+    match job {
+        None => {
+            tx.execute("DELETE FROM meta WHERE key = ?1", [&key])?;
+        }
+        Some(job) => {
+            let body = serde_json::to_string(job).map_err(json_error)?;
+            tx.prepare_cached("INSERT INTO meta(key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value")?
+                .execute(params![key, body])?;
         }
     }
     Ok(())

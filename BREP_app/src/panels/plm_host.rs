@@ -29,12 +29,11 @@ use std::rc::Rc;
 use eframe::egui;
 
 use crate::document::{Access, Documents};
-use crate::panels::plm::{access_for, PanelEvent, PlmLifecycle, PlmPanel, Rights};
+use crate::panels::plm::{access_with, PanelEvent, PlmLifecycle, PlmPanel, Rights};
 use crate::plm::client::PlmClient;
 use crate::plm::PlmFuture;
 use crate::store::ModelStore;
 
-mod save;
 
 /// A link to the configured PLM web app, for management outside CAD.
 pub fn web_url(store: &dyn ModelStore, route: &str) -> Option<String> {
@@ -67,6 +66,36 @@ pub fn pending_access() -> Access {
     Access::read_only("the revision is being read from the PLM")
 }
 
+/// A write-behind failure as the user reads it (`None`: no toast of its own).
+/// The PLM server not answering is one plain sentence naming the document as
+/// its tab does, not the transport's words; a preference written then
+/// (`@recent_documents`) says nothing, as the pane already said the server
+/// is not reachable. Anything else is shown as it came.
+pub fn plain_write_failure(message: &str) -> Option<String> {
+    const UNREACHABLE: &str = "' was NOT saved: the PLM server did not answer";
+    // A `401` (`PlmError::SignIn`): the sign-in ended, not the network.
+    const SIGNED_OUT: &str = "' was NOT saved: sign in again";
+    let (end, why) = match (message.find(UNREACHABLE), message.find(SIGNED_OUT)) {
+        (Some(end), _) => (end, "the PLM server is not reachable. It stays unsaved in its tab: Save again when the server is back."),
+        (None, Some(end)) => (end, "your PLM sign-in has ended. It stays unsaved in its tab: sign in again (Settings › PLM), then Save."),
+        (None, None) => return Some(message.to_string()),
+    };
+    if !message.starts_with('\'') {
+        return Some(message.to_string());
+    }
+    let name = &message[1..end];
+    if name.starts_with('@') {
+        return None;
+    }
+    let shown = revision_of(name).map_or_else(|| name.to_string(), |(part, revision)| format!("{part}/{revision}"));
+    Some(format!("{shown} was NOT saved: {why}"))
+}
+
+fn capitalised(text: &str) -> String {
+    let mut chars = text.chars();
+    chars.next().map_or_else(String::new, |first| first.to_uppercase().collect::<String>() + chars.as_str())
+}
+
 /// `part/<part>/rev/<revision>` read out of a document name as the explorer
 /// spells it (`/models/part/<p>/rev/<r>.nbrep`, or the bare key). Only a PLM
 /// session may read names this way: the shape alone is not proof.
@@ -82,6 +111,41 @@ pub fn revision_of(name: &str) -> Option<(String, String)> {
 
 /// The name to open another revision of the same part under: `name` with its
 /// revision swapped, so the explorer's prefix and the class's extension stay.
+/// Every PLM revision `library` holds, at any depth and once each, that the
+/// store's index says is checked out to the user, deepest first; the
+/// panel's own revision is not one of them.
+/// Each is named as a Save names it (`plate (CPART000000003 rev A)`).
+fn held_parts(library: &serde_json::Value, store: &dyn ModelStore, panel: &PlmPanel) -> Vec<String> {
+    fn walk(
+        library: &serde_json::Value,
+        store: &dyn ModelStore,
+        panel: &PlmPanel,
+        seen: &mut std::collections::HashSet<String>,
+        out: &mut Vec<String>,
+    ) {
+        for (name, entry) in library.as_object().into_iter().flatten() {
+            walk(&entry["document"]["partsLibrary"], store, panel, seen, out);
+            let Some(key) = entry["sourceKey"].as_str().filter(|key| !key.is_empty()) else { continue };
+            if !seen.insert(key.to_string()) {
+                continue;
+            }
+            let Some((part, revision)) = crate::plm::bom::revision_of_document(key) else { continue };
+            if panel.matches_document(&part, &revision) {
+                continue;
+            }
+            let held = store
+                .plm_revision(&crate::plm::identity::document_key(&part, &revision))
+                .is_some_and(|row| row.locked_by_me);
+            if held {
+                out.push(crate::document::owned_save::shown(key, std::slice::from_ref(name)));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(library, store, panel, &mut std::collections::HashSet::new(), &mut out);
+    out
+}
+
 pub fn sibling_revision(name: &str, key: &str) -> Option<String> {
     let start = name.find("part/")?;
     let (_, new_revision) = revision_of(key)?;
@@ -102,8 +166,9 @@ pub fn sibling_revision(name: &str, key: &str) -> Option<String> {
 pub static HIT_KEYS: &[crate::automation::hit_keys::HitKeyDoc] = &[
     crate::automation::hit_keys::HitKeyDoc { panel: "plm", prefix: "panel:clip", meaning: "the visible PLM pane region", command: None },
     crate::automation::hit_keys::HitKeyDoc { panel: "plm", prefix: "section:", meaning: "section:lifecycle, the revision browser and checkout", command: None },
-    crate::automation::hit_keys::HitKeyDoc { panel: "plm", prefix: "lifecycle:", meaning: "lifecycle:revision:<label> opens a revision; lifecycle:verb:check-out acquires its lock", command: None },
-    crate::automation::hit_keys::HitKeyDoc { panel: "plm", prefix: "save:", meaning: "checkout-on-save consent: save:yes, save:no, save:remember", command: None },
+    crate::automation::hit_keys::HitKeyDoc { panel: "plm", prefix: "lifecycle:", meaning: "lifecycle:revision (the Open revision dropdown; choosing an entry, lifecycle:revision#<label>, opens that revision); lifecycle:verb:check-out acquires its lock; lifecycle:held:check-in opens the PLM page that checks in the parts this assembly uses that are checked out to you", command: None },
+    crate::automation::hit_keys::HitKeyDoc { panel: "plm", prefix: "follow:", meaning: "another client saved this tab's revision while it holds edits: follow:keep keeps them, follow:take takes their version; for edited copies in an assembly whose revisions moved, follow:copies-keep / follow:copies-take", command: None },
+    crate::automation::hit_keys::HitKeyDoc { panel: "plm", prefix: "superseded:", meaning: "an assembly uses a superseded or obsolete PLM revision: superseded:update replaces it with the current release (mates kept, as Replace keeps them), superseded:keep leaves it; on an assembly that keeps its revisions (released, held by someone), superseded:new-revision makes its next revision and updates it there", command: None },
     crate::automation::hit_keys::HitKeyDoc { panel: "plm", prefix: "web:", meaning: "management links opening the PLM web app in another tab: summary, revisions, attachments, structure, history, parts, workspace, reviews", command: None },
 ];
 
@@ -176,12 +241,22 @@ pub struct HostActions {
     /// Open these document names (another revision the user picked, or the
     /// one a New revision started).
     pub open: Vec<String>,
+    /// For the names in `open` that a workspace folder's link opened: that
+    /// folder `(id, name)` (`crate::document::Document::plm_folder`).
+    pub opened_from: Vec<(String, (String, String))>,
     /// A section asked for a file: open the file chooser for (tag, title),
     /// and hand what it delivers to [`PlmHost::deliver_picked`].
     pub pick_file: Option<(String, String)>,
     /// The user decided, submitted, commented or released: ask the review
     /// inbox again (`ToolbarPanel::refresh_inbox`).
     pub refresh_inbox: bool,
+    /// Files a section downloaded (an attachment, a workspace file): hand
+    /// each to the file dialog's export door, which asks where on desktop.
+    pub save_files: Vec<crate::panels::file::SaveRequest>,
+    /// The server refused the session's sign-in (revoked under Linked
+    /// desktops, expired): the shell opens the Settings PLM tab to sign in
+    /// again, naming why.
+    pub sign_in_again: Option<String>,
 }
 
 /// The file-chooser tag of the workspace section.
@@ -192,13 +267,19 @@ pub const PICK_ATTACHMENTS: &str = "plm:attachments:";
 /// Every PLM panel, and the one client they share.
 #[derive(Default)]
 pub struct PlmHost {
-    save: save::SaveCheckout,
     web_base: String,
     client: Option<Rc<PlmClient>>,
     rights: Option<Rights>,
     rights_pending: Option<PlmFuture<Rights>>,
     /// The lifecycle panel of each open PLM document, by document id.
     lifecycle: HashMap<u64, PlmPanel>,
+    /// The PLM parts the active assembly uses that are checked out to the
+    /// user ([`held_parts`]), named for the pane.
+    held: Vec<String>,
+    /// Per document, the PLM parts it has changed and not saved, with what the
+    /// index said of each (editable; who else holds it): one released or
+    /// taken by someone else meanwhile is told at once ([`Self::watch_changed`]).
+    changed_rows: HashMap<u64, std::collections::BTreeMap<String, (bool, Option<String>)>>,
     /// Events a panel raised that another section acts on. S4's review section
     /// drains `OpenReview` here.
     pub routed: Vec<PanelEvent>,
@@ -232,6 +313,17 @@ pub struct PlmHost {
     /// The re-point check on open (S5) and the answers given while the pane
     /// drew, applied by the next [`Self::sync`].
     repoint: crate::panels::plm_import::RepointCheck,
+    cached: crate::panels::plm_import::CachedCopyCheck,
+    /// Copies pinned to a superseded revision, and the answers given while the pane drew.
+    superseded: crate::panels::plm_import::SupersededCheck,
+    superseded_asked: Vec<(u64, bool)>,
+    superseded_new: Vec<u64>,
+    /// Open tabs follow their revisions when another client saves them
+    /// (`panels::plm_tab_follow`), and the answers given while the pane drew.
+    tab_follow: crate::panels::plm_tab_follow::TabFollow,
+    tab_follow_asked: Vec<(u64, bool)>,
+    /// The answers about edited copies whose revisions moved (`cached`).
+    copies_asked: Vec<(u64, bool)>,
     repoint_asked: Vec<(u64, crate::panels::plm_import::RepointChoice)>,
     /// The parts section (S7), and what it asked for while it drew.
     parts: crate::panels::plm_parts::PlmPartsPanel,
@@ -249,6 +341,8 @@ pub struct PlmHost {
     /// Reviews asked for — by the lifecycle section, the
     /// toolbar's inbox — opened by the next [`Self::sync`], which has the client.
     review_asked: Vec<crate::panels::plm_review::PlmReviewEvent>,
+    /// See [`Self::signed_out_here`].
+    quiet_sign_out: bool,
 }
 
 impl PlmHost {
@@ -280,12 +374,26 @@ impl PlmHost {
             self.lifecycle.clear();
             self.workspace = crate::panels::plm_workspace::WorkspaceBrowser::new();
             self.repoint = crate::panels::plm_import::RepointCheck::new();
+            self.cached = crate::panels::plm_import::CachedCopyCheck::new();
+            self.superseded = Default::default();
+            self.superseded_asked.clear();
+            self.superseded_new.clear();
+            self.tab_follow = Default::default();
+            self.tab_follow_asked.clear();
+            self.copies_asked.clear();
             self.parts = crate::panels::plm_parts::PlmPartsPanel::new();
             self.import = crate::panels::plm_import::PlmImportPanel::new();
             self.review = crate::panels::plm_review::ReviewSection::new();
         }
         self.sync_sections(&client, store, docs);
         let mut actions = self.sync_with(&client, store, docs, saves);
+        // A new revision made to use the current releases opens next to its source.
+        for (source, key) in self.superseded.take_opened() {
+            match docs.iter().find(|d| d.id() == source).and_then(|d| d.name()).and_then(|name| sibling_revision(name, &key)) {
+                Some(name) => actions.open.push(name),
+                None => actions.open.push(key),
+            }
+        }
         // The review section (S4): what the lifecycle section and the
         // toolbar's inbox asked to open, and the open pane's answers.
         let reviews = crate::panels::plm_review::PlmReviewClient { client: client.clone() };
@@ -308,13 +416,93 @@ impl PlmHost {
             // The store's held index rows (the BOM's PLM columns): exactly the
             // revisions the feed named, the whole index only when stale.
             store.refresh_plm_index(&moved.keys, moved.stale);
+            self.tab_follow.moved(&client, docs, &moved.keys, moved.stale, store.pending_writes() > 0);
+            self.cached.moved(docs, &moved.keys, moved.stale);
             self.followed = true;
+        }
+        // Said once when the server stops answering, and once when it is
+        // back, with what is still to be saved, rather than one transport
+        // error per failed write.
+        let reach = self.follower.take_reach();
+        let quiet = self.quiet_sign_out && matches!(reach, Some(crate::panels::plm_follow::Reach::SignedOut));
+        if quiet {
+            self.quiet_sign_out = false;
+        }
+        if let Some(reach) = reach.filter(|_| !quiet) {
+            use crate::panels::plm_follow::Reach;
+            use brep_render::engine_state::NoticeSeverity;
+            let unsaved = docs.iter().filter(|d| d.name().is_some_and(|n| revision_of(n).is_some()) && d.is_dirty()).count();
+            let (severity, text) = match reach {
+                Reach::SignedOut => {
+                    let why = "your PLM sign-in has ended (it was signed out or revoked on the server)".to_string();
+                    actions.sign_in_again = Some(why.clone());
+                    (
+                        NoticeSeverity::Warning,
+                        format!("{}. Sign in again in Settings › PLM: your work stays in the open tabs, and Save writes it once you are signed in.", capitalised(&why)),
+                    )
+                }
+                Reach::SignedIn if unsaved > 0 => (
+                    NoticeSeverity::Info,
+                    format!("Signed in to the PLM again: Save to write the {unsaved} tab(s) with unsaved changes."),
+                ),
+                Reach::SignedIn => (NoticeSeverity::Info, "Signed in to the PLM again.".to_string()),
+                Reach::Lost => (
+                    NoticeSeverity::Warning,
+                    "The PLM server is not reachable. Your work stays in the open tabs; a Save made now reaches nothing and the tab stays unsaved.".to_string(),
+                ),
+                Reach::Back if unsaved > 0 => (
+                    NoticeSeverity::Info,
+                    format!("The PLM server is reachable again: Save to write the {unsaved} tab(s) with unsaved changes."),
+                ),
+                Reach::Back => (NoticeSeverity::Info, "The PLM server is reachable again.".to_string()),
+            };
+            docs.engine_mut().push_notice_as(severity, text);
         }
         actions
     }
 
+    /// A Save's write found the server unreachable: say so when it answers
+    /// again, with the tabs still to save.
+    pub fn note_unreachable(&mut self) {
+        self.follower.note_unreachable();
+    }
+
     /// Open a review in the review section (the toolbar's
     /// inbox rows). Opened by the next [`Self::sync`].
+    /// A PLM part the active assembly has changed (not saved yet) that was
+    /// released, or checked out by someone else, since: told now, while the
+    /// user is still working on it, rather than at Save (which then makes a
+    /// new revision for it, or keeps the change in the assembly).
+    fn watch_changed(&mut self, docs: &mut Documents, store: &dyn ModelStore) {
+        let open: Vec<u64> = docs.iter().map(|d| d.id()).collect();
+        self.changed_rows.retain(|id, _| open.contains(id));
+        let active = docs.active_id();
+        let mut now = std::collections::BTreeMap::new();
+        for key in docs.owned_modified_keys_of(active) {
+            let Some((part, revision)) = crate::plm::bom::revision_of_document(&key) else { continue };
+            let Some(row) = store.plm_revision(&crate::plm::identity::document_key(&part, &revision)) else { continue };
+            let other = row.locked_by.clone().filter(|_| !row.locked_by_me);
+            now.insert(key, (row.editable, other, row.lifecycle, row.part_name));
+        }
+        let before = self.changed_rows.remove(&active).unwrap_or_default();
+        let mut told = Vec::new();
+        for (key, (editable, other, lifecycle, name)) in &now {
+            let Some((was_editable, was_other)) = before.get(key) else { continue };
+            let shown = crate::document::owned_save::shown(key, std::slice::from_ref(name));
+            if *was_editable && !editable {
+                told.push(format!("{shown} was {lifecycle} on the PLM while you were changing it here: Save makes a new revision of it for your change"));
+            } else if was_other.is_none() {
+                if let Some(who) = other {
+                    told.push(format!("{shown} was checked out by {who} while you were changing it here: Save keeps your change in this assembly until it can be written"));
+                }
+            }
+        }
+        for text in told {
+            docs.tab_engine_mut().push_notice_as(brep_render::engine_state::NoticeSeverity::Warning, text);
+        }
+        self.changed_rows.insert(active, now.into_iter().map(|(key, (editable, other, ..))| (key, (editable, other))).collect());
+    }
+
     pub fn open_review(&mut self, event: crate::panels::plm_review::PlmReviewEvent) {
         self.review_asked.push(event);
     }
@@ -335,6 +523,12 @@ impl PlmHost {
     pub fn next_follow_in(&self) -> Option<f64> {
         let now = self.started?.elapsed().as_secs_f64();
         self.client.as_ref().map(|_| self.follower.next_in(now))
+    }
+
+    /// This machine signed out of the PLM (Settings › PLM › Forget): the
+    /// refusal the feed meets next is expected, so it raises no prompt.
+    pub fn signed_out_here(&mut self) {
+        self.quiet_sign_out = true;
     }
 
     /// Ask the feed at the next sync instead of at the interval (scripts).
@@ -372,13 +566,14 @@ impl PlmHost {
                 actions.pick_file = Some((PICK_WORKSPACE.into(), "Add a file to this folder".into()));
             }
             if let Some(key) = asked.open {
-                actions.open.push(crate::panels::plm_workspace::document_name(store, &key));
+                let name = crate::panels::plm_workspace::document_name(store, &key);
+                if let Some(folder) = asked.open_folder {
+                    actions.opened_from.push((name.clone(), folder));
+                }
+                actions.open.push(name);
             }
             if let Some((name, bytes)) = asked.downloaded {
-                self.workspace.notice = Some(match store.export_file_named_bytes(&name, &bytes) {
-                    Ok(()) => format!("saved {name}"),
-                    Err(e) => format!("could not save {name}: {e}"),
-                });
+                actions.save_files.push(crate::panels::file::SaveRequest::bytes("Save the file", name, bytes));
             }
         }
         let saved = self.saves_seen.is_some_and(|seen| seen != saves);
@@ -432,6 +627,14 @@ impl PlmHost {
                 self.apply(event, *id, name, store, docs, &mut actions);
             }
         }
+        // The PLM parts the active assembly uses that are checked out to the
+        // user: its Saves check them out, and nothing else gives them back.
+        let active = docs.active_id();
+        self.held = match self.lifecycle.get(&active) {
+            Some(panel) => held_parts(docs.tab_engine().history.parts_library(), store, panel),
+            None => Vec::new(),
+        };
+        self.watch_changed(docs, store);
         let settled: Vec<u64> = self
             .saved_pending
             .iter()
@@ -442,9 +645,9 @@ impl PlmHost {
         for id in settled {
             self.warn_saved_in_review(docs, id);
         }
-        // The files section's exports and downloads need the documents and the
-        // store mutably, which drawing does not have.
-        self.attachments.sync(store, docs);
+        // The files section's exports and downloads need the documents
+        // mutably, which drawing does not have.
+        actions.save_files.extend(self.attachments.sync(docs));
         self.route();
         actions
     }
@@ -466,6 +669,22 @@ impl PlmHost {
             }
         }
         self.repoint.sync(client, docs, waker);
+        let writing = store.pending_writes() > 0;
+        self.cached.sync(client, store, docs, waker, writing);
+        self.superseded.sync(client, store, docs, waker);
+        for (id, update) in std::mem::take(&mut self.superseded_asked) {
+            self.superseded.answer(docs, store, id, update);
+        }
+        for id in std::mem::take(&mut self.superseded_new) {
+            self.superseded.make_new_revision(client, docs, id);
+        }
+        for (id, take) in std::mem::take(&mut self.copies_asked) {
+            self.cached.answer(docs, id, take);
+        }
+        self.tab_follow.poll(docs, waker, writing);
+        for (id, take) in std::mem::take(&mut self.tab_follow_asked) {
+            self.tab_follow.answer(docs, id, take);
+        }
         for (id, choice) in std::mem::take(&mut self.repoint_asked) {
             if let Err(problem) = self.repoint.answer(docs, id, choice) {
                 docs.engine_mut().push_notice(format!("Re-point: {problem}"));
@@ -562,8 +781,17 @@ impl PlmHost {
                 let was_editable = docs.iter().find(|d| d.id() == id).is_some_and(|d| d.save_access().is_editable());
                 set_access(docs, id, access.clone());
                 let unsaved_edits = docs.iter().find(|d| d.id() == id).is_some_and(|doc| doc.is_dirty());
-                if access.is_editable() && !was_editable && !unsaved_edits {
-                    reload(docs, id, name, store);
+                if access.is_editable() && !was_editable && !unsaved_edits && reload(docs, id, name, store) {
+                    // The reload takes the stored document, whose embedded copies
+                    // the open's cached-copy check had refreshed: check them
+                    // again, or the refresh is silently undone.
+                    self.cached.recheck(id);
+                }
+            }
+            PanelEvent::Moved(change) => {
+                if let Some(doc) = docs.iter_mut().find(|d| d.id() == id) {
+                    let (severity, text) = moved_notice(&doc.title(), doc.is_dirty(), &change);
+                    doc.engine.push_notice_as(severity, text);
                 }
             }
             PanelEvent::Open(key) => {
@@ -606,6 +834,9 @@ impl PlmHost {
             || self.workspace.busy()
             || self.follower.busy()
             || self.repoint.busy()
+            || self.cached.busy()
+            || self.superseded.busy()
+            || self.tab_follow.busy()
             || self.parts.busy()
             || !self.inserting.is_empty()
             || self.uploading.is_some()
@@ -643,6 +874,80 @@ impl PlmHost {
             return;
         };
         let active = docs.active_id();
+        if self.tab_follow.asking(active) {
+            ui.colored_label(ui.visuals().warn_fg_color, "Another client saved this revision while you have unsaved edits here.");
+            ui.horizontal(|ui| {
+                let keep = ui.button("Keep my edits");
+                self.hits.insert("follow:keep".into(), keep.rect);
+                if keep.clicked() {
+                    self.tab_follow_asked.push((active, false));
+                }
+                let take = ui.button("Take their version");
+                self.hits.insert("follow:take".into(), take.rect);
+                if take.on_hover_text("Discards your unsaved edits in this tab").clicked() {
+                    self.tab_follow_asked.push((active, true));
+                }
+            });
+            ui.separator();
+        }
+        if self.superseded.asking(active) {
+            let found = self.superseded.found(active);
+            let lines: Vec<String> = found
+                .iter()
+                .map(|s| format!("{}: {} uses {} rev {}; rev {} is current.", s.paths.join(", "), s.number, s.lifecycle, s.from, s.to))
+                .collect();
+            ui.colored_label(ui.visuals().warn_fg_color, lines.join("\n"));
+            ui.horizontal(|ui| {
+                let update = ui.button(if found.len() == 1 { format!("Update to rev {}", found[0].to) } else { "Update them".to_string() });
+                self.hits.insert("superseded:update".into(), update.rect);
+                if update.on_hover_text("Replace with the current release; mates are kept as Replace keeps them. One undo step per part.").clicked() {
+                    self.superseded_asked.push((active, true));
+                }
+                let keep = ui.button("Not now");
+                self.hits.insert("superseded:keep".into(), keep.rect);
+                if keep.clicked() {
+                    self.superseded_asked.push((active, false));
+                }
+            });
+            ui.separator();
+        }
+        if let Some(why) = self.superseded.keeps(active).map(str::to_string) {
+            let found = self.superseded.found(active);
+            let to: Vec<String> = found.iter().map(|s| format!("{} rev {}", s.number, s.to)).collect();
+            ui.colored_label(
+                ui.visuals().warn_fg_color,
+                format!("This assembly keeps the revisions it was built with ({why}). {} superseded.", if found.len() == 1 { "One part it uses is" } else { "Parts it uses are" }),
+            );
+            if self.superseded.creating(active) {
+                ui.horizontal(|ui| { ui.spinner(); ui.label("Making its next revision…"); });
+            } else {
+                let make = ui.button(format!("Make a new revision using {}", to.join(", ")));
+                self.hits.insert("superseded:new-revision".into(), make.rect);
+                if make.on_hover_text("Its next revision, checked out to you, opens with the current revisions in place; this one is not changed").clicked() {
+                    self.superseded_new.push(active);
+                }
+            }
+            ui.separator();
+        }
+        if let Some(paths) = self.cached.asking(active) {
+            ui.colored_label(
+                ui.visuals().warn_fg_color,
+                format!("{} changed on the PLM, and you have unsaved edits to it in this assembly.", paths.join(", ")),
+            );
+            ui.horizontal(|ui| {
+                let keep = ui.button("Keep my edits");
+                self.hits.insert("follow:copies-keep".into(), keep.rect);
+                if keep.clicked() {
+                    self.copies_asked.push((active, false));
+                }
+                let take = ui.button("Take their version");
+                self.hits.insert("follow:copies-take".into(), take.rect);
+                if take.on_hover_text("Discards your unsaved edits to those parts in this assembly").clicked() {
+                    self.copies_asked.push((active, true));
+                }
+            });
+            ui.separator();
+        }
         let mut target = None;
         section(ui, &mut self.hits, LIFECYCLE, |ui, hits| {
             let Some(panel) = self.lifecycle.get_mut(&active) else {
@@ -653,24 +958,55 @@ impl PlmHost {
                 ui.heading(format!("{} · {}", part.number, part.name));
                 if let Some(revision) = panel.revision() {
                     target = Some((part.id.clone(), revision.id.clone()));
-                    match access_for(revision) {
+                    match access_with(revision, panel.rights()) {
                         Access::Editable => { ui.label("Checked out by you"); }
                         Access::ReadOnly { reason } => { ui.colored_label(ui.visuals().warn_fg_color, format!("Session edits allowed; saving unavailable: {reason}")); }
                     }
                 }
-                ui.label("Open revision");
-                for revision in &part.revision_views {
-                    let selected = panel.revision().is_some_and(|r| r.id == revision.id);
-                    let button = ui.selectable_label(selected, &revision.label);
-                    hits.put(&format!("revision:{}", revision.label), button.rect);
-                    if button.clicked() && !selected {
-                        self.picked.push(PanelEvent::Open(revision.document_key.clone()));
+                // The revisions as one dropdown (revision, its open entries
+                // revision#<label>); choosing another opens it.
+                ui.horizontal(|ui| {
+                    ui.label("Open revision");
+                    let choices: Vec<(usize, &str, &str)> =
+                        part.revision_views.iter().enumerate().map(|(i, revision)| (i, revision.label.as_str(), revision.label.as_str())).collect();
+                    let open = part.revision_views.iter().position(|revision| panel.revision().is_some_and(|r| r.id == revision.id));
+                    let mut chosen = open.unwrap_or(usize::MAX);
+                    let mut local = std::collections::HashMap::new();
+                    let (changed, _) = crate::form::enum_dropdown(ui, "revision", &choices, &mut chosen, None, Some(&mut local));
+                    for (key, rect) in local {
+                        hits.put(&key, rect);
                     }
-                }
+                    if changed && Some(chosen) != open {
+                        if let Some(revision) = part.revision_views.get(chosen) {
+                            self.picked.push(PanelEvent::Open(revision.document_key.clone()));
+                        }
+                    }
+                });
                 if panel.offered().contains(&crate::panels::plm::Verb::CheckOut) {
                     let button = ui.button("Check out");
                     hits.put("verb:check-out", button.rect);
                     if button.clicked() { panel.press(&client, crate::panels::plm::Verb::CheckOut); }
+                }
+                // What its Saves checked out stays checked out to the user
+                // (and locked to everyone else) until it is checked in on the
+                // PLM, where the assembly checks in with its children.
+                if !self.held.is_empty() {
+                    let count = self.held.len();
+                    ui.colored_label(
+                        ui.visuals().warn_fg_color,
+                        format!(
+                            "{count} part{} this assembly uses {} checked out to you: {}. Check {} in with the assembly on the PLM (Check in with its children).",
+                            if count == 1 { "" } else { "s" },
+                            if count == 1 { "is" } else { "are" },
+                            self.held.join(", "),
+                            if count == 1 { "it" } else { "them" },
+                        ),
+                    );
+                    if let Some(revision) = panel.revision() {
+                        let route = format!("#/part/{}/{}/summary", crate::plm::identity::segment(&part.id), crate::plm::identity::segment(&revision.id));
+                        let link = web_link(ui, "Check in on the PLM", format!("{}{route}", self.web_base));
+                        hits.put("held:check-in", link.rect);
+                    }
                 }
             }
             if panel.busy() { ui.spinner(); ui.ctx().request_repaint(); }
@@ -739,6 +1075,9 @@ impl PlmHost {
             "busy": panel.is_some_and(|p| p.busy()),
             "message": panel.and_then(|p| p.message()),
             "offered": panel.map(|p| p.offered().iter().filter(|v| **v == crate::panels::plm::Verb::CheckOut).map(|v| v.key()).collect::<Vec<_>>()).unwrap_or_default(),
+            // The PLM parts this assembly uses that are checked out to the
+            // user (Check in with parts gives them back).
+            "held": self.held,
             // The Files section (S8): what is staged, listed, refused.
             "files": self.attachments.state_json(doc.id()),
             // The Parts list (S5): whether this document disagrees with its
@@ -748,6 +1087,16 @@ impl PlmHost {
                 "disagrees": self.repoint.disagreement(doc.id()).is_some(),
                 "repoints": self.repoint.disagreement(doc.id()).map_or(0, |d| d.repoints.len()),
             },
+            // Embedded copies older than their PLM revisions, refreshed on open.
+            "cachedCopies": { "checking": self.cached.busy(), "refreshed": self.cached.refreshed(doc.id()), "unread": self.cached.unread(doc.id()), "live": self.cached.live_json(doc.id()) },
+            // Copies pinned to a superseded or obsolete revision (`plm::superseded`).
+            "superseded": self.superseded.state_json(doc.id()),
+            // Requests the session's PLM client has sent: an operation's cost is
+            // this read before and after it.
+            "requestsSent": self.client.as_ref().map(|c| c.requests_sent()),
+            "requestsByRoute": self.client.as_ref().map(|c| c.requests_by_route()),
+            // Another client saved this tab's revision (`panels::plm_tab_follow`).
+            "followTab": self.tab_follow.state_json(doc.id()),
             // The Parts section (S7).
             "parts": self.parts.state_json(),
             "workspaceThumbnails": self.workspace.thumbnail_entries(),
@@ -757,6 +1106,55 @@ impl PlmHost {
             "whereUsed": self.where_used.state_json(),
         })
         .to_string()
+    }
+}
+
+/// The one notice a change on the PLM under an open tab gets: what moved,
+/// and, when the tab holds unsaved edits, what Save will do with them now.
+fn moved_notice(title: &str, unsaved: bool, change: &crate::panels::plm::Moved) -> (brep_render::engine_state::NoticeSeverity, String) {
+    use crate::panels::plm::Moved;
+    use brep_render::engine_state::NoticeSeverity::{Info, Warning};
+    let kept = "your unsaved changes are only in this tab";
+    match change {
+        // The checkout went away (checked in on the web, or a lock broken
+        // and maybe taken): say so now, not at the next Save.
+        Moved::LockLost { holder, by } => {
+            let how = match by {
+                crate::panels::plm::LockGone::BrokenBy(user) => format!(" ({user} broke your lock)"),
+                crate::panels::plm::LockGone::You => " (you checked it in on the PLM)".to_string(),
+                crate::panels::plm::LockGone::Unknown => String::new(),
+            };
+            let next = match (holder, unsaved) {
+                (Some(user), true) => format!("{user} has it checked out now; Save offers Save As to keep your changes as a new part"),
+                (None, true) => "Save offers to check it out again".to_string(),
+                (Some(user), false) => format!("{user} has it checked out now"),
+                (None, false) => "check it out again to save to it".to_string(),
+            };
+            if unsaved {
+                (Warning, format!("{title} is no longer checked out to you{how}, and {kept}: {next}"))
+            } else {
+                (Info, format!("{title} is no longer checked out to you{how}: {next}"))
+            }
+        }
+        Moved::CheckedOutBy(user) if unsaved => {
+            (Warning, format!("{user} checked out {title}, and {kept}: Save offers Save As to keep them as a new part"))
+        }
+        Moved::CheckedOutBy(user) => (Info, format!("{user} checked out {title}")),
+        Moved::Lifecycle { to, by } => {
+            let by = by.as_deref().map(|user| format!(" by {user}")).unwrap_or_default();
+            let what = match to.as_str() {
+                "released" => format!("{title} was released{by}"),
+                "obsolete" => format!("{title} was made obsolete"),
+                "superseded" => format!("{title} was superseded by a newer release"),
+                other => format!("{title} is {other} now"),
+            };
+            if unsaved {
+                (Warning, format!("{what}, and {kept}: Save offers Save As to keep them as a new revision"))
+            } else {
+                (Info, format!("{what}: it is read-only now"))
+            }
+        }
+        Moved::Renamed(name) => (Info, format!("{title} is named \"{name}\" on the PLM now")),
     }
 }
 
@@ -770,16 +1168,26 @@ fn set_access(docs: &mut Documents, id: u64, access: Access) {
 
 /// Re-read a document that just became editable, if the store holds other
 /// bytes than it shows: someone saved it since it was opened.
-fn reload(docs: &mut Documents, id: u64, name: &str, store: &dyn ModelStore) {
-    let Some(text) = store.read(name) else { return };
-    let Some(doc) = docs.iter_mut().find(|d| d.id() == id) else { return };
+/// Take the stored `name` into tab `id` when it differs; `true` when it did.
+fn reload(docs: &mut Documents, id: u64, name: &str, store: &dyn ModelStore) -> bool {
+    let Some(text) = store.read(name) else { return false };
+    let Some(doc) = docs.iter_mut().find(|d| d.id() == id) else { return false };
+    // The bytes it was opened from: the open's own runs have written into the
+    // tab since (snapshots, a first mate solve), so the compare below always
+    // differs, and the reload ran the whole document a second time per open.
+    if doc.holds_stored(&text) {
+        return false;
+    }
     let same = serde_json::from_str::<serde_json::Value>(&text).ok()
         == serde_json::from_str::<serde_json::Value>(&doc.engine.history.request_json()).ok();
     if same {
-        return;
+        return false;
     }
     if doc.engine.set_history_json(&text).is_ok() {
         doc.mark_clean();
+        doc.note_opened_from(&text);
+        return true;
     }
+    false
 }
 

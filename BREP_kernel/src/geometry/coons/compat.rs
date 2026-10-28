@@ -35,11 +35,11 @@ use crate::{NurbsCurve, Vec4, KNOT_IDENTITY_TOL};
 /// inferred: a caller that promises "bit for bit" needs to see a zero here.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CompatWork {
-    /// Degrees added by [`elevate_degree`].
+    /// Degrees added by `elevate_degree`.
     pub elevated_by: usize,
-    /// Knots added by [`merge_knots`].
+    /// Knots added by `merge_knots`.
     pub knots_inserted: usize,
-    /// Whether [`normalise_domain`] moved the knot domain.
+    /// Whether `normalise_domain` moved the knot domain.
     pub domain_remapped: bool,
 }
 

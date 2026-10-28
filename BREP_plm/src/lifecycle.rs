@@ -7,9 +7,12 @@
 //!
 //! # What is NOT here
 //!
-//! Release does not check children. This server has no BOM yet, so a gate that
-//! claimed to verify "every referenced child is Released" would be verifying
-//! nothing. The rule belongs in the architecture and lands with the BOM.
+//! Only which state may follow which. The release gates that read the rest of
+//! the store live with the write that releases (`Db::transition` in
+//! [`crate::db`]): required catalog values, the released-children gate
+//! (`require_released_children`, over the uses lists in [`crate::bom`]), the
+//! review rule, a workflow required for release, a pending bake, a held
+//! check-out and the `beforeRelease` hook.
 
 use crate::model::Lifecycle;
 

@@ -1,14 +1,14 @@
 //! Importing EVERY part KiCad has, over as many sittings as it takes.
 //!
-//! [`super::kicad_remote`] fetches one file. [`super::kicad_library`] follows one
-//! symbol through the chain and saves one part. This module is the stage on top
+//! [`super::kicad_library`] clones KiCad's libraries (or finds an install),
+//! follows one symbol through the chain and saves one part. This module is the stage on top
 //! of both: it walks every symbol library at a tag, and every symbol in each
 //! one, through the SAME `part_from_symbol` → `import_part` chain, writing one
 //! document per symbol.
 //!
-//! KiCad 9.0.9.1 is ~165 symbol libraries holding thousands of symbols whose 3D
-//! models are gigabytes, and a whole part measured 1.16 s of download and parse.
-//! So a full sweep is hours, and the three things that makes necessary are the
+//! KiCad 9.0.9.1 is ~165 symbol libraries holding thousands of symbols, and the
+//! STEP parse alone is about half a second for a real SOIC-8. So a full sweep
+//! is hours, and the three things that makes necessary are the
 //! whole design of this file: it must show progress, it must stop when asked,
 //! and it must be able to pick up where it left off WITHOUT paying again for
 //! what it already did.
@@ -16,7 +16,7 @@
 //! # The ledger
 //!
 //! Resume is answered by a file, not by looking at what is on disk: one
-//! append-only JSON-lines [`Ledger`] per tag, beside the fetch cache
+//! append-only JSON-lines [`Ledger`] per tag, beside the clones
 //! (`<cache root>/bulk-import-<tag>.jsonl`). One line per part, keyed by the
 //! symbol's `library_id` — `Timer:NE555D`, library nickname included, because
 //! `NE555D` alone is not unique across 165 libraries.
@@ -46,10 +46,8 @@
 //! is in the ledger's FILE NAME: a sweep at another tag is another corpus and
 //! starts its own ledger rather than inheriting conclusions about this one.
 //!
-//! Resume reads that one file once — thousands of short lines, no network, no
-//! per-part `stat` — and skips every key it settled. The fetch cache then skips
-//! the network a second time independently, which is what makes a part that was
-//! interrupted midway through its conversion re-parse without re-downloading.
+//! Resume reads that one file once — thousands of short lines, no per-part
+//! `stat` — and skips every key it settled.
 //!
 //! # Failure is the normal case
 //!
@@ -59,25 +57,19 @@
 //! with a [`Grade`] and never retried, and the part is still written with
 //! whatever it does have.
 //!
-//! What IS retried is a request that went unanswered: a 429 that outlived its
-//! backoff, a 5xx, a dropped connection, a library whose download failed. Those
-//! are recorded [`Outcome::Failed`] and a later run redoes exactly them, with no
-//! mode to select — resume retries failures by definition. This only works
-//! because [`RemoteFiles::take_problems`](super::kicad_remote::RemoteFiles::take_problems)
-//! distinguishes a 404 from an unanswered request: the chain itself cannot, and
-//! without the distinction a rate limit would be written into the ledger as
-//! "KiCad has no model for this part" and never looked at again.
+//! What IS retried is a part whose document could not be written, and a
+//! library whose `.kicad_sym` could not be read: recorded [`Outcome::Failed`]
+//! (or not recorded at all), so a later run redoes exactly them, with no mode
+//! to select — resume retries failures by definition.
 //!
-//! A forced sweep ignores the ledger and redoes everything, still serving files
-//! from the fetch cache — at a fixed tag those files cannot be stale.
+//! A forced sweep ignores the ledger and redoes everything.
 
 #![cfg(not(target_arch = "wasm32"))]
 
 use super::kicad_import::{
     import_part, parse_step, part_from_symbol, read_symbol_library, FootprintChoice, Imported,
-    KicadPart, ModelFile,
+    KicadFiles, KicadLibrary, KicadPart, ModelFile,
 };
-use super::kicad_remote::{Fetcher, RemoteFiles, Repo};
 use crate::store::ModelStore;
 use brep_render::engine_state::EngineState;
 use serde_json::{json, Value};
@@ -164,10 +156,6 @@ pub struct Record {
     pub document: String,
     /// Why the grade is what it is, trimmed.
     pub notes: Vec<String>,
-    /// What this part cost: files downloaded and their bytes. Zero when the
-    /// fetch cache answered every read.
-    pub files: usize,
-    pub bytes: u64,
     /// Unix seconds, so a user can see how far a run got and when.
     pub at: u64,
 }
@@ -178,8 +166,6 @@ impl Record {
         let mut value = json!({
             "key": self.key,
             "document": self.document,
-            "files": self.files,
-            "bytes": self.bytes,
             "at": self.at,
         });
         match &self.outcome {
@@ -222,8 +208,6 @@ impl Record {
                 .and_then(Value::as_array)
                 .map(|list| list.iter().filter_map(Value::as_str).map(str::to_owned).collect())
                 .unwrap_or_default(),
-            files: value.get("files").and_then(Value::as_u64).unwrap_or(0) as usize,
-            bytes: value.get("bytes").and_then(Value::as_u64).unwrap_or(0),
             at: value.get("at").and_then(Value::as_u64).unwrap_or(0),
         })
     }
@@ -501,7 +485,7 @@ fn settle_with_memo(part: &mut KicadPart, memo: &mut HashMap<String, ModelFile>)
 pub struct Progress {
     pub libraries_total: usize,
     pub libraries_done: usize,
-    /// Libraries whose own `.kicad_sym` did not come down. Nothing is recorded
+    /// Libraries whose own `.kicad_sym` could not be read. Nothing is recorded
     /// for their symbols, so a resume walks them again.
     pub libraries_failed: usize,
     pub library: String,
@@ -513,8 +497,6 @@ pub struct Progress {
     pub imported: usize,
     pub skipped: usize,
     pub failed: usize,
-    pub files: usize,
-    pub bytes: u64,
     /// The last few things that went wrong, newest last.
     pub notes: Vec<String>,
     /// The sweep has stopped, for any reason.
@@ -528,7 +510,7 @@ pub struct Progress {
 impl Progress {
     /// How far along, in `0.0..=1.0`: whole libraries plus the fraction of the
     /// one in hand. Honest about what is knowable — the symbol count of a
-    /// library nobody has downloaded yet is not.
+    /// library nobody has read yet is not.
     pub fn fraction(&self) -> f32 {
         if self.libraries_total == 0 {
             return 0.0;
@@ -558,14 +540,12 @@ impl Progress {
             format!("{} {}/{} \u{2014} {}", self.library, self.symbols_done, self.symbols_total, self.symbol)
         };
         format!(
-            "{head} | library {}/{} | {} imported, {} already done, {} failed | {} files, {:.1} MB",
+            "{head} | library {}/{} | {} imported, {} already done, {} failed",
             self.libraries_done.min(self.libraries_total),
             self.libraries_total,
             self.imported,
             self.skipped,
             self.failed,
-            self.files,
-            self.bytes as f64 / 1_048_576.0
         )
     }
 
@@ -583,9 +563,13 @@ impl Progress {
 
 /// What to sweep.
 pub struct Sweep {
-    /// Where files are cached and where the ledger lives.
+    /// Where the ledger lives.
     pub cache_root: PathBuf,
     pub tag: String,
+    /// The folder of `*.kicad_sym` files, and the footprint and model folders
+    /// the chain follows from them.
+    pub symbols_dir: PathBuf,
+    pub library: KicadLibrary,
     /// The symbol libraries to walk, in order. One name is how a user sweeps a
     /// single library, which is also the only size of sweep that has been
     /// measured end to end.
@@ -604,7 +588,7 @@ pub struct Sweep {
 /// down a channel.
 pub fn sweep(
     plan: &Sweep,
-    files: &RemoteFiles,
+    files: &dyn KicadFiles,
     ledger: &mut Ledger,
     writer: &dyn PartWriter,
     cancel: &AtomicBool,
@@ -625,10 +609,11 @@ pub fn sweep(
         report(&progress);
 
         let file = format!("{library}.kicad_sym");
+        let path = plan.symbols_dir.join(&file);
         let read = files
-            .fetch_file(Repo::Symbols, &file)
+            .read(&path.to_string_lossy())
+            .ok_or_else(|| format!("{} could not be read", path.display()))
             .and_then(|bytes| read_symbol_library(&file, &bytes));
-        let _ = files.take_problems();
         let symbols = match read {
             Ok((symbols, _warnings)) => symbols,
             Err(error) => {
@@ -659,32 +644,17 @@ pub fn sweep(
             progress.symbol = key.clone();
             report(&progress);
 
-            // Start the part with a clean slate, so what is drained after it
-            // belongs to it alone.
-            let _ = files.take_fetched();
-            let _ = files.take_problems();
-            let before = files.fetched_bytes();
-
-            let mut part = part_from_symbol(symbol, &FootprintChoice::Named, &files.library(), files);
+            let mut part = part_from_symbol(symbol, &FootprintChoice::Named, &plan.library, files);
             settle_with_memo(&mut part, &mut memo);
 
-            let fetched = files.take_fetched();
-            let problems = files.take_problems();
-            let bytes = files.fetched_bytes().saturating_sub(before);
             let document = bulk_document_name(&key);
             let mut notes: Vec<String> =
                 part.notes.iter().take(LEDGER_NOTES).map(|note| trim_note(note)).collect();
 
             // The document FIRST, its ledger line second. See the module doc.
-            let outcome = if problems.is_empty() {
-                match write_part(writer, &document, &part) {
-                    Ok(_) => Outcome::Done(grade(&part)),
-                    Err(error) => Outcome::Failed(error),
-                }
-            } else {
-                // A part whose reads were not all answered is not a part whose
-                // gaps are KiCad's. Nothing is written for it.
-                Outcome::Failed(problems.join("; "))
+            let outcome = match write_part(writer, &document, &part) {
+                Ok(_) => Outcome::Done(grade(&part)),
+                Err(error) => Outcome::Failed(error),
             };
             let written = matches!(outcome, Outcome::Done(_));
             if let Outcome::Failed(reason) = &outcome {
@@ -694,16 +664,12 @@ pub fn sweep(
             } else {
                 progress.imported += 1;
             }
-            progress.files += fetched.len();
-            progress.bytes += bytes;
 
             let record = Record {
                 key,
                 outcome,
                 document: if written { document } else { String::new() },
                 notes,
-                files: fetched.len(),
-                bytes,
                 at: now(),
             };
             if let Err(error) = ledger.append(record) {
@@ -770,9 +736,7 @@ impl BulkRun {
     }
 
     /// Ask it to stop. Cooperative: the part in hand finishes and is recorded,
-    /// then the sweep returns, so no part is left half-done. A download already
-    /// in flight has to come back first, which is what "at worst one file"
-    /// means.
+    /// then the sweep returns, so no part is left half-done.
     pub fn stop(&self) {
         self.cancel.store(true, Ordering::Relaxed);
     }
@@ -791,12 +755,14 @@ impl BulkRun {
 /// The ledger is opened HERE, before the thread exists, so a cache folder that
 /// cannot be written is an error the user sees instead of an hours-long run
 /// whose progress is lost.
-pub fn start(plan: Sweep, fetch: Fetcher, writer: Box<dyn PartWriter + Send>) -> Result<BulkRun, String> {
+pub fn start(
+    plan: Sweep,
+    files: Box<dyn KicadFiles + Send>,
+    writer: Box<dyn PartWriter + Send>,
+) -> Result<BulkRun, String> {
     let mut ledger = Ledger::open(&plan.cache_root, &plan.tag)?;
     let resumed = ledger.counts().0;
     let path = ledger.path().to_path_buf();
-    let files = RemoteFiles::new(plan.cache_root.clone(), plan.tag.clone(), fetch);
-    files.prepare()?;
     let cancel = Arc::new(AtomicBool::new(false));
     let (send, updates) = std::sync::mpsc::channel();
     let flag = Arc::clone(&cancel);
@@ -806,7 +772,7 @@ pub fn start(plan: Sweep, fetch: Fetcher, writer: Box<dyn PartWriter + Send>) ->
             // waits, and the cancel flag is what stops the sweep.
             let _ = send.send(progress.clone());
         };
-        sweep(&plan, &files, &mut ledger, writer.as_ref(), &flag, &mut report);
+        sweep(&plan, files.as_ref(), &mut ledger, writer.as_ref(), &flag, &mut report);
     });
     Ok(BulkRun {
         updates,

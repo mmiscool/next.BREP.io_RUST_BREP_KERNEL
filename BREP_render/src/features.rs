@@ -151,7 +151,7 @@ pub fn feature_icon(kind: &str) -> Option<char> {
         "THK" | "THICKEN" => 0xE045,
         "SM.TAB" => 0xE046,
         "SM.CF" => 0xE047,
-        "SM.F" => 0xE048,
+        "SM.F" | "SM.CLOSED_CORNER" | "SM.CC" => 0xE048,
         "SM.HEM" => 0xE049,
         "SM.FILLET" | "SM.CFIL" => 0xE04A,
         "SM.CHAMFER" | "SM.CCHM" => 0xE04B,
@@ -167,6 +167,8 @@ pub fn feature_icon(kind: &str) -> Option<char> {
         "TU" | "TUBE" => 0xE055,
         "XFORM" | "TRANSFORM" => 0xE056,
         "PATTERN" => 0xE057,
+        // The component pattern draws the part Pattern's artwork.
+        "APAT" | "PATTERN COMPONENT" => 0xE057,
         "ACOMP" | "ASSEMBLY COMPONENT" => 0xE058,
         "SM.UNFOLD" => 0xE059,
         "TF" | "TRANSFORM FACE" | "TRANSFORMFACE" => 0xE05D,

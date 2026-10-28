@@ -2,7 +2,7 @@
 //! (`brep-mcp` headless / window, or a dial-in adapter).
 //!
 //! Three registries live here; the engine's feature catalogue is the fourth:
-//! - [`command`] — every command registers a [`CommandSpec`] (name, group,
+//! - [`command`] — every command registers a [`CommandSpec`](crate::automation::command::CommandSpec) (name, group,
 //!   doc, derived argument/result schemas, frame phase, annotations, handler)
 //!   in its module's `COMMANDS` static; [`command::registry`] gathers them.
 //!   A host reads the registry and generates its tool list; nothing lists
@@ -70,8 +70,18 @@ mod cmd_ecad;
 mod cmd_state;
 #[cfg(feature = "automation")]
 mod cmd_wire_harness;
+#[cfg(feature = "automation")]
+mod cmd_cam;
+mod cmd_exploded;
+mod cmd_instructions;
+mod cmd_instructions_motion;
+mod cmd_simulation;
+mod cmd_simulation_play;
+mod cmd_cam_sim;
 #[cfg(all(feature = "automation", not(target_arch = "wasm32")))]
 mod cmd_plm;
+#[cfg(all(feature = "automation", not(target_arch = "wasm32")))]
+mod cmd_kicad;
 
 /// How a host builds the app. `store: None` = the default store (the user's
 /// own config directory); a host MUST pass an isolated store. `seed: false`

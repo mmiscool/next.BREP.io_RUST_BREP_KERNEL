@@ -664,6 +664,76 @@ pub fn expand_bom(state: &State, bom: &mut crate::bom::Bom, flat: bool) {
     }
 }
 
+/// The uses list a CAD document implies (S5, derived on the server): one line
+/// per part revision its components place, in the order each first appears;
+/// `quantity` the count, `reference` the occurrences' reference designators
+/// (else their ids) joined by ", ", `unit` "each" — exactly the `{"uses":
+/// [...]}` body the CAD app sends to `PUT …/uses` (`plm::uses::uses_lines`).
+/// `None` for a document that publishes no list (a plain part: no component
+/// and no parts library). `Err` names every occurrence that places no PLM
+/// revision: the app publishes nothing then, and neither does the server.
+pub fn document_uses(document: &Value) -> Option<Result<Value, String>> {
+    let features = document.get("features")?.as_array()?;
+    let library = document.get("partsLibrary").and_then(Value::as_object);
+    let components: Vec<&Value> = features
+        .iter()
+        .filter(|feature| matches!(feature["type"].as_str(), Some("ACOMP") | Some("ASSEMBLY COMPONENT")))
+        .collect();
+    if components.is_empty() && library.is_none_or(|library| library.is_empty()) {
+        return None;
+    }
+    let mut lines: Vec<(String, String, u32, Vec<String>)> = Vec::new();
+    let mut refusals: Vec<String> = Vec::new();
+    for feature in components {
+        let params = &feature["inputParams"];
+        let id = params["id"].as_str().unwrap_or_default().to_string();
+        let designator = params["bom"]["Reference_Designator"].as_str().map(str::trim).unwrap_or_default();
+        let label = if designator.is_empty() { id.clone() } else { designator.to_string() };
+        let part_name = params["partName"].as_str().unwrap_or_default();
+        let Some(entry) = library.and_then(|library| library.get(part_name)) else {
+            refusals.push(format!("{label}: the document has no parts-library entry '{part_name}'"));
+            continue;
+        };
+        let key = entry["sourceKey"].as_str().unwrap_or_default();
+        if key.is_empty() {
+            refusals.push(format!("{label}: '{part_name}' is embedded in this document and was never a part — insert it from the PLM"));
+            continue;
+        }
+        let key = key.strip_prefix("/models/").unwrap_or(key);
+        let key = match key.rsplit_once('.') {
+            Some((stem, extension)) if !extension.contains('/') => stem,
+            _ => key,
+        };
+        let Some((part, revision)) = crate::identity::split_key(key) else {
+            refusals.push(format!("{label}: '{part_name}' is a local component without a PLM revision — import it into PLM first"));
+            continue;
+        };
+        match lines.iter_mut().find(|(p, r, _, _)| *p == part && *r == revision) {
+            Some(line) => {
+                line.2 += 1;
+                line.3.push(label);
+            }
+            None => lines.push((part, revision, 1, vec![label])),
+        }
+    }
+    if !refusals.is_empty() {
+        return Some(Err(format!(
+            "the uses list was not published — {} occurrence{} name{} no PLM revision: {}",
+            refusals.len(),
+            if refusals.len() == 1 { "" } else { "s" },
+            if refusals.len() == 1 { "s" } else { "" },
+            refusals.join("; ")
+        )));
+    }
+    let uses: Vec<Value> = lines
+        .into_iter()
+        .map(|(part, revision, quantity, labels)| {
+            json!({"part": part, "revision": revision, "quantity": quantity, "unit": "each", "find_number": "", "reference": labels.join(", "), "notes": ""})
+        })
+        .collect();
+    Some(Ok(json!({ "uses": uses })))
+}
+
 pub fn document_occurrences(document: &Value) -> Option<Vec<Occurrence>> {
     let features = document.get("features")?.as_array()?;
     let library = document.get("partsLibrary").and_then(Value::as_object);

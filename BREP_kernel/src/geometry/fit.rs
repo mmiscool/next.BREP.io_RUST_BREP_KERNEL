@@ -833,7 +833,7 @@ const LADDER_BUDGET_FACTOR: usize = 2;
 /// or at the input's own station count, whichever comes first.
 ///
 /// 1024 is a COST cap, not a geometric one. As SHIPPED it is a BACKSTOP that
-/// nothing in the corpus reaches, because [`LADDER_BUDGET_FACTOR`] binds first
+/// nothing in the corpus reaches, because `LADDER_BUDGET_FACTOR` binds first
 /// for every caller here (80 → 160 for the imprint driver, 96 → 192 for
 /// `offset_shell`). The reading below is the ladder let OFF that bound, kept
 /// because it is what the ceiling exists for. Measured over the 55-row case
@@ -896,7 +896,7 @@ pub struct PolylineFitReport {
     pub rms: f64,
     /// Largest distance from the curve to the input POLYLINE, sampled between
     /// the fit's own stations. Reported, never compared against the tolerance:
-    /// see [`measure_polyline_fit`] — its floor is the input's chord sag.
+    /// see `measure_polyline_fit` — its floor is the input's chord sag.
     pub between_stations: f64,
     /// The deviation the caller asked for.
     pub tolerance: f64,
@@ -986,7 +986,7 @@ pub enum PolylineFitExit {
     /// tolerance is still unmet. More points cannot help; a different lane, a
     /// finer march or a looser bar can.
     InputExhausted,
-    /// A doubling failed to improve the deviation by [`STALL_FACTOR`], so the
+    /// A doubling failed to improve the deviation by `STALL_FACTOR`, so the
     /// input rather than the station count is what binds. The better of the two
     /// curves is returned.
     Stalled,
@@ -1326,7 +1326,7 @@ pub fn fit_polyline_at(
 /// than returning silently — the interpolant becomes a trim boundary and every
 /// mass property downstream is read off it, so "within a step of the marched
 /// points" is not good enough. This is the same contract
-/// [`offset::fold_locus::fit_locus_pcurve`] already keeps for a traced locus
+/// `offset::fold_locus::fit_locus_pcurve` already keeps for a traced locus
 /// and [`crate::PcurveFitReport`] for a pcurve.
 ///
 /// THE LANE IS ALSO MEASURED. `local_interpolation` is the lane the ladder
@@ -1357,7 +1357,7 @@ pub fn fit_polyline_at(
 /// Escape hatch: `BREP_POLYLINE_FIT_REFINE=0` fits rung zero alone, for
 /// bisecting a moved number against the pre-ladder tree.
 ///
-/// [`offset::fold_locus::fit_locus_pcurve`]: crate::offset
+/// The locus fitter is in `crate::offset::fold_locus`.
 pub fn fit_polyline(
     points: &[Vec3],
     tolerance: f64,

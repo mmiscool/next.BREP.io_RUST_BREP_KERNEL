@@ -1,6 +1,6 @@
 [package]
 name = "BREP_plm"
-version = "0.3.1"
+version = "0.4.0"
 edition = "2021"
 # The floor the rest of the family builds on, and the compiler
 # rust-toolchain.toml pins. Nothing here needs more.
@@ -20,6 +20,8 @@ include = [
     "/web/app.js",
     "/web/webmcp.js",
     "/web/native-import.js",
+    "/web/release-children.js",
+    "/web/used-by.js",
     "/web/setup.js",
     "/web/workflows.js",
     "/web/workflow-flowchart.js",
@@ -93,8 +95,9 @@ brep-script-core = { package = "BREP_script_core", version = "0.1.2", path = "..
 # Scripts' synchronous `http.request`. Sync on purpose: a Boa host function
 # cannot await, and every call carries its own timeout.
 ureq = "2"
-brep-kernel = { package = "BREP_kernel", version = "0.10.0", path = "../BREP_kernel" }
-brep-ecad-core = { package = "BREP_ecad_core", version = "0.3.0", path = "../BREP_ecad_core" }
+brep-kernel = { package = "BREP_kernel", version = "0.11.0", path = "../BREP_kernel" }
+brep-ecad-core = { package = "BREP_ecad_core", version = "0.3.1", path = "../BREP_ecad_core" }
+brep-instructions = { package = "BREP_instructions", version = "0.1.0", path = "../BREP_instructions" }
 # Optional native TLS (`--tls-cert` / `--tls-key`). rustls and ring are
 # already in the tree through ureq; ring, not aws-lc, so no cmake. Plain
 # HTTP/1.1 over the TLS stream, through hyper directly, because axum 0.7's
@@ -105,7 +108,7 @@ hyper-util = { version = "0.1", features = ["tokio", "server", "http1", "service
 # embedded SQLite). `bundled` compiles SQLite itself — no system library, the
 # same SQLite on every machine, and FTS5 with the trigram tokenizer the part
 # search needs.
-rusqlite = { version = "0.40", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled", "backup"] }
 # Backups (`brep-plm backup` / `restore`): one gzipped tar holding the
 # SQLite snapshot, the documents, the attachment blobs and the scripts. Both
 # pure Rust (flate2's default backend is miniz_oxide), and flate2 was already

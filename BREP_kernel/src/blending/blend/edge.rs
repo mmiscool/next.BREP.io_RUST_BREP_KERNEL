@@ -6,6 +6,7 @@ use super::corner::*;
 mod closed;
 mod keep;
 mod open;
+pub(super) use open::{RailWindowReader, network_rail_reuse_on};
 mod support;
 
 pub use closed::{blend_closed_edge, blend_closed_edge_knot_aware, blend_edge_variable, is_pcurve_floor_refusal, with_pcurve_knot_retry};

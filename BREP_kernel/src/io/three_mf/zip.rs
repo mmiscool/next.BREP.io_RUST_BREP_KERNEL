@@ -124,7 +124,7 @@ fn add(a: usize, b: usize) -> Result<usize, ZipError> {
 }
 
 /// CRC-32 (IEEE 802.3), computed bitwise so no static table is needed.
-fn crc32(data: &[u8]) -> u32 {
+pub(super) fn crc32(data: &[u8]) -> u32 {
     let mut crc = 0xffff_ffffu32;
     for &byte in data {
         crc ^= u32::from(byte);

@@ -113,7 +113,7 @@ impl EngineState {
         Ok(rows)
     }
 
-    /// Export the BOM as CSV: the exact [`BOM_CSV_HEADER`], one line per row,
+    /// Export the BOM as CSV: the exact `BOM_CSV_HEADER`, one line per row,
     /// LF endings. A cut length is written to three decimals; a wire without
     /// one leaves `mfQty` empty and names the reason in `status`.
     pub fn export_bom_csv(&mut self) -> Result<String, String> {
@@ -327,7 +327,7 @@ impl EngineState {
 
     /// Write ONE attribute on the open document. `Value::Null` (or an empty
     /// string) REMOVES the key, and the last key takes the empty record with
-    /// it — [`write_attribute`]'s rules, shared with the library-entry lane, so
+    /// it — `write_attribute`'s rules, shared with the library-entry lane, so
     /// a document that was never annotated serializes exactly as before.
     ///
     /// Unlike [`Self::set_part_attribute`] there is no kernel store to keep in

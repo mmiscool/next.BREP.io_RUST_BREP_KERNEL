@@ -10,11 +10,15 @@ use std::collections::HashMap;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum FaceKind {
     Unknown,
+    /// The cap a PMI section view draws over a cut (`pmi_section`): display
+    /// only, no kernel face — it carries the section colour and is picked as
+    /// its solid.
+    SectionCap,
 }
 
 /// One face of a solid: a contiguous triangle range of the solid mesh plus the
 /// kernel face identity.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct FaceDisplay {
     /// Kernel face name (byte-exact pipeline name); empty when unnamed.
     pub name: String,
@@ -35,7 +39,7 @@ pub struct FaceDisplay {
 
 /// One display edge: a world-space polyline plus the kernel edge identity and
 /// the typed flags the previous display layer kept per object.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct EdgeDisplay {
     /// Kernel edge name (`faceA|faceB[n]` convention); empty when unnamed.
     pub name: String,
@@ -51,7 +55,7 @@ pub struct EdgeDisplay {
 }
 
 /// One display vertex (kernel topology vertex).
-#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct VertexDisplay {
     pub topo_id: u64,
     pub position: [f64; 3],
@@ -59,7 +63,7 @@ pub struct VertexDisplay {
 
 /// The triangle mesh of one solid, ready for GPU upload (f32; the kernel's f64
 /// buffers are narrowed exactly once, here).
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct DisplayMesh {
     /// Interleaved-ready parallel arrays: xyz per vertex.
     pub positions: Vec<[f32; 3]>,
@@ -71,7 +75,7 @@ pub struct DisplayMesh {
 }
 
 /// A displayed solid: mesh + named faces/edges/vertices + visibility.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SolidDisplay {
     /// Kernel solid name — the scene key.
     pub name: String,
@@ -87,12 +91,31 @@ pub struct SolidDisplay {
     /// Optional per-solid base color override (R14 — user-set solid color),
     /// else the name-hashed stable color is used.
     pub color_override: Option<[f32; 3]>,
+    /// Display-only opacity (0 clear .. 1 opaque; `None` = opaque): a motion
+    /// study's transparency clip. A translucent solid draws after every opaque
+    /// one through the blended pass, with its base colour's alpha set to this.
+    pub opacity: Option<f32>,
     /// Monotonic content revision (R10). Every freshly built display gets a
     /// unique value, so the renderer's GPU-buffer cache re-uploads on any
     /// rebuild — correct-by-default (equivalent to teardown-rebuild). The
     /// reused-buffer fast path (keep a revision stable across a `reused`
     /// pipeline result) is a follow-up optimization.
     pub revision: u64,
+    /// Nonzero: this display is the solid of revision `shape_revision`, MOVED
+    /// rigidly (the same mesh topology, faces, edges, vertices and styles; only
+    /// positions and normals differ). The renderer may then rewrite those in the
+    /// buffers it already holds instead of rebuilding them. Every other change
+    /// resets it to 0, so a stale value can never skip a rebuild.
+    #[serde(default)]
+    pub shape_revision: u64,
+    /// The affine (column-major 4×4) that takes the geometry of shape
+    /// `shape_revision` to this display's positions, when that is all that
+    /// moved it (an explode pose): the renderer then draws the buffers it holds
+    /// for the shape through it, writing a matrix instead of every vertex.
+    /// `None` for an unposed display, and for one moved any other way; every
+    /// change that resets `shape_revision` resets this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pose: Option<[f32; 16]>,
     pub mesh: DisplayMesh,
     pub faces: Vec<FaceDisplay>,
     pub edges: Vec<EdgeDisplay>,
@@ -155,6 +178,14 @@ pub struct RenderScene {
     /// Bumped whenever [`Self::set_visible`] actually CHANGES a solid's
     /// visibility — see [`Self::visibility_revision`].
     visibility_revision: u64,
+    /// A Work part's CONTEXT scene only: the context faces drawn emphasised,
+    /// `(solid, face, selected)` (else hovered). Set by
+    /// `EngineState::sync_context_highlight`; the context render pass reads it.
+    pub highlight: Vec<(String, String, bool)>,
+    /// A Work part's CONTEXT scene only: its colour and opacity (`None`: the
+    /// default [`crate::render::WORK_PART_CONTEXT_RGBA`]). Set by
+    /// `EngineState::set_context_display`; the context render pass reads it.
+    pub tint: Option<[f32; 4]>,
 }
 
 impl RenderScene {
@@ -180,6 +211,7 @@ impl RenderScene {
         self.pick_trees.get_mut().clear();
         self.solids.clear();
         self.index.clear();
+        self.highlight.clear();
     }
 
     /// Empty the scene, RETURNING every solid by value (the name index is cleared
@@ -203,6 +235,8 @@ impl RenderScene {
         if solid.color_override != color {
             solid.color_override = color;
             solid.revision = next_revision();
+            solid.shape_revision = 0;
+            solid.pose = None;
         }
         true
     }
@@ -217,7 +251,7 @@ impl RenderScene {
     /// know about neither.
     ///
     /// SKETCH sheets are skipped: their `color_override` is the synthesized
-    /// [`crate::engine_state::SKETCH_SHEET_COLOR`], not a metadata colour, and
+    /// `crate::engine_state::SKETCH_SHEET_COLOR`, not a metadata colour, and
     /// re-deriving it from a store that has no record for the sheet would blank
     /// it back to the global face colour.
     ///
@@ -238,6 +272,10 @@ impl RenderScene {
                 changed = true;
             }
             for face in &mut solid.faces {
+                // A section cap keeps the section colour its view gave it.
+                if face.kind == FaceKind::SectionCap {
+                    continue;
+                }
                 // An unnamed face can carry no metadata record, so it always
                 // inherits the solid rather than costing a store lookup.
                 let want = if face.name.is_empty() {
@@ -252,6 +290,8 @@ impl RenderScene {
             }
             if changed {
                 solid.revision = next_revision();
+                solid.shape_revision = 0;
+                solid.pose = None;
                 any = true;
             }
         }
@@ -372,7 +412,7 @@ impl RenderScene {
         }
     }
 
-    /// See [`Self::exact`]'s revision counter.
+    /// See `Self::exact`'s revision counter.
     pub fn exact_revision(&self) -> u64 {
         self.exact_revision
     }
@@ -745,7 +785,10 @@ pub fn solid_display_from_payload(
         source_handle: 0, // set by the caller that knows the resident handle
         visible: true,
         color_override: None,
+        opacity: None,
         revision: next_revision(),
+        shape_revision: 0,
+        pose: None,
         mesh: DisplayMesh {
             positions,
             normals,

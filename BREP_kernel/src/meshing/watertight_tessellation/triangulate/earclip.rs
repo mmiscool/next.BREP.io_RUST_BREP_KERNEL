@@ -283,8 +283,7 @@ pub(in crate::watertight_tessellation) fn ear_clip(
             // ear is either near-zero area or "contains" an on-edge vertex.
             // Split the ring on a VALIDATED interior diagonal and recurse —
             // region-respecting by construction, unlike the fan fallback,
-            // which sprays triangles across concavities (problemInbox
-            // 2026-08-04: junk triangles on a merged planar face).
+            // which sprays triangles across concavities.
             if let Some((oa, ob)) = find_split_diagonal(&vertices, indices, epsilon, region) {
                 let mut first: Vec<usize> = indices[oa..=ob].to_vec();
                 let mut second: Vec<usize> = indices[ob..].to_vec();

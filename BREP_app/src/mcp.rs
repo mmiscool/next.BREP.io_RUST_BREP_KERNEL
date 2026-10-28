@@ -8,7 +8,7 @@
 //! Code or Codex can drive the app a person is looking at.
 //!
 //! Sequence (main.rs): bind the listener → print how to configure the agent →
-//! open the window → once the app exists, [`start`] attaches the server to its
+//! open the window → once the app exists, [`start`](crate::mcp::start) attaches the server to its
 //! queue and serves. The store is the user's own (this is their app, not a
 //! test host), which is what the tools' docs say.
 use crate::automation::command::{Envelope as AppEnvelope, Reply as AppReply};

@@ -10,12 +10,12 @@ use crate::{ExtendRefusal, KernelRefusal, KernelStage, OrRefuse};
 /// The offset meridian runs between the source parameters at which it reaches
 /// each rim's cap plane, so a rim is the offset carrier's intersection with its
 /// cap rather than the offset of the old rim (see
-/// [`offset_general_revolution_face`]).
+/// `offset_general_revolution_face`).
 ///
 /// A PARTIAL CYLINDER (an extruded sketch arc, a fillet band between planes)
 /// does not take the general lane: its meridian edges usually meet planes that
 /// are parallel to the axis but do not contain it, where keeping a corner at
-/// its old azimuth is wrong. [`offset_partial_cylinder_face`] re-intersects
+/// its old azimuth is wrong. `offset_partial_cylinder_face` re-intersects
 /// those corners exactly first, and only a face outside its scope falls
 /// through to the general lane below.
 ///

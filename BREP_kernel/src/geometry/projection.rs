@@ -434,7 +434,7 @@ fn surface_newton(
 /// The point of `surface` nearest `point`, over the surface's whole domain.
 ///
 /// Analytic carriers answer in closed form; every other surface goes through
-/// [`project_point_to_surface_general`], which says what it guarantees.
+/// `project_point_to_surface_general`, which says what it guarantees.
 /// `#[track_caller]` names the call site in the `BREP_PROJECTION_AUDIT` log.
 #[track_caller]
 pub fn project_point_to_surface(

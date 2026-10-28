@@ -33,6 +33,9 @@ pub const FAMILY_SOURCE_KEY: &str = "familySource";
 pub const TEMPLATE_INPUTS_KEY: &str = "templateInputs";
 /// The document key a spun-out copy records its template under.
 pub const TEMPLATE_SOURCE_KEY: &str = "templateSource";
+/// The Save As lineage chain the CAD app writes (identities a part was saved
+/// from). Not the model; members and template instances do not inherit it.
+pub const DERIVED_FROM_KEY: &str = "derivedFrom";
 /// The document key the class is stored under. A normal part writes none.
 pub const DOCUMENT_CLASS_KEY: &str = "documentClass";
 /// The document key the part attributes (the BOM's source) live under.
@@ -270,12 +273,15 @@ pub fn stable_json_hash(value: &Value) -> u64 {
 
 /// The keys that are not the family's MODEL: the table (a row edit must not
 /// regenerate every member), the class, the view state, and stamps.
-const NOT_THE_MODEL: [&str; 6] = [
+const NOT_THE_MODEL: [&str; 7] = [
     FAMILY_TABLE_KEY,
     DOCUMENT_CLASS_KEY,
     "workbench",
     FAMILY_SOURCE_KEY,
     TEMPLATE_SOURCE_KEY,
+    // The CAD app's Save As lineage chain (Replace component): where the
+    // document came from, not its model.
+    DERIVED_FROM_KEY,
     // The embedded preview a CAD save writes into the document: derived from
     // the model, and the CAD app's copy of this list excludes it too.
     "thumbnail",
@@ -341,6 +347,7 @@ pub fn member_document(family: &Value, family_file: &str, row: &FamilyRow) -> Va
         object.remove(DOCUMENT_CLASS_KEY);
         object.remove(TEMPLATE_INPUTS_KEY);
         object.remove(TEMPLATE_SOURCE_KEY);
+        object.remove(DERIVED_FROM_KEY);
         object.insert(
             "expressions".into(),
             Value::String(rewrite_expressions(expressions, &row.values)),
@@ -479,6 +486,7 @@ pub fn spin_out(
     object.remove(DOCUMENT_CLASS_KEY);
     object.remove(FAMILY_TABLE_KEY);
     object.remove(FAMILY_SOURCE_KEY);
+    object.remove(DERIVED_FROM_KEY);
     object.insert(
         TEMPLATE_SOURCE_KEY.into(),
         serde_json::json!({ "template": template_file, "contentHash": template_hash(template) }),

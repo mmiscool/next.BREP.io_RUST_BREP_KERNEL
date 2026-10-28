@@ -130,6 +130,12 @@ pub struct PlmCall {
     /// `anonymous` for none.
     #[serde(default, rename = "as", skip_serializing_if = "Option::is_none")]
     pub as_user: Option<String>,
+    /// Call as that account's signed-in BROWSER instead of its token: sign in
+    /// with its password and send the session cookie and CSRF token, as the
+    /// PLM page does. For routes a token may not call (deciding a desktop
+    /// sign-in link).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub browser: bool,
     /// Name values in the answer for later strings: `{"part": "/id"}` makes
     /// `${plm:part}` the answer's `id`. A pointer that finds nothing fails.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
@@ -267,6 +273,14 @@ fn default_motion_hold_ms() -> u32 {
 fn default_cursor_scale() -> u32 {
     3
 }
+
+/// The step the runner answers itself, from the script's PLM fixture.
+/// Here, not in `runner`: the script format builds without the server.
+pub const PLM_REQUEST: &str = "plm_request";
+
+/// The other step the runner answers itself: `{"action": "stop" | "start"}`
+/// takes the script's PLM server down and brings the same one back.
+pub const PLM_SERVER: &str = "plm_server";
 
 /// The tools a [`Motion`] can film: the three drag compositions, which are the
 /// only steps that have a press, a travel and a release to film.
@@ -416,6 +430,23 @@ impl Script {
                         return Err(format!("step {i}: `frame.motion.cursor_scale` must be at least 1"));
                     }
                 }
+            }
+            // A field the runner cannot honour on this step is refused by
+            // name, never dropped: a plm_request's dropped `bind` once showed
+            // up only as "not known" two steps later.
+            if (step.tool == PLM_REQUEST || step.tool == PLM_SERVER) && (step.save.is_some() || step.compare.is_some()) {
+                return Err(format!(
+                    "step {i}: `{}` is answered by the runner and makes no image, so `save` / `compare` cannot be honoured",
+                    step.tool
+                ));
+            }
+            if !step.bind.is_empty() && step.expect_error.is_some() {
+                return Err(format!(
+                    "step {i}: `bind` reads the step's result, but `expect_error` expects it to fail, so nothing would be bound"
+                ));
+            }
+            if !step.bind.is_empty() && s.plm.is_none() {
+                return Err(format!("step {i}: `bind` needs the script to declare `plm`, which holds the variables"));
             }
             for (j, e) in step.expect.iter().enumerate() {
                 if e.operator_count() != 1 {

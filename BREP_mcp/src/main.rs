@@ -257,7 +257,7 @@ fn main() {
                     // A script that only uses catalogue tools needs no app.
                     // Nor does one that only talks to its PLM fixture.
                     let needs_app = script.steps.iter().any(|s| {
-                        !matches!(s.tool.as_str(), "feature_catalogue" | "feature_schema" | brep_mcp::runner::PLM_REQUEST)
+                        !matches!(s.tool.as_str(), "feature_catalogue" | "feature_schema" | brep_mcp::runner::PLM_REQUEST | brep_mcp::runner::PLM_SERVER)
                     });
                     // The session's STORE is a real directory beside the run's
                     // artefacts, so the file modal lists what this script saved

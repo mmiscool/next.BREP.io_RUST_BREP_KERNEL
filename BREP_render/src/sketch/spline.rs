@@ -69,7 +69,7 @@ pub struct InsertedAnchor {
 ///   spline's own guides shadow it and make the very splines a user most wants to
 ///   refine the ones that cannot be refined.
 /// * The clicked span must have four DISTINCT ids and the click must land clear of
-///   the span's ends ([`MIN_SPAN_PARAM`]) — a cusp built by repeating an id cannot be
+///   the span's ends (`MIN_SPAN_PARAM`) — a cusp built by repeating an id cannot be
 ///   subdivided without corrupting the other role, and a split at a span end is
 ///   degenerate.
 ///

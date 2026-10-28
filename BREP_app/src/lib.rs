@@ -21,6 +21,7 @@ pub mod form;
 pub mod form_view;
 pub mod icon_text;
 pub mod icons;
+pub mod instructions;
 mod http;
 /// The native binary's `log` sink (`main.rs`): `RUST_LOG` to stderr. Replaces
 /// `env_logger`; the wasm build logs through the browser console instead.
@@ -42,6 +43,8 @@ pub mod recovery;
 /// Scripts in the CAD app: the CAD host for the PLM's interpreter core (S11).
 #[cfg(feature = "scripting")]
 pub mod scripting;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod simulation_export;
 pub mod store;
 /// A template's input marks and its spin-out (`.tbrep`).
 pub mod template;

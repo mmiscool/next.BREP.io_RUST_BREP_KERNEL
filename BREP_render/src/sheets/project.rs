@@ -143,6 +143,11 @@ pub struct ViewDrawing {
     pub error: String,
     /// The model as VISIBLE edge lines, one polyline per visible run.
     pub edges: Vec<Vec<[f64; 2]>>,
+    /// Visible runs drawn in the HIGHLIGHT stroke (the manufacturing
+    /// instructions draw the parts a step adds this way); empty on a sheet.
+    /// They are not among `edges`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub highlighted: Vec<Vec<[f64; 2]>>,
     /// Every enabled, resolved annotation of the saved view, projected.
     pub annotations: Vec<AnnotationDrawing>,
     /// Every point of this projection a SHEET dimension can be anchored to —
@@ -227,6 +232,7 @@ impl ViewDrawing {
             scale: placed.scale,
             error: String::new(),
             edges: Vec::new(),
+            highlighted: Vec::new(),
             annotations: Vec::new(),
             anchors: Vec::new(),
             text_mm: 0.0,
@@ -511,7 +517,7 @@ pub fn project_view(
     report: Option<&PmiViewReport>,
 ) -> ViewDrawing {
     let (unposed, env) = (Unposed::new(), brep_kernel::Env::default());
-    project_view_through(&Model { scene, unposed: &unposed, env: &env }, placed, view, report, None, &mut LinesMode::Compute)
+    project_view_through(&Model { scene, unposed: &unposed, env: &env }, placed, view, report, None, None, &mut LinesMode::Compute)
 }
 
 /// What a projection reads beside the sheet and its PMI views: the scene, the
@@ -551,10 +557,11 @@ impl HiddenLine {
 
 /// What a SECTION placement projects through, once its cut has been resolved
 /// against the source placement's projection: the derived camera frame, the
-/// half-space to keep, and the letter.
+/// half-space to keep, the second plane of a half section, and the letter.
 pub struct SectionSetup {
     pub frame: ViewFrame,
     pub plane: ClipPlane,
+    pub half: Option<super::hlr::HalfLine>,
     pub label: String,
 }
 
@@ -587,17 +594,21 @@ pub enum Derived {
 /// With a DETAIL, the frame is the source's camera re-targeted on the circle's
 /// centre (so this placement's `position` is where the centre lands), and
 /// visibility is decided inside the circle's cylinder at the detail's own
-/// scale; [`clip_to_circle`] then trims only a chord that bows past the rim.
+/// scale; `clip_to_circle` then trims only a chord that bows past the rim.
 ///
 /// Both draw the model ONLY: the saved view's annotations were laid out
 /// against THAT view's camera and scale, and a section's camera is a different
 /// one, while a detail's circle would cut a dimension or a frame in half.
+///
+/// `letter` captions a plain placement of a SECTIONED saved view
+/// ([`super::Sheet::view_letters`]); a derived view carries its own.
 pub fn project_view_through(
     model: &Model,
     placed: &PlacedView,
     view: Option<&PmiView>,
     report: Option<&PmiViewReport>,
     derived: Option<Derived>,
+    letter: Option<&str>,
     mode: &mut LinesMode,
 ) -> ViewDrawing {
     let (scene, unposed) = (model.scene, model.unposed);
@@ -623,11 +634,27 @@ pub fn project_view_through(
     }
 
     let saved_section = derived.is_none() && view.display.section.is_some();
-    let derived = derived.or_else(|| view.section_plane().map(|(point, normal)| {
+    // A half section draws as one: the second plane is edge-on to the section
+    // view, a line on the paper. Any other set of planes has no such drawing.
+    let planes = if derived.is_none() { view.section_planes_in(report) } else { Vec::new() };
+    if planes.len() > 2 || planes.get(1).is_some_and(|(_, second)| dot(*second, planes[0].1).abs() > 1e-6) {
+        out.error = format!(
+            "PMI view '{}' is sectioned by {} planes; a sheet draws one plane, or a half section of two perpendicular planes",
+            placed.view,
+            planes.len()
+        );
+        return out;
+    }
+    let derived = derived.or_else(|| planes.first().map(|&(point, normal)| {
         let original = ViewFrame::of(camera);
         let seed = if dot(original.up, normal).abs() < 0.99 { original.up } else if normal[0].abs() < 0.9 { [1., 0., 0.] } else { [0., 1., 0.] };
         let right = norm(cross(normal, seed));
-        Derived::Section(SectionSetup { frame: ViewFrame { target: point, right, up: cross(right, normal), forward: normal }, plane: ClipPlane { point, normal }, label: view.name.clone() })
+        let frame = ViewFrame { target: point, right, up: cross(right, normal), forward: normal };
+        let half = planes.get(1).map(|&(at, second)| {
+            let (normal, at) = ([dot(second, frame.right), dot(second, frame.up)], frame.to_view(at));
+            super::hlr::HalfLine { normal, offset: normal[0] * at[0] + normal[1] * at[1] }
+        });
+        Derived::Section(SectionSetup { frame, plane: ClipPlane { point, normal }, half, label: letter.unwrap_or("A").to_string() })
     }));
     let frame = match &derived {
         Some(Derived::Section(setup)) => setup.frame,
@@ -640,13 +667,19 @@ pub fn project_view_through(
     // did not reach the scene sends the placement to the mesh approximation,
     // and so does a pass handed to the runner that has not come back yet. The
     // placement says which drew it rather than drawing that solid as nothing.
-    let plan = exact_solids(scene, view, report);
+    let plan = exact_solids(scene, unposed, view, report);
     let clip = match &derived {
         None => LinesClip::Whole,
         Some(Derived::Detail(setup)) => LinesClip::Circle { radius: setup.radius },
-        Some(Derived::Section(_)) => LinesClip::Section,
+        Some(Derived::Section(setup)) => LinesClip::Section { half: setup.half },
     };
     let exact = plan.as_ref().and_then(|plan| exact_lines_for(plan, &frame, placed, clip, mode));
+    if matches!(mode, LinesMode::Export(_)) && exact.is_none() {
+        if plan.is_none() {
+            out.error = "exact geometry is unavailable for this picture".into();
+        }
+        return out;
+    }
     out.hidden_line = if exact.is_some() { HiddenLine::Analytic } else { HiddenLine::Mesh }.label().into();
     match &derived {
         None => {
@@ -785,10 +818,12 @@ pub fn project_sheet_with(
     // a PLAIN one — a section or a detail OF a section or a detail is refused
     // by name rather than ordered, because this pass is one pass and a chain
     // would need as many.
+    let letters = sheet.view_letters(views);
     let mut drawn: Vec<ViewDrawing> = sheet
         .views
         .iter()
-        .map(|placed| {
+        .zip(&letters)
+        .map(|(placed, letter)| {
             let saved = views.iter().find(|view| view.id == placed.view);
             if placed.section.is_some() || placed.detail.is_some() {
                 // A stand-in until the second pass: it holds the id and the
@@ -796,7 +831,7 @@ pub fn project_sheet_with(
                 // row and a grab rect on the paper.
                 ViewDrawing::empty(placed, saved.map(|v| v.name.clone()).unwrap_or_default())
             } else {
-                project_view_through(model, placed, saved, report.and_then(|report| report.view(&placed.view)), None, mode)
+                project_view_through(model, placed, saved, report.and_then(|report| report.view(&placed.view)), None, letter.as_deref(), mode)
             }
         })
         .collect();
@@ -811,6 +846,7 @@ pub fn project_sheet_with(
                     views.iter().find(|view| view.id == placed.view),
                     report.and_then(|report| report.view(&placed.view)),
                     Some(Derived::Detail(setup)),
+                    None,
                     mode,
                 );
                 let mark = DetailMark { id: placed.id.clone(), ..mark };
@@ -831,6 +867,7 @@ pub fn project_sheet_with(
                     views.iter().find(|view| view.id == placed.view),
                     report.and_then(|report| report.view(&placed.view)),
                     Some(Derived::Section(setup)),
+                    None,
                     mode,
                 );
                 // The LINE goes on the source, where it was picked. Its own
@@ -840,6 +877,32 @@ pub fn project_sheet_with(
                 let source_placed = &sheet.views[source];
                 drawn[source].bounds = bounds_of(&drawn[source], source_placed);
             }
+        }
+    }
+    // A saved sectioned view's cutting plane, on every plain placement that
+    // sees it edge-on: its line, arrows and letter, as a picked cut's.
+    for (index, placed) in sheet.views.iter().enumerate() {
+        if placed.section.is_some() || placed.detail.is_some() {
+            continue;
+        }
+        let Some(label) = drawn[index].section.as_ref().map(|section| section.label.clone()) else { continue };
+        let Some(view) = views.iter().find(|view| view.id == placed.view) else { continue };
+        let Some((point, normal)) = view.section_plane_in(report.and_then(|report| report.view(&placed.view))) else { continue };
+        for (other, source) in sheet.views.iter().enumerate() {
+            if other == index || source.section.is_some() || source.detail.is_some() {
+                continue;
+            }
+            if drawn[other].section.is_some() || !drawn[other].error.is_empty() {
+                continue;
+            }
+            let Some(camera) = views.iter().find(|view| view.id == source.view).and_then(|view| view.camera.as_ref()) else { continue };
+            let frame = ViewFrame::of(camera);
+            if dot(normal, frame.forward).abs() > 1e-6 {
+                continue;
+            }
+            let Some(mark) = plane_mark(&drawn[other], source, &frame, point, normal, &placed.id, &label) else { continue };
+            drawn[other].section_marks.push(mark);
+            drawn[other].bounds = bounds_of(&drawn[other], source);
         }
     }
     // The sheet's own dimensions come LAST: they anchor to the placements'
@@ -964,6 +1027,7 @@ fn section_setup(
     let setup = SectionSetup {
         frame: ViewFrame { target, right, up: cross(right, forward), forward },
         plane: ClipPlane { point: target, normal: forward },
+        half: None,
         label: cut.label.clone(),
     };
     let cap = if source.text_mm > 1e-9 { source.text_mm } else { 12.0 * MM_PER_POINT };
@@ -989,6 +1053,54 @@ fn section_mark(
     // order the camera is, so the arrows point where the section looks.
     let sign = if cut.flip { -1.0 } else { 1.0 };
     let look = [-along[1] * sign, along[0] * sign];
+    cutting_mark(&placed.id, &cut.label, from, to, look, cap)
+}
+
+/// A saved section's cutting plane `(point, normal)` on a plain placement
+/// whose camera `frame` sees it edge-on: the plane's trace across the
+/// placement's drawn edges, arrows the way the section looks. `None` when the
+/// placement draws nothing to cross.
+fn plane_mark(
+    source: &ViewDrawing,
+    placed: &PlacedView,
+    frame: &ViewFrame,
+    point: [f64; 3],
+    normal: [f64; 3],
+    id: &str,
+    label: &str,
+) -> Option<SectionMark> {
+    let paper = |v: [f64; 3]| {
+        let length = (v[0] * v[0] + v[1] * v[1]).sqrt();
+        (length > 1e-9).then(|| [v[0] / length, v[1] / length])
+    };
+    // Paper y runs DOWN: a view direction's paper image is (right, −up).
+    let at = frame.to_view(point);
+    let centre = to_paper(placed, at[0], at[1]);
+    let trace = cross(normal, frame.forward);
+    let along = paper([dot(trace, frame.right), -dot(trace, frame.up), 0.0])?;
+    let look = paper([dot(normal, frame.right), -dot(normal, frame.up), 0.0])?;
+    let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
+    for p in source.edges.iter().flatten() {
+        let t = (p[0] - centre[0]) * along[0] + (p[1] - centre[1]) * along[1];
+        lo = lo.min(t);
+        hi = hi.max(t);
+    }
+    if !(hi > lo) {
+        return None;
+    }
+    let from = [centre[0] + along[0] * lo, centre[1] + along[1] * lo];
+    let to = [centre[0] + along[0] * hi, centre[1] + along[1] * hi];
+    let cap = if source.text_mm > 1e-9 { source.text_mm } else { 12.0 * MM_PER_POINT };
+    Some(cutting_mark(id, label, from, to, look, cap))
+}
+
+/// A cutting line from `from` to `to` on the paper, with a tail past each end,
+/// an arrow at each pointing `look` (a unit paper direction), and `label`
+/// beside each arrow — for the SECTION placement `id`.
+fn cutting_mark(id: &str, label: &str, from: [f64; 2], to: [f64; 2], look: [f64; 2], cap: f64) -> SectionMark {
+    let span = [to[0] - from[0], to[1] - from[1]];
+    let length = (span[0] * span[0] + span[1] * span[1]).sqrt().max(1e-9);
+    let along = [span[0] / length, span[1] / length];
     let tail = cap * 1.5;
     let arrow = cap * 1.2;
     let mut lines = vec![vec![
@@ -1011,7 +1123,7 @@ fn section_mark(
             tip,
         ]);
         texts.push(SheetText::flat(
-            cut.label.clone(),
+            label.to_string(),
             [
                 root[0] + outward[0] * cap * 1.2 + look[0] * cap * 0.6,
                 root[1] + outward[1] * cap * 1.2 + look[1] * cap * 0.6,
@@ -1019,7 +1131,7 @@ fn section_mark(
             cap,
         ));
     }
-    SectionMark { id: placed.id.clone(), label: cut.label.clone(), lines, texts }
+    SectionMark { id: id.to_string(), label: label.to_string(), lines, texts }
 }
 
 /// Where anchor `reference` landed on a finished placement's paper, or the
@@ -1315,11 +1427,37 @@ impl SolidPose {
     pub fn apply(&self, p: [f64; 3]) -> [f64; 3] {
         let (center, scale, translate) = (self.center, self.scale, self.translate);
         let local = [(p[0] - center[0]) * scale[0], (p[1] - center[1]) * scale[1], (p[2] - center[2]) * scale[2]];
-        let rotated = crate::engine_state::rotate_euler_xyz_f64(local, self.rotate_deg);
+        // Degrees, as the kernel's explode rows and balloon anchors read them.
+        let rotated = crate::engine_state::rotate_euler_xyz_f64(local, self.rotate_deg.map(f64::to_radians));
         [
             rotated[0] + center[0] + translate[0],
             rotated[1] + center[1] + translate[1],
             rotated[2] + center[2] + translate[2],
+        ]
+    }
+
+    /// The pose as a column-major 4×4: p' = R·S·(p − c) + c + t, so the linear
+    /// part is R·S and the translation c + t − R·S·c.
+    pub fn matrix(&self) -> [f64; 16] {
+        let radians = self.rotate_deg.map(f64::to_radians);
+        let column = |axis: [f64; 3]| crate::engine_state::rotate_euler_xyz_f64(axis, radians);
+        let cols = [
+            column([self.scale[0], 0.0, 0.0]),
+            column([0.0, self.scale[1], 0.0]),
+            column([0.0, 0.0, self.scale[2]]),
+        ];
+        let c = self.center;
+        let lc = [
+            cols[0][0] * c[0] + cols[1][0] * c[1] + cols[2][0] * c[2],
+            cols[0][1] * c[0] + cols[1][1] * c[1] + cols[2][1] * c[2],
+            cols[0][2] * c[0] + cols[1][2] * c[1] + cols[2][2] * c[2],
+        ];
+        let t = [c[0] + self.translate[0] - lc[0], c[1] + self.translate[1] - lc[1], c[2] + self.translate[2] - lc[2]];
+        [
+            cols[0][0], cols[0][1], cols[0][2], 0.0,
+            cols[1][0], cols[1][1], cols[1][2], 0.0,
+            cols[2][0], cols[2][1], cols[2][2], 0.0,
+            t[0], t[1], t[2], 1.0,
         ]
     }
 
@@ -1365,6 +1503,10 @@ pub struct LinesSolid {
     pub handle: u32,
     pub fingerprint: u64,
     pub poses: Vec<SolidPose>,
+    /// The view's section leaves it whole (its **Not cut** list): a section
+    /// draws it uncut and takes no cut from it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub whole: bool,
 }
 
 impl LinesSolid {
@@ -1376,6 +1518,9 @@ impl LinesSolid {
         let mut identity = format!("{}#{:016x};", self.name, self.fingerprint);
         for pose in &self.poses {
             identity.push_str(&pose.identity());
+        }
+        if self.whole {
+            identity.push_str("whole;");
         }
         identity
     }
@@ -1416,17 +1561,23 @@ fn posed_solid<'a>(
     poses.iter().fold(solid, |solid, pose| std::borrow::Cow::Owned(pose_solid(&solid, &|p| pose.apply(p))))
 }
 
+/// Whether the view's section leaves solid `name` uncut (its **Not cut** list).
+fn left_whole(view: &PmiView, name: &str) -> bool {
+    view.display.section.as_ref().is_some_and(|section| section.excludes(name))
+}
+
 /// The plan of every solid a saved view draws, or `None` when any of them has
 /// no topology in the scene.
-fn exact_solids<'a>(scene: &'a RenderScene, view: &PmiView, report: Option<&PmiViewReport>) -> Option<ExactPlan<'a>> {
+fn exact_solids<'a>(scene: &'a RenderScene, unposed: &Unposed, view: &PmiView, report: Option<&PmiViewReport>) -> Option<ExactPlan<'a>> {
     let mut plan = ExactPlan { solids: Vec::new(), sources: Vec::new(), each: Vec::new(), identity: String::new() };
-    for solid in drawn_solids(scene, view) {
+    for solid in drawn_solids(scene, unposed, view) {
         let (brep, fingerprint) = scene.exact_solid_fingerprinted(&solid.name)?;
         let planned = LinesSolid {
             name: solid.name.clone(),
             handle: solid.source_handle,
             fingerprint,
             poses: poses_of(report, &solid.name),
+            whole: left_whole(view, &solid.name),
         };
         plan.each.push(planned.identity());
         plan.solids.push(planned);
@@ -1441,12 +1592,13 @@ fn exact_solids<'a>(scene: &'a RenderScene, view: &PmiView, report: Option<&PmiV
 // ---------------------------------------------------------------------------
 
 /// What an exact pass is restricted to, as a job carries it: a SECTION's cap
-/// is the cut the job computes itself, so it has no data to carry.
+/// is the cut the job computes itself, so it carries only a half section's
+/// second plane.
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum LinesClip {
     Whole,
     Circle { radius: f64 },
-    Section,
+    Section { half: Option<super::hlr::HalfLine> },
 }
 
 impl LinesClip {
@@ -1455,13 +1607,19 @@ impl LinesClip {
         match self {
             LinesClip::Whole => "whole".into(),
             LinesClip::Circle { radius } => format!("circle {:x}", radius.to_bits()),
-            LinesClip::Section => "section".into(),
+            LinesClip::Section { half: None } => "section".into(),
+            LinesClip::Section { half: Some(half) } => format!(
+                "section half {:x},{:x},{:x}",
+                half.normal[0].to_bits(),
+                half.normal[1].to_bits(),
+                half.offset.to_bits()
+            ),
         }
     }
 }
 
 /// ONE placement's analytic pass, as the runner is asked to run it: everything
-/// [`exact_lines`] would compute on a miss, by reference to the runner's own
+/// `exact_lines` would compute on a miss, by reference to the runner's own
 /// resident solids rather than a copy of them.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct LinesJob {
@@ -1487,6 +1645,8 @@ pub enum LinesMode<'a> {
     /// placement then draws its mesh approximation — or [`Deferred::Here`] to
     /// run it on this thread after all.
     Defer(&'a mut dyn FnMut(LinesJob) -> Deferred),
+    /// An export waits for exact lines without drawing a mesh preview on the UI thread.
+    Export(&'a mut dyn FnMut(LinesJob) -> Deferred),
 }
 
 /// A deferred job's answer.
@@ -1513,7 +1673,8 @@ pub fn run_lines_job(job: &LinesJob) -> Result<ExactLines, String> {
     }
     let solids: Vec<&brep_kernel::BrepSolid> = posed.iter().collect();
     let each: Vec<String> = job.solids.iter().map(LinesSolid::identity).collect();
-    Ok(compute_exact_lines(&solids, &each, &job.frame, &job.placed, job.clip))
+    let whole: Vec<bool> = job.solids.iter().map(|solid| solid.whole).collect();
+    Ok(compute_exact_lines(&solids, &each, &whole, &job.frame, &job.placed, job.clip))
 }
 
 /// The analytic pass itself, relative to `origin` (a placement at the paper
@@ -1521,6 +1682,7 @@ pub fn run_lines_job(job: &LinesJob) -> Result<ExactLines, String> {
 fn compute_exact_lines(
     solids: &[&brep_kernel::BrepSolid],
     each: &[String],
+    whole: &[bool],
     frame: &ViewFrame,
     origin: &PlacedView,
     clip: LinesClip,
@@ -1536,12 +1698,21 @@ fn compute_exact_lines(
             runs: super::hlr::visible_edges_with(solids, &trims, frame, origin, &super::hlr::Clip::Circle { radius }).runs,
             cut: Vec::new(),
         },
-        LinesClip::Section => {
+        LinesClip::Section { half } => {
             // The exact cut: the plane against every face, trimmed. Its curves
             // are the hatch's boundary, the cap that hides what is behind the
             // cut face, and model lines in their own right.
-            let cut = super::hlr::section_curves_with(solids, &trims, frame, origin);
-            let clip = super::hlr::Clip::Beyond { cap: &cut };
+            // A solid the section leaves whole adds nothing to the cut, and a
+            // half section's cut stops at its second plane.
+            let cut_by = |index: &usize| !whole.get(*index).copied().unwrap_or(false);
+            let cut_solids: Vec<&brep_kernel::BrepSolid> = (0..solids.len()).filter(cut_by).map(|i| solids[i]).collect();
+            let cut_trims: Vec<&super::hlr::SolidTrims> = (0..solids.len()).filter(cut_by).map(|i| trims[i]).collect();
+            let cut = super::hlr::section_curves_with(&cut_solids, &cut_trims, frame, origin);
+            let cut = match half {
+                Some(half) => close_on_half(cut, half, origin),
+                None => cut,
+            };
+            let clip = super::hlr::Clip::Beyond { cap: &cut, whole, half };
             ExactLines { runs: super::hlr::visible_edges_with(solids, &trims, frame, origin, &clip).runs, cut }
         }
     }
@@ -1564,7 +1735,7 @@ fn exact_lines_for(
         None => {
             let deferred = match mode {
                 LinesMode::Compute => Deferred::Here,
-                LinesMode::Defer(defer) => defer(LinesJob {
+                LinesMode::Defer(defer) | LinesMode::Export(defer) => defer(LinesJob {
                     key: key.clone(),
                     placement: placed.id.clone(),
                     solids: plan.solids.clone(),
@@ -1579,7 +1750,8 @@ fn exact_lines_for(
                 Deferred::Here => {
                     let posed = plan.posed();
                     let solids: Vec<&brep_kernel::BrepSolid> = posed.iter().map(|solid| solid.as_ref()).collect();
-                    compute_exact_lines(&solids, &plan.each, frame, &origin, clip)
+                    let whole: Vec<bool> = plan.solids.iter().map(|solid| solid.whole).collect();
+                    compute_exact_lines(&solids, &plan.each, &whole, frame, &origin, clip)
                 }
             };
             store_exact_lines(key, lines.clone());
@@ -1724,6 +1896,51 @@ fn pose_solid(solid: &brep_kernel::BrepSolid, pose: &dyn Fn([f64; 3]) -> [f64; 3
 }
 
 /// Polylines as the two-point segments [`hatch`] counts crossings against.
+/// A half section's cut on the paper of a placement at `origin`: the section
+/// curves on the side the second plane removes, closed along its line — each
+/// run of the line between two crossings of the cut, taken in pairs, is the
+/// edge the two cut faces share. The result is the region the hatch fills and
+/// the cap hides behind, both of which read it by parity.
+fn close_on_half(cut: Vec<Vec<[f64; 2]>>, half: super::hlr::HalfLine, origin: &PlacedView) -> Vec<Vec<[f64; 2]>> {
+    let side = |p: [f64; 2]| {
+        half.at([(p[0] - origin.position[0]) / origin.scale, (origin.position[1] - p[1]) / origin.scale, 0.0])
+    };
+    let mut out: Vec<Vec<[f64; 2]>> = Vec::new();
+    let mut crossings: Vec<[f64; 2]> = Vec::new();
+    for line in cut {
+        let mut run: Vec<[f64; 2]> = Vec::new();
+        for (i, &p) in line.iter().enumerate() {
+            let g = side(p);
+            if i > 0 {
+                let q = line[i - 1];
+                let h = side(q);
+                if (h < 0.0) != (g < 0.0) {
+                    let t = h / (h - g);
+                    let x = [q[0] + (p[0] - q[0]) * t, q[1] + (p[1] - q[1]) * t];
+                    crossings.push(x);
+                    run.push(x);
+                    if g >= 0.0 {
+                        out.push(std::mem::take(&mut run));
+                    }
+                }
+            }
+            if g < 0.0 {
+                run.push(p);
+            }
+        }
+        if run.len() > 1 {
+            out.push(run);
+        }
+    }
+    // Along the line on the paper (y runs down the paper, so the paper
+    // direction of the view's (−n_y, n_x) is (−n_y, −n_x)).
+    let along = |p: &[f64; 2]| -p[0] * half.normal[1] - p[1] * half.normal[0];
+    crossings.sort_by(|a, b| along(a).partial_cmp(&along(b)).unwrap_or(std::cmp::Ordering::Equal));
+    out.extend(crossings.chunks_exact(2).map(|pair| vec![pair[0], pair[1]]));
+    out.retain(|line| line.len() > 1);
+    out
+}
+
 fn segments_of(lines: &[Vec<[f64; 2]>]) -> Vec<Vec<[f64; 2]>> {
     lines.iter().flat_map(|line| line.windows(2).map(|w| vec![w[0], w[1]])).collect()
 }
@@ -1732,13 +1949,15 @@ fn segments_of(lines: &[Vec<[f64; 2]>]) -> Vec<Vec<[f64; 2]>> {
 // The drawn meshes
 // ---------------------------------------------------------------------------
 
-/// The solids a saved view draws: visible in the scene, not hidden by the
-/// view's own `display.hidden` set, and not a committed SKETCH (a drawing
-/// shows the model, not the sketches it was built from).
-fn drawn_solids<'a>(scene: &'a RenderScene, view: &PmiView) -> Vec<&'a crate::scene::SolidDisplay> {
+/// The solids a saved view draws, each read UN-POSED (the viewport's active
+/// view may have hidden or clipped it for its own section): visible, not
+/// hidden by the view's own `display.hidden` set, and not a committed SKETCH
+/// (a drawing shows the model, not the sketches it was built from).
+fn drawn_solids<'a>(scene: &'a RenderScene, unposed: &'a Unposed, view: &PmiView) -> Vec<&'a crate::scene::SolidDisplay> {
     scene
         .solids()
         .iter()
+        .map(|solid| unposed.get(&solid.name).unwrap_or(solid))
         .filter(|solid| solid.visible && !solid.is_sketch)
         .filter(|solid| !view.display.hidden.iter().any(|name| name == &solid.name))
         .filter(|solid| solid.mesh.indices.len() >= 3)
@@ -1747,11 +1966,11 @@ fn drawn_solids<'a>(scene: &'a RenderScene, view: &PmiView) -> Vec<&'a crate::sc
 
 /// The names of every solid some placement of `sheet` draws: the solids whose
 /// topology its exact pass needs.
-pub fn sheet_solid_names(scene: &RenderScene, sheet: &super::Sheet, views: &[PmiView]) -> Vec<String> {
+pub fn sheet_solid_names(scene: &RenderScene, unposed: &Unposed, sheet: &super::Sheet, views: &[PmiView]) -> Vec<String> {
     let mut names: Vec<String> = Vec::new();
     for placed in &sheet.views {
         let Some(view) = views.iter().find(|view| view.id == placed.view) else { continue };
-        for solid in drawn_solids(scene, view) {
+        for solid in drawn_solids(scene, unposed, view) {
             if !names.contains(&solid.name) {
                 names.push(solid.name.clone());
             }
@@ -1764,7 +1983,7 @@ pub fn sheet_solid_names(scene: &RenderScene, sheet: &super::Sheet, views: &[Pmi
 /// viewport's active view posed it in place, so every placement starts from
 /// the model as built and applies its own view's poses.
 fn drawn_displays<'a>(scene: &'a RenderScene, unposed: &'a Unposed, view: &PmiView) -> Vec<&'a crate::scene::SolidDisplay> {
-    drawn_solids(scene, view).into_iter().map(|solid| unposed.get(&solid.name).unwrap_or(solid)).collect()
+    drawn_solids(scene, unposed, view)
 }
 
 
@@ -1855,10 +2074,14 @@ fn mesh_lines_for(
 ) -> ExactLines {
     let displays = drawn_displays(scene, unposed, view);
     let mut identity = String::from("mesh|");
-    for display in &displays {
+    let whole: Vec<bool> = displays.iter().map(|display| left_whole(view, &display.name)).collect();
+    for (display, whole) in displays.iter().zip(&whole) {
         identity.push_str(&format!("{}@{};", display.name, display.revision));
         for pose in poses_of(report, &display.name) {
             identity.push_str(&pose.identity());
+        }
+        if *whole {
+            identity.push_str("whole;");
         }
     }
     let bits = |v: [f64; 3]| format!("{:x},{:x},{:x}", v[0].to_bits(), v[1].to_bits(), v[2].to_bits());
@@ -1871,8 +2094,9 @@ fn mesh_lines_for(
             let origin = PlacedView { position: [0.0, 0.0], ..placed.clone() };
             let meshes = mesh_solids(&displays, report);
             let lines = match (clip, plane) {
-                (LinesClip::Section, Some(plane)) => {
-                    let cut: Vec<Vec<[f64; 2]>> = mesh_cut(&meshes, plane)
+                (LinesClip::Section { half }, Some(plane)) => {
+                    let cut_meshes: Vec<_> = meshes.iter().zip(&whole).filter(|(_, whole)| !**whole).map(|(mesh, _)| mesh.clone()).collect();
+                    let cut: Vec<Vec<[f64; 2]>> = mesh_cut(&cut_meshes, plane)
                         .iter()
                         .map(|segment| {
                             segment
@@ -1884,7 +2108,11 @@ fn mesh_lines_for(
                                 .collect()
                         })
                         .collect();
-                    let beyond = super::hlr::Clip::Beyond { cap: &cut };
+                    let cut = match half {
+                        Some(half) => close_on_half(cut, half, &origin),
+                        None => cut,
+                    };
+                    let beyond = super::hlr::Clip::Beyond { cap: &cut, whole: &whole, half };
                     ExactLines { runs: super::hlr::visible_mesh_lines(&meshes, frame, &origin, &beyond).runs, cut }
                 }
                 (LinesClip::Circle { radius }, _) => ExactLines {
@@ -2640,10 +2868,20 @@ fn annotations(
             [a[0] + dot(d, right3) * placed.scale, a[1] - dot(d, up3) * placed.scale]
         };
 
+        // An explode step draws NO label, on a sheet as in the 3D view (owner
+        // 2026-10-26: "I don't want to see the exploded labels at all";
+        // 2026-10-27, on a placed view: "Exploding a part should not result
+        // in any additional text being displayed"). The layout gives every
+        // row one text run as its fallback; the 3D overlay never reads the
+        // runs (its chip pass skips the kind) and the PDF's 3D model leaves
+        // the row out (`pdf3d::drawable`), so the sheet was the one consumer
+        // that drew it. The step's dashed trace line stays: it is the row's
+        // own `showTraceLine`, and the viewport draws it too.
+        let explode = matches!(row.geometry, brep_kernel::PmiGeometry::Explode { .. });
         let texts: Vec<SheetText> = drawn
             .texts
             .iter()
-            .filter(|run| !run.text.trim().is_empty())
+            .filter(|run| !explode && !run.text.trim().is_empty())
             .map(|run| {
                 let cap = run.height * placed.scale;
                 if flatten {
@@ -2786,6 +3024,7 @@ impl Unit {
         })
     }
 }
+
 
 
 

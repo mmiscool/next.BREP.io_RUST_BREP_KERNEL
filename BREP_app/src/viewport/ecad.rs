@@ -1225,12 +1225,15 @@ impl EcadViewport {
                         // is mostly used for, or any name typed.
                         ui.label("Power net");
                         ui.horizontal(|ui| {
-                            for name in brep_ecad_egui::POWER_NETS {
-                                let pick = ui.selectable_label(editor.power_net_text == name, name);
-                                if pick.clicked() {
-                                    editor.power_net_text = name.into();
-                                }
-                                hits.insert(format!("power_net:{name}"), pick.rect);
+                            // The four usual nets as one dropdown (power_net:preset, its
+                            // open entries power_net:preset#<name>); a typed name shows
+                            // the dropdown empty and keeps the field below.
+                            let choices: Vec<(String, &str, &str)> =
+                                brep_ecad_egui::POWER_NETS.iter().map(|name| (name.to_string(), *name, *name)).collect();
+                            let mut chosen = editor.power_net_text.clone();
+                            let (changed, _) = crate::form::enum_dropdown(ui, "power_net:preset", &choices, &mut chosen, None, Some(hits));
+                            if changed {
+                                editor.power_net_text = chosen;
                             }
                         });
                         let field = ui.add(egui::TextEdit::singleline(&mut editor.power_net_text).desired_width(160.0));

@@ -48,7 +48,10 @@ pub const DEFAULT_PASSWORD: &str = "test-mcp-password";
 const START_TIMEOUT: Duration = Duration::from_secs(60);
 
 pub struct PlmFixture {
-    child: Child,
+    /// Behind a lock: a `plm_server` step stops and starts it mid-script.
+    child: Mutex<Child>,
+    /// How to start the server again on the same address and data.
+    respawn: Respawn,
     /// `http://127.0.0.1:<port>`, no trailing slash.
     pub url: String,
     /// Which binary is serving, and when it was built: `<path> (built <UTC>)`.
@@ -57,6 +60,8 @@ pub struct PlmFixture {
     pub binary: String,
     /// Username → token secret. `admin` is always present.
     tokens: BTreeMap<String, String>,
+    /// Username → password, for a `browser` call's sign-in. `admin` too.
+    passwords: BTreeMap<String, String>,
     /// The account the app was configured as (empty: none).
     app_user: String,
     /// Values `bind` captured, plus the built-ins.
@@ -64,6 +69,63 @@ pub struct PlmFixture {
     /// The server's data directory, removed on drop.
     data: PathBuf,
     agent: ureq::Agent,
+}
+
+/// What a `plm_server` start needs to bring the same server back: the same
+/// binary, arguments, data directory and address (the app's `plm.json` names
+/// that address, so a new port would read as a different server).
+struct Respawn {
+    bin: PathBuf,
+    bind: String,
+    args: Vec<String>,
+    env: BTreeMap<String, String>,
+    log: PathBuf,
+}
+
+/// Spawn `brep-plm serve` and drain both pipes into `log` (appended) for the
+/// server's whole life, so a chatty server never blocks on a full pipe.
+/// Stdout lines are also sent on the channel for the caller to read the
+/// start-up lines from.
+fn spawn_server(respawn: &Respawn, data: &Path) -> Result<(Child, mpsc::Receiver<String>), String> {
+    let mut child = Command::new(&respawn.bin)
+        .arg("serve")
+        .arg("--bind")
+        .arg(&respawn.bind)
+        .arg("--data")
+        .arg(data)
+        .args(&respawn.args)
+        // Never clone KiCad's libraries from GitLab; a script's `env` may override.
+        .env("BREP_PLM_KICAD_GIT_BASE", "off")
+        .envs(&respawn.env)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("spawn {}: {e}", respawn.bin.display()))?;
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&respawn.log)
+        .map_err(|e| format!("{}: {e}", respawn.log.display()))?;
+    let log = std::sync::Arc::new(Mutex::new(file));
+    let (tx, rx) = mpsc::channel::<String>();
+    let stdout = child.stdout.take().ok_or("no stdout pipe")?;
+    let stderr = child.stderr.take().ok_or("no stderr pipe")?;
+    {
+        let log = log.clone();
+        std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                let _ = writeln!(log.lock().unwrap(), "{line}");
+                let _ = tx.send(line);
+            }
+        });
+    }
+    std::thread::spawn(move || {
+        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+            let _ = writeln!(log.lock().unwrap(), "stderr: {line}");
+        }
+    });
+    Ok((child, rx))
 }
 
 /// An answer from the server, whatever its status.
@@ -134,45 +196,17 @@ impl PlmFixture {
         std::fs::create_dir_all(&root).map_err(|e| format!("{}: {e}", root.display()))?;
         let data = data_dir(&root)?;
         let log_path = root.join("serve.log");
-        let mut command = Command::new(&bin);
-        command
-            .arg("serve")
-            .arg("--bind")
+        let respawn = Respawn {
+            bin: bin.clone(),
             // `:0`: the OS picks the port and the server reports it, so no
             // other process can take it between choosing and binding.
-            .arg("127.0.0.1:0")
-            .arg("--data")
-            .arg(&data)
-            .args(&spec.args)
-            .envs(&spec.env)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        let mut child = command.spawn().map_err(|e| format!("spawn {}: {e}", bin.display()))?;
-
-        // Both pipes are drained into the log for the server's whole life, so
-        // a chatty server can never block on a full pipe. Stdout lines are also
-        // sent here until the fixture has what it needs.
-        let log = std::sync::Arc::new(Mutex::new(
-            std::fs::File::create(&log_path).map_err(|e| format!("{}: {e}", log_path.display()))?,
-        ));
-        let (tx, rx) = mpsc::channel::<String>();
-        let stdout = child.stdout.take().ok_or("no stdout pipe")?;
-        let stderr = child.stderr.take().ok_or("no stderr pipe")?;
-        {
-            let log = log.clone();
-            std::thread::spawn(move || {
-                for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-                    let _ = writeln!(log.lock().unwrap(), "{line}");
-                    let _ = tx.send(line);
-                }
-            });
-        }
-        std::thread::spawn(move || {
-            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-                let _ = writeln!(log.lock().unwrap(), "stderr: {line}");
-            }
-        });
+            bind: "127.0.0.1:0".into(),
+            args: spec.args.clone(),
+            env: spec.env.clone(),
+            log: log_path.clone(),
+        };
+        let _ = std::fs::remove_file(&log_path);
+        let (mut child, rx) = spawn_server(&respawn, &data)?;
 
         let fail = |child: &mut Child, why: String| -> String {
             let _ = child.kill();
@@ -207,11 +241,14 @@ impl PlmFixture {
         };
         let url = format!("http://{}", seen.listening.as_deref().unwrap_or_default());
         let agent = ureq::AgentBuilder::new().redirects(0).timeout(Duration::from_secs(60)).build();
+        let respawn = Respawn { bind: seen.listening.clone().unwrap_or_default(), ..respawn };
         let mut fixture = Self {
-            child,
+            child: Mutex::new(child),
+            respawn,
             url,
             binary: describe_binary(&bin),
             tokens: BTreeMap::new(),
+            passwords: BTreeMap::new(),
             app_user: String::new(),
             vars: Mutex::new(BTreeMap::new()),
             data: data.clone(),
@@ -222,15 +259,15 @@ impl PlmFixture {
         loop {
             match fixture.send("GET", "/api/me", &[], None) {
                 Ok(_) => break,
-                Err(e) if Instant::now() > deadline => return Err(fail(&mut fixture.child, format!("brep-plm never answered: {e}"))),
+                Err(e) if Instant::now() > deadline => return Err(fail(fixture.child.get_mut().unwrap(), format!("brep-plm never answered: {e}"))),
                 Err(_) => std::thread::sleep(Duration::from_millis(50)),
             }
         }
         if let Err(e) = fixture.seed(spec, &password) {
-            return Err(fail(&mut fixture.child, format!("seeding the PLM: {e}")));
+            return Err(fail(fixture.child.get_mut().unwrap(), format!("seeding the PLM: {e}")));
         }
         if let Err(e) = fixture.configure_app(&spec.app_user, spec.app_token, store) {
-            return Err(fail(&mut fixture.child, e));
+            return Err(fail(fixture.child.get_mut().unwrap(), e));
         }
         Ok(fixture)
     }
@@ -268,6 +305,7 @@ impl PlmFixture {
         };
         let admin = mint(self, "test-mcp admin", "full", None)?;
         self.tokens.insert("admin".into(), admin);
+        self.passwords.insert("admin".into(), password.to_string());
         for user in &spec.users {
             let body = json!({
                 "username": user.username,
@@ -287,6 +325,7 @@ impl PlmFixture {
                 .to_string();
             let token = mint(self, &format!("test-mcp {}", user.username), user.scope.as_deref().unwrap_or("full"), Some(&id))?;
             self.tokens.insert(user.username.clone(), token);
+            self.passwords.insert(user.username.clone(), user.password.clone().unwrap_or_else(|| DEFAULT_PASSWORD.into()));
         }
         {
             let mut vars = self.vars.lock().unwrap();
@@ -361,8 +400,13 @@ impl PlmFixture {
         };
         let who = call.as_user.as_deref().unwrap_or("admin");
         let bearer;
+        let session;
         let mut headers: Vec<(&str, &str)> = Vec::new();
-        if who != "anonymous" {
+        if call.browser {
+            session = self.browser_session(who)?;
+            headers.push(("Cookie", &session.0));
+            headers.push(("X-CSRF-Token", &session.1));
+        } else if who != "anonymous" {
             let token = self.tokens.get(who).ok_or_else(|| format!("`as: {who}` is not an account the fixture made"))?;
             bearer = format!("Bearer {token}");
             headers.push(("Authorization", &bearer));
@@ -379,6 +423,63 @@ impl PlmFixture {
             self.bind(&parsed, &call.bind).map_err(|e| format!("{method} {path} answered {}: {e}", answer.status))?;
         }
         Ok(answer)
+    }
+
+    /// A `plm_server` step: `stop` kills the server (the app's next request
+    /// finds nothing listening, as when a server goes down or the network
+    /// drops); `start` brings the same server back on the same address and
+    /// data, and answers once it serves. Accounts, tokens and every write
+    /// before the stop survive, as they do a real restart.
+    pub fn server(&self, action: &str) -> Result<Value, String> {
+        let mut child = self.child.lock().unwrap();
+        match action {
+            "stop" => {
+                let _ = child.kill();
+                let _ = child.wait();
+                Ok(json!({ "stopped": true }))
+            }
+            "start" => {
+                if child.try_wait().map_err(|e| e.to_string())?.is_none() {
+                    return Err("`plm_server` start: the server is already running".into());
+                }
+                let (fresh, rx) = spawn_server(&self.respawn, &self.data)?;
+                *child = fresh;
+                let deadline = Instant::now() + START_TIMEOUT;
+                let mut seen = Startup::default();
+                while seen.listening.is_none() {
+                    match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                        Ok(line) => read_startup_line(&line, &mut seen),
+                        Err(_) => return Err(format!("brep-plm did not serve again (server log: {})", self.respawn.log.display())),
+                    }
+                }
+                while let Err(e) = self.send("GET", "/api/me", &[], None) {
+                    if Instant::now() > deadline {
+                        return Err(format!("brep-plm never answered after the restart: {e}"));
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                Ok(json!({ "started": true, "url": self.url }))
+            }
+            other => Err(format!("`plm_server` action `{other}`: expected `stop` or `start`")),
+        }
+    }
+
+    /// A fresh browser session of `who`: its cookie and CSRF token.
+    fn browser_session(&self, who: &str) -> Result<(String, String), String> {
+        let password = self.passwords.get(who).ok_or_else(|| format!("`as: {who}` has no password the fixture knows"))?;
+        let login = self.send("POST", "/api/login", &[], Some(json_body(&json!({ "username": who, "password": password }))))?;
+        let cookie = login
+            .headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("set-cookie"))
+            .and_then(|(_, v)| v.split(';').next())
+            .map(str::to_string)
+            .ok_or_else(|| format!("{who}'s sign-in answered {} with no cookie", login.status))?;
+        let csrf = login
+            .json()
+            .and_then(|v| v["csrf"].as_str().map(str::to_string))
+            .ok_or_else(|| format!("{who}'s sign-in gave no csrf"))?;
+        Ok((cookie, csrf))
     }
 
     /// Capture values of `from` under names (`name → JSON pointer`), for
@@ -428,8 +529,9 @@ impl PlmFixture {
 
 impl Drop for PlmFixture {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        let child = self.child.get_mut().unwrap();
+        let _ = child.kill();
+        let _ = child.wait();
         let _ = std::fs::remove_dir_all(&self.data);
     }
 }

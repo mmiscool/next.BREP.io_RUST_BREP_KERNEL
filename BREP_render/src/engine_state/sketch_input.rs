@@ -242,6 +242,7 @@ impl EngineState {
         };
         let (du, dv) = (u - drag.anchor.0, v - drag.anchor.1);
         let session = &mut edit.session;
+        let before = session.doc.clone();
         for (id, ox, oy, _) in &drag.points {
             if let Some(p) = session.doc.point_mut(id) {
                 p.x = *ox + du;
@@ -269,6 +270,13 @@ impl EngineState {
                 }
             }
         }
+        // A drag can collapse a free radius without producing a solver error.
+        // Preserve the last valid geometry, while tolerating pre-existing broken
+        // circles in imported documents so they can still be edited/repaired.
+        if newly_collapsed_radial_geometry(&before, &session.doc) {
+            session.doc = before;
+            let _ = session.resolve();
+        }
         self.refresh_sketch_overlay();
         self.dirty = true;
     }
@@ -287,6 +295,7 @@ impl EngineState {
         // world units) — read before the `&mut` borrow of `sketch_edit`.
         let drop_tol = self.sketch_pick_radius();
         if let Some(edit) = self.sketch_edit.as_mut() {
+            let before = edit.session.doc.clone();
             // Drop-time inference (S6c): a SINGLE-point drop snaps to a coincident
             // point / point-on-line at the release position, mirroring the previous
             // coincident-on-drop / point-on-line-on-drop inference. A whole-
@@ -304,6 +313,10 @@ impl EngineState {
                 );
             }
             let _ = edit.session.resolve();
+            if newly_collapsed_radial_geometry(&before, &edit.session.doc) {
+                edit.session.doc = before;
+                let _ = edit.session.resolve();
+            }
             // Discard the drag's undo snapshot when the doc is unchanged (a mere
             // grab-and-release, no move and no inferred constraint), so it neither
             // pollutes undo nor clobbers redo. An inferred constraint changes the
@@ -342,6 +355,25 @@ impl EngineState {
     }
 }
 
+fn radial_distance(doc: &crate::sketch::SketchDoc, points: &[serde_json::Value]) -> f64 {
+    match (doc.point(&points[0]), doc.point(&points[1])) {
+        (Some(a), Some(b)) => (b.x - a.x).hypot(b.y - a.y),
+        _ => 0.0,
+    }
+}
+
+fn newly_collapsed_radial_geometry(
+    before: &crate::sketch::SketchDoc,
+    after: &crate::sketch::SketchDoc,
+) -> bool {
+    before.geometries.iter().any(|g| {
+        matches!(g.geom_type.as_str(), "circle" | "arc")
+            && g.points.len() >= 2
+            && radial_distance(before, &g.points) > 1e-5
+            && radial_distance(after, &g.points) <= 1e-5
+    })
+}
+
 // ===========================================================================
 // Sketch draw tools (S3a) — primitive placement: point / line / rect / circle / arc.
 //
@@ -372,6 +404,10 @@ impl EngineState {
             edit.handdraw_stroke.clear();
         } else {
             return;
+        }
+        // A context edge lit for pickEdges is only that tool's to show.
+        if self.sketch_active_tool() != Some("pickEdges") {
+            self.hover_context(None);
         }
         self.refresh_sketch_overlay();
         self.dirty = true;
@@ -444,6 +480,21 @@ impl EngineState {
         let Some(edit) = self.sketch_edit.as_mut() else {
             return;
         };
+        // Check the SNAP RESULT, not just the cursor: a nearby radius click can
+        // reuse the center id. Keep waiting for a valid radius/end without adding
+        // points or an undo step. Arc endpoints must also be off the center.
+        if matches!(tool.as_str(), "circle" | "arc") && !edit.pending.is_empty() {
+            let doc = &edit.session.doc;
+            let Some(center) = doc.point(&edit.pending[0]) else { return; };
+            let snapped = doc.points.iter()
+                .filter(|p| (p.x - u).hypot(p.y - v) <= radius)
+                .min_by(|a, b| (a.x - u).hypot(a.y - v).total_cmp(&(b.x - u).hypot(b.y - v)));
+            let (x, y) = snapped.map_or((u, v), |p| (p.x, p.y));
+            let distance = (x - center.x).hypot(y - center.y);
+            if !distance.is_finite() || distance <= 1e-5 {
+                return;
+            }
+        }
         // A draw tool is active → this click WILL mutate the doc (a point and/or a
         // geometry); snapshot for undo before it does (S6a).
         edit.record_undo();

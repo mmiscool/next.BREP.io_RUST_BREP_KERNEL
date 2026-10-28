@@ -1230,7 +1230,7 @@ fn solid_from_shell(source: &BrepSolid, shell: &ShellRecord) -> BrepSolid {
 /// and for a Normal rib the in-plane normal `plane normal × segment direction` —
 /// the left of the chain seen from the side the normal points to.
 ///
-/// A face the rib SPLITS is named by [`restamp_rib_faces`]: one fragment keeps
+/// A face the rib SPLITS is named by `restamp_rib_faces`: one fragment keeps
 /// the name and the others are named after the rib and the side they are on.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RibNames {

@@ -26,10 +26,18 @@ pub enum DocumentClass {
     Family,
     /// A template: a seed whose marked inputs specialise a new part on insert.
     Template,
+    /// Manufacturing instructions: an assembly revision placed as one grounded
+    /// component, with the steps in the `instructions` block. Not one of the
+    /// part classes a Save As converts between ([`Self::ALL`]): instructions
+    /// are made from an assembly, never from a part.
+    Instructions,
 }
 
 impl DocumentClass {
+    /// The part classes Save As and New offer.
     pub const ALL: [DocumentClass; 3] = [Self::Normal, Self::Family, Self::Template];
+    /// Every class a file or a field can name.
+    pub const KNOWN: [DocumentClass; 4] = [Self::Normal, Self::Family, Self::Template, Self::Instructions];
 
     /// The file extension, dot included, lowercase.
     pub fn extension(self) -> &'static str {
@@ -37,6 +45,7 @@ impl DocumentClass {
             Self::Normal => ".nbrep",
             Self::Family => ".fbrep",
             Self::Template => ".tbrep",
+            Self::Instructions => ".ibrep",
         }
     }
 
@@ -47,6 +56,7 @@ impl DocumentClass {
             Self::Normal => None,
             Self::Family => Some("family"),
             Self::Template => Some("template"),
+            Self::Instructions => Some("instructions"),
         }
     }
 
@@ -56,6 +66,7 @@ impl DocumentClass {
             Self::Normal => "Part",
             Self::Family => "Family",
             Self::Template => "Template",
+            Self::Instructions => "Instructions",
         }
     }
 
@@ -65,13 +76,14 @@ impl DocumentClass {
             Self::Normal => "normal",
             Self::Family => "family",
             Self::Template => "template",
+            Self::Instructions => "instructions",
         }
     }
 
     /// The class a file name's extension names, if it names one.
     pub fn of_name(name: &str) -> Option<Self> {
         let lower = name.to_ascii_lowercase();
-        Self::ALL
+        Self::KNOWN
             .into_iter()
             .find(|class| lower.ends_with(class.extension()))
     }
@@ -82,6 +94,7 @@ impl DocumentClass {
         match value.and_then(serde_json::Value::as_str) {
             Some("family") => Self::Family,
             Some("template") => Self::Template,
+            Some("instructions") => Self::Instructions,
             _ => Self::Normal,
         }
     }

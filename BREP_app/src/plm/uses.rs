@@ -466,6 +466,11 @@ pub(crate) fn publish_on_save() -> crate::plm::backend::SavedHook {
             if !publishes_on_save(&document) {
                 return Ok(());
             }
+            // A server with `derived-uses` set the list from the document in
+            // the write itself (and said so in its answer if it could not).
+            if client.me().is_some_and(|me| me.has("derived-uses")) {
+                return Ok(());
+            }
             publish_uses(&client, &key, &document)
                 .await
                 .map(|_| ())

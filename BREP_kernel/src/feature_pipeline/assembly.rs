@@ -10,11 +10,11 @@
 //!
 //! # Lifecycle, run at the tail of every history execution
 //!
-//! 1. VALIDATE ([`lifecycle`]): disabled → `status:'disabled'`; unknown type →
+//! 1. VALIDATE (`lifecycle`): disabled → `status:'disabled'`; unknown type →
 //!    an error entry without aborting the rest; duplicate detection across the
 //!    overlapping family {touch_align, distance, angle, concentric,
 //!    perpendicular, tangent} via order-independent selection-pair signatures.
-//! 2. MAP ([`mapping`]): each element ref resolves through
+//! 2. MAP (`mapping`): each element ref resolves through
 //!    `solvers/assembly_resolve` to an analytic frame in the owning component's
 //!    LOCAL space. Unresolvable/unsupported selections fail that constraint
 //!    only (status from [`crate::ResolveError::status`]); the solve continues.
@@ -23,7 +23,7 @@
 //!    constraint's `persistentData`; distance/angle first-solve initialization
 //!    commits into `inputParams` only on success.
 //! 4. WRITE BACK: solved poses re-pose the scene components in place
-//!    ([`crate::feature_pipeline::component`]) and are exported as generic
+//!    (`crate::feature_pipeline::component`) and are exported as generic
 //!    `inputParams.transform` JSON updates for the owning ACOMP features (the
 //!    pose-authority contract; applied by [`assembly_apply_document_json`] with
 //!    no compile-time dependency on the ACOMP feature).
@@ -44,6 +44,7 @@ use serde::{Deserialize, Serialize};
 use crate::feature_pipeline::Env;
 
 pub(crate) mod exports;
+pub(crate) mod flexible;
 pub(crate) mod infer;
 pub(crate) mod lifecycle;
 pub(crate) mod mapping;
@@ -51,21 +52,25 @@ pub(crate) mod constraints;
 
 pub use exports::{
     assembly_add_constraint_json, assembly_apply_document_json,
-    assembly_apply_inferred_constraints_json, assembly_dof_json,
+    assembly_apply_inferred_constraints_json, assembly_component_entities_json, assembly_dof_json,
     assembly_infer_constraints_json, assembly_inferable_types_json,
     assembly_move_constraint_json, assembly_overlay_json, assembly_pose_updates_json,
-    assembly_remove_constraint_json, assembly_run_solve_json,
+    assembly_drag_solve_json, assembly_frame_solve_json, assembly_remove_constraint_json, assembly_resolve_refs_json,
+    assembly_run_solve_json,
     assembly_set_constraint_enabled_json, assembly_set_constraint_open_json,
     assembly_state_json, assembly_statuses_json, assembly_update_constraint_json,
     // The native doors: the same mutations with their errors as text. A native
     // caller must use these — a `JsValue` error aborts a native build.
     assembly_add_constraint_impl, assembly_apply_document_impl, assembly_move_constraint_impl,
-    assembly_remove_constraint_impl, assembly_run_solve_impl,
+    assembly_drag_solve_impl, assembly_frame_solve_impl, assembly_flip_plan_json, assembly_rebase_mechanical_impl, assembly_remove_constraint_impl, assembly_run_solve_impl,
     assembly_set_constraint_enabled_impl, assembly_set_constraint_open_impl,
     assembly_update_constraint_impl,
+    // The session transfer: an owned copy of one thread's session for another.
+    assembly_session_export, assembly_session_import, assembly_session_serial, RetiredSession, SessionTransfer,
 };
 pub use constraints::{
-    constraint_schema_catalogue, constraint_type, ConstraintTypeDef, CONSTRAINT_TYPES,
+    constraint_hidden_params, constraint_schema_catalogue, constraint_type, ConstraintTypeDef,
+    CONSTRAINT_TYPES,
 };
 // The pose write-back encoder (`mapping::transform_to_pose_params`): the ONE
 // matrix → `{translate, rotateEulerDeg}` (intrinsic XYZ, degrees) conversion,
@@ -198,6 +203,10 @@ impl ConstraintEntry {
             self.remove_persistent("error");
             self.remove_persistent("kernel");
         }
+        if status != "conflict" {
+            self.remove_persistent("conflictWith");
+            self.remove_persistent("suppressSuggested");
+        }
     }
 
     /// The current status word (empty when the constraint never ran).
@@ -223,11 +232,12 @@ pub(crate) fn finish_history_run(
     env: &Env,
 ) {
     let mut state = request.assembly.clone().unwrap_or_default();
-    let outcome = if state.constraints.is_empty() {
+    let mut outcome = if state.constraints.is_empty() {
         lifecycle::LifecycleOutcome::empty()
     } else {
         lifecycle::run_constraints(&mut state, scene, env)
     };
+    follow_pattern_seeds(scene, &mut outcome);
     exports::install_session(
         state,
         scene.clone(),
@@ -235,5 +245,45 @@ pub(crate) fn finish_history_run(
         request.configurator.clone(),
         outcome,
     );
+}
+
+/// Re-pose every Pattern Component instance onto its seed's pose as the solve
+/// left it (`delta · seed`), so instances follow a mated seed in the same run.
+/// A moved instance is reported like a solved body (its solids re-tessellate)
+/// but writes no pose back: it has no feature of its own to fold into.
+fn follow_pattern_seeds(
+    scene: &mut crate::feature_pipeline::SceneMap,
+    outcome: &mut lifecycle::LifecycleOutcome,
+) {
+    let follows: Vec<(String, crate::AffineTransform)> = scene
+        .components
+        .values()
+        .filter_map(|record| {
+            let follow = record.pattern.as_ref()?;
+            let seed = scene.components.get(&follow.seed)?;
+            let delta = match &follow.driver {
+                // HOLES: the offset is the driver's, applied through its solved pose.
+                Some(driver) => {
+                    let driver = scene.components.get(driver)?.transform;
+                    let inverse = driver.rigid_inverse().ok()?;
+                    let compose = crate::feature_pipeline::component::compose;
+                    compose(&compose(&driver, &follow.delta).ok()?, &inverse).ok()?
+                }
+                None => follow.delta,
+            };
+            let target = crate::feature_pipeline::component::compose(&delta, &seed.transform).ok()?;
+            let moved = target
+                .elements
+                .iter()
+                .zip(record.transform.elements.iter())
+                .any(|(new, old)| (new - old).abs() > 1e-12);
+            moved.then(|| (record.id.clone(), target))
+        })
+        .collect();
+    for (id, target) in follows {
+        if crate::feature_pipeline::component::update_component_transform(scene, &id, target).is_ok() {
+            outcome.moved_solids.extend(scene.component_solids(&id));
+        }
+    }
 }
 

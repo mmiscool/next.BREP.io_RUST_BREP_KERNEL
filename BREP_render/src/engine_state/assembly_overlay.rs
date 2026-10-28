@@ -21,6 +21,9 @@ use brep_gizmos::hit_region::{point_region, segment_region, HitShape};
 /// Sits just under the feature-dim gizmo group (10003) so an armed feature
 /// gizmo draws over constraint graphics.
 const CONSTRAINT_OVERLAY_GROUP: &str = "assembly-constraint-overlay";
+/// The free-motion glyph at the selected component (its own group, so the
+/// constraint overlay's bake never clears it).
+const FREEDOM_GLYPH_GROUP: &str = "assembly-freedom-glyph";
 
 impl EngineState {
     // -----------------------------------------------------------------------
@@ -115,6 +118,7 @@ impl EngineState {
     /// frame stays quiet (no dirty loop).
     pub fn ensure_constraint_overlay_current(&mut self) {
         let want = self.settings.show_constraint_graphics && !self.any_sketch_mode();
+        self.ensure_freedom_glyph(want);
         if !want {
             self.clear_constraint_overlay();
             return;
@@ -132,6 +136,95 @@ impl EngineState {
         if super::overlay_wpp_stale(self.constraint_overlay_wpp, wpp) {
             self.bake_constraint_overlay();
         }
+    }
+
+    /// The component whose free motion the glyph shows: the selection is
+    /// exactly one top-level component's solids (a component pick, from the
+    /// viewport or the tree), and nothing else.
+    pub fn freedom_glyph_component(&self) -> Option<String> {
+        let emphasis = &self.emphasis;
+        if emphasis.selected_solids.is_empty()
+            || !emphasis.selected_faces.is_empty()
+            || !emphasis.selected_edges.is_empty()
+            || !emphasis.selected_vertices.is_empty()
+        {
+            return None;
+        }
+        let record = self.assembly_components.iter().find(|record| {
+            record.solids.len() == emphasis.selected_solids.len()
+                && record.solids.iter().all(|solid| emphasis.selected_solids.contains(solid))
+        })?;
+        Some(record.id.clone())
+    }
+
+    /// What the free-motion glyph draws now: `{component, center, slides,
+    /// axes: [{point, direction}]}` from the last solve's `bodyFreedom`, or
+    /// `null` (no single component selected, a fixed component, or one the
+    /// solve did not analyse).
+    pub fn freedom_glyph_value(&self) -> serde_json::Value {
+        let Some(id) = self.freedom_glyph_component() else { return serde_json::Value::Null };
+        // The one row, never a clone of the whole report: this runs per frame.
+        let freedom = match &self.assembly_sync {
+            Some(sync) => sync.dof["bodyFreedom"][id.as_str()].clone(),
+            None => return serde_json::Value::Null,
+        };
+        let Some(center) = self.component_bbox_center(&id) else { return serde_json::Value::Null };
+        if !freedom.is_object() {
+            return serde_json::Value::Null;
+        }
+        serde_json::json!({
+            "component": id,
+            "center": center,
+            "slides": freedom["slides"],
+            "axes": freedom["axes"],
+        })
+    }
+
+    /// Keep the glyph group in step with the selection, the solve and the
+    /// zoom; re-baked only when one of them actually changed.
+    fn ensure_freedom_glyph(&mut self, want: bool) {
+        let glyph = if want { self.freedom_glyph_value() } else { serde_json::Value::Null };
+        if glyph.is_null() {
+            if self.freedom_glyph_key.take().is_some() {
+                let _ = self.set_overlay_json(
+                    &serde_json::json!({ "groups": [ { "name": FREEDOM_GLYPH_GROUP } ] }).to_string(),
+                );
+            }
+            return;
+        }
+        let key = glyph.to_string();
+        let wpp = self.camera.world_per_pixel();
+        if self.freedom_glyph_key.as_deref() == Some(key.as_str())
+            && !super::overlay_wpp_stale(self.freedom_glyph_wpp, wpp)
+        {
+            return;
+        }
+        let point = |value: &serde_json::Value| -> Option<[f64; 3]> {
+            Some([value[0].as_f64()?, value[1].as_f64()?, value[2].as_f64()?])
+        };
+        let Some(center) = point(&glyph["center"]) else { return };
+        let slides: Vec<[f64; 3]> = glyph["slides"].as_array().into_iter().flatten().filter_map(point).collect();
+        let axes: Vec<([f64; 3], [f64; 3])> = glyph["axes"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|axis| Some((point(&axis["point"])?, point(&axis["direction"])?)))
+            .collect();
+        let (positions, colors) = crate::feature_dimensions::freedom_glyph_buffers(center, &slides, &axes, wpp);
+        let _ = self.set_overlay_json(
+            &serde_json::json!({
+                "groups": [
+                    {
+                        "name": FREEDOM_GLYPH_GROUP,
+                        "renderOrder": 10003,
+                        "tris": { "positions": positions, "colors": colors },
+                    }
+                ]
+            })
+            .to_string(),
+        );
+        self.freedom_glyph_key = Some(key);
+        self.freedom_glyph_wpp = if wpp > 0.0 { wpp } else { f64::MIN_POSITIVE };
     }
 
     /// The cached overlay records (read-only view for the app's label pass +
@@ -380,7 +473,7 @@ impl EngineState {
     /// press to start the drag [`Self::constraint_drag_begin`] claims, published
     /// so the arrow is addressable BY NAME instead of by projection arithmetic.
     ///
-    /// The point is [`crate::feature_dimensions::arrow_handle_point`] — a
+    /// The point is `crate::feature_dimensions::arrow_handle_point` — a
     /// distance arrow's TIP, an angle arc's sweep-end handle — projected through
     /// the same [`point_region`] builder the hit regions come from, so the
     /// published point and the pickable region can never drift: a press here is
@@ -628,7 +721,7 @@ impl EngineState {
     /// `assembly_update_constraint_json` (auto-solves), consume the reply's
     /// `movedSolids` display seam (re-posed resident solids re-tessellate in
     /// place so the release shows this frame), and then run the SAME tail as
-    /// every panel-side constraint edit ([`Self::after_constraint_mutation`]):
+    /// every panel-side constraint edit (`Self::after_constraint_mutation`):
     /// a checkpointed fold — the drag is one undo entry — and the rerun, which
     /// re-keys the moved instance's cache entry to the pose it now has. A
     /// commit against a session that no longer has the constraint (or no

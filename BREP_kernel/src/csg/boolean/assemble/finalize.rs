@@ -14,7 +14,7 @@ fn repair_edges_from_consistent_pcurves(
         .map_or(true, |value| value == "1" || value == "on");
     let started = web_time::Instant::now();
     let work = repair_edges_from_consistent_pcurves_mode(solid, tolerance, enabled)?;
-    if std::env::var("BREP_PROFILE").is_ok() {
+    if crate::imprint::profile_enabled() {
         eprintln!("assemble.repair_trace.profile ms={:.3} edges={} samples={} skipped={}",
             started.elapsed().as_secs_f64() * 1000.0, work.edges, work.samples, work.skipped);
     }

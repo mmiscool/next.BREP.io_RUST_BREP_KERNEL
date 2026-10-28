@@ -290,13 +290,48 @@ pub(super) fn clip_branch_to_trims(
 /// True when at least three of five interior samples of `curve` lie on the
 /// trimmed span of `edge` — a (near-)coincident overlap rather than a
 /// transversal crossing.
+/// `BREP_IMPRINT_OVERLAP_HULL` (lane P3b row 4, 2026-10-26): in
+/// [`curve_overlaps_edge`], a station farther than `limit` from the edge's
+/// control hull is counted off the edge without a projection. On by default
+/// (promoted 2026-10-26); `0`/`off` disables it.
+fn overlap_hull_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let enabled = *ON.get_or_init(|| !matches!(std::env::var("BREP_IMPRINT_OVERLAP_HULL").as_deref(), Ok("0") | Ok("off")));
+    enabled
+}
+
+
+thread_local! {
+    static OVERLAP_HULL_SKIPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+/// Stations the overlap hull pre-check answered without a projection on this thread since the last call.
+pub(super) fn take_overlap_hull_skips() -> u64 {
+    OVERLAP_HULL_SKIPS.with(|count| count.replace(0))
+}
+
 pub(super) fn curve_overlaps_edge(curve: &NurbsCurve, edge: &EdgeRecord, limit: f64) -> Result<bool, KernelRefusal> {
     let [c0, c1] = curve.domain().or_refuse(KernelStage::Intersect, "domain")?;
     let low = edge.t0.min(edge.t1);
     let high = edge.t0.max(edge.t1);
+    // HULL PRE-CHECK (`BREP_IMPRINT_OVERLAP_HULL`): the nearest point of the
+    // edge to a station lies on the edge's curve, which lies in its control
+    // hull, so a station farther than `limit` from the hull is off the edge
+    // without being projected. The count below is unchanged.
+    let hull = if overlap_hull_enabled() {
+        edge.curve.control_points.iter().map(|control| control.point()).collect::<Result<Vec<_>, _>>().ok()
+            .map(|points| Aabb::from_points(points).expanded(limit))
+    } else {
+        None
+    };
     let mut on = 0;
     for fraction in [0.1, 0.3, 0.5, 0.7, 0.9] {
         let point = curve.evaluate(c0 + (c1 - c0) * fraction).or_refuse(KernelStage::Intersect, "evaluate")?;
+        if let Some(hull) = &hull {
+            if !hull.contains(point) {
+                OVERLAP_HULL_SKIPS.with(|count| count.set(count.get() + 1));
+                continue;
+            }
+        }
         let projection = project_point_to_curve(&edge.curve, point).or_refuse(KernelStage::Intersect, "project_point_to_curve")?;
         let nearest = edge.curve.evaluate(projection.u.clamp(low, high)).or_refuse(KernelStage::Intersect, "evaluate")?;
         if nearest.sub(point).length() <= limit {
@@ -362,6 +397,16 @@ fn curve_param_subrange(curve: &NurbsCurve, lo: f64, hi: f64) -> Result<NurbsCur
 /// face) aborts that one reuse and keeps the historical behaviour. Escape hatch
 /// `BREP_SHARED_SECTION_EDGE=0` restores the mint-a-duplicate path wholesale
 /// (the clean A/B lever).
+/// `BREP_SHARED_SECTION_HULL_GATE` (lane P3b row 1): the control-hull pre-gate
+/// in [`reuse_boundary_section_edges`]. On by default (promoted 2026-10-26);
+/// `0`/`off` disables it.
+fn reuse_hull_gate_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let enabled = *ON.get_or_init(|| !matches!(std::env::var("BREP_SHARED_SECTION_HULL_GATE").as_deref(), Ok("0") | Ok("off")));
+    enabled
+}
+
+
 pub(super) fn reuse_boundary_section_edges(
     result: &mut ImprintResultRecord,
     face_edge_lists: &HashMap<FaceKey, Vec<&EdgeRecord>>,
@@ -379,6 +424,14 @@ pub(super) fn reuse_boundary_section_edges(
     // Measured on fixture 09: matching endpoints project at ~1e-9; the nearest
     // non-matching edge is ≥3.5e-3 — 2.5 orders of separation.
     let endpoint_gate = assembler_weld(tolerance);
+    let reuse_hull_gate = reuse_hull_gate_enabled();
+    let hull_admits = |edge: &EdgeRecord, ps: Vec3, pe: Vec3| -> bool {
+        let Ok(points) = edge.curve.control_points.iter().map(|control| control.point()).collect::<Result<Vec<_>, _>>() else {
+            return true;
+        };
+        let hull = Aabb::from_points(points).expanded(endpoint_gate);
+        hull.contains(ps) && hull.contains(pe)
+    };
     let scale = solid_scale(solid_a).max(solid_scale(solid_b));
     let span_band = (SHARED_SECTION_BAND_FRACTION * scale).max(endpoint_gate);
     let piece_point: HashMap<u64, Vec3> =
@@ -417,15 +470,15 @@ pub(super) fn reuse_boundary_section_edges(
             continue;
         };
         if ps.sub(pe).length() <= endpoint_gate {
-            // CLOSED-RING REUSE (problemInbox equator-tangent): a closed
-            // section ring coincident with an existing closed boundary edge
-            // (the inscribed sphere's equator IS the cylinder's cap-edge
-            // circle) can never be unified by the assembler's endpoint weld —
-            // closed rings have no distinct endpoints to weld — so the two
-            // records stay separate and strand one-use. Unlike the open-arc
-            // path below, EXACT coincidence must be accepted here (no lower
-            // floor): reuse is the ONLY identity mechanism available to
-            // rings. Escape hatch: BREP_SHARED_SECTION_RING=0.
+            // CLOSED-RING REUSE: a closed section ring coincident with an
+            // existing closed boundary edge (the inscribed sphere's equator
+            // IS the cylinder's cap-edge circle) can never be unified by the
+            // assembler's endpoint weld — closed rings have no distinct
+            // endpoints to weld — so the two records stay separate and strand
+            // one-use. Unlike the open-arc path below, EXACT coincidence must
+            // be accepted here (no lower floor): reuse is the ONLY identity
+            // mechanism available to rings. Escape hatch:
+            // BREP_SHARED_SECTION_RING=0.
             if std::env::var("BREP_SHARED_SECTION_RING").as_deref() != Ok("0") {
                 let mut chosen: Option<Reuse> = None;
                 let mut best_score = f64::INFINITY;
@@ -522,6 +575,18 @@ pub(super) fn reuse_boundary_section_edges(
                 // Both section endpoints must lie ON the edge's curve, at
                 // parameters inside the edge's live window (closed rings
                 // included — the parent is often a ring the section grazes).
+                // HULL PRE-GATE (`BREP_SHARED_SECTION_HULL_GATE`, lane P3b row 1):
+                // the projection distance of an endpoint onto the edge is at
+                // least its distance to the edge's control hull (a NURBS
+                // curve lies in its control hull), so an edge whose hull is
+                // farther than `endpoint_gate` from either endpoint fails the
+                // gate below without being asked.
+                if reuse_hull_gate && !hull_admits(edge, ps, pe) {
+                    continue;
+                }
+                if profile_enabled() {
+                    imprint_split_add(|split| split.reuse_edges += 1);
+                }
                 let (Ok(proj_s), Ok(proj_e)) = (
                     project_point_to_curve(&edge.curve, ps),
                     project_point_to_curve(&edge.curve, pe),
@@ -1581,6 +1646,7 @@ fn join_section_pieces(
             }
             _ => None,
         };
+        let exact_trim_join = joined.is_some();
         let pcurve = match joined {
             Some(pcurve) => pcurve,
             None => match {
@@ -1610,7 +1676,14 @@ fn join_section_pieces(
         // reading the collar as the two arcs they were written against — the
         // seam-marker half of "one rim, one edge", owned by `blending/` and the
         // naming pass — so the arcs stay here until they read one closed edge.
-        if spans_a_period_of_a_doubly_curved_carrier(&face.surface, &pcurve)? {
+        // An isoparametric ring whose ends are the two images of the seam
+        // already has the required seam marker. Joining its existing trims
+        // exactly neither moves that marker nor refits a full-period trim.
+        // The blanket full-period veto left the cage/cube report's tracing
+        // origin as an extra 0.269 mm edge on just such a ring.
+        if spans_a_period_of_a_doubly_curved_carrier(&face.surface, &pcurve)?
+            && !(exact_trim_join && is_seam_anchored_iso_rim(&face.surface, &pcurve)?)
+        {
             return Ok(false);
         }
         pcurves.push(FacePcurve {
@@ -1639,6 +1712,66 @@ fn join_section_pieces(
         }
     }
     Ok(true)
+}
+
+/// A single in-domain isoparametric turn, anchored at both images of the
+/// carrier seam. Use the positive-weight control hull rather than samples:
+/// a wavy trim or one that crosses the branch internally is not this case.
+fn is_seam_anchored_iso_rim(
+    surface: &NurbsSurface,
+    pcurve: &NurbsCurve,
+) -> Result<bool, KernelRefusal> {
+    let (closed_u, closed_v) = surface
+        .closed_directions()
+        .or_refuse(KernelStage::Intersect, "closed_directions")?;
+    let u = surface
+        .domain_u()
+        .or_refuse(KernelStage::Intersect, "domain_u")?;
+    let v = surface
+        .domain_v()
+        .or_refuse(KernelStage::Intersect, "domain_v")?;
+    let [t0, t1] = pcurve
+        .domain()
+        .or_refuse(KernelStage::Intersect, "domain")?;
+    let start = pcurve
+        .evaluate(t0)
+        .or_refuse(KernelStage::Intersect, "evaluate")?;
+    let end = pcurve
+        .evaluate(t1)
+        .or_refuse(KernelStage::Intersect, "evaluate")?;
+    for (closed, period, transverse, a, b, fixed, swap) in [
+        (closed_u, u, v, start.x, end.x, start.y, false),
+        (closed_v, v, u, start.y, end.y, start.x, true),
+    ] {
+        if !closed {
+            continue;
+        }
+        let epsilon = (period[1] - period[0]).abs() * 1e-8;
+        let transverse_epsilon = (transverse[1] - transverse[0]).abs() * 1e-8;
+        let at = |x: f64, y: f64| (x - y).abs() <= epsilon;
+        if !((at(a, period[0]) && at(b, period[1])) || (at(a, period[1]) && at(b, period[0])))
+            || fixed < transverse[0] - transverse_epsilon
+            || fixed > transverse[1] + transverse_epsilon
+        {
+            continue;
+        }
+        if pcurve.control_points.iter().all(|point| {
+            if point.w <= 0.0 {
+                return false;
+            }
+            let (along, across) = if swap {
+                (point.y / point.w, point.x / point.w)
+            } else {
+                (point.x / point.w, point.y / point.w)
+            };
+            along >= period[0] - epsilon
+                && along <= period[1] + epsilon
+                && (across - fixed).abs() <= transverse_epsilon
+        }) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Whether `pcurve` runs a full period of a CLOSED direction of `surface`, on a

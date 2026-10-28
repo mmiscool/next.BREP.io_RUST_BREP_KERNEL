@@ -24,7 +24,7 @@
 //! # Selection sync (both ways)
 //!
 //! Clicking an entity row drives the engine's name-based SELECTION
-//! ([`EngineState::select_by_name`] / [`select_vertex_by_position`]) so it
+//! ([`EngineState::select_by_name`] / [`select_vertex_by_position`](brep_render::engine_state::EngineState::select_vertex_by_position)) so it
 //! highlights (emphasis) in the viewport; and the engine's CURRENT selection
 //! (`state.emphasis`) bolds the matching tree row — the same emphasis the
 //! viewport reads, so a viewport pick lights up the tree and vice-versa.
@@ -34,7 +34,7 @@
 //! MOUSING OVER a row highlights that entity in the 3D view exactly as mousing
 //! over it in the viewport does: the row feeds the SAME `emphasis` hover buckets
 //! the viewport's `hover_at` fills, through the name-based twins
-//! ([`EngineState::hover_by_name`] / [`hover_vertex_by_position`]) — so there is
+//! ([`EngineState::hover_by_name`] / [`hover_vertex_by_position`](brep_render::engine_state::EngineState::hover_vertex_by_position)) — so there is
 //! one hover highlight, one style, one clear. It lights exactly the rows whose
 //! CLICK selects one 3D entity (solids, committed sketches, datums/planes, and
 //! the face/edge/vertex leaves); the Scene root and the Faces/Edges/Vertices

@@ -106,6 +106,7 @@ fn newton_closest_pair(
     second: &NurbsCurve,
     seed_s: f64,
     seed_t: f64,
+    curvature: bool,
 ) -> Result<[f64; 2], String> {
     let [s0, s1] = first.domain()?;
     let [t0, t1] = second.domain()?;
@@ -117,10 +118,12 @@ fn newton_closest_pair(
         let residual = first_derivatives[0].sub(second_derivatives[0]);
         let f = first_derivatives[1].dot(residual);
         let g = -second_derivatives[1].dot(residual);
-        let j00 = first_derivatives[2].dot(residual) + first_derivatives[1].length_squared();
+        let j00 = first_derivatives[1].length_squared()
+            + if curvature { first_derivatives[2].dot(residual) } else { 0.0 };
         let j01 = -first_derivatives[1].dot(second_derivatives[1]);
         let j10 = -second_derivatives[1].dot(first_derivatives[1]);
-        let j11 = -second_derivatives[2].dot(residual) + second_derivatives[1].length_squared();
+        let j11 = second_derivatives[1].length_squared()
+            - if curvature { second_derivatives[2].dot(residual) } else { 0.0 };
         let residual_length = residual.length();
         let converged_first =
             f.abs() <= EPSILON + 1e-10 * first_derivatives[1].length() * residual_length.max(1e-30);
@@ -386,9 +389,27 @@ fn intersect_curves_general(
     let [t0, t1] = second.domain()?;
     let closed_first = first.evaluate(s0)?.sub(first.evaluate(s1)?).length() <= tolerance;
     let closed_second = second.evaluate(t0)?.sub(second.evaluate(t1)?).length() <= tolerance;
-    let mut results: Vec<CurveCurveIntersection> = Vec::new();
+    // The distance Hessian can lead Newton to a nonzero stationary point
+    // instead of a crossing. For a secant of a closed circle, every box seed
+    // can converge to the circle's seam this way. Retry failed seeds with
+    // the positive-semidefinite Gauss–Newton system (no curvature terms).
+    // Keep the successful Newton candidates first so their established
+    // parameters win deduplication; the retry must meet the same gap test.
+    let mut candidates = Vec::with_capacity(seeds.len());
+    let mut failed = Vec::new();
     for [seed_s, seed_t] in seeds {
-        let [s, t] = newton_closest_pair(first, second, seed_s, seed_t)?;
+        let pair = newton_closest_pair(first, second, seed_s, seed_t, true)?;
+        if first.evaluate(pair[0])?.sub(second.evaluate(pair[1])?).length() <= tolerance {
+            candidates.push(pair);
+        } else {
+            failed.push([seed_s, seed_t]);
+        }
+    }
+    for [seed_s, seed_t] in failed {
+        candidates.push(newton_closest_pair(first, second, seed_s, seed_t, false)?);
+    }
+    let mut results: Vec<CurveCurveIntersection> = Vec::new();
+    for [s, t] in candidates {
         let first_point = first.evaluate(s)?;
         let second_point = second.evaluate(t)?;
         let gap = first_point.sub(second_point).length();

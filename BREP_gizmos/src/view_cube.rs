@@ -31,7 +31,7 @@
 //! # Cube orientation
 //! Geometry uses world axes (FRONT at +Z, TOP at +Y). The
 //! [`ViewCube::mini_camera`] copies both the main camera's forward and up
-//! vectors so the cube mirrors its roll. [`cube_up`] orthogonalizes the up
+//! vectors so the cube mirrors its roll. `cube_up` orthogonalizes the up
 //! vector, using the Y-up fallback only when the supplied frame is degenerate.
 //! Back-facing faces, edges, and glyphs are culled for both CPU and GPU overlays.
 //!

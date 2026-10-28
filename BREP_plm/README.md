@@ -56,8 +56,9 @@ characters percent-encoded.
 This development version requires a fresh data directory when upgrading from
 opaque model IDs. Stop the old server, reset its data directory and CAD caches,
 then start this version with schema 6. Existing model data is not migrated.
-This greenfield schema requires a fresh data directory; old change orders,
-workflow purpose fields, file-store imports and schema upgrades are not supported.
+This greenfield schema requires a fresh data directory. Earlier data is not
+imported or upgraded: change orders (no longer a feature; use review rounds or
+workflows), workflow purpose fields and file-store imports are not carried over.
 
 ## What it does
 
@@ -88,9 +89,9 @@ workflow purpose fields, file-store imports and schema upgrades are not supporte
   up or down while preserving their order. The CAD chooser uses the same
   server configurations and can save personal configurations. Changing a view
   does not remove attribute data. CSV exports follow the selected configuration.
-- **Change orders and review.** A set of revisions released or obsoleted
-  together after one review round, all or none; reviewers, a release gate,
-  threaded discussion and an inbox.
+- **Review.** A review round on each submitted revision: reviewers,
+  approvals on the current document, a release gate, threaded discussion and
+  an inbox.
 - **Catalog and sourcing.** A category tree with inherited typed attributes,
   tags, manufacturers and suppliers, and each part's manufacturer part numbers
   with supplier offers and price breaks.

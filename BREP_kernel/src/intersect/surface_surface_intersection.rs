@@ -1138,7 +1138,7 @@ pub struct SurfaceIntersectionOptions {
     pub tree_seeds: bool,
     /// SUB-GATE STARTS (2026-10-17, the revolve-into-bore report): the
     /// `|n_a × n_b|` an EXPLICIT seed is admitted at, in place of
-    /// [`TRANSVERSE_START_CROSS`]. Grid and tree starts keep the gate: the
+    /// `TRANSVERSE_START_CROSS`. Grid and tree starts keep the gate: the
     /// tangency-band runaway it exists for is theirs (a refined start inside
     /// a band is a point no transverse curve passes through). An explicit
     /// seed the caller has PROVEN to lie on a crossing — a trim edge of one

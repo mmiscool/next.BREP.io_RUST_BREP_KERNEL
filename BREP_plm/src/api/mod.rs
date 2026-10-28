@@ -24,11 +24,16 @@ mod frontend;
 pub mod cad;
 pub mod catalog;
 pub mod family;
+pub mod instructions;
+pub mod jobs;
+pub mod player;
+pub mod tools;
 pub mod parts;
 pub mod preferences;
 pub mod review;
 pub mod scripts;
 pub mod credentials;
+pub mod desktop_link;
 pub mod settings;
 pub mod setup;
 pub mod workflow;
@@ -80,6 +85,7 @@ pub fn router(db: Shared) -> Router {
         .route("/cad/config", get(cad::config))
         .route("/api/setup/import", post(setup::import))
         .route("/api/setup/kicad-libraries", get(setup::kicad_libraries))
+        .route("/api/setup/kicad-folders", post(setup::kicad_folders))
         .route("/api/setup/kicad-part-type", post(setup::kicad_part_type))
         .route("/api/setup/kicad-taxonomy", post(setup::kicad_taxonomy))
         .route("/api/workflows", get(workflow::definitions).post(workflow::save))
@@ -91,6 +97,13 @@ pub fn router(db: Shared) -> Router {
         .route("/api/login", post(accounts::login))
         .route("/api/logout", post(accounts::logout))
         .route("/api/me", get(accounts::me))
+        .route("/desktop-link", get(frontend::index))
+        .route("/api/desktop/link", post(desktop_link::register))
+        .route("/api/desktop/link/poll", post(desktop_link::poll))
+        .route("/api/desktop/link/inspect", post(desktop_link::inspect))
+        .route("/api/desktop/link/approve", post(desktop_link::approve))
+        .route("/api/desktop/link/deny", post(desktop_link::deny))
+        .route("/api/desktop/sign-out", post(desktop_link::sign_out))
         .route("/api/me/preferences", get(preferences::list))
         .route(
             "/api/me/preferences/:key",
@@ -148,6 +161,22 @@ pub fn router(db: Shared) -> Router {
         .route("/api/import/validate", post(native_import::validate))
         .route("/api/parts/:id/bom/diff", get(bom::diff))
         .route("/api/parts/:id/where-used", get(bom::where_used))
+        .route("/api/parts/:id/instructions", get(instructions::list))
+        .route("/api/tools", get(tools::list).post(tools::create))
+        .route("/api/tools/:id", get(tools::get).patch(tools::update))
+        .route("/api/tools/:id/picture", get(tools::picture).put(tools::set_picture))
+        .route("/api/jobs", get(jobs::list).post(jobs::create))
+        .route("/api/jobs/:id", get(jobs::get).patch(jobs::update))
+        .route("/api/jobs/:id/steps/:step/signoff", post(jobs::sign))
+        .route("/api/jobs/:id/steps/:step/reopen", post(jobs::reopen))
+        .route("/api/serials", get(jobs::serial))
+        .route("/api/parts/:id/revisions/:rev/player-data", get(player::get).put(player::put))
+        .route("/api/parts/:id/revisions/:rev/shares", get(player::list_shares).post(player::create_share))
+        .route("/api/parts/:id/revisions/:rev/shares/:share", delete(player::revoke_share))
+        .route("/instructions/:number/:rev", get(player::view))
+        .route("/motion/:number/:rev", get(player::motion_view))
+        .route("/s/:token", get(player::shared))
+        .route("/s/:token/data", get(player::shared_data))
         .route("/api/parts/:id/replace", post(bom::replace))
         // -- attachments ------------------------------------------------------
         .route(
@@ -242,7 +271,7 @@ pub fn router(db: Shared) -> Router {
         .route("/api/workspaces", get(workspace::list_workspaces))
         .route("/api/workspace/entries", get(workspace::list_folder))
         .route("/api/workspace/folders", post(workspace::create_folder))
-        .route("/api/workspace/links", post(workspace::create_link))
+        .route("/api/workspace/links", get(workspace::folders_linking).post(workspace::create_link))
         .route("/api/workspace/files", post(workspace::create_file))
         .route(
             "/api/workspace/entries/:id",
@@ -411,9 +440,10 @@ pub async fn guard(State(db): State<Shared>, request: Request, next: Next) -> Re
     let peer = request.extensions().get::<ConnectInfo<SocketAddr>>().map(|ConnectInfo(addr)| addr.ip());
     let actor = actor_of(&db, request.headers(), peer);
     let mut response = audit::scope(actor, next.run(request)).await;
-    // The hosted CAD app answers with its own policy ([`crate::cad`]); every
-    // other response gets the PLM's, whatever its handler set.
-    let own_policy = if path.starts_with(crate::cad::PREFIX) {
+    // The hosted CAD app and the instructions player ([`crate::player`])
+    // answer with their own policy; every other response gets the PLM's,
+    // whatever its handler set.
+    let own_policy = if path.starts_with(crate::cad::PREFIX) || path.starts_with("/instructions/") || path.starts_with("/motion/") || path.starts_with("/s/") {
         response.headers_mut().remove(header::CONTENT_SECURITY_POLICY)
     } else {
         None

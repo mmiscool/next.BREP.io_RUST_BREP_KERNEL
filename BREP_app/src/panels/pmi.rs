@@ -23,8 +23,8 @@
 //! row and its label in the viewport carry the selection) and a double click
 //! opens its form; its menu offers Edit, Move up / down and Delete — the same
 //! menu a right-click on the annotation's label chip opens in the viewport
-//! ([`annotation_actions`], [`run_row_action`]), and Delete is also the Delete
-//! key on a selected annotation ([`delete_annotation`], driven by the app
+//! (`annotation_actions`, `run_row_action`), and Delete is also the Delete
+//! key on a selected annotation (`delete_annotation`, driven by the app
 //! shell). Hovering an annotation row highlights the geometry it references.
 //!
 //! # Form mode
@@ -286,8 +286,10 @@ impl PmiPanel {
     pub fn show(&mut self, ui: &mut egui::Ui, state: &mut EngineState) {
         self.locked = state.history.locked().map(str::to_string);
         self.hits.clear();
-        self.hits.insert("pmi:panel:clip".into(), ui.clip_rect());
-        let pmi = state.pmi_state();
+        self.hits.insert("panel:clip".into(), ui.clip_rect());
+        // The shared parse and a BORROWED report: this runs every frame, and a
+        // 500-step view's block is milliseconds to parse and its report to copy.
+        let pmi = state.pmi_state_shared();
         let stale_form = self.plugin_form.as_ref().is_some_and(|form| {
             if let Some(id) = &form.id {
                 state.pmi_open_annotation() != Some(id.as_str()) || pmi.find_annotation(id).is_none()
@@ -308,7 +310,8 @@ impl PmiPanel {
             self.show_plugin_form(ui, state);
             return;
         }
-        let report = state.pmi_report().cloned().unwrap_or_default();
+        let no_report = PmiReport::default();
+        let report = state.pmi_report().unwrap_or(&no_report);
         let active = state.pmi_active_view().map(String::from);
         let open = state.pmi_open_annotation().map(String::from);
         let open_view = state.pmi_open_view().map(String::from);
@@ -333,10 +336,17 @@ impl PmiPanel {
                 let picking = state
                     .ref_select_field()
                     .filter(|f| f.target == RefSelectTarget::Pmi && f.subject == annotation.id());
-                self.show_form(ui, &annotation, &report, picking.as_ref(), &mut action, &mut close, &mut hover);
+                self.show_form(ui, &annotation, report, picking.as_ref(), &mut action, &mut close, &mut hover);
             }
-            (None, Some(view)) => self.show_view_form(ui, &view, &mut action, &mut close),
-            (None, None) => self.show_tree(ui, &pmi, &report, active.as_deref(), selected.as_deref(), &mut action, &state.plugin_annotation_catalogue()),
+            (None, Some(view)) => {
+                // The section-plane pick running in this view's form, if one is.
+                let picking = state
+                    .ref_select_field()
+                    .filter(|f| f.target == RefSelectTarget::Pmi && f.subject == view.id);
+                let section_error = report.view(&view.id).map(|row| row.section_error.clone()).unwrap_or_default();
+                self.show_view_form(ui, &view, &section_error, picking.as_ref(), &mut action, &mut close);
+            }
+            (None, None) => self.show_tree(ui, &pmi, report, active.as_deref(), selected.as_deref(), &mut action, &state.plugin_annotation_catalogue()),
         }
 
         let result = action.map_or(Ok(()), |action| apply(state, action));
@@ -355,11 +365,14 @@ impl PmiPanel {
         // This pane drew (or opened) the pick: the shell finishes an in-form
         // pick no form claims, so one never runs on with its field off screen.
         if let Some(field) = state.ref_select_field() {
-            if field.target == RefSelectTarget::Pmi && state.pmi_open_annotation() == Some(field.subject.as_str()) {
+            if field.target == RefSelectTarget::Pmi
+                && (state.pmi_open_annotation() == Some(field.subject.as_str()) || state.pmi_open_view() == Some(field.subject.as_str()))
+            {
                 state.ref_select_claim();
             }
         }
-        let open_explode = state.pmi_open_annotation().and_then(|id| state.pmi_state().find_annotation(id).filter(|(_, a)| a.kind == "explode").map(|_| id.to_owned()));
+        // Read AFTER the action applied (the shared parse follows the revision).
+        let open_explode = state.pmi_open_annotation().and_then(|id| state.pmi_state_shared().find_annotation(id).filter(|(_, a)| a.kind == "explode").map(|_| id.to_owned()));
         if let Some(id) = open_explode {
             if !state.transform_armed_for(&id) { state.arm_transform(&id); }
             state.sync_transform_gizmo();
@@ -604,6 +617,7 @@ impl PmiPanel {
             root_cells: None,
             empty_hint: Some("(no views — Capture view to snapshot the camera and start annotating)"),
             hits_prefix: "pmi:",
+            drag_rows: false,
         };
         let out = column_tree::column_tree(ui, &spec, &mut self.layout, &rows, Some(&mut self.hits));
 
@@ -672,12 +686,29 @@ impl PmiPanel {
         &mut self,
         ui: &mut egui::Ui,
         view: &brep_render::brep_kernel::PmiView,
+        section_error: &str,
+        picking: Option<&RefSelectField>,
         action: &mut Option<Action>,
         close: &mut bool,
     ) {
         let schema = pmi_view_schema();
         let fields = form_fields_from_schema(&schema);
         let mut params = pmi_view_params(view);
+        // The plane picker belongs to the Plane normal only, and the parts
+        // left uncut to a section that is on.
+        let mut hidden: std::collections::HashSet<String> = Default::default();
+        if params["sectionAxis"] != "Plane" {
+            hidden.insert("sectionPlane".to_string());
+        }
+        if params["sectionEnabled"] != true {
+            hidden.insert("sectionExclude".to_string());
+            hidden.insert("halfAxis".to_string());
+        }
+        // The half section's offset and side mean something once it has a plane.
+        if params["sectionEnabled"] != true || params["halfAxis"] == "None" {
+            hidden.insert("halfOffset".to_string());
+            hidden.insert("halfFlip".to_string());
+        }
         // Keyed by the id, never the name: the title scopes the form's widget
         // state, and the name is one of the fields being typed into.
         let title = format!("PMI view {}", view.id);
@@ -685,20 +716,37 @@ impl PmiPanel {
             title: &title,
             subtitle: Some(view.name.as_str()),
             fields: &fields,
-            hidden: None,
-            banner: None,
+            hidden: Some(&hidden),
+            // A Plane section whose face or plane does not resolve cuts nothing: say why.
+            banner: (!section_error.is_empty()).then(|| (section_error, egui::Color32::from_rgb(0xf8, 0x51, 0x49))),
             trailing: None,
             exit_label: "Return to tree",
             extra: None,
             rollback: false,
             hits_prefix: "pmi:",
             read_only: self.locked.as_deref(),
-            // A view's form has no reference field.
-            picking: None,
+            // The section plane is a reference field (the pick bar on phones).
+            picking: picking.map(|f| crate::form::ActivePick { path: &f.path, names: &f.names }),
         };
         let out = form_view(ui, &spec, &mut params, Some(&mut self.hits));
         let anchor = self.hits.get("pmi:form:feature").map(|rect| rect.min).unwrap_or(egui::Pos2::ZERO);
         self.hits.insert(format!("pmi:form:view:{}", view.id), egui::Rect::from_min_size(anchor, egui::Vec2::ZERO));
+        if let Some(activate) = out.ref_activate {
+            *action = Some(Action::BeginRefSelect {
+                id: view.id.clone(),
+                path: activate.path,
+                label: activate.label,
+                filter: activate.filter,
+                multiple: activate.multiple,
+                seed: activate.seed,
+            });
+        }
+        if let Some(index) = out.pick_remove {
+            *action = Some(Action::RefSelectRemove(index));
+        }
+        if out.pick_done {
+            *action = Some(Action::FinishRefSelect);
+        }
         if out.changed {
             // A view needs a name: a name field emptied on the way to a new one
             // writes nothing until there is a name again.
@@ -831,6 +879,6 @@ pub static HIT_KEYS: &[HitKeyDoc] = &[
     // panel's prefix rather than the `pmi:form:` chrome. Undocumented until
     // 2026-09-13 for the same reason the rest of the pane's keys were: the
     // check had never run with an annotation form open.
-    HitKeyDoc { panel: "pmi", prefix: "pmi:field:", meaning: "one control of the open annotation's or view's form (pmi:field:<path>, plus #activate on a reference field) \u{2014} a note's text, an anchor or plane picker; a view's `pmi:field:name`, `pmi:field:textSizePt`, `pmi:field:wireframe` and its `pmi:field:updateCamera` / `pmi:field:updateVisibility` buttons", command: Some("pmi_update_annotation") },
-    HitKeyDoc { panel: "pmi", prefix: "pmi:panel:clip", meaning: "the visible region of the pane", command: None },
+    HitKeyDoc { panel: "pmi", prefix: "pmi:field:", meaning: "one control of the open annotation's or view's form (pmi:field:<path>, plus #activate on a reference field) \u{2014} a note's text, an anchor or plane picker; a view's `pmi:field:name`, `pmi:field:textSizePt`, `pmi:field:wireframe`, its section controls `pmi:field:sectionEnabled`, `pmi:field:sectionAxis` (options `#View`, `#X`, `#Y`, `#Z`, `#Plane`), `pmi:field:sectionPlane` (shown for Plane; `#activate` picks the planar face or datum plane), `pmi:field:sectionOffset`, `pmi:field:sectionFlip` and `pmi:field:sectionExclude` (shown while the section is on; `#activate` picks the solids or components left uncut), `pmi:field:halfAxis` (options `#None`, `#View`, `#X`, `#Y`, `#Z`: a second plane, shown while the section is on) with `pmi:field:halfOffset` and `pmi:field:halfFlip` (shown once it has a plane), and its `pmi:field:updateCamera` / `pmi:field:updateVisibility` buttons", command: Some("pmi_update_annotation") },
+    HitKeyDoc { panel: "pmi", prefix: "panel:clip", meaning: "the visible region of the pane", command: None },
 ];

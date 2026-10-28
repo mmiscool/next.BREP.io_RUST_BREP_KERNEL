@@ -2,7 +2,7 @@
 //! the engine-native UI. Settings, dock layout, and model documents all use the
 //! same [`ModelStore::read`] / [`ModelStore::write`] API. Only its backend differs:
 //! desktop writes files; the browser mirrors an ASYNC, swappable
-//! [`mirror_store::StoreBackend`] — IndexedDB today, a remote server next — into
+//! `mirror_store::StoreBackend` — IndexedDB today, a remote server next — into
 //! memory and writes behind it, which is what keeps this whole API synchronous.
 //!
 //! Desktop reads the real filesystem on every call. The browser CANNOT: IndexedDB
@@ -12,8 +12,8 @@
 //! is that it never falls behind the storage it stands for, and the key space has
 //! MORE than one writer: every other tab of the same origin. So each tab announces
 //! the key it committed and re-reads the keys it is told about
-//! ([`mirror_store::MirrorStore::refresh_key`], over the `brep-app:store` broadcast
-//! in [`web_model`]). Save a part in one tab and the tab holding the assembly can
+//! (`mirror_store::MirrorStore::refresh_key`, over the `brep-app:store` broadcast
+//! in `web_model`). Save a part in one tab and the tab holding the assembly can
 //! insert it — no reload.
 
 /// Reserved persistent-object names used internally for application state.
@@ -74,7 +74,22 @@ pub const PREFERENCE_KEYS: &[&str] = &[
 /// after the local write (D1, S1's composition); the local copy is what a
 /// network drop cannot take away — and `@plm_import`, which is never
 /// mirrored.
-pub const LOCAL_KEYS: &[&str] = &[RECOVERY_KEY, PLM_IMPORT_KEY, PLUGINS_KEY, JAVASCRIPT_DRAFT_KEY, RECENT_THUMBNAILS_KEY];
+///
+/// The CAM workbench's user tool library (`panels::cam_library`) is LOCAL
+/// too: a preference key is served per user by a PLM, whose server
+/// allow-lists the preference names (`BREP_plm` `api::preferences::KEYS`),
+/// so a new preference would be refused by every deployed server and the
+/// sign-in's preference load fails on the first refused key. The library
+/// stays on the machine until the PLM gains the key and the backend
+/// tolerates a server that lacks it.
+pub const LOCAL_KEYS: &[&str] = &[
+    RECOVERY_KEY,
+    PLM_IMPORT_KEY,
+    PLUGINS_KEY,
+    JAVASCRIPT_DRAFT_KEY,
+    RECENT_THUMBNAILS_KEY,
+    crate::panels::cam_library::CAM_TOOL_LIBRARY_KEY,
+];
 
 /// Which of the three key spaces a store name belongs to (D1, the round 10
 /// answer). Every name is exactly one of them:
@@ -234,6 +249,8 @@ pub fn media_type(file_name: &str) -> &'static str {
         "pdf" => "application/pdf",
         "svg" => "image/svg+xml",
         "glb" => "model/gltf-binary",
+        // The 3MF Consortium's registered type for the package.
+        "3mf" => "model/3mf",
         "json" => "application/json",
         // The PCB's fabrication bundle.
         "zip" => "application/zip",
@@ -319,7 +336,7 @@ pub trait ModelStore {
     }
 
     /// The name a person sees for `identity`: the tab title, the name field.
-    /// The default is the file rule, [`model_display_name`]; a PLM store knows
+    /// The default is the file rule, `model_display_name`; a PLM store knows
     /// the part number and revision label from its index, which the key alone
     /// does not carry.
     fn display_name(&self, identity: &str) -> String {
@@ -348,15 +365,55 @@ pub trait ModelStore {
         name.to_string()
     }
 
+    /// [`Self::canonical_identity`] as a function that outlives the borrow:
+    /// what the open documents compare identities with (a tab is named by the
+    /// explorer's spelling, a `sourceKey` by whatever the part was inserted
+    /// by — `crate::document::live_link`).
+    fn canonicalizer(&self) -> Canonicalizer {
+        std::rc::Rc::new(str::to_string)
+    }
+
     /// Persistence failures that surfaced AFTER a `write` / `remove` already
     /// returned `Ok` — the price of a WRITE-BEHIND backend (see
-    /// [`mirror_store`]). The app shell drains this once per frame into the toast
+    /// `mirror_store`). The app shell drains this once per frame into the toast
     /// overlay, so a save that never reached storage is never silent: the
     /// in-memory copy means nothing is lost mid-session, but the user has to know
     /// it will not survive a reload. Empty on a backend that writes synchronously
     /// (native files), which reports through `write`'s `Err` instead.
     fn take_persistence_errors(&self) -> Vec<String> {
         Vec::new()
+    }
+
+    /// The documents (as named to `write`) whose write failed AFTER `write`
+    /// returned `Ok`, each once. The frame loop marks their tabs unsaved again:
+    /// a Save that never reached the server must not leave a clean tab, or
+    /// closing it loses the edit without a question. Empty on a backend that
+    /// writes synchronously, whose `write` returns the `Err` itself.
+    fn take_failed_writes(&self) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// The last write of `name` failed after it returned: what [`Self::read`]
+    /// gives is this session's, not the backend's. A Save that would skip the
+    /// write because the store "already holds" the text must write it.
+    fn write_failed(&self, name: &str) -> bool {
+        let _ = name;
+        false
+    }
+
+    /// For a [`Self::write_failed`] key: the content hash of the document the
+    /// failed write was based on (empty: unknown).
+    fn failed_write_base(&self, name: &str) -> Option<String> {
+        let _ = name;
+        None
+    }
+
+    /// [`Self::write`], but only over the document whose content hash is
+    /// `expected` (a PLM revision's `If-Match`): a backend holding a newer one
+    /// refuses it, and the failure says so. A store with no such check writes.
+    fn write_if(&self, name: &str, contents: &str, expected: &str) -> Result<(), String> {
+        let _ = expected;
+        self.write(name, contents)
     }
 
     /// The PLM this session is on, or is configured for and not on (why, when
@@ -381,6 +438,23 @@ pub trait ModelStore {
     fn plm_revision(&self, key: &str) -> Option<crate::plm::client::IndexEntry> {
         let _ = key;
         None
+    }
+
+    /// This session's checkout of the PLM revision `key` just landed: its
+    /// index row reads it as checked out to us now, before the change feed
+    /// says so (a Save planned meanwhile must not ask to check it out again).
+    /// A no-op on every file store.
+    fn note_checked_out(&self, key: &str) {
+        let _ = key;
+    }
+
+    /// Whether the index row of the PLM revision `key` lists our own last
+    /// write of it, with nothing newer listed since: what the change feed
+    /// names for it is our own save, which a reader need not read back.
+    /// `false` on every file store.
+    fn plm_written_by_us(&self, key: &str) -> bool {
+        let _ = key;
+        false
     }
 
     /// Bring the held index up to date after the change feed moved: `keys`
@@ -487,6 +561,17 @@ pub trait ModelStore {
     fn browser_write(&self, name: &str, contents: &str) -> Result<String, String> {
         self.write(name, contents)?;
         Ok(name.to_string())
+    }
+
+    /// Write `contents` under EXACTLY `file_name` (extension kept: no model
+    /// extension munging, unlike [`Self::browser_write`]) at the current
+    /// browser location, and return the written file's full identity. The
+    /// Save-file chooser's door: on desktop every export goes through it once
+    /// the user has chosen the folder in the explorer. Default: unsupported —
+    /// the browser has no folders to choose and downloads instead
+    /// ([`Self::export_file_named_bytes`]).
+    fn browser_write_bytes(&self, _file_name: &str, _contents: &[u8]) -> Result<String, String> {
+        Err("this storage backend cannot write a file at a location".into())
     }
 
     /// Files available to the in-app explorer for a foreign-format import.
@@ -637,6 +722,30 @@ pub async fn hydrate_web_store() {
 #[cfg(target_arch = "wasm32")]
 pub use web_model::set_repaint_ctx;
 
+/// Ask for a frame from anywhere, any thread: an async answer has landed that
+/// the frame loop should pick up. Browser: the egui context registered at boot.
+/// Native: the PLM executor's wake hook (the frame loop's `request_repaint`).
+pub(crate) fn wake_ui() {
+    #[cfg(target_arch = "wasm32")]
+    web_model::wake_frame_loop();
+    #[cfg(not(target_arch = "wasm32"))]
+    crate::plm::native::request_wake();
+}
+
+/// Run a background task (a PLM request, a store write, a thumbnail upload) and
+/// wake the frame loop whenever it makes progress. The app repaints only on
+/// input and explicit requests, so an answer that lands while the user is not
+/// moving the mouse is otherwise not shown, and a step that waits for the next
+/// frame does not run, until they do. Natively the PLM executor's waker already
+/// wakes the loop; in the browser the task is wrapped so each poll (after the
+/// I/O it was waiting on) requests a repaint.
+pub(crate) fn spawn_waking(task: impl std::future::Future<Output = ()> + 'static) {
+    #[cfg(target_arch = "wasm32")]
+    wasm_bindgen_futures::spawn_local(web_model::WakeOnPoll(Box::pin(task)));
+    #[cfg(not(target_arch = "wasm32"))]
+    crate::plm::native::spawn(task);
+}
+
 /// The document extension for a model recipe (`<name>.nbrep`) — the NORMAL
 /// part's. A bare name with no class extension means this one; a family
 /// (`.fbrep`) or template (`.tbrep`) keeps its extension in its name, so its
@@ -682,7 +791,7 @@ mod native_boot {
         super::PREFERENCE_KEYS.iter().chain(super::LOCAL_KEYS).copied()
     }
 
-    /// A [`StoreBackend`] over the native file store: the mirror's keys mapped
+    /// A `StoreBackend` over the native file store: the mirror's keys mapped
     /// back to the names `FileModelStore` has always used, so `@recovery` lands
     /// in `<root>/recovery.json` in a PLM session exactly as it does in a file
     /// session. It is the PLM session's LOCAL key space (D1: the local-first
@@ -827,6 +936,12 @@ mod native_boot {
         fn plm_revision(&self, key: &str) -> Option<crate::plm::client::IndexEntry> {
             self.core.plm_revision(key)
         }
+        fn note_checked_out(&self, key: &str) {
+            self.core.note_checked_out(key)
+        }
+        fn plm_written_by_us(&self, key: &str) -> bool {
+            self.core.plm_written_by_us(key)
+        }
         fn refresh_plm_index(&self, keys: &[String], stale: bool) {
             self.core.refresh_plm_index(keys, stale)
         }
@@ -845,6 +960,9 @@ mod native_boot {
         fn canonical_identity(&self, name: &str) -> String {
             self.core.canonical_identity(name)
         }
+        fn canonicalizer(&self) -> super::Canonicalizer {
+            self.core.canonicalizer()
+        }
         fn write(&self, name: &str, contents: &str) -> Result<(), String> {
             self.core.write(name, contents)
         }
@@ -859,6 +977,18 @@ mod native_boot {
         // early return would stall it.
         fn take_persistence_errors(&self) -> Vec<String> {
             self.core.take_persistence_errors()
+        }
+        fn take_failed_writes(&self) -> Vec<String> {
+            self.core.take_failed_writes()
+        }
+        fn write_failed(&self, name: &str) -> bool {
+            self.core.write_failed(name)
+        }
+        fn failed_write_base(&self, name: &str) -> Option<String> {
+            self.core.failed_write_base(name)
+        }
+        fn write_if(&self, name: &str, contents: &str, expected: &str) -> Result<(), String> {
+            self.core.write_if(name, contents, expected)
         }
         fn plm_session(&self) -> Option<crate::plm::connection::Session> {
             use crate::plm::connection::{parse_label, Keep, Session, Status};
@@ -897,6 +1027,12 @@ mod native_boot {
         }
         fn browser_write(&self, name: &str, contents: &str) -> Result<String, String> {
             self.core.browser_write(name, contents)
+        }
+        // The Save-file chooser browses the LOCAL files (`local_files`), so a
+        // write at its location is the file store's; delegated like its
+        // export siblings below rather than to the PLM's document mirror.
+        fn browser_write_bytes(&self, file_name: &str, contents: &[u8]) -> Result<String, String> {
+            self.files.browser_write_bytes(file_name, contents)
         }
 
         // --- this machine's real files ----------------------------------------
@@ -976,6 +1112,9 @@ mod native_boot {
 // `ModelStore::sibling_of`, whose defaults are exactly the path rules below,
 // so a file backend is unchanged and a PLM backend supplies its own.
 
+/// [`ModelStore::canonicalizer`]'s answer.
+pub type Canonicalizer = std::rc::Rc<dyn Fn(&str) -> String>;
+
 /// A document identity read for its shape — see the enumeration above.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DocumentIdentity {
@@ -1052,7 +1191,7 @@ pub(crate) fn model_display_name(file_name: &str) -> String {
 #[cfg(not(target_arch = "wasm32"))]
 mod native_model {
     use super::{
-        model_display_name, BrowserEntry, BrowserPlace, ModelStore, PlaceKind, DOCK_LAYOUT_KEY,
+        model_display_name, BrowserEntry, BrowserPlace, ModelStore, PlaceKind, Residency, DOCK_LAYOUT_KEY,
         FEATURE_PALETTE_DISPLAY_KEY, KICAD_LIBRARY_KEY, PINNED_KEY, PLM_IMPORT_KEY, RECOVERY_KEY,
         SETTINGS_KEY,
     };
@@ -1181,18 +1320,23 @@ mod native_model {
         /// Resolve a name to a path. Explicit paths remain supported for existing
         /// callers; a bare name maps to `<dir>/<sanitized>.nbrep`.
         fn resolve(&self, name: &str) -> PathBuf {
+            Self::resolve_in(&self.app_dir, &self.dir, name)
+        }
+
+        fn resolve_in(app_dir: &Path, dir: &Path, name: &str) -> PathBuf {
             match name {
-                SETTINGS_KEY => return self.app_dir.join("settings.json"),
-                FEATURE_PALETTE_DISPLAY_KEY => return self.app_dir.join("feature_palette_display.json"),
-                DOCK_LAYOUT_KEY => return self.app_dir.join("dock_layout.json"),
-                PINNED_KEY => return self.app_dir.join("pinned.json"),
-                RECOVERY_KEY => return self.app_dir.join("recovery.json"),
-                KICAD_LIBRARY_KEY => return self.app_dir.join("kicad_library.json"),
-                super::RECENT_DOCUMENTS_KEY => return self.app_dir.join("recent_documents.json"),
-                super::RECENT_THUMBNAILS_KEY => return self.app_dir.join("recent_thumbnails.json"),
-                PLM_IMPORT_KEY => return self.app_dir.join("plm_import.json"),
-                super::PLUGINS_KEY => return self.app_dir.join("plugins.json"),
-                super::JAVASCRIPT_DRAFT_KEY => return self.app_dir.join("javascript_draft.js"),
+                SETTINGS_KEY => return app_dir.join("settings.json"),
+                FEATURE_PALETTE_DISPLAY_KEY => return app_dir.join("feature_palette_display.json"),
+                DOCK_LAYOUT_KEY => return app_dir.join("dock_layout.json"),
+                PINNED_KEY => return app_dir.join("pinned.json"),
+                RECOVERY_KEY => return app_dir.join("recovery.json"),
+                KICAD_LIBRARY_KEY => return app_dir.join("kicad_library.json"),
+                crate::panels::cam_library::CAM_TOOL_LIBRARY_KEY => return app_dir.join("cam_tools.json"),
+                super::RECENT_DOCUMENTS_KEY => return app_dir.join("recent_documents.json"),
+                super::RECENT_THUMBNAILS_KEY => return app_dir.join("recent_thumbnails.json"),
+                PLM_IMPORT_KEY => return app_dir.join("plm_import.json"),
+                super::PLUGINS_KEY => return app_dir.join("plugins.json"),
+                super::JAVASCRIPT_DRAFT_KEY => return app_dir.join("javascript_draft.js"),
                 _ => {}
             }
             if name.contains('/') || name.contains('\\') {
@@ -1209,7 +1353,7 @@ mod native_model {
                     }
                 })
                 .collect();
-            self.dir.join(class.file_name(&safe))
+            dir.join(class.file_name(&safe))
         }
 
         fn home_dir() -> PathBuf {
@@ -1272,6 +1416,11 @@ mod native_model {
             std::fs::read_to_string(self.resolve(name)).ok()
         }
 
+        // A stat, not a read: an assembly's Save asks this of every part it places.
+        fn residency(&self, name: &str) -> Residency {
+            if self.resolve(name).is_file() { Residency::Resident } else { Residency::Absent }
+        }
+
         fn write(&self, name: &str, contents: &str) -> Result<(), String> {
             let path = self.resolve(name);
             if let Some(parent) = path.parent() {
@@ -1303,6 +1452,11 @@ mod native_model {
             // `resolve` is where every read and write goes, so it IS the
             // document a name means; the explorer spells paths the same way.
             self.resolve(name).to_string_lossy().into_owned()
+        }
+
+        fn canonicalizer(&self) -> super::Canonicalizer {
+            let (app_dir, dir) = (self.app_dir.clone(), self.dir.clone());
+            std::rc::Rc::new(move |name| Self::resolve_in(&app_dir, &dir, name).to_string_lossy().into_owned())
         }
 
         fn browser_location(&self) -> String {
@@ -1378,7 +1532,11 @@ mod native_model {
         }
 
         fn browser_navigate(&self, location: &str) -> Result<(), String> {
-            let path = PathBuf::from(location);
+            // Rebuilt from its components: a typed `C:\models/sub` (or
+            // `/models//sub/`) is the folder the walker lists as
+            // `C:\models\sub`, and a file written there must carry the same
+            // identity, or one file reads as two.
+            let path: PathBuf = PathBuf::from(location).components().collect();
             if path.is_dir() {
                 *self.browser_dir.borrow_mut() = path;
                 Ok(())
@@ -1443,6 +1601,21 @@ mod native_model {
             // This door writes the file ITSELF rather than going through
             // `write`, so it has to move the generation itself.
             self.bump();
+            Ok(path.to_string_lossy().into_owned())
+        }
+
+        fn browser_write_bytes(&self, file_name: &str, contents: &[u8]) -> Result<String, String> {
+            let file_name = PathBuf::from(file_name)
+                .file_name()
+                .ok_or("invalid file name")?
+                .to_owned();
+            let folder = self.browser_dir.borrow().clone();
+            // The folder the explorer shows normally exists; the models folder
+            // of a fresh store may not yet (the export lane made it too).
+            std::fs::create_dir_all(&folder).map_err(|e| format!("create {}: {e}", folder.display()))?;
+            let path = folder.join(file_name);
+            std::fs::write(&path, contents)
+                .map_err(|e| format!("write {}: {e}", path.display()))?;
             Ok(path.to_string_lossy().into_owned())
         }
 
@@ -1667,6 +1840,17 @@ pub(crate) mod mirror_store {
             None
         }
 
+        /// See [`ModelStore::note_checked_out`].
+        fn note_checked_out(&self, key: &str) {
+            let _ = key;
+        }
+
+        /// See [`ModelStore::plm_written_by_us`].
+        fn plm_written_by_us(&self, key: &str) -> bool {
+            let _ = key;
+            false
+        }
+
         /// See [`ModelStore::refresh_plm_index`].
         fn refresh_plm_index(&self, keys: &[String], stale: bool) {
             let _ = (keys, stale);
@@ -1740,6 +1924,14 @@ pub(crate) mod mirror_store {
         /// Persist `value` under `key`, creating or overwriting.
         fn put(&self, key: &str, value: &str) -> BackendFuture<()>;
 
+        /// [`Self::put`] only over the document whose content hash is
+        /// `expected`. A backend that can tell refuses a newer one with an
+        /// error starting [`CHANGED_ELSEWHERE`]; one that cannot just puts.
+        fn put_if(&self, key: &str, value: &str, expected: &str) -> BackendFuture<()> {
+            let _ = expected;
+            self.put(key, value)
+        }
+
         /// Delete `key`. Succeeding on an absent key is correct.
         fn delete(&self, key: &str) -> BackendFuture<()>;
     }
@@ -1797,6 +1989,12 @@ pub(crate) mod mirror_store {
 
         fn plm_revision(&self, key: &str) -> Option<crate::plm::client::IndexEntry> {
             self.documents.plm_revision(key)
+        }
+        fn note_checked_out(&self, key: &str) {
+            self.documents.note_checked_out(key)
+        }
+        fn plm_written_by_us(&self, key: &str) -> bool {
+            self.documents.plm_written_by_us(key)
         }
 
         fn refresh_plm_index(&self, keys: &[String], stale: bool) {
@@ -1863,6 +2061,10 @@ pub(crate) mod mirror_store {
             self.route(key).put(key, value)
         }
 
+        fn put_if(&self, key: &str, value: &str, expected: &str) -> BackendFuture<()> {
+            self.route(key).put_if(key, value, expected)
+        }
+
         fn delete(&self, key: &str) -> BackendFuture<()> {
             self.route(key).delete(key)
         }
@@ -1918,6 +2120,10 @@ pub(crate) mod mirror_store {
         }
     }
 
+    /// What a backend's refusal starts with when it holds a newer document
+    /// than the one a conditional write ([`StoreBackend::put_if`]) was based on.
+    pub(crate) const CHANGED_ELSEWHERE: &str = "changed elsewhere: ";
+
     /// Persistence failures that happened AFTER the synchronous `write` returned
     /// `Ok` — the price of write-behind. Nothing is lost mid-session (the mirror
     /// holds it), but the user MUST learn that it did not persist, so the log is
@@ -1929,6 +2135,16 @@ pub(crate) mod mirror_store {
     pub(crate) struct ErrorLog {
         log: RefCell<Vec<String>>,
         drained: Cell<usize>,
+        /// The documents whose write failed, not yet taken by the frame loop,
+        /// which marks their tabs unsaved again ([`ModelStore::take_failed_writes`]).
+        failed_writes: RefCell<Vec<String>>,
+        /// Keys whose LAST write failed: the mirror holds what was sent (this
+        /// session reads it), the backend does not ([`ModelStore::write_failed`]);
+        /// with the content hash of the backend's document that write was
+        /// based on (empty: unknown), for the retry's `If-Match`.
+        unsynced: RefCell<BTreeMap<String, String>>,
+        /// Per key, the base of the write last issued.
+        bases: RefCell<BTreeMap<String, String>>,
         /// Wakes the reactive frame loop so a failure recorded from an async
         /// callback is toasted THIS frame instead of waiting for stray input.
         wake: Option<Rc<dyn Fn()>>,
@@ -1939,6 +2155,9 @@ pub(crate) mod mirror_store {
             Self {
                 log: RefCell::new(Vec::new()),
                 drained: Cell::new(0),
+                failed_writes: RefCell::new(Vec::new()),
+                unsynced: RefCell::new(BTreeMap::new()),
+                bases: RefCell::new(BTreeMap::new()),
                 wake,
             }
         }
@@ -1963,6 +2182,43 @@ pub(crate) mod mirror_store {
             if let Some(wake) = &self.wake {
                 wake();
             }
+        }
+
+        /// The write of document `name` failed: besides its message, the frame
+        /// loop learns WHICH document, so its tab reads unsaved again.
+        pub(crate) fn record_failed_write(&self, name: &str) {
+            let mut failed = self.failed_writes.borrow_mut();
+            if !failed.iter().any(|n| n == name) {
+                failed.push(name.to_string());
+            }
+        }
+
+        fn take_failed_writes(&self) -> Vec<String> {
+            std::mem::take(&mut *self.failed_writes.borrow_mut())
+        }
+
+        /// A write of `key` is issued, based on the backend's document with
+        /// content hash `base` (empty: unknown).
+        fn note_base(&self, key: &str, base: String) {
+            self.bases.borrow_mut().insert(key.to_string(), base);
+        }
+
+        /// A write of `key` settled. Failed, the key is unsynced, keeping the
+        /// base of its FIRST failed write (the backend's document before this
+        /// session's unconfirmed writes); landed, or refused because the
+        /// backend holds a newer document (`refused`), it is not.
+        fn mark_unsynced(&self, key: &str, failed: bool) {
+            let mut unsynced = self.unsynced.borrow_mut();
+            if failed {
+                let base = self.bases.borrow().get(key).cloned().unwrap_or_default();
+                unsynced.entry(key.to_string()).or_insert(base);
+            } else {
+                unsynced.remove(key);
+            }
+        }
+
+        fn unsynced(&self, key: &str) -> Option<String> {
+            self.unsynced.borrow().get(key).cloned()
         }
 
         /// Messages recorded since the last drain (what the UI has not shown yet).
@@ -1996,7 +2252,7 @@ pub(crate) mod mirror_store {
     /// per-key queue does with the next.
     #[cfg(target_arch = "wasm32")]
     fn spawn(task: impl Future<Output = ()> + 'static) {
-        wasm_bindgen_futures::spawn_local(task);
+        super::spawn_waking(task);
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -2055,6 +2311,23 @@ pub(crate) mod mirror_store {
         freshness: Rc<RefCell<BTreeMap<String, u64>>>,
         /// A whole-index answer also speaks for keys never seen locally.
         full_index_authority: Rc<Cell<u64>>,
+        /// The explorer's last listing and what it was taken from: an open
+        /// Insert or Open dialog lists the folder every frame, and walking a
+        /// 5,000-part key space each time was the dialog's frame cost.
+        listing: Rc<RefCell<Option<(ListingKey, Vec<BrowserEntry>)>>>,
+    }
+
+    /// What a folder listing of [`MirrorStore`] depends on: the folder, the
+    /// extensions asked for, and the key space as its mutation count, its
+    /// size and its byte total say (a body that loads keeps its count but
+    /// may move its size).
+    #[derive(Clone, PartialEq)]
+    struct ListingKey {
+        dir: String,
+        extensions: Vec<String>,
+        mutations: u64,
+        keys: usize,
+        bytes: u64,
     }
 
     /// A write the per-key queue holds back: the document name its failure is
@@ -2103,6 +2376,7 @@ pub(crate) mod mirror_store {
                 clock: Rc::new(Cell::new(0)),
                 freshness: Rc::new(RefCell::new(BTreeMap::new())),
                 full_index_authority: Rc::new(Cell::new(0)),
+                listing: Rc::new(RefCell::new(None)),
             }
         }
         /// The next tick of the authority clock.
@@ -2133,6 +2407,7 @@ pub(crate) mod mirror_store {
                 // document arm would key as `brep-app:model:@kicad_library` and
                 // LIST as a document the day anything wrote it here.
                 KICAD_LIBRARY_KEY => "brep-app:kicad_library".into(),
+                crate::panels::cam_library::CAM_TOOL_LIBRARY_KEY => "brep-app:cam_tools".into(),
                 super::RECENT_DOCUMENTS_KEY => "brep-app:recent_documents".into(),
                 super::RECENT_THUMBNAILS_KEY => "brep-app:recent_thumbnails".into(),
                 PLM_IMPORT_KEY => "brep-app:plm_import".into(),
@@ -2242,6 +2517,7 @@ pub(crate) mod mirror_store {
             let pending = self.pending.clone();
             let in_flight = self.in_flight.clone();
             let errors = self.errors.clone();
+            let entries = self.entries.clone();
             let key = key.to_string();
             move |name, outcome| {
                 pending.set(pending.get().saturating_sub(1));
@@ -2254,8 +2530,30 @@ pub(crate) mod mirror_store {
                         }
                     }
                 }
-                if let Err(message) = outcome {
-                    errors.record(format!("'{name}' was NOT saved: {message}"));
+                match outcome {
+                    Err(message) if message.starts_with(CHANGED_ELSEWHERE) => {
+                        // The backend refused it because it holds a newer
+                        // document than the one this write was based on: not
+                        // ours any more. The mirror forgets what was sent, so
+                        // the next read takes the newer document and a Save
+                        // asks as for any document changed elsewhere.
+                        errors.mark_unsynced(&key, false);
+                        if let Some(entry) = entries.borrow_mut().get_mut(&key) {
+                            let bytes = match entry {
+                                Entry::Resident(text) => text.len() as u64,
+                                Entry::OnDisk { bytes } => *bytes,
+                            };
+                            *entry = Entry::OnDisk { bytes };
+                        }
+                        errors.record_failed_write(name);
+                        errors.record(format!("'{name}' was NOT saved: {}", &message[CHANGED_ELSEWHERE.len()..]));
+                    }
+                    Err(message) => {
+                        errors.record_failed_write(name);
+                        errors.mark_unsynced(&key, true);
+                        errors.record(format!("'{name}' was NOT saved: {message}"));
+                    }
+                    Ok(()) => errors.mark_unsynced(&key, false),
                 }
             }
         }
@@ -2523,156 +2821,10 @@ pub(crate) mod mirror_store {
         }
     }
 
-    impl ModelStore for MirrorStore {
-        fn backend_label(&self) -> String {
-            self.backend.label()
-        }
-
-        fn plm_client(&self) -> Option<std::rc::Rc<crate::plm::client::PlmClient>> {
-            self.backend.plm_client()
-        }
-
-        fn plm_revision(&self, key: &str) -> Option<crate::plm::client::IndexEntry> {
-            self.backend.plm_revision(key)
-        }
-
-        /// A feed move: what the server now lists for `keys` — or, `stale`,
-        /// for everything — is folded into the entries as LAZY `OnDisk`
-        /// rows, so a document another client, the web app or Generate made
-        /// after this app booted is listed and opens without a reload (bodies
-        /// load on demand, as at boot). See [`Self::reconcile`] for what is
-        /// never touched.
-        fn refresh_plm_index(&self, keys: &[String], stale: bool) {
-            // A backend that keeps no index answers `Err` and nothing moves.
-            if !stale && keys.is_empty() {
-                return;
-            }
-            let store = self.clone();
-            // The answer speaks for the server AS OF NOW: ticked before the
-            // request leaves, so anything local that happens while it is on
-            // the wire outranks it.
-            let issued = self.tick();
-            if stale {
-                let request = self.backend.index_all();
-                spawn(async move {
-                    if let Ok(rows) = request.await {
-                        store.reconcile(None, rows, issued);
-                    }
-                });
-            } else {
-                let asked: Vec<String> = keys.iter().map(|key| format!("{PREFIX}{key}")).collect();
-                let request = self.backend.index_rows(keys);
-                spawn(async move {
-                    if let Ok(rows) = request.await {
-                        store.reconcile(Some(&asked), rows, issued);
-                    }
-                });
-            }
-        }
-        fn remember_saved_document(&self, name: &str, contents: &str) {
-            let key = Self::key(name);
-            self.stamp_local(&key);
-            self.entries.borrow_mut().insert(key, Entry::Resident(contents.into()));
-            self.mutations.set(self.mutations.get().wrapping_add(1));
-        }
-
-        fn list(&self) -> Vec<String> {
-            // `BTreeMap` iterates in key order, so the names come out sorted.
-            self.entries
-                .borrow()
-                .keys()
-                .filter_map(|key| key.strip_prefix(PREFIX).map(str::to_string))
-                .collect()
-        }
-
-        fn read(&self, name: &str) -> Option<String> {
-            let key = Self::key(name);
-            let held = self.entries.borrow().get(&key).cloned();
-            match held {
-                Some(Entry::Resident(value)) => Some(value),
-                // Listed but not loaded: ask for it and answer `None` NOW — the
-                // API is synchronous. The bytes land through `resolve`, which
-                // moves the generation and wakes the frame, so a caller keyed on
-                // the generation reads again. `residency` tells the two `None`s
-                // apart.
-                Some(Entry::OnDisk { .. }) => {
-                    self.load(&key);
-                    None
-                }
-                None => None,
-            }
-        }
-
-        fn canonical_identity(&self, name: &str) -> String {
-            // The explorer's spelling of a document key (`browser_entries`);
-            // a reserved name has no other spelling.
-            match Self::key(name).strip_prefix(PREFIX) {
-                Some(relative) => Self::virtual_model_path(relative),
-                None => name.to_string(),
-            }
-        }
-
-        fn residency(&self, name: &str) -> Residency {
-            match self.entries.borrow().get(&Self::key(name)) {
-                Some(Entry::Resident(_)) => Residency::Resident,
-                Some(Entry::OnDisk { .. }) => Residency::OnDisk,
-                None => Residency::Absent,
-            }
-        }
-
-        fn write(&self, name: &str, contents: &str) -> Result<(), String> {
-            let key = Self::key(name);
-            self.stamp_local(&key);
-            self.entries
-                .borrow_mut()
-                .insert(key.clone(), Entry::Resident(contents.to_string()));
-            // The mirror is authoritative for this session, so `Ok` is honest:
-            // every subsequent read sees the new bytes. Durability is the
-            // backend's job and its failure arrives via `take_persistence_errors`.
-            let backend = self.backend.clone();
-            let (put_key, contents) = (key.clone(), contents.to_string());
-            self.push(name, &key, move || backend.put(&put_key, &contents));
-            self.mutations.set(self.mutations.get().wrapping_add(1));
-            Ok(())
-        }
-
-        fn remove(&self, name: &str) -> Result<(), String> {
-            let key = Self::key(name);
-            self.stamp_local(&key);
-            // The backend delete is pushed either way (the mirror may be
-            // ahead of it), but only a delete that found something COUNTS —
-            // the same rule `FileModelStore::remove` keeps.
-            let existed = self.entries.borrow_mut().remove(&key).is_some();
-            let backend = self.backend.clone();
-            let delete_key = key.clone();
-            self.push(name, &key, move || backend.delete(&delete_key));
-            if existed {
-                self.mutations.set(self.mutations.get().wrapping_add(1));
-            }
-            Ok(())
-        }
-
-        // `browser_write` needs no bump of its own: it routes through `write`.
-        fn mutation_generation(&self) -> u64 {
-            self.mutations.get()
-        }
-
-        fn pending_writes(&self) -> usize {
-            self.pending()
-        }
-
-        fn take_persistence_errors(&self) -> Vec<String> {
-            self.errors.drain()
-        }
-
-        fn browser_location(&self) -> String {
-            // The RAW navigable path (breadcrumb / back-forward / path-edit rely on
-            // this being feed-able straight back to `browser_navigate`); the human
-            // "virtual filesystem" context lives in `backend_label`.
-            self.browser_dir.borrow().clone()
-        }
-
-        fn browser_entries(&self, extensions: &[&str]) -> Vec<BrowserEntry> {
+    impl MirrorStore {
+        /// The explorer's listing of the current folder, read from the whole key
+        /// space ([`ModelStore::browser_entries`] caches it).
+        fn list_folder(&self, extensions: &[&str]) -> Vec<BrowserEntry> {
             let current = self.browser_dir.borrow().clone();
             if current == "/" {
                 return vec![BrowserEntry {
@@ -2758,6 +2910,224 @@ pub(crate) mod mirror_store {
             entries.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then_with(|| a.name.cmp(&b.name)));
             entries
         }
+    }
+
+    impl ModelStore for MirrorStore {
+        fn backend_label(&self) -> String {
+            self.backend.label()
+        }
+
+        fn plm_client(&self) -> Option<std::rc::Rc<crate::plm::client::PlmClient>> {
+            self.backend.plm_client()
+        }
+
+        fn plm_revision(&self, key: &str) -> Option<crate::plm::client::IndexEntry> {
+            self.backend.plm_revision(key)
+        }
+        fn note_checked_out(&self, key: &str) {
+            self.backend.note_checked_out(key)
+        }
+        fn plm_written_by_us(&self, key: &str) -> bool {
+            self.backend.plm_written_by_us(key)
+        }
+
+        /// A feed move: what the server now lists for `keys` — or, `stale`,
+        /// for everything — is folded into the entries as LAZY `OnDisk`
+        /// rows, so a document another client, the web app or Generate made
+        /// after this app booted is listed and opens without a reload (bodies
+        /// load on demand, as at boot). See [`Self::reconcile`] for what is
+        /// never touched.
+        fn refresh_plm_index(&self, keys: &[String], stale: bool) {
+            // A backend that keeps no index answers `Err` and nothing moves.
+            if !stale && keys.is_empty() {
+                return;
+            }
+            let store = self.clone();
+            // The answer speaks for the server AS OF NOW: ticked before the
+            // request leaves, so anything local that happens while it is on
+            // the wire outranks it.
+            let issued = self.tick();
+            if stale {
+                let request = self.backend.index_all();
+                spawn(async move {
+                    if let Ok(rows) = request.await {
+                        store.reconcile(None, rows, issued);
+                    }
+                });
+            } else {
+                let asked: Vec<String> = keys.iter().map(|key| format!("{PREFIX}{key}")).collect();
+                let request = self.backend.index_rows(keys);
+                spawn(async move {
+                    if let Ok(rows) = request.await {
+                        store.reconcile(Some(&asked), rows, issued);
+                    }
+                });
+            }
+        }
+        fn remember_saved_document(&self, name: &str, contents: &str) {
+            let key = Self::key(name);
+            self.stamp_local(&key);
+            self.entries.borrow_mut().insert(key, Entry::Resident(contents.into()));
+            self.mutations.set(self.mutations.get().wrapping_add(1));
+        }
+
+        fn list(&self) -> Vec<String> {
+            // `BTreeMap` iterates in key order, so the names come out sorted.
+            self.entries
+                .borrow()
+                .keys()
+                .filter_map(|key| key.strip_prefix(PREFIX).map(str::to_string))
+                .collect()
+        }
+
+        fn read(&self, name: &str) -> Option<String> {
+            let key = Self::key(name);
+            let held = self.entries.borrow().get(&key).cloned();
+            match held {
+                Some(Entry::Resident(value)) => Some(value),
+                // Listed but not loaded: ask for it and answer `None` NOW — the
+                // API is synchronous. The bytes land through `resolve`, which
+                // moves the generation and wakes the frame, so a caller keyed on
+                // the generation reads again. `residency` tells the two `None`s
+                // apart.
+                Some(Entry::OnDisk { .. }) => {
+                    self.load(&key);
+                    None
+                }
+                None => None,
+            }
+        }
+
+        fn canonical_identity(&self, name: &str) -> String {
+            // The explorer's spelling of a document key (`browser_entries`);
+            // a reserved name has no other spelling.
+            match Self::key(name).strip_prefix(PREFIX) {
+                Some(relative) => Self::virtual_model_path(relative),
+                None => name.to_string(),
+            }
+        }
+
+        fn canonicalizer(&self) -> super::Canonicalizer {
+            std::rc::Rc::new(|name| match Self::key(name).strip_prefix(PREFIX) {
+                Some(relative) => Self::virtual_model_path(relative),
+                None => name.to_string(),
+            })
+        }
+
+        fn residency(&self, name: &str) -> Residency {
+            match self.entries.borrow().get(&Self::key(name)) {
+                Some(Entry::Resident(_)) => Residency::Resident,
+                Some(Entry::OnDisk { .. }) => Residency::OnDisk,
+                None => Residency::Absent,
+            }
+        }
+
+        fn write(&self, name: &str, contents: &str) -> Result<(), String> {
+            let key = Self::key(name);
+            // What the backend holds as this write leaves (a PLM revision's
+            // content hash): the base a retry sends if the write fails.
+            let base = crate::plm::bom::revision_of_document(name)
+                .and_then(|(part, revision)| self.plm_revision(&crate::plm::identity::document_key(&part, &revision)))
+                .map(|row| row.content_hash)
+                .unwrap_or_default();
+            self.errors.note_base(&key, base);
+            self.stamp_local(&key);
+            self.entries
+                .borrow_mut()
+                .insert(key.clone(), Entry::Resident(contents.to_string()));
+            // The mirror is authoritative for this session, so `Ok` is honest:
+            // every subsequent read sees the new bytes. Durability is the
+            // backend's job and its failure arrives via `take_persistence_errors`.
+            let backend = self.backend.clone();
+            let (put_key, contents) = (key.clone(), contents.to_string());
+            self.push(name, &key, move || backend.put(&put_key, &contents));
+            self.mutations.set(self.mutations.get().wrapping_add(1));
+            Ok(())
+        }
+
+        fn write_if(&self, name: &str, contents: &str, expected: &str) -> Result<(), String> {
+            let key = Self::key(name);
+            self.errors.note_base(&key, expected.to_string());
+            self.stamp_local(&key);
+            self.entries
+                .borrow_mut()
+                .insert(key.clone(), Entry::Resident(contents.to_string()));
+            let backend = self.backend.clone();
+            let (put_key, contents, expected) = (key.clone(), contents.to_string(), expected.to_string());
+            self.push(name, &key, move || backend.put_if(&put_key, &contents, &expected));
+            self.mutations.set(self.mutations.get().wrapping_add(1));
+            Ok(())
+        }
+
+        fn remove(&self, name: &str) -> Result<(), String> {
+            let key = Self::key(name);
+            self.stamp_local(&key);
+            // The backend delete is pushed either way (the mirror may be
+            // ahead of it), but only a delete that found something COUNTS —
+            // the same rule `FileModelStore::remove` keeps.
+            let existed = self.entries.borrow_mut().remove(&key).is_some();
+            let backend = self.backend.clone();
+            let delete_key = key.clone();
+            self.push(name, &key, move || backend.delete(&delete_key));
+            if existed {
+                self.mutations.set(self.mutations.get().wrapping_add(1));
+            }
+            Ok(())
+        }
+
+        // `browser_write` needs no bump of its own: it routes through `write`.
+        fn mutation_generation(&self) -> u64 {
+            self.mutations.get()
+        }
+
+        fn pending_writes(&self) -> usize {
+            self.pending()
+        }
+
+        fn take_persistence_errors(&self) -> Vec<String> {
+            self.errors.drain()
+        }
+
+        fn take_failed_writes(&self) -> Vec<String> {
+            self.errors.take_failed_writes()
+        }
+
+        fn write_failed(&self, name: &str) -> bool {
+            self.errors.unsynced(&Self::key(name)).is_some()
+        }
+
+        fn failed_write_base(&self, name: &str) -> Option<String> {
+            self.errors.unsynced(&Self::key(name))
+        }
+
+        fn browser_location(&self) -> String {
+            // The RAW navigable path (breadcrumb / back-forward / path-edit rely on
+            // this being feed-able straight back to `browser_navigate`); the human
+            // "virtual filesystem" context lives in `backend_label`.
+            self.browser_dir.borrow().clone()
+        }
+
+        fn browser_entries(&self, extensions: &[&str]) -> Vec<BrowserEntry> {
+            let key = {
+                let entries = self.entries.borrow();
+                ListingKey {
+                    dir: self.browser_dir.borrow().clone(),
+                    extensions: extensions.iter().map(|e| e.to_string()).collect(),
+                    mutations: self.mutations.get(),
+                    keys: entries.len(),
+                    bytes: entries.values().map(Entry::len).sum(),
+                }
+            };
+            if let Some((cached, listing)) = self.listing.borrow().as_ref() {
+                if *cached == key {
+                    return listing.clone();
+                }
+            }
+            let listing = self.list_folder(extensions);
+            *self.listing.borrow_mut() = Some((key, listing.clone()));
+            listing
+        }
+
 
         fn browser_enter(&self, identity: &str) -> Result<(), String> {
             if identity == "/models" || identity.starts_with("/models/") {
@@ -2865,6 +3235,10 @@ pub(crate) mod mirror_store {
     }
 }
 
+#[cfg(target_arch = "wasm32")]
+#[path = "store_host.rs"]
+mod host;
+
 // --- Browser: IndexedDB documents + download / upload interchange --------------
 #[cfg(target_arch = "wasm32")]
 mod web_model {
@@ -2946,7 +3320,19 @@ mod web_model {
     /// Ask the reactive frame loop for a repaint. Reads `REPAINT_CTX` at CALL time,
     /// so it does not matter that the store is built (during boot) before the app
     /// shell registers the context.
-    fn wake_frame_loop() {
+    /// A task that asks for a frame after every poll; see [`super::spawn_waking`].
+    pub(crate) struct WakeOnPoll(pub(crate) std::pin::Pin<Box<dyn Future<Output = ()>>>);
+
+    impl Future for WakeOnPoll {
+        type Output = ();
+        fn poll(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<()> {
+            let poll = self.0.as_mut().poll(cx);
+            wake_frame_loop();
+            poll
+        }
+    }
+
+    pub(crate) fn wake_frame_loop() {
         REPAINT_CTX.with(|c| {
             if let Some(ctx) = c.borrow().as_ref() {
                 ctx.request_repaint();
@@ -3318,6 +3704,16 @@ mod web_model {
     /// in the panel header and toasting every write that does not persist.
     pub(super) async fn hydrate() {
         let wake: Rc<dyn Fn()> = Rc::new(wake_frame_loop);
+        if super::host::available() {
+            let backend: Rc<dyn StoreBackend> = Rc::new(super::host::HostBackend);
+            let core = match backend.load_index().await {
+                Ok(entries) => MirrorStore::from_index(backend, entries, Some(wake)),
+                Err(error) => unavailable(format!("OrcaSlicer storage: {error}"), Some(wake)),
+            };
+            install_verification_hooks(&core);
+            BOOT_STORE.with(|c| *c.borrow_mut() = Some(IdbModelStore { core }));
+            return;
+        }
         let channel = web_sys::BroadcastChannel::new(CHANNEL_NAME).ok();
         let core = match IdbBackend::open(channel.clone()).await {
             Ok(backend) => {
@@ -3392,9 +3788,11 @@ mod web_model {
         );
         // Seed the notice channel so the FIRST frame tells the user, before they
         // have saved anything and discovered it the hard way.
-        core.report(format!(
-            "{reason} — this session will not be saved; use Download to keep your work"
-        ));
+        core.report(if super::host::available() {
+            format!("{reason} — this session will not be saved; check OrcaSlicer plugin permissions and reload")
+        } else {
+            format!("{reason} — this session will not be saved; use Download to keep your work")
+        });
         core
     }
 
@@ -3611,6 +4009,27 @@ mod web_model {
     /// The half both downloads share: an object URL for `blob`, a synthetic
     /// anchor click carrying EXACTLY `file_name`, then the URL released.
     fn click_download(file_name: &str, blob: &web_sys::Blob) -> Result<(), String> {
+        if super::host::available() {
+            let name = file_name.to_owned();
+            let blob = blob.clone();
+            wasm_bindgen_futures::spawn_local(async move {
+                let result = async {
+                    let buffer = wasm_bindgen_futures::JsFuture::from(blob.array_buffer()).await
+                        .map_err(|e| format!("export bytes: {e:?}"))?;
+                    let bytes = js_sys::Uint8Array::new(&buffer).to_vec();
+                    let binary: String = bytes.into_iter().map(char::from).collect();
+                    let encoded = web_sys::window().ok_or("no window")?.btoa(&binary)
+                        .map_err(|e| format!("export encoding: {e:?}"))?;
+                    super::host::request(serde_json::json!({"op":"export", "name":name,
+                        "base64":encoded})).await
+                }.await;
+                if let Err(error) = result {
+                    BOOT_NOTICE.with(|n| *n.borrow_mut() = Some(format!("Local export failed: {error}")));
+                    wake_frame_loop();
+                }
+            });
+            return Ok(());
+        }
         let document = web_sys::window()
             .and_then(|w| w.document())
             .ok_or("no document")?;
@@ -3645,6 +4064,12 @@ mod web_model {
         fn plm_revision(&self, key: &str) -> Option<crate::plm::client::IndexEntry> {
             self.core.plm_revision(key)
         }
+        fn note_checked_out(&self, key: &str) {
+            self.core.note_checked_out(key)
+        }
+        fn plm_written_by_us(&self, key: &str) -> bool {
+            self.core.plm_written_by_us(key)
+        }
         fn refresh_plm_index(&self, keys: &[String], stale: bool) {
             self.core.refresh_plm_index(keys, stale)
         }
@@ -3663,6 +4088,9 @@ mod web_model {
         fn canonical_identity(&self, name: &str) -> String {
             self.core.canonical_identity(name)
         }
+        fn canonicalizer(&self) -> super::Canonicalizer {
+            self.core.canonicalizer()
+        }
         fn write(&self, name: &str, contents: &str) -> Result<(), String> {
             self.core.write(name, contents)
         }
@@ -3676,6 +4104,18 @@ mod web_model {
             let mut errors: Vec<String> = BOOT_NOTICE.with(|n| n.borrow_mut().take()).into_iter().collect();
             errors.extend(self.core.take_persistence_errors());
             errors
+        }
+        fn take_failed_writes(&self) -> Vec<String> {
+            self.core.take_failed_writes()
+        }
+        fn write_failed(&self, name: &str) -> bool {
+            self.core.write_failed(name)
+        }
+        fn failed_write_base(&self, name: &str) -> Option<String> {
+            self.core.failed_write_base(name)
+        }
+        fn write_if(&self, name: &str, contents: &str, expected: &str) -> Result<(), String> {
+            self.core.write_if(name, contents, expected)
         }
         fn plm_session(&self) -> Option<crate::plm::connection::Session> {
             use crate::plm::connection::{parse_label, Keep, Session, Status};

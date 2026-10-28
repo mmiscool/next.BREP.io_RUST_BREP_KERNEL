@@ -1,9 +1,18 @@
 use super::*;
 
+/// How near (pt, times the label scale) a constraint chip's anchor may be to a
+/// pointer resting on a gizmo handle before the chip steps aside: a chip
+/// reaches about this far from its anchor.
+const GIZMO_CHIP_CLEARANCE: f32 = 40.0;
+
 /// The egui text color for CONSTRAINT annotations (the dimension VALUE labels), read
 /// from the engine's single source of truth — the display-settings sketch palette
 /// ([`brep_render::style::RenderSettings::sketch_colors`]) — so the label text follows
 /// the same (editable) color as the engine-drawn leaders + geometric glyphs.
+/// The widest a PMI label chip draws, as a fraction of the viewport's width;
+/// a longer label is cut short with an ellipsis ([`Viewport::draw_pmi_labels`]).
+const PMI_LABEL_MAX_WIDTH_FRACTION: f32 = 0.45;
+
 fn constraint_text_color(settings: &brep_render::style::RenderSettings) -> egui::Color32 {
     rgb_color32(settings.sketch_colors().constraint)
 }
@@ -664,12 +673,15 @@ impl Viewport {
         rect: egui::Rect,
         state: &mut EngineState,
     ) {
+        self.constraint_menu_hits.clear();
         let labels: Vec<serde_json::Value> =
             serde_json::from_str(&state.constraint_labels_json()).unwrap_or_default();
         if labels.is_empty() {
             if self.constraint_label_hovered.take().is_some() {
                 state.constraint_hover_end();
             }
+            self.constraint_chips_drawn.clear();
+            self.constraint_label_menu = None;
             return;
         }
 
@@ -698,9 +710,23 @@ impl Viewport {
         // `state`).
         let label_scale = state.settings.label_scale;
 
+        // A gizmo handle under the pointer wins over a chip drawn on top of it
+        // (a constraint anchored at a component's bbox centre puts its chip on
+        // the Move gizmo's centre ball). An egui Area hit-tests even when it is
+        // not interactable, so the chips near the pointer are not drawn at all
+        // while the pointer is over a handle, and the press reaches the gizmo.
+        let gizmo_pointer = ctx
+            .input(|input| input.pointer.hover_pos())
+            .filter(|pos| rect.contains(*pos))
+            .filter(|pos| {
+                state.transform_pick((pos.x - rect.min.x) as f64, (pos.y - rect.min.y) as f64) != 0
+            });
+
         // Deferred engine mutations (never touch `state` inside the area closures).
         let mut hovered: Option<String> = None;
-        let mut clicked: Option<String> = None;
+        let mut clicked: Option<(String, egui::Pos2)> = None;
+        let mut menu_at: Option<(String, egui::Pos2)> = None;
+        let mut drawn: Vec<(String, egui::Rect)> = Vec::new();
 
         for (i, label) in labels.iter().enumerate() {
             let scr = screens[i];
@@ -726,6 +752,9 @@ impl Viewport {
                 (rgb[2].as_f64().unwrap_or(1.0) * 255.0).round() as u8,
             );
             let pos = egui::pos2(rect.min.x + scr[0] as f32, rect.min.y + scr[1] as f32);
+            if gizmo_pointer.is_some_and(|pointer| pointer.distance(pos) < GIZMO_CHIP_CLEARANCE * label_scale) {
+                continue;
+            }
             let area_id = egui::Id::new(("brep-constraint-label", id));
             egui::Area::new(area_id)
                 .order(egui::Order::Middle)
@@ -795,11 +824,18 @@ impl Viewport {
                                 hovered = Some(id.to_string());
                             }
                             if resp.clicked() {
-                                clicked = Some(id.to_string());
+                                let at = resp.interact_pointer_pos().unwrap_or(resp.rect.center());
+                                clicked = Some((id.to_string(), at));
                             }
+                            if resp.secondary_clicked() {
+                                let at = resp.interact_pointer_pos().unwrap_or(resp.rect.center());
+                                menu_at = Some((id.to_string(), at));
+                            }
+                            drawn.push((id.to_string(), resp.rect));
                         });
                 });
         }
+        self.constraint_chips_drawn = drawn;
 
         // --- apply deferred actions (state free to borrow again) -----------------
         match hovered {
@@ -815,8 +851,73 @@ impl Viewport {
                 }
             }
         }
-        if let Some(id) = clicked {
-            state.constraint_label_clicked(&id);
+        match clicked {
+            // While a reference pick runs (a feature's, a PMI field's, a clip's,
+            // an instructions step's), a chip is not a target: the click goes to
+            // the pick under it, as if the chip were not there — on an assembly
+            // a mate's chip sits on the very part the pick wants (every pin of
+            // the pin grid is under its mate's label) — and the chip keeps only
+            // its hover text.
+            Some((_, at)) if state.ref_select_active() => {
+                state.ref_select_click((at.x - rect.min.x) as f64, (at.y - rect.min.y) as f64);
+            }
+            Some((id, _)) => state.constraint_label_clicked(&id),
+            None => {}
+        }
+        // A right-click SELECTS (not opens), so the chip the menu acts on
+        // carries the accent while it is up.
+        if let Some((id, _)) = &menu_at {
+            state.constraint_select(id);
+        }
+        self.show_constraint_label_menu(ctx, state, menu_at);
+    }
+
+    /// A constraint chip's RIGHT-CLICK menu: Flip, Edit, Suppress, Delete —
+    /// the entries and the dispatch of the Constraints panel row's menu
+    /// (`panels::assembly_constraints::{constraint_actions_for,
+    /// run_constraint_action}`), drawn by the shared `column_tree::action_menu`
+    /// as the PMI chip menu is. Entries are published as
+    /// `constraintmenu/menuitem:<constraint id>:<action id>`. `request` (a
+    /// right-click this frame) is applied after the open menu draws; a chip no
+    /// longer drawn takes its menu with it.
+    fn show_constraint_label_menu(
+        &mut self,
+        ctx: &egui::Context,
+        state: &mut EngineState,
+        request: Option<(String, egui::Pos2)>,
+    ) {
+        let mut chosen: Option<(String, String)> = None;
+        if let Some((id, pos)) = self.constraint_label_menu.clone() {
+            if self.constraint_chips_drawn.iter().any(|(chip, _)| *chip == id) {
+                let actions = crate::panels::assembly_constraints::constraint_actions_for(state, &id);
+                let hits = &mut self.constraint_menu_hits;
+                let layer = egui::LayerId::new(egui::Order::Middle, egui::Id::new(("brep-constraint-label", id.as_str())));
+                let (action, still_open) = crate::column_tree::action_menu(
+                    ctx,
+                    layer,
+                    egui::Id::new("brep-constraint-label-menu"),
+                    pos,
+                    &actions,
+                    |entry, rect| {
+                        hits.insert(format!("menuitem:{id}:{}", entry.id), rect);
+                    },
+                );
+                if !still_open {
+                    self.constraint_label_menu = None;
+                }
+                chosen = action.map(|action| (id, action));
+            } else {
+                self.constraint_label_menu = None;
+            }
+        }
+        if let Some((id, action)) = chosen {
+            self.constraint_label_menu = None;
+            if let Err(error) = crate::panels::assembly_constraints::run_constraint_action(state, &id, &action) {
+                state.push_notice(format!("Assembly constraints: {error}"));
+            }
+        }
+        if let Some(request) = request {
+            self.constraint_label_menu = Some(request);
         }
     }
 
@@ -835,8 +936,9 @@ impl Viewport {
         rect: egui::Rect,
         state: &mut EngineState,
     ) {
-        let labels: Vec<serde_json::Value> =
-            serde_json::from_str(&state.pmi_labels_json()).unwrap_or_default();
+        // Typed, and nothing at all to build without an active view: this
+        // runs every frame of every workbench.
+        let labels = if state.pmi_active_view().is_some() { state.pmi_labels() } else { Vec::new() };
         self.pmi_label_hits.clear();
         self.pmi_menu_hits.clear();
         if labels.is_empty() {
@@ -849,29 +951,12 @@ impl Viewport {
             }
             return;
         }
-        let worlds: Vec<[f64; 3]> = labels
-            .iter()
-            .map(|l| {
-                let w = &l["world"];
-                [
-                    w[0].as_f64().unwrap_or(0.0),
-                    w[1].as_f64().unwrap_or(0.0),
-                    w[2].as_f64().unwrap_or(0.0),
-                ]
-            })
-            .collect();
-        let screens: Vec<[f64; 4]> = serde_json::to_string(&worlds)
-            .ok()
-            .and_then(|s| state.world_to_screen_json(&s).ok())
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default();
-        if screens.len() != labels.len() {
-            return;
-        }
+        let worlds: Vec<[f64; 3]> = labels.iter().map(|label| label.world).collect();
+        let screens = state.world_to_screen_points(&worlds);
         let label_scale = state.settings.label_scale;
 
         let mut hovered: Option<String> = None;
-        let mut clicked: Option<String> = None;
+        let mut clicked: Option<(String, egui::Pos2)> = None;
         let mut double_clicked: Option<String> = None;
         let mut drag_to: Option<(String, f64, f64)> = None;
         let mut drag_ended = false;
@@ -884,38 +969,47 @@ impl Viewport {
                 // The engine's ONE label policy (ViewCamera::label_anchor_visible).
                 continue;
             }
-            let Some(id) = label["id"].as_str() else {
-                continue;
-            };
-            let text = label["text"].as_str().unwrap_or(id).to_string();
-            let message = label["message"].as_str().unwrap_or("").to_string();
-            let status = label["status"].as_str().unwrap_or("").to_string();
-            let open = label["open"].as_bool().unwrap_or(false);
+            let id = label.id.as_str();
+            let text = &label.text;
+            let message = &label.message;
+            let status = label.status;
+            let open = label.open;
             // Selected in the PMI tree: the same heavier outline an open one
             // carries, the constraint chip's selected accent.
-            let selected = label["selected"].as_bool().unwrap_or(false);
-            let text_size = label["textSizePt"].as_f64().unwrap_or(12.0);
-            let balloon = label["type"].as_str() == Some("balloon") && status == "ok";
-            let rgb = &label["color"];
+            let selected = label.selected;
+            let text_size = label.text_size_pt;
+            let balloon = label.kind == "balloon" && status == "ok";
+            let rgb = label.color;
             let color = egui::Color32::from_rgb(
-                (rgb[0].as_f64().unwrap_or(1.0) * 255.0).round() as u8,
-                (rgb[1].as_f64().unwrap_or(1.0) * 255.0).round() as u8,
-                (rgb[2].as_f64().unwrap_or(1.0) * 255.0).round() as u8,
+                (rgb[0] as f64 * 255.0).round() as u8,
+                (rgb[1] as f64 * 255.0).round() as u8,
+                (rgb[2] as f64 * 255.0).round() as u8,
             );
             // The view's text size scales the chip on top of the user's label scale.
             let scale = label_scale * (text_size / 12.0) as f32;
             let pos = egui::pos2(rect.min.x + scr[0] as f32, rect.min.y + scr[1] as f32);
             let area_id = egui::Id::new(("brep-pmi-label", id));
+            // A chip stays INSIDE the 3D view: it floats over the panes'
+            // layer, so one reaching past the viewport (an explode listing
+            // fifty targets, at a large text size) would cover the PMI form
+            // and take its clicks. A label wider than the cap is cut short
+            // with an ellipsis; its hover text has the whole of it.
+            let max_width = (rect.width() * PMI_LABEL_MAX_WIDTH_FRACTION).max(1.0);
             egui::Area::new(area_id)
                 .order(egui::Order::Middle)
                 .fixed_pos(pos)
                 .pivot(egui::Align2::CENTER_CENTER)
+                .constrain_to(rect)
                 .show(ctx, |ui| {
                     if self.touch_suppressed {
                         ui.disable();
                     }
+                    ui.set_clip_rect(rect);
+                    ui.set_max_width(max_width);
                     let dark = egui::Color32::from_rgb(20, 20, 20);
                     let font = label_font(ui.style(), scale);
+                    let cut_short =
+                        ui.fonts_mut(|f| f.layout_no_wrap(text.clone(), font.clone(), color).size().x) > max_width;
                     egui::Frame::new()
                         .fill(dark)
                         .stroke(egui::Stroke::new(if open || selected { 2.5 } else { 1.0 }, color))
@@ -952,13 +1046,14 @@ impl Viewport {
                             let resp = ui.add(
                                 button
                                     .frame(false)
-                                    .wrap_mode(egui::TextWrapMode::Extend)
+                                    .wrap_mode(if cut_short { egui::TextWrapMode::Truncate } else { egui::TextWrapMode::Extend })
                                     .sense(egui::Sense::click_and_drag()),
                             );
+                            let whole = if cut_short { format!("\n{text}") } else { String::new() };
                             let resp = if message.is_empty() {
-                                resp.on_hover_text(format!("{id} \u{2014} {status} (drag to move, click to select, double-click to edit, right-click for its menu)"))
+                                resp.on_hover_text(format!("{id} \u{2014} {status} (drag to move, click to select, double-click to edit, right-click for its menu){whole}"))
                             } else {
-                                resp.on_hover_text(format!("{id} \u{2014} {status}: {message}"))
+                                resp.on_hover_text(format!("{id} \u{2014} {status}: {message}{whole}"))
                             };
                             if resp.hovered() {
                                 hovered = Some(id.to_string());
@@ -970,7 +1065,8 @@ impl Viewport {
                             if crate::panels::tree::is_double_click(&resp) {
                                 double_clicked = Some(id.to_string());
                             } else if resp.clicked() {
-                                clicked = Some(id.to_string());
+                                let at = resp.interact_pointer_pos().unwrap_or(resp.rect.center());
+                                clicked = Some((id.to_string(), at));
                             }
                             if resp.dragged() {
                                 if let Some(p) = resp.interact_pointer_pos() {
@@ -1016,8 +1112,15 @@ impl Viewport {
         }
         if let Some(id) = double_clicked {
             state.pmi_label_double_clicked(&id);
-        } else if let Some(id) = clicked {
-            state.pmi_label_clicked(&id);
+        } else if let Some((id, at)) = clicked {
+            // While a reference pick runs, a chip is not a target (the
+            // constraint chips' rule): the click goes to the pick under it, as
+            // if the chip were not there, and the chip keeps its hover text.
+            if state.ref_select_active() {
+                state.ref_select_click((at.x - rect.min.x) as f64, (at.y - rect.min.y) as f64);
+            } else {
+                state.pmi_label_clicked(&id);
+            }
         }
         // A right-click SELECTS too, so the chip the menu acts on carries the
         // accent while it is up.

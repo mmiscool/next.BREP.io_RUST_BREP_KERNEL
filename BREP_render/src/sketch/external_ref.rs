@@ -289,6 +289,48 @@ pub fn add_external_ref(doc: &mut SketchDoc, link: &EdgeLink) -> (Vec<Value>, Ve
     (point_ids, geom_ids)
 }
 
+/// Materialize an [`EdgeLink`] as PLAIN sketch geometry, a copy that nothing
+/// keeps up to date: free points (not fixed, construction or external), no
+/// grounds, and each geometry carrying `note`. A copied end that lands on a
+/// plain point already in the sketch (within `1e-6·extent`) reuses it, so the
+/// edges of one loop, copied one by one, join into a closed profile. Returns
+/// the geometry ids.
+pub fn add_copied_edge(doc: &mut SketchDoc, link: &EdgeLink, note: &str) -> Vec<Value> {
+    let uvs = link.point_uvs();
+    let near = 1e-6 * polyline_extent(&uvs).max(1.0);
+    let mut point_ids = Vec::new();
+    for (u, v) in uvs {
+        let reuse = doc
+            .points
+            .iter()
+            .find(|p| !p.construction && !p.external_reference && dist((p.x, p.y), (u, v)) <= near)
+            .map(|p| p.id.clone());
+        let id = reuse.unwrap_or_else(|| {
+            let id = doc.next_point_id();
+            doc.points.push(SketchPoint { id: id.clone(), x: u, y: v, fixed: false, construction: false, external_reference: false });
+            id
+        });
+        point_ids.push(id);
+    }
+    let push = |doc: &mut SketchDoc, geom_type: &str, points: Vec<Value>| {
+        let id = doc.next_geometry_id();
+        let mut extra = Map::new();
+        extra.insert("note".to_string(), Value::String(note.to_string()));
+        doc.geometries.push(SketchGeometry { id: id.clone(), geom_type: geom_type.to_string(), points, extra });
+        id
+    };
+    match link {
+        EdgeLink::Line { .. } => vec![push(doc, "line", point_ids[..2].to_vec())],
+        EdgeLink::Circle { .. } => vec![push(doc, "circle", point_ids[..2].to_vec())],
+        EdgeLink::Arc { .. } => vec![push(doc, "arc", point_ids[..3].to_vec())],
+        EdgeLink::Polyline { .. } => point_ids
+            .windows(2)
+            .filter(|w| id_key(&w[0]) != id_key(&w[1]))
+            .map(|w| push(doc, "line", w.to_vec()))
+            .collect(),
+    }
+}
+
 /// Remove every entity an [`ExternalRef`] materialized: its geometries, its points,
 /// and any constraint referencing one of its points (the `⏚` grounds).
 fn remove_ref_entities(doc: &mut SketchDoc, r: &ExternalRef) {

@@ -40,7 +40,13 @@ pub const DEFAULT_DENSITY: f64 = 1.0;
 #[derive(Debug, Clone, Default)]
 pub struct MetadataStore {
     entries: BTreeMap<String, BTreeMap<String, String>>,
+    /// Names the content: every mutation takes a fresh process-wide number, and
+    /// a clone (an undo snapshot) carries its content's number with it, so two
+    /// equal stamps always hold equal records.
+    stamp: u64,
 }
+
+static STAMPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 impl MetadataStore {
     pub fn new() -> Self {
@@ -52,12 +58,22 @@ impl MetadataStore {
         self.entries.is_empty()
     }
 
+    /// The content stamp: unmoved means unchanged (see the field).
+    pub fn stamp(&self) -> u64 {
+        self.stamp
+    }
+
+    fn touch(&mut self) {
+        self.stamp = STAMPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// Set (or overwrite) one attribute of `name`'s record. An empty object name
     /// or key is ignored (no phantom records).
     pub fn set_attribute(&mut self, name: &str, key: &str, value: &str) {
         if name.is_empty() || key.is_empty() {
             return;
         }
+        self.touch();
         self.entries
             .entry(name.to_string())
             .or_default()
@@ -73,6 +89,9 @@ impl MetadataStore {
         let existed = record.remove(key).is_some();
         if record.is_empty() {
             self.entries.remove(name);
+        }
+        if existed {
+            self.touch();
         }
         existed
     }
@@ -104,6 +123,7 @@ impl MetadataStore {
     /// Drop every record (a part load replaces the store wholesale).
     pub fn clear(&mut self) {
         self.entries.clear();
+        self.touch();
     }
 
     /// One object's record as a JSON object `{ key: value, ... }` (`{}` when the
@@ -145,6 +165,7 @@ impl MetadataStore {
     /// coerced to their JSON text so a legacy document never fails the load.
     pub fn load_json(&mut self, value: Option<&Value>) {
         self.entries.clear();
+        self.touch();
         let Some(Value::Object(objects)) = value else {
             return;
         };
@@ -224,7 +245,7 @@ impl EngineState {
     /// body/face colours, a colour typed or picked in the Info window, a colour
     /// restored from a saved document. The store is the authority; the display's
     /// `color_override` fields are a derived cache of it, rebuilt after every
-    /// history apply ([`EngineState::finish_apply`]), on every document load, on
+    /// history apply (`EngineState::finish_apply`), on every document load, on
     /// a metadata edit, and whenever the display setting flips.
     ///
     /// [`crate::style::RenderSettings::override_model_colors`] is honoured HERE
@@ -367,8 +388,13 @@ impl EngineState {
     /// - **Face** — `{ ok, name, kind:"face", solid, surfaceType, area,
     ///   edgeLengthTotal, creatingFeature }` (`edgeLengthTotal` = its boundary
     ///   edges; `surfaceType` = the carrier-surface classification, e.g.
-    ///   `"Plane"`/`"Cylinder"`/`"Cone"`/`"Sphere"`/`"Torus"`/`"NURBS"`).
-    /// - **Edge** — `{ ok, name, kind:"edge", solid, length, creatingFeature }`.
+    ///   `"Plane"`/`"Cylinder"`/`"Cone"`/`"Sphere"`/`"Torus"`/`"NURBS"`), plus
+    ///   the carrier's dimensions when it has them: `radius` + `diameter`
+    ///   (cylinder, sphere), `halfAngleDeg` (cone), `majorRadius` +
+    ///   `minorRadius` (torus).
+    /// - **Edge** — `{ ok, name, kind:"edge", solid, length, creatingFeature }`,
+    ///   plus `curveType` (`"Circle"`/`"Arc"`), `radius`, `diameter` and an
+    ///   arc's `sweepDeg` when the edge lies on a circle.
     ///
     /// `{ ok:false, name, message }` for an empty/unknown name, a non-resident
     /// solid, or a kernel measurement failure.

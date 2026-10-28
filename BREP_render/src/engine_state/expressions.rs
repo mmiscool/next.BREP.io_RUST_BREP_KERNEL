@@ -24,7 +24,7 @@ impl EngineState {
     /// runs nothing. Returns the build report.
     ///
     /// TRANSIENT by construction: the source is substituted into the run
-    /// REQUEST only ([`Self::rerun_history`]), never into the history, so the
+    /// REQUEST only (`Self::rerun_history`), never into the history, so the
     /// document, its undo stacks, its dirty state and what Save writes are
     /// untouched.
     ///

@@ -1,31 +1,31 @@
 //! Thumbnails of PLM revisions (P9): the picture a save makes and uploads.
 //!
-//! The server never renders ([`brep_plm::thumbnail`]); the CAD app does, with
+//! The server never renders (`brep_plm::thumbnail`); the CAD app does, with
 //! the CPU rasterizer every host shares ([`brep_render::thumbnail`]). The
 //! parts of it here:
 //!
-//! - [`stage`], at the save site: the scene is copied out of the engine on the
+//! - [`stage`](crate::plm::thumbnail::stage), at the save site: the scene is copied out of the engine on the
 //!   UI thread (well under a millisecond), and the raster runs off it. Natively
 //!   on a thread of its own; in the browser, which has no threads, when the
 //!   upload first asks for the picture, which is after the server has accepted
 //!   the document, not in the frame that saved. A save made while a rebuild is
-//!   still running waits for that run to land ([`tick`]), so the picture is of
+//!   still running waits for that run to land ([`tick`](crate::plm::thumbnail::tick)), so the picture is of
 //!   the model that was saved, not the one before.
-//! - [`upload_on_save`], a [`SavedHook`] the PLM backend runs after each
+//! - `upload_on_save`, a `SavedHook` the PLM backend runs after each
 //!   accepted document write: when a picture was staged for exactly those
 //!   bytes (their SHA-256 is the server's `content_hash`), it is uploaded in a
 //!   task of its own, so the key's next write never waits for it. It never
 //!   fails the save: an upload the server refuses is counted and said in
-//!   [`stats`], and the next save tries again.
-//! - [`chain`] runs it after S5's uses publisher, which keeps its own error.
-//! - The RECENT-FILE pictures (`stage_recent`, [`persist_recent`],
-//!   [`recent_textures`]): the File menu's recent list shows a small square of
+//!   [`stats`](crate::plm::thumbnail::stats), and the next save tries again.
+//! - `chain` runs it after S5's uses publisher, which keeps its own error.
+//! - The RECENT-FILE pictures (`stage_recent`, [`persist_recent`](crate::plm::thumbnail::persist_recent),
+//!   [`recent_textures`](crate::plm::thumbnail::recent_textures)): the File menu's recent list shows a small square of
 //!   every document saved through ANY store (browser, native file, PLM), made
 //!   by the same rasterizer and the same staging (a save mid-rebuild waits the
 //!   same way) and kept in the local store under
 //!   [`RECENT_THUMBNAILS_KEY`](crate::store::RECENT_THUMBNAILS_KEY) — one
 //!   JSON map, name → base64 PNG, pruned to the recent list. The PLM upload
-//!   path and its [`stats`] are untouched by it: a PLM save stages two
+//!   path and its [`stats`](crate::plm::thumbnail::stats) are untouched by it: a PLM save stages two
 //!   pictures, the server's and the menu's, and counts the server's.
 
 use std::cell::RefCell;
@@ -214,7 +214,8 @@ fn picture_of(engine: &EngineState, doc: u64, size: u32) -> Picture {
 /// The pictures of a save through the store. Every store's save gets the
 /// File menu's recent-list picture (`stage_recent`); a PLM store's save of a
 /// revision's document (`name` in either spelling) also gets the server's
-/// ([`stage`]). The file stores upload nothing.
+/// ([`stage`]), and an instructions revision's save its player data
+/// ([`crate::plm::player_data`]). The file stores upload nothing.
 pub fn stage_save(store: &dyn crate::store::ModelStore, name: &str, document: &str, engine: &EngineState, doc: u64) {
     stage_recent(name, engine, doc);
     if store.plm_client().is_none() {
@@ -222,6 +223,7 @@ pub fn stage_save(store: &dyn crate::store::ModelStore, name: &str, document: &s
     }
     if let Some(key) = crate::plm::uses::revision_key_in(name) {
         stage(&key, document, engine, doc);
+        crate::plm::player_data::stage(&key, document, engine, doc);
     }
 }
 
@@ -321,10 +323,7 @@ fn revision_of(key: &str) -> Result<(String, String), String> {
 }
 
 fn detach(task: impl Future<Output = ()> + 'static) {
-    #[cfg(target_arch = "wasm32")]
-    wasm_bindgen_futures::spawn_local(task);
-    #[cfg(not(target_arch = "wasm32"))]
-    super::native::spawn(task);
+    crate::store::spawn_waking(task);
 }
 
 // ---------------------------------------------------------------------------
@@ -465,6 +464,18 @@ pub fn recent_textures(ctx: &egui::Context, store: &dyn ModelStore) -> Rc<BTreeM
         *cache = Some(RecentTextures { generation, textures: textures.clone() });
         textures
     })
+}
+
+/// The preview a document carries (`thumbnail: {data, status}`, as a save
+/// or a bake embeds it) as an egui image; `None` when it has none, or only
+/// the empty placeholder.
+pub(crate) fn embedded_image(document: &serde_json::Value) -> Option<egui::ColorImage> {
+    let thumbnail = &document["thumbnail"];
+    if thumbnail["status"].as_str().is_some_and(|status| status != "ready") {
+        return None;
+    }
+    let encoded = thumbnail["data"].as_str().or_else(|| thumbnail["png"].as_str())?;
+    decode_png(&base64_decode(encoded)?)
 }
 
 /// A stored PNG as an egui image; `None` for bytes that are not one.

@@ -4,8 +4,12 @@
 //! brep-plm serve [--data <dir>] [--bind <addr>] [--scripts <dir>]
 //!                [--secure-cookies off|on|auto] [--trust-proxy]
 //!                [--tls-cert <pem> --tls-key <pem>] [--lock-script-editor]
-//!                [--max-attachment-mb <n>]
+//!                [--max-attachment-mb <n>] [--max-document-mb <n>]
+//!                [--min-client-version <v>]
 //!                [--backup-dir <dir> [--backup-every <minutes>] [--backup-keep <n>]]
+//!                [--web-dir <dir>]
+//!                [--bake-worker-executable <file> --bake-worker-token-file <file>
+//!                 --bake-worker-url <url>]
 //!                [--cad-app <dir>] [--cad-connect-src <origin>]...
 //! brep-plm backup  [--data <dir>] [--scripts <dir>] --out <file.tar.gz>
 //! brep-plm restore --from <file.tar.gz> --data <new dir>

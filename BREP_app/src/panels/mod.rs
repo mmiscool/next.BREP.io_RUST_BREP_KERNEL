@@ -32,11 +32,25 @@ pub fn below_chrome(ctx: &egui::Context, x: f32, dy: f32) -> egui::Pos2 {
 }
 pub mod assembly_components;
 pub mod assembly_constraints;
+pub mod exploded_views;
 pub mod bom;
 pub mod bom_plm;
 pub mod bom_columns;
 pub mod bom_configuration;
 pub mod bug_report;
+pub mod cam;
+pub mod instructions;
+pub mod instructions_player;
+pub mod cam_setup;
+pub mod cam_tool;
+pub mod cam_library;
+pub mod cam_operation;
+pub mod cam_machine;
+pub mod cam_generate;
+pub mod cam_multiaxis;
+pub mod cam_post;
+pub mod cam_autoprogram;
+pub mod cam_sim;
 pub mod busy;
 pub mod component_actions;
 pub mod context_bar;
@@ -54,15 +68,14 @@ pub mod info_windows;
 pub mod auto_constraints;
 pub mod interference;
 pub mod kicad_import;
-// Native only: the `--kicad-library` window, the GitLab fetch behind its
-// download path, and the bulk sweep over both. All three are
-// `#![cfg(not(target_arch = "wasm32"))]` inside, so the wasm build compiles them
-// away to nothing.
+// Native only: the `--kicad-library` window and the bulk sweep it runs. Both
+// are `#![cfg(not(target_arch = "wasm32"))]` inside, so the wasm build compiles
+// them away to nothing.
 pub mod kicad_bulk;
 pub mod kicad_library;
-pub mod kicad_remote;
 pub mod part_properties;
 pub mod parts_library;
+pub mod pick_bar;
 pub mod plm;
 pub mod plm_follow;
 pub mod plm_host;
@@ -71,12 +84,14 @@ pub mod plm_attachments;
 pub mod plm_launch;
 pub mod plm_workspace;
 pub mod plm_import;
+pub mod plm_tab_follow;
 pub mod plm_parts;
 /// The family table pane on a PLM store (S9): Generate on the server, the member part type, the category keys.
 pub mod plm_family;
 /// Review and the inbox (plm-cad-integration-todo §3 S4).
 pub mod plm_review;
 pub mod qualify;
+pub mod replace_component;
 pub mod family_table_editor;
 pub mod scene;
 pub mod selection;
@@ -97,3 +112,4 @@ pub mod update_components;
 pub mod wire_harness;
 
 pub mod ribbon;
+pub mod simulation;

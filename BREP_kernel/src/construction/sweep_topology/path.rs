@@ -13,7 +13,7 @@ use super::*;
 ///   - every segment STRAIGHT (a polyline, open or CLOSED) → the MITRE lane: the
 ///     section is swept along each segment and the two sweeps are trimmed to
 ///     the joint's bisector plane, sharing one face loop there
-///     ([`Self::cornered_polyline`], `sweep_topology/miter.rs`). A closed one is
+///     ([`SweepPath::cornered_polyline`], `sweep_topology/miter.rs`). A closed one is
 ///     a picture FRAME: its closing joint is a mitre like the rest and it has no
 ///     caps at all;
 ///   - a corner at a CURVED segment → refused by name. A curve has no single
@@ -155,7 +155,7 @@ pub struct SweepPath {
     /// The last segment's end returns to the first segment's start.
     pub closed: bool,
     /// The UNIT NORMAL of the plane the whole path lies in, when it lies in one
-    /// to within [`MAX_PLANARITY_DEVIATION`] of its own extent.
+    /// to within `MAX_PLANARITY_DEVIATION` of its own extent.
     ///
     /// `None` for a spatial path, and also for one whose sampled polygon
     /// encloses no signed area to derive a normal from — a straight run, or a
@@ -171,7 +171,7 @@ pub struct SweepPath {
     ///
     /// Read with [`Self::corner`] by the MITRE lane: a cornered run of straight
     /// segments is a polyline, and a polyline corner is the one corner a sweep
-    /// can join exactly (see [`Self::cornered_polyline`]). A corner at a CURVED
+    /// can join exactly (see [`SweepPath::cornered_polyline`]). A corner at a CURVED
     /// segment is not — there is no single bisector plane a curve's section can
     /// be trimmed to — so the straightness of the segments, not the size of the
     /// break, is what separates the two.

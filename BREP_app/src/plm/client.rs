@@ -171,6 +171,9 @@ pub struct Me {
     /// predates the list: then it has none of them. Names are only added.
     #[serde(default)]
     pub features: Vec<String>,
+    /// Whether the server lets this account write (the author group, as the
+    /// server resolves it); absent from a server that does not say.
+    pub can_author: Option<bool>,
 }
 
 impl Me {
@@ -190,6 +193,31 @@ pub enum Credential {
     /// native password sign-in carries it itself, only long enough to mint a
     /// token. `csrf` goes on every change.
     Session { cookie: Option<String>, csrf: Option<String> },
+}
+
+/// `POST /api/desktop/link`'s answer. `link_token` goes in the URL the
+/// browser opens (`path`); `poll_secret` never leaves the app.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct DesktopLink {
+    pub link_token: String,
+    pub poll_secret: String,
+    /// The short code the app shows and the browser page repeats.
+    pub code: String,
+    /// The link page, relative to the server (`/desktop-link?token=…`).
+    pub path: String,
+    pub expires_in: u64,
+    pub interval: u64,
+}
+
+/// What a poll of a desktop link found.
+#[derive(Debug, Clone, PartialEq)]
+pub enum LinkPoll {
+    Pending,
+    Denied,
+    /// Approved: an API token of this machine's own.
+    Approved(String),
+    /// Expired, already collected, or never known.
+    Gone,
 }
 
 /// `GET /api/store/index`: the store's metadata, one row per revision with a
@@ -228,6 +256,9 @@ pub struct PutAck {
     pub seq: u64,
     pub content_hash: String,
     pub size: u64,
+    /// A server with `derived-uses` sets the revision's uses list from the
+    /// document in the same write; this says why it did not, when it did not.
+    pub uses_refused: Option<String>,
 }
 
 /// `GET /api/store/changes?since=`.
@@ -246,11 +277,47 @@ pub struct PlmClient {
     transport: Rc<dyn PlmTransport>,
     credential: RefCell<Credential>,
     me: RefCell<Option<Me>>,
+    /// Requests sent since the client was made: what an operation costs the
+    /// server, read before and after it (`__brepPlmDoc.requestsSent`).
+    sent: std::cell::Cell<u64>,
+    /// The same, by route ([`route_of`]): which requests an operation costs.
+    by_route: RefCell<std::collections::BTreeMap<String, u64>>,
+}
+
+/// A request's route for the tally: the method and the path with each
+/// segment that holds a digit (an id, a number, a revision key) as `*`, and
+/// no query (`PUT /api/store/doc/part/*/rev/A`).
+pub fn route_of(method: &str, path: &str) -> String {
+    let path = path.split('?').next().unwrap_or(path);
+    let segments: Vec<&str> = path.split('/').map(|s| if s.chars().any(|c| c.is_ascii_digit()) { "*" } else { s }).collect();
+    format!("{method} {}", segments.join("/"))
 }
 
 impl PlmClient {
     pub fn new(transport: Rc<dyn PlmTransport>) -> Self {
-        Self { transport, credential: RefCell::new(Credential::Anonymous), me: RefCell::new(None) }
+        Self {
+            transport,
+            credential: RefCell::new(Credential::Anonymous),
+            me: RefCell::new(None),
+            sent: std::cell::Cell::new(0),
+            by_route: RefCell::new(Default::default()),
+        }
+    }
+
+    /// Requests this client has sent (see the field).
+    pub fn requests_sent(&self) -> u64 {
+        self.sent.get()
+    }
+
+
+    /// Requests sent, by route ([`route_of`]).
+    pub fn requests_by_route(&self) -> std::collections::BTreeMap<String, u64> {
+        self.by_route.borrow().clone()
+    }
+
+    fn count(&self, method: &str, path: &str) {
+        self.sent.set(self.sent.get() + 1);
+        *self.by_route.borrow_mut().entry(route_of(method, path)).or_default() += 1;
     }
 
     /// Who the client is signed in as, once a sign-in has passed the version
@@ -259,8 +326,22 @@ impl PlmClient {
         self.me.borrow().clone()
     }
 
+    /// `Some(false)`: the signed-in account may read the PLM but not write to
+    /// it, so a Save to it can only be refused. `None` until the server said.
+    pub fn can_author(&self) -> Option<bool> {
+        self.me.borrow().as_ref().and_then(|me| me.can_author)
+    }
+
     pub fn credential(&self) -> Credential {
         self.credential.borrow().clone()
+    }
+
+    /// Take `token` as the credential with no request: one the caller has
+    /// just seen the server accept for the same user (a sign-in again after
+    /// the session's token was revoked), so the session goes on with its open
+    /// documents instead of switching stores.
+    pub fn replace_token(&self, token: &str) {
+        *self.credential.borrow_mut() = Credential::Token(token.trim().to_string());
     }
 
     /// Forget the credential locally. (A token stays valid on the server; the
@@ -288,6 +369,7 @@ impl PlmClient {
         if body.as_deref().is_some_and(|b| serde_json::from_slice::<Value>(b).is_ok()) {
             headers.push(("Content-Type".into(), "application/json".into()));
         }
+        self.count(method, path);
         let request = PlmRequest { method, path: path.to_string(), headers, body: body.unwrap_or_default() };
         self.transport.send(request).await.map_err(PlmError::Unreachable)
     }
@@ -305,6 +387,7 @@ impl PlmClient {
         let credential = self.credential.borrow().clone();
         let mut headers = credential_headers(&credential, method);
         headers.push(("Content-Type".into(), content_type.to_string()));
+        self.count(method, path);
         let request = PlmRequest { method, path: path.to_string(), headers, body };
         let response = self.transport.send(request).await.map_err(PlmError::Unreachable)?;
         if (200..300).contains(&response.status) {
@@ -386,6 +469,39 @@ impl PlmClient {
         Ok((me, token))
     }
 
+    /// `POST /api/desktop/link`: ask the server for a browser sign-in link
+    /// (the native lane's frictionless sign-in). No credential is sent.
+    pub async fn register_desktop_link(&self, host: &str, os: &str) -> Result<DesktopLink, PlmError> {
+        let body = serde_json::to_vec(&json!({ "host": host, "os": os, "app_version": CLIENT_VERSION })).unwrap_or_default();
+        let path = "/api/desktop/link";
+        parse(&self.checked(&Credential::Anonymous, "POST", path, Some(body)).await?, path)
+    }
+
+    /// `POST /api/desktop/link/poll`: what became of the link `poll_secret`
+    /// belongs to. A link the server no longer knows (expired, used) is
+    /// [`LinkPoll::Gone`], not an error.
+    pub async fn poll_desktop_link(&self, poll_secret: &str) -> Result<LinkPoll, PlmError> {
+        let body = serde_json::to_vec(&json!({ "poll_secret": poll_secret })).unwrap_or_default();
+        let path = "/api/desktop/link/poll";
+        let response = self.send_as(&Credential::Anonymous, "POST", path, Some(body)).await?;
+        if response.status == 404 {
+            return Ok(LinkPoll::Gone);
+        }
+        if !(200..300).contains(&response.status) {
+            return Err(PlmError::from_response(&response));
+        }
+        let answer: Value = parse(&response, path)?;
+        match answer.get("status").and_then(Value::as_str) {
+            Some("pending") => Ok(LinkPoll::Pending),
+            Some("denied") => Ok(LinkPoll::Denied),
+            Some("approved") => match answer.get("token").and_then(Value::as_str) {
+                Some(token) => Ok(LinkPoll::Approved(token.to_string())),
+                None => Err(PlmError::Malformed(format!("{path} approved without a token"))),
+            },
+            other => Err(PlmError::Malformed(format!("{path} answered status {other:?}"))),
+        }
+    }
+
     /// `POST /api/login`. The cookie comes back when the transport can see
     /// `Set-Cookie` (native); in a browser it cannot, and need not — the
     /// browser keeps it.
@@ -450,6 +566,25 @@ impl PlmClient {
     pub async fn put_document(&self, key: &str, bytes: Vec<u8>) -> Result<PutAck, PlmError> {
         let path = doc_path(key);
         let response = self.call("PUT", &path, Some(bytes)).await?;
+        parse(&response, &path)
+    }
+
+    /// [`Self::put_document`] only over the document whose content hash is
+    /// `expected` (`If-Match`): a save based on that document. One the
+    /// server holds a newer document for is [`PlmError::Conflict`], naming
+    /// when it changed, and writes nothing.
+    pub async fn put_document_if(&self, key: &str, bytes: Vec<u8>, expected: &str) -> Result<PutAck, PlmError> {
+        let path = doc_path(key);
+        let credential = self.credential.borrow().clone();
+        let mut headers = credential_headers(&credential, "PUT");
+        headers.push(("Content-Type".into(), "application/json".into()));
+        headers.push(("If-Match".into(), format!("\"{expected}\"")));
+        self.count("PUT", &path);
+        let request = PlmRequest { method: "PUT", path: path.clone(), headers, body: bytes };
+        let response = self.transport.send(request).await.map_err(PlmError::Unreachable)?;
+        if !(200..300).contains(&response.status) {
+            return Err(PlmError::from_response(&response));
+        }
         parse(&response, &path)
     }
 

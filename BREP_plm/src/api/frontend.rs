@@ -48,6 +48,8 @@ fn embedded(path: &str, mime: &'static str) -> Response {
         "split-panes.js" => include_bytes!("../../web/split-panes.js"),
         "style.css" => include_bytes!("../../web/style.css"),
         "native-import.js" => include_bytes!("../../web/native-import.js"),
+        "release-children.js" => include_bytes!("../../web/release-children.js"),
+        "used-by.js" => include_bytes!("../../web/used-by.js"),
         "workbench.js" => include_bytes!("../../web/workbench.js"),
         "open-pages.js" => include_bytes!("../../web/open-pages.js"),
         "file-documents.js" => include_bytes!("../../web/file-documents.js"),

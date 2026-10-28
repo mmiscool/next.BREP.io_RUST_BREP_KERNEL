@@ -2271,8 +2271,8 @@ fn fragment_face_arranged(
             }
         }
         if profile.enabled {
-            eprintln!("fragment.region face={} edges={} holes={} interior={interior_ms:.3} containment={containment_ms:.3} loops={:.3}",
-                face.id, region.outer.len(), region.holes.len(), profile.lap(&mut region_lap).as_secs_f64() * 1000.0);
+            crate::imprint::profile_emit(format_args!("fragment.region face={} edges={} holes={} interior={interior_ms:.3} containment={containment_ms:.3} loops={:.3}",
+                face.id, region.outer.len(), region.holes.len(), profile.lap(&mut region_lap).as_secs_f64() * 1000.0));
         }
         fragments.push(FaceFragmentRecord {
             operand,

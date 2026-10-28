@@ -548,6 +548,47 @@ pub fn edge_length_native(handle: u32, edge_name: &str) -> Result<f64, String> {
     })
 }
 
+/// The carrier dimensions of a resident solid's named face, for the Info
+/// panel: a cylinder's radius and diameter, a cone's half-angle, a sphere's
+/// radius, a torus's radii (see [`crate::surface_carrier_dimensions`]).
+/// `Ok(None)` for a plane or a free-form face; errs if no face carries
+/// `face_name`.
+pub fn face_carrier_dimensions_native(
+    handle: u32,
+    face_name: &str,
+) -> Result<Option<crate::CarrierDimensions>, String> {
+    with_registered_solid_str(handle, |solid| {
+        let face = solid
+            .shells
+            .iter()
+            .flat_map(|shell| &shell.faces)
+            .find(|face| face.name.as_deref() == Some(face_name))
+            .ok_or_else(|| format!("face '{face_name}' not found"))?;
+        Ok(crate::surface_carrier_dimensions(&face.surface))
+    })
+}
+
+/// The circle a resident solid's named edge lies on, when it does: radius,
+/// diameter and an arc's sweep (see [`crate::curve_carrier_dimensions`]).
+/// `Ok(None)` for a line or any other curve; errs if no edge carries
+/// `edge_name`.
+pub fn edge_carrier_dimensions_native(
+    handle: u32,
+    edge_name: &str,
+) -> Result<Option<crate::CarrierDimensions>, String> {
+    with_registered_solid_str(handle, |solid| {
+        let edge = solid
+            .edges
+            .iter()
+            .find(|edge| edge.name.as_deref() == Some(edge_name))
+            .ok_or_else(|| format!("edge '{edge_name}' not found"))?;
+        if edge.degenerate {
+            return Ok(None);
+        }
+        Ok(crate::curve_carrier_dimensions(&edge.curve, edge.t0, edge.t1))
+    })
+}
+
 /// Escape hatch: pull a resident solid's full topology across the boundary (for
 /// STEP export or JSON-only lanes during the migration). Prefer handle-native
 /// ops — this re-incurs the serialization cost the registry exists to avoid.

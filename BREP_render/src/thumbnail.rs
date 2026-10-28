@@ -6,7 +6,7 @@
 //! fit to what is drawn, square, on a transparent background: Lambert shading
 //! under a fixed light, a depth buffer, each body's viewport colour (a face's
 //! colour, else its solid's, else the name-hashed colour), and the display
-//! edges drawn over it. It is supersampled [`SUPERSAMPLE`]× per axis and
+//! edges drawn over it. It is supersampled `SUPERSAMPLE`× per axis and
 //! averaged down, so silhouettes are anti-aliased.
 //!
 //! [`capture`] copies what the picture needs out of the scene (cheap, on the
@@ -65,37 +65,42 @@ impl Capture {
 /// Copy the visible bodies out of `scene`: every visible solid and committed
 /// sketch sheet, hidden faces left out, in the viewport's colours.
 pub fn capture(scene: &RenderScene) -> Capture {
-    let mut bodies = Vec::new();
-    for solid in scene.solids().iter().filter(|s| s.visible) {
-        let mesh = &solid.mesh;
-        let base = solid.color_override.unwrap_or_else(|| solid_color_srgb(&solid.name).map(|c| c as f32));
-        let mut body = Body { positions: mesh.positions.clone(), normals: mesh.normals.clone(), ..Body::default() };
-        for (tri, idx) in mesh.indices.chunks_exact(3).enumerate() {
-            let face_index = mesh.face_ids.get(tri).map(|&f| f as usize);
-            if face_index.is_some_and(|f| !solid.visibility.is_face_visible(f)) {
-                continue;
-            }
-            let face = face_index.and_then(|f| solid.faces.get(f));
-            body.indices.extend_from_slice(idx);
-            body.colors.push(face.and_then(|f| f.color_override).unwrap_or(base));
-        }
-        body.edges = solid
-            .edges
-            .iter()
-            .enumerate()
-            .filter(|(i, e)| !e.centerline && solid.visibility.is_edge_visible(*i))
-            .map(|(_, e)| e.polyline.clone())
-            .collect();
-        if !body.indices.is_empty() {
-            bodies.push(body);
-        }
-    }
-    Capture { bodies }
+    Capture { bodies: scene.solids().iter().filter(|s| s.visible).filter_map(body_of).collect() }
 }
+
+/// One display's body as [`capture`] copies it, whatever its visibility:
+/// hidden faces left out, in the viewport's colours. `None` when no face is
+/// left to draw.
+pub fn body_of(solid: &crate::scene::SolidDisplay) -> Option<Body> {
+    let mesh = &solid.mesh;
+    let base = solid.color_override.unwrap_or_else(|| solid_color_srgb(&solid.name).map(|c| c as f32));
+    let mut body = Body { positions: mesh.positions.clone(), normals: mesh.normals.clone(), ..Body::default() };
+    for (tri, idx) in mesh.indices.chunks_exact(3).enumerate() {
+        let face_index = mesh.face_ids.get(tri).map(|&f| f as usize);
+        if face_index.is_some_and(|f| !solid.visibility.is_face_visible(f)) {
+            continue;
+        }
+        let face = face_index.and_then(|f| solid.faces.get(f));
+        body.indices.extend_from_slice(idx);
+        body.colors.push(face.and_then(|f| f.color_override).unwrap_or(base));
+    }
+    body.edges = solid
+        .edges
+        .iter()
+        .enumerate()
+        .filter(|(i, e)| !e.centerline && solid.visibility.is_edge_visible(*i))
+        .map(|(_, e)| e.polyline.clone())
+        .collect();
+    (!body.indices.is_empty()).then_some(body)
+}
+
+/// A view's orthonormal basis: right, up, and the direction from the model
+/// toward the eye.
+pub type Basis = ([f64; 3], [f64; 3], [f64; 3]);
 
 /// The ISO view's orthonormal basis: right, up, and the direction from the
 /// model toward the eye.
-fn iso_basis() -> ([f64; 3], [f64; 3], [f64; 3]) {
+fn iso_basis() -> Basis {
     let k = 1.0 / 3f64.sqrt();
     let back = [k, k, k];
     let up_world = [0.0, 1.0, 0.0];
@@ -133,8 +138,7 @@ struct Projection {
 }
 
 impl Projection {
-    fn fit(capture: &Capture, pixels: u32) -> Self {
-        let (right, up, back) = iso_basis();
+    fn fit(capture: &Capture, pixels: u32, (right, up, back): Basis) -> Self {
         // Fit the projected extent of every vertex, not the bbox's corners, so
         // a long thin part fills the picture.
         let (mut lo, mut hi) = ([f64::INFINITY; 2], [f64::NEG_INFINITY; 2]);
@@ -169,14 +173,26 @@ pub fn render_png(capture: &Capture, size: u32) -> Option<Vec<u8>> {
     encode_png(&rgba, size, size).ok()
 }
 
+/// [`render_png`] from another direction: `basis` (right, up, toward the
+/// eye) in place of the ISO view's, fit and lit the same way.
+pub fn render_png_from(capture: &Capture, size: u32, basis: Basis) -> Option<Vec<u8>> {
+    let rgba = render_rgba_from(capture, size, basis)?;
+    encode_png(&rgba, size, size).ok()
+}
+
 /// [`render_png`]'s pixels, before encoding: `size`² RGBA, row-major.
 pub fn render_rgba(capture: &Capture, size: u32) -> Option<Vec<u8>> {
+    render_rgba_from(capture, size, iso_basis())
+}
+
+/// [`render_png_from`]'s pixels, before encoding.
+pub fn render_rgba_from(capture: &Capture, size: u32, basis: Basis) -> Option<Vec<u8>> {
     if capture.is_empty() || size == 0 {
         return None;
     }
     let n = size * SUPERSAMPLE;
     let w = n as usize;
-    let projection = Projection::fit(capture, n);
+    let projection = Projection::fit(capture, n, basis);
     let mut depth = vec![f32::INFINITY; w * w];
     let mut color = vec![[0f32; 4]; w * w];
     // The key light, from the upper left of the view and toward the viewer; a

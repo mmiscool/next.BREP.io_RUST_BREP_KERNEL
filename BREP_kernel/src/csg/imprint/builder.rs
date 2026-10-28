@@ -12,6 +12,47 @@ use super::*;
 /// `BREP_IMPRINT_HULL_CULL`: skips the overlap test and curve crossing for
 /// boundary edges whose control hull is clear of the section's. On by
 /// default; `0`/`off` disables it.
+/// `BREP_IMPRINT_PIERCE_CULL` (lane P3b row 1, 2026-10-26): skips the exact
+/// edge/carrier pierce solve for a boundary edge whose control hull is clear
+/// of the section's by more than every band a pierce is read through (see
+/// the PIERCE CULL note in `process_curve`). On by default (promoted 2026-10-26
+/// after the 98 + 144 case body-digest census); `0`/`off` disables it.
+pub(super) fn pierce_cull_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let enabled = *ON.get_or_init(|| !matches!(std::env::var("BREP_IMPRINT_PIERCE_CULL").as_deref(), Ok("0") | Ok("off")));
+    enabled
+}
+
+
+thread_local! {
+    pub(super) static PIERCE_CULLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+/// Edges whose pierce solve the pierce cull skipped on this thread since the last call.
+pub(super) fn take_pierce_culls() -> u64 {
+    PIERCE_CULLS.with(|count| count.replace(0))
+}
+
+/// `BREP_IMPRINT_EXCHANGE_HULL` (lane P3b row 7, 2026-10-27): in
+/// [`ImprintBuilder::exchange_piece_endpoint_junctions`], a piece whose
+/// control hull is clear of a ridden edge's control hull by more than the
+/// overlap limit cannot ride it (no station is within the limit), and a
+/// station outside that expanded hull is off the edge without a projection.
+/// On by default (promoted 2026-10-27); `0`/`off` disables it.
+pub(super) fn exchange_hull_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let enabled = *ON.get_or_init(|| !matches!(std::env::var("BREP_IMPRINT_EXCHANGE_HULL").as_deref(), Ok("0") | Ok("off")));
+    enabled
+}
+
+
+thread_local! {
+    static EXCHANGE_HULL_SKIPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+/// Pieces and stations the exchange hull pre-gate answered without a projection on this thread since the last call.
+pub(super) fn take_exchange_hull_skips() -> u64 {
+    EXCHANGE_HULL_SKIPS.with(|count| count.replace(0))
+}
+
 pub(super) fn hull_cull_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let enabled = *ON.get_or_init(|| !matches!(std::env::var("BREP_IMPRINT_HULL_CULL").as_deref(), Ok("0") | Ok("off")));
@@ -205,27 +246,27 @@ impl<'a> ImprintBuilder<'a> {
     }
 
     /// OVERLAP-JUNCTION EXCHANGE, PIECE-ENDPOINT POST-PASS (rotated
-    /// equator-tangency, cardinal-sphere sub-configuration — problemInbox
-    /// rot2 2026-08-14): the per-call exchange in `process_curve` can only
-    /// imprint junctions IT sees onto edges IT sees — but the seam-crossing
-    /// junction of a section riding an operand ring can be minted by a
-    /// boundary-copy call whose `split_faces` exclude the ring, while the
-    /// analytic call that DOES ride the ring carries that same junction at
-    /// its closed curve's parameterization origin (param 0/1), where the
-    /// endpoint guards suppress it (`perpendicular(cap_normal)` derives the
-    /// analytic circle's origin, which lands exactly on the sphere seam for
-    /// cardinal sphere axes). No single call ever holds both halves, so the
-    /// ring stays one CLOSED record against two OPEN arc pieces — the
-    /// one-use S=2 genus=1 signature. This post-pass runs once ALL calls
-    /// have minted their pieces: every endpoint of an OPEN piece that RIDES
-    /// an overlap-ridden edge, and that is a real junction (referenced by
-    /// ≥ 2 piece-endpoint slots — a marched curve's deliberate slack end is
+    /// equator-tangency, cardinal-sphere sub-configuration): the per-call
+    /// exchange in `process_curve` can only imprint junctions IT sees onto
+    /// edges IT sees — but the seam-crossing junction of a section riding
+    /// an operand ring can be minted by a boundary-copy call whose
+    /// `split_faces` exclude the ring, while the analytic call that DOES
+    /// ride the ring carries that same junction at its closed curve's
+    /// parameterization origin (param 0/1), where the endpoint guards
+    /// suppress it (`perpendicular(cap_normal)` derives the analytic
+    /// circle's origin, which lands exactly on the sphere seam for cardinal
+    /// sphere axes). No single call ever holds both halves, so the ring
+    /// stays one CLOSED record against two OPEN arc pieces — the one-use
+    /// S=2 genus=1 signature. This post-pass runs once ALL calls have
+    /// minted their pieces: every endpoint of an OPEN piece that RIDES an
+    /// overlap-ridden edge, and that is a real junction (referenced by ≥ 2
+    /// piece-endpoint slots — a marched curve's deliberate slack end is
     /// degree 1 and must NOT imprint; see the `!refine` guard in the
     /// overlap branch), is imprinted onto that edge via `add_edge_split`
     /// (which keeps the near-endpoint and dedup guards — a junction already
-    /// at the ring's own vertex is correctly rejected there).
-    /// Escape hatches: `BREP_OVERLAP_PIECE_ENDPOINT_SPLIT=0` (this pass) or
-    /// the family hatch `BREP_OVERLAP_JUNCTION_SPLIT=0` (whole exchange).
+    /// at the ring's own vertex is correctly rejected there). Escape
+    /// hatches: `BREP_OVERLAP_PIECE_ENDPOINT_SPLIT=0` (this pass) or the
+    /// family hatch `BREP_OVERLAP_JUNCTION_SPLIT=0` (whole exchange).
     pub(super) fn exchange_piece_endpoint_junctions(&mut self) -> Result<(), KernelRefusal> {
         if std::env::var("BREP_OVERLAP_JUNCTION_SPLIT").as_deref() == Ok("0")
             || std::env::var("BREP_OVERLAP_PIECE_ENDPOINT_SPLIT").as_deref() == Ok("0")
@@ -262,6 +303,17 @@ impl<'a> ImprintBuilder<'a> {
             }
             let low = edge.t0.min(edge.t1);
             let high = edge.t0.max(edge.t1);
+            // HULL PRE-GATE (`BREP_IMPRINT_EXCHANGE_HULL`): the edge's control
+            // hull expanded by the overlap limit holds every point within the
+            // limit of the edge; a piece whose control hull misses it has no
+            // station on the edge (`on` would read 0), and a station outside
+            // it is off without being projected. The counts are unchanged.
+            let edge_hull = if exchange_hull_enabled() {
+                edge.curve.control_points.iter().map(|control| control.point()).collect::<Result<Vec<_>, _>>().ok()
+                    .map(|points| crate::spatial::Aabb::from_points(points).expanded(overlap_limit))
+            } else {
+                None
+            };
             for piece in &self.pieces {
                 // Open pieces only: a CLOSED piece riding a closed ring is
                 // the shared-section RING reuse's territory; splitting the
@@ -272,11 +324,25 @@ impl<'a> ImprintBuilder<'a> {
                 }
                 // Ride test over the piece's LIVE window (records may carry
                 // a window narrower than the curve's domain).
+                if let Some(hull) = &edge_hull {
+                    let apart = piece.curve.control_points.iter().map(|control| control.point()).collect::<Result<Vec<_>, _>>().ok()
+                        .is_some_and(|points| !hull.intersects(crate::spatial::Aabb::from_points(points), 0.0));
+                    if apart {
+                        EXCHANGE_HULL_SKIPS.with(|count| count.set(count.get() + 1));
+                        continue;
+                    }
+                }
                 ride_tests += 1;
                 let mut on = 0usize;
                 for fraction in [0.1, 0.3, 0.5, 0.7, 0.9] {
                     let t = piece.t0 + (piece.t1 - piece.t0) * fraction;
                     let point = piece.curve.evaluate(t).or_refuse(KernelStage::Intersect, "evaluate")?;
+                    if let Some(hull) = &edge_hull {
+                        if !hull.contains(point) {
+                            EXCHANGE_HULL_SKIPS.with(|count| count.set(count.get() + 1));
+                            continue;
+                        }
+                    }
                     let projection = project_point_to_curve(&edge.curve, point).or_refuse(KernelStage::Intersect, "project_point_to_curve")?;
                     let nearest = edge.curve.evaluate(projection.u.clamp(low, high)).or_refuse(KernelStage::Intersect, "evaluate")?;
                     if nearest.sub(point).length() <= overlap_limit {
@@ -398,7 +464,7 @@ impl<'a> ImprintBuilder<'a> {
         refine: bool,
         exact_pcurves: Option<[NurbsCurve; 2]>,
     ) -> Result<(), KernelRefusal> {
-        let profile = std::env::var_os("BREP_PROFILE").is_some();
+        let profile = profile_enabled();
         let began = profile.then(Instant::now);
         let mut split_parameters = Vec::new();
         let mut fuzzy_junctions: Vec<(Vec3, f64)> = Vec::new();
@@ -443,6 +509,30 @@ impl<'a> ImprintBuilder<'a> {
             Some(crate::spatial::Aabb::from_points(points))
         };
         let curve_hull = if hull_cull { control_hull(&curve) } else { None };
+        // PIERCE CULL (`BREP_IMPRINT_PIERCE_CULL`, lane P3b row 1). Every use of
+        // an edge's pierce set below is local to that edge and bounded in
+        // distance from the section: a pierce is a fuzzy-junction candidate
+        // only within `4e-3 * (1 + |hit|)` of a curve hit ON the section, is
+        // recovered as a cut only when it projects onto the section within
+        // `2e-3 * (1 + |pierce|)` (the station rescue re-reads the same bar),
+        // and the ambiguity read compares pierces of the SAME edge. So an edge
+        // whose control hull is separated from the section's control hull by
+        // more than `4e-3 * (1 + the farthest corner of either hull)` — every
+        // point of the edge is in its hull, every point of the section in its —
+        // can contribute nothing, and its curve/carrier solve is skipped
+        // outright. The overlap test and the curve crossing are untouched.
+        let pierce_cull = refine && pierce_cull_enabled();
+        let pierce_hull = if pierce_cull && curve_hull.is_none() { control_hull(&curve) } else { None };
+        let section_hull = curve_hull.or(pierce_hull);
+        let farthest_corner = |hull: &crate::spatial::Aabb| -> f64 {
+            hull.minimum.length().max(hull.maximum.length())
+                .max(Vec3::new(hull.minimum.x, hull.minimum.y, hull.maximum.z).length())
+                .max(Vec3::new(hull.minimum.x, hull.maximum.y, hull.minimum.z).length())
+                .max(Vec3::new(hull.minimum.x, hull.maximum.y, hull.maximum.z).length())
+                .max(Vec3::new(hull.maximum.x, hull.minimum.y, hull.minimum.z).length())
+                .max(Vec3::new(hull.maximum.x, hull.minimum.y, hull.maximum.z).length())
+                .max(Vec3::new(hull.maximum.x, hull.maximum.y, hull.minimum.z).length())
+        };
         for face in split_faces {
             let other = if face.key() == first.key() {
                 second
@@ -455,18 +545,34 @@ impl<'a> ImprintBuilder<'a> {
                 }
                 // Propagate failures: a swallowed error here silently drops
                 // junction splits and corrupts topology far downstream.
-                let pierces = if refine {
-                    intersect_curve_surface(
+                let solve_pierces = |builder: &Self| -> Result<Vec<crate::CurveSurfaceIntersection>, KernelRefusal> {
+                    let started = profile.then(Instant::now);
+                    let pierces = intersect_curve_surface(
                         &edge.curve,
                         &other.face.surface,
-                        self.tolerance.max(1e-9),
+                        builder.tolerance.max(1e-9),
                     )
                     .map_err(|error| {
                         format!("imprint pierce recovery on edge {}: {error}", edge.id)
-                    }).or_refuse(KernelStage::Intersect, "csg.imprint.builder")?
-                } else {
-                    Vec::new()
+                    }).or_refuse(KernelStage::Intersect, "csg.imprint.builder")?;
+                    if let Some(started) = started {
+                        let elapsed = started.elapsed();
+                        imprint_split_add(|split| { split.pierce += elapsed; split.pierce_edges += 1; });
+                    }
+                    Ok(pierces)
                 };
+                let pierce_apart = match (&section_hull, pierce_cull) {
+                    (Some(hull), true) => control_hull(&edge.curve).is_some_and(|edge_hull| {
+                        let band = 4e-3 * (1.0 + farthest_corner(hull).max(farthest_corner(&edge_hull)));
+                        !hull.intersects(edge_hull, band)
+                    }),
+                    _ => false,
+                };
+                if pierce_apart {
+                    PIERCE_CULLS.with(|count| count.set(count.get() + 1));
+                }
+                // Switch off: the production order, the solve before the overlap test.
+                let mut pierces = if refine && !pierce_cull { solve_pierces(self)? } else { Vec::new() };
                 // A (near-)coincident overlap must exchange ENDPOINTS only:
                 // intersect_curves between overlapping curves reports
                 // spurious subdivision hits along the whole shared span,
@@ -480,7 +586,13 @@ impl<'a> ImprintBuilder<'a> {
                 if apart {
                     HULL_CULLS.with(|count| count.set(count.get() + 1));
                 }
-                if !apart && curve_overlaps_edge(&curve, edge, overlap_limit)? {
+                let split_clock = profile.then(Instant::now);
+                let overlaps = !apart && curve_overlaps_edge(&curve, edge, overlap_limit)?;
+                if let Some(started) = split_clock {
+                    let elapsed = started.elapsed();
+                    imprint_split_add(|split| { split.overlap += elapsed; split.overlap_edges += (!apart) as u64; });
+                }
+                if overlaps {
                     self.barrier_edges.insert((face.operand, edge.id));
                     self.overlap_ridden_edges.insert((face.operand, edge.id));
                     overlapped_edges.push((face.operand, edge));
@@ -518,9 +630,19 @@ impl<'a> ImprintBuilder<'a> {
                     }
                     continue;
                 }
+                // Switch on: the solve runs only here, past the overlap branch
+                // that never reads it, and only for an edge the cull admits.
+                if refine && pierce_cull && !pierce_apart {
+                    pierces = solve_pierces(self)?;
+                }
+                let split_clock = profile.then(Instant::now);
                 let curve_hits = if apart { Vec::new() } else { intersect_curves(&curve, &edge.curve, 1e-5).map_err(|error| {
                     format!("imprint curve-edge crossing on edge {}: {error}", edge.id)
                 }).or_refuse(KernelStage::Intersect, "csg.imprint.builder")? };
+                if let Some(started) = split_clock {
+                    let elapsed = started.elapsed();
+                    imprint_split_add(|split| { split.crossing += elapsed; split.crossing_edges += (!apart) as u64; });
+                }
                 for hit in curve_hits {
                     if hit.t < edge.t0 - 1e-9 || hit.t > edge.t1 + 1e-9 {
                         continue;
@@ -656,6 +778,11 @@ impl<'a> ImprintBuilder<'a> {
 
                 // A fitted SSI curve can miss a boundary curve by chord sag.
                 // Exact edge/surface pierces recover those topological cuts.
+                let split_clock = profile.then(Instant::now);
+                if let Some(started) = split_clock {
+                    let _ = started;
+                    imprint_split_add(|split| split.recover_pierces += pierces.len() as u64);
+                }
                 if refine {
                     for pierce in &pierces {
                         if pierce.t < edge.t0 - 1e-9 || pierce.t > edge.t1 + 1e-9 {
@@ -807,6 +934,10 @@ impl<'a> ImprintBuilder<'a> {
                             },
                         ));
                     }
+                }
+                if let Some(started) = split_clock {
+                    let elapsed = started.elapsed();
+                    imprint_split_add(|split| split.recover += elapsed);
                 }
             }
         }
@@ -1287,7 +1418,7 @@ impl<'a> ImprintBuilder<'a> {
                 })
                 .collect::<Result<Vec<_>, KernelRefusal>>()?;
             if let Some(start) = pcurve_started {
-                eprintln!("imprint.process_pcurves ms={:.3}", start.elapsed().as_secs_f64() * 1000.0);
+                profile_line!("imprint.process_pcurves ms={:.3}", start.elapsed().as_secs_f64() * 1000.0);
             }
             let id = self.next_id;
             self.next_id += 1;
@@ -1320,7 +1451,7 @@ impl<'a> ImprintBuilder<'a> {
             });
         }
         if let Some(start) = emission_started {
-            eprintln!("imprint.process_time crossing={crossing_ms:.3} emission={:.3}", start.elapsed().as_secs_f64() * 1000.0);
+            profile_line!("imprint.process_time crossing={crossing_ms:.3} emission={:.3}", start.elapsed().as_secs_f64() * 1000.0);
         }
         Ok(())
     }

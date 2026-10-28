@@ -109,8 +109,7 @@ impl EngineState {
     /// Whether a screen-px pick in DIMENSION mode lands on a dimension ARROWHEAD
     /// (a linear leader's orange cone TIP at `point_b`, or an angular arc's orange
     /// sweep-END handle sphere). Returns the grabbed annotation's `field_key` — the
-    /// viewport routes a DRAG that starts here to [`feature_dimension_drag`](Self::
-    /// feature_dimension_drag), editing that param live (Fix 4). `None` in any other
+    /// viewport routes a DRAG that starts here to [`feature_dimension_drag`](Self::feature_dimension_drag), editing that param live (Fix 4). `None` in any other
     /// gizmo mode / when no arrowhead is under the pointer. Distinct from
     /// [`dimension_origin_pick`](Self::dimension_origin_pick): that grabs the SHARED
     /// origin sphere (a mode toggle), this grabs an arrowHEAD (a value edit). The
@@ -191,14 +190,14 @@ impl EngineState {
     /// that param's value.
     ///
     /// The point is the arrowHEAD end of the `Arrow` region
-    /// ([`dimension_hit_regions`](Self::dimension_hit_regions)), not its middle:
+    /// (`dimension_hit_regions`), not its middle:
     /// a LINEAR leader's capsule runs `point_a → point_b` and the whole shaft
     /// grabs, but the cone TIP at `b` is the thing a reader sees and a
     /// walkthrough should be filmed pulling; an ANGULAR dim's region is already
     /// the sweep-end handle circle, so its center is the point.
     ///
     /// Published ONLY where the gizmo's own pick answers with that field, AND
-    /// still answers it [`GRAB_MARGIN_PX`] away in each direction — the same
+    /// still answers it `GRAB_MARGIN_PX` away in each direction — the same
     /// rule [`transform_handle_points`](Self::transform_handle_points) follows,
     /// with a margin the transform widget does not need.
     ///
@@ -273,7 +272,7 @@ impl EngineState {
     /// DEBUG overlay: the EXACT SCREEN-space (viewport-local px) pickable regions
     /// of the armed feature's dimension gizmo — the SAME regions
     /// `dimension_arrow_pick` + `dimension_origin_pick` 2D-test the cursor against
-    /// ([`dimension_hit_regions`](Self::dimension_hit_regions)) — so the red
+    /// (`dimension_hit_regions`) — so the red
     /// outline can NEVER drift from the grabbable area. Each item is a
     /// `{ kind:"capsule", a:[x,y], b:[x,y], r }` (linear leaders) or
     /// `{ kind:"circle", c:[x,y], r }` (origin / arc-handle spheres); the app only
@@ -562,7 +561,7 @@ impl EngineState {
 
     /// (Re)project the dimension leaders onto the current geometry. Called on arm
     /// + after every param change (drag / value edit / rerun in dimension mode)
-    /// + on a material ZOOM ([`Self::ensure_feature_dimension_overlay_current`]).
+    /// + on a material ZOOM (`Self::ensure_feature_dimension_overlay_current`).
     /// Remembers the `world_per_pixel` it baked at, which is what lets that
     /// per-frame ensure fire on change ONLY.
     pub fn refresh_feature_dimension_overlay(&mut self) {

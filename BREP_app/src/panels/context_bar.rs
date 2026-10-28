@@ -18,7 +18,7 @@
 //!     BUNDLE solid's producer is the harness tail, which is not a history
 //!     feature: the button stays in place but DISABLED, its tooltip naming the
 //!     spline the bundle follows and the Wire Harness panel as the things to
-//!     edit instead ([`Selection::harness_bundle`]).
+//!     edit instead (`Selection::harness_bundle`).
 //! * **Feature-from-selection** — WHICH features a selection offers is answered
 //!   by the KERNEL, per feature: each feature module defines `context_applicable`
 //!   (aggregated in `feature_pipeline::context_offer`), a predicate over the
@@ -101,6 +101,9 @@ pub struct ContextBarPanel {
     shown_component_actions: Vec<String>,
     /// The single component the actions target this frame (its ACOMP id).
     shown_component_target: Option<String>,
+    /// Every component the offered actions act on this frame: the single
+    /// target, or the occurrences a face / multi-component selection moves.
+    shown_component_targets: Vec<String>,
     /// The tallest the card may draw, in points, set by the shell each frame:
     /// down to the ViewCube's top, so a long rail scrolls instead of covering
     /// the cube (lane U audit item 2: at 1280x800 a face selection's 22 rows
@@ -114,6 +117,7 @@ impl ContextBarPanel {
         self.shown_actions.clear(); self.shown_features.clear();
         self.shown_constraints.clear(); self.shown_pmi.clear();
         self.shown_component_actions.clear(); self.shown_component_target = None;
+        self.shown_component_targets.clear();
     }
     pub fn new() -> Self {
         Self::default()
@@ -134,6 +138,7 @@ impl ContextBarPanel {
         self.shown_pmi.clear();
         self.shown_component_actions.clear();
         self.shown_component_target = None;
+        self.shown_component_targets.clear();
 
         // Modeling context actions ONLY. Hidden with no selection (geometry OR a
         // label-selected constraint), and never during reference-selection (the
@@ -202,10 +207,34 @@ impl ContextBarPanel {
             &state.settings.workbench,
             &crate::workbench::ButtonState::of(state),
         )
+        // A Pattern Component instance is not a component of its own: its
+        // actions are the pattern's (suppress it, go to its seed), below.
+        .filter(|id| brep_kernel::pattern_component_instance(id).is_none())
         .map(|id| {
             let fixed = state.component_info(id).map(|info| info.fixed).unwrap_or(false);
             (id.to_string(), fixed)
         });
+        // The seed of a selected instance: "Select seed" goes there.
+        let instance_seed = comp
+            .sole_target()
+            .and_then(brep_kernel::pattern_component_instance)
+            .map(|(_, seed, _)| seed);
+        // Any OTHER all-component selection — a face, edge or vertex of one
+        // component, or geometry of several — offers Move alone, aimed at the
+        // owning top-level occurrences (several move together on one gizmo).
+        let move_targets = if component_target.is_some() {
+            Vec::new()
+        } else {
+            // Moving an instance moves what it follows: its seed.
+            let mut targets: Vec<String> = Vec::new();
+            for id in component_move_targets(&comp, &state.settings.workbench, &crate::workbench::ButtonState::of(state)) {
+                let id = brep_kernel::pattern_component_instance(&id).map_or(id, |(_, seed, _)| seed);
+                if !targets.contains(&id) {
+                    targets.push(id);
+                }
+            }
+            targets
+        };
 
         // Build the action items: the generic actions, then feature-from-selection.
         // Info (🕵 U+1F575, the previous app's "Inspector, Metadata & Mass Properties"
@@ -244,6 +273,35 @@ impl ContextBarPanel {
             items.push(item);
             self.shown_actions.push("edit-owning".into());
         }
+        if let Some(seed) = &instance_seed {
+            items.push(ActionItem::new(
+                "action:select-seed",
+                format!("Select seed {seed}"),
+                "Select the component this instance follows: move, mate or edit it, and every instance follows",
+            ));
+            self.shown_actions.push("select-seed".into());
+        }
+        // A pattern instance (a part Pattern copy or a Pattern Component
+        // instance): suppress it, and while any instance of that pattern is
+        // suppressed, bring them all back.
+        let pattern_instance = sel.single.as_deref().and_then(|name| state.pattern_instance_of(name));
+        if let Some((pattern, number)) = &pattern_instance {
+            items.push(ActionItem::new(
+                "action:suppress-instance",
+                format!("Suppress instance {number}"),
+                format!("Make instance {number} of {pattern} produce no geometry (one undo step)"),
+            ));
+            self.shown_actions.push("suppress-instance".into());
+            let suppressed = state.pattern_suppressed(pattern).len();
+            if suppressed > 0 {
+                items.push(ActionItem::new(
+                    "action:unsuppress-instances",
+                    format!("Unsuppress instances ({suppressed})"),
+                    format!("Bring back every suppressed instance of {pattern}"),
+                ));
+                self.shown_actions.push("unsuppress-instances".into());
+            }
+        }
         // Component actions: shown INSTEAD of the feature offers when the
         // selection is exactly one component's member solid(s).
         if let Some((target, fixed)) = &component_target {
@@ -256,6 +314,34 @@ impl ContextBarPanel {
                 self.shown_component_actions.push(action.id().to_string());
             }
             self.shown_component_target = Some(target.clone());
+            self.shown_component_targets = vec![target.clone()];
+        }
+        if !move_targets.is_empty() {
+            let action = ComponentAction::Move;
+            let tooltip = if move_targets.len() == 1 {
+                "Move the component that owns the selection (move/rotate gizmo on-off)"
+            } else {
+                "Move the selected components together with one move/rotate gizmo"
+            };
+            items.push(ActionItem::new(
+                format!("component:{}", action.id()),
+                action.label(false),
+                tooltip,
+            ));
+            self.shown_component_actions.push(action.id().to_string());
+            self.shown_component_targets = move_targets.clone();
+        }
+        // A prompt, not a block: when the targets include FIXED components,
+        // offer to unfix them and move them with the rest (one undo step).
+        let unfix_targets = unfix_move_targets(state, &self.shown_component_targets);
+        if !unfix_targets.is_empty() {
+            items.push(ActionItem::new(
+                format!("component:{UNFIX_MOVE}"),
+                "\u{1F513} Unfix and Move",
+                "Unfix the fixed components in the selection and move them with the rest \
+                 (unfixed only when you drag; one undo step)",
+            ));
+            self.shown_component_actions.push(UNFIX_MOVE.to_string());
         }
         // Constraint offers (all-component selections in a workbench that shows
         // the constraints panel): one button per applicable constraint type.
@@ -342,6 +428,28 @@ impl ContextBarPanel {
             Some("action:hide") => {
                 state.hide_selected();
             }
+            Some("action:select-seed") => {
+                if let Some(seed) = &instance_seed {
+                    state.select_component(seed);
+                }
+            }
+            Some("action:suppress-instance") => {
+                if let Some((pattern, number)) = &pattern_instance {
+                    match state.pattern_set_suppressed(pattern, Some(*number), true) {
+                        Ok(()) => {
+                            state.clear_selection();
+                        }
+                        Err(error) => state.push_notice(error),
+                    }
+                }
+            }
+            Some("action:unsuppress-instances") => {
+                if let Some((pattern, _)) = &pattern_instance {
+                    if let Err(error) = state.pattern_set_suppressed(pattern, None, false) {
+                        state.push_notice(error);
+                    }
+                }
+            }
             Some("action:info") => {
                 // No engine mutation — hand the shell one target per selected entity
                 // so it opens (or, on dedup, keeps) a pinned Info window for each.
@@ -364,6 +472,11 @@ impl ContextBarPanel {
                     if let Some(action) = ComponentAction::from_id(&key["component:".len()..]) {
                         outcome.component = run_component_action(state, action, target);
                     }
+                } else if key == "component:move" && !move_targets.is_empty() {
+                    state.component_move_group_toggle(&move_targets);
+                }
+                if key == format!("component:{UNFIX_MOVE}") && !unfix_targets.is_empty() {
+                    state.component_move_unfix_toggle(&unfix_targets);
                 }
             }
             Some(key) if key.starts_with("constraint:") => {
@@ -414,6 +527,7 @@ impl ContextBarPanel {
             "pmi": self.shown_pmi,
             "componentActions": self.shown_component_actions,
             "componentTarget": self.shown_component_target,
+            "componentTargets": self.shown_component_targets,
         })
         .to_string()
     }
@@ -426,8 +540,8 @@ struct ComponentSelection {
     /// Unique owning ACOMP ids across every selected NAMED entity, selection
     /// order.
     ids: Vec<String>,
-    /// Whether EVERY selected named entity is component-owned (and at least one
-    /// is selected; vertices carry no names, so any vertex disqualifies).
+    /// Whether EVERY selected entity is component-owned (and at least one is
+    /// selected; a vertex counts through its owning solid).
     all_component: bool,
     /// Whether the selection is member SOLIDS only (the shape a viewport
     /// component click produces).
@@ -446,6 +560,16 @@ impl ComponentSelection {
     fn sole_target(&self) -> Option<&str> {
         (self.suppress_features() && self.solids_only && self.ids.len() == 1)
             .then(|| self.ids[0].as_str())
+    }
+
+    /// The occurrences a Move on this selection moves: every owning component
+    /// of an all-component selection (empty otherwise).
+    fn move_targets(&self) -> Vec<String> {
+        if self.suppress_features() {
+            self.ids.clone()
+        } else {
+            Vec::new()
+        }
     }
 }
 
@@ -467,8 +591,19 @@ fn component_selection(sel: &Selection, state: &EngineState) -> ComponentSelecti
             None => all = false,
         }
     }
+    // Vertices carry no names: the engine resolves their owning solids.
     if sel.vertices > 0 {
-        all = false;
+        any = true;
+        match state.selected_vertex_components() {
+            Some(owners) => {
+                for id in owners {
+                    if !ids.contains(&id) {
+                        ids.push(id);
+                    }
+                }
+            }
+            None => all = false,
+        }
     }
     ComponentSelection {
         ids,
@@ -534,6 +669,8 @@ struct Selection {
     vertices: usize,
     /// The producer feature id of a SINGLE-entity selection with a known producer.
     owning_feature: Option<String>,
+    /// The name of a SINGLE-entity selection.
+    single: Option<String>,
 }
 
 impl Selection {
@@ -614,6 +751,7 @@ impl Selection {
             planes,
             vertices,
             owning_feature,
+            single,
         }
     }
 
@@ -885,6 +1023,43 @@ fn component_action_target<'a>(
     list_shown.then(|| comp.sole_target()).flatten()
 }
 
+/// The context bar's "Unfix and Move" action id (`component:unfix-move`) —
+/// a bar-only action, not one of the BOM row menu's [`ComponentAction`]s.
+const UNFIX_MOVE: &str = "unfix-move";
+
+/// The components "Unfix and Move" acts on: all of `targets` when at least
+/// one of them is fixed, else none (plain Move already covers them).
+fn unfix_move_targets(state: &EngineState, targets: &[String]) -> Vec<String> {
+    let any_fixed = targets
+        .iter()
+        .any(|id| state.component_info(id).is_some_and(|info| info.fixed));
+    if any_fixed {
+        targets.to_vec()
+    } else {
+        Vec::new()
+    }
+}
+
+/// The occurrences the lone Move action targets for a selection that is not
+/// the single-component action shape — under the same BOM-visibility gate as
+/// [`component_action_target`].
+fn component_move_targets(
+    comp: &ComponentSelection,
+    workbench: &str,
+    panels: &crate::workbench::ButtonState,
+) -> Vec<String> {
+    let list_shown = crate::workbench::panel_visible(
+        workbench,
+        crate::workbench::assembly::BOM_PANEL_ID,
+        panels,
+    );
+    if list_shown && comp.sole_target().is_none() {
+        comp.move_targets()
+    } else {
+        Vec::new()
+    }
+}
+
 /// The PMI annotation actions to offer: every type whose `applicable`
 /// predicate ([`brep_kernel::PMI_TYPES`]) accepts the probe — gated on the PMI
 /// panel being available in the active workbench (PMI + All) and on an active
@@ -1097,6 +1272,9 @@ pub static HIT_KEYS: &[HitKeyDoc] = &[
     HitKeyDoc { panel: "context", prefix: "action:hide", meaning: "hide or show the selected geometry", command: Some("set_visible") },
     HitKeyDoc { panel: "context", prefix: "action:info", meaning: "open one pinned Info window per selected entity (mass properties, topology, metadata)", command: None },
     HitKeyDoc { panel: "context", prefix: "action:delete-constraint", meaning: "delete the assembly constraint whose viewport label is selected", command: Some("assembly_remove_constraint") },
+    HitKeyDoc { panel: "context", prefix: "action:suppress-instance", meaning: "suppress the selected pattern instance (a part Pattern copy makes no geometry; a Pattern Component instance places nothing)", command: None },
+    HitKeyDoc { panel: "context", prefix: "action:select-seed", meaning: "select the seed component a Pattern Component instance follows", command: None },
+    HitKeyDoc { panel: "context", prefix: "action:unsuppress-instances", meaning: "bring back every suppressed instance of the selected instance's Pattern", command: None },
     HitKeyDoc { panel: "context", prefix: "action:edit-owning", meaning: "roll to and edit the feature that created the selection (disabled for a wire-harness bundle solid, which no history feature owns)", command: None },
     HitKeyDoc { panel: "context", prefix: "feature:", meaning: "add the offered feature from the selection (feature:type)", command: None },
     HitKeyDoc { panel: "context", prefix: "component:", meaning: "a component action", command: None },

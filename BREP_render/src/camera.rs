@@ -4,7 +4,7 @@
 use crate::geometry3d::{cross3 as cross, dot3 as dot, norm3 as norm};
 
 /// Axis-aligned bounding box (world space, f64).
-#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Aabb {
     pub min: [f64; 3],
     pub max: [f64; 3],

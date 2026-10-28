@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{identify, ok_seq, require_admin, require_user, Shared};
 use crate::db::now;
-use crate::model::{ApiToken, TokenScope, Timestamp};
+use crate::model::{ApiToken, DesktopDevice, TokenScope, Timestamp};
 use crate::security::{self, Lockout, ThrottleKind};
 use crate::{auth, Error};
 
@@ -122,6 +122,8 @@ pub struct TokenView {
     pub last_used_at: Option<Timestamp>,
     pub expires_at: Option<Timestamp>,
     pub expired: bool,
+    /// Set for a Linked desktop: the machine its browser sign-in named.
+    pub desktop: Option<DesktopDevice>,
 }
 
 fn view(token: &ApiToken, username: &str, now: Timestamp) -> TokenView {
@@ -136,6 +138,7 @@ fn view(token: &ApiToken, username: &str, now: Timestamp) -> TokenView {
         last_used_at: token.last_used_at,
         expires_at: token.expires_at,
         expired: token.expires_at.is_some_and(|at| at <= now),
+        desktop: token.desktop.clone(),
     }
 }
 
@@ -221,6 +224,7 @@ pub async fn create_token(
         created_at: created,
         last_used_at: None,
         expires_at: body.expires_days.filter(|d| *d > 0).map(|d| created + d * 86_400),
+        desktop: None,
     };
     let stored = token.clone();
     let username = db.mutate(move |state| {

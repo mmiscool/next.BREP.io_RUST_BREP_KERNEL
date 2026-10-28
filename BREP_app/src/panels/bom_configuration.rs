@@ -77,6 +77,9 @@ pub struct BomConfiguration {
     slot: Option<Slot>,
     last: Option<Instant>,
     keys: String,
+    /// The store's mutation generation the configuration was read at: a
+    /// save, or a row the change feed refreshed, reads it again.
+    generation: u64,
     pub columns: Vec<String>,
     selected: String,
     name: String,
@@ -85,13 +88,16 @@ pub struct BomConfiguration {
     save: Option<Rc<RefCell<Option<Result<String, String>>>>>,
 }
 fn spawn(task: impl std::future::Future<Output = ()> + 'static) {
-    #[cfg(target_arch = "wasm32")]
-    wasm_bindgen_futures::spawn_local(task);
-    #[cfg(not(target_arch = "wasm32"))]
-    crate::plm::native::spawn(task);
+    crate::store::spawn_waking(task);
 }
 impl BomConfiguration {
-    pub fn ensure(&mut self, client: &Rc<PlmClient>, keys: Vec<String>) {
+    /// Read the configuration (and the snapshots of `keys`) when it is not
+    /// current: other keys, a moved store `generation` (a save, a row the
+    /// change feed refreshed), or a minute gone (a layout someone changed on
+    /// the server says nothing in the feed). It was read every 3 s while the
+    /// BOM was showing: 20 requests a minute per user, most of them answers
+    /// already held.
+    pub fn ensure(&mut self, client: &Rc<PlmClient>, keys: Vec<String>, generation: u64) {
         let keys = keys
             .iter()
             .filter_map(|key| {
@@ -169,13 +175,15 @@ impl BomConfiguration {
         if self.save.is_some()
             || self.slot.is_some()
             || (keys == self.keys
+                && generation == self.generation
                 && self
                     .last
-                    .is_some_and(|last| last.elapsed() < Duration::from_secs(3)))
+                    .is_some_and(|last| last.elapsed() < Duration::from_secs(60)))
         {
             return;
         }
         self.keys = keys.clone();
+        self.generation = generation;
         self.last = Some(Instant::now());
         let slot: Slot = Rc::default();
         self.slot = Some(slot.clone());

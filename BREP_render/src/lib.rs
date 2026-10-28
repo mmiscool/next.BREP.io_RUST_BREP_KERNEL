@@ -18,6 +18,7 @@
 pub use brep_kernel;
 
 pub mod assembly_status;
+pub mod cam_sim;
 pub mod camera;
 pub mod color;
 pub mod constraint_overlays;

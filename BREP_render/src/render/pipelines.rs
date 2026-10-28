@@ -33,6 +33,19 @@ impl RenderCore {
                 count: None,
             }],
         });
+        let model_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("model"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: true,
+                    min_binding_size: std::num::NonZeroU64::new(std::mem::size_of::<ModelParams>() as u64),
+                },
+                count: None,
+            }],
+        });
         let globals_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("globals"),
             size: std::mem::size_of::<Globals>() as u64,
@@ -53,6 +66,12 @@ impl RenderCore {
             bind_group_layouts: &[Some(&globals_layout), Some(&style_layout)],
             immediate_size: 0,
         });
+        // The solids' pipelines draw each solid through its own pose (group 2).
+        let solid_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("brep-render solids"),
+            bind_group_layouts: &[Some(&globals_layout), Some(&style_layout), Some(&model_layout)],
+            immediate_size: 0,
+        });
 
         const ALPHA_BLEND: wgpu::BlendState = wgpu::BlendState::ALPHA_BLENDING;
         let color_target = |blend: Option<wgpu::BlendState>| {
@@ -69,7 +88,7 @@ impl RenderCore {
 
         let mesh_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("mesh"),
-            layout: Some(&pipeline_layout),
+            layout: Some(&solid_layout),
             vertex: wgpu::VertexState {
                 module: &shader,
                 entry_point: Some("vs_mesh"),
@@ -112,12 +131,57 @@ impl RenderCore {
             cache: None,
         });
 
+        let context_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("work part context"),
+            layout: Some(&solid_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_mesh"),
+                compilation_options: Default::default(),
+                buffers: &[wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<MeshVertex>() as u64,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3],
+                }],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_context"),
+                compilation_options: Default::default(),
+                targets: &[color_target(Some(ALPHA_BLEND))],
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                front_face: wgpu::FrontFace::Ccw,
+                // Double-sided, like the retired materials during picking — and
+                // the +plane-z winding convention (R13) is never "corrected".
+                cull_mode: None,
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(wgpu::CompareFunction::Less),
+                stencil: Default::default(),
+                // Push faces slightly back so the edge overlay wins its
+                // z-fight against the faces it outlines.
+                bias: wgpu::DepthBiasState {
+                    constant: 4,
+                    slope_scale: 2.0,
+                    clamp: 0.0,
+                },
+            }),
+            multisample,
+            multiview_mask: None,
+            cache: None,
+        });
+
         // Wireframe: same vertex layout as the mesh, but drawn as a line list
         // (each triangle's 3 edges) with a flat fragment. `PolygonMode::Line`
         // is unavailable on the WebGL/downlevel path, so we expand to lines.
         let wire_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("wireframe"),
-            layout: Some(&pipeline_layout),
+            layout: Some(&solid_layout),
             vertex: wgpu::VertexState {
                 module: &shader,
                 entry_point: Some("vs_mesh"),
@@ -155,7 +219,7 @@ impl RenderCore {
         let edge_pipeline = |label: &str, depth_compare: wgpu::CompareFunction| {
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some(label),
-                layout: Some(&pipeline_layout),
+                layout: Some(&solid_layout),
                 vertex: wgpu::VertexState {
                     module: &shader,
                     entry_point: Some("vs_edge"),
@@ -199,7 +263,7 @@ impl RenderCore {
 
         let point_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("points"),
-            layout: Some(&pipeline_layout),
+            layout: Some(&solid_layout),
             vertex: wgpu::VertexState {
                 module: &shader,
                 entry_point: Some("vs_point"),
@@ -385,13 +449,25 @@ impl RenderCore {
             overlay_line: StyleBuf::new(&device, &style_layout, "overlay-line"),
         };
 
+        let identity_model = IdentityModel::new(&device, &queue, &model_layout);
+        let context_style = StyleBuf::new(&device, &style_layout, "work part context");
+        context_style.write(&queue, super::WORK_PART_CONTEXT_RGBA, [0.0; 4]);
+        let context_selected = StyleBuf::new(&device, &style_layout, "work part context selected");
+        let context_hovered = StyleBuf::new(&device, &style_layout, "work part context hovered");
+
         Self {
+            context_pipeline,
+            context_style,
+            context_selected,
+            context_hovered,
             device,
             queue,
             format,
             globals_buf,
             globals_bind,
             style_layout,
+            model_layout,
+            identity_model,
             mesh_pipeline,
             wire_pipeline,
             edge_visible_pipeline,

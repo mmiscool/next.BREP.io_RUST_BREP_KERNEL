@@ -1138,7 +1138,7 @@ impl RouteReading {
 /// # The two halves, and which one already existed
 ///
 /// The SECTION half is the kernel's own `intersect_surfaces`. Note that
-/// [`carrier_section`] above is NOT usable here: it seeds its march from the
+/// `carrier_section` above is NOT usable here: it seeds its march from the
 /// edge it is replacing (`edge_seeds`), and the whole point of this question is
 /// faces that share no edge with the moved group, so there is no seed to take.
 ///

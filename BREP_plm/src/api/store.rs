@@ -212,10 +212,20 @@ pub async fn write_doc(
         return Err(Error::bad_request("a document must be JSON"));
     }
 
-    let seq = db.write_document(&part_id, &revision_id, &body)?;
+    // `If-Match: <content hash>`: write only over that document (a client
+    // retrying a save that failed, based on what it last read).
+    let if_match = headers
+        .get(axum::http::header::IF_MATCH)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.trim().trim_matches('"').to_string())
+        .filter(|v| !v.is_empty());
+    // The uses list is derived from the document in the same write
+    // (`derived-uses`); why it was not, when it was not, rides the answer.
+    let (seq, uses_refused) = db.write_document_deriving(&part_id, &revision_id, &body, if_match.as_deref())?;
     Ok(Json(serde_json::json!({
         "ok": true,
         "seq": seq,
+        "uses_refused": uses_refused,
         "content_hash": db.read(|state|state.part(&part_id).and_then(|p|p.revision(&revision_id)).map(|r|r.content_hash.clone()).unwrap_or_default()),
         "size": body.len(),
     }))

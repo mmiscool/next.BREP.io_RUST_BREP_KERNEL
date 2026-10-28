@@ -6,16 +6,16 @@
 //! evaluates its expressions, builds its features, and reports. This module is
 //! that worker.
 //!
-//! - [`bake_document`] runs one document through a bare [`EngineState`] and
+//! - [`bake_document`](crate::plm::bake::bake_document) runs one document through a bare [`EngineState`](brep_render::engine_state::EngineState) and
 //!   its synchronous runner. That is the history run the app does on open,
 //!   without egui, without a window and without a GPU.
-//! - [`verdict`] reads the run's report. The engine LOADS a document whose
+//! - [`verdict`](crate::plm::bake::verdict) reads the run's report. The engine LOADS a document whose
 //!   expressions do not evaluate or whose features do not build, and reports
 //!   each failure in `featureErrors`. So a load that succeeds is not a bake
 //!   that succeeded: any feature error fails the job, with the sentences the
 //!   engine wrote.
 //!
-//! - [`run_pass`] is the loop, one pass of it: claim the oldest free job
+//! - [`run_pass`](crate::plm::bake::run_pass) is the loop, one pass of it: claim the oldest free job
 //!   (`POST /api/bake/next`), read the document the server assembled, bake it,
 //!   and either keep it (`PUT /api/bake/jobs/:id/result`) or say why not
 //!   (`POST /api/bake/jobs/:id/fail`). It signs in with a `worker`-scoped
@@ -28,7 +28,7 @@
 //!
 //! **The lease.** A claim lapses after 15 minutes (`BAKE_LEASE` on the
 //! server), and the engine's run cannot be pre-empted. So while a job is held,
-//! a [`Renewal`] thread beside the bake says "still baking"
+//! a [`Renewal`](crate::plm::bake::Renewal) thread beside the bake says "still baking"
 //! (`POST /api/bake/jobs/:id/renew`) every third of a lease, and a bake of any
 //! length keeps its claim. The thread stops the moment the job reports (its
 //! guard is dropped), and a refused renewal (someone took the job over, it
@@ -174,7 +174,12 @@ async fn bake_job(client: &PlmClient, job: BakeJob) -> Result<JobOutcome, PlmErr
         Ok(Some(bytes)) if job.expected_hash.as_ref().is_some_and(|hash| *hash != super::thumbnail::content_hash(&String::from_utf8_lossy(&bytes))) => {
             "the model changed after Force resave was queued; retry it".into()
         }
-        Ok(Some(bytes)) => match std::str::from_utf8(&bytes).map_err(|e| e.to_string()).and_then(bake_document) {
+        // Baked with every embedded PLM copy read from its revision (a parent's
+        // copy is a cache): the check and the thumbnail are the current parts'.
+        Ok(Some(bytes)) => match match std::str::from_utf8(&bytes) {
+            Ok(text) => bake_document(&super::cached_copies::with_current_copies(client, text).await),
+            Err(e) => Err(e.to_string()),
+        } {
             Ok(bake) => match verdict(&job.number, &job.revision_label, &bake) {
                 Ok(()) => return keep(client, job, bytes, bake.thumbnail).await,
                 Err(sentence) => sentence,

@@ -1,5 +1,5 @@
 //! Selection panel — the **selection filter** (which entity kinds a viewport
-//! click may pick), rendered as a single horizontal row in the shell's bottom
+//! click may pick), rendered as a row or compact popup in the shell's bottom
 //! STATUS BAR (not a side-panel section). Follows the panel pattern: a small
 //! state struct + a `show_status_bar(&mut self, ui, state)` the bottom bar calls
 //! once per frame in modeling mode; `EngineState` stays the single brain (it owns
@@ -63,6 +63,9 @@ const KINDS: [(&str, &str); 7] = [
 #[derive(Default)]
 pub struct SelectionPanel {
     hits: HashMap<String, egui::Rect>,
+    /// The compact filter button's caption as last drawn, `None` while the
+    /// full row is drawn instead (published as `__brepFilterButton`).
+    button: Option<String>,
 }
 
 impl SelectionPanel {
@@ -70,73 +73,95 @@ impl SelectionPanel {
         Self::default()
     }
 
-    /// Draw the selection filter as a single horizontal row into the shell's
+    /// Draw the selection filter as a row or compact popup in the shell's
     /// bottom STATUS BAR: a leading "All" tristate checkbox + one CHECKBOX per
     /// pickable kind (all reflecting the LIVE engine `selection_filter`). Rebuilds
     /// `hits` as it draws. Called by the bottom bar in modeling mode.
     pub fn show_status_bar(&mut self, ui: &mut egui::Ui, state: &mut EngineState) {
         self.hits.clear();
-        ui.horizontal_wrapped(|ui| {
-            // While the reference-selection picker is active the engine
-            // temporarily CONSTRAINS the filter to the active field's allowed
-            // kinds (see `begin_ref_select`). Letting a bottom-bar click edit it
-            // then would clobber that constraint, so LOCK the row: it still shows
-            // the constrained kinds (greyed) but is non-interactive until the
-            // picker finishes/cancels and the filter is restored.
-            let locked = state.ref_select_active();
-            if locked {
-                ui.icon_label(egui::RichText::new("\u{1f512} Reference selection — filter locked").weak())
-                    .on_hover_text(
-                        "The pick filter is set by the field being referenced. \
-                         Finish the pick (Done on its field, or Escape) to change it.",
-                    );
-            } else {
-                ui.label("Pickable:");
+        self.button = None;
+        // A loading label can leave only a sliver of the status bar. Never
+        // wrap the filter into that sliver: a popup does not consume viewport
+        // height and remains usable with touch-sized controls. The whole
+        // filter is then ONE button whose caption says what is pickable.
+        if crate::viewport::touch::enabled(ui.ctx()) || ui.available_width() < crate::viewport::touch::NARROW_WIDTH {
+            let caption = button_caption(&state.selection_filter(), state.ref_select_active());
+            self.button = Some(caption.clone());
+            let menu = egui::containers::menu::MenuButton::new(caption)
+                .config(egui::containers::menu::MenuConfig::new()
+                    .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside))
+                .ui(ui, |ui| {
+                    ui.set_width(240.0_f32.min(ui.ctx().content_rect().width() - 24.0));
+                    egui::ScrollArea::vertical()
+                        .max_height((ui.ctx().content_rect().height() - 100.0).max(88.0))
+                        .show(ui, |ui| self.show_filters(ui, state));
+                });
+            self.hits.insert("filters:toggle".into(), menu.0.rect);
+        } else {
+            ui.horizontal_wrapped(|ui| self.show_filters(ui, state));
+        }
+    }
+
+    fn show_filters(&mut self, ui: &mut egui::Ui, state: &mut EngineState) {
+        // While the reference-selection picker is active the engine
+        // temporarily CONSTRAINS the filter to the active field's allowed
+        // kinds (see `begin_ref_select`). Letting a bottom-bar click edit it
+        // then would clobber that constraint, so LOCK the row: it still shows
+        // the constrained kinds (greyed) but is non-interactive until the
+        // picker finishes/cancels and the filter is restored.
+        let locked = state.ref_select_active();
+        if locked {
+            ui.icon_label(egui::RichText::new("\u{1f512} Reference selection — filter locked").weak())
+                .on_hover_text(
+                    "The pick filter is set by the field being referenced. \
+                     Finish the pick (Done on its field, or Escape) to change it.",
+                );
+        } else {
+            ui.label("Pickable:");
+        }
+
+        // `add_enabled_ui(false, …)` greys the widgets AND makes them
+        // non-interactive, so no `.changed()`/`.clicked()` fires while locked
+        // — the constrained filter cannot be overwritten. Rects are still laid
+        // out and published so the verifier and layout stay consistent.
+        ui.add_enabled_ui(!locked, |ui| {
+            let mut filter = state.selection_filter();
+            let before = filter;
+
+            // Leading "All" TRISTATE CHECKBOX (mirrors the Scene tree's group
+            // checkbox idiom): checked when EVERY kind is on, the indeterminate
+            // dash when some-but-not-all are on, unchecked when none are.
+            // Toggling it applies the toggle-all semantic — all-on → clear all;
+            // partial or none → set all on — which is exactly the checkbox's
+            // post-click value. Published under `filter:ALL` for the verifier.
+            let all_on = KINDS.iter().all(|(k, _)| filter.get(k));
+            let any_on = KINDS.iter().any(|(k, _)| filter.get(k));
+            let mut all_checked = all_on;
+            let resp = ui.add(
+                egui::Checkbox::new(&mut all_checked, "All").indeterminate(any_on && !all_on),
+            );
+            self.hits.insert("filter:ALL".into(), resp.rect);
+            if resp.changed() {
+                let target = toggle_all_target(&filter);
+                for (kind, _) in KINDS {
+                    filter.set(kind, target);
+                }
             }
 
-            // `add_enabled_ui(false, …)` greys the widgets AND makes them
-            // non-interactive, so no `.changed()`/`.clicked()` fires while locked
-            // — the constrained filter cannot be overwritten. Rects are still laid
-            // out and published so the verifier and layout stay consistent.
-            ui.add_enabled_ui(!locked, |ui| {
-                let mut filter = state.selection_filter();
-                let before = filter;
-
-                // Leading "All" TRISTATE CHECKBOX (mirrors the Scene tree's group
-                // checkbox idiom): checked when EVERY kind is on, the indeterminate
-                // dash when some-but-not-all are on, unchecked when none are.
-                // Toggling it applies the toggle-all semantic — all-on → clear all;
-                // partial or none → set all on — which is exactly the checkbox's
-                // post-click value. Published under `filter:ALL` for the verifier.
-                let all_on = KINDS.iter().all(|(k, _)| filter.get(k));
-                let any_on = KINDS.iter().any(|(k, _)| filter.get(k));
-                let mut all_checked = all_on;
-                let resp = ui.add(
-                    egui::Checkbox::new(&mut all_checked, "All").indeterminate(any_on && !all_on),
-                );
-                self.hits.insert("filter:ALL".into(), resp.rect);
+            // One CHECKBOX per kind, reflecting the live filter. A `.changed()`
+            // checkbox updates the working copy; it is written back once below.
+            for (kind, label) in KINDS {
+                let mut on = filter.get(kind);
+                let resp = ui.checkbox(&mut on, label);
+                self.hits.insert(format!("filter:{kind}"), resp.rect);
                 if resp.changed() {
-                    let target = toggle_all_target(&filter);
-                    for (kind, _) in KINDS {
-                        filter.set(kind, target);
-                    }
+                    filter.set(kind, on);
                 }
+            }
 
-                // One CHECKBOX per kind, reflecting the live filter. A `.changed()`
-                // checkbox updates the working copy; it is written back once below.
-                for (kind, label) in KINDS {
-                    let mut on = filter.get(kind);
-                    let resp = ui.checkbox(&mut on, label);
-                    self.hits.insert(format!("filter:{kind}"), resp.rect);
-                    if resp.changed() {
-                        filter.set(kind, on);
-                    }
-                }
-
-                if filter != before {
-                    state.set_selection_filter(filter);
-                }
-            });
+            if filter != before {
+                state.set_selection_filter(filter);
+            }
         });
     }
 
@@ -145,6 +170,13 @@ impl SelectionPanel {
     /// last-modeling-frame rects for widgets that are no longer on screen.
     pub fn clear_hits(&mut self) {
         self.hits.clear();
+        self.button = None;
+    }
+
+    /// The `__brepFilterButton` verifier global: `{shown, label}` — whether
+    /// the filter is collapsed to its one button, and the button's caption.
+    pub fn button_json(&self) -> String {
+        serde_json::json!({ "shown": self.button.is_some(), "label": self.button }).to_string()
     }
 
     /// The published widget hit-rects (egui points) for the headed verifier —
@@ -153,6 +185,21 @@ impl SelectionPanel {
     pub fn hits_json(&self) -> String {
         crate::automation::hit_rects::hits_json(&self.hits)
     }
+}
+
+/// The compact filter button's caption: what a click may pick, so the state
+/// shows without opening the popup. "All" and "None" for the two ends, the
+/// kind names for one or two, a count beyond that; a reference pick's
+/// constraint is marked locked (the popup cannot change it).
+fn button_caption(filter: &SelectionFilter, locked: bool) -> String {
+    let on: Vec<&str> = KINDS.iter().filter(|(k, _)| filter.get(k)).map(|(_, label)| *label).collect();
+    let what = match on.len() {
+        0 => "None".to_string(),
+        n if n == KINDS.len() => "All".to_string(),
+        1 | 2 => on.join(", "),
+        n => format!("{n} of {}", KINDS.len()),
+    };
+    if locked { format!("Filter (locked): {what}") } else { format!("Filter: {what}") }
 }
 
 /// The "toggle all" target value: if EVERY pickable kind is currently on, the
@@ -165,5 +212,6 @@ fn toggle_all_target(filter: &SelectionFilter) -> bool {
 
 /// The hit keys this panel publishes (see `automation::hit_keys`).
 pub static HIT_KEYS: &[HitKeyDoc] = &[
+    HitKeyDoc { panel: "selection", prefix: "filters:toggle", meaning: "show or hide pickable filters when the status bar is compact", command: None },
     HitKeyDoc { panel: "selection", prefix: "filter:", meaning: "toggle which entity kinds a click may pick (filter:ALL, filter:kind)", command: None },
 ];

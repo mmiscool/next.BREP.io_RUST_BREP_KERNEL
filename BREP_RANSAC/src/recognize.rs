@@ -254,7 +254,7 @@ pub fn recognize_surfaces_with_attempt_budget(
 /// carrier for exactly its triangles before generic extraction divides it.
 ///
 /// The candidate is accepted by the ordinary distance, normal and support
-/// gates, with only [`CANDIDATE_ROUNDOFF_EPSILONS`] added to the distance
+/// gates, with only `CANDIDATE_ROUNDOFF_EPSILONS` added to the distance
 /// tolerance. A component whose whole fit passes, or that has no candidate,
 /// runs exactly as in [`recognize_surfaces_with_unresolved`], so with no
 /// candidates the result is identical. The returned work counts the

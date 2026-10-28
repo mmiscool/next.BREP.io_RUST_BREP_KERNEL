@@ -27,8 +27,18 @@ struct Style {
     params: vec4<f32>,
 };
 
+// A solid's pose (the solid pipelines' group 2): its buffers hold its
+// shape's geometry, drawn through `model`; `normal` is the inverse transpose of
+// its linear part. Identity for anything unposed. The overlay entry points
+// never read it (their pipelines have no group 2).
+struct Model {
+    model: mat4x4<f32>,
+    normal: mat4x4<f32>,
+};
+
 @group(0) @binding(0) var<uniform> globals: Globals;
 @group(1) @binding(0) var<uniform> style: Style;
+@group(2) @binding(0) var<uniform> pose: Model;
 
 fn srgb_encode(c: vec3<f32>) -> vec3<f32> {
     let lo = c * 12.92;
@@ -52,14 +62,14 @@ fn vs_mesh(
     @location(1) normal: vec3<f32>,
 ) -> MeshOut {
     var out: MeshOut;
-    out.position = globals.view_proj * vec4<f32>(position, 1.0);
-    out.normal = normal;
-    out.world = position;
+    let world = (pose.model * vec4<f32>(position, 1.0)).xyz;
+    out.position = globals.view_proj * vec4<f32>(world, 1.0);
+    out.normal = (pose.normal * vec4<f32>(normal, 0.0)).xyz;
+    out.world = world;
     return out;
 }
 
-@fragment
-fn fs_mesh(in: MeshOut) -> @location(0) vec4<f32> {
+fn mesh_color(in: MeshOut) -> vec3<f32> {
     var n = normalize(in.normal);
     if (style.params.x > 0.5) {
         // Flat shading: face normal from screen-space derivatives.
@@ -90,7 +100,17 @@ fn fs_mesh(in: MeshOut) -> @location(0) vec4<f32> {
     let spec = vec3<f32>(0.0056) * pow(max(dot(refl, v), 0.0), 24.0) * 1.4;
 
     let color = style.color.rgb * diffuse_light + spec;
-    return vec4<f32>(srgb_encode(color), 1.0);
+    return srgb_encode(color);
+}
+
+@fragment
+fn fs_mesh(in: MeshOut) -> @location(0) vec4<f32> {
+    return vec4<f32>(mesh_color(in), 1.0);
+}
+
+@fragment
+fn fs_context(in: MeshOut) -> @location(0) vec4<f32> {
+    return vec4<f32>(mesh_color(in), style.color.a);
 }
 
 // Wireframe: the tessellated triangle mesh drawn as lines. Flat base color (no
@@ -123,8 +143,8 @@ fn vs_edge(
     );
     let corner = corners[vertex_index];
 
-    let clip0 = globals.view_proj * vec4<f32>(p0, 1.0);
-    let clip1 = globals.view_proj * vec4<f32>(p1, 1.0);
+    let clip0 = globals.view_proj * (pose.model * vec4<f32>(p0, 1.0));
+    let clip1 = globals.view_proj * (pose.model * vec4<f32>(p1, 1.0));
     let half_vp = globals.viewport.xy * 0.5;
     let px0 = clip0.xy / clip0.w * half_vp;
     let px1 = clip1.xy / clip1.w * half_vp;
@@ -150,9 +170,19 @@ fn vs_edge(
     let offset_px = perp * (corner.y * half_w) + along * half_w;
     let ndc_offset = offset_px / half_vp * clip.w;
 
-    // NDC depth nudge toward the camera so boundary edges win the z-fight with
-    // their own faces (faces also carry a depth bias pushing them back).
-    let nudge = style.params.y;
+    // Perspective depth is A - B / distance: a constant NDC nudge can
+    // pull hidden edges through entire walls near the far plane. Scale it by
+    // the remaining depth range (1 - z/w), bounding the relative displacement
+    // toward the eye by the style nudge. Orthographic depth is linear and keeps
+    // its existing bias. Faces also carry a rasterizer bias, including at z=1
+    // where the perspective nudge vanishes.
+    let perspective = any(vec3<f32>(
+        globals.view_proj[0].w, globals.view_proj[1].w, globals.view_proj[2].w
+    ) != vec3<f32>(0.0));
+    var nudge = style.params.y;
+    if (perspective) {
+        nudge *= clamp(1.0 - clip.z / clip.w, 0.0, 1.0);
+    }
     var out: EdgeOut;
     out.position = vec4<f32>(clip.xy + ndc_offset, clip.z - nudge * clip.w, clip.w);
     return out;
@@ -183,7 +213,7 @@ fn vs_point(
         vec2<f32>(-1.0, 1.0), vec2<f32>(1.0, -1.0), vec2<f32>(1.0, 1.0),
     );
     let corner = corners[vertex_index];
-    let clip = globals.view_proj * vec4<f32>(center, 1.0);
+    let clip = globals.view_proj * (pose.model * vec4<f32>(center, 1.0));
     let half_vp = globals.viewport.xy * 0.5;
     let radius_px = style.params.x * max(globals.viewport.z, 1e-3) * 0.5;
     let ndc_offset = corner * radius_px / half_vp * clip.w;

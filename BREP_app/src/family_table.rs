@@ -290,8 +290,10 @@ pub fn engine_family_source(engine: &brep_render::engine_state::EngineState) -> 
 /// The top-level keys that are NOT the family's model: the table itself (a
 /// row edit must not regenerate every member), the class, the view state the
 /// file reopens in, and stamps.
-const NOT_THE_MODEL: [&str; 6] = [
+const NOT_THE_MODEL: [&str; 7] = [
     FAMILY_TABLE_KEY,
+    // The Save As lineage chain: where the document came from, not its model.
+    brep_render::engine_state::replace_component::DERIVED_FROM_KEY,
     crate::document_class::DOCUMENT_CLASS_KEY,
     "workbench",
     FAMILY_SOURCE_KEY,
@@ -303,7 +305,7 @@ const NOT_THE_MODEL: [&str; 6] = [
 ];
 
 /// A content hash of the family's model: the whole document less the keys in
-/// [`NOT_THE_MODEL`]. Key order does not matter (`stable_json_hash`).
+/// `NOT_THE_MODEL`. Key order does not matter (`stable_json_hash`).
 pub fn history_hash(family: &serde_json::Value) -> String {
     let mut model = family.clone();
     if let Some(object) = model.as_object_mut() {
@@ -413,6 +415,10 @@ pub fn member_document(
         object.remove(crate::document_class::DOCUMENT_CLASS_KEY);
         object.remove(crate::template::TEMPLATE_INPUTS_KEY);
         object.remove(crate::template::TEMPLATE_SOURCE_KEY);
+        // A member's lineage is its family stamp; a chain the family document
+        // inherited from a Save As would make every member a relative of
+        // whatever the family was copied from.
+        object.remove(brep_render::engine_state::replace_component::DERIVED_FROM_KEY);
         object.insert(
             "expressions".into(),
             serde_json::Value::String(member_expressions(expressions, row)),

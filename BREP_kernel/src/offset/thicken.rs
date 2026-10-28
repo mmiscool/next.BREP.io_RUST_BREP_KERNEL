@@ -517,7 +517,7 @@ fn boundary_images(
 /// A general (non-iso) pcurve on a CURVED sheet is no longer refused: its two
 /// 3D images come from [`crate::image_curve::image_curve_pair`], which fits the
 /// composed curve-on-surface on both sheets over ONE shared parameter set (the
-/// basis identity [`ruled_wall`] requires) and refuses only when the fit misses
+/// basis identity `ruled_wall` requires) and refuses only when the fit misses
 /// its measured tolerance.  Unlike a push against a FIXED neighbour, both
 /// sheets here move together, so the image of the shared trim IS the boundary.
 ///

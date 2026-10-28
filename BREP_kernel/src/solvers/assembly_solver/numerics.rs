@@ -182,6 +182,7 @@ pub(super) fn lm_core(
     scale: f64,
     tight: f64,
     max_iterations: usize,
+    linear: LinearAlgebra,
 ) -> Result<LmRun, String> {
     let n = 6 * groups.len();
     let m: usize = atoms.iter().map(Atom::rows).sum();
@@ -205,6 +206,11 @@ pub(super) fn lm_core(
     let mut best_poses = poses.clone();
     let mut best_max = max_abs(&r);
     let mut lambda = -1.0f64;
+
+    if linear == LinearAlgebra::Sparse && n > 0 && m > 0 {
+        let inc = Incidence::new(atoms, groups, poses.len());
+        return lm_sparse(atoms, poses, groups, &inc, LmState { run, r, s, best_poses, best_max }, step_tol, &col_step, tight, max_iterations);
+    }
 
     // Levenberg-Marquardt with re-centred pose increments (mirrors
     // sketch_solver::newton_polish's damping schedule and guards).
@@ -315,6 +321,106 @@ pub(super) fn lm_core(
     Ok(run)
 }
 
+/// The LM loop's carried state at entry (shared with the sparse path).
+struct LmState {
+    run: LmRun,
+    r: Vec<f64>,
+    s: f64,
+    best_poses: Vec<Pose>,
+    best_max: f64,
+}
+
+/// [`lm_core`]'s loop over the block-sparse Jacobian, normal equations and
+/// Cholesky (`sparse.rs`). Same damping schedule, guards, acceptance test and
+/// best-iterate bookkeeping; H and g are bit-identical to the dense path's,
+/// only the factorization's roundoff differs.
+#[allow(clippy::too_many_arguments)]
+fn lm_sparse(
+    atoms: &[Atom],
+    poses: &mut Vec<Pose>,
+    groups: &[SolveGroup],
+    inc: &Incidence,
+    state: LmState,
+    step_tol: f64,
+    col_step: &[f64],
+    tight: f64,
+    max_iterations: usize,
+) -> Result<LmRun, String> {
+    let LmState { mut run, mut r, mut s, mut best_poses, mut best_max } = state;
+    let n = 6 * groups.len();
+    let m = r.len();
+    let max_abs = |v: &[f64]| v.iter().fold(0.0f64, |acc, &x| acc.max(x.abs()));
+    let sum_sq = |v: &[f64]| v.iter().fold(0.0f64, |acc, &x| acc + x * x);
+    let zeros = vec![0.0f64; n];
+    let mut pose_scratch: Vec<Pose> = Vec::with_capacity(poses.len());
+    let mut lambda = -1.0f64;
+    'outer: for _iter in 0..max_iterations {
+        if best_max <= tight {
+            break;
+        }
+        let (jac, rows) = sparse_fd_jacobian(atoms, poses, groups, col_step, inc);
+        run.rows += rows;
+        let normal = BlockNormal::new(&jac, atoms, inc, &r, groups.len());
+        let max_diag = normal.max_diag();
+        if !(max_diag > 0.0) {
+            break; // No sensitivity to any pose increment.
+        }
+        if lambda < 0.0 {
+            lambda = 1e-9 * max_diag;
+        }
+        let lambda_ceiling = 1e12 * max_diag;
+
+        let mut stepped = false;
+        let mut step_small = false;
+        for _try in 0..ASM_MAX_DAMPING {
+            let mut delta: Vec<f64> = normal.g.iter().map(|v| -v).collect();
+            if !normal.solve_damped(lambda, &mut delta) {
+                lambda *= ASM_LAMBDA_UP;
+                if lambda > lambda_ceiling {
+                    break;
+                }
+                continue;
+            }
+            let mut r_trial: Vec<f64> = Vec::with_capacity(m);
+            eval_residuals(atoms, poses, groups, &delta, &mut pose_scratch, &mut r_trial);
+            run.rows += m;
+            let s_trial = sum_sq(&r_trial);
+            if s_trial.is_finite() && s_trial < s {
+                let step_norm = sum_sq(&delta).sqrt();
+                effective_poses(poses, groups, &delta, &mut pose_scratch);
+                for (bi, pose) in pose_scratch.iter().enumerate() {
+                    poses[bi] = Pose {
+                        q: quat_normalize(pose.q).map_err(|e| format!("assembly solve: {e}"))?,
+                        t: pose.t,
+                    };
+                }
+                eval_residuals(atoms, poses, groups, &zeros, &mut pose_scratch, &mut r);
+                run.rows += m;
+                s = sum_sq(&r);
+                let m_now = max_abs(&r);
+                if m_now < best_max {
+                    best_max = m_now;
+                    best_poses.copy_from_slice(poses);
+                }
+                lambda = (lambda * ASM_LAMBDA_DOWN).max(1e-12 * max_diag);
+                run.iterations += 1;
+                stepped = true;
+                step_small = step_norm <= step_tol;
+                break;
+            }
+            lambda *= ASM_LAMBDA_UP;
+            if lambda > lambda_ceiling {
+                break;
+            }
+        }
+        if !stepped || step_small {
+            break 'outer; // Converged, stalled, or damping exhausted.
+        }
+    }
+    poses.copy_from_slice(&best_poses);
+    Ok(run)
+}
+
 // ---------------------------------------------------------------------------
 // Problem preparation (validation, atom expansion, scale) and diagnostics
 // ---------------------------------------------------------------------------
@@ -328,7 +434,7 @@ pub(super) struct Prepared {
     /// Atom index → mate index.
     pub(super) atom_mate: Vec<usize>,
     /// Residual row → mate index.
-    row_mate: Vec<usize>,
+    pub(super) row_mate: Vec<usize>,
     /// Total residual rows.
     pub(super) m: usize,
     /// Total effective rows (per-atom theoretical rank), for redundancy.
@@ -337,6 +443,9 @@ pub(super) struct Prepared {
     pub(super) scale: f64,
     /// Absolute convergence target (`tolerance * scale`).
     pub(super) tight: f64,
+    /// The options' linear algebra and diagnostics switches.
+    pub(super) linear: LinearAlgebra,
+    diagnostics: bool,
 }
 
 pub(super) fn prepare(
@@ -393,6 +502,44 @@ pub(super) fn prepare(
                 track(b.p);
             }
             Atom::DirMatch(..) | Atom::DirCross(..) | Atom::DirDot(..) | Atom::DirAngle(..) => {}
+            Atom::Limit(measure, ..) => match measure {
+                Measure::PointOnPlane(p, o, _) | Measure::PointLineDistance(p, o, _) => {
+                    track(p.p);
+                    track(o.p);
+                }
+                Measure::PointDistance(a, b) | Measure::LineLineDistance(a, _, b, _) => {
+                    track(a.p);
+                    track(b.p);
+                }
+                Measure::DirDot(..) | Measure::DirAngle(..) => {}
+            },
+            Atom::SymPoints(a, b, o, _) | Atom::SymAxisLateral(a, b, _, o, _) => {
+                track(a.p);
+                track(b.p);
+                track(o.p);
+            }
+            Atom::SymPointOnPlane(p, oa, _, o, _) => {
+                track(p.p);
+                track(oa.p);
+                track(o.p);
+            }
+            Atom::SymDirMatch(..) | Atom::SymDirCross(..) | Atom::GearPhase(..) => {}
+            Atom::RackTravel(_, p, _, origin, _) => {
+                track(p.p);
+                track(origin);
+            }
+            Atom::ScrewAdvance(oa, _, _, _, pb, _, offset0, _) => {
+                track(oa.p);
+                track(pb.p);
+                track(Vec3::new(offset0, 0.0, 0.0));
+            }
+            Atom::PointOnCurve(p, ref curve)
+            | Atom::AxisOnCurve(p, _, ref curve)
+            | Atom::CurveAlong(p, _, ref curve, ..)
+            | Atom::CamContact(p, _, ref curve, ..) => {
+                track(p.p);
+                track(Vec3::new(curve.curve.scale(), 0.0, 0.0));
+            }
         }
     }
     let tight = options.tolerance * scale;
@@ -407,6 +554,8 @@ pub(super) fn prepare(
         effective_rows,
         scale,
         tight,
+        linear: options.linear_algebra,
+        diagnostics: options.diagnostics,
     })
 }
 
@@ -444,17 +593,36 @@ pub(super) fn finalize(
     }
 
     // DOF diagnostics at the solution (Jacobian rank, sketch_solver-style).
-    let col_step = column_steps(prep.movable.len(), prep.scale);
-    let jac = finite_diff_jacobian(&prep.atoms, best_poses, &movable_groups, &col_step, m);
-    let rank = numerical_rank(jac, m, n);
-    let dof = n - rank;
-    let redundant = prep.effective_rows.saturating_sub(rank);
-    let status = if redundant > 0 {
-        "over"
-    } else if dof > 0 {
-        "under"
+    // The sparse Jacobian densified is bit-identical to the dense one.
+    let (rank, dof, redundant, status, body_freedom) = if prep.diagnostics {
+        let col_step = column_steps(prep.movable.len(), prep.scale);
+        let jac = match prep.linear {
+            LinearAlgebra::Dense => finite_diff_jacobian(&prep.atoms, best_poses, &movable_groups, &col_step, m),
+            LinearAlgebra::Sparse => {
+                let inc = Incidence::new(&prep.atoms, &movable_groups, best_poses.len());
+                sparse_fd_jacobian(&prep.atoms, best_poses, &movable_groups, &col_step, &inc)
+                    .0
+                    .to_dense(&prep.atoms, &inc, n)
+            }
+        };
+        let (rank, freedoms) = rank_and_body_freedoms(jac, m, n, prep.movable.len() <= FREEDOM_ANALYSIS_MAX_BODIES);
+        let dof = n - rank;
+        let redundant = prep.effective_rows.saturating_sub(rank);
+        let status = if redundant > 0 {
+            "over"
+        } else if dof > 0 {
+            "under"
+        } else {
+            "well"
+        };
+        let body_freedom = freedoms
+            .into_iter()
+            .zip(&prep.movable)
+            .map(|(free, &body)| body_freedom(&bodies[body].id, free, best_poses[body].t))
+            .collect();
+        (rank, dof, redundant, status, body_freedom)
     } else {
-        "well"
+        (0, 0, 0, "unchecked", Vec::new())
     };
 
     if max_residual > prep.tight {
@@ -512,5 +680,151 @@ pub(super) fn finalize(
         rank,
         redundant,
         status: status.into(),
+        body_freedom,
     })
+}
+
+/// The most movable bodies whose per-body freedom is analysed (the null-space
+/// basis is `dof × 6·bodies`); above it the solve reports only the totals.
+const FREEDOM_ANALYSIS_MAX_BODIES: usize = 200;
+
+/// A null-space entry below this is zero: the basis is built from the
+/// reduced Jacobian, so its entries are O(1) coefficients.
+const FREEDOM_TOL: f64 = 1e-6;
+
+/// The Jacobian's rank, exactly as [`numerical_rank`] computes it, and (when
+/// `per_body`) each body's free `(rotations, translations)`: the rank of the
+/// null-space basis restricted to that body's six columns
+/// (`[rx, ry, rz, tx, ty, tz]`, rotations about the body's own origin), with
+/// the rotation share counted from its first three columns.
+///
+/// Each body's entry also carries WHICH motions are free, from the reduced
+/// basis block: a row whose pivot is a rotation column is a free rotation
+/// generator `(ω, v)` (the body turns about `ω` while its origin moves `v`),
+/// one whose pivot is a translation column a pure slide.
+pub(super) fn rank_and_body_freedoms(
+    mut a: Vec<Vec<f64>>,
+    m: usize,
+    n: usize,
+    per_body: bool,
+) -> (usize, Vec<BodyNullSpace>) {
+    if n == 0 {
+        return (0, Vec::new());
+    }
+    if m == 0 {
+        let free = || BodyNullSpace {
+            rotations: 3,
+            translations: 3,
+            turns: (0..3).map(|i| { let mut g = [0.0; 6]; g[i] = 1.0; g }).collect(),
+            slides: (0..3).map(|i| { let mut d = [0.0; 3]; d[i] = 1.0; d }).collect(),
+        };
+        return (0, if per_body { (0..n / 6).map(|_| free()).collect() } else { Vec::new() });
+    }
+    let maxabs = a.iter().flatten().fold(0.0f64, |acc, &v| acc.max(v.abs()));
+    let tol = if maxabs > 0.0 { ASM_RANK_REL_TOL * maxabs } else { ASM_RANK_REL_TOL };
+    let mut pivots = Vec::new();
+    let rank = row_reduce(&mut a, m, n, tol, |col| pivots.push(col));
+    if !per_body {
+        return (rank, Vec::new());
+    }
+    // Reduced row echelon form: pivot row i holds pivot column pivots[i]. A
+    // free column f spans the null space with 1 at f and −a[i][f] at each
+    // pivot column.
+    let is_pivot: Vec<bool> = (0..n).map(|col| pivots.contains(&col)).collect();
+    let basis: Vec<Vec<f64>> = (0..n)
+        .filter(|&col| !is_pivot[col])
+        .map(|free| {
+            let mut v = vec![0.0; n];
+            v[free] = 1.0;
+            for (row, &pivot) in pivots.iter().enumerate() {
+                v[pivot] = -a[row][free];
+            }
+            v
+        })
+        .collect();
+    let freedoms = (0..n / 6)
+        .map(|body| {
+            // Columns in order, rotations first: the reduced rows pivoting
+            // in the first three are the rotation share (exactly the rank of
+            // those three columns), the rest are pure slides.
+            let mut block: Vec<Vec<f64>> = basis.iter().map(|v| v[6 * body..6 * body + 6].to_vec()).collect();
+            let rows = block.len();
+            let mut pivots = Vec::new();
+            let total = row_reduce(&mut block, rows, 6, FREEDOM_TOL, |col| pivots.push(col));
+            let mut turns = Vec::new();
+            let mut slides = Vec::new();
+            for (row, &pivot) in block.iter().zip(&pivots).take(total) {
+                if pivot < 3 {
+                    turns.push([row[0], row[1], row[2], row[3], row[4], row[5]]);
+                } else {
+                    slides.push([row[3], row[4], row[5]]);
+                }
+            }
+            BodyNullSpace { rotations: turns.len(), translations: slides.len(), turns, slides }
+        })
+        .collect();
+    (rank, freedoms)
+}
+
+/// A body's [`BodyNullSpace`] as the report states it: unit slide
+/// directions, and each free rotation as an AXIS LINE (where the body turns
+/// about), in world coordinates. `origin` is the body's pose origin, the
+/// point its rotation columns turn about.
+fn body_freedom(id: &str, free: BodyNullSpace, origin: crate::Vec3) -> BodyFreedom {
+    let dot = |a: [f64; 3], b: [f64; 3]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+    let scaled = |a: [f64; 3], k: f64| [a[0] * k, a[1] * k, a[2] * k];
+    let minus = |a: [f64; 3], b: [f64; 3]| [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
+    // Orthonormal slides (Gram–Schmidt).
+    let mut slides: Vec<[f64; 3]> = Vec::new();
+    for slide in &free.slides {
+        let mut d = *slide;
+        for known in &slides {
+            d = minus(d, scaled(*known, dot(d, *known)));
+        }
+        let length = dot(d, d).sqrt();
+        if length > FREEDOM_TOL {
+            slides.push(scaled(d, 1.0 / length));
+        }
+    }
+    // Each turn generator (ω, v): orthonormalise the ω's (carrying v along),
+    // drop the slide share of v (the axis may sit anywhere along a slide),
+    // and place the axis where the motion is a pure turn: p = o + ω×v/|ω|².
+    let mut turns: Vec<([f64; 3], [f64; 3])> = Vec::new();
+    for turn in &free.turns {
+        let mut w = [turn[0], turn[1], turn[2]];
+        let mut v = [turn[3], turn[4], turn[5]];
+        for (known_w, known_v) in &turns {
+            let k = dot(w, *known_w);
+            w = minus(w, scaled(*known_w, k));
+            v = minus(v, scaled(*known_v, k));
+        }
+        let length = dot(w, w).sqrt();
+        if length > FREEDOM_TOL {
+            turns.push((scaled(w, 1.0 / length), scaled(v, 1.0 / length)));
+        }
+    }
+    let axes = turns
+        .into_iter()
+        .map(|(w, mut v)| {
+            for slide in &slides {
+                v = minus(v, scaled(*slide, dot(v, *slide)));
+            }
+            let cross = [w[1] * v[2] - w[2] * v[1], w[2] * v[0] - w[0] * v[2], w[0] * v[1] - w[1] * v[0]];
+            FreeAxis { point: [origin.x + cross[0], origin.y + cross[1], origin.z + cross[2]], direction: w }
+        })
+        .collect();
+    BodyFreedom { id: id.to_string(), rotations: free.rotations, translations: free.translations, axes, slides }
+}
+
+/// One body's free motion at the solution ([`rank_and_body_freedoms`]):
+/// the counts, and a basis of each (unnormalised, the body's own frame of
+/// columns: rotations about its origin, translations of it).
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct BodyNullSpace {
+    pub rotations: usize,
+    pub translations: usize,
+    /// `(ω, v)` per free rotation.
+    pub turns: Vec<[f64; 6]>,
+    /// A direction per free slide.
+    pub slides: Vec<[f64; 3]>,
 }

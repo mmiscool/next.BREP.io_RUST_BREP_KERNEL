@@ -181,6 +181,12 @@ impl<'de, T: serde::Deserialize<'de> + Keyed + Clone> serde::Deserialize<'de> fo
     }
 }
 
+impl Keyed for crate::jobs::Job {
+    fn key(&self) -> &str {
+        &self.id
+    }
+}
+
 impl Keyed for crate::model::Session {
     fn key(&self) -> &str {
         &self.token

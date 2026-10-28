@@ -29,8 +29,8 @@ pub const SAMPLES: u32 = 4;
 pub const COLOR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 
-/// NDC depth nudge for boundary edges (they must win the z-fight with their
-/// own faces; faces also carry a rasterizer depth bias pushing them back).
+/// Boundary-edge depth bias: NDC in orthographic, scaled by the remaining
+/// depth range in perspective (see vs_edge). Faces also carry rasterizer bias.
 const EDGE_NUDGE: f32 = 2e-4;
 
 #[repr(C)]
@@ -39,6 +39,158 @@ struct Globals {
     view_proj: [[f32; 4]; 4],
     viewport: [f32; 4],
     forward: [f32; 4],
+}
+
+/// A solid's pose on the GPU: the model matrix its buffers are drawn
+/// through, and the inverse transpose of its linear part for the normals.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct ModelParams {
+    model: [f32; 16],
+    normal: [f32; 16],
+}
+
+const IDENTITY4: [f32; 16] = [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0];
+
+impl ModelParams {
+    fn of(pose: Option<&[f32; 16]>) -> Self {
+        let Some(m) = pose else { return Self { model: IDENTITY4, normal: IDENTITY4 } };
+        // The normals' matrix: the inverse transpose of the 3×3 linear part
+        // (equal to it for a rotation; it keeps them normal under a scale).
+        let a = |row: usize, col: usize| m[col * 4 + row] as f64;
+        let cof = |r0: usize, r1: usize, c0: usize, c1: usize| a(r0, c0) * a(r1, c1) - a(r0, c1) * a(r1, c0);
+        let det = a(0, 0) * cof(1, 2, 1, 2) - a(0, 1) * cof(1, 2, 0, 2) + a(0, 2) * cof(1, 2, 0, 1);
+        let mut normal = IDENTITY4;
+        if det.abs() > 1e-30 {
+            // (A⁻¹)ᵀ = cofactor(A) / det.
+            let c = [
+                [cof(1, 2, 1, 2), -cof(1, 2, 0, 2), cof(1, 2, 0, 1)],
+                [-cof(0, 2, 1, 2), cof(0, 2, 0, 2), -cof(0, 2, 0, 1)],
+                [cof(0, 1, 1, 2), -cof(0, 1, 0, 2), cof(0, 1, 0, 1)],
+            ];
+            for row in 0..3 {
+                for col in 0..3 {
+                    normal[col * 4 + row] = (c[row][col] / det) as f32;
+                }
+            }
+        }
+        Self { model: *m, normal }
+    }
+}
+
+/// Every solid pose of one GPU scene in ONE uniform buffer, a [`MODEL_STRIDE`]
+/// slot each, bound at the solid's offset (group 2, dynamic offset). A frame
+/// that moves 500 solids writes the changed range once: a write per solid was
+/// most of the frame (~0.25-0.8 ms a write under a software adapter).
+struct ModelArena {
+    buf: wgpu::Buffer,
+    bind: wgpu::BindGroup,
+    capacity: u32,
+    data: Vec<u8>,
+    free: Vec<u32>,
+    next: u32,
+    /// The byte range written since the last flush.
+    dirty: Option<(usize, usize)>,
+    /// The buffer is new (grown): the whole of it is written.
+    fresh: bool,
+}
+
+/// One pose slot: the uniform offset alignment every adapter honours.
+const MODEL_STRIDE: u64 = 256;
+
+fn model_binding(device: &wgpu::Device, layout: &wgpu::BindGroupLayout, buf: &wgpu::Buffer, label: &str) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some(label),
+        layout,
+        entries: &[wgpu::BindGroupEntry {
+            binding: 0,
+            resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                buffer: buf,
+                offset: 0,
+                size: std::num::NonZeroU64::new(std::mem::size_of::<ModelParams>() as u64),
+            }),
+        }],
+    })
+}
+
+fn model_buffer(device: &wgpu::Device, slots: u32, label: &str) -> wgpu::Buffer {
+    device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some(label),
+        size: slots as u64 * MODEL_STRIDE,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    })
+}
+
+impl ModelArena {
+    fn new(device: &wgpu::Device, layout: &wgpu::BindGroupLayout, capacity: u32) -> Self {
+        let capacity = capacity.max(16);
+        let buf = model_buffer(device, capacity, "solid poses");
+        let bind = model_binding(device, layout, &buf, "solid poses");
+        Self { buf, bind, capacity, data: vec![0; capacity as usize * MODEL_STRIDE as usize], free: Vec::new(), next: 0, dirty: None, fresh: true }
+    }
+
+    fn alloc(&mut self) -> u32 {
+        self.free.pop().unwrap_or_else(|| {
+            self.next += 1;
+            self.next - 1
+        })
+    }
+
+    fn release(&mut self, slot: u32) {
+        self.free.push(slot);
+    }
+
+    fn set(&mut self, slot: u32, pose: Option<&[f32; 16]>) {
+        let need = (slot as usize + 1) * MODEL_STRIDE as usize;
+        if self.data.len() < need {
+            self.data.resize(need.next_power_of_two(), 0);
+        }
+        let at = slot as usize * MODEL_STRIDE as usize;
+        let params = ModelParams::of(pose);
+        let bytes = bytemuck::bytes_of(&params);
+        self.data[at..at + bytes.len()].copy_from_slice(bytes);
+        let (lo, hi) = self.dirty.unwrap_or((at, at + bytes.len()));
+        self.dirty = Some((lo.min(at), hi.max(at + bytes.len())));
+    }
+
+    fn offset(slot: u32) -> u32 {
+        (slot as u64 * MODEL_STRIDE) as u32
+    }
+
+    /// Put what changed on the GPU: one write (or a new, larger buffer).
+    fn flush(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, layout: &wgpu::BindGroupLayout) {
+        let slots = (self.data.len() / MODEL_STRIDE as usize) as u32;
+        if slots > self.capacity {
+            self.capacity = slots;
+            self.buf = model_buffer(device, slots, "solid poses");
+            self.bind = model_binding(device, layout, &self.buf, "solid poses");
+            self.fresh = true;
+        }
+        if std::mem::take(&mut self.fresh) {
+            queue.write_buffer(&self.buf, 0, &self.data[..self.capacity as usize * MODEL_STRIDE as usize]);
+        } else if let Some((lo, hi)) = self.dirty {
+            let hi = hi.next_multiple_of(4);
+            queue.write_buffer(&self.buf, lo as u64, &self.data[lo..hi]);
+        }
+        self.dirty = None;
+    }
+}
+
+/// A single identity pose for what the solid pipelines draw that is not a
+/// solid's own buffers (bound at offset 0).
+struct IdentityModel {
+    _buf: wgpu::Buffer,
+    bind: wgpu::BindGroup,
+}
+
+impl IdentityModel {
+    fn new(device: &wgpu::Device, queue: &wgpu::Queue, layout: &wgpu::BindGroupLayout) -> Self {
+        let buf = model_buffer(device, 1, "identity pose");
+        queue.write_buffer(&buf, 0, bytemuck::bytes_of(&ModelParams::of(None)));
+        let bind = model_binding(device, layout, &buf, "identity pose");
+        Self { _buf: buf, bind }
+    }
 }
 
 #[repr(C)]
@@ -191,6 +343,11 @@ struct EdgeRange {
 
 struct GpuSolid {
     revision: u64,
+    /// The shape revision these buffers were built from (`shape_revision`, or
+    /// the revision itself for an unposed display): a display of the same
+    /// shape is re-posed by rewriting `vertex_buf`, `edge_buf` and `point_buf`.
+    shape: u64,
+    vertex_count: u32,
     vertex_buf: wgpu::Buffer,
     index_buf: wgpu::Buffer,
     /// Line-list indices for the wireframe view (each triangle → its 3 edges).
@@ -217,6 +374,13 @@ struct GpuSolid {
     /// Selected/hovered face boundary outline segments (cache keyed by the
     /// emphasis generation).
     boundary: Option<BoundaryBuf>,
+    /// This solid's slot in its scene's [`ModelArena`] (the pose its buffers
+    /// are drawn through; identity unless posed).
+    model_slot: u32,
+    /// The buffers hold the geometry of `shape` itself, as uploaded: a pose
+    /// of that shape is then a matrix write. False once a re-pose rewrote
+    /// them (a drag), until the next upload.
+    holds_shape: bool,
 }
 
 struct BoundaryBuf {
@@ -225,6 +389,11 @@ struct BoundaryBuf {
     buf: Option<wgpu::Buffer>,
     count: u32,
 }
+
+/// The Work part context tint: assembly components around the part being
+/// edited are drawn in this colour, alpha-blended without depth writes and
+/// without pick handles.
+pub const WORK_PART_CONTEXT_RGBA: [f32; 4] = [0.45, 0.55, 0.65, 0.22];
 
 /// A scene uploaded to GPU buffers, retained across frames; sync with
 /// [`RenderCore::sync_scene`].
@@ -238,6 +407,12 @@ pub struct GpuScene {
     /// Count of solid (re)uploads (R10 observability: a reused solid must NOT
     /// bump this across a sync).
     uploads: u64,
+    /// Count of in-place re-poses (positions rewritten, nothing rebuilt).
+    reposes: u64,
+    /// Count of poses drawn through a matrix (a 128-byte write, no vertex).
+    pose_writes: u64,
+    /// Every solid's pose, one buffer (made on the first sync).
+    models: Option<ModelArena>,
 }
 
 impl GpuScene {
@@ -245,6 +420,18 @@ impl GpuScene {
     /// reused-buffer fast path).
     pub fn upload_count(&self) -> u64 {
         self.uploads
+    }
+
+    /// Total in-place re-poses since creation (a rigidly moved solid whose
+    /// buffers were rewritten rather than rebuilt).
+    pub fn repose_count(&self) -> u64 {
+        self.reposes
+    }
+
+    /// Total poses taken by a matrix write alone (the buffers kept the
+    /// shape's geometry and nothing of it was rewritten).
+    pub fn pose_write_count(&self) -> u64 {
+        self.pose_writes
     }
 }
 
@@ -311,7 +498,19 @@ pub struct RenderCore {
     globals_buf: wgpu::Buffer,
     globals_bind: wgpu::BindGroup,
     style_layout: wgpu::BindGroupLayout,
+    /// Group 2 of the solid pipelines: a solid's pose in its scene's
+    /// [`ModelArena`], at a dynamic offset.
+    model_layout: wgpu::BindGroupLayout,
+    /// Bound for whatever the solid pipelines draw that is not a solid's own
+    /// buffers (face boundaries, the world axes).
+    identity_model: IdentityModel,
     mesh_pipeline: wgpu::RenderPipeline,
+    context_pipeline: wgpu::RenderPipeline,
+    context_style: StyleBuf,
+    /// A selected / hovered context face: the selection colours, still
+    /// translucent (the context pass blends without depth writes).
+    context_selected: StyleBuf,
+    context_hovered: StyleBuf,
     wire_pipeline: wgpu::RenderPipeline,
     edge_visible_pipeline: wgpu::RenderPipeline,
     edge_hidden_pipeline: wgpu::RenderPipeline,

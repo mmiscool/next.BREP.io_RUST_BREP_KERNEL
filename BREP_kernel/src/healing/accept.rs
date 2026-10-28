@@ -2225,7 +2225,7 @@ const MAXIMUM_CROSSING_PIECES: usize = 8;
 /// * A crossing whose carriers' intersection does not cut BOTH trims. Then the
 ///   mesh crossing is not a curve the faces share and there is nothing to split
 ///   along.
-/// * More pieces than [`MAXIMUM_CROSSING_PIECES`], because every candidate drop
+/// * More pieces than `MAXIMUM_CROSSING_PIECES`, because every candidate drop
 ///   is rebuilt in full and the enumeration has to run to the end rather than
 ///   be sampled.
 /// * Any split whose reassembly does not come back SOUND. Every way of dropping
@@ -2255,8 +2255,8 @@ const MAXIMUM_CROSSING_PIECES: usize = 8;
 /// NEW configuration has no room for — a bore's exit ring still recorded on the
 /// top face after the exit has migrated onto the side. Neither is material this
 /// drop ran past; both are held by nothing the drop keeps, and keeping either
-/// cannot close. [`fragment_is_detached`] retires the one the fragmenter
-/// returns as its own island and [`holds_only_stale_loops`] the one it returns
+/// cannot close. `fragment_is_detached` retires the one the fragmenter
+/// returns as its own island and `holds_only_stale_loops` the one it returns
 /// as a hole loop that has left its face, and the ledger says a repair retired
 /// something rather than leaving it to be read off the cell counts.
 ///
@@ -2265,7 +2265,7 @@ const MAXIMUM_CROSSING_PIECES: usize = 8;
 /// times is three faces along one curve, which is not a body either, and the
 /// assembly does not refuse it — it puts the third face on a shell of its own
 /// and every floor in this repository then passes the result.
-/// [`over_used_edge`] refuses that candidate where the third use still exists,
+/// `over_used_edge` refuses that candidate where the third use still exists,
 /// which is here. It is what stopped the turned-bore migration returning a body
 /// 23% out on area.
 pub fn resolve_face_crossing(solid: &BrepSolid) -> Result<BrepSolid, KernelRefusal> {

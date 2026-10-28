@@ -65,7 +65,7 @@ pub(crate) struct FragmentProfile {
 impl FragmentProfile {
     pub(crate) fn new() -> Self {
         Self {
-            enabled: std::env::var("BREP_PROFILE").is_ok(),
+            enabled: crate::imprint::profile_enabled(),
             ..Self::default()
         }
     }
@@ -95,9 +95,9 @@ impl FragmentProfile {
         if !self.enabled {
             return;
         }
-        eprintln!("fragment.scope operand={operand} faces={} box_candidates={} arranged={} regions={} far_arranged={} far_regions={} separated={} uncut_probes={}", self.faces, self.box_candidates, self.arranged_faces, self.region_faces, self.far_arranged, self.far_regions, self.separated_faces, self.uncut_probe_faces);
+        crate::imprint::profile_emit(format_args!("fragment.scope operand={operand} faces={} box_candidates={} arranged={} regions={} far_arranged={} far_regions={} separated={} uncut_probes={}", self.faces, self.box_candidates, self.arranged_faces, self.region_faces, self.far_arranged, self.far_regions, self.separated_faces, self.uncut_probe_faces));
         let ms = |d: Duration| d.as_secs_f64() * 1_000.0;
-        eprintln!(
+        crate::imprint::profile_emit(format_args!(
             "fragment.profile operand={operand} faces={} cut_faces={} untouched={:.2} setup={:.2} hints={:.2} boundary={:.2} cuts={:.2} dedup_bridge={:.2} arrange={:.2} regions={:.2} rescue={:.2} loop_split_faces={} loop_split_declined={} loop_split={:.2} slowest={:?}",
             self.faces,
             self.cut_faces,
@@ -114,6 +114,6 @@ impl FragmentProfile {
             self.loop_split_declined,
             ms(self.loop_split),
             self.slowest.iter().map(|(id, ms)| format!("{id}:{ms:.2}")).collect::<Vec<_>>(),
-        );
+        ));
     }
 }

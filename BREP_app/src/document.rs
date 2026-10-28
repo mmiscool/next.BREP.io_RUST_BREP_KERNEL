@@ -6,12 +6,16 @@
 //! documents are pumped each frame, so switching tabs cannot redirect a pending
 //! result to another document. Each open document retains its runner and scene.
 //!
-//! Display settings are shared across tabs by [`carry_settings`]; workbench
+//! Display settings are shared across tabs by `carry_settings`; workbench
 //! selection belongs to each document. A new engine initially inherits the
 //! current workbench, which a loaded document can override.
 
 use brep_render::engine_state::EngineState;
 
+pub mod cam;
+pub mod live_link;
+pub mod owned_save;
+pub mod work_part;
 pub mod ecad;
 
 /// Builds a fresh engine for a new document — the platform runner, the viewcube,
@@ -84,9 +88,41 @@ pub struct Document {
     untitled: u32,
     /// PLM write permission is independent of editing the session copy.
     plm_save_access: Option<Access>,
+    /// The PLM workspace folder `(id, name)` this tab was opened from (a link
+    /// in the workspace panel), for this session: the parts its Save makes
+    /// PLM items for are linked there. `None`: opened another way, so the
+    /// items go to the top of the workspace.
+    plm_folder: Option<(String, String)>,
+    /// A hash of the stored text this tab was opened from (or last reloaded
+    /// from): while the store still holds those bytes, nobody has saved it
+    /// since, and there is nothing to take — see [`Self::holds_stored`].
+    opened_from: Option<u64>,
     /// The model request JSON as of the last New / Open / Save — the baseline
     /// the dirty flag compares the live history against.
     saved_signature: Option<String>,
+    /// The baseline's top-level parts library as `{entry: (sourceKey,
+    /// sourceSignature)}`, taken from the engine whenever the baseline is (a
+    /// handful of entries, where parsing `saved_signature` is the whole
+    /// document); `None` when the baseline came from elsewhere, so
+    /// [`Self::saved_sources`] parses it.
+    saved_sources: Option<SavedSources>,
+    /// Moves every time `saved_signature` is replaced (a cache key for what
+    /// is derived from the baseline).
+    baseline_generation: u64,
+    /// [`Self::content_key`] when the baseline was taken from the document
+    /// itself (`None` when it came from elsewhere): while the key is unmoved,
+    /// the document IS its baseline.
+    baseline_content: Option<ContentKey>,
+    /// While the document is as it was opened, what the runs of the open write
+    /// back is part of the open: see [`Document::settle_open_runs`]. `None`
+    /// once the user edits, or once anything else writes the document.
+    settle: Option<Settle>,
+    /// After a write that discarded the user's edits (`Take their version`),
+    /// the runs it causes re-solve the document back towards its clean
+    /// baseline, but not to the same bits: see [`Document::converge_runs`].
+    /// `None` once the user edits, once it converged, or after
+    /// [`CONVERGE_RUNS`] runs.
+    converge: Option<(Settle, u32)>,
     /// The cached tab-strip dirty dot. See [`Document::dirty_marker`] for why
     /// this is not simply `is_dirty()`.
     dirty_marker: bool,
@@ -111,13 +147,13 @@ pub struct Document {
     /// document ([`ecad::BlockSync`]).
     pub ecad_blocks: [ecad::BlockSync; 4],
     pub ecad_parts_revision: Option<u64>,
-    /// The broken-reference lines [`crate::panels::ecad_parts::sync`] has
+    /// The broken-reference lines `crate::panels::ecad_parts::sync` has
     /// already put in front of the user. A device whose part is missing is a
     /// STANDING state and the revision bumps on every edit, so without this it
     /// would toast on every keystroke — the same rule
     /// [`ecad::BlockSync::unreported`] keeps for an UNLINKED component.
     pub ecad_parts_reported: Vec<String>,
-    /// What [`crate::panels::ecad_parts::follow_occurrences`] last saw of the
+    /// What `crate::panels::ecad_parts::follow_occurrences` last saw of the
     /// assembly's occurrences; `None` until the first frame looks.
     pub ecad_occurrences: Option<crate::panels::ecad_parts::OccurrenceMark>,
     /// The parts-library entries whose saved part has moved on since this
@@ -132,6 +168,10 @@ pub struct Document {
     /// The history's refused-edit count as of the last
     /// [`Document::take_refused`], so each refusal is told once.
     refused_seen: u64,
+    /// The [`Document::edit_key`] and baseline generation the
+    /// `insertedCopies` block was last brought up to date at
+    /// (`owned_save::note_inserted_copies`).
+    pub(crate) inserted_noted: Option<((u64, u64), u64)>,
 }
 
 /// What the dirty flag compares: the saved document ([`EngineState::history_request_json`])
@@ -148,8 +188,120 @@ pub struct Document {
 /// rather than by parsing that again: the dot recomputes this on every run-moving
 /// edit, and a second parse of a megabyte assembly doubles it. A test holds the two
 /// together (`the_signature_is_the_saved_document_less_its_workbench`).
+/// A parts library's top-level entries as `{entry: (sourceKey, sourceSignature)}`.
+pub(crate) type SavedSources = std::collections::HashMap<String, (String, String)>;
+
+fn sources_of(library: &serde_json::Value) -> SavedSources {
+    library
+        .as_object()
+        .map(|entries| {
+            entries
+                .iter()
+                .map(|(name, entry)| {
+                    let field = |key: &str| entry[key].as_str().unwrap_or_default().to_string();
+                    (name.clone(), (field("sourceKey"), field("sourceSignature")))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn raw_hash(text: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    text.hash(&mut hasher);
+    hasher.finish()
+}
+
 fn signature(engine: &EngineState) -> String {
     signature_without(engine, None)
+}
+
+/// What [`Document::settle_open_runs`] last saw: the user's edit serial at the
+/// clean baseline, and the applied-run generation and history revision at the
+/// last check.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Settle {
+    serial: u64,
+    generation: u64,
+    revision: u64,
+}
+
+impl Settle {
+    fn of(engine: &EngineState) -> Self {
+        Self {
+            serial: engine.history.edit_serial(),
+            generation: engine.applied_generation(),
+            revision: engine.history.revision(),
+        }
+    }
+}
+
+/// What the document holds: its runs and edits ([`Document::edit_key`]) and
+/// its object metadata, which moves neither.
+type ContentKey = ((u64, u64), u64);
+
+fn content_key(engine: &EngineState) -> ContentKey {
+    ((engine.applied_generation(), engine.history_revision()), engine.metadata.stamp())
+}
+
+/// How many applied runs [`Document::converge_runs`] watches.
+const CONVERGE_RUNS: u32 = 16;
+/// Relative tolerance of [`nearly_equal`] (absolute below 1).
+const CONVERGE_TOLERANCE: f64 = 1e-6;
+
+/// The document keys [`Document::converge_runs`] leaves out of its compare:
+/// ONLY keys whose value in the history never reaches a saved file, because
+/// the saved form (`EngineState::history_request_json`) overwrites them from
+/// the session: the rendered preview, and the active workbench (stamped into
+/// the history by any write-back of that form, e.g. a Work part's return).
+/// Adding a key here lets a difference in it read clean, so a new entry needs
+/// the same argument.
+const CONVERGE_DERIVED_DOCUMENT_KEYS: &[&str] = &["thumbnail", "workbench"];
+/// The embedded-copy keys it leaves out, at every depth, on the same terms:
+/// the copy's cached geometry, which a refresh blanks and the next run re-heals.
+const CONVERGE_DERIVED_COPY_KEYS: &[&str] = &["snapshot"];
+
+/// `document` without [`CONVERGE_DERIVED_DOCUMENT_KEYS`] and, on every
+/// embedded copy, [`CONVERGE_DERIVED_COPY_KEYS`]. Everything else is compared.
+fn without_derived(mut document: serde_json::Value) -> serde_json::Value {
+    fn strip(document: &mut serde_json::Value) {
+        if let Some(entries) = document.get_mut("partsLibrary").and_then(serde_json::Value::as_object_mut) {
+            for entry in entries.values_mut() {
+                if let Some(entry) = entry.as_object_mut() {
+                    for key in CONVERGE_DERIVED_COPY_KEYS {
+                        entry.remove(*key);
+                    }
+                }
+                strip(&mut entry["document"]);
+            }
+        }
+    }
+    if let Some(object) = document.as_object_mut() {
+        for key in CONVERGE_DERIVED_DOCUMENT_KEYS {
+            object.remove(*key);
+        }
+    }
+    strip(&mut document);
+    document
+}
+
+/// `a` and `b` alike but for floating-point numbers within
+/// [`CONVERGE_TOLERANCE`]. Keys, strings, booleans and integers (counts, ids)
+/// compare exactly.
+fn nearly_equal(a: &serde_json::Value, b: &serde_json::Value) -> bool {
+    use serde_json::Value;
+    match (a, b) {
+        (Value::Number(x), Value::Number(y)) if x.is_f64() && y.is_f64() => match (x.as_f64(), y.as_f64()) {
+            (Some(x), Some(y)) => (x - y).abs() <= CONVERGE_TOLERANCE * x.abs().max(y.abs()).max(1.0),
+            _ => false,
+        },
+        (Value::Array(x), Value::Array(y)) => x.len() == y.len() && x.iter().zip(y).all(|(x, y)| nearly_equal(x, y)),
+        (Value::Object(x), Value::Object(y)) => {
+            x.len() == y.len() && x.iter().all(|(k, v)| y.get(k).is_some_and(|w| nearly_equal(v, w)))
+        }
+        _ => a == b,
+    }
 }
 
 /// The saved-content signature with one document block left out — the
@@ -160,13 +312,62 @@ fn signature_without(engine: &EngineState, without: Option<&str>) -> String {
         serde_json::from_str(&engine.history.request_json()).unwrap_or_else(|_| serde_json::json!({}));
     if let Some(object) = document.as_object_mut() {
         if let Some(key) = without {
-            object.remove(key);
+            // In order, as the document drops it (`set_document_block_no_undo`):
+            // `remove` would move the last key into the gap.
+            object.shift_remove(key);
         }
         if !engine.metadata.is_empty() {
             object.insert("metadata".into(), engine.metadata.to_json());
         }
     }
+    without_run_record(&mut document);
+    if let Some(object) = document.as_object_mut() {
+        object.shift_remove(owned_save::INSERTED_COPIES_BLOCK);
+    }
     document.to_string()
+}
+
+/// Drop what the mate solver writes into each assembly constraint as the
+/// record of its last RUN — `persistentData.error`, `.kernel` (residual,
+/// iterations, rank, …) and `.message`, which quotes the residual — so an
+/// edit and its undo compare equal although the re-solve after the undo
+/// started from the solved pose and took 0 iterations instead of 4. What a
+/// solve decides (`status`, `satisfied`, first-solve choices) still counts.
+/// The library's saved rows go too ([`without_saved_rows`]).
+/// Comparison only: the saved file keeps the record.
+pub(crate) fn without_run_record(document: &mut serde_json::Value) {
+    without_saved_rows(document);
+    let Some(constraints) = document
+        .get_mut("assembly")
+        .and_then(|assembly| assembly.get_mut("constraints"))
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return;
+    };
+    for constraint in constraints {
+        if let Some(record) = constraint.get_mut("persistentData").and_then(serde_json::Value::as_object_mut) {
+            for key in ["error", "kernel", "message"] {
+                record.remove(key);
+            }
+        }
+    }
+}
+
+/// Drop each library entry's `nestedRows`, at every depth: the rows of the
+/// run that made the entry's snapshot, which a run writes back and re-stamps
+/// (the kernel's `SavedRows`), the same kind of record as the solver's.
+fn without_saved_rows(document: &mut serde_json::Value) {
+    let Some(entries) = document.get_mut("partsLibrary").and_then(serde_json::Value::as_object_mut) else {
+        return;
+    };
+    for entry in entries.values_mut() {
+        if let Some(object) = entry.as_object_mut() {
+            object.shift_remove("nestedRows");
+        }
+        if let Some(child) = entry.get_mut("document") {
+            without_saved_rows(child);
+        }
+    }
 }
 
 /// One [`ecad::BlockSync`] per eCAD block, none of them pulled yet.
@@ -191,11 +392,21 @@ impl Document {
     /// the first edit marks it dirty.
     pub fn new(engine: EngineState) -> Self {
         let saved_signature = Some(signature(&engine));
+        let baseline_content = Some(content_key(&engine));
+        let saved_sources = Some(sources_of(engine.history.parts_library()));
+        let settle = Some(Settle::of(&engine));
         Self {
             engine,
             name: None,
             plm_save_access: None,
+            plm_folder: None,
+            opened_from: None,
+            baseline_content,
             saved_signature,
+            saved_sources,
+            baseline_generation: 0,
+            settle,
+            converge: None,
             dirty_marker: false,
             marker_key: None,
             dirty_checks: 0,
@@ -209,6 +420,7 @@ impl Document {
             ecad_outdated: Vec::new(),
             ecad_update_requested: false,
             refused_seen: 0,
+            inserted_noted: None,
         }
     }
 
@@ -222,7 +434,14 @@ impl Document {
             engine,
             name,
             plm_save_access: None,
+            plm_folder: None,
+            opened_from: None,
             saved_signature: None,
+            saved_sources: None,
+            baseline_generation: 0,
+            baseline_content: None,
+            settle: None,
+            converge: None,
             dirty_marker: true,
             marker_key: None,
             dirty_checks: 0,
@@ -236,6 +455,7 @@ impl Document {
             ecad_outdated: Vec::new(),
             ecad_update_requested: false,
             refused_seen: 0,
+            inserted_noted: None,
         }
     }
 
@@ -314,11 +534,161 @@ impl Document {
     /// Save, or a `?loadModel=` boot-load).
     pub fn mark_clean(&mut self) {
         self.saved_signature = Some(signature(&self.engine));
+        self.saved_sources = Some(sources_of(self.engine.history.parts_library()));
+        self.baseline_generation += 1;
+        self.baseline_content = Some(content_key(&self.engine));
         self.dirty_marker = false;
         self.marker_key = Some(self.edit_key());
+        self.settle = Some(Settle::of(&self.engine));
+    }
+
+    /// Keep taking what the open's runs write back as part of the open, from
+    /// here (a check on open that wrote the document itself and absorbed that
+    /// write, [`Self::absorb_open_write`], re-arms so the run it causes is
+    /// absorbed too).
+    pub(crate) fn arm_open_settle(&mut self) {
+        self.settle = Some(Settle::of(&self.engine));
+    }
+
+    /// A document's first runs after it is opened write back into it: the
+    /// first solve of a mate stored unsolved (the pose and the solve's
+    /// status), and the snapshots of embedded parts stored without one (the
+    /// PLM import blanks them). None of that is the user's change, so closing
+    /// the document must not ask to save it.
+    ///
+    /// Called once a frame. While the user has not edited the document since
+    /// it was opened (its edit serial is unchanged), a run that has APPLIED
+    /// moves the clean baseline to the document as that run left it. The rule
+    /// is conservative where it cannot tell: the document changing while no
+    /// run applied (a write that took no undo step, which could be the user's)
+    /// stops the settling for good, and the document stays as dirty as it is.
+    /// The worst case is one needless save prompt, never an unsaved edit that
+    /// reads saved.
+    pub fn settle_open_runs(&mut self) {
+        let Some(last) = self.settle else {
+            return;
+        };
+        let now = Settle::of(&self.engine);
+        if now.serial != last.serial || (now.generation == last.generation && now.revision != last.revision) {
+            self.settle = None;
+            return;
+        }
+        if now.generation == last.generation || self.engine.run_pending() {
+            return;
+        }
+        if now.revision != last.revision {
+            self.saved_signature = Some(signature(&self.engine));
+            self.saved_sources = Some(sources_of(self.engine.history.parts_library()));
+            self.baseline_generation += 1;
+            self.baseline_content = Some(content_key(&self.engine));
+            self.marker_key = None;
+        }
+        self.settle = Some(now);
+    }
+
+    /// Watch the runs a write that discarded the user's edits causes: see
+    /// [`Self::converge_runs`].
+    pub(crate) fn arm_converge(&mut self) {
+        self.converge = Some((Settle::of(&self.engine), 0));
+    }
+
+    /// Called once a frame. After `Self::arm_converge`, once a run has
+    /// applied and the user has not edited since: when the document equals its
+    /// clean baseline to within `CONVERGE_TOLERANCE` in every number (mates
+    /// re-solved the poses the discarded edit had moved, to ~1e-9), the solved
+    /// document becomes the baseline, as a Save's would. A real change is far
+    /// outside the tolerance and leaves the tab changed.
+    pub fn converge_runs(&mut self) {
+        let Some((last, runs)) = self.converge else {
+            return;
+        };
+        let now = Settle::of(&self.engine);
+        if now.serial != last.serial || runs >= CONVERGE_RUNS {
+            self.converge = None;
+            return;
+        }
+        if now.generation == last.generation || self.engine.run_pending() {
+            return;
+        }
+        let current = signature(&self.engine);
+        let near = self.saved_signature.as_deref().is_some_and(|saved| {
+            match (serde_json::from_str::<serde_json::Value>(saved), serde_json::from_str::<serde_json::Value>(&current)) {
+                (Ok(saved), Ok(current)) => nearly_equal(&without_derived(saved), &without_derived(current)),
+                _ => false,
+            }
+        });
+        if near {
+            if self.saved_signature.as_deref() != Some(current.as_str()) {
+                self.saved_signature = Some(current);
+                self.saved_sources = Some(sources_of(self.engine.history.parts_library()));
+                self.baseline_generation += 1;
+                self.baseline_content = Some(content_key(&self.engine));
+                self.marker_key = None;
+            }
+            self.converge = None;
+        } else {
+            self.converge = Some((now, runs + 1));
+        }
     }
 
     pub(crate) fn save_signature(&self) -> String { signature(&self.engine) }
+
+    /// The workspace folder this tab was opened from ([`Self::plm_folder`]'s field).
+    pub(crate) fn plm_folder(&self) -> Option<&(String, String)> {
+        self.plm_folder.as_ref()
+    }
+
+    /// The tab was opened (or reloaded) from the stored `text`.
+    pub(crate) fn note_opened_from(&mut self, text: &str) {
+        self.opened_from = Some(raw_hash(text));
+    }
+
+    /// Whether the store's `text` is still the text this tab was opened from:
+    /// a byte compare, not the document's, which the open's own runs have
+    /// written back into (snapshots, a first mate solve).
+    pub(crate) fn holds_stored(&self, text: &str) -> bool {
+        self.opened_from == Some(raw_hash(text))
+    }
+
+    pub(crate) fn set_plm_folder(&mut self, folder: Option<(String, String)>) {
+        self.plm_folder = folder;
+    }
+
+    /// The clean baseline's top-level parts library, `{entry: (sourceKey,
+    /// sourceSignature)}` (empty for a recovered, never-saved tab), without
+    /// parsing the saved document when the baseline was taken from the engine.
+    pub(crate) fn saved_sources(&self) -> SavedSources {
+        match &self.saved_sources {
+            Some(sources) => sources.clone(),
+            None => self
+                .saved_signature
+                .as_deref()
+                .and_then(|saved| serde_json::from_str::<serde_json::Value>(saved).ok())
+                .map(|saved| sources_of(&saved["partsLibrary"]))
+                .unwrap_or_default(),
+        }
+    }
+
+    /// The clean baseline as a document (`None` for a recovered, never-saved
+    /// one): what this tab last opened or saved.
+    pub(crate) fn saved_document(&self) -> Option<serde_json::Value> {
+        serde_json::from_str(self.saved_signature.as_deref()?).ok()
+    }
+
+    /// Take `baseline` (what [`Self::saved_document`] returned, changed the
+    /// way the document itself just was) as the clean baseline: a write that
+    /// is not the user's change adds no unsaved change, and the user's own
+    /// unsaved changes stay unsaved. `key` is [`Self::edit_key`] before the write.
+    pub(crate) fn rebase_saved_document(&mut self, baseline: &serde_json::Value, key: (u64, u64)) {
+        self.saved_signature = Some(baseline.to_string());
+        // Not the engine's own state: the sources are read from it on demand.
+        self.saved_sources = None;
+        self.baseline_generation += 1;
+        self.baseline_content = None;
+        if self.marker_key == Some(key) {
+            self.marker_key = Some(self.edit_key());
+        }
+    }
 
     /// [`Self::save_signature`] of the document with one block left out: what a
     /// copy saved without that block has as its clean baseline.
@@ -328,14 +698,32 @@ impl Document {
 
     pub(crate) fn mark_saved_signature(&mut self, saved: String) {
         self.saved_signature = Some(saved);
+        self.saved_sources = None;
+        self.baseline_generation += 1;
+        self.baseline_content = None;
         self.marker_key = None;
         self.refresh_dirty_marker();
+    }
+
+    /// Restored from crash recovery and not saved since: it has no clean
+    /// baseline, and what differs from its stored document is the user's
+    /// unsaved work, not an older copy to refresh.
+    pub fn is_recovered(&self) -> bool {
+        self.saved_signature.is_none()
+    }
+
+    /// Its Save did not reach the store after all (a write-behind backend
+    /// reported the failure once `write` had returned `Ok`): unsaved again, so
+    /// the close prompt asks and Save writes it. A later Save that lands takes
+    /// a new baseline as any Save does.
+    pub(crate) fn mark_write_failed(&mut self) {
+        self.mark_saved_signature(String::new());
     }
 
     /// Dirty = the live model differs from the last saved/opened baseline.
     /// (Rolling the history does NOT change the request document, so navigating
     /// steps never marks dirty — only real edits/add/delete/reorder do.)
-    /// The workbench the document is in is not part of it ([`signature`]).
+    /// The workbench the document is in is not part of it (`signature`).
     ///
     /// HONEST but not free: it serializes the whole request document, which for
     /// an assembly carrying an embedded parts library is megabytes. Every place
@@ -358,11 +746,17 @@ impl Document {
     /// every write to the SAVED document moves, the `partsLibrary` block
     /// included (it is held in a field beside the document and both its setters
     /// tick the revision themselves). An object-metadata change (a workbench
-    /// change is not an unsaved change at all, [`signature`]) moves neither and can
+    /// change is not an unsaved change at all, `signature`) moves neither and can
     /// leave the dot one edit behind: a marker briefly optimistic, never a lost
     /// edit, since [`Self::is_dirty`] is recomputed honestly at the close prompt.
     pub fn edit_key(&self) -> (u64, u64) {
         (self.engine.applied_generation(), self.engine.history_revision())
+    }
+
+    /// Whether the document is still the baseline it took from itself (an
+    /// Open, a Save, or the open's runs settling).
+    pub(crate) fn is_its_baseline(&self) -> bool {
+        self.baseline_content == Some(content_key(&self.engine))
     }
 
     /// The cached dirty flag the tab strip draws. Recomputing it serializes
@@ -408,6 +802,14 @@ impl Document {
     /// open stays unsaved. So the open changes nothing a document that needed no
     /// bringing up would show — the honest [`Self::is_dirty`] and the dot alike.
     pub fn absorb_open_write(&mut self, before: &serde_json::Value, after: &serde_json::Value, key: (u64, u64)) {
+        // Compared as the baseline was taken ([`signature`]): without the
+        // run's records, or a block holding saved rows never matches.
+        let compared = |document: &serde_json::Value| {
+            let mut document = document.clone();
+            without_run_record(&mut document);
+            document
+        };
+        let (before, after) = (&compared(before), &compared(after));
         let rebased = self.saved_signature.as_deref().and_then(|saved| {
             let mut base: serde_json::Value = serde_json::from_str(saved).ok()?;
             let (base_map, before, after) = (base.as_object_mut()?, before.as_object()?, after.as_object()?);
@@ -418,13 +820,16 @@ impl Document {
                 }
                 match is {
                     Some(value) => base_map.insert(name.clone(), value.clone()),
-                    None => base_map.remove(name),
+                    None => base_map.shift_remove(name),
                 };
             }
             Some(base.to_string())
         });
         if let Some(rebased) = rebased {
             self.saved_signature = Some(rebased);
+            self.saved_sources = None;
+            self.baseline_generation += 1;
+            self.baseline_content = None;
         }
         if self.marker_key == Some(key) {
             self.marker_key = Some(self.edit_key());
@@ -452,6 +857,29 @@ impl Document {
 /// [`Documents::engine_mut`] is infallible and the shell never has to render a
 /// "no document" state that would be an empty viewport with extra steps.
 pub struct Documents {
+    work_part: Option<work_part::WorkPart>,
+    /// An ancestor sub-assembly to make the Work part once its assembly's run
+    /// lands: `(assembly tab id, component path, mode)`
+    /// ([`Documents::work_part_up_to`]).
+    work_part_next: Option<(u64, String, work_part::WorkPartMode)>,
+    /// The Work part readback's `context` map (every assembly solid outside
+    /// the work occurrence, in assembly coordinates), by (component path,
+    /// host scene fingerprint): automation reads it every frame.
+    work_part_context: std::cell::RefCell<Option<((String, u64), serde_json::Value)>>,
+    /// [`Documents::owned_modified_keys_of`]'s last answer: `(tab id, edit
+    /// key, baseline length)` and the keys.
+    owned_cache: std::cell::RefCell<Option<owned_save::OwnedCacheKey>>,
+    /// [`Documents::synced_signatures`]'s last answer, by (tab id, baseline).
+    synced_cache: std::cell::RefCell<Option<owned_save::SyncedCache>>,
+    /// The signature each entry added after a tab's baseline was first seen
+    /// with, by ((tab id, baseline generation), entry name).
+    learned_signatures: std::cell::RefCell<std::collections::HashMap<((u64, u64), String), String>>,
+    /// The newest state of every source open documents hold ([`live_link`]).
+    live: live_link::LiveLinks,
+    /// The store's spelling of a document identity
+    /// ([`crate::store::ModelStore::canonicalizer`]): a tab and a `sourceKey`
+    /// naming one file the same way.
+    canon: crate::store::Canonicalizer,
     open: Vec<Document>,
     active: usize,
     /// How a new tab's engine is built (platform runner + persisted settings).
@@ -464,6 +892,14 @@ impl Documents {
         let first = Document::fresh(new_engine(), crate::document_class::DocumentClass::Normal);
         Self {
             open: vec![first],
+            work_part: None,
+            work_part_next: None,
+            work_part_context: Default::default(),
+            owned_cache: Default::default(),
+            synced_cache: Default::default(),
+            learned_signatures: Default::default(),
+            live: Default::default(),
+            canon: std::rc::Rc::new(str::to_string),
             active: 0,
             new_engine,
         }
@@ -516,12 +952,40 @@ impl Documents {
         (camera.width, camera.height)
     }
 
+    /// The engine the user is editing: the active tab's, or — while a Work
+    /// part is edited in place in that tab — the hosted part's
+    /// ([`work_part`]). Save, the dirty dot and the tab identity stay the
+    /// tab's own ([`Self::active`], [`Self::tab_engine`]).
     pub fn engine(&self) -> &EngineState {
-        &self.open[self.active].engine
+        match self.hosted() {
+            Some(doc) => &doc.engine,
+            None => &self.open[self.active].engine,
+        }
     }
 
     pub fn engine_mut(&mut self) -> &mut EngineState {
+        if self.work_part_in_place() {
+            return &mut self.hosted_mut().unwrap().engine;
+        }
         &mut self.open[self.active].engine
+    }
+
+    /// The active TAB's own engine — the document Save writes. The same as
+    /// [`Self::engine`] except while a Work part is edited in place, when this
+    /// is the assembly.
+    pub fn tab_engine(&self) -> &EngineState {
+        &self.open[self.active].engine
+    }
+
+    pub fn tab_engine_mut(&mut self) -> &mut EngineState {
+        &mut self.open[self.active].engine
+    }
+
+    /// The identity of what the panels and viewport are drawing: the hosted
+    /// Work part's document while one is edited in place, else the active
+    /// tab's. The shell resets its document-scoped state when this changes.
+    pub fn view_id(&self) -> u64 {
+        self.hosted().map_or_else(|| self.active_id(), Document::id)
     }
 
     pub fn active(&self) -> &Document {
@@ -529,6 +993,20 @@ impl Documents {
     }
 
     pub fn active_mut(&mut self) -> &mut Document {
+        &mut self.open[self.active]
+    }
+
+    /// The document being DRAWN and edited: the hosted Work part while one is
+    /// edited in place, else the active tab ([`Self::active`] stays the tab,
+    /// for its name, dirty state and Save).
+    pub fn view(&self) -> &Document {
+        self.hosted().unwrap_or(&self.open[self.active])
+    }
+
+    pub fn view_mut(&mut self) -> &mut Document {
+        if self.work_part_in_place() {
+            return self.hosted_mut().unwrap();
+        }
         &mut self.open[self.active]
     }
 
@@ -589,19 +1067,31 @@ impl Documents {
     pub fn pump_all(&mut self) -> bool {
         use brep_render::brep_kernel::parts_library_revision;
         let mut work_in_flight = false;
+        let in_place = self.work_part_in_place();
         for index in 0..self.open.len() {
-            let background = index != self.active;
-            let doc = &self.open[index];
+            // While a Work part is edited in place, its assembly tab is pumped
+            // as a background document: the store holds the PART's library.
+            let background = index != self.active || in_place;
+            // Only a frame where something lands needs the document's own
+            // library: a run in flight is otherwise polled and left, and
+            // swapping the libraries both ways on every frame of it cost
+            // ~30 ms a frame on l500 (a Work part edit in place).
+            let doc = &mut self.open[index];
             let own_library = background
-                && (doc.engine.run_pending()
+                && (doc.engine.run_landing()
                     || doc.engine.mesh_imports_pending()
                     || doc.engine.history.ports_follow_pending());
+            let doc = &self.open[index];
             if own_library {
                 install_library_of(doc);
             }
             let revision = parts_library_revision();
             let doc = &mut self.open[index];
-            doc.engine.pump();
+            if background && !own_library && doc.engine.run_pending() {
+                doc.engine.pump_holding_runs();
+            } else {
+                doc.engine.pump();
+            }
             work_in_flight |= doc.engine.run_pending()
                 || doc.engine.queries_pending()
                 || doc.engine.mesh_imports_pending()
@@ -612,7 +1102,33 @@ impl Documents {
                 self.install_active_library();
             }
         }
+        // The hosted Work part (edited in place) is the foreground engine: the
+        // store already holds its library.
+        if let Some(doc) = self.hosted_mut() {
+            doc.engine.pump();
+            let engine = &doc.engine;
+            work_in_flight |= engine.run_pending()
+                || engine.queries_pending()
+                || engine.mesh_imports_pending()
+                || engine.step_probes_pending()
+                || engine.topology_pending()
+                || engine.sheet_lines_pending();
+        }
+        self.sync_work_part();
+        self.begin_next_work_part();
         work_in_flight
+    }
+
+    /// Compare identities the way the store does (the shell installs it).
+    pub fn set_canonicalizer(&mut self, canon: crate::store::Canonicalizer) {
+        self.canon = canon;
+        self.forget_published();
+    }
+
+    /// The tab holding the document `key` names, in the store's spelling.
+    pub fn index_of_source(&self, key: &str) -> Option<usize> {
+        let wanted = (self.canon)(key);
+        self.open.iter().position(|doc| doc.name.as_deref().is_some_and(|name| (self.canon)(name) == wanted))
     }
 
     /// The tab holding the document stored under `name`, if any.
@@ -662,9 +1178,17 @@ impl Documents {
         if index >= self.open.len() || index == self.active {
             return;
         }
+        if self.work_part.is_some() {
+            if let Err(error) = self.finish_work_part() {
+                self.engine_mut().push_notice(format!("Work part: {error}"));
+                return;
+            }
+        }
         let settings = self.open[self.active].engine.settings_json();
+        self.publish_live(self.active);
         self.active = index;
         carry_settings(&settings, &mut self.open[index].engine, false);
+        self.pull_live(index);
         self.install_active_library();
     }
 
@@ -682,7 +1206,7 @@ impl Documents {
     /// put back; an entry the store already holds unchanged is kept as it is,
     /// heal included (`install_parts_library`).
     fn install_active_library(&self) {
-        install_library_of(&self.open[self.active]);
+        install_library_of(self.hosted().unwrap_or(&self.open[self.active]));
     }
 
     /// Close tab `index`. Closing the LAST document leaves a fresh untitled one
@@ -695,6 +1219,13 @@ impl Documents {
         if index >= self.open.len() {
             return;
         }
+        if self.work_part.as_ref().is_some_and(|session| {
+            let id = self.open[index].id();
+            id == session.assembly_id || id == session.part_id
+        }) {
+            self.engine_mut().push_notice("Return to assembly before closing a Work part session document");
+            return;
+        }
         // Taken BEFORE the removal: if the closing tab was the active one, its
         // settings are the session's and must survive into whatever is shown next.
         let settings = self.open[self.active].engine.settings_json();
@@ -702,7 +1233,13 @@ impl Documents {
         // on the 800x600 default camera, so carry the live viewport size too.
         let viewport = self.viewport_size();
         let closed_active = index == self.active;
-        self.open.remove(index);
+        // A tab closed with its changes SAVED leaves them to the linked
+        // documents; one closed with them discarded does not.
+        if closed_active && !self.open[index].is_dirty() {
+            self.publish_live(index);
+        }
+        let closed = self.open.remove(index);
+        self.forget_live(closed.id());
         // The replacement for a session closed down to nothing is a brand-new
         // tab, so it takes the WHOLE of the session's settings — workbench
         // included — exactly as `New` does through `spawn_engine`.
@@ -721,13 +1258,32 @@ impl Documents {
         if closed_active {
             let active = self.active;
             carry_settings(&settings, &mut self.open[active].engine, refilled);
+            self.pull_live(active);
             self.install_active_library();
         }
     }
 
     /// Refresh every tab's dirty dot (see [`Document::refresh_dirty_marker`]).
+    /// The write of document `name` failed after its Save returned: the tabs
+    /// showing it (any spelling of the same identity) read unsaved again.
+    /// Whether one did.
+    pub fn mark_write_failed(&mut self, store: &dyn crate::store::ModelStore, name: &str) -> bool {
+        let failed = store.canonical_identity(name);
+        let mut marked = false;
+        for doc in &mut self.open {
+            if doc.name().is_some_and(|n| store.canonical_identity(n) == failed) {
+                doc.mark_write_failed();
+                marked = true;
+            }
+        }
+        marked
+    }
+
     pub fn refresh_dirty_markers(&mut self) {
         for doc in &mut self.open {
+            owned_save::note_inserted_copies(doc);
+            doc.settle_open_runs();
+            doc.converge_runs();
             doc.refresh_dirty_marker();
         }
     }

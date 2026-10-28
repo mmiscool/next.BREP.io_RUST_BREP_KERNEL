@@ -11,15 +11,15 @@
 //! at a part under them selected nothing, and errors stayed up after they had
 //! been dealt with. So:
 //!
-//! - **A bounded stack.** At most [`MAX_VISIBLE`] cards are drawn; older ones
+//! - **A bounded stack.** At most `MAX_VISIBLE` cards are drawn; older ones
 //!   fold into one `+N older` chip above them.
 //! - **Repeats coalesce.** A message equal to one already up does not add a
 //!   card: that card counts it (`×3`), restarts its clock and moves to the
 //!   bottom as the newest.
 //! - **A resolved error retires.** When the document changes after a card was
 //!   raised, the card is SUPERSEDED — whatever it complained about was acted on
-//!   — and leaves once it has been up [`MIN_SHOWN`], instead of sitting out
-//!   the whole [`TTL`]. A card raised again after that change is a new
+//!   — and leaves once it has been up `MIN_SHOWN`, instead of sitting out
+//!   the whole `TTL`. A card raised again after that change is a new
 //!   complaint about the new state, and stays.
 //! - **A card eats clicks only inside itself.** Each card is its OWN area, so
 //!   the gap between two cards, and everything around the stack, is the canvas.

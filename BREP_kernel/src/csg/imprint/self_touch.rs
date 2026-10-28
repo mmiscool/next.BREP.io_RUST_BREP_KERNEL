@@ -160,10 +160,55 @@ fn closest_approach(
     Ok(best)
 }
 
+thread_local! {
+    /// [`face_self_touches`]' splits per face, as (index into the face's
+    /// non-degenerate edges, parameter), keyed by everything the scan reads:
+    /// the band's bits and, per edge in order, its degenerate flag, its two
+    /// vertices renumbered by first appearance (which pairs share a vertex,
+    /// never the ids) and its subcurve's content. The fillet's cutter
+    /// composition hands the same faces, under new ids, to imprint after
+    /// imprint (0.77 s of F9 on the sprocket report 1d179b4a).
+    static TOUCH_MEMO: std::cell::RefCell<HashMap<[u64; 2], Vec<(usize, f64)>>> = std::cell::RefCell::new(HashMap::default());
+    static TOUCH_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Drop every memoised self-touch scan (`reading_memo::clear`).
+pub(crate) fn clear_touch_memo() {
+    TOUCH_MEMO.with(|memo| memo.borrow_mut().clear());
+}
+
+/// Faces scanned (memo misses and unmemoised scans) since the thread started.
+pub(super) fn touch_scans() -> usize {
+    TOUCH_SCANS.with(|scans| scans.get())
+}
+
+/// The content key of one face's self-touch scan (see [`TOUCH_MEMO`]).
+fn touch_key(edges: &[&EdgeRecord], scans: &[EdgeScan<'_>], band: f64) -> [u64; 2] {
+    let mut lane = crate::mass_properties::TwoLane::new();
+    lane.f64(band);
+    lane.usize(edges.len());
+    let mut numbering: HashMap<u64, usize> = HashMap::default();
+    for edge in edges {
+        lane.bool(edge.degenerate);
+        for vertex in [edge.start_vertex_id, edge.end_vertex_id] {
+            let next = numbering.len();
+            lane.usize(*numbering.entry(vertex).or_insert(next));
+        }
+    }
+    lane.usize(scans.len());
+    for scan in scans {
+        crate::mass_properties::hash_curve(&mut lane, &scan.curve);
+    }
+    lane.finish()
+}
+
 /// Every self-touch of ONE face's loops, as the `(edge, parameter)` splits
 /// that mint each touch as a vertex on BOTH touching edges.  Shared by the
 /// imprint builder's per-operand pass and the solid-level entry point below
-/// so the two lanes can never scan on different terms.
+/// so the two lanes can never scan on different terms.  Served from
+/// [`TOUCH_MEMO`] when a face of the same content was scanned before; off
+/// under `BREP_SELF_TOUCH_MEMO=0`, the reading memo's hatch
+/// (`BREP_READING_MEMO=0`) and the scan's own trace (`BREP_DEBUG_SELF_TOUCH`).
 fn face_self_touches<'a>(
     operand: u8,
     face_id: u64,
@@ -180,11 +225,24 @@ fn face_self_touches<'a>(
         .filter(|edge| !edge.degenerate)
         .map(|edge| Ok(edge_scan(edge, subcurve(edge)?)))
         .collect::<Result<Vec<_>, KernelRefusal>>()?;
+    let memo = !debug
+        && crate::reading_memo::memo_on()
+        && std::env::var("BREP_SELF_TOUCH_MEMO").as_deref() != Ok("0");
+    let key = memo.then(|| touch_key(edges, &scans, band));
+    if let Some(key) = key {
+        if let Some(found) = TOUCH_MEMO.with(|memo| memo.borrow().get(&key).cloned()) {
+            crate::reading_memo::note(true);
+            return Ok(found.into_iter().map(|(index, parameter)| (scans[index].edge, parameter)).collect());
+        }
+        crate::reading_memo::note(false);
+    }
+    TOUCH_SCANS.with(|count| count.set(count.get() + 1));
     let lengths = scans
         .iter()
         .map(|scan| curve_length_rough(&scan.curve))
         .collect::<Result<Vec<_>, KernelRefusal>>()?;
     let mut splits = Vec::new();
+    let mut found: Vec<(usize, f64)> = Vec::new();
     for (index, first) in scans.iter().enumerate() {
         for (other, second) in scans.iter().enumerate().skip(index + 1) {
             if shares_a_vertex(first.edge, second.edge) || !boxes_overlap(first, second, band) {
@@ -203,7 +261,18 @@ fn face_self_touches<'a>(
             }
             splits.push((first.edge, t));
             splits.push((second.edge, u));
+            found.push((index, t));
+            found.push((other, u));
         }
+    }
+    if let Some(key) = key {
+        TOUCH_MEMO.with(|memo| {
+            let mut memo = memo.borrow_mut();
+            if memo.len() >= crate::reading_memo::capacity() {
+                memo.clear();
+            }
+            memo.insert(key, found);
+        });
     }
     Ok(splits)
 }
@@ -302,3 +371,4 @@ impl ImprintBuilder<'_> {
         Ok(())
     }
 }
+

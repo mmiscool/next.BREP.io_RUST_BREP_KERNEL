@@ -6,7 +6,7 @@
 //! — PMI annotates whatever is on screen). Conventions:
 //!
 //! - a face / edge name → its analytic frame through
-//!   [`crate::assembly_resolve`] (plane, axis, sphere, circle, line);
+//!   `crate::assembly_resolve` (plane, axis, sphere, circle, line);
 //! - `{solid}@x,y,z` → the vertex of `solid` nearest that WORLD position
 //!   (PMI resolves against the world-posed resident solids, the same solids
 //!   the STEP exporter writes — unlike an assembly constraint's

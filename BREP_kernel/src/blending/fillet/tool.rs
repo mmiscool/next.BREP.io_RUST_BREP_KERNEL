@@ -352,6 +352,7 @@ pub(super) fn is_terminal_blend_refusal(refusal: &KernelRefusal) -> bool {
         || crate::blend::is_marched_fit_off_carriers(refusal)
         || crate::blend::is_consumed_snap(refusal)
         || crate::blend::is_planar_chart_refusal(refusal)
+        || crate::blend::is_tangential_transverse_end(refusal)
 }
 
 fn fillet_or_chamfer_inner(

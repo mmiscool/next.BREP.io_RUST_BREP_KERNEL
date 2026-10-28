@@ -13,7 +13,7 @@ pub type SessionSlot = Arc<RwLock<Option<Arc<Session>>>>;
 
 /// Tool names the server implements itself (compositions and file halves);
 /// the app command of the same name is not exposed twice.
-pub const SERVER_OWNED: &[&str] = &["illustration_presentation", "screenshot", "feature_add", "feature_add_many", "feature_set_params", "doc_import", "doc_export", "doc_load"];
+pub const SERVER_OWNED: &[&str] = &["illustration_presentation", "screenshot", "feature_add", "feature_add_many", "feature_set_params", "doc_import", "doc_export", "doc_load", "cam_post_text"];
 
 /// The server-owned tool that WRAPS an app command under a different name.
 ///
@@ -28,6 +28,7 @@ pub const SERVER_TOOL_FOR: &[(&str, &str)] = &[
     ("doc_json", "document_save"),
     ("doc_import", "document_import"),
     ("doc_export", "document_export"),
+    ("cam_post_text", "cam_post"),
 ];
 
 /// The tool a caller actually invokes for `command` — itself, unless the server

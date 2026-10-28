@@ -9,6 +9,11 @@ pub(super) struct Recovery {
     component_id: String,
     source: Option<String>,
     destination: Option<String>,
+    /// The chosen file exists: `(that file, the free name beside it)`, and
+    /// the dialog asks which (prompts over refusals).
+    taken: Option<(String, String)>,
+    /// The user chose to overwrite this file.
+    overwrite: Option<String>,
 }
 
 impl FileDialog {
@@ -18,6 +23,30 @@ impl FileDialog {
         store: &dyn ModelStore,
         component_id: &str,
     ) {
+        // A part inside a sub-assembly (a nested BOM line) with no file of its
+        // own: its new file is named here too.
+        if component_id.contains(':') {
+            match docs.occurrence_part(component_id) {
+                Ok((part, source)) if source.as_deref().is_none_or(str::is_empty) => {
+                    self.name_buf = part;
+                    self.status.clear();
+                    self.use_folder(Purpose::Models, store);
+                    self.component_part = Some(Recovery {
+                        assembly_id: docs.active_id(),
+                        component_id: component_id.into(),
+                        source: None,
+                        destination: None,
+                        taken: None,
+                        overwrite: None,
+                    });
+                    self.open_modal(Mode::CreateComponentPart);
+                }
+                Ok((_, Some(source))) => self.open_document(docs, store, &source),
+                Ok(_) => {}
+                Err(error) => docs.engine_mut().push_notice(format!("'{component_id}': {error}")),
+            }
+            return;
+        }
         let source = part_source_key(docs.engine(), component_id);
         if let Some(key) = &source {
             match read_now(store, key) {
@@ -28,8 +57,11 @@ impl FileDialog {
                     }
                     return;
                 }
+                // Listed, not read yet (an Open takes a PLM copy that hashes
+                // to its revision without reading the revision): the read is
+                // asked for and the part opens in its tab when it lands.
                 ReadNow::Loading => {
-                    docs.engine_mut().push_notice(format!("This part's source document '{key}' is still loading — Edit Part again in a moment"));
+                    self.open_document(docs, store, key);
                     return;
                 }
                 ReadNow::Absent => {}
@@ -59,6 +91,8 @@ impl FileDialog {
             component_id: component_id.into(),
             source,
             destination,
+            taken: None,
+            overwrite: None,
         });
         self.open_modal(Mode::CreateComponentPart);
     }
@@ -76,10 +110,13 @@ impl FileDialog {
     ) {
         let mut create = false;
         let mut cancel = false;
+        // Some(true): overwrite the taken file; Some(false): the free name.
+        let mut choice: Option<bool> = None;
         let source = self
             .component_part
             .as_ref()
             .and_then(|p| p.destination.clone());
+        let taken = self.component_part.as_ref().and_then(|p| p.taken.clone());
         let modal = egui::Modal::new(egui::Id::new("brep-create-component-part")).show(ctx, |ui| {
             ui.heading("Create part file?");
             ui.label("The component has no available source file. Save its embedded part definition and open it in its own tab.");
@@ -95,16 +132,53 @@ impl FileDialog {
                     self.want_focus = false;
                 }
             }
-            ui.horizontal(|ui| {
-                let button = ui.button("Create part file");
-                self.hit("createpart", &button);
-                create = button.clicked();
-                let button = ui.button("Cancel");
-                self.hit("cancel", &button);
-                cancel = button.clicked();
-            });
+            match taken.clone() {
+                // The name is taken: ask, the free name first (Enter).
+                Some((existing, free)) => {
+                    ui.label(format!(
+                        "'{}' exists: overwrite it, or save as '{}'?",
+                        model_display_name(&existing),
+                        model_display_name(&free)
+                    ));
+                    ui.horizontal(|ui| {
+                        let button = ui.button(format!("Save as '{}'", model_display_name(&free)));
+                        self.hit("createpart:free", &button);
+                        if button.clicked() || ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                            choice = Some(false);
+                        }
+                        let button = ui.button(format!("Overwrite '{}'", model_display_name(&existing)));
+                        self.hit("createpart:overwrite", &button);
+                        if button.clicked() {
+                            choice = Some(true);
+                        }
+                        let button = ui.button("Cancel");
+                        self.hit("cancel", &button);
+                        cancel = button.clicked();
+                    });
+                }
+                None => {
+                    ui.horizontal(|ui| {
+                        let button = ui.button("Create part file");
+                        self.hit("createpart", &button);
+                        create = button.clicked();
+                        let button = ui.button("Cancel");
+                        self.hit("cancel", &button);
+                        cancel = button.clicked();
+                    });
+                }
+            }
             if !self.status.is_empty() { ui.colored_label(ui.visuals().error_fg_color, &self.status); }
         });
+        if let (Some(overwrite), Some((existing, free))) = (choice, taken) {
+            if let Some(pending) = self.component_part.as_mut() {
+                pending.taken = None;
+                pending.overwrite = overwrite.then(|| existing.clone());
+            }
+            if !overwrite {
+                self.name_buf = model_display_name(&free);
+            }
+            create = true;
+        }
         if cancel || modal.should_close() {
             self.cancel_component_part();
         } else if create {
@@ -123,17 +197,24 @@ impl FileDialog {
             .component_part
             .as_ref()
             .ok_or("no component selected")?;
+        let embedded_only = pending.source.as_deref().is_none_or(str::is_empty);
+        let overwrite = pending.overwrite.clone();
         let index = docs
             .iter()
             .position(|doc| doc.id() == pending.assembly_id)
             .ok_or("the assembly tab was closed")?;
+        // A part inside a sub-assembly (a nested BOM line): `ACOMP1:ACOMP2`, only
+        // ever offered while it has no file of its own.
+        let nested = pending.component_id.contains(':');
         let assembly = docs.get(index).unwrap();
-        let info = assembly
-            .engine
-            .component_info(&pending.component_id)
-            .ok_or("the component was removed")?;
-        if part_source_key(&assembly.engine, &pending.component_id) != pending.source {
-            return Err("the component source changed; cancel and Edit Part again".into());
+        if !nested {
+            assembly
+                .engine
+                .component_info(&pending.component_id)
+                .ok_or("the component was removed")?;
+            if part_source_key(&assembly.engine, &pending.component_id) != pending.source {
+                return Err("the component source changed; cancel and Edit Part again".into());
+            }
         }
         // PLM revisions must be created by the PLM's New part/revision workflow.
         // Never reinterpret a remote reference as a successful local file save.
@@ -180,7 +261,33 @@ impl FileDialog {
         }) {
             return Err("that part already has an open tab; cancel and open that tab".into());
         }
-        ensure_absent(store, &identity)?;
+        let overwriting = overwrite.as_deref() == Some(identity.as_str());
+        if embedded_only && !overwriting && matches!(read_now(store, &identity), ReadNow::Ready(_)) {
+            let free = free_beside(store, &identity);
+            if let Some(pending) = self.component_part.as_mut() {
+                pending.taken = Some((identity, free));
+            }
+            return Ok(());
+        }
+        if !overwriting {
+            ensure_absent(store, &identity)?;
+        }
+        if nested {
+            let component_id = pending.component_id.clone();
+            docs.save_part_as(index, store, &component_id, &identity, overwriting)?;
+            self.open_document(docs, store, &identity);
+            self.save_generation += 1;
+            self.status = format!("created and opened {identity}");
+            self.cancel_component_part();
+            return Ok(());
+        }
+        let info = docs
+            .get(index)
+            .unwrap()
+            .engine
+            .component_info(&pending.component_id)
+            .ok_or("the component was removed")?;
+        let assembly = docs.get(index).unwrap();
         let mut document: serde_json::Value =
             serde_json::from_str(&assembly.engine.history_request_json())
                 .map_err(|e| e.to_string())?;
@@ -212,14 +319,24 @@ impl FileDialog {
         if reconnect && !assembly.access().is_editable() {
             return Err("the assembly is read-only; its source link cannot be updated".into());
         }
-        entry["sourceKey"] = serde_json::json!(identity);
-        entry["sourceSignature"] = serde_json::json!(signature);
         // Part preparation can take time; check again immediately before saving.
-        ensure_absent(store, &identity)?;
-        store.write(&identity, &contents)?;
-        if reconnect {
-            docs.get_mut(index).unwrap().engine.edit_document_json(&document.to_string())
-                .map_err(|e| format!("file saved at {identity}, but reconnect failed: {e}; cancel and open the saved part"))?;
+        if !overwriting {
+            ensure_absent(store, &identity)?;
+        }
+        if embedded_only {
+            // A part that never had a file: the Save's own promotion, under the
+            // chosen name, so every file-less copy of it (at any depth) takes
+            // the new file, not only this entry.
+            let component_id = pending.component_id.clone();
+            docs.save_part_as(index, store, &component_id, &identity, overwriting)?;
+        } else {
+            entry["sourceKey"] = serde_json::json!(identity);
+            entry["sourceSignature"] = serde_json::json!(signature);
+            store.write(&identity, &contents)?;
+            if reconnect {
+                docs.get_mut(index).unwrap().engine.edit_document_json(&document.to_string())
+                    .map_err(|e| format!("file saved at {identity}, but reconnect failed: {e}; cancel and open the saved part"))?;
+            }
         }
         docs.open_document(standalone);
         self.save_generation += 1;
@@ -227,6 +344,20 @@ impl FileDialog {
         self.cancel_component_part();
         Ok(())
     }
+}
+
+/// The first `<stem>-2`, `<stem>-3`, … beside `identity` that the store does
+/// not hold.
+fn free_beside(store: &dyn ModelStore, identity: &str) -> String {
+    let file = crate::store::file_name_of(identity);
+    let (stem, extension) = match file.rfind('.') {
+        Some(dot) if dot > 0 => (&file[..dot], &file[dot..]),
+        _ => (file.as_str(), ".nbrep"),
+    };
+    (2..)
+        .map(|n| crate::store::sibling_identity(identity, &format!("{stem}-{n}{extension}")))
+        .find(|candidate| matches!(read_now(store, candidate), ReadNow::Absent))
+        .unwrap_or_default()
 }
 
 fn ensure_absent(store: &dyn ModelStore, identity: &str) -> Result<(), String> {

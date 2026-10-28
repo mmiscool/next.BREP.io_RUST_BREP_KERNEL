@@ -347,29 +347,50 @@ impl EngineState {
             return self.port_point_pose(&address);
         }
         let id = self.transform_gizmo.feature_id.as_deref()?;
-        if let Some(row) = self.pmi_report.as_ref().and_then(|r| r.annotation(id)) {
-            if self.pmi_active_view.as_deref()
-                != self
-                    .pmi_state()
-                    .find_annotation(id)
-                    .map(|(v, _)| v.id.as_str())
-            {
+        let pmi_annotation = {
+            let state = self.pmi_state_shared();
+            state
+                .find_annotation(id)
+                .map(|(view, annotation)| (view.id.clone(), annotation.kind.clone(), annotation.params.clone()))
+        };
+        if let Some((view_id, kind, params)) = pmi_annotation {
+            if self.pmi_active_view.as_deref() != Some(view_id.as_str()) {
                 return None;
             }
-            if let brep_kernel::PmiGeometry::Explode {
-                center,
-                translate,
-                rotate_deg,
-                scale,
-                ..
-            } = &row.geometry
-            {
+            if let Some(row) = self.pmi_report.as_ref().and_then(|r| r.annotation(id)) {
+                // Part-way through playback the step's gizmo sits where its step
+                // has brought its bodies.
+                let fraction = self.explode_step_of(id).map_or(1.0, |step| self.explode_fraction(step));
+                if let brep_kernel::PmiGeometry::Explode {
+                    center,
+                    translate,
+                    rotate_deg,
+                    scale,
+                    ..
+                } = &super::exploded_ops::explode_at(&row.geometry, fraction)
+                {
+                    return Some(TransformPose {
+                        position: std::array::from_fn(|i| center[i] + translate[i]),
+                        rotation_deg: *rotate_deg,
+                        scale: *scale,
+                    });
+                }
+            }
+            // An explode step the kernel has not laid out (its targets are
+            // still in the picker, or the run has not landed): the gizmo
+            // stands on what the step is about to move, so the controls are
+            // there from the first pick, before Done commits it.
+            if kind == "explode" {
+                let center = self.pmi_explode_live_center(id)?;
+                let transform = params.get("transform");
+                let position = read_pose_vec3(None, transform, "position", [0.0; 3]);
                 return Some(TransformPose {
-                    position: std::array::from_fn(|i| center[i] + translate[i]),
-                    rotation_deg: *rotate_deg,
-                    scale: *scale,
+                    position: std::array::from_fn(|axis| center[axis] + position[axis]),
+                    rotation_deg: read_pose_vec3(None, transform, "rotationEuler", [0.0; 3]),
+                    scale: read_pose_vec3(None, transform, "scale", [1.0; 3]),
                 });
             }
+            return None;
         }
         let index = self.history.index_of(id)?;
         if self.transform_gizmo.cage.is_some() {
@@ -753,6 +774,8 @@ impl EngineState {
     pub fn transform_release(&mut self) {
         if self.transform_gizmo.drag.take().is_some() {
             self.widgets.set_transform_active(0);
+            // The re-sync below marks the frame only in Transform mode.
+            self.dirty = true;
             // ONE UNDO STEP PER DRAG. `set_feature_params` coalesces on
             // `param:{index}` so that the hundred writes a single drag makes do
             // not become a hundred undo entries — but nothing ended the run, so
@@ -804,7 +827,7 @@ impl EngineState {
         let pmi = self.pmi_state();
         if let Some((_, annotation)) = pmi.find_annotation(&id) {
             if annotation.kind == "explode" {
-                let center = self
+                let laid_out = self
                     .pmi_report
                     .as_ref()
                     .and_then(|r| r.annotation(&id))
@@ -812,7 +835,18 @@ impl EngineState {
                         brep_kernel::PmiGeometry::Explode { center, .. } => Some(*center),
                         _ => None,
                     });
+                // Before the kernel lays the step out (a pick still running)
+                // the gizmo stands on the live centre, and a drag there
+                // already writes the step's position.
+                let center = laid_out.or_else(|| self.pmi_explode_live_center(&id));
                 if let Some(center) = center {
+                    // The drag started from where playback showed the step and
+                    // is stored as its full delta: show the step at full (the
+                    // steps before it are already), so its bodies stay under
+                    // the gizmo.
+                    if let (true, Some(progress), Some(step)) = (laid_out.is_some(), self.explode_playback.progress, self.explode_step_of(&id)) {
+                        self.explode_playback.progress = Some(progress.max(step as f64 + 1.0));
+                    }
                     let mut params = annotation.params.clone();
                     params["transform"] = serde_json::json!({ "position": std::array::from_fn::<_, 3, _>(|i| pose.position[i] - center[i]), "rotationEuler": pose.rotation_deg, "scale": pose.scale });
                     let _ = self.pmi_update_annotation(&id, &params.to_string());

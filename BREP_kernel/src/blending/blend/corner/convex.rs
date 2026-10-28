@@ -10,9 +10,9 @@ use super::*;
 ///
 /// Dispatch beyond the convex trihedral fast path:
 ///   * N>3 walls with a common tangent ball → spherical N-gon patch;
-///   * N≥4 walls with NO common ball → [`round_general_star`] (N=4 Coons);
+///   * N≥4 walls with NO common ball → `round_general_star` (N=4 Coons);
 ///   * trihedral corner with ONE CONCAVE incident edge (fillet tangent
-///     vertices missing) → [`round_mixed_concave_corner`] (torus sector);
+///     vertices missing) → `round_mixed_concave_corner` (torus sector);
 ///   * CURVED-WALL trihedral corner (two planar walls + one cylindrical
 ///     wall through the vertex, all three incident edges convex and
 ///     filleted) → corner ball solved against the offset cylinder, then the

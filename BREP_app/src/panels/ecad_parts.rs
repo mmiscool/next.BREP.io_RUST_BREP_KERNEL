@@ -9,7 +9,7 @@
 //! directly wireable; the only way through it is an interface the board itself
 //! declares. That is the PART's rule, not the diagram's: the kernel applies the
 //! same filter to the port set a part exports (`ports::export_ports`), and
-//! [`devices`] is the consumer that honours it on the app side.
+//! `devices` is the consumer that honours it on the app side.
 //!
 //! A nested assembly's document is embedded whole — its own `features` and its
 //! own `partsLibrary` — so the walk is a plain recursion into
@@ -18,7 +18,7 @@
 //!
 //! # What identifies a device
 //!
-//! The OCCURRENCE CHAIN (`ACOMP7:ACOMP1`) — [`PartSource::instance`], and the
+//! The OCCURRENCE CHAIN (`ACOMP7:ACOMP1`) — `PartSource::instance`, and the
 //! prefix the device's connection points address under. The parts-library KEY
 //! is a different namespace at every level of the tree and is NOT stable across
 //! a part's version history (the kernel's `add_part_to_library` disambiguates a

@@ -1081,12 +1081,15 @@ impl PlmPartsPanel {
             let by_name = DocumentClass::of_name(self.form.name.trim()).is_some();
             ui.add_enabled_ui(!by_name, |ui| {
                 ui.horizontal(|ui| {
-                    for class in [DocumentClass::Normal, DocumentClass::Family, DocumentClass::Template] {
-                        let button = ui.selectable_label(self.form.effective_class() == class, class.label());
-                        self.hits.insert(format!("plm_parts:new:class:{}", class.slug()), button.rect);
-                        if button.clicked() {
-                            self.form.class = class;
-                        }
+                    // One dropdown (plm_parts:new:class, its open entries
+                    // plm_parts:new:class#<slug>); it shows the class the name
+                    // implies when the name decides.
+                    let classes = [DocumentClass::Normal, DocumentClass::Family, DocumentClass::Template];
+                    let choices: Vec<(DocumentClass, &str, &str)> = classes.iter().map(|class| (*class, class.slug(), class.label())).collect();
+                    let mut chosen = self.form.effective_class();
+                    let (changed, _) = crate::form::enum_dropdown(ui, "plm_parts:new:class", &choices, &mut chosen, None, Some(&mut self.hits));
+                    if changed {
+                        self.form.class = chosen;
                     }
                 });
             });

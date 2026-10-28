@@ -13,7 +13,7 @@
 //!   cone arrow + orange origin sphere, GRABBABLE (drag edits
 //!   `inputParams.distance`, commit auto-solves). Plane-based pairings draw the
 //!   TRUE dimension perpendicular to the BASE face (the perpendicular-foot
-//!   construction on [`build_distance_annotation`], matching the kernel's
+//!   construction on `build_distance_annotation`, matching the kernel's
 //!   signed `d = (P_other − P_base)·n̂_base` convention); plane-less pairings
 //!   keep the plain anchor-to-anchor leader.
 //! * **angle** → an ANGULAR annotation (the screen-constant arc + orange sweep-end
@@ -291,10 +291,13 @@ fn build_row(row: &Value, state_constraints: &Value) -> Option<ConstraintOverlay
     // Dragging: only the dimensional kinds, and only while the param is NOT a
     // non-numeric expression string (absent / number / plain numeric string are
     // all draggable — matching the feature-dimension expression rule).
+    // A limit mate holds a range, not the single value the handle edits: its
+    // handle is not draggable.
+    let limited = input_params.get("limit").and_then(Value::as_bool).unwrap_or(false);
     let draggable = match kind {
         ConstraintOverlayKind::Leader => false,
-        ConstraintOverlayKind::Distance => param_allows_drag(&input_params, "distance"),
-        ConstraintOverlayKind::Angle => param_allows_drag(&input_params, "angle"),
+        ConstraintOverlayKind::Distance => !limited && param_allows_drag(&input_params, "distance"),
+        ConstraintOverlayKind::Angle => !limited && param_allows_drag(&input_params, "angle"),
     };
 
     let annotation = match kind {

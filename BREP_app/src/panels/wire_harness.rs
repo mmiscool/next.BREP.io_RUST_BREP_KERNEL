@@ -74,7 +74,7 @@ impl WireHarnessPanel {
     /// shared panel pattern.
     pub fn show(&mut self, ui: &mut egui::Ui, state: &mut EngineState) {
         self.hits.clear();
-        self.hits.insert("wh:panel:clip".into(), ui.clip_rect());
+        self.hits.insert("panel:clip".into(), ui.clip_rect());
 
         let harness = state.wire_harness_state();
         let empty = WireHarnessReport::default();
@@ -184,6 +184,7 @@ impl WireHarnessPanel {
                 "(no connections — add ports, attach spline ends to them, then Add wire)",
             ),
             hits_prefix: "wh:",
+            drag_rows: false,
         };
         let out = column_tree::column_tree(ui, &spec, &mut self.layout, &rows, Some(&mut self.hits));
 
@@ -274,7 +275,7 @@ impl WireHarnessPanel {
     }
 
     /// The per-frame widget rects for the headed verifier, as `[x, y, w, h]`
-    /// like every other `__brep*Hit` map (`wh:add`, `wh:bundles`, `wh:panel:clip`,
+    /// like every other `__brep*Hit` map (`wh:add`, `wh:bundles`, `panel:clip`,
     /// and the column tree's `wh:row:{id}` / `wh:cell:{id}:{column}` /
     /// `wh:menu:{id}` keys).
     pub fn hits_json(&self) -> String {
@@ -369,6 +370,6 @@ pub static HIT_KEYS: &[HitKeyDoc] = &[
     HitKeyDoc { panel: "wireharness", prefix: "wh:add", meaning: "add a connection", command: Some("wire_harness_add_connection") },
     HitKeyDoc { panel: "wireharness", prefix: "wh:bundles", meaning: "toggle bundle solids", command: Some("wire_harness_set_build_bundles") },
     HitKeyDoc { panel: "wireharness", prefix: "wh:bundle:", meaning: "a bundle's status line (hover for the reason)", command: None },
-    HitKeyDoc { panel: "wireharness", prefix: "wh:panel:clip", meaning: "the visible region of the pane", command: None },
+    HitKeyDoc { panel: "wireharness", prefix: "panel:clip", meaning: "the visible region of the pane", command: None },
     HitKeyDoc { panel: "wireharness", prefix: "wh:", meaning: "a connection row control", command: Some("wire_harness_update_connection") },
 ];

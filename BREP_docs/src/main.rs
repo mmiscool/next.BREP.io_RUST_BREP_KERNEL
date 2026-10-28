@@ -301,9 +301,53 @@ fn render_markdown(source: &str, page_dir: &Path, icons: &Icons) -> (String, Str
         }
     }
 
+    assign_heading_ids(&mut events);
     let mut html = String::new();
     pulldown_cmark::html::push_html(&mut html, events.into_iter());
     (html, text)
+}
+
+/// Give every heading the id GitHub gives it, so a `page.md#some-heading`
+/// link written against the Markdown lands on that heading in the site too.
+/// A repeated heading takes `-1`, `-2`, … as GitHub numbers them. A heading's
+/// inlined icon is markup, not text, and does not reach its slug.
+fn assign_heading_ids(events: &mut [Event]) {
+    let mut used: BTreeMap<String, usize> = BTreeMap::new();
+    let mut i = 0;
+    while i < events.len() {
+        if matches!(events[i], Event::Start(Tag::Heading { .. })) {
+            let mut text = String::new();
+            let mut end = i + 1;
+            while end < events.len() && !matches!(events[end], Event::End(TagEnd::Heading(_))) {
+                if let Event::Text(t) | Event::Code(t) = &events[end] {
+                    text.push_str(t);
+                }
+                end += 1;
+            }
+            let slug = heading_slug(&text);
+            if !slug.is_empty() {
+                let seen = used.entry(slug.clone()).or_insert(0);
+                let unique = if *seen == 0 { slug } else { format!("{slug}-{seen}") };
+                *seen += 1;
+                if let Event::Start(Tag::Heading { id, .. }) = &mut events[i] {
+                    *id = Some(CowStr::from(unique));
+                }
+            }
+            i = end;
+        }
+        i += 1;
+    }
+}
+
+/// GitHub's heading anchor: lower case, every character that is not a letter,
+/// digit, space, `-` or `_` dropped, then each space a `-`.
+fn heading_slug(text: &str) -> String {
+    text.trim()
+        .chars()
+        .flat_map(char::to_lowercase)
+        .filter(|c| c.is_alphanumeric() || *c == ' ' || *c == '-' || *c == '_')
+        .map(|c| if c == ' ' { '-' } else { c })
+        .collect()
 }
 
 fn rewrite_md_link(dest: CowStr) -> CowStr {

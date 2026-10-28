@@ -356,7 +356,7 @@ pub fn constraint_glyphs_buffers(
 /// Like [`constraint_glyphs_buffers`], but emphasizes the hovered / selected
 /// constraint (matched by a `{"kind":"constraint","id":…}` ref) in the SAME amber /
 /// light-blue as a selected / hovered point or geometry (via
-/// [`super::tessellate::interaction_color`]); an empty hover + selection reproduce the
+/// `super::tessellate::interaction_color`); an empty hover + selection reproduce the
 /// plain-green output.
 pub fn constraint_glyphs_buffers_with_state(
     doc: &SketchDoc,

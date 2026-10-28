@@ -667,9 +667,9 @@ const PCURVE_RAISED_SAMPLES: usize = 2000;
 /// never be mistaken for a met floor.
 ///
 /// [`fit_pcurve_on_surface`] asks for [`PCURVE_REFINEMENT_TOLERANCE`] and stops
-/// at [`MAX_PCURVE_SAMPLES`] — or, where that ceiling bound and the floor is
-/// reachable, at [`PCURVE_RAISED_SAMPLES`]. Until 2026-09-12 a trim that ran
-/// out of samples came back exactly like one that met the floor; on
+/// at `MAX_PCURVE_SAMPLES` — or, where that ceiling bound and the floor is
+/// reachable, at `PCURVE_RAISED_SAMPLES`. Until 2026-09-12 a trim that ran out
+/// of samples came back exactly like one that met the floor; on
 /// `boolean_fuzz_corpus/25_cube_pierce_solid` that silence hid a 1.65e-3 volume
 /// error. Now every fit says which it was: `residual` is measured on the curve
 /// that is actually returned and `exit` names why refinement stopped.
@@ -697,8 +697,8 @@ pub struct PcurveFitReport {
     /// exit is retried only while `residual` exceeds it by more than the floor,
     /// i.e. while the returned curve is worse than its input.
     pub off_surface: f64,
-    /// Whether the fit re-entered refinement with [`PCURVE_RAISED_SAMPLES`]
-    /// after [`MAX_PCURVE_SAMPLES`] bound with the floor unmet.
+    /// Whether the fit re-entered refinement with `PCURVE_RAISED_SAMPLES`
+    /// after `MAX_PCURVE_SAMPLES` bound with the floor unmet.
     pub raised: bool,
     /// Largest parameter distance a station's inversion was pulled back into
     /// an OPEN direction's domain when the returned curve was interpolated: a
@@ -735,7 +735,7 @@ impl PcurveFitReport {
     /// A pcurve's image lies on the carrier, so at a station standing `g` off
     /// it no image can come closer than `g`; a fit whose residual is within
     /// the floor of `off_surface` is as good as the input allows, and one over
-    /// it is worse than its input — the same condition [`refine_pcurve`] uses
+    /// it is worse than its input — the same condition `refine_pcurve` uses
     /// to decide that a raise can still buy accuracy. This is the bar every
     /// station builder refuses over ([`build_pcurve_on_surface_stations`]).
     /// It is blind to sideways error quadratically (a station tracked `d`
@@ -756,9 +756,9 @@ pub enum PcurveFitExit {
     /// A probe round found every station within the floor. An affine carrier
     /// maps exactly and reports this with a zero residual.
     Converged,
-    /// The sample ceiling bound before the floor was met: [`MAX_PCURVE_SAMPLES`]
+    /// The sample ceiling bound before the floor was met: `MAX_PCURVE_SAMPLES`
     /// when the raise was declined (the residual is already explained by
-    /// [`PcurveFitReport::off_surface`]), [`PCURVE_RAISED_SAMPLES`] when it was
+    /// [`PcurveFitReport::off_surface`]), `PCURVE_RAISED_SAMPLES` when it was
     /// taken and bound too.
     SampleCeiling,
     /// Every refinement round was spent and the last one still inserted
@@ -776,7 +776,7 @@ pub enum PcurveFitExit {
     Stalled,
     /// The last probe round found every span it PROBED within the floor, but
     /// skipped spans narrower than the loop's own resolution floor — 1e-3 of
-    /// the parameter range in [`refine_pcurve`], [`SPAN_FLOOR`] (1e-6) in
+    /// the parameter range in `refine_pcurve`, `SPAN_FLOOR` (1e-6) in
     /// [`fit_pcurve_on_surface_stations`] — and a sweep over those found the
     /// floor unmet.
     /// Until 2026-09-12 this exit was reported as `Converged` with the probed
@@ -828,7 +828,7 @@ pub struct PcurveFitLedger {
     pub span_floor: u64,
     /// Largest residual among the unmet fits; zero when there are none.
     pub worst_unmet_residual: f64,
-    /// Fits that re-entered refinement with [`PCURVE_RAISED_SAMPLES`], met or
+    /// Fits that re-entered refinement with `PCURVE_RAISED_SAMPLES`, met or
     /// not.
     pub raised: u64,
     /// Unmet ceiling exits that were NOT raised because the residual is
@@ -2433,7 +2433,7 @@ pub fn build_pcurve_on_surface_marched(
 /// Build a pcurve for a represented subrange of a larger edge curve.
 ///
 /// On an affine carrier the answer is exact and is taken as such
-/// ([`affine_pcurve_on_range`]). Otherwise this samples only the represented
+/// (`affine_pcurve_on_range`). Otherwise this samples only the represented
 /// interval, which is essential when off-interval control points do not lie on
 /// the target carrier — the exact lane restricts the net by knot insertion
 /// first, so those control points are removed rather than ignored.
@@ -2456,7 +2456,7 @@ pub fn fit_pcurve_on_surface_range(
 }
 
 /// [`fit_pcurve_on_surface_range`] for the callers that only need the curve:
-/// the fit is ACCEPTED or REFUSED on its bar ([`accept_fit`]), never returned
+/// the fit is ACCEPTED or REFUSED on its bar (`accept_fit`), never returned
 /// off it.
 pub fn build_pcurve_on_surface_range(
     surface: &NurbsSurface,
@@ -2903,7 +2903,7 @@ fn repair_branch_jumps(
 /// Range fitter with explicit sampling knobs, reporting what the fit achieved.
 /// [`fit_pcurve_on_surface_range`] keeps the long-standing (base 64, 3
 /// refinement rounds, 513 cap) budget; a fit that binds at that cap with the
-/// bar unmet grows once to [`PCURVE_RAISED_SAMPLES`]
+/// bar unmet grows once to `PCURVE_RAISED_SAMPLES`
 /// ([`fit_pcurve_on_surface_stations`]).
 ///
 /// NOTE (2026-09-03): this comment used to say "STEP import retries failed fits
@@ -3479,7 +3479,7 @@ fn end_span_challenger(
 
 
 /// [`fit_pcurve_on_surface_range_dense`] for the callers that only need the
-/// curve, accepted or refused on its bar ([`accept_fit`]).
+/// curve, accepted or refused on its bar (`accept_fit`).
 #[allow(clippy::too_many_arguments)]
 pub fn build_pcurve_on_surface_range_dense(
     surface: &NurbsSurface,
@@ -3557,7 +3557,7 @@ pub(crate) fn range_breaks(
 ///
 /// `stations(fraction)` must be continuous in `fraction` over `[0, 1]` and land
 /// on (or very near) `surface`; `breaks` are the fractions at which it is not
-/// C2 ([`range_breaks`]), each of which becomes a station so no kink sits
+/// C2 (`range_breaks`), each of which becomes a station so no kink sits
 /// between two nodes. Everything else — inversion, branch repair, refinement
 /// and the measurement — is shared with the derived lane by construction.
 ///
@@ -3590,9 +3590,9 @@ pub(crate) fn range_breaks(
 /// and extremal between — unless its last round probed every span and found
 /// nothing to insert, in which case that round's maximum already is that
 /// measurement. A fit that binds at `parameter_cap` or spends its rounds with
-/// the bar still unmet grows ONCE to [`PCURVE_RAISED_SAMPLES`]
-/// (deterministic). The report says which exit it took and what it reached;
-/// the `build_*` wrappers refuse over the bar, this function never does.
+/// the bar still unmet grows ONCE to `PCURVE_RAISED_SAMPLES` (deterministic).
+/// The report says which exit it took and what it reached; the `build_*`
+/// wrappers refuse over the bar, this function never does.
 #[allow(clippy::too_many_arguments)]
 pub fn fit_pcurve_on_surface_stations(
     surface: &NurbsSurface,
@@ -4109,7 +4109,7 @@ fn fit_station_pcurve_mode(
 }
 
 /// [`fit_pcurve_on_surface_stations`] for the callers that only need the
-/// curve, accepted or refused on its bar ([`accept_fit`]).
+/// curve, accepted or refused on its bar (`accept_fit`).
 pub fn build_pcurve_on_surface_stations(
     surface: &NurbsSurface,
     stations: &dyn Fn(f64) -> Result<Vec3, String>,

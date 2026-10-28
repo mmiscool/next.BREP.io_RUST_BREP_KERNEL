@@ -270,7 +270,7 @@ pub struct StepImportReport {
     /// is the outcome their text had.
     pub failed_refusals: Vec<crate::KernelRefusal>,
     /// Open surface-model sheets skipped (not solids, so not in `failed`);
-    /// also the counter [`SHEETS_SKIPPED`] in `diagnostics`.
+    /// also the counter `SHEETS_SKIPPED` in `diagnostics`.
     pub sheets_skipped: usize,
     /// `(index into solids, approximation)` for every imported body whose
     /// shell closes over its bar (`import.shell_closure`); see
@@ -282,7 +282,7 @@ pub struct StepImportReport {
     /// The import's diagnostics: measurements always, plus one
     /// `import.stated_precision_inconsistent` warning when the file's stated
     /// precision is far under the deviation its own geometry shows
-    /// ([`precision::stated_precision_diagnostics`]). Informational only —
+    /// (`precision::stated_precision_diagnostics`). Informational only —
     /// acceptance never depends on it.
     pub diagnostics: crate::KernelDiagnostics,
 }

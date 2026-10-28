@@ -64,3 +64,15 @@ impl DirLock {
     }
 }
 
+impl Drop for DirLock {
+    /// Release the lock on the open file description itself, not only this
+    /// handle's reference to it. The file is opened close-on-exec (std's
+    /// default), but a child another thread forks while the lock is held keeps
+    /// a copy of the descriptor until its `exec`, and an advisory lock lives as
+    /// long as any copy does: dropping the handle alone left the directory
+    /// "in use" for that window (a flake in the test below, 2026-10-22).
+    fn drop(&mut self) {
+        let _ = self._file.unlock();
+    }
+}
+

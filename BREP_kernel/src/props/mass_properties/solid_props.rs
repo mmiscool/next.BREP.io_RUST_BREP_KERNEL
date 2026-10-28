@@ -249,7 +249,7 @@ pub fn signed_volume_against(solid: &BrepSolid, bar: f64) -> Result<f64, String>
 /// in the full mass cache. If the bound cannot prove `> bar`, the old path runs.
 ///
 /// The verdict is the exact check's: when the reading sits within
-/// [`SIGN_READING_MARGIN`] of the magnitudes of the bar, the exact value is
+/// `SIGN_READING_MARGIN` of the magnitudes of the bar, the exact value is
 /// returned instead, bit for bit. Callers compare the result with `bar`.
 pub fn solid_signed_volume_for_sign(solid: &BrepSolid, bar: f64) -> Result<f64, String> {
     let enabled = match std::env::var("BREP_SPHERE_SIGN_BOUND") {

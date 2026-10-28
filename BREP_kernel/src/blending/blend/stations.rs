@@ -1,3 +1,7 @@
+pub(super) mod analytic_rim;
+pub(super) mod analytic_network;
+mod offset_memo;
+
 use crate::{KernelRefusal, KernelStage, OrRefuse, RefusalClass};
 use crate::topology::{BrepSolid, CoedgeRecord, EdgeRecord, FaceRecord};
 use crate::offset_point::StationaryChart;
@@ -224,18 +228,27 @@ pub(super) fn tangency_state(
     // `derivatives_extended(..,0)[0][0] == derivatives_extended(..,1)[0][0]`.
     let first = blend_offset(first).at(uv[0], uv[1], rho[0]).or_refuse(KernelStage::Refine, "at")?;
     let second = blend_offset(second).at(uv[2], uv[3], rho[1]).or_refuse(KernelStage::Refine, "at")?;
+    Ok(tangency_from_samples(first, second, section_point, section_tangent))
+}
+
+fn tangency_from_samples(
+    first: crate::OffsetSample,
+    second: crate::OffsetSample,
+    section_point: Vec3,
+    section_tangent: Vec3,
+) -> TangencyState {
     // Coincident ball centres = the two offset surfaces intersect here.
     let center = first.point;
     let mismatch = center.sub(second.point);
     let plane = center.sub(section_point).dot(section_tangent);
-    Ok(TangencyState {
+    TangencyState {
         residual: [mismatch.x, mismatch.y, mismatch.z, plane],
         p1: first.source,
         p2: second.source,
         center,
         n1: first.normal,
         n2: second.normal,
-    })
+    }
 }
 
 /// Residual of (4.9.2) + (4.9.5) at uv = (u, v, a, b).
@@ -305,6 +318,11 @@ pub(in crate::blend) fn solve_station_state_chord(
     scale: f64,
     jacobian: &mut Option<[[f64; 4]; 4]>,
 ) -> Result<([f64; 4], TangencyState), KernelRefusal> {
+    let mut memo = offset_memo::enabled().then(|| offset_memo::Samples::new([first, second]));
+    let mut read = |uv| match memo.as_mut() {
+        Some(samples) => samples.state(rho, uv, section_point, section_tangent),
+        None => tangency_state(first, second, rho, uv, section_point, section_tangent),
+    };
     let mut uv = seed;
     let tolerance = 1e-11 * (1.0 + scale);
     let mut previous_error = f64::INFINITY;
@@ -316,7 +334,7 @@ pub(in crate::blend) fn solve_station_state_chord(
     // plain road would not.
     for _ in 0..NEWTON_ITERATIONS {
         evaluations += 1;
-        let Ok(state) = tangency_state(first, second, rho, uv, section_point, section_tangent) else {
+        let Ok(state) = read(uv) else {
             break;
         };
         let error = state.residual.iter().map(|value| value.abs()).fold(0.0, f64::max);
@@ -335,7 +353,7 @@ pub(in crate::blend) fn solve_station_state_chord(
                 let mut probe = uv;
                 probe[column] += step;
                 evaluations += 1;
-                let Ok(probed) = tangency_state(first, second, rho, probe, section_point, section_tangent) else {
+                let Ok(probed) = read(probe) else {
                     readable = false;
                     break;
                 };
@@ -383,12 +401,17 @@ fn solve_station_state_traced(
     scale: f64,
     mut trace: Option<&mut NewtonTrace>,
 ) -> Result<([f64; 4], TangencyState), KernelRefusal> {
+    let mut memo = offset_memo::enabled().then(|| offset_memo::Samples::new([first, second]));
+    let mut read = |uv| match memo.as_mut() {
+        Some(samples) => samples.state(rho, uv, section_point, section_tangent),
+        None => tangency_state(first, second, rho, uv, section_point, section_tangent),
+    };
     let mut uv = seed;
     let tolerance = 1e-11 * (1.0 + scale);
     let mut evaluations = 0u64;
     for _ in 0..NEWTON_ITERATIONS {
         evaluations += 1;
-        let state = match tangency_state(first, second, rho, uv, section_point, section_tangent) {
+        let state = match read(uv) {
             Ok(state) => state,
             Err(error) => {
                 if let Some(trace) = trace.as_deref_mut() {
@@ -424,7 +447,7 @@ fn solve_station_state_traced(
             let mut probe = uv;
             probe[column] += step;
             evaluations += 1;
-            let probed = match tangency_state(first, second, rho, probe, section_point, section_tangent) {
+            let probed = match read(probe) {
                 Ok(probed) => probed,
                 Err(error) => {
                     crate::blend::record_count("count.march.tangency_evals", evaluations);
@@ -443,7 +466,7 @@ fn solve_station_state_traced(
             let mut probe = uv;
             probe[column] = chart.parameter(chart.regular(uv[column]) + step);
             evaluations += 1;
-            let probed = match tangency_state(first, second, rho, probe, section_point, section_tangent) {
+            let probed = match read(probe) {
                 Ok(probed) => probed,
                 Err(error) => {
                     crate::blend::record_count("count.march.tangency_evals", evaluations);
@@ -934,19 +957,16 @@ fn solve_anchored_start(
         uv[free[2]] = x[3];
         uv
     };
-    let state_at = |x: &[f64; 4]| -> Result<TangencyState, KernelRefusal> {
+    let mut memo = offset_memo::enabled().then(|| offset_memo::Samples::new([first, second]));
+    let mut state_at = |x: &[f64; 4]| -> Result<TangencyState, KernelRefusal> {
         let (section_point, section_tangent) = edge
             .curve
             .point_and_unit_tangent_extended(x[0], edge.t0, edge.t1)
             .map_err(|error| format!("blend anchored start: edge {}: {error}", edge.id)).or_refuse(KernelStage::Refine, "point_and_unit_tangent_extended")?;
-        tangency_state(
-            first,
-            second,
-            rho_at(x[0]),
-            assemble(x),
-            section_point,
-            section_tangent,
-        )
+        match memo.as_mut() {
+            Some(samples) => samples.state(rho_at(x[0]), assemble(x), section_point, section_tangent),
+            None => tangency_state(first, second, rho_at(x[0]), assemble(x), section_point, section_tangent),
+        }
     };
     for _ in 0..NEWTON_ITERATIONS {
         let state = state_at(&x)?;
@@ -983,7 +1003,7 @@ fn solve_anchored_start(
     // surface parameters.  Acceptance still requires ALL FOUR original
     // residuals, so this cannot hide a genuinely wrong anchor.
     let mut fixed = [x[1], x[2], x[3]];
-    let fixed_state = |values: &[f64; 3]| -> Result<TangencyState, KernelRefusal> {
+    let mut fixed_state = |values: &[f64; 3]| -> Result<TangencyState, KernelRefusal> {
         let full = [seed_t, values[0], values[1], values[2]];
         state_at(&full)
     };
@@ -1721,6 +1741,7 @@ fn closed_wall_interval_misses(
             crate::blend::record_count("count.closed.march.wall_centres", (CLOSED_WALL_CENTRES - 1) as u64);
             let _probes_timing = crate::blend::BlendTimer::start("timing.closed.march.ladder.wall.probes_ms");
             centres.push(right.station.center);
+            let prepared = super::chain::PreparedWall::for_interval(&centres);
             let (from, to) = (parameters[interval], parameters[interval + 1]);
             let mut declared = 0.0_f64;
             for step in (2..CLOSED_WALL_CENTRES).step_by(2) {
@@ -1728,8 +1749,10 @@ fn closed_wall_interval_misses(
                 for k in 1..CLOSED_WALL_SECTIONS {
                     let v = v_low + (v_high - v_low) * k as f64 / CLOSED_WALL_SECTIONS as f64;
                     let point = rows.surface.evaluate(u, v).ok()?;
-                    let (reading, uncertainty) =
-                        super::chain::declared_wall_probe_located(point, &centres, step, step as f64 / CLOSED_WALL_CENTRES as f64, radius)?;
+                    let (reading, uncertainty) = match &prepared {
+                        Some(cache) => cache.read(point, step, step as f64 / CLOSED_WALL_CENTRES as f64, radius),
+                        None => super::chain::declared_wall_probe_located(point, &centres, step, step as f64 / CLOSED_WALL_CENTRES as f64, radius),
+                    }?;
                     declared = declared.max(reading + uncertainty);
                 }
             }

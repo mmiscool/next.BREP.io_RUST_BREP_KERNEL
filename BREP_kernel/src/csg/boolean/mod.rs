@@ -58,7 +58,7 @@ pub struct BooleanOptions {
     #[serde(default = "default_true")]
     pub merge_coplanar_faces: bool,
     /// Face-name substrings that PIN a result face out of the coplanar/cosurface
-    /// merge (only consulted when [`merge_coplanar_faces`] is on). A face whose
+    /// merge (only consulted when [`Self::merge_coplanar_faces`] is on). A face whose
     /// `name` CONTAINS any of these is emitted unchanged instead of being
     /// coalesced with a mergeable neighbour; faces matching none merge exactly as
     /// before. Default empty — no caller sees a behavior change unless it opts
@@ -1386,6 +1386,19 @@ pub fn boolean_operation_nary(
     operands: &[BrepSolid],
     operation: BooleanOperation,
 ) -> Result<BrepSolid, KernelRefusal> {
+    boolean_operation_nary_with_options(operands, operation, &BooleanOptions::default())
+}
+
+/// [`boolean_operation_nary`] under the caller's [`BooleanOptions`]: the
+/// tolerance, the coplanar-face merge and its `keep_unmerged_name_substrs`
+/// list are honoured exactly as the binary path honours them, so a caller that
+/// falls back from a sequence of binary unions to one arrangement (the sheet
+/// metal walk with adjacent bends) keeps the same face partition contract.
+pub fn boolean_operation_nary_with_options(
+    operands: &[BrepSolid],
+    operation: BooleanOperation,
+    options: &BooleanOptions,
+) -> Result<BrepSolid, KernelRefusal> {
     if operands.is_empty() {
         return Err(KernelRefusal::input(KernelStage::Collect, "operands", "boolean_operation_nary: no operands provided"));
     }
@@ -1396,7 +1409,6 @@ pub fn boolean_operation_nary(
         return Err(KernelRefusal::input(KernelStage::Collect, "operands", "boolean_operation_nary: at most 255 operands supported"));
     }
     let debug = std::env::var("BREP_DEBUG_BOOL").is_ok();
-    let options = BooleanOptions::default();
 
     // One tolerance policy for the whole set: the largest-scale operand's policy
     // dominates (every derived band is monotonic in scale), matching how the

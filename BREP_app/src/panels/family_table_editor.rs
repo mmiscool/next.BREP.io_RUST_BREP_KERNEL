@@ -360,7 +360,7 @@ impl PasteOutcome {
 /// expression names, which a header row may name as new columns.
 ///
 /// * A header row: every cell of the first line is a header this table knows
-///   ([`header_target`]) and at least one names a part number or an
+///   (`header_target`) and at least one names a part number or an
 ///   expression. The remaining lines are written column by column under their
 ///   headers, starting at `at.row`, and a model expression that is not yet a
 ///   column becomes one.

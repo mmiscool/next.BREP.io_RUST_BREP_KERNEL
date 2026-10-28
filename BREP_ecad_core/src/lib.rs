@@ -9,6 +9,7 @@ pub mod erc;
 pub mod fabrication;
 pub mod footprint;
 pub mod kicad;
+pub mod kicad_git;
 pub mod netlist;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};

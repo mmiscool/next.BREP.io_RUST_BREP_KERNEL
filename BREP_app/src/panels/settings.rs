@@ -65,7 +65,7 @@ pub enum Tab {
 
 /// The display-settings panel's own transient UI state. It holds NO model state:
 /// the settings buffer is re-seeded from the live engine each frame (see
-/// [`SettingsPanel::settings_section`]).
+/// `SettingsPanel::settings_section`).
 pub struct SettingsPanel {
     /// Whether the floating window is shown. Toggled by the toolbar gear button
     /// and by the window's own close (`×`) button; public so the toolbar can bind
@@ -99,6 +99,10 @@ pub struct SettingsPanel {
     pub reconnect_blocker: Option<String>,
     /// Connect now was pressed: the config root the app switches to.
     reconnect_request: Option<std::path::PathBuf>,
+    /// The live session's sign-in was refused by the server (revoked,
+    /// expired): the tab reads not connected, with this reason, until the
+    /// person signs in again.
+    signed_out: Option<String>,
 }
 
 impl SettingsPanel {
@@ -107,6 +111,37 @@ impl SettingsPanel {
     pub fn show_plm_tab(&mut self) {
         self.open = true;
         self.tab = Tab::Plm;
+    }
+
+    /// The server ended this session's sign-in: open the PLM tab on its
+    /// sign-in, saying `why`, instead of a raw error on every request.
+    pub fn ask_plm_sign_in(&mut self, why: String) {
+        self.signed_out = Some(why);
+        self.show_plm_tab();
+    }
+
+    /// A native sign-in in the tab passed: `(username, token)`. The shell
+    /// hands it to the live session when that session's token was refused;
+    /// the tab reads connected again.
+    pub fn take_fresh_plm_token(&mut self) -> Option<(String, String)> {
+        let fresh = self.plm.as_mut()?.take_fresh_token()?;
+        self.signed_out = None;
+        Some(fresh)
+    }
+
+    /// Forget signed this machine out on the server since the last call: the
+    /// tab reads not connected, and the shell expects the server's refusal.
+    pub fn take_plm_signed_out_here(&mut self) -> bool {
+        if !self.plm.as_mut().is_some_and(|plm| plm.take_signed_out_here()) {
+            return false;
+        }
+        self.signed_out = Some("you signed out of the PLM on this machine: the next start is the file app, or sign in again".into());
+        true
+    }
+
+    /// The live session's sign-in was refused (see [`Self::ask_plm_sign_in`]).
+    pub fn plm_signed_out(&self) -> bool {
+        self.signed_out.is_some()
     }
 
     /// A fresh panel. The settings buffer is re-seeded from the engine every frame
@@ -123,6 +158,7 @@ impl SettingsPanel {
             plm: None,
             reconnect_blocker: None,
             reconnect_request: None,
+            signed_out: None,
         }
     }
 
@@ -164,7 +200,7 @@ impl SettingsPanel {
         // with the history + scene panels) — empty while the window is closed.
         if crate::automation::registry::enabled() {
             crate::automation::registry::publish("__brepSettingsHit", "settings window widget rects (field:*, group:*, panel:clip); empty while the window is closed", &self.hits_json());
-            crate::automation::registry::publish("__brepPlm", "the Settings PLM tab: {tab, status, url, username, reason, busy, outcome, failed}; tab false (and the rest null) in a file-only session", &self.plm_json(store));
+            crate::automation::registry::publish("__brepPlm", "the Settings PLM tab: {tab, status, url, username, reason, busy, outcome, failed, linking, linkCode, linkUrl, linkToken, linkNote}; tab false (and the rest null) in a file-only session", &self.plm_json(store));
         }
     }
 
@@ -260,6 +296,12 @@ impl SettingsPanel {
             "tab": true, "status": status, "url": url, "username": username, "reason": reason,
             "busy": plm.busy(), "outcome": outcome, "failed": failed,
             "connectable": plm.connectable(), "reconnectBlocker": self.reconnect_blocker,
+            "linking": plm.linking(),
+            "linkCode": plm.link.as_ref().map(|l| l.code.clone()),
+            "linkUrl": plm.link.as_ref().map(|l| l.url.clone()),
+            // The token alone, for a script deciding the link as the browser would.
+            "linkToken": plm.link.as_ref().and_then(|l| l.url.split_once("token=").map(|(_, t)| t.to_string())),
+            "linkNote": plm.link.as_ref().and_then(|l| l.note.clone()),
         })
         .to_string()
     }
@@ -287,10 +329,17 @@ impl SettingsPanel {
             crate::plm::connection::Status::Connected { url, .. } | crate::plm::connection::Status::NotConnected { url, .. } => url.clone(),
         };
         let same = self.plm.as_ref().is_some_and(|c| c.url() == url && *c.keep() == session.keep);
+        // Refused by the server: not connected, whatever the store's label says.
+        let status = match (&self.signed_out, session.status) {
+            (Some(why), crate::plm::connection::Status::Connected { url, .. }) => {
+                crate::plm::connection::Status::NotConnected { url, reason: Some(why.clone()) }
+            }
+            (_, status) => status,
+        };
         match self.plm.as_mut().filter(|_| same) {
             // Same server, same keep: a live switch moves only the status.
-            Some(plm) => plm.set_status(session.status),
-            None => self.plm = Some(PlmConnection::new(session.status, session.keep)),
+            Some(plm) => plm.set_status(status),
+            None => self.plm = Some(PlmConnection::new(status, session.keep)),
         }
     }
 
@@ -322,40 +371,49 @@ impl SettingsPanel {
         let native = matches!(plm.keep(), Keep::Files(_));
         let idle = !plm.busy();
         if native {
-            ui.label("Paste an API token (from the PLM's web page):");
-            let token = ui.add(
-                egui::TextEdit::singleline(&mut plm.token_input)
-                    .password(true)
-                    .hint_text("plm_…"),
-            );
-            hits.insert("plm:token".into(), token.rect);
-            let use_token = ui.add_enabled(
-                idle && !plm.token_input.trim().is_empty(),
-                egui::Button::new("Use token"),
-            );
-            hits.insert("plm:use-token".into(), use_token.rect);
-            if use_token.clicked() {
-                plm.use_token();
-            }
+            browser_sign_in(ui, plm, hits, idle);
             ui.separator();
-        }
-        if native {
-            ui.label("Or sign in, and this machine keeps a token (not the password):");
-            let username =
-                ui.add(egui::TextEdit::singleline(&mut plm.username).hint_text("username"));
-            hits.insert("plm:username".into(), username.rect);
-            let password = ui.add(
-                egui::TextEdit::singleline(&mut plm.password)
-                    .password(true)
-                    .hint_text("password"),
-            );
-            hits.insert("plm:password".into(), password.rect);
-            let can_sign_in = idle && !plm.username.trim().is_empty() && !plm.password.is_empty();
-            let sign_in = ui.add_enabled(can_sign_in, egui::Button::new("Sign in"));
-            hits.insert("plm:sign-in".into(), sign_in.rect);
-            if sign_in.clicked() {
-                plm.use_password();
-            }
+            // The fallback, for a machine with no browser (or a person who
+            // would rather type): a pasted token, or a password traded for one.
+            let here = egui::CollapsingHeader::new("Sign in here instead")
+                .id_salt("plm-sign-in-here")
+                .default_open(false)
+                .show(ui, |ui| {
+                    ui.label("Paste an API token (from the PLM's web page):");
+                    let token = ui.add(
+                        egui::TextEdit::singleline(&mut plm.token_input)
+                            .password(true)
+                            .hint_text("plm_…"),
+                    );
+                    hits.insert("plm:token".into(), token.rect);
+                    let use_token = ui.add_enabled(
+                        idle && !plm.token_input.trim().is_empty(),
+                        egui::Button::new("Use token"),
+                    );
+                    hits.insert("plm:use-token".into(), use_token.rect);
+                    if use_token.clicked() {
+                        plm.use_token();
+                    }
+                    ui.separator();
+                    ui.label("Or sign in, and this machine keeps a token (not the password):");
+                    let username =
+                        ui.add(egui::TextEdit::singleline(&mut plm.username).hint_text("username"));
+                    hits.insert("plm:username".into(), username.rect);
+                    let password = ui.add(
+                        egui::TextEdit::singleline(&mut plm.password)
+                            .password(true)
+                            .hint_text("password"),
+                    );
+                    hits.insert("plm:password".into(), password.rect);
+                    let can_sign_in =
+                        idle && !plm.username.trim().is_empty() && !plm.password.is_empty();
+                    let sign_in = ui.add_enabled(can_sign_in, egui::Button::new("Sign in"));
+                    hits.insert("plm:sign-in".into(), sign_in.rect);
+                    if sign_in.clicked() {
+                        plm.use_password();
+                    }
+                });
+            hits.insert("plm:sign-in-here".into(), here.header_response.rect);
             ui.separator();
         } else {
             ui.label("This browser uses your PLM session. Manage your account and sign in on the PLM page.");
@@ -693,6 +751,70 @@ impl SettingsPanel {
     }
 }
 
+
+/// The PLM tab's browser sign-in (native): one button, then "Continue in your
+/// browser" with the code the page will show, the link to copy when no browser
+/// opened, and Cancel. The link page opens through `open_url`: eframe hands it
+/// to the default browser, and the headless automation host opens nothing. Hit keys `plm:browser-sign-in`, `plm:link-code`,
+/// `plm:link-url`, `plm:copy-link`, `plm:cancel-link`.
+fn browser_sign_in(
+    ui: &mut egui::Ui,
+    plm: &mut crate::plm::connection::PlmConnection,
+    hits: &mut HashMap<String, egui::Rect>,
+    idle: bool,
+) {
+    if let Some(url) = plm.take_open_request() {
+        ui.ctx().open_url(egui::OpenUrl::new_tab(url));
+    }
+    if let Some(wait) = plm.link_wait() {
+        ui.ctx().request_repaint_after(std::time::Duration::from_secs_f64(wait.max(0.05)));
+    }
+    let Some(link) = &plm.link else {
+        if plm.linking() {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("Starting the sign-in…");
+            });
+            return;
+        }
+        ui.label("Sign in with your PLM account in your web browser. This machine keeps a token, never your password.");
+        let start = ui.add_enabled(idle, egui::Button::new("Sign in with your browser"));
+        hits.insert("plm:browser-sign-in".into(), start.rect);
+        if start.clicked() {
+            plm.sign_in_with_browser();
+        }
+        return;
+    };
+    ui.strong("Continue in your browser");
+    ui.label("Approve the sign-in on the PLM page that opened in your browser. It shows this code:");
+    let code = ui.label(egui::RichText::new(&link.code).monospace().size(22.0).strong());
+    hits.insert("plm:link-code".into(), code.rect);
+    ui.label("No browser page? Copy this link into a browser:");
+    let url = ui.add(egui::Label::new(egui::RichText::new(&link.url).small().weak()).wrap().selectable(true));
+    hits.insert("plm:link-url".into(), url.rect);
+    let (url_text, note) = (link.url.clone(), link.note.clone());
+    ui.horizontal(|ui| {
+        let copy = ui.button("Copy link");
+        hits.insert("plm:copy-link".into(), copy.rect);
+        if copy.clicked() {
+            ui.ctx().copy_text(url_text);
+        }
+        let cancel = ui.button("Cancel");
+        hits.insert("plm:cancel-link".into(), cancel.rect);
+        if cancel.clicked() {
+            plm.cancel_link();
+        }
+    });
+    if let Some(note) = note {
+        ui.label(egui::RichText::new(note).color(PROBLEM_AMBER));
+    }
+    if plm.link.is_some() {
+        ui.horizontal(|ui| {
+            ui.spinner();
+            ui.label("Waiting for the approval…");
+        });
+    }
+}
 
 /// Reload the page onto the PLM session a web sign-in (or sign-out) made.
 fn reload_page() {

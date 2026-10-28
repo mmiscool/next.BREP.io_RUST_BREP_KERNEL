@@ -12,6 +12,7 @@ pub(super) struct IllustrationSnapshot {
     open_view: Option<String>,
     modeling: Option<super::pmi_ops::PmiModelingSnapshot>,
     explode: std::collections::HashMap<String, crate::scene::SolidDisplay>,
+    section_hidden: Vec<String>,
 }
 
 impl EngineState {
@@ -34,6 +35,7 @@ impl EngineState {
             open_view: self.pmi_open_view.clone(),
             modeling: self.pmi_modeling.clone(),
             explode: self.pmi_explode_originals.clone(),
+            section_hidden: self.pmi_section_hidden.clone(),
         });
         Ok(())
     }
@@ -62,6 +64,7 @@ impl EngineState {
         self.pmi_open_view = snapshot.open_view;
         self.pmi_modeling = snapshot.modeling;
         self.pmi_explode_originals = snapshot.explode;
+        self.pmi_section_hidden = snapshot.section_hidden;
         self.refresh_pmi_overlay();
         self.dirty = true;
         Ok(())

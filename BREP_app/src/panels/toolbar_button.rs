@@ -367,7 +367,7 @@ pub fn menu_row(
 
 /// The width an overflow menu of `rows` — `(glyph, label)` pairs — is drawn at:
 /// the NATURAL width of its widest row, measured by egui in a throwaway
-/// invisible sizing pass, exactly the way [`switcher_width`] measures the
+/// invisible sizing pass, exactly the way `switcher_width` measures the
 /// switcher. Re-deriving egui's button padding and atom-gap arithmetic here
 /// would go quietly loose or tight the next time either changes.
 pub fn menu_width(ui: &egui::Ui, rows: &[(&str, &str)]) -> f32 {

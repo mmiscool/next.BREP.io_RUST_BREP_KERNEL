@@ -11,6 +11,34 @@ pub(crate) fn enabled(ctx: &egui::Context) -> bool {
     ctx.data(|d| d.get_temp::<bool>(egui::Id::new("brep-touch-input"))).unwrap_or(false)
 }
 
+/// Below this window width (points) a layout is NARROW even with a mouse.
+pub(crate) const NARROW_WIDTH: f32 = 650.0;
+
+/// Touch input or a window narrower than [`NARROW_WIDTH`]: the layouts in
+/// which the side panels would cover the view, so a dialog's reference pick
+/// takes the view over (`panels::pick_bar`).
+pub(crate) fn narrow(ctx: &egui::Context) -> bool {
+    enabled(ctx) || ctx.content_rect().width() < NARROW_WIDTH
+}
+
+/// Whether the shell drew NO chrome this frame (a focused reference pick,
+/// `panels::pick_bar`): the page's own full-screen button, which the toolbar
+/// places, must not float over the view then.
+pub(crate) fn set_chrome_hidden(ctx: &egui::Context, hidden: bool) {
+    ctx.data_mut(|d| d.insert_temp(egui::Id::new("brep-chrome-hidden"), hidden));
+}
+
+pub(crate) fn chrome_hidden(ctx: &egui::Context) -> bool {
+    ctx.data(|d| d.get_temp::<bool>(egui::Id::new("brep-chrome-hidden"))).unwrap_or(false)
+}
+
+/// The page's full-screen button shows only beside the toolbar that places
+/// it: never under a modal, never while the chrome is hidden.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+pub(crate) fn fullscreen_button_visible(ctx: &egui::Context) -> bool {
+    !chrome_hidden(ctx) && ctx.memory(|m| m.top_modal_layer().is_none())
+}
+
 pub(crate) fn compact(ctx: &egui::Context) -> bool {
     #[cfg(target_arch = "wasm32")]
     {
@@ -57,7 +85,7 @@ pub(crate) fn publish_editor(ctx: &egui::Context) {
                     let style = ctx.global_style();
                     let payload = serde_json::json!({ "x": rect.left() * zoom, "y": rect.top() * zoom,
                         "bg": style.visuals.widgets.inactive.bg_fill.to_array(), "fg": style.visuals.text_color().to_array(),
-                        "visible": ctx.memory(|m| m.top_modal_layer().is_none()) }).to_string();
+                        "visible": fullscreen_button_visible(ctx) }).to_string();
                     let _ = callback.call1(&JsValue::NULL, &JsValue::from_str(&payload));
                 }
             }

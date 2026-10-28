@@ -190,23 +190,21 @@ fn simple_hole_bridge(
 /// construction): cast a +u ray from the anchor, take the closest polygon
 /// edge it pierces, then refine to any reflex vertex hiding inside the
 /// (anchor, hit, candidate) triangle — the one with the smallest angle off
-/// the ray wins. A nearest-vertex heuristic without the visibility test
-/// (the previous code) let a bridge slice straight through an adjacent
-/// hole's chain, and the self-intersecting merged polygon ear-clipped OVER
-/// the holes (problemInbox 2026-08-05T01-07: a spider face's four quadrant
-/// openings rendered filled solid).
+/// the ray wins. A nearest-vertex heuristic without the visibility test (the
+/// previous code) let a bridge slice straight through an adjacent hole's
+/// chain, and the self-intersecting merged polygon ear-clipped OVER the
+/// holes.
 ///
 /// Eberly's construction only guarantees that the returned vertex is VISIBLE,
 /// not that it is close: when the pierced edge is a long diagonal, its max-u
-/// endpoint can be the far corner of the whole face. On a plate whose holes
-/// all sit along such a diagonal, every hole then bridged to that one corner —
-/// four 300-unit corridors converging on a single vertex, which pinches the
-/// merged polygon into slivers the ear clip cannot resolve; it stalls and fans,
-/// spraying overlapping triangles over the face (problemInbox
-/// 2026-08-06T19-00: an excavator arm's side plates meshed 1.9x their own
-/// area). So the Eberly vertex is used as a guaranteed-visible FALLBACK, and
-/// the target actually taken is the NEAREST vertex whose bridge is verified
-/// clear — short bridges leave the polygon locally simple and ear-clippable.
+/// endpoint can be the far corner of the whole face. On a plate whose holes all
+/// sit along such a diagonal, every hole then bridged to that one corner — four
+/// 300-unit corridors converging on a single vertex, which pinches the merged
+/// polygon into slivers the ear clip cannot resolve; it stalls and fans,
+/// spraying overlapping triangles over the face. So the Eberly vertex is used
+/// as a guaranteed-visible FALLBACK, and the target actually taken is the
+/// NEAREST vertex whose bridge is verified clear — short bridges leave the
+/// polygon locally simple and ear-clippable.
 pub(in crate::watertight_tessellation) fn bridge_target(polygon: &[FaceVertex], hole: &[FaceVertex], hole_anchor: usize) -> usize {
     let anchor = hole[hole_anchor].uv;
     nearest_clear_bridge_target(polygon, hole, hole_anchor)
@@ -397,10 +395,8 @@ pub(in crate::watertight_tessellation) fn bridge_is_clear(
     // test is as load-bearing as the crossing test: a bridge that dives into the
     // hole's OWN interior has to come back out across this chain, and when it
     // exits exactly THROUGH a chain vertex the crossing is not "proper", so the
-    // crossing test alone waves it through (problemInbox 2026-08-06T21-04: an
-    // evenly sampled circular bolt hole puts a vertex exactly antipodal to its
-    // own max-u anchor, so the corridor ran down the hole's diameter and the ear
-    // clip filled half the hole).
+    // crossing test alone waves it through (so the corridor ran down the hole's
+    // diameter and the ear clip filled half the hole).
     let hole_count = hole.len();
     for offset in 0..hole_count {
         let h0 = offset;

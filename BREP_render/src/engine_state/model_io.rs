@@ -558,9 +558,9 @@ impl EngineState {
     /// The colour the VIEWPORT is showing a body with no persisted colour of
     /// its own: the uniform `face_color` setting, or the stable name-hash in the
     /// artifact look. This is the one place the GLB lane parts company with the
-    /// STEP lane, which leaves such a body unstyled — glTF has no "no style"
-    /// state, so a primitive with no material renders in the format's own
-    /// default (white, fully metallic), a colour nobody chose.
+    /// STEP and 3MF lanes, which leave such a body unstyled — glTF has no "no
+    /// style" state, so a primitive with no material renders in the format's
+    /// own default (white, fully metallic), a colour nobody chose.
     fn display_body_color(&self, name: &str) -> [u8; 3] {
         match self.settings.face_color_mode {
             crate::style::FaceColorMode::HashedBySolid => {
@@ -588,7 +588,7 @@ impl EngineState {
     /// NODE's transform — see the kernel module's doc. COLOURS are the metadata
     /// store's, the same authority the STEP lane reads, with a face's beating its
     /// body's; a body the store says nothing about takes the colour the viewport
-    /// shows it in ([`Self::display_body_color`]). `override_model_colors` is not
+    /// shows it in (`Self::display_body_color`). `override_model_colors` is not
     /// honoured, exactly as it is not by the STEP lane: it is a display switch
     /// whose contract is that the store is never touched.
     ///
@@ -641,6 +641,57 @@ impl EngineState {
         )
         .map(|(bytes, _report)| bytes)
     }
+    /// Export the CURRENT display scene as a 3MF package (`.3mf`) — the same
+    /// triangles the STL, OBJ and GLB lanes write, through the kernel's
+    /// [`brep_kernel::write_3mf`], one named `<object>` per scene solid with
+    /// its vertices welded (3MF wants a closed manifold, which the per-face
+    /// display soup is not). BINARY, so the bytes cross the store's byte-shaped
+    /// interchange like a GLB's.
+    ///
+    /// COLOURS follow the STEP lane's rule, not the GLB lane's: the metadata
+    /// store is the authority, a face's colour beats its body's, and a body the
+    /// store says nothing about is written with NO material — 3MF, unlike glTF,
+    /// has that state, and it is what a slicer user wants of an unpainted part
+    /// (it prints in the filament's colour, not a grey this app chose). The one
+    /// exception is the same as STEP's: in the `hashedBySolid` face-colour mode
+    /// an uncoloured body is written in the name-derived colour the viewport
+    /// shows. `override_model_colors` is not honoured, as in the other lanes.
+    ///
+    /// Errs when the scene has no triangles.
+    pub fn export_3mf_bytes(&self, document_name: &str) -> Result<Vec<u8>, String> {
+        self.plugin_export_ready()?;
+        let colors: std::collections::BTreeMap<String, [u8; 3]> =
+            self.persisted_export_colors().into_iter().collect();
+        let hashed = self.settings.face_color_mode == crate::style::FaceColorMode::HashedBySolid;
+        let solids: Vec<brep_kernel::ThreeMfSolid> = self
+            .scene
+            .solids()
+            .iter()
+            .map(|solid| {
+                let mut mesh = brep_kernel::Mesh::default();
+                for (position, normal) in solid.mesh.positions.iter().zip(&solid.mesh.normals) {
+                    mesh.positions.extend(position.iter().map(|value| f64::from(*value)));
+                    mesh.normals.extend(normal.iter().map(|value| f64::from(*value)));
+                }
+                mesh.indices = solid.mesh.indices.clone();
+                mesh.face_ids = solid.mesh.face_ids.clone();
+                let face_colors = solid
+                    .faces
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, face)| {
+                        colors.get(&face.name).map(|rgb| (index as u32, *rgb))
+                    })
+                    .collect();
+                let color = colors.get(&solid.name).copied().or_else(|| {
+                    hashed.then(|| srgb_bytes(crate::color::solid_color_srgb(&solid.name)))
+                });
+                brep_kernel::ThreeMfSolid { name: solid.name.clone(), mesh, color, face_colors }
+            })
+            .collect();
+        brep_kernel::write_3mf(&solids, document_name).map(|(bytes, _report)| bytes)
+    }
+
     /// The solids a 3D PDF shows ([`crate::sheets::pdf3d::Body`]): every
     /// visible, non-sketch solid with triangles, UN-POSED (an explode the
     /// active PMI view applies to the viewport is that view's, not the
@@ -653,9 +704,9 @@ impl EngineState {
         self.scene
             .solids()
             .iter()
+            .map(|shown| self.pmi_explode_originals.get(&shown.name).unwrap_or(shown))
             .filter(|solid| solid.visible && !solid.is_sketch && solid.mesh.indices.len() >= 3)
-            .map(|shown| {
-                let solid = self.pmi_explode_originals.get(&shown.name).unwrap_or(shown);
+            .map(|solid| {
                 let body = colors.get(&solid.name).copied().unwrap_or_else(|| self.display_body_color(&solid.name));
                 let face_colors: Vec<[u8; 3]> = solid
                     .faces

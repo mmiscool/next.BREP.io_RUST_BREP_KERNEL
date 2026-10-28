@@ -59,6 +59,24 @@ pub async fn list_folder(
 }
 
 #[derive(Debug, Deserialize, Default)]
+pub struct LinksQuery {
+    /// A part id or number.
+    #[serde(default)]
+    pub part: String,
+}
+
+/// The folders of the caller's own workspace that link a part (`?part=`).
+pub async fn folders_linking(
+    State(db): State<Shared>,
+    headers: HeaderMap,
+    Query(query): Query<LinksQuery>,
+) -> Result<Json<Value>, Error> {
+    let user = require_user(&db, &headers)?;
+    let folders = db.folders_linking(&user, &query.part)?;
+    Ok(Json(json!({ "folders": folders })))
+}
+
+#[derive(Debug, Deserialize, Default)]
 pub struct NewFolder {
     #[serde(default)]
     pub parent: String,

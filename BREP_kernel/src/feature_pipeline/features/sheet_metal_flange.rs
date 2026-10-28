@@ -23,8 +23,9 @@
 //! remove the overlapping corner square. Closed corners extend the earlier
 //! wall by `R+t` and the other by `R`; miter corners cut both at 45°.
 //! Closed/miter treatments require perpendicular corners and 90° folds.
-//! Acute/reflex corners, over-folds, and reshaping an edge already flanged by
-//! another feature are rejected. Finite-width rip slots use SM.CUTOUT.
+//! Acute/reflex corners and over-folds are rejected. An adjacent open corner
+//! may shorten a plain rectangular wall from an earlier feature; decorated
+//! walls retain the reshape refusal. Finite-width rip slots use SM.CUTOUT.
 
 use crate::feature_pipeline::sheet_metal::{self, Bend, Edge, Flat, Hole, HoleBend, HoleBendKind};
 use crate::feature_pipeline::{FeatureContext, FeatureResult};

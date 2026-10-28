@@ -260,8 +260,23 @@ pub fn fillet_edges(
     // `BREP_SUBSET_SEARCH_FULL=1` restores the full search.
     let cap = std::env::var_os("BREP_SUBSET_SEARCH_FULL").is_none().then_some(1);
     let _cap = SubsetDropCap::set(cap);
-    let (result, selection) =
-        fillet_edges_reported(solid, edge_points, edge_names, radius, chamfer, name)?;
+    let (result, selection) = match fillet_edges_reported(solid, edge_points, edge_names, radius, chamfer, name) {
+        // A wall that folds is relieved where it folds, not refused
+        // (`blend/relief.rs`).
+        Err(fold) if !chamfer && crate::blend::is_wall_fold(&fold) && crate::blend::relief::radius_relief_on() => {
+            let misfit = crate::blend::relief::is_misfit_fold(&fold);
+            let relieved = relieve_fold(solid, edge_points, edge_names, radius, name, fold);
+            // A misfit (a lane's refusal read as the ball not fitting) took
+            // the group off the ladder that follows the network; when no
+            // relief builds, that ladder answers, as it did before the relief.
+            if relieved.is_err() && misfit {
+                let _off = crate::blend::relief::MisfitOff::enter();
+                return fillet_edges(solid, edge_points, edge_names, radius, chamfer, name);
+            }
+            return relieved;
+        }
+        reported => reported?,
+    };
     if selection.is_complete() {
         return Ok(result);
     }
@@ -303,6 +318,206 @@ pub fn fillet_edges(
                 .unwrap_or("the whole group built but not every edge grew a wall"),
         ),
     ))
+}
+
+/// The fillet a constant `radius` would fold: rebuilt with the radius reduced
+/// only where it does not fit (`blend/relief.rs`), and a note saying where
+/// and to what. Selected edges joined (through shared vertices) to no relief
+/// zone are built at the constant radius first; each relieved group is then
+/// built by the taper network on that body. A relief that still folds is
+/// planned again with a wider margin; when none builds, the fold stands with
+/// the last relief's reason appended.
+fn relieve_fold(
+    solid: &BrepSolid,
+    edge_points: &[Vec3],
+    edge_names: Option<&[String]>,
+    radius: f64,
+    name: Option<&str>,
+    fold: KernelRefusal,
+) -> Result<BrepSolid, KernelRefusal> {
+    let _relieving = crate::blend::relief::Relieving::enter();
+    let debug = std::env::var("BREP_DEBUG_NETWORK").is_ok();
+    let selected: Vec<u64> = edge_points.iter().map(|point| resolve_edge_by_point(solid, *point)).collect::<Result<_, _>>()?;
+    // One edge per carrier continued (`relief::join_continuations`): the
+    // selection is read again on the joined body, two points on one joined
+    // edge selecting it once.
+    let joined = crate::blend::relief::join_continuations(solid, &selected);
+    let solid = joined.as_ref().unwrap_or(solid);
+    let mut ids: Vec<u64> = Vec::with_capacity(edge_points.len());
+    let mut points: Vec<Vec3> = Vec::with_capacity(edge_points.len());
+    let mut names: Vec<String> = Vec::with_capacity(edge_points.len());
+    for (index, point) in edge_points.iter().enumerate() {
+        let id = resolve_edge_by_point(solid, *point)?;
+        if !ids.contains(&id) {
+            ids.push(id);
+            points.push(*point);
+            if let Some(name) = edge_names.and_then(|names| names.get(index)) {
+                names.push(name.clone());
+            }
+        }
+    }
+    let (edge_points, edge_names) = (&points[..], edge_names.map(|_| &names[..]));
+    if debug && joined.is_some() {
+        eprintln!("radius relief: joined continuation edges, {} selected edges become {}", selected.len(), ids.len());
+    }
+    let started = web_time::Instant::now();
+    let measured = match crate::blend::relief::measure_ceilings(solid, &ids, radius) {
+        Ok(measured) => measured,
+        Err(refusal) => return Err(fold.with_message(|message| format!("{message}; the relief could not measure the edges: {refusal}"))),
+    };
+    if debug {
+        eprintln!("radius relief: ceilings measured in {:.1} ms", started.elapsed().as_secs_f64() * 1e3);
+    }
+    // A relief is LOCAL: the requested radius stands where it fits. Where it
+    // fits nowhere on the selection (a ball wider than a rod's rim, the whole
+    // rim short alike) a radius lowered everywhere is a different request,
+    // and the fold stands, naming the largest ball that does fit.
+    let largest = measured.iter().flatten().map(|(_, ceiling)| *ceiling).fold(0.0_f64, f64::max);
+    if largest < radius {
+        return Err(fold.with_message(|message| {
+            format!("{message}; r {radius} fits nowhere along the selection, so it is not reduced locally: the largest ball that fits anywhere on it is {largest:.6}")
+        }));
+    }
+    let mut last: Option<KernelRefusal> = None;
+    for attempt in 0..crate::blend::relief::ATTEMPTS {
+        let plan = match crate::blend::relief::plan_relief(solid, &ids, radius, &measured, attempt) {
+            Ok(Some(plan)) => plan,
+            // The ball fits everywhere the probe reads: the fold is not one
+            // a smaller radius answers.
+            Ok(None) => break,
+            Err(refusal) => {
+                last = Some(refusal);
+                break;
+            }
+        };
+        let mark = crate::blend::blend_notes_mark();
+        match build_relief_plan(solid, edge_points, edge_names, &ids, radius, name, &plan) {
+            Ok(body) => {
+                for zone in &plan.zones {
+                    let near: Vec<String> = zone
+                        .edges
+                        .iter()
+                        .filter_map(|index| solid.edges.iter().find(|edge| edge.id == ids[*index]))
+                        .map(|edge| edge.name.clone().unwrap_or_else(|| format!("edge #{}", edge.id)))
+                        .map(|label| format!("`{label}`"))
+                        .collect();
+                    // The note states what was built: where the law never
+                    // climbs back to the requested radius on the zone's edges
+                    // (report 5e49bb42's rim, 1.08 to 1.78 against r 2.2), it
+                    // says so instead of "locally".
+                    let (low, high) = zone
+                        .edges
+                        .iter()
+                        .flat_map(|index| plan.stops[*index].iter().map(|(_, r)| *r))
+                        .fold((f64::INFINITY, 0.0_f64), |(low, high), r| (low.min(r), high.max(r)));
+                    let note = if high < radius * (1.0 - 1e-9) {
+                        format!(
+                            "radius reduced over the whole of {}: {low:.2} to {high:.2}, so r {radius} is reached nowhere \
+                             on them (where they turn tightest the largest ball that fits is {:.2})",
+                            near.join(", "),
+                            zone.ceiling,
+                        )
+                    } else {
+                        format!(
+                            "radius reduced to {:.2} locally near {}: r {radius} does not fit there (the largest ball that does is {:.2})",
+                            zone.radius,
+                            near.join(", "),
+                            zone.ceiling,
+                        )
+                    };
+                    crate::blend::record_blend_note(note);
+                }
+                return Ok(body);
+            }
+            Err(refusal) => {
+                crate::blend::blend_notes_truncate(mark);
+                if debug {
+                    eprintln!("radius relief attempt {attempt} refused at {:.1} ms: {refusal}", started.elapsed().as_secs_f64() * 1e3);
+                }
+                last = Some(refusal);
+            }
+        }
+    }
+    Err(match last {
+        Some(last) => fold.with_message(|message| format!("{message}; a locally reduced radius did not build either: {last}")),
+        None => fold,
+    })
+}
+
+/// Build one relief plan (see [`relieve_fold`]).
+fn build_relief_plan(
+    solid: &BrepSolid,
+    edge_points: &[Vec3],
+    edge_names: Option<&[String]>,
+    ids: &[u64],
+    radius: f64,
+    name: Option<&str>,
+    plan: &crate::blend::relief::ReliefPlan,
+) -> Result<BrepSolid, KernelRefusal> {
+    // Groups of selected edges joined through shared vertices.
+    let count = ids.len();
+    let mut group: Vec<usize> = (0..count).collect();
+    let find = |group: &mut Vec<usize>, mut index: usize| {
+        while group[index] != index {
+            group[index] = group[group[index]];
+            index = group[index];
+        }
+        index
+    };
+    let vertices: Vec<[u64; 2]> = ids
+        .iter()
+        .map(|id| {
+            solid.edges.iter().find(|edge| edge.id == *id).map(|edge| [edge.start_vertex_id, edge.end_vertex_id]).unwrap_or([u64::MAX; 2])
+        })
+        .collect();
+    for a in 0..count {
+        for b in a + 1..count {
+            if vertices[a].iter().any(|vertex| *vertex != u64::MAX && vertices[b].contains(vertex)) {
+                let (root_a, root_b) = (find(&mut group, a), find(&mut group, b));
+                group[root_a] = root_b;
+            }
+        }
+    }
+    let reduced: Vec<bool> = plan.stops.iter().map(|stops| stops.iter().any(|(_, r)| *r < radius)).collect();
+    let relieved_group: Vec<bool> = (0..count)
+        .map(|index| {
+            let root = find(&mut group, index);
+            (0..count).any(|other| reduced[other] && find(&mut group, other) == root)
+        })
+        .collect();
+    let pick = |want: bool| -> (Vec<Vec3>, Option<Vec<String>>, Vec<Vec<(f64, f64)>>) {
+        let indices: Vec<usize> = (0..count).filter(|index| relieved_group[*index] == want).collect();
+        (
+            indices.iter().map(|index| edge_points[*index]).collect(),
+            edge_names.map(|names| indices.iter().filter_map(|index| names.get(*index).cloned()).collect()),
+            indices.iter().map(|index| plan.stops[*index].clone()).collect(),
+        )
+    };
+    let (constant_points, constant_names, _) = pick(false);
+    let (relieved_points, relieved_names, relieved_stops) = pick(true);
+    let mut body = solid.clone();
+    if !constant_points.is_empty() {
+        body = fillet_edges(&body, &constant_points, constant_names.as_deref(), radius, false, name)?;
+    }
+    let built = fillet_edges_variable_impl(
+        &body,
+        &relieved_points,
+        relieved_names.as_deref(),
+        &relieved_stops,
+        false,
+        name,
+        "fillet_edges",
+        false,
+    )?;
+    let issues = built.validate();
+    if !issues.is_empty() {
+        return Err(KernelRefusal::internal(
+            KernelStage::Validate,
+            "relief_validate",
+            format!("radius relief: the relieved fillet does not validate: {issues:?}"),
+        ));
+    }
+    Ok(built)
 }
 
 /// What a blend selection actually achieved.
@@ -536,6 +751,17 @@ pub fn fillet_edges_reported(
                     let declined = matches!(&pad_error.class, crate::RefusalClass::UnsupportedGeometry { what } if what == "open_pad_shape");
                     if declined { error } else { pad_error }
                 })
+            }).or_else(|error| {
+                // The cusp composition (reports 80c5d9d1 and 6dfd5a22): every
+                // mixed corner a CUSP, the convex and concave edges leaving it
+                // tangent. Declines by class on any other corner, and every
+                // other refusal keeps the one before it: it is the last try.
+                cusp_composition(solid, &selected_ids, edge_points, edge_names, radius, name, &corners).map_err(|cusp_error| {
+                    if std::env::var("BREP_DEBUG_NETWORK").is_ok() {
+                        eprintln!("cusp composition refused: {cusp_error}");
+                    }
+                    error
+                })
             });
             match composed {
                 Ok(result) => {
@@ -561,7 +787,7 @@ pub fn fillet_edges_reported(
                             KernelStage::Validate,
                             "runout_walls_missing",
                             format!(
-                                "{entry}: the runout composition built a solid with no wall on {}",
+                                "{entry}: the composition built a solid with no wall on {}",
                                 missing.iter().map(|index| selection_label(*index, edge_points, edge_names, name)).collect::<Vec<_>>().join(", ")
                             ),
                         ));
@@ -674,7 +900,10 @@ pub fn fillet_edges_reported(
     // to catch.  Reported by name instead (`blend/fold.rs`).
     // A miter past the sharp edge's far vertex needs support-face switching,
     // not a smaller selection. Do not let the subset search mask the limit.
-    if crate::blend::is_wall_fold(&group_err) || crate::blend::is_miter_support_overrun(&group_err) {
+    // Nor can dropping another edge close a tangential end whose taper failed.
+    if crate::blend::is_wall_fold(&group_err) || crate::blend::is_miter_support_overrun(&group_err)
+        || crate::blend::is_tangential_transverse_end(&group_err)
+    {
         return Err(group_err);
     }
     // Fewer than two edges: nothing to drop, so the group error is final.
@@ -747,11 +976,12 @@ pub fn fillet_edges_reported(
 }
 
 /// Lane R1: [`walls_missing`] reads a station's side off its nearest face
-/// before casting a ray. Off unless `BREP_WALLS_MISSING_NEAREST` is `1`/`on`
-/// until its census promotes it.
+/// before casting a ray. On by default (promoted 2026-10-19 on the fixed
+/// reader: 98 + 144 census 0 differ); `BREP_WALLS_MISSING_NEAREST=0` (or
+/// `off`) casts the ray at every station.
 pub(crate) fn walls_missing_nearest_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| matches!(std::env::var("BREP_WALLS_MISSING_NEAREST").as_deref(), Ok("1") | Ok("on")))
+    *ON.get_or_init(|| !matches!(std::env::var("BREP_WALLS_MISSING_NEAREST").as_deref(), Ok("0") | Ok("off")))
 }
 
 
@@ -832,7 +1062,7 @@ pub(super) fn walls_missing_ties(
     let build_timing = crate::blend::BlendTimer::start("timing.walls_missing.classifier_ms");
     let classifier = SolidClassifier::new(result, band)
         .or_refuse(KernelStage::Validate, "wall_classifier")?;
-    // Lane R1 (`BREP_WALLS_MISSING_NEAREST=1`): a station's On-or-not is read
+    // Lane R1 (`BREP_WALLS_MISSING_NEAREST`): a station's On-or-not is read
     // off its nearest face first (`NearestFaceSide`, the classifier's own On
     // band of ten `band`s, answering only where the read is rigorous); the
     // ray answers whatever it declines.
@@ -1311,12 +1541,12 @@ fn rounded_boss_composition(
         .collect::<Result<_, _>>()?;
     // Round the connected convex selection together. Its far corners need
     // their usual vertex patches before a concave rim can cross these walls.
-    let mut convex_indices = vec![spine_index];
+    let mut rounded_indices = vec![spine_index];
     loop {
         let next = (0..selected_ids.len()).find(|index| {
             convexity[*index]
-                && !convex_indices.contains(index)
-                && convex_indices.iter().any(|other| {
+                && !rounded_indices.contains(index)
+                && rounded_indices.iter().any(|other| {
                     let edge = selected_edges[*index];
                     let mate = selected_edges[*other];
                     [edge.start_vertex_id, edge.end_vertex_id]
@@ -1325,18 +1555,51 @@ fn rounded_boss_composition(
                 })
         });
         match next {
-            Some(index) => convex_indices.push(index),
+            Some(index) => rounded_indices.push(index),
             None => break,
         }
     }
-    convex_indices.sort_by_key(|index| selected_ids[*index]);
+    // Keep complete stars together. A selected concave edge between two
+    // convex rims is part of their vertex blend, even though it is not part
+    // of the convex flood above. Rounding the rims without it builds a horn
+    // torus for an *unselected* third edge; adding that edge later leaves a
+    // flat cap against the torus instead of the selected star's tangent sector.
+    // Only absorb an edge whose selected neighbours are already in this
+    // group at BOTH ends. In particular, never pull in a concave rim leading
+    // to another mixed corner: that rim still needs the bridge below.
+    loop {
+        let next = (0..selected_ids.len()).find(|&index| {
+            if convexity[index] || rounded_indices.contains(&index) {
+                return false;
+            }
+            let edge = selected_edges[index];
+            let mut has_star = false;
+            for vertex in [edge.start_vertex_id, edge.end_vertex_id] {
+                let neighbours: Vec<_> = selected_edges.iter().enumerate()
+                    .filter(|(other, mate)| *other != index
+                        && (mate.start_vertex_id == vertex || mate.end_vertex_id == vertex))
+                    .map(|(other, _)| other)
+                    .collect();
+                if neighbours.iter().any(|other| !rounded_indices.contains(other)) {
+                    return false;
+                }
+                has_star |= neighbours.len() >= 2;
+            }
+            has_star
+        });
+        match next {
+            Some(index) => rounded_indices.push(index),
+            None => break,
+        }
+    }
+    rounded_indices.sort_by_key(|index| selected_ids[*index]);
     let mixed: Vec<_> = corners
         .iter()
         .filter(|corner| {
             corner
                 .convex
                 .iter()
-                .any(|index| convex_indices.contains(index))
+                .any(|index| rounded_indices.contains(index))
         })
         .collect();
     if mixed.iter().any(|corner| {
@@ -1411,7 +1674,7 @@ fn rounded_boss_composition(
     }
     // Give unnamed walls distinct identities too: bridges are located by
     // their two carriers, never proximity to the old corner.
-    let convex_names: Vec<String> = convex_indices
+    let rounded_names: Vec<String> = rounded_indices
         .iter()
         .map(|index| {
             per_edge_name(edge_names, name, *index)
@@ -1419,14 +1682,14 @@ fn rounded_boss_composition(
                 .unwrap_or_else(|| format!("FILLET:ROUNDED_BOSS_SPINE:{index}"))
         })
         .collect();
-    let convex_points: Vec<Vec3> = convex_indices
+    let rounded_points: Vec<Vec3> = rounded_indices
         .iter()
         .map(|index| edge_points[*index])
         .collect();
     let rounded = fillet_edges_group_in(
         solid,
-        &convex_points,
-        Some(&convex_names),
+        &rounded_points,
+        Some(&rounded_names),
         radius,
         false,
         name,
@@ -1434,7 +1697,7 @@ fn rounded_boss_composition(
     )?;
     let mut bridges = Vec::new();
     for (corner, cap) in mixed.iter().zip(&caps) {
-        let wall_index = convex_indices
+        let wall_index = rounded_indices
             .iter()
             .position(|index| *index == corner.convex[0])
             .ok_or_else(|| {
@@ -1460,7 +1723,7 @@ fn rounded_boss_composition(
                 faces.iter().any(|face| face.id == *cap)
                     && faces
                         .iter()
-                        .any(|face| face.name.as_deref() == Some(&convex_names[wall_index]))
+                        .any(|face| face.name.as_deref() == Some(&rounded_names[wall_index]))
             })
             .collect();
         if candidates.len() != 1 {
@@ -1471,7 +1734,7 @@ fn rounded_boss_composition(
     let rim_ids: Vec<u64> = selected_ids
         .iter()
         .enumerate()
-        .filter(|(index, _)| !convex_indices.contains(index))
+        .filter(|(index, _)| !rounded_indices.contains(index))
         .map(|(_, id)| *id)
         .collect();
     // Both ends must join requested rim edges: never extend a selection
@@ -1491,7 +1754,7 @@ fn rounded_boss_composition(
     let mut points = Vec::new();
     let mut names = Vec::new();
     for (index, id) in selected_ids.iter().enumerate() {
-        if convex_indices.contains(&index) {
+        if rounded_indices.contains(&index) {
             continue;
         }
         let edge = rounded
@@ -1756,6 +2019,91 @@ fn open_pad_composition(
     Ok(result)
 }
 
+/// The CUSP composition (2026-10-24/25 reports 80c5d9d1 and 6dfd5a22): a
+/// selection whose every mixed corner is a CUSP — a convex edge and a concave
+/// edge leaving the vertex tangent to each other, the face they share
+/// narrowing to zero width between them. Report 6dfd5a22 selects the whole
+/// of E6's start-face sliver outside F2's r 5 round: its two straight convex
+/// edges run on G1 into the concave arc at both tips.
+///
+/// No other composition admits it: the pads of the open-pad composition
+/// trim into the boss, and here both blends must TAPER to the tip, each
+/// against the face the other leaves. Built in two stages, each an ordinary
+/// group build, the order report 80c5d9d1 took by hand (F9, then F10):
+///
+/// 1. Every CONCAVE edge first: its round tapers to zero at each cusp
+///    (`blend/taper_runout.rs`), leaving a hairline of the shared face
+///    beside it.
+/// 2. Every CONVEX edge on the stage-1 body: its round tapers to zero at the
+///    same tips, with the width read against the stage-1 round's rail (the
+///    face's boundary past the cusp line, `taper_runout::boundary_chain`).
+///    The two rounds are G1 to the hairline between them.
+fn cusp_composition(
+    solid: &BrepSolid,
+    selected_ids: &[u64],
+    edge_points: &[Vec3],
+    edge_names: Option<&[String]>,
+    radius: f64,
+    name: Option<&str>,
+    corners: &[crate::blend::MixedCorner],
+) -> Result<BrepSolid, KernelRefusal> {
+    let shape = |message: String| KernelRefusal::unsupported(KernelStage::Classify, "cusp_composition_shape", message);
+    if std::env::var("BREP_NO_NETWORK").is_ok() {
+        return Err(shape("the cusp composition is a network construction and BREP_NO_NETWORK is set".into()));
+    }
+    let edge_of = |index: usize| solid.edges.iter().find(|edge| edge.id == selected_ids[index]);
+    // The unit tangent leaving `vertex` into the edge.
+    let away = |index: usize, vertex: u64| -> Option<Vec3> {
+        let edge = edge_of(index)?;
+        let at_start = edge.start_vertex_id == vertex;
+        let tangent = edge.curve.unit_tangent(if at_start { edge.t0 } else { edge.t1 }, edge.t0, edge.t1).ok()?;
+        Some(if at_start { tangent } else { tangent.scale(-1.0) })
+    };
+    if corners.is_empty() {
+        return Err(shape("no mixed corners".into()));
+    }
+    for corner in corners {
+        let cusped = corner.convex.iter().all(|&convex| {
+            corner.concave.iter().any(|&concave| {
+                matches!((away(convex, corner.vertex), away(concave, corner.vertex)), (Some(a), Some(b)) if a.dot(b) >= 1.0 - 1e-6)
+            })
+        });
+        if !cusped || corner.convex.is_empty() || corner.concave.is_empty() {
+            return Err(shape(format!("the mixed corner at vertex {} is not a cusp", corner.vertex)));
+        }
+    }
+    let convexity = crate::blend::selection_convexity(solid, selected_ids, radius)
+        .ok_or_else(|| shape("the selection's convexity could not be read edge by edge".into()))?;
+    let concave: Vec<usize> = (0..selected_ids.len()).filter(|index| !convexity[*index]).collect();
+    let convex: Vec<usize> = (0..selected_ids.len()).filter(|index| convexity[*index]).collect();
+    if concave.is_empty() || convex.is_empty() {
+        return Err(shape("the cusp composition needs convex and concave edges".into()));
+    }
+    let names_of = |indices: &[usize]| -> Option<Vec<String>> { edge_names.map(|names| indices.iter().map(|index| names[*index].clone()).collect()) };
+    let points_of = |indices: &[usize]| -> Vec<Vec3> { indices.iter().map(|index| edge_points[*index]).collect() };
+    let debug = std::env::var("BREP_DEBUG_NETWORK").is_ok();
+    let stage1 = fillet_edges_group_in(solid, &points_of(&concave), names_of(&concave).as_deref(), radius, false, name, None)
+        .map_err(|error| error.with_message(|error| format!("cusp composition, the concave rounds: {error}")))?;
+    if debug {
+        eprintln!("cusp composition: stage 1 built the {} concave rounds", concave.len());
+    }
+    // Each convex edge is read again on the stage-1 body by its point: the
+    // taper split it only at its hairline's end, beside the tip.
+    for &index in &convex {
+        resolve_edge_by_point(&stage1, edge_points[index])
+            .map_err(|error| error.with_message(|error| format!("cusp composition: a convex edge is not on the stage-1 body: {error}")))?;
+    }
+    let result = fillet_edges_group_in(&stage1, &points_of(&convex), names_of(&convex).as_deref(), radius, false, name, None)
+        .map_err(|error| error.with_message(|error| format!("cusp composition, the convex rounds: {error}")))?;
+    // Every round here tapers to zero at a tip, and the two rounds meet on
+    // the hairline of the face between them: an edge's end stations stay ON
+    // the skin (the concave arc's first tenth, where the convex round's
+    // contact lands back on the arc), and the wall check reads the majority
+    // of a tie, as it does for the runout composition's network ring.
+    RUNOUT_RING_IS_NETWORK.with(|flag| flag.set(true));
+    Ok(result)
+}
+
 fn runout_composition(
     solid: &BrepSolid,
     selected_ids: &[u64],
@@ -1869,8 +2217,9 @@ fn runout_composition(
 // BREP lane L: begin walls_missing_tie_all_stations_20261015
 thread_local! {
     /// Set by a runout composition that SUCCEEDED on the network's ring (no
-    /// network refusal recorded while its ring was built), read and cleared
-    /// by its acceptance: only there does a tie take the majority.
+    /// network refusal recorded while its ring was built), and by a cusp
+    /// composition that built (`cusp_composition`), read and cleared by the
+    /// acceptance: only there does a tie take the majority.
     static RUNOUT_RING_IS_NETWORK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 // BREP lane L: end walls_missing_tie_all_stations_20261015
@@ -2178,6 +2527,10 @@ thread_local! {
     /// The network's last refusal in a group build on this thread, read
     /// back by the runout composition when its ring stage fails.
     static LAST_NETWORK_REFUSAL: std::cell::RefCell<Option<KernelRefusal>> = const { std::cell::RefCell::new(None) };
+    /// The wall fold the network refused THIS group build's selection by,
+    /// scoped to one [`fillet_edges_group_unchecked`] call (nested component
+    /// builds save and restore it).
+    static GROUP_NETWORK_FOLD: std::cell::RefCell<Option<KernelRefusal>> = const { std::cell::RefCell::new(None) };
 }
 
 /// One component of a selection: its edge points (as bits, so the key is
@@ -2299,7 +2652,32 @@ struct GroupBody {
     bowtie_clean: bool,
 }
 
+/// [`fillet_edges_group_lanes`], answering a selection the network refused
+/// by a WALL FOLD and the cutter composition then failed too by that fold,
+/// not by the composition's own text: the fold is the reason, and the
+/// composition's last cutter ("mates share their end boundary edge" on the
+/// 2026-10-21 sculpted cap, report 5e49bb42) names nothing the user can act
+/// on. The fold keeps its class, so the subset search above stops on it.
 fn fillet_edges_group_unchecked(
+    solid: &BrepSolid,
+    edge_points: &[Vec3],
+    edge_names: Option<&[String]>,
+    radius: f64,
+    chamfer: bool,
+    name: Option<&str>,
+    memo: Option<&mut ComponentMemo>,
+    wrap_concave: bool,
+) -> Result<GroupBody, KernelRefusal> {
+    let outer = GROUP_NETWORK_FOLD.with(|fold| fold.borrow_mut().take());
+    let built = fillet_edges_group_lanes(solid, edge_points, edge_names, radius, chamfer, name, memo, wrap_concave);
+    let fold = GROUP_NETWORK_FOLD.with(|fold| std::mem::replace(&mut *fold.borrow_mut(), outer));
+    match (built, fold) {
+        (Err(error), Some(fold)) if !crate::blend::is_wall_fold(&error) => Err(fold),
+        (built, _) => built,
+    }
+}
+
+fn fillet_edges_group_lanes(
     solid: &BrepSolid,
     edge_points: &[Vec3],
     edge_names: Option<&[String]>,
@@ -2611,8 +2989,9 @@ fn fillet_edges_group_unchecked(
             }
         });
         // BREP lane L: end lcount229_knot_aware_group_network_20261016
-        match network_result {
-            Ok(mut network) => {
+        // The network's result under its acceptance: `Ok(Some)` accepted,
+        // `Ok(None)` rejected (the ladder goes on), `Err` terminal.
+        let accept_network = |mut network: BrepSolid, built_radius: f64| -> Result<Option<GroupBody>, KernelRefusal> {
                 // Fail-safe like the rest of the ladder: a heal or validation
                 // problem in the network result falls through to the cutter,
                 // it does not fail the group.  So does an UNTRIMMED result: the
@@ -2622,7 +3001,7 @@ fn fillet_edges_group_unchecked(
                 // self-intersecting solid is still a watertight one.
                 let entry = if chamfer { "chamfer_edges" } else { "fillet_edges" };
                 let heal = crate::blend::BlendTimer::start("timing.heal_vertex_gaps_ms");
-                let healed = heal_edge_vertex_gaps(&mut network, radius);
+                let healed = heal_edge_vertex_gaps(&mut network, built_radius);
                 heal.stop();
                 // See the closed-rim lane above: widen a planar carrier the
                 // surgery overran, or refuse — terminally — rather than fall
@@ -2641,7 +3020,7 @@ fn fillet_edges_group_unchecked(
                 // and a bowtie is watertight, incident and connected.
                 let bowtie = check_loop_self_crossings(&network, entry).and_then(|()| check_blend_wall_loops(&network, entry));
                 if healed.is_ok() && issues.is_empty() && interference.is_ok() && bowtie.is_ok() {
-                    return Ok(GroupBody { body: network, bowtie_clean: true });
+                    return Ok(Some(GroupBody { body: network, bowtie_clean: true }));
                 }
                 if std::env::var("BREP_DEBUG_NETWORK").is_ok() {
                     eprintln!(
@@ -2651,15 +3030,86 @@ fn fillet_edges_group_unchecked(
                     dump_loops_debug("INPUT", solid);
                     dump_loops_debug("RESULT", &network);
                 }
+                Ok(None)
+        };
+        match network_result {
+            Ok(network) => {
+                if let Some(body) = accept_network(network, radius)? {
+                    return Ok(body);
+                }
             }
             Err(refusal) => {
                 if std::env::var("BREP_DEBUG_NETWORK").is_ok() {
                     eprintln!("network refused: {refusal}");
                 }
+                // A stripe whose TAPER to a cusp reaches its full radius only
+                // inside the corner setback at its other end has no constant
+                // run at all (report 80c5d9d1's F10, 2026-10-24: r 1 on the two
+                // straight edges of a sliver at most 2 wide within 0.9 of its
+                // square corner). The round is built at the largest smaller
+                // radius whose taper clears the setback, and says so, as the
+                // relief says it over a whole rim. Before 2026-10-26 the group
+                // fell through to the cutter composition, which closed each
+                // round on a web and a cap under the neighbouring blend (an
+                // undercut) in 9 minutes.
+                let pinched_taper = matches!(&refusal.class, crate::RefusalClass::UnsupportedGeometry { what }
+                    if what == crate::blend::STRIPE_PINCH_TAPER_WHAT);
+                if !chamfer && pinched_taper && crate::blend::relief::radius_relief_on() {
+                    let labels: Vec<String> =
+                        (0..edge_points.len()).map(|index| selection_label(index, edge_points, edge_names, name)).collect();
+                    for step in 1..=10u32 {
+                        let reduced = radius * (1.0 - 0.05 * f64::from(step));
+                        let built = crate::blend::blend_star_network_with_corner_policy(
+                            solid, &selected_edge_ids, reduced, chamfer, &network_names, &network_corner_name, wrap_concave,
+                        );
+                        if std::env::var("BREP_DEBUG_NETWORK").is_ok() {
+                            eprintln!(
+                                "taper pinch ladder: r {reduced:.4} -> {}",
+                                match &built {
+                                    Ok(_) => "built".to_string(),
+                                    Err(error) => format!("refused: {error}"),
+                                }
+                            );
+                        }
+                        match built {
+                            Ok(network) => {
+                                let Some(body) = accept_network(network, reduced)? else { break };
+                                crate::blend::record_blend_note(format!(
+                                    "radius reduced over the whole of {} to {reduced:.4}: at r {radius} the round tapering to \
+                                     its tip reaches the full radius only inside the corner setback at its other end, so \
+                                     r {radius} is reached nowhere",
+                                    labels.join(", ")
+                                ));
+                                return Ok(body);
+                            }
+                            Err(again) if matches!(&again.class, crate::RefusalClass::UnsupportedGeometry { what }
+                                if what == crate::blend::STRIPE_PINCH_TAPER_WHAT) => continue,
+                            Err(_) => break,
+                        }
+                    }
+                }
                 // The runout composition reads the ring's own classification
                 // back when the ring stage falls through to the cutter and
                 // that refuses too (`LAST_NETWORK_REFUSAL`).
                 LAST_NETWORK_REFUSAL.with(|last| *last.borrow_mut() = Some(refusal.clone()));
+                if crate::blend::is_wall_fold(&refusal) {
+                    GROUP_NETWORK_FOLD.with(|fold| *fold.borrow_mut() = Some(refusal.clone()));
+                }
+                // A refusal that is not a fold where the ball does not fit
+                // (report 37e16630 at r 1.0, a ball the size of the round it
+                // rides: its centre curve collapses to a point and the station
+                // Newton is singular) is the fold the relief answers, not a
+                // question for the composition, which took 143 s over it.
+                if !chamfer && !crate::blend::is_wall_fold(&refusal) && crate::blend::relief::radius_relief_on() {
+                    let started = web_time::Instant::now();
+                    let misfit = crate::blend::relief::first_misfit(solid, &selected_edge_ids, radius);
+                    if std::env::var("BREP_DEBUG_NETWORK").is_ok() {
+                        eprintln!("radius relief: misfit probe {misfit:?} in {:.1} ms", started.elapsed().as_secs_f64() * 1e3);
+                    }
+                    if let Some((edge_id, least)) = misfit {
+                        return Err(crate::blend::relief::misfit_fold(edge_id, least, radius, &refusal));
+                    }
+                }
                 // The fail-safe above is for a refusal that says "not this
                 // lane".  A marched fit that left its carriers does not say
                 // that, and the cutter's answer to the same selection is not a
@@ -2668,15 +3118,18 @@ fn fillet_edges_group_unchecked(
                 // closed form, and it VALIDATES.  A refusal that falls through
                 // to a validating wrong solid is not a refusal.
                 //
-                // Only that one, not all of `is_terminal_blend_refusal`.  The
-                // single-edge tool also reads the WALL FOLD as terminal, and
-                // making the group build agree costs
-                // `inbox_20260902_corner_torus_collar_fillet::each_collar_has_its_own_fold_threshold`
-                // a collar that the cutter composes today (measured
-                // 2026-09-16: refuses at fold factor 1.035935 on a radius-2.1
-                // wall). Whether a group selection should refuse where a
-                // single edge does is a decision with a test standing on the
-                // current answer, and it is not this slice's.
+                // Not every WALL FOLD, though the single-edge tool reads them all
+                // as terminal (`is_terminal_blend_refusal`): a fold of the lens
+                // between the rails is one the composition's cutter carves
+                // (`inbox_20260902_corner_torus_collar_fillet::each_collar_has_its_own_fold_threshold`,
+                // the r 2.1 collar at fold factor 1.036). One that reaches a
+                // RAIL is not: the ball pokes out through the face it rides,
+                // there is no lens to carve, and every cutter sweeps the same
+                // envelope. Until 2026-10-21 the group fell through on that too:
+                // report 37e16630's end face at r 1.7 around an r 1 round on its
+                // outline ran the composition and its subset search for over 20
+                // minutes. A lens fold the composition cannot rescue either is
+                // answered by the fold (`fillet_edges_group_unchecked`).
                 //
                 // A blend stopping within a sliver of its face's width that
                 // cannot be snapped onto the far edge without opening the shell
@@ -2695,12 +3148,16 @@ fn fillet_edges_group_unchecked(
                 // (`blend::PLANAR_CHART_EDGE_OFF_PLANE`,
                 // `blend::PLANAR_CHART_WIDEN_UNSOUND`): the clamped body the
                 // composition would answer with is the defect being refused.
-                if crate::blend::is_marched_fit_off_carriers(&refusal)
+                // A tangential end whose taper could not be planned also has
+                // no supported closure for cutter composition to recover.
+                if crate::blend::is_rail_fold(&refusal)
+                    || crate::blend::is_marched_fit_off_carriers(&refusal)
                     || crate::blend::is_consumed_snap(&refusal)
                     || crate::blend::is_rail_collapse(&refusal)
                     || crate::blend::is_full_width_collapse(&refusal)
                     || crate::blend::is_planar_chart_refusal(&refusal)
                     || crate::blend::is_miter_support_overrun(&refusal)
+                    || crate::blend::is_tangential_transverse_end(&refusal)
                 {
                     return Err(refusal);
                 }
@@ -3237,7 +3694,7 @@ fn concave_first_on() -> bool {
 /// Variable-radius fillet/chamfer of a GROUP of edges (§4.9.5), the app entry
 /// for tapered blends: each selected edge (resolved by a point on it) is
 /// blended with the SAME radius profile `radii` — a list of (edge-fraction,
-/// radius) stops in [0,1] — applied along that edge's own parameterization.
+/// radius) stops in `[0,1]` — applied along that edge's own parameterization.
 /// Edges are blended independently (no shared-vertex corner rounding; a
 /// variable-radius star has no single tangent ball), so this is the tapered
 /// counterpart of `fillet_edges` for the constant case.
@@ -3358,10 +3815,15 @@ fn fillet_edges_variable_impl(
     // radius, a result its acceptance rejects) falls through to the
     // composition below exactly as before.
     if crate::blend::taper_network_on() && edge_points.len() >= 2 {
-        if let Some(built) = fillet_variable_network(
+        match fillet_variable_network(
             solid, edge_points, edge_names, per_edge_stops, chamfer, name, entry, max_radius,
         )? {
-            return Ok(built);
+            Ok(built) => return Ok(built),
+            // A radius relief's law is the network's to build: the
+            // composition below took 75 s a plan on report 37e16630 at r 1.0
+            // and built none, so the relief's next plan is asked instead.
+            Err(refusal) if crate::blend::relief::relieving() => return Err(refusal),
+            Err(_) => {}
         }
     }
 
@@ -3593,7 +4055,7 @@ fn fillet_variable_network(
     name: Option<&str>,
     entry: &str,
     max_radius: f64,
-) -> Result<Option<BrepSolid>, KernelRefusal> {
+) -> Result<Result<BrepSolid, KernelRefusal>, KernelRefusal> {
     let mut edge_ids = Vec::with_capacity(edge_points.len());
     for point in edge_points {
         edge_ids.push(resolve_edge_by_point(solid, *point)?);
@@ -3605,15 +4067,31 @@ fn fillet_variable_network(
         .collect();
     let network_corner_name = |adjacent: &[usize]| corner_face_name(edge_names, name, adjacent);
     let debug = std::env::var("BREP_DEBUG_NETWORK").is_ok();
-    let mut network = match crate::blend::blend_star_network_laws(
-        solid, &edge_ids, &laws, chamfer, &network_names, &network_corner_name, true,
-    ) {
+    // A support pcurve off the floor is re-run ONCE with the knot-aware
+    // support fit, as the constant group's network is; a re-run that also
+    // fails keeps the first refusal. A radius relief's law crowds the
+    // march's stations into its ramp, and the rail's knot spans there are
+    // finer than the uniform track can follow (report 1ce49a5c: r 1.4 on
+    // the outline of a cut through a sub-D body, its relieved rail spans
+    // 7.7e-5 against a track spacing of 2.4e-4, 1.5e-6 off at 4097
+    // samples).
+    let law_network = || {
+        crate::blend::blend_star_network_laws(solid, &edge_ids, &laws, chamfer, &network_names, &network_corner_name, true)
+    };
+    let network_result = law_network().or_else(|first| {
+        if crate::blend::is_pcurve_floor_refusal(&first) {
+            crate::blend::with_pcurve_knot_retry(law_network).map_err(|_| first)
+        } else {
+            Err(first)
+        }
+    });
+    let mut network = match network_result {
         Ok(network) => network,
         Err(refusal) => {
             if debug {
                 eprintln!("law network refused: {refusal}");
             }
-            return Ok(None);
+            return Ok(Err(refusal));
         }
     };
     // The constant group's acceptance of a network result, in its order:
@@ -3628,12 +4106,12 @@ fn fillet_variable_network(
     if healed.is_ok() && issues.is_empty() && interference.is_ok() && bowtie.is_ok() {
         crate::soundness::census::profile_operation(&network, &[solid], None, entry);
         match crate::accept_sound(network, entry) {
-            Ok(sound) => return Ok(Some(sound)),
+            Ok(sound) => return Ok(Ok(sound)),
             Err(refusal) => {
                 if debug {
                     eprintln!("law network result unsound: {refusal}");
                 }
-                return Ok(None);
+                return Ok(Err(refusal));
             }
         }
     }
@@ -3643,7 +4121,17 @@ fn fillet_variable_network(
              interference={interference:?} bowtie={bowtie:?}"
         );
     }
-    Ok(None)
+    Ok(Err(KernelRefusal::unsupported(
+        KernelStage::Validate,
+        "law_network_rejected",
+        format!(
+            "{entry}: the tapered network's result was rejected (heal {}, {} validation issues, interference {}, loops {})",
+            if healed.is_ok() { "ok" } else { "failed" },
+            issues.len(),
+            if interference.is_ok() { "ok" } else { "found" },
+            if bowtie.is_ok() { "ok" } else { "found" },
+        ),
+    )))
 }
 
 pub(crate) fn fillet_edges_variable_stops(

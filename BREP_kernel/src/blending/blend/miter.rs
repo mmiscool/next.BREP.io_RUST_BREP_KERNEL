@@ -51,6 +51,9 @@ pub(super) struct MiterStripe<'a> {
     pub(super) radius: f64,
 }
 
+/// Row parameters this close are one station ([`MiterStripe::u_limit`]).
+const VERTEX_STATION_TIE: f64 = 1e-9;
+
 impl MiterStripe<'_> {
     /// Section coordinate from `f` (0 on the shared rail, 1 on the other).
     fn z(&self, fraction: f64) -> f64 {
@@ -96,7 +99,15 @@ impl MiterStripe<'_> {
     /// radius beyond the corner), so P is out in the overshoot and the seam
     /// runs the other way, back into the span.  Both are "toward the vertex";
     /// only the row end that lies beyond it differs.
+    ///
+    /// A ball AT the vertex station (a radius equal to the round the corner
+    /// already carries: report 37e16630 at r 1.0, where both read 0.885720)
+    /// heads for the vertex's own row end; the bare comparison flipped on
+    /// the last bit there and sent the seam back along the whole stripe.
     fn u_limit(&self) -> f64 {
+        if (self.u_vertex() - self.u_ball).abs() <= VERTEX_STATION_TIE {
+            return self.u_end();
+        }
         if self.u_vertex() >= self.u_ball {
             self.rows.u_domain[1]
         } else {

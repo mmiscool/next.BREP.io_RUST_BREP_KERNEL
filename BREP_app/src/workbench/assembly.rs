@@ -16,9 +16,9 @@ pub const CONSTRAINTS_PANEL_ID: &str = "assemblyConstraints";
 /// The BOM panel's id (the columned parts list).
 pub const BOM_PANEL_ID: &str = "assemblyBom";
 
-/// Datum / Plane / Sketch / Component (`ACOMP`).
+/// Datum / Plane / Sketch / Component (`ACOMP`) / Pattern Component (`APAT`).
 fn includes(feature: &FeatureInfo<'_>) -> bool {
-    matches!(feature.type_code, "S" | "D" | "P" | "ACOMP")
+    matches!(feature.type_code, "S" | "D" | "P" | "ACOMP" | "APAT")
 }
 
 /// Add Component's id — named because the shell arm that answers for it and

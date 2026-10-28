@@ -130,6 +130,15 @@ fn check_unique(state: &State, owner: &str, parent: &str, name: &str, except: &s
     Ok(())
 }
 
+/// A folder that links a part ([`Db::folders_linking`]): its id (empty for
+/// the top), its name and its path from the top (`Frames/Welded`).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct LinkingFolder {
+    pub id: String,
+    pub name: String,
+    pub path: String,
+}
+
 /// The folders from `id` up to the top: `id` first. Bounded by
 /// [`MAX_DEPTH`] + 1 steps, so a damaged tree cannot loop.
 fn ancestry(state: &State, id: &str) -> Vec<String> {
@@ -440,6 +449,33 @@ impl Db {
                 .collect();
             rows.sort_by_key(|r| (!r.mine, r.username.to_ascii_lowercase()));
             rows
+        })
+    }
+
+    /// The folders of `viewer`'s OWN workspace holding a link to `part` (an
+    /// id or number), each once, in tree order: what an assembly opened some
+    /// other way than from the workspace is filed under. The top of the
+    /// workspace is the folder with an empty id.
+    pub fn folders_linking(&self, viewer: &User, part: &str) -> Result<Vec<LinkingFolder>, Error> {
+        self.read(|state| {
+            let part = state.part_by_id_or_number(part.trim()).ok_or_else(|| Error::not_found("part"))?;
+            let mut out: Vec<LinkingFolder> = Vec::new();
+            for link in state.workspace.iter().filter(|e| {
+                e.owner == viewer.id && e.kind == WorkspaceKind::Link && e.link.as_ref().is_some_and(|l| l.part_id == part.id)
+            }) {
+                if out.iter().any(|f| f.id == link.parent) {
+                    continue;
+                }
+                let mut names: Vec<String> = ancestry(state, &link.parent)
+                    .iter()
+                    .filter_map(|id| state.workspace.get(id).map(|e| e.name.clone()))
+                    .collect();
+                names.reverse();
+                let name = names.last().cloned().unwrap_or_default();
+                out.push(LinkingFolder { id: link.parent.clone(), name, path: names.join("/") });
+            }
+            out.sort_by_key(|f| f.path.to_ascii_lowercase());
+            Ok(out)
         })
     }
 

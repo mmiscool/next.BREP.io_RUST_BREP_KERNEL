@@ -1,4 +1,6 @@
-//! 3MF (3D Manufacturing Format) import — the core specification only.
+//! 3MF (3D Manufacturing Format) import and export — the core specification
+//! only. [`write_3mf`] is the export half, documented in [`write`]; the rest of
+//! this page is the reader.
 //!
 //! [`read_3mf`] reads a 3MF package (an OPC ZIP container) and returns the
 //! meshes its `<resources>` define plus the flattened list of instances the
@@ -23,18 +25,32 @@
 //!   inner-to-outer, with the winding of a mirrored instance reversed so the
 //!   soup stays outward-facing.
 //!
+//! # Colours
+//!
+//! The core specification's one property group IS read: `<basematerials>` with
+//! its `<base displaycolor="#RRGGBB">` entries, an object's `pid`/`pindex`
+//! default and a triangle's own `pid`/`p1`. Each triangle of
+//! [`ThreeMfMesh::triangle_colors`] (and of the flattened
+//! [`ThreeMfReadResult::triangle_colors`]) is the colour it resolves to, or
+//! `None` — a triangle with no property, or one naming a group that is not a
+//! base material. The vectors are EMPTY when no triangle resolves, so a plain
+//! package costs nothing. Colour is appearance, never geometry: a malformed or
+//! dangling property reference is `None`, not a refusal. This is what the
+//! writer ([`write_3mf`]) emits, so an export re-imports with its colours.
+//!
 //! # What is ignored, by design
 //!
-//! Everything outside the core namespace: the materials-and-properties, slice,
+//! Everything outside the core namespace: the materials-and-properties
+//! extension's colour groups, textures and composites, and the slice,
 //! production, beam-lattice and secure-content extensions. Extension elements
-//! are skipped as whole subtrees and prefixed attributes (`p:UUID`, a
-//! triangle's `pid`/`p1..p3` property indices) are never read, so a file that
-//! carries them imports as pure geometry rather than failing. A package that
-//! declares such an extension REQUIRED (`requiredextensions`) is refused
-//! instead, because honouring it is exactly what this reader cannot do.
-//! `<metadata>` and thumbnails carry no geometry and are skipped. An object's
-//! `name` is kept on each [`ThreeMfInstance`] only so a consumer can say WHICH
-//! object a refusal is about.
+//! are skipped as whole subtrees and prefixed attributes (`p:UUID`) are never
+//! read, so a file that carries them imports as geometry plus whatever core
+//! colours it has, rather than failing. A package that declares such an
+//! extension REQUIRED (`requiredextensions`) is refused instead, because
+//! honouring it is exactly what this reader cannot do. `<metadata>` and
+//! thumbnails carry no geometry and are skipped. An object's `name` is kept on
+//! each [`ThreeMfInstance`] only so a consumer can say WHICH object a refusal
+//! is about.
 //!
 //! Anything the core specification makes required and the file omits — the
 //! start-part relationship, an object id, a triangle's vertex indices, a
@@ -70,8 +86,11 @@
 
 mod inflate;
 mod model;
+mod write;
 mod xml;
 mod zip;
+
+pub use write::{write_3mf, ThreeMfSolid, ThreeMfWriteReport};
 
 
 use serde::Serialize;
@@ -211,6 +230,10 @@ pub struct ThreeMfMesh {
     pub positions: Vec<f64>,
     /// Triangle corners, three indices into `positions`/3.
     pub indices: Vec<u32>,
+    /// One entry per triangle — the 8-bit sRGB colour its base material gives
+    /// it, or `None` — when at least one triangle of the mesh resolves to a
+    /// colour; EMPTY otherwise. See the module doc's "Colours".
+    pub triangle_colors: Vec<Option<[u8; 3]>>,
 }
 
 impl ThreeMfMesh {
@@ -275,6 +298,11 @@ pub struct ThreeMfReadResult {
     /// Triangle corners into `positions`/3, winding preserved (reversed for a
     /// mirrored instance so the result stays outward-facing).
     pub indices: Vec<u32>,
+    /// Parallel to the flattened triangles (`indices.len() / 3` entries, each
+    /// following its triangle through the instance order and a mirrored
+    /// placement's winding reversal) when any placed triangle resolves to a
+    /// colour; EMPTY otherwise.
+    pub triangle_colors: Vec<Option<[u8; 3]>>,
 }
 
 impl ThreeMfReadResult {
@@ -455,10 +483,25 @@ fn flatten(
     let meshes = document
         .meshes
         .iter()
-        .map(|mesh| ThreeMfMesh {
-            object_id: mesh.object_id,
-            positions: mesh.positions.iter().map(|value| value * scale).collect(),
-            indices: mesh.indices.clone(),
+        .map(|mesh| {
+            let object_color = document.color(mesh.object_property);
+            let mut triangle_colors: Vec<Option<[u8; 3]>> = mesh
+                .properties
+                .iter()
+                .map(|property| match property {
+                    Some(property) => document.color(Some(*property)),
+                    None => object_color,
+                })
+                .collect();
+            if triangle_colors.iter().all(Option::is_none) {
+                triangle_colors.clear();
+            }
+            ThreeMfMesh {
+                object_id: mesh.object_id,
+                positions: mesh.positions.iter().map(|value| value * scale).collect(),
+                indices: mesh.indices.clone(),
+                triangle_colors,
+            }
         })
         .collect::<Vec<_>>();
     let mut instances = Vec::new();
@@ -471,6 +514,8 @@ fn flatten(
     }
     let mut positions = Vec::new();
     let mut indices = Vec::new();
+    let mut triangle_colors: Vec<Option<[u8; 3]>> = Vec::new();
+    let colored = instances.iter().any(|instance| !meshes[instance.mesh].triangle_colors.is_empty());
     let mut triangles = 0usize;
     for instance in &mut instances {
         let mesh = &meshes[instance.mesh];
@@ -503,6 +548,14 @@ fn flatten(
                 indices.extend([base + triangle[0], base + triangle[1], base + triangle[2]]);
             }
         }
+        // A colour rides with its triangle whichever way it is wound.
+        if colored {
+            if mesh.triangle_colors.is_empty() {
+                triangle_colors.extend(std::iter::repeat(None).take(mesh.triangle_count()));
+            } else {
+                triangle_colors.extend_from_slice(&mesh.triangle_colors);
+            }
+        }
     }
     Ok(ThreeMfReadResult {
         model_part,
@@ -511,6 +564,7 @@ fn flatten(
         instances,
         positions,
         indices,
+        triangle_colors,
     })
 }
 

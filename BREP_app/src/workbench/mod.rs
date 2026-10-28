@@ -36,14 +36,17 @@ pub use commands::*;
 
 pub mod all;
 pub mod assembly;
+pub mod cam;
 pub mod diagram;
 pub mod drawing;
 pub mod ecad;
+pub mod instructions;
 pub mod modeling;
 pub mod pads;
 pub mod pcb;
 pub mod pmi;
 pub mod sheet_metal;
+pub mod simulation;
 pub mod sketch;
 pub mod sketch3d;
 pub mod symbol;
@@ -219,6 +222,12 @@ pub static WORKBENCHES: &[&Workbench] = &[
     &pcb::PCB,
     &symbol::SYMBOL,
     &pads::PADS,
+    // Manufacturing: setups, tools, operations and toolpaths over the model.
+    &cam::CAM,
+    // Manufacturing instructions: an assembly, step by step.
+    &instructions::INSTRUCTIONS,
+    // Motion studies: an assembly's mates driven over time.
+    &simulation::SIMULATION,
 ];
 
 /// Workbenches DECLARED but not yet in the dropdown — none today. A

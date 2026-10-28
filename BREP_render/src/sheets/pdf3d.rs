@@ -37,8 +37,8 @@
 //! the claim is checked in a real reader, not taken from the text.
 
 use brep_kernel::{
-    pmi_present, PmiAnnotationReport, PmiCamera, PmiGeometry, PmiLayoutStyle, PmiPlane, PmiProjection, PmiReport,
-    PmiState, PmiStatus, PmiView,
+    pmi_present, PmiAnnotationReport, PmiCamera, PmiGeometry, PmiLayoutStyle, PmiPlane, PmiPose, PmiProjection,
+    PmiReport, PmiState, PmiStatus, PmiView,
 };
 
 use super::pdf::{string_literal, PT_PER_MM};
@@ -104,6 +104,15 @@ pub struct View3d {
     pub wireframe: bool,
     /// Visibility per [`Model3d::nodes`] entry.
     pub visible: Vec<bool>,
+    /// Per [`Model3d::nodes`] entry, the node's `/M` in this view: a solid
+    /// an explode step moves, as its composed stages ([`stage_matrix`]).
+    /// `None` leaves the node where the stream put it.
+    pub poses: Vec<Option<[f64; 12]>>,
+    /// The view's section plane, `(point, normal)`, kept where
+    /// `(p − point)·normal ≥ 0` as in the viewport. A half section's further
+    /// planes are not carried: a `/3DCrossSection` cannot keep what either
+    /// plane keeps, so the reader cuts the first plane only.
+    pub section: Option<([f64; 3], [f64; 3])>,
 }
 
 /// The file's 3D content: the U3D bytes, the node names in stream order, and
@@ -356,18 +365,48 @@ pub fn build(bodies: &[Body], pmi: &PmiState, report: Option<&PmiReport>) -> Res
     let nodes: Vec<String> = scene.models.iter().map(|model| model.name.clone()).collect();
     let mut views: Vec<View3d> = cameras
         .iter()
-        .map(|(view, camera)| View3d {
-            id: view.id.clone(),
-            name: if view.name.trim().is_empty() { view.id.clone() } else { view.name.clone() },
-            camera: (*camera).clone(),
-            wireframe: view.display.wireframe,
-            visible: owners
-                .iter()
-                .map(|owner| match owner {
-                    Owner::Solid(solid) => !view.display.hidden.iter().any(|hidden| hidden == solid),
-                    Owner::View(id) => *id == view.id,
-                })
-                .collect(),
+        .map(|(view, camera)| {
+            // The stream holds every solid where it was modelled; a view that
+            // explodes moves them by node, with the same resolved rows the
+            // viewport and the sheets pose by, step after step.
+            let rows = report.and_then(|report| report.view(&view.id));
+            let mut stages: std::collections::HashMap<&str, Vec<PmiPose>> = std::collections::HashMap::new();
+            for row in rows.into_iter().flat_map(|rows| &rows.annotations) {
+                if !row.enabled || row.status != PmiStatus::Ok {
+                    continue;
+                }
+                if let PmiGeometry::Explode { solids, translate, rotate_deg, scale, center, .. } = &row.geometry {
+                    for solid in solids {
+                        stages.entry(solid.as_str()).or_default().push(PmiPose {
+                            center: *center,
+                            translate: *translate,
+                            rotate_deg: *rotate_deg,
+                            scale: *scale,
+                        });
+                    }
+                }
+            }
+            View3d {
+                id: view.id.clone(),
+                name: if view.name.trim().is_empty() { view.id.clone() } else { view.name.clone() },
+                camera: (*camera).clone(),
+                wireframe: view.display.wireframe,
+                visible: owners
+                    .iter()
+                    .map(|owner| match owner {
+                        Owner::Solid(solid) => !view.display.hidden.iter().any(|hidden| hidden == solid),
+                        Owner::View(id) => *id == view.id,
+                    })
+                    .collect(),
+                poses: owners
+                    .iter()
+                    .map(|owner| match owner {
+                        Owner::Solid(solid) => stages.get(solid.as_str()).map(|stages| stage_matrix(stages)),
+                        Owner::View(_) => None,
+                    })
+                    .collect(),
+                section: view.section_plane_in(rows),
+            }
         })
         .collect();
     // A document with no saved view still opens on SOMETHING: an isometric
@@ -379,9 +418,47 @@ pub fn build(bodies: &[Body], pmi: &PmiState, report: Option<&PmiReport>) -> Res
             camera: isometric_camera(bodies),
             wireframe: false,
             visible: owners.iter().map(|owner| matches!(owner, Owner::Solid(_))).collect(),
+            poses: vec![None; owners.len()],
+            section: None,
         });
     }
     Ok(Model3d { u3d, nodes, views, annotations })
+}
+
+/// A solid's explode stages as a `/3DNode /M`: the matrix's three columns,
+/// then its translation, the order `/C2W` is written in. Every stage is
+/// affine, so the composition is read off where it takes the origin and the
+/// three unit points.
+pub fn stage_matrix(stages: &[PmiPose]) -> [f64; 12] {
+    let apply = |point: [f64; 3]| stages.iter().fold(point, |p, stage| stage.apply(p));
+    let origin = apply([0.0; 3]);
+    let mut matrix = [0.0; 12];
+    for (axis, unit) in [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]].into_iter().enumerate() {
+        let column = sub(apply(unit), origin);
+        matrix[axis * 3..axis * 3 + 3].copy_from_slice(&column);
+    }
+    matrix[9..].copy_from_slice(&origin);
+    matrix
+}
+
+/// A sectioned view's cut as the `/3DCrossSection` its `/SA` lists (PDF
+/// 1.7): centred on `point`, the default plane (normal +x) turned by `/O
+/// [null β γ]`, β about y then γ about z, onto `normal`. The plane itself is
+/// not drawn (`/PO 0`); its intersection with the model is. Which side a
+/// reader removes is not stated by the standard and has not been checked in
+/// a reader here.
+fn cross_section(point: [f64; 3], normal: [f64; 3]) -> String {
+    let n = unit(normal).unwrap_or([1.0, 0.0, 0.0]);
+    let beta = (-n[2]).clamp(-1.0, 1.0).asin().to_degrees();
+    let gamma = n[1].atan2(n[0]).to_degrees();
+    format!(
+        "<< /Type /3DCrossSection /C [{} {} {}] /O [null {} {}] /PO 0 /IV true >>",
+        num(point[0]),
+        num(point[1]),
+        num(point[2]),
+        num(beta),
+        num(gamma)
+    )
 }
 
 /// The id of the view a document without saved views opens on.
@@ -473,19 +550,31 @@ pub fn view_dict(model: &Model3d, view: &View3d, name: &str, projection: Project
         .nodes
         .iter()
         .zip(&view.visible)
-        .map(|(node, visible)| format!("<< /Type /3DNode /N ({}) /V {visible} >>", string_literal(node)))
+        .zip(view.poses.iter().chain(std::iter::repeat(&None)))
+        .map(|((node, visible), pose)| match pose {
+            Some(pose) => {
+                let pose: Vec<String> = pose.iter().map(|v| num(*v)).collect();
+                format!("<< /Type /3DNode /N ({}) /V {visible} /M [{}] >>", string_literal(node), pose.join(" "))
+            }
+            None => format!("<< /Type /3DNode /N ({}) /V {visible} >>", string_literal(node)),
+        })
         .collect();
+    let section = view
+        .section
+        .map(|(point, normal)| format!(" /SA [{}]", cross_section(point, normal)))
+        .unwrap_or_default();
     format!(
         "<< /Type /3DView /XN ({}) /IN ({}) /MS /M /C2W [{}] /CO {} /P {} \
          /BG << /Type /3DBG /Subtype /SC /C [1 1 1] >> \
          /RM << /Type /3DRenderMode /Subtype /{} >> \
-         /LS << /Type /3DLightingScheme /Subtype /Hard >> /NR true /NA [{}] >>",
+         /LS << /Type /3DLightingScheme /Subtype /Hard >>{} /NR true /NA [{}] >>",
         string_literal(name),
         string_literal(&view.id),
         matrix.join(" "),
         num(orbit.max(0.0)),
         projection,
         if view.wireframe { "Wireframe" } else { "Solid" },
+        section,
         nodes.join(" ")
     )
 }
@@ -642,7 +731,7 @@ pub const CAPTION: [&str; 2] = [
 impl Page3d {
     /// The page laid out on paper `width_mm` × `height_mm`: the title at the
     /// top, the caption at the foot, a row of buttons above it (wrapping
-    /// every [`BUTTONS_PER_ROW`]), and the box filling what is left.
+    /// every `BUTTONS_PER_ROW`), and the box filling what is left.
     pub fn layout(width_mm: f64, height_mm: f64, title: &str, model: &Model3d) -> Page3d {
         let (w, h) = (width_mm.max(100.0), height_mm.max(100.0));
         let inner = w - 2.0 * PAGE_MARGIN_MM;

@@ -668,6 +668,16 @@ const FOOT_TRAVEL: usize = 4;
 /// node already tried; `None` when the foot is not found that way (or a
 /// solve is unreadable), which fails its interval as before.
 fn locate_foot(p: Vec3, nodes: &[Vec3], j: usize, radius: f64) -> Option<usize> {
+    locate_foot_read(p, nodes, j, radius).map(|(node, _)| node)
+}
+
+/// Keep the converged stencil's distance with its node. The caller can use
+/// this exact reading instead of solving the same stencil a second time.
+fn locate_foot_read(p: Vec3, nodes: &[Vec3], j: usize, radius: f64) -> Option<(usize, f64)> {
+    locate_foot_read_prepared(p, nodes, j, radius, None)
+}
+
+fn locate_foot_read_prepared(p: Vec3, nodes: &[Vec3], j: usize, radius: f64, prepared: Option<&StencilPreparation>) -> Option<(usize, f64)> {
     let n = nodes.len();
     if n < 4 || j == 0 || j + 1 >= n {
         return None;
@@ -676,8 +686,8 @@ fn locate_foot(p: Vec3, nodes: &[Vec3], j: usize, radius: f64) -> Option<usize> 
     let mut at = j;
     loop {
         let base = (at - 1).min(n - 4);
-        match stencil_solve(p, nodes, base, at, radius) {
-            Solve::Read(_) => return Some(at),
+        match stencil_solve_prepared(p, nodes, base, at, radius, prepared) {
+            Solve::Read(distance) => return Some((at, distance)),
             Solve::Unread => return None,
             Solve::Window(s) => {
                 tried.push(at);
@@ -744,17 +754,17 @@ pub(in crate::blend) fn declared_wall_probe_why(p: Vec3, fine: &[Vec3], jf: usiz
 }
 
 fn stencil_solve(p: Vec3, nodes: &[Vec3], base: usize, j: usize, radius: f64) -> Solve {
+    stencil_solve_prepared(p, nodes, base, j, radius, None)
+}
+
+fn stencil_solve_prepared(p: Vec3, nodes: &[Vec3], base: usize, j: usize, radius: f64, prepared: Option<&StencilPreparation>) -> Solve {
     let finite = |v: Vec3| v.x.is_finite() && v.y.is_finite() && v.z.is_finite();
     let n = nodes.len();
-    if n < 4 || j == 0 || j + 1 >= n || base + 4 > n || !radius.is_finite() || !finite(p) || !nodes.iter().all(|&c| finite(c)) {
+    if n < 4 || j == 0 || j + 1 >= n || base + 4 > n || !radius.is_finite() || !finite(p) || !prepared.map_or_else(|| wall_nodes_finite(nodes), |cache| cache.finite) {
         wall_decline(|| format!("stencil {n} nodes base {base} j {j}: unreadable input"));
         return Solve::Unread;
     }
-    // Newton's divided differences on 0, 1, 2, 3, s in node units from `base`.
-    let [p0, p1, p2, p3] = [nodes[base], nodes[base + 1], nodes[base + 2], nodes[base + 3]];
-    let d1 = p1.sub(p0);
-    let d2 = p2.sub(p1.scale(2.0)).add(p0).scale(0.5);
-    let d3 = p3.sub(p2.scale(3.0)).add(p1.scale(3.0)).sub(p0).scale(1.0 / 6.0);
+    let [p0, d1, d2, d3] = prepared.map_or_else(|| wall_coefficients(nodes, base), |cache| cache.coefficients(nodes, base));
     let curve = |s: f64| -> (Vec3, Vec3, Vec3) {
         let c = p0.add(d1.scale(s)).add(d2.scale(s * (s - 1.0))).add(d3.scale(s * (s - 1.0) * (s - 2.0)));
         let c1 = d1.add(d2.scale(2.0 * s - 1.0)).add(d3.scale(3.0 * s * s - 6.0 * s + 2.0));
@@ -858,21 +868,64 @@ pub(in crate::blend) fn wall_probe_reading(p: Vec3, nodes: &[Vec3], j: usize, ra
 /// symmetric stencils that both under-read read a spread of zero). An
 /// ESTIMATE, not a bound: a proxy whose error does not shrink with density
 /// would still hide. `None` when any reading is unreadable.
+
+fn wall_solve_reuse_on() -> bool {
+    std::env::var("BREP_WALL_SOLVE_REUSE").map_or(true, |value| value != "0" && value != "off")
+}
+
 pub(in crate::blend) fn declared_wall_probe(p: Vec3, fine: &[Vec3], jf: usize, radius: f64) -> Option<(f64, f64)> {
+    declared_wall_probe_with(p, fine, jf, radius, wall_solve_reuse_on())
+}
+
+fn declared_wall_probe_with(p: Vec3, fine: &[Vec3], jf: usize, radius: f64, reuse: bool) -> Option<(f64, f64)> {
+    declared_wall_probe_prepared(p, fine, jf, radius, reuse, None)
+}
+
+fn declared_wall_probe_prepared(p: Vec3, fine: &[Vec3], jf: usize, radius: f64, reuse: bool, prepared: Option<&PreparedWall<'_>>) -> Option<(f64, f64)> {
     if jf % 2 != 0 || fine.len() < 9 || fine.len() % 2 == 0 {
         wall_decline(|| format!("declared reader: node {jf} of {} not an even node of an odd fine set", fine.len()));
         return None;
     }
-    let Some((reading, spread)) = wall_probe_reading(p, fine, jf, radius) else {
-        wall_decline(|| format!("FINE two-stencil reading at node {jf} of {}", fine.len()));
-        return None;
+    let (reading, spread, at_fine) = if reuse {
+        let read = (|| {
+            let n = fine.len();
+            let (j, a) = locate_foot_read_prepared(p, fine, jf, radius, prepared.map(|c| &c.fine_stencils))?;
+            let first = (j - 1).min(n - 4);
+            let second = if j >= 2 { (j - 2).min(n - 4) } else { j.min(n - 4) };
+            let second = if second == first { if first >= 1 { first - 1 } else { first + 1 } } else { second };
+            let b = match stencil_solve_prepared(p, fine, second, j, radius, prepared.map(|c| &c.fine_stencils)) {
+                Solve::Read(distance) => distance,
+                _ => return None,
+            };
+            Some((a.abs().max(b.abs()), (a - b).abs(), a))
+        })();
+        let Some(read) = read else {
+            wall_decline(|| format!("FINE two-stencil reading at node {jf} of {}", fine.len()));
+            return None;
+        };
+        read
+    } else {
+        let Some((reading, spread)) = wall_probe_reading(p, fine, jf, radius) else {
+            wall_decline(|| format!("FINE two-stencil reading at node {jf} of {}", fine.len()));
+            return None;
+        };
+        let Some(at_fine) = sweep_residual(p, fine, jf, radius) else {
+            wall_decline(|| format!("FINE sweep at node {jf} of {}", fine.len()));
+            return None;
+        };
+        (reading, spread, at_fine)
     };
-    let Some(at_fine) = sweep_residual(p, fine, jf, radius) else {
-        wall_decline(|| format!("FINE sweep at node {jf} of {}", fine.len()));
-        return None;
+    let coarse_owned;
+    let coarse = match prepared {
+        Some(cache) => cache.coarse.as_slice(),
+        None => { coarse_owned = wall_coarse(fine); &coarse_owned }
     };
-    let coarse: Vec<Vec3> = fine.iter().step_by(2).copied().collect();
-    let Some(at_coarse) = sweep_residual(p, &coarse, jf / 2, radius) else {
+    let at_coarse = if reuse {
+        locate_foot_read_prepared(p, coarse, jf / 2, radius, prepared.map(|c| &c.coarse_stencils)).map(|(_, distance)| distance)
+    } else {
+        sweep_residual(p, coarse, jf / 2, radius)
+    };
+    let Some(at_coarse) = at_coarse else {
         wall_decline(|| format!("COARSE sweep at node {} of {}", jf / 2, coarse.len()));
         return None;
     };
@@ -1170,6 +1223,7 @@ pub(super) fn wall_interior_misses(
         let (from, to) = (samples[left].parameter, samples[*next].parameter);
         let (mut declared, mut worst, mut spread) = (0.0_f64, 0.0_f64, 0.0_f64);
         let mut read = true;
+        let prepared = PreparedWall::for_interval(&centres);
         'probes: for step in (2..subdivisions).step_by(2) {
             let global = from + (step as f64 / subdivisions as f64) * (to - from);
             let global = if wrap { global.rem_euclid(1.0) } else { global };
@@ -1177,7 +1231,10 @@ pub(super) fn wall_interior_misses(
             for k in 1..probes {
                 let v = k as f64 / probes as f64;
                 let reading = surface.evaluate(u, v).ok().and_then(|p| {
-                    declared_wall_probe_located(p, &centres, step, step as f64 / subdivisions as f64, radius)
+                    match &prepared {
+                        Some(cache) => cache.read(p, step, step as f64 / subdivisions as f64, radius),
+                        None => declared_wall_probe_located(p, &centres, step, step as f64 / subdivisions as f64, radius),
+                    }
                 });
                 match reading {
                     Some((distance, gap)) => {
@@ -2316,4 +2373,72 @@ fn project_piece_pcurve_track(
         )));
     }
     Ok(fit.curve)
+}
+
+
+
+/// Immutable interval input; only coefficients are filled lazily. The Newton
+/// iterations, foot windows and decline ordering remain in the common reader.
+pub(in crate::blend) struct PreparedWall<'a> {
+    fine: &'a [Vec3],
+    coarse: Vec<Vec3>,
+    fine_stencils: StencilPreparation,
+    coarse_stencils: StencilPreparation,
+}
+
+struct StencilPreparation {
+    finite: bool,
+    coefficients: std::cell::RefCell<Vec<Option<[Vec3; 4]>>>,
+}
+impl StencilPreparation {
+    fn new(nodes: &[Vec3]) -> Self {
+        Self { finite: wall_nodes_finite(nodes), coefficients: std::cell::RefCell::new(vec![None; nodes.len().saturating_sub(3)]) }
+    }
+    fn coefficients(&self, nodes: &[Vec3], base: usize) -> [Vec3; 4] {
+        let mut entries = self.coefficients.borrow_mut();
+        *entries[base].get_or_insert_with(|| wall_coefficients(nodes, base))
+    }
+}
+
+fn wall_nodes_finite(nodes: &[Vec3]) -> bool {
+    nodes.iter().all(|c| c.x.is_finite() && c.y.is_finite() && c.z.is_finite())
+}
+
+fn wall_coefficients(nodes: &[Vec3], base: usize) -> [Vec3; 4] {
+    // Newton's divided differences on 0, 1, 2, 3, s in node units from `base`.
+    let [p0, p1, p2, p3] = [nodes[base], nodes[base + 1], nodes[base + 2], nodes[base + 3]];
+    let d1 = p1.sub(p0);
+    let d2 = p2.sub(p1.scale(2.0)).add(p0).scale(0.5);
+    let d3 = p3.sub(p2.scale(3.0)).add(p1.scale(3.0)).sub(p0).scale(1.0 / 6.0);
+    [p0, d1, d2, d3]
+}
+
+fn wall_coarse(fine: &[Vec3]) -> Vec<Vec3> {
+    fine.iter().step_by(2).copied().collect()
+}
+
+fn wall_preparation_on() -> bool {
+    std::env::var("BREP_WALL_PREPARE").ok().as_deref() != Some("0")
+}
+
+impl<'a> PreparedWall<'a> {
+    pub(in crate::blend) fn for_interval(fine: &'a [Vec3]) -> Option<Self> {
+        (wall_preparation_on() && wall_solve_reuse_on()).then(|| Self::new(fine))
+    }
+    fn new(fine: &'a [Vec3]) -> Self {
+        let coarse = wall_coarse(fine);
+        let fine_stencils = StencilPreparation::new(fine);
+        let coarse_stencils = StencilPreparation::new(&coarse);
+        Self { fine, coarse, fine_stencils, coarse_stencils }
+    }
+    pub(in crate::blend) fn read(&self, p: Vec3, j: usize, fraction: f64, radius: f64) -> Option<(f64, f64)> {
+        let read = |at| declared_wall_probe_prepared(p, self.fine, at, radius, true, Some(self));
+        match read(j) {
+            Some(read) => Some(read),
+            None => match centre_path_node(self.fine, fraction) {
+                Some(located) if located != j => read(located),
+                _ => None,
+            },
+        }
+    }
 }

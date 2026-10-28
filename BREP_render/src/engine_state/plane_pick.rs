@@ -50,9 +50,19 @@ impl EngineState {
     ///
     /// This is the RAW list (no selection filter); the filter-honoring callers are
     /// [`Self::candidates_filtered_at`] (the pick-list popup) and
-    /// [`Self::pick_top_at`] (every single-hit pick).
+    /// `Self::pick_top_at` (every single-hit pick).
     pub fn pick_candidates_at(&self, x: f64, y: f64) -> Vec<pick::PickCandidate> {
-        let mut out = pick::pick(&self.scene, &self.camera, x, y, &self.pick_options());
+        let mut out = pick::pick_unoccluded(&self.scene, &self.context_scene, &self.camera, x, y, &self.pick_options());
+        // An instructions occurrence pick reaches the GHOSTS too: the parts
+        // earlier steps placed are drawn in the context layer under their
+        // own names, their solids hidden, and a callout points at any part.
+        if self.ref_select.as_ref().is_some_and(|state| matches!(state.target, super::RefSelectTarget::Instructions { .. })) {
+            out.extend(
+                pick::pick(&self.context_scene, &self.camera, x, y, &self.pick_options())
+                    .into_iter()
+                    .filter(|candidate| candidate.kind == pick::PickKind::Solid),
+            );
+        }
         // Appended AFTER `pick`'s own `MAX_CANDIDATES` truncation, so a plane is
         // never dropped by a crowd of faces under the same pixel.
         out.extend(self.plane_candidates_at(x, y));

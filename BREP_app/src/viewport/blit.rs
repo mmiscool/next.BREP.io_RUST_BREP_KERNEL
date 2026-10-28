@@ -101,13 +101,21 @@ impl Viewport {
         Self {
             core,
             gpu_scene,
+            context_gpu_scene: GpuScene::default(),
             egui_renderer: render_state.renderer.clone(),
             blit_layout,
             blit_sampler,
             blit_pipeline,
             offscreen: None,
+            force_render: true,
+            #[cfg(feature = "automation")]
+            rendered_inputs: None,
             sheet: super::sheet::SheetViewport::default(),
             ecad: super::ecad::EcadViewport::default(),
+            move_card: super::move_card::MoveCard::default(),
+            constraint_chips_drawn: Vec::new(),
+            constraint_label_menu: None,
+            constraint_menu_hits: std::collections::HashMap::new(),
             dragging: false,
             touch: Default::default(),
             touch_suppressed: false,
@@ -138,6 +146,11 @@ impl Viewport {
             pmi_label_hits: Vec::new(),
             pmi_label_menu: None,
             pmi_menu_hits: std::collections::HashMap::new(),
+            component_menu: None,
+            component_menu_hits: std::collections::HashMap::new(),
+            component_menu_probe: serde_json::Value::Null,
+            component_request: None,
+            empty_double_click: false,
         }
     }
 
@@ -187,6 +200,33 @@ impl Viewport {
                 bind_group,
             });
         self.offscreen = Some(Offscreen { view, w, h });
+        self.force_render = true;
+    }
+
+    /// The stale-frame check (automation builds): a frame that did not render
+    /// although its render inputs differ from the last rendered frame's shows
+    /// a stale view, because some producer changed what is drawn without
+    /// marking the engine dirty. Counted in `__brepPerf.staleFrames` (the MCP
+    /// test runner fails a script that raises it) and logged with the inputs
+    /// that changed. Each change is counted once.
+    #[cfg(feature = "automation")]
+    pub(super) fn check_stale_frame(&mut self, rendered: bool, phys_w: u32, phys_h: u32, ppp: f32, state: &EngineState) {
+        let mut inputs = state.render_fingerprint();
+        // The physical size stands in for the texture; ppp rides with it.
+        inputs[0].1 ^= (u64::from(phys_w) << 32 | u64::from(phys_h)) ^ u64::from(ppp.to_bits()).rotate_left(17);
+        if !rendered {
+            if let Some(last) = &self.rendered_inputs {
+                let changed: Vec<&str> = inputs.iter().zip(last).filter(|(a, b)| a.1 != b.1).map(|(a, _)| a.0).collect();
+                if !changed.is_empty() {
+                    crate::perf::note_stale_frame();
+                    eprintln!("BREP_STALE_FRAME changed={}", changed.join(","));
+                }
+            }
+        }
+        // Counted once: the next frames compare with this one.
+        if rendered || self.rendered_inputs.is_some() {
+            self.rendered_inputs = Some(inputs);
+        }
     }
 
     /// Render the 3D scene into the offscreen texture via the engine's render
@@ -203,6 +243,10 @@ impl Viewport {
                 state.settings_generation,
             );
         }
+        self.core.sync_scene(
+            &mut self.context_gpu_scene, &state.context_scene,
+            &state.settings, state.settings_generation,
+        );
         // Fit near/far to everything drawn (solids + the pushed overlay + the FULL
         // widget overlay's world bounds + the origin) and resolve the camera in one
         // shared step — see `EngineState::fit_camera_and_overlay`. Folding the full
@@ -225,7 +269,10 @@ impl Viewport {
         {
             let _span = crate::perf::span(crate::perf::Phase::Draw);
             self.core
-                .render_to_view(&mut self.gpu_scene, &state.scene, &params, &off.view);
+                .render_to_view_with_context(
+                    &mut self.gpu_scene, &state.scene, &params, &off.view,
+                    Some((&self.context_gpu_scene, &state.context_scene)),
+                );
         }
         state.dirty = false;
     }

@@ -56,7 +56,7 @@ pub struct FaceFragmentRecord {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub extra_test_points: Vec<Vec3>,
     /// The fragment's place among its source face's fragments, from the
-    /// fragmentation that cut it ([`canonical_fragment_order`]); `None` for a
+    /// fragmentation that cut it (`canonical_fragment_order`); `None` for a
     /// fragment no arrangement produced (an untouched or rescued face).
     #[serde(skip)]
     pub order: Option<FragmentOrder>,

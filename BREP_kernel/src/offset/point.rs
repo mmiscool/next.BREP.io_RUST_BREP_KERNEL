@@ -58,14 +58,14 @@ pub enum OffsetNormal {
     /// Not [`OffsetNormal::FaceStable`]'s recovery — no nudge off a point and
     /// no walk along a collapsed row. Where the cross product vanishes this
     /// reads the ONE-SIDED LIMIT of the same cross product from inside the
-    /// domain ([`raw_unit_normal`]), the surface twin of
+    /// domain (`raw_unit_normal`), the surface twin of
     /// `NurbsCurve::unit_tangent`: an extruded face inherits a stationary
     /// parameter of its profile curve as an isoline where `S_u` vanishes,
     /// though the face is perfectly regular there. Only a carrier with no
     /// regular point in reach refuses, by name. The POINT past such a boundary
-    /// moves along the same limit ([`raw_extended_point`]) where the ruled
+    /// moves along the same limit (`raw_extended_point`) where the ruled
     /// extension would stand still. Near such an isoline the vanishing partial
-    /// is re-read from the control net's differences ([`well_rounded_partials`]),
+    /// is re-read from the control net's differences (`well_rounded_partials`),
     /// whose rounding shrinks with it, so the normal keeps its direction up to
     /// the isoline instead of turning with the basis derivatives' rounding.
     ///
@@ -110,7 +110,7 @@ pub enum OffsetNormal {
     /// **No consumer rides this lane yet.** It exists as the exact half of the
     /// evaluator's contract and as the diagnostic's comparator; switching a
     /// caller onto it changes that caller's last digits and is a separate,
-    /// measured step. See [`offset_normal_diagnostic`].
+    /// measured step. See `offset_normal_diagnostic`.
     ExactAnalytic { same_sense: bool },
 }
 
@@ -153,7 +153,7 @@ pub struct OffsetSample {
 ///
 /// Construction is free — it stores three references and reads nothing — so a
 /// caller inside a Newton loop may build one per call without paying anything.
-/// `site` is a short stable label used only by [`offset_normal_diagnostic`].
+/// `site` is a short stable label used only by `offset_normal_diagnostic`.
 #[derive(Clone, Copy)]
 pub struct OffsetEvaluator<'a> {
     site: &'static str,

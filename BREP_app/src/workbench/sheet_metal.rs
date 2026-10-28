@@ -7,7 +7,7 @@
 //! Classification lives HERE, off the feature type code (the kernel is untouched).
 //!
 //! Phase 2 adds the real flat-pattern (unfold/export) toolbar button to
-//! [`BUTTONS`]; v1 ships none (no dead / "coming soon" affordance).
+//! `BUTTONS`; v1 ships none (no dead / "coming soon" affordance).
 
 use super::{FeatureInfo, Workbench, WorkbenchButton};
 

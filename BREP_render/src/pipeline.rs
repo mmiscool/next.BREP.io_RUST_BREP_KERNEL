@@ -342,6 +342,10 @@ pub struct SceneRunner {
     /// library reload; a name never installed proceeds to the feature's normal
     /// unresolved-reference error, avoiding an endless reload loop.
     pub(crate) parts_library_names: std::collections::BTreeSet<String>,
+    /// The run whose tail installed this thread's assembly session: its
+    /// generation and the kernel's session serial right after it. A session
+    /// anything else has replaced since (serial moved) is not that run's.
+    pub(crate) session_of: Option<(u64, u64)>,
 }
 
 /// One placed component as the run left it — the engine's own projection of the
@@ -371,6 +375,13 @@ pub struct ComponentSnapshot {
     pub solids: Vec<String>,
     /// The part's harness PORT ids, namespaced (`{id}:{part port id}`).
     pub ports: Vec<String>,
+    /// A sub-assembly's SOLVED occurrence poses: path below this component
+    /// (`ACOMP2`, `ACOMP2:ACOMP1`) → pose in this component's part-local
+    /// frame, row-major 4x4. A nested occurrence sits at `transform` composed
+    /// with this, NOT at the transform its document authors: the
+    /// sub-assembly's own mates may have moved it. Empty for a part.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub nested_poses: std::collections::BTreeMap<String, [f64; 16]>,
 }
 
 impl ComponentSnapshot {
@@ -393,7 +404,7 @@ impl ComponentSnapshot {
 /// ACOMP EXECUTES, which is before the constraint tail solves; the solved pose
 /// arrives separately as the write-back. Missing/garbage values fall back to the
 /// identity placement, exactly like the feature's own reader.
-fn pose_params_to_transform(pose: &serde_json::Value) -> [f64; 16] {
+pub(crate) fn pose_params_to_transform(pose: &serde_json::Value) -> [f64; 16] {
     let vec3 = |key: &str| -> [f64; 3] {
         let value = &pose[key];
         std::array::from_fn(|axis| value[axis].as_f64().unwrap_or(0.0))
@@ -432,6 +443,11 @@ impl From<&brep_kernel::ComponentRecord> for ComponentSnapshot {
             source: record.source.clone(),
             solids: record.solids.clone(),
             ports: record.ports.clone(),
+            nested_poses: record
+                .nested_poses
+                .iter()
+                .map(|(path, pose)| (path.clone(), pose.elements))
+                .collect(),
         }
     }
 }
@@ -584,6 +600,7 @@ impl SceneRunner {
             last_lod: 1.0,
             parts_library_revision: None,
             parts_library_names: std::collections::BTreeSet::new(),
+            session_of: None,
         }
     }
 
@@ -596,6 +613,18 @@ impl SceneRunner {
         // run's stamp will not match and the library is re-sent.
         self.parts_library_revision = None;
         self.parts_library_names.clear();
+        self.session_of = None;
+    }
+
+    /// An owned copy of the assembly session the run of `generation` left on
+    /// this thread, or `None` when this thread's session is not that run's.
+    pub(crate) fn export_session(&self, generation: u64) -> Option<brep_kernel::SessionTransfer> {
+        match self.session_of {
+            Some((ran, serial)) if ran == generation && serial == brep_kernel::assembly_session_serial() => {
+                brep_kernel::assembly_session_export()
+            }
+            _ => None,
+        }
     }
 
     /// Execute `request` and fold it into an ordered delta snapshot (does NOT

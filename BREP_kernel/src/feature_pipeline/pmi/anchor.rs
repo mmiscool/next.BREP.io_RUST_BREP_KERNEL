@@ -2,8 +2,8 @@
 //!
 //! The head is DERIVED, never stored, and it lies on a face or an edge of
 //! the target occurrence AS DISPLAYED in the owning view. By default it is
-//! the point of the occurrence's displayed surface nearest the bubble
-//! ([`nearest_displayed_point`]); an optional `anchor` reference pins it to
+//! the point of the occurrence's displayed surface nearest the bubble in
+//! screen space ([`nearest_screen_point`]); an optional `anchor` reference pins it to
 //! an edge (the point of that edge nearest the bubble) or to a vertex
 //! (exactly there). Every candidate is exact B-rep geometry: face feet from
 //! the surface projector kept only where they land inside the face's trim,
@@ -34,11 +34,13 @@
 //! viewport can re-derive the head from a dragged bubble on the exact-solid
 //! clone it holds, with the very same functions, and never run the history.
 //!
-//! Limits: under a non-uniform explode scale the mapped foot is still on the
+//! Legacy 3D projection limits: under a non-uniform explode scale the mapped foot is still on the
 //! displayed surface but is not guaranteed to be the nearest point of it;
 //! under a section the head is the nearest KEPT candidate (a kept foot, a
 //! kept vertex, or an edge's crossing of the plane), not the nearest point of
-//! the cut surface itself, which may lie on a face's section curve.
+//! the cut surface itself, which may lie on a face's section curve. The screen
+//! projector additionally searches planar face/section lines; curved face
+//! section curves are not constructed here.
 
 use serde::{Deserialize, Serialize};
 
@@ -130,17 +132,32 @@ pub struct SolidPoses {
 }
 
 /// A section half-space in the DISPLAYED frame: geometry is kept where
-/// `(p − point)·normal ≥ 0` (the display clip's own test).
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+/// `(p − point)·normal ≥ 0` (the display clip's own test). A section of
+/// several planes lists the others in `also`: it keeps where ANY plane keeps
+/// (material is removed only where every plane removes it).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HalfSpace {
     pub point: [f64; 3],
     pub normal: [f64; 3],
+    /// The section's further planes, `(point, kept-side normal)`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub also: Vec<([f64; 3], [f64; 3])>,
 }
 
 impl HalfSpace {
-    /// The signed distance of `p` from the plane, positive on the kept side.
+    /// The section of `planes` (`(point, kept-side normal)`, the first being
+    /// the main one); `None` without any.
+    pub fn of(planes: &[([f64; 3], [f64; 3])]) -> Option<Self> {
+        let (&(point, normal), rest) = planes.split_first()?;
+        Some(Self { point, normal, also: rest.to_vec() })
+    }
+
+    /// The signed distance of `p` from the kept region's boundary, positive
+    /// inside: from the plane, or for several planes the largest of their
+    /// distances (≥ 0 exactly where one of them keeps `p`).
     pub fn signed(&self, p: [f64; 3]) -> f64 {
-        (0..3).map(|i| (p[i] - self.point[i]) * self.normal[i]).sum()
+        let from = |point: [f64; 3], normal: [f64; 3]| (0..3).map(|i| (p[i] - point[i]) * normal[i]).sum::<f64>();
+        self.also.iter().fold(from(self.point, self.normal), |best, &(point, normal)| best.max(from(point, normal)))
     }
 
     /// Whether `p` is displayed (kept), to `tolerance` on the plane itself.
@@ -168,6 +185,9 @@ pub enum BalloonAnchorMode {
 /// The head derivation recipe carried on a balloon's leader geometry.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BalloonAnchor {
+    /// Camera used to minimize automatic leaders in screen space.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub camera: Option<super::PmiCamera>,
     /// The occurrence's VISIBLE solid names (scene names) the default head
     /// projects onto.
     pub solids: Vec<String>,
@@ -321,6 +341,140 @@ pub fn nearest_displayed_point(solid: &BrepSolid, scope: HeadScope<'_>, bubble: 
     Ok(best.map(|b| b.display))
 }
 
+/// Camera-plane coordinates. Perspective projection is a homogeneous transform,
+/// so projecting NURBS controls preserves the original curve/surface parameters.
+fn screen_control(camera: &super::PmiCamera, scope: HeadScope<'_>, p: crate::Vec4) -> crate::Vec4 {
+    let world = scope.display(Vec3::new(p.x / p.w, p.y / p.w, p.z / p.w));
+    let d = camera.view_direction();
+    let forward = Vec3::new(d[0], d[1], d[2]);
+    let up = Vec3::new(camera.up[0], camera.up[1], camera.up[2]);
+    let right = forward.cross(up);
+    let right = right.scale(1.0 / right.length().max(1e-15));
+    let up = right.cross(forward);
+    let v = Vec3::new(world[0] - camera.eye[0], world[1] - camera.eye[1], world[2] - camera.eye[2]);
+    let weight = match camera.projection {
+        super::PmiProjection::Orthographic { .. } => p.w,
+        super::PmiProjection::Perspective { .. } => p.w * v.dot(forward),
+    };
+    crate::Vec4 { x: v.dot(right) * p.w, y: v.dot(up) * p.w, z: 0.0, w: weight }
+}
+
+pub(super) fn head_distance(camera: Option<&super::PmiCamera>, a: [f64; 3], b: [f64; 3]) -> f64 {
+    let project = |p: [f64; 3]| {
+        if let Some(camera) = camera {
+            let q = screen_control(camera, HeadScope::PLAIN, crate::Vec4::from_point(Vec3::new(p[0], p[1], p[2]), 1.0));
+            [q.x / q.w, q.y / q.w, 0.0]
+        } else { p }
+    };
+    let a = project(a);
+    let b = project(b);
+    (0..3).map(|i| (a[i] - b[i]).powi(2)).sum()
+}
+
+/// A planar face's section line may contain the nearest kept point between
+/// topology edges. Intersect the section with the affine parameter rectangle,
+/// project that segment, and qualify its foot against the original face trim.
+/// Trim-hole endpoints are already covered by the topology edge crossings.
+fn planar_section_feet(face: &FaceRecord, scope: HeadScope<'_>, camera: &super::PmiCamera, query: Vec3, spatial: f64) -> Result<Vec<Vec3>, String> {
+    let Some(section) = scope.section else { return Ok(Vec::new()); };
+    let Some(crate::AnalyticSurface::Plane { .. }) = face.surface.analytic() else { return Ok(Vec::new()); };
+    let [u0, u1] = face.surface.domain_u()?;
+    let [v0, v1] = face.surface.domain_v()?;
+    let corners = [[u0, v0], [u1, v0], [u1, v1], [u0, v1]];
+    let mut feet = Vec::new();
+    for (point, normal) in std::iter::once((section.point, section.normal)).chain(section.also.iter().copied()) {
+        let mut crossings: Vec<[f64; 2]> = Vec::new();
+        for k in 0..4 {
+            let a = corners[k];
+            let b = corners[(k + 1) % 4];
+            let signed = |uv: [f64; 2]| -> Result<f64, String> {
+                let p = scope.display(face.surface.evaluate(uv[0], uv[1])?);
+                Ok((0..3).map(|i| (p[i] - point[i]) * normal[i]).sum())
+            };
+            let da = signed(a)?;
+            let db = signed(b)?;
+            if da.abs() <= spatial { crossings.push(a); }
+            if da * db < 0.0 {
+                let t = da / (da - db);
+                crossings.push([a[0] + t * (b[0] - a[0]), a[1] + t * (b[1] - a[1])]);
+            }
+        }
+        // Pick the farthest pair (a corner may be encountered twice).
+        let pair = crossings.iter().flat_map(|a| crossings.iter().map(move |b| (*a, *b)))
+            .max_by(|(a, b), (c, d)| {
+                let length = |a: &[f64; 2], b: &[f64; 2]| (a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2);
+                length(a, b).total_cmp(&length(c, d))
+            });
+        let Some((a, b)) = pair else { continue; };
+        if a == b { continue; }
+        let controls = [a, b].into_iter().map(|uv| {
+            face.surface.evaluate(uv[0], uv[1]).map(|p| screen_control(camera, scope, crate::Vec4::from_point(p, 1.0)))
+        }).collect::<Result<Vec<_>, _>>()?;
+        let Ok(line) = NurbsCurve::new(1, vec![0.0, 0.0, 1.0, 1.0], controls) else { continue; };
+        let Ok(foot) = project_point_to_curve(&line, query) else { continue; };
+        let uv = Vec2 { x: a[0] + foot.u * (b[0] - a[0]), y: a[1] + foot.u * (b[1] - a[1]) };
+        let derivatives = face.surface.derivatives(uv.x, uv.y, 1)?;
+        let band = crate::tolerance::surface_uv_tolerance(spatial, derivatives[1][0].length(), derivatives[0][1].length());
+        if matches!(parameter_point_in_face(face, uv, band), Ok(PolygonClass::Inside | PolygonClass::Boundary)) {
+            feet.push(face.surface.evaluate(uv.x, uv.y)?);
+        }
+    }
+    Ok(feet)
+}
+
+/// Minimize the projected distance, then evaluate the original B-rep at the
+/// winning parameters. Depth never biases the screen-space minimization.
+/// Explicit edge/vertex anchors retain their existing semantics.
+pub fn nearest_screen_point(
+    solid: &BrepSolid, scope: HeadScope<'_>, bubble: [f64; 3], camera: Option<&super::PmiCamera>,
+) -> Result<Option<[f64; 3]>, String> {
+    let Some(camera) = camera else { return nearest_displayed_point(solid, scope, bubble); };
+    let q = screen_control(camera, HeadScope::PLAIN, crate::Vec4::from_point(Vec3::new(bubble[0], bubble[1], bubble[2]), 1.0));
+    let query = Vec3::new(q.x / q.w, q.y / q.w, 0.0);
+    let spatial = KernelTolerances::for_solid(solid, 1e-7).spatial();
+    let mut best: Option<Best> = None;
+    let direction = camera.view_direction();
+    let depth = |p: [f64; 3]| (0..3).map(|i| (p[i] - camera.eye[i]) * direction[i]).sum::<f64>();
+    let mut offer = |point: Vec3| {
+        let display = scope.display(point);
+        if !scope.keeps(display, spatial) { return; }
+        if matches!(camera.projection, super::PmiProjection::Perspective { .. }) && depth(display) <= 0.0 { return; }
+        let d2 = head_distance(Some(camera), display, bubble);
+        if d2.is_finite() && best.as_ref().is_none_or(|b| d2 < b.d2 - 1e-12 || ((d2 - b.d2).abs() <= 1e-12 && depth(display) < depth(b.display))) {
+            best = Some(Best { display, d2 });
+        }
+    };
+    for vertex in &solid.vertices { offer(vertex.point); }
+    for edge in &solid.edges {
+        for t in [edge.t0, edge.t1] { offer(edge.curve.evaluate(t)?); }
+        if edge.degenerate { continue; }
+        let span = span_curve(&edge.curve, edge.t0.min(edge.t1), edge.t0.max(edge.t1))?;
+        let projected = NurbsCurve::new(span.degree, span.knots.clone(), span.control_points.iter().map(|p| screen_control(camera, scope, *p)).collect());
+        if let Ok(curve) = projected {
+            if let Ok(foot) = project_point_to_curve(&curve, query) { offer(edge.curve.evaluate(foot.u)?); }
+        }
+        if let Some(section) = scope.section {
+            for p in edge_plane_crossings(edge, &scope, section)? { offer(p); }
+        }
+    }
+    for face in solid.shells.iter().flat_map(|s| &s.faces) {
+        for foot in planar_section_feet(face, scope, camera, query, spatial)? { offer(foot); }
+        let s = &face.surface;
+        // Construct anew: cached analytic carriers and projection grids belong
+        // to the unprojected surface and must not survive this transform.
+        let projected = crate::NurbsSurface::new(s.degree_u, s.degree_v, s.knots_u.clone(), s.knots_v.clone(),
+            s.control_points.iter().map(|row| row.iter().map(|p| screen_control(camera, scope, *p)).collect()).collect());
+        let Ok(surface) = projected else { continue; };
+        let Ok(foot) = project_point_to_surface(&surface, query) else { continue; };
+        let derivatives = s.derivatives(foot.u, foot.v, 1)?;
+        let band = crate::tolerance::surface_uv_tolerance(spatial, derivatives[1][0].length(), derivatives[0][1].length());
+        if matches!(parameter_point_in_face(face, Vec2 { x: foot.u, y: foot.v }, band), Ok(PolygonClass::Inside | PolygonClass::Boundary)) {
+            offer(s.evaluate(foot.u, foot.v)?);
+        }
+    }
+    Ok(best.map(|b| b.display))
+}
+
 /// The point of `solid`'s surface nearest `point`, un-posed and unsectioned
 /// (the modeling-frame form of [`nearest_displayed_point`]).
 pub fn nearest_point_on_solid(solid: &BrepSolid, point: Vec3) -> Result<Vec3, String> {
@@ -393,7 +547,7 @@ pub fn nearest_displayed_point_on_edge(edge: &EdgeRecord, scope: HeadScope<'_>, 
     Ok(best.map(|b| b.display))
 }
 
-/// Where `edge`'s span crosses the section plane (modeling points): the
+/// Where `edge`'s span crosses the section's boundary (modeling points): the
 /// signed distance of the DISPLAYED curve is sampled along the span and each
 /// sign change bisected to the parameter.
 fn edge_plane_crossings(edge: &EdgeRecord, scope: &HeadScope<'_>, section: &HalfSpace) -> Result<Vec<Vec3>, String> {
@@ -484,8 +638,8 @@ pub fn balloon_head<'a>(
                     missing.push(name.clone());
                     continue;
                 };
-                if let Some(display) = nearest_displayed_point(brep, anchor.scope(name), bubble)? {
-                    let d2 = (0..3).map(|i| (display[i] - bubble[i]).powi(2)).sum::<f64>();
+                if let Some(display) = nearest_screen_point(brep, anchor.scope(name), bubble, anchor.camera.as_ref())? {
+                    let d2 = head_distance(anchor.camera.as_ref(), display, bubble);
                     if best.as_ref().is_none_or(|b| d2 < b.d2) {
                         best = Some(Best { display, d2 });
                     }

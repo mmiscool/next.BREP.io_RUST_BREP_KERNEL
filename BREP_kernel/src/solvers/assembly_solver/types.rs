@@ -105,6 +105,15 @@ impl MateAlign {
     }
 }
 
+/// A curve a curve mate follows, in its body's LOCAL frame: an edge's carrier
+/// over the edge's parameter range `[t0, t1]`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MateCurve {
+    pub curve: crate::NurbsCurve,
+    pub t0: f64,
+    pub t1: f64,
+}
+
 /// Mate geometry + semantics. All points/directions/planes/axes are expressed
 /// in the OWNING body's local frame (`*_a` on `body_a`, `*_b` on `body_b`).
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -224,6 +233,131 @@ pub enum MateKind {
         radius: f64,
         plane_b: MatePlane,
     },
+    /// A LIMIT mate: the quantity `mate` measures stays inside `[min, max]`
+    /// instead of equalling its target (whose own value is ignored). `mate`
+    /// is a distance kind (`min`/`max` in model units, signed exactly as that
+    /// kind's `distance`) or an angle kind (degrees; `DirectedAngle` is
+    /// signed, wraps, and the range runs from `min` counter-clockwise to
+    /// `max`). The rows the kind holds besides its measure (the parallelism of
+    /// `DistancePlanePlane`) still bind. Inside the range the limit row is
+    /// zero and removes nothing; outside it is the signed distance to the
+    /// nearer end.
+    Limit {
+        mate: Box<MateKind>,
+        min: f64,
+        max: f64,
+    },
+    /// Path: `point_a` lies on `curve_b` (3 rows, removes 2 DOF) — the closest
+    /// point of the curve, found afresh from fixed samples at every evaluation
+    /// (no state between evaluations). `along`, when set, also pins where on
+    /// the curve: a percent of its parameter range from its start (from its
+    /// end with `reverse`), wrapped on a closed curve (1 row more).
+    PointOnCurve {
+        point_a: [f64; 3],
+        curve_b: MateCurve,
+        #[serde(default)]
+        along: Option<f64>,
+        #[serde(default)]
+        reverse: bool,
+    },
+    /// Slot: the axis `axis_a` stays parallel to `normal_b` (either sense)
+    /// and passes through `curve_b`, the slot's centreline (3 + 3 rows,
+    /// removes 4 DOF; the pin may slide along the curve, between its ends,
+    /// spin, and slide along its own axis). `along` / `reverse` as for
+    /// [`MateKind::PointOnCurve`], read where the axis crosses the curve.
+    Slot {
+        axis_a: MateAxis,
+        curve_b: MateCurve,
+        normal_b: [f64; 3],
+        #[serde(default)]
+        along: Option<f64>,
+        #[serde(default)]
+        reverse: bool,
+    },
+    /// Cam: a follower of radius `radius` centred at `center_a` (a roller
+    /// when `axis_a` is set: its axis stays parallel to `normal_b`; else a
+    /// ball or point, kept in the profile's plane) touches `profile_b`, a
+    /// planar curve with plane normal `normal_b`: the follower's in-plane
+    /// distance to the profile equals its radius, on the outside of a closed
+    /// profile (the left of an open one, seen from the normal) unless
+    /// `flip` (1 row + the plane rows).
+    Cam {
+        center_a: [f64; 3],
+        #[serde(default)]
+        axis_a: Option<[f64; 3]>,
+        radius: f64,
+        profile_b: MateCurve,
+        normal_b: [f64; 3],
+        #[serde(default)]
+        flip: bool,
+    },
+    /// `element_a` (on body A) and `element_b` (on body B) are mirror images
+    /// about `plane_c`, a plane of the mate's `body_c`: points mirror onto
+    /// points (3 DOF), a plane onto a plane facing the mirrored way (3 DOF),
+    /// an axis onto an axis in either sense (4 DOF). Both elements must be of
+    /// one kind.
+    Symmetric {
+        element_a: SymmetricElement,
+        element_b: SymmetricElement,
+        plane_c: MatePlane,
+    },
+    /// Gear: A's spin about `axis_a` and B's spin about `axis_b` are coupled,
+    /// `ratio·θa + θb = 0` (external mesh, opposite senses; `reverse` makes it
+    /// `ratio·θa − θb = 0`). A spin is the signed angle, about the body's own
+    /// axis, from the WORLD reference `world_ref_*` to the body's local
+    /// `ref_*` (a direction ⟂ its axis). `ratio` is teeth(A)/teeth(B) — B's
+    /// turns per turn of A. [`MateKind::rebase`] captures the references so the
+    /// mate holds the poses it is given (1 DOF removed).
+    Gear {
+        axis_a: MateAxis,
+        ref_a: [f64; 3],
+        world_ref_a: [f64; 3],
+        axis_b: MateAxis,
+        ref_b: [f64; 3],
+        world_ref_b: [f64; 3],
+        ratio: f64,
+        #[serde(default)]
+        reverse: bool,
+    },
+    /// Rack and pinion: pinion A's spin about `pinion_axis` (measured as for
+    /// `Gear`) drives rack B along its local `rack_direction`: the travel of
+    /// `rack_point` from `world_rack_point` along that direction equals
+    /// `distance_per_revolution · θ / 2π` (`reverse` flips the sense) (1 DOF).
+    RackPinion {
+        pinion_axis: MateAxis,
+        pinion_ref: [f64; 3],
+        world_pinion_ref: [f64; 3],
+        rack_point: [f64; 3],
+        rack_direction: [f64; 3],
+        world_rack_point: [f64; 3],
+        distance_per_revolution: f64,
+        #[serde(default)]
+        reverse: bool,
+    },
+    /// Screw: B advances along A's `axis_a` by `pitch` per turn it makes
+    /// about it, relative to A: `(s − offset0) = ±pitch·(θ − angle0)/2π`,
+    /// where `θ` is the signed angle about the axis from A's `ref_a` to B's
+    /// `ref_b` and `s` the height of B's `point_b` along the axis (1 DOF).
+    Screw {
+        axis_a: MateAxis,
+        ref_a: [f64; 3],
+        ref_b: [f64; 3],
+        point_b: [f64; 3],
+        pitch: f64,
+        #[serde(default)]
+        reverse: bool,
+        angle0: f64,
+        offset0: f64,
+    },
+}
+
+/// One side of a [`MateKind::Symmetric`] mate, in its owning body's frame.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum SymmetricElement {
+    Point { point: [f64; 3] },
+    Plane { plane: MatePlane },
+    Axis { axis: MateAxis },
 }
 
 /// One mate between two distinct bodies of the assembly.
@@ -236,6 +370,10 @@ pub struct AssemblyMate {
     pub body_a: usize,
     /// Index into the `bodies` slice owning the `*_b` geometry.
     pub body_b: usize,
+    /// Index of a THIRD body owning `*_c` geometry (the mirror plane of a
+    /// symmetric mate); `None` for every two-body mate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body_c: Option<usize>,
     #[serde(flatten)]
     pub kind: MateKind,
 }
@@ -270,6 +408,29 @@ pub struct AssemblySolveOptions {
     /// §7.5–7.6 strategy selection; omitted in JSON means `Auto`.
     #[serde(default)]
     pub strategy: SolveStrategy,
+    /// How each LM step's normal equations are built and solved. `Sparse`
+    /// (the default) is block-sparse over the bodies; `Dense` is the original
+    /// dense path, kept for one release as a fallback and an A/B reference.
+    #[serde(default)]
+    pub linear_algebra: LinearAlgebra,
+    /// Compute the DOF diagnostics (Jacobian rank, `dof`, `redundant`,
+    /// `status`). A caller that only needs poses (the live drag) turns it
+    /// off; the report then carries `status: "unchecked"` and zero counts.
+    #[serde(default = "default_true")]
+    pub diagnostics: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// The LM step's linear algebra (see [`AssemblySolveOptions::linear_algebra`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LinearAlgebra {
+    #[default]
+    Sparse,
+    Dense,
 }
 
 impl Default for AssemblySolveOptions {
@@ -278,6 +439,8 @@ impl Default for AssemblySolveOptions {
             tolerance: default_tolerance(),
             max_iterations: default_max_iterations(),
             strategy: SolveStrategy::default(),
+            linear_algebra: LinearAlgebra::default(),
+            diagnostics: true,
         }
     }
 }
@@ -339,4 +502,32 @@ pub struct AssemblySolution {
     /// `"well"`, `"under"`, or `"over"` (over = redundant rows exist; the
     /// solution is still exact unless the solve returned `Err`).
     pub status: String,
+    /// Per movable body, the freedom the mates leave it at the solution (the
+    /// Jacobian's null space restricted to that body's six columns). Empty
+    /// when diagnostics were off or the assembly is too large to analyse.
+    #[serde(default)]
+    pub body_freedom: Vec<BodyFreedom>,
+}
+
+/// How free one body is left: free turns (rotations about its own origin)
+/// and the remaining free slides (pure translations). Both zero = fully
+/// defined.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct BodyFreedom {
+    pub id: String,
+    pub rotations: usize,
+    pub translations: usize,
+    /// One axis line per free rotation (world), orthonormal directions.
+    #[serde(default)]
+    pub axes: Vec<FreeAxis>,
+    /// One unit direction per free slide (world), orthonormal.
+    #[serde(default)]
+    pub slides: Vec<[f64; 3]>,
+}
+
+/// A line a body can still turn about: a point on it and its unit direction.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct FreeAxis {
+    pub point: [f64; 3],
+    pub direction: [f64; 3],
 }

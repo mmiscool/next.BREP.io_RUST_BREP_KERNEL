@@ -11,6 +11,27 @@ use super::*;
 /// the coedge-coherent manifold normal-coherent; the signed-volume flip then
 /// orients it outward. Only invoked after a non-coplanar rim weld, so the
 /// coplanar cylinder/prism shells keep their exact assembled orientation.
+/// `BREP_OFFSET_ONE_CALL_IMPRINT` (lane P3b row 6, 2026-10-26): one
+/// `build_imprints` over a composite of every carrier instead of one call per
+/// pair. On by default (promoted 2026-10-27 after the 98 + 144 case oracle
+/// census); `0`/`off` retains the per-pair calls. Re-pinned by independent
+/// oracles, not byte-identical (piece and vertex numbering is the single
+/// call's).
+fn one_call_imprint_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let enabled = *ON.get_or_init(|| !matches!(std::env::var("BREP_OFFSET_ONE_CALL_IMPRINT").as_deref(), Ok("0") | Ok("off")));
+    enabled
+}
+
+thread_local! {
+    static ONE_CALL_RUNS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+/// Shell or offset operations whose imprint the one call produced on this thread since the last call.
+pub(super) fn take_one_call_runs() -> u64 {
+    ONE_CALL_RUNS.with(|count| count.replace(0))
+}
+
+
 fn coheres_face_normals(solid: &mut BrepSolid) -> Result<(), KernelRefusal> {
     for face in solid.shells.iter_mut().flat_map(|shell| &mut shell.faces) {
         face.same_sense = parameter_space_area(face).or_refuse(KernelStage::Sew, "parameter_space_area")? > 0.0;
@@ -167,6 +188,9 @@ pub(super) fn offset_body(
     entry: &str,
 ) -> Result<OffsetShellResultRecord, KernelRefusal> {
     profile::reset();
+    // Lane P3b row 3: one stderr write per operation for every profile line
+    // emitted below (`crate::imprint::ProfileSink`).
+    let _profile_sink = crate::imprint::ProfileSink::open();
     let started = web_time::Instant::now();
     let result = offset_shell_any_lane(source, opening_face_ids, distance, body).and_then(|result| {
         let mut clock = web_time::Instant::now();
@@ -467,6 +491,7 @@ fn offset_shell_impl(
     // that read a retained face's TRIM — the apex-cap scan below is the one —
     // must read the carved trim, not the one the source still carries.
     let mut carved_supports = HashMap::<u64, FaceRecord>::default();
+    let mut shielded_cusps = HashSet::<u64>::default();
 
     for face_id in &retained {
         let face = source_faces.iter().find(|face| face.id == *face_id).unwrap();
@@ -519,10 +544,16 @@ fn offset_shell_impl(
         // see `outward_carrier_extension`. A reflex junction needs no
         // outward growth at all (those offsets cross inside the trims).
         let mut curved_reach = None;
+        let planar_reach = planar_opening_reach(face, &source_faces, &opening_set, distance)?;
         let extension = if distance < 0.0 {
             outward_carrier_extension(source, face, &source_faces, &opening_set, distance.abs())?
         } else {
             let mut inward = crate::CarrierExtension::uniform(reflex_extension.unwrap_or(0.0));
+            if let Some(reach) = planar_reach {
+                let grown = reach + REACH_CLEARANCE * distance;
+                inward = crate::CarrierExtension::uniform(inward.u_min.max(grown));
+                os_debug!("carrier for src face {face_id}: planar reach to its opening {reach:.6}");
+            }
             if reflex_extension.is_some() {
                 let [u_min, u_max, v_min, v_max] =
                     apex_corner_reach(source, face, &source_faces, &opening_set, distance)?;
@@ -603,7 +634,7 @@ fn offset_shell_impl(
         // inverted patch in it welds into a shell that validates and bounds the
         // wrong solid.
         profile::lap(&mut clock, profile::CARRIER_TRIM);
-        let carved = profile::detail("carve_folded_support", || carve_folded_support(source, face, distance))?;
+        let carved = profile::detail("carve_folded_support", || carve_shell_support(source, face, distance, opening_face_ids))?;
         profile::lap(&mut clock, profile::CARRIER_REGULARITY);
         // A CUT RIM — the face's rim with a planar opening running across
         // its surface rather than along a v end — has the trim rebuilt over
@@ -640,6 +671,9 @@ fn offset_shell_impl(
                     carved.fold_boundary
                 );
                 carved_supports.insert(*face_id, carved.face.clone());
+                if carved.shielded_cusp {
+                    shielded_cusps.insert(*face_id);
+                }
                 &carved.solid
             }
             (None, None) => source,
@@ -699,13 +733,22 @@ fn offset_shell_impl(
         // fall inside the neighbouring offset section after that scaling.
         // Use the extended plane's full rectangle and let the neighbouring
         // carriers cut the skin. The source face and the offset surface stay
-        // unchanged. Unlike an outline offset, this needs no approximation of
+        // unchanged. Circular outlines need the same construction: scaling a
+        // reflex arc can also clip away its offset cylinder's section. Unlike
+        // an outline offset, this needs no approximation of
         // the planar rim's parallel curve (which may collapse at a tight turn).
         if distance > 0.0
             && reflex_extension.is_some()
             && face.surface.is_affine().or_refuse(KernelStage::Refine, "is_affine")?
-            && outline_has_free_element(source, face)?
+            && outline_has_curved_element(source, face)?
         {
+            carrier = full_rectangle_face(&carrier, &carrier.shells[0].faces[0])?;
+        }
+        if planar_reach.is_some() {
+            // A chamfer's trimmed polygon can cut diagonally across its
+            // patch. Scaling that polygon with the net can still clip the
+            // opening section. Let the opening and neighbouring offsets
+            // trim the grown construction rectangle instead.
             carrier = full_rectangle_face(&carrier, &carrier.shells[0].faces[0])?;
         }
         if open_section_reach {
@@ -1281,8 +1324,24 @@ fn offset_shell_impl(
     let mut imprint = empty_imprint();
     let mut next_piece_id = 1;
     let mut next_vertex_id = 1;
-    for first in 0..carriers.len() {
-        for second in first + 1..carriers.len() {
+    // Lane P3b row 2 (2026-10-26): where the IMPRINT phase spends its time
+    // outside `build_imprints`, one `offset_shell.imprint_split` line under
+    // BREP_PROFILE: the carrier-pair builds and merges, the wall x source
+    // builds, their standalone face copies and merges, the apex ring splits,
+    // the smooth-split sync and the boundary-coincidence filter.
+    let split_profile = crate::imprint::profile_enabled();
+    let mut split_ms = [0.0f64; 9];
+    let mut split_clock = split_profile.then(web_time::Instant::now);
+    let mut split_lap = |slot: usize, clock: &mut Option<web_time::Instant>| {
+        if let Some(started) = clock {
+            let now = web_time::Instant::now();
+            split_ms[slot] += (now - *started).as_secs_f64() * 1e3;
+            *started = now;
+        }
+    };
+    // The pair skip rules, one closure for both imprint paths below (the
+    // per-pair calls and row 6's one-call composite).
+    let pair_admitted = |first: usize, second: usize| -> bool {
             let first_source = source_by_id[&carriers[first].source_face_id];
             let second_source = source_by_id[&carriers[second].source_face_id];
             if matches!(carriers[first].kind, OffsetFaceRole::Wall)
@@ -1305,16 +1364,16 @@ fn offset_shell_impl(
                     && !inward_extended_walls.contains(&second))
                     || !source_faces_adjacent(first_source, second_source)
                 {
-                    continue;
+                    return false;
                 }
             }
             if smooth.pairs.contains(&(first, second)) {
                 os_debug!("pair ({first},{second}) skipped: smooth");
-                continue;
+                return false;
             }
             if !carrier_bounds[first].intersects(carrier_bounds[second], pair_tolerance) {
                 os_debug!("pair ({first},{second}) skipped: bounds");
-                continue;
+                return false;
             }
             if !source_faces_adjacent(first_source, second_source)
                 && sample_separation(
@@ -1323,8 +1382,114 @@ fn offset_shell_impl(
                 ) > reach
             {
                 os_debug!("pair ({first},{second}) skipped: separation");
+                return false;
+            }
+            true
+    };
+    // The wall x source pairs: an extended opening wall (outward, or inward
+    // at a reflex rim) against each retained source face adjacent to its
+    // opening (see the note at the per-pair loop below).
+    let mut wall_source_pairs: Vec<(usize, u64)> = Vec::new();
+    if body == Body::Shell && (distance < 0.0 || !inward_extended_walls.is_empty()) {
+        for index in 0..carriers.len() {
+            if !matches!(carriers[index].kind, OffsetFaceRole::Wall) {
                 continue;
             }
+            if distance > 0.0 && !inward_extended_walls.contains(&index) {
+                continue;
+            }
+            let opening = source_by_id[&carriers[index].source_face_id];
+            for retained_id in &retained {
+                if source_faces_adjacent(opening, source_by_id[retained_id]) {
+                    wall_source_pairs.push((index, *retained_id));
+                }
+            }
+        }
+    }
+    let one_call = one_call_imprint_enabled();
+    let mut one_call_done = false;
+    if one_call {
+        // ONE-CALL IMPRINT (`BREP_OFFSET_ONE_CALL_IMPRINT`, lane P3b row 6):
+        // every carrier and every retained source face a wall is cut against
+        // go into one open sheet solid (ids renumbered per member), one
+        // `build_imprints` processes exactly the admitted pairs, and its
+        // post-passes run once over the whole piece set. The record comes
+        // back in the shell's operand space. A failure of the single call
+        // falls back to the per-pair path below, which tolerates a failed
+        // pair on its own.
+        let mut members: Vec<(u8, &BrepSolid)> = carriers.iter().enumerate().map(|(index, carrier)| (index as u8, &carrier.solid)).collect();
+        let mut source_members: Vec<(u64, BrepSolid)> = Vec::new();
+        for (_, retained_id) in &wall_source_pairs {
+            if !source_members.iter().any(|(id, _)| id == retained_id) {
+                source_members.push((*retained_id, standalone_face(source, *retained_id)?));
+            }
+        }
+        for (_, solid) in &source_members {
+            members.push((SOURCE_OPERAND, solid));
+        }
+        let composite = compose_imprint_operands(&members);
+        let mut admitted: HashSet<(usize, usize)> = HashSet::default();
+        for first in 0..carriers.len() {
+            for second in first + 1..carriers.len() {
+                if pair_admitted(first, second) {
+                    admitted.insert((composite.face_index[first], composite.face_index[second]));
+                }
+            }
+        }
+        for (index, retained_id) in &wall_source_pairs {
+            let member = carriers.len() + source_members.iter().position(|(id, _)| id == retained_id).unwrap();
+            let (a, b) = (composite.face_index[*index], composite.face_index[member]);
+            admitted.insert((a.min(b), a.max(b)));
+        }
+        split_lap(0, &mut split_clock);
+        match crate::imprint::build_carrier_imprints_within(
+            &composite.solid,
+            &|first, second| admitted.contains(&(first, second)),
+            &ImprintOptions {
+                tolerance,
+                maximum_fit_points: 96,
+                local_fit: false,
+                fit_chunk_points: None,
+                maximum_ssi_step: Some((scale * 0.0005).max(tolerance * 100.0)),
+                span_budget: None,
+                hermite_sections: false,
+                tangent_curve_lane: false,
+                exact_iso_pcurves: false,
+                march_starts: false,
+                two_radius_junctions: false,
+                tangent_curve_imprint: false,
+            },
+            !shielded_cusps.is_empty(),
+        ) {
+            Ok(record) => {
+                split_lap(1, &mut split_clock);
+                imprint = translate_composite_imprint(record, &composite, tolerance, scale)?;
+                next_piece_id = imprint.pieces.iter().map(|piece| piece.id).max().unwrap_or(0) + 1;
+                next_vertex_id = imprint.vertices.iter().map(|vertex| vertex.id).max().unwrap_or(0) + 1;
+                one_call_done = true;
+                ONE_CALL_RUNS.with(|count| count.set(count.get() + 1));
+                split_lap(2, &mut split_clock);
+                os_debug!(
+                    "one-call imprint: {} members, {} admitted pairs, {} pieces",
+                    members.len(),
+                    admitted.len(),
+                    imprint.pieces.len(),
+                );
+            }
+            Err(error) => {
+                os_debug!("one-call imprint failed, per-pair path: {error}");
+            }
+        }
+    }
+    for first in 0..carriers.len() {
+        for second in first + 1..carriers.len() {
+            if one_call_done {
+                break;
+            }
+            if !pair_admitted(first, second) {
+                continue;
+            }
+            split_lap(0, &mut split_clock);
             let pair = match crate::imprint::build_carrier_imprints(
                 &carriers[first].solid,
                 &carriers[second].solid,
@@ -1359,6 +1524,7 @@ fn offset_shell_impl(
                     two_radius_junctions: false,
                     tangent_curve_imprint: false,
                 },
+                !shielded_cusps.is_empty(),
             ) {
                 Ok(pair) => pair,
                 // A failed pair imprint (e.g. the marching SSI exhausting its
@@ -1373,6 +1539,7 @@ fn offset_shell_impl(
                     continue;
                 }
             };
+            split_lap(1, &mut split_clock);
             let pieces_before = imprint.pieces.len();
             merge_pair_imprint(
                 &mut imprint,
@@ -1384,6 +1551,7 @@ fn offset_shell_impl(
                 tolerance,
                 scale,
             );
+            split_lap(2, &mut split_clock);
             os_debug!(
                 "pair ({first},{second}) src=({},{}) pieces+={}",
                 carriers[first].source_face_id,
@@ -1404,6 +1572,9 @@ fn offset_shell_impl(
         // share an edge with its opening: the wall then fragments into the
         // ring (kept) and the opening hole (dropped by the void guard).
         for index in 0..carriers.len() {
+            if one_call_done {
+                break;
+            }
             if !matches!(carriers[index].kind, OffsetFaceRole::Wall) {
                 continue;
             }
@@ -1416,7 +1587,9 @@ fn offset_shell_impl(
                 if !source_faces_adjacent(opening, retained_face) {
                     continue;
                 }
+                split_lap(0, &mut split_clock);
                 let neighbor = standalone_face(source, *retained_id)?;
+                split_lap(3, &mut split_clock);
                 let pair = match build_imprints(
                     &carriers[index].solid,
                     &neighbor,
@@ -1444,6 +1617,7 @@ fn offset_shell_impl(
                         continue;
                     }
                 };
+                split_lap(4, &mut split_clock);
                 let pieces_before = imprint.pieces.len();
                 merge_pair_imprint(
                     &mut imprint,
@@ -1455,6 +1629,7 @@ fn offset_shell_impl(
                     tolerance,
                     scale,
                 );
+                split_lap(5, &mut split_clock);
                 os_debug!(
                     "wall×source pair ({index},{retained_id}) pieces+={}",
                     imprint.pieces.len() - pieces_before,
@@ -1546,7 +1721,9 @@ fn offset_shell_impl(
             }
         }
     }
+    split_lap(6, &mut split_clock);
     synchronize_smooth_edge_splits(&mut imprint, &smooth.edge_pairs);
+    split_lap(7, &mut split_clock);
     // This decides whether an imprint is genuinely the carrier's existing
     // trim, not whether independently fitted curves can later be sewn. The
     // looser assembly tolerance can erase a short separating branch while it
@@ -1593,6 +1770,27 @@ fn offset_shell_impl(
                         .unwrap_or(false)
                 })
             });
+            // Separate retained planes can imprint overlapping portions of the
+            // same line on this carrier. Arrange that cut once: duplicate
+            // segments otherwise erase the region between a blend section
+            // and the line. Preserve each piece on its other carrier.
+            let candidates = by_face.piece_ids.clone();
+            by_face.piece_ids.retain(|id| {
+                let edge = &piece_geometry[id];
+                if edge.curve.degree != 1 || edge.curve.control_points.len() != 2 {
+                    return true;
+                }
+                !candidates.iter().any(|other_id| {
+                    if id == other_id { return false; }
+                    let other = &piece_geometry[other_id];
+                    if other.curve.degree != 1 || other.curve.control_points.len() != 2 {
+                        return false;
+                    }
+                    fragment_edge_lies_on(edge, other, tolerance).unwrap_or(false)
+                        && (other_id < id
+                            || !fragment_edge_lies_on(other, edge, tolerance).unwrap_or(false))
+                })
+            });
             if debug_enabled() && before.len() != by_face.piece_ids.len() {
                 os_debug!(
                     "carrier[{index}] dropped boundary-coincident pieces: {:?} -> {:?}",
@@ -1612,6 +1810,13 @@ fn offset_shell_impl(
                 entry.piece_ids,
             );
         }
+    }
+    split_lap(8, &mut split_clock);
+    if split_profile {
+        eprintln!(
+            "offset_shell.imprint_split skips={:.3} pair_build={:.3} pair_merge={:.3} standalone={:.3} wall_build={:.3} wall_merge={:.3} ring={:.3} smooth={:.3} filter={:.3}",
+            split_ms[0], split_ms[1], split_ms[2], split_ms[3], split_ms[4], split_ms[5], split_ms[6], split_ms[7], split_ms[8],
+        );
     }
     profile::lap(&mut clock, profile::IMPRINT);
     let mut split_carriers = Vec::new();
@@ -1832,6 +2037,18 @@ fn offset_shell_impl(
             // opposite side of the point from this face's own), taken only on
             // the THIN side of the onset.
             let mut readings = Vec::with_capacity(fragments_by_carrier[index].len());
+            // The construction band allows a carrier's own fit residual. It
+            // must not also preserve pockets buried by neighboring offsets:
+            // that coverage is what justified admitting a finite cusp. Keep
+            // the own-face reading unchanged, and measure other faces at the
+            // fit tolerance for this construction.
+            let cusp_neighbors = if shielded_cusps.is_empty() {
+                Vec::new()
+            } else {
+                retained_faces_with_edges.iter()
+                    .filter(|(face, _)| face.id != carrier.source_face_id)
+                    .cloned().collect::<Vec<_>>()
+            };
             for fragment in &fragments_by_carrier[index] {
                 let reading = offset_skin_reading(
                     fragment.test_point,
@@ -1839,6 +2056,16 @@ fn offset_shell_impl(
                     distance,
                     offset_skin_tolerance,
                 );
+                let reading = if matches!(&reading, SkinReading::On) && !cusp_neighbors.is_empty() {
+                    offset_skin_reading(
+                        fragment.test_point,
+                        &cusp_neighbors,
+                        distance,
+                        4.0 * KernelTolerances::for_solid(source, 1e-7).intersection_fit,
+                    )
+                } else {
+                    reading
+                };
                 let reading = match reading {
                     SkinReading::On => match coincident_offset_face(
                         fragment.test_point,

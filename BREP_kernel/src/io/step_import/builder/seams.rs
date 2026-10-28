@@ -58,10 +58,8 @@ impl<'a> SolidBuilder<'a> {
                         // pre-pass seats them ON the seam), but a closed edge
                         // shared by TWO periodic walls whose seam meridians
                         // differ cannot be anchored for both — the un-anchored
-                        // wall sees a mid-span crossing and the edge must
-                        // split exactly like an open arc (problemInbox
-                        // 2026-08-05T01-04: fillet-torus rim 180° out of
-                        // phase with its cylinder neighbour folded its pcurve).
+                        // wall sees a mid-span crossing and the edge must split
+                        // exactly like an open arc.
                         if edge.degenerate {
                             continue;
                         }
@@ -474,9 +472,8 @@ impl<'a> SolidBuilder<'a> {
                 // girdling curve at VARYING v (e.g. the saddle where a drilled
                 // hole meets a curved face, exported as a closed B-spline) has
                 // its geometry preserved: it is rotated so its seam vertex
-                // lands on the wall's seam meridian instead (problemInbox
-                // 2026-08-05T01-04: the reseat flattened such saddles into
-                // circles, leaving edges up to 0.09 model-units off-surface).
+                // lands on the wall's seam meridian instead (leaving edges up
+                // to 0.09 model-units off-surface).
                 let mut v_min = f64::INFINITY;
                 let mut v_max = f64::NEG_INFINITY;
                 let edge = self.edge_record(edge_id).clone();

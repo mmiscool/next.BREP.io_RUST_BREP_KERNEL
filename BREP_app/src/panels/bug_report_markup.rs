@@ -76,17 +76,14 @@ impl Markup {
     ) -> Option<egui::ColorImage> {
         let mut changed = false;
         ui.horizontal_wrapped(|ui| {
-            for (tool, label) in [
-                (Tool::Pen, "Pen"),
-                (Tool::Arrow, "Arrow"),
-                (Tool::Rectangle, "Rectangle"),
-            ] {
-                let response = ui.selectable_value(&mut self.tool, tool, label);
-                hits.insert(
-                    format!("markup:{}", label.to_lowercase()),
-                    response.interact_rect,
-                );
-            }
+            // The tool as one dropdown (markup:tool, its open entries
+            // markup:tool#pen, #arrow, #rectangle).
+            let choices = [
+                (Tool::Pen, "pen", "Pen"),
+                (Tool::Arrow, "arrow", "Arrow"),
+                (Tool::Rectangle, "rectangle", "Rectangle"),
+            ];
+            crate::form::enum_dropdown(ui, "markup:tool", &choices, &mut self.tool, None, Some(hits));
             ui.label("Color:");
             ui.color_edit_button_srgba(&mut self.color);
             let undo = ui.add_enabled(!self.marks.is_empty(), egui::Button::new("Undo"));

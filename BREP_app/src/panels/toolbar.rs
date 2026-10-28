@@ -374,6 +374,12 @@ impl ToolbarPanel {
         crate::automation::hit_rects::hits_json(&self.hits)
     }
 
+    /// For a frame the toolbar is not drawn (a focused reference pick): none
+    /// of its rects may stay published.
+    pub fn clear_hits(&mut self) {
+        self.hits.clear();
+    }
+
 }
 
 

@@ -1765,7 +1765,7 @@ pub(super) fn connected_components(solid: &BrepSolid, face_ids: &[u64]) -> Vec<V
 ///   so the chain re-uses the ids it was given.
 ///
 /// A single-face selection is put to the SAME gate, in full, and falls through
-/// to the chain when it does not hold — see [`delete_one_face`]. A lone face
+/// to the chain when it does not hold — see `delete_one_face`. A lone face
 /// can be a patch on its own: a bore's wall is one, and so is a bore whose
 /// mouth is tangent to something, where the rim arrives as runs of two
 /// pinch-split faces' loops instead of as a hole loop.

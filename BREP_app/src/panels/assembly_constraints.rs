@@ -56,6 +56,7 @@
 //! through [`crate::form_view::FormViewSpec::rollback`].
 
 use crate::automation::hit_keys::HitKeyDoc;
+use crate::column_tree::RowAction;
 use crate::form_view::{form_view, FormViewSpec};
 use crate::panels::tree::{self, TreeRow};
 use crate::panels::update_components::UpdateComponents;
@@ -77,6 +78,75 @@ const DELETE_RED: egui::Color32 = egui::Color32::from_rgb(0xd8, 0x54, 0x4f);
 
 /// One constraint row's per-frame snapshot (owned, so the draw loop can defer
 /// `&mut state` mutations — the shared panel pattern).
+/// The constraint menu's entries (a row's right-click menu and a viewport
+/// chip's): Flip, Edit, Suppress / Enable, Delete.
+pub(crate) const ACT_FLIP: &str = "flip";
+pub(crate) const ACT_EDIT: &str = "edit";
+pub(crate) const ACT_SUPPRESS: &str = "suppress";
+pub(crate) const ACT_ENABLE: &str = "enable";
+pub(crate) const ACT_DELETE: &str = "delete";
+
+/// The menu a constraint of `type_id` offers, `enabled` or suppressed.
+pub(crate) fn constraint_actions(type_id: &str, enabled: bool) -> Vec<RowAction> {
+    let flip = RowAction::new(ACT_FLIP, format!("{FLIP_GLYPH} Flip")).tooltip("The other solution: the other side, facing the other way, turning the other way");
+    let flip = match flip_refusal(type_id) {
+        Some(why) => flip.disabled(why),
+        None => flip,
+    };
+    let toggle = if enabled {
+        RowAction::new(ACT_SUPPRESS, "Suppress").tooltip("Switch this constraint off without deleting it")
+    } else {
+        RowAction::new(ACT_ENABLE, "Enable").tooltip("Switch this constraint back on")
+    };
+    vec![
+        flip,
+        RowAction::new(ACT_EDIT, "\u{270E} Edit").tooltip("Open the constraint's form"),
+        toggle,
+        RowAction::new(ACT_DELETE, "\u{2716} Delete").separator_above().destructive(),
+    ]
+}
+
+/// [`constraint_actions`] for the live constraint `id` (empty when it is gone).
+pub(crate) fn constraint_actions_for(state: &mut EngineState, id: &str) -> Vec<RowAction> {
+    let rows = state.assembly_statuses_value();
+    rows.as_array()
+        .into_iter()
+        .flatten()
+        .find(|row| row["id"] == id)
+        .map(|row| constraint_actions(row["type"].as_str().unwrap_or(""), row["enabled"].as_bool().unwrap_or(true)))
+        .unwrap_or_default()
+}
+
+/// Run one menu entry on constraint `id`: the ONE dispatch the row menu and
+/// the chip menu share.
+pub(crate) fn run_constraint_action(state: &mut EngineState, id: &str, action: &str) -> Result<(), String> {
+    match action {
+        ACT_FLIP => state.assembly_flip_constraint(id).map(drop).map_err(|reason| format!("Flip {id}: {reason}")),
+        ACT_EDIT => {
+            state.constraint_label_clicked(id);
+            Ok(())
+        }
+        ACT_SUPPRESS => state.assembly_set_constraint_enabled(id, false),
+        ACT_ENABLE => state.assembly_set_constraint_enabled(id, true),
+        ACT_DELETE => state.assembly_remove_constraint(id),
+        other => Err(format!("unknown constraint menu entry '{other}'")),
+    }
+}
+
+/// The Flip button's glyph (⇅).
+const FLIP_GLYPH: &str = "\u{21C5}";
+
+/// Why a constraint type cannot flip, or `None` when it can (the kernel's
+/// `flip_rule` decides the rest: a Distance to a line refuses on the click).
+fn flip_refusal(type_id: &str) -> Option<&'static str> {
+    match type_id {
+        "fixed" => Some("A fixed component has nothing to flip"),
+        "coincident" => Some("Coincident elements have one solution"),
+        "symmetric" => Some("A symmetric pair has one solution"),
+        _ => None,
+    }
+}
+
 struct ConstraintRow {
     id: String,
     type_id: String,
@@ -97,6 +167,9 @@ struct ConstraintRow {
     enabled: bool,
     open: bool,
     status: String,
+    /// In a named conflict, this is the member suppressing it would suggest
+    /// (the most recently added).
+    suppress_suggested: bool,
     input_params: Value,
 }
 
@@ -110,6 +183,10 @@ enum Action {
     /// A double click on the row: select AND open, as a label click does.
     SelectAndOpen(String),
     Delete(String),
+    /// The row's Flip: the constraint's other solution, one undo step.
+    Flip(String),
+    /// An entry of a row's right-click menu ([`run_constraint_action`]).
+    Menu(String, String),
     Move(String, usize),
     UpdateParams(String, Value),
     Solve,
@@ -138,6 +215,19 @@ pub struct AssemblyConstraintsPanel {
     drag_src: Option<usize>,
     /// Why the document may not change this frame (the form draws disabled).
     locked: Option<String>,
+    /// The "held after Replace — Review" button was clicked; the shell opens
+    /// the Replace summary and clears it.
+    pub review_replace_requested: bool,
+    /// The open RIGHT-CLICK menu of a constraint row: the constraint and the
+    /// screen point it opened at.
+    row_menu: Option<(String, egui::Pos2)>,
+    /// A right-click this frame, applied after the open menu has drawn.
+    row_menu_request: Option<(String, egui::Pos2)>,
+    /// The Exploded views section at the pane's foot (`panels::exploded_views`).
+    exploded: crate::panels::exploded_views::ExplodedSection,
+    /// The held-mates count and wording, per history revision
+    /// (`replace_component::held_summary`).
+    held: Option<(u64, usize, &'static str)>,
 }
 
 impl AssemblyConstraintsPanel {
@@ -218,6 +308,40 @@ impl AssemblyConstraintsPanel {
             ),
         }
 
+        // --- the open row menu: the same entries and dispatch as a chip's ------
+        if let Some((id, pos)) = self.row_menu.clone() {
+            match rows.iter().find(|row| row.id == id && !row.open) {
+                Some(row) => {
+                    let hits = &mut self.hits;
+                    let (chosen, still_open) = crate::column_tree::action_menu(
+                        ui.ctx(),
+                        ui.layer_id(),
+                        egui::Id::new("brep-acon-row-menu"),
+                        pos,
+                        &constraint_actions(&row.type_id, row.enabled),
+                        |entry, rect| {
+                            hits.insert(format!("acon:menuitem:{id}:{}", entry.id), rect);
+                        },
+                    );
+                    if !still_open {
+                        self.row_menu = None;
+                    }
+                    if let Some(entry) = chosen {
+                        self.row_menu = None;
+                        action = Some(Action::Menu(id, entry));
+                    }
+                }
+                None => self.row_menu = None,
+            }
+        }
+        if let Some(request) = self.row_menu_request.take() {
+            self.row_menu = Some(request);
+        }
+        // The Exploded views section, under the tree (never under a form).
+        if !rows.iter().any(|row| row.open) {
+            self.exploded.show(ui, state, &mut self.hits);
+        }
+
         // --- apply the one deferred engine mutation ----------------------------
         let result: Result<(), String> = match action {
             Some(Action::Add(type_id, params)) => state
@@ -236,6 +360,8 @@ impl AssemblyConstraintsPanel {
                 state.assembly_set_constraint_open(&id, true)
             }
             Some(Action::Delete(id)) => state.assembly_remove_constraint(&id),
+            Some(Action::Flip(id)) => state.assembly_flip_constraint(&id).map(drop).map_err(|reason| format!("Flip {id}: {reason}")),
+            Some(Action::Menu(id, entry)) => run_constraint_action(state, &id, &entry),
             Some(Action::Move(id, index)) => state.assembly_move_constraint(&id, index),
             Some(Action::UpdateParams(id, params)) => {
                 state.assembly_update_constraint(&id, &params.to_string())
@@ -429,6 +555,25 @@ impl AssemblyConstraintsPanel {
                     *action = Some(Action::UpdateComponents);
                 }
 
+                // Mates a Replace component is holding (disabled, waiting for a
+                // face): say so where the mates are, and reopen the summary.
+                let (held, after) = crate::panels::replace_component::held_summary(&mut self.held, state);
+                if held > 0 {
+                    let review = ui
+                        .add(
+                            egui::Button::new(
+                                egui::RichText::new(format!("\u{26A0} {held} mate(s) held after {after}: Review"))
+                                    .color(ui.visuals().warn_fg_color),
+                            )
+                            .min_size(full),
+                        )
+                        .on_hover_text("These mates lost their face when a component was replaced or its part was edited; pick a face or delete them");
+                    self.hits.insert("acon:replace-review".into(), review.rect);
+                    if review.clicked() {
+                        self.review_replace_requested = true;
+                    }
+                }
+
                 // Solve status: "No constraints solved yet", the DOF summary, or
                 // the last solve error.
                 ui.label(egui::RichText::new(dof_summary(dof)).weak());
@@ -581,6 +726,10 @@ impl AssemblyConstraintsPanel {
         let mut del_clicked = false;
         let mut edit_rect = egui::Rect::NOTHING;
         let mut edit_clicked = false;
+        let mut suppress_rect = egui::Rect::NOTHING;
+        let mut suppress_clicked = false;
+        let mut flip_rect = egui::Rect::NOTHING;
+        let mut flip_clicked = false;
 
         let status_label = assembly_status::status_label(&row.status);
         let [r, g, b] = assembly_status::status_color_rgb(&row.status);
@@ -613,11 +762,35 @@ impl AssemblyConstraintsPanel {
                 edit_clicked = edit.clicked();
                 ui.add_space(4.0);
 
+                // Flip to the other solution; a type with only one says why.
+                let refusal = flip_refusal(&row.type_id);
+                let flip = ui
+                    .add_enabled(refusal.is_none(), crate::icon_text::icon_button(ui, FLIP_GLYPH).small())
+                    .on_hover_text("Flip: the other solution (the other side, facing the other way, turning the other way)")
+                    .on_disabled_hover_text(refusal.unwrap_or_default());
+                flip_rect = flip.rect;
+                flip_clicked = flip.clicked();
+                ui.add_space(4.0);
+
                 let cb = ui
                     .add(egui::Checkbox::new(&mut enabled, ""))
                     .on_hover_text("Enable/disable this constraint");
                 enabled_rect = cb.rect;
                 enabled_clicked = cb.clicked();
+
+                // A named conflict offers to suppress this member; the
+                // suggested one (the most recently added) says so.
+                if row.status == "conflict" {
+                    let text = if row.suppress_suggested { "Suppress \u{2605}" } else { "Suppress" };
+                    let hover = if row.suppress_suggested {
+                        "Suppress this constraint to resolve the conflict (suggested: it is the most recently added)"
+                    } else {
+                        "Suppress this constraint to resolve the conflict"
+                    };
+                    let suppress = ui.add(egui::Button::new(egui::RichText::new(text).small())).on_hover_text(hover);
+                    suppress_rect = suppress.rect;
+                    suppress_clicked = suppress.clicked();
+                }
 
                 // Not selectable: it sits in the row's blank space, and a
                 // drag-to-select label senses clicks — selectable, the status
@@ -632,15 +805,30 @@ impl AssemblyConstraintsPanel {
         );
         // The published row rect IS the band — the whole strip is the click
         // target, so the whole strip is what a script aims at.
+        // A right-click anywhere on the row opens its menu (applied after the
+        // menu draws, so the click that opens it is not the click that closes it).
+        let secondary = if resp.band.secondary_clicked() { Some(&resp.band) } else if resp.label.secondary_clicked() { Some(&resp.label) } else { None };
+        if let Some(response) = secondary {
+            let at = response.interact_pointer_pos().unwrap_or(response.rect.center());
+            self.row_menu_request = Some((row.id.clone(), at));
+        }
         self.hits.insert(format!("acon:row:{}", row.id), resp.band.rect);
         self.hits.insert(format!("acon:box:{}", row.id), resp.box_rect);
         self.hits.insert(format!("acon:del:{}", row.id), del_rect);
         self.hits.insert(format!("acon:edit:{}", row.id), edit_rect);
+        self.hits.insert(format!("acon:flip:{}", row.id), flip_rect);
         self.hits
             .insert(format!("acon:enable:{}", row.id), enabled_rect);
+        if suppress_rect != egui::Rect::NOTHING {
+            self.hits.insert(format!("acon:suppress:{}", row.id), suppress_rect);
+        }
 
         if del_clicked {
             *action = Some(Action::Delete(row.id.clone()));
+        } else if flip_clicked {
+            *action = Some(Action::Flip(row.id.clone()));
+        } else if suppress_clicked {
+            *action = Some(Action::SetEnabled(row.id.clone(), false));
         } else if enabled_clicked {
             *action = Some(Action::SetEnabled(row.id.clone(), enabled));
         } else if resp.double_clicked() {
@@ -692,6 +880,11 @@ impl AssemblyConstraintsPanel {
             *close = Some(row.id.clone());
             return;
         };
+        let hidden: std::collections::HashSet<String> =
+            brep_render::brep_kernel::constraint_hidden_params(&row.type_id, &row.input_params)
+                .into_iter()
+                .map(str::to_string)
+                .collect();
         let fields = form_fields_from_schema(schema);
         let mut params = row.input_params.clone();
 
@@ -718,9 +911,9 @@ impl AssemblyConstraintsPanel {
             // The owner's call: assembly constraints have NO rollback, so an exit
             // carries no roll and this panel has no roll branch at all.
             rollback: false,
-            // No conditional fields on a constraint form today; the hook is here
-            // uniformly so any dialog can opt in later.
-            hidden: None,
+            // Conditional fields (a limit mate's range vs its target), from
+            // the kernel's one rule.
+            hidden: Some(&hidden),
             // The panel shows ONE form at a time, but its hit map holds the
             // tree's `acon:*` keys too AND is scanned alongside the history
             // panel's by the headed verifier — so the form's keys stay
@@ -825,17 +1018,21 @@ fn snapshot_rows(
     overlay: &Value,
     schemas: &[Value],
 ) -> Vec<ConstraintRow> {
-    let status_of = |id: &str| -> String {
+    let status_row = |id: &str| -> Option<&Value> {
         statuses
             .as_array()
-            .and_then(|rows| {
-                rows.iter().find(|row| {
-                    row.get("id").and_then(Value::as_str) == Some(id)
-                })
-            })
+            .and_then(|rows| rows.iter().find(|row| row.get("id").and_then(Value::as_str) == Some(id)))
+    };
+    let status_of = |id: &str| -> String {
+        status_row(id)
             .and_then(|row| row.get("status").and_then(Value::as_str))
             .unwrap_or("")
             .to_string()
+    };
+    let suggested_of = |id: &str| -> bool {
+        status_row(id)
+            .and_then(|row| row.get("suppressSuggested").and_then(Value::as_bool))
+            .unwrap_or(false)
     };
     let overlay_value = |id: &str| -> Option<f64> {
         overlay
@@ -911,6 +1108,7 @@ fn snapshot_rows(
                         enabled: entry.get("enabled").and_then(Value::as_bool).unwrap_or(true),
                         open: entry.get("open").and_then(Value::as_bool).unwrap_or(false),
                         status: status_of(&id),
+                        suppress_suggested: suggested_of(&id),
                         input_params: params,
                         id,
                         type_id,
@@ -925,6 +1123,14 @@ fn snapshot_rows(
 /// (the old app only surfaced duplicates).
 fn dof_summary(dof: &Value) -> String {
     if dof.get("ok").and_then(Value::as_bool) == Some(false) {
+        if let Some(ids) = dof.get("conflict").and_then(Value::as_array) {
+            let ids: Vec<&str> = ids.iter().filter_map(Value::as_str).collect();
+            let suggested = dof.get("suggestSuppress").and_then(Value::as_str).unwrap_or("");
+            return format!(
+                "Conflict: {} cannot all hold. Suppress one to solve (suggested: {suggested}).",
+                ids.join(", ")
+            );
+        }
         let error = dof.get("error").and_then(Value::as_str).unwrap_or("solve failed");
         return format!("Solve failed: {error}");
     }
@@ -1030,11 +1236,15 @@ pub static HIT_KEYS: &[HitKeyDoc] = &[
     HitKeyDoc { panel: "assemblyconstraints", prefix: "acon:solve", meaning: "solve", command: Some("assembly_solve") },
     HitKeyDoc { panel: "assemblyconstraints", prefix: "acon:autosolve", meaning: "toggle auto-solve", command: Some("settings_set") },
     HitKeyDoc { panel: "assemblyconstraints", prefix: "acon:update", meaning: "update components", command: Some("component_update") },
+    HitKeyDoc { panel: "assemblyconstraints", prefix: "acon:replace-review", meaning: "reopen the Replace component summary for mates it holds", command: Some("assembly_replace_report") },
     HitKeyDoc { panel: "assemblyconstraints", prefix: "acon:graphics", meaning: "toggle overlay graphics", command: Some("settings_set") },
     HitKeyDoc { panel: "assemblyconstraints", prefix: "acon:row:", meaning: "a constraint's row (acon:row:<id>) \u{2014} a click SELECTS the constraint, a double click opens its form", command: None },
     HitKeyDoc { panel: "assemblyconstraints", prefix: "acon:edit:", meaning: "open a constraint's form", command: None },
     HitKeyDoc { panel: "assemblyconstraints", prefix: "acon:del:", meaning: "delete a constraint", command: Some("assembly_remove_constraint") },
     HitKeyDoc { panel: "assemblyconstraints", prefix: "acon:box:", meaning: "a constraint's enable box", command: Some("assembly_set_constraint_enabled") },
+    HitKeyDoc { panel: "assemblyconstraints", prefix: "acon:menuitem:", meaning: "one entry of a constraint row's OPEN right-click menu (acon:menuitem:<id>:<flip|edit|suppress|enable|delete>), published only while the menu is up; the same entries and dispatch as the viewport chip's menu (constraintmenu/menuitem:)", command: None },
+    HitKeyDoc { panel: "assemblyconstraints", prefix: "acon:flip:", meaning: "flip a constraint to its other solution (acon:flip:<id>): the other side, facing the other way, turning the other way; one undo step. Disabled, with the reason, for a type with one solution (Fixed, Coincident, Symmetric)", command: None },
+    HitKeyDoc { panel: "assemblyconstraints", prefix: "acon:suppress:", meaning: "suppress a member of a named conflict (acon:suppress:<id>; the suggested one is the most recently added)", command: Some("assembly_set_constraint_enabled") },
     HitKeyDoc { panel: "assemblyconstraints", prefix: "acon:panel:clip", meaning: "the visible region of the pane", command: None },
     HitKeyDoc { panel: "assemblyconstraints", prefix: "acon:", meaning: "a constraint form control", command: Some("assembly_update_constraint") },
 ];

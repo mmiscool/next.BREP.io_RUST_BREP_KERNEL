@@ -1,6 +1,6 @@
 [package]
 name = "BREP_render"
-version = "0.9.0"
+version = "0.10.0"
 edition = "2021"
 license-file = "LICENSE.md"
 repository = "https://github.com/mmiscool/next.BREP.io_RUST_BREP_KERNEL"
@@ -37,16 +37,26 @@ crate-type = ["cdylib", "rlib"]
 # path dependency links the kernel rlib without touching its build.
 
 [dependencies]
-brep_plugins = { package = "BREP_plugins", version = "0.3.0", path = "../BREP_plugins" }
+brep_plugins = { package = "BREP_plugins", version = "0.3.1", path = "../BREP_plugins" }
 # BOM reference edits validate electronics snapshots with their owning schema.
-BREP_ecad_core = { version = "0.3.0", path = "../BREP_ecad_core" }
+BREP_ecad_core = { version = "0.3.1", path = "../BREP_ecad_core" }
 # Base kernel link WITHOUT `parallel` — the wasm build must not pull rayon
 # (the shipped kernel wasm enables neither feature). `parallel` is added back
 # for native only, below.
-brep_kernel = { package = "BREP_kernel", version = "0.10.0", path = "../BREP_kernel", default-features = false }
+brep_kernel = { package = "BREP_kernel", version = "0.11.0", path = "../BREP_kernel", default-features = false }
+# The CAM engine, for the worker's generation job (`runner::Command::CamGenerate`):
+# the kernel adapter needs the resident solids, which live on the runner side.
+# `kernel` turns on that adapter; the crate is pure Rust and builds for wasm32.
+brep_cam = { package = "BREP_cam", version = "0.1.0", path = "../BREP_cam", features = ["kernel"] }
+# Manufacturing instructions: the instructions block, the wizard and step edits
+# (serde only; builds for wasm32).
+brep_instructions = { package = "BREP_instructions", version = "0.1.0", path = "../BREP_instructions" }
+# Motion studies: the simulation block, motors, clips and sampling (serde only;
+# builds for wasm32).
+brep_simulation = { package = "BREP_simulation", version = "0.1.0", path = "../BREP_simulation" }
 # Mesh imports pass through the topology-aware RANSAC reconstruction stack
 # before they enter the ordinary IMPORT3D history lane.
-brep-reconstruction = { package = "BREP_reconstruction", version = "0.7.0", path = "../BREP_reconstruction" }
+brep-reconstruction = { package = "BREP_reconstruction", version = "0.8.0", path = "../BREP_reconstruction" }
 # The in-scene gizmos / overlay widgets (transform gizmo, ViewCube, datum/axis
 # visuals, dimension leaders, curve display). Pure geometry + hit-testing, no
 # GPU/kernel dep — the engine converts its emitted `Overlay` into overlay GPU
@@ -69,7 +79,9 @@ serde_json = "1"
 # renderer core never touches these — they belong to the thin shells (headless
 # readback, winit window).
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-brep_kernel = { package = "BREP_kernel", version = "0.10.0", path = "../BREP_kernel", features = ["parallel"] }
+brep_kernel = { package = "BREP_kernel", version = "0.11.0", path = "../BREP_kernel", features = ["parallel"] }
+# CAM contact solves on rayon for native generation (byte-identical output).
+brep_cam = { package = "BREP_cam", version = "0.1.0", path = "../BREP_cam", features = ["kernel", "parallel"] }
 pollster = "0.4"
 winit = { version = "0.30", optional = true }
 

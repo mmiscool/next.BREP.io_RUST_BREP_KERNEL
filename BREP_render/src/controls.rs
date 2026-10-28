@@ -6,7 +6,7 @@
 //! - wheel = zoom about the target, a gentle exponential step per notch
 //!   (`enableAnimations` was false in the app, so there is deliberately NO
 //!   inertia/damping; the smooth ramp comes from egui's own per-frame scroll
-//!   smoothing — see [`ZOOM_PER_NOTCH`]).
+//!   smoothing — see `ZOOM_PER_NOTCH`).
 //!
 //! Input arrives as forwarded browser pointer/wheel events through the R3 API (CSS
 //! pixels); the same struct drives the winit desktop shell.
@@ -154,7 +154,7 @@ impl ArcballControls {
     }
 
     /// Wheel zoom about the target. `delta_y` is in egui POINTS (see
-    /// [`ZOOM_PER_NOTCH`]); negative = zoom in. Returns true when the camera
+    /// `ZOOM_PER_NOTCH`); negative = zoom in. Returns true when the camera
     /// changed.
     pub fn wheel(
         &mut self,

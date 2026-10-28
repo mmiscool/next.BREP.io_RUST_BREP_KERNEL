@@ -1,6 +1,6 @@
 [package]
 name = "BREP_app"
-version = "0.9.0"
+version = "0.10.0"
 edition = "2021"
 license-file = "LICENSE.md"
 repository = "https://github.com/mmiscool/next.BREP.io_RUST_BREP_KERNEL"
@@ -72,9 +72,20 @@ default = ["mcp", "scripting"]
 scripting = ["dep:brep-script-core"]
 
 [dependencies]
-brep-plugins = { package = "BREP_plugins", version = "0.3.0", path = "../BREP_plugins" }
+brep-plugins = { package = "BREP_plugins", version = "0.3.1", path = "../BREP_plugins" }
+# The shared CAM model (setups, tools, operations, toolpaths) the CAM
+# workbench persists in the document's `cam` block and the dialogs edit. Pure
+# Rust, no features: the kernel adapter stays on the generation side.
+# `post-runtime`: C4's posts on the Boa interpreter, for the CAM pane's Post…
+# and cam_post (contract C19-27), in every build (the MCP host builds the app
+# without `scripting`), so posting is a Boa caller on wasm too.
+brep_cam = { package = "BREP_cam", version = "0.1.0", path = "../BREP_cam", features = ["post-runtime"] }
 # The windowing-agnostic viewer brain + wgpu-29 render core we are hosting.
-brep-render = { package = "BREP_render", version = "0.9.0", path = "../BREP_render" }
+brep-render = { package = "BREP_render", version = "0.10.0", path = "../BREP_render" }
+# Manufacturing instructions: the block, the wizard, step edits and the player.
+brep_instructions = { package = "BREP_instructions", version = "0.1.0", path = "../BREP_instructions" }
+# Motion studies: the simulation block the Simulation pane edits.
+brep_simulation = { package = "BREP_simulation", version = "0.1.0", path = "../BREP_simulation" }
 # wgpu named directly so we can spell the types the render core hands back /
 # takes (TextureView, Device, ...). Resolves to the SAME wgpu 29.x as
 # brep-render and eframe's egui-wgpu (all constrain ^29), so the handle types
@@ -139,11 +150,11 @@ ehttp = "0.5"
 # PNG decode for the library's result thumbnails (decoded on the UI thread, then
 # uploaded with ctx.load_texture). PNG-only + default-features off keeps it lean
 # and pure-Rust (wasm-safe) — the step.parts thumbnails are all PNG.
-image = { version = "0.25", default-features = false, features = ["png"] }
+image = { version = "0.25", default-features = false, features = ["png", "gif"] }
 # The electronics documents (schematic, wiring diagram, board, symbol, pads) and
 # their embeddable egui editors, moved in from eCAD as sibling crates. Their
 # manifests stand alone, like every crate here; see the profile section below.
-BREP_ecad_core = { version = "0.3.0", path = "../BREP_ecad_core" }
+BREP_ecad_core = { version = "0.3.1", path = "../BREP_ecad_core" }
 BREP_ecad_egui = { version = "0.3.0", path = "../BREP_ecad_egui" }
 # The script interpreter core shared with the PLM server (feature `scripting`).
 # It turns on Boa's wasm backend itself, so nothing about Boa is spelled here.
@@ -215,7 +226,7 @@ web-sys = { version = "0.3", features = [
 # WebMCP tools over the page's own platform (src/webmcp.rs). Declared per
 # target so the wasm build never resolves rmcp or hyper; the `mcp` feature's
 # `dep:brep-mcp-core` activates whichever entry the target has.
-brep-mcp-core = { package = "BREP_mcp_core", version = "0.7.0", path = "../BREP_mcp_core", default-features = false, optional = true }
+brep-mcp-core = { package = "BREP_mcp_core", version = "0.8.0", path = "../BREP_mcp_core", default-features = false, optional = true }
 # The host protocol's channels (`tokio::sync` is the one tokio feature set
 # that compiles for wasm32); no runtime, no timers — the page's event loop
 # runs the tasks and `setTimeout` is the pause.
@@ -224,8 +235,16 @@ tokio = { version = "1", default-features = false, features = ["sync"], optional
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 # The MCP server core (feature `mcp`): the same server `brep-mcp` hosts
 # headlessly, embedded here over the app's own automation queue.
-brep-mcp-core = { package = "BREP_mcp_core", version = "0.7.0", path = "../BREP_mcp_core", optional = true }
+brep-mcp-core = { package = "BREP_mcp_core", version = "0.8.0", path = "../BREP_mcp_core", optional = true }
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "net", "time"], optional = true }
+# A motion study's MP4 export (src/simulation_export.rs): a pure-Rust H.264
+# encoder (rusty_h264-encoder + -common, BSD-2-Clause, no C in the tree) and
+# a pure-Rust MP4 muxer (mp4e, MIT). GIF export rides the `image` crate's gif
+# feature above. Native only (this target table): the web app plays studies
+# but writes no video file, and its build never pulls these.
+rusty_h264-encoder = "0.16.1"
+rusty_h264-common = "0.16.1"
+mp4e = "1.0.5"
 
 [[bin]]
 name = "brep-app"

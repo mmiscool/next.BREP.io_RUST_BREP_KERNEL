@@ -223,6 +223,9 @@ struct OverlayGroupW {
     lines: Vec<LineVertex>,
     points: Vec<OverlayPointW>,
     point_size: f32,
+    /// [`fold_words`] of the group's geometry, computed once when it is set;
+    /// [`WidgetRegistry::render_fingerprint`] reads it instead of the vertices.
+    content_hash: u64,
 }
 
 /// Default screen size (CSS px) for an overlay point when unspecified.
@@ -295,12 +298,30 @@ impl OverlayGroupW {
             }
         }
 
-        Self { name, render_order, tris, lines, points, point_size }
+        let mut content_hash = FOLD_SEED;
+        for v in &tris {
+            content_hash = fold_words(content_hash, v.pos.iter().chain(&v.normal).chain(&v.color).map(|f| f.to_bits()));
+        }
+        for v in &lines {
+            content_hash = fold_words(content_hash, v.pos.iter().chain(&v.color).map(|f| f.to_bits()));
+        }
+        Self { name, render_order, tris, lines, points, point_size, content_hash }
     }
 
     fn is_empty(&self) -> bool {
         self.tris.is_empty() && self.lines.is_empty() && self.points.is_empty()
     }
+}
+
+const FOLD_SEED: u64 = 0xcbf2_9ce4_8422_2325;
+
+/// FNV-1a over 32-bit words: cheap enough to run over a whole CAM stock group
+/// when it is set, and only used to notice change (not for security).
+fn fold_words(mut hash: u64, words: impl Iterator<Item = u32>) -> u64 {
+    for word in words {
+        hash = (hash ^ word as u64).wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
 }
 
 enum DimW {
@@ -752,6 +773,12 @@ impl WidgetRegistry {
     /// core draws those with a NO-depth-write pipeline so a translucent plane can
     /// never occlude the gizmos/dimensions that follow.
     pub fn build_main_overlay(&self, cam: &GizmoCamera) -> (Overlay, usize) {
+        self.build_main_overlay_with(cam, true)
+    }
+
+    /// [`Self::build_main_overlay`], with the general groups left out when
+    /// `groups` is false.
+    fn build_main_overlay_with(&self, cam: &GizmoCamera, groups: bool) -> (Overlay, usize) {
         let mut ov = Overlay::new();
 
         for p in &self.planes {
@@ -792,7 +819,7 @@ impl WidgetRegistry {
         // equal orders). Tris/lines are pre-expanded; point quads are built here
         // camera-facing + screen-constant since the overlay pass has no point
         // pipeline of its own.
-        let mut order: Vec<&OverlayGroupW> = self.overlay_groups.iter().collect();
+        let mut order: Vec<&OverlayGroupW> = if groups { self.overlay_groups.iter().collect() } else { Vec::new() };
         order.sort_by_key(|g| g.render_order);
         for g in order {
             ov.tris.extend_from_slice(&g.tris);
@@ -850,6 +877,32 @@ impl WidgetRegistry {
     /// Any overlay widget is present (main geometry or the ViewCube).
     pub fn any_visible(&self) -> bool {
         self.has_main_overlay() || self.viewcube_enabled
+    }
+
+    /// A hash of everything this registry would draw with `cam`: the main
+    /// overlay without the groups and the ViewCube, built as a frame builds
+    /// them, plus each group's identity and stored `fold_words` hash. Used by
+    /// the app's stale-frame check (automation builds) to notice a drawn
+    /// change that did not mark the frame dirty.
+    pub fn render_fingerprint(&self, cam: &GizmoCamera) -> u64 {
+        let (main, planes) = self.build_main_overlay_with(cam, false);
+        let tri_words = main.tris.iter().flat_map(|v| v.pos.into_iter().chain(v.normal).chain(v.color)).map(f32::to_bits);
+        let line_words = main.lines.iter().flat_map(|v| v.pos.into_iter().chain(v.color)).map(f32::to_bits);
+        let mut hash = fold_words(FOLD_SEED, tri_words.chain(line_words).chain([planes as u32]));
+        for g in &self.overlay_groups {
+            hash = fold_words(hash, g.name.bytes().map(u32::from).chain([g.render_order as u32, g.point_size.to_bits()]));
+            hash = fold_words(hash, [g.content_hash as u32, (g.content_hash >> 32) as u32].into_iter());
+            for p in &g.points {
+                let c: [f32; 3] = p.center.into();
+                hash = fold_words(hash, c.into_iter().chain(p.color).map(f32::to_bits));
+            }
+        }
+        if let Some(cube) = self.build_viewcube(cam) {
+            let tris = cube.overlay.tris.iter().flat_map(|v| v.pos.into_iter().chain(v.color)).map(f32::to_bits);
+            let lines = cube.overlay.lines.iter().flat_map(|v| v.pos.into_iter().chain(v.color)).map(f32::to_bits);
+            hash = fold_words(hash, tris.chain(lines).chain(cube.rect_css.map(f32::to_bits)));
+        }
+        hash
     }
 
     /// Build a whole frame's overlay geometry from the live camera.
@@ -989,7 +1042,7 @@ impl WidgetRegistry {
     }
 
     /// The VISIBLE transform gizmo's current frame origin in world space, or `None`
-    /// when the gizmo is hidden. Reflects the last [`set_transform_json`] feed, so
+    /// when the gizmo is hidden. Reflects the last [`set_transform_json`](Self::set_transform_json) feed, so
     /// it tracks the live-follow re-sync during a drag (Fix 3) — distinct from a
     /// params-derived anchor, this proves the drawn widget actually moved.
     pub fn transform_origin(&self) -> Option<[f32; 3]> {
@@ -1073,7 +1126,7 @@ impl WidgetRegistry {
         drag_delta_json(gz, cam, handle, sx, sy, cx, cy)
     }
 
-    /// Like [`transform_drag_json`] but resolved against an EXPLICIT frozen frame
+    /// Like [`transform_drag_json`](Self::transform_drag_json) but resolved against an EXPLICIT frozen frame
     /// (`{origin,x,y,z}`, the grab-time feature frame) instead of the live widget
     /// gizmo. This lets the engine re-sync the VISIBLE gizmo to the moving feature
     /// pose every drag frame (Fix 3 live-follow) while the delta stays anchored to

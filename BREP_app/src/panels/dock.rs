@@ -14,8 +14,8 @@
 //! * [`PaneKind`] — the serde discriminant of a tile; carries NO state.
 //! * [`DockState`] — owns the `Tree<PaneKind>`, load/save/reconcile, and the
 //!   per-frame workbench visibility pass
-//!   ([`DockState::apply_workbench_visibility`]). One field on `BrepApp`.
-//! * [`DockBehavior`] — a transient, per-frame `egui_tiles::Behavior` built from
+//!   (`DockState::apply_workbench_visibility`). One field on `BrepApp`.
+//! * `DockBehavior` — a transient, per-frame `egui_tiles::Behavior` built from
 //!   disjoint `&mut` borrows of the app's panels + engine (see [`DockContext`]);
 //!   its `pane_ui` just delegates to each panel's existing `show(...)`.
 //!
@@ -40,6 +40,7 @@ use crate::panels::history::HistoryPanel;
 use crate::panels::scene::ScenePanel;
 use crate::panels::update_components::UpdateComponents;
 use crate::panels::wire_harness::WireHarnessPanel;
+use crate::panels::cam::CamPanel;
 use crate::panels::pmi::PmiPanel;
 use crate::panels::qualify::QualifyPanel;
 use crate::panels::family_table_editor::FamilyTableEditor;
@@ -61,7 +62,7 @@ pub enum PaneKind {
     /// second hand-drawn strip inside it.
     ///
     /// The id is process-unique and therefore meaningless in a RELOADED layout;
-    /// [`DockState::sync_document_panes`] renumbers whatever it finds onto the
+    /// `DockState::sync_document_panes` renumbers whatever it finds onto the
     /// live documents, which is what makes the persisted layout survive.
     Document(u64),
     /// Index into the persisted, owned plugin ID table (never reused).
@@ -100,6 +101,18 @@ pub enum PaneKind {
     /// Claimed by no workbench and gated on the SESSION: on screen exactly
     /// while the store is a PLM ([`workbench::PLM_PANEL_ID`]).
     Plm,
+    /// The CAM browser tree: setups and their operations, NC programs and the
+    /// tool library (claimed by the CAM workbench).
+    Cam,
+    /// Manufacturing instructions: the step tree and the selected step's
+    /// editor (claimed by the Instructions workbench).
+    Instructions,
+    /// The in-app instructions player, shop or customer mode (claimed by the
+    /// Instructions workbench).
+    InstructionsPlayer,
+    /// Motion studies: the studies and the active one's timeline (claimed by
+    /// the Simulation workbench).
+    Simulation,
 }
 
 impl PaneKind {
@@ -107,7 +120,7 @@ impl PaneKind {
     /// three unclaimed panes first, then the workbench-claimed ones. Every one
     /// of them is in the tree at all times — the workbench only hides them — so
     /// this is the order of the default left-hand tab strip, left to right.
-    const SIDE: [PaneKind; 13] = [
+    const SIDE: [PaneKind; 17] = [
         PaneKind::History,
         PaneKind::Scene,
         PaneKind::Expressions,
@@ -121,12 +134,16 @@ impl PaneKind {
         PaneKind::Qualify,
         PaneKind::FamilyTable,
         PaneKind::Plm,
+        PaneKind::Cam,
+        PaneKind::Instructions,
+        PaneKind::InstructionsPlayer,
+        PaneKind::Simulation,
     ];
 
-    /// The side panes an automation caller can name — [`Self::SIDE`] under a
+    /// The side panes an automation caller can name — `Self::SIDE` under a
     /// public name, so `describe_panes` / `show_pane` enumerate the dock rather
     /// than keeping a second list of it.
-    pub const ALL: [PaneKind; 13] = Self::SIDE;
+    pub const ALL: [PaneKind; 17] = Self::SIDE;
 
     /// Human tab title.
     pub fn title(self) -> &'static str {
@@ -152,6 +169,10 @@ impl PaneKind {
             PaneKind::Qualify => "Qualify",
             PaneKind::FamilyTable => "Family table",
             PaneKind::Plm => "PLM",
+            PaneKind::Cam => "CAM",
+            PaneKind::Instructions => "Instructions",
+            PaneKind::InstructionsPlayer => "Player",
+            PaneKind::Simulation => "Simulation",
         }
     }
 
@@ -174,10 +195,14 @@ impl PaneKind {
             PaneKind::Qualify => Some(workbench::QUALIFY_PANEL_ID),
             PaneKind::FamilyTable => Some(workbench::FAMILY_TABLE_PANEL_ID),
             PaneKind::Plm => Some(workbench::PLM_PANEL_ID),
+            PaneKind::Cam => Some(workbench::cam::PANEL_ID),
+            PaneKind::Instructions => Some(workbench::instructions::PANEL_ID),
+            PaneKind::InstructionsPlayer => Some(workbench::instructions::PLAYER_PANEL_ID),
+            PaneKind::Simulation => Some(workbench::simulation::PANEL_ID),
         }
     }
 
-    /// [`Self::visible_in`] under a public name, so `show_pane` can refuse a
+    /// `Self::visible_in` under a public name, so `show_pane` can refuse a
     /// pane the active workbench does not carry instead of no-op'ing.
     pub fn visible_under_workbench(self, wb: &str, panels: &workbench::ButtonState) -> bool {
         self.visible_in(wb, panels)
@@ -397,6 +422,9 @@ pub struct DockState {
     /// behind on the next entry: the user's choice, not the door's. Saved with
     /// the layout, so a restart remembers it too.
     ecad_declined: Vec<PaneKind>,
+    /// The Instructions door ([`Self::arrange_instructions`]) has run on this
+    /// layout: it runs once. Saved with the layout.
+    instructions_arranged: bool,
     mobile: CompactDock,
 }
 
@@ -415,6 +443,8 @@ enum Noting {
 
 /// The field of the saved layout that carries [`DockState`]'s eCAD door notes.
 const ECAD_DECLINED_KEY: &str = "brepEcadDeclined";
+/// The layout-file key of the Instructions door's note ([`DockState::arrange_instructions`]).
+const INSTRUCTIONS_ARRANGED_KEY: &str = "brepInstructionsArranged";
 
 /// The disjoint `&mut` borrows the dock needs to draw a frame — assembled by the
 /// shell from `BrepApp`'s fields (all distinct, so the borrow checker allows it).
@@ -439,6 +469,14 @@ pub struct DockContext<'a> {
     pub model_store: &'a dyn ModelStore,
     /// Every PLM panel ([`crate::panels::plm_host`]); drawn only in a PLM session.
     pub plm: &'a mut crate::panels::plm_host::PlmHost,
+    /// The CAM browser tree (the CAM workbench's pane).
+    pub cam: &'a mut CamPanel,
+    /// The Instructions workbench's pane.
+    pub instructions: &'a mut crate::panels::instructions::InstructionsPanel,
+    /// The Instructions workbench's player.
+    pub instructions_player: &'a mut crate::panels::instructions_player::InstructionsPlayerPanel,
+    /// The Simulation workbench's pane.
+    pub simulation: &'a mut crate::panels::simulation::SimulationPanel,
 }
 
 /// What a dock frame hands back to the shell — the SAME cross-panel requests the
@@ -474,6 +512,7 @@ impl DockState {
             .and_then(|notes| serde_json::from_value::<Vec<PaneKind>>(notes.clone()).ok())
             .unwrap_or_default();
         let plugin_ids = saved.as_ref().and_then(|v| v.get("brepPluginIds")).and_then(|v| serde_json::from_value(v.clone()).ok()).unwrap_or_default();
+        let instructions_arranged = saved.as_ref().and_then(|v| v.get(INSTRUCTIONS_ARRANGED_KEY)).and_then(serde_json::Value::as_bool).unwrap_or(false);
         let tree = saved
             .and_then(|json| serde_json::from_value::<Tree<PaneKind>>(json).ok())
             .and_then(salvage)
@@ -487,6 +526,7 @@ impl DockState {
             ports: None,
             ecad_entry: None,
             ecad_declined,
+            instructions_arranged,
             mobile: CompactDock::default(),
         }
     }
@@ -498,7 +538,10 @@ impl DockState {
         let wb = ctx.docs.engine().settings.workbench.clone();
         // Visibility is asked of the workbench AND the document, so it is
         // computed here, before the behavior takes `&mut docs`.
-        self.apply_workbench_visibility(&wb, &workbench::ButtonState::of(ctx.docs.engine()));
+        // A Work part edited in place keeps the ASSEMBLY's BOM on screen under
+        // the part's Modeling tools: it is the product structure being edited.
+        let forced = ctx.docs.work_part_in_place().then_some(PaneKind::Bom);
+        self.apply_workbench_visibility(&wb, &workbench::ButtonState::of(ctx.docs.engine()), forced);
         self.sync_plugin_panes(ctx.docs.engine());
         // The QUALIFY pane's door, run right after the visibility pass and for
         // the same reason the dialog door runs where it does: a pane that was
@@ -513,6 +556,7 @@ impl DockState {
             &wb,
         );
         self.surface_ecad_pane(ctx.docs.active_id(), &wb);
+        self.arrange_instructions(&wb, ctx.docs.engine().is_instructions());
         // One tab per open model, active tab = active model. Must run BEFORE the
         // draw so a document opened or closed last frame is already reflected in
         // the bar the user is about to see.
@@ -864,6 +908,41 @@ impl DockState {
         }
     }
 
+    /// **The Instructions door.** The first time instructions are open in the
+    /// Instructions workbench, the Instructions pane leaves the side strip for
+    /// a column of its own between the strip and the viewport (a wider share
+    /// than the strip: its action rows need the room), and the BOM
+    /// comes to the front of the strip: a BOM row then drags into a step over
+    /// a short move with both on screen. The one structural move a workbench
+    /// makes, and it is made ONCE per layout (the note is saved with it): a
+    /// user who tabs the two back together keeps them so, and a layout where
+    /// they are already apart is noted as done and left alone.
+    fn arrange_instructions(&mut self, wb: &str, is_instructions: bool) {
+        if self.instructions_arranged || wb != workbench::instructions::INSTRUCTIONS.id || !is_instructions {
+            return;
+        }
+        let (Some(pane), Some(bom), Some(root)) = (self.find_pane(PaneKind::Instructions), self.find_pane(PaneKind::Bom), self.tree.root()) else {
+            return;
+        };
+        let strip = self.tree.tiles.parent_of(pane);
+        let tabbed_together = strip.is_some()
+            && self.tree.tiles.parent_of(bom) == strip
+            && matches!(strip.and_then(|s| self.tree.tiles.get(s)), Some(Tile::Container(Container::Tabs(_))));
+        let root_is_row = matches!(self.tree.tiles.get(root), Some(Tile::Container(Container::Linear(linear))) if linear.dir == egui_tiles::LinearDir::Horizontal);
+        if tabbed_together && root_is_row {
+            self.tree.move_tile_to_container(pane, root, 1, true);
+            if let Some(Tile::Container(Container::Linear(linear))) = self.tree.tiles.get_mut(root) {
+                let children = linear.children.clone();
+                for (child, share) in children.iter().zip([0.25, 0.30, 0.45]) {
+                    linear.shares.set_share(*child, share);
+                }
+            }
+            self.show_pane(PaneKind::Bom);
+        }
+        self.instructions_arranged = true;
+        self.dirty = true;
+    }
+
     /// The pane in front of the tab group `kind` sits in (itself when it is in
     /// front), as the layout would resolve it; `None` for a pane not in a tab
     /// group.
@@ -894,11 +973,11 @@ impl DockState {
     /// pane into its own split, then switch to Modeling). It is a walk of a
     /// tree with a dozen nodes, and it sets no dirty flag: visibility is
     /// derived from the workbench, never persisted state.
-    fn apply_workbench_visibility(&mut self, wb: &str, panels: &workbench::ButtonState) {
+    fn apply_workbench_visibility(&mut self, wb: &str, panels: &workbench::ButtonState, forced: Option<PaneKind>) {
         let Some(root) = self.tree.root() else {
             return;
         };
-        self.refresh_visibility(root, wb, panels);
+        self.refresh_visibility(root, wb, panels, forced);
         // The root is what the dock draws into: it shows even in the degenerate
         // case where the workbench claims none of what is in it.
         self.tree.tiles.set_visible(root, true);
@@ -906,16 +985,16 @@ impl DockState {
 
     /// The post-order half of [`Self::apply_workbench_visibility`]: set `id`'s
     /// visibility and answer whether its subtree has anything left to show.
-    fn refresh_visibility(&mut self, id: TileId, wb: &str, panels: &workbench::ButtonState) -> bool {
+    fn refresh_visibility(&mut self, id: TileId, wb: &str, panels: &workbench::ButtonState, forced: Option<PaneKind>) -> bool {
         let visible = match self.tree.tiles.get(id) {
-            Some(Tile::Pane(kind)) => kind.visible_in(wb, panels),
+            Some(Tile::Pane(kind)) => forced == Some(*kind) || kind.visible_in(wb, panels),
             // `children_vec` first: the recursion needs `&mut tiles` back.
             // `|=` on `bool` does not short-circuit, so every child is visited
             // (each one has its OWN visibility to set, not just a vote here).
             Some(Tile::Container(container)) => {
                 let mut any = false;
                 for child in container.children_vec() {
-                    any |= self.refresh_visibility(child, wb, panels);
+                    any |= self.refresh_visibility(child, wb, panels, forced);
                 }
                 any
             }
@@ -1221,6 +1300,7 @@ impl DockState {
             fields.insert(ECAD_DECLINED_KEY.into(), notes);
         }
         json["brepPluginIds"] = serde_json::json!(self.plugin_ids);
+        json[INSTRUCTIONS_ARRANGED_KEY] = serde_json::json!(self.instructions_arranged);
         let _ = store.write(DOCK_LAYOUT_KEY, &json.to_string());
     }
 }
@@ -1354,7 +1434,7 @@ fn salvage(tree: Tree<PaneKind>) -> Option<Tree<PaneKind>> {
     if missing.is_empty() {
         return Some(tree);
     }
-    let mut dock = DockState { tree, plugin_ids: Vec::new(), dirty: false, snapshot: Vec::new(), dialogs: None, ports: None, ecad_entry: None, ecad_declined: Vec::new(), mobile: CompactDock::default() };
+    let mut dock = DockState { tree, plugin_ids: Vec::new(), dirty: false, snapshot: Vec::new(), dialogs: None, ports: None, ecad_entry: None, ecad_declined: Vec::new(), instructions_arranged: false, mobile: CompactDock::default() };
     let home = dock.side_home()?;
     for kind in missing {
         let pane = dock.tree.tiles.insert_pane(kind);
@@ -1388,6 +1468,10 @@ struct DockBehavior<'a> {
     update_components: &'a mut UpdateComponents,
     model_store: &'a dyn ModelStore,
     plm: &'a mut crate::panels::plm_host::PlmHost,
+    cam: &'a mut CamPanel,
+    instructions: &'a mut crate::panels::instructions::InstructionsPanel,
+    instructions_player: &'a mut crate::panels::instructions_player::InstructionsPlayerPanel,
+    simulation: &'a mut crate::panels::simulation::SimulationPanel,
     // --- outputs, drained after Tree::ui -----------------------------------
     insert_component_requested: bool,
     feature_focus: Option<String>,
@@ -1436,6 +1520,10 @@ impl<'a> DockBehavior<'a> {
             update_components: ctx.update_components,
             model_store: ctx.model_store,
             plm: ctx.plm,
+            cam: ctx.cam,
+            instructions: ctx.instructions,
+            instructions_player: ctx.instructions_player,
+            simulation: ctx.simulation,
             insert_component_requested: false,
             feature_focus: None,
             component_request: None,
@@ -1466,6 +1554,10 @@ impl<'a> DockBehavior<'a> {
                 PaneKind::Expressions => self.expressions.clear_hits(),
                 PaneKind::Qualify => self.qualify.clear_hits(),
                 PaneKind::FamilyTable => self.family_table.clear_hits(),
+                PaneKind::Cam => self.cam.clear_hits(),
+                PaneKind::Instructions => self.instructions.clear_hits(),
+                PaneKind::InstructionsPlayer => self.instructions_player.clear_hits(),
+                PaneKind::Simulation => self.simulation.clear_hits(),
                 PaneKind::Plm | PaneKind::Plugin(_) => {}
                 // The eCAD parts pane's rects (`parts:`) are cleared every frame
                 // by `ecad_parts::take_add_part_request`, so an undrawn one
@@ -1507,14 +1599,14 @@ impl<'a> Behavior<PaneKind> for DockBehavior<'a> {
             PaneKind::Document(_) => {
                 // An eCAD workbench draws its editor here instead of the 3D
                 // view; the editor lives on the document, beside its engine.
-                let doc = self.docs.active_mut();
+                let doc = self.docs.view_mut();
                 match workbench::ecad::Target::of_workbench(&doc.engine.settings.workbench) {
                     Some(target) => self.viewport.show_ecad(ui, doc, target),
                     None => self.viewport.show(ui, &mut doc.engine),
                 }
             }
             PaneKind::EcadLibrary => {
-                let doc = self.docs.active_mut();
+                let doc = self.docs.view_mut();
                 match workbench::ecad::Target::of_workbench(&doc.engine.settings.workbench) {
                     Some(workbench::ecad::Target::Diagram) => doc.ecad.diagram.library_panel(ui),
                     Some(workbench::ecad::Target::Pcb) => doc.ecad.pcb.library_panel(ui),
@@ -1523,7 +1615,7 @@ impl<'a> Behavior<PaneKind> for DockBehavior<'a> {
                 }
             }
             PaneKind::EcadInspector => {
-                let doc = self.docs.active_mut();
+                let doc = self.docs.view_mut();
                 match workbench::ecad::Target::of_workbench(&doc.engine.settings.workbench) {
                     Some(workbench::ecad::Target::Diagram) => doc.ecad.diagram.inspector(ui),
                     Some(workbench::ecad::Target::Pcb) => doc.ecad.pcb.inspector(ui),
@@ -1549,9 +1641,17 @@ impl<'a> Behavior<PaneKind> for DockBehavior<'a> {
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         let document = self.docs.active().name().map(str::to_string);
+                        // While a Work part is edited in place the BOM is still
+                        // the ASSEMBLY's product structure, with the work line
+                        // marked; double click another line to switch to it.
+                        let in_place = self.docs.work_part_in_place();
+                        self.bom.set_work_part(
+                            in_place.then(|| self.docs.work_part_path().map(str::to_string)).flatten(),
+                        );
+                        let engine = if in_place { self.docs.tab_engine_mut() } else { self.docs.engine_mut() };
                         let outcome = self.bom.show(
                             ui,
-                            self.docs.engine_mut(),
+                            engine,
                             self.model_store,
                             self.update_components,
                             document.as_deref(),
@@ -1563,6 +1663,11 @@ impl<'a> Behavior<PaneKind> for DockBehavior<'a> {
                         }
                         if outcome.component.is_some() {
                             self.component_request = outcome.component;
+                        }
+                        if let Some((key, value)) = outcome.work_part_attribute {
+                            if let Err(error) = self.docs.engine_mut().set_document_part_attribute(&key, value) {
+                                self.docs.engine_mut().push_notice(format!("BOM: {error}"));
+                            }
                         }
                         if outcome.update_components {
                             if let Err(error) = self.update_components.run(self.docs.engine_mut(), self.model_store) {
@@ -1615,7 +1720,7 @@ impl<'a> Behavior<PaneKind> for DockBehavior<'a> {
             // which that is — so, unlike the eCAD panes, the target is passed
             // IN rather than dispatched on.
             PaneKind::Qualify => scroll(ui, "dock-qualify", |ui| {
-                let doc = self.docs.active_mut();
+                let doc = self.docs.view_mut();
                 let target = workbench::ecad::Target::of_workbench(&doc.engine.settings.workbench);
                 self.qualify.show(ui, &mut doc.engine, &mut doc.ecad, target);
             }),
@@ -1646,6 +1751,19 @@ impl<'a> Behavior<PaneKind> for DockBehavior<'a> {
                 }
             }
             PaneKind::Plm => scroll(ui, "dock-plm", |ui| self.plm.ui(ui, self.docs)),
+            PaneKind::Cam => scroll(ui, "dock-cam", |ui| {
+                self.cam.show(ui, self.docs.engine_mut(), self.model_store);
+            }),
+            PaneKind::Instructions => scroll(ui, "dock-instructions", |ui| {
+                self.instructions.show(ui, self.docs.engine_mut());
+            }),
+            PaneKind::InstructionsPlayer => scroll(ui, "dock-instructions-player", |ui| {
+                let client = self.model_store.plm_client();
+                self.instructions_player.show(ui, self.docs.engine_mut(), client.as_ref());
+            }),
+            PaneKind::Simulation => scroll(ui, "dock-simulation", |ui| {
+                self.simulation.show(ui, self.docs.engine_mut());
+            }),
         }
         UiResponse::None
     }

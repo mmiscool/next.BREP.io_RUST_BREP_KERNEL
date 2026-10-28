@@ -1482,7 +1482,7 @@ impl Document {
         }
     }
     /// Lay every part out afresh by its nets: the part with the most pins in the
-    /// middle of the board, then each part, in [`Self::placement_order`], in the free
+    /// middle of the board, then each part, in `Self::placement_order`, in the free
     /// room nearest the parts already laid out that it shares a small net with. Each
     /// keeps its side and its rotation. Where the room runs out the rest are packed
     /// in rows below, as [`Self::auto_place`] packs them, and the outline grows.

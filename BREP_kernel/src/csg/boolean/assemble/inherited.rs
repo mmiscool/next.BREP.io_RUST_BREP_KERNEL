@@ -559,7 +559,7 @@ pub(super) fn challenge_inherited_trims_scoped(
     // Accepted overrides, per loop: (face index, loop index) -> coedge index -> pcurve.
     let mut accepted: HashMap<(usize, usize), HashMap<usize, NurbsCurve>> = HashMap::default();
     let mut order: Vec<(usize, usize, usize)> = Vec::new();
-    let profile = std::env::var("BREP_PROFILE").is_ok();
+    let profile = crate::imprint::profile_enabled();
     let before_memo = crate::reading_memo::counts();
     let (mut eligible, mut endpoints, mut tracking, mut candidates) = (0usize, 0usize, 0usize, 0usize);
     let (mut far_reused, mut far_read, mut fits_served) = (0usize, 0usize, 0usize);

@@ -54,8 +54,8 @@
 //! its solid is a circle of that diameter swept along the spline's exact chain
 //! (`sweep_profile_along_chain_with_stations`), named `WireHarness:{spline}`
 //! with faces `…:Wall0`, `…:Wall1`, `…:Start`, `…:End`. The bundle solids ride
-//! an extra [`FeatureResult`] (`id` [`WIRE_HARNESS_FEATURE_ID`], `type`
-//! [`WIRE_HARNESS_FEATURE_TYPE`]) appended to the run's results, so the
+//! an extra [`FeatureResult`] (`id` [`WIRE_HARNESS_FEATURE_ID`](crate::feature_pipeline::wire_harness::WIRE_HARNESS_FEATURE_ID), `type`
+//! [`WIRE_HARNESS_FEATURE_TYPE`](crate::feature_pipeline::wire_harness::WIRE_HARNESS_FEATURE_TYPE)) appended to the run's results, so the
 //! display pipeline shows them through the standard solid path (rendering
 //! requirement R31). A bundle that fails to build reports its error on the
 //! bundle row and never halts the run.
@@ -191,7 +191,7 @@ pub struct WireHarnessState {
     /// here, in the typed block, because the block is rewritten from this struct
     /// on every harness edit and a key it did not know would be dropped.
     ///
-    /// The router never reads it and [`harness_fingerprint`] deliberately does
+    /// The router never reads it and `harness_fingerprint` deliberately does
     /// not hash it: a margin change must not invalidate a route, so the tail
     /// replays its cache and only the BOM's arithmetic moves. Omitted from the
     /// saved block at 0, so a document that never set one saves as before.

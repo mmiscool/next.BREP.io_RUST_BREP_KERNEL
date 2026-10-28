@@ -52,10 +52,17 @@ impl EngineState {
 
     /// Update the CSS viewport size (used by all camera math). The physical
     /// framebuffer size + DPR are the presentation shell's concern.
+    /// The viewport calls this every frame, so it marks the frame dirty only
+    /// when the size really changes: an unconditional mark re-rendered the
+    /// whole scene on every repaint (about 0.34 s a frame for a large CAM stock
+    /// on a machine without a GPU), whether or not anything had changed.
     pub fn resize(&mut self, css_width: f64, css_height: f64) {
-        self.camera.width = css_width.max(1.0);
-        self.camera.height = css_height.max(1.0);
-        self.dirty = true;
+        let (width, height) = (css_width.max(1.0), css_height.max(1.0));
+        if self.camera.width != width || self.camera.height != height {
+            self.camera.width = width;
+            self.camera.height = height;
+            self.dirty = true;
+        }
     }
 
     // --- Pointer / wheel ingestion (R22) ----------------------------------
@@ -138,7 +145,7 @@ impl EngineState {
     }
 
     /// The frame the named views and the ViewCube are read in: Z-up
-    /// ([`ViewFrame::Board`]) while the document shows a board, Y-up otherwise.
+    /// ([`crate::view::ViewFrame::Board`]) while the document shows a board, Y-up otherwise.
     ///
     /// Keyed on the DOCUMENT, not the workbench: the board is seen in 3D from
     /// every workbench that draws the 3D view (Modeling, Assembly…) — the PCB
@@ -201,15 +208,21 @@ impl EngineState {
     pub fn world_to_screen_json(&self, points_json: &str) -> Result<String, String> {
         let points: Vec<[f64; 3]> = serde_json::from_str(points_json)
             .map_err(|error| format!("world_to_screen points parse: {error}"))?;
-        let out: Vec<[f64; 4]> = points
-            .into_iter()
-            .map(|p| {
+        let out = self.world_to_screen_points(&points);
+        Ok(serde_json::to_string(&out).unwrap_or_else(|_| "[]".to_string()))
+    }
+
+    /// [`Self::world_to_screen_json`] without the JSON: what a native pass
+    /// that projects every frame calls.
+    pub fn world_to_screen_points(&self, points: &[[f64; 3]]) -> Vec<[f64; 4]> {
+        points
+            .iter()
+            .map(|&p| {
                 let (sx, sy, depth) = self.camera.project(p);
                 let visible = self.camera.label_anchor_visible(p);
                 [sx, sy, depth, if visible { 1.0 } else { 0.0 }]
             })
-            .collect();
-        Ok(serde_json::to_string(&out).unwrap_or_else(|_| "[]".to_string()))
+            .collect()
     }
 
     /// The camera matrices for the host overlays' per-frame world→screen /
@@ -235,6 +248,49 @@ impl EngineState {
 }
 
 impl EngineState {
+    /// One hash per kind of render input, for the app's stale-frame check
+    /// (automation builds): a frame whose inputs hash differently from the last
+    /// rendered frame's but that is not marked dirty would show a stale view.
+    /// Selection and hover highlight are `emphasis`; sketch previews and every
+    /// other `set_overlay` geometry, the gizmos and the ViewCube are `widgets`;
+    /// theme and background colours bump `settings_generation`; tessellation
+    /// arriving later bumps a solid's `revision` in `scene`.
+    pub fn render_fingerprint(&self) -> [(&'static str, u64); 5] {
+        use std::hash::{Hash, Hasher};
+        let hash = |f: &dyn Fn(&mut std::collections::hash_map::DefaultHasher)| {
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            f(&mut h);
+            h.finish()
+        };
+        let camera = self.camera.resolve();
+        [
+            ("camera", hash(&|h| {
+                for v in camera.view_proj.iter().flatten() {
+                    v.to_bits().hash(h);
+                }
+                self.camera.width.to_bits().hash(h);
+                self.camera.height.to_bits().hash(h);
+                self.camera.world_per_pixel().to_bits().hash(h);
+            })),
+            ("settings", self.settings_generation),
+            ("scene", hash(&|h| {
+                for solid in self.scene.solids().iter().chain(self.context_scene.solids()) {
+                    solid.name.hash(h);
+                    solid.revision.hash(h);
+                }
+            })),
+            ("emphasis", hash(&|h| {
+                format!("{:?}", self.emphasis).hash(h);
+                self.context_scene.highlight.hash(h);
+                self.context_scene.tint.map(|rgba| rgba.map(f32::to_bits)).hash(h);
+                for solid in self.context_scene.solids() {
+                    solid.visible.hash(h);
+                }
+            })),
+            ("widgets", self.widgets.render_fingerprint(&gizmo_camera(&self.camera))),
+        ]
+    }
+
     /// Build this frame's overlay-widget geometry, or None when nothing is
     /// enabled (skips the overlay passes entirely).
     pub fn build_widget_overlay(&self) -> Option<WidgetOverlay> {

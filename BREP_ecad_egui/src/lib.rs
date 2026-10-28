@@ -139,7 +139,7 @@ pub fn is_ground(name: &str) -> bool {
 }
 /// The power symbol for net `name`, as KiCad's `power` library draws one: a single
 /// hidden power input pin at its origin, named for the net, under reference
-/// `#PWR`. [`Document::place`] names the pin's net after [`Symbol::power_net`], so
+/// `#PWR`. [`Document::place`](brep_ecad_core::Document::place_power_symbol) names the pin's net after [`Symbol::power_net`], so
 /// every power symbol of one name is one net; the board and the parts list leave
 /// it out, as they leave out KiCad's. Its pin is a power INPUT, as KiCad's is, so
 /// it does not drive the net: a net fed from off the sheet still wants a power

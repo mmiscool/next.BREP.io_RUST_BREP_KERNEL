@@ -221,8 +221,8 @@ pub fn selection_centre(solid: &BrepSolid, face_ids: &[u64]) -> Option<Vec3> {
 /// The pivot a Transform Face whose `faces` are `names` gets by default, read
 /// off the scene the results BEFORE it build — the value the app stores into
 /// `pivot` when the selection is committed, and the value `build` falls back to
-/// for a null `pivot`, because both go through [`resolve_selection`] and
-/// [`selection_centre`]. `None` when the selection does not resolve to faces on
+/// for a null `pivot`, because both go through `resolve_selection` and
+/// `selection_centre`. `None` when the selection does not resolve to faces on
 /// one solid.
 pub fn face_transform_pivot(prefix: &[FeatureResult], names: &[String]) -> Option<[f64; 3]> {
     let mut scene = SceneMap::default();

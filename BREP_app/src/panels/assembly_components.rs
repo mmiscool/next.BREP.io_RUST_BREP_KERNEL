@@ -27,6 +27,9 @@ pub(crate) const FIXED_GLYPH: &str = "\u{23DA}"; // ⏚ earth ground
 
 /// The outdated-vs-source badge glyph (`↻` — "refresh me").
 pub(crate) const OUTDATED_GLYPH: &str = "\u{21BB}";
+/// The under-defined glyph (CAD convention: a component the mates do not
+/// fully hold reads "(−)").
+pub(crate) const UNDER_DEFINED_GLYPH: &str = "(\u{2212})";
 
 /// The outdated badge's amber (the status map's warning amber `#ff9f0a`).
 pub(crate) const OUTDATED_AMBER: egui::Color32 = egui::Color32::from_rgb(0xff, 0x9f, 0x0a);
@@ -48,6 +51,10 @@ pub(crate) struct ComponentRow {
     /// Worst constraint status referencing this component (None = the
     /// component participates in no constraint — no rollup dot).
     pub rollup_status: Option<String>,
+    /// What the mates leave this component free to do, `(turns, slides)`,
+    /// from the last solve's per-body analysis. `None` = fixed, or not
+    /// analysed (no solve yet, or too large an assembly).
+    pub freedom: Option<(usize, usize)>,
     /// Every member solid currently visible?
     pub visible: bool,
     /// Any member solid in the current selection (viewport → tree sync)?
@@ -177,6 +184,7 @@ pub(crate) fn snapshot(state: &mut EngineState, updates: &UpdateComponents) -> V
         }
     }
 
+    let body_freedom = state.assembly_dof_value()["bodyFreedom"].clone();
     let selected_solids = state.emphasis.selected_solids.clone();
     let solid_visible: HashMap<String, bool> = state
         .scene
@@ -201,6 +209,15 @@ pub(crate) fn snapshot(state: &mut EngineState, updates: &UpdateComponents) -> V
                 fixed: record.fixed,
                 outdated: updates.is_outdated(&record.part_name),
                 rollup_status: rollup.get(&record.id).cloned(),
+                freedom: match body_freedom.get(&record.id) {
+                    Some(free) => Some((
+                        free["rotations"].as_u64().unwrap_or(0) as usize,
+                        free["translations"].as_u64().unwrap_or(0) as usize,
+                    )),
+                    // Analysed, but no mate reaches it: entirely free.
+                    None if !record.fixed && body_freedom.as_object().is_some_and(|map| !map.is_empty()) => Some((3, 3)),
+                    None => None,
+                },
                 visible: record
                     .solids
                     .iter()
@@ -237,6 +254,7 @@ pub(crate) fn publish_tree(rows: &[ComponentRow]) {
                     "visible": row.visible,
                     "selected": row.selected,
                     "status": row.rollup_status,
+                    "freedom": row.freedom.map(|(turns, slides)| serde_json::json!({ "rotations": turns, "translations": slides })),
                     "solids": row.solids,
                 })
             })
