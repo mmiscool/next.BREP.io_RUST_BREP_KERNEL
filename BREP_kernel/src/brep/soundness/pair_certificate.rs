@@ -6,7 +6,7 @@ use super::{CertifiedFacePair, CertificateScope};
 type Bounds = [[f64; 2]; 3];
 
 pub(super) fn enabled() -> bool {
-    matches!(std::env::var("BREP_SOUNDNESS_PAIR_CERTIFICATES").as_deref(), Ok("1" | "on"))
+    switch!(live "BREP_SOUNDNESS_PAIR_CERTIFICATES", false)
 }
 
 fn include(bounds: &mut Bounds, p: Vec3) -> Option<()> {

@@ -99,7 +99,7 @@ impl Sketch3dEdit {
     fn snapshot(&self) -> Sketch3dSnapshot {
         Sketch3dSnapshot {
             doc: self.session.doc.clone(),
-            selection: self.session.selection.clone(),
+            selection: self.session.selection.items.clone(),
             external_refs: self.external_refs.clone(),
             work_plane: self.session.work_plane.clone(),
         }
@@ -113,8 +113,8 @@ impl Sketch3dEdit {
 
     fn restore(&mut self, snap: Sketch3dSnapshot) {
         self.session.doc = snap.doc;
-        self.session.selection = snap.selection;
-        self.session.hovered = None;
+        self.session.selection.items = snap.selection;
+        self.session.selection.hovered = None;
         self.external_refs = snap.external_refs;
         self.session.work_plane = snap.work_plane;
         self.pending.clear();
@@ -407,8 +407,8 @@ impl EngineState {
             "geometryCount": session.doc.geometries.len(),
             "constraintCount": session.doc.constraints.len(),
             "pendingLen": edit.pending.len(),
-            "selection": session.selection,
-            "hovered": session.hovered,
+            "selection": session.selection.items,
+            "hovered": session.selection.hovered,
             "applicableConstraints": session.applicable_constraints(),
             "dimensions": session.dimension_labels(),
             "externalRefs": edit.external_refs,
@@ -433,7 +433,7 @@ impl EngineState {
     }
 
     pub fn sketch3d_selection_count(&self) -> usize {
-        self.sketch3d_edit.as_ref().map_or(0, |edit| edit.session.selection.len())
+        self.sketch3d_edit.as_ref().map_or(0, |edit| edit.session.selection.items.len())
     }
 
     pub fn sketch3d_pending_len(&self) -> usize {
@@ -918,7 +918,7 @@ impl EngineState {
         if let Some(gid) = gid {
             refs.push(crate::sketch3d::entity_geometry_ref(&gid));
         }
-        edit.session.selection = refs;
+        edit.session.selection.items = refs;
         self.sketch3d_delete_selection();
         true
     }
@@ -937,8 +937,8 @@ impl EngineState {
             .and_then(|edit| edit.session.pick_entity(&self.camera, x, y, radius));
         let (changed, preview_live) = match self.sketch3d_edit.as_mut() {
             Some(edit) => {
-                let changed = !crate::sketch::session::entity_ref_eq(edit.session.hovered.as_ref(), new_hover.as_ref());
-                edit.session.hovered = new_hover;
+                let changed = !crate::sketch::session::entity_ref_eq(edit.session.selection.hovered.as_ref(), new_hover.as_ref());
+                edit.session.selection.hovered = new_hover;
                 let moved = edit.hover_world != world;
                 edit.hover_world = world;
                 (changed, edit.session.tool.is_some() && moved)
@@ -957,7 +957,7 @@ impl EngineState {
             .sketch3d_edit
             .as_mut()
             .map_or(false, |edit| {
-                let had = edit.session.hovered.take().is_some() || edit.hover_world.take().is_some();
+                let had = edit.session.selection.hovered.take().is_some() || edit.hover_world.take().is_some();
                 had
             });
         if changed {
@@ -1016,7 +1016,7 @@ impl EngineState {
     /// whether something was grabbed; otherwise the drag is the camera's.
     pub fn sketch3d_drag_begin(&mut self, x: f64, y: f64) -> bool {
         let radius = self.sketch3d_pick_radius_px();
-        let points = self.sketch3d_edit.as_ref().and_then(|edit| match edit.session.hovered.as_ref() {
+        let points = self.sketch3d_edit.as_ref().and_then(|edit| match edit.session.selection.hovered.as_ref() {
             Some(entity) => edit.session.drag_points_from_ref(entity),
             None => edit
                 .session
@@ -1336,8 +1336,8 @@ impl EngineState {
             let geometry_alive = gid.map_or(true, |g| doc.geometry(g).is_some());
             points_alive && geometry_alive
         });
-        edit.session.selection.clear();
-        edit.session.hovered = None;
+        edit.session.selection.items.clear();
+        edit.session.selection.hovered = None;
         edit.pending.clear();
         let _ = edit.session.resolve();
         self.refresh_sketch3d_overlay();

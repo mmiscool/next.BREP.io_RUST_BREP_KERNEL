@@ -3,8 +3,7 @@ use super::{blend_offset, tangency_from_samples, TangencyState};
 use crate::{KernelRefusal, KernelStage, NurbsSurface, OffsetSample, OrRefuse, Vec3};
 
 pub(super) fn enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("BREP_STATION_OFFSET_MEMO").ok().as_deref() == Some("1"))
+    switch!("BREP_STATION_OFFSET_MEMO", false)
 }
 
 #[derive(Clone, Copy)]

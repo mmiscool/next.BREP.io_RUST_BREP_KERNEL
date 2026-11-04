@@ -235,35 +235,16 @@ fn validate_component_id(id: &str) -> Result<(), String> {
 /// move as rigid bodies — a scaling/shearing/reflecting instance pose is a
 /// modeling error, rejected loudly (no fallback).
 fn require_rigid(transform: &AffineTransform) -> Result<(), String> {
-    let m = &transform.elements;
-    let rows = [[m[0], m[1], m[2]], [m[4], m[5], m[6]], [m[8], m[9], m[10]]];
-    for i in 0..3 {
-        for j in i..3 {
-            let dot: f64 = (0..3).map(|k| rows[i][k] * rows[j][k]).sum();
-            let expected = if i == j { 1.0 } else { 0.0 };
-            if (dot - expected).abs() > 1e-8 {
-                return Err("component transform must be rigid (rotation + translation)".into());
-            }
-        }
-    }
-    if (transform.determinant3() - 1.0).abs() > 1e-8 {
+    if transform.is_rigid(crate::RIGID_TOL) { return Ok(()); }
+    if (transform.determinant3() - 1.0).abs() > crate::RIGID_TOL {
         return Err("component transform must be rigid (no reflection/scale)".into());
     }
-    Ok(())
+    Err("component transform must be rigid (rotation + translation)".into())
 }
 
 /// Row-major product `a · b` (apply `b` first, then `a`).
 pub(crate) fn compose(a: &AffineTransform, b: &AffineTransform) -> Result<AffineTransform, String> {
-    let (ma, mb) = (&a.elements, &b.elements);
-    let mut out = [0.0f64; 16];
-    for row in 0..4 {
-        for col in 0..4 {
-            out[row * 4 + col] = (0..4)
-                .map(|k| ma[row * 4 + k] * mb[k * 4 + col])
-                .sum();
-        }
-    }
-    AffineTransform::new(out)
+    a.compose(b)
 }
 
 // ===========================================================================

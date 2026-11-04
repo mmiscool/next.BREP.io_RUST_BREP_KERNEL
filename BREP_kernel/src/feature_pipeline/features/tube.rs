@@ -2025,7 +2025,7 @@ fn named_ring(
 /// chain lane tries, to stderr. The reading behind the 2026-10-13 report:
 /// `examples/tube_timing_probe.rs` runs a document under it.
 fn trace_enabled() -> bool {
-    std::env::var_os("BREP_TUBE_TRACE").is_some()
+    debug_flag!(live "BREP_TUBE_TRACE")
 }
 
 
@@ -2310,12 +2310,8 @@ fn build_graph(segments: &[Segment]) -> (Vec<Vec3>, Vec<(usize, usize)>) {
 /// order.
 fn connected_components(edge_nodes: &[(usize, usize)], node_count: usize) -> Vec<Vec<usize>> {
     let mut parent: Vec<usize> = (0..node_count).collect();
-    fn find(parent: &mut [usize], mut x: usize) -> usize {
-        while parent[x] != x {
-            parent[x] = parent[parent[x]];
-            x = parent[x];
-        }
-        x
+    fn find(parent: &mut [usize], x: usize) -> usize {
+        crate::union_find::find_root(parent, x)
     }
     for &(a, b) in edge_nodes {
         let ra = find(&mut parent, a);

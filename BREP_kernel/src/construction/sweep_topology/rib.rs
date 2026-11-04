@@ -200,22 +200,10 @@ pub(super) fn junction_edge_curve(
 /// In-plane circumcircle of three coplanar points (projected onto `ex`/`ey`,
 /// `np = ex×ey`).  Returns `None` when the three points are collinear.
 fn circumcircle(a: Vec3, b: Vec3, c: Vec3, ex: Vec3, ey: Vec3, np: Vec3) -> Option<(Vec3, f64)> {
-    let (ax, ay) = (a.dot(ex), a.dot(ey));
-    let (bx, by) = (b.dot(ex), b.dot(ey));
-    let (cx, cy) = (c.dot(ex), c.dot(ey));
-    let d = 2.0 * (ax * (by - cy) + bx * (cy - ay) + cx * (ay - by));
-    if d.abs() < 1e-12 {
-        return None;
-    }
-    let a2 = ax * ax + ay * ay;
-    let b2 = bx * bx + by * by;
-    let c2 = cx * cx + cy * cy;
-    let ux = (a2 * (by - cy) + b2 * (cy - ay) + c2 * (ay - by)) / d;
-    let uy = (a2 * (cx - bx) + b2 * (ax - cx) + c2 * (bx - ax)) / d;
+    let [ux, uy] = crate::circumcenter_2d([a.dot(ex), a.dot(ey)], [b.dot(ex), b.dot(ey)], [c.dot(ex), c.dot(ey)])?;
     let plane_off = a.dot(np);
     let center = ex.scale(ux).add(ey.scale(uy)).add(np.scale(plane_off));
-    let radius = a.sub(center).length();
-    Some((center, radius))
+    Some((center, a.sub(center).length()))
 }
 
 /// Intersect an offset LINE (through `line_point`, direction `line_dir`) with an

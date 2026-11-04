@@ -728,12 +728,10 @@ pub fn serves(min_client_version: &str, client_version: &str) -> bool {
     }
 }
 
+use crate::plm::identity::doc_path;
+
 fn preference_path(name: &str) -> String {
     format!("/api/me/preferences/{name}")
-}
-
-fn doc_path(key: &str) -> String {
-    format!("/api/store/doc/{}", key.trim_start_matches('/').replace('%', "%25"))
 }
 
 fn session_cookie(credential: &Credential) -> Option<String> {

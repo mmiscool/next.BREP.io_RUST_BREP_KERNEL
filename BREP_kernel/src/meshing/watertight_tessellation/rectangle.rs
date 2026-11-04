@@ -455,26 +455,7 @@ fn build_grid(
 }
 
 fn triangle_distance(p: Vec3, a: Vec3, b: Vec3, c: Vec3) -> f64 {
-    let n = b.sub(a).cross(c.sub(a));
-    let nn = n.length_squared();
-    if nn <= 0. {
-        return f64::INFINITY;
-    }
-    let q = p.sub(n.scale(p.sub(a).dot(n) / nn));
-    if [
-        b.sub(a).cross(q.sub(a)).dot(n),
-        c.sub(b).cross(q.sub(b)).dot(n),
-        a.sub(c).cross(q.sub(c)).dot(n),
-    ]
-    .iter()
-    .all(|&x| x >= 0.)
-    {
-        p.sub(q).length()
-    } else {
-        deflection_to_chord(p, a, b)
-            .min(deflection_to_chord(p, b, c))
-            .min(deflection_to_chord(p, c, a))
-    }
+    p.sub(crate::closest_point_on_triangle(p, a, b, c)).length()
 }
 
 #[derive(Clone, Copy)]

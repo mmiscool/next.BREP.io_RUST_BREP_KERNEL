@@ -17,40 +17,14 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-/// The document key the table is stored under.
-pub const FAMILY_TABLE_KEY: &str = "familyTable";
-
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct FamilyTable {
-    pub columns: Vec<FamilyColumn>,
-    pub rows: Vec<FamilyRow>,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct FamilyColumn {
-    /// The expression name this column drives (e.g. `length`).
-    pub name: String,
-    /// Optional display label; empty = show `name`.
-    #[serde(default)]
-    pub label: String,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct FamilyRow {
-    /// Typed by the user; the member's file name (`<partNumber>.nbrep`).
-    pub part_number: String,
-    /// Kept for the PLM; ignored on the file system.
-    #[serde(default)]
-    pub revision: String,
-    #[serde(default)]
-    pub description: String,
-    /// Column name -> expression source text for this row ("12", "m * 2").
-    #[serde(default)]
-    pub values: BTreeMap<String, String>,
-}
+// The table, its rows and the pure functions over them (the rewrite, the
+// effective row, the fingerprints) are the kernel's, shared with the PLM server
+// (I2, 2026-11-01): one copy, so a member and a stamp the server writes are
+// the ones this app writes.
+pub use brep_render::brep_kernel::family::{
+    effective_row, history_hash, rewrite_expressions, row_hash, FamilyColumn, FamilyRow, FamilyTable,
+    FAMILY_SOURCE_KEY, FAMILY_TABLE_KEY,
+};
 
 /// The table a document carries, or an empty one when it has none (or the
 /// block does not parse).
@@ -103,17 +77,6 @@ pub fn apply_table(
         .set_document_block(FAMILY_TABLE_KEY, Some(block), coalesce);
 }
 
-/// `row` as Generate uses it: only the values of the table's CURRENT columns,
-/// and only non-empty ones. A cell left empty keeps the family's own
-/// definition; a value left behind by a removed column is ignored.
-pub fn effective_row(table: &FamilyTable, row: &FamilyRow) -> FamilyRow {
-    let mut row = row.clone();
-    row.values.retain(|name, value| {
-        !value.trim().is_empty() && table.columns.iter().any(|column| column.name == *name)
-    });
-    row
-}
-
 /// The member's `expressions` source, exactly as Generate bakes it: every
 /// statement that defines a name the row sets becomes `name = <row text>`,
 /// in place, so later statements that use it see the row's value. A name the
@@ -123,81 +86,6 @@ pub fn effective_row(table: &FamilyTable, row: &FamilyRow) -> FamilyRow {
 /// Pass the row through [`effective_row`] first, as Generate does.
 pub fn member_expressions(expressions: &str, row: &FamilyRow) -> String {
     rewrite_expressions(expressions, &row.values)
-}
-
-/// [`member_expressions`] for any name -> source map: the ONE rewrite, which a
-/// template's spin-out uses too.
-pub fn rewrite_expressions(expressions: &str, values: &BTreeMap<String, String>) -> String {
-    let mut out = expressions.to_string();
-    let mut defined = std::collections::BTreeSet::new();
-    // Splice back to front so earlier spans keep their offsets.
-    for (start, end) in statement_spans(expressions).into_iter().rev() {
-        let Some(name) = assigned_name(&expressions[start..end]) else {
-            continue;
-        };
-        if let Some(value) = values.get(name) {
-            out.replace_range(start..end, &format!("{name} = {}", value.trim()));
-            defined.insert(name.to_string());
-        }
-    }
-    // Appended, not prepended: a cell may use the family's own variables
-    // (`a * 3`), and the evaluator runs statements in order.
-    for (name, value) in values {
-        if !defined.contains(name.as_str()) {
-            if !out.is_empty() && !out.trim_end().ends_with(';') {
-                out.push(';');
-            }
-            if !out.is_empty() && !out.ends_with('\n') {
-                out.push('\n');
-            }
-            out.push_str(&format!("{name} = {};\n", value.trim()));
-        }
-    }
-    out
-}
-
-/// The byte spans of the source's statements: from the first code character
-/// after the previous `;` up to (not including) the next `;` or the end.
-/// `//` comments are skipped, so a comment ahead of a statement is not in its
-/// span and survives a replacement.
-fn statement_spans(source: &str) -> Vec<(usize, usize)> {
-    let bytes = source.as_bytes();
-    let mut spans = Vec::new();
-    let mut start = None;
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'/' if bytes.get(i + 1) == Some(&b'/') => {
-                while i < bytes.len() && bytes[i] != b'\n' {
-                    i += 1;
-                }
-                continue;
-            }
-            b';' => {
-                if let Some(s) = start.take() {
-                    spans.push((s, i));
-                }
-            }
-            c if !c.is_ascii_whitespace() && start.is_none() => start = Some(i),
-            _ => {}
-        }
-        i += 1;
-    }
-    if let Some(s) = start {
-        spans.push((s, source.len()));
-    }
-    spans
-}
-
-/// The name a statement assigns (`name = rhs`), comments stripped.
-fn assigned_name(statement: &str) -> Option<&str> {
-    let eq = statement.find('=')?;
-    let name = statement[..eq].trim();
-    let mut chars = name.chars();
-    let first = chars.next()?;
-    ((first.is_ascii_alphabetic() || first == '_' || first == '$')
-        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$'))
-    .then_some(name)
 }
 
 /// Why `part_number` cannot be a file name, if it cannot.
@@ -252,9 +140,6 @@ pub fn member_identity(family_identity: Option<&str>, part_number: &str) -> Opti
     ))
 }
 
-/// The document key a generated member records its family under.
-pub const FAMILY_SOURCE_KEY: &str = "familySource";
-
 /// What produced a family member — stamped into the member document by
 /// Generate, and compared by the next Generate to skip an unchanged row.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -285,46 +170,6 @@ pub fn engine_family_source(engine: &brep_render::engine_state::EngineState) -> 
         .history
         .document_block(FAMILY_SOURCE_KEY)
         .and_then(|block| serde_json::from_value(block.clone()).ok())
-}
-
-/// The top-level keys that are NOT the family's model: the table itself (a
-/// row edit must not regenerate every member), the class, the view state the
-/// file reopens in, and stamps.
-const NOT_THE_MODEL: [&str; 7] = [
-    FAMILY_TABLE_KEY,
-    // The Save As lineage chain: where the document came from, not its model.
-    brep_render::engine_state::replace_component::DERIVED_FROM_KEY,
-    crate::document_class::DOCUMENT_CLASS_KEY,
-    "workbench",
-    FAMILY_SOURCE_KEY,
-    crate::template::TEMPLATE_SOURCE_KEY,
-    // The embedded preview `history_request_json` carries since the model
-    // thumbnails landed: derived from the model, rendered anew on every save,
-    // and absent from the copy the server hashes.
-    "thumbnail",
-];
-
-/// A content hash of the family's model: the whole document less the keys in
-/// `NOT_THE_MODEL`. Key order does not matter (`stable_json_hash`).
-pub fn history_hash(family: &serde_json::Value) -> String {
-    let mut model = family.clone();
-    if let Some(object) = model.as_object_mut() {
-        for key in NOT_THE_MODEL {
-            object.remove(key);
-        }
-    }
-    format!("{:016x}", brep_render::brep_kernel::stable_json_hash(&model))
-}
-
-/// A content hash of what a row puts into its member: its part number,
-/// description and effective values.
-pub fn row_hash(row: &FamilyRow) -> String {
-    let value = serde_json::json!({
-        "partNumber": row.part_number.trim(),
-        "description": row.description.trim(),
-        "values": row.values,
-    });
-    format!("{:016x}", brep_render::brep_kernel::stable_json_hash(&value))
 }
 
 /// What Generate did, one entry per table row, in table order.

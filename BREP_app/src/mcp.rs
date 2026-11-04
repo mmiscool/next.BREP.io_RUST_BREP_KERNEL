@@ -11,7 +11,7 @@
 //! open the window → once the app exists, [`start`](crate::mcp::start) attaches the server to its
 //! queue and serves. The store is the user's own (this is their app, not a
 //! test host), which is what the tools' docs say.
-use crate::automation::command::{Envelope as AppEnvelope, Reply as AppReply};
+use crate::automation::command::Envelope as AppEnvelope;
 use crate::automation::queue::AutomationQueue;
 use brep_mcp_core::host::{Backend, Envelope, HostInfo, HostRequest, NativePlatform, Reply};
 use brep_mcp_core::server::BrepServer;
@@ -24,9 +24,10 @@ use std::time::Duration;
 /// The port `--mcp` listens on unless `--mcp-port` says otherwise.
 pub const DEFAULT_PORT: u16 = 8765;
 
-/// How long one command may wait for the window to answer. A window paints
-/// on demand (every submit requests a repaint), so a reply normally arrives
-/// within a frame or two; this bounds a hung or minimised app.
+/// How long one command may wait for the window to answer. A submit wakes the
+/// desktop loop, which dispatches document-level commands without a frame
+/// (`desktop_loop`); frame-bound commands (input, captures, layout) answer on
+/// the next drawn frame. This bounds a hung app or a window never drawn.
 const REPLY_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// The ports the Info window's **Start MCP server** button tries, in order:
@@ -104,6 +105,8 @@ pub enum Status {
     /// Never started, or stopped: `error` is the line the console printed when
     /// something went wrong (`None` for a plain "not started").
     Stopped { error: Option<String> },
+    /// Port reserved; application attachment has not completed yet.
+    Starting { url: String, session_root: PathBuf, note: Option<String> },
     /// Serving on `url`; `note` is [`Launch::note`].
     Running { url: String, session_root: PathBuf, note: Option<String> },
 }
@@ -133,6 +136,11 @@ pub fn info_view() -> crate::panels::info::McpView {
     use crate::panels::info::McpView;
     match status() {
         Status::Stopped { error } => McpView::Stopped { error },
+        Status::Starting { url, session_root, note } => McpView::Running {
+            instructions: agent_instructions(&url, &session_root),
+            url,
+            note: Some(format!("Application host not ready; waiting for command dispatch. {}", note.unwrap_or_default())),
+        },
         Status::Running { url, session_root, note } => McpView::Running {
             instructions: agent_instructions(&url, &session_root),
             url,
@@ -154,7 +162,7 @@ fn start_over(queue: Arc<AutomationQueue>, adapter: String, ports: impl IntoIter
     // A refusal is not a failure: it must not touch the status (the button
     // is disabled while the server runs, so this is belt and braces), and it
     // must not bind a port it would only drop.
-    if let Status::Running { url, .. } = status() {
+    if let Status::Running { url, .. } | Status::Starting { url, .. } = status() {
         return Err(format!("the MCP server is already running on {url}"));
     }
     let launch = match launch(ports, None) {
@@ -188,51 +196,64 @@ pub fn default_session_root() -> PathBuf {
 }
 
 /// The text printed in the terminal at launch: how to point an agent at this
-/// window. Both forms each agent accepts — its CLI and its config file.
+/// window. Both forms each agent accepts — its CLI and its config file —
+/// each sending the server's token (D3), which stays in its file: the text
+/// names the file, never the secret.
 pub fn agent_instructions(url: &str, session_root: &Path) -> String {
+    instructions_naming(url, session_root, &brep_mcp_core::http::Credential::path())
+}
+
+/// [`agent_instructions`] naming this token file.
+fn instructions_naming(url: &str, session_root: &Path, token: &Path) -> String {
     format!(
-        "BREP MCP server listening on {url}\n\
+        "BREP MCP endpoint {url} (serving after application host readiness)\n\
+         Headless automation: use brep-mcp serve --http PORT with its own free port.\n\
+         HTTP uses bearer authentication, not OAuth or Dynamic Client Registration.\n\
          This window is the session: an agent's tools act on the documents you see here.\n\
+         Every request needs the server's token, `Authorization: Bearer <token>`; the token is in\n\
+         \x20 {token} (readable by you only).\n\
          \n\
          Claude Code:\n\
-         \x20 claude mcp add --transport http brep {url}\n\
-         \x20 or in a project's .mcp.json:\n\
-         \x20   {{ \"mcpServers\": {{ \"brep\": {{ \"type\": \"http\", \"url\": \"{url}\" }} }} }}\n\
+         \x20 In a project's .mcp.json, with BREP_MCP_TOKEN loaded privately from the token file:\n\
+         \x20   {{ \"mcpServers\": {{ \"brep\": {{ \"type\": \"http\", \"url\": \"{url}\", \"headers\": {{ \"Authorization\": \"Bearer ${{BREP_MCP_TOKEN}}\" }} }} }} }}\n\
          \n\
-         Codex:\n\
-         \x20 codex mcp add brep --url {url}\n\
+         Codex, with BREP_MCP_TOKEN loaded privately from the token file:\n\
+         \x20 codex mcp add brep --url {url} --bearer-token-env-var BREP_MCP_TOKEN\n\
          \x20 or in ~/.codex/config.toml:\n\
          \x20   [mcp_servers.brep]\n\
          \x20   url = \"{url}\"\n\
+         \x20   bearer_token_env_var = \"BREP_MCP_TOKEN\"\n\
          \n\
-         Then ask the agent to call session_start; screenshots and call logs land under\n\
+         Then ask the agent to use run_script; screenshots and call logs land under\n\
          \x20 {root}\n",
+        token = token.display(),
         root = session_root.display(),
     )
-}
-
-/// The app's reply in the server's shape: the same JSON, the blob beside it.
-fn convert(mut r: AppReply) -> Reply {
-    let blob = r.blob.take();
-    let (id, frame) = (r.id, r.frame);
-    match serde_json::to_value(&r).map_err(|e| e.to_string()).and_then(|v| Reply::from_app(v, blob)) {
-        Ok(reply) => reply,
-        Err(e) => Reply::err(id, frame, e),
-    }
 }
 
 /// Submit one command to the window and wait for its reply off the runtime.
 async fn forward(queue: &Arc<AutomationQueue>, envelope: Envelope) -> Reply {
     let id = envelope.id;
-    let rx = queue.submit(AppEnvelope { id, cmd: envelope.cmd, args: envelope.args });
-    match tokio::task::spawn_blocking(move || rx.recv_timeout(REPLY_TIMEOUT)).await {
-        Ok(Ok(reply)) => convert(reply),
-        Ok(Err(std::sync::mpsc::RecvTimeoutError::Timeout)) => Reply::err(
-            id,
-            queue.frame(),
-            format!("no reply from the app within {} s (is the window responding?)", REPLY_TIMEOUT.as_secs()),
-        ),
-        Ok(Err(std::sync::mpsc::RecvTimeoutError::Disconnected)) => Reply::err(id, queue.frame(), "the app dropped the command"),
+    let deadline = std::time::Instant::now() + REPLY_TIMEOUT;
+    let rx = queue.submit_before(AppEnvelope { id, cmd: envelope.cmd, args: envelope.args }, Some(deadline));
+    match tokio::task::spawn_blocking(move || (rx.recv_timeout(REPLY_TIMEOUT), rx)).await {
+        Ok((Ok(reply), _)) => reply.into_host(),
+        Ok((Err(std::sync::mpsc::RecvTimeoutError::Timeout), rx)) => {
+            // Say which: a command still queued is withdrawn and never runs;
+            // one a handler accepted may have had (or still have) effects.
+            // A withdrawal answers on `rx`, as does work that finished (or
+            // expired in the queue) in the meantime: that reply is the truth.
+            let _ = queue.withdraw(id);
+            match rx.try_recv() {
+                Ok(reply) => reply.into_host(),
+                Err(_) => Reply::err(
+                    id,
+                    queue.frame(),
+                    format!("host_deadline_exceeded: no reply within {} s; the app accepted the command and it may have had effects; host frame {}; reconcile before retrying", REPLY_TIMEOUT.as_secs(), queue.frame()),
+                ),
+            }
+        }
+        Ok((Err(std::sync::mpsc::RecvTimeoutError::Disconnected), _)) => Reply::err(id, queue.frame(), "the app dropped the command"),
         Err(e) => Reply::err(id, queue.frame(), e.to_string()),
     }
 }
@@ -248,106 +269,247 @@ async fn capture(queue: &Arc<AutomationQueue>, region: Value) -> Result<(Value, 
     Ok((reply.result.unwrap_or(Value::Null), png))
 }
 
-/// Start the server thread over the app's queue. Called from the eframe
-/// creation closure, once the app (and its queue) exists — or from the Info
-/// window's button, any time later; returns as soon as the thread is spawned.
-/// `adapter` names the GPU for the session info. At most ONCE per process: a
-/// second call while the server runs is refused with its address, so neither
-/// path can stack a second server on the first.
-pub fn start(queue: Arc<AutomationQueue>, adapter: String, launch: Launch) -> Result<(), String> {
-    {
-        let mut status = STATUS.lock().unwrap_or_else(|p| p.into_inner());
-        if let Status::Running { url, .. } = &*status {
-            return Err(format!("the MCP server is already running on {url}"));
-        }
-        *status = Status::Running { url: launch.url(), session_root: launch.session_root.clone(), note: launch.note.clone() };
+/// The app's one server, attached to its queue: created by the first of
+/// [`start`] (which adds the HTTP listener) and the JavaScript editor's Run
+/// (which needs none), and shared by both. It and its runtime live for the
+/// process.
+pub struct Embedded {
+    pub server: BrepServer,
+    pub runtime: tokio::runtime::Runtime,
+    /// The attach's outcome once it has finished.
+    attached: Arc<std::sync::OnceLock<Result<(), String>>>,
+    /// Signalled once `attached` is set.
+    attached_signal: Arc<tokio::sync::Notify>,
+}
+
+static SESSION_ROOT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+static EMBEDDED: std::sync::OnceLock<Result<Embedded, String>> = std::sync::OnceLock::new();
+
+static STATE_CONFIGURATION: std::sync::OnceLock<Result<brep_mcp_core::launch_state::Resolved, String>> = std::sync::OnceLock::new();
+
+/// Freeze the desktop policy before either the editor or HTTP starts the singleton.
+/// Failed resolution is sticky too: never substitute an ephemeral identity.
+pub fn configure_state(policy: &brep_mcp_core::launch_state::Policy) -> Result<(), String> {
+    let resolved = brep_mcp_core::launch_state::resolve(brep_mcp_core::launch_state::Host::Desktop, policy);
+    STATE_CONFIGURATION.set(resolved.clone()).map_err(|_| "MCP state configuration is already fixed for this launch".to_string())?;
+    resolved.map(|_| ()).map_err(fail)
+}
+
+/// Read-only UI snapshot; looking at settings must not initialize the server.
+pub fn state_configuration() -> Option<&'static Result<brep_mcp_core::launch_state::Resolved, String>> {
+    STATE_CONFIGURATION.get()
+}
+
+pub fn state_settings_path() -> Result<PathBuf, String> {
+    brep_mcp_core::launch_state::config_dir().map(|p| p.join("mcp-state.json"))
+        .ok_or_else(|| "cannot locate the machine-local MCP settings directory".into())
+}
+
+pub fn save_desktop_policy(policy: brep_mcp_core::launch_state::Policy) -> Result<(), String> {
+    save_desktop_policy_at(&state_settings_path()?, policy)
+}
+
+fn save_desktop_policy_at(path: &Path, policy: brep_mcp_core::launch_state::Policy) -> Result<(), String> {
+    policy.validate()?;
+    let mut settings = brep_mcp_core::launch_state::Settings::load(path)?;
+    settings.desktop = Some(policy);
+    settings.save(path)
+}
+
+
+impl Embedded {
+    /// `None` while the attach is in flight; then whether it succeeded.
+    pub fn attached(&self) -> Option<Result<(), String>> {
+        self.attached.get().cloned()
     }
-    // The state registry publishes only for a host; this window has one now.
-    // Part of the start sequence, not of either caller, so an agent connected
-    // through the button sees `hit_rects` and `state_get` like one connected
-    // at launch.
-    crate::automation::registry::set_enabled(true);
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .thread_name("brep-mcp-worker")
-        .enable_all()
-        .build()
-        .map_err(|e| {
-            set_status(Status::Stopped { error: None });
-            format!("tokio runtime: {e}")
-        })?;
-    let url = launch.url();
-    std::thread::Builder::new()
-        .name("brep-mcp".into())
-        .spawn(move || {
-            rt.block_on(async move {
-                let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<HostRequest>();
-                let q = queue.clone();
-                tokio::spawn(async move {
-                    while let Some(req) = rx.recv().await {
-                        let q = q.clone();
-                        match req {
-                            HostRequest::Command { envelope, reply } => {
-                                tokio::spawn(async move {
-                                    let _ = reply.send(forward(&q, envelope).await);
-                                });
-                            }
-                            HostRequest::Screenshot { region, reply } => {
-                                tokio::spawn(async move {
-                                    let _ = reply.send(capture(&q, region).await);
-                                });
-                            }
-                            // The DOCS ANNOTATION overlay belongs to the
-                            // headless harness, which owns its egui context and
-                            // paints on top of the app's frame for the
-                            // walkthrough GIFs. A running window draws the
-                            // product, not a caption band over it, so this says
-                            // so rather than capturing an unannotated frame and
-                            // letting a silent GIF claim otherwise.
-                            HostRequest::Annotate { reply, .. } => {
-                                let _ = reply.send(Err(
-                                    "the window host draws no annotation overlay: docs walkthroughs are recorded by the headless host (brep-mcp)".to_string(),
-                                ));
-                            }
-                            // The app is not the server's to stop.
-                            HostRequest::Stop => {}
+}
+
+/// The app's server, created on the first call (`record`: whether its
+/// session keeps a call log; the first caller decides). Returns at once: the
+/// attach completes on the server's runtime, because it is answered by the
+/// app's frame, which may be the caller.
+pub fn embedded(queue: &Arc<AutomationQueue>, adapter: &str, record: bool) -> Result<&'static Embedded, String> {
+    EMBEDDED
+        .get_or_init(|| {
+            let policy = STATE_CONFIGURATION.get_or_init(|| {
+                brep_mcp_core::launch_state::resolve(brep_mcp_core::launch_state::Host::Desktop, &Default::default())
+            }).as_ref().map_err(Clone::clone)?;
+            policy.prepare_named_parent().map_err(fail)?;
+            // The state registry publishes only for a host; this window has
+            // one now (`hit_rects`, `state_get` read it).
+            crate::automation::registry::set_enabled(true);
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .thread_name("brep-mcp-worker")
+                .enable_all()
+                .build()
+                .map_err(|e| format!("tokio runtime: {e}"))?;
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<HostRequest>();
+            let q = queue.clone();
+            runtime.spawn(async move {
+                while let Some(req) = rx.recv().await {
+                    let q = q.clone();
+                    match req {
+                        HostRequest::Command { envelope, reply } => {
+                            tokio::spawn(async move {
+                                let _ = reply.send(forward(&q, envelope).await);
+                            });
                         }
+                        HostRequest::Screenshot { region, reply } => {
+                            tokio::spawn(async move {
+                                let _ = reply.send(capture(&q, region).await);
+                            });
+                        }
+                        // The DOCS ANNOTATION overlay belongs to the
+                        // headless harness, which owns its egui context and
+                        // paints on top of the app's frame for the
+                        // walkthrough GIFs. A running window draws the
+                        // product, not a caption band over it, so this says
+                        // so rather than capturing an unannotated frame and
+                        // letting a silent GIF claim otherwise.
+                        HostRequest::Annotate { reply, .. } => {
+                            let _ = reply.send(Err(
+                                "the window host draws no annotation overlay: docs walkthroughs are recorded by the headless host (brep-mcp)".to_string(),
+                            ));
+                        }
+                        // The app is not the server's to stop.
+                        HostRequest::Stop => {}
                     }
-                });
-                let info = HostInfo {
-                    backend: "window",
-                    adapter,
-                    platform: std::env::consts::OS,
-                    width: 0.0,
-                    height: 0.0,
-                    ppp: 1.0,
-                };
-                let server = BrepServer::new(launch.session_root, Backend::Attached { tx, info, platform: Arc::new(NativePlatform) });
-                // Attach now: the first `tools/list` must already carry the
-                // app's commands (the HTTP transport may answer statelessly).
-                match server.attach(true).await {
-                    Ok(info) => log::info!("brep-app --mcp: attached session {} ({}x{} @ {})", info.id, info.host.width, info.host.height, info.host.ppp),
-                    Err(e) => {
-                        fail(format!("cannot attach the server to the app: {e}"));
-                        return;
-                    }
-                }
-                let listener = match launch.listener.set_nonblocking(true).and_then(|_| tokio::net::TcpListener::from_std(launch.listener)) {
-                    Ok(l) => l,
-                    Err(e) => {
-                        fail(format!("listener: {e}"));
-                        return;
-                    }
-                };
-                if let Err(e) = brep_mcp_core::http::serve_http(server, listener).await {
-                    fail(format!("server on {url} stopped: {e}"));
                 }
             });
+            let info = HostInfo { backend: "window", adapter: adapter.to_string(), platform: std::env::consts::OS, width: 0.0, height: 0.0, ppp: 1.0 };
+            let server = BrepServer::new(SESSION_ROOT.get_or_init(default_session_root).clone(), Backend::Attached { tx, info, platform: Arc::new(NativePlatform) });
+            let server = match &policy.state_dir {
+                Some(path) => server.with_state_dir(path).map_err(fail)?,
+                None => server,
+            };
+            let attached = Arc::new(std::sync::OnceLock::new());
+            let attached_signal = Arc::new(tokio::sync::Notify::new());
+            let (s, done, signal) = (server.clone(), attached.clone(), attached_signal.clone());
+            runtime.spawn(async move {
+                let outcome = match s.attach(record).await {
+                    Ok(info) => {
+                        log::info!("brep-app: attached session {} ({}x{} @ {})", info.id, info.host.width, info.host.height, info.host.ppp);
+                        Ok(())
+                    }
+                    Err(e) => Err(format!("cannot attach the server to the app: {e}")),
+                };
+                let _ = done.set(outcome);
+                signal.notify_waiters();
+            });
+            Ok(Embedded { server, runtime, attached, attached_signal })
         })
-        .map_err(|e| {
-            set_status(Status::Stopped { error: None });
-            format!("spawn the MCP server thread: {e}")
-        })?;
+        .as_ref()
+        .map_err(Clone::clone)
+}
+
+/// Serve the app's server over a loopback listener. Called from the eframe
+/// creation closure, once the app (and its queue) exists — or from the Info
+/// window's button, any time later; returns as soon as the listener is
+/// handed to the server. `adapter` names the GPU for the session info. At
+/// most ONCE per process: a second call while the server runs is refused
+/// with its address, so neither path can stack a second listener on the
+/// first. The JavaScript editor may have created the server already; the
+/// listener then serves that one.
+pub fn start(queue: Arc<AutomationQueue>, adapter: String, launch: Launch) -> Result<(), String> {
+    let root = SESSION_ROOT.get_or_init(|| launch.session_root.clone());
+    if root != &launch.session_root {
+        return Err(format!("the embedded session already uses {}; cannot relocate live artifacts to {}", root.display(), launch.session_root.display()));
+    }
+    {
+        let mut status = STATUS.lock().unwrap_or_else(|p| p.into_inner());
+        if let Status::Running { url, .. } | Status::Starting { url, .. } = &*status {
+            return Err(format!("the MCP server is already running on {url}"));
+        }
+        *status = Status::Starting { url: launch.url(), session_root: launch.session_root.clone(), note: launch.note.clone() };
+    }
+    // The loopback credential (D3): read or minted before anything listens.
+    let credential = brep_mcp_core::http::Credential::load_or_create().map_err(|e| {
+        set_status(Status::Stopped { error: None });
+        format!("the MCP token: {e}")
+    })?;
+    let embedded = embedded(&queue, &adapter, false).map_err(|e| {
+        set_status(Status::Stopped { error: None });
+        e
+    })?;
+    launch.listener.set_nonblocking(true).map_err(|e| {
+        set_status(Status::Stopped { error: None });
+        format!("listener: {e}")
+    })?;
+    let url = launch.url();
+    let (server, attached, signal) = (embedded.server.clone(), embedded.attached.clone(), embedded.attached_signal.clone());
+    let ready_status = Status::Running { url: url.clone(), session_root: launch.session_root.clone(), note: launch.note.clone() };
+    let std_listener = launch.listener;
+    embedded.runtime.spawn(async move {
+        // The first `tools/list` must already carry the app's commands (the
+        // HTTP transport may answer statelessly): serve once attached. The
+        // attach is itself an app command, so "Running" means dispatch works.
+        loop {
+            // Registered before the check, so a set in between still wakes it.
+            let notified = signal.notified();
+            let mut notified = std::pin::pin!(notified);
+            notified.as_mut().enable();
+            match attached.get() {
+                Some(Ok(())) => break,
+                Some(Err(e)) => {
+                    fail(e);
+                    return;
+                }
+                None => notified.await,
+            }
+        }
+        let listener = match tokio::net::TcpListener::from_std(std_listener) {
+            Ok(l) => l,
+            Err(e) => {
+                fail(format!("listener: {e}"));
+                return;
+            }
+        };
+        set_status(ready_status);
+        eprintln!("BREP MCP application host ready; serving on {url}");
+        if let Err(e) = brep_mcp_core::http::serve_http(server, listener, credential).await {
+            fail(format!("server on {url} stopped: {e}"));
+        }
+    });
     Ok(())
+}
+
+/// The JavaScript editor's runner: the app's server's code mode, the same
+/// realm, limits and `brep.*` functions an agent's `run_script` gets.
+pub struct EditorHost {
+    queue: Arc<AutomationQueue>,
+    adapter: String,
+}
+
+impl EditorHost {
+    pub fn new(queue: Arc<AutomationQueue>, adapter: String) -> Self {
+        EditorHost { queue, adapter }
+    }
+
+    fn service(&self) -> Result<(&'static Embedded, Arc<brep_mcp_core::cad::CadService>), String> {
+        let e = embedded(&self.queue, &self.adapter, false)?;
+        Ok((e, e.server.state.cad.clone()))
+    }
+}
+
+impl crate::javascript::ScriptHost for EditorHost {
+    fn ready(&self) -> Result<bool, String> {
+        let (e, _) = self.service()?;
+        e.attached().transpose().map(|r| r.is_some())
+    }
+    fn run(&self, source: &str) -> Result<String, String> {
+        let (e, cad) = self.service()?;
+        let _enter = e.runtime.enter();
+        cad.run_local(source, "javascript")
+    }
+    fn result(&self, id: &str) -> Result<Option<Value>, String> {
+        self.service()?.1.result_local(id)
+    }
+    fn halt(&self, id: &str) -> Result<(), String> {
+        let (e, cad) = self.service()?;
+        let _enter = e.runtime.enter();
+        cad.halt_local(id)
+    }
 }
 

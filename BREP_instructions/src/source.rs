@@ -56,6 +56,7 @@ fn read_level(document: &Value, prefix: &str, path: &str, name: &str, depth: usi
             fastener: truthy(&attributes[FASTENER_ATTRIBUTE]),
             serial_tracked: truthy(&attributes[SERIAL_TRACKED_ATTRIBUTE]),
             torque: Some(text(&attributes[TORQUE_ATTRIBUTE])).filter(|t| !t.is_empty()),
+            attributes: attribute_texts(attributes),
             children,
         });
         ids.push(id.to_string());
@@ -147,6 +148,28 @@ fn text(value: &Value) -> String {
         Value::Number(n) => n.to_string(),
         _ => String::new(),
     }
+}
+
+/// A part's attributes as display text: every text, number or yes/no value
+/// that is not empty, in the order the JSON map holds them (an object or a
+/// list is not a detail a reader can read, and is left out), save the
+/// fastener, torque and serial-tracking attributes the component carries as
+/// its own fields.
+fn attribute_texts(attributes: &Value) -> Vec<(String, String)> {
+    attributes
+        .as_object()
+        .into_iter()
+        .flatten()
+        .filter(|(key, _)| ![FASTENER_ATTRIBUTE, SERIAL_TRACKED_ATTRIBUTE, TORQUE_ATTRIBUTE].contains(&key.trim()))
+        .filter_map(|(key, value)| {
+            let shown = match value {
+                Value::Bool(true) => "Yes".to_string(),
+                Value::Bool(false) => "No".to_string(),
+                other => text(other),
+            };
+            (!key.trim().is_empty() && !shown.is_empty()).then(|| (key.trim().to_string(), shown))
+        })
+        .collect()
 }
 
 /// An attribute's yes: `true`, or text `true` / `yes` / `1` / `y` (any case).

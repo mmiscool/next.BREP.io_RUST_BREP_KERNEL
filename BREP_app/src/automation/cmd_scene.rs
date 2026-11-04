@@ -1,7 +1,7 @@
 //! Scene queries and selection: what exists, what is under a point, what is
 //! selected, mass properties. Points are egui surface points; the viewport
 //! offset is applied here.
-use crate::automation::command::{parse_args, schema_of, Annotations, CommandSpec, Ctx, Empty, Handler, NoArgs, Outcome, Phase};
+use crate::automation::command::{app_command, read_engine, parse_args, CommandSpec, Ctx, NoArgs, Outcome};
 use crate::automation::cmd_document::parse;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -62,6 +62,101 @@ fn local(ctx: &Ctx<'_>, x: f32, y: f32) -> Result<(f64, f64), String> {
     Ok(((x - r.min.x) as f64, (y - r.min.y) as f64))
 }
 
+// These schemas describe the existing JSON producers in scene_query.rs and
+// Scene::listing_json. Keep their wire shapes: summary bounds are xyz objects,
+// per-solid bounds are arrays, and aggregate mass tensors are explicitly null.
+fn number3_schema() -> Value {
+    json!({"type":"array","items":{"type":"number"},"minItems":3,"maxItems":3})
+}
+
+fn scene_entities_result_schema() -> Value {
+    let names = json!({"type":"array","items":{"type":"string"}});
+    let count = json!({"type":"integer","minimum":0});
+    json!({
+        "type":"object",
+        "properties":{
+            "solids":{"type":"array","items":{
+                "type":"object",
+                "properties":{
+                    "name":{"type":"string"},"visible":{"type":"boolean"},
+                    "faces":names,"edges":names,
+                    "vertices":{"type":"array","items":{
+                        "type":"object",
+                        "properties":{"topoId":count,"position":number3_schema()},
+                        "required":["topoId","position"],"additionalProperties":false
+                    }}
+                },
+                "required":["name","visible","faces","edges","vertices"],"additionalProperties":false
+            }},
+            "listing":{"type":"array","items":{
+                "type":"object",
+                "properties":{"name":{"type":"string"},"kind":{"const":"SOLID"},
+                    "visible":{"type":"boolean"},"faces":count,"edges":count,"vertices":count},
+                "required":["name","kind","visible","faces","edges","vertices"],"additionalProperties":false
+            }}
+        },
+        "required":["solids","listing"],"additionalProperties":false
+    })
+}
+
+fn model_inspect_result_schema() -> Value {
+    let xyz = json!({"type":"object",
+        "properties":{"x":{"type":"number"},"y":{"type":"number"},"z":{"type":"number"}},
+        "required":["x","y","z"],"additionalProperties":false});
+    let nullable_number = json!({"type":["number","null"]});
+    json!({
+        "type":"object",
+        "properties":{
+            "solidCount":{"type":"integer","minimum":0},"valid":{"type":"boolean"},
+            "volumeMm3":nullable_number,
+            "boundsMm":{"type":["object","null"],"properties":{"min":xyz,"max":xyz},
+                "required":["min","max"],"additionalProperties":false},
+            "warnings":{"type":"array","items":{"type":"string"}},
+            "solids":{"type":"array","items":{
+                "type":"object",
+                "properties":{
+                    "name":{"type":"string"},"valid":{"type":"boolean"},"volumeMm3":nullable_number,
+                    "boundsMm":{"type":"object","properties":{"min":number3_schema(),"max":number3_schema()},
+                        "required":["min","max"],"additionalProperties":false},
+                    "issues":{"type":"array","items":{"type":"object",
+                        "properties":{"severity":{"type":"string"},"message":{"type":"string"}},
+                        "required":["severity","message"],"additionalProperties":false}}
+                },
+                "required":["name","valid","volumeMm3","boundsMm","issues"],"additionalProperties":false
+            }}
+        },
+        "required":["solidCount","valid","volumeMm3","boundsMm","warnings","solids"],"additionalProperties":false
+    })
+}
+
+fn mass_properties_result_schema() -> Value {
+    let matrix = json!({"type":"array","items":number3_schema(),"minItems":3,"maxItems":3});
+    // Finite density can still overflow scaled values; serde_json emits null
+    // for those non-finite results. Preserve that existing wire behavior.
+    let scaled3 = json!({"type":"array","items":{"type":["number","null"]},"minItems":3,"maxItems":3});
+    let scaled_matrix = json!({"type":"array","items":scaled3,"minItems":3,"maxItems":3});
+    // The app converts producer ok=false replies into tool errors, so only the
+    // successful single-solid and aggregate shapes belong in outputSchema.
+    let mut properties = json!({
+        "ok":{"const":true},"target":{"type":"string"},
+        "density":{"type":"number"},"volume":{"type":"number"},
+        "surfaceArea":{"type":"number"},"mass":{"type":["number","null"]},"centroid":number3_schema()
+    });
+    let required = json!(["ok","target","solidCount","density","volume","surfaceArea","mass",
+        "centroid","inertia","principalMoments","principalAxes"]);
+    properties["solidCount"] = json!({"const":1});
+    properties["inertia"] = scaled_matrix;
+    properties["principalMoments"] = scaled3;
+    properties["principalAxes"] = matrix;
+    let single = json!({"type":"object","properties":properties,"required":required,"additionalProperties":false});
+    properties["solidCount"] = json!({"type":"integer","minimum":2});
+    for field in ["inertia", "principalMoments", "principalAxes"] {
+        properties[field] = json!({"type":"null"});
+    }
+    let aggregate = json!({"type":"object","properties":properties,"required":required,"additionalProperties":false});
+    json!({"type":"object","oneOf":[single,aggregate]})
+}
+
 fn scene_entities(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
     let _: NoArgs = parse_args(args)?;
     let engine = ctx.app.docs.engine();
@@ -69,6 +164,40 @@ fn scene_entities(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
         "solids": parse(&engine.scene_entities_json()),
         "listing": parse(&engine.scene_listing_json()),
     })))
+}
+
+// Raw geometric hits and selection-filtered candidates have different wire
+// shapes (pick::candidates_to_json versus selection_ux::candidates_at).
+fn pick_candidate_schema() -> Value {
+    json!({"type":"object","properties":{
+        "kind":{"type":"string","enum":["VERTEX","EDGE","FACE","PLANE","SOLID","COMPONENT"]},
+        "name":{"type":"string"},"solid":{"type":"string"},
+        "depth":{"type":"number"},"screenDist":{"type":"number"},"position":number3_schema()
+    },"required":["kind","name","solid","depth","screenDist","position"],"additionalProperties":false})
+}
+fn pick_result_schema() -> Value {
+    json!({"type":"object","properties":{"candidates":{"type":"array","items":pick_candidate_schema()}},
+        "required":["candidates"],"additionalProperties":false})
+}
+fn hover_result_schema() -> Value {
+    json!({"type":"object","properties":{"changed":{"type":"boolean"},
+        "candidate":{"anyOf":[pick_candidate_schema(),{"type":"null"}]}},
+        "required":["changed","candidate"],"additionalProperties":false})
+}
+fn locate_result_schema() -> Value {
+    // Filtered kind labels also describe application-specific entities (e.g.
+    // sketches); do not restrict them to the raw geometric PickKind enum.
+    let candidate = json!({"type":"object","properties":{
+        "kind":{"type":"string"},"name":{"type":"string"},"solid":{"type":"string"},"depth":{"type":"number"}
+    },"required":["kind","name","solid","depth"],"additionalProperties":false});
+    let nullable_candidate = json!({"anyOf":[candidate,{"type":"null"}]});
+    json!({"type":"object","properties":{
+        "kind":{"type":"string"},"name":{"type":"string"},"owner":{"type":"string"},
+        "x":{"type":"number"},"y":{"type":"number"},"depth":{"type":"number"},
+        "visible":{"type":"boolean"},"world":number3_schema(),
+        "under":{"type":"array","items":candidate},"rank":{"type":["integer","null"],"minimum":0},
+        "takes":nullable_candidate,"reaches":{"type":"boolean"},"occluded_by":nullable_candidate
+    },"required":["kind","name","owner","x","y","depth","visible","world","under","rank","takes","reaches","occluded_by"],"additionalProperties":false})
 }
 
 fn pick(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
@@ -84,13 +213,31 @@ fn hover(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
     Ok(Outcome::Done(json!({ "changed": changed, "candidate": parse(&ctx.app.docs.engine().hover_json(lx, ly)) })))
 }
 
+// One producer for select/selection_set/selection: EngineState::selection_json
+// (BREP_render/src/engine_state/selection_ux.rs). Vertices are a count because
+// they are position-keyed, unlike the named entities in the four arrays.
+fn selection_result_schema() -> Value {
+    let names = json!({"type":"array","items":{"type":"string"}});
+    let selection = json!({
+        "type":"object",
+        "properties":{"solids":names,"faces":names,"edges":names,"datums":names,"vertices":{"type":"integer","minimum":0}},
+        "required":["solids","faces","edges","datums","vertices"],
+        "additionalProperties":false
+    });
+    json!({"type":"object","properties":{"selection":selection},"required":["selection"],"additionalProperties":false})
+}
+
+fn selection_clear_result_schema() -> Value {
+    json!({"type":"object","properties":{"changed":{"type":"boolean"}},"required":["changed"],"additionalProperties":false})
+}
+
 fn select(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
     let a: SelectArgs = parse_args(args)?;
     let ok = ctx.app.docs.engine_mut().select_by_name(&a.kind, &a.name);
     if !ok {
         return Err(format!("nothing selected: unknown kind `{}` or name `{}`", a.kind, a.name));
     }
-    Ok(Outcome::Done(json!({ "selection": parse(&ctx.app.docs.engine().selection_json()) })))
+    Ok(Outcome::Done(json!({ "selection": ctx.app.docs.engine().selection_value() })))
 }
 
 fn selection_set(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
@@ -99,7 +246,7 @@ fn selection_set(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
         .docs
         .engine_mut()
         .set_selection(&a.solids, &a.faces, &a.edges, &a.datums);
-    Ok(Outcome::Done(json!({ "selection": parse(&ctx.app.docs.engine().selection_json()) })))
+    Ok(Outcome::Done(json!({ "selection": ctx.app.docs.engine().selection_value() })))
 }
 
 fn select_clear(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
@@ -109,8 +256,7 @@ fn select_clear(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
 }
 
 fn selection(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
-    let _: NoArgs = parse_args(args)?;
-    Ok(Outcome::Done(json!({ "selection": parse(&ctx.app.docs.engine().selection_json()) })))
+    read_engine(ctx, args, |e| json!({ "selection": e.selection_value() }))
 }
 
 fn set_visible(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
@@ -359,6 +505,22 @@ fn locate(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
     })))
 }
 
+fn model_inspect(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
+    let _: NoArgs = parse_args(args)?;
+    // The checks are runner queries: answered now if they are cached, else on
+    // the frame the replies land (the frame thread never replays the history).
+    if let Some(summary) = ctx.app.docs.engine_mut().model_inspect_poll() {
+        return Ok(Outcome::Done(summary));
+    }
+    let handle = ctx.app.docs.active().handle().to_string();
+    Ok(Outcome::Poll(Box::new(move |ctx: &mut Ctx<'_>| {
+        let Some(engine) = ctx.app.docs.engine_of_handle_mut(&handle) else {
+            return Some(Err("document_unknown: the document closed while it was being inspected".into()));
+        };
+        engine.model_inspect_poll().map(|summary| Ok(Outcome::Done(summary)))
+    })))
+}
+
 fn mass_properties(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
     let a: MassArgs = parse_args(args)?;
     let v = parse(&ctx.app.docs.engine().mass_properties_json(a.name.as_deref(), a.density));
@@ -369,15 +531,16 @@ fn mass_properties(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
 }
 
 pub static COMMANDS: &[CommandSpec] = &[
-    CommandSpec { name: "scene_entities", group: "scene", doc: "Every resident solid with its face and edge names and vertex positions (the reference names feature parameters take), plus the scene listing.", phase: Phase::Read, annotations: Annotations::READ, args_schema: schema_of::<NoArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(scene_entities) },
-    CommandSpec { name: "pick", group: "scene", doc: "Ranked pick candidates under a surface point (VERTEX > EDGE > FACE > PLANE > SOLID > COMPONENT). Does not change the selection.", phase: Phase::Read, annotations: Annotations::READ, args_schema: schema_of::<PointArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(pick) },
-    CommandSpec { name: "hover", group: "scene", doc: "Set the hover highlight to whatever is under a surface point and return it.", phase: Phase::Mutate, annotations: Annotations::MUTATE_NOWAIT, args_schema: schema_of::<PointArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(hover) },
-    CommandSpec { name: "select", group: "scene", doc: "Replace the selection with one named entity: kind solid | face | edge | datum.", phase: Phase::Mutate, annotations: Annotations::MUTATE_NOWAIT, args_schema: schema_of::<SelectArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(select) },
-    CommandSpec { name: "selection_set", group: "scene", doc: "Replace the WHOLE selection with these named entities — the write twin of `selection`, and the way to put a multi-entity selection back (`select` takes one name). Vertices have no names and are not restored.", phase: Phase::Mutate, annotations: Annotations::MUTATE_NOWAIT, args_schema: schema_of::<SelectionSetArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(selection_set) },
-    CommandSpec { name: "select_clear", group: "scene", doc: "Clear the selection.", phase: Phase::Mutate, annotations: Annotations::MUTATE_NOWAIT, args_schema: schema_of::<NoArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(select_clear) },
-    CommandSpec { name: "selection", group: "scene", doc: "The current selection `{solids, faces, edges, datums, vertices}`.", phase: Phase::Read, annotations: Annotations::READ, args_schema: schema_of::<NoArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(selection) },
-    CommandSpec { name: "set_visible", group: "scene", doc: "Show or hide a scene entity by name.", phase: Phase::Mutate, annotations: Annotations::MUTATE_NOWAIT, args_schema: schema_of::<VisibleArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(set_visible) },
-    CommandSpec { name: "locate", group: "scene", doc: "Where an entity is on the surface, in egui points: a face's triangle centroid, an edge's ARC-LENGTH midpoint, a vertex (by topoId), a solid's bbox centre — projected through the camera. A committed SKETCH is reached as `kind: \"solid\"` under its feature id; one with no mesh (an open chain, a points-only hole placement, a Helix) anchors on the midpoint of its longest edge, or on its first point. `under` is the ranked candidate list a DWELL there would open, filtered the way the viewport filters it; `rank` is this entity's place in that list. What a REGULAR click takes is `takes` — the nearest admitted candidate by depth, which is also what the hover highlight lights — and `reaches` says whether that is this entity; `occluded_by` is what the click would take instead. (A reference field's picker is unchanged and still takes the list's top candidate, so `takes` is that while one is open.) The list resolves a part to its OWNING SOLID where the filter admits only solids, so a face of a cylinder ranks 0 when the cylinder does. The bridge from a reference name to a pointer click, which `click_entity` and `drag_entity` spend.", phase: Phase::Read, annotations: Annotations::READ, args_schema: schema_of::<LocateArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(locate) },
-    CommandSpec { name: "mass_properties", group: "scene", doc: "Volume, surface area, mass, centroid, inertia and principal moments of one solid or of all — the closed-form check for an example model.", phase: Phase::Read, annotations: Annotations::READ, args_schema: schema_of::<MassArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(mass_properties) },
+    app_command!("scene", "scene_entities", "Every resident solid with its face and edge names and vertex positions (the reference names feature parameters take), plus the scene listing.", NoArgs, scene_entities, Read, READ, scene_entities_result_schema),
+    app_command!("scene", "pick", "Ranked pick candidates under a surface point (VERTEX > EDGE > FACE > PLANE > SOLID > COMPONENT). Does not change the selection.", PointArgs, pick, Read, READ, pick_result_schema),
+    app_command!("scene", "hover", "Set the hover highlight to whatever is under a surface point and return it.", PointArgs, hover, Mutate, MUTATE_NOWAIT, hover_result_schema),
+    app_command!("scene", "select", "Replace the selection with one named entity: kind solid | face | edge | datum.", SelectArgs, select, Mutate, MUTATE_NOWAIT, selection_result_schema),
+    app_command!("scene", "selection_set", "Replace the WHOLE selection with these named entities — the write twin of `selection`, and the way to put a multi-entity selection back (`select` takes one name). Vertices have no names and are not restored.", SelectionSetArgs, selection_set, Mutate, MUTATE_NOWAIT, selection_result_schema),
+    app_command!("scene", "select_clear", "Clear the selection.", NoArgs, select_clear, Mutate, MUTATE_NOWAIT, selection_clear_result_schema),
+    app_command!("scene", "selection", "The current selection `{solids, faces, edges, datums, vertices}`.", NoArgs, selection, Read, READ, selection_result_schema),
+    app_command!("scene", "set_visible", "Show or hide a scene entity by name.", VisibleArgs, set_visible, Mutate, MUTATE_NOWAIT),
+    app_command!("scene", "locate", "Where an entity is on the surface, in egui points: a face's triangle centroid, an edge's ARC-LENGTH midpoint, a vertex (by topoId), a solid's bbox centre — projected through the camera. A committed SKETCH is reached as `kind: \"solid\"` under its feature id; one with no mesh (an open chain, a points-only hole placement, a Helix) anchors on the midpoint of its longest edge, or on its first point. `under` is the ranked candidate list a DWELL there would open, filtered the way the viewport filters it; `rank` is this entity's place in that list. What a REGULAR click takes is `takes` — the nearest admitted candidate by depth, which is also what the hover highlight lights — and `reaches` says whether that is this entity; `occluded_by` is what the click would take instead. (A reference field's picker is unchanged and still takes the list's top candidate, so `takes` is that while one is open.) The list resolves a part to its OWNING SOLID where the filter admits only solids, so a face of a cylinder ranks 0 when the cylinder does. The bridge from a reference name to a pointer click, which `click_entity` and `drag_entity` spend.", LocateArgs, locate, Read, READ, locate_result_schema),
+    app_command!("scene", "model_inspect", "The model summary: `solidCount`, `valid` (every solid passed the kernel's topology validation and measured), total `volumeMm3`, overall `boundsMm` {min, max} as {x, y, z}, `warnings`, and per solid {name, valid, issues, volumeMm3, boundsMm}. Null where the kernel could not give a number, with a warning; never an estimate.", NoArgs, model_inspect, Read, READ, model_inspect_result_schema),
+    app_command!("scene", "mass_properties", "Volume, surface area, mass, centroid, inertia and principal moments of one solid or of all — the closed-form check for an example model.", MassArgs, mass_properties, Read, READ, mass_properties_result_schema),
 ];
 

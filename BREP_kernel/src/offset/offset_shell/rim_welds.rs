@@ -4,9 +4,9 @@ use super::*;
 /// A closed edge sampled as a circle: center, unit axis, radius. `None` when
 /// the samples do not lie on a common circle within tolerance.
 pub(super) struct RimCircle {
-    center: Vec3,
-    axis: Vec3,
-    radius: f64,
+    pub(super) center: Vec3,
+    pub(super) axis: Vec3,
+    pub(super) radius: f64,
 }
 
 pub(super) fn fit_rim_circle(edge: &EdgeRecord, tolerance: f64) -> Result<Option<RimCircle>, KernelRefusal> {

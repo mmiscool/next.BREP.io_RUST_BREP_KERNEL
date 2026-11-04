@@ -1,7 +1,7 @@
 //! A motion study's published motion on a manufacturing-instructions step
 //! (`brep_render::engine_state` `instructions_motion`): what the assembly
 //! published, attach one to a step, take it off.
-use crate::automation::command::{parse_args, schema_of, Annotations, CommandSpec, Ctx, Empty, Handler, NoArgs, Outcome, Phase};
+use crate::automation::command::{app_command, parse_args, CommandSpec, Ctx, NoArgs, Outcome};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -53,8 +53,32 @@ fn instructions_detach_motion(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome,
     Ok(Outcome::Done(motions(ctx)?))
 }
 
+fn motion_object(properties: Value) -> Value {
+    let required: Vec<_> = properties.as_object().unwrap().keys().cloned().collect();
+    json!({"type":"object","properties":properties,"required":required,"additionalProperties":false})
+}
+fn instructions_motions_result_schema() -> Value {
+    let count = json!({"type":"integer","minimum":0});
+    let published = motion_object(json!({
+        "study":{"type":"string"},"name":{"type":"string"},"frames":count,
+        "duration":{"type":"number"},"fps":count,"current":{"type":"boolean"}
+    }));
+    // Authored step.motion is arbitrary JSON. Its study member is copied
+    // without coercion, including null when absent, so retain that wire type.
+    let attached = motion_object(json!({"step":{"type":"string"},"study":{},"frames":count}));
+    motion_object(json!({"motions":{"type":"array","items":published},"attached":{"type":"array","items":attached}}))
+}
+fn instructions_attach_motion_result_schema() -> Value {
+    let mut schema = instructions_motions_result_schema();
+    for key in ["study", "step"] {
+        schema["properties"][key] = json!({"type":"string"});
+        schema["required"].as_array_mut().unwrap().push(json!(key));
+    }
+    schema
+}
+
 pub static COMMANDS: &[CommandSpec] = &[
-    CommandSpec { name: "instructions_motions", group: "instructions", doc: "The motion studies the assembly published (the Simulation workbench's Publish writes a study's baked frames into the assembly's document; the instructions read them from the placed copy): `motions` [{study, name, frames, duration, fps, current}] — `current` false when the motion was published before the assembly changed, so it cannot be attached until published again — and `attached` [{step, study, frames}], the steps that carry one.", phase: Phase::Read, annotations: Annotations::READ, args_schema: schema_of::<NoArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(instructions_motions) },
-    CommandSpec { name: "instructions_attach_motion", group: "instructions", doc: "Give `step` the published motion of `study` (the assembly's only published study when absent) as its motion: a copy of the study's frames, played in the player in place of the step's insertion animation and kept with the instructions. Refused when the study is not published, was published before the assembly changed, or several are published and none is named; nothing is written then. One undo step. Returns `instructions_motions` plus `step` and `study`.", phase: Phase::Mutate, annotations: Annotations::MUTATE, args_schema: schema_of::<AttachArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(instructions_attach_motion) },
-    CommandSpec { name: "instructions_detach_motion", group: "instructions", doc: "Take the motion off `step`; its insertion animation plays again. One undo step. Returns `instructions_motions`.", phase: Phase::Mutate, annotations: Annotations::MUTATE, args_schema: schema_of::<DetachArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(instructions_detach_motion) },
+    app_command!("instructions", "instructions_motions", "The motion studies the assembly published (the Simulation workbench's Publish writes a study's baked frames into the assembly's document; the instructions read them from the placed copy): `motions` [{study, name, frames, duration, fps, current}] — `current` false when the motion was published before the assembly changed, so it cannot be attached until published again — and `attached` [{step, study, frames}], the steps that carry one.", NoArgs, instructions_motions, Read, READ, instructions_motions_result_schema),
+    app_command!("instructions", "instructions_attach_motion", "Give `step` the published motion of `study` (the assembly's only published study when absent) as its motion: a copy of the study's frames, played in the player in place of the step's insertion animation and kept with the instructions. Refused when the study is not published, was published before the assembly changed, or several are published and none is named; nothing is written then. One undo step. Returns `instructions_motions` plus `step` and `study`.", AttachArgs, instructions_attach_motion, Mutate, MUTATE, instructions_attach_motion_result_schema),
+    app_command!("instructions", "instructions_detach_motion", "Take the motion off `step`; its insertion animation plays again. One undo step. Returns `instructions_motions`.", DetachArgs, instructions_detach_motion, Mutate, MUTATE, instructions_motions_result_schema),
 ];

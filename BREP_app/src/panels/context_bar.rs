@@ -828,16 +828,30 @@ impl Selection {
         out
     }
 
+    /// "Selected: 2 faces, 1 edge" — the kinds that ARE selected, in the
+    /// bar's own order, each counted in the singular or the plural. It used to
+    /// list every kind with its zero ("0 solid, 0 sketch, 1 face, 0 edge,
+    /// 0 plane, 0 vertex"), six numbers to find the one that was not 0
+    /// (ui-polish-2026-10-28 row 3).
     fn summary(&self) -> String {
-        format!(
-            "Selected: {} solid, {} sketch, {} face, {} edge, {} plane, {} vertex",
-            self.solids.len(),
-            self.sketches.len(),
-            self.faces.len(),
-            self.edges.len(),
-            self.planes.len(),
-            self.vertices,
-        )
+        let count = crate::panels::count;
+        let parts: Vec<String> = [
+            (self.solids.len(), "solid", "solids"),
+            (self.sketches.len(), "sketch", "sketches"),
+            (self.faces.len(), "face", "faces"),
+            (self.edges.len(), "edge", "edges"),
+            (self.planes.len(), "plane", "planes"),
+            (self.vertices, "vertex", "vertices"),
+        ]
+        .into_iter()
+        .filter(|(n, _, _)| *n > 0)
+        .map(|(n, one, many)| count(n, one, many))
+        .collect();
+        if parts.is_empty() {
+            "Selected: nothing".to_string()
+        } else {
+            format!("Selected: {}", parts.join(", "))
+        }
     }
 }
 

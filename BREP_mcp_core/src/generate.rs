@@ -56,6 +56,7 @@ pub fn commands_json(tools: &ToolSet) -> Value {
                 "waits": t.annotations.waits,
             },
             "inputSchema": t.input_schema,
+            "outputSchema": t.output_schema,
         })).collect::<Vec<_>>()
     })
 }
@@ -153,6 +154,16 @@ pub fn widgets_md(reg: &Registries) -> String {
     out
 }
 
+/// The tools a script may call, from a tool set (what `brep-cad.d.ts` types).
+fn script_tools(tools: &ToolSet) -> Vec<crate::cad::ScriptTool> {
+    tools
+        .specs
+        .iter()
+        .filter(|t| crate::cad::script_callable(t.group, &t.name))
+        .map(|t| crate::cad::ScriptTool { name: t.name.clone(), group: t.group.to_string(), doc: t.doc.clone(), input_schema: t.input_schema.clone(), output_schema: t.output_schema.clone() })
+        .collect()
+}
+
 /// Every generated file as `(relative path, content)`.
 pub fn all(tools: &ToolSet) -> Vec<(String, String)> {
     all_with(tools, &Registries::default())
@@ -165,6 +176,7 @@ pub fn all_with(tools: &ToolSet, reg: &Registries) -> Vec<(String, String)> {
         ("commands.json".into(), serde_json::to_string_pretty(&commands_json(tools)).unwrap_or_default() + "\n"),
         ("features.md".into(), features_md()),
         ("features.json".into(), serde_json::to_string_pretty(&crate::schema::all()).unwrap_or_default() + "\n"),
+        ("brep-cad.d.ts".into(), crate::cad::declarations::module(&crate::cad::catalogue::Catalogue::new(), &script_tools(tools))),
     ];
     if !reg.state.is_null() {
         files.push(("state.md".into(), state_md(reg)));

@@ -595,19 +595,8 @@ fn interval_at(parameters: &[f64], u: f64) -> Option<(usize, f64)> {
 /// thread.
 const AFFINE_READS_DEFAULT: bool = true;
 
-thread_local! {
-    static AFFINE_READS_FOR_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
-}
-
 pub(in crate::blend) fn affine_reads_on() -> bool {
-    if let Some(forced) = AFFINE_READS_FOR_TEST.with(|forced| forced.get()) {
-        return forced;
-    }
-    match std::env::var("BREP_BLEND_AFFINE_READS").as_deref() {
-        Ok("0") | Ok("off") => false,
-        Ok("1") | Ok("on") => true,
-        _ => AFFINE_READS_DEFAULT,
-    }
+    switch!(live "BREP_BLEND_AFFINE_READS", AFFINE_READS_DEFAULT)
 }
 
 
@@ -682,6 +671,97 @@ pub(in crate::blend) fn affine_rail_standoff(rail: &NurbsCurve, carrier: &NurbsS
     Some(worst)
 }
 
+/// Lane N row 4 (2026-10-28): the exact revolution rows' reads in closed
+/// form. `BREP_EXACT_REVOLUTION_READS=1`/`on` turns them on, `=0`/`off`
+/// off; ON by default since lane N's promotion (2026-10-28).
+const EXACT_REVOLUTION_READS_DEFAULT: bool = true;
+
+pub(in crate::blend) fn exact_revolution_reads_on() -> bool {
+    switch!(live "BREP_EXACT_REVOLUTION_READS", EXACT_REVOLUTION_READS_DEFAULT)
+}
+
+
+/// A bound on `|S(pcurve(s)) − rail(s)|` over the whole parameter range when
+/// the shipped pair is an exact revolution row's (`exact_revolution_rows`):
+///
+/// * on the REVOLUTION carrier the pcurve is a uv line along one coordinate
+///   and the rail is the carrier's parallel circle at the held coordinate,
+///   continued to the line's range along its own conic pieces
+///   (`extend_conic_ends`) and re-parameterised to `[0, 1]`; that curve is
+///   rebuilt here from the pcurve's two ends and compared with the rail net
+///   for net — identical bases, so the homogeneous control differences
+///   bound the curves everywhere (`net_bound`);
+/// * on an AFFINE plane the pcurve carries the rail's own knots and the
+///   chart images of the rail's control points; the plane's image of the
+///   pcurve net is compared with the rail net the same way.
+///
+/// `None` when the pair is neither (the sampled read runs). The rail's
+/// standoff from the carrier and the pcurve's miss are each at most the
+/// bound (a point's distance to a surface is at most its distance to any
+/// point of it; the miss adds the standoff once more), so a bound within a
+/// third of the pcurve floor stands the trim by the march trim's own rule.
+pub(in crate::blend) fn exact_revolution_read_bound(rail: &NurbsCurve, carrier: &NurbsSurface, pcurve: &NurbsCurve) -> Option<f64> {
+    if let Some((origin, s_u, s_v)) = affine_plane_frame(carrier) {
+        // The plane's image of the pcurve net, weight for weight.
+        if pcurve.degree != rail.degree || pcurve.knots != rail.knots || pcurve.control_points.len() != rail.control_points.len() {
+            return None;
+        }
+        let ([u0, _], [v0, _]) = (carrier.domain_u().ok()?, carrier.domain_v().ok()?);
+        let image: Vec<Vec4> = pcurve
+            .control_points
+            .iter()
+            .map(|control| {
+                let (u, v) = (control.x / control.w, control.y / control.w);
+                let point = origin.add(s_u.scale(u - u0)).add(s_v.scale(v - v0));
+                Vec4 { x: point.x * control.w, y: point.y * control.w, z: point.z * control.w, w: control.w }
+            })
+            .collect();
+        return crate::blend::stations::net_bound(&rail.control_points, &image);
+    }
+    if !matches!(carrier.analytic(), Some(crate::AnalyticSurface::RuledRevolution { .. } | crate::AnalyticSurface::Revolution { .. } | crate::AnalyticSurface::Torus { .. } | crate::AnalyticSurface::Sphere { .. })) {
+        return None;
+    }
+    if !affine_curve(pcurve) {
+        return None;
+    }
+    let [q0, q1] = pcurve.domain().ok()?;
+    let (a, b) = (pcurve.evaluate(q0).ok()?, pcurve.evaluate(q1).ok()?);
+    let ([u0, u1], [v0, v1]) = (carrier.domain_u().ok()?, carrier.domain_v().ok()?);
+    let (circle, from, to) = if a.y.to_bits() == b.y.to_bits() && a.x != b.x && a.y >= v0 && a.y <= v1 {
+        (carrier.iso_curve_v(a.y).ok()?, a.x, b.x)
+    } else if a.x.to_bits() == b.x.to_bits() && a.y != b.y && a.x >= u0 && a.x <= u1 {
+        (carrier.iso_curve_u(a.x).ok()?, a.y, b.y)
+    } else {
+        return None;
+    };
+    let [c0, c1] = circle.domain().ok()?;
+    let reversed = to < from;
+    let circle = if reversed { circle.reversed().ok()? } else { circle };
+    let on_curve = |along: f64| if reversed { c0 + c1 - along } else { along };
+    let (lo, hi) = (on_curve(from), on_curve(to));
+    if !(hi > lo) {
+        return None;
+    }
+    let segment = super::support::extend_conic_ends(&circle, lo, hi).ok()?;
+    let [r0, r1] = segment.domain().ok()?;
+    let degree = segment.degree;
+    let mut knots = segment.knots.clone();
+    for knot in knots.iter_mut() {
+        *knot = ((*knot - r0) / (r1 - r0)).clamp(0.0, 1.0);
+    }
+    for knot in knots.iter_mut().take(degree + 1) {
+        *knot = 0.0;
+    }
+    let count = knots.len();
+    for knot in knots.iter_mut().skip(count - degree - 1) {
+        *knot = 1.0;
+    }
+    if rail.degree != degree || rail.knots != knots || rail.control_points.len() != segment.control_points.len() {
+        return None;
+    }
+    crate::blend::stations::net_bound(&rail.control_points, &segment.control_points)
+}
+
 /// Each shipped rail's worst distance from its carrier over ITS OWN window
 /// ([`shipped_window`]): both window ends exactly and the quarter points of
 /// every station span inside it, each against the carrier's EXTENSION
@@ -698,12 +778,26 @@ pub(in crate::blend) fn rails_on_shipped_windows(
     windows: [Option<[f64; 2]>; 2],
 ) -> (f64, [usize; 2]) {
     read_rail_windows([&rows.cr, &rows.cs], parameters, stations, carriers, windows,
-        rows.exact_extrusion && affine_reads_on(), None)
+        rows.exact_extrusion && affine_reads_on(), certified_rail_bounds(rows, carriers), None)
+}
+
+/// An exact revolution row's rails, bounded in closed form
+/// (`exact_revolution_read_bound`) when the reads lane is on: the standoff
+/// over any window is at most the bound.
+fn certified_rail_bounds(rows: &FittedRows, carriers: [&NurbsSurface; 2]) -> [Option<f64>; 2] {
+    if rows.revolution_axis.is_none() || !exact_revolution_reads_on() {
+        return [None, None];
+    }
+    [
+        exact_revolution_read_bound(&rows.cr, carriers[0], &rows.cr_pcurve),
+        exact_revolution_read_bound(&rows.cs, carriers[1], &rows.cs_pcurve),
+    ]
 }
 
 fn read_rail_windows(
     rails: [&NurbsCurve; 2], parameters: &[f64], stations: &[Station],
     carriers: [&NurbsSurface; 2], windows: [Option<[f64; 2]>; 2], affine: bool,
+    certified: [Option<f64>; 2],
     mut memo: Option<&mut RailFeet>,
 ) -> (f64, [usize; 2]) {
     let mut worst = 0.0_f64;
@@ -717,6 +811,17 @@ fn read_rail_windows(
             samples[side] += 2;
             if !worst.is_nan() && off > worst {
                 worst = off;
+            }
+            continue;
+        }
+        // An exact revolution row's rail: its net bound against the carrier's
+        // own circle (or the plane's image of its pcurve) is its standoff's
+        // bound over every window.
+        if let Some(bound) = certified[side] {
+            crate::blend::record_count("count.read.revolution_rails", 1);
+            samples[side] += 1;
+            if !worst.is_nan() && bound > worst {
+                worst = bound;
             }
             continue;
         }
@@ -775,6 +880,7 @@ pub(in crate::blend) struct RailWindowReader {
     parameters: Vec<f64>,
     stations: Vec<Station>,
     affine: bool,
+    certified: [Option<f64>; 2],
     feet: RailFeet,
 }
 
@@ -791,13 +897,13 @@ impl RailWindowReader {
             rails: [rows.cr.clone(), rows.cs.clone()],
             carriers: [carriers[0].clone(), carriers[1].clone()],
             parameters: parameters.to_vec(), stations: stations.to_vec(),
-            affine: rows.exact_extrusion && affine_reads_on(), feet: RailFeet::default(),
+            affine: rows.exact_extrusion && affine_reads_on(), certified: certified_rail_bounds(rows, carriers), feet: RailFeet::default(),
         }
     }
 
     pub(in crate::blend) fn read(&mut self, windows: [Option<[f64; 2]>; 2]) -> (f64, [usize; 2]) {
         read_rail_windows([&self.rails[0], &self.rails[1]], &self.parameters, &self.stations,
-            [&self.carriers[0], &self.carriers[1]], windows, self.affine, Some(&mut self.feet))
+            [&self.carriers[0], &self.carriers[1]], windows, self.affine, self.certified, Some(&mut self.feet))
     }
 }
 
@@ -1247,6 +1353,31 @@ pub(in crate::blend) fn build_open_surgery(
     ends: [EndPlan; 2],
     name: Option<&str>,
 ) -> Result<SewnStripe, KernelRefusal> {
+    build_open_surgery_with_tail(solid, result, take_id, edge, first, second, rows, ends, name, [None, None])
+}
+
+/// [`build_open_surgery`] for a stripe whose finish end rolled onto tangent
+/// neighbours (`crate::blend::rollover::stopped_end_tail`, switch, default
+/// off): after the pristine sewing, each rolled side's rail is split at its
+/// crossing vertex, the part past it and the cap's leg move from the mate's
+/// loop into the neighbour's — where they replace the run of the crossed
+/// tangent edge from the crossing to the sharp vertex, which is deleted —
+/// and the part past it gets its pcurve on the neighbour. The mate keeps the
+/// rail up to the crossing and the rest of the tangent edge. With no rolled
+/// side the sewing is exactly [`build_open_surgery`]'s.
+#[allow(clippy::too_many_arguments)]
+pub(in crate::blend) fn build_open_surgery_with_tail(
+    solid: &BrepSolid,
+    result: &mut BrepSolid,
+    take_id: &mut dyn FnMut() -> u64,
+    edge: &EdgeRecord,
+    first: &BlendMate,
+    second: &BlendMate,
+    rows: FittedRows,
+    ends: [EndPlan; 2],
+    name: Option<&str>,
+    tail: [Option<crate::blend::rollover::TailSplice<'_>>; 2],
+) -> Result<SewnStripe, KernelRefusal> {
     let [start_end, finish_end] = ends;
 
     // Trim the support rows to the crossing window.
@@ -1371,6 +1502,19 @@ pub(in crate::blend) fn build_open_surgery(
         // read once as shipped by the march trim's rule (`march_trim_stands`)
         // and kept; whatever does not stand takes the refit road below.
         if rows.revolution_axis.is_some() {
+            // Lane N row 4: the pair bounded in closed form stands without a
+            // sample (`exact_revolution_read_bound` on the UNCUT row and
+            // pcurve, whose restrictions to [a, b] these are: miss + standoff
+            // within three bounds).
+            if exact_revolution_reads_on() {
+                let cert_timing = crate::blend::BlendTimer::start("timing.surgery.trim.exact.cert_ms");
+                let bound = exact_revolution_read_bound(row, surface, pcurve);
+                cert_timing.stop();
+                if bound.is_some_and(|bound| 3.0 * bound <= crate::pcurve::PCURVE_REFINEMENT_TOLERANCE) {
+                    crate::blend::record_count("count.surgery.exact_revolution_trim_certified", 1);
+                    return Ok(Some((rail, interpolated)));
+                }
+            }
             let read_timing = crate::blend::BlendTimer::start("timing.surgery.trim.exact.read_ms");
             let read = crate::blend::track_fit::read_shipped_pcurve(surface, &|t| rail.evaluate(t), &interpolated, d0, d1);
             read_timing.stop();
@@ -2292,6 +2436,40 @@ pub(in crate::blend) fn build_open_surgery(
             identified.push((from, to));
         }
     }
+    // The stopped-end rollover's sides: the rail past the crossing and the
+    // cap's leg chain move onto the neighbours, and the end footprint is
+    // re-traced on every face it touches.
+    let mut cr_edge_id = cr_edge_id;
+    let mut cs_edge_id = cs_edge_id;
+    if tail.iter().any(Option::is_some) {
+        let EndPlan::Cap(cap) = &finish_end else {
+            return Err(KernelRefusal::unsupported(KernelStage::Sew, "stopped_end_rollover", "blend stopped-end rollover: the rolled stripe's finish end is not a cap, which is the only end this lane closes on the neighbours"));
+        };
+        let mut footprint = StoppedEndFootprint::default();
+        // The cap plane at the finish vertex: through the sharp vertex, normal
+        // the edge's tangent there; the fillet lies on the -tangent side.
+        {
+            let sharp = result.vertices.iter().find(|vertex| vertex.id == cap.sharp_vertex).map(|vertex| vertex.point)
+                .ok_or_else(|| KernelRefusal::internal(KernelStage::Sew, "stopped_end_rollover", "blend stopped-end rollover: the sharp vertex vanished"))?;
+            let d = edge.curve.derivatives(edge.t1, 1).or_refuse(KernelStage::Refine, "derivatives")?;
+            footprint.plane = (sharp, d[1].normalized().or_refuse(KernelStage::Refine, "normalized")?);
+            footprint.sharp_vertex = cap.sharp_vertex;
+        }
+        for (side, splice) in tail.into_iter().enumerate() {
+            let Some(splice) = splice else { continue };
+            let (mate, rail_edge_id, rim, sewn) = if side == 0 {
+                (first, cr_edge_id, w1b, sew_first.is_some())
+            } else {
+                (second, cs_edge_id, w2b, sew_second.is_some())
+            };
+            let Some(rail_edge_id) = rail_edge_id.filter(|_| !sewn) else {
+                return Err(KernelRefusal::unsupported(KernelStage::Sew, "stopped_end_rollover", "blend stopped-end rollover: a rolled side's rail collapsed or sewed onto an existing edge, which this lane does not split"));
+            };
+            let part_on_mate = roll_side_footprint(result, take_id, mate, &splice, rail_edge_id, rim, cap.sharp_vertex, &mut footprint)?;
+            if side == 0 { cr_edge_id = Some(part_on_mate); } else { cs_edge_id = Some(part_on_mate); }
+        }
+        retrace_stopped_end_footprint(result, take_id, footprint)?;
+    }
     Ok(SewnStripe {
         cr_edge_id,
         cs_edge_id,
@@ -2300,6 +2478,296 @@ pub(in crate::blend) fn build_open_surgery(
         snap,
         identified,
     })
+}
+
+/// A stopped-end rollover's footprint on the solid, gathered side by side
+/// and re-traced once ([`retrace_stopped_end_footprint`]).
+#[derive(Default)]
+struct StoppedEndFootprint {
+    /// The new boundary of the footprint, per face: (face, edge, from, to,
+    /// pcurve from -> to on that face).
+    pieces: Vec<(u64, u64, u64, u64, NurbsCurve)>,
+    /// The faces whose loops change: the mates and every face a piece lies on.
+    faces: Vec<u64>,
+    /// The cap plane: (sharp point, unit edge tangent at the vertex). The
+    /// fillet lies on the side opposite the tangent.
+    plane: (Vec3, Vec3),
+    sharp_vertex: u64,
+}
+
+/// One rolled side, after the pristine sewing: the rail is split at the
+/// crossing vertex (on the crossed tangent edge) and the tangent edge there;
+/// the pristine splice's rail far part and first leg piece leave the mate's
+/// loop (they belong to the neighbours), and the footprint's new boundary on
+/// the neighbours — the far part with its pcurve on the neighbour by
+/// projection, and the cap's leg chain — is recorded for the re-trace.
+/// Returns the rail part left on the mate.
+#[allow(clippy::too_many_arguments)]
+fn roll_side_footprint(
+    result: &mut BrepSolid,
+    take_id: &mut dyn FnMut() -> u64,
+    mate: &BlendMate,
+    splice: &crate::blend::rollover::TailSplice<'_>,
+    rail_edge_id: u64,
+    rim_vertex: u64,
+    sharp_vertex: u64,
+    footprint: &mut StoppedEndFootprint,
+) -> Result<u64, KernelRefusal> {
+    let what = "stopped_end_rollover";
+    let not_built = |message: String| KernelRefusal::unsupported(KernelStage::Sew, what, format!("blend stopped-end rollover: {message}"));
+    let _ = sharp_vertex;
+    let rolled = splice.rolled;
+    let crossing_vertex = take_id();
+    result.vertices.push(VertexRecord { id: crossing_vertex, point: rolled.point });
+    let rail_parts = crate::blend::rollover_surgery::split_edge_at_vertices(result, rail_edge_id, &[(crossing_vertex, rolled.point)], take_id)?;
+    let [rail_near, rail_far] = [rail_parts[0], rail_parts[1]];
+    let rail_far_edge = result.edges.iter().find(|edge| edge.id == rail_far).cloned()
+        .ok_or_else(|| KernelRefusal::internal(KernelStage::Sew, what, "blend stopped-end rollover: the rail's far part vanished"))?;
+    if rail_far_edge.end_vertex_id != rim_vertex {
+        return Err(not_built(format!("the rail's far part ends at vertex {} rather than the finish rim {rim_vertex}", rail_far_edge.end_vertex_id)));
+    }
+    // The crossed tangent edge, or the part of it the cap's leg chain left
+    // holding the crossing (the chain may have split it already).
+    let holds_crossing = |result: &BrepSolid, id: u64| -> Result<bool, KernelRefusal> {
+        let Some(edge) = result.edges.iter().find(|edge| edge.id == id) else { return Ok(false) };
+        let foot = crate::project_point_to_curve(&edge.curve, rolled.point).or_refuse(KernelStage::Refine, "project_point_to_curve")?;
+        Ok(foot.distance <= 1e-6 && foot.u > edge.t0.min(edge.t1) && foot.u < edge.t0.max(edge.t1))
+    };
+    let crossed = if result.edges.iter().any(|edge| edge.id == rolled.edge_id) {
+        rolled.edge_id
+    } else {
+        let candidates: Vec<u64> = result.edges.iter().map(|edge| edge.id).collect();
+        let mut found = None;
+        for id in candidates {
+            if holds_crossing(result, id)? {
+                found = Some(id);
+                break;
+            }
+        }
+        found.ok_or_else(|| not_built(format!("no part of tangent edge {} holds the crossing any more", rolled.edge_id)))?
+    };
+    crate::blend::rollover_surgery::split_edge_at_vertices(result, crossed, &[(crossing_vertex, rolled.point)], take_id)?;
+    // The neighbour's pcurve of the rail's far part, by projection.
+    let neighbour_surface = result
+        .shells
+        .iter()
+        .flat_map(|shell| &shell.faces)
+        .find(|face| face.id == rolled.neighbour_face_id)
+        .map(|face| face.surface.clone())
+        .ok_or_else(|| KernelRefusal::internal(KernelStage::Sew, what, "blend stopped-end rollover: the neighbour face vanished"))?;
+    let far_pcurve = {
+        const SAMPLES: usize = 24;
+        let [t0, t1] = [rail_far_edge.t0, rail_far_edge.t1];
+        let mut uvs = Vec::with_capacity(SAMPLES + 1);
+        let mut ts = Vec::with_capacity(SAMPLES + 1);
+        for k in 0..=SAMPLES {
+            let t = t0 + (t1 - t0) * k as f64 / SAMPLES as f64;
+            let point = rail_far_edge.curve.evaluate(t).or_refuse(KernelStage::Refine, "evaluate")?;
+            let projection = crate::project_point_to_surface(&neighbour_surface, point).or_refuse(KernelStage::Refine, "project_point_to_surface")?;
+            uvs.push(Vec3::new(projection.u, projection.v, 0.0));
+            ts.push(t);
+        }
+        // Clamped over the rail part's own parameter interval (the edge's).
+        crate::fit::interpolate_curve(&uvs, 3, &ts).or_refuse(KernelStage::Refine, "interpolate_curve")?
+    };
+    // The pristine splice's artefacts leave the mate's loop.
+    let leg_edge_id = splice.legs.first().map(|piece| piece.edge_id)
+        .ok_or_else(|| not_built("a rolled side has no cap leg".to_string()))?;
+    let mate_face = result
+        .shells
+        .iter_mut()
+        .flat_map(|shell| shell.faces.iter_mut())
+        .find(|face| face.id == mate.face.id)
+        .ok_or_else(|| KernelRefusal::internal(KernelStage::Sew, what, "blend stopped-end rollover: the mate face vanished"))?;
+    mate_face.loops[mate.loop_index].coedges.retain(|coedge| coedge.edge_id != rail_far && coedge.edge_id != leg_edge_id);
+    footprint.pieces.push((rolled.neighbour_face_id, rail_far, crossing_vertex, rim_vertex, far_pcurve));
+    for piece in &splice.legs {
+        footprint.pieces.push((piece.face_id, piece.edge_id, piece.from, piece.to, piece.pcurve.clone()));
+    }
+    for face_id in [mate.face.id, rolled.neighbour_face_id].into_iter().chain(splice.legs.iter().map(|piece| piece.face_id)) {
+        if !footprint.faces.contains(&face_id) {
+            footprint.faces.push(face_id);
+        }
+    }
+    Ok(rail_near)
+}
+
+/// Re-trace the footprint: an existing edge of an affected face whose both
+/// ends lie on the footprint's new boundary and whose midpoint lies on the
+/// fillet's side of the cap plane is INTERIOR to the footprint and deleted
+/// (F10: edge 46 between the crossing and the cap leg's exit, edge 68
+/// between its crossing and vertex 34); then every affected loop is traced
+/// afresh through its remaining coedges and the new pieces — each vertex
+/// of the new boundary has exactly one way on — the first closed trace
+/// keeping the loop, every further one its own face on the same carrier
+/// (F10: face 13's triangle beyond the cap plane).
+fn retrace_stopped_end_footprint(
+    result: &mut BrepSolid,
+    take_id: &mut dyn FnMut() -> u64,
+    footprint: StoppedEndFootprint,
+) -> Result<(), KernelRefusal> {
+    let what = "stopped_end_rollover";
+    let not_built = |message: String| KernelRefusal::unsupported(KernelStage::Sew, what, format!("blend stopped-end rollover: {message}"));
+    let (sharp_point, tangent) = footprint.plane;
+    let mut boundary_vertices: Vec<u64> = vec![footprint.sharp_vertex];
+    for (_, _, from, to, _) in &footprint.pieces {
+        for vertex in [*from, *to] {
+            if !boundary_vertices.contains(&vertex) {
+                boundary_vertices.push(vertex);
+            }
+        }
+    }
+    let piece_edges: Vec<u64> = footprint.pieces.iter().map(|piece| piece.1).collect();
+    // Interior edges, among those on the affected faces.
+    let mut interior: Vec<u64> = Vec::new();
+    for face in result.shells.iter().flat_map(|shell| &shell.faces).filter(|face| footprint.faces.contains(&face.id)) {
+        for coedge in face.loops.iter().flat_map(|lp| &lp.coedges) {
+            let Some(edge) = result.edges.iter().find(|edge| edge.id == coedge.edge_id) else { continue };
+            if piece_edges.contains(&edge.id) || interior.contains(&edge.id) {
+                continue;
+            }
+            if !(boundary_vertices.contains(&edge.start_vertex_id) && boundary_vertices.contains(&edge.end_vertex_id)) {
+                continue;
+            }
+            let mid = edge.curve.evaluate(0.5 * (edge.t0 + edge.t1)).or_refuse(KernelStage::Refine, "evaluate")?;
+            if mid.sub(sharp_point).dot(tangent) < 0.0 {
+                interior.push(edge.id);
+            }
+        }
+    }
+    if std::env::var("BREP_DEBUG_NETWORK").is_ok() {
+        eprintln!("stopped-end rollover: footprint faces {:?}, interior edges {:?}, boundary vertices {:?}", footprint.faces, interior, boundary_vertices);
+    }
+    let edge_ends: std::collections::HashMap<u64, (u64, u64)> = result.edges.iter().map(|edge| (edge.id, (edge.start_vertex_id, edge.end_vertex_id))).collect();
+    let mut new_faces: Vec<FaceRecord> = Vec::new();
+    // Face names the result uses (the app keys faces by name; this model
+    // already carries `_1` splits of its own): a remnant takes a free suffix.
+    let mut taken: Vec<String> = result.shells.iter().flat_map(|shell| &shell.faces).filter_map(|face| face.name.clone()).collect();
+    for face_id in footprint.faces.clone() {
+        let face = result
+            .shells
+            .iter_mut()
+            .flat_map(|shell| shell.faces.iter_mut())
+            .find(|face| face.id == face_id)
+            .ok_or_else(|| KernelRefusal::internal(KernelStage::Sew, what, format!("blend stopped-end rollover: face {face_id} vanished")))?;
+        let pieces: Vec<&(u64, u64, u64, u64, NurbsCurve)> = footprint.pieces.iter().filter(|piece| piece.0 == face_id).collect();
+        let mut rebuilt_loops: Vec<LoopRecord> = Vec::new();
+        for loop_record in &face.loops {
+            let touched = loop_record.coedges.iter().any(|coedge| interior.contains(&coedge.edge_id))
+                || loop_record.coedges.iter().any(|coedge| {
+                    edge_ends.get(&coedge.edge_id).is_some_and(|(a, b)| boundary_vertices.contains(a) || boundary_vertices.contains(b))
+                });
+            if !touched {
+                rebuilt_loops.push(loop_record.clone());
+                continue;
+            }
+            // Directed remaining coedges (direction fixed, with their place in
+            // the old loop) and undirected pieces.
+            let n = loop_record.coedges.len();
+            let mut remaining: Vec<(CoedgeRecord, u64, u64, usize)> = Vec::new();
+            for (index, coedge) in loop_record.coedges.iter().enumerate() {
+                if interior.contains(&coedge.edge_id) {
+                    continue;
+                }
+                let (start, end) = edge_ends.get(&coedge.edge_id).copied()
+                    .ok_or_else(|| KernelRefusal::internal(KernelStage::Sew, what, format!("blend stopped-end rollover: coedge {} names a missing edge {}", coedge.id, coedge.edge_id)))?;
+                let (from, to) = if coedge.forward { (start, end) } else { (end, start) };
+                remaining.push((coedge.clone(), from, to, index));
+            }
+            let mut loose: Vec<&(u64, u64, u64, u64, NurbsCurve)> = pieces.clone();
+            // Trace closed walks: start at a remaining coedge, follow the
+            // continuation at each vertex — the old loop's own successor when
+            // it is there (a periodic face's loop passes its seam vertex
+            // twice), else the unique way on.
+            while !remaining.is_empty() {
+                // Start on a coedge that is not a degenerate self-loop (a
+                // periodic face's pole edge runs from a vertex to itself).
+                let start_at = remaining.iter().position(|(_, from, to, _)| from != to).unwrap_or(0);
+                let (first, from0, to0, index0) = remaining.remove(start_at);
+                let mut walk: Vec<CoedgeRecord> = vec![first];
+                let mut at = to0;
+                let mut previous = index0;
+                let mut guard = 0usize;
+                loop {
+                    guard += 1;
+                    if guard > 4096 {
+                        return Err(not_built(format!("face {face_id}: the re-trace does not close")));
+                    }
+                    let mut next_remaining: Vec<usize> = remaining.iter().enumerate().filter(|(_, (_, from, _, _))| *from == at).map(|(k, _)| k).collect();
+                    let successor_is_start = (previous + 1) % n == index0;
+                    if at == from0 && (successor_is_start || next_remaining.is_empty()) {
+                        // Back at the start along the old loop's own order (a
+                        // seam vertex passed twice does not close it early).
+                        if at == from0 && successor_is_start {
+                            break;
+                        }
+                        if loose.iter().all(|piece| piece.2 != at && piece.3 != at) {
+                            break;
+                        }
+                    }
+                    if next_remaining.len() > 1 {
+                        if let Some(k) = next_remaining.iter().copied().find(|k| remaining[*k].3 == (previous + 1) % n) {
+                            next_remaining = vec![k];
+                        }
+                    }
+                    let next_pieces: Vec<usize> = loose.iter().enumerate().filter(|(_, piece)| piece.2 == at || piece.3 == at).map(|(k, _)| k).collect();
+                    match (next_remaining.len(), next_pieces.len()) {
+                        (1, 0) => {
+                            let (coedge, _, to, index) = remaining.remove(next_remaining[0]);
+                            walk.push(coedge);
+                            at = to;
+                            previous = index;
+                        }
+                        (0, 1) => {
+                            let piece = loose.remove(next_pieces[0]);
+                            let (edge_id, from, to, pcurve) = (piece.1, piece.2, piece.3, &piece.4);
+                            let (start, _) = edge_ends.get(&edge_id).copied()
+                                .ok_or_else(|| KernelRefusal::internal(KernelStage::Sew, what, format!("blend stopped-end rollover: footprint edge {edge_id} missing")))?;
+                            let along = from == at;
+                            let coedge_forward = if along { start == from } else { start == to };
+                            walk.push(CoedgeRecord {
+                                id: take_id(),
+                                edge_id,
+                                forward: coedge_forward,
+                                pcurve: if along { pcurve.clone() } else { pcurve.reversed().or_refuse(KernelStage::Refine, "reversed")? },
+                            });
+                            at = if along { to } else { from };
+                        }
+                        (r, p) => {
+                            return Err(not_built(format!("face {face_id}: vertex {at} has {} ways on ({r} boundary, {p} new), not one", r + p)));
+                        }
+                    }
+                }
+                rebuilt_loops.push(LoopRecord { id: if rebuilt_loops.is_empty() { loop_record.id } else { take_id() }, coedges: walk });
+            }
+            if !loose.is_empty() {
+                return Err(not_built(format!("face {face_id}: {} new boundary piece(s) joined no loop", loose.len())));
+            }
+        }
+        // The first loop keeps the face; every further closed trace of a
+        // touched loop is a face of its own on the same carrier.
+        let kept = rebuilt_loops.remove(0);
+        face.loops = vec![kept];
+        let surface = face.surface.clone();
+        let same_sense = face.same_sense;
+        let base_name = face.name.clone();
+        for extra in rebuilt_loops {
+            let name = base_name.as_ref().map(|base| {
+                (1..).map(|k| format!("{base}_{k}")).find(|candidate| !taken.contains(candidate)).expect("a free name")
+            });
+            if let Some(name) = &name {
+                taken.push(name.clone());
+            }
+            new_faces.push(FaceRecord { id: take_id(), surface: surface.clone(), same_sense, loops: vec![extra], name });
+        }
+    }
+    if !new_faces.is_empty() {
+        let shell_index = result.shells.iter().position(|shell| !shell.faces.is_empty())
+            .ok_or_else(|| KernelRefusal::internal(KernelStage::Sew, what, "blend stopped-end rollover: no shell"))?;
+        result.shells[shell_index].faces.extend(new_faces);
+    }
+    result.edges.retain(|edge| !interior.contains(&edge.id));
+    Ok(())
 }
 
 /// Swap the two parameters of a face: the surface's control net, every
@@ -2353,5 +2821,6 @@ pub(in crate::blend) fn prune_orphan_vertices(result: &mut BrepSolid) {
 fn cs_blend_pcurve_reversed(cs_domain: &[f64; 2]) -> Result<NurbsCurve, KernelRefusal> {
     crate::sweep_topology::parameter_line(cs_domain[1], 1.0, cs_domain[0], 1.0).or_refuse(KernelStage::Refine, "parameter_line")
 }
+
 
 

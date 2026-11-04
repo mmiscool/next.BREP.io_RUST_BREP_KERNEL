@@ -163,14 +163,7 @@ fn section_symmetry(
         return Ok(vec![0]);
     }
     let rotate = |point: Vec3, angle: f64| {
-        let offset = point.sub(axis_point);
-        let (sin, cos) = angle.sin_cos();
-        axis_point.add(
-            offset
-                .scale(cos)
-                .add(axis.cross(offset).scale(sin))
-                .add(axis.scale(axis.dot(offset) * (1.0 - cos))),
-        )
+        axis_point.add(point.sub(axis_point).rotate_about(axis, angle))
     };
     'shift: for shift in 1..count {
         for index in 0..count {

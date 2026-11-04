@@ -191,9 +191,7 @@ pub(super) fn set_folders(db: &Db, folders: &FoldersRequest) -> Result<Value, Er
         saved.insert(repo.install_folder().into(), json!(path));
     }
     std::fs::create_dir_all(file.parent().unwrap()).map_err(Error::internal)?;
-    let temporary = file.with_extension(format!("{}.tmp", crate::auth::new_id()));
-    std::fs::write(&temporary, serde_json::to_vec(&saved).map_err(Error::internal)?).map_err(Error::internal)?;
-    std::fs::rename(&temporary, &file).map_err(Error::internal)?;
+    crate::db::write_atomic(&file, serde_json::to_vec(&saved).map_err(Error::internal)?).map_err(Error::internal)?;
     libraries(db)
 }
 

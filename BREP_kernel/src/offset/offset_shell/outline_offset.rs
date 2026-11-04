@@ -61,7 +61,9 @@ fn length(a: P2) -> f64 {
     dot(a, a).sqrt()
 }
 fn unit(a: P2) -> P2 {
-    scale(a, 1.0 / length(a))
+    let magnitude = length(a);
+    if magnitude == 0.0 { return [0.0, 0.0]; }
+    scale(a, 1.0 / magnitude)
 }
 
 /// A free-form outline edge in the plane's frame: its curve with every
@@ -256,15 +258,7 @@ impl PlaneFrame {
 
 /// The circle through three points, or `None` when they are collinear.
 fn circle_through(a: P2, b: P2, c: P2) -> Option<(P2, f64)> {
-    let d = 2.0 * (a[0] * (b[1] - c[1]) + b[0] * (c[1] - a[1]) + c[0] * (a[1] - b[1]));
-    if d.abs() <= 1e-300 {
-        return None;
-    }
-    let (aa, bb, cc) = (dot(a, a), dot(b, b), dot(c, c));
-    let centre = [
-        (aa * (b[1] - c[1]) + bb * (c[1] - a[1]) + cc * (a[1] - b[1])) / d,
-        (aa * (c[0] - b[0]) + bb * (a[0] - c[0]) + cc * (b[0] - a[0])) / d,
-    ];
+    let centre = crate::circumcenter_2d(a, b, c)?;
     Some((centre, length(sub(a, centre))))
 }
 
@@ -346,6 +340,7 @@ fn classify_edge(
 /// Intersections of two offset elements treated as whole lines and circles.
 fn intersections(first: &Element, second: &Element) -> Vec<P2> {
     let line_circle = |p: P2, d: P2, c: P2, r: f64| -> Vec<P2> {
+        if dot(d, d) == 0.0 { return Vec::new(); }
         let f = sub(p, c);
         let (b, cc) = (dot(f, d), dot(f, f) - r * r);
         let disc = b * b - cc;

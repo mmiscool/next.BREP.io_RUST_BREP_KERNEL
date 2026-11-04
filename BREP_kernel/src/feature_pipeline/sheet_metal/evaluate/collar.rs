@@ -31,13 +31,7 @@ pub(crate) fn circle_of_loop(loop_curves: &[crate::NurbsCurve]) -> Option<([f64;
         samples[samples.len() / 3],
         samples[2 * samples.len() / 3],
     );
-    let d = 2.0 * (p1[0] * (p2[1] - p3[1]) + p2[0] * (p3[1] - p1[1]) + p3[0] * (p1[1] - p2[1]));
-    if d.abs() < 1e-12 {
-        return None;
-    }
-    let sq = |p: [f64; 2]| p[0] * p[0] + p[1] * p[1];
-    let cx = (sq(p1) * (p2[1] - p3[1]) + sq(p2) * (p3[1] - p1[1]) + sq(p3) * (p1[1] - p2[1])) / d;
-    let cy = (sq(p1) * (p3[0] - p2[0]) + sq(p2) * (p1[0] - p3[0]) + sq(p3) * (p2[0] - p1[0])) / d;
+    let [cx, cy] = crate::circumcenter_2d(p1, p2, p3)?;
     let radius = ((p1[0] - cx).powi(2) + (p1[1] - cy).powi(2)).sqrt();
     if radius < 1e-9 {
         return None;

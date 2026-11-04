@@ -779,7 +779,7 @@ pub(super) fn edge_subcurve(edge: &EdgeRecord) -> Result<NurbsCurve, KernelRefus
             .split(edge.t1)
             .or_refuse(KernelStage::Intersect, "split")?
             .0;
-    } else if std::env::var("BREP_DEBUG_SUBRANGE").is_ok() && edge.t1 < domain[1] - epsilon {
+    } else if env_read!("BREP_DEBUG_SUBRANGE").is_some() && edge.t1 < domain[1] - epsilon {
         eprintln!("abnormal subrange skip in imprint edge_subcurve");
     }
     Ok(curve)
@@ -806,10 +806,14 @@ pub(super) fn parameter_tolerance(
     parameter: f64,
     tolerance: f64,
 ) -> Result<f64, KernelRefusal> {
-    let tangent = curve
-        .derivatives(parameter, 1)
-        .or_refuse(KernelStage::Intersect, "derivatives")?[1]
-        .length();
+    let tangent = if crate::curve::small_curve_derivatives_enabled() {
+        curve.derivatives_small(parameter, 1).or_refuse(KernelStage::Intersect, "derivatives")?[1].length()
+    } else {
+        curve
+            .derivatives(parameter, 1)
+            .or_refuse(KernelStage::Intersect, "derivatives")?[1]
+            .length()
+    };
     Ok(tolerance / tangent.max(1e-12))
 }
 
@@ -853,7 +857,14 @@ pub(super) fn curve_lies_on_surface(
     // grazing contact is not a shared section, and translating the operands
     // must not enlarge that geometric allowance.
     let carrier_tolerance = tolerance.max(1e-7);
-    for fraction in [0.0, 0.25, 0.5, 0.75, 1.0] {
+    // The quarter samples first, then — only for a curve every one of them
+    // admitted — the odd eighths. The quarters alone are exactly where a
+    // four-quadrant NURBS circle has its knots, so a circle that merely
+    // TOUCHES a surface at its four quadrant points read as lying on it:
+    // the 2026-11-01 report's cylinder rim, tangent to a NURBS Solid box
+    // cage at the four side midpoints and 0.89 off it at the corners, was
+    // exchanged whole onto the cage face and cut it into four false regions.
+    for fraction in [0.0, 0.25, 0.5, 0.75, 1.0, 0.125, 0.375, 0.625, 0.875] {
         let point = curve
             .evaluate(start + (end - start) * fraction)
             .or_refuse(KernelStage::Intersect, "evaluate")?;
@@ -1121,7 +1132,7 @@ pub(super) fn curve_spans_on_face(
 pub(super) fn curve_spans_after_whole_miss(
     curve: NurbsCurve, face: &FaceRecord, face_edges: &[&EdgeRecord], tolerance: f64,
 ) -> Result<Vec<NurbsCurve>, KernelRefusal> {
-    if std::env::var("BREP_LIES_ON_SPANS").as_deref() == Ok("0") {
+    if env_read!("BREP_LIES_ON_SPANS").as_deref() == Some("0") {
         return Ok(Vec::new());
     }
     let split_clock = profile_enabled().then(Instant::now);
@@ -1133,29 +1144,84 @@ pub(super) fn curve_spans_after_whole_miss(
     spans
 }
 
+/// The boundary edges' control hulls the span search reads, memoised for one
+/// imprint (2026-11-03). The search rebuilt every boundary
+/// edge's hull on every call (cookie-cutter: 465k rebuilds over 62k calls, 55
+/// of its 89 ms). Every caller passes edges borrowed from the imprint's two
+/// operand solids, which no stage mutates while the scope is open, so an
+/// edge's address names it; the entry also keeps the curve's control count and
+/// the bits of its first and last control point, and a mismatch recomputes. A
+/// hull is a pure function of the control points, so the served hull is the
+/// computed one; a hull that errors is never stored.
+pub(super) struct EdgeHullScope {
+    previous: Option<rustc_hash::FxHashMap<usize, ([u64; 9], Aabb)>>,
+}
+thread_local! {
+    static EDGE_HULLS: std::cell::RefCell<Option<rustc_hash::FxHashMap<usize, ([u64; 9], Aabb)>>> = const { std::cell::RefCell::new(None) };
+}
+impl EdgeHullScope {
+    pub(super) fn open(enabled: bool) -> Self {
+        let previous = EDGE_HULLS.with(|cell| std::mem::replace(&mut *cell.borrow_mut(), enabled.then(rustc_hash::FxHashMap::default)));
+        Self { previous }
+    }
+}
+impl Drop for EdgeHullScope {
+    fn drop(&mut self) {
+        EDGE_HULLS.with(|cell| *cell.borrow_mut() = self.previous.take());
+    }
+}
+pub(super) fn edge_hull_memo_enabled() -> bool {
+    switch!("BREP_IMPRINT_EDGE_HULL_MEMO", true)
+}
+fn control_hull(curve: &NurbsCurve) -> Result<Aabb, KernelRefusal> {
+    let points = curve
+        .control_points
+        .iter()
+        .map(|point| point.point())
+        .collect::<Result<Vec<_>, _>>()
+        .or_refuse(KernelStage::Intersect, "control point")?;
+    Ok(Aabb::from_points(points))
+}
+fn edge_control_hull(edge: &EdgeRecord) -> Result<Aabb, KernelRefusal> {
+    let controls = &edge.curve.control_points;
+    let guard = |controls: &[crate::Vec4]| -> [u64; 9] {
+        match (controls.first(), controls.last()) {
+            (Some(first), Some(last)) => [controls.len() as u64, first.x.to_bits(), first.y.to_bits(), first.z.to_bits(), first.w.to_bits(), last.x.to_bits(), last.y.to_bits(), last.z.to_bits(), last.w.to_bits()],
+            _ => [0; 9],
+        }
+    };
+    let key = edge as *const EdgeRecord as usize;
+    let stored = EDGE_HULLS.with(|cell| cell.borrow().as_ref().map(|memo| memo.get(&key).copied()));
+    let Some(stored) = stored else { return control_hull(&edge.curve) };
+    let mark = guard(controls);
+    if let Some((stored_mark, hull)) = stored {
+        if stored_mark == mark {
+            return Ok(hull);
+        }
+    }
+    let hull = control_hull(&edge.curve)?;
+    EDGE_HULLS.with(|cell| {
+        if let Some(memo) = cell.borrow_mut().as_mut() {
+            memo.insert(key, (mark, hull));
+        }
+    });
+    Ok(hull)
+}
+
 fn curve_spans_after_whole_miss_impl(
     curve: NurbsCurve, face: &FaceRecord, face_edges: &[&EdgeRecord], tolerance: f64,
 ) -> Result<Vec<NurbsCurve>, KernelRefusal> {
-    let hull = |curve: &NurbsCurve| -> Result<Aabb, KernelRefusal> {
-        let points = curve
-            .control_points
-            .iter()
-            .map(|point| point.point())
-            .collect::<Result<Vec<_>, _>>()
-            .or_refuse(KernelStage::Intersect, "control point")?;
-        Ok(Aabb::from_points(points))
-    };
     let [start, end] = curve.domain().or_refuse(KernelStage::Intersect, "domain")?;
     let split_tolerance = 2e-9f64.max((end - start) * KNOT_IDENTITY_TOL);
     let overlap_limit = tolerance.max(1e-5);
     const CROSSING_TOLERANCE: f64 = 1e-5;
     let start_point = curve.evaluate(start).or_refuse(KernelStage::Intersect, "evaluate")?;
     let end_point = curve.evaluate(end).or_refuse(KernelStage::Intersect, "evaluate")?;
-    let curve_hull = hull(&curve)?;
+    let curve_hull = control_hull(&curve)?;
     let mut crossings = Vec::new();
     for edge in face_edges {
         if edge.degenerate
-            || !curve_hull.intersects(hull(&edge.curve)?, CROSSING_TOLERANCE)
+            || !curve_hull.intersects(edge_control_hull(edge)?, CROSSING_TOLERANCE)
             || curve_overlaps_edge(&curve, edge, overlap_limit)?
         {
             continue;
@@ -1247,7 +1313,7 @@ pub(crate) enum IsoGate {
 /// with `BREP_FIT_CENSUS=1` compares every pair that then marches against the
 /// exact curve.
 pub(super) fn iso_gate() -> IsoGate {
-    if std::env::var("BREP_ISO_GATE_GEOMETRY").as_deref() == Ok("0") {
+    if env_read!("BREP_ISO_GATE_GEOMETRY").as_deref() == Some("0") {
         IsoGate::Count
     } else {
         IsoGate::Geometry

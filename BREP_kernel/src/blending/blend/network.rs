@@ -82,6 +82,9 @@ struct StripeRung {
     rows: FittedRows,
     parameters: Vec<f64>,
     stations: Vec<Station>,
+    /// The stations the march snapped onto the edge's vertices, start then
+    /// finish (the stopped-end rollover reads where the stripe's own end is).
+    vertex_indices: [usize; 2],
     dense: OpenDenseCentres,
     reading: OpenRungReading,
     rail_reader: Option<std::cell::RefCell<super::edge::RailWindowReader>>,
@@ -105,6 +108,9 @@ struct StripeMeasure {
     stationary_end: bool,
     wall_check: bool,
     exact_lane: bool,
+    /// The stations the march snapped onto the edge's vertices, start then
+    /// finish (the stopped-end rollover reads where the stripe's own end is).
+    vertex_indices: [usize; 2],
 }
 
 impl Stripe<'_> {
@@ -235,19 +241,8 @@ struct MixedStar {
 /// composition).
 const MIXED_STAR_DEFAULT: bool = true;
 
-thread_local! {
-    static MIXED_STAR_FOR_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
-}
-
 pub(crate) fn mixed_star_on() -> bool {
-    if let Some(forced) = MIXED_STAR_FOR_TEST.with(|forced| forced.get()) {
-        return forced;
-    }
-    match std::env::var("BREP_BLEND_MIXED_STAR").as_deref() {
-        Ok("0") | Ok("off") => false,
-        Ok("1") | Ok("on") => true,
-        _ => MIXED_STAR_DEFAULT,
-    }
+    switch!(live "BREP_BLEND_MIXED_STAR", MIXED_STAR_DEFAULT)
 }
 
 
@@ -589,19 +584,8 @@ pub(crate) fn is_reentrant_concave(refusal: &KernelRefusal) -> bool {
 /// one-ended concave-third end).
 const CONCAVE_MITER_DEFAULT: bool = true;
 
-thread_local! {
-    static CONCAVE_MITER_FOR_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
-}
-
 pub(crate) fn concave_miter_on() -> bool {
-    if let Some(forced) = CONCAVE_MITER_FOR_TEST.with(|forced| forced.get()) {
-        return forced;
-    }
-    match std::env::var("BREP_BLEND_CONCAVE_MITER").as_deref() {
-        Ok("0") | Ok("off") => false,
-        Ok("1") | Ok("on") => true,
-        _ => CONCAVE_MITER_DEFAULT,
-    }
+    switch!(live "BREP_BLEND_CONCAVE_MITER", CONCAVE_MITER_DEFAULT)
 }
 
 
@@ -619,19 +603,8 @@ pub(crate) fn concave_miter_on() -> bool {
 /// refusal either way).
 const CREASED_SEAM_DEFAULT: bool = true;
 
-thread_local! {
-    static CREASED_SEAM_FOR_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
-}
-
 pub(crate) fn creased_seam_on() -> bool {
-    if let Some(forced) = CREASED_SEAM_FOR_TEST.with(|forced| forced.get()) {
-        return forced;
-    }
-    match std::env::var("BREP_BLEND_CREASED_SEAM").as_deref() {
-        Ok("0") | Ok("off") => false,
-        Ok("1") | Ok("on") => true,
-        _ => CREASED_SEAM_DEFAULT,
-    }
+    switch!(live "BREP_BLEND_CREASED_SEAM", CREASED_SEAM_DEFAULT)
 }
 
 // BREP named hunk: end lcount234_creased_seam_join_20261016
@@ -1695,8 +1668,18 @@ fn blend_star_network_building(
             // or fold probe (tautologies on an extrusion; the revolution lane
             // declines a wall that could fold before the rows are built).
             let probes_off = exact_lane || revolution.is_some();
-            let certified = if exact_lane && !chamfer && poles == [false, false] && bounded_ends == [false, false] {
-                super::stations::analytic_network::construct(edge, first, second, wall_radius, overshoot, ends)
+            let certified = if exact_lane && poles == [false, false] && bounded_ends == [false, false] {
+                if chamfer {
+                    super::stations::analytic_network::construct_chamfer(edge, first, second, wall_radius, overshoot, ends)
+                } else {
+                    super::stations::analytic_network::construct(edge, first, second, wall_radius, overshoot, ends)
+                }
+            } else if poles == [false, false] && bounded_ends == [false, false] {
+                revolution.and_then(|axis| if chamfer {
+                    super::stations::analytic_arc::construct_chamfer(edge, first, second, axis, wall_radius, overshoot, ends)
+                } else {
+                    super::stations::analytic_arc::construct(edge, first, second, axis, wall_radius, overshoot, ends)
+                })
             } else { None };
             let mut certified_rows = None;
             let mut certified_parameters = None;
@@ -1821,8 +1804,8 @@ fn blend_star_network_building(
                             1,
                         );
                     }
-                    if super::timing::enabled() && std::env::var_os("BREP_PROFILE").is_some() {
-                        eprintln!(
+                    if super::timing::enabled() && crate::profile::profile_enabled() {
+                        profile_line!(
                             "blend.stripe edge={} stations={station_count} overshoot={overshoot:.3} \
                              marched={} inserted={} march_ms={march_ms:.3} fit_ms={fit_ms:.3} exact={}",
                             edge.id,
@@ -1987,7 +1970,7 @@ fn blend_star_network_building(
             );
         }
         let accepted_now = accepts(&reading);
-        let rung = StripeRung { rows, parameters, stations, dense, reading, rail_reader };
+        let rung = StripeRung { rows, parameters, stations, vertex_indices, dense, reading, rail_reader };
         if accepted.is_none() {
             if accepted_now {
                 let met = !wall_check || meets_model(&rung.reading);
@@ -2061,7 +2044,7 @@ fn blend_star_network_building(
                 return Err(KernelRefusal::internal(KernelStage::Refine, "network_ladder", "blend network: the stripe ladder ended without a rung"));
             }
         };
-        let StripeRung { rows, parameters, stations, dense, reading, rail_reader } = rung;
+        let StripeRung { rows, parameters, stations, vertex_indices, dense, reading, rail_reader } = rung;
         super::record_count("count.stations_shipped", parameters.len() as u64);
         super::record_count("count.request_rungs", request_rungs as u64);
         if !ladder_accepted {
@@ -2096,6 +2079,7 @@ fn blend_star_network_building(
                 stationary_end,
                 wall_check,
                 exact_lane,
+                vertex_indices,
             },
             law: law.clone(),
             end_radius,
@@ -3599,6 +3583,11 @@ fn blend_star_network_building(
     }
 
     let mut pending_caps: Vec<PendingCap> = Vec::new();
+    // The stopped-end rollover (switch, default off): a stripe whose finish
+    // end the network CAPS and whose tracks left their carriers across
+    // tangent edges before the vertex rolls onto the neighbours there; its
+    // re-marched rows, crossings and cap leg chains, for its surgery.
+    let mut rolled_ends: Vec<Option<RolledEnd>> = (0..stripes.len()).map(|_| None).collect();
     let mut pending_tapers: Vec<super::taper_runout::PendingTaper> = Vec::new();
     // The (stripe index) of every end planned as a taper to a cusp.
     let mut taper_ends: Vec<usize> = Vec::new();
@@ -3810,16 +3799,46 @@ fn blend_star_network_building(
                             stripe.edge.id, boundary.id
                         )));
                     }
-                    let (plan, needs_validation) = plan_cap_end(
-                        solid,
-                        &mut result,
-                        &mut take_id,
-                        stripe,
-                        vertex,
-                        at_start,
-                        stripe.end_radius[slot],
-                        &mut pending_caps,
-                    )?;
+                    // The end the network caps: with the switch on, a finish
+                    // end whose tracks left their carriers rolls first.
+                    let rolled = if !at_start && super::stopped_end_rollover_on() {
+                        plan_stopped_end_rollover(solid, stripe, chamfer)?
+                    } else {
+                        None
+                    };
+                    let (plan, needs_validation, chains) = match rolled {
+                        Some((rows, sides)) => {
+                            let outcome = plan_cap_end(
+                                solid,
+                                &mut result,
+                                &mut take_id,
+                                stripe,
+                                &rows,
+                                vertex,
+                                at_start,
+                                stripe.end_radius[slot],
+                                &mut pending_caps,
+                                [sides[0].as_ref(), sides[1].as_ref()],
+                            )?;
+                            rolled_ends[index] = Some(RolledEnd { rows, sides, chains: [Vec::new(), Vec::new()] });
+                            outcome
+                        }
+                        None => plan_cap_end(
+                            solid,
+                            &mut result,
+                            &mut take_id,
+                            stripe,
+                            &stripe.rows,
+                            vertex,
+                            at_start,
+                            stripe.end_radius[slot],
+                            &mut pending_caps,
+                            [None, None],
+                        )?,
+                    };
+                    if let Some(rolled) = rolled_ends[index].as_mut() {
+                        rolled.chains = chains;
+                    }
                     crossings.note(needs_validation || !tangent);
                     end_plans[index][slot] = Some(EndPlan::Cap(plan));
                 }
@@ -3871,7 +3890,8 @@ fn blend_star_network_building(
         // built a collapsed 5F/8E/5V miter 8.0e-4 off its closed form.
         let band = consumed_band(solid);
         let converted = converted_rows.iter().find(|(converted_index, _)| *converted_index == index).map(|(_, rows)| rows);
-        let stripe_rows: &FittedRows = converted.unwrap_or(&stripe.rows);
+        let rolled = rolled_ends[index].take();
+        let stripe_rows: &FittedRows = rolled.as_ref().map(|rolled| &rolled.rows).or(converted).unwrap_or(&stripe.rows);
         for (row, start, finish, which) in [
             (
                 &stripe_rows.cr,
@@ -3936,7 +3956,7 @@ fn blend_star_network_building(
             shipped_wall_report(stripe, spans, stripe.law.constant().unwrap_or(radius), solid)
         };
         report_timing.stop();
-        sewn.push(build_open_surgery(
+        sewn.push(build_open_surgery_with_tail(
             solid,
             &mut result,
             &mut take_id,
@@ -3946,6 +3966,13 @@ fn blend_star_network_building(
             rows,
             [start_plan, finish_plan],
             stripe.name.as_deref(),
+            match rolled.as_ref() {
+                Some(rolled) => [
+                    rolled.sides[0].as_ref().map(|side| super::rollover::TailSplice { rolled: side, legs: rolled.chains[0].clone() }),
+                    rolled.sides[1].as_ref().map(|side| super::rollover::TailSplice { rolled: side, legs: rolled.chains[1].clone() }),
+                ],
+                None => [None, None],
+            },
         )?);
         if let Some((reason, bar, measured, detail)) = report {
             let face_id = sewn[sewn.len() - 1].blend_face_id;
@@ -4016,8 +4043,8 @@ fn blend_star_network_building(
             .collect();
         let (face, reading) = build_ribbon_star_patch(&ribs, patch.center, patch.outward, patch.name.as_deref(), &mut take_id)?;
         super::record_count("count.ribbon_star_fills", 1);
-        if super::timing::enabled() && std::env::var_os("BREP_PROFILE").is_some() {
-            eprintln!(
+        if super::timing::enabled() && crate::profile::profile_enabled() {
+            profile_line!(
                 "blend.ribbon_star residual={:.3e} scale={:.3e} twist={:.3e}",
                 reading.cross_derivative_residual, reading.cross_derivative_scale, reading.twist_discrepancy
             );
@@ -4635,6 +4662,13 @@ fn blend_star_network_building(
     if collapse.changed() {
         check_collapse_closure(solid, &result)?;
     }
+    if let Ok(path) = std::env::var("BREP_DEBUG_NETWORK_DUMP") {
+        // Diagnostic: the sewn body before the gate, for an invalid-topology
+        // read (stopped-end rollover lane, 2026-11-02).
+        if let Ok(text) = serde_json::to_string(&result) {
+            let _ = std::fs::write(&path, text);
+        }
+    }
     let built = crossings.gate(result)?;
     gate_timing.stop();
     // Only a network that BUILT owes its reports. Each binds to its wall on
@@ -4923,8 +4957,11 @@ struct PendingCap {
     plane_normal: Vec3,
     /// (edge id, stored start vertex, stored end vertex)
     arc: (u64, u64, u64),
-    first_leg: (u64, u64, u64),
-    second_leg: (u64, u64, u64),
+    /// Each leg as a chain rim -> sharp vertex: one piece on the mate, or
+    /// (stopped-end rollover) a piece per neighbour face the cap plane
+    /// crosses on its way to the vertex.
+    first_leg: Vec<(u64, u64, u64)>,
+    second_leg: Vec<(u64, u64, u64)>,
     /// The bulkhead's outward normal must point along this (away from the
     /// stripe): the sliver's cross-section faces the continuing edge.
     outward: Vec3,
@@ -4935,24 +4972,159 @@ struct PendingCap {
 /// legs to the sharp vertex, and record the planar bulkhead. The boolean
 /// requires validation when the curved-carrier construction was used.
 #[allow(clippy::too_many_arguments)]
+/// A stripe's stopped-end rollover: its re-marched rows, the crossing per
+/// side and the cap's leg chains (filled once the cap is planned).
+struct RolledEnd {
+    rows: FittedRows,
+    sides: [Option<super::rollover::RolledSide>; 2],
+    chains: [Vec<super::rollover::LegPiece>; 2],
+}
+
+/// The stopped-end rollover of `stripe`'s finish end (switch on, the end the
+/// network caps): `None` when no track leaves its carrier across a tangent
+/// edge before the vertex; else the rows refitted over the re-marched tail
+/// (`rollover::stopped_end_tail`), parameter points of the tail read on the
+/// mates' extensions, broken at the crossing stations, and the crossing per
+/// side with its row parameter.
+fn plan_stopped_end_rollover(
+    solid: &BrepSolid,
+    stripe: &Stripe,
+    chamfer: bool,
+) -> Result<Option<(FittedRows, [Option<super::rollover::RolledSide>; 2])>, KernelRefusal> {
+    let edge = stripe.edge;
+    let measure = &stripe.measure;
+    let radius = stripe.end_radius[1].abs().max(stripe.end_radius[0].abs());
+    let crossings = super::rollover::stopped_end_crossings(solid, &measure.stations, [&stripe.first, &stripe.second], radius, measure.vertex_indices)?;
+    if crossings.is_empty() {
+        return Ok(None);
+    }
+    let debug = std::env::var("BREP_DEBUG_NETWORK").is_ok();
+    if debug {
+        for crossing in &crossings {
+            eprintln!(
+                "stopped-end rollover: edge {} side {} leaves face {} across edge {} onto face {} between stations {:?} (vertex station {}) at ({:.6},{:.6},{:.6})",
+                edge.id, crossing.side, crossing.mate_face_id, crossing.edge_id, crossing.neighbour_face_id, crossing.stations, measure.vertex_indices[1],
+                crossing.point.x, crossing.point.y, crossing.point.z
+            );
+        }
+    }
+    let law = &stripe.law;
+    let radius_at = |t: f64| -> f64 {
+        match law.constant() {
+            Some(radius) => radius,
+            None => law.at_fraction((t - edge.t0) / (edge.t1 - edge.t0)),
+        }
+    };
+    let scale = super::stations::march_model_scale(&edge.curve, edge.t0, edge.t1, radius)?;
+    let mut rolled = super::rollover::stopped_end_tail(
+        solid, edge, [&stripe.first, &stripe.second], &radius_at, scale, &measure.stations, &measure.dense.station_ts, measure.vertex_indices, crossings,
+    )?;
+    // The row parameters are normalised chord fractions; the start end was
+    // planned on the stripe's rows, so the untouched stations keep their
+    // parameters exactly (the fit breaks at the crossing station, which
+    // leaves the rows before it bit-identical) and the domain ends past 1
+    // by the tail's change of length.
+    let parameters = station_parameters(&rolled.stations);
+    let ratio = match rolled.breaks.first() {
+        Some(&first_break) if first_break > 1 && parameters[first_break - 1] > 0.0 => measure.parameters[first_break - 1] / parameters[first_break - 1],
+        _ => 1.0,
+    };
+    for side in rolled.sides.iter_mut().flatten() {
+        side.row_parameter = parameters[side.station] * ratio;
+    }
+    // The rows' support pcurves stay on the MATES: a tail station's parameter
+    // point is read on the mate's extension (the surgery draws the tail's
+    // rail on the neighbour from the 3-D rail).
+    let mut on_mates = rolled.stations.clone();
+    for (side, mate) in [&stripe.first, &stripe.second].into_iter().enumerate() {
+        let Some(rolled_side) = &rolled.sides[side] else { continue };
+        for station in on_mates.iter_mut().skip(rolled_side.station) {
+            let point = if side == 0 { station.p1 } else { station.p2 };
+            let projection = crate::project_point_to_surface(&mate.face.surface, point).or_refuse(KernelStage::Refine, "project_point_to_surface")?;
+            if side == 0 { station.uv1 = [projection.u, projection.v]; } else { station.uv2 = [projection.u, projection.v]; }
+        }
+    }
+    let extrusion = law.constant().and_then(|_| extrusion_direction(edge, &stripe.first, &stripe.second));
+    let mut rows = fit_open_rows_breaking_at(&on_mates, &parameters, chamfer, Some(rolled.vertex_indices), extrusion, &rolled.breaks)?;
+    rows.vertex_stations = vertex_stations(&parameters, rolled.vertex_indices);
+    // The fit runs on normalised parameters; the rows are then reparameterised
+    // by `ratio` so the untouched stations keep the parameters the start end
+    // was planned with (affine knot maps change no geometry).
+    if (ratio - 1.0).abs() > 0.0 {
+        let scale_curve = |curve: &NurbsCurve| -> Result<NurbsCurve, KernelRefusal> {
+            NurbsCurve::new(curve.degree, curve.knots.iter().map(|knot| knot * ratio).collect(), curve.control_points.clone()).or_refuse(KernelStage::Refine, "NurbsCurve::new")
+        };
+        rows.cr = scale_curve(&rows.cr)?;
+        rows.cs = scale_curve(&rows.cs)?;
+        rows.cr_pcurve = scale_curve(&rows.cr_pcurve)?;
+        rows.cs_pcurve = scale_curve(&rows.cs_pcurve)?;
+        if let Some(center) = &rows.center {
+            rows.center = Some(scale_curve(center)?);
+        }
+        rows.surface = crate::NurbsSurface::new(
+            rows.surface.degree_u,
+            rows.surface.degree_v,
+            rows.surface.knots_u.iter().map(|knot| knot * ratio).collect(),
+            rows.surface.knots_v.clone(),
+            rows.surface.control_points.clone(),
+        ).or_refuse(KernelStage::Refine, "NurbsSurface::new")?;
+        rows.u_domain = [rows.u_domain[0] * ratio, rows.u_domain[1] * ratio];
+        rows.vertex_stations = rows.vertex_stations.map(|[a, b]| [a * ratio, b * ratio]);
+    }
+    if debug {
+        for (side, mate) in [&stripe.first, &stripe.second].into_iter().enumerate() {
+            let Some(rolled_side) = &rolled.sides[side] else { continue };
+            let neighbour = solid.shells.iter().flat_map(|shell| &shell.faces).find(|face| face.id == rolled_side.neighbour_face_id);
+            let row = if side == 0 { &rows.cr } else { &rows.cs };
+            let (a, b) = (parameters[rolled_side.station] * ratio, parameters[rolled.vertex_indices[1]] * ratio);
+            let (mut off_neighbour, mut off_mate) = (0.0f64, 0.0f64);
+            for k in 0..=20 {
+                let u = a + (b - a) * k as f64 / 20.0;
+                let point = row.evaluate(u).or_refuse(KernelStage::Refine, "evaluate")?;
+                if let Some(neighbour) = neighbour {
+                    off_neighbour = off_neighbour.max(crate::project_point_to_surface(&neighbour.surface, point).map(|p| p.distance).unwrap_or(f64::NAN));
+                }
+                off_mate = off_mate.max(crate::project_point_to_surface(&mate.face.surface, point).map(|p| p.distance).unwrap_or(f64::NAN));
+            }
+            eprintln!(
+                "stopped-end rollover: edge {} side {} tail rail over rows [{a:.6}, {b:.6}] ({} stations, {} in all, vertex station {}): {off_neighbour:.3e} off face {}, {off_mate:.3e} off mate {}",
+                edge.id, side, rolled.stations.len() - rolled_side.station, rolled.stations.len(), rolled.vertex_indices[1], rolled_side.neighbour_face_id, mate.face.id
+            );
+        }
+    }
+    Ok(Some((rows, rolled.sides)))
+}
+
+#[allow(clippy::too_many_arguments)]
 fn plan_cap_end(
     solid: &BrepSolid,
     result: &mut BrepSolid,
     take_id: &mut dyn FnMut() -> u64,
     stripe: &Stripe,
+    rows: &FittedRows,
     vertex: u64,
     at_start: bool,
     radius: f64,
     pending: &mut Vec<PendingCap>,
-) -> Result<(CapEnd, bool), KernelRefusal> {
+    tail: [Option<&super::rollover::RolledSide>; 2],
+) -> Result<(CapEnd, bool, [Vec<super::rollover::LegPiece>; 2]), KernelRefusal> {
+    // The carrier each leg is drawn on: the mate, or the neighbour the
+    // track rolled onto at a stopped end (the rim vertex lies there).
+    let face_by_id = |id: u64| -> Result<&FaceRecord, KernelRefusal> {
+        solid.shells.iter().flat_map(|shell| &shell.faces).find(|face| face.id == id)
+            .ok_or_else(|| KernelRefusal::internal(KernelStage::Refine, "cap_carrier", format!("blend network: cap carrier face {id} missing")))
+    };
+    let carriers: [&FaceRecord; 2] = [
+        match tail[0] { Some(rolled) => face_by_id(rolled.neighbour_face_id)?, None => stripe.first.face },
+        match tail[1] { Some(rolled) => face_by_id(rolled.neighbour_face_id)?, None => stripe.second.face },
+    ];
     let sharp_point = solid
         .vertices
         .iter()
         .find(|candidate| candidate.id == vertex)
         .ok_or(KernelRefusal::internal(KernelStage::Refine, "cap_vertex", "blend network: cap vertex missing"))?
         .point;
-    let station = stripe
-        .rows
+    let station = rows
         .vertex_stations
         .ok_or(KernelRefusal::internal(KernelStage::Refine, "vertex_stations", "blend network: stripe rows carry no vertex stations"))?[usize::from(!at_start)];
     if !(station > RIM_MARGIN && station < 1.0 - RIM_MARGIN) {
@@ -4962,10 +5134,9 @@ fn plan_cap_end(
             stripe.edge.id
         )));
     }
-    let first_point = stripe.rows.cr.evaluate(station).or_refuse(KernelStage::Refine, "evaluate")?;
-    let second_point = stripe.rows.cs.evaluate(station).or_refuse(KernelStage::Refine, "evaluate")?;
-    let center = stripe
-        .rows
+    let first_point = rows.cr.evaluate(station).or_refuse(KernelStage::Refine, "evaluate")?;
+    let second_point = rows.cs.evaluate(station).or_refuse(KernelStage::Refine, "evaluate")?;
+    let center = rows
         .center
         .as_ref()
         .ok_or(KernelRefusal::internal(KernelStage::Refine, "centre_path", "blend network: stripe rows carry no centre path"))?
@@ -4978,9 +5149,9 @@ fn plan_cap_end(
     let planar = [first_point, second_point, center].iter().all(|point| {
         point.sub(sharp_point).dot(normal).abs() <= 1e-5 * (1.0 + radius)
     });
-    let straight_legs = [(first_point, &stripe.first), (second_point, &stripe.second)]
-        .into_iter().all(|(point, mate)| {
-            crate::project_point_to_surface(&mate.face.surface, point.add(sharp_point).scale(0.5))
+    let straight_legs = [(first_point, carriers[0]), (second_point, carriers[1])]
+        .into_iter().all(|(point, carrier)| {
+            crate::project_point_to_surface(&carrier.surface, point.add(sharp_point).scale(0.5))
                 .is_ok_and(|projection| projection.distance <= 1e-6 * (1.0 + radius))
         });
     let section = if planar && straight_legs {
@@ -4999,7 +5170,7 @@ fn plan_cap_end(
                 "blend network: curved cap on a split continuous rim requires the tangent-chain lane",
             ));
         }
-        Some(cap::plane_section(stripe, sharp_point, normal, station, at_start)?)
+        Some(cap::plane_section(stripe, rows, sharp_point, normal, station, at_start, [tail[0].map(|_| carriers[0]), tail[1].map(|_| carriers[1])])?)
     };
     let (cr_parameter, cs_parameter, first_point, second_point) = match &section {
         Some(section) => (section.cr, section.cs, section.first, section.second),
@@ -5058,6 +5229,16 @@ fn plan_cap_end(
     } else {
         crate::sweep_topology::parameter_line(station, 1.0, station, 0.0).or_refuse(KernelStage::Refine, "parameter_line")?
     };
+    // A rolled side's leg is a chain over the neighbours (committed first:
+    // the closure below borrows the result); its first piece is what the
+    // stripe's surgery references as the leg.
+    let mut chains: [Vec<super::rollover::LegPiece>; 2] = [Vec::new(), Vec::new()];
+    if tail[0].is_some() {
+        chains[0] = cap::leg_chain(result, take_id, carriers[0].id, first_point, first_vertex, sharp_point, sharp_vertex, sharp_point, normal)?;
+    }
+    if tail[1].is_some() {
+        chains[1] = cap::leg_chain(result, take_id, carriers[1].id, second_point, second_vertex, sharp_point, sharp_vertex, sharp_point, normal)?;
+    }
     // Legs from rim to vertex. Keep the traced curves and pcurves on curved
     // carriers; the original straight-leg lane uses the projected endpoints.
     let mut leg = |rim_point: Vec3,
@@ -5086,8 +5267,17 @@ fn plan_cap_end(
         let b = crate::project_point_to_surface(&face.surface, sharp_point).or_refuse(KernelStage::Refine, "project_point_to_surface")?;
         Ok((id, crate::sweep_topology::parameter_line(a.u, a.v, b.u, b.v).or_refuse(KernelStage::Refine, "parameter_line")?))
     };
-    let first_leg = leg(first_point, first_vertex, stripe.first.face, section.as_ref().map(|s| &s.legs[0]))?;
-    let second_leg = leg(second_point, second_vertex, stripe.second.face, section.as_ref().map(|s| &s.legs[1]))?;
+    let first_leg = match chains[0].first() {
+        Some(piece) => (piece.edge_id, piece.pcurve.clone()),
+        None => leg(first_point, first_vertex, carriers[0], section.as_ref().and_then(|s| s.legs[0].as_ref()))?,
+    };
+    let second_leg = match chains[1].first() {
+        Some(piece) => (piece.edge_id, piece.pcurve.clone()),
+        None => leg(second_point, second_vertex, carriers[1], section.as_ref().and_then(|s| s.legs[1].as_ref()))?,
+    };
+    let chain_or = |chain: &[super::rollover::LegPiece], single: (u64, u64, u64)| -> Vec<(u64, u64, u64)> {
+        if chain.is_empty() { vec![single] } else { chain.iter().map(|piece| (piece.edge_id, piece.from, piece.to)).collect() }
+    };
     // The bulkhead plane's frame: u along first->second rim, v completing.
     let plane_u = second_point.sub(first_point).normalized().or_refuse(KernelStage::Refine, "normalized")?;
     let plane_v = normal.cross(plane_u).normalized().or_refuse(KernelStage::Refine, "normalized")?;
@@ -5097,8 +5287,8 @@ fn plan_cap_end(
         plane_v,
         plane_normal: normal,
         arc: (arc_edge_id, from_vertex, to_vertex),
-        first_leg: (first_leg.0, first_vertex, sharp_vertex),
-        second_leg: (second_leg.0, second_vertex, sharp_vertex),
+        first_leg: chain_or(&chains[0], (first_leg.0, first_vertex, sharp_vertex)),
+        second_leg: chain_or(&chains[1], (second_leg.0, second_vertex, sharp_vertex)),
         outward: normal.scale(-1.0),
         name: stripe.name.clone(),
     });
@@ -5115,6 +5305,7 @@ fn plan_cap_end(
             sharp_vertex,
         },
         section.is_some(),
+        chains,
     ))
 }
 
@@ -5132,8 +5323,8 @@ fn sew_cap(
     // back so the cap sits inside the patch's parameter square: the section
     // spans at most a few radii around the vertex.
     let reach = {
-        let a = vertex_point_of(result, cap.first_leg.1)?;
-        let b = vertex_point_of(result, cap.second_leg.1)?;
+        let a = vertex_point_of(result, cap.first_leg[0].1)?;
+        let b = vertex_point_of(result, cap.second_leg[0].1)?;
         a.sub(cap.plane_origin)
             .length()
             .max(b.sub(cap.plane_origin).length())
@@ -5163,10 +5354,10 @@ fn sew_cap(
     // ending at the arc's stored END, the arc reversed, then the other leg
     // back to the vertex.
     let (arc_id, arc_start, arc_end) = cap.arc;
-    let leg_to = |rim: u64| -> Result<(u64, u64, u64), KernelRefusal> {
-        for leg in [cap.first_leg, cap.second_leg] {
-            if leg.1 == rim {
-                return Ok(leg);
+    let leg_to = |rim: u64| -> Result<Vec<(u64, u64, u64)>, KernelRefusal> {
+        for leg in [&cap.first_leg, &cap.second_leg] {
+            if leg.first().is_some_and(|piece| piece.1 == rim) {
+                return Ok(leg.clone());
             }
         }
         Err(KernelRefusal::internal(KernelStage::Sew, "cap_leg", "blend network: cap leg for the rim is missing"))
@@ -5186,26 +5377,32 @@ fn sew_cap(
         NurbsCurve::new(edge.curve.degree, edge.curve.knots.clone(), mapped)
             .or_refuse(KernelStage::Refine, "new")
     };
-    let coedges = vec![
-        CoedgeRecord {
+    // Walk: vertex -> (leg_in's pieces, last to first, each reversed) -> arc
+    // end, the arc reversed, arc start -> (leg_out's pieces, first to last,
+    // forward) -> vertex.
+    let mut coedges = Vec::with_capacity(leg_in.len() + leg_out.len() + 1);
+    for piece in leg_in.iter().rev() {
+        coedges.push(CoedgeRecord {
             id: take_id(),
-            edge_id: leg_in.0,
+            edge_id: piece.0,
             forward: false,
-            pcurve: mapped_pcurve(leg_in.0)?.reversed().or_refuse(KernelStage::Refine, "reversed")?,
-        },
-        CoedgeRecord {
+            pcurve: mapped_pcurve(piece.0)?.reversed().or_refuse(KernelStage::Refine, "reversed")?,
+        });
+    }
+    coedges.push(CoedgeRecord {
+        id: take_id(),
+        edge_id: arc_id,
+        forward: false,
+        pcurve: mapped_pcurve(arc_id)?.reversed().or_refuse(KernelStage::Refine, "reversed")?,
+    });
+    for piece in &leg_out {
+        coedges.push(CoedgeRecord {
             id: take_id(),
-            edge_id: arc_id,
-            forward: false,
-            pcurve: mapped_pcurve(arc_id)?.reversed().or_refuse(KernelStage::Refine, "reversed")?,
-        },
-        CoedgeRecord {
-            id: take_id(),
-            edge_id: leg_out.0,
+            edge_id: piece.0,
             forward: true,
-            pcurve: mapped_pcurve(leg_out.0)?,
-        },
-    ];
+            pcurve: mapped_pcurve(piece.0)?,
+        });
+    }
     let plane_normal = plane.normal(0.5, 0.5).or_refuse(KernelStage::Refine, "normal")?;
     let same_sense = plane_normal.dot(cap.outward) > 0.0;
     let loop_id = take_id();
@@ -5333,19 +5530,8 @@ fn ladder_reach(edge: &EdgeRecord, corners: &[(u64, Vec<usize>, VertexKind<'_>)]
 /// on a test's own thread.
 const SHORT_RUNGS_DEFERRED_DEFAULT: bool = true;
 
-thread_local! {
-    static SHORT_RUNGS_DEFERRED_FOR_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
-}
-
 pub(in crate::blend) fn short_rungs_deferred_on() -> bool {
-    if let Some(forced) = SHORT_RUNGS_DEFERRED_FOR_TEST.with(|forced| forced.get()) {
-        return forced;
-    }
-    match std::env::var("BREP_BLEND_SHORT_RUNGS").as_deref() {
-        Ok("0") | Ok("off") => false,
-        Ok("1") | Ok("on") => true,
-        _ => SHORT_RUNGS_DEFERRED_DEFAULT,
-    }
+    switch!(live "BREP_BLEND_SHORT_RUNGS", SHORT_RUNGS_DEFERRED_DEFAULT)
 }
 
 
@@ -6217,6 +6403,10 @@ pub(in crate::blend) struct CarrierSeamSplit {
     rail_edge: u64,
     /// Parameter on the rail edge's own curve where it crosses the meridian.
     rail_parameter: f64,
+    // A capped rail can cross the seam while the vertex walk stays closed.
+    // These cap coedges move with its wrapped piece to the other seam image.
+    wrapped: Vec<usize>,
+    wrapped_before: bool,
 }
 
 /// The traversal endpoints of a coedge: its walk runs start -> end, which is
@@ -6346,6 +6536,11 @@ pub(in crate::blend) fn plan_carrier_seam_split(
         let breaks: Vec<usize> = (0..count)
             .filter(|&index| walks[index].1 != walks[(index + 1) % count].0)
             .collect();
+        if breaks.is_empty() {
+            if let Some(plan) = plan_capped_seam_split(result, rail_edges, face, loop_index, &walks, period)? {
+                return Ok(Some(CarrierSeamRepair::Split(plan)));
+            }
+        }
         // Each eaten seam end leaves two breaks. A split carrier can have
         // more than one such end in this loop; require every break to belong
         // to exactly one identifiable, double-used seam before repairing any.
@@ -6532,9 +6727,146 @@ pub(in crate::blend) fn plan_carrier_seam_split(
                         period,
                         rail_edge: edge.id,
                         rail_parameter: edge.t0 + (edge.t1 - edge.t0) * along,
+                        wrapped: Vec::new(),
+                        wrapped_before: false,
                     })));
                 }
             }
+        }
+    }
+    Ok(None)
+}
+
+/// A cap returns a rail to the original sharp vertex, so its loop stays
+/// connected even when the rail crosses a periodic seam. Move the short
+/// out-of-chart cap walk with the split rail, then re-foot the seam on the
+/// crossing. Only a newly built rail and a wholly wrapped adjacent walk are
+/// eligible; pre-existing crossings and walks crossing back are not repaired.
+fn plan_capped_seam_split(
+    result: &BrepSolid,
+    rail_edges: &[u64],
+    face: &FaceRecord,
+    loop_index: usize,
+    walks: &[(u64, u64)],
+    period: f64,
+) -> Result<Option<CarrierSeamSplit>, KernelRefusal> {
+    let coedges = &face.loops[loop_index].coedges;
+    let count = coedges.len();
+    let band = 1e-9 * period;
+    let endpoint = |coedge: &CoedgeRecord, end: bool| -> Result<f64, KernelRefusal> {
+        let [a, b] = coedge
+            .pcurve
+            .domain()
+            .or_refuse(KernelStage::Refine, "domain")?;
+        Ok(coedge
+            .pcurve
+            .evaluate(if end { b } else { a })
+            .or_refuse(KernelStage::Refine, "evaluate")?
+            .x)
+    };
+    for incoming in 0..count {
+        let seam_edge = coedges[incoming].edge_id;
+        if coedges.iter().filter(|ce| ce.edge_id == seam_edge).count() != 2 {
+            continue;
+        }
+        let outgoing = (0..count)
+            .find(|&i| i != incoming && coedges[i].edge_id == seam_edge)
+            .unwrap();
+        if walks[incoming].1 != walks[outgoing].0 {
+            continue;
+        }
+        let level_in = endpoint(&coedges[incoming], true)?;
+        let level_out = endpoint(&coedges[outgoing], false)?;
+        if ((level_in - level_out).abs() - period).abs() > band {
+            continue;
+        }
+        let mut meridians = true;
+        for (position, level) in [(incoming, level_in), (outgoing, level_out)] {
+            let (low, high) = pcurve_u_range(&coedges[position].pcurve)?;
+            meridians &= (low - level).abs() <= band && (high - level).abs() <= band;
+        }
+        if !meridians {
+            continue;
+        }
+        let lower = level_in.min(level_out);
+        let upper = level_in.max(level_out);
+        let mut path = Vec::new();
+        let mut i = (incoming + 1) % count;
+        while i != outgoing {
+            path.push(i);
+            i = (i + 1) % count;
+        }
+        for (offset, &position) in path.iter().enumerate() {
+            let coedge = &coedges[position];
+            if !rail_edges.contains(&coedge.edge_id) {
+                continue;
+            }
+            let start = endpoint(coedge, false)?;
+            let end = endpoint(coedge, true)?;
+            let outside = |u: f64| u < lower - band || u > upper + band;
+            let before = outside(start);
+            if before == outside(end) {
+                continue;
+            }
+            let level = if before { level_in } else { level_out };
+            let off = if before { start } else { end };
+            if (off - level).abs() >= period * 0.5 {
+                continue;
+            }
+            let wrapped = if before {
+                &path[..offset]
+            } else {
+                &path[offset + 1..]
+            };
+            if wrapped.is_empty() {
+                continue;
+            }
+            let mut eligible = true;
+            for &at in wrapped {
+                let (low, high) = pcurve_u_range(&coedges[at].pcurve)?;
+                eligible &= if off < level {
+                    high <= level + band && low > level - period * 0.5
+                } else {
+                    low >= level - band && high < level + period * 0.5
+                };
+            }
+            if !eligible {
+                continue;
+            }
+            let Some(q) = pcurve_u_crossing(&coedge.pcurve, level)? else {
+                continue;
+            };
+            let edge = result
+                .edges
+                .iter()
+                .find(|edge| edge.id == coedge.edge_id)
+                .ok_or(KernelRefusal::internal(
+                    KernelStage::Sew,
+                    "crossing_rail",
+                    "blend network: capped rail vanished",
+                ))?;
+            let [q0, q1] = coedge
+                .pcurve
+                .domain()
+                .or_refuse(KernelStage::Refine, "domain")?;
+            let walked = (q - q0) / (q1 - q0);
+            let along = if coedge.forward { walked } else { 1.0 - walked };
+            return Ok(Some(CarrierSeamSplit {
+                face_id: face.id,
+                loop_index,
+                crossing_position: position,
+                seam_in_position: incoming,
+                seam_out_position: outgoing,
+                seam_edge,
+                dangling_vertex: walks[incoming].1,
+                level_in,
+                level_out,
+                period,
+                rail_edge: edge.id,
+                rail_parameter: edge.t0 + (edge.t1 - edge.t0) * along,
+                wrapped: wrapped.to_vec(),
+                wrapped_before: before,
+            }));
         }
     }
     Ok(None)
@@ -6760,17 +7092,26 @@ pub(in crate::blend) fn apply_carrier_seam_split(
             rail.id, plan.level_in
         )));
     }
+    let wrapped: Vec<_> = plan.wrapped.iter().map(|&position| {
+        let mut coedge = loop_record.coedges[position].clone();
+        let shift = if plan.wrapped_before { plan.level_out - plan.level_in }
+                    else { plan.level_in - plan.level_out };
+        for control in &mut coedge.pcurve.control_points { control.x += shift * control.w; }
+        coedge
+    }).collect();
     let mut rebuilt = Vec::with_capacity(loop_record.coedges.len() + 1);
     for (position, coedge) in loop_record.coedges.iter().enumerate() {
-        if position == plan.crossing_position {
+        if position == plan.crossing_position || plan.wrapped.contains(&position) {
             continue;
         }
         if position == plan.seam_out_position {
+            if plan.wrapped_before { rebuilt.extend(wrapped.iter().cloned()); }
             rebuilt.push(arriving.clone());
         }
         rebuilt.push(coedge.clone());
         if position == plan.seam_in_position {
             rebuilt.push(leaving.clone());
+            if !plan.wrapped_before { rebuilt.extend(wrapped.iter().cloned()); }
         }
     }
     loop_record.coedges = rebuilt;
@@ -6938,3 +7279,4 @@ fn refine_seam_crossing(
         Ok(seed)
     }
 }
+

@@ -230,12 +230,8 @@ fn heal_operands_inner(solid: &mut BrepSolid, heal_tol: f64, model: f64) -> Resu
     }
 
     let mut parent: Vec<usize> = (0..n).collect();
-    fn find(parent: &mut Vec<usize>, mut x: usize) -> usize {
-        while parent[x] != x {
-            parent[x] = parent[parent[x]];
-            x = parent[x];
-        }
-        x
+    fn find(parent: &mut Vec<usize>, x: usize) -> usize {
+        crate::union_find::find_root(parent, x)
     }
 
     // Cap the fuse radius by a fraction of the shortest incident feature.
@@ -756,7 +752,7 @@ fn profiling_on() -> bool {
 
 /// `BREP_DEBUG_TRIM_REFIT_PROFILE` set (any value): open the scope profile.
 fn trim_refit_profiling() -> bool {
-    std::env::var_os("BREP_DEBUG_TRIM_REFIT_PROFILE").is_some()
+    debug_flag!(live "BREP_DEBUG_TRIM_REFIT_PROFILE")
 }
 
 /// Bit-exact identity of a pcurve: degree, knot bits and control-point bits.
@@ -2313,9 +2309,10 @@ fn unclamped_foot(surface: &crate::NurbsSurface, point: Vec3, hint: Option<[f64;
         }
         for _ in 0..ITERATIONS {
             iterations += 1;
-            let Ok(derivatives) = surface.derivatives_extended(u, v, 1) else { break };
-            let residual = derivatives[0][0].sub(point);
-            let (su, sv) = (derivatives[1][0], derivatives[0][1]);
+            // Same first partials and extension arithmetic, without allocating
+            // a Vec of Vecs at every Newton station.
+            let Ok((image, su, sv)) = surface.deriv1_extended(u, v) else { break };
+            let residual = image.sub(point);
             let (a, b, c) = (su.dot(su), su.dot(sv), sv.dot(sv));
             let (gu, gv) = (su.dot(residual), sv.dot(residual));
             let determinant = a * c - b * b;
@@ -2400,8 +2397,8 @@ fn finish_foot(surface: &crate::NurbsSurface, d: f64, u: f64, v: f64) -> Option<
     };
     let (du_out, dv_out) = (out(u, u0, u1, closed_u), out(v, v0, v1, closed_v));
     let (beyond_u, beyond_v) = if du_out > 0.0 || dv_out > 0.0 {
-        let derivatives = surface.derivatives_extended(u, v, 1).ok()?;
-        let (speed_u, speed_v) = (derivatives[1][0].length(), derivatives[0][1].length());
+        let (_, su, sv) = surface.deriv1_extended(u, v).ok()?;
+        let (speed_u, speed_v) = (su.length(), sv.length());
         if !(speed_u.is_finite() && speed_v.is_finite()) {
             return None;
         }
@@ -2411,5 +2408,6 @@ fn finish_foot(surface: &crate::NurbsSurface, d: f64, u: f64, v: f64) -> Option<
     };
     Some(ScopeFoot { distance: d, uv: [u, v], beyond_u, beyond_v })
 }
+
 
 

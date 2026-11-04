@@ -18,4 +18,6 @@ dependency:
 - **player**: the interactive HTML player. `player/player.html` is a trusted template,
   and `PlayerData` is its data format. A server serves the template and the data
   separately (`served_html`), and an offline copy inlines the data into one
-  self-contained file (`offline_html`).
+  self-contained file (`offline_html`). Beside the steps the data carries each step's
+  view PMI and the assembly's tree with a thumbnail per part, for the page's Model and
+  Parts tabs.

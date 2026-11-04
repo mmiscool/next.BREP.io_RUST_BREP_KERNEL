@@ -30,8 +30,7 @@ pub fn parameter_space_area(face: &FaceRecord) -> Result<f64, String> {
 /// reads every planar face's trim loops open again, as they were read before
 /// the closing chords, so the two readings are two cells of one binary.
 fn open_planar_loops() -> bool {
-    static OPEN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *OPEN.get_or_init(|| std::env::var_os("BREP_OPEN_PLANAR_LOOPS").is_some())
+    debug_flag!("BREP_OPEN_PLANAR_LOOPS")
 }
 
 /// Every straight uv chord that closes a trim loop of `face`: from where one
@@ -78,7 +77,7 @@ pub(super) fn loop_closing_chords(face: &FaceRecord) -> Result<Vec<(Vec3, Vec3)>
 pub(crate) fn closed_parameter_space_area(face: &FaceRecord) -> Result<f64, String> {
     let mut area = parameter_space_area(face)?;
     for (end, start) in loop_closing_chords(face)? {
-        area += 0.5 * (end.x * start.y - start.x * end.y);
+        area += 0.5 * (crate::polygon::area_term([end.x, end.y], [start.x, start.y]));
     }
     Ok(area)
 }
@@ -139,7 +138,7 @@ pub(crate) fn closed_parameter_space_area_on_carrier(face: &FaceRecord) -> Resul
             if image_here.sub(image_next).length() <= bar {
                 continue;
             }
-            area += 0.5 * (here.x * next.y - next.x * here.y);
+            area += 0.5 * (crate::polygon::area_term([here.x, here.y], [next.x, next.y]));
         }
     }
     Ok(area)
@@ -195,8 +194,7 @@ pub(super) const GAUSS_COUNT: usize = GAUSS_X.len();
 /// paired A/B timing of the two in ONE binary under ONE load — which is the
 /// only honest way to quote a speed-up on a box that runs eight agents.
 pub(super) fn tensor_blocks_on() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("BREP_MASS_TENSOR_BLOCK").as_deref() != Ok("0"))
+    switch!("BREP_MASS_TENSOR_BLOCK", true)
 }
 
 /// Accumulate every `kind` over ONE parameter cell by tensor Gauss–Legendre,
@@ -363,6 +361,40 @@ pub(super) fn integrate_untrimmed_multi(
                 &mut totals,
                 &mut rules,
             )?;
+        }
+    }
+    Ok(totals)
+}
+
+/// Every `kind` over the knot-span grid CLIPPED to `rectangle`
+/// (`[u_lo, u_hi, v_lo, v_hi]`, inside the domain): the untrimmed sweep's
+/// own rules on each cell's intersection with the rectangle, so a face whose
+/// single loop is an iso-rectangle (`polygons::iso_rectangle_trim`) is read
+/// without the trimmed route's chord polygons, cell quadtree and triangle
+/// cubature. Lane O, 2026-10-28: the filleted box's outward offset carried
+/// its quarter-cylinder image as such a face (the carrier extended past the
+/// walls, the trim v in [0.069, 0.931]) and the trimmed route spent 6.5 ms
+/// on 496 full cells and 31 744 stations for a one-span surface; this sweep
+/// reads it in a few stations per span.
+pub(super) fn integrate_iso_rectangle_multi(
+    face: &FaceRecord,
+    rectangle: [f64; 4],
+    kinds: &[Integrand],
+) -> Result<Vec<f64>, String> {
+    let (u_breaks, v_breaks) = surface_breaks(&face.surface)?;
+    let mut totals = vec![0.0f64; kinds.len()];
+    let mut rules = rule::SurfaceRules::new(&face.surface)?;
+    for upair in u_breaks.windows(2) {
+        let (u_lo, u_hi) = (upair[0].max(rectangle[0]), upair[1].min(rectangle[1]));
+        if u_hi <= u_lo {
+            continue;
+        }
+        for vpair in v_breaks.windows(2) {
+            let (v_lo, v_hi) = (vpair[0].max(rectangle[2]), vpair[1].min(rectangle[3]));
+            if v_hi <= v_lo {
+                continue;
+            }
+            integrate_cell_scaled(face, [u_lo, u_hi, v_lo, v_hi], 1.0, kinds, &mut totals, &mut rules)?;
         }
     }
     Ok(totals)

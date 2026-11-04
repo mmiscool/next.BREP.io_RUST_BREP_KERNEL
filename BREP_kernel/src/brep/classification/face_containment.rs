@@ -67,69 +67,44 @@ pub const COVERING_RIM_STRIP_SWITCH: &str = "BREP_COVERING_RIM_STRIP";
 /// off, does the same here. Read per query.
 pub const NO_SPHERE_CHART_TRIM_SWITCH: &str = "BREP_NO_SPHERE_CHART_TRIM";
 
-/// Whether a `"0"`-style lane switch is off: its environment value is exactly
-/// `"0"`.
-fn switched_off(name: &str) -> bool {
-    std::env::var(name).as_deref() == Ok("0")
-}
+// The lane switches below are `"0"`-style: each is off when its environment
+// value is exactly `"0"` (`switch!(.., true)`), read through its call
+// site's once-cell while `BREP_ENV_READ_ONCE` is on. They were read once
+// under `BREP_CONTAINMENT_SWITCHES_ONCE` (lane O row 18) until S1 folded that
+// table into `switch!`; only variables set before a process starts go
+// through it, so `NO_SPHERE_CHART_TRIM_SWITCH` and the debug flags stay live.
+
 
 /// Whether the wrapped-horizon lane sums each loop's parity over the query's
 /// period images (`true`, the default) or keeps the per-image combining
 /// (`false`, [`HORIZON_CROSS_FRAME_SWITCH`] = `"0"`). Read from the environment
 /// on every call, as the lane reads it on every query.
 pub fn horizon_cross_frame() -> bool {
-    !switched_off(HORIZON_CROSS_FRAME_SWITCH)
+    switch!(HORIZON_CROSS_FRAME_SWITCH, true)
 }
 
 /// Whether the sphere-chart lane may substitute for the generic scan's parity
 /// count: neither `BREP_NO_SPHERE_CHARTS` nor [`NO_SPHERE_CHART_TRIM_SWITCH`]
 /// is set. Read on every call.
 fn sphere_chart_trim_enabled() -> bool {
-    std::env::var("BREP_NO_SPHERE_CHARTS").is_err()
+    env_read!("BREP_NO_SPHERE_CHARTS").is_none()
         && std::env::var(NO_SPHERE_CHART_TRIM_SWITCH).is_err()
 }
 
 fn point_segment_distance(point: Vec2, start: Vec2, end: Vec2) -> f64 {
-    let segment = end.sub(start);
-    let length_squared = segment.dot(segment);
-    if length_squared <= 1e-30 {
-        return point.sub(start).length();
-    }
-    let parameter = (point.sub(start).dot(segment) / length_squared).clamp(0.0, 1.0);
-    point.sub(start.add(segment.scale(parameter))).length()
+    point.distance_to_segment(start, end, 1e-30)
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum PolygonClass {
-    Inside,
-    Outside,
-    Boundary,
-}
+pub use crate::polygon::PolygonClass;
 
 fn point_in_polygon(point: Vec2, polygon: &[Vec2], tolerance: f64) -> PolygonClass {
-    for index in 0..polygon.len() {
-        if point_segment_distance(point, polygon[index], polygon[(index + 1) % polygon.len()])
-            <= tolerance
-        {
-            return PolygonClass::Boundary;
-        }
-    }
-    let mut inside = false;
-    for index in 0..polygon.len() {
-        let a = polygon[index];
-        let b = polygon[(index + 1) % polygon.len()];
-        if (a.y > point.y) != (b.y > point.y) {
-            let crossing = a.x + (point.y - a.y) / (b.y - a.y) * (b.x - a.x);
-            if crossing > point.x {
-                inside = !inside;
-            }
-        }
-    }
-    if inside {
-        PolygonClass::Inside
-    } else {
-        PolygonClass::Outside
-    }
+    crate::polygon::classify(point, polygon, tolerance, 1e-30)
+}
+
+/// The even-odd half of [`point_in_polygon`]: whether a ray from `point`
+/// towards +x crosses `polygon` an odd number of times.
+fn polygon_parity_inside(point: Vec2, polygon: &[Vec2]) -> bool {
+    crate::polygon::parity_inside([point.x, point.y], polygon.len(), |i| [polygon[i].x, polygon[i].y])
 }
 
 
@@ -149,16 +124,16 @@ struct SegmentPrep {
 /// queries on one thread never answers from data prepared under the other.
 pub(crate) fn lane_switches() -> f64 {
     let mut bits = 0u32;
-    if switched_off(SEAM_BAND_MERGED_SWITCH) {
+    if !switch!(SEAM_BAND_MERGED_SWITCH, true) {
         bits |= 1;
     }
-    if switched_off(HORIZON_CONTAINMENT_SWITCH) {
+    if !switch!(HORIZON_CONTAINMENT_SWITCH, true) {
         bits |= 2;
     }
-    if switched_off(HORIZON_SINGLE_LOOP_SWITCH) {
+    if !switch!(HORIZON_SINGLE_LOOP_SWITCH, true) {
         bits |= 4;
     }
-    if switched_off(COVERING_RIM_STRIP_SWITCH) {
+    if !switch!(COVERING_RIM_STRIP_SWITCH, true) {
         bits |= 8;
     }
     bits as f64
@@ -232,8 +207,7 @@ const CHORD_INDEX_MAX_COORDINATE: f64 = 1e100;
 /// [`ChordIndex`]: `BREP_CONTAINMENT_INDEX=0` keeps the linear scans
 /// everywhere, for an A/B of the two in one build. Read once per process.
 fn chord_index_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| !switched_off("BREP_CONTAINMENT_INDEX"))
+    switch!("BREP_CONTAINMENT_INDEX", true)
 }
 
 /// A node of a [`ChordIndex`]: the exact box (the min and max of the samples,
@@ -501,12 +475,9 @@ impl ChordIndex {
                     for index in node.first as usize..node.last as usize {
                         let a = polygon[index];
                         let b = polygon[(index + 1) % polygon.len()];
-                        if (a.y > point.y) != (b.y > point.y) {
-                            let crossing = a.x + (point.y - a.y) / (b.y - a.y) * (b.x - a.x);
-                            if crossing > point.x {
-                                let parity = &mut odd[node.loop_index as usize];
-                                *parity = !*parity;
-                            }
+                        if crate::polygon::crosses_ray([point.x, point.y], [a.x, a.y], [b.x, b.y]) {
+                            let parity = &mut odd[node.loop_index as usize];
+                            *parity = !*parity;
                         }
                     }
                 }
@@ -561,8 +532,33 @@ fn linear_scan(
     // `(loop index, chord index, distance)` of the nearest chord, scanned in
     // loop order then chord order so a tie resolves as it always has.
     let mut nearest: Option<(usize, usize, f64)> = None;
+    let fused = fused_scan_enabled();
     for (loop_index, (samples, chords)) in generic.loops.iter().zip(&generic.segments).enumerate() {
         let polygon = &samples.polygon;
+        if fused {
+            // One distance per chord serves the boundary test and the nearest
+            // chord; `chords` holds one entry per polygon sample.
+            let mut on_boundary = false;
+            for index in 0..polygon.len() {
+                let distance = point_segment_distance(point, polygon[index], polygon[(index + 1) % polygon.len()]);
+                if distance <= tolerance {
+                    on_boundary = true;
+                }
+                if index < chords.len()
+                    && nearest
+                        .as_ref()
+                        .is_none_or(|(_, _, nearest_distance)| distance < *nearest_distance)
+                {
+                    nearest = Some((loop_index, index, distance));
+                }
+            }
+            if on_boundary {
+                boundary = true;
+            } else if polygon_parity_inside(point, polygon) {
+                crossings += 1;
+            }
+            continue;
+        }
         match point_in_polygon(point, polygon, tolerance) {
             PolygonClass::Boundary => boundary = true,
             PolygonClass::Inside => crossings += 1,
@@ -582,6 +578,17 @@ fn linear_scan(
     }
     (crossings, boundary, nearest)
 }
+
+/// FUSED SCAN (lane O row 24, 2026-10-29; on by default since the batch 6 promotion, `BREP_CONTAINMENT_FUSED_SCAN=0` restores the two passes).
+/// [`linear_scan`] measured every chord's distance twice, once in
+/// [`point_in_polygon`]'s boundary pass and once for the nearest chord; on the
+/// D2 outward shells that pair was most of the point-in-face query's own time.
+/// The fused pass computes each distance once and feeds both, then counts
+/// parity only off the boundary, as `point_in_polygon` does. Read once per process.
+fn fused_scan_enabled() -> bool {
+    switch!("BREP_CONTAINMENT_FUSED_SCAN", true)
+}
+
 
 /// The generic scan's `(odd loops, boundary, nearest chord)` for `point`, read
 /// as `scan` says. When the index answers, `odd loops` is not counted on a
@@ -735,29 +742,25 @@ thread_local! {
         }) };
 }
 
+impl crate::profile::Counters for ContainmentProfile {
+    fn armed(&self) -> bool {
+        self.enabled
+    }
+}
+
 fn containment_profile(update: impl FnOnce(&mut ContainmentProfile)) {
-    CONTAINMENT_PROFILE.with(|cell| {
-        let mut profile = cell.get();
-        if profile.enabled {
-            update(&mut profile);
-            cell.set(profile);
-        }
-    });
+    crate::profile::update(&CONTAINMENT_PROFILE, update)
 }
 
 fn containment_profile_started() -> Option<web_time::Instant> {
-    CONTAINMENT_PROFILE
-        .with(|cell| cell.get().enabled)
-        .then(web_time::Instant::now)
+    crate::profile::started(&CONTAINMENT_PROFILE)
 }
 
-fn containment_elapsed_ms(started: Option<web_time::Instant>) -> f64 {
-    started.map_or(0.0, |s| s.elapsed().as_secs_f64() * 1_000.0)
-}
+use crate::profile::elapsed_ms as containment_elapsed_ms;
 
 /// Arm the preparation counters (reset to zero) when `BREP_PROFILE` is set.
 pub(crate) fn containment_profile_begin() {
-    let enabled = std::env::var("BREP_PROFILE").is_ok();
+    let enabled = crate::profile::profile_enabled();
     CONTAINMENT_PROFILE.with(|cell| {
         cell.set(ContainmentProfile {
             enabled,
@@ -773,7 +776,7 @@ pub(crate) fn containment_profile_report(label: &str) {
     if !p.enabled {
         return;
     }
-    eprintln!(
+    profile_line!(
         "containment.profile {label} cache_misses={} seam_band: preps={} ms={:.2} sphere_cap: preps={} ms={:.2} horizon: preps={} ms={:.2} rim_strip: preps={} ms={:.2} generic: preps={} ms={:.2} chords={} index: builds={} ms={:.2} region: builds={} evaluate_ms={:.2} canonical_ms={:.2} segments_ms={:.2}",
         p.cache_misses, p.seam_band_preps, p.seam_band_ms, p.sphere_cap_preps, p.sphere_cap_ms,
         p.horizon_preps, p.horizon_ms, p.rim_strip_preps, p.rim_strip_ms, p.generic_preps,
@@ -844,7 +847,23 @@ thread_local! {
 /// caller), then the face's data in a fixed order, every count before the
 /// values it counts — handing each value to `visit` until it returns false.
 /// Returns whether every value was visited.
+/// Each coedge's SLOT: the flat index (loops in order, coedges in order) of
+/// the first coedge of this face that names the same edge. The prepared face
+/// reads an edge id only to see whether one face uses an edge twice (a slit,
+/// `build_sphere_region`), which is this pattern and not the id's value; the
+/// assembler renumbers every result's edges (`next_edge_id: 1`), so a key on
+/// the ids missed for every geometrically unchanged face of a running body
+/// (the elephant's fold: 167 misses of 167 uncut probes, 1.47 s of region
+/// builds, 2026-11-02). Keying and storing the slot instead
+/// serves the same prepared face, whose every lane reads the same pattern.
+fn coedge_slots(face: &FaceRecord) -> Vec<usize> {
+    let ids: Vec<u64> = face.loops.iter().flat_map(|record| record.coedges.iter().map(|coedge| coedge.edge_id)).collect();
+    ids.iter().enumerate().map(|(at, id)| ids[..at].iter().position(|earlier| earlier == id).unwrap_or(at)).collect()
+}
+
 fn walk_face_signature<F: FnMut(f64) -> bool>(face: &FaceRecord, switches: f64, visit: &mut F) -> bool {
+    let slots = coedge_slots(face);
+    let mut flat = 0usize;
     let surface = &face.surface;
     let point = |visit: &mut F, p: &crate::Vec4| visit(p.x) && visit(p.y) && visit(p.z) && visit(p.w);
     if !(visit(switches)
@@ -875,7 +894,9 @@ fn walk_face_signature<F: FnMut(f64) -> bool>(face: &FaceRecord, switches: f64, 
         }
         for coedge in &loop_record.coedges {
             let curve = &coedge.pcurve;
-            if !(visit(coedge.edge_id as f64)
+            let slot = slots[flat];
+            flat += 1;
+            if !(visit(slot as f64)
                 && visit(if coedge.forward { 1.0 } else { 0.0 })
                 && visit(curve.degree as f64)
                 && visit(curve.knots.len() as f64))
@@ -899,6 +920,8 @@ fn walk_face_signature<F: FnMut(f64) -> bool>(face: &FaceRecord, switches: f64, 
 /// whose signatures agree to the bit hash the same.
 fn face_key_hash(face: &FaceRecord, switches: f64) -> u64 {
     use std::hash::Hasher;
+    let slots = coedge_slots(face);
+    let mut flat = 0usize;
     let mut hasher = rustc_hash::FxHasher::default();
     let mut write = |value: f64| hasher.write_u64(value.to_bits());
     let surface = &face.surface;
@@ -918,7 +941,8 @@ fn face_key_hash(face: &FaceRecord, switches: f64) -> u64 {
         write(loop_record.coedges.len() as f64);
         for coedge in &loop_record.coedges {
             let curve = &coedge.pcurve;
-            write(coedge.edge_id as f64);
+            write(slots[flat] as f64);
+            flat += 1;
             write(if coedge.forward { 1.0 } else { 0.0 });
             write(curve.degree as f64);
             write(curve.knots.len() as f64);
@@ -962,6 +986,7 @@ fn cached_entry(
 pub(crate) fn forget_prepared_faces() {
     PREPARED_FACES.with(|cache| cache.borrow_mut().entries.clear());
 }
+
 
 /// `face`'s prepared data if a query on this thread prepared it and it is
 /// still cached, without touching the cache: a caller that only wants the
@@ -1082,7 +1107,7 @@ fn prepare_seam_band(face: &FaceRecord) -> Result<SeamBandPrep, String> {
     // polygon, and even-odd the query's period images against it. Gated on a
     // genuinely seam-crossing single loop on a doubly-periodic surface; every
     // other face falls through unchanged. Hatch: BREP_SEAM_BAND_MERGED=0.
-    if loops_uv.len() == 1 && !switched_off(SEAM_BAND_MERGED_SWITCH) {
+    if loops_uv.len() == 1 && switch!(SEAM_BAND_MERGED_SWITCH, true) {
         let coedges = &face.loops[retained[0]].coedges;
         let offsets = crate::topology::loop_seam_offsets(coedges, true, true, u_span, v_span)?;
         if offsets.iter().any(|o| o[0] != 0.0 || o[1] != 0.0) {
@@ -1259,7 +1284,7 @@ fn prepare_wrapped_horizon(face: &FaceRecord, prepared: &PreparedFace) -> Result
     if face.surface.closed_directions()? != (true, false) || face.loops.is_empty() {
         return Ok(None);
     }
-    if switched_off(HORIZON_CONTAINMENT_SWITCH) {
+    if !switch!(HORIZON_CONTAINMENT_SWITCH, true) {
         return Ok(None);
     }
     // SINGLE/DOUBLE-LOOP straddlers (t91's face 675: ONE loop drawn in-domain
@@ -1272,7 +1297,7 @@ fn prepare_wrapped_horizon(face: &FaceRecord, prepared: &PreparedFace) -> Result
     // only requires a non-empty loop set; non-straddling loops still bail to
     // the plain path unchanged. Escape hatch: BREP_HORIZON_SINGLE_LOOP=0
     // restores the old minimum.
-    if face.loops.len() <= 2 && switched_off(HORIZON_SINGLE_LOOP_SWITCH) {
+    if face.loops.len() <= 2 && !switch!(HORIZON_SINGLE_LOOP_SWITCH, true) {
         return Ok(None);
     }
     let [u0, u1] = face.surface.domain_u()?;
@@ -1602,7 +1627,7 @@ fn prepare_covering_rim_strip(face: &FaceRecord) -> Result<Option<RimStripPrep>,
     if face.surface.closed_directions()? != (true, false) || face.loops.len() != 2 {
         return Ok(None);
     }
-    if switched_off(COVERING_RIM_STRIP_SWITCH) {
+    if !switch!(COVERING_RIM_STRIP_SWITCH, true) {
         return Ok(None);
     }
     let [u0, u1] = face.surface.domain_u()?;
@@ -1757,6 +1782,8 @@ fn covering_rim_strip_point_in_face(
 /// (degree + 1) × 4` chords, the closed polygon per loop, and the chord
 /// parameters behind every polygon edge.
 fn prepare_generic(face: &FaceRecord, prepared: &PreparedFace) -> Result<GenericPrep, String> {
+    let slots = coedge_slots(face);
+    let mut flat = 0usize;
     let mut loops: Vec<LoopSamples> = Vec::with_capacity(face.loops.len());
     let mut segments: Vec<Vec<SegmentPrep>> = Vec::with_capacity(face.loops.len());
     let mut chord_count = 0;
@@ -1782,7 +1809,8 @@ fn prepare_generic(face: &FaceRecord, prepared: &PreparedFace) -> Result<Generic
                     parameter_end,
                 });
             }
-            coedges.push((coedge.edge_id, first, sample_count));
+            coedges.push((slots[flat] as u64, first, sample_count));
+            flat += 1;
             first += sample_count;
         }
         debug_assert_eq!(first, polygon.len());
@@ -1800,8 +1828,8 @@ fn prepare_generic(face: &FaceRecord, prepared: &PreparedFace) -> Result<Generic
 }
 
 /// One trim loop as [`parameter_point_in_face`] already sampled it: the closed
-/// polygon it counts parity against, plus `(edge id, first sample, sample count)`
-/// per coedge in loop order, which is all the spherical lane needs to drop a slit
+/// polygon it counts parity against, plus `(edge slot, first sample, sample count)`
+/// per coedge in loop order (`coedge_slots`), which is all the spherical lane needs to drop a slit
 /// and to rebuild the boundary as SEGMENTS rather than as one ring.
 struct LoopSamples {
     polygon: std::rc::Rc<Vec<Vec2>>,
@@ -1884,8 +1912,8 @@ fn build_sphere_region(
     // the trim never cut. It bounds no material, so it is left out of the region
     // rather than cancelled numerically afterwards.
     let mut uses: std::collections::HashMap<u64, usize> = std::collections::HashMap::new();
-    for coedge in face.loops.iter().flat_map(|record| record.coedges.iter()) {
-        *uses.entry(coedge.edge_id).or_insert(0) += 1;
+    for slot in coedge_slots(face) {
+        *uses.entry(slot as u64).or_insert(0) += 1;
     }
     // Boundary SEGMENTS, not one polyline per loop.
     //
@@ -1980,8 +2008,7 @@ fn sphere_chart_atlas(face: &FaceRecord) -> Option<crate::sphere_chart::SphereAt
 /// runs per ray-face intersection inside every boolean, so the cost when the
 /// trace is off must be one `OnceLock` read, not an environment lookup per exit.
 fn containment_trace_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("BREP_DEBUG_CONTAINMENT").is_ok())
+    debug_flag!("BREP_DEBUG_CONTAINMENT")
 }
 
 /// Name the lane that answered, under `BREP_DEBUG_CONTAINMENT`.  This function
@@ -2276,35 +2303,29 @@ fn point_in_face_scanned(
                 / (segment_length * segment_length))
                 .clamp(0.0, 1.0);
     let [domain_start, domain_end] = curve.domain()?;
-    let mut parameter = chord_parameter;
-    for _ in 0..12 {
-        let derivatives = curve.derivatives(parameter, 2)?;
-        let on_curve = Vec2 {
-            x: derivatives[0].x,
-            y: derivatives[0].y,
-        };
-        let tangent = Vec2 {
-            x: derivatives[1].x,
-            y: derivatives[1].y,
-        };
-        let second = Vec2 {
-            x: derivatives[2].x,
-            y: derivatives[2].y,
-        };
-        let residual = on_curve.sub(point);
-        let denominator = tangent.dot(tangent) + residual.dot(second);
-        if denominator.abs() < 1e-30 {
-            break;
+    let small = crate::curve::small_curve_derivatives_enabled();
+    let read = |parameter: f64, count: usize| -> Result<[Vec3; 3], String> {
+        if small {
+            return curve.derivatives_small(parameter, count);
         }
-        let step = -residual.dot(tangent) / denominator;
-        parameter = (parameter + step).clamp(domain_start, domain_end);
-        if step.abs() < 1e-14 * (domain_end - domain_start + 1.0) {
-            break;
-        }
-    }
+        let heap = curve.derivatives(parameter, count)?;
+        let mut grid = [Vec3::default(); 3];
+        grid[..heap.len()].copy_from_slice(&heap);
+        Ok(grid)
+    };
+    use crate::projection::{curve_foot_newton, CurveFootPolicy, FootDomain, FootMode};
+    let (parameter, _) = curve_foot_newton(curve, Vec3::new(point.x, point.y, 0.0),
+        chord_parameter, [domain_start, domain_end], CurveFootPolicy {
+            domain: FootDomain::Clamp,
+            iterations: 12,
+            slope_guard: 1e-30,
+            step_limit: f64::INFINITY,
+            parameter_tolerance: 1e-14 * (domain_end - domain_start + 1.0),
+            mode: FootMode::Planar,
+        })?;
     let margin = 1e-9 * (domain_end - domain_start);
     if parameter > domain_start + margin && parameter < domain_end - margin {
-        let derivatives = curve.derivatives(parameter, 1)?;
+        let derivatives = read(parameter, 1)?;
         let on_curve = Vec2 {
             x: derivatives[0].x,
             y: derivatives[0].y,
@@ -2332,3 +2353,5 @@ fn point_in_face_scanned(
     trace_lane(face, point, "parity (nearest curve declined)", parity);
     Ok(parity)
 }
+
+

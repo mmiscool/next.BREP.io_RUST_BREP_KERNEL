@@ -834,8 +834,34 @@ pub(crate) fn adaptive_coedge_error(
 thread_local! {
     static COEDGE_MEMO: std::cell::RefCell<Option<HashMap<Vec<u64>, Result<f64, String>>>> =
         const { std::cell::RefCell::new(None) };
+    // A bounded continuation of the same full-content readings across
+    // operations. A bore chain changes two cap faces but carries earlier
+    // bore walls unchanged; closing the operation scope used to discard
+    // every one of those expensive curved-coedge readings.
+    static RETAINED_COEDGE_READINGS: std::cell::RefCell<(HashMap<Vec<u64>, f64>, usize)> =
+        std::cell::RefCell::new((HashMap::default(), 0));
     /// Reads served from the memo and reads computed, in the open scope.
     static COEDGE_MEMO_COUNTS: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+const RETAINED_COEDGE_WORDS: usize = 1 << 20;
+const RETAINED_COEDGE_ENTRIES: usize = 4096;
+
+pub(crate) fn clear_coedge_readings() {
+    RETAINED_COEDGE_READINGS.with(|cache| *cache.borrow_mut() = (HashMap::default(), 0));
+}
+
+fn retain_coedge_reading(key: Vec<u64>, value: f64) {
+    if key.len() > RETAINED_COEDGE_WORDS { return; }
+    RETAINED_COEDGE_READINGS.with(|cache| {
+        let (map, words) = &mut *cache.borrow_mut();
+        if *words + key.len() > RETAINED_COEDGE_WORDS || map.len() >= RETAINED_COEDGE_ENTRIES {
+            map.clear();
+            *words = 0;
+        }
+        *words += key.len();
+        map.insert(key, value);
+    });
 }
 
 /// `BREP_VALIDATE_COEDGE_MEMO` (lane X): while a [`CoedgeMemoScope`] is open,
@@ -848,12 +874,13 @@ thread_local! {
 /// times (assembly, face merge, the closing check) and most coedges arrive at
 /// the later two unchanged. On by default; `0`/`off` disables it.
 pub(crate) fn coedge_memo_enabled() -> bool {
-    let enabled = !matches!(std::env::var("BREP_VALIDATE_COEDGE_MEMO").as_deref(), Ok("0") | Ok("off"));
-    enabled
+    switch!(live "BREP_VALIDATE_COEDGE_MEMO", true)
 }
 
 
-/// The memo's lifetime: one operation. Nested scopes share the outer one.
+/// The active memo's lifetime: one operation. Nested scopes share the outer
+/// one. Successful full-content readings also enter the bounded retention
+/// cache; errors remain local, and a closed/disabled scope consults neither.
 pub(crate) struct CoedgeMemoScope {
     opened: bool,
 }
@@ -879,8 +906,8 @@ impl Drop for CoedgeMemoScope {
         if self.opened {
             COEDGE_MEMO.with(|memo| *memo.borrow_mut() = None);
             let (hits, misses) = COEDGE_MEMO_COUNTS.with(|counts| counts.get());
-            if std::env::var_os("BREP_PROFILE").is_some() {
-                eprintln!("validate.coedge_memo hits={hits} misses={misses}");
+            if crate::profile::profile_enabled() {
+                profile_line!("validate.coedge_memo hits={hits} misses={misses}");
             }
         }
     }
@@ -923,8 +950,7 @@ fn coedge_memo_key(
 /// Only `validate`'s own per-coedge read takes it: every other caller of
 /// [`coedge_error_floored`] / [`adaptive_coedge_error`] keeps the sampler.
 pub(crate) fn exact_lines_enabled() -> bool {
-    let enabled = !matches!(std::env::var("BREP_VALIDATE_EXACT_LINES").as_deref(), Ok("0") | Ok("off"));
-    enabled
+    switch!("BREP_VALIDATE_EXACT_LINES", true)
 }
 
 
@@ -995,12 +1021,256 @@ pub(crate) fn exact_line_on_plane_error(
     Some(start.max(end))
 }
 
+/// An upper bound on the coedge error when the pcurve is an ISO-LINE of the
+/// carrier run at the edge's own parameter (lane O row 37); `None` sends the
+/// coedge to the sampler. The admitted class: a pcurve of degree 1 with two
+/// control points of equal weight, or one of any degree with equal weights
+/// whose running controls are its knots' Greville abscissae (it reads `q` at
+/// `q`, and its domain is the run), whose controls share one coordinate exactly
+/// (`v = c`, or `u = c`), its other coordinate running from the edge's start
+/// parameter to its end (`t0 → t1`, or `t1 → t0` for a reversed coedge) inside
+/// the carrier's domain; an edge curve with the carrier's degree and knots in
+/// that direction. Then the sampler compares, at each fraction, the carrier's
+/// iso-curve `I(s) = S(s, c)` with `C(s)` at the SAME parameter `s`. `I` is a
+/// rational curve on the same knots whose homogeneous controls are the net's
+/// rows blended by the basis at `c`; when its weights are the edge curve's
+/// (up to one common factor), `I − C = Σ R_i(s)(Q_i − P_i)` with `R_i` a
+/// partition of unity, so `max |Q_i − P_i|` bounds the error everywhere. A
+/// weight mismatch adds `4·δ·diameter` (δ the largest relative weight
+/// difference, bounded at 1e-12); anything larger declines.
+pub(crate) fn exact_iso_image_error(
+    surface: &NurbsSurface,
+    pcurve: &NurbsCurve,
+    curve: &NurbsCurve,
+    edge: &EdgeRecord,
+    forward: bool,
+) -> Option<f64> {
+    let weight = pcurve.control_points.first()?.w;
+    if pcurve.control_points.len() < 2 || !(weight > 0.0) || pcurve.control_points.iter().any(|control| control.w != weight) {
+        return None;
+    }
+    let points = pcurve.control_points.iter().map(|control| control.point().ok()).collect::<Option<Vec<_>>>()?;
+    let (a, b) = (points[0], points[points.len() - 1]);
+    // `along_u`: the iso-line is `v = c` and the run is in u.
+    let (along_u, constant, run) = if points.iter().all(|point| point.y == a.y) && a.x != b.x {
+        (true, a.y, (a.x, b.x))
+    } else if points.iter().all(|point| point.x == a.x) && a.y != b.y {
+        (false, a.x, (a.y, b.y))
+    } else {
+        return None;
+    };
+    // The running coordinate is affine in the pcurve's parameter: a straight
+    // two-point pcurve (any knots), or one of any degree whose running controls
+    // are its own knots' Greville abscissae with equal weights, so that it reads
+    // `q` at `q` (linear precision) and the run is the pcurve's own domain
+    // (`imprint::support::iso_line_pcurve`'s form).
+    let linear = pcurve.degree == 1 && points.len() == 2 && pcurve.knots.len() == 4;
+    let run = if linear {
+        run
+    } else {
+        let degree = pcurve.degree;
+        if degree == 0 || pcurve.knots.len() != points.len() + degree + 1 {
+            return None;
+        }
+        for (index, point) in points.iter().enumerate() {
+            let greville = pcurve.knots[index + 1..=index + degree].iter().sum::<f64>() / degree as f64;
+            if (if along_u { point.x } else { point.y }) != greville {
+                return None;
+            }
+        }
+        let [q0, q1] = pcurve.domain().ok()?;
+        (q0, q1)
+    };
+    let (run_knots, run_degree, other_knots, other_degree) = if along_u {
+        (&surface.knots_u, surface.degree_u, &surface.knots_v, surface.degree_v)
+    } else {
+        (&surface.knots_v, surface.degree_v, &surface.knots_u, surface.degree_u)
+    };
+    if curve.degree != run_degree || &curve.knots != run_knots {
+        return None;
+    }
+    let expected = if forward { (edge.t0, edge.t1) } else { (edge.t1, edge.t0) };
+    if run.0 != expected.0 || run.1 != expected.1 {
+        return None;
+    }
+    let run_vector = crate::KnotVector::new(run_knots.clone(), run_degree).ok()?;
+    let [r0, r1] = run_vector.domain();
+    let (low, high) = (run.0.min(run.1), run.0.max(run.1));
+    if !(low >= r0 && high <= r1) {
+        return None;
+    }
+    let other = crate::KnotVector::new(other_knots.clone(), other_degree).ok()?;
+    let [o0, o1] = other.domain();
+    if !(constant >= o0 && constant <= o1) {
+        return None;
+    }
+    let span = other.find_span(constant);
+    let basis = other.basis_functions(span, constant);
+    let count = curve.control_points.len();
+    let rows = &surface.control_points;
+    let net_count = if along_u { rows.len() } else { rows.first()?.len() };
+    if net_count != count {
+        return None;
+    }
+    let mut controls = Vec::with_capacity(count);
+    for index in 0..count {
+        let mut blended = crate::Vec4 { x: 0.0, y: 0.0, z: 0.0, w: 0.0 };
+        for (offset, weight) in basis.iter().enumerate() {
+            let other_index = span - other_degree + offset;
+            let control = if along_u { *rows.get(index)?.get(other_index)? } else { *rows.get(other_index)?.get(index)? };
+            blended = blended.add(control.scale(*weight));
+        }
+        if !(blended.w > 0.0) {
+            return None;
+        }
+        controls.push(blended);
+    }
+    let factor = controls[0].w / curve.control_points[0].w;
+    if !(factor > 0.0) {
+        return None;
+    }
+    let mut weight_defect = 0.0f64;
+    let mut gap = 0.0f64;
+    let mut diameter = 0.0f64;
+    let first = curve.control_points[0].point().ok()?;
+    for (iso, own) in controls.iter().zip(&curve.control_points) {
+        if !(own.w > 0.0) {
+            return None;
+        }
+        weight_defect = weight_defect.max((iso.w / factor - own.w).abs() / own.w);
+        let (iso_point, own_point) = (iso.point().ok()?, own.point().ok()?);
+        gap = gap.max(iso_point.sub(own_point).length());
+        diameter = diameter.max(own_point.sub(first).length());
+    }
+    if weight_defect > 1e-12 {
+        return None;
+    }
+    Some(gap + 4.0 * weight_defect * diameter)
+}
+
+/// `BREP_VALIDATE_EXACT_IMAGES` (lane N, 2026-10-28): `validate` bounds a
+/// coedge on an affine plane in closed form when its pcurve is the plane's
+/// chart image of its edge curve (`exact_plane_image_error`). On by default;
+/// `0`/`off` sends it to the sampler.
+pub(crate) fn exact_images_enabled() -> bool {
+    switch!(live "BREP_VALIDATE_EXACT_IMAGES", true)
+}
+
+
+/// A bound on the coedge error when the pcurve is the affine plane's chart
+/// image of the edge curve, BY CONSTRUCTION: the carrier of degree 1 × 1 on a
+/// 2 × 2 net of equal weights with no parallelogram defect (an affine map
+/// `S(u, v) = P00 + ũ·(P10 − P00) + ṽ·(P01 − P00)`, `ũ`, `ṽ` the parameters
+/// normalised to the carrier's domain, the same map past it, which is what
+/// the sampler's `evaluate_extended` reads on a plane); the pcurve of the edge
+/// curve's degree and knots, bit for bit. The affine map commutes with the
+/// rational combination, so `S∘q` is the rational curve on the pcurve's bases
+/// whose homogeneous controls are the map's images of the pcurve's, and with
+/// identical bases the homogeneous control differences bound `|S∘q − c|`
+/// everywhere (positive weights: a partition of unity). The sampler compares
+/// `S(q(q0 + f·Δq))` with `c(t0 + f·Δt)` (forward) or `c(t1 − f·Δt)`: the
+/// parameters must correspond bit for bit — the pcurve's domain the edge's
+/// range forward, or its mirror in the curve's domain reversed (the curve then
+/// compared reversed). `None` for anything else, or a bound over
+/// `1e-10·(1 + scale)`: the sampler reads it.
+pub(crate) fn exact_plane_image_error(
+    surface: &NurbsSurface,
+    pcurve: &NurbsCurve,
+    curve: &NurbsCurve,
+    edge: &EdgeRecord,
+    forward: bool,
+) -> Option<f64> {
+    if pcurve.degree != curve.degree || pcurve.knots != curve.knots || pcurve.control_points.len() != curve.control_points.len() {
+        return None;
+    }
+    if surface.degree_u != 1
+        || surface.degree_v != 1
+        || surface.knots_u.len() != 4
+        || surface.knots_v.len() != 4
+        || surface.control_points.len() != 2
+        || surface.control_points.iter().any(|row| row.len() != 2)
+    {
+        return None;
+    }
+    let weight = surface.control_points[0][0].w;
+    if !(weight > 0.0) || surface.control_points.iter().flatten().any(|control| control.w != weight) {
+        return None;
+    }
+    let corner = |i: usize, j: usize| surface.control_points[i][j].point().ok();
+    let (p00, p01, p10, p11) = (corner(0, 0)?, corner(0, 1)?, corner(1, 0)?, corner(1, 1)?);
+    let defect = p11.sub(p10).sub(p01.sub(p00));
+    if defect.x != 0.0 || defect.y != 0.0 || defect.z != 0.0 {
+        return None;
+    }
+    let ([u0, u1], [v0, v1]) = (surface.domain_u().ok()?, surface.domain_v().ok()?);
+    if !(u1 > u0 && v1 > v0) {
+        return None;
+    }
+    let [q0, q1] = pcurve.domain().ok()?;
+    let [c0, c1] = curve.domain().ok()?;
+    let (t0, t1) = (edge.t0, edge.t1);
+    let reference = if forward {
+        if q0.to_bits() != t0.to_bits() || q1.to_bits() != t1.to_bits() {
+            return None;
+        }
+        curve.clone()
+    } else {
+        // c(t1 − f·Δt) is the reversed curve's c(c0 + c1 − s) at
+        // s = c0 + c1 − t1 + f·Δt: the pcurve's domain must be that range.
+        if q0.to_bits() != (c0 + c1 - t1).to_bits() || q1.to_bits() != (c0 + c1 - t0).to_bits() {
+            return None;
+        }
+        let reversed = curve.reversed().ok()?;
+        if reversed.knots != pcurve.knots {
+            return None;
+        }
+        reversed
+    };
+    let (du, dv) = (p10.sub(p00), p01.sub(p00));
+    let mut image = Vec::with_capacity(pcurve.control_points.len());
+    for control in &pcurve.control_points {
+        if !(control.w > 0.0) {
+            return None;
+        }
+        let (u, v) = (control.x / control.w, control.y / control.w);
+        let point = p00.add(du.scale((u - u0) / (u1 - u0))).add(dv.scale((v - v0) / (v1 - v0)));
+        image.push(crate::Vec4 { x: point.x * control.w, y: point.y * control.w, z: point.z * control.w, w: control.w });
+    }
+    let bound = homogeneous_net_bound(&reference.control_points, &image)?;
+    let scale = [p00, p01, p10, p11].iter().fold(0f64, |m, p| m.max(p.length()));
+    (bound <= 1e-10 * (1.0 + scale)).then_some(bound)
+}
+
+/// For two rational curves on identical bases with positive weights: a bound
+/// on the distance between them everywhere, from the homogeneous control
+/// differences and the weights' floor.
+fn homogeneous_net_bound(a: &[crate::Vec4], b: &[crate::Vec4]) -> Option<f64> {
+    if a.len() != b.len() || a.is_empty() {
+        return None;
+    }
+    let origin = Vec3::new(a[0].x / a[0].w, a[0].y / a[0].w, a[0].z / a[0].w);
+    let mut floor = f64::INFINITY;
+    let (mut numerator, mut denominator, mut reach) = (0f64, 0f64, 0f64);
+    for (p, q) in a.iter().zip(b) {
+        if !(p.w > 0.0 && q.w > 0.0) {
+            return None;
+        }
+        floor = floor.min(p.w);
+        let ph = Vec3::new(p.x, p.y, p.z).sub(origin.scale(p.w));
+        let qh = Vec3::new(q.x, q.y, q.z).sub(origin.scale(q.w));
+        numerator = numerator.max(ph.sub(qh).length());
+        denominator = denominator.max((p.w - q.w).abs());
+        reach = reach.max(qh.length() / q.w);
+    }
+    let bound = (numerator + reach * denominator) / floor;
+    bound.is_finite().then_some(bound)
+}
+
 /// Lane R1 (granted 2026-10-18): the closed-form coedge reading of an
 /// iso-parameter line. On by default (promoted 2026-10-18 on the 98 + 144
 /// census); `BREP_VALIDATE_EXACT_ISO=0` (or `off`) sends it to the sampler.
 pub(crate) fn exact_iso_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| !matches!(std::env::var("BREP_VALIDATE_EXACT_ISO").as_deref(), Ok("0") | Ok("off")))
+    switch!("BREP_VALIDATE_EXACT_ISO", true)
 }
 
 
@@ -1057,11 +1327,30 @@ pub(crate) fn exact_iso_line_error(
     if start.to_bits() != from.to_bits() || end.to_bits() != to.to_bits() {
         return None;
     }
-    if iso.degree != curve.degree
-        || iso.knots.len() != curve.knots.len()
-        || iso.knots.iter().zip(&curve.knots).any(|(x, y)| x.to_bits() != y.to_bits())
-        || iso.control_points.len() != curve.control_points.len()
-    {
+    let matches = |iso: &NurbsCurve| {
+        iso.degree == curve.degree
+            && iso.knots.len() == curve.knots.len()
+            && iso.knots.iter().zip(&curve.knots).all(|(x, y)| x.to_bits() == y.to_bits())
+            && iso.control_points.len() == curve.control_points.len()
+    };
+    // Lane N (2026-10-28, with `exact_images_enabled`): an edge that is a
+    // trimmed piece of the iso curve — a blend row cut to its crossing window
+    // by two splits (`trim_row`: split at the low end, then at the high end) —
+    // is compared with the iso curve cut the same way, which reproduces it.
+    let iso = if !matches(&iso) && exact_images_enabled() {
+        let (low, high) = (from.min(to), from.max(to));
+        let [d0, d1] = iso.domain().ok()?;
+        let tail = if low == d0 { iso } else { iso.split(low).ok()?.1 };
+        let piece = if high == d1 { tail } else { tail.split(high).ok()?.0 };
+        if !matches(&piece) {
+            return None;
+        }
+        crate::blend::record_count("count.validate.exact_iso_piece", 1);
+        piece
+    } else {
+        iso
+    };
+    if !matches(&iso) {
         return None;
     }
     let size = iso
@@ -1104,6 +1393,12 @@ fn memoized_coedge_error(
             return Ok(error);
         }
     }
+    if exact_images_enabled() {
+        if let Some(error) = exact_plane_image_error(surface, pcurve, curve, edge, forward) {
+            crate::blend::record_count("count.validate.exact_image", 1);
+            return Ok(error);
+        }
+    }
     if COEDGE_MEMO.with(|memo| memo.borrow().is_none()) {
         return coedge_error_floored(surface, pcurve, curve, edge, forward, tolerance);
     }
@@ -1112,8 +1407,16 @@ fn memoized_coedge_error(
         COEDGE_MEMO_COUNTS.with(|counts| counts.set((counts.get().0 + 1, counts.get().1)));
         return hit;
     }
+    if let Some(value) = RETAINED_COEDGE_READINGS.with(|cache| cache.borrow().0.get(&key).copied()) {
+        COEDGE_MEMO_COUNTS.with(|counts| counts.set((counts.get().0 + 1, counts.get().1)));
+        COEDGE_MEMO.with(|memo| {
+            if let Some(map) = memo.borrow_mut().as_mut() { map.insert(key, Ok(value)); }
+        });
+        return Ok(value);
+    }
     COEDGE_MEMO_COUNTS.with(|counts| counts.set((counts.get().0, counts.get().1 + 1)));
     let read = coedge_error_floored(surface, pcurve, curve, edge, forward, tolerance);
+    if let Ok(value) = read { retain_coedge_reading(key.clone(), value); }
     COEDGE_MEMO.with(|memo| {
         if let Some(map) = memo.borrow_mut().as_mut() {
             map.insert(key, read.clone());
@@ -1147,8 +1450,7 @@ pub(crate) fn coedge_error_floored(
 /// over 1e-3, once per process (the floor runs per span of every coedge of
 /// every `validate()`, so the environment is not read per sample).
 fn coedge_floor_tracing() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("BREP_DEBUG_COEDGE_FLOOR").is_some())
+    debug_flag!("BREP_DEBUG_COEDGE_FLOOR")
 }
 
 /// `‖S(q(s)) − c(t(s))‖` at the midpoint of every knot span of `pcurve` and of
@@ -1472,8 +1774,8 @@ impl BrepSolid {
 }
 
 fn validate_memo_on() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| !matches!(std::env::var("BREP_VALIDATE_MEMO").as_deref(), Ok("0") | Ok("off")))
+    switch!("BREP_VALIDATE_MEMO", true)
 }
+
 
 

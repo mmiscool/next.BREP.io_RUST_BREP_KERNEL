@@ -30,7 +30,7 @@ impl JointProfile {
     }
     fn report(&self, replaced: usize) {
         if self.started.is_some() {
-            eprintln!("assemble.joints.profile replaced={replaced} stages_ms={:?}", self.ms);
+            profile_line!("assemble.joints.profile replaced={replaced} stages_ms={:?}", self.ms);
         }
     }
 }

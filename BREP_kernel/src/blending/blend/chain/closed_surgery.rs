@@ -946,7 +946,7 @@ pub(in crate::blend) fn signed_area(coedges: &[CoedgeRecord]) -> Result<f64, Ker
             let t = t0 + (t1 - t0) * index as f64 / SAMPLES as f64;
             let point = coedge.pcurve.evaluate(t).or_refuse(KernelStage::Refine, "evaluate")?;
             if let Some(before) = previous {
-                twice_area += before.x * point.y - point.x * before.y;
+                twice_area += crate::polygon::area_term([before.x, before.y], [point.x, point.y]);
             }
             previous = Some(point);
         }

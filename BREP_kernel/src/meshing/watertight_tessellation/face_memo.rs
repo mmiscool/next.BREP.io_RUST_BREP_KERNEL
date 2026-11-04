@@ -47,7 +47,7 @@ thread_local! {
 
 #[cfg(not(target_arch = "wasm32"))]
 fn enabled_from_env() -> bool {
-    !matches!(std::env::var("BREP_TESS_MEMO").as_deref(), Ok("0") | Ok("off"))
+    switch!(live "BREP_TESS_MEMO", true)
 }
 
 /// No env vars in the browser: the shipped wasm path keeps the memo on.
@@ -99,7 +99,42 @@ pub(in crate::watertight_tessellation) fn key(
             }
         }
     }
+    // The soundness scan's bounded mesh (`scan_mesh.rs`, default on) differs
+    // from the display mesh: tag its entries, and only those, so the default
+    // keys keep their bytes.
+    if super::scan_mesh::face_bound(face).is_some() {
+        lane.bool(true);
+    }
     lane.finish()
+}
+
+/// Diagnostic only: distinguish changed face inputs from changed boundary
+/// samples or tolerance when explaining a mesh-cache miss. Uses the existing
+/// per-face trace switch; no additional hashing runs in ordinary calls.
+pub(super) fn trace_key(face_id: u32, face: &FaceRecord, samples: &HashMap<u64, EdgeSamples>, chord: f64, key: [u64; 2]) {
+    let mut geometry = TwoLane::new();
+    hash_face(&mut geometry, face);
+    let geometry = geometry.finish();
+    let mut boundary = TwoLane::new();
+    for loop_record in &face.loops {
+        for coedge in &loop_record.coedges {
+            match samples.get(&coedge.edge_id) {
+                None => boundary.bool(false),
+                Some(edge) => {
+                    boundary.bool(true);
+                    boundary.floats(&edge.fractions);
+                    boundary.usize(edge.positions.len());
+                    for point in &edge.positions {
+                        boundary.f64(point.x); boundary.f64(point.y); boundary.f64(point.z);
+                    }
+                    boundary.f64(edge.worst_sag);
+                }
+            }
+        }
+    }
+    let boundary = boundary.finish();
+    eprintln!("tess.key face={face_id} geometry={:016x}{:016x} samples={:016x}{:016x} chord_bits={:016x} rule={} full={:016x}{:016x}",
+        geometry[0], geometry[1], boundary[0], boundary[1], chord.to_bits(), super::triangulate::ruling_seed_enabled(), key[0], key[1]);
 }
 
 /// The stored fragment under `key`, restamped with `face_id`.

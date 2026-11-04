@@ -250,10 +250,14 @@ impl RenderScene {
     /// display setting is overriding model colours", so this method needs to
     /// know about neither.
     ///
-    /// SKETCH sheets are skipped: their `color_override` is the synthesized
+    /// A SKETCH sheet's own `color_override` is the synthesized
     /// `crate::engine_state::SKETCH_SHEET_COLOR`, not a metadata colour, and
     /// re-deriving it from a store that has no record for the sheet would blank
-    /// it back to the global face colour.
+    /// it back to the global face colour — so it is left alone. The sketch's
+    /// `color` attribute (keyed by the sketch id, which is the sheet's name)
+    /// lands on the sheet's FACES instead: a face override wins over the
+    /// solid's colour, and clearing the attribute clears the face overrides,
+    /// which restores the synthesized sheet colour underneath.
     ///
     /// A changed solid's `revision` is bumped so the renderer re-uploads it —
     /// and ONLY when something actually changed. That no-op guarantee is
@@ -262,15 +266,19 @@ impl RenderScene {
     pub fn apply_metadata_colors(&mut self, lookup: impl Fn(&str) -> Option<[f32; 3]>) -> bool {
         let mut any = false;
         for solid in &mut self.solids {
-            if solid.is_sketch {
-                continue;
-            }
             let mut changed = false;
-            let want = lookup(&solid.name);
-            if solid.color_override != want {
-                solid.color_override = want;
-                changed = true;
-            }
+            // A sketch sheet keeps its synthesized base colour; its metadata
+            // colour reaches the display through the faces below.
+            let sheet_color = if solid.is_sketch {
+                lookup(&solid.name)
+            } else {
+                let want = lookup(&solid.name);
+                if solid.color_override != want {
+                    solid.color_override = want;
+                    changed = true;
+                }
+                None
+            };
             for face in &mut solid.faces {
                 // A section cap keeps the section colour its view gave it.
                 if face.kind == FaceKind::SectionCap {
@@ -282,7 +290,8 @@ impl RenderScene {
                     None
                 } else {
                     lookup(&face.name)
-                };
+                }
+                .or(sheet_color);
                 if face.color_override != want {
                     face.color_override = want;
                     changed = true;

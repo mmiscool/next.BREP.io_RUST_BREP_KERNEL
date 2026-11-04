@@ -168,12 +168,15 @@ pub(super) fn tessellate_faces_stride_keyed(
     if let Some(keys) = keys {
         *keys = face_keys.clone().unwrap_or_default();
     }
+    let scan_mesh = super::scan_mesh::active();
     let mesh_one = |index: usize, face_id: u32, face: &FaceRecord| -> Result<Mesh, String> {
+        let _scan_mesh = super::scan_mesh::ScanMeshScope::set(scan_mesh);
         // The content memo (`face_memo.rs`): a face meshed before under the
         // same carrier, trims, shared samples and chord is served its stored
         // fragment, restamped. A miss meshes as before and stores the result.
         let key = if memo { face_keys.as_ref().map(|keys| keys[index]) } else { None };
         if let Some(key) = key {
+            if face_lines { super::face_memo::trace_key(face_id, face, samples, chord_tolerance, key); }
             if let Some(fragment) = super::face_memo::lookup(key, face_id) {
                 if face_lines {
                     eprintln!(
@@ -210,7 +213,7 @@ pub(super) fn tessellate_faces_stride_keyed(
     let mesh = concatenate_meshes(fragments);
     if tess_profile_enabled() {
         let (hits, misses, entries, triangles) = super::face_memo::take_counts();
-        eprintln!("tess.memo enabled={memo} hits={hits} misses={misses} entries={entries} stored_tris={triangles}");
+        profile_line!("tess.memo enabled={memo} hits={hits} misses={misses} entries={entries} stored_tris={triangles}");
     }
     if armed_here.is_some() {
         profile::end(armed_here, chord_tolerance, mesh.indices.len() / 3);

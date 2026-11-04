@@ -128,6 +128,7 @@ fn collect_placements(
             inside_radius: hole_bend.inside_radius,
             k_factor: hole_bend.k_factor,
             child: child.clone(),
+            reliefs: Vec::new(),
         };
         let r_out = bend.mid_radius(thickness) + thickness * 0.5;
         placement.wedge_strips.push(WedgeStrip {
@@ -176,7 +177,7 @@ pub fn evaluate(tree: &SheetTree, fold: f64) -> Result<BrepSolid, String> {
     // assembly cannot join that contact, assemble all of its interfaces in
     // one arrangement, before intermediate edge coalescing changes a rim's
     // parameterization. Existing successful assemblies keep their topology.
-    let joint_parts = (fold.abs() >= 1e-9 && has_adjacent_bends(&tree.root))
+    let joint_parts = (fold.abs() >= 1e-9 && has_adjacent_bends(&tree.root) && adjacent_bend_fallback_allowed())
         .then(|| parts.clone());
     let mut solid = match union_all(parts, fold.abs() >= 1e-9) {
         Ok(solid) => solid,
@@ -208,8 +209,22 @@ pub fn evaluate(tree: &SheetTree, fold: f64) -> Result<BrepSolid, String> {
     // is idempotent (it re-derives the same `{faceA}|{faceB}[n]` names), so
     // unfold's output stays byte-identical.
     crate::feature_pipeline::features::common::stamp_derived_edge_names(&mut solid);
+    // A mirrored part carries the names Mirror gave its copy (`::{suffix}`).
+    for suffix in &tree.name_suffixes {
+        crate::feature_pipeline::features::common::namespace_copy_names(&mut solid, suffix);
+    }
     Ok(solid)
 }
+
+/// Whether [`evaluate`] may fall back to the one-arrangement assembly of an
+/// adjacent-bend tree. Always, outside the private tests: a test probing the
+/// SEQUENTIAL route alone (the thin-stock tangent-contact row, 2026-10-28)
+/// switches the fallback off on its thread so the sequential refusal is the
+/// verdict instead of the safety net's success.
+fn adjacent_bend_fallback_allowed() -> bool {
+    true
+}
+
 
 fn has_adjacent_bends(flat: &Flat) -> bool {
     let n = flat.edges.len();
@@ -312,6 +327,7 @@ fn emit_hole_bend(
                 inside_radius: hole_bend.inside_radius,
                 k_factor: hole_bend.k_factor,
                 child: child.clone(),
+                reliefs: Vec::new(),
             };
             let (wedge, child_frame) = build_bend(&bend, a, b, frame, thickness, fold)?;
             if let Some(wedge) = wedge {

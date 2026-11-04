@@ -16,6 +16,7 @@ pub mod family_table;
 /// file association to claim.
 #[cfg(not(target_arch = "wasm32"))]
 pub mod file_association;
+pub mod handles;
 pub mod fonts;
 pub mod form;
 pub mod form_view;
@@ -30,6 +31,10 @@ pub mod logger;
 /// The embedded MCP server (`brep-app --mcp`); native builds with `mcp`.
 #[cfg(all(not(target_arch = "wasm32"), feature = "mcp"))]
 pub mod mcp;
+/// The desktop event loop: eframe's winit application plus application-command
+/// dispatch that does not wait for a frame (a hidden Wayland window gets none).
+#[cfg(not(target_arch = "wasm32"))]
+pub mod desktop_loop;
 pub mod offsite;
 pub mod palette;
 pub mod panels;
@@ -65,6 +70,11 @@ pub mod javascript;
 // Its `worker_entry` is the worker-side onmessage loop. wasm only.
 #[cfg(target_arch = "wasm32")]
 pub mod worker;
+
+// The browser's code worker: one run_script execution on Boa in a Web Worker
+// the page can terminate (`web/code-worker.js` → `code_worker_entry`).
+#[cfg(all(target_arch = "wasm32", feature = "scripting"))]
+pub mod code_worker;
 
 // --- wasm entry ----------------------------------------------------------------
 #[cfg(target_arch = "wasm32")]

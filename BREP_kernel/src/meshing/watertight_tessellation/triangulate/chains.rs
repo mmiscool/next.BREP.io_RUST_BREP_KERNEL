@@ -50,13 +50,7 @@ pub(in crate::watertight_tessellation) fn loop_chain_offset(
 }
 
 pub(in crate::watertight_tessellation) fn signed_area(chain: &[FaceVertex]) -> f64 {
-    let mut area = 0.0;
-    for index in 0..chain.len() {
-        let a = chain[index].uv;
-        let b = chain[(index + 1) % chain.len()].uv;
-        area += a[0] * b[1] - b[0] * a[1];
-    }
-    area * 0.5
+    crate::polygon::signed_area_2d(chain.len(), |i| chain[i].uv)
 }
 
 /// Diagonal of the 3D bounding box of a chain's vertex positions. ~0 for a pole

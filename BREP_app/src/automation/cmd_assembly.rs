@@ -8,7 +8,7 @@
 //! enumerates constraint kinds: `assembly_constraint_catalogue` hands back the
 //! kernel's own schema catalogue, which is what `assembly_add_constraint`
 //! validates against.
-use crate::automation::command::{parse_args, schema_of, Annotations, CommandSpec, Ctx, Empty, Handler, NoArgs, Outcome, Phase};
+use crate::automation::command::{app_command, engine_call, parse_args, schema_of, CommandSpec, Ctx, Empty, NoArgs, Outcome};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -328,15 +328,22 @@ fn component_insert(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
 
 fn assembly_replace_component(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
     let a: ReplaceComponentArgs = parse_args(args)?;
-    // A Work part edited in context is finished first, as the menu does.
-    let (_, docs, _) = ctx.app.file_docs_store();
-    crate::panels::replace_component::finish_work_part_for_replace(docs)?;
-    require_assembly(ctx)?;
     let source = match (a.source, a.part_name) {
         (Some(source), None) => crate::panels::replace_component::ReplaceSource::Stored(source),
         (None, Some(part)) => crate::panels::replace_component::ReplaceSource::Library(part),
         _ => return Err("give exactly one of `source` (a stored part) or `partName` (a library entry)".into()),
     };
+    // Reject a missing entry before finishing a hosted Work part. The TAB
+    // owns the assembly library while its Work part has a different engine.
+    if let crate::panels::replace_component::ReplaceSource::Library(part) = &source {
+        if !ctx.app.docs.tab_engine().history.parts_library()[part].is_object() {
+            return Err(format!("part '{part}' is not in the parts library"));
+        }
+    }
+    // A valid replacement finishes the Work part first, as the menu does.
+    let (_, docs, _) = ctx.app.file_docs_store();
+    crate::panels::replace_component::finish_work_part_for_replace(docs)?;
+    require_assembly(ctx)?;
     let (_, docs, store) = ctx.app.file_docs_store();
     let engine = docs.engine_mut();
     if a.id.contains(':') {
@@ -430,9 +437,7 @@ fn component_info(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
 }
 
 fn component_set_fixed(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
-    let a: ComponentFixedArgs = parse_args(args)?;
-    ctx.app.docs.engine_mut().set_component_fixed(&a.id, a.fixed)?;
-    Ok(Outcome::Done(json!({})))
+    engine_call(ctx, args, |e, a: ComponentFixedArgs| e.set_component_fixed(&a.id, a.fixed))
 }
 
 fn component_select(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
@@ -494,9 +499,7 @@ fn bom_part_attributes(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String
 }
 
 fn bom_set_part_attribute(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
-    let a: PartAttributeArgs = parse_args(args)?;
-    ctx.app.docs.engine_mut().set_part_attribute(&a.part_name, &a.key, a.value)?;
-    Ok(Outcome::Done(json!({})))
+    engine_call(ctx, args, |e, a: PartAttributeArgs| e.set_part_attribute(&a.part_name, &a.key, a.value))
 }
 
 fn bom_occurrence_attributes(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
@@ -505,37 +508,35 @@ fn bom_occurrence_attributes(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, 
 }
 
 fn bom_set_occurrence_attribute(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
-    let a: OccurrenceAttributeArgs = parse_args(args)?;
-    ctx.app.docs.engine_mut().set_occurrence_attribute(&a.ids, &a.key, a.value)?;
-    Ok(Outcome::Done(json!({})))
+    engine_call(ctx, args, |e, a: OccurrenceAttributeArgs| e.set_occurrence_attribute(&a.ids, &a.key, a.value))
 }
 
 pub static COMMANDS: &[CommandSpec] = &[
-    CommandSpec { name: "assembly_state", group: "assembly", doc: "The assembly: component instances, constraints, per-constraint solve statuses and the remaining degrees of freedom. `hasAssembly` is false for a document with no components.", phase: Phase::Read, annotations: Annotations::READ, args_schema: schema_of::<NoArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(assembly_state) },
-    CommandSpec { name: "assembly_constraint_catalogue", group: "assembly", doc: "Every mate constraint the kernel offers, with its parameter schema — the types `assembly_add_constraint` takes.", phase: Phase::Read, annotations: Annotations::READ, args_schema: schema_of::<NoArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(assembly_constraint_catalogue) },
-    CommandSpec { name: "assembly_add_constraint", group: "assembly", doc: "Add a mate constraint and (when auto-solve is on) re-solve. Returns the minted constraint id.", phase: Phase::Mutate, annotations: Annotations::MUTATE, args_schema: schema_of::<AddConstraintArgs>, result_schema: schema_of::<ConstraintAdded>, handler: Handler::App(assembly_add_constraint) },
-    CommandSpec { name: "assembly_update_constraint", group: "assembly", doc: "Replace a constraint's inputParams and re-solve.", phase: Phase::Mutate, annotations: Annotations::MUTATE, args_schema: schema_of::<UpdateConstraintArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(assembly_update_constraint) },
-    CommandSpec { name: "assembly_remove_constraint", group: "assembly", doc: "Delete a constraint and re-solve.", phase: Phase::Mutate, annotations: Annotations::DESTRUCTIVE, args_schema: schema_of::<ConstraintIdArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(assembly_remove_constraint) },
-    CommandSpec { name: "assembly_set_constraint_enabled", group: "assembly", doc: "Suppress or re-enable one constraint and re-solve.", phase: Phase::Mutate, annotations: Annotations::MUTATE, args_schema: schema_of::<ConstraintEnabledArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(assembly_set_constraint_enabled) },
-    CommandSpec { name: "assembly_move_constraint", group: "assembly", doc: "Move a constraint to a new position in the list and re-solve (solve order is list order).", phase: Phase::Mutate, annotations: Annotations::MUTATE, args_schema: schema_of::<ConstraintMoveArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(assembly_move_constraint) },
-    CommandSpec { name: "assembly_solve", group: "assembly", doc: "Run the constraint solver now (the manual Solve the panel offers when auto-solve is off) and return the statuses and remaining DOF.", phase: Phase::Mutate, annotations: Annotations::MUTATE, args_schema: schema_of::<NoArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(assembly_solve) },
-    CommandSpec { name: "assembly_parts_library", group: "assembly", doc: "The document's parts-library entry names — what `component_insert` places.", phase: Phase::Read, annotations: Annotations::READ, args_schema: schema_of::<NoArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(assembly_parts_library) },
-    CommandSpec { name: "component_insert", group: "assembly", doc: "Place another instance of a parts-library entry: appends an ACOMP feature with an identity transform and runs it. The document's FIRST component is grounded. Returns the feature id; move it with `feature_set_params` on its `transform`.", phase: Phase::Mutate, annotations: Annotations::MUTATE, args_schema: schema_of::<ComponentInsertArgs>, result_schema: schema_of::<ComponentAdded>, handler: Handler::App(component_insert) },
-    CommandSpec { name: "assembly_replace_component", group: "assembly", doc: "Replace the part an occurrence shows (or, with `allInstances`, every occurrence of that part) with a stored part (`source`) or a library entry (`partName`), keeping the occurrence's id, pose and attributes. One undo step. Mates are re-resolved by face name only when the parts share lineage (same family, or one saved from the other); otherwise, or when a name is missing or changed type, the mate is kept DISABLED with a `replace` marker and a suggestion. `report` is null until the run lands: read it with `assembly_replace_report`.", phase: Phase::Mutate, annotations: Annotations::MUTATE, args_schema: schema_of::<ReplaceComponentArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(assembly_replace_component) },
-    CommandSpec { name: "assembly_replace_report", group: "assembly", doc: "The last replace's report (`{components, from, to, lineage, kept, unresolved, notes}`) and every mate still carrying a replace marker at ANY depth (`unresolved`; a sub-assembly's mate is listed as `<occurrence path>:<id>` with namespaced refs; markers survive save/reopen).", phase: Phase::Read, annotations: Annotations::READ, args_schema: schema_of::<NoArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(assembly_replace_report) },
-    CommandSpec { name: "assembly_replace_repair", group: "assembly", doc: "Point held mate references at picked entities, one undo step, at any depth (ids and refs as `assembly_replace_report` lists them; a sub-assembly's mate takes a ref inside that sub-assembly). A mate with nothing left held is re-enabled (if it was enabled before the replace) and loses its marker. Delete one with `assembly_replace_delete`.", phase: Phase::Mutate, annotations: Annotations::MUTATE, args_schema: schema_of::<ReplaceRepairArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(assembly_replace_repair) },
-    CommandSpec { name: "assembly_replace_delete", group: "assembly", doc: "Delete a mate a replace is holding, at any depth: a top-level id (`CONC1`) or a sub-assembly's mate by its occurrence path (`ACOMP1:CONC1`, which edits that sub-assembly's definition). One undo step.", phase: Phase::Mutate, annotations: Annotations::MUTATE, args_schema: schema_of::<ConstraintIdArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(assembly_replace_delete) },
-    CommandSpec { name: "assembly_replace_accept", group: "assembly", doc: "Accept the PRE-TICKED suggestions (the entity whose geometry is the old one's) of the given held mates, or of every held mate at every depth, as one undo step.", phase: Phase::Mutate, annotations: Annotations::MUTATE, args_schema: schema_of::<ReplaceAcceptArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(assembly_replace_accept) },
-    CommandSpec { name: "component_info", group: "assembly", doc: "One component instance with authored expressions, requested and solver-adjusted evaluated placement matrices, frame/units, evaluation status, attributes and member names. Numeric legacy fields describe evaluated geometry; failed or pending placement is null.", phase: Phase::Read, annotations: Annotations::READ, args_schema: schema_of::<ComponentIdArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(component_info) },
-    CommandSpec { name: "component_set_fixed", group: "assembly", doc: "Ground or unground a component (its ACOMP `isFixed`) and re-run.", phase: Phase::Mutate, annotations: Annotations::MUTATE, args_schema: schema_of::<ComponentFixedArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(component_set_fixed) },
-    CommandSpec { name: "component_select", group: "assembly", doc: "Select exactly these component instances (their member solids) — the selection a constraint's reference pick reads.", phase: Phase::Mutate, annotations: Annotations::MUTATE_NOWAIT, args_schema: schema_of::<ComponentSelectArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(component_select) },
-    CommandSpec { name: "interference_check", group: "assembly", doc: "Check component pairs with an explicit pair budget and revision-bound continuation; clearance_mm adds a near-miss gap check (nearMisses, minDistance). Only allClear=true establishes complete clearance; zero-volume contact candidates remain unverified without a distance witness.", phase: Phase::Read, annotations: Annotations::READ, args_schema: schema_of::<InterferenceArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(interference_check) },
-    CommandSpec { name: "assembly_inferable_types", group: "assembly", doc: "The constraint types automatic inference can produce, each with what placement it reads as that constraint — the rows the Auto Constraints dialog lists.", phase: Phase::Read, annotations: Annotations::READ, args_schema: schema_of::<NoArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(assembly_inferable_types) },
-    CommandSpec { name: "assembly_infer_constraints", group: "assembly", doc: "Read the components' current placement as constraints WITHOUT creating any: the candidates (type, elements, the measurement each was read from) plus what was skipped. The look-before-you-leap half of Auto Constraints — an imported STEP assembly is fully posed and completely unconstrained, and this says what would hold it there.", phase: Phase::Read, annotations: Annotations::READ, args_schema: schema_of::<InferConstraintsArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(assembly_infer_constraints) },
-    CommandSpec { name: "assembly_apply_inferred_constraints", group: "assembly", doc: "Create every constraint `assembly_infer_constraints` accepts and solve the batch as ONE undo step. Pairs that already carry a constraint are left alone, so running it twice creates nothing the second time.", phase: Phase::Mutate, annotations: Annotations::MUTATE, args_schema: schema_of::<InferConstraintsArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(assembly_apply_inferred_constraints) },
-    CommandSpec { name: "component_update", group: "assembly", doc: "Check the parts library against the saved source documents: how many entries are outdated and which have no source. `run: true` refreshes the outdated ones and re-runs (the Constraints header's Update components button); entries with no source are skipped, never fatal.", phase: Phase::Mutate, annotations: Annotations::MUTATE, args_schema: schema_of::<UpdateComponentsArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(component_update) },
-    CommandSpec { name: "bom_part_attributes", group: "assembly", doc: "One parts-library entry's BOM attributes (the `part.` columns).", phase: Phase::Read, annotations: Annotations::READ, args_schema: schema_of::<PartNameArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(bom_part_attributes) },
-    CommandSpec { name: "bom_set_part_attribute", group: "assembly", doc: "Write one BOM attribute on a PART — shared by every occurrence of it. `null` removes the key.", phase: Phase::Mutate, annotations: Annotations::MUTATE, args_schema: schema_of::<PartAttributeArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(bom_set_part_attribute) },
-    CommandSpec { name: "bom_occurrence_attributes", group: "assembly", doc: "One component occurrence's BOM attributes (the `occurrence.` columns).", phase: Phase::Read, annotations: Annotations::READ, args_schema: schema_of::<ComponentIdArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(bom_occurrence_attributes) },
-    CommandSpec { name: "bom_set_occurrence_attribute", group: "assembly", doc: "Write one BOM attribute across component OCCURRENCES — one undo step however many ids. `null` removes the key.", phase: Phase::Mutate, annotations: Annotations::MUTATE, args_schema: schema_of::<OccurrenceAttributeArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(bom_set_occurrence_attribute) },
+    app_command!("assembly", "assembly_state", "The assembly: component instances, constraints, per-constraint solve statuses and the remaining degrees of freedom. `hasAssembly` is false for a document with no components.", NoArgs, assembly_state, Read, READ, super::assembly_output_schema::state),
+    app_command!("assembly", "assembly_constraint_catalogue", "Every mate constraint the kernel offers, with its parameter schema — the types `assembly_add_constraint` takes.", NoArgs, assembly_constraint_catalogue, Read, READ, super::assembly_output_schema::catalogue),
+    app_command!("assembly", "assembly_add_constraint", "Add a mate constraint and (when auto-solve is on) re-solve. Returns the minted constraint id.", AddConstraintArgs, assembly_add_constraint, Mutate, MUTATE, schema_of::<ConstraintAdded>),
+    app_command!("assembly", "assembly_update_constraint", "Replace a constraint's inputParams and re-solve.", UpdateConstraintArgs, assembly_update_constraint, Mutate, MUTATE),
+    app_command!("assembly", "assembly_remove_constraint", "Delete a constraint and re-solve.", ConstraintIdArgs, assembly_remove_constraint, Mutate, DESTRUCTIVE, super::assembly_output_schema::mutation_empty),
+    app_command!("assembly", "assembly_set_constraint_enabled", "Suppress or re-enable one constraint and re-solve.", ConstraintEnabledArgs, assembly_set_constraint_enabled, Mutate, MUTATE, super::assembly_output_schema::mutation_empty),
+    app_command!("assembly", "assembly_move_constraint", "Move a constraint to a new position in the list and re-solve (solve order is list order).", ConstraintMoveArgs, assembly_move_constraint, Mutate, MUTATE, super::assembly_output_schema::mutation_empty),
+    app_command!("assembly", "assembly_solve", "Run the constraint solver now (the manual Solve the panel offers when auto-solve is off) and return the statuses and remaining DOF.", NoArgs, assembly_solve, Mutate, MUTATE, super::assembly_output_schema::solve),
+    app_command!("assembly", "assembly_parts_library", "The document's parts-library entry names — what `component_insert` places.", NoArgs, assembly_parts_library, Read, READ, super::assembly_output_schema::parts),
+    app_command!("assembly", "component_insert", "Place another instance of a parts-library entry: appends an ACOMP feature with an identity transform and runs it. The document's FIRST component is grounded. Returns the feature id; move it with `feature_set_params` on its `transform`.", ComponentInsertArgs, component_insert, Mutate, MUTATE, schema_of::<ComponentAdded>),
+    app_command!("assembly", "assembly_replace_component", "Replace the part an occurrence shows (or, with `allInstances`, every occurrence of that part) with a stored part (`source`) or a library entry (`partName`), keeping the occurrence's id, pose and attributes. One undo step. Mates are re-resolved by face name only when the parts share lineage (same family, or one saved from the other); otherwise, or when a name is missing or changed type, the mate is kept DISABLED with a `replace` marker and a suggestion. `report` is null until the run lands: read it with `assembly_replace_report`.", ReplaceComponentArgs, assembly_replace_component, Mutate, MUTATE, super::assembly_output_schema::replace_component),
+    app_command!("assembly", "assembly_replace_report", "The last replace's report (`{components, from, to, lineage, kept, unresolved, notes}`) and every mate still carrying a replace marker at ANY depth (`unresolved`; a sub-assembly's mate is listed as `<occurrence path>:<id>` with namespaced refs; markers survive save/reopen).", NoArgs, assembly_replace_report, Read, READ, super::assembly_output_schema::replace_report),
+    app_command!("assembly", "assembly_replace_repair", "Point held mate references at picked entities, one undo step, at any depth (ids and refs as `assembly_replace_report` lists them; a sub-assembly's mate takes a ref inside that sub-assembly). A mate with nothing left held is re-enabled (if it was enabled before the replace) and loses its marker. Delete one with `assembly_replace_delete`.", ReplaceRepairArgs, assembly_replace_repair, Mutate, MUTATE, super::assembly_output_schema::replace_unresolved),
+    app_command!("assembly", "assembly_replace_delete", "Delete a mate a replace is holding, at any depth: a top-level id (`CONC1`) or a sub-assembly's mate by its occurrence path (`ACOMP1:CONC1`, which edits that sub-assembly's definition). One undo step.", ConstraintIdArgs, assembly_replace_delete, Mutate, MUTATE, super::assembly_output_schema::replace_unresolved),
+    app_command!("assembly", "assembly_replace_accept", "Accept the PRE-TICKED suggestions (the entity whose geometry is the old one's) of the given held mates, or of every held mate at every depth, as one undo step.", ReplaceAcceptArgs, assembly_replace_accept, Mutate, MUTATE, super::assembly_output_schema::replace_accept),
+    app_command!("assembly", "component_info", "One component instance with authored expressions, requested and solver-adjusted evaluated placement matrices, frame/units, evaluation status, attributes and member names. Numeric legacy fields describe evaluated geometry; failed or pending placement is null.", ComponentIdArgs, component_info, Read, READ, super::assembly_output_schema::component),
+    app_command!("assembly", "component_set_fixed", "Ground or unground a component (its ACOMP `isFixed`) and re-run.", ComponentFixedArgs, component_set_fixed, Mutate, MUTATE),
+    app_command!("assembly", "component_select", "Select exactly these component instances (their member solids) — the selection a constraint's reference pick reads.", ComponentSelectArgs, component_select, Mutate, MUTATE_NOWAIT, super::assembly_output_schema::selected),
+    app_command!("assembly", "interference_check", "Check component pairs with an explicit pair budget and revision-bound continuation; clearance_mm adds a near-miss gap check (nearMisses, minDistance). Only allClear=true establishes complete clearance; zero-volume contact candidates remain unverified without a distance witness.", InterferenceArgs, interference_check, Read, READ, super::assembly_output_schema::interference),
+    app_command!("assembly", "assembly_inferable_types", "The constraint types automatic inference can produce, each with what placement it reads as that constraint — the rows the Auto Constraints dialog lists.", NoArgs, assembly_inferable_types, Read, READ, super::assembly_output_schema::inferable_types),
+    app_command!("assembly", "assembly_infer_constraints", "Read the components' current placement as constraints WITHOUT creating any: the candidates (type, elements, the measurement each was read from) plus what was skipped. The look-before-you-leap half of Auto Constraints — an imported STEP assembly is fully posed and completely unconstrained, and this says what would hold it there.", InferConstraintsArgs, assembly_infer_constraints, Read, READ, super::assembly_output_schema::scan),
+    app_command!("assembly", "assembly_apply_inferred_constraints", "Create every constraint `assembly_infer_constraints` accepts and solve the batch as ONE undo step. Pairs that already carry a constraint are left alone, so running it twice creates nothing the second time.", InferConstraintsArgs, assembly_apply_inferred_constraints, Mutate, MUTATE, super::assembly_output_schema::apply),
+    app_command!("assembly", "component_update", "Check the parts library against the saved source documents: how many entries are outdated and which have no source. `run: true` refreshes the outdated ones and re-runs (the Constraints header's Update components button); entries with no source are skipped, never fatal.", UpdateComponentsArgs, component_update, Mutate, MUTATE, super::assembly_output_schema::updated),
+    app_command!("assembly", "bom_part_attributes", "One parts-library entry's BOM attributes (the `part.` columns).", PartNameArgs, bom_part_attributes, Read, READ, super::assembly_output_schema::attributes),
+    app_command!("assembly", "bom_set_part_attribute", "Write one BOM attribute on a PART — shared by every occurrence of it. `null` removes the key.", PartAttributeArgs, bom_set_part_attribute, Mutate, MUTATE),
+    app_command!("assembly", "bom_occurrence_attributes", "One component occurrence's BOM attributes (the `occurrence.` columns).", ComponentIdArgs, bom_occurrence_attributes, Read, READ, super::assembly_output_schema::attributes),
+    app_command!("assembly", "bom_set_occurrence_attribute", "Write one BOM attribute across component OCCURRENCES — one undo step however many ids. `null` removes the key.", OccurrenceAttributeArgs, bom_set_occurrence_attribute, Mutate, MUTATE),
 ];

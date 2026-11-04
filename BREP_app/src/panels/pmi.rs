@@ -16,8 +16,8 @@
 //! (activating applies the camera / visibility / wireframe / explode poses;
 //! deactivating restores the modeling state); a click SELECTS it and leaves
 //! the active view alone, and a double click activates it and opens the view's
-//! own dialog; its menu offers Edit view, Update camera, Update visibility,
-//! Wireframe on/off, Delete. An ANNOTATION row shows the type icon, its id,
+//! own dialog; its menu offers Edit view, Update camera, Hide selected (a
+//! hide step for the selection), Wireframe on/off, Delete. An ANNOTATION row shows the type icon, its id,
 //! its resolved text (the value + tolerance, the note, the callout …) or its
 //! error, a status badge and an **enabled** toggle; a click SELECTS it (the
 //! row and its label in the viewport carry the selection) and a double click
@@ -75,7 +75,7 @@ const ACT_EDIT_VIEW: &str = "edit-view";
 const ACT_ACTIVATE: &str = "activate";
 const ACT_DEACTIVATE: &str = "deactivate";
 const ACT_UPDATE_CAMERA: &str = "update-camera";
-const ACT_UPDATE_VISIBILITY: &str = "update-visibility";
+const ACT_HIDE_SELECTED: &str = "hide-selected";
 const ACT_WIREFRAME: &str = "wireframe";
 const ACT_DELETE_VIEW: &str = "delete-view";
 const ACT_EDIT: &str = "edit";
@@ -92,7 +92,7 @@ enum Action {
     Activate(String),
     Deactivate,
     UpdateCamera(String),
-    UpdateVisibility(String),
+    HideSelected(String),
     Wireframe(String, bool),
     DeleteView(String),
     SetEnabled(String, bool),
@@ -139,7 +139,7 @@ fn apply(state: &mut EngineState, action: Action) -> Result<(), String> {
             Ok(())
         }
         Action::UpdateCamera(id) => state.pmi_update_view_camera(&id),
-        Action::UpdateVisibility(id) => state.pmi_update_view_visibility(&id),
+        Action::HideSelected(id) => state.pmi_hide_selected(Some(&id)).map(|_| ()),
         Action::Wireframe(id, on) => state.pmi_set_view_display(&id, &PmiViewPatch { wireframe: Some(on), ..Default::default() }),
         Action::DeleteView(id) => state.pmi_delete_view(&id),
         Action::SetEnabled(id, on) => state.pmi_set_annotation_enabled(&id, on),
@@ -205,7 +205,7 @@ fn menu_action(pmi: &PmiState, id: String, action: &str) -> Option<Action> {
         ACT_ACTIVATE => Some(Action::Activate(id)),
         ACT_DEACTIVATE => Some(Action::Deactivate),
         ACT_UPDATE_CAMERA => Some(Action::UpdateCamera(id)),
-        ACT_UPDATE_VISIBILITY => Some(Action::UpdateVisibility(id)),
+        ACT_HIDE_SELECTED => Some(Action::HideSelected(id)),
         ACT_WIREFRAME => pmi.find_view(&id).map(|view| Action::Wireframe(id.clone(), !view.display.wireframe)),
         ACT_DELETE_VIEW => Some(Action::DeleteView(id)),
         ACT_EDIT => Some(Action::Open(Some(id))),
@@ -528,9 +528,9 @@ impl PmiPanel {
             })
             .weak(),
         );
-        if active.is_none() {
-            ui.label(egui::RichText::new("Capture a view to start annotating").weak().italics());
-        }
+        // No hint line under the summary (owner 2026-10-28: "Get rid of that
+        // completely"): the summary already says "no active view", and a line
+        // that comes and goes with the active view shifted the tree below it.
         ui.add_space(2.0);
 
         // --- the tree ---------------------------------------------------------------
@@ -573,7 +573,7 @@ impl PmiPanel {
                             RowAction::new(ACT_ACTIVATE, "Activate view").tooltip("Apply this view's camera, visibility and wireframe")
                         },
                         RowAction::new(ACT_UPDATE_CAMERA, "Update camera").tooltip("Re-capture the camera from the current viewpoint"),
-                        RowAction::new(ACT_UPDATE_VISIBILITY, "Update visibility").tooltip("Re-capture which objects are hidden"),
+                        RowAction::new(ACT_HIDE_SELECTED, "Hide selected").tooltip("Add a hide step: the selected solids or components stay hidden while this view is active"),
                         RowAction::new(ACT_WIREFRAME, if view.display.wireframe { "Wireframe off" } else { "Wireframe on" }),
                         RowAction::new(ACT_DELETE_VIEW, "Delete view").tooltip("Delete the view and its annotations").separator_above().destructive(),
                     ]);
@@ -759,7 +759,7 @@ impl PmiPanel {
         }
         match out.button_clicked.as_deref() {
             Some("updateCamera") => *action = Some(Action::UpdateCamera(view.id.clone())),
-            Some("updateVisibility") => *action = Some(Action::UpdateVisibility(view.id.clone())),
+            Some("hideSelected") => *action = Some(Action::HideSelected(view.id.clone())),
             _ => {}
         }
         if out.exit_clicked {
@@ -879,6 +879,6 @@ pub static HIT_KEYS: &[HitKeyDoc] = &[
     // panel's prefix rather than the `pmi:form:` chrome. Undocumented until
     // 2026-09-13 for the same reason the rest of the pane's keys were: the
     // check had never run with an annotation form open.
-    HitKeyDoc { panel: "pmi", prefix: "pmi:field:", meaning: "one control of the open annotation's or view's form (pmi:field:<path>, plus #activate on a reference field) \u{2014} a note's text, an anchor or plane picker; a view's `pmi:field:name`, `pmi:field:textSizePt`, `pmi:field:wireframe`, its section controls `pmi:field:sectionEnabled`, `pmi:field:sectionAxis` (options `#View`, `#X`, `#Y`, `#Z`, `#Plane`), `pmi:field:sectionPlane` (shown for Plane; `#activate` picks the planar face or datum plane), `pmi:field:sectionOffset`, `pmi:field:sectionFlip` and `pmi:field:sectionExclude` (shown while the section is on; `#activate` picks the solids or components left uncut), `pmi:field:halfAxis` (options `#None`, `#View`, `#X`, `#Y`, `#Z`: a second plane, shown while the section is on) with `pmi:field:halfOffset` and `pmi:field:halfFlip` (shown once it has a plane), and its `pmi:field:updateCamera` / `pmi:field:updateVisibility` buttons", command: Some("pmi_update_annotation") },
+    HitKeyDoc { panel: "pmi", prefix: "pmi:field:", meaning: "one control of the open annotation's or view's form (pmi:field:<path>, plus #activate on a reference field) \u{2014} a note's text, an anchor or plane picker; a view's `pmi:field:name`, `pmi:field:textSizePt`, `pmi:field:wireframe`, its section controls `pmi:field:sectionEnabled`, `pmi:field:sectionAxis` (options `#View`, `#X`, `#Y`, `#Z`, `#Plane`), `pmi:field:sectionPlane` (shown for Plane; `#activate` picks the planar face or datum plane), `pmi:field:sectionOffset`, `pmi:field:sectionFlip` and `pmi:field:sectionExclude` (shown while the section is on; `#activate` picks the solids or components left uncut), `pmi:field:halfAxis` (options `#None`, `#View`, `#X`, `#Y`, `#Z`: a second plane, shown while the section is on) with `pmi:field:halfOffset` and `pmi:field:halfFlip` (shown once it has a plane), and its `pmi:field:updateCamera` / `pmi:field:hideSelected` buttons (the latter adds a `hide` step for the selection)", command: Some("pmi_update_annotation") },
     HitKeyDoc { panel: "pmi", prefix: "panel:clip", meaning: "the visible region of the pane", command: None },
 ];

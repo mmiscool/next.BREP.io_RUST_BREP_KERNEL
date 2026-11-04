@@ -26,6 +26,7 @@
 //! and the store-write + component-add lives in `StepPartsPanel::import_step_text`,
 //! all unit-tested with injected data — no network in the test suite.
 
+use crate::http::query_component;
 use crate::http::{fetch_bytes, fetch_text};
 use crate::automation::hit_keys::HitKeyDoc;
 use crate::panels::parts_library::document_signature;
@@ -63,28 +64,13 @@ pub struct PartItem {
 
 // --- pure helpers (unit-tested; no egui, no network) -------------------------
 
-/// Percent-encode a query VALUE (RFC 3986 unreserved set kept; everything else,
-/// space included, becomes `%XX`). One field only — not worth a urlencoding crate.
-fn encode_query(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for b in s.bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(b as char)
-            }
-            _ => out.push_str(&format!("%{b:02X}")),
-        }
-    }
-    out
-}
-
 /// The `/v1/parts` search URL for `query` (blank ⇒ plain list) at 1-based `page`.
 fn search_url(base: &str, query: &str, page: u32) -> String {
     let mut url = format!("{base}/parts?pageSize={PAGE_SIZE}&page={page}");
     let q = query.trim();
     if !q.is_empty() {
         url.push_str("&q=");
-        url.push_str(&encode_query(q));
+        url.push_str(&query_component(q));
     }
     url
 }

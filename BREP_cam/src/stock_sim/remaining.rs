@@ -122,7 +122,7 @@ pub fn remaining_stock_mesh_region(
     let mut scratch = Vec::new();
     let mut excess = Vec::with_capacity(mesh.positions.len());
     for p in &mesh.positions {
-        let key = [p.x.to_bits(), p.y.to_bits(), p.z.to_bits()];
+        let key = [crate::geom::canonical_bits(p.x), crate::geom::canonical_bits(p.y), crate::geom::canonical_bits(p.z)];
         let value = *seen.entry(key).or_insert_with(|| match nearest_triangle(part, index, *p, start_radius, options.max_distance) {
             Some((_, d)) => {
                 if d > options.tolerance && inside_by_majority(part, index, *p, jitter, &mut scratch) {
@@ -148,7 +148,7 @@ pub fn remaining_stock_mesh_region(
             if !(*v > options.tolerance) {
                 return false;
             }
-            let key = [p.x.to_bits(), p.y.to_bits(), p.z.to_bits()];
+            let key = [crate::geom::canonical_bits(p.x), crate::geom::canonical_bits(p.y), crate::geom::canonical_bits(p.z)];
             *below_seen.entry(key).or_insert_with(|| {
                 let beside = nearest_triangle(part, index, *p, start_radius, options.max_distance).and_then(|(tri, _)| {
                     let t = part.triangle(tri);

@@ -229,6 +229,20 @@ pub(super) fn face_volume_terms_about(face: &FaceRecord, reference: Vec3) -> Res
         let values = integrate_untrimmed_multi(face, &kinds)?;
         mass_profile(|p| p.untrimmed_ms += super::profile::elapsed_ms(started));
         values
+    } else if let Some(rectangle) = iso_rectangle_route_on().then(|| iso_rectangle_trim(face)).transpose()?.flatten() {
+        // The sign reading's iso-rectangle route (lane O, 2026-10-28): a
+        // single loop of four axis-parallel line pcurves is a sub-rectangle
+        // of the knot grid, read with the untrimmed sweep's rules on the
+        // clipped cells instead of the trimmed route's chord polygons and
+        // cell quadtree. `BREP_MASS_ISO_RECT=0` keeps the trimmed route.
+        mass_profile(|p| {
+            p.route_iso_rectangle += 1;
+            p.gate_ms += super::profile::elapsed_ms(gate_started);
+        });
+        let started = super::profile::profile_started();
+        let values = integrate_iso_rectangle_multi(face, rectangle, &kinds)?;
+        mass_profile(|p| p.untrimmed_ms += super::profile::elapsed_ms(started));
+        values
     } else {
         mass_profile(|p| {
             p.trimmed_faces += 1;
@@ -238,3 +252,10 @@ pub(super) fn face_volume_terms_about(face: &FaceRecord, reference: Vec3) -> Res
     };
     Ok([values[0] / 3.0, values[1] / 3.0, values[2] / 3.0, values[3] / 3.0])
 }
+
+/// The iso-rectangle route of [`face_volume_terms_about`], on unless
+/// `BREP_MASS_ISO_RECT` is `0`/`off`. Read once.
+fn iso_rectangle_route_on() -> bool {
+    switch!("BREP_MASS_ISO_RECT", true)
+}
+

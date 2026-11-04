@@ -37,21 +37,41 @@
 //! build of the app (`BREP_app/src/webmcp.rs`), which compiles this for
 //! wasm32 so a page serves the same tools the desktop does.
 #[cfg(feature = "server")]
+pub mod cad;
+#[cfg(feature = "server")]
 pub mod generate;
 pub mod host;
+pub mod files;
 #[cfg(feature = "server")]
 pub mod http;
+#[cfg(feature = "server")]
+pub mod launch_state;
 pub mod image;
 #[cfg(feature = "server")]
 pub mod plm_fixture;
+#[cfg(feature = "server")]
+pub mod program;
 #[cfg(feature = "server")]
 pub mod render_mesh;
 #[cfg(feature = "server")]
 pub mod runner;
 pub mod schema;
 pub mod script;
+pub mod script_sdk;
 #[cfg(feature = "server")]
 pub mod server;
 pub mod session;
 pub mod tools;
 pub mod validate;
+
+#[cfg(feature = "server")]
+pub mod skills;
+#[cfg(feature = "server")]
+pub mod skill_distribution;
+
+#[cfg(feature = "server")]
+pub mod prompts;
+
+
+#[cfg(feature = "server")]
+mod progress;

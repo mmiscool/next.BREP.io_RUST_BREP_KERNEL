@@ -1,5 +1,10 @@
+mod wall_samples;
+mod analytic_foot;
+mod torus_plane;
 pub(super) mod analytic_rim;
+pub(in crate::blend) use analytic_rim::net_bound;
 pub(super) mod analytic_network;
+pub(super) mod analytic_arc;
 mod offset_memo;
 
 use crate::{KernelRefusal, KernelStage, OrRefuse, RefusalClass};
@@ -251,6 +256,33 @@ fn tangency_from_samples(
     }
 }
 
+/// A finite-difference column changes only one carrier. Reuse the other
+/// carrier's successful base reading, keeping the residual's arithmetic order.
+/// This is local to one Newton iteration; it does not approximate a Jacobian
+/// or carry a derivative between stations.
+fn tangency_column_state(
+    surfaces: [&NurbsSurface; 2],
+    rho: [f64; 2],
+    probe: [f64; 4],
+    column: usize,
+    base: &TangencyState,
+    section_point: Vec3,
+    section_tangent: Vec3,
+) -> Result<TangencyState, KernelRefusal> {
+    let (first, second) = if column < 2 {
+        (
+            blend_offset(surfaces[0]).at(probe[0], probe[1], rho[0]).or_refuse(KernelStage::Refine, "at")?,
+            crate::OffsetSample { source: base.p2, normal: base.n2, point: base.p2.add(base.n2.scale(rho[1])) },
+        )
+    } else {
+        (
+            crate::OffsetSample { source: base.p1, normal: base.n1, point: base.center },
+            blend_offset(surfaces[1]).at(probe[2], probe[3], rho[1]).or_refuse(KernelStage::Refine, "at")?,
+        )
+    };
+    Ok(tangency_from_samples(first, second, section_point, section_tangent))
+}
+
 /// Residual of (4.9.2) + (4.9.5) at uv = (u, v, a, b).
 pub(super) fn tangency_residual(
     first: &NurbsSurface,
@@ -318,7 +350,8 @@ pub(in crate::blend) fn solve_station_state_chord(
     scale: f64,
     jacobian: &mut Option<[[f64; 4]; 4]>,
 ) -> Result<([f64; 4], TangencyState), KernelRefusal> {
-    let mut memo = offset_memo::enabled().then(|| offset_memo::Samples::new([first, second]));
+    let memo_enabled = offset_memo::enabled();
+    let mut memo = memo_enabled.then(|| offset_memo::Samples::new([first, second]));
     let mut read = |uv| match memo.as_mut() {
         Some(samples) => samples.state(rho, uv, section_point, section_tangent),
         None => tangency_state(first, second, rho, uv, section_point, section_tangent),
@@ -353,7 +386,10 @@ pub(in crate::blend) fn solve_station_state_chord(
                 let mut probe = uv;
                 probe[column] += step;
                 evaluations += 1;
-                let Ok(probed) = read(probe) else {
+                let probed = if memo_enabled { read(probe) } else {
+                    tangency_column_state([first, second], rho, probe, column, &state, section_point, section_tangent)
+                };
+                let Ok(probed) = probed else {
                     readable = false;
                     break;
                 };
@@ -401,7 +437,8 @@ fn solve_station_state_traced(
     scale: f64,
     mut trace: Option<&mut NewtonTrace>,
 ) -> Result<([f64; 4], TangencyState), KernelRefusal> {
-    let mut memo = offset_memo::enabled().then(|| offset_memo::Samples::new([first, second]));
+    let memo_enabled = offset_memo::enabled();
+    let mut memo = memo_enabled.then(|| offset_memo::Samples::new([first, second]));
     let mut read = |uv| match memo.as_mut() {
         Some(samples) => samples.state(rho, uv, section_point, section_tangent),
         None => tangency_state(first, second, rho, uv, section_point, section_tangent),
@@ -447,7 +484,11 @@ fn solve_station_state_traced(
             let mut probe = uv;
             probe[column] += step;
             evaluations += 1;
-            let probed = match read(probe) {
+            let probed = match if memo_enabled {
+                read(probe)
+            } else {
+                tangency_column_state([first, second], rho, probe, column, &state, section_point, section_tangent)
+            } {
                 Ok(probed) => probed,
                 Err(error) => {
                     crate::blend::record_count("count.march.tangency_evals", evaluations);
@@ -466,7 +507,11 @@ fn solve_station_state_traced(
             let mut probe = uv;
             probe[column] = chart.parameter(chart.regular(uv[column]) + step);
             evaluations += 1;
-            let probed = match read(probe) {
+            let probed = match if memo_enabled {
+                read(probe)
+            } else {
+                tangency_column_state([first, second], rho, probe, column, &state, section_point, section_tangent)
+            } {
                 Ok(probed) => probed,
                 Err(error) => {
                     crate::blend::record_count("count.march.tangency_evals", evaluations);
@@ -824,6 +869,18 @@ pub(super) fn branch_hop(
     left: &Continued,
     right: &Continued,
 ) -> Option<KernelRefusal> {
+    branch_hop_with_points(surfaces, rho_at, left, right, &|t| {
+        edge.curve.point_and_unit_tangent_extended(t, edge.t0, edge.t1).map(|(point, _)| point)
+    })
+}
+
+fn branch_hop_with_points(
+    surfaces: [&NurbsSurface; 2],
+    rho_at: &dyn Fn(f64) -> [f64; 2],
+    left: &Continued,
+    right: &Continued,
+    point: &dyn Fn(f64) -> Result<Vec3, String>,
+) -> Option<KernelRefusal> {
     for (index, surface) in surfaces.into_iter().enumerate() {
         let (Ok((closed_u, closed_v)), Ok(domain_u), Ok(domain_v)) =
             (surface.closed_directions(), surface.domain_u(), surface.domain_v())
@@ -853,11 +910,6 @@ pub(super) fn branch_hop(
     }
     let (Some(left_center), Some(right_center)) = (left.center, right.center) else {
         return None;
-    };
-    let point = |t: f64| {
-        edge.curve
-            .point_and_unit_tangent_extended(t, edge.t0, edge.t1)
-            .map(|(point, _)| point)
     };
     let chord = point(right.t).and_then(|right| Ok(right.sub(point(left.t)?).length()));
     let Ok(chord) = chord else {
@@ -1122,6 +1174,7 @@ struct MarchFrame<'a> {
     /// to the network's rail bar before its fold can be cut (the chain lane
     /// climbs its own per-segment ladder for the same reason).
     depth_budget: usize,
+    station_solver: Option<torus_plane::Solver>,
 }
 
 impl MarchFrame<'_> {
@@ -1244,15 +1297,13 @@ impl MarchFrame<'_> {
                 .curve
                 .point_and_unit_tangent_extended(t, self.edge.t0, self.edge.t1)
                 .map_err(|error| format!("blend march: edge {}: {error}", self.edge.id)).or_refuse(KernelStage::Refine, "point_and_unit_tangent_extended")?;
-            let (uv, state) = solve_station_state(
-                self.surface1,
-                self.surface2,
-                (self.rho_at)(t),
-                seed,
-                section_point,
-                section_tangent,
-                self.scale,
-            )?;
+            let proposed = self.station_solver.as_ref().and_then(|solver| solver.solve(
+                [self.surface1, self.surface2], (self.rho_at)(t), seed, section_point, section_tangent, self.scale));
+            let (uv, state) = match proposed {
+                Some(solved) => solved,
+                None => solve_station_state(self.surface1, self.surface2, (self.rho_at)(t), seed,
+                    section_point, section_tangent, self.scale)?,
+            };
             self.node(t, uv, &state)
         }
     }
@@ -1347,21 +1398,35 @@ impl MarchFrame<'_> {
         seed: [f64; 4],
         t: f64,
         jacobian: &mut Option<[[f64; 4]; 4]>,
+        previous_section: &mut Option<(u64, Vec3)>,
     ) -> Result<MarchNode, KernelRefusal> {
         let (section_point, section_tangent) = self
             .edge
             .curve
             .point_and_unit_tangent_extended(t, self.edge.t0, self.edge.t1)
             .map_err(|error| format!("blend march: edge {}: {error}", self.edge.id)).or_refuse(KernelStage::Refine, "point_and_unit_tangent_extended")?;
-        let (uv, state) = solve_station_state_chord(
-            self.surface1, self.surface2, (self.rho_at)(t), seed, left.uv, section_point, section_tangent, self.scale, jacobian,
-        )?;
+        let proposed = self.station_solver.as_ref().and_then(|solver| solver.solve(
+            [self.surface1, self.surface2], (self.rho_at)(t), seed, section_point, section_tangent, self.scale));
+        let (uv, state) = match proposed {
+            Some(solved) => solved,
+            None => solve_station_state_chord(self.surface1, self.surface2, (self.rho_at)(t), seed,
+                left.uv, section_point, section_tangent, self.scale, jacobian)?,
+        };
         let node = self.node(t, uv, &state)?;
         let before = Continued { t: left.t, uv: left.uv, center: Some(left.station.center) };
         let after = Continued { t: node.t, uv: node.uv, center: Some(node.station.center) };
-        match branch_hop([self.surface1, self.surface2], self.edge, self.rho_at, &before, &after) {
+        // The solver just read this exact section successfully. The previous
+        // successful solve also read its section; reuse only exact t bits.
+        let point = |at: f64| {
+            if at.to_bits() == t.to_bits() { return Ok(section_point); }
+            if let Some((key, point)) = *previous_section {
+                if key == at.to_bits() { return Ok(point); }
+            }
+            self.edge.curve.point_and_unit_tangent_extended(at, self.edge.t0, self.edge.t1).map(|(point, _)| point)
+        };
+        match branch_hop_with_points([self.surface1, self.surface2], self.rho_at, &before, &after, &point) {
             Some(reason) => Err(reason),
-            None => Ok(node),
+            None => { *previous_section = Some((t.to_bits(), section_point)); Ok(node) },
         }
     }
 
@@ -1711,6 +1776,9 @@ fn closed_wall_interval_misses(
     // (quadratic in t; linear from two, the neighbour's own (u, v) from one),
     // with the Jacobian carried from centre to centre across the whole rim.
     // Off the switch, the plain continuation from the neighbour, as before.
+    let sections: Vec<f64> = (1..CLOSED_WALL_SECTIONS)
+        .map(|k| v_low + (v_high - v_low) * k as f64 / CLOSED_WALL_SECTIONS as f64).collect();
+    let samples = wall_samples::WallSamples::new(&rows.surface, &sections);
     let predict = crate::blend::closed_wall_predict_on();
     let mut jacobian: Option<[[f64; 4]; 4]> = None;
     (0..nodes.len().saturating_sub(1))
@@ -1719,13 +1787,14 @@ fn closed_wall_interval_misses(
             let mut centres = Vec::with_capacity(CLOSED_WALL_CENTRES + 1);
             centres.push(left.station.center);
             let mut previous = left.clone();
+            let mut previous_section = None;
             let mut history: Vec<(f64, [f64; 4])> = vec![(left.t, left.uv)];
             let centres_timing = crate::blend::BlendTimer::start("timing.closed.march.ladder.wall.centres_ms");
             for step in 1..CLOSED_WALL_CENTRES {
                 let t = left.t + (right.t - left.t) * step as f64 / CLOSED_WALL_CENTRES as f64;
                 previous = if predict {
                     let seed = extrapolated_seed(&history, t);
-                    let node = frame.continue_node_predicted(&previous, seed, t, &mut jacobian).ok()?;
+                    let node = frame.continue_node_predicted(&previous, seed, t, &mut jacobian, &mut previous_section).ok()?;
                     history.push((t, node.uv));
                     if history.len() > 3 {
                         history.remove(0);
@@ -1746,9 +1815,12 @@ fn closed_wall_interval_misses(
             let mut declared = 0.0_f64;
             for step in (2..CLOSED_WALL_CENTRES).step_by(2) {
                 let u = low + (high - low) * (from + (to - from) * step as f64 / CLOSED_WALL_CENTRES as f64);
-                for k in 1..CLOSED_WALL_SECTIONS {
-                    let v = v_low + (v_high - v_low) * k as f64 / CLOSED_WALL_SECTIONS as f64;
-                    let point = rows.surface.evaluate(u, v).ok()?;
+                let basis = samples.as_ref().map(|samples| samples.row(u));
+                for (section, &v) in sections.iter().enumerate() {
+                    let point = match (&samples, &basis) {
+                        (Some(samples), Some(basis)) => samples.point(basis, section),
+                        _ => rows.surface.evaluate(u, v),
+                    }.ok()?;
                     let (reading, uncertainty) = match &prepared {
                         Some(cache) => cache.read(point, step, step as f64 / CLOSED_WALL_CENTRES as f64, radius),
                         None => super::chain::declared_wall_probe_located(point, &centres, step, step as f64 / CLOSED_WALL_CENTRES as f64, radius),
@@ -1883,6 +1955,7 @@ fn march_stations_impl(
         scale,
         fit_tolerance,
         depth_budget,
+        station_solver: torus_plane::Solver::new([surface1, surface2]),
     };
     let mut nodes: Vec<MarchNode> = Vec::with_capacity(SEED_INTERVALS + 1);
     let seed_timing = crate::blend::BlendTimer::start("timing.closed.march.seed_ms");
@@ -1999,7 +2072,7 @@ fn march_stations_impl(
             for round in 0..=REFINE_ROUNDS {
                 crate::blend::record_count("count.closed.march.rounds", 1);
                 let stations: Vec<Station> = nodes.iter().map(|node| node.station).collect();
-                let parameters = station_parameters(&stations);
+                let parameters = closed_station_parameters(&stations, [surface1, surface2]);
                 // The two rails are independent of the rational middle row.
                 // Fitting the chamfer rows here lets rail refinement proceed
                 // even when a coarse fillet middle row has negative weights.
@@ -2200,6 +2273,43 @@ fn march_stations_impl(
 /// Chord-length parameters over the mean of the two support polylines,
 /// normalised to [0, 1] (§4.9: station spacing proportional to the mean
 /// support arc length).
+/// A closed torus/plane rim is smooth in the tube angle. Chord-length
+/// parameters retain a small spacing-dependent ripple; use the geometric
+/// angle only for a monotone complete tube circuit on recognized carriers.
+/// The full solved grid, all refinement probes and all acceptance bars stay.
+pub(super) fn closed_station_parameters(stations: &[Station], surfaces: [&NurbsSurface; 2]) -> Vec<f64> {
+    if switch!("BREP_COMPACT_CLOSED_ROWS", true) && stations.len() >= 65 {
+        for index in 0..2 {
+            let Some(crate::AnalyticSurface::Torus { frame, major_radius, .. }) = surfaces[index].analytic() else { continue; };
+            let Some(crate::AnalyticSurface::Plane { u_dir, v_dir, .. }) = surfaces[1-index].analytic() else { continue; };
+            let Ok(normal) = u_dir.cross(*v_dir).normalized() else { continue; };
+            if normal.dot(frame.axis).abs() > 1e-10 { continue; }
+            let mut angles: Vec<f64> = Vec::with_capacity(stations.len());
+            for station in stations {
+                let point = if index == 0 { station.p1 } else { station.p2 };
+                let delta = point.sub(frame.origin);
+                let axial = delta.dot(frame.axis);
+                let radial = delta.sub(frame.axis.scale(axial)).length();
+                let mut angle = axial.atan2(radial-major_radius);
+                if let Some(&previous) = angles.last() {
+                    angle += ((previous-angle)/std::f64::consts::TAU).round()*std::f64::consts::TAU;
+                }
+                angles.push(angle);
+            }
+            if let (Some(&first),Some(&last)) = (angles.first(),angles.last()) {
+                let span = last-first;
+                if (span.abs()-std::f64::consts::TAU).abs() <= 1e-8
+                    && angles.windows(2).all(|a| (a[1]-a[0])*span > 0.0) {
+                    for value in &mut angles { *value = (*value-first)/span; }
+                    crate::blend::record_count("count.closed.torus_angle_parameters", 1);
+                    return angles;
+                }
+            }
+        }
+    }
+    station_parameters(stations)
+}
+
 pub(super) fn station_parameters(stations: &[Station]) -> Vec<f64> {
     let mut parameters = Vec::with_capacity(stations.len());
     let mut accumulated = 0.0;
@@ -2256,8 +2366,7 @@ pub(super) struct FittedRows {
 /// 98 + 144 census); `BREP_CLOSED_FOLD_CLOSED_FORM=0` (or `off`) restores the
 /// probe on every closed-rim march.
 pub(super) fn closed_form_fold_on() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| !matches!(std::env::var("BREP_CLOSED_FOLD_CLOSED_FORM").as_deref(), Ok("0") | Ok("off")))
+    switch!("BREP_CLOSED_FOLD_CLOSED_FORM", true)
 }
 
 
@@ -2635,6 +2744,67 @@ pub(super) fn fit_closed_rows(
     parameters: &[f64],
     chamfer: bool,
 ) -> Result<FittedRows, KernelRefusal> {
+    if switch!("BREP_COMPACT_CLOSED_ROWS", true) && stations.len() >= 65 {
+        // Proposal only: preserve every solved section as a reference, and
+        // insert the worst omitted sections until the existing track floor
+        // is met. All original rail/wall/trim/soundness gates still run.
+        let degree = 7;
+        let stride = 4;
+        let mut indices: Vec<usize> = (0..stations.len()-1).step_by(stride).collect();
+        indices.push(stations.len()-1);
+        // This stricter proposal screen leaves margin for the unchanged
+        // serialized-body one-sided certificate. It does not replace or
+        // relax any rail, wall, trim or soundness acceptance tolerance.
+        let bar = 1e-9;
+        for _ in 0..6 {
+            let coarse: Vec<Station> = indices.iter().map(|&i| stations[i]).collect();
+            let fractions: Vec<f64> = indices.iter().map(|&i| parameters[i]).collect();
+            let Ok(rows) = fit_closed_rows_degree(&coarse, &fractions, chamfer, degree) else { break; };
+            let middle = (!chamfer).then(|| NurbsCurve::new(rows.surface.degree_u, rows.surface.knots_u.clone(),
+                rows.surface.control_points.iter().map(|row| row[1]).collect())).transpose();
+            let Ok(middle) = middle else { break; };
+            let mut misses = Vec::new();
+            let mut readable = true;
+            for (index, (station, &fraction)) in stations.iter().zip(parameters).enumerate() {
+                let u = rows.u_domain[0]+(rows.u_domain[1]-rows.u_domain[0])*fraction;
+                let (Ok(p1),Ok(p2)) = (rows.cr.evaluate(u),rows.cs.evaluate(u)) else { readable=false; break; };
+                let errors=[p1.sub(station.p1).length(),p2.sub(station.p2).length()];
+                if !errors.iter().all(|e| e.is_finite()) { readable=false; break; }
+                let mut miss=errors[0].max(errors[1]);
+                if let Some(middle) = &middle {
+                    let Ok(h) = middle.evaluate_homogeneous(u) else { readable=false; break; };
+                    let wanted = Vec4::from_point(station.apex,station.weight);
+                    for delta in [h.x-wanted.x,h.y-wanted.y,h.z-wanted.z,h.w-wanted.w] {
+                        if !delta.is_finite() { readable=false; break; }
+                        miss=miss.max(delta.abs()/station.weight.min(1.0));
+                    }
+                }
+                if !miss.is_finite() { readable=false; break; }
+                if miss>bar { misses.push((miss,index)); }
+            }
+            if !readable { break; }
+            if misses.is_empty() {
+                crate::blend::record_count("count.closed.compact_rows",1);
+                crate::blend::record_count("count.closed.compact_sections",indices.len() as u64);
+                return Ok(rows);
+            }
+            misses.sort_by(|a,b| b.0.total_cmp(&a.0));
+            let old=indices.len();
+            let add: Vec<usize> = misses.iter().filter(|(_,i)| !indices.contains(i)).take(2).map(|(_,i)| *i).collect();
+            indices.extend(add);
+            indices.sort_unstable(); indices.dedup();
+            if indices.len()==old || indices.len()>=stations.len()/2 { break; }
+        }
+    }
+    fit_closed_rows_degree(stations,parameters,chamfer,FIT_DEGREE)
+}
+
+fn fit_closed_rows_degree(
+    stations: &[Station],
+    parameters: &[f64],
+    chamfer: bool,
+    degree: usize,
+) -> Result<FittedRows, KernelRefusal> {
     let count = stations.len();
     // Unwrapped pcurve periods: how far each uv track travelled in one
     // loop (zero on open carriers, ±domain-span across a seam).
@@ -2679,7 +2849,7 @@ pub(super) fn fit_closed_rows(
             1.0,
         ));
     };
-    for offset in (1..=FIT_DEGREE).rev() {
+    for offset in (1..=degree).rev() {
         let index = wrap(-(offset as isize));
         push(&stations[index], parameters[index] - 1.0, -1.0);
     }
@@ -2687,7 +2857,7 @@ pub(super) fn fit_closed_rows(
         // The final station already carries the +period uv from the march.
         push(&stations[index], parameters[index], 0.0);
     }
-    for offset in 1..=FIT_DEGREE {
+    for offset in 1..=degree {
         let index = wrap(offset as isize);
         push(&stations[index], parameters[index] + 1.0, 1.0);
     }
@@ -2701,7 +2871,7 @@ pub(super) fn fit_closed_rows(
     let seam_low = (0.0 - low) / range;
     let seam_high = (1.0 - low) / range;
     let fit_row = |samples: &[Vec4]| -> Result<NurbsCurve, KernelRefusal> {
-        let curve = fit::interpolate_homogeneous(samples, FIT_DEGREE, &normalized).or_refuse(KernelStage::Refine, "interpolate_homogeneous")?;
+        let curve = fit::interpolate_homogeneous(samples, degree, &normalized).or_refuse(KernelStage::Refine, "interpolate_homogeneous")?;
         let (_, tail) = curve.split(seam_low).or_refuse(KernelStage::Refine, "split")?;
         let (middle, _) = tail.split(seam_high).or_refuse(KernelStage::Refine, "split")?;
         Ok(middle)
@@ -2716,7 +2886,7 @@ pub(super) fn fit_closed_rows(
         Some(fit_row(&samples_mid)?)
     };
     let u_domain = cr.domain().or_refuse(KernelStage::Refine, "domain")?;
-    let surface = crate::blend::rows::surface_from_rows(FIT_DEGREE, &cr, &cs, mid.as_ref(), true)?;
+    let surface = crate::blend::rows::surface_from_rows(degree, &cr, &cs, mid.as_ref(), true)?;
     Ok(FittedRows {
         surface,
         cr,
@@ -2931,6 +3101,9 @@ pub(super) fn closed_rail_interval_misses_at(
 /// carrier closer, so the reading never exceeds the seed's own distance and
 /// is always the distance to an actual point of the extended carrier.
 pub(in crate::blend) fn extended_foot_distance(carrier: &NurbsSurface, point: Vec3, seed: [f64; 2]) -> Result<f64, KernelRefusal> {
+    if analytic_foot::enabled() {
+        if let Some(reading) = analytic_foot::distance(carrier, point, seed) { return reading; }
+    }
     let reading = extended_foot_distance_halving(carrier, point, seed, true);
     reading
 }
@@ -2961,8 +3134,17 @@ fn extended_foot_distance_halving(carrier: &NurbsSurface, point: Vec3, seed: [f6
         return Ok(f64::INFINITY);
     }
     for _ in 0..30 {
-        let d = carrier.derivatives_extended(uv[0], uv[1], 1).or_refuse(KernelStage::Refine, "derivatives_extended")?;
-        let (offset, su, sv) = (d[0][0].sub(point), d[1][0], d[0][1]);
+        // Only the point and first partials enter this Newton step. The
+        // first-partial reader preserves their arithmetic and extension but
+        // does not allocate the nested derivative grid at every iteration.
+        // Keep the historical reader in the spent-halving comparison arm.
+        let (position, su, sv) = if shortcut {
+            carrier.deriv1_extended(uv[0], uv[1]).or_refuse(KernelStage::Refine, "derivatives_extended")?
+        } else {
+            let d = carrier.derivatives_extended(uv[0], uv[1], 1).or_refuse(KernelStage::Refine, "derivatives_extended")?;
+            (d[0][0], d[1][0], d[0][1])
+        };
+        let offset = position.sub(point);
         let (a, b, c) = (su.dot(su), su.dot(sv), sv.dot(sv));
         let (gu, gv) = (su.dot(offset), sv.dot(offset));
         let det = a * c - b * b;
@@ -3033,6 +3215,12 @@ pub(super) fn locate_mate<'a>(
     Err(KernelRefusal::internal(KernelStage::Classify, "mating_face", format!("blend: edge {edge_id} has no (second) mating face")))
 }
 
+/// The shortest support-side probe [`signed_radii`] tries on a short edge,
+/// and how many rungs (a quarter of the edge's chord, then quartered) it
+/// tries after the usual quarter-radius step.
+const SHORT_PROBE_FLOOR: f64 = 1e-6;
+const SHORT_PROBE_RUNGS: usize = 4;
+
 /// Signed radii ρ1/ρ2 (4.9.2): the ball center sits along the inward
 /// bisector of the mid-edge cross-section; ρ is its projection sign onto
 /// each face's RAW normal times the radius.
@@ -3049,33 +3237,52 @@ pub(super) fn signed_radii(
     // carrier seam even though it is far from the edge's topological seam.
     // UV classification calls that probe `Boundary`, so sample symmetric
     // interior fractions until both support-side signs are unambiguous.
+    //
+    // A SHORT edge beside a narrow face needs a shorter probe too (bug report
+    // 2026-11-01; `sliver_edge_support_probe_tests`): a follow-tangent fillet
+    // along a crease that runs onto a neighbour fillet's face leaves a
+    // 0.005-long edge between the crease face and that fillet face, and a
+    // probe a quarter radius (0.025) off it lands outside the crease face's
+    // trim on BOTH sides at every station, so the whole chain refused as
+    // "could not orient support directions". The material never swaps sides
+    // along an edge, so a probe that lands inside the trim at a shorter step
+    // reads the same side. The shorter steps are tried only on an edge
+    // shorter than four usual steps, and only after the usual step failed at
+    // every station: every edge that orients today is unchanged.
+    let chord = edge
+        .curve
+        .evaluate(edge.t1)
+        .or_refuse(KernelStage::Refine, "evaluate")?
+        .sub(edge.curve.evaluate(edge.t0).or_refuse(KernelStage::Refine, "evaluate")?)
+        .length();
+    let mut steps = vec![probe_step];
+    if chord < 4.0 * probe_step {
+        let mut shorter = 0.25 * chord;
+        while shorter >= SHORT_PROBE_FLOOR && steps.len() < 1 + SHORT_PROBE_RUNGS {
+            steps.push(shorter);
+            shorter *= 0.25;
+        }
+    }
     let mut seed = None;
-    for fraction in [0.5, 0.375, 0.625, 0.25, 0.75] {
-        let t = edge.t0 + (edge.t1 - edge.t0) * fraction;
-        let point = edge.curve.evaluate(t).or_refuse(KernelStage::Refine, "evaluate")?;
-        let tangent = edge
-            .curve
-            .unit_tangent(t, edge.t0, edge.t1)
-            .map_err(|error| format!("blend: edge {}: {error}", edge.id)).or_refuse(KernelStage::Refine, "unit_tangent")?;
-        let Ok(into1) = crate::fillet::into_face_direction(
-            first_face, point, tangent, point, tangent, probe_step,
-        ) else {
-            continue;
-        };
-        let Ok(into2) = crate::fillet::into_face_direction(
-            second_face,
-            point,
-            tangent,
-            point,
-            tangent,
-            probe_step,
-        ) else {
-            continue;
-        };
-        let uv1 = edge_uv_on_face(first_coedge, edge, t)?;
-        let uv2 = edge_uv_on_face(second_coedge, edge, t)?;
-        seed = Some((point, into1, into2, uv1, uv2));
-        break;
+    'steps: for step in steps {
+        for fraction in [0.5, 0.375, 0.625, 0.25, 0.75] {
+            let t = edge.t0 + (edge.t1 - edge.t0) * fraction;
+            let point = edge.curve.evaluate(t).or_refuse(KernelStage::Refine, "evaluate")?;
+            let tangent = edge
+                .curve
+                .unit_tangent(t, edge.t0, edge.t1)
+                .map_err(|error| format!("blend: edge {}: {error}", edge.id)).or_refuse(KernelStage::Refine, "unit_tangent")?;
+            let Ok(into1) = crate::fillet::into_face_direction(first_face, point, tangent, point, tangent, step) else {
+                continue;
+            };
+            let Ok(into2) = crate::fillet::into_face_direction(second_face, point, tangent, point, tangent, step) else {
+                continue;
+            };
+            let uv1 = edge_uv_on_face(first_coedge, edge, t)?;
+            let uv2 = edge_uv_on_face(second_coedge, edge, t)?;
+            seed = Some((point, into1, into2, uv1, uv2));
+            break 'steps;
+        }
     }
     let (mid_point, into1, into2, uv1_mid, uv2_mid) =
         seed.ok_or(KernelRefusal::internal(KernelStage::Classify, "support_orientation", "blend: could not orient support directions away from carrier seams"))?;
@@ -3103,4 +3310,8 @@ pub(super) fn signed_radii(
     };
     Ok((rho1, rho2))
 }
+
+
+
+
 

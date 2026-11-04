@@ -1,6 +1,6 @@
 [package]
 name = "BREP_simulation"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 license-file = "LICENSE.md"
 repository = "https://github.com/mmiscool/next.BREP.io_RUST_BREP_KERNEL"
@@ -24,6 +24,11 @@ include = [
 [lib]
 name = "brep_simulation"
 
+[features]
+default = []
+schema = ["dep:schemars"]
+
 [dependencies]
+schemars = { version = "1.2", optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

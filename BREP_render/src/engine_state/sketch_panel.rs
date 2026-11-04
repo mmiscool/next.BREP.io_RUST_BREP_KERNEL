@@ -96,7 +96,7 @@ impl EngineState {
     fn sketch_ref_selected(session: &crate::sketch::SketchSession, kind: &str, id: &serde_json::Value) -> bool {
         use crate::sketch::doc::id_key;
         let key = id_key(id);
-        session.selection.iter().any(|r| {
+        session.selection.items.iter().any(|r| {
             r.get("kind").and_then(serde_json::Value::as_str) == Some(kind)
                 && r.get("id").map(id_key).as_deref() == Some(key.as_str())
         })
@@ -171,7 +171,9 @@ impl EngineState {
                 SketchEntityRow {
                     kind: "geometry",
                     id: g.id.clone(),
-                    label: format!("{}:{}{mark} [{pts}]{note}", g.geom_type, id_key(&g.id)),
+                    label: if g.geom_type == "text" {
+                        format!("Text: {}", g.extra.get("text").and_then(|v|v.as_str()).unwrap_or(""))
+                    } else { format!("{}:{}{mark} [{pts}]{note}", g.geom_type, id_key(&g.id)) },
                     selected: Self::sketch_ref_selected(session, "geometry", &g.id),
                     construction,
                     conflicting: false,
@@ -350,7 +352,7 @@ impl EngineState {
         };
         let sel_ids: Vec<serde_json::Value> = edit
             .session
-            .selection
+            .selection.items
             .iter()
             .filter(|r| r.get("kind").and_then(|v| v.as_str()) == Some("point"))
             .filter_map(|r| r.get("id").cloned())
@@ -416,12 +418,13 @@ impl EngineState {
     /// all construction. Re-solves + refreshes. Returns whether anything was
     /// selected. No-op with nothing selected / not in sketch mode.
     pub fn sketch_toggle_construction(&mut self) -> bool {
+        if self.sketch_selection_has_text_frame() { return false; }
         let Some(edit) = self.sketch_edit.as_mut() else {
             return false;
         };
         let mut pt_ids: Vec<serde_json::Value> = Vec::new();
         let mut geo_ids: Vec<serde_json::Value> = Vec::new();
-        for r in &edit.session.selection {
+        for r in &edit.session.selection.items {
             match r.get("kind").and_then(|v| v.as_str()) {
                 Some("point") => {
                     // The part-origin reference stays construction.
@@ -521,7 +524,7 @@ impl EngineState {
         let doc = &edit.session.doc;
         let sel: Vec<&serde_json::Value> = edit
             .session
-            .selection
+            .selection.items
             .iter()
             .filter(|r| r.get("kind").and_then(|v| v.as_str()) == Some("point"))
             .filter_map(|r| r.get("id"))
@@ -542,11 +545,12 @@ impl EngineState {
     /// NOT all construction (`Some(false)`), or nothing is selected (`None`) — labels
     /// the ◐ construction-toggle button's direction.
     pub fn sketch_selection_all_construction(&self) -> Option<bool> {
+        if self.sketch_selection_has_text_frame() { return None; }
         let edit = self.sketch_edit.as_ref()?;
         let doc = &edit.session.doc;
         let mut any = false;
         let mut all = true;
-        for r in &edit.session.selection {
+        for r in &edit.session.selection.items {
             match r.get("kind").and_then(|v| v.as_str()) {
                 Some("point") => {
                     any = true;
@@ -584,7 +588,7 @@ fn sketch_palette_for(session: &crate::sketch::SketchSession) -> Vec<SketchConst
     let doc = &session.doc;
     let mut sel_points: Vec<serde_json::Value> = Vec::new();
     let mut geos: Vec<&crate::sketch::SketchGeometry> = Vec::new();
-    for r in &session.selection {
+    for r in &session.selection.items {
         match r.get("kind").and_then(|v| v.as_str()) {
             Some("point") => {
                 if let Some(id) = r.get("id") {
@@ -601,6 +605,8 @@ fn sketch_palette_for(session: &crate::sketch::SketchSession) -> Vec<SketchConst
             _ => {}
         }
     }
+
+    if geos.iter().any(|g| g.geom_type == "text") { return Vec::new(); }
 
     // point-coverage = selected point ids ∪ endpoints of selected geometries
     // (arc: only points[0..2] — center + start).
@@ -1011,7 +1017,7 @@ fn sketch_build_and_add_constraint(
         let mut geometry_type: Option<String> = None;
         let mut first_kind: Option<String> = None;
         let mut has_geometry = false;
-        for (i, r) in session.selection.iter().enumerate() {
+        for (i, r) in session.selection.items.iter().enumerate() {
             let kind = r.get("kind").and_then(|v| v.as_str());
             let Some(id) = r.get("id") else { continue };
             if i == 0 {
@@ -1294,3 +1300,42 @@ fn sketch_build_and_add_constraint(
     added_any
 }
 
+
+impl EngineState {
+    fn sketch_selection_has_text_frame(&self) -> bool {
+        let Some(edit) = &self.sketch_edit else { return false; };
+        edit.session.selection.items.iter().any(|r| {
+            let id = &r["id"];
+            if r["kind"] == "geometry" {
+                edit.session.doc.geometry(id).is_some_and(|g| g.geom_type == "text" || g.extra.contains_key("textFrame"))
+            } else {
+                edit.session.doc.geometries.iter().any(|g| g.geom_type == "text" && g.points.contains(id))
+            }
+        })
+    }
+
+    pub fn sketch_selected_text(&self) -> Option<(serde_json::Value, String, String)> {
+        let session = &self.sketch_edit.as_ref()?.session;
+        if session.selection.items.len() != 1 { return None; }
+        let r = &session.selection.items[0];
+        if r["kind"] != "geometry" { return None; }
+        let g = session.doc.geometry(&r["id"])?;
+        if g.geom_type != "text" { return None; }
+        Some((g.id.clone(), g.extra["text"].as_str()?.into(), g.extra["font"].as_str()?.into()))
+    }
+
+    pub fn sketch_edit_text(&mut self, id: &serde_json::Value, text: &str, font: &str) -> Result<(), String> {
+        let contours = crate::sketch::text::outlines(text,font)?;
+        let edit = self.sketch_edit.as_mut().ok_or("No active sketch")?;
+        let g = edit.session.doc.geometry(id).filter(|g| g.geom_type == "text").ok_or("Text object no longer exists")?;
+        if g.extra["text"] == text && g.extra["font"] == font { return Ok(()); }
+        edit.record_undo();
+        let g = edit.session.doc.geometry_mut(id).unwrap();
+        g.extra.insert("text".into(), serde_json::json!(text));
+        g.extra.insert("font".into(), serde_json::json!(font));
+        g.extra.insert("textContours".into(), contours);
+        self.refresh_sketch_overlay();
+        self.dirty = true;
+        Ok(())
+    }
+}

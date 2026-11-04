@@ -28,6 +28,7 @@
 //! Nothing here is constructed without a server: the file-based app never
 //! reaches this panel.
 
+use crate::http::query_component;
 use crate::document_class::DocumentClass;
 use crate::plm::PlmFuture;
 use eframe::egui;
@@ -252,13 +253,13 @@ impl PartsQuery {
     pub fn to_query(&self) -> String {
         let mut pairs = vec![format!("limit={PAGE}")];
         if !self.q.trim().is_empty() {
-            pairs.push(format!("q={}", encode(self.q.trim())));
+            pairs.push(format!("q={}", query_component(self.q.trim())));
         }
         if !self.category.is_empty() {
-            pairs.push(format!("category={}", encode(&self.category)));
+            pairs.push(format!("category={}", query_component(&self.category)));
         }
         if let Some(after) = &self.after {
-            pairs.push(format!("after={}", encode(after)));
+            pairs.push(format!("after={}", query_component(after)));
         }
         if self.include_attributes {
             pairs.push("include=attributes".into());
@@ -269,22 +270,10 @@ impl PartsQuery {
                 Bound::Min => ".min",
                 Bound::Max => ".max",
             };
-            pairs.push(format!("attr.{}{suffix}={}", encode(&filter.key), encode(filter.value.trim())));
+            pairs.push(format!("attr.{}{suffix}={}", query_component(&filter.key), query_component(filter.value.trim())));
         }
         pairs.join("&")
     }
-}
-
-/// Percent-encode everything but the unreserved characters (RFC 3986).
-fn encode(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    for byte in text.bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => out.push(byte as char),
-            _ => out.push_str(&format!("%{byte:02X}")),
-        }
-    }
-    out
 }
 
 /// The PLM's part and catalog routes, as this panel needs them. S1's client
@@ -359,7 +348,7 @@ impl PartCatalog for PlmPartCatalog {
         self.json("GET", "/api/categories".into(), None)
     }
     fn schema(&self, category: &str) -> PlmFuture<Schema> {
-        self.json("GET", format!("/api/categories/{}/schema", encode(category)), None)
+        self.json("GET", format!("/api/categories/{}/schema", query_component(category)), None)
     }
     fn parts_page(&self, query: &PartsQuery) -> PlmFuture<PartsPage> {
         self.json("GET", format!("/api/parts?{}", query.to_query()), None)
@@ -388,7 +377,7 @@ impl PartCatalog for PlmPartCatalog {
     }
     fn create_revision(&self, part: &str, label: &str) -> PlmFuture<CreatedRevision> {
         let body = serde_json::to_vec(&serde_json::json!({ "label": label })).ok();
-        self.json("POST", format!("/api/parts/{}/revisions", encode(part)), body)
+        self.json("POST", format!("/api/parts/{}/revisions", query_component(part)), body)
     }
     fn attribute_filters(&self) -> bool {
         self.attribute_filters
@@ -411,19 +400,19 @@ pub async fn save_as_new_revision(
 ) -> Result<String, String> {
     let body = |value: serde_json::Value| Some(serde_json::to_vec(&value).unwrap_or_default());
     let created = client
-        .call("POST", &format!("/api/parts/{}/revisions", encode(part)), body(serde_json::json!({ "label": label })))
+        .call("POST", &format!("/api/parts/{}/revisions", query_component(part)), body(serde_json::json!({ "label": label })))
         .await
         .map_err(|error| error.to_string())?;
     let revision: CreatedRevision =
         serde_json::from_slice(&created.body).map_err(|error| format!("the new revision's answer: {error}"))?;
-    let base = format!("/api/parts/{}/revisions/{}", encode(part), encode(&revision.id));
+    let base = format!("/api/parts/{}/revisions/{}", query_component(part), query_component(&revision.id));
     client
         .call("POST", &format!("{base}/checkout"), body(serde_json::json!({ "client_id": "brep-app" })))
         .await
         .map_err(|error| error.to_string())?;
     let key = crate::plm::identity::document_key(part, &revision.id);
     client
-        .call("PUT", &format!("/api/store/doc/{key}"), Some(document.as_bytes().to_vec()))
+        .call("PUT", &crate::plm::identity::doc_path(&key), Some(document.as_bytes().to_vec()))
         .await
         .map_err(|error| format!("revision {} was created and checked out, but the document was not written: {error}", revision.label))?;
     Ok(key)
@@ -906,14 +895,14 @@ impl PlmPartsPanel {
             if self.browser.loading() {
                 ui.weak("Loading…");
             } else if self.browser.next.is_some() {
-                ui.weak(format!("{} parts shown", self.browser.rows.len()));
+                ui.weak(format!("{} shown", crate::panels::count(self.browser.rows.len(), "part", "parts")));
                 let more = ui.add_enabled(self.browser.refresh.is_none(), egui::Button::new("Load more"));
                 self.hits.insert("plm_parts:more".into(), more.rect);
                 if more.clicked() {
                     self.browser.load_more(catalog);
                 }
             } else {
-                ui.weak(format!("{} parts", self.browser.rows.len()));
+                ui.weak(crate::panels::count(self.browser.rows.len(), "part", "parts"));
             }
             if let Some(row) = selected {
                 let link = ui.button(format!("Link {} to workspace", row.number));

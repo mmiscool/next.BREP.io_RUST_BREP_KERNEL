@@ -23,11 +23,19 @@ pub fn execute(ctx: &FeatureContext) -> FeatureResult {
     }
 }
 
+pub(crate) fn validate_radius(radius: f64) -> Result<(), String> {
+    if !radius.is_finite() || radius <= 0.0 {
+        return Err("invalid_arguments: cylinder radius must be finite and greater than zero; use height or a transform to change direction".into());
+    }
+    Ok(())
+}
+
 fn build(ctx: &FeatureContext) -> Result<FeatureResult, String> {
-    // radius is a magnitude (|radius|); height is DIRECTIONAL — a negative height
+    // Radius must be positive; height is DIRECTIONAL — a negative height
     // extends the cylinder to the -Y side (built with the magnitude, then spun a
     // half turn below). Diverges from the old `Math.abs` on height.
-    let radius = ctx.number("radius")?.abs();
+    let radius = ctx.number("radius")?;
+    validate_radius(radius)?;
     let height = ctx.number("height")?;
 
     let mut solid = make_cylinder_brep(
@@ -92,7 +100,8 @@ pub fn schema() -> serde_json::Value {
         "radius": {
             "type": "number",
             "default_value": 5,
-            "hint": "Radius of the cylinder"
+            "exclusiveMinimum": 0,
+            "hint": "Radius of the cylinder; must be greater than zero"
         },
         "height": {
             "type": "number",

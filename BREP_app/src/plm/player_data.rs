@@ -35,7 +35,7 @@ use brep_render::engine_state::EngineState;
 
 use super::backend::SavedHook;
 use super::client::{PlmClient, PlmError};
-use super::thumbnail::content_hash;
+use super::content_hash;
 
 /// What a `409` reads as: the server holds another document than the one the
 /// data was made from.
@@ -160,7 +160,7 @@ pub fn stage(key: &str, document: &str, engine: &EngineState, doc: u64) {
         data.fill(make(engine));
     }
     count(|s| s.staged += 1);
-    STAGED.with(|s| s.borrow_mut().insert(key.to_string(), Staged { hash: content_hash(document), data }));
+    STAGED.with(|s| s.borrow_mut().insert(key.to_string(), Staged { hash: content_hash(document.as_bytes()), data }));
 }
 
 /// Make the data of the saves made mid-rebuild whose run has landed; called
@@ -192,7 +192,7 @@ pub fn tick<'a>(engine_of: impl Fn(u64) -> Option<&'a EngineState>) {
 /// The data staged for exactly these bytes under `key`, taken. Data staged
 /// for other bytes (a later save) is left for that save's own hook.
 fn take(key: &str, document: &str) -> Option<Data> {
-    let hash = content_hash(document);
+    let hash = content_hash(document.as_bytes());
     STAGED.with(|s| {
         let mut staged = s.borrow_mut();
         match staged.get(key) {
@@ -208,7 +208,7 @@ pub(crate) fn upload_on_save() -> SavedHook {
     Rc::new(|client, key, value| {
         let key = crate::plm::uses::revision_key_in(&key).unwrap_or(key);
         if let Some(data) = take(&key, &value) {
-            let hash = content_hash(&value);
+            let hash = content_hash(value.as_bytes());
             crate::store::spawn_waking(async move { upload(&client, &key, &hash, data).await });
         }
         Box::pin(async { Ok(()) })

@@ -274,8 +274,8 @@ fn sphere_fit_reading_mode(
         .then(|| sphere_fit_key(source, fitted, same_sense, distance)).flatten();
     if let Some(deviation) = key.as_ref().and_then(|key|
         SPHERE_FIT_READINGS.with(|memo| memo.borrow().get(key).copied())) {
-        if std::env::var_os("BREP_PROFILE").is_some() {
-            eprintln!("offset.sphere_fit_memo hit=1 stations=0");
+        if crate::profile::profile_enabled() {
+            profile_line!("offset.sphere_fit_memo hit=1 stations=0");
         }
         // Band is not an input to the fixed grid. Preserve the actual reading
         // and judge it against this caller's band, never the stored caller's.
@@ -289,8 +289,8 @@ fn sphere_fit_reading_mode(
             memo.insert(key, measured.deviation());
         });
     }
-    if std::env::var_os("BREP_PROFILE").is_some() {
-        eprintln!("offset.sphere_fit_memo hit=0 stations={}", FIT_SAMPLES * FIT_SAMPLES);
+    if crate::profile::profile_enabled() {
+        profile_line!("offset.sphere_fit_memo hit=0 stations={}", FIT_SAMPLES * FIT_SAMPLES);
     }
     Ok(measured)
 }

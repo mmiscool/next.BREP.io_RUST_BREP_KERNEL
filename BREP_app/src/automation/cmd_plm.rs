@@ -6,7 +6,7 @@
 //! Native only. The pass blocks the frame while it talks to the server, which
 //! is what a headless session and a test want, and the browser build has no
 //! worker to run.
-use crate::automation::command::{parse_args, schema_of, Annotations, CommandSpec, Ctx, Empty, Handler, Outcome, Phase};
+use crate::automation::command::{app_command, parse_args, CommandSpec, Ctx, Outcome};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -25,10 +25,12 @@ pub struct BakePassArgs {
 fn plm_bake_pass(_ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
     let a: BakePassArgs = parse_args(args)?;
     let started = web_time::Instant::now();
-    let outcomes = crate::plm::bake::pass_blocking(&a.url, &a.token, a.max_jobs.unwrap_or(1000))?;
-    Ok(Outcome::Done(json!({
-        "jobs": outcomes.iter().map(|o| o.to_json()).collect::<Vec<_>>(),
-        "ms": started.elapsed().as_millis() as u64,
+    // The pass runs on the frame thread's task queue and lands in `slot`;
+    // the command answers on the frame it finishes (`Outcome::Poll`).
+    let slot = crate::plm::bake::pass_spawned(&a.url, &a.token, a.max_jobs.unwrap_or(1000));
+    Ok(Outcome::Poll(Box::new(move |_ctx: &mut Ctx<'_>| {
+        let done = slot.lock().unwrap().take()?;
+        Some(done.map(|jobs| Outcome::Done(json!({ "jobs": jobs, "ms": started.elapsed().as_millis() as u64 }))))
     })))
 }
 
@@ -42,6 +44,6 @@ fn plm_follow_now(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
 }
 
 pub static COMMANDS: &[CommandSpec] = &[
-    CommandSpec { name: "plm_follow_now", group: "plm", doc: "Ask the PLM change feed at the next frame instead of at its interval (the pane follows other clients: a moved feed re-reads every open PLM document's part and the inbox). Answers the follower's counts so far: feed requests and moves.", phase: Phase::Mutate, annotations: Annotations::MUTATE, args_schema: schema_of::<crate::automation::command::NoArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(plm_follow_now) },
-    CommandSpec { name: "plm_bake_pass", group: "plm", doc: "Run one pass of the PLM bake worker: claim each queued job in turn (`POST /api/bake/next`), open the document the server assembled on an engine of its own, build it, and keep it (`PUT …/result`) or report why not (`POST …/fail`, with the build's feature errors). Returns each job's `{id, number, revision, source, status: done|failed|dropped, error|why}` and the pass's `ms`. The open documents are untouched. An error means the server did not answer or refused the token.", phase: Phase::Mutate, annotations: Annotations::MUTATE, args_schema: schema_of::<BakePassArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(plm_bake_pass) },
+    app_command!("plm", "plm_follow_now", "Ask the PLM change feed at the next frame instead of at its interval (the pane follows other clients: a moved feed re-reads every open PLM document's part and the inbox). Answers the follower's counts so far: feed requests and moves.", crate::automation::command::NoArgs, plm_follow_now, Mutate, MUTATE, super::domain_output_schema::plm_follow_now),
+    app_command!("plm", "plm_bake_pass", "Run one pass of the PLM bake worker: claim each queued job in turn (`POST /api/bake/next`), open the document the server assembled on an engine of its own, build it, and keep it (`PUT …/result`) or report why not (`POST …/fail`, with the build's feature errors). Returns each job's `{id, number, revision, source, status: done|failed|dropped, error|why}` and the pass's `ms`. The open documents are untouched. An error means the server did not answer or refused the token.", BakePassArgs, plm_bake_pass, Mutate, MUTATE, super::domain_output_schema::plm_bake_pass),
 ];

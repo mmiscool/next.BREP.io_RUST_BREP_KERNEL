@@ -37,6 +37,15 @@ pub fn document_key(part: &str, revision: &str) -> String {
     format!("part/{}/rev/{}", segment(part), segment(revision))
 }
 
+/// The store route for the document `key` (`part/<p>/rev/<r>`, already
+/// segmented). The server percent-decodes the path once before splitting it,
+/// so each `%` of the segmented key is escaped again: `M3/A2` is segmented to
+/// `M3%2FA2` and sent as `M3%252FA2`, which decodes back to the key. Every
+/// `/api/store/doc` request goes through here.
+pub fn doc_path(key: &str) -> String {
+    format!("/api/store/doc/{}", key.trim_start_matches('/').replace('%', "%25"))
+}
+
 pub fn part_path(part: &str) -> String {
     format!("/api/parts/{}", segment(part))
 }

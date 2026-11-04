@@ -13,7 +13,7 @@
 use brep_render::engine_state::EngineState;
 
 /// The document key the class is stored under.
-pub const DOCUMENT_CLASS_KEY: &str = "documentClass";
+pub const DOCUMENT_CLASS_KEY: &str = brep_render::brep_kernel::family::DOCUMENT_CLASS_KEY;
 
 /// What a document is for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]

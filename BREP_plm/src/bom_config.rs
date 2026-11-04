@@ -849,13 +849,6 @@ pub fn release_problems(
 }
 
 pub fn layout_csv(bom: &crate::bom::Bom, layout: &Layout, fields: &[Field]) -> String {
-    fn cell(value: &str) -> String {
-        if value.contains([',', '"', '\n', '\r']) {
-            format!("\"{}\"", value.replace('"', "\"\""))
-        } else {
-            value.into()
-        }
-    }
     let columns: Vec<&Field> = layout
         .columns
         .iter()
@@ -863,7 +856,7 @@ pub fn layout_csv(bom: &crate::bom::Bom, layout: &Layout, fields: &[Field]) -> S
         .collect();
     let mut csv = columns
         .iter()
-        .map(|f| cell(&f.name))
+        .map(|f| crate::bom::csv_cell(&f.name))
         .collect::<Vec<_>>()
         .join(",");
     csv.push('\n');
@@ -883,7 +876,7 @@ pub fn layout_csv(bom: &crate::bom::Bom, layout: &Layout, fields: &[Field]) -> S
                 } else {
                     builtins.get(&field.key)
                 };
-                cell(&match value {
+                crate::bom::csv_cell(&match value {
                     None | Some(Value::Null) => String::new(),
                     Some(Value::String(s)) => s.clone(),
                     Some(v) => v.to_string(),

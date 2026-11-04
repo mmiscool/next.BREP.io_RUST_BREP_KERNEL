@@ -45,8 +45,5 @@ impl Frame {
 
 /// Rodrigues rotation of `v` about unit axis `k` by `angle` radians.
 pub(super) fn rotate_about(v: Vec3, k: Vec3, angle: f64) -> Vec3 {
-    let (s, c) = angle.sin_cos();
-    v.scale(c)
-        .add(k.cross(v).scale(s))
-        .add(k.scale(k.dot(v) * (1.0 - c)))
+    v.rotate_about(k, angle)
 }

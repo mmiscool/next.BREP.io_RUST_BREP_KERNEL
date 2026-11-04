@@ -501,7 +501,7 @@ pub async fn load_into_revision(
     if serde_json::from_str::<Value>(contents).is_err() {
         return Err("the file is not a model document (it does not parse as JSON)".into());
     }
-    let path = format!("/api/store/doc/{key}");
+    let path = crate::plm::identity::doc_path(key);
     let bytes = contents.as_bytes().to_vec();
     with_checkout(client, key, async {
         client.call("PUT", &path, Some(bytes)).await.map(|_| ()).map_err(|e| e.to_string())
@@ -559,7 +559,7 @@ pub async fn run_import(
             }
             Step::Upload { identity, key, document, .. } => {
                 let bytes = document.clone().into_bytes();
-                let path = format!("/api/store/doc/{key}");
+                let path = crate::plm::identity::doc_path(key);
                 let written = with_checkout(client, key, async {
                     client.call("PUT", &path, Some(bytes)).await.map(|_| ()).map_err(|e| e.to_string())
                 })

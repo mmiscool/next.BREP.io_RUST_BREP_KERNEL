@@ -75,15 +75,17 @@ pub fn blend_smooth_chain_if_closed(
 /// A closed chain's ladder that tops out answers the same refusal for the same
 /// inputs, and a fillet selection asks it again and again: the group's cutter
 /// composition, then every drop-one subset, each blending the same collar on a
-/// solid the earlier edges did not touch there (up to four calls a case). Up
-/// to its verdict the ladder reads only the chain — every segment's edge, both
+/// solid the earlier edges did not touch there (up to four calls a case). Up to
+/// its verdict the ladder reads only the chain — every segment's edge, both
 /// mate faces (surface, sense, loops) and coedges, the signed radii — the
 /// radius, the chamfer flag, the bar and three switches, never the rest of the
 /// solid; the key is exactly those, bit for bit. Only the `chain_ladder_top`
-/// refusal is kept, and a hit returns that refusal unchanged.
-/// `BREP_CHAIN_LADDER_MEMO=0` turns the memo off; `=verify` recomputes every
-/// hit and panics unless the recomputed answer is the cached refusal, byte for
-/// byte.
+/// refusal is kept, and a hit returns that refusal unchanged. With
+/// `BREP_CHAIN_LADDER_SIGNED_KEY=1` (default off) the mates' loops leave the
+/// key and the segments' signed radii, the only reading of those loops the
+/// ladder makes, take their place. `BREP_CHAIN_LADDER_MEMO=0` turns the memo
+/// off; `=verify` recomputes every hit and panics unless the recomputed answer
+/// is the cached refusal, byte for byte.
 fn blend_closed_smooth_chain(
     solid: &BrepSolid,
     segments: &[ChainSegment<'_>],
@@ -101,7 +103,34 @@ fn blend_closed_smooth_chain(
         return blend_closed_smooth_chain_unmemoized(solid, segments, radius, chamfer, name);
     }
     let bar = crate::KernelTolerances::for_solid(solid, 1e-7).intersection_fit;
-    let key = ladder_memo_key(segments, radius, chamfer, bar);
+    // Lane F (2026-10-31, `BREP_CHAIN_LADDER_SIGNED_KEY=1`, default off):
+    // up to its verdict the ladder reads the mates' loops ONLY through the
+    // segments' signed radii (`signed_radii`, the march's and the dense
+    // contacts' one into-face probe, called with exactly these arguments);
+    // every other read is a carrier, a pcurve or an edge curve. Keyed on those
+    // signs instead of on the whole loops, a chain whose mates another blend of
+    // the same selection changed elsewhere asks the same ladder again and hits.
+    let signed = if chain_ladder_signed_key_on() {
+        let mut signs = Vec::with_capacity(segments.len());
+        for segment in segments {
+            match crate::blend::stations::signed_radii(
+                segment.edge,
+                segment.first.face,
+                segment.first.coedge,
+                segment.second.face,
+                segment.second.coedge,
+                radius,
+            ) {
+                Ok(pair) => signs.push(pair),
+                // The march refuses at the same call: nothing to key.
+                Err(_) => return blend_closed_smooth_chain_unmemoized(solid, segments, radius, chamfer, name),
+            }
+        }
+        Some(signs)
+    } else {
+        None
+    };
+    let key = ladder_memo_key(segments, radius, chamfer, bar, signed.as_deref());
     let cached = LADDER_MEMO.with(|memo| memo.borrow().iter().find(|(stored, _)| *stored == key).map(|(_, refusal)| refusal.clone()));
     if let (Some(refusal), false) = (&cached, verify) {
         crate::blend::record_count("count.chain_ladder_memo.hit", 1);
@@ -128,6 +157,13 @@ fn blend_closed_smooth_chain(
     result
 }
 
+/// Whether the ladder memo keys a chain's mates by the segments' signed radii
+/// instead of their whole loops (lane F 2026-10-31): OFF unless
+/// `BREP_CHAIN_LADDER_SIGNED_KEY=1` (or `on`).
+fn chain_ladder_signed_key_on() -> bool {
+    switch!("BREP_CHAIN_LADDER_SIGNED_KEY", false)
+}
+
 /// How many topped-out ladders the memo keeps (oldest dropped first).
 const LADDER_MEMO_CAPACITY: usize = 32;
 
@@ -137,7 +173,7 @@ thread_local! {
 }
 
 /// Every input the closed-chain ladder reads up to its verdict, as raw bits.
-fn ladder_memo_key(segments: &[ChainSegment<'_>], radius: f64, chamfer: bool, bar: f64) -> Vec<u64> {
+fn ladder_memo_key(segments: &[ChainSegment<'_>], radius: f64, chamfer: bool, bar: f64, signed: Option<&[(f64, f64)]>) -> Vec<u64> {
     fn curve(key: &mut Vec<u64>, curve: &NurbsCurve) {
         key.extend([curve.degree as u64, curve.knots.len() as u64, curve.control_points.len() as u64]);
         key.extend(curve.knots.iter().map(|knot| knot.to_bits()));
@@ -145,7 +181,7 @@ fn ladder_memo_key(segments: &[ChainSegment<'_>], radius: f64, chamfer: bool, ba
             key.extend([point.x.to_bits(), point.y.to_bits(), point.z.to_bits(), point.w.to_bits()]);
         }
     }
-    fn face(key: &mut Vec<u64>, face: &FaceRecord) {
+    fn face(key: &mut Vec<u64>, face: &FaceRecord, loops: bool) {
         let surface = &face.surface;
         key.extend([face.id, face.same_sense as u64, surface.degree_u as u64, surface.degree_v as u64]);
         key.extend([surface.knots_u.len() as u64, surface.knots_v.len() as u64, surface.control_points.len() as u64]);
@@ -155,6 +191,9 @@ fn ladder_memo_key(segments: &[ChainSegment<'_>], radius: f64, chamfer: bool, ba
             for point in row {
                 key.extend([point.x.to_bits(), point.y.to_bits(), point.z.to_bits(), point.w.to_bits()]);
             }
+        }
+        if !loops {
+            return;
         }
         key.push(face.loops.len() as u64);
         for loop_record in &face.loops {
@@ -174,15 +213,19 @@ fn ladder_memo_key(segments: &[ChainSegment<'_>], radius: f64, chamfer: bool, ba
         wall_verdict_on() as u64,
         local_continue_on() as u64,
         segments.len() as u64,
+        signed.is_some() as u64,
     ];
-    for segment in segments {
+    for (index, segment) in segments.iter().enumerate() {
+        if let Some((rho1, rho2)) = signed.and_then(|signs| signs.get(index)) {
+            key.extend([rho1.to_bits(), rho2.to_bits()]);
+        }
         let edge = segment.edge;
         key.extend([edge.id, edge.start_vertex_id, edge.end_vertex_id, edge.t0.to_bits(), edge.t1.to_bits(), segment.forward as u64]);
         curve(&mut key, &edge.curve);
         for mate in [&segment.first, &segment.second] {
             key.extend([mate.coedge.id, mate.coedge.edge_id, mate.coedge.forward as u64, mate.loop_index as u64, mate.rho.to_bits()]);
             curve(&mut key, &mate.coedge.pcurve);
-            face(&mut key, mate.face);
+            face(&mut key, mate.face, signed.is_none());
         }
     }
     key
@@ -483,44 +526,16 @@ const PIECE_TRACK_CEILING: usize = 4096;
 /// seeded (`rail_deviation`'s reading, shared with the dense diagnostic).
 fn closest_on_rail(curve: &NurbsCurve, target: Vec3, seed: f64, reach: f64) -> Result<f64, KernelRefusal> {
     let [low, high] = curve.domain().or_refuse(KernelStage::Refine, "domain")?;
-    let distance = |u: f64| -> Result<f64, KernelRefusal> {
-        Ok(curve.derivatives_extended(u, 0).or_refuse(KernelStage::Refine, "derivatives_extended")?[0].sub(target).length())
-    };
-    let mut u = seed.clamp(low, high);
-    let mut best = distance(u)?;
-    for _ in 0..40 {
-        let derivatives = curve.derivatives_extended(u, 2).or_refuse(KernelStage::Refine, "derivatives_extended")?;
-        let offset = derivatives[0].sub(target);
-        let slope = offset.dot(derivatives[1]);
-        let curvature = derivatives[1].dot(derivatives[1]) + offset.dot(derivatives[2]);
-        // Off a minimum's basin the Newton step points the wrong way; walk
-        // downhill by the bound instead and let the test below shorten it.
-        let mut step = if curvature > 0.0 {
-            (slope / curvature).clamp(-reach, reach)
-        } else {
-            reach.copysign(slope)
-        };
-        let mut trial = (u - step).clamp(low, high);
-        let mut trial_distance = distance(trial)?;
-        for _ in 0..30 {
-            if trial_distance < best {
-                break;
-            }
-            step *= 0.5;
-            trial = (u - step).clamp(low, high);
-            trial_distance = distance(trial)?;
-        }
-        if !(trial_distance < best) {
-            break;
-        }
-        let moved = (trial - u).abs();
-        u = trial;
-        best = trial_distance;
-        if moved < 1e-15 {
-            break;
-        }
-    }
-    Ok(best)
+    let (u, _) = crate::projection::curve_foot_newton(curve, target, seed, [low, high],
+        crate::projection::CurveFootPolicy {
+            domain: crate::projection::FootDomain::Clamp,
+            iterations: 40,
+            slope_guard: -1.0, // nonpositive curvature uses the downhill step
+            step_limit: reach,
+            parameter_tolerance: 1e-15,
+            mode: crate::projection::FootMode::Backtracked,
+        }).or_refuse(KernelStage::Refine, "curve_foot_newton")?;
+    Ok(curve.derivatives_extended(u, 0).or_refuse(KernelStage::Refine, "derivatives_extended")?[0].sub(target).length())
 }
 
 /// Points of every interval the LOCAL-INSERTION path judges a chain rung's
@@ -772,12 +787,17 @@ fn stencil_solve_prepared(p: Vec3, nodes: &[Vec3], base: usize, j: usize, radius
         (c, c1, c2)
     };
     let start = j as f64 - base as f64;
+    let initial = prepared.and_then(|cache| cache.start(base, j, &curve));
+    let point_length = p.length();
     let mut s = start;
     let mut converged = false;
-    for _ in 0..50 {
-        let (c, c1, c2) = curve(s);
+    let mut converged_point = None;
+    for iteration in 0..50 {
+        let state = if iteration == 0 { initial.unwrap_or_else(|| WallStart::new(curve(s))) }
+            else { WallStart::new(curve(s)) };
+        let (c, c1, c2) = state.curve;
         let w = c.sub(p);
-        let (g, slope) = (w.dot(c1), c1.dot(c1) + w.dot(c2));
+        let (g, slope) = (w.dot(c1), state.tangent_squared + w.dot(c2));
         if !(g.is_finite() && slope.is_finite()) || slope == 0.0 {
             wall_decline(|| format!("stencil {n} nodes base {base} j {j}: slope {slope:e} g {g:e} at s {s}"));
             return Solve::Unread;
@@ -794,9 +814,10 @@ fn stencil_solve_prepared(p: Vec3, nodes: &[Vec3], base: usize, j: usize, radius
         // distance is off the true stationary one by about
         // ½·|g|·δs/|C − p| ≤ 8ε·(|p| + |C|)·|C′|/ρ for δs within the
         // one-node window, far below any bar.
-        let stationary = g.abs() <= 16.0 * f64::EPSILON * (p.length() + c.length()) * c1.length();
+        let stationary = g.abs() <= 16.0 * f64::EPSILON * (point_length + state.point_length) * state.tangent_length;
         if stationary {
             converged = true;
+            converged_point = Some(c);
             break;
         }
         let step = g / slope;
@@ -826,7 +847,7 @@ fn stencil_solve_prepared(p: Vec3, nodes: &[Vec3], base: usize, j: usize, radius
         wall_decline(|| format!("stencil {n} nodes base {base} j {j}: no convergence in 50 steps, s {s}"));
         return Solve::Unread;
     }
-    let distance = curve(s).0.sub(p).length() - radius;
+    let distance = converged_point.unwrap_or_else(|| curve(s).0).sub(p).length() - radius;
     if distance.is_finite() {
         Solve::Read(distance)
     } else {
@@ -870,7 +891,7 @@ pub(in crate::blend) fn wall_probe_reading(p: Vec3, nodes: &[Vec3], j: usize, ra
 /// would still hide. `None` when any reading is unreadable.
 
 fn wall_solve_reuse_on() -> bool {
-    std::env::var("BREP_WALL_SOLVE_REUSE").map_or(true, |value| value != "0" && value != "off")
+    switch!(live "BREP_WALL_SOLVE_REUSE", true)
 }
 
 pub(in crate::blend) fn declared_wall_probe(p: Vec3, fine: &[Vec3], jf: usize, radius: f64) -> Option<(f64, f64)> {
@@ -1297,7 +1318,7 @@ thread_local! {
 /// census promotes it). The ladder repeats its local rounds from scratch on
 /// every rung.
 fn local_continue_on() -> bool {
-    std::env::var("BREP_CHAIN_LOCAL_CONTINUE").as_deref() == Ok("1")
+    switch!(live "BREP_CHAIN_LOCAL_CONTINUE", false)
 }
 
 /// The most local rounds a rung may take with the switch on.
@@ -2386,13 +2407,37 @@ pub(in crate::blend) struct PreparedWall<'a> {
     coarse_stencils: StencilPreparation,
 }
 
+#[derive(Clone, Copy)]
+struct WallStart {
+    curve: (Vec3, Vec3, Vec3),
+    point_length: f64,
+    tangent_length: f64,
+    tangent_squared: f64,
+}
+impl WallStart {
+    fn new(curve: (Vec3, Vec3, Vec3)) -> Self {
+        Self { point_length: curve.0.length(), tangent_length: curve.1.length(),
+            tangent_squared: curve.1.dot(curve.1), curve }
+    }
+}
+
 struct StencilPreparation {
     finite: bool,
     coefficients: std::cell::RefCell<Vec<Option<[Vec3; 4]>>>,
+    // Every section probe starts at the same integer position of a stencil.
+    // Cache that exact evaluation, not a converged foot of another probe.
+    starts: std::cell::RefCell<Vec<[Option<WallStart>; 2]>>,
 }
 impl StencilPreparation {
     fn new(nodes: &[Vec3]) -> Self {
-        Self { finite: wall_nodes_finite(nodes), coefficients: std::cell::RefCell::new(vec![None; nodes.len().saturating_sub(3)]) }
+        Self { finite: wall_nodes_finite(nodes), coefficients: std::cell::RefCell::new(vec![None; nodes.len().saturating_sub(3)]),
+            starts: std::cell::RefCell::new(vec![[None; 2]; nodes.len().saturating_sub(3)]) }
+    }
+    fn start(&self, base: usize, j: usize, curve: &impl Fn(f64) -> (Vec3, Vec3, Vec3)) -> Option<WallStart> {
+        let offset = j.checked_sub(base)?;
+        if !(1..=2).contains(&offset) { return None; }
+        let mut entries = self.starts.borrow_mut();
+        Some(*entries.get_mut(base)?[offset-1].get_or_insert_with(|| WallStart::new(curve(offset as f64))))
     }
     fn coefficients(&self, nodes: &[Vec3], base: usize) -> [Vec3; 4] {
         let mut entries = self.coefficients.borrow_mut();
@@ -2418,7 +2463,7 @@ fn wall_coarse(fine: &[Vec3]) -> Vec<Vec3> {
 }
 
 fn wall_preparation_on() -> bool {
-    std::env::var("BREP_WALL_PREPARE").ok().as_deref() != Some("0")
+    switch!(live "BREP_WALL_PREPARE", true)
 }
 
 impl<'a> PreparedWall<'a> {

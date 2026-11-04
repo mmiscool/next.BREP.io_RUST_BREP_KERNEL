@@ -458,21 +458,9 @@ fn perspective(fov_deg: f64, aspect: f64, near: f64, far: f64) -> Mat4 {
 // Colour
 // ---------------------------------------------------------------------------
 
-fn srgb_to_linear(c: f64) -> f64 {
-    if c <= 0.04045 {
-        c / 12.92
-    } else {
-        ((c + 0.055) / 1.055).powf(2.4)
-    }
-}
+use brep_render::color::{srgb_to_linear, linear_to_srgb};
 
-fn linear_to_srgb(c: f64) -> f64 {
-    if c <= 0.0031308 {
-        c * 12.92
-    } else {
-        1.055 * c.powf(1.0 / 2.4) - 0.055
-    }
-}
+
 
 fn to_linear(c: [u8; 3]) -> [f64; 3] {
     [

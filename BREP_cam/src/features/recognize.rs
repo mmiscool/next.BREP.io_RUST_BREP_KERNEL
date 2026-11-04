@@ -651,7 +651,7 @@ fn boss_wall_refusal(ctx: &Ctx<'_>, walls: &[&Neighbour<'_>], base_z: f64) -> Op
             _ => return Some(format!("wall {name} is drafted or curved; needs 3D finishing or another setup")),
         }
         type Key = (u64, u64, u64);
-        let key = |p: Point3| -> Key { (p.x.to_bits(), p.y.to_bits(), p.z.to_bits()) };
+        let key = |p: Point3| -> Key { (crate::geom::canonical_bits(p.x), crate::geom::canonical_bits(p.y), crate::geom::canonical_bits(p.z)) };
         let mut edges: BTreeMap<(Key, Key), (Point3, Point3, u32)> = BTreeMap::new();
         for triangle in ctx.input.mesh.triangles.iter().filter(|t| t.face == wall.face) {
             let v = triangle.vertices();

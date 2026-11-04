@@ -5,7 +5,7 @@ use crate::drop::{finish::{FinishContext,invalid,polyline,MAX_SOURCE_SEGMENTS},D
 use std::collections::BTreeMap;
 
 type VertexKey=[u64;3];
-fn key(p:Point3)->VertexKey {[p.x,p.y,p.z].map(|x|if x==0. {0} else {x.to_bits()})}
+fn key(p:Point3)->VertexKey {[p.x,p.y,p.z].map(crate::geom::canonical_bits)}
 struct Trace {a:Point3,b:Point3,first:u32,second:u32,transverse:Point3}
 /// A ball centre lies radius units along the outward facet normal. This 3D
 /// predicate works for vertical walls as well as height-field facets.

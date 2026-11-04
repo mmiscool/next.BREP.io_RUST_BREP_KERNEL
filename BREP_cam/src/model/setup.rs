@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 /// Every algorithm runs in MACHINE coordinates (cutter axis +Z, depths descend
 /// in Z). `model_to_machine` is the only transform CAM applies to geometry;
 /// the default aligns model +Z with machine +Z.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Setup {
@@ -55,6 +56,7 @@ impl Setup {
 }
 
 /// The work offset the post program uses.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[serde(default)]
@@ -72,6 +74,7 @@ impl Default for WorkOffset {
 }
 
 /// Program number and comment for the NC output.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProgramInfo {
@@ -83,6 +86,7 @@ pub struct ProgramInfo {
 
 /// Raw material definition. Geometric stock is given in MODEL coordinates and
 /// transformed with the setup; `FromRest` chains setups.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 #[non_exhaustive]
@@ -196,6 +200,7 @@ impl Stock {
 }
 
 /// Safe heights in MACHINE Z. Absolute values; the operation may override.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[serde(default)]

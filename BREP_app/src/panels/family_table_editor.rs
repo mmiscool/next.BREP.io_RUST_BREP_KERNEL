@@ -238,52 +238,22 @@ pub fn column_title(column: &FamilyColumn) -> &str {
 // --- Tab-separated paste ----------------------------------------------------
 
 /// Split clipboard text into rows of cells the way spreadsheets write it:
-/// tab between cells, a newline (`\n` or `\r\n`) between rows, and a cell
-/// holding a tab, a newline or a quote wrapped in double quotes with inner
-/// quotes doubled. A trailing newline does not make an empty last row.
+/// tab between cells, a line break (`\n`, `\r\n` or `\r`) between rows, and
+/// a cell holding a tab, a line break or a quote wrapped in double quotes with
+/// inner quotes doubled. A trailing line break does not make an empty last row,
+/// and a leading byte-order mark is not part of the first cell.
+///
+/// The reader is the kernel's `text::delimited`, the one the PLM's CSV import
+/// uses, read LENIENTLY: a paste shows what was copied and never refuses, so an
+/// unclosed quote ends at the end of the text and text after a closing quote
+/// stays in its cell.
 pub fn parse_tsv(text: &str) -> Vec<Vec<String>> {
-    let mut rows = Vec::new();
-    let mut row = Vec::new();
-    let mut cell = String::new();
-    let mut chars = text.chars().peekable();
-    let mut at_cell_start = true;
-    while let Some(ch) = chars.next() {
-        match ch {
-            '"' if at_cell_start => {
-                // A quoted cell: read to the closing quote, `""` is a quote.
-                loop {
-                    match chars.next() {
-                        Some('"') if chars.peek() == Some(&'"') => {
-                            chars.next();
-                            cell.push('"');
-                        }
-                        Some('"') | None => break,
-                        Some(c) => cell.push(c),
-                    }
-                }
-                at_cell_start = false;
-            }
-            '\t' => {
-                row.push(std::mem::take(&mut cell));
-                at_cell_start = true;
-            }
-            '\r' if chars.peek() == Some(&'\n') => {}
-            '\n' | '\r' => {
-                row.push(std::mem::take(&mut cell));
-                rows.push(std::mem::take(&mut row));
-                at_cell_start = true;
-            }
-            c => {
-                cell.push(c);
-                at_cell_start = false;
-            }
-        }
-    }
-    if !cell.is_empty() || !row.is_empty() {
-        row.push(cell);
-        rows.push(row);
-    }
-    rows
+    use brep_render::brep_kernel::text::delimited;
+    delimited::parse(delimited::strip_bom(text), '\t', delimited::Strictness::Lenient)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|record| record.fields)
+        .collect()
 }
 
 /// Where a pasted column lands.
@@ -1062,7 +1032,7 @@ impl FamilyTableEditor {
             self.hits.insert("family:copy_table".into(), copy.rect);
             if copy.clicked() {
                 ui.ctx().copy_text(to_tsv(table));
-                self.status = format!("copied {} rows", table.rows.len());
+                self.status = format!("copied {}", crate::panels::count(table.rows.len(), "row", "rows"));
             }
             ui.separator();
             let plm = self.plm.active();

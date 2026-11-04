@@ -34,6 +34,9 @@ use std::collections::HashMap;
 /// The sketch panel's transient UI state (the sketch itself lives in the engine).
 #[derive(Default)]
 pub struct SketchPanel {
+    text_dialog: Option<(serde_json::Value, String, String)>,
+    text_error: Option<String>,
+    text_hits: HashMap<String, egui::Rect>,
     /// Per-frame Sketch-actions card widget rects, published as `__brepSketchHit`.
     ctx_hits: HashMap<String, egui::Rect>,
     /// Per-frame entity-list widget rects, published as `__brepSketchListHit`.
@@ -137,6 +140,9 @@ impl SketchPanel {
         let construction = state.sketch_selection_all_construction();
 
         let mut items: Vec<ActionItem> = Vec::new();
+        if state.sketch_selected_text().is_some() {
+            items.push(ActionItem::new("text", "Edit text", "Edit text contents and font"));
+        }
         for action in &actions {
             items.push(ActionItem::new(
                 format!("constraint:{}", action.symbol),
@@ -198,6 +204,10 @@ impl SketchPanel {
         };
 
         match clicked.as_deref() {
+            Some("text") => {
+                self.text_dialog = state.sketch_selected_text();
+                self.text_error = None;
+            }
             Some(key) if key.starts_with("constraint:") => {
                 state.sketch_add_constraint(&key["constraint:".len()..]);
             }
@@ -218,6 +228,40 @@ impl SketchPanel {
             }
             _ => {}
         }
+    }
+
+    pub fn show_text_dialog(&mut self, ctx: &egui::Context, state: &mut EngineState) {
+        self.text_hits.clear();
+        if !state.sketch_mode() { self.text_dialog = None; }
+        let Some((id, text, font)) = &mut self.text_dialog else { return; };
+        let mut open = true;
+        let mut apply = false;
+        let mut cancel = false;
+        let modal = egui::Modal::new(egui::Id::new("sketch-text-dialog")).show(ctx, |ui| {
+            ui.heading("Sketch text");
+            ui.label("Text");
+            self.text_hits.insert("text:contents".into(), ui.text_edit_singleline(text).rect);
+            ui.label("Font");
+            let fonts: Vec<(String, &str, &str)> = brep_render::sketch::text::FONTS.iter().map(|name| (name.to_string(), *name, *name)).collect();
+            crate::form::enum_dropdown(ui, "text:font", &fonts, font, None, Some(&mut self.text_hits));
+            if let Some(error) = &self.text_error { ui.colored_label(egui::Color32::RED, error); }
+            ui.horizontal(|ui| {
+                let response = ui.button("Apply");
+                apply = response.clicked();
+                self.text_hits.insert("text:apply".into(), response.rect);
+                let response = ui.button("Cancel");
+                cancel = response.clicked();
+                self.text_hits.insert("text:cancel".into(), response.rect);
+            });
+        });
+        if modal.should_close() { open = false; }
+        if apply {
+            match state.sketch_edit_text(id, text, font) {
+                Ok(()) => open = false,
+                Err(error) => self.text_error = Some(error),
+            }
+        }
+        if !open || cancel { self.text_dialog = None; self.text_error = None; }
     }
 
     /// The sketch-mode LEFT panel: Curves / Points / Constraints as selectable,
@@ -279,7 +323,9 @@ impl SketchPanel {
         if !state.sketch_mode() {
             return "{}".to_string();
         }
-        crate::automation::hit_rects::hits_json(&self.ctx_hits)
+        let mut hits = self.ctx_hits.clone();
+        hits.extend(self.text_hits.clone());
+        crate::automation::hit_rects::hits_json(&hits)
     }
 
     /// The ENTITY LIST's widget rects (egui points), published as
@@ -332,7 +378,7 @@ impl SketchPanel {
             "geometries": session.map(|s| s.doc.geometries.len()),
             "constraints": session.map(|s| s.doc.constraints.len()),
             // S2 picking state (the headless verifier asserts hover/selection).
-            "hovered": session.and_then(|s| s.hovered.clone()),
+            "hovered": session.and_then(|s| s.selection.hovered.clone()),
             "selectionCount": state.sketch_selection_count(),
             // Constraint selection (select + delete): how many selected refs are
             // constraints, so the verifier can assert a constraint pick + delete.
@@ -586,6 +632,7 @@ fn solver_settings_section(ui: &mut egui::Ui, collapsed: &mut bool, state: &mut 
 /// separate PANELS because they are separate blobs: `sketch` is the floating
 /// actions card, `sketchlist` the scrolling entity list that owns a `panel:clip`.
 pub static HIT_KEYS: &[HitKeyDoc] = &[
+    HitKeyDoc { panel: "sketch", prefix: "text", meaning: "edit selected text; text:contents, text:font (its entries text:font#<name> while open), text:apply and text:cancel address the dialog", command: None },
     HitKeyDoc { panel: "sketch", prefix: "constraint:", meaning: "apply the offered sketch constraint to the selection (constraint:glyph, e.g. constraint:⌒)", command: None },
     HitKeyDoc { panel: "sketch", prefix: "fix", meaning: "ground the selected points, or unground them when all are grounded", command: None },
     HitKeyDoc { panel: "sketch", prefix: "construction", meaning: "flip the selection between construction and regular geometry", command: None },

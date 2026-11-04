@@ -118,6 +118,10 @@ pub struct State {
     pub suppliers: Vec<Company>,
     /// The administrator's policy choices ([`Settings`]).
     pub settings: Settings,
+    /// The workspace model the store is at ([`crate::workspace::MODEL`]);
+    /// an older one is brought up to date when the store opens.
+    #[serde(default)]
+    pub workspace_model: u32,
     pub changes: Vec<Change>,
     /// The lowest sequence the change log can still answer for completely.
     /// It moves only when [`CHANGE_LOG_LIMIT`] forces entries out, so a
@@ -278,6 +282,11 @@ impl Db {
                 "part and revision identities must match their current number and label"));
         }
         let before = sql::small_value(&mut state);
+        // A store with no workspace entries has nothing to convert: it is at
+        // the current model from the start, with no audited change.
+        if state.workspace.iter().next().is_none() {
+            state.workspace_model = crate::workspace::MODEL;
+        }
 
         let mut seeded = None;
         if state.part_types.is_empty() {
@@ -341,6 +350,9 @@ impl Db {
             Err(error) => eprintln!("brep-plm: could not sweep attachment files: {error}"),
         }
         db.recover_workflows().map_err(io::Error::other)?;
+        if db.read(|state| state.workspace_model < crate::workspace::MODEL) {
+            db.mutate(crate::workspace::migrate).map_err(io::Error::other)?;
+        }
         Ok((db, seeded))
     }
 
@@ -867,11 +879,30 @@ fn restore_small(state: &mut State, before: &Value) -> Result<(), Error> {
 }
 
 /// Write `body` to `path` through a temporary file and a rename, so a reader
-/// never sees a partial file.
-pub(crate) fn write_atomic(path: &Path, body: &str) -> io::Result<()> {
-    let temp = path.with_extension("tmp");
-    fs::write(&temp, body)?;
-    fs::rename(&temp, path)
+/// never sees a partial file and a crash never leaves a short one: the
+/// temporary sits beside `path` (same file system, so the rename is atomic),
+/// is named for this process and write (`<name>.<pid>-<n>.tmp`, so two
+/// writers never share one and it never replaces `path`'s extension), is
+/// flushed to disk before the rename, and is removed when any step fails.
+pub(crate) fn write_atomic(path: &Path, body: impl AsRef<[u8]>) -> io::Result<()> {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let name = path.file_name().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no file name"))?;
+    let mut temp_name = name.to_os_string();
+    temp_name.push(format!(".{}-{}.tmp", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
+    let temp = path.with_file_name(temp_name);
+    let written = (|| {
+        let mut file = fs::OpenOptions::new().write(true).create_new(true).open(&temp)?;
+        file.write_all(body.as_ref())?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&temp, path)
+    })();
+    if written.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+    written
 }
 
 // ===========================================================================
@@ -2778,3 +2809,4 @@ pub(crate) fn find_revision_mut<'a>(
         .ok_or_else(|| Error::not_found("revision"))?;
     Ok((number, revision))
 }
+

@@ -183,6 +183,11 @@ impl EngineState {
         self.camera.state_json()
     }
 
+    /// [`Self::camera_state_json`] as a JSON value.
+    pub fn camera_state_value(&self) -> serde_json::Value {
+        self.camera.state_value()
+    }
+
     pub fn apply_camera_state_json(&mut self, json: &str) -> Result<(), String> {
         self.camera.apply_state_json(json)?;
         self.dirty = true;

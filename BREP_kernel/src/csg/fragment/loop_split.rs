@@ -52,14 +52,13 @@ pub(super) enum LoopSplitMode {
     On,
 }
 
-/// `BREP_LOOP_SPLIT`, read once per process.
+/// `BREP_LOOP_SPLIT`, read once per process (while `BREP_ENV_READ_ONCE` is on).
 pub(super) fn loop_split_mode() -> LoopSplitMode {
-    static MODE: std::sync::OnceLock<LoopSplitMode> = std::sync::OnceLock::new();
-    *MODE.get_or_init(|| match std::env::var("BREP_LOOP_SPLIT").as_deref() {
-        Ok("0") | Ok("off") => LoopSplitMode::Off,
-        Ok("check") => LoopSplitMode::Check,
-        _ => LoopSplitMode::On,
-    })
+    match mode_switch!("BREP_LOOP_SPLIT", true) {
+        crate::env_read::Mode::Off => LoopSplitMode::Off,
+        crate::env_read::Mode::Check => LoopSplitMode::Check,
+        crate::env_read::Mode::On => LoopSplitMode::On,
+    }
 }
 
 /// Why the loop split left a face to the arrangement. Named so the census
@@ -301,7 +300,7 @@ fn signed_area(polygon: &[Vec2]) -> f64 {
     for index in 0..polygon.len() {
         let a = polygon[index];
         let b = polygon[(index + 1) % polygon.len()];
-        area += 0.5 * (a.x * b.y - b.x * a.y);
+        area += 0.5 * (crate::polygon::area_term([a.x, a.y], [b.x, b.y]));
     }
     area
 }
@@ -392,6 +391,16 @@ pub(super) fn loop_split_face(
     loop_split_face_impl(solid, operand, face, face_key, piece_ids, index, cycles, shared_rings, touch_rings, touch_rings && junction_chords_enabled())
 }
 
+/// A periodic chart join: two section arcs close physically at one seam
+/// vertex but form a chord between its two distinct boundary-chart uses.
+/// The original pcurves and all crossing/clearance checks are retained.
+/// On by default; `BREP_LOOP_SPLIT_PERIODIC_JOINS=0`/`off` retains the
+/// arrangement fallback for this class.
+pub(super) fn periodic_chart_joins_enabled() -> bool {
+    switch!(live "BREP_LOOP_SPLIT_PERIODIC_JOINS", true)
+}
+
+
 /// `BREP_LOOP_SPLIT_JUNCTION_CHORDS` (lane X row 6): the touching pieces of a
 /// face reach TWO or more loop junctions through vertices inside the face (the
 /// wall of a bore tangent to the box wall: each cap circle crosses the chart
@@ -402,8 +411,7 @@ pub(super) fn loop_split_face(
 /// end on no loop declines. On by default: `0`/`off` declines the class (it
 /// needs `BREP_LOOP_SPLIT_TOUCH_RINGS`).
 pub(super) fn junction_chords_enabled() -> bool {
-    let enabled = !matches!(std::env::var("BREP_LOOP_SPLIT_JUNCTION_CHORDS").as_deref(), Ok("0") | Ok("off"));
-    enabled
+    switch!(live "BREP_LOOP_SPLIT_JUNCTION_CHORDS", true)
 }
 
 
@@ -415,8 +423,7 @@ pub(super) fn junction_chords_enabled() -> bool {
 /// the disc its own region; so does the split. On by default: `0`/`off`
 /// declines the class.
 pub(super) fn touch_rings_enabled() -> bool {
-    let enabled = !matches!(std::env::var("BREP_LOOP_SPLIT_TOUCH_RINGS").as_deref(), Ok("0") | Ok("off"));
-    enabled
+    switch!(live "BREP_LOOP_SPLIT_TOUCH_RINGS", true)
 }
 
 
@@ -723,7 +730,36 @@ fn loop_split_face_impl(
                 }
             }
         }
-        if junctions.len() >= 2 {
+        // A single minted seam vertex has TWO chart uses. Certify those
+        // uses at opposite ends of exactly one periodic coordinate, and
+        // certify the other junction by vertex identity AND chart agreement.
+        // This is an open chart chord, not a UV-closed touching ring. No seam
+        // hop is admitted inside the chord or across any ordinary loop join.
+        let periodic_chord = junctions.len() == 1 && touch_arcs.len() == 2
+            && (closed.0 != closed.1) && periodic_chart_joins_enabled()
+            && {
+                let junction = junctions[0];
+                let ends = touch_arcs.iter().map(|(entry, start, end)| {
+                    if *start == junction && *end != junction {
+                        Some((entry.start(), entry.start_point, *end, entry.end()))
+                    } else if *end == junction && *start != junction {
+                        Some((entry.end(), entry.end_point, *start, entry.start()))
+                    } else { None }
+                }).collect::<Option<Vec<_>>>();
+                ends.is_some_and(|ends| {
+                    let (a, pa, ia, qa) = ends[0];
+                    let (b, pb, ib, qb) = ends[1];
+                    let (a_periodic, b_periodic, a_other, b_other, domain) = if closed.0 {
+                        (a.x, b.x, a.y, b.y, u_domain)
+                    } else { (a.y, b.y, a.x, b.x, v_domain) };
+                    ia == ib && qa.sub(qb).length() <= uv_match
+                        && pa.sub(pb).length() <= vertex_band
+                        && (a_other - b_other).abs() <= uv_match
+                        && (((a_periodic - domain[0]).abs() <= uv_match && (b_periodic - domain[1]).abs() <= uv_match)
+                            || ((b_periodic - domain[0]).abs() <= uv_match && (a_periodic - domain[1]).abs() <= uv_match))
+                })
+            };
+        if junctions.len() >= 2 || periodic_chord {
             chord_arcs = std::mem::take(&mut touch_arcs);
         }
     }

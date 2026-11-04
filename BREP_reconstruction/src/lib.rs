@@ -14,3 +14,4 @@ pub mod stl_conversion;
 mod hybrid_freeform_split;
 mod hybrid_recovery;
 mod hybrid_whole_freeform;
+mod hypothesis_switch;

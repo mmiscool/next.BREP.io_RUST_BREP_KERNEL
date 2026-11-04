@@ -60,15 +60,7 @@ pub fn cl_from_contact(cc: Point3, n: Point3, a: Point3, big_r: f64, r: f64) -> 
     cc.add(n.scale(r)).add(m.scale(big_r - r)).sub(a.scale(r))
 }
 
-fn slerp(a: Point3, b: Point3, t: f64) -> Point3 {
-    let d = a.dot(b).clamp(-1.0, 1.0);
-    let theta = d.acos();
-    if theta < 1e-12 {
-        return a;
-    }
-    let s = theta.sin();
-    a.scale(((1.0 - t) * theta).sin() / s).add(b.scale((t * theta).sin() / s)).normalized().unwrap_or(b)
-}
+use crate::multiaxis::slerp;
 
 /// Limit the angle between consecutive axes to `max_rad`: alternating
 /// forward and backward passes pull each axis toward its neighbour until no

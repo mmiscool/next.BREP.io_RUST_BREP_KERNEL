@@ -185,8 +185,8 @@ pub(crate) fn guard_offset(bounds: Aabb) -> Option<Vec3> {
 /// One `recentre.fired` line on stderr under `BREP_PROFILE`, the switch the
 /// boolean's and the mass integrator's profiles read.
 pub(crate) fn profile_fired(entry: &str, offset: Vec3, bounds: Aabb) {
-    if std::env::var("BREP_PROFILE").is_ok() {
-        eprintln!(
+    if crate::profile::profile_enabled() {
+        profile_line!(
             "recentre.fired entry={entry} distance={:.4e} diagonal={:.4e}",
             offset.length(),
             bounds.diagonal()

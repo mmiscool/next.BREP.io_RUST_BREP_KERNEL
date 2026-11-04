@@ -1023,19 +1023,17 @@ pub fn validate_step_file_faces_with_progress(
                 let tolerance = validation
                     .distance_tolerance
                     .max(validation.relative_face_tolerance * scale);
-                let options = RecognitionOptions {
-                    distance_tolerance: tolerance,
-                    // The relative face tolerance is already folded into the
-                    // scale-aware absolute tolerance immediately above.
-                    relative_tolerance: 0.0,
-                    normal_tolerance: validation.normal_tolerance_degrees.to_radians(),
-                    minimum_support: 1,
-                    max_hypotheses: validation.max_hypotheses.max(1),
-                    max_refinement_iterations: validation.max_refinement_iterations.max(1),
-                    discover_regions: false,
-                    sampling: SamplingMode::Vertices,
-                    ..RecognitionOptions::default()
-                };
+                let mut options = RecognitionOptions::default();
+                options.distance_tolerance = tolerance;
+                // The relative face tolerance is already folded into the
+                // scale-aware absolute tolerance immediately above.
+                options.relative_tolerance = 0.0;
+                options.normal_tolerance = validation.normal_tolerance_degrees.to_radians();
+                options.minimum_support = 1;
+                options.max_hypotheses = validation.max_hypotheses.max(1);
+                options.max_refinement_iterations = validation.max_refinement_iterations.max(1);
+                options.discover_regions = false;
+                options.sampling = SamplingMode::Vertices;
                 let triangles: Vec<_> = (0..mesh.triangles.len()).collect();
                 let initial_guess = perturbed_initial(truth, scale);
                 let fixed = constrained_fixed_parameters(truth);

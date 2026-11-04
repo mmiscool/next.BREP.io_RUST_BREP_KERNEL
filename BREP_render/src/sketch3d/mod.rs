@@ -23,7 +23,7 @@ pub use brep_kernel::{
 };
 use brep_kernel::{sketch3d_constraint_type, Vec3};
 
-use crate::sketch::session::{constraint_ref, geometry_ref, point_ref, refs_equal};
+use crate::sketch::session::{constraint_ref, geometry_ref, point_ref, refs_equal, RefSelection};
 use crate::sketch::tessellate::{interaction_color, SketchTessellation, POINT_SIZE_PX};
 use crate::sketch::PlaneFrame;
 use crate::style::SketchColors;
@@ -140,10 +140,9 @@ pub struct Sketch3dSession {
     pub doc: Sketch3dDoc,
     /// The last solve's diagnostics.
     pub diagnostics: Sketch3dDiagnostics,
-    /// Selected entity refs (`{"kind":"point"|"geometry"|"constraint","id":…}`).
-    pub selection: Vec<Value>,
-    /// The entity under the cursor.
-    pub hovered: Option<Value>,
+    /// Selected entity refs (`{"kind":"point"|"geometry"|"constraint","id":…}`)
+    /// and the entity under the cursor — the planar session's set.
+    pub selection: RefSelection,
     /// The armed draw tool (`None` = select).
     pub tool: Option<String>,
     /// The working plane a free click lands on.
@@ -158,8 +157,7 @@ impl Sketch3dSession {
         let mut session = Self {
             doc,
             diagnostics: Sketch3dDiagnostics::default(),
-            selection: Vec::new(),
-            hovered: None,
+            selection: RefSelection::default(),
             tool: None,
             work_plane: WorkPlane::default(),
             colors: SketchColors::default(),
@@ -181,23 +179,19 @@ impl Sketch3dSession {
     // --- selection / hover -------------------------------------------------
 
     pub fn is_selected(&self, entity_ref: &Value) -> bool {
-        self.selection.iter().any(|r| refs_equal(r, entity_ref))
+        self.selection.is_selected(entity_ref)
     }
 
     pub fn toggle_selection(&mut self, entity_ref: Value) {
-        if let Some(pos) = self.selection.iter().position(|r| refs_equal(r, &entity_ref)) {
-            self.selection.remove(pos);
-        } else {
-            self.selection.push(entity_ref);
-        }
+        self.selection.toggle(entity_ref)
     }
 
     pub fn clear_selection(&mut self) {
-        self.selection.clear();
+        self.selection.clear()
     }
 
     pub fn set_hover(&mut self, entity_ref: Option<Value>) {
-        self.hovered = entity_ref;
+        self.selection.hovered = entity_ref;
     }
 
     /// The selected entity refs split by kind: `(point ids, geometry ids,
@@ -206,7 +200,7 @@ impl Sketch3dSession {
         let mut points = Vec::new();
         let mut geometries = Vec::new();
         let mut constraints = Vec::new();
-        for r in &self.selection {
+        for r in &self.selection.items {
             let Some(id) = r.get("id").cloned() else { continue };
             match r.get("kind").and_then(Value::as_str) {
                 Some("point") => points.push(id),
@@ -338,8 +332,8 @@ impl Sketch3dSession {
     pub fn tessellation(&self, world_per_pixel: f64) -> SketchTessellation {
         let mut out = SketchTessellation::default();
         let colors = &self.colors;
-        let hovered = self.hovered.as_ref();
-        let selection = &self.selection;
+        let hovered = self.selection.hovered.as_ref();
+        let selection = &self.selection.items;
         let dash_len = (8.0 * world_per_pixel).max(0.02);
         let gap_len = (6.0 * world_per_pixel).max(0.01);
         for g in &self.doc.geometries {

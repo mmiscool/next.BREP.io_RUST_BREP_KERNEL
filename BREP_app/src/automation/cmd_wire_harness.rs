@@ -5,8 +5,7 @@
 //! it through the harness segments and (when bundles are on) builds the bundle
 //! solids. These are the operations `panels::wire_harness` performs, on the
 //! same engine methods.
-use crate::automation::command::{parse_args, schema_of, Annotations, CommandSpec, Ctx, Empty, Handler, NoArgs, Outcome, Phase};
-use crate::automation::cmd_document::parse;
+use crate::automation::command::{app_command, engine_call, read_engine, parse_args, schema_of, CommandSpec, Ctx, NoArgs, Outcome};
 use brep_render::engine_state::ConnectionPatch;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -73,8 +72,7 @@ pub struct ConnectionAdded {
 }
 
 fn wire_harness_state(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
-    let _: NoArgs = parse_args(args)?;
-    Ok(Outcome::Done(parse(&ctx.app.docs.engine().wire_harness_state_json())))
+    read_engine(ctx, args, |e| e.wire_harness_state_value())
 }
 
 fn wire_harness_add_connection(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
@@ -91,9 +89,7 @@ fn wire_harness_update_connection(ctx: &mut Ctx<'_>, args: Value) -> Result<Outc
 }
 
 fn wire_harness_remove_connection(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
-    let a: ConnectionIdArgs = parse_args(args)?;
-    ctx.app.docs.engine_mut().wire_harness_remove_connection(&a.id)?;
-    Ok(Outcome::Done(json!({})))
+    engine_call(ctx, args, |e, a: ConnectionIdArgs| e.wire_harness_remove_connection(&a.id))
 }
 
 fn wire_harness_set_build_bundles(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
@@ -103,9 +99,7 @@ fn wire_harness_set_build_bundles(ctx: &mut Ctx<'_>, args: Value) -> Result<Outc
 }
 
 fn wire_harness_set_cut_margin(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
-    let a: CutMarginArgs = parse_args(args)?;
-    ctx.app.docs.engine_mut().wire_harness_set_cut_margin(a.margin)?;
-    Ok(Outcome::Done(json!({})))
+    engine_call(ctx, args, |e, a: CutMarginArgs| e.wire_harness_set_cut_margin(a.margin))
 }
 
 /// Every harness wire as its BOM line — engine truth, the rows the BOM panel
@@ -135,11 +129,11 @@ fn bom_wire_lines(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
 }
 
 pub static COMMANDS: &[CommandSpec] = &[
-    CommandSpec { name: "wire_harness_state", group: "harness", doc: "The document's harness block: every connection, whether bundle solids are built, and the last run's routing report (endpoints, segments, per-connection routes, bundles).", phase: Phase::Read, annotations: Annotations::READ, args_schema: schema_of::<NoArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(wire_harness_state) },
-    CommandSpec { name: "wire_harness_add_connection", group: "harness", doc: "Add a wire between two port features and re-run the routing. Either end may be empty and filled in later. Returns the connection id.", phase: Phase::Mutate, annotations: Annotations::MUTATE, args_schema: schema_of::<AddConnectionArgs>, result_schema: schema_of::<ConnectionAdded>, handler: Handler::App(wire_harness_add_connection) },
-    CommandSpec { name: "wire_harness_update_connection", group: "harness", doc: "Patch one connection's name, ends or diameter; absent fields are unchanged.", phase: Phase::Mutate, annotations: Annotations::MUTATE, args_schema: schema_of::<UpdateConnectionArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(wire_harness_update_connection) },
-    CommandSpec { name: "wire_harness_remove_connection", group: "harness", doc: "Delete one connection and re-run the routing.", phase: Phase::Mutate, annotations: Annotations::DESTRUCTIVE, args_schema: schema_of::<ConnectionIdArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(wire_harness_remove_connection) },
-    CommandSpec { name: "wire_harness_set_cut_margin", group: "harness", doc: "Set the cut margin added once to every wire's routed length to give its BOM cut length (MF QTY). The routing is not re-done; a negative margin is refused.", phase: Phase::Mutate, annotations: Annotations::MUTATE, args_schema: schema_of::<CutMarginArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(wire_harness_set_cut_margin) },
-    CommandSpec { name: "bom_wire_lines", group: "harness", doc: "Every harness wire as its BOM line: connection ID, stock part number, routed length, margin and MF QTY (length + margin) — or no number and the status saying why (routing, cancelled, rolled-back, no-run, or the router's own status).", phase: Phase::Read, annotations: Annotations::READ, args_schema: schema_of::<NoArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(bom_wire_lines) },
-    CommandSpec { name: "wire_harness_set_build_bundles", group: "harness", doc: "Turn the bundle solids on or off. Off still routes and reports — it just builds no geometry.", phase: Phase::Mutate, annotations: Annotations::MUTATE, args_schema: schema_of::<BuildBundlesArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(wire_harness_set_build_bundles) },
+    app_command!("harness", "wire_harness_state", "The document's harness block: every connection, whether bundle solids are built, and the last run's routing report (endpoints, segments, per-connection routes, bundles).", NoArgs, wire_harness_state, Read, READ, super::domain_output_schema::wire_harness_state),
+    app_command!("harness", "wire_harness_add_connection", "Add a wire between two port features and re-run the routing. Either end may be empty and filled in later. Returns the connection id.", AddConnectionArgs, wire_harness_add_connection, Mutate, MUTATE, schema_of::<ConnectionAdded>),
+    app_command!("harness", "wire_harness_update_connection", "Patch one connection's name, ends or diameter; absent fields are unchanged.", UpdateConnectionArgs, wire_harness_update_connection, Mutate, MUTATE),
+    app_command!("harness", "wire_harness_remove_connection", "Delete one connection and re-run the routing.", ConnectionIdArgs, wire_harness_remove_connection, Mutate, DESTRUCTIVE),
+    app_command!("harness", "wire_harness_set_cut_margin", "Set the cut margin added once to every wire's routed length to give its BOM cut length (MF QTY). The routing is not re-done; a negative margin is refused.", CutMarginArgs, wire_harness_set_cut_margin, Mutate, MUTATE),
+    app_command!("harness", "bom_wire_lines", "Every harness wire as its BOM line: connection ID, stock part number, routed length, margin and MF QTY (length + margin) — or no number and the status saying why (routing, cancelled, rolled-back, no-run, or the router's own status).", NoArgs, bom_wire_lines, Read, READ, super::domain_output_schema::bom_wire_lines),
+    app_command!("harness", "wire_harness_set_build_bundles", "Turn the bundle solids on or off. Off still routes and reports — it just builds no geometry.", BuildBundlesArgs, wire_harness_set_build_bundles, Mutate, MUTATE),
 ];

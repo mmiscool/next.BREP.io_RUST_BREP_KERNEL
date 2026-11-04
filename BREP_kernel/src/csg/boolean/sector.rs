@@ -48,17 +48,10 @@ pub(super) enum SectorMode {
 
 /// [`BooleanOptions::sector_classification`] under its environment override.
 pub(super) fn sector_mode(options: &BooleanOptions) -> SectorMode {
-    match std::env::var("BREP_SECTOR_CLASS").as_deref() {
-        Ok("0") | Ok("off") => SectorMode::Off,
-        Ok("check") => SectorMode::Check,
-        Ok(_) => SectorMode::On,
-        Err(_) => {
-            if options.sector_classification {
-                SectorMode::On
-            } else {
-                SectorMode::Off
-            }
-        }
+    match mode_switch!(live "BREP_SECTOR_CLASS", options.sector_classification) {
+        crate::env_read::Mode::Off => SectorMode::Off,
+        crate::env_read::Mode::Check => SectorMode::Check,
+        crate::env_read::Mode::On => SectorMode::On,
     }
 }
 

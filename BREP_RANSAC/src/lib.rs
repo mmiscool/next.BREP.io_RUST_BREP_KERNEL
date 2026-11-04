@@ -22,11 +22,16 @@ pub use design_intent::{
     constrain_planes_perpendicular, constrain_shared_axis, constrain_tangent, DesignIntentError,
 };
 pub use error::RecognitionError;
-pub use math::Vec3;
+#[doc(hidden)]
+pub use fit::{kasa_circle_2d, FitProfile};
+pub use math::{jacobi_eigen_symmetric3, refine_cone, ConeRefinePolicy, JacobiZeroTurn, Vec3};
 pub use mesh::{AnalyzedMesh, Mesh, MeshAnalysisOptions, SourceMetadata, TriangleData};
 pub use options::{RecognitionOptions, SamplingMode};
+#[doc(hidden)]
+pub use options::{AdaptiveSampling, HypothesisPolicy};
 pub use recognize::{
     recognize_surfaces, recognize_surfaces_with_attempt_budget, recognize_surfaces_with_candidates,
+    recognize_surfaces_with_extraction_profile, ExtractionProfile,
     recognize_surfaces_with_unresolved, reconstruct_analyzed, ComponentCandidate, RecognitionWork,
     reconstruct_surface, reconstruct_surface_from_vertices,
 };

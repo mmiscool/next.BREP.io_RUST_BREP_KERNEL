@@ -651,7 +651,12 @@ impl EngineState {
     /// refreshed so the next run ingests it. Returns the EFFECTIVE entry name.
     pub(crate) fn resolve_component_insert(&mut self, insert: ComponentInsert<'_>) -> Result<String, String> {
         let part_name = match insert {
-            ComponentInsert::Existing { part_name } => part_name.to_string(),
+            ComponentInsert::Existing { part_name } => {
+                if !self.parts_library_names().iter().any(|name| name == part_name) {
+                    return Err(format!("part '{part_name}' is not in the parts library"));
+                }
+                part_name.to_string()
+            },
             ComponentInsert::New {
                 name,
                 source_key,

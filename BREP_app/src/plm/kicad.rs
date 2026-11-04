@@ -26,15 +26,10 @@
 //! in flight. A part stopped between its write and its release is an
 //! `imported` draft, and the next run finishes it.
 
+use crate::http::query_component;
 use crate::plm::client::PlmClient;
+use crate::plm::content_hash;
 use serde_json::Value;
-
-/// Lowercase hex SHA-256 of `bytes` — the server's `content_hash` of a
-/// document written with exactly these bytes.
-pub fn content_hash(bytes: &[u8]) -> String {
-    use sha2::{Digest, Sha256};
-    Sha256::digest(bytes).iter().map(|byte| format!("{byte:02x}")).collect()
-}
 
 /// What the server says about the part a `library_id` already names (a row of
 /// `GET /api/parts?external_ref=`, P8).
@@ -116,21 +111,12 @@ async fn call(client: &PlmClient, method: &'static str, path: &str, payload: Opt
     Ok(serde_json::from_slice(&response.body).unwrap_or(Value::Null))
 }
 
-fn encode(text: &str) -> String {
-    text.bytes()
-        .map(|byte| match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => (byte as char).to_string(),
-            _ => format!("%{byte:02X}"),
-        })
-        .collect()
-}
-
 /// The part `library_id` names in `part_type`, if any.
 pub async fn find(client: &PlmClient, part_type: &str, library_id: &str) -> Result<Option<ImportedRow>, String> {
     let page = call(
         client,
         "GET",
-        &format!("/api/parts?limit=2&part_type={}&external_ref={}", encode(part_type), encode(library_id)),
+        &format!("/api/parts?limit=2&part_type={}&external_ref={}", query_component(part_type), query_component(library_id)),
         None,
     )
     .await?;
@@ -143,7 +129,7 @@ pub async fn find(client: &PlmClient, part_type: &str, library_id: &str) -> Resu
 async fn write_and_release(client: &PlmClient, part: &str, revision: &str, document: &[u8]) -> Result<(), String> {
     let base = crate::plm::identity::revision_path(&part, &revision);
     call(client, "POST", &format!("{base}/checkout"), body(serde_json::json!({ "client_id": "brep-app kicad" }))).await?;
-    let written = call(client, "PUT", &format!("/api/store/doc/{}", super::identity::document_key(part, revision).replace("%", "%25")), Some(document.to_vec())).await;
+    let written = call(client, "PUT", &super::identity::doc_path(&super::identity::document_key(part, revision)), Some(document.to_vec())).await;
     call(client, "POST", &format!("{base}/checkin"), body(serde_json::json!({}))).await?;
     written?;
     call(client, "POST", &format!("{base}/state"), body(serde_json::json!({ "to": "released" }))).await?;

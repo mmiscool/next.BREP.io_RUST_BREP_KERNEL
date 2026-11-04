@@ -472,7 +472,8 @@ impl Emitter<'_, '_> {
             PmiGeometry::None
             | PmiGeometry::Leader { .. }
             | PmiGeometry::Note { .. }
-            | PmiGeometry::Explode { .. } => Ok(None),
+            | PmiGeometry::Explode { .. }
+            | PmiGeometry::Hide { .. } => Ok(None),
         }
     }
 
@@ -876,7 +877,7 @@ pub(crate) fn write_pmi(
             if report.status != PmiStatus::Ok || !report.enabled {
                 continue;
             }
-            if matches!(report.geometry, PmiGeometry::Explode { .. } | PmiGeometry::None) {
+            if matches!(report.geometry, PmiGeometry::Explode { .. } | PmiGeometry::Hide { .. } | PmiGeometry::None) {
                 continue;
             }
             let semantic = emitter.semantic(annotation, report, &env)?;

@@ -284,9 +284,7 @@ fn line_hodograph_roots(c: &SpanControls, dir: [f64; 2], lo: f64, hi: f64) -> Ve
     } else {
         let disc = b * b - 4.0 * a * cc;
         if disc >= 0.0 {
-            let root = disc.sqrt();
-            roots.push((-b - root) / (2.0 * a));
-            roots.push((-b + root) / (2.0 * a));
+            roots.extend(crate::poly::solve_quadratic(cc, b, a));
         }
     }
     roots.retain(|t| t.is_finite() && *t >= lo && *t <= hi);

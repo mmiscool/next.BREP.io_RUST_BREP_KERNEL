@@ -7,6 +7,8 @@
 //! positions in `triangles`, so an index built on a snapshot is valid for the
 //! snapshot's lifetime.
 
+pub(crate) mod core;
+
 use crate::model::{Bounds3, Point3, RigidTransform, TargetRef};
 use crate::numeric::Tolerance;
 use serde::{Deserialize, Serialize};

@@ -145,47 +145,23 @@ pub fn field_input(
     field_input_with(ui, field, current, probe, actions, None)
 }
 
-/// ONE dropdown for an enumeration — the form's enum field, for a panel's own
-/// state as much as for a schema field (the owner's rule, 2026-10-27: an
-/// enumeration is a dropdown, never a row of radio or segmented buttons).
-/// `choices` are `(value, id, label)`: the value written to `current` when the
-/// entry is chosen, the id the entry's hit key carries, and the text shown.
-/// The closed combo shows the chosen value's label (nothing when `current`
-/// matches no choice) and is as wide as `width` says (egui's own when `None`,
-/// for a combo that shares its row). `hits`, when given, gets the combo's rect
-/// under `key` and each OPEN entry's rect under `key#id`, the shape every
-/// script clicks a form's enum with (`click_widget key`, then `key#id`).
-/// Returns whether the choice changed and the combo's response.
-pub fn enum_dropdown<T: PartialEq + Clone>(
-    ui: &mut egui::Ui,
-    key: &str,
-    choices: &[(T, &str, &str)],
-    current: &mut T,
-    width: Option<f32>,
-    mut hits: Option<&mut HashMap<String, egui::Rect>>,
-) -> (bool, egui::Response) {
-    let shown = choices
-        .iter()
-        .find(|(value, _, _)| value == current)
-        .map_or_else(String::new, |(_, _, label)| label.to_string());
-    let mut combo = egui::ComboBox::from_id_salt(("form-enum", key));
-    if let Some(width) = width {
-        combo = combo.width(width);
-    }
-    let mut changed = false;
-    let combo = combo.selected_text(shown).show_ui(ui, |ui| {
-        for (value, id, label) in choices {
-            let item = ui.selectable_value(current, value.clone(), *label);
-            changed |= item.changed();
-            if let Some(map) = hits.as_deref_mut() {
-                map.insert(format!("{key}#{id}"), item.rect);
-            }
-        }
-    });
-    if let Some(map) = hits.as_deref_mut() {
-        map.insert(key.to_string(), combo.response.rect);
-    }
-    (changed, combo.response)
+pub use brep_ecad_egui::widgets::enum_dropdown;
+
+/// The form's single-line text box (a [`FieldKind::Text`] field's), for a
+/// panel field that must see its whole response — one that commits on focus
+/// loss rather than on every keystroke.
+pub fn text_input(ui: &mut egui::Ui, text: &mut String, width: f32) -> egui::Response {
+    ui.add(
+        egui::TextEdit::singleline(text)
+            .margin(crate::viewport::touch::text_edit_margin(ui))
+            .desired_width(width)
+            .min_size(crate::viewport::touch::target_size(ui.ctx(), egui::Vec2::ZERO)),
+    )
+}
+
+/// The width a form input takes in the current layout: see `input_width`.
+pub fn text_input_width(ui: &egui::Ui) -> f32 {
+    input_width(ui, ui.spacing().text_edit_width)
 }
 
 /// [`field_input`] for a form that may have a reference pick RUNNING:
@@ -276,8 +252,7 @@ pub fn field_input_with(
                 );
                 (false, r.rect)
             } else {
-                let r = ui.add(egui::TextEdit::singleline(&mut s).margin(crate::viewport::touch::text_edit_margin(ui)).desired_width(width)
-                    .min_size(crate::viewport::touch::target_size(ui.ctx(), egui::Vec2::ZERO)));
+                let r = text_input(ui, &mut s, width);
                 if r.changed() {
                     set_at(current, path, Value::String(s));
                 }

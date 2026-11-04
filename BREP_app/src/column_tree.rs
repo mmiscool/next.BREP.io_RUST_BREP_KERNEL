@@ -296,6 +296,10 @@ pub struct ColumnTreeOut {
     /// A row was clicked (select) — on its first column's label, or anywhere
     /// else along its band that no cell of its own claimed.
     pub clicked: Option<String>,
+    /// The `empty_hint` row's label rect, when the tree drew one (no rows).
+    /// Crate-private evidence for the layout tests: the hint is the one row
+    /// whose width the caller never sized, so it is the one that can overflow.
+    pub empty_hint_rect: Option<egui::Rect>,
     /// A row was double-clicked (open its dialog), over the same area as
     /// [`Self::clicked`]. egui reports the second press as a click too, so on
     /// this frame `clicked` names the same row: a consumer checks this first.
@@ -557,7 +561,22 @@ fn draw_pane(
         if let Some(hint) = spec.empty_hint {
             if offset == 0 {
                 let guides = tree::child_guides(&[], true);
-                tree::node(ui, TreeRow::leaf(&guides, true, hint), |_| {});
+                // The hint is a sentence, and the pane it is drawn in is as
+                // wide as the table's columns — wider than the dock shows when
+                // the columns scroll. The label truncates to its `Ui`, so give
+                // it the VISIBLE width (the clip), or "(no connections — add
+                // ports, attach spline ends" ran past the pane edge
+                // (ui-polish-2026-10-28 row 4).
+                let visible = (ui.clip_rect().right() - ui.cursor().left())
+                    .min(ui.available_width())
+                    .max(ui.spacing().interact_size.x);
+                let node = ui
+                    .scope(|ui| {
+                        ui.set_max_width(visible);
+                        tree::node(ui, TreeRow::leaf(&guides, true, hint), |_| {})
+                    })
+                    .inner;
+                out.empty_hint_rect = Some(node.label.rect);
             } else {
                 // The other pane still spends the same row, so the two panes
                 // keep the same height.

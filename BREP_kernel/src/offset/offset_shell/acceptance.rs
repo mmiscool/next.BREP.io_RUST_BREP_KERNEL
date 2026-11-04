@@ -39,7 +39,7 @@ pub(super) fn accept_offset_result_with_certificate(
 ) -> Result<BrepSolid, KernelRefusal> {
     if enabled && exact_single_sphere(&solid) {
         if crate::imprint::profile_enabled() {
-            eprintln!("offset_accept.profile certificate=single_sphere faces=1");
+            profile_line!("offset_accept.profile certificate=single_sphere faces=1");
         }
         return Ok(solid);
     }

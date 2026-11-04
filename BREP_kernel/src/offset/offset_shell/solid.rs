@@ -279,6 +279,56 @@ pub fn offset_shell_by_boolean(
     Ok(OffsetShellResultRecord { solid, face_images })
 }
 
+/// Lane O row 34: the CLOSED hollow, a shell with no openings. The offset
+/// body, the whole source grown or shrunk with sharp joins, against the
+/// source: `source − body` inward and `body − source` outward, so the result
+/// is the outer shell and the inner void's shell, with the walls of the band
+/// between them. `distance` carries `offset_shell`'s sign (positive inward).
+/// `face_images` are read back from the operands by surface as in
+/// [`offset_shell_by_boolean`]: `Offset` for the body's faces, `Source` for
+/// the source's.
+///
+/// The construction checks itself: the result is exactly two shells and its
+/// volume is the difference of the operands' volumes.
+pub fn offset_shell_closed(source: &BrepSolid, distance: f64) -> Result<OffsetShellResultRecord, KernelRefusal> {
+    let body = offset_body(source, &[], distance, Body::Whole, "offset_shell_closed")?;
+    let (kept, removed) = if distance > 0.0 { (source, &body.solid) } else { (&body.solid, source) };
+    let solid = boolean_operation(kept, removed, BooleanOperation::Subtract, &BooleanOptions::default())
+        .map_err(|error| {
+            error.with_message(|message| format!("offset_shell: the closed hollow's difference could not be built: {message}"))
+        })?;
+    let volume = |solid: &BrepSolid| {
+        crate::solid_mass_properties(solid)
+            .map(|properties| properties.volume)
+            .or_refuse(KernelStage::Validate, "solid_mass_properties")
+    };
+    let expected = volume(kept)? - volume(removed)?;
+    let measured = volume(&solid)?;
+    if solid.shells.len() != 2 || !(expected > 0.0) || !((measured - expected).abs() <= 1e-9 * expected) {
+        return Err(KernelRefusal::internal(
+            KernelStage::Validate,
+            "offset_shell_closed_hollow",
+            format!(
+                "offset_shell: the closed hollow is not the band between its operands ({} shells, volume {measured} against {expected})",
+                solid.shells.len()
+            ),
+        ));
+    }
+    let mut operands = body
+        .solid
+        .shells
+        .iter()
+        .flat_map(|shell| &shell.faces)
+        .zip(&body.face_images)
+        .map(|(face, image)| (face, image.clone()))
+        .collect::<Vec<_>>();
+    operands.extend(source.shells.iter().flat_map(|shell| &shell.faces).map(|face| {
+        (face, OffsetShellFaceImageRecord { role: OffsetFaceRole::Source, source_face_id: face.id })
+    }));
+    let face_images = provenance_by_surface(&solid, &operands, None)?;
+    Ok(OffsetShellResultRecord { solid, face_images })
+}
+
 /// Whether a refusal of the direct pipeline is one of its OWN named
 /// inabilities, the ones the boolean recipe can answer differently: an
 /// `offset_shell_*` unsupported-geometry or internal refusal, or the

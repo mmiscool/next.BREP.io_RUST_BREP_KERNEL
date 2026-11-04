@@ -60,10 +60,59 @@ body.motion #timeline, body.step-motion #timeline { display:flex; }
 #timeline .marks { position:absolute; left:112px; right:11em; top:4px; height:4px; pointer-events:none; }
 #timeline .marks span { position:absolute; top:0; width:2px; height:4px; background:var(--caution); }
 #timeline .clash { color:var(--caution); min-width:7em; }
+/* The tabs: Steps (the instructions), Model (the assembly tree over the
+   model, every part shown or hidden on its own) and Parts (a card per part). */
+#tabs { display:none; gap:4px; }
+body.has-assembly #tabs { display:flex; }
+#tabs button { min-height:36px; padding:6px 14px; border-radius:8px; }
+#tabs button[aria-selected=true] { background:var(--accent); color:#111; border-color:var(--accent); font-weight:600; }
+#tree, #part-info, #parts { display:none; }
+body.tab-model #checklist, body.tab-model #details, body.tab-model footer, body.tab-model #timeline { display:none; }
+body.tab-model main, body.tab-model.customer main { grid-template-columns:300px 1fr 300px; }
+body.tab-model #tree, body.tab-model #part-info { display:block; overflow:auto; padding:12px; background:var(--panel); }
+#tree { border-right:1px solid var(--line); }
+#part-info { border-left:1px solid var(--line); }
+body.tab-parts main, body.tab-parts footer, body.tab-parts #timeline { display:none; }
+body.tab-parts #parts { display:block; overflow:auto; padding:16px; min-height:0; }
+.tree-tools { display:flex; flex-wrap:wrap; gap:6px; margin-bottom:10px; }
+.tree-tools button, .part-actions button, .uses button { min-height:32px; padding:4px 10px; border-radius:7px; font-size:14px; }
+.row { display:flex; align-items:center; gap:4px; min-height:32px; border-radius:6px; padding-right:4px; }
+.row.selected { background:#26394a; }
+.row.off .name { color:var(--dim); text-decoration:line-through; }
+.row .twist { width:22px; height:22px; flex:none; display:grid; place-items:center; cursor:pointer; color:var(--dim); user-select:none; }
+.row .vis { width:18px; height:18px; flex:none; margin:0 4px; accent-color:var(--accent); }
+.row .name { flex:1; cursor:pointer; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.row .find { color:var(--accent); font-size:12px; min-width:1.5em; text-align:right; }
+.row .kind { color:var(--dim); font-size:11px; text-transform:uppercase; }
+.part-head { display:flex; gap:12px; align-items:center; }
+.part-head img, .card img { width:96px; height:96px; background:#0e141b; border-radius:8px; flex:none; object-fit:contain; }
+.part-head h2 { margin:0; font-size:18px; word-break:break-word; }
+.props { display:grid; grid-template-columns:auto 1fr; gap:2px 10px; margin:10px 0; font-size:14px; }
+.props dt { color:var(--dim); }
+.props dd { margin:0; word-break:break-word; }
+.uses { display:flex; flex-direction:column; gap:4px; align-items:flex-start; }
+.uses .none { color:var(--dim); font-size:14px; }
+.part-actions { display:flex; gap:6px; flex-wrap:wrap; margin-top:10px; }
+#parts-filter { font:inherit; padding:8px 10px; border-radius:8px; border:1px solid var(--line); background:#0e141b; color:var(--text); width:min(420px, 100%); margin-bottom:14px; }
+#parts-count { color:var(--dim); margin-left:12px; }
+#parts-grid { display:grid; grid-template-columns:repeat(auto-fill, minmax(300px, 1fr)); gap:12px; }
+.card { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:12px; }
+.card.flash { border-color:var(--accent); }
+.badge { display:inline-block; font-size:11px; text-transform:uppercase; letter-spacing:.04em; color:var(--dim); border:1px solid var(--line); border-radius:4px; padding:0 5px; margin:4px 4px 0 0; }
+#pmi-toggle[aria-pressed=false] { opacity:.55; }
+#pmi-list { font-size:14px; color:var(--dim); }
 @media (max-width: 900px) {
   main, body.customer main { grid-template-columns:1fr; grid-template-rows:45vh auto; }
   #checklist { display:none; }
   #details { border-left:0; border-top:1px solid var(--line); }
+  body.tab-model main, body.tab-model.customer main { grid-template-columns:1fr; grid-template-rows:45vh auto auto; }
+  body.tab-model main { overflow:auto; }
+  body.tab-model #viewport { order:-1; }
+  body.tab-model #tree, body.tab-model #part-info { border:0; border-top:1px solid var(--line); overflow:visible; }
+  header { flex-wrap:wrap; }
+  #tabs { width:100%; }
+  #tabs button { flex:1; }
+  #parts-grid { grid-template-columns:1fr; }
 }
 </style>
 </head>
@@ -71,9 +120,16 @@ body.motion #timeline, body.step-motion #timeline { display:flex; }
 <script type="application/json" id="mi-config">{{CONFIG}}</script>
 <script type="application/json" id="mi-data">{{DATA}}</script>
 <div id="app">
-  <header><h1 id="doc-title">Instructions</h1><span class="sub" id="doc-sub"></span></header>
+  <header><h1 id="doc-title">Instructions</h1><span class="sub" id="doc-sub"></span>
+    <nav id="tabs" role="tablist" aria-label="Views">
+      <button id="tab-steps" role="tab" aria-selected="true">Steps</button>
+      <button id="tab-model" role="tab" aria-selected="false">Model</button>
+      <button id="tab-parts" role="tab" aria-selected="false">Parts</button>
+    </nav>
+  </header>
   <main>
     <nav id="checklist" aria-label="Steps"></nav>
+    <nav id="tree" aria-label="Assembly tree"></nav>
     <div id="viewport"><canvas id="canvas"></canvas></div>
     <section id="details">
       <div id="chapter"></div>
@@ -83,12 +139,19 @@ body.motion #timeline, body.step-motion #timeline { display:flex; }
       <div class="section" id="torque-section"><h3>Torque</h3><div id="torque"></div></div>
       <div class="section" id="callouts"></div>
       <div class="section" id="notes"></div>
+      <div class="section" id="pmi-section"><h3>Annotations</h3><div id="pmi-list"></div></div>
       <div id="signoff"></div>
     </section>
+    <section id="part-info" aria-label="Part"></section>
   </main>
+  <section id="parts" aria-label="Parts">
+    <input id="parts-filter" type="search" placeholder="Filter parts" aria-label="Filter parts"><span id="parts-count"></span>
+    <div id="parts-grid"></div>
+  </section>
   <footer>
     <button id="back">&#9664; Back</button>
     <button id="replay" title="Play the insertion again">&#8635;</button>
+    <button id="pmi-toggle" title="Show or hide the view's annotations" aria-pressed="true" hidden>PMI</button>
     <span class="count" id="count"></span>
     <button id="next" class="primary">Next &#9654;</button>
   </footer>
@@ -292,7 +355,8 @@ body.motion #timeline, body.step-motion #timeline { display:flex; }
   }
 
   function draw(now) {
-    if (!gl || !steps.length) return;
+    // A frame queued before the tab changed draws nothing on another tab.
+    if (!gl || !steps.length || tab !== 'steps') return;
     var step = steps[current];
     var w = canvas.clientWidth * devicePixelRatio | 0, h = canvas.clientHeight * devicePixelRatio | 0;
     if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; }
@@ -383,9 +447,42 @@ body.motion #timeline, body.step-motion #timeline { display:flex; }
       placed.forEach(function (i) { drawEdges(i, 0.35 * fade(i)); });
       gl.depthMask(true);
     }
+    drawPmi(step, vp);
     if (t < 1 || (motion && mplaying)) requestAnimationFrame(draw); else anim.running = false;
   }
-  function redraw() { requestAnimationFrame(motion && !motionInStep ? drawMotion : draw); }
+  // ---------- PMI ----------
+  // A step's view annotations (step.pmi): lines (the stroked text among
+  // them) and filled arrowheads in world space, drawn over the parts in the
+  // viewport's PMI amber, never hidden by them, as the app's overlay draws.
+  var PMI = [0.98, 0.78, 0.22, 1], showPmi = true;
+  function pmiBuffers(step) {
+    if (!step.pmi || !gl) return null;
+    if (!step.pmiGl) {
+      var seg = step.pmi.lines ? decode(step.pmi.lines, Float32Array) : new Float32Array(0);
+      var tri = step.pmi.arrows ? decode(step.pmi.arrows, Float32Array) : new Float32Array(0);
+      var buf = function (arr) { var b = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, b); gl.bufferData(gl.ARRAY_BUFFER, arr, gl.STATIC_DRAW); return b; };
+      step.pmiGl = { l: seg.length ? buf(seg) : null, lc: seg.length / 3, a: tri.length ? buf(tri) : null, ac: tri.length / 3 };
+    }
+    return step.pmiGl;
+  }
+  function drawPmi(step, vp) {
+    var b = showPmi ? pmiBuffers(step) : null;
+    if (!b) return;
+    gl.useProgram(lines);
+    gl.disableVertexAttribArray(prog.n);
+    gl.disable(gl.DEPTH_TEST);
+    gl.disable(gl.BLEND);
+    gl.uniformMatrix4fv(lines.mvp, false, vp);
+    gl.uniform4fv(lines.color, PMI);
+    if (b.l) { gl.bindBuffer(gl.ARRAY_BUFFER, b.l); gl.enableVertexAttribArray(lines.p); gl.vertexAttribPointer(lines.p, 3, gl.FLOAT, false, 0, 0); gl.drawArrays(gl.LINES, 0, b.lc); }
+    if (b.a) { gl.bindBuffer(gl.ARRAY_BUFFER, b.a); gl.enableVertexAttribArray(lines.p); gl.vertexAttribPointer(lines.p, 3, gl.FLOAT, false, 0, 0); gl.drawArrays(gl.TRIANGLES, 0, b.ac); }
+    gl.enable(gl.DEPTH_TEST);
+  }
+  function redraw() {
+    if (tab === 'model') { requestAnimationFrame(drawModel); return; }
+    if (tab === 'parts') return;
+    requestAnimationFrame(motion && !motionInStep ? drawMotion : draw);
+  }
   // Replay: the step's motion from its first frame, else the insertion slide.
   function play() {
     if (motion && motionInStep) { motionSeek(0); motionPlay(); return; }
@@ -445,7 +542,7 @@ body.motion #timeline, body.step-motion #timeline { display:flex; }
     cam.eye = add(cam.target, scale(dir, dist));
   }
   function drawMotion(now) {
-    if (!gl || !motion) return;
+    if (!gl || !motion || tab !== 'steps') return;
     if (mplaying) {
       mclock += Math.max(0, (now - mlast) / 1000); mlast = now;
       var at = Math.round(mclock * motion.fps);
@@ -794,6 +891,12 @@ body.motion #timeline, body.step-motion #timeline { display:flex; }
       label.appendChild(el('span', 'qty', add.quantity + '× '));
       label.appendChild(document.createTextNode(add.name || add.part));
       row.appendChild(label);
+      // The part's card on the Parts tab.
+      if (partsByKey[add.part]) {
+        row.title = 'Show this part on the Parts tab';
+        row.style.cursor = 'pointer';
+        row.addEventListener('click', function () { showPartCard(add.part); });
+      }
       adds.appendChild(row);
     });
     var tools = $('tools');
@@ -828,6 +931,14 @@ body.motion #timeline, body.step-motion #timeline { display:flex; }
       callouts.appendChild(box);
     });
     $('notes').textContent = step.notes || '';
+    // Without WebGL the view's annotations are listed (the step's picture
+    // does not draw them).
+    var pmiList = $('pmi-list');
+    pmiList.textContent = '';
+    var texts = step.pmi && step.pmi.texts ? step.pmi.texts : [];
+    texts.forEach(function (t) { pmiList.appendChild(el('div', '', t)); });
+    $('pmi-section').hidden = !!gl || !texts.length;
+    $('pmi-toggle').hidden = !gl || !step.pmi;
     renderSignoff(step);
     if (mode === 'shop') renderChecklist();
     var fallback = $('fallback');
@@ -888,6 +999,318 @@ body.motion #timeline, body.step-motion #timeline { display:flex; }
     box.appendChild(message);
   }
 
+  // ---------- Model and Parts tabs ----------
+  // data.assembly is the occurrence tree, depth first. Each row owns the
+  // nodes whose occurrence is its path or under it and under no deeper row;
+  // a row is shown when neither it nor any row above it is switched off.
+  // The Parts tab groups the rows by part (a card per part) with the steps
+  // that add them.
+  var tab = 'steps', rows = [], byPath = {}, nodeRow = [], off = {}, open = {}, selected = null;
+  var partList = [], partsByKey = {}, savedCam = {};
+  var ROOT = '';
+  function copyCam() { return JSON.parse(JSON.stringify(cam)); }
+  function under(occurrence, path) { return occurrence === path || occurrence.indexOf(path + ':') === 0; }
+  function buildAssembly() {
+    var list = data.assembly || [];
+    if (!list.length) return;
+    document.body.classList.add('has-assembly');
+    rows = list.map(function (r) {
+      return { path: r.path, parent: r.parent || ROOT, depth: r.depth || 0, name: r.name || r.part, part: r.part || r.name, src: r, children: [], nodes: [], steps: [] };
+    });
+    byPath[ROOT] = { path: ROOT, parent: null, depth: -1, name: data.target && data.target.name ? data.target.name : (data.title || 'Assembly'), children: [], nodes: [], steps: [] };
+    rows.forEach(function (r) { byPath[r.path] = r; });
+    rows.forEach(function (r) { (byPath[r.parent] || byPath[ROOT]).children.push(r); });
+    nodeRow = data.nodes.map(function (node, i) {
+      var best = byPath[ROOT];
+      rows.forEach(function (r) { if (under(node.occurrence, r.path) && r.path.length > (best.path || '').length) best = r; });
+      best.nodes.push(i);
+      return best;
+    });
+    // The steps that use a row: those that add it, else those that add the
+    // sub-assembly it came in with.
+    rows.forEach(function (r) {
+      var direct = [], within = [];
+      steps.forEach(function (step, i) {
+        (step.adds || []).forEach(function (add) {
+          var occs = add.occurrences || [];
+          if (occs.indexOf(r.path) >= 0 || (!occs.length && add.part === r.part)) { if (direct.indexOf(i) < 0) direct.push(i); }
+          else if (occs.some(function (o) { return under(r.path, o); })) { if (within.indexOf(i) < 0) within.push(i); }
+        });
+      });
+      r.steps = direct.length ? direct : within;
+    });
+    rows.forEach(function (r) { if (r.depth === 0) open[r.path] = false; });
+    open[ROOT] = true;
+    rows.forEach(function (r) {
+      var p = partsByKey[r.part];
+      if (!p) { p = partsByKey[r.part] = { key: r.part, name: r.name, src: r.src, rows: [], steps: [], thumbnail: r.src.thumbnail }; partList.push(p); }
+      p.rows.push(r);
+      if (!p.thumbnail) p.thumbnail = r.src.thumbnail;
+      r.steps.forEach(function (i) { if (p.steps.indexOf(i) < 0) p.steps.push(i); });
+    });
+    partList.forEach(function (p) { p.steps.sort(function (a, b) { return a - b; }); });
+    $('tab-steps').addEventListener('click', function () { setTab('steps'); });
+    $('tab-model').addEventListener('click', function () { setTab('model'); });
+    $('tab-parts').addEventListener('click', function () { setTab('parts'); });
+    $('parts-filter').addEventListener('input', renderParts);
+    $('tab-steps').hidden = !steps.length;
+  }
+  function chain(row) { var out = []; for (var r = row; r; r = r.parent === null ? null : byPath[r.parent]) out.push(r); return out; }
+  function subtree(row) { var out = [row]; row.children.forEach(function (c) { out = out.concat(subtree(c)); }); return out; }
+  function nodeShown(i) { return !chain(nodeRow[i] || byPath[ROOT]).some(function (r) { return off[r.path]; }); }
+  function nodesOf(row) { var out = []; subtree(row).forEach(function (r) { out = out.concat(r.nodes); }); return out; }
+  function setShown(path, on) {
+    var row = byPath[path];
+    if (!row) return;
+    subtree(row).forEach(function (r) { off[r.path] = !on; });
+    if (on) chain(row).forEach(function (r) { off[r.path] = false; });
+    renderTree(); redraw();
+  }
+  function isolate(path) {
+    var row = byPath[path];
+    if (!row) return;
+    off = {};
+    var keep = {};
+    chain(row).concat(subtree(row)).forEach(function (r) { keep[r.path] = true; });
+    rows.forEach(function (r) { off[r.path] = !keep[r.path]; });
+    chain(row).forEach(function (r) { if (r !== row) open[r.path] = true; });
+    selectRow(path, true);
+  }
+  function selectRow(path, fit) {
+    selected = byPath[path] && path !== ROOT ? path : null;
+    if (selected) chain(byPath[selected]).forEach(function (r) { if (r.path !== selected) open[r.path] = true; });
+    renderTree(); renderPartInfo();
+    if (fit && selected) fitNodes(nodesOf(byPath[selected]).filter(nodeShown), true);
+    redraw();
+  }
+  function renderTree() {
+    var tree = $('tree');
+    tree.textContent = '';
+    var tools = el('div', 'tree-tools');
+    var tool = function (label, title, fn) { var b = el('button', '', label); b.title = title; b.addEventListener('click', fn); tools.appendChild(b); };
+    tool('Show all', 'Show every part', function () { off = {}; renderTree(); redraw(); });
+    tool('Hide all', 'Hide every part', function () { setShown(ROOT, false); });
+    tool('Expand', 'Open every sub-assembly', function () { rows.forEach(function (r) { if (r.children.length) open[r.path] = true; }); renderTree(); });
+    tool('Collapse', 'Close every sub-assembly', function () { rows.forEach(function (r) { open[r.path] = false; }); renderTree(); });
+    tool('Fit', 'Fit what is shown in the view', function () { fitNodes(data.nodes.map(function (_, i) { return i; }).filter(nodeShown), true); redraw(); });
+    tree.appendChild(tools);
+    var line = function (row) {
+      var div = el('div', 'row' + (row.path === selected ? ' selected' : '') + (off[row.path] ? ' off' : ''));
+      div.setAttribute('data-path', row.path);
+      div.style.paddingLeft = (Math.max(0, row.depth + 1) * 16) + 'px';
+      var twist = el('span', 'twist', row.children.length ? (open[row.path] ? '▾' : '▸') : '');
+      if (row.children.length) twist.addEventListener('click', function () { open[row.path] = !open[row.path]; renderTree(); });
+      div.appendChild(twist);
+      var vis = el('input', 'vis');
+      vis.type = 'checkbox';
+      vis.checked = !off[row.path];
+      vis.title = 'Show or hide';
+      vis.setAttribute('aria-label', 'Show ' + row.name);
+      vis.addEventListener('change', function () { setShown(row.path, vis.checked); });
+      div.appendChild(vis);
+      if (row.src && row.src.findNumber) div.appendChild(el('span', 'find', row.src.findNumber));
+      var name = el('span', 'name', row.name);
+      name.title = row.path || row.name;
+      name.addEventListener('click', function () { selectRow(row.path === selected ? null : row.path); });
+      name.addEventListener('dblclick', function () { selectRow(row.path, true); });
+      div.appendChild(name);
+      if (row.src && row.src.subassembly) div.appendChild(el('span', 'kind', 'asm'));
+      tree.appendChild(div);
+      if (open[row.path]) row.children.forEach(line);
+    };
+    line(byPath[ROOT]);
+  }
+  // The details of a part (`p`, a parts-list entry), for the Model tab's
+  // panel (`row`: the occurrence selected) and the Parts tab's card.
+  function partDetails(box, p, row) {
+    var head = el('div', 'part-head');
+    var pic = safeImage(p.thumbnail);
+    if (pic) { var img = el('img'); img.alt = ''; img.src = pic; head.appendChild(img); }
+    var titles = el('div');
+    titles.appendChild(el('h2', '', p.name));
+    var src = p.src;
+    if (src.subassembly) titles.appendChild(el('span', 'badge', 'Sub-assembly'));
+    if (src.fastener) titles.appendChild(el('span', 'badge', 'Fastener'));
+    if (src.serialTracked) titles.appendChild(el('span', 'badge', 'Serial tracked'));
+    head.appendChild(titles);
+    box.appendChild(head);
+    var props = el('dl', 'props');
+    var prop = function (k, v) { if (v === undefined || v === null || v === '') return; props.appendChild(el('dt', '', k)); props.appendChild(el('dd', '', v)); };
+    prop('Part', src.partId || '');
+    var finds = [];
+    p.rows.forEach(function (r) { var f = r.src.findNumber; if (f && finds.indexOf(f) < 0) finds.push(f); });
+    prop('Find no.', finds.join(', '));
+    prop('Quantity', String(p.rows.length));
+    if (row) prop('Occurrence', row.path);
+    prop('Torque', src.torque || '');
+    (src.attributes || []).forEach(function (a) { if (a && a.length === 2) prop(String(a[0]).replace(/_/g, ' '), a[1]); });
+    box.appendChild(props);
+    box.appendChild(el('h3', '', 'Used in steps'));
+    var uses = el('div', 'uses');
+    var list = row ? row.steps : p.steps;
+    if (!list.length) uses.appendChild(el('span', 'none', 'No step adds it.'));
+    list.forEach(function (i) {
+      var b = el('button', '', steps[i].number + '. ' + steps[i].title);
+      b.setAttribute('data-step', steps[i].id);
+      b.addEventListener('click', function () { go(i); });
+      uses.appendChild(b);
+    });
+    box.appendChild(uses);
+    var actions = el('div', 'part-actions');
+    var action = function (label, fn) { var b = el('button', '', label); b.addEventListener('click', fn); actions.appendChild(b); };
+    if (row) {
+      action('Isolate', function () { isolate(row.path); });
+      action(off[row.path] ? 'Show' : 'Hide', function () { setShown(row.path, !!off[row.path]); renderPartInfo(); });
+      action('Fit', function () { fitNodes(nodesOf(row), true); redraw(); });
+      action('Part card', function () { showPartCard(p.key); });
+    } else {
+      action('Show in model', function () { showInModel(p); });
+    }
+    box.appendChild(actions);
+  }
+  function renderPartInfo() {
+    var box = $('part-info');
+    box.textContent = '';
+    var row = selected ? byPath[selected] : null;
+    if (!row) {
+      box.appendChild(el('h3', '', 'Model'));
+      var shown = data.nodes.map(function (_, i) { return i; }).filter(nodeShown).length;
+      box.appendChild(el('p', '', rows.length + ' components, ' + partList.length + ' distinct parts; ' + shown + ' of ' + data.nodes.length + ' bodies shown.'));
+      box.appendChild(el('p', 'none', 'Pick a part in the tree to see its details. Double-click to fit it.'));
+      return;
+    }
+    partDetails(box, partsByKey[row.part], row);
+  }
+  function renderParts() {
+    var grid = $('parts-grid');
+    grid.textContent = '';
+    var q = $('parts-filter').value.trim().toLowerCase();
+    var shown = partList.filter(function (p) {
+      if (!q) return true;
+      var hay = [p.name, p.key, p.src.partId || ''].concat(p.rows.map(function (r) { return r.src.findNumber || ''; }))
+        .concat((p.src.attributes || []).map(function (a) { return a.join(' '); })).join(' ').toLowerCase();
+      return hay.indexOf(q) >= 0;
+    });
+    shown.forEach(function (p) {
+      var card = el('div', 'card');
+      card.setAttribute('data-part', p.key);
+      partDetails(card, p, null);
+      grid.appendChild(card);
+    });
+    $('parts-count').textContent = shown.length + ' of ' + partList.length + ' parts';
+  }
+  function showPartCard(key) {
+    setTab('parts');
+    $('parts-filter').value = '';
+    renderParts();
+    var cards = $('parts-grid').children;
+    for (var i = 0; i < cards.length; i++) {
+      if (cards[i].getAttribute('data-part') === key) {
+        cards[i].classList.add('flash');
+        if (cards[i].scrollIntoView) cards[i].scrollIntoView({ block: 'center' });
+      }
+    }
+  }
+  function showInModel(p) {
+    setTab('model');
+    off = {};
+    var keep = {};
+    p.rows.forEach(function (row) { chain(row).concat(subtree(row)).forEach(function (r) { keep[r.path] = true; }); chain(row).forEach(function (r) { if (r !== row) open[r.path] = true; }); });
+    rows.forEach(function (r) { off[r.path] = !keep[r.path]; });
+    selected = p.rows[0].path;
+    renderTree(); renderPartInfo();
+    var nodes = [];
+    p.rows.forEach(function (row) { nodes = nodes.concat(nodesOf(row)); });
+    fitNodes(nodes, true);
+    redraw();
+  }
+  // Frame `indices` (keep the view direction when `keep` and the camera has
+  // one), as a step without a camera is framed.
+  function fitNodes(indices, keep) {
+    if (!indices.length) indices = data.nodes.map(function (_, i) { return i; });
+    var b = bounds(indices);
+    var center = [0, 1, 2].map(function (k) { return (b.lo[k] + b.hi[k]) / 2; });
+    var radius = Math.max(1e-6, Math.hypot(b.hi[0] - b.lo[0], b.hi[1] - b.lo[1], b.hi[2] - b.lo[2]) / 2);
+    var dir = keep ? norm(sub(cam.eye, cam.target)) : norm([0.6, 0.45, 0.66]);
+    if (!keep) { cam.up = screenUp(dir, [0, 1, 0]); cam.ortho = false; cam.fov = 35; }
+    cam.radius = radius;
+    cam.minHalfWidth = radius * 1.05;
+    cam.half = radius * 1.2;
+    cam.target = center;
+    var dist = cam.ortho ? radius * 4 : radius / Math.tan(cam.fov * Math.PI / 360) * 1.25;
+    cam.eye = add(center, scale(dir, dist));
+  }
+  function setTab(name, quiet) {
+    if (name !== 'steps' && name !== 'model' && name !== 'parts') return;
+    if ((name === 'model' || name === 'parts') && !rows.length) return;
+    if (name === 'steps' && !steps.length) return;
+    if (name === tab) return;
+    savedCam[tab] = copyCam();
+    if (motion && mplaying) { mplaying = false; motionShow(); }
+    anim.running = false;
+    tab = name;
+    ['steps', 'model', 'parts'].forEach(function (t) {
+      document.body.classList.toggle('tab-' + t, t === name);
+      $('tab-' + t).setAttribute('aria-selected', t === name ? 'true' : 'false');
+    });
+    if (name === 'model') {
+      if (savedCam.model) cam = savedCam.model; else fitNodes([], false);
+      renderTree(); renderPartInfo();
+    } else if (name === 'parts') {
+      renderParts();
+    } else if (!quiet && savedCam.steps) {
+      cam = savedCam.steps;
+    }
+    redraw();
+  }
+  // The Model tab's drawing: every shown node in its own colour with its
+  // edges, the selected component's in the highlight colour.
+  function drawModel() {
+    if (!gl || tab !== 'model') return;
+    var w = canvas.clientWidth * devicePixelRatio | 0, h = canvas.clientHeight * devicePixelRatio | 0;
+    if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; }
+    gl.viewport(0, 0, w, h);
+    gl.clearColor(0.075, 0.106, 0.141, 1);
+    gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+    gl.enable(gl.DEPTH_TEST);
+    gl.disable(gl.BLEND);
+    gl.depthMask(true);
+    gl.useProgram(prog);
+    var dist = distance(), aspect = w / Math.max(1, h), far = dist + cam.radius * 8, near = Math.max(dist / 1000, 1e-4);
+    var proj = cam.ortho ? ortho(effectiveHalf(), aspect, -far, far) : perspective(cam.fov, aspect, near, far);
+    var vp = mul(proj, lookAt(cam.eye, cam.target, cam.up));
+    var lit = {};
+    if (selected && byPath[selected]) nodesOf(byPath[selected]).forEach(function (i) { lit[i] = true; });
+    var shown = data.nodes.map(function (_, i) { return i; }).filter(nodeShown);
+    gl.enable(gl.POLYGON_OFFSET_FILL);
+    gl.polygonOffset(1, 1);
+    shown.forEach(function (i) {
+      var node = data.nodes[i], m = meshes[node.mesh];
+      if (!m) return;
+      var model = new Float32Array(node.matrix), c = lit[i] ? [1.0, 0.6, 0.12] : node.color;
+      gl.uniformMatrix4fv(prog.mvp, false, mul(vp, model));
+      gl.uniformMatrix4fv(prog.model, false, model);
+      gl.uniform4fv(prog.color, [c[0], c[1], c[2], 1]);
+      gl.bindBuffer(gl.ARRAY_BUFFER, m.p); gl.enableVertexAttribArray(prog.p); gl.vertexAttribPointer(prog.p, 3, gl.FLOAT, false, 0, 0);
+      gl.bindBuffer(gl.ARRAY_BUFFER, m.n); gl.enableVertexAttribArray(prog.n); gl.vertexAttribPointer(prog.n, 3, gl.FLOAT, false, 0, 0);
+      gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, m.i);
+      gl.drawElements(gl.TRIANGLES, m.count, gl.UNSIGNED_INT, 0);
+    });
+    gl.disable(gl.POLYGON_OFFSET_FILL);
+    if (showEdges) {
+      gl.useProgram(lines);
+      gl.disableVertexAttribArray(prog.n);
+      shown.forEach(function (i) {
+        var node = data.nodes[i], m = meshes[node.mesh];
+        if (!m || !m.e) return;
+        gl.uniformMatrix4fv(lines.mvp, false, mul(vp, new Float32Array(node.matrix)));
+        gl.uniform4fv(lines.color, [EDGE[0], EDGE[1], EDGE[2], 1]);
+        gl.bindBuffer(gl.ARRAY_BUFFER, m.e); gl.enableVertexAttribArray(lines.p); gl.vertexAttribPointer(lines.p, 3, gl.FLOAT, false, 0, 0);
+        gl.drawArrays(gl.LINES, 0, m.edgeCount);
+      });
+    }
+  }
+
   // ---------- Jobs floor (served by the PLM, shop mode with a job) ----------
   var csrf = '';
   function api(method, path, body) {
@@ -926,6 +1349,7 @@ body.motion #timeline, body.step-motion #timeline { display:flex; }
 
   function go(i) {
     if (i < 0 || i >= steps.length) return;
+    if (tab !== 'steps') setTab('steps', true);
     current = i;
     frameStep(steps[current]);
     renderStep();
@@ -936,8 +1360,14 @@ body.motion #timeline, body.step-motion #timeline { display:flex; }
   $('back').addEventListener('click', function () { go(current - 1); });
   $('next').addEventListener('click', function () { go(current + 1); });
   $('replay').addEventListener('click', play);
+  $('pmi-toggle').addEventListener('click', function () {
+    showPmi = !showPmi;
+    $('pmi-toggle').setAttribute('aria-pressed', showPmi ? 'true' : 'false');
+    redraw();
+  });
   document.addEventListener('keydown', function (e) {
     if (e.target && e.target.tagName === 'INPUT') return;
+    if (tab !== 'steps') return;
     if (e.key === 'ArrowRight' || e.key === 'PageDown') go(current + 1);
     if (e.key === 'ArrowLeft' || e.key === 'PageUp') go(current - 1);
     if (e.key === ' ' && motion && motionInStep) { e.preventDefault(); if (mplaying) motionPause(); else motionPlay(); }
@@ -956,8 +1386,10 @@ body.motion #timeline, body.step-motion #timeline { display:flex; }
   };
   window.brepInstructions = {
     state: function () {
-      return { mode: mode, step: steps[current] ? steps[current].id : null, index: current, steps: steps.length, done: Object.keys(done), webgl: !!gl, webgl2: gl2, animating: anim.running,
-        edges: meshes.filter(function (m) { return m.edgeCount > 0; }).length };
+      var st = steps[current];
+      return { mode: mode, step: st ? st.id : null, index: current, steps: steps.length, done: Object.keys(done), webgl: !!gl, webgl2: gl2, animating: anim.running,
+        edges: meshes.filter(function (m) { return m.edgeCount > 0; }).length, tab: tab,
+        pmi: st && st.pmi ? st.pmi.annotations : 0, pmiShown: showPmi && !!(st && st.pmi) };
     },
     go: go,
     camera: function () {
@@ -967,7 +1399,20 @@ body.motion #timeline, body.step-motion #timeline { display:flex; }
     project: project,
     focusPointAt: focusPointAt,
     // For automation: draw the edges or not (the verifier compares the two).
-    edges: function (on) { showEdges = !!on; redraw(); }
+    edges: function (on) { showEdges = !!on; redraw(); },
+    // For automation: draw the step's PMI or not.
+    pmi: function (on) { showPmi = !!on; $('pmi-toggle').setAttribute('aria-pressed', showPmi ? 'true' : 'false'); redraw(); },
+    // The tabs: 'steps', 'model' or 'parts'.
+    tab: function (name) { setTab(name); return tab; },
+    // The Model tab: the tree's rows, what is shown, and the selection.
+    model: function () {
+      return { rows: rows.map(function (r) { return { path: r.path, name: r.name, part: r.part, depth: r.depth, on: !off[r.path], open: !!open[r.path], nodes: r.nodes.length, steps: r.steps.map(function (i) { return steps[i].id; }) }; }),
+        shown: data.nodes.map(function (_, i) { return i; }).filter(nodeShown).length, nodes: data.nodes.length, selected: selected };
+    },
+    show: function (path, on) { setShown(path, on !== false); },
+    select: function (path) { selectRow(path); },
+    isolate: function (path) { isolate(path); },
+    parts: function () { return partList.map(function (p) { return { part: p.key, name: p.name, quantity: p.rows.length, steps: p.steps.map(function (i) { return steps[i].id; }), thumbnail: !!safeImage(p.thumbnail) }; }); }
   };
 
   load().then(function (d) {
@@ -977,8 +1422,10 @@ body.motion #timeline, body.step-motion #timeline { display:flex; }
     $('doc-sub').textContent = data.subtitle || '';
     flatten();
     try { initGL(); } catch (e) { gl = null; }
+    buildAssembly();
+    document.body.classList.add('tab-steps');
     if (!steps.length && data.motion && data.motion.frames && data.motion.frames.length) { startMotion(); return; }
-    if (!steps.length) { $('title').textContent = 'No steps'; return; }
+    if (!steps.length) { $('title').textContent = 'No steps'; if (rows.length) setTab('model'); return; }
     var ready = (mode === 'shop' && config.job) ? loadJob().catch(function (err) { $('doc-sub').textContent = 'Job: ' + err.message; }) : Promise.resolve();
     return ready.then(function () { go(0); });
   }).catch(function (err) {

@@ -1,6 +1,7 @@
 //! Typed probing intent. All positions/normals are in MACHINE coordinates.
 use super::{Point3,TargetRef,WorkOffset};
 use serde::{Deserialize,Serialize};
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Clone,Copy,Debug,PartialEq,Eq,Serialize,Deserialize)]
 #[serde(rename_all="camelCase")]
 pub enum ProbeKind {SingleSurface,OutsideCorner,InsideCorner,Web,Pocket,Bore,Boss,Rectangle,Angle,Inspection}
@@ -8,6 +9,7 @@ impl ProbeKind {
     /// Serde names of every variant, in declaration order.
     pub const VARIANTS: &'static [&'static str] = &["singleSurface","outsideCorner","insideCorner","web","pocket","bore","boss","rectangle","angle","inspection"];
 }
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Clone,Debug,PartialEq,Serialize,Deserialize)]
 #[serde(rename_all="camelCase")]
 pub struct ProbePoint {
@@ -19,6 +21,7 @@ pub struct ProbePoint {
     pub lower_tolerance:f64,
     pub upper_tolerance:f64,
 }
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Clone,Debug,PartialEq,Serialize,Deserialize)]
 #[serde(rename_all="camelCase",default)]
 pub struct ProbeSettings {
@@ -33,6 +36,7 @@ pub struct ProbeSettings {
     pub result_prefix:String,
 }
 impl Default for ProbeSettings {fn default()->Self {Self {stylus_radius:1.,shank_radius:0.25,shank_length:20.,approach_distance:2.,overtravel:0.5,feed:100.,result_prefix:"probe".into()}}}
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Clone,Debug,PartialEq,Serialize,Deserialize)]
 #[serde(rename_all="camelCase",default)]
 pub struct ProbeWcsParams {
@@ -41,11 +45,13 @@ pub struct ProbeWcsParams {
     pub kind:ProbeKind,
     pub points:Vec<ProbePoint>,pub settings:ProbeSettings,pub wcs:WorkOffset}
 impl Default for ProbeWcsParams {fn default()->Self {Self {kind:ProbeKind::SingleSurface,points:Vec::new(),settings:ProbeSettings::default(),wcs:WorkOffset::default()}}}
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Clone,Debug,PartialEq,Default,Serialize,Deserialize)]
 #[serde(rename_all="camelCase",default)]
 pub struct ProbeGeometryParams {pub points:Vec<ProbePoint>,pub settings:ProbeSettings}
 /// An expanded trigger move, never ordinary cutting. The reference is the
 /// bottom of the stylus sphere; expected target = nominal + radius*normal - Z*radius.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Clone,Debug,PartialEq,Serialize,Deserialize)]
 #[serde(rename_all="camelCase")]
 pub struct ProbeCycle {

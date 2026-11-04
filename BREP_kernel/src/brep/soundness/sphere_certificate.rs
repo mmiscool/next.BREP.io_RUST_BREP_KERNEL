@@ -20,7 +20,7 @@ struct Ball {
 pub(super) fn enabled() -> bool {
     // This proof uses the full scanner's sphere atlas and trim classification.
     // An explicit request for either alternative keeps that scanner path.
-    if std::env::var_os("BREP_NO_SPHERE_CHARTS").is_some()
+    if env_read!("BREP_NO_SPHERE_CHARTS").is_some()
         || std::env::var_os("BREP_NO_SPHERE_CHART_TRIM").is_some()
         || !super::trim_samples_enabled()
     {

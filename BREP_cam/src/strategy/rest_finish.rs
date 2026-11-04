@@ -97,7 +97,7 @@ pub(crate) fn stock_rest_needed(operation:&Operation,mesh:&MeshSnapshot,grid:&De
 /// and radius within one triangle) returns the same value.
 type GapMemo=std::collections::HashMap<[u64;3],f64>;
 fn memo_gap(p:Point3,normal:Point3,small:f64,current:&DropCutter<'_>,memo:&mut GapMemo,runner:&mut Runner<'_>)->Result<f64,CamError> {
-    let key=[p.x.to_bits(),p.y.to_bits(),p.z.to_bits()];
+    let key=[crate::geom::canonical_bits(p.x),crate::geom::canonical_bits(p.y),crate::geom::canonical_bits(p.z)];
     if let Some(&g)=memo.get(&key) {return Ok(g);}
     let g=gap(p,normal,small,current,runner)?;memo.insert(key,g);Ok(g)
 }

@@ -756,14 +756,6 @@ pub fn export_json(state: &State) -> Value {
     })
 }
 
-fn cell(text: &str) -> String {
-    if text.contains([',', '"', '\n', '\r']) {
-        format!("\"{}\"", text.replace('"', "\"\""))
-    } else {
-        text.to_string()
-    }
-}
-
 /// One row per part: its identity, catalog, current state and preferred MPN.
 pub fn parts_csv(state: &State) -> String {
     let mut out = String::from(
@@ -796,7 +788,7 @@ pub fn parts_csv(state: &State) -> String {
             maker,
             attributes.join("; "),
         ];
-        out.push_str(&row.iter().map(|c| cell(c)).collect::<Vec<_>>().join(","));
+        out.push_str(&row.iter().map(|c| crate::bom::csv_cell(c)).collect::<Vec<_>>().join(","));
         out.push('\n');
     }
     out
@@ -825,7 +817,7 @@ pub fn structure_csv(state: &State) -> String {
                     line.reference.clone(),
                     line.notes.clone(),
                 ];
-                out.push_str(&row.iter().map(|c| cell(c)).collect::<Vec<_>>().join(","));
+                out.push_str(&row.iter().map(|c| crate::bom::csv_cell(c)).collect::<Vec<_>>().join(","));
                 out.push('\n');
             }
         }

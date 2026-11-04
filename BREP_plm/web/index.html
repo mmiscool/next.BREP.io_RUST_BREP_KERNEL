@@ -1028,6 +1028,38 @@
       </section>
     </div>
 
+    <h2>Install the desktop app</h2>
+    <p class="muted">Install the BREP desktop app on a workstation from this server alone: one
+      command downloads it, checks its SHA-256, registers the .nbrep, .fbrep and .tbrep files,
+      and points it at this server. Then sign in from the app (Settings, PLM tab).</p>
+    <p class="empty" id="install-none" hidden>This server offers no desktop app to install. An
+      administrator puts the app's native builds and install scripts in the server's
+      <code>--cad-app</code> directory.</p>
+    <div class="account" id="install-platforms">
+      <section class="card" id="install-linux" hidden>
+        <h3>Linux</h3>
+        <p class="muted">In a terminal:</p>
+        <pre class="output" id="install-linux-command"></pre>
+        <div class="toolbar">
+          <button type="button" id="install-linux-copy">Copy command</button>
+          <a class="button-link" id="install-linux-script" download>Download install.sh</a>
+          <a class="button-link" id="install-linux-app" download>Download the app</a>
+        </div>
+        <p class="muted mono" id="install-linux-hash"></p>
+      </section>
+      <section class="card" id="install-windows" hidden>
+        <h3>Windows</h3>
+        <p class="muted">In PowerShell:</p>
+        <pre class="output" id="install-windows-command"></pre>
+        <div class="toolbar">
+          <button type="button" id="install-windows-copy">Copy command</button>
+          <a class="button-link" id="install-windows-script" download>Download install.ps1</a>
+          <a class="button-link" id="install-windows-app" download>Download the app</a>
+        </div>
+        <p class="muted mono" id="install-windows-hash"></p>
+      </section>
+    </div>
+
     <h2>Linked desktops</h2>
     <p class="muted">Each BREP desktop app you signed in through this browser ("Sign in with
       your browser"). Revoke one and that app is signed out at its next request: it asks to

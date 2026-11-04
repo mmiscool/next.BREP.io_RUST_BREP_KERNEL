@@ -156,7 +156,7 @@ pub(crate) use intersect::{intersect_analytic_pair_with, ruled_gate, ruled_gate_
 pub use recognition::recognize;
 pub(crate) use canonical::{canonical_carriers_enabled, canonicalise_carriers, CanonicalReport, CanonicalRewrite};
 pub use revolution::{revolution_structure, RevolutionStructure};
-pub(crate) use revolution::circumcenter;
+pub use revolution::circumcenter;
 use recognition::generatrix_is_meridional_half_ray;
 
 impl AnalyticSurface {
@@ -311,3 +311,53 @@ impl AnalyticSurface {
         }
     }
 }
+
+pub(crate) use recognition::curve_scale;
+
+/// Circumcenter in a plane, with a scale-relative degeneracy guard.
+pub fn circumcenter_2d(a: [f64; 2], b: [f64; 2], c: [f64; 2]) -> Option<[f64; 2]> {
+    let scale = (b[0] - a[0]).abs().max((b[1] - a[1]).abs())
+        .max((c[0] - a[0]).abs()).max((c[1] - a[1]).abs());
+    let d = 2.0 * (a[0] * (b[1] - c[1]) + b[0] * (c[1] - a[1]) + c[0] * (a[1] - b[1]));
+    if !d.is_finite() || d.abs() <= 1e-12 * scale * scale { return None; }
+    let aa = a[0] * a[0] + a[1] * a[1];
+    let bb = b[0] * b[0] + b[1] * b[1];
+    let cc = c[0] * c[0] + c[1] * c[1];
+    Some([
+        (aa * (b[1] - c[1]) + bb * (c[1] - a[1]) + cc * (a[1] - b[1])) / d,
+        (aa * (c[0] - b[0]) + bb * (a[0] - c[0]) + cc * (b[0] - a[0])) / d,
+    ])
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct RecognizedCircle {
+    pub centre: Vec3,
+    pub axis: Vec3,
+    pub radius: f64,
+    /// Largest sampled radial or planar residual in model units.
+    pub worst: f64,
+}
+
+/// Sampled circle recognition; this does not certify exact NURBS equivalence.
+pub fn recognize_circle(curve: &NurbsCurve, t0: f64, t1: f64, tolerance: f64) -> Option<RecognizedCircle> {
+    if !(tolerance >= 0.0) || !t0.is_finite() || !t1.is_finite() || t0 == t1 {
+        return None;
+    }
+    let a = curve.evaluate(t0).ok()?;
+    let b = curve.evaluate(t0 + (t1 - t0) / 3.0).ok()?;
+    let c = curve.evaluate(t0 + 2.0 * (t1 - t0) / 3.0).ok()?;
+    let centre = circumcenter(a, b, c)?;
+    let normal = b.sub(a).cross(c.sub(a));
+    let axis = normal.scale(1.0 / normal.length());
+    let radius = a.sub(centre).length();
+    if !(radius > 0.0) || !radius.is_finite() { return None; }
+    let mut worst = 0.0_f64;
+    for i in 0..=64 {
+        let d = curve.evaluate(t0 + (t1 - t0) * i as f64 / 64.0).ok()?.sub(centre);
+        let error = (d.length() - radius).abs().max(d.dot(axis).abs());
+        if !error.is_finite() || error > tolerance { return None; }
+        worst = worst.max(error);
+    }
+    Some(RecognizedCircle { centre, axis, radius, worst })
+}
+

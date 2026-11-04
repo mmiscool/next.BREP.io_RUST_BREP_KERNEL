@@ -1,6 +1,6 @@
 [package]
 name = "BREP_mcp_core"
-version = "0.8.0"
+version = "0.9.0"
 edition = "2021"
 license-file = "LICENSE.md"
 repository = "https://github.com/mmiscool/next.BREP.io_RUST_BREP_KERNEL"
@@ -46,6 +46,7 @@ server = [
     "dep:rmcp",
     "dep:hyper",
     "dep:hyper-util",
+    "dep:http-body-util",
     "dep:ureq",
     "tokio/rt-multi-thread",
     "tokio/macros",
@@ -53,10 +54,13 @@ server = [
     "tokio/io-util",
     "tokio/time",
     "tokio/net",
+    "dep:sha2",
+    "dep:brep-script-core",
+    "dep:uuid",
 ]
 
 [dependencies]
-rmcp = { version = "3.2", default-features = false, features = ["server", "transport-io", "transport-streamable-http-server"], optional = true }
+rmcp = { version = "3.8", default-features = false, features = ["server", "transport-io", "transport-streamable-http-server"], optional = true }
 schemars = "1.2"
 # `sync` alone in the base: the host protocol's channels. It is the one tokio
 # feature set that compiles for wasm32-unknown-unknown; the runtime, timers
@@ -66,12 +70,23 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 image = { version = "0.25", default-features = false, features = ["png", "gif"] }
 base64 = "0.22"
+# The CAD operation service (src/cad): SHA-256 for manifest hashes, artifact
+# digests and the admission-key MAC; v4 uuids for the epoch, handles and the
+# key secret. Both were already in this lockfile (sha2 via the render stack,
+# uuid via rmcp's session ids).
+sha2 = { version = "0.10", optional = true }
+# Code mode's worker (Boa, unchanged): a host binary runs it when started
+# with the hidden worker flag (`cad::code::worker_entry`).
+brep-script-core = { package = "BREP_script_core", version = "0.1.3", path = "../BREP_script_core", optional = true }
+uuid = { version = "1", features = ["v4"], optional = true }
 # The feature catalogue (schema.rs) is read straight from the engine.
-brep-render = { package = "BREP_render", version = "0.10.0", path = "../BREP_render" }
+brep-render = { package = "BREP_render", version = "0.11.0", path = "../BREP_render" }
 # The streamable-HTTP transport is a tower service; hyper serves it on a
 # loopback listener (http.rs). hyper-util's `service` bridges tower to hyper.
 hyper = { version = "1", features = ["server", "http1"], optional = true }
 hyper-util = { version = "0.1", features = ["tokio", "service"], optional = true }
+# The credential guard answers 401/403 in the transport's own body type.
+http-body-util = { version = "0.1", optional = true }
 # The PLM fixture (plm_fixture.rs) talks to a loopback `brep-plm serve`: plain
 # HTTP, so no TLS stack. ureq is already in BREP_mcp's tree through the app.
 ureq = { version = "2", default-features = false, optional = true }

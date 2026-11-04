@@ -8,16 +8,6 @@ pub(crate) const MAT4_IDENTITY: Mat4 = [
 ];
 
 pub(crate) fn mat4_mul(a: &Mat4, b: &Mat4) -> Mat4 {
-    let mut out = [0.0f64; 16];
-    for row in 0..4 {
-        for col in 0..4 {
-            let mut sum = 0.0;
-            for k in 0..4 {
-                sum += a[row * 4 + k] * b[k * 4 + col];
-            }
-            out[row * 4 + col] = sum;
-        }
-    }
-    out
+    crate::transform_topology::multiply_elements(a, b)
 }
 

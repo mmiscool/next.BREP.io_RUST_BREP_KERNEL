@@ -633,7 +633,10 @@ impl EngineState {
         // distance (clear of everything shown) so it depends on the frame
         // alone, not on the viewport the edit was made in.
         if matches!(self.camera.projection, crate::view::Projection::Orthographic { .. }) {
-            let size = shown.size();
+            // An empty step shows nothing: its box is inside out (+inf..-inf),
+            // whose infinite diagonal put the eye at infinity, and the history
+            // document then stored it as null and refused every later run.
+            let size = if shown.is_empty() { [0.0; 3] } else { shown.size() };
             let diagonal = (size[0] * size[0] + size[1] * size[1] + size[2] * size[2]).sqrt();
             let distance = (4.0 * diagonal).max(10.0);
             let (eye, target) = (self.camera.eye, self.camera.target);

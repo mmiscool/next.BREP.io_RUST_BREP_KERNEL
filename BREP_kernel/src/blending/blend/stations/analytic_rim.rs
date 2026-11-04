@@ -3,14 +3,13 @@ use super::*;
 
 
 fn enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("BREP_ANALYTIC_CAP_RIM").ok().as_deref() != Some("0"))
+    switch!("BREP_ANALYTIC_CAP_RIM", true)
 }
 
 /// Positive rational bases form a partition of unity. For identical bases,
 /// this bounds the entire rational curve/patch difference, including between
 /// samples, from the homogeneous control differences and denominator floor.
-fn net_bound(a: &[Vec4], b: &[Vec4]) -> Option<f64> {
+pub(in crate::blend) fn net_bound(a: &[Vec4], b: &[Vec4]) -> Option<f64> {
     if a.len() != b.len() || a.is_empty() { return None; }
     let origin = Vec3::new(a[0].x / a[0].w, a[0].y / a[0].w, a[0].z / a[0].w);
     if [origin.x, origin.y, origin.z].iter().any(|v| !v.is_finite()) { return None; }

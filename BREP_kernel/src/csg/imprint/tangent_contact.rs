@@ -86,6 +86,19 @@ const LEVENBERG_DAMPING: f64 = 1e-10;
 /// refinement needs.
 const JACOBIAN_STEP: f64 = 1e-7;
 
+/// How far along the Hessian's null direction the EXTENSION PROBE looks, as a
+/// fraction of the local radius of curvature `1 / κ`.  A rank-deficient
+/// Hessian only says the carriers agree to SECOND order along that direction;
+/// whether they keep touching is a higher-order question the probe answers by
+/// refining a seed this far along it.  An extended contact (sphere in its
+/// cylinder, G1 elbow) refines onto the contact curve a whole step away; an
+/// isolated higher-order contact (a B-spline body whose side is flat to
+/// second order at the one point a cylinder grazes it) refines back onto the
+/// node or not at all, because the carriers separate there with the CUBE of
+/// the offset and their normals with its square — at this step, `~1e-4`
+/// radians against a refinement bar of the model tolerance.
+const EXTENSION_PROBE_FRACTION: f64 = 1e-2;
+
 /// How a tangency inside both trims is shaped.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct TangentContact {
@@ -101,6 +114,19 @@ pub(super) struct TangentContact {
     pub curvature_contrast: f64,
     /// The two eigenvalues have opposite signs: two branches cross.
     pub saddle: bool,
+    /// The contact CONTINUES along the Hessian's null direction — the
+    /// extension probe refined a seed a probe step along it onto a contact a
+    /// probe step away. Only measured when the Hessian is rank-deficient;
+    /// `false` otherwise. A rank-deficient contact that does not extend is an
+    /// isolated HIGHER-ORDER node: the carriers agree to second order there
+    /// but separate at third, so the section is still a curve everywhere but
+    /// that point.
+    pub extends: bool,
+    /// The local curvature scale `κ` the rank ratio is measured against (the
+    /// larger spectral norm of the two second fundamental forms). Across a
+    /// tangential contact the carriers separate as `δ² κ / 2`, so `κ` sets
+    /// how far along the contact a march can be placed at a given tolerance.
+    pub curvature_scale: f64,
 }
 
 impl TangentContact {
@@ -122,7 +148,11 @@ impl TangentContact {
     /// node it admits, and an assembly that then tears is reported against the
     /// node rather than as an anonymous degeneracy.
     pub(super) fn is_isolated_node(&self) -> bool {
-        self.saddle && self.rank_ratio >= NODE_RANK_FLOOR
+        if self.rank_ratio < NODE_RANK_FLOOR {
+            // Second order cannot decide; the extension probe did.
+            return !self.extends;
+        }
+        self.saddle
     }
 
     /// What the contact is, for a refusal message: its shape, its place, and
@@ -447,17 +477,13 @@ fn second_fundamental_form(
 
 /// Eigenvalues of a symmetric 2×2 matrix.
 fn eigenvalues(matrix: [[f64; 2]; 2]) -> (f64, f64) {
-    let trace = matrix[0][0] + matrix[1][1];
-    let determinant = matrix[0][0] * matrix[1][1] - matrix[0][1] * matrix[1][0];
-    let discriminant = (trace * trace / 4.0 - determinant).max(0.0).sqrt();
-    (trace / 2.0 + discriminant, trace / 2.0 - discriminant)
+    crate::eigen2::eigenvalues(matrix)
 }
 
 /// Spectral norm of a symmetric 2×2 matrix — the local curvature scale a
 /// carrier contributes.
 fn spectral_norm(matrix: [[f64; 2]; 2]) -> f64 {
-    let (first, second) = eigenvalues(matrix);
-    first.abs().max(second.abs())
+    crate::eigen2::spectral_norm(matrix)
 }
 
 /// Classify the tangential contact `witness` lies on: refine onto the contact,
@@ -519,6 +545,17 @@ pub(super) fn classify_tangent_contact(
         0.0
     };
     let largest = lambda_first.abs().max(lambda_second.abs());
+    let extends = rank_ratio < NODE_RANK_FLOOR && curvature_scale > 0.0 && {
+        // The null direction of `H`, in 3-D.
+        let null_eigenvalue = if lambda_first.abs() <= lambda_second.abs() {
+            lambda_first
+        } else {
+            lambda_second
+        };
+        let [x, y] = crate::eigen2::eigenvector(difference, null_eigenvalue);
+        let direction = basis_u.scale(x).add(basis_v.scale(y));
+        contact_extends(first, second, point, direction, 1.0 / curvature_scale, tolerance)?
+    };
     Ok(Some(TangentContact {
         point,
         rank_ratio,
@@ -529,6 +566,38 @@ pub(super) fn classify_tangent_contact(
             0.0
         },
         saddle: lambda_first * lambda_second < 0.0,
+        extends,
+        curvature_scale,
     }))
+}
+
+/// The EXTENSION PROBE: does the contact at `point` continue along
+/// `direction`? Seed the refinement a probe step to either side and ask
+/// whether it lands on a contact at least half a step away. Either side
+/// suffices — a contact curve may end at `point` on a carrier's domain edge.
+fn contact_extends(
+    first: &NurbsSurface,
+    second: &NurbsSurface,
+    point: Vec3,
+    direction: Vec3,
+    radius: f64,
+    tolerance: f64,
+) -> Result<bool, KernelRefusal> {
+    let step = radius * EXTENSION_PROBE_FRACTION;
+    if !(step.is_finite() && step > 0.0) {
+        return Ok(true);
+    }
+    for sign in [1.0, -1.0] {
+        let seed = point.add(direction.scale(sign * step));
+        if let Some((parameters, _)) = refine_contact(first, second, seed, tolerance)? {
+            let reached = first
+                .evaluate(parameters.ua, parameters.va)
+                .or_refuse(KernelStage::Intersect, "evaluate")?;
+            if reached.sub(point).length() >= 0.5 * step {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
 }
 

@@ -52,15 +52,7 @@ fn concave_rim_overrun(
         };
         let (outer, rim_polygon) = (polygon(0)?, polygon(rim_loop)?);
         let within = |points: &[(f64, f64)], x: f64, y: f64| -> bool {
-            let mut odd = false;
-            for k in 0..points.len() {
-                let (ax, ay) = points[k];
-                let (bx, by) = points[(k + 1) % points.len()];
-                if (ay > y) != (by > y) && x < ax + (y - ay) * (bx - ax) / (by - ay) {
-                    odd = !odd;
-                }
-            }
-            odd
+            crate::polygon::parity_inside([x, y], points.len(), |k| [points[k].0, points[k].1])
         };
         // The plate's region about the rim: inside the outer loop, outside the
         // rim's own loop (where the boss stands).
@@ -451,7 +443,7 @@ fn blend_closed_edge_impl(
                 // The Carve march did not build: the fold stays the answer.
                 Err(_) => break,
             };
-            let parameters = station_parameters(&stations);
+            let parameters = crate::blend::stations::closed_station_parameters(&stations, [&first_mate.face.surface, &second_mate.face.surface]);
             let off = match fit_closed_rows(&stations, &parameters, chamfer) {
                 Ok(rows) => rails_off_closed_carriers(&rows, &stations, &parameters, &first_mate, &second_mate)?,
                 Err(_) => break,
@@ -558,26 +550,7 @@ fn blend_closed_edge_impl(
         // march refined (which is where an exit would hide).
         let stride = (stations.len() / 16).max(1);
         stations.iter().step_by(stride).any(|station| {
-            let mut uv = if second_side {
-                station.uv2
-            } else {
-                station.uv1
-            };
-            if let Ok((closed_u, closed_v)) = face.surface.closed_directions() {
-                if closed_u {
-                    if let Ok([low, high]) = face.surface.domain_u() {
-                        uv[0] = low + (uv[0] - low).rem_euclid(high - low);
-                    }
-                }
-                if closed_v {
-                    if let Ok([low, high]) = face.surface.domain_v() {
-                        uv[1] = low + (uv[1] - low).rem_euclid(high - low);
-                    }
-                }
-            }
-            crate::parameter_point_in_face(face, crate::Vec2 { x: uv[0], y: uv[1] }, 1e-6)
-                .map(|class| class == crate::PolygonClass::Outside)
-                .unwrap_or(true)
+            support_exits_at(face, if second_side { station.uv2 } else { station.uv1 })
         })
     };
     // The edge-preserving construction below cannot answer it (it consumes
@@ -588,7 +561,24 @@ fn blend_closed_edge_impl(
     // as before. An exit across a sharp boundary, or onto a tangent neighbour
     // the ball cannot roll onto, keeps the route below unchanged.
     let exits_timing = crate::blend::BlendTimer::start("timing.closed.march.exits_ms");
-    let exits = [support_exits(first_face, false), support_exits(second_face, true)];
+    // A mate bounded only by parallels of the rim's axis answers for all its
+    // stations with ONE probe (`support_exit_between_parallels`); any other
+    // mate, and any station near a boundary, takes the full probe scan.
+    let revolution = crate::blend::stations::closed_revolution_axis(&first_mate, &second_mate);
+    let exit_of = |face: &FaceRecord, second_side: bool| -> bool {
+        let contacts: Vec<Vec3> = stations.iter().map(|station| if second_side { station.p2 } else { station.p1 }).collect();
+        let probe = |station: usize| -> bool {
+            support_exits_at(face, if second_side { stations[station].uv2 } else { stations[station].uv1 })
+        };
+        match revolution.and_then(|axis| support_exit_between_parallels(solid, face, axis, &contacts, &probe)) {
+            Some(exit) => {
+                crate::blend::record_count("count.closed.exits_by_parallels", 1);
+                exit
+            }
+            None => support_exits(face, second_side),
+        }
+    };
+    let exits = [exit_of(first_face, false), exit_of(second_face, true)];
     exits_timing.stop();
     if exits[0] || exits[1] {
         let scale = crate::blend::stations::march_model_scale(&edge.curve, edge.t0, edge.t1, radius_at(mid_t))?;
@@ -661,7 +651,7 @@ fn blend_closed_edge_impl(
     march_timing.stop();
     crate::blend::record_count("count.closed.stations", stations.len() as u64);
     let rows_timing = crate::blend::BlendTimer::start("timing.closed.rows_ms");
-    let mut parameters = station_parameters(&stations);
+    let mut parameters = crate::blend::stations::closed_station_parameters(&stations, [&first_mate.face.surface, &second_mate.face.surface]);
     let exact_rows = analytic_rows.map(Ok).or_else(|| exact_closed_revolution_rows(&stations, &first_mate, &second_mate, chamfer));
     crate::blend::record_count(
         if exact_rows.is_some() { "count.rows.exact_revolution" } else { "count.rows.fitted_closed" },
@@ -697,7 +687,7 @@ fn blend_closed_edge_impl(
                         "blend closed-edge: the fitted rows loop ({error}); re-marching under Carve"
                     ));
                     stations = climb_carve_ladder(&error)?;
-                    parameters = station_parameters(&stations);
+                    parameters = crate::blend::stations::closed_station_parameters(&stations, [&first_mate.face.surface, &second_mate.face.surface]);
                     rows = fit_closed_rows(&stations, &parameters, chamfer)?;
                     carve_fold = true;
                 }
@@ -1486,7 +1476,7 @@ fn plane_affine_pcurve(rail: &NurbsCurve, surface: &NurbsSurface) -> Option<Nurb
 /// fallback, does not.
 pub(in crate::blend) fn refit_closed_support_pcurve(rail: &NurbsCurve, old: &NurbsCurve, surface: &NurbsSurface) -> Result<NurbsCurve, KernelRefusal> {
     let knot_retry = KNOT_RETRY.with(|flag| flag.get());
-    refit_closed_support_pcurve_read_with(rail, old, surface, &mut crate::blend::track_fit::FootMemo::default(), knot_retry).map(|(fitted, _)| fitted)
+    refit_closed_support_pcurve_read_with(rail, old, surface, &mut crate::blend::track_fit::FootMemo::transient(), knot_retry).map(|(fitted, _)| fitted)
 }
 
 thread_local! {
@@ -1640,7 +1630,7 @@ fn fit_and_read_support(
     // unreadable sample, found after every sample was sought) must leave
     // the caller's memo holding the feet of the curve the caller keeps,
     // not this curve's.
-    let mut own = crate::blend::track_fit::FootMemo::default();
+    let mut own = memo.empty_like();
     let (miss, standoff, samples, worst) =
         crate::blend::track_fit::read_shipped_pcurve_memo(surface, &|t| rail.evaluate(t), &fitted, d0, d1, &mut own)?;
     *memo = own;
@@ -1650,6 +1640,114 @@ fn fit_and_read_support(
     Ok((fitted, (miss, standoff, samples, worst)))
 }
 
+
+/// One exit probe: whether a support station's `uv` (wrapped into a closed
+/// carrier's domain) classifies OUTSIDE `face`'s trims, an unreadable class
+/// counting as outside.
+fn support_exits_at(face: &FaceRecord, mut uv: [f64; 2]) -> bool {
+    if let Ok((closed_u, closed_v)) = face.surface.closed_directions() {
+        if closed_u {
+            if let Ok([low, high]) = face.surface.domain_u() {
+                uv[0] = low + (uv[0] - low).rem_euclid(high - low);
+            }
+        }
+        if closed_v {
+            if let Ok([low, high]) = face.surface.domain_v() {
+                uv[1] = low + (uv[1] - low).rem_euclid(high - low);
+            }
+        }
+    }
+    crate::parameter_point_in_face(face, crate::Vec2 { x: uv[0], y: uv[1] }, 1e-6)
+        .map(|class| class == crate::PolygonClass::Outside)
+        .unwrap_or(true)
+}
+
+/// The exit question for a mate bounded only by PARALLELS of the rim's axis
+/// (lane R 2026-10-28, the cylinder rims row: 17 probes per mate were 0.15 ms
+/// of a two-rim fillet's ~1.5 ms).
+///
+/// A plane normal to the axis or a cylinder/cone about it is cut by the
+/// parallels into cells — annuli of the plane between consecutive radii,
+/// bands of the cylinder between consecutive heights — and when every
+/// boundary edge of the face (seams, used twice by one loop, aside) is such a
+/// parallel, each cell is wholly inside the face or wholly outside it.  The
+/// support contacts of a rim between coaxial carriers are parallels too, so
+/// when every station's meridian coordinate (radius on a plane, height on a
+/// cylinder or cone) lies in ONE open cell, clear of its bounding parallels
+/// by a margin far above the probe's 1e-6 band, every station classifies the
+/// same, and the first station's probe is the scan's answer.  `None` — the
+/// full scan — for any other carrier, any boundary that is not a parallel,
+/// and any station within the margin of a boundary, so a track that does
+/// meet a boundary is classified station by station exactly as before.
+fn support_exit_between_parallels(
+    solid: &BrepSolid,
+    face: &FaceRecord,
+    (origin, axis): (Vec3, Vec3),
+    contacts: &[Vec3],
+    probe: &dyn Fn(usize) -> bool,
+) -> Option<bool> {
+    let radial = match face.surface.analytic()? {
+        crate::AnalyticSurface::Plane { .. } => true,
+        crate::AnalyticSurface::RuledRevolution { .. } => false,
+        _ => return None,
+    };
+    if contacts.is_empty() {
+        return None;
+    }
+    let axis = axis.normalized().ok()?;
+    let coordinates = |point: Vec3| -> (f64, f64) {
+        let offset = point.sub(origin);
+        let height = offset.dot(axis);
+        (offset.sub(axis.scale(height)).length(), height)
+    };
+    let meridian = |point: Vec3| -> f64 {
+        let (radius, height) = coordinates(point);
+        if radial { radius } else { height }
+    };
+    let scale = contacts.iter().map(|point| point.sub(origin).length()).fold(1.0, f64::max);
+    let parallel_band = 1e-9 * scale;
+    let margin = 1e-5 * scale;
+    // Every boundary edge but the seams must be a parallel: one radius and
+    // one height along the whole edge, read at nine points.
+    let mut boundaries: Vec<f64> = Vec::new();
+    for loop_record in &face.loops {
+        for coedge in &loop_record.coedges {
+            if loop_record.coedges.iter().filter(|other| other.edge_id == coedge.edge_id).count() == 2 {
+                continue;
+            }
+            let boundary = solid.edges.iter().find(|candidate| candidate.id == coedge.edge_id)?;
+            if boundary.degenerate {
+                continue;
+            }
+            let mut read: Option<(f64, f64)> = None;
+            for step in 0..=8 {
+                let point = boundary.curve.evaluate(boundary.t0 + (boundary.t1 - boundary.t0) * step as f64 / 8.0).ok()?;
+                let here = coordinates(point);
+                match read {
+                    None => read = Some(here),
+                    Some(first) => {
+                        if (here.0 - first.0).abs() > parallel_band || (here.1 - first.1).abs() > parallel_band {
+                            return None;
+                        }
+                    }
+                }
+            }
+            let (radius, height) = read?;
+            boundaries.push(if radial { radius } else { height });
+        }
+    }
+    // One open cell holds every station, clear of every boundary parallel.
+    let readings: Vec<f64> = contacts.iter().map(|point| meridian(*point)).collect();
+    let low = readings.iter().copied().fold(f64::INFINITY, f64::min);
+    let high = readings.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    if !(low.is_finite() && high.is_finite()) {
+        return None;
+    }
+    if boundaries.iter().any(|boundary| *boundary >= low - margin && *boundary <= high + margin) {
+        return None;
+    }
+    Some(probe(0))
+}
 
 fn build_surgery(
     solid: &BrepSolid,

@@ -645,6 +645,123 @@ pub(super) fn is_untrimmed(face: &FaceRecord) -> Result<bool, String> {
     Ok((closed_parameter_space_area_on_carrier(face)?.abs() - domain_area).abs() <= 1e-6 * domain_area)
 }
 
+/// The single loop of `face` as an iso-rectangle `[u_lo, u_hi, v_lo, v_hi]`
+/// inside the surface domain: exactly four straight pcurves, each parallel
+/// to a parameter axis, joined end to end, alternating direction, wound
+/// counter-clockwise in uv, every corner within 1e-6 of the domain's span of
+/// the domain. Such a trim is a sub-rectangle of the knot grid and is
+/// integrated by `integration::integrate_iso_rectangle_multi` (lane O,
+/// 2026-10-28). `None` for anything else — a curved or oblique pcurve, a
+/// hole, a clockwise loop (whose meaning the trimmed route decides) — which
+/// keeps the trimmed route. Under `BREP_PROFILE_MASS_FACES` a decline names
+/// its reason on stderr.
+pub(super) fn iso_rectangle_trim(face: &FaceRecord) -> Result<Option<[f64; 4]>, String> {
+    let found = iso_rectangle_trim_impl(face)?;
+    if let Err(reason) = &found {
+        if super::profile::face_lines_enabled() {
+            eprintln!("mass.iso_rect face={} declined: {reason}", face.id);
+        }
+    }
+    Ok(found.ok())
+}
+
+fn iso_rectangle_trim_impl(face: &FaceRecord) -> Result<Result<[f64; 4], &'static str>, String> {
+    if face.loops.len() != 1 {
+        return Ok(Err("not one loop"));
+    }
+    if face.loops[0].coedges.len() != 4 {
+        return Ok(Err("not four coedges"));
+    }
+    let ku = crate::KnotVector::new(face.surface.knots_u.clone(), face.surface.degree_u)?;
+    let kv = crate::KnotVector::new(face.surface.knots_v.clone(), face.surface.degree_v)?;
+    let [u0, u1] = ku.domain();
+    let [v0, v1] = kv.domain();
+    let (span_u, span_v) = (u1 - u0, v1 - v0);
+    if !(span_u > 0.0 && span_v > 0.0) {
+        return Ok(Err("empty domain"));
+    }
+    // Pcurve ends meet and controls sit on their line to round-off on an
+    // exact chart and to the fit's own residual on a fitted one: 1e-7 of the
+    // span admits both and is a decade under the sign reading's own margin.
+    let (eps_u, eps_v) = (1e-7 * span_u, 1e-7 * span_v);
+    let mut segments: Vec<([f64; 2], [f64; 2])> = Vec::with_capacity(4);
+    for coedge in &face.loops[0].coedges {
+        // A straight axis-parallel pcurve of ANY degree: every control point
+        // shares the constant coordinate (a NURBS curve lies in its control
+        // hull, so the curve is the segment between its ends) and the control
+        // polygon is monotone in the other, so the curve traverses that
+        // segment once. The imprint emits a fitted straight pcurve on a
+        // fitted carrier; its degree says nothing about the trim.
+        let pcurve = &coedge.pcurve;
+        if pcurve.control_points.len() < 2 {
+            return Ok(Err("a pcurve with one control point"));
+        }
+        let mut controls = Vec::with_capacity(pcurve.control_points.len());
+        for control in &pcurve.control_points {
+            controls.push(control.point()?);
+        }
+        let (first, last) = (controls[0], controls[controls.len() - 1]);
+        let (du, dv) = ((last.x - first.x).abs(), (last.y - first.y).abs());
+        let along_u = dv <= eps_v && du > eps_u;
+        let along_v = du <= eps_u && dv > eps_v;
+        if !(along_u || along_v) {
+            return Ok(Err("a pcurve not parallel to a parameter axis"));
+        }
+        let (constant, varying, eps_constant): (fn(&Vec3) -> f64, fn(&Vec3) -> f64, f64) =
+            if along_u { (|p| p.y, |p| p.x, eps_v) } else { (|p| p.x, |p| p.y, eps_u) };
+        let level = constant(&first);
+        if controls.iter().any(|control| (constant(control) - level).abs() > eps_constant) {
+            return Ok(Err("a pcurve whose controls leave its line"));
+        }
+        let direction = (varying(&last) - varying(&first)).signum();
+        if controls.windows(2).any(|pair| (varying(&pair[1]) - varying(&pair[0])) * direction < 0.0) {
+            return Ok(Err("a pcurve whose controls turn back"));
+        }
+        // A pcurve is stored in the loop's traversal direction; `forward`
+        // relates the coedge to its 3-D edge, not to the pcurve.
+        segments.push(([first.x, first.y], [last.x, last.y]));
+    }
+    let along_u = |segment: &([f64; 2], [f64; 2])| (segment.1[1] - segment.0[1]).abs() <= eps_v;
+    for index in 0..4 {
+        let (_, to) = segments[index];
+        let (from, _) = segments[(index + 1) % 4];
+        if (to[0] - from[0]).abs() > eps_u || (to[1] - from[1]).abs() > eps_v {
+            if super::profile::face_lines_enabled() {
+                eprintln!(
+                    "mass.iso_rect face={} gap between pcurves {} and {}: ({:.3e}, {:.3e}) of spans ({:.3e}, {:.3e})",
+                    face.id, index, (index + 1) % 4, to[0] - from[0], to[1] - from[1], span_u, span_v
+                );
+            }
+            return Ok(Err("consecutive pcurves do not meet"));
+        }
+        if along_u(&segments[index]) == along_u(&segments[(index + 1) % 4]) {
+            return Ok(Err("consecutive pcurves run the same way"));
+        }
+    }
+    let corners: Vec<[f64; 2]> = segments.iter().map(|segment| segment.0).collect();
+    if !(polygon_signed_area(&corners) > 0.0) {
+        return Ok(Err("not wound counter-clockwise"));
+    }
+    let (mut u_lo, mut u_hi, mut v_lo, mut v_hi) = (f64::INFINITY, f64::NEG_INFINITY, f64::INFINITY, f64::NEG_INFINITY);
+    for corner in &corners {
+        u_lo = u_lo.min(corner[0]);
+        u_hi = u_hi.max(corner[0]);
+        v_lo = v_lo.min(corner[1]);
+        v_hi = v_hi.max(corner[1]);
+    }
+    // A corner outside the domain by more than round-off is not a sub-rectangle
+    // of the knot grid; one inside it by round-off is clamped onto it.
+    let (slack_u, slack_v) = (1e-6 * span_u, 1e-6 * span_v);
+    if u_lo < u0 - slack_u || u_hi > u1 + slack_u || v_lo < v0 - slack_v || v_hi > v1 + slack_v {
+        return Ok(Err("a corner outside the domain"));
+    }
+    let rectangle = [u_lo.max(u0), u_hi.min(u1), v_lo.max(v0), v_hi.min(v1)];
+    if rectangle[1] - rectangle[0] <= eps_u || rectangle[3] - rectangle[2] <= eps_v {
+        return Ok(Err("a collapsed rectangle"));
+    }
+    Ok(Ok(rectangle))
+}
+
 /// Symmetric degree-5 triangle cubature (barycentric points and weights,
 /// normalized to unit area) — Golovanov §8.10 Table 8.10.2.
 pub(super) const TRIANGLE_CUBATURE: [([f64; 3], f64); 7] = [
@@ -676,13 +793,7 @@ pub(super) const TRIANGLE_CUBATURE: [([f64; 3], f64); 7] = [
 ];
 
 pub(super) fn polygon_signed_area(polygon: &[[f64; 2]]) -> f64 {
-    let mut area = 0.0;
-    for index in 0..polygon.len() {
-        let a = polygon[index];
-        let b = polygon[(index + 1) % polygon.len()];
-        area += a[0] * b[1] - b[0] * a[1];
-    }
-    area * 0.5
+    crate::polygon::signed_area_2d(polygon.len(), |i| polygon[i])
 }
 
 /// Sutherland–Hodgman clip of one loop against an axis-aligned cell.  A

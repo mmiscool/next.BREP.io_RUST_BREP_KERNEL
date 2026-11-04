@@ -1,6 +1,6 @@
 //! Documents: new / load / save-as-text / import / export / tabs. Files never
 //! cross this boundary — the host reads and writes them and passes content.
-use crate::automation::command::{parse_args, schema_of, Annotations, CommandSpec, Ctx, Empty, Handler, NoArgs, Outcome, Phase};
+use crate::automation::command::{app_command, parse_args, schema_of, CommandSpec, Ctx, Empty, NoArgs, Outcome};
 use crate::document::Document;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -90,6 +90,10 @@ pub enum ExportFormat {
 #[serde(deny_unknown_fields)]
 pub struct ExportArgs {
     pub format: ExportFormat,
+    /// STEP only: export just these resident solids of a part document
+    /// (default: every solid). Its PMI is left out of a subset.
+    #[serde(default)]
+    pub solids: Option<Vec<String>>,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -100,8 +104,30 @@ pub struct IndexArgs {
 
 #[derive(Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
+pub struct NewArgs {
+    /// A display label for the new, untitled tab (never a file name).
+    #[serde(default)]
+    pub title: Option<String>,
+    /// Make the new tab the visible one (default). False opens it behind the
+    /// visible document, which keeps its panels and camera.
+    #[serde(default = "yes")]
+    pub activate: bool,
+}
+
+fn yes() -> bool {
+    true
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct CloseArgs {
-    pub index: usize,
+    /// The tab's position. One of `index` and `id` is required.
+    #[serde(default)]
+    pub index: Option<usize>,
+    /// The tab's public handle (`docs_list`'s `id`): closes that document
+    /// wherever its tab now is.
+    #[serde(default)]
+    pub id: Option<String>,
     /// Close even if the document has unsaved changes.
     #[serde(default)]
     pub discard: bool,
@@ -125,6 +151,11 @@ pub struct Tab {
     pub title: String,
     pub name: Option<String>,
     pub dirty: bool,
+    /// The document's public handle: a command's `context.documentId`.
+    pub id: String,
+    /// The committed revision (decimal string): a writing command's
+    /// `context.expectedRevision`.
+    pub revision: String,
 }
 
 #[derive(Serialize, schemars::JsonSchema)]
@@ -221,16 +252,45 @@ fn tabs(ctx: &Ctx<'_>) -> Tabs {
         tabs: docs
             .iter()
             .enumerate()
-            .map(|(i, d)| Tab { index: i, title: d.title(), name: d.name().map(str::to_string), dirty: d.is_dirty() })
+            .map(|(i, d)| Tab {
+                index: i,
+                title: d.title(),
+                name: d.name().map(str::to_string),
+                dirty: d.is_dirty(),
+                id: d.handle().to_string(),
+                revision: d.committed_revision().to_string(),
+            })
             .collect(),
     }
 }
 
 fn doc_new(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
-    let _: NoArgs = parse_args(args)?;
-    let doc = Document::fresh(ctx.app.docs.spawn_engine(), crate::document_class::DocumentClass::Normal);
-    let index = ctx.app.docs.open_document(doc);
-    Ok(Outcome::Done(json!({ "index": index })))
+    let a: NewArgs = parse_args(args)?;
+    let mut doc = Document::fresh(ctx.app.docs.spawn_engine(), crate::document_class::DocumentClass::Normal);
+    doc.set_label(a.title.filter(|t| !t.trim().is_empty()));
+    let index = if a.activate { ctx.app.docs.open_document(doc) } else { ctx.app.docs.open_document_behind(doc) };
+    Ok(Outcome::Done(json!({ "index": index, "context": opened_context(ctx, index) })))
+}
+
+// Successful doc_load JSON, including the nullable name and the context
+// returned by opened_context. Keep the engine's report as its native JSON.
+fn doc_load_result_schema() -> Value {
+    json!({"type":"object","properties":{
+        "index":{"type":"integer","minimum":0},
+        "name":{"type":["string","null"]},
+        "report":{"description":"The engine's native model-load report."},
+        "context":{"anyOf":[{"type":"null"},{"type":"object","properties":{
+            "documentId":{"type":"string"},"expectedRevision":{"type":"string"}
+        },"required":["documentId","expectedRevision"],"additionalProperties":false}]}
+    },"required":["index","name","report","context"],"additionalProperties":false})
+}
+
+// ImportArgs::name is String, unlike LoadArgs::name. The import report is
+// native JSON and can vary with the imported format and reconstruction path.
+fn doc_import_result_schema() -> Value {
+    json!({"type":"object","properties":{
+        "name":{"type":"string"},"report":{"description":"The engine's native import report."}
+    },"required":["name","report"],"additionalProperties":false})
 }
 
 fn doc_load(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
@@ -245,7 +305,37 @@ fn doc_load(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
     let mut doc = Document::new(engine);
     doc.set_name(a.name.clone());
     let index = ctx.app.docs.open_document(doc);
-    Ok(Outcome::Done(json!({ "index": index, "name": a.name, "report": parse(&report) })))
+    Ok(Outcome::Done(json!({ "index": index, "name": a.name, "report": parse(&report), "context": opened_context(ctx, index) })))
+}
+
+/// The context a just-opened document's first write names.
+fn opened_context(ctx: &Ctx<'_>, index: usize) -> Value {
+    ctx.app.docs.get(index).map_or(Value::Null, |d| {
+        json!({ "documentId": d.handle(), "expectedRevision": d.committed_revision().to_string() })
+    })
+}
+
+// Document readback carries authored JSON rather than a closed kernel DTO.
+// The stable envelope is typed, while plugin fields and custom attributes stay
+// intact. opened_context can return null when the tab cannot be resolved.
+fn doc_new_result_schema() -> Value {
+    json!({"type":"object","properties":{
+        "index":{"type":"integer","minimum":0},
+        "context":{"anyOf":[{"type":"null"},{"type":"object","properties":{
+            "documentId":{"type":"string"},"expectedRevision":{"type":"string"}
+        },"required":["documentId","expectedRevision"],"additionalProperties":false}]}
+    },"required":["index","context"],"additionalProperties":false})
+}
+fn doc_json_result_schema() -> Value {
+    json!({"type":"object","properties":{
+        "document":{"description":"Complete authored document JSON, including plugin and user-defined fields."},
+        "bytes":{"type":"integer","minimum":0,"description":"UTF-8 byte length of the serialized native document."}
+    },"required":["document","bytes"],"additionalProperties":false})
+}
+fn document_attributes_result_schema() -> Value {
+    json!({"type":"object","properties":{
+        "attributes":{"type":"object","additionalProperties":true,"description":"Document BOM attributes; values may be arbitrary authored JSON."}
+    },"required":["attributes"],"additionalProperties":false})
 }
 
 fn doc_json(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
@@ -285,6 +375,9 @@ fn doc_import(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
 
 fn doc_export(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
     let a: ExportArgs = parse_args(args)?;
+    if a.solids.is_some() && !matches!(a.format, ExportFormat::Step) {
+        return Err("`solids` selects what a STEP export writes; other formats export the whole document".into());
+    }
     // Files and the root PRODUCT take the document's DISPLAY name, as the
     // UI's Export does (its name field starts from `model_display_name`). A
     // document saved through the explorer is named by its full path, and the
@@ -377,7 +470,7 @@ fn doc_export(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
     let engine = ctx.app.docs.engine_mut();
     let (format, text) = match a.format {
         ExportFormat::Brep => ("brep", engine.history_request_json()),
-        ExportFormat::Step => ("step", engine.export_step_text_named(&document_name)?),
+        ExportFormat::Step => ("step", engine.export_step_text_selected(&document_name, a.solids.as_deref())?),
         ExportFormat::Stl => ("stl", engine.export_stl_text()?),
         ExportFormat::Obj => ("obj", engine.export_obj_text()?),
         ExportFormat::Iges => ("iges", engine.export_iges_text()?),
@@ -422,13 +515,18 @@ fn doc_activate(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
 
 fn doc_close(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
     let a: CloseArgs = parse_args(args)?;
-    let Some(doc) = ctx.app.docs.get(a.index) else {
-        return Err(format!("no document {} ({} open)", a.index, ctx.app.docs.len()));
+    let index = match (a.index, a.id.as_deref()) {
+        (_, Some(id)) => ctx.app.docs.index_of_handle(id).ok_or_else(|| "document_unknown: no open document has that handle".to_string())?,
+        (Some(index), None) => index,
+        (None, None) => return Err("pass `index` or `id`".into()),
+    };
+    let Some(doc) = ctx.app.docs.get(index) else {
+        return Err(format!("no document {index} ({} open)", ctx.app.docs.len()));
     };
     if doc.is_dirty() && !a.discard {
-        return Err(format!("document {} has unsaved changes; pass discard: true to close it anyway", a.index));
+        return Err(format!("document {index} has unsaved changes; pass discard: true to close it anyway"));
     }
-    ctx.app.docs.close(a.index);
+    ctx.app.docs.close(index);
     serde_json::to_value(tabs(ctx)).map(Outcome::Done).map_err(|e| e.to_string())
 }
 
@@ -452,65 +550,38 @@ pub(crate) fn parse(text: &str) -> Value {
 }
 
 /// Standard base64, padded — the inverse of [`base64_decode`], for handing a
-/// BINARY export back through a JSON result. No dependency.
+/// BINARY export back through a JSON result.
 pub(crate) fn base64_encode(bytes: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity((bytes.len() + 2) / 3 * 4);
-    for chunk in bytes.chunks(3) {
-        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
-        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
-        for slot in 0..4 {
-            if slot <= chunk.len() {
-                out.push(ALPHABET[((n >> (18 - slot * 6)) & 0x3f) as usize] as char);
-            } else {
-                out.push('=');
-            }
-        }
-    }
-    out
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD.encode(bytes)
 }
 
-/// Standard base64 (with or without padding); no dependency.
+/// Base64 as a caller may hand it in: the standard or the URL-safe alphabet,
+/// with or without padding, wrapped across lines or spaced. Anything else is
+/// refused naming what is wrong.
 pub(crate) fn base64_decode(s: &str) -> Result<Vec<u8>, String> {
-    fn val(c: u8) -> Result<u32, String> {
-        Ok(match c {
-            b'A'..=b'Z' => (c - b'A') as u32,
-            b'a'..=b'z' => (c - b'a') as u32 + 26,
-            b'0'..=b'9' => (c - b'0') as u32 + 52,
-            b'+' | b'-' => 62,
-            b'/' | b'_' => 63,
-            _ => return Err(format!("invalid base64 byte {c:#x}")),
-        })
-    }
-    let mut out = Vec::with_capacity(s.len() * 3 / 4);
-    let mut acc: u32 = 0;
-    let mut bits = 0;
-    for &c in s.as_bytes() {
-        if c == b'=' || c == b'\n' || c == b'\r' || c == b' ' {
-            continue;
-        }
-        acc = (acc << 6) | val(c)?;
-        bits += 6;
-        if bits >= 8 {
-            bits -= 8;
-            out.push(((acc >> bits) & 0xff) as u8);
-        }
-    }
-    Ok(out)
+    use base64::engine::{DecodePaddingMode, GeneralPurpose, GeneralPurposeConfig};
+    use base64::Engine as _;
+    let config = GeneralPurposeConfig::new()
+        .with_decode_padding_mode(DecodePaddingMode::Indifferent)
+        .with_decode_allow_trailing_bits(true);
+    let compact: String = s.chars().filter(|c| !matches!(c, '\n' | '\r' | ' ' | '\t')).collect();
+    let alphabet = if compact.contains(['-', '_']) { &base64::alphabet::URL_SAFE } else { &base64::alphabet::STANDARD };
+    GeneralPurpose::new(alphabet, config).decode(compact).map_err(|e| format!("invalid base64: {e}"))
 }
 
 pub static COMMANDS: &[CommandSpec] = &[
-    CommandSpec { name: "app_close", group: "document", doc: "Close the app as its window's close button does: unsaved documents are written for recovery at once (the next start offers them), and the close waits until the store's writes (a Save just made, the recovery blob) have landed, at most 30 s. Watch `__brepClosing` {closing, closed, pending}; the headless host stays up, so follow with session_restart.", phase: Phase::Mutate, annotations: Annotations::MUTATE, args_schema: schema_of::<NoArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(app_close) },
-    CommandSpec { name: "doc_new", group: "document", doc: "Open a new document as a tab and make it active. Parts start with a datum (D) and its XY/XZ/YZ reference planes.", phase: Phase::Mutate, annotations: Annotations::MUTATE, args_schema: schema_of::<NoArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(doc_new) },
-    CommandSpec { name: "doc_load", group: "document", doc: "Open a `.nbrep` document (passed as text) in a new tab, run its history and fit the camera. Returns the run report.", phase: Phase::Mutate, annotations: Annotations::MUTATE, args_schema: schema_of::<LoadArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(doc_load) },
-    CommandSpec { name: "doc_json", group: "document", doc: "The active document as `.nbrep` (the history request with metadata).", phase: Phase::Read, annotations: Annotations::READ, args_schema: schema_of::<NoArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(doc_json) },
-    CommandSpec { name: "doc_import", group: "document", doc: "Append an Import 3D Model feature from STEP / IGES text or STL / OBJ / 3MF bytes (base64). STL, OBJ and 3MF go through mesh reconstruction on the runner; a 3MF is read to the 3MF core specification and its build instances are flattened first.", phase: Phase::Mutate, annotations: Annotations::MUTATE, args_schema: schema_of::<ImportArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(doc_import) },
-    CommandSpec { name: "doc_export", group: "document", doc: "Export the active document: brep (native JSON), step, stl, obj, iges, the sheet-metal flat pattern as dxf / svg, or the open drawing sheet as sheet_svg, all as `text`; glb (binary glTF 2.0 of the display mesh), 3mf (a 3MF package of the display mesh: one object per body, the document's colours as base materials) and EVERY drawing sheet as sheet_pdf (one PDF, a page per sheet in sheet order, with the count in `pages`) and the same set with the live 3D model as sheet_pdf_3d (PDF 1.7: a 3D box over every placement marked `threeD` and a last page given over to the model, read back in `model3d`) as `base64`. The two sheet formats also answer `texts`: every text string the file shows, read back from the bytes written. For a document whose PCB board has parts: fabrication (one zip of Gerber X2 layers, Excellon drills, the pick-and-place and parts-BOM CSVs and a README) as `base64`, with its `files` read back from the archive's directory, `readBack` (top/bottom copper flashes, plated/unplated drill hits, the outline's size in mm and the CSVs' row counts, counted from the files) and `warnings`; and the CSVs alone as pick_place_csv (JLCPCB CPL columns) and ecad_bom_csv (JLCPCB BOM columns), as `text` with their data `rows`. For a document whose PCB schematic has parts: kicad_netlist, its KiCad netlist (`.net`, export version \"E\": the parts and every net with its pins, under the Connectivity panel's net names) as `text`.", phase: Phase::Read, annotations: Annotations::READ, args_schema: schema_of::<ExportArgs>, result_schema: schema_of::<Exported>, handler: Handler::App(doc_export) },
-    CommandSpec { name: "part_attributes_get", group: "document", doc: "The active document's own BOM part attributes (`partAttributes`) — the record the toolbar's Part Properties dialog edits, and the one an assembly's BOM reads off this part.", phase: Phase::Read, annotations: Annotations::READ, args_schema: schema_of::<NoArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(part_attributes_get) },
-    CommandSpec { name: "part_attribute_set", group: "document", doc: "Write ONE of the active document's own BOM part attributes (Part_Number, Material, Mass, or any custom field); a null or empty value removes it. One undo step per field.", phase: Phase::Mutate, annotations: Annotations::MUTATE, args_schema: schema_of::<PartAttributeArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(part_attribute_set) },
-    CommandSpec { name: "docs_list", group: "document", doc: "The open document tabs and which is active.", phase: Phase::Read, annotations: Annotations::READ, args_schema: schema_of::<NoArgs>, result_schema: schema_of::<Tabs>, handler: Handler::App(docs_list) },
-    CommandSpec { name: "doc_activate", group: "document", doc: "Make the tab at `index` the active document.", phase: Phase::Mutate, annotations: Annotations::MUTATE_NOWAIT, args_schema: schema_of::<IndexArgs>, result_schema: schema_of::<Tabs>, handler: Handler::App(doc_activate) },
-    CommandSpec { name: "doc_close", group: "document", doc: "Close the tab at `index`; refuses a dirty document unless `discard` is true.", phase: Phase::Mutate, annotations: Annotations::DESTRUCTIVE, args_schema: schema_of::<CloseArgs>, result_schema: schema_of::<Tabs>, handler: Handler::App(doc_close) },
-    CommandSpec { name: "doc_mark_clean", group: "document", doc: "Mark the active document as saved (the host wrote `doc_json` to disk).", phase: Phase::Mutate, annotations: Annotations::MUTATE_NOWAIT, args_schema: schema_of::<NoArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(doc_mark_clean) },
+    app_command!("document", "app_close", "Close the app as its window's close button does: unsaved documents are written for recovery at once (the next start offers them), and the close waits until the store's writes (a Save just made, the recovery blob) have landed, at most 30 s. Watch `__brepClosing` {closing, closed, pending}; the headless host stays up, so follow with session_restart.", NoArgs, app_close, Mutate, MUTATE),
+    app_command!("document", "doc_new", "Open a new document as a tab and make it active. Parts start with a datum (D) and its XY/XZ/YZ reference planes. `title` labels the untitled tab; `activate: false` opens it behind the visible document.", NewArgs, doc_new, Mutate, MUTATE, doc_new_result_schema),
+    app_command!("document", "doc_load", "Open a `.nbrep` document (passed as text) in a new tab, run its history and fit the camera. Returns the run report.", LoadArgs, doc_load, Mutate, MUTATE, doc_load_result_schema),
+    app_command!("document", "doc_json", "The active document as `.nbrep` (the history request with metadata).", NoArgs, doc_json, Read, READ, doc_json_result_schema),
+    app_command!("document", "doc_import", "Append an Import 3D Model feature from STEP / IGES text or STL / OBJ / 3MF bytes (base64). STL, OBJ and 3MF go through mesh reconstruction on the runner; a 3MF is read to the 3MF core specification and its build instances are flattened first.", ImportArgs, doc_import, Mutate, MUTATE, doc_import_result_schema),
+    app_command!("document", "doc_export", "Export the active document: brep (native JSON), step, stl, obj, iges, the sheet-metal flat pattern as dxf / svg, or the open drawing sheet as sheet_svg, all as `text`; glb (binary glTF 2.0 of the display mesh), 3mf (a 3MF package of the display mesh: one object per body, the document's colours as base materials) and EVERY drawing sheet as sheet_pdf (one PDF, a page per sheet in sheet order, with the count in `pages`) and the same set with the live 3D model as sheet_pdf_3d (PDF 1.7: a 3D box over every placement marked `threeD` and a last page given over to the model, read back in `model3d`) as `base64`. The two sheet formats also answer `texts`: every text string the file shows, read back from the bytes written. For a document whose PCB board has parts: fabrication (one zip of Gerber X2 layers, Excellon drills, the pick-and-place and parts-BOM CSVs and a README) as `base64`, with its `files` read back from the archive's directory, `readBack` (top/bottom copper flashes, plated/unplated drill hits, the outline's size in mm and the CSVs' row counts, counted from the files) and `warnings`; and the CSVs alone as pick_place_csv (JLCPCB CPL columns) and ecad_bom_csv (JLCPCB BOM columns), as `text` with their data `rows`. For a document whose PCB schematic has parts: kicad_netlist, its KiCad netlist (`.net`, export version \"E\": the parts and every net with its pins, under the Connectivity panel's net names) as `text`.", ExportArgs, doc_export, Read, READ, schema_of::<Exported>),
+    app_command!("document", "part_attributes_get", "The active document's own BOM part attributes (`partAttributes`) — the record the toolbar's Part Properties dialog edits, and the one an assembly's BOM reads off this part.", NoArgs, part_attributes_get, Read, READ, document_attributes_result_schema),
+    app_command!("document", "part_attribute_set", "Write ONE of the active document's own BOM part attributes (Part_Number, Material, Mass, or any custom field); a null or empty value removes it. One undo step per field.", PartAttributeArgs, part_attribute_set, Mutate, MUTATE, document_attributes_result_schema),
+    app_command!("document", "docs_list", "The open document tabs and which is active. Each tab's `id` and `revision` are the document context any command accepts at the root of its arguments, `context: {documentId: id, expectedRevision: revision}`: checked right before the command runs, it must name the visible document (else `document_not_active`; a tab with a Work part edited in place answers `document_busy`), a write's `expectedRevision` must be the current revision (else `revision_conflict`), and an object result answers with `context: {documentId, expectedRevision}` as it stands after the command. Errors begin with that stable code. A geometry run the command starts moves the revision again when it lands.", NoArgs, docs_list, Read, READ, schema_of::<Tabs>),
+    app_command!("document", "doc_activate", "Make the tab at `index` the active document.", IndexArgs, doc_activate, Mutate, MUTATE_NOWAIT, schema_of::<Tabs>),
+    app_command!("document", "doc_close", "Close the tab at `index`, or the document whose handle is `id` wherever its tab is; refuses a dirty document unless `discard` is true.", CloseArgs, doc_close, Mutate, DESTRUCTIVE, schema_of::<Tabs>),
+    app_command!("document", "doc_mark_clean", "Mark the active document as saved (the host wrote `doc_json` to disk).", NoArgs, doc_mark_clean, Mutate, MUTATE_NOWAIT),
 ];
 

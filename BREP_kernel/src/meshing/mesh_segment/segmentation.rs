@@ -469,12 +469,8 @@ fn peel_carriers(
 
     // Facets: union of coplanar edge-adjacent member triangles.
     let mut parent: Vec<usize> = (0..tri_ids.len()).collect();
-    fn find(parent: &mut [usize], mut x: usize) -> usize {
-        while parent[x] != x {
-            parent[x] = parent[parent[x]];
-            x = parent[x];
-        }
-        x
+    fn find(parent: &mut [usize], x: usize) -> usize {
+        crate::union_find::find_root(parent, x)
     }
     let mut adjacency: Vec<Vec<usize>> = vec![Vec::new(); tri_ids.len()];
     for (index, &t) in tri_ids.iter().enumerate() {
@@ -1160,7 +1156,7 @@ fn straddle_rejoin(
 /// Segment a triangle mesh into smooth regions and recognize each region's
 /// analytic carrier.  `positions` are xyz triples; `indices` is a triangle
 /// index buffer, or empty to treat `positions` as a raw soup of consecutive
-/// triangles (the binary-STL layout of `read_binary_stl`).
+/// triangles (the STL layout of `read_stl`).
 pub fn segment_mesh_faces(
     positions: &[f64],
     indices: &[u32],

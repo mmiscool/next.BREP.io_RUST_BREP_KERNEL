@@ -93,6 +93,11 @@ impl EngineState {
     /// [`apply_settings_json`](Self::apply_settings_json)): the schema-driven form seeds its widgets from
     /// this and the storage seam persists it.
     pub fn settings_json(&self) -> String {
+        self.settings_value().to_string()
+    }
+
+    /// [`Self::settings_json`] as a JSON value.
+    pub fn settings_value(&self) -> serde_json::Value {
         // Projection is live CAMERA state surfaced to the settings layer as a boolean
         // (`orthographic`) so the toolbar toggle persists and the settings panel can
         // round-trip it without clobbering. DERIVE it from the camera here — it is
@@ -109,7 +114,7 @@ impl EngineState {
                 )),
             );
         }
-        value.to_string()
+        value
     }
 
     /// The current per-solid metadata color overrides as JSON —
@@ -691,6 +696,85 @@ impl EngineState {
     /// area / mass and the volume-weighted centroid, with the tensor fields
     /// `null` (select one solid for its inertia). `ok:false` with a `message` on
     /// no solids / an unknown name / an integrator failure.
+    /// The model summary an agent checks a build against: every scene solid
+    /// with resident geometry, each with its kernel validation (topology
+    /// incidence checks; an `error` issue makes it invalid), its exact volume
+    /// and its display bounds (the mesh's world box, which edges lie on).
+    /// `valid` is true only when every solid validated and measured; an empty
+    /// model is valid with no solids, `bounds` and `volume` null. Numbers the
+    /// kernel could not give are null with a warning naming the solid.
+    ///
+    /// The checks run on the RUNNER, against its warm registry, as
+    /// measurement queries ([`crate::runner::MeasureKind::Inspect`]): `None`
+    /// while any is still in flight (call again on a later frame). A
+    /// main-thread re-execution of the history — what a resident-handle
+    /// collection here would cost — replayed a 27 MB STEP import on the frame
+    /// thread for 157 s (2026-10-28).
+    pub fn model_inspect_poll(&mut self) -> Option<serde_json::Value> {
+        let names: Vec<String> = self.scene.solids().iter().filter(|s| !s.is_sketch).map(|s| s.name.clone()).collect();
+        let key = |name: &str| format!("\u{1}inspect:{name}");
+        for name in &names {
+            let k = key(name);
+            if !self.info_cache.contains_key(&k) && !self.pending_query.values().any(|p| *p == k) {
+                self.next_query_id += 1;
+                let id = self.next_query_id;
+                self.pending_query.insert(id, k);
+                self.runner.submit_query(crate::runner::MeasureQuery {
+                    id,
+                    kind: crate::runner::MeasureKind::Inspect,
+                    owner: name.clone(),
+                    entity: name.clone(),
+                    density: 1.0,
+                });
+            }
+        }
+        self.pump_queries();
+        if names.iter().any(|n| !self.info_cache.contains_key(&key(n))) {
+            return None;
+        }
+        let mut solids = Vec::new();
+        let mut warnings = Vec::new();
+        let mut valid = true;
+        let mut total_volume = Some(0.0f64);
+        let mut bounds: Option<([f64; 3], [f64; 3])> = None;
+        for solid in self.scene.solids().iter().filter(|s| !s.is_sketch) {
+            let reply: serde_json::Value = serde_json::from_str(&self.info_cache[&key(&solid.name)]).unwrap_or_default();
+            if reply["ok"] != true {
+                // No resident geometry: not a solid of the model the kernel holds.
+                continue;
+            }
+            let issues = reply["issues"].as_array().cloned().unwrap_or_default();
+            let solid_valid = !issues.iter().any(|i| i["severity"].as_str().is_some_and(|s| s.eq_ignore_ascii_case("error")));
+            let volume = reply["volume"].as_f64();
+            if let Some(error) = reply["volumeError"].as_str() {
+                warnings.push(format!("{}: volume unavailable: {error}", solid.name));
+            }
+            valid &= solid_valid && volume.is_some();
+            total_volume = total_volume.zip(volume).map(|(a, b)| a + b);
+            let (min, max) = (solid.bbox.min, solid.bbox.max);
+            bounds = Some(match bounds {
+                None => (min, max),
+                Some((lo, hi)) => (std::array::from_fn(|i| lo[i].min(min[i])), std::array::from_fn(|i| hi[i].max(max[i]))),
+            });
+            solids.push(serde_json::json!({
+                "name": solid.name,
+                "valid": solid_valid,
+                "issues": issues,
+                "volumeMm3": volume,
+                "boundsMm": { "min": min, "max": max },
+            }));
+        }
+        let vec3 = |v: [f64; 3]| serde_json::json!({ "x": v[0], "y": v[1], "z": v[2] });
+        Some(serde_json::json!({
+            "solidCount": solids.len(),
+            "valid": valid,
+            "boundsMm": bounds.map(|(lo, hi)| serde_json::json!({ "min": vec3(lo), "max": vec3(hi) })),
+            "volumeMm3": if solids.is_empty() { None } else { total_volume },
+            "warnings": warnings,
+            "solids": solids,
+        }))
+    }
+
     pub fn mass_properties_json(&self, name: Option<&str>, density: f64) -> String {
         let handles = self.resident_solid_handles();
 

@@ -20,6 +20,158 @@ use web_time::Instant;
 const MIN_ANGLE: f64 = numerical::MIN_CONE_HALF_ANGLE;
 const MAX_ANGLE: f64 = std::f64::consts::FRAC_PI_2 - MIN_ANGLE;
 
+/// Where the fitter and generic model selection spent their time, collected
+/// on the calling thread only while a profiled extraction asks for it
+/// ([`crate::recognize_surfaces_with_extraction_profile`], lane U row 1). A
+/// measuring aid, not a stable interface; nothing reads it back, so the fits
+/// are those of an unprofiled run.
+#[doc(hidden)]
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct FitProfile {
+    /// Observations built from the mesh selection.
+    pub observation_seconds: f64,
+    /// Torus fits that initialize from the samples (no matching initial
+    /// surface).
+    pub torus_fits: usize,
+    /// `initialize_torus_seeds`, whole.
+    pub torus_seed_seconds: f64,
+    /// Of which `torus_coplanarity_seeds` (the 32 coplanarity steps).
+    pub torus_coplanarity_seconds: f64,
+    /// Of which the fixed axis seeds: constant latitude, the centreline and
+    /// signed-offset initializers, normal offsets and the 12-step
+    /// centre/axis alternation, each candidate ranked.
+    pub torus_axis_seconds: f64,
+    /// Of which the normal-offset radius refinement, in the fits that needed
+    /// normal disambiguation or roundoff recovery.
+    pub torus_offset_refine_seconds: f64,
+    /// Fits that ran the normal-offset radius refinement.
+    pub torus_offset_refines: usize,
+    /// Fits that refined more than one start (`needs_multistart` or
+    /// normal-offset alternatives).
+    pub torus_multistart_fits: usize,
+    /// Starts those fits refined.
+    pub torus_multistart_starts: usize,
+    /// LM over every start of those fits.
+    pub torus_multistart_seconds: f64,
+    /// LM of the fits with one start.
+    pub torus_single_seconds: f64,
+    /// Final measurement of the fitted torus.
+    pub torus_measure_seconds: f64,
+    /// Generic model selection (`best_model_impl`) calls.
+    pub selections: usize,
+    /// Triangles or vertices those calls selected over, summed.
+    pub selection_size: usize,
+    /// Calls that returned no model.
+    pub selections_failed: usize,
+    /// Wall of the calls that returned no model.
+    pub selections_failed_seconds: f64,
+    /// Calls that stopped at a score bound before fitting every kind.
+    pub selections_bound_exit: usize,
+    /// Per kind, in the recognizer's order (plane, sphere, cylinder, cone,
+    /// torus): fits run by model selection.
+    pub kind_fits: [usize; 5],
+    /// Their seconds (observations included).
+    pub kind_seconds: [f64; 5],
+    /// Fits whose model was selected.
+    pub kind_won: [usize; 5],
+    /// Fits that passed the tolerance gates and were not selected.
+    pub kind_valid_lost: [usize; 5],
+    /// Fits that failed the tolerance gates.
+    pub kind_rejected: [usize; 5],
+    /// Fits that returned an error.
+    pub kind_errors: [usize; 5],
+    /// Seconds of every fit that was not selected (valid-lost, rejected,
+    /// error, and every fit of a call that returned no model).
+    pub kind_lost_seconds: [f64; 5],
+    /// Fits run while an earlier kind of the same call was already
+    /// numerically exact (its score above the unseen-kind bound, so the call
+    /// went on).
+    pub kind_after_exact: [usize; 5],
+    /// Their seconds.
+    pub kind_after_exact_seconds: [f64; 5],
+    /// Fits run while an earlier kind of the same call already passed the
+    /// tolerance gates.
+    pub kind_after_valid: [usize; 5],
+    /// Their seconds.
+    pub kind_after_valid_seconds: [f64; 5],
+    /// `model_rank` of the accepted fits.
+    pub rank_seconds: f64,
+    /// The sphere-limit, cylinder-limit and observable-curvature filters.
+    pub filter_seconds: f64,
+}
+
+impl FitProfile {
+    pub(crate) fn absorb(&mut self, other: &FitProfile) {
+        self.observation_seconds += other.observation_seconds;
+        self.torus_fits += other.torus_fits;
+        self.torus_seed_seconds += other.torus_seed_seconds;
+        self.torus_coplanarity_seconds += other.torus_coplanarity_seconds;
+        self.torus_axis_seconds += other.torus_axis_seconds;
+        self.torus_offset_refine_seconds += other.torus_offset_refine_seconds;
+        self.torus_offset_refines += other.torus_offset_refines;
+        self.torus_multistart_fits += other.torus_multistart_fits;
+        self.torus_multistart_starts += other.torus_multistart_starts;
+        self.torus_multistart_seconds += other.torus_multistart_seconds;
+        self.torus_single_seconds += other.torus_single_seconds;
+        self.torus_measure_seconds += other.torus_measure_seconds;
+        self.selections += other.selections;
+        self.selection_size += other.selection_size;
+        self.selections_failed += other.selections_failed;
+        self.selections_failed_seconds += other.selections_failed_seconds;
+        self.selections_bound_exit += other.selections_bound_exit;
+        for kind in 0..5 {
+            self.kind_fits[kind] += other.kind_fits[kind];
+            self.kind_seconds[kind] += other.kind_seconds[kind];
+            self.kind_won[kind] += other.kind_won[kind];
+            self.kind_valid_lost[kind] += other.kind_valid_lost[kind];
+            self.kind_rejected[kind] += other.kind_rejected[kind];
+            self.kind_errors[kind] += other.kind_errors[kind];
+            self.kind_lost_seconds[kind] += other.kind_lost_seconds[kind];
+            self.kind_after_exact[kind] += other.kind_after_exact[kind];
+            self.kind_after_exact_seconds[kind] += other.kind_after_exact_seconds[kind];
+            self.kind_after_valid[kind] += other.kind_after_valid[kind];
+            self.kind_after_valid_seconds[kind] += other.kind_after_valid_seconds[kind];
+        }
+        self.rank_seconds += other.rank_seconds;
+        self.filter_seconds += other.filter_seconds;
+    }
+}
+
+thread_local! {
+    static FIT_PROFILE: std::cell::RefCell<Option<FitProfile>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Starts collecting a [`FitProfile`] on this thread when `on`.
+pub(crate) fn fit_profile_start(on: bool) {
+    if on {
+        FIT_PROFILE.with(|cell| *cell.borrow_mut() = Some(FitProfile::default()));
+    }
+}
+
+/// Stops collecting and returns what was collected since the start.
+pub(crate) fn fit_profile_take() -> Option<FitProfile> {
+    FIT_PROFILE.with(|cell| cell.borrow_mut().take())
+}
+
+/// The clock, when this thread collects a [`FitProfile`].
+pub(crate) fn fit_profile_clock() -> Option<Instant> {
+    FIT_PROFILE.with(|cell| cell.borrow().is_some()).then(Instant::now)
+}
+
+/// Adds to the profile being collected, if any; `started` is the clock
+/// [`fit_profile_clock`] returned.
+pub(crate) fn fit_profile_note(started: Option<Instant>, note: impl FnOnce(&mut FitProfile, f64)) {
+    let Some(started) = started else {
+        return;
+    };
+    let seconds = started.elapsed().as_secs_f64();
+    FIT_PROFILE.with(|cell| {
+        if let Some(profile) = cell.borrow_mut().as_mut() {
+            note(profile, seconds);
+        }
+    });
+}
+
 /// One quadrature/sample observation used by the numerical fitters.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct FitObservation {
@@ -53,7 +205,9 @@ pub(crate) fn fit_surface_with_path(
     path: FitPath,
 ) -> Result<SurfaceFitResult, RecognitionError> {
     mesh.validate_selection(triangle_indices)?;
+    let started = fit_profile_clock();
     let samples = observations_for_selection(mesh, triangle_indices, options.sampling);
+    fit_profile_note(started, |profile, seconds| profile.observation_seconds += seconds);
     let mut fitted = fit_primitive(kind, &samples, initial, fixed, options)?;
     set_selection_support(&mut fitted.metrics, mesh, triangle_indices);
     Ok(to_result(fitted, initial, fixed, options, path, false))
@@ -69,7 +223,9 @@ pub(crate) fn fit_surface_from_vertices_with_path(
     path: FitPath,
 ) -> Result<SurfaceFitResult, RecognitionError> {
     mesh.validate_vertex_selection(vertex_indices)?;
+    let started = fit_profile_clock();
     let samples = observations_for_vertex_selection(mesh, vertex_indices);
+    fit_profile_note(started, |profile, seconds| profile.observation_seconds += seconds);
     let mut fitted = fit_primitive(kind, &samples, initial, fixed, options)?;
     set_vertex_selection_support(&mut fitted.metrics, mesh, vertex_indices);
     Ok(to_result(fitted, initial, fixed, options, path, false))
@@ -401,7 +557,18 @@ pub(crate) fn fit_primitive(
             (seeds.primary, seeds.alternatives)
         }
         None if kind == SurfaceType::Torus => {
-            let seeds = initialize_torus_seeds(initialization_observations, centroid, scale)?;
+            let started = fit_profile_clock();
+            let seeds = initialize_torus_seeds(
+                initialization_observations,
+                centroid,
+                scale,
+                options.torus_fast,
+            );
+            fit_profile_note(started, |profile, seconds| {
+                profile.torus_fits += 1;
+                profile.torus_seed_seconds += seconds;
+            });
+            let seeds = seeds?;
             (seeds.primary, seeds.alternatives)
         }
         None => (
@@ -411,6 +578,10 @@ pub(crate) fn fit_primitive(
     };
     let initialization_seconds = elapsed(initialization_started);
     let refinement_started = options.collect_phase_timings.then(Instant::now);
+    let torus_started = (kind == SurfaceType::Torus && matching_initial.is_none())
+        .then(fit_profile_clock)
+        .flatten();
+    let torus_starts = 1 + alternatives.len();
     let (surface, final_improvement, selected_seed) = match kind {
         SurfaceType::Plane => (refine_plane(seed, observations, fixed)?, 0.0, seed),
         SurfaceType::Cylinder if !alternatives.is_empty() => {
@@ -494,6 +665,15 @@ pub(crate) fn fit_primitive(
             (refined.0, refined.1, seed)
         }
     };
+    fit_profile_note(torus_started, |profile, seconds| {
+        if torus_starts > 1 {
+            profile.torus_multistart_fits += 1;
+            profile.torus_multistart_starts += torus_starts;
+            profile.torus_multistart_seconds += seconds;
+        } else {
+            profile.torus_single_seconds += seconds;
+        }
+    });
     let refinement_seconds = elapsed(refinement_started);
     // A supplied hint's starting residual is part of the public accuracy
     // contract. For unknown/type-only fits, collect the generated seed's
@@ -510,7 +690,9 @@ pub(crate) fn fit_primitive(
         return Err(fit_error(kind, "refinement produced invalid parameters"));
     }
     let validation_started = options.collect_phase_timings.then(Instant::now);
+    let torus_started = torus_started.and_then(|_| fit_profile_clock());
     let (orientation, metrics) = measure_surface(surface, observations);
+    fit_profile_note(torus_started, |profile, seconds| profile.torus_measure_seconds += seconds);
     let validation_seconds = elapsed(validation_started);
     Ok(FittedModel {
         surface,
@@ -1339,7 +1521,7 @@ fn initialize_torus(
     centroid: Vec3,
     scale: f64,
 ) -> Result<AnalyticSurface, RecognitionError> {
-    Ok(initialize_torus_seeds(samples, centroid, scale)?.primary)
+    Ok(initialize_torus_seeds(samples, centroid, scale, false)?.primary)
 }
 
 struct TorusInitializationSeeds {
@@ -1457,6 +1639,13 @@ impl TorusSeedRanking {
                 .is_some_and(|best_max_chord| best_max_chord <= upper)
     }
 
+    /// Some seed agrees with every observed normal within the multistart
+    /// fidelity ([`RecognitionOptions::torus_fast`]'s gate).
+    fn has_normal_fidelity(&self) -> bool {
+        let upper = 1.0 - numerical::TORUS_MULTISTART_NORMAL_FIDELITY_MAX_RADIANS.cos();
+        self.best_max_normal_chord.is_some_and(|best_max_chord| best_max_chord <= upper)
+    }
+
     fn needs_roundoff_recovery(&self, samples: &[FitObservation]) -> bool {
         let Some((primary, _)) = self.primary else {
             return false;
@@ -1511,10 +1700,12 @@ fn torus_normal_moment_rank(samples: &[FitObservation]) -> Option<f64> {
     (trace.is_finite() && trace > 0.0).then_some((values[0] / trace).max(0.0))
 }
 
+/// `fast`: [`RecognitionOptions::torus_fast`].
 fn initialize_torus_seeds(
     samples: &[FitObservation],
     centroid: Vec3,
     scale: f64,
+    fast: bool,
 ) -> Result<TorusInitializationSeeds, RecognitionError> {
     let (_, ncov) = normal_statistics(samples)
         .ok_or_else(|| fit_error(SurfaceType::Torus, "torus initialization requires normals"))?;
@@ -1530,7 +1721,10 @@ fn initialize_torus_seeds(
         }
     }
     let (_, mvectors) = eigen_symmetric3(moment);
+    let started = fit_profile_clock();
     let normal_offset_seeds = torus_coplanarity_seeds(samples, centroid, scale);
+    fit_profile_note(started, |profile, seconds| profile.torus_coplanarity_seconds += seconds);
+    let axis_started = fit_profile_clock();
     let mut coplanarity_seeds = Vec::new();
     for &(axis, signed_radius) in &normal_offset_seeds {
         if coplanarity_seeds.iter().all(|(old, _): &(Vec3, f64)| {
@@ -1572,22 +1766,24 @@ fn initialize_torus_seeds(
             ranking.consider(surface, samples, scale);
         }
         let mut axis_point = centroid;
+        let mut rows = Vec::with_capacity(samples.len() + 1);
+        let mut rhs = Vec::with_capacity(samples.len() + 1);
         // Alternate the normal-line coplanarity center and axis estimates.
         for _ in 0..12 {
-            let mut rows = Vec::new();
-            let mut rhs = Vec::new();
+            rows.clear();
+            rhs.clear();
             for sample in samples {
                 let Some(n) = sample.normal.and_then(Vec3::normalized) else {
                     continue;
                 };
                 let wv = n.cross(axis);
                 let w = sample.weight.sqrt();
-                rows.push(vec![wv.x * w, wv.y * w, wv.z * w]);
+                rows.push([wv.x * w, wv.y * w, wv.z * w]);
                 rhs.push((sample.point - centroid).cross(n).dot(axis) * w);
             }
             // Gauge pin along the current axis.
             let reg = numerical::TORUS_AXIS_GAUGE_WEIGHT;
-            rows.push(vec![axis.x * reg, axis.y * reg, axis.z * reg]);
+            rows.push([axis.x * reg, axis.y * reg, axis.z * reg]);
             rhs.push(0.0);
             let Some(c) = least_squares(&rows, &rhs, numerical::ALGEBRAIC_REGULARIZATION_RELATIVE)
             else {
@@ -1621,7 +1817,10 @@ fn initialize_torus_seeds(
         });
         ranking.consider(surface, samples, scale);
     }
-    if ranking.needs_normal_disambiguation(samples) || ranking.needs_roundoff_recovery(samples) {
+    fit_profile_note(axis_started, |profile, seconds| profile.torus_axis_seconds += seconds);
+    let recover = ranking.needs_roundoff_recovery(samples) && (!fast || ranking.has_normal_fidelity());
+    if ranking.needs_normal_disambiguation(samples) || recover {
+        let started = fit_profile_clock();
         for &(axis, signed_minor) in &normal_offset_seeds {
             if let Some(surface) =
                 refine_torus_normal_offset_radius(samples, centroid, axis, signed_minor, scale)
@@ -1636,6 +1835,10 @@ fn initialize_torus_seeds(
                 }
             }
         }
+        fit_profile_note(started, |profile, seconds| {
+            profile.torus_offset_refines += 1;
+            profile.torus_offset_refine_seconds += seconds;
+        });
     }
     let mut seeds = ranking.finish(samples)?;
     normal_offset_candidates.sort_by(|left, right| {
@@ -2126,7 +2329,15 @@ fn initialize_torus_from_signed_normal_offset(
     {
         return None;
     }
-    let centerline: Vec<_> = samples
+    let centerline = normal_offset_centerline(samples, signed_minor);
+    let line_centroid = weighted_centroid(&centerline);
+    torus_from_normal_offset_centerline(&centerline, line_centroid, centroid, axis, signed_minor, scale)
+}
+
+/// `point - signed_minor * normal` for every sample with a normal: on a torus
+/// of that signed tube radius, its major circle.
+fn normal_offset_centerline(samples: &[FitObservation], signed_minor: f64) -> Vec<FitObservation> {
+    samples
         .iter()
         .filter_map(|sample| {
             let normal = sample.normal.and_then(Vec3::normalized)?;
@@ -2137,9 +2348,26 @@ fn initialize_torus_from_signed_normal_offset(
                 triangle: sample.triangle,
             })
         })
-        .collect();
-    let line_centroid = weighted_centroid(&centerline)?;
-    let (cx, cy, major_radius) = projected_circle(&centerline, centroid, axis)?;
+        .collect()
+}
+
+/// [`initialize_torus_from_signed_normal_offset`] from its centerline and
+/// the centerline's weighted centroid.
+fn torus_from_normal_offset_centerline(
+    centerline: &[FitObservation],
+    line_centroid: Option<Vec3>,
+    centroid: Vec3,
+    axis: Vec3,
+    signed_minor: f64,
+    scale: f64,
+) -> Option<AnalyticSurface> {
+    if !signed_minor.is_finite()
+        || signed_minor.abs() <= numerical::TORUS_RADIUS_RELATIVE_MIN * scale
+    {
+        return None;
+    }
+    let line_centroid = line_centroid?;
+    let (cx, cy, major_radius) = projected_circle(centerline, centroid, axis)?;
     let (u, v) = axis.orthonormal_basis()?;
     let axial_offset = (line_centroid - centroid).dot(axis);
     let minor_radius = signed_minor.abs();
@@ -2179,27 +2407,20 @@ fn refine_torus_normal_offset_radius(
     let axis = seed_axis.normalized()?.canonicalized();
     let candidate = |log_factor: f64| {
         let signed_minor = signed_seed * log_factor.exp();
-        let centerline: Vec<_> = samples
-            .iter()
-            .filter_map(|sample| {
-                let normal = sample.normal.and_then(Vec3::normalized)?;
-                Some(FitObservation {
-                    point: sample.point - normal * signed_minor,
-                    normal: None,
-                    weight: sample.weight,
-                    triangle: sample.triangle,
-                })
-            })
-            .collect();
-        let dynamic_axis = weighted_centroid(&centerline).and_then(|centerline_centroid| {
+        // One centerline per radius serves the dynamic axis and both
+        // initializations below (each would rebuild the same points).
+        let centerline = normal_offset_centerline(samples, signed_minor);
+        let centerline_centroid = weighted_centroid(&centerline);
+        let dynamic_axis = centerline_centroid.and_then(|centerline_centroid| {
             eigen_symmetric3(point_covariance(&centerline, centerline_centroid)).1[0].normalized()
         });
         [Some(axis), dynamic_axis]
             .into_iter()
             .flatten()
             .filter_map(|candidate_axis| {
-                let surface = initialize_torus_from_signed_normal_offset(
-                    samples,
+                let surface = torus_from_normal_offset_centerline(
+                    &centerline,
+                    centerline_centroid,
                     centroid,
                     candidate_axis,
                     signed_minor,
@@ -2481,6 +2702,15 @@ fn meridian_circle(
     fit_circle_2d(&points)
 }
 
+/// Unweighted least-squares (Kåsa) circle through 2D points: the weighted
+/// fit below at unit weights, centred, with its pivoted-QR fallback for
+/// narrow arcs whose normal equations erase the curvature direction.
+/// Returns `(centre_x, centre_y, radius)`.
+pub fn kasa_circle_2d(points: &[(f64, f64)]) -> Option<(f64, f64, f64)> {
+    let weighted: Vec<(f64, f64, f64)> = points.iter().map(|&(x, y)| (x, y, 1.0)).collect();
+    fit_circle_2d(&weighted)
+}
+
 fn fit_circle_2d(points: &[(f64, f64, f64)]) -> Option<(f64, f64, f64)> {
     if points.len() < 3 {
         return None;
@@ -2500,7 +2730,7 @@ fn fit_circle_2d(points: &[(f64, f64, f64)]) -> Option<(f64, f64, f64)> {
         // to the selected face area. Tiny CAD trims can otherwise fall below
         // the absolute rank threshold despite having a well-spread circle.
         let w = (weight / total).sqrt();
-        rows.push(vec![x * w, y * w, w]);
+        rows.push([x * w, y * w, w]);
         rhs.push((x * x + y * y) * w);
     }
     let circle = |solution: Vec<f64>| {
@@ -2520,8 +2750,12 @@ fn fit_circle_2d(points: &[(f64, f64, f64)]) -> Option<(f64, f64, f64)> {
     };
     let normal_equation =
         least_squares(&rows, &rhs, numerical::ALGEBRAIC_REGULARIZATION_RELATIVE).and_then(circle);
-    let qr = least_squares_qr(&rows, &rhs, numerical::ALGEBRAIC_REGULARIZATION_RELATIVE)
-        .and_then(circle);
+    // Solved only when neither return below takes the normal-equation
+    // circle: the QR solve is pure, so deferring it changes no result.
+    let qr = || {
+        least_squares_qr(&rows, &rhs, numerical::ALGEBRAIC_REGULARIZATION_RELATIVE)
+            .and_then(circle)
+    };
     let covariance = points.iter().fold([0.0; 3], |mut sum, &(px, py, weight)| {
         let x = px - mx;
         let y = py - my;
@@ -2558,7 +2792,7 @@ fn fit_circle_2d(points: &[(f64, f64, f64)]) -> Option<(f64, f64, f64)> {
             return Some(candidate);
         }
     }
-    [normal_equation, qr]
+    [normal_equation, qr()]
         .into_iter()
         .flatten()
         .min_by(|left, right| error(*left).total_cmp(&error(*right)))

@@ -9,8 +9,7 @@ pub struct WasmBrepSolid {
 impl WasmBrepSolid {
     #[wasm_bindgen(constructor)]
     pub fn new(solid_json: &str) -> Result<WasmBrepSolid, JsValue> {
-        let solid: BrepSolid = serde_json::from_str(solid_json)
-            .map_err(|error| javascript_error(error.to_string()))?;
+        let solid: BrepSolid = json_in(solid_json)?;
         let solid = validate_imported_solid(solid, "WasmBrepSolid")?;
         Ok(Self { solid })
     }
@@ -28,22 +27,21 @@ impl WasmBrepSolid {
     }
 
     pub fn to_json(&self) -> Result<String, JsValue> {
-        serde_json::to_string(&self.solid).map_err(|error| javascript_error(error.to_string()))
+        json_out(&self.solid)
     }
 
     pub fn validate_json(&self) -> Result<String, JsValue> {
-        serde_json::to_string(&self.solid.validate())
-            .map_err(|error| javascript_error(error.to_string()))
+        json_out(&self.solid.validate())
     }
 
     pub fn mass_properties_json(&self) -> Result<String, JsValue> {
         let properties = solid_mass_properties(&self.solid).map_err(javascript_error)?;
-        serde_json::to_string(&properties).map_err(|error| javascript_error(error.to_string()))
+        json_out(&properties)
     }
 
     pub fn full_mass_properties_json(&self) -> Result<String, JsValue> {
         let properties = solid_mass_properties_full(&self.solid).map_err(javascript_error)?;
-        serde_json::to_string(&properties).map_err(|error| javascript_error(error.to_string()))
+        json_out(&properties)
     }
 
     /// Full mass properties scaled to a physical `density` (Golovanov §8.11):
@@ -52,8 +50,7 @@ impl WasmBrepSolid {
     /// are density-independent. Returns the `DensityMassProperties` JSON.
     pub fn full_mass_properties_with_density_json(&self, density: f64) -> Result<String, JsValue> {
         let properties = solid_mass_properties_full(&self.solid).map_err(javascript_error)?;
-        serde_json::to_string(&properties.with_density(density))
-            .map_err(|error| javascript_error(error.to_string()))
+        json_out(&properties.with_density(density))
     }
 
     pub fn tessellate_json(
@@ -69,7 +66,7 @@ impl WasmBrepSolid {
             },
         )
         .map_err(javascript_error)?;
-        serde_json::to_string(&mesh).map_err(|error| javascript_error(error.to_string()))
+        json_out(&mesh)
     }
 
     pub fn transform_json(
@@ -83,7 +80,7 @@ impl WasmBrepSolid {
         let transform = AffineTransform::new(matrix).map_err(javascript_error)?;
         let solid = transform_brep(&self.solid, transform, reverse_orientation)
             .map_err(javascript_error)?;
-        serde_json::to_string(&solid).map_err(|error| javascript_error(error.to_string()))
+        json_out(&solid)
     }
 
     pub fn transform_buffer(
@@ -263,7 +260,7 @@ impl WasmBrepSolid {
             },
         )
         .map_err(javascript_refusal)?;
-        serde_json::to_string(&solid).map_err(|error| javascript_error(error.to_string()))
+        json_out(&solid)
     }
 
     pub fn offset_shell_json(
@@ -283,7 +280,7 @@ impl WasmBrepSolid {
             })
             .collect::<Result<Vec<_>, _>>()?;
         let result = offset_shell(&self.solid, &face_ids, distance).map_err(javascript_refusal)?;
-        serde_json::to_string(&result).map_err(|error| javascript_error(error.to_string()))
+        json_out(&result)
     }
 
     /// Golovanov §6.12 direct editing — delete a transition face (chamfer /
@@ -309,7 +306,7 @@ impl WasmBrepSolid {
             ));
         }
         let solid = delete_face_and_heal(&self.solid, face_id as u64).map_err(javascript_refusal)?;
-        serde_json::to_string(&solid).map_err(|error| javascript_error(error.to_string()))
+        json_out(&solid)
     }
 
     /// Golovanov §6.12 direct editing — translate a face group rigidly by
@@ -338,7 +335,7 @@ impl WasmBrepSolid {
             .collect::<Result<Vec<_>, _>>()?;
         let solid =
             move_faces(&self.solid, &face_ids, Vec3::new(dx, dy, dz)).map_err(javascript_refusal)?;
-        serde_json::to_string(&solid).map_err(|error| javascript_error(error.to_string()))
+        json_out(&solid)
     }
 
     pub fn export_step(&self, name: &str, unit: &str, timestamp: &str) -> Result<String, JsValue> {
@@ -358,8 +355,7 @@ impl WasmBrepSolid {
             1e-4
         };
         let (solid, report) = sew_solid(&self.solid, tolerance).map_err(javascript_refusal)?;
-        serde_json::to_string(&serde_json::json!({ "solid": solid, "report": report }))
-            .map_err(|error| javascript_error(error.to_string()))
+        json_out(&serde_json::json!({ "solid": solid, "report": report }))
     }
 }
 
@@ -367,8 +363,7 @@ impl WasmBrepSolid {
 impl WasmNurbsSurface {
     #[wasm_bindgen(constructor)]
     pub fn new(surface_json: &str) -> Result<WasmNurbsSurface, JsValue> {
-        let serialized: NurbsSurface = serde_json::from_str(surface_json)
-            .map_err(|error| javascript_error(error.to_string()))?;
+        let serialized: NurbsSurface = json_in(surface_json)?;
         let surface = NurbsSurface::new(
             serialized.degree_u,
             serialized.degree_v,
@@ -442,8 +437,7 @@ impl WasmNurbsSurface {
 impl WasmNurbsCurve {
     #[wasm_bindgen(constructor)]
     pub fn new(curve_json: &str) -> Result<WasmNurbsCurve, JsValue> {
-        let serialized: NurbsCurve = serde_json::from_str(curve_json)
-            .map_err(|error| javascript_error(error.to_string()))?;
+        let serialized: NurbsCurve = json_in(curve_json)?;
         let curve = NurbsCurve::new(
             serialized.degree,
             serialized.knots,

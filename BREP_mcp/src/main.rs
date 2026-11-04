@@ -5,6 +5,8 @@
 //!                                     the feature catalogue as JSON Schema / the generated docs
 //!   brep-mcp test <scripts…>          run test-mcp scripts headlessly
 //!   brep-mcp shot <doc> <png>         render one document to an image
+//!   brep-mcp typescript status|provision
+//!                                     report, or install, the pinned TypeScript compiler
 //!   brep-mcp render-mesh <mesh.json> <out.png> [--normalize|--frame …]
 //!                                     rasterise a triangle mesh on the CPU and
 //!                                     measure its silhouette
@@ -22,11 +24,31 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Export and manage the reviewed Markdown skill bundle offline.
+    Skills {
+        #[command(subcommand)]
+        command: SkillCommand,
+    },
     /// Serve MCP over stdio, or over streamable HTTP with `--http`.
     Serve {
         /// Where sessions keep their store, shots and logs (default: the OS temp dir).
         #[arg(long)]
         session_root: Option<PathBuf>,
+        /// Private persistent execution state for this server identity. Reuse
+        /// after restart; interrupted work is reconciled, never replayed.
+        #[arg(long, conflicts_with_all = ["instance", "ephemeral"])]
+        state_dir: Option<PathBuf>,
+        /// Stable named execution-state identity (default: headless). Use a
+        /// different name for each concurrently running server.
+        #[arg(long, conflicts_with = "ephemeral")]
+        instance: Option<String>,
+        /// Keep execution state only in memory for this process.
+        #[arg(long)]
+        ephemeral: bool,
+        /// Opt-in private diagnostic metadata archive. Independent of execution
+        /// state; bounded history and gaps, never automatic mutation replay.
+        #[arg(long)]
+        event_journal_dir: Option<PathBuf>,
         /// Serve the streamable-HTTP transport on this loopback port instead of
         /// stdio — the same transport `brep-app --mcp` exposes, with no window.
         /// 0 picks a free port; the URL is printed on stderr.
@@ -87,6 +109,11 @@ enum Command {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
+    /// The TypeScript toolchain `run_script` checks TypeScript with.
+    Typescript {
+        #[command(subcommand)]
+        command: TypescriptCommand,
+    },
     /// Render a document to a PNG through the headless host.
     Shot {
         doc: PathBuf,
@@ -100,6 +127,53 @@ enum Command {
         #[arg(long)]
         session_root: Option<PathBuf>,
     },
+}
+
+#[derive(Subcommand)]
+enum TypescriptCommand {
+    /// Report the compiler `run_script` would check TypeScript with: the same
+    /// discovery and launcher probe `tools/list` advertises. Exits 1 when
+    /// TypeScript is unavailable.
+    Status,
+    /// Install the pinned TypeScript into the user-local prefix discovery
+    /// checks, with npm (`BREP_NPM` or PATH). Downloads; never run by a tool call.
+    Provision,
+}
+
+#[derive(Subcommand)]
+enum SkillCommand {
+    /// Export this binary's reviewed bundle; refuses to replace an existing file.
+    #[command(visible_alias = "fetch")]
+    Bundle { #[arg(long)] output: PathBuf },
+    /// Install or update the managed selection from this binary's exact bundle.
+    #[command(visible_alias = "update")]
+    Install {
+        #[arg(long)] bundle: PathBuf,
+        /// SHA256 obtained from the reviewed bundle, not an untrusted download.
+        #[arg(long)] sha256: String,
+        #[arg(long)] directory: PathBuf,
+    },
+    /// Verify the installed selection and report its version directory.
+    Inspect { #[arg(long)] directory: PathBuf },
+    /// Restore the previous installed version after verifying its reviewed pin.
+    Rollback { #[arg(long)] directory: PathBuf, #[arg(long)] sha256: String },
+}
+
+fn skill_command(command: SkillCommand) -> Result<Value, String> {
+    use brep_mcp_core::skill_distribution as distribution;
+    let receipt = match command {
+        SkillCommand::Bundle { output } => {
+            let output_text=output.to_str().ok_or("bundle output path must be UTF-8")?;
+            let digest=distribution::export(&output)?;
+            return Ok(json!({"sha256":digest,"bundle":output_text}));
+        }
+        SkillCommand::Install { bundle, sha256, directory } => {
+            distribution::install(&distribution::read_bundle(&bundle)?,&sha256,&directory)?
+        }
+        SkillCommand::Inspect { directory } => distribution::inspect(&directory)?,
+        SkillCommand::Rollback { directory, sha256 } => distribution::rollback(&directory,&sha256)?,
+    };
+    serde_json::to_value(receipt).map_err(|e| e.to_string())
 }
 
 fn session_root(explicit: Option<PathBuf>) -> PathBuf {
@@ -152,11 +226,51 @@ async fn stop_session(server: &BrepServer) {
 }
 
 fn main() {
+    // Started as a code-mode worker (the host spawning itself): run it, done.
+    if brep_mcp_core::cad::code::worker_entry() {
+        return;
+    }
     let cli = Cli::parse();
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     let code = match cli.command {
-        Command::Serve { session_root: root, http } => {
-            let server = BrepServer::new(session_root(root), brep_mcp::headless_backend());
+        Command::Typescript { command: TypescriptCommand::Status } => match brep_mcp_core::cad::code::typescript_status() {
+            Ok((node, tsc)) => { println!("TypeScript {} available: node {} runs {}", brep_mcp_core::cad::code::TSC_VERSION, node.display(), tsc.display()); 0 }
+            Err(error) => { eprintln!("brep-mcp: typescript: {}", error.message); 1 }
+        },
+        Command::Typescript { command: TypescriptCommand::Provision } => match brep_mcp_core::cad::code::provision_typescript() {
+            Ok(report) => { println!("{report}"); 0 }
+            Err(error) => { eprintln!("brep-mcp: typescript provision: {error}"); 1 }
+        },
+        Command::Skills { command } => match skill_command(command) {
+            Ok(value) => { println!("{value}"); 0 }
+            Err(error) => { eprintln!("brep-mcp: skills: {error}"); 1 }
+        },
+        Command::Serve { session_root: root, state_dir, instance, ephemeral, event_journal_dir, http } => {
+            use brep_mcp_core::launch_state::{Host, Policy};
+            let persistence = match brep_mcp_core::launch_state::resolve(Host::Headless, &Policy { instance, state_dir, ephemeral }) {
+                Ok(configuration) => configuration,
+                Err(error) => { eprintln!("brep-mcp: execution-state configuration: {error}"); std::process::exit(1); }
+            };
+            if let Err(error) = persistence.prepare_named_parent() {
+                eprintln!("brep-mcp: persistent state: {error}"); std::process::exit(1);
+            }
+            let server = BrepServer::new(session_root(root), brep_mcp::headless_backend()).with_commands(&brep_mcp::command_descriptions());
+            let server = if let Some(directory) = &persistence.state_dir {
+                match server.with_state_dir(directory) {
+                    Ok(server) => server,
+                    Err(error) => { eprintln!("brep-mcp: persistent state at {}: {error}. Use a distinct --instance or --state-dir for another server, or --ephemeral for temporary work.", directory.display()); std::process::exit(1); }
+                }
+            } else { server };
+            match &persistence.state_dir {
+                Some(directory) => eprintln!("brep-mcp: execution state {} ({:?})", directory.display(), persistence.source),
+                None => eprintln!("brep-mcp: execution state is ephemeral ({:?})", persistence.source),
+            }
+            let server = if let Some(directory) = event_journal_dir {
+                match server.with_event_journal(&directory) {
+                    Ok(server) => server,
+                    Err(error) => { eprintln!("brep-mcp: diagnostic archive: {error}"); std::process::exit(1); }
+                }
+            } else { server };
             let result = match http {
                 // Streamable HTTP: bind first, so a busy port is a launch error
                 // rather than a server nobody can reach, then print the URL the
@@ -166,8 +280,10 @@ fn main() {
                         .await
                         .map_err(|e| format!("cannot listen on 127.0.0.1:{port}: {e}"))?;
                     let bound = listener.local_addr().map_err(|e| e.to_string())?.port();
+                    let credential = brep_mcp::http::Credential::load_or_create()?;
                     eprintln!("brep-mcp listening on {}", brep_mcp::http::url(bound));
-                    brep_mcp::http::serve_http(server, listener).await.map_err(|e| e.to_string())
+                    eprintln!("every request needs `Authorization: Bearer <token>`, the token in {}", brep_mcp::http::Credential::path().display());
+                    brep_mcp::http::serve_http(server, listener, credential).await.map_err(|e| e.to_string())
                 }),
                 None => rt.block_on(brep_mcp::server::serve_stdio(server)).map_err(|e| e.to_string()),
             };
@@ -227,7 +343,7 @@ fn main() {
             if backend != "headless" {
                 eprintln!("brep-mcp: backend `{backend}` is not available yet; using headless");
             }
-            let server = BrepServer::new(session_root(root), brep_mcp::headless_backend());
+            let server = BrepServer::new(session_root(root), brep_mcp::headless_backend()).with_commands(&brep_mcp::command_descriptions());
             let out_root = out.unwrap_or_else(|| PathBuf::from("target/test-mcp"));
             let baselines = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/baselines");
             let mut worst = brep_mcp::script::exit::PASS;
@@ -245,7 +361,17 @@ fn main() {
                     eprintln!("--- order check: {pass} pass ({} scripts) ---", list.len());
                 }
                 for path in list {
-                    let script = match std::fs::read_to_string(path).map_err(|e| e.to_string()).and_then(|t| brep_mcp::script::Script::parse(&t)) {
+                    // A `.js` script is a PROGRAM, played through code mode
+                    // (`brep_mcp::program`); a `.json` one is a step list.
+                    let is_program = path.extension().is_some_and(|e| e == "js");
+                    let loaded = std::fs::read_to_string(path).map_err(|e| e.to_string()).and_then(|t| {
+                        if is_program {
+                            brep_mcp::program::Program::parse(&t).map(|p| (p.script.clone(), Some(p)))
+                        } else {
+                            brep_mcp::script::Script::parse(&t).map(|s| (s, None))
+                        }
+                    });
+                    let (script, program) = match loaded {
                         Ok(s) => s,
                         Err(e) => {
                             eprintln!("brep-mcp: {}: {e}", path.display());
@@ -256,9 +382,12 @@ fn main() {
                     let out_dir = pass_root.join(&script.name);
                     // A script that only uses catalogue tools needs no app.
                     // Nor does one that only talks to its PLM fixture.
-                    let needs_app = script.steps.iter().any(|s| {
-                        !matches!(s.tool.as_str(), "feature_catalogue" | "feature_schema" | brep_mcp::runner::PLM_REQUEST | brep_mcp::runner::PLM_SERVER)
-                    });
+                    let needs_app = match &program {
+                        Some(p) => p.needs_app(),
+                        None => script.steps.iter().any(|s| {
+                            !matches!(s.tool.as_str(), "feature_catalogue" | "feature_schema" | brep_mcp::runner::PLM_REQUEST | brep_mcp::runner::PLM_SERVER)
+                        }),
+                    };
                     // The session's STORE is a real directory beside the run's
                     // artefacts, so the file modal lists what this script saved
                     // and a `session_restart` comes back to it. It is also the
@@ -321,8 +450,13 @@ fn main() {
                         plm: plm.clone(),
                     };
                     let result = rt.block_on(async {
-                        let tools = server.state.tools.read().await;
-                        brep_mcp::runner::run(&script, &tools, &opts).await
+                        match &program {
+                            Some(program) => brep_mcp::program::run(program, &server.state, &opts).await,
+                            None => {
+                                let tools = server.state.tools.read().await;
+                                brep_mcp::runner::run(&script, &tools, &opts).await
+                            }
+                        }
                     });
                     if needs_app {
                         rt.block_on(stop_session(&server));
@@ -382,7 +516,7 @@ fn main() {
                 .split_once('x')
                 .and_then(|(a, b)| Some((a.parse::<f32>().ok()?, b.parse::<f32>().ok()?)))
                 .unwrap_or((1280.0, 800.0));
-            let server = BrepServer::new(session_root(root), brep_mcp::headless_backend());
+            let server = BrepServer::new(session_root(root), brep_mcp::headless_backend()).with_commands(&brep_mcp::command_descriptions());
             let result: Result<(), String> = rt.block_on(async {
                 start_session(&server, json!({ "backend": "headless", "width": w, "height": h, "ppp": ppp, "document": doc.display().to_string(), "record": false })).await?;
                 call(&server, "standard_view", json!({ "name": view })).await?;

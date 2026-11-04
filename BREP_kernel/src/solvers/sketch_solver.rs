@@ -414,3 +414,31 @@ use constraints_shape::{
 use jsnum::*;
 
 pub use api::{solve_sketch, solve_sketch_from_json};
+
+/// Mint a collision-free sketch ID, with caller-selected reserved IDs omitted.
+pub fn mint_sketch_id<'a>(ids: impl Iterator<Item = &'a Value>, skip: impl Fn(&Value) -> bool) -> Value {
+    let ids: Vec<&Value> = ids.filter(|id| !skip(id)).collect();
+    let mut max: Option<i64> = None;
+    for &id in &ids {
+        if let Some(n) = id_num(id) {
+            if n.is_finite() {
+                let i = n.floor() as i64;
+                max = Some(max.map_or(i, |m| m.max(i)));
+            }
+        }
+    }
+    let mut candidate = max.map(|m| m + 1).unwrap_or(ids.len() as i64);
+    let existing: std::collections::HashSet<String> = ids.iter().map(|&id| sketch_id_key(id)).collect();
+    while existing.contains(&sketch_id_key(&Value::from(candidate))) {
+        candidate += 1;
+    }
+    Value::from(candidate)
+}
+
+fn id_num(value: &Value) -> Option<f64> {
+    match value {
+        Value::Number(number) => number.as_f64(),
+        Value::String(text) => text.trim().parse::<f64>().ok(),
+        _ => None,
+    }
+}

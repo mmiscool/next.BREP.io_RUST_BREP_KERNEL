@@ -40,7 +40,9 @@ mod frame;
 mod plate;
 mod bend;
 mod collar;
+mod relief;
 mod walk;
+mod warp;
 
 pub use walk::{evaluate, folded_flat_placements, FlatPlacement, WedgeStrip};
 pub(crate) use collar::circle_of_loop;

@@ -37,6 +37,7 @@ const LOCAL_FALSE_ALARM: f64 = 1e-6;
 /// Gauss-Newton steps: fixed, so the fit is a function of the mesh alone.
 const SPHERE_STEPS: usize = 10;
 const TORUS_STEPS: usize = 20;
+const CONE_STEPS: usize = 20;
 
 /// A fitted whole primitive.
 #[derive(Clone, Copy, Debug)]
@@ -76,13 +77,13 @@ impl WholeFitReport {
 /// Lane J row 11, promoted ON 2026-10-16: BREP_HYBRID_WHOLE_LOCAL=0 restores
 /// row 9's global test alone.
 pub(crate) fn whole_local_enabled() -> bool {
-    std::env::var("BREP_HYBRID_WHOLE_LOCAL").map_or(true, |v| v != "0")
+    brep_kernel::switch!(live "BREP_HYBRID_WHOLE_LOCAL", true)
 }
 
 /// Lane J row 9, promoted ON 2026-10-16: BREP_HYBRID_WHOLE_FREEFORM=0 restores
 /// row 6 alone.
 pub(crate) fn whole_freeform_enabled() -> bool {
-    std::env::var("BREP_HYBRID_WHOLE_FREEFORM").map_or(true, |v| v != "0")
+    brep_kernel::switch!(live "BREP_HYBRID_WHOLE_FREEFORM", true)
 }
 
 fn sub(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
@@ -121,43 +122,13 @@ fn frame(axis: [f64; 3]) -> ([f64; 3], [f64; 3]) {
     (e1, cross(axis, e1))
 }
 
-/// Solve the dense system `a x = b` (row-major, n x n) by Gaussian
-/// elimination with partial pivoting; `None` when it is singular relative to
-/// its largest pivot.
-fn solve(mut a: Vec<f64>, mut b: Vec<f64>, n: usize) -> Option<Vec<f64>> {
-    let largest = a.iter().fold(0.0_f64, |m, v| m.max(v.abs()));
-    if !(largest > 0.0) || !largest.is_finite() {
-        return None;
-    }
-    for col in 0..n {
-        let pivot = (col..n).max_by(|&i, &j| a[i * n + col].abs().total_cmp(&a[j * n + col].abs()))?;
-        if a[pivot * n + col].abs() <= largest * 1e-14 {
-            return None;
-        }
-        if pivot != col {
-            for k in 0..n {
-                a.swap(pivot * n + k, col * n + k);
-            }
-            b.swap(pivot, col);
-        }
-        for row in col + 1..n {
-            let f = a[row * n + col] / a[col * n + col];
-            if f != 0.0 {
-                for k in col..n {
-                    a[row * n + k] -= f * a[col * n + k];
-                }
-                b[row] -= f * b[col];
-            }
-        }
-    }
-    let mut x = vec![0.0; n];
-    for row in (0..n).rev() {
-        let mut s = b[row];
-        for k in row + 1..n {
-            s -= a[row * n + k] * x[k];
-        }
-        x[row] = s / a[row * n + row];
-    }
+/// Solve the dense system `a x = b` (row-major, n x n) with the kernel's
+/// shared solver ([`brep_kernel::solve_dense`]: partial pivoting, singular
+/// below `1e-13` of the largest entry); `None` when it is singular or the
+/// solution is not finite.
+fn solve(a: Vec<f64>, b: Vec<f64>, n: usize) -> Option<Vec<f64>> {
+    let rows = a.chunks_exact(n).map(<[f64]>::to_vec).collect();
+    let x = brep_kernel::solve_dense(rows, b).ok()?;
     x.iter().all(|v| v.is_finite()).then_some(x)
 }
 
@@ -176,46 +147,29 @@ fn least_squares(rows: impl Iterator<Item = (Vec<f64>, f64)>, n: usize) -> Optio
     solve(ata, atb, n)
 }
 
-/// Eigenvector of the smallest eigenvalue of a symmetric 3 x 3 matrix, by a
-/// fixed number of cyclic Jacobi sweeps.
-fn smallest_eigenvector(mut m: [[f64; 3]; 3]) -> [f64; 3] {
-    let mut v = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
-    for _ in 0..32 {
-        for (p, q) in [(0, 1), (0, 2), (1, 2)] {
-            if m[p][q] == 0.0 {
-                continue;
-            }
-            let theta = (m[q][q] - m[p][p]) / (2.0 * m[p][q]);
-            let t = theta.signum() / (theta.abs() + (theta * theta + 1.0).sqrt());
-            let t = if theta == 0.0 { 1.0 } else { t };
-            let c = 1.0 / (t * t + 1.0).sqrt();
-            let s = t * c;
-            for k in 0..3 {
-                let (mkp, mkq) = (m[k][p], m[k][q]);
-                m[k][p] = c * mkp - s * mkq;
-                m[k][q] = s * mkp + c * mkq;
-            }
-            for k in 0..3 {
-                let (mpk, mqk) = (m[p][k], m[q][k]);
-                m[p][k] = c * mpk - s * mqk;
-                m[q][k] = s * mpk + c * mqk;
-            }
-            for row in v.iter_mut() {
-                let (a, b) = (row[p], row[q]);
-                row[p] = c * a - s * b;
-                row[q] = s * a + c * b;
-            }
-        }
-    }
-    let k = (0..3).min_by(|&a, &b| m[a][a].total_cmp(&m[b][b])).unwrap_or(0);
-    [v[0][k], v[1][k], v[2][k]]
+/// Eigenvector of the smallest eigenvalue of a symmetric 3 x 3 matrix: the
+/// shared Jacobi ([`brep_ransac::jacobi_eigen_symmetric3`], relative
+/// convergence test) at this module's former turn (+1 at equal diagonals).
+fn smallest_eigenvector(m: [[f64; 3]; 3]) -> [f64; 3] {
+    brep_ransac::jacobi_eigen_symmetric3(m, brep_ransac::JacobiZeroTurn::Positive).1[0]
 }
 
 fn fit_sphere(points: &[[f64; 3]], diagonal: f64) -> Option<WholeFit> {
-    // Algebraic start: |p|^2 = 2 c.p + k.
-    let start = least_squares(points.iter().map(|&p| (vec![2.0 * p[0], 2.0 * p[1], 2.0 * p[2], 1.0], -dot(p, p))), 4)?;
-    let mut center = [start[0], start[1], start[2]];
-    let mut radius = (start[3] + dot(center, center)).sqrt();
+    // Algebraic start: |q|^2 = 2 c.q + k in coordinates centred on the
+    // points' mean, so a part far from the world origin does not read as
+    // singular (|p|^2 dwarfs the radius term; RANSAC fit.rs and the kernel
+    // carrier_fit both centre).
+    let centroid = scale(points.iter().fold([0.0; 3], |s, &p| add(s, p)), 1.0 / points.len() as f64);
+    let start = least_squares(
+        points.iter().map(|&p| {
+            let q = sub(p, centroid);
+            (vec![2.0 * q[0], 2.0 * q[1], 2.0 * q[2], 1.0], -dot(q, q))
+        }),
+        4,
+    )?;
+    let offset = [start[0], start[1], start[2]];
+    let mut center = add(centroid, offset);
+    let mut radius = (start[3] + dot(offset, offset)).sqrt();
     for _ in 0..SPHERE_STEPS {
         let step = least_squares(
             points.iter().filter_map(|&p| {
@@ -356,7 +310,7 @@ fn normal_deviate(tail: f64) -> f64 {
 /// Lane J row 13: `BREP_WHOLE_CARRIER_SCAN=0` restores the direct analytic
 /// builders and row 6's whole primitive without the local residual scan.
 pub(crate) fn whole_carrier_scan_enabled() -> bool {
-    std::env::var("BREP_WHOLE_CARRIER_SCAN").map_or(true, |v| v != "0")
+    brep_kernel::switch!(live "BREP_WHOLE_CARRIER_SCAN", true)
 }
 
 /// Lane J row 12: the row 11 local scan read on one carrier's own vertex
@@ -555,6 +509,137 @@ fn vertex_neighbours(indices: &[u32], used: &[u32]) -> Vec<Vec<usize>> {
     neighbours
 }
 
+/// Vertices lying within `tolerance` of the segment between two of their own
+/// edge neighbours: a stitched T-junction's vertex, on the chord of the edge
+/// it split. Such a vertex sits inside a convex surface by the chord's sag
+/// (to 1.6e-2 on a T-junction OCCT torus whose other vertices stay within
+/// 6.4e-4) and carries no reading of the surface. A genuine small flat or
+/// dimple moves coplanar vertex patches, not collinear triples.
+pub(crate) fn chord_vertices(positions: &[f64], indices: &[u32], tolerance: f64) -> std::collections::BTreeSet<u32> {
+    chord_spans(positions, indices, tolerance).into_keys().collect()
+}
+
+/// [`chord_vertices`] with, for each, every pair of its edge neighbours it
+/// lies between. A vertex on a ruling of a cylinder or cone lies between its
+/// neighbours along the ruling too; a stitched chord vertex's pair sits on
+/// the surface it lies inside of.
+pub(crate) fn chord_spans(
+    positions: &[f64],
+    indices: &[u32],
+    tolerance: f64,
+) -> std::collections::BTreeMap<u32, Vec<(u32, u32)>> {
+    let point = |v: u32| {
+        let i = 3 * v as usize;
+        [positions[i], positions[i + 1], positions[i + 2]]
+    };
+    let mut neighbours = std::collections::BTreeMap::<u32, std::collections::BTreeSet<u32>>::new();
+    for t in indices.chunks_exact(3) {
+        for k in 0..3 {
+            let (a, b) = (t[k], t[(k + 1) % 3]);
+            neighbours.entry(a).or_default().insert(b);
+            neighbours.entry(b).or_default().insert(a);
+        }
+    }
+    let mut chord = std::collections::BTreeMap::new();
+    for (&v, around) in &neighbours {
+        let p = point(v);
+        let around: Vec<u32> = around.iter().copied().collect();
+        let mut spans = Vec::new();
+        for (i, &a) in around.iter().enumerate() {
+            for &b in &around[i + 1..] {
+                let (pa, ab) = (point(a), sub(point(b), point(a)));
+                let span = dot(ab, ab);
+                let t = dot(sub(p, pa), ab) / span;
+                if span > 0.0 && t > 0.0 && t < 1.0 && length(cross(sub(p, pa), ab)) / span.sqrt() <= tolerance {
+                    spans.push((a, b));
+                }
+            }
+        }
+        if !spans.is_empty() {
+            chord.insert(v, spans);
+        }
+    }
+    chord
+}
+
+/// A cone's start from its facets (`triangles`, each three corners), as the
+/// segmenter's own cone fit starts: every tangent plane passes through the
+/// apex (area-weighted least squares on facet normals), the axis is the
+/// direction the facet normals vary least along, pointed into the facets,
+/// and the half angle is the mean of the corners' angles off it.
+pub(crate) fn cone_start(triangles: &[[[f64; 3]; 3]]) -> Option<([f64; 3], [f64; 3], f64)> {
+    let mut ata = vec![0.0; 9];
+    let mut atb = vec![0.0; 3];
+    let mut moment = [[0.0; 3]; 3];
+    for t in triangles {
+        let cross_product = cross(sub(t[1], t[0]), sub(t[2], t[0]));
+        let area = 0.5 * length(cross_product);
+        let Some(n) = normalized(cross_product) else { continue };
+        let centroid = scale(add(add(t[0], t[1]), t[2]), 1.0 / 3.0);
+        for a in 0..3 {
+            atb[a] += area * n[a] * dot(n, centroid);
+            for b in 0..3 {
+                ata[3 * a + b] += area * n[a] * n[b];
+                moment[a][b] += area * n[a] * n[b];
+            }
+        }
+    }
+    let apex = solve(ata, atb, 3)?;
+    let apex = [apex[0], apex[1], apex[2]];
+    let mut axis = normalized(smallest_eigenvector(moment))?;
+    let inward: f64 = triangles.iter().flat_map(|t| t.iter()).map(|&p| dot(sub(p, apex), axis)).sum();
+    if inward < 0.0 {
+        axis = scale(axis, -1.0);
+    }
+    let angles: Vec<f64> = triangles
+        .iter()
+        .flat_map(|t| t.iter())
+        .map(|&p| {
+            let q = sub(p, apex);
+            let h = dot(q, axis);
+            length(sub(q, scale(axis, h))).atan2(h)
+        })
+        .collect();
+    let half_angle = angles.iter().sum::<f64>() / angles.len().max(1) as f64;
+    (half_angle.is_finite() && (1.0e-6..std::f64::consts::FRAC_PI_2 - 1.0e-6).contains(&half_angle))
+        .then_some((apex, axis, half_angle))
+}
+
+/// Gauss-Newton refit of a cone (apex, unit axis into the nappe, half
+/// angle) over `points`, from the given start; the refit and the largest
+/// distance of a point from it, or `None` when a step is singular or the
+/// result leaves one nappe.
+pub(crate) fn refit_cone(
+    points: &[[f64; 3]],
+    apex: [f64; 3],
+    axis: [f64; 3],
+    half_angle: f64,
+) -> Option<([f64; 3], [f64; 3], f64, f64)> {
+    let residual = |p: [f64; 3], apex: [f64; 3], axis: [f64; 3], half_angle: f64| {
+        let q = sub(p, apex);
+        let h = dot(q, axis);
+        let r = length(sub(q, scale(axis, h)));
+        r * half_angle.cos() - h * half_angle.sin()
+    };
+    let trace = std::env::var("BREP_DEBUG_CONE_REFIT").is_ok();
+    if trace {
+        eprintln!("[refit-cone] {} points from apex {apex:?} axis {axis:?} angle {half_angle:.4}", points.len());
+    }
+    // The shared slice refinement (record item N2 step 2), at this module's
+    // fixed step count so the fit is a function of the mesh alone; a point on
+    // the axis takes no part, and the angle is range-tested below, not clamped.
+    let policy = brep_ransac::ConeRefinePolicy { steps: CONE_STEPS, stop_below: 0.0, min_radius: 0.0, clamp_angle: false };
+    let (apex, axis, half_angle) = brep_ransac::refine_cone(points, apex, axis, half_angle, policy)?;
+    if trace {
+        eprintln!("[refit-cone]   result apex {apex:?} axis {axis:?} angle {half_angle:.4}");
+    }
+    if !(1.0e-6..std::f64::consts::FRAC_PI_2 - 1.0e-6).contains(&half_angle) {
+        return None;
+    }
+    let deviation = points.iter().map(|&p| residual(p, apex, axis, half_angle).abs()).fold(0.0, f64::max);
+    deviation.is_finite().then_some((apex, axis, half_angle, deviation))
+}
+
 fn chi_square_quantile(k: f64, z: f64) -> f64 {
     let h = 2.0 / (9.0 * k);
     k * (1.0 - h + z * h.sqrt()).powi(3)
@@ -563,7 +648,18 @@ fn chi_square_quantile(k: f64, z: f64) -> f64 {
 /// Fit the primitive of `genus` (0 sphere, 1 ring torus) to the vertices the
 /// triangles use, and read its residual. `None` when the fit fails.
 pub(crate) fn fit_whole_primitive(positions: &[f64], indices: &[u32], genus: i64) -> Option<WholeFitReport> {
-    let used: std::collections::BTreeSet<u32> = indices.iter().copied().collect();
+    fit_whole_primitive_without(positions, indices, genus, &std::collections::BTreeSet::new())
+}
+
+/// [`fit_whole_primitive`] over the vertices the triangles use except
+/// `excluded`, which take no part in the fit, the residual or the local scan.
+pub(crate) fn fit_whole_primitive_without(
+    positions: &[f64],
+    indices: &[u32],
+    genus: i64,
+    excluded: &std::collections::BTreeSet<u32>,
+) -> Option<WholeFitReport> {
+    let used: std::collections::BTreeSet<u32> = indices.iter().copied().filter(|v| !excluded.contains(v)).collect();
     let points: Vec<[f64; 3]> = used
         .iter()
         .map(|&v| {

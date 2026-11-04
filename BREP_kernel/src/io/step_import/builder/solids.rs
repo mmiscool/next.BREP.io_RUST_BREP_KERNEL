@@ -661,7 +661,7 @@ pub(in crate::step_import) fn build_solid_from_shell_captured(
     // assemble each face's loops/pcurves from the (now consistent) topology.
     // Phase wall-clock on stderr when `BREP_PROFILE` is set — the switch the
     // boolean's `boolean.<stage>_ms` lines use.
-    let profile = std::env::var("BREP_PROFILE").is_ok();
+    let profile = crate::profile::profile_enabled();
     let mut lap_started = web_time::Instant::now();
     let mut laps: Vec<(&str, f64)> = Vec::new();
     let mut lap = |name: &'static str, started: &mut web_time::Instant, laps: &mut Vec<(&str, f64)>| {
@@ -762,7 +762,7 @@ pub(in crate::step_import) fn build_solid_from_shell_captured(
     lap("closure", &mut lap_started, &mut laps);
     if profile {
         let line: Vec<String> = laps.iter().map(|(name, ms)| format!("{name}={ms:.2}")).collect();
-        eprintln!("step_import.profile shell=#{shell_ref} faces={} {}", face_refs.len(), line.join(" "));
+        profile_line!("step_import.profile shell=#{shell_ref} faces={} {}", face_refs.len(), line.join(" "));
     }
     Ok((solid, captured, readings::BodyReadings { bounded, closure }))
 }

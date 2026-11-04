@@ -12,6 +12,14 @@
 //!   added, the insertion offsets and the camera. A server stores it per
 //!   instructions revision and the template fetches it. Data written before
 //!   the step tree (schema 1: chapters of steps) reads as a flat list.
+//! * Beside the steps the data carries the assembly's occurrence tree
+//!   ([`PlayerComponent`], one row per placed component with its thumbnail
+//!   and details), which the page's Model tab shows as an expandable tree
+//!   over the model with every part's visibility its own, and its Parts tab
+//!   as one card per part with the steps that use it; and per step the PMI
+//!   its view shows ([`PlayerPmi`]: dimensions, notes, balloons, leaders,
+//!   laid out by the same `pmi_present` the viewport, the sheets and the 3D
+//!   PDF use), drawn over the parts.
 //! * The offline copy is the same template with the data inlined
 //!   ([`offline_html`]): one self-contained `.html`.
 
@@ -75,6 +83,11 @@ pub struct PlayerData {
     pub tool_pictures: BTreeMap<String, String>,
     pub meshes: Vec<PlayerMesh>,
     pub nodes: Vec<PlayerNode>,
+    /// The assembly's occurrence tree, depth first (a component before its
+    /// children): the Model tab's tree and the Parts tab's cards. Absent from
+    /// data made before the tree was carried, and from a motion study's.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub assembly: Vec<PlayerComponent>,
     /// A motion study's baked frames: with no chapters the page is the study's
     /// player (a timeline over the frames); a step may carry one too (its
     /// motion). Absent from instructions made before motion existed.
@@ -161,6 +174,9 @@ pub struct PlayerStep {
     /// the node's own matrix (world space), as the step's pictures pose it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub poses: Vec<Pose>,
+    /// The PMI the step's view shows, drawn over the parts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pmi: Option<PlayerPmi>,
     /// A rendered picture of the step (PNG data URL), for customer mode and
     /// for viewers without WebGL.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -228,6 +244,127 @@ pub struct Insertion {
 pub struct Pose {
     pub node: usize,
     pub matrix: [f64; 16],
+}
+
+/// A step view's PMI as the page draws it: every enabled, resolved
+/// annotation of the view (not its explode or hide rows) laid out in world
+/// space, sized as the viewport sized it when the view was saved. Text is
+/// stroked with the PMI font, so the page needs no font of its own. Arrays
+/// are little-endian base64 like a mesh's.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlayerPmi {
+    /// f32 xyz pairs: dimension, extension and leader lines, frames and the
+    /// stroked text, as line segments.
+    pub lines: String,
+    /// f32 xyz triples: the filled arrowheads, as triangles.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub arrows: String,
+    /// How many annotations are drawn.
+    pub annotations: usize,
+    /// Each drawn annotation's text, in the view's order (for a reader
+    /// without WebGL and for automation).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub texts: Vec<String>,
+}
+
+impl PlayerPmi {
+    /// The drawing of `annotations` annotations from their polylines (each
+    /// at least two points; every polyline becomes its consecutive segments)
+    /// and arrowhead triangles. `None` when there is nothing to draw.
+    pub fn new(polylines: &[Vec<[f64; 3]>], arrows: &[[[f64; 3]; 3]], annotations: usize, texts: Vec<String>) -> Option<Self> {
+        let mut segments: Vec<f32> = Vec::new();
+        for line in polylines {
+            for pair in line.windows(2) {
+                segments.extend(pair[0].iter().chain(&pair[1]).map(|&v| v as f32));
+            }
+        }
+        let triangles: Vec<f32> = arrows.iter().flatten().flatten().map(|&v| v as f32).collect();
+        if segments.is_empty() && triangles.is_empty() {
+            return None;
+        }
+        Some(Self {
+            lines: encode_f32(&segments),
+            arrows: if triangles.is_empty() { String::new() } else { encode_f32(&triangles) },
+            annotations,
+            texts,
+        })
+    }
+}
+
+/// One placed component of the assembly: a row of the Model tab's tree and,
+/// with the other rows of its part, a card of the Parts tab.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlayerComponent {
+    /// The occurrence path (`ACOMP1:ACOMP3`): a node belongs to the deepest
+    /// component whose path its occurrence starts with (then `:`).
+    pub path: String,
+    /// The parent component's path; none at the top of the assembly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<String>,
+    /// 0 at the top of the assembly.
+    #[serde(default)]
+    pub depth: usize,
+    /// The part's name.
+    pub name: String,
+    /// What a step's add names the part by: its PLM id, or its name.
+    pub part: String,
+    /// The PLM part id when the part was placed from a PLM revision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub part_id: Option<String>,
+    #[serde(default)]
+    pub find_number: String,
+    #[serde(default)]
+    pub subassembly: bool,
+    #[serde(default)]
+    pub fastener: bool,
+    #[serde(default)]
+    pub serial_tracked: bool,
+    #[serde(default)]
+    pub grounded: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub torque: Option<String>,
+    /// The part's attributes as `[name, value]` text pairs.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attributes: Vec<(String, String)>,
+    /// The part's thumbnail (PNG data URL); every row of one part carries
+    /// the same.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thumbnail: Option<String>,
+}
+
+impl PlayerComponent {
+    /// One row per component of `root` and its sub-assemblies, depth first.
+    /// Thumbnails are filled by [`PlayerData::build`] from the scene's.
+    pub fn rows(root: &crate::wizard::Level) -> Vec<Self> {
+        let mut out = Vec::new();
+        fn walk(level: &crate::wizard::Level, parent: Option<&str>, depth: usize, out: &mut Vec<PlayerComponent>) {
+            for c in &level.components {
+                out.push(PlayerComponent {
+                    path: c.path.clone(),
+                    parent: parent.map(str::to_string),
+                    depth,
+                    name: c.part.clone(),
+                    part: c.part_key().to_string(),
+                    part_id: c.part_id.clone(),
+                    find_number: c.find_number.clone(),
+                    subassembly: c.children.is_some(),
+                    fastener: c.fastener,
+                    serial_tracked: c.serial_tracked,
+                    grounded: c.grounded,
+                    torque: c.torque.clone(),
+                    attributes: c.attributes.clone(),
+                    thumbnail: None,
+                });
+                if let Some(children) = &c.children {
+                    walk(children, Some(&c.path), depth + 1, out);
+                }
+            }
+        }
+        walk(root, None, 0, &mut out);
+        out
+    }
 }
 
 /// One triangle mesh, shared by every node of the same part. Arrays are
@@ -321,6 +458,11 @@ pub struct Scene {
     pub thumbnails: HashMap<String, String>,
     /// Each step's explode poses, by step id.
     pub poses: HashMap<String, Vec<Pose>>,
+    /// Each step's view PMI, by step id.
+    pub pmi: HashMap<String, PlayerPmi>,
+    /// The assembly's occurrence tree ([`PlayerComponent::rows`]); each
+    /// row's thumbnail is taken from `thumbnails` by its part.
+    pub assembly: Vec<PlayerComponent>,
     /// The wrapper occurrence the instructions place the assembly under
     /// (`ACOMP1`): a step's motion, keyed by the assembly's own occurrences,
     /// is re-keyed under it. Empty when the nodes are the assembly's own.
@@ -572,12 +714,19 @@ impl PlayerData {
                     adding,
                     insertion,
                     poses: scene.poses.get(&step.id).cloned().unwrap_or_default(),
+                    pmi: scene.pmi.get(&step.id).cloned(),
                     image: scene.step_images.get(&step.id).cloned(),
                     motion: step_motion(step, &scene.wrapper)?,
                 });
             }
         }
         let title = if block.front.title.is_empty() { block.target.name.clone() } else { block.front.title.clone() };
+        let mut assembly = scene.assembly;
+        for row in &mut assembly {
+            if row.thumbnail.is_none() {
+                row.thumbnail = scene.thumbnails.get(&row.part).cloned();
+            }
+        }
         Ok(Self {
             schema: DATA_SCHEMA,
             title,
@@ -594,6 +743,7 @@ impl PlayerData {
             tools: block.tools_list().into_iter().map(|(t, _)| t).collect(),
             meshes: scene.meshes,
             nodes: scene.nodes,
+            assembly,
             motion: None,
         })
     }
@@ -646,6 +796,7 @@ impl PlayerData {
             tool_pictures: BTreeMap::new(),
             meshes: scene.meshes,
             nodes: scene.nodes,
+            assembly: Vec::new(),
             motion: Some(motion),
         })
     }
@@ -764,14 +915,17 @@ pub fn base64(bytes: &[u8]) -> String {
     out
 }
 
-/// Standard base64 back to bytes (an unknown character ends the input).
-pub fn unbase64(text: &str) -> Vec<u8> {
+/// Standard base64 back to bytes: padding (at most two `=`) only at the end.
+/// `None` for any other character, so a corrupt string is never read as the
+/// prefix before its first bad character.
+pub fn unbase64(text: &str) -> Option<Vec<u8>> {
     let value = |c: u8| BASE64.iter().position(|&b| b == c);
+    let body = text.strip_suffix("==").or_else(|| text.strip_suffix('=')).unwrap_or(text);
     let mut out = Vec::with_capacity(text.len() / 4 * 3);
     let mut acc: u32 = 0;
     let mut bits = 0;
-    for c in text.bytes() {
-        let Some(v) = value(c) else { break };
+    for c in body.bytes() {
+        let v = value(c)?;
         acc = (acc << 6) | v as u32;
         bits += 6;
         if bits >= 8 {
@@ -780,12 +934,13 @@ pub fn unbase64(text: &str) -> Vec<u8> {
             acc &= (1 << bits) - 1;
         }
     }
-    out
+    Some(out)
 }
 
-/// The f32 values an [`encode_f32`] string carries.
+/// The f32 values an [`encode_f32`] string carries; none for a string that is
+/// not base64 (never a short read of its good prefix).
 pub fn decode_f32(text: &str) -> Vec<f32> {
-    unbase64(text).chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect()
+    unbase64(text).unwrap_or_default().chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect()
 }
 
 pub fn encode_f32(values: &[f32]) -> String {

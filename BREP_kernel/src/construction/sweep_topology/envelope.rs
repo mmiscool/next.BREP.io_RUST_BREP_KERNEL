@@ -252,18 +252,7 @@ fn fit_circle(samples: &[Vec3]) -> Result<Option<FittedCircle>, KernelRefusal> {
 /// The centre of the circle through three points, or `None` when they are
 /// collinear.
 fn circumcentre(a: Vec3, b: Vec3, c: Vec3) -> Option<Vec3> {
-    let ab = b.sub(a);
-    let ac = c.sub(a);
-    let normal = ab.cross(ac);
-    let denominator = 2.0 * normal.dot(normal);
-    if denominator <= 0.0 || !denominator.is_finite() {
-        return None;
-    }
-    let term = ac
-        .cross(normal)
-        .scale(ab.dot(ab))
-        .add(normal.cross(ab).scale(ac.dot(ac)));
-    Some(a.add(term.scale(1.0 / denominator)))
+    crate::circumcenter(a, b, c)
 }
 
 /// Recognize the one configuration the envelope lane builds, or say — in words

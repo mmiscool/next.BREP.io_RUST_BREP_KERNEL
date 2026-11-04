@@ -149,8 +149,7 @@ fn whole(lo: f64, hi: f64) -> Vec<Panel> {
 /// everywhere — the A/B switch for this rule's cost, and the way a reading is
 /// compared against what the integrator read before it.
 pub(super) fn rational_rule_on() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("BREP_MASS_RATIONAL_RULE").as_deref() != Ok("0"))
+    switch!("BREP_MASS_RATIONAL_RULE", true)
 }
 
 // --- the weight polynomial and its roots ------------------------------------
@@ -263,10 +262,10 @@ fn roots(mut coefficients: Vec<f64>) -> Vec<Complex> {
         let (c, b, a) = (coefficients[0], coefficients[1], coefficients[2]);
         let discriminant = b * b - 4.0 * a * c;
         return if discriminant >= 0.0 {
-            let root = discriminant.sqrt();
+            let roots = crate::poly::solve_quadratic(c, b, a);
             vec![
-                Complex { re: (-b + root) / (2.0 * a), im: 0.0 },
-                Complex { re: (-b - root) / (2.0 * a), im: 0.0 },
+                Complex { re: roots[1], im: 0.0 },
+                Complex { re: roots[0], im: 0.0 },
             ]
         } else {
             let imaginary = (-discriminant).sqrt() / (2.0 * a);

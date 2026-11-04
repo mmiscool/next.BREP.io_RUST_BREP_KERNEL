@@ -3706,7 +3706,7 @@ fn dump_flagged(solid: &BrepSolid, entry: &str) {
 // ---------------------------------------------------------------------------
 
 fn trace_on() -> bool {
-    std::env::var("BREP_HEAL_TRACE").is_ok_and(|value| !value.is_empty() && value != "0")
+    debug_flag!(live "BREP_HEAL_TRACE")
 }
 
 /// Measurement hatch for the section fit the repair's imprint asks for:

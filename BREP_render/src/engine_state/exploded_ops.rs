@@ -41,12 +41,25 @@ pub struct ExplodeStep {
     pub enabled: bool,
 }
 
+/// One hide step of an exploded view (a `hide` row of a PMI view): the
+/// components / solids it keeps out of the view.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HideStep {
+    pub id: String,
+    pub targets: Vec<String>,
+    /// What a person reads for each target, as [`ExplodeStep::labels`].
+    pub labels: Vec<String>,
+    pub enabled: bool,
+}
+
 /// A PMI view that holds explode steps.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExplodedView {
     pub id: String,
     pub name: String,
     pub steps: Vec<ExplodeStep>,
+    /// Its hide steps, in row order (not steps of the playback).
+    pub hides: Vec<HideStep>,
 }
 
 /// `geometry` with an explode delta taken `fraction` of the way: the
@@ -179,6 +192,21 @@ fn steps_of(annotations: &[PmiAnnotation], parts: &std::collections::HashMap<Str
         .collect()
 }
 
+fn hides_of(annotations: &[PmiAnnotation], parts: &std::collections::HashMap<String, String>) -> Vec<HideStep> {
+    annotations
+        .iter()
+        .filter(|a| a.kind == "hide")
+        .map(|a| {
+            let targets = a.references("targets");
+            let labels = targets
+                .iter()
+                .map(|t| parts.get(t).map_or_else(|| t.clone(), |part| format!("{part} ({t})")))
+                .collect();
+            HideStep { id: a.params["id"].as_str().unwrap_or_default().to_string(), targets, labels, enabled: a.enabled }
+        })
+        .collect()
+}
+
 impl EngineState {
     /// Every PMI view with at least one explode step, in view order.
     pub fn exploded_views(&self) -> Vec<ExplodedView> {
@@ -195,7 +223,7 @@ impl EngineState {
             .collect();
         // A step on a placement inside a sub-assembly names that placement's part.
         for view in &state.views {
-            for target in view.annotations.iter().filter(|a| a.kind == "explode").flat_map(|a| a.references("targets")) {
+            for target in view.annotations.iter().filter(|a| a.kind == "explode" || a.kind == "hide").flat_map(|a| a.references("targets")) {
                 if target.contains(':') && !parts.contains_key(&target) {
                     if let Some(part) = self.part_at_path(&target) {
                         parts.insert(target, part);
@@ -206,7 +234,12 @@ impl EngineState {
         state
             .views
             .iter()
-            .map(|view| ExplodedView { id: view.id.clone(), name: view.name.clone(), steps: steps_of(&view.annotations, &parts) })
+            .map(|view| ExplodedView {
+                id: view.id.clone(),
+                name: view.name.clone(),
+                steps: steps_of(&view.annotations, &parts),
+                hides: hides_of(&view.annotations, &parts),
+            })
             .filter(|view| !view.steps.is_empty())
             .collect()
     }
@@ -292,6 +325,9 @@ impl EngineState {
                 "steps": view.steps.iter().map(|step| json!({
                     "id": step.id, "targets": step.targets, "labels": step.labels, "translate": step.translate,
                     "trace": step.trace, "enabled": step.enabled,
+                })).collect::<Vec<_>>(),
+                "hides": view.hides.iter().map(|step| json!({
+                    "id": step.id, "targets": step.targets, "labels": step.labels, "enabled": step.enabled,
                 })).collect::<Vec<_>>(),
             })).collect::<Vec<_>>(),
         })

@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 /// A cutting tool as the user defines it. Geometry is a flat parameter set
 /// (`None` where the kind does not use a field); [`crate::cutter::Cutter`]
 /// turns it into a validated profile for the algorithms.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Tool {
@@ -52,6 +53,7 @@ impl Tool {
 }
 
 /// Tool families from the capability matrix.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 #[non_exhaustive]
@@ -144,6 +146,7 @@ impl ToolKind {
 }
 
 /// Tool dimensions in model units. Angles in degrees.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolGeometry {
@@ -221,6 +224,7 @@ impl ToolGeometry {
 }
 
 /// A tool holder as stacked frusta from the tool side (bottom) upward.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Holder {
@@ -234,6 +238,7 @@ pub struct Holder {
 }
 
 /// One frustum of a holder profile.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HolderSegment {
@@ -281,6 +286,7 @@ impl Holder {
 }
 
 /// Coolant request posted with the tool.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Coolant {
@@ -295,6 +301,7 @@ pub enum Coolant {
 }
 
 /// Spindle rotation sense.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum SpindleDirection {
@@ -309,6 +316,7 @@ impl SpindleDirection {
 }
 
 /// Default feeds and speeds for a tool. Feeds in model units per minute.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FeedsSpeeds {

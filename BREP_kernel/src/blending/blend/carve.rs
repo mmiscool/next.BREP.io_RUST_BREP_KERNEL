@@ -342,39 +342,9 @@ fn crease_at(
     Ok(Some(point))
 }
 
-fn solve3(mut matrix: [[f64; 3]; 3], mut rhs: [f64; 3]) -> Option<[f64; 3]> {
-    for column in 0..3 {
-        let mut pivot = column;
-        for row in column + 1..3 {
-            if matrix[row][column].abs() > matrix[pivot][column].abs() {
-                pivot = row;
-            }
-        }
-        if !(matrix[pivot][column].abs() > 0.0) {
-            return None;
-        }
-        matrix.swap(column, pivot);
-        rhs.swap(column, pivot);
-        for row in column + 1..3 {
-            let factor = matrix[row][column] / matrix[column][column];
-            for inner in column..3 {
-                matrix[row][inner] -= factor * matrix[column][inner];
-            }
-            rhs[row] -= factor * rhs[column];
-        }
-    }
-    let mut out = [0.0f64; 3];
-    for row in (0..3).rev() {
-        let mut value = rhs[row];
-        for column in row + 1..3 {
-            value -= matrix[row][column] * out[column];
-        }
-        out[row] = value / matrix[row][row];
-    }
-    if out.iter().any(|value| !value.is_finite()) {
-        return None;
-    }
-    Some(out)
+fn solve3(matrix: [[f64; 3]; 3], rhs: [f64; 3]) -> Option<[f64; 3]> {
+    let out = crate::fit::solve_small(matrix, rhs, 3).ok()?;
+    out.iter().all(|value| value.is_finite()).then_some(out)
 }
 
 /// Find the fold lens on a wall and trace the crease that bounds it.

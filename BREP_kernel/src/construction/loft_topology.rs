@@ -32,13 +32,12 @@ pub(crate) struct ConstructionProfile {
 }
 impl ConstructionProfile {
     pub(crate) fn new(builder: &'static str) -> Self {
-        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let enabled = *ENABLED.get_or_init(|| std::env::var("BREP_PROFILE").is_ok());
+        let enabled = crate::profile::profile_enabled();
         Self { builder, started: enabled.then(web_time::Instant::now) }
     }
     pub(crate) fn lap(&mut self, phase: &str) {
         if let Some(started) = &mut self.started {
-            eprintln!("construction.profile builder={} {}_ms={:.6}",
+            profile_line!("construction.profile builder={} {}_ms={:.6}",
                 self.builder, phase, started.elapsed().as_secs_f64() * 1000.0);
             *started = web_time::Instant::now();
         }

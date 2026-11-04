@@ -172,12 +172,8 @@ impl DisjointSet {
         }
     }
 
-    fn find(&mut self, mut index: usize) -> usize {
-        while self.parent[index] != index {
-            self.parent[index] = self.parent[self.parent[index]];
-            index = self.parent[index];
-        }
-        index
+    fn find(&mut self, index: usize) -> usize {
+        crate::union_find::find_root(&mut self.parent, index)
     }
 
     fn union(&mut self, first: usize, second: usize) {
@@ -478,7 +474,7 @@ const FOLD_TRANSVERSAL_SINE: f64 = 1e-6;
 /// attribution a population sweep needs — "which rule turned this hit away,
 /// and by how much" — cannot be reconstructed from the counts.
 fn fold_trace_enabled() -> bool {
-    std::env::var("BREP_FOLD_TRACE").is_ok_and(|value| !value.is_empty() && value != "0")
+    debug_flag!(live "BREP_FOLD_TRACE")
 }
 
 macro_rules! fold_trace {
@@ -497,10 +493,7 @@ macro_rules! fold_trace {
 /// every pair the corner lane declines, so it is one `OnceLock` read rather
 /// than an environment lookup each time.
 fn pierce_trace_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        std::env::var("BREP_PIERCE_TRACE").is_ok_and(|value| !value.is_empty() && value != "0")
-    })
+    debug_flag!("BREP_PIERCE_TRACE")
 }
 
 macro_rules! pierce_trace {
@@ -518,8 +511,7 @@ macro_rules! pierce_trace {
 /// per stage rather than as one `timing.soundness_ms` ("Rules every slice
 /// follows", measure before changing).
 fn scan_profile_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("BREP_PROFILE").is_ok())
+    crate::profile::profile_enabled()
 }
 
 /// Knobs for [`solid_self_intersections`]. [`SelfIntersectionOptions::for_solid`]
@@ -827,7 +819,7 @@ pub fn solid_self_intersections(
     // report, so the order changes only what a scan costs.
     if analytic_body::enabled() && analytic_body::certifies(solid, options) {
         if let Some(started) = started {
-            eprintln!("soundness.profile ms={:.2} faces={} certificate=analytic_plane_cylinder triangles=0 confirmed=0 folds=0", started.elapsed().as_secs_f64()*1000.0, solid.shells.iter().map(|shell| shell.faces.len()).sum::<usize>());
+            profile_line!("soundness.profile ms={:.2} faces={} certificate=analytic_plane_cylinder triangles=0 confirmed=0 folds=0", started.elapsed().as_secs_f64()*1000.0, solid.shells.iter().map(|shell| shell.faces.len()).sum::<usize>());
         }
         return Ok(SelfIntersectionReport {
             certificate: Some("analytic_plane_cylinder"),
@@ -836,7 +828,7 @@ pub fn solid_self_intersections(
     }
     if tube_grid::enabled() && tube_grid::certifies(solid, options) {
         if let Some(started) = started {
-            eprintln!("soundness.profile ms={:.2} faces={} certificate=tube_grid triangles=0 confirmed=0 folds=0", started.elapsed().as_secs_f64()*1000.0, solid.shells.iter().map(|shell| shell.faces.len()).sum::<usize>());
+            profile_line!("soundness.profile ms={:.2} faces={} certificate=tube_grid triangles=0 confirmed=0 folds=0", started.elapsed().as_secs_f64()*1000.0, solid.shells.iter().map(|shell| shell.faces.len()).sum::<usize>());
         }
         return Ok(SelfIntersectionReport {
             certificate: Some("tube_grid"),
@@ -845,7 +837,7 @@ pub fn solid_self_intersections(
     }
     if blend_patch::enabled() && blend_patch::certifies(solid, options) {
         if let Some(started) = started {
-            eprintln!("soundness.profile ms={:.2} faces={} certificate=analytic_blend triangles=0 confirmed=0 folds=0", started.elapsed().as_secs_f64()*1000.0, solid.shells.iter().map(|shell| shell.faces.len()).sum::<usize>());
+            profile_line!("soundness.profile ms={:.2} faces={} certificate=analytic_blend triangles=0 confirmed=0 folds=0", started.elapsed().as_secs_f64()*1000.0, solid.shells.iter().map(|shell| shell.faces.len()).sum::<usize>());
         }
         return Ok(SelfIntersectionReport {
             certificate: Some("analytic_blend"),
@@ -854,13 +846,13 @@ pub fn solid_self_intersections(
     }
     if sphere_certificate::enabled() && sphere_certificate::certifies(solid, options) {
         if let Some(started) = started {
-            eprintln!("soundness.profile ms={:.2} faces={} certificate=native_trimmed_spheres triangles=0 confirmed=0 folds=0", started.elapsed().as_secs_f64()*1000.0, solid.shells[0].faces.len());
+            profile_line!("soundness.profile ms={:.2} faces={} certificate=native_trimmed_spheres triangles=0 confirmed=0 folds=0", started.elapsed().as_secs_f64()*1000.0, solid.shells[0].faces.len());
         }
         return Ok(empty_intersection_report(options));
     }
     if nurbs_certificate::enabled() && nurbs_certificate::certifies(solid, options) {
         if let Some(started) = started {
-            eprintln!("soundness.profile ms={:.2} faces={} certificate=native_nurbs_horizontal_sections triangles=0 confirmed=0 folds=0", started.elapsed().as_secs_f64()*1000.0, solid.shells[0].faces.len());
+            profile_line!("soundness.profile ms={:.2} faces={} certificate=native_nurbs_horizontal_sections triangles=0 confirmed=0 folds=0", started.elapsed().as_secs_f64()*1000.0, solid.shells[0].faces.len());
         }
         return Ok(empty_intersection_report(options));
     }
@@ -1018,10 +1010,20 @@ fn solid_self_intersections_uncached(
     // the latter runs a coherent-orientation pass and a mesh validation that
     // can fail on exactly the broken solids this detector exists to inspect,
     // and winding is irrelevant to a crossing test.
-    let (mesh, face_keys) = crate::watertight_tessellation::tessellate_brep_watertight_face_stride_keyed(
-        solid, options.chord_tolerance, 1, 0,
-    )?;
+    // `BREP_SOUNDNESS_SCAN_MESH` (default on): analytic faces take the
+    // scan's bounded refinement (every triangle within the chord of its
+    // carrier by a closed-form bound) instead of the display refinement.
+    let (mesh, face_keys) = {
+        let _scan_mesh = crate::watertight_tessellation::ScanMeshScope::open();
+        crate::watertight_tessellation::tessellate_brep_watertight_face_stride_keyed(
+            solid, options.chord_tolerance, 1, 0,
+        )?
+    };
     let tessellate_ms = stage_ms(profile);
+    if profile.is_some() && crate::watertight_tessellation::scan_mesh_enabled() {
+        let (bounded, fallbacks) = crate::watertight_tessellation::take_scan_mesh_counts();
+        profile_line!("soundness.scan_mesh bounded_faces={bounded} fallback_faces={fallbacks} tessellate_ms={tessellate_ms:.2}");
+    }
     let triangle_count = mesh.indices.len() / 3;
     report.triangles = triangle_count;
     if triangle_count == 0 {
@@ -1313,7 +1315,7 @@ fn solid_self_intersections_uncached(
         pair_memo::store(clean);
         if profile.is_some() {
             let (hits, stored, entries) = pair_memo::take_counts();
-            eprintln!("soundness.pair_memo served={hits} stored={stored} entries={entries}");
+            profile_line!("soundness.pair_memo served={hits} stored={stored} entries={entries}");
         }
     }
     let resolve_started = scan_profile_enabled().then(Instant::now);
@@ -1360,7 +1362,7 @@ fn solid_self_intersections_uncached(
 
     if profile.is_some() {
         let after = fold_memo::counts();
-        eprintln!("soundness.fold_memo reused={} read={}", after.0 - fold_counts.0, after.1 - fold_counts.1);
+        profile_line!("soundness.fold_memo reused={} read={}", after.0 - fold_counts.0, after.1 - fold_counts.1);
     }
     report.confirmed = best.into_values().collect();
     report
@@ -1371,7 +1373,7 @@ fn solid_self_intersections_uncached(
         .folds
         .sort_by(|a, b| b.uv_separation.total_cmp(&a.uv_separation).then(a.face.cmp(&b.face)));
     if profile.is_some() {
-        eprintln!(
+        profile_line!(
             "soundness.profile ms={:.2} faces={} tris={triangle_count} chord={:.3e} | \
              tessellate_ms={tessellate_ms:.2} weld_ms={weld_ms:.2} bvh_ms={bvh_ms:.2} \
              sweep_ms={sweep_ms:.2} confirm_ms={confirm_ms:.2} resolve_ms={resolve_ms:.2} fold_ms={:.2} | \
@@ -1394,7 +1396,7 @@ fn solid_self_intersections_uncached(
             if profile.is_some() {
                 let mut rules = std::collections::BTreeMap::new();
                 for proof in &plan.proofs { *rules.entry(proof.rule).or_insert(0usize) += 1; }
-                eprintln!("soundness.certificates {}", serde_json::json!({"rules": rules, "skipped_by_certificate": plan.scope}));
+                profile_line!("soundness.certificates {}", serde_json::json!({"rules": rules, "skipped_by_certificate": plan.scope}));
             }
             report.certified_pairs = plan.proofs;
             report.skipped_by_certificate = Some(plan.scope);
@@ -1906,8 +1908,7 @@ fn straddle(surface: &NurbsSurface, triangle: &[Vec3; 3], band: f64) -> Option<f
 /// tessellation node's side of the other carrier counted whether or not the
 /// node lay inside its own face's trim. Diagnostic A/B hatch, not a policy.
 fn node_membership_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("BREP_SCAN_NODE_MEMBERSHIP").as_deref() != Ok("0"))
+    switch!("BREP_SCAN_NODE_MEMBERSHIP", true)
 }
 
 /// Is `point` a point `face` OWNS: on the face's carrier, inside (or on) its
@@ -2282,8 +2283,7 @@ const TRIM_SAMPLE_TOLERANCE: f64 = 1e-9;
 /// across-sample was taken from the triangle without asking the face whether
 /// it owns that spot.
 fn trim_samples_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("BREP_PIERCE_TRIM_SAMPLES").as_deref() != Ok("0"))
+    switch!("BREP_PIERCE_TRIM_SAMPLES", true)
 }
 
 /// Does `triangle` sit on BOTH sides of `surface`, either side of the crossing

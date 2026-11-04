@@ -50,6 +50,11 @@ fn worst_residual(curve: &NurbsCurve, t0: f64, t1: f64, surfaces: &[&NurbsSurfac
 }
 
 fn worst_residual_uncached(curve: &NurbsCurve, t0: f64, t1: f64, surfaces: &[&NurbsSurface]) -> Result<f64, KernelRefusal> {
+    if segment_residual_enabled() {
+        if let Some(worst) = segment_plane_residual(curve, t0, t1, surfaces)? {
+            return Ok(worst);
+        }
+    }
     let stations = carrier_stations(curve, t0, t1);
     RESIDUAL_WORK.with(|work| {
         let (calls, projections) = work.get();
@@ -65,6 +70,60 @@ fn worst_residual_uncached(curve: &NurbsCurve, t0: f64, t1: f64, surfaces: &[&Nu
     }
     Ok(worst)
 }
+
+/// Lane O row 14 (2026-10-28; on by default since the batch 4 promotion,
+/// `BREP_RECONSTRUCT_SEGMENT_RESIDUAL=0` takes the stations): a straight edge
+/// on affine plane carriers in closed form. The plane's unclamped foot `(u, v)` is affine in the point, so
+/// when both ends' feet lie inside the patch domain every foot of the segment
+/// does, the projector clamps nothing, and the distance to the plane is the
+/// absolute value of an affine function of the parameter: its worst lies at an
+/// end. The ends are read by the same projector the stations use. Anything
+/// else (a curved or rational-varying edge, a non-plane carrier, a foot that
+/// would clamp) returns `None` and takes the stations.
+fn segment_plane_residual(curve: &NurbsCurve, t0: f64, t1: f64, surfaces: &[&NurbsSurface]) -> Result<Option<f64>, KernelRefusal> {
+    if curve.degree != 1 || curve.control_points.len() != 2 || surfaces.is_empty() {
+        return Ok(None);
+    }
+    let [first, second] = [curve.control_points[0], curve.control_points[1]];
+    if !(first.w > 0.0) || (first.w - second.w).abs() > 1e-12 * first.w.abs() {
+        return Ok(None);
+    }
+    let ends = [curve.evaluate(t0).or_refuse(KernelStage::Sew, "evaluate")?, curve.evaluate(t1).or_refuse(KernelStage::Sew, "evaluate")?];
+    for surface in surfaces {
+        let Some(crate::AnalyticSurface::Plane { origin, u_dir, v_dir, u_domain, v_domain }) = surface.analytic() else { return Ok(None) };
+        let (a, b, c) = (u_dir.dot(*u_dir), u_dir.dot(*v_dir), v_dir.dot(*v_dir));
+        let determinant = a * c - b * b;
+        if !(determinant.abs() > 1e-16 * (a * c).max(1.0)) {
+            return Ok(None);
+        }
+        for point in ends {
+            let d = point.sub(*origin);
+            let (fu, fv) = (u_dir.dot(d), v_dir.dot(d));
+            let u = (fu * c - fv * b) / determinant + u_domain[0];
+            let v = (fv * a - fu * b) / determinant + v_domain[0];
+            if !(u >= u_domain[0] && u <= u_domain[1] && v >= v_domain[0] && v <= v_domain[1]) {
+                return Ok(None);
+            }
+        }
+    }
+    RESIDUAL_WORK.with(|work| {
+        let (calls, projections) = work.get();
+        work.set((calls + 1, projections + (ends.len() * surfaces.len()) as u64));
+    });
+    let mut worst = 0.0f64;
+    for point in ends {
+        for surface in surfaces {
+            let projection = crate::project_point_to_surface(surface, point).or_refuse(KernelStage::Sew, "project_point_to_surface")?;
+            worst = worst.max(projection.distance);
+        }
+    }
+    Ok(Some(worst))
+}
+
+fn segment_residual_enabled() -> bool {
+    switch!("BREP_RECONSTRUCT_SEGMENT_RESIDUAL", true)
+}
+
 
 /// Uniform stations alone alias inherited polygon vertices. Include each
 /// represented knot span's quarters in both entry and candidate checks.
@@ -512,7 +571,7 @@ pub(in crate::boolean) fn reconstruct_edges_from_carriers_in(
 
     if crate::imprint::profile_enabled() {
         let work = RESIDUAL_WORK.with(|work| work.get());
-        eprintln!("assemble.reconstruct.work queries={} readings={} projections={}", RESIDUAL_QUERIES.with(|queries| queries.get()) - queries_before, work.0 - work_before.0, work.1 - work_before.1);
+        profile_line!("assemble.reconstruct.work queries={} readings={} projections={}", RESIDUAL_QUERIES.with(|queries| queries.get()) - queries_before, work.0 - work_before.0, work.1 - work_before.1);
     }
     let mut replaced = Vec::new();
     for (edge_index, curve, residual_before, residual_after) in candidates {

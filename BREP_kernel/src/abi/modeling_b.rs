@@ -9,37 +9,33 @@ pub(crate) struct TangentLoftRequest {
 
 #[wasm_bindgen]
 pub fn loft_profile_brep_closed_json(request_json: &str) -> Result<String, JsValue> {
-    let request: LoftBrepRequest =
-        serde_json::from_str(request_json).map_err(|error| javascript_error(error.to_string()))?;
+    let request: LoftBrepRequest = json_in(request_json)?;
     let solid = loft_profile_brep_closed(&request.sections).map_err(javascript_refusal)?;
-    serde_json::to_string(&solid).map_err(|error| javascript_error(error.to_string()))
+    json_out(&solid)
 }
 
 #[wasm_bindgen]
 pub fn loft_profile_brep_closed_buffer(request_json: &str) -> Result<WasmSolidBuffer, JsValue> {
-    let request: LoftBrepRequest =
-        serde_json::from_str(request_json).map_err(|error| javascript_error(error.to_string()))?;
+    let request: LoftBrepRequest = json_in(request_json)?;
     let solid = loft_profile_brep_closed(&request.sections).map_err(javascript_refusal)?;
     solid_buffer(&solid, "{}".into())
 }
 
 #[wasm_bindgen]
 pub fn loft_profile_brep_tangent_json(request_json: &str) -> Result<String, JsValue> {
-    let request: TangentLoftRequest =
-        serde_json::from_str(request_json).map_err(|error| javascript_error(error.to_string()))?;
+    let request: TangentLoftRequest = json_in(request_json)?;
     let solid = loft_profile_brep_tangent(
         &request.sections,
         request.start_direction,
         request.end_direction,
     )
     .map_err(javascript_refusal)?;
-    serde_json::to_string(&solid).map_err(|error| javascript_error(error.to_string()))
+    json_out(&solid)
 }
 
 #[wasm_bindgen]
 pub fn loft_profile_brep_tangent_buffer(request_json: &str) -> Result<WasmSolidBuffer, JsValue> {
-    let request: TangentLoftRequest =
-        serde_json::from_str(request_json).map_err(|error| javascript_error(error.to_string()))?;
+    let request: TangentLoftRequest = json_in(request_json)?;
     let solid = loft_profile_brep_tangent(
         &request.sections,
         request.start_direction,
@@ -51,25 +47,22 @@ pub fn loft_profile_brep_tangent_buffer(request_json: &str) -> Result<WasmSolidB
 
 #[wasm_bindgen]
 pub fn loft_profile_brep_guided_buffer(request_json: &str) -> Result<WasmSolidBuffer, JsValue> {
-    let request: GuidedLoftRequest =
-        serde_json::from_str(request_json).map_err(|error| javascript_error(error.to_string()))?;
+    let request: GuidedLoftRequest = json_in(request_json)?;
     let solid = guided_loft_dispatch(&request).map_err(javascript_refusal)?;
     solid_buffer(&solid, "{}".into())
 }
 
 #[wasm_bindgen]
 pub fn sweep_profile_along_path_json(request_json: &str) -> Result<String, JsValue> {
-    let request: SweepRequest =
-        serde_json::from_str(request_json).map_err(|error| javascript_error(error.to_string()))?;
+    let request: SweepRequest = json_in(request_json)?;
     let solid = sweep_profile_along_path(&request.profile, &request.path, request.name.as_deref())
         .map_err(javascript_refusal)?;
-    serde_json::to_string(&solid).map_err(|error| javascript_error(error.to_string()))
+    json_out(&solid)
 }
 
 #[wasm_bindgen]
 pub fn sweep_profile_along_path_buffer(request_json: &str) -> Result<WasmSolidBuffer, JsValue> {
-    let request: SweepRequest =
-        serde_json::from_str(request_json).map_err(|error| javascript_error(error.to_string()))?;
+    let request: SweepRequest = json_in(request_json)?;
     let solid = sweep_profile_along_path(&request.profile, &request.path, request.name.as_deref())
         .map_err(javascript_refusal)?;
     solid_buffer(&solid, "{}".into())
@@ -87,8 +80,7 @@ pub(crate) struct TwistedSweepRequest {
 
 #[wasm_bindgen]
 pub fn sweep_profile_twisted_json(request_json: &str) -> Result<String, JsValue> {
-    let request: TwistedSweepRequest =
-        serde_json::from_str(request_json).map_err(|error| javascript_error(error.to_string()))?;
+    let request: TwistedSweepRequest = json_in(request_json)?;
     let solid = sweep_profile_twisted(
         &request.profile,
         &request.path,
@@ -96,13 +88,12 @@ pub fn sweep_profile_twisted_json(request_json: &str) -> Result<String, JsValue>
         request.name.as_deref(),
     )
     .map_err(javascript_refusal)?;
-    serde_json::to_string(&solid).map_err(|error| javascript_error(error.to_string()))
+    json_out(&solid)
 }
 
 #[wasm_bindgen]
 pub fn sweep_profile_twisted_buffer(request_json: &str) -> Result<WasmSolidBuffer, JsValue> {
-    let request: TwistedSweepRequest =
-        serde_json::from_str(request_json).map_err(|error| javascript_error(error.to_string()))?;
+    let request: TwistedSweepRequest = json_in(request_json)?;
     let solid = sweep_profile_twisted(
         &request.profile,
         &request.path,
@@ -115,8 +106,7 @@ pub fn sweep_profile_twisted_buffer(request_json: &str) -> Result<WasmSolidBuffe
 
 #[wasm_bindgen]
 pub fn sweep_profile_helix_json(request_json: &str) -> Result<String, JsValue> {
-    let request: HelixSweepRequest =
-        serde_json::from_str(request_json).map_err(|error| javascript_error(error.to_string()))?;
+    let request: HelixSweepRequest = json_in(request_json)?;
     let solid = sweep_profile_helix(
         &request.profile,
         request.axis_origin,
@@ -127,13 +117,12 @@ pub fn sweep_profile_helix_json(request_json: &str) -> Result<String, JsValue> {
         request.name.as_deref(),
     )
     .map_err(javascript_refusal)?;
-    serde_json::to_string(&solid).map_err(|error| javascript_error(error.to_string()))
+    json_out(&solid)
 }
 
 #[wasm_bindgen]
 pub fn sweep_profile_helix_buffer(request_json: &str) -> Result<WasmSolidBuffer, JsValue> {
-    let request: HelixSweepRequest =
-        serde_json::from_str(request_json).map_err(|error| javascript_error(error.to_string()))?;
+    let request: HelixSweepRequest = json_in(request_json)?;
     let solid = sweep_profile_helix(
         &request.profile,
         request.axis_origin,
@@ -149,27 +138,24 @@ pub fn sweep_profile_helix_buffer(request_json: &str) -> Result<WasmSolidBuffer,
 
 #[wasm_bindgen]
 pub fn transform_brep_json(request_json: &str) -> Result<String, JsValue> {
-    let request: TransformBrepRequest =
-        serde_json::from_str(request_json).map_err(|error| javascript_error(error.to_string()))?;
+    let request: TransformBrepRequest = json_in(request_json)?;
     let transform = AffineTransform::new(request.matrix).map_err(javascript_error)?;
     let solid = transform_brep(&request.solid, transform, request.reverse_orientation)
         .map_err(javascript_error)?;
-    serde_json::to_string(&solid).map_err(|error| javascript_error(error.to_string()))
+    json_out(&solid)
 }
 
 #[wasm_bindgen]
 pub fn mirror_brep_json(request_json: &str) -> Result<String, JsValue> {
-    let request: MirrorBrepRequest =
-        serde_json::from_str(request_json).map_err(|error| javascript_error(error.to_string()))?;
+    let request: MirrorBrepRequest = json_in(request_json)?;
     let solid = mirror_brep(&request.solid, request.plane_point, request.plane_normal)
         .map_err(javascript_error)?;
-    serde_json::to_string(&solid).map_err(|error| javascript_error(error.to_string()))
+    json_out(&solid)
 }
 
 #[wasm_bindgen]
 pub fn mirror_brep_buffer(request_json: &str) -> Result<WasmSolidBuffer, JsValue> {
-    let request: MirrorBrepRequest =
-        serde_json::from_str(request_json).map_err(|error| javascript_error(error.to_string()))?;
+    let request: MirrorBrepRequest = json_in(request_json)?;
     let solid = mirror_brep(&request.solid, request.plane_point, request.plane_normal)
         .map_err(javascript_error)?;
     solid_buffer(&solid, "{}".into())
@@ -180,13 +166,12 @@ pub fn mirror_brep_buffer(request_json: &str) -> Result<WasmSolidBuffer, JsValue
 /// "plane does not intersect the solid" when the plane misses the body.
 #[wasm_bindgen]
 pub fn split_solid_by_plane_json(request_json: &str) -> Result<String, JsValue> {
-    let request: SplitByPlaneRequest =
-        serde_json::from_str(request_json).map_err(|error| javascript_error(error.to_string()))?;
+    let request: SplitByPlaneRequest = json_in(request_json)?;
     let (below, above) =
         split_solid_by_plane(&request.solid, request.plane_point, request.plane_normal)
             .map_err(javascript_error)?;
     let result = serde_json::json!({ "below": below, "above": above });
-    serde_json::to_string(&result).map_err(|error| javascript_error(error.to_string()))
+    json_out(&result)
 }
 
 /// Cut a solid by an analytic tool surface (Golovanov §6.4). The request is
@@ -196,11 +181,10 @@ pub fn split_solid_by_plane_json(request_json: &str) -> Result<String, JsValue> 
 /// solid" when the tool does not cleanly cut the body.
 #[wasm_bindgen]
 pub fn split_solid_by_surface_json(request_json: &str) -> Result<String, JsValue> {
-    let request: SplitBySurfaceRequest =
-        serde_json::from_str(request_json).map_err(|error| javascript_error(error.to_string()))?;
+    let request: SplitBySurfaceRequest = json_in(request_json)?;
     let pieces = split_solid_by_surface(&request.solid, &request.tool).map_err(javascript_error)?;
     let result = serde_json::json!({ "pieces": pieces });
-    serde_json::to_string(&result).map_err(|error| javascript_error(error.to_string()))
+    json_out(&result)
 }
 
 /// Cut a solid by the analytic carrier of a selected face's `surface` (Golovanov
@@ -210,47 +194,42 @@ pub fn split_solid_by_surface_json(request_json: &str) -> Result<String, JsValue
 /// faces or when the carrier does not cleanly divide the body.
 #[wasm_bindgen]
 pub fn split_solid_by_face_surface_json(request_json: &str) -> Result<String, JsValue> {
-    let request: SplitByFaceSurfaceRequest =
-        serde_json::from_str(request_json).map_err(|error| javascript_error(error.to_string()))?;
+    let request: SplitByFaceSurfaceRequest = json_in(request_json)?;
     let pieces =
         split_solid_by_face_surface(&request.solid, &request.surface).map_err(javascript_error)?;
     let result = serde_json::json!({ "pieces": pieces });
-    serde_json::to_string(&result).map_err(|error| javascript_error(error.to_string()))
+    json_out(&result)
 }
 
 #[wasm_bindgen]
 pub fn solid_mass_properties_json(solid_json: &str) -> Result<String, JsValue> {
-    let solid: BrepSolid =
-        serde_json::from_str(solid_json).map_err(|error| javascript_error(error.to_string()))?;
+    let solid: BrepSolid = json_in(solid_json)?;
     let properties = solid_mass_properties(&solid).map_err(javascript_error)?;
-    serde_json::to_string(&properties).map_err(|error| javascript_error(error.to_string()))
+    json_out(&properties)
 }
 
 #[wasm_bindgen]
 pub fn solid_mass_properties_full_json(solid_json: &str) -> Result<String, JsValue> {
-    let solid: BrepSolid =
-        serde_json::from_str(solid_json).map_err(|error| javascript_error(error.to_string()))?;
+    let solid: BrepSolid = json_in(solid_json)?;
     let properties = solid_mass_properties_full(&solid).map_err(javascript_error)?;
-    serde_json::to_string(&properties).map_err(|error| javascript_error(error.to_string()))
+    json_out(&properties)
 }
 
 #[wasm_bindgen]
 pub fn face_metrics_json(face_json: &str) -> Result<String, JsValue> {
-    let face: FaceRecord =
-        serde_json::from_str(face_json).map_err(|error| javascript_error(error.to_string()))?;
+    let face: FaceRecord = json_in(face_json)?;
     let metrics = FaceMetrics {
         parameter_space_area: parameter_space_area(&face).map_err(javascript_error)?,
         area: face_area(&face).map_err(javascript_error)?,
         volume_contribution: face_volume_contribution(&face).map_err(javascript_error)?,
         trim_polygons: trim_polygons(&face).map_err(javascript_error)?,
     };
-    serde_json::to_string(&metrics).map_err(|error| javascript_error(error.to_string()))
+    json_out(&metrics)
 }
 
 #[wasm_bindgen]
 pub fn tessellate_face_json(request_json: &str) -> Result<String, JsValue> {
-    let request: TessellateFaceRequest =
-        serde_json::from_str(request_json).map_err(|error| javascript_error(error.to_string()))?;
+    let request: TessellateFaceRequest = json_in(request_json)?;
     let mesh = tessellate_face(
         &request.face,
         TessellationOptions {
@@ -260,13 +239,12 @@ pub fn tessellate_face_json(request_json: &str) -> Result<String, JsValue> {
         request.face.id as u32,
     )
     .map_err(javascript_error)?;
-    serde_json::to_string(&mesh).map_err(|error| javascript_error(error.to_string()))
+    json_out(&mesh)
 }
 
 #[wasm_bindgen]
 pub fn tessellate_brep_json(request_json: &str) -> Result<String, JsValue> {
-    let request: TessellateBrepRequest =
-        serde_json::from_str(request_json).map_err(|error| javascript_error(error.to_string()))?;
+    let request: TessellateBrepRequest = json_in(request_json)?;
     let mesh = tessellate_brep(
         &request.solid,
         TessellationOptions {
@@ -275,71 +253,64 @@ pub fn tessellate_brep_json(request_json: &str) -> Result<String, JsValue> {
         },
     )
     .map_err(javascript_error)?;
-    serde_json::to_string(&mesh).map_err(|error| javascript_error(error.to_string()))
+    json_out(&mesh)
 }
 
 #[wasm_bindgen]
 pub fn classify_points_json(request_json: &str) -> Result<String, JsValue> {
-    let request: ClassifyPointsRequest =
-        serde_json::from_str(request_json).map_err(|error| javascript_error(error.to_string()))?;
+    let request: ClassifyPointsRequest = json_in(request_json)?;
     let classifications = request
         .points
         .into_iter()
         .map(|point| classify_point(point, &request.solid, request.tolerance))
         .collect::<Result<Vec<_>, _>>()
         .map_err(javascript_error)?;
-    serde_json::to_string(&classifications).map_err(|error| javascript_error(error.to_string()))
+    json_out(&classifications)
 }
 
 #[wasm_bindgen]
 pub fn arrange_segments_json(request_json: &str) -> Result<String, JsValue> {
-    let request: ArrangeSegmentsRequest =
-        serde_json::from_str(request_json).map_err(|error| javascript_error(error.to_string()))?;
+    let request: ArrangeSegmentsRequest = json_in(request_json)?;
     let regions =
         arrange_segments(&request.segments, request.tolerance).map_err(javascript_error)?;
-    serde_json::to_string(&regions).map_err(|error| javascript_error(error.to_string()))
+    json_out(&regions)
 }
 
 #[wasm_bindgen]
 pub fn build_pcurve_json(request_json: &str) -> Result<String, JsValue> {
-    let request: BuildPcurveRequest =
-        serde_json::from_str(request_json).map_err(|error| javascript_error(error.to_string()))?;
+    let request: BuildPcurveRequest = json_in(request_json)?;
     let pcurve =
         build_pcurve_on_surface(&request.surface, &request.curve).map_err(javascript_error)?;
-    serde_json::to_string(&pcurve).map_err(|error| javascript_error(error.to_string()))
+    json_out(&pcurve)
 }
 
 #[wasm_bindgen]
 pub fn build_imprints_json(request_json: &str) -> Result<String, JsValue> {
-    let request: BuildImprintsRequest =
-        serde_json::from_str(request_json).map_err(|error| javascript_error(error.to_string()))?;
+    let request: BuildImprintsRequest = json_in(request_json)?;
     let result = build_imprints(&request.solid_a, &request.solid_b, &request.options)
         .map_err(javascript_refusal)?;
-    serde_json::to_string(&result).map_err(|error| javascript_error(error.to_string()))
+    json_out(&result)
 }
 
 #[wasm_bindgen]
 pub fn apply_edge_splits_json(request_json: &str) -> Result<String, JsValue> {
-    let request: ApplyEdgeSplitsRequest =
-        serde_json::from_str(request_json).map_err(|error| javascript_error(error.to_string()))?;
+    let request: ApplyEdgeSplitsRequest = json_in(request_json)?;
     let result = apply_edge_splits(&request.solid, request.operand, &request.imprint)
         .map_err(javascript_refusal)?;
-    serde_json::to_string(&result).map_err(|error| javascript_error(error.to_string()))
+    json_out(&result)
 }
 
 #[wasm_bindgen]
 pub fn fragment_faces_json(request_json: &str) -> Result<String, JsValue> {
-    let request: FragmentFacesRequest =
-        serde_json::from_str(request_json).map_err(|error| javascript_error(error.to_string()))?;
+    let request: FragmentFacesRequest = json_in(request_json)?;
     let result = fragment_solid(&request.solid, request.operand, &request.imprint)
         .map_err(javascript_refusal)?;
-    serde_json::to_string(&result).map_err(|error| javascript_error(error.to_string()))
+    json_out(&result)
 }
 
 #[wasm_bindgen]
 pub fn boolean_brep_json(request_json: &str) -> Result<String, JsValue> {
-    let request: BooleanRequest =
-        serde_json::from_str(request_json).map_err(|error| javascript_error(error.to_string()))?;
+    let request: BooleanRequest = json_in(request_json)?;
     let result = boolean_operation(
         &request.first,
         &request.second,
@@ -347,13 +318,12 @@ pub fn boolean_brep_json(request_json: &str) -> Result<String, JsValue> {
         &request.options,
     )
     .map_err(javascript_refusal)?;
-    serde_json::to_string(&result).map_err(|error| javascript_error(error.to_string()))
+    json_out(&result)
 }
 
 #[wasm_bindgen]
 pub fn boolean_brep_diagnostics_json(request_json: &str) -> Result<String, JsValue> {
-    let request: BooleanRequest =
-        serde_json::from_str(request_json).map_err(|error| javascript_error(error.to_string()))?;
+    let request: BooleanRequest = json_in(request_json)?;
     let result = boolean_operation_with_diagnostics(
         &request.first,
         &request.second,
@@ -361,16 +331,15 @@ pub fn boolean_brep_diagnostics_json(request_json: &str) -> Result<String, JsVal
         &request.options,
     )
     .map_err(javascript_refusal)?;
-    serde_json::to_string(&result).map_err(|error| javascript_error(error.to_string()))
+    json_out(&result)
 }
 
 #[wasm_bindgen]
 pub fn offset_surface_json(request_json: &str) -> Result<String, JsValue> {
-    let request: OffsetSurfaceRequest =
-        serde_json::from_str(request_json).map_err(|error| javascript_error(error.to_string()))?;
+    let request: OffsetSurfaceRequest = json_in(request_json)?;
     let surface = offset_surface(&request.face, request.distance, request.planar_extension)
         .map_err(javascript_refusal)?;
-    serde_json::to_string(&surface).map_err(|error| javascript_error(error.to_string()))
+    json_out(&surface)
 }
 
 #[derive(Deserialize)]
@@ -383,11 +352,10 @@ pub(crate) struct SolveAssemblyRequest {
 
 #[wasm_bindgen]
 pub fn solve_assembly_json(request_json: &str) -> Result<String, JsValue> {
-    let request: SolveAssemblyRequest =
-        serde_json::from_str(request_json).map_err(|error| javascript_error(error.to_string()))?;
+    let request: SolveAssemblyRequest = json_in(request_json)?;
     let solution = solve_assembly(&request.bodies, &request.mates, &request.options)
         .map_err(javascript_error)?;
-    serde_json::to_string(&solution).map_err(|error| javascript_error(error.to_string()))
+    json_out(&solution)
 }
 
 #[derive(Deserialize)]
@@ -403,26 +371,23 @@ pub(crate) struct SegmentMeshRequest {
 
 #[wasm_bindgen]
 pub fn segment_mesh_faces_json(request_json: &str) -> Result<String, JsValue> {
-    let request: SegmentMeshRequest =
-        serde_json::from_str(request_json).map_err(|error| javascript_error(error.to_string()))?;
+    let request: SegmentMeshRequest = json_in(request_json)?;
     let segmentation = segment_mesh_faces(&request.positions, &request.indices, &request.options)
         .map_err(javascript_error)?;
-    serde_json::to_string(&segmentation).map_err(|error| javascript_error(error.to_string()))
+    json_out(&segmentation)
 }
 
 #[wasm_bindgen]
 pub fn mesh_regions_to_brep_json(request_json: &str) -> Result<String, JsValue> {
-    let request: SegmentMeshRequest =
-        serde_json::from_str(request_json).map_err(|error| javascript_error(error.to_string()))?;
+    let request: SegmentMeshRequest = json_in(request_json)?;
     let solid = mesh_regions_to_brep(&request.positions, &request.indices, &request.options)
         .map_err(javascript_error)?;
-    serde_json::to_string(&solid).map_err(|error| javascript_error(error.to_string()))
+    json_out(&solid)
 }
 
 #[wasm_bindgen]
 pub fn mesh_regions_to_brep_buffer(request_json: &str) -> Result<WasmSolidBuffer, JsValue> {
-    let request: SegmentMeshRequest =
-        serde_json::from_str(request_json).map_err(|error| javascript_error(error.to_string()))?;
+    let request: SegmentMeshRequest = json_in(request_json)?;
     let solid = mesh_regions_to_brep(&request.positions, &request.indices, &request.options)
         .map_err(javascript_error)?;
     solid_buffer(&solid, "{}".into())
@@ -441,17 +406,15 @@ pub(crate) struct ThickenSheetRequest {
 
 #[wasm_bindgen]
 pub fn thicken_face_sheet_json(request_json: &str) -> Result<String, JsValue> {
-    let request: ThickenSheetRequest =
-        serde_json::from_str(request_json).map_err(|error| javascript_error(error.to_string()))?;
+    let request: ThickenSheetRequest = json_in(request_json)?;
     let bodies = thicken_face_sheet(&request.surface, request.thickness, request.symmetric)
         .map_err(javascript_refusal)?;
-    serde_json::to_string(&bodies).map_err(|error| javascript_error(error.to_string()))
+    json_out(&bodies)
 }
 
 #[wasm_bindgen]
 pub fn thicken_face_sheet_buffer(request_json: &str) -> Result<WasmSolidBuffer, JsValue> {
-    let request: ThickenSheetRequest =
-        serde_json::from_str(request_json).map_err(|error| javascript_error(error.to_string()))?;
+    let request: ThickenSheetRequest = json_in(request_json)?;
     let bodies = thicken_face_sheet(&request.surface, request.thickness, request.symmetric)
         .map_err(javascript_refusal)?;
     solid_buffer(single_body(&bodies, "thicken_face_sheet")?, "{}".into())
@@ -470,8 +433,7 @@ pub(crate) struct ThickenTrimmedSheetRequest {
 
 #[wasm_bindgen]
 pub fn thicken_trimmed_sheet_json(request_json: &str) -> Result<String, JsValue> {
-    let request: ThickenTrimmedSheetRequest =
-        serde_json::from_str(request_json).map_err(|error| javascript_error(error.to_string()))?;
+    let request: ThickenTrimmedSheetRequest = json_in(request_json)?;
     let bodies = thicken_trimmed_sheet(
         &request.surface,
         &request.loops,
@@ -479,13 +441,12 @@ pub fn thicken_trimmed_sheet_json(request_json: &str) -> Result<String, JsValue>
         request.symmetric,
     )
     .map_err(javascript_refusal)?;
-    serde_json::to_string(&bodies).map_err(|error| javascript_error(error.to_string()))
+    json_out(&bodies)
 }
 
 #[wasm_bindgen]
 pub fn thicken_trimmed_sheet_buffer(request_json: &str) -> Result<WasmSolidBuffer, JsValue> {
-    let request: ThickenTrimmedSheetRequest =
-        serde_json::from_str(request_json).map_err(|error| javascript_error(error.to_string()))?;
+    let request: ThickenTrimmedSheetRequest = json_in(request_json)?;
     let bodies = thicken_trimmed_sheet(
         &request.surface,
         &request.loops,
@@ -516,8 +477,7 @@ fn single_body<'a>(bodies: &'a [BrepSolid], operation: &str) -> Result<&'a BrepS
 
 #[wasm_bindgen]
 pub fn offset_face_carrier_json(request_json: &str) -> Result<String, JsValue> {
-    let request: OffsetFaceCarrierRequest =
-        serde_json::from_str(request_json).map_err(|error| javascript_error(error.to_string()))?;
+    let request: OffsetFaceCarrierRequest = json_in(request_json)?;
     let carrier = offset_face_carrier(
         &request.solid,
         request.face_id,
@@ -525,22 +485,20 @@ pub fn offset_face_carrier_json(request_json: &str) -> Result<String, JsValue> {
         request.planar_extension,
     )
     .map_err(javascript_refusal)?;
-    serde_json::to_string(&carrier).map_err(|error| javascript_error(error.to_string()))
+    json_out(&carrier)
 }
 
 #[wasm_bindgen]
 pub fn offset_shell_json(request_json: &str) -> Result<String, JsValue> {
-    let request: OffsetShellRequest =
-        serde_json::from_str(request_json).map_err(|error| javascript_error(error.to_string()))?;
+    let request: OffsetShellRequest = json_in(request_json)?;
     let result = offset_shell(&request.solid, &request.opening_face_ids, request.distance)
         .map_err(javascript_refusal)?;
-    serde_json::to_string(&result).map_err(|error| javascript_error(error.to_string()))
+    json_out(&result)
 }
 
 #[wasm_bindgen]
 pub fn offset_shell_diagnostics_json(request_json: &str) -> Result<String, JsValue> {
-    let request: OffsetShellDiagnosticsRequest =
-        serde_json::from_str(request_json).map_err(|error| javascript_error(error.to_string()))?;
+    let request: OffsetShellDiagnosticsRequest = json_in(request_json)?;
     let result = offset_shell_with_diagnostics(
         &request.solid,
         &request.opening_face_ids,
@@ -548,13 +506,12 @@ pub fn offset_shell_diagnostics_json(request_json: &str) -> Result<String, JsVal
         request.tolerances,
     )
     .map_err(javascript_refusal)?;
-    serde_json::to_string(&result).map_err(|error| javascript_error(error.to_string()))
+    json_out(&result)
 }
 
 #[wasm_bindgen]
 pub fn export_step_json(request_json: &str) -> Result<String, JsValue> {
-    let request: ExportStepRequest =
-        serde_json::from_str(request_json).map_err(|error| javascript_error(error.to_string()))?;
+    let request: ExportStepRequest = json_in(request_json)?;
     export_step(
         &request.solids,
         &request.name,
@@ -566,11 +523,10 @@ pub fn export_step_json(request_json: &str) -> Result<String, JsValue> {
 
 #[wasm_bindgen]
 pub fn merge_curve_continuations_json(request_json: &str) -> Result<String, JsValue> {
-    let request: CoalesceRequest =
-        serde_json::from_str(request_json).map_err(|error| javascript_error(error.to_string()))?;
+    let request: CoalesceRequest = json_in(request_json)?;
     let solid = merge_curve_continuation_edges(&request.solid, request.tolerance)
         .map_err(|refusal| javascript_error(refusal.message))?;
-    serde_json::to_string(&solid).map_err(|error| javascript_error(error.to_string()))
+    json_out(&solid)
 }
 
 #[wasm_bindgen]

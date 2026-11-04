@@ -4,13 +4,20 @@
 //!
 //! Parameters:
 //! - `sheet` names the target sheet body.
-//! - `profile` names a sketch or its `{sketch}:FACE` alias. Each region cuts
-//!   independently; inner loops preserve material islands. Solid/face cutters
-//!   are unsupported.
+//! - `profile` names a sketch or its `{sketch}:FACE` alias, or a solid body.
+//!   Each sketch region cuts independently; inner loops preserve material
+//!   islands. Face cutters are unsupported.
 //! - `forwardDistance` / `backDistance` measure depth from the sketch plane
-//!   along ±normal. Zero or absent means through-all on that side.
+//!   along ±normal. Zero or absent means through-all on that side. A solid
+//!   tool ignores them.
 //! - `keepTool` publishes separate cutter solids as `{id}:CUTTER` or
-//!   `{id}:CUTTER:{n}`. The profile sketch is consumed on success.
+//!   `{id}:CUTTER:{n}`. The profile sketch is consumed on success. A solid
+//!   tool is consumed unless `keepTool` keeps it.
+//!
+//! A solid tool cuts every flat it passes through with a perpendicular-walled
+//! through hole over the union of its sections at the flat's two faces, so an
+//! angled tool can be pushed straight through the opening (see
+//! [`solid_tool_cut`]).
 //!
 //! Folded flat placements map profile loops and depth intervals into each
 //! parallel flat's local frame. Rational control points and weights are
@@ -67,23 +74,30 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, String> {
         common::first_reference_name(ctx.param("profile"))
             .ok_or("sheet-metal cutout: missing `profile` reference selection")?,
     );
+    let keep_tool = ctx
+        .param("keepTool")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
     let profile = match ctx.scene.resolve_profile(&profile_name) {
         Some(profile) => profile,
         None => {
+            if let Some(tool_handle) = ctx.scene.resolve_solid(&profile_name) {
+                if profile_name == body_name {
+                    return Err(format!(
+                        "sheet-metal cutout: the tool solid '{profile_name}' is the sheet itself"
+                    ));
+                }
+                return solid_tool_cut(ctx, tree, &body_name, &profile_name, tool_handle, keep_tool);
+            }
             if ctx.scene.resolve_face(&profile_name).is_some() {
                 return Err(format!(
                     "sheet-metal cutout: profile '{profile_name}' is a resident solid face — \
-                     face/solid cutters are not supported; select a sketch profile"
-                ));
-            }
-            if ctx.scene.resolve_solid(&profile_name).is_some() {
-                return Err(format!(
-                    "sheet-metal cutout: profile '{profile_name}' is a solid body — \
-                     solid-tool cutouts are not supported; select a sketch profile"
+                     face cutters are not supported; select a sketch profile or a solid body"
                 ));
             }
             return Err(format!(
-                "sheet-metal cutout: profile '{profile_name}' not found (no sketch profile)"
+                "sheet-metal cutout: profile '{profile_name}' not found (no sketch profile or \
+                 solid body)"
             ));
         }
     };
@@ -93,7 +107,7 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, String> {
         ));
     }
 
-    // --- Depths + tool retention ---
+    // --- Depths ---
     // 0 / absent = through-all on that side (see module docs for the divergence).
     let forward = common::optional_number(ctx, "forwardDistance")?
         .unwrap_or(0.0)
@@ -101,10 +115,6 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, String> {
     let back = common::optional_number(ctx, "backDistance")?
         .unwrap_or(0.0)
         .max(0.0);
-    let keep_tool = ctx
-        .param("keepTool")
-        .and_then(|value| value.as_bool())
-        .unwrap_or(false);
 
     // --- Map every profile region onto the folded flats ---
     let placements = sheet_metal::evaluate::folded_flat_placements(&tree)?;
@@ -221,12 +231,7 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, String> {
     }
 
     // --- Bake the holes into the tree and re-evaluate ---
-    for (flat_id, hole) in cuts {
-        tree.root.find_by_id_mut(&flat_id)
-            .ok_or_else(|| format!("sheet-metal cutout: flat `{flat_id}` vanished from the tree"))?
-            .holes
-            .push(hole);
-    }
+    bake_holes(&mut tree, cuts)?;
     let added = sheet_metal::register_folded(tree.clone(), &body_name)?;
     let mut result = FeatureResult::empty(ctx.id.clone(), ctx.feature_type.clone());
     result.added.push(added);
@@ -242,6 +247,17 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, String> {
         }
     }
     Ok(result)
+}
+
+/// Push each `(flat id, hole)` onto its flat in the tree.
+fn bake_holes(tree: &mut sheet_metal::SheetTree, cuts: Vec<(String, Hole)>) -> Result<(), String> {
+    for (flat_id, hole) in cuts {
+        tree.root.find_by_id_mut(&flat_id)
+            .ok_or_else(|| format!("sheet-metal cutout: flat `{flat_id}` vanished from the tree"))?
+            .holes
+            .push(hole);
+    }
+    Ok(())
 }
 
 // ===========================================================================
@@ -617,84 +633,98 @@ fn extrude_footprint(
 /// `(u, v)` loops: the outer boundary (largest |area|) + island loops. The top
 /// cap is the single planar face all of whose loop edges sit at `z = z_top`
 /// (coplanar-merge fuses the two overlapping caps into one, so the boundary has
-/// no interior/overlap edges); each loop's edge curves are dropped to `z = 0`
-/// and chained head-to-tail.
+/// no interior/overlap edges).
 fn cross_section_loops(
     solid: &crate::BrepSolid,
     z_top: f64,
 ) -> Result<(Vec<NurbsCurve>, Vec<Vec<NurbsCurve>>), String> {
-    let tol = 1e-6 * z_top.abs().max(1.0);
+    let mut regions = cap_regions(solid, z_top)?;
+    if regions.len() != 1 {
+        // 0 or >1 means the boolean did not merge the cap — a loud failure,
+        // never a partial hole.
+        return Err(format!(
+            "sheet-metal cutout: oblique footprint union produced {} top-cap faces (expected \
+             1) — the boolean did not merge the union cross-section",
+            regions.len()
+        ));
+    }
+    Ok(regions.pop().expect("one cap region"))
+}
+
+/// Every face of `solid` whose loop edges ALL sit in the plane `z = z_cap`,
+/// read back as closed `(u, v)` loops: per face, the outer boundary (largest
+/// |area|) + its island loops. Each loop's edge curves are dropped to `z = 0`
+/// and chained head-to-tail. After a coplanar-merging boolean each connected
+/// cap region is one face.
+fn cap_regions(
+    solid: &crate::BrepSolid,
+    z_cap: f64,
+) -> Result<Vec<(Vec<NurbsCurve>, Vec<Vec<NurbsCurve>>)>, String> {
+    let tol = 1e-6 * z_cap.abs().max(1.0);
     let edge_by_id: std::collections::HashMap<u64, &crate::topology::EdgeRecord> =
         solid.edges.iter().map(|edge| (edge.id, edge)).collect();
 
-    // Every face whose loop edges ALL sit in the top plane. After coplanar merge
-    // there is exactly one (its loops = outer + islands); 0 or >1 means the
-    // boolean did not merge the cap — a loud failure, never a partial hole.
     let mut cap_faces = Vec::new();
     for shell in &solid.shells {
         for face in &shell.faces {
             if face.loops.is_empty() {
                 continue;
             }
-            let mut all_top = true;
+            let mut all_in_plane = true;
             'face: for loop_record in &face.loops {
                 for coedge in &loop_record.coedges {
                     let Some(edge) = edge_by_id.get(&coedge.edge_id) else {
-                        all_top = false;
+                        all_in_plane = false;
                         break 'face;
                     };
                     for cp in &edge.curve.control_points {
-                        if (cp.point()?.z - z_top).abs() > tol {
-                            all_top = false;
+                        if (cp.point()?.z - z_cap).abs() > tol {
+                            all_in_plane = false;
                             break 'face;
                         }
                     }
                 }
             }
-            if all_top {
+            if all_in_plane {
                 cap_faces.push(face);
             }
         }
     }
-    if cap_faces.len() != 1 {
-        return Err(format!(
-            "sheet-metal cutout: oblique footprint union produced {} top-cap faces (expected \
-             1) — the boolean did not merge the union cross-section",
-            cap_faces.len()
-        ));
-    }
 
-    // Chain each loop into a closed head-to-tail curve chain in (u, v, 0). The
-    // boolean trims a shared curve by NARROWING the edge's `[t0, t1]` range (not
-    // by rebuilding control points), so read the TRIMMED subcurve — the full
-    // curve would give the untrimmed tips and leave a gap at every trim vertex.
-    let mut loops: Vec<Vec<NurbsCurve>> = Vec::new();
-    for loop_record in &cap_faces[0].loops {
-        let bag = loop_record
-            .coedges
-            .iter()
-            .map(|coedge| {
-                let edge = edge_by_id
-                    .get(&coedge.edge_id)
-                    .ok_or("sheet-metal cutout: cross-section coedge lost its edge")?;
-                project_curve_uv(&subcurve(&edge.curve, edge.t0, edge.t1)?)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        loops.push(chain_loop(bag)?);
-    }
-
-    // Largest |area| = outer boundary; the rest are islands (holes in the cut).
-    let mut best = 0usize;
-    let mut best_area = -1.0;
-    for (index, chain) in loops.iter().enumerate() {
-        let area = loop_area(chain)?.abs();
-        if area > best_area {
-            best_area = area;
-            best = index;
+    // The boolean trims a shared curve by NARROWING the edge's `[t0, t1]` range
+    // (not by rebuilding control points), so read the TRIMMED subcurve — the
+    // full curve would give the untrimmed tips and leave a gap at every trim
+    // vertex.
+    let mut regions = Vec::with_capacity(cap_faces.len());
+    for face in cap_faces {
+        let mut loops: Vec<Vec<NurbsCurve>> = Vec::new();
+        for loop_record in &face.loops {
+            let bag = loop_record
+                .coedges
+                .iter()
+                .map(|coedge| {
+                    let edge = edge_by_id
+                        .get(&coedge.edge_id)
+                        .ok_or("sheet-metal cutout: cross-section coedge lost its edge")?;
+                    project_curve_uv(&subcurve(&edge.curve, edge.t0, edge.t1)?)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            loops.push(chain_loop(bag)?);
         }
+        // Largest |area| = outer boundary; the rest are islands (holes in the cut).
+        let mut best = 0usize;
+        let mut best_area = -1.0;
+        for (index, chain) in loops.iter().enumerate() {
+            let area = loop_area(chain)?.abs();
+            if area > best_area {
+                best_area = area;
+                best = index;
+            }
+        }
+        let outer = loops.remove(best);
+        regions.push((outer, loops));
     }
-    let outer = loops.remove(best);
-    Ok((outer, loops))
+    Ok(regions)
 }
 
 /// The subcurve of `curve` over the edge parameter range `[t0, t1]` (the boolean
@@ -773,14 +803,7 @@ fn chain_loop(mut bag: Vec<NurbsCurve>) -> Result<Vec<NurbsCurve>, String> {
 /// Shoelace signed area of a curve chain (sampled), in its own `(x, y)`.
 fn loop_area(curves: &[NurbsCurve]) -> Result<f64, String> {
     let poly = sample_flat_curves(curves)?;
-    let mut area = 0.0;
-    let n = poly.len();
-    for i in 0..n {
-        let a = poly[i];
-        let b = poly[(i + 1) % n];
-        area += a[0] * b[1] - b[0] * a[1];
-    }
-    Ok(area * 0.5)
+    Ok(crate::polygon::signed_area_2d(poly.len(), |i| poly[i]))
 }
 
 /// Sample a chain of flat `(x, y, 0)` curves into a 2D polygon (16 pts/curve).
@@ -827,19 +850,7 @@ fn polygon_overlaps_strip(poly: &[[f64; 2]], strip: &WedgeStrip) -> bool {
 
 /// Even-odd point-in-polygon (ray cast toward +x).
 fn point_in_polygon(p: [f64; 2], poly: &[[f64; 2]]) -> bool {
-    let n = poly.len();
-    let mut inside = false;
-    for i in 0..n {
-        let a = poly[i];
-        let b = poly[(i + 1) % n];
-        if (a[1] > p[1]) != (b[1] > p[1]) {
-            let x = a[0] + (p[1] - a[1]) * (b[0] - a[0]) / (b[1] - a[1]);
-            if x > p[0] {
-                inside = !inside;
-            }
-        }
-    }
-    inside
+    crate::polygon::parity_inside(p, poly.len(), |i| poly[i])
 }
 
 fn orient(a: [f64; 2], b: [f64; 2], c: [f64; 2]) -> f64 {
@@ -893,6 +904,240 @@ fn polygons_overlap(a: &[[f64; 2]], b: &[[f64; 2]]) -> bool {
         }
     }
     false
+}
+
+// ===========================================================================
+// Solid-tool cut
+// ===========================================================================
+
+/// Cut the sheet with a SOLID tool (`profile` names a solid body). On every
+/// flat the tool reaches, the tool is sectioned at the flat's two face planes
+/// (`z = ±t/2`) and the hole is the perpendicular-walled THROUGH prism over the
+/// 2D UNION of the two sections: the oblique-sketch rule (cut once per face,
+/// `X\A\B = X\(A∪B)`), so a tool at any tilt can be pushed straight through
+/// the laser-cut opening. A tool whose widest section lies inside the thickness
+/// (a sphere centred in the sheet) under-cuts there by design, like the oblique
+/// waist. The depths are ignored; the tool solid is consumed unless `keepTool`.
+fn solid_tool_cut(
+    ctx: &FeatureContext,
+    mut tree: sheet_metal::SheetTree,
+    body_name: &str,
+    tool_name: &str,
+    tool_handle: u32,
+    keep_tool: bool,
+) -> Result<FeatureResult, String> {
+    let tool = crate::registered_solid_clone(tool_handle)?;
+    let placements = sheet_metal::evaluate::folded_flat_placements(&tree)?;
+    let half_t = tree.thickness * 0.5;
+    let mut cuts: Vec<(String, Hole)> = Vec::new();
+    for placement in &placements {
+        for hole in solid_tool_holes(&tool, tool_name, placement, half_t)? {
+            cuts.push((placement.id.clone(), hole));
+        }
+    }
+    if cuts.is_empty() {
+        return Err(format!(
+            "sheet-metal cutout: tool solid '{tool_name}' does not cut any flat of \
+             '{body_name}' — it must pass through the sheet"
+        ));
+    }
+    bake_holes(&mut tree, cuts)?;
+    let added = sheet_metal::register_folded(tree, body_name)?;
+    let mut result = FeatureResult::empty(ctx.id.clone(), ctx.feature_type.clone());
+    result.added.push(added);
+    result.removed.push(body_name.to_string());
+    if !keep_tool {
+        result.removed.push(tool_name.to_string());
+    }
+    Ok(result)
+}
+
+/// The holes a solid tool cuts in one flat (empty when it misses the flat).
+/// The tool, mapped into the flat frame, is intersected with a slab over its
+/// own `(u, v)` bounds (so an overhanging tool still cuts an edge notch) and
+/// `z ∈ [−t/2, t/2]`; the slab result's caps at `±t/2` are the two sections.
+/// Each connected region of their union becomes one hole, which must overlap a
+/// top AND a bottom section (a blind tool is a loud error, as for an oblique
+/// sketch) and must stay out of the bend wedges.
+fn solid_tool_holes(
+    tool: &crate::BrepSolid,
+    tool_name: &str,
+    placement: &FlatPlacement,
+    half_t: f64,
+) -> Result<Vec<Hole>, String> {
+    let local = solid_to_flat_frame(tool, placement)?;
+    let Some((lo, hi)) = control_bounds(&local)? else {
+        return Ok(Vec::new());
+    };
+    // Cheap rejects on the control-net hull: the slab's z range, then the
+    // flat outline grown by its widest bend wedge.
+    let eps = 1e-9 * half_t.max(1.0);
+    if lo.z >= half_t - eps || hi.z <= -half_t + eps {
+        return Ok(Vec::new());
+    }
+    let reach = placement
+        .wedge_strips
+        .iter()
+        .map(|strip| strip.reach)
+        .fold(0.0, f64::max);
+    let mut out_lo = [f64::INFINITY; 2];
+    let mut out_hi = [f64::NEG_INFINITY; 2];
+    for p in &placement.outline {
+        for axis in 0..2 {
+            out_lo[axis] = out_lo[axis].min(p[axis] - reach);
+            out_hi[axis] = out_hi[axis].max(p[axis] + reach);
+        }
+    }
+    if hi.x < out_lo[0] || lo.x > out_hi[0] || hi.y < out_lo[1] || lo.y > out_hi[1] {
+        return Ok(Vec::new());
+    }
+
+    // --- The two sections: tool ∩ slab, read at the slab's caps. ---
+    let margin = half_t.max(0.05 * (hi.x - lo.x).hypot(hi.y - lo.y));
+    let corners = [
+        Vec3::new(lo.x - margin, lo.y - margin, 0.0),
+        Vec3::new(hi.x + margin, lo.y - margin, 0.0),
+        Vec3::new(hi.x + margin, hi.y + margin, 0.0),
+        Vec3::new(lo.x - margin, hi.y + margin, 0.0),
+    ];
+    let rectangle = (0..4)
+        .map(|i| line_curve(corners[i], corners[(i + 1) % 4]))
+        .collect::<Result<Vec<_>, _>>()?;
+    let slab = extrude_footprint(&rectangle, -half_t, 2.0 * half_t)?;
+    let section = common::intersect_solid(local, slab).map_err(|error| {
+        format!(
+            "sheet-metal cutout: sectioning tool solid '{tool_name}' at flat '{}' failed: {error}",
+            placement.id
+        )
+    })?;
+    if section.shells.iter().all(|shell| shell.faces.is_empty()) {
+        return Ok(Vec::new()); // the tool's hull reached the slab, the tool did not
+    }
+    let top = cap_regions(&section, half_t)?;
+    let bottom = cap_regions(&section, -half_t)?;
+    let blind = || {
+        format!(
+            "sheet-metal cutout: tool solid '{tool_name}' does not pass through flat '{}' — \
+             a solid tool must cross both faces of the sheet (a partial-depth cut is not \
+             supported)",
+            placement.id
+        )
+    };
+    if top.is_empty() && bottom.is_empty() {
+        // Material inside the thickness that pierces neither face.
+        let inside = control_bounds(&section)?.is_some_and(|(s_lo, s_hi)| {
+            let hull = vec![
+                [s_lo.x, s_lo.y],
+                [s_hi.x, s_lo.y],
+                [s_hi.x, s_hi.y],
+                [s_lo.x, s_hi.y],
+            ];
+            polygons_overlap(&hull, &placement.outline)
+        });
+        return if inside { Err(blind()) } else { Ok(Vec::new()) };
+    }
+
+    // --- UNION the section prisms and read each merged region back. ---
+    let top_polys = top
+        .iter()
+        .map(|(outer, _)| sample_flat_curves(outer))
+        .collect::<Result<Vec<_>, _>>()?;
+    let bottom_polys = bottom
+        .iter()
+        .map(|(outer, _)| sample_flat_curves(outer))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut f_lo = [f64::INFINITY; 2];
+    let mut f_hi = [f64::NEG_INFINITY; 2];
+    for p in top_polys.iter().chain(bottom_polys.iter()).flatten() {
+        for axis in 0..2 {
+            f_lo[axis] = f_lo[axis].min(p[axis]);
+            f_hi[axis] = f_hi[axis].max(p[axis]);
+        }
+    }
+    let height = (f_hi[0] - f_lo[0]).hypot(f_hi[1] - f_lo[1]).max(1e-3);
+    let prisms = top
+        .iter()
+        .chain(bottom.iter())
+        .map(|(outer, islands)| footprint_prism(outer, islands, height))
+        .collect::<Result<Vec<_>, _>>()?;
+    let union = common::union_region_solids(prisms)
+        .map_err(|e| format!("sheet-metal cutout: solid-tool section union failed: {e}"))?;
+
+    let mut holes = Vec::new();
+    for (outer, islands) in cap_regions(&union, height)? {
+        let poly = sample_flat_curves(&outer)?;
+        let on_flat = polygons_overlap(&poly, &placement.outline);
+        for strip in &placement.wedge_strips {
+            if polygon_overlaps_strip(&poly, strip) {
+                return Err(format!(
+                    "sheet-metal cutout: tool solid '{tool_name}' crosses bend '{}' at flat \
+                     '{}' — cutting across a bend arc is not supported; keep each cut inside \
+                     one flat",
+                    strip.bend_id, placement.id
+                ));
+            }
+        }
+        if !on_flat {
+            continue; // the tool crosses this flat's plane away from its material
+        }
+        let pierces = |polys: &[Vec<[f64; 2]>]| polys.iter().any(|p| polygons_overlap(p, &poly));
+        if !pierces(&top_polys) || !pierces(&bottom_polys) {
+            return Err(blind());
+        }
+        holes.push(Hole {
+            outer,
+            islands,
+            z_min: Some(-half_t),
+            z_max: Some(half_t),
+        });
+    }
+    Ok(holes)
+}
+
+/// Rigidly map a WORLD solid into a flat's local frame: `p` →
+/// `((p−origin)·u, (p−origin)·v, (p−origin)·w)`.
+fn solid_to_flat_frame(
+    solid: &crate::BrepSolid,
+    placement: &FlatPlacement,
+) -> Result<crate::BrepSolid, String> {
+    let (o, u, v, w) = (placement.origin, placement.u, placement.v, placement.w);
+    let transform = crate::AffineTransform::new([
+        u.x, u.y, u.z, -u.dot(o),
+        v.x, v.y, v.z, -v.dot(o),
+        w.x, w.y, w.z, -w.dot(o),
+        0.0, 0.0, 0.0, 1.0,
+    ])?;
+    let reflect = transform.determinant3() < 0.0;
+    crate::transform_brep(solid, transform, reflect)
+}
+
+/// Axis-aligned bounds of a solid's control nets (faces and vertices) — a
+/// conservative hull of the body. `None` for an empty solid.
+fn control_bounds(solid: &crate::BrepSolid) -> Result<Option<(Vec3, Vec3)>, String> {
+    let mut lo = Vec3::new(f64::INFINITY, f64::INFINITY, f64::INFINITY);
+    let mut hi = Vec3::new(f64::NEG_INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY);
+    let mut grow = |p: Vec3| {
+        lo = Vec3::new(lo.x.min(p.x), lo.y.min(p.y), lo.z.min(p.z));
+        hi = Vec3::new(hi.x.max(p.x), hi.y.max(p.y), hi.z.max(p.z));
+    };
+    for vertex in &solid.vertices {
+        grow(vertex.point);
+    }
+    for face in solid.shells.iter().flat_map(|shell| shell.faces.iter()) {
+        for cp in face.surface.control_points.iter().flatten() {
+            grow(cp.point()?);
+        }
+    }
+    Ok((lo.x <= hi.x).then_some((lo, hi)))
+}
+
+/// A degree-1 segment `a → b`.
+fn line_curve(a: Vec3, b: Vec3) -> Result<NurbsCurve, String> {
+    NurbsCurve::new(
+        1,
+        vec![0.0, 0.0, 1.0, 1.0],
+        vec![crate::Vec4::from_point(a, 1.0), crate::Vec4::from_point(b, 1.0)],
+    )
 }
 
 // ===========================================================================
@@ -1030,28 +1275,29 @@ pub fn schema() -> serde_json::Value {
             "type": "reference_selection",
             "selectionFilter": [
                 "FACE",
-                "SKETCH"
+                "SKETCH",
+                "SOLID"
             ],
             "multiple": false,
             "default_value": null,
-            "hint": "Sketch profile to cut with (always consumed). Each sketch region cuts; inner loops are islands that keep their material."
+            "hint": "Sketch profile or solid body to cut with. A sketch is always consumed; each sketch region cuts and inner loops are islands that keep their material. A solid cuts a perpendicular-walled hole through each flat it crosses, sized to its outline on both faces, and is consumed unless Keep Tool is on."
         },
         "forwardDistance": {
             "type": "number",
             "default_value": 0,
             "min": 0,
-            "hint": "Blind cut depth forward of the sketch plane (along the sketch normal). 0 = cut through everything on that side."
+            "hint": "Blind cut depth forward of the sketch plane (along the sketch normal). 0 = cut through everything on that side. Ignored for a solid tool."
         },
         "backDistance": {
             "type": "number",
             "default_value": 0,
             "min": 0,
-            "hint": "Blind cut depth behind the sketch plane (against the sketch normal). 0 = cut through everything on that side."
+            "hint": "Blind cut depth behind the sketch plane (against the sketch normal). 0 = cut through everything on that side. Ignored for a solid tool."
         },
         "keepTool": {
             "type": "boolean",
             "default_value": false,
-            "hint": "Also keep the generated cutting tool solid(s) in the scene ({id}:CUTTER)."
+            "hint": "Also keep the generated cutting tool solid(s) in the scene ({id}:CUTTER). With a solid tool, keep that solid instead of consuming it."
         }
     }
 })

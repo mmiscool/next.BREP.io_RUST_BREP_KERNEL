@@ -823,12 +823,17 @@ impl Viewport {
         // Touch has no hover dwell or Alt key. A stationary held contact asks
         // for the same ranked candidate list as Alt+click on a mouse. egui's
         // long-touch flag never fires for desktop mouse input.
-        if response.long_touched() && !state.any_sketch_mode() && !state.ref_select_active() {
+        if response.long_touched() && !state.any_sketch_mode() {
             if let Some(pos) = response.interact_pointer_pos() {
                 let (lx, ly) = local(pos);
-                let candidates = state.candidates_filtered_at(lx, ly);
+                let reference = state.ref_select_active();
+                let candidates = if reference {
+                    state.ref_select_candidates_at(lx, ly)
+                } else {
+                    state.candidates_filtered_at(lx, ly)
+                };
                 self.candidate_popup = (!candidates.is_empty())
-                    .then(|| CandidatePopup { anchor: pos, candidates });
+                    .then(|| CandidatePopup { anchor: pos, candidates, reference });
                 self.candidate_popup_fresh = self.candidate_popup.is_some();
                 self.hover_lit_since = None;
             }
@@ -1020,7 +1025,22 @@ impl Viewport {
                     // catches a press that egui classifies as a drag.
                     state.viewcube_click(cx, cy);
                 } else if state.ref_select_active() {
-                    state.ref_select_click(lx, ly);
+                    // A reference field is picking. The same two triggers open
+                    // the pick list here — a dwelled click or Alt+click — but
+                    // over the FIELD's admitted candidates, and a row goes into
+                    // the field's running list. A plain click takes the top
+                    // admitted hit by kind, so with a field that admits a face
+                    // and a solid the face always wins it: the list is the only
+                    // way to the solid (the SM Cutout tool body, 2026-10-29).
+                    if mods.alt || self.hover_dwell_armed(ui.ctx()) {
+                        let cands = state.ref_select_candidates_at(lx, ly);
+                        self.candidate_popup = (!cands.is_empty())
+                            .then(|| CandidatePopup { anchor: pos, candidates: cands, reference: true });
+                        self.candidate_popup_fresh = self.candidate_popup.is_some();
+                    } else {
+                        state.ref_select_click(lx, ly);
+                    }
+                    self.hover_lit_since = None;
                 } else if state.transform_center_pick(lx, ly) {
                     // The orange CENTER sphere in transform mode toggles to the
                     // DIMENSION arrows (the old app's center-handle ◎ toggle).
@@ -1051,7 +1071,7 @@ impl Viewport {
                     // single candidate (the power-user inspection trigger).
                     let cands = state.candidates_filtered_at(lx, ly);
                     self.candidate_popup = (!cands.is_empty())
-                        .then(|| CandidatePopup { anchor: pos, candidates: cands });
+                        .then(|| CandidatePopup { anchor: pos, candidates: cands, reference: false });
                     self.candidate_popup_fresh = self.candidate_popup.is_some();
                     // The dwell is SPENT on the list it opened: dismissing this
                     // one must not leave a clock that re-opens it on the spot.
@@ -1086,7 +1106,7 @@ impl Viewport {
                     // question "should it open at all" is answered differently.
                     let cands = state.candidates_filtered_at(lx, ly);
                     self.candidate_popup = (!cands.is_empty())
-                        .then(|| CandidatePopup { anchor: pos, candidates: cands });
+                        .then(|| CandidatePopup { anchor: pos, candidates: cands, reference: false });
                     self.candidate_popup_fresh = self.candidate_popup.is_some();
                     // Spent on the list it opened (see the Alt+click twin).
                     self.hover_lit_since = None;
@@ -1382,10 +1402,15 @@ impl Viewport {
     /// draw" rule).
     fn show_candidate_popup(&mut self, ctx: &egui::Context, state: &mut EngineState) {
         self.candidate_hits.clear();
-        // A modal mode (reference-selection / sketch edit) supersedes the pick
-        // list: drop a popup left open by modeling clicks so it neither draws
-        // over the modal nor swallows the modal's first viewport click.
-        if state.ref_select_active() || state.any_sketch_mode() {
+        // A modal mode supersedes a pick list opened outside it: sketch edit
+        // drops any list, and a reference pick starting or ending drops the
+        // list of the other mode, so it neither draws over the modal nor
+        // swallows the modal's first viewport click (nor feeds a field that is
+        // no longer picking).
+        let reference = state.ref_select_active();
+        if state.any_sketch_mode()
+            || self.candidate_popup.as_ref().is_some_and(|p| p.reference != reference)
+        {
             self.candidate_popup = None;
         }
         let Some(popup) = self.candidate_popup.as_ref() else {
@@ -1398,7 +1423,7 @@ impl Viewport {
         // Row selected-state, read BEFORE the draw (no engine borrow inside it).
         let selected_rows: Vec<bool> = candidates
             .iter()
-            .map(|c| state.candidate_is_selected(c))
+            .map(|c| if reference { state.ref_select_has_candidate(c) } else { state.candidate_is_selected(c) })
             .collect();
 
         let mut hits: Vec<egui::Rect> = Vec::with_capacity(candidates.len());
@@ -1418,17 +1443,21 @@ impl Viewport {
                 frame.fill = frame.fill.gamma_multiply(0.85);
                 frame.show(ui, |ui| {
                     ui.set_max_width(280.0);
-                    // Header row: title + a "Clear Selection" action.
+                    // Header row: title + a "Clear Selection" action. A
+                    // reference pick has no modeling selection to clear (the
+                    // field's own list removes its picks).
                     ui.horizontal(|ui| {
                         ui.label(egui::RichText::new("Select an object").weak().small());
-                        ui.with_layout(
-                            egui::Layout::right_to_left(egui::Align::Center),
-                            |ui| {
-                                if ui.small_button("Clear Selection").clicked() {
-                                    clear_clicked = true;
-                                }
-                            },
-                        );
+                        if !reference {
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if ui.small_button("Clear Selection").clicked() {
+                                        clear_clicked = true;
+                                    }
+                                },
+                            );
+                        }
                     });
                     // A long candidate list scrolls instead of growing past the
                     // viewport; hover keeps re-resolving as rows slide under the
@@ -1500,7 +1529,11 @@ impl Viewport {
             // list reopens on the next click); in Ctrl+Click mode a plain
             // entry click REPLACES the selection with exactly that entity.
             let toggles = state.settings.multi_select == MultiSelectMode::ClickToggles;
-            if toggles || mods.command || mods.ctrl {
+            if reference {
+                // A reference field's row: into the field's running list,
+                // named exactly as a plain click would name it.
+                state.ref_select_take_candidate(&candidates[i]);
+            } else if toggles || mods.command || mods.ctrl {
                 state.toggle_candidate(&candidates[i]);
             } else {
                 state.select_candidate(&candidates[i]);

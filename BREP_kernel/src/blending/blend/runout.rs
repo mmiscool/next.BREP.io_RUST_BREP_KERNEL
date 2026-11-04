@@ -840,19 +840,8 @@ struct EndChain {
 /// battery, the case manifest and hlr_tests; `=0`/`off` is the escape hatch.
 const ONE_ENDED_RUNOUT_DEFAULT: bool = true;
 
-thread_local! {
-    static ONE_ENDED_RUNOUT_FOR_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
-}
-
 pub(crate) fn one_ended_runout_on() -> bool {
-    if let Some(forced) = ONE_ENDED_RUNOUT_FOR_TEST.with(|forced| forced.get()) {
-        return forced;
-    }
-    match std::env::var("BREP_BLEND_ONE_ENDED_RUNOUT").as_deref() {
-        Ok("0") | Ok("off") => false,
-        Ok("1") | Ok("on") => true,
-        _ => ONE_ENDED_RUNOUT_DEFAULT,
-    }
+    switch!(live "BREP_BLEND_ONE_ENDED_RUNOUT", ONE_ENDED_RUNOUT_DEFAULT)
 }
 
 
@@ -888,21 +877,10 @@ pub(crate) const ONE_ENDED_CONCAVE_THIRD_WHAT: &str = "one_ended_concave_third";
 
 const CONCAVE_THIRD_RUNOUT_DEFAULT: bool = true;
 
-thread_local! {
-    static CONCAVE_THIRD_RUNOUT_FOR_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
-}
-
 /// `BREP_BLEND_CONCAVE_THIRD_RUNOUT=1`/`on` builds the concave-third
 /// one-ended end, `=0`/`off` refuses it by name (`ONE_ENDED_CONCAVE_THIRD_WHAT`).
 pub(crate) fn concave_third_runout_on() -> bool {
-    if let Some(forced) = CONCAVE_THIRD_RUNOUT_FOR_TEST.with(|forced| forced.get()) {
-        return forced;
-    }
-    match std::env::var("BREP_BLEND_CONCAVE_THIRD_RUNOUT").as_deref() {
-        Ok("0") | Ok("off") => false,
-        Ok("1") | Ok("on") => true,
-        _ => CONCAVE_THIRD_RUNOUT_DEFAULT,
-    }
+    switch!(live "BREP_BLEND_CONCAVE_THIRD_RUNOUT", CONCAVE_THIRD_RUNOUT_DEFAULT)
 }
 
 

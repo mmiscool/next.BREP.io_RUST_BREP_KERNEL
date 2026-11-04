@@ -29,7 +29,7 @@ pub mod features;
 pub mod face_transform_help;
 pub mod formatting;
 mod geometry2d;
-mod geometry3d;
+pub mod geometry3d;
 pub mod history;
 mod json_support;
 pub mod metadata;

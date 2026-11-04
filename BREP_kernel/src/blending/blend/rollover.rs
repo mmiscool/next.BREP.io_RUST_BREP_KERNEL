@@ -17,7 +17,7 @@
 //! the sewing are not built; the validation record of 2026-10-11 measures
 //! them.
 use crate::topology::{BrepSolid, EdgeRecord, FaceRecord};
-use crate::{fit, KernelRefusal, KernelStage, NurbsSurface, OrRefuse, PolygonClass, Vec3};
+use crate::{fit, KernelRefusal, KernelStage, NurbsCurve, NurbsSurface, OrRefuse, PolygonClass, Vec3};
 use super::stations::{
     apex_point, branch_hop, closed_rail_interval_misses, continue_station, raw_normal, solve_station, station_parameters,
     tangency_state, BlendMate, Continued, FittedRows, Station, NEWTON_ITERATIONS, REFINE_ROUNDS, SEED_INTERVALS,
@@ -295,7 +295,10 @@ pub(super) fn tangent_crossings(
             if !tangent_at(solid, face, neighbour, point) {
                 continue;
             }
-            if !crate::fillet::neighbour_carries_ball(solid, face, neighbour, radius) {
+            // The ball's side: centre = p + rho * n_raw, and the outward
+            // normal is n_raw on a same_sense face.
+            let ball_outside = (mate.rho != 0.0).then(|| (mate.rho > 0.0) == face.same_sense);
+            if !crate::fillet::neighbour_carries_ball_sided(solid, face, neighbour, radius, ball_outside) {
                 continue;
             }
             found.push(RailCrossing {
@@ -315,6 +318,360 @@ pub(super) fn tangent_crossings(
     Ok(found)
 }
 
+/// The STOPPED-END crossings of an open stripe (user bug F10, 2026-11-02):
+/// on each side, the last crossing before the finish vertex's station at
+/// which the track LEAVES its mate onto a tangent neighbour and after
+/// which it never returns before that station. Stations past the vertex
+/// (the overshoot, marched on the carriers' extensions) are not read. At
+/// most one crossing per side, side 0 first.
+pub(super) fn stopped_end_crossings(
+    solid: &BrepSolid,
+    stations: &[Station],
+    mates: [&BlendMate<'_>; 2],
+    radius: f64,
+    vertex_indices: [usize; 2],
+) -> Result<Vec<RailCrossing>, KernelRefusal> {
+    let finish = vertex_indices[1].min(stations.len().saturating_sub(1));
+    if finish <= vertex_indices[0] {
+        return Ok(Vec::new());
+    }
+    let crossings = tangent_crossings(solid, &stations[..=finish], mates, radius)?;
+    let mut found = Vec::new();
+    for side in 0..2 {
+        let on_side: Vec<&RailCrossing> = crossings.iter().filter(|crossing| crossing.side == side).collect();
+        // The last crossing before the vertex must be a leaving one.
+        if let Some(last) = on_side.last() {
+            if last.leaving && last.stations[0] > vertex_indices[0] {
+                found.push((*last).clone());
+            }
+        }
+    }
+    Ok(found)
+}
+
+/// One side of an open stripe that rolled onto its tangent neighbour at a
+/// stopped end: what the surgery needs to split the rail there.
+#[derive(Clone, Debug)]
+pub(crate) struct RolledSide {
+    pub(crate) neighbour_face_id: u64,
+    /// The crossed tangent edge of the mate.
+    pub(crate) edge_id: u64,
+    /// Index of the crossing station in the tail's station list.
+    pub(crate) station: usize,
+    /// The crossing contact, on the crossed edge.
+    pub(crate) point: Vec3,
+    /// The crossing station's ROW parameter (the rails' and pcurves'), set
+    /// once the rows are fitted; the surgery splits the rail there.
+    pub(crate) row_parameter: f64,
+}
+
+/// One piece of a stopped-end cap's leg: the plane/carrier intersection on
+/// ONE face, from `from` to `to` (the chain runs rim -> sharp vertex, and
+/// crosses a face boundary where the carrier does not reach the vertex: F10's
+/// leg from the rim on face 19 crosses edge 56 onto face 26, which holds
+/// vertex 34).
+#[derive(Clone, Debug)]
+pub(crate) struct LegPiece {
+    pub(crate) edge_id: u64,
+    pub(crate) face_id: u64,
+    pub(crate) from: u64,
+    pub(crate) to: u64,
+    /// On `face_id`, parameterised from `from` to `to`.
+    pub(crate) pcurve: NurbsCurve,
+}
+
+/// What the surgery splices for one rolled side: the crossing and the
+/// cap's leg chain on the neighbours.
+pub(crate) struct TailSplice<'a> {
+    pub(crate) rolled: &'a RolledSide,
+    pub(crate) legs: Vec<LegPiece>,
+}
+
+/// An open stripe's stations with its stopped-end tail re-marched on the
+/// swapped carriers (see [`stopped_end_tail`]).
+pub(crate) struct StoppedEndTail {
+    pub(crate) stations: Vec<Station>,
+    pub(crate) ts: Vec<f64>,
+    pub(crate) vertex_indices: [usize; 2],
+    /// The crossing stations' indices: the rows and pcurves break there.
+    pub(crate) breaks: Vec<usize>,
+    pub(crate) sides: [Option<RolledSide>; 2],
+}
+
+const STOPPED_END_WHAT: &str = "stopped_end_rollover";
+
+/// The stripe's stations with the tail past its stopped-end crossings
+/// re-marched on the swapped carriers (user bug F10, 2026-11-02). The
+/// crossings are solved in march order, each with the rail frozen on its
+/// tangent edge and the other side on whatever carrier it is on by then (a
+/// mate, or the neighbour it already rolled onto); the stations after a
+/// crossing are marched at the ORIGINAL march's parameters — the vertex
+/// station and the overshoot included — on the pair with that side swapped
+/// to its neighbour, its signed radius adjusted to the neighbour's raw
+/// normal (C1), continuing from the crossing station re-read on the new
+/// pair (which must agree with the frozen-rail solve: the contact lies on
+/// the tangent edge, on both faces). Stations before the first crossing are
+/// the march's own.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn stopped_end_tail(
+    solid: &BrepSolid,
+    edge: &EdgeRecord,
+    mates: [&BlendMate<'_>; 2],
+    radius_at: &dyn Fn(f64) -> f64,
+    scale: f64,
+    stations: &[Station],
+    station_ts: &[f64],
+    vertex_indices: [usize; 2],
+    mut crossings: Vec<RailCrossing>,
+) -> Result<StoppedEndTail, KernelRefusal> {
+    let not_built = |what: String| KernelRefusal::unsupported(KernelStage::Refine, STOPPED_END_WHAT, format!("blend stopped-end rollover: {what}"));
+    // The native parameter of every station: the dense reading's, else read
+    // back off the centres (every centre lies in its station's section plane).
+    let ts: Vec<f64> = if station_ts.len() == stations.len() {
+        station_ts.to_vec()
+    } else {
+        stations.iter().map(|station| edge_parameter_near(edge, station.center)).collect::<Result<_, _>>()?
+    };
+    crossings.sort_by_key(|crossing| crossing.stations[0]);
+    let face_by_id = |id: u64| -> Result<&FaceRecord, KernelRefusal> {
+        solid
+            .shells
+            .iter()
+            .flat_map(|shell| &shell.faces)
+            .find(|face| face.id == id)
+            .ok_or_else(|| KernelRefusal::internal(KernelStage::Refine, "rollover_face", format!("blend stopped-end rollover: face {id} vanished")))
+    };
+    // The carriers each side is on, as owned mates (the neighbour borrows
+    // the mate's coedge and loop: only its face and ρ are read here).
+    let mut current: [BlendMate<'_>; 2] = [
+        BlendMate { face: mates[0].face, coedge: mates[0].coedge, loop_index: mates[0].loop_index, rho: mates[0].rho },
+        BlendMate { face: mates[1].face, coedge: mates[1].coedge, loop_index: mates[1].loop_index, rho: mates[1].rho },
+    ];
+    let mut sides: [Option<RolledSide>; 2] = [None, None];
+    let mut out_stations: Vec<Station> = Vec::with_capacity(stations.len() + 2);
+    let mut out_ts: Vec<f64> = Vec::with_capacity(stations.len() + 2);
+    let mut breaks = Vec::new();
+    // Stations the crossing solves read their seeds from: the original list
+    // with a rolled side's parameter points moved onto its neighbour.
+    let mut work: Vec<Station> = stations.to_vec();
+    let mut next_target = 0usize;
+    for (k, crossing) in crossings.iter().enumerate() {
+        let side = crossing.side;
+        if sides[side].is_some() {
+            return Err(not_built(format!("side {side} leaves its carrier twice before the vertex")));
+        }
+        // The crossing station: the frozen-rail solve, or — where its Newton
+        // is singular (the trimmed F10 model's coarser rung) — a bisection of
+        // the march between the bracket's stations on the crossed side's
+        // membership of its mate, the contact then snapped onto the edge.
+        let (t_cross, station) = match solve_crossing(edge, [&current[0], &current[1]], radius_at, &work, crossing, scale) {
+            Ok(solved) => solved,
+            Err(error) => {
+                if std::env::var("BREP_DEBUG_NETWORK").is_ok() {
+                    eprintln!("stopped-end rollover: frozen-rail solve declined ({}); bisecting the march", error.message);
+                }
+                bisect_crossing(solid, edge, [&current[0], &current[1]], radius_at, &work, &ts, crossing, scale)?
+            }
+        };
+        if k == 0 {
+            // The march's own stations up to the crossing.
+            let before = crossing.stations[0];
+            out_stations.extend_from_slice(&stations[..=before]);
+            out_ts.extend_from_slice(&ts[..=before]);
+            next_target = before + 1;
+        } else if let Some(&last) = out_ts.last() {
+            if t_cross <= last {
+                return Err(not_built(format!("crossing stations out of order ({t_cross:.6} after {last:.6})")));
+            }
+        }
+        while next_target < ts.len() && ts[next_target] <= t_cross {
+            next_target += 1;
+        }
+        // The crossing station, the rolled side's parameter point read on the
+        // neighbour; the pair swapped from here on.
+        let neighbour = face_by_id(crossing.neighbour_face_id)?;
+        let point = if side == 0 { station.p1 } else { station.p2 };
+        let projection = crate::project_point_to_surface(&neighbour.surface, point).or_refuse(KernelStage::Refine, "project_point_to_surface")?;
+        let on_mate = track_uv(&station, side);
+        let mate_raw = raw_normal(&current[side].face.surface, on_mate[0], on_mate[1])?;
+        let neighbour_raw = raw_normal(&neighbour.surface, projection.u, projection.v)?;
+        let rho = if mate_raw.dot(neighbour_raw) < 0.0 { -current[side].rho } else { current[side].rho };
+        current[side] = BlendMate { face: neighbour, coedge: current[side].coedge, loop_index: current[side].loop_index, rho };
+        let mut first = station;
+        if side == 0 {
+            first.uv1 = [projection.u, projection.v];
+        } else {
+            first.uv2 = [projection.u, projection.v];
+        }
+        let surfaces = [&current[0].face.surface, &current[1].face.surface];
+        let signs = [current[0].rho.signum(), current[1].rho.signum()];
+        let frame = PieceFrame { edge, surfaces, signs, radius_at, scale };
+        let seed_uv = [first.uv1[0], first.uv1[1], first.uv2[0], first.uv2[1]];
+        let check = frame.station(t_cross, seed_uv)?;
+        let agreement = check.center.sub(first.center).length().max(check.p1.sub(first.p1).length()).max(check.p2.sub(first.p2).length());
+        if agreement > 1e-6 * scale {
+            return Err(KernelRefusal::non_convergence(
+                KernelStage::Refine,
+                STOPPED_END_WHAT,
+                format!("blend stopped-end rollover: the crossing station re-read on face {} moves by {agreement:.3e}", neighbour.id),
+            ));
+        }
+        breaks.push(out_stations.len());
+        sides[side] = Some(RolledSide { neighbour_face_id: neighbour.id, edge_id: crossing.edge_id, station: out_stations.len(), point, row_parameter: 0.0 });
+        out_stations.push(first);
+        out_ts.push(t_cross);
+        // March on the new pair to the next crossing (exclusive) or the end.
+        let stop = crossings.get(k + 1).map(|next| {
+            // The next crossing's own parameter is read after its solve; the
+            // targets up to its bracket's first station are marched now.
+            ts[next.stations[0]]
+        });
+        let mut left = Continued { t: t_cross, uv: seed_uv, center: Some(first.center) };
+        while next_target < ts.len() && stop.is_none_or(|stop| ts[next_target] <= stop) {
+            let t = ts[next_target];
+            let (node, marched) = frame.continue_from(&left, t)?;
+            out_stations.push(marched);
+            out_ts.push(node.t);
+            // The working seed list follows the rolled side onto the neighbour.
+            if side == 0 {
+                work[next_target].uv1 = marched.uv1;
+            } else {
+                work[next_target].uv2 = marched.uv2;
+            }
+            left = node;
+            next_target += 1;
+        }
+    }
+    // The vertex stations: the start one unchanged, the finish one at its
+    // original parameter.
+    let t_finish = ts[vertex_indices[1]];
+    let finish = out_ts
+        .iter()
+        .position(|t| (t - t_finish).abs() <= 1e-12 * (1.0 + t_finish.abs()))
+        .ok_or_else(|| not_built("the vertex station was not marched on the neighbour".to_string()))?;
+    Ok(StoppedEndTail { stations: out_stations, ts: out_ts, vertex_indices: [vertex_indices[0], finish], breaks, sides })
+}
+
+/// The crossing station by bisection: the march continued on the current
+/// pair from the bracket's first station to the parameter where the crossed
+/// side's parameter point leaves its mate, to 1e-12 of the bracket's span;
+/// the crossed contact is then within the bisection's reach of the tangent
+/// edge and is snapped onto it (its parameter point re-read on the mate).
+#[allow(clippy::too_many_arguments)]
+fn bisect_crossing(
+    solid: &BrepSolid,
+    edge: &EdgeRecord,
+    mates: [&BlendMate<'_>; 2],
+    radius_at: &dyn Fn(f64) -> f64,
+    stations: &[Station],
+    ts: &[f64],
+    crossing: &RailCrossing,
+    scale: f64,
+) -> Result<(f64, Station), KernelRefusal> {
+    let side = crossing.side;
+    let [before, after] = crossing.stations;
+    let surfaces = [&mates[0].face.surface, &mates[1].face.surface];
+    let signs = [mates[0].rho.signum(), mates[1].rho.signum()];
+    let frame = PieceFrame { edge, surfaces, signs, radius_at, scale };
+    let start = &stations[before];
+    let mut left = Continued { t: ts[before], uv: [start.uv1[0], start.uv1[1], start.uv2[0], start.uv2[1]], center: Some(start.center) };
+    let (mut lo, mut hi) = (ts[before], ts[after]);
+    let mut inside_station = *start;
+    let mut outside_station: Option<Station> = None;
+    let span = (hi - lo).abs().max(1e-300);
+    for _ in 0..60 {
+        if (hi - lo).abs() <= 1e-12 * span {
+            break;
+        }
+        let mid = 0.5 * (lo + hi);
+        let (node, station) = frame.continue_from(&left, mid)?;
+        if inside(mates[side].face, track_uv(&station, side)) == crossing.leaving {
+            // Still on the mate (leaving) / still off it (returning): advance.
+            lo = mid;
+            left = node;
+            inside_station = station;
+        } else {
+            hi = mid;
+            outside_station = Some(station);
+        }
+    }
+    let tangent_edge = solid
+        .edges
+        .iter()
+        .find(|candidate| candidate.id == crossing.edge_id)
+        .ok_or_else(|| KernelRefusal::internal(KernelStage::Refine, "rollover_tangent_edge", format!("blend stopped-end rollover: tangent edge {} vanished", crossing.edge_id)))?;
+    // The membership test reads the mate's PCURVE, which stands off the 3-D
+    // edge by the operand's trim band; refine the bracket on the contact's
+    // signed offset from the edge itself, which vanishes at the crossing.
+    let contact_of = |station: &Station| if side == 0 { station.p1 } else { station.p2 };
+    let offset_of = |station: &Station, across: Vec3| -> Result<f64, KernelRefusal> {
+        let contact = contact_of(station);
+        let foot = crate::project_point_to_curve(&tangent_edge.curve, contact).or_refuse(KernelStage::Refine, "project_point_to_curve")?;
+        Ok(contact.sub(foot.point).dot(across))
+    };
+    let mut t_cross = lo;
+    let mut station = inside_station;
+    if let Some(outside) = outside_station {
+        // Inside -> outside across the edge, the reference direction.
+        if let Ok(across) = contact_of(&outside).sub(contact_of(&inside_station)).normalized() {
+            let start = &stations[before];
+            let mut left = Continued { t: ts[before], uv: [start.uv1[0], start.uv1[1], start.uv2[0], start.uv2[1]], center: Some(start.center) };
+            let (mut a, mut b) = (ts[before], ts[after]);
+            let (_, station_a) = frame.continue_from(&left, a)?;
+            let (_, station_b) = frame.continue_from(&left, b)?;
+            let (mut fa, mut fb) = (offset_of(&station_a, across)?, offset_of(&station_b, across)?);
+            if fa * fb < 0.0 {
+                for _ in 0..80 {
+                    // Regula falsi with bisection safeguard.
+                    let mut t = b - fb * (b - a) / (fb - fa);
+                    if !(t > a.min(b) && t < a.max(b)) {
+                        t = 0.5 * (a + b);
+                    }
+                    let (node, candidate) = frame.continue_from(&left, t)?;
+                    let f = offset_of(&candidate, across)?;
+                    t_cross = t;
+                    station = candidate;
+                    if f.abs() <= 1e-10 * (1.0 + scale) {
+                        break;
+                    }
+                    if (f < 0.0) == (fa < 0.0) {
+                        a = t;
+                        fa = f;
+                        left = node;
+                    } else {
+                        b = t;
+                        fb = f;
+                    }
+                    if (b - a).abs() <= 1e-13 * span {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    // Snap the crossed contact onto the tangent edge and re-read its
+    // parameter point on the mate.
+    let contact = contact_of(&station);
+    let foot = crate::project_point_to_curve(&tangent_edge.curve, contact).or_refuse(KernelStage::Refine, "project_point_to_curve")?;
+    if foot.distance > 1e-6 * (1.0 + scale) {
+        return Err(KernelRefusal::non_convergence(
+            KernelStage::Refine,
+            STOPPED_END_WHAT,
+            format!("blend stopped-end rollover: the bisected crossing stands {:.3e} off tangent edge {}", foot.distance, crossing.edge_id),
+        ));
+    }
+    let on_edge = tangent_edge.curve.evaluate(foot.u).or_refuse(KernelStage::Refine, "evaluate")?;
+    let on_mate = crate::project_point_to_surface(&mates[side].face.surface, on_edge).or_refuse(KernelStage::Refine, "project_point_to_surface")?;
+    if side == 0 {
+        station.p1 = on_edge;
+        station.uv1 = [on_mate.u, on_mate.v];
+    } else {
+        station.p2 = on_edge;
+        station.uv2 = [on_mate.u, on_mate.v];
+    }
+    Ok((t_cross, station))
+}
+
 /// The edge parameter whose normal plane holds `point`: the foot of the
 /// point on the edge, from the nearest of 256 samples by Newton on
 /// `(P − C(t)) · C'(t) = 0`. A station's contacts and centre all lie in its
@@ -331,21 +688,16 @@ pub(super) fn edge_parameter_near(edge: &EdgeRecord, point: Vec3) -> Result<f64,
             best = (t, distance);
         }
     }
-    let mut t = best.0;
-    for _ in 0..12 {
-        let derivatives = edge.curve.derivatives_extended(t, 2).or_refuse(KernelStage::Refine, "derivatives_extended")?;
-        let offset = point.sub(derivatives[0]);
-        let value = offset.dot(derivatives[1]);
-        let slope = offset.dot(derivatives[2]) - derivatives[1].dot(derivatives[1]);
-        if slope.abs() <= 1e-18 {
-            break;
-        }
-        let step = value / slope;
-        t -= step;
-        if step.abs() <= 1e-14 * (1.0 + span.abs()) {
-            break;
-        }
-    }
+    use crate::projection::{curve_foot_newton, CurveFootPolicy, FootDomain, FootMode};
+    let (t, _) = curve_foot_newton(&edge.curve, point, best.0, [edge.t0, edge.t1],
+        CurveFootPolicy {
+            domain: FootDomain::Extended,
+            iterations: 12,
+            slope_guard: 1e-18,
+            step_limit: f64::INFINITY,
+            parameter_tolerance: 1e-14 * (1.0 + span.abs()),
+            mode: FootMode::Stationary { positive_slope: false, relative_step: false },
+        }).or_refuse(KernelStage::Refine, "derivatives_extended")?;
     Ok(t)
 }
 
@@ -825,6 +1177,8 @@ pub(super) fn march_pieces(
         let (t_from, from_station) = from.solved.as_ref().expect("the plan holds solved crossings only");
         let (t_to, to_station) = to.solved.as_ref().expect("the plan holds solved crossings only");
         let (t_from, mut t_to) = (*t_from, *t_to);
+        // The piece that runs past the march's end (its parameters wrap).
+        let wraps = t_to <= t_from;
         if t_to <= t_from {
             t_to += span;
         }
@@ -928,12 +1282,39 @@ pub(super) fn march_pieces(
                         ));
                     }
                 }
+                // Lane N census row 5 (with `sided_ball_neighbour_on`): a
+                // ROLLED piece that wraps past the march's end carries the
+                // anchored seam too — the rim's seam vertex lies on the
+                // rolled stretch (lCount_408: the round on the far side of
+                // the boss from the cylinder's seam is crossed there). A
+                // station is marched AT the seam parameter, between the
+                // uniform ones, and the surgery splits the through rail
+                // there as it does for a piece on the mates.
+                let seam_t = (wraps && anchor_u.is_some() && crate::fillet::sided_ball_neighbour_on()).then_some(edge.t1).filter(|t| *t > t_from && *t < t_to);
+                // A uniform station within a hair of the seam IS the seam
+                // station: no second one beside it.
+                let hair = 1e-9 * span.abs().max(1.0);
+                let mut seam_pending = seam_t;
                 for k in 1..intervals {
                     let t = t_from + (t_to - t_from) * k as f64 / intervals as f64;
+                    if let Some(at) = seam_pending.filter(|at| *at <= t + hair) {
+                        seam_pending = None;
+                        if at < t - hair {
+                            let (node, station) = frame.continue_from(&left, at)?;
+                            stations.push(station);
+                            ts.push(node.t);
+                            left = node;
+                        }
+                    }
                     let (node, station) = frame.continue_from(&left, t)?;
                     stations.push(station);
                     ts.push(node.t);
                     left = node;
+                }
+                if let Some(at) = seam_pending {
+                    let (node, station) = frame.continue_from(&left, at)?;
+                    stations.push(station);
+                    ts.push(node.t);
                 }
                 stations.push(last);
                 ts.push(t_to);
@@ -951,6 +1332,9 @@ pub(super) fn march_pieces(
                 let [_, start] = from.stations;
                 Some(1 + (stations.len() - 1 - start))
             }
+            // The rolled wrapping piece's seam station (above): found again
+            // by its parameter point below, like every other.
+            Some(_) if wraps && rolled_side.is_some() && crate::fillet::sided_ball_neighbour_on() => Some(0),
             _ => None,
         };
         // Refinement: the fitted rails against the carriers between

@@ -45,13 +45,7 @@ fn constraint_signature(
 
 fn build_coincident_canonical_map(constraints: &[Value]) -> HashMap<i64, i64> {
     fn find(parent: &mut HashMap<i64, i64>, x: i64) -> i64 {
-        let p = *parent.entry(x).or_insert(x);
-        if p == x {
-            return x;
-        }
-        let root = find(parent, p);
-        parent.insert(x, root);
-        root
+        crate::union_find::find_keyed_root(parent, x)
     }
 
     let mut parent: HashMap<i64, i64> = HashMap::default();

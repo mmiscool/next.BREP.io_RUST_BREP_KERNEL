@@ -623,19 +623,7 @@ pub(crate) fn fit_meridian_circle(samples: &[Vec3]) -> Option<(Vec3, f64, f64)> 
         samples[samples.len() / 3],
         samples[2 * samples.len() / 3],
     );
-    let ab = middle.sub(first);
-    let ac = last.sub(first);
-    let normal = ab.cross(ac);
-    let denominator = 2.0 * normal.dot(normal);
-    if denominator <= 0.0 || !denominator.is_finite() {
-        return None;
-    }
-    let centre = first.add(
-        ac.cross(normal)
-            .scale(ab.dot(ab))
-            .add(normal.cross(ab).scale(ac.dot(ac)))
-            .scale(1.0 / denominator),
-    );
+    let centre = crate::circumcenter(first, middle, last)?;
     let radius = first.sub(centre).length();
     if !(radius > 0.0) {
         return None;
@@ -718,7 +706,7 @@ pub(crate) fn whole_face(
         let mut previous = curve.evaluate(t0).or_refuse(KernelStage::Refine, "evaluate")?;
         for index in 1..=32 {
             let point = curve.evaluate(t0 + (t1 - t0) * index as f64 / 32.0).or_refuse(KernelStage::Refine, "evaluate")?;
-            area += 0.5 * (previous.x * point.y - point.x * previous.y);
+            area += 0.5 * (crate::polygon::area_term([previous.x, previous.y], [point.x, point.y]));
             box_u = (box_u.0.min(point.x), box_u.1.max(point.x));
             box_v = (box_v.0.min(point.y), box_v.1.max(point.y));
             previous = point;

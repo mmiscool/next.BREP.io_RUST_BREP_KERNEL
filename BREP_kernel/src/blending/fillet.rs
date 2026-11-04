@@ -45,6 +45,8 @@ use crate::{KernelRefusal, KernelStage, OrRefuse, RefusalClass};
 
 #[path = "fillet/analyze.rs"]
 mod analyze;
+#[path = "fillet/chamfer_star.rs"]
+mod chamfer_star;
 #[path = "fillet/edges.rs"]
 mod edges;
 #[path = "fillet/tool.rs"]
@@ -58,7 +60,7 @@ pub use edges::{
 };
 pub(crate) use analyze::into_face_direction;
 pub(crate) use analyze::{face_grid_classes, NearestFaceSide};
-pub(crate) use analyze::{face_plane_normal, neighbour_carries_ball};
+pub(crate) use analyze::{face_plane_normal, neighbour_carries_ball, neighbour_carries_ball_sided, sided_ball_neighbour_on};
 
 use analyze::{
     analyze_edge, check_blend_interference, check_blend_wall_loops, check_loop_self_crossings, check_mixed_concavity,

@@ -688,6 +688,9 @@ pub struct BlendTarget {
     pub edge_names: Vec<String>,
     /// The selected edges' ids on the target solid, parallel to `edge_points`.
     pub edge_ids: Vec<u64>,
+    /// The ids among `edge_ids` that were picked AS EDGES (not gathered from
+    /// a picked face's boundary): what the fillet's "Follow tangent" grows.
+    pub picked_edge_ids: Vec<u64>,
 }
 
 /// Resolved blend selection; callers decide how to handle cross-solid input.
@@ -862,14 +865,18 @@ pub fn resolve_blend_selection(ctx: &FeatureContext) -> Result<BlendSelection, S
     // (dedup spans the whole selection, not per-face) in a single short borrow.
     // The originating edge NAME is captured PARALLEL to each point so the grown
     // blend face can be named after the edge it came from.
-    let (edge_points, edge_names, edge_ids) = crate::with_registered_solid_str(handle, |solid| {
+    let (edge_points, edge_names, edge_ids, picked_edge_ids) = crate::with_registered_solid_str(handle, |solid| {
         let mut seen = FxHashSet::default();
+        let mut picked = Vec::new();
         let mut points = Vec::new();
         let mut names = Vec::new();
         let mut ids = Vec::new();
         for (_, entity) in &resolved {
             match entity {
                 ResolvedRef::Edge(edge_id) => {
+                    if !picked.contains(edge_id) {
+                        picked.push(*edge_id);
+                    }
                     if seen.insert(*edge_id) {
                         points.push(sample_edge_midpoint(solid, *edge_id)?);
                         names.push(edge_name_or_id(solid, *edge_id));
@@ -887,7 +894,7 @@ pub fn resolve_blend_selection(ctx: &FeatureContext) -> Result<BlendSelection, S
                 }
             }
         }
-        Ok((points, names, ids))
+        Ok((points, names, ids, picked))
     })?;
 
     Ok(BlendSelection {
@@ -897,6 +904,7 @@ pub fn resolve_blend_selection(ctx: &FeatureContext) -> Result<BlendSelection, S
             edge_points,
             edge_names,
             edge_ids,
+            picked_edge_ids,
         }),
         multi_solid: false,
         unresolved,
@@ -926,6 +934,48 @@ pub fn resolve_blend_selection(ctx: &FeatureContext) -> Result<BlendSelection, S
 /// The fillet feature reads this only after the plain selection has refused,
 /// as a one-time fallback.
 pub fn open_tangent_chain_extension(solid: &BrepSolid, selected: &[u64]) -> Result<Vec<(u64, Vec3, String)>, String> {
+    walk_tangent_chains(solid, selected, selected, false)
+}
+
+/// The fillet's "Follow tangent" option: every unselected edge on the G1
+/// tangent chains through `seeds` (the edges picked as edges), closed loops
+/// included, as `(id, midpoint sample, name)` in walk order, de-duplicated
+/// against `selected` (the whole selection, face-gathered edges included)
+/// and each other.
+///
+/// The rule is the open-chain walk's ([`open_tangent_chain_extension`])
+/// without its first-step carrier guard, which exists only for the refusal
+/// fallback: from each end vertex of each seed edge, take the single
+/// other edge whose unit tangent there continues the chain's within 1e-6 of
+/// parallel (the blend's own conjugacy bar). A walk stops at a sharp junction
+/// (no tangent continuation), at an ambiguous one (more than one tangent
+/// continuation), at an edge already taken (a selected edge, or the seed
+/// again when the chain closes). A closed single-edge loop (a circle rim)
+/// is its own whole chain and adds nothing.
+pub fn tangent_chain_expansion(
+    solid: &BrepSolid,
+    seeds: &[u64],
+    selected: &[u64],
+) -> Result<Vec<(u64, Vec3, String)>, String> {
+    walk_tangent_chains(solid, seeds, selected, true)
+}
+
+/// The one continuation a tangent walk takes from a vertex: among the
+/// candidate edges' tangents leaving it, those within 1e-6 of parallel to
+/// `onward`; `None` when there is none (a sharp junction ends the chain) or
+/// more than one (an ambiguous junction ends it too).
+pub(super) fn single_tangent_continuation(candidates: &[(u64, Vec3)], onward: Vec3) -> Option<u64> {
+    let mut tangent = candidates.iter().filter(|(_, direction)| direction.dot(onward) >= 1.0 - 1e-6);
+    let first = tangent.next()?;
+    tangent.next().is_none().then_some(first.0)
+}
+
+fn walk_tangent_chains(
+    solid: &BrepSolid,
+    seeds: &[u64],
+    selected: &[u64],
+    follow: bool,
+) -> Result<Vec<(u64, Vec3, String)>, String> {
     let tangent_at = |edge: &crate::topology::EdgeRecord, vertex: u64| -> Result<Vec3, String> {
         // The tangent pointing AWAY from `vertex`, into the edge.
         let at_start = edge.start_vertex_id == vertex;
@@ -963,9 +1013,9 @@ pub fn open_tangent_chain_extension(solid: &BrepSolid, selected: &[u64]) -> Resu
             .count()
             == 2
     };
-    let mut taken: FxHashSet<u64> = selected.iter().copied().collect();
+    let mut taken: FxHashSet<u64> = selected.iter().chain(seeds).copied().collect();
     let mut added = Vec::new();
-    for &seed in selected {
+    for &seed in seeds {
         let Some(seed_edge) = solid.edges.iter().find(|edge| edge.id == seed) else { continue };
         if seed_edge.start_vertex_id == seed_edge.end_vertex_id || seed_edge.degenerate {
             continue;
@@ -973,12 +1023,11 @@ pub fn open_tangent_chain_extension(solid: &BrepSolid, selected: &[u64]) -> Resu
         for start in [seed_edge.start_vertex_id, seed_edge.end_vertex_id] {
             let mut current = seed_edge;
             let mut vertex = start;
-            for _ in 0..128 {
+            for _ in 0..if follow { solid.edges.len().max(128) } else { 128 } {
                 // The chain's direction leaving `vertex` onward is minus the
                 // current edge's tangent away from it.
                 let onward = tangent_at(current, vertex)?.scale(-1.0);
-                let mut next = None;
-                let mut count = 0;
+                let mut candidates = Vec::new();
                 for candidate in &solid.edges {
                     if candidate.id == current.id
                         || candidate.degenerate
@@ -987,13 +1036,11 @@ pub fn open_tangent_chain_extension(solid: &BrepSolid, selected: &[u64]) -> Resu
                     {
                         continue;
                     }
-                    if tangent_at(candidate, vertex)?.dot(onward) >= 1.0 - 1e-6 {
-                        count += 1;
-                        next = Some(candidate);
-                    }
+                    candidates.push((candidate.id, tangent_at(candidate, vertex)?));
                 }
-                let Some(next) = next.filter(|_| count == 1) else { break };
-                if current.id == seed && !changes_carrier(seed, next.id) && !mere_split(vertex) {
+                let Some(next_id) = single_tangent_continuation(&candidates, onward) else { break };
+                let Some(next) = solid.edges.iter().find(|edge| edge.id == next_id) else { break };
+                if !follow && current.id == seed && !changes_carrier(seed, next.id) && !mere_split(vertex) {
                     break;
                 }
                 if !taken.insert(next.id) {
@@ -1781,23 +1828,7 @@ fn hole_group(i: usize, contains: &[Vec<bool>], depths: &[usize]) -> HoleGroup {
 
 /// Standard even-odd ray-cast point-in-polygon in the profile's UV plane.
 fn point_in_polygon_uv(point: [f64; 2], polygon: &[[f64; 2]]) -> bool {
-    let count = polygon.len();
-    if count < 3 {
-        return false;
-    }
-    let mut inside = false;
-    let mut j = count - 1;
-    for i in 0..count {
-        let pi = polygon[i];
-        let pj = polygon[j];
-        let intersects = (pi[1] > point[1]) != (pj[1] > point[1])
-            && point[0] < (pj[0] - pi[0]) * (point[1] - pi[1]) / (pj[1] - pi[1]) + pi[0];
-        if intersects {
-            inside = !inside;
-        }
-        j = i;
-    }
-    inside
+    polygon.len() >= 3 && crate::polygon::parity_inside(point, polygon.len(), |i| polygon[i])
 }
 
 /// Stamp `{id}:HOLE:{key}` on every still-unnamed face of a hole cutter — the
@@ -1845,6 +1876,23 @@ pub fn subtract_solid(body: BrepSolid, cutter: BrepSolid) -> Result<BrepSolid, K
     crate::free_registered_solid(body_handle);
     crate::free_registered_solid(cutter_handle);
     cut
+}
+
+/// Boolean-intersect `tool` with `body` with `merge_coplanar_faces` — the
+/// [`subtract_solid`] twin (register both, intersect, free both).
+pub fn intersect_solid(body: BrepSolid, tool: BrepSolid) -> Result<BrepSolid, KernelRefusal> {
+    let options = BooleanOptions {
+        merge_coplanar_faces: true,
+        ..BooleanOptions::default()
+    };
+    let body_handle = crate::register_solid_value(body);
+    let tool_handle = crate::register_solid_value(tool);
+    let common = crate::with_two_registered_solids(body_handle, tool_handle, |body, tool| {
+        crate::boolean_operation(body, tool, BooleanOperation::Intersect, &options)
+    });
+    crate::free_registered_solid(body_handle);
+    crate::free_registered_solid(tool_handle);
+    common
 }
 
 /// The straight-sweep hole cutter: the hole loop extruded into a prism that

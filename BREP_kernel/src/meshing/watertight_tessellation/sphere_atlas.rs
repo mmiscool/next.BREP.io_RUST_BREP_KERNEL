@@ -115,7 +115,7 @@ pub(super) fn tessellate_spherical_face_watertight(
     face_id: u32,
     mesh: &mut Mesh,
 ) -> Result<bool, String> {
-    if std::env::var("BREP_NO_SPHERE_CHARTS").is_ok() {
+    if env_read!("BREP_NO_SPHERE_CHARTS").is_some() {
         return Ok(false);
     }
     let Some(atlas) = SphereAtlas::of_surface(&face.surface) else {

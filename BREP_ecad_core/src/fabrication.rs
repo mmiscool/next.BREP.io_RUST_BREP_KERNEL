@@ -4,6 +4,7 @@
 //! positive Y up as both formats expect. Board coordinates are Y down, so Y is
 //! flipped here and nowhere else. All layers are viewed from the top, as Gerber
 //! requires; bottom-side footprints are already mirrored by their placement.
+use crate::csv_field;
 use crate::board::{Board, Placement, Shape};
 use crate::{Document, Point};
 use std::collections::{BTreeMap, BTreeSet};
@@ -345,15 +346,6 @@ impl Fabrication {
             placements: rows(text("-pos.csv")),
             bom_lines: rows(text("-bom.csv")),
         }
-    }
-}
-
-/// A CSV field, quoted when it holds a comma, a quote or a line break.
-fn csv_field(text: &str) -> String {
-    if text.contains([',', '"', '\n', '\r']) {
-        format!("\"{}\"", text.replace('"', "\"\""))
-    } else {
-        text.to_owned()
     }
 }
 

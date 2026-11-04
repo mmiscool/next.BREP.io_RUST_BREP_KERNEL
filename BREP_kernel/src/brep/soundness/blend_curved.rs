@@ -15,11 +15,7 @@ pub(super) type Decline = &'static str;
 pub(super) fn enabled() -> bool {
     // On by default (promoted 2026-10-16); `BREP_SOUNDNESS_BLEND_CURVED=0`
     // (any value but 1/on) restores the blend row without curved neighbours.
-    match std::env::var("BREP_SOUNDNESS_BLEND_CURVED") {
-        Ok(value) => value == "1" || value == "on",
-        Err(std::env::VarError::NotPresent) => true,
-        Err(_) => false,
-    }
+    switch!(live "BREP_SOUNDNESS_BLEND_CURVED", true)
 }
 
 // What is proved, on top of blend_patch.rs and analytic_body.rs.
@@ -86,8 +82,7 @@ const TORUS_REACH_BARS: f64 = 1e3;
 /// 98 + 144 census); `BREP_SOUNDNESS_TORUS_EMBEDDED=0` (or `off`) restores the
 /// cell proof.
 pub(super) fn torus_embedded_on() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| !matches!(std::env::var("BREP_SOUNDNESS_TORUS_EMBEDDED").as_deref(), Ok("0") | Ok("off")))
+    switch!("BREP_SOUNDNESS_TORUS_EMBEDDED", true)
 }
 
 /// A recognised ring torus.
@@ -286,8 +281,7 @@ pub(super) fn one_sided_patch(record: &FaceRecord, nets: &[Net], implicit: &Impl
 /// (promoted 2026-10-18 on the 98 + 144 census);
 /// `BREP_SOUNDNESS_ONE_SIDED_REVOLUTION=0` (or `off`) reads the cells.
 pub(super) fn one_sided_revolution_on() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| !matches!(std::env::var("BREP_SOUNDNESS_ONE_SIDED_REVOLUTION").as_deref(), Ok("0") | Ok("off")))
+    switch!("BREP_SOUNDNESS_ONE_SIDED_REVOLUTION", true)
 }
 
 /// Cheap shape checks, no cells: a face this module could read as a patch.
@@ -335,6 +329,18 @@ fn binomial(n: usize, k: usize) -> f64 {
     table[n][k]
 }
 
+/// The product weights depend only on the two Bernstein degrees. Keep
+/// their original multiply-then-divide arithmetic, once per immutable pair.
+fn product_weights(first: usize, second: usize) -> &'static [f64] {
+    static WEIGHTS: std::sync::OnceLock<Vec<std::sync::OnceLock<Vec<f64>>>> = std::sync::OnceLock::new();
+    let side = MAX_DEGREE + 1;
+    let tables = WEIGHTS.get_or_init(|| (0..side*side).map(|_| std::sync::OnceLock::new()).collect());
+    tables[first*side+second].get_or_init(|| {
+        (0..=first).flat_map(|i| (0..=second).map(move |j|
+            binomial(first, i) * binomial(second, j) / binomial(first+second, i+j))).collect()
+    })
+}
+
 /// A tensor Bernstein polynomial of degree (n, m), coefficients row-major.
 #[derive(Clone)]
 struct Poly {
@@ -351,6 +357,8 @@ impl Poly {
     fn mul(&self, o: &Poly) -> Poly {
         let (n, m) = (self.n + o.n, self.m + o.m);
         assert!(n <= MAX_DEGREE && m <= MAX_DEGREE, "screened: degree within the binomial table");
+        let weights_u = product_weights(self.n, o.n);
+        let weights_v = product_weights(self.m, o.m);
         let mut c = vec![0.; (n + 1) * (m + 1)];
         for i in 0..=self.n {
             for l in 0..=self.m {
@@ -359,9 +367,9 @@ impl Poly {
                     continue;
                 }
                 for j in 0..=o.n {
-                    let wu = binomial(self.n, i) * binomial(o.n, j) / binomial(n, i + j);
+                    let wu = weights_u[i*(o.n+1)+j];
                     for k in 0..=o.m {
-                        let wv = binomial(self.m, l) * binomial(o.m, k) / binomial(m, l + k);
+                        let wv = weights_v[l*(o.m+1)+k];
                         c[(i + j) * (m + 1) + l + k] += wu * wv * a * o.c[j * (o.m + 1) + k];
                     }
                 }
@@ -708,4 +716,5 @@ pub(super) fn net_box(net: &Net) -> (Vec3, Vec3) {
     }
     (lo, hi)
 }
+
 

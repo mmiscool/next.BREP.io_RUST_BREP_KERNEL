@@ -27,25 +27,23 @@
 //! `document_export {path: "bracket.step"}` lands as a download, where the
 //! Export dialog's would.
 //!
-//! The split with `web/webmcp.js`: everything about the tools is Rust — the
-//! list ([`tool_list`](crate::webmcp::tool_list)), the direct tier ([`DIRECT`](crate::webmcp::DIRECT), [`compact`](crate::webmcp::compact)), the
-//! invocation. The JS file only registers what the list says with whichever
-//! `modelContext` object the browser provides, and turns a reply's PNGs into
-//! blob URLs. The browser API is still moving (it was `navigator.modelContext`
-//! and `provideContext` before `document.modelContext` and `registerTool`),
-//! and that churn belongs in the one small file that names it.
+//! The page registers the server's front door (`FRONT_DOOR`): `run_script`,
+//! `script_result`, `script_halt`, `screenshot`, `input` and `files`. A program runs in
+//! a Web Worker of its own (`web/code-worker.js`, Boa in this same wasm,
+//! `src/code_worker.rs`); its `brep.<group>.<tool>()` calls come back here and
+//! run the tool set's handlers, and the page terminates the worker on a halt
+//! or the wall-clock limit — the browser's counterpart of the native
+//! worker process the server kills. Six tools also sit under every browser
+//! agent's tool-count limit (ChatGPT's browser disabled a page with the full
+//! set, 2026-10-14).
 //!
-//! Not every browser takes the whole set. Chrome's agent registers all of it;
-//! ChatGPT's browser disables a page whose "WebMCP configuration exceeds
-//! supported limits" (observed 2026-10-14 with the full set; the limit is
-//! undocumented, and published accounts land at about 22 tools with
-//! descriptions under 1,500 characters). So the page registers two tiers:
-//! [`DIRECT`](crate::webmcp::DIRECT), a small set of the everyday tools with [`compact`](crate::webmcp::compact) descriptions
-//! and schemas, and three gateway tools — `brep_tools` lists every tool,
-//! `brep_tool` returns one's full description and schema, `brep_call` invokes
-//! any of them — through which the rest is reachable, in full, with the same
-//! semantics. A page may ask for the full set instead (`web/webmcp.js`,
-//! `all: true`; `?webmcp=all`).
+//! The split with `web/webmcp.js`: everything about the tools is Rust — the
+//! list (`front_door_list`), the executions, the invocation. The JS file only
+//! registers what the list says with whichever `modelContext` object the
+//! browser provides, and turns a reply's PNGs into blob URLs. The browser API
+//! is still moving (it was `navigator.modelContext` and `provideContext`
+//! before `document.modelContext` and `registerTool`), and that churn belongs
+//! in the one small file that names it.
 //!
 //! The non-wasm half of this file is pure and compiles natively so the shape
 //! of what the page registers is under test (`tests` below, over the very
@@ -68,144 +66,70 @@ pub const SCREENSHOT: &str = "screenshot";
 pub fn compose_tools(cx: Arc<ServerContext>, slot: SessionSlot, describe: &Value) -> Vec<ToolSpec> {
     use brep_mcp_core::tools::{app, compose, session_engine_tools};
     let mut tools = session_engine_tools(slot.clone());
-    tools.extend(compose::session_tools(cx));
+    tools.extend(compose::described_session_tools(cx, Some(describe)));
     tools.extend(app::app_tools(slot.clone(), describe));
-    tools.extend(compose::pointer_tools(slot.clone()));
-    tools.extend(compose::capture_tools(slot.clone()));
-    tools.extend(compose::document_tools(slot.clone()));
-    tools.extend(compose::feature_tools(slot.clone()));
-    tools.extend(compose::registry_tools(slot));
+    tools.extend(compose::described_pointer_tools(slot.clone(), describe));
+    tools.extend(compose::described_capture_tools(slot.clone(), describe));
+    tools.extend(compose::document_tools(slot.clone(), describe));
+    tools.extend(compose::feature_tools(slot.clone(), describe));
+    tools.extend(compose::registry_tools(slot.clone()));
+    let file_handler: Arc<dyn Fn(Value) -> brep_mcp_core::tools::ToolFuture + Send + Sync> = Arc::new(move |args| {
+        let slot = slot.clone();
+        Box::pin(async move {
+            let session = app::current(&slot).await?;
+            let reply = session.host.call_ok("files", args).await?;
+            Ok(brep_mcp_core::tools::ToolOutput::json(reply.result.unwrap_or(Value::Null)))
+        })
+    });
+    tools.extend(brep_mcp_core::files::script_tools(file_handler.clone()));
+    let mut files = ToolSpec::new("files", "script", "Manage files under named documents/workspace roots in the browser store. Paths are relative; writes settle before success. Overwriting requires overwrite:true; directory copy/delete requires recursive:true. Transfer limit256KiB; list page limit256; tree entry limit1024.", brep_mcp_core::files::input_schema(), brep_mcp_core::tools::Annotations::DESTRUCTIVE, move |args| file_handler(args));
+    files.output_schema = brep_mcp_core::files::output_schema();
+    tools.push(files);
     tools
 }
 
-/// The tool list the page registers: `[{name, title, group, summary,
-/// description, inputSchema, annotations: {readOnlyHint, consequentialHint},
-/// waits}]`, one per tool of the set, in the set's order. The schemas are
-/// the tools' own (a waiting tool already carries the idle contract's `wait`
-/// / `timeout_ms` knobs); [`SCREENSHOT`] gains the page's `inline` knob.
-pub fn tool_list(set: &ToolSet) -> Value {
-    let mut out = Vec::with_capacity(set.specs.len());
-    for spec in &set.specs {
-        let mut schema = spec.input_schema.clone();
-        if spec.name == SCREENSHOT {
-            if let Some(o) = schema.as_object_mut() {
-                o.entry("properties").or_insert_with(|| json!({}));
-            }
-            if let Some(props) = schema.get_mut("properties").and_then(Value::as_object_mut) {
-                props.insert(
-                    "inline".into(),
-                    json!({ "type": "boolean", "default": false, "description": "carry the inline PNG in the reply as `data_url` (large); the page keeps the full capture as a blob URL either way" }),
-                );
-            }
-        }
-        out.push(json!({
-            "name": spec.name,
-            "title": spec.name,
-            "group": spec.group,
-            "summary": cut(&spec.doc, SUMMARY_CHARS),
-            "description": format!("[{}] {}", spec.group, spec.doc),
-            "inputSchema": schema,
-            "annotations": {
-                "readOnlyHint": spec.annotations.read_only,
-                "consequentialHint": spec.annotations.destructive,
-            },
-            "waits": spec.annotations.waits,
-        }));
+/// The page's front door, the server's (`brep_mcp_core::cad::tools::FRONT_DOOR`):
+/// the six tools an agent lists. Everything else is a function of the
+/// program `run_script` runs, `await brep.<group>.<tool>(args)`, generated
+/// from this same set (`brep_mcp_core::script_sdk`).
+pub const FRONT_DOOR: &[&str] = &["run_script", "script_result", "script_halt", SCREENSHOT, "input", "files"];
+
+/// The tool list the page registers: the [`FRONT_DOOR`], `[{name, title,
+/// description, inputSchema, annotations: {readOnlyHint, consequentialHint}}]`.
+/// [`SCREENSHOT`] is the capture tool's schema with the page's `inline` knob.
+pub fn front_door_list(set: &ToolSet) -> Value {
+    let wait = json!({ "type": "integer", "minimum": 0, "maximum": 600000, "description": "how long to wait for the result, ms (default 60000); a longer run answers its status and keeps going" });
+    let mut shot = set.specs.iter().find(|t| t.name == SCREENSHOT).map(|t| t.input_schema.clone()).unwrap_or_else(|| json!({ "type": "object" }));
+    if let Some(o) = shot.as_object_mut() {
+        o.entry("properties").or_insert_with(|| json!({}));
     }
-    Value::Array(out)
-}
-
-/// The everyday tools a page registers directly, compacted: inspect, learn
-/// the features and their schemas, add and edit features, undo, pick by
-/// name, look. Everything else is reached through the gateway tools. Each
-/// name is a tool of the set (the test below holds the list to that).
-pub const DIRECT: &[&str] = &[
-    "frame_info",
-    "doc_new",
-    "history_listing",
-    "feature_catalogue",
-    "feature_schema",
-    "feature_add",
-    "feature_params",
-    "feature_set_params",
-    "feature_delete",
-    "undo",
-    "redo",
-    "scene_entities",
-    "selection",
-    "selection_set",
-    "click_entity",
-    "mass_properties",
-    "zoom_to_fit",
-    "standard_view",
-    SCREENSHOT,
-];
-
-/// How much of a doc string a direct tool's description keeps, and a
-/// gateway listing's summary. Cuts land on a sentence end where one falls
-/// inside the budget, so a description reads whole.
-pub const DESCRIPTION_CHARS: usize = 480;
-pub const SUMMARY_CHARS: usize = 140;
-/// The cap on a compacted schema's per-property description.
-pub const PROPERTY_CHARS: usize = 160;
-
-/// `text` within `max` characters: whole when it fits, otherwise cut at the
-/// last sentence end inside the budget, or at the budget with an ellipsis.
-pub fn cut(text: &str, max: usize) -> String {
-    let text = text.trim();
-    if text.chars().count() <= max {
-        return text.to_string();
+    if let Some(props) = shot.get_mut("properties").and_then(Value::as_object_mut) {
+        props.insert(
+            "inline".into(),
+            json!({ "type": "boolean", "default": false, "description": "carry the inline PNG in the reply as `data_url` (large); the page keeps the full capture as a blob URL either way" }),
+        );
     }
-    let head: String = text.chars().take(max).collect();
-    if let Some(end) = head.rfind(". ").or_else(|| head.rfind(".\n")) {
-        if end > max / 3 {
-            return head[..=end].to_string();
-        }
-    }
-    let mut cut: String = head.chars().take(max.saturating_sub(1)).collect();
-    cut.push('…');
-    cut
-}
-
-/// A direct tool as the page registers it: the description cut to
-/// [`DESCRIPTION_CHARS`], the schema without its `$schema` and `title`,
-/// `additionalProperties: false` at the top (ChatGPT's browser requires
-/// it), and each property's description cut to [`PROPERTY_CHARS`]. The
-/// full form stays reachable through `brep_tool`.
-pub fn compact(tool: &Value) -> Value {
-    let mut schema = tool["inputSchema"].clone();
-    if let Some(o) = schema.as_object_mut() {
-        o.remove("$schema");
-        o.remove("title");
-        o.insert("additionalProperties".into(), json!(false));
-        if let Some(props) = o.get_mut("properties").and_then(Value::as_object_mut) {
-            for prop in props.values_mut() {
-                if let Some(d) = prop.get("description").and_then(Value::as_str).map(|d| cut(d, PROPERTY_CHARS)) {
-                    prop["description"] = json!(d);
-                }
-            }
-        }
-    }
-    json!({
-        "name": tool["name"],
-        "title": tool["title"],
-        "description": cut(tool["description"].as_str().unwrap_or(""), DESCRIPTION_CHARS),
-        "inputSchema": schema,
-        "annotations": tool["annotations"],
-    })
-}
-
-/// The direct tier: [`DIRECT`] in order, each [`compact`]ed.
-pub fn direct_list(set: &ToolSet) -> Value {
-    let all = tool_list(set);
-    let all = all.as_array().cloned().unwrap_or_default();
-    Value::Array(
-        DIRECT
-            .iter()
-            .filter_map(|name| all.iter().find(|t| t["name"] == *name))
-            .map(compact)
-            .collect(),
-    )
+    let tool = |name: &str, description: &str, schema: Value, read_only: bool| {
+        json!({ "name": name, "title": name, "description": description, "inputSchema": schema, "annotations": { "readOnlyHint": read_only, "consequentialHint": !read_only } })
+    };
+    json!([
+        tool(
+            "run_script",
+            "Run a JavaScript program on the CAD app in this page: `export default async function main()` returning JSON. Every app tool is a script function, `await brep.<group>.<tool>(args)` (import { brep } from \"@brep/cad\"). It runs in a Web Worker the page halts on request. Waits up to wait_ms for the result; a longer run answers its executionId and status and keeps going (script_result, script_halt). JavaScript only: TypeScript and the cad.* operation client run in the native app and brep-mcp.",
+            json!({ "type": "object", "properties": { "source": { "type": "string", "minLength": 1, "maxLength": 262144 }, "language": { "enum": ["javascript"], "default": "javascript" }, "wait_ms": wait, "key": { "type": "string", "minLength": 1, "maxLength": 128, "description": "a retry key of your choosing: the same key with the same program answers the SAME execution" } }, "required": ["source"], "additionalProperties": false }),
+            false,
+        ),
+        tool("script_result", "A script's result once it has finished (waiting up to wait_ms, default 0), else its status.", json!({ "type": "object", "properties": { "executionId": { "type": "string" }, "wait_ms": wait }, "required": ["executionId"], "additionalProperties": false }), true),
+        tool("script_halt", "Halt a running script now: its Web Worker is terminated wherever it is. App commands it had already sent run on.", json!({ "type": "object", "properties": { "executionId": { "type": "string" } }, "required": ["executionId"], "additionalProperties": false }), false),
+        tool(SCREENSHOT, "A PNG of the app as it is now (region: full | viewport | {x,y,w,h}, egui points). Optional save_as writes a file.", shot, false),
+        tool(
+            "input",
+            "Inject mouse and keyboard input into the app: `steps`, each `{tool, args}` with tool one of the pointer/keyboard tools (click, drag, hotkey, type_text, key, text, pointer_move, pointer_down, pointer_up, wheel, click_entity, drag_entity, modifiers_set, paste, click_gap, pointer_gone), run in order. Answers each step's result; stops at the first that fails.",
+            json!({ "type": "object", "properties": { "steps": { "type": "array", "maxItems": 256, "items": { "type": "object", "properties": { "tool": { "type": "string" }, "args": { "type": "object" } }, "required": ["tool"], "additionalProperties": false } } }, "required": ["steps"], "additionalProperties": false }),
+            false,
+        ),
+        tool("files", "Bounded file management under named roots in this page's persistent store: list/stat/read/write/mkdir/copy/move/delete. Read-only operations do not mutate; replacement requires overwrite:true and directory copy/delete requires recursive:true.", brep_mcp_core::files::input_schema(), false),
+    ])
 }
 
 /// Take the page's own `inline` knob out of a [`SCREENSHOT`] call's
@@ -226,7 +150,7 @@ pub use web::*;
 #[cfg(target_arch = "wasm32")]
 mod web {
     use super::*;
-    use crate::automation::command::{describe, Envelope as AppEnvelope, Reply as AppReply};
+    use crate::automation::command::{describe, Envelope as AppEnvelope};
     use crate::automation::queue::AutomationQueue;
     use brep_mcp_core::host::{Backend, HostInfo, HostRequest, KeptShot, Platform, PlatformFuture, Reply};
     use brep_mcp_core::tools::compose::attach_session;
@@ -327,7 +251,7 @@ mod web {
         let started = now_ms();
         loop {
             match rx.try_recv() {
-                Ok(reply) => return convert(reply),
+                Ok(reply) => return reply.into_host(),
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => return Reply::err(id, q.frame(), "the app dropped the command"),
                 Err(std::sync::mpsc::TryRecvError::Empty) => {
                     if q.is_poisoned() {
@@ -339,17 +263,6 @@ mod web {
                     sleep(16).await;
                 }
             }
-        }
-    }
-
-    /// The app's reply in the host protocol's shape — the same conversion
-    /// the window embed makes.
-    fn convert(mut r: AppReply) -> Reply {
-        let blob = r.blob.take();
-        let (id, frame) = (r.id, r.frame);
-        match serde_json::to_value(&r).map_err(|e| e.to_string()).and_then(|v| Reply::from_app(v, blob)) {
-            Ok(reply) => reply,
-            Err(e) => Reply::err(id, frame, e),
         }
     }
 
@@ -550,22 +463,13 @@ mod web {
         JsValue::from_str(&e)
     }
 
-    /// The tool list as JSON text (see [`tool_list`]); resolves once the
-    /// session has attached.
+    /// The tool list as JSON text (see [`front_door_list`]); resolves once
+    /// the session has attached.
     #[wasm_bindgen]
     pub fn webmcp_tools() -> js_sys::Promise {
         future_to_promise(async move {
             let set = tools().await.map_err(js_err)?;
-            Ok(JsValue::from_str(&tool_list(&set).to_string()))
-        })
-    }
-
-    /// The direct tier as JSON text (see [`direct_list`]).
-    #[wasm_bindgen]
-    pub fn webmcp_direct() -> js_sys::Promise {
-        future_to_promise(async move {
-            let set = tools().await.map_err(js_err)?;
-            Ok(JsValue::from_str(&direct_list(&set).to_string()))
+            Ok(JsValue::from_str(&front_door_list(&set).to_string()))
         })
     }
 
@@ -586,11 +490,332 @@ mod web {
 
     async fn invoke(name: &str, args: JsValue) -> Result<JsValue, String> {
         let set = tools().await?;
-        let spec = set.get(name).ok_or_else(|| format!("unknown tool `{name}`"))?;
         let mut args = js_to_value(&args)?;
+        if FRONT_DOOR.contains(&name) { brep_mcp_core::script_sdk::validate_front_door(name, &args)?; }
         let inline = take_inline(name, &mut args);
-        let out = (spec.handler)(args).await?;
+        let out = match name {
+            "run_script" => ToolOutput::json(run_script(&set, &args).await),
+            "script_result" => {
+                let id = args.get("executionId").and_then(Value::as_str).unwrap_or_default().to_string();
+                ToolOutput::json(settle(&id, args.get("wait_ms").and_then(Value::as_u64).unwrap_or(0)).await)
+            }
+            "script_halt" => ToolOutput::json(halt(args.get("executionId").and_then(Value::as_str).unwrap_or_default())),
+            "files" => {
+                let spec = set.get("files").ok_or("no files tool")?;
+                (spec.handler)(args).await?
+            }
+            SCREENSHOT => {
+                let spec = set.specs.iter().find(|t| t.name == SCREENSHOT).ok_or("no capture tool")?;
+                (spec.handler)(args).await?
+            }
+            "input" => {
+                let mut results = Vec::new();
+                for step in args.get("steps").and_then(Value::as_array).cloned().unwrap_or_default() {
+                    let tool = step.get("tool").and_then(Value::as_str).unwrap_or_default().to_string();
+                    let spec = set.get(&tool).filter(|s| matches!(s.group, "pointer" | "keyboard")).ok_or_else(|| format!("`{tool}` is not a pointer or keyboard tool"))?;
+                    let out = (spec.handler)(step.get("args").cloned().unwrap_or(json!({}))).await.map_err(|e| format!("{tool}: {e}"))?;
+                    results.push(json!({ "tool": tool, "result": out.json }));
+                }
+                ToolOutput::json(json!({ "steps": results }))
+            }
+            other => {
+                let hint = set
+                    .get(other)
+                    .filter(|t| brep_mcp_core::script_sdk::script_callable(t.group, &t.name))
+                    .map(|t| format!("call it from run_script as `await brep.{}.{}(args)`", brep_mcp_core::script_sdk::ident(t.group), brep_mcp_core::script_sdk::method_name(t.group, &t.name)))
+                    .unwrap_or_else(|| "it is not a tool of this page".into());
+                return Err(format!("`{other}` is not a front-door tool: {hint}"));
+            }
+        };
         to_js(out, inline)
+    }
+
+    // ---- run_script in the browser: one Web Worker per execution ----------
+
+    /// The limits a browser execution runs under: the native defaults that a
+    /// page can enforce (wall clock, sizes, outstanding host calls) — the
+    /// worker is terminated at the wall. CPU time and heap are not measurable
+    /// in a page; the native runner's limits for them do not apply here.
+    const WALL_MS: i32 = 15 * 60 * 1000;
+    const SOURCE_BYTES: usize = 256 << 10;
+    const OUTSTANDING_CALLS: u32 = 8;
+    const LOG_BYTES: usize = 64 << 10;
+    const RESULT_BYTES: usize = 64 << 10;
+    /// Finished executions kept for `script_result`, newest last.
+    const RETAINED: usize = 64;
+
+    struct WebExec {
+        id: String,
+        worker: web_sys::Worker,
+        source: String,
+        key: Option<String>,
+        state: &'static str,
+        result: Option<Value>,
+        logs: Vec<String>,
+        log_bytes: usize,
+        outstanding: u32,
+        timer: i32,
+        // Held for the worker's life; dropped only once another execution
+        // evicts this one (never from inside their own invocation).
+        _onmessage: Closure<dyn FnMut(web_sys::MessageEvent)>,
+        _wall: Closure<dyn FnMut()>,
+    }
+
+    thread_local! {
+        static EXECS: RefCell<Vec<WebExec>> = const { RefCell::new(Vec::new()) };
+        static NEXT_EXEC: Cell<u64> = const { Cell::new(0) };
+    }
+
+    fn fail(code: &str, message: impl Into<String>) -> Value {
+        json!({ "ok": false, "error": { "code": code, "message": message.into() } })
+    }
+
+    async fn run_script(set: &Arc<ToolSet>, args: &Value) -> Value {
+        let source = args.get("source").and_then(Value::as_str).unwrap_or_default().to_string();
+        if args.get("language").and_then(Value::as_str).is_some_and(|l| l != "javascript") {
+            return fail("compile_failed", "the browser runs JavaScript: TypeScript is type-checked and run by the native app and brep-mcp");
+        }
+        if source.len() > SOURCE_BYTES {
+            return fail("resource_limit", format!("source is larger than {SOURCE_BYTES} bytes"));
+        }
+        let key = args.get("key").and_then(Value::as_str).map(str::to_string);
+        // A retry key: the same program answers the execution it started.
+        let known = key.as_ref().and_then(|k| EXECS.with(|e| e.borrow().iter().find(|x| x.key.as_ref() == Some(k)).map(|x| (x.id.clone(), x.source == source))));
+        let id = match known {
+            Some((_, false)) => return fail("idempotency_conflict", "this key was used for a different program"),
+            Some((id, true)) => id,
+            None => match start(set, source, key) {
+                Ok(id) => id,
+                Err(e) => return fail("internal_error", e),
+            },
+        };
+        settle(&id, args.get("wait_ms").and_then(Value::as_u64).unwrap_or(60_000).min(600_000)).await
+    }
+
+    fn start(set: &Arc<ToolSet>, source: String, key: Option<String>) -> Result<String, String> {
+        if EXECS.with(|e| e.borrow().iter().filter(|x| x.result.is_none()).count()) >= 2 {
+            return Err("too many scripts are running; wait for a result or halt a script".into());
+        }
+        if EXECS.with(|e| { let xs = e.borrow(); xs.len() >= RETAINED && !xs.iter().any(|x| x.result.is_some() && x.key.is_none()) }) {
+            return Err("execution retention is full; retry keys are preserved until the page reloads".into());
+        }
+        let n = NEXT_EXEC.with(|c| {
+            c.set(c.get() + 1);
+            c.get()
+        });
+        let id = format!("exec_web_{n}");
+        let options = web_sys::WorkerOptions::new();
+        options.set_type(web_sys::WorkerType::Module);
+        let worker = web_sys::Worker::new_with_options("./code-worker.js", &options).map_err(|e| format!("the code worker did not start: {e:?}"))?;
+        let exec_id = id.clone();
+        let onmessage = Closure::wrap(Box::new(move |event: web_sys::MessageEvent| {
+            if let Some(text) = event.data().as_string() {
+                from_worker(&exec_id, &text);
+            }
+        }) as Box<dyn FnMut(web_sys::MessageEvent)>);
+        worker.set_onmessage(Some(onmessage.as_ref().unchecked_ref()));
+        let exec_id = id.clone();
+        let wall = Closure::wrap(Box::new(move || {
+            finish(&exec_id, "failed", None, Some(json!({ "code": "resource_limit", "message": format!("the program ran past its {} ms wall-clock limit and was stopped", WALL_MS) })));
+        }) as Box<dyn FnMut()>);
+        let timer = web_sys::window()
+            .and_then(|w| w.set_timeout_with_callback_and_timeout_and_arguments_0(wall.as_ref().unchecked_ref(), WALL_MS).ok())
+            .unwrap_or(0);
+        let module = brep_mcp_core::script_sdk::browser_module(&brep_mcp_core::script_sdk::script_tools(&set.specs));
+        let first = json!({ "source": source, "sdk": module, "manifest": "{}" }).to_string();
+        // The page's own compiled module first: the worker instantiates it
+        // instead of fetching and compiling the app's wasm again.
+        worker.post_message(&wasm_bindgen::module()).map_err(|e| format!("the code worker refused the module: {e:?}"))?;
+        worker.post_message(&JsValue::from_str(&first)).map_err(|e| format!("the code worker refused its program: {e:?}"))?;
+        EXECS.with(|e| {
+            let mut execs = e.borrow_mut();
+            while execs.len() >= RETAINED {
+                match execs.iter().position(|x| x.result.is_some() && x.key.is_none()) {
+                    Some(i) => drop(execs.remove(i)),
+                    None => break,
+                }
+            }
+            execs.push(WebExec { id: id.clone(), worker, source, key, state: "running", result: None, logs: Vec::new(), log_bytes: 0, outstanding: 0, timer, _onmessage: onmessage, _wall: wall });
+        });
+        Ok(id)
+    }
+
+    /// One protocol message from execution `id`'s worker.
+    fn from_worker(id: &str, text: &str) {
+        let Ok(msg) = serde_json::from_str::<Value>(text) else { return };
+        if let Some(line) = msg.get("log").and_then(Value::as_str) {
+            EXECS.with(|e| {
+                if let Some(x) = e.borrow_mut().iter_mut().find(|x| x.id == id) {
+                    if x.log_bytes + line.len() <= LOG_BYTES {
+                        x.log_bytes += line.len();
+                        x.logs.push(line.to_string());
+                    }
+                }
+            });
+        } else if let Some(done) = msg.get("done") {
+            let output = done.get("ok").cloned();
+            let mut error = done.get("error").cloned();
+            let mut state = if output.is_some() { "succeeded" } else { "failed" };
+            if output.as_ref().is_some_and(|o| o.to_string().len() > RESULT_BYTES) {
+                state = "failed";
+                error = Some(json!({ "code": "resource_limit", "message": format!("main's result is larger than {RESULT_BYTES} bytes") }));
+            }
+            finish(id, state, if state == "succeeded" { output } else { None }, error);
+        } else if let (Some(call), Some(method), Some(body)) = (msg.get("call").and_then(Value::as_u64), msg.get("method").and_then(Value::as_str), msg.get("body").and_then(Value::as_str)) {
+            let admitted = EXECS.with(|e| {
+                let mut execs = e.borrow_mut();
+                let x = execs.iter_mut().find(|x| x.id == id && x.result.is_none())?;
+                (x.outstanding < OUTSTANDING_CALLS).then(|| {
+                    x.outstanding += 1;
+                })
+            });
+            let (id, method, body) = (id.to_string(), method.to_string(), body.to_string());
+            spawn_local(async move {
+                let response = if admitted.is_some() {
+                    host_call(&method, &body).await
+                } else {
+                    fail("resource_limit", format!("more than {OUTSTANDING_CALLS} host calls outstanding"))
+                };
+                EXECS.with(|e| {
+                    let mut execs = e.borrow_mut();
+                    if let Some(x) = execs.iter_mut().find(|x| x.id == id) {
+                        if admitted.is_some() {
+                            x.outstanding -= 1;
+                        }
+                        if x.result.is_none() {
+                            let reply = json!({ "reply": call, "body": response.to_string() }).to_string();
+                            let _ = x.worker.post_message(&JsValue::from_str(&reply));
+                        }
+                    }
+                });
+            });
+        }
+    }
+
+    /// A program's bridge call: `tool.<name>` runs that script-callable
+    /// tool's handler, answered as the service's `Response`.
+    async fn host_call(method: &str, body: &str) -> Value {
+        let Some(name) = method.strip_prefix("tool.") else {
+            return fail("method_unknown", format!("`{method}`: the cad.* operation service runs in the native app and brep-mcp; in the browser use brep.<group>.<tool>()"));
+        };
+        let set = match tools().await {
+            Ok(set) => set,
+            Err(e) => return fail("host_stopped", e),
+        };
+        let Some(spec) = set.specs.iter().find(|t| t.name == name && brep_mcp_core::script_sdk::script_callable(t.group, &t.name)) else {
+            return fail("method_unknown", format!("no script function for tool `{name}`"));
+        };
+        let args: Value = serde_json::from_str(body).unwrap_or(json!({}));
+        match (spec.handler)(args).await {
+            Ok(out) => {
+                let mut value = out.json;
+                if !out.images.is_empty() {
+                    let images: Vec<Value> = out.images.iter().map(|i| json!({ "mediaType": i.mime, "dataUrl": format!("data:{};base64,{}", i.mime, base64(&i.png)) })).collect();
+                    match value.as_object_mut() {
+                        Some(o) => {
+                            o.insert("images".into(), Value::Array(images));
+                        }
+                        None => value = json!({ "value": value, "images": images }),
+                    }
+                }
+                json!({ "ok": true, "value": value })
+            }
+            Err(e) => fail("evaluation_failed", e),
+        }
+    }
+
+    /// End execution `id`: terminate its worker, stop its wall timer, keep
+    /// its result. A second end (the wall after a halt) changes nothing.
+    fn finish(id: &str, state: &'static str, output: Option<Value>, error: Option<Value>) {
+        EXECS.with(|e| {
+            let mut execs = e.borrow_mut();
+            let Some(x) = execs.iter_mut().find(|x| x.id == id && x.result.is_none()) else { return };
+            x.worker.terminate();
+            if let Some(w) = web_sys::window() {
+                w.clear_timeout_with_handle(x.timer);
+            }
+            x.state = state;
+            let error = error.map(|mut e| {
+                e["executionId"] = json!(id);
+                e
+            });
+            x.result = Some(json!({
+                "executionId": id,
+                "state": state,
+                "typeChecking": "not_applicable",
+                "output": output,
+                "error": error,
+                "operations": [],
+                "logText": x.logs.join("\n"),
+            }));
+        });
+    }
+
+    /// `script_halt`: terminate the worker now.
+    fn halt(id: &str) -> Value {
+        let known = EXECS.with(|e| e.borrow().iter().any(|x| x.id == id));
+        if !known {
+            return fail("execution_unknown", "no retained execution has that id");
+        }
+        finish(id, "cancelled", None, Some(json!({ "code": "cancelled", "message": "halted by script_halt" })));
+        status(id)
+    }
+
+    fn status(id: &str) -> Value {
+        EXECS.with(|e| match e.borrow().iter().find(|x| x.id == id) {
+            Some(x) => match &x.result {
+                Some(r) => json!({ "ok": true, "value": r }),
+                None => json!({ "ok": true, "value": { "running": true, "status": { "executionId": id, "state": x.state } } }),
+            },
+            None => fail("execution_unknown", "no retained execution has that id"),
+        })
+    }
+
+    /// The JavaScript editor's runner in the browser: the page's own
+    /// executions, the same Web Worker runner and `brep.*` functions an
+    /// agent's `run_script` gets.
+    pub struct PageScripts;
+
+    impl crate::javascript::ScriptHost for PageScripts {
+        fn ready(&self) -> Result<bool, String> {
+            if let Some(why) = FAILED.with(|f| f.borrow().clone()) {
+                return Err(why);
+            }
+            if !ATTACHED.with(|a| a.get()) {
+                return Err("the page's tool host has not started".into());
+            }
+            Ok(TOOLS.with(|t| t.borrow().is_some()))
+        }
+        fn run(&self, source: &str) -> Result<String, String> {
+            let set = TOOLS.with(|t| t.borrow().clone()).ok_or("the page's tools are not attached yet")?;
+            if source.len() > SOURCE_BYTES {
+                return Err(format!("source is larger than {SOURCE_BYTES} bytes"));
+            }
+            start(&set, source.to_string(), None)
+        }
+        fn result(&self, id: &str) -> Result<Option<Value>, String> {
+            let s = status(id);
+            if s["ok"] != true {
+                return Err(s["error"]["message"].as_str().unwrap_or("unknown execution").to_string());
+            }
+            Ok((s["value"]["running"] != true).then(|| s["value"].clone()))
+        }
+        fn halt(&self, id: &str) -> Result<(), String> {
+            let r = halt(id);
+            if r["ok"] == true { Ok(()) } else { Err(r["error"]["message"].as_str().unwrap_or("unknown execution").to_string()) }
+        }
+    }
+
+    /// The result once it has ended (waiting up to `wait_ms`), else its status.
+    async fn settle(id: &str, wait_ms: u64) -> Value {
+        let deadline = js_sys::Date::now() + wait_ms as f64;
+        loop {
+            let s = status(id);
+            if s["ok"] != true || s["value"]["running"] != true || js_sys::Date::now() >= deadline {
+                return s;
+            }
+            sleep(25).await;
+        }
     }
 
     /// A JS value (an object, `null` or `undefined`) as the tool's
@@ -627,17 +852,8 @@ mod web {
 
     /// Standard base64: a data URL's payload, a binary file's content.
     fn base64(bytes: &[u8]) -> String {
-        const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-        let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
-        for chunk in bytes.chunks(3) {
-            let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
-            let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
-            out.push(TABLE[(n >> 18) as usize & 63] as char);
-            out.push(TABLE[(n >> 12) as usize & 63] as char);
-            out.push(if chunk.len() > 1 { TABLE[(n >> 6) as usize & 63] as char } else { '=' });
-            out.push(if chunk.len() > 2 { TABLE[n as usize & 63] as char } else { '=' });
-        }
-        out
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD.encode(bytes)
     }
 }
 

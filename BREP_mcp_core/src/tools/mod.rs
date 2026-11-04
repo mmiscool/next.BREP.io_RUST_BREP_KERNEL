@@ -55,6 +55,7 @@ pub struct ToolSpec {
     pub group: &'static str,
     pub doc: String,
     pub input_schema: Value,
+    pub output_schema: Value,
     pub annotations: Annotations,
     pub handler: Arc<dyn Fn(Value) -> ToolFuture + Send + Sync>,
 }
@@ -73,6 +74,7 @@ impl ToolSpec {
             group,
             doc: doc.into(),
             input_schema,
+            output_schema: serde_json::json!({"type":"object", "additionalProperties":true}),
             annotations,
             handler: Arc::new(handler),
         }
@@ -127,10 +129,26 @@ fn arg_str(args: &Value, key: &str) -> Result<String, String> {
         .ok_or_else(|| format!("missing string argument `{key}`"))
 }
 
+// These MCP wrappers summarize/convert the app's raw feature descriptors;
+// their replies are not plugin_feature_catalogue/plugin_feature_schema replies.
+fn feature_catalogue_output_schema() -> Value {
+    let text=json!({"type":"string"});
+    object_schema(json!({"features":{"type":"array","items":object_schema(json!({
+        "type":text,"shortName":text,"longName":text,"displayBuilder":{"type":"boolean"}
+    }), &["type","shortName","longName","displayBuilder"])}}), &["features"])
+}
+fn feature_schema_output_schema() -> Value {
+    let dictionary=json!({"type":"object","additionalProperties":true});
+    object_schema(json!({"type":{"type":"string"},"longName":{"type":"string"},
+        "schema":dictionary,"defaults":dictionary,
+        "persistentData":dictionary,"persistentDataExample":dictionary
+    }), &["type","longName","schema","defaults"])
+}
+
 /// Tools that need no app session: they read the kernel's feature catalogue
 /// directly. Everything else arrives through the app's command registry.
 pub fn engine_tools() -> Vec<ToolSpec> {
-    vec![
+    let mut tools = vec![
         ToolSpec::new(
             "feature_catalogue",
             "features",
@@ -187,7 +205,15 @@ pub fn engine_tools() -> Vec<ToolSpec> {
                 })
             },
         ),
-    ]
+    ];
+    for tool in &mut tools {
+        match tool.name.as_str() {
+            "feature_catalogue" => tool.output_schema = feature_catalogue_output_schema(),
+            "feature_schema" => tool.output_schema = feature_schema_output_schema(),
+            _ => {}
+        }
+    }
+    tools
 }
 
 /// Resolve a custom schema from the active document without polluting the

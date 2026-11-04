@@ -134,7 +134,6 @@ const LAW_SAMPLES: usize = 1024;
 const RELIEF_DEFAULT: bool = true;
 
 thread_local! {
-    static RELIEF_FOR_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
     /// Set while a relief builds, so the constant builds it makes do not
     /// relieve again.
     static RELIEVING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -156,14 +155,7 @@ pub(crate) fn tapered_flush_join_on() -> bool {
 }
 
 fn relief_switch() -> bool {
-    if let Some(forced) = RELIEF_FOR_TEST.with(|forced| forced.get()) {
-        return forced;
-    }
-    match std::env::var("BREP_BLEND_RADIUS_RELIEF").as_deref() {
-        Ok("0") | Ok("off") => false,
-        Ok("1") | Ok("on") => true,
-        _ => RELIEF_DEFAULT,
-    }
+    switch!(live "BREP_BLEND_RADIUS_RELIEF", RELIEF_DEFAULT)
 }
 
 
@@ -195,11 +187,11 @@ impl Drop for Relieving {
 
 /// `BREP_DEBUG_RELIEF=1`: every ceiling probe's reading.
 fn trace_on() -> bool {
-    std::env::var("BREP_DEBUG_RELIEF").is_ok()
+    debug_flag!(live "BREP_DEBUG_RELIEF")
 }
 
 fn debug_on() -> bool {
-    std::env::var("BREP_DEBUG_NETWORK").is_ok()
+    debug_flag!(live "BREP_DEBUG_NETWORK")
 }
 
 /// One edge's ceilings: `(edge fraction, largest ball that fits)` at the

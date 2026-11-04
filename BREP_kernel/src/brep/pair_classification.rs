@@ -26,11 +26,7 @@ pub struct SurfacePairClassification {
     pub tangential_only: bool,
 }
 
-#[derive(Clone, Copy)]
-struct Bounds {
-    low: Vec3,
-    high: Vec3,
-}
+use crate::spatial::Aabb as Bounds;
 
 fn same_surface(first: &NurbsSurface, second: &NurbsSurface, tolerance: f64) -> bool {
     first.degree_u == second.degree_u
@@ -85,48 +81,7 @@ fn planar_support(surface: &NurbsSurface, tolerance: f64) -> Result<Option<(Vec3
         .then_some((origin, normal)))
 }
 
-impl Bounds {
-    fn of(surface: &NurbsSurface) -> Result<Self, String> {
-        let mut low = Vec3::new(f64::INFINITY, f64::INFINITY, f64::INFINITY);
-        let mut high = Vec3::new(f64::NEG_INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY);
-        for control in surface.control_points.iter().flatten() {
-            let point = control.point()?;
-            low.x = low.x.min(point.x);
-            low.y = low.y.min(point.y);
-            low.z = low.z.min(point.z);
-            high.x = high.x.max(point.x);
-            high.y = high.y.max(point.y);
-            high.z = high.z.max(point.z);
-        }
-        Ok(Self { low, high })
-    }
 
-    fn separation(self, other: Self) -> f64 {
-        let axis_gap = |a0: f64, a1: f64, b0: f64, b1: f64| {
-            if a1 < b0 {
-                b0 - a1
-            } else if b1 < a0 {
-                a0 - b1
-            } else {
-                0.0
-            }
-        };
-        Vec3::new(
-            axis_gap(self.low.x, self.high.x, other.low.x, other.high.x),
-            axis_gap(self.low.y, self.high.y, other.low.y, other.high.y),
-            axis_gap(self.low.z, self.high.z, other.low.z, other.high.z),
-        )
-        .length()
-    }
-
-    fn scale(self, other: Self) -> f64 {
-        self.high
-            .sub(self.low)
-            .length()
-            .max(other.high.sub(other.low).length())
-            .max(1.0)
-    }
-}
 
 fn surface_samples(surface: &NurbsSurface) -> Result<Vec<(f64, f64, Vec3)>, String> {
     let u = surface.domain_u()?;
@@ -195,7 +150,7 @@ impl SurfaceClassifyData {
             .map(|(u, v, point)| (u, v, point, surface.normal(u, v).ok()))
             .collect();
         Ok(Self {
-            bounds: Bounds::of(surface)?,
+            bounds: Bounds::from_surface_controls(surface)?,
             planar: planar_support(surface, model_tolerance)?,
             samples,
         })
@@ -236,7 +191,7 @@ pub fn classify_surface_pair_cached(
     let first_bounds = first_data.bounds;
     let second_bounds = second_data.bounds;
     let hull_separation = first_bounds.separation(second_bounds);
-    let scale = first_bounds.scale(second_bounds);
+    let scale = first_bounds.pair_scale(second_bounds);
     let contact = (model_tolerance * 100.0).max(scale * 1e-7);
     if hull_separation > contact {
         return Ok(SurfacePairClassification {

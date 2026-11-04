@@ -22,9 +22,7 @@ fn triple(value: &Value) -> Option<[f64; 3]> {
     Some([array.first()?.as_f64()?, array.get(1)?.as_f64()?, array.get(2)?.as_f64()?])
 }
 
-fn dot(a: [f64; 3], b: [f64; 3]) -> f64 {
-    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
-}
+use crate::geometry3d::dot3 as dot;
 
 /// A unit vector perpendicular to `n`.
 fn perpendicular(n: [f64; 3]) -> [f64; 3] {

@@ -109,13 +109,9 @@ fn iso_basis() -> Basis {
     (right, up, back)
 }
 
-fn cross(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
-    [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]]
-}
+use crate::geometry3d::cross3 as cross;
 
-fn dot(a: [f64; 3], b: [f64; 3]) -> f64 {
-    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
-}
+use crate::geometry3d::dot3 as dot;
 
 fn normalize(v: [f64; 3]) -> [f64; 3] {
     let n = dot(v, v).sqrt();
@@ -326,15 +322,7 @@ fn draw_segment(depth: &mut [f32], color: &mut [[f32; 4]], w: usize, p: [f64; 3]
 
 /// 8-bit RGBA PNG, no ancillary chunks.
 fn encode_png(rgba: &[u8], width: u32, height: u32) -> Result<Vec<u8>, String> {
-    let mut out = Vec::new();
-    {
-        let mut encoder = png::Encoder::new(&mut out, width, height);
-        encoder.set_color(png::ColorType::Rgba);
-        encoder.set_depth(png::BitDepth::Eight);
-        let mut writer = encoder.write_header().map_err(|error| format!("png header: {error}"))?;
-        writer.write_image_data(rgba).map_err(|error| format!("png data: {error}"))?;
-    }
-    Ok(out)
+    brep_gizmos::raster::encode_png(rgba, width, height, png::ColorType::Rgba)
 }
 
 /// Portable preview carried by native CAD JSON. The image has no external URL.

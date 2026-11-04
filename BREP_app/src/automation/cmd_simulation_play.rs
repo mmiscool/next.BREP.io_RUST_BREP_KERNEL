@@ -3,7 +3,7 @@
 //! is baked once (its frames solved in order through the kernel, time-sliced
 //! inside the app's frames) and every command reads the same baked frames;
 //! nothing is written to the document.
-use crate::automation::command::{parse_args, schema_of, Annotations, CommandSpec, Ctx, Empty, Handler, NoArgs, Outcome, Phase};
+use crate::automation::command::{app_command, parse_args, CommandSpec, Ctx, NoArgs, Outcome};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -151,12 +151,67 @@ fn simulation_publish(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String>
     Ok(Outcome::Done(json!({ "study": study, "frames": frames })))
 }
 
+fn playback_object(properties: Value) -> Value {
+    let required: Vec<_> = properties.as_object().unwrap().keys().cloned().collect();
+    json!({"type":"object","properties":properties,"required":required})
+}
+fn simulation_publish_result_schema() -> Value {
+    playback_object(json!({"study":{"type":"string"},"frames":{"type":"integer","minimum":0}}))
+}
+
+fn simulation_export_result_schema() -> Value {
+    let mut variants = Vec::new();
+    for format in ["gif", "mp4", "html"] {
+        for destination in ["path", "base64"] {
+            let mut properties = json!({
+                "study":{"type":"string"},"format":{"const":format},
+                "fps":{"type":"integer","minimum":0},"frames":{"type":"integer","minimum":0},
+                "bytes":{"type":"integer","minimum":0},"head":{"type":"string"}
+            });
+            properties[destination] = json!({"type":"string", "description": if destination == "base64" { "Complete exported file encoded as base64." } else { "Path of the written export file." }});
+            if format != "html" {
+                properties["fps"] = json!({"type":"integer","minimum":1});
+                properties["width"] = json!({"type":"integer","minimum":16,"maximum":4096});
+                properties["height"] = properties["width"].clone();
+            }
+            let mut branch = playback_object(properties);
+            branch["additionalProperties"] = json!(false);
+            variants.push(branch);
+        }
+    }
+    json!({"oneOf":variants})
+}
+
+pub(super) fn simulation_playback_result_schema() -> Value {
+    let count = json!({"type":"integer","minimum":0});
+    let string = json!({"type":"string"});
+    let number = json!({"type":"number"});
+    let strings = json!({"type":"array","items":string});
+    let counts = json!({"type":"array","items":count});
+    let vector = json!({"type":"array","items":{"type":["number","null"]},"minItems":3,"maxItems":3});
+    let pose = playback_object(json!({"translate":vector,"rotateEulerDeg":vector}));
+    let populated = playback_object(json!({
+        "study":string,"time":number,"playheadFrame":count,"shown":{"type":["integer","null"],"minimum":0},
+        "baked":count,"total":count,"playing":{"type":"boolean"},"looping":{"type":"boolean"},
+        "failed":counts,"error":{"type":["string","null"]},
+        "poses":{"type":"object","additionalProperties":pose},
+        "interference":{"type":"boolean"},"clashes":counts,
+        "shownClashes":{"type":"array","items":{"type":"array","items":string,"minItems":2,"maxItems":2}},
+        "hidden":strings,"explode":{"type":"array","items":playback_object(json!({"view":string,"progress":number}))},
+        "camera":{"anyOf":[{"type":"null"},playback_object(json!({"from":string,"to":string,"t":number}))]},
+        "cameraHeld":{"type":"boolean"},"opacity":{"type":"object","additionalProperties":number},
+        "section":{"anyOf":[{"type":"null"},playback_object(json!({"view":string,"offset":number}))]}
+    }));
+    // Native callers see null; the MCP adapter wraps that branch as value:null.
+    json!({"oneOf":[{"type":"null"},populated]})
+}
+
 pub static COMMANDS: &[CommandSpec] = &[
-    CommandSpec { name: "simulation_publish", group: "simulation", doc: "Publish a study (the active one): bake it to the end and write its motion into the assembly's `simulation` block as the study's `motion` — the player's frames (moved occurrences as pose deltas keyed by occurrence, hidden ones, opacities, camera, clashes) with `study` and `assemblySignature` (the assembly document's signature, its published motions left out) beside them — for a manufacturing-instructions step to attach (`instructions_attach_motion`). One undo step; the bake is kept. Returns `study` and `frames`.", phase: Phase::Mutate, annotations: Annotations::MUTATE, args_schema: schema_of::<PublishArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(simulation_publish) },
-    CommandSpec { name: "simulation_playback", group: "simulation", doc: "The motion-study playback: `study`, `time` (s), `playheadFrame` (the frame at the playhead; a reply's top-level `frame` is the app frame the command ran on), `shown` (the frame the displays show, null at rest), `baked` of `total` frames (the bake is time-sliced over the app's frames: wait for baked == total before reading a late frame), `playing`, `looping`, `failed` (frames the mates could not hold; they show the previous frame's poses), `error` (the last such frame's reason) `poses` (the occurrences the shown frame moved from their document poses, {translate, rotateEulerDeg}), `interference` (whether the study checks it), `clashes` (the baked frames where parts interfere: an edge of one part's mesh pierces a face of another's; contact is not a clash) and `shownClashes` (the [a, b] occurrence pairs clashing at the shown frame; their displays are tinted). Null when no study has been played or scrubbed.", phase: Phase::Read, annotations: Annotations::READ, args_schema: schema_of::<NoArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(simulation_playback) },
-    CommandSpec { name: "simulation_play", group: "simulation", doc: "Play a study (the active one) from its playhead — from 0 when it stands at the end — baking it first if need be; `loop` sets whether it repeats. Displays are posed frame by frame and the document is untouched. Shows the Simulation pane. Returns the playback.", phase: Phase::Mutate, annotations: Annotations::MUTATE, args_schema: schema_of::<PlayArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(simulation_play) },
-    CommandSpec { name: "simulation_pause", group: "simulation", doc: "Hold the playhead where it is; the frame stays shown. Returns the playback.", phase: Phase::Mutate, annotations: Annotations::MUTATE, args_schema: schema_of::<NoArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(simulation_pause) },
-    CommandSpec { name: "simulation_stop", group: "simulation", doc: "Stop: every display back at its document pose, the playhead at 0; the bake is kept. Returns the playback.", phase: Phase::Mutate, annotations: Annotations::MUTATE, args_schema: schema_of::<NoArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(simulation_stop) },
-    CommandSpec { name: "simulation_export", group: "simulation", doc: "Write a study (the active one) as a video or as the interactive player: `format` gif (every frame its own palette, loops), mp4 (H.264) or html (one self-contained page: the instructions player template with the study's frames on a timeline — every target, no GPU), `width`×`height` pixels (16..=4096; MP4 even; 960×540 when absent; not used by html), at `fps` (the study's when absent). The study is baked first if need be, every baked frame is drawn at that size through the viewport's renderer with the current display settings (poses, clips, camera, tint), and the playhead goes back where it stood. With `path` the file is written there (native) and the reply carries `path`, `bytes`, `frames` and `head` (the first bytes as text: `GIF89a`, or an MP4's `ftyp`); without it the file comes back as `base64`. Native only.", phase: Phase::Mutate, annotations: Annotations::MUTATE, args_schema: schema_of::<ExportArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(simulation_export) },
-    CommandSpec { name: "simulation_seek", group: "simulation", doc: "Scrub: put the playhead at `time` seconds (clamped to the study) and show that frame, pausing. A frame not baked yet is shown once it is (read `baked` and `shown`). Shows the Simulation pane. Returns the playback.", phase: Phase::Mutate, annotations: Annotations::MUTATE, args_schema: schema_of::<SeekArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(simulation_seek) },
+    app_command!("simulation", "simulation_publish", "Publish a study (the active one): bake it to the end and write its motion into the assembly's `simulation` block as the study's `motion` — the player's frames (moved occurrences as pose deltas keyed by occurrence, hidden ones, opacities, camera, clashes) with `study` and `assemblySignature` (the assembly document's signature, its published motions left out) beside them — for a manufacturing-instructions step to attach (`instructions_attach_motion`). One undo step; the bake is kept. Returns `study` and `frames`.", PublishArgs, simulation_publish, Mutate, MUTATE, simulation_publish_result_schema),
+    app_command!("simulation", "simulation_playback", "The motion-study playback: `study`, `time` (s), `playheadFrame` (the frame at the playhead; a reply's top-level `frame` is the app frame the command ran on), `shown` (the frame the displays show, null at rest), `baked` of `total` frames (the bake is time-sliced over the app's frames: wait for baked == total before reading a late frame), `playing`, `looping`, `failed` (frames the mates could not hold; they show the previous frame's poses), `error` (the last such frame's reason) `poses` (the occurrences the shown frame moved from their document poses, {translate, rotateEulerDeg}), `interference` (whether the study checks it), `clashes` (the baked frames where parts interfere: an edge of one part's mesh pierces a face of another's; contact is not a clash) and `shownClashes` (the [a, b] occurrence pairs clashing at the shown frame; their displays are tinted). Null when no study has been played or scrubbed.", NoArgs, simulation_playback, Read, READ, simulation_playback_result_schema),
+    app_command!("simulation", "simulation_play", "Play a study (the active one) from its playhead — from 0 when it stands at the end — baking it first if need be; `loop` sets whether it repeats. Displays are posed frame by frame and the document is untouched. Shows the Simulation pane. Returns the playback.", PlayArgs, simulation_play, Mutate, MUTATE, simulation_playback_result_schema),
+    app_command!("simulation", "simulation_pause", "Hold the playhead where it is; the frame stays shown. Returns the playback.", NoArgs, simulation_pause, Mutate, MUTATE, simulation_playback_result_schema),
+    app_command!("simulation", "simulation_stop", "Stop: every display back at its document pose, the playhead at 0; the bake is kept. Returns the playback.", NoArgs, simulation_stop, Mutate, MUTATE, simulation_playback_result_schema),
+    app_command!("simulation", "simulation_export", "Write a study (the active one) as a video or as the interactive player: `format` gif (every frame its own palette, loops), mp4 (H.264) or html (one self-contained page: the instructions player template with the study's frames on a timeline — every target, no GPU), `width`×`height` pixels (16..=4096; MP4 even; 960×540 when absent; not used by html), at `fps` (the study's when absent). The study is baked first if need be, every baked frame is drawn at that size through the viewport's renderer with the current display settings (poses, clips, camera, tint), and the playhead goes back where it stood. With `path` the file is written there (native) and the reply carries `path`, `bytes`, `frames` and `head` (the first bytes as text: `GIF89a`, or an MP4's `ftyp`); without it the file comes back as `base64`. Native only.", ExportArgs, simulation_export, Mutate, MUTATE, simulation_export_result_schema),
+    app_command!("simulation", "simulation_seek", "Scrub: put the playhead at `time` seconds (clamped to the study) and show that frame, pausing. A frame not baked yet is shown once it is (read `baked` and `shown`). Shows the Simulation pane. Returns the playback.", SeekArgs, simulation_seek, Mutate, MUTATE, simulation_playback_result_schema),
 ];

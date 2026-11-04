@@ -82,6 +82,22 @@ impl PaletteDisplay {
         Self::SmallIcons,
     ];
 
+    /// `(value, hit id, label)` per layout for [`crate::form::enum_dropdown`];
+    /// the hit id is the variant name (`display#CompactSingle`).
+    fn choices() -> [(Self, &'static str, &'static str); 5] {
+        Self::ALL.map(|mode| (mode, mode.id(), mode.label()))
+    }
+
+    fn id(self) -> &'static str {
+        match self {
+            Self::CompactSingle => "CompactSingle",
+            Self::CompactMulti => "CompactMulti",
+            Self::LargeIcons => "LargeIcons",
+            Self::MediumIcons => "MediumIcons",
+            Self::SmallIcons => "SmallIcons",
+        }
+    }
+
     fn label(self) -> &'static str {
         match self {
             Self::CompactSingle => "Compact list — 1 column",
@@ -213,7 +229,7 @@ pub struct Palette {
     want_focus: bool,
     /// Per-frame widget rects (text input + visible rows) for the headed
     /// verifier. Keys include `"input"`, `"display"`, `"top"`, and `"item:<id>"`.
-    /// Rebuilt each show; visible dropdown options use `"display:<mode>"`.
+    /// Rebuilt each show; visible dropdown options use `"display#<mode>"`.
     hits: HashMap<String, egui::Rect>,
 }
 
@@ -310,34 +326,25 @@ impl Palette {
                 ui.add_space(4.0);
             }
 
-            if crate::viewport::touch::enabled(ctx) {
-                ui.horizontal(|ui| {
-                    ui.label("Display");
-                    for (mode, label) in [(PaletteDisplay::CompactSingle, "List"), (PaletteDisplay::LargeIcons, "Icons")] {
-                        let option = ui.selectable_value(&mut self.display, mode, label);
-                        self.hits.insert(format!("display:{mode:?}"), option.rect);
-                        if mode == PaletteDisplay::CompactSingle { self.hits.insert("display".into(), option.rect); }
-                        if option.changed() { self.display_changed = true; }
-                    }
-                });
-            } else {
+            // ONE layout dropdown (an enumeration is a dropdown — the owner's
+            // rule): every layout on a desktop, the two a phone offers (a list
+            // and finger-sized icons) on touch.
             ui.horizontal(|ui| {
                 ui.label("Display");
-                let combo = egui::ComboBox::from_id_salt("palette-display")
-                    .selected_text(self.display.label())
-                    .show_ui(ui, |ui| {
-                        for mode in PaletteDisplay::ALL {
-                            let option = ui.selectable_value(&mut self.display, mode, mode.label());
-                            self.hits.insert(format!("display:{mode:?}"), option.rect);
-                            if option.changed() {
-                                self.display_changed = true;
-                                self.want_focus = true;
-                            }
-                        }
-                    });
-                self.hits.insert("display".into(), combo.response.rect);
+                let all = PaletteDisplay::choices();
+                let touch = crate::viewport::touch::enabled(ctx);
+                let choices: Vec<(PaletteDisplay, &str, &str)> = if touch {
+                    vec![(PaletteDisplay::CompactSingle, "CompactSingle", "List"), (PaletteDisplay::LargeIcons, "LargeIcons", "Icons")]
+                } else {
+                    all.to_vec()
+                };
+                let (changed, _) = crate::form::enum_dropdown(ui, "display", &choices, &mut self.display, None, Some(&mut self.hits));
+                if changed {
+                    self.display_changed = true;
+                    // A phone's chooser must not pop its keyboard open.
+                    self.want_focus = !touch;
+                }
             });
-            }
             ui.add_space(4.0);
 
             // --- search input (focused by default) ----------------------------
@@ -590,6 +597,6 @@ pub static HIT_KEYS: &[HitKeyDoc] = &[
     HitKeyDoc { panel: "palette", prefix: "top", meaning: "the current top match — the entry Enter picks", command: None },
     HitKeyDoc { panel: "palette", prefix: "item:", meaning: "one offered entry, by its opaque id (item:P.CU for the add-feature palette's Cube)", command: None },
     HitKeyDoc { panel: "palette", prefix: "display", meaning: "the layout dropdown's header", command: None },
-    HitKeyDoc { panel: "palette", prefix: "display:", meaning: "a layout in the open dropdown (display:LargeIcons, :MediumIcons, :SmallIcons, :CompactMulti, :CompactSingle)", command: None },
+    HitKeyDoc { panel: "palette", prefix: "display#", meaning: "a layout in the open dropdown (display#LargeIcons, #MediumIcons, #SmallIcons, #CompactMulti, #CompactSingle; on touch only #CompactSingle and #LargeIcons)", command: None },
 ];
 

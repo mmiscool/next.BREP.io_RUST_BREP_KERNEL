@@ -119,11 +119,12 @@ impl Platform for NativePlatform {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        format!("{secs}-{}", std::process::id())
+        format!("{secs}-{}", uuid::Uuid::new_v4())
     }
 
     fn session_dir(&self, root: &std::path::Path, id: &str) -> Result<PathBuf, String> {
         let dir = root.join(id);
+        private_dir(&dir)?;
         for sub in ["shots", "exports", "config"] {
             std::fs::create_dir_all(dir.join(sub)).map_err(|e| format!("session dir {}: {e}", dir.display()))?;
         }
@@ -147,13 +148,19 @@ impl Platform for NativePlatform {
 
     fn write_file(&self, path: String, bytes: Vec<u8>, overwrite: bool) -> PlatformFuture<'_, Result<String, String>> {
         let result = (|| {
-            if !overwrite && std::path::Path::new(&path).exists() {
-                return Err(format!("{path} exists; pass overwrite: true"));
-            }
+            use std::io::Write;
             if let Some(parent) = std::path::Path::new(&path).parent() {
-                let _ = std::fs::create_dir_all(parent);
+                std::fs::create_dir_all(parent).map_err(|e| format!("external_io_failed: {path}: {e}"))?;
             }
-            std::fs::write(&path, &bytes).map_err(|e| format!("{path}: {e}"))?;
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true);
+            if overwrite { options.create(true).truncate(true); } else { options.create_new(true); }
+            let mut file = options.open(&path).map_err(|e| {
+                if !overwrite && e.kind() == std::io::ErrorKind::AlreadyExists {
+                    format!("overwrite_refused: {path} exists; pass overwrite: true")
+                } else { format!("external_io_failed: {path}: {e}") }
+            })?;
+            file.write_all(&bytes).map_err(|e| format!("external_io_failed: {path}: {e}"))?;
             Ok(path.clone())
         })();
         Box::pin(std::future::ready(result))
@@ -257,6 +264,9 @@ pub struct HostConfig {
     pub seed: bool,
     /// The session's private store directory.
     pub store_dir: PathBuf,
+    /// The server's code mode, for the app's JavaScript editor to run on.
+    #[cfg(feature = "server")]
+    pub scripts: Option<crate::cad::LocalScripts>,
 }
 
 pub type SpawnFn = Arc<dyn Fn(HostConfig) -> Result<HostHandle, String> + Send + Sync>;
@@ -384,5 +394,29 @@ impl HostHandle {
             let _ = j.join();
         }
     }
+
+    /// Request shutdown even when in-flight callers still share the handle.
+    pub fn request_stop(&self) {
+        if self.owned { let _ = self.tx.send(HostRequest::Stop); }
+    }
 }
 
+
+/// Create an owner-only directory before writing private session content.
+#[cfg(feature = "server")]
+pub(crate) fn private_dir(path: &std::path::Path) -> Result<(), String> {
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)] {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let meta = std::fs::symlink_metadata(path).map_err(|e| e.to_string())?;
+    if !meta.is_dir() || meta.file_type().is_symlink() { return Err("private directory must not be a symbolic link".into()); }
+    #[cfg(unix)] {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}

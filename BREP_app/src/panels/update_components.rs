@@ -403,7 +403,7 @@ fn copy_is_revision(store: &dyn ModelStore, source_key: &str, document: &Value) 
     document["features"].is_array()
         && store
             .plm_revision(&crate::plm::identity::document_key(&part, &revision))
-            .is_some_and(|row| crate::plm::kicad::content_hash(document.to_string().as_bytes()) == row.content_hash)
+            .is_some_and(|row| crate::plm::content_hash(document.to_string().as_bytes()) == row.content_hash)
 }
 
 /// The signature comparison over the LIVE document's `partsLibrary` block →

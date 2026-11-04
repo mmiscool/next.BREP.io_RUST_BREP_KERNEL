@@ -52,6 +52,10 @@ pub struct Component {
     pub serial_tracked: bool,
     /// The fastener's `Torque` attribute text.
     pub torque: Option<String>,
+    /// The part's own `partAttributes` with a text, number or yes/no value
+    /// (description, material, vendor …): what the
+    /// player's parts page lists as the part's details.
+    pub attributes: Vec<(String, String)>,
     /// A sub-assembly's own level.
     pub children: Option<Box<Level>>,
 }

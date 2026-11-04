@@ -231,7 +231,7 @@ fn assemble_fragments_impl(
         assembler.next_face_id += 1;
     }
     if profile {
-        eprintln!(
+        profile_line!(
             "assemble.weld_ms={:.2} edges={} vertices={} candidates={} exhaustive={}",
             stage_started.elapsed().as_secs_f64() * 1_000.0,
             assembler.edges.len(),
@@ -290,7 +290,7 @@ fn assemble_fragments_impl(
         }
     }
     if profile {
-        eprintln!(
+        profile_line!(
             "assemble.conform_ms={:.2}",
             stage_started.elapsed().as_secs_f64() * 1_000.0
         );
@@ -298,12 +298,8 @@ fn assemble_fragments_impl(
     let stage_started = Instant::now();
 
     let mut parent = (0..faces.len()).collect::<Vec<_>>();
-    fn find(parent: &mut [usize], mut index: usize) -> usize {
-        while parent[index] != index {
-            parent[index] = parent[parent[index]];
-            index = parent[index];
-        }
-        index
+    fn find(parent: &mut [usize], index: usize) -> usize {
+        crate::union_find::find_root(parent, index)
     }
     let mut edge_faces: HashMap<u64, Vec<usize>> = HashMap::default();
     for (face_index, face) in faces.iter().enumerate() {
@@ -347,7 +343,7 @@ fn assemble_fragments_impl(
     // only; every structural check still reads the whole solid.
     let validate_in = |solid: &BrepSolid| {
         if profile {
-            eprintln!("assemble.validate_reads faces={} examined={}", solid.shells.iter().map(|s| s.faces.len()).sum::<usize>(),
+            profile_line!("assemble.validate_reads faces={} examined={}", solid.shells.iter().map(|s| s.faces.len()).sum::<usize>(),
                 scope.as_ref().map_or_else(|| solid.shells.iter().map(|s| s.faces.len()).sum::<usize>(), |s| s.examined.len()));
         }
         match &scope {
@@ -366,7 +362,7 @@ fn assemble_fragments_impl(
         .vertices
         .retain(|vertex| used_vertices.contains(&vertex.id));
     if profile {
-        eprintln!(
+        profile_line!(
             "assemble.shells_ms={:.2}",
             stage_started.elapsed().as_secs_f64() * 1_000.0
         );
@@ -410,15 +406,15 @@ fn assemble_fragments_impl(
         let stage_started = Instant::now();
         let settled = settle_vertices_onto_carriers(&mut solid, tolerance, &assembler.imprint_edges)?;
         if profile {
-            eprintln!("assemble.open_settle_ms={:.2}", stage_started.elapsed().as_secs_f64() * 1_000.0);
+            profile_line!("assemble.open_settle_ms={:.2}", stage_started.elapsed().as_secs_f64() * 1_000.0);
         }
         let rebuilt = reconstruct_edges_from_carriers(&mut solid, tolerance)?;
         if profile {
-            eprintln!("assemble.open_reconstruct_ms={:.2}", stage_started.elapsed().as_secs_f64() * 1_000.0);
+            profile_line!("assemble.open_reconstruct_ms={:.2}", stage_started.elapsed().as_secs_f64() * 1_000.0);
         }
         let trims = close_trim_loop_joints(&mut solid, tolerance)?;
         if profile {
-            eprintln!(
+            profile_line!(
                 "assemble.edges_ms={:.2} settled={} rebuilt={} trims={}",
                 stage_started.elapsed().as_secs_f64() * 1_000.0,
                 settled.len(),
@@ -732,7 +728,7 @@ fn assemble_fragments_impl(
         None => merge_curve_continuation_edges(&solid, tolerance)?,
     };
     if profile {
-        eprintln!(
+        profile_line!(
             "assemble.continuation_ms={:.2}",
             stage_started.elapsed().as_secs_f64() * 1_000.0
         );
@@ -740,7 +736,7 @@ fn assemble_fragments_impl(
     let stage_started = Instant::now();
     let polished = polish_triple_junction_vertices_in(&mut solid, tolerance, touched_vertices.as_ref())?;
     if profile {
-        eprintln!(
+        profile_line!(
             "assemble.junction_ms={:.2} polished={polished}",
             stage_started.elapsed().as_secs_f64() * 1_000.0
         );
@@ -755,7 +751,7 @@ fn assemble_fragments_impl(
     let stage_started = Instant::now();
     let mut issues = validate_in(&solid);
     if profile {
-        eprintln!(
+        profile_line!(
             "assemble.validate_ms={:.2}",
             stage_started.elapsed().as_secs_f64() * 1_000.0
         );
@@ -857,7 +853,7 @@ fn assemble_fragments_impl(
         let mut pass_started = Instant::now();
         let mut pass_ms = |label: &str, pass_started: &mut Instant| {
             if profile {
-                eprintln!("assemble.edges.{label}_ms={:.2}", pass_started.elapsed().as_secs_f64() * 1_000.0);
+                profile_line!("assemble.edges.{label}_ms={:.2}", pass_started.elapsed().as_secs_f64() * 1_000.0);
                 *pass_started = Instant::now();
             }
         };
@@ -894,7 +890,7 @@ fn assemble_fragments_impl(
             }
         }
         if profile {
-            eprintln!(
+            profile_line!(
                 "assemble.edges_ms={:.2}",
                 stage_started.elapsed().as_secs_f64() * 1_000.0
             );
@@ -1043,7 +1039,7 @@ fn assemble_fragments_impl(
         None => Some(solid_signed_volume_for_sign(&solid, bar).or_refuse(KernelStage::Sew, "solid_signed_volume")?),
     };
     if profile {
-        eprintln!(
+        profile_line!(
             "assemble.mass_check_ms={:.2}",
             stage_started.elapsed().as_secs_f64() * 1_000.0
         );
@@ -1066,8 +1062,7 @@ fn assemble_fragments_impl(
 /// moved fragment swapped with one whose area lies within 4.2e-10 of its own);
 /// `0`/`off` disables it.
 fn canonical_fragment_order_enabled() -> bool {
-    let enabled = !matches!(std::env::var("BREP_FRAGMENT_CANONICAL_ORDER").as_deref(), Ok("0") | Ok("off"));
-    enabled
+    switch!(live "BREP_FRAGMENT_CANONICAL_ORDER", true)
 }
 
 

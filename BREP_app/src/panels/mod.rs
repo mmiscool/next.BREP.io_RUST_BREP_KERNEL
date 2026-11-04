@@ -26,6 +26,15 @@ pub fn set_chrome_bottom(ctx: &egui::Context, y: f32) {
 /// y (56, 80, 96, …) that the Ribbon, taller than the old toolbar, now covers:
 /// Settings and Part Properties opened over its buttons and Plugins, with no
 /// default, over the menu bar (lane U audit item 4).
+/// "1 face" / "2 faces": a count with its noun in the singular for exactly one
+/// and the plural otherwise — the one place the app's panels agree on wording
+/// (BREP_ecad_egui carries the same helper for its inspectors). Zero is plural
+/// ("0 faces"), as in English.
+pub(crate) fn count(n: usize, one: &str, many: &str) -> String {
+    format!("{n} {}", if n == 1 { one } else { many })
+}
+
+
 pub fn below_chrome(ctx: &egui::Context, x: f32, dy: f32) -> egui::Pos2 {
     let top = ctx.data(|d| d.get_temp::<f32>(egui::Id::new(CHROME_BOTTOM))).unwrap_or(56.0);
     egui::pos2(x, top + 8.0 + dy)

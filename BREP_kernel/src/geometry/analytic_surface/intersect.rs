@@ -117,6 +117,9 @@ pub(crate) fn intersect_analytic_pair_with(
     if let Some(curves) = intersect_recognized_pair(first, second, tolerance, gate) {
         return Some(curves);
     }
+    if let Some(curves) = intersect_plane_affine_sphere(first, second, tolerance) {
+        return Some(curves);
+    }
     if let Some(curves) = intersect_coaxial_revolutions(first, second, tolerance) {
         return Some(curves);
     }
@@ -186,6 +189,23 @@ fn intersect_axial_plane_revolution(
         }
     }
     Some(curves)
+}
+
+/// Plane x affine sphere (`geometry/affine_sphere.rs`, under
+/// `BREP_AFFINE_SPHERE`): the exact ellipse, either operand order. Nothing
+/// else pairs with an ellipsoid in closed form (sphere, cylinder and cone
+/// sections of it are quartics; the marcher keeps them).
+fn intersect_plane_affine_sphere(
+    first: &NurbsSurface,
+    second: &NurbsSurface,
+    tolerance: f64,
+) -> Option<Vec<NurbsCurve>> {
+    for (plane_surface, other) in [(first, second), (second, first)] {
+        let Some(ellipsoid) = other.affine_sphere() else { continue };
+        let Some(plane) = plane_surface.analytic().and_then(plane_data) else { continue };
+        return ellipsoid.plane_section(plane.origin, plane.normal, tolerance);
+    }
+    None
 }
 
 fn intersect_recognized_pair(

@@ -27,11 +27,14 @@ fn subcurve_by_fraction(
             .split(second)
             .or_refuse(KernelStage::Refine, "split")?
             .0;
-    } else if std::env::var("BREP_DEBUG_SUBRANGE").is_ok() && second < domain[1] - epsilon {
+    } else if env_read!("BREP_DEBUG_SUBRANGE").is_some() && second < domain[1] - epsilon {
         eprintln!("abnormal subrange skip in edge_split subcurve");
     }
     Ok(result)
 }
+
+/// The physical weld floor [`claim_vertex`] widens by an edge's measured band.
+const SPLIT_VERTEX_FLOOR: f64 = 1e-7;
 
 /// Which vertex IS this split point?.
 ///
@@ -66,7 +69,7 @@ fn claim_vertex(
     // seam vertex, regardless of placement. The former origin-coupled floor
     // merged fixture 30's exact crossing 1.422e-5 from its seam, and translating
     // the same cylinders by ten units made all four operations refuse.
-    let floor: f64 = 1e-7;
+    let floor: f64 = SPLIT_VERTEX_FLOOR;
     let tolerance = floor.max(if entity_band.is_finite() && entity_band > 0.0 {
         entity_band
     } else {
@@ -223,7 +226,14 @@ pub fn apply_edge_splits_with_map(
         if partition.len() <= 2 {
             continue;
         }
-        let entity_band = entity.edge(edge.id);
+        // `claim_vertex` reads the band only through `SPLIT_VERTEX_FLOOR.max(band)`:
+        // an edge whose affine bound is under half that floor (lane O row 25,
+        // `BREP_EDGE_BAND_AFFINE_BOUND=1`) gets the floor without sampling.
+        let entity_band = if entity.edge_bound_under(edge.id, 0.5 * SPLIT_VERTEX_FLOOR) {
+            0.0
+        } else {
+            entity.edge(edge.id)
+        };
         let mut vertex_ids = vec![edge.start_vertex_id];
         for parameter in &partition[1..partition.len() - 1] {
             let point = edge

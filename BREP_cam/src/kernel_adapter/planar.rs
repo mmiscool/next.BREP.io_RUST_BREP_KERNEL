@@ -114,9 +114,26 @@ pub fn curve_segments(
             }
         }
     }
-    // Chords within the chordal tolerance, by recursive bisection.
+    // Seed each knot span with eight pieces: a symmetric S-bend can have its
+    // midpoint on the end chord even though neither lobe follows that chord.
+    // Include the requested endpoints and preserve the traversal direction.
+    let mut breaks = vec![a];
+    breaks.extend(curve.knots.iter().copied().filter(|&t| t > a.min(b) && t < a.max(b)));
+    breaks.push(b);
+    breaks.sort_by(f64::total_cmp);
+    breaks.dedup();
+    if a > b { breaks.reverse(); }
     let mut pts: Vec<Point3> = vec![samples[0]];
-    subdivide(&eval, a, b, samples[0], samples[SAMPLES - 1], chord_tol.max(tol.distance_eps), 0, &mut pts)?;
+    for span in breaks.windows(2) {
+        let mut ta = span[0];
+        for i in 1..=8 {
+            let tb = if i == 8 { span[1] } else { span[0] + (span[1] - span[0]) * i as f64 / 8.0 };
+            let pa = *pts.last().unwrap();
+            let pb = eval(tb)?;
+            subdivide(&eval, ta, tb, pa, pb, chord_tol.max(tol.distance_eps), 0, &mut pts)?;
+            ta = tb;
+        }
+    }
     let zmin = pts.iter().map(|p| p.z).fold(zmin, f64::min);
     let zmax = pts.iter().map(|p| p.z).fold(zmax, f64::max);
     let mut segs = Vec::new();

@@ -130,18 +130,8 @@ impl<'a> Profile<'a> {
         let a = curve.evaluate(domain[0])?;
         let b = curve.evaluate((domain[0] + domain[1]) * 0.5)?;
         let c = curve.evaluate(domain[1])?;
-        let ab = b.sub(a);
-        let ac = c.sub(a);
-        let n = ab.cross(ac);
-        if n.dot(n) <= 1e-28 * ab.dot(ab) * ac.dot(ac) {
-            return Err("ruled-torus: degenerate circular profile".into());
-        }
-        let center = a.add(
-            n.cross(ab)
-                .scale(ac.dot(ac))
-                .add(ac.cross(n).scale(ab.dot(ab)))
-                .scale(0.5 / n.dot(n)),
-        );
+        let center = crate::circumcenter(a, b, c)
+            .ok_or("ruled-torus: degenerate circular profile")?;
         let (major, axial) = meridian(frame, center);
         let minor = a.sub(center).length();
         let scale = major.abs().max(minor).max(1.0);

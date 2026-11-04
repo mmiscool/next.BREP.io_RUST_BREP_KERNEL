@@ -2,11 +2,94 @@
 use serde::{Deserialize, Serialize};
 use wasm_bindgen::prelude::*;
 
+/// One environment variable read through its call site's once-cell
+/// ([`env_read::read`], lane O row 19): `std::env::var(name).ok()` as an
+/// `Option<Cow<str>>`, kept for the process when `BREP_ENV_READ_ONCE` is on.
+/// Only for variables nothing sets at run time.
+macro_rules! env_read {
+    ($name:literal) => {{
+        static CELL: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+        $crate::env_read::read($name, &CELL)
+    }};
+}
+/// One on/off switch (consolidation S1): `switch!("BREP_X", default)` reads
+/// `BREP_X` through its call site's once-cell ([`env_read::switch`], kept for
+/// the process while `BREP_ENV_READ_ONCE` is on); `switch!(live "BREP_X",
+/// default)` reads it on every call, for a variable a probe sets at run time.
+/// One grammar (owner decision 2026-11-01): `0|off|false` off, `1|on|true`
+/// on, unset or anything else the default. In the kernel's tests one keyed
+/// override (`env_read::with_switch_for_test`) forces either form.
+#[macro_export]
+macro_rules! switch {
+    (live $name:expr, $default:expr) => {
+        $crate::env_read::switch_live($name, $default, $crate::env_read::Grammar::Switch)
+    };
+    ($name:expr, $default:expr) => {{
+        static CELL: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+        $crate::env_read::switch($name, &CELL, $default, $crate::env_read::Grammar::Switch)
+    }};
+}
+
+/// One debug, trace or `BREP_NO_*` flag (consolidation S1): on when its
+/// variable is set to anything but `0`, `off` or `false`.
+/// `debug_flag!(live "BREP_X")` reads it on every call.
+#[macro_export]
+macro_rules! debug_flag {
+    (live $name:expr) => {
+        $crate::env_read::switch_live($name, false, $crate::env_read::Grammar::Flag)
+    };
+    ($name:expr) => {{
+        static CELL: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+        $crate::env_read::switch($name, &CELL, false, $crate::env_read::Grammar::Flag)
+    }};
+}
+
+/// One `0|off / check / on` mode (consolidation X1): an
+/// [`env_read::Mode`]; unset, `On` when `default_on` and `Off` otherwise.
+/// `mode_switch!(live "BREP_X", default_on)` reads it on every call.
+#[macro_export]
+macro_rules! mode_switch {
+    (live $name:expr, $default_on:expr) => {
+        $crate::env_read::mode_live($name, $default_on)
+    };
+    ($name:expr, $default_on:expr) => {{
+        static CELL: std::sync::OnceLock<Option<$crate::env_read::Mode>> = std::sync::OnceLock::new();
+        $crate::env_read::mode($name, &CELL, $default_on)
+    }};
+}
+
+/// `eprintln!` for a `BREP_PROFILE` line: buffered while a
+/// [`profile::ProfileSink`] is open (consolidation I8).
+macro_rules! profile_line {
+    ($($arg:tt)*) => { $crate::profile::profile_emit(format_args!($($arg)*)) };
+}
+
+// The wasm global allocator, when the `wasm-talc` feature asks for it.
+#[cfg(all(feature = "wasm-talc", target_family = "wasm", not(target_feature = "atomics")))]
+#[global_allocator]
+static TALC: talc::wasm::WasmDynamicTalc = talc::wasm::new_wasm_dynamic_allocator();
+
+// The native global allocator, when the `native-rusty-alloc` feature asks for it.
+#[cfg(all(feature = "native-rusty-alloc", not(target_family = "wasm")))]
+#[global_allocator]
+static RUSTY_ALLOC: rusty_alloc_api::RustyAlloc = rusty_alloc_api::RustyAlloc;
+
+mod profile;
+
+/// Switch reading for the kernel's dependants ([`switch!`],
+/// [`debug_flag!`], [`mode_switch!`]); not a stable interface.
+#[doc(hidden)]
+pub mod env_read;
+
 /// The wasm panic hook every `#[wasm_bindgen]` entry point installs. Replaces
 /// the `console_error_panic_hook` crate for the whole BREP family — reached as
 /// `brep_kernel::panic_hook` and, through the render engine's re-export, as
 /// `brep_render::brep_kernel::panic_hook`.
 pub mod panic_hook;
+
+/// Plain-text formats shared by the CAD app and the PLM server
+/// (`text::delimited`: CSV and tab-separated text).
+pub mod text;
 
 #[path = "geometry/tolerance.rs"]
 mod tolerance;
@@ -31,7 +114,7 @@ pub use diagnostics::{
     KernelStage, OrRefuse, RefusalClass, SoundnessDefect, UndecidedCause,
 };
 #[path = "geometry/polygon.rs"]
-mod polygon;
+pub mod polygon;
 #[path = "geometry/curve.rs"]
 mod curve;
 pub use curve::{
@@ -261,7 +344,7 @@ pub use feature_pipeline::pmi::{
     balloon_head as pmi_balloon_head, clamp_text_size, format_dimension, format_number,
     nearest_point_on_edge, nearest_point_on_solid, pmi_schema_catalogue, pmi_type,
     nearest_displayed_point, nearest_displayed_point_on_edge, pose_apply as pmi_pose_apply, pose_unapply as pmi_pose_unapply,
-    resolve_state as pmi_resolve_state, BalloonAnchor, BalloonAnchorMode, FcfFrame, HalfSpace as PmiHalfSpace, HeadScope as PmiHeadScope, PmiAnnotation,
+    resolve_state as pmi_resolve_state, entry_names_solid, BalloonAnchor, BalloonAnchorMode, FcfFrame, HalfSpace as PmiHalfSpace, HeadScope as PmiHeadScope, PmiAnnotation,
     PmiAnnotationReport, PmiCamera, PmiDisplay, PmiGeometry, PmiPlane, PmiPose, PmiProjection, PmiReport,
     PmiState, PmiStatus, PmiTypeDef, PmiView, PmiViewReport, SolidPoses as PmiSolidPoses, ToleranceBlock, ToleranceMode, PMI_TYPES,
 };
@@ -294,6 +377,9 @@ pub use feature_pipeline::IsolatedSceneMetadata;
 // The imported-colour read of the name-keyed scene-metadata store. Thread-local
 // like the rest of it, so an off-thread runner reads it and ships the result.
 pub use feature_pipeline::scene_metadata_colors_json;
+// Family tables (rows, the expression rewrite, the persisted fingerprints): one
+// copy for the CAD app and the PLM server.
+pub use feature_pipeline::family;
 // The assemblies parts library (unique part payloads for ACOMP instances):
 // insert / update-refresh mutations and the save-side serialization surface.
 pub use feature_pipeline::{
@@ -364,6 +450,12 @@ pub fn eval_expression(
 pub use wasm_bindgen_rayon::init_thread_pool;
 #[path = "geometry/projection.rs"]
 mod projection;
+#[path = "geometry/projection_profile.rs"]
+mod projection_profile;
+#[doc(hidden)]
+pub use projection_profile::report as projection_profile_report;
+#[path = "geometry/affine_sphere.rs"]
+mod affine_sphere;
 pub use projection::{
     project_point_to_curve, project_point_to_surface, project_point_to_surface_seeded,
     CurveProjection, SurfaceProjection,
@@ -567,7 +659,7 @@ pub use faceted_repair::{mesh_to_faceted_brep, repair_triangle_soup, MeshRepairR
 #[path = "offset/offset_shell.rs"]
 mod offset_shell;
 pub use offset_shell::{
-    offset_shell, offset_shell_by_boolean, offset_shell_with_diagnostics, offset_solid, OffsetCorners,
+    offset_shell, offset_shell_by_boolean, offset_shell_closed, offset_shell_with_diagnostics, offset_solid, OffsetCorners,
     OffsetFaceRole, OffsetShellFaceImageRecord, OffsetShellResultRecord,
 };
 pub(crate) use offset_shell::{is_offset_shell_no_retained_face, is_offset_shell_open_curved_rim};
@@ -611,7 +703,8 @@ pub use iges::{export_iges, import_iges};
 #[path = "io/mesh_io.rs"]
 mod mesh_io;
 pub use mesh_io::{
-    read_binary_stl, read_obj, write_binary_stl, write_obj, ObjReadResult, StlReadResult,
+    parse_stl_triangles, read_obj, read_stl, write_ascii_stl, write_binary_stl, write_obj,
+    ObjReadResult, StlError, StlFormat, StlReadResult, StlTriangles,
 };
 // 3MF (3D Manufacturing Format) import, core specification only: the OPC/ZIP
 // container, the model XML, and the build's instances flattened into one
@@ -644,7 +737,7 @@ mod solver_linear_algebra;
 #[path = "solvers/sketch_solver.rs"]
 mod sketch_solver;
 pub use sketch_solver::{
-    is_sketch_origin_point_id, sketch_id_key, solve_sketch, solve_sketch_from_json,
+    is_sketch_origin_point_id, sketch_id_key, mint_sketch_id, solve_sketch, solve_sketch_from_json,
     SketchSolverSettings, SolveSketchRequest, SKETCH_ORIGIN_POINT_ID,
 };
 #[path = "solvers/assembly_solver.rs"]
@@ -689,6 +782,7 @@ mod sew;
 pub use sew::{sew_solid, split_pinched_vertices, SewReport};
 #[path = "meshing/mesh_weld.rs"]
 mod mesh_weld;
+pub use mesh_weld::{canonical_bits, VertexWeld};
 #[path = "meshing/mesh_segment.rs"]
 mod mesh_segment;
 pub use mesh_segment::{
@@ -708,6 +802,51 @@ pub struct Vec3 {
 }
 
 impl Vec3 {
+    pub const ZERO: Self = Self { x: 0.0, y: 0.0, z: 0.0 };
+    pub const X: Self = Self { x: 1.0, y: 0.0, z: 0.0 };
+    pub const Y: Self = Self { x: 0.0, y: 1.0, z: 0.0 };
+    pub const Z: Self = Self { x: 0.0, y: 0.0, z: 1.0 };
+
+    /// Normalize using the standard vector guard, or return the caller's fallback.
+    pub fn normalized_or(self, fallback: Self) -> Self {
+        self.normalized().unwrap_or(fallback)
+    }
+
+    /// Rodrigues rotation about a unit axis through the origin.
+    #[inline]
+    pub fn rotate_about(self, axis: Self, angle: f64) -> Self {
+        let (sin, cos) = angle.sin_cos();
+        self.scale(cos)
+            .add(axis.cross(self).scale(sin))
+            .add(axis.scale(axis.dot(self) * (1.0 - cos)))
+    }
+
+    /// Distance to a segment. `guard` is the caller's squared-length threshold.
+    #[inline]
+    pub fn distance_to_segment(self, start: Self, end: Self, guard: f64) -> f64 {
+        let segment = end.sub(start);
+        let length_squared = segment.dot(segment);
+        if length_squared <= guard {
+            return self.sub(start).length();
+        }
+        let parameter = (self.sub(start).dot(segment) / length_squared).clamp(0.0, 1.0);
+        self.sub(start.add(segment.scale(parameter))).length()
+    }
+
+    /// Squared distance, retaining the seed sweep's projection on zero-length segments.
+    #[inline]
+    pub fn distance_to_segment_squared(self, start: Self, end: Self) -> f64 {
+        let segment = end.sub(start);
+        let length_squared = segment.dot(segment);
+        let parameter = if length_squared > 0.0 {
+            (self.sub(start).dot(segment) / length_squared).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let residual = self.sub(start.add(segment.scale(parameter)));
+        residual.dot(residual)
+    }
+
     pub fn new(x: f64, y: f64, z: f64) -> Self {
         Self { x, y, z }
     }
@@ -890,3 +1029,36 @@ pub fn make_cylinder(radius: f64, height: f64, segments: usize) -> Mesh {
 mod abi;
 pub use abi::*;
 
+
+#[path = "healing/curve_helpers.rs"]
+mod curve_helpers;
+
+#[path = "geometry/eigen2.rs"]
+mod eigen2;
+
+#[path = "geometry/union_find.rs"]
+pub mod union_find;
+pub use union_find::UnionFind;
+
+#[path = "geometry/poly.rs"]
+pub mod poly;
+
+pub use analytic_surface::{circumcenter, circumcenter_2d, recognize_circle, RecognizedCircle};
+
+#[path = "geometry/triangle.rs"]
+mod triangle;
+pub use triangle::closest_point_on_triangle;
+
+pub use tolerance::RIGID_TOL;
+
+impl std::ops::Index<usize> for Vec3 {
+    type Output = f64;
+    fn index(&self, index: usize) -> &Self::Output {
+        match index { 0 => &self.x, 1 => &self.y, 2 => &self.z, _ => panic!("Vec3 index out of bounds: {index}") }
+    }
+}
+impl std::ops::IndexMut<usize> for Vec3 {
+    fn index_mut(&mut self, index: usize) -> &mut Self::Output {
+        match index { 0 => &mut self.x, 1 => &mut self.y, 2 => &mut self.z, _ => panic!("Vec3 index out of bounds: {index}") }
+    }
+}

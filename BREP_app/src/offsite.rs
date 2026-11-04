@@ -175,7 +175,7 @@ pub(crate) fn fetch_text(
             ctx.request_repaint();
             return;
         }
-        web::fetch_text_into(ctx, url, tx);
+        crate::http::fetch_text_into(&ctx, url, tx);
     });
     rx
 }
@@ -226,23 +226,6 @@ mod web {
             Some(policy) => f(policy),
             None => WAITERS.with(|w| w.borrow_mut().push(Box::new(f))),
         }
-    }
-
-    /// `crate::http::fetch_text`'s request, answering into `tx`.
-    pub fn fetch_text_into(
-        ctx: eframe::egui::Context,
-        url: String,
-        tx: std::sync::mpsc::Sender<Result<String, String>>,
-    ) {
-        ehttp::fetch(ehttp::Request::get(url), move |result| {
-            let out = match result {
-                Ok(r) if r.ok => Ok(r.text().map(str::to_owned).unwrap_or_else(|| String::from_utf8_lossy(&r.bytes).into_owned())),
-                Ok(r) => Err(format!("HTTP {} {}", r.status, r.status_text)),
-                Err(error) => Err(error),
-            };
-            let _ = tx.send(out);
-            ctx.request_repaint();
-        });
     }
 
     pub fn prefetch() {

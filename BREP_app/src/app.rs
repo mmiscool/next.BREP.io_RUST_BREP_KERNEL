@@ -1159,6 +1159,7 @@ impl BrepApp {
     /// and still owes the frame its reads.
     #[cfg(feature = "automation")]
     fn drain_reads(&mut self, ctx: &egui::Context) {
+        let _t = crate::perf::trace("drain reads + publish_view");
         let queue = self.automation.clone();
         let frame = ctx.cumulative_frame_nr();
         queue.drain_app(
@@ -1166,6 +1167,85 @@ impl BrepApp {
             &mut crate::automation::command::Ctx { app: self, egui: ctx },
             frame,
         );
+        // The frame drawn now shows this document: a capture landing next
+        // frame is of it.
+        let view = self.docs.view();
+        queue.publish_view(view.handle(), view.committed_revision());
+    }
+
+    /// Every notice raised since the last gather — the engine's, storage
+    /// failures found after a write returned, refused edits — mirrored to the
+    /// automation queue's `notices` drain. Called by the frame (which then
+    /// shows them as toasts) and by the frame-free service step, so a hidden
+    /// window still reports what the user would have seen.
+    fn gather_notices(&mut self) -> Vec<(brep_render::engine_state::NoticeSeverity, String)> {
+        use brep_render::engine_state::NoticeSeverity;
+        let mut raised = self.docs.engine_mut().take_graded_notices();
+        // Same lane for STORAGE failures the store could only discover after its
+        // synchronous `write` returned `Ok` (the browser backend writes behind an
+        // in-memory mirror). A save that did not persist must never be silent.
+        let errors = self.model_store.take_persistence_errors().into_iter().chain(self.autosave.take_errors());
+        let failures: Vec<String> = errors.filter_map(|text| crate::panels::plm_host::plain_write_failure(&text)).collect();
+        if let Some(last) = failures.last() {
+            // The status line said "saved …" when the write was issued.
+            self.file.status = last.clone();
+        }
+        if failures.iter().any(|text| text.contains("the PLM server is not reachable")) {
+            self.plm.note_unreachable();
+        }
+        raised.extend(failures.into_iter().map(|text| (NoticeSeverity::Error, text)));
+        // ...and the tab whose Save that was is unsaved again: it was marked
+        // clean when the write was issued, and a clean tab closes without a
+        // question.
+        let failed = self.model_store.take_failed_writes();
+        for name in &failed {
+            self.docs.mark_write_failed(self.model_store.as_ref(), name);
+        }
+        // A part an open assembly holds a copy of (saved with it): the copy
+        // keeps the change, marked, so the next Save writes it again.
+        for name in &failed {
+            self.docs.mark_failed_copies(self.model_store.as_ref(), name);
+        }
+        // An edit a read-only document refused (a PLM revision not checked out,
+        // or released): its history kept the saved bytes, and this says why.
+        for doc in self.docs.iter_mut() {
+            if let Some(text) = doc.take_refused() {
+                raised.push((NoticeSeverity::Warning, text));
+            }
+        }
+        // The automation channel's `notices` drain: what the user would have SEEN.
+        // Without this the drain has no producers at all and every script's
+        // `{"notices": []}` asserts nothing.
+        #[cfg(feature = "automation")]
+        for (_, text) in &raised {
+            self.automation.push_notice(
+                crate::automation::command::NoticeKind::Toast,
+                text.clone(),
+            );
+        }
+        raised
+    }
+
+    /// Application-command dispatch without a frame (the desktop loop's
+    /// service step; see `automation::queue`): the PLM/store tasks that
+    /// answered, the queue's frame-free head, the background runs it started,
+    /// and the notices they raised. Draws nothing. Returns whether work it
+    /// must keep servicing is still in flight.
+    #[cfg(feature = "automation")]
+    pub fn service_automation(&mut self, ctx: &egui::Context) -> bool {
+        #[cfg(not(target_arch = "wasm32"))]
+        crate::plm::native::run_pending();
+        let queue = self.automation.clone();
+        let polled = queue.drain_frameless(&mut crate::automation::command::Ctx { app: self, egui: ctx });
+        let running = self.docs.pump_all();
+        let raised = self.gather_notices();
+        if !raised.is_empty() {
+            let now = ctx.input(|i| i.time);
+            self.toasts.extend(raised, now);
+        }
+        // A window that IS drawn shows the effect on its next frame.
+        ctx.request_repaint();
+        polled || running || queue.has_frameless_work()
     }
 
     /// Reset everything the shared panels and the viewport hold ABOUT ONE
@@ -1211,7 +1291,7 @@ impl BrepApp {
     /// the headed verifier can prove each roll / edit produced different geometry
     /// (names alone don't: a SUBTRACT reuses the target's name).
     #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
-    fn model_signature_json(&self) -> String {
+    pub(crate) fn model_signature_json(&self) -> String {
         let solids: Vec<serde_json::Value> = self
             .docs
             .engine()
@@ -1266,6 +1346,12 @@ impl BrepApp {
     /// What this session is running on. The app's ONE record of it: the Info
     /// window draws it, a problem report carries it, the `diagnostics` command
     /// returns it and the MCP banner names its adapter — all from here.
+    /// Where the JavaScript editor's Run sends a program (a host's own
+    /// script runner; the desktop app installs its server's on its own).
+    pub fn set_script_host(&mut self, host: Box<dyn crate::javascript::ScriptHost>) {
+        self.javascript.host = Some(host);
+    }
+
     pub fn diagnostics(&self) -> &crate::diagnostics::Diagnostics {
         &self.diagnostics
     }
@@ -1575,6 +1661,7 @@ impl eframe::App for BrepApp {
         // spends is the whole diagnosis.
         crate::perf::tick();
         let _ui_span = crate::perf::span(crate::perf::Phase::Ui);
+        let _frame_trace = crate::perf::trace("frame");
 
         // The native store and PLM queue (`plm::native`): every task whose I/O
         // answered since the last frame finishes here, on this thread, FIRST —
@@ -1610,6 +1697,7 @@ impl eframe::App for BrepApp {
         {
             let queue = self.automation.clone();
             let frame = ctx.cumulative_frame_nr();
+            let _t = crate::perf::trace("drain mutate");
             queue.drain_app(
                 crate::automation::command::Phase::Mutate,
                 &mut crate::automation::command::Ctx { app: self, egui: &ctx },
@@ -1772,7 +1860,10 @@ impl eframe::App for BrepApp {
         // EVERY open document is pumped, not just the active one — see
         // `Documents::pump_all`, which also keeps the active document's parts
         // library in the kernel's store when a background tab's run lands.
-        let work_in_flight = self.docs.pump_all();
+        let work_in_flight = {
+            let _t = crate::perf::trace("pump_all");
+            self.docs.pump_all()
+        };
         if work_in_flight {
             ctx.request_repaint();
         }
@@ -1844,7 +1935,10 @@ impl eframe::App for BrepApp {
 
         // The tab strip's dirty dots, refreshed once per frame (cheap — see
         // `Document::refresh_dirty_marker`).
-        self.docs.refresh_dirty_markers();
+        {
+            let _t = crate::perf::trace("refresh_dirty_markers");
+            self.docs.refresh_dirty_markers();
+        }
 
         // --- boot-load (?loadModel=): apply the fetched model once it lands ----
         // Replaces the seed with the URL-specified document (armed in `new`). The
@@ -2000,6 +2094,17 @@ impl eframe::App for BrepApp {
         }
         self.plugins.active_document = self.docs.active_id();
         self.plugins.show(&ctx, self.docs.engine_mut(), self.model_store.as_ref());
+        // Run goes to the app's own script runner (its server's code mode),
+        // started on the first run; installed once the window is opened.
+        #[cfg(all(not(target_arch = "wasm32"), feature = "mcp"))]
+        if self.javascript.open && self.javascript.host.is_none() {
+            self.javascript.host = Some(Box::new(crate::mcp::EditorHost::new(self.automation.clone(), self.diagnostics.adapter_line())));
+        }
+        // In the browser: the page's Web Worker runner (src/webmcp.rs).
+        #[cfg(all(target_arch = "wasm32", feature = "mcp", feature = "scripting"))]
+        if self.javascript.open && self.javascript.host.is_none() {
+            self.javascript.host = Some(Box::new(crate::webmcp::PageScripts));
+        }
         self.javascript.show(&ctx, &mut self.docs, self.model_store.as_ref());
         // The panels' exports (a plugin bundle, the script) leave through the
         // file dialog's export door: the Save-file chooser on desktop, a
@@ -2509,6 +2614,7 @@ impl eframe::App for BrepApp {
         // NOTHING during capture, so the screenshot it requested never contains
         // this dialog.
         self.bug_report.show(&ctx, self.docs.engine_mut());
+        self.sketch.show_text_dialog(&ctx, self.docs.engine_mut());
 
         // --- Info: the licences + this session's diagnostics + the MCP start
         // button, a floating window toggled from the toolbar's info button.
@@ -2743,49 +2849,7 @@ impl eframe::App for BrepApp {
         // every one of them: `Toasts::extend` keeps only the last few on screen,
         // and a message dropped for space is exactly the one a host wants told.
         use brep_render::engine_state::NoticeSeverity;
-        let mut raised = self.docs.engine_mut().take_graded_notices();
-        // Same lane for STORAGE failures the store could only discover after its
-        // synchronous `write` returned `Ok` (the browser backend writes behind an
-        // in-memory mirror). A save that did not persist must never be silent.
-        let errors = self.model_store.take_persistence_errors().into_iter().chain(self.autosave.take_errors());
-        let failures: Vec<String> = errors.filter_map(|text| crate::panels::plm_host::plain_write_failure(&text)).collect();
-        if let Some(last) = failures.last() {
-            // The status line said "saved …" when the write was issued.
-            self.file.status = last.clone();
-        }
-        if failures.iter().any(|text| text.contains("the PLM server is not reachable")) {
-            self.plm.note_unreachable();
-        }
-        raised.extend(failures.into_iter().map(|text| (NoticeSeverity::Error, text)));
-        // ...and the tab whose Save that was is unsaved again: it was marked
-        // clean when the write was issued, and a clean tab closes without a
-        // question.
-        let failed = self.model_store.take_failed_writes();
-        for name in &failed {
-            self.docs.mark_write_failed(self.model_store.as_ref(), name);
-        }
-        // A part an open assembly holds a copy of (saved with it): the copy
-        // keeps the change, marked, so the next Save writes it again.
-        for name in &failed {
-            self.docs.mark_failed_copies(self.model_store.as_ref(), name);
-        }
-        // An edit a read-only document refused (a PLM revision not checked out,
-        // or released): its history kept the saved bytes, and this says why.
-        for doc in self.docs.iter_mut() {
-            if let Some(text) = doc.take_refused() {
-                raised.push((NoticeSeverity::Warning, text));
-            }
-        }
-        // The automation channel's `notices` drain: what the user would have SEEN.
-        // Without this the drain has no producers at all and every script's
-        // `{"notices": []}` asserts nothing.
-        #[cfg(feature = "automation")]
-        for (_, text) in &raised {
-            self.automation.push_notice(
-                crate::automation::command::NoticeKind::Toast,
-                text.clone(),
-            );
-        }
+        let raised = self.gather_notices();
         self.toasts.extend(raised, now);
         // An edit after a card was raised supersedes it (`Toasts::note_document`).
         self.toasts
@@ -2844,7 +2908,7 @@ impl eframe::App for BrepApp {
             crate::automation::registry::publish("__brepBusy", "the status bar's working indicator {shown, activities:[{kind, label, document, cancellable, elapsed}]} — everything in flight, most important first; shown once work has lasted 0.2 s", &self.busy.state_json());
             crate::automation::registry::publish("__brepStatusHit", "status bar widget rects: busy, busy:more, busy:cancel (present only while the working indicator shows)", &self.busy.hits_json());
             crate::automation::registry::publish("__brepHit", "history panel widget rects: step:i edit:i del:i box:i add:menu form:* field:* panel:clip", &self.history.hits_json());
-            crate::automation::registry::publish("__brepPaletteHit", "add-feature palette widget rects in screen points: input top item:type display display:mode (empty while closed)", &self.history.palette_hits_json());
+            crate::automation::registry::publish("__brepPaletteHit", "add-feature palette widget rects in screen points: input top item:type display display#mode (empty while closed)", &self.history.palette_hits_json());
             crate::automation::registry::publish("__brepExprHit", "expressions panel widget rects", &self.expressions.hits_json());
             crate::automation::registry::publish("__brepExpr", "expressions script, its variables and the configurator",
                 &serde_json::json!({

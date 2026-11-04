@@ -1,18 +1,17 @@
 //! Family and template SEED documents, read and written the way the CAD app
 //! reads and writes them (§3.2, round 8).
 //!
-//! The server never links the kernel or the CAD app. This module is a small
-//! mirror of just the document fields families and templates use —
+//! The server never links the CAD app (it does link the kernel). This module
+//! reads and writes just the document fields families and templates use —
 //! `documentClass`, `familyTable`, `familySource`, `templateInputs` and
-//! `templateSource` — and of the few pure functions over them:
+//! `templateSource`. The pure functions over them it shares with the CAD app
+//! through the kernel (`brep_kernel::family`):
 //!
 //! * the expression rewrite a row or a template input applies
-//!   (`BREP_app/src/family_table.rs` `rewrite_expressions`), ported line for
-//!   line so a member the server assembles is the member the CAD app would
-//!   write;
-//! * the fingerprints (`history_hash`, `row_hash`, `template_hash`), which use
-//!   the kernel's `stable_json_hash`. That function is copied verbatim below
-//!   and pinned by golden values computed with the kernel itself, so a stamp
+//!   (`rewrite_expressions`), so a member the server assembles is the member
+//!   the CAD app would write;
+//! * the fingerprints (`history_hash`, `row_hash`; `template_hash` here), on
+//!   the kernel's `stable_json_hash` and pinned by golden values, so a stamp
 //!   the server writes and a stamp the CAD app writes compare equal.
 //!
 //! What this module can NOT do is evaluate an expression. The CAD app refuses
@@ -25,61 +24,22 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-/// The document key the family table is stored under.
-pub const FAMILY_TABLE_KEY: &str = "familyTable";
-/// The document key a generated member records its family under.
-pub const FAMILY_SOURCE_KEY: &str = "familySource";
+// The table, its rows, the key names, the expression rewrite, the identifier
+// rule and the fingerprints are the kernel's, the very code the CAD app runs
+// (I2, 2026-11-01): one copy instead of a port kept in step by tests.
+pub use brep_kernel::family::{
+    effective_row, history_hash, is_identifier, rewrite_expressions, row_hash, FamilyColumn, FamilyRow, FamilyTable,
+    DERIVED_FROM_KEY, DOCUMENT_CLASS_KEY, FAMILY_SOURCE_KEY, FAMILY_TABLE_KEY, TEMPLATE_SOURCE_KEY,
+};
+
 /// The document key a template's input marks are stored under.
 pub const TEMPLATE_INPUTS_KEY: &str = "templateInputs";
-/// The document key a spun-out copy records its template under.
-pub const TEMPLATE_SOURCE_KEY: &str = "templateSource";
-/// The Save As lineage chain the CAD app writes (identities a part was saved
-/// from). Not the model; members and template instances do not inherit it.
-pub const DERIVED_FROM_KEY: &str = "derivedFrom";
-/// The document key the class is stored under. A normal part writes none.
-pub const DOCUMENT_CLASS_KEY: &str = "documentClass";
 /// The document key the part attributes (the BOM's source) live under.
 pub const PART_ATTRIBUTES_KEY: &str = "partAttributes";
 
 // ===========================================================================
 // The family table
 // ===========================================================================
-
-/// A family's table: one row per member.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct FamilyTable {
-    #[serde(default)]
-    pub columns: Vec<FamilyColumn>,
-    #[serde(default)]
-    pub rows: Vec<FamilyRow>,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct FamilyColumn {
-    /// The expression name this column drives (`length`).
-    pub name: String,
-    /// Optional display label; empty shows `name`.
-    #[serde(default)]
-    pub label: String,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct FamilyRow {
-    /// Typed by the user: the member's part number.
-    pub part_number: String,
-    /// The member revision this row writes. The CAD app on the file system
-    /// ignores it; the PLM honours it.
-    #[serde(default)]
-    pub revision: String,
-    #[serde(default)]
-    pub description: String,
-    /// Column name -> expression source text ("12", "m * 2").
-    #[serde(default)]
-    pub values: BTreeMap<String, String>,
-}
 
 /// The table a document carries, or an empty one when it has none or the
 /// block does not parse — as the CAD app reads it.
@@ -100,15 +60,6 @@ pub fn write_table(document: &mut Value, table: &FamilyTable) -> Result<(), Stri
     Ok(())
 }
 
-/// `row` as Generate uses it: only the values of the table's CURRENT columns,
-/// and only non-empty ones. An empty cell keeps the family's own definition.
-pub fn effective_row(table: &FamilyTable, row: &FamilyRow) -> FamilyRow {
-    let mut row = row.clone();
-    row.values
-        .retain(|name, value| !value.trim().is_empty() && table.columns.iter().any(|c| c.name == *name));
-    row
-}
-
 /// The class a document says it is: `family`, `template`, or `None` for a
 /// normal part (which writes no field).
 pub fn document_class(document: &Value) -> Option<&str> {
@@ -116,89 +67,6 @@ pub fn document_class(document: &Value) -> Option<&str> {
         Some(class @ ("family" | "template")) => Some(class),
         _ => None,
     }
-}
-
-// ===========================================================================
-// The expression rewrite (BREP_app/src/family_table.rs, ported)
-// ===========================================================================
-
-/// `expressions` with every statement that defines a name in `values`
-/// replaced, in place, by `name = <value>`; a name the source never defines
-/// is appended. Comments outside the replaced statements are kept and the
-/// rest of the source is untouched byte for byte.
-pub fn rewrite_expressions(expressions: &str, values: &BTreeMap<String, String>) -> String {
-    let mut out = expressions.to_string();
-    let mut defined = std::collections::BTreeSet::new();
-    // Splice back to front so earlier spans keep their offsets.
-    for (start, end) in statement_spans(expressions).into_iter().rev() {
-        let Some(name) = assigned_name(&expressions[start..end]) else {
-            continue;
-        };
-        if let Some(value) = values.get(name) {
-            out.replace_range(start..end, &format!("{name} = {}", value.trim()));
-            defined.insert(name.to_string());
-        }
-    }
-    // Appended, not prepended: a value may use the family's own variables,
-    // and the evaluator runs statements in order.
-    for (name, value) in values {
-        if !defined.contains(name.as_str()) {
-            if !out.is_empty() && !out.trim_end().ends_with(';') {
-                out.push(';');
-            }
-            if !out.is_empty() && !out.ends_with('\n') {
-                out.push('\n');
-            }
-            out.push_str(&format!("{name} = {};\n", value.trim()));
-        }
-    }
-    out
-}
-
-/// The byte spans of the source's statements, `//` comments skipped.
-fn statement_spans(source: &str) -> Vec<(usize, usize)> {
-    let bytes = source.as_bytes();
-    let mut spans = Vec::new();
-    let mut start = None;
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'/' if bytes.get(i + 1) == Some(&b'/') => {
-                while i < bytes.len() && bytes[i] != b'\n' {
-                    i += 1;
-                }
-                continue;
-            }
-            b';' => {
-                if let Some(s) = start.take() {
-                    spans.push((s, i));
-                }
-            }
-            c if !c.is_ascii_whitespace() && start.is_none() => start = Some(i),
-            _ => {}
-        }
-        i += 1;
-    }
-    if let Some(s) = start {
-        spans.push((s, source.len()));
-    }
-    spans
-}
-
-/// The name a statement assigns (`name = rhs`).
-fn assigned_name(statement: &str) -> Option<&str> {
-    let eq = statement.find('=')?;
-    let name = statement[..eq].trim();
-    is_identifier(name).then_some(name)
-}
-
-/// An expression name: a letter, `_` or `$`, then letters, digits, `_`, `$`.
-pub fn is_identifier(name: &str) -> bool {
-    let mut chars = name.chars();
-    chars
-        .next()
-        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_' || c == '$')
-        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
 }
 
 /// The `name = rhs` assignments of an expressions source, in order
@@ -227,88 +95,11 @@ fn expressions_of(document: &Value) -> &str {
 // Fingerprints
 // ===========================================================================
 
-/// The kernel's `stable_json_hash`, copied verbatim
-/// (`BREP_kernel/src/feature_pipeline/parts_library.rs`): a sorted-key walk,
-/// string leaves verbatim, through std's `DefaultHasher`. The repo pins one
-/// toolchain, so this and the kernel's agree; the golden values in the tests
-/// below were computed by the kernel and fail loudly if they ever stop.
-pub fn stable_json_hash(value: &Value) -> u64 {
-    use std::hash::{Hash, Hasher};
-    fn walk(value: &Value, hasher: &mut impl Hasher) {
-        match value {
-            Value::Null => 0u8.hash(hasher),
-            Value::Bool(flag) => {
-                1u8.hash(hasher);
-                flag.hash(hasher);
-            }
-            Value::Number(number) => {
-                2u8.hash(hasher);
-                number.to_string().hash(hasher);
-            }
-            Value::String(text) => {
-                3u8.hash(hasher);
-                text.hash(hasher);
-            }
-            Value::Array(items) => {
-                4u8.hash(hasher);
-                for item in items {
-                    walk(item, hasher);
-                }
-            }
-            Value::Object(map) => {
-                5u8.hash(hasher);
-                let mut keys: Vec<&String> = map.keys().collect();
-                keys.sort();
-                for key in keys {
-                    key.hash(hasher);
-                    walk(&map[key], hasher);
-                }
-            }
-        }
-    }
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    walk(value, &mut hasher);
-    hasher.finish()
-}
-
-/// The keys that are not the family's MODEL: the table (a row edit must not
-/// regenerate every member), the class, the view state, and stamps.
-const NOT_THE_MODEL: [&str; 7] = [
-    FAMILY_TABLE_KEY,
-    DOCUMENT_CLASS_KEY,
-    "workbench",
-    FAMILY_SOURCE_KEY,
-    TEMPLATE_SOURCE_KEY,
-    // The CAD app's Save As lineage chain (Replace component): where the
-    // document came from, not its model.
-    DERIVED_FROM_KEY,
-    // The embedded preview a CAD save writes into the document: derived from
-    // the model, and the CAD app's copy of this list excludes it too.
-    "thumbnail",
-];
-
-/// A content hash of the family's model: the whole document less the table,
-/// the class, the view state and the stamps. Changing it regenerates every
-/// member.
-pub fn history_hash(family: &Value) -> String {
-    let mut model = family.clone();
-    if let Some(object) = model.as_object_mut() {
-        for key in NOT_THE_MODEL {
-            object.remove(key);
-        }
-    }
-    format!("{:016x}", stable_json_hash(&model))
-}
-
-/// A content hash of what a row puts into its member.
-pub fn row_hash(row: &FamilyRow) -> String {
-    let value = serde_json::json!({
-        "partNumber": row.part_number.trim(),
-        "description": row.description.trim(),
-        "values": row.values,
-    });
-    format!("{:016x}", stable_json_hash(&value))
-}
+/// The kernel's `stable_json_hash` itself (a sorted-key walk, string leaves
+/// verbatim, through std's `DefaultHasher`), so a stamp the server writes and
+/// a stamp the CAD app writes compare equal. The golden values in the tests
+/// below were computed by the kernel and fail loudly if it ever changes.
+pub use brep_kernel::stable_json_hash;
 
 /// A content hash of a template document less its view state.
 pub fn template_hash(template: &Value) -> String {
@@ -515,15 +306,17 @@ pub struct CsvRows {
 /// `rev`) and `description` are optional; every other header is an
 /// expression name. Tab-separated text — a paste from a spreadsheet — is read
 /// the same way. Quoted fields may hold the separator, quotes (`""`) and line
-/// breaks. Blank lines are skipped.
+/// breaks. Blank lines are skipped. The reader is the kernel's
+/// `text::delimited`, strict: an unclosed quote, or text after a closing
+/// quote, is refused naming its line.
 pub fn parse_csv(text: &str) -> Result<CsvRows, String> {
-    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
-    let first_line = text.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
-    let separator = if first_line.contains('\t') && !first_line.contains(',') { '\t' } else { ',' };
-    let records = split_records(text, separator)?;
+    use brep_kernel::text::delimited;
+    let text = delimited::strip_bom(text);
+    let records = delimited::parse(text, delimited::sniff_separator(text), delimited::Strictness::Strict)?;
     let mut records = records
         .into_iter()
-        .filter(|(_, fields)| fields.iter().any(|f| !f.trim().is_empty()));
+        .filter(|record| !record.is_blank())
+        .map(|record| (record.line, record.fields));
     let Some((_, header)) = records.next() else {
         return Err("the CSV is empty — its first line names the columns".into());
     };
@@ -596,56 +389,5 @@ pub fn parse_csv(text: &str) -> Result<CsvRows, String> {
         out.rows.push(row);
     }
     Ok(out)
-}
-
-/// Split CSV text into records (with their 1-based starting line numbers).
-fn split_records(text: &str, separator: char) -> Result<Vec<(usize, Vec<String>)>, String> {
-    let mut records = Vec::new();
-    let mut fields = Vec::new();
-    let mut field = String::new();
-    let mut quoted = false;
-    let mut line = 1;
-    let mut record_line = 1;
-    let mut chars = text.chars().peekable();
-    while let Some(c) = chars.next() {
-        if quoted {
-            match c {
-                '"' if chars.peek() == Some(&'"') => {
-                    chars.next();
-                    field.push('"');
-                }
-                '"' => quoted = false,
-                '\n' => {
-                    line += 1;
-                    field.push('\n');
-                }
-                _ => field.push(c),
-            }
-            continue;
-        }
-        match c {
-            '"' if field.trim().is_empty() => {
-                field.clear();
-                quoted = true;
-            }
-            c if c == separator => fields.push(std::mem::take(&mut field)),
-            '\r' => {}
-            '\n' => {
-                fields.push(std::mem::take(&mut field));
-                records.push((record_line, std::mem::take(&mut fields)));
-                line += 1;
-                record_line = line;
-            }
-            _ => field.push(c),
-        }
-    }
-    if quoted {
-        return Err(format!("line {record_line}: a quoted field is never closed"));
-    }
-    if !field.is_empty() || !fields.is_empty() {
-        fields.push(field);
-        records.push((record_line, fields));
-    }
-    Ok(records)
 }
 

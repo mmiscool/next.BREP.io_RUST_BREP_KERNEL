@@ -9,7 +9,7 @@
 //! a person does. The sheet is exported through `document_export` with format
 //! `sheet_svg`, beside every other output format.
 use crate::automation::cmd_document::parse;
-use crate::automation::command::{parse_args, schema_of, Annotations, CommandSpec, Ctx, Empty, Handler, NoArgs, Outcome, Phase};
+use crate::automation::command::{app_command, engine_call, read_engine, parse_args, schema_of, CommandSpec, Ctx, NoArgs, Outcome};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -263,8 +263,7 @@ fn sheet_state(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
 }
 
 fn sheet_catalogue(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
-    let _: NoArgs = parse_args(args)?;
-    Ok(Outcome::Done(ctx.app.docs.engine().sheet_catalogue()))
+    read_engine(ctx, args, |e| e.sheet_catalogue())
 }
 
 fn sheet_add(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
@@ -274,21 +273,15 @@ fn sheet_add(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
 }
 
 fn sheet_update(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
-    let a: UpdateSheetArgs = parse_args(args)?;
-    ctx.app.docs.engine_mut().sheet_update(&a.id, &a.params.to_string())?;
-    Ok(Outcome::Done(json!({})))
+    engine_call(ctx, args, |e, a: UpdateSheetArgs| e.sheet_update(&a.id, &a.params.to_string()))
 }
 
 fn sheet_delete(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
-    let a: SheetIdArgs = parse_args(args)?;
-    ctx.app.docs.engine_mut().sheet_delete(&a.id)?;
-    Ok(Outcome::Done(json!({})))
+    engine_call(ctx, args, |e, a: SheetIdArgs| e.sheet_delete(&a.id))
 }
 
 fn sheet_open(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
-    let a: OpenSheetArgs = parse_args(args)?;
-    ctx.app.docs.engine_mut().sheet_set_open(a.id.as_deref())?;
-    Ok(Outcome::Done(json!({})))
+    engine_call(ctx, args, |e, a: OpenSheetArgs| e.sheet_set_open(a.id.as_deref()))
 }
 
 fn sheet_place_view(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
@@ -302,9 +295,7 @@ fn sheet_place_view(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
 }
 
 fn sheet_update_view(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
-    let a: UpdatePlacedViewArgs = parse_args(args)?;
-    ctx.app.docs.engine_mut().sheet_update_view(&a.id, &a.params.to_string())?;
-    Ok(Outcome::Done(json!({})))
+    engine_call(ctx, args, |e, a: UpdatePlacedViewArgs| e.sheet_update_view(&a.id, &a.params.to_string()))
 }
 
 fn sheet_move_view(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
@@ -318,9 +309,7 @@ fn sheet_move_view(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
 }
 
 fn sheet_remove_view(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
-    let a: SheetIdArgs = parse_args(args)?;
-    ctx.app.docs.engine_mut().sheet_remove_view(&a.id)?;
-    Ok(Outcome::Done(json!({})))
+    engine_call(ctx, args, |e, a: SheetIdArgs| e.sheet_remove_view(&a.id))
 }
 
 fn sheet_add_dimension(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
@@ -335,9 +324,7 @@ fn sheet_add_dimension(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String
 }
 
 fn sheet_update_dimension(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
-    let a: UpdateDimensionArgs = parse_args(args)?;
-    ctx.app.docs.engine_mut().sheet_update_dimension(&a.id, &a.params.to_string())?;
-    Ok(Outcome::Done(json!({})))
+    engine_call(ctx, args, |e, a: UpdateDimensionArgs| e.sheet_update_dimension(&a.id, &a.params.to_string()))
 }
 
 fn sheet_move_dimension(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
@@ -351,9 +338,7 @@ fn sheet_move_dimension(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, Strin
 }
 
 fn sheet_remove_dimension(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
-    let a: SheetIdArgs = parse_args(args)?;
-    ctx.app.docs.engine_mut().sheet_remove_dimension(&a.id)?;
-    Ok(Outcome::Done(json!({})))
+    engine_call(ctx, args, |e, a: SheetIdArgs| e.sheet_remove_dimension(&a.id))
 }
 
 fn sheet_add_ordinate(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
@@ -368,9 +353,7 @@ fn sheet_add_ordinate(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String>
 }
 
 fn sheet_update_ordinate(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
-    let a: UpdateOrdinateArgs = parse_args(args)?;
-    ctx.app.docs.engine_mut().sheet_update_ordinate(&a.id, &a.params.to_string())?;
-    Ok(Outcome::Done(json!({})))
+    engine_call(ctx, args, |e, a: UpdateOrdinateArgs| e.sheet_update_ordinate(&a.id, &a.params.to_string()))
 }
 
 fn sheet_move_ordinate(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
@@ -384,9 +367,7 @@ fn sheet_move_ordinate(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String
 }
 
 fn sheet_remove_ordinate(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
-    let a: SheetIdArgs = parse_args(args)?;
-    ctx.app.docs.engine_mut().sheet_remove_ordinate(&a.id)?;
-    Ok(Outcome::Done(json!({})))
+    engine_call(ctx, args, |e, a: SheetIdArgs| e.sheet_remove_ordinate(&a.id))
 }
 
 fn sheet_add_section(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
@@ -411,15 +392,11 @@ fn sheet_add_revision(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String>
 }
 
 fn sheet_update_revision(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
-    let a: UpdateRevisionArgs = parse_args(args)?;
-    ctx.app.docs.engine_mut().sheet_update_revision(&a.id, a.index, &a.params.to_string())?;
-    Ok(Outcome::Done(json!({})))
+    engine_call(ctx, args, |e, a: UpdateRevisionArgs| e.sheet_update_revision(&a.id, a.index, &a.params.to_string()))
 }
 
 fn sheet_remove_revision(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
-    let a: RevisionRowArgs = parse_args(args)?;
-    ctx.app.docs.engine_mut().sheet_remove_revision(&a.id, a.index)?;
-    Ok(Outcome::Done(json!({})))
+    engine_call(ctx, args, |e, a: RevisionRowArgs| e.sheet_remove_revision(&a.id, a.index))
 }
 
 fn sheet_add_detail(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
@@ -451,30 +428,30 @@ fn sheet_anchor_pick(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> 
 }
 
 pub static COMMANDS: &[CommandSpec] = &[
-    CommandSpec { name: "sheet_state", group: "sheets", doc: "The document's drawing sheets, which one the viewport is showing, which object's form is open (`openObject`) and which is selected (`selectedObject`), and the OPEN sheet's projection \u{2014} the paper in millimetres, each placed view's visible edge runs, EVERY annotation of the view it places, the anchor candidates a sheet mark can be placed on, and the sheet's own dimensions and ordinate sets.", phase: Phase::Read, annotations: Annotations::READ, args_schema: schema_of::<NoArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(sheet_state) },
-    CommandSpec { name: "sheet_catalogue", group: "sheets", doc: "The parameter schemas of a sheet, of a placed view, of a sheet dimension, of an ordinate set, of a section view and of a detail view \u{2014} what `sheet_update`, `sheet_update_view` (all three kinds of placement), `sheet_update_dimension` and `sheet_update_ordinate` take. The placed view's `view` field offers this document's saved PMI views.", phase: Phase::Read, annotations: Annotations::READ, args_schema: schema_of::<NoArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(sheet_catalogue) },
-    CommandSpec { name: "sheet_add", group: "sheets", doc: "Add an A3 drawing sheet and open it in the sheet viewport. Returns the sheet id.", phase: Phase::Mutate, annotations: Annotations::MUTATE, args_schema: schema_of::<AddSheetArgs>, result_schema: schema_of::<SheetAdded>, handler: Handler::App(sheet_add) },
-    CommandSpec { name: "sheet_update", group: "sheets", doc: "Patch a sheet's name, paper size (a preset, or Custom with `widthMm` / `heightMm`), border, title block, notes, or its whole `revisions` list (rows of `rev`, `date`, `description`, in table order); absent keys are unchanged.", phase: Phase::Mutate, annotations: Annotations::MUTATE, args_schema: schema_of::<UpdateSheetArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(sheet_update) },
-    CommandSpec { name: "sheet_add_revision", group: "sheets", doc: "Append a row to a sheet's REVISION TABLE \u{2014} what the sheet dialog's `+ Add revision` does. Absent fields are seeded: the letter after the last row's (`A` on an empty table), today's date, no description. The sheet draws its rows as a table beside the title block, in the order they were added. Returns the row's index.", phase: Phase::Mutate, annotations: Annotations::MUTATE, args_schema: schema_of::<AddRevisionArgs>, result_schema: schema_of::<RevisionAdded>, handler: Handler::App(sheet_add_revision) },
-    CommandSpec { name: "sheet_update_revision", group: "sheets", doc: "Patch one revision row's `rev`, `date` or `description` \u{2014} what typing into the sheet dialog's Revisions section does; absent keys are unchanged.", phase: Phase::Mutate, annotations: Annotations::MUTATE, args_schema: schema_of::<UpdateRevisionArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(sheet_update_revision) },
-    CommandSpec { name: "sheet_remove_revision", group: "sheets", doc: "Remove one revision row; the rows after it move up and keep their order. A sheet whose last row goes draws no revision table.", phase: Phase::Mutate, annotations: Annotations::DESTRUCTIVE, args_schema: schema_of::<RevisionRowArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(sheet_remove_revision) },
-    CommandSpec { name: "sheet_delete", group: "sheets", doc: "Delete a sheet and every view placed on it.", phase: Phase::Mutate, annotations: Annotations::DESTRUCTIVE, args_schema: schema_of::<SheetIdArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(sheet_delete) },
-    CommandSpec { name: "sheet_open", group: "sheets", doc: "Draw a sheet in the viewport instead of the 3D model; with no `id`, close the sheet and return to the 3D view.", phase: Phase::Mutate, annotations: Annotations::MUTATE, args_schema: schema_of::<OpenSheetArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(sheet_open) },
-    CommandSpec { name: "sheet_place_view", group: "sheets", doc: "Place a saved PMI view on a sheet (the open one when `sheet_id` is absent) at a position in paper millimetres and a scale in paper millimetres per model unit. The view's camera must be orthographic. Returns the placement id.", phase: Phase::Mutate, annotations: Annotations::MUTATE, args_schema: schema_of::<PlaceViewArgs>, result_schema: schema_of::<SheetAdded>, handler: Handler::App(sheet_place_view) },
-    CommandSpec { name: "sheet_update_view", group: "sheets", doc: "Replace a placed view's params: which saved view it draws, where it sits on the paper, its scale.", phase: Phase::Mutate, annotations: Annotations::MUTATE, args_schema: schema_of::<UpdatePlacedViewArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(sheet_update_view) },
-    CommandSpec { name: "sheet_move_view", group: "sheets", doc: "Move a placed view to a position in paper millimetres \u{2014} what dragging it in the sheet viewport does.", phase: Phase::Mutate, annotations: Annotations::MUTATE, args_schema: schema_of::<MovePlacedViewArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(sheet_move_view) },
-    CommandSpec { name: "sheet_remove_view", group: "sheets", doc: "Take one placed view off its sheet. Any sheet dimension anchored to it STAYS, unresolved with the reason \u{2014} deleting the sheet is what takes them.", phase: Phase::Mutate, annotations: Annotations::DESTRUCTIVE, args_schema: schema_of::<SheetIdArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(sheet_remove_view) },
-    CommandSpec { name: "sheet_add_dimension", group: "sheets", doc: "Add a dimension drawn ON the sheet, anchored to a placement's projected geometry. LINEAR takes two anchors and measures the MODEL distance between them in the view's projection plane, in model units at any sheet scale; RADIAL and DIAMETRAL take one CIRCLE anchor and read the model radius. An anchor is `{placement}:{kind}:{solid}#{entity}` \u{2014} `sheet_state` lists every one a placement offers under `drawing.views[].anchors`. Returns the dimension id.", phase: Phase::Mutate, annotations: Annotations::MUTATE, args_schema: schema_of::<AddDimensionArgs>, result_schema: schema_of::<SheetAdded>, handler: Handler::App(sheet_add_dimension) },
-    CommandSpec { name: "sheet_update_dimension", group: "sheets", doc: "Patch a sheet dimension's kind, alignment, anchors, offset, precision or TOLERANCE BLOCK \u{2014} the PMI dimension's own keys: `tolMode` (none / symmetric / deviation / limits), `tolUpper`, `tolLower` and `isReference` \u{2014} written with the kernel's own dimension text; absent keys are unchanged. A dimension with no block of its own whose anchors are the points a free linear or a radial PMI dimension of the placement's view measures writes that dimension's block, and its drawing names it as `toleranceFrom`.", phase: Phase::Mutate, annotations: Annotations::MUTATE, args_schema: schema_of::<UpdateDimensionArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(sheet_update_dimension) },
-    CommandSpec { name: "sheet_move_dimension", group: "sheets", doc: "Move a sheet dimension's line: how far it sits from its anchors in paper millimetres, signed \u{2014} what dragging its value box in the sheet viewport does.", phase: Phase::Mutate, annotations: Annotations::MUTATE, args_schema: schema_of::<MoveDimensionArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(sheet_move_dimension) },
-    CommandSpec { name: "sheet_remove_dimension", group: "sheets", doc: "Take one dimension off its sheet.", phase: Phase::Mutate, annotations: Annotations::DESTRUCTIVE, args_schema: schema_of::<SheetIdArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(sheet_remove_dimension) },
-    CommandSpec { name: "sheet_add_ordinate", group: "sheets", doc: "Add an ORDINATE SET drawn on the sheet: a datum anchor and any number of members, each reading its signed distance from the datum along one paper axis (`horizontal` reads x, right positive; `vertical` reads UP the page). Anchors are the same `{placement}:{kind}:{solid}#{entity}` references a sheet dimension takes. Returns the set id.", phase: Phase::Mutate, annotations: Annotations::MUTATE, args_schema: schema_of::<AddOrdinateArgs>, result_schema: schema_of::<SheetAdded>, handler: Handler::App(sheet_add_ordinate) },
-    CommandSpec { name: "sheet_update_ordinate", group: "sheets", doc: "Patch an ordinate set's axis, datum, members, baseline offset, precision or tolerance block (`tolMode`, `tolUpper`, `tolLower`, `isReference`, written on every member's value and never on the datum's); absent keys are unchanged. Clearing the DATUM keeps the set, unresolved: every value it draws is a distance from the datum, so until one is picked again it draws its id and the reason.", phase: Phase::Mutate, annotations: Annotations::MUTATE, args_schema: schema_of::<UpdateOrdinateArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(sheet_update_ordinate) },
-    CommandSpec { name: "sheet_move_ordinate", group: "sheets", doc: "Move an ordinate set's BASELINE: its signed distance from the datum in paper millimetres \u{2014} what dragging the datum's value box in the sheet viewport does. One number moves the whole run.", phase: Phase::Mutate, annotations: Annotations::MUTATE, args_schema: schema_of::<MoveOrdinateArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(sheet_move_ordinate) },
-    CommandSpec { name: "sheet_remove_ordinate", group: "sheets", doc: "Take one ordinate set off its sheet.", phase: Phase::Mutate, annotations: Annotations::DESTRUCTIVE, args_schema: schema_of::<SheetIdArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(sheet_remove_ordinate) },
-    CommandSpec { name: "sheet_add_section", group: "sheets", doc: "Add a SECTION VIEW of a placement: a second placement of the same saved PMI view whose camera looks along the normal of the plane through the two anchors, drawing the model CLIPPED at that plane with the cut faces hatched. Both anchors must be points of `source`, whose own viewing direction lies in the plane. The section line, its arrows and its letter are drawn on `source`. Returns the placement id.", phase: Phase::Mutate, annotations: Annotations::MUTATE, args_schema: schema_of::<AddSectionArgs>, result_schema: schema_of::<SheetAdded>, handler: Handler::App(sheet_add_section) },
-    CommandSpec { name: "sheet_add_detail", group: "sheets", doc: "Add a DETAIL VIEW of a placement: the region inside a circle picked on it \u{2014} centred on one anchor, its rim through another \u{2014} redrawn at a scale of its own (twice the source's by default) through the SOURCE's camera, the model's visible lines clipped to the circle. The circle and its letter are drawn on `source`; the detail is captioned `DETAIL B` over its scale. A detail of a detail and a detail of a section are refused by name. Returns the placement id.", phase: Phase::Mutate, annotations: Annotations::MUTATE, args_schema: schema_of::<AddDetailArgs>, result_schema: schema_of::<SheetAdded>, handler: Handler::App(sheet_add_detail) },
-    CommandSpec { name: "sheet_new_section", group: "sheets", doc: "Add a SECTION VIEW with no cutting line yet and open its form \u{2014} what the Drawing workbench's Section view button does. It draws its id and `no cutting line yet` until its `cut` field (two anchors of one placement) is set, through `sheet_update_view` or the form's reference picker; the first line names its source, whose saved view and scale it takes, beside it. Returns the placement id.", phase: Phase::Mutate, annotations: Annotations::MUTATE, args_schema: schema_of::<NewDerivedArgs>, result_schema: schema_of::<SheetAdded>, handler: Handler::App(sheet_new_section) },
-    CommandSpec { name: "sheet_new_detail", group: "sheets", doc: "Add a DETAIL VIEW with no circle yet and open its form \u{2014} what the Drawing workbench's Detail view button does. It is unresolved until its `centre` and `rim` fields (anchors of one placement) are set, through `sheet_update_view` or the form's reference picker; the first names its source, whose view it takes at twice its scale, beside it. Returns the placement id.", phase: Phase::Mutate, annotations: Annotations::MUTATE, args_schema: schema_of::<NewDerivedArgs>, result_schema: schema_of::<SheetAdded>, handler: Handler::App(sheet_new_detail) },
-    CommandSpec { name: "sheet_anchor_pick", group: "sheets", doc: "Pick an anchor BY NAME while the reference picker is up for a sheet object's reference row \u{2014} what clicking its marker (`sheet/anchor:<ref>`) does, for anchors that sit too close on the paper for a click to say which was meant. A list row gains it (in a row that is full for its object, the oldest pick makes room) and commits from the row's own `sheets/sheets:field:<path>#activate` (Done while it is focused); a single row is replaced and commits on the pick. Refused when no sheet reference is being picked.", phase: Phase::Mutate, annotations: Annotations::MUTATE, args_schema: schema_of::<AnchorPickArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(sheet_anchor_pick) },
+    app_command!("sheets", "sheet_state", "The document's drawing sheets, which one the viewport is showing, which object's form is open (`openObject`) and which is selected (`selectedObject`), and the OPEN sheet's projection \u{2014} the paper in millimetres, each placed view's visible edge runs, EVERY annotation of the view it places, the anchor candidates a sheet mark can be placed on, and the sheet's own dimensions and ordinate sets.", NoArgs, sheet_state, Read, READ, super::sheet_output_schema::sheet_state_schema),
+    app_command!("sheets", "sheet_catalogue", "The parameter schemas of a sheet, of a placed view, of a sheet dimension, of an ordinate set, of a section view and of a detail view \u{2014} what `sheet_update`, `sheet_update_view` (all three kinds of placement), `sheet_update_dimension` and `sheet_update_ordinate` take. The placed view's `view` field offers this document's saved PMI views.", NoArgs, sheet_catalogue, Read, READ, super::catalogue_output_schema::sheet_catalogue_schema),
+    app_command!("sheets", "sheet_add", "Add an A3 drawing sheet and open it in the sheet viewport. Returns the sheet id.", AddSheetArgs, sheet_add, Mutate, MUTATE, schema_of::<SheetAdded>),
+    app_command!("sheets", "sheet_update", "Patch a sheet's name, paper size (a preset, or Custom with `widthMm` / `heightMm`), border, title block, notes, or its whole `revisions` list (rows of `rev`, `date`, `description`, in table order); absent keys are unchanged.", UpdateSheetArgs, sheet_update, Mutate, MUTATE),
+    app_command!("sheets", "sheet_add_revision", "Append a row to a sheet's REVISION TABLE \u{2014} what the sheet dialog's `+ Add revision` does. Absent fields are seeded: the letter after the last row's (`A` on an empty table), today's date, no description. The sheet draws its rows as a table beside the title block, in the order they were added. Returns the row's index.", AddRevisionArgs, sheet_add_revision, Mutate, MUTATE, schema_of::<RevisionAdded>),
+    app_command!("sheets", "sheet_update_revision", "Patch one revision row's `rev`, `date` or `description` \u{2014} what typing into the sheet dialog's Revisions section does; absent keys are unchanged.", UpdateRevisionArgs, sheet_update_revision, Mutate, MUTATE),
+    app_command!("sheets", "sheet_remove_revision", "Remove one revision row; the rows after it move up and keep their order. A sheet whose last row goes draws no revision table.", RevisionRowArgs, sheet_remove_revision, Mutate, DESTRUCTIVE),
+    app_command!("sheets", "sheet_delete", "Delete a sheet and every view placed on it.", SheetIdArgs, sheet_delete, Mutate, DESTRUCTIVE),
+    app_command!("sheets", "sheet_open", "Draw a sheet in the viewport instead of the 3D model; with no `id`, close the sheet and return to the 3D view.", OpenSheetArgs, sheet_open, Mutate, MUTATE),
+    app_command!("sheets", "sheet_place_view", "Place a saved PMI view on a sheet (the open one when `sheet_id` is absent) at a position in paper millimetres and a scale in paper millimetres per model unit. The view's camera must be orthographic. Returns the placement id.", PlaceViewArgs, sheet_place_view, Mutate, MUTATE, schema_of::<SheetAdded>),
+    app_command!("sheets", "sheet_update_view", "Replace a placed view's params: which saved view it draws, where it sits on the paper, its scale.", UpdatePlacedViewArgs, sheet_update_view, Mutate, MUTATE),
+    app_command!("sheets", "sheet_move_view", "Move a placed view to a position in paper millimetres \u{2014} what dragging it in the sheet viewport does.", MovePlacedViewArgs, sheet_move_view, Mutate, MUTATE),
+    app_command!("sheets", "sheet_remove_view", "Take one placed view off its sheet. Any sheet dimension anchored to it STAYS, unresolved with the reason \u{2014} deleting the sheet is what takes them.", SheetIdArgs, sheet_remove_view, Mutate, DESTRUCTIVE),
+    app_command!("sheets", "sheet_add_dimension", "Add a dimension drawn ON the sheet, anchored to a placement's projected geometry. LINEAR takes two anchors and measures the MODEL distance between them in the view's projection plane, in model units at any sheet scale; RADIAL and DIAMETRAL take one CIRCLE anchor and read the model radius. An anchor is `{placement}:{kind}:{solid}#{entity}` \u{2014} `sheet_state` lists every one a placement offers under `drawing.views[].anchors`. Returns the dimension id.", AddDimensionArgs, sheet_add_dimension, Mutate, MUTATE, schema_of::<SheetAdded>),
+    app_command!("sheets", "sheet_update_dimension", "Patch a sheet dimension's kind, alignment, anchors, offset, precision or TOLERANCE BLOCK \u{2014} the PMI dimension's own keys: `tolMode` (none / symmetric / deviation / limits), `tolUpper`, `tolLower` and `isReference` \u{2014} written with the kernel's own dimension text; absent keys are unchanged. A dimension with no block of its own whose anchors are the points a free linear or a radial PMI dimension of the placement's view measures writes that dimension's block, and its drawing names it as `toleranceFrom`.", UpdateDimensionArgs, sheet_update_dimension, Mutate, MUTATE),
+    app_command!("sheets", "sheet_move_dimension", "Move a sheet dimension's line: how far it sits from its anchors in paper millimetres, signed \u{2014} what dragging its value box in the sheet viewport does.", MoveDimensionArgs, sheet_move_dimension, Mutate, MUTATE),
+    app_command!("sheets", "sheet_remove_dimension", "Take one dimension off its sheet.", SheetIdArgs, sheet_remove_dimension, Mutate, DESTRUCTIVE),
+    app_command!("sheets", "sheet_add_ordinate", "Add an ORDINATE SET drawn on the sheet: a datum anchor and any number of members, each reading its signed distance from the datum along one paper axis (`horizontal` reads x, right positive; `vertical` reads UP the page). Anchors are the same `{placement}:{kind}:{solid}#{entity}` references a sheet dimension takes. Returns the set id.", AddOrdinateArgs, sheet_add_ordinate, Mutate, MUTATE, schema_of::<SheetAdded>),
+    app_command!("sheets", "sheet_update_ordinate", "Patch an ordinate set's axis, datum, members, baseline offset, precision or tolerance block (`tolMode`, `tolUpper`, `tolLower`, `isReference`, written on every member's value and never on the datum's); absent keys are unchanged. Clearing the DATUM keeps the set, unresolved: every value it draws is a distance from the datum, so until one is picked again it draws its id and the reason.", UpdateOrdinateArgs, sheet_update_ordinate, Mutate, MUTATE),
+    app_command!("sheets", "sheet_move_ordinate", "Move an ordinate set's BASELINE: its signed distance from the datum in paper millimetres \u{2014} what dragging the datum's value box in the sheet viewport does. One number moves the whole run.", MoveOrdinateArgs, sheet_move_ordinate, Mutate, MUTATE),
+    app_command!("sheets", "sheet_remove_ordinate", "Take one ordinate set off its sheet.", SheetIdArgs, sheet_remove_ordinate, Mutate, DESTRUCTIVE),
+    app_command!("sheets", "sheet_add_section", "Add a SECTION VIEW of a placement: a second placement of the same saved PMI view whose camera looks along the normal of the plane through the two anchors, drawing the model CLIPPED at that plane with the cut faces hatched. Both anchors must be points of `source`, whose own viewing direction lies in the plane. The section line, its arrows and its letter are drawn on `source`. Returns the placement id.", AddSectionArgs, sheet_add_section, Mutate, MUTATE, schema_of::<SheetAdded>),
+    app_command!("sheets", "sheet_add_detail", "Add a DETAIL VIEW of a placement: the region inside a circle picked on it \u{2014} centred on one anchor, its rim through another \u{2014} redrawn at a scale of its own (twice the source's by default) through the SOURCE's camera, the model's visible lines clipped to the circle. The circle and its letter are drawn on `source`; the detail is captioned `DETAIL B` over its scale. A detail of a detail and a detail of a section are refused by name. Returns the placement id.", AddDetailArgs, sheet_add_detail, Mutate, MUTATE, schema_of::<SheetAdded>),
+    app_command!("sheets", "sheet_new_section", "Add a SECTION VIEW with no cutting line yet and open its form \u{2014} what the Drawing workbench's Section view button does. It draws its id and `no cutting line yet` until its `cut` field (two anchors of one placement) is set, through `sheet_update_view` or the form's reference picker; the first line names its source, whose saved view and scale it takes, beside it. Returns the placement id.", NewDerivedArgs, sheet_new_section, Mutate, MUTATE, schema_of::<SheetAdded>),
+    app_command!("sheets", "sheet_new_detail", "Add a DETAIL VIEW with no circle yet and open its form \u{2014} what the Drawing workbench's Detail view button does. It is unresolved until its `centre` and `rim` fields (anchors of one placement) are set, through `sheet_update_view` or the form's reference picker; the first names its source, whose view it takes at twice its scale, beside it. Returns the placement id.", NewDerivedArgs, sheet_new_detail, Mutate, MUTATE, schema_of::<SheetAdded>),
+    app_command!("sheets", "sheet_anchor_pick", "Pick an anchor BY NAME while the reference picker is up for a sheet object's reference row \u{2014} what clicking its marker (`sheet/anchor:<ref>`) does, for anchors that sit too close on the paper for a click to say which was meant. A list row gains it (in a row that is full for its object, the oldest pick makes room) and commits from the row's own `sheets/sheets:field:<path>#activate` (Done while it is focused); a single row is replaced and commits on the pick. Refused when no sheet reference is being picked.", AnchorPickArgs, sheet_anchor_pick, Mutate, MUTATE),
 ];

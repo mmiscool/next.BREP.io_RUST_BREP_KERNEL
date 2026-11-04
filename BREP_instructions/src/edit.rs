@@ -203,6 +203,7 @@ pub struct AddReport {
     pub left: Vec<LeftOccurrence>,
 }
 
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LeftOccurrence {

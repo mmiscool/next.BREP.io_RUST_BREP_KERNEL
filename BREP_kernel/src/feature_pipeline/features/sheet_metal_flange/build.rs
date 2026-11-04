@@ -315,7 +315,8 @@ fn resolve_selection(
 /// `{flat}:CUTOUT:{hole}:{segment}` (hole bore wall). The loop-level cap name
 /// `{flat}:CUTOUT:{hole}` does NOT parse — the pick must name a segment.
 fn parse_target(name: &str) -> Option<Target> {
-    let base = strip_dedup_suffix(name);
+    // A mirrored part's names end in its mirrors' `::{feature}` namespaces.
+    let base = strip_dedup_suffix(name.split("::").next().unwrap_or(name));
     if let Some((flat, rest)) = base.split_once(":CUTOUT:") {
         if flat.is_empty() {
             return None;
@@ -435,5 +436,6 @@ pub(super) fn corner_child_flat(
         holes: Vec::new(),
         hole_bends: Vec::new(),
         outline_curves: Default::default(),
+        end_cuts: Vec::new(),
     })
 }

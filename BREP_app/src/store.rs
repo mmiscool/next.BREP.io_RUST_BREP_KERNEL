@@ -240,6 +240,10 @@ pub enum PlaceKind {
 ///
 /// Unknown extensions fall back to `application/octet-stream`, which is the
 /// correct "some bytes, download them" answer.
+///
+/// It is also the type a file is UPLOADED to the PLM with (attachments and
+/// workspace files), so a model stored there comes back down as the same
+/// opaque bytes and keeps its name.
 pub fn media_type(file_name: &str) -> &'static str {
     let extension = std::path::Path::new(file_name)
         .extension()
@@ -267,14 +271,68 @@ pub fn media_type(file_name: &str) -> &'static str {
         "dxf" => "image/vnd.dxf",
         "csv" => "text/csv",
         "txt" => "text/plain",
+        "md" => "text/markdown",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
         _ => "application/octet-stream",
     }
+}
+
+/// Write `bytes` to `path` so that a crash or a full disk mid-save never leaves
+/// a short or empty file where the last good one was: a temporary beside
+/// `path` (`<name>.<pid>-<n>.tmp`, unique per write, never a sibling's name),
+/// written, flushed to disk, then renamed over `path`; on any failure the
+/// temporary is removed and `path` is untouched. `secret` creates the
+/// temporary owner-only (0600 on unix) from the first byte. The app's one
+/// atomic write: model saves, exports and the PLM config/token (I4).
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+pub(crate) fn write_atomic(path: &std::path::Path, bytes: &[u8], secret: bool) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let name = path
+        .file_name()
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "no file name"))?;
+    let mut temp_name = name.to_os_string();
+    temp_name.push(format!(".{}-{}.tmp", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
+    let temp = path.with_file_name(temp_name);
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    if secret {
+        use std::os::unix::fs::OpenOptionsExt;
+        // Created 0600, never chmod-ed down afterwards: there is no instant at
+        // which a secret sits in a file another user could open.
+        options.mode(0o600);
+    }
+    #[cfg(not(unix))]
+    let _ = secret;
+    let written = options
+        .open(&temp)
+        .and_then(|mut file| {
+            file.write_all(bytes)?;
+            file.sync_all()
+        })
+        .and_then(|()| std::fs::rename(&temp, path));
+    if written.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    written
 }
 
 /// The application's single persistent-storage abstraction. Reserved application
 /// keys and named model documents are read and written through the same methods.
 /// All methods take `&self`; mutable backend state lives behind interior mutability.
 pub trait ModelStore {
+    /// Bounded file management over this host's persistent file store.
+    #[cfg(feature = "automation")]
+    fn files(&self, _request: &brep_mcp_core::files::Request) -> Result<brep_mcp_core::files::Reply, String> {
+        Err("files is unsupported by this store backend".into())
+    }
+    /// None while persistence is in flight; otherwise the operation's result.
+    #[cfg(feature = "automation")]
+    fn files_settled(&self, _request: &brep_mcp_core::files::Request) -> Option<Result<(), String>> { Some(Ok(())) }
+
     /// A short human label of where documents persist, for the panel header
     /// (e.g. `"filesystem: ~/.config/brep-app/models"` or `"browser storage"`).
     fn backend_label(&self) -> String {
@@ -421,6 +479,25 @@ pub trait ModelStore {
     /// file-based app, and the tab is absent.
     fn plm_session(&self) -> Option<crate::plm::connection::Session> {
         None
+    }
+
+    /// Where this session's PLM server URL is kept: the Settings PLM tab's
+    /// Server URL field reads it, in every native session (file or PLM).
+    /// `None` where no `plm.json` exists to write — the browser, whose PLM is
+    /// the server that serves its page, and the in-memory stores.
+    fn plm_url_setting(&self) -> Option<crate::plm::connection::UrlSetting> {
+        None
+    }
+
+    /// Save the Server URL to `plm.json` as `--plm-configure` does
+    /// ([`crate::plm::config::repoint`]: a malformed URL is refused, and a
+    /// different server drops this machine's token). A file session that was
+    /// on `plm.json` reports the new server from here on (signed out), so the
+    /// tab's sign-in reaches it at once; a PLM session stays on its server
+    /// until the next start.
+    fn save_plm_url(&self, url: &str) -> Result<crate::plm::connection::UrlSaved, String> {
+        let _ = url;
+        Err("this session keeps no PLM settings".into())
     }
 
     /// The signed-in PLM client of a session whose store IS the PLM, for the
@@ -877,10 +954,18 @@ mod native_boot {
     /// session on the file stores at `root` instead, saying why on the first
     /// frame. A PLM never makes the app fail to start.
     pub fn boot_native_store(root: PathBuf, config: PlmConfig) -> Box<dyn ModelStore> {
-        let url = config.url.clone();
+        let (url, source) = (config.url.clone(), config.url_source);
         match boot_with(&root, config, plm_connect, BOOT_TIMEOUT) {
             Ok(store) => Box::new(store),
-            Err(reason) => super::file_store_with_notice(root, format!("PLM at {url}: {reason}")),
+            Err(reason) => {
+                let reason = format!("PLM at {url}: {reason}");
+                Box::new(
+                    FileModelStore::rooted_at(root)
+                        .with_plm_launch(url, source)
+                        .with_notice(format!("{reason} — this session uses the file stores"))
+                        .with_plm_reason(reason),
+                )
+            }
         }
     }
 
@@ -903,6 +988,7 @@ mod native_boot {
     ) -> Result<NativeMirrorStore, String> {
         use crate::plm::native::block_on_for;
         let late = || format!("no answer within {} s", timeout.as_secs());
+        let files = FileModelStore::rooted_at(root.to_path_buf()).with_plm_launch(config.url.clone(), config.url_source);
         let local: Rc<dyn StoreBackend> = Rc::new(NativeFileBackend::rooted_at(root.to_path_buf()));
         let backend = block_on_for(connect(config, local), timeout).ok_or_else(late)??;
         // The index, not the documents: a catalog of thousands of parts must
@@ -913,7 +999,7 @@ mod native_boot {
             .map_err(|e| format!("the store index would not load ({e})"))?;
         let wake: Rc<dyn Fn()> = Rc::new(crate::plm::native::request_wake);
         let core = MirrorStore::from_index(backend, entries, Some(wake));
-        Ok(NativeMirrorStore { core, files: FileModelStore::rooted_at(root.to_path_buf()) })
+        Ok(NativeMirrorStore { core, files })
     }
 
     /// The native PLM session store: the mirror (every CRUD and explorer
@@ -926,6 +1012,9 @@ mod native_boot {
     }
 
     impl ModelStore for NativeMirrorStore {
+        #[cfg(feature = "automation")]
+        fn files(&self, request: &brep_mcp_core::files::Request) -> Result<brep_mcp_core::files::Reply, String> { self.files.files(request) }
+
         // --- delegated to the mirror ------------------------------------------
         fn backend_label(&self) -> String {
             self.core.backend_label()
@@ -994,6 +1083,14 @@ mod native_boot {
             use crate::plm::connection::{parse_label, Keep, Session, Status};
             let (url, username) = parse_label(&self.core.backend_label())?;
             Some(Session { status: Status::Connected { url, username }, keep: Keep::Files(self.files.root().to_path_buf()) })
+        }
+        // The URL lives in the local file lane: `files` was told this
+        // launch's URL and where it came from.
+        fn plm_url_setting(&self) -> Option<crate::plm::connection::UrlSetting> {
+            self.files.plm_url_setting()
+        }
+        fn save_plm_url(&self, url: &str) -> Result<crate::plm::connection::UrlSaved, String> {
+            self.files.save_plm_url(url)
         }
         fn pending_writes(&self) -> usize {
             self.core.pending_writes()
@@ -1231,6 +1328,9 @@ mod native_model {
         /// The PLM configured in `app_dir` (read once, when the store is
         /// built) and why this session is not on it: the PLM tab's status.
         plm: RefCell<Option<crate::plm::connection::Session>>,
+        /// Where `plm`'s URL came from: `plm.json`, unless the launch named
+        /// it by switch or variable ([`Self::with_plm_launch`]).
+        plm_source: Cell<crate::plm::config::Source>,
     }
 
     impl FileModelStore {
@@ -1245,6 +1345,7 @@ mod native_model {
                 mutations: Cell::new(0),
                 notices: RefCell::new(Vec::new()),
                 plm: RefCell::new(plm),
+                plm_source: Cell::new(crate::plm::config::Source::File),
             }
         }
 
@@ -1263,6 +1364,7 @@ mod native_model {
                 mutations: Cell::new(0),
                 notices: RefCell::new(Vec::new()),
                 plm: RefCell::new(None),
+                plm_source: Cell::new(crate::plm::config::Source::File),
             }
         }
 
@@ -1282,6 +1384,7 @@ mod native_model {
                 mutations: Cell::new(0),
                 notices: RefCell::new(Vec::new()),
                 plm: RefCell::new(plm),
+                plm_source: Cell::new(crate::plm::config::Source::File),
             }
         }
 
@@ -1289,6 +1392,16 @@ mod native_model {
         /// [`ModelStore::take_persistence_errors`]).
         pub fn with_notice(self, notice: String) -> Self {
             self.notices.borrow_mut().push(notice);
+            self
+        }
+
+        /// The PLM this launch resolved — `url` from `source`, which may be
+        /// `--plm-url` or `BREP_PLM_URL` rather than this root's `plm.json` —
+        /// as the session the PLM tab shows (not connected, reason unknown).
+        pub fn with_plm_launch(self, url: String, source: crate::plm::config::Source) -> Self {
+            use crate::plm::connection::{Keep, Session, Status};
+            *self.plm.borrow_mut() = Some(Session { status: Status::NotConnected { url, reason: None }, keep: Keep::Files(self.app_dir.clone()) });
+            self.plm_source.set(source);
             self
         }
 
@@ -1378,6 +1491,17 @@ mod native_model {
     }
 
     impl ModelStore for FileModelStore {
+        #[cfg(feature = "automation")]
+        fn files(&self, request: &brep_mcp_core::files::Request) -> Result<brep_mcp_core::files::Reply, String> {
+            std::fs::create_dir_all(&self.dir).map_err(|e| e.to_string())?;
+            let backend = brep_mcp_core::files::native::NativeFiles::new([
+                ("documents".into(), self.dir.clone()), ("workspace".into(), self.dir.clone()),
+            ])?;
+            let reply = brep_mcp_core::files::execute(&backend, request)?;
+            if !request.operation.annotations().read_only { self.mutations.set(self.mutations.get().wrapping_add(1)); }
+            Ok(reply)
+        }
+
         fn backend_label(&self) -> String {
             format!("filesystem: {}", self.dir.display())
         }
@@ -1394,6 +1518,30 @@ mod native_model {
 
         fn plm_session(&self) -> Option<crate::plm::connection::Session> {
             self.plm.borrow().clone()
+        }
+
+        fn plm_url_setting(&self) -> Option<crate::plm::connection::UrlSetting> {
+            use crate::plm::connection::{Status, UrlSetting};
+            let plm = self.plm.borrow();
+            let url = plm.as_ref().map(|session| match &session.status {
+                Status::Connected { url, .. } | Status::NotConnected { url, .. } => url.clone(),
+            });
+            Some(UrlSetting {
+                dir: self.app_dir.clone(),
+                url: url.filter(|url| !url.is_empty()),
+                source: plm.as_ref().map(|_| self.plm_source.get()),
+            })
+        }
+
+        fn save_plm_url(&self, url: &str) -> Result<crate::plm::connection::UrlSaved, String> {
+            let (url, token_dropped) = crate::plm::config::repoint(&self.app_dir, url)?;
+            // A session on plm.json moves to the new server now (signed out:
+            // the tab's sign-in reaches it). One a switch or variable named
+            // keeps that URL for this launch; plm.json is for the next.
+            if self.plm_source.get() == crate::plm::config::Source::File {
+                *self.plm.borrow_mut() = configured_plm(&self.app_dir);
+            }
+            Ok(crate::plm::connection::UrlSaved { url, token_dropped })
         }
 
         fn list(&self) -> Vec<String> {
@@ -1426,7 +1574,7 @@ mod native_model {
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent).map_err(|e| format!("create models dir: {e}"))?;
             }
-            std::fs::write(&path, contents).map_err(|e| format!("write {}: {e}", path.display()))?;
+            super::write_atomic(&path, contents.as_bytes(), false).map_err(|e| format!("write {}: {e}", path.display()))?;
             self.bump();
             Ok(())
         }
@@ -1596,7 +1744,7 @@ mod native_model {
                 .into_owned();
             let file_name = super::model_file_name(&file_name);
             let path = self.browser_dir.borrow().join(file_name);
-            std::fs::write(&path, contents)
+            super::write_atomic(&path, contents.as_bytes(), false)
                 .map_err(|e| format!("write {}: {e}", path.display()))?;
             // This door writes the file ITSELF rather than going through
             // `write`, so it has to move the generation itself.
@@ -1614,7 +1762,7 @@ mod native_model {
             // of a fresh store may not yet (the export lane made it too).
             std::fs::create_dir_all(&folder).map_err(|e| format!("create {}: {e}", folder.display()))?;
             let path = folder.join(file_name);
-            std::fs::write(&path, contents)
+            super::write_atomic(&path, contents, false)
                 .map_err(|e| format!("write {}: {e}", path.display()))?;
             Ok(path.to_string_lossy().into_owned())
         }
@@ -1668,7 +1816,7 @@ mod native_model {
                 .ok_or("invalid export file name")?
                 .to_owned();
             let path = self.dir.join(name);
-            std::fs::write(&path, contents)
+            super::write_atomic(&path, contents, false)
                 .map_err(|e| format!("write {}: {e}", path.display()))
         }
     }
@@ -1720,6 +1868,12 @@ pub(crate) mod mirror_store {
     /// at `brep-app:settings` / `:dock_layout` / `:pinned` (see [`MirrorStore::key`]).
     pub(crate) const PREFIX: &str = "brep-app:model:";
     pub(crate) const DIR_PREFIX: &str = "brep-app:dir:";
+    /// Ordinary binary/text files stay separate from model documents.
+    pub(crate) const FILE_PREFIX: &str = "brep-app:file:";
+
+    #[cfg(feature = "automation")]
+    mod files { include!("store_files.rs"); }
+
 
     /// How many distinct persistence failures the error log keeps before the
     /// oldest is dropped. The log is a user-facing notice channel, not telemetry.
@@ -1749,7 +1903,7 @@ pub(crate) mod mirror_store {
 
     /// One row of a PLM index answer: the mirror key, its size and the hash
     /// of the document the server holds (sha256, hex — what
-    /// [`crate::plm::kicad::content_hash`] computes of the same bytes).
+    /// [`crate::plm::content_hash`] computes of the same bytes).
     pub(crate) struct IndexRow {
         pub(crate) key: String,
         pub(crate) bytes: u64,
@@ -1772,7 +1926,7 @@ pub(crate) mod mirror_store {
     /// A key this module did not mint counts as a document.
     #[cfg_attr(not(test), allow(dead_code))] // routed by S1's PLM session
     pub(crate) fn key_space(key: &str) -> Option<KeySpace> {
-        if key.starts_with(DIR_PREFIX) {
+        if key.starts_with(DIR_PREFIX) || key.starts_with(FILE_PREFIX) {
             return None;
         }
         for name in super::PREFERENCE_KEYS.iter().chain(super::LOCAL_KEYS) {
@@ -1934,6 +2088,14 @@ pub(crate) mod mirror_store {
 
         /// Delete `key`. Succeeding on an absent key is correct.
         fn delete(&self, key: &str) -> BackendFuture<()>;
+
+        /// Commit a bounded file rename as one transaction. A failure must
+        /// preserve the source keys; stores without this primitive refuse it.
+        #[cfg(feature = "automation")]
+        fn move_files(&self, _entries: Vec<(String, String, String)>) -> BackendFuture<()> {
+            Box::pin(async { Err("atomic file moves are unsupported by this backend".into()) })
+        }
+
     }
 
     /// A [`StoreBackend`] that sends each [`KeySpace`] to its own backend — the
@@ -2620,7 +2782,7 @@ pub(crate) mod mirror_store {
                     self.freshness.borrow_mut().insert(row.key.clone(), issued);
                     let same = match entries.get(&row.key) {
                         Some(Entry::Resident(held)) => {
-                            crate::plm::kicad::content_hash(held.as_bytes()) == row.content_hash
+                            crate::plm::content_hash(held.as_bytes()) == row.content_hash
                         }
                         Some(Entry::OnDisk { bytes }) => *bytes == row.bytes,
                         None => false,
@@ -2913,6 +3075,13 @@ pub(crate) mod mirror_store {
     }
 
     impl ModelStore for MirrorStore {
+        #[cfg(feature = "automation")]
+        fn files(&self, request: &brep_mcp_core::files::Request) -> Result<brep_mcp_core::files::Reply, String> {
+            brep_mcp_core::files::execute(self, request)
+        }
+        #[cfg(feature = "automation")]
+        fn files_settled(&self, request: &brep_mcp_core::files::Request) -> Option<Result<(), String>> { self.file_settlement(request) }
+
         fn backend_label(&self) -> String {
             self.backend.label()
         }
@@ -3243,7 +3412,7 @@ mod host;
 #[cfg(target_arch = "wasm32")]
 mod web_model {
     use super::mirror_store::{
-        BackendFuture, MirrorStore, StoreBackend, UnavailableBackend, DIR_PREFIX, PREFIX,
+        BackendFuture, MirrorStore, StoreBackend, UnavailableBackend, DIR_PREFIX, FILE_PREFIX, PREFIX,
     };
     use super::{
         model_display_name, BrowserEntry, BrowserPlace, ImportedFile, ModelStore,
@@ -3566,7 +3735,7 @@ mod web_model {
         /// `@dock_layout`, `@recovery` and friends are per-tab working state, and
         /// syncing them live would have two windows fight over one layout.
         fn announce(channel: &Option<web_sys::BroadcastChannel>, key: &str) {
-            if !key.starts_with(PREFIX) && !key.starts_with(DIR_PREFIX) {
+            if !key.starts_with(PREFIX) && !key.starts_with(DIR_PREFIX) && !key.starts_with(FILE_PREFIX) {
                 return;
             }
             if let Some(channel) = channel {
@@ -3632,6 +3801,31 @@ mod web_model {
                     entries.push((key, value));
                 }
                 Ok(entries)
+            })
+        }
+
+        #[cfg(feature = "automation")]
+        fn move_files(&self, entries: Vec<(String, String, String)>) -> BackendFuture<()> {
+            let started = (|| -> Result<IdbFuture, String> {
+                let (transaction, store) = self.transact(web_sys::IdbTransactionMode::Readwrite)?;
+                for (old, new, value) in &entries {
+                    let put = store.put_with_key(&JsValue::from_str(value), &JsValue::from_str(new));
+                    let delete = put.and_then(|_| store.delete(&JsValue::from_str(old)));
+                    if let Err(error) = delete {
+                        let _ = transaction.abort();
+                        return Err(js_error(&error));
+                    }
+                }
+                Ok(on_transaction(transaction))
+            })();
+            let channel = self.channel.clone();
+            Box::pin(async move {
+                started?.await?;
+                for (old, new, _) in entries {
+                    Self::announce(&channel, &old);
+                    Self::announce(&channel, &new);
+                }
+                Ok(())
             })
         }
 
@@ -4054,6 +4248,13 @@ mod web_model {
     }
 
     impl ModelStore for IdbModelStore {
+        #[cfg(feature = "automation")]
+        fn files(&self, request: &brep_mcp_core::files::Request) -> Result<brep_mcp_core::files::Reply, String> {
+            self.core.files(request)
+        }
+        #[cfg(feature = "automation")]
+        fn files_settled(&self, request: &brep_mcp_core::files::Request) -> Option<Result<(), String>> { self.core.files_settled(request) }
+
         // --- delegated to the mirror ------------------------------------------
         fn backend_label(&self) -> String {
             self.core.backend_label()

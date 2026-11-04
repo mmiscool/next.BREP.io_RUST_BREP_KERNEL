@@ -23,6 +23,51 @@ pub(super) fn with_straight_corrections_skipped<T>(f: impl FnOnce() -> T) -> T {
     result
 }
 
+/// What the sliver bound (`BREP_SIGN_SLIVER_BOUND`, `solid_props`) reads in
+/// place of the chord corrections: `measure` is the sum, over every station
+/// [`curved_boundary_correction`] would have evaluated, of the station's
+/// |weight · jacobian| (the factor its integrand is multiplied by), so the
+/// skipped correction of any slot is at most `measure` times that slot's
+/// integrand bound. `declined` marks a face whose route reads its own
+/// corrections (the hopped unwrap's area test) or evaluates past an open
+/// direction (where no control-net bound holds); `complement` is the largest
+/// untrimmed total a complete sphere subtracted its cells from (a rounding
+/// scale for the certificate's slack).
+#[derive(Clone, Copy, Default, Debug)]
+pub(super) struct SliverMeasure {
+    pub(super) measure: f64,
+    pub(super) declined: bool,
+    pub(super) complement: f64,
+}
+
+thread_local! {
+    /// Set only inside [`with_sliver_measure`]: the chord corrections
+    /// evaluate no surface station and add their measure here instead.
+    static SLIVER_MEASURE: Cell<Option<SliverMeasure>> = const { Cell::new(None) };
+}
+
+/// Run `f` (one face's sign terms) with the chord corrections replaced by
+/// their measure; returns `f`'s value (cells only) and the measure.
+pub(super) fn with_sliver_measure<T>(f: impl FnOnce() -> T) -> (T, SliverMeasure) {
+    let previous = SLIVER_MEASURE.with(|cell| cell.replace(Some(SliverMeasure::default())));
+    let result = f();
+    let measure = SLIVER_MEASURE.with(|cell| cell.replace(previous)).unwrap_or_default();
+    (result, measure)
+}
+
+fn sliver_measure_active() -> bool {
+    SLIVER_MEASURE.with(|cell| cell.get().is_some())
+}
+
+fn note_sliver(update: impl FnOnce(&mut SliverMeasure)) {
+    SLIVER_MEASURE.with(|cell| {
+        if let Some(mut measure) = cell.get() {
+            update(&mut measure);
+            cell.set(Some(measure));
+        }
+    });
+}
+
 /// Chords whose correction was skipped on this thread since it started.
 pub(super) fn straight_corrections_skipped() -> u64 {
     STRAIGHT_CORRECTIONS_SKIPPED.with(|cell| cell.get())
@@ -132,6 +177,12 @@ pub(super) fn integrate_trimmed_multi_with(
             trim_polygons_unwrapped(face, closed_u, closed_v, u1 - u0, v1 - v0)?;
         mass_profile(|p| p.polygons_ms += super::profile::elapsed_ms(polygons_started));
         if hopped {
+            if sliver_measure_active() {
+                // The route picks raw or unwrapped by an area read WITH its
+                // corrections; the bound cannot stand in for it.
+                note_sliver(|m| m.declined = true);
+                return Ok(vec![0.0; kinds.len()]);
+            }
             let raw = trim_polygons_tagged(face)?;
             let raw_area =
                 integrate_trimmed_polys(face, &[Integrand::Area], &raw, false, domain)?[0];
@@ -513,7 +564,9 @@ pub(super) fn integrate_trimmed_polys(
                     && top.sub(frame.origin.sub(pole)).length() <= band));
         if complete && no_winding && orientation != sign {
             for (value, kind) in totals.iter_mut().zip(kinds) {
-                *value = integrate_untrimmed(face, *kind)? - *value;
+                let whole = integrate_untrimmed(face, *kind)?;
+                note_sliver(|m| m.complement = m.complement.max(whole.abs()));
+                *value = whole - *value;
             }
         }
     }
@@ -553,6 +606,21 @@ fn curved_boundary_correction(
     let eps_u = 1e-12 * (u1 - u0).abs();
     let eps_v = 1e-12 * (v1 - v0).abs();
     let skip_straight = SKIP_STRAIGHT_CORRECTIONS.with(|cell| cell.get());
+    let measuring = sliver_measure_active();
+    // On the covering-plane path a station past an OPEN direction reads the
+    // carrier's tangent-plane extension, which the control net does not
+    // bound; the measure declines the face at the first such station (a
+    // closed direction wraps onto the carrier, and the in-domain path skips
+    // or clamps a station past the domain).
+    let (open_u, open_v) = if measuring && extended {
+        match face.surface.closed_directions() {
+            Ok((closed_u, closed_v)) => (!closed_u, !closed_v),
+            Err(_) => (true, true),
+        }
+    } else {
+        (false, false)
+    };
+    let mut measure = 0.0f64;
     // One straightness reading per coedge, taken the first time one of its
     // chords asks.
     let mut straight: Vec<Vec<Option<bool>>> = if skip_straight {
@@ -607,11 +675,25 @@ fn curved_boundary_correction(
                         if !extended && (u < u0 - eps_u || u > u1 + eps_u || v < v0 - eps_v || v > v1 + eps_v) {
                             continue;
                         }
+                        if measuring {
+                            if (open_u && (u < u0 - eps_u || u > u1 + eps_u)) || (open_v && (v < v0 - eps_v || v > v1 + eps_v)) {
+                                note_sliver(|m| m.declined = true);
+                                return Ok(());
+                            }
+                            measure += (weight_s * ACROSS_W[j] * jacobian).abs();
+                            continue;
+                        }
                         station(u, v, -orientation * weight_s * ACROSS_W[j] * jacobian, totals)?;
                     }
                 }
             }
         }
+    }
+    if measuring {
+        if !measure.is_finite() {
+            note_sliver(|m| m.declined = true);
+        }
+        note_sliver(|m| m.measure += measure);
     }
     Ok(())
 }

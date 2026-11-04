@@ -91,7 +91,7 @@ button {
 button:hover { filter: brightness(1.08); }
 button:disabled { opacity: .45; cursor: not-allowed; filter: none; }
 button.ghost { background: transparent; color: var(--ink); border-color: var(--line); }
-button.link { background: none; border: none; color: var(--accent); padding: 2px 6px; }
+button.link { background: none; border: none; color: var(--accent); padding: 2px 6px; text-align: left; }
 button.danger { background: var(--danger); }
 /* A text button that warns: red text, never a red block. */
 button.link.danger { background: none; color: var(--danger); }
@@ -800,6 +800,9 @@ th { text-transform: none; letter-spacing: normal; }
 .tree-row.drop-target { background: color-mix(in srgb, var(--accent) 18%, var(--panel)); outline: 2px dashed var(--accent); }
 .tree-empty { font-size: 12px; color: var(--muted); margin: 8px; }
 .detail-heading { display: flex; gap: 16px; align-items: center; }
+.folder-properties { display: grid; gap: 10px; max-width: 420px; margin: 8px 0 12px; }
+.folder-properties > button { justify-self: start; }
+.folder-properties input[readonly] { background: transparent; border-color: transparent; padding-left: 0; }
 .detail-heading .thumb-lg { width: 64px; height: 64px; flex: 0 0 64px; }
 .detail-heading > div { min-width: 0; }
 .detail-heading p { margin: 4px 0; }
@@ -1235,3 +1238,10 @@ body.resizing-panes, body.resizing-panes * { cursor: col-resize !important; user
 .job-steps li.current { border-color: var(--accent); }
 .job-sign { display: grid; gap: 8px; margin-top: 8px; }
 .job-sign button { min-height: 44px; }
+
+/* The Home tree's and part pages' right-click menu (Copy, Cut, Paste). */
+.context-menu { position: fixed; z-index: 1000; min-width: 220px; max-width: min(360px, calc(100vw - 8px)); padding: 4px; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; box-shadow: 0 6px 24px rgb(0 0 0 / .18); display: grid; }
+.context-menu button { background: transparent; color: var(--ink); border: 0; border-radius: 4px; text-align: left; padding: 7px 10px; font-size: 13px; min-height: 32px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.context-menu button:hover:not(:disabled), .context-menu button:focus-visible { background: color-mix(in srgb, var(--accent) 12%, var(--panel)); outline: none; }
+.context-menu button:disabled { color: var(--muted); }
+.context-menu hr { border: 0; border-top: 1px solid var(--line); margin: 4px 0; }

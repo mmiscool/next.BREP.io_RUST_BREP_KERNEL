@@ -114,6 +114,7 @@ pub fn capabilities_json() -> String {
             "import_iges",
             "write_binary_stl",
             "read_binary_stl",
+            "read_stl",
             "mesh_to_faceted_brep",
             "import_stl_solid",
             "write_obj",
@@ -149,26 +150,28 @@ pub fn mesh_volume_json(mesh_json: &str) -> Result<f64, JsValue> {
 
 #[wasm_bindgen]
 pub fn write_stl_bytes(mesh_json: &str, name: &str) -> Result<Vec<u8>, JsValue> {
-    let mesh: Mesh =
-        serde_json::from_str(mesh_json).map_err(|error| javascript_error(error.to_string()))?;
+    let mesh: Mesh = json_in(mesh_json)?;
     write_binary_stl(&mesh, name).map_err(javascript_error)
 }
 
+/// Read binary or ASCII STL bytes ([`read_stl`]) as `{tri_count,
+/// positions, format}` JSON.
 #[wasm_bindgen]
 pub fn read_stl_json(data: &[u8]) -> Result<String, JsValue> {
-    let result = read_binary_stl(data).map_err(javascript_error)?;
-    serde_json::to_string(&result).map_err(|error| javascript_error(error.to_string()))
+    let result = read_stl(data).map_err(javascript_error)?;
+    json_out(&result)
 }
 
-/// Import binary-STL bytes as a faceted (planar-triangle) BREP solid.
+/// Import binary or ASCII STL bytes ([`read_stl`]) as a faceted
+/// (planar-triangle) BREP solid.
 /// `tolerance <= 0` derives the vertex-weld band from the model's
 /// bounding-box diagonal.
 #[wasm_bindgen]
 pub fn import_stl_solid(data: &[u8], tolerance: f64) -> Result<String, JsValue> {
     crate::panic_hook::set_once();
-    let stl = read_binary_stl(data).map_err(javascript_error)?;
+    let stl = read_stl(data).map_err(javascript_error)?;
     let solid = mesh_to_faceted_brep(&stl.positions, None, tolerance).map_err(|refusal| javascript_error(refusal.message))?;
-    serde_json::to_string(&solid).map_err(|error| javascript_error(error.to_string()))
+    json_out(&solid)
 }
 
 /// Diagnostic carrier preview: re-express a surface over an inflated domain
@@ -176,21 +179,19 @@ pub fn import_stl_solid(data: &[u8], tolerance: f64) -> Result<String, JsValue> 
 /// directions keep their full period). `inflate <= 0` defaults to 2.
 #[wasm_bindgen]
 pub fn carrier_preview_patch_json(surface_json: &str, inflate: f64) -> Result<String, JsValue> {
-    let surface: NurbsSurface =
-        serde_json::from_str(surface_json).map_err(|error| javascript_error(error.to_string()))?;
+    let surface: NurbsSurface = json_in(surface_json)?;
     let inflate = if inflate.is_finite() && inflate > 0.0 {
         inflate
     } else {
         2.0
     };
     let preview = carrier_preview_patch(&surface, inflate).map_err(javascript_error)?;
-    serde_json::to_string(&preview).map_err(|error| javascript_error(error.to_string()))
+    json_out(&preview)
 }
 
 #[wasm_bindgen]
 pub fn write_obj_text(mesh_json: &str, name: &str) -> Result<String, JsValue> {
-    let mesh: Mesh =
-        serde_json::from_str(mesh_json).map_err(|error| javascript_error(error.to_string()))?;
+    let mesh: Mesh = json_in(mesh_json)?;
     write_obj(&mesh, name).map_err(javascript_error)
 }
 
@@ -203,5 +204,5 @@ pub fn import_obj_solid(text: &str, tolerance: f64) -> Result<String, JsValue> {
     let obj = read_obj(text).map_err(javascript_error)?;
     let solid = mesh_to_faceted_brep(&obj.positions, Some(&obj.indices), tolerance)
         .map_err(|refusal| javascript_error(refusal.message))?;
-    serde_json::to_string(&solid).map_err(|error| javascript_error(error.to_string()))
+    json_out(&solid)
 }

@@ -74,6 +74,10 @@ pub enum MeasureKind {
     Solid,
     Face,
     Edge,
+    /// A whole-solid CHECK for `model_inspect`: the kernel's topology
+    /// validation issues and the exact volume, read from the runner's warm
+    /// registry instead of a main-thread re-execution of the history.
+    Inspect,
 }
 
 /// A per-object MEASUREMENT request routed to the runner (which owns the warm
@@ -935,6 +939,17 @@ fn measure_json(runner: &crate::pipeline::SceneRunner, query: &MeasureQuery) -> 
         .to_string();
     };
     match query.kind {
+        MeasureKind::Inspect => {
+            let issues: Vec<serde_json::Value> = match brep_kernel::validate_handle_native(handle) {
+                Ok(issues) => issues.into_iter().map(|(severity, message)| serde_json::json!({ "severity": severity, "message": message })).collect(),
+                Err(error) => vec![serde_json::json!({ "severity": "error", "message": format!("validation unavailable: {error}") })],
+            };
+            let (volume, volume_error) = match brep_kernel::mass_measures_handle_native(handle) {
+                Ok(properties) => (Some(properties.volume), None),
+                Err(error) => (None, Some(error)),
+            };
+            serde_json::json!({ "ok": true, "kind": "inspect", "issues": issues, "volume": volume, "volumeError": volume_error }).to_string()
+        }
         MeasureKind::Solid => {
             match brep_kernel::mass_properties_handle_native(handle, query.density) {
                 Ok(properties) => {

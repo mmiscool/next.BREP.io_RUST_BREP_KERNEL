@@ -23,6 +23,7 @@
 //! [`Workspaces`], which S1's client implements ([`PlmWorkspaces`]); the golden tests below
 //! run it against the REAL router. Nothing here is constructed without a server.
 
+use crate::http::query_component;
 use crate::plm::PlmFuture;
 use eframe::egui;
 use serde::Deserialize;
@@ -30,7 +31,7 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::task::Waker;
 
-use super::plm_attachments::{human_size, media_type_for, Attachment};
+use super::plm_attachments::{human_size, Attachment};
 use super::plm_parts::Pending;
 
 // --- the wire ------------------------------------------------------------------
@@ -235,18 +236,6 @@ pub struct PlmWorkspaces {
     pub client: std::rc::Rc<crate::plm::client::PlmClient>,
 }
 
-fn encode(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    for byte in text.bytes() {
-        if byte.is_ascii_alphanumeric() || b"-._~".contains(&byte) {
-            out.push(byte as char);
-        } else {
-            out.push_str(&format!("%{byte:02X}"));
-        }
-    }
-    out
-}
-
 impl PlmWorkspaces {
     fn read<T: for<'de> Deserialize<'de> + 'static>(
         &self,
@@ -270,7 +259,7 @@ impl PlmWorkspaces {
 
     fn bytes_entry(&self, method: &'static str, path: String, name: &str, bytes: Vec<u8>) -> PlmFuture<Entry> {
         let client = self.client.clone();
-        let media_type = media_type_for(name).to_string();
+        let media_type = crate::store::media_type(name).to_string();
         Box::pin(async move {
             let response = client.call_typed(method, &path, bytes, &media_type).await.map_err(|e| e.to_string())?;
             serde_json::from_slice::<Made>(&response.body)
@@ -291,7 +280,7 @@ impl Workspaces for PlmWorkspaces {
 
     fn folder(&self, owner: &str, parent: &str) -> PlmFuture<Vec<Entry>> {
         let folder: PlmFuture<Folder> =
-            self.read("GET", format!("/api/workspace/entries?owner={}&parent={}", encode(owner), encode(parent)), None);
+            self.read("GET", format!("/api/workspace/entries?owner={}&parent={}", query_component(owner), query_component(parent)), None);
         Box::pin(async move { Ok(folder.await?.entries) })
     }
 
@@ -304,21 +293,21 @@ impl Workspaces for PlmWorkspaces {
     }
 
     fn add_file(&self, parent: &str, name: &str, bytes: Vec<u8>) -> PlmFuture<Entry> {
-        let path = format!("/api/workspace/files?parent={}&name={}", encode(parent), encode(name));
+        let path = format!("/api/workspace/files?parent={}&name={}", query_component(parent), query_component(name));
         self.bytes_entry("POST", path, name, bytes)
     }
 
     fn replace_file(&self, id: &str, name: &str, bytes: Vec<u8>) -> PlmFuture<Entry> {
-        self.bytes_entry("PUT", format!("/api/workspace/entries/{}/content", encode(id)), name, bytes)
+        self.bytes_entry("PUT", format!("/api/workspace/entries/{}/content", query_component(id)), name, bytes)
     }
 
     fn update(&self, id: &str, fields: Value) -> PlmFuture<Entry> {
-        self.entry("PATCH", format!("/api/workspace/entries/{}", encode(id)), Some(fields))
+        self.entry("PATCH", format!("/api/workspace/entries/{}", query_component(id)), Some(fields))
     }
 
     fn delete(&self, id: &str, recursive: bool) -> PlmFuture<()> {
         let client = self.client.clone();
-        let path = format!("/api/workspace/entries/{}?recursive={recursive}", encode(id));
+        let path = format!("/api/workspace/entries/{}?recursive={recursive}", query_component(id));
         Box::pin(async move {
             client.call("DELETE", &path, None).await.map_err(|e| e.to_string())?;
             Ok(())
@@ -326,46 +315,32 @@ impl Workspaces for PlmWorkspaces {
     }
 
     fn versions(&self, id: &str) -> PlmFuture<Vec<Version>> {
-        let versions: PlmFuture<Versions> = self.read("GET", format!("/api/workspace/entries/{}/versions", encode(id)), None);
+        let versions: PlmFuture<Versions> = self.read("GET", format!("/api/workspace/entries/{}/versions", query_component(id)), None);
         Box::pin(async move { Ok(versions.await?.versions) })
     }
 
     fn restore(&self, id: &str, version: u32) -> PlmFuture<Entry> {
-        self.entry("POST", format!("/api/workspace/entries/{}/versions/{version}/restore", encode(id)), None)
+        self.entry("POST", format!("/api/workspace/entries/{}/versions/{version}/restore", query_component(id)), None)
     }
 
     fn download(&self, id: &str, version: u32) -> PlmFuture<Vec<u8>> {
         let client = self.client.clone();
-        let path = format!("/api/workspace/entries/{}/content?version={version}", encode(id));
+        let path = format!("/api/workspace/entries/{}/content?version={version}", query_component(id));
         Box::pin(async move { Ok(client.call("GET", &path, None).await.map_err(|e| e.to_string())?.body) })
     }
 
     fn promote(&self, id: &str, to: &PromoteTo) -> PlmFuture<Attachment> {
         let body = json!({ "part": to.part, "revision": to.revision, "version": to.version, "kind": to.kind });
-        let promoted: PlmFuture<Promoted> = self.read("POST", format!("/api/workspace/entries/{}/promote", encode(id)), Some(body));
+        let promoted: PlmFuture<Promoted> = self.read("POST", format!("/api/workspace/entries/{}/promote", query_component(id)), Some(body));
         Box::pin(async move { Ok(promoted.await?.attachment) })
     }
 
     fn lookup(&self, part: &str) -> PlmFuture<PartLookup> {
-        self.read("GET", format!("/api/parts/{}", encode(part.trim())), None)
+        self.read("GET", format!("/api/parts/{}", query_component(part.trim())), None)
     }
 }
 
 // --- the host's half ---------------------------------------------------------------
-
-/// `part/<part>/rev/<revision>` out of a store name, however the store spells it
-/// (`/models/part/<p>/rev/<r>.nbrep` natively, the bare key on the web).
-pub fn key_of(name: &str) -> Option<String> {
-    let tail = &name[name.find("part/")?..];
-    let segments: Vec<&str> = tail.split('/').collect();
-    match segments.as_slice() {
-        ["part", part, "rev", revision] if !part.is_empty() && !revision.is_empty() => {
-            let revision = revision.split('.').next().unwrap_or(revision);
-            (!revision.is_empty()).then(|| crate::plm::identity::document_key(&part, &revision))
-        }
-        _ => None,
-    }
-}
 
 /// The name the store opens the document `key` under: its one spelling, as the explorer
 /// spelled it before S14 (`/models/part/<p>/rev/<r>.nbrep` on the mirror store), so a
@@ -623,6 +598,19 @@ impl WorkspaceBrowser {
         self.selection_cleared();
         self.entries = None;
         self.reload_folder(plm);
+    }
+
+    /// The user's own Home, at its top: where every opening of the dialog
+    /// starts. Every folder reachable from it (linked folders included) is a
+    /// folder to walk into.
+    pub fn go_home(&mut self) {
+        self.owner.clear();
+        self.owner_label = "My workspace".into();
+        self.path.clear();
+        self.selection_cleared();
+        self.cut = None;
+        self.entries = None;
+        self.list_pending = None;
     }
 
     /// Go to a pinned folder of the user's own workspace.
@@ -1363,11 +1351,8 @@ impl WorkspaceBrowser {
                 ui.label("Revision");
                 let revision = ui.add(egui::TextEdit::singleline(&mut to.revision).desired_width(50.0).hint_text("part"));
                 self.hit(prefix, "sel:promote-revision", &revision);
-                egui::ComboBox::from_id_salt((prefix, "ws-promote-kind")).selected_text(&to.kind).show_ui(ui, |ui| {
-                    for kind in ["drawing", "datasheet", "spec", "image", "other"] {
-                        ui.selectable_value(&mut to.kind, kind.to_string(), kind);
-                    }
-                });
+                let kinds = ["drawing", "datasheet", "spec", "image", "other"].map(|kind| (kind.to_string(), kind, kind));
+                crate::form::enum_dropdown(ui, &format!("{prefix}ws:sel:promote-kind"), &kinds, &mut to.kind, None, Some(&mut self.hits));
                 let go = ui.add_enabled(!to.part.trim().is_empty(), egui::Button::new("Promote"));
                 self.hit(prefix, "sel:promote-go", &go);
                 if go.clicked() {

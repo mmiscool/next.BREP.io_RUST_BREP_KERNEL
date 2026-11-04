@@ -126,7 +126,7 @@ async fn write_copy(client: &PlmClient, key: &str, document: &str) -> Result<(),
     client
         .call(
             "PUT",
-            &format!("/api/store/doc/{key}"),
+            &crate::plm::identity::doc_path(key),
             Some(document.as_bytes().to_vec()),
         )
         .await

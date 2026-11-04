@@ -4,7 +4,7 @@
 //! the automation command share. The engine does the swap and the mate
 //! classification (`brep_render::engine_state::replace_component`).
 
-use brep_render::engine_state::{document_signature, ComponentInsert, EngineState};
+use brep_render::engine_state::{document_signature, ComponentInsert, EngineState, RefSelectTarget};
 use eframe::egui;
 
 use crate::automation::hit_keys::HitKeyDoc;
@@ -944,7 +944,9 @@ pub struct ReplaceDialog {
     /// User's suggestion ticks, `(constraint, ref)` → ticked; absent = the
     /// suggestion's own `preTicked`.
     ticks: std::collections::BTreeMap<(String, String), bool>,
-    /// A repair pick in progress: the reference waiting for a viewport pick.
+    /// The repair pick running in the result window, `(mate, ref)`: a mirror
+    /// of the engine's [`RefSelectTarget::ReplaceRepair`] pick, refreshed each
+    /// frame the window draws, for the automation state.
     picking: Option<(String, String)>,
     /// The chosen candidate is still loading (a PLM revision listed by the
     /// index, not read yet): the replace runs the frame it arrives.
@@ -993,13 +995,11 @@ impl ReplaceDialog {
         *self = Self::default();
     }
 
-    /// The shell's Escape: cancel a repair pick in progress, else close the
-    /// chooser. `true` when it took the key. The result window (summary)
-    /// stays: held mates are not something to dismiss by a stray key.
+    /// The shell's Escape: close the chooser. `true` when it took the key.
+    /// A repair pick is the engine's reference pick, which the shell's own
+    /// Escape cancels next; the result window (summary) stays: held mates are
+    /// not something to dismiss by a stray key.
     pub fn escape(&mut self) -> bool {
-        if self.picking.take().is_some() {
-            return true;
-        }
         if self.target.is_some() {
             self.close();
             return true;
@@ -1292,6 +1292,19 @@ impl ReplaceDialog {
         }
         let rows = unresolved.as_array().cloned().unwrap_or_default();
         let mut repairs: Vec<(String, String, String)> = Vec::new();
+        // A finished repair pick: it must lie in the same occurrence as the
+        // reference it replaces — the ref minus its entity name
+        // (`ACOMP1:ACOMP1:Hole_S` → `ACOMP1:ACOMP1`).
+        if let Some((id, reference, picked)) = engine.take_replace_repair_pick() {
+            let owner = reference.rsplit_once(':').map(|(path, _)| path).unwrap_or("").to_string();
+            if picked.starts_with(&format!("{owner}:")) {
+                repairs.push((id, reference, picked));
+            } else {
+                self.status = format!("Pick a face or edge of {owner} for {id}: {picked} is on another part");
+            }
+        }
+        let running = engine.ref_select_field().filter(|f| f.target == RefSelectTarget::ReplaceRepair);
+        self.picking = running.as_ref().map(|f| (f.subject.clone(), f.path.first().cloned().unwrap_or_default()));
         let mut delete: Option<String> = None;
         if !rows.is_empty() {
             ui.separator();
@@ -1332,31 +1345,28 @@ impl ReplaceDialog {
                         }
                         let picking = self.picking.as_ref() == Some(&(id.clone(), reference.clone()));
                         if picking {
-                            let selected: Vec<String> = engine
-                                .emphasis
-                                .selected_faces
-                                .iter()
-                                .chain(engine.emphasis.selected_edges.iter())
-                                .cloned()
-                                .collect();
-                            // The pick must lie in the same occurrence: the ref
-                            // minus its entity name (`ACOMP1:ACOMP1:Hole_S` →
-                            // `ACOMP1:ACOMP1`).
-                            let owner = reference.rsplit_once(':').map(|(path, _)| path).unwrap_or("").to_string();
-                            let usable = selected.len() == 1 && selected[0].starts_with(&format!("{owner}:"));
-                            ui.weak("Select the face or edge to use in the viewport.");
-                            let use_button = ui.add_enabled(usable, egui::Button::new("Use selection"));
-                            self.hits.insert("replace:use-selection".into(), use_button.rect);
-                            if use_button.clicked() {
-                                repairs.push((id.clone(), reference.clone(), selected[0].clone()));
-                                self.picking = None;
+                            // The standard reference pick runs for this row:
+                            // a face or edge clicked in the view finishes it
+                            // (one pick) and the repair lands next frame.
+                            engine.ref_select_claim();
+                            ui.weak("Click the face or edge to use in the viewport.");
+                            let cancel = ui.small_button("Cancel pick");
+                            self.hits.insert(format!("replace:cancel-pick:{row_key}"), cancel.rect);
+                            if cancel.clicked() {
+                                engine.cancel_ref_select();
                             }
                         } else {
-                            let pick = ui.small_button("Pick\u{2026}").on_hover_text("Pick the replacement face in the viewport");
+                            let pick = ui.small_button("Pick\u{2026}").on_hover_text("Pick the replacement face or edge in the viewport");
                             self.hits.insert(format!("replace:pick:{row_key}"), pick.rect);
                             if pick.clicked() {
-                                self.picking = Some((id.clone(), reference.clone()));
-                                engine.clear_selection();
+                                if engine.ref_select_active() {
+                                    engine.finish_ref_select();
+                                }
+                                self.status.clear();
+                                engine.begin_ref_select_for_replace_repair(&id, &reference);
+                                // Claimed the frame it opens, too: the shell
+                                // finishes an in-form pick no form claims.
+                                engine.ref_select_claim();
                             }
                         }
                     });
@@ -1416,8 +1426,8 @@ pub static HIT_KEYS: &[HitKeyDoc] = &[
     HitKeyDoc { panel: "replace", prefix: "replace:apply", meaning: "replace with the chosen candidate", command: Some("assembly_replace_component") },
     HitKeyDoc { panel: "replace", prefix: "replace:cancel", meaning: "close the chooser without replacing", command: None },
     HitKeyDoc { panel: "replace", prefix: "replace:tick:", meaning: "use the suggested face for an unresolved reference (replace:tick:<mate>:<ref>)", command: None },
-    HitKeyDoc { panel: "replace", prefix: "replace:pick:", meaning: "pick the replacement face in the viewport (replace:pick:<mate>:<ref>)", command: None },
-    HitKeyDoc { panel: "replace", prefix: "replace:use-selection", meaning: "use the selected face for the reference being picked", command: Some("assembly_replace_repair") },
+    HitKeyDoc { panel: "replace", prefix: "replace:pick:", meaning: "start the reference pick for one held reference (replace:pick:<mate>:<ref>): faces and edges only, and the one face or edge clicked in the viewport repairs it", command: Some("assembly_replace_repair") },
+    HitKeyDoc { panel: "replace", prefix: "replace:cancel-pick:", meaning: "cancel the running repair pick (replace:cancel-pick:<mate>:<ref>)", command: None },
     HitKeyDoc { panel: "replace", prefix: "replace:delete:", meaning: "delete an unresolved mate (replace:delete:<mate>)", command: Some("assembly_remove_constraint") },
     HitKeyDoc { panel: "replace", prefix: "replace:apply-ticked", meaning: "apply every ticked suggestion", command: Some("assembly_replace_accept") },
     HitKeyDoc { panel: "replace", prefix: "replace:close", meaning: "close the summary (held mates stay listed)", command: None },

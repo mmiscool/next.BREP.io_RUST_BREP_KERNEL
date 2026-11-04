@@ -400,7 +400,7 @@ impl EngineState {
             }
             edit.session.doc = snapshot.doc;
             edit.session.dim_offsets = snapshot.dim_offsets;
-            edit.session.selection = snapshot.selection;
+            edit.session.selection.items = snapshot.selection;
             edit.external_refs = snapshot.external_refs;
             // Drop transient interaction state a restore can invalidate (an in-flight
             // draw chain / drag / freehand stroke could reference points the snapshot no
@@ -410,7 +410,7 @@ impl EngineState {
             edit.drag = None;
             edit.handdraw_stroke.clear();
             edit.dim_drag_snapshotted = false;
-            edit.session.hovered = None;
+            edit.session.selection.hovered = None;
             self.resolve_active_sketch("undo/redo");
             true
         };
@@ -550,6 +550,7 @@ impl EngineState {
         let Some(edit) = self.sketch_edit.as_mut() else {
             return false;
         };
+        if edit.session.doc.geometry(&geo_id).is_some_and(|g| g.extra.contains_key("textFrame") || g.geom_type == "text") { return false; }
         // A geometry IS under the cursor → this click may mutate the doc; snapshot for
         // undo before it does (S6a). Popped below if the trim changed nothing.
         edit.record_undo();
@@ -887,10 +888,10 @@ impl EngineState {
     pub fn sketch_selected_angle_constraint(&self) -> Option<serde_json::Value> {
         use crate::sketch::doc::id_key;
         let edit = self.sketch_edit.as_ref()?;
-        if edit.session.selection.len() != 1 {
+        if edit.session.selection.items.len() != 1 {
             return None;
         }
-        let r = &edit.session.selection[0];
+        let r = &edit.session.selection.items[0];
         if r.get("kind").and_then(serde_json::Value::as_str) != Some("constraint") {
             return None;
         }

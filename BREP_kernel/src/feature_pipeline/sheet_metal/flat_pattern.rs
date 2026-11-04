@@ -63,7 +63,7 @@
 //! as the `fold = 0` plate does — only its enlarged hole opening shows (no collar
 //! wall region).
 
-use super::tree::{Flat, HoleBendKind, SheetTree};
+use super::tree::{Edge, Flat, HoleBendKind, SheetTree};
 use crate::{point_in_polygon, segment_intersection, NurbsCurve, Vec2};
 
 /// A 2D segment (its two endpoints) in the common root-plane frame.
@@ -170,7 +170,7 @@ pub fn build(tree: &SheetTree) -> Result<FlatPattern, String> {
         ));
     }
     let mut out = FlatPattern { polylines: Vec::new(), annotations: Vec::new() };
-    walk(&tree.root, Placement::identity(), tree.thickness, None, &mut out)?;
+    walk(&tree.root, Placement::identity(), tree.thickness, None, false, &mut out)?;
     if out.polylines.is_empty() {
         return Err("sheet-metal flat pattern: tree produced no geometry".into());
     }
@@ -188,8 +188,18 @@ fn walk(
     place: Placement,
     thickness: f64,
     seam: Option<Seg>,
+    seam_relieved: bool,
     out: &mut FlatPattern,
 ) -> Result<(), String> {
+    // A flat trimmed by end cuts (a closed corner at any angle) is drawn at its
+    // midplane: the outline clipped by each cut's line through z = 0.
+    let trimmed;
+    let flat = if flat.end_cuts.is_empty() {
+        flat
+    } else {
+        trimmed = midplane_trimmed(flat);
+        &trimmed
+    };
     let n = flat.outline.len();
 
     // 0. The flat's MATERIAL region: its outline and every hole loop, sampled once
@@ -203,7 +213,7 @@ fn walk(
     //    carries a bend (its tangent is drawn by `emit_bend`) or one that is this
     //    flat's seam to its parent (the parent's `emit_bend` draws it as the
     //    child-side tangent). Those are dropped here so they never render as a cut.
-    emit_outline(flat, &region, place, seam, out)?;
+    emit_outline(flat, &region, place, seam, seam_relieved, out)?;
 
     // 2. Hole loops (outer + islands), clipped to the blank. A blind pocket's rim
     //    is emitted as a cut loop too — consistent with the `fold = 0` plate, which
@@ -222,7 +232,7 @@ fn walk(
     //        drawn collar is not developable — its wall is skipped (its enlarged
     //        opening already shows as a hole loop above), matching the `fold = 0`
     //        plate.
-    let mut children: Vec<(&Flat, Placement, Seg)> = Vec::new();
+    let mut children: Vec<(&Flat, Placement, Seg, bool)> = Vec::new();
     for index in 0..n {
         let Some(bend) = flat.edges.get(index).and_then(|edge| edge.bend.as_ref()) else {
             continue;
@@ -237,10 +247,11 @@ fn walk(
             bend.angle_deg,
             bend.inside_radius,
             &bend.child,
+            &bend.reliefs,
             place,
             &mut children,
             out,
-        );
+        )?;
     }
     for hole_bend in &flat.hole_bends {
         let HoleBendKind::Straight { child } = &hole_bend.kind else {
@@ -277,16 +288,61 @@ fn walk(
             hole_bend.angle_deg,
             hole_bend.inside_radius,
             child,
+            &[],
             place,
             &mut children,
             out,
-        );
+        )?;
     }
 
-    for (child, child_place, child_seam) in children {
-        walk(child, child_place, thickness, Some(child_seam), out)?;
+    for (child, child_place, child_seam, relieved) in children {
+        walk(child, child_place, thickness, Some(child_seam), relieved, out)?;
     }
     Ok(())
+}
+
+/// `flat`'s outline clipped by each end cut's trace on the midplane (z = 0),
+/// keeping every surviving edge's id; a cut edge is `cut{i}`. Flats with curved
+/// outline segments are drawn untrimmed (no closed corner makes one).
+fn midplane_trimmed(flat: &Flat) -> Flat {
+    let mut trimmed = flat.clone();
+    trimmed.end_cuts.clear();
+    if !flat.outline_curves.is_empty() || flat.edges.len() != flat.outline.len() {
+        return trimmed;
+    }
+    for (index, cut) in flat.end_cuts.iter().enumerate() {
+        let [nx, ny, nz] = cut.normal;
+        if nx.hypot(ny) <= 1e-12 {
+            continue;
+        }
+        let k = nx * cut.point[0] + ny * cut.point[1] + nz * cut.point[2];
+        let side = |p: [f64; 2]| nx * p[0] + ny * p[1] - k;
+        let n = trimmed.outline.len();
+        let mut outline = Vec::with_capacity(n + 1);
+        let mut edges = Vec::with_capacity(n + 1);
+        for i in 0..n {
+            let (p, q) = (trimmed.outline[i], trimmed.outline[(i + 1) % n]);
+            let (sp, sq) = (side(p), side(q));
+            if sp <= 0.0 {
+                outline.push(p);
+                edges.push(trimmed.edges[i].clone());
+            }
+            if (sp <= 0.0) != (sq <= 0.0) {
+                let t = sp / (sp - sq);
+                outline.push([p[0] + t * (q[0] - p[0]), p[1] + t * (q[1] - p[1])]);
+                edges.push(if sp <= 0.0 {
+                    Edge { id: format!("cut{index}"), bend: None }
+                } else {
+                    trimmed.edges[i].clone()
+                });
+            }
+        }
+        if outline.len() >= 3 {
+            trimmed.outline = outline;
+            trimmed.edges = edges;
+        }
+    }
+    trimmed
 }
 
 /// Emit `flat`'s outer cut profile. An outline edge that carries a bend or is the
@@ -302,6 +358,7 @@ fn emit_outline(
     region: &Region,
     place: Placement,
     seam: Option<Seg>,
+    seam_relieved: bool,
     out: &mut FlatPattern,
 ) -> Result<(), String> {
     let n = flat.outline.len();
@@ -329,9 +386,15 @@ fn emit_outline(
     // A fold line the cut has eaten into would leave `emit_bend` drawing a tangent
     // and two side edges across air — the bend region is not developable there at
     // all. SM.CUTOUT refuses a region that enters a bend-wedge footprint, so this
-    // is unreachable through the feature; say so loudly rather than draw it.
+    // is unreachable through the feature; say so loudly rather than draw it. A
+    // bend that carries the same cut as a relief (closed-corner reliefs at the
+    // bend centres) is drawn clipped instead, on both of its sides.
     for (i, &is_fold) in suppressed.iter().enumerate() {
-        if is_fold {
+        let relieved = match flat.edges.get(i).and_then(|edge| edge.bend.as_ref()) {
+            Some(bend) => !bend.reliefs.is_empty(),
+            None => seam_relieved,
+        };
+        if is_fold && !relieved {
             region.check_fold_edge_uncut(
                 flat.outline[i],
                 flat.outline[(i + 1) % n],
@@ -469,19 +532,60 @@ fn emit_bend<'a>(
     angle_deg: f64,
     inside_radius: f64,
     child: &'a Flat,
+    reliefs: &[super::tree::Hole],
     place: Placement,
-    children: &mut Vec<(&'a Flat, Placement, Seg)>,
+    children: &mut Vec<(&'a Flat, Placement, Seg, bool)>,
     out: &mut FlatPattern,
-) {
+) -> Result<(), String> {
     let e = normalized([b[0] - a[0], b[1] - a[1]]);
     if e == [0.0, 0.0] {
-        return; // degenerate fold edge — nothing to unfold
+        return Ok(()); // degenerate fold edge — nothing to unfold
     }
     let out_dir = [e[1], -e[0]]; // in-plane outward = right of a -> b (CCW)
     let a2 = [a[0] + out_dir[0] * allowance, a[1] + out_dir[1] * allowance];
     let b2 = [b[0] + out_dir[0] * allowance, b[1] + out_dir[1] * allowance];
 
-    if allowance > 1e-9 {
+    if allowance > 1e-9 && !reliefs.is_empty() {
+        // A relieved bend: its strip, in band coordinates (x across from the
+        // parent fold line, y along the hinge), is a region of its own whose
+        // reliefs are holes; every bend line is clipped to it like a cut line.
+        let length = ((b[0] - a[0]).powi(2) + (b[1] - a[1]).powi(2)).sqrt();
+        let mut holes = Vec::with_capacity(reliefs.len());
+        for relief in reliefs {
+            holes.push((Ring::new(sample_loop(&relief.outer)?), Vec::new()));
+        }
+        let strip = Region {
+            outline: Ring::new(vec![[0.0, 0.0], [allowance, 0.0], [allowance, length], [0.0, length]]),
+            holes,
+        };
+        let band = Placement { o: place.map(a), u: place.map_dir(out_dir), v: place.map_dir(e) };
+        let lines = [
+            ([0.0, 0.0], [allowance, 0.0], LoopRole::Cut),
+            ([0.0, length], [allowance, length], LoopRole::Cut),
+            ([0.0, 0.0], [0.0, length], LoopRole::BendInternal),
+            ([allowance, 0.0], [allowance, length], LoopRole::BendInternal),
+        ];
+        for (p, q, role) in lines {
+            push_clipped(&[p, q], false, &strip, band, role, out);
+        }
+        // The centerline runs inside the strip: keep the stretches over metal.
+        let half = allowance * 0.5;
+        for (p, q) in strip.split([half, 0.0], [half, length]) {
+            if strip.material([(p[0] + q[0]) * 0.5, (p[1] + q[1]) * 0.5]) {
+                out.polylines.push(open_line(band.map(p), band.map(q), LoopRole::Fold));
+            }
+        }
+        for relief in reliefs {
+            emit_loop(&relief.outer, &strip, band, out)?;
+        }
+        let mid = band.map([half, length * 0.5]);
+        let dir = place.map_dir(e);
+        out.annotations.push(Annotation {
+            pos: mid,
+            rotation_deg: readable_angle(dir[1].atan2(dir[0]).to_degrees()),
+            text: bend_label(angle_deg, inside_radius),
+        });
+    } else if allowance > 1e-9 {
         // The two SIDE edges — the outer cut profile continuing through the bend.
         out.polylines.push(open_line(place.map(a), place.map(a2), LoopRole::Cut));
         out.polylines.push(open_line(place.map(b), place.map(b2), LoopRole::Cut));
@@ -524,7 +628,9 @@ fn emit_bend<'a>(
             v: place.map_dir(e),
         },
         seam,
+        !reliefs.is_empty(),
     ));
+    Ok(())
 }
 
 /// A two-point open polyline of the given role.

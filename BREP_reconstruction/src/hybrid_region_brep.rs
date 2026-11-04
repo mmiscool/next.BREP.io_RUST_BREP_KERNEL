@@ -19,6 +19,7 @@ use brep_kernel::{
     SegmentOptions,
     TopologyArena, Vec3, Vec4, KNOT_IDENTITY_TOL,
 };
+use crate::stl_conversion::{DemotedKind, DemotionCause, HybridDemotion};
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::f64::consts::TAU;
 
@@ -37,6 +38,9 @@ struct CylinderCarrier {
     /// Largest radial deviation of a source vertex the segmenter accepted
     /// for this carrier: how far a ring vertex may sit off the exact circle.
     deviation: f64,
+    /// [`HybridSwitches::pair_section_bar`], carried so every crossing test
+    /// on this carrier agrees.
+    pair_section_bar: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -169,7 +173,7 @@ struct LocalRegions {
 enum HybridBuildFailure {
     /// No single parameter seam avoids all trims of this cylindrical wall.
     Periodic { original: u32 },
-    Region { original: u32, message: String },
+    Region { original: u32, message: String, cause: DemotionCause },
     /// The assembled shell failed a whole-body check after regions were
     /// built on a lane whose edges carry fitted pcurves on a sphere or
     /// cylinder (a tilted sphere ring, a crossing-bore ellipse). Those
@@ -192,7 +196,7 @@ impl From<&str> for HybridBuildFailure {
 }
 
 /// Auditable accounting for an analytic/faceted reconstruction.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Serialize)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, serde::Serialize)]
 pub(crate) struct HybridBrepStats {
     pub(crate) total_faces: usize,
     pub(crate) analytic_plane_faces: usize,
@@ -222,9 +226,16 @@ pub(crate) struct HybridBrepStats {
     pub(crate) split_over_budget_regions: usize,
     pub(crate) split_budget_hit_regions: usize,
     pub(crate) split_band_declined_regions: usize,
+    /// [`HybridSwitches::gather_cone_strips`]: runs of cone strips gathered.
+    pub(crate) gathered_cone_runs: usize,
+    /// [`HybridSwitches::revolve_ends_first`]: line ends moved onto a vertex
+    /// a revolved chain placed, and arcs given their ring's common station.
+    pub(crate) moved_line_ends: usize,
     /// Lane J row 13: row 11's scan on the segmentation's whole sphere or
     /// torus carrier.
     pub(crate) whole_carrier_scan: crate::stl_conversion::WholeCarrierScanReport,
+    /// Lane V row 1: why each demoted region was demoted.
+    pub(crate) demotions: Vec<HybridDemotion>,
 }
 
 /// Validated reconstructed solid and the accounting used to select policy.
@@ -271,7 +282,52 @@ pub(crate) fn hybrid_plane_cylinder_brep(
     indices: Option<&[u32]>,
     options: &SegmentOptions,
 ) -> Result<HybridBrepOutput, String> {
-    hybrid_plane_cylinder_brep_retry(positions, indices, options, None)
+    hybrid_plane_cylinder_brep_retry(positions, indices, options, HybridSwitches::from_env(), None)
+}
+
+/// [`hybrid_plane_cylinder_brep`] without promotion 9's switches
+/// (`gather_cone_strips`, `revolve_ends_first`): the STL conversion's second
+/// try when the first rebuilt solid fails its STEP round trip.
+pub(crate) fn hybrid_plane_cylinder_brep_before_promotion_9(
+    positions: &[f64],
+    indices: Option<&[u32]>,
+    options: &SegmentOptions,
+) -> Result<Option<HybridBrepOutput>, String> {
+    let switches = HybridSwitches::from_env();
+    if !switches.gather_cone_strips && !switches.revolve_ends_first {
+        return Ok(None);
+    }
+    let without = HybridSwitches { gather_cone_strips: false, revolve_ends_first: false, ..switches };
+    hybrid_plane_cylinder_brep_retry(positions, indices, options, without, None).map(Some)
+}
+
+/// [`hybrid_plane_cylinder_brep`] without promotion 10's switches
+/// (`split_noise_bar`, `split_merge_refit`, `join_lone_freeform`,
+/// `assemble_cone_bore`), and with `with_promotion_9` false without
+/// promotion 9's too: the STL conversion's further tries when the rebuilt
+/// solid fails its STEP round trip.
+pub(crate) fn hybrid_plane_cylinder_brep_before_promotion_10(
+    positions: &[f64],
+    indices: Option<&[u32]>,
+    options: &SegmentOptions,
+    with_promotion_9: bool,
+) -> Result<Option<HybridBrepOutput>, String> {
+    let switches = HybridSwitches::from_env();
+    if !(switches.split_noise_bar || switches.split_merge_refit || switches.join_lone_freeform || switches.assemble_cone_bore) {
+        return Ok(None);
+    }
+    let mut without = HybridSwitches {
+        split_noise_bar: false,
+        split_merge_refit: false,
+        join_lone_freeform: false,
+        assemble_cone_bore: false,
+        ..switches
+    };
+    if !with_promotion_9 {
+        without.gather_cone_strips = false;
+        without.revolve_ends_first = false;
+    }
+    hybrid_plane_cylinder_brep_retry(positions, indices, options, without, None).map(Some)
 }
 
 /// Localized failures demote one region per attempt; past this many, the
@@ -288,48 +344,2140 @@ pub fn segment_for_hybrid(
     indices: &[u32],
     options: &SegmentOptions,
 ) -> Result<MeshSegmentation, String> {
-    segment_for_hybrid_measured(positions, indices, options).map(|(segmentation, _)| segmentation)
+    // The census reads this per source triangle; the crease cut changes the
+    // triangles.
+    let switches = HybridSwitches { crease_cut: false, ..HybridSwitches::from_env() };
+    segment_for_hybrid_measured(positions, indices, options, switches, &Forbidden::default())
+        .map(|(segmentation, _, _, _)| segmentation)
 }
 
 /// Lane J row 7, promoted ON 2026-10-16: the freeform split and the crossing
 /// fixes it relies on; BREP_HYBRID_SPLIT_FREEFORM=0 restores the old path.
 fn split_freeform_enabled() -> bool {
-    std::env::var("BREP_HYBRID_SPLIT_FREEFORM").map_or(true, |v| v != "0")
+    brep_kernel::switch!(live "BREP_HYBRID_SPLIT_FREEFORM", true)
 }
 
-/// The hybrid segmentation and what the freeform split did (its measured
-/// noise is zero when it wrote no carrier).
+/// Lane V's rebuild switches, read from the environment once per rebuild
+/// (tests set them directly; `Default` is every switch off, the pre-lane-V
+/// path). Rows 2a, 2b and 2c promoted ON 2026-10-29 as a set (census arm
+/// `all3`: degraded 8.36 -> 7.20 % faceted, coarse 15.40 -> 6.48 %, no row
+/// worse); each `=0` restores its old path. Promoted ON 2026-10-29 as a
+/// second set (owner): row 2d (`absorb_revolve`), `absorb_retry`,
+/// `pair_section_bar`, `whole_same_kind` and `whole_exact` (census arm
+/// `b10all`: degraded 7.20 -> 4.97 % faceted, coarse 6.48 -> 0 %, 53 rows
+/// fewer and none more, no false kind or parameter); each `=0` restores its
+/// old path. Promoted ON 2026-10-29 as a third set (owner): `cap_ring`,
+/// `crease_cut` and `shared_crossing` (census arm `b13shared` against the
+/// promoted defaults: degraded 4.97 -> 4.29 % faceted, 7 rows fewer and none
+/// more, no false kind or parameter); each `=0` restores its old path.
+/// Promoted ON 2026-10-29 as a fourth set (owner): `sliver_lean`,
+/// `whole_refit` and `crease_walls` (census arm `b18all` against the
+/// promoted defaults: degraded 4.29 -> 3.62 % faceted, 12 rows fewer and
+/// none more, no false kind or parameter, no volume flag); each `=0`
+/// restores its old path. Promoted ON 2026-10-30 as a fifth set (owner):
+/// `join_wall_pieces`, `absorb_chord`, `cone_refit`, `join_cone_pieces` and
+/// `split_lone_cone` (census arm `b24all` against the promoted defaults:
+/// degraded 3.62 -> 2.65 % faceted, 29 rows fewer and none more, no false
+/// kind or parameter, no volume flag); each `=0` restores its old path.
+/// Promoted ON 2026-10-30 as a sixth set (owner): `absorb_share`,
+/// `join_cone_across` and `cone_seam` (census arm `b27all` against the
+/// promoted defaults: degraded 2.65 -> 2.46 % faceted, 8 rows fewer and
+/// none more, no false kind or parameter, no volume flag); each `=0`
+/// restores its old path. Promoted ON 2026-10-30 as a seventh set (owner):
+/// `split_cone_bore`, `split_probe_crease`, `absorb_curved_slivers` and
+/// `noise_any_region` (census arm `b35all` against the promoted defaults:
+/// degraded 2.46 -> 2.11 % faceted, 29 rows fewer and none more, no false
+/// kind or parameter, no volume flag); each `=0` restores its old path.
+/// Promoted ON 2026-10-31 as an eighth set (owner): `pointed_cone_apex`,
+/// `absorb_repeat` and `frustum_two_rings` (census arm `b41all` against the
+/// promoted defaults: degraded 2.11 -> 2.05 % faceted, 11 rows fewer and
+/// none more, no false kind or parameter, no volume flag); each `=0`
+/// restores its old path. Promoted ON 2026-10-31 as a ninth set (owner):
+/// `merge_coplanar_planes`, `cone_stage_budget` and `plane_corners` (with
+/// the STL conversion's `BREP_HYBRID_ROUNDTRIP_FALLBACK`; census pair
+/// `p8on` against `p8off` in the promotion 8 hand-off), a volume error that
+/// rises within its jittered siblings' range with no false kind or
+/// parameter and the truth carrier unchanged no longer holding a switch
+/// back; each `=0` restores its old path. Promoted ON 2026-10-31 as a tenth
+/// set (owner): `gather_cone_strips` and `revolve_ends_first` (census pair
+/// `p9on` against `p9off` in the promotion 9 hand-off); each `=0` restores
+/// its old path. Promoted ON 2026-10-31 as an eleventh set (owner):
+/// `cone_seam_bar` and `join_split_runs` (census pair `p10on` against
+/// `p10off` in the promotion 10 hand-off); each `=0` restores its old path.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct HybridSwitches {
+    /// Row 2a: the cap-fragment absorb runs on every noisy mesh, not only
+    /// after the freeform split measured noise, at the builder's
+    /// exact-topology bar (twice the measured noise). A jittered frustum kept
+    /// one-triangle plane fragments on its cap rims; each split the rim into
+    /// short chains no seam avoids, and the cone wall was demoted ("arc chain
+    /// crosses the chosen seam"). BREP_HYBRID_ABSORB_UNSPLIT=1.
+    pub(crate) absorb_unsplit: bool,
+    /// Row 2b: a cylinder or cone ring or arc is the iso curve at the chain's
+    /// mean station, so its bar holds each point to that station; the
+    /// station spread is peak to peak, up to twice the deviation it stands
+    /// for. BREP_HYBRID_RING_MEAN_BAR=1.
+    pub(crate) ring_mean_bar: bool,
+    /// Row 2c: a revolve region whose triangles fall in several
+    /// edge-connected pieces becomes one region per piece, all on its
+    /// carrier. The equal-radius crossed cylinders' walls each hold two arms
+    /// that touch only at the crossing's two singular vertices; one face
+    /// over both arms rebuilt as a genus-1 shell and the whole-body check
+    /// demoted both walls. BREP_HYBRID_SPLIT_REVOLVE_PIECES=1.
+    pub(crate) split_revolve_pieces: bool,
+    /// Row 2d: a small region beside a cylinder, cone, sphere or torus at
+    /// least eight times its size joins that region when the carrier holds
+    /// every one of its vertices within the builder's bar and every
+    /// triangle faces the carrier's way. One-triangle "planes" on a crossed
+    /// wall, 20-70-triangle false cones and 4-triangle spheres on T-junction
+    /// slivers each failed an edge with the wall, and the wall was demoted
+    /// with them. BREP_HYBRID_ABSORB_REVOLVE=0
+    /// restores the old path (promoted ON 2026-10-29).
+    pub(crate) absorb_revolve: bool,
+    /// Crossing cylinders (`cylinder_pair_section_bar`): the axis gap and an
+    /// edge's offset from its section plane are held to the same bar as the
+    /// radius, `accepted_radial_bar` of the exact-topology tolerance and the
+    /// walls' deviation, instead of the bare tolerance. On chordal walls
+    /// (T-junction vertices on chords, ~1e-3 deviation) the radius passed
+    /// at 1.9e-3 while the section plane failed at 6.5e-5, and both walls
+    /// were demoted (cause `cylinder_cylinder_edge`).
+    /// BREP_HYBRID_PAIR_SECTION_BAR=0
+    /// restores the old path (promoted ON 2026-10-29).
+    pub(crate) pair_section_bar: bool,
+    /// With row 2d: a host that took fragments and was demoted anyway is
+    /// rebuilt with nothing joined to it (up to `ABSORB_RETRY_LIMIT` rounds,
+    /// each forbidding every host demoted so far), and the rebuild with the
+    /// fewest faceted triangles is kept. A joined wall can fail where its pieces
+    /// passed (a jittered torus demoted whole, `torus_surface`; a pointed
+    /// cone's `cone_span`), and a host demoted either way takes the
+    /// fragments it absorbed with it: 48 census rows were worse with 2d.
+    /// BREP_HYBRID_ABSORB_RETRY=0
+    /// restores the old path (promoted ON 2026-10-29).
+    pub(crate) absorb_retry: bool,
+    /// A closed mesh the segmenter splits into several regions of one sphere
+    /// or torus kind (plus freeform strays, and strays of other carriers each
+    /// under 16 triangles and together at most 2 %) is offered to the whole-primitive fit as one
+    /// region: `fit_whole_primitive` over every vertex but stitched
+    /// T-junction vertices (`chord_vertices`), taken only when the residual
+    /// reads as noise, then the genus and volume checks. A T-junction OCCT torus held its outer and inner
+    /// halves as two tori (1 773 and 1 938 triangles) whose separate fits
+    /// missed the shared latitude ring's coaxiality bar, and both halves
+    /// were demoted (`torus_ring_edge`). BREP_HYBRID_WHOLE_SAME_KIND=0
+    /// restores the old path (promoted ON 2026-10-29).
+    pub(crate) whole_same_kind: bool,
+    /// A closed mesh whose largest region is a sphere or torus is fitted
+    /// whole beside strays of any carrier and size, and taken only when the
+    /// fit is exact: every vertex but stitched T-junction ones
+    /// (`chord_vertices`) within the weld tolerance. A real flat or cone
+    /// leaves its vertices off the primitive; the kernel T-junction tori and
+    /// spheres carried 30-86-triangle false cones on their chordal bands,
+    /// and their exact fits read 1e-15. BREP_HYBRID_WHOLE_EXACT=0
+    /// restores the old path (promoted ON 2026-10-29).
+    pub(crate) whole_exact: bool,
+    /// A cylinder edge on a plane square to its axis within 0.01 is judged
+    /// as the builder builds it when the two regions' shared edges close
+    /// into loops: `snap_cylinder_axes` squares the axis to the cap, so the
+    /// ring is held to the radial bar about that axis. The edge check held
+    /// the ring's station spread about the fitted axis to `tolerance * 4`;
+    /// a noisy wall's axis tilts 4-8e-4 rad, moving a unit cap ring's
+    /// station by ~1e-4 against a 6.4e-5 bar, and the crossed cylinders'
+    /// walls fell against their own caps (`plane_neighbour_edge`).
+    /// BREP_HYBRID_CAP_RING=0
+    /// restores the old path (promoted ON 2026-10-29).
+    pub(crate) cap_ring: bool,
+    /// A freeform strip between two equal-radius crossing cylinder walls,
+    /// every vertex within the pair's radial bar of one wall or the other,
+    /// is cut along the walls' section ellipse (`cut_crossing_strips`): each
+    /// edge from a vertex on one wall only to one on the other only is split
+    /// where it crosses a section plane, at the ellipse point there, and
+    /// every piece joins the wall its vertices lie on. The coarse facets
+    /// straddling the crease shared no exact edge with either wall (a chord
+    /// leaves the facet plane by its sag, 7e-5 to 2.3e-2 against a 1.6e-5
+    /// bar) and both walls were demoted (`facet_neighbour_edge`).
+    /// BREP_HYBRID_CREASE_CUT=0
+    /// restores the old path (promoted ON 2026-10-29).
+    pub(crate) crease_cut: bool,
+    /// Cylinder regions that are pieces of one wall (axes parallel within
+    /// 0.01, each origin within the radial bar of the other's axis line,
+    /// radii within that bar) and that both cross the same third cylinder
+    /// take one carrier: the mean axis, origin and radius
+    /// (`share_crossing_wall_carriers`). The crossing's tangent point is then
+    /// one point for both. A T-junction vertical wall held its arms above and
+    /// below the horizontal wall as two fits 1.9e-5 apart; the vertex both
+    /// crossings end at was pinned to one pair's tangent point, the other
+    /// pair's two section ellipses then ended 2e-5 apart at it against a
+    /// 1.6e-5 bar ("exact curves disagree"), and the retry faceted the row.
+    /// BREP_HYBRID_SHARED_CROSSING=0
+    /// restores the old path (promoted ON 2026-10-29).
+    pub(crate) shared_crossing: bool,
+    /// Row 2d's facing gate also allows a facet the lean its vertex noise
+    /// can give it: asin of twice its worst vertex residual over its least
+    /// altitude, at most the normal gate itself. A sliver 1e-2 high with
+    /// vertices 1e-3 off the wall tilts by up to ~11 degrees on noise
+    /// alone; a cap triangulated from rim vertices has large altitudes and
+    /// residuals near zero, so it gains almost nothing. On census record
+    /// kernel_crossed_cylinders_s10_d0.001_tjunction a 161-triangle false
+    /// cylinder strip on the horizontal wall (worst vertex 2.6e-3 against a
+    /// 1.9e-2 bar) was refused by three slivers 0.9-1.5e-2 high leaning
+    /// 18.6-22.4 degrees against a 15 degree gate plus their spread.
+    /// BREP_HYBRID_SLIVER_LEAN=0
+    /// restores the old path (promoted ON 2026-10-29).
+    pub(crate) sliver_lean: bool,
+    /// The crease cut also takes a region of up to [`CREASE_SLIVER`]
+    /// triangles fitted as anything but a cylinder, and counts cylinder
+    /// regions that are pieces of one wall ([`same_cylinder_wall`]) as that
+    /// wall: the region must border exactly two walls that cross. Each piece
+    /// joins the member of its wall the source triangle borders (else the
+    /// wall's largest). On census record
+    /// occt_crossed_cylinders_s1_d0.005_tjunction each wall came as about
+    /// five cylinder pieces of 20-64 triangles, with 4-triangle false tori
+    /// and 2-triangle planes on the crease between them; every wall was
+    /// demoted (`torus_ring_edge`, `plane_neighbour_edge`).
+    /// BREP_HYBRID_CREASE_WALLS=0
+    /// restores the old path (promoted ON 2026-10-29).
+    pub(crate) crease_walls: bool,
+    /// A whole sphere or torus the strays rule admits on the segmenter's
+    /// carrier, whose deviation passes the weld tolerance, takes instead the
+    /// whole fit without stitched chord vertices when that fit is exact
+    /// (every vertex within the weld tolerance). The segmenter fits the
+    /// chord vertices too: on census record occt_sphere_s1_d0.02_tjunction
+    /// with [`HybridSwitches::sliver_lean`] a 7-triangle stray joined the
+    /// sphere, the strays fell under 1 % of the mesh, and the carrier a
+    /// 2.1e-2 deviation biased gave a volume 9.7e-5 off where the exact
+    /// refit (radius 2.0, 4.4e-16) had been taken.
+    /// BREP_HYBRID_WHOLE_REFIT=0
+    /// restores the old path (promoted ON 2026-10-29).
+    pub(crate) whole_refit: bool,
+    /// Edge-adjacent cylinder regions that are pieces of one wall
+    /// ([`same_cylinder_wall`]) become one region on the largest piece's
+    /// carrier, before `split_revolve_pieces` (`join_wall_pieces`). On
+    /// census record kernel_crossed_cylinders_s1_d0.001_jitter-0.1 the
+    /// vertical wall came as pieces of 3 931 and 1 343 triangles (axes
+    /// 4e-4 apart, origins within 4.7e-4 of each other's axis against a
+    /// 1.1e-3 bar) meeting along 8 zig-zag mesh edges, and the horizontal
+    /// wall likewise; each such edge is neither a ruling nor a crossing, and
+    /// every wall was demoted.
+    /// BREP_HYBRID_JOIN_WALL_PIECES=0
+    /// restores the old path (promoted ON 2026-10-30).
+    pub(crate) join_wall_pieces: bool,
+    /// Row 2d's vertex bar skips stitched T-junction chord vertices
+    /// (`chord_vertices`): such a vertex sits inside the wall by its chord's
+    /// sag and reads nothing of it, and the host's deviation does not grow
+    /// for it. On census record kernel_crossed_cylinders_s1_d0.02_tjunction
+    /// 4-8 triangle freeform and plane slivers in the middle of the lower
+    /// wall (deviation 2.75e-4) held chord vertices ~1e-2 inside it, row 2d
+    /// refused them, and each demoted the wall (`plane_neighbour_edge`).
+    /// A chord vertex is skipped only for a host that holds both ends of its
+    /// chord (`chord_spans`): a vertex on a cone's ruling lies between its
+    /// ruling neighbours too, and on census record
+    /// occt_countersunk_hole_s1_d0.05_tjunction a cone sliver whose every
+    /// off-ring vertex was such a vertex joined the bore (220 -> 308 faceted).
+    /// BREP_HYBRID_ABSORB_CHORD=0
+    /// restores the old path (promoted ON 2026-10-30).
+    pub(crate) absorb_chord: bool,
+    /// A cone region whose deviation passes the weld tolerance is refitted
+    /// on its vertices other than stitched chord vertices, and takes that
+    /// refit when it is exact (every such vertex within the weld tolerance;
+    /// `refit_chord_cones`). The segmenter fits the chord vertices too: on
+    /// census record occt_countersunk_hole_s1_d0.05_tjunction 7 chord
+    /// vertices sit up to 1.7e-2 off the countersink, whose other 152 are
+    /// within 2.2e-16, and the cone fitted at deviation 4.5e-3; its edge
+    /// with the bore was refused (`cylinder_cone_edge`).
+    /// BREP_HYBRID_CONE_REFIT=0
+    /// restores the old path (promoted ON 2026-10-30).
+    pub(crate) cone_refit: bool,
+    /// Edge-adjacent cone regions whose union refits as one cone within the
+    /// pair's radial bar become one region on that refit
+    /// (`join_cone_pieces`), before `split_revolve_pieces`.
+    /// BREP_HYBRID_JOIN_CONE_PIECES=0
+    /// restores the old path (promoted ON 2026-10-30).
+    pub(crate) join_cone_pieces: bool,
+    /// The freeform split takes a region the cone stage finds to be one
+    /// cone (the lone proposal is a cone whose support covers 19 in 20 of
+    /// the region): strips the cone does not hold stay as they are, and row
+    /// 7's cylinders that cover less than 19 in 20 of the region wait for
+    /// the cone stage. On census record
+    /// occt_countersunk_hole_s1_d0.001_tjunction the segmenter left the
+    /// countersink with stray bore slivers as one 3 927-triangle freeform
+    /// region; the cone stage fitted one cone holding 3 907 of them, and the
+    /// split, which asked for two carriers, declined it.
+    /// BREP_HYBRID_SPLIT_LONE_CONE=0
+    /// restores the old path (promoted ON 2026-10-30).
+    pub(crate) split_lone_cone: bool,
+    /// Row 2d shares out a fragment no single host takes: each triangle goes
+    /// to the eligible host (size, carrier, not forbidden) that holds it
+    /// with the least residual, when every triangle has one. On census
+    /// record kernel_countersunk_hole_s1_d0.001_jitter-0.1 a 5-triangle
+    /// sphere sliver held full-height bore triangles and countersink
+    /// triangles at the ring (worst 1.34 off the cone, 7.5e-2 off the bore);
+    /// left alone, the cone was refused at its edge (`sphere_ring_edge`).
+    /// BREP_HYBRID_ABSORB_SHARE=0
+    /// restores the old path (promoted ON 2026-10-30).
+    pub(crate) absorb_share: bool,
+    /// [`HybridSwitches::join_cone_pieces`] also takes as candidates cone
+    /// pieces that border one non-cone region of at most
+    /// [`CONE_BRIDGE_TRIANGLES`] between them; row 2d then takes the
+    /// slivers between the joined pieces (else `split_revolve_pieces` parts
+    /// them again). On census record occt_countersunk_hole_s1_d0.005_jitter-0.1
+    /// the countersink came as about 30 one-column strips of 15-16 triangles
+    /// with sphere, freeform and plane slivers between them, no two strips
+    /// edge-adjacent.
+    /// BREP_HYBRID_JOIN_CONE_ACROSS=0
+    /// restores the old path (promoted ON 2026-10-30).
+    pub(crate) join_cone_across: bool,
+    /// A cone face with no ruling or cylinder seam to follow takes as its
+    /// seam the meridian of a boundary endpoint that avoids every open trim,
+    /// as a cylinder's frame does; else its axis' arbitrary perpendicular.
+    /// On census record occt_countersunk_hole_s1_d0.005_jitter-0.1 the
+    /// joined countersink met the planar strips of a faceted bore along
+    /// 2-point chains, and the arbitrary seam fell inside one ("arc chain ...
+    /// crosses the chosen seam: u 0.988 -> 1.012").
+    /// BREP_HYBRID_CONE_SEAM=0
+    /// restores the old path (promoted ON 2026-10-30).
+    pub(crate) cone_seam: bool,
+    /// The freeform split's cone stage gives a cone it proposes alone that
+    /// holds less than 19 in 20 of the region a cylinder on its axis through
+    /// the rest, as a second carrier (`coaxial_bore`). On census record
+    /// kernel_countersunk_hole_s1_d0.005_jitter-0.1 the countersink and 64
+    /// bore triangles were one freeform region of 958; the cone stage fitted
+    /// the countersink (894 triangles) and the bore only as 16-triangle
+    /// pieces under the carrier floor, and the split declined the region.
+    /// BREP_HYBRID_SPLIT_CONE_BORE=0
+    /// restores the old path (promoted ON 2026-10-30).
+    pub(crate) split_cone_bore: bool,
+    /// A region the freeform split's stages divide nothing of is drawn
+    /// again with each hypothesis from a probe that crosses no edge whose
+    /// triangle normals differ by more than the normal tolerance
+    /// (`RecognitionOptions::probe_crease_gate`) and first grows to 32
+    /// triangles (`GATED_PROBE_TRIANGLES`). On census
+    /// record occt_crossed_cylinders_s10_d0.001_jitter-0.3 both walls were one
+    /// region of 788 long triangles, every 128-triangle probe spanned the
+    /// crossing, and all 400 cylinder samples traced mixed the walls (radii
+    /// 9-2 900 against 10, no seed triangle held); stage 1 accepted nothing
+    /// and the region stayed faceted. On occt_crossed_cylinders_s1_d0.005_jitter-0.1
+    /// each wall piece holds about 103 long triangles, and the default
+    /// 128-triangle probe spanned two of them through the gate.
+    /// BREP_HYBRID_SPLIT_PROBE_CREASE=0
+    /// restores the old path (promoted ON 2026-10-30).
+    pub(crate) split_probe_crease: bool,
+    /// A torus, cone, cylinder or sphere fragment under 8 triangles that
+    /// borders a plane region holding every one of its vertices within the
+    /// bar plane and freeform fragments already join at
+    /// (`absorb_plane_fragments`) joins that plane. On census record
+    /// occt_frustum_s1_d0.005_jitter-1.0 a flat 4-triangle torus on the top
+    /// cap (all at z 5.00) sat between the cap plane and the 1 638-triangle
+    /// cone wall, and the wall was demoted at it (`torus_ring_edge`).
+    /// BREP_HYBRID_ABSORB_CURVED_SLIVERS=0
+    /// restores the old path (promoted ON 2026-10-30).
+    pub(crate) absorb_curved_slivers: bool,
+    /// When no plane region of at least 16 triangles measures the mesh's
+    /// noise, the noisy-cap join takes it from the largest deviation of any
+    /// analytic region that size (`measured_region_noise`). On census record
+    /// occt_pointed_cone_s10_d0.005_jitter-1.0 the 61-triangle base came as
+    /// 13 fragments of 1-12 triangles, the plane noise read 0, the join never
+    /// ran, and the 1 691-triangle cone (deviation 4.8e-2) was demoted at the
+    /// fragments (`plane_neighbour_edge`).
+    /// BREP_HYBRID_NOISE_ANY_REGION=0
+    /// restores the old path (promoted ON 2026-10-30).
+    pub(crate) noise_any_region: bool,
+    /// A cone snapped to the closed ring it shares with a plane takes the
+    /// ring's centre from a least-squares circle fit in that plane
+    /// (`ring_circle_center`) instead of the mean of the ring's points; and
+    /// a cone none of whose vertices lies within its bar of the apex takes
+    /// its apex at the vertex nearest its axis, with the opening refitted,
+    /// when every vertex then holds within that bar (`apex_at_vertex`). On
+    /// census record kernel_pointed_cone_s1_d0.001_jitter-0.1 the cone held
+    /// two base triangles, its ring missed two of its 128 rim vertices, the
+    /// mean sat 0.032 off the axis, and the apex lay 0.032 from the apex
+    /// vertex (bar 7.3e-4); on jitter-0.3 the fitted opening (0.3746 against
+    /// 0.3805) put the apex 0.087 beyond that vertex. Neither cone was taken
+    /// as pointed (`cone_span`). The plane-ring snap also takes a fitted
+    /// axis up to `RING_SNAP_TILT` off the plane normal when the ring is a
+    /// circle about the normal within the cone's bar: on
+    /// kernel_pointed_cone_s10_d0.005_jitter-0.3 the fitted axis lay 0.012
+    /// off, the snap (0.01) was skipped, and the base ring read an axial
+    /// spread of 0.50 (`chain_edge_cone`). BREP_HYBRID_POINTED_CONE_APEX=0
+    /// restores the old path (promoted ON 2026-10-31).
+    pub(crate) pointed_cone_apex: bool,
+    /// The cap-fragment absorb (`absorb_plane_fragments`, after the noisy
+    /// cap join) repeats while a pass joins a fragment, so a fragment that
+    /// borders the cap plane only through fragments the last pass joined
+    /// joins too. On census record occt_frustum_s10_d0.005_jitter-1.0 the
+    /// top cap came as 13 fragments; one pass joined eight to the
+    /// 8-triangle piece, and a 2-triangle fragment bordering it only through
+    /// a 7-triangle one (under the 8-triangle host size), with three more
+    /// beyond it, stayed apart; the cone wall failed at them
+    /// (`arc chain crosses the chosen seam`). BREP_HYBRID_ABSORB_REPEAT=0
+    /// restores the old path (promoted ON 2026-10-31).
+    pub(crate) absorb_repeat: bool,
+    /// A cone snapped to two closed rings it shares with parallel planes,
+    /// whose first ring's frame misses the second ring by more than the
+    /// cone's radial bar, takes its axis through the two ring centres (each
+    /// from a circle fit, `ring_circle_center`) and its opening from both
+    /// radii, when the line lies within 0.01 of the normal and the openings
+    /// agree within 0.05 rad. On census record
+    /// occt_frustum_s10_d0.005_jitter-1.0 read through the repaired mesh the
+    /// top ring came first; its 43-triangle cap's normal tilted 1.2e-3 off,
+    /// and 50 below it the base ring read a radial error of 0.106 against a
+    /// bar of 0.094 (`chain_edge_cone`), while the record's ring lies within
+    /// 0.04 of the true cone. Taken whenever two rings snapped (arm b40two),
+    /// kernel_frustum_s10_d0.001_jitter-1.0 went from 3 faces to 3 389: its
+    /// ring means sat off the axis and the centre line tilted the top ring
+    /// past its station bar.
+    /// BREP_HYBRID_FRUSTUM_TWO_RINGS=0
+    /// restores the old path (promoted ON 2026-10-31).
+    pub(crate) frustum_two_rings: bool,
+    /// After the cap-fragment absorb, two edge-adjacent plane regions of at
+    /// least 16 triangles each whose vertices all lie within twice the
+    /// measured noise of their least-squares plane become one on it
+    /// (`merge_coplanar_planes`). On census record
+    /// occt_cylinder_s10_d0.005_jitter-1.0 the bottom cap came as two
+    /// coplanar planes of 36 and 25 triangles, both past the fragment size
+    /// the join and absorb take, and the cylinder was demoted where they
+    /// meet (the cause behind ABSORB_CURVED_SLIVERS' whole-rebuild
+    /// fallback). BREP_HYBRID_MERGE_COPLANAR_PLANES=0
+    /// restores the old path (promoted ON 2026-10-31).
+    pub(crate) merge_coplanar_planes: bool,
+    /// Every chain end where only plane regions meet moves to the nearest
+    /// point on all of their planes, within the exact-topology tolerance
+    /// (`place_plane_corners`). The builder kept mesh vertex positions, so a
+    /// jittered plane face's corners sat off its plane; the STEP import
+    /// splits such a face into triangles through its vertices while the
+    /// neighbouring edges stay where the builder put them, and on nine
+    /// census countersinks the trims then missed their charts (`pcurve fit
+    /// refused`) and the whole conversion failed (findings note
+    /// 2026-10-31, option A). BREP_HYBRID_PLANE_CORNERS=0
+    /// restores the old path (promoted ON 2026-10-31).
+    pub(crate) plane_corners: bool,
+    /// A cone the segmenter shredded into one region per strip (each fitted
+    /// as whatever it read: sphere, torus, cone, plane or freeform) is
+    /// gathered back into one cone region when one cone fitted to the run
+    /// holds every vertex within the radial bar (`gather_cone_strips`). On
+    /// census record occt_countersunk_hole_s10_d0.005_jitter-0.1 (jitter
+    /// 0.05 of the split bar) the 738-triangle countersink came as about 48
+    /// regions of 15-16 triangles, nearly all demoted, and the row kept 553
+    /// faceted triangles. BREP_HYBRID_GATHER_CONE_STRIPS=0
+    /// restores the old path (promoted ON 2026-10-31).
+    pub(crate) gather_cone_strips: bool,
+    /// The chain edges on cylinder, cone, sphere or torus regions are built
+    /// before the lines between planes, and a line ends at the vertex such an
+    /// edge already placed rather than at the mesh vertex. On census record
+    /// occt_frustum_s1_d0.05_jitter-0.1 a line between two top-cap fragments
+    /// placed a ring vertex at its mesh position; the cone's ring arc, the
+    /// iso circle at the ring's mean station, then ended 5.2e-3 from it, the
+    /// whole solid failed topology validation (`CurveVertexGap`), and the
+    /// cone wall was demoted in the rebuild without CONE_SEAM; four occt and
+    /// kernel frustum rows (440-478 faceted) fail the same way. Arcs of one
+    /// cylinder or cone ring also share the ring's station
+    /// (`common_arc_stations`): on occt_frustum_s10_d0.05_jitter-0.1 the top
+    /// ring came as arcs between cap fragments, each the iso circle at its
+    /// own mean station, and two of them ended 1.1e-2 apart at their shared
+    /// vertex. BREP_HYBRID_REVOLVE_ENDS_FIRST=0
+    /// restores the old path (promoted ON 2026-10-31).
+    pub(crate) revolve_ends_first: bool,
+    /// The freeform split's cone stage draws up to 2 048 attempts instead of
+    /// 256 (`SPLIT_CONE_STAGE_BUDGET_ATTEMPTS`). On census record
+    /// kernel_countersunk_hole_s10_d0.005_jitter-1.0 the stage ran out of its
+    /// budget on the countersink region, proposed nothing, and the row kept
+    /// 970 faceted triangles. BREP_HYBRID_CONE_STAGE_BUDGET=0
+    /// restores the old path (promoted ON 2026-10-31).
+    pub(crate) cone_stage_budget: bool,
+    /// A cone's arc chain may end within the bar the cone's seam search
+    /// allows (tolerance over the circumference at the wide end) of its
+    /// seam, as a cylinder's, sphere's and torus's already may, instead of
+    /// within 1e-8. The search put the seam through a jittered arc end and
+    /// the builder then refused that end 1.6e-4 of a turn past it ("crosses
+    /// the chosen seam") on census record
+    /// kernel_countersunk_hole_s10_d0.02_jitter-0.1 (jitter 0.20 of the split
+    /// bar), and the countersink was demoted with 180 faceted triangles.
+    /// BREP_HYBRID_CONE_SEAM_BAR=0 restores the old path (promoted ON
+    /// 2026-10-31).
+    pub(crate) cone_seam_bar: bool,
+    /// The noisy cap join (`join_noisy_planar_fragments`) cuts a run of small
+    /// regions whose one plane fails at its creases (adjacent triangles more
+    /// than 30 degrees apart) and joins each piece whose own plane holds. On
+    /// census record occt_crossed_cylinders_s10_d0.02_jitter-0.3 three of the
+    /// four 40-triangle caps came as freeform fragments linked through small
+    /// wall pieces into one 127-triangle run, its plane missed by 10.3, none
+    /// was joined, and the walls were demoted at them (444 faceted).
+    /// BREP_HYBRID_JOIN_SPLIT_RUNS=0 restores the old path (promoted ON
+    /// 2026-10-31).
+    pub(crate) join_split_runs: bool,
+    /// The freeform split's coaxial bore (`split_cone_bore`) also takes the
+    /// small plane regions beside the region that it holds and the cone does
+    /// not, and counts its pieces with them. On census record
+    /// kernel_countersunk_hole_s1_d0.005_jitter-1.0 the segmenter cut 33 of
+    /// the radius-1 bore's 96 triangles out as sixteen 2-triangle plane
+    /// strips, the bore's other 63 sat in the countersink's region in pieces
+    /// of 2-12 between them, the bore was refused under its 16-triangle
+    /// piece floor, and the region stayed faceted (957 triangles).
+    /// BREP_HYBRID_BORE_STRIPS=1 (default off).
+    pub(crate) bore_strips: bool,
+    /// A cone and the bore beneath it are assembled across the regions the
+    /// segmenter and the split left them in. The freeform split's lone cone
+    /// (`split_lone_cone`) takes a region it holds 3 in 4 of, not only 19 in
+    /// 20, leaving the rest in the region; after the cone pieces are joined,
+    /// `hybrid_freeform_split::assemble_cone_bore` fits one bore on its own
+    /// axis through every square-facing triangle the cone's bordering
+    /// fragments hold and hands each of them to the cone or the bore. On
+    /// census record occt_countersunk_hole_s1_d0.005_jitter-1.0 the
+    /// countersink and its bore were spread over freeform regions of 353,
+    /// 159, 53 and 51 triangles and a dozen 15-triangle fragments, the
+    /// cone held 92 and 94 % of the two largest (the split wants 19 in 20),
+    /// and the cone's axis was tilted 3.9e-3 off the bore's (1.2e-2 over the
+    /// bore against a bar of 6.8e-3), so a bore on it held 2 of 22.
+    /// BREP_HYBRID_ASSEMBLE_CONE_BORE=0 restores the old path (promoted ON
+    /// 2026-11-03 with the three below).
+    pub(crate) assemble_cone_bore: bool,
+    /// The whole-primitive path (`whole_closed_primitive`) admits, beside a
+    /// dominant freeform region, strays each under 16 triangles (freeform
+    /// ones at most 32) and together at most a tenth of the mesh, and leaves
+    /// them to the whole fit's residual test. On census record occt_torus_s1_d0.1_jitter-1.0
+    /// the segmenter chipped about 200 slivers of 1-10 triangles (2-triangle
+    /// "spheres", 1-triangle planes, freeform pieces) off the torus's one
+    /// freeform region of 3 285, 6.9 % of the mesh against row 10's 1 %,
+    /// and the row was faceted (3 503 triangles).
+    /// BREP_HYBRID_WHOLE_FREEFORM_STRAYS=1 (default off).
+    pub(crate) whole_freeform_strays: bool,
+    /// The first freeform split pass whose carriers' fits hold less than
+    /// 19 in 20 of the region proposes once more with its cylinder fits of
+    /// one wall refitted as one cylinder, and a region the passes decline
+    /// takes that proposal
+    /// (`hybrid_freeform_split::merge_refit_cylinders`); a merged wall's
+    /// support is the region it holds at the merge bar, a region it carries
+    /// is assigned at that bar, and an enclosed sliver group running along
+    /// the carrier's axis joins it whatever its tilt. On census record
+    /// kernel_crossed_cylinders_s1_d0.05_jitter-0.3 each crossing wall came
+    /// as fits of 35-128 triangles, none a tenth of the region, and the row
+    /// was faceted (2 772 triangles).
+    /// BREP_HYBRID_SPLIT_MERGE_REFIT=0 restores the old path (promoted ON
+    /// 2026-11-03).
+    pub(crate) split_merge_refit: bool,
+    /// The noisy cap join (`join_noisy_planar_fragments`) also takes a run
+    /// that is one whole freeform region of at least 16 triangles whose
+    /// least-squares plane holds every vertex within the measured noise: a
+    /// cap the kernel segmenter kept whole instead of splitting into
+    /// fragments. The join as it is takes only runs of two or more regions,
+    /// so such a cap stayed freeform, the wall's rim edges were judged
+    /// against its jittered facets' planes and failed the ring gate, and the
+    /// builder demoted the wall. On census record
+    /// kernel_crossed_cylinders_s10_d0.05_jitter-0.3 the bottom cap (30
+    /// triangles, 0.13 off its plane against a 0.13 noise, 0.15 degrees off
+    /// the wall's axis) was that region and the row stayed faceted (2 788
+    /// triangles) with the merged walls.
+    /// BREP_HYBRID_JOIN_LONE_FREEFORM=0 restores the old path (promoted ON
+    /// 2026-11-03).
+    pub(crate) join_lone_freeform: bool,
+    /// With [`HybridSwitches::split_merge_refit`]: a region every freeform
+    /// split pass leaves without a proposal, merged or not, is drawn once
+    /// more for planes and cylinders at the merge bar (two split bars), and
+    /// every cylinder fit of that pass is a wall at that bar (refitted with
+    /// the fits of its wall, supported by what it holds at the bar) in a
+    /// merged proposal the region takes. On census record
+    /// kernel_crossed_cylinders_s1_d0.02_jitter-1.0 the vertices lie up to
+    /// 0.016 off the walls against the 0.008 bar and the passes accepted no
+    /// fit at all; the row was faceted (2 207 triangles).
+    /// BREP_HYBRID_SPLIT_NOISE_BAR=0 restores the old path (promoted ON
+    /// 2026-11-03).
+    pub(crate) split_noise_bar: bool,
+}
+
+/// [`HybridSwitches::crease_walls`]: the largest non-cylinder region the
+/// crease cut takes.
+const CREASE_SLIVER: usize = 16;
+
+/// [`HybridSwitches::pointed_cone_apex`]: how far (the sine of the angle) a
+/// cone's fitted axis may lie off the normal of a plane it shares a closed
+/// ring with and still snap to it, when that ring is a circle about the
+/// normal within the cone's bar; 0.01 otherwise.
+const RING_SNAP_TILT: f64 = 0.05;
+
+/// [`HybridSwitches::join_cone_across`]: the largest region two cone pieces
+/// may border between them and still be join candidates.
+const CONE_BRIDGE_TRIANGLES: usize = 16;
+
+impl HybridSwitches {
+    pub(crate) fn from_env() -> Self {
+        Self::from_lookup(|name| std::env::var(name).ok())
+    }
+
+    /// The switches the variables `lookup` returns select: a promoted row
+    /// is on unless its variable is exactly "0", an opt-in row
+    /// (`bore_strips`, `assemble_cone_bore`, `whole_freeform_strays`) only
+    /// when it is exactly "1".
+    fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Self {
+        let promoted = |name: &str| lookup(name).as_deref() != Some("0");
+        let opted_in = |name: &str| lookup(name).as_deref() == Some("1");
+        Self {
+            absorb_unsplit: promoted("BREP_HYBRID_ABSORB_UNSPLIT"),
+            ring_mean_bar: promoted("BREP_HYBRID_RING_MEAN_BAR"),
+            split_revolve_pieces: promoted("BREP_HYBRID_SPLIT_REVOLVE_PIECES"),
+            absorb_revolve: promoted("BREP_HYBRID_ABSORB_REVOLVE"),
+            pair_section_bar: promoted("BREP_HYBRID_PAIR_SECTION_BAR"),
+            absorb_retry: promoted("BREP_HYBRID_ABSORB_RETRY"),
+            whole_same_kind: promoted("BREP_HYBRID_WHOLE_SAME_KIND"),
+            whole_exact: promoted("BREP_HYBRID_WHOLE_EXACT"),
+            cap_ring: promoted("BREP_HYBRID_CAP_RING"),
+            crease_cut: promoted("BREP_HYBRID_CREASE_CUT"),
+            shared_crossing: promoted("BREP_HYBRID_SHARED_CROSSING"),
+            sliver_lean: promoted("BREP_HYBRID_SLIVER_LEAN"),
+            crease_walls: promoted("BREP_HYBRID_CREASE_WALLS"),
+            whole_refit: promoted("BREP_HYBRID_WHOLE_REFIT"),
+            join_wall_pieces: promoted("BREP_HYBRID_JOIN_WALL_PIECES"),
+            absorb_chord: promoted("BREP_HYBRID_ABSORB_CHORD"),
+            cone_refit: promoted("BREP_HYBRID_CONE_REFIT"),
+            join_cone_pieces: promoted("BREP_HYBRID_JOIN_CONE_PIECES"),
+            split_lone_cone: promoted("BREP_HYBRID_SPLIT_LONE_CONE"),
+            absorb_share: promoted("BREP_HYBRID_ABSORB_SHARE"),
+            join_cone_across: promoted("BREP_HYBRID_JOIN_CONE_ACROSS"),
+            cone_seam: promoted("BREP_HYBRID_CONE_SEAM"),
+            split_cone_bore: promoted("BREP_HYBRID_SPLIT_CONE_BORE"),
+            split_probe_crease: promoted("BREP_HYBRID_SPLIT_PROBE_CREASE"),
+            absorb_curved_slivers: promoted("BREP_HYBRID_ABSORB_CURVED_SLIVERS"),
+            noise_any_region: promoted("BREP_HYBRID_NOISE_ANY_REGION"),
+            pointed_cone_apex: promoted("BREP_HYBRID_POINTED_CONE_APEX"),
+            absorb_repeat: promoted("BREP_HYBRID_ABSORB_REPEAT"),
+            frustum_two_rings: promoted("BREP_HYBRID_FRUSTUM_TWO_RINGS"),
+            merge_coplanar_planes: promoted("BREP_HYBRID_MERGE_COPLANAR_PLANES"),
+            cone_stage_budget: promoted("BREP_HYBRID_CONE_STAGE_BUDGET"),
+            plane_corners: promoted("BREP_HYBRID_PLANE_CORNERS"),
+            gather_cone_strips: promoted("BREP_HYBRID_GATHER_CONE_STRIPS"),
+            revolve_ends_first: promoted("BREP_HYBRID_REVOLVE_ENDS_FIRST"),
+            cone_seam_bar: promoted("BREP_HYBRID_CONE_SEAM_BAR"),
+            join_split_runs: promoted("BREP_HYBRID_JOIN_SPLIT_RUNS"),
+            bore_strips: opted_in("BREP_HYBRID_BORE_STRIPS"),
+            assemble_cone_bore: promoted("BREP_HYBRID_ASSEMBLE_CONE_BORE"),
+            whole_freeform_strays: opted_in("BREP_HYBRID_WHOLE_FREEFORM_STRAYS"),
+            split_merge_refit: promoted("BREP_HYBRID_SPLIT_MERGE_REFIT"),
+            join_lone_freeform: promoted("BREP_HYBRID_JOIN_LONE_FREEFORM"),
+            split_noise_bar: promoted("BREP_HYBRID_SPLIT_NOISE_BAR"),
+        }
+    }
+}
+
+/// The hybrid segmentation, what the freeform split did (its measured noise
+/// is zero when it wrote no carrier), under row 2d the triangles of each
+/// host that took fragments (by its id before the join; `forbid` names hosts
+/// that may take none and regions the widened cut may not take), and under [`HybridSwitches::crease_cut`] the cut
+/// mesh (positions, indices, each triangle's source triangle) the
+/// segmentation then indexes.
 fn segment_for_hybrid_measured(
     positions: &[f64],
     indices: &[u32],
     options: &SegmentOptions,
-) -> Result<(MeshSegmentation, crate::hybrid_freeform_split::SplitReport), String> {
+    switches: HybridSwitches,
+    forbid: &Forbidden,
+) -> Result<(MeshSegmentation, crate::hybrid_freeform_split::SplitReport, BTreeMap<u32, Vec<usize>>, Option<CutMesh>), String> {
     let mut segmentation = segment_mesh_faces(positions, indices, options)?;
     crate::hybrid_recovery::recover(positions, indices, options, &mut segmentation);
     // Lane J row 7, promoted ON: a freeform region that holds several
     // carriers is split into them (crossing cylinder walls under vertex
     // noise). BREP_HYBRID_SPLIT_FREEFORM=0 restores the unsplit region.
-    let split = if split_freeform_enabled() {
-        crate::hybrid_freeform_split::split(positions, indices, options, &mut segmentation)
+    let mut split = if split_freeform_enabled() {
+        crate::hybrid_freeform_split::split(
+            positions,
+            indices,
+            options,
+            &mut segmentation,
+            switches.split_lone_cone,
+            switches.split_cone_bore,
+            switches.split_probe_crease,
+            switches.cone_stage_budget,
+            switches.bore_strips,
+            switches.assemble_cone_bore,
+            switches.split_merge_refit,
+            switches.split_noise_bar,
+        )
     } else {
         Default::default()
     };
     let split_noise = split.noise;
     // Lane J row 5, promoted ON: BREP_HYBRID_NOISE_PLANES=0 restores the
     // unjoined fragments.
-    if std::env::var("BREP_HYBRID_NOISE_PLANES").map_or(true, |v| v != "0") {
-        let noise = measured_plane_noise(&segmentation).max(split_noise);
-        join_noisy_planar_fragments(&mut segmentation, positions, indices, noise, split_noise > 0.0);
-        if split_noise > 0.0 {
-            crate::hybrid_freeform_split::absorb_plane_fragments(&mut segmentation, positions, indices, noise);
+    if brep_kernel::switch!(live "BREP_HYBRID_NOISE_PLANES", true) {
+        let mut noise = measured_plane_noise(&segmentation).max(split_noise);
+        if noise == 0.0 && switches.noise_any_region {
+            noise = measured_region_noise(&segmentation);
         }
+        join_noisy_planar_fragments(&mut segmentation, positions, indices, noise, split_noise > 0.0, switches.join_split_runs, switches.join_lone_freeform);
+        if switches.absorb_unsplit {
+            // The builder's exact-topology bar (twice the plane noise): a
+            // rim fragment is split off because a vertex sits past the
+            // cap's own largest residual.
+            // Under absorb_repeat, a fragment that borders the cap only
+            // through fragments a pass joined takes another pass.
+            while crate::hybrid_freeform_split::absorb_plane_fragments(
+                &mut segmentation,
+                positions,
+                indices,
+                2.0 * noise,
+                switches.absorb_curved_slivers,
+            ) && switches.absorb_repeat
+            {}
+        } else if split_noise > 0.0 {
+            crate::hybrid_freeform_split::absorb_plane_fragments(
+                &mut segmentation,
+                positions,
+                indices,
+                noise,
+                switches.absorb_curved_slivers,
+            );
+        }
+        // After the absorb, a cap is in its final pieces.
+        if switches.merge_coplanar_planes {
+            merge_coplanar_planes(&mut segmentation, positions, indices, 2.0 * noise);
+        }
+    }
+    let mut absorbed = BTreeMap::new();
+    let vertices = positions.chunks_exact(3).map(|p| Vec3::new(p[0], p[1], p[2])).collect::<Vec<_>>();
+    let diagonal = mesh_diagonal(&vertices);
+    // The exact-topology bar hybrid_plane_cylinder_brep_once uses.
+    let mut tolerance = (options.fit_tolerance * diagonal).min(2.0e-6 * diagonal).max(1.0e-10);
+    if brep_kernel::switch!(live "BREP_HYBRID_MESH_NOISE", true) {
+        tolerance = tolerance.max(2.0 * measured_plane_noise(&segmentation).max(split_noise));
+    }
+    if switches.gather_cone_strips {
+        split.gathered_cone_runs = gather_cone_strips(&mut segmentation, positions, indices, tolerance, switches.split_noise_bar.then_some(options.weld_tolerance));
+    }
+    if switches.join_cone_pieces {
+        join_cone_pieces(&mut segmentation, positions, indices, tolerance, options.weld_tolerance, switches.join_cone_across);
+    }
+    if switches.assemble_cone_bore {
+        crate::hybrid_freeform_split::assemble_cone_bore(&mut segmentation, positions, indices, options);
+    }
+    if switches.absorb_revolve {
+        let cos_normal_gate = options.normal_tolerance_deg.to_radians().cos();
+        let chord = if switches.absorb_chord {
+            crate::hybrid_whole_freeform::chord_spans(positions, indices, options.weld_tolerance)
+        } else {
+            BTreeMap::new()
+        };
+        absorbed = absorb_revolve_fragments(
+            &mut segmentation,
+            &vertices,
+            indices,
+            tolerance,
+            diagonal,
+            cos_normal_gate,
+            switches.sliver_lean,
+            &chord,
+            &forbid.hosts,
+            switches.absorb_share,
+        );
+    }
+    let cut = if switches.crease_cut {
+        let chord = if switches.crease_walls {
+            crate::hybrid_whole_freeform::chord_vertices(positions, indices, options.weld_tolerance)
+        } else {
+            BTreeSet::new()
+        };
+        cut_crossing_strips(&mut segmentation, positions, indices, tolerance, switches.crease_walls, &chord, &forbid.cuts)
+    } else {
+        None
+    };
+    if switches.join_wall_pieces {
+        join_wall_pieces(&mut segmentation, cut.as_ref().map_or(indices, |cut| cut.indices.as_slice()), tolerance);
+    }
+    if switches.split_revolve_pieces {
+        split_revolve_pieces(&mut segmentation, cut.as_ref().map_or(indices, |cut| cut.indices.as_slice()));
+    }
+    if switches.cone_refit {
+        let (positions, indices) = cut.as_ref().map_or((positions, indices), |cut| (cut.positions.as_slice(), cut.indices.as_slice()));
+        refit_chord_cones(&mut segmentation, positions, indices, options.weld_tolerance);
     }
     if std::env::var("BREP_DEBUG_SPLIT").is_ok() {
         for r in &segmentation.regions {
             eprintln!("[seg] {} {} tris {} dev {:.2e} bbox ({:.2},{:.2},{:.2})..({:.2},{:.2},{:.2})", r.id, r.carrier.kind(), r.triangle_count, r.max_deviation, r.bbox_min.x, r.bbox_min.y, r.bbox_min.z, r.bbox_max.x, r.bbox_max.y, r.bbox_max.z);
         }
     }
-    Ok((segmentation, split))
+    Ok((segmentation, split, absorbed, cut))
+}
+
+/// The mesh [`HybridSwitches::crease_cut`] leaves: a cut triangle keeps its
+/// index for its first piece and appends the others, each naming its source
+/// triangle in `parent`.
+pub(crate) struct CutMesh {
+    positions: Vec<f64>,
+    indices: Vec<u32>,
+    parent: Vec<usize>,
+    /// Under [`HybridSwitches::crease_walls`], the source triangles of each
+    /// region cut only because of that switch.
+    widened: Vec<Vec<usize>>,
+}
+
+/// What a rebuild under [`HybridSwitches::absorb_retry`] may not join: row
+/// 2d hosts (by id before the join) and, under
+/// [`HybridSwitches::crease_walls`], regions holding these source triangles
+/// that the widened crease cut would take.
+#[derive(Clone, Debug, Default)]
+struct Forbidden {
+    hosts: BTreeSet<u32>,
+    cuts: BTreeSet<usize>,
+}
+
+/// [`HybridSwitches::crease_cut`]: cut every freeform region that borders
+/// exactly two cylinder regions forming an equal-radius crossing
+/// (`cylinder_pair_section`) and whose vertices each lie within the pair's
+/// radial bar of one of them. An edge from a vertex on one wall only to one
+/// on the other only is split where it crosses a section plane, at the point
+/// of that plane's ellipse (the curve `cylinder_pair_section_edge` builds)
+/// at the crossing's in-plane angle; a region is left whole when such an edge
+/// borders a triangle outside it, crosses both planes or none, or its
+/// ellipse point lies off the edge by more than the bar. Pieces join the
+/// wall of their vertices on one wall only (a piece with none takes the wall
+/// its vertices are nearer). `None` when nothing was cut. Under
+/// [`HybridSwitches::crease_walls`] the candidates and walls widen as that
+/// switch says, and a vertex in `chord` (empty otherwise) need lie on
+/// neither wall; a region so widened is not cut when it holds a triangle in
+/// `forbid`.
+fn cut_crossing_strips(
+    segmentation: &mut MeshSegmentation,
+    positions: &[f64],
+    indices: &[u32],
+    tolerance: f64,
+    crease_walls: bool,
+    chord: &BTreeSet<u32>,
+    forbid: &BTreeSet<usize>,
+) -> Option<CutMesh> {
+    let triangle_count = segmentation.triangle_region_ids.len();
+    if indices.len() != triangle_count * 3 {
+        return None;
+    }
+    let point = |v: u32| Vec3::new(positions[3 * v as usize], positions[3 * v as usize + 1], positions[3 * v as usize + 2]);
+    let mut edges = HashMap::<(u32, u32), Vec<usize>>::new();
+    for t in 0..triangle_count {
+        for c in 0..3 {
+            let (a, b) = (indices[3 * t + c], indices[3 * t + (c + 1) % 3]);
+            edges.entry((a.min(b), a.max(b))).or_default().push(t);
+        }
+    }
+    let mut members = BTreeMap::<u32, Vec<usize>>::new();
+    for (t, &r) in segmentation.triangle_region_ids.iter().enumerate() {
+        members.entry(r).or_default().push(t);
+    }
+    let cylinder_of = |r: u32| {
+        segmentation.regions.get(r as usize).and_then(|region| carrier_cylinder(region, true).ok().flatten())
+    };
+    let mut new_positions = positions.to_vec();
+    let mut new_indices = indices.to_vec();
+    let mut parent = (0..triangle_count).collect::<Vec<_>>();
+    let mut labels = segmentation.triangle_region_ids.clone();
+    let mut cut_any = false;
+    // Under crease_walls, each wall a cut joined: its pieces become one
+    // region (by the lowest id).
+    let mut joined_walls = BTreeMap::<u32, u32>::new();
+    let mut widened = Vec::new();
+    for (&region, triangles) in &members {
+        let Some(carrier) = segmentation.regions.get(region as usize).map(|r| &r.carrier) else { continue };
+        let sliver =
+            crease_walls && triangles.len() <= CREASE_SLIVER && !matches!(carrier, RegionCarrier::Cylinder { .. });
+        if !matches!(carrier, RegionCarrier::Freeform) && !sliver {
+            continue;
+        }
+        let mut walls = BTreeSet::new();
+        for &t in triangles {
+            for c in 0..3 {
+                let (a, b) = (indices[3 * t + c], indices[3 * t + (c + 1) % 3]);
+                for &n in &edges[&(a.min(b), a.max(b))] {
+                    let r = labels[n];
+                    if r != region && cylinder_of(r).is_some() {
+                        walls.insert(r);
+                    }
+                }
+            }
+        }
+        // Each wall's cylinder regions; one each unless crease_walls joins
+        // the pieces of one wall.
+        let mut classes = Vec::<Vec<u32>>::new();
+        for &wall in &walls {
+            let Some(cylinder) = cylinder_of(wall) else { continue };
+            let joins = |class: &Vec<u32>| {
+                crease_walls
+                    && class.iter().any(|&w| cylinder_of(w).is_some_and(|c| same_cylinder_wall(c, cylinder, tolerance)))
+            };
+            let (joined, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut classes).into_iter().partition(joins);
+            classes = kept;
+            classes.push(std::iter::once(wall).chain(joined.into_iter().flatten()).collect());
+        }
+        let [class_a, class_b] = &classes[..] else { continue };
+        let lead = |class: &[u32]| {
+            class.iter().copied().max_by_key(|&w| (members.get(&w).map_or(0, Vec::len), std::cmp::Reverse(w))).unwrap()
+        };
+        let (wall_a, wall_b) = (lead(class_a), lead(class_b));
+        let (Some(first), Some(second)) = (cylinder_of(wall_a), cylinder_of(wall_b)) else { continue };
+        let Some((center, normals)) = cylinder_pair_section(first, second, tolerance) else { continue };
+        let deviation = class_a.iter().chain(class_b).filter_map(|&w| cylinder_of(w)).map(|c| c.deviation).fold(0.0, f64::max);
+        let bar = accepted_radial_bar(tolerance * 4.0, deviation);
+        let radial_error = |cylinder: CylinderCarrier, p: Vec3| (radial(cylinder, p).length() - cylinder.radius).abs();
+        // The nearest piece of the first wall (on_first) or the second.
+        let error = |on_first: bool, p: Vec3| {
+            let class = if on_first { class_a } else { class_b };
+            class.iter().filter_map(|&w| cylinder_of(w)).map(|c| radial_error(c, p)).fold(f64::INFINITY, f64::min)
+        };
+        // Each vertex: on the first wall, on the second.
+        let mut side = HashMap::<u32, (bool, bool)>::new();
+        for &t in triangles {
+            for c in 0..3 {
+                let v = indices[3 * t + c];
+                side.entry(v).or_insert_with(|| (error(true, point(v)) <= bar, error(false, point(v)) <= bar));
+            }
+        }
+        // A stitched T-junction vertex in `chord` sits on the chord of the
+        // edge it split and reads neither wall; it takes no side.
+        if side.iter().any(|(v, &(a, b))| !a && !b && !chord.contains(v)) {
+            continue;
+        }
+        // Cut only because of crease_walls: a non-freeform region, a wall
+        // of several pieces, or a vertex on neither wall.
+        let widens = sliver
+            || class_a.len() > 1
+            || class_b.len() > 1
+            || side.values().any(|&(a, b)| !a && !b);
+        if widens && triangles.iter().any(|t| forbid.contains(t)) {
+            continue;
+        }
+        let only = |v: u32| match side[&v] {
+            (true, false) => Some(true),
+            (false, true) => Some(false),
+            _ => None,
+        };
+        let Ok(minor) = first.axis.cross(second.axis).normalized() else { continue };
+        let radius = 0.5 * (first.radius + second.radius);
+        let mut cuts = BTreeMap::<(u32, u32), Vec3>::new();
+        let mut whole = true;
+        for &t in triangles {
+            for c in 0..3 {
+                let (a, b) = (indices[3 * t + c], indices[3 * t + (c + 1) % 3]);
+                let key = (a.min(b), a.max(b));
+                if cuts.contains_key(&key) || only(a).is_none() || only(b).is_none() || only(a) == only(b) {
+                    continue;
+                }
+                if edges[&key].iter().any(|&n| labels[n] != region) {
+                    whole = false;
+                    break;
+                }
+                let (p, q) = (point(key.0), point(key.1));
+                let mut found = Vec::new();
+                for &normal in &normals {
+                    let (sp, sq) = (p.sub(center).dot(normal), q.sub(center).dot(normal));
+                    if !(sp * sq < 0.0) {
+                        continue;
+                    }
+                    let x = p.add(q.sub(p).scale(sp / (sp - sq)));
+                    let Ok(major) = normal.cross(minor).normalized() else { continue };
+                    let along = major.dot(first.axis);
+                    let major_radius = radius / (1.0 - along * along).sqrt();
+                    let d = x.sub(center);
+                    let angle = (d.dot(minor) / radius).atan2(d.dot(major) / major_radius);
+                    let on_ellipse = center
+                        .add(major.scale(major_radius * angle.cos()))
+                        .add(minor.scale(radius * angle.sin()));
+                    if on_ellipse.sub(x).length() <= bar {
+                        found.push(on_ellipse);
+                    }
+                }
+                let [cut] = found[..] else {
+                    whole = false;
+                    break;
+                };
+                cuts.insert(key, cut);
+            }
+            if !whole {
+                break;
+            }
+        }
+        if !whole {
+            continue;
+        }
+        let mut cut_vertex = HashMap::<(u32, u32), u32>::new();
+        for (&key, &cut) in &cuts {
+            cut_vertex.insert(key, (new_positions.len() / 3) as u32);
+            new_positions.extend([cut.x, cut.y, cut.z]);
+        }
+        for &t in triangles {
+            let v = [indices[3 * t], indices[3 * t + 1], indices[3 * t + 2]];
+            // The member of the wall this source triangle borders, else the
+            // wall's largest.
+            let wall_of = |on_first: bool| {
+                let (class, lead) = if on_first { (class_a, wall_a) } else { (class_b, wall_b) };
+                (0..3)
+                    .flat_map(|k| &edges[&(v[k].min(v[(k + 1) % 3]), v[k].max(v[(k + 1) % 3]))])
+                    .map(|&n| labels[n])
+                    .find(|r| class.contains(r))
+                    .unwrap_or(lead)
+            };
+            let split = |k: usize| cut_vertex.get(&(v[k].min(v[(k + 1) % 3]), v[k].max(v[(k + 1) % 3]))).copied();
+            let cut_edges = (0..3).filter(|&k| split(k).is_some()).collect::<Vec<_>>();
+            let mut pieces = Vec::<([u32; 3], u32)>::new();
+            match cut_edges[..] {
+                [] => {
+                    let wall = v.iter().find_map(|&x| only(x)).map_or_else(
+                        || {
+                            let (ea, eb) = v.iter().fold((0.0, 0.0), |(ea, eb), &x| {
+                                (ea + error(true, point(x)), eb + error(false, point(x)))
+                            });
+                            wall_of(ea <= eb)
+                        },
+                        wall_of,
+                    );
+                    pieces.push((v, wall));
+                }
+                [k] => {
+                    let m = split(k).unwrap();
+                    let (a, b, c) = (v[k], v[(k + 1) % 3], v[(k + 2) % 3]);
+                    pieces.push(([a, m, c], wall_of(only(a).unwrap())));
+                    pieces.push(([m, b, c], wall_of(only(b).unwrap())));
+                }
+                [k1, k2] => {
+                    // The vertex both cut edges share stands alone.
+                    let lone = if (k1 + 1) % 3 == k2 { k2 } else { k1 };
+                    let (a, b, c) = (v[lone], v[(lone + 1) % 3], v[(lone + 2) % 3]);
+                    let (m1, m2) = (split(lone).unwrap(), split((lone + 2) % 3).unwrap());
+                    let (own, other) = (wall_of(only(a).unwrap()), wall_of(only(b).unwrap()));
+                    pieces.push(([a, m1, m2], own));
+                    pieces.push(([m1, b, c], other));
+                    pieces.push(([m1, c, m2], other));
+                }
+                _ => unreachable!("two sides cut at most two edges of a triangle"),
+            }
+            for (index, (corners, wall)) in pieces.into_iter().enumerate() {
+                let slot = if index == 0 {
+                    t
+                } else {
+                    parent.push(t);
+                    labels.push(wall);
+                    new_indices.extend([0, 0, 0]);
+                    labels.len() - 1
+                };
+                new_indices[3 * slot..3 * slot + 3].copy_from_slice(&corners);
+                labels[slot] = wall;
+            }
+        }
+        cut_any = true;
+        if widens {
+            widened.push(triangles.clone());
+        }
+        for class in [class_a, class_b].into_iter().filter(|_| crease_walls) {
+            let lowest = class.iter().copied().chain(class.iter().filter_map(|w| joined_walls.get(w).copied())).min().unwrap();
+            for (_, to) in joined_walls.iter_mut().filter(|(_, to)| class.contains(to)) {
+                *to = lowest;
+            }
+            for &w in class {
+                joined_walls.insert(w, lowest);
+            }
+        }
+    }
+    if !cut_any {
+        return None;
+    }
+    // The pieces of one wall meet along mesh edges once the crease between
+    // them is cut; one region over them lets split_revolve_pieces part only
+    // the pieces that do not touch. Its deviation covers every piece.
+    for label in &mut labels {
+        if let Some(&to) = joined_walls.get(label) {
+            *label = to;
+        }
+    }
+    for (&from, &to) in &joined_walls {
+        let deviation = segmentation.regions[from as usize].max_deviation;
+        let region = &mut segmentation.regions[to as usize];
+        region.max_deviation = region.max_deviation.max(deviation);
+    }
+    let area = |t: usize| {
+        let [a, b, c] = [new_indices[3 * t], new_indices[3 * t + 1], new_indices[3 * t + 2]].map(|v| {
+            Vec3::new(new_positions[3 * v as usize], new_positions[3 * v as usize + 1], new_positions[3 * v as usize + 2])
+        });
+        0.5 * b.sub(a).cross(c.sub(a)).length()
+    };
+    for region in &mut segmentation.regions {
+        region.triangle_count = 0;
+        region.area = 0.0;
+    }
+    for (t, &r) in labels.iter().enumerate() {
+        if let Some(region) = segmentation.regions.get_mut(r as usize) {
+            region.triangle_count += 1;
+            region.area += area(t);
+        }
+    }
+    segmentation.triangle_count = labels.len();
+    segmentation.triangle_region_ids = labels;
+    crate::hybrid_freeform_split::compact(segmentation);
+    Some(CutMesh { positions: new_positions, indices: new_indices, parent, widened })
+}
+
+/// Outward normal of a revolve carrier at a point, before its sense (the
+/// segmenter's own field, `mesh_segment::segmentation::carrier_normal`).
+fn revolve_carrier_normal(carrier: &RegionCarrier, p: Vec3) -> Option<Vec3> {
+    match *carrier {
+        RegionCarrier::Cylinder { axis_point, axis_dir, .. } => {
+            let d = p.sub(axis_point);
+            d.sub(axis_dir.scale(d.dot(axis_dir))).normalized().ok()
+        }
+        RegionCarrier::Cone { apex, axis_dir, half_angle_rad, .. } => {
+            let d = p.sub(apex);
+            let radial = d.sub(axis_dir.scale(d.dot(axis_dir))).normalized().ok()?;
+            let (sin_a, cos_a) = half_angle_rad.sin_cos();
+            Some(radial.scale(cos_a).sub(axis_dir.scale(sin_a)))
+        }
+        RegionCarrier::Sphere { center, .. } => p.sub(center).normalized().ok(),
+        RegionCarrier::Torus { center, axis_dir, major_radius, .. } => {
+            let d = p.sub(center);
+            let radial = d.sub(axis_dir.scale(d.dot(axis_dir))).normalized().ok()?;
+            p.sub(center.add(radial.scale(major_radius))).normalized().ok()
+        }
+        _ => None,
+    }
+}
+
+/// Distance of a point from a revolve carrier (the segmenter's
+/// `carrier_distance`); infinite for anything else.
+fn revolve_carrier_distance(carrier: &RegionCarrier, p: Vec3) -> f64 {
+    match *carrier {
+        RegionCarrier::Cylinder { axis_point, axis_dir, radius, .. } => {
+            let d = p.sub(axis_point);
+            (d.sub(axis_dir.scale(d.dot(axis_dir))).length() - radius).abs()
+        }
+        RegionCarrier::Cone { apex, axis_dir, half_angle_rad, .. } => {
+            let d = p.sub(apex);
+            let s = d.dot(axis_dir);
+            let r = d.sub(axis_dir.scale(s)).length();
+            ((r - s * half_angle_rad.tan()) * half_angle_rad.cos()).abs()
+        }
+        RegionCarrier::Sphere { center, radius, .. } => (p.sub(center).length() - radius).abs(),
+        RegionCarrier::Torus { center, axis_dir, major_radius, minor_radius, .. } => {
+            let d = p.sub(center);
+            let s = d.dot(axis_dir);
+            let rho = d.sub(axis_dir.scale(s)).length();
+            ((rho - major_radius).hypot(s) - minor_radius).abs()
+        }
+        _ => f64::INFINITY,
+    }
+}
+
+/// Lane V row 2d ([`HybridSwitches::absorb_revolve`]): a region joins an
+/// edge-adjacent revolve region at least eight times its size whose carrier
+/// holds every one of its vertices within `accepted_radial_bar(tolerance,
+/// host deviation)` and passes the segmenter's own acceptance gate on every
+/// non-degenerate triangle: its normal within `normal_tolerance_deg` of the
+/// carrier's at the centroid, plus half the spread of the carrier's normals
+/// at its three vertices (a chord facet with every vertex on the carrier
+/// leans by up to that much: the coarse crossing's one-triangle slivers sit
+/// 15-23 degrees off at a 15 degree gate). A cap triangulated from rim
+/// vertices alone has every vertex on the wall but faces 90 degrees off. Of
+/// several such hosts the one with the smallest largest residual wins
+/// (then the lowest id); the host's accepted deviation grows to cover what
+/// it took. Smallest fragments go first, in passes repeated until one
+/// joins nothing. A host in `forbid` (ids before the join) takes nothing.
+/// A vertex in `chord` ([`HybridSwitches::absorb_chord`]) takes no part in
+/// the vertex bar. Returns the triangles each host that took fragments ends
+/// up holding.
+fn absorb_revolve_fragments(
+    segmentation: &mut MeshSegmentation,
+    vertices: &[Vec3],
+    indices: &[u32],
+    tolerance: f64,
+    diagonal: f64,
+    cos_normal_gate: f64,
+    sliver_lean: bool,
+    chord: &BTreeMap<u32, Vec<(u32, u32)>>,
+    forbid: &BTreeSet<u32>,
+    share: bool,
+) -> BTreeMap<u32, Vec<usize>> {
+    let triangle_count = segmentation.triangle_region_ids.len();
+    if indices.len() != triangle_count * 3 {
+        return BTreeMap::new();
+    }
+    let corner = |t: usize, c: usize| vertices[indices[3 * t + c] as usize];
+    let mut edges = HashMap::<(u32, u32), Vec<usize>>::new();
+    for t in 0..triangle_count {
+        for c in 0..3 {
+            let (a, b) = (indices[3 * t + c], indices[3 * t + (c + 1) % 3]);
+            edges.entry((a.min(b), a.max(b))).or_default().push(t);
+        }
+    }
+    let mut members = BTreeMap::<u32, Vec<usize>>::new();
+    for (t, &r) in segmentation.triangle_region_ids.iter().enumerate() {
+        members.entry(r).or_default().push(t);
+    }
+    let degenerate = 1.0e-12 * diagonal * diagonal;
+    let mut changed = false;
+    let mut hosts = BTreeSet::new();
+    // Repeat until a pass joins nothing: a sliver visited before the
+    // pieces beside it joined their wall sees only those small pieces.
+    loop {
+        let mut order = members.iter().filter(|(_, t)| !t.is_empty()).map(|(&r, _)| r).collect::<Vec<_>>();
+        order.sort_by_key(|r| (members[r].len(), *r));
+        let mut joined = false;
+        for fragment in order {
+            let triangles = members[&fragment].clone();
+            if triangles.is_empty() {
+                continue;
+            }
+            let mut neighbours = BTreeSet::new();
+            for &t in &triangles {
+                for c in 0..3 {
+                    let (a, b) = (indices[3 * t + c], indices[3 * t + (c + 1) % 3]);
+                    for &n in &edges[&(a.min(b), a.max(b))] {
+                        let r = segmentation.triangle_region_ids[n];
+                        if r != fragment {
+                            neighbours.insert(r);
+                        }
+                    }
+                }
+            }
+            let mut best: Option<(f64, u32)> = None;
+            let mut eligible = Vec::new();
+            for host in neighbours {
+                let Some(region) = segmentation.regions.get(host as usize) else { continue };
+                if forbid.contains(&host) {
+                    continue;
+                }
+                let size = members.get(&host).map_or(0, Vec::len);
+                if size < 8 * triangles.len() {
+                    continue;
+                }
+                let bar = accepted_radial_bar(tolerance, region.max_deviation);
+                let sense = match region.carrier {
+                    RegionCarrier::Cylinder { sense, .. }
+                    | RegionCarrier::Cone { sense, .. }
+                    | RegionCarrier::Sphere { sense, .. }
+                    | RegionCarrier::Torus { sense, .. } => f64::from(sense),
+                    _ => continue,
+                };
+                eligible.push((host, bar, sense));
+                let mut worst = 0.0_f64;
+                let fit = |t: usize| {
+                    let gate = (degenerate, cos_normal_gate, sliver_lean);
+                    revolve_triangle_fit(&region.carrier, sense, t, vertices, indices, bar, chord, gate)
+                };
+                let holds = triangles.iter().all(|&t| {
+                    let (residual, facing) = fit(t);
+                    worst = worst.max(residual);
+                    facing
+                });
+                if std::env::var("BREP_DEBUG_ROW2D").is_ok() {
+                    eprintln!(
+                        "[row2d] fragment {fragment} ({} {}, at {:.3},{:.3},{:.3}) host {host} ({size}, {}) worst {worst:.2e} bar {bar:.2e} facing {holds}",
+                        triangles.len(),
+                        segmentation.regions.get(fragment as usize).map_or("?", |r| r.carrier.kind()),
+                        corner(triangles[0], 0).x,
+                        corner(triangles[0], 0).y,
+                        corner(triangles[0], 0).z,
+                        region.carrier.kind()
+                    );
+                }
+                if holds && worst <= bar && best.is_none_or(|(residual, _)| worst < residual) {
+                    best = Some((worst, host));
+                }
+            }
+            let Some((residual, host)) = best else {
+                // [`HybridSwitches::absorb_share`]: each triangle to the
+                // eligible host holding it with the least residual, when
+                // every triangle has one.
+                if !share || triangles.len() < 2 {
+                    continue;
+                }
+                let gate = (degenerate, cos_normal_gate, sliver_lean);
+                let shared: Option<Vec<(usize, u32, f64)>> = triangles
+                    .iter()
+                    .map(|&t| {
+                        eligible
+                            .iter()
+                            .filter_map(|&(host, bar, sense)| {
+                                let carrier = &segmentation.regions[host as usize].carrier;
+                                let (residual, facing) =
+                                    revolve_triangle_fit(carrier, sense, t, vertices, indices, bar, chord, gate);
+                                (facing && residual <= bar).then_some((t, host, residual))
+                            })
+                            .min_by(|a, b| a.2.total_cmp(&b.2))
+                    })
+                    .collect();
+                let Some(shared) = shared else { continue };
+                if std::env::var("BREP_DEBUG_ROW2D").is_ok() {
+                    eprintln!("[row2d] fragment {fragment} ({}) shared among {:?}", triangles.len(), shared.iter().map(|s| s.1).collect::<BTreeSet<_>>());
+                }
+                for (t, host, residual) in shared {
+                    segmentation.triangle_region_ids[t] = host;
+                    let region = &mut segmentation.regions[host as usize];
+                    region.max_deviation = region.max_deviation.max(residual);
+                    members.get_mut(&host).unwrap().push(t);
+                    hosts.insert(host);
+                }
+                members.get_mut(&fragment).unwrap().clear();
+                joined = true;
+                continue;
+            };
+            for &t in &triangles {
+                segmentation.triangle_region_ids[t] = host;
+            }
+            let region = &mut segmentation.regions[host as usize];
+            region.max_deviation = region.max_deviation.max(residual);
+            members.get_mut(&host).unwrap().extend(&triangles);
+            members.get_mut(&fragment).unwrap().clear();
+            hosts.insert(host);
+            joined = true;
+        }
+        if !joined {
+            break;
+        }
+        changed = true;
+    }
+    if changed {
+        crate::hybrid_freeform_split::compact(segmentation);
+    }
+    hosts
+        .into_iter()
+        .filter_map(|host| members.remove(&host).filter(|triangles| !triangles.is_empty()).map(|t| (host, t)))
+        .collect()
+}
+
+/// Row 2d's test of one triangle against a host carrier: the largest
+/// distance of its vertices from the carrier (a chord vertex reads nothing
+/// of the host when the host holds both ends of its chord: a vertex on a
+/// cone's ruling lies between its ruling neighbours too), and whether its
+/// facet faces the carrier within the normal gate, plus half the spread of
+/// the carrier's normals at its vertices, plus under `sliver_lean` the tilt
+/// its vertex residuals can give it across its least altitude. A degenerate
+/// facet faces any carrier.
+#[allow(clippy::too_many_arguments)]
+fn revolve_triangle_fit(
+    carrier: &RegionCarrier,
+    sense: f64,
+    t: usize,
+    vertices: &[Vec3],
+    indices: &[u32],
+    bar: f64,
+    chord: &BTreeMap<u32, Vec<(u32, u32)>>,
+    (degenerate, cos_normal_gate, sliver_lean): (f64, f64, bool),
+) -> (f64, bool) {
+    let on_host = |v: u32| revolve_carrier_distance(carrier, vertices[v as usize]) <= bar;
+    let chord_of_host =
+        |v: u32| chord.get(&v).is_some_and(|spans| spans.iter().any(|&(a, b)| on_host(a) && on_host(b)));
+    let corners = [indices[3 * t], indices[3 * t + 1], indices[3 * t + 2]];
+    let [a, b, c] = corners.map(|v| vertices[v as usize]);
+    let mut worst = 0.0_f64;
+    for (&v, p) in corners.iter().zip([a, b, c]) {
+        if !chord_of_host(v) {
+            worst = worst.max(revolve_carrier_distance(carrier, p));
+        }
+    }
+    let normal = b.sub(a).cross(c.sub(a));
+    if normal.length() <= degenerate {
+        return (worst, true);
+    }
+    let angle = |u: Vec3, v: Vec3| u.dot(v).clamp(-1.0, 1.0).acos();
+    let (Ok(facet), Some(centroid), Some(na), Some(nb), Some(nc)) = (
+        normal.normalized(),
+        revolve_carrier_normal(carrier, a.add(b).add(c).scale(1.0 / 3.0)),
+        revolve_carrier_normal(carrier, a),
+        revolve_carrier_normal(carrier, b),
+        revolve_carrier_normal(carrier, c),
+    ) else {
+        return (worst, false);
+    };
+    let spread = angle(na, nb).max(angle(nb, nc)).max(angle(nc, na));
+    let lean = if sliver_lean {
+        let longest = b.sub(a).length().max(c.sub(b).length()).max(a.sub(c).length());
+        let residual = [a, b, c].into_iter().map(|p| revolve_carrier_distance(carrier, p)).fold(0.0, f64::max);
+        (2.0 * residual * longest / normal.length()).min(1.0).asin().min(cos_normal_gate.acos())
+    } else {
+        0.0
+    };
+    (worst, angle(facet.scale(sense), centroid) <= cos_normal_gate.acos() + 0.5 * spread + lean)
+}
+
+/// [`HybridSwitches::join_wall_pieces`]: union edge-adjacent cylinder
+/// regions that are pieces of one wall into the largest of them (its
+/// carrier, the largest deviation, the summed area).
+fn join_wall_pieces(segmentation: &mut MeshSegmentation, indices: &[u32], tolerance: f64) {
+    let triangle_count = segmentation.triangle_region_ids.len();
+    if indices.len() != triangle_count * 3 {
+        return;
+    }
+    let mut edges = HashMap::<(u32, u32), Vec<u32>>::new();
+    for (t, corners) in indices.chunks_exact(3).enumerate() {
+        for k in 0..3 {
+            let (a, b) = (corners[k], corners[(k + 1) % 3]);
+            edges.entry((a.min(b), a.max(b))).or_default().push(segmentation.triangle_region_ids[t]);
+        }
+    }
+    let cylinder_of = |r: u32| {
+        segmentation.regions.get(r as usize).and_then(|region| carrier_cylinder(region, true).ok().flatten())
+    };
+    let mut pairs = BTreeSet::new();
+    for regions in edges.values() {
+        if let [a, b] = regions[..] {
+            if a != b {
+                pairs.insert((a.min(b), a.max(b)));
+            }
+        }
+    }
+    let mut group = BTreeMap::<u32, u32>::new();
+    fn root(group: &BTreeMap<u32, u32>, mut r: u32) -> u32 {
+        while let Some(&up) = group.get(&r).filter(|&&up| up != r) {
+            r = up;
+        }
+        r
+    }
+    for (a, b) in pairs {
+        let (Some(first), Some(second)) = (cylinder_of(a), cylinder_of(b)) else { continue };
+        if !same_cylinder_wall(first, second, tolerance) {
+            continue;
+        }
+        let (ra, rb) = (root(&group, a), root(&group, b));
+        if ra != rb {
+            group.insert(ra.max(rb), ra.min(rb));
+            group.entry(ra.min(rb)).or_insert(ra.min(rb));
+        }
+    }
+    if group.is_empty() {
+        return;
+    }
+    let mut members = BTreeMap::<u32, Vec<u32>>::new();
+    for &r in group.keys() {
+        members.entry(root(&group, r)).or_default().push(r);
+    }
+    let mut target = HashMap::<u32, u32>::new();
+    for pieces in members.values() {
+        let size = |r: u32| segmentation.regions[r as usize].triangle_count;
+        let lead = pieces.iter().copied().max_by_key(|&r| (size(r), std::cmp::Reverse(r))).unwrap();
+        let deviation = pieces.iter().map(|&r| segmentation.regions[r as usize].max_deviation).fold(0.0, f64::max);
+        let area = pieces.iter().map(|&r| segmentation.regions[r as usize].area).sum::<f64>();
+        let region = &mut segmentation.regions[lead as usize];
+        region.max_deviation = deviation;
+        region.area = area;
+        for &r in pieces {
+            target.insert(r, lead);
+        }
+    }
+    for r in &mut segmentation.triangle_region_ids {
+        if let Some(&lead) = target.get(r) {
+            *r = lead;
+        }
+    }
+    crate::hybrid_freeform_split::compact(segmentation);
+}
+
+/// [`HybridSwitches::cone_refit`]: a cone region past the weld tolerance
+/// takes the refit on its vertices other than stitched chord vertices when
+/// that refit holds every one of them within the weld tolerance; its
+/// deviation is then theirs.
+fn refit_chord_cones(segmentation: &mut MeshSegmentation, positions: &[f64], indices: &[u32], weld_tolerance: f64) {
+    if indices.len() != segmentation.triangle_region_ids.len() * 3 {
+        return;
+    }
+    let chord = crate::hybrid_whole_freeform::chord_vertices(positions, indices, weld_tolerance);
+    let mut vertices = BTreeMap::<u32, BTreeSet<u32>>::new();
+    for (t, &r) in segmentation.triangle_region_ids.iter().enumerate() {
+        vertices.entry(r).or_default().extend(indices[3 * t..3 * t + 3].iter().filter(|v| !chord.contains(v)));
+    }
+    for region in &mut segmentation.regions {
+        let RegionCarrier::Cone { apex, axis_dir, half_angle_rad, sense } = region.carrier else { continue };
+        if region.max_deviation <= weld_tolerance {
+            continue;
+        }
+        let Some(own) = vertices.get(&region.id) else { continue };
+        let points: Vec<[f64; 3]> = own
+            .iter()
+            .map(|&v| {
+                let i = 3 * v as usize;
+                [positions[i], positions[i + 1], positions[i + 2]]
+            })
+            .collect();
+        let Some((apex, axis, half_angle, deviation)) = crate::hybrid_whole_freeform::refit_cone(
+            &points,
+            [apex.x, apex.y, apex.z],
+            [axis_dir.x, axis_dir.y, axis_dir.z],
+            half_angle_rad,
+        ) else {
+            continue;
+        };
+        if std::env::var("BREP_DEBUG_SPLIT").is_ok() {
+            eprintln!(
+                "[cone-refit] region {} tris {} deviation {:.2e} -> {deviation:.2e} on {} vertices (bar {weld_tolerance:.1e})",
+                region.id,
+                region.triangle_count,
+                region.max_deviation,
+                points.len()
+            );
+        }
+        if deviation > weld_tolerance {
+            continue;
+        }
+        region.carrier = RegionCarrier::Cone {
+            apex: Vec3::new(apex[0], apex[1], apex[2]),
+            axis_dir: Vec3::new(axis[0], axis[1], axis[2]),
+            half_angle_rad: half_angle,
+            sense,
+        };
+        region.max_deviation = deviation;
+    }
+}
+
+/// [`HybridSwitches::join_cone_pieces`]: edge-adjacent cone regions whose
+/// union refits as one cone ([`crate::hybrid_whole_freeform::refit_cone`]
+/// from the larger side's carrier, stitched chord vertices left out) within
+/// the pair's radial bar at `tolerance * 4` become one region on that
+/// refit, the largest first. A piece's apex is no test: across a narrow
+/// sector, tilting the axis trades against the opening, and pieces of one
+/// countersink at d0.001 jitter-0.1 hold apexes 1e-3 to 2e-1 apart.
+/// [`HybridSwitches::gather_cone_strips`]: the most triangles a region may
+/// hold and still be gathered as one strip of a shredded cone.
+const GATHER_STRIP_TRIANGLES: usize = 32;
+
+/// [`HybridSwitches::gather_cone_strips`]: every edge-connected run of at
+/// least three non-plane regions of at most [`GATHER_STRIP_TRIANGLES`]
+/// (whatever the segmenter fitted to each strip: sphere, torus, cone,
+/// cylinder or freeform) and at least 64 triangles is fitted with one cone
+/// from its own facets (`cone_start`, then `refit_cone` on its vertices);
+/// when every vertex holds within the radial bar, the bordering plane
+/// strips of at most that size the cone also holds join the run, the cone
+/// is fitted again, and the run becomes one cone region.
+///
+/// With `chord_weld` (under [`HybridSwitches::split_noise_bar`], the weld
+/// tolerance), the cone is fitted without the vertices the mesh put on a
+/// chord between two of their neighbours (T-junction vertices, which sit
+/// inside the cone by that chord's sag): on census record
+/// occt_pointed_cone_s1_d0.1_tjunction the 21 strips of the wall refitted at
+/// 1.65e-2 against a bar of 6.0e-5 and stayed 327 facets.
+fn gather_cone_strips(
+    segmentation: &mut MeshSegmentation,
+    positions: &[f64],
+    indices: &[u32],
+    tolerance: f64,
+    chord_weld: Option<f64>,
+) -> usize {
+    let triangle_count = segmentation.triangle_region_ids.len();
+    if indices.len() != triangle_count * 3 {
+        return 0;
+    }
+    let chord = chord_weld.map_or_else(BTreeSet::new, |weld| crate::hybrid_whole_freeform::chord_vertices(positions, indices, weld));
+    let point = |v: u32| {
+        let i = 3 * v as usize;
+        [positions[i], positions[i + 1], positions[i + 2]]
+    };
+    let size = |segmentation: &MeshSegmentation, r: u32| segmentation.regions[r as usize].triangle_count;
+    let is_plane = |segmentation: &MeshSegmentation, r: u32| {
+        matches!(segmentation.regions[r as usize].carrier, RegionCarrier::Plane { .. })
+    };
+    let mut neighbours = BTreeMap::<u32, BTreeSet<u32>>::new();
+    let mut edges = HashMap::<(u32, u32), Vec<u32>>::new();
+    let mut members = BTreeMap::<u32, Vec<usize>>::new();
+    for (t, corners) in indices.chunks_exact(3).enumerate() {
+        let r = segmentation.triangle_region_ids[t];
+        members.entry(r).or_default().push(t);
+        for k in 0..3 {
+            let (a, b) = (corners[k], corners[(k + 1) % 3]);
+            edges.entry((a.min(b), a.max(b))).or_default().push(r);
+        }
+    }
+    for regions in edges.values() {
+        if let [a, b] = regions[..] {
+            if a != b {
+                neighbours.entry(a).or_default().insert(b);
+                neighbours.entry(b).or_default().insert(a);
+            }
+        }
+    }
+    // A plane strip of the cone (16 triangles on the record) joins the run;
+    // a two-triangle plane strip of a coarse bore beside it does not.
+    let strip = |segmentation: &MeshSegmentation, r: u32| {
+        size(segmentation, r) <= GATHER_STRIP_TRIANGLES && (!is_plane(segmentation, r) || size(segmentation, r) >= 8)
+    };
+    let mut seen = BTreeSet::new();
+    let mut runs = Vec::new();
+    for r in 0..segmentation.regions.len() as u32 {
+        if seen.contains(&r) || !strip(segmentation, r) || !members.contains_key(&r) {
+            continue;
+        }
+        let mut run = vec![r];
+        seen.insert(r);
+        let mut at = 0;
+        while at < run.len() {
+            let here = run[at];
+            at += 1;
+            for &n in neighbours.get(&here).into_iter().flatten() {
+                if !seen.contains(&n) && strip(segmentation, n) {
+                    seen.insert(n);
+                    run.push(n);
+                }
+            }
+        }
+        runs.push(run);
+    }
+    // A chord vertex the fitted cone does not hold at the bar is dropped
+    // and the cone fitted again, at most three times (the mesh's vertices
+    // along the rulings pass the chord test too and stay).
+    let fit = |regions: &[u32], bar: f64| {
+        let triangles: Vec<usize> = regions.iter().flat_map(|r| members[r].iter().copied()).collect();
+        let facets: Vec<[[f64; 3]; 3]> = triangles.iter().map(|&t| [0, 1, 2].map(|c| point(indices[3 * t + c]))).collect();
+        let mut vertices: Vec<u32> = triangles
+            .iter()
+            .flat_map(|&t| indices[3 * t..3 * t + 3].iter().copied())
+            .collect::<BTreeSet<u32>>()
+            .into_iter()
+            .collect();
+        let (apex, axis, half_angle) = crate::hybrid_whole_freeform::cone_start(&facets)?;
+        let mut fitted = crate::hybrid_whole_freeform::refit_cone(&vertices.iter().map(|&v| point(v)).collect::<Vec<_>>(), apex, axis, half_angle)?;
+        for _ in 0..3 {
+            if chord.is_empty() || fitted.3 <= bar {
+                break;
+            }
+            let (apex, axis, half_angle) = (fitted.0, fitted.1, fitted.2);
+            let off = |v: u32| {
+                let q = point(v);
+                let d = [q[0] - apex[0], q[1] - apex[1], q[2] - apex[2]];
+                let h = d[0] * axis[0] + d[1] * axis[1] + d[2] * axis[2];
+                let r = ((d[0] - h * axis[0]).powi(2) + (d[1] - h * axis[1]).powi(2) + (d[2] - h * axis[2]).powi(2)).sqrt();
+                (r * half_angle.cos() - h * half_angle.sin()).abs() > bar
+            };
+            let before = vertices.len();
+            vertices.retain(|&v| !(chord.contains(&v) && off(v)));
+            if vertices.len() == before {
+                break;
+            }
+            fitted = crate::hybrid_whole_freeform::refit_cone(&vertices.iter().map(|&v| point(v)).collect::<Vec<_>>(), apex, axis, half_angle)?;
+        }
+        Some((fitted, facets))
+    };
+    let mut gathered = 0;
+    let mut claimed = BTreeSet::<u32>::new();
+    for mut run in runs {
+        let total: usize = run.iter().map(|&r| size(segmentation, r)).sum();
+        if run.len() < 3 || total < 64 {
+            continue;
+        }
+        let deviation = run.iter().map(|&r| segmentation.regions[r as usize].max_deviation).fold(0.0, f64::max);
+        let bar = accepted_radial_bar(tolerance * 4.0, deviation);
+        let Some(((apex, axis, half_angle, refit), _)) = fit(&run, bar) else { continue };
+        if !(refit <= bar) {
+            if std::env::var("BREP_DEBUG_SPLIT").is_ok() {
+                eprintln!("[cone-gather] {} strips ({total} tris): refit {refit:.2e} bar {bar:.2e}, left", run.len());
+            }
+            continue;
+        }
+        // Plane strips the cone holds.
+        let cone = ConeCarrier {
+            apex: Vec3::new(apex[0], apex[1], apex[2]),
+            axis: Vec3::new(axis[0], axis[1], axis[2]),
+            half_angle,
+            sense: 1,
+            deviation: refit,
+        };
+        let holds = |v: u32| {
+            let [x, y, z] = point(v);
+            let p = Vec3::new(x, y, z);
+            chord.contains(&v) || (cone_radial(cone, p).length() * half_angle.cos() - cone_station(cone, p) * half_angle.sin()).abs() <= bar
+        };
+        let planes: BTreeSet<u32> = run
+            .iter()
+            .flat_map(|r| neighbours.get(r).into_iter().flatten().copied())
+            .filter(|&n| {
+                // With `chord_weld`, a bordering cone region of any size the
+                // cone holds is its own piece too (census record
+                // occt_pointed_cone_s1_d0.1_tjunction: the segmenter's cone
+                // of 67 below the 21 strips, fitted apart through a
+                // T-junction vertex, met the gathered cone in a ring the
+                // builder demoted as not coaxial).
+                let piece = (is_plane(segmentation, n) && size(segmentation, n) <= GATHER_STRIP_TRIANGLES)
+                    || (chord_weld.is_some()
+                        && !claimed.contains(&n)
+                        && matches!(segmentation.regions[n as usize].carrier, RegionCarrier::Cone { .. }));
+                piece && !run.contains(&n) && members[&n].iter().all(|&t| indices[3 * t..3 * t + 3].iter().all(|&v| holds(v)))
+            })
+            .collect();
+        run.extend(planes);
+        let Some(((apex, axis, half_angle, refit), facets)) = fit(&run, bar) else { continue };
+        if !(refit <= bar) {
+            continue;
+        }
+        let (apex, axis) = (Vec3::new(apex[0], apex[1], apex[2]), Vec3::new(axis[0], axis[1], axis[2]));
+        // The sense from the facets: the side of the outward normal
+        // r cos - axis sin they face.
+        let facing: f64 = facets
+            .iter()
+            .map(|t| {
+                let [a, b, c] = t.map(|p| Vec3::new(p[0], p[1], p[2]));
+                let centroid = a.add(b).add(c).scale(1.0 / 3.0);
+                let delta = centroid.sub(apex);
+                let radial = delta.sub(axis.scale(delta.dot(axis)));
+                let outward = radial
+                    .normalized()
+                    .map_or(Vec3::new(0.0, 0.0, 0.0), |u| u.scale(half_angle.cos()).sub(axis.scale(half_angle.sin())));
+                b.sub(a).cross(c.sub(a)).dot(outward)
+            })
+            .sum();
+        let lead = run.iter().copied().max_by_key(|&r| (size(segmentation, r), std::cmp::Reverse(r))).unwrap();
+        if std::env::var("BREP_DEBUG_SPLIT").is_ok() {
+            eprintln!("[cone-gather] {} regions into {lead}: refit {refit:.2e} bar {bar:.2e}", run.len());
+        }
+        claimed.extend(run.iter().copied());
+        let area: f64 = run.iter().map(|&r| segmentation.regions[r as usize].area).sum();
+        for &r in &run {
+            for &t in &members[&r] {
+                segmentation.triangle_region_ids[t] = lead;
+            }
+        }
+        let region = &mut segmentation.regions[lead as usize];
+        region.carrier = RegionCarrier::Cone {
+            apex,
+            axis_dir: axis,
+            half_angle_rad: half_angle,
+            sense: if facing >= 0.0 { 1 } else { -1 },
+        };
+        region.max_deviation = refit;
+        region.area = area;
+        gathered += 1;
+    }
+    if gathered > 0 {
+        crate::hybrid_freeform_split::compact(segmentation);
+    }
+    gathered
+}
+
+fn join_cone_pieces(
+    segmentation: &mut MeshSegmentation,
+    positions: &[f64],
+    indices: &[u32],
+    tolerance: f64,
+    weld_tolerance: f64,
+    across: bool,
+) {
+    let triangle_count = segmentation.triangle_region_ids.len();
+    if indices.len() != triangle_count * 3 {
+        return;
+    }
+    let chord = crate::hybrid_whole_freeform::chord_vertices(positions, indices, weld_tolerance);
+    let mut edges = HashMap::<(u32, u32), Vec<u32>>::new();
+    let mut vertices = BTreeMap::<u32, BTreeSet<u32>>::new();
+    for (t, corners) in indices.chunks_exact(3).enumerate() {
+        let r = segmentation.triangle_region_ids[t];
+        for k in 0..3 {
+            let (a, b) = (corners[k], corners[(k + 1) % 3]);
+            edges.entry((a.min(b), a.max(b))).or_default().push(r);
+        }
+        vertices.entry(r).or_default().extend(corners.iter().copied());
+    }
+    let cone_of = |r: u32| segmentation.regions.get(r as usize).and_then(|region| carrier_cone(region).ok().flatten());
+    let mut pairs = BTreeSet::new();
+    let mut bordering = BTreeMap::<u32, BTreeSet<u32>>::new();
+    for regions in edges.values() {
+        if let [a, b] = regions[..] {
+            if a != b && cone_of(a).is_some() && cone_of(b).is_some() {
+                pairs.insert((a.min(b), a.max(b)));
+            }
+            if a != b {
+                bordering.entry(a).or_default().insert(b);
+                bordering.entry(b).or_default().insert(a);
+            }
+        }
+    }
+    // [`HybridSwitches::join_cone_across`]: cone pieces bordering one small
+    // region between them are candidates too.
+    if across {
+        for (&bridge, around) in &bordering {
+            let small = segmentation.regions.get(bridge as usize).is_some_and(|region| {
+                region.triangle_count <= CONE_BRIDGE_TRIANGLES && carrier_cone(region).ok().flatten().is_none()
+            });
+            if !small {
+                continue;
+            }
+            let cones: Vec<u32> = around.iter().copied().filter(|&r| cone_of(r).is_some()).collect();
+            for (i, &a) in cones.iter().enumerate() {
+                for &b in &cones[i + 1..] {
+                    pairs.insert((a.min(b), a.max(b)));
+                }
+            }
+        }
+    }
+    if std::env::var("BREP_DEBUG_SPLIT").is_ok() {
+        let cones = segmentation.regions.iter().filter(|r| matches!(r.carrier, RegionCarrier::Cone { .. })).count();
+        eprintln!("[cone-join] {cones} cone regions, {} candidate pairs (across {across})", pairs.len());
+    }
+    if pairs.is_empty() && !across {
+        return;
+    }
+    // Each group: its lead, its carrier, its vertices, its deviation bar.
+    let size = |r: u32| segmentation.regions[r as usize].triangle_count;
+    let mut lead = BTreeMap::<u32, u32>::new();
+    let mut groups = BTreeMap::<u32, (ConeCarrier, BTreeSet<u32>, usize, f64)>::new();
+    for &(a, b) in &pairs {
+        for r in [a, b] {
+            if let Some(cone) = cone_of(r) {
+                lead.insert(r, r);
+                groups.entry(r).or_insert_with(|| (cone, vertices.get(&r).cloned().unwrap_or_default(), size(r), cone.deviation));
+            }
+        }
+    }
+    fn root(lead: &BTreeMap<u32, u32>, mut r: u32) -> u32 {
+        while let Some(&up) = lead.get(&r).filter(|&&up| up != r) {
+            r = up;
+        }
+        r
+    }
+    let mut order: Vec<(u32, u32)> = pairs.into_iter().collect();
+    order.sort_by_key(|&(a, b)| (std::cmp::Reverse(size(a) + size(b)), a, b));
+    let point = |v: u32| {
+        let i = 3 * v as usize;
+        [positions[i], positions[i + 1], positions[i + 2]]
+    };
+    let mut joined = false;
+    // Under `across`, every cone region at once first: two one-column
+    // strips are narrow sectors that leave a cone's axis and opening
+    // undetermined, their union together is not.
+    if across {
+        let cones: Vec<u32> = (0..segmentation.regions.len() as u32).filter(|&r| cone_of(r).is_some()).collect();
+        let top = cones.iter().copied().max_by_key(|&r| (size(r), std::cmp::Reverse(r)));
+        if let (true, Some(top)) = (cones.len() >= 3, top) {
+            let union: BTreeSet<u32> = cones.iter().flat_map(|r| vertices.get(r).into_iter().flatten().copied()).collect();
+            let deviation = cones.iter().filter_map(|&r| cone_of(r)).map(|c| c.deviation).fold(0.0, f64::max);
+            let bar = accepted_radial_bar(tolerance * 4.0, deviation);
+            let cone = cone_of(top).unwrap();
+            // A one-column strip's own carrier can be all but flat (half
+            // angle 1.564 on census record
+            // occt_countersunk_hole_s1_d0.005_jitter-0.1) and the refit
+            // diverges from it, so the union starts from its own facets.
+            let facets: Vec<[[f64; 3]; 3]> = segmentation
+                .triangle_region_ids
+                .iter()
+                .enumerate()
+                .filter(|(_, r)| cones.contains(r))
+                .map(|(t, _)| [0, 1, 2].map(|c| point(indices[3 * t + c])))
+                .collect();
+            let start = crate::hybrid_whole_freeform::cone_start(&facets);
+            let refit_on = |keep: &dyn Fn(u32) -> bool| {
+                let (apex, axis, half_angle) = start?;
+                let points: Vec<[f64; 3]> = union.iter().copied().filter(|&v| keep(v)).map(point).collect();
+                crate::hybrid_whole_freeform::refit_cone(&points, apex, axis, half_angle).filter(|fit| fit.3 <= bar)
+            };
+            let fitted = refit_on(&|_| true).or_else(|| refit_on(&|v| !chord.contains(&v)));
+            if std::env::var("BREP_DEBUG_SPLIT").is_ok() {
+                eprintln!("[cone-join] all {} cone regions: refit {:?} bar {bar:.2e}", cones.len(), fitted.map(|f| f.3));
+            }
+            if let Some((apex, axis, half_angle, refit)) = fitted {
+                // The fresh start picks its own axis direction, so the sense
+                // is read from the facets: the side of the outward normal
+                // r cos - axis sin they face.
+                let (apex, axis) = (Vec3::new(apex[0], apex[1], apex[2]), Vec3::new(axis[0], axis[1], axis[2]));
+                let facing: f64 = facets
+                    .iter()
+                    .map(|t| {
+                        let [a, b, c] = t.map(|p| Vec3::new(p[0], p[1], p[2]));
+                        let centroid = a.add(b).add(c).scale(1.0 / 3.0);
+                        let delta = centroid.sub(apex);
+                        let radial = delta.sub(axis.scale(delta.dot(axis)));
+                        let outward = radial.normalized().map_or(Vec3::new(0.0, 0.0, 0.0), |u| {
+                            u.scale(half_angle.cos()).sub(axis.scale(half_angle.sin()))
+                        });
+                        b.sub(a).cross(c.sub(a)).dot(outward)
+                    })
+                    .sum();
+                let carrier = ConeCarrier {
+                    apex,
+                    axis,
+                    half_angle,
+                    sense: if facing >= 0.0 { 1 } else { -1 },
+                    deviation: refit,
+                };
+                let count = cones.iter().map(|&r| size(r)).sum();
+                for &r in &cones {
+                    lead.insert(r, top);
+                    groups.remove(&r);
+                }
+                lead.insert(top, top);
+                groups.insert(top, (carrier, union, count, deviation.max(refit)));
+                joined = true;
+            }
+        }
+    }
+    for (a, b) in order {
+        let (ra, rb) = (root(&lead, a), root(&lead, b));
+        if ra == rb {
+            continue;
+        }
+        let (big, small) = if (groups[&ra].2, std::cmp::Reverse(ra)) >= (groups[&rb].2, std::cmp::Reverse(rb)) { (ra, rb) } else { (rb, ra) };
+        let (cone, own, count, deviation) = &groups[&big];
+        let (_, other, other_count, other_deviation) = &groups[&small];
+        let union: BTreeSet<u32> = own.union(other).copied().collect();
+        let bar = accepted_radial_bar(tolerance * 4.0, deviation.max(*other_deviation));
+        let refit_on = |keep: &dyn Fn(u32) -> bool| {
+            let points: Vec<[f64; 3]> = union.iter().copied().filter(|&v| keep(v)).map(point).collect();
+            crate::hybrid_whole_freeform::refit_cone(
+                &points,
+                [cone.apex.x, cone.apex.y, cone.apex.z],
+                [cone.axis.x, cone.axis.y, cone.axis.z],
+                cone.half_angle,
+            )
+            .filter(|fit| fit.3 <= bar)
+        };
+        // Stitched chord vertices are left out. Under `across` every vertex
+        // is tried first: on a coarse cone nearly every vertex lies between
+        // its ruling neighbours, and too few are left to fit.
+        let without_chords = |v: u32| !chord.contains(&v);
+        let fitted = if across { refit_on(&|_| true).or_else(|| refit_on(&without_chords)) } else { refit_on(&without_chords) };
+        if std::env::var("BREP_DEBUG_SPLIT").is_ok() {
+            eprintln!("[cone-join] {big} ({count}) + {small} ({other_count}): refit {:?} bar {bar:.2e}", fitted.map(|f| f.3));
+        }
+        let Some((apex, axis, half_angle, refit)) = fitted else { continue };
+        let carrier = ConeCarrier {
+            apex: Vec3::new(apex[0], apex[1], apex[2]),
+            axis: Vec3::new(axis[0], axis[1], axis[2]),
+            half_angle,
+            sense: cone.sense,
+            deviation: refit,
+        };
+        let merged = (carrier, union, count + other_count, deviation.max(*other_deviation).max(refit));
+        groups.remove(&small);
+        groups.insert(big, merged);
+        lead.insert(small, big);
+        joined = true;
+    }
+    if !joined {
+        return;
+    }
+    let mut target = HashMap::<u32, u32>::new();
+    for &r in lead.keys() {
+        let top = root(&lead, r);
+        if top != r {
+            target.insert(r, top);
+        }
+    }
+    for (&top, (cone, _, _, _)) in &groups {
+        if !target.values().any(|&t| t == top) {
+            continue;
+        }
+        let area = target.iter().filter(|(_, &t)| t == top).map(|(&r, _)| segmentation.regions[r as usize].area).sum::<f64>();
+        let region = &mut segmentation.regions[top as usize];
+        region.carrier = RegionCarrier::Cone { apex: cone.apex, axis_dir: cone.axis, half_angle_rad: cone.half_angle, sense: cone.sense };
+        region.max_deviation = cone.deviation;
+        region.area += area;
+    }
+    for r in &mut segmentation.triangle_region_ids {
+        if let Some(&top) = target.get(r) {
+            *r = top;
+        }
+    }
+    crate::hybrid_freeform_split::compact(segmentation);
+}
+
+/// Lane V row 2c ([`HybridSwitches::split_revolve_pieces`]): give every
+/// edge-connected piece of a revolve region a region of its own on the same
+/// carrier. Triangles that share only a vertex are separate pieces. The
+/// first piece (by lowest triangle) keeps the region id; area is shared out
+/// by triangle count, as `split_periodic_cylinder` does.
+fn split_revolve_pieces(segmentation: &mut MeshSegmentation, indices: &[u32]) {
+    let triangle_count = segmentation.triangle_region_ids.len();
+    if indices.len() != triangle_count * 3 {
+        return;
+    }
+    let mut edges = HashMap::<(u32, u32), Vec<usize>>::new();
+    for t in 0..triangle_count {
+        for c in 0..3 {
+            let (a, b) = (indices[3 * t + c], indices[3 * t + (c + 1) % 3]);
+            edges.entry((a.min(b), a.max(b))).or_default().push(t);
+        }
+    }
+    let mut neighbours = vec![Vec::new(); triangle_count];
+    for incident in edges.values() {
+        for &x in incident {
+            for &y in incident {
+                if x != y && segmentation.triangle_region_ids[x] == segmentation.triangle_region_ids[y] {
+                    neighbours[x].push(y);
+                }
+            }
+        }
+    }
+    let revolve = |carrier: &RegionCarrier| {
+        matches!(
+            carrier,
+            RegionCarrier::Cylinder { .. }
+                | RegionCarrier::Cone { .. }
+                | RegionCarrier::Sphere { .. }
+                | RegionCarrier::Torus { .. }
+        )
+    };
+    let mut first_piece = vec![true; segmentation.regions.len()];
+    let mut seen = vec![false; triangle_count];
+    for start in 0..triangle_count {
+        let original = segmentation.triangle_region_ids[start];
+        if seen[start] || !segmentation.regions.get(original as usize).is_some_and(|r| revolve(&r.carrier)) {
+            continue;
+        }
+        let mut piece = vec![start];
+        seen[start] = true;
+        let mut at = 0;
+        while at < piece.len() {
+            let t = piece[at];
+            at += 1;
+            for &n in &neighbours[t] {
+                if !seen[n] {
+                    seen[n] = true;
+                    piece.push(n);
+                }
+            }
+        }
+        if std::mem::replace(&mut first_piece[original as usize], false) {
+            continue;
+        }
+        let next = segmentation.regions.len() as u32;
+        let template = &segmentation.regions[original as usize];
+        let mut region = template.clone();
+        region.id = next;
+        region.triangle_count = piece.len();
+        region.area = template.area * piece.len() as f64 / template.triangle_count.max(1) as f64;
+        let template = &mut segmentation.regions[original as usize];
+        template.triangle_count -= piece.len();
+        template.area -= region.area;
+        for &t in &piece {
+            segmentation.triangle_region_ids[t] = next;
+        }
+        segmentation.regions.push(region);
+    }
+}
+
+/// The least-squares plane through `points`: their centroid and the
+/// smallest-variance direction of their covariance (Jacobi), unoriented.
+fn least_squares_plane(points: &[Vec3]) -> Option<(Vec3, Vec3)> {
+    if points.is_empty() {
+        return None;
+    }
+    let inv = 1.0 / points.len() as f64;
+    let centroid = points.iter().fold(Vec3::new(0.0, 0.0, 0.0), |acc, &q| acc.add(q.scale(inv)));
+    let mut m = [[0.0_f64; 3]; 3];
+    for &q in points {
+        let d = q.sub(centroid);
+        let d = [d.x, d.y, d.z];
+        for i in 0..3 {
+            for j in 0..3 {
+                m[i][j] += d[i] * d[j];
+            }
+        }
+    }
+    let mut basis = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+    for _ in 0..50 {
+        let (mut p, mut q, mut largest) = (0, 1, 0.0_f64);
+        for i in 0..3 {
+            for j in (i + 1)..3 {
+                if m[i][j].abs() > largest {
+                    largest = m[i][j].abs();
+                    p = i;
+                    q = j;
+                }
+            }
+        }
+        if largest < 1e-30 {
+            break;
+        }
+        let theta = 0.5 * (m[q][q] - m[p][p]) / m[p][q];
+        let t = theta.signum() / (theta.abs() + (theta * theta + 1.0).sqrt());
+        let t = if theta == 0.0 { 1.0 } else { t };
+        let (c, sn) = (1.0 / (t * t + 1.0).sqrt(), t / (t * t + 1.0).sqrt());
+        let mut next = m;
+        for k in 0..3 {
+            next[k][p] = c * m[k][p] - sn * m[k][q];
+            next[k][q] = sn * m[k][p] + c * m[k][q];
+        }
+        let rotated = next;
+        for k in 0..3 {
+            next[p][k] = c * rotated[p][k] - sn * rotated[q][k];
+            next[q][k] = sn * rotated[p][k] + c * rotated[q][k];
+        }
+        m = next;
+        for row in &mut basis {
+            let (a, b) = (row[p], row[q]);
+            row[p] = c * a - sn * b;
+            row[q] = sn * a + c * b;
+        }
+    }
+    let smallest = (0..3).min_by(|&a, &b| m[a][a].total_cmp(&m[b][b])).unwrap();
+    let normal = Vec3::new(basis[0][smallest], basis[1][smallest], basis[2][smallest]).normalized().ok()?;
+    Some((centroid, normal))
+}
+
+/// [`HybridSwitches::merge_coplanar_planes`]: the fewest triangles each of
+/// two planes needs to merge. Smaller plane fragments are the noisy cap
+/// join's and the absorb's; on a coarse jittered cylinder wall two adjacent
+/// 2-triangle facet strips also hold within the bar (census record
+/// occt_stepped_shaft_s10_d0.005_jitter-1.0, whose conversion then failed
+/// its STEP round trip).
+const COPLANAR_PLANE_TRIANGLES: usize = 16;
+
+/// [`HybridSwitches::merge_coplanar_planes`]: two edge-adjacent plane
+/// regions of at least [`COPLANAR_PLANE_TRIANGLES`] each whose vertices all
+/// lie within `bar` of their least-squares plane become one region on that
+/// plane (oriented as the larger one), the first such pair (by region ids)
+/// at a time until none is left.
+fn merge_coplanar_planes(segmentation: &mut MeshSegmentation, positions: &[f64], indices: &[u32], bar: f64) {
+    let triangle_count = segmentation.triangle_region_ids.len();
+    if !(bar > 0.0) || indices.len() != triangle_count * 3 {
+        return;
+    }
+    let point = |v: u32| Vec3::new(positions[3 * v as usize], positions[3 * v as usize + 1], positions[3 * v as usize + 2]);
+    let mut edges = HashMap::<(u32, u32), Vec<usize>>::new();
+    for t in 0..triangle_count {
+        for c in 0..3 {
+            let (a, b) = (indices[3 * t + c], indices[3 * t + (c + 1) % 3]);
+            edges.entry((a.min(b), a.max(b))).or_default().push(t);
+        }
+    }
+    let plane = |segmentation: &MeshSegmentation, r: u32| match segmentation.regions.get(r as usize).map(|region| &region.carrier) {
+        Some(&RegionCarrier::Plane { origin, normal }) => Some((origin, normal)),
+        _ => None,
+    };
+    let mut changed = false;
+    loop {
+        let mut members = BTreeMap::<u32, BTreeSet<u32>>::new();
+        for (t, &r) in segmentation.triangle_region_ids.iter().enumerate() {
+            members.entry(r).or_default().extend(&indices[3 * t..3 * t + 3]);
+        }
+        let mut pairs = BTreeSet::new();
+        for incident in edges.values() {
+            if let [x, y] = incident.as_slice() {
+                let (a, b) = (segmentation.triangle_region_ids[*x], segmentation.triangle_region_ids[*y]);
+                if a != b && plane(segmentation, a).is_some() && plane(segmentation, b).is_some() {
+                    pairs.insert((a.min(b), a.max(b)));
+                }
+            }
+        }
+        let Some((keep, absorb, origin, normal, deviation)) = pairs.into_iter().find_map(|(a, b)| {
+            let size = |r: u32| segmentation.regions[r as usize].triangle_count;
+            if size(a).min(size(b)) < COPLANAR_PLANE_TRIANGLES {
+                return None;
+            }
+            let (keep, absorb) = if (size(a), std::cmp::Reverse(a)) >= (size(b), std::cmp::Reverse(b)) { (a, b) } else { (b, a) };
+            let union = members[&keep].union(&members[&absorb]).map(|&v| point(v)).collect::<Vec<_>>();
+            let (origin, normal) = least_squares_plane(&union)?;
+            let (_, facing) = plane(segmentation, keep)?;
+            let normal = if normal.dot(facing) < 0.0 { normal.scale(-1.0) } else { normal };
+            let deviation = union.iter().map(|q| q.sub(origin).dot(normal).abs()).fold(0.0_f64, f64::max);
+            (deviation <= bar).then_some((keep, absorb, origin, normal, deviation))
+        }) else {
+            break;
+        };
+        if std::env::var("BREP_DEBUG_SPLIT").is_ok() {
+            eprintln!(
+                "[coplanar] {keep} ({}) + {absorb} ({}): deviation {deviation:.2e} bar {bar:.2e}",
+                segmentation.regions[keep as usize].triangle_count,
+                segmentation.regions[absorb as usize].triangle_count
+            );
+        }
+        let (count, area) = (segmentation.regions[absorb as usize].triangle_count, segmentation.regions[absorb as usize].area);
+        for r in &mut segmentation.triangle_region_ids {
+            if *r == absorb {
+                *r = keep;
+            }
+        }
+        let region = &mut segmentation.regions[keep as usize];
+        region.triangle_count += count;
+        region.area += area;
+        region.carrier = RegionCarrier::Plane { origin, normal };
+        region.max_deviation = deviation;
+        segmentation.regions[absorb as usize].triangle_count = 0;
+        changed = true;
+    }
+    if changed {
+        crate::hybrid_freeform_split::compact(segmentation);
+    }
 }
 
 /// Vertex noise the mesh demonstrably carries: the largest residual of a
@@ -345,6 +2493,17 @@ fn measured_plane_noise(segmentation: &MeshSegmentation) -> f64 {
         .fold(0.0_f64, f64::max)
 }
 
+/// [`HybridSwitches::noise_any_region`]: the largest deviation of any
+/// analytic region of at least 16 triangles, for a mesh with no such plane.
+fn measured_region_noise(segmentation: &MeshSegmentation) -> f64 {
+    segmentation
+        .regions
+        .iter()
+        .filter(|region| !matches!(region.carrier, RegionCarrier::Freeform) && region.triangle_count >= 16)
+        .map(|region| region.max_deviation)
+        .fold(0.0_f64, f64::max)
+}
+
 /// On a noisy mesh the small fan triangles of a planar cap tilt past the
 /// region grower's dihedral and each piece fails a plane fit whose bar scales
 /// with that piece's own size: a jittered frustum cap read as eight freeform
@@ -355,16 +2514,36 @@ fn measured_plane_noise(segmentation: &MeshSegmentation) -> f64 {
 /// mesh carries on its large planes (the tilted fan normals that split the
 /// cap are not evidence either way). A clean mesh measures no noise and is
 /// unchanged.
+/// [`HybridSwitches::join_split_runs`]: the cosine of the largest angle
+/// between adjacent triangles a split run's piece crosses (30 degrees).
+const JOIN_CREASE_COS: f64 = 0.866_025_403_784_438_6;
+
 fn join_noisy_planar_fragments(
     segmentation: &mut MeshSegmentation,
     positions: &[f64],
     indices: &[u32],
     noise: f64,
     curved_slivers: bool,
+    split_runs: bool,
+    lone_freeform: bool,
 ) {
     let triangle_count = segmentation.triangle_region_ids.len();
     if !(noise > 0.0) || indices.len() != triangle_count * 3 {
         return;
+    }
+    // [`HybridSwitches::join_split_runs`]: a split piece can take part of a
+    // region, so every region's count must be its true count before the
+    // join moves triangles out of it (a stale count underflowed on the
+    // assembly fixture of `assembly_retains_curved_faces_and_four_conical_cavities`).
+    if split_runs {
+        for region in &mut segmentation.regions {
+            region.triangle_count = 0;
+        }
+        for &r in &segmentation.triangle_region_ids {
+            if let Some(region) = segmentation.regions.get_mut(r as usize) {
+                region.triangle_count += 1;
+            }
+        }
     }
     let point = |i: u32| {
         let at = i as usize * 3;
@@ -417,80 +2596,82 @@ fn join_noisy_planar_fragments(
                 }
             }
         }
-        let regions = run.iter().map(|&t| segmentation.triangle_region_ids[t]).collect::<BTreeSet<_>>();
-        if regions.len() < 2 {
+        let fit = |run: &Vec<usize>| {
+            let regions = run.iter().map(|&t| segmentation.triangle_region_ids[t]).collect::<BTreeSet<_>>();
+            // [`HybridSwitches::join_lone_freeform`]: a run that is one whole
+            // freeform region of at least 16 triangles is a cap the kernel
+            // segmenter kept whole, and takes the same plane test; anything
+            // smaller stays a sliver.
+            let lone_cap = lone_freeform
+                && regions.len() == 1
+                && regions.iter().next().is_some_and(|&r| {
+                    segmentation.regions.get(r as usize).is_some_and(|region| {
+                        matches!(region.carrier, RegionCarrier::Freeform)
+                            && region.triangle_count >= 16
+                            && region.triangle_count == run.len()
+                    })
+                });
+            if regions.len() < 2 && !lone_cap {
+                return None;
+            }
+            // Least-squares plane through the run's vertices: the centroid and
+            // the smallest-variance direction of their covariance (Jacobi).
+            let mut verts = run.iter().flat_map(|&t| (0..3).map(move |c| indices[3 * t + c])).collect::<Vec<_>>();
+            verts.sort_unstable();
+            verts.dedup();
+            let points = verts.iter().map(|&v| point(v)).collect::<Vec<_>>();
+            let (centroid, normal) = least_squares_plane(&points)?;
+            // Orient with the run's triangles.
+            let mut facing = 0.0;
+            let mut area = 0.0;
+            for &t in run {
+                let [a, b, c] = [point(indices[3 * t]), point(indices[3 * t + 1]), point(indices[3 * t + 2])];
+                let cross = b.sub(a).cross(c.sub(a));
+                facing += cross.dot(normal);
+                area += cross.length();
+            }
+            let normal = if facing < 0.0 { normal.scale(-1.0) } else { normal };
+            let max_deviation = verts.iter().map(|&v| point(v).sub(centroid).dot(normal).abs()).fold(0.0_f64, f64::max);
+            (max_deviation <= noise).then_some((centroid, normal, max_deviation, area * 0.5))
+        };
+        if let Some((centroid, normal, max_deviation, area)) = fit(&run) {
+            joins.push((run, centroid, normal, max_deviation, area));
             continue;
         }
-        // Least-squares plane through the run's vertices: the centroid and
-        // the smallest-variance direction of their covariance (Jacobi).
-        let mut verts = run.iter().flat_map(|&t| (0..3).map(move |c| indices[3 * t + c])).collect::<Vec<_>>();
-        verts.sort_unstable();
-        verts.dedup();
-        let inv = 1.0 / verts.len() as f64;
-        let centroid = verts.iter().fold(Vec3::new(0.0, 0.0, 0.0), |acc, &v| acc.add(point(v).scale(inv)));
-        let mut m = [[0.0_f64; 3]; 3];
-        for &v in &verts {
-            let d = point(v).sub(centroid);
-            let d = [d.x, d.y, d.z];
-            for i in 0..3 {
-                for j in 0..3 {
-                    m[i][j] += d[i] * d[j];
-                }
-            }
+        // [`HybridSwitches::join_split_runs`]: a run that holds several caps
+        // linked through small wall pieces is cut at its creases and each
+        // piece is tried alone.
+        if !split_runs {
+            continue;
         }
-        let mut basis = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
-        for _ in 0..50 {
-            let (mut p, mut q, mut largest) = (0, 1, 0.0_f64);
-            for i in 0..3 {
-                for j in (i + 1)..3 {
-                    if m[i][j].abs() > largest {
-                        largest = m[i][j].abs();
-                        p = i;
-                        q = j;
+        let unit = |t: usize| {
+            let [a, b, c] = [point(indices[3 * t]), point(indices[3 * t + 1]), point(indices[3 * t + 2])];
+            b.sub(a).cross(c.sub(a)).normalized().ok()
+        };
+        let members: BTreeSet<usize> = run.iter().copied().collect();
+        let mut placed = BTreeSet::new();
+        for &seed in &run {
+            if !placed.insert(seed) {
+                continue;
+            }
+            let mut piece = vec![seed];
+            let mut at = 0;
+            while at < piece.len() {
+                let t = piece[at];
+                at += 1;
+                for &n in &neighbours[t] {
+                    if members.contains(&n)
+                        && !placed.contains(&n)
+                        && unit(t).zip(unit(n)).is_some_and(|(a, b)| a.dot(b) >= JOIN_CREASE_COS)
+                    {
+                        placed.insert(n);
+                        piece.push(n);
                     }
                 }
             }
-            if largest < 1e-30 {
-                break;
+            if let Some((centroid, normal, max_deviation, area)) = fit(&piece) {
+                joins.push((piece, centroid, normal, max_deviation, area));
             }
-            let theta = 0.5 * (m[q][q] - m[p][p]) / m[p][q];
-            let t = theta.signum() / (theta.abs() + (theta * theta + 1.0).sqrt());
-            let t = if theta == 0.0 { 1.0 } else { t };
-            let (c, sn) = (1.0 / (t * t + 1.0).sqrt(), t / (t * t + 1.0).sqrt());
-            let mut next = m;
-            for k in 0..3 {
-                next[k][p] = c * m[k][p] - sn * m[k][q];
-                next[k][q] = sn * m[k][p] + c * m[k][q];
-            }
-            let rotated = next;
-            for k in 0..3 {
-                next[p][k] = c * rotated[p][k] - sn * rotated[q][k];
-                next[q][k] = sn * rotated[p][k] + c * rotated[q][k];
-            }
-            m = next;
-            for row in &mut basis {
-                let (a, b) = (row[p], row[q]);
-                row[p] = c * a - sn * b;
-                row[q] = sn * a + c * b;
-            }
-        }
-        let smallest = (0..3).min_by(|&a, &b| m[a][a].total_cmp(&m[b][b])).unwrap();
-        let Ok(normal) = Vec3::new(basis[0][smallest], basis[1][smallest], basis[2][smallest]).normalized() else {
-            continue;
-        };
-        // Orient with the run's triangles.
-        let mut facing = 0.0;
-        let mut area = 0.0;
-        for &t in &run {
-            let [a, b, c] = [point(indices[3 * t]), point(indices[3 * t + 1]), point(indices[3 * t + 2])];
-            let cross = b.sub(a).cross(c.sub(a));
-            facing += cross.dot(normal);
-            area += cross.length();
-        }
-        let normal = if facing < 0.0 { normal.scale(-1.0) } else { normal };
-        let max_deviation = verts.iter().map(|&v| point(v).sub(centroid).dot(normal).abs()).fold(0.0_f64, f64::max);
-        if max_deviation <= noise {
-            joins.push((run, centroid, normal, max_deviation, area * 0.5));
         }
     }
     if joins.is_empty() {
@@ -549,10 +2730,19 @@ fn join_noisy_planar_fragments(
 /// most 1 % of the mesh.
 const WHOLE_STRAY_TRIANGLES: usize = 8;
 
+/// [`HybridSwitches::whole_same_kind`]: a stray of another kind beside the
+/// pieces of a whole sphere or torus holds fewer triangles than this (the
+/// plane count `measured_plane_noise` takes as evidence).
+const WHOLE_SAME_KIND_OTHER: usize = 16;
+
+/// [`HybridSwitches::whole_freeform_strays`]: the strays beside a dominant
+/// freeform region hold at most one in this many of the mesh's triangles.
+const WHOLE_FREEFORM_STRAY_SHARE: usize = 10;
+
 /// Lane J row 10, promoted ON 2026-10-16: BREP_HYBRID_WHOLE_STRAYS=0 restores
 /// rows 6 and 9's one-region requirement.
 fn whole_strays_enabled() -> bool {
-    std::env::var("BREP_HYBRID_WHOLE_STRAYS").map_or(true, |v| v != "0")
+    brep_kernel::switch!(live "BREP_HYBRID_WHOLE_STRAYS", true)
 }
 
 /// The exact sphere or ring torus for a closed mesh that the segmentation
@@ -566,6 +2756,7 @@ fn whole_closed_primitive(
     segmentation: &MeshSegmentation,
     weld_tolerance: f64,
     tally: &mut crate::stl_conversion::WholeCarrierScanReport,
+    switches: HybridSwitches,
 ) -> Option<HybridBrepOutput> {
     let triangle_count = indices.len() / 3;
     // Lane J row 10: besides the whole primitive the segmenter may leave stray
@@ -573,11 +2764,50 @@ fn whole_closed_primitive(
     // sphere. They join the dominant region; the fit and checks below then run
     // over the whole mesh as before.
     let strays_enabled = whole_strays_enabled();
+    let mut whole_fit = false;
+    let mut exact_only = false;
     let region = if strays_enabled {
         let region = segmentation.regions.iter().max_by_key(|region| region.triangle_count)?;
         let strays = segmentation.regions.iter().filter(|other| other.id != region.id);
         let admitted = !strays.clone().any(|other| other.triangle_count >= WHOLE_STRAY_TRIANGLES)
             && 100 * strays.clone().map(|other| other.triangle_count).sum::<usize>() <= triangle_count;
+        // [`HybridSwitches::whole_same_kind`]: the strays row 10 declines are
+        // pieces of the dominant region's sphere or torus kind, freeform
+        // regions (no carrier claims them; noise leaves them), and regions
+        // of other carriers each under `WHOLE_SAME_KIND_OTHER` triangles (no
+        // fit that is evidence) and together at most 2 % of the mesh. The
+        // whole fit's residual test, local scan included, decides whether
+        // they are noise.
+        let kind = region.carrier.kind();
+        let revolve = matches!(region.carrier, RegionCarrier::Sphere { .. } | RegionCarrier::Torus { .. });
+        let others = strays
+            .clone()
+            .filter(|other| other.carrier.kind() != kind && !matches!(other.carrier, RegionCarrier::Freeform));
+        whole_fit = switches.whole_same_kind
+            && !admitted
+            && revolve
+            && strays.clone().any(|other| other.carrier.kind() == kind && other.triangle_count >= WHOLE_STRAY_TRIANGLES)
+            && others.clone().all(|other| other.triangle_count < WHOLE_SAME_KIND_OTHER)
+            && 50 * others.map(|other| other.triangle_count).sum::<usize>() <= triangle_count;
+        // [`HybridSwitches::whole_exact`]: any strays, an exact fit only.
+        exact_only = !whole_fit && switches.whole_exact && !admitted && revolve;
+        whole_fit |= exact_only;
+        // [`HybridSwitches::whole_freeform_strays`]: beside a dominant
+        // freeform region, strays with a carrier each under
+        // `WHOLE_SAME_KIND_OTHER` triangles, freeform strays (no carrier,
+        // no evidence) each at most `GATHER_STRIP_TRIANGLES`, together at
+        // most a tenth of the mesh, are left to the whole fit's residual
+        // test (lane J row 9's freeform path).
+        let freeform_strays = switches.whole_freeform_strays
+            && !admitted
+            && !whole_fit
+            && matches!(region.carrier, RegionCarrier::Freeform)
+            && strays.clone().all(|other| {
+                other.triangle_count < WHOLE_SAME_KIND_OTHER
+                    || (matches!(other.carrier, RegionCarrier::Freeform) && other.triangle_count <= GATHER_STRIP_TRIANGLES)
+            })
+            && WHOLE_FREEFORM_STRAY_SHARE * strays.clone().map(|other| other.triangle_count).sum::<usize>() <= triangle_count;
+        let admitted = admitted || whole_fit || freeform_strays;
         if segmentation.regions.len() > 1 && std::env::var("BREP_DEBUG_SPLIT").is_ok() {
             let listed: Vec<_> = strays.map(|other| (other.carrier.kind(), other.triangle_count)).collect();
             eprintln!(
@@ -630,7 +2860,20 @@ fn whole_closed_primitive(
         return None;
     }
     let mut fitted_deviation = None;
-    let (solid, genus, area, volume, smallest_radius, sphere) = match region.carrier {
+    if switches.whole_refit && strays_enabled && !whole_fit && region.max_deviation > weld_tolerance {
+        let genus = match region.carrier {
+            RegionCarrier::Sphere { .. } => Some(0),
+            RegionCarrier::Torus { .. } => Some(1),
+            _ => None,
+        };
+        let excluded = crate::hybrid_whole_freeform::chord_vertices(positions, indices, weld_tolerance);
+        whole_fit = genus.is_some_and(|genus| {
+            crate::hybrid_whole_freeform::fit_whole_primitive_without(positions, indices, genus, &excluded)
+                .is_some_and(|refit| refit.max_deviation <= weld_tolerance)
+        });
+    }
+    let carrier = if whole_fit { RegionCarrier::Freeform } else { region.carrier.clone() };
+    let (solid, genus, area, volume, smallest_radius, sphere) = match carrier {
         RegionCarrier::Sphere { center, radius, sense: 1 } => (
             brep_kernel::make_sphere_brep(center, radius, Vec3::new(0.0, 0.0, 1.0)).ok()?,
             0,
@@ -659,7 +2902,14 @@ fn whole_closed_primitive(
                 0 => 1,
                 _ => return None,
             };
-            let report = crate::hybrid_whole_freeform::fit_whole_primitive(positions, indices, genus)?;
+            // [`HybridSwitches::whole_same_kind`]: stitched T-junction
+            // vertices sit on chords and read nothing of the surface.
+            let excluded = if whole_fit {
+                crate::hybrid_whole_freeform::chord_vertices(positions, indices, weld_tolerance)
+            } else {
+                BTreeSet::new()
+            };
+            let report = crate::hybrid_whole_freeform::fit_whole_primitive_without(positions, indices, genus, &excluded)?;
             if std::env::var("BREP_DEBUG_SPLIT").is_ok() {
                 eprintln!(
                     "[whole] genus {genus} vertices {} statistic {:.2} quantile {:.2} local {:.2} threshold {:.2} max deviation {:.3e} {:?}",
@@ -672,7 +2922,11 @@ fn whole_closed_primitive(
                     report.fit
                 );
             }
-            if !report.residual_is_noise() {
+            // On the same-kind path a fit leaving every vertex within the
+            // weld tolerance is exact (as row 13 reads it): its residual is
+            // roundoff, which the statistics cannot read as noise.
+            let exact = whole_fit && report.max_deviation <= weld_tolerance;
+            if !exact && (exact_only || !report.residual_is_noise()) {
                 return None;
             }
             fitted_deviation = Some(report.max_deviation);
@@ -765,12 +3019,162 @@ fn whole_closed_primitive(
     Some(HybridBrepOutput { solid, stats })
 }
 
-fn hybrid_plane_cylinder_brep_retry(
+pub(crate) fn hybrid_plane_cylinder_brep_retry(
     positions: &[f64],
     indices: Option<&[u32]>,
     options: &SegmentOptions,
-    mut injected_failure: Option<u32>,
+    switches: HybridSwitches,
+    injected_failure: Option<u32>,
 ) -> Result<HybridBrepOutput, String> {
+    let (mut best, mut demoted_hosts) =
+        rebuild_with_forbidden_hosts(positions, indices, options, switches, injected_failure, &Forbidden::default())?;
+    if !(switches.absorb_revolve && switches.absorb_retry) {
+        return Ok(best);
+    }
+    // [`HybridSwitches::absorb_retry`]: each rebuild forbids every host
+    // demoted so far; the joins it makes instead can fail in turn.
+    // The widened crease cut's regions are forbidden only once no new host
+    // is, and in one rebuild more if the hosts used every retry.
+    let mut forbid = Forbidden::default();
+    let mut seen_cuts = demoted_hosts.cuts.clone();
+    for _ in 0..ABSORB_RETRY_LIMIT {
+        let before = forbid.hosts.len();
+        forbid.hosts.extend(demoted_hosts.hosts);
+        if forbid.hosts.len() == before {
+            let before = forbid.cuts.len();
+            forbid.cuts.extend(demoted_hosts.cuts);
+            if forbid.cuts.len() == before {
+                break;
+            }
+        }
+        let Ok((output, hosts)) = rebuild_with_forbidden_hosts(positions, indices, options, switches, None, &forbid)
+        else {
+            break;
+        };
+        if output.stats.faceted_triangles < best.stats.faceted_triangles {
+            best = output;
+        }
+        seen_cuts.extend(&hosts.cuts);
+        demoted_hosts = hosts;
+    }
+    if !seen_cuts.is_subset(&forbid.cuts) {
+        forbid.cuts.extend(seen_cuts);
+        if let Ok((output, _)) = rebuild_with_forbidden_hosts(positions, indices, options, switches, None, &forbid) {
+            if output.stats.faceted_triangles < best.stats.faceted_triangles {
+                best = output;
+            }
+        }
+    }
+    Ok(best)
+}
+
+/// [`hybrid_brep_with_forbidden_hosts`], made again without
+/// [`HybridSwitches::cone_seam`] when it fails with it: a seam that avoids
+/// every open trim lets a cone's arcs be built that the arbitrary seam had
+/// refused, which demoted only that cone; when such an arc misses its mesh
+/// vertices the whole rebuild fails topology validation (census record
+/// occt_frustum_s1_d0.05_jitter-0.1, a 5e-3 curve/vertex gap). Each rebuild
+/// of the retry falls back on its own: a failed absorb retry was dropped
+/// and its gain lost (occt_pointed_cone_s10_d0.02_jitter-0.1 80 -> 88).
+/// A rebuild that still fails is made again without
+/// [`HybridSwitches::absorb_curved_slivers`] too: slivers joined to two
+/// coplanar fragments of one jittered cap left the edge between them 0.04
+/// off its vertices (census record occt_cylinder_s10_d0.005_jitter-1.0, which
+/// fell to a faceted repair, 131 -> 248 faceted).
+fn rebuild_with_forbidden_hosts(
+    positions: &[f64],
+    indices: Option<&[u32]>,
+    options: &SegmentOptions,
+    switches: HybridSwitches,
+    injected_failure: Option<u32>,
+    forbid: &Forbidden,
+) -> Result<(HybridBrepOutput, Forbidden), String> {
+    let mut rebuilt = hybrid_brep_with_forbidden_hosts(positions, indices, options, switches, injected_failure, forbid);
+    let without_seam = HybridSwitches { cone_seam: false, ..switches };
+    let without_slivers = HybridSwitches { absorb_curved_slivers: false, ..without_seam };
+    // [`HybridSwitches::split_noise_bar`]: a rebuild that still fails is
+    // made again without the noise-bar pass, alone and then with the two
+    // above: the region goes back to the facets it was. A lone cone the
+    // pass proposed on census record occt_pointed_cone_s10_d0.02_jitter-1.0,
+    // whose base cap is dust at this jitter, failed topology validation
+    // whole (nonzero periodic boundary winding) and the row fell to a
+    // faceted repair, 477 -> 496.
+    let without_noise_bar = HybridSwitches { split_noise_bar: false, ..switches };
+    let without_all = HybridSwitches { split_noise_bar: false, ..without_slivers };
+    for (fallback, applies) in [
+        (without_seam, switches.cone_seam),
+        (without_slivers, switches.absorb_curved_slivers),
+        (without_noise_bar, switches.split_noise_bar),
+        (without_all, switches.split_noise_bar && (switches.cone_seam || switches.absorb_curved_slivers)),
+    ] {
+        if rebuilt.is_err() && applies {
+            rebuilt = hybrid_brep_with_forbidden_hosts(positions, indices, options, fallback, injected_failure, forbid);
+        }
+    }
+    // [`HybridSwitches::gather_cone_strips`]: a rebuild that gathered a cone
+    // is kept only when it leaves fewer faceted triangles than the rebuild
+    // without the gather (a gathered countersink at jitter 0.3 was demoted
+    // whole, 524 -> 738 faceted, on census record
+    // occt_countersunk_hole_s10_d0.005_jitter-0.3).
+    // [`HybridSwitches::revolve_ends_first`]: with the revolved chains built
+    // first, a vertex disagreement can blame a revolved region where the
+    // line built first had blamed a small one (census record
+    // occt_countersunk_hole_s1_d0.001_tjunction: 20 -> 3 927 faceted). Only
+    // a rebuild that failed or holds such a demotion is made again without
+    // the switch, and the one with fewer faceted triangles is kept; every
+    // other rebuild pays nothing. A solid whose own STEP the import refuses
+    // is the STL conversion's to catch (`hybrid_roundtrip_fallback_enabled`
+    // rebuilds it without this switch before the faceted fallback).
+    if switches.revolve_ends_first {
+        let blamed = rebuilt.as_ref().map_or(true, |(output, _)| {
+            output
+                .stats
+                .demotions
+                .iter()
+                .any(|demotion| demotion.message.as_deref().is_some_and(|m| m.contains("exact curves disagree")))
+        });
+        if blamed {
+            let without = HybridSwitches { revolve_ends_first: false, ..switches };
+            let plain = rebuild_with_forbidden_hosts(positions, indices, options, without, injected_failure, forbid);
+            rebuilt = match (rebuilt, plain) {
+                (Ok(with), Ok(plain)) if with.0.stats.faceted_triangles < plain.0.stats.faceted_triangles => Ok(with),
+                (with, Err(_)) => with,
+                (_, plain) => plain,
+            };
+        }
+    }
+    // A gathered rebuild with no facet cannot be beaten; only one that still
+    // holds a facet is compared with the rebuild without the gather.
+    let gathered = rebuilt
+        .as_ref()
+        .map_or(true, |(output, _)| output.stats.gathered_cone_runs > 0 && output.stats.faceted_triangles > 0);
+    if switches.gather_cone_strips && gathered {
+        let without = HybridSwitches { gather_cone_strips: false, ..switches };
+        let plain = rebuild_with_forbidden_hosts(positions, indices, options, without, injected_failure, forbid);
+        rebuilt = match (rebuilt, plain) {
+            (Ok(with), Ok(plain)) if with.0.stats.faceted_triangles < plain.0.stats.faceted_triangles => Ok(with),
+            (Ok(with), Err(_)) => Ok(with),
+            (_, plain) => plain,
+        };
+    }
+    rebuilt
+}
+
+/// Rebuilds [`HybridSwitches::absorb_retry`] makes at most.
+const ABSORB_RETRY_LIMIT: usize = 4;
+
+/// One hybrid rebuild with its local-demotion retries, row 2d joining no
+/// fragment to a host in `forbid`; also the hosts that took fragments and
+/// hold a demoted triangle, and the triangles of each region the widened
+/// crease cut took whose pieces hold one.
+fn hybrid_brep_with_forbidden_hosts(
+    positions: &[f64],
+    indices: Option<&[u32]>,
+    options: &SegmentOptions,
+    switches: HybridSwitches,
+    mut injected_failure: Option<u32>,
+    forbid: &Forbidden,
+) -> Result<(HybridBrepOutput, Forbidden), String> {
     // The segmentation does not depend on the demotions; run it once.
     let owned_indices;
     let index_buffer: &[u32] = match indices {
@@ -780,7 +3184,13 @@ fn hybrid_plane_cylinder_brep_retry(
             &owned_indices
         }
     };
-    let (mut segmentation, split) = segment_for_hybrid_measured(positions, index_buffer, options)?;
+    let (mut segmentation, split, absorbed, cut) =
+        segment_for_hybrid_measured(positions, index_buffer, options, switches, forbid)?;
+    // [`HybridSwitches::crease_cut`]: build on the cut mesh.
+    let (positions, index_buffer, parent) = match &cut {
+        Some(cut) => (cut.positions.as_slice(), cut.indices.as_slice(), Some(cut.parent.as_slice())),
+        None => (positions, index_buffer, None),
+    };
     let split_noise = split.noise;
     let mut whole_carrier_scan = crate::stl_conversion::WholeCarrierScanReport::default();
     let with_split = |mut output: HybridBrepOutput| {
@@ -789,6 +3199,7 @@ fn hybrid_plane_cylinder_brep_retry(
         output.stats.split_over_budget_regions = split.over_budget_regions;
         output.stats.split_budget_hit_regions = split.budget_hit_regions;
         output.stats.split_band_declined_regions = split.band_declined_regions;
+        output.stats.gathered_cone_runs = split.gathered_cone_runs;
         output
     };
     // Lane J row 6, promoted ON: a closed mesh the segmentation holds as ONE
@@ -796,10 +3207,17 @@ fn hybrid_plane_cylinder_brep_retry(
     // (it failed "not bounded by closed rings" and faceted everything), while
     // raw RANSAC fragmented the same noisy body and never offered the whole
     // primitive. BREP_HYBRID_WHOLE_PRIMITIVE=0 restores the faceted path.
-    if std::env::var("BREP_HYBRID_WHOLE_PRIMITIVE").map_or(true, |v| v != "0") {
-        if let Some(mut output) = whole_closed_primitive(positions, index_buffer, &segmentation, options.weld_tolerance, &mut whole_carrier_scan) {
+    if brep_kernel::switch!(live "BREP_HYBRID_WHOLE_PRIMITIVE", true) {
+        if let Some(mut output) = whole_closed_primitive(
+            positions,
+            index_buffer,
+            &segmentation,
+            options.weld_tolerance,
+            &mut whole_carrier_scan,
+            switches,
+        ) {
             output.stats.whole_carrier_scan = whole_carrier_scan;
-            return Ok(with_split(output));
+            return Ok((with_split(output), Forbidden::default()));
         }
     }
     let mut split_attempted = BTreeSet::new();
@@ -819,12 +3237,13 @@ fn hybrid_plane_cylinder_brep_retry(
         edges: Vec::new(),
         shells: Vec::new(),
     })?;
-    let mut forced_demotions = BTreeSet::new();
+    let mut forced_demotions = BTreeMap::<u32, (DemotionCause, String)>::new();
     loop {
         let attempt = if let Some(original) = injected_failure.take() {
             Err(HybridBuildFailure::Region {
                 original,
                 message: "injected localized carrier construction failure".into(),
+                cause: DemotionCause::Injected,
             })
         } else {
             hybrid_plane_cylinder_brep_once(
@@ -835,12 +3254,33 @@ fn hybrid_plane_cylinder_brep_retry(
                 split_noise,
                 blank.clone(),
                 &forced_demotions,
+                switches,
+                parent,
             )
         };
         match attempt {
             Ok(mut output) => {
                 output.stats.whole_carrier_scan = whole_carrier_scan;
-                return Ok(with_split(output));
+                let demoted = output.stats.demotions.iter().map(|d| d.region).collect::<BTreeSet<_>>();
+                let hosts = absorbed
+                    .iter()
+                    .filter(|(_, triangles)| {
+                        triangles.iter().any(|&t| demoted.contains(&segmentation.triangle_region_ids[t]))
+                    })
+                    .map(|(&host, _)| host)
+                    .collect();
+                // A widened cut region's first pieces keep their source
+                // triangle's index.
+                let cuts = cut
+                    .iter()
+                    .flat_map(|cut| &cut.widened)
+                    .filter(|triangles| {
+                        triangles.iter().any(|&t| demoted.contains(&segmentation.triangle_region_ids[t]))
+                    })
+                    .flatten()
+                    .copied()
+                    .collect();
+                return Ok((with_split(output), Forbidden { hosts, cuts }));
             }
             Err(HybridBuildFailure::Periodic { original }) => {
                 if split_attempted.len() < HYBRID_RETRY_LIMIT
@@ -849,15 +3289,19 @@ fn hybrid_plane_cylinder_brep_retry(
                 {
                     continue;
                 }
-                if !forced_demotions.insert(original) || forced_demotions.len() > HYBRID_RETRY_LIMIT {
+                if forced_demotions
+                    .insert(original, (DemotionCause::PeriodicSeam, "no safe periodic split".into()))
+                    .is_some()
+                    || forced_demotions.len() > HYBRID_RETRY_LIMIT
+                {
                     return Err(format!("hybrid BREP: no safe periodic split for region {original}"));
                 }
             }
-            Err(HybridBuildFailure::Region { original, message }) => {
+            Err(HybridBuildFailure::Region { original, message, cause }) => {
                 if std::env::var("BREP_DEBUG_HYBRID").is_ok() {
                     eprintln!("[hybrid] retry: region {original} failed: {message}");
                 }
-                if !forced_demotions.insert(original) {
+                if forced_demotions.insert(original, (cause, message.clone())).is_some() {
                     return Err(format!(
                         "hybrid BREP: region {original} remained unconstructible after local demotion: {message}"
                     ));
@@ -873,7 +3317,11 @@ fn hybrid_plane_cylinder_brep_retry(
                     eprintln!("[hybrid] retry: fitted-pcurve regions {originals:?} failed: {message}");
                 }
                 let before = forced_demotions.len();
-                forced_demotions.extend(originals);
+                for original in originals {
+                    forced_demotions
+                        .entry(original)
+                        .or_insert_with(|| (DemotionCause::WholeBodyCheck, message.clone()));
+                }
                 if forced_demotions.len() == before {
                     return Err(message);
                 }
@@ -982,7 +3430,9 @@ fn hybrid_plane_cylinder_brep_once(
     segmentation: &MeshSegmentation,
     split_noise: f64,
     mut arena: TopologyArena,
-    forced_demotions: &BTreeSet<u32>,
+    forced_demotions: &BTreeMap<u32, (DemotionCause, String)>,
+    switches: HybridSwitches,
+    parent: Option<&[usize]>,
 ) -> Result<HybridBrepOutput, HybridBuildFailure> {
     if positions.is_empty()
         || !positions.len().is_multiple_of(3)
@@ -1025,7 +3475,7 @@ fn hybrid_plane_cylinder_brep_once(
     // Lane J row 5, promoted ON: the exact-topology bar is raised to twice
     // the vertex noise the mesh carries on its large planes.
     // BREP_HYBRID_MESH_NOISE=0 keeps the bar at the fit tolerance alone.
-    let tolerance = if std::env::var("BREP_HYBRID_MESH_NOISE").map_or(true, |v| v != "0") {
+    let tolerance = if brep_kernel::switch!(live "BREP_HYBRID_MESH_NOISE", true) {
         tolerance.max(2.0 * measured_plane_noise(segmentation).max(split_noise))
     } else {
         tolerance
@@ -1040,6 +3490,8 @@ fn hybrid_plane_cylinder_brep_once(
         &incidence,
         tolerance,
         forced_demotions,
+        switches,
+        parent,
     )?;
     let stats = local.stats;
     let local_to_original = local.local_to_original;
@@ -1087,7 +3539,11 @@ fn hybrid_plane_cylinder_brep_once(
     .map_err(|(region, message)| HybridBuildFailure::Region {
         original: local_to_original[&region],
         message,
+        cause: DemotionCause::CylinderAxisSnap,
     })?;
+    if switches.shared_crossing {
+        share_crossing_wall_carriers(&mut cylinder_carriers, &chains, tolerance);
+    }
     snap_cone_carriers(
         &mut cone_carriers,
         &cylinder_carriers,
@@ -1095,10 +3551,13 @@ fn hybrid_plane_cylinder_brep_once(
         &chains,
         &vertices,
         tolerance,
+        switches.pointed_cone_apex,
+        switches.frustum_two_rings,
     )
     .map_err(|(region, message)| HybridBuildFailure::Region {
         original: local_to_original[&region],
         message,
+        cause: DemotionCause::ConeSnap,
     })?;
     snap_cylinder_ruling_vertices(
         &mut vertices,
@@ -1116,6 +3575,9 @@ fn hybrid_plane_cylinder_brep_once(
     );
     if split_freeform_enabled() {
         pin_crossing_chain_ends(&chains, &mut vertices, &cylinder_carriers, tolerance);
+    }
+    if switches.pointed_cone_apex {
+        apex_at_vertex(&mut cone_carriers, &local.triangle_regions, &triangles, &vertices, tolerance);
     }
     let pointed_cones = pointed_cone_regions(
         &cone_carriers,
@@ -1152,7 +3614,11 @@ fn hybrid_plane_cylinder_brep_once(
     stage_trace("axes snapped");
     let cylinders = build_cylinder_surfaces(&cylinder_carriers, &chains, &vertices, tolerance)
         .map_err(|(region, message)| match message {
-            Some(message) => HybridBuildFailure::Region { original: local_to_original[&region], message },
+            Some(message) => HybridBuildFailure::Region {
+                original: local_to_original[&region],
+                message,
+                cause: DemotionCause::CylinderSurface,
+            },
             None => HybridBuildFailure::Periodic { original: local_to_original[&region] },
         })?;
     let cones = build_cone_surfaces(
@@ -1162,10 +3628,13 @@ fn hybrid_plane_cylinder_brep_once(
         &chains,
         &vertices,
         tolerance,
+        switches.cone_seam,
+        switches.gather_cone_strips,
     )
         .map_err(|(region, message)| HybridBuildFailure::Region {
             original: local_to_original[&region],
             message,
+        cause: DemotionCause::ConeSurface,
         })?;
     let spheres = build_sphere_surfaces(
         &sphere_carriers,
@@ -1181,6 +3650,7 @@ fn hybrid_plane_cylinder_brep_once(
     .map_err(|(region, message)| HybridBuildFailure::Region {
         original: local_to_original[&region],
         message,
+        cause: DemotionCause::SphereSurface,
     })?;
     let tori = build_torus_surfaces(
         &torus_carriers,
@@ -1194,6 +3664,7 @@ fn hybrid_plane_cylinder_brep_once(
     .map_err(|(region, message)| HybridBuildFailure::Region {
         original: local_to_original[&region],
         message,
+        cause: DemotionCause::TorusSurface,
     })?;
     stage_trace("surfaces built");
     sort_region_cycles(
@@ -1208,6 +3679,9 @@ fn hybrid_plane_cylinder_brep_once(
     );
     stage_trace("cycles sorted");
 
+    if switches.plane_corners {
+        place_plane_corners(&mut vertices, &chains, &planes, tolerance);
+    }
     let mut ids = Ids(2);
     let mut arena_vertices = HashMap::new();
     // The regions of the chain that first placed each endpoint vertex.  A
@@ -1217,15 +3691,28 @@ fn hybrid_plane_cylinder_brep_once(
     // to demote, so the blame goes to the revolve that placed the vertex.
     let mut vertex_placers = HashMap::<usize, (u32, u32)>::new();
 
-    let mut built_edges = Vec::with_capacity(chains.len());
+    let mut built_slots: Vec<Option<BuiltEdge>> = (0..chains.len()).map(|_| None).collect();
     let chain_trace = std::env::var("BREP_DEBUG_HYBRID").is_ok();
-    for (chain_index, chain) in chains.iter().enumerate() {
-        let involves_revolve = [chain.adjacent.0, chain.adjacent.1].iter().any(|region| {
+    let revolves = |chain: &Chain| {
+        [chain.adjacent.0, chain.adjacent.1].iter().any(|region| {
             cylinders.contains_key(region)
                 || cones.contains_key(region)
                 || spheres.contains_key(region)
                 || tori.contains_key(region)
-        });
+        })
+    };
+    // [`HybridSwitches::revolve_ends_first`]: chains on a revolved region
+    // first, so their exact ends place the vertices the lines then join.
+    let mut order: Vec<usize> = (0..chains.len()).collect();
+    let mut common_station = HashMap::<usize, f64>::new();
+    let mut moved_line_ends = 0usize;
+    if switches.revolve_ends_first {
+        order.sort_by_key(|&index| !revolves(&chains[index]));
+        common_station = common_arc_stations(&chains, &vertices, &cylinders, &cones, tolerance);
+    }
+    for chain_index in order {
+        let chain = &chains[chain_index];
+        let involves_revolve = revolves(chain);
         if chain_trace && involves_revolve {
             let kind = |region: u32| {
                 if planes.contains_key(&region) {
@@ -1262,6 +3749,9 @@ fn hybrid_plane_cylinder_brep_once(
             &spheres,
             &tori,
             tolerance,
+            switches,
+            &common_station,
+            &mut moved_line_ends,
             &mut arena,
             &mut arena_vertices,
             &mut ids,
@@ -1271,15 +3761,18 @@ fn hybrid_plane_cylinder_brep_once(
                 let local = [chain.adjacent.0, chain.adjacent.1]
                     .into_iter()
                     .find(|region| spheres.contains_key(region) || tori.contains_key(region))
+                    .map(|region| (region, DemotionCause::ChainEdgeCurved))
                     .or_else(|| {
                         [chain.adjacent.0, chain.adjacent.1]
                             .into_iter()
                             .find(|region| cones.contains_key(region))
+                            .map(|region| (region, DemotionCause::ChainEdgeCone))
                     })
                     .or_else(|| {
                         [chain.adjacent.0, chain.adjacent.1]
                             .into_iter()
                             .find(|region| cylinders.contains_key(region))
+                            .map(|region| (region, DemotionCause::ChainEdgeCylinder))
                     });
                 let local = local.or_else(|| {
                     let endpoints = [chain.vertices.first(), chain.vertices.last()];
@@ -1294,11 +3787,13 @@ fn hybrid_plane_cylinder_brep_once(
                                 || spheres.contains_key(region)
                                 || tori.contains_key(region)
                         })
+                        .map(|region| (region, DemotionCause::ChainEdgeVertexPlacer))
                 });
-                if let Some(local) = local {
+                if let Some((local, cause)) = local {
                     return Err(HybridBuildFailure::Region {
                         original: local_to_original[&local],
                         message,
+                        cause,
                     });
                 }
                 return Err(HybridBuildFailure::Global(message));
@@ -1307,8 +3802,9 @@ fn hybrid_plane_cylinder_brep_once(
         for vertex in [chain.vertices.first(), chain.vertices.last()].into_iter().flatten() {
             vertex_placers.entry(*vertex).or_insert(chain.adjacent);
         }
-        built_edges.push(built);
+        built_slots[chain_index] = Some(built);
     }
+    let built_edges: Vec<BuiltEdge> = built_slots.into_iter().map(|built| built.expect("every chain is built")).collect();
 
     stage_trace("chain edges built");
     let mut faces = Vec::<FaceId>::new();
@@ -1336,6 +3832,7 @@ fn hybrid_plane_cylinder_brep_once(
             .map_err(|message| HybridBuildFailure::Region {
                 original: local_to_original[&region],
                 message,
+        cause: DemotionCause::CylinderFace,
             })?
         } else if let Some(torus) = tori.get(&region) {
             build_revolve_band_face(
@@ -1351,6 +3848,7 @@ fn hybrid_plane_cylinder_brep_once(
             .map_err(|message| HybridBuildFailure::Region {
                 original: local_to_original[&region],
                 message,
+        cause: DemotionCause::TorusFace,
             })?
         } else if let Some(sphere) = spheres.get(&region) {
             build_sphere_face(
@@ -1364,6 +3862,7 @@ fn hybrid_plane_cylinder_brep_once(
             .map_err(|message| HybridBuildFailure::Region {
                 original: local_to_original[&region],
                 message,
+        cause: DemotionCause::SphereFace,
             })?
         } else {
             build_cone_face(
@@ -1377,6 +3876,7 @@ fn hybrid_plane_cylinder_brep_once(
             .map_err(|message| HybridBuildFailure::Region {
                 original: local_to_original[&region],
                 message,
+        cause: DemotionCause::ConeFace,
             })?
         };
         faces.push(face);
@@ -1434,6 +3934,8 @@ fn hybrid_plane_cylinder_brep_once(
             }
         }
     };
+    let mut stats = stats;
+    stats.moved_line_ends = moved_line_ends;
     let output = finish_shell(arena, stats).map_err(&fail)?;
     // The rebuild must keep the source shell's topology. A closed source
     // mesh has genus (2 − V + E − F)/2; an output with another genus is a
@@ -1508,6 +4010,7 @@ fn validate_cone_span(
         return Err(HybridBuildFailure::Region {
             original,
             message: "pointed or zero-span cone requires unsupported pole topology".into(),
+            cause: DemotionCause::ConeSpan,
         });
     }
     Ok(())
@@ -1571,7 +4074,7 @@ fn validate_closed_incidence(
     Ok(())
 }
 
-fn carrier_cylinder(region: &MeshRegion) -> Result<Option<CylinderCarrier>, String> {
+fn carrier_cylinder(region: &MeshRegion, pair_section_bar: bool) -> Result<Option<CylinderCarrier>, String> {
     let RegionCarrier::Cylinder {
         axis_point,
         axis_dir,
@@ -1590,6 +4093,7 @@ fn carrier_cylinder(region: &MeshRegion) -> Result<Option<CylinderCarrier>, Stri
         radius,
         sense,
         deviation: region.max_deviation.max(0.0),
+        pair_section_bar,
     }))
 }
 
@@ -1827,6 +4331,18 @@ fn edge_is_cylinder_ruling(cylinder: CylinderCarrier, a: Vec3, b: Vec3, toleranc
         && direction.cross(cylinder.axis).length() <= 0.01
 }
 
+/// How far a crossing's axes may miss each other and an edge point may sit
+/// off a section plane: the bare exact-topology bar, or, under
+/// [`HybridSwitches::pair_section_bar`], the radial bar the walls' deviation
+/// already earns their radius.
+fn cylinder_pair_section_bar(first: CylinderCarrier, second: CylinderCarrier, tolerance: f64) -> f64 {
+    if first.pair_section_bar || second.pair_section_bar {
+        accepted_radial_bar(tolerance * 4.0, first.deviation.max(second.deviation))
+    } else {
+        tolerance * 4.0
+    }
+}
+
 /// Where two cylinders of one radius whose axes cross meet: the two planes
 /// through the crossing point normal to the sum and to the difference of the
 /// axes (each cuts both walls in the same ellipse), or `None` when the pair
@@ -1853,7 +4369,7 @@ fn cylinder_pair_section(
     let t = (e - b * d) / denominator;
     let p1 = first.origin.add(a1.scale(s));
     let p2 = second.origin.add(a2.scale(t));
-    if p1.sub(p2).length() > tolerance * 4.0 {
+    if p1.sub(p2).length() > cylinder_pair_section_bar(first, second, tolerance) {
         return None;
     }
     let normals = [a1.add(a2).normalized().ok()?, a1.sub(a2).normalized().ok()?];
@@ -1882,16 +4398,29 @@ fn cylinder_pair_corner_cut(
     }) {
         return false;
     }
-    let on = |point: Vec3, k: usize| point.sub(center).dot(normals[k]).abs() <= tolerance * 4.0;
-    if !((on(a, 0) && on(b, 1)) || (on(a, 1) && on(b, 0))) {
-        return false;
-    }
+    let plane_bar = cylinder_pair_section_bar(first, second, tolerance);
+    let on = |point: Vec3, k: usize| point.sub(center).dot(normals[k]).abs() <= plane_bar;
     let Ok(minor) = first.axis.cross(second.axis).normalized() else {
         return false;
     };
     let radius = 0.5 * (first.radius + second.radius);
     let length = b.sub(a).length();
-    [center.add(minor.scale(radius)), center.sub(minor.scale(radius))]
+    let tangents = [center.add(minor.scale(radius)), center.sub(minor.scale(radius))];
+    if !((on(a, 0) && on(b, 1)) || (on(a, 1) && on(b, 0))) {
+        // Under the pair-section bar: near a tangent point the two walls are
+        // tangent to each other, so a point within the radial bar `e` of both
+        // sits up to about sqrt(2 r e) off both section planes. One end on a
+        // plane and the other that close to a tangent point is still the
+        // corner cut `split_crossing_cylinder_chains` moves onto it.
+        if !(first.pair_section_bar || second.pair_section_bar) {
+            return false;
+        }
+        let reach = (2.0 * radius * plane_bar).sqrt();
+        let near = |point: Vec3| tangents.iter().any(|&tangent| tangent.sub(point).length() <= reach.min(length));
+        let on_any = |point: Vec3| on(point, 0) || on(point, 1);
+        return (on_any(a) && near(b)) || (on_any(b) && near(a));
+    }
+    tangents
         .iter()
         .any(|&tangent| tangent.sub(a).length().min(tangent.sub(b).length()) < length)
 }
@@ -1912,14 +4441,37 @@ fn cylinder_pair_section_normal(
     }) {
         return None;
     }
+    let plane_bar = cylinder_pair_section_bar(first, second, tolerance);
     normals
         .into_iter()
         .find(|normal| {
             points
                 .iter()
-                .all(|point| point.sub(center).dot(*normal).abs() <= tolerance * 4.0)
+                .all(|point| point.sub(center).dot(*normal).abs() <= plane_bar)
         })
         .map(|normal| (center, normal))
+}
+
+/// [`HybridSwitches::cap_ring`]: both ends on a plane square to the
+/// cylinder's axis within 0.01 and within the radial bar of the wall about
+/// the axis squared to that plane (through the same origin), as
+/// `snap_cylinder_axes` leaves it.
+fn cap_ring_supported(cylinder: CylinderCarrier, plane: PlaneInfo, a: Vec3, b: Vec3, tolerance: f64) -> bool {
+    let Ok(normal) = plane.normal.normalized() else {
+        return false;
+    };
+    if normal.cross(cylinder.axis).length() > 0.01 {
+        return false;
+    }
+    let snapped = CylinderCarrier {
+        axis: if normal.dot(cylinder.axis) >= 0.0 { normal } else { normal.scale(-1.0) },
+        ..cylinder
+    };
+    [a, b].iter().all(|&point| {
+        point.sub(plane.origin).dot(normal).abs() <= tolerance
+            && (radial(snapped, point).length() - snapped.radius).abs()
+                <= accepted_radial_bar(tolerance * 4.0, snapped.deviation)
+    })
 }
 
 fn cylinder_plane_edge_supported(
@@ -2135,7 +4687,9 @@ fn local_regions(
     vertices: &[Vec3],
     incidence: &BTreeMap<EdgeKey, Vec<usize>>,
     tolerance: f64,
-    forced_demotions: &BTreeSet<u32>,
+    forced_demotions: &BTreeMap<u32, (DemotionCause, String)>,
+    switches: HybridSwitches,
+    parent: Option<&[usize]>,
 ) -> Result<LocalRegions, String> {
     let mut original_cylinders = HashMap::<u32, CylinderCarrier>::new();
     let mut original_cones = HashMap::<u32, ConeCarrier>::new();
@@ -2151,27 +4705,27 @@ fn local_regions(
         if let RegionCarrier::Plane { origin, normal } = region.carrier {
             original_planes.insert(region.id, PlaneInfo { origin, normal });
         }
-        if let Some(cylinder) = carrier_cylinder(region)? {
+        if let Some(cylinder) = carrier_cylinder(region, switches.pair_section_bar)? {
             original_cylinders.insert(region.id, cylinder);
-            if !forced_demotions.contains(&region.id) {
+            if !forced_demotions.contains_key(&region.id) {
                 retained.insert(region.id);
             }
         }
         if let Some(cone) = carrier_cone(region)? {
             original_cones.insert(region.id, cone);
-            if !forced_demotions.contains(&region.id) {
+            if !forced_demotions.contains_key(&region.id) {
                 retained.insert(region.id);
             }
         }
         if let Some(sphere) = carrier_sphere(region)? {
             original_spheres.insert(region.id, sphere);
-            if !forced_demotions.contains(&region.id) {
+            if !forced_demotions.contains_key(&region.id) {
                 retained.insert(region.id);
             }
         }
         if let Some(torus) = carrier_torus(region)? {
             original_tori.insert(region.id, torus);
-            if !forced_demotions.contains(&region.id) {
+            if !forced_demotions.contains_key(&region.id) {
                 retained.insert(region.id);
             }
         }
@@ -2245,8 +4799,44 @@ fn local_regions(
         }
     };
 
+    // Lane V row 1: the first cause that removed each region from
+    // `retained`. Within one round a direct cause replaces a recursive one,
+    // so a recursive demotion is one no direct check would have made.
+    let mut causes = BTreeMap::<u32, (DemotionCause, Option<u32>, usize)>::new();
+    // [`HybridSwitches::cap_ring`]: region pairs whose shared edges close
+    // into loops (every vertex on two of them), the cap loops
+    // `snap_cylinder_axes` squares a cylinder's axis to.
+    let mut closed_pairs = BTreeSet::<(u32, u32)>::new();
+    if switches.cap_ring {
+        let mut degree = BTreeMap::<(u32, u32), HashMap<usize, usize>>::new();
+        for (&(a, b), incident) in incidence {
+            let (first, second) = (triangle_regions[incident[0]], triangle_regions[incident[1]]);
+            if first != second {
+                let entry = degree.entry((first.min(second), first.max(second))).or_default();
+                *entry.entry(a).or_default() += 1;
+                *entry.entry(b).or_default() += 1;
+            }
+        }
+        closed_pairs.extend(
+            degree
+                .into_iter()
+                .filter(|(_, counts)| counts.values().all(|&count| count == 2))
+                .map(|(pair, _)| pair),
+        );
+    }
+    let mut round = 0_usize;
     loop {
+        round += 1;
         let mut demote = BTreeSet::new();
+        let mut round_causes = BTreeMap::<u32, (DemotionCause, Option<u32>)>::new();
+        let mut note = |region: u32, cause: DemotionCause, neighbor: u32| {
+            let entry = round_causes.entry(region).or_insert((cause, Some(neighbor)));
+            if entry.0 == DemotionCause::DemotedNeighbourNotRuling
+                && cause != DemotionCause::DemotedNeighbourNotRuling
+            {
+                *entry = (cause, Some(neighbor));
+            }
+        };
         for (&(a, b), incident) in incidence {
             let first = triangle_regions[incident[0]];
             let second = triangle_regions[incident[1]];
@@ -2261,7 +4851,7 @@ fn local_regions(
                     continue;
                 };
                 if retained.contains(&neighbor) {
-                    let (supported, why) = match (own, revolve_of(neighbor)) {
+                    let (supported, why, cause) = match (own, revolve_of(neighbor)) {
                         (Revolve::Cylinder(cylinder), Some(Revolve::Cone(cone)))
                         | (Revolve::Cone(cone), Some(Revolve::Cylinder(cylinder))) => (
                             cylinder_cone_edge_supported(
@@ -2272,6 +4862,7 @@ fn local_regions(
                                 tolerance,
                             ),
                             "cylinder/cone edge unsupported",
+                            DemotionCause::CylinderConeEdge,
                         ),
                         // Two cylinders meet exactly along a shared axial
                         // ruling: a tangent chain of arcs on parallel axes
@@ -2303,27 +4894,33 @@ fn local_regions(
                                     tolerance,
                                 ),
                             "cylinder/cylinder edge is neither a shared ruling nor an equal-radius crossing",
+                            DemotionCause::CylinderCylinderEdge,
                         ),
                         (Revolve::Sphere(sphere), Some(other))
                         | (other, Some(Revolve::Sphere(sphere))) => (
                             sphere_ring_with(sphere, other, vertices[a], vertices[b]),
                             "sphere edge is not a coaxial ring",
+                            DemotionCause::SphereRingEdge,
                         ),
                         (Revolve::Torus(torus), Some(other))
                         | (other, Some(Revolve::Torus(torus))) => (
                             torus_ring_with(torus, other, vertices[a], vertices[b]),
                             "torus edge is not a coaxial ring",
+                            DemotionCause::TorusRingEdge,
                         ),
                         (Revolve::Cone(first), Some(Revolve::Cone(second))) => (
                             cone_cone_edge_supported(first, second, vertices[a], vertices[b], tolerance),
                             "cone/cone edge is not a coaxial ring",
+                            DemotionCause::ConeConeEdge,
                         ),
-                        _ => (false, "same-kind revolve adjacency"),
+                        _ => (false, "same-kind revolve adjacency", DemotionCause::SameKindRevolveEdge),
                     };
                     if !supported {
                         demote_trace(candidate, neighbor, why, vertices[a], vertices[b]);
                         demote.insert(candidate);
                         demote.insert(neighbor);
+                        note(candidate, cause, neighbor);
+                        note(neighbor, cause, candidate);
                     }
                     continue;
                 }
@@ -2366,7 +4963,7 @@ fn local_regions(
                 // planar area cutoff). Judge that actual support before
                 // discarding the entire curved face as a non-planar adjacency.
                 let neighbor_plane = if let Some(&plane) = original_planes.get(&neighbor) {
-                    Some(plane)
+                    Some((plane, DemotionCause::PlaneNeighbourEdge))
                 } else if unresolved_regions.contains(&neighbor) {
                     let triangle = incident
                         .iter()
@@ -2375,19 +4972,18 @@ fn local_regions(
                         .ok_or_else(|| {
                             "hybrid BREP: missing unresolved interface triangle".to_owned()
                         })?;
-                    Some(facet_plane(triangles[triangle], vertices)?)
+                    Some((facet_plane(triangles[triangle], vertices)?, DemotionCause::FacetNeighbourEdge))
                 } else {
                     None
                 };
-                if let Some(plane) = neighbor_plane {
+                if let Some((plane, cause)) = neighbor_plane {
                     let supported = match own {
-                        Revolve::Cylinder(cylinder) => cylinder_plane_edge_supported(
-                            cylinder,
-                            plane,
-                            vertices[a],
-                            vertices[b],
-                            tolerance,
-                        ),
+                        Revolve::Cylinder(cylinder) => {
+                            cylinder_plane_edge_supported(cylinder, plane, vertices[a], vertices[b], tolerance)
+                                || (cause == DemotionCause::PlaneNeighbourEdge
+                                    && closed_pairs.contains(&(candidate.min(neighbor), candidate.max(neighbor)))
+                                    && cap_ring_supported(cylinder, plane, vertices[a], vertices[b], tolerance))
+                        }
                         Revolve::Cone(cone) => cone_plane_edge_supported(
                             cone,
                             plane,
@@ -2413,6 +5009,7 @@ fn local_regions(
                     if !supported {
                         demote_trace(candidate, neighbor, "edge with plane neighbour unsupported", vertices[a], vertices[b]);
                         demote.insert(candidate);
+                        note(candidate, cause, neighbor);
                     }
                     continue;
                 }
@@ -2430,6 +5027,7 @@ fn local_regions(
                 if !supported {
                     demote_trace(candidate, neighbor, "edge with non-plane neighbour is not a ruling", vertices[a], vertices[b]);
                     demote.insert(candidate);
+                    note(candidate, DemotionCause::DemotedNeighbourNotRuling, neighbor);
                 }
             }
         }
@@ -2438,6 +5036,9 @@ fn local_regions(
         }
         for region in demote {
             retained.remove(&region);
+            if let Some(&(cause, neighbor)) = round_causes.get(&region) {
+                causes.entry(region).or_insert((cause, neighbor, round));
+            }
         }
     }
 
@@ -2449,6 +5050,55 @@ fn local_regions(
         .copied()
         .filter(|id| !retained.contains(id))
         .collect::<BTreeSet<_>>();
+    let mut region_triangles = HashMap::<u32, usize>::new();
+    for region in triangle_regions {
+        if demoted.contains(region) {
+            *region_triangles.entry(*region).or_default() += 1;
+        }
+    }
+    // Rounds only ever demote after their neighbours, so the roots of a
+    // recursive chain resolve in round order.
+    let mut by_round = demoted.iter().copied().collect::<Vec<_>>();
+    by_round.sort_by_key(|id| causes.get(id).map_or(0, |&(_, _, round)| round));
+    let mut roots = HashMap::<u32, DemotionCause>::new();
+    let mut demotions = Vec::with_capacity(demoted.len());
+    for region in by_round {
+        let kind = if original_cylinders.contains_key(&region) {
+            DemotedKind::Cylinder
+        } else if original_cones.contains_key(&region) {
+            DemotedKind::Cone
+        } else if original_spheres.contains_key(&region) {
+            DemotedKind::Sphere
+        } else {
+            DemotedKind::Torus
+        };
+        let (cause, neighbour, round, message) = if let Some((cause, message)) = forced_demotions.get(&region) {
+            (*cause, None, 0, Some(message.clone()))
+        } else {
+            let &(cause, neighbour, round) = causes
+                .get(&region)
+                .ok_or_else(|| format!("hybrid BREP: region {region} demoted without a cause"))?;
+            (cause, neighbour, round, None)
+        };
+        let root_cause = match (cause, neighbour) {
+            (DemotionCause::DemotedNeighbourNotRuling, Some(neighbour)) => {
+                roots.get(&neighbour).copied().unwrap_or(cause)
+            }
+            _ => cause,
+        };
+        roots.insert(region, root_cause);
+        demotions.push(HybridDemotion {
+            region,
+            kind,
+            triangles: region_triangles.get(&region).copied().unwrap_or(0),
+            cause,
+            root_cause,
+            neighbour,
+            round,
+            message,
+        });
+    }
+    demotions.sort_by_key(|demotion| demotion.region);
     let mut planes = HashMap::new();
     let mut cylinders = HashMap::new();
     let mut cones = HashMap::new();
@@ -2593,12 +5243,25 @@ fn local_regions(
         .iter()
         .filter(|region| demoted.contains(region))
         .count();
-    let faceted_triangles = triangles.len()
-        - analytic_plane_triangles
-        - analytic_cylinder_triangles
-        - analytic_cone_triangles
-        - analytic_sphere_triangles
-        - analytic_torus_triangles;
+    // [`HybridSwitches::crease_cut`]: counted per source triangle, faceted
+    // when any piece of it is.
+    let faceted_triangles = match parent {
+        Some(parent) => fallback
+            .iter()
+            .zip(parent)
+            .filter(|(&faceted, _)| faceted)
+            .map(|(_, &source)| source)
+            .collect::<BTreeSet<_>>()
+            .len(),
+        None => {
+            triangles.len()
+                - analytic_plane_triangles
+                - analytic_cylinder_triangles
+                - analytic_cone_triangles
+                - analytic_sphere_triangles
+                - analytic_torus_triangles
+        }
+    };
     let stats = HybridBrepStats {
         total_faces: next as usize,
         analytic_plane_faces: original_planes.len(),
@@ -2644,7 +5307,10 @@ fn local_regions(
         split_over_budget_regions: 0,
         split_budget_hit_regions: 0,
         split_band_declined_regions: 0,
+        gathered_cone_runs: 0,
+        moved_line_ends: 0,
         whole_carrier_scan: Default::default(),
+        demotions,
     };
     Ok(LocalRegions {
         triangle_regions: local_triangle_regions,
@@ -2983,6 +5649,96 @@ fn pin_crossing_chain_ends(
     }
 }
 
+/// Two cylinder carriers are pieces of one wall: axes parallel within 0.01,
+/// radii and each origin's distance from the other's axis line within the
+/// pair's radial bar at `tolerance * 4`.
+fn same_cylinder_wall(first: CylinderCarrier, second: CylinderCarrier, tolerance: f64) -> bool {
+    let off_line = |c: CylinderCarrier, p: Vec3| {
+        let d = p.sub(c.origin);
+        d.sub(c.axis.scale(d.dot(c.axis))).length()
+    };
+    let bar = accepted_radial_bar(tolerance * 4.0, first.deviation.max(second.deviation));
+    first.axis.cross(second.axis).length() <= 0.01
+        && (first.radius - second.radius).abs() <= bar
+        && off_line(first, second.origin) <= bar
+        && off_line(second, first.origin) <= bar
+}
+
+/// [`HybridSwitches::shared_crossing`]: give the pieces of one cylinder wall
+/// that cross the same third cylinder one carrier, so both crossings share
+/// their tangent points and section ellipses.
+fn share_crossing_wall_carriers(
+    cylinders: &mut HashMap<u32, CylinderCarrier>,
+    chains: &[Chain],
+    tolerance: f64,
+) {
+    let mut crossed = HashMap::<u32, BTreeSet<u32>>::new();
+    for chain in chains {
+        let (a, b) = chain.adjacent;
+        let (Some(&first), Some(&second)) = (cylinders.get(&a), cylinders.get(&b)) else {
+            continue;
+        };
+        if cylinder_pair_section(first, second, tolerance).is_some() {
+            crossed.entry(a).or_default().insert(b);
+            crossed.entry(b).or_default().insert(a);
+        }
+    }
+    let mut regions = crossed.keys().copied().collect::<Vec<_>>();
+    regions.sort_unstable();
+    let mut group = regions.iter().map(|&r| (r, r)).collect::<HashMap<_, _>>();
+    fn root(group: &HashMap<u32, u32>, mut r: u32) -> u32 {
+        while group[&r] != r {
+            r = group[&r];
+        }
+        r
+    }
+    for (i, &a) in regions.iter().enumerate() {
+        for &b in &regions[i + 1..] {
+            if !same_cylinder_wall(cylinders[&a], cylinders[&b], tolerance) || crossed[&a].is_disjoint(&crossed[&b]) {
+                continue;
+            }
+            let (ra, rb) = (root(&group, a), root(&group, b));
+            group.insert(ra.max(rb), ra.min(rb));
+        }
+    }
+    let mut members = BTreeMap::<u32, Vec<u32>>::new();
+    for &r in &regions {
+        members.entry(root(&group, r)).or_default().push(r);
+    }
+    for pieces in members.values().filter(|pieces| pieces.len() > 1) {
+        let lead = cylinders[&pieces[0]];
+        let n = pieces.len() as f64;
+        let Ok(axis) = pieces
+            .iter()
+            .map(|r| {
+                let a = cylinders[r].axis;
+                if a.dot(lead.axis) >= 0.0 { a } else { a.scale(-1.0) }
+            })
+            .fold(Vec3::default(), |sum, a| sum.add(a))
+            .normalized()
+        else {
+            continue;
+        };
+        // Each origin moved along the mean axis to the lead's station, then
+        // averaged.
+        let origin = pieces
+            .iter()
+            .map(|r| {
+                let o = cylinders[r].origin;
+                o.sub(axis.scale(o.sub(lead.origin).dot(axis)))
+            })
+            .fold(Vec3::default(), |sum, o| sum.add(o))
+            .scale(1.0 / n);
+        let radius = pieces.iter().map(|r| cylinders[r].radius).sum::<f64>() / n;
+        let deviation = pieces.iter().map(|r| cylinders[r].deviation).fold(0.0, f64::max);
+        for r in pieces {
+            let piece = cylinders.get_mut(r).unwrap();
+            let axis = if piece.axis.dot(axis) >= 0.0 { axis } else { axis.scale(-1.0) };
+            *piece = CylinderCarrier { origin, axis, radius, deviation, ..*piece };
+        }
+    }
+}
+
 fn split_crossing_cylinder_chains(
     chains: Vec<Chain>,
     boundaries: &mut [RegionBoundary],
@@ -3019,8 +5775,9 @@ fn split_crossing_cylinder_chains(
             let second = *cylinders.get(&chain.adjacent.1)?;
             let (center, normals) = cylinder_pair_section(first, second, tolerance)?;
             let bar = tolerance * 4.0;
+            let plane_bar = cylinder_pair_section_bar(first, second, tolerance);
             let points: Vec<Vec3> = loop_vertices.iter().map(|&id| vertices[id]).collect();
-            let on = |point: Vec3, k: usize| point.sub(center).dot(normals[k]).abs() <= bar;
+            let on = |point: Vec3, k: usize| point.sub(center).dot(normals[k]).abs() <= plane_bar;
             if points.iter().all(|&p| on(p, 0)) || points.iter().all(|&p| on(p, 1)) {
                 return None;
             }
@@ -3045,7 +5802,19 @@ fn split_crossing_cylinder_chains(
                 // point (below), which every chain through it shares.
                 let exact = distance <= bar;
                 if !exact && (uses.get(&loop_vertices[index]) != Some(&1) || distance >= before.max(after)) {
-                    return None;
+                    // Under the pair-section bar a corner cut may end up to
+                    // sqrt(2 r bar) from a tangent point
+                    // (`cylinder_pair_corner_cut`), so its end moves onto the
+                    // point from that far: on a chordal crossing (walls fitted
+                    // at 1.7e-2) the corner sat 6.5e-2 off the fitted point,
+                    // as far as its neighbours, and the loop stayed closed.
+                    let reach = (2.0 * radius * plane_bar).sqrt();
+                    if !(first.pair_section_bar || second.pair_section_bar)
+                        || uses.get(&loop_vertices[index]) != Some(&1)
+                        || distance > reach
+                    {
+                        return None;
+                    }
                 }
                 corners.push((index, tangent));
             }
@@ -3217,6 +5986,8 @@ fn snap_cone_carriers(
     chains: &[Chain],
     vertices: &[Vec3],
     tolerance: f64,
+    ring_fit_center: bool,
+    two_rings: bool,
 ) -> Result<(), (u32, String)> {
     for (&region, cone) in cones.iter_mut() {
         let relevant = chains
@@ -3361,6 +6132,9 @@ fn snap_cone_carriers(
         // Otherwise a ring in an axis-normal plane supplies an equally exact
         // frame. This covers truncated cones without an adjacent cylinder.
         if snapped.is_none() {
+            // Every ring that snaps, in chain order: (axis, centre, radius,
+            // points).
+            let mut rings = Vec::<(Vec3, Vec3, f64, Vec<Vec3>)>::new();
             for chain in relevant.iter().filter(|chain| chain.closed) {
                 let neighbor = if chain.adjacent.0 == region {
                     chain.adjacent.1
@@ -3374,7 +6148,10 @@ fn snap_cone_carriers(
                 if axis.dot(cone.axis) < 0.0 {
                     axis = axis.scale(-1.0);
                 }
-                if axis.cross(cone.axis).length() > 0.01 {
+                // A fitted axis up to RING_SNAP_TILT off the normal snaps
+                // only when the ring is a circle about it within the bar.
+                let tilt = axis.cross(cone.axis).length();
+                if tilt > if ring_fit_center { RING_SNAP_TILT } else { 0.01 } {
                     continue;
                 }
                 let points = chain_points(chain, vertices);
@@ -3384,6 +6161,12 @@ fn snap_cone_carriers(
                     .fold(Vec3::new(0.0, 0.0, 0.0), Vec3::add)
                     .scale(1.0 / points.len() as f64);
                 let center = mean.sub(axis.scale(mean.sub(plane.origin).dot(axis)));
+                // A ring missing some of its vertices has its mean off the axis.
+                let center = if ring_fit_center || two_rings {
+                    ring_circle_center(&points, center, axis).unwrap_or(center)
+                } else {
+                    center
+                };
                 let radius = points
                     .iter()
                     .map(|&point| {
@@ -3392,11 +6175,68 @@ fn snap_cone_carriers(
                     })
                     .sum::<f64>()
                     / points.len() as f64;
-                if radius > tolerance {
-                    let apex = center.sub(axis.scale(radius / cone.half_angle.tan()));
-                    snapped = Some((apex, axis));
-                    break;
+                let bar = accepted_radial_bar(tolerance * 4.0, cone.deviation);
+                if tilt > 0.01
+                    && points.iter().any(|&point| {
+                        let delta = point.sub(center);
+                        (delta.sub(axis.scale(delta.dot(axis))).length() - radius).abs() > bar
+                    })
+                {
+                    continue;
                 }
+                if radius > tolerance {
+                    rings.push((axis, center, radius, points));
+                    if !two_rings {
+                        break;
+                    }
+                }
+            }
+            // [`HybridSwitches::frustum_two_rings`]: a cone between two
+            // parallel plane rings takes its axis through their centres (a
+            // jittered cap's normal tilts by more than the centres move) and
+            // its opening from both radii.
+            let single = rings.first().map(|(axis, center, radius, _)| {
+                (center.sub(axis.scale(radius / cone.half_angle.tan())), *axis)
+            });
+            // The first ring's frame stands when it already holds the
+            // second ring within the bar the ring edge is built to.
+            let bar = accepted_radial_bar(tolerance, cone.deviation);
+            let second_holds = match (single, rings.get(1)) {
+                (Some((apex, axis)), Some((_, _, _, points))) => {
+                    let snapped = ConeCarrier { apex, axis, ..*cone };
+                    points.iter().all(|&point| {
+                        let distance = cone_radial(snapped, point).length() * cone.half_angle.cos()
+                            - cone_station(snapped, point) * cone.half_angle.sin();
+                        distance.abs() <= bar
+                    })
+                }
+                _ => true,
+            };
+            let pair = match rings.as_slice() {
+                [(axis, c0, r0, _), (other, c1, r1, _), ..]
+                    if two_rings && !second_holds && axis.cross(*other).length() <= 0.01 =>
+                {
+                    let span = c1.sub(*c0).length();
+                    c1.sub(*c0)
+                        .normalized()
+                        .ok()
+                        .filter(|line| span > tolerance && line.cross(*axis).length() <= 0.01)
+                        .and_then(|line| {
+                            let slope = (r1 - r0) / span;
+                            let apex = c0.sub(line.scale(r0 / slope));
+                            let half_angle = slope.abs().atan();
+                            let direction = c0.sub(apex).normalized().ok()?;
+                            (slope.is_finite() && (half_angle - cone.half_angle).abs() <= 0.05)
+                                .then_some((apex, direction, half_angle))
+                        })
+                }
+                _ => None,
+            };
+            if let Some((apex, direction, half_angle)) = pair {
+                cone.half_angle = half_angle;
+                snapped = Some((apex, direction));
+            } else if single.is_some() {
+                snapped = single;
             }
         }
 
@@ -3406,6 +6246,202 @@ fn snap_cone_carriers(
         }
     }
     Ok(())
+}
+
+/// [`HybridSwitches::pointed_cone_apex`]: the centre of the least-squares
+/// circle x² + y² + d x + e y + f = 0 through `points` in the plane through
+/// `center` normal to `axis`. `None` when the points do not fix one.
+fn ring_circle_center(points: &[Vec3], center: Vec3, axis: Vec3) -> Option<Vec3> {
+    let helper = if axis.x.abs() < 0.9 { Vec3::new(1.0, 0.0, 0.0) } else { Vec3::new(0.0, 1.0, 0.0) };
+    let u = axis.cross(helper).normalized().ok()?;
+    let v = axis.cross(u);
+    let mut normal = [[0.0f64; 4]; 3];
+    for &point in points {
+        let delta = point.sub(center);
+        let (x, y) = (delta.dot(u), delta.dot(v));
+        let row = [x, y, 1.0];
+        let rhs = -(x * x + y * y);
+        for i in 0..3 {
+            for j in 0..3 {
+                normal[i][j] += row[i] * row[j];
+            }
+            normal[i][3] += row[i] * rhs;
+        }
+    }
+    let det = |m: [[f64; 3]; 3]| {
+        m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1]) - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
+            + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0])
+    };
+    let matrix = |column: Option<usize>| {
+        let mut m = [[0.0; 3]; 3];
+        for i in 0..3 {
+            for j in 0..3 {
+                m[i][j] = if Some(j) == column { normal[i][3] } else { normal[i][j] };
+            }
+        }
+        m
+    };
+    let whole = det(matrix(None));
+    if !whole.is_normal() {
+        return None;
+    }
+    let (d, e) = (det(matrix(Some(0))) / whole, det(matrix(Some(1))) / whole);
+    let fitted = center.add(u.scale(-0.5 * d)).add(v.scale(-0.5 * e));
+    fitted.x.is_finite().then_some(fitted)
+}
+
+/// [`HybridSwitches::revolve_ends_first`]: the open chains on one cylinder
+/// or cone whose stations each hold within `tolerance` of their mean are
+/// arcs of a ring at that station; arcs of one region whose mean stations
+/// lie within `tolerance` of each other are one ring and share the
+/// point-weighted mean station (as the surface parameter v), so consecutive
+/// arcs end at one point.
+fn common_arc_stations(
+    chains: &[Chain],
+    vertices: &[Vec3],
+    cylinders: &HashMap<u32, CylinderInfo>,
+    cones: &HashMap<u32, ConeInfo>,
+    tolerance: f64,
+) -> HashMap<usize, f64> {
+    // Per region: (chain, mean v, point count, mean station).
+    let mut arcs = BTreeMap::<u32, Vec<(usize, f64, usize, f64)>>::new();
+    for (index, chain) in chains.iter().enumerate() {
+        if chain.closed {
+            continue;
+        }
+        for region in [chain.adjacent.0, chain.adjacent.1] {
+            let (stations, vs): (Vec<f64>, Vec<f64>) = if let Some(cylinder) = cylinders.get(&region) {
+                chain_points(chain, vertices)
+                    .iter()
+                    .map(|&p| {
+                        let s = station(cylinder.carrier, p);
+                        (s, (s - cylinder.base_station) / cylinder.height)
+                    })
+                    .unzip()
+            } else if let Some(cone) = cones.get(&region) {
+                chain_points(chain, vertices)
+                    .iter()
+                    .map(|&p| {
+                        let s = cone_station(cone.carrier, p);
+                        (s, (s - cone.base_station) / cone.height)
+                    })
+                    .unzip()
+            } else {
+                continue;
+            };
+            let mean = stations.iter().sum::<f64>() / stations.len() as f64;
+            if stations.iter().any(|s| (s - mean).abs() > tolerance) {
+                continue;
+            }
+            let v = vs.iter().sum::<f64>() / vs.len() as f64;
+            arcs.entry(region).or_default().push((index, v, vs.len(), mean));
+        }
+    }
+    let mut common = HashMap::new();
+    for (_, mut list) in arcs {
+        list.sort_by(|a, b| a.3.total_cmp(&b.3));
+        let mut start = 0;
+        while start < list.len() {
+            let mut end = start + 1;
+            while end < list.len() && list[end].3 - list[end - 1].3 <= tolerance {
+                end += 1;
+            }
+            if end - start >= 2 {
+                let group = &list[start..end];
+                let weight: usize = group.iter().map(|arc| arc.2).sum();
+                let v = group.iter().map(|arc| arc.1 * arc.2 as f64).sum::<f64>() / weight as f64;
+                for arc in group {
+                    common.insert(arc.0, v);
+                }
+            }
+            start = end;
+        }
+    }
+    common
+}
+
+/// [`HybridSwitches::plane_corners`]: every chain end where only plane
+/// regions meet moves to the nearest point on all of their planes (the
+/// corner three independent planes share, the nearest point of the line two
+/// share, or the foot on one), when that move is within `tolerance`. A plane
+/// face then holds its own boundary, and a line between two planes joins
+/// points on both.
+fn place_plane_corners(vertices: &mut [Vec3], chains: &[Chain], planes: &HashMap<u32, PlaneInfo>, tolerance: f64) {
+    let mut incident = BTreeMap::<usize, BTreeSet<u32>>::new();
+    for chain in chains {
+        let ends = [chain.vertices.first(), chain.vertices.last()];
+        for &vertex in ends.into_iter().flatten() {
+            incident.entry(vertex).or_default().extend([chain.adjacent.0, chain.adjacent.1]);
+        }
+    }
+    for (vertex, regions) in incident {
+        let Some(carriers) = regions.iter().map(|region| planes.get(region)).collect::<Option<Vec<_>>>() else {
+            continue;
+        };
+        // Independent constraints n . p = n . o, kept while each adds a
+        // direction at least 0.1 (sine) off the span of those before it.
+        let mut rows: Vec<(Vec3, f64)> = Vec::new();
+        let mut span: Vec<Vec3> = Vec::new();
+        for plane in carriers {
+            let Ok(normal) = plane.normal.normalized() else { continue };
+            let residual = span.iter().fold(normal, |n, &basis| n.sub(basis.scale(n.dot(basis))));
+            if rows.len() == 3 || residual.length() < 0.1 {
+                continue;
+            }
+            span.push(residual.scale(1.0 / residual.length()));
+            rows.push((normal, normal.dot(plane.origin)));
+        }
+        if rows.is_empty() {
+            continue;
+        }
+        // p = v - N^T (N N^T)^-1 (N v - d): the nearest point satisfying
+        // every kept row.
+        let point = vertices[vertex];
+        let k = rows.len();
+        let mut gram = [[0.0_f64; 3]; 3];
+        let mut excess = [0.0_f64; 3];
+        for i in 0..k {
+            for j in 0..k {
+                gram[i][j] = rows[i].0.dot(rows[j].0);
+            }
+            excess[i] = rows[i].0.dot(point) - rows[i].1;
+        }
+        let Some(weights) = solve_small(&gram, &excess, k) else { continue };
+        let placed = (0..k).fold(point, |p, i| p.sub(rows[i].0.scale(weights[i])));
+        if placed.sub(point).length() <= tolerance {
+            vertices[vertex] = placed;
+        }
+    }
+}
+
+/// The solution of the leading `k` x `k` system `a x = b` (Gaussian
+/// elimination with partial pivoting), `None` when it is singular.
+fn solve_small(a: &[[f64; 3]; 3], b: &[f64; 3], k: usize) -> Option<[f64; 3]> {
+    let mut m = [[0.0_f64; 4]; 3];
+    for i in 0..k {
+        m[i][..k].copy_from_slice(&a[i][..k]);
+        m[i][3] = b[i];
+    }
+    for column in 0..k {
+        let pivot = (column..k).max_by(|&x, &y| m[x][column].abs().total_cmp(&m[y][column].abs()))?;
+        if m[pivot][column].abs() < 1.0e-12 {
+            return None;
+        }
+        m.swap(column, pivot);
+        for row in 0..k {
+            if row != column {
+                let factor = m[row][column] / m[column][column];
+                for c in column..4 {
+                    m[row][c] -= factor * m[column][c];
+                }
+            }
+        }
+    }
+    let mut x = [0.0_f64; 3];
+    for i in 0..k {
+        x[i] = m[i][3] / m[i][i];
+    }
+    Some(x)
 }
 
 fn station(carrier: CylinderCarrier, point: Vec3) -> f64 {
@@ -3557,6 +6593,62 @@ fn build_cylinder_surfaces(
 
 /// Cone regions that reach their apex: the region owns a mesh vertex at the
 /// carrier's apex and is bounded by exactly one closed ring away from it.
+/// [`HybridSwitches::pointed_cone_apex`]: a cone none of whose vertices
+/// lies within its radial bar of the apex moves its apex along the axis to
+/// the vertex nearest the axis, when that vertex is within the bar of it,
+/// and refits the opening to its vertices by least squares (r = s tan); the
+/// move is kept only when every vertex then lies within the bar of the
+/// cone.
+fn apex_at_vertex(
+    carriers: &mut HashMap<u32, ConeCarrier>,
+    triangle_regions: &[u32],
+    triangles: &[[usize; 3]],
+    vertices: &[Vec3],
+    tolerance: f64,
+) {
+    for (&region, cone) in carriers.iter_mut() {
+        let bar = accepted_radial_bar(tolerance * 4.0, cone.deviation);
+        let own: BTreeSet<usize> = triangle_regions
+            .iter()
+            .zip(triangles)
+            .filter(|(&owner, _)| owner == region)
+            .flat_map(|(_, triangle)| triangle.iter().copied())
+            .collect();
+        if own.iter().any(|&vertex| vertices[vertex].sub(cone.apex).length() <= bar) {
+            continue;
+        }
+        let Some(tip) = own
+            .iter()
+            .map(|&vertex| vertices[vertex])
+            .min_by(|a, b| cone_radial(*cone, *a).length().total_cmp(&cone_radial(*cone, *b).length()))
+        else {
+            continue;
+        };
+        if cone_radial(*cone, tip).length() > bar {
+            continue;
+        }
+        let apex = cone.apex.add(cone.axis.scale(cone_station(*cone, tip)));
+        let moved = ConeCarrier { apex, ..*cone };
+        let (rs, ss) = own.iter().fold((0.0, 0.0), |(rs, ss), &vertex| {
+            let s = cone_station(moved, vertices[vertex]);
+            (rs + cone_radial(moved, vertices[vertex]).length() * s, ss + s * s)
+        });
+        let half_angle = (rs / ss).atan();
+        if !(1.0e-6..std::f64::consts::FRAC_PI_2 - 1.0e-6).contains(&half_angle) {
+            continue;
+        }
+        let refit = ConeCarrier { half_angle, ..moved };
+        let holds = own.iter().all(|&vertex| {
+            let point = vertices[vertex];
+            let distance = cone_radial(refit, point).length() * half_angle.cos() - cone_station(refit, point) * half_angle.sin();
+            distance.abs() <= bar
+        });
+        if holds {
+            *cone = refit;
+        }
+    }
+}
+
 fn pointed_cone_regions(
     carriers: &HashMap<u32, ConeCarrier>,
     triangle_regions: &[u32],
@@ -3604,6 +6696,8 @@ fn build_cone_surfaces(
     chains: &[Chain],
     vertices: &[Vec3],
     tolerance: f64,
+    meridian_search: bool,
+    search_past_cylinder: bool,
 ) -> Result<HashMap<u32, ConeInfo>, (u32, String)> {
     let mut result = HashMap::new();
     for (&region, &carrier) in carriers {
@@ -3653,6 +6747,12 @@ fn build_cone_surfaces(
             };
             cylinders.get(&neighbor).map(|cylinder| cylinder.x_axis)
         });
+        // Under `gather_cone_strips` a cylinder's seam is only the first
+        // candidate (below): the cone gathered on census record
+        // occt_countersunk_hole_s10_d0.005_jitter-0.3 took its bore's seam,
+        // which ran through a two-point arc to a bore strip, and the whole
+        // cone was demoted ("crosses the chosen seam").
+        let mut from_cylinder = seam.is_some();
         for chain in &relevant {
             if chain.closed {
                 continue;
@@ -3666,6 +6766,7 @@ fn build_cone_surfaces(
                 && r0.cross(r1).length() <= tolerance * r0.length().max(r1.length())
             {
                 seam = Some(r0.normalized().map_err(|error| (region, error))?);
+                from_cylinder = false;
                 break;
             }
         }
@@ -3676,12 +6777,70 @@ fn build_cone_surfaces(
                 seam = cone_radial(carrier, vertices[ring.vertices[0]]).normalized().ok();
             }
         }
-        let x_axis = match seam {
+        let initial = match seam {
             Some(axis) => axis,
             None => carrier
                 .axis
                 .perpendicular()
                 .map_err(|error| (region, error))?,
+        };
+        // [`HybridSwitches::cone_seam`]: with no ruling or cylinder seam to
+        // follow, choose a meridian that avoids every open trim. Candidates
+        // run midway between angularly consecutive open-chain endpoints: a
+        // seam through a jittered boundary vertex starts the closed rings
+        // there, off their exact circle (a 5e-3 curve/vertex gap on census
+        // record occt_frustum_s1_d0.05_jitter-0.1).
+        let ruled_seam = seam.is_some() && !(from_cylinder && search_past_cylinder);
+        let x_axis = if !ruled_seam && !pointed && meridian_search {
+            let seam_bar = (tolerance / (TAU * (high * carrier.half_angle.tan()).max(tolerance))).max(1.0e-8);
+            let y0 = carrier.axis.cross(initial);
+            let mut ends: Vec<f64> = relevant
+                .iter()
+                .filter(|chain| !chain.closed)
+                .flat_map(|chain| [chain.vertices[0], *chain.vertices.last().unwrap()])
+                .map(|vertex| {
+                    let r = cone_radial(carrier, vertices[vertex]);
+                    r.dot(y0).atan2(r.dot(initial))
+                })
+                .collect();
+            ends.sort_by(f64::total_cmp);
+            let midways = (0..ends.len()).map(|i| {
+                let next = if i + 1 < ends.len() { ends[i + 1] } else { ends[0] + TAU };
+                let angle = 0.5 * (ends[i] + next);
+                initial.scale(angle.cos()).add(y0.scale(angle.sin()))
+            });
+            // Under `gather_cone_strips`, the open-chain ends too: a ring of
+            // two-point arcs round the whole cone (a coarse bore's strips
+            // below a gathered countersink) leaves no meridian between ends
+            // that crosses none of them, but one through a shared end does.
+            let at_ends: Vec<Vec3> = if search_past_cylinder {
+                ends.iter().map(|&angle| initial.scale(angle.cos()).add(y0.scale(angle.sin()))).collect()
+            } else {
+                Vec::new()
+            };
+            std::iter::once(initial)
+                .chain(midways)
+                .chain(at_ends)
+                .find(|&x| {
+                    let y = carrier.axis.cross(x);
+                    relevant.iter().filter(|chain| !chain.closed).all(|chain| {
+                        let mut angles = chain_points(chain, vertices)
+                            .iter()
+                            .map(|&point| {
+                                let r = cone_radial(carrier, point);
+                                r.dot(y).atan2(r.dot(x)) / TAU
+                            })
+                            .collect::<Vec<_>>();
+                        unwrap(&mut angles);
+                        let low = angles.iter().copied().fold(f64::INFINITY, f64::min);
+                        let high = angles.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                        let shift = (-low - seam_bar).ceil();
+                        low + shift >= -seam_bar && high + shift <= 1.0 + seam_bar
+                    })
+                })
+                .unwrap_or(initial)
+        } else {
+            initial
         };
         let y_axis = carrier
             .axis
@@ -4747,6 +7906,9 @@ fn build_chain_edge(
     spheres: &HashMap<u32, SphereInfo>,
     tori: &HashMap<u32, TorusInfo>,
     tolerance: f64,
+    switches: HybridSwitches,
+    common_station: &HashMap<usize, f64>,
+    moved_line_ends: &mut usize,
     arena: &mut TopologyArena,
     arena_vertices: &mut HashMap<usize, brep_kernel::VertexId>,
     ids: &mut Ids,
@@ -4779,6 +7941,15 @@ fn build_chain_edge(
         let stations = points.iter().map(|&p| info.station(p)).collect::<Vec<_>>();
         let station_spread = stations.iter().copied().fold(f64::NEG_INFINITY, f64::max)
             - stations.iter().copied().fold(f64::INFINITY, f64::min);
+        // Lane V row 2b (HybridSwitches::ring_mean_bar).
+        let station_error = if switches.ring_mean_bar
+            && matches!(info, RevolveInfoRef::Cylinder(_) | RevolveInfoRef::Cone(_))
+        {
+            let mean = stations.iter().sum::<f64>() / stations.len() as f64;
+            stations.iter().map(|station| (station - mean).abs()).fold(0.0, f64::max)
+        } else {
+            station_spread
+        };
         let radius_error = points
             .iter()
             .map(|&point| info.radial_error(point))
@@ -4828,7 +7999,7 @@ fn build_chain_edge(
                 .collect::<Vec<_>>();
             unwrap(&mut ring_us);
             let sweep = ring_us[ring_us.len() - 1] - ring_us[0];
-            if station_spread > tolerance
+            if station_error > tolerance
                 || radius_error > info.radial_bar(tolerance)
                 || (sweep.abs() - 1.0).abs() > 0.02
                 || !monotone_parameter_walk(&ring_us, 1.0e-5)
@@ -4853,7 +8024,7 @@ fn build_chain_edge(
                     end: [if sweep > 0.0 { 1.0 } else { -1.0 }, v],
                 }),
             )
-        } else if station_spread <= tolerance && radius_error <= info.radial_bar(tolerance) {
+        } else if station_error <= tolerance && radius_error <= info.radial_bar(tolerance) {
             if !monotone_parameter_walk(&us, 1.0e-5) {
                 return Err(format!(
                     "hybrid BREP: cylinder arc chain {chain_index} backtracks"
@@ -4861,7 +8032,16 @@ fn build_chain_edge(
             }
             let mut a = us[0];
             let mut b = *us.last().unwrap();
-            let seam_tolerance = info.seam_tolerance(tolerance);
+            // [`HybridSwitches::cone_seam_bar`]: a cone's arc may end within
+            // the bar its seam search allowed (tolerance over the wide end's
+            // circumference), not 1e-8.
+            let seam_tolerance = match info {
+                RevolveInfoRef::Cone(cone) if switches.cone_seam_bar => {
+                    let radius = (cone.base_station + cone.height) * cone.carrier.half_angle.tan();
+                    (tolerance / (TAU * radius.max(tolerance))).max(1.0e-8)
+                }
+                _ => info.seam_tolerance(tolerance),
+            };
             let shift = (-2..=2)
                 .map(f64::from)
                 .find(|shift| {
@@ -4895,6 +8075,11 @@ fn build_chain_edge(
                 ));
             }
             let v = coordinates.iter().map(|uv| uv[1]).sum::<f64>() / coordinates.len() as f64;
+            // [`HybridSwitches::revolve_ends_first`]: arcs of one ring share
+            // its station.
+            let own = v;
+            let v = common_station.get(&chain_index).copied().unwrap_or(v);
+            *moved_line_ends += usize::from(v != own);
             let low = a.min(b);
             let high = a.max(b);
             let curve = trim_curve(&info.surface().iso_curve_v(v)?, low, high)?;
@@ -5154,8 +8339,22 @@ fn build_chain_edge(
                 "hybrid BREP: non-cylinder chain {chain_index} is not a line"
             ));
         }
+        // [`HybridSwitches::revolve_ends_first`]: a line ends where a
+        // revolved chain already placed its end vertex.
+        let placed = |vertex: usize, mesh: Vec3| {
+            arena_vertices
+                .get(&vertex)
+                .filter(|_| switches.revolve_ends_first)
+                .and_then(|&id| arena.vertices.get(id))
+                .map_or(mesh, |placed| placed.point)
+        };
+        let (start, end) = (
+            placed(chain.vertices[0], points[0]),
+            placed(*chain.vertices.last().unwrap(), *points.last().unwrap()),
+        );
+        *moved_line_ends += usize::from(start.sub(points[0]).length() > 0.0) + usize::from(end.sub(*points.last().unwrap()).length() > 0.0);
         (
-            make_line(points[0], *points.last().unwrap())?,
+            make_line(start, end)?,
             0.0,
             1.0,
             true,

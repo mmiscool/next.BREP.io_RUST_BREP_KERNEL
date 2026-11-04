@@ -228,19 +228,10 @@ fn triangle_mesh(triangles: &[[[f64; 3]; 3]]) -> Option<Mesh> {
     (!mesh.triangles.is_empty()).then_some(mesh)
 }
 
-fn sub(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
-    [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
-}
-fn cross(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
-    [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]]
-}
-fn dot(a: [f64; 3], b: [f64; 3]) -> f64 {
-    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
-}
-fn unit(a: [f64; 3]) -> Option<[f64; 3]> {
-    let len = dot(a, a).sqrt();
-    (len > 1e-12 && len.is_finite()).then(|| [a[0] / len, a[1] / len, a[2] / len])
-}
+use crate::geometry3d::sub3 as sub;
+use crate::geometry3d::cross3 as cross;
+use crate::geometry3d::dot3 as dot;
+use crate::geometry3d::normalize3 as unit;
 
 /// The camera's right, up and forward (eye → target) unit vectors; `None`
 /// for a degenerate camera (eye on target, or up along the view).
@@ -303,42 +294,8 @@ pub fn build(bodies: &[Body], pmi: &PmiState, report: Option<&PmiReport>) -> Res
         pmi.views.iter().filter_map(|view| view.camera.as_ref().map(|camera| (view, camera))).collect();
     for (view, camera) in &cameras {
         let Some(rows) = report.and_then(|report| report.view(&view.id)) else { continue };
-        let Some((right, _, forward)) = camera_frame(camera) else { continue };
-        // Sized as the viewport sized them when the view was saved: the
-        // overlay's pixel sizes times the saved camera's world per pixel. The
-        // model units a U3D line lives in cannot stay a constant size on
-        // screen, so this is exact at the view's own framing and scales with
-        // the model when the reader zooms.
-        let wpp = world_per_pixel(camera);
-        let text_height = TEXT_PX_AT_12PT * wpp * (view.display.text_size_pt / 12.0);
-        let style = PmiLayoutStyle {
-            arrow: ARROW_PX * wpp,
-            text_height,
-            view_dir: forward,
-            view_up: camera.up,
-            plane: None,
-        };
-        for row in &rows.annotations {
-            if !drawable(row) {
-                continue;
-            }
-            // A view-aligned row is laid out in the view-parallel plane
-            // through its label, facing the camera — the STEP presentation's
-            // rule, so the two 3D exports draw the same thing.
-            let row_style = PmiLayoutStyle {
-                plane: row.plane.or(Some(PmiPlane {
-                    origin: row.label_world,
-                    normal: [-forward[0], -forward[1], -forward[2]],
-                    x_axis: right,
-                })),
-                ..style
-            };
-            let drawn = pmi_present(&row.geometry, row.label_world, &row.text, &row_style);
-            let mut polylines: Vec<Vec<[f32; 3]>> =
-                drawn.polylines.iter().chain(&drawn.frames).map(|line| line.iter().copied().map(to_f32).collect()).collect();
-            for run in &drawn.texts {
-                polylines.extend(run.strokes().into_iter().map(|stroke| stroke.into_iter().map(to_f32).collect()));
-            }
+        for (row, drawn) in view_annotations(view, camera, rows) {
+            let polylines: Vec<Vec<[f32; 3]>> = drawn.lines.iter().map(|line| line.iter().copied().map(to_f32).collect()).collect();
             let lines = line_set(&polylines);
             let fill = triangle_mesh(&drawn.arrows);
             if lines.is_none() && fill.is_none() {
@@ -394,7 +351,7 @@ pub fn build(bodies: &[Body], pmi: &PmiState, report: Option<&PmiReport>) -> Res
                 visible: owners
                     .iter()
                     .map(|owner| match owner {
-                        Owner::Solid(solid) => !view.display.hidden.iter().any(|hidden| hidden == solid),
+                        Owner::Solid(solid) => !view.hides(solid),
                         Owner::View(id) => *id == view.id,
                     })
                     .collect(),
@@ -423,6 +380,52 @@ pub fn build(bodies: &[Body], pmi: &PmiState, report: Option<&PmiReport>) -> Res
         });
     }
     Ok(Model3d { u3d, nodes, views, annotations })
+}
+
+/// One annotation laid out in world space as a 3D view draws it.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct DrawnAnnotation {
+    /// Dimension, extension and leader lines, frames, and the text stroked
+    /// with the PMI font, as open polylines.
+    pub lines: Vec<Vec<[f64; 3]>>,
+    /// The filled arrowheads, as triangles.
+    pub arrows: Vec<[[f64; 3]; 3]>,
+}
+
+/// Every drawable annotation of a saved view (`rows`, its report) laid out
+/// for a 3D model shown from `camera`: sized as the viewport sized them when
+/// the view was saved (the overlay's pixel sizes times the saved camera's
+/// world per pixel; a model-unit line cannot stay a constant size on screen,
+/// so this is exact at the view's own framing and scales with the model when
+/// the reader zooms), a view-aligned row laid out in the view-parallel plane
+/// through its label, facing the camera, as the STEP presentation lays it
+/// out. The 3D PDF and the instructions player both draw these.
+pub fn view_annotations<'a>(view: &PmiView, camera: &PmiCamera, rows: &'a brep_kernel::PmiViewReport) -> Vec<(&'a PmiAnnotationReport, DrawnAnnotation)> {
+    let Some((right, _, forward)) = camera_frame(camera) else { return Vec::new() };
+    let wpp = world_per_pixel(camera);
+    let text_height = TEXT_PX_AT_12PT * wpp * (view.display.text_size_pt / 12.0);
+    let style = PmiLayoutStyle { arrow: ARROW_PX * wpp, text_height, view_dir: forward, view_up: camera.up, plane: None };
+    let mut out = Vec::new();
+    for row in &rows.annotations {
+        if !drawable(row) {
+            continue;
+        }
+        let row_style = PmiLayoutStyle {
+            plane: row.plane.or(Some(PmiPlane { origin: row.label_world, normal: [-forward[0], -forward[1], -forward[2]], x_axis: right })),
+            ..style
+        };
+        let drawn = pmi_present(&row.geometry, row.label_world, &row.text, &row_style);
+        let mut lines: Vec<Vec<[f64; 3]>> = drawn.polylines.iter().chain(&drawn.frames).cloned().collect();
+        for run in &drawn.texts {
+            lines.extend(run.strokes());
+        }
+        lines.retain(|line| line.len() >= 2);
+        if lines.is_empty() && drawn.arrows.is_empty() {
+            continue;
+        }
+        out.push((row, DrawnAnnotation { lines, arrows: drawn.arrows }));
+    }
+    out
 }
 
 /// A solid's explode stages as a `/3DNode /M`: the matrix's three columns,
@@ -491,10 +494,10 @@ pub fn isometric_camera(bodies: &[Body]) -> PmiCamera {
 }
 
 /// A report row the 3D model draws: enabled, resolved, and not an explode
-/// (which moves solids rather than annotating them, and which the STEP
-/// presentation leaves out for the same reason).
+/// or hide step (which move or hide solids rather than annotating them, and
+/// which the STEP presentation leaves out for the same reason).
 fn drawable(row: &PmiAnnotationReport) -> bool {
-    row.enabled && row.status == PmiStatus::Ok && !matches!(row.geometry, PmiGeometry::Explode { .. })
+    row.enabled && row.status == PmiStatus::Ok && !matches!(row.geometry, PmiGeometry::Explode { .. } | PmiGeometry::Hide { .. })
 }
 
 // ---------------------------------------------------------------------------

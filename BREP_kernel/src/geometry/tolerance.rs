@@ -78,7 +78,7 @@ pub struct KernelTolerances {
 
 impl Default for KernelTolerances {
     fn default() -> Self {
-        Self::for_scale(1.0, 1e-7)
+        Self::for_scale(1.0, DEFAULT_MODEL)
     }
 }
 
@@ -218,6 +218,18 @@ impl KernelTolerances {
             .max(diagonal.abs() * PCURVE_ACCEPTANCE_REL)
     }
 }
+
+/// The default spatial identity tolerance, `KernelTolerances::default().model`
+/// (consolidation L9). The modules that hard-coded it as their own
+/// `LINEAR_TOLERANCE` (pcurve, projection, SSI) name it here; they still do not
+/// read a caller's non-default `model` (threading the policy is a separate,
+/// behaviour-changing step).
+pub(crate) const DEFAULT_MODEL: f64 = 1e-7;
+
+/// Floating-point floor (consolidation L9): guards a division, a
+/// normalisation or a Newton step against a value indistinguishable from zero.
+/// Never a modelling tolerance.
+pub(crate) const FP_FLOOR: f64 = 1e-12;
 
 /// Fraction of the model bounding-box diagonal used as the size-coupled edge/
 /// pcurve coincidence ceiling in [`KernelTolerances::pcurve_acceptance`].
@@ -729,3 +741,6 @@ pub fn vertex_tolerance_from_edges(
         .fold(0.0f64, f64::max)
 }
 
+
+/// Shared rigidity band for component and STEP placements.
+pub const RIGID_TOL: f64 = 1e-8;

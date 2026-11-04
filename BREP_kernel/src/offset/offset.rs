@@ -308,19 +308,8 @@ impl CarrierExtension {
 /// net unevenly and the cloned pcurves leave their edges.
 const EXACT_TRIM_BOX_DEFAULT: bool = true;
 
-thread_local! {
-    static EXACT_TRIM_BOX_FOR_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
-}
-
 fn exact_trim_box_on() -> bool {
-    if let Some(forced) = EXACT_TRIM_BOX_FOR_TEST.with(|forced| forced.get()) {
-        return forced;
-    }
-    match std::env::var("BREP_OFFSET_EXACT_TRIM_BOX").as_deref() {
-        Ok("0") | Ok("off") => false,
-        Ok("1") | Ok("on") => true,
-        _ => EXACT_TRIM_BOX_DEFAULT,
-    }
+    switch!(live "BREP_OFFSET_EXACT_TRIM_BOX", EXACT_TRIM_BOX_DEFAULT)
 }
 
 
@@ -511,8 +500,8 @@ fn offset_surface_measured_sided_mode(
             // The construction already read this exact source/result pair on
             // the same grid. Only the report band differs; it is not a grid
             // input. Retain the measured deviation, never substitute zero.
-            if std::env::var_os("BREP_PROFILE").is_some() {
-                eprintln!("offset.sphere_reading.profile reused=1");
+            if crate::profile::profile_enabled() {
+                profile_line!("offset.sphere_reading.profile reused=1");
             }
             Some(MeasuredTolerance::new(sphere_reading.unwrap(), band))
         }
@@ -711,15 +700,7 @@ fn revolved_arc_offset_surface(
     let (ab, ae) = (b.sub(a), e.sub(a));
     let normal = ab.cross(ae);
     let normal_length_squared = normal.dot(normal);
-    if normal_length_squared <= 1e-24 {
-        return Ok(None);
-    }
-    let centre = a.add(
-        ae.cross(normal)
-            .scale(ab.dot(ab))
-            .add(normal.cross(ab).scale(ae.dot(ae)))
-            .scale(0.5 / normal_length_squared),
-    );
+    let Some(centre) = crate::circumcenter(a, b, e) else { return Ok(None); };
     let radius = a.sub(centre).length();
     let scale = (centre.length() + radius).max(1.0);
     let band = 1e-9 * scale;
@@ -839,6 +820,136 @@ fn revolved_arc_offset_surface(
         Ok(measured) if measured.within_band() => Ok(Some(surface)),
         _ => Ok(None),
     }
+}
+
+/// Lane O row 35's switch, default on since 2026-11-02 (batch 19; `0`/`off`
+/// restores the fit): a circular cylinder's offset carrier is built exactly
+/// ([`cylinder_offset_surface`]). The carve's certificate of the same factor
+/// is row 35a's own switch (`carriers.rs`).
+pub(crate) fn exact_cylinder_offsets_on() -> bool {
+    switch!("BREP_OFFSET_EXACT_CYLINDER", true)
+}
+
+
+/// The axis, radius and offset scale factor of a recognized CIRCULAR CYLINDER
+/// offset by `distance` (`offset_surface`'s sign: positive opposite the face
+/// normal), or `None` for every other carrier and for an offset through the
+/// axis. The move is read off the shared [`OffsetEvaluator`] at the middle of
+/// the domain, as in [`sphere_offset_surface`]: it must be radial and exactly
+/// `|d|` long, so this cannot invent a sign convention.
+pub(crate) fn cylinder_offset_factor(
+    surface: &NurbsSurface,
+    same_sense: bool,
+    distance: f64,
+) -> Result<Option<(Vec3, Vec3, f64, f64)>, KernelRefusal> {
+    if std::env::var_os("BREP_NO_ANALYTIC_OFFSET").is_some() {
+        return Ok(None);
+    }
+    let Some(crate::AnalyticSurface::RuledRevolution { frame, rho0, rho1, height }) = surface.analytic() else {
+        return Ok(None);
+    };
+    let radius = 0.5 * (rho0 + rho1);
+    if !(radius > 0.0) || (rho0 - rho1).abs() > 1e-9 * radius.max(1.0) {
+        return Ok(None);
+    }
+    let Ok(axis) = frame.axis.normalized() else {
+        return Ok(None);
+    };
+    let origin = frame.origin;
+    let band = 1e-9 * (origin.length() + radius + height.abs()).max(1.0);
+    let perpendicular = |point: Vec3| {
+        let along = point.sub(origin);
+        along.sub(axis.scale(along.dot(axis)))
+    };
+    let [u0, u1] = surface.domain_u().or_refuse(KernelStage::Refine, "domain_u")?;
+    let [v0, v1] = surface.domain_v().or_refuse(KernelStage::Refine, "domain_v")?;
+    let Ok(sample) = OffsetEvaluator::new("offset_surface", surface, OffsetNormal::FaceStable { same_sense })
+        .at((u0 + u1) * 0.5, (v0 + v1) * 0.5, -distance)
+    else {
+        return Ok(None);
+    };
+    let (source_radial, offset_radial) = (perpendicular(sample.source), perpendicular(sample.point));
+    let offset_radius = offset_radial.length();
+    if (source_radial.length() - radius).abs() > band
+        || offset_radius <= band
+        || offset_radial.dot(source_radial) <= 0.0
+        || ((offset_radius - radius).abs() - distance.abs()).abs() > band
+        || sample.point.sub(sample.source).dot(axis).abs() > band
+    {
+        return Ok(None);
+    }
+    Ok(Some((origin, axis, radius, offset_radius / radius)))
+}
+
+/// Lane O row 35: the EXACT offset of a circular cylinder, or `None`.
+///
+/// A cylinder's normal is radial and constant along each ruling, so its
+/// pointwise offset is the coaxial cylinder of radius `R ± d`. Every column
+/// of the net (a rational circle) is an affine image of one polygon in a
+/// plane normal to the axis, and scaling about the axis by `(R ± d)/R` maps
+/// it to the same image of the offset circle; the rulings stay parallel to
+/// the axis. Knots, degrees and weights are untouched, so the same `(u, v)`
+/// names the corresponding point and cloned trims land where they did. The
+/// finished net must land on the pointwise offset of `reference` everywhere
+/// on the measurement grid, to `1e-9` of the model's scale; every decline
+/// falls through to the fit.
+fn cylinder_offset_surface(
+    reference: &NurbsSurface,
+    same_sense: bool,
+    distance: f64,
+) -> Result<Option<NurbsSurface>, KernelRefusal> {
+    let Some((origin, axis, radius, factor)) = cylinder_offset_factor(reference, same_sense, distance)? else {
+        return Ok(None);
+    };
+    if reference.control_points.iter().flatten().any(|control| !(control.w > 0.0)) {
+        return Ok(None);
+    }
+    let Ok(rows) = reference
+        .control_points
+        .iter()
+        .map(|row| {
+            row.iter()
+                .map(|control| {
+                    let point = control.point()?;
+                    let foot = origin.add(axis.scale(point.sub(origin).dot(axis)));
+                    Ok(Vec4::from_point(foot.add(point.sub(foot).scale(factor)), control.w))
+                })
+                .collect::<Result<Vec<_>, String>>()
+        })
+        .collect::<Result<Vec<Vec<_>>, String>>()
+    else {
+        return Ok(None);
+    };
+    let Ok(surface) = NurbsSurface::new(
+        reference.degree_u,
+        reference.degree_v,
+        reference.knots_u.clone(),
+        reference.knots_v.clone(),
+        rows,
+    ) else {
+        return Ok(None);
+    };
+    // The construction is exact once the recognizer has proved the cylinder
+    // and the evaluator has fixed the move, so this reads the finished net at
+    // 5 × 3 stations, both domain ends included, against the pointwise offset:
+    // a check of the build, not a measurement. `offset_surface_measured_*`
+    // still takes its full grid reading of this carrier, as of any fit.
+    let band = 1e-9 * (origin.length() + radius * factor.max(1.0)).max(1.0);
+    let evaluator = OffsetEvaluator::new("offset_surface", reference, OffsetNormal::FaceStable { same_sense });
+    let [u0, u1] = reference.domain_u().or_refuse(KernelStage::Refine, "domain_u")?;
+    let [v0, v1] = reference.domain_v().or_refuse(KernelStage::Refine, "domain_v")?;
+    for i in 0..=4 {
+        for j in 0..=2 {
+            let (u, v) = (u0 + (u1 - u0) * i as f64 / 4.0, v0 + (v1 - v0) * j as f64 / 2.0);
+            let (Ok(want), Ok(got)) = (evaluator.at(u, v, -distance), surface.evaluate(u, v)) else {
+                return Ok(None);
+            };
+            if !(want.point.sub(got).length() <= band) {
+                return Ok(None);
+            }
+        }
+    }
+    Ok(Some(surface))
 }
 
 pub(crate) fn offset_surface_with_lane(
@@ -1313,6 +1424,16 @@ fn offset_surface_constructed(
         }
     }
     let reference = extended_source.as_ref().unwrap_or(source);
+    // Lane O row 35 (`BREP_OFFSET_EXACT_CYLINDER`, default on): a CIRCULAR
+    // CYLINDER's offset is the coaxial cylinder, built exactly from the
+    // reference the extension above settled on (so every growth decision is
+    // the fit's own) and measured before it is kept; any decline falls through
+    // to the fit below, unchanged.
+    if !reparameterised && exact_cylinder_offsets_on() {
+        if let Some(surface) = cylinder_offset_surface(reference, face.same_sense, distance)? {
+            return Ok((surface, OffsetSurfaceLane::Analytic, extended_source));
+        }
+    }
     let weights = reference
         .control_points
         .iter()
@@ -2019,7 +2140,20 @@ fn carrier_edge_curve(
     fit_tolerance: f64,
 ) -> Result<(NurbsCurve, f64, f64), KernelRefusal> {
     // `BREP_CARRIER_POLYLINE=1` restores the polyline for an A/B comparison.
-    let image = if std::env::var("BREP_CARRIER_POLYLINE").as_deref() == Ok("1") {
+    // TRUSTED AFFINE IMAGE (lane O row 23, 2026-10-29;
+    // on by default since the batch 6 promotion, `BREP_CARRIER_AFFINE_IMAGE=0` sweeps). On an affine carrier the image
+    // is the pcurve's control net through the patch's own affine map, exact up to
+    // round-off for any degree and weights, so `image_curve`'s 25-sample sweep
+    // can only confirm it; this caller discards the deviation it measures. The
+    // image and its range are what `image_curve`'s affine tier returns.
+    if affine_image_trusted() && surface.is_affine().or_refuse(KernelStage::Refine, "is_affine")? {
+        let [q0, q1] = pcurve.domain().or_refuse(KernelStage::Refine, "domain")?;
+        if (q1 - q0).is_finite() && (q1 - q0).abs() > 0.0 {
+            let curve = crate::image_curve::affine_image_curve(surface, pcurve).or_refuse(KernelStage::Refine, "affine_image_curve")?;
+            return Ok((curve, q0, q1));
+        }
+    }
+    let image = if env_read!("BREP_CARRIER_POLYLINE").as_deref() == Some("1") {
         Err("BREP_CARRIER_POLYLINE set".to_string())
     } else {
         crate::image_curve::image_curve(surface, pcurve, fit_tolerance, "offset_face_carrier")
@@ -2039,6 +2173,86 @@ fn carrier_edge_curve(
             Ok((curve, t0, t1))
         }
     }
+}
+
+fn affine_image_trusted() -> bool {
+    switch!("BREP_CARRIER_AFFINE_IMAGE", true)
+}
+
+
+/// Avoid constructing the fallback trace when the exact image will be used.
+/// Positive, bounded control nets on well-separated knots make every skipped
+/// in-domain evaluation total. The collapse witness is an actual vertex of
+/// the old adaptive trace: its last point, or its midpoint when the first
+/// subdivision fires. Near-collapsed images and uncertified inputs stay eager.
+/// `BREP_OFFSET_LAZY_CARRIER_TRACE`; on by default since
+/// 2026-11-02 (lane O batch 21), `0`/`off` restores the eager trace.
+fn lazy_carrier_trace(
+    surface: &NurbsSurface,
+    pcurve: &NurbsCurve,
+    collapse_tolerance: f64,
+    fit_tolerance: f64,
+) -> Option<(Vec<Vec3>, (NurbsCurve, f64, f64))> {
+    if !switch!("BREP_OFFSET_LAZY_CARRIER_TRACE", true) {
+        return None;
+    }
+    // A straight image costs only the initial five samples. Do not spend
+    // certificate/ladder setup on those small traces.
+    if pcurve.degree == 1 && pcurve.control_points.len() == 2 {
+        let (a, b) = (pcurve.control_points[0], pcurve.control_points[1]);
+        if (surface.degree_u <= 1 && surface.degree_v <= 1)
+            || (a.w == b.w && a.y == b.y && surface.degree_u <= 1)
+            || (a.w == b.w && a.x == b.x && surface.degree_v <= 1)
+        {
+            return None;
+        }
+    }
+    fn knots_ok(knots: &[f64], degree: usize, count: usize) -> bool {
+        degree <= 3 && count <= 64
+            && KnotVector::new(knots.to_vec(), degree).ok().is_some_and(|k| k.control_point_count() == count)
+            && knots.iter().all(|k| k.is_finite() && k.abs() <= 1e6)
+            && knots.windows(2).all(|k| k[0] == k[1] || k[1] - k[0] >= 1e-6)
+    }
+    let bounded = |p: &Vec4| (1e-3..=1e3).contains(&p.w)
+        && [p.x, p.y, p.z].iter().all(|x| x.is_finite() && x.abs() <= 1e12);
+    let columns = surface.control_points.first()?.len();
+    if !knots_ok(&surface.knots_u, surface.degree_u, surface.control_points.len())
+        || !knots_ok(&surface.knots_v, surface.degree_v, columns)
+        || surface.control_points.iter().any(|row| row.len() != columns || row.iter().any(|p| !bounded(p)))
+        || !knots_ok(&pcurve.knots, pcurve.degree, pcurve.control_points.len())
+        || pcurve.control_points.iter().any(|p| !bounded(p))
+    {
+        return None;
+    }
+    let ([u0, u1], [v0, v1]) = (surface.domain_u().ok()?, surface.domain_v().ok()?);
+    let uv = pcurve.control_points.iter().map(|p| p.point().ok()).collect::<Option<Vec<_>>>()?;
+    if uv.iter().any(|p| p.x < u0 || p.x > u1 || p.y < v0 || p.y > v1) {
+        return None;
+    }
+    // Only the ladder's exact tiers: a fitted image is not worth speculating.
+    if !surface.is_affine().ok()? && !uv.iter().all(|p| p.x == uv[0].x) && !uv.iter().all(|p| p.y == uv[0].y) {
+        return None;
+    }
+    let [start, end] = pcurve.domain().ok()?;
+    let evaluate = |fraction: f64| {
+        let uv = pcurve.evaluate(start + (end - start) * fraction).ok()?;
+        surface.evaluate(uv.x, uv.y).ok()
+    };
+    let first = evaluate(0.0)?;
+    let last = evaluate(1.0)?;
+    let samples = [evaluate(0.25)?, evaluate(0.5)?, evaluate(0.75)?];
+    let deviation = samples.iter().enumerate().map(|(index, point)| {
+        point.sub(first.add(last.sub(first).scale((index + 1) as f64 * 0.25))).length()
+    }).fold(0.0, f64::max);
+    if last.sub(first).length() <= collapse_tolerance
+        && !(deviation > 5e-4 && samples[1].sub(first).length() > collapse_tolerance)
+    {
+        return None;
+    }
+    // Empty fallback data deliberately declines a refused image; the caller
+    // then takes the old trace and preserves its refusal and interpolation.
+    let image = carrier_edge_curve(surface, pcurve, &[], &[], fit_tolerance).ok()?;
+    Some((vec![first, samples[1], last], image))
 }
 
 fn mapped_pcurve_polyline(
@@ -2489,9 +2703,16 @@ fn offset_face_carrier_impl(
             // retrim) stay degenerate below. The threshold scales with the
             // offset distance: a real ring measures ~d·cos α, while fitted
             // pole rows wobble ~1e-4 absolute.
-            let (points, parameters) =
-                mapped_pcurve_polyline(&surface, &source_coedge.pcurve, false)?;
             let collapse_tolerance = 1e-6f64.max(distance.abs() * 1e-2);
+            let (points, parameters, exact_image) = match lazy_carrier_trace(
+                &surface, &source_coedge.pcurve, collapse_tolerance, fit_tolerance,
+            ) {
+                Some((points, image)) => (points, Vec::new(), Some(image)),
+                None => {
+                    let (points, parameters) = mapped_pcurve_polyline(&surface, &source_coedge.pcurve, false)?;
+                    (points, parameters, None)
+                }
+            };
             let image_collapsed = points
                 .iter()
                 .all(|point| point.sub(points[0]).length() <= collapse_tolerance);
@@ -2544,6 +2765,8 @@ fn offset_face_carrier_impl(
                             ],
                         ).or_refuse(KernelStage::Refine, "new")?;
                         (curve, 0.0, 1.0)
+                    } else if let Some(image) = exact_image {
+                        image
                     } else {
                         carrier_edge_curve(
                             &surface,
@@ -2646,5 +2869,7 @@ fn offset_face_carrier_impl(
         lane,
     })
 }
+
+
 
 

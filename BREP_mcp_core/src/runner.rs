@@ -23,6 +23,10 @@ pub enum Outcome {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct StepResult {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_error: Option<bool>,
     pub index: usize,
     pub tool: String,
     pub outcome: Outcome,
@@ -83,7 +87,7 @@ pub struct RunOptions {
 
 /// `__brepPerf.staleFrames` when the session's app publishes it (automation
 /// builds carry the check), else None.
-async fn stale_frames(tools: &ToolSet) -> Option<u64> {
+pub(crate) async fn stale_frames(tools: &ToolSet) -> Option<u64> {
     let get = tools.get("state_get")?;
     let out = (get.handler)(json!({ "names": ["__brepPerf"] })).await.ok()?;
     out.json.get("__brepPerf")?.get("staleFrames")?.as_u64()
@@ -111,6 +115,7 @@ pub async fn run(script: &Script, tools: &ToolSet, opts: &RunOptions) -> RunResu
     for (index, step) in script.steps.iter().enumerate() {
         if Instant::now() > deadline {
             steps.push(StepResult {
+                group: None, expected_error: None,
                 index,
                 tool: step.tool.clone(),
                 outcome: Outcome::Timeout,
@@ -164,6 +169,7 @@ pub async fn run(script: &Script, tools: &ToolSet, opts: &RunOptions) -> RunResu
             };
             if let Err(why) = recorded {
                 steps.push(StepResult {
+                    group: None, expected_error: None,
                     index,
                     tool: "annotate+screenshot".into(),
                     outcome: Outcome::ToolError,
@@ -192,6 +198,7 @@ pub async fn run(script: &Script, tools: &ToolSet, opts: &RunOptions) -> RunResu
                     // reading `result.json` about a failed filming wants.
                     steps.push(result);
                     steps.push(StepResult {
+                        group: None, expected_error: None,
                         index,
                         tool: "annotate+screenshot".into(),
                         outcome: Outcome::ToolError,
@@ -223,6 +230,7 @@ pub async fn run(script: &Script, tools: &ToolSet, opts: &RunOptions) -> RunResu
             eprintln!("stale-frame check: {} {}", script.name, after - before);
             if after > before {
                 steps.push(StepResult {
+                    group: None, expected_error: None,
                     index: script.steps.len(),
                     tool: "stale-frame check".into(),
                     outcome: Outcome::ExpectationFailed,
@@ -246,6 +254,7 @@ pub async fn run(script: &Script, tools: &ToolSet, opts: &RunOptions) -> RunResu
                 Ok(v) => video = Some(v),
                 Err(why) => {
                     steps.push(StepResult {
+                        group: None, expected_error: None,
                         index: script.steps.len(),
                         tool: "video".into(),
                         outcome: Outcome::ToolError,
@@ -451,6 +460,7 @@ async fn run_step(
 ) -> (StepResult, Vec<crate::tools::ToolImage>) {
     let started = Instant::now();
     let mut res = StepResult {
+        group: None, expected_error: None,
         index,
         tool: step.tool.clone(),
         outcome: Outcome::Pass,
@@ -570,7 +580,14 @@ async fn run_step(
     if let (Some(Value::Object(extra)), Value::Object(into)) = (extra_args, &mut args) {
         into.extend(extra);
     }
-    let output = match (spec.handler)(args).await {
+    // A step that never answers fails, naming itself, instead of hanging the
+    // whole run: its own `timeout_ms` plus two minutes, else ten minutes.
+    let limit = args.get("timeout_ms").and_then(Value::as_u64).map_or(600_000, |t| t.saturating_add(120_000));
+    let answered = match tokio::time::timeout(std::time::Duration::from_millis(limit), (spec.handler)(args)).await {
+        Ok(answered) => answered,
+        Err(_) => Err(format!("step {index} (`{}`) gave no answer within {} s", step.tool, limit / 1000)),
+    };
+    let output = match answered {
         Ok(o) => {
             if let Some(pattern) = &step.expect_error {
                 res.outcome = Outcome::ExpectationFailed;
@@ -612,27 +629,57 @@ async fn run_step(
             res.failures.push(why);
         }
     }
-    if let Some(first) = output.images.first() {
-        let name = step
-            .save
-            .clone()
-            .unwrap_or_else(|| format!("{index:04}-{}.png", step.tool));
-        let path = opts.out_dir.join(&name);
-        let _ = std::fs::write(&path, &first.png);
+    keep_image(
+        index,
+        &step.tool,
+        output.images.first().map(|i| i.png.as_slice()),
+        step.save.as_deref(),
+        step.compare.as_ref(),
+        &opts.out_dir,
+        &opts.baselines_dir,
+        opts.update_baselines,
+        &mut res,
+    );
+    if !res.failures.is_empty() {
+        res.outcome = Outcome::ExpectationFailed;
+    }
+    res.elapsed_ms = started.elapsed().as_millis();
+    (res, output.images)
+}
+
+/// A step's image: written under its `save` name (or `NNNN-<tool>.png`),
+/// and compared with its baseline when the step asks — shared by the JSON
+/// runner and script mode's step records.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn keep_image(
+    index: usize,
+    tool: &str,
+    png: Option<&[u8]>,
+    save: Option<&str>,
+    compare: Option<&crate::script::Compare>,
+    out_dir: &Path,
+    baselines_dir: &Path,
+    update_baselines: bool,
+    res: &mut StepResult,
+) {
+    if let Some(png) = png {
+        let name = save.map(str::to_string).unwrap_or_else(|| format!("{index:04}-{tool}.png"));
+        let path = out_dir.join(&name);
+        let _ = std::fs::write(&path, png);
         res.image = Some(name.clone());
-        if let Some(cmp) = &step.compare {
-            let baseline = opts.baselines_dir.join(&cmp.baseline);
-            match (image::decode_png(&first.png), std::fs::read(&baseline)) {
+        if let Some(cmp) = compare {
+            let baseline = baselines_dir.join(&cmp.baseline);
+            match (image::decode_png(png), std::fs::read(&baseline)) {
                 (Ok(actual), Ok(base_bytes)) => match image::decode_png(&base_bytes) {
                     Ok(base) => {
                         let d = image::diff(&base, &actual, 8);
                         res.diff_ratio = Some(d.ratio);
                         if d.ratio > cmp.max_diff_ratio {
-                            if opts.update_baselines {
+                            if update_baselines {
                                 let _ = std::fs::create_dir_all(baseline.parent().unwrap_or(Path::new(".")));
-                                let _ = std::fs::write(&baseline, &first.png);
+                                let _ = std::fs::write(&baseline, png);
                             } else {
-                                let _ = std::fs::write(opts.out_dir.join(format!("{name}.diff.png")), image::encode_png(&d.mask).unwrap_or_default());
+                                let _ = std::fs::write(out_dir.join(format!("{name}.diff.png")), image::encode_png(&d.mask).unwrap_or_default());
                                 res.failures.push(format!(
                                     "image differs from baseline `{}` by {:.4} (max {:.4})",
                                     cmp.baseline, d.ratio, cmp.max_diff_ratio
@@ -643,9 +690,9 @@ async fn run_step(
                     Err(e) => res.failures.push(format!("baseline `{}`: {e}", cmp.baseline)),
                 },
                 (Ok(_), Err(_)) => {
-                    if opts.update_baselines {
+                    if update_baselines {
                         let _ = std::fs::create_dir_all(baseline.parent().unwrap_or(Path::new(".")));
-                        let _ = std::fs::write(&baseline, &first.png);
+                        let _ = std::fs::write(&baseline, png);
                     } else {
                         res.failures.push(format!(
                             "no baseline `{}` (run with --update-baselines to create it)",
@@ -656,14 +703,9 @@ async fn run_step(
                 (Err(e), _) => res.failures.push(format!("step image: {e}")),
             }
         }
-    } else if step.compare.is_some() || step.save.is_some() {
-        res.failures.push(format!("step {index} asked to save/compare an image but `{}` produced none", step.tool));
+    } else if compare.is_some() || save.is_some() {
+        res.failures.push(format!("step {index} asked to save/compare an image but `{tool}` produced none"));
     }
-    if !res.failures.is_empty() {
-        res.outcome = Outcome::ExpectationFailed;
-    }
-    res.elapsed_ms = started.elapsed().as_millis();
-    (res, output.images)
 }
 
 /// The SESSION STORE for a run: `<out_dir>/store`, emptied first.
@@ -785,7 +827,7 @@ fn diff_paths(a: &Value, b: &Value, at: &str, out: &mut Vec<String>) {
     }
 }
 
-fn substitute_out(v: Value, out: &Path) -> Value {
+pub(crate) fn substitute_out(v: Value, out: &Path) -> Value {
     match v {
         Value::String(s) if s.contains("${out}") => Value::String(s.replace("${out}", &out.display().to_string())),
         Value::Array(a) => Value::Array(a.into_iter().map(|x| substitute_out(x, out)).collect()),
@@ -794,7 +836,7 @@ fn substitute_out(v: Value, out: &Path) -> Value {
     }
 }
 
-fn write_step_json(opts: &RunOptions, index: usize, tool: &str, value: &Value) {
+pub(crate) fn write_step_json(opts: &RunOptions, index: usize, tool: &str, value: &Value) {
     if let Ok(text) = serde_json::to_string_pretty(value) {
         let _ = std::fs::write(opts.out_dir.join(format!("{index:04}-{tool}.json")), text);
     }

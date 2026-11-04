@@ -250,6 +250,7 @@ impl PanelMode {
 /// The history panel's transient UI state (the model lives in the engine).
 #[derive(Default)]
 pub struct HistoryPanel {
+    rejected_edit: Option<(String, String)>,
     /// The per-frame map of egui widget screen rects, published to JS for the
     /// headed verifier. Rebuilt every frame.
     hits: HashMap<String, egui::Rect>,
@@ -612,7 +613,7 @@ impl HistoryPanel {
             state.finish_ref_select();
         }
         if out.changed {
-            let _ = state.update_feature_params(id, &params.to_string());
+            self.rejected_edit = state.update_feature_params(id, &params.to_string()).err().map(|e| (id.to_string(), e));
             // An edit elsewhere on the form while a pick runs ends the pick
             // (at the end of the frame, see `ref_select_request_finish`): the
             // model is rolled to BEFORE this feature while its field is being
@@ -622,6 +623,9 @@ impl HistoryPanel {
             if picking.is_some() {
                 state.ref_select_request_finish();
             }
+        }
+        if let Some((feature, error)) = &self.rejected_edit {
+            if feature == id { ui.colored_label(ui.visuals().error_fg_color, error); }
         }
         // A button click (e.g. `editSketch`) binds to no param — stage it as a
         // deferred action keyed by (feature id, button key); `show` acts after the

@@ -36,8 +36,13 @@ pub mod queue;
 
 #[cfg(feature = "automation")]
 mod cmd_assembly;
+mod assembly_output_schema;
+// The output-schema vocabulary (U4d); some helpers only serve automation-gated schemas.
+#[cfg_attr(not(feature = "automation"), allow(dead_code))]
+mod schema_dsl;
 #[cfg(feature = "automation")]
 mod cmd_classes;
+mod cmd_files;
 #[cfg(feature = "automation")]
 mod cmd_camera;
 #[cfg(feature = "automation")]
@@ -99,3 +104,36 @@ impl Default for AppOptions {
 
 #[cfg(feature = "automation")]
 mod cmd_plugins;
+mod plugin_output_schema;
+
+#[cfg(feature = "automation")]
+mod catalogue_output_schema;
+
+#[cfg(feature = "automation")]
+mod pmi_output_schema;
+
+#[cfg(feature = "automation")]
+mod diagnostic_output_schema;
+
+#[cfg(feature = "automation")]
+mod sheet_output_schema;
+
+#[cfg(feature = "automation")]
+mod cam_sim_output_schema;
+
+#[cfg(feature = "automation")]
+mod cam_tool_output_schema;
+
+#[cfg(feature = "automation")]
+mod cam_path_output_schema;
+
+#[cfg(feature = "automation")]
+mod cam_setup_output_schema;
+#[cfg(feature = "automation")]
+mod cam_autoprogram_output_schema;
+
+#[cfg(feature = "automation")]
+mod domain_output_schema;
+
+#[cfg(feature = "automation")]
+mod cam_state_output_schema;

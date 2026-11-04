@@ -42,7 +42,7 @@ use crate::{
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 pub(super) fn fit_census_enabled() -> bool {
-    std::env::var_os("BREP_FIT_CENSUS").is_some()
+    debug_flag!(live "BREP_FIT_CENSUS")
 }
 
 /// The running thread's name, which is the test's name under the test

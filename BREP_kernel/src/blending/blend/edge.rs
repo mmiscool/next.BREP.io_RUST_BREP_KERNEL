@@ -27,7 +27,7 @@ pub(crate) use support::{
 };
 pub(super) use support::BLEND_WIDER_THAN_FACE;
 pub(super) use support::check_snap_closure;
-pub(super) use open::{build_open_surgery, fresh_id_source, prune_orphan_vertices};
+pub(super) use open::{build_open_surgery, build_open_surgery_with_tail, fresh_id_source, prune_orphan_vertices};
 pub(super) use open::{
     acceptance_deficit, exact_extrusion_wall_readings, junction_stencil, open_wall_readings_why, read_on_stencil, rails_on_shipped_windows, shipped_window, OpenRungReading, OPEN_REQUEST_RUNGS,
     OPEN_WALL_CENTRES,

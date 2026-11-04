@@ -16,7 +16,7 @@ pub fn box_brep_json(
         size_z,
     )
     .map_err(javascript_error)?;
-    serde_json::to_string(&solid).map_err(|error| javascript_error(error.to_string()))
+    json_out(&solid)
 }
 
 #[wasm_bindgen]
@@ -35,7 +35,7 @@ pub fn pyramid_brep_json(
         sides as usize,
     )
     .map_err(javascript_error)?;
-    serde_json::to_string(&solid).map_err(|error| javascript_error(error.to_string()))
+    json_out(&solid)
 }
 
 #[wasm_bindgen]
@@ -56,7 +56,7 @@ pub fn cylinder_brep_json(
         height,
     )
     .map_err(javascript_error)?;
-    serde_json::to_string(&solid).map_err(|error| javascript_error(error.to_string()))
+    json_out(&solid)
 }
 
 #[wasm_bindgen]
@@ -69,14 +69,14 @@ pub fn cone_brep_json(radius_bottom: f64, radius_top: f64, height: f64) -> Resul
         height,
     )
     .map_err(javascript_error)?;
-    serde_json::to_string(&solid).map_err(|error| javascript_error(error.to_string()))
+    json_out(&solid)
 }
 
 #[wasm_bindgen]
 pub fn sphere_brep_json(radius: f64) -> Result<String, JsValue> {
     let solid = make_sphere_brep(Vec3::default(), radius, Vec3::new(0.0, 1.0, 0.0))
         .map_err(javascript_error)?;
-    serde_json::to_string(&solid).map_err(|error| javascript_error(error.to_string()))
+    json_out(&solid)
 }
 
 /// Import an ISO-10303-21 (STEP Part 21) document and return the reconstructed
@@ -85,7 +85,7 @@ pub fn sphere_brep_json(radius: f64) -> Result<String, JsValue> {
 #[wasm_bindgen]
 pub fn import_step_json(step_text: &str) -> Result<String, JsValue> {
     let solids = import_step(step_text).map_err(javascript_error)?;
-    serde_json::to_string(&solids).map_err(|error| javascript_error(error.to_string()))
+    json_out(&solids)
 }
 
 #[wasm_bindgen]
@@ -97,5 +97,5 @@ pub fn torus_brep_json(major_radius: f64, minor_radius: f64) -> Result<String, J
         minor_radius,
     )
     .map_err(javascript_error)?;
-    serde_json::to_string(&solid).map_err(|error| javascript_error(error.to_string()))
+    json_out(&solid)
 }

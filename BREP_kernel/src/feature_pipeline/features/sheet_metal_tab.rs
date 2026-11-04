@@ -118,10 +118,12 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, String> {
             holes,
             hole_bends: Vec::new(),
             outline_curves,
+            end_cuts: Vec::new(),
         },
         default_inside_radius: bend_radius,
         default_k_factor: k_factor,
         root_transform,
+        name_suffixes: Vec::new(),
     };
 
     let added = sheet_metal::register_folded(tree, &ctx.id)?;
@@ -202,7 +204,7 @@ fn sampled_loop_area(curves: &[NurbsCurve]) -> Result<f64, String> {
     for i in 0..points.len() {
         let a = points[i];
         let b = points[(i + 1) % points.len()];
-        area2 += a[0] * b[1] - b[0] * a[1];
+        area2 += crate::polygon::area_term(a, b);
     }
     Ok(area2 * 0.5)
 }

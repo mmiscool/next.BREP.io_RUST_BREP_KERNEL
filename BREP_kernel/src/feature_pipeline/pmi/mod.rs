@@ -9,9 +9,13 @@
 //! on the history request, round-tripped through the saved document and
 //! ABSENT on every document without PMI (so those files re-serialize
 //! byte-identically). A **view** is a named camera snapshot plus display
-//! state (text size, wireframe, hidden object names) plus an ordered list of
-//! annotations; a saved view maps to an AP242 `DRAUGHTING_MODEL` +
-//! `CAMERA_MODEL_D3` on export and is the unit a future drawing sheet places.
+//! state (text size, wireframe, the object names hidden at capture) plus an
+//! ordered list of annotations; a saved view maps to an AP242
+//! `DRAUGHTING_MODEL` + `CAMERA_MODEL_D3` on export and is the unit a future
+//! drawing sheet places. What a view hides is the union of that captured
+//! baseline and its **hide steps** (`hide` annotations naming solids /
+//! components, tracked like explode steps): [`PmiView::hides`] is the one
+//! rule every consumer reads, and the report lists the outcome per view.
 //!
 //! An **annotation** is `{ type, enabled, inputParams, labelWorld? }`: its
 //! params follow a kernel schema exactly like a feature's or an assembly
@@ -166,8 +170,10 @@ pub struct PmiDisplay {
     pub text_size_pt: f64,
     #[serde(default)]
     pub wireframe: bool,
-    /// Scene object NAMES hidden in this view (resolved to runtime visibility
-    /// on apply; a name that no longer exists is ignored).
+    /// Scene object NAMES hidden in this view at capture (the baseline the
+    /// instructions wizard also writes); a name that no longer exists is
+    /// ignored. The view's `hide` annotations add to it: read
+    /// [`PmiView::hides`], never this list alone.
     #[serde(default)]
     pub hidden: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -232,15 +238,22 @@ impl PmiSectionPlane {
         }
     }
 }
+/// Whether a SOLID / COMPONENT list entry names `solid`: the solid itself,
+/// or a component it belongs to (`ACOMP1` covers `ACOMP1:Part` and a nested
+/// `ACOMP1:ACOMP2:Part`; a prefix of a longer name, `ACOMP1` for
+/// `ACOMP10:Part`, is not the name). The rule a section's **Not cut** list
+/// and a view's hide steps share.
+pub fn entry_names_solid(entry: &str, solid: &str) -> bool {
+    let entry = entry.trim();
+    !entry.is_empty() && (solid == entry || solid.strip_prefix(entry).is_some_and(|rest| rest.starts_with(':')))
+}
+
 impl PmiSection {
     /// Whether the solid named `solid` is left uncut: it is listed, or it
     /// belongs to a listed component (`ACOMP1` covers `ACOMP1:Part` and a
     /// nested `ACOMP1:ACOMP2:Part`).
     pub fn excludes(&self, solid: &str) -> bool {
-        self.exclude.iter().any(|entry| {
-            let entry = entry.trim();
-            !entry.is_empty() && (solid == entry || solid.strip_prefix(entry).is_some_and(|rest| rest.starts_with(':')))
-        })
+        self.exclude.iter().any(|entry| entry_names_solid(entry, solid))
     }
 
     /// The unflipped normal: the axis's, else (`View`) the frozen one, else
@@ -332,6 +345,33 @@ impl PmiView {
             planes.push((point, normal));
         }
         planes
+    }
+}
+
+impl PmiView {
+    /// Whether this view hides the solid named `solid`: it is in the
+    /// captured baseline (`display.hidden`), or an ENABLED hide step names it
+    /// or a component it belongs to ([`entry_names_solid`]). Names only, no
+    /// run needed: the viewport applies it the moment a step is added,
+    /// edited, removed or undone, and the sheets, the 3D PDF and the
+    /// instructions pictures read the same answer.
+    pub fn hides(&self, solid: &str) -> bool {
+        self.display.hidden.iter().any(|name| name == solid)
+            || self.hide_targets().any(|entry| entry_names_solid(entry, solid))
+    }
+
+    /// Every target of the view's enabled hide steps, in step order.
+    pub fn hide_targets(&self) -> impl Iterator<Item = &str> {
+        self.annotations
+            .iter()
+            .filter(|annotation| annotation.enabled && annotation.kind == annotations::hide::DEF.type_id)
+            .flat_map(|annotation| match annotation.params.get("targets") {
+                Some(Value::String(name)) => std::slice::from_ref(name).iter().map(String::as_str).collect::<Vec<_>>(),
+                Some(Value::Array(items)) => items.iter().filter_map(Value::as_str).collect(),
+                _ => Vec::new(),
+            })
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
     }
 }
 
@@ -622,6 +662,11 @@ pub struct PmiViewReport {
     /// Why a `Plane` section's reference did not resolve (no cut is shown).
     #[serde(default, rename = "sectionError", skip_serializing_if = "String::is_empty")]
     pub section_error: String,
+    /// The scene solids the view hides ([`PmiView::hides`] over this run's
+    /// scene: the captured baseline plus its enabled hide steps), sorted.
+    /// Absent when it hides nothing.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hidden: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -763,6 +808,11 @@ pub enum PmiGeometry {
     Hole {
         anchor: [f64; 3],
         normal: [f64; 3],
+    },
+    /// Display-only: keep `solids` out of the view while it is active. Draws
+    /// nothing (no chip, no text, no line).
+    Hide {
+        solids: Vec<String>,
     },
     /// Display-only: pose `solids` by the delta while the view is active.
     Explode {
@@ -986,9 +1036,12 @@ pub fn resolve_state(
                     let section = view.display.section.as_ref();
                     section.is_some_and(|section| reference_solid(scene, reference).is_some_and(|solid| section.excludes(&solid)))
                 };
+                let mut hidden: Vec<String> = scene.solids.keys().filter(|name| view.hides(name)).cloned().collect();
+                hidden.sort();
                 PmiViewReport {
                     section_plane: view.display.section.as_ref().filter(|s| s.axis == "Plane").and_then(|_| view.section_plane()),
                     section_error: section_errors.remove(&view.id).unwrap_or_default(),
+                    hidden,
                     id: view.id.clone(),
                     annotations: view
                         .annotations

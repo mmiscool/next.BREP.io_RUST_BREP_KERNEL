@@ -299,13 +299,8 @@ impl SimulationPanel {
         ui.strong("Export");
         ui.horizontal_wrapped(|ui| {
             let mut format = self.export_format.clone();
-            let combo = egui::ComboBox::from_id_salt("simulation-export-format").selected_text(format.to_uppercase()).show_ui(ui, |ui| {
-                for kind in ["gif", "mp4", "html"] {
-                    let option = ui.selectable_value(&mut format, kind.to_string(), kind.to_uppercase());
-                    self.hits.insert(format!("simulation:menuitem:export_format:{kind}"), option.rect);
-                }
-            });
-            self.hits.insert("simulation:export:format".into(), combo.response.rect);
+            let choices = [("gif".to_string(), "gif", "GIF"), ("mp4".to_string(), "mp4", "MP4"), ("html".to_string(), "html", "HTML")];
+            crate::form::enum_dropdown(ui, "simulation:export:format", &choices, &mut format, None, Some(&mut self.hits));
             if format != self.export_format {
                 // A default path follows the format's extension.
                 if self.export_path.ends_with(&format!(".{}", self.export_format)) {
@@ -718,9 +713,9 @@ impl SimulationPanel {
 fn clip_label(clip: &Clip) -> String {
     match &clip.body {
         ClipBody::Suppress { constraint } => format!("Suppress {constraint}"),
-        ClipBody::Camera { views } => format!("Camera ({} views)", views.len()),
-        ClipBody::Visibility { occurrences } => format!("Hide ({} parts)", occurrences.len()),
-        ClipBody::Transparency { occurrences, .. } => format!("Transparency ({} parts)", occurrences.len()),
+        ClipBody::Camera { views } => format!("Camera ({})", crate::panels::count(views.len(), "view", "views")),
+        ClipBody::Visibility { occurrences } => format!("Hide ({})", crate::panels::count(occurrences.len(), "part", "parts")),
+        ClipBody::Transparency { occurrences, .. } => format!("Transparency ({})", crate::panels::count(occurrences.len(), "part", "parts")),
         ClipBody::Section { view, .. } => format!("Section {view}"),
         ClipBody::Explode { collapse, .. } => if *collapse { "Collapse".to_string() } else { "Explode".to_string() },
     }
@@ -762,7 +757,7 @@ pub static HIT_KEYS: &[HitKeyDoc] = &[
     HitKeyDoc { panel: "simulation", prefix: "simulation:item:", meaning: "the open motor's or clip's form (the app's schema-driven dialog): form:feature (the title), form:return (back to the rows), field:<key> (a motor: constraint, from, to, mode, speed, shape, start, end, accel; a clip: from, to, and by kind constraint | occurrences | opacityFrom, opacityTo | view1..view4 | view, sweepEnabled, sweepFrom, sweepTo | view, collapse), field:<key>#<variant> (an open option menu's entries), field:occurrences#activate (Select, or Done while the pick runs), #line<i> and #x<i> (a picked part and its remove)", command: Some("simulation_update") },
     HitKeyDoc { panel: "simulation", prefix: "simulation:publish", meaning: "Publish (or Publish again): bake the study to the end and write its motion into the assembly's simulation block, for a manufacturing-instructions step to attach", command: Some("simulation_publish") },
     HitKeyDoc { panel: "simulation", prefix: "simulation:export:", meaning: "the Export row: format (GIF | MP4 | HTML), width, height, fps, the file path and run (a video renders every baked frame at that size; HTML writes the interactive player page)", command: Some("simulation_export") },
-    HitKeyDoc { panel: "simulation", prefix: "simulation:menuitem:export_format:", meaning: "the export format menu's entries (gif, mp4, html)", command: Some("simulation_export") },
+    HitKeyDoc { panel: "simulation", prefix: "simulation:export:format#", meaning: "the export format dropdown's entries while open (#gif, #mp4, #html)", command: Some("simulation_export") },
 ];
 
 /// `__brepSimulation`: the engine's simulation state and the pane's.

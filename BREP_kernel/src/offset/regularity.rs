@@ -73,7 +73,7 @@ use crate::{NurbsCurve, NurbsSurface};
 /// reads — this module answers for both callers, so it cannot borrow either
 /// one's macro.
 fn debug_enabled() -> bool {
-    std::env::var("BREP_OS_DEBUG").is_ok_and(|value| !value.is_empty() && value != "0")
+    env_read!("BREP_OS_DEBUG").is_some_and(|value| !value.is_empty() && value != "0")
 }
 
 /// The worst sample a scan saw: the fold factor, where it is, and the
@@ -428,18 +428,7 @@ impl TrimRegion {
         }
         let mut inside = false;
         for polyline in &self.loops {
-            let count = polyline.len();
-            let mut previous = count - 1;
-            for current in 0..count {
-                let (a, b) = (polyline[previous], polyline[current]);
-                if (a[1] > v) != (b[1] > v) {
-                    let t = (v - a[1]) / (b[1] - a[1]);
-                    if u < a[0] + t * (b[0] - a[0]) {
-                        inside = !inside;
-                    }
-                }
-                previous = current;
-            }
+            inside ^= crate::polygon::parity_inside([u, v], polyline.len(), |i| polyline[i]);
         }
         inside
     }

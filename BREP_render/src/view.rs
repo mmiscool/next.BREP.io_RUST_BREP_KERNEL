@@ -568,6 +568,11 @@ impl ViewCamera {
 
     /// Serialize the full camera state (R3: the host holds plain JSON only).
     pub fn state_json(&self) -> String {
+        self.state_value().to_string()
+    }
+
+    /// [`Self::state_json`] as a JSON value.
+    pub fn state_value(&self) -> serde_json::Value {
         let (kind, scale) = match self.projection {
             Projection::Orthographic { half_height } => ("orthographic", half_height),
             Projection::Perspective { fov_y_deg } => ("perspective", fov_y_deg),
@@ -585,7 +590,6 @@ impl ViewCamera {
             "height": self.height,
             "worldPerPixel": self.world_per_pixel(),
         })
-        .to_string()
     }
 
     /// Restore from [`ViewCamera::state_json`] output (viewport size is NOT
@@ -651,3 +655,11 @@ impl brep_gizmos::hit_region::RegionCamera for ViewCamera {
     }
 }
 
+
+/// Multiply column-major f32 display poses.
+pub(crate) fn mat4_mul_column_major(a: &[f32; 16], b: &[f32; 16]) -> [f32; 16] {
+    std::array::from_fn(|k| {
+        let (col, row) = (k / 4, k % 4);
+        (0..4).map(|n| a[n * 4 + row] * b[col * 4 + n]).sum()
+    })
+}

@@ -4,7 +4,7 @@
 //! is refused, with nothing written, when the block would not validate. An
 //! edit that changes which step adds what also brings the step views up to
 //! date (hidden parts, balloons), keeping each step's camera.
-use crate::automation::command::{parse_args, schema_of, Annotations, CommandSpec, Ctx, Empty, Handler, NoArgs, Outcome, Phase};
+use crate::automation::command::{app_command, parse_args, schema_of, CommandSpec, Ctx, NoArgs, Outcome};
 use brep_instructions::edit;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -348,18 +348,33 @@ pub struct ExportArgs {
 }
 
 fn instructions_export(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
-    use crate::automation::cmd_document::base64_encode;
     let a: ExportArgs = parse_args(args)?;
+    // The drawn formats need the exact solids. They are ASKED for here and
+    // the export finishes on the frame they have all landed — the frame never
+    // waits for the runner; a reply that has not come within the engine's
+    // wait is said rather than drawn around.
+    if matches!(a.format.as_str(), "pdf" | "svg" | "images") && !ctx.app.docs.engine_mut().instructions_request_topology() {
+        let deadline = web_time::Instant::now() + brep_render::engine_state::TOPOLOGY_WAIT;
+        return Ok(Outcome::Poll(Box::new(move |ctx: &mut Ctx<'_>| {
+            if !ctx.app.docs.engine().topology_pending() {
+                Some(export_now(ctx, &a))
+            } else if web_time::Instant::now() >= deadline {
+                Some(Err(format!(
+                    "the exact geometry is still loading after {} s: wait_idle, then export again",
+                    brep_render::engine_state::TOPOLOGY_WAIT.as_secs()
+                )))
+            } else {
+                None
+            }
+        })));
+    }
+    export_now(ctx, &a)
+}
+
+fn export_now(ctx: &mut Ctx<'_>, a: &ExportArgs) -> Result<Outcome, String> {
+    use crate::automation::cmd_document::base64_encode;
     let engine = ctx.app.docs.engine_mut();
     let step = || a.step.clone().ok_or_else(|| format!("format {}: name the `step`", a.format));
-    // The drawn formats wait for the exact solids; a reply that has not come
-    // within the engine's wait is said rather than drawn around.
-    if matches!(a.format.as_str(), "pdf" | "svg" | "images") && !engine.instructions_topology_ready() {
-        return Err(format!(
-            "the exact geometry is still loading after {} s: wait_idle, then export again",
-            brep_render::engine_state::TOPOLOGY_WAIT.as_secs()
-        ));
-    }
     let out = match a.format.as_str() {
         "pdf" => {
             let (pdf, pages) = engine.instructions_pdf()?;
@@ -410,38 +425,145 @@ fn instructions_export(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String
                 .map(|step| {
                     json!({ "id": step.id, "number": step.number, "parent": step.parent, "depth": step.depth, "title": step.title, "placed": step.placed.len(), "adding": step.adding.len(),
                             "insertion": step.insertion.len(), "camera": step.camera.is_some(), "image": step.image.is_some(),
-                            "thumbnails": step.adds.iter().filter(|add| add.thumbnail.is_some()).count() })
+                            "thumbnails": step.adds.iter().filter(|add| add.thumbnail.is_some()).count(),
+                            "pmi": step.pmi.as_ref().map_or(0, |pmi| pmi.annotations) })
                 })
                 .collect();
             json!({ "format": "html", "mode": mode.as_str(), "bytes": html.len(), "title": data.title, "meshes": data.meshes.len(),
                     "toolPictures": inlined, "toolPicturesPending": pending, "toolPicturesMissing": ids.len().saturating_sub(inlined + pending),
                     "edges": data.meshes.iter().filter(|mesh| !mesh.edges.is_empty()).count(),
-                    "nodes": data.nodes.len(), "steps": steps, "selfContained": !html.contains("{{") && !html.contains("://") })
+                    "nodes": data.nodes.len(), "steps": steps,
+                    "assembly": data.assembly.len(), "assemblyThumbnails": data.assembly.iter().filter(|row| row.thumbnail.is_some()).count(),
+                    "selfContained": !html.contains("{{") && !html.contains("://") })
         }
         other => return Err(format!("format '{other}': pdf, png, svg, images or html")),
     };
     Ok(Outcome::Done(out))
 }
 
+// The nineteen state/edit replies share the engine's state serializer.
+// Keep its recursive authored DTO definitions at the result root so local
+// references remain valid in both native metadata and MCP composition.
+fn instructions_object(properties: Value) -> Value {
+    let required: Vec<_> = properties.as_object().unwrap().keys().cloned().collect();
+    json!({"type":"object","properties":properties,"required":required})
+}
+
+fn instructions_derived<T: schemars::JsonSchema>(defs: &mut Value) -> Value {
+    let mut schema = schema_of::<T>();
+    let root = schema.as_object_mut().unwrap();
+    root.remove("$schema");
+    if let Some(Value::Object(nested)) = root.remove("$defs") {
+        for (name, definition) in nested {
+            if let Some(existing) = defs.get(&name) { assert_eq!(existing, &definition); }
+            defs[&name] = definition;
+        }
+    }
+    schema
+}
+
+fn instructions_result_schema() -> Value {
+    let mut defs = json!({});
+    let block = instructions_derived::<brep_instructions::Instructions>(&mut defs);
+    let strings = json!({"type":"array","items":{"type":"string"}});
+    let populated = instructions_object(json!({
+        "instructions":block,"steps":{"type":"integer","minimum":0},
+        "wizardPending":{"type":"boolean"},"viewsPending":{"type":"boolean"},
+        "shownStep":{"type":["string","null"]},"ghosted":strings,
+        "insertion":{"type":["number","null"]},"emptySteps":strings,
+        "unplanned":{"type":"array","items":instructions_object(json!({"occurrence":{"type":"string"},"part":{"type":"string"}}))},
+        "wrapper":{"anyOf":[{"type":"null"},instructions_object(json!({"id":{"type":"string"},"part":{"type":"string"}}))]}
+    }));
+    // A parse error is returned as a successful state snapshot with an error
+    // string; an ordinary non-instructions document omits that field.
+    let absent = json!({"type":"object","properties":{"instructions":{"type":"null"},"error":{"type":"string"}},"required":["instructions"]});
+    json!({"type":"object","oneOf":[absent,populated],"$defs":defs})
+}
+
+fn instructions_extended(properties: Value) -> Value {
+    let mut result = instructions_result_schema();
+    for branch in result["oneOf"].as_array_mut().unwrap() {
+        for (name,schema) in properties.as_object().unwrap() {
+            branch["properties"][name] = schema.clone();
+            branch["required"].as_array_mut().unwrap().push(json!(name));
+        }
+    }
+    result
+}
+fn instructions_new_result_schema() -> Value {
+    instructions_extended(json!({"index":{"type":"integer","minimum":0}}))
+}
+fn instructions_step_result_schema() -> Value {
+    instructions_extended(json!({"step":{"type":"string"}}))
+}
+fn instructions_play_result_schema() -> Value {
+    instructions_extended(json!({"mode":{"enum":["shop","customer"]}}))
+}
+fn instructions_add_parts_result_schema() -> Value {
+    let mut defs = json!({});
+    let left = instructions_derived::<Option<Vec<edit::LeftOccurrence>>>(&mut defs);
+    let mut result = instructions_extended(json!({"added":{"type":"integer","minimum":0},"left":left}));
+    for (name, definition) in defs.as_object().unwrap() {
+        if let Some(existing) = result["$defs"].get(name) { assert_eq!(existing, definition); }
+        result["$defs"][name] = definition.clone();
+    }
+    result
+}
+
+fn instructions_export_result_schema() -> Value {
+    let count = json!({"type":"integer","minimum":0});
+    let string = json!({"type":"string"});
+    let strings = json!({"type":"array","items":string});
+    let hidden_line = json!({"type":["string","null"]});
+    let pdf = instructions_object(json!({
+        "format":{"const":"pdf"},"bytes":count,"base64":string,"pages":count,
+        "hiddenLine":hidden_line,"texts":strings
+    }));
+    let png = instructions_object(json!({
+        "format":{"const":"png"},"step":string,"bytes":count,"base64":string,
+        "width":{"type":"integer","minimum":16,"maximum":4096},
+        "height":{"type":"integer","minimum":16,"maximum":4096}
+    }));
+    let svg = instructions_object(json!({
+        "format":{"const":"svg"},"step":string,"bytes":count,"hiddenLine":hidden_line,
+        "texts":strings,"text":string
+    }));
+    let images = instructions_object(json!({
+        "format":{"const":"images"},"bytes":count,"base64":string,
+        "files":{"type":"array","items":instructions_object(json!({"name":string,"bytes":count}))}
+    }));
+    let html = instructions_object(json!({
+        "format":{"const":"html"},"mode":{"enum":["shop","customer"]},"bytes":count,
+        "title":string,"meshes":count,"toolPictures":count,"toolPicturesPending":count,
+        "toolPicturesMissing":count,"edges":count,"nodes":count,"selfContained":{"type":"boolean"},
+        "steps":{"type":"array","items":instructions_object(json!({
+            "id":string,"number":count,"parent":{"type":["string","null"]},"depth":count,
+            "title":string,"placed":count,"adding":count,"insertion":count,
+            "camera":{"type":"boolean"},"image":{"type":"boolean"},"thumbnails":count
+        }))}
+    }));
+    json!({"type":"object","oneOf":[pdf,png,svg,images,html]})
+}
+
 pub static COMMANDS: &[CommandSpec] = &[
-    CommandSpec { name: "instructions_state", group: "instructions", doc: "The active document's manufacturing instructions: `instructions` (the block: target assembly revision, template, front matter, the step tree `steps` where each step holds its child `steps` with their adds, view, tools, torque, callouts, arrows, notes, sign-off; a pending `retarget`), `steps` (the count), `shownStep` (the step whose view is active), `ghosted` (the parts drawn as ghosts), `insertion` (the player's insertion fraction while the step's parts move home, else null), `emptySteps`, `unplanned` (the assembly's parts in no step: occurrence and part) and `wrapper` (the component placing the assembly). `instructions: null` on any other document.", phase: Phase::Read, annotations: Annotations::READ, args_schema: schema_of::<NoArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(instructions_state) },
-    CommandSpec { name: "instructions_new", group: "instructions", doc: "Open a new tab holding manufacturing instructions for an assembly: `from` a store key, else the active (saved) document. The assembly is placed as one grounded component and its key is the instructions' target. With `wizard` (default true) the wizard proposes the step tree: a sub-assembly is one step whose children build it (read before it), then mate order (or an exploded view's reverse order), fasteners last, each step with its own view; it runs once the assembly is built, so `wizardPending` may be true in the reply (wait_idle, then instructions_state). Returns the `instructions_state` plus the tab `index`. Refused for a part, an unsaved document or instructions.", phase: Phase::Mutate, annotations: Annotations::MUTATE, args_schema: schema_of::<NewArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(instructions_new) },
-    CommandSpec { name: "instructions_wizard", group: "instructions", doc: "Rerun the wizard on the instructions' assembly: the step tree is replaced (the target, template and front matter stay) and the old steps' views are removed. One undo step. Returns the `instructions_state`.", phase: Phase::Mutate, annotations: Annotations::MUTATE, args_schema: schema_of::<NoArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(instructions_wizard) },
-    CommandSpec { name: "instructions_retarget_approve", group: "instructions", doc: "Approve the pending re-target (`instructions.retarget` in the state). When Update components (component_update) or a linked tab brings the instructions a new state of their assembly, the wizard reruns on the changed parts only, in the same undo step: an added part gets a step after its mated neighbour's, a removed one leaves its step, a replaced one takes its new part, and the change is listed (added, removed, replaced, touchedSteps, emptySteps) until approved. Approving makes the new revision the target and deletes the steps it left empty. Refused when none waits; a further update is refused until it is approved. One undo step. Returns the `instructions_state`.", phase: Phase::Mutate, annotations: Annotations::MUTATE, args_schema: schema_of::<NoArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(instructions_retarget_approve) },
-    CommandSpec { name: "instructions_retarget_reject", group: "instructions", doc: "Reject the pending re-target (`instructions.retarget` in the state): the one undo that takes the new revision of the assembly and its re-target back together, as Undo does, so the instructions keep describing the revision they did. Refused when none waits, when the re-target came in with the file (nothing in this session takes it back: approve it, or update again later), and when edits followed it (they would be undone too: undo them first, or approve). Leaves a redo step, as the undo would. Returns the `instructions_state`.", phase: Phase::Mutate, annotations: Annotations::MUTATE, args_schema: schema_of::<NoArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(instructions_retarget_reject) },
-    CommandSpec { name: "instructions_show_step", group: "instructions", doc: "Show a step's view: its camera, the parts not placed yet hidden, and the balloons on the parts it adds. Refused for a step without a view.", phase: Phase::Mutate, annotations: Annotations::MUTATE, args_schema: schema_of::<StepArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(instructions_show_step) },
-    CommandSpec { name: "instructions_update_step", group: "instructions", doc: "Set a step's fields from `patch` (title, notes, view, tools, torque, callouts, arrows, signoff, motion). Unknown fields and invalid values are refused with nothing written; parts move only through merge, split and instructions_move_add.", phase: Phase::Mutate, annotations: Annotations::MUTATE, args_schema: schema_of::<UpdateStepArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(instructions_update_step) },
-    CommandSpec { name: "instructions_merge", group: "instructions", doc: "Merge two or more sibling steps (steps under one parent) into the first of them in their order (it keeps its place; parts, tools, callouts, arrows and child steps are appended, notes joined; parts of one BOM row become one row with the quantity). Returns the state plus the kept `step`.", phase: Phase::Mutate, annotations: Annotations::MUTATE, args_schema: schema_of::<MergeArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(instructions_merge) },
-    CommandSpec { name: "instructions_split", group: "instructions", doc: "Split the parts at `adds` (indices) out of a step into a new step right after it, with the arrows and callouts that point at them. At least one part must stay. Returns the state plus the new `step`.", phase: Phase::Mutate, annotations: Annotations::MUTATE, args_schema: schema_of::<SplitArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(instructions_split) },
-    CommandSpec { name: "instructions_capture_camera", group: "instructions", doc: "Capture the viewport's camera as a step's view camera (point the camera first with `camera_set` / `standard_view`, or orbit the shown step). It is the author's from then on: every edit keeps it, until instructions_reset_view; `cameraCaptured` on the step says so. The PMI workbench's Update camera on a step's view does the same. One undo step. Returns the state.", phase: Phase::Mutate, annotations: Annotations::MUTATE, args_schema: schema_of::<StepArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(instructions_capture_camera) },
-    CommandSpec { name: "instructions_reset_view", group: "instructions", doc: "Drop a step's captured camera: its view's camera is generated again, framing everything the step shows (the parts it adds, its children's included, and the ghosts placed before it) from its parent step's camera direction, or the isometric (orthographic) at the top level, fitted in a fixed 1280×800 viewport so it is the same from any window. One undo step. Returns the state.", phase: Phase::Mutate, annotations: Annotations::MUTATE, args_schema: schema_of::<StepArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(instructions_reset_view) },
-    CommandSpec { name: "instructions_add_parts", group: "instructions", doc: "A BOM row dragged into a step: add `occurrences` of the assembly (or every occurrence of `part` at the assembly's top level, what a packed BOM row stands for) to `step`. An occurrence already in a step, or inside a sub-assembly another step places, is left where it is and reported in `left` (with that step), unless `step` is inside that sub-assembly's group; `added` counts the rest. One BOM row per part, a fastener bringing its torque when the step has none. An occurrence the assembly lacks or a missing step is refused with nothing written. The step views follow in the same undo step. Returns the state plus `added` and `left`; `unplanned` in the state lists the assembly's parts in no step.", phase: Phase::Mutate, annotations: Annotations::MUTATE, args_schema: schema_of::<AddPartsArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(instructions_add_parts) },
-    CommandSpec { name: "instructions_remove_add", group: "instructions", doc: "Take a part (by its index in `step`'s adds) out of its step: it is in no step then (`unplanned` in the state), its insertion arrows and the callouts pointing at it go with it, and a torque that came from it is dropped. One undo step. Returns the state.", phase: Phase::Mutate, annotations: Annotations::MUTATE, args_schema: schema_of::<RemoveAddArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(instructions_remove_add) },
-    CommandSpec { name: "instructions_move_step", group: "instructions", doc: "Move a step to `index` among its siblings, or, with `parent`, under that step (its children with it; `\"\"` is the top level): a step cannot go inside itself, and its id never changes. Like every edit that changes which step adds what (merge, split, new step, move a part, delete), the step views follow: the parts hidden and the balloons are made again, a generated camera is made again for the step's parts, a captured camera (instructions_capture_camera) and the author's own annotations stay.", phase: Phase::Mutate, annotations: Annotations::MUTATE, args_schema: schema_of::<MoveStepArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(instructions_move_step) },
-    CommandSpec { name: "instructions_move_add", group: "instructions", doc: "Move one part (by its index in `from`'s adds) to a sibling step `to` (one under the same parent); the step it leaves may be left empty (listed in `emptySteps`).", phase: Phase::Mutate, annotations: Annotations::MUTATE, args_schema: schema_of::<MoveAddArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(instructions_move_add) },
-    CommandSpec { name: "instructions_play", group: "instructions", doc: "The in-app player: go `to` first, next, back, replay or a `step` (its view shown, the parts earlier steps placed ghosted, its arrowed parts moving home: `insertion` in the state is the fraction until they arrive, then null), and/or set the Player pane's `mode` (shop, customer). Next on the last step and Back on the first stay put. Returns the `instructions_state` plus the `mode`.", phase: Phase::Mutate, annotations: Annotations::MUTATE, args_schema: schema_of::<PlayArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(instructions_play) },
-    CommandSpec { name: "instructions_new_step", group: "instructions", doc: "Insert an empty step `after` a step (as its next sibling), or at the end of the top level, with its own view. Parts come to it by instructions_move_add. Returns the state plus the new `step`.", phase: Phase::Mutate, annotations: Annotations::MUTATE, args_schema: schema_of::<NewStepArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(instructions_new_step) },
-    CommandSpec { name: "instructions_delete_step", group: "instructions", doc: "Delete an empty step. A step that still adds parts is refused: move them first.", phase: Phase::Mutate, annotations: Annotations::MUTATE, args_schema: schema_of::<StepArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(instructions_delete_step) },
-    CommandSpec { name: "instructions_export", group: "instructions", doc: "Write the instructions out, as File ▸ Export does: `pdf` (the cover, the parts list, the tools list and the steps on the page template, each step's view drawn as a drawing sheet draws a PMI view, hidden lines removed by the exact pass over the solids' B-reps, which the export asks the runner for first and waits for; `pages`, `hiddenLine` (`analytic`, or `mesh: ` naming the pictures a B-rep that never came left to the mesh approximation) and every shown string in `texts`, read back from the bytes), `png` (one `step`'s picture from its view's camera, `size` pixels square, default 800: what it adds in colour, what earlier steps placed in grey), `svg` (one `step`'s number and title over its view as lines and text; `hiddenLine` and `texts` read back), `images` (every step's PNG and SVG in one zip, `step-01-MS2.png` …, listed in `files`), or `html` (the offline player: one self-contained page in `mode` shop or customer, the meshes, step cameras, step pictures, part thumbnails and the linked tools' pictures inlined as data:image (`toolPictures` the count inlined, `toolPicturesPending` those still being fetched from the PLM tools library, `toolPicturesMissing` those the library has none of or no session can fetch; wait_idle and export again for the pending ones); returns its `bytes`, `meshes`, `edges` (meshes carrying their edge lines), `nodes`, `selfContained` (no placeholder left, no URL to fetch) and per step what it places, adds and moves home). Binary files come back in `base64`. What the viewport shows (a step in the player, its ghosts) changes no file.", phase: Phase::Read, annotations: Annotations::READ, args_schema: schema_of::<ExportArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(instructions_export) },
-    CommandSpec { name: "instructions_update", group: "instructions", doc: "Set the page template (`template`: stepsPerPage 1, 2 or 4, orientation portrait or landscape, paper A4, A3, Letter, …) and the front matter (`front`: title, subtitle, coverStep, partsList, toolsList). Given keys replace the current ones; unknown keys are refused.", phase: Phase::Mutate, annotations: Annotations::MUTATE, args_schema: schema_of::<UpdateArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(instructions_update) },
+    app_command!("instructions", "instructions_state", "The active document's manufacturing instructions: `instructions` (the block: target assembly revision, template, front matter, the step tree `steps` where each step holds its child `steps` with their adds, view, tools, torque, callouts, arrows, notes, sign-off; a pending `retarget`), `steps` (the count), `shownStep` (the step whose view is active), `ghosted` (the parts drawn as ghosts), `insertion` (the player's insertion fraction while the step's parts move home, else null), `emptySteps`, `unplanned` (the assembly's parts in no step: occurrence and part) and `wrapper` (the component placing the assembly). `instructions: null` on any other document.", NoArgs, instructions_state, Read, READ, instructions_result_schema),
+    app_command!("instructions", "instructions_new", "Open a new tab holding manufacturing instructions for an assembly: `from` a store key, else the active (saved) document. The assembly is placed as one grounded component and its key is the instructions' target. With `wizard` (default true) the wizard proposes the step tree: a sub-assembly is one step whose children build it (read before it), then mate order (or an exploded view's reverse order), fasteners last, each step with its own view; it runs once the assembly is built, so `wizardPending` may be true in the reply (wait_idle, then instructions_state). Returns the `instructions_state` plus the tab `index`. Refused for a part, an unsaved document or instructions.", NewArgs, instructions_new, Mutate, MUTATE, instructions_new_result_schema),
+    app_command!("instructions", "instructions_wizard", "Rerun the wizard on the instructions' assembly: the step tree is replaced (the target, template and front matter stay) and the old steps' views are removed. One undo step. Returns the `instructions_state`.", NoArgs, instructions_wizard, Mutate, MUTATE, instructions_result_schema),
+    app_command!("instructions", "instructions_retarget_approve", "Approve the pending re-target (`instructions.retarget` in the state). When Update components (component_update) or a linked tab brings the instructions a new state of their assembly, the wizard reruns on the changed parts only, in the same undo step: an added part gets a step after its mated neighbour's, a removed one leaves its step, a replaced one takes its new part, and the change is listed (added, removed, replaced, touchedSteps, emptySteps) until approved. Approving makes the new revision the target and deletes the steps it left empty. Refused when none waits; a further update is refused until it is approved. One undo step. Returns the `instructions_state`.", NoArgs, instructions_retarget_approve, Mutate, MUTATE, instructions_result_schema),
+    app_command!("instructions", "instructions_retarget_reject", "Reject the pending re-target (`instructions.retarget` in the state): the one undo that takes the new revision of the assembly and its re-target back together, as Undo does, so the instructions keep describing the revision they did. Refused when none waits, when the re-target came in with the file (nothing in this session takes it back: approve it, or update again later), and when edits followed it (they would be undone too: undo them first, or approve). Leaves a redo step, as the undo would. Returns the `instructions_state`.", NoArgs, instructions_retarget_reject, Mutate, MUTATE, instructions_result_schema),
+    app_command!("instructions", "instructions_show_step", "Show a step's view: its camera, the parts not placed yet hidden, and the balloons on the parts it adds. Refused for a step without a view.", StepArgs, instructions_show_step, Mutate, MUTATE, instructions_result_schema),
+    app_command!("instructions", "instructions_update_step", "Set a step's fields from `patch` (title, notes, view, tools, torque, callouts, arrows, signoff, motion). Unknown fields and invalid values are refused with nothing written; parts move only through merge, split and instructions_move_add.", UpdateStepArgs, instructions_update_step, Mutate, MUTATE, instructions_result_schema),
+    app_command!("instructions", "instructions_merge", "Merge two or more sibling steps (steps under one parent) into the first of them in their order (it keeps its place; parts, tools, callouts, arrows and child steps are appended, notes joined; parts of one BOM row become one row with the quantity). Returns the state plus the kept `step`.", MergeArgs, instructions_merge, Mutate, MUTATE, instructions_step_result_schema),
+    app_command!("instructions", "instructions_split", "Split the parts at `adds` (indices) out of a step into a new step right after it, with the arrows and callouts that point at them. At least one part must stay. Returns the state plus the new `step`.", SplitArgs, instructions_split, Mutate, MUTATE, instructions_step_result_schema),
+    app_command!("instructions", "instructions_capture_camera", "Capture the viewport's camera as a step's view camera (point the camera first with `camera_set` / `standard_view`, or orbit the shown step). It is the author's from then on: every edit keeps it, until instructions_reset_view; `cameraCaptured` on the step says so. The PMI workbench's Update camera on a step's view does the same. One undo step. Returns the state.", StepArgs, instructions_capture_camera, Mutate, MUTATE, instructions_result_schema),
+    app_command!("instructions", "instructions_reset_view", "Drop a step's captured camera: its view's camera is generated again, framing everything the step shows (the parts it adds, its children's included, and the ghosts placed before it) from its parent step's camera direction, or the isometric (orthographic) at the top level, fitted in a fixed 1280×800 viewport so it is the same from any window. One undo step. Returns the state.", StepArgs, instructions_reset_view, Mutate, MUTATE, instructions_result_schema),
+    app_command!("instructions", "instructions_add_parts", "A BOM row dragged into a step: add `occurrences` of the assembly (or every occurrence of `part` at the assembly's top level, what a packed BOM row stands for) to `step`. An occurrence already in a step, or inside a sub-assembly another step places, is left where it is and reported in `left` (with that step), unless `step` is inside that sub-assembly's group; `added` counts the rest. One BOM row per part, a fastener bringing its torque when the step has none. An occurrence the assembly lacks or a missing step is refused with nothing written. The step views follow in the same undo step. Returns the state plus `added` and `left`; `unplanned` in the state lists the assembly's parts in no step.", AddPartsArgs, instructions_add_parts, Mutate, MUTATE, instructions_add_parts_result_schema),
+    app_command!("instructions", "instructions_remove_add", "Take a part (by its index in `step`'s adds) out of its step: it is in no step then (`unplanned` in the state), its insertion arrows and the callouts pointing at it go with it, and a torque that came from it is dropped. One undo step. Returns the state.", RemoveAddArgs, instructions_remove_add, Mutate, MUTATE, instructions_result_schema),
+    app_command!("instructions", "instructions_move_step", "Move a step to `index` among its siblings, or, with `parent`, under that step (its children with it; `\"\"` is the top level): a step cannot go inside itself, and its id never changes. Like every edit that changes which step adds what (merge, split, new step, move a part, delete), the step views follow: the parts hidden and the balloons are made again, a generated camera is made again for the step's parts, a captured camera (instructions_capture_camera) and the author's own annotations stay.", MoveStepArgs, instructions_move_step, Mutate, MUTATE, instructions_result_schema),
+    app_command!("instructions", "instructions_move_add", "Move one part (by its index in `from`'s adds) to a sibling step `to` (one under the same parent); the step it leaves may be left empty (listed in `emptySteps`).", MoveAddArgs, instructions_move_add, Mutate, MUTATE, instructions_result_schema),
+    app_command!("instructions", "instructions_play", "The in-app player: go `to` first, next, back, replay or a `step` (its view shown, the parts earlier steps placed ghosted, its arrowed parts moving home: `insertion` in the state is the fraction until they arrive, then null), and/or set the Player pane's `mode` (shop, customer). Next on the last step and Back on the first stay put. Returns the `instructions_state` plus the `mode`.", PlayArgs, instructions_play, Mutate, MUTATE, instructions_play_result_schema),
+    app_command!("instructions", "instructions_new_step", "Insert an empty step `after` a step (as its next sibling), or at the end of the top level, with its own view. Parts come to it by instructions_move_add. Returns the state plus the new `step`.", NewStepArgs, instructions_new_step, Mutate, MUTATE, instructions_step_result_schema),
+    app_command!("instructions", "instructions_delete_step", "Delete an empty step. A step that still adds parts is refused: move them first.", StepArgs, instructions_delete_step, Mutate, MUTATE, instructions_result_schema),
+    app_command!("instructions", "instructions_export", "Write the instructions out, as File ▸ Export does: `pdf` (the cover, the parts list, the tools list and the steps on the page template, each step's view drawn as a drawing sheet draws a PMI view, hidden lines removed by the exact pass over the solids' B-reps, which the export asks the runner for first and waits for; `pages`, `hiddenLine` (`analytic`, or `mesh: ` naming the pictures a B-rep that never came left to the mesh approximation) and every shown string in `texts`, read back from the bytes), `png` (one `step`'s picture from its view's camera, `size` pixels square, default 800: what it adds in colour, what earlier steps placed in grey), `svg` (one `step`'s number and title over its view as lines and text; `hiddenLine` and `texts` read back), `images` (every step's PNG and SVG in one zip, `step-01-MS2.png` …, listed in `files`), or `html` (the offline player: one self-contained page in `mode` shop or customer, the meshes, step cameras, step pictures, part thumbnails and the linked tools' pictures inlined as data:image (`toolPictures` the count inlined, `toolPicturesPending` those still being fetched from the PLM tools library, `toolPicturesMissing` those the library has none of or no session can fetch; wait_idle and export again for the pending ones); returns its `bytes`, `meshes`, `edges` (meshes carrying their edge lines), `nodes`, `selfContained` (no placeholder left, no URL to fetch) and per step what it places, adds and moves home). Binary files come back in `base64`. What the viewport shows (a step in the player, its ghosts) changes no file.", ExportArgs, instructions_export, Read, READ, instructions_export_result_schema),
+    app_command!("instructions", "instructions_update", "Set the page template (`template`: stepsPerPage 1, 2 or 4, orientation portrait or landscape, paper A4, A3, Letter, …) and the front matter (`front`: title, subtitle, coverStep, partsList, toolsList). Given keys replace the current ones; unknown keys are refused.", UpdateArgs, instructions_update, Mutate, MUTATE, instructions_result_schema),
 ];

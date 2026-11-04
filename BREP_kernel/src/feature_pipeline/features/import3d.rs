@@ -206,8 +206,8 @@ fn restore_native_bodies(ctx: &FeatureContext, payload: &str) -> Result<FeatureR
         // kernel's canonical one (`analytic_surface/canonical.rs`).
         if crate::canonical_carriers_enabled() {
             let report = crate::canonicalise_carriers(&mut body);
-            if std::env::var_os("BREP_PROFILE").is_some() && !report.rewritten.is_empty() {
-                eprintln!("import3d.canonical_carriers solid={} rewritten={:?}", solid.name, report.rewritten);
+            if crate::profile::profile_enabled() && !report.rewritten.is_empty() {
+                profile_line!("import3d.canonical_carriers solid={} rewritten={:?}", solid.name, report.rewritten);
             }
         }
         // A payload encoded straight from `snapshot_solids` (not through

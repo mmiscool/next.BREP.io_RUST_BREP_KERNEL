@@ -137,7 +137,7 @@ struct Occurrence {
     id: String,
     /// Every member `(scene name, handle)`.
     members: Vec<(String, u32)>,
-    /// The members the view shows (not in its hidden list).
+    /// The members the view shows (`PmiView::hides` says no).
     visible: Vec<(String, u32)>,
     stages: BTreeMap<String, Vec<PmiPose>>,
     section: Option<HalfSpace>,
@@ -187,10 +187,10 @@ fn occurrence(annotation: &PmiAnnotation, context: &PmiContext<'_>) -> Result<Oc
         Some(cut) => names.iter().filter(|name| cut.excludes(name)).cloned().collect(),
         None => Vec::new(),
     };
-    let hidden: &[String] = view.map_or(&[], |view| view.display.hidden.as_slice());
+    // Hidden by the view: its captured baseline or one of its hide steps.
     let visible: Vec<(String, u32)> = members
         .iter()
-        .filter(|(name, _)| !hidden.contains(name))
+        .filter(|(name, _)| !view.is_some_and(|view| view.hides(name)))
         .cloned()
         .collect();
     // The DISPLAYED box of the occurrence: each member's box corners posed

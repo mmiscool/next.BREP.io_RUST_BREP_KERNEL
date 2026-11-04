@@ -166,17 +166,11 @@ fn triple(value: &Value) -> Option<[f64; 3]> {
     Some([list[0].as_f64()?, list[1].as_f64()?, list[2].as_f64()?])
 }
 
-fn sub(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
-    [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
-}
+use crate::geometry3d::sub3 as sub;
 
-fn dot(a: [f64; 3], b: [f64; 3]) -> f64 {
-    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
-}
+use crate::geometry3d::dot3 as dot;
 
-fn norm(a: [f64; 3]) -> f64 {
-    dot(a, a).sqrt()
-}
+use crate::geometry3d::len3 as norm;
 
 /// Distance from `p` to the line through `origin` along unit `direction`.
 fn line_distance(p: [f64; 3], origin: [f64; 3], direction: [f64; 3]) -> f64 {
@@ -1413,6 +1407,38 @@ impl EngineState {
             })
             .collect();
         Value::Array(rows)
+    }
+
+    /// Start the REPAIR PICK for one held reference of mate `mate`: the
+    /// standard reference selection ([`RefSelectTarget::ReplaceRepair`]),
+    /// filtered to faces and edges, ONE pick. Nothing rolls: the repair names
+    /// the assembly as it stands. The finished pick waits for
+    /// [`Self::take_replace_repair_pick`].
+    pub fn begin_ref_select_for_replace_repair(&mut self, mate: &str, old_ref: &str) {
+        let filter = vec!["FACE".to_string(), "EDGE".to_string()];
+        let restore_index = self.history.rollback();
+        self.selection_filter = SelectionFilter::from_ref_filter(&filter);
+        self.replace_repair_pick = None;
+        self.ref_select = Some(RefSelectState {
+            feature_id: mate.to_string(),
+            path: vec![old_ref.to_string()],
+            label: format!("Replacement for {old_ref}"),
+            filter,
+            multiple: false,
+            names: Vec::new(),
+            restore_index,
+            target: RefSelectTarget::ReplaceRepair,
+            picks: 0,
+            claimed: false,
+            finish_requested: false,
+        });
+        self.sync_ref_select_emphasis();
+    }
+
+    /// The finished repair pick `(mate, old ref, picked name)`, once: the
+    /// replace dialog takes it and runs the repair.
+    pub fn take_replace_repair_pick(&mut self) -> Option<(String, String, String)> {
+        self.replace_repair_pick.take()
     }
 
     /// Repair unresolved references, as ONE undo step: each `(constraint id,

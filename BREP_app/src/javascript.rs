@@ -35,11 +35,109 @@ ui.notify("Edit its dimensions in the feature history");
 return { featuresBefore: cad.document.features.length };
 "#;
 
+/// Where Run sends a program when the app has a script runner: the app's
+/// own server's code mode (`crate::mcp::EditorHost`), the same realm, limits
+/// and generated `brep.<group>.<tool>` functions an agent's `run_script`
+/// gets. Without one (the web build, a bare test harness) Run uses the
+/// plugin runner's editor action.
+pub trait ScriptHost {
+    /// Whether the runner is up; the first call starts it.
+    fn ready(&self) -> Result<bool, String>;
+    /// Submit a program; answers its execution id.
+    fn run(&self, source: &str) -> Result<String, String>;
+    /// The execution's result once it has ended, `None` while it runs.
+    fn result(&self, id: &str) -> Result<Option<serde_json::Value>, String>;
+    /// Halt it: the worker is killed wherever it is.
+    fn halt(&self, id: &str) -> Result<(), String>;
+}
+
+/// A run on the [`ScriptHost`], in its document. Its edits fold into one
+/// undo group, kept when the program succeeds and rolled back otherwise, as
+/// the plugin runner's transaction is.
+enum Script {
+    Starting { doc: u64, program: String },
+    Running { doc: u64, id: String, token: u64 },
+    /// Ended: the group closes once the document's engine is idle, so a
+    /// staged feature still landing folds in (or rolls back) with the rest.
+    Closing { doc: u64, token: u64, rollback: bool, output: String, since: web_time::Instant, idle: u32 },
+}
+
+/// How long a closing run waits for its document to go idle before the
+/// group closes anyway (an edit still landing then stands on its own).
+const CLOSE_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// A closing run's document must read idle this many polls running, and
+/// [`CLOSE_SETTLE`] must have passed: a tool call the program issued just
+/// before it ended (or was killed) may still be on its way to the app's
+/// queue, which drains AFTER this poll in the frame, and its edit belongs in
+/// the group.
+const CLOSE_IDLE_POLLS: u32 = 5;
+const CLOSE_SETTLE: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// An editor script as a program for the [`ScriptHost`]. A module (a line
+/// starting `import` or `export`) runs as written. Anything else is a classic
+/// editor body: it runs with `cad.document` (the history snapshot with
+/// `addFeature(type, params, persistentData)`, `updateFeature(id, params)`
+/// (a merge, as `feature_set_params` merges) and `deleteFeature(id)`),
+/// `cad.selection`, `cad.brep` (every app tool) and `ui.notify`; the document
+/// commands apply in order after it returns, and a returned value prints as
+/// `Result:`. The body may `await`.
+pub fn program(source: &str) -> String {
+    if source.lines().any(|l| l.starts_with("import ") || l.starts_with("export ")) {
+        return source.to_string();
+    }
+    format!(
+        r#"import {{ brep }} from "@brep/cad";
+export default async function main() {{
+  const commands = [];
+  const stage = c => {{ if (commands.length >= 256) throw Error("too many document commands"); commands.push(c); }};
+  const snapshot = (await brep.document.doc_json({{}})).document;
+  const selection = (await brep.scene.selection({{}})).selection;
+  const document = Object.freeze({{
+    ...snapshot,
+    addFeature: (type, params = {{}}, persistentData = {{}}) => stage(() => brep.features.feature_add(Object.keys(persistentData).length ? {{ type, params, persistent_data: persistentData }} : {{ type, params }})),
+    updateFeature: (id, params) => stage(() => brep.features.feature_set_params({{ id, patch: params }})),
+    deleteFeature: id => stage(() => brep.history.feature_delete({{ id }})),
+  }});
+  const notify = message => console.log(String(message));
+  const cad = Object.freeze({{ document, selection, params: {{}}, notify, brep }});
+  const ui = Object.freeze({{ notify }});
+  const result = await (async function (cad, ui) {{
+{source}
+  }})(cad, ui);
+  for (const command of commands) await command();
+  if (result !== undefined) console.log("Result:", JSON.stringify(result));
+  return null;
+}}
+"#
+    )
+}
+
+/// What a finished execution shows: the outcome, the console lines, and a
+/// module's returned value.
+fn script_output(result: &serde_json::Value) -> String {
+    let mut lines = vec![match result["state"].as_str() {
+        Some("succeeded") => "Completed.".to_string(),
+        Some("cancelled") => "Cancelled.".to_string(),
+        _ => format!("Failed: {}", result["error"]["message"].as_str().unwrap_or("the script failed")),
+    }];
+    if let Some(log) = result["logText"].as_str().filter(|l| !l.is_empty()) {
+        lines.push(log.to_string());
+    }
+    if !result["output"].is_null() {
+        lines.push(format!("Result: {}", result["output"]));
+    }
+    lines.join("\n")
+}
+
 pub struct JavaScriptEditor {
     pub open: bool,
     source: String,
     output: String,
     pending: Option<u64>, // originating document, retained across tab switches
+    /// The app's script runner, when it has one (see [`ScriptHost`]).
+    pub host: Option<Box<dyn ScriptHost>>,
+    script: Option<Script>,
     importing: bool,
     /// This frame's widget rects (egui points) for the automation host; empty
     /// while the window is closed.
@@ -59,6 +157,10 @@ impl JavaScriptEditor {
         self.pending == Some(document)
     }
 
+    pub fn set_source(&mut self, source: String) {
+        self.source = source;
+    }
+
     pub fn editing_source(ctx: &egui::Context) -> bool {
         ctx.memory(|memory| memory.has_focus(egui::Id::new("cad-javascript-source")))
     }
@@ -71,6 +173,8 @@ impl JavaScriptEditor {
                 .unwrap_or_else(|| EXAMPLE.into()),
             output: String::new(),
             pending: None,
+            host: None,
+            script: None,
             importing: false,
             hits: HashMap::new(),
             exports: Vec::new(),
@@ -99,6 +203,100 @@ impl JavaScriptEditor {
         crate::automation::hit_rects::hits_json(&self.hits)
     }
 
+    /// Halt the running script and roll its edits back once its document
+    /// is idle; `output` says why.
+    fn halt_script(&mut self, docs: &mut Documents, output: String) {
+        match self.script.take() {
+            Some(Script::Starting { .. }) => {
+                self.pending = None;
+                self.output = output;
+            }
+            Some(Script::Running { doc, id, token }) => {
+                if let Some(host) = &self.host {
+                    let _ = host.halt(&id);
+                }
+                // Brake a history run the script started, as the app's
+                // cancel button does; a staged feature then rolls back.
+                if let Some(d) = docs.iter_mut().find(|d| d.id() == doc) {
+                    d.engine.cancel_run();
+                }
+                self.script = Some(Script::Closing { doc, token, rollback: true, output, since: web_time::Instant::now(), idle: 0 });
+            }
+            other => self.script = other,
+        }
+    }
+
+    /// One frame of a run on the [`ScriptHost`].
+    fn poll_script(&mut self, ctx: &egui::Context, docs: &mut Documents) {
+        ctx.request_repaint_after(std::time::Duration::from_millis(30));
+        let doc_id = match &self.script {
+            Some(Script::Starting { doc, .. } | Script::Running { doc, .. } | Script::Closing { doc, .. }) => *doc,
+            None => return,
+        };
+        if !docs.iter().any(|d| d.id() == doc_id) {
+            if let (Some(Script::Running { id, .. }), Some(host)) = (&self.script, &self.host) {
+                let _ = host.halt(id);
+            }
+            self.script = None;
+            self.pending = None;
+            self.output = "The script's document was closed.".into();
+            return;
+        }
+        // The app's tools act on the ACTIVE document: a run whose document
+        // is no longer active would write another one.
+        if docs.active_id() != doc_id && matches!(self.script, Some(Script::Starting { .. } | Script::Running { .. })) {
+            return self.halt_script(docs, "Halted: the active document changed while the script ran; its edits were rolled back.".into());
+        }
+        let Some(host) = &self.host else { return };
+        let doc = docs.iter_mut().find(|d| d.id() == doc_id).expect("checked above");
+        match self.script.take() {
+            Some(Script::Starting { doc: d, program }) => match host.ready() {
+                Ok(true) => {
+                    let token = doc.engine.history_group_begin();
+                    match host.run(&program) {
+                        Ok(id) => self.script = Some(Script::Running { doc: d, id, token }),
+                        Err(e) => {
+                            let _ = doc.engine.history_group_end(token, false);
+                            self.pending = None;
+                            self.output = e;
+                        }
+                    }
+                }
+                Ok(false) => self.script = Some(Script::Starting { doc: d, program }),
+                Err(e) => {
+                    self.pending = None;
+                    self.output = e;
+                }
+            },
+            Some(Script::Running { doc: d, id, token }) => match host.result(&id) {
+                Ok(None) => self.script = Some(Script::Running { doc: d, id, token }),
+                Ok(Some(result)) => {
+                    let rollback = result["state"] != "succeeded";
+                    let output = script_output(&result);
+                    self.script = Some(Script::Closing { doc: d, token, rollback, output, since: web_time::Instant::now(), idle: 0 });
+                }
+                Err(e) => self.script = Some(Script::Closing { doc: d, token, rollback: true, output: e, since: web_time::Instant::now(), idle: 0 }),
+            },
+            Some(Script::Closing { doc: d, token, rollback, output, since, idle }) => {
+                doc.engine.pump();
+                let quiet = !doc.engine.run_pending() && !doc.engine.stage_feature_pending();
+                let idle = if quiet { idle + 1 } else { 0 };
+                let settled = idle >= CLOSE_IDLE_POLLS && since.elapsed() >= CLOSE_SETTLE;
+                if !settled && since.elapsed() < CLOSE_WAIT {
+                    self.script = Some(Script::Closing { doc: d, token, rollback, output, since, idle });
+                    return;
+                }
+                self.pending = None;
+                self.output = match doc.engine.history_group_end(token, rollback) {
+                    Ok(true) => format!("{output}\nIts edits were rolled back."),
+                    Ok(false) => output,
+                    Err(e) => format!("{output}\n{e}"),
+                };
+            }
+            None => {}
+        }
+    }
+
     /// Record a widget's VISIBLE rect for the host.
     fn hit(&mut self, key: &str, resp: &egui::Response) {
         self.hits.insert(key.to_string(), resp.interact_rect);
@@ -113,6 +311,9 @@ impl JavaScriptEditor {
                     Err(e) => self.output = format!("Cannot open script: {e}"),
                 }
             }
+        }
+        if self.script.is_some() {
+            return self.poll_script(ctx, docs);
         }
         let Some(id) = self.pending else {
             return;
@@ -157,6 +358,9 @@ impl JavaScriptEditor {
         self.surface = ctx.content_rect();
         let mut open = self.open;
         let shown = egui::Window::new("JavaScript editor").id(egui::Id::new(WINDOW_ID)).open(&mut open)
+            // Under the toolbar / Ribbon like Settings, Plugins and Info: without
+            // a position egui put it over the menu bar (ui-polish-2026-10-28 row 5).
+            .default_pos(crate::panels::below_chrome(ctx, 16.0, 0.0))
             .default_size(egui::vec2(720.0, 620.0)).min_size(egui::vec2(420.0, 320.0)).resizable(true).show(ctx, |ui| {
             ui.label(format!("Run in: {}", docs.active().title()));
             if let Some(id) = self.pending {
@@ -172,7 +376,13 @@ impl JavaScriptEditor {
                     || docs.engine().plugin_action_status()["state"] == "pending";
                 let run = ui.add_enabled(!busy, egui::Button::new("Run script"));
                 self.hit("run", &run);
-                if run.clicked() {
+                // `cad.geometry` (kernel solids in an editor body) is the
+                // plugin runner's; such a script stays there.
+                if run.clicked() && self.host.is_some() && !self.source.contains("cad.geometry") {
+                    self.pending = Some(docs.active_id());
+                    self.script = Some(Script::Starting { doc: docs.active_id(), program: program(&self.source) });
+                    self.output = "Running…".into();
+                } else if run.clicked() {
                     match docs.engine_mut().run_javascript(&self.source) {
                         Ok(_) => { self.pending = Some(docs.active_id()); self.output = "Running…".into(); }
                         Err(e) => self.output = e,
@@ -180,7 +390,9 @@ impl JavaScriptEditor {
                 }
                 let cancel = ui.add_enabled(self.pending.is_some(), egui::Button::new("Cancel"));
                 self.hit("cancel", &cancel);
-                if cancel.clicked() {
+                if cancel.clicked() && self.script.is_some() {
+                    self.halt_script(docs, "Cancelled.".into());
+                } else if cancel.clicked() {
                     if let Some(id) = self.pending {
                         if let Some(doc) = docs.iter_mut().find(|doc| doc.id() == id) {
                             doc.engine.cancel_plugin_action();
@@ -218,6 +430,9 @@ impl JavaScriptEditor {
                 ui.label("Write JavaScript statements. cad.document is a snapshot of the current history; cad.selection contains the current selection.");
                 ui.monospace("cad.document.addFeature(type, params)\ncad.document.updateFeature(id, params)\ncad.document.deleteFeature(id)\nconsole.log / info / warn / error(...)\nui.notify(text)\nreturn { any: 'JSON result' };");
                 ui.label("Built-in types include P.CU (sizeX, sizeY, sizeZ), P.S (radius), and P.CY (radius, height). Successful changes form one undo step. Each Run executes the script again.");
+                if self.host.is_some() {
+                    ui.label("Every app tool is a function too: await cad.brep.<group>.<tool>(args), the same functions an agent's run_script gets (typed in the server's brep://cad/sdk.d.ts resource). A program that starts with import { brep } from \"@brep/cad\" and export default async function main() runs as written. A failed or cancelled run is rolled back.");
+                }
                 let example = ui.button("Load box example");
                 if example.clicked() { self.source = EXAMPLE.into(); }
                 example

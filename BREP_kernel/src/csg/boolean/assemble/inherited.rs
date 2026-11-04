@@ -313,6 +313,67 @@ fn candidate_memoized(face: &crate::FaceRecord, edge: &crate::topology::EdgeReco
     (read, false)
 }
 
+/// Both trigger readings precede either fit. Keep their exact-input projection
+/// memos alive through candidate admission: the fitter's nested scope then
+/// shares these feet instead of discarding them before the common read.
+/// Unwind the two surface scopes in reverse order; restore the original use
+/// order in the returned readings. Fits read immutable geometry and neither
+/// use's fit or admission consumes the other's result.
+#[derive(Debug)]
+enum PairRead {
+    Unread,
+    Clean,
+    Candidates(Vec<UseRead>, usize),
+}
+
+/// The first use's reading when the second use's candidate already declined
+/// the pair ([`read_pair`]).
+const SKIPPED_FIRST: &str = "not read: the other use declined";
+
+fn read_pair(
+    faces: [&crate::FaceRecord; 2],
+    edge: &crate::topology::EdgeRecord,
+    coedges: [&crate::topology::CoedgeRecord; 2],
+    bar: f64,
+    reuse_feet: bool,
+) -> PairRead {
+    // The two tracking reads' feet are kept but not hashed unless a candidate
+    // read follows (`pcurve::defer_foot_inserts`): most pairs read clean.
+    let first_feet = reuse_feet.then(|| crate::pcurve::FootMemoScope::open(&faces[0].surface));
+    let first = crate::pcurve::defer_foot_inserts(|| old_tracking(faces[0], edge, coedges[0]));
+    let second_feet = reuse_feet.then(|| crate::pcurve::FootMemoScope::open(&faces[1].surface));
+    let second = crate::pcurve::defer_foot_inserts(|| old_tracking(faces[1], edge, coedges[1]));
+    let (Some((first, first_tracking)), Some((second, second_tracking))) = (first, second) else {
+        return PairRead::Unread;
+    };
+    if first_tracking <= bar && second_tracking <= bar {
+        return PairRead::Clean;
+    }
+    let read_first = || candidate_memoized(faces[0], edge, coedges[0], &first, bar);
+    let read_second = || candidate_memoized(faces[1], edge, coedges[1], &second, bar);
+    let (first, second) = if reuse_feet {
+        let second = read_second();
+        drop(second_feet);
+        // `edge_decision` leaves the pair unchanged when EITHER use declines,
+        // so once the second use's candidate is declined the first use's fit
+        // and common read cannot change the decision: skip them (the
+        // elephant's sphere-side trims, already within 1e-8, declined while
+        // the fitted side's read cost 110-120 ms, 2026-11-02).
+        // The placeholder is never admitted and never memoised.
+        if matches!(second.0, UseRead::Declined(_)) {
+            drop(first_feet);
+            return PairRead::Candidates(vec![UseRead::Declined(SKIPPED_FIRST.into()), second.0], usize::from(second.1));
+        }
+        let first = read_first();
+        drop(first_feet);
+        (first, second)
+    } else {
+        // The original ordering remains the independent test oracle.
+        (read_first(), read_second())
+    };
+    PairRead::Candidates(vec![first.0, second.0], usize::from(first.1) + usize::from(second.1))
+}
+
 fn candidate(face: &crate::FaceRecord, edge: &crate::topology::EdgeRecord, coedge: &crate::topology::CoedgeRecord, old: &NurbsCurve, bar: f64) -> UseRead {
 
     let forward = coedge.forward;
@@ -597,27 +658,27 @@ pub(super) fn challenge_inherited_trims_scoped(
             continue;
         }
         tracking += edge_uses.len();
-        let olds: Vec<Option<(NurbsCurve, f64)>> = edge_uses.iter().map(|u| old_tracking(faces[u.0], edge, &faces[u.0].loops[u.1].coedges[u.2])).collect();
-        if olds.iter().any(|old| old.is_none()) {
-            if debug {
-                eprintln!("inherited: edge {} {:?} (operand {operand} edge {source_edge}) declined: an old trim is unread", edge.id, edge.name);
+        let pair_faces = [faces[edge_uses[0].0], faces[edge_uses[1].0]];
+        let pair_coedges = [
+            &pair_faces[0].loops[edge_uses[0].1].coedges[edge_uses[0].2],
+            &pair_faces[1].loops[edge_uses[1].1].coedges[edge_uses[1].2],
+        ];
+        let reads = match read_pair(pair_faces, edge, pair_coedges, bar, true) {
+            PairRead::Unread => {
+                if debug {
+                    eprintln!("inherited: edge {} {:?} (operand {operand} edge {source_edge}) declined: an old trim is unread", edge.id, edge.name);
+                }
+                continue;
             }
-            continue;
-        }
-        if olds.iter().flatten().all(|(_, tracking)| *tracking <= bar) {
-            continue;
-        }
-        // Either use over the bar: BOTH get a candidate and both must be admitted.
-        candidates += edge_uses.len();
-        let reads: Vec<UseRead> = edge_uses
-            .iter()
-            .zip(&olds)
-            .map(|(u, old)| {
-                let (read, served) = candidate_memoized(faces[u.0], edge, &faces[u.0].loops[u.1].coedges[u.2], &old.as_ref().expect("read above").0, bar);
-                fits_served += served as usize;
-                read
-            })
-            .collect();
+            PairRead::Clean => continue,
+            PairRead::Candidates(reads, served) => {
+                // Profile only: a use skipped after the other declined is
+                // neither fitted nor served.
+                candidates += reads.iter().filter(|read| !matches!(read, UseRead::Declined(why) if why == SKIPPED_FIRST)).count();
+                fits_served += served;
+                reads
+            }
+        };
         let Some(taken) = edge_decision(&reads) else {
             if debug {
                 eprintln!("inherited: edge {} {:?} (operand {operand} edge {source_edge}) pair left unchanged: {reads:?}", edge.id, edge.name);
@@ -662,7 +723,7 @@ pub(super) fn challenge_inherited_trims_scoped(
     }
     if profile {
         let after = crate::reading_memo::counts();
-        eprintln!("assemble.inherited_reads faces={} scoped={} eligible={eligible} far_reused={far_reused} far_read={far_read} endpoints={endpoints} tracking={tracking} candidates={candidates} fits={} fits_served={fits_served} reused={} reread={}",
+        profile_line!("assemble.inherited_reads faces={} scoped={} eligible={eligible} far_reused={far_reused} far_read={far_read} endpoints={endpoints} tracking={tracking} candidates={candidates} fits={} fits_served={fits_served} reused={} reread={}",
             faces.len(), scope.map_or(faces.len(), |s| s.len()), candidates - fits_served, after.0 - before_memo.0, after.1 - before_memo.1);
     }
     drop(faces);

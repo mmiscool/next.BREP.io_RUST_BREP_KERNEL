@@ -29,19 +29,80 @@ pub(super) fn pcurve_for<'a>(piece: &'a ImprintPieceRecord, face: FaceKey) -> Re
 }
 
 pub(super) fn point_in_polygon(point: Vec2, polygon: &[Vec2]) -> bool {
-    let mut inside = false;
-    for index in 0..polygon.len() {
-        let a = polygon[index];
-        let b = polygon[(index + 1) % polygon.len()];
-        if (a.y > point.y) != (b.y > point.y) {
-            let crossing = a.x + (point.y - a.y) / (b.y - a.y) * (b.x - a.x);
-            if crossing > point.x {
+    crate::polygon::parity_inside([point.x, point.y], polygon.len(), |i| [polygon[i].x, polygon[i].y])
+}
+
+/// PARITY INDEX (lane O row 17, 2026-10-28; on by default since the batch 4
+/// promotion, `BREP_FRAGMENT_PARITY_INDEX=0` reads every edge). [`point_in_polygon`] toggles on exactly the edges whose
+/// half-open y-span `[min, max)` holds the query's y, and the toggles commute,
+/// so reading only those edges, each by the same predicate and the same
+/// crossing expression, returns the same answer. The interior-point search
+/// asks it once per polygon edge per pass (six passes at most), which on the
+/// D1 bench case's 272-edge regions was the whole of `fragment.region
+/// interior`; the index buckets the edges by y so a query reads the few edges
+/// of its bucket. Every edge is registered in each bucket its closed y-span
+/// touches, and the bucket map is monotone in y, so no contributing edge is
+/// skipped.
+pub(super) struct PolygonParityIndex<'a> {
+    polygon: &'a [Vec2],
+    low: f64,
+    scale: f64,
+    buckets: Vec<Vec<u32>>,
+}
+impl<'a> PolygonParityIndex<'a> {
+    pub(super) fn new(polygon: &'a [Vec2]) -> Option<Self> {
+        if polygon.len() < 64 || polygon.len() >= u32::MAX as usize {
+            return None;
+        }
+        let (mut low, mut high) = (f64::INFINITY, f64::NEG_INFINITY);
+        for point in polygon {
+            if !(point.x.is_finite() && point.y.is_finite()) {
+                return None;
+            }
+            low = low.min(point.y);
+            high = high.max(point.y);
+        }
+        if !(high > low) {
+            return None;
+        }
+        let count = ((polygon.len() as f64).sqrt().ceil() as usize).clamp(8, 256);
+        let scale = count as f64 / (high - low);
+        if !scale.is_finite() {
+            return None;
+        }
+        let mut index = Self { polygon, low, scale, buckets: vec![Vec::new(); count] };
+        for edge in 0..polygon.len() {
+            let a = polygon[edge];
+            let b = polygon[(edge + 1) % polygon.len()];
+            let (first, last) = (index.bucket(a.y.min(b.y)), index.bucket(a.y.max(b.y)));
+            for bucket in first..=last {
+                index.buckets[bucket].push(edge as u32);
+            }
+        }
+        Some(index)
+    }
+    fn bucket(&self, y: f64) -> usize {
+        let at = ((y - self.low) * self.scale).floor();
+        if at.is_nan() || at < 0.0 { 0 } else { (at as usize).min(self.buckets.len() - 1) }
+    }
+    pub(super) fn contains(&self, point: Vec2) -> bool {
+        let mut inside = false;
+        for &edge in &self.buckets[self.bucket(point.y)] {
+            let index = edge as usize;
+            let a = self.polygon[index];
+            let b = self.polygon[(index + 1) % self.polygon.len()];
+            if crate::polygon::crosses_ray([point.x, point.y], [a.x, a.y], [b.x, b.y]) {
                 inside = !inside;
             }
         }
+        inside
     }
-    inside
 }
+
+pub(super) fn parity_index_enabled() -> bool {
+    switch!("BREP_FRAGMENT_PARITY_INDEX", true)
+}
+
 
 /// Interior points of the region, best-clearance first.  The first entry
 /// is the same point the single-point selection historically produced;
@@ -184,6 +245,12 @@ pub(super) fn interior_points_in_polygons_indexed(
     let index = (indexed && edge_count >= 64
         && std::iter::once(&outer_edges).chain(hole_edges.iter()).flatten().all(|(a, b)| a.x.is_finite() && a.y.is_finite() && b.x.is_finite() && b.y.is_finite()))
         .then(|| InteriorSegmentIndex::new(std::iter::once(&outer_edges).chain(hole_edges.iter()).flatten().copied().collect()));
+    let parity = parity_index_enabled();
+    let outer_parity = if parity { PolygonParityIndex::new(outer_polygon) } else { None };
+    let hole_parity: Vec<Option<PolygonParityIndex<'_>>> = hole_polygons.iter()
+        .map(|hole| if parity { PolygonParityIndex::new(hole) } else { None }).collect();
+    let inside_outer = |point: Vec2| outer_parity.as_ref().map_or_else(|| point_in_polygon(point, outer_polygon), |index| index.contains(point));
+    let inside_hole = |hole: usize, point: Vec2| hole_parity[hole].as_ref().map_or_else(|| point_in_polygon(point, &hole_polygons[hole]), |index| index.contains(point));
     for factor in [0.25, 0.1, 0.05, 0.01, 0.002, 4e-4] {
         let epsilon = scale * factor;
         for &(a, b) in &outer_edges {
@@ -199,10 +266,8 @@ pub(super) fn interior_points_in_polygons_indexed(
                 }
                 .scale(epsilon),
             );
-            if !point_in_polygon(candidate, outer_polygon)
-                || hole_polygons
-                    .iter()
-                    .any(|hole| point_in_polygon(candidate, hole))
+            if !inside_outer(candidate)
+                || (0..hole_polygons.len()).any(|hole| inside_hole(hole, candidate))
             {
                 continue;
             }
@@ -255,11 +320,48 @@ pub(super) fn interior_points_in_polygons_indexed(
 /// segment's tag; a segment without a position reads as `u64::MAX`.
 fn chain_segment(usage: &crate::CycleUse) -> (u64, u64) {
     let tag = &usage.piece.parent.tag;
-    (
-        tag.get("chain").and_then(serde_json::Value::as_u64).unwrap_or(u64::MAX),
-        tag.get("seg").and_then(serde_json::Value::as_u64).unwrap_or(u64::MAX),
-    )
+    (tag_chain(tag).unwrap_or(u64::MAX), tag_seg(tag).unwrap_or(u64::MAX))
 }
+
+/// PACKED SEGMENT TAGS (lane O row 9, 2026-10-28; on by default since its
+/// promotion, `BREP_FRAGMENT_PACKED_TAGS=0` writes the object tags).
+/// Every arrangement piece and every cycle use clones its
+/// parent segment, tag included; the `{"chain", "seg"}` object allocates a map
+/// and two keys on each clone, and the D1 bench case's 272-segment faces paid
+/// for it ~1 100 times a face. The packed tag is ONE JSON number,
+/// `chain · 2^32 + seg`, which clones without allocating. The readers below
+/// accept both encodings, and the values they return are the same, so the
+/// arrangement and every fragment are unchanged.
+pub(super) fn segment_tag(chain: usize, segment: usize) -> serde_json::Value {
+    // Compared as u64: on wasm32 a usize cannot hold 1 << 32 (the shift
+    // overflowed there, failing the web build), and every usize fits.
+    if packed_tags_enabled() && chain < (1 << 20) && (segment as u64) < (1u64 << 32) {
+        serde_json::Value::from(((chain as u64) << 32) | segment as u64)
+    } else {
+        serde_json::json!({ "chain": chain, "seg": segment })
+    }
+}
+
+/// The chain a segment tag names, in either encoding.
+pub(super) fn tag_chain(tag: &serde_json::Value) -> Option<u64> {
+    match tag {
+        serde_json::Value::Number(number) => number.as_u64().map(|packed| packed >> 32),
+        _ => tag.get("chain").and_then(serde_json::Value::as_u64),
+    }
+}
+
+/// The segment index a segment tag names, in either encoding.
+pub(super) fn tag_seg(tag: &serde_json::Value) -> Option<u64> {
+    match tag {
+        serde_json::Value::Number(number) => number.as_u64().map(|packed| packed & 0xffff_ffff),
+        _ => tag.get("seg").and_then(serde_json::Value::as_u64),
+    }
+}
+
+fn packed_tags_enabled() -> bool {
+    switch!("BREP_FRAGMENT_PACKED_TAGS", true)
+}
+
 
 /// A region's topological key (lane X row 9): the sorted (chain, segment)
 /// list of its outer loop, then the sorted lists of its holes. It reads no
@@ -281,12 +383,7 @@ pub(super) fn region_topology_key(outer: &[crate::CycleUse], holes: &[Vec<crate:
 }
 
 fn chain_index(usage: &crate::CycleUse) -> Result<usize, KernelRefusal> {
-    usage
-        .piece
-        .parent
-        .tag
-        .get("chain")
-        .and_then(serde_json::Value::as_u64)
+    tag_chain(&usage.piece.parent.tag)
         .map(|value| value as usize)
         .ok_or_else(|| KernelRefusal::internal(KernelStage::Fragment, "fragment.loops", "fragment_face: arrangement lost chain tag"))
 }
@@ -301,16 +398,81 @@ pub(super) fn build_loop(
     tolerance: f64,
     surface: &NurbsSurface,
 ) -> Result<Option<FragmentLoop>, KernelRefusal> {
-    let mut uses = cycle.to_vec();
+    if loop_view_enabled() {
+        let views = cycle
+            .iter()
+            .map(|usage| Ok(UseView { a: usage.piece.a, b: usage.piece.b, forward: usage.forward, chain: chain_index(usage)? }))
+            .collect::<Result<Vec<_>, KernelRefusal>>()?;
+        return build_loop_uses(views, reverse, chains, tolerance, surface);
+    }
+    build_loop_uses(cycle.to_vec(), reverse, chains, tolerance, surface)
+}
+
+/// What [`build_loop_uses`] reads of one arrangement use: its ends, its
+/// direction and its chain. The cloned [`crate::CycleUse`] carries the piece's
+/// whole parent segment and its `serde_json` tag, re-read for the chain on
+/// every comparison; [`UseView`] copies the ends and parses the chain once.
+trait LoopUse {
+    fn forward(&self) -> bool;
+    fn set_forward(&mut self, forward: bool);
+    fn a(&self) -> Vec2;
+    fn b(&self) -> Vec2;
+    fn chain(&self) -> Result<usize, KernelRefusal>;
+}
+
+impl LoopUse for crate::CycleUse {
+    fn forward(&self) -> bool { self.forward }
+    fn set_forward(&mut self, forward: bool) { self.forward = forward; }
+    fn a(&self) -> Vec2 { self.piece.a }
+    fn b(&self) -> Vec2 { self.piece.b }
+    fn chain(&self) -> Result<usize, KernelRefusal> { chain_index(self) }
+}
+
+#[derive(Clone, Copy)]
+struct UseView {
+    a: Vec2,
+    b: Vec2,
+    forward: bool,
+    chain: usize,
+}
+
+impl LoopUse for UseView {
+    fn forward(&self) -> bool { self.forward }
+    fn set_forward(&mut self, forward: bool) { self.forward = forward; }
+    fn a(&self) -> Vec2 { self.a }
+    fn b(&self) -> Vec2 { self.b }
+    fn chain(&self) -> Result<usize, KernelRefusal> { Ok(self.chain) }
+}
+
+/// LOOP VIEW (lane O row 8, 2026-10-28; on by default since its promotion,
+/// `BREP_FRAGMENT_LOOP_VIEW=0` restores the cloned cycle):
+/// [`build_loop`] reads its cycle through [`UseView`] instead of
+/// cloning it. The loop it builds reads the same ends, directions and chains,
+/// so every coedge, pcurve and source is the clone path's to the byte.
+/// Measured on the filleted box's outward offset (D1), whose two arc regions
+/// hold ~270 uses each: the clone and the per-comparison tag parse were
+/// 0.43 of build_loop's 0.49 ms per attempt (cad-bot fast build, plain).
+fn loop_view_enabled() -> bool {
+    switch!("BREP_FRAGMENT_LOOP_VIEW", true)
+}
+
+
+fn build_loop_uses<U: LoopUse>(
+    mut uses: Vec<U>,
+    reverse: bool,
+    chains: &[Chain],
+    tolerance: f64,
+    surface: &NurbsSurface,
+) -> Result<Option<FragmentLoop>, KernelRefusal> {
     if reverse {
         uses.reverse();
         for usage in &mut uses {
-            usage.forward = !usage.forward;
+            usage.set_forward(!usage.forward());
         }
     }
     let mut start = 0;
     for index in 0..uses.len() {
-        if chain_index(&uses[(index + uses.len() - 1) % uses.len()])? != chain_index(&uses[index])?
+        if uses[(index + uses.len() - 1) % uses.len()].chain()? != uses[index].chain()?
         {
             start = index;
             break;
@@ -320,25 +482,25 @@ pub(super) fn build_loop(
     let mut coedges = Vec::new();
     let mut index = 0;
     while index < uses.len() {
-        let chain_id = chain_index(&uses[index])?;
+        let chain_id = uses[index].chain()?;
         let mut run_end_index = index + 1;
-        while run_end_index < uses.len() && chain_index(&uses[run_end_index])? == chain_id {
+        while run_end_index < uses.len() && uses[run_end_index].chain()? == chain_id {
             run_end_index += 1;
         }
         let chain = chains
             .get(chain_id)
             .ok_or_else(|| KernelRefusal::internal(KernelStage::Fragment, "fragment.loops", "fragment_face: unknown arrangement chain"))?;
         let run = &uses[index..run_end_index];
-        let run_start = if run[0].forward {
-            run[0].piece.a
+        let run_start = if run[0].forward() {
+            run[0].a()
         } else {
-            run[0].piece.b
+            run[0].b()
         };
         let last = &run[run.len() - 1];
-        let run_end = if last.forward {
-            last.piece.b
+        let run_end = if last.forward() {
+            last.b()
         } else {
-            last.piece.a
+            last.a()
         };
         let epsilon = tolerance * 20.0;
         let chain_closed = chain.start.sub(chain.end).length() <= epsilon;
@@ -383,7 +545,7 @@ pub(super) fn build_loop(
                 };
                 let start_tolerance = (epsilon * 20.0).max(chord_tolerance(run_start) * 1.01);
                 let end_tolerance = (epsilon * 20.0).max(chord_tolerance(run_end) * 1.01);
-                if std::env::var("BREP_DEBUG_FRAG").is_ok() {
+                if env_read!("BREP_DEBUG_FRAG").is_some() {
                     eprintln!(
                         "partial run: chain {chain_id} count={} run={} complete={complete} span={parameter_span:.6e} \
                          start(d={:.6e} tol={:.6e} f={:.9}) end(d={:.6e} tol={:.6e} f={:.9})",
@@ -474,21 +636,21 @@ pub(super) fn build_loop(
             if !chain_closed && run_start.sub(run_end).length() <= epsilon {
                 return Ok(None);
             }
-            if std::env::var("BREP_DEBUG_FRAG").is_ok() {
+            if env_read!("BREP_DEBUG_FRAG").is_some() {
                 eprintln!(
                     "incomplete run: chain {chain_id} count={} closed={} start=({:.9},{:.9}) end=({:.9},{:.9}); run len={} start=({:.9},{:.9}) end=({:.9},{:.9}) epsilon={:.3e}",
                     chain.count, chain_closed, chain.start.x, chain.start.y, chain.end.x, chain.end.y,
                     run.len(), run_start.x, run_start.y, run_end.x, run_end.y, epsilon
                 );
                 for usage in run {
-                    eprintln!("   use fwd={} a=({:.9},{:.9}) b=({:.9},{:.9})", usage.forward, usage.piece.a.x, usage.piece.a.y, usage.piece.b.x, usage.piece.b.y);
+                    eprintln!("   use fwd={} a=({:.9},{:.9}) b=({:.9},{:.9})", usage.forward(), usage.a().x, usage.a().y, usage.b().x, usage.b().y);
                 }
             }
             return Err(KernelRefusal::internal(KernelStage::Fragment, "fragment.loops", format!(
                 "fragment_face: chain {chain_id} fragmented into an incomplete run"
             )));
         }
-        let chain_forward = run[0].forward;
+        let chain_forward = run[0].forward();
         match &chain.source {
             ChainSource::Boundary { coedge: source, .. } => coedges.push(FragmentCoedge {
                 source: FragmentEdgeSource::Boundary {

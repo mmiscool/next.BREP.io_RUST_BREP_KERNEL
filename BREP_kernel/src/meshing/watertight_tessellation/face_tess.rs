@@ -120,15 +120,7 @@ impl Bridged {
 /// ear clip as before 2026-10-17; unset or anything else takes the CDT first.
 /// Read once; the browser build reads the default.
 fn developable_cdt_enabled() -> bool {
-    #[cfg(target_arch = "wasm32")]
-    {
-        true
-    }
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ENABLED.get_or_init(|| std::env::var("BREP_TESS_DEVELOPABLE_CDT").as_deref() != Ok("0"))
-    }
+    switch!("BREP_TESS_DEVELOPABLE_CDT", true)
 }
 
 pub(super) fn tessellate_face_watertight(

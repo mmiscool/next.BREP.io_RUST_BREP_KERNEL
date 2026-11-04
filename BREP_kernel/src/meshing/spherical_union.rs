@@ -388,26 +388,5 @@ pub fn reconstruct_spherical_mesh_union(
 }
 
 fn point_triangle_distance(p: Vec3, [a, b, c]: [Vec3; 3]) -> f64 {
-    let ab = b.sub(a);
-    let ac = c.sub(a);
-    let ap = p.sub(a);
-    let n = ab.cross(ac);
-    let nn = n.length_squared();
-    if nn > 0. {
-        let projection = p.sub(n.scale(ap.dot(n) / nn));
-        if [(a, b), (b, c), (c, a)]
-            .iter()
-            .all(|&(x, y)| y.sub(x).cross(projection.sub(x)).dot(n) >= -1e-14 * nn)
-        {
-            return ap.dot(n).abs() / nn.sqrt();
-        }
-    }
-    [(a, b), (b, c), (c, a)]
-        .iter()
-        .map(|&(x, y)| {
-            let edge = y.sub(x);
-            let t = (p.sub(x).dot(edge) / edge.length_squared()).clamp(0., 1.);
-            p.sub(x.add(edge.scale(t))).length()
-        })
-        .fold(f64::INFINITY, f64::min)
+    p.sub(crate::closest_point_on_triangle(p, a, b, c)).length()
 }

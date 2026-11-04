@@ -268,10 +268,10 @@ pub(crate) fn line_meets_offset_cylinder(
     if disc < 0.0 {
         return Err(OffsetPairDegeneracy::NoRealIntersection);
     }
-    let sq = disc.sqrt();
+    let roots = crate::poly::solve_quadratic(c, b, a);
     Ok([
-        line.point.add(line.direction.scale((-b - sq) / (2.0 * a))),
-        line.point.add(line.direction.scale((-b + sq) / (2.0 * a))),
+        line.point.add(line.direction.scale(roots[0])),
+        line.point.add(line.direction.scale(roots[1])),
     ])
 }
 
@@ -499,8 +499,7 @@ pub(crate) mod diag {
     /// Off unless `BREP_OFFSET_PAIR_DIAG` is set; the only cost on the hot path
     /// when off is one `OnceLock` read.
     pub(crate) fn enabled() -> bool {
-        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ON.get_or_init(|| std::env::var("BREP_OFFSET_PAIR_DIAG").is_ok())
+        debug_flag!("BREP_OFFSET_PAIR_DIAG")
     }
 
     fn ulps(a: f64, b: f64) -> u64 {

@@ -25,6 +25,7 @@
 //! polls its requests each frame with a waker that repaints, like S7's panel.
 //! Nothing here is constructed without a server.
 
+use crate::http::query_component;
 use crate::plm::PlmFuture;
 use eframe::egui;
 use std::collections::HashMap;
@@ -95,29 +96,12 @@ pub struct Upload {
 
 impl Upload {
     /// A file with its media type and kind worked out from its name
-    /// ([`media_type_for`], [`kind_for`]).
+    /// ([`crate::store::media_type`], the type a download of it carries too;
+    /// [`kind_for`]). The server shows only a few safe types inline; this only
+    /// names the type.
     pub fn of(name: &str, bytes: Vec<u8>) -> Self {
-        let media_type = media_type_for(name).to_string();
+        let media_type = crate::store::media_type(name).to_string();
         Upload { name: name.to_string(), kind: kind_for(&media_type).to_string(), media_type, note: String::new(), bytes }
-    }
-}
-
-/// The media type a CAD user's files are sent as, by extension. The server
-/// shows only a few safe types inline; this only names the type.
-pub fn media_type_for(name: &str) -> &'static str {
-    let extension = name.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase()).unwrap_or_default();
-    match extension.as_str() {
-        "pdf" => "application/pdf",
-        "step" | "stp" => "model/step",
-        "stl" => "model/stl",
-        "png" => "image/png",
-        "jpg" | "jpeg" => "image/jpeg",
-        "svg" => "image/svg+xml",
-        "dxf" => "image/vnd.dxf",
-        "txt" | "md" => "text/plain",
-        "csv" => "text/csv",
-        "json" | "nbrep" | "fbrep" | "tbrep" => "application/json",
-        _ => "application/octet-stream",
     }
 }
 
@@ -148,18 +132,6 @@ pub fn human_size(bytes: u64) -> String {
     }
 }
 
-/// Percent-encode a query or path value.
-fn encode(text: &str) -> String {
-    let mut out = String::new();
-    for byte in text.bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => out.push(byte as char),
-            _ => out.push_str(&format!("%{byte:02X}")),
-        }
-    }
-    out
-}
-
 /// The PLM's attachment routes, as this panel needs them. An `Err` is the
 /// sentence to show: the server's refusal, word for word, or why no answer
 /// came.
@@ -177,7 +149,7 @@ pub struct PlmAttachments {
 impl PartAttachments for PlmAttachments {
     fn list(&self, part: &str, revision: &str) -> PlmFuture<AttachmentList> {
         let client = self.client.clone();
-        let path = format!("/api/parts/{}/attachments?revision={}", encode(part), encode(revision));
+        let path = format!("/api/parts/{}/attachments?revision={}", query_component(part), query_component(revision));
         Box::pin(async move {
             let response = client.call("GET", &path, None).await.map_err(|e| e.to_string())?;
             serde_json::from_slice(&response.body)
@@ -187,17 +159,17 @@ impl PartAttachments for PlmAttachments {
 
     fn download(&self, id: &str) -> PlmFuture<Vec<u8>> {
         let client = self.client.clone();
-        let path = format!("/api/attachments/{}", encode(id));
+        let path = format!("/api/attachments/{}", query_component(id));
         Box::pin(async move { Ok(client.call("GET", &path, None).await.map_err(|e| e.to_string())?.body) })
     }
 
     fn upload(&self, part: &str, revision: Option<&str>, upload: &Upload) -> PlmFuture<Attachment> {
         let client = self.client.clone();
         let base = match revision {
-            Some(rev) => format!("/api/parts/{}/revisions/{}/attachments", encode(part), encode(rev)),
-            None => format!("/api/parts/{}/attachments", encode(part)),
+            Some(rev) => format!("/api/parts/{}/revisions/{}/attachments", query_component(part), query_component(rev)),
+            None => format!("/api/parts/{}/attachments", query_component(part)),
         };
-        let path = format!("{base}?name={}&kind={}&note={}", encode(&upload.name), encode(&upload.kind), encode(&upload.note));
+        let path = format!("{base}?name={}&kind={}&note={}", query_component(&upload.name), query_component(&upload.kind), query_component(&upload.note));
         let (bytes, media_type) = (upload.bytes.clone(), upload.media_type.clone());
         Box::pin(async move {
             let response = client.call_typed("POST", &path, bytes, &media_type).await.map_err(|e| e.to_string())?;

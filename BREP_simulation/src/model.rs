@@ -26,6 +26,7 @@ pub const FPS_RANGE: std::ops::RangeInclusive<u32> = 1..=120;
 pub const DEFAULT_DURATION: f64 = 4.0;
 pub const DEFAULT_FPS: u32 = 30;
 
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Simulation {
@@ -39,6 +40,7 @@ pub struct Simulation {
     pub id_counter: u64,
 }
 
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Study {
@@ -60,6 +62,7 @@ pub struct Study {
     pub motion: Option<Value>,
 }
 
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Interference {
@@ -74,6 +77,7 @@ impl Default for Interference {
 }
 
 /// A mate driven over time. Its kind (distance or angle) is the constraint's.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Motor {
@@ -87,6 +91,7 @@ pub struct Motor {
 }
 
 /// How a motor's value moves.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "mode", rename_all = "camelCase")]
 pub enum Drive {
@@ -106,6 +111,7 @@ pub enum Drive {
 }
 
 /// The motion profiles a motor can follow.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Shape {
@@ -132,6 +138,7 @@ impl Shape {
 pub const DEFAULT_ACCEL: f64 = 0.25;
 
 /// One timeline row other than a motor, active over `[from, to]`.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Clip {
@@ -142,6 +149,7 @@ pub struct Clip {
     pub body: ClipBody,
 }
 
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum ClipBody {

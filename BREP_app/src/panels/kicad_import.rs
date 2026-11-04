@@ -628,14 +628,14 @@ pub fn import_part(state: &mut EngineState, part: &KicadPart) -> Result<Imported
     let mut features = Vec::new();
     let mut summary = Vec::new();
     if let Some(symbol) = &part.symbol {
-        summary.push(format!("symbol {} ({} pins)", symbol.library_id, symbol.pins.len()));
+        summary.push(format!("symbol {} ({})", symbol.library_id, crate::panels::count(symbol.pins.len(), "pin", "pins")));
     }
     if let Some(footprint) = &part.footprint {
         summary.push(format!("{} pads", footprint.pads.len()));
     }
     if let Some(model) = &part.model {
         features.push(model_feature(state, model)?);
-        summary.push(format!("3D model ({} bodies)", model.bodies.len()));
+        summary.push(format!("3D model ({})", crate::panels::count(model.bodies.len(), "body", "bodies")));
     }
     let mut ports_block = None;
     if let Some(symbol) = &part.symbol {
@@ -1272,7 +1272,7 @@ impl KicadImport {
                     let symbol = &symbols[index];
                     let row = ui.selectable_label(
                         *selected == Some(index),
-                        format!("{}  ({} pins)", symbol.library_id, symbol.pins.len()),
+                        format!("{}  ({})", symbol.library_id, crate::panels::count(symbol.pins.len(), "pin", "pins")),
                     );
                     hit(&format!("symbol:{}", symbol.library_id), &row);
                     if row.clicked() {
@@ -1413,12 +1413,12 @@ fn show_review(ui: &mut egui::Ui, part: &KicadPart, warnings: &[String], reading
     fact(
         ui,
         "Symbol",
-        part.symbol.as_ref().map_or("none".into(), |s| format!("{} ({} pins)", s.library_id, s.pins.len())),
+        part.symbol.as_ref().map_or("none".into(), |s| format!("{} ({})", s.library_id, crate::panels::count(s.pins.len(), "pin", "pins"))),
     );
     fact(
         ui,
         "Pads",
-        part.footprint.as_ref().map_or("none".into(), |f| format!("{} ({} pads)", f.name, f.pads.len())),
+        part.footprint.as_ref().map_or("none".into(), |f| format!("{} ({})", f.name, crate::panels::count(f.pads.len(), "pad", "pads"))),
     );
     if let (Some(_), Some(file)) = (&part.footprint, &part.footprint_file) {
         path_label(ui, file);
@@ -1432,7 +1432,7 @@ fn show_review(ui: &mut egui::Ui, part: &KicadPart, warnings: &[String], reading
             });
         }
         (Some(m), None) => {
-            fact(ui, "3D model", format!("{} bodies", m.bodies.len()));
+            fact(ui, "3D model", crate::panels::count(m.bodies.len(), "body", "bodies"));
             path_label(ui, &m.step_file);
             ui.weak(format!(
                 "offset {:?} mm, rotation {:?}°, scale {:?}",

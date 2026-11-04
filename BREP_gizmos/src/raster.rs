@@ -63,7 +63,7 @@ pub fn render_overlay_png(
         }
     }
 
-    encode_png(&rgb, width, height)
+    encode_png(&rgb, width, height, png::ColorType::Rgb).expect("raster PNG")
 }
 
 fn view_depth(camera: &GizmoCamera, p: Vec3) -> f32 {
@@ -135,16 +135,20 @@ fn draw_line(rgb: &mut [u8], w: usize, h: usize, a: [f32; 2], b: [f32; 2], col: 
     }
 }
 
-fn encode_png(rgb: &[u8], width: u32, height: u32) -> Vec<u8> {
+pub fn encode_png(rgb: &[u8], width: u32, height: u32, color: png::ColorType) -> Result<Vec<u8>, String> {
     let mut out = Vec::new();
     {
         let mut encoder = png::Encoder::new(&mut out, width, height);
-        encoder.set_color(png::ColorType::Rgb);
+        encoder.set_color(color);
         encoder.set_depth(png::BitDepth::Eight);
-        let mut writer = encoder.write_header().expect("png header");
-        writer.write_image_data(rgb).expect("png data");
+        let mut writer = encoder
+            .write_header()
+            .map_err(|error| format!("png header: {error}"))?;
+        writer
+            .write_image_data(rgb)
+            .map_err(|error| format!("png data: {error}"))?;
     }
-    out
+    Ok(out)
 }
 
 /// A simple ortho view_proj (world→clip) looking from `eye` at `target`, +Z up
@@ -159,3 +163,4 @@ pub fn test_view_proj(eye: [f32; 3], target: [f32; 3], width: f32, height: f32) 
     let up = if fwd.z.abs() > 0.9 { Vec3::Y } else { Vec3::Z };
     crate::math::ortho_view_proj(eye, fwd, up, 6.0, width, height)
 }
+

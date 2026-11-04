@@ -16,6 +16,33 @@
 use super::*;
 use crate::{KernelRefusal, NurbsSurface, OrRefuse};
 
+/// The surface normal at `(u, v)`, or — where the parametrization has a pole
+/// there (an exact sphere octant's pole, lane N `BREP_BLEND_EXACT_OCTANT`) and
+/// the derivative cross product vanishes — the normal read a hair inside the
+/// domain, which on a smooth carrier is the limit the pole's own normal is.
+/// Lane O 2026-10-28: the octant's pole vertex is also a corner the joint
+/// solve moves, and the bare read refused it ("Vec3.normalized: zero-length
+/// vector"). A point the hair cannot read either keeps the refusal.
+fn normal_at_or_near(surface: &NurbsSurface, u: f64, v: f64) -> Result<Vec3, KernelRefusal> {
+    if let Ok(normal) = surface.normal(u, v) {
+        return Ok(normal);
+    }
+    let [u0, u1] = surface.domain_u().or_refuse(KernelStage::Refine, "joint_offset_normal")?;
+    let [v0, v1] = surface.domain_v().or_refuse(KernelStage::Refine, "joint_offset_normal")?;
+    let (hair_u, hair_v) = (1e-7 * (u1 - u0), 1e-7 * (v1 - v0));
+    let toward = |value: f64, low: f64, high: f64, hair: f64| if value - low < high - value { value + hair } else { value - hair };
+    for (nu, nv) in [
+        (u, toward(v, v0, v1, hair_v)),
+        (toward(u, u0, u1, hair_u), v),
+        (toward(u, u0, u1, hair_u), toward(v, v0, v1, hair_v)),
+    ] {
+        if let Ok(normal) = surface.normal(nu, nv) {
+            return Ok(normal);
+        }
+    }
+    surface.normal(u, v).or_refuse(KernelStage::Refine, "joint_offset_normal")
+}
+
 fn meet(
     mut point: Vec3,
     surfaces: &[&NurbsSurface],
@@ -36,9 +63,7 @@ fn meet(
             }
             .or_refuse(KernelStage::Refine, "joint_offset_projection")?;
             seeds[index] = Some((foot.u, foot.v));
-            let normal = surface
-                .normal(foot.u, foot.v)
-                .or_refuse(KernelStage::Refine, "joint_offset_normal")?;
+            let normal = normal_at_or_near(surface, foot.u, foot.v)?;
             // A support equation measures normal departure. Tangential
             // departure from a finite plane is handled by the rebuilt trim.
             let residual = point.sub(foot.point).dot(normal);

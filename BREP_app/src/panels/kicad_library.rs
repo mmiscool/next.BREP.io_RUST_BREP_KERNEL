@@ -860,7 +860,7 @@ impl KicadLibraryWindow {
                     }
                     let row = ui.selectable_label(
                         false,
-                        format!("{}  ({} pins)", symbol.library_id, symbol.pins.len()),
+                        format!("{}  ({})", symbol.library_id, crate::panels::count(symbol.pins.len(), "pin", "pins")),
                     );
                     if row.clicked() {
                         read = Some(symbol.clone());
@@ -1034,19 +1034,19 @@ fn show_review(ui: &mut egui::Ui, part: &KicadPart, warnings: &[String]) {
         ui.label(
             part.symbol
                 .as_ref()
-                .map_or("none".into(), |s| format!("{} ({} pins)", s.library_id, s.pins.len())),
+                .map_or("none".into(), |s| format!("{} ({})", s.library_id, crate::panels::count(s.pins.len(), "pin", "pins"))),
         );
         ui.end_row();
         ui.label("Pads");
         ui.label(match (&part.footprint, &part.footprint_file) {
-            (Some(f), Some(file)) => format!("{} ({} pads) from {file}", f.name, f.pads.len()),
-            (Some(f), None) => format!("{} ({} pads)", f.name, f.pads.len()),
+            (Some(f), Some(file)) => format!("{} ({}) from {file}", f.name, crate::panels::count(f.pads.len(), "pad", "pads")),
+            (Some(f), None) => format!("{} ({})", f.name, crate::panels::count(f.pads.len(), "pad", "pads")),
             (None, _) => "none".into(),
         });
         ui.end_row();
         ui.label("3D model");
         ui.label(match &part.model {
-            Some(model) => format!("{} ({} bodies)", model.step_file, model.bodies.len()),
+            Some(model) => format!("{} ({})", model.step_file, crate::panels::count(model.bodies.len(), "body", "bodies")),
             None => "none".into(),
         });
         ui.end_row();

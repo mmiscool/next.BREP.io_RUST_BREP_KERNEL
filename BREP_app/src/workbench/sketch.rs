@@ -11,7 +11,7 @@
 //! They are therefore SHARED buttons: declared once here and appended to every
 //! workbench's row by [`super::shared_buttons`], conditional
 //! ([`WorkbenchButton::when`]) on a sketch actually being edited. Out of sketch
-//! mode the row is unchanged; in it, every workbench grows the same eleven
+//! mode the row is unchanged; in it, every workbench grows the same twelve
 //! buttons, and switching workbench mid-sketch keeps them.
 //!
 //! This replaced the sketch-mode DRAW-TOOLS STRIP (`panels::sketch`'s
@@ -55,6 +55,7 @@ pub const DRAW_TOOLS: &[(&str, &str)] = &[
     ("sketch.tool.handdraw", "handdraw"),
     ("sketch.tool.trim", "trim"),
     ("sketch.tool.pickEdges", "pickEdges"),
+    ("sketch.tool.text", "text"),
 ];
 
 /// The ENGINE tool id a draw-tool button arms, or `None` for any other id —
@@ -80,7 +81,7 @@ fn tool_armed(state: &ButtonState, id: &str) -> bool {
     state.engine.sketch_active_tool().unwrap_or("select") == tool
 }
 
-/// The eleven buttons, in the strip's old order: the ten tools, then the
+/// The twelve buttons: the eleven tools, then the
 /// one-shot Auto-constrain.
 ///
 /// Every glyph is catalogued artwork (this app ships no font fallback, so an
@@ -191,6 +192,13 @@ pub static BUTTONS: &[WorkbenchButton] = &[
         disabled: None,
         caption: None,
         menu: &[],
+    },
+    WorkbenchButton {
+        id: "sketch.tool.text", glyph: "\u{E089}",
+        ribbon_path: "Home/Sketch/Text", size: crate::workbench::CommandSize::Compact,
+        tooltip: "Text outlines (place two rectangle corners; select text to edit)",
+        when: Some(sketch_is_open), pressed: Some(|state| tool_armed(state, "sketch.tool.text")),
+        disabled: None, caption: Some(|_| "Text".into()), menu: &[],
     },
     WorkbenchButton {
         id: AUTOCONSTRAIN_BUTTON_ID,

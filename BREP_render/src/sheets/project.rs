@@ -141,6 +141,11 @@ pub struct ViewDrawing {
     /// saved view, no captured camera, a perspective camera).
     #[serde(skip_serializing_if = "String::is_empty")]
     pub error: String,
+    /// The scene names of the solids this placement draws: the model's
+    /// visible solids less the ones the saved view hides (its captured
+    /// baseline and its hide steps), in scene order.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub solids: Vec<String>,
     /// The model as VISIBLE edge lines, one polyline per visible run.
     pub edges: Vec<Vec<[f64; 2]>>,
     /// Visible runs drawn in the HIGHLIGHT stroke (the manufacturing
@@ -231,6 +236,7 @@ impl ViewDrawing {
             position: placed.position,
             scale: placed.scale,
             error: String::new(),
+            solids: Vec::new(),
             edges: Vec::new(),
             highlighted: Vec::new(),
             annotations: Vec::new(),
@@ -449,17 +455,11 @@ pub struct ViewFrame {
     pub forward: [f64; 3],
 }
 
-fn sub(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
-    [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
-}
+use crate::geometry3d::sub3 as sub;
 
-fn cross(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
-    [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]]
-}
+use crate::geometry3d::cross3 as cross;
 
-fn dot(a: [f64; 3], b: [f64; 3]) -> f64 {
-    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
-}
+use crate::geometry3d::dot3 as dot;
 
 fn norm(v: [f64; 3]) -> [f64; 3] {
     let len = dot(v, v).sqrt();
@@ -662,6 +662,7 @@ pub fn project_view_through(
         None => ViewFrame::of(camera),
     };
     out.text_mm = view.display.text_size_pt * MM_PER_POINT;
+    out.solids = drawn_solids(scene, unposed, view).iter().map(|solid| solid.name.clone()).collect();
     let cap = if out.text_mm > 1e-9 { out.text_mm } else { 12.0 * MM_PER_POINT };
     // The exact pass needs every drawn solid's B-rep; a solid whose topology
     // did not reach the scene sends the placement to the mesh approximation,
@@ -1951,15 +1952,16 @@ fn segments_of(lines: &[Vec<[f64; 2]>]) -> Vec<Vec<[f64; 2]>> {
 
 /// The solids a saved view draws, each read UN-POSED (the viewport's active
 /// view may have hidden or clipped it for its own section): visible, not
-/// hidden by the view's own `display.hidden` set, and not a committed SKETCH
-/// (a drawing shows the model, not the sketches it was built from).
+/// hidden by the view itself (`PmiView::hides`: its captured baseline or one
+/// of its hide steps), and not a committed SKETCH (a drawing shows the model,
+/// not the sketches it was built from).
 fn drawn_solids<'a>(scene: &'a RenderScene, unposed: &'a Unposed, view: &PmiView) -> Vec<&'a crate::scene::SolidDisplay> {
     scene
         .solids()
         .iter()
         .map(|solid| unposed.get(&solid.name).unwrap_or(solid))
         .filter(|solid| solid.visible && !solid.is_sketch)
-        .filter(|solid| !view.display.hidden.iter().any(|name| name == &solid.name))
+        .filter(|solid| !view.hides(&solid.name))
         .filter(|solid| solid.mesh.indices.len() >= 3)
         .collect()
 }
@@ -2877,7 +2879,10 @@ fn annotations(
         // the row out (`pdf3d::drawable`), so the sheet was the one consumer
         // that drew it. The step's dashed trace line stays: it is the row's
         // own `showTraceLine`, and the viewport draws it too.
-        let explode = matches!(row.geometry, brep_kernel::PmiGeometry::Explode { .. });
+        // (The layout itself gives neither step a fallback run any more; this
+        // keeps the sheet honest should one ever come back. A hide step is
+        // the same: it draws nothing.)
+        let explode = matches!(row.geometry, brep_kernel::PmiGeometry::Explode { .. } | brep_kernel::PmiGeometry::Hide { .. });
         let texts: Vec<SheetText> = drawn
             .texts
             .iter()

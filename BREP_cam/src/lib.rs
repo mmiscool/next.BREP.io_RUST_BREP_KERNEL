@@ -28,6 +28,7 @@ pub mod collision;
 pub mod cutter;
 pub mod cycle_time;
 pub mod error;
+pub mod geom;
 pub mod index;
 #[cfg(feature = "kernel")]
 pub mod kernel_adapter;

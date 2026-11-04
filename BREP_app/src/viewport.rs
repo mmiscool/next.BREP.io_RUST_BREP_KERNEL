@@ -49,9 +49,15 @@ struct Offscreen {
 /// plain click with MULTIPLE filter-admitted items under the pointer (and on
 /// Alt+click explicitly): the ranked, filter-respecting candidates captured when
 /// it opened + the screen anchor (cursor position) to draw the list at.
+///
+/// `reference` marks a list opened while a reference field is picking: its rows
+/// are the field's admitted candidates and a chosen row goes into the field's
+/// running list, never into the modeling selection. A list whose mode no longer
+/// matches (the picker started or ended under it) is dropped.
 struct CandidatePopup {
     anchor: egui::Pos2,
     candidates: Vec<PickCandidate>,
+    reference: bool,
 }
 
 /// The central 3D viewport: the engine's render core + the app-owned offscreen

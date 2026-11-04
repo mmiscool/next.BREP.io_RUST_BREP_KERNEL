@@ -86,6 +86,9 @@ pub struct Document {
     /// [`Documents::open_document`], the lowest number no other open untitled
     /// tab holds, so two new tabs never share a label (lane U, ruling P2).
     untitled: u32,
+    /// The tab label an agent gave an untitled document (`cad.documents.create`'s
+    /// title): display only, never a file name, so nothing is saved under it.
+    label: Option<String>,
     /// PLM write permission is independent of editing the session copy.
     plm_save_access: Option<Access>,
     /// The PLM workspace folder `(id, name)` this tab was opened from (a link
@@ -135,6 +138,12 @@ pub struct Document {
     /// a different one now" without comparing indices (closing a tab BEFORE the
     /// active one moves the index without changing the document).
     id: u64,
+    /// The committed revision an agent's write names as its expectation
+    /// ([`Document::committed_revision`]): `(content key last observed, count)`.
+    committed: std::cell::Cell<(ContentKey, u64)>,
+    /// The public handle an agent names this document by
+    /// ([`crate::handles`]); random, never stored, never reused.
+    handle: String,
     /// This document's eCAD editors — Diagram, PCB, Symbol and Pads — kept
     /// beside its engine, so each tab has its own and a tab switch keeps their
     /// pan, zoom and view: a switch rebuilds the PANELS
@@ -411,7 +420,10 @@ impl Document {
             marker_key: None,
             dirty_checks: 0,
             id: next_document_id(),
+            committed: std::cell::Cell::new((((0, 0), 0), 0)),
+            handle: crate::handles::mint("doc"),
             untitled: 1,
+            label: None,
             ecad: crate::workbench::ecad::Editors::new(),
             ecad_blocks: ecad_blocks(),
             ecad_parts_revision: None,
@@ -446,7 +458,10 @@ impl Document {
             marker_key: None,
             dirty_checks: 0,
             id: next_document_id(),
+            committed: std::cell::Cell::new((((0, 0), 0), 0)),
+            handle: crate::handles::mint("doc"),
             untitled: 1,
+            label: None,
             ecad: crate::workbench::ecad::Editors::new(),
             ecad_blocks: ecad_blocks(),
             ecad_parts_revision: None,
@@ -518,8 +533,13 @@ impl Document {
             Some(name) => crate::panels::plm_host::revision_of(name)
                 .map(|(part, revision)| format!("{part}/{revision}"))
                 .unwrap_or_else(|| crate::store::model_display_name(name)),
-            None => self.untitled_title(),
+            None => self.label.clone().unwrap_or_else(|| self.untitled_title()),
         }
+    }
+
+    /// Give an untitled document a display label (see `label`).
+    pub fn set_label(&mut self, label: Option<String>) {
+        self.label = label;
     }
 
     /// What an untitled document is called, and what Save As offers for it.
@@ -850,6 +870,36 @@ impl Document {
     pub fn id(&self) -> u64 {
         self.id
     }
+
+    /// The public handle (`doc_<epoch>_<nonce>`) automation names it by.
+    pub fn handle(&self) -> &str {
+        &self.handle
+    }
+
+    /// The document's committed revision: a per-document count that moves
+    /// whenever its `content_key` has moved since the last observation —
+    /// a history edit, undo and redo (they write the history), a run's
+    /// write-back (the applied generation), a block write and an object
+    /// metadata change (the stamp). A view change (camera, selection,
+    /// workbench, tab switch, an idle frame) moves none of the three.
+    ///
+    /// Why observation is enough: all three components are monotonic process
+    /// counters, so a content key never recurs, and any change between two
+    /// observations reads as a different key at the second one. Two commits
+    /// between observations count as one step — the value is an equality token
+    /// for "nothing was written since", never a count of writes.
+    pub fn committed_revision(&self) -> u64 {
+        let key = content_key(&self.engine);
+        let (seen, revision) = self.committed.get();
+        if seen == key {
+            return revision;
+        }
+        // The first observation of a document is its revision 1 (0 is never
+        // handed out, so an unobserved document cannot match a guess of 0).
+        let next = revision + 1;
+        self.committed.set((key, next));
+        next
+    }
 }
 
 /// Every open document + which one is active. Always holds AT LEAST ONE
@@ -1014,6 +1064,21 @@ impl Documents {
         self.active
     }
 
+    /// The tab holding the document whose process-unique id is `id`.
+    pub fn index_of_id(&self, id: u64) -> Option<usize> {
+        self.open.iter().position(|doc| doc.id == id)
+    }
+
+    /// The engine of the document whose public handle is `handle` (any tab).
+    pub fn engine_of_handle_mut(&mut self, handle: &str) -> Option<&mut EngineState> {
+        self.open.iter_mut().find(|doc| doc.handle == handle).map(|doc| &mut doc.engine)
+    }
+
+    /// The tab whose public handle is `handle`.
+    pub fn index_of_handle(&self, handle: &str) -> Option<usize> {
+        self.open.iter().position(|doc| doc.handle == handle)
+    }
+
     /// The ACTIVE document's handle — the shell compares it frame to frame to
     /// notice a switch from ANY source (a tab click, a close, New, Open, Open
     /// Part, a crash-recovery restore) with one check instead of a hook per site.
@@ -1083,10 +1148,12 @@ impl Documents {
                     || doc.engine.history.ports_follow_pending());
             let doc = &self.open[index];
             if own_library {
+                let _t = crate::perf::trace("install_library_of");
                 install_library_of(doc);
             }
             let revision = parts_library_revision();
             let doc = &mut self.open[index];
+            let _t = crate::perf::trace(if own_library { "pump (landing, own library)" } else { "pump" });
             if background && !own_library && doc.engine.run_pending() {
                 doc.engine.pump_holding_runs();
             } else {
@@ -1151,15 +1218,42 @@ impl Documents {
     }
 
     /// Add `doc` as a new tab and make it active.
-    pub fn open_document(&mut self, mut doc: Document) -> usize {
+    pub fn open_document(&mut self, doc: Document) -> usize {
+        let index = self.open_document_behind(doc);
+        self.activate(index);
+        index
+    }
+
+    /// Add a tab WITHOUT activating it: the visible document, its panels and
+    /// camera stay as they are (an agent's `cad.documents.create`). Its seed
+    /// run lands as a background tab's does (`pump_all`).
+    pub fn open_document_behind(&mut self, mut doc: Document) -> usize {
         if doc.name.is_none() {
             let taken: Vec<u32> = self.open.iter().filter(|d| d.name.is_none()).map(|d| d.untitled).collect();
             doc.untitled = (1..).find(|n| !taken.contains(n)).unwrap_or(1);
         }
         self.open.push(doc);
-        let index = self.open.len() - 1;
-        self.activate(index);
-        index
+        self.open.len() - 1
+    }
+
+    /// Route an ENGINE-ONLY automation command to background tab `index`:
+    /// for the length of one handler call, `index` stands in as the active
+    /// document (so `engine()` / `engine_mut()` / `active()` resolve to it)
+    /// with its own parts library in the kernel's store. Nothing the user
+    /// sees moves — no settings carry, no live-link publish, no panel reset —
+    /// because [`Self::route_end`] puts everything back before the frame
+    /// draws. Returns the token `route_end` takes. Callers refuse routing
+    /// while a Work part is edited in place (its redirect would win).
+    pub(crate) fn route_begin(&mut self, index: usize) -> usize {
+        let visible = self.active;
+        self.active = index;
+        install_library_of(&self.open[index]);
+        visible
+    }
+
+    pub(crate) fn route_end(&mut self, visible: usize) {
+        self.active = visible.min(self.open.len().saturating_sub(1));
+        self.install_active_library();
     }
 
     /// Number the untitled tabs 1, 2, … in tab order. Only for a session being

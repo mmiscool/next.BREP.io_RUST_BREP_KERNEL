@@ -13,22 +13,12 @@ use crate::scene::{DisplayMesh, EdgeDisplay, FaceDisplay, FaceKind, SolidDisplay
 /// so the cut reads as the cut, as the hatching does on a sheet.
 pub const SECTION_CAP_RGB: [f32; 3] = [0.86, 0.42, 0.36];
 
-fn dot(a: [f64; 3], b: [f64; 3]) -> f64 {
-    (0..3).map(|i| a[i] * b[i]).sum()
-}
-fn sub(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
-    std::array::from_fn(|i| a[i] - b[i])
-}
+use crate::geometry3d::dot3 as dot;
+use crate::geometry3d::sub3 as sub;
 fn mix(a: [f64; 3], b: [f64; 3], t: f64) -> [f64; 3] {
     std::array::from_fn(|i| a[i] + (b[i] - a[i]) * t)
 }
-fn cross(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
-    [
-        a[1] * b[2] - a[2] * b[1],
-        a[2] * b[0] - a[0] * b[2],
-        a[0] * b[1] - a[1] * b[0],
-    ]
-}
+use crate::geometry3d::cross3 as cross;
 fn unit(a: [f64; 3]) -> [f64; 3] {
     let len = dot(a, a).sqrt().max(1e-20);
     a.map(|v| v / len)

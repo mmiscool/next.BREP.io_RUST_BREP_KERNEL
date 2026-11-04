@@ -686,7 +686,10 @@ fn retire(engine: &mut brep_render::engine_state::EngineState, gone: &[(String, 
         }
         lines.push(line);
     }
-    if let Some(connections) = draft["wireHarness"]["connections"].as_array_mut() {
+    // `get_mut`, not `draft[..]`: a mutable index inserts the keys it reads, which
+    // wrote `wireHarness: {connections: null}` into a document without a harness
+    // and the kernel then refused the whole history request.
+    if let Some(connections) = draft.get_mut("wireHarness").and_then(|h| h.get_mut("connections")).and_then(Value::as_array_mut) {
         let before = connections.len();
         connections.retain(|c| !["from", "to"].iter().any(|end| lost(c[end].as_str())));
         let dropped = before - connections.len();

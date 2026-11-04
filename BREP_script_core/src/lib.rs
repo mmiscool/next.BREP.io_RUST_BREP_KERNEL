@@ -22,8 +22,10 @@
 //! Boa's [`RuntimeLimits`](boa_engine::vm::RuntimeLimits) bound three things,
 //! and they are set here:
 //!
-//! * each LOOP may run at most [`LOOP_ITERATION_LIMIT`] iterations — an
-//!   infinite `while (true)` throws instead of hanging;
+//! * each CALL FRAME may run at most [`LOOP_ITERATION_LIMIT`] loop iterations
+//!   in total (Boa counts per frame, not per loop) — an infinite `while (true)`
+//!   throws instead of hanging, but a loop that calls a function whose own
+//!   loops stay under the limit is not bounded in total;
 //! * call depth is at most [`RECURSION_LIMIT`] — runaway recursion throws;
 //! * the VM stack size.
 //!
@@ -45,7 +47,7 @@ use serde_json::Value;
 /// own that could drift to another version.
 pub use boa_engine;
 
-/// The most iterations any one loop may run before it throws.
+/// The most loop iterations any one call frame may run before it throws.
 pub const LOOP_ITERATION_LIMIT: u64 = 10_000_000;
 
 /// The deepest call stack a script may build before it throws.
@@ -204,3 +206,5 @@ fn install_console(context: &mut Context, logs: &Logs) -> JsResult<()> {
 
 
 pub mod modules;
+/// The code-mode worker process (a host binary started with its worker flag).
+pub mod worker;

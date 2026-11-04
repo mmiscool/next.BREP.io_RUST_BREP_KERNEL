@@ -18,7 +18,9 @@ pub(super) fn perpendicular(axis: [f64; 3]) -> [f64; 3] {
     let n = Vec3::new(axis[0], axis[1], axis[2]);
     let helper = if n.x.abs() < 0.9 { Vec3::new(1.0, 0.0, 0.0) } else { Vec3::new(0.0, 1.0, 0.0) };
     let r = n.cross(helper);
-    let r = r.scale(1.0 / r.length());
+    let magnitude = r.length();
+    // A zero axis has no preferred spin reference; keep a finite deterministic seed.
+    let r = if magnitude == 0.0 { Vec3::X } else { r.scale(1.0 / magnitude) };
     [r.x, r.y, r.z]
 }
 

@@ -935,33 +935,14 @@ fn solve_corner(
     )))
 }
 
-/// Solve a symmetric 3×3 system by Cramer's rule. `None` when it is singular
+/// Solve a symmetric 3×3 system with relative partial pivoting. `None` when it is singular
 /// even after damping, which means the carriers constrain nothing at all.
 fn solve3(matrix: &[[f64; 3]; 3], rhs: &[f64; 3]) -> Option<[f64; 3]> {
-    let det = determinant3(matrix);
-    if det.abs() <= f64::MIN_POSITIVE {
-        return None;
-    }
-    let mut out = [0.0f64; 3];
-    for column in 0..3 {
-        let mut replaced = *matrix;
-        for row in 0..3 {
-            replaced[row][column] = rhs[row];
-        }
-        out[column] = determinant3(&replaced) / det;
-    }
-    if out.iter().all(|value| value.is_finite()) {
-        Some(out)
-    } else {
-        None
-    }
+    let out = crate::fit::solve_small(*matrix, *rhs, 3).ok()?;
+    out.iter().all(|value| value.is_finite()).then_some(out)
 }
 
-fn determinant3(m: &[[f64; 3]; 3]) -> f64 {
-    m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1])
-        - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
-        + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0])
-}
+
 
 /// Rebuild one edge as the section of its own two carriers, delimited by its
 /// own two re-solved corners.
@@ -1385,4 +1366,14 @@ fn crossed_faces(
         }
     }
     crossed
+}
+
+/// Rank diagnostic remains determinant-based even though the solve uses pivoting.
+fn determinant3(m: &[[f64; 3]; 3]) -> f64 {
+    crate::AffineTransform { elements: [
+        m[0][0], m[0][1], m[0][2], 0.0,
+        m[1][0], m[1][1], m[1][2], 0.0,
+        m[2][0], m[2][1], m[2][2], 0.0,
+        0.0, 0.0, 0.0, 1.0,
+    ] }.determinant3()
 }

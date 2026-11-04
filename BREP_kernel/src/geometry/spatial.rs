@@ -25,6 +25,69 @@ fn axis(point: Vec3, index: usize) -> f64 {
 }
 
 impl Aabb {
+    pub(crate) fn separation(self, other: Self) -> f64 {
+        let axis_gap = |a0: f64, a1: f64, b0: f64, b1: f64| {
+            if a1 < b0 {
+                b0 - a1
+            } else if b1 < a0 {
+                a0 - b1
+            } else {
+                0.0
+            }
+        };
+        Vec3::new(
+            axis_gap(self.minimum.x, self.maximum.x, other.minimum.x, other.maximum.x),
+            axis_gap(self.minimum.y, self.maximum.y, other.minimum.y, other.maximum.y),
+            axis_gap(self.minimum.z, self.maximum.z, other.minimum.z, other.maximum.z),
+        )
+        .length()
+    }
+
+    pub(crate) fn pair_scale(self, other: Self) -> f64 {
+        self.maximum
+            .sub(self.minimum)
+            .length()
+            .max(other.maximum.sub(other.minimum).length())
+            .max(1.0)
+    }
+
+
+    pub fn from_curve_controls(curve: &crate::NurbsCurve) -> Result<Self, String> {
+        let mut bounds = Self::empty();
+        for point in &curve.control_points {
+            bounds.include_point(point.point()?);
+        }
+        Ok(bounds)
+    }
+
+    /// Overlap with tolerance added to the upper operands (legacy intersector order).
+    pub(crate) fn intersects_upper(self, other: Self, tolerance: f64) -> bool {
+        self.minimum.x <= other.maximum.x + tolerance
+            && self.maximum.x + tolerance >= other.minimum.x
+            && self.minimum.y <= other.maximum.y + tolerance
+            && self.maximum.y + tolerance >= other.minimum.y
+            && self.minimum.z <= other.maximum.z + tolerance
+            && self.maximum.z + tolerance >= other.minimum.z
+    }
+
+    pub(crate) fn intersects_exact(self, other: Self) -> bool {
+        self.minimum.x <= other.maximum.x
+            && self.maximum.x >= other.minimum.x
+            && self.minimum.y <= other.maximum.y
+            && self.maximum.y >= other.minimum.y
+            && self.minimum.z <= other.maximum.z
+            && self.maximum.z >= other.minimum.z
+    }
+
+    pub(crate) fn from_nonempty_points(points: &[Vec3]) -> Option<Self> {
+        let first = *points.first()?;
+        let mut bounds = Self { minimum: first, maximum: first };
+        for &point in &points[1..] {
+            bounds.include_point(point);
+        }
+        Some(bounds)
+    }
+
     pub fn empty() -> Self {
         Self {
             minimum: Vec3::new(f64::INFINITY, f64::INFINITY, f64::INFINITY),

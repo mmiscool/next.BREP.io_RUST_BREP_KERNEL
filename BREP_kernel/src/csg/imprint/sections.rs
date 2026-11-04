@@ -295,9 +295,7 @@ pub(super) fn clip_branch_to_trims(
 /// control hull is counted off the edge without a projection. On by default
 /// (promoted 2026-10-26); `0`/`off` disables it.
 fn overlap_hull_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let enabled = *ON.get_or_init(|| !matches!(std::env::var("BREP_IMPRINT_OVERLAP_HULL").as_deref(), Ok("0") | Ok("off")));
-    enabled
+    switch!("BREP_IMPRINT_OVERLAP_HULL", true)
 }
 
 
@@ -323,9 +321,30 @@ pub(super) fn curve_overlaps_edge(curve: &NurbsCurve, edge: &EdgeRecord, limit: 
     } else {
         None
     };
+    // SEGMENT OVERLAP (lane O row 11, 2026-10-28; on by default since the batch 4
+    // promotion, `BREP_IMPRINT_SEGMENT_OVERLAP=0` takes the Newton): on a straight edge (a non-rational degree-1 curve of two
+    // equal-weight controls, linear in its parameter) the projection is a dot
+    // product, clamped to the curve's domain as `project_point_to_curve`
+    // clamps it, then to the edge's window as below; the nearest point is the
+    // control segment at that parameter. Same decision as the Newton
+    // projection to round-off; the planar sections of an outward box shell
+    // test ~130 straight edges per one-call imprint.
+    let segment = if segment_overlap_enabled() { straight_segment(&edge.curve) } else { None };
+    let [k0, k1] = edge.curve.domain().or_refuse(KernelStage::Intersect, "domain")?;
     let mut on = 0;
     for fraction in [0.1, 0.3, 0.5, 0.7, 0.9] {
         let point = curve.evaluate(c0 + (c1 - c0) * fraction).or_refuse(KernelStage::Intersect, "evaluate")?;
+        if let Some(segment) = &segment {
+            if segment.length_squared > 0.0 && k1 > k0 {
+                let along = (point.sub(segment.start).dot(segment.direction) / segment.length_squared).clamp(0.0, 1.0);
+                let parameter = (k0 + (k1 - k0) * along).clamp(low, high);
+                let nearest = segment.start.add(segment.direction.scale((parameter - k0) / (k1 - k0)));
+                if nearest.sub(point).length() <= limit {
+                    on += 1;
+                }
+                continue;
+            }
+        }
         if let Some(hull) = &hull {
             if !hull.contains(point) {
                 OVERLAP_HULL_SKIPS.with(|count| count.set(count.get() + 1));
@@ -345,14 +364,96 @@ pub(super) fn curve_overlaps_edge(curve: &NurbsCurve, edge: &EdgeRecord, limit: 
 /// distance, sampled). Used bidirectionally so the B2 span-coincidence test
 /// rejects partial overlaps and same-endpoint-but-different-path curves.
 pub(super) fn max_curve_deviation(a: &NurbsCurve, b: &NurbsCurve) -> Result<f64, KernelRefusal> {
+    max_curve_deviation_until(a, b, f64::INFINITY)
+}
+
+/// The same ordered distance samples, stopping once rejection is certain.
+/// Below `limit` this returns the exhaustive reading bit for bit. Above it
+/// only the rejection matters; later samples cannot lower the maximum.
+fn max_curve_deviation_until(a: &NurbsCurve, b: &NurbsCurve, limit: f64) -> Result<f64, KernelRefusal> {
     let [d0, d1] = a.domain().or_refuse(KernelStage::Intersect, "domain")?;
+    // STRAIGHT TARGET (lane O, 2026-10-28): the distance from a point to a
+    // segment is closed form, and along a straight `a` it is convex (the
+    // distance to a convex set), so two segments deviate most at `a`'s ends.
+    // The boundary-reuse pass of the outward box shells spent ~0.9 ms on
+    // 33 + 33 Newton projections per candidate, every one of them a line
+    // against a line; this reads the same deviation without a projection.
+    // The result is only ever compared with a band, never stored.
+    if let Some(segment) = segment_deviation_on().then(|| straight_segment(b)).flatten() {
+        let stations: &[f64] = if straight_segment(a).is_some() { &[0.0, 1.0] } else { &SAMPLE_FRACTIONS };
+        let mut worst = 0.0f64;
+        for fraction in stations {
+            let point = a.evaluate(d0 + (d1 - d0) * fraction).or_refuse(KernelStage::Intersect, "evaluate")?;
+            worst = worst.max(segment.distance(point));
+        }
+        return Ok(worst);
+    }
     let mut worst = 0.0f64;
     for k in 0..=32 {
         let t = d0 + (d1 - d0) * (k as f64 / 32.0);
         let point = a.evaluate(t).or_refuse(KernelStage::Intersect, "evaluate")?;
         worst = worst.max(project_point_to_curve(b, point).or_refuse(KernelStage::Intersect, "project_point_to_curve")?.distance);
+        if worst > limit {
+            break;
+        }
     }
     Ok(worst)
+}
+
+/// The straight-target read of [`max_curve_deviation`], on unless
+/// `BREP_IMPRINT_SEGMENT_DEVIATION` is `0`/`off` (the A/B lever). Read once.
+fn segment_deviation_on() -> bool {
+    switch!("BREP_IMPRINT_SEGMENT_DEVIATION", true)
+}
+
+/// The segment overlap read of [`curve_overlaps_edge`] (row 11): on by
+/// default since the batch 4 promotion; `BREP_IMPRINT_SEGMENT_OVERLAP=0` turns
+/// it off. Read once.
+pub(super) fn segment_overlap_enabled() -> bool {
+    switch!("BREP_IMPRINT_SEGMENT_OVERLAP", true)
+}
+
+
+/// The 33 equal fractions of `max_curve_deviation`'s sampled read.
+const SAMPLE_FRACTIONS: [f64; 33] = {
+    let mut fractions = [0.0f64; 33];
+    let mut k = 0;
+    while k < 33 {
+        fractions[k] = k as f64 / 32.0;
+        k += 1;
+    }
+    fractions
+};
+
+/// A degree-1 curve of two equal-weight control points, as the segment it is.
+struct Segment {
+    start: Vec3,
+    direction: Vec3,
+    length_squared: f64,
+}
+
+impl Segment {
+    /// Distance from `point` to the segment, the nearest parameter clamped to
+    /// the segment's ends exactly as `project_point_to_curve` clamps to the
+    /// curve's domain.
+    fn distance(&self, point: Vec3) -> f64 {
+        let offset = point.sub(self.start);
+        let t = if self.length_squared > 0.0 { (offset.dot(self.direction) / self.length_squared).clamp(0.0, 1.0) } else { 0.0 };
+        offset.sub(self.direction.scale(t)).length()
+    }
+}
+
+fn straight_segment(curve: &NurbsCurve) -> Option<Segment> {
+    if curve.degree != 1 || curve.control_points.len() != 2 {
+        return None;
+    }
+    let [first, second] = [curve.control_points[0], curve.control_points[1]];
+    if first.w <= 0.0 || (first.w - second.w).abs() > 1e-12 * first.w.abs() {
+        return None;
+    }
+    let (start, end) = (first.point().ok()?, second.point().ok()?);
+    let direction = end.sub(start);
+    Some(Segment { start, direction, length_squared: direction.dot(direction) })
 }
 
 /// The sub-curve of `curve` over the parameter window `[lo, hi]`, by exact
@@ -401,9 +502,7 @@ fn curve_param_subrange(curve: &NurbsCurve, lo: f64, hi: f64) -> Result<NurbsCur
 /// in [`reuse_boundary_section_edges`]. On by default (promoted 2026-10-26);
 /// `0`/`off` disables it.
 fn reuse_hull_gate_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let enabled = *ON.get_or_init(|| !matches!(std::env::var("BREP_SHARED_SECTION_HULL_GATE").as_deref(), Ok("0") | Ok("off")));
-    enabled
+    switch!("BREP_SHARED_SECTION_HULL_GATE", true)
 }
 
 
@@ -501,10 +600,19 @@ pub(super) fn reuse_boundary_section_edges(
                         let Ok(ring) = edge_subcurve(edge) else {
                             continue;
                         };
-                        let (Ok(dev_a), Ok(dev_b)) = (
-                            max_curve_deviation(&piece.curve, &ring),
-                            max_curve_deviation(&ring, &piece.curve),
-                        ) else {
+                        // The ring path used to read all 66 projections even
+                        // when the first one already disproved identity (each
+                        // old bore against each new bore on a plate face).
+                        // Preserve every passing score and its tie ordering;
+                        // only stop readings that must fail the existing bar.
+                        let limit = if reuse_hull_gate { endpoint_gate } else { f64::INFINITY };
+                        let Ok(dev_a) = max_curve_deviation_until(&piece.curve, &ring, limit) else {
+                            continue;
+                        };
+                        if reuse_hull_gate && dev_a > endpoint_gate {
+                            continue;
+                        }
+                        let Ok(dev_b) = max_curve_deviation_until(&ring, &piece.curve, limit) else {
                             continue;
                         };
                         let deviation = dev_a.max(dev_b);

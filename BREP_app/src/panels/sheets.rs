@@ -306,6 +306,11 @@ pub(crate) fn delete_held_object(state: &mut EngineState, id: &str) -> Result<()
 }
 
 /// The panel's transient UI state.
+/// The sheet artwork: the Drawing ribbon's Add-sheet glyph (catalogued, so it
+/// draws as an icon). The pane used U+1F5CB, which no font here carries, so
+/// its header and every sheet row showed a box (ui-polish-2026-10-28 row 8).
+const SHEET_GLYPH: &str = "\u{E077}";
+
 pub struct SheetsPanel {
     hits: HashMap<String, egui::Rect>,
     layout: ColumnLayout,
@@ -432,7 +437,7 @@ impl SheetsPanel {
         // --- header -------------------------------------------------------------
         ui.horizontal_wrapped(|ui| {
             let add = ui
-                .add(crate::icon_text::icon_button(ui, "\u{1F5CB} Add sheet"))
+                .add(crate::icon_text::icon_button(ui, &format!("{SHEET_GLYPH} Add sheet")))
                 .on_hover_text("Add an A3 sheet and open it in the sheet viewport");
             self.hits.insert("sheets:add".into(), add.rect);
             if add.clicked() {
@@ -501,7 +506,7 @@ impl SheetsPanel {
                 let count = sheet.views.len();
                 let mut row = RowNode::new(&sheet.id)
                     .cell(NAME, Value::String(sheet.name.clone()))
-                    .cell(KIND, serde_json::json!([{ "glyph": "\u{1F5CB}", "color": if is_open { ACTIVE_COLOR } else { MUTED_COLOR }, "tooltip": "drawing sheet" }]))
+                    .cell(KIND, serde_json::json!([{ "glyph": SHEET_GLYPH, "color": if is_open { ACTIVE_COLOR } else { MUTED_COLOR }, "tooltip": "drawing sheet" }]))
                     .cell(
                         VALUE,
                         Value::String(format!(
@@ -533,8 +538,12 @@ impl SheetsPanel {
                             Some(view) if view.error.is_empty() => (
                                 "\u{2713}",
                                 OK_COLOR,
-                                format!("{} edges, {} annotations", view.edges.len(), view.annotations.len()),
-                                format!("{} edges", view.edges.len()),
+                                format!(
+                                    "{}, {}",
+                                    crate::panels::count(view.edges.len(), "edge", "edges"),
+                                    crate::panels::count(view.annotations.len(), "annotation", "annotations")
+                                ),
+                                crate::panels::count(view.edges.len(), "edge", "edges"),
                             ),
                             Some(view) => ("\u{2715}", ERROR_COLOR, view.error.clone(), view.error.clone()),
                             None => ("\u{2013}", MUTED_COLOR, "open the sheet to draw it".into(), String::new()),

@@ -124,6 +124,16 @@ impl EngineState {
     }
 
     fn pump_with(&mut self, hold_runs: bool) {
+        self.history.begin_frame();
+        // A user edit refused because an agent's staged feature is evaluating
+        // is said, once per refusal, rather than silently dropped.
+        if self.history.busy_refused() > self.busy_refused_seen {
+            self.busy_refused_seen = self.history.busy_refused();
+            self.push_notice(format!(
+                "Not applied: {}. Try again when it has finished.",
+                self.history.busy().unwrap_or("an agent's change to this document is still evaluating")
+            ));
+        }
         self.pump_plugin_installations();
         // The runner REFUSED a run because its resident parts library could not
         // serve it (see `Reply::NeedPartsLibrary`). It has already forgotten
@@ -1172,6 +1182,7 @@ impl EngineState {
             .history
             .index_of(id)
             .ok_or_else(|| format!("no feature with id '{id}'"))?;
+        brep_kernel::feature_pipeline::validate_literal_feature_params(&self.feature_type_at(index).unwrap_or_default(), &params)?;
         self.stamp_face_transform_pivot(index, &mut params);
         self.history.set_feature_params(index, params);
         Ok(self.rerun_history())
@@ -1257,6 +1268,7 @@ impl EngineState {
                 .index_of(id)
                 .ok_or_else(|| format!("no feature with id '{id}'"))?;
             let mut params = params.clone();
+            brep_kernel::feature_pipeline::validate_literal_feature_params(&self.feature_type_at(index).unwrap_or_default(), &params)?;
             self.stamp_face_transform_pivot(index, &mut params);
             resolved.push((index, params));
         }
@@ -1269,6 +1281,7 @@ impl EngineState {
     pub fn add_feature(&mut self, feature_json: &str) -> Result<String, String> {
         let feature: serde_json::Value =
             serde_json::from_str(feature_json).map_err(|e| format!("feature parse: {e}"))?;
+        brep_kernel::feature_pipeline::validate_literal_feature_params(feature["type"].as_str().unwrap_or_default(), &feature["inputParams"])?;
         self.refuse_duplicate_ids(std::slice::from_ref(&feature))?;
         if !self.append_plugin_features(std::slice::from_ref(&feature))? {
             self.history.push_feature(feature);
@@ -1296,6 +1309,11 @@ impl EngineState {
     pub fn add_features(&mut self, features: &[serde_json::Value]) -> String {
         if features.is_empty() {
             return self.history_report.clone();
+        }
+        for feature in features {
+            if let Err(error) = brep_kernel::feature_pipeline::validate_literal_feature_params(feature["type"].as_str().unwrap_or_default(), &feature["inputParams"]) {
+                return serde_json::json!({"error":error}).to_string();
+            }
         }
         if let Err(error) = self.refuse_duplicate_ids(features) {
             return serde_json::json!({"error":error}).to_string();
@@ -1406,6 +1424,23 @@ impl EngineState {
         } else {
             self.history_report.clone()
         }
+    }
+
+    /// Open an undo group on this document's history: every edit until
+    /// [`Self::history_group_end`] is one undo step (a script's run).
+    pub fn history_group_begin(&mut self) -> u64 {
+        self.history.group_begin()
+    }
+
+    /// Close undo group `token`; with `rollback`, restore the document as it
+    /// was when the group opened and re-run. Whether it rolled back.
+    pub fn history_group_end(&mut self, token: u64, rollback: bool) -> Result<bool, String> {
+        let rolled = self.history.group_end(token, rollback)?;
+        if rolled {
+            self.reinstall_rewound_parts_library();
+            self.rerun_history();
+        }
+        Ok(rolled)
     }
 
     /// [`Self::undo`] without its run, for a caller that edits the document

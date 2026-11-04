@@ -1,7 +1,7 @@
 //! Binary and ASCII STL import with deterministic vertex welding.
 
 use crate::{Mesh, Vec3};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::fmt::{Display, Formatter};
 use std::fs;
 use std::io;
@@ -19,23 +19,9 @@ pub struct StlReadOptions {
     pub weld_tolerance: Option<f64>,
 }
 
-/// Encoding detected while importing an STL file.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum StlFormat {
-    /// The 80-byte-header binary STL encoding.
-    Binary,
-    /// The line-oriented ASCII STL encoding.
-    Ascii,
-}
-
-impl Display for StlFormat {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            Self::Binary => "binary",
-            Self::Ascii => "ASCII",
-        })
-    }
-}
+/// Encoding detected while importing an STL file (the kernel's STL format
+/// layer, [`brep_kernel::parse_stl_triangles`]).
+pub use brep_kernel::StlFormat;
 
 /// An imported mesh and useful ingestion statistics.
 #[derive(Clone, Debug, PartialEq)]
@@ -133,6 +119,18 @@ impl Display for StlError {
     }
 }
 
+impl From<brep_kernel::StlError> for StlError {
+    fn from(error: brep_kernel::StlError) -> Self {
+        match error {
+            brep_kernel::StlError::InvalidFormat(message) => Self::InvalidFormat(message),
+            brep_kernel::StlError::Truncated { expected, actual } => {
+                Self::Truncated { expected, actual }
+            }
+            brep_kernel::StlError::InvalidGeometry(message) => Self::InvalidGeometry(message),
+        }
+    }
+}
+
 impl std::error::Error for StlError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
@@ -162,34 +160,18 @@ pub fn read_stl_with_options(
 
 /// Parses binary or ASCII STL bytes and creates an indexed mesh.
 ///
-/// Binary structure is checked before the leading `solid` token because
-/// binary STL headers are arbitrary and commonly begin with that word.
+/// The format layer (sniffing, the binary and ASCII grammars, and their
+/// refusals) is the kernel's [`brep_kernel::parse_stl_triangles`]; this adds
+/// the options, the zero-area drops and the deterministic weld.
 pub fn parse_stl_bytes(bytes: &[u8], options: &StlReadOptions) -> Result<StlImport, StlError> {
     validate_options(options)?;
-    if bytes.is_empty() {
-        return Err(StlError::InvalidFormat("the input is empty".into()));
-    }
-
-    let binary_length = declared_binary_length(bytes);
-    let (format, triangles) = if binary_length == Some(bytes.len()) {
-        (StlFormat::Binary, parse_binary(bytes)?)
-    } else {
-        match parse_ascii(bytes) {
-            Ok(triangles) => (StlFormat::Ascii, triangles),
-            Err(ascii_error) => {
-                if let Some(expected) = binary_length {
-                    if expected > bytes.len() && looks_like_binary(bytes) {
-                        return Err(StlError::Truncated {
-                            expected,
-                            actual: bytes.len(),
-                        });
-                    }
-                }
-                return Err(ascii_error);
-            }
-        }
-    };
-    build_import(triangles, format, options)
+    let parsed = brep_kernel::parse_stl_triangles(bytes)?;
+    let triangles = parsed
+        .triangles
+        .iter()
+        .map(|triangle| triangle.map(|[x, y, z]| Vec3::new(x, y, z)))
+        .collect();
+    build_import(triangles, parsed.format, options)
 }
 
 fn validate_options(options: &StlReadOptions) -> Result<(), StlError> {
@@ -201,204 +183,6 @@ fn validate_options(options: &StlReadOptions) -> Result<(), StlError> {
         }
     }
     Ok(())
-}
-
-fn declared_binary_length(bytes: &[u8]) -> Option<usize> {
-    let count_bytes: [u8; 4] = bytes.get(80..84)?.try_into().ok()?;
-    let count = u32::from_le_bytes(count_bytes) as usize;
-    84_usize.checked_add(count.checked_mul(50)?)
-}
-
-fn looks_like_binary(bytes: &[u8]) -> bool {
-    bytes
-        .iter()
-        .take(84)
-        .any(|&byte| !matches!(byte, b'\t' | b'\n' | b'\r' | 0x20..=0x7e))
-}
-
-fn parse_binary(bytes: &[u8]) -> Result<Vec<[Vec3; 3]>, StlError> {
-    let expected = declared_binary_length(bytes)
-        .ok_or_else(|| StlError::InvalidFormat("binary header is incomplete".into()))?;
-    if expected != bytes.len() {
-        return Err(if expected > bytes.len() {
-            StlError::Truncated {
-                expected,
-                actual: bytes.len(),
-            }
-        } else {
-            StlError::InvalidFormat(format!(
-                "binary STL has {} unexpected trailing bytes",
-                bytes.len() - expected
-            ))
-        });
-    }
-    let count = (expected - 84) / 50;
-    if count == 0 {
-        return Err(StlError::InvalidGeometry(
-            "the STL contains no triangles".into(),
-        ));
-    }
-    let mut triangles = Vec::with_capacity(count);
-    for facet in 0..count {
-        let offset = 84 + facet * 50;
-        let normal = read_binary_vec3(bytes, offset)?;
-        if !normal.is_finite() {
-            return Err(StlError::InvalidGeometry(format!(
-                "facet {facet} has a non-finite normal"
-            )));
-        }
-        triangles.push([
-            read_binary_vec3(bytes, offset + 12)?,
-            read_binary_vec3(bytes, offset + 24)?,
-            read_binary_vec3(bytes, offset + 36)?,
-        ]);
-    }
-    Ok(triangles)
-}
-
-fn read_binary_vec3(bytes: &[u8], offset: usize) -> Result<Vec3, StlError> {
-    let component = |start: usize| -> Result<f64, StlError> {
-        let raw: [u8; 4] = bytes
-            .get(start..start + 4)
-            .and_then(|slice| slice.try_into().ok())
-            .ok_or_else(|| StlError::InvalidFormat("binary vector is incomplete".into()))?;
-        Ok(f32::from_le_bytes(raw) as f64)
-    };
-    Ok(Vec3::new(
-        component(offset)?,
-        component(offset + 4)?,
-        component(offset + 8)?,
-    ))
-}
-
-fn parse_ascii(bytes: &[u8]) -> Result<Vec<[Vec3; 3]>, StlError> {
-    let text = std::str::from_utf8(bytes)
-        .map_err(|_| StlError::InvalidFormat("ASCII STL is not valid UTF-8".into()))?;
-    let lines: Vec<(usize, &str)> = text
-        .lines()
-        .enumerate()
-        .filter_map(|(index, line)| {
-            let trimmed = line.trim();
-            (!trimmed.is_empty()).then_some((index + 1, trimmed))
-        })
-        .collect();
-    let Some(&(first_line, first_raw)) = lines.first() else {
-        return Err(StlError::InvalidFormat("the input is empty".into()));
-    };
-    let first = first_raw.strip_prefix('\u{feff}').unwrap_or(first_raw);
-    if !first
-        .split_whitespace()
-        .next()
-        .is_some_and(|token| token.eq_ignore_ascii_case("solid"))
-    {
-        return Err(StlError::InvalidFormat(format!(
-            "line {first_line}: ASCII STL must begin with 'solid'"
-        )));
-    }
-
-    let mut cursor = 1;
-    let mut triangles = Vec::new();
-    while cursor < lines.len() {
-        let (line_number, line) = lines[cursor];
-        if line
-            .split_whitespace()
-            .next()
-            .is_some_and(|token| token.eq_ignore_ascii_case("endsolid"))
-        {
-            cursor += 1;
-            if cursor != lines.len() {
-                return Err(StlError::InvalidFormat(format!(
-                    "line {}: content follows 'endsolid'",
-                    lines[cursor].0
-                )));
-            }
-            break;
-        }
-        let normal = parse_prefixed_vec3(line_number, line, &["facet", "normal"])?;
-        if !normal.is_finite() {
-            return Err(StlError::InvalidGeometry(format!(
-                "line {line_number}: facet normal is non-finite"
-            )));
-        }
-        cursor += 1;
-        expect_ascii_line(&lines, cursor, &["outer", "loop"])?;
-        cursor += 1;
-        let mut vertices = [Vec3::ZERO; 3];
-        for vertex in &mut vertices {
-            let &(number, source) = lines
-                .get(cursor)
-                .ok_or_else(|| StlError::InvalidFormat("ASCII STL ends inside a facet".into()))?;
-            *vertex = parse_prefixed_vec3(number, source, &["vertex"])?;
-            cursor += 1;
-        }
-        expect_ascii_line(&lines, cursor, &["endloop"])?;
-        cursor += 1;
-        expect_ascii_line(&lines, cursor, &["endfacet"])?;
-        cursor += 1;
-        triangles.push(vertices);
-    }
-    if triangles.is_empty() {
-        return Err(StlError::InvalidGeometry(
-            "the STL contains no triangles".into(),
-        ));
-    }
-    Ok(triangles)
-}
-
-fn expect_ascii_line(
-    lines: &[(usize, &str)],
-    cursor: usize,
-    expected: &[&str],
-) -> Result<(), StlError> {
-    let &(number, source) = lines
-        .get(cursor)
-        .ok_or_else(|| StlError::InvalidFormat("ASCII STL ends inside a facet".into()))?;
-    let tokens: Vec<_> = source.split_whitespace().collect();
-    if tokens.len() == expected.len()
-        && tokens
-            .iter()
-            .zip(expected)
-            .all(|(actual, expected)| actual.eq_ignore_ascii_case(expected))
-    {
-        Ok(())
-    } else {
-        Err(StlError::InvalidFormat(format!(
-            "line {number}: expected '{}'",
-            expected.join(" ")
-        )))
-    }
-}
-
-fn parse_prefixed_vec3(
-    line_number: usize,
-    source: &str,
-    prefix: &[&str],
-) -> Result<Vec3, StlError> {
-    let tokens: Vec<_> = source.split_whitespace().collect();
-    if tokens.len() != prefix.len() + 3
-        || !tokens[..prefix.len()]
-            .iter()
-            .zip(prefix)
-            .all(|(actual, expected)| actual.eq_ignore_ascii_case(expected))
-    {
-        return Err(StlError::InvalidFormat(format!(
-            "line {line_number}: expected '{} x y z'",
-            prefix.join(" ")
-        )));
-    }
-    let mut values = [0.0; 3];
-    for (index, token) in tokens[prefix.len()..].iter().enumerate() {
-        values[index] = token.parse::<f64>().map_err(|_| {
-            StlError::InvalidFormat(format!("line {line_number}: '{token}' is not a number"))
-        })?;
-    }
-    let vector = Vec3::new(values[0], values[1], values[2]);
-    if !vector.is_finite() {
-        return Err(StlError::InvalidGeometry(format!(
-            "line {line_number}: vector contains a non-finite value"
-        )));
-    }
-    Ok(vector)
 }
 
 fn build_import(
@@ -507,6 +291,9 @@ fn facet_has_area(points: [Vec3; 3], facet: usize) -> Result<bool, StlError> {
     Ok(cross.length_squared() != 0.0)
 }
 
+/// The kernel's tolerance weld ([`brep_kernel::VertexWeld`]: `floor` cells
+/// of twice the tolerance, a match at `distance <= tolerance`, the
+/// lowest-index matching vertex) over the kept facets' corners in order.
 fn weld_vertices(
     source: &[(usize, [Vec3; 3])],
     bbox_min: Vec3,
@@ -517,53 +304,31 @@ fn weld_vertices(
     if tolerance == 0.0 {
         return weld_exact(source, dropped);
     }
-    // Leave headroom for the neighbor-cell offsets below.
-    if diagonal / tolerance > (i64::MAX - 2) as f64 {
+    // The weld keys absolute cells floor(p / 2 tol); leave headroom for the
+    // neighbour offsets on the largest coordinate the box reaches.
+    let reach = diagonal + bbox_min.x.abs().max(bbox_min.y.abs()).max(bbox_min.z.abs());
+    if !(reach / tolerance <= (i64::MAX - 2) as f64) {
         return Err(StlError::InvalidOptions(
             "weld_tolerance is too small relative to the model size; use zero for exact welding"
                 .into(),
         ));
     }
 
+    let mut weld = brep_kernel::VertexWeld::new(tolerance);
     let mut vertices = Vec::<Vec3>::new();
-    let mut cells = BTreeMap::<[i64; 3], Vec<u32>>::new();
     let mut triangles = Vec::with_capacity(source.len());
     for &(facet, points) in source {
         let mut triangle = [0_u32; 3];
         for (corner, &point) in points.iter().enumerate() {
-            let key = cell_key(point, bbox_min, tolerance)?;
-            let mut matched = None;
-            for dx in -1..=1 {
-                for dy in -1..=1 {
-                    for dz in -1..=1 {
-                        let neighbor = [key[0] + dx, key[1] + dy, key[2] + dz];
-                        if let Some(candidates) = cells.get(&neighbor) {
-                            for &candidate in candidates {
-                                let delta = (point - vertices[candidate as usize]) / tolerance;
-                                if delta.length_squared() <= 1.0
-                                    && matched.is_none_or(|current| candidate < current)
-                                {
-                                    matched = Some(candidate);
-                                }
-                            }
-                        }
-                    }
-                }
+            let index = weld.weld([point.x, point.y, point.z]);
+            if index == vertices.len() {
+                vertices.push(point);
             }
-            let index = match matched {
-                Some(index) => index,
-                None => {
-                    let index = u32::try_from(vertices.len()).map_err(|_| {
-                        StlError::InvalidGeometry(
-                            "the welded mesh exceeds the u32 vertex-index limit".into(),
-                        )
-                    })?;
-                    vertices.push(point);
-                    cells.entry(key).or_default().push(index);
-                    index
-                }
-            };
-            triangle[corner] = index;
+            triangle[corner] = u32::try_from(index).map_err(|_| {
+                StlError::InvalidGeometry(
+                    "the welded mesh exceeds the u32 vertex-index limit".into(),
+                )
+            })?;
         }
         if triangle[0] == triangle[1]
             || triangle[1] == triangle[2]
@@ -581,20 +346,6 @@ fn weld_vertices(
     Ok((vertices, triangles))
 }
 
-fn cell_key(point: Vec3, origin: Vec3, tolerance: f64) -> Result<[i64; 3], StlError> {
-    let relative = point - origin;
-    let cell = [relative.x, relative.y, relative.z].map(|value| (value / tolerance).floor());
-    if cell
-        .iter()
-        .any(|&value| !value.is_finite() || value < 0.0 || value > (i64::MAX - 2) as f64)
-    {
-        return Err(StlError::InvalidOptions(
-            "weld_tolerance cannot be represented by the spatial index".into(),
-        ));
-    }
-    Ok(cell.map(|value| value as i64))
-}
-
 fn weld_exact(
     source: &[(usize, [Vec3; 3])],
     dropped: &mut Vec<DroppedFacet>,
@@ -605,7 +356,7 @@ fn weld_exact(
     for &(facet, points) in source {
         let mut triangle = [0_u32; 3];
         for (corner, &point) in points.iter().enumerate() {
-            let canonical_bits = |value: f64| if value == 0.0 { 0 } else { value.to_bits() };
+            let canonical_bits = brep_kernel::canonical_bits;
             let key = [
                 canonical_bits(point.x),
                 canonical_bits(point.y),

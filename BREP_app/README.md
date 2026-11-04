@@ -1,7 +1,7 @@
 # BREP_app
 
 The BREP CAD application: one Rust egui/wgpu codebase for native desktop and
-WebAssembly. Package `BREP_app`, library `brep_app`, version 0.8.0.
+WebAssembly. Package `BREP_app`, library `brep_app`, version 0.10.0.
 The 3D engine is `BREP_render`; geometry comes from `BREP_kernel`.
 
 ## Build and run
@@ -22,6 +22,32 @@ declare. The WebAssembly build is made with `wasm-pack` from a source checkout.
 [Model Context Protocol](https://modelcontextprotocol.io) server, through
 [`BREP_mcp_core`](https://crates.io/crates/BREP_mcp_core), so an agent can drive
 the same window a person is using.
+
+For independent automation with no window or focus dependency, install
+`BREP_mcp` and launch `brep-mcp serve` (stdio) or `brep-mcp serve --http PORT`.
+HTTP requires the bearer token in the app's configuration directory, normally
+`~/.config/brep-app/mcp-token`, or `BREP_MCP_TOKEN_FILE`. It does not use OAuth
+or Dynamic Client Registration. Configure the client through an environment
+credential setting without printing or committing the token.
+
+On Linux, `cargo install BREP_app` installs an executable on PATH. Then run
+`brep-app --install-file-associations` to register the desktop entry; launch it
+with `gtk-launch brep-app` in the same desktop environment. The PLM download
+installer (`install/install.sh --prefix DIR URL`) performs both steps and sets
+mode 0755 after verifying the download. Copy a manually built binary with
+`install -m 755 SOURCE DESTINATION` so the executable mode is explicit.
+
+Desktop records live in `$XDG_DATA_HOME/applications` (default
+`~/.local/share/applications`). Installation and launch must use the same XDG
+location; an existing file elsewhere does not establish launcher discovery.
+The generated Exec argument quotes the actual executable path, including spaces.
+Avoid `%` in the installation path: some GLib desktop launchers check executable
+existence before expanding escaped percent characters and cannot discover that entry.
+Desktop launch starts the ordinary GUI, like `brep-app`, without implicitly
+starting another MCP listener. To attach to that window, use its Start MCP
+server action. Use `brep-app --mcp --session-root DIR` for a CLI-launched window
+host and configure artifacts before opening the JavaScript editor. Do not
+launch another MCP host on the same port.
 
 ## Touch navigation in the 3D view
 

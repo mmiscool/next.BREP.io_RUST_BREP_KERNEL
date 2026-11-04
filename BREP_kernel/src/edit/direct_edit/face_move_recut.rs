@@ -701,7 +701,7 @@ impl Cell {
             .map(|i| {
                 let a = self.points[i];
                 let b = self.points[(i + 1) % n];
-                a[0] * b[1] - b[0] * a[1]
+                crate::polygon::area_term(a, b)
             })
             .sum::<f64>()
             * 0.5
@@ -720,7 +720,7 @@ impl Cell {
         for i in 0..n {
             let a = self.points[i];
             let b = self.points[(i + 1) % n];
-            let w = a[0] * b[1] - b[0] * a[1];
+            let w = crate::polygon::area_term(a, b);
             cx += (a[0] + b[0]) * w;
             cy += (a[1] + b[1]) * w;
         }

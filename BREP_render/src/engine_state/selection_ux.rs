@@ -213,6 +213,11 @@ impl EngineState {
     /// that takes both reads them in ITS OWN kind order (the field's
     /// `selectionFilter`), which is fixed by the schema.
     pub fn selection_json(&self) -> String {
+        self.selection_value().to_string()
+    }
+
+    /// [`Self::selection_json`] as a JSON value.
+    pub fn selection_value(&self) -> serde_json::Value {
         let solids: Vec<&String> = self.emphasis.selected_solids.iter().collect();
         let faces: Vec<&String> = self.emphasis.selected_faces.iter().collect();
         let edges: Vec<&String> = self.emphasis.selected_edges.iter().collect();
@@ -224,7 +229,6 @@ impl EngineState {
             "datums": datums,
             "vertices": self.emphasis.selected_vertices.len(),
         })
-        .to_string()
     }
 
     // --- Reference-selection widget (the engine-native picker, #42) --------
@@ -337,7 +341,6 @@ impl EngineState {
             return;
         };
         let filter = state.filter.clone();
-        let multiple = state.multiple;
         let target = state.target;
         // A SHEET pick is an anchor on the paper, never a 3D hit: the sheet
         // viewport feeds `ref_select_pick_sheet_anchor` instead.
@@ -362,14 +365,69 @@ impl EngineState {
         // field now picks a construction plane through the ORDINARY candidate
         // list — including one sitting under a face, which the geometry-miss
         // fallback below could never reach.
+        match self.pick_top_at(x, y, &filter) {
+            Some(hit) => self.ref_select_take_candidate(&hit),
+            None => self.ref_select_take_miss(x, y, &filter),
+        }
+    }
+
+    /// The candidates a reference pick may take under CSS-pixel `(x, y)`, for
+    /// the PICK LIST the viewport opens on a dwelled (or Alt) click while a
+    /// reference field is picking: the raw list
+    /// ([`pick_candidates_at`](Self::pick_candidates_at)) admitted by the
+    /// field's OWN kind strings — the same admission
+    /// [`ref_select_click`](Self::ref_select_click) applies — in the shared
+    /// pick-list order. A plain click takes the top admitted row by kind, so
+    /// with a `["SOLID","FACE","SKETCH"]` field the face always wins it and the
+    /// solid behind that face is reachable only through this list. Empty when
+    /// no field is picking, for a sheet pick (anchors are on the paper), and
+    /// when a Work part's context is in front (the click refuses that too).
+    pub fn ref_select_candidates_at(&self, x: f64, y: f64) -> Vec<pick::PickCandidate> {
+        let Some(state) = self.ref_select.as_ref() else {
+            return Vec::new();
+        };
+        if state.target == RefSelectTarget::Sheet {
+            return Vec::new();
+        }
+        let instructions_pick = matches!(state.target, RefSelectTarget::Instructions { .. });
+        if !instructions_pick && self.context_hit_at(x, y).is_some() {
+            return Vec::new();
+        }
+        let filter = &state.filter;
+        self.pick_candidates_at(x, y)
+            .into_iter()
+            .filter(|c| filter.is_empty() || self.candidate_admitted(filter, c))
+            .collect()
+    }
+
+    /// Whether `candidate` is already in the running reference list — the pick
+    /// list's per-row selected state while a reference field is picking.
+    pub fn ref_select_has_candidate(&self, candidate: &pick::PickCandidate) -> bool {
+        let Some(state) = self.ref_select.as_ref() else {
+            return false;
+        };
+        !candidate.name.trim().is_empty() && state.names.iter().any(|n| n == &candidate.name)
+    }
+
+    /// Take ONE candidate into the running reference list — what a plain click
+    /// does with its top hit, and what a pick-list row does with its own. The
+    /// candidate resolves to a name exactly as the click's did (a plane only by
+    /// a resolved D/P frame name, a vertex as a coordinate ref for the targets
+    /// that read one, a spline anchor as its owning port); single fields
+    /// replace, multiple fields append, de-duplicated. No-op while no field is
+    /// picking, for a sheet pick, and for a hit that resolves to no name.
+    pub fn ref_select_take_candidate(&mut self, hit: &pick::PickCandidate) {
+        let Some(target) = self.ref_select.as_ref().map(|state| state.target) else {
+            return;
+        };
+        if target == RefSelectTarget::Sheet {
+            return;
+        }
         // A spline anchor attaches to a PORT: whatever part of a port's drawn
         // sheet was hit (its line, its base vertex, the sheet itself), the
         // pick resolves to the OWNING sheet, which is keyed by the port id;
         // anything that is not a port is refused with a notice.
         if let RefSelectTarget::SplineAnchor { .. } = target {
-            let Some(hit) = self.pick_top_at(x, y, &filter) else {
-                return;
-            };
             let owner = if hit.solid.trim().is_empty() { hit.name.clone() } else { hit.solid.clone() };
             if !self.is_port_id(&owner) {
                 self.push_notice(format!("'{owner}' is not a port — pick a port to attach the anchor"));
@@ -381,18 +439,18 @@ impl EngineState {
             self.sync_ref_select_emphasis();
             return;
         }
-        let picked = match self.pick_top_at(x, y, &filter) {
-            Some(hit) if hit.kind == pick::PickKind::Plane => {
+        let picked = match hit {
+            hit if hit.kind == pick::PickKind::Plane => {
                 // Accept ONLY a resolved D/P frame name, the same guard the
                 // fallback applies — a stray widget-fed plane never lands in a
                 // reference field.
                 if self.datum_feature_for_name(&hit.name).is_none() {
                     return;
                 }
-                hit.name
+                hit.name.clone()
             }
-            Some(hit) if !hit.name.trim().is_empty() => hit.name,
-            Some(hit) => {
+            hit if !hit.name.trim().is_empty() => hit.name.clone(),
+            hit => {
                 // A vertex pick carries no kernel name. For an ASSEMBLY CONSTRAINT
                 // field that accepts VERTEX, build the `{solidName}@x,y,z` ref with
                 // COMPONENT-LOCAL coordinates (world pick · owning-component
@@ -421,39 +479,33 @@ impl EngineState {
                     _ => return,
                 }
             }
-            None => {
-                // TOTAL MISS. The plane CARDS are candidates above and they are
-                // the same set `datum_pick` tests, so in the app this arm is
-                // unreachable for a plane field; it is kept as a second line of
-                // defense for the tested `["PLANE","FACE"]` sketchPlane flow (and
-                // it is the ONLY path that would reach a datum AXIS, were one ever
-                // fed). Accept ONLY a resolved D/P frame name
-                // (`datum_feature_for_name`, mirroring `select_datum`'s guard) so an
-                // AXIS name — which `datum_pick` may also return — never lands in a
-                // plane field.
-                let admits_plane = filter
-                    .iter()
-                    .any(|k| k.eq_ignore_ascii_case("PLANE") || k.eq_ignore_ascii_case("DATUM"));
-                if !admits_plane {
-                    return;
-                }
-                let name = self.datum_pick(x, y);
-                if name.is_empty() || self.datum_feature_for_name(&name).is_none() {
-                    return;
-                }
-                name
-            }
         };
-        let state = self.ref_select.as_mut().expect("active by guard above");
-        if multiple {
-            if !state.names.iter().any(|n| n == &picked) {
-                state.names.push(picked);
-            }
-        } else {
-            state.names = vec![picked];
+        self.ref_select_add_name(picked);
+    }
+
+    /// A reference click that hit NO admitted candidate: only a plane field can
+    /// still take something, through the datum widget pick.
+    fn ref_select_take_miss(&mut self, x: f64, y: f64, filter: &[String]) {
+        // TOTAL MISS. The plane CARDS are candidates above and they are
+        // the same set `datum_pick` tests, so in the app this arm is
+        // unreachable for a plane field; it is kept as a second line of
+        // defense for the tested `["PLANE","FACE"]` sketchPlane flow (and
+        // it is the ONLY path that would reach a datum AXIS, were one ever
+        // fed). Accept ONLY a resolved D/P frame name
+        // (`datum_feature_for_name`, mirroring `select_datum`'s guard) so an
+        // AXIS name — which `datum_pick` may also return — never lands in a
+        // plane field.
+        let admits_plane = filter
+            .iter()
+            .any(|k| k.eq_ignore_ascii_case("PLANE") || k.eq_ignore_ascii_case("DATUM"));
+        if !admits_plane {
+            return;
         }
-        state.picks += 1;
-        self.sync_ref_select_emphasis();
+        let name = self.datum_pick(x, y);
+        if name.is_empty() || self.datum_feature_for_name(&name).is_none() {
+            return;
+        }
+        self.ref_select_add_name(name);
     }
 
     /// Feed a picked NAME into the running list — what [`Self::ref_select_click`]
@@ -594,6 +646,17 @@ impl EngineState {
         // A motion-study CLIP's parts commit into the `simulation` block
         // through the study patch lane; nothing rolled and nothing re-runs,
         // so the tail is the CAM one: highlight and filter back to default.
+        // A REPLACE REPAIR pick is handed to the replace dialog, which runs
+        // the repair (one undo step, nested assemblies included); nothing
+        // rolled, so the tail is the highlight and the filter going back.
+        if state.target == RefSelectTarget::ReplaceRepair {
+            let _ = self.emphasis.apply_json("{}");
+            self.selection_filter = SelectionFilter::default();
+            let old_ref = state.path.first().cloned().unwrap_or_default();
+            self.replace_repair_pick = state.names.into_iter().next().map(|pick| (state.feature_id, old_ref, pick));
+            self.dirty = true;
+            return;
+        }
         if state.target == RefSelectTarget::Simulation {
             let _ = self.emphasis.apply_json("{}");
             self.selection_filter = SelectionFilter::default();
@@ -680,6 +743,7 @@ impl EngineState {
                     | RefSelectTarget::Cam
                     | RefSelectTarget::Instructions { .. }
                     | RefSelectTarget::Simulation
+                    | RefSelectTarget::ReplaceRepair
             )
         })
     }

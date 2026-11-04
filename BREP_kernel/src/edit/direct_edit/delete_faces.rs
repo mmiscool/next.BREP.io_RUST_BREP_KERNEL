@@ -233,6 +233,13 @@ fn encloses_every_survivor(
             .get(&coedge.edge_id)
             .is_some_and(|count| count.selected > 0)
     };
+    // A face's own degenerate pole (an exact octant's, used by that face
+    // alone) bounds nothing: it is neither on the selection nor a boundary
+    // the face keeps against a survivor.
+    let own_pole = |coedge: &CoedgeRecord| {
+        counts.get(&coedge.edge_id).is_some_and(|count| count.selected == 0 && count.kept == 1)
+            && solid.edges.iter().any(|edge| edge.id == coedge.edge_id && edge.degenerate)
+    };
     let mut bordered = false;
     for face in solid.shells.iter().flat_map(|shell| &shell.faces) {
         if selected.contains(&face.id) {
@@ -242,7 +249,7 @@ fn encloses_every_survivor(
         if !coedges.clone().any(on_selection) {
             continue;
         }
-        if !coedges.all(on_selection) {
+        if !coedges.all(|coedge| on_selection(coedge) || own_pole(coedge)) {
             return false;
         }
         bordered = true;

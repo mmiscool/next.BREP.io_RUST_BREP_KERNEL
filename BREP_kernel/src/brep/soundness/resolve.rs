@@ -17,12 +17,7 @@ use crate::projection::project_point_to_curve;
 /// 1/on) restores the scan without resolution, for an on/off census, and
 /// keeps the acceptance from refusing on an undecided scan.
 pub(crate) fn enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| match std::env::var("BREP_SOUNDNESS_RESOLVE") {
-        Ok(value) => value == "1" || value == "on",
-        Err(std::env::VarError::NotPresent) => true,
-        Err(_) => false,
-    })
+    switch!("BREP_SOUNDNESS_RESOLVE", true)
 }
 
 /// Off by default (2026-10-16): `BREP_SOUNDNESS_REFUSE_UNDECIDED=1|on` makes
@@ -32,8 +27,7 @@ pub(crate) fn enabled() -> bool {
 /// tangent family) still ends undecided there. The report lists them either
 /// way.
 pub(crate) fn refuse_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| matches!(std::env::var("BREP_SOUNDNESS_REFUSE_UNDECIDED").as_deref(), Ok("1") | Ok("on")))
+    switch!("BREP_SOUNDNESS_REFUSE_UNDECIDED", false)
 }
 
 /// Seeds along the mesh crossing segment (both ends included).
@@ -114,25 +108,10 @@ fn common_point(a: &NurbsSurface, b: &NurbsSurface, seed: Vec3, tolerance: f64, 
     None
 }
 
-/// Cramer's rule on a 3x3 system; `None` when it is singular.
+/// Partial-pivot solve of a 3x3 system; `None` when it is singular.
 fn solve3(m: [[f64; 3]; 3], r: [f64; 3]) -> Option<[f64; 3]> {
-    let det = |m: [[f64; 3]; 3]| {
-        m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1]) - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
-            + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0])
-    };
-    let d = det(m);
-    if !(d.abs() > 1e-300) || !d.is_finite() {
-        return None;
-    }
-    let mut out = [0.; 3];
-    for (col, slot) in out.iter_mut().enumerate() {
-        let mut k = m;
-        for row in 0..3 {
-            k[row][col] = r[row];
-        }
-        *slot = det(k) / d;
-    }
-    out.iter().all(|x| x.is_finite()).then_some(out)
+    let out = crate::fit::solve_small(m, r, 3).ok()?;
+    out.iter().all(|value| value.is_finite()).then_some(out)
 }
 
 /// Does `face` own its own parameter `(u, v)`? `None` when the trim test fails.

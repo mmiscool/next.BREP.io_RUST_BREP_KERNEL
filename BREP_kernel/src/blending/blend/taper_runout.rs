@@ -109,26 +109,15 @@ const PIECE_SAMPLES: usize = 17;
 /// Promoted 2026-10-19 (lane R7).
 const TAPER_RUNOUT_DEFAULT: bool = true;
 
-thread_local! {
-    static TAPER_RUNOUT_FOR_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
-}
-
 /// `BREP_BLEND_TAPER_RUNOUT=1`/`on` (the default) builds the tapered cusp
 /// runout; `=0`/`off` leaves the end to the network's free end and the cutter.
 pub(crate) fn taper_runout_on() -> bool {
-    if let Some(forced) = TAPER_RUNOUT_FOR_TEST.with(|forced| forced.get()) {
-        return forced;
-    }
-    match std::env::var("BREP_BLEND_TAPER_RUNOUT").as_deref() {
-        Ok("0") | Ok("off") => false,
-        Ok("1") | Ok("on") => true,
-        _ => TAPER_RUNOUT_DEFAULT,
-    }
+    switch!(live "BREP_BLEND_TAPER_RUNOUT", TAPER_RUNOUT_DEFAULT)
 }
 
 
 fn debug_on() -> bool {
-    std::env::var("BREP_DEBUG_NETWORK").is_ok()
+    debug_flag!(live "BREP_DEBUG_NETWORK")
 }
 
 /// The law (module doc): the radius at a section whose width is `width`.

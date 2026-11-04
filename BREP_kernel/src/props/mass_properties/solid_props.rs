@@ -268,11 +268,16 @@ pub(super) fn solid_signed_volume_for_sign_with_bound(solid: &BrepSolid, bar: f6
     if enabled {
         if let Some(lower) = super::sphere_sign::positive_volume_bound(solid) {
             if bar.is_finite() && lower > bar {
-                if std::env::var("BREP_PROFILE").is_ok() {
-                    eprintln!("mass.sign_certificate kind=trimmed_spheres lower={lower:.9} bar={bar:.3e}");
+                if crate::profile::profile_enabled() {
+                    profile_line!("mass.sign_certificate kind=trimmed_spheres lower={lower:.9} bar={bar:.3e}");
                 }
                 return Ok(lower);
             }
+        }
+    }
+    if sliver_bound_enabled() {
+        if let Some(lower) = sliver_bound_certificate(solid, bar) {
+            return Ok(lower);
         }
     }
     let token = super::profile::begin("solid_signed_volume_for_sign");
@@ -283,6 +288,205 @@ pub(super) fn solid_signed_volume_for_sign_with_bound(solid: &BrepSolid, bar: f6
         return Ok(reading);
     }
     solid_signed_volume(solid)
+}
+
+/// `BREP_SIGN_SLIVER_BOUND` (on by default since 2026-11-03,
+/// tier-P promotion; `0`/`off` restores the reading alone): before the sign
+/// reading, try a certificate that integrates every face's cells exactly as
+/// the reading does but skips the surface stations of its chord corrections,
+/// bounding them instead (see [`sliver_bound_certificate`]). Read on every
+/// call.
+fn sliver_bound_enabled() -> bool {
+    switch!(live "BREP_SIGN_SLIVER_BOUND", true)
+}
+
+
+/// A lower bound on the sign reading that proves its verdict, or `None`.
+///
+/// The reading sums, per face, the cells' quadrature plus the chord
+/// corrections' quadrature `Σ w_k f(Q_k)` (`trimmed::curved_boundary_correction`,
+/// positive Gauss weights times the sliver jacobian). Its correction is at most
+/// `Σ |w_k| · sup |f|`: the first factor is the face's sliver measure
+/// (`trimmed::with_sliver_measure`, read from the pcurves alone), the second
+/// comes from the carrier's control net ([`surface_flux_bounds`]): the volume
+/// integrand `(P - local) · N` is at most `r · n`, the vector area's `N` at most
+/// `n`, so a face's contribution about the shell reference moves by at most
+/// `measure · n · (r + |local - reference|) / 3`. Faces the reading already
+/// holds exact terms for are taken as they are (bound zero); faces whose route
+/// reads its own corrections are integrated exactly, as the reading does.
+///
+/// The certificate stands only when the bounded sum clears the bar by the
+/// reading's own margin, with every bound and a rounding slack added to the
+/// magnitude: then the reading would return a value above the bar without its
+/// exact fallback, and this returns a lower bound on that value. Otherwise
+/// `None`, and the reading runs as before (an error anywhere also yields
+/// `None`, so the reading reports it).
+pub(super) fn sliver_bound_certificate(solid: &BrepSolid, bar: f64) -> Option<f64> {
+    if !bar.is_finite() {
+        return None;
+    }
+    let token = super::profile::begin("solid_sign_sliver_bound");
+    let outcome = super::trimmed::with_straight_corrections_skipped(|| -> Option<(f64, f64, f64, f64, [usize; 3])> {
+        let (mut reading, mut magnitude, mut bound, mut scale) = (0.0, 0.0, 0.0, 0.0);
+        let mut counts = [0usize; 3]; // exact terms held, bounded, integrated exactly
+        for shell in &solid.shells {
+            let reference = shell_volume_reference(shell).ok()?;
+            let (mut volume, mut compensation) = (0.0f64, 0.0f64);
+            for face in &shell.faces {
+                let local = face_volume_reference(face).unwrap_or(reference);
+                let identity = super::identity::face_contribution_identity(face, local);
+                let offset = local.sub(reference);
+                let (terms, face_bound, face_scale) = match crate::reading_memo::peek_sign_terms(identity) {
+                    Some(terms) => {
+                        counts[0] += 1;
+                        (terms?, 0.0, 0.0)
+                    }
+                    None => match crate::reading_memo::memoized_bounded_sign_terms(identity, || bounded_face_terms(face, local)) {
+                        Some((terms, per_offset, fixed, rounding)) => {
+                            counts[1] += 1;
+                            (terms, fixed + per_offset * offset.length(), rounding)
+                        }
+                        None => {
+                            counts[2] += 1;
+                            let terms = crate::reading_memo::memoized_sign_terms(identity, || {
+                                face_volume_terms_about(face, local).ok()
+                            })?;
+                            (terms, 0.0, 0.0)
+                        }
+                    },
+                };
+                let area = Vec3::new(terms[1], terms[2], terms[3]);
+                let contribution = terms[0] + offset.dot(area);
+                magnitude += contribution.abs();
+                bound += face_bound;
+                scale += terms[0].abs() + offset.length() * area.length() + face_bound + face_scale * (1.0 + offset.length());
+                let next = volume + contribution;
+                if volume.abs() >= contribution.abs() {
+                    compensation += (volume - next) + contribution;
+                } else {
+                    compensation += (contribution - next) + volume;
+                }
+                volume = next;
+            }
+            reading += volume + compensation;
+        }
+        Some((reading, magnitude, bound, scale, counts))
+    });
+    super::profile::end(token);
+    let (reading, magnitude, bound, scale, counts) = outcome?;
+    // Rounding: the reading adds each correction station to a running total
+    // the cells started, and the certificate does not; a face's stations number
+    // well under 1e6, so their re-association moves a slot by far less than
+    // 1e-9 of the face's scale.
+    let slack = 1e-9 * scale;
+    let lower = reading - bound - slack;
+    let certified = [reading, magnitude, bound, scale, lower].iter().all(|v| v.is_finite())
+        && lower > bar
+        && lower - bar > SIGN_READING_MARGIN * (magnitude + bound + slack);
+    if crate::profile::profile_enabled() {
+        profile_line!(
+            "mass.sign_certificate kind=sliver_bound certified={certified} cells={reading:.9e} bound={bound:.3e} slack={slack:.3e} magnitude={magnitude:.3e} held={} bounded={} exact={}",
+            counts[0], counts[1], counts[2]
+        );
+    }
+    certified.then_some(lower)
+}
+
+/// One face's sign terms with the chord corrections bounded, as
+/// `(terms, per_offset, fixed, rounding)`: the face's contribution about a
+/// shell reference `ref` lies within `fixed + per_offset · |local - ref|` of
+/// the reading's, and `rounding` is a scale for the certificate's slack.
+/// `None` when the face's route reads its own corrections, a bound is not
+/// finite, or the integration fails (the reading then integrates it).
+pub(super) fn bounded_face_terms(face: &FaceRecord, local: Vec3) -> Option<([f64; 4], f64, f64, f64)> {
+    let (terms, measure) = super::trimmed::with_sliver_measure(|| face_volume_terms_about(face, local));
+    let terms = terms.ok()?;
+    if measure.declined || !terms.iter().all(|v| v.is_finite()) {
+        return None;
+    }
+    if measure.measure == 0.0 {
+        return Some((terms, 0.0, 0.0, measure.complement / 3.0));
+    }
+    let (n, r) = surface_flux_bounds(&face.surface, local)?;
+    let per_offset = measure.measure * n / 3.0;
+    let fixed = per_offset * r;
+    [per_offset, fixed].iter().all(|v| v.is_finite()).then_some((terms, per_offset, fixed, measure.complement / 3.0))
+}
+
+/// Bounds from the control net of `surface`, valid over its whole domain (and
+/// its periodic wraps): `n >= |S_u × S_v|` and `r >= |S - center|`.
+///
+/// With homogeneous controls `Q = (w (P - center), w)`, all weights positive:
+/// `S - center` is a convex combination of the `P - center`, so `r` is their
+/// largest length; the homogeneous derivative `A_u` is a convex combination
+/// of `p (Q_{i+1} - Q_i) / (u_{i+p+1} - u_{i+1})` (spline differentiation,
+/// partition of unity of the degree-lowered basis), so its point part and its
+/// weight part are at most the largest lengths of those differences' parts;
+/// and `S_u = (X_u - w_u (S - center)) / w` with `w >= ` the smallest weight.
+/// `None` for a non-positive or non-finite weight or control.
+pub(super) fn surface_flux_bounds(surface: &crate::NurbsSurface, center: Vec3) -> Option<(f64, f64)> {
+    let net = &surface.control_points;
+    let rows = net.len();
+    let columns = net.first()?.len();
+    if rows == 0 || columns == 0 || net.iter().any(|row| row.len() != columns) {
+        return None;
+    }
+    let relative = |i: usize, j: usize| -> Option<[f64; 4]> {
+        let q = net[i][j];
+        let values = [q.x - center.x * q.w, q.y - center.y * q.w, q.z - center.z * q.w, q.w];
+        (values.iter().all(|v| v.is_finite()) && q.w > 0.0).then_some(values)
+    };
+    let mut w_min = f64::INFINITY;
+    let mut r = 0.0f64;
+    for i in 0..rows {
+        for j in 0..columns {
+            let q = relative(i, j)?;
+            w_min = w_min.min(q[3]);
+            r = r.max((q[0] * q[0] + q[1] * q[1] + q[2] * q[2]).sqrt() / q[3]);
+        }
+    }
+    // (largest |X_d|, largest |w_d|) in one parameter direction.
+    let derivative = |along_u: bool| -> Option<(f64, f64)> {
+        let (degree, knots, count) = if along_u {
+            (surface.degree_u, &surface.knots_u, rows)
+        } else {
+            (surface.degree_v, &surface.knots_v, columns)
+        };
+        if knots.len() < count + degree + 1 {
+            return None;
+        }
+        let (mut point, mut weight) = (0.0f64, 0.0f64);
+        if degree == 0 {
+            return Some((0.0, 0.0));
+        }
+        for k in 0..count.saturating_sub(1) {
+            let span = knots[k + degree + 1] - knots[k + 1];
+            if !(span > 0.0) {
+                continue;
+            }
+            let factor = degree as f64 / span;
+            let others = if along_u { columns } else { rows };
+            for other in 0..others {
+                let (a, b) = if along_u {
+                    (relative(k, other)?, relative(k + 1, other)?)
+                } else {
+                    (relative(other, k)?, relative(other, k + 1)?)
+                };
+                let d = [b[0] - a[0], b[1] - a[1], b[2] - a[2], b[3] - a[3]];
+                point = point.max(factor * (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt());
+                weight = weight.max(factor * d[3].abs());
+            }
+        }
+        Some((point, weight))
+    };
+    let (xu, wu) = derivative(true)?;
+    let (xv, wv) = derivative(false)?;
+    let su = (xu + wu * r) / w_min;
+    let sv = (xv + wv * r) / w_min;
+    let n = su * sv;
+    // A little headroom for the evaluator's own rounding.
+    let (n, r) = (n * (1.0 + 1e-9), r * (1.0 + 1e-9));
+    (n.is_finite() && r.is_finite() && w_min.is_finite()).then_some((n, r))
 }
 
 /// Retain the exact path's shell references and compensated face order.
@@ -302,7 +506,7 @@ fn solid_sign_terms_reading(solid: &BrepSolid) -> Result<(f64, f64), String> {
 }
 
 fn sign_terms_oracle_enabled() -> bool {
-    std::env::var("BREP_SIGN_TERMS_ORACLE").as_deref() == Ok("1")
+    switch!(live "BREP_SIGN_TERMS_ORACLE", false)
 }
 
 /// Diagnostic census only; the shipped reading and the sphere certificate
@@ -330,8 +534,8 @@ pub(super) fn check_sign_terms(solid: &BrepSolid, reading: f64) -> Result<(), St
 /// sign reading's margin is read against).
 fn shell_volume_sign_reading(shell: &ShellRecord, shell_index: usize) -> Result<(f64, f64), String> {
     let reference = shell_volume_reference(shell)?;
-    if std::env::var_os("BREP_PROFILE").is_some() {
-        eprintln!(
+    if crate::profile::profile_enabled() {
+        profile_line!(
             "mass.sign_reference faces={} reference=({:.9},{:.9},{:.9})",
             shell.faces.len(), reference.x, reference.y, reference.z
         );
@@ -390,7 +594,7 @@ pub(super) fn shell_volume_reference(shell: &ShellRecord) -> Result<Vec3, String
 }
 
 /// One finite authored point, with the same fallbacks as the exact integral.
-fn face_volume_reference(face: &FaceRecord) -> Option<Vec3> {
+pub(super) fn face_volume_reference(face: &FaceRecord) -> Option<Vec3> {
     let finite = |point: Vec3| point.x.is_finite() && point.y.is_finite() && point.z.is_finite();
     if let Some(coedge) = face
         .loops

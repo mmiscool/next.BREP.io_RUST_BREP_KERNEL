@@ -50,6 +50,7 @@ pub fn feature_schema_catalogue() -> serde_json::Value {
             super::features::sheet_metal_flange::schema(),
             super::features::sheet_metal_hem::schema(),
             super::features::sheet_metal_closed_corner::schema(),
+            super::features::sheet_metal_mirror::schema(),
             super::features::sheet_metal_corner::schema_fillet(),
             super::features::sheet_metal_corner::schema_chamfer(),
             super::features::sheet_metal_cutout::schema(),

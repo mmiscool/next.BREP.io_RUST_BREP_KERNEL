@@ -18,7 +18,7 @@ pub mod trim;
 pub use doc::{SketchConstraint, SketchDiagnostics, SketchDoc, SketchGeometry, SketchPoint};
 pub use external_ref::{classify_uv, EdgeLink, ExternalRef};
 pub use session::{
-    constraint_ref, entity_ref_eq, geometry_ref, point_ref, refs_equal, SketchSession,
+    constraint_ref, entity_ref_eq, geometry_ref, point_ref, refs_equal, RefSelection, SketchSession,
 };
 pub use solve::SketchSolverSettings;
 pub use tessellate::SketchTessellation;
@@ -199,3 +199,5 @@ fn normalize(v: [f64; 3]) -> Option<[f64; 3]> {
     }
 }
 
+
+pub mod text;

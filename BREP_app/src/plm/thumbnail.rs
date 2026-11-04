@@ -41,12 +41,7 @@ use brep_render::thumbnail::{self as raster, Capture};
 
 use super::backend::SavedHook;
 use super::client::PlmClient;
-
-/// SHA-256 of a document's bytes, lowercase hex: the server's `content_hash`.
-pub fn content_hash(document: &str) -> String {
-    use sha2::{Digest, Sha256};
-    Sha256::digest(document.as_bytes()).iter().map(|b| format!("{b:02x}")).collect()
-}
+use super::content_hash;
 
 /// What happened to the pictures this session made, for scripts and tests.
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
@@ -196,7 +191,7 @@ static LAST_RENDER_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU
 pub fn stage(key: &str, document: &str, engine: &EngineState, doc: u64) {
     let picture = picture_of(engine, doc, raster::SIZE);
     count(|s| s.staged += 1);
-    STAGED.with(|s| s.borrow_mut().insert(key.to_string(), Staged { hash: content_hash(document), picture }));
+    STAGED.with(|s| s.borrow_mut().insert(key.to_string(), Staged { hash: content_hash(document.as_bytes()), picture }));
 }
 
 /// A picture of `engine`'s model, `size` on edge: started now, or once the
@@ -252,7 +247,7 @@ pub fn tick<'a>(engine_of: impl Fn(u64) -> Option<&'a EngineState>) {
 /// The picture staged for exactly these bytes under `key`, taken. One staged
 /// for other bytes (a later save) is left for that save's own hook.
 fn take(key: &str, document: &str) -> Option<Picture> {
-    let hash = content_hash(document);
+    let hash = content_hash(document.as_bytes());
     STAGED.with(|s| {
         let mut staged = s.borrow_mut();
         match staged.get(key) {
@@ -269,7 +264,7 @@ pub(crate) fn upload_on_save() -> SavedHook {
         // One spelling for the staged picture and the upload's route.
         let key = crate::plm::uses::revision_key_in(&key).unwrap_or(key);
         if let Some(picture) = take(&key, &value) {
-            let hash = content_hash(&value);
+            let hash = content_hash(value.as_bytes());
             detach(async move { upload(&client, &key, &hash, picture).await });
         }
         Box::pin(async { Ok(()) })
@@ -490,38 +485,16 @@ fn decode_png(bytes: &[u8]) -> Option<egui::ColorImage> {
     Some(egui::ColorImage::from_rgba_unmultiplied([image.width() as usize, image.height() as usize], image.as_raw()))
 }
 
-const BASE64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-
 /// Standard base64 with padding: how a PNG rides in the string-valued store.
 fn base64_encode(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    for chunk in bytes.chunks(3) {
-        let n = chunk.iter().enumerate().fold(0u32, |n, (i, b)| n | (u32::from(*b) << (16 - 8 * i)));
-        for i in 0..4 {
-            if i <= chunk.len() {
-                out.push(BASE64[((n >> (18 - 6 * i)) & 63) as usize] as char);
-            } else {
-                out.push('=');
-            }
-        }
-    }
-    out
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD.encode(bytes)
 }
 
+/// [`base64_encode`]'s inverse; padding optional. `None` for anything that is
+/// not standard base64.
 fn base64_decode(text: &str) -> Option<Vec<u8>> {
-    let text = text.trim_end_matches('=');
-    let mut out = Vec::with_capacity(text.len() * 3 / 4);
-    let mut acc = 0u32;
-    let mut bits = 0u32;
-    for c in text.bytes() {
-        let value = BASE64.iter().position(|b| *b == c)? as u32;
-        acc = (acc << 6) | value;
-        bits += 6;
-        if bits >= 8 {
-            bits -= 8;
-            out.push(((acc >> bits) & 0xff) as u8);
-        }
-    }
-    Some(out)
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD_NO_PAD.decode(text.trim_end_matches('=')).ok()
 }
 

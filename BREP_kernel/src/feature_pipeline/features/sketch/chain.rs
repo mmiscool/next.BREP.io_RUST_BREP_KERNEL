@@ -138,7 +138,7 @@ pub(super) fn weld_chain(curves: &mut [NurbsCurve], closed: bool) {
         let target = curve_endpoint(&curves[index - 1], false);
         snap_curve_endpoint(&mut curves[index], target, true);
     }
-    if closed && curves.len() >= 2 {
+    if closed && !curves.is_empty() {
         let target = curve_endpoint(&curves[0], true);
         let last = curves.len() - 1;
         snap_curve_endpoint(&mut curves[last], target, false);

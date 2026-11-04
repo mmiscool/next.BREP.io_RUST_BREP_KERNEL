@@ -464,7 +464,7 @@ impl AnalyticSurface {
 
 /// Largest absolute Cartesian coordinate over a curve's control points — the
 /// curve counterpart of [`surface_scale`], for scale-relative tolerances.
-fn curve_scale(curve: &NurbsCurve) -> f64 {
+pub(crate) fn curve_scale(curve: &NurbsCurve) -> f64 {
     curve
         .control_points
         .iter()

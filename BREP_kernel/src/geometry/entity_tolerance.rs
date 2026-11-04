@@ -64,6 +64,14 @@ use crate::{
 };
 use rustc_hash::FxHashMap as HashMap;
 
+/// Whether [`EntityTolerances::edge`] may answer a straight edge on bilinear
+/// carriers from its affine bound (lane O row 25, on by default since the batch 6
+/// promotion, `BREP_EDGE_BAND_AFFINE_BOUND=0` samples every edge). Read once per process.
+fn affine_band_bound_enabled() -> bool {
+    switch!("BREP_EDGE_BAND_AFFINE_BOUND", true)
+}
+
+
 /// Fraction of an edge's own length that bounds its measured band.
 ///
 /// The band is spent deciding whether two points ON the edge are the same
@@ -215,6 +223,9 @@ impl<'s> EntityTolerances<'s> {
             return self.floor;
         }
         let cap = self.edge_cap(edge);
+        if self.floor > 0.0 && self.edge_bound_under(id, 0.5 * self.floor) {
+            return clamp_band(self.floor, 0.0, cap);
+        }
         // A measurement that failed says nothing, so it must not widen
         // anything: the floor stands (I2).
         let worst = self.raw_edge(id).unwrap_or(0.0);
@@ -307,6 +318,93 @@ impl<'s> EntityTolerances<'s> {
     }
 
     /// `cap_E = min(EDGE_CAP_FRACTION * len(E), PCURVE_ACCEPTANCE_REL * D)`.
+    /// AFFINE BAND BOUND (lane O row 25, 2026-10-29; on by default since the
+    /// batch 6 promotion, `BREP_EDGE_BAND_AFFINE_BOUND=0` samples). An upper bound on what
+    /// [`Self::raw_edge`] would measure, without its sampling, when every use
+    /// of `edge` is a straight non-rational pcurve on a non-rational bilinear
+    /// patch and the edge is a straight non-rational segment; `None` otherwise.
+    ///
+    /// Every sample `measure_edge_against_pcurve_image` takes, uniform,
+    /// subdivided or knot-span midpoint, reads `d(f) = S(p(q0 + (q1 − q0) f)) −
+    /// C(t(f))` at some `f` in `[0, 1]`, with `p` and `t` affine in `f`. On a
+    /// bilinear patch `S(p(f))` is quadratic in `f` with second coefficient
+    /// `Δs Δr T` (`T` the patch twist, `Δs`, `Δr` the pcurve's normalised
+    /// extents), and `C(t(f))` is affine, so `|d(f)| ≤ max(|d(0)|, |d(1)|) +
+    /// |Δs Δr T| / 4`. A rounding allowance covers the evaluations. When this
+    /// bound is under half the floor, the measured worst is under the floor and
+    /// [`clamp_band`] returns the floor, the same band the sampling yields.
+    /// Whether edge `id`'s [`Self::affine_edge_bound`] is at most `ceiling`:
+    /// then every value the sampled measurement could return is at most
+    /// `ceiling` too. False with the switch off, for an unknown or degenerate
+    /// edge, and wherever the bound does not apply.
+    pub(crate) fn edge_bound_under(&mut self, id: u64, ceiling: f64) -> bool {
+        if !affine_band_bound_enabled() {
+            return false;
+        }
+        self.ensure_index();
+        let Some(edge) = self.edge_index.as_ref().and_then(|index| index.get(&id)).copied() else {
+            return false;
+        };
+        let under = !edge.degenerate && self.affine_edge_bound(id, edge).is_some_and(|bound| bound <= ceiling);
+        under
+    }
+
+    fn affine_edge_bound(&self, id: u64, edge: &EdgeRecord) -> Option<f64> {
+        fn straight(curve: &NurbsCurve) -> bool {
+            curve.degree == 1 && curve.control_points.len() == 2 && curve.knots.len() == 4
+                && curve.control_points.iter().all(|p| p.w == 1.0)
+        }
+        let uses = self.coedges.as_ref()?.get(&id)?;
+        if uses.is_empty() || !straight(&edge.curve) {
+            return None;
+        }
+        let mut magnitude = 0.0f64;
+        let mut grow = |p: &crate::Vec4| magnitude = magnitude.max(p.x.abs()).max(p.y.abs()).max(p.z.abs());
+        edge.curve.control_points.iter().for_each(&mut grow);
+        let mut bound = 0.0f64;
+        for use_record in uses {
+            let (surface, pcurve) = (use_record.surface, use_record.pcurve);
+            if !straight(pcurve)
+                || surface.degree_u != 1
+                || surface.degree_v != 1
+                || surface.knots_u.len() != 4
+                || surface.knots_v.len() != 4
+                || surface.control_points.len() != 2
+                || surface.control_points.iter().any(|row| row.len() != 2 || row.iter().any(|p| p.w != 1.0))
+            {
+                return None;
+            }
+            surface.control_points.iter().flatten().for_each(&mut grow);
+            let net = &surface.control_points;
+            let twist = Vec3::new(
+                net[1][1].x - net[1][0].x - net[0][1].x + net[0][0].x,
+                net[1][1].y - net[1][0].y - net[0][1].y + net[0][0].y,
+                net[1][1].z - net[1][0].z - net[0][1].z + net[0][0].z,
+            )
+            .length();
+            let span_u = surface.knots_u[3] - surface.knots_u[0];
+            let span_v = surface.knots_v[3] - surface.knots_v[0];
+            let [q0, q1] = pcurve.domain().ok()?;
+            let mut end_gap = 0.0f64;
+            let mut ends = [crate::Vec3::default(); 2];
+            for (slot, fraction) in [0.0, 1.0].into_iter().enumerate() {
+                let uv = pcurve.evaluate(q0 + (q1 - q0) * fraction).ok()?;
+                ends[slot] = uv;
+                let on_surface = surface.evaluate_extended(uv.x, uv.y).ok()?;
+                let t = if use_record.forward {
+                    edge.t0 + (edge.t1 - edge.t0) * fraction
+                } else {
+                    edge.t1 - (edge.t1 - edge.t0) * fraction
+                };
+                end_gap = end_gap.max(on_surface.sub(edge.curve.evaluate(t).ok()?).length());
+            }
+            let bend = ((ends[1].x - ends[0].x) / span_u * (ends[1].y - ends[0].y) / span_v).abs() * twist / 4.0;
+            bound = bound.max(end_gap + bend);
+        }
+        let bound = bound + 1e-12 * (1.0 + magnitude);
+        bound.is_finite().then_some(bound)
+    }
+
     fn edge_cap(&self, edge: &EdgeRecord) -> f64 {
         (EDGE_CAP_FRACTION * edge_length(edge)).min(self.size_cap)
     }
@@ -380,4 +478,5 @@ fn edge_length(edge: &EdgeRecord) -> f64 {
         0.0
     }
 }
+
 

@@ -1905,8 +1905,8 @@ fn profile_stage(code: &str, ms: f64) {
         _ => None,
     };
     if let Some(row) = row { profile::record(row, ms); }
-    if std::env::var("BREP_PROFILE").is_ok() {
-        eprintln!("boolean.{code}={ms:.2}");
+    if crate::profile::profile_enabled() {
+        profile_line!("boolean.{code}={ms:.2}");
     }
 }
 
@@ -1981,9 +1981,9 @@ fn prepared_operands(
     crate::heal::refit_inherited_trims(&mut first_owned, policy)?;
     crate::heal::refit_inherited_trims(&mut second_owned, policy)?;
     profile_stage("heal.refit_ms", refit_started.elapsed().as_secs_f64() * 1_000.0);
-    if std::env::var("BREP_PROFILE").is_ok() {
+    if crate::profile::profile_enabled() {
         let (hits, misses) = crate::reading_memo::counts();
-        eprintln!("boolean.reading_memo hits={hits} misses={misses}");
+        profile_line!("boolean.reading_memo hits={hits} misses={misses}");
     }
     profile_stage("heal_ms", stage_started.elapsed().as_secs_f64() * 1_000.0);
     // Seamless full-period band faces (STEP import) break the seam-aware

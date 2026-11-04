@@ -2,7 +2,7 @@
 //! in the mutate phase, completed by the matching `Event::Screenshot` in a later
 //! frame's input phase (§5). The headless host renders directly instead and
 //! answers this command itself; the window and dial-in hosts go through here.
-use crate::automation::command::{parse_args, schema_of, Annotations, CommandSpec, Ctx, Empty, Handler, Outcome, Phase};
+use crate::automation::command::{app_command, parse_args, schema_of, CommandSpec, Ctx, Empty, Outcome};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -37,6 +37,9 @@ pub struct ScreenshotInfo {
     /// The captured rect in egui points.
     pub region: [f32; 4],
     pub png_bytes: usize,
+    /// The document the image shows, `{documentId, revision}` as drawn in the
+    /// captured frame (null for a capture taken outside an app frame).
+    pub document: Option<Value>,
 }
 
 /// Resolve a region to a pixel rect on a `w`×`h` image at `ppp`.
@@ -67,7 +70,7 @@ pub fn encode_capture(image: &egui::ColorImage, ppp: f32, view: Option<egui::Rec
     let mut out = std::io::Cursor::new(Vec::new());
     cropped.write_to(&mut out, image::ImageFormat::Png).map_err(|e| format!("png encode: {e}"))?;
     let png = out.into_inner();
-    let info = ScreenshotInfo { width: cw, height: ch, ppp, region: pts, png_bytes: png.len() };
+    let info = ScreenshotInfo { width: cw, height: ch, ppp, region: pts, png_bytes: png.len(), document: None };
     Ok((serde_json::to_value(info).map_err(|e| e.to_string())?, png))
 }
 
@@ -75,7 +78,8 @@ fn screenshot(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
     let a: ScreenshotArgs = parse_args(args)?;
     let token = ctx.app.automation.next_token();
     ctx.egui.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::new(token)));
-    Ok(Outcome::AwaitScreenshot { token, region: a.region })
+    let document = Some(ctx.app.docs.view().handle().to_string());
+    Ok(Outcome::AwaitScreenshot { token, region: a.region, document })
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -104,8 +108,8 @@ fn illustration_presentation(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, 
 }
 
 pub static COMMANDS: &[CommandSpec] = &[
-    CommandSpec { name: "illustration_presentation", group: "capture", doc: "Internal presentation loan for illustration_capture_many: preserves camera, full selection, display settings, saved-view state and display transforms without editing history or creating documents.", phase: Phase::Mutate, annotations: Annotations::MUTATE_NOWAIT, args_schema: schema_of::<IllustrationArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(illustration_presentation) },
-    CommandSpec { name: "screenshot", group: "capture", doc: "Capture the composited frame (egui chrome and the 3D view) as PNG: region `full` (default), `viewport`, or `{x,y,w,h}` in egui points. The PNG rides beside the JSON reply.", phase: Phase::Mutate, annotations: Annotations::READ, args_schema: schema_of::<ScreenshotArgs>, result_schema: schema_of::<ScreenshotInfo>, handler: Handler::App(screenshot) },
+    app_command!("capture", "illustration_presentation", "Internal presentation loan for illustration_capture_many: preserves camera, full selection, display settings, saved-view state and display transforms without editing history or creating documents.", IllustrationArgs, illustration_presentation, Mutate, MUTATE_NOWAIT, schema_of::<Empty>),
+    app_command!("capture", "screenshot", "Capture the composited frame (egui chrome and the 3D view) as PNG: region `full` (default), `viewport`, or `{x,y,w,h}` in egui points. The PNG rides beside the JSON reply.", ScreenshotArgs, screenshot, Mutate, READ, schema_of::<ScreenshotInfo>),
 ];
 
 #[allow(dead_code)]

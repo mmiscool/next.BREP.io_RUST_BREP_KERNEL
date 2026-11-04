@@ -58,8 +58,9 @@ pub enum Tab {
     Display,
     /// Assembly-wide configuration (today: the BOM's columns).
     Assemblies,
-    /// The PLM this session is on or configured for: sign-in, check, forget
-    /// (plan S1 part 3). Present only when the store reports a PLM.
+    /// The PLM server: its URL (editable wherever `plm.json` can be written),
+    /// and for the PLM this session is on or configured for, sign-in, check,
+    /// forget (plan S1 part 3). Present in every session (owner 2026-10-29).
     Plm,
 }
 
@@ -94,6 +95,14 @@ pub struct SettingsPanel {
     /// The PLM tab's state, built when the store first reports a PLM and
     /// rebuilt if its URL changes. `None` in a file-only session.
     plm: Option<crate::plm::connection::PlmConnection>,
+    /// The Server URL field's edit buffer, and the store URL it was seeded
+    /// from: re-seeded when the store's URL moves, never mid-edit. It commits
+    /// on focus loss (Enter included), the BOM columns editor's rule.
+    url_buf: Option<(String, Option<String>)>,
+    /// What the last Server URL commit did: saved (the sentence says what
+    /// happens next) or refused (the reason). Kept here, not on `plm`, which
+    /// a new URL rebuilds.
+    url_outcome: Option<crate::plm::connection::Outcome>,
     /// Set by the app every frame: why this session cannot switch to the PLM
     /// live (open named or dirty documents), or `None` when it can.
     pub reconnect_blocker: Option<String>,
@@ -156,6 +165,8 @@ impl SettingsPanel {
             assemblies_collapsed: false,
             bom_columns_buf: None,
             plm: None,
+            url_buf: None,
+            url_outcome: None,
             reconnect_blocker: None,
             reconnect_request: None,
             signed_out: None,
@@ -200,7 +211,7 @@ impl SettingsPanel {
         // with the history + scene panels) — empty while the window is closed.
         if crate::automation::registry::enabled() {
             crate::automation::registry::publish("__brepSettingsHit", "settings window widget rects (field:*, group:*, panel:clip); empty while the window is closed", &self.hits_json());
-            crate::automation::registry::publish("__brepPlm", "the Settings PLM tab: {tab, status, url, username, reason, busy, outcome, failed, linking, linkCode, linkUrl, linkToken, linkNote}; tab false (and the rest null) in a file-only session", &self.plm_json(store));
+            crate::automation::registry::publish("__brepPlm", "the Settings PLM tab (present in every session, so tab is always true): {tab, status, url, username, reason, busy, outcome, failed, linking, linkCode, linkUrl, linkToken, linkNote} for the session's PLM — status \"not-configured\" (and those null) when there is none — and the Server URL field {serverUrl, urlSource (\"plm.json\", \"BREP_PLM_URL\", \"--plm-url\" or null), urlEditable, urlField, urlOutcome, urlFailed}", &self.plm_json(store));
         }
     }
 
@@ -231,22 +242,17 @@ impl SettingsPanel {
         // which is how the Assemblies editor COMMITS. Deferring by one frame lets
         // the editor blur normally (invisible at 60fps, and the difference between
         // "my BOM columns saved" and "my typing disappeared").
-        // The PLM tab exists only while the store reports a PLM: a file-only
-        // session has no such tab at all.
+        // The PLM tab is in every session: a file-only one shows its Server
+        // URL field, which is how such a session connects.
         self.sync_plm(store.plm_session());
-        if self.plm.is_none() && self.tab == Tab::Plm {
-            self.tab = Tab::Display;
-        }
         let tab = self.tab;
         ui.horizontal(|ui| {
             let display = ui.selectable_value(&mut self.tab, Tab::Display, "Display");
             let assemblies = ui.selectable_value(&mut self.tab, Tab::Assemblies, "Assemblies");
             self.hits.insert("tab:display".into(), display.rect);
             self.hits.insert("tab:assemblies".into(), assemblies.rect);
-            if self.plm.is_some() {
-                let plm = ui.selectable_value(&mut self.tab, Tab::Plm, "PLM");
-                self.hits.insert("tab:plm".into(), plm.rect);
-            }
+            let plm = ui.selectable_value(&mut self.tab, Tab::Plm, "PLM");
+            self.hits.insert("tab:plm".into(), plm.rect);
         });
         // ...and because of that defer, the switch needs ONE more frame to show
         // its new section. The shell only requests a repaint while work is
@@ -269,7 +275,10 @@ impl SettingsPanel {
                 match tab {
                     Tab::Display => self.settings_section(ui, state, store),
                     Tab::Assemblies => self.assemblies_section(ui, state, store),
-                    Tab::Plm => self.plm_section(ui),
+                    Tab::Plm => {
+                        self.plm_url_section(ui, store);
+                        self.plm_section(ui);
+                    }
                 }
             });
     }
@@ -279,8 +288,23 @@ impl SettingsPanel {
     fn plm_json(&mut self, store: &dyn ModelStore) -> String {
         use crate::plm::connection::{Outcome, Status};
         self.sync_plm(store.plm_session());
+        let setting = store.plm_url_setting();
+        let (url_outcome, url_failed) = match &self.url_outcome {
+            Some(Outcome::Done(text)) => (Some(text.clone()), false),
+            Some(Outcome::Failed(text)) => (Some(text.clone()), true),
+            None => (None, false),
+        };
+        let field = serde_json::json!({
+            "serverUrl": setting.as_ref().and_then(|s| s.url.clone()),
+            "urlSource": setting.as_ref().and_then(|s| s.source).map(crate::plm::config::url_origin),
+            "urlEditable": setting.is_some(),
+            "urlField": self.url_buf.as_ref().map(|(buf, _)| buf.clone()),
+            "urlOutcome": url_outcome, "urlFailed": url_failed,
+        });
         let Some(plm) = self.plm.as_mut() else {
-            return serde_json::json!({ "tab": false, "status": null }).to_string();
+            let mut json = serde_json::json!({ "tab": true, "status": "not-configured", "url": null });
+            json.as_object_mut().expect("an object").extend(field.as_object().expect("an object").clone());
+            return json.to_string();
         };
         plm.poll();
         let (status, url, username, reason) = match &plm.status {
@@ -292,7 +316,7 @@ impl SettingsPanel {
             Some(Outcome::Failed(text)) => (Some(text.clone()), true),
             None => (None, false),
         };
-        serde_json::json!({
+        let mut json = serde_json::json!({
             "tab": true, "status": status, "url": url, "username": username, "reason": reason,
             "busy": plm.busy(), "outcome": outcome, "failed": failed,
             "connectable": plm.connectable(), "reconnectBlocker": self.reconnect_blocker,
@@ -302,8 +326,9 @@ impl SettingsPanel {
             // The token alone, for a script deciding the link as the browser would.
             "linkToken": plm.link.as_ref().and_then(|l| l.url.split_once("token=").map(|(_, t)| t.to_string())),
             "linkNote": plm.link.as_ref().and_then(|l| l.note.clone()),
-        })
-        .to_string()
+        });
+        json.as_object_mut().expect("an object").extend(field.as_object().expect("an object").clone());
+        json.to_string()
     }
 
     /// Connect now's request, for the app to act on (once).
@@ -343,6 +368,119 @@ impl SettingsPanel {
         }
     }
 
+    /// The PLM tab's Server URL (owner 2026-10-29): the URL this session uses
+    /// or would use and where it came from, and — wherever a `plm.json` can be
+    /// written — the field that writes it, committed on focus loss (Enter
+    /// included) exactly as `--plm-configure` would write it. Hit keys
+    /// `plm:url`, `plm:url-source`, `plm:url-outcome`.
+    fn plm_url_section(&mut self, ui: &mut egui::Ui, store: &dyn ModelStore) {
+        use crate::plm::config::{url_origin, Source};
+        use crate::plm::connection::{Outcome, Status};
+        let setting = store.plm_url_setting();
+        let editable = setting.is_some();
+        // No setting is the browser: its PLM is the server serving the page.
+        let shown = match &setting {
+            Some(setting) => setting.url.clone(),
+            None => self.plm.as_ref().map(|plm| plm.url().to_string()).filter(|url| !url.is_empty()),
+        };
+        let source = setting.as_ref().and_then(|s| s.source);
+        if self.url_buf.as_ref().is_none_or(|(_, from)| *from != shown) {
+            self.url_buf = Some((shown.clone().unwrap_or_default(), shown.clone()));
+        }
+
+        tree::node(
+            ui,
+            TreeRow {
+                guides: &[],
+                is_last: true,
+                expandable: false,
+                expanded: true,
+                root: true,
+                glyph: None,
+                label: "PLM server",
+                selected: false,
+                highlighted: false,
+                draggable: false,
+                tint: None,
+            },
+            |_| {},
+        );
+        let mut committed = false;
+        let mut rect = egui::Rect::NOTHING;
+        let (buf, _) = self.url_buf.as_mut().expect("seeded above");
+        tree::node(ui, TreeRow::leaf(&[], true, "Server URL"), |ui| {
+            ui.add_enabled_ui(editable, |ui| {
+                let width = form::text_input_width(ui);
+                let field = form::text_input(ui, buf, width);
+                committed = field.lost_focus();
+                rect = field.rect;
+            });
+        });
+        self.hits.insert("plm:url".into(), rect);
+
+        if committed && editable {
+            let typed = buf.trim().to_string();
+            if typed != shown.clone().unwrap_or_default() {
+                self.url_outcome = Some(if typed.is_empty() {
+                    Outcome::Failed("an empty URL is not saved: Forget this machine's sign-in removes the server from this machine".into())
+                } else {
+                    match store.save_plm_url(&typed) {
+                        Err(why) => Outcome::Failed(format!("not saved: {why}")),
+                        Ok(saved) => {
+                            let mut said = format!("saved to plm.json: {}", saved.url);
+                            if saved.token_dropped {
+                                said += "; this machine's sign-in for the previous server is forgotten (a token is never sent to another server)";
+                            }
+                            match (source, self.plm.as_ref().map(|plm| &plm.status)) {
+                                (Some(Source::Env | Source::Flag), _) => {
+                                    said += &format!(
+                                        "; this launch stays on {} ({} overrides plm.json), and a start without it uses {}",
+                                        shown.clone().unwrap_or_default(),
+                                        url_origin(source.expect("matched")),
+                                        saved.url
+                                    );
+                                }
+                                (_, Some(Status::Connected { url, .. })) if *url != saved.url => {
+                                    said += &format!("; this session stays on {url} until the next start");
+                                }
+                                _ => said += "; sign in below, then Connect now (or the next start) puts this session on it",
+                            }
+                            // The store's URL moves only for a session on
+                            // plm.json; keep the saved text either way.
+                            let from = store.plm_url_setting().and_then(|s| s.url);
+                            self.url_buf = Some((saved.url.clone(), from));
+                            Outcome::Done(said)
+                        }
+                    }
+                });
+            }
+        }
+
+        let note = match (&setting, source) {
+            (Some(_), Some(source @ (Source::Env | Source::Flag))) => format!(
+                "From {}, which overrides plm.json for this launch. A URL saved here is what a launch without it uses.",
+                url_origin(source)
+            ),
+            (Some(_), Some(Source::File)) => {
+                "From plm.json. Changing the server forgets this machine's sign-in: a token is never sent to a different server.".into()
+            }
+            (Some(_), None) => "No PLM server is set: this session uses the files on this machine. Enter the server's URL (http:// or https://) and press Enter, then sign in.".into(),
+            (None, _) if shown.is_some() => "The web app uses the PLM that serves this page.".into(),
+            (None, _) => "This page is not served by a PLM, so there is no server to point it at: open the CAD app from your PLM's web page to use one.".into(),
+        };
+        let said = ui.add(egui::Label::new(note).wrap());
+        self.hits.insert("plm:url-source".into(), said.rect);
+        if let Some(outcome) = &self.url_outcome {
+            let (text, color) = match outcome {
+                Outcome::Done(text) => (text.clone(), ui.visuals().text_color()),
+                Outcome::Failed(text) => (text.clone(), PROBLEM_AMBER),
+            };
+            let said = ui.add(egui::Label::new(egui::RichText::new(text).color(color)).wrap());
+            self.hits.insert("plm:url-outcome".into(), said.rect);
+        }
+        ui.separator();
+    }
+
     /// The `PLM` TAB (plan S1 part 3): where this session's PLM is and who it
     /// is signed in as, or why it is not; a token paste and a password
     /// sign-in; a check; and Forget. Hit keys `plm:*`.
@@ -367,6 +505,11 @@ impl SettingsPanel {
         let shown = ui.add(egui::Label::new(status).wrap());
         hits.insert("plm:status".into(), shown.rect);
         ui.separator();
+        // A plm.json that names no usable server: the field above is the fix,
+        // and nothing below has a server to ask.
+        if plm.url().is_empty() {
+            return;
+        }
 
         let native = matches!(plm.keep(), Keep::Files(_));
         let idle = !plm.busy();
@@ -828,8 +971,8 @@ fn reload_page() {
 pub static HIT_KEYS: &[HitKeyDoc] = &[
     HitKeyDoc { panel: "settings", prefix: "field:", meaning: "a settings field by key", command: None },
     HitKeyDoc { panel: "settings", prefix: "group:", meaning: "a settings group header", command: None },
-    HitKeyDoc { panel: "settings", prefix: "tab:", meaning: "a settings tab (tab:display, tab:assemblies, and tab:plm while a PLM is configured)", command: None },
-    HitKeyDoc { panel: "settings", prefix: "plm:", meaning: "the PLM tab: status, check, outcome; hosted account; desktop token, use-token, username, password, sign-in, forget", command: None },
+    HitKeyDoc { panel: "settings", prefix: "tab:", meaning: "a settings tab (tab:display, tab:assemblies, tab:plm — the PLM tab is in every session)", command: None },
+    HitKeyDoc { panel: "settings", prefix: "plm:", meaning: "the PLM tab: url (the Server URL field, committed on Enter or focus loss into plm.json), url-source, url-outcome; status, check, outcome; hosted account; desktop token, use-token, username, password, sign-in, forget", command: None },
     HitKeyDoc { panel: "settings", prefix: "box:", meaning: "expand/collapse a section", command: None },
     HitKeyDoc { panel: "settings", prefix: "bom-columns:reset", meaning: "reset the BOM columns", command: None },
     HitKeyDoc { panel: "settings", prefix: "panel:clip", meaning: "the visible region of the window", command: None },

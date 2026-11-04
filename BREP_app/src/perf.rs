@@ -177,6 +177,33 @@ impl Drop for Span {
     }
 }
 
+/// A scratch phase timer for one block of the frame: with `BREP_FRAME_TRACE=1`
+/// it writes `[frame-trace] <label> <ms>` to stderr when the block took
+/// longer than 250 ms, and costs one clock read otherwise. What finds the
+/// phase that holds a frame for seconds when `perf`/ptrace are unavailable.
+#[must_use = "the timer reports when the guard drops; bind it to a name"]
+pub fn trace(label: &'static str) -> Trace {
+    Trace { label, start: Instant::now() }
+}
+
+pub struct Trace {
+    label: &'static str,
+    start: Instant,
+}
+
+impl Drop for Trace {
+    fn drop(&mut self) {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ON.get_or_init(|| std::env::var_os("BREP_FRAME_TRACE").is_some_and(|v| v == "1")) {
+            return;
+        }
+        let ms = self.start.elapsed().as_secs_f64() * 1000.0;
+        if ms > 250.0 {
+            eprintln!("[frame-trace] {} {:.0} ms", self.label, ms);
+        }
+    }
+}
+
 /// The rolling window as JSON: the `__brepPerf` blob and the Info-window rows
 /// read this one value, so they cannot disagree.
 ///

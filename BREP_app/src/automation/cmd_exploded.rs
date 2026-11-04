@@ -4,7 +4,7 @@
 //! on the same engine calls. Steps are ordinary PMI explode annotations, so
 //! `pmi_update_annotation` / `pmi_remove_annotation` / `pmi_move_annotation`
 //! edit them.
-use crate::automation::command::{parse_args, schema_of, Annotations, CommandSpec, Ctx, Empty, Handler, NoArgs, Outcome, Phase};
+use crate::automation::command::{app_command, read_engine, parse_args, CommandSpec, Ctx, NoArgs, Outcome};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -61,8 +61,7 @@ fn exploded_add_step(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> 
 }
 
 fn exploded_state(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
-    let _: NoArgs = parse_args(args)?;
-    Ok(Outcome::Done(ctx.app.docs.engine().exploded_state_json()))
+    read_engine(ctx, args, |e| e.exploded_state_json())
 }
 
 fn assembly_auto_explode(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
@@ -89,10 +88,46 @@ fn exploded_animate(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
     Ok(Outcome::Done(json!({})))
 }
 
+// Inline nested schemas keep the generated script declarations fully typed.
+// These shapes follow exploded_state_json; animation intentionally returns {}.
+fn reply_object(properties: Value, required: &[&str]) -> Value {
+    json!({"type":"object","properties":properties,"required":required,"additionalProperties":false})
+}
+
+fn exploded_state_schema() -> Value {
+    let strings = json!({"type":"array","items":{"type":"string"}});
+    let hide = reply_object(json!({"id":{"type":"string"},"targets":strings,"labels":strings,"enabled":{"type":"boolean"}}), &["id","targets","labels","enabled"]);
+    let step = reply_object(json!({
+        "id":{"type":"string"},"targets":strings,"labels":strings,
+        "translate":{"type":"array","items":{"type":"number"},"minItems":3,"maxItems":3},
+        "trace":{"type":"boolean"},"enabled":{"type":"boolean"}
+    }), &["id","targets","labels","translate","trace","enabled"]);
+    let view = reply_object(json!({"id":{"type":"string"},"name":{"type":"string"},"steps":{"type":"array","items":step},"hides":{"type":"array","items":hide}}), &["id","name","steps","hides"]);
+    reply_object(json!({
+        "activeView":{"type":["string","null"]},"steps":{"type":"integer","minimum":0},
+        "progress":{"type":"number","minimum":0},"animating":{"type":"boolean"},
+        "views":{"type":"array","items":view}
+    }), &["activeView","steps","progress","animating","views"])
+}
+
+fn auto_explode_schema() -> Value {
+    reply_object(json!({"view":{"type":"string"}}), &["view"])
+}
+
+fn add_step_schema() -> Value {
+    reply_object(json!({"id":{"type":"string"},"state":exploded_state_schema()}), &["id","state"])
+}
+
+fn animation_schema() -> Value {
+    let mut schema = reply_object(json!({}), &[]);
+    schema["description"] = json!("Intentionally empty native success payload. The MCP adapter adds its frame and optional notices; playback is observed with exploded_state.");
+    schema
+}
+
 pub static COMMANDS: &[CommandSpec] = &[
-    CommandSpec { name: "exploded_state", group: "assembly", doc: "The assembly's exploded views (PMI views holding explode steps: id, name, and per step its targets, translation, trail and enabled flag) and the active view's playback: step count, progress (0 = collapsed, the step count = fully exploded) and whether an Explode / Collapse animation is running.", phase: Phase::Read, annotations: Annotations::READ, args_schema: schema_of::<NoArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(exploded_state) },
-    CommandSpec { name: "assembly_auto_explode", group: "assembly", doc: "Make a new exploded view: one step per top-level component, each moved straight away from the base component (the first fixed one, else the largest) by `spread` times half the assembly's diagonal, the outermost first, trails on. `depth` > 1 then opens each sub-assembly too (the base included): its placements move away from its own base by `spread` times half its own size, level by level after the assembly's own steps, a nested step moving on top of those above it. The view is framed on the exploded parts and becomes active. Returns its id.", phase: Phase::Mutate, annotations: Annotations::MUTATE, args_schema: schema_of::<AutoExplodeArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(assembly_auto_explode) },
-    CommandSpec { name: "exploded_set_progress", group: "assembly", doc: "Show the active exploded view's steps up to `progress` (clamped to 0 ..= the step count; step k is shown at clamp(progress - k, 0, 1)), stopping any animation. Display only: nothing is saved.", phase: Phase::Mutate, annotations: Annotations::MUTATE, args_schema: schema_of::<ProgressArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(exploded_set_progress) },
-    CommandSpec { name: "exploded_animate", group: "assembly", doc: "Play the active exploded view's steps out (`explode: true`, from collapsed when fully exploded) or back home, at `steps_per_second`. The app advances it once per frame; `exploded_state` `animating` says when it is done.", phase: Phase::Mutate, annotations: Annotations::MUTATE_NOWAIT, args_schema: schema_of::<AnimateArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(exploded_animate) },
-    CommandSpec { name: "exploded_add_step", group: "assembly", doc: "Add a step to the shown exploded view that moves `targets` (the selection's placements when absent: a part inside a sub-assembly is its occurrence path, `ACOMP1:ACOMP2`) up by their own size, and select it so its gizmo drags it. Returns `{id, state}` (the `exploded_state` after it). Refused with no exploded view shown or nothing to move.", phase: Phase::Mutate, annotations: Annotations::MUTATE, args_schema: schema_of::<AddStepArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(exploded_add_step) },
+    app_command!("assembly", "exploded_state", "The assembly's exploded views (PMI views holding explode steps: id, name, and per step its targets, translation, trail and enabled flag) and the active view's playback: step count, progress (0 = collapsed, the step count = fully exploded) and whether an Explode / Collapse animation is running.", NoArgs, exploded_state, Read, READ, exploded_state_schema),
+    app_command!("assembly", "assembly_auto_explode", "Make a new exploded view: one step per top-level component, each moved straight away from the base component (the first fixed one, else the largest) by `spread` times half the assembly's diagonal, the outermost first, trails on. `depth` > 1 then opens each sub-assembly too (the base included): its placements move away from its own base by `spread` times half its own size, level by level after the assembly's own steps, a nested step moving on top of those above it. The view is framed on the exploded parts and becomes active. Returns its id.", AutoExplodeArgs, assembly_auto_explode, Mutate, MUTATE, auto_explode_schema),
+    app_command!("assembly", "exploded_set_progress", "Show the active exploded view's steps up to `progress` (clamped to 0 ..= the step count; step k is shown at clamp(progress - k, 0, 1)), stopping any animation. Display only: nothing is saved.", ProgressArgs, exploded_set_progress, Mutate, MUTATE, exploded_state_schema),
+    app_command!("assembly", "exploded_animate", "Play the active exploded view's steps out (`explode: true`, from collapsed when fully exploded) or back home, at `steps_per_second`. The app advances it once per frame; `exploded_state` `animating` says when it is done.", AnimateArgs, exploded_animate, Mutate, MUTATE_NOWAIT, animation_schema),
+    app_command!("assembly", "exploded_add_step", "Add a step to the shown exploded view that moves `targets` (the selection's placements when absent: a part inside a sub-assembly is its occurrence path, `ACOMP1:ACOMP2`) up by their own size, and select it so its gizmo drags it. Returns `{id, state}` (the `exploded_state` after it). Refused with no exploded view shown or nothing to move.", AddStepArgs, exploded_add_step, Mutate, MUTATE, add_step_schema),
 ];

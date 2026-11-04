@@ -1986,7 +1986,10 @@ fn symbol_extent(symbol: &Symbol, rotation: u8) -> (Point, Point) {
     );
     (lo, hi)
 }
-fn csv_field(text: &str) -> String {
+/// A CSV field, quoted (inner quotes doubled) when it holds a comma, a quote
+/// or a line break: the one rule for the crate's CSVs (the BOM here, the
+/// fabrication pick-and-place and parts BOM).
+pub(crate) fn csv_field(text: &str) -> String {
     if text.contains([',', '"', '\n', '\r']) {
         format!("\"{}\"", text.replace('"', "\"\""))
     } else {

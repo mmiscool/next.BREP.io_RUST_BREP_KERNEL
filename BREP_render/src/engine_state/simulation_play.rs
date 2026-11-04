@@ -999,25 +999,10 @@ impl EngineState {
 }
 
 /// `a · b`, row-major 4×4.
-pub(super) fn mat_mul(a: &[f64; 16], b: &[f64; 16]) -> [f64; 16] {
-    std::array::from_fn(|k| {
-        let (row, col) = (k / 4, k % 4);
-        (0..4).map(|n| a[row * 4 + n] * b[n * 4 + col]).sum()
-    })
-}
+pub(super) use crate::geometry3d::mat4_mul_row_major as mat_mul;
 
 /// The inverse of a rigid row-major 4×4: `[Rᵀ | −Rᵀ·t]`.
-pub(super) fn rigid_inverse(m: &[f64; 16]) -> [f64; 16] {
-    let mut out = [0.0; 16];
-    for row in 0..3 {
-        for col in 0..3 {
-            out[row * 4 + col] = m[col * 4 + row];
-        }
-        out[row * 4 + 3] = -(0..3).map(|k| m[k * 4 + row] * m[k * 4 + 3]).sum::<f64>();
-    }
-    out[15] = 1.0;
-    out
-}
+pub(super) use crate::geometry3d::mat4_rigid_inverse as rigid_inverse;
 
 /// Two poses within roundoff of each other.
 pub(super) fn same_matrix(a: &[f64; 16], b: &[f64; 16]) -> bool {
@@ -1025,12 +1010,7 @@ pub(super) fn same_matrix(a: &[f64; 16], b: &[f64; 16]) -> bool {
 }
 
 /// `a · b`, column-major 4×4 (`SolidDisplay::pose`'s spelling).
-fn mat4_mul_column_major(a: &[f32; 16], b: &[f32; 16]) -> [f32; 16] {
-    std::array::from_fn(|k| {
-        let (col, row) = (k / 4, k % 4);
-        (0..4).map(|n| a[n * 4 + row] * b[col * 4 + n]).sum()
-    })
-}
+use crate::view::mat4_mul_column_major;
 
 /// Move a display rigidly by the row-major `m`: the renderer draws the
 /// buffers it holds for the shape through the matrix (`pose`, over any pose

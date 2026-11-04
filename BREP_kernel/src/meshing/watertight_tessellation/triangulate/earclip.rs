@@ -41,19 +41,7 @@ fn point_in_ring(vertices: &[FaceVertex], indices: &[usize], p: [f64; 2]) -> boo
 /// Crossing parity of a horizontal +u ray against a closed uv chain of `count`
 /// vertices addressed by `uv`.  Shared by the ring and whole-polygon forms.
 pub(super) fn crossing_parity_inside(count: usize, uv: impl Fn(usize) -> [f64; 2], p: [f64; 2]) -> bool {
-    let mut inside = false;
-    for offset in 0..count {
-        let a = uv(offset);
-        let b = uv((offset + 1) % count);
-        if (a[1] > p[1]) != (b[1] > p[1]) {
-            let t = (p[1] - a[1]) / (b[1] - a[1]);
-            let x = a[0] + t * (b[0] - a[0]);
-            if x > p[0] {
-                inside = !inside;
-            }
-        }
-    }
-    inside
+    crate::polygon::parity_inside(p, count, uv)
 }
 
 /// Find a VALID splitting diagonal of a stalled ear-clip ring: two

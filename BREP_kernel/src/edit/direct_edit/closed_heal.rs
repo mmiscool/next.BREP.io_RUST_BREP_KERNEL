@@ -150,19 +150,8 @@ pub(super) fn rim_iso_station(surface: &NurbsSurface, rim: &NurbsCurve, toleranc
 /// Centre, unit normal and radius of the circle through three points, or
 /// `None` when they are collinear. Exact (the circumcentre in closed form).
 pub(super) fn circle_through(a: Vec3, b: Vec3, c: Vec3) -> Option<(Vec3, Vec3, f64)> {
-    let u = b.sub(a);
-    let v = c.sub(a);
-    let n = u.cross(v);
-    let n_squared = n.dot(n);
-    if n_squared <= 1e-24 {
-        return None;
-    }
-    let offset = v
-        .scale(u.dot(u))
-        .sub(u.scale(v.dot(v)))
-        .cross(n)
-        .scale(0.5 / n_squared);
-    let center = a.add(offset);
+    let center = crate::circumcenter(a, b, c)?;
+    let n = b.sub(a).cross(c.sub(a));
     Some((center, n.normalized().ok()?, a.sub(center).length()))
 }
 

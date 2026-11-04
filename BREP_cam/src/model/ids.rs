@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 macro_rules! string_id {
     ($(#[$doc:meta])* $name:ident) => {
         $(#[$doc])*
+        #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
         #[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
         #[serde(transparent)]
         pub struct $name(pub String);
@@ -72,6 +73,7 @@ string_id!(
 /// `face == None` names the whole body. Resolution against a mesh snapshot
 /// happens by name; an unresolvable reference is a reported error, never a
 /// silently empty target.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TargetRef {
@@ -102,6 +104,7 @@ impl TargetRef {
 /// checks always protect every triangle of `target_solids` and
 /// `protected_solids`. An empty `target_solids` list is a reported error for
 /// an enabled operation.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TargetSelection {
@@ -152,6 +155,7 @@ impl TargetSelection {
 }
 
 /// One BREP edge by persistent names, like [`TargetRef`] for faces.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EdgeRef {
@@ -168,6 +172,7 @@ impl EdgeRef {
 }
 
 /// An ordered chain of curves to machine along.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[serde(default)]
@@ -210,6 +215,7 @@ impl ChainRef {
 }
 
 /// Where a chain's curves come from.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase", rename_all_fields = "camelCase")]
 pub enum ChainSource {
@@ -279,6 +285,7 @@ impl ChainSource {
 }
 
 /// Which side of a chain the tool stays on.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ChainSide {

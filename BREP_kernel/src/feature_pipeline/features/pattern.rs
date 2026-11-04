@@ -36,7 +36,10 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, String> {
         return Ok(result);
     }
 
-    let resolved = common::resolve_solid_names(ctx.scene, &names, &mut result.unresolved);
+    let mut resolved = common::resolve_solid_names(ctx.scene, &names, &mut result.unresolved);
+    // A source listed twice would only stack identical copies under one name.
+    let mut seen = std::collections::BTreeSet::new();
+    resolved.retain(|(name, _)| seen.insert(name.clone()));
     if resolved.is_empty() {
         return Ok(result);
     }
@@ -73,7 +76,7 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, String> {
     // Build EVERYTHING as owned `BrepSolid`s first; register handles only once the
     // whole feature has succeeded, so an error mid-build leaks nothing.
     let mut owned_added: Vec<(String, BrepSolid)> = Vec::new();
-    for (source_name, handle) in &resolved {
+    for (source_index, (source_name, handle)) in resolved.iter().enumerate() {
         // Each clone: transform the source, then retag its faces (`cloneInstance`).
         let mut clones: Vec<(String, BrepSolid)> = Vec::with_capacity(matrices.len());
         for (offset, matrix) in matrices.iter().enumerate() {
@@ -82,7 +85,16 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, String> {
             if suppressed.contains(&(index as i64)) {
                 continue;
             }
-            let name = format!("{feature_id}_{index}");
+            // The first source's copies keep `{id}_{index}`; each further source's
+            // carry its name after the index (`{id}_{index}_{source}`), or every
+            // source's copies would share one name and only the last survive in
+            // the scene. The index still follows `{id}_`, so instance suppression
+            // reads the same number for every source.
+            let name = if source_index == 0 {
+                format!("{feature_id}_{index}")
+            } else {
+                format!("{feature_id}_{index}_{source_name}")
+            };
             let transform = AffineTransform::new(*matrix)?;
             let mut solid =
                 crate::with_registered_solid_str(*handle, |solid| transform_brep(solid, transform, false))?;

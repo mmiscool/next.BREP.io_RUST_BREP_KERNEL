@@ -710,8 +710,7 @@ pub(super) fn fold_number(
 /// `BREP_BLEND_ROWS_LOOP_CHECK=0` skips [`check_rows_loop`] (a census hatch;
 /// unset or anything else runs it). Read once.
 fn rows_loop_check_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var("BREP_BLEND_ROWS_LOOP_CHECK").as_deref() != Ok("0"))
+    switch!("BREP_BLEND_ROWS_LOOP_CHECK", true)
 }
 
 /// Sub-steps of each station interval and samples across the section the

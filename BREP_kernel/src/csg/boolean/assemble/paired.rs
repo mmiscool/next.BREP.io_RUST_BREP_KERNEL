@@ -395,6 +395,32 @@ fn remap(mut pc: NurbsCurve, range: [f64; 2]) -> Option<NurbsCurve> {
     Some(pc)
 }
 
+/// A reversed curve's knots are a + b - k, so its domain can come back an
+/// ulp off [a, b], and `difference_bound` declines unequal domains outright:
+/// whether a partner isoline certified the section used to depend on that
+/// rounding (`offset_subtract_fixture`'s faces 24 and 26, which leave a
+/// joint open by 8.7e-4 when the pierces upstream move by a few ulps). With
+/// the pin (lane O row 26, default on since batch 7; `BREP_PAIRED_PINNED_REVERSAL=0`
+/// restores the old reading) a reversal whose
+/// ends miss the range by rounding only is re-pinned to it by the same linear
+/// knot map as `remap`; one already on the range is returned untouched.
+fn pinned_reversal(reversed: NurbsCurve, range: [f64; 2]) -> Option<NurbsCurve> {
+    let [a, b] = reversed.domain().ok()?;
+    if [a, b] == range || !pinned_reversal_enabled() {
+        return Some(reversed);
+    }
+    let rounding = 8.0 * f64::EPSILON * range[0].abs().max(range[1].abs()).max(range[1] - range[0]);
+    if (a - range[0]).abs() > rounding || (b - range[1]).abs() > rounding {
+        return Some(reversed);
+    }
+    remap(reversed, range)
+}
+
+fn pinned_reversal_enabled() -> bool {
+    switch!("BREP_PAIRED_PINNED_REVERSAL", true)
+}
+
+
 /// Fit only the newly constructed carrier intersection, never inherited
 /// off-carrier stations. Affine images receive a complete rational bound;
 /// analytic images retain the analytic fitter's independent span witnesses.
@@ -430,7 +456,7 @@ fn companion(
         };
         for reversed in [false, true] {
             let candidate = if reversed {
-                iso.reversed().ok()?
+                pinned_reversal(iso.reversed().ok()?, range)?
             } else {
                 iso.clone()
             };
@@ -1405,7 +1431,7 @@ pub(super) fn reconstruct(solid: &mut BrepSolid, bar: f64, scope: Option<&HashSe
     let mut scans = 0;
     let result = reconstruct_impl(solid, bar, scope, skip_empty, &mut scans);
     if crate::imprint::profile_enabled() {
-        eprintln!("assemble.paired.profile containment_scans={scans} skip_empty={skip_empty}");
+        profile_line!("assemble.paired.profile containment_scans={scans} skip_empty={skip_empty}");
     }
     if tracing {
         super::super::clearance::trace_motion(

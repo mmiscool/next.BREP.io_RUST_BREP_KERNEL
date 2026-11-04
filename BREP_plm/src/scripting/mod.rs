@@ -204,9 +204,7 @@ impl Scripts {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(Error::internal)?;
         }
-        let temp = path.with_extension("js.tmp");
-        fs::write(&temp, text).map_err(Error::internal)?;
-        fs::rename(&temp, &path).map_err(Error::internal)?;
+        crate::db::write_atomic(&path, text).map_err(Error::internal)?;
         self.forget(&path);
         Ok(())
     }

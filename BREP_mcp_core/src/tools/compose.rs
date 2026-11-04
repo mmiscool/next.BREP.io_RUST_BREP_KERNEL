@@ -20,6 +20,9 @@ pub struct ServerContext {
     /// Called after a session starts or stops so the server rebuilds its tool
     /// list from the new registry and announces `tools/list_changed`.
     pub on_tools_changed: Arc<dyn Fn() + Send + Sync>,
+    /// The server's code mode (a spawned app's editor runs on it).
+    #[cfg(feature = "server")]
+    pub cad: std::sync::Weak<crate::cad::CadService>,
 }
 
 fn s(v: &Value, k: &str) -> Option<String> {
@@ -72,6 +75,82 @@ async fn stop_host(host: crate::host::HostHandle) -> Result<(), String> {
     }
 }
 
+// SessionInfo and HostInfo serialize these fields on both spawning and
+// attached hosts. Host-owned readbacks retain their native schemas when known.
+fn session_output_schema(name: &str, describe: Option<&Value>) -> Value {
+    let text = json!({"type":"string"});
+    let number = json!({"type":"number"});
+    let count = json!({"type":"integer","minimum":0});
+    if name == "session_record" {
+        return object_schema(json!({"recording":{"type":"boolean"}}), &["recording"]);
+    }
+    if name == "session_script" {
+        let step = object_schema(json!({"tool":text,"args":{}}), &["tool","args"]);
+        let script = object_schema(json!({
+            "name":text,"note":text,"backend":text,
+            "size":{"type":"array","items":number,"minItems":2,"maxItems":2},
+            "ppp":number,"steps":{"type":"array","items":step}
+        }), &["name","note","backend","size","ppp","steps"]);
+        return object_schema(json!({"script":script}), &["script"]);
+    }
+    let host = object_schema(json!({
+        "backend":text,"adapter":text,"platform":text,"width":number,"height":number,"ppp":number
+    }), &["backend","adapter","platform","width","height","ppp"]);
+    let mut result = object_schema(json!({
+        "id":text,"dir":text,"host":host,"uptime_ms":count,"shots":count,"recording":{"type":"boolean"}
+    }), &["id","dir","host","uptime_ms","shots","recording"]);
+    if matches!(name, "session_start" | "session_restart") {
+        result["properties"]["after"] = after_result_schema();
+        result["required"].as_array_mut().unwrap().push(json!("after"));
+    }
+    if name == "session_start" {
+        result["properties"]["commands"] = count;
+        result["required"].as_array_mut().unwrap().push(json!("commands"));
+    }
+    if name == "session_info" {
+        for (field, group, command, definition) in [
+            ("frame_info", "frame", "frame_info", "SessionFrame"),
+            ("pointer", "pointer", "pointer_state", "SessionPointer"),
+        ] {
+            let property = if let Some(mut native) = describe.and_then(|d| native_result_schema(d, group, command)) {
+                relocate_session_refs(&mut native, definition);
+                result["$defs"][definition] = native;
+                json!({"anyOf":[{"$ref":format!("#/$defs/{definition}")},{"type":"null"}]})
+            } else {
+                json!({"description":"Host-owned readback; schema unavailable before a host describes its commands."})
+            };
+            result["properties"][field] = property;
+            result["required"].as_array_mut().unwrap().push(json!(field));
+        }
+    }
+    result
+}
+
+// Nest each native schema under its own definition so identically named local
+// definitions cannot collide. JSON Pointer refs still target that native root.
+fn relocate_session_refs(node: &mut Value, definition: &str) {
+    match node {
+        Value::Object(map) => {
+            if let Some(Value::String(reference)) = map.get_mut("$ref") {
+                if reference == "#" || reference.starts_with("#/") {
+                    *reference = format!("#/$defs/{definition}{}", &reference[1..]);
+                }
+            }
+            for value in map.values_mut() { relocate_session_refs(value, definition); }
+        }
+        Value::Array(values) => for value in values { relocate_session_refs(value, definition); },
+        _ => {}
+    }
+}
+
+pub fn described_session_tools(cx: Arc<ServerContext>, describe: Option<&Value>) -> Vec<ToolSpec> {
+    let mut tools = session_tools(cx);
+    for tool in &mut tools {
+        tool.output_schema = session_output_schema(&tool.name, describe);
+    }
+    tools
+}
+
 pub fn session_tools(cx: Arc<ServerContext>) -> Vec<ToolSpec> {
     let start_cx = cx.clone();
     let stop_cx = cx.clone();
@@ -114,10 +193,13 @@ pub fn session_tools(cx: Arc<ServerContext>) -> Vec<ToolSpec> {
                             }
                             let root = cx.session_root.clone();
                             std::fs::create_dir_all(&root).map_err(|e| format!("session root {}: {e}", root.display()))?;
-                            let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
                             let store_dir = match s(&args, "store_root") {
                                 Some(p) => PathBuf::from(p),
-                                None => root.join(format!("store-{stamp}")),
+                                None => {
+                                    let path = root.join(format!("store-{}", uuid::Uuid::new_v4()));
+                                    crate::host::private_dir(&path)?;
+                                    path
+                                }
                             };
                             let cfg = HostConfig {
                                 width: f(&args, "width", 1400.0),
@@ -125,6 +207,8 @@ pub fn session_tools(cx: Arc<ServerContext>) -> Vec<ToolSpec> {
                                 ppp: f(&args, "ppp", 1.0),
                                 seed: b(&args, "seed", false),
                                 store_dir,
+                                #[cfg(feature = "server")]
+                                scripts: cx.cad.upgrade().map(|cad| crate::cad::LocalScripts::new(&cad, tokio::runtime::Handle::current())),
                             };
                             let host = spawn_host(spawn.clone(), cfg.clone()).await?;
                             Arc::new(Session::new(&root, host, Some(cfg), b(&args, "record", true))?)
@@ -238,6 +322,9 @@ pub fn session_tools(cx: Arc<ServerContext>) -> Vec<ToolSpec> {
                     let session = current(&cx.slot).await?;
                     let mut v = serde_json::to_value(session.info()).map_err(|e| e.to_string())?;
                     v["frame_info"] = session.host.call_ok("frame_info", json!({})).await?.result.unwrap_or(Value::Null);
+                    v["host"]["width"] = v["frame_info"]["surface"][0].clone();
+                    v["host"]["height"] = v["frame_info"]["surface"][1].clone();
+                    v["host"]["ppp"] = v["frame_info"]["ppp"].clone();
                     v["pointer"] = session.host.call_ok("pointer_state", json!({})).await?.result.unwrap_or(Value::Null);
                     Ok(ToolOutput::json(v))
                 })
@@ -274,6 +361,9 @@ pub fn session_tools(cx: Arc<ServerContext>) -> Vec<ToolSpec> {
             },
         ),
     ];
+    for tool in &mut tools {
+        tool.output_schema = session_output_schema(&tool.name, None);
+    }
     // An attached window is the user's app: the server never built it and must
     // not offer to build it again. Dropping the tool rather than refusing it at
     // call time keeps `tools/list` honest about what this host can do.
@@ -373,6 +463,50 @@ async fn seq(session: &Session, steps: &[(&str, Value)]) -> Result<(), String> {
     Ok(())
 }
 
+fn wait_frames_output_schema() -> Value {
+    let count=json!({"type":"integer","minimum":0});
+    object_schema(json!({"from":count,"to":count,"frames":count}), &["from","to","frames"])
+}
+fn wait_state_output_schema() -> Value {
+    object_schema(json!({"frames":{"type":"integer","minimum":0},
+        "state":{"type":"object","additionalProperties":true,
+            "description":"Requested state names mapped to publisher values; state_schema provides optional publisher schemas."}
+    }), &["frames","state"])
+}
+
+/// The wait-idle wrapper returns the owning app's frame_info payload verbatim.
+/// Preserve its root-local definitions instead of duplicating its DTO here.
+pub fn described_pointer_tools(slot: SessionSlot, describe: &Value) -> Vec<ToolSpec> {
+    let mut tools=pointer_tools(slot);
+    if let Some(schema)=native_result_schema(describe, "frame", "frame_info") {
+        if let Some(tool)=tools.iter_mut().find(|tool| tool.name=="wait_idle") {
+            tool.output_schema=schema;
+        }
+    }
+    tools
+}
+
+/// Stable gesture receipts shared by pointer, keyboard and widget wrappers.
+/// Images from captured drags travel separately in ToolOutput::images.
+fn gesture_output_schema(name: &str) -> Option<Value> {
+    let point = json!({"type":"array","items":{"type":"number"},"minItems":2,"maxItems":2});
+    let rect = json!({"type":"array","items":{"type":"number"},"minItems":4,"maxItems":4});
+    let text = json!({"type":"string"});
+    let world = json!({"type":"array","items":{"type":"number"},"minItems":3,"maxItems":3});
+    Some(match name {
+        "click" => object_schema(json!({"clicked":point}), &["clicked"]),
+        "drag" => object_schema(json!({"from":point,"to":point,"steps":{"type":"integer","minimum":1}}), &["from","to","steps"]),
+        "hotkey" => object_schema(json!({"key":text}), &["key"]),
+        "type_text" => json!({"type":"object","properties":{},"additionalProperties":false}),
+        "click_widget" => object_schema(json!({"key":text,"clicked":point,"rect":rect}), &["key","clicked","rect"]),
+        "drag_widget" => object_schema(json!({"key":text,"from":point,"to":point,"rect":rect}), &["key","from","to","rect"]),
+        "scroll_into_view" => object_schema(json!({"key":text,"rect":rect}), &["key","rect"]),
+        "click_entity" => object_schema(json!({"kind":text,"name":text,"clicked":point,"world":world}), &["kind","name","clicked","world"]),
+        "drag_entity" => object_schema(json!({"kind":text,"name":text,"from":point,"to":point,"world":world}), &["kind","name","from","to","world"]),
+        _ => return None,
+    })
+}
+
 pub fn pointer_tools(slot: SessionSlot) -> Vec<ToolSpec> {
     let click_slot = slot.clone();
     let drag_slot = slot.clone();
@@ -386,7 +520,7 @@ pub fn pointer_tools(slot: SessionSlot) -> Vec<ToolSpec> {
     let wait_slot = slot.clone();
     let frames_slot = slot.clone();
     let state_slot = slot.clone();
-    vec![
+    let mut tools=vec![
         ToolSpec::new(
             "click",
             "pointer",
@@ -737,7 +871,17 @@ pub fn pointer_tools(slot: SessionSlot) -> Vec<ToolSpec> {
                 })
             },
         ),
-    ]
+    ];
+    for tool in &mut tools {
+        match tool.name.as_str() {
+            "wait_frames" => tool.output_schema=wait_frames_output_schema(),
+            "wait_state" => tool.output_schema=wait_state_output_schema(),
+            _ => if let Some(schema) = gesture_output_schema(&tool.name) {
+                tool.output_schema = schema;
+            }
+        }
+    }
+    tools
 }
 
 /// Where `locate` puts an entity on the surface, refusing rather than clicking
@@ -1123,8 +1267,15 @@ pub fn key_documented(docs: &Value, panel: &str, key: &str) -> bool {
     })
 }
 
+fn hit_keys_check_output_schema() -> Value {
+    object_schema(json!({
+        "checked":{"type":"integer","minimum":0},
+        "undocumented":{"type":"array","items":{"type":"string"}}
+    }), &["checked","undocumented"])
+}
+
 pub fn registry_tools(slot: SessionSlot) -> Vec<ToolSpec> {
-    vec![ToolSpec::new(
+    let mut tool = ToolSpec::new(
         "hit_keys_check",
         "widgets",
         "Every widget key the app publishes this frame that no panel has documented (the hit-key registry gate). An empty list is the pass condition.",
@@ -1152,7 +1303,9 @@ pub fn registry_tools(slot: SessionSlot) -> Vec<ToolSpec> {
                 Ok(ToolOutput::json(json!({ "checked": checked, "undocumented": undocumented })))
             })
         },
-    )]
+    );
+    tool.output_schema = hit_keys_check_output_schema();
+    vec![tool]
 }
 
 /// The settings and selection a presentation capture borrowed, and how to give
@@ -1207,10 +1360,76 @@ impl Presentation {
     }
 }
 
+/// Metadata shared by the capture tool and the direct MCP screenshot tool.
+/// The MCP transport carries image bytes in content blocks; the CodeMode
+/// bridge adds artifact references in `images`. Host extensions remain open.
+fn screenshot_output_schema() -> Value {
+    let artifact = object_schema(json!({
+        "artifactId":{"type":"string"}, "uri":{"type":"string"},
+        "chunkUriTemplate":{"type":"string"}, "mediaType":{"type":"string"},
+        "byteLength":{"type":"integer","minimum":0}, "sha256":{"type":"string"},
+        "expiresAt":{"type":"string"}
+    }), &["artifactId","uri","chunkUriTemplate","mediaType","byteLength","sha256","expiresAt"]);
+    json!({
+        "type":"object",
+        "description":"Screenshot metadata. MCP image content is separate; CodeMode additionally supplies image artifact references.",
+        "properties":{
+            "width":{"type":"integer","minimum":1}, "height":{"type":"integer","minimum":1},
+            "ppp":{"type":"number","exclusiveMinimum":0},
+            "region":{"type":"array","items":{"type":"number"},"minItems":4,"maxItems":4},
+            "png_bytes":{"type":"integer","minimum":1},
+            "document":{"anyOf":[{"type":"null"},{"type":"object","properties":{
+                "documentId":{"type":"string"},"revision":{"type":"string"}
+            },"required":["documentId","revision"],"additionalProperties":true}]},
+            "shot":{"type":"integer","minimum":0}, "path":{"type":"string"},
+            "inline_size":{"type":"array","items":{"type":"integer","minimum":1},"minItems":2,"maxItems":2},
+            "flat":{"type":"boolean"},
+            "images":{"type":"array","items":artifact,"description":"Image artifact references added by CodeMode; direct MCP replies use image content blocks."}
+        },
+        "required":["width","height","ppp","region","png_bytes","document","shot","path","inline_size","flat"],
+        "additionalProperties":true
+    })
+}
+
+fn annotate_output_schema() -> Value {
+    object_schema(json!({"frame":{"type":"integer","minimum":0},"highlighted":{"type":"integer","minimum":0}}), &["frame","highlighted"])
+}
+
+fn illustration_output_schema(requested: Value) -> Value {
+    let text = json!({"type":"string"});
+    let strings = json!({"type":"array","items":text});
+    let document = json!({"type":"integer","minimum":0});
+    let capture = object_schema(json!({
+        "id":text,"components":strings,"solids":strings,"visibleComponents":strings,"visibleSolids":strings,
+        "camera":{"description":"Host camera readback; null if the host camera JSON could not be parsed."},
+        "requested":requested,"document_id":document,"shot":{"type":"integer","minimum":0},
+        "path":text,"manifest":{"type":["string","null"]}
+    }), &["id","components","solids","visibleComponents","visibleSolids","camera","requested","document_id","shot","path","manifest"]);
+    object_schema(json!({
+        "captures":{"type":"array","maxItems":64,"items":capture},"document_id":document,"restored":{"const":true},
+        "images":screenshot_output_schema()["properties"]["images"].clone()
+    }), &["captures","document_id","restored"])
+}
+
+pub fn described_capture_tools(slot: SessionSlot, describe: &Value) -> Vec<ToolSpec> {
+    let mut tools = capture_tools(slot);
+    if let Some(mut camera) = native_result_schema(describe, "camera", "camera_get") {
+        if camera["properties"].get("camera").is_some() {
+            relocate_session_refs(&mut camera, "CaptureCamera");
+            let tool = tools.iter_mut().find(|tool| tool.name == "illustration_capture_many").unwrap();
+            tool.output_schema["$defs"]["CaptureCamera"] = camera;
+            tool.output_schema["properties"]["captures"]["items"]["properties"]["camera"] = json!({
+                "anyOf":[{"$ref":"#/$defs/CaptureCamera/properties/camera"},{"type":"null"}]
+            });
+        }
+    }
+    tools
+}
+
 pub fn capture_tools(slot: SessionSlot) -> Vec<ToolSpec> {
     let illustration_slot = slot.clone();
     let annotate_slot = slot.clone();
-    vec![ToolSpec::new(
+    let mut tools = vec![ToolSpec::new(
         "illustration_capture_many",
         "capture",
         "Capture multiple assembly illustrations using temporary presentation state. Each view starts from the original camera/visibility/selection/settings, optionally activates a saved 3D view, selects components, applies display-only explode translations and captures a PNG. All state is restored on success or failure. Cancellation stops between captures and still restores. No temporary documents or modeling features are created.",
@@ -1293,14 +1512,14 @@ pub fn capture_tools(slot: SessionSlot) -> Vec<ToolSpec> {
          For a clean presentation render pass `settings` and/or `clear_selection`: they apply for THIS capture only and are put back afterwards, so a screenshot never leaves the session looking different than it found it — e.g. `settings: {showVertices: false, showEdges: false}` for a shaded render.",
         object_schema(json!({
             "region": { "oneOf": [{ "type": "string", "enum": ["full", "viewport"] }, { "type": "object", "properties": { "x": {"type":"number"}, "y": {"type":"number"}, "w": {"type":"number"}, "h": {"type":"number"} }, "required": ["x","y","w","h"] }], "default": "full" },
-            "max_width": { "type": "integer", "default": 1024 },
+            "max_width": { "type": "integer", "default": 1024, "minimum": 1, "maximum": 16384 },
             "cursor": { "type": "boolean", "default": true },
-            "cursor_scale": { "type": "integer", "default": 1, "minimum": 1, "description": "size of the drawn pointer, as a multiple of the 12 px arrow — raised for a picture that will be downscaled far enough to lose it" },
+            "cursor_scale": { "type": "integer", "default": 1, "minimum": 1, "maximum": 32, "description": "size of the drawn pointer, as a multiple of the 12 px arrow — raised for a picture that will be downscaled far enough to lose it" },
             "save_as": { "type": "string", "description": "also copy the full-resolution PNG to this path" },
             "settings": { "type": "object", "description": "a settings patch (any `settings_get` key) applied for this capture only and reverted afterwards — showFaces / showEdges / showVertices / wireframe / background / flatShading are the presentation knobs" },
             "clear_selection": { "type": "boolean", "default": false, "description": "drop the selection highlight for this capture, then put the selection back (position-keyed vertex selections do not survive the round trip)" }
         }), &[]),
-        Annotations::READ,
+        Annotations { read_only: false, destructive: true, idempotent: false, waits: false },
         move |args| {
             let slot = slot.clone();
             Box::pin(async move {
@@ -1382,16 +1601,157 @@ pub fn capture_tools(slot: SessionSlot) -> Vec<ToolSpec> {
                 Ok(ToolOutput::json(result))
             })
         },
-    )]
+    )];
+    for tool in &mut tools {
+        match tool.name.as_str() {
+            "screenshot" => tool.output_schema = screenshot_output_schema(),
+            "annotate" => tool.output_schema = annotate_output_schema(),
+            "illustration_capture_many" => tool.output_schema = illustration_output_schema(tool.input_schema["properties"]["views"]["items"].clone()),
+            _ => {}
+        }
+    }
+    tools
 }
 
-pub fn document_tools(slot: SessionSlot) -> Vec<ToolSpec> {
+/// Clone the owning app's DTO schema, including its local definitions. Do not
+/// reconstruct native fields in the server, or select an ambiguous descriptor.
+/// Older hosts without a usable schema retain their existing generic contract.
+fn native_result_schema(describe: &Value, group: &str, name: &str) -> Option<Value> {
+    let mut matches = describe.as_array()?.iter().filter(|entry| entry["group"] == group && entry["name"] == name);
+    let schema = matches.next()?.get("resultSchema")?;
+    if matches.next().is_some() || schema.get("type")?.as_str()? != "object"
+        || !(schema.get("properties").is_some_and(Value::is_object) || schema.get("anyOf").is_some_and(Value::is_array)) {
+        return None;
+    }
+    Some(schema.clone())
+}
+
+/// Server-owned settle metadata from app::after_wait. Report/listing payloads
+/// remain the native JSON; a failed optional model query produces null.
+pub(super) fn after_result_schema() -> Value {
+    object_schema(json!({
+        "frame":{"type":"integer","minimum":0}, "step":{"type":"integer","minimum":0},
+        "listing":{"description":"Native history listing at the settled frame."},
+        "report":{"description":"Native run report at the settled frame."},
+        "model":{"type":["object","null"],"additionalProperties":true}
+    }), &["frame","step","listing","report","model"])
+}
+
+/// Extend a native schema in place so #/$defs references keep their root.
+fn feature_result_schema(describe: &Value, name: &str) -> Option<Value> {
+    let mut result = native_result_schema(describe, "history", name)?;
+    let properties = result["properties"].as_object_mut()?;
+    properties.insert("warnings".into(), json!({"type":"array","items":{"type":"string"}}));
+    properties.insert("after".into(), after_result_schema());
+    if name == "feature_add" {
+        // The native handler appends these to Report. feature_id_at returns
+        // Option<String>, so its null case must not be strengthened away.
+        properties.insert("id".into(), json!({"type":["string","null"]}));
+        properties.insert("index".into(), json!({"type":"integer","minimum":0}));
+        let required = result.as_object_mut()?.entry("required").or_insert_with(|| json!([])).as_array_mut()?;
+        for key in ["id", "index"] {
+            if !required.iter().any(|item| item == key) { required.push(json!(key)); }
+        }
+    }
+    result["additionalProperties"] = json!(true);
+    Some(result)
+}
+
+/// Preserve every native batch branch and its definition root. Only the
+/// legacy Report lane receives IDs/warnings/settle metadata from the server;
+/// structured native results are forwarded unchanged.
+fn feature_many_result_schema(describe: &Value) -> Option<Value> {
+    let mut result = native_result_schema(describe, "history", "feature_add_many")?;
+    let branches = result.get_mut("anyOf")?.as_array_mut()?;
+    let legacy_indices: Vec<usize> = branches.iter().enumerate().filter_map(|(index, branch)| {
+        let required = branch.get("required")?.as_array()?;
+        let properties = branch.get("properties")?.as_object()?;
+        ["report", "step", "history_len"].iter().all(|key| properties.contains_key(*key) && required.contains(&json!(key))).then_some(index)
+    }).collect();
+    // An older or unexpected registry cannot safely be treated as this
+    // protocol. Keep the tool's generic fallback rather than guess a branch.
+    if legacy_indices.len() != 1 { return None; }
+    let legacy = &mut branches[legacy_indices[0]];
+    let properties = legacy["properties"].as_object_mut()?;
+    properties.insert("ids".into(), json!({"type":"array","items":{"type":"string"}}));
+    properties.insert("warnings".into(), json!({"type":"array","items":{"type":"string"}}));
+    properties.insert("after".into(), after_result_schema());
+    let required = legacy["required"].as_array_mut()?;
+    if !required.contains(&json!("ids")) { required.push(json!("ids")); }
+
+    // batch_validation_errors runs before native identity normalization.
+    // Alias and ID values below are raw echoed JSON, including missing/null
+    // or malformed input, so do not promise strings on this refusal branch.
+    let validation_error = object_schema(json!({
+        "path":{"type":"string"},"position":{"type":"integer","minimum":0},
+        "alias":{"description":"Raw caller alias or null when absent."},"message":{"type":"string"}
+    }), &["path","position","alias","message"]);
+    let item = object_schema(json!({
+        "position":{"type":"integer","minimum":0},
+        "alias":{"description":"Raw caller alias or null when absent."},
+        "id":{"description":"Raw caller ID or null when absent."},
+        "status":{"enum":["failed","not_evaluated"]},"committed":{"const":false},
+        "validationErrors":{"type":"array","items":validation_error}
+    }), &["position","alias","id","status","committed","validationErrors"]);
+    branches.push(object_schema(json!({
+        "success":{"const":false},"status":{"const":"validation_failed"},
+        "validationErrors":{"type":"array","minItems":1,"items":validation_error},
+        "items":{"type":"array","items":item},"modelChanged":{"const":false}
+    }), &["success","status","validationErrors","items","modelChanged"]));
+    Some(result)
+}
+
+/// Exported's metadata survives the file-writing wrapper, while the content
+/// moves to disk. Retain all native $defs, including nested PDF/PCB summaries.
+fn document_export_result_schema(describe: &Value) -> Option<Value> {
+    let mut result = native_result_schema(describe, "document", "doc_export")?;
+    let properties = result["properties"].as_object_mut()?;
+    properties.remove("text");
+    properties.remove("base64");
+    properties.insert("path".into(), json!({"type":"string"}));
+    properties.insert("head".into(), json!({"type":"string","description":"Up to 16 file bytes decoded lossily as UTF-8."}));
+    let required = result.as_object_mut()?.entry("required").or_insert_with(|| json!([])).as_array_mut()?;
+    required.retain(|item| item != "text" && item != "base64");
+    for key in ["path", "head"] {
+        if !required.iter().any(|item| item == key) { required.push(json!(key)); }
+    }
+    result["additionalProperties"] = json!(true);
+    Some(result)
+}
+
+/// Both file-reading wrappers always wait and append `after` on success.
+fn document_read_result_schema(describe: &Value, native: &str) -> Option<Value> {
+    let mut result = native_result_schema(describe, "document", native)?;
+    result["properties"].as_object_mut()?.insert("after".into(), after_result_schema());
+    let required = result.as_object_mut()?.entry("required").or_insert_with(|| json!([])).as_array_mut()?;
+    if !required.iter().any(|key| key == "after") { required.push(json!("after")); }
+    result["additionalProperties"] = json!(true);
+    Some(result)
+}
+
+/// Posting can return text alone, or additionally write that text to a file.
+fn cam_post_result_schema(describe: &Value) -> Option<Value> {
+    let mut result = native_result_schema(describe, "cam", "cam_post_text")?;
+    let properties = result["properties"].as_object_mut()?;
+    properties.insert("path".into(), json!({"type":"string"}));
+    properties.insert("bytes".into(), json!({"type":"integer","minimum":0}));
+    // The optional file fields are emitted together. This preserves the
+    // no-path branch without claiming an independently optional byte count.
+    let dependencies = result.as_object_mut()?.entry("dependentRequired").or_insert_with(|| json!({})).as_object_mut()?;
+    dependencies.insert("path".into(), json!(["bytes"]));
+    dependencies.insert("bytes".into(), json!(["path"]));
+    result["additionalProperties"] = json!(true);
+    Some(result)
+}
+
+
+pub fn document_tools(slot: SessionSlot, describe: &Value) -> Vec<ToolSpec> {
     let open_slot = slot.clone();
     let save_slot = slot.clone();
     let import_slot = slot.clone();
     let export_slot = slot.clone();
     let post_slot = slot.clone();
-    vec![
+    let mut tools = vec![
         ToolSpec::new(
             "document_open",
             "document",
@@ -1405,7 +1765,7 @@ pub fn document_tools(slot: SessionSlot) -> Vec<ToolSpec> {
                     let path = s(&args, "path").ok_or("missing `path`")?;
                     let text = session.host.platform.read_text(path.clone()).await?;
                     let mut r = session.host.call_ok("doc_load", json!({ "json": text, "name": file_name(&path) })).await?.result.unwrap_or(Value::Null);
-                    r["after"] = after_wait(&session, u(&args, "timeout_ms", 60_000)).await?;
+                    crate::tools::app::settled_result(&mut r, after_wait(&session, u(&args, "timeout_ms", 60_000)).await?);
                     session.record("document_open", &args, true, json!({}));
                     Ok(ToolOutput::json(r))
                 })
@@ -1455,7 +1815,12 @@ pub fn document_tools(slot: SessionSlot) -> Vec<ToolSpec> {
                     let b64 = base64_encode(&bytes);
                     let name = file_name(&path).unwrap_or_default();
                     let mut r = session.host.call_ok("doc_import", json!({ "format": format, "name": name, "base64": b64 })).await?.result.unwrap_or(Value::Null);
-                    r["after"] = after_wait(&session, u(&args, "timeout_ms", 120_000)).await?;
+                    let after = after_wait(&session, u(&args, "timeout_ms", 120_000)).await?;
+                    // Mesh reconstruction has a documented submission marker, not
+                    // a feature evaluation report. Keep it for existing clients;
+                    // completed geometry and failures remain in after / notices.
+                    if r["report"].get("meshImport").is_some() { r["after"] = after; }
+                    else { crate::tools::app::settled_result(&mut r, after); }
                     session.record("document_import", &args, true, json!({}));
                     Ok(ToolOutput::json(r))
                 })
@@ -1527,7 +1892,20 @@ pub fn document_tools(slot: SessionSlot) -> Vec<ToolSpec> {
                 })
             },
         ),
-    ]
+    ];
+    for tool in &mut tools {
+        match tool.name.as_str() {
+            "document_save" => tool.output_schema = object_schema(json!({
+                "path":{"type":"string"}, "bytes":{"type":"integer","minimum":0}
+            }), &["path","bytes"]),
+            "document_export" => if let Some(schema) = document_export_result_schema(describe) { tool.output_schema = schema; },
+            "document_open" => if let Some(schema) = document_read_result_schema(describe, "doc_load") { tool.output_schema = schema; },
+            "document_import" => if let Some(schema) = document_read_result_schema(describe, "doc_import") { tool.output_schema = schema; },
+            "cam_post" => if let Some(schema) = cam_post_result_schema(describe) { tool.output_schema = schema; },
+            _ => {},
+        }
+    }
+    tools
 }
 
 /// The schema of ONE item in `feature_add` / `feature_add_many`: the same
@@ -1586,7 +1964,7 @@ async fn seed_feature(
     params["id"] = json!(id);
     let v = validate::validate_entry(&entry, &params, known);
     if !v.ok() {
-        return Err(format!("invalid parameters for {} `{id}`: {}", id_.long_name, v.errors.join("; ")));
+        return Err(format!("invalid_arguments: invalid parameters for {} `{id}`: {}", id_.long_name, v.errors.join("; ")));
     }
     let mut feature = json!({ "type": id_.feature_type, "inputParams": params });
     if let Some(pd) = item.get("persistent_data") {
@@ -1621,11 +1999,11 @@ fn batch_validation_errors(args: &Value) -> Vec<Value> {
     errors
 }
 
-pub fn feature_tools(slot: SessionSlot) -> Vec<ToolSpec> {
+pub fn feature_tools(slot: SessionSlot, describe: &Value) -> Vec<ToolSpec> {
     let add_slot = slot.clone();
     let many_slot = slot.clone();
     let set_slot = slot.clone();
-    vec![
+    let mut tools = vec![
         ToolSpec::new(
             "feature_add",
             "features",
@@ -1650,7 +2028,7 @@ pub fn feature_tools(slot: SessionSlot) -> Vec<ToolSpec> {
                         r["warnings"] = json!(warnings);
                     }
                     if b(&args, "wait", true) {
-                        r["after"] = after_wait(&session, u(&args, "timeout_ms", 60_000)).await?;
+                        crate::tools::app::settled_result(&mut r, after_wait(&session, u(&args, "timeout_ms", 60_000)).await?);
                     }
                     session.record("feature_add", &args, true, json!({ "id": id }));
                     Ok(ToolOutput::json(r))
@@ -1747,7 +2125,7 @@ pub fn feature_tools(slot: SessionSlot) -> Vec<ToolSpec> {
                         r["warnings"] = json!(warnings);
                     }
                     if b(&args, "wait", true) {
-                        r["after"] = after_wait(&session, u(&args, "timeout_ms", 60_000)).await?;
+                        crate::tools::app::settled_result(&mut r, after_wait(&session, u(&args, "timeout_ms", 60_000)).await?);
                     }
                     session.record("feature_add_many", &args, true, json!({ "ids": ids }));
                     Ok(ToolOutput::json(r))
@@ -1773,21 +2151,29 @@ pub fn feature_tools(slot: SessionSlot) -> Vec<ToolSpec> {
                     let checked = validate::patched_view(&entry, &merged, args.get("patch").unwrap_or(&json!({})));
                     let v = validate::validate_entry(&entry, &checked, known.as_ref());
                     if !v.ok() {
-                        return Err(format!("invalid parameters for {ty}: {}", v.errors.join("; ")));
+                        return Err(format!("invalid_arguments: invalid parameters for {ty}: {}", v.errors.join("; ")));
                     }
                     let mut r = session.host.call_ok("feature_set_params", json!({ "id": id, "input_params": merged })).await?.result.unwrap_or(Value::Null);
                     if !v.warnings.is_empty() {
                         r["warnings"] = json!(v.warnings);
                     }
                     if b(&args, "wait", true) {
-                        r["after"] = after_wait(&session, u(&args, "timeout_ms", 60_000)).await?;
+                        crate::tools::app::settled_result(&mut r, after_wait(&session, u(&args, "timeout_ms", 60_000)).await?);
                     }
                     session.record("feature_set_params", &args, true, json!({}));
                     Ok(ToolOutput::json(r))
                 })
             },
         ),
-    ]
+    ];
+    for tool in &mut tools {
+        if matches!(tool.name.as_str(), "feature_add" | "feature_set_params") {
+            if let Some(schema) = feature_result_schema(describe, &tool.name) { tool.output_schema = schema; }
+        } else if tool.name == "feature_add_many" {
+            if let Some(schema) = feature_many_result_schema(describe) { tool.output_schema = schema; }
+        }
+    }
+    tools
 }
 
 /// Every reference name in the scene right now (solids, faces, edges).

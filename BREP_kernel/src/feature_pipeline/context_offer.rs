@@ -94,6 +94,7 @@ pub static FEATURE_APPLICABILITY: &[(&str, fn(&SelectionProbe) -> bool)] = &[
     ("SM.F", super::features::sheet_metal_flange::context_applicable),
     ("SM.HEM", super::features::sheet_metal_hem::context_applicable),
     ("SM.CLOSED_CORNER", super::features::sheet_metal_closed_corner::context_applicable),
+    ("SM.MIRROR", super::features::sheet_metal_mirror::context_applicable),
     ("SM.FILLET", super::features::sheet_metal_corner::context_applicable),
     ("SM.CHAMFER", super::features::sheet_metal_corner::context_applicable),
     ("SM.CUTOUT", super::features::sheet_metal_cutout::context_applicable),

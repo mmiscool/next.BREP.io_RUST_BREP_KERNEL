@@ -62,4 +62,12 @@ pub trait PlmTransport {
     fn send(&self, request: PlmRequest) -> PlmFuture<PlmResponse>;
 }
 
+/// Lowercase hex SHA-256 of `bytes`: the server's `content_hash`
+/// (`brep_plm::auth::content_hash`) of a document written with exactly these
+/// bytes. The app's one copy (I13).
+pub fn content_hash(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(bytes).iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
 pub mod identity;

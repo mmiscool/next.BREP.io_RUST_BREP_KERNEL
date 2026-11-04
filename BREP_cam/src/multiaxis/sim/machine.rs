@@ -75,7 +75,7 @@ impl LinkShapeGeometry for LinkShape {
             }
             LinkShape::Cylinder { base, axis, radius, height } => {
                 let a = axis.normalized().unwrap_or(Point3::Z);
-                let e1 = a.cross(if a.z.abs() < 0.9 { Point3::Z } else { Point3::X }).normalized().unwrap_or(Point3::X);
+                let e1 = crate::geom::perpendicular(a);
                 let e2 = a.cross(e1);
                 let nh = steps(*height);
                 let na = steps(std::f64::consts::TAU * radius).max(8);

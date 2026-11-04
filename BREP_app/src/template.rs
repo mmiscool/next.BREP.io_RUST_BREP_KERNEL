@@ -19,10 +19,11 @@ use std::collections::BTreeMap;
 /// The document key the input marks are stored under.
 pub const TEMPLATE_INPUTS_KEY: &str = "templateInputs";
 /// The document key a spun-out copy records its template under.
-pub const TEMPLATE_SOURCE_KEY: &str = "templateSource";
+pub const TEMPLATE_SOURCE_KEY: &str = brep_render::brep_kernel::family::TEMPLATE_SOURCE_KEY;
 
 /// One marked input: an expression the user sets when inserting.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "automation", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct TemplateInput {
     /// The expression name (`height`).

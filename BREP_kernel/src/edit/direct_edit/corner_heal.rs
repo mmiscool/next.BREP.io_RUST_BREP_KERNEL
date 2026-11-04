@@ -146,6 +146,9 @@ pub(super) struct CornerBlendGroup {
     corner_id: u64,
     /// The corner face's boundary edges.
     corner_edges: Vec<u64>,
+    /// The corner face's degenerate pole edges (an exact octant's, used by
+    /// that face alone): pruned with it.
+    corner_poles: Vec<u64>,
     /// The strips, in the corner's own loop order.
     pub(super) strips: Vec<CornerStrip>,
 }
@@ -217,13 +220,26 @@ pub(super) fn classify_corner_blend_group(
             return None;
         };
         let corner = &solid.shells[shell_index].faces[face_index];
-        if corner.loops.len() != 1 || corner.loops[0].coedges.len() != 3 {
+        if corner.loops.len() != 1 {
+            continue;
+        }
+        // An exact octant carries a degenerate pole edge in its loop besides
+        // its three arcs (2026-10-28): the arcs are the corner's edges, the
+        // pole goes with the face. A pole used by any other face is not one.
+        let is_pole = |edge_id: u64| {
+            solid.edges.iter().any(|edge| edge.id == edge_id && edge.degenerate)
+                && solid.shells.iter().flat_map(|shell| &shell.faces).filter(|face| face.id != corner_id)
+                    .all(|face| face.loops.iter().flat_map(|l| &l.coedges).all(|coedge| coedge.edge_id != edge_id))
+        };
+        let corner_poles: Vec<u64> = corner.loops[0].coedges.iter().map(|coedge| coedge.edge_id).filter(|id| is_pole(*id)).collect();
+        if corner.loops[0].coedges.len() != 3 + corner_poles.len() || corner_poles.len() > 1 {
             continue;
         }
         let corner_edges: Vec<u64> = corner.loops[0]
             .coedges
             .iter()
             .map(|coedge| coedge.edge_id)
+            .filter(|id| !corner_poles.contains(id))
             .collect();
         if corner_edges.iter().copied().collect::<HashSet<u64>>().len() != 3 {
             continue;
@@ -280,6 +296,7 @@ pub(super) fn classify_corner_blend_group(
             shell_index,
             corner_id,
             corner_edges,
+            corner_poles,
             strips,
         });
     }
@@ -370,6 +387,7 @@ fn corner_group_region(
         .corner_edges
         .iter()
         .copied()
+        .chain(group.corner_poles.iter().copied())
         .chain(
             group
                 .strips

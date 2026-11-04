@@ -1,8 +1,8 @@
 use super::*;
 
 /// One in-flight sketch drag (S2): the grabbed points and the anchor uv. A single
-/// entry for a point grab; all of a geometry's (deduped) points for a geometry
-/// grab (a rigid translate). Each point tracks the cursor by an ABSOLUTE
+/// entry for a point grab; a geometry's movable (deduped) points for a geometry
+/// grab. Locked endpoints stay anchored. Each point tracks the cursor by an ABSOLUTE
 /// `orig + (uv - anchor)` (never incremental — the solver moves points between
 /// frames, so incremental deltas would drift).
 #[derive(Clone)]
@@ -11,6 +11,8 @@ pub struct SketchDrag {
     pub(super) points: Vec<(serde_json::Value, f64, f64, bool)>,
     /// The plane `(u, v)` where the grab started — the anchor for the delta.
     pub(super) anchor: (f64, f64),
+    /// Only point grabs infer constraints on release, even if an edge has one free end.
+    pub(super) infer_on_drop: bool,
 }
 
 /// The active engine-native sketch edit — the live session plus the state to
@@ -94,7 +96,7 @@ impl SketchEdit {
         SketchSnapshot {
             doc: self.session.doc.clone(),
             dim_offsets: self.session.dim_offsets.clone(),
-            selection: self.session.selection.clone(),
+            selection: self.session.selection.items.clone(),
             external_refs: self.external_refs.clone(),
         }
     }

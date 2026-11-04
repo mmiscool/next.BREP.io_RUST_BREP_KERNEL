@@ -163,23 +163,7 @@ pub(super) fn classify_regions(loops: Vec<Loop>) -> Result<Vec<Vec<Loop>>, Strin
 
 /// Standard ray-cast point-in-polygon (UV).
 fn point_in_polygon(point: [f64; 2], polygon: &[[f64; 2]]) -> bool {
-    let mut inside = false;
-    let count = polygon.len();
-    if count < 3 {
-        return false;
-    }
-    let mut j = count - 1;
-    for i in 0..count {
-        let pi = polygon[i];
-        let pj = polygon[j];
-        let intersects = (pi[1] > point[1]) != (pj[1] > point[1])
-            && point[0] < (pj[0] - pi[0]) * (point[1] - pi[1]) / (pj[1] - pi[1]) + pi[0];
-        if intersects {
-            inside = !inside;
-        }
-        j = i;
-    }
-    inside
+    polygon.len() >= 3 && crate::polygon::parity_inside(point, polygon.len(), |i| polygon[i])
 }
 
 /// Emit a loop's curves in the plane frame, head-to-tail and welded exactly
@@ -192,6 +176,16 @@ pub(super) fn emit_loop(loop_data: &Loop, frame: &Frame) -> Result<ProfileLoop, 
         edge_names.push(segment.name.clone());
     }
     weld_chain(&mut curves, true);
+    // A single closed Bézier is a valid sketch loop, but profile consumers
+    // require at least two boundary curves (as for circles and ellipses).
+    // Split exactly by knot insertion, preserving both source edge and loop
+    // identity. Keep the path/per-geometry publications as one source curve.
+    if curves.len() == 1 {
+        let [start, end] = curves[0].domain()?;
+        let (first, second) = curves[0].split((start + end) * 0.5)?;
+        curves = vec![first, second];
+        edge_names.push(edge_names[0].clone());
+    }
     Ok(ProfileLoop {
         curves,
         edge_names,

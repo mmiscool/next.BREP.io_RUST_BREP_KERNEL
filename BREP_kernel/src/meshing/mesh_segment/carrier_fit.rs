@@ -5,73 +5,14 @@ use super::*;
 // ---------------------------------------------------------------------------
 
 /// Jacobi eigendecomposition of a symmetric 3×3 matrix.  Returns the
-/// eigenvalues in ascending order with their (unit) eigenvectors.
-fn eigen_symmetric3(mut m: [[f64; 3]; 3]) -> ([f64; 3], [Vec3; 3]) {
-    let mut v = [[0.0_f64; 3]; 3];
-    for (i, row) in v.iter_mut().enumerate() {
-        row[i] = 1.0;
-    }
-    let scale = m
-        .iter()
-        .flat_map(|row| row.iter())
-        .fold(0.0_f64, |acc, value| acc.max(value.abs()))
-        .max(1e-300);
-    for _ in 0..64 {
-        // Largest off-diagonal element.
-        let (mut p, mut q, mut largest) = (0usize, 1usize, m[0][1].abs());
-        if m[0][2].abs() > largest {
-            p = 0;
-            q = 2;
-            largest = m[0][2].abs();
-        }
-        if m[1][2].abs() > largest {
-            p = 1;
-            q = 2;
-            largest = m[1][2].abs();
-        }
-        if largest <= 1e-15 * scale {
-            break;
-        }
-        let apq = m[p][q];
-        let theta = (m[q][q] - m[p][p]) / (2.0 * apq);
-        let t = if theta >= 0.0 {
-            1.0 / (theta + (1.0 + theta * theta).sqrt())
-        } else {
-            1.0 / (theta - (1.0 + theta * theta).sqrt())
-        };
-        let c = 1.0 / (1.0 + t * t).sqrt();
-        let s = t * c;
-        let (app, aqq) = (m[p][p], m[q][q]);
-        m[p][p] = app - t * apq;
-        m[q][q] = aqq + t * apq;
-        m[p][q] = 0.0;
-        m[q][p] = 0.0;
-        for i in 0..3 {
-            if i != p && i != q {
-                let (aip, aiq) = (m[i][p], m[i][q]);
-                m[i][p] = c * aip - s * aiq;
-                m[p][i] = m[i][p];
-                m[i][q] = s * aip + c * aiq;
-                m[q][i] = m[i][q];
-            }
-            let (vip, viq) = (v[i][p], v[i][q]);
-            v[i][p] = c * vip - s * viq;
-            v[i][q] = s * vip + c * viq;
-        }
-    }
-    let mut order = [0usize, 1, 2];
-    order.sort_by(|&a, &b| m[a][a].total_cmp(&m[b][b]));
-    let values = [
-        m[order[0]][order[0]],
-        m[order[1]][order[1]],
-        m[order[2]][order[2]],
-    ];
-    let vectors = [
-        Vec3::new(v[0][order[0]], v[1][order[0]], v[2][order[0]]),
-        Vec3::new(v[0][order[1]], v[1][order[1]], v[2][order[1]]),
-        Vec3::new(v[0][order[2]], v[1][order[2]], v[2][order[2]]),
-    ];
-    (values, vectors)
+/// eigenvalues in ascending order with their (unit) eigenvectors: the one
+/// solver RANSAC exports ([`brep_ransac::jacobi_eigen_symmetric3`]) at this
+/// module's former turn (+1 at equal diagonals), its eigenvectors taken as
+/// the rotation's columns, not renormalised: bit for bit the former copy.
+fn eigen_symmetric3(m: [[f64; 3]; 3]) -> ([f64; 3], [Vec3; 3]) {
+    let (values, vectors) =
+        brep_ransac::jacobi_eigen_symmetric3(m, brep_ransac::JacobiZeroTurn::Positive);
+    (values, vectors.map(|[x, y, z]| Vec3::new(x, y, z)))
 }
 
 fn sym3_accumulate(m: &mut [[f64; 3]; 3], d: Vec3, weight: f64) {
@@ -83,9 +24,28 @@ fn sym3_accumulate(m: &mut [[f64; 3]; 3], d: Vec3, weight: f64) {
     }
 }
 
+/// Record item N2 step 4 (2026-11-01), default OFF: `BREP_CARRIER_KASA_QR=1`
+/// fits every carrier circle with RANSAC's Kåsa circle and its pivoted-QR
+/// fallback for narrow arcs ([`brep_ransac::kasa_circle_2d`]) instead of the
+/// normal-equation solve below. Switch grammar: `0|off|false` off,
+/// `1|on|true` on, anything else the default. Read once per process.
+fn kasa_qr_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        match std::env::var("BREP_CARRIER_KASA_QR").as_deref().map(str::to_ascii_lowercase).as_deref() {
+            Ok("1" | "on" | "true") => true,
+            Ok("0" | "off" | "false") => false,
+            _ => false,
+        }
+    })
+}
+
 /// Least-squares (Kåsa) circle through 2D points; centered internally for
 /// conditioning.  Returns (center_x, center_y, radius).
 fn fit_circle_2d(points: &[(f64, f64)]) -> Option<(f64, f64, f64)> {
+    if kasa_qr_enabled() {
+        return brep_ransac::kasa_circle_2d(points);
+    }
     if points.len() < 3 {
         return None;
     }
@@ -1024,3 +984,4 @@ fn refine_torus_on_vertices(
     }
     Some((torus.axis, torus.center))
 }
+

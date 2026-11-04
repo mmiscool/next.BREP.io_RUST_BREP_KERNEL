@@ -565,7 +565,7 @@ $('parts-page-size').addEventListener('change', () => act(renderParts));
 
 function partRow(part) {
   return `
-    <tr data-part-id="${escape(part.id)}">
+    <tr data-part-id="${escape(part.id)}" data-copy-kind="part" data-copy-part="${escape(part.id)}" data-copy-label="${escape(part.number)}">
       <td><input type="checkbox" class="part-select" aria-label="Select ${escape(part.number)}"${selectedParts.has(part.id)?' checked':''}></td>
       <td class="thumb-cell"><span class="part-tile-preview"><a href="#/part/${encodeURIComponent(part.id)}" tabindex="-1">${thumb(part.thumbnail_url)}</a>${part.locked ? `<span class="part-tile-lock" role="img" aria-label="Checked out" title="Checked out">${PART_ATTRIBUTE_LOCK_ICON}</span>` : ''}</span></td>
       <td class="number"><div class="part-tile-identity"><a href="#/part/${encodeURIComponent(part.id)}">${escape(part.number)}/${escape(part.latest_label)}</a><span class="state state-${escape(part.latest_state)}">${escape(statusName(part.latest_state))}</span></div></td>
@@ -856,6 +856,8 @@ async function renderPart(id, selectedRevision, requestedTab) {
     location.hash = `#/workflows/${encodeURIComponent(detail.id)}/${encodeURIComponent(revision)}`;
   };
   $('part-number').textContent = detail.number;
+  // Right-click the heading to copy the part (Workbench's context menu).
+  Object.assign($('part-number').closest('h1').dataset, { copyKind: 'part', copyPart: detail.id, copyRevision: '', copyLabel: detail.number });
   $('part-name').textContent = detail.name;
   $('part-meta').innerHTML =
     `${escape(detail.part_type)}${detail.document_class && detail.document_class !== 'normal' ? ` · ${classBadge(detail.document_class)}` : ''} · created ${escape(when(detail.created_at))}`
@@ -881,7 +883,7 @@ async function renderPart(id, selectedRevision, requestedTab) {
       ? `${escape(rev.locked_by)}${rev.locked_by_me ? ' (you)' : ''}<br><span class="muted">${when(rev.locked_at)}</span>`
       : '—';
     return `
-      <tr data-revision-id="${escape(rev.id)}">
+      <tr data-revision-id="${escape(rev.id)}" data-copy-kind="part" data-copy-part="${escape(currentPart.id)}" data-copy-revision="${escape(rev.id)}" data-copy-label="${escape(`${currentPart.number} rev ${rev.label}`)}">
         <td><span class="rev-label">${revThumb(rev)}<strong>${escape(rev.label)}</strong></span>${revisionContext(rev)}</td>
         <td><span class="state state-${escape(rev.lifecycle)}">${escape(statusName(rev.lifecycle))}</span></td>
         <td>${reviewCell(rev)}</td>
@@ -3080,7 +3082,7 @@ async function loadAttachments() {
         : `<a href="${FileDocuments.route('attachment',a.id,currentPart.id,a.on==='part'?'':attaching.revision)}">Open</a>`)
       : '';
     return `
-      <tr>
+      <tr data-copy-kind="attachment" data-copy-id="${escape(a.id)}" data-copy-part="${escape(currentPart.id)}" data-copy-revision="${escape(a.on==='part'?'':attaching.revision)}" data-copy-label="${escape(a.name)}">
         <td>${thumb}${FileDocuments.documentLink(a,currentPart.id,a.on==='part'?'':attaching.revision)}
           <span class="muted mono">${escape(a.media_type)}</span></td>
         <td>${escape(a.on)}</td>
@@ -3254,8 +3256,55 @@ function wireRevoke(container, after) {
   }
 }
 
+// Install the desktop app (My account): one card per platform for which the
+// `--cad-app` directory holds BOTH the native app and its install script
+// (`/cad/config`'s `native` and `installers`) — a script with no app to fetch
+// would only fail. The command names this page's own origin, which is the
+// address the workstation reaches the server by.
+const INSTALL_PLATFORMS = [
+  { id: 'linux', native: 'linux-x86_64', script: 'linux', command: (url, script) => `curl -fsSL ${script} | sh -s -- ${url}` },
+  { id: 'windows', native: 'windows-x86_64', script: 'windows', command: (url, script) => `& ([scriptblock]::Create((Invoke-WebRequest -UseBasicParsing ${script}).Content)) -Url ${url}` },
+];
+
+const megabytes = (size) => `${(size / 1048576).toFixed(1)} MB`;
+
+async function renderInstall() {
+  let config = null;
+  try {
+    config = await api('GET', '/cad/config');
+  } catch {
+    config = null;
+  }
+  const url = location.origin;
+  let offered = 0;
+  for (const platform of INSTALL_PLATFORMS) {
+    const app = config && config.native ? config.native[platform.native] : null;
+    const script = config && config.installers ? config.installers[platform.script] : null;
+    const card = $(`install-${platform.id}`);
+    card.hidden = !(app && script);
+    if (card.hidden) continue;
+    offered += 1;
+    const scriptUrl = new URL(script.path, url + '/').href;
+    $(`install-${platform.id}-command`).textContent = platform.command(url, scriptUrl);
+    $(`install-${platform.id}-script`).href = scriptUrl;
+    $(`install-${platform.id}-app`).href = new URL(app.path, url + '/').href;
+    $(`install-${platform.id}-app`).textContent = `Download the app (${megabytes(app.size)})`;
+    $(`install-${platform.id}-hash`).textContent = `SHA-256 ${app.sha256}`;
+  }
+  $('install-none').hidden = offered > 0;
+}
+
+for (const platform of INSTALL_PLATFORMS) {
+  const copy = $(`install-${platform.id}-copy`);
+  copy.addEventListener('click', () => act(async () => {
+    await navigator.clipboard.writeText($(`install-${platform.id}-command`).textContent);
+    copy.textContent = 'Copied';
+  }));
+}
+
 async function renderAccount() {
   $('account-who').textContent = `Signed in as ${me.username}${me.display_name ? ` (${me.display_name})` : ''}.`;
+  await renderInstall();
   const all = await api('GET', '/api/tokens');
   const desktops = all.filter((t) => t.desktop);
   const tokens = all.filter((t) => !t.desktop);
@@ -4481,7 +4530,7 @@ async function drawBomAttributes({bom,tag='',head,rows,selection,editButton,stat
   rows.innerHTML=bom.lines.map((line,i)=>{
     if(hidden(line))return '';
     if(capped&&++shown>BOM_SHOWN_FIRST)return '';
-    return `<tr data-bom-position="${escape(line.position)}" ${bom.flat?'':`aria-level="${line.level}" ${branches.has(line.position)?`aria-expanded="${!view.collapsed.has(line.position)}"`:''}`}>${hasWarnings?`<td class="bom-warning-column">${line.warnings?.length?`<button type="button" class="bom-warning-icon" data-bom-warning="${i}" title="${escape(line.warnings.join('\n'))}" aria-label="Warnings for ${escape(line.number)} rev ${escape(line.revision_label)}">⚠</button>`:''}</td>`:''}${bom.flat?'':treeCell(line)}${fields.map(f=>{
+    return `<tr data-bom-position="${escape(line.position)}" data-copy-kind="part" data-copy-part="${escape(line.part_id)}" data-copy-revision="${escape(line.revision_id||'')}" data-copy-label="${escape(line.number)}" ${bom.flat?'':`aria-level="${line.level}" ${branches.has(line.position)?`aria-expanded="${!view.collapsed.has(line.position)}"`:''}`}>${hasWarnings?`<td class="bom-warning-column">${line.warnings?.length?`<button type="button" class="bom-warning-icon" data-bom-warning="${i}" title="${escape(line.warnings.join('\n'))}" aria-label="Warnings for ${escape(line.number)} rev ${escape(line.revision_label)}">⚠</button>`:''}</td>`:''}${bom.flat?'':treeCell(line)}${fields.map(f=>{
     const value=valueOf(line,f),applicable=f.edit?.resource==='part'||(f.scope==='part'?f.part_type===line.part_type:line.occurrence_ids.length>0);
     if(f.editable&&applicable&&me.can_author)return `<td>${fieldValueEditor(f,value,false,`data-bom-row="${i}" data-bom-field="${escape(f.id)}"`)}</td>`;
     if(f.id==='builtin.number')return `<td><a href="#/part/${encodeURIComponent(line.part_id)}">${escape(line.number)}</a></td>`;

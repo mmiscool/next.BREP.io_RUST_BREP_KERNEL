@@ -69,6 +69,8 @@ thread_local! {
     static MEMO: RefCell<HashMap<(Reading, [u64; 2]), Option<f64>>> = RefCell::new(HashMap::default());
     // Volume and vector area / 3, keyed by the face and its local anchor.
     static SIGN_TERMS: RefCell<HashMap<[u64; 2], Option<[f64; 4]>>> = RefCell::new(HashMap::default());
+    // Cells-only terms and correction bounds (`memoized_bounded_sign_terms`).
+    static BOUNDED_TERMS: RefCell<HashMap<[u64; 2], Option<([f64; 4], f64, f64, f64)>>> = RefCell::new(HashMap::default());
     static HITS: Cell<u64> = const { Cell::new(0) };
     static MISSES: Cell<u64> = const { Cell::new(0) };
 }
@@ -173,6 +175,48 @@ pub(crate) fn memoized_sign_terms(key: [u64; 2], read: impl FnOnce() -> Option<[
     value
 }
 
+/// The exact sign terms the memo already holds for `key`, without reading
+/// (the sliver-bound certificate, `BREP_SIGN_SLIVER_BOUND`): `Some(None)` is a
+/// held failure. A hit is retained for the fold as [`memoized_sign_terms`]
+/// retains it.
+pub(crate) fn peek_sign_terms(key: [u64; 2]) -> Option<Option<[f64; 4]>> {
+    if !memo_on() {
+        return None;
+    }
+    if let Some(value) = FOLD_TERMS.with(|memo| memo.borrow().as_ref().and_then(|m| m.get(&key).copied())) {
+        note(true);
+        return Some(Some(value));
+    }
+    let value = SIGN_TERMS.with(|memo| memo.borrow().get(&key).copied())?;
+    note(true);
+    retain_sign(key, value);
+    Some(value)
+}
+
+/// A face's cells-only sign terms and their correction bounds
+/// (`solid_props::bounded_face_terms`), keyed like [`memoized_sign_terms`].
+/// Never read as exact terms; cleared with the memo.
+pub(crate) fn memoized_bounded_sign_terms(
+    key: [u64; 2],
+    read: impl FnOnce() -> Option<([f64; 4], f64, f64, f64)>,
+) -> Option<([f64; 4], f64, f64, f64)> {
+    if !memo_on() {
+        return read();
+    }
+    if let Some(value) = BOUNDED_TERMS.with(|memo| memo.borrow().get(&key).copied()) {
+        return value;
+    }
+    let value = read();
+    BOUNDED_TERMS.with(|memo| {
+        let mut memo = memo.borrow_mut();
+        if memo.len() >= CAPACITY {
+            memo.clear();
+        }
+        memo.insert(key, value);
+    });
+    value
+}
+
 /// Count a hit or a miss taken by a memo of the same contract that stores
 /// another value type (`heal::claim_memo`), so one profile line covers both.
 pub(crate) fn note(hit: bool) {
@@ -190,8 +234,10 @@ pub(crate) const fn capacity() -> usize {
 
 /// Drop every entry (the history cache's clear, a document switch).
 pub(crate) fn clear() {
+    crate::topology::clear_coedge_readings();
     MEMO.with(|memo| memo.borrow_mut().clear());
     SIGN_TERMS.with(|memo| memo.borrow_mut().clear());
+    BOUNDED_TERMS.with(|memo| memo.borrow_mut().clear());
     FOLD_TERMS.with(|memo| { if let Some(memo) = memo.borrow_mut().as_mut() { memo.clear(); } });
     crate::heal::clear_claim_memo();
     crate::boolean::clear_candidate_memo();

@@ -220,18 +220,12 @@ pub(crate) fn plan_pairs(components: &[PlanComponent], clearance: f64) -> PairPl
 
 type Triangle = [[f64; 3]; 3];
 
-fn sub(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
-    [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
-}
+use crate::geometry3d::sub3 as sub;
 fn add_scaled(a: [f64; 3], d: [f64; 3], t: f64) -> [f64; 3] {
     [a[0] + d[0] * t, a[1] + d[1] * t, a[2] + d[2] * t]
 }
-fn dot(a: [f64; 3], b: [f64; 3]) -> f64 {
-    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
-}
-fn cross(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
-    [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]]
-}
+use crate::geometry3d::dot3 as dot;
+use crate::geometry3d::cross3 as cross;
 fn dist2(a: [f64; 3], b: [f64; 3]) -> f64 {
     let d = sub(a, b);
     dot(d, d)

@@ -14,9 +14,10 @@
 //! shows: a step shown in the player, its ghosts and an insertion half way
 //! home do not change a file.
 //!
-//! The player data carries one mesh per drawn solid, already where the
-//! assembly puts it (an identity matrix), each step's camera and picture, and
-//! a thumbnail per part the steps add.
+//! The player data carries one mesh per part, each node with its placement,
+//! each step's camera, picture and view PMI (laid out as the 3D PDF lays it
+//! out, [`crate::sheets::pdf3d::view_annotations`]), and the assembly's tree
+//! with a thumbnail per part (the page's Model and Parts tabs).
 
 use super::{component_move::now_ms, EngineState};
 use crate::scene::SolidDisplay;
@@ -134,6 +135,17 @@ impl EngineState {
     /// [`Self::topology_pending`] clears). Returns whether every drawn solid's
     /// B-rep is in the scene now: the exact pass draws the pictures. Otherwise
     /// the mesh approximation does, and the file says so.
+    /// Ask for the exact solids the step pictures draw WITHOUT waiting:
+    /// returns whether they are all here already. The frame's `pump` lands the
+    /// replies; a caller that may not block (automation) checks
+    /// [`Self::topology_pending`] on later frames.
+    pub fn instructions_request_topology(&mut self) -> bool {
+        let names: Vec<String> = self.scene.solids().iter().filter(|solid| !solid.is_sketch).map(|solid| solid.name.clone()).collect();
+        self.request_exact_solids(names.iter().map(String::as_str));
+        self.pump_topology();
+        !self.topology_pending()
+    }
+
     pub fn instructions_topology_ready(&mut self) -> bool {
         let names: Vec<String> = self.scene.solids().iter().filter(|solid| !solid.is_sketch).map(|solid| solid.name.clone()).collect();
         self.request_exact_solids(names.iter().map(String::as_str));
@@ -269,7 +281,7 @@ impl EngineState {
         let unposed = self.instructions_export_displays();
         let mut capture = thumbnail::Capture::default();
         for name in &names {
-            if view.display.hidden.contains(name) || presentation.hidden.contains(name) {
+            if view.hides(name) || presentation.hidden.contains(name) {
                 continue;
             }
             let Some(display) = unposed.get(name).filter(|display| !display.is_sketch) else { continue };
@@ -281,8 +293,8 @@ impl EngineState {
     }
 
     /// The interactive player's data: the steps over every drawn solid, each
-    /// step's camera from its view and its picture, and each added part's
-    /// thumbnail. What PLM serves per revision and the offline copy inlines.
+    /// step's camera from its view, its picture and its view's PMI, and the
+    /// assembly's tree with each part's thumbnail. What PLM serves per revision and the offline copy inlines.
     pub fn instructions_player_data(&self) -> Result<PlayerData, String> {
         let block = self.instructions_required()?;
         let unposed = self.instructions_export_displays();
@@ -320,6 +332,24 @@ impl EngineState {
             placements.push(holder.and_then(|c| self.instructions_occurrence_placement(&c.path)));
         }
         scene.share_meshes(&keys, &placements);
+        // A part's thumbnail, once per part: every solid of `occurrence` (a
+        // part's, or a sub-assembly's), unposed.
+        let thumbnail_of = |scene: &mut player::Scene, part: &str, occurrence: &str| {
+            if scene.thumbnails.contains_key(part) {
+                return;
+            }
+            let mut capture = thumbnail::Capture::default();
+            for solid in self.scene.solids() {
+                let name = solid.name.as_str();
+                let inside = name == occurrence || name.strip_prefix(occurrence).is_some_and(|rest| rest.starts_with(':'));
+                if let Some(display) = unposed.get(name).filter(|display| inside && !display.is_sketch) {
+                    capture.bodies.extend(thumbnail::body_of(display));
+                }
+            }
+            if let Some(png) = thumbnail::render_png(&capture, PLAYER_THUMBNAIL_PX) {
+                scene.thumbnails.insert(part.to_string(), player::png_data_url(&png));
+            }
+        };
         let pmi = self.pmi_state();
         for (_, step) in block.steps() {
             // The step view's explode poses, a matrix per posed node, in the
@@ -339,7 +369,20 @@ impl EngineState {
                     scene.poses.insert(step.id.clone(), posed);
                 }
             }
-            let camera = step.view.as_deref().and_then(|id| pmi.views.iter().find(|view| view.id == id)).and_then(|view| view.camera.as_ref());
+            let view = step.view.as_deref().and_then(|id| pmi.views.iter().find(|view| view.id == id));
+            let camera = view.and_then(|view| view.camera.as_ref());
+            // The PMI the view shows, laid out as the 3D PDF lays it out.
+            if let (Some(view), Some(camera)) = (view, camera) {
+                if let Some(rows) = self.pmi_report.as_ref().and_then(|report| report.view(&view.id)) {
+                    let drawn = crate::sheets::pdf3d::view_annotations(view, camera, rows);
+                    let texts: Vec<String> = drawn.iter().map(|(row, _)| row.text.clone()).filter(|text| !text.trim().is_empty()).collect();
+                    let lines: Vec<Vec<[f64; 3]>> = drawn.iter().flat_map(|(_, d)| d.lines.iter().cloned()).collect();
+                    let arrows: Vec<[[f64; 3]; 3]> = drawn.iter().flat_map(|(_, d)| d.arrows.iter().copied()).collect();
+                    if let Some(drawing) = player::PlayerPmi::new(&lines, &arrows, drawn.len(), texts) {
+                        scene.pmi.insert(step.id.clone(), drawing);
+                    }
+                }
+            }
             if let Some(camera) = camera {
                 let (fov_deg, half_height) = match camera.projection {
                     PmiProjection::Perspective { fov_y_deg } => (Some(fov_y_deg), None),
@@ -351,23 +394,18 @@ impl EngineState {
                 }
             }
             for add in &step.adds {
-                if scene.thumbnails.contains_key(&add.part) {
-                    continue;
-                }
                 // The part's first occurrence: its solid, or a sub-assembly's.
-                let Some(occurrence) = add.occurrences.first() else { continue };
-                let mut capture = thumbnail::Capture::default();
-                for solid in self.scene.solids() {
-                    let name = solid.name.as_str();
-                    let inside = name == occurrence || name.strip_prefix(occurrence.as_str()).is_some_and(|rest| rest.starts_with(':'));
-                    if let Some(display) = unposed.get(name).filter(|display| inside && !display.is_sketch) {
-                        capture.bodies.extend(thumbnail::body_of(display));
-                    }
-                }
-                if let Some(png) = thumbnail::render_png(&capture, PLAYER_THUMBNAIL_PX) {
-                    scene.thumbnails.insert(add.part.clone(), player::png_data_url(&png));
+                if let Some(occurrence) = add.occurrences.first() {
+                    thumbnail_of(&mut scene, &add.part, occurrence);
                 }
             }
+        }
+        // The assembly's tree, each part with its thumbnail: the page's Model
+        // and Parts tabs.
+        scene.assembly = player::PlayerComponent::rows(&level);
+        let parts: Vec<(String, String)> = scene.assembly.iter().map(|row| (row.part.clone(), row.path.clone())).collect();
+        for (part, path) in parts {
+            thumbnail_of(&mut scene, &part, &path);
         }
         PlayerData::build(&block, scene)
     }

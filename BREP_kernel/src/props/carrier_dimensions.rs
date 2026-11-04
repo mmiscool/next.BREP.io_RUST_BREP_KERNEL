@@ -171,17 +171,7 @@ fn circle_through(points: &[Vec3], tolerance: f64) -> Option<(Vec3, f64)> {
     let ab = b.sub(a);
     let ac = c.sub(a);
     let normal = ab.cross(ac);
-    let denominator = 2.0 * normal.length_squared();
-    if denominator <= f64::MIN_POSITIVE {
-        return None;
-    }
-    let centre = a.add(
-        normal
-            .cross(ab)
-            .scale(ac.length_squared())
-            .add(ac.cross(normal).scale(ab.length_squared()))
-            .scale(1.0 / denominator),
-    );
+    let centre = crate::circumcenter(a, b, c)?;
     let radius = a.sub(centre).length();
     let unit_normal = normal.normalized().ok()?;
     let on_circle = points.iter().all(|p| {

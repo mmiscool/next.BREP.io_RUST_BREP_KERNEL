@@ -10,7 +10,7 @@
 //! ([`crate::app::BrepApp::start_spin`]), not by the host issuing one move per
 //! call: a host-driven drag puts a round trip between every pair of frames, and
 //! `dt` would then report the host's latency instead of the app's frame period.
-use crate::automation::command::{parse_args, schema_of, Annotations, CommandSpec, Ctx, Empty, Handler, NoArgs, Outcome, Phase};
+use crate::automation::command::{app_command, parse_args, CommandSpec, Ctx, NoArgs, Outcome};
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -46,6 +46,32 @@ fn default_frames() -> u32 {
 
 fn default_true() -> bool {
     true
+}
+
+fn perf_reset_result_schema() -> Value {
+    serde_json::json!({"type":"object","properties":{},"additionalProperties":false})
+}
+fn perf_spin_result_schema() -> Value {
+    serde_json::json!({"type":"object","properties":{
+        "frames":{"type":"integer","minimum":0,"maximum":4294967295u64},
+        "step":{"type":"array","items":{"type":"number"},"minItems":2,"maxItems":2}
+    },"required":["frames","step"],"additionalProperties":false})
+}
+fn perf_stats_result_schema() -> Value {
+    let count = serde_json::json!({"type":"integer","minimum":0});
+    let timing = serde_json::json!({"type":"object","properties":{
+        "avg":{"type":"number"},"p95":{"type":"number"},"max":{"type":"number"}
+    },"required":["avg","p95","max"],"additionalProperties":false});
+    let tally = serde_json::json!({"type":"object","properties":{
+        "count":count,"ms":{"type":"number"},"features":count,"reused":count,"errors":count
+    },"required":["count","ms","features","reused","errors"],"additionalProperties":false});
+    serde_json::json!({"type":"object","properties":{
+        "frames":count,"window":count,"staleFrames":count,"spinning":{"type":"boolean"},
+        "dt":timing,"ui":timing,"publish":timing,"sync":timing,"fit":timing,"overlays":timing,"draw":timing,
+        "runs":{"type":"object","properties":{
+            "sites":{"type":"object","additionalProperties":tally},"total":tally
+        },"required":["sites","total"],"additionalProperties":false}
+    },"required":["frames","window","staleFrames","spinning","dt","ui","publish","sync","fit","overlays","draw","runs"],"additionalProperties":false})
 }
 
 fn perf_stats(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
@@ -86,7 +112,7 @@ fn perf_reset(_ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
 }
 
 pub static COMMANDS: &[CommandSpec] = &[
-    CommandSpec { name: "perf_stats", group: "frame", doc: "Where the last ~120 frames' milliseconds went, in ms. `dt` is the frame PERIOD a user feels; `ui` brackets the whole UI body; `publish`, `sync`, `fit`, `overlays` and `draw` are nested inside it (the remainder is egui's own layout and painting). Each is {avg, p95, max}. `spinning` says whether a `perf_spin` is still running — poll this until it is false, then read. `runs` is the history-replay tally since the last reset: one {count, ms, features, reused, errors} per SITE that called `execute_history`, plus their total. `runs.sites.runner` is the one execution an edit is supposed to cost, and any other site is a duplicate replay of the whole document — a thing frame milliseconds cannot state, because a duplicate and a slow machine look alike. Bracket an interaction with `perf_reset` and read this after it.", phase: Phase::Read, annotations: Annotations::READ, args_schema: schema_of::<PerfArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(perf_stats) },
-    CommandSpec { name: "perf_spin", group: "frame", doc: "Orbit the camera for `frames` frames, one pointer step per frame, through the same drag path the mouse takes. Clears the timing window and the history-replay counts first (unless `reset` is false), so `perf_stats` afterwards reports the spin alone. Returns at once — poll `perf_stats.spinning`.", phase: Phase::Mutate, annotations: Annotations::MUTATE_NOWAIT, args_schema: schema_of::<SpinArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(perf_spin) },
-    CommandSpec { name: "perf_reset", group: "frame", doc: "Drop every timing sample and every history-replay count. Use before an interaction whose cost is the question; `perf_stats` afterwards then reports that interaction alone, in frame milliseconds AND in `execute_history` calls.", phase: Phase::Mutate, annotations: Annotations::MUTATE_NOWAIT, args_schema: schema_of::<NoArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(perf_reset) },
+    app_command!("frame", "perf_stats", "Where the last ~120 frames' milliseconds went, in ms. `dt` is the frame PERIOD a user feels; `ui` brackets the whole UI body; `publish`, `sync`, `fit`, `overlays` and `draw` are nested inside it (the remainder is egui's own layout and painting). Each is {avg, p95, max}. `spinning` says whether a `perf_spin` is still running — poll this until it is false, then read. `runs` is the history-replay tally since the last reset: one {count, ms, features, reused, errors} per SITE that called `execute_history`, plus their total. `runs.sites.runner` is the one execution an edit is supposed to cost, and any other site is a duplicate replay of the whole document — a thing frame milliseconds cannot state, because a duplicate and a slow machine look alike. Bracket an interaction with `perf_reset` and read this after it.", PerfArgs, perf_stats, Read, READ, perf_stats_result_schema),
+    app_command!("frame", "perf_spin", "Orbit the camera for `frames` frames, one pointer step per frame, through the same drag path the mouse takes. Clears the timing window and the history-replay counts first (unless `reset` is false), so `perf_stats` afterwards reports the spin alone. Returns at once — poll `perf_stats.spinning`.", SpinArgs, perf_spin, Mutate, MUTATE_NOWAIT, perf_spin_result_schema),
+    app_command!("frame", "perf_reset", "Drop every timing sample and every history-replay count. Use before an interaction whose cost is the question; `perf_stats` afterwards then reports that interaction alone, in frame milliseconds AND in `execute_history` calls.", NoArgs, perf_reset, Mutate, MUTATE_NOWAIT, perf_reset_result_schema),
 ];

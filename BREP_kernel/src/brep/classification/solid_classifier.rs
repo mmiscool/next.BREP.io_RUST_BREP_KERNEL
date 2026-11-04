@@ -124,29 +124,25 @@ thread_local! {
         }) };
 }
 
+impl crate::profile::Counters for ClassifyProfile {
+    fn armed(&self) -> bool {
+        self.enabled
+    }
+}
+
 fn classify_profile(update: impl FnOnce(&mut ClassifyProfile)) {
-    CLASSIFY_PROFILE.with(|cell| {
-        let mut profile = cell.get();
-        if profile.enabled {
-            update(&mut profile);
-            cell.set(profile);
-        }
-    });
+    crate::profile::update(&CLASSIFY_PROFILE, update)
 }
 
 fn classify_profile_started() -> Option<web_time::Instant> {
-    CLASSIFY_PROFILE
-        .with(|cell| cell.get().enabled)
-        .then(web_time::Instant::now)
+    crate::profile::started(&CLASSIFY_PROFILE)
 }
 
-fn classify_elapsed_ms(started: Option<web_time::Instant>) -> f64 {
-    started.map_or(0.0, |s| s.elapsed().as_secs_f64() * 1_000.0)
-}
+use crate::profile::elapsed_ms as classify_elapsed_ms;
 
 /// Arm the classifier counters (reset to zero) when `BREP_PROFILE` is set.
 pub(crate) fn classify_profile_begin() {
-    let enabled = std::env::var("BREP_PROFILE").is_ok();
+    let enabled = crate::profile::profile_enabled();
     CLASSIFY_PROFILE.with(|cell| {
         cell.set(ClassifyProfile {
             enabled,
@@ -162,7 +158,7 @@ pub(crate) fn classify_profile_report(label: &str) {
     if !p.enabled {
         return;
     }
-    eprintln!(
+    profile_line!(
         "classify.profile {label} calls={} builds={} build_ms={:.2} band: candidates={} project_ms={:.2} trim_tests={} trim_ms={:.2} rays={} ray_faces={} csi_ms={:.2} exact_faces={} fallback_faces={} ray_trim_tests={} ray_trim_ms={:.2} coincident: calls={} ms={:.2}",
         p.classify_calls, p.classifier_builds, p.classifier_build_ms, p.band_candidates,
         p.band_project_ms, p.band_trim_tests, p.band_trim_ms, p.rays, p.ray_faces,
@@ -178,11 +174,7 @@ pub(crate) fn classify_profile_report(label: &str) {
 /// bench 52/52 bodies and 1197/1197 lines) read identical;
 /// `BREP_CLASSIFY_EXACT_RAY=0` (or `off`) restores the sampled search.
 fn exact_ray_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let enabled = *ENABLED.get_or_init(|| {
-        !matches!(std::env::var("BREP_CLASSIFY_EXACT_RAY").as_deref(), Ok("0") | Ok("off"))
-    });
-    enabled
+    switch!("BREP_CLASSIFY_EXACT_RAY", true)
 }
 
 

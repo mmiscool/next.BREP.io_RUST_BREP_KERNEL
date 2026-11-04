@@ -4,6 +4,7 @@ use super::{MachineId, Point3};
 use serde::{Deserialize, Serialize};
 
 /// A machine tool the setup is posted for.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Machine {
@@ -52,6 +53,7 @@ impl Default for Machine {
 
 /// A rigid link of the machine that solids attach to (the kinematics chain
 /// resolves its pose).
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase", rename_all_fields = "camelCase")]
 pub enum Link {
@@ -67,6 +69,7 @@ pub enum Link {
 
 /// Shape of a machine solid in its link's frame. Geometric queries
 /// (containment, surface sampling) live with the simulation.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase", rename_all_fields = "camelCase")]
 pub enum LinkShape {
@@ -99,6 +102,7 @@ impl LinkShape {
 }
 
 /// One machine solid: a shape attached to a link.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LinkSolid {
@@ -108,6 +112,7 @@ pub struct LinkSolid {
 }
 
 /// The machine's collision geometry.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[serde(default)]
@@ -132,6 +137,7 @@ impl MachineModel {
 }
 
 /// Machine family and, for multi-axis mills, the rotary arrangement.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase", rename_all_fields = "camelCase")]
 #[non_exhaustive]
@@ -156,6 +162,7 @@ impl Default for MachineKind {
 }
 
 /// Where the two rotary axes of a five-axis machine live.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase", rename_all_fields = "camelCase")]
 pub enum Kinematics {
@@ -168,6 +175,7 @@ pub enum Kinematics {
 }
 
 /// A rotary axis: its name, direction and pivot in machine coordinates.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RotaryAxis {
@@ -184,6 +192,7 @@ pub struct RotaryAxis {
 }
 
 /// Linear travel limits in machine coordinates.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TravelLimits {
@@ -192,6 +201,7 @@ pub struct TravelLimits {
 }
 
 /// Spindle speed range in rpm.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[serde(default)]
@@ -207,6 +217,7 @@ impl Default for SpindleLimits {
 }
 
 /// Feed limits in model units per minute.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[serde(default)]

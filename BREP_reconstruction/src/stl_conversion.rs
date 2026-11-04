@@ -102,14 +102,13 @@ pub struct StlConversionOptions {
 
 impl Default for StlConversionOptions {
     fn default() -> Self {
-        let recognition = RecognitionOptions {
-            collect_phase_timings: true,
-            // Facet centroids lie on polygon chords rather than on the
-            // underlying design carrier. Welded STL vertices retain the best
-            // available samples of cylinders and other curved CAD surfaces.
-            sampling: SamplingMode::Vertices,
-            ..RecognitionOptions::default()
-        };
+        let mut recognition = RecognitionOptions::default();
+        recognition.collect_phase_timings = true;
+        // Facet centroids lie on polygon chords rather than on the
+        // underlying design carrier. Welded STL vertices retain the best
+        // available samples of cylinders and other curved CAD surfaces.
+        recognition.sampling = SamplingMode::Vertices;
+        recognition.torus_fast = crate::hypothesis_switch::torus_fast();
         Self {
             recognition,
             policy: ConversionPolicy::AllowFacetedFallback,
@@ -260,6 +259,108 @@ pub struct HybridConversionReport {
     pub segmentation_unsupported_regions: usize,
 }
 
+/// Lane V row 1: why the mixed builder demoted a recognised analytic region.
+/// The edge causes come from the boundary check before any surface is built
+/// (`local_regions`); the others are the build stage whose localized failure
+/// forced the demotion and a retry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DemotionCause {
+    /// A shared edge with a retained cone (or cylinder) is not a coaxial ring.
+    CylinderConeEdge,
+    /// Two cylinders meet in neither a shared ruling nor an equal-radius crossing.
+    CylinderCylinderEdge,
+    /// A sphere edge with a retained revolve is not a coaxial ring.
+    SphereRingEdge,
+    /// A torus edge with a retained revolve is not a coaxial ring.
+    TorusRingEdge,
+    /// Two cones meet in other than a coaxial ring.
+    ConeConeEdge,
+    /// A revolve pair with no exact-edge rule.
+    SameKindRevolveEdge,
+    /// An edge with a segmented plane is not that plane's section.
+    PlaneNeighbourEdge,
+    /// An edge with an unsupported region's facet is not in the facet's plane.
+    FacetNeighbourEdge,
+    /// Recursive demotion: the neighbour revolve was demoted to facets and the
+    /// shared edge is not a ruling.
+    DemotedNeighbourNotRuling,
+    /// Snapping a cylinder axis to its planar trims failed.
+    CylinderAxisSnap,
+    /// Snapping a cone carrier failed.
+    ConeSnap,
+    /// A pointed or zero-span cone.
+    ConeSpan,
+    /// Building the cylinder surface failed.
+    CylinderSurface,
+    /// No single parameter seam avoids every trim of a cylinder.
+    PeriodicSeam,
+    /// Building the cone surface failed.
+    ConeSurface,
+    /// Building the sphere surface failed.
+    SphereSurface,
+    /// Building the torus surface failed.
+    TorusSurface,
+    /// A chain edge failed; blamed on its sphere or torus side.
+    ChainEdgeCurved,
+    /// A chain edge failed; blamed on its cone side.
+    ChainEdgeCone,
+    /// A chain edge failed; blamed on its cylinder side.
+    ChainEdgeCylinder,
+    /// A chain between non-revolves failed; blamed on the revolve whose chain
+    /// first placed one of its end vertices.
+    ChainEdgeVertexPlacer,
+    /// Building the cylinder face failed.
+    CylinderFace,
+    /// Building the cone face failed.
+    ConeFace,
+    /// Building the sphere face failed.
+    SphereFace,
+    /// Building the torus face failed.
+    TorusFace,
+    /// The assembled shell failed a whole-body check with fitted-pcurve
+    /// regions on it; those regions were demoted together.
+    WholeBodyCheck,
+    /// A test-injected failure.
+    Injected,
+}
+
+/// The carrier kind a demoted region had.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DemotedKind {
+    /// Cylinder carrier.
+    Cylinder,
+    /// Cone carrier.
+    Cone,
+    /// Sphere carrier.
+    Sphere,
+    /// Torus carrier.
+    Torus,
+}
+
+/// One demoted region of a mixed analytic/faceted rebuild.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub struct HybridDemotion {
+    /// Segmentation region id.
+    pub region: u32,
+    /// Its carrier kind.
+    pub kind: DemotedKind,
+    /// Its source triangles.
+    pub triangles: usize,
+    /// Why it was demoted.
+    pub cause: DemotionCause,
+    /// The cause at the start of a recursive demotion chain: the neighbour's
+    /// root cause for `DemotedNeighbourNotRuling`, otherwise `cause`.
+    pub root_cause: DemotionCause,
+    /// The neighbouring region across the failing edge, for an edge cause.
+    pub neighbour: Option<u32>,
+    /// Boundary-check round that demoted it, from 1; 0 for a forced demotion.
+    pub round: usize,
+    /// The builder's message, for a forced demotion.
+    pub message: Option<String>,
+}
+
 /// One body of the document: a single vertex-connected component of the input
 /// mesh, reconstructed on its own.
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -297,6 +398,10 @@ pub struct ComponentConversionReport {
     pub analytic_used_repaired_mesh: bool,
     /// Mixed analytic/faceted accounting for this body.
     pub hybrid_rebuild: Option<HybridConversionReport>,
+    /// Lane V row 1: why each region the mixed builder demoted was demoted;
+    /// their triangles sum to `hybrid_rebuild.demoted_triangles`.
+    #[serde(default)]
+    pub hybrid_demotions: Vec<HybridDemotion>,
     /// Face count immediately after faceted repair, when that path was used.
     pub faceted_faces_before_merge: Option<usize>,
     /// Face count after the safe coplanar merge attempt.
@@ -368,6 +473,9 @@ pub struct StlConversionReport {
     /// several bodies this sums every body that took that backend.
     #[serde(default)]
     pub hybrid_rebuild: Option<HybridConversionReport>,
+    /// Lane V row 1: every body's demotion records, in document order.
+    #[serde(default)]
+    pub hybrid_demotions: Vec<HybridDemotion>,
     /// One record per body, in document order — the authoritative per-body
     /// account when the input held several closed shells. Always populated;
     /// a single-body conversion has exactly one entry.
@@ -715,6 +823,7 @@ fn refused_component(mesh: &Mesh, triangles: usize, reason: String) -> Component
         regions: Vec::new(),
         topology_refit: None,
         hybrid_rebuild: None,
+        hybrid_demotions: Vec::new(),
         faceted_faces_before_merge: None,
         faceted_faces_after_merge: None,
         faces: 0,
@@ -748,6 +857,7 @@ struct ComponentDetail {
     regions: Vec<ConversionRegionReport>,
     topology_refit: Option<ConversionRegionReport>,
     hybrid_rebuild: Option<HybridConversionReport>,
+    hybrid_demotions: Vec<HybridDemotion>,
     faceted_faces_before_merge: Option<usize>,
     faceted_faces_after_merge: Option<usize>,
     faces: usize,
@@ -990,6 +1100,7 @@ fn convert_component(
         ));
     }
 
+    let mut hybrid_demotions = Vec::new();
     let (
         solid,
         backend,
@@ -1068,9 +1179,50 @@ fn convert_component(
                 } else {
                     Err("mixed analytic/faceted rebuild requires a closed two-manifold".to_owned())
                 };
+                // An opt-in round trip of the rebuilt solid alone: a solid
+                // its own STEP cannot import takes the faceted fallback.
+                let hybrid_attempt = hybrid_attempt.and_then(|output| {
+                    if hybrid_roundtrip_fallback_enabled() {
+                        if let Err(error) = solid_round_trips(&output.solid) {
+                            // Promotion 9's switches can move a line onto a
+                            // ring vertex past the import's bar (census record
+                            // occt_frustum_s10_d0.05_jitter-0.1); the rebuild
+                            // without them is tried before the facets.
+                            let second = crate::hybrid_region_brep::hybrid_plane_cylinder_brep_before_promotion_9(
+                                source_positions,
+                                source_indices,
+                                &segmentation_options(source_positions, options),
+                            );
+                            if let Ok(Some(second)) = second {
+                                if solid_round_trips(&second.solid).is_ok() {
+                                    return Ok(second);
+                                }
+                            }
+                            // Then without promotion 10's switches, keeping
+                            // promotion 9's, and then without either.
+                            for with_promotion_9 in [true, false] {
+                                let further = crate::hybrid_region_brep::hybrid_plane_cylinder_brep_before_promotion_10(
+                                    source_positions,
+                                    source_indices,
+                                    &segmentation_options(source_positions, options),
+                                    with_promotion_9,
+                                );
+                                if let Ok(Some(further)) = further {
+                                    if solid_round_trips(&further.solid).is_ok() {
+                                        return Ok(further);
+                                    }
+                                }
+                            }
+                            return Err(format!(
+                                "{kernel_error}; the mixed rebuild's solid failed its STEP round trip: {error}"
+                            ));
+                        }
+                    }
+                    Ok(output)
+                });
                 match hybrid_attempt {
                     Ok(output) => {
-                        let stats = output.stats;
+                        let stats = &output.stats;
                         whole_carrier_scan = whole_carrier_scan.sum(stats.whole_carrier_scan);
                         if stats.split_freeform_regions
                             + stats.split_declined_regions
@@ -1088,7 +1240,7 @@ fn convert_component(
                                 stats.split_band_declined_regions
                             ));
                         }
-                        let hybrid_report = hybrid_report(output.stats);
+                        let hybrid_report = hybrid_report(&output.stats);
                         if options.policy == ConversionPolicy::RequireFullyAnalytic
                             && hybrid_report.faceted_faces != 0
                         {
@@ -1102,6 +1254,7 @@ fn convert_component(
                             } else {
                                 "independent segmentation reconstructed exact plane/cylinder/cone/sphere regions and retained unsupported or unsafe regions as facets"
                             };
+                            hybrid_demotions = output.stats.demotions;
                             Ok((
                                 output.solid,
                                 ConversionBackend::HybridAnalyticRebuild,
@@ -1212,6 +1365,7 @@ fn convert_component(
         regions,
         topology_refit,
         hybrid_rebuild,
+        hybrid_demotions,
         faceted_faces_before_merge,
         faceted_faces_after_merge,
         faces,
@@ -1370,6 +1524,7 @@ fn aggregate_report(
             source_closed_manifold: detail.source_closed_manifold,
             analytic_used_repaired_mesh: detail.analytic_used_repaired_mesh,
             hybrid_rebuild: detail.hybrid_rebuild,
+            hybrid_demotions: detail.hybrid_demotions.clone(),
             faceted_faces_before_merge: detail.faceted_faces_before_merge,
             faceted_faces_after_merge: detail.faceted_faces_after_merge,
             faces: detail.faces,
@@ -1410,6 +1565,10 @@ fn aggregate_report(
             .iter()
             .find_map(|detail| detail.topology_refit.clone()),
         hybrid_rebuild,
+        hybrid_demotions: details
+            .iter()
+            .flat_map(|detail| detail.hybrid_demotions.iter().cloned())
+            .collect(),
         components: component_reports,
         exported_step_bytes: 0,
         exported_advanced_faces: 0,
@@ -1838,10 +1997,10 @@ fn disjoint_complete_partition(regions: &[SurfaceRegion], triangle_count: usize)
 
 /// A source mesh the repair closed, with the buffers every downstream lane
 /// reads bound to it.
-struct RepairedMesh {
+pub(crate) struct RepairedMesh {
     mesh: Mesh,
-    positions: Vec<f64>,
-    indices: Vec<u32>,
+    pub(crate) positions: Vec<f64>,
+    pub(crate) indices: Vec<u32>,
     message: String,
 }
 
@@ -1849,7 +2008,7 @@ struct RepairedMesh {
 /// when the repair actually closed it — a mesh too broken to close keeps the
 /// refusal it has always had, and a file whose repair would CHANGE a closed
 /// mesh never reaches here.
-fn repaired_closed_mesh(
+pub(crate) fn repaired_closed_mesh(
     source_positions: &[f64],
     source_indices: Option<&[u32]>,
     options: &StlConversionOptions,
@@ -2220,7 +2379,7 @@ fn solid_face_count(solid: &brep_kernel::BrepSolid) -> usize {
 /// ring torus is one region.
 const MAX_WHOLE_PRIMITIVE_REGIONS: usize = 3;
 
-fn segmentation_options(positions: &[f64], options: &StlConversionOptions) -> SegmentOptions {
+pub(crate) fn segmentation_options(positions: &[f64], options: &StlConversionOptions) -> SegmentOptions {
     SegmentOptions {
         deflection_angle_deg: options.kernel_deflection_angle_degrees,
         fit_tolerance: options.kernel_fit_tolerance,
@@ -2254,8 +2413,33 @@ fn segmentation_options(positions: &[f64], options: &StlConversionOptions) -> Se
 /// kernel region rebuilder can pay for themselves.
 /// Lane J row 12, promoted ON 2026-10-16: BREP_RECOG_SEGMENT_CARRIER=0
 /// restores recognition without the segmentation's carriers.
+/// Promoted ON 2026-10-31 (owner; BREP_HYBRID_ROUNDTRIP_FALLBACK=0 restores
+/// the old path): the mixed
+/// rebuild's solid is exported and imported alone before it is taken, and a
+/// solid that fails takes the faceted fallback instead of failing the whole
+/// conversion. Nine of the census's ten lost rows are countersinks whose
+/// rebuilt solid the STEP import refuses ("pcurve fit refused": a trim
+/// misses its stations by up to 5e-2 out of sample), and the tenth
+/// (kernel_pointed_cone_s10_d0.05_jitter-1.0) imports with an edge used
+/// four times.
+fn hybrid_roundtrip_fallback_enabled() -> bool {
+    brep_kernel::switch!(live "BREP_HYBRID_ROUNDTRIP_FALLBACK", true)
+}
+
+/// [`hybrid_roundtrip_fallback_enabled`]: the solid's own STEP imports
+/// and every imported solid validates.
+fn solid_round_trips(solid: &brep_kernel::BrepSolid) -> Result<(), String> {
+    let text = export_step(std::slice::from_ref(solid), "round-trip", "millimeter", "2026-01-01T00:00:00Z")
+        .map_err(|error| format!("export: {error}"))?;
+    let imported = import_step(&text).map_err(|error| error.to_string())?;
+    match imported.iter().map(|solid| solid.validate()).find(|issues| !issues.is_empty()) {
+        Some(issues) => Err(format!("imported solid invalid: {issues:?}")),
+        None => Ok(()),
+    }
+}
+
 fn segment_carrier_enabled() -> bool {
-    std::env::var("BREP_RECOG_SEGMENT_CARRIER").map_or(true, |v| v != "0")
+    brep_kernel::switch!(live "BREP_RECOG_SEGMENT_CARRIER", true)
 }
 
 /// Lane J row 12: the recognition tolerance is raised to the segmentation's
@@ -2518,7 +2702,7 @@ fn try_hybrid_analytic(
     )
 }
 
-fn hybrid_report(stats: crate::hybrid_region_brep::HybridBrepStats) -> HybridConversionReport {
+fn hybrid_report(stats: &crate::hybrid_region_brep::HybridBrepStats) -> HybridConversionReport {
     HybridConversionReport {
         total_faces: stats.total_faces,
         analytic_plane_faces: stats.analytic_plane_faces,

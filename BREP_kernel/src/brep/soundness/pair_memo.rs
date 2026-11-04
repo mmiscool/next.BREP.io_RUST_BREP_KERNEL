@@ -36,7 +36,7 @@ thread_local! {
 
 #[cfg(not(target_arch = "wasm32"))]
 fn enabled_from_env() -> bool {
-    !matches!(std::env::var("BREP_SOUNDNESS_PAIR_MEMO").as_deref(), Ok("0") | Ok("off"))
+    switch!(live "BREP_SOUNDNESS_PAIR_MEMO", true)
 }
 
 /// No env vars in the browser: the shipped wasm path keeps the memo on.

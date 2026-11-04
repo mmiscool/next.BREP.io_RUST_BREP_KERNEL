@@ -153,7 +153,7 @@ pub(crate) fn ortho_view_proj(eye: Vec3, fwd: Vec3, up_hint: Vec3, half: f32, w:
     mat_mul4(&ortho, &view)
 }
 
-fn mat_mul4(a: &[[f32; 4]; 4], b: &[[f32; 4]; 4]) -> [[f32; 4]; 4] {
+pub(crate) fn mat_mul4(a: &[[f32; 4]; 4], b: &[[f32; 4]; 4]) -> [[f32; 4]; 4] {
     let mut out = [[0.0f32; 4]; 4];
     for col in 0..4 {
         for row in 0..4 {

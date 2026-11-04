@@ -291,11 +291,8 @@ impl BoundaryIndex {
             tested += 1;
             let a = self.ring[edge];
             let b = self.ring[(edge + 1) % count];
-            if (a[1] > uv[1]) != (b[1] > uv[1]) {
-                let x = a[0] + (uv[1] - a[1]) / (b[1] - a[1]) * (b[0] - a[0]);
-                if x > uv[0] {
-                    *crossings += 1;
-                }
+            if crate::polygon::crosses_ray(uv, a, b) {
+                *crossings += 1;
             }
         };
         let from = self.ring_starts[bucket] as usize;

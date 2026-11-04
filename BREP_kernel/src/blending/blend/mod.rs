@@ -21,6 +21,7 @@ mod carve;
 mod chain;
 mod collapse;
 mod corner;
+pub(crate) mod creased_rim;
 mod edge;
 mod fold;
 mod miter;
@@ -31,6 +32,7 @@ mod restrict;
 pub(super) mod rollover;
 mod rollover_surgery;
 pub(crate) mod runout;
+pub(crate) mod split_rim;
 mod stations;
 mod rows;
 mod track_fit;
@@ -44,16 +46,11 @@ pub(crate) fn is_tangential_transverse_end(refusal: &crate::KernelRefusal) -> bo
         if what == TANGENTIAL_TRANSVERSE_END)
 }
 
-thread_local! {
-    static REFINE_OFF_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
 /// Whether the open march's local station refinement runs. Escape hatch
 /// `BREP_BLEND_REFINE=0` restores the uniform ladder exactly; a test turns it
 /// off for its own thread with `set_refinement_off_for_test`.
 pub(crate) fn station_refinement_on() -> bool {
-    std::env::var("BREP_BLEND_REFINE").as_deref() != Ok("0")
-        && !REFINE_OFF_FOR_TEST.with(|off| off.get())
+    switch!(live "BREP_BLEND_REFINE", true)
 }
 
 thread_local! {
@@ -96,21 +93,6 @@ pub(in crate::blend) fn open_pad_network_on() -> bool {
     OPEN_PAD_NETWORK.with(|flag| flag.get())
 }
 
-
-thread_local! {
-    static EXACT_LANE_FOR_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
-    static EXACT_REVOLUTION_FOR_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
-    static EXACT_RIM_LANE_FOR_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
-    static ACCEPT_ONCE_FOR_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
-    static CHAIN_ARC_STATIONS_FOR_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
-    static TAPER_NETWORK_FOR_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
-    static ROLLOVER_FOR_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
-    static EXACT_TRIM_FOR_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
-    static UNEQUAL_MITER_FOR_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
-    static NO_COMMON_BALL_STAR_FOR_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
-    static CROSSED_RAILS_FOR_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
-}
-
 /// Off, the network names the stripe `crossed_rails` and the selection
 /// falls through to the cutter composition, whose body is the union of the
 /// canal removals (a ridge). `BREP_BLEND_CROSSED_RAILS=0` is the escape
@@ -119,14 +101,7 @@ thread_local! {
 const CROSSED_RAILS_DEFAULT: bool = true;
 
 pub(crate) fn crossed_rails_on() -> bool {
-    if let Some(forced) = CROSSED_RAILS_FOR_TEST.with(|forced| forced.get()) {
-        return forced;
-    }
-    match std::env::var("BREP_BLEND_CROSSED_RAILS").as_deref() {
-        Ok("0") => false,
-        Ok("1") => true,
-        _ => CROSSED_RAILS_DEFAULT,
-    }
+    switch!(live "BREP_BLEND_CROSSED_RAILS", CROSSED_RAILS_DEFAULT)
 }
 
 /// Off, the network refuses `unequal_corner_radius` or `n_sided_corner` by
@@ -136,14 +111,7 @@ pub(crate) fn crossed_rails_on() -> bool {
 const NO_COMMON_BALL_STAR_DEFAULT: bool = true;
 
 pub(crate) fn no_common_ball_star_on() -> bool {
-    if let Some(forced) = NO_COMMON_BALL_STAR_FOR_TEST.with(|forced| forced.get()) {
-        return forced;
-    }
-    match std::env::var("BREP_BLEND_RIBBON_STAR").as_deref() {
-        Ok("0") => false,
-        Ok("1") => true,
-        _ => NO_COMMON_BALL_STAR_DEFAULT,
-    }
+    switch!(live "BREP_BLEND_RIBBON_STAR", NO_COMMON_BALL_STAR_DEFAULT)
 }
 
 /// The corner has no common ball; the point both shared-face rails stop at is
@@ -157,14 +125,7 @@ pub(crate) fn no_common_ball_star_on() -> bool {
 const UNEQUAL_MITER_DEFAULT: bool = true;
 
 pub(crate) fn unequal_miter_on() -> bool {
-    if let Some(forced) = UNEQUAL_MITER_FOR_TEST.with(|forced| forced.get()) {
-        return forced;
-    }
-    match std::env::var("BREP_BLEND_UNEQUAL_MITER").as_deref() {
-        Ok("0") => false,
-        Ok("1") => true,
-        _ => UNEQUAL_MITER_DEFAULT,
-    }
+    switch!(live "BREP_BLEND_UNEQUAL_MITER", UNEQUAL_MITER_DEFAULT)
 }
 
 /// Off, the closed lane names the rollover and declines as it did when the
@@ -175,15 +136,24 @@ pub(crate) fn unequal_miter_on() -> bool {
 const ROLLOVER_DEFAULT: bool = true;
 
 pub(crate) fn rollover_on() -> bool {
-    if let Some(forced) = ROLLOVER_FOR_TEST.with(|forced| forced.get()) {
-        return forced;
-    }
-    match std::env::var("BREP_BLEND_ROLLOVER").as_deref() {
-        Ok("0") => false,
-        Ok("1") => true,
-        _ => ROLLOVER_DEFAULT,
-    }
+    switch!(live "BREP_BLEND_ROLLOVER", ROLLOVER_DEFAULT)
 }
+
+/// The STOPPED-END rollover of an open stripe (user bug F10, 2026-11-02):
+/// a track that leaves its mate across a tangent edge before the stripe's
+/// own vertex and never comes back — the F10 fillet's rails run 1.1e-2 past
+/// faces 13/23's boundaries onto the F8 blend faces 19/26 — has its tail
+/// re-marched on the neighbour from the crossing station and the cap's
+/// legs drawn on the neighbours. Default OFF: `BREP_BLEND_STOPPED_END_ROLLOVER=1`
+/// turns it on, `set_stopped_end_rollover_for_test` forces it on a test's
+/// own thread. Promotion owes the blend/fillet filters and both censuses
+/// with the switch on.
+const STOPPED_END_ROLLOVER_DEFAULT: bool = false;
+
+pub(crate) fn stopped_end_rollover_on() -> bool {
+    switch!(live "BREP_BLEND_STOPPED_END_ROLLOVER", STOPPED_END_ROLLOVER_DEFAULT)
+}
+
 
 /// OPEN stripes: a straight edge between planar mates is one section
 /// extruded, so the network marches its stations once and skips the ladder's
@@ -200,25 +170,11 @@ const EXACT_LANE_DEFAULT: bool = true;
 const EXACT_RIM_LANE_DEFAULT: bool = true;
 
 pub(crate) fn exact_rim_lane_on() -> bool {
-    if let Some(forced) = EXACT_RIM_LANE_FOR_TEST.with(|forced| forced.get()) {
-        return forced;
-    }
-    match std::env::var("BREP_BLEND_EXACT_RIM").as_deref() {
-        Ok("0") => false,
-        Ok("1") => true,
-        _ => EXACT_RIM_LANE_DEFAULT,
-    }
+    switch!(live "BREP_BLEND_EXACT_RIM", EXACT_RIM_LANE_DEFAULT)
 }
 
 pub(crate) fn exact_lane_on() -> bool {
-    if let Some(forced) = EXACT_LANE_FOR_TEST.with(|forced| forced.get()) {
-        return forced;
-    }
-    match std::env::var("BREP_BLEND_EXACT_LANE").as_deref() {
-        Ok("0") => false,
-        Ok("1") => true,
-        _ => EXACT_LANE_DEFAULT,
-    }
+    switch!(live "BREP_BLEND_EXACT_LANE", EXACT_LANE_DEFAULT)
 }
 
 /// The exact rows are not the fitted rows' bytes, so the lane landed behind
@@ -232,14 +188,7 @@ pub(crate) fn exact_lane_on() -> bool {
 const EXACT_REVOLUTION_DEFAULT: bool = true;
 
 pub(crate) fn exact_revolution_on() -> bool {
-    if let Some(forced) = EXACT_REVOLUTION_FOR_TEST.with(|forced| forced.get()) {
-        return forced;
-    }
-    match std::env::var("BREP_BLEND_EXACT_REVOLUTION").as_deref() {
-        Ok("0") => false,
-        Ok("1") => true,
-        _ => EXACT_REVOLUTION_DEFAULT,
-    }
+    switch!(live "BREP_BLEND_EXACT_REVOLUTION", EXACT_REVOLUTION_DEFAULT)
 }
 
 /// The surgery lane's exact support trim (slice 1b of the box fillet's
@@ -260,14 +209,7 @@ pub(crate) fn exact_revolution_on() -> bool {
 const EXACT_TRIM_DEFAULT: bool = true;
 
 pub(crate) fn exact_trim_on() -> bool {
-    if let Some(forced) = EXACT_TRIM_FOR_TEST.with(|forced| forced.get()) {
-        return forced;
-    }
-    match std::env::var("BREP_BLEND_EXACT_TRIM").as_deref() {
-        Ok("0") => false,
-        Ok("1") => true,
-        _ => EXACT_TRIM_DEFAULT,
-    }
+    switch!(live "BREP_BLEND_EXACT_TRIM", EXACT_TRIM_DEFAULT)
 }
 
 /// Same landing rule and switch shape as [`exact_lane_on`]:
@@ -275,14 +217,7 @@ pub(crate) fn exact_trim_on() -> bool {
 const ACCEPT_ONCE_DEFAULT: bool = true;
 
 pub(crate) fn accept_once_on() -> bool {
-    if let Some(forced) = ACCEPT_ONCE_FOR_TEST.with(|forced| forced.get()) {
-        return forced;
-    }
-    match std::env::var("BREP_BLEND_ACCEPT_ONCE").as_deref() {
-        Ok("0") => false,
-        Ok("1") => true,
-        _ => ACCEPT_ONCE_DEFAULT,
-    }
+    switch!(live "BREP_BLEND_ACCEPT_ONCE", ACCEPT_ONCE_DEFAULT)
 }
 
 /// Equal-length chains are unchanged either way; unequal ones move their
@@ -292,14 +227,7 @@ pub(crate) fn accept_once_on() -> bool {
 const CHAIN_ARC_STATIONS_DEFAULT: bool = false;
 
 pub(crate) fn chain_arc_stations_on() -> bool {
-    if let Some(forced) = CHAIN_ARC_STATIONS_FOR_TEST.with(|forced| forced.get()) {
-        return forced;
-    }
-    match std::env::var("BREP_BLEND_CHAIN_ARC_STATIONS").as_deref() {
-        Ok("0") => false,
-        Ok("1") => true,
-        _ => CHAIN_ARC_STATIONS_DEFAULT,
-    }
+    switch!(live "BREP_BLEND_CHAIN_ARC_STATIONS", CHAIN_ARC_STATIONS_DEFAULT)
 }
 
 /// `BREP_BLEND_TAPER_NETWORK=0` is the escape hatch, `=1` forces it on;
@@ -307,14 +235,7 @@ pub(crate) fn chain_arc_stations_on() -> bool {
 const TAPER_NETWORK_DEFAULT: bool = true;
 
 pub(crate) fn taper_network_on() -> bool {
-    if let Some(forced) = TAPER_NETWORK_FOR_TEST.with(|forced| forced.get()) {
-        return forced;
-    }
-    match std::env::var("BREP_BLEND_TAPER_NETWORK").as_deref() {
-        Ok("0") => false,
-        Ok("1") => true,
-        _ => TAPER_NETWORK_DEFAULT,
-    }
+    switch!(live "BREP_BLEND_TAPER_NETWORK", TAPER_NETWORK_DEFAULT)
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -470,6 +391,12 @@ impl BlendOperation {
     }
 }
 
+/// Whether the innermost open blend operation is the outermost one (no
+/// nested operation inside another).
+pub(crate) fn blend_operation_outermost() -> bool {
+    BLEND_OPERATION_DEPTH.with(|depth| depth.get() <= 1)
+}
+
 impl Drop for BlendOperation {
     fn drop(&mut self) {
         BLEND_OPERATION_DEPTH.with(|depth| {
@@ -530,7 +457,7 @@ pub(crate) mod timing {
     }
 
     pub(super) fn begin_operation() {
-        let profile = std::env::var_os("BREP_PROFILE").is_some();
+        let profile = crate::profile::profile_enabled();
         TO_STDERR.with(|to_stderr| to_stderr.set(profile));
         let on = profile || CAPTURE.with(|capture| capture.get());
         ENABLED.with(|enabled| enabled.set(on));
@@ -822,19 +749,8 @@ pub(crate) use network::is_reentrant_concave;
 /// either way on a test's thread.
 const CLOSED_TRIM_READ_FIRST_DEFAULT: bool = true;
 
-thread_local! {
-    static CLOSED_TRIM_READ_FIRST_FOR_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
-}
-
 pub(crate) fn closed_trim_read_first_on() -> bool {
-    if let Some(forced) = CLOSED_TRIM_READ_FIRST_FOR_TEST.with(|forced| forced.get()) {
-        return forced;
-    }
-    match std::env::var("BREP_BLEND_CLOSED_TRIM_READ_FIRST").as_deref() {
-        Ok("0") => false,
-        Ok("1") => true,
-        _ => CLOSED_TRIM_READ_FIRST_DEFAULT,
-    }
+    switch!(live "BREP_BLEND_CLOSED_TRIM_READ_FIRST", CLOSED_TRIM_READ_FIRST_DEFAULT)
 }
 
 
@@ -854,19 +770,8 @@ pub(crate) fn closed_trim_read_first_on() -> bool {
 /// `set_closed_wall_predict_for_test` forces either way on a test's thread.
 const CLOSED_WALL_PREDICT_DEFAULT: bool = true;
 
-thread_local! {
-    static CLOSED_WALL_PREDICT_FOR_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
-}
-
 pub(crate) fn closed_wall_predict_on() -> bool {
-    if let Some(forced) = CLOSED_WALL_PREDICT_FOR_TEST.with(|forced| forced.get()) {
-        return forced;
-    }
-    match std::env::var("BREP_BLEND_CLOSED_WALL_PREDICT").as_deref() {
-        Ok("0") => false,
-        Ok("1") => true,
-        _ => CLOSED_WALL_PREDICT_DEFAULT,
-    }
+    switch!(live "BREP_BLEND_CLOSED_WALL_PREDICT", CLOSED_WALL_PREDICT_DEFAULT)
 }
 
 

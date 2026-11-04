@@ -23,11 +23,7 @@ impl CertifiedPrimitive {
 pub(crate) fn primitive_certificate_enabled() -> bool {
     // Promoted after the 98/144-case byte census. Explicit =0 restores the
     // full constructor validator; eligibility never changes geometry or errors.
-    match std::env::var("BREP_CERTIFIED_PRIMITIVES") {
-        Ok(value) => value == "1" || value == "on",
-        Err(std::env::VarError::NotPresent) => true,
-        Err(_) => false,
-    }
+    switch!(live "BREP_CERTIFIED_PRIMITIVES", true)
 }
 
 // This is an eligibility bound, never a new refusal: every input outside it

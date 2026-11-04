@@ -286,6 +286,11 @@ impl EngineState {
     pub fn metadata_json(&self) -> String {
         self.metadata.to_json_string()
     }
+
+    /// [`Self::metadata_json`] as a JSON value.
+    pub fn metadata_value(&self) -> Value {
+        self.metadata.to_json()
+    }
 }
 
 // --- EngineState: measurements + provenance (SEPARATE impl block) ------------

@@ -308,6 +308,8 @@ pub fn present(geometry: &PmiGeometry, label: [f64; 3], text: &str, style: &Layo
                 }
             }
         }
+        // A hide step draws nothing at all.
+        PmiGeometry::Hide { .. } => {}
         PmiGeometry::Datum { anchor, letter, .. } => {
             let anchor = v3(*anchor);
             let dir = unit_or(label.sub(anchor), up);
@@ -354,8 +356,13 @@ pub fn present(geometry: &PmiGeometry, label: [f64; 3], text: &str, style: &Layo
             }
         }
     }
-    // Every other annotation reads as one run centred on its label.
-    if out.texts.is_empty() && !text.is_empty() {
+    // Every other annotation reads as one run centred on its label. The
+    // display-only steps are not annotations: an explode step draws no label
+    // anywhere (owner 2026-10-26 / 2026-10-27: "Exploding a part should not
+    // result in any additional text being displayed") and a hide step draws
+    // nothing, so neither gets the fallback run — no consumer has to strip it.
+    let display_only = matches!(geometry, PmiGeometry::Explode { .. } | PmiGeometry::Hide { .. });
+    if out.texts.is_empty() && !text.is_empty() && !display_only {
         out.texts.push(TextRun {
             text: text.to_string(),
             anchor: a3(label),

@@ -955,7 +955,7 @@ pub fn settings_schema() -> Vec<SettingsField> {
         ),
         f(
             "disableStartupModel",
-            "Start with an empty document (no example model)",
+            "Start with an empty document",
             "Startup",
             FieldKind::Bool,
         ),

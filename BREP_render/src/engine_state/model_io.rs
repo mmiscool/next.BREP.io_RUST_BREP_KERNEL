@@ -130,18 +130,38 @@ impl EngineState {
     /// carrying its pose — nested sub-assemblies included. Without components
     /// the flat single-product writer is used, exactly as before.
     pub fn export_step_text_named(&mut self, document_name: &str) -> Result<String, String> {
+        self.export_step_text_selected(document_name, None)
+    }
+
+    /// [`Self::export_step_text_named`] restricted to the resident solids
+    /// named in `only` (each must be one; none may repeat). A subset is a
+    /// flat part's: a document with assembly components or a board refuses
+    /// it, and its PMI is left out, since the annotations may reference
+    /// solids the file no longer holds.
+    pub fn export_step_text_selected(&mut self, document_name: &str, only: Option<&[String]>) -> Result<String, String> {
         self.plugin_export_ready()?;
         // The component projection the structured lane places instances by is
         // the one the last run shipped (post-solve poses), so nothing has to be
         // synced here; the resident re-run below registers the geometry.
         let request: HistoryRequest = serde_json::from_value(self.run_request_value())
             .map_err(|e| format!("export STEP: history request: {e}"))?;
-        let named = self.plugin_resident_handles(&request)?;
+        let mut named = self.plugin_resident_handles(&request)?;
+        if let Some(only) = only {
+            if !self.assembly_components.is_empty() {
+                return Err("export STEP: a subset of solids is exported from a part document, not an assembly".into());
+            }
+            for name in only {
+                if !named.iter().any(|(n, _)| n == name) {
+                    return Err(format!("export STEP: `{name}` is not a solid of this model"));
+                }
+            }
+            named.retain(|(n, _)| only.contains(n));
+        }
         // A board document's BOARD — substrate, copper, via barrels — as exact
         // solids. The viewport's board is display triangles in no registry, so
         // these are handed to the writer as values, in the ROOT product beside
         // whatever the history made (`step_solids`).
-        let board = self.board_step_solids().unwrap_or_default();
+        let board = if only.is_some() { Default::default() } else { self.board_step_solids().unwrap_or_default() };
         for notice in &board.notices {
             self.push_notice_as(super::NoticeSeverity::Warning, notice.clone());
         }
@@ -161,6 +181,7 @@ impl EngineState {
         let report = request
             .pmi
             .as_ref()
+            .filter(|_| only.is_none())
             .map(|_| {
                 let _trace = crate::run_trace::span("export_pmi");
                 self.execute_plugin_history(&request).pmi
@@ -170,7 +191,7 @@ impl EngineState {
         if !annotation_errors.is_empty() {
             return Err(format!("plugin annotation export replay failed: {}", annotation_errors.join("; ")));
         }
-        let pmi = match (request.pmi.as_ref(), report.as_ref()) {
+        let pmi = match (request.pmi.as_ref().filter(|_| only.is_none()), report.as_ref()) {
             (Some(state), Some(report)) => Some(brep_kernel::StepPmi { state, report }),
             _ => None,
         };
@@ -487,31 +508,20 @@ impl EngineState {
     /// scene has no triangles.
     pub fn export_stl_text(&self) -> Result<String, String> {
         self.plugin_export_ready()?;
-        let mut out = String::from("solid brep\n");
-        let mut triangles = 0usize;
+        let mut facets = Vec::new();
         for solid in self.scene.solids() {
             let positions = &solid.mesh.positions;
             for tri in solid.mesh.indices.chunks_exact(3) {
                 let a = positions[tri[0] as usize];
                 let b = positions[tri[1] as usize];
                 let c = positions[tri[2] as usize];
-                let normal = triangle_normal(a, b, c);
-                out.push_str(&format!(
-                    "  facet normal {} {} {}\n    outer loop\n",
-                    normal[0], normal[1], normal[2]
-                ));
-                for v in [a, b, c] {
-                    out.push_str(&format!("      vertex {} {} {}\n", v[0], v[1], v[2]));
-                }
-                out.push_str("    endloop\n  endfacet\n");
-                triangles += 1;
+                facets.push((triangle_normal(a, b, c), [a, b, c]));
             }
         }
-        out.push_str("endsolid brep\n");
-        if triangles == 0 {
+        if facets.is_empty() {
             return Err("nothing to export: the scene has no triangles".into());
         }
-        Ok(out)
+        Ok(brep_kernel::write_ascii_stl("brep", facets))
     }
 
     /// Export the CURRENT display scene as Wavefront OBJ text — the same
@@ -2237,17 +2247,7 @@ const MAT4_IDENTITY: Mat4 = [
 ];
 
 /// Row-major 4×4 product `a · b`.
-fn mat4_mul(a: &Mat4, b: &Mat4) -> Mat4 {
-    let mut out = [0.0; 16];
-    for row in 0..4 {
-        for column in 0..4 {
-            out[row * 4 + column] = (0..4)
-                .map(|k| a[row * 4 + k] * b[k * 4 + column])
-                .sum();
-        }
-    }
-    out
-}
+use crate::geometry3d::mat4_mul_row_major as mat4_mul;
 
 /// Split a non-rigid world placement into `world = rigid · factor`, where
 /// `rigid` is a component pose (rotation + translation, det +1) and `factor` is

@@ -1,5 +1,6 @@
 //! Footprint editor: pads, holes, and silkscreen, working like the symbol editor.
 use super::*;
+use crate::editor_core::{EditorCore, WindowEditor, WindowSpec, editor_window};
 use crate::actions::{Action, ActionGroup, action, command, key};
 use crate::board_view::{BACKGROUND, SILK, THROUGH_HOLE, WARNING, layer_color};
 use crate::symbol_editor::{InspectorHits, LIST_SHARE, grip_under, key_word, list_height};
@@ -177,13 +178,9 @@ pub struct FootprintEditor {
     /// The symbol's pin names by number, for the Symbol pins list: a number alone
     /// says little about which pin a pad is for. Empty when the host has not said.
     pin_names: std::collections::BTreeMap<String, String>,
+    core: EditorCore<Footprint, Item, (Footprint, Point)>,
     tool: DrawTool,
-    selected: Option<Item>,
     start: Option<Point>,
-    drag: Option<(Footprint, Point)>,
-    history: History<Footprint>,
-    zoom: f32,
-    pan: Vec2,
     fit: bool,
     grid: i32,
     /// Copies, and step between them, for repeating the selected pad.
@@ -197,9 +194,9 @@ pub struct FootprintEditor {
     /// was given. Held so a selection a HOST asks for can be brought into view.
     canvas: Rect,
     error: String,
-    pending_change: Option<Change>,
     /// The Inspector's clickable widgets as it last drew them, for [`Self::hits`].
     inspector: InspectorHits,
+    toolbar_hits: InspectorHits,
     /// The pass the canvas was last drawn in: the Inspector's rects are
     /// published only while it is drawn beside it.
     canvas_pass: u64,
@@ -211,6 +208,13 @@ pub struct FootprintEditor {
     items_height: Option<f32>,
     pins_height: Option<f32>,
 }
+impl WindowEditor for FootprintEditor {
+    fn toolbar(&mut self, ui: &mut egui::Ui) { FootprintEditor::toolbar(self, ui); }
+    fn properties(&mut self, ui: &mut egui::Ui) { FootprintEditor::properties(self, ui); }
+    fn canvas(&mut self, ui: &mut egui::Ui, size: Vec2) { FootprintEditor::canvas(self, ui, size); }
+    fn validate(&self) -> Result<(), String> { FootprintEditor::validate(self) }
+    fn error(&mut self) -> &mut String { &mut self.error }
+}
 impl FootprintEditor {
     pub fn new(footprint: Footprint, target: Option<Uuid>, pins: Vec<String>) -> Self {
         Self {
@@ -218,21 +222,17 @@ impl FootprintEditor {
             target,
             pins,
             pin_names: Default::default(),
+            core: EditorCore::new(0.08),
             tool: DrawTool::Select,
-            selected: None,
             start: None,
-            drag: None,
-            history: History::default(),
-            zoom: 0.08,
-            pan: Vec2::ZERO,
             fit: true,
             grid: 50,
             repeat: (1, 0, 1270),
             pending_number: None,
             canvas: Rect::from_min_size(Pos2::ZERO, Vec2::new(800., 600.)),
             error: String::new(),
-            pending_change: None,
             inspector: InspectorHits::default(),
+            toolbar_hits: InspectorHits::default(),
             canvas_pass: 0,
             listed: None,
             items_height: None,
@@ -258,18 +258,15 @@ impl FootprintEditor {
     /// change; the properties panel uses one key for all of its fields, so consecutive
     /// edits there merge whichever field they touched.
     fn record_as(&mut self, before: Footprint, coalesce: Option<&str>) {
-        if before != self.footprint {
-            self.history.record(before, &self.footprint);
-            self.note_change(coalesce.map(str::to_owned));
-        }
+        self.core.record(before, &self.footprint, coalesce);
     }
     fn note_change(&mut self, coalesce: Option<String>) {
-        Change::record(&mut self.pending_change, coalesce);
+        self.core.note_change(coalesce);
     }
     /// The edits made since the last call, merged into one. A host that keeps the
     /// footprint in its own file calls this once a frame and stores [`Self::footprint`].
     pub fn take_change(&mut self) -> Option<Change> {
-        self.pending_change.take()
+        self.core.take_change()
     }
     /// The drawing tool that is up, by the last word of the action that picks it
     /// (`pads.tool.<name>`). Read-only, for a host that publishes it.
@@ -286,7 +283,7 @@ impl FootprintEditor {
     /// Where the canvas is looking: the footprint origin's offset from the canvas centre in
     /// points, and the zoom in points per micrometre. Read-only, for a host that shows it.
     pub fn pan_zoom(&self) -> (Vec2, f32) {
-        (self.pan, self.zoom)
+        (self.core.pan, self.core.zoom)
     }
     /// The pin numbers of the symbol these pads belong to, so the editor lists the
     /// pins that still have no pad. For a host that keeps the symbol beside the
@@ -321,7 +318,7 @@ impl FootprintEditor {
     /// empty. The symbol-wide identity a host joins on, exactly as
     /// [`SymbolEditor::selected_pin`] is; `Item` stays private.
     pub fn selected_pad(&self) -> Option<&str> {
-        match self.selected {
+        match self.core.selected {
             Some(Item::Pad(index)) => {
                 self.footprint.pads.get(index).map(|pad| pad.number.as_str())
             }
@@ -334,19 +331,19 @@ impl FootprintEditor {
     pub fn select_pad(&mut self, number: &str) -> bool {
         match self.footprint.pads.iter().position(|pad| pad.number == number) {
             Some(index) => {
-                self.selected = Some(Item::Pad(index));
+                self.core.selected = Some(Item::Pad(index));
                 // And bring it into view if it is off the canvas. A host's jump
                 // from a connection point has to SHOW the pad, and the canvas may
                 // be zoomed in on another corner of the footprint; a pad already on
                 // screen does not move it.
                 let at = self.footprint.pads[index].at;
-                let centre = self.canvas.center() + self.pan;
+                let centre = self.canvas.center() + self.core.pan;
                 if !self
                     .canvas
                     .shrink(12.)
-                    .contains(on_canvas(centre, self.zoom, at))
+                    .contains(on_canvas(centre, self.core.zoom, at))
                 {
-                    self.pan = -Vec2::new(at.x as f32, at.y as f32) * self.zoom;
+                    self.core.pan = -Vec2::new(at.x as f32, at.y as f32) * self.core.zoom;
                 }
                 true
             }
@@ -360,10 +357,10 @@ impl FootprintEditor {
     /// given — the mapping the canvas paints with — and then the Inspector's
     /// widgets, `inspector:<thing>`, where [`Self::properties`] last drew them.
     pub fn hits(&self, canvas: Rect) -> Vec<(String, Rect)> {
-        let center = canvas.center() + self.pan;
-        let screen = |p: Point| on_canvas(center, self.zoom, p);
+        let center = canvas.center() + self.core.pan;
+        let screen = |p: Point| on_canvas(center, self.core.zoom, p);
         let pads = self.footprint.pads.iter().enumerate().map(|(i, pad)| {
-            let size = Vec2::new(pad.size.x.abs() as f32, pad.size.y.abs() as f32) * self.zoom;
+            let size = Vec2::new(pad.size.x.abs() as f32, pad.size.y.abs() as f32) * self.core.zoom;
             let rect = Rect::from_center_size(screen(pad.at), size.max(Vec2::splat(6.)));
             (pad_key(i, pad), rect)
         });
@@ -374,13 +371,14 @@ impl FootprintEditor {
                 .max_by(|a, b| a.0.distance(a.1).total_cmp(&b.0.distance(b.1)))?;
             Some((format!("silk:{i}"), Rect::from_center_size(a.lerp(b, 0.5), Vec2::splat(8.))))
         });
-        pads.chain(silk).chain(self.inspector.shown(self.canvas_pass)).collect()
+        pads.chain(silk).chain(self.inspector.shown(self.canvas_pass))
+            .chain(self.toolbar_hits.shown(self.canvas_pass)).collect()
     }
     /// The index of the selected silkscreen line, or `None` when the selection
     /// is a pad or empty — [`Self::selected_pad`]'s twin for silk, which has
     /// no number and is named by its place in the list, as `silk:<index>` is.
     pub fn selected_silk(&self) -> Option<usize> {
-        match self.selected {
+        match self.core.selected {
             Some(Item::Silk(index)) if index < self.footprint.silk.len() => Some(index),
             _ => None,
         }
@@ -389,19 +387,19 @@ impl FootprintEditor {
     /// undo history starts afresh and the load is not reported by [`Self::take_change`].
     pub fn set_footprint(&mut self, footprint: Footprint) {
         self.footprint = footprint;
-        self.history = History::default();
-        self.selected = None;
-        self.drag = None;
+        self.core.history = History::default();
+        self.core.selected = None;
+        self.core.drag = None;
         self.start = None;
         self.error.clear();
-        self.pending_change = None;
+        self.core.pending_change = None;
     }
     /// Run a command from [`pad_actions`] by id, as a click on its button does.
     pub fn run_action(&mut self, id: &str) -> bool {
         crate::actions::run_action(self, pad_actions().iter(), id)
     }
     fn set_tool(&mut self, tool: DrawTool) {
-        if let Some((before, _)) = self.drag.take() {
+        if let Some((before, _)) = self.core.drag.take() {
             self.footprint = before;
         }
         // A pin waiting for a pad survives a change between the two pad tools —
@@ -414,34 +412,17 @@ impl FootprintEditor {
         self.start = None;
     }
     fn undo(&mut self) {
-        if self.history.can_undo() {
-            self.history.undo(&mut self.footprint);
-            self.selected = None;
-            self.note_change(None);
-        }
+        self.core.undo(&mut self.footprint);
     }
     /// Undo or redo for the keyboard or a host, unless a drag is still recording.
     pub(crate) fn step_history(&mut self, key: HistoryKey) {
-        if self.drag.is_none() {
-            match key {
-                HistoryKey::Undo => self.undo(),
-                HistoryKey::Redo => self.redo(),
-            }
-        }
+        self.core.step_history(&mut self.footprint, key);
     }
     pub(crate) fn can_step_history(&self, key: HistoryKey) -> bool {
-        self.drag.is_none()
-            && match key {
-                HistoryKey::Undo => self.history.can_undo(),
-                HistoryKey::Redo => self.history.can_redo(),
-            }
+        self.core.can_step_history(key)
     }
     fn redo(&mut self) {
-        if self.history.can_redo() {
-            self.history.redo(&mut self.footprint);
-            self.selected = None;
-            self.note_change(None);
-        }
+        self.core.redo(&mut self.footprint);
     }
     fn validate(&self) -> Result<(), String> {
         self.footprint.validate()
@@ -506,7 +487,7 @@ impl FootprintEditor {
             self.tool = DrawTool::Pad;
         }
         self.start = None;
-        self.drag = None;
+        self.core.drag = None;
         self.pending_number = Some(number);
     }
     /// Symbol pins with no pad of the same number.
@@ -542,14 +523,18 @@ impl FootprintEditor {
         }
     }
     fn grid_combo(&mut self, ui: &mut egui::Ui, salt: &str) -> egui::Response {
-        egui::ComboBox::from_id_salt(salt)
-            .selected_text(format!("Grid {}", grid_text(self.grid)))
-            .show_ui(ui, |ui| {
-                for grid in GRIDS {
-                    ui.selectable_value(&mut self.grid, grid, grid_text(grid));
-                }
-            })
-            .response
+        let ids: Vec<_> = GRIDS.iter().map(i32::to_string).collect();
+        let labels: Vec<_> = GRIDS.iter().map(|&grid| grid_text(grid)).collect();
+        let choices: Vec<_> = GRIDS.iter().zip(&ids).zip(&labels)
+            .map(|((&grid, id), label)| (grid, id.as_str(), label.as_str())).collect();
+        ui.push_id(salt, |ui| {
+            if salt == "footprint-grid" {
+                self.toolbar_hits.begin(ui.ctx());
+                self.toolbar_hits.enum_dropdown(ui, "toolbar_grid", &choices, &mut self.grid)
+            } else {
+                self.inspector.enum_dropdown(ui, "grid", &choices, &mut self.grid)
+            }
+        }).inner
     }
     /// Pairs of copper pads closer than [`min_pad_gap`], with their gap in
     /// micrometres, closest first. Two pads of ONE number are one pin (a
@@ -665,54 +650,19 @@ impl FootprintEditor {
     /// The editor in a window of its own, with Apply and Cancel for the standalone app.
     /// Returns Some(true) on Apply, Some(false) on Cancel or close.
     pub(crate) fn window(&mut self, ctx: &egui::Context) -> Option<bool> {
-        let mut open = true;
-        let mut action = None;
         // While this window is open the keyboard history is its own.
         self.run_shortcuts(ctx);
-        egui::Window::new("Footprint editor")
-            .id(egui::Id::new("footprint_editor"))
-            .default_size(Vec2::new(980., 680.))
-            .min_size(Vec2::new(660., 460.))
-            .open(&mut open)
-            .collapsible(false)
-            .show(ctx, |ui| {
-                self.toolbar(ui);
-                ui.separator();
-                ui.horizontal_top(|ui| {
-                    let height = (ui.available_height() - 55.).max(300.);
-                    ui.allocate_ui_with_layout(
-                        Vec2::new(250., height),
-                        egui::Layout::top_down(egui::Align::Min),
-                        |ui| self.properties(ui),
-                    );
-                    let size = Vec2::new(ui.available_width().max(300.), height);
-                    self.canvas(ui, size);
-                });
-                ui.separator();
-                if !self.error.is_empty() {
-                    ui.colored_label(ui.visuals().error_fg_color, &self.error);
-                }
-                ui.horizontal(|ui| {
-                    if ui.button("Apply footprint").clicked() {
-                        match self.validate() {
-                            Ok(()) => action = Some(true),
-                            Err(e) => self.error = e,
-                        }
-                    }
-                    if ui.button("Cancel").clicked() {
-                        action = Some(false);
-                    }
-                    ui.small(if self.target.is_some() {
-                        "Updates this part and the session footprint library."
-                    } else {
-                        "Adds or updates this footprint in the session library."
-                    });
-                });
-            });
-        if !open {
-            action = Some(false);
-        }
-        action
+        let hint = if self.target.is_some() {
+            "Updates this part and the session footprint library."
+        } else {
+            "Adds or updates this footprint in the session library."
+        };
+        editor_window(self, ctx, WindowSpec {
+            title: "Footprint editor", id: "footprint_editor",
+            default_size: Vec2::new(980., 680.), min_size: Vec2::new(660., 460.),
+            inspector_width: 250., apply: "Apply footprint", hint,
+            measure_canvas_after_inspector: false,
+        })
     }
     /// The footprint's name, what its items are on, the symbol's pins, and the
     /// selected item's fields.
@@ -761,8 +711,7 @@ impl FootprintEditor {
         // toolbar, which carries it too, is not drawn in the app.
         ui.horizontal(|ui| {
             ui.label("Snap");
-            let grid = self.grid_combo(ui, "footprint-grid-inspector");
-            self.inspector.mark("grid", &grid);
+            self.grid_combo(ui, "footprint-grid-inspector");
         });
         // Pads closer than a board allows are found here, where they are drawn,
         // not on the board after the part is placed and routed.
@@ -790,7 +739,7 @@ impl FootprintEditor {
             self.inspector.mark("gap_warning", &warning);
         }
         // The selection came from elsewhere since the lists were last drawn.
-        let reveal = self.selected != self.listed;
+        let reveal = self.core.selected != self.listed;
         self.pins_section(ui, pane, reveal);
         ui.separator();
         ui.label("Items");
@@ -812,8 +761,8 @@ impl FootprintEditor {
             .collect();
         // Read again: a pin's row just picked is a selection the Items list
         // has not shown.
-        let reveal = self.selected != self.listed;
-        let selected = self.selected;
+        let reveal = self.core.selected != self.listed;
+        let selected = self.core.selected;
         let mut pick = None;
         let keys: Vec<String> = self
             .footprint
@@ -864,21 +813,21 @@ impl FootprintEditor {
             self.inspector.mark("items_grip", &grip);
         }
         if let Some(item) = pick {
-            self.selected = Some(item);
+            self.core.selected = Some(item);
         }
         // A row clicked is on screen already: only a selection made elsewhere
         // scrolls the lists.
-        self.listed = self.selected;
+        self.listed = self.core.selected;
         ui.separator();
         ui.label("Item properties");
-        match self.selected {
+        match self.core.selected {
             Some(Item::Pad(i)) if i < self.footprint.pads.len() => self.pad_properties(ui, i),
             Some(Item::Silk(i)) if i < self.footprint.silk.len() => self.silk_properties(ui, i),
             _ => {
                 ui.small("Select an item on the canvas or in the list.");
             }
         }
-        if self.selected.is_some() {
+        if self.core.selected.is_some() {
             let delete = ui.button("Delete item");
             self.inspector.mark("delete", &delete);
             if delete.clicked() {
@@ -909,7 +858,7 @@ impl FootprintEditor {
                 (pin.clone(), self.pin_row(pin), pad)
             })
             .collect();
-        let selected = self.selected;
+        let selected = self.core.selected;
         let armed = self.pending_number.clone();
         let (mut pick, mut place, mut cancel) = (None, None, false);
         let hits = &mut self.inspector;
@@ -966,7 +915,7 @@ impl FootprintEditor {
             self.inspector.mark("pins_grip", &grip);
         }
         if let Some(index) = pick {
-            self.selected = Some(Item::Pad(index));
+            self.core.selected = Some(Item::Pad(index));
         }
         if let Some(pin) = place {
             self.place_pad_for(pin);
@@ -1001,7 +950,7 @@ impl FootprintEditor {
             self.inspector.mark("make_pad", &make);
             if make.clicked() {
                 self.footprint.silk.remove(i);
-                self.selected = Some(Item::Pad(self.footprint.pads.len()));
+                self.core.selected = Some(Item::Pad(self.footprint.pads.len()));
                 self.footprint.pads.push(Pad {
                     number,
                     at,
@@ -1031,18 +980,15 @@ impl FootprintEditor {
             (Some(_), true) => PadKind::ThroughHole,
             (Some(_), false) => PadKind::Unplated,
         };
-        let choice = egui::ComboBox::from_label("Type")
-            .selected_text(kind_name(kind))
-            .show_ui(ui, |ui| {
-                for k in [
-                    PadKind::SurfaceMount,
-                    PadKind::ThroughHole,
-                    PadKind::Unplated,
-                ] {
-                    ui.selectable_value(&mut kind, k, kind_name(k));
-                }
-            });
-        hits.mark("type", &choice.response);
+        let choices = [
+            (PadKind::SurfaceMount, "surface_mount", kind_name(PadKind::SurfaceMount)),
+            (PadKind::ThroughHole, "through_hole", kind_name(PadKind::ThroughHole)),
+            (PadKind::Unplated, "unplated", kind_name(PadKind::Unplated)),
+        ];
+        ui.horizontal(|ui| {
+            hits.enum_dropdown(ui, "type", &choices, &mut kind);
+            ui.label("Type");
+        });
         let default_drill = (pad.size.x.min(pad.size.y) * 6 / 10 / 50 * 50).max(100);
         match kind {
             PadKind::SurfaceMount => {
@@ -1121,14 +1067,15 @@ impl FootprintEditor {
             }
         }
         ui.separator();
-        let shape = egui::ComboBox::from_label("Shape")
-            .selected_text(shape_name(pad.shape))
-            .show_ui(ui, |ui| {
-                for shape in [PadShape::Rect, PadShape::Circle, PadShape::Oval] {
-                    ui.selectable_value(&mut pad.shape, shape, shape_name(shape));
-                }
-            });
-        hits.mark("shape", &shape.response);
+        let choices = [
+            (PadShape::Rect, "rect", shape_name(PadShape::Rect)),
+            (PadShape::Circle, "circle", shape_name(PadShape::Circle)),
+            (PadShape::Oval, "oval", shape_name(PadShape::Oval)),
+        ];
+        ui.horizontal(|ui| {
+            hits.enum_dropdown(ui, "shape", &choices, &mut pad.shape);
+            ui.label("Shape");
+        });
         point_fields(ui, hits, "Position", &mut pad.at);
         ui.label("Size");
         mm_field(ui, hits, "Width", &mut pad.size.x, 0.01..=100.);
@@ -1188,10 +1135,10 @@ impl FootprintEditor {
             }
             self.footprint.pads.push(pad);
         }
-        self.selected = Some(Item::Pad(self.footprint.pads.len() - 1));
+        self.core.selected = Some(Item::Pad(self.footprint.pads.len() - 1));
     }
     fn remove_selected(&mut self) {
-        match self.selected.take() {
+        match self.core.selected.take() {
             Some(Item::Pad(i)) if i < self.footprint.pads.len() => {
                 self.footprint.pads.remove(i);
             }
@@ -1202,7 +1149,7 @@ impl FootprintEditor {
         }
     }
     fn hit(&self, p: Pos2, screen: impl Fn(Point) -> Pos2, world: Point) -> Option<Item> {
-        let tolerance = f64::from(5. / self.zoom);
+        let tolerance = f64::from(5. / self.core.zoom);
         for (i, pad) in self.footprint.pads.iter().enumerate().rev() {
             if Shape::pad(pad.at, pad.size, pad.shape).distance_to_point(world) <= tolerance {
                 return Some(Item::Pad(i));
@@ -1227,24 +1174,24 @@ impl FootprintEditor {
             let (mut min, mut max) = self.footprint.bounds();
             min = Point::new(min.x.min(-2000), min.y.min(-2000));
             max = Point::new(max.x.max(2000), max.y.max(2000));
-            self.zoom = crate::valid_zoom(((rect.width() - 70.) / (max.x - min.x) as f32)
+            self.core.zoom = crate::valid_zoom(((rect.width() - 70.) / (max.x - min.x) as f32)
                 .min((rect.height() - 70.) / (max.y - min.y) as f32)
-                .min(1.), self.zoom);
-            self.pan =
-                -Vec2::new((min.x + max.x) as f32 / 2., (min.y + max.y) as f32 / 2.) * self.zoom;
+                .min(1.), self.core.zoom);
+            self.core.pan =
+                -Vec2::new((min.x + max.x) as f32 / 2., (min.y + max.y) as f32 / 2.) * self.core.zoom;
             self.fit = false;
         }
         if response.dragged_by(PointerButton::Secondary)
             || response.dragged_by(PointerButton::Middle)
         {
-            self.pan += ui.input(|i| i.pointer.delta());
+            self.core.pan += ui.input(|i| i.pointer.delta());
         }
         if response.hovered() {
             let scroll = ui.input(|i| i.smooth_scroll_delta.y);
-            self.zoom = crate::scaled_zoom(self.zoom, (scroll * 0.002).exp());
+            self.core.zoom = crate::scaled_zoom(self.core.zoom, (scroll * 0.002).exp());
         }
-        let zoom = self.zoom;
-        let center = rect.center() + self.pan;
+        let zoom = self.core.zoom;
+        let center = rect.center() + self.core.pan;
         let screen = |p: Point| on_canvas(center, zoom, p);
         let raw = |p: Pos2| {
             Point::new(
@@ -1257,18 +1204,18 @@ impl FootprintEditor {
             && let Some(p) = ui.input(|i| i.pointer.press_origin())
         {
             if self.tool == DrawTool::Select {
-                self.selected = self.hit(p, screen, raw(p));
-                self.drag = self.selected.map(|_| (self.footprint.clone(), raw(p)));
+                self.core.selected = self.hit(p, screen, raw(p));
+                self.core.drag = self.core.selected.map(|_| (self.footprint.clone(), raw(p)));
             } else {
                 self.start = Some(self.snap(raw(p)));
             }
         }
-        if let (Some((before, start)), Some(p)) = (&self.drag, pointer) {
+        if let (Some((before, start)), Some(p)) = (&self.core.drag, pointer) {
             let q = raw(p);
             // Snap the offset so items that sit off the grid keep their position relative to it.
             let delta = self.snap(Point::new(q.x - start.x, q.y - start.y));
             self.footprint = before.clone();
-            match self.selected {
+            match self.core.selected {
                 Some(Item::Pad(i)) => {
                     let pad = &mut self.footprint.pads[i];
                     pad.at = pad.at.offset(delta);
@@ -1282,7 +1229,7 @@ impl FootprintEditor {
             }
         }
         if response.drag_stopped_by(PointerButton::Primary) {
-            if let Some((before, _)) = self.drag.take() {
+            if let Some((before, _)) = self.core.drag.take() {
                 self.record(before);
             }
             if let Some(start) = self.start.take()
@@ -1300,18 +1247,18 @@ impl FootprintEditor {
                     let at = self.snap(raw(p));
                     self.add_item(at, at);
                 }
-                DrawTool::Select => self.selected = self.hit(p, screen, raw(p)),
+                DrawTool::Select => self.core.selected = self.hit(p, screen, raw(p)),
                 _ => {}
             }
         }
         if response.secondary_clicked()
             && let Some(p) = pointer
         {
-            self.selected = self.hit(p, screen, raw(p));
+            self.core.selected = self.hit(p, screen, raw(p));
         }
         response.context_menu(|ui| {
             menu_ui(ui);
-            if self.selected.is_some() && ui.button("Delete item").clicked() {
+            if self.core.selected.is_some() && ui.button("Delete item").clicked() {
                 let before = self.footprint.clone();
                 self.remove_selected();
                 self.record(before);
@@ -1416,7 +1363,7 @@ impl FootprintEditor {
             if let Some(colour) = link_ring(self.link(pad)) {
                 paint_shape(shape, None, Some(Stroke::new(RING_WIDTH, colour)), RING_GAP);
             }
-            if self.selected == Some(Item::Pad(i)) {
+            if self.core.selected == Some(Item::Pad(i)) {
                 paint_shape(shape, None, Some(Stroke::new(2., ACCENT)), 0.);
             }
         }
@@ -1441,7 +1388,7 @@ impl FootprintEditor {
             );
         }
         for (i, line) in self.footprint.silk.iter().enumerate() {
-            let color = if self.selected == Some(Item::Silk(i)) {
+            let color = if self.core.selected == Some(Item::Silk(i)) {
                 ACCENT
             } else {
                 SILK
@@ -1454,7 +1401,7 @@ impl FootprintEditor {
         // Hovering names the item under the pointer and says what it is on. The
         // canvas is where a user looks first, and a number drawn on a pad does not
         // say whether the symbol has a pin of that number.
-        if self.drag.is_none()
+        if self.core.drag.is_none()
             && self.start.is_none()
             && let Some(p) = ui
                 .input(|i| i.pointer.hover_pos())
@@ -1474,7 +1421,7 @@ impl FootprintEditor {
         // is not where the pointer is. At 50 µm a pointer at 1.27 mm put its pad
         // at 1.25, and nothing said so until the Inspector's Position field.
         if self.tool != DrawTool::Select
-            && self.drag.is_none()
+            && self.core.drag.is_none()
             && let Some(p) = ui.input(|i| i.pointer.hover_pos()).filter(|p| rect.contains(*p))
         {
             let at = self.snap(raw(p));
@@ -1537,7 +1484,7 @@ impl FootprintEditor {
                     Some(pin) if !self.footprint.pads.iter().any(|p| p.number == pin) => pin,
                     _ => self.next_number(),
                 };
-                self.selected = Some(Item::Pad(self.footprint.pads.len()));
+                self.core.selected = Some(Item::Pad(self.footprint.pads.len()));
                 self.footprint.pads.push(Pad {
                     number,
                     at,
@@ -1570,7 +1517,7 @@ impl FootprintEditor {
                             .collect()
                     }
                 };
-                self.selected = Some(Item::Silk(self.footprint.silk.len()));
+                self.core.selected = Some(Item::Silk(self.footprint.silk.len()));
                 self.footprint.silk.push(line);
             }
             DrawTool::Select => {}
@@ -1655,10 +1602,10 @@ static PAD_ACTIONS: &[Action<FootprintEditor>] = &[
     .enabled_when(|e| e.can_step_history(HistoryKey::Redo)),
     pad_action("pads.fit", "Fit", ActionGroup::Zoom, |e| e.fit = true).keys(&[key(Key::F)]),
     pad_action("pads.zoom_in", "Zoom +", ActionGroup::Zoom, |e| {
-        e.zoom = crate::scaled_zoom(e.zoom, 1.25)
+        e.core.zoom = crate::scaled_zoom(e.core.zoom, 1.25)
     }),
     pad_action("pads.zoom_out", "Zoom −", ActionGroup::Zoom, |e| {
-        e.zoom = crate::scaled_zoom(e.zoom, 1.0 / 1.25)
+        e.core.zoom = crate::scaled_zoom(e.core.zoom, 1.0 / 1.25)
     }),
     grid_action!("pads.grid.10", "Grid 0.01 mm", 10),
     grid_action!("pads.grid.50", "Grid 0.05 mm", 50),
@@ -1674,7 +1621,7 @@ static PAD_ACTIONS: &[Action<FootprintEditor>] = &[
         e.record(before);
     })
     .keys(&[key(Key::Delete), key(Key::Backspace)])
-    .enabled_when(|e| e.selected.is_some()),
+    .enabled_when(|e| e.core.selected.is_some()),
 ];
 
 /// The pad a drawn outline would be, when the outline is one of the two shapes a

@@ -1,9 +1,16 @@
 use crate::{KernelRefusal, KernelStage, OrRefuse};
 use super::*;
 use super::types::{Chain, ChainSource};
-use super::sampling::{enforce_boundary_crossing_parity, refine_near_hints, sag_refine_chain, sample_chain, trimmed_curve};
-use super::loops::{build_loop, edge_for, interior_points, pcurve_for, point_in_polygon, vertex_point};
+use super::sampling::{enforce_boundary_crossing_parity, refine_near_hints, sag_refine_chain, sample_boundary_chain, sample_chain, trimmed_curve};
+use super::loops::{build_loop, edge_for, interior_points, pcurve_for, point_in_polygon, segment_tag, tag_chain, vertex_point};
 use super::loop_split::{fragments_agree, loop_split_census, loop_split_face, loop_split_mode, LoopSplitMode};
+/// `BREP_BOUNDARY_VERTEX_HINTS=0|off` restores boundary sampling that is blind
+/// to the face's other loops (see the BOUNDARY-VERTEX HINTS note in
+/// `fragment_face`).
+fn boundary_vertex_hints_enabled() -> bool {
+    switch!("BREP_BOUNDARY_VERTEX_HINTS", true)
+}
+
 /// Imprint id-index shared across every face of one operand. Built ONCE in
 /// `fragment_solid`; without it each face rebuilt `pieces_by_id`/`vertex_by_id`
 /// over ALL pieces (O(F*(P + P*V))) and linear-scanned `by_face`. Lookup-only,
@@ -146,7 +153,7 @@ fn source_loop_winding_negative(face: &FaceRecord) -> Result<Option<bool>, Kerne
         let mut area = 0.0;
         for (index, point) in points.iter().enumerate() {
             let next = points[(index + 1) % points.len()];
-            area += 0.5 * (point.x * next.y - next.x * point.y);
+            area += 0.5 * (crate::polygon::area_term([point.x, point.y], [next.x, next.y]));
         }
         if best.map(|current: f64| area.abs() > current.abs()).unwrap_or(true) {
             best = Some(area);
@@ -291,7 +298,10 @@ fn fragment_face_stages(
             x: (u[0] + u[1]) / 2.0,
             y: (v[0] + v[1]) / 2.0,
         };
-        if parameter_point_in_face(face, uv, 1e-9).or_refuse(KernelStage::Fragment, "parameter_point_in_face")? != PolygonClass::Inside {
+        let probe_started = profile.enabled.then(Instant::now);
+        let centre_inside = parameter_point_in_face(face, uv, 1e-9).or_refuse(KernelStage::Fragment, "parameter_point_in_face")? == PolygonClass::Inside;
+        if let Some(started) = probe_started { profile.uncut_probe += started.elapsed(); }
+        if !centre_inside {
             // Trimmed faces need the arrangement path even without cuts to
             // find a point in their actual outer loop.
         } else {
@@ -301,38 +311,14 @@ fn fragment_face_stages(
                     x: u[0] + (u[1] - u[0]) * fu,
                     y: v[0] + (v[1] - v[0]) * fv,
                 };
-                if parameter_point_in_face(face, candidate, 1e-9).or_refuse(KernelStage::Fragment, "parameter_point_in_face")? == PolygonClass::Inside {
+                let probe_started = profile.enabled.then(Instant::now);
+                let inside = parameter_point_in_face(face, candidate, 1e-9).or_refuse(KernelStage::Fragment, "parameter_point_in_face")? == PolygonClass::Inside;
+                if let Some(started) = probe_started { profile.uncut_probe += started.elapsed(); }
+                if inside {
                     extra_test_points.push(face.surface.evaluate(candidate.x, candidate.y).or_refuse(KernelStage::Fragment, "evaluate")?);
                 }
             }
-            let untouched = vec![FaceFragmentRecord {
-                operand,
-                source_face_id: face.id,
-                surface: face.surface.clone(),
-                same_sense: face.same_sense,
-                loops: face
-                    .loops
-                    .iter()
-                    .map(|loop_record| FragmentLoop {
-                        coedges: loop_record
-                            .coedges
-                            .iter()
-                            .map(|coedge| FragmentCoedge {
-                                source: FragmentEdgeSource::Boundary {
-                                    operand,
-                                    edge_id: coedge.edge_id,
-                                },
-                                forward: coedge.forward,
-                                pcurve: coedge.pcurve.clone(),
-                            })
-                            .collect(),
-                    })
-                    .collect(),
-                test_point: face.surface.evaluate(uv.x, uv.y).or_refuse(KernelStage::Fragment, "evaluate")?,
-                test_uv: uv,
-                extra_test_points,
-                order: None,
-            }];
+            let untouched = vec![untouched_fragment(face, operand, uv, extra_test_points)?];
             profile.untouched += profile.lap(lap_start);
             return Ok(untouched);
         }
@@ -365,6 +351,17 @@ fn fragment_face_stages(
         *lap_start = profile.enabled.then(Instant::now);
     }
     let arranged = fragment_face_arranged(solid, operand, face, face_key, piece_ids, index, profile, lap_start);
+    // A face no section touches that the arrangement answered with NOTHING is
+    // not gone: it is one fragment, itself, and all it needs is a point of
+    // its own material, found beside its trim (`trim_interior_probe`). The
+    // arrangement keeps every face it does split (a pinched loop into two).
+    if piece_ids.is_empty() && trim_probe_enabled() && matches!(&arranged, Ok(fragments) if fragments.is_empty()) {
+        let u = KnotVector::new(face.surface.knots_u.clone(), face.surface.degree_u).or_refuse(KernelStage::Fragment, "new")?.domain();
+        let v = KnotVector::new(face.surface.knots_v.clone(), face.surface.degree_v).or_refuse(KernelStage::Fragment, "new")?.domain();
+        if let Some((uv, extra_test_points)) = trim_interior_probe(face, u, v)? {
+            return Ok(vec![untouched_fragment(face, operand, uv, extra_test_points)?]);
+        }
+    }
     if let Some(split) = split_result {
         let verdict = match (&split, &arranged) {
             (Err(decline), _) => format!("declined {decline}"),
@@ -740,7 +737,7 @@ fn fragment_face_arranged(
             segments.push(Segment2 {
                 a: pair[0],
                 b: pair[1],
-                tag: json!({ "chain": chain_index, "seg": segment_index }),
+                tag: segment_tag(chain_index, segment_index),
             });
         }
         chains.push(Chain {
@@ -787,6 +784,37 @@ fn fragment_face_arranged(
     // seam-image copy — which is the period window the face's material lives
     // in. See the cut-chain period lift below.
     let mut band_hull = [[f64::INFINITY, f64::NEG_INFINITY]; 2];
+    // BOUNDARY-VERTEX HINTS (2026-11-02): a curved boundary chord is refined
+    // where ANOTHER boundary vertex of the face lies within its length, exactly
+    // as `refine_near_hints` already refines it near a cut's endpoints.
+    // `sample_boundary_chain` only keeps a chord within a ten-thousandth of the
+    // domain diagonal of its pcurve, and that bound cannot see a second loop:
+    // the plate's top face (diagonal 222) drew its r 10.7 blend-corner arc at
+    // 16 chords sagging 0.0128, while the corner vertex of the hole the earlier
+    // subtracts cut sits 0.011 inside that arc. The hole loop poked through the
+    // outer loop's polyline, the arrangement cut the rim at the chord crossings
+    // (0.04 from the true arc, on the far side of the hole vertex), and the
+    // subtract refused with four one-use rim edges and a 0.0125 vertex gap. The
+    // face's own vertices are hints, so a chord that a neighbouring vertex
+    // approaches within its length is drawn sixteen times finer there (sag 5e-5
+    // against the 0.011 clearance). A chord's own endpoints are not hints for
+    // it (every chord ends at a vertex), and a straight pcurve has no chords to
+    // refine. Escape hatch `BREP_BOUNDARY_VERTEX_HINTS=0|off`.
+    let boundary_vertex_hints: Vec<Vec2> = if boundary_vertex_hints_enabled() {
+        let mut hints = Vec::new();
+        for loop_record in &face.loops {
+            for coedge in &loop_record.coedges {
+                let [start, end] = coedge.pcurve.domain().or_refuse(KernelStage::Fragment, "domain")?;
+                for parameter in [start, end] {
+                    let point = coedge.pcurve.evaluate(parameter).or_refuse(KernelStage::Fragment, "evaluate")?;
+                    hints.push(Vec2 { x: point.x, y: point.y });
+                }
+            }
+        }
+        hints
+    } else {
+        Vec::new()
+    };
     for (loop_index, loop_record) in face.loops.iter().enumerate() {
         // SEAM-HOP UNWRAP: a loop whose pcurves are drawn IN-DOMAIN but hop
         // the seam between consecutive coedges (t91's face 675: the boundary
@@ -829,12 +857,30 @@ fn fragment_face_arranged(
                 .get(coedge_index)
                 .copied()
                 .unwrap_or([0.0, 0.0]);
-            let initial = sample_chain(&coedge.pcurve)?;
             // Adaptive samples are not uniformly spaced in parameter. Do not
             // feed them to refine_near_hints, which assumes uniform input.
             let boundary_points = if strip_resolution.is_some() {
+                let initial = sample_chain(&coedge.pcurve)?;
                 sag_refine_chain(&coedge.pcurve, initial, sampling_bound)?.0
-            } else { refine_near_hints(&initial, &coedge.pcurve, &cut_hints)? };
+            } else {
+                // A curved boundary is drawn within a ten-thousandth of the
+                // domain's diagonal of itself (`sample_boundary_chain`), so a
+                // narrow face's two rims cannot cross each other.
+                let initial = sample_boundary_chain(&coedge.pcurve, (diagonal * 1e-4).max(sampling_bound), 1024)?;
+                if boundary_vertex_hints.is_empty() || initial.len() < 3 {
+                    refine_near_hints(&initial, &coedge.pcurve, &cut_hints)?
+                } else {
+                    let own = [initial[0], initial[initial.len() - 1]];
+                    let hints: Vec<Vec2> = cut_hints
+                        .iter()
+                        .copied()
+                        .chain(boundary_vertex_hints.iter().copied().filter(|hint| {
+                            own.iter().all(|end| hint.sub(*end).length() > arrangement_tolerance)
+                        }))
+                        .collect();
+                    refine_near_hints(&initial, &coedge.pcurve, &hints)?
+                }
+            };
             let points: Vec<Vec2> = boundary_points
                     .into_iter()
                     .map(|point| {
@@ -896,7 +942,7 @@ fn fragment_face_arranged(
                     min_u = min_u.min(point.x);
                     max_u = max_u.max(point.x);
                     let next = flat[(index + 1) % flat.len()];
-                    area += point.x * next.y - next.x * point.y;
+                    area += crate::polygon::area_term([point.x, point.y], [next.x, next.y]);
                 }
                 // Full-span discrimination must use the UNWRAPPED width: a
                 // straddling hole's raw control hull spans the whole domain
@@ -920,7 +966,7 @@ fn fragment_face_arranged(
                         && hull[1] >= u_domain[1] - 1e-6 * span
                 });
                 if compact && is_hole && has_full_span_other && (straddles_low ^ straddles_high) {
-                    if std::env::var("BREP_DEBUG_FRAG")
+                    if env_read!("BREP_DEBUG_FRAG")
                         .map(|value| value == face.id.to_string())
                         .unwrap_or(false)
                     {
@@ -1188,7 +1234,7 @@ fn fragment_face_arranged(
                 } else {
                     lift.y = shift;
                 }
-                if std::env::var("BREP_DEBUG_FRAG")
+                if env_read!("BREP_DEBUG_FRAG")
                     .map(|value| value == face.id.to_string())
                     .unwrap_or(false)
                 {
@@ -1208,7 +1254,7 @@ fn fragment_face_arranged(
             &original_flags,
             &boundary_segments,
             arrangement_tolerance,
-            std::env::var("BREP_DEBUG_FRAG")
+            env_read!("BREP_DEBUG_FRAG")
                 .map(|value| value == face.id.to_string())
                 .unwrap_or(false),
             face.id,
@@ -1400,7 +1446,7 @@ fn fragment_face_arranged(
             segments.push(Segment2 {
                 a,
                 b,
-                tag: json!({ "chain": chain_index, "seg": 0 }),
+                tag: segment_tag(chain_index, 0),
             });
             chains.push(Chain {
                 source,
@@ -1410,7 +1456,7 @@ fn fragment_face_arranged(
                 segments: vec![(a, b)],
             });
             boundary_segments.push((a, b));
-            if std::env::var("BREP_DEBUG_FRAG")
+            if env_read!("BREP_DEBUG_FRAG")
                 .map(|value| value == face.id.to_string())
                 .unwrap_or(false)
             {
@@ -1492,7 +1538,7 @@ fn fragment_face_arranged(
                         || other.end.sub(cut_end).length() <= node_tolerance)
             })
     };
-    let debug_drop = std::env::var("BREP_DEBUG_FRAG")
+    let debug_drop = env_read!("BREP_DEBUG_FRAG")
         .map(|value| value == face.id.to_string())
         .unwrap_or(false);
     // MICRO-BOUNDARY SKIP (t316). A boundary chain SHORTER than the coincidence
@@ -1689,14 +1735,13 @@ fn fragment_face_arranged(
     }
     if !dropped_chains.is_empty() {
         segments.retain(|segment| {
-            segment.tag["chain"]
-                .as_u64()
+            tag_chain(&segment.tag)
                 .map(|chain| !dropped_chains.contains(&(chain as usize)))
                 .unwrap_or(true)
         });
     }
 
-    let debug = std::env::var("BREP_DEBUG_FRAG")
+    let debug = env_read!("BREP_DEBUG_FRAG")
         .map(|value| value == face.id.to_string())
         .unwrap_or(false);
     if debug {
@@ -1927,7 +1972,7 @@ fn fragment_face_arranged(
                     }
                 }
                 for segment in segments.iter_mut() {
-                    if segment.tag["chain"].as_u64() != Some(chain as u64) {
+                    if tag_chain(&segment.tag) != Some(chain as u64) {
                         continue;
                     }
                     if segment.a.sub(old).length() <= 1e-15 {
@@ -2129,12 +2174,12 @@ fn fragment_face_arranged(
         for (ci, new_segments, _) in plans {
             chains[ci].count = new_segments.len();
             chains[ci].segments = new_segments.clone();
-            segments.retain(|s| s.tag["chain"].as_u64() != Some(ci as u64));
+            segments.retain(|s| tag_chain(&s.tag) != Some(ci as u64));
             for (segment_index, (a, b)) in new_segments.into_iter().enumerate() {
                 segments.push(Segment2 {
                     a,
                     b,
-                    tag: json!({ "chain": ci, "seg": segment_index }),
+                    tag: segment_tag(ci, segment_index),
                 });
             }
         }
@@ -2507,6 +2552,120 @@ pub(crate) fn face_separated(face: &FaceRecord, bounds: crate::Aabb, band: f64) 
 /// other operand: every point of the face has the same Outside classification.
 /// Keep the authored loops exactly; no interior-point search or arrangement
 /// is needed to decide material against an operand outside this carrier box.
+/// TRIM-SIDE PROBE for a face no section touches whose arrangement came back
+/// EMPTY (hosted report 2026-11-02 "boolean fails", the shelf pin): the
+/// bracket union's cylinder carried its cone on a 0.01-wide cap ring (the
+/// cone's base rim 0.01 inside the cylinder's cap), no section on it. Its
+/// domain centre is its hole, so it went to the arrangement for a test
+/// point, which sampled a circle at 32 chords: the inner rim's chords sagged
+/// 0.0115 into the hole, the only region's test point sat there, "outside
+/// trimmed face", and the face was dropped without a word (open edges at
+/// assembly, or a body that validated at the wrong volume). A face without
+/// a cut that the arrangement does not split is one fragment, itself; all
+/// it needs is a point of its own material, and that lies beside its trim: a
+/// station on each loop's pcurve, stepped off along the pcurve's normal on
+/// both sides over a ladder of distances, the first one the trim owns. The
+/// arrangement's own answers stand where it gives any (a pinched loop it
+/// splits in two). Escape hatch `BREP_FRAGMENT_TRIM_PROBE=0|off` leaves the
+/// empty answer as it was.
+fn trim_probe_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !matches!(std::env::var("BREP_FRAGMENT_TRIM_PROBE").as_deref(), Ok("0") | Ok("off")))
+}
+
+/// The face itself as its one fragment, with the test point `uv`.
+fn untouched_fragment(
+    face: &FaceRecord,
+    operand: u8,
+    uv: Vec2,
+    extra_test_points: Vec<Vec3>,
+) -> Result<FaceFragmentRecord, KernelRefusal> {
+    Ok(FaceFragmentRecord {
+        operand,
+        source_face_id: face.id,
+        surface: face.surface.clone(),
+        same_sense: face.same_sense,
+        loops: face
+            .loops
+            .iter()
+            .map(|loop_record| FragmentLoop {
+                coedges: loop_record
+                    .coedges
+                    .iter()
+                    .map(|coedge| FragmentCoedge {
+                        source: FragmentEdgeSource::Boundary {
+                            operand,
+                            edge_id: coedge.edge_id,
+                        },
+                        forward: coedge.forward,
+                        pcurve: coedge.pcurve.clone(),
+                    })
+                    .collect(),
+            })
+            .collect(),
+        test_point: face.surface.evaluate(uv.x, uv.y).or_refuse(KernelStage::Fragment, "evaluate")?,
+        test_uv: uv,
+        extra_test_points,
+        order: None,
+    })
+}
+
+/// A point of `face`'s material beside its trim, with up to two more as
+/// extra test points, or `None` when no station of the ladder is owned.
+fn trim_interior_probe(
+    face: &FaceRecord,
+    u: [f64; 2],
+    v: [f64; 2],
+) -> Result<Option<(Vec2, Vec<Vec3>)>, KernelRefusal> {
+    let diagonal = ((u[1] - u[0]).powi(2) + (v[1] - v[0]).powi(2)).sqrt();
+    if !(diagonal > 0.0) {
+        return Ok(None);
+    }
+    let mut found: Vec<Vec2> = Vec::new();
+    'loops: for loop_record in &face.loops {
+        for coedge in &loop_record.coedges {
+            let [a, b] = coedge.pcurve.domain().or_refuse(KernelStage::Fragment, "domain")?;
+            if !(b > a) {
+                continue;
+            }
+            for fraction in [0.5, 0.25, 0.75] {
+                let t = a + (b - a) * fraction;
+                let derivatives = coedge.pcurve.derivatives(t, 1).or_refuse(KernelStage::Fragment, "derivatives")?;
+                let (at, tangent) = (derivatives[0], derivatives[1]);
+                let speed = (tangent.x * tangent.x + tangent.y * tangent.y).sqrt();
+                if !(speed > 0.0) || !speed.is_finite() {
+                    continue;
+                }
+                let normal = Vec2 { x: -tangent.y / speed, y: tangent.x / speed };
+                for scale in [1e-2, 1e-3, 1e-4, 1e-5, 1e-6] {
+                    let step = diagonal * scale;
+                    for sign in [1.0, -1.0] {
+                        let candidate = Vec2 { x: at.x + normal.x * step * sign, y: at.y + normal.y * step * sign };
+                        if candidate.x < u[0] || candidate.x > u[1] || candidate.y < v[0] || candidate.y > v[1] {
+                            continue;
+                        }
+                        if parameter_point_in_face(face, candidate, 1e-9).or_refuse(KernelStage::Fragment, "parameter_point_in_face")? == PolygonClass::Inside {
+                            found.push(candidate);
+                            if found.len() >= 3 {
+                                break 'loops;
+                            }
+                            continue 'loops;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let Some(uv) = found.first().copied() else {
+        return Ok(None);
+    };
+    let mut extra_test_points = Vec::new();
+    for candidate in found.iter().skip(1) {
+        extra_test_points.push(face.surface.evaluate(candidate.x, candidate.y).or_refuse(KernelStage::Fragment, "evaluate")?);
+    }
+    Ok(Some((uv, extra_test_points)))
+}
+
 fn separated_fragment(face: &FaceRecord, operand: u8) -> Option<FaceFragmentRecord> {
     let coedge = face.loops.first()?.coedges.first()?;
     let [a, b] = coedge.pcurve.domain().ok()?;
@@ -2533,8 +2692,14 @@ pub(crate) fn fragment_solid_against(
     other: Option<(crate::Aabb, f64)>,
 ) -> Result<Vec<FaceFragmentRecord>, KernelRefusal> {
     let mut profile = FragmentProfile::new();
+    if profile.enabled {
+        crate::classification::containment_profile_begin();
+    }
     let result = fragment_solid_profiled(solid, operand, imprint, other, &mut profile);
     profile.report(operand);
+    if profile.enabled {
+        crate::classification::containment_profile_report("fragment");
+    }
     result
 }
 

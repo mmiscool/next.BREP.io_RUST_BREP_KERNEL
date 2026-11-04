@@ -288,7 +288,7 @@ pub fn coons_bilinear_reported(
 }
 
 /// Homogeneous distance between two control points.
-fn homogeneous_distance(first: Vec4, second: Vec4) -> f64 {
+pub(crate) fn homogeneous_distance(first: Vec4, second: Vec4) -> f64 {
     ((first.x - second.x).powi(2)
         + (first.y - second.y).powi(2)
         + (first.z - second.z).powi(2)

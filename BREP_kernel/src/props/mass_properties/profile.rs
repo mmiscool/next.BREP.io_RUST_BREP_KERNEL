@@ -18,6 +18,9 @@ pub(crate) struct MassProfile {
     pub route_raw: u64,
     pub route_untrimmed: u64,
     pub route_affine: u64,
+    /// A single loop of four axis-parallel line pcurves inside the domain,
+    /// integrated over the knot-span cells clipped to that rectangle.
+    pub route_iso_rectangle: u64,
     pub polygon_chords: u64,
     pub base_cells: u64,
     pub full_cells: u64,
@@ -57,7 +60,7 @@ thread_local! {
         enabled: false, faces: 0, trimmed_faces: 0, route_biperiodic: 0, route_winding: 0,
         route_seam_band: 0, route_cap: 0, route_wall: 0, route_hopped_raw: 0,
         route_hopped_unwrapped: 0, route_straddle: 0, route_periodic_raw: 0, route_raw: 0,
-        route_untrimmed: 0, route_affine: 0, polygon_chords: 0, base_cells: 0, full_cells: 0,
+        route_untrimmed: 0, route_affine: 0, route_iso_rectangle: 0, polygon_chords: 0, base_cells: 0, full_cells: 0,
         full_stations: 0, leaf_cells: 0, tri_stations: 0, corr_chords: 0, corr_stations: 0,
         polygons_ms: 0.0, base_clip_ms: 0.0, cells_ms: 0.0, child_clip_ms: 0.0, full_ms: 0.0,
         leaf_ms: 0.0, corr_ms: 0.0, untrimmed_ms: 0.0, gate_ms: 0.0, rule_ms: 0.0,
@@ -68,18 +71,18 @@ thread_local! {
 
 /// Read-modify-write the thread-local profile when it is enabled; a no-op
 /// (one flag read) otherwise.
+impl crate::profile::Counters for MassProfile {
+    fn armed(&self) -> bool {
+        self.enabled
+    }
+}
+
 pub(crate) fn mass_profile(update: impl FnOnce(&mut MassProfile)) {
-    PROFILE.with(|cell| {
-        let mut profile = cell.get();
-        if profile.enabled {
-            update(&mut profile);
-            cell.set(profile);
-        }
-    });
+    crate::profile::update(&PROFILE, update)
 }
 
 pub(crate) fn mass_profile_enabled() -> bool {
-    PROFILE.with(|cell| cell.get().enabled)
+    crate::profile::armed(&PROFILE)
 }
 
 /// The live counters, for a before/after delta around one face.
@@ -96,6 +99,7 @@ fn route_name(delta: &MassProfile) -> &'static str {
     for (count, name) in [
         (delta.route_affine, "affine"),
         (delta.route_untrimmed, "untrimmed"),
+        (delta.route_iso_rectangle, "iso_rect"),
         (delta.route_biperiodic, "biperiodic"),
         (delta.route_winding, "winding"),
         (delta.route_seam_band, "seam_band"),
@@ -182,17 +186,15 @@ pub(crate) fn emit_face(
 
 /// Milliseconds since `started` when profiling is on; `None` otherwise.
 pub(crate) fn profile_started() -> Option<Instant> {
-    mass_profile_enabled().then(Instant::now)
+    crate::profile::started(&PROFILE)
 }
 
-pub(crate) fn elapsed_ms(started: Option<Instant>) -> f64 {
-    started.map_or(0.0, |s| s.elapsed().as_secs_f64() * 1_000.0)
-}
+pub(crate) use crate::profile::elapsed_ms;
 
 /// Start a profiled call: resets the counters and arms them when
 /// `BREP_PROFILE` is set. Returns whether profiling is on.
 pub(crate) fn begin(call: &str) -> Option<(String, Instant)> {
-    let enabled = std::env::var("BREP_PROFILE").is_ok();
+    let enabled = crate::profile::profile_enabled();
     let face_lines = enabled && std::env::var("BREP_PROFILE_MASS_FACES").is_ok();
     PROFILE.with(|cell| {
         cell.set(MassProfile {
@@ -210,7 +212,7 @@ pub(crate) fn end(token: Option<(String, Instant)>) {
         return;
     };
     let p = PROFILE.with(|cell| cell.get());
-    eprintln!(
+    profile_line!(
         "mass.profile call={call} ms={:.2} faces={} trimmed={} routes: affine={} untrimmed={} biperiodic={} winding={} seam_band={} cap={} wall={} hopped_raw={} hopped_unwrapped={} straddle={} periodic_raw={} raw={} | chords={} base_cells={} full_cells={} full_stations={} leaf_cells={} tri_stations={} corr_chords={} corr_stations={} | gate_ms={:.2} polygons_ms={:.2} base_clip_ms={:.2} cells_ms={:.2} child_clip_ms={:.2} full_ms={:.2} leaf_ms={:.2} corr_ms={:.2} untrimmed_ms={:.2} rule_ms={:.2} rule_spans={} rule_sampled={}",
         started.elapsed().as_secs_f64() * 1_000.0,
         p.faces, p.trimmed_faces, p.route_affine, p.route_untrimmed, p.route_biperiodic,

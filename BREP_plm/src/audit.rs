@@ -312,14 +312,15 @@ fn diff_collection(
 
 /// A workspace entry's change, named by what moved: a new file version
 /// (a replace or a restore), a move to another folder, a rename, or a link
-/// pinned or set to follow.
+/// pinned or set to follow, or a new owner.
 fn workspace_action(changes: &BTreeMap<String, FieldChange>) -> &'static str {
     let moved: Vec<&str> = changes.keys().map(String::as_str).filter(|k| !QUIET_FIELDS.contains(k)).collect();
     match moved.as_slice() {
         ["versions"] => "version",
-        ["parent"] | ["name", "parent"] => "move",
+        ["parent"] | ["name", "parent"] | ["owner", "parent"] | ["name", "owner", "parent"] => "move",
         ["name"] => "rename",
         ["link"] => "pin",
+        ["owner"] => "owner",
         _ => "update",
     }
 }
@@ -536,13 +537,6 @@ pub fn refine(mut events: Vec<AuditEvent>) -> Vec<AuditEvent> {
 
 /// CSV of events, for the admin's export.
 pub fn to_csv(events: &[AuditEvent]) -> String {
-    let quote = |text: &str| {
-        if text.contains([',', '"', '\n', '\r']) {
-            format!("\"{}\"", text.replace('"', "\"\""))
-        } else {
-            text.to_string()
-        }
-    };
     let mut out = String::from("id,at,user,via,ip,action,kind,entity,label,part,changes,detail,seq\n");
     for e in events {
         let changes = if e.changes.is_empty() {
@@ -565,7 +559,7 @@ pub fn to_csv(events: &[AuditEvent]) -> String {
             e.detail.clone(),
             e.seq.to_string(),
         ];
-        out.push_str(&row.iter().map(|f| quote(f)).collect::<Vec<_>>().join(","));
+        out.push_str(&row.iter().map(|f| crate::bom::csv_cell(f)).collect::<Vec<_>>().join(","));
         out.push('\n');
     }
     out

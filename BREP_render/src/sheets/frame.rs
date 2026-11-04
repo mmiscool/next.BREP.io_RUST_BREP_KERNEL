@@ -372,7 +372,7 @@ pub fn iso_date(unix_seconds: i64) -> String {
 /// Days since 1970-01-01 as a civil date — Howard Hinnant's `civil_from_days`,
 /// exact for every day in a proleptic Gregorian calendar and the reason this
 /// file needs no date crate.
-fn civil_from_days(days: i64) -> (i64, u32, u32) {
+pub fn civil_from_days(days: i64) -> (i64, u32, u32) {
     // Shift the era so the leap day lands at the END of a 400-year cycle.
     let z = days + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;

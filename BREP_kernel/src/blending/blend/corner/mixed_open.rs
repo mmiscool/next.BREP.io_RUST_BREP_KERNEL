@@ -54,20 +54,8 @@ const CTX: &str = "round_mixed_concave_open_corner";
 /// builds, so that escape hatch keeps meaning "the class as before".
 const OPEN_MIXED_CORNER_DEFAULT: bool = true;
 
-thread_local! {
-    static OPEN_MIXED_CORNER_FOR_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
-}
-
 pub(crate) fn open_mixed_corner_on() -> bool {
-    let own = match OPEN_MIXED_CORNER_FOR_TEST.with(|forced| forced.get()) {
-        Some(forced) => forced,
-        None => match std::env::var("BREP_BLEND_OPEN_MIXED_CORNER").as_deref() {
-            Ok("0") | Ok("off") => false,
-            Ok("1") | Ok("on") => true,
-            _ => OPEN_MIXED_CORNER_DEFAULT,
-        },
-    };
-    own && crate::blend::runout::one_ended_runout_on()
+    switch!(live "BREP_BLEND_OPEN_MIXED_CORNER", OPEN_MIXED_CORNER_DEFAULT) && crate::blend::runout::one_ended_runout_on()
 }
 
 

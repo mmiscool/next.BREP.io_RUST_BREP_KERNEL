@@ -240,7 +240,7 @@ pub fn face_outline<F: Fn(u32) -> bool>(mesh: &MeshSnapshot, include: F, tol: &T
         return Err(PlanarError::InvalidInput("the selected faces fold over in XY; use the silhouette".into()));
     }
     // Edges used twice (once each way) are interior; keep the singles.
-    let key = |p: Point3| (p.x.to_bits(), p.y.to_bits(), p.z.to_bits());
+    let key = |p: Point3| (crate::geom::canonical_bits(p.x), crate::geom::canonical_bits(p.y), crate::geom::canonical_bits(p.z));
     let mut keyed: Vec<((u64, u64, u64), (u64, u64, u64), usize)> = edges.iter().enumerate().map(|(i, (a, b))| (key(*a), key(*b), i)).collect();
     let mut reversed: Vec<((u64, u64, u64), (u64, u64, u64))> = edges.iter().map(|(a, b)| (key(*b), key(*a))).collect();
     keyed.sort();

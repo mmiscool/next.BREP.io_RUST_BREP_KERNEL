@@ -8,11 +8,8 @@ use crate::push::{PushContext,Direction,Fiber};
 use crate::waterline::contour::{self,Limits};
 
 fn error(s:&str)->CamError {CamError::InvalidInput(format!("steep/shallow: {s}"))}
-fn key(p:Point3)->[u64;3] {[p.x,p.y,p.z].map(|v|if v==0.0 {0}else{v.to_bits()})}
-fn segment_distance(p:Point3,a:Point3,b:Point3)->f64 {
-    let d=b.sub(a);let length=d.length_squared();
-    if length==0.0 {p.distance(a)}else{p.distance(a.lerp(b,(p.sub(a).dot(d)/length).clamp(0.0,1.0)))}
-}
+fn key(p:Point3)->[u64;3] {[p.x,p.y,p.z].map(crate::geom::canonical_bits)}
+use crate::geom::point_segment_distance as segment_distance;
 
 struct Regions {classes:Vec<Option<bool>>,solids:Vec<String>,boundary:Vec<(Point3,Point3)>,boundary_solids:Vec<String>}
 impl Regions {

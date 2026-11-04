@@ -92,9 +92,78 @@ const MIN_MARGIN: f64 = 1e-6;
 const MAX_FACES: usize = 64;
 pub(super) const MAX_CELLS: usize = 8192;
 
-/// One cell: a (pu+1) x (pv+1) Euclidean net, rational in u only.
+// Promoted together; setting an individual switch to 0 restores its original path.
+fn compact_cells_enabled() -> bool {
+    switch!("BREP_TUBE_GRID_COMPACT_CELLS", true)
+}
+
+fn point_bounds(mut points: impl Iterator<Item = Vec3>) -> Option<(Vec3, Vec3, Vec3, usize)> {
+    let first = points.next()?;
+    if !(first.x.is_finite() && first.y.is_finite() && first.z.is_finite()) { return None; }
+    let (mut lo, mut hi, mut sum, mut count) = (first, first, Vec3::new(0., 0., 0.).add(first), 1);
+    for p in points {
+        if !(p.x.is_finite() && p.y.is_finite() && p.z.is_finite()) { return None; }
+        lo = Vec3::new(lo.x.min(p.x), lo.y.min(p.y), lo.z.min(p.z));
+        hi = Vec3::new(hi.x.max(p.x), hi.y.max(p.y), hi.z.max(p.z));
+        sum = sum.add(p);
+        count += 1;
+    }
+    Some((lo, hi, sum, count))
+}
+
+// A cell keeps its rectangular control net in one allocation. Rows remain
+// slices in the original order, so every certificate fold reads the same bits.
+pub(super) struct CellNet {
+    points: Vec<Vec3>,
+    columns: usize,
+}
+
+impl CellNet {
+    fn from_rows(rows: Vec<Vec<Vec3>>) -> Option<Self> {
+        let columns = rows.first()?.len();
+        if columns == 0 || rows.iter().any(|row| row.len() != columns) { return None; }
+        Some(Self { points: rows.into_iter().flatten().collect(), columns })
+    }
+    pub(super) fn iter(&self) -> std::slice::Chunks<'_, Vec3> { self.points.chunks(self.columns) }
+    fn len(&self) -> usize { self.points.len() / self.columns }
+}
+
+impl std::ops::Index<usize> for CellNet {
+    type Output = [Vec3];
+    fn index(&self, row: usize) -> &Self::Output {
+        &self.points[row * self.columns..(row + 1) * self.columns]
+    }
+}
+
+impl<'a> IntoIterator for &'a CellNet {
+    type Item = &'a [Vec3];
+    type IntoIter = std::slice::Chunks<'a, Vec3>;
+    fn into_iter(self) -> Self::IntoIter { self.iter() }
+}
+
+// Both storage layouts use the same subdivision arithmetic and weight checks.
+trait SplitNet {
+    fn allocate(rows: usize, columns: usize) -> Self;
+    fn put(&mut self, row: usize, column: usize, point: Vec3);
+}
+impl SplitNet for CellNet {
+    fn allocate(rows: usize, columns: usize) -> Self {
+        Self { points: vec![Vec3::default(); rows * columns], columns }
+    }
+    fn put(&mut self, row: usize, column: usize, point: Vec3) {
+        self.points[row * self.columns + column] = point;
+    }
+}
+impl SplitNet for Vec<Vec<Vec3>> {
+    fn allocate(rows: usize, columns: usize) -> Self { vec![vec![Vec3::default(); columns]; rows] }
+    fn put(&mut self, row: usize, column: usize, point: Vec3) { self[row][column] = point; }
+}
+
+/// One cell: a Euclidean net rational in u only. Grouped tube cells concatenate
+/// consecutive polynomial v-span controls, including their repeated endpoints;
+/// consumers use the aggregate hull and cones, never a single polynomial evaluator.
 pub(super) struct Cell {
-    pub(super) net: Vec<Vec<Vec3>>,
+    pub(super) net: CellNet,
     /// The weight of each u row (the same in every v column).
     #[cfg_attr(not(test), allow(dead_code))]
     weights: Vec<f64>,
@@ -108,20 +177,29 @@ pub(super) struct Cell {
 
 impl Cell {
     pub(super) fn new(net: Vec<Vec<Vec3>>, weights: Vec<f64>) -> Option<Self> {
-        let points: Vec<Vec3> = net.iter().flatten().copied().collect();
-        if !points.iter().all(|p| p.x.is_finite() && p.y.is_finite() && p.z.is_finite()) {
-            return None;
-        }
-        let mut lo = points[0];
-        let mut hi = points[0];
-        let mut sum = Vec3::new(0., 0., 0.);
-        for p in &points {
-            lo = Vec3::new(lo.x.min(p.x), lo.y.min(p.y), lo.z.min(p.z));
-            hi = Vec3::new(hi.x.max(p.x), hi.y.max(p.y), hi.z.max(p.z));
-            sum = sum.add(*p);
-        }
+        Self::from_net(CellNet::from_rows(net)?, weights)
+    }
+
+    fn from_net(net: CellNet, weights: Vec<f64>) -> Option<Self> {
+        let compact = compact_cells_enabled();
+        let points = (!compact).then(|| net.iter().flatten().copied().collect::<Vec<_>>());
+        let (lo, hi, sum, point_count) = if let Some(points) = &points {
+            // Retain the original passes in the disabled arm.
+            if !points.iter().all(|p| p.x.is_finite() && p.y.is_finite() && p.z.is_finite()) { return None; }
+            let mut lo = points[0];
+            let mut hi = points[0];
+            let mut sum = Vec3::new(0., 0., 0.);
+            for p in points {
+                lo = Vec3::new(lo.x.min(p.x), lo.y.min(p.y), lo.z.min(p.z));
+                hi = Vec3::new(hi.x.max(p.x), hi.y.max(p.y), hi.z.max(p.z));
+                sum = sum.add(*p);
+            }
+            Some((lo, hi, sum, points.len()))
+        } else {
+            point_bounds(net.iter().flatten().copied())
+        }?;
         let (ku, kv) = (net.len(), net[0].len());
-        let mut u = Vec::new();
+        let mut u = if compact { Vec::with_capacity(ku * (ku - 1) / 2 * kv) } else { Vec::new() };
         for l in 0..kv {
             for k1 in 0..ku {
                 for k2 in k1 + 1..ku {
@@ -129,7 +207,7 @@ impl Cell {
                 }
             }
         }
-        let mut v = Vec::new();
+        let mut v = if compact { Vec::with_capacity(ku * (kv - 1)) } else { Vec::new() };
         for row in &net {
             for l in 0..kv - 1 {
                 v.push(row[l + 1].sub(row[l]));
@@ -142,7 +220,7 @@ impl Cell {
             return None;
         }
         let mean_v = v.iter().fold(Vec3::new(0., 0., 0.), |a, d| a.add(*d)).scale(1. / v.len() as f64);
-        Some(Self { centroid: sum.scale(1. / points.len() as f64), net, weights, lo, hi, u, v, mean_v })
+        Some(Self { centroid: sum.scale(1. / point_count as f64), net, weights, lo, hi, u, v, mean_v })
     }
 }
 
@@ -151,6 +229,7 @@ impl Cell {
     /// in both directions, its cones read from the hodographs' Bernstein
     /// coefficients).
     pub(super) fn with_cones(net: Vec<Vec<Vec3>>, u: Vec<Vec3>, v: Vec<Vec3>) -> Option<Self> {
+        let net = CellNet::from_rows(net)?;
         let points: Vec<Vec3> = net.iter().flatten().copied().collect();
         if points.is_empty() || !points.iter().all(|p| p.x.is_finite() && p.y.is_finite() && p.z.is_finite()) || u.is_empty() || v.is_empty() {
             return None;
@@ -172,66 +251,74 @@ impl Cell {
 /// by inserting every interior knot to multiplicity `degree` (Piegl & Tiller
 /// A5.6: one pass, each span refined in place, O(n p^2)).
 pub(super) fn bezier_spans(knots: &[f64], points: &[Vec3], degree: usize) -> Option<Vec<Vec<Vec3>>> {
-    let p = degree;
-    let n = points.len();
-    if p == 0 || n < p + 1 || knots.len() != n + p + 1 || knots.iter().any(|k| !k.is_finite()) || knots.windows(2).any(|w| w[1] < w[0]) {
-        return None;
-    }
-    let (a, b) = (knots[0], knots[knots.len() - 1]);
-    if !(b > a) || knots[..=p].iter().any(|k| *k != a) || knots[knots.len() - p - 1..].iter().any(|k| *k != b) {
-        return None;
-    }
-    let m = knots.len() - 1;
-    let (mut a, mut b) = (p, p + 1);
-    let mut spans = Vec::with_capacity(n);
-    let mut span: Vec<Vec3> = points[..=p].to_vec();
-    let mut alphas = vec![0.; p];
-    while b < m {
-        let first = b;
-        while b < m && knots[b + 1] == knots[b] {
-            b += 1;
-        }
-        let mult = b - first + 1;
-        if b < m && mult > p {
-            return None;
-        }
-        let mut next = vec![Vec3::new(0., 0., 0.); p + 1];
-        if mult < p {
-            let numer = knots[b] - knots[a];
-            for j in (mult + 1..=p).rev() {
-                alphas[j - mult - 1] = numer / (knots[a + j] - knots[a]);
-            }
-            let r = p - mult;
-            for j in 1..=r {
-                let s = mult + j;
-                for k in (s..=p).rev() {
-                    let alpha = alphas[k - s];
-                    span[k] = span[k].scale(alpha).add(span[k - 1].scale(1. - alpha));
-                }
-                if b < m {
-                    next[r - j] = span[p];
-                }
-            }
-        }
-        spans.push(span);
-        if b >= m {
-            break;
-        }
-        for i in p - mult..=p {
-            next[i] = points[b - p + i];
-        }
-        span = next;
-        a = b;
-        b += 1;
-    }
-    Some(spans)
+    crate::curve::bezier_decompose_raw(knots, points, degree, Vec3::new(0., 0., 0.),
+        |a, b, alpha| a.scale(alpha).add(b.scale(1. - alpha)))
 }
 
 /// Split a cell's homogeneous net (rows k, columns l) into `parts` equal u
 /// pieces. The weight of a row is the same in every column, so it stays so.
 pub(super) fn split_u(net: &[Vec<[f64; 4]>], parts: usize) -> Option<Vec<(Vec<Vec<Vec3>>, Vec<f64>)>> {
+    split_u_with_storage(net, parts, compact_cells_enabled())
+}
+
+// Convert each split column directly into its final Euclidean storage.
+// The homogeneous de Casteljau arithmetic and weight checks are identical
+// to the general path; only the intermediate nested heap nets disappear.
+fn split_halves_compact(net: &[Vec<[f64; 4]>]) -> Option<Vec<(Vec<Vec<Vec3>>, Vec<f64>)>> {
+    split_halves_from(net.len() - 1, net[0].len(), |k, l| net[k][l])
+}
+
+// Read homogeneous controls directly into the stack column. Wall conversion
+// can supply the same products without materializing a temporary heap net.
+fn split_halves_from<N: SplitNet>(degree: usize, columns: usize, control: impl Fn(usize, usize) -> [f64; 4]) -> Option<Vec<(N, Vec<f64>)>> {
+    // The common linear, quadratic and cubic walls use the same arithmetic
+    // with a compile-time order. This lets the compiler unroll de Casteljau
+    // and remove unused stack slots without changing any weight check.
+    match degree {
+        1 => split_halves_order::<2, N>(degree, columns, control),
+        2 => split_halves_order::<3, N>(degree, columns, control),
+        3 => split_halves_order::<4, N>(degree, columns, control),
+        _ => split_halves_order::<{ crate::curve::MAX_STACK_ORDER }, N>(degree, columns, control),
+    }
+}
+
+fn split_halves_order<const ORDER: usize, N: SplitNet>(degree: usize, columns: usize, control: impl Fn(usize, usize) -> [f64; 4]) -> Option<Vec<(N, Vec<f64>)>> {
+    let mut left_net = N::allocate(degree + 1, columns);
+    let mut right_net = N::allocate(degree + 1, columns);
+    let mut left_weights = vec![0.; degree + 1];
+    let mut right_weights = vec![0.; degree + 1];
+    for l in 0..columns {
+        let mut level = [[0.; 4]; ORDER];
+        let mut left = level;
+        let mut right = level;
+        for k in 0..=degree { level[k] = control(k, l); }
+        left[0] = level[0];
+        right[degree] = level[degree];
+        for r in 1..=degree {
+            for i in 0..=degree - r {
+                level[i] = std::array::from_fn(|c| 0.5 * level[i][c] + 0.5 * level[i + 1][c]);
+            }
+            left[r] = level[0];
+            right[degree - r] = level[degree - r];
+        }
+        for k in 0..=degree {
+            let (a, b) = (left[k], right[k]);
+            if !(a[3] > 0. && b[3] > 0. && a[3].is_finite() && b[3].is_finite()) { return None; }
+            if l == 0 { left_weights[k] = a[3]; right_weights[k] = b[3]; }
+            else if left_weights[k] != a[3] || right_weights[k] != b[3] { return None; }
+            left_net.put(k, l, Vec3::new(a[0] / a[3], a[1] / a[3], a[2] / a[3]));
+            right_net.put(k, l, Vec3::new(b[0] / b[3], b[1] / b[3], b[2] / b[3]));
+        }
+    }
+    Some(vec![(left_net, left_weights), (right_net, right_weights)])
+}
+
+fn split_u_with_storage(net: &[Vec<[f64; 4]>], parts: usize, compact: bool) -> Option<Vec<(Vec<Vec<Vec3>>, Vec<f64>)>> {
+    if compact && parts == 2 && net.len() - 1 <= crate::curve::MAX_STACK_DEGREE {
+        return split_halves_compact(net);
+    }
     let mut pieces = Vec::with_capacity(parts);
-    let mut rest = net.to_vec();
+    let mut rest: std::borrow::Cow<'_, [Vec<[f64; 4]>]> = if compact { std::borrow::Cow::Borrowed(net) } else { std::borrow::Cow::Owned(net.to_vec()) };
     for remaining in (2..=parts).rev() {
         let t = 1. / remaining as f64;
         let columns = rest[0].len();
@@ -239,6 +326,20 @@ pub(super) fn split_u(net: &[Vec<[f64; 4]>], parts: usize) -> Option<Vec<(Vec<Ve
         let mut left = vec![vec![[0.; 4]; columns]; degree + 1];
         let mut right = vec![vec![[0.; 4]; columns]; degree + 1];
         for l in 0..columns {
+            if compact && degree <= crate::curve::MAX_STACK_DEGREE {
+                let mut level = [[0.; 4]; crate::curve::MAX_STACK_ORDER];
+                for (k, row) in rest.iter().enumerate() { level[k] = row[l]; }
+                left[0][l] = level[0];
+                right[degree][l] = level[degree];
+                for r in 1..=degree {
+                    for i in 0..=degree - r {
+                        level[i] = std::array::from_fn(|c| (1. - t) * level[i][c] + t * level[i + 1][c]);
+                    }
+                    left[r][l] = level[0];
+                    right[degree - r][l] = level[degree - r];
+                }
+                continue;
+            }
             let mut level: Vec<[f64; 4]> = rest.iter().map(|row| row[l]).collect();
             left[0][l] = level[0];
             right[degree][l] = level[degree];
@@ -251,9 +352,9 @@ pub(super) fn split_u(net: &[Vec<[f64; 4]>], parts: usize) -> Option<Vec<(Vec<Ve
             }
         }
         pieces.push(left);
-        rest = right;
+        rest = std::borrow::Cow::Owned(right);
     }
-    pieces.push(rest);
+    pieces.push(rest.into_owned());
     pieces
         .into_iter()
         .map(|piece| {
@@ -310,18 +411,126 @@ fn wall_columns(surface: &NurbsSurface) -> Result<Vec<Vec<Cell>>, Decline> {
         .ok_or("a wall's v knots are not a clamped spline")?;
     let spans_v = rows[0].len();
     let spans_u = (net.len() - 1) / pu;
+    let direct_halves = compact_cells_enabled() && SPLIT_U == 2 && pu <= crate::curve::MAX_STACK_DEGREE;
     let mut columns = Vec::with_capacity(spans_u * SPLIT_U);
     for span in 0..spans_u {
         let mut pieces: Vec<Vec<Cell>> = (0..SPLIT_U).map(|_| Vec::with_capacity(spans_v)).collect();
         for j in 0..spans_v {
-            let homogeneous: Vec<Vec<[f64; 4]>> = (0..=pu)
+            let split = if direct_halves {
+                split_halves_from(pu, rows[span * pu][j].len(), |k, l| {
+                    let w = net[span * pu + k][0].w;
+                    let p = rows[span * pu + k][j][l];
+                    [p.x * w, p.y * w, p.z * w, w]
+                })
+            } else {
+                let homogeneous: Vec<Vec<[f64; 4]>> = (0..=pu)
                 .map(|k| {
                     let w = net[span * pu + k][0].w;
                     rows[span * pu + k][j].iter().map(|p| [p.x * w, p.y * w, p.z * w, w]).collect()
                 })
                 .collect();
-            for (q, (piece, weights)) in split_u(&homogeneous, SPLIT_U).ok_or("a split cell lost its weights")?.into_iter().enumerate() {
-                pieces[q].push(Cell::new(piece, weights).ok_or("a degenerate cell")?);
+                split_u(&homogeneous, SPLIT_U).and_then(|pieces| pieces.into_iter()
+                    .map(|(net, weights)| Some((CellNet::from_rows(net)?, weights))).collect())
+            };
+            for (q, (piece, weights)) in split.ok_or("a split cell lost its weights")?.into_iter().enumerate() {
+                pieces[q].push(Cell::from_net(piece, weights).ok_or("a degenerate cell")?);
+            }
+        }
+        columns.extend(pieces);
+    }
+    Ok(columns)
+}
+
+// Consecutive Bezier spans remain piecewise polynomial: concatenation retains
+// every control and every derivative generator. Repeated seam endpoints add
+// only a zero difference, removed by Cell::from_net. Exact equality below
+// proves continuity at internal boundaries (no jump is hidden in a cone).
+// Positive span widths merely rescale derivative generators, preserving cones.
+// A grouped cell and adjacent grouped cells have rectangular parameter domains,
+// so the existing segment-integral proof covers their internal span boundaries.
+// Hull separation uses ALL controls, never just the group endpoints.
+fn wall_columns_grouped(surface: &NurbsSurface, group: usize) -> Result<Vec<Vec<Cell>>, Decline> {
+    let (pu, pv) = (surface.degree_u, surface.degree_v);
+    let net = &surface.control_points;
+    if pu == 0 || pv == 0 || net.len() < 2 || net.iter().any(|row| row.len() != net[0].len()) {
+        return Err("a wall net is not a grid");
+    }
+    if surface.knots_u.len() != net.len() + pu + 1 {
+        return Err("a wall's u knots do not fit its net");
+    }
+    for row in net {
+        let w = row[0].w;
+        if !(w > 0.) || !w.is_finite() || row.iter().any(|c| c.w != w) {
+            return Err("a wall's weights vary along v");
+        }
+    }
+    // u must already be Bezier: clamped, every interior knot of multiplicity pu.
+    let ku = &surface.knots_u;
+    let (a, b) = (ku[0], ku[ku.len() - 1]);
+    if !(b > a) || ku[..=pu].iter().any(|k| *k != a) || ku[ku.len() - pu - 1..].iter().any(|k| *k != b) {
+        return Err("a wall's u knots are not clamped");
+    }
+    let mut interior = ku[pu + 1..ku.len() - pu - 1].to_vec();
+    interior.dedup();
+    if interior.iter().any(|k| ku.iter().filter(|x| *x == k).count() != pu) {
+        return Err("a wall is not Bezier in u");
+    }
+    let rows: Vec<Vec<Vec<Vec3>>> = net
+        .iter()
+        .map(|row| {
+            let euclid: Vec<Vec3> = row.iter().map(|c| Vec3::new(c.x / c.w, c.y / c.w, c.z / c.w)).collect();
+            bezier_spans(&surface.knots_v, &euclid, pv)
+        })
+        .collect::<Option<_>>()
+        .ok_or("a wall's v knots are not a clamped spline")?;
+    let spans_v = rows[0].len();
+    let spans_u = (net.len() - 1) / pu;
+    if group > 1 {
+        for row in &rows {
+            for pair in row.windows(2) {
+                let (a, b) = (pair[0].last().unwrap(), pair[1].first().unwrap());
+                if a.x != b.x || a.y != b.y || a.z != b.z {
+                    return Err("grouped spans do not share an exact endpoint");
+                }
+            }
+        }
+    }
+    // Keep both cap-end spans intact: their original endpoint-column and
+    // strict half-space checks are unchanged. Interior aggregate hull checks
+    // can be stronger than fine checks; any failure retries the fine proof.
+    let mut ranges = Vec::new();
+    let mut first = 0;
+    while first < spans_v {
+        let end = if first == 0 || first == spans_v - 1 { first + 1 }
+            else { (first + group).min(spans_v - 1) };
+        ranges.push((first, end));
+        first = end;
+    }
+    let direct_halves = compact_cells_enabled() && SPLIT_U == 2 && pu <= crate::curve::MAX_STACK_DEGREE;
+    let mut columns = Vec::with_capacity(spans_u * SPLIT_U);
+    for span in 0..spans_u {
+        let mut pieces: Vec<Vec<Cell>> = (0..SPLIT_U).map(|_| Vec::with_capacity(ranges.len())).collect();
+        for &(first, end) in &ranges {
+            let count = (end - first) * (pv + 1);
+            let control = |k: usize, l: usize| rows[span * pu + k][first + l / (pv + 1)][l % (pv + 1)];
+            let split = if direct_halves {
+                split_halves_from(pu, count, |k, l| {
+                    let w = net[span * pu + k][0].w;
+                    let p = control(k, l);
+                    [p.x * w, p.y * w, p.z * w, w]
+                })
+            } else {
+                let homogeneous: Vec<Vec<[f64; 4]>> = (0..=pu)
+                .map(|k| {
+                    let w = net[span * pu + k][0].w;
+                    (0..count).map(|l| { let p = control(k, l); [p.x * w, p.y * w, p.z * w, w] }).collect()
+                })
+                .collect();
+                split_u(&homogeneous, SPLIT_U).and_then(|pieces| pieces.into_iter()
+                    .map(|(net, weights)| Some((CellNet::from_rows(net)?, weights))).collect())
+            };
+            for (q, (piece, weights)) in split.ok_or("a split cell lost its weights")?.into_iter().enumerate() {
+                pieces[q].push(Cell::from_net(piece, weights).ok_or("a degenerate cell")?);
             }
         }
         columns.extend(pieces);
@@ -349,15 +558,60 @@ fn arc(mut angles: Vec<f64>) -> Option<(f64, f64)> {
     (width < std::f64::consts::PI).then_some((start, width))
 }
 
+/// `arc` for the two selected endpoint angles, with its identical arithmetic.
+fn arc_pair(a: f64, b: f64) -> Option<(f64, f64)> {
+    let tau = std::f64::consts::TAU;
+    let mut angles = [a.rem_euclid(tau), b.rem_euclid(tau)];
+    angles.sort_by(f64::total_cmp);
+    let mut widest = (angles[0] + tau - angles[1], 1);
+    let gap = angles[1] - angles[0];
+    if gap > widest.0 { widest = (gap, 0); }
+    let width = tau - widest.0;
+    (width < std::f64::consts::PI).then_some((angles[(widest.1 + 1) % 2], width))
+}
+
 /// The projected-cone margin of a block (radians): positive proves the block
 /// injective, see the module notes.
-fn block_margin(cells: &[&Cell]) -> f64 {
+fn block_margin_with_extrema(cells: &[&Cell], extrema: bool) -> f64 {
     let sum = |vs: &mut dyn Iterator<Item = &Vec3>| vs.fold(Vec3::new(0., 0., 0.), |a, d| a.add(*d));
-    let mean_u = sum(&mut cells.iter().flat_map(|c| &c.u));
-    let mean_v = sum(&mut cells.iter().flat_map(|c| &c.v));
+    let (mean_u, mean_v) = if extrema {
+        (cells.iter().flat_map(|c| &c.u).fold(Vec3::new(0., 0., 0.), |a, d| a.add(*d)),
+         cells.iter().flat_map(|c| &c.v).fold(Vec3::new(0., 0., 0.), |a, d| a.add(*d)))
+    } else {
+        (sum(&mut cells.iter().flat_map(|c| &c.u)), sum(&mut cells.iter().flat_map(|c| &c.v)))
+    };
     let Ok(normal) = mean_u.cross(mean_v).normalized() else { return -1. };
     let Ok(e1) = mean_u.sub(normal.scale(mean_u.dot(normal))).normalized() else { return -1. };
     let e2 = normal.cross(e1);
+    if extrema {
+        // In these open half-planes the angular order is the order of y/x
+        // (u), or -x/y (v). Read only the endpoint angles, using the same
+        // projection and atan2 as the complete search. Other cones fall back.
+        fn ends<'a>(vs: impl Iterator<Item = &'a Vec3>, e1: Vec3, e2: Vec3, u: bool) -> Option<(f64, f64)> {
+            let mut low = (f64::INFINITY, (0., 0.));
+            let mut high = (f64::NEG_INFINITY, (0., 0.));
+            for d in vs {
+                let (x, y) = (d.dot(e1), d.dot(e2));
+                if !(x.is_finite() && y.is_finite() && if u { x > 0. } else { y > 0. }) { return None; }
+                let slope = if u { y / x } else { -x / y };
+                if !slope.is_finite() { return None; }
+                if slope < low.0 { low = (slope, (x, y)); }
+                if slope > high.0 { high = (slope, (x, y)); }
+            }
+            if !low.0.is_finite() { return None; }
+            Some((low.1.1.atan2(low.1.0), high.1.1.atan2(high.1.0)))
+        }
+        if let (Some(au), Some(av)) = (ends(cells.iter().flat_map(|c| &c.u), e1, e2, true), ends(cells.iter().flat_map(|c| &c.v), e1, e2, false)) {
+            if let (Some((su, wu)), Some((sv, wv))) = (arc_pair(au.0, au.1), arc_pair(av.0, av.1)) {
+                let lead = (sv - su).rem_euclid(std::f64::consts::TAU);
+                let margin = (lead - wu).min(std::f64::consts::PI - (lead + wv));
+                // Rounded slope ties can exchange adjacent endpoints by a
+                // few ulps. Re-read the full cone near the decision boundary;
+                // this guard is far wider than division/atan2 roundoff.
+                if (margin - MIN_MARGIN).abs() > 1e-12 { return margin; }
+            }
+        }
+    }
     let angles = |vs: &mut dyn Iterator<Item = &Vec3>| -> Option<Vec<f64>> {
         vs.map(|d| {
             let (x, y) = (d.dot(e1), d.dot(e2));
@@ -437,15 +691,32 @@ fn euclid_weighted(points: &[Vec4]) -> Vec<(Vec3, f64)> {
     points.iter().map(|c| (Vec3::new(c.x / c.w, c.y / c.w, c.z / c.w), c.w)).collect()
 }
 
-/// The cells of one grid carry no two distinct parameter points to one
-/// point: every 2x2 block (cyclic in u when `cyclic`) is injective by its
-/// tangent cones, and every cell pair sharing no block is separated by more
-/// than `tau` (sweep along x first).
-pub(super) fn injective(grid: &[Vec<Cell>], cyclic: bool, tau: f64) -> Result<(), Decline> {
+// A larger rectangular patch union has the same mean-value cone proof as
+// a 2x2 block. Certifying it covers every constituent 2x2 domain. Keep the
+// original pair-separation checks, and fall back to the original blocks if
+// any larger cover fails. No derivative or angular threshold is omitted.
+fn cover_column(grid: &[Vec<Cell>], a: usize, b: usize, first: usize, end: usize) -> bool {
+    let mut cells = Vec::with_capacity(2 * (end - first + 1));
+    for j in first..=end {
+        cells.push(&grid[a][j]);
+        if a != b { cells.push(&grid[b][j]); }
+    }
+    if block_margin_with_extrema(&cells, true) > MIN_MARGIN { return true; }
+    if end - first <= 1 { return false; }
+    let middle = first + (end - first) / 2;
+    cover_column(grid, a, b, first, middle) && cover_column(grid, a, b, middle, end)
+}
+
+fn check_blocks(grid: &[Vec<Cell>], cyclic: bool, extrema: bool, cover: bool) -> Result<(), Decline> {
+    check_blocks_with_stride(grid, cyclic, extrema, cover, 8)
+}
+
+fn check_blocks_with_stride(grid: &[Vec<Cell>], cyclic: bool, extrema: bool, cover: bool, stride: usize) -> Result<(), Decline> {
     let (nu, nv) = (grid.len(), grid[0].len());
     let blocks_u = if cyclic { nu } else { nu.saturating_sub(1).max(1) };
     for a in 0..blocks_u {
         let b = if cyclic { (a + 1) % nu } else { (a + 1).min(nu - 1) };
+        if cover && extrema && nv > 2 && (0..nv - 1).step_by(stride).all(|first| cover_column(grid, a, b, first, (first + stride).min(nv - 1))) { continue; }
         for j in 0..nv.saturating_sub(1).max(1) {
             let mut block = vec![&grid[a][j]];
             if b != a {
@@ -457,11 +728,62 @@ pub(super) fn injective(grid: &[Vec<Cell>], cyclic: bool, tau: f64) -> Result<()
                     block.push(&grid[b][j + 1]);
                 }
             }
-            if !(block_margin(&block) > MIN_MARGIN) {
+            if !(block_margin_with_extrema(&block, extrema) > MIN_MARGIN) {
                 return Err("a block's tangent cones do not prove it injective");
             }
         }
     }
+    Ok(())
+}
+
+// Keep the broad-phase data contiguous: most x candidates separate in y/z
+// without needing their cell's heap nets or cyclic-neighbor arithmetic.
+fn separated_pairs_compact(grid: &[Vec<Cell>], cyclic: bool, tau: f64) -> Result<(usize, usize), Decline> {
+    struct Bounds<'a> { cell: &'a Cell, a: usize, j: usize, lo: Vec3, hi_tau: Vec3 }
+    let nu = grid.len();
+    let mut ordered: Vec<_> = grid.iter().enumerate().flat_map(|(a, column)| {
+        column.iter().enumerate().map(move |(j, cell)| Bounds { cell, a, j, lo: cell.lo,
+            hi_tau: Vec3::new(cell.hi.x + tau, cell.hi.y + tau, cell.hi.z + tau) })
+    }).collect();
+    ordered.sort_by(|a, b| a.lo.x.total_cmp(&b.lo.x));
+    let (mut candidates, mut gaps) = (0, 0);
+    for (i, cell) in ordered.iter().enumerate() {
+        for other in &ordered[i + 1..] {
+            if other.lo.x > cell.hi_tau.x { break; }
+            candidates += 1;
+            if other.lo.y > cell.hi_tau.y || cell.lo.y > other.hi_tau.y
+                || other.lo.z > cell.hi_tau.z || cell.lo.z > other.hi_tau.z { continue; }
+            let du = cell.a.abs_diff(other.a);
+            let du = if cyclic { du.min(nu - du) } else { du };
+            if du <= 1 && cell.j.abs_diff(other.j) <= 1 { continue; }
+            gaps += 1;
+            if !(gap(cell.cell, other.cell) > tau) { return Err("two cells sharing no block are not separated"); }
+        }
+    }
+    Ok((candidates, gaps))
+}
+
+/// The cells of one grid carry no two distinct parameter points to one
+/// point: every 2x2 block (cyclic in u when `cyclic`) is injective by its
+/// tangent cones, and every cell pair sharing no block is separated by more
+/// than `tau` (sweep along x first).
+pub(super) fn injective(grid: &[Vec<Cell>], cyclic: bool, tau: f64) -> Result<(), Decline> {
+    injective_with_stride(grid, cyclic, tau, 8)
+}
+
+fn injective_with_stride(grid: &[Vec<Cell>], cyclic: bool, tau: f64, stride: usize) -> Result<(), Decline> {
+    let compact = compact_cells_enabled();
+    let extrema = std::env::var_os("BREP_TUBE_GRID_CONE_EXTREMA").is_none_or(|v| v != "0");
+    let started = crate::imprint::profile_enabled().then(web_time::Instant::now);
+    let (nu, nv) = (grid.len(), grid[0].len());
+    let cover = std::env::var_os("BREP_TUBE_GRID_BLOCK_COVER").is_none_or(|v| v != "0");
+    if stride == 8 { check_blocks(grid, cyclic, extrema, cover)?; }
+    else { check_blocks_with_stride(grid, cyclic, extrema, cover, stride)?; }
+    let blocks_elapsed = started.map(|t| t.elapsed());
+    let (mut candidate_pairs, mut gap_calls) = (0_usize, 0_usize);
+    if compact {
+        (candidate_pairs, gap_calls) = separated_pairs_compact(grid, cyclic, tau)?;
+    } else {
     let mut by_x: Vec<(usize, usize)> = (0..nu).flat_map(|a| (0..nv).map(move |j| (a, j))).collect();
     by_x.sort_by(|p, q| grid[p.0][p.1].lo.x.total_cmp(&grid[q.0][q.1].lo.x));
     for (i, &(a, j)) in by_x.iter().enumerate() {
@@ -471,7 +793,11 @@ pub(super) fn injective(grid: &[Vec<Cell>], cyclic: bool, tau: f64) -> Result<()
             if other.lo.x > cell.hi.x + tau {
                 break;
             }
-            let du = if cyclic { let d = (a + nu - b) % nu; d.min(nu - d) } else { a.abs_diff(b) };
+            candidate_pairs += usize::from(started.is_some());
+            let du = if cyclic {
+                let d = if compact { a.abs_diff(b) } else { (a + nu - b) % nu };
+                d.min(nu - d)
+            } else { a.abs_diff(b) };
             if du <= 1 && j.abs_diff(k) <= 1 {
                 continue;
             }
@@ -479,16 +805,34 @@ pub(super) fn injective(grid: &[Vec<Cell>], cyclic: bool, tau: f64) -> Result<()
                 || cell.lo.y > other.hi.y + tau
                 || other.lo.z > cell.hi.z + tau
                 || cell.lo.z > other.hi.z + tau;
+            gap_calls += usize::from(started.is_some() && !boxes_apart);
             if !boxes_apart && !(gap(cell, other) > tau) {
                 return Err("two cells sharing no block are not separated");
             }
         }
+    }
+    }
+    if let (Some(started), Some(blocks)) = (started, blocks_elapsed) {
+        crate::imprint::profile_emit(format_args!("tube_grid.injective cells={} nu={} nv={} candidates={} gaps={} blocks_ms={:.6} pairs_ms={:.6}",
+            nu * nv, nu, nv, candidate_pairs, gap_calls, blocks.as_secs_f64() * 1000., started.elapsed().saturating_sub(blocks).as_secs_f64() * 1000.));
     }
     Ok(())
 }
 
 /// `Ok(cells)` when the body is proved free of crossings and folds.
 pub(super) fn verdict(solid: &BrepSolid, options: SelfIntersectionOptions) -> Result<usize, Decline> {
+    let group = if switch!("BREP_TUBE_GRID_GROUPED_CELLS", true) { 4 } else { 1 };
+    verdict_with_fallback(solid, options, group)
+}
+
+fn verdict_with_fallback(solid: &BrepSolid, options: SelfIntersectionOptions, group: usize) -> Result<usize, Decline> {
+    if group > 1 {
+        if let Ok(cells) = verdict_grouped(solid, options, group) { return Ok(cells); }
+    }
+    verdict_grouped(solid, options, 1)
+}
+
+fn verdict_grouped(solid: &BrepSolid, options: SelfIntersectionOptions, group: usize) -> Result<usize, Decline> {
     let mut profile = crate::loft_topology::ConstructionProfile::new("tube_grid");
     let tau = options.weld;
     if !(tau > 0.) || !tau.is_finite() {
@@ -591,7 +935,8 @@ pub(super) fn verdict(solid: &BrepSolid, options: SelfIntersectionOptions) -> Re
     profile.lap("structure");
     let mut grid: Vec<Vec<Cell>> = Vec::new();
     for index in &order {
-        grid.extend(wall_columns(&walls[*index].surface)?);
+        grid.extend(if group == 1 { wall_columns(&walls[*index].surface)? }
+            else { wall_columns_grouped(&walls[*index].surface, group)? });
         profile.lap("polynomial_v_wall");
     }
     let (nu, nv) = (grid.len(), grid[0].len());
@@ -701,7 +1046,10 @@ pub(super) fn verdict(solid: &BrepSolid, options: SelfIntersectionOptions) -> Re
         return Err("the two caps are not apart");
     }
     profile.lap("caps");
-    injective(&grid, true, tau)?;
+    // Adjacent covers share their last/first group, so every neighboring
+    // pair is covered even when the number of groups per cover shrinks.
+    if group == 1 { injective(&grid, true, tau)?; }
+    else { injective_with_stride(&grid, true, tau, (8 / group).max(1))?; }
     profile.lap("injectivity");
     Ok(nu * nv)
 }

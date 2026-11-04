@@ -87,8 +87,56 @@ pub(super) fn build_flat_plate(flat: &Flat, thickness: f64, frame: Frame) -> Res
     // Cut any holes (SM.CUTOUT bakes them into the flat, so they show folded AND
     // unfolded): subtract a through-thickness prism per hole loop.
     let solid = subtract_holes(solid, flat, thickness, half_t)?;
+    let solid = apply_end_cuts(solid, flat, thickness)?;
 
     transform_brep(&solid, frame.affine()?, false)
+}
+
+/// Trim `plate` by each of the flat's [`super::super::tree::PlaneCut`]s: a box on
+/// the removed side, far larger than the plate, whose face on the plane becomes
+/// the plate's new end face `{flat}:SIDE:cut{i}` (exact: a plane).
+fn apply_end_cuts(plate: BrepSolid, flat: &Flat, thickness: f64) -> Result<BrepSolid, String> {
+    if flat.end_cuts.is_empty() {
+        return Ok(plate);
+    }
+    let reach = flat
+        .outline
+        .iter()
+        .fold(0.0_f64, |m, p| m.max(p[0].abs()).max(p[1].abs()))
+        .max(thickness)
+        * 4.0
+        + 10.0 * thickness;
+    let options = BooleanOptions {
+        merge_coplanar_faces: true,
+        ..BooleanOptions::default()
+    };
+    let mut current = plate;
+    for (index, cut) in flat.end_cuts.iter().enumerate() {
+        let v = |a: [f64; 3]| Vec3::new(a[0], a[1], a[2]);
+        let n = v(cut.normal).normalized()?;
+        let seed = if n.x.abs() < 0.9 { Vec3::new(1.0, 0.0, 0.0) } else { Vec3::new(0.0, 1.0, 0.0) };
+        let a = n.cross(seed).normalized()?;
+        let b = n.cross(a);
+        let o = v(cut.point);
+        let corner = |i: f64, j: f64| o.add(a.scale(i * reach)).add(b.scale(j * reach));
+        let ring = [corner(-1.0, -1.0), corner(1.0, -1.0), corner(1.0, 1.0), corner(-1.0, 1.0)];
+        let profile = (0..4)
+            .map(|k| make_line(ring[k], ring[(k + 1) % 4]))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut cutter = extrude_profile_brep(&profile, n, 2.0 * reach)?;
+        for face in cutter.shells.iter_mut().flat_map(|shell| shell.faces.iter_mut()) {
+            face.name = Some(format!("{}:SIDE:cut{index}", flat.id));
+        }
+        let body = crate::register_solid_value(current);
+        let tool = crate::register_solid_value(cutter);
+        let cut_result = crate::with_two_registered_solids(body, tool, |body, tool| {
+            boolean_operation(body, tool, BooleanOperation::Subtract, &options)
+        });
+        crate::free_registered_solid(body);
+        crate::free_registered_solid(tool);
+        current = cut_result.map_err(|error| format!("sheet-metal end cut on `{}`: {error}", flat.id))?;
+    }
+    Ok(current)
 }
 
 /// Subtract each [`Hole`] from `plate` as a prism over its exact outer loop.

@@ -662,7 +662,20 @@ fn read_network(solid: &BrepSolid, face_ids: &[u64], op: &str) -> Option<Network
     let mut vertex_set: HashSet<u64> = HashSet::default();
     for edge_id in &network_edges {
         let edge = edge_records.get(edge_id)?;
-        if edge.degenerate || owners.get(edge_id).map_or(0, Vec::len) != 2 {
+        if edge.degenerate {
+            // A vertex blend's pole (an exact octant, 2026-10-28): its one use
+            // is the selected face's own, so it goes with that face and bounds
+            // nothing — not a network edge to junction. Any other degenerate
+            // edge is not a blend network's.
+            let own = owners
+                .get(edge_id)
+                .is_some_and(|owners| !owners.is_empty() && owners.iter().all(|owner| *owner == owners[0]) && faces.contains(&owners[0]));
+            if !own {
+                return None;
+            }
+            continue;
+        }
+        if owners.get(edge_id).map_or(0, Vec::len) != 2 {
             return None;
         }
         vertex_set.insert(edge.start_vertex_id);
@@ -828,6 +841,9 @@ fn read_network(solid: &BrepSolid, face_ids: &[u64], op: &str) -> Option<Network
         let mut rims: Vec<(u64, u64)> = Vec::new();
         let mut meets_survivor = false;
         for coedge in face.loops.iter().flat_map(|loop_record| &loop_record.coedges) {
+            if edge_records[&coedge.edge_id].degenerate {
+                continue; // the vertex blend's own pole: neither a rim nor an end
+            }
             let other = *owners[&coedge.edge_id].iter().find(|id| **id != face_id)?;
             // A kept strip is where a deleted strip ENDS: a mitre, never a rim,
             // even where the two are tangent (a vertex blend is tangent to all

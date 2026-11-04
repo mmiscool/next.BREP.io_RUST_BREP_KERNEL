@@ -12,7 +12,7 @@ pub mod flat_pattern;
 pub mod tree;
 
 pub use evaluate::evaluate;
-pub use tree::{Bend, Edge, Flat, Hole, HoleBend, HoleBendKind, SheetTree};
+pub use tree::{Bend, Edge, Flat, Hole, HoleBend, HoleBendKind, PlaneCut, SheetTree};
 
 use std::cell::RefCell;
 use std::collections::HashMap;

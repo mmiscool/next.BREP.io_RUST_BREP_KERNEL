@@ -65,5 +65,6 @@ pub mod sheet_metal_corner;
 pub mod sheet_metal_cutout;
 pub mod sheet_metal_flange;
 pub mod sheet_metal_hem;
+pub mod sheet_metal_mirror;
 pub mod sheet_metal_tab;
 pub mod sheet_metal_unfold;

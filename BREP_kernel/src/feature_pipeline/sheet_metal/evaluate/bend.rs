@@ -97,7 +97,12 @@ pub(super) fn build_bend(
         }
     };
     let wedge = match build_bend_wedge(bend, r_in, r_out, edge_len, mag)? {
-        Some(wedge) => Some(transform_brep(&wedge, wedge_frame.affine()?, false)?),
+        Some(wedge) => {
+            // Reliefs are cut in the canonical frame, where the band's
+            // developed coordinates map onto the wedge by one fixed fold map.
+            let wedge = super::relief::cut_bend_reliefs(wedge, bend, thickness, edge_len, side < 0.0)?;
+            Some(transform_brep(&wedge, wedge_frame.affine()?, false)?)
+        }
         None => None,
     };
 
@@ -155,9 +160,11 @@ fn strip_flat(bend: &Bend, allowance: f64, length: f64) -> Flat {
                 bend: None,
             })
             .collect(),
-        holes: Vec::new(),
+        // Bend-zone reliefs are drawn in these very coordinates: exact holes.
+        holes: bend.reliefs.clone(),
         hole_bends: Vec::new(),
         outline_curves: Default::default(),
+        end_cuts: Vec::new(),
     }
 }
 

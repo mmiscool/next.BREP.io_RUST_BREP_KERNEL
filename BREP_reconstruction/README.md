@@ -16,6 +16,6 @@ under:
   serialization.
 
 It is a library-only package, version 0.6.0. The kernel dependency is pinned
-EXACTLY (`BREP_kernel = "=0.9.0"`), so the two move in lockstep; it also depends on
+EXACTLY (`BREP_kernel = "=0.12.0"`), so the two move in lockstep; it also depends on
 `BREP_RANSAC`, `serde` and `serde_json`. Licence: the Autodrop3d licence in
 `LICENSE.md`, shipped in the crate.

@@ -64,7 +64,7 @@ pub fn unchanged(document: &Value, hash_of: &dyn Fn(&str) -> Option<String>) -> 
                 if !bad.contains(&key) {
                     let copy = &entry["document"];
                     let same = copy["features"].is_array()
-                        && hash_of(&key).is_some_and(|hash| crate::plm::kicad::content_hash(copy.to_string().as_bytes()) == hash);
+                        && hash_of(&key).is_some_and(|hash| crate::plm::content_hash(copy.to_string().as_bytes()) == hash);
                     if same {
                         good.entry(key).or_insert_with(|| copy.clone());
                     } else {

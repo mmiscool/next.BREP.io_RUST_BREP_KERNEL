@@ -174,6 +174,23 @@ mod platform {
         }
     }
 
+    // Desktop Entry Exec quoting, followed by the key-file string escaping.
+    // This is not shell quoting: the desktop launcher parses the argument itself.
+    pub(super) fn exec_argument(exe: &Path) -> Result<String, String> {
+        let text = exe.to_str().ok_or("desktop executable path must be UTF-8")?;
+        if text.contains(['=', '\n', '\r', '\0']) {
+            return Err("desktop executable path cannot contain '=', a newline or NUL".into());
+        }
+        let mut quoted = String::from("\"");
+        for c in text.chars() {
+            if c == '%' { quoted.push_str("%%"); continue; }
+            if matches!(c, '\\' | '"' | '$' | '`') { quoted.push('\\'); }
+            quoted.push(c);
+        }
+        quoted.push('"');
+        Ok(quoted.replace('\\', "\\\\").replace('\t', "\\t"))
+    }
+
     pub fn install(exe: &Path) -> Vec<Step> {
         install_at(exe, &data_home(), None)
     }
@@ -181,6 +198,10 @@ mod platform {
     /// [`install`] into `data` (an `XDG_DATA_HOME`), with the helpers found on
     /// `path` when given.
     pub(super) fn install_at(exe: &Path, data: &Path, path: Option<&std::ffi::OsStr>) -> Vec<Step> {
+        let executable = match exec_argument(exe) {
+            Ok(value) => value,
+            Err(error) => return vec![Step::failed("desktop executable path", error)],
+        };
         let data = data.to_path_buf();
         let mime_dir = data.join("mime");
         let mut steps = Vec::new();
@@ -222,7 +243,7 @@ mod platform {
                  Categories=Graphics;Engineering;3DGraphics;\n\
                  MimeType={mime_types}\n\
                  StartupNotify=true\n",
-                exe.display()
+                executable
             ),
             "write the desktop entry",
         ));

@@ -37,9 +37,7 @@ use std::borrow::Cow;
 /// Promoted on the 239-document census (0 documents differ) and the tangent
 /// bore's paired timing (8.05 -> 7.67 ms, 9F/21E/12V -> 8F/18E/10V).
 pub(super) fn seam_reseat_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let enabled = *ENABLED.get_or_init(|| !matches!(std::env::var("BREP_SEAM_RESEAT").as_deref(), Ok("0") | Ok("off")));
-    enabled
+    switch!("BREP_SEAM_RESEAT", true)
 }
 
 
@@ -57,9 +55,9 @@ pub(super) fn reseat_tangent_seams<'a>(
         reseat_operand(first, second, later, weld).map_or(Cow::Borrowed(first), Cow::Owned),
         reseat_operand(second, first, later, weld).map_or(Cow::Borrowed(second), Cow::Owned),
     );
-    if std::env::var_os("BREP_PROFILE").is_some() {
+    if crate::profile::profile_enabled() {
         let after = TOPOLOGY_WORK.with(|work| work.get());
-        eprintln!("boolean.seam_topology censuses={} coedges={}", after.0 - before.0, after.1 - before.1);
+        profile_line!("boolean.seam_topology censuses={} coedges={}", after.0 - before.0, after.1 - before.1);
     }
     result
 }
@@ -234,8 +232,7 @@ impl ReseatTopology {
 }
 
 fn topology_memo_enabled() -> bool {
-    thread_local! { static OFF: std::cell::OnceCell<bool> = const { std::cell::OnceCell::new() }; }
-    !OFF.with(|off| *off.get_or_init(|| std::env::var("BREP_RESEAT_TOPOLOGY_MEMO").as_deref() == Ok("0")))
+    switch!("BREP_RESEAT_TOPOLOGY_MEMO", true)
 }
 
 fn reseat_operand(solid: &BrepSolid, other: &BrepSolid, later: &[String], weld: f64) -> Option<BrepSolid> {

@@ -38,11 +38,7 @@ pub(super) fn enabled() -> bool {
 pub(super) fn closed_enabled() -> bool {
     // On by default (promoted 2026-10-16); `BREP_SOUNDNESS_BLEND_CLOSED=0`
     // (any value but 1/on) declines a closed patch on its seam again.
-    match std::env::var("BREP_SOUNDNESS_BLEND_CLOSED") {
-        Ok(value) => value == "1" || value == "on",
-        Err(std::env::VarError::NotPresent) => true,
-        Err(_) => false,
-    }
+    switch!(live "BREP_SOUNDNESS_BLEND_CLOSED", true)
 }
 
 pub(super) fn certifies(solid: &BrepSolid, options: SelfIntersectionOptions) -> bool {

@@ -26,10 +26,79 @@ which is how a page serves the same tools over WebMCP.
 - `image` — screenshot processing and comparison.
 - `render_mesh` — a CPU mesh rasteriser and silhouette comparison that need no
   GPU, window or browser; the `render_mesh` example is its command line.
-- `generate` — the generated tool reference.
+- `generate` — registry input/output schemas and TypeScript declarations.
+- `cad` — bounded JavaScript/TypeScript workers, semantic CAD operations,
+  scoped artifacts, selective function discovery and process-scoped task handles.
+- `prompts` — the same seven workflows via `prompts/list` and `prompts/get`.
+  Each takes a required `request` string and optional workflow context listed in
+  its descriptor. Retrieval returns user-role messages and performs no CAD work.
+  The catalogue is static for the server lifetime; it does not advertise change
+  notifications. Unknown names, cursors, arguments and non-string values fail.
+- `skills` — seven embedded workflows exposed through the official Skills
+  extension and Resources, with SHA-256 file manifests.
+- `skill_distribution` — offline bundle export, explicitly pinned installation,
+  verified version selection and rollback for those reviewed Markdown workflows.
+
+The public tool list stays at six entries (`run_script`, `script_result`, `script_halt`,
+`screenshot`, `input`, `files`). Scripts discover other functions as
+needed. Resources expose function contracts, execution/document snapshots and
+bounded artifact chunks. Resource notifications invalidate snapshots and clients
+reread them after changes or reconnects. The server supports MCP 2026-07-28
+cache metadata, the Skills extension and polling through the Tasks extension;
+legacy clients continue using `script_result` and `script_halt`.
+
+Clients can opt into request progress with a `progressToken` when `run_script`
+or `script_result` waits for execution. Updates report elapsed request-wait
+seconds, once per second, with at most 600 updates and no completion percentage.
+They stop when the request finishes or is cancelled; cancelling the wait does
+not cancel accepted execution. Use `script_halt` to stop execution. Legacy HTTP
+reconnection can replay an identical cached SSE progress event; clients should
+deduplicate by event ID. Task polling remains available independently.
+
+The local credential grants the user's application authority. Trusted scripts
+can call functions that read and write files. Restricted executions omit that
+bridge and check document permissions per capability. Workers are separate
+processes, with Linux watchdog measurements and bounded host bridges; they are
+not an OS sandbox. Task records, diagnostic events and artifacts use bounded retention. Library hosts select durable execution
+admission and result records with `BrepServer::with_state_dir`. The native launch
+paths resolve stable profiles: `headless` for `brep-mcp serve` and `desktop` for
+the application. Profiles live under the per-user `brep-app/mcp-state` directory.
+Use `serve --instance NAME` for another concurrent server, `--state-dir PATH` to
+reopen an existing journal in place, or `--ephemeral` for process-only execution
+state. An identity already owned by another process produces a startup error.
+
+Launch flags override `BREP_MCP_INSTANCE`, `BREP_MCP_STATE_DIR`, or
+`BREP_MCP_EPHEMERAL=true`; environment settings override the corresponding
+`headless` or `desktop` policy in the config directory's `mcp-state.json`.
+Each layer selects one whole mode. Desktop flags use the `--mcp-` prefix and
+machine-local preferences take effect on restart, including editor-first use.
+The default config directory follows `XDG_CONFIG_HOME`, Windows `APPDATA`, then
+`HOME/.config`, with `brep-app` appended.
+
+An initial durable launch starts a new journal; prior ephemeral executions cannot
+be recovered. Interrupted executions require reconciliation and are never
+replayed automatically. Artifact bytes, app state and the diagnostic event ring
+are not persisted by the execution journal.
 
 It depends on [`BREP_render`](https://crates.io/crates/BREP_render), and on
 `rmcp` and `tokio`.
+
+## Native TypeScript toolchain
+
+User JavaScript runs in Boa. TypeScript additionally needs Node and exactly
+TypeScript 7.0.2. Set `BREP_NODE` to the Node executable and `BREP_TSC` to the
+TypeScript package's JavaScript `bin/tsc` launcher, or expose `node` and that
+`tsc` on PATH. If an installation exposes a shell shim, point `BREP_TSC`
+directly at the package launcher. Nothing is installed automatically:
+`code::provision_typescript` (the `brep-mcp typescript provision` and
+`brep-app --provision-typescript` commands) installs the pinned package with
+npm into `code::typescript_prefix`, and `code::typescript_status` is the
+discovery-plus-launcher-probe check the server advertises.
+
+Node starts the compiler launcher (which may start its native compiler), with
+one strict check-and-emit invocation using `--noEmitOnError`. Compiler time,
+memory and output limits still apply. Only successfully checked JavaScript
+is passed to Boa; Node never runs user programs. Bun is not required.
 
 ## Feature flags
 

@@ -4,8 +4,8 @@ use crate::projection::project_point_to_surface_from_seed;
 use crate::{project_point_to_surface, KnotVector, NurbsSurface, Vec3};
 use serde::{Deserialize, Serialize};
 
-const EPSILON: f64 = 1e-12;
-const LINEAR_TOLERANCE: f64 = 1e-7;
+const EPSILON: f64 = crate::tolerance::FP_FLOOR;
+const LINEAR_TOLERANCE: f64 = crate::tolerance::DEFAULT_MODEL;
 
 /// Minimum `|n_a × n_b|` at a start point for a trace to begin there — the
 /// gate `intersect_surfaces` applies to explicit seeds and grid starts alike,
@@ -71,58 +71,8 @@ fn step_budget(maximum_steps: usize, maximum_step: f64, diagonal: f64) -> usize 
     needed as usize
 }
 
-#[derive(Clone, Copy)]
-struct Bounds {
-    minimum: Vec3,
-    maximum: Vec3,
-}
+use crate::spatial::Aabb as Bounds;
 
-impl Bounds {
-    fn from_surface(surface: &NurbsSurface) -> Result<Self, String> {
-        let mut minimum = Vec3::new(f64::INFINITY, f64::INFINITY, f64::INFINITY);
-        let mut maximum = Vec3::new(f64::NEG_INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY);
-        for point in surface.control_points.iter().flatten() {
-            let point = point.point()?;
-            minimum.x = minimum.x.min(point.x);
-            minimum.y = minimum.y.min(point.y);
-            minimum.z = minimum.z.min(point.z);
-            maximum.x = maximum.x.max(point.x);
-            maximum.y = maximum.y.max(point.y);
-            maximum.z = maximum.z.max(point.z);
-        }
-        Ok(Self { minimum, maximum })
-    }
-
-    fn diagonal(self) -> f64 {
-        self.maximum.sub(self.minimum).length()
-    }
-
-    fn expanded(self, amount: f64) -> Self {
-        let delta = Vec3::new(amount, amount, amount);
-        Self {
-            minimum: self.minimum.sub(delta),
-            maximum: self.maximum.add(delta),
-        }
-    }
-
-    fn contains(self, point: Vec3) -> bool {
-        point.x >= self.minimum.x
-            && point.x <= self.maximum.x
-            && point.y >= self.minimum.y
-            && point.y <= self.maximum.y
-            && point.z >= self.minimum.z
-            && point.z <= self.maximum.z
-    }
-
-    fn intersects(self, other: Self, tolerance: f64) -> bool {
-        self.expanded(tolerance).minimum.x <= other.maximum.x
-            && self.maximum.x + tolerance >= other.minimum.x
-            && self.minimum.y - tolerance <= other.maximum.y
-            && self.maximum.y + tolerance >= other.minimum.y
-            && self.minimum.z - tolerance <= other.maximum.z
-            && self.maximum.z + tolerance >= other.minimum.z
-    }
-}
 
 #[derive(Clone, Copy)]
 struct SurfaceInfo<'a> {
@@ -174,11 +124,7 @@ fn surface_info(surface: &NurbsSurface) -> Result<SurfaceInfo<'_>, String> {
 }
 
 fn fit(value: f64, minimum: f64, maximum: f64, closed: bool) -> f64 {
-    if closed {
-        (value - minimum).rem_euclid(maximum - minimum) + minimum
-    } else {
-        value.clamp(minimum, maximum)
-    }
+    crate::projection::fit_parameter(value, minimum, maximum, closed)
 }
 
 
@@ -282,8 +228,8 @@ fn find_start_points(
     };
     let nu = grid_count(first, true);
     let nv = grid_count(first, false);
-    let first_box = Bounds::from_surface(first.surface)?;
-    let second_box = Bounds::from_surface(second.surface)?;
+    let first_box = Bounds::from_surface_controls(first.surface)?;
+    let second_box = Bounds::from_surface_controls(second.surface)?;
     let gate = first_box.diagonal().min(second_box.diagonal()) * 0.15 + tolerance;
     let expanded_second = second_box.expanded((tolerance * 100.0).max(gate));
     let mut starts = Vec::new();
@@ -330,7 +276,7 @@ fn span_leaves(info: SurfaceInfo<'_>) -> Result<Vec<SpanLeaf>, String> {
     let (spans_u, spans_v) = (spans(&surface.knots_u, p, rows), spans(&surface.knots_v, q, columns));
     if spans_u.is_empty() || spans_v.is_empty() {
         return Ok(vec![SpanLeaf {
-            bounds: Bounds::from_surface(surface)?,
+            bounds: Bounds::from_surface_controls(surface)?,
             centre: [0.5 * (info.u0 + info.u1), 0.5 * (info.v0 + info.v1)],
         }]);
     }
@@ -379,8 +325,8 @@ fn tree_start_points(
     second: SurfaceInfo<'_>,
     tolerance: f64,
 ) -> Result<Option<(Vec<IntersectionPoint>, usize)>, String> {
-    let first_box = Bounds::from_surface(first.surface)?;
-    let second_box = Bounds::from_surface(second.surface)?;
+    let first_box = Bounds::from_surface_controls(first.surface)?;
+    let second_box = Bounds::from_surface_controls(second.surface)?;
     let gate = first_box.diagonal().min(second_box.diagonal()) * 0.15 + tolerance;
     let grow = (tolerance * 100.0).max(gate);
     let leaves_a = span_leaves(first)?;
@@ -1058,14 +1004,7 @@ fn trace(
 }
 
 fn point_segment_distance(point: Vec3, start: Vec3, end: Vec3) -> f64 {
-    let segment = end.sub(start);
-    let length_squared = segment.length_squared();
-    if length_squared <= EPSILON {
-        return point.sub(start).length();
-    }
-    let parameter = point.sub(start).dot(segment) / length_squared;
-    let parameter = parameter.clamp(0.0, 1.0);
-    point.sub(start.add(segment.scale(parameter))).length()
+    point.distance_to_segment(start, end, EPSILON)
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1226,8 +1165,9 @@ pub fn intersect_surfaces(
     second_surface: &NurbsSurface,
     options: &SurfaceIntersectionOptions,
 ) -> Result<Vec<SurfaceIntersectionCurve>, String> {
-    let first_box = Bounds::from_surface(first_surface)?;
-    let second_box = Bounds::from_surface(second_surface)?;
+    let _lap = crate::projection_profile::Lap::enter_pair(first_surface, second_surface);
+    let first_box = Bounds::from_surface_controls(first_surface)?;
+    let second_box = Bounds::from_surface_controls(second_surface)?;
     if !first_box.intersects(second_box, options.tolerance * 10.0) {
         return Ok(Vec::new());
     }
@@ -1437,8 +1377,8 @@ pub fn intersect_surfaces_supplemental(
     second_surface: &NurbsSurface,
     options: &SurfaceIntersectionOptions,
 ) -> Result<Vec<SurfaceIntersectionCurve>, String> {
-    let first_box = Bounds::from_surface(first_surface)?;
-    let second_box = Bounds::from_surface(second_surface)?;
+    let first_box = Bounds::from_surface_controls(first_surface)?;
+    let second_box = Bounds::from_surface_controls(second_surface)?;
     if !first_box.intersects(second_box, options.tolerance * 10.0) {
         return Ok(Vec::new());
     }

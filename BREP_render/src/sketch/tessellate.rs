@@ -85,6 +85,16 @@ pub fn tessellate_with_state(
     let dash_len = (8.0 * world_per_pixel).max(0.02);
     let gap_len = (6.0 * world_per_pixel).max(0.01);
 
+    let expanded = doc.geometries.iter().any(|g| g.geom_type == "text").then(|| super::text::expanded(doc).ok()).flatten();
+    if let Some(derived) = &expanded {
+        for geo in derived.geometries.iter().filter(|g| g.extra.contains_key("textOwner")) {
+            let poly = geometry_polyline_uv(geo, derived);
+            let world: Vec<_> = poly.iter().map(|p| plane.to_world(p[0], p[1])).collect();
+            let color = interaction_color(colors, colors.geometry, hovered, selection, "geometry", &geo.extra["textOwner"]);
+            push_solid(&mut out, &world, rgb(color));
+        }
+    }
+
     // --- curves -> overlay line segments --------------------------------------
     for geo in &doc.geometries {
         let pts = match sample_geometry(geo, &get, plane) {
@@ -467,7 +477,7 @@ fn preview_polyline_uv(tool: &str, pending: &[[f64; 2]], cursor: [f64; 2]) -> Ve
             poly
         }
         // Axis-aligned (in uv) rectangle from corner A to the cursor (corner B).
-        "rect" if !pending.is_empty() => {
+        "rect" | "text" if !pending.is_empty() => {
             let [ax, ay] = pending[0];
             let [bx, by] = cursor;
             vec![[ax, ay], [bx, ay], [bx, by], [ax, by], [ax, ay]]

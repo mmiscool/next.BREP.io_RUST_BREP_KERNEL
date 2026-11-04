@@ -1,5 +1,35 @@
 use crate::{KernelRefusal, KernelStage, OrRefuse, RefusalClass, MAX_FIT_STATIONS};
 
+// Fit-split instrumentation (2026-11-02): where the section
+// fit's time goes, read only under BREP_PROFILE and printed once per
+// `build_imprints` as `imprint.fit_split`. Zero behaviour: timers only.
+#[derive(Clone, Copy)]
+pub(super) enum FitSplitLane { InitialFit, EvenSliverTotal, RefineTotal, Consistency, Midspan, MidspanRefine, CarrierUpper, Representatives, Seeded, FullRefit, CarrierReadings }
+const FIT_SPLIT_LANES: usize = 11;
+const FIT_SPLIT_NAMES: [&str; FIT_SPLIT_LANES] = ["initial_fit", "even_sliver_total", "refine_total", "consistency", "midspan", "midspan_refine", "carrier_upper", "representatives", "seeded", "full_refit", "carrier_readings"];
+thread_local! {
+    static FIT_SPLIT: std::cell::RefCell<([f64; FIT_SPLIT_LANES], [u64; FIT_SPLIT_LANES])> = const { std::cell::RefCell::new(([0.0; FIT_SPLIT_LANES], [0; FIT_SPLIT_LANES])) };
+}
+pub(super) fn fit_split_started() -> Option<Instant> { crate::profile::profile_enabled().then(Instant::now) }
+pub(super) fn fit_split_add(lane: FitSplitLane, started: Option<Instant>, calls: u64) {
+    if let Some(started) = started {
+        FIT_SPLIT.with(|cell| { let mut cell = cell.borrow_mut(); cell.0[lane as usize] += started.elapsed().as_secs_f64() * 1e3; cell.1[lane as usize] += calls; });
+    }
+}
+pub(super) fn fit_split_timed<T>(lane: FitSplitLane, run: impl FnOnce() -> T) -> T {
+    let started = fit_split_started();
+    let out = run();
+    fit_split_add(lane, started, 1);
+    out
+}
+pub(super) fn fit_split_report() {
+    let (ms, calls) = FIT_SPLIT.with(|cell| std::mem::take(&mut *cell.borrow_mut()));
+    let line = FIT_SPLIT_NAMES.iter().enumerate().map(|(i, name)| format!("{name}={:.2}/{}", ms[i], calls[i])).collect::<Vec<_>>().join(" ");
+    profile_line!("imprint.fit_split {line}");
+    let (calls, stations, points, params_ms, interpolate_ms, measure_ms) = crate::fit::station_set_split_take();
+    profile_line!("imprint.station_set calls={calls} stations={stations} points={points} params_ms={params_ms:.2} interpolate_ms={interpolate_ms:.2} measure_ms={measure_ms:.2}");
+}
+
 /// The degree a marched section is interpolated at (2026-09-27). The march
 /// puts every station on both carriers; the fit decides how far the curve
 /// strays BETWEEN them, and a cubic's O(h^4) there left `BadBoolean`'s
@@ -91,16 +121,52 @@ pub(super) fn fast_path_carrier_readings(fit: &PolylineFit, run: &[Vec3], first:
     (station, midspan_carrier_upper(fit, first, second))
 }
 
+/// SECTION-REFINE READ MEMO (`BREP_SECTION_REFINE_READ_MEMO`, default on, =0 restores;
+/// 2026-11-03). One section refine reads the carrier distance of
+/// the SAME points several times: a representative round reads every mid-span
+/// in [`midspan_misses`], again in [`midspan_carrier_upper`], and, once a
+/// representative has run, the mid-spans and knot interiors a second time on
+/// the unchanged fit. In wasm the planter's carrier upper reads were 103 ms of
+/// its 395 ms section fit. This keeps each `(carrier, point bits)` reading for
+/// one `refine_section_against_carriers_inner` call, error included, so every
+/// caller sees exactly the value (or error) the first read returned. Off, it
+/// is the projector itself.
+pub(super) struct CarrierReads {
+    memo: Option<HashMap<(usize, [u64; 3]), Result<f64, String>>>,
+}
+impl CarrierReads {
+    pub(super) fn off() -> Self {
+        Self { memo: None }
+    }
+    pub(super) fn open() -> Self {
+        Self { memo: switch!(live "BREP_SECTION_REFINE_READ_MEMO", true).then(HashMap::default) }
+    }
+    /// The carrier distance at `point` on carrier `side` (0 first, 1 second).
+    pub(super) fn distance(&mut self, side: usize, surface: &NurbsSurface, point: Vec3) -> Result<f64, String> {
+        let Some(memo) = self.memo.as_mut() else {
+            return project_point_to_surface(surface, point).map(|projection| projection.distance);
+        };
+        memo.entry((side, [point.x.to_bits(), point.y.to_bits(), point.z.to_bits()]))
+            .or_insert_with(|| project_point_to_surface(surface, point).map(|projection| projection.distance))
+            .clone()
+    }
+}
+
 /// The worst of BOTH carriers at the fit's mid-spans, each carrier read on its
 /// own and checked finite BEFORE any max (`f64::max` would drop a NaN from one
 /// carrier and pass the other's reading): NaN as soon as either is unreadable.
 pub(super) fn midspan_carrier_upper(fit: &PolylineFit, first: &NurbsSurface, second: &NurbsSurface) -> f64 {
-    let read = |surface: &NurbsSurface, point: Vec3| project_point_to_surface(surface, point).map_or(f64::NAN, |projection| projection.distance);
+    midspan_carrier_upper_read(fit, first, second, &mut CarrierReads::off())
+}
+
+/// [`midspan_carrier_upper`] through a section-refine round's [`CarrierReads`].
+fn midspan_carrier_upper_read(fit: &PolylineFit, first: &NurbsSurface, second: &NurbsSurface, reads: &mut CarrierReads) -> f64 {
+    let mut read = |side: usize, surface: &NurbsSurface, point: Vec3| reads.distance(side, surface, point).unwrap_or(f64::NAN);
     let mut worst = 0.0f64;
     for span in 0..fit.parameters.len().saturating_sub(1) {
         let mid = 0.5 * (fit.parameters[span] + fit.parameters[span + 1]);
         let (a, b) = match fit.curve.evaluate(mid) {
-            Ok(point) => (read(first, point), read(second, point)),
+            Ok(point) => (read(0, first, point), read(1, second, point)),
             Err(_) => (f64::NAN, f64::NAN),
         };
         if !(a.is_finite() && b.is_finite()) || worst.is_nan() {
@@ -117,7 +183,12 @@ pub(super) fn midspan_carrier_upper(fit: &PolylineFit, first: &NurbsSurface, sec
 /// and projector-based: an upper reading at its points, not a certified
 /// maximum of the curve.
 pub(super) fn knot_interior_carrier_upper(curve: &NurbsCurve, first: &NurbsSurface, second: &NurbsSurface) -> f64 {
-    let read = |surface: &NurbsSurface, point: Vec3| project_point_to_surface(surface, point).map_or(f64::NAN, |projection| projection.distance);
+    knot_interior_carrier_upper_read(curve, first, second, &mut CarrierReads::off())
+}
+
+/// [`knot_interior_carrier_upper`] through a section-refine round's [`CarrierReads`].
+fn knot_interior_carrier_upper_read(curve: &NurbsCurve, first: &NurbsSurface, second: &NurbsSurface, reads: &mut CarrierReads) -> f64 {
+    let mut read = |side: usize, surface: &NurbsSurface, point: Vec3| reads.distance(side, surface, point).unwrap_or(f64::NAN);
     let Ok([t0, t1]) = curve.domain() else { return f64::NAN };
     let mut knots: Vec<f64> = curve.knots.iter().copied().filter(|knot| *knot >= t0 && *knot <= t1).collect();
     knots.dedup();
@@ -129,7 +200,7 @@ pub(super) fn knot_interior_carrier_upper(curve: &NurbsCurve, first: &NurbsSurfa
         for fraction in [0.25, 0.5, 0.75] {
             let value = match curve.evaluate(pair[0] + (pair[1] - pair[0]) * fraction) {
                 Ok(point) => {
-                    let (a, b) = (read(first, point), read(second, point));
+                    let (a, b) = (read(0, first, point), read(1, second, point));
                     if a.is_finite() && b.is_finite() { a.max(b) } else { f64::NAN }
                 }
                 Err(_) => f64::NAN,
@@ -386,12 +457,10 @@ pub(super) enum ExactIsoPcurves {
 }
 
 fn exact_iso_pcurves(options: &ImprintOptions) -> ExactIsoPcurves {
-    match std::env::var("BREP_EXACT_ISO_PCURVES").as_deref() {
-        Ok("0") | Ok("off") => ExactIsoPcurves::Off,
-        Ok("check") => ExactIsoPcurves::Check,
-        Ok(_) => ExactIsoPcurves::On,
-        Err(_) if options.exact_iso_pcurves => ExactIsoPcurves::On,
-        Err(_) => ExactIsoPcurves::Off,
+    match mode_switch!(live "BREP_EXACT_ISO_PCURVES", options.exact_iso_pcurves) {
+        crate::env_read::Mode::Off => ExactIsoPcurves::Off,
+        crate::env_read::Mode::Check => ExactIsoPcurves::Check,
+        crate::env_read::Mode::On => ExactIsoPcurves::On,
     }
 }
 
@@ -470,11 +539,7 @@ const SECTION_MIDSPAN_PROGRESS: f64 = 0.5;
 
 /// Squared distance from `point` to the segment `from`-`to`.
 fn distance_to_segment_sq(point: Vec3, from: Vec3, to: Vec3) -> f64 {
-    let d = to.sub(from);
-    let l2 = d.dot(d);
-    let t = if l2 > 0.0 { (point.sub(from).dot(d) / l2).clamp(0.0, 1.0) } else { 0.0 };
-    let q = from.add(d.scale(t));
-    point.sub(q).dot(point.sub(q))
+    point.distance_to_segment_squared(from, to)
 }
 
 /// How a mid-span refinement left (`SECTION_MIDSPAN_*`), for the pair trace.
@@ -508,6 +573,7 @@ fn midspan_misses(
     second: &NurbsSurface,
     floor: f64,
     tolerance: f64,
+    reads: &mut CarrierReads,
 ) -> Result<(f64, usize, Vec<(usize, Vec3)>), String> {
     let mut worst = 0.0f64;
     let mut missing = 0usize;
@@ -515,9 +581,7 @@ fn midspan_misses(
     for span in 0..fit.parameters.len().saturating_sub(1) {
         let mid = 0.5 * (fit.parameters[span] + fit.parameters[span + 1]);
         let point = fit.curve.evaluate(mid)?;
-        let off = project_point_to_surface(first, point)?
-            .distance
-            .max(project_point_to_surface(second, point)?.distance);
+        let off = reads.distance(0, first, point)?.max(reads.distance(1, second, point)?);
         worst = worst.max(off);
         if off <= floor {
             continue;
@@ -525,9 +589,9 @@ fn midspan_misses(
         missing += 1;
         // The refined point must stay on THIS span: half its chord is the reach.
         let reach = 0.5 * fit.kept[span + 1].sub(fit.kept[span]).length();
-        if let Some(refined) = crate::surface_surface_intersection::refine_to_intersection(
+        if let Some(refined) = fit_split_timed(FitSplitLane::MidspanRefine, || crate::surface_surface_intersection::refine_to_intersection(
             first, second, point, tolerance, reach,
-        )? {
+        ))? {
             inserts.push((span, refined));
         }
     }
@@ -667,13 +731,25 @@ pub(super) fn even_sliver_ends_measured(
     maximum_fit_points: usize,
     local_fit: bool,
 ) -> Result<(Vec<Vec3>, PolylineFit, bool, SliverEvening), String> {
-    let (fit, recovered) = crate::fit::fit_polyline_of_degree_with_recovery(
+    fit_split_timed(FitSplitLane::EvenSliverTotal, || even_sliver_ends_measured_inner(section, first, second, tolerance, fit_tolerance, maximum_fit_points, local_fit))
+}
+
+fn even_sliver_ends_measured_inner(
+    section: Vec<Vec3>,
+    first: &NurbsSurface,
+    second: &NurbsSurface,
+    tolerance: f64,
+    fit_tolerance: f64,
+    maximum_fit_points: usize,
+    local_fit: bool,
+) -> Result<(Vec<Vec3>, PolylineFit, bool, SliverEvening), String> {
+    let (fit, recovered) = fit_split_timed(FitSplitLane::InitialFit, || crate::fit::fit_polyline_of_degree_with_recovery(
         &section,
         fit_tolerance,
         maximum_fit_points,
         local_fit,
         section_fit_degree(),
-    )?;
+    ))?;
     let mut evened = section.clone();
     let slivers = even_sliver_ends(&mut evened, first, second, tolerance)?;
     if slivers == 0 {
@@ -800,6 +876,25 @@ pub(super) fn refine_section_against_carriers_with(
     representatives: bool,
     receipt: &mut RefineReceipt,
 ) -> Result<(PolylineFit, f64, f64, usize, MidspanExit), String> {
+    let started = fit_split_started();
+    let out = refine_section_against_carriers_inner(section, fit, first, second, fit_tolerance, tolerance, local_fit, gate, representatives, receipt);
+    fit_split_add(FitSplitLane::RefineTotal, started, 1);
+    out
+}
+
+#[allow(clippy::too_many_arguments)]
+fn refine_section_against_carriers_inner(
+    section: &mut Vec<Vec3>,
+    fit: PolylineFit,
+    first: &NurbsSurface,
+    second: &NurbsSurface,
+    fit_tolerance: f64,
+    tolerance: f64,
+    local_fit: bool,
+    gate: f64,
+    representatives: bool,
+    receipt: &mut RefineReceipt,
+) -> Result<(PolylineFit, f64, f64, usize, MidspanExit), String> {
     // A reused receipt starts clean, so an error return leaves `returned`
     // None as documented, never a previous call's value.
     *receipt = RefineReceipt::default();
@@ -826,6 +921,7 @@ pub(super) fn refine_section_against_carriers_with(
     // discounting input points is the reserved relocation ruling).
     // `representatives` false (the `BREP_SECTION_REPRESENTATIVES=0` hatch)
     // restores the seeded path everywhere for an attribution A/B only.
+    let consistency_started = fit_split_started();
     let original_consistent = representatives
         && section.iter().all(|point| {
             let a = project_point_to_surface(first, *point).map_or(f64::NAN, |projection| projection.distance);
@@ -833,6 +929,7 @@ pub(super) fn refine_section_against_carriers_with(
             a.is_finite() && b.is_finite() && a <= fit_tolerance && b <= fit_tolerance
         });
     receipt.original_consistent = original_consistent;
+    fit_split_add(FitSplitLane::Consistency, consistency_started, 1);
     let mut refit_path = String::from("standing");
     let mut refit_seeds = 0usize;
     let mut refit_seeds_kept = 0usize;
@@ -867,17 +964,18 @@ pub(super) fn refine_section_against_carriers_with(
     // best measured (fit, section) state kept for its budget exits.
     let mut representative_ran = false;
     let mut best_state: Option<((PolylineFit, Vec<Vec3>), f64)> = None;
+    let mut reads = CarrierReads::open();
     loop {
         // On an accepted representative candidate a read or refinement ERROR is
         // not a refusal: the section takes the original full refit of the same
         // run instead, as an unreadable read does below.
-        let (mut worst, missing, inserts) = match midspan_misses(&fit, first, second, floor, tolerance) {
+        let (mut worst, missing, inserts) = match fit_split_timed(FitSplitLane::Midspan, || midspan_misses(&fit, first, second, floor, tolerance, &mut reads)) {
             Ok(reading) => reading,
             Err(_) if representative_fit => {
                 representative_fit = false;
                 seeded_refit = false;
                 let maximum_points = section.len().min(MAX_FIT_STATIONS);
-                fit = fit_polyline_of_degree(section, fit_tolerance, maximum_points, local_fit, section_fit_degree())?;
+                fit = fit_split_timed(FitSplitLane::FullRefit, || fit_polyline_of_degree(section, fit_tolerance, maximum_points, local_fit, section_fit_degree()))?;
                 fit_source = RefinedFitSource::FullRefit;
                 refit_path = String::from("full-after-unreadable-representative");
                 refit_trials += 1;
@@ -893,15 +991,15 @@ pub(super) fn refine_section_against_carriers_with(
         // carrier target is unchanged). An unreadable read never passes: the
         // section takes the original full refit of the same run instead.
         if representative_fit {
-            let interior = knot_interior_carrier_upper(&fit.curve, first, second);
-            let midspans = midspan_carrier_upper(&fit, first, second);
+            let interior = fit_split_timed(FitSplitLane::CarrierUpper, || knot_interior_carrier_upper_read(&fit.curve, first, second, &mut reads));
+            let midspans = fit_split_timed(FitSplitLane::CarrierUpper, || midspan_carrier_upper_read(&fit, first, second, &mut reads));
             if interior.is_finite() && midspans.is_finite() {
                 worst = worst.max(interior).max(midspans);
             } else {
                 representative_fit = false;
                 seeded_refit = false;
                 let maximum_points = section.len().min(MAX_FIT_STATIONS);
-                fit = fit_polyline_of_degree(section, fit_tolerance, maximum_points, local_fit, section_fit_degree())?;
+                fit = fit_split_timed(FitSplitLane::FullRefit, || fit_polyline_of_degree(section, fit_tolerance, maximum_points, local_fit, section_fit_degree()))?;
                 fit_source = RefinedFitSource::FullRefit;
                 refit_path = String::from("full-after-unreadable-representative");
                 refit_trials += 1;
@@ -990,8 +1088,8 @@ pub(super) fn refine_section_against_carriers_with(
         // nothing is read or cloned.
         let mut current_common = f64::NAN;
         if representative_ran && section.len() <= MAX_FIT_STATIONS {
-            let interior = knot_interior_carrier_upper(&fit.curve, first, second);
-            let midspans = midspan_carrier_upper(&fit, first, second);
+            let interior = fit_split_timed(FitSplitLane::CarrierUpper, || knot_interior_carrier_upper_read(&fit.curve, first, second, &mut reads));
+            let midspans = fit_split_timed(FitSplitLane::CarrierUpper, || midspan_carrier_upper_read(&fit, first, second, &mut reads));
             current_common = if interior.is_finite() && midspans.is_finite() { interior.max(midspans) } else { f64::NAN };
             keep_best_state(&mut best_state, || (fit.clone(), section.clone()), current_common);
         }
@@ -1021,7 +1119,7 @@ pub(super) fn refine_section_against_carriers_with(
                     seeded_refit = false;
                     let maximum_points = section.len().min(MAX_FIT_STATIONS);
                     let retry_started = round_census.is_some().then(Instant::now);
-                    fit = fit_polyline_of_degree(section, fit_tolerance, maximum_points, local_fit, section_fit_degree())?;
+                    fit = fit_split_timed(FitSplitLane::FullRefit, || fit_polyline_of_degree(section, fit_tolerance, maximum_points, local_fit, section_fit_degree()))?;
                     fit_source = RefinedFitSource::FullRefit;
                     // Trace: one more fit for the SAME round, its cost, and no
                     // seed counters carried over from the rejected seeded fit.
@@ -1168,7 +1266,7 @@ pub(super) fn refine_section_against_carriers_with(
         let refit_source;
         let refit = if next_kept == fit.kept.len() {
             let (refit, path) = if original_consistent {
-                let (refit, path, cost) = crate::fit::fit_polyline_representatives_with_witnesses(
+                let (refit, path, cost) = fit_split_timed(FitSplitLane::Representatives, || crate::fit::fit_polyline_representatives_with_witnesses(
                     section,
                     &kept_seeds,
                     &insert_indices,
@@ -1177,7 +1275,7 @@ pub(super) fn refine_section_against_carriers_with(
                     maximum_points,
                     local_fit,
                     section_fit_degree(),
-                )?;
+                ))?;
                 // MIXED UNITS, named as such: the candidate's own
                 // `fit_station_set` interpolations plus one per call of the
                 // full refit `fit_polyline_of_degree`, which may itself run
@@ -1188,14 +1286,14 @@ pub(super) fn refine_section_against_carriers_with(
                 (refit, path)
             } else {
                 refit_cost = crate::fit::RepresentativeCost::default();
-                crate::fit::fit_polyline_seeded_with_path(
+                fit_split_timed(FitSplitLane::Seeded, || crate::fit::fit_polyline_seeded_with_path(
                     section,
                     &seeds,
                     fit_tolerance,
                     maximum_points,
                     local_fit,
                     section_fit_degree(),
-                )?
+                ))?
             };
             // Only an ACCEPTED seeded fit can be retried in full: a fallback
             // already is the full refit, and retrying it would repeat it.
@@ -1213,7 +1311,7 @@ pub(super) fn refine_section_against_carriers_with(
             refit_cost = crate::fit::RepresentativeCost::default();
             refit_path = String::from("full-unmatched");
             refit_source = RefinedFitSource::FullRefit;
-            fit_polyline_of_degree(section, fit_tolerance, maximum_points, local_fit, section_fit_degree())?
+            fit_split_timed(FitSplitLane::FullRefit, || fit_polyline_of_degree(section, fit_tolerance, maximum_points, local_fit, section_fit_degree()))?
         };
         if round_census.is_some() {
             // Trace only: how many seeds the refit kept. This does NOT tell an
@@ -1307,8 +1405,7 @@ pub(crate) fn build_carrier_imprints_within(
 /// ([`super::support::planar_point_contact`]) once their seeds are accepted.
 /// On by default; `0`/`off` disables it.
 pub(super) fn plane_point_skip_enabled() -> bool {
-    let enabled = !matches!(std::env::var("BREP_IMPRINT_PLANE_POINT_SKIP").as_deref(), Ok("0") | Ok("off"));
-    enabled
+    switch!(live "BREP_IMPRINT_PLANE_POINT_SKIP", true)
 }
 
 thread_local! {
@@ -1349,6 +1446,7 @@ fn build_imprints_with_carrier_seeds(
     let setup_started = profile_enabled().then(Instant::now);
     let windows_before = window_reads();
     let _pcurve_cache = super::pcurve_cache::FitCacheScope::open(pcurve_cache);
+    let _edge_hulls = super::support::EdgeHullScope::open(super::support::edge_hull_memo_enabled());
     let _intersection_cache = super::intersection_cache::Scope::open();
     let reuse_whole_miss = open_carriers &&
         std::env::var("BREP_OFFSET_IMPRINT_READINGS").map_or(true, |v| v != "0" && v != "off");
@@ -2508,7 +2606,7 @@ fn build_imprints_with_carrier_seeds(
             if profile.enabled {
                 // Net metadata only: observing carriers must not warm their
                 // recognition/projection caches before the section fitter.
-                eprintln!("imprint.march_pair first={:?} second={:?} ids={}x{} degrees={}x{}/{}x{} nets={}x{}/{}x{} stations={:?}",
+                profile_line!("imprint.march_pair first={:?} second={:?} ids={}x{} degrees={}x{}/{}x{} nets={}x{}/{}x{} stations={:?}",
                     first.face.name, second.face.name, first.face.id, second.face.id,
                     first.face.surface.degree_u, first.face.surface.degree_v,
                     second.face.surface.degree_u, second.face.surface.degree_v,
@@ -2516,12 +2614,55 @@ fn build_imprints_with_carrier_seeds(
                     second.face.surface.control_points.len(), second.face.surface.control_points.first().map_or(0, Vec::len),
                     branches.iter().map(|branch| branch.points.len()).collect::<Vec<_>>());
             }
+            // GRAZING PIERCES BOUND CLIP INTERVALS TOO (hosted report
+            // 2026-11-01, "Boolean seems to take way too long": the cage-box
+            // union with the cylinder moved 0.165 off the cage's axis). The
+            // seed gate rejects a pierce whose `|tan·n|` is under 0.1 as a
+            // march START, but the point is still an exact section point on
+            // a trim edge: the end of a trim interval. The cylinder's bottom
+            // rim crosses the cage's flat-to-second-order side twice, 0.036
+            // apart, at `|tan·n|` = 0.0035, so the disc keeps a 0.036-long
+            // piece of the y = 0 section there. Marched from the accepted
+            // seeds with ~0.9 stations, that interval held no station, the
+            // clip dropped it, the disc's two lenses stayed unbounded and
+            // the arrangement tore: an open-edge refusal that sent the union
+            // up the perturbation ladder (64 imprints, ~39 s native, every
+            // rung refused). Inserting the rejected hits — gated, like every
+            // seed, to the ones lying on the branch — gives such an interval
+            // its endpoints. Only a RESOLVABLE pierce is inserted: its
+            // position along the edge is known to `tol / |tan·n|`, so the
+            // same bound the sub-gate re-march below admits a start at,
+            // `|tan·n| >= √(tol / 2·scale)`, keeps the lateral uncertainty
+            // inside the tangency band. Below it the hits are lies-on
+            // samples (an edge in the other carrier reads |tan·n| = 0 at
+            // every sample) or near-tangent brushes whose along-edge
+            // position is a guess: the 2026-10-25 offset-shell history
+            // (`successive_fillet_history_shells_under_the_one_call_imprint`)
+            // inserts 25 pairs' worth of such points at |tan·n| ≤ 1.1e-4 and
+            // its O.S10 pcurve fit then misses its stations by 2.6e-3.
+            // `BREP_GRAZING_CLIP_REFINE=0` restores the accepted seeds alone.
+            let clip_points: std::borrow::Cow<'_, [Vec3]> = if grazing_hits.is_empty()
+                || std::env::var("BREP_GRAZING_CLIP_REFINE").as_deref() == Ok("0")
+            {
+                std::borrow::Cow::Borrowed(&seed_points)
+            } else {
+                let resolvable = (options.tolerance / (2.0 * builder.scale.max(options.tolerance))).sqrt();
+                let mut points = seed_points.clone();
+                points.extend(grazing_hits.iter().filter(|hit| hit.1 >= resolvable).map(|hit| hit.0));
+                if debug_pairs && points.len() != seed_points.len() {
+                    eprintln!(
+                        "pair {}x{}: {} grazing pierce(s) at |tan.n| >= {resolvable:.3e} join the trim clip",
+                        first.face.id, second.face.id, points.len() - seed_points.len()
+                    );
+                }
+                std::borrow::Cow::Owned(points)
+            };
             for branch in branches {
                 // The pierce seeds are the section's exact trim-crossing
                 // points — insert them so no trim interval shorter than the
                 // march step is invisible to the point-classification clip.
                 let refined_points =
-                    insert_seed_points_into_branch(&branch.points, &seed_points, options.tolerance);
+                    insert_seed_points_into_branch(&branch.points, &clip_points, options.tolerance);
                 let clip_started = profile.enabled.then(Instant::now);
                 let mut runs = clip_branch_to_trims(&refined_points, first, second)?;
                 // TANGENT-RIM LANDING: a run the march stalled short of a trim
@@ -2537,6 +2678,23 @@ fn build_imprints_with_carrier_seeds(
                     || pair_classification.relation == SurfacePairRelation::NearTangent
                 {
                     for run in runs.iter_mut() {
+                        for (operand, edge_id, parameter, from, to) in land_run_ends_on_tangent_node(
+                            run,
+                            first,
+                            second,
+                            &face_edge_lists,
+                            options.tolerance,
+                        )? {
+                            if debug_pairs {
+                                eprintln!(
+                                    "pair {}x{}: tangent-node landing: run end ({:.6},{:.6},{:.6}) -> \
+                                     node ({:.9},{:.9},{:.9}) on operand {operand} edge {edge_id} at t={parameter:.9}",
+                                    first.face.id, second.face.id, from.x, from.y, from.z, to.x, to.y, to.z
+                                );
+                            }
+                            let edge = builder.edges[&(operand, edge_id)];
+                            builder.add_edge_split(operand, edge, parameter)?;
+                        }
                         for (operand, edge_id, parameter, from, to) in land_run_ends_on_tangent_rim(
                             run,
                             tangent_node,
@@ -2697,7 +2855,7 @@ fn build_imprints_with_carrier_seeds(
                                 return None;
                             }
                             let (station_upper, midspan_upper) =
-                                fast_path_carrier_readings(&fit, &section, &first.face.surface, &second.face.surface);
+                                fit_split_timed(FitSplitLane::CarrierReadings, || fast_path_carrier_readings(&fit, &section, &first.face.surface, &second.face.surface));
                             carrier_miss_route(station_upper, midspan_upper, fit_tolerance)
                         });
                         if let Some((gate, route)) = refine_route {
@@ -3347,8 +3505,7 @@ fn edge_crosses_carrier(
 /// on the other carrier as before (see the seed loop); unset or anything else
 /// skips it. Read once.
 fn lies_on_seed_skip_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var("BREP_IMPRINT_LIES_ON_SEED_SKIP").as_deref() != Ok("0"))
+    switch!("BREP_IMPRINT_LIES_ON_SEED_SKIP", true)
 }
 
 /// TANGENT-RIM LANDING (hosted report 2026-10-17, "boolean fails": a box
@@ -3484,6 +3641,127 @@ fn land_run_ends_on_tangent_rim(
     }
     Ok(landings)
 }
+/// TANGENT-NODE LANDING (hosted report 2026-11-01, "Boolean fails": a NURBS
+/// Solid BOX cage, 10³ with 8 segments and 3 rings, unioned with a radius-5
+/// cylinder standing on `y = 0`).
+///
+/// Three collinear cage points per side make the body flat to second order at
+/// each side midpoint, and the cylinder's bottom rim passes through all four:
+/// the two carriers touch at four isolated higher-order NODES that lie ON a
+/// trim edge. Two section branches leave each node, mutually tangent there
+/// (`z = ±c·y^{3/2}` on the wall). The march cannot place a station near such
+/// a node: across the contact the carriers separate only as `δ² κ / 2`, so at
+/// the model tolerance a station is uncertain by `√(2·tol/κ)` along the rim
+/// (`1e-3` here). Measured: the four arcs ended ON the rim but 1.4e-5..2e-4
+/// along it from their nodes, so each node's two arrivals split the rim twice
+/// and left `On` slivers between, and the arcs into the node on the cylinder's
+/// seam wobbled ACROSS the seam at `y ≈ 1.3e-3` (the true branch touches the
+/// seam only at the node), leaving seam-hugging slivers. Six open corners and
+/// a torn shell; [`land_run_ends_on_tangent_rim`] does not reach it because
+/// those ends are already on the edge — they stopped at the wrong place ALONG
+/// it, not short of it.
+///
+/// So: a run end where the carriers are tangent is refined onto its contact
+/// (`classify_tangent_contact`); when that contact is an isolated node within
+/// the landing reach that lies on a trim edge of either face, the stations
+/// inside the node's ambiguity radius `3·√(2·tol/κ)` are dropped — they carry
+/// no position the march could resolve — and the end is the node itself,
+/// provided the closing chord stays on both carriers
+/// ([`landing_segment_within`]). Every edge through the node is split exactly
+/// there, so both branches arriving at a node share one vertex. Returns the
+/// splits as [`land_run_ends_on_tangent_rim`] does.
+fn land_run_ends_on_tangent_node(
+    run: &mut Vec<Vec3>,
+    first: TaggedFace<'_>,
+    second: TaggedFace<'_>,
+    face_edge_lists: &HashMap<FaceKey, Vec<&EdgeRecord>>,
+    tolerance: f64,
+) -> Result<Vec<(u8, u64, f64, Vec3, Vec3)>, KernelRefusal> {
+    let mut landings = Vec::new();
+    if run.len() < 2 || std::env::var("BREP_TANGENT_NODE_LANDING").as_deref() == Ok("0") {
+        return Ok(landings);
+    }
+    for at_end in [false, true] {
+        let end = if at_end { run[run.len() - 1] } else { run[0] };
+        if !pair_normals_parallel_at(first, second, end)? {
+            continue;
+        }
+        let reach = 1e-2 * (1.0 + end.length());
+        let Some(contact) =
+            classify_tangent_contact(&first.face.surface, &second.face.surface, end, tolerance)?
+        else {
+            continue;
+        };
+        let node = contact.point;
+        if !contact.is_isolated_node() || node.sub(end).length() > reach || contact.curvature_scale <= 0.0 {
+            continue;
+        }
+        let clearance = (tolerance * 100.0).max(1e-6) * (1.0 + node.length());
+        // Every trim edge of either face the node lies on.
+        let mut splits: Vec<(u8, u64, f64)> = Vec::new();
+        for face in [first, second] {
+            let Some(edges) = face_edge_lists.get(&face.key()) else {
+                continue;
+            };
+            for edge in edges {
+                if edge.degenerate {
+                    continue;
+                }
+                let projection = project_point_to_curve(&edge.curve, node)
+                    .or_refuse(KernelStage::Intersect, "project_point_to_curve")?;
+                let parameter = projection.u.clamp(edge.t0.min(edge.t1), edge.t0.max(edge.t1));
+                let foot = edge.curve.evaluate(parameter).or_refuse(KernelStage::Intersect, "evaluate")?;
+                if foot.sub(node).length() <= tolerance * 10.0
+                    && !splits.iter().any(|&(operand, id, _)| operand == face.operand && id == edge.id)
+                {
+                    splits.push((face.operand, edge.id, parameter));
+                }
+            }
+        }
+        if splits.is_empty() {
+            continue;
+        }
+        // The ambiguity radius: the stations inside it are noise along the
+        // contact and are dropped outright. Beyond it, keep dropping while
+        // the closing chord to the node still rides both carriers to ten
+        // times the tolerance: near the node the branch is TANGENT to the
+        // contact direction (on the seam node, to the seam itself), so its
+        // true offset from that direction grows only as `r^{3/2}` and a
+        // station must be far enough out for that offset to dominate the
+        // corrector's noise — or the fitted piece wobbles across the seam.
+        let ambiguity = 3.0 * (2.0 * tolerance / contact.curvature_scale).sqrt();
+        let tight = tolerance * 10.0;
+        let mut kept: Vec<Vec3> = if at_end { run.clone() } else { run.iter().rev().copied().collect() };
+        while kept.len() > 1 && kept[kept.len() - 1].sub(node).length() <= ambiguity {
+            kept.pop();
+        }
+        let last = kept[kept.len() - 1];
+        if last.sub(node).length() > reach
+            || !landing_segment_within(&first.face.surface, &second.face.surface, last, node, clearance)
+        {
+            continue;
+        }
+        while kept.len() > 2 {
+            let further = kept[kept.len() - 2];
+            if further.sub(node).length() > reach
+                || !landing_segment_within(&first.face.surface, &second.face.surface, further, node, tight)
+            {
+                break;
+            }
+            kept.pop();
+        }
+        kept.push(node);
+        if !at_end {
+            kept.reverse();
+        }
+        *run = kept;
+        for (operand, edge_id, parameter) in splits {
+            landings.push((operand, edge_id, parameter, end, node));
+        }
+    }
+    Ok(landings)
+}
+
 /// The widened landing's certificate: is the straight segment from the
 /// stalled run end `from` to the foot `to` within `clearance` of BOTH
 /// carriers at every interior sample?

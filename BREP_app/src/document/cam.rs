@@ -26,6 +26,7 @@ use std::collections::BTreeMap;
 /// An NC program: an ordered group of operations posted through one
 /// post-processor to one file. User input; the motion stream it posts is
 /// derived at post time (lane C4).
+#[cfg_attr(feature = "automation", derive(schemars::JsonSchema))]
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct NcProgram {
@@ -51,6 +52,7 @@ pub struct NcProgram {
 /// what let the frame follow the model when it is rebuilt, and what the
 /// dialog shows in its picker fields. Entity names are the persistent names
 /// the selection uses (`Box_PZ`, a `{solid}@x,y,z` vertex).
+#[cfg_attr(feature = "automation", derive(schemars::JsonSchema))]
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct SetupOrientation {

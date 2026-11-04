@@ -140,6 +140,9 @@ fn build(ctx: &FeatureContext) -> Result<SketchOutput, String> {
         .get("sketch")
         .ok_or("sketch: solver returned no sketch")?;
 
+    let expanded = super::text::expand_text(solved_sketch)?;
+    let solved_sketch = &expanded;
+
     // id -> solved (x, y).
     let mut points: std::collections::HashMap<String, [f64; 2]> = std::collections::HashMap::new();
     if let Some(array) = solved_sketch.get("points").and_then(|p| p.as_array()) {
@@ -373,7 +376,9 @@ fn build(ctx: &FeatureContext) -> Result<SketchOutput, String> {
     let mut open_plans: Vec<Vec<(usize, bool)>> = Vec::new();
     for chain in chain_segments(&segments) {
         if chain.closed {
-            if chain.entries.len() < 2 {
+            if chain.entries.len() < 2
+                && !matches!(&segments[chain.entries[0].0].kind, SegKind::Bezier { .. })
+            {
                 return Err("sketch: degenerate profile loop (< 2 edges)".into());
             }
             loop_plans.push(chain.entries);

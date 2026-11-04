@@ -65,13 +65,11 @@ pub(super) fn recover(
         if !tolerance.is_finite() || tolerance <= 0. {
             continue;
         }
-        let recognition = RecognitionOptions {
-            distance_tolerance: tolerance,
-            relative_tolerance: 0.,
-            normal_tolerance: options.normal_tolerance_deg.to_radians(),
-            sampling: SamplingMode::Vertices,
-            ..RecognitionOptions::default()
-        };
+        let mut recognition = RecognitionOptions::default();
+        recognition.distance_tolerance = tolerance;
+        recognition.relative_tolerance = 0.;
+        recognition.normal_tolerance = options.normal_tolerance_deg.to_radians();
+        recognition.sampling = SamplingMode::Vertices;
         // Segment carriers are approximate normal fits. Refine only their own
         // measured support before asking whether neighboring strips agree.
         let ids: Vec<_> = segmentation

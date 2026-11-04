@@ -1329,25 +1329,30 @@ impl Default for Settings {
 // Workspaces — each user's folders of links and files (plm-cad-integration D12)
 // ===========================================================================
 
-/// One entry of a user's workspace: a folder, a link to a part, or a file.
+/// One workspace entry: a folder, a link (to a part or a folder), or a file.
 ///
-/// A workspace replaces directories in PLM mode. It is a tree per user,
-/// stored flat: each entry names its parent folder (empty at the top). A
-/// link is never a copy of the part; deleting one never touches the part. A
-/// file's bytes are blobs in the attachment store, and every replace keeps
-/// the version before it ([`FileVersion`]).
+/// Stored flat. A folder is stored once and sits nowhere (`parent` empty);
+/// every place it appears is a link to it. A link or a file sits in a folder
+/// (`parent`) or at the top of a user's Home (`parent` empty, `owner` the
+/// user). A link is never a copy; deleting one never touches what it points
+/// at. A file's bytes are blobs in the attachment store, and every replace
+/// keeps the version before it ([`FileVersion`]).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WorkspaceEntry {
     pub id: String,
-    /// The user whose workspace this is.
+    /// Who owns it. A folder's owner renames it and changes what is in it.
+    /// For an entry at the top of a Home, that Home's user; else whoever
+    /// placed it.
     pub owner: String,
-    /// The folder it is in; empty at the top of the workspace.
+    /// The folder it is in; empty at the top of a Home, and always for a
+    /// folder.
     #[serde(default)]
     pub parent: String,
-    /// Unique among its folder's entries, ignoring ASCII case.
+    /// A part link's or file's name is unique among those of its folder,
+    /// ignoring ASCII case. A link to a folder carries the folder's name.
     pub name: String,
     pub kind: WorkspaceKind,
-    /// For a link: the part, and the revision it is pinned to.
+    /// For a link: the part (and the revision it is pinned to), or the folder.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub link: Option<WorkspaceLink>,
     /// For a file: every version, oldest first; the last is current.
@@ -1376,11 +1381,26 @@ impl WorkspaceKind {
     }
 }
 
-/// What a link points at. Held by id, so a part renamed or renumbered is
+/// What a link points at: a part, a folder, a file, or a part's (or
+/// revision's) attachment. Held by id, so a part renamed or renumbered is
 /// still found.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct WorkspaceLink {
+    /// The part; for a link to an attachment, the part it is on. Empty for a
+    /// link to a folder or a file.
+    #[serde(default)]
     pub part_id: String,
+    /// For a link to a folder: the folder, which is one folder however many
+    /// Homes link it (its name, owner and contents are the same in each).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub folder_id: String,
+    /// For a link to a file: the file, stored once like a folder.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub file_id: String,
+    /// For a link to an attachment: which, on the part `part_id` (and the
+    /// revision `revision_id`, when it is a revision's).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub attachment_id: String,
     /// Empty: the link follows the part's newest revision, drafts included
     /// (D13). Else the revision it is pinned to.
     #[serde(default)]

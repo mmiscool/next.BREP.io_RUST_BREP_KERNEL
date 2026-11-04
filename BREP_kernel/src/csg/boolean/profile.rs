@@ -42,7 +42,7 @@ impl Drop for Scope {
 pub(crate) struct Feature(bool);
 impl Feature {
     pub(crate) fn begin() -> Self {
-        let enabled = std::env::var_os("BREP_PROFILE").is_some();
+        let enabled = crate::profile::profile_enabled();
         Self(enabled && ACCOUNT.with(|state| {
             let mut state = state.borrow_mut();
             if state.is_some() { return false; }

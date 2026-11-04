@@ -157,7 +157,7 @@ pub fn feature_icon(kind: &str) -> Option<char> {
         "SM.CHAMFER" | "SM.CCHM" => 0xE04B,
         "SM.CUTOUT" => 0xE04C,
         "LOFT" => 0xE04D,
-        "M" | "MIRROR" => 0xE04E,
+        "M" | "MIRROR" | "SM.MIRROR" | "SM.MI" => 0xE04E,
         "SPL" | "SPLIT" => 0xE04F,
         "R" | "REVOLVE" => 0xE050,
         "RIB" => 0xE051,

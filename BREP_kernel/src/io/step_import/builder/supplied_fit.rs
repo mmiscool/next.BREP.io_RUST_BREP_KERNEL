@@ -435,7 +435,7 @@ fn supplied_trace(args: std::fmt::Arguments<'_>) {
 /// onto a second branch, which is real work in the lane's hot loop and exists
 /// only to be measured.
 fn supplied_tracing() -> bool {
-    std::env::var("BREP_DEBUG_SUPPLIED_PCURVE").is_ok()
+    debug_flag!(live "BREP_DEBUG_SUPPLIED_PCURVE")
 }
 
 /// `BREP_SUPPLIED_PCURVES=1` turns this lane ON, `=0` or unset leaves it OFF,

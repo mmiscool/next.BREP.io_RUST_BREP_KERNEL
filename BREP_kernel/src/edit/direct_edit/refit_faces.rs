@@ -1212,17 +1212,18 @@ fn fit_carrier(
         RefitSurfaceKind::Sphere => SurfaceHint::KnownType { surface_type: SurfaceType::Sphere },
         RefitSurfaceKind::Torus => SurfaceHint::KnownType { surface_type: SurfaceType::Torus },
     };
-    let options = |distance: f64, normal: f64| RecognitionOptions {
-        distance_tolerance: distance,
-        relative_tolerance: 0.0,
+    let options = |distance: f64, normal: f64| {
+        let mut options = RecognitionOptions::default();
+        options.distance_tolerance = distance;
+        options.relative_tolerance = 0.0;
         // The facets' normals are the chords' and not the surface's: the
         // user asserts the family, the positional residual is the judge.
-        normal_tolerance: normal,
-        minimum_support: 1,
-        minimum_support_area: 0.0,
-        discover_regions: false,
-        sampling: SamplingMode::Vertices,
-        ..RecognitionOptions::default()
+        options.normal_tolerance = normal;
+        options.minimum_support = 1;
+        options.minimum_support_area = 0.0;
+        options.discover_regions = false;
+        options.sampling = SamplingMode::Vertices;
+        options
     };
     // First at the caller's tolerance; if nothing fits there, again with a
     // loose one so the refusal can quote the residual it missed by.
@@ -1617,17 +1618,7 @@ fn as_circle(curve: &NurbsCurve, scale: f64) -> Option<(Vec3, Vec3, f64)> {
     let ab = b.sub(a);
     let ac = c.sub(a);
     let normal = ab.cross(ac);
-    let denom = 2.0 * normal.length_squared();
-    if denom <= 1e-30 {
-        return None;
-    }
-    let center = a.add(
-        normal
-            .cross(ab)
-            .scale(ac.length_squared())
-            .add(ac.cross(normal).scale(ab.length_squared()))
-            .scale(1.0 / denom),
-    );
+    let center = crate::circumcenter(a, b, c)?;
     let radius = a.sub(center).length();
     let unit_normal = normal.normalized().ok()?;
     let tol = scale * 1e-9 + radius * 1e-9;

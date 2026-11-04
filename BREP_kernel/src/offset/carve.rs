@@ -138,7 +138,7 @@ pub(crate) struct CarvedTrim {
 /// The offset family's own trace switch, the same `BREP_OS_DEBUG` the shell and
 /// the regularity scan read.
 fn debug_enabled() -> bool {
-    std::env::var("BREP_OS_DEBUG").is_ok_and(|value| !value.is_empty() && value != "0")
+    env_read!("BREP_OS_DEBUG").is_some_and(|value| !value.is_empty() && value != "0")
 }
 
 macro_rules! carve_debug {
@@ -1236,7 +1236,7 @@ fn parameter_area(side: &[CarvedLoop]) -> f64 {
     for index in 0..points.len() {
         let a = points[index];
         let b = points[(index + 1) % points.len()];
-        twice += a[0] * b[1] - b[0] * a[1];
+        twice += crate::polygon::area_term(a, b);
     }
     twice.abs() * 0.5
 }

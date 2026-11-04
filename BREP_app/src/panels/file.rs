@@ -89,7 +89,8 @@ enum Mode {
     SaveAs,
     /// Confirm discarding unsaved changes before CLOSING a document tab —
     /// the ONE place unsaved work can still be lost now that New and Open
-    /// both add a tab. `pending_close` holds the tab index.
+    /// both add a tab. `pending_close` holds the document's id and the
+    /// committed revision the prompt was raised at.
     ConfirmClose,
     /// Choose an export format (STEP / IGES / STL / OBJ / JSON) for the current model.
     Export,
@@ -838,7 +839,7 @@ pub struct FileDialog {
     /// the component insert instead of Open's load-document.
     pending_component_import: bool,
     /// The tab index a pending [`Mode::ConfirmClose`] will close on "Discard".
-    pending_close: Option<usize>,
+    pending_close: Option<(u64, u64)>,
     /// A probed STEP assembly waiting on the §3.9 choice modal. `Some` means the
     /// ENGINE is holding a parsed assembly for us (with every product's solids
     /// resident), so every exit from that modal must end its life: import it,
@@ -1041,6 +1042,10 @@ impl FileDialog {
             FileAction::NewOfClass(class) => self.new_document(docs, class),
             FileAction::Open => {
                 self.use_folder(Purpose::Models, store);
+                // A PLM session's Open starts in the user's Home every time.
+                if store.plm_client().is_some() {
+                    self.workspace.go_home();
+                }
                 self.open_modal(Mode::Open);
             }
             FileAction::Save => match docs.active().name().map(str::to_string) {
@@ -1559,7 +1564,7 @@ impl FileDialog {
     pub fn request_close(&mut self, docs: &mut Documents, index: usize) {
         let dirty = docs.get(index).is_some_and(Document::is_dirty);
         if dirty {
-            self.pending_close = Some(index);
+            self.pending_close = docs.get(index).map(|doc| (doc.id(), doc.committed_revision()));
             self.open_modal(Mode::ConfirmClose);
         } else {
             docs.close(index);
@@ -1570,11 +1575,14 @@ impl FileDialog {
     /// dirty document tab. Keeps the verifier's `confirm:discard` /
     /// `confirm:cancel` hit keys — the same two buttons, one door further on.
     fn show_confirm_close(&mut self, ctx: &egui::Context, docs: &mut Documents) {
-        // A tab closed / reordered under an open prompt (there is no such path
-        // today, but the index is only meaningful while it resolves).
+        // The prompt names a DOCUMENT, not a tab position: a tab closed or
+        // moved under it (an agent's close, a reorder) cannot redirect the
+        // discard to whatever now sits at the old index, and a document that
+        // changed since (an agent's write) dismisses the prompt — the user
+        // confirmed discarding what they saw, not what it has become.
         let Some(title) = self
             .pending_close
-            .and_then(|index| docs.get(index))
+            .and_then(|(id, revision)| docs.index_of_id(id).and_then(|i| docs.get(i)).filter(|doc| doc.committed_revision() == revision))
             .map(Document::title)
         else {
             self.pending_close = None;
@@ -1603,7 +1611,7 @@ impl FileDialog {
             });
         });
         if discard {
-            if let Some(index) = self.pending_close.take() {
+            if let Some(index) = self.pending_close.take().and_then(|(id, _)| docs.index_of_id(id)) {
                 docs.close(index);
             }
             self.open = false;
@@ -1998,7 +2006,7 @@ impl FileDialog {
                 // pane sets, and every step's picture as PNG and SVG in one zip.
                 let not_instructions = "Open manufacturing instructions first (New from assembly in the Instructions workbench)";
                 let pdf = ui
-                    .add_enabled(has_instructions, egui::Button::new("PDF"))
+                    .add_enabled(has_instructions, egui::Button::new("Instructions (PDF)"))
                     .on_hover_text("The cover, the parts list, the tools list and the steps, on the page template set in the Instructions pane")
                     .on_disabled_hover_text(not_instructions);
                 self.hit("export:instructionspdf", &pdf);
@@ -4644,6 +4652,39 @@ impl FileDialog {
         _: bool,
     ) -> Result<family_table::GenerateReport, String> {
         Err("in the browser, Generate a PLM family from the family table's Generate button".into())
+    }
+
+    /// The non-blocking door automation takes (`family_generate`): a local
+    /// Generate finishes here (`Ok(Some(report))`); a PLM Generate saves the
+    /// family first if asked (the write is queued, not waited for) and
+    /// answers `Ok(None)` with its revision key — the caller then waits for
+    /// the store's writes and runs [`crate::plm::family::generate`] as a task
+    /// on later frames, and hands the report to [`Self::record_generate_report`].
+    pub(crate) fn begin_generate_active_family(
+        &mut self,
+        docs: &mut Documents,
+        store: &dyn ModelStore,
+        save: bool,
+    ) -> Result<Result<family_table::GenerateReport, String>, String> {
+        let plm_key = docs.active().name().and_then(crate::plm::family::revision_key);
+        match (store.plm_client(), plm_key) {
+            (Some(_), Some(key)) => {
+                if docs.active().is_dirty() {
+                    if !save {
+                        return Err(crate::plm::family::UNSAVED_FAMILY.into());
+                    }
+                    store.write(&key, &docs.tab_engine().history_request_json())?;
+                    docs.active_mut().mark_clean();
+                    self.save_generation += 1;
+                }
+                Ok(Err(key))
+            }
+            _ => Ok(Ok(self.record_generate(family_table::generate_family(store, docs.active().name(), &docs.engine().history_request_json())))),
+        }
+    }
+
+    pub(crate) fn record_generate_report(&mut self, report: family_table::GenerateReport) -> family_table::GenerateReport {
+        self.record_generate(report)
     }
 
     fn record_generate(&mut self, report: family_table::GenerateReport) -> family_table::GenerateReport {

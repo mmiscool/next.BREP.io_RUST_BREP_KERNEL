@@ -27,6 +27,7 @@
 //! torus whose inner equator, lies outside the selected trim offsets perfectly
 //! well over the sheet actually being thickened.
 
+use crate::mass_properties::{GAUSS_X, GAUSS_W};
 use crate::{KernelRefusal, KernelStage, OrRefuse};
 use crate::offset_carve::{carve_folded_trim_scanned, dropped_sweep as carve_dropped_sweep, CarveOutcome};
 use crate::offset_regularity::{scan_offset_regularity, Certainty, RegularityScan, ScanBudget, TrimRegion};
@@ -342,26 +343,6 @@ fn ruled_wall(bottom: &NurbsCurve, top: &NurbsCurve) -> Result<NurbsSurface, Ker
     .or_refuse(KernelStage::Refine, "new")
 }
 
-const GAUSS_X: [f64; 8] = [
-    -0.9602898564975363,
-    -0.7966664774136267,
-    -0.525532409916329,
-    -0.18343464249564978,
-    0.18343464249564978,
-    0.525532409916329,
-    0.7966664774136267,
-    0.9602898564975363,
-];
-const GAUSS_W: [f64; 8] = [
-    0.10122853629037669,
-    0.22238103445337445,
-    0.31370664587788727,
-    0.362683783378362,
-    0.362683783378362,
-    0.31370664587788727,
-    0.22238103445337445,
-    0.10122853629037669,
-];
 
 /// Green's-theorem signed-area contribution ∮ (x·y' − y·x')/2 of one pcurve,
 /// integrated per knot span with 8-point Gauss.  Summed over a closed loop
@@ -783,6 +764,7 @@ fn thicken_one_region(
         .flatten()
         .map(|control| control.point().or_refuse(KernelStage::Refine, "point"))
         .collect::<Result<Vec<_>, KernelRefusal>>()?;
+    let sheet_scale = crate::model_scale(sheet_points.iter().copied());
     let fit_tolerance =
         crate::KernelTolerances::for_scale(crate::model_scale(sheet_points), 1e-7).intersection_fit;
 
@@ -805,33 +787,75 @@ fn thicken_one_region(
             starts.push(curve.evaluate(q0).or_refuse(KernelStage::Refine, "evaluate")?);
         }
 
+        // ---- Poles: a boundary pcurve whose image on the sheet is ONE point
+        // (an exact sphere octant's pole, lane N `BREP_BLEND_EXACT_OCTANT`) is
+        // a degenerate edge, not a rim: its two ends are one junction, it gets
+        // no wall, and on each cap it stays as a degenerate coedge so the
+        // parameter loop still closes. Lane O 2026-10-28; before this the two
+        // ends read as coincident junctions and the sheet was refused. ----
+        let pole_band = 1e-9 * sheet_scale.max(1.0);
+        let mut pole = vec![false; count];
+        for (index, curve) in loop_curves.iter().enumerate() {
+            let [q0, q1] = curve.domain().or_refuse(KernelStage::Refine, "domain")?;
+            let mut images = Vec::with_capacity(5);
+            for fraction in [0.0, 0.25, 0.5, 0.75, 1.0] {
+                let uv = curve.evaluate(q0 + (q1 - q0) * fraction).or_refuse(KernelStage::Refine, "evaluate")?;
+                images.push(surface.evaluate(uv.x, uv.y).or_refuse(KernelStage::Refine, "evaluate")?);
+            }
+            pole[index] = images.iter().all(|point| point.sub(images[0]).length() <= pole_band);
+        }
+        if pole.iter().all(|is_pole| *is_pole) {
+            return Err(KernelRefusal::input(KernelStage::Collect, "thicken_degenerate_boundary", "thickenSheet: sheet boundary is degenerate (every boundary curve is a pole)"));
+        }
+        // junction_of[j]: the junction j stands for. Junction j + 1 is junction
+        // j when pcurve j is a pole; walk from a junction no pole ends at.
+        let mut junction_of: Vec<usize> = (0..count).collect();
+        let first_real = (0..count).find(|&j| !pole[(j + count - 1) % count]).unwrap_or(0);
+        for step in 1..count {
+            let j = (first_real + step) % count;
+            let previous = (j + count - 1) % count;
+            if pole[previous] {
+                junction_of[j] = junction_of[previous];
+            }
+        }
+
         // ---- Junction vertices: junction j = start of pcurve j. ----
-        let mut bottom_vertex_ids = Vec::with_capacity(count);
-        let mut top_vertex_ids = Vec::with_capacity(count);
-        let mut bottom_points = Vec::with_capacity(count);
-        let mut top_points = Vec::with_capacity(count);
-        for start in &starts {
+        let mut bottom_vertex_ids = vec![0u64; count];
+        let mut top_vertex_ids = vec![0u64; count];
+        let mut bottom_points = vec![Vec3::default(); count];
+        let mut top_points = vec![Vec3::default(); count];
+        for (junction, start) in starts.iter().enumerate() {
+            if junction_of[junction] != junction {
+                continue;
+            }
             let bottom_point = bottom.evaluate(start.x, start.y).or_refuse(KernelStage::Refine, "evaluate")?;
             let top_point = top.evaluate(start.x, start.y).or_refuse(KernelStage::Refine, "evaluate")?;
             vertices.push(VertexRecord {
                 id: next_id,
                 point: bottom_point,
             });
-            bottom_vertex_ids.push(next_id);
+            bottom_vertex_ids[junction] = next_id;
             next_id += 1;
             vertices.push(VertexRecord {
                 id: next_id,
                 point: top_point,
             });
-            top_vertex_ids.push(next_id);
+            top_vertex_ids[junction] = next_id;
             next_id += 1;
-            bottom_points.push(bottom_point);
-            top_points.push(top_point);
+            bottom_points[junction] = bottom_point;
+            top_points[junction] = top_point;
             // Opposite chart endpoints represent one junction on a periodic
             // strip; all other coincidences remain the pinch refusal below.
             if seam.is_none() || (start.x - u0).abs() <= eps_u {
                 bottom_junction_points.push(bottom_point);
             }
+        }
+        for junction in 0..count {
+            let owner = junction_of[junction];
+            bottom_vertex_ids[junction] = bottom_vertex_ids[owner];
+            top_vertex_ids[junction] = top_vertex_ids[owner];
+            bottom_points[junction] = bottom_points[owner];
+            top_points[junction] = top_points[owner];
         }
 
         // ---- Boundary edges on both sheets + vertical junction edges. ----
@@ -863,7 +887,7 @@ fn thicken_one_region(
                 t1: image.t1,
                 start_vertex_id: bottom_vertex_ids[start_j],
                 end_vertex_id: bottom_vertex_ids[end_j],
-                degenerate: false,
+                degenerate: pole[index],
                 name: None,
             });
             bottom_edge_ids.push(next_id);
@@ -875,14 +899,17 @@ fn thicken_one_region(
                 t1: image.t1,
                 start_vertex_id: top_vertex_ids[start_j],
                 end_vertex_id: top_vertex_ids[end_j],
-                degenerate: false,
+                degenerate: pole[index],
                 name: None,
             });
             top_edge_ids.push(next_id);
             next_id += 1;
         }
-        let mut vertical_edge_ids = Vec::with_capacity(count);
+        let mut vertical_edge_ids = vec![0u64; count];
         for junction in 0..count {
+            if junction_of[junction] != junction {
+                continue;
+            }
             edges.push(EdgeRecord {
                 id: next_id,
                 curve: make_line(bottom_points[junction], top_points[junction]).or_refuse(KernelStage::Refine, "make_line")?,
@@ -893,8 +920,11 @@ fn thicken_one_region(
                 degenerate: false,
                 name: None,
             });
-            vertical_edge_ids.push(next_id);
+            vertical_edge_ids[junction] = next_id;
             next_id += 1;
+        }
+        for junction in 0..count {
+            vertical_edge_ids[junction] = vertical_edge_ids[junction_of[junction]];
         }
 
         if let Some([first, second]) = seam {
@@ -938,7 +968,7 @@ fn thicken_one_region(
         // CW hole loop (material on the left, void on the right).  Hence
         // same_sense = dir uniformly, with the loop winding to match.
         for (index, image) in images.iter().enumerate() {
-            if seam.is_some_and(|indices| indices.contains(&index)) {
+            if seam.is_some_and(|indices| indices.contains(&index)) || pole[index] {
                 continue;
             }
             let next_index = (index + 1) % count;

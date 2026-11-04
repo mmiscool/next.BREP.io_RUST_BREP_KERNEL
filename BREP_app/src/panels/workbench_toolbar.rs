@@ -68,7 +68,16 @@ impl WorkbenchToolbarPanel {
                 ui.add_space(2.0);
                 toolbar_button::wrapped(ui, |ui| {
                     for (index, (name, members)) in groups.iter().enumerate() {
-                        if index > 0 {
+                        // A group that will not fit the rest of the line starts
+                        // the next one, caption and all: the strip wrapped one
+                        // button at a time, leaving "Sweep" and two of its
+                        // buttons on one line and the third alone on the next
+                        // (ui-polish-2026-10-28 row 15). A group wider than a
+                        // whole line still wraps inside itself.
+                        let starts_line = index > 0 && group_does_not_fit(ui, name, members.len());
+                        if starts_line {
+                            ui.end_row();
+                        } else if index > 0 {
                             ui.separator();
                         }
                         caption(ui, name);
@@ -115,6 +124,24 @@ impl WorkbenchToolbarPanel {
     pub fn hits_json(&self) -> String {
         crate::automation::hit_rects::hits_json(&self.hits)
     }
+}
+
+/// Whether a group (its caption and `buttons` square buttons, after a
+/// separator) is wider than what is left of the current line, on a line that
+/// already holds something.
+fn group_does_not_fit(ui: &egui::Ui, name: &str, buttons: usize) -> bool {
+    let font = egui::FontId::proportional(super::ribbon::CHROME_CAPTION_SIZE);
+    let caption_w = ui.ctx().fonts_mut(|f| f.layout_no_wrap(name.to_owned(), font, egui::Color32::PLACEHOLDER).size().x);
+    let gap = ui.spacing().item_spacing.x;
+    let button = crate::viewport::touch::target_size(
+        ui.ctx(),
+        egui::vec2(super::toolbar_button::TOOLBAR_BTN, super::toolbar_button::TOOLBAR_BTN),
+    )
+    .x;
+    let separator = ui.spacing().item_spacing.x * 2.0 + 1.0;
+    let needed = separator + caption_w + gap + buttons as f32 * (button + gap);
+    let remaining = ui.max_rect().right().min(ui.clip_rect().right()) - ui.cursor().left();
+    needed > remaining && needed <= ui.max_rect().width() && ui.cursor().left() > ui.max_rect().left() + 0.5
 }
 
 /// A small, dim group caption ahead of its buttons.

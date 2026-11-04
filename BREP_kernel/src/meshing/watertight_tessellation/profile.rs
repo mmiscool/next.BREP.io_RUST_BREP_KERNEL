@@ -173,27 +173,25 @@ thread_local! {
 /// Read-modify-write the thread-local profile when it is enabled; a no-op
 /// (one flag read) otherwise.
 pub(in crate::watertight_tessellation) fn tess_profile(update: impl FnOnce(&mut TessProfile)) {
-    PROFILE.with(|cell| {
-        let mut profile = cell.get();
-        if profile.enabled {
-            update(&mut profile);
-            cell.set(profile);
-        }
-    });
+    crate::profile::update(&PROFILE, update)
+}
+
+impl crate::profile::Counters for TessProfile {
+    fn armed(&self) -> bool {
+        self.enabled
+    }
 }
 
 pub(in crate::watertight_tessellation) fn tess_profile_enabled() -> bool {
-    PROFILE.with(|cell| cell.get().enabled)
+    crate::profile::armed(&PROFILE)
 }
 
 /// Milliseconds since `started` when profiling is on; `None` otherwise.
 pub(in crate::watertight_tessellation) fn profile_started() -> Option<Instant> {
-    tess_profile_enabled().then(Instant::now)
+    crate::profile::started(&PROFILE)
 }
 
-pub(in crate::watertight_tessellation) fn elapsed_ms(started: Option<Instant>) -> f64 {
-    started.map_or(0.0, |s| s.elapsed().as_secs_f64() * 1_000.0)
-}
+pub(in crate::watertight_tessellation) use crate::profile::elapsed_ms;
 
 /// Start a profiled tessellation: resets the counters and arms them when
 /// `BREP_PROFILE` is set.
@@ -212,15 +210,9 @@ fn begin_with(enabled: bool) -> Option<Instant> {
     enabled.then(Instant::now)
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+/// `BREP_PROFILE` ([`crate::profile::profile_enabled`]; never in the browser).
 fn profile_switch() -> bool {
-    std::env::var("BREP_PROFILE").is_ok()
-}
-
-/// No env vars in the browser; the shipped wasm path never arms this.
-#[cfg(target_arch = "wasm32")]
-fn profile_switch() -> bool {
-    false
+    crate::profile::profile_enabled()
 }
 
 /// `BREP_PROFILE_TESS_FACES`: one `tess.face` line per face, from the
@@ -335,7 +327,7 @@ pub(in crate::watertight_tessellation) fn end(started: Option<Instant>, chord: f
         return;
     };
     let p = PROFILE.with(|cell| cell.get());
-    eprintln!(
+    profile_line!(
         "tess.profile ms={:.2} chord={chord:.3e} faces={} tris={triangles} | \
          edge_sampling_ms={:.2} seed_ms={:.2} refine_ms={:.2} | stations={} placed={} \
          margin_tests={} parity_tests={} host_ms={:.2} host_visits={} \

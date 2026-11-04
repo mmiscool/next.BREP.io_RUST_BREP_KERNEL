@@ -294,8 +294,10 @@ fn parse_side_ref(token: &str, what: &str) -> Result<SideRef, String> {
     ))
 }
 
-/// Strip a trailing `[n]` face-name dedup suffix, if present.
+/// Strip a trailing `[n]` face-name dedup suffix, if present, and a mirrored
+/// part's `::{feature}` namespaces.
 fn strip_dedup_suffix(name: &str) -> &str {
+    let name = name.split("::").next().unwrap_or(name);
     match (name.rfind('['), name.ends_with(']')) {
         (Some(open), true) if name[open + 1..name.len() - 1].chars().all(|c| c.is_ascii_digit()) => {
             &name[..open]

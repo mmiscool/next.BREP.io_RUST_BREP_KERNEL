@@ -1,6 +1,5 @@
 //! Camera: read / set the state, fit, standard views, projection.
-use crate::automation::command::{parse_args, schema_of, Annotations, CommandSpec, Ctx, Empty, Handler, NoArgs, Outcome, Phase};
-use crate::automation::cmd_document::parse;
+use crate::automation::command::{app_command, read_engine, parse_args, CommandSpec, Ctx, NoArgs, Outcome};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -25,16 +24,37 @@ pub struct ProjectionArgs {
     pub kind: String,
 }
 
+// Shared by every camera command: ViewCamera::state_json is the producer
+// (BREP_render/src/view.rs). Its two projection kinds share this flat shape;
+// `scale` means half-height for orthographic and vertical FOV in degrees for
+// perspective. Near may be negative; these are not visibility bounds.
+fn camera_result_schema() -> Value {
+    let vector = json!({"type":"array","items":{"type":"number"},"minItems":3,"maxItems":3});
+    let camera = json!({
+        "type":"object",
+        "properties":{
+            "kind":{"enum":["orthographic","perspective"]},
+            "eye":vector,"target":vector,"up":vector,
+            "scale":{"type":"number","description":"Orthographic half-height or perspective vertical field of view in degrees, selected by kind."},
+            "near":{"type":"number"},"far":{"type":"number"},
+            "width":{"type":"number"},"height":{"type":"number"},
+            "worldPerPixel":{"type":"number"}
+        },
+        "required":["kind","eye","target","up","scale","near","far","width","height","worldPerPixel"],
+        "additionalProperties":false
+    });
+    json!({"type":"object","properties":{"camera":camera},"required":["camera"],"additionalProperties":false})
+}
+
 fn camera_get(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
-    let _: NoArgs = parse_args(args)?;
-    Ok(Outcome::Done(json!({ "camera": parse(&ctx.app.docs.engine().camera_state_json()) })))
+    read_engine(ctx, args, |e| json!({ "camera": e.camera_state_value() }))
 }
 
 fn camera_set(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
     let a: CameraSetArgs = parse_args(args)?;
     let text = serde_json::to_string(&a.state).map_err(|e| e.to_string())?;
     ctx.app.docs.engine_mut().apply_camera_state_json(&text)?;
-    Ok(Outcome::Done(json!({ "camera": parse(&ctx.app.docs.engine().camera_state_json()) })))
+    Ok(Outcome::Done(json!({ "camera": ctx.app.docs.engine().camera_state_value() })))
 }
 
 fn zoom_to_fit(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
@@ -43,7 +63,7 @@ fn zoom_to_fit(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
     // the open sheet's paper, or the 3D scene — exactly as the toolbar button
     // beside it does.
     ctx.app.zoom_to_fit();
-    Ok(Outcome::Done(json!({ "camera": parse(&ctx.app.docs.engine().camera_state_json()) })))
+    Ok(Outcome::Done(json!({ "camera": ctx.app.docs.engine().camera_state_value() })))
 }
 
 fn standard_view(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
@@ -51,7 +71,7 @@ fn standard_view(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
     if !ctx.app.docs.engine_mut().standard_view(&a.name.to_ascii_uppercase()) {
         return Err(format!("unknown view `{}` (FRONT BACK LEFT RIGHT TOP BOTTOM ISO)", a.name));
     }
-    Ok(Outcome::Done(json!({ "camera": parse(&ctx.app.docs.engine().camera_state_json()) })))
+    Ok(Outcome::Done(json!({ "camera": ctx.app.docs.engine().camera_state_value() })))
 }
 
 fn set_projection(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
@@ -61,13 +81,13 @@ fn set_projection(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
         return Err("kind must be `perspective` or `orthographic`".into());
     }
     ctx.app.docs.engine_mut().set_projection(&k);
-    Ok(Outcome::Done(json!({ "camera": parse(&ctx.app.docs.engine().camera_state_json()) })))
+    Ok(Outcome::Done(json!({ "camera": ctx.app.docs.engine().camera_state_value() })))
 }
 
 pub static COMMANDS: &[CommandSpec] = &[
-    CommandSpec { name: "camera_get", group: "camera", doc: "The camera state: kind, eye, target, up, near/far, projection block, worldPerPixel.", phase: Phase::Read, annotations: Annotations::READ, args_schema: schema_of::<NoArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(camera_get) },
-    CommandSpec { name: "camera_set", group: "camera", doc: "Apply a camera state (the shape `camera_get` returns).", phase: Phase::Mutate, annotations: Annotations::MUTATE_NOWAIT, args_schema: schema_of::<CameraSetArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(camera_set) },
-    CommandSpec { name: "zoom_to_fit", group: "camera", doc: "Frame the whole model \u{2014} or, while a drawing sheet is open, the sheet's whole paper (the toolbar's Zoom-to-fit button is this same branch).", phase: Phase::Mutate, annotations: Annotations::MUTATE_NOWAIT, args_schema: schema_of::<NoArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(zoom_to_fit) },
-    CommandSpec { name: "standard_view", group: "camera", doc: "Snap to a standard view and fit: FRONT BACK LEFT RIGHT TOP BOTTOM ISO.", phase: Phase::Mutate, annotations: Annotations::MUTATE_NOWAIT, args_schema: schema_of::<ViewArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(standard_view) },
-    CommandSpec { name: "set_projection", group: "camera", doc: "Switch between perspective and orthographic projection.", phase: Phase::Mutate, annotations: Annotations::MUTATE_NOWAIT, args_schema: schema_of::<ProjectionArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(set_projection) },
+    app_command!("camera", "camera_get", "The camera state: projection kind/scale, eye, target, up, near/far, viewport width/height and worldPerPixel.", NoArgs, camera_get, Read, READ, camera_result_schema),
+    app_command!("camera", "camera_set", "Apply a camera state (the shape `camera_get` returns).", CameraSetArgs, camera_set, Mutate, MUTATE_NOWAIT, camera_result_schema),
+    app_command!("camera", "zoom_to_fit", "Frame the whole model \u{2014} or, while a drawing sheet is open, the sheet's whole paper (the toolbar's Zoom-to-fit button is this same branch).", NoArgs, zoom_to_fit, Mutate, MUTATE_NOWAIT, camera_result_schema),
+    app_command!("camera", "standard_view", "Snap to a standard view and fit: FRONT BACK LEFT RIGHT TOP BOTTOM ISO.", ViewArgs, standard_view, Mutate, MUTATE_NOWAIT, camera_result_schema),
+    app_command!("camera", "set_projection", "Switch between perspective and orthographic projection.", ProjectionArgs, set_projection, Mutate, MUTATE_NOWAIT, camera_result_schema),
 ];

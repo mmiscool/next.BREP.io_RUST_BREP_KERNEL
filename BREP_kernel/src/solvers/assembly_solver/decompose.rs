@@ -4,40 +4,7 @@ use super::*;
 // §7.5–7.6 decomposition pipeline
 // ---------------------------------------------------------------------------
 
-/// Deterministic union-find (smallest index wins as representative).
-struct UnionFind {
-    parent: Vec<usize>,
-}
-
-impl UnionFind {
-    fn new(n: usize) -> Self {
-        Self {
-            parent: (0..n).collect(),
-        }
-    }
-
-    fn find(&mut self, x: usize) -> usize {
-        let mut root = x;
-        while self.parent[root] != root {
-            root = self.parent[root];
-        }
-        let mut cur = x;
-        while self.parent[cur] != root {
-            let next = self.parent[cur];
-            self.parent[cur] = root;
-            cur = next;
-        }
-        root
-    }
-
-    fn union(&mut self, a: usize, b: usize) {
-        let (ra, rb) = (self.find(a), self.find(b));
-        if ra != rb {
-            let (lo, hi) = if ra < rb { (ra, rb) } else { (rb, ra) };
-            self.parent[hi] = lo;
-        }
-    }
-}
+use crate::union_find::UnionFind;
 
 /// Every body a mate reaches: its two sides and, for a symmetric mate, the
 /// mirror's body when that is a third one.

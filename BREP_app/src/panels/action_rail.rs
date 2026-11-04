@@ -82,7 +82,18 @@ pub fn action_rail(
             text_w
         });
     }
-    let col_w = widest + 2.0 * ui.spacing().button_padding.x;
+    let mut col_w = widest + 2.0 * ui.spacing().button_padding.x;
+    // A rail of four short verbs ("Clear", "Hide", "Info", "Move" — an
+    // assembly component) measured narrower than its own title, so "Selection
+    // actions" wrapped onto two lines and the subtitle onto six. The title is
+    // the floor of the column (ui-polish-2026-10-28 row 3).
+    if let Some(title) = title {
+        let body = egui::TextStyle::Body.resolve(ui.style());
+        let title_w = ui.ctx().fonts_mut(|f| {
+            f.layout_no_wrap(title.to_owned(), body, egui::Color32::PLACEHOLDER).size().x
+        });
+        col_w = col_w.max(title_w);
+    }
 
     ui.set_width(col_w.max(1.0));
     if let Some(title) = title {
@@ -176,3 +187,4 @@ pub(crate) fn mobile_actions_json(ctx: &egui::Context, entry: egui::Rect) -> Str
     serde_json::json!({"open": [entry.left(), entry.top(), entry.width(), entry.height()], "visible": palette.is_open(),
         "rects": serde_json::from_str::<serde_json::Value>(&crate::automation::hit_rects::hits_json(palette.hits().iter())).unwrap_or_default()}).to_string()
 }
+

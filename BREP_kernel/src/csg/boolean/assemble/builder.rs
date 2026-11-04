@@ -213,10 +213,7 @@ pub(super) fn source_edge(source: &FragmentEdgeSource, index: &AssembleIndex) ->
 
 /// Same-binary attribution for the identity index; never an acceptance switch.
 fn weld_index_on() -> bool {
-    thread_local! {
-        static OFF: std::cell::OnceCell<bool> = const { std::cell::OnceCell::new() };
-    }
-    !OFF.with(|cell| *cell.get_or_init(|| std::env::var("BREP_ASSEMBLY_MEMO").as_deref() == Ok("0")))
+    switch!("BREP_ASSEMBLY_MEMO", true)
 }
 
 /// Index the exact identity exclusion already enforced by the weld. Keep
@@ -321,7 +318,7 @@ pub(super) fn snap_edge_curve_endpoints(
     let domain = curve.domain().or_refuse(KernelStage::Sew, "domain")?;
     if t1 < domain[1] - epsilon && t1 > domain[0] + epsilon {
         curve = curve.split(t1).or_refuse(KernelStage::Sew, "split")?.0;
-    } else if std::env::var("BREP_DEBUG_SUBRANGE").is_ok() && t1 < domain[1] - epsilon {
+    } else if env_read!("BREP_DEBUG_SUBRANGE").is_some() && t1 < domain[1] - epsilon {
         eprintln!("abnormal subrange skip in snap_edge_curve_endpoints");
     }
     let mut controls = curve.control_points.clone();

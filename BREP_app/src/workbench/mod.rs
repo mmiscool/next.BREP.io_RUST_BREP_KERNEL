@@ -427,6 +427,7 @@ fn press_refusal_in(registry: &[&'static Workbench], id: &str, state: &ButtonSta
 /// U+2713 ✓ is a status tick (a resolved annotation, the switcher's active
 /// entry), not "finish". Rotate and finish have pictures of their own.
 pub const SYNONYMS: &[(&[&str], &str)] = &[
+    (&["sketch.tool.text", "symbol.tool.text"], "places text in the active editor"),
     (
         &[
             "sketch.tool.select",

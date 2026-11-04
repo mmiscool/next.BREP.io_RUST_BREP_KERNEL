@@ -1,39 +1,8 @@
 use crate::{KernelRefusal, KernelStage, OrRefuse};
 use super::*;
 
-#[derive(Clone, Copy)]
-pub(super) struct Bounds {
-    minimum: Vec3,
-    maximum: Vec3,
-}
+pub(super) use crate::spatial::Aabb as Bounds;
 
-impl Bounds {
-    pub(super) fn from_points(points: &[Vec3]) -> Option<Self> {
-        let first = *points.first()?;
-        let mut bounds = Self {
-            minimum: first,
-            maximum: first,
-        };
-        for point in &points[1..] {
-            bounds.minimum.x = bounds.minimum.x.min(point.x);
-            bounds.minimum.y = bounds.minimum.y.min(point.y);
-            bounds.minimum.z = bounds.minimum.z.min(point.z);
-            bounds.maximum.x = bounds.maximum.x.max(point.x);
-            bounds.maximum.y = bounds.maximum.y.max(point.y);
-            bounds.maximum.z = bounds.maximum.z.max(point.z);
-        }
-        Some(bounds)
-    }
-
-    pub(super) fn intersects(self, other: Self, tolerance: f64) -> bool {
-        self.minimum.x <= other.maximum.x + tolerance
-            && self.maximum.x + tolerance >= other.minimum.x
-            && self.minimum.y <= other.maximum.y + tolerance
-            && self.maximum.y + tolerance >= other.minimum.y
-            && self.minimum.z <= other.maximum.z + tolerance
-            && self.maximum.z + tolerance >= other.minimum.z
-    }
-}
 
 pub(super) fn edge_sample_points(solid: &BrepSolid) -> Result<Vec<Vec3>, KernelRefusal> {
     let mut points = Vec::new();

@@ -307,31 +307,10 @@ impl Sketch3dDoc {
 /// Shared solver key for sketch entity and mobility-map lookups.
 pub use crate::sketch_solver::sketch_id_key as id_key;
 
-fn id_num(value: &Value) -> Option<f64> {
-    match value {
-        Value::Number(number) => number.as_f64(),
-        Value::String(text) => text.trim().parse::<f64>().ok(),
-        _ => None,
-    }
-}
+
 
 fn mint_next_id<'a>(ids: impl Iterator<Item = &'a Value>) -> Value {
-    let ids: Vec<&Value> = ids.collect();
-    let mut max: Option<i64> = None;
-    for &id in &ids {
-        if let Some(n) = id_num(id) {
-            if n.is_finite() {
-                let i = n.floor() as i64;
-                max = Some(max.map_or(i, |m| m.max(i)));
-            }
-        }
-    }
-    let mut candidate = max.map(|m| m + 1).unwrap_or(ids.len() as i64);
-    let existing: std::collections::HashSet<String> = ids.iter().map(|&id| id_key(id)).collect();
-    while existing.contains(&id_key(&Value::from(candidate))) {
-        candidate += 1;
-    }
-    Value::from(candidate)
+    crate::mint_sketch_id(ids, |_| false)
 }
 
 // ---------------------------------------------------------------------------

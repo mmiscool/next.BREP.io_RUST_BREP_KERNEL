@@ -429,8 +429,13 @@ fn draw_field(
     let mut actions = form::FieldActions::default();
     ui.add_space(4.0);
     // A `Button` field IS its own label (the schema gives it one), so a label
-    // above it would say the same thing twice.
-    if !matches!(field.kind, FieldKind::Button { .. }) {
+    // above it would say the same thing twice. A `Bool` puts its checkbox on
+    // the label's row, as Settings does: a box alone on a line under its label
+    // spent two rows on one tick and read as detached from it
+    // (ui-polish-2026-10-28 row 12). The box is still the field's rect and the
+    // only thing that toggles, exactly as before.
+    let inline = matches!(field.kind, FieldKind::Bool);
+    if !inline && !matches!(field.kind, FieldKind::Button { .. }) {
         ui.label(&field.label);
     }
     // Scope the widget id-stack to THIS (subject, field) so a Scalar's
@@ -442,8 +447,16 @@ fn draw_field(
     // dialog) has `leadIn.kind` and `ramp.kind` on one subject, which would
     // otherwise share an id. A single-segment path is its key, as before.
     ui.push_id((spec.title, field.path.join(".")), |ui| {
-        let (changed, r) =
-            form::field_input_with(ui, field, params, Some(&mut probe), &mut actions, spec.picking);
+        let (changed, r) = if inline {
+            ui.horizontal(|ui| {
+                let drawn = form::field_input_with(ui, field, params, Some(&mut probe), &mut actions, spec.picking);
+                ui.label(&field.label);
+                drawn
+            })
+            .inner
+        } else {
+            form::field_input_with(ui, field, params, Some(&mut probe), &mut actions, spec.picking)
+        };
         out.changed |= changed;
         rect = r;
     });

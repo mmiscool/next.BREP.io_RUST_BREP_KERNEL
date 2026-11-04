@@ -1,12 +1,14 @@
 use crate::fit::{
-    evaluate_surface, evaluate_surface_from_vertices, fit_surface_from_vertices_with_path,
-    fit_surface_with_path, selection_scale, vertex_selection_scale,
+    evaluate_surface, evaluate_surface_from_vertices, fit_profile_clock, fit_profile_note,
+    fit_profile_start, fit_profile_take, fit_surface_from_vertices_with_path, fit_surface_with_path,
+    selection_scale, vertex_selection_scale, FitProfile,
 };
 use crate::numerical::recognition as numerical;
 use crate::{
-    AnalyticSurface, AnalyzedMesh, ConstraintMask, FitPath, Mesh, MeshAnalysisOptions,
-    MetadataTrust, RecognitionError, RecognitionOptions, RecognitionResult, SurfaceFitResult,
-    SurfaceHint, SurfaceRegion, SurfaceType, UnresolvedRegionDiagnostic,
+    AdaptiveSampling, AnalyticSurface, AnalyzedMesh, ConstraintMask, FitPath, HypothesisPolicy,
+    Mesh, MeshAnalysisOptions, MetadataTrust, RecognitionError, RecognitionOptions,
+    RecognitionResult, SurfaceFitResult, SurfaceHint, SurfaceRegion, SurfaceType,
+    UnresolvedRegionDiagnostic,
 };
 use std::cmp::Ordering;
 use std::collections::{BTreeSet, VecDeque};
@@ -21,9 +23,6 @@ const TYPES: [SurfaceType; 5] = [
 ];
 
 const MODEL_COMPLEXITY_PENALTY_UNIT: f64 = numerical::MODEL_COMPLEXITY_PENALTY_UNIT;
-// The probe supplies spatial/normal diversity without increasing the number
-// of triangles actually passed to a primitive fitter.
-const HYPOTHESIS_DIVERSITY_PROBE_TRIANGLES: usize = 128;
 
 #[derive(Clone, Copy, Debug)]
 struct ModelRank {
@@ -171,11 +170,14 @@ pub fn recognize_surfaces_with_unresolved(
     mesh: &Mesh,
     options: &RecognitionOptions,
 ) -> Result<RecognitionResult, RecognitionError> {
-    recognize_budgeted(mesh, options, &mut AttemptBudget::unlimited())
+    recognize_budgeted(mesh, options, &mut AttemptBudget::unlimited(), &[])
 }
 
 /// Work spent by [`recognize_surfaces_with_attempt_budget`].
+///
+/// Non-exhaustive: a later counter is not a breaking change.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct RecognitionWork {
     /// Generic hypotheses drawn, over every extraction round of every
     /// connected component.
@@ -189,6 +191,259 @@ pub struct RecognitionWork {
     /// Connected components accepted whole on a supplied
     /// [`ComponentCandidate`] after their own whole fit was refused.
     pub seeded_components: usize,
+    /// Generic hypotheses drawn per primitive kind, in the recognizer's kind
+    /// order (plane, sphere, cylinder, cone, torus).
+    pub hypotheses_by_kind: [usize; 5],
+    /// Extraction rounds that stopped because every kind's miss bound fell
+    /// to `1 - confidence` (the classical seed bound, or the adaptive
+    /// policy's product bound).
+    pub stops_at_risk_bound: usize,
+    /// Extraction rounds that stopped at `max_hypotheses` (or at one draw per
+    /// remaining triangle per kind, when that is smaller) with the bound not
+    /// yet met.
+    pub stops_at_hypothesis_cap: usize,
+    /// Extraction rounds of the adaptive policy that stopped because every
+    /// remaining triangle had seeded every kind.
+    pub stops_at_seed_exhaustion: usize,
+    /// Extraction rounds cut short by the attempt budget; the round's
+    /// candidates are dropped and `exhausted` is set.
+    pub stops_at_budget: usize,
+}
+
+impl RecognitionWork {
+    /// Adds the work of a component extracted on its own budget.
+    fn absorb(&mut self, other: &RecognitionWork) {
+        self.attempts += other.attempts;
+        self.rounds += other.rounds;
+        self.exhausted |= other.exhausted;
+        self.seeded_components += other.seeded_components;
+        for (mine, theirs) in self.hypotheses_by_kind.iter_mut().zip(&other.hypotheses_by_kind) {
+            *mine += theirs;
+        }
+        self.stops_at_risk_bound += other.stops_at_risk_bound;
+        self.stops_at_hypothesis_cap += other.stops_at_hypothesis_cap;
+        self.stops_at_seed_exhaustion += other.stops_at_seed_exhaustion;
+        self.stops_at_budget += other.stops_at_budget;
+    }
+}
+
+/// Where generic extraction spent its wall time and its work, returned by
+/// [`recognize_surfaces_with_extraction_profile`]. A measuring aid for the
+/// validation probes, not a stable interface: the fields follow the
+/// extraction loop. Seconds are summed over every hypothesis, so with more
+/// than one worker they exceed the wall time.
+#[doc(hidden)]
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ExtractionProfile {
+    /// Wall time of generic extraction over every component (whole fits,
+    /// supplied candidates and the rounds), the denominator of the shares.
+    pub extraction_seconds: f64,
+    /// Whole-component fits and supplied-candidate validation.
+    pub whole_fit_seconds: f64,
+    /// Rebuilding the round's remaining ids and its seed schedules
+    /// (classical: one shuffle per kind; adaptive: the per-round tables).
+    pub seed_order_seconds: f64,
+    /// Adaptive only: the kind bandit and the Boltzmann seed draw.
+    pub seed_choice_seconds: f64,
+    /// Breadth-first probes around the seeds.
+    pub neighborhood_seconds: f64,
+    /// Normal-diverse near-minimal samples.
+    pub sample_seconds: f64,
+    /// Sample fits per kind, in the recognizer's kind order (plane, sphere,
+    /// cylinder, cone, torus).
+    pub fit_seconds: [f64; 5],
+    /// Sample fits per kind.
+    pub fits: [usize; 5],
+    /// Support growth (`support_component`).
+    pub support_seconds: f64,
+    /// Support refits whose support count was at least the round's
+    /// incumbent count when the hypothesis was drawn.
+    pub refit_winning_seconds: f64,
+    /// Support refits whose support count was below that incumbent: they
+    /// cannot replace it.
+    pub refit_dominated_seconds: f64,
+    /// Refit events (a probe chain can refit more than once).
+    pub refits_winning: usize,
+    /// Dominated refit events.
+    pub refits_dominated: usize,
+    /// Dominated refits whose outcome cannot change the probe chain's next
+    /// step (the support did not grow beyond its probe, or the probe was
+    /// exhausted), so skipping them is exact.
+    pub refits_dominated_exact: usize,
+    /// Seconds of those.
+    pub refit_dominated_exact_seconds: f64,
+    /// Ranking refits (`selection_scale`, `model_rank`).
+    pub rank_seconds: f64,
+    /// The share of `rank_seconds` spent on dominated refits.
+    pub rank_dominated_seconds: f64,
+    /// Rounds run, including abandoned ones.
+    pub rounds: usize,
+    /// Hypotheses drawn in those rounds.
+    pub seeds_consumed: usize,
+    /// `remaining × kinds` summed over those rounds: the seeds a full
+    /// schedule offers.
+    pub seed_slots: usize,
+    /// Triangles the support test ran on.
+    pub support_triangles_tested: usize,
+    /// Vertex distance evaluations of the support test.
+    pub distance_evaluations: usize,
+    /// Distinct vertices among those, per hypothesis, summed.
+    pub distinct_vertices_evaluated: usize,
+    /// Rounds that found no candidate and abandoned the rest of the
+    /// component.
+    pub abandoned_rounds: usize,
+    /// Triangles those rounds left unresolved.
+    pub abandoned_triangles: usize,
+    /// Abandoned remainders that still held a connected piece of at least
+    /// `minimum_support` triangles.
+    pub abandoned_with_piece: usize,
+    /// Triangles in such pieces.
+    pub abandoned_piece_triangles: usize,
+    /// Inside the sample fits (lane U row 1).
+    pub sample_fitter: FitProfile,
+    /// Inside the whole-component fits: model selection per kind.
+    pub whole_fitter: FitProfile,
+    /// Inside the support refits.
+    pub refit_fitter: FitProfile,
+    /// Torus sample fits by what came of them: the fit returned an error,
+    /// its support stayed under `minimum_support`, the support refit failed,
+    /// the refit succeeded.
+    pub torus_sample_outcomes: [usize; 4],
+    /// Seconds of those torus sample fits, by the same outcome.
+    pub torus_sample_outcome_seconds: [f64; 4],
+}
+
+impl ExtractionProfile {
+    fn absorb(&mut self, other: &ExtractionProfile) {
+        self.whole_fit_seconds += other.whole_fit_seconds;
+        self.seed_order_seconds += other.seed_order_seconds;
+        self.seed_choice_seconds += other.seed_choice_seconds;
+        self.neighborhood_seconds += other.neighborhood_seconds;
+        self.sample_seconds += other.sample_seconds;
+        for kind in 0..5 {
+            self.fit_seconds[kind] += other.fit_seconds[kind];
+            self.fits[kind] += other.fits[kind];
+        }
+        self.support_seconds += other.support_seconds;
+        self.refit_winning_seconds += other.refit_winning_seconds;
+        self.refit_dominated_seconds += other.refit_dominated_seconds;
+        self.refits_winning += other.refits_winning;
+        self.refits_dominated += other.refits_dominated;
+        self.refits_dominated_exact += other.refits_dominated_exact;
+        self.refit_dominated_exact_seconds += other.refit_dominated_exact_seconds;
+        self.rank_seconds += other.rank_seconds;
+        self.rank_dominated_seconds += other.rank_dominated_seconds;
+        self.rounds += other.rounds;
+        self.seeds_consumed += other.seeds_consumed;
+        self.seed_slots += other.seed_slots;
+        self.support_triangles_tested += other.support_triangles_tested;
+        self.distance_evaluations += other.distance_evaluations;
+        self.distinct_vertices_evaluated += other.distinct_vertices_evaluated;
+        self.abandoned_rounds += other.abandoned_rounds;
+        self.abandoned_triangles += other.abandoned_triangles;
+        self.abandoned_with_piece += other.abandoned_with_piece;
+        self.abandoned_piece_triangles += other.abandoned_piece_triangles;
+        self.sample_fitter.absorb(&other.sample_fitter);
+        self.whole_fitter.absorb(&other.whole_fitter);
+        self.refit_fitter.absorb(&other.refit_fitter);
+        for outcome in 0..4 {
+            self.torus_sample_outcomes[outcome] += other.torus_sample_outcomes[outcome];
+            self.torus_sample_outcome_seconds[outcome] += other.torus_sample_outcome_seconds[outcome];
+        }
+    }
+
+    /// Moves what this thread's fitter collected since [`fit_profile_start`]
+    /// into the bucket `slot` picks.
+    fn take_fitter(profile: &mut Option<Self>, slot: fn(&mut Self) -> &mut FitProfile) {
+        if let (Some(profile), Some(fitter)) = (profile, fit_profile_take()) {
+            slot(profile).absorb(&fitter);
+        }
+    }
+
+    /// One torus sample fit of `seconds` that ended in `outcome` (see
+    /// [`Self::torus_sample_outcomes`]).
+    fn torus_sample(&mut self, outcome: usize, seconds: f64) {
+        self.torus_sample_outcomes[outcome] += 1;
+        self.torus_sample_outcome_seconds[outcome] += seconds;
+    }
+
+    /// Adds the seconds since `started` to the field `slot` picks.
+    fn charge(profile: &mut Option<Self>, started: Option<Instant>, slot: fn(&mut Self) -> &mut f64) {
+        if let (Some(profile), Some(started)) = (profile, started) {
+            *slot(profile) += started.elapsed().as_secs_f64();
+        }
+    }
+
+    /// One support refit of `count` triangles against an incumbent of
+    /// `incumbent`; `exact` when skipping it could not change the chain.
+    fn refit(&mut self, started: Option<Instant>, count: usize, incumbent: usize, exact: bool) {
+        let seconds = started.map_or(0.0, |started| started.elapsed().as_secs_f64());
+        if count < incumbent {
+            self.refits_dominated += 1;
+            self.refit_dominated_seconds += seconds;
+            if exact {
+                self.refits_dominated_exact += 1;
+                self.refit_dominated_exact_seconds += seconds;
+            }
+        } else {
+            self.refits_winning += 1;
+            self.refit_winning_seconds += seconds;
+        }
+    }
+
+    /// An abandoned round: how much of `remaining` was a connected piece the
+    /// next round could still have drawn from.
+    fn abandon(&mut self, mesh: &AnalyzedMesh, remaining: &Remaining, options: &RecognitionOptions) {
+        self.abandoned_rounds += 1;
+        self.abandoned_triangles += remaining.len();
+        let ids: Vec<usize> = remaining.iter().copied().collect();
+        let pieces: usize = mesh
+            .connected_components(&ids, options.respect_features)
+            .iter()
+            .filter(|piece| piece.len() >= options.minimum_support)
+            .map(Vec::len)
+            .sum();
+        if pieces > 0 {
+            self.abandoned_with_piece += 1;
+            self.abandoned_piece_triangles += pieces;
+        }
+    }
+}
+
+/// Distance work of one support growth.
+#[derive(Default)]
+struct SupportTally {
+    triangles: usize,
+    evaluations: usize,
+    vertices: std::collections::HashSet<usize>,
+}
+
+/// [`recognize_surfaces_with_attempt_budget`], also returning where generic
+/// extraction spent its time. The regions and the work are those of the
+/// unprofiled call; only the clock reads differ.
+#[doc(hidden)]
+pub fn recognize_surfaces_with_extraction_profile(
+    mesh: &Mesh,
+    options: &RecognitionOptions,
+    max_attempts: usize,
+    kinds: &[SurfaceType],
+) -> Result<(RecognitionResult, RecognitionWork, ExtractionProfile), RecognitionError> {
+    let kinds: Vec<_> = TYPES.into_iter().filter(|kind| kinds.is_empty() || kinds.contains(kind)).collect();
+    let mut budget = AttemptBudget {
+        limit: Some(max_attempts),
+        kinds,
+        work: RecognitionWork::default(),
+        profile: Some(ExtractionProfile::default()),
+    };
+    let result = recognize_budgeted(mesh, options, &mut budget, &[])?;
+    Ok((result, budget.work, budget.profile.unwrap_or_default()))
+}
+
+fn kind_index(kind: SurfaceType) -> usize {
+    TYPES
+        .iter()
+        .position(|&candidate| candidate == kind)
+        .expect("every primitive kind is in TYPES")
 }
 
 /// A carrier another stage already fitted to exactly the triangles of one
@@ -243,9 +498,9 @@ pub fn recognize_surfaces_with_attempt_budget(
         limit: Some(max_attempts),
         kinds,
         work: RecognitionWork::default(),
-        candidates: Vec::new(),
+        profile: None,
     };
-    let result = recognize_budgeted(mesh, options, &mut budget)?;
+    let result = recognize_budgeted(mesh, options, &mut budget, &[])?;
     Ok((result, budget.work))
 }
 
@@ -265,7 +520,8 @@ pub fn recognize_surfaces_with_candidates(
     candidates: &[ComponentCandidate],
 ) -> Result<(RecognitionResult, RecognitionWork), RecognitionError> {
     let mut budget = AttemptBudget::unlimited();
-    budget.candidates = candidates
+    // Sorted triangle sets and their candidate carriers.
+    let candidates: Vec<(Vec<usize>, AnalyticSurface)> = candidates
         .iter()
         .map(|candidate| {
             let mut ids = candidate.triangle_indices.clone();
@@ -274,7 +530,7 @@ pub fn recognize_surfaces_with_candidates(
             (ids, candidate.surface)
         })
         .collect();
-    let result = recognize_budgeted(mesh, options, &mut budget)?;
+    let result = recognize_budgeted(mesh, options, &mut budget, &candidates)?;
     Ok((result, budget.work))
 }
 
@@ -283,8 +539,8 @@ struct AttemptBudget {
     /// Kinds generic hypotheses are drawn for, in [`TYPES`] order.
     kinds: Vec<SurfaceType>,
     work: RecognitionWork,
-    /// Sorted triangle sets and their candidate carriers.
-    candidates: Vec<(Vec<usize>, AnalyticSurface)>,
+    /// Collected only by [`recognize_surfaces_with_extraction_profile`].
+    profile: Option<ExtractionProfile>,
 }
 
 impl AttemptBudget {
@@ -293,8 +549,28 @@ impl AttemptBudget {
             limit: None,
             kinds: TYPES.to_vec(),
             work: RecognitionWork::default(),
-            candidates: Vec::new(),
+            profile: None,
         }
+    }
+
+    /// Takes up to `want` attempts, as many as the limit allows, without
+    /// marking the budget exhausted: the caller knows whether the run would
+    /// have asked for the attempt the limit refuses.
+    fn admit(&mut self, want: usize) -> usize {
+        if self.work.exhausted {
+            return 0;
+        }
+        let admitted = match self.limit {
+            Some(limit) => want.min(limit.saturating_sub(self.work.attempts)),
+            None => want,
+        };
+        self.work.attempts += admitted;
+        admitted
+    }
+
+    /// Returns admitted attempts the run turned out not to draw.
+    fn refund(&mut self, count: usize) {
+        self.work.attempts -= count;
     }
 
     /// Takes one attempt, or marks the budget exhausted and refuses.
@@ -312,6 +588,7 @@ fn recognize_budgeted(
     mesh: &Mesh,
     options: &RecognitionOptions,
     budget: &mut AttemptBudget,
+    candidates: &[(Vec<usize>, AnalyticSurface)],
 ) -> Result<RecognitionResult, RecognitionError> {
     options.validate()?;
     let analyzed = mesh.analyze(&MeshAnalysisOptions {
@@ -377,9 +654,9 @@ fn recognize_budgeted(
     } else {
         vec![remaining]
     };
-    for component in components {
-        extract_component(&analyzed, &component, options, &mut regions, budget);
-    }
+    let extraction_started = budget.profile.is_some().then(Instant::now);
+    extract_components(&analyzed, &components, options, candidates, &mut regions, budget);
+    ExtractionProfile::charge(&mut budget.profile, extraction_started, |p| &mut p.extraction_seconds);
     if options.allow_disconnected_same_surface {
         merge_disconnected_regions(&analyzed, options, &mut regions);
     }
@@ -660,12 +937,15 @@ fn best_model_impl(
     use_score_bounds: bool,
 ) -> Result<SurfaceFitResult, RecognitionError> {
     let evaluation_started = options.collect_phase_timings.then(Instant::now);
+    let mut tally = SelectionTally::start(selection);
     let tolerance = options.distance_tolerance + options.relative_tolerance * scale.max(1.0);
     let mut candidates = Vec::new();
     let mut rejected = Vec::new();
     for kind in TYPES {
+        let fit_started = tally.clock(&candidates);
         match selection.fit(mesh, kind, None, fixed, options, path) {
             Ok(model) if selection.accepted(&model, options, scale) => {
+                let rank_started = tally.fitted(fit_started, kind, 0);
                 let rank = model_rank(
                     mesh,
                     selection,
@@ -674,16 +954,23 @@ fn best_model_impl(
                     tolerance,
                     options.normal_tolerance,
                 );
+                tally.ranked(rank_started);
                 candidates.push((rank, kind, model));
             }
-            Ok(model) => rejected.push((
-                kind,
-                format!(
-                    "max distance {:.3e}, max normal {:.3e}",
-                    model.metrics.max_error, model.metrics.max_normal_error
-                ),
-            )),
-            Err(e) => rejected.push((kind, e.to_string())),
+            Ok(model) => {
+                tally.fitted(fit_started, kind, 1);
+                rejected.push((
+                    kind,
+                    format!(
+                        "max distance {:.3e}, max normal {:.3e}",
+                        model.metrics.max_error, model.metrics.max_normal_error
+                    ),
+                ))
+            }
+            Err(e) => {
+                tally.fitted(fit_started, kind, 2);
+                rejected.push((kind, e.to_string()))
+            }
         }
         if use_score_bounds {
             if let Some(bound) = unseen_model_score_lower_bound(kind) {
@@ -699,6 +986,7 @@ fn best_model_impl(
                     // residual terms are non-negative and the ordinary score
                     // lower bound is safe within the exact tier.
                     if rank.numerically_exact && rank.score < bound {
+                        tally.finish(Some(best_kind), true);
                         let (_, _, model) = candidates.remove(best_index);
                         record_tolerance_valid_losers(&mut rejected, candidates, best_kind, rank);
                         rejected.sort_by_key(|(candidate_kind, _)| *candidate_kind);
@@ -728,6 +1016,7 @@ fn best_model_impl(
     // geometric gate and R is below the configured spatial resolution, the
     // torus's extra axis and radius are not identifiable; retain the simpler
     // sphere. This does not suppress a torus when the sphere fails validation.
+    let filter_started = tally.filter_clock();
     let valid_sphere = candidates
         .iter()
         .any(|(_, kind, _)| *kind == SurfaceType::Sphere);
@@ -861,7 +1150,9 @@ fn best_model_impl(
             ));
         }
     }
+    tally.filtered(filter_started);
     candidates.sort_by(|a, b| compare_model_rank(a.0, a.1, b.0, b.1));
+    tally.finish(candidates.first().map(|candidate| candidate.1), false);
     if candidates.is_empty() {
         return Err(RecognitionError::FitFailed {
             surface: None,
@@ -880,6 +1171,115 @@ fn best_model_impl(
         "best tolerance-valid model selected by numerical-exactness tier, residual score, and simplicity penalty",
         evaluation_started.as_ref(),
     ))
+}
+
+/// [`FitProfile`] bookkeeping of one `best_model_impl` call, inert unless the
+/// thread collects a profile.
+struct SelectionTally {
+    started: Option<Instant>,
+    size: usize,
+    /// Per kind: seconds of its fit, when it ran.
+    seconds: [Option<f64>; 5],
+    /// Per kind: 0 accepted, 1 failed the gates, 2 error.
+    outcome: [u8; 5],
+    after_exact: [bool; 5],
+    after_valid: [bool; 5],
+    rank_seconds: f64,
+    filter_seconds: f64,
+}
+
+impl SelectionTally {
+    fn start(selection: Selection<'_>) -> Self {
+        let size = match selection {
+            Selection::Triangles(ids) | Selection::Vertices(ids) => ids.len(),
+        };
+        Self {
+            started: fit_profile_clock(),
+            size,
+            seconds: [None; 5],
+            outcome: [0; 5],
+            after_exact: [false; 5],
+            after_valid: [false; 5],
+            rank_seconds: 0.0,
+            filter_seconds: 0.0,
+        }
+    }
+
+    /// The clock before a kind's fit, noting what the earlier kinds left.
+    fn clock(&mut self, candidates: &[(ModelRank, SurfaceType, SurfaceFitResult)]) -> Option<(Instant, bool, bool)> {
+        self.started?;
+        let exact = candidates.iter().any(|(rank, ..)| rank.numerically_exact);
+        Some((Instant::now(), exact, !candidates.is_empty()))
+    }
+
+    fn fitted(&mut self, started: Option<(Instant, bool, bool)>, kind: SurfaceType, outcome: u8) -> Option<Instant> {
+        let (started, exact, valid) = started?;
+        let index = kind_index(kind);
+        self.seconds[index] = Some(started.elapsed().as_secs_f64());
+        self.outcome[index] = outcome;
+        self.after_exact[index] = exact;
+        self.after_valid[index] = valid;
+        Some(Instant::now())
+    }
+
+    fn ranked(&mut self, started: Option<Instant>) {
+        if let Some(started) = started {
+            self.rank_seconds += started.elapsed().as_secs_f64();
+        }
+    }
+
+    fn filter_clock(&self) -> Option<Instant> {
+        self.started.map(|_| Instant::now())
+    }
+
+    fn filtered(&mut self, started: Option<Instant>) {
+        if let Some(started) = started {
+            self.filter_seconds += started.elapsed().as_secs_f64();
+        }
+    }
+
+    fn finish(&self, selected: Option<SurfaceType>, bound_exit: bool) {
+        let tally = self;
+        fit_profile_note(self.started, |profile, seconds| {
+            profile.selections += 1;
+            profile.selection_size += tally.size;
+            profile.selections_bound_exit += usize::from(bound_exit);
+            if selected.is_none() {
+                profile.selections_failed += 1;
+                profile.selections_failed_seconds += seconds;
+            }
+            profile.rank_seconds += tally.rank_seconds;
+            profile.filter_seconds += tally.filter_seconds;
+            for index in 0..5 {
+                let Some(fit_seconds) = tally.seconds[index] else {
+                    continue;
+                };
+                profile.kind_fits[index] += 1;
+                profile.kind_seconds[index] += fit_seconds;
+                match tally.outcome[index] {
+                    1 => profile.kind_rejected[index] += 1,
+                    2 => profile.kind_errors[index] += 1,
+                    _ => {}
+                }
+                if selected.is_some_and(|kind| kind_index(kind) == index) {
+                    profile.kind_won[index] += 1;
+                } else {
+                    if tally.outcome[index] == 0 {
+                        profile.kind_valid_lost[index] += 1;
+                    }
+                    profile.kind_lost_seconds[index] += fit_seconds;
+                }
+                if tally.after_exact[index] {
+                    profile.kind_after_exact[index] += 1;
+                    profile.kind_after_exact_seconds[index] += fit_seconds;
+                }
+                if tally.after_valid[index] {
+                    profile.kind_after_valid[index] += 1;
+                    profile.kind_after_valid_seconds[index] += fit_seconds;
+                }
+            }
+        });
+    }
 }
 
 fn torus_observably_dominates_cylinder(
@@ -1175,31 +1575,199 @@ fn merge_disconnected_regions(
     }
 }
 
+/// Worker threads the options ask for: the cores the process may run on
+/// when `threads` is 0, else `threads`; one on `wasm32`, which has no
+/// threads to spawn.
+fn worker_threads(options: &RecognitionOptions) -> usize {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = options;
+        1
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        match options.threads {
+            0 => std::thread::available_parallelism().map_or(1, |cores| cores.get()),
+            threads => threads,
+        }
+    }
+}
+
+/// `f(0)..f(count)` in index order. With more than one worker on a native
+/// target the indices are handed out dynamically to `workers` scoped
+/// threads; otherwise they run in order on the caller's thread. A panic in
+/// a worker is resumed on the caller's thread.
+fn parallel_map<T: Send>(workers: usize, count: usize, f: impl Fn(usize) -> T + Sync) -> Vec<T> {
+    parallel_map_on_workers(workers, count, |_, index| f(index))
+}
+
+/// [`parallel_map`], also passing the worker evaluating each index (below
+/// `workers`, and 0 on the caller's thread), so each worker can own scratch.
+fn parallel_map_on_workers<T: Send>(
+    workers: usize,
+    count: usize,
+    f: impl Fn(usize, usize) -> T + Sync,
+) -> Vec<T> {
+    #[cfg(target_arch = "wasm32")]
+    let _ = workers;
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let workers = workers.min(count);
+        if workers > 1 {
+            let next = std::sync::atomic::AtomicUsize::new(0);
+            let collected: Vec<Vec<(usize, T)>> = std::thread::scope(|scope| {
+                let handles: Vec<_> = (0..workers)
+                    .map(|worker| {
+                        let (next, f) = (&next, &f);
+                        scope.spawn(move || {
+                            let mut mine = Vec::new();
+                            loop {
+                                let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                if index >= count {
+                                    break;
+                                }
+                                mine.push((index, f(worker, index)));
+                            }
+                            mine
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|handle| handle.join().unwrap_or_else(|payload| std::panic::resume_unwind(payload)))
+                    .collect()
+            });
+            let mut slots: Vec<Option<T>> = (0..count).map(|_| None).collect();
+            for (index, value) in collected.into_iter().flatten() {
+                slots[index] = Some(value);
+            }
+            return slots.into_iter().map(|slot| slot.expect("every index was evaluated once")).collect();
+        }
+    }
+    (0..count).map(|index| f(0, index)).collect()
+}
+
+/// Generic extraction over the connected components. When there are at least
+/// as many components that can need extraction as workers, the workers take
+/// the components, largest first, each on a local budget without a limit, and
+/// the results are merged in component order, which is what the one-at-a-time
+/// loop produces (also for the merge of disconnected regions that follows).
+/// Under an attempt limit the one-at-a-time loop charges the components in
+/// order and stops at the first draw the limit refuses, so the merge replays
+/// that accounting: a component whose draws fit in what is left is taken as
+/// computed, the first one that does not is run again on the real budget (it
+/// is cut inside, and marks the budget exhausted), and the components after
+/// it contribute nothing, as in the one-at-a-time loop. Otherwise the
+/// components run in order and the workers go to the rounds' hypothesis
+/// batches.
+fn extract_components(
+    mesh: &AnalyzedMesh,
+    components: &[Vec<usize>],
+    options: &RecognitionOptions,
+    candidates: &[(Vec<usize>, AnalyticSurface)],
+    out: &mut Vec<SurfaceRegion>,
+    budget: &mut AttemptBudget,
+) {
+    let workers = worker_threads(options);
+    let eligible = components
+        .iter()
+        .filter(|component| component.len() >= options.minimum_support)
+        .count();
+    if workers > 1 && eligible >= workers && !budget.work.exhausted {
+        let mut largest_first: Vec<usize> = (0..components.len()).collect();
+        largest_first.sort_by_key(|&index| std::cmp::Reverse(components[index].len()));
+        let kinds = &budget.kinds;
+        let profiling = budget.profile.is_some();
+        let mut extracted = parallel_map(workers, components.len(), |slot| {
+            let index = largest_first[slot];
+            let mut local = AttemptBudget {
+                limit: None,
+                kinds: kinds.clone(),
+                work: RecognitionWork::default(),
+                profile: profiling.then(ExtractionProfile::default),
+            };
+            let mut regions = Vec::new();
+            extract_component(mesh, &components[index], options, candidates, &mut regions, &mut local, 1);
+            (index, regions, local.work, local.profile)
+        });
+        extracted.sort_by_key(|(index, ..)| *index);
+        for (index, regions, work, profile) in extracted {
+            debug_assert!(!work.exhausted && work.stops_at_budget == 0, "an unlimited budget refuses nothing");
+            if budget.work.exhausted {
+                break;
+            }
+            let fits = budget
+                .limit
+                .is_none_or(|limit| budget.work.attempts.saturating_add(work.attempts) <= limit);
+            if fits {
+                out.extend(regions);
+                budget.work.absorb(&work);
+                if let (Some(total), Some(profile)) = (&mut budget.profile, &profile) {
+                    total.absorb(profile);
+                }
+            } else {
+                // The one-at-a-time loop is cut inside this component: run it
+                // on the real budget, which refuses the draw the limit
+                // refuses there and marks the budget exhausted.
+                extract_component(mesh, &components[index], options, candidates, out, budget, 1);
+                debug_assert!(budget.work.exhausted);
+            }
+        }
+        return;
+    }
+    for component in components {
+        extract_component(mesh, component, options, candidates, out, budget, workers);
+    }
+}
+
 fn extract_component(
     mesh: &AnalyzedMesh,
     component: &[usize],
     options: &RecognitionOptions,
+    candidates: &[(Vec<usize>, AnalyticSurface)],
     out: &mut Vec<SurfaceRegion>,
     budget: &mut AttemptBudget,
+    workers: usize,
 ) {
     if component.len() < options.minimum_support || budget.work.exhausted {
         return;
     }
-    if let Ok(fit) = reconstruct_analyzed(mesh, component, &SurfaceHint::Unknown, options) {
+    let whole_started = budget.profile.is_some().then(Instant::now);
+    fit_profile_start(budget.profile.is_some());
+    let whole = reconstruct_analyzed(mesh, component, &SurfaceHint::Unknown, options);
+    ExtractionProfile::take_fitter(&mut budget.profile, |p| &mut p.whole_fitter);
+    if let Ok(fit) = whole {
+        ExtractionProfile::charge(&mut budget.profile, whole_started, |p| &mut p.whole_fit_seconds);
         out.push(to_region(fit, component.to_vec()));
         return;
     }
-    if let Some(fit) = candidate_fit(mesh, component, options, &budget.candidates) {
+    if let Some(fit) = candidate_fit(mesh, component, options, candidates) {
+        ExtractionProfile::charge(&mut budget.profile, whole_started, |p| &mut p.whole_fit_seconds);
         budget.work.seeded_components += 1;
         out.push(to_region(fit, component.to_vec()));
         return;
     }
+    ExtractionProfile::charge(&mut budget.profile, whole_started, |p| &mut p.whole_fit_seconds);
+    if let HypothesisPolicy::Adaptive(policy) = &options.hypothesis_policy {
+        return extract_component_adaptive(mesh, component, options, out, budget, policy);
+    }
     // CAD-aware hypothesis generation: fit small connected neighborhoods and
     // grow their geometric support through adjacency. This is deterministic
     // with a supplied seed and lets tangent analytic regions separate.
-    let mut remaining: BTreeSet<usize> = component.iter().copied().collect();
+    //
+    // A round's hypotheses are fixed by its seed permutations, and each one
+    // reads only the round's remaining triangles, so they are evaluated in
+    // batches (of one on a single worker) and applied in draw order: the
+    // regions, their diagnostics and the work are those of the one-at-a-time
+    // loop, including where an attempt budget cuts the round.
+    let mut remaining = Remaining::new(mesh, component);
     let mut rng = SplitMix(options.deterministic_seed.unwrap_or(0x52414e534143));
+    let batch_size = if workers > 1 { workers * budget.kinds.len() } else { 1 };
+    let scratch: Vec<std::sync::Mutex<Scratch>> =
+        (0..workers.max(1)).map(|_| std::sync::Mutex::new(Scratch::new(mesh))).collect();
+    let profiling = budget.profile.is_some();
     while remaining.len() >= options.minimum_support {
+        let seed_order_started = profiling.then(Instant::now);
         let ids: Vec<_> = remaining.iter().copied().collect();
         // One independently shuffled, without-replacement seed schedule per
         // primitive. At the full cap every remaining triangle is tried once
@@ -1210,137 +1778,901 @@ fn extract_component(
             .iter()
             .map(|_| shuffled_seed_order(&ids, &mut rng))
             .collect();
+        ExtractionProfile::charge(&mut budget.profile, seed_order_started, |p| &mut p.seed_order_seconds);
         let mut best: Option<(usize, ModelRank, SurfaceFitResult, Vec<usize>)> = None;
         let attempt_cap = options.max_hypotheses.min(ids.len() * kinds.len());
         let mut attempts_required = attempt_cap;
         let mut attempt = 0;
         let mut region_growth_seconds = options.collect_phase_timings.then_some(0.0);
         while attempt < attempts_required {
+            let want = batch_size.min(attempts_required - attempt);
+            let admitted = budget.admit(want);
+            let drawn: Vec<(usize, SurfaceType)> = (attempt..attempt + admitted)
+                .map(|index| {
+                    let slot = index % kinds.len();
+                    (seed_orders[slot][index / kinds.len()], kinds[slot])
+                })
+                .collect();
+            for &(_, kind) in &drawn {
+                budget.work.hypotheses_by_kind[kind_index(kind)] += 1;
+            }
+            let incumbent = best.as_ref().map_or(0, |(count, ..)| *count);
+            let evaluated = parallel_map_on_workers(workers, admitted, |worker, offset| {
+                let (seed, kind) = drawn[offset];
+                // Each worker locks only its own scratch, so this never waits.
+                let mut scratch = scratch[worker].lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                classical_hypothesis(mesh, &remaining, &mut scratch, seed, kind, options, incumbent, profiling)
+            });
+            let mut applied = 0;
+            for (offset, (probe_best, growth_seconds, profile)) in evaluated.into_iter().enumerate() {
+                let attempt_index = attempt + offset;
+                if attempt_index >= attempts_required {
+                    break;
+                }
+                applied += 1;
+                if let (Some(total), Some(seconds)) = (&mut region_growth_seconds, growth_seconds) {
+                    *total += seconds;
+                }
+                if let (Some(total), Some(profile)) = (&mut budget.profile, &profile) {
+                    total.absorb(profile);
+                }
+                let Some((_, rank, mut fit, support)) = probe_best else {
+                    continue;
+                };
+                fit.diagnostics.hypotheses_generated = attempt_index + 1;
+                let area = fit.metrics.supported_area;
+                let replace = best.as_ref().is_none_or(|(count, old_rank, old, _)| {
+                    support.len() > *count
+                        || (support.len() == *count
+                            && (area > old.metrics.supported_area
+                                || (area == old.metrics.supported_area
+                                    && compare_model_rank(
+                                        rank,
+                                        fit.surface.surface_type(),
+                                        *old_rank,
+                                        old.surface.surface_type(),
+                                    ) == Ordering::Less)))
+                });
+                if replace {
+                    let support_fraction = support.len() as f64 / ids.len() as f64;
+                    attempts_required = attempts_required.min(required_seed_hypotheses(
+                        options.confidence,
+                        support_fraction,
+                        kinds.len(),
+                        attempt_cap,
+                    ));
+                    attempts_required = attempts_required.max(attempt_index + 1);
+                    best = Some((support.len(), rank, fit, support));
+                }
+            }
+            // Hypotheses past the bound a winner in this batch shrank were
+            // never drawn by the one-at-a-time loop.
+            for &(_, kind) in &drawn[applied..] {
+                budget.work.hypotheses_by_kind[kind_index(kind)] -= 1;
+            }
+            budget.refund(admitted - applied);
+            attempt += applied;
+            if applied < admitted {
+                break;
+            }
+            if admitted < want {
+                // The round's next hypothesis is one the limit refuses.
+                budget.work.exhausted = true;
+                budget.work.stops_at_budget += 1;
+                return;
+            }
+        }
+        // The round ran to the classical bound, or to the cap when the bound
+        // asked for more than the cap allowed.
+        if attempts_required < attempt_cap {
+            budget.work.stops_at_risk_bound += 1;
+        } else {
+            budget.work.stops_at_hypothesis_cap += 1;
+        }
+        if let Some(profile) = &mut budget.profile {
+            profile.rounds += 1;
+            profile.seeds_consumed += attempt;
+            profile.seed_slots += ids.len() * kinds.len();
+            if best.is_none() {
+                profile.abandon(mesh, &remaining, options);
+            }
+        }
+        let Some((_, _, mut fit, support)) = best else {
+            break;
+        };
+        fit.diagnostics.phase_timings.region_growth_seconds = region_growth_seconds;
+        for id in &support {
+            remaining.remove(id);
+        }
+        budget.work.rounds += 1;
+        out.push(to_region(fit, support));
+    }
+}
+
+/// One classical hypothesis: the probe chain around `seed` for `kind` over
+/// `remaining`, returning the best candidate any probe size produced
+/// (support count, rank, refit, support), the seconds spent growing support
+/// when phase timings are collected, and its extraction profile when
+/// `profiling` (refits measured against `incumbent`, the round's best count
+/// when it was drawn). It reads nothing a round writes, so a round's
+/// hypotheses can run in any order or at once.
+#[allow(clippy::type_complexity, clippy::too_many_arguments)]
+fn classical_hypothesis(
+    mesh: &AnalyzedMesh,
+    remaining: &Remaining,
+    scratch: &mut Scratch,
+    seed: usize,
+    kind: SurfaceType,
+    options: &RecognitionOptions,
+    incumbent: usize,
+    profiling: bool,
+) -> (
+    Option<(usize, ModelRank, SurfaceFitResult, Vec<usize>)>,
+    Option<f64>,
+    Option<ExtractionProfile>,
+) {
+    let mut region_growth_seconds = options.collect_phase_timings.then_some(0.0);
+    let mut profile = profiling.then(ExtractionProfile::default);
+    // Generate each primitive from the smallest diverse triangle set that
+    // supplies its fitter's required independent observations in every
+    // public sampling mode. Final support is still grown and validated
+    // against the complete connected region below. Keeping the fitted sample
+    // primitive-specific avoids fitting every candidate to the full
+    // diversity probe while preserving aggressive rank/degeneracy rejection
+    // in the fitter.
+    let sample_size = hypothesis_sample_triangles(kind);
+    // The probe supplies spatial/normal diversity without increasing the
+    // number of triangles actually passed to a primitive fitter.
+    let mut probe_limit = options
+        .hypothesis_probe_triangles
+        .max(sample_size)
+        .min(remaining.len());
+    let mut probe_best: Option<(usize, ModelRank, SurfaceFitResult, Vec<usize>)> = None;
+    let mut search = Neighborhood::start(scratch, seed);
+    loop {
+        let started = profiling.then(Instant::now);
+        let probe = search.grow(mesh, remaining, scratch, probe_limit, probe_crease(options));
+        ExtractionProfile::charge(&mut profile, started, |p| &mut p.neighborhood_seconds);
+        if probe.len() < sample_size {
+            break;
+        }
+        let started = profiling.then(Instant::now);
+        let sample = diverse_hypothesis_sample(mesh, seed, &probe, sample_size);
+        ExtractionProfile::charge(&mut profile, started, |p| &mut p.sample_seconds);
+        let mut grew_beyond_probe = false;
+        let mut reconstructed_probe = false;
+        let started = profiling.then(Instant::now);
+        fit_profile_start(profiling);
+        let fitted = fit_surface_with_path(
+            mesh,
+            &sample,
+            kind,
+            None,
+            ConstraintMask::default(),
+            options,
+            FitPath::GenericRecognition,
+        );
+        ExtractionProfile::take_fitter(&mut profile, |p| &mut p.sample_fitter);
+        let fit_seconds = started.map_or(0.0, |started| started.elapsed().as_secs_f64());
+        // What came of a torus sample fit (row 1): see `torus_sample_outcomes`.
+        let mut torus_outcome = 0;
+        if let Some(profile) = &mut profile {
+            profile.fit_seconds[kind_index(kind)] += fit_seconds;
+            profile.fits[kind_index(kind)] += 1;
+        }
+        if let Ok(candidate) = fitted {
+            torus_outcome = 1;
+            let growth_started = options.collect_phase_timings.then(Instant::now);
+            let started = profiling.then(Instant::now);
+            let mut tally = profiling.then(SupportTally::default);
+            let support = support_component(
+                mesh,
+                remaining,
+                scratch,
+                seed,
+                candidate.surface,
+                options,
+                tally.as_mut(),
+            );
+            ExtractionProfile::charge(&mut profile, started, |p| &mut p.support_seconds);
+            if let (Some(profile), Some(tally)) = (&mut profile, tally) {
+                profile.support_triangles_tested += tally.triangles;
+                profile.distance_evaluations += tally.evaluations;
+                profile.distinct_vertices_evaluated += tally.vertices.len();
+            }
+            if let (Some(total), Some(started)) = (&mut region_growth_seconds, growth_started) {
+                *total += started.elapsed().as_secs_f64();
+            }
+            grew_beyond_probe = support.len() > probe.len();
+            if support.len() >= options.minimum_support {
+                let started = profiling.then(Instant::now);
+                fit_profile_start(profiling);
+                let refitted = reconstruct_analyzed(
+                    mesh,
+                    &support,
+                    &SurfaceHint::InitialGuess {
+                        surface: candidate.surface,
+                        trust: crate::MetadataTrust::InitialGuess,
+                    },
+                    options,
+                );
+                ExtractionProfile::take_fitter(&mut profile, |p| &mut p.refit_fitter);
+                torus_outcome = if refitted.is_ok() { 3 } else { 2 };
+                if let Some(profile) = &mut profile {
+                    let exhausted = probe.len() == remaining.len() || probe.len() < probe_limit;
+                    profile.refit(started, support.len(), incumbent, !grew_beyond_probe || exhausted);
+                }
+                if let Ok(fit) = refitted {
+                    reconstructed_probe = true;
+                    let started = profiling.then(Instant::now);
+                    let area = fit.metrics.supported_area;
+                    let support_scale = selection_scale(mesh, &support);
+                    let support_tolerance = options.distance_tolerance
+                        + options.relative_tolerance * support_scale.max(1.0);
+                    let rank = model_rank(
+                        mesh,
+                        Selection::Triangles(&support),
+                        fit.surface.surface_type(),
+                        &fit,
+                        support_tolerance,
+                        options.normal_tolerance,
+                    );
+                    let replace = probe_best.as_ref().is_none_or(|(count, old_rank, old, _)| {
+                        support.len() > *count
+                            || (support.len() == *count
+                                && (area > old.metrics.supported_area
+                                    || (area == old.metrics.supported_area
+                                        && compare_model_rank(
+                                            rank,
+                                            fit.surface.surface_type(),
+                                            *old_rank,
+                                            old.surface.surface_type(),
+                                        ) == Ordering::Less)))
+                    });
+                    ExtractionProfile::charge(&mut profile, started, |p| &mut p.rank_seconds);
+                    if support.len() < incumbent {
+                        ExtractionProfile::charge(&mut profile, started, |p| &mut p.rank_dominated_seconds);
+                    }
+                    if replace {
+                        probe_best = Some((support.len(), rank, fit, support));
+                    }
+                }
+            }
+        }
+        if let (Some(profile), SurfaceType::Torus) = (&mut profile, kind) {
+            profile.torus_sample(torus_outcome, fit_seconds);
+        }
+        let exhausted = probe.len() == remaining.len() || probe.len() < probe_limit;
+        if (grew_beyond_probe && reconstructed_probe) || exhausted {
+            break;
+        }
+        // A candidate explaining no more triangles than its local probe is
+        // under-observed (for example one planar strip of a finely faceted
+        // cylinder). Expand only the diversity probe; every fitter call
+        // remains primitive-minimal.
+        probe_limit = probe_limit.saturating_mul(2).min(remaining.len());
+    }
+    (probe_best, region_growth_seconds, profile)
+}
+
+/// Relative cost of one generic hypothesis per kind, in units of a plane
+/// hypothesis, in [`TYPES`] order. The sample fit dominates a losing
+/// hypothesis, and on brep-vm2 (release, 2026-10-27, the jitter-1.0 d0.02
+/// torus and the jitter-0.3 d0.02 crossing fixtures) it measured 0.01 ms for
+/// a plane, 0.05 sphere, 0.13 cylinder, 0.27 cone and 9.2 torus. The bandit
+/// divides a kind's reward by this instead of reading the clock, so a run
+/// stays reproducible under `deterministic_seed`.
+const HYPOTHESIS_COST_UNITS: [f64; 5] = [1.0, 5.0, 13.0, 27.0, 920.0];
+
+/// Uniform index in `0..n` by rejection, as [`shuffled_seed_order`] draws.
+fn uniform_index(rng: &mut SplitMix, n: usize) -> usize {
+    debug_assert!(n > 0);
+    let n_u64 = n as u64;
+    let zone = (u64::MAX / n_u64) * n_u64;
+    loop {
+        let value = rng.next();
+        if value < zone {
+            return (value % n_u64) as usize;
+        }
+    }
+}
+
+/// Uniform `f64` in `[0, 1)` from the top 53 bits of one draw.
+fn unit_interval(rng: &mut SplitMix) -> f64 {
+    (rng.next() >> 11) as f64 / (1u64 << 53) as f64
+}
+
+/// Standard normal by Box–Muller (one of the pair).
+fn standard_normal(rng: &mut SplitMix) -> f64 {
+    let u = loop {
+        let u = unit_interval(rng);
+        if u > 0.0 {
+            break u;
+        }
+    };
+    let v = unit_interval(rng);
+    (-2.0 * u.ln()).sqrt() * (2.0 * std::f64::consts::PI * v).cos()
+}
+
+/// Gamma(`shape`, 1) for `shape >= 1` by Marsaglia–Tsang.
+fn gamma_sample(rng: &mut SplitMix, shape: f64) -> f64 {
+    debug_assert!(shape >= 1.0);
+    let d = shape - 1.0 / 3.0;
+    let c = 1.0 / (9.0 * d).sqrt();
+    loop {
+        let x = standard_normal(rng);
+        let v = 1.0 + c * x;
+        if v <= 0.0 {
+            continue;
+        }
+        let v = v * v * v;
+        let u = unit_interval(rng);
+        if u > 0.0 && u.ln() < 0.5 * x * x + d - d * v + d * v.ln() {
+            return d * v;
+        }
+    }
+}
+
+/// Beta(`successes + 1`, `failures + 1`): the posterior of a rate under a
+/// uniform prior.
+fn beta_sample(rng: &mut SplitMix, successes: usize, failures: usize) -> f64 {
+    let x = gamma_sample(rng, successes as f64 + 1.0);
+    let y = gamma_sample(rng, failures as f64 + 1.0);
+    x / (x + y)
+}
+
+/// The arm a bandit draws next: first any eligible arm below its floor share
+/// of the `total` draws so far (the most deficient, lowest index on ties),
+/// otherwise the eligible arm with the largest `score`. At least one arm must
+/// be eligible.
+fn choose_arm(draws: &[usize], scores: &[f64], eligible: &[bool], floor_share: f64, total: usize) -> usize {
+    let arms = draws.len();
+    debug_assert!(arms > 0 && scores.len() == arms && eligible.len() == arms);
+    let minimum = (floor_share * (total + 1) as f64 / arms as f64).ceil() as usize;
+    let deficient = (0..arms)
+        .filter(|&i| eligible[i] && draws[i] < minimum)
+        .min_by(|&a, &b| draws[a].cmp(&draws[b]).then(a.cmp(&b)));
+    if let Some(arm) = deficient {
+        return arm;
+    }
+    (0..arms)
+        .filter(|&i| eligible[i])
+        .fold(None, |best: Option<usize>, i| match best {
+            Some(b) if scores[i] <= scores[b] => Some(b),
+            _ => Some(i),
+        })
+        .expect("at least one eligible arm")
+}
+
+/// What the adaptive policy has learned about one primitive kind on a
+/// component, carried from round to round (halved at each round's start, so
+/// the extracted regions stop weighing on what remains).
+#[derive(Clone, Copy, Debug, Default)]
+struct KindPosterior {
+    /// Hypotheses whose support reached `minimum_support`.
+    reached: f64,
+    /// Hypotheses that did the work and did not.
+    failed: f64,
+    /// Sum of the reached candidates' support shares of the round's triangles.
+    support_share: f64,
+    /// Doubling chains past a hopeless probe that later reached
+    /// `minimum_support`, and chains that never did.
+    rescued: f64,
+    /// See `rescued`.
+    unrescued: f64,
+}
+
+impl KindPosterior {
+    fn halve(&mut self) {
+        self.reached *= 0.5;
+        self.failed *= 0.5;
+        self.support_share *= 0.5;
+        self.rescued *= 0.5;
+        self.unrescued *= 0.5;
+    }
+
+    /// Posterior mean of the chance that doubling past a hopeless probe is
+    /// rescued, under a uniform prior.
+    fn rescue_rate(&self) -> f64 {
+        (self.rescued + 1.0) / (self.rescued + self.unrescued + 2.0)
+    }
+
+    /// One Thompson draw of the support share a hypothesis of this kind
+    /// gains: a sampled success rate times the mean support share of its
+    /// successes (one pseudo-success of `prior_share` while none is seen).
+    fn sample_value(&self, rng: &mut SplitMix, prior_share: f64) -> f64 {
+        let success = beta_sample(rng, self.reached.round() as usize, self.failed.round() as usize);
+        let mean_share = (self.support_share + prior_share) / (self.reached + 1.0);
+        success * mean_share
+    }
+}
+
+/// Spatial temperatures of the adaptive policy's Boltzmann seed distribution,
+/// as multiples of `AdaptiveSampling::seed_temperature`; each is a bandit arm
+/// ([`TemperatureArm`]). The last, infinite, is uniform over the triangles the
+/// distribution ranges over, so a controller that has stopped improving at
+/// the cooler arms reheats by choosing it.
+const TEMPERATURE_BANK: [f64; 7] = [0.05, 0.1, 0.25, 0.5, 1.0, 2.0, f64::INFINITY];
+
+/// Position of the infinite temperature in [`TEMPERATURE_BANK`]; the uniform
+/// part of the seed mixture reports its outcomes to this arm.
+const UNIFORM_ARM: usize = TEMPERATURE_BANK.len() - 1;
+
+/// What the adaptive policy has learned about one spatial temperature on a
+/// component (halved at each round's start, like [`KindPosterior`]).
+#[derive(Clone, Copy, Debug, Default)]
+struct TemperatureArm {
+    /// Draws whose seed this arm chose.
+    tried: f64,
+    /// Those that replaced the round's incumbent.
+    improved: f64,
+    /// Sum of those replacements' gains in share of the round's triangles.
+    gain: f64,
+}
+
+impl TemperatureArm {
+    fn halve(&mut self) {
+        self.tried *= 0.5;
+        self.improved *= 0.5;
+        self.gain *= 0.5;
+    }
+
+    /// Mean gain of this arm's replacements, one pseudo-replacement of
+    /// `prior_gain` while none is seen.
+    fn mean_gain(&self, prior_gain: f64) -> f64 {
+        (self.gain + prior_gain) / (self.improved + 1.0)
+    }
+
+    /// One Thompson draw of the improvement a draw at this temperature makes
+    /// to the incumbent: a sampled improvement rate (uniform prior) times the
+    /// mean gain.
+    fn sample_value(&self, rng: &mut SplitMix, prior_gain: f64) -> f64 {
+        let improved = self.improved.round().max(0.0) as usize;
+        let failed = (self.tried - self.improved).round().max(0.0) as usize;
+        beta_sample(rng, improved, failed) * self.mean_gain(prior_gain)
+    }
+}
+
+/// The temperature arm with the largest Thompson draw (the coolest on a tie).
+fn choose_temperature(bank: &[TemperatureArm], rng: &mut SplitMix, prior_gain: f64) -> usize {
+    let mut best = 0;
+    let mut best_value = f64::NEG_INFINITY;
+    for (arm, state) in bank.iter().enumerate() {
+        let value = state.sample_value(rng, prior_gain);
+        if value > best_value {
+            best = arm;
+            best_value = value;
+        }
+    }
+    best
+}
+
+/// The share of the component's error budget `delta_total` a round that
+/// extracted `extracted` of the component's `component_size` triangles may
+/// spend: proportional to what it extracted, so that the disjoint extracted
+/// regions of the certified rounds sum to at most `delta_total`.
+fn round_error_share(delta_total: f64, extracted: usize, component_size: usize) -> f64 {
+    delta_total * extracted as f64 / component_size as f64
+}
+
+/// One seed from the Boltzmann part of the adaptive mixture: weight
+/// `exp(-explored / temperature)` over the positions of `ids` that `kind` has
+/// not seeded and that are outside the incumbent; `None` when no such
+/// position remains.
+fn boltzmann_seed(
+    rng: &mut SplitMix,
+    ids: &[usize],
+    tried: &[bool],
+    incumbent: &[bool],
+    explored: &[f64],
+    temperature: f64,
+) -> Option<usize> {
+    let weight = |position: usize| -> f64 {
+        if tried[position] || incumbent[position] {
+            0.0
+        } else {
+            (-explored[ids[position]] / temperature).exp()
+        }
+    };
+    let total: f64 = (0..ids.len()).map(weight).sum();
+    if !(total > 0.0) {
+        return None;
+    }
+    let mut target = unit_interval(rng) * total;
+    let mut last = None;
+    for position in 0..ids.len() {
+        let w = weight(position);
+        if w <= 0.0 {
+            continue;
+        }
+        last = Some(position);
+        if target < w {
+            return Some(position);
+        }
+        target -= w;
+    }
+    last
+}
+
+/// Generic extraction under [`HypothesisPolicy::Adaptive`]. Same component
+/// partition, fitters, support growth, refit and ranking as the classical
+/// loop; what changes is how each hypothesis is drawn and when a round stops.
+///
+/// Per round over the remaining triangles `R`, `n = |R|`, `n0` the component's
+/// triangle count, `w` the incumbent's share of `n` (0 before a candidate):
+/// - the kind is drawn by Thompson sampling on [`KindPosterior`]: the sampled
+///   support share a hypothesis of the kind gains, divided by its cost
+///   ([`HYPOTHESIS_COST_UNITS`] plus the mean kind cost, the price of the
+///   round slot a draw occupies whatever its kind), among the kinds some
+///   remaining triangle has not seeded yet, every such kind keeping
+///   `kind_floor` of the draws; the posterior carries across rounds, halved;
+/// - the seed is uniform over `R` with probability `seed_exploration`,
+///   otherwise Boltzmann over the unexplored triangles outside the incumbent
+///   that this kind has not seeded, at a temperature drawn by Thompson
+///   sampling over [`TEMPERATURE_BANK`] scaled by `seed_temperature`
+///   ([`TemperatureArm`]); the uniform draws report to the infinite arm;
+/// - the probe is the classical chain (128 triangles, doubled while the
+///   candidate reaches `minimum_support` without outgrowing the probe), except
+///   that at the first probe whose candidate did not reach `minimum_support`
+///   the chain is kept, once, with probability `max(probe_floor, rescue
+///   rate)` and otherwise dropped; a kept chain runs on as the classical one
+///   does. The rescue rate is how often a kept chain of this kind went on to
+///   reach `minimum_support`, so the chance a rescuable chain is kept equals
+///   the rate however many doublings the rescue takes;
+/// - after each draw the round stops for the first of these that holds, each
+///   counted in [`RecognitionWork`]:
+///   1. risk bound: every kind's miss bound `(1 - seed_exploration * w)^d_k`
+///      (`d_k` its draws so far; 0 once every remaining triangle has seeded
+///      it) is at most the round's share of the component's error budget,
+///      `(1 - confidence) * |incumbent| / n0` ([`round_error_share`]). The
+///      best support `B` of the round's triangles has some kind `k*` and
+///      `|B| >= |incumbent|` from the first draw on, so every uniform draw of
+///      kind `k*`, whenever it was made, hit a seed of `B` with probability at
+///      least `w`; the probability that every draw of `k*` missed `B` is at
+///      most that kind's bound (the classical rule credits its earlier draws
+///      the same way), and requiring every kind's bound at or below the
+///      round's share bounds the miss by that share whatever `k*` is. The
+///      extracted regions are disjoint, so the certified rounds' shares sum
+///      to at most `1 - confidence` over the component; rounds that stop
+///      otherwise certify nothing and spend nothing. As in the classical
+///      rule, this is a seed-visitation bound: a visited seed still has to
+///      produce a usable hypothesis;
+///   2. seed exhaustion: every remaining triangle has seeded every kind;
+///   3. the cap `max_hypotheses` (or one draw per remaining triangle per
+///      kind, when smaller), reached without any of the above.
+///   An attempt budget cut ends the round and the component at once.
+/// A draw that repeats a (seed, kind) pair already tried in the round counts
+/// toward the bound and the cap and does no fitting.
+fn extract_component_adaptive(
+    mesh: &AnalyzedMesh,
+    component: &[usize],
+    options: &RecognitionOptions,
+    out: &mut Vec<SurfaceRegion>,
+    budget: &mut AttemptBudget,
+    policy: &AdaptiveSampling,
+) {
+    let mut remaining = Remaining::new(mesh, component);
+    let mut scratch = Scratch::new(mesh);
+    let mut rng = SplitMix(options.deterministic_seed.unwrap_or(0x52414e534143));
+    let kinds = budget.kinds.clone();
+    let kind_count = kinds.len();
+    let mean_cost =
+        kinds.iter().map(|&kind| HYPOTHESIS_COST_UNITS[kind_index(kind)]).sum::<f64>() / kind_count as f64;
+    let kind_cost: Vec<f64> =
+        kinds.iter().map(|&kind| HYPOTHESIS_COST_UNITS[kind_index(kind)] + mean_cost).collect();
+    let mut posterior = vec![KindPosterior::default(); kind_count];
+    let mut bank = [TemperatureArm::default(); TEMPERATURE_BANK.len()];
+    // Losing supports a triangle has sat in, over every round of this
+    // component: the seed distribution's history.
+    let mut explored = vec![0.0f64; mesh.triangles.len()];
+    let delta_total = 1.0 - options.confidence;
+    let component_size = component.len();
+    let profiling = budget.profile.is_some();
+    while remaining.len() >= options.minimum_support {
+        let seed_order_started = profiling.then(Instant::now);
+        let ids: Vec<usize> = remaining.iter().copied().collect();
+        let n = ids.len();
+        posterior.iter_mut().for_each(KindPosterior::halve);
+        bank.iter_mut().for_each(TemperatureArm::halve);
+        let mut tried: Vec<Vec<bool>> = vec![vec![false; n]; kind_count];
+        let mut tried_count = vec![0usize; kind_count];
+        let mut kind_draws = vec![0usize; kind_count];
+        let mut incumbent = vec![false; n];
+        let mut best: Option<(usize, ModelRank, SurfaceFitResult, Vec<usize>)> = None;
+        let attempt_cap = options.max_hypotheses.min(n * kind_count);
+        let mut attempt = 0;
+        let mut region_growth_seconds = options.collect_phase_timings.then_some(0.0);
+        let mut stopped_early = false;
+        ExtractionProfile::charge(&mut budget.profile, seed_order_started, |p| &mut p.seed_order_seconds);
+        while attempt < attempt_cap {
             if !budget.take() {
+                budget.work.stops_at_budget += 1;
                 return;
             }
             let attempt_index = attempt;
             attempt += 1;
-            let kind_index = attempt_index % kinds.len();
-            let round = attempt_index / kinds.len();
-            let seed = seed_orders[kind_index][round];
-            let kind = kinds[kind_index];
-            // Generate each primitive from the smallest diverse triangle set
-            // that supplies its fitter's required independent observations in
-            // every public sampling mode. Final support is still grown and
-            // validated against the complete connected region below. Keeping
-            // the fitted sample primitive-specific avoids fitting every
-            // candidate to the full diversity probe while preserving
-            // aggressive rank/degeneracy rejection in the fitter.
-            let sample_size = hypothesis_sample_triangles(kind);
-            let mut probe_limit = HYPOTHESIS_DIVERSITY_PROBE_TRIANGLES
-                .max(sample_size)
-                .min(remaining.len());
-            let mut probe_best: Option<(usize, ModelRank, SurfaceFitResult, Vec<usize>)> = None;
-            loop {
-                let probe = neighborhood(mesh, seed, &remaining, probe_limit);
-                if probe.len() < sample_size {
-                    break;
-                }
-                let sample = diverse_hypothesis_sample(mesh, seed, &probe, sample_size);
-                let mut grew_beyond_probe = false;
-                let mut reconstructed_probe = false;
-                if let Ok(candidate) = fit_surface_with_path(
-                    mesh,
-                    &sample,
-                    kind,
-                    None,
-                    ConstraintMask::default(),
-                    options,
-                    FitPath::GenericRecognition,
-                ) {
-                    let growth_started = options.collect_phase_timings.then(Instant::now);
-                    let support = support_component(mesh, &ids, seed, candidate.surface, options);
-                    if let (Some(total), Some(started)) =
-                        (&mut region_growth_seconds, growth_started)
-                    {
-                        *total += started.elapsed().as_secs_f64();
+            let seed_choice_started = profiling.then(Instant::now);
+            let incumbent_count = best.as_ref().map_or(0, |(count, ..)| *count);
+            let w = best.as_ref().map_or(0.0, |(count, ..)| *count as f64 / n as f64);
+            let prior_gain = if w > 0.0 { w } else { 1.0 / kind_count as f64 };
+            let eligible: Vec<bool> = tried_count.iter().map(|&tried| tried < n).collect();
+            debug_assert!(eligible.iter().any(|&open| open), "seed exhaustion leaves a kind to draw");
+            let scores: Vec<f64> = posterior
+                .iter()
+                .zip(&kind_cost)
+                .map(|(kind, cost)| kind.sample_value(&mut rng, prior_gain) / cost)
+                .collect();
+            let kind_slot = choose_arm(&kind_draws, &scores, &eligible, policy.kind_floor, attempt_index);
+            let kind = kinds[kind_slot];
+            budget.work.hypotheses_by_kind[kind_index(kind)] += 1;
+            kind_draws[kind_slot] += 1;
+            let (arm, position) = if unit_interval(&mut rng) < policy.seed_exploration {
+                (UNIFORM_ARM, uniform_index(&mut rng, n))
+            } else {
+                let arm = choose_temperature(&bank, &mut rng, prior_gain);
+                let position = boltzmann_seed(
+                    &mut rng,
+                    &ids,
+                    &tried[kind_slot],
+                    &incumbent,
+                    &explored,
+                    TEMPERATURE_BANK[arm] * policy.seed_temperature,
+                )
+                .unwrap_or_else(|| uniform_index(&mut rng, n));
+                (arm, position)
+            };
+            ExtractionProfile::charge(&mut budget.profile, seed_choice_started, |p| &mut p.seed_choice_seconds);
+            // The gain, in share of the round's triangles, when this draw
+            // replaced the incumbent.
+            let mut improvement = None;
+            if !tried[kind_slot][position] {
+                tried[kind_slot][position] = true;
+                tried_count[kind_slot] += 1;
+                let seed = ids[position];
+                let sample_size = hypothesis_sample_triangles(kind);
+                let mut probe_limit =
+                    options.hypothesis_probe_triangles.max(sample_size).min(remaining.len());
+                let mut probe_best: Option<(usize, ModelRank, SurfaceFitResult, Vec<usize>)> = None;
+                let mut did_work = false;
+                let mut reached_any = false;
+                let mut doubled_past_hopeless = false;
+                let mut search = Neighborhood::start(&mut scratch, seed);
+                loop {
+                    let started = profiling.then(Instant::now);
+                    let probe = search.grow(mesh, &remaining, &mut scratch, probe_limit, probe_crease(options));
+                    ExtractionProfile::charge(&mut budget.profile, started, |p| &mut p.neighborhood_seconds);
+                    if probe.len() < sample_size {
+                        break;
                     }
-                    grew_beyond_probe = support.len() > probe.len();
-                    if support.len() >= options.minimum_support {
-                        if let Ok(fit) = reconstruct_analyzed(
+                    let started = profiling.then(Instant::now);
+                    let sample = diverse_hypothesis_sample(mesh, seed, &probe, sample_size);
+                    ExtractionProfile::charge(&mut budget.profile, started, |p| &mut p.sample_seconds);
+                    let mut grew_beyond_probe = false;
+                    let mut reconstructed_probe = false;
+                    let mut reached = false;
+                    did_work = true;
+                    let started = profiling.then(Instant::now);
+                    fit_profile_start(profiling);
+                    let fitted = fit_surface_with_path(
+                        mesh,
+                        &sample,
+                        kind,
+                        None,
+                        ConstraintMask::default(),
+                        options,
+                        FitPath::GenericRecognition,
+                    );
+                    ExtractionProfile::take_fitter(&mut budget.profile, |p| &mut p.sample_fitter);
+                    let fit_seconds = started.map_or(0.0, |started| started.elapsed().as_secs_f64());
+                    // What came of a torus sample fit (row 1): see `torus_sample_outcomes`.
+                    let mut torus_outcome = 0;
+                    if let Some(profile) = &mut budget.profile {
+                        profile.fit_seconds[kind_index(kind)] += fit_seconds;
+                        profile.fits[kind_index(kind)] += 1;
+                    }
+                    if let Ok(candidate) = fitted {
+                        torus_outcome = 1;
+                        let growth_started = options.collect_phase_timings.then(Instant::now);
+                        let started = profiling.then(Instant::now);
+                        let mut tally = profiling.then(SupportTally::default);
+                        let support = support_component(
                             mesh,
-                            &support,
-                            &SurfaceHint::InitialGuess {
-                                surface: candidate.surface,
-                                trust: crate::MetadataTrust::InitialGuess,
-                            },
+                            &remaining,
+                            &mut scratch,
+                            seed,
+                            candidate.surface,
                             options,
-                        ) {
-                            reconstructed_probe = true;
-                            let area = fit.metrics.supported_area;
-                            let support_scale = selection_scale(mesh, &support);
-                            let support_tolerance = options.distance_tolerance
-                                + options.relative_tolerance * support_scale.max(1.0);
-                            let rank = model_rank(
+                            tally.as_mut(),
+                        );
+                        ExtractionProfile::charge(&mut budget.profile, started, |p| &mut p.support_seconds);
+                        if let (Some(profile), Some(tally)) = (&mut budget.profile, tally) {
+                            profile.support_triangles_tested += tally.triangles;
+                            profile.distance_evaluations += tally.evaluations;
+                            profile.distinct_vertices_evaluated += tally.vertices.len();
+                        }
+                        if let (Some(total), Some(started)) =
+                            (&mut region_growth_seconds, growth_started)
+                        {
+                            *total += started.elapsed().as_secs_f64();
+                        }
+                        grew_beyond_probe = support.len() > probe.len();
+                        if support.len() >= options.minimum_support {
+                            reached = true;
+                            let started = profiling.then(Instant::now);
+                            fit_profile_start(profiling);
+                            let refitted = reconstruct_analyzed(
                                 mesh,
-                                Selection::Triangles(&support),
-                                fit.surface.surface_type(),
-                                &fit,
-                                support_tolerance,
-                                options.normal_tolerance,
+                                &support,
+                                &SurfaceHint::InitialGuess {
+                                    surface: candidate.surface,
+                                    trust: crate::MetadataTrust::InitialGuess,
+                                },
+                                options,
                             );
-                            let replace =
-                                probe_best.as_ref().is_none_or(|(count, old_rank, old, _)| {
-                                    support.len() > *count
-                                        || (support.len() == *count
-                                            && (area > old.metrics.supported_area
-                                                || (area == old.metrics.supported_area
-                                                    && compare_model_rank(
-                                                        rank,
-                                                        fit.surface.surface_type(),
-                                                        *old_rank,
-                                                        old.surface.surface_type(),
-                                                    ) == Ordering::Less)))
-                                });
-                            if replace {
-                                probe_best = Some((support.len(), rank, fit, support));
+                            ExtractionProfile::take_fitter(&mut budget.profile, |p| &mut p.refit_fitter);
+                            torus_outcome = if refitted.is_ok() { 3 } else { 2 };
+                            if let Some(profile) = &mut budget.profile {
+                                let exhausted =
+                                    probe.len() == remaining.len() || probe.len() < probe_limit;
+                                profile.refit(
+                                    started,
+                                    support.len(),
+                                    incumbent_count,
+                                    !grew_beyond_probe || exhausted,
+                                );
+                            }
+                            if let Ok(fit) = refitted {
+                                reconstructed_probe = true;
+                                let started = profiling.then(Instant::now);
+                                let area = fit.metrics.supported_area;
+                                let support_scale = selection_scale(mesh, &support);
+                                let support_tolerance = options.distance_tolerance
+                                    + options.relative_tolerance * support_scale.max(1.0);
+                                let rank = model_rank(
+                                    mesh,
+                                    Selection::Triangles(&support),
+                                    fit.surface.surface_type(),
+                                    &fit,
+                                    support_tolerance,
+                                    options.normal_tolerance,
+                                );
+                                let replace =
+                                    probe_best.as_ref().is_none_or(|(count, old_rank, old, _)| {
+                                        support.len() > *count
+                                            || (support.len() == *count
+                                                && (area > old.metrics.supported_area
+                                                    || (area == old.metrics.supported_area
+                                                        && compare_model_rank(
+                                                            rank,
+                                                            fit.surface.surface_type(),
+                                                            *old_rank,
+                                                            old.surface.surface_type(),
+                                                        ) == Ordering::Less)))
+                                    });
+                                ExtractionProfile::charge(&mut budget.profile, started, |p| &mut p.rank_seconds);
+                                if support.len() < incumbent_count {
+                                    ExtractionProfile::charge(&mut budget.profile, started, |p| {
+                                        &mut p.rank_dominated_seconds
+                                    });
+                                }
+                                if replace {
+                                    probe_best = Some((support.len(), rank, fit, support));
+                                }
                             }
                         }
                     }
+                    if let (Some(profile), SurfaceType::Torus) = (&mut budget.profile, kind) {
+                        profile.torus_sample(torus_outcome, fit_seconds);
+                    }
+                    if reached {
+                        if doubled_past_hopeless && !reached_any {
+                            posterior[kind_slot].rescued += 1.0;
+                        }
+                        reached_any = true;
+                    }
+                    let exhausted = probe.len() == remaining.len() || probe.len() < probe_limit;
+                    if (grew_beyond_probe && reconstructed_probe) || exhausted {
+                        break;
+                    }
+                    if !reached_any && !doubled_past_hopeless {
+                        // The chain's first hopeless probe: keep the chain
+                        // as often as such chains of this kind have been
+                        // rescued, never below the floor. One coin decides
+                        // the whole chain, so a rescue two doublings away is
+                        // as likely to be kept as one a single doubling away.
+                        let continue_probability =
+                            policy.probe_floor.max(posterior[kind_slot].rescue_rate());
+                        if unit_interval(&mut rng) >= continue_probability {
+                            break;
+                        }
+                        doubled_past_hopeless = true;
+                    }
+                    probe_limit = probe_limit.saturating_mul(2).min(remaining.len());
                 }
-                let exhausted = probe.len() == remaining.len() || probe.len() < probe_limit;
-                if (grew_beyond_probe && reconstructed_probe) || exhausted {
+                if doubled_past_hopeless && !reached_any {
+                    posterior[kind_slot].unrescued += 1.0;
+                }
+                if did_work {
+                    if reached_any {
+                        posterior[kind_slot].reached += 1.0;
+                    } else {
+                        posterior[kind_slot].failed += 1.0;
+                    }
+                }
+                if let Some((count, rank, mut fit, support)) = probe_best {
+                    posterior[kind_slot].support_share += count as f64 / n as f64;
+                    let area = fit.metrics.supported_area;
+                    let replace = best.as_ref().is_none_or(|(best_count, old_rank, old, _)| {
+                        count > *best_count
+                            || (count == *best_count
+                                && (area > old.metrics.supported_area
+                                    || (area == old.metrics.supported_area
+                                        && compare_model_rank(
+                                            rank,
+                                            fit.surface.surface_type(),
+                                            *old_rank,
+                                            old.surface.surface_type(),
+                                        ) == Ordering::Less)))
+                    });
+                    if replace {
+                        let previous = best.as_ref().map_or(0, |(count, ..)| *count);
+                        improvement = Some(count.saturating_sub(previous) as f64 / n as f64);
+                        if let Some((_, _, _, old_support)) = &best {
+                            for &id in old_support {
+                                explored[id] += 1.0;
+                            }
+                        }
+                        incumbent.iter_mut().for_each(|flag| *flag = false);
+                        for &id in &support {
+                            if let Ok(at) = ids.binary_search(&id) {
+                                incumbent[at] = true;
+                            }
+                        }
+                        fit.diagnostics.hypotheses_generated = attempt_index + 1;
+                        best = Some((count, rank, fit, support));
+                    } else {
+                        for &id in &support {
+                            explored[id] += 1.0;
+                        }
+                    }
+                }
+            }
+            bank[arm].tried += 1.0;
+            if let Some(gain) = improvement {
+                bank[arm].improved += 1.0;
+                bank[arm].gain += gain;
+            }
+            if let Some((count, ..)) = &best {
+                // Whichever part of the mixture fired, each uniform draw of
+                // the best support's kind hit it with probability at least
+                // seed_exploration * w, whenever it was made.
+                let w = *count as f64 / n as f64;
+                let round_delta = round_error_share(delta_total, *count, component_size);
+                let certified = (0..kind_count).all(|slot| {
+                    tried_count[slot] >= n
+                        || (1.0 - policy.seed_exploration * w).powi(kind_draws[slot] as i32) <= round_delta
+                });
+                if certified {
+                    budget.work.stops_at_risk_bound += 1;
+                    stopped_early = true;
                     break;
                 }
-                // A candidate explaining no more triangles than its local
-                // probe is under-observed (for example one planar strip of a
-                // finely faceted cylinder). Expand only the diversity probe;
-                // every fitter call remains primitive-minimal.
-                probe_limit = probe_limit.saturating_mul(2).min(remaining.len());
             }
-            let Some((_, rank, mut fit, support)) = probe_best else {
-                continue;
-            };
-            fit.diagnostics.hypotheses_generated = attempt_index + 1;
-            let area = fit.metrics.supported_area;
-            let replace = best.as_ref().is_none_or(|(count, old_rank, old, _)| {
-                support.len() > *count
-                    || (support.len() == *count
-                        && (area > old.metrics.supported_area
-                            || (area == old.metrics.supported_area
-                                && compare_model_rank(
-                                    rank,
-                                    fit.surface.surface_type(),
-                                    *old_rank,
-                                    old.surface.surface_type(),
-                                ) == Ordering::Less)))
-            });
-            if replace {
-                let support_fraction = support.len() as f64 / ids.len() as f64;
-                attempts_required = attempts_required.min(required_seed_hypotheses(
-                    options.confidence,
-                    support_fraction,
-                    kinds.len(),
-                    attempt_cap,
-                ));
-                attempts_required = attempts_required.max(attempt);
-                best = Some((support.len(), rank, fit, support));
+            if tried_count.iter().all(|&count| count >= n) {
+                budget.work.stops_at_seed_exhaustion += 1;
+                stopped_early = true;
+                break;
+            }
+        }
+        if !stopped_early {
+            budget.work.stops_at_hypothesis_cap += 1;
+        }
+        if let Some(profile) = &mut budget.profile {
+            profile.rounds += 1;
+            profile.seeds_consumed += attempt;
+            profile.seed_slots += n * kind_count;
+            if best.is_none() {
+                profile.abandon(mesh, &remaining, options);
             }
         }
         let Some((_, _, mut fit, support)) = best else {
@@ -1509,40 +2841,167 @@ fn required_seed_hypotheses(
     rounds.saturating_mul(kinds).clamp(minimum, cap)
 }
 
-fn neighborhood(
-    mesh: &AnalyzedMesh,
-    seed: usize,
-    allowed: &BTreeSet<usize>,
-    limit: usize,
-) -> Vec<usize> {
-    let mut seen = BTreeSet::new();
-    let mut queue = VecDeque::from([seed]);
-    seen.insert(seed);
-    while let Some(id) = queue.pop_front() {
-        if seen.len() >= limit {
-            break;
+/// A component's triangles not yet extracted: ordered, for the rounds' seed
+/// tables, and flat over the mesh's triangles, for the membership tests of
+/// the probes and of support growth.
+struct Remaining {
+    ordered: BTreeSet<usize>,
+    member: Vec<bool>,
+}
+
+impl Remaining {
+    fn new(mesh: &AnalyzedMesh, ids: &[usize]) -> Self {
+        let mut member = vec![false; mesh.triangles.len()];
+        for &id in ids {
+            member[id] = true;
         }
-        for n in mesh.triangles[id].neighbors.iter().flatten() {
-            if allowed.contains(n) && seen.insert(*n) {
-                queue.push_back(*n);
-            }
+        Self {
+            ordered: ids.iter().copied().collect(),
+            member,
         }
     }
-    seen.into_iter().collect()
+
+    fn len(&self) -> usize {
+        self.ordered.len()
+    }
+
+    fn iter(&self) -> std::collections::btree_set::Iter<'_, usize> {
+        self.ordered.iter()
+    }
+
+    fn contains(&self, id: usize) -> bool {
+        self.member[id]
+    }
+
+    fn remove(&mut self, id: &usize) {
+        self.ordered.remove(id);
+        self.member[*id] = false;
+    }
 }
+
+/// Per-worker scratch for the probes and support growth: epoch stamps over
+/// the mesh's triangles, so a hypothesis neither allocates nor clears a set.
+struct Scratch {
+    probe: Vec<u32>,
+    probe_epoch: u32,
+    support: Vec<u32>,
+    support_epoch: u32,
+}
+
+impl Scratch {
+    fn new(mesh: &AnalyzedMesh) -> Self {
+        Self {
+            probe: vec![0; mesh.triangles.len()],
+            probe_epoch: 0,
+            support: vec![0; mesh.triangles.len()],
+            support_epoch: 0,
+        }
+    }
+
+    /// A stamp no probe triangle carries yet.
+    fn probe_stamp(&mut self) -> u32 {
+        if self.probe_epoch == u32::MAX {
+            self.probe.fill(0);
+            self.probe_epoch = 0;
+        }
+        self.probe_epoch += 1;
+        self.probe_epoch
+    }
+
+    /// Two stamps no support triangle carries yet: rejected, then accepted.
+    fn support_stamps(&mut self) -> (u32, u32) {
+        if self.support_epoch >= u32::MAX - 1 {
+            self.support.fill(0);
+            self.support_epoch = 0;
+        }
+        self.support_epoch += 2;
+        (self.support_epoch - 1, self.support_epoch)
+    }
+}
+
+/// The breadth-first probe around a seed over the remaining triangles,
+/// stopping once it holds `limit` triangles. A probe chain only raises the
+/// limit, so the search resumes where it stopped instead of starting again:
+/// a search to the larger limit passes through the stopped state (it pops the
+/// same triangles in the same order until then), so the probe is the one a
+/// fresh search returns.
+struct Neighborhood {
+    stamp: u32,
+    visited: Vec<usize>,
+    queue: VecDeque<usize>,
+}
+
+impl Neighborhood {
+    fn start(scratch: &mut Scratch, seed: usize) -> Self {
+        let stamp = scratch.probe_stamp();
+        scratch.probe[seed] = stamp;
+        Self {
+            stamp,
+            visited: vec![seed],
+            queue: VecDeque::from([seed]),
+        }
+    }
+
+    /// The probe at `limit` (no smaller than the last one asked for),
+    /// sorted; with `crease` (a cosine), across no edge whose triangle
+    /// normals are further apart ([`RecognitionOptions::probe_crease_gate`]).
+    fn grow(
+        &mut self,
+        mesh: &AnalyzedMesh,
+        allowed: &Remaining,
+        scratch: &mut Scratch,
+        limit: usize,
+        crease: Option<f64>,
+    ) -> Vec<usize> {
+        while let Some(id) = self.queue.pop_front() {
+            if self.visited.len() >= limit {
+                // A fresh search to a larger limit expands this triangle next.
+                self.queue.push_front(id);
+                break;
+            }
+            for &n in mesh.triangles[id].neighbors.iter().flatten() {
+                if crease.is_some_and(|cos| mesh.triangles[id].normal.dot(mesh.triangles[n].normal) < cos) {
+                    continue;
+                }
+                if allowed.contains(n) && scratch.probe[n] != self.stamp {
+                    scratch.probe[n] = self.stamp;
+                    self.visited.push(n);
+                    self.queue.push_back(n);
+                }
+            }
+        }
+        let mut probe = self.visited.clone();
+        probe.sort_unstable();
+        probe
+    }
+}
+
+/// [`RecognitionOptions::probe_crease_gate`]: the cosine a probe's edge
+/// normals must reach.
+fn probe_crease(options: &RecognitionOptions) -> Option<f64> {
+    options.probe_crease_gate.then(|| options.normal_tolerance.cos())
+}
+
 fn triangle_support(
     mesh: &AnalyzedMesh,
     id: usize,
     surface: AnalyticSurface,
     options: &RecognitionOptions,
+    mut tally: Option<&mut SupportTally>,
 ) -> bool {
     let t = &mesh.triangles[id];
     let tolerance =
         options.distance_tolerance + options.relative_tolerance * mesh.diagonal.max(1.0);
-    if t.vertices
-        .iter()
-        .any(|&v| surface.signed_distance(mesh.vertices[v]).abs() > tolerance)
-    {
+    if let Some(tally) = tally.as_deref_mut() {
+        tally.triangles += 1;
+    }
+    if t.vertices.iter().any(|&v| {
+        if let Some(tally) = tally.as_deref_mut() {
+            tally.evaluations += 1;
+            tally.vertices.insert(v);
+        }
+        surface.signed_distance(mesh.vertices[v]).abs() > tolerance
+    }) {
         return false;
     }
     let Some(normal) = surface.normal_at(t.centroid) else {
@@ -1550,31 +3009,48 @@ fn triangle_support(
     };
     t.normal.dot(normal).abs().clamp(-1.0, 1.0).acos() <= options.normal_tolerance
 }
+/// The connected component of `candidates` that `surface` supports and that
+/// contains `seed`, grown through adjacency. Each candidate's support test
+/// runs when the growth first reaches it, so the scan costs the component
+/// and its boundary rather than every remaining triangle; the set is the
+/// one a scan of every candidate followed by the same growth would return.
+/// `tally`, when given, counts the distance work.
+#[allow(clippy::too_many_arguments)]
 fn support_component(
     mesh: &AnalyzedMesh,
-    candidates: &[usize],
+    candidates: &Remaining,
+    scratch: &mut Scratch,
     seed: usize,
     surface: AnalyticSurface,
     options: &RecognitionOptions,
+    mut tally: Option<&mut SupportTally>,
 ) -> Vec<usize> {
-    let allowed: BTreeSet<_> = candidates
-        .iter()
-        .copied()
-        .filter(|&i| triangle_support(mesh, i, surface, options))
-        .collect();
-    if !allowed.contains(&seed) {
+    if !candidates.contains(seed)
+        || !triangle_support(mesh, seed, surface, options, tally.as_deref_mut())
+    {
         return Vec::new();
     }
-    let mut seen = BTreeSet::from([seed]);
+    let (rejected, accepted) = scratch.support_stamps();
+    let stamps = &mut scratch.support;
+    stamps[seed] = accepted;
+    let mut seen = vec![seed];
     let mut queue = VecDeque::from([seed]);
     while let Some(id) = queue.pop_front() {
-        for n in mesh.triangles[id].neighbors.iter().flatten() {
-            if allowed.contains(n) && seen.insert(*n) {
-                queue.push_back(*n);
+        for &n in mesh.triangles[id].neighbors.iter().flatten() {
+            if !candidates.contains(n) || stamps[n] == accepted || stamps[n] == rejected {
+                continue;
+            }
+            if triangle_support(mesh, n, surface, options, tally.as_deref_mut()) {
+                stamps[n] = accepted;
+                seen.push(n);
+                queue.push_back(n);
+            } else {
+                stamps[n] = rejected;
             }
         }
     }
-    seen.into_iter().collect()
+    seen.sort_unstable();
+    seen
 }
 struct SplitMix(u64);
 impl SplitMix {

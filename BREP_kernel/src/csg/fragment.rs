@@ -48,6 +48,8 @@ pub(crate) struct FragmentProfile {
     far_arranged: u64,
     far_regions: u64,
     untouched: Duration,
+    /// Of `untouched`, the three `parameter_point_in_face` probes alone.
+    pub(crate) uncut_probe: Duration,
     setup: Duration,
     hints: Duration,
     boundary: Duration,
@@ -71,13 +73,7 @@ impl FragmentProfile {
     }
 
     pub(crate) fn lap(&self, started: &mut Option<Instant>) -> Duration {
-        if !self.enabled {
-            return Duration::ZERO;
-        }
-        let now = Instant::now();
-        let elapsed = started.map(|s| now - s).unwrap_or_default();
-        *started = Some(now);
-        elapsed
+        crate::profile::lap(self.enabled, started)
     }
 
     fn face_done(&mut self, face_id: u64, started: Option<Instant>) {
@@ -98,10 +94,11 @@ impl FragmentProfile {
         crate::imprint::profile_emit(format_args!("fragment.scope operand={operand} faces={} box_candidates={} arranged={} regions={} far_arranged={} far_regions={} separated={} uncut_probes={}", self.faces, self.box_candidates, self.arranged_faces, self.region_faces, self.far_arranged, self.far_regions, self.separated_faces, self.uncut_probe_faces));
         let ms = |d: Duration| d.as_secs_f64() * 1_000.0;
         crate::imprint::profile_emit(format_args!(
-            "fragment.profile operand={operand} faces={} cut_faces={} untouched={:.2} setup={:.2} hints={:.2} boundary={:.2} cuts={:.2} dedup_bridge={:.2} arrange={:.2} regions={:.2} rescue={:.2} loop_split_faces={} loop_split_declined={} loop_split={:.2} slowest={:?}",
+            "fragment.profile operand={operand} faces={} cut_faces={} untouched={:.2} uncut_probe={:.2} setup={:.2} hints={:.2} boundary={:.2} cuts={:.2} dedup_bridge={:.2} arrange={:.2} regions={:.2} rescue={:.2} loop_split_faces={} loop_split_declined={} loop_split={:.2} slowest={:?}",
             self.faces,
             self.cut_faces,
             ms(self.untouched),
+            ms(self.uncut_probe),
             ms(self.setup),
             ms(self.hints),
             ms(self.boundary),

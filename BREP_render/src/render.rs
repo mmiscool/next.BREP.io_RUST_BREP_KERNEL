@@ -535,19 +535,7 @@ pub struct RenderCore {
 /// 8-bit RGB PNG encode (no text/time chunks — byte-deterministic).
 #[cfg(not(target_arch = "wasm32"))]
 fn encode_png(rgb: &[u8], width: u32, height: u32) -> Result<Vec<u8>, String> {
-    let mut out = Vec::new();
-    {
-        let mut encoder = png::Encoder::new(&mut out, width, height);
-        encoder.set_color(png::ColorType::Rgb);
-        encoder.set_depth(png::BitDepth::Eight);
-        let mut writer = encoder
-            .write_header()
-            .map_err(|error| format!("png header: {error}"))?;
-        writer
-            .write_image_data(rgb)
-            .map_err(|error| format!("png data: {error}"))?;
-    }
-    Ok(out)
+    brep_gizmos::raster::encode_png(rgb, width, height, png::ColorType::Rgb)
 }
 
 mod pipelines;

@@ -30,6 +30,7 @@ mod pole_patch;
 mod rectangle;
 mod stride_encode;
 mod face_memo;
+mod scan_mesh;
 
 use profile::*;
 use triangulate::*;
@@ -44,6 +45,7 @@ use rectangle::*;
 pub use face_tess::triangulate_planar_region;
 pub use orient::tessellate_brep_watertight;
 pub use face_memo::clear as clear_face_memo;
+pub(crate) use scan_mesh::{enabled as scan_mesh_enabled, take_counts as take_scan_mesh_counts, ScanMeshScope};
 pub(crate) use stride_encode::tessellate_brep_watertight_face_stride_keyed;
 pub use stride_encode::{
     sample_edge_polylines, sample_edges_encoded, tessellate_brep_watertight_face_stride,

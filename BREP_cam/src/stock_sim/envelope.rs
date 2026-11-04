@@ -150,12 +150,7 @@ impl StockEnvelope {
     }
 }
 
-fn point_segment_distance(p: (f64, f64), a: (f64, f64), b: (f64, f64)) -> f64 {
-    let (dx, dy) = (b.0 - a.0, b.1 - a.1);
-    let len2 = dx * dx + dy * dy;
-    let t = if len2 > 0.0 { (((p.0 - a.0) * dx + (p.1 - a.1) * dy) / len2).clamp(0.0, 1.0) } else { 0.0 };
-    ((p.0 - a.0 - t * dx).powi(2) + (p.1 - a.1 - t * dy).powi(2)).sqrt()
-}
+use crate::geom::point_segment_distance_2d as point_segment_distance;
 
 fn point_rect_distance(p: (f64, f64), lo: (f64, f64), hi: (f64, f64)) -> f64 {
     let dx = (lo.0 - p.0).max(0.0).max(p.0 - hi.0);

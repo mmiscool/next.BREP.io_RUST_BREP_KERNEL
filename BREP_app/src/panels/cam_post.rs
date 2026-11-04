@@ -113,6 +113,35 @@ pub struct CamPostPanel {
     specs: HashMap<String, Result<BTreeMap<String, brep_cam::post::PropertySpec>, String>>,
 }
 
+/// A post property as the form's field (`None` for free text, which the
+/// panel draws as a commit-on-blur text box): `boolean` a checkbox, `enum` a
+/// dropdown of its values, `number` / `integer` a numeric field bounded on
+/// commit when the post gives a minimum (up to its maximum, if any).
+fn post_field(key: &str, spec: &brep_cam::post::PropertySpec) -> Option<brep_render::style::FormField> {
+    use brep_render::style::FieldKind;
+    let kind = match spec.kind.as_str() {
+        "boolean" => FieldKind::Bool,
+        "enum" => FieldKind::Enum { variants: spec.values.iter().flatten().filter_map(Value::as_str).map(str::to_string).collect() },
+        "number" | "integer" => match spec.min {
+            Some(min) => FieldKind::BoundedScalar { min, max: spec.max.unwrap_or(f64::MAX), step: 1.0 },
+            None => FieldKind::Scalar { step: 1.0 },
+        },
+        _ => return None,
+    };
+    Some(brep_render::style::FormField { path: vec![key.to_string()], label: spec.title.clone(), group: String::new(), kind })
+}
+
+/// The edit a form field made, as the property stores it: a number field
+/// takes numbers only (an expression is not a post value) and an integer
+/// rounds; the other kinds store what the field wrote.
+fn post_value(spec: &brep_cam::post::PropertySpec, written: Value) -> Option<Value> {
+    match spec.kind.as_str() {
+        "number" => written.as_f64().map(|n| json!(n)),
+        "integer" => written.as_f64().map(|n| json!(n.round() as i64)),
+        _ => Some(written),
+    }
+}
+
 /// The value a property widget shows: the program's, else the post's default.
 fn shown_value<'a>(props: &'a BTreeMap<String, Value>, name: &str, spec: &'a brep_cam::post::PropertySpec) -> &'a Value {
     props.get(name).unwrap_or(&spec.default)
@@ -205,41 +234,30 @@ impl CamPostPanel {
                                     ui.label(&spec.title).on_hover_text(if spec.description.is_empty() { name.as_str() } else { spec.description.as_str() });
                                     let value = shown_value(&program.properties, name, spec).clone();
                                     let mut changed: Option<Value> = None;
-                                    let r = match spec.kind.as_str() {
-                                        "boolean" => {
-                                            let mut b = value.as_bool().unwrap_or(false);
-                                            let r = ui.checkbox(&mut b, "");
-                                            if r.changed() { changed = Some(Value::Bool(b)); }
-                                            r
+                                    let key = format!("cam:post:prop:{name}");
+                                    let rect = match post_field(&key, spec) {
+                                        // A checkbox, a number or a choice: the form's own field.
+                                        Some(field) => {
+                                            let mut doc = json!({ key.as_str(): value.clone() });
+                                            let mut actions = crate::form::FieldActions::default();
+                                            let (edited, rect) = ui.scope(|ui| {
+                                                ui.set_max_width(160.0);
+                                                crate::form::field_input(ui, &field, &mut doc, Some(&mut self.hits), &mut actions)
+                                            }).inner;
+                                            if edited {
+                                                changed = post_value(spec, doc[key.as_str()].take());
+                                            }
+                                            rect
                                         }
-                                        "number" | "integer" => {
-                                            let mut n = value.as_f64().unwrap_or(0.0);
-                                            let mut d = egui::DragValue::new(&mut n);
-                                            if let Some(lo) = spec.min { d = d.range(lo..=spec.max.unwrap_or(f64::MAX)); }
-                                            if spec.kind == "integer" { d = d.fixed_decimals(0); }
-                                            let r = ui.add(d);
-                                            if r.changed() { changed = Some(if spec.kind == "integer" { json!(n.round() as i64) } else { json!(n) }); }
-                                            r
-                                        }
-                                        "enum" => {
-                                            let current = value.as_str().unwrap_or("").to_string();
-                                            let mut pick = current.clone();
-                                            let r = egui::ComboBox::from_id_salt(format!("cam-post-prop-{name}")).selected_text(&current).show_ui(ui, |ui| {
-                                                for v in spec.values.iter().flatten().filter_map(Value::as_str) {
-                                                    ui.selectable_value(&mut pick, v.to_string(), v);
-                                                }
-                                            }).response;
-                                            if pick != current { changed = Some(Value::String(pick)); }
-                                            r
-                                        }
-                                        _ => {
+                                        // Free text commits when the box loses focus, not per keystroke.
+                                        None => {
                                             let mut text = value.as_str().map(str::to_string).unwrap_or_else(|| if value.is_null() { String::new() } else { value.to_string() });
-                                            let r = ui.add(egui::TextEdit::singleline(&mut text).desired_width(160.0));
+                                            let r = crate::form::text_input(ui, &mut text, 160.0);
                                             if r.lost_focus() && Value::String(text.clone()) != value { changed = Some(Value::String(text)); }
-                                            r
+                                            r.rect
                                         }
                                     };
-                                    self.hits.insert(format!("cam:post:prop:{name}"), r.rect);
+                                    self.hits.insert(key, rect);
                                     if let Some(v) = changed {
                                         edit = Some((program.id.clone(), BTreeMap::from([(name.clone(), v)])));
                                     }

@@ -2,48 +2,10 @@ use crate::curve::interior_knot_count;
 use crate::{project_point_to_surface, NurbsCurve, NurbsSurface, Vec3};
 use serde::Serialize;
 
-const EPSILON: f64 = 1e-12;
+const EPSILON: f64 = crate::tolerance::FP_FLOOR;
 
-#[derive(Clone, Copy)]
-struct Bounds {
-    minimum: Vec3,
-    maximum: Vec3,
-}
+use crate::spatial::Aabb as Bounds;
 
-impl Bounds {
-    fn from_points(points: impl IntoIterator<Item = Vec3>) -> Self {
-        let mut bounds = Self {
-            minimum: Vec3::new(f64::INFINITY, f64::INFINITY, f64::INFINITY),
-            maximum: Vec3::new(f64::NEG_INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY),
-        };
-        for point in points {
-            bounds.minimum.x = bounds.minimum.x.min(point.x);
-            bounds.minimum.y = bounds.minimum.y.min(point.y);
-            bounds.minimum.z = bounds.minimum.z.min(point.z);
-            bounds.maximum.x = bounds.maximum.x.max(point.x);
-            bounds.maximum.y = bounds.maximum.y.max(point.y);
-            bounds.maximum.z = bounds.maximum.z.max(point.z);
-        }
-        bounds
-    }
-
-    fn expanded(self, amount: f64) -> Self {
-        let delta = Vec3::new(amount, amount, amount);
-        Self {
-            minimum: self.minimum.sub(delta),
-            maximum: self.maximum.add(delta),
-        }
-    }
-
-    fn intersects(self, other: Self) -> bool {
-        self.minimum.x <= other.maximum.x
-            && self.maximum.x >= other.minimum.x
-            && self.minimum.y <= other.maximum.y
-            && self.maximum.y >= other.minimum.y
-            && self.minimum.z <= other.maximum.z
-            && self.maximum.z >= other.minimum.z
-    }
-}
 
 /// The box of the carrier's control points, in their order; the first control
 /// point that is not a point is the error. Read without collecting them: it
@@ -108,11 +70,7 @@ fn span_bounds(surface: &NurbsSurface) -> Result<Vec<Bounds>, String> {
 }
 
 fn fit_parameter(value: f64, minimum: f64, maximum: f64, closed: bool) -> f64 {
-    if closed {
-        (value - minimum).rem_euclid(maximum - minimum) + minimum
-    } else {
-        value.clamp(minimum, maximum)
-    }
+    crate::projection::fit_parameter(value, minimum, maximum, closed)
 }
 
 fn solve_three(matrix: [[f64; 3]; 3], rhs: Vec3) -> Option<[f64; 3]> {
@@ -217,8 +175,7 @@ pub struct CurveSurfaceIntersection {
 /// domain. `BREP_CS_DUPLICATE_CAP=0` restores the uncapped tolerance, which at
 /// a stationary parameter is 1e6 and swallows every other hit on the curve.
 fn duplicate_cap_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var("BREP_CS_DUPLICATE_CAP").as_deref() != Ok("0"))
+    switch!("BREP_CS_DUPLICATE_CAP", true)
 }
 
 pub fn intersect_curve_surface(
@@ -226,6 +183,7 @@ pub fn intersect_curve_surface(
     surface: &NurbsSurface,
     tolerance: f64,
 ) -> Result<Vec<CurveSurfaceIntersection>, String> {
+    let _lap = crate::projection_profile::Lap::enter(crate::projection_profile::LANE_INTERSECT_CURVE_SURFACE, surface);
     let seeds = sampled_seeds(curve, surface, tolerance)?;
     intersect_curve_surface_from_seeds(curve, surface, tolerance, seeds)
 }
@@ -246,8 +204,8 @@ fn sampled_seeds(curve: &NurbsCurve, surface: &NurbsSurface, tolerance: f64) -> 
     let mut seeds = Vec::new();
     for pair in samples.windows(2) {
         let segment_box = Bounds::from_points([pair[0].1, pair[1].1]).expanded(tolerance * 10.0);
-        if segment_box.intersects(surface_box)
-            && span_boxes.iter().any(|span_box| segment_box.intersects(span_box.expanded(tolerance * 10.0)))
+        if segment_box.intersects_exact(surface_box)
+            && span_boxes.iter().any(|span_box| segment_box.intersects_exact(span_box.expanded(tolerance * 10.0)))
         {
             seeds.push((pair[0].0 + pair[1].0) * 0.5);
         }

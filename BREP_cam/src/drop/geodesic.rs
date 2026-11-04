@@ -135,9 +135,7 @@ fn triangle_update(v:Point3,a:Point3,b:Point3,da:f64,db:f64)->f64 {
     let candidate=da+(db-da)*t+v.distance(a.lerp(b,t));
     if candidate>=da.max(db) {candidate}else{f64::INFINITY}
 }
-fn segment_distance(p:Point3,a:Point3,b:Point3)->f64 {
-    let d=b.sub(a);let q=d.length_squared();if q==0. {return p.distance(a);}p.distance(a.lerp(b,(p.sub(a).dot(d)/q).clamp(0.,1.)))
-}
+use crate::geom::point_segment_distance as segment_distance;
 
 pub(crate) fn generate(ctx:&FinishContext<'_>,p:&ScallopParams,runner:&mut Runner<'_>)->Result<Toolpath,CamError> {
     if p.cusp_height.is_some() {return Err(invalid("freeform scallop currently requires CL-surface stepover; cusp-height control is available on verified analytic patches"));}

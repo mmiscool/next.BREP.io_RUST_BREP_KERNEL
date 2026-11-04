@@ -7,6 +7,8 @@ use brep_ecad_core::{
 use egui::{Align2, Color32, FontId, Key, PointerButton, Pos2, Rect, Sense, Stroke, Vec2};
 
 mod actions;
+pub mod widgets;
+mod editor_core;
 
 /// `n` and its noun, singular for exactly one: "1 pad", "2 pads", "0 pads".
 /// The panels' counts read "1 pads" and "1 graphics" (lane U audit item 8).

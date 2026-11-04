@@ -18,9 +18,7 @@ use super::*;
 /// the PIERCE CULL note in `process_curve`). On by default (promoted 2026-10-26
 /// after the 98 + 144 case body-digest census); `0`/`off` disables it.
 pub(super) fn pierce_cull_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let enabled = *ON.get_or_init(|| !matches!(std::env::var("BREP_IMPRINT_PIERCE_CULL").as_deref(), Ok("0") | Ok("off")));
-    enabled
+    switch!("BREP_IMPRINT_PIERCE_CULL", true)
 }
 
 
@@ -39,9 +37,7 @@ pub(super) fn take_pierce_culls() -> u64 {
 /// station outside that expanded hull is off the edge without a projection.
 /// On by default (promoted 2026-10-27); `0`/`off` disables it.
 pub(super) fn exchange_hull_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let enabled = *ON.get_or_init(|| !matches!(std::env::var("BREP_IMPRINT_EXCHANGE_HULL").as_deref(), Ok("0") | Ok("off")));
-    enabled
+    switch!("BREP_IMPRINT_EXCHANGE_HULL", true)
 }
 
 
@@ -53,10 +49,42 @@ pub(super) fn take_exchange_hull_skips() -> u64 {
     EXCHANGE_HULL_SKIPS.with(|count| count.replace(0))
 }
 
-pub(super) fn hull_cull_enabled() -> bool {
+/// MINTED-ONLY EDGE SPLITS (hosted reports 2026-11-02 "boolean fails": the
+/// mug tree's branch union and the shelf pin's bracket union). `process_curve`
+/// splits the operand edges a section crosses as it finds the crossings, on the
+/// WHOLE section, before the sub-segments between the crossings are classified
+/// against the trims. A sub-segment the trims reject (the full plane×cylinder
+/// ellipse that enters the cylinder's trim for 5° and leaves it everywhere
+/// else; the full generatrix line a bracket's floor cuts for 0.4 of a 7.4
+/// cylinder) left its crossings behind as splits with no piece ending at them:
+/// seven on the mug tree's cylinder seam, two on the shelf pin's far rim. A
+/// split nothing ends at is a stray vertex, and it made an otherwise untouched
+/// face (the pin's 0.01-wide cap annulus, no piece on it, far from the bracket)
+/// a touched one that the fragmenter then lost. With this on, a crossing's
+/// split is recorded only once a minted sub-segment ends at it (by section
+/// parameter, or by point within the junction's own radius). Escape hatch
+/// `BREP_IMPRINT_MINTED_SPLITS=0|off` restores the eager splits.
+pub(super) fn minted_splits_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let enabled = *ON.get_or_init(|| !matches!(std::env::var("BREP_IMPRINT_HULL_CULL").as_deref(), Ok("0") | Ok("off")));
+    let enabled = *ON.get_or_init(|| !matches!(std::env::var("BREP_IMPRINT_MINTED_SPLITS").as_deref(), Ok("0") | Ok("off")));
     enabled
+}
+
+
+/// An operand-edge split `process_curve` found on the whole section, held
+/// until a minted sub-segment claims it (see [`minted_splits_enabled`]).
+struct PendingSplit<'a> {
+    operand: u8,
+    edge: &'a EdgeRecord,
+    edge_parameter: f64,
+    /// Where on the section the crossing sits.
+    curve_parameter: f64,
+    /// The crossing's point (the junction it snapped to, when it did).
+    point: Vec3,
+}
+
+pub(super) fn hull_cull_enabled() -> bool {
+    switch!("BREP_IMPRINT_HULL_CULL", true)
 }
 
 
@@ -199,11 +227,57 @@ fn pcurve_images_apart(
 
 impl<'a> ImprintBuilder<'a> {
     fn vertex(&mut self, point: Vec3, merge_radius: f64) -> (u64, Vec3) {
+        self.vertex_apart_from(point, merge_radius, None)
+    }
+
+    /// Both ends of one section through the registry. SECTION ENDS DISTINCT
+    /// (`BREP_IMPRINT_SECTION_ENDS_DISTINCT`, default off; lane O's 705
+    /// hand-off, 2026-11-03): a registry radius GROWS with every merge, so a
+    /// junction whose fuzzy pierce left a radius of a few 1e-3 can later take
+    /// BOTH ends of a genuinely distinct short section (the offset band across
+    /// the 705 cap skin: its start merges 6.308e-3 into the vertex a wall
+    /// skin's section left at its end with radius 7.570e-3, its end lands on
+    /// that vertex), which then reads as a loopback and yields no piece. With
+    /// the switch, when both ends take one vertex while lying farther apart
+    /// than the base radius and their own fuzzy radii, the end farther from
+    /// that vertex is resolved again without it: a grown radius may absorb a
+    /// near-duplicate of its junction, not the other end of a section this
+    /// pair separates from it. Every other merge is as before.
+    fn section_vertices(&mut self, start: Vec3, start_radius: f64, end: Vec3, end_radius: f64) -> ((u64, Vec3), (u64, Vec3)) {
+        let first = self.vertex(start, start_radius);
+        let second = self.vertex(end, end_radius);
+        if first.0 != second.0 || !switch!(live "BREP_IMPRINT_SECTION_ENDS_DISTINCT", false) {
+            return (first, second);
+        }
+        let base = self.tolerance * 10.0 * merge_scale(self.scale);
+        if start.sub(end).length() <= base.max(start_radius).max(end_radius) {
+            return (first, second);
+        }
+        let Some(shared) = self.vertices.iter().find(|vertex| vertex.id == first.0).map(|vertex| vertex.point) else {
+            return (first, second);
+        };
+        if start.sub(shared).length() >= end.sub(shared).length() {
+            (self.vertex_apart_from(start, start_radius, Some(first.0)), second)
+        } else {
+            (first, self.vertex_apart_from(end, end_radius, Some(first.0)))
+        }
+    }
+
+    fn vertex_apart_from(&mut self, point: Vec3, merge_radius: f64, apart_from: Option<u64>) -> (u64, Vec3) {
         let base = self.tolerance * 10.0 * merge_scale(self.scale);
         for vertex in &self.vertices {
             let existing_radius = self.vertex_radii.get(&vertex.id).copied().unwrap_or(0.0);
             let distance = vertex.point.sub(point).length();
+            if apart_from == Some(vertex.id) && distance > base.max(merge_radius) {
+                continue;
+            }
             if distance <= base.max(existing_radius).max(merge_radius) {
+                if distance > self.tolerance && env_read!("BREP_DEBUG_PROCESS_CURVE").is_some() {
+                    eprintln!(
+                        "vertex: MERGE v{} dist={distance:.3e} base={base:.3e} existing_radius={existing_radius:.3e} merge_radius={merge_radius:.3e} at=({:.7},{:.7},{:.7}) -> ({:.7},{:.7},{:.7})",
+                        vertex.id, point.x, point.y, point.z, vertex.point.x, vertex.point.y, vertex.point.z
+                    );
+                }
                 self.vertex_radii
                     .insert(vertex.id, existing_radius.max(merge_radius));
                 // The registry point is canonical.  Returning the caller's
@@ -268,7 +342,7 @@ impl<'a> ImprintBuilder<'a> {
     /// hatches: `BREP_OVERLAP_PIECE_ENDPOINT_SPLIT=0` (this pass) or the
     /// family hatch `BREP_OVERLAP_JUNCTION_SPLIT=0` (whole exchange).
     pub(super) fn exchange_piece_endpoint_junctions(&mut self) -> Result<(), KernelRefusal> {
-        if std::env::var("BREP_OVERLAP_JUNCTION_SPLIT").as_deref() == Ok("0")
+        if env_read!("BREP_OVERLAP_JUNCTION_SPLIT").as_deref() == Some("0")
             || std::env::var("BREP_OVERLAP_PIECE_ENDPOINT_SPLIT").as_deref() == Ok("0")
         {
             return Ok(());
@@ -473,6 +547,8 @@ impl<'a> ImprintBuilder<'a> {
         // onto them once the full junction set is known — see the
         // OVERLAP-JUNCTION EXCHANGE after the split_parameters dedup.
         let mut overlapped_edges: Vec<(u8, &EdgeRecord)> = Vec::new();
+        let minted_only = minted_splits_enabled();
+        let mut pending_splits: Vec<PendingSplit<'a>> = Vec::new();
         let [whole_start, whole_end] = curve.domain().or_refuse(KernelStage::Intersect, "domain")?;
         // Anything finer than the assembler's weld tolerance cannot survive
         // as distinct topology, so that is the meaningful noise floor for
@@ -480,7 +556,7 @@ impl<'a> ImprintBuilder<'a> {
         // exact curve and every wiggle would otherwise count as a crossing).
         let overlap_limit = self.tolerance.max(1e-5);
         let distinct_pierces_on_section =
-            std::env::var("BREP_PIERCE_DISTINCT_ON_SECTION").as_deref() != Ok("0");
+            env_read!("BREP_PIERCE_DISTINCT_ON_SECTION").as_deref() != Some("0");
         // Crossings this close to the curve's own endpoints are the
         // endpoint junction itself seen through the finders' spatial
         // tolerance: splitting there leaves a sliver piece whose surviving
@@ -611,7 +687,13 @@ impl<'a> ImprintBuilder<'a> {
                                     .clamp(edge.t0.min(edge.t1), edge.t0.max(edge.t1)),
                             ).or_refuse(KernelStage::Intersect, "csg.imprint.builder")?;
                             if nearest.sub(point).length() <= overlap_limit {
-                                self.add_edge_split(face.operand, edge, projection.u)?;
+                                pending_splits.push(PendingSplit {
+                                    operand: face.operand,
+                                    edge,
+                                    edge_parameter: projection.u,
+                                    curve_parameter: parameter,
+                                    point,
+                                });
                             }
                         }
                     }
@@ -764,9 +846,21 @@ impl<'a> ImprintBuilder<'a> {
                         continue;
                     }
                     if let Some(junction) = fuzzy_junction {
+                        if env_read!("BREP_DEBUG_PROCESS_CURVE").is_some() {
+                            eprintln!(
+                                "process_curve[{:?}/{:?}]: FUZZY hit op={} edge={} at=({:.7},{:.7},{:.7}) radius={:.3e}",
+                                first.key(), second.key(), face.operand, edge.id, junction.0.x, junction.0.y, junction.0.z, junction.1
+                            );
+                        }
                         fuzzy_junctions.push(junction);
                     }
-                    self.add_edge_split(face.operand, edge, edge_parameter)?;
+                    pending_splits.push(PendingSplit {
+                        operand: face.operand,
+                        edge,
+                        edge_parameter,
+                        curve_parameter,
+                        point: junction_point,
+                    });
                     if interior
                         && !split_parameters
                             .iter()
@@ -917,7 +1011,13 @@ impl<'a> ImprintBuilder<'a> {
                         {
                             continue;
                         }
-                        self.add_edge_split(face.operand, edge, pierce.t)?;
+                        pending_splits.push(PendingSplit {
+                            operand: face.operand,
+                            edge,
+                            edge_parameter: pierce.t,
+                            curve_parameter: projection.u,
+                            point: pierce.point,
+                        });
                         if interior
                             && !split_parameters
                                 .iter()
@@ -925,14 +1025,18 @@ impl<'a> ImprintBuilder<'a> {
                         {
                             split_parameters.push(projection.u);
                         }
-                        fuzzy_junctions.push((
-                            pierce.point,
-                            if interior {
-                                (2.0 * projection.distance).max(2e-5).min(1.5e-3)
-                            } else {
-                                (1.2 * projection.distance).max(2e-5)
-                            },
-                        ));
+                        let pierce_radius = if interior {
+                            (2.0 * projection.distance).max(2e-5).min(1.5e-3)
+                        } else {
+                            (1.2 * projection.distance).max(2e-5)
+                        };
+                        if env_read!("BREP_DEBUG_PROCESS_CURVE").is_some() {
+                            eprintln!(
+                                "process_curve[{:?}/{:?}]: FUZZY pierce op={} edge={} t={:.6} at=({:.7},{:.7},{:.7}) proj_dist={:.3e} proj_u={:.6} interior={interior} ends_on={ends_on} radius={pierce_radius:.3e}",
+                                first.key(), second.key(), face.operand, edge.id, pierce.t, pierce.point.x, pierce.point.y, pierce.point.z, projection.distance, projection.u
+                            );
+                        }
+                        fuzzy_junctions.push((pierce.point, pierce_radius));
                     }
                 }
                 if let Some(started) = split_clock {
@@ -1112,7 +1216,7 @@ impl<'a> ImprintBuilder<'a> {
         // adds its interior junctions. Escape hatch:
         // BREP_OVERLAP_JUNCTION_SPLIT=0.
         if !overlapped_edges.is_empty()
-            && std::env::var("BREP_OVERLAP_JUNCTION_SPLIT").as_deref() != Ok("0")
+            && env_read!("BREP_OVERLAP_JUNCTION_SPLIT").as_deref() != Some("0")
         {
             for parameter in &split_parameters {
                 let point = curve.evaluate(*parameter).or_refuse(KernelStage::Intersect, "evaluate")?;
@@ -1124,12 +1228,18 @@ impl<'a> ImprintBuilder<'a> {
                             .clamp(edge.t0.min(edge.t1), edge.t0.max(edge.t1)),
                     ).or_refuse(KernelStage::Intersect, "csg.imprint.builder")?;
                     if nearest.sub(point).length() <= overlap_limit {
-                        self.add_edge_split(*operand, edge, projection.u)?;
+                        pending_splits.push(PendingSplit {
+                            operand: *operand,
+                            edge,
+                            edge_parameter: projection.u,
+                            curve_parameter: *parameter,
+                            point,
+                        });
                     }
                 }
             }
         }
-        if std::env::var("BREP_DEBUG_PROCESS_CURVE").is_ok() {
+        if env_read!("BREP_DEBUG_PROCESS_CURVE").is_some() {
             eprintln!(
                 "process_curve[{:?}/{:?}]: domain=[{curve_start:.6},{curve_end:.6}] splits={} at {:?}",
                 first.key(),
@@ -1168,7 +1278,7 @@ impl<'a> ImprintBuilder<'a> {
         }
         pieces.push((rest, rest_pcurves));
 
-        let debug_process = std::env::var("BREP_DEBUG_PROCESS_CURVE").is_ok();
+        let debug_process = env_read!("BREP_DEBUG_PROCESS_CURVE").is_some();
         if debug_process {
             let spans: Vec<String> = pieces
                 .iter()
@@ -1187,6 +1297,9 @@ impl<'a> ImprintBuilder<'a> {
                 spans.join(" ")
             );
         }
+        // The ends of every sub-segment minted below: `(t0, t1, start, end,
+        // start radius, end radius)`, what a pending split must land on.
+        let mut minted_ends: Vec<(f64, f64, Vec3, Vec3, f64, f64)> = Vec::new();
         for (piece, piece_pcurves) in pieces {
             let [t0, t1] = piece.domain().or_refuse(KernelStage::Intersect, "domain")?;
             if debug_process {
@@ -1326,8 +1439,20 @@ impl<'a> ImprintBuilder<'a> {
             if let Some((junction, _, _)) = end_fuzzy {
                 end = junction;
             }
-            let (start_vertex_id, canonical_start) = self.vertex(start, start_radius);
-            let (end_vertex_id, canonical_end) = self.vertex(end, end_radius);
+            if debug_process {
+                let raw_start = piece.evaluate(t0).or_refuse(KernelStage::Intersect, "evaluate")?;
+                let raw_end = piece.evaluate(t1).or_refuse(KernelStage::Intersect, "evaluate")?;
+                eprintln!(
+                    "process_curve[{:?}/{:?}]: ENDS raw=({:.7},{:.7},{:.7})->({:.7},{:.7},{:.7}) snapped=({:.7},{:.7},{:.7})->({:.7},{:.7},{:.7}) fuzzy=({},{}) radii=({start_radius:.3e},{end_radius:.3e})",
+                    first.key(), second.key(), raw_start.x, raw_start.y, raw_start.z, raw_end.x, raw_end.y, raw_end.z,
+                    start.x, start.y, start.z, end.x, end.y, end.z, start_fuzzy.is_some(), end_fuzzy.is_some()
+                );
+            }
+            let ((start_vertex_id, canonical_start), (end_vertex_id, canonical_end)) =
+                self.section_vertices(start, start_radius, end, end_radius);
+            if debug_process {
+                eprintln!("process_curve[{:?}/{:?}]: VERTS start=v{start_vertex_id} end=v{end_vertex_id}", first.key(), second.key());
+            }
             for (vertex_id, fuzzy) in [(start_vertex_id, start_fuzzy.is_some()), (end_vertex_id, end_fuzzy.is_some())] {
                 let source = if fuzzy { JunctionSource::EdgePoint } else { JunctionSource::FacePoint };
                 let entry = self.vertex_sources.entry(vertex_id).or_insert(source);
@@ -1438,6 +1563,7 @@ impl<'a> ImprintBuilder<'a> {
             for face in &attach {
                 self.by_face.entry(face.key()).or_default().push(id);
             }
+            minted_ends.push((t0, t1, start, end, start_radius, end_radius));
             self.pieces.push(ImprintPieceRecord {
                 id,
                 curve: snapped,
@@ -1450,9 +1576,38 @@ impl<'a> ImprintBuilder<'a> {
                 shared_edge: None,
             });
         }
+        // Commit the splits a minted sub-segment ends at; the rest were
+        // crossings of sub-segments the trims rejected (`minted_splits_enabled`).
+        let end_parameter_band = 1e-6f64.max(split_tolerance);
+        let merge_base = self.tolerance * 10.0 * merge_scale(self.scale);
+        for split in pending_splits {
+            let claimed = !minted_only
+                || minted_ends.iter().any(|(t0, t1, start, end, start_radius, end_radius)| {
+                    (split.curve_parameter - t0).abs() <= end_parameter_band
+                        || (split.curve_parameter - t1).abs() <= end_parameter_band
+                        || split.point.sub(*start).length() <= overlap_limit.max(*start_radius).max(merge_base)
+                        || split.point.sub(*end).length() <= overlap_limit.max(*end_radius).max(merge_base)
+                });
+            if claimed {
+                self.add_edge_split(split.operand, split.edge, split.edge_parameter)?;
+            } else if debug_process {
+                eprintln!(
+                    "process_curve[{:?}/{:?}]: DROP stray edge split op={} edge={} t={:.6} at ({:.5},{:.5},{:.5}): no minted sub-segment ends there",
+                    first.key(),
+                    second.key(),
+                    split.operand,
+                    split.edge.id,
+                    split.edge_parameter,
+                    split.point.x,
+                    split.point.y,
+                    split.point.z
+                );
+            }
+        }
         if let Some(start) = emission_started {
             profile_line!("imprint.process_time crossing={crossing_ms:.3} emission={:.3}", start.elapsed().as_secs_f64() * 1000.0);
         }
         Ok(())
     }
 }
+

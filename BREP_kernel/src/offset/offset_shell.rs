@@ -28,7 +28,7 @@ const SOURCE_OPERAND: u8 = 250;
 const MINIMUM_DISTANCE: f64 = 1e-7;
 
 fn debug_enabled() -> bool {
-    std::env::var("BREP_OS_DEBUG").is_ok_and(|value| !value.is_empty() && value != "0")
+    env_read!("BREP_OS_DEBUG").is_some_and(|value| !value.is_empty() && value != "0")
 }
 
 macro_rules! os_debug {
@@ -78,8 +78,15 @@ mod connectors;
 mod orientation;
 #[path = "offset_shell/rim_welds.rs"]
 mod rim_welds;
+#[path = "offset_shell/rim_round.rs"]
+mod rim_round;
+
 #[path = "offset_shell/revolved_wedge.rs"]
 mod revolved_wedge;
+#[path = "offset_shell/planar_shell.rs"]
+mod planar_shell;
+#[path = "offset_shell/sphere_body.rs"]
+mod sphere_body;
 #[path = "offset_shell/outline_offset.rs"]
 mod outline_offset;
 #[path = "offset_shell/vacated_rim.rs"]
@@ -107,7 +114,7 @@ use rim_welds::*;
 use smooth_sync::*;
 
 pub use pipeline::{offset_shell, offset_shell_with_diagnostics};
-pub use solid::{offset_shell_by_boolean, offset_solid, OffsetCorners};
+pub use solid::{offset_shell_by_boolean, offset_shell_closed, offset_solid, OffsetCorners};
 pub(crate) use refusals::{is_offset_shell_no_retained_face, is_offset_shell_open_curved_rim};
 pub(crate) use orientation::{flip_all_faces, flip_shell_faces, orient_open_solid_faces};
 
@@ -118,10 +125,7 @@ fn merge_connected_shells(solid: &mut BrepSolid, shell_unions: Vec<(usize, usize
     }
     let mut parent = (0..solid.shells.len()).collect::<Vec<_>>();
     fn root(parent: &mut [usize], index: usize) -> usize {
-        if parent[index] != index {
-            parent[index] = root(parent, parent[index]);
-        }
-        parent[index]
+        crate::union_find::find_root(parent, index)
     }
     for (first, second) in shell_unions {
         let first_root = root(&mut parent, first);

@@ -313,42 +313,12 @@ impl SketchDoc {
     }
 }
 
-/// Parse an id `Value` as a number (numeric ids, or numeric strings like `"12"`),
-/// or `None` for a non-numeric id.
-fn id_num(value: &Value) -> Option<f64> {
-    match value {
-        Value::Number(number) => number.as_f64(),
-        Value::String(text) => text.trim().parse::<f64>().ok(),
-        _ => None,
-    }
-}
-
-/// Mint the next id for a collection: `max(numeric ids) + 1`, falling back to the
-/// element count when nothing parses as a number, then bumped until it does not
-/// collide (under [`id_key`]) with any existing id.
+/// Mint the next id for a collection: the kernel's [`brep_kernel::mint_sketch_id`]
+/// (`max(numeric ids) + 1`, else the element count, bumped past any collision
+/// under [`id_key`]). The reserved part-origin point (and its ground) never
+/// takes a slot in the numbering, so the first user point / constraint is
+/// still 0.
 fn mint_next_id(ids: &[&Value]) -> Value {
-    // The reserved part-origin point (and its ground) never takes a slot in the
-    // numbering, so the first user point / constraint is still 0.
-    let ids: Vec<&Value> = ids
-        .iter()
-        .copied()
-        .filter(|id| !brep_kernel::is_sketch_origin_point_id(id))
-        .collect();
-    let ids = ids.as_slice();
-    let mut max: Option<i64> = None;
-    for &id in ids {
-        if let Some(n) = id_num(id) {
-            if n.is_finite() {
-                let i = n.floor() as i64;
-                max = Some(max.map_or(i, |m| m.max(i)));
-            }
-        }
-    }
-    let mut candidate = max.map(|m| m + 1).unwrap_or(ids.len() as i64);
-    let existing: std::collections::HashSet<String> = ids.iter().map(|&id| id_key(id)).collect();
-    while existing.contains(&id_key(&Value::from(candidate))) {
-        candidate += 1;
-    }
-    Value::from(candidate)
+    brep_kernel::mint_sketch_id(ids.iter().copied(), brep_kernel::is_sketch_origin_point_id)
 }
 

@@ -1,4 +1,5 @@
 use super::*;
+use crate::editor_core::{EditorCore, WindowEditor, WindowSpec, editor_window};
 use crate::actions::{Action, ActionGroup, action, command, key};
 use brep_ecad_core::Pin;
 
@@ -205,15 +206,14 @@ pub struct SymbolEditor {
     pub symbol: Symbol,
     /// The component this was opened from, for the host to put the symbol back on.
     pub target: Option<Uuid>,
+    core: EditorCore<Symbol, Item, Drag>,
     tool: DrawTool,
-    selected: Option<Item>,
     /// The selection the Items list last drew. When the two differ the
     /// selection came from elsewhere — the canvas, or Next unbound — and the
     /// list scrolls its row into view, so a pin chosen on a 40-pin symbol is
     /// never selected below the fold.
     listed: Option<Item>,
     start: Option<Point>,
-    drag: Option<Drag>,
     /// The pin length the user last worked in, which the next pin drawn takes.
     /// One symbol's pins are all the same length in practice, so the editor
     /// remembers the answer rather than asking for it again.
@@ -222,12 +222,8 @@ pub struct SymbolEditor {
     /// said. `None` is NOT "nothing binds": an editor nobody has told says
     /// nothing at all about binding, and draws no warning for it.
     points: Option<PinPoints>,
-    history: History<Symbol>,
-    zoom: f32,
-    pan: Vec2,
     fit: bool,
     error: String,
-    pending_change: Option<Change>,
     /// The Inspector's clickable widgets as it last drew them, for [`Self::hits`].
     inspector: InspectorHits,
     /// The pass the canvas was last drawn in: the Inspector's rects are
@@ -237,24 +233,26 @@ pub struct SymbolEditor {
     /// height it takes from the pane.
     list_height: Option<f32>,
 }
+impl WindowEditor for SymbolEditor {
+    fn toolbar(&mut self, ui: &mut egui::Ui) { SymbolEditor::toolbar(self, ui); }
+    fn properties(&mut self, ui: &mut egui::Ui) { SymbolEditor::properties(self, ui); }
+    fn canvas(&mut self, ui: &mut egui::Ui, size: Vec2) { SymbolEditor::canvas(self, ui, size); }
+    fn validate(&self) -> Result<(), String> { SymbolEditor::validate(self) }
+    fn error(&mut self) -> &mut String { &mut self.error }
+}
 impl SymbolEditor {
     pub fn new(symbol: Symbol, target: Option<Uuid>) -> Self {
         Self {
             symbol,
             target,
+            core: EditorCore::new(0.025),
             tool: DrawTool::Select,
-            selected: None,
             listed: None,
             start: None,
-            drag: None,
             pin_length: DEFAULT_PIN_LENGTH,
             points: None,
-            history: History::default(),
-            zoom: 0.025,
-            pan: Vec2::ZERO,
             fit: true,
             error: String::new(),
-            pending_change: None,
             inspector: InspectorHits::default(),
             canvas_pass: 0,
             list_height: None,
@@ -288,18 +286,15 @@ impl SymbolEditor {
     /// change; the properties panel uses one key for all of its fields, so consecutive
     /// edits there merge whichever field they touched.
     fn record_as(&mut self, before: Symbol, coalesce: Option<&str>) {
-        if before != self.symbol {
-            self.history.record(before, &self.symbol);
-            self.note_change(coalesce.map(str::to_owned));
-        }
+        self.core.record(before, &self.symbol, coalesce);
     }
     fn note_change(&mut self, coalesce: Option<String>) {
-        Change::record(&mut self.pending_change, coalesce);
+        self.core.note_change(coalesce);
     }
     /// The edits made since the last call, merged into one. A host that keeps the symbol
     /// in its own file calls this once a frame and stores [`Self::symbol`].
     pub fn take_change(&mut self) -> Option<Change> {
-        self.pending_change.take()
+        self.core.take_change()
     }
     /// The drawing tool that is up, by the last word of the action that picks it
     /// (`symbol.tool.<name>`). Read-only, for a host that publishes it.
@@ -316,7 +311,7 @@ impl SymbolEditor {
     /// Where the canvas is looking: the symbol origin's offset from the canvas centre in
     /// points, and the zoom in points per micrometre. Read-only, for a host that shows it.
     pub fn pan_zoom(&self) -> (Vec2, f32) {
-        (self.pan, self.zoom)
+        (self.core.pan, self.core.zoom)
     }
     /// The NUMBER of the selected pin, or `None` when the selection is a graphic
     /// or empty. The identity a host joins on: a pin's number is what a pad
@@ -324,7 +319,7 @@ impl SymbolEditor {
     /// whole of the selection a host outside eCAD can act on. `Item` itself
     /// stays private — it indexes this editor's own lists.
     pub fn selected_pin(&self) -> Option<&str> {
-        match self.selected {
+        match self.core.selected {
             Some(Item::Pin(index)) => self.symbol.pins.get(index).map(|pin| pin.number.as_str()),
             _ => None,
         }
@@ -337,7 +332,7 @@ impl SymbolEditor {
     pub fn select_pin(&mut self, number: &str) -> bool {
         match self.symbol.pins.iter().position(|pin| pin.number == number) {
             Some(index) => {
-                self.selected = Some(Item::Pin(index));
+                self.core.selected = Some(Item::Pin(index));
                 true
             }
             None => false,
@@ -392,7 +387,7 @@ impl SymbolEditor {
     /// Select the first unbound pin after the selected one, round to the
     /// start. Nothing selected, or a graphic, starts from the first pin.
     fn select_next_unbound(&mut self) {
-        let after = match self.selected {
+        let after = match self.core.selected {
             Some(Item::Pin(i)) => i + 1,
             _ => 0,
         };
@@ -401,7 +396,7 @@ impl SymbolEditor {
             .map(|k| (after + k) % count)
             .find(|&i| self.unbound(&self.symbol.pins[i].number))
         {
-            self.selected = Some(Item::Pin(next));
+            self.core.selected = Some(Item::Pin(next));
         }
     }
     /// Where each pin is drawn, `pin:<number>` (`pin_key`), in screen points
@@ -409,8 +404,8 @@ impl SymbolEditor {
     /// with — and then the Inspector's widgets, `inspector:<thing>`, where
     /// [`Self::properties`] last drew them (`InspectorHits`).
     pub fn hits(&self, canvas: Rect) -> Vec<(String, Rect)> {
-        let center = canvas.center() + self.pan;
-        let screen = |p: Point| on_canvas(center, self.zoom, p);
+        let center = canvas.center() + self.core.pan;
+        let screen = |p: Point| on_canvas(center, self.core.zoom, p);
         let mut hits: Vec<(String, Rect)> = self
             .symbol
             .pins
@@ -426,7 +421,7 @@ impl SymbolEditor {
         // the hit test are one reading): a drag from `pin:<n>:tip` aims and
         // lengthens the pin from its body end, one from `pin:<n>:root` does it
         // from the tip. No pin selected, no handles, exactly as on screen.
-        if let Some(Item::Pin(index)) = self.selected
+        if let Some(Item::Pin(index)) = self.core.selected
             && let Some(pin) = self.symbol.pins.get(index)
         {
             let (tip, root) = (screen(pin.at), screen(pin.end));
@@ -442,12 +437,12 @@ impl SymbolEditor {
     /// starts afresh and the load is not reported by [`Self::take_change`].
     pub fn set_symbol(&mut self, symbol: Symbol) {
         self.symbol = symbol;
-        self.history = History::default();
-        self.selected = None;
-        self.drag = None;
+        self.core.history = History::default();
+        self.core.selected = None;
+        self.core.drag = None;
         self.start = None;
         self.error.clear();
-        self.pending_change = None;
+        self.core.pending_change = None;
     }
     /// Bring a multi-unit symbol the KiCad import wrote before gates existed up to
     /// the gate shape ([`Symbol::migrate_legacy_units`]), reported to the host as a
@@ -462,7 +457,7 @@ impl SymbolEditor {
         migrated
     }
     fn set_tool(&mut self, tool: DrawTool) {
-        if let Some(drag) = self.drag.take() {
+        if let Some(drag) = self.core.drag.take() {
             self.symbol = drag.before;
         }
         self.tool = tool;
@@ -473,34 +468,17 @@ impl SymbolEditor {
         crate::actions::run_action(self, symbol_actions().iter(), id)
     }
     fn undo(&mut self) {
-        if self.history.can_undo() {
-            self.history.undo(&mut self.symbol);
-            self.selected = None;
-            self.note_change(None);
-        }
+        self.core.undo(&mut self.symbol);
     }
     /// Undo or redo for the keyboard or a host, unless a drag is still recording.
     pub(crate) fn step_history(&mut self, key: HistoryKey) {
-        if self.drag.is_none() {
-            match key {
-                HistoryKey::Undo => self.undo(),
-                HistoryKey::Redo => self.redo(),
-            }
-        }
+        self.core.step_history(&mut self.symbol, key);
     }
     pub(crate) fn can_step_history(&self, key: HistoryKey) -> bool {
-        self.drag.is_none()
-            && match key {
-                HistoryKey::Undo => self.history.can_undo(),
-                HistoryKey::Redo => self.history.can_redo(),
-            }
+        self.core.can_step_history(key)
     }
     fn redo(&mut self) {
-        if self.history.can_redo() {
-            self.history.redo(&mut self.symbol);
-            self.selected = None;
-            self.note_change(None);
-        }
+        self.core.redo(&mut self.symbol);
     }
     fn validate(&self) -> Result<(), String> {
         if self.symbol.library_id.trim().is_empty()
@@ -549,56 +527,19 @@ impl SymbolEditor {
     /// The editor in a window of its own, with Apply and Cancel for the standalone app.
     /// Returns Some(true) on Apply, Some(false) on Cancel or close.
     pub(crate) fn window(&mut self, ctx: &egui::Context) -> Option<bool> {
-        let mut open = true;
-        let mut action = None;
         // While this window is open the keyboard history is its own.
         self.run_shortcuts(ctx);
-        egui::Window::new("Symbol editor")
-            .id(egui::Id::new("symbol_editor"))
-            .default_size(Vec2::new(960., 660.))
-            .min_size(Vec2::new(640., 450.))
-            .open(&mut open)
-            .collapsible(false)
-            .show(ctx, |ui| {
-                self.toolbar(ui);
-                ui.separator();
-                ui.horizontal_top(|ui| {
-                    ui.allocate_ui_with_layout(
-                        Vec2::new(220., (ui.available_height() - 55.).max(300.)),
-                        egui::Layout::top_down(egui::Align::Min),
-                        |ui| self.properties(ui),
-                    );
-                    let size = Vec2::new(
-                        ui.available_width().max(300.),
-                        (ui.available_height() - 55.).max(300.),
-                    );
-                    self.canvas(ui, size);
-                });
-                ui.separator();
-                if !self.error.is_empty() {
-                    ui.colored_label(ui.visuals().error_fg_color, &self.error);
-                }
-                ui.horizontal(|ui| {
-                    if ui.button("Apply symbol").clicked() {
-                        match self.validate() {
-                            Ok(()) => action = Some(true),
-                            Err(e) => self.error = e,
-                        }
-                    }
-                    if ui.button("Cancel").clicked() {
-                        action = Some(false);
-                    }
-                    ui.small(if self.target.is_some() {
-                        "Updates this component and the session library."
-                    } else {
-                        "Adds or updates this symbol in the session library."
-                    });
-                });
-            });
-        if !open {
-            action = Some(false);
-        }
-        action
+        let hint = if self.target.is_some() {
+            "Updates this component and the session library."
+        } else {
+            "Adds or updates this symbol in the session library."
+        };
+        editor_window(self, ctx, WindowSpec {
+            title: "Symbol editor", id: "symbol_editor",
+            default_size: Vec2::new(960., 660.), min_size: Vec2::new(640., 450.),
+            inspector_width: 220., apply: "Apply symbol", hint,
+            measure_canvas_after_inspector: true,
+        })
     }
     /// The symbol's name and the selected item's fields: the Inspector. It
     /// scrolls as a whole, so nothing at its foot is lost below a short pane,
@@ -626,8 +567,9 @@ impl SymbolEditor {
             "symbol_name",
             &ui.add(
                 egui::TextEdit::singleline(&mut self.symbol.library_id)
-                    .hint_text("Library:Name — the name is a placed part's value"),
-            ),
+                    .hint_text("Library:Name"),
+            )
+            .on_hover_text("The symbol's library and name, as Library:Name — a placed part's value"),
         );
         ui.label("Reference prefix");
         hits.mark("reference_prefix", &ui.text_edit_singleline(&mut self.symbol.reference_prefix));
@@ -689,7 +631,7 @@ impl SymbolEditor {
             }
         }
         // The selection came from elsewhere since the list was last drawn.
-        let reveal = self.selected != self.listed;
+        let reveal = self.core.selected != self.listed;
         // A share of the pane, never less than the nine rows it always had, or
         // the height the user dragged it to.
         let height = list_height(self.list_height, pane, LIST_SHARE, LIST_HEIGHT);
@@ -705,15 +647,15 @@ impl SymbolEditor {
                         Graphic::Text { .. } => "Text",
                     };
                     let response = ui.selectable_label(
-                        self.selected == Some(Item::Graphic(i)),
+                        self.core.selected == Some(Item::Graphic(i)),
                         format!("{name} {}", i + 1),
                     );
-                    if reveal && self.selected == Some(Item::Graphic(i)) {
+                    if reveal && self.core.selected == Some(Item::Graphic(i)) {
                         response.scroll_to_me(Some(egui::Align::Center));
                     }
                     hits.mark(format!("row:graphic:{i}"), &response);
                     if response.clicked() {
-                        self.selected = Some(Item::Graphic(i));
+                        self.core.selected = Some(Item::Graphic(i));
                     }
                 }
                 for (i, p) in self.symbol.pins.iter().enumerate() {
@@ -730,14 +672,14 @@ impl SymbolEditor {
                     // drawn on the theme's ground. Not on the selected row, whose
                     // own fill it does not read on; the Inspector below says it
                     // for that pin.
-                    let row = if unbound[i] && self.selected != Some(Item::Pin(i)) {
+                    let row = if unbound[i] && self.core.selected != Some(Item::Pin(i)) {
                         egui::RichText::new(row).color(ui.visuals().warn_fg_color)
                     } else {
                         egui::RichText::new(row)
                     };
                     let response =
-                        ui.selectable_label(self.selected == Some(Item::Pin(i)), row);
-                    if reveal && self.selected == Some(Item::Pin(i)) {
+                        ui.selectable_label(self.core.selected == Some(Item::Pin(i)), row);
+                    if reveal && self.core.selected == Some(Item::Pin(i)) {
                         response.scroll_to_me(Some(egui::Align::Center));
                     }
                     // Named as the pin is on the canvas, so a script reaches
@@ -749,7 +691,7 @@ impl SymbolEditor {
                         response
                     };
                     if response.clicked() {
-                        self.selected = Some(Item::Pin(i));
+                        self.core.selected = Some(Item::Pin(i));
                     }
                 }
             });
@@ -758,13 +700,13 @@ impl SymbolEditor {
         }
         // A row clicked is on screen already: only a selection made elsewhere
         // scrolls the list.
-        self.listed = self.selected;
+        self.listed = self.core.selected;
         ui.separator();
         ui.label("Item properties");
         // Set by a button that must reach past the borrow of the pin it was
         // pressed under, so it is carried out below.
         let mut level: Option<i32> = None;
-        match self.selected {
+        match self.core.selected {
             Some(Item::Pin(i)) if i < self.symbol.pins.len() => {
                 // Read what the panel must SAY about this pin before taking the
                 // pin itself mutably: the binding lives beside the symbol, not
@@ -827,26 +769,15 @@ impl SymbolEditor {
                         }
                     }
                 }
-                let kind = egui::ComboBox::from_label("Electrical type")
-                    .selected_text(&p.electrical_type)
-                    .show_ui(ui, |ui| {
-                        for t in [
-                            "passive",
-                            "input",
-                            "output",
-                            "bidirectional",
-                            "tri_state",
-                            "power_in",
-                            "power_out",
-                            "open_collector",
-                            "open_emitter",
-                            "no_connect",
-                            "unspecified",
-                        ] {
-                            ui.selectable_value(&mut p.electrical_type, t.into(), t);
-                        }
-                    });
-                hits.mark("electrical_type", &kind.response);
+                let choices: Vec<_> = [
+                    "passive", "input", "output", "bidirectional", "tri_state",
+                    "power_in", "power_out", "open_collector", "open_emitter",
+                    "no_connect", "unspecified",
+                ].into_iter().map(|t| (t.to_owned(), t, t)).collect();
+                ui.horizontal(|ui| {
+                    hits.enum_dropdown(ui, "electrical_type", &choices, &mut p.electrical_type);
+                    ui.label("Electrical type");
+                });
                 hits.mark("hidden", &ui.checkbox(&mut p.hidden, "Hidden"));
                 // Which way the pin leaves the body, and how far it reaches.
                 // Both are the vector from `end` to `at` read two ways, and
@@ -938,7 +869,7 @@ impl SymbolEditor {
             }
             coalesce = None;
         }
-        if self.selected.is_some() {
+        if self.core.selected.is_some() {
             let delete = ui.button("Delete item");
             self.inspector.mark("delete", &delete);
             if delete.clicked() {
@@ -981,7 +912,7 @@ impl SymbolEditor {
     /// the end glued to the outline stays put and the tip swings round it. One
     /// undo step per press, however many presses go round.
     fn rotate_pin(&mut self) {
-        let Some(Item::Pin(index)) = self.selected else {
+        let Some(Item::Pin(index)) = self.core.selected else {
             return;
         };
         let before = self.symbol.clone();
@@ -997,7 +928,7 @@ impl SymbolEditor {
     /// takes any length, these take the one a schematic pin is changed by. One
     /// undo step per press, and the next pin drawn takes the new length.
     fn step_pin_length(&mut self, steps: i32) {
-        let Some(Item::Pin(index)) = self.selected else {
+        let Some(Item::Pin(index)) = self.core.selected else {
             return;
         };
         let before = self.symbol.clone();
@@ -1010,7 +941,7 @@ impl SymbolEditor {
     }
     /// Whether the selected pin can be shortened: it is longer than one step.
     fn pin_can_shorten(&self) -> bool {
-        matches!(self.selected, Some(Item::Pin(index))
+        matches!(self.core.selected, Some(Item::Pin(index))
             if self.symbol.pins.get(index).is_some_and(|pin| pin_length(pin) > GRID))
     }
     /// The lowest whole number no pin of this symbol carries: what a new pin
@@ -1024,7 +955,7 @@ impl SymbolEditor {
     }
     /// Whether the selected item is a pin this symbol still has.
     fn pin_selected(&self) -> bool {
-        matches!(self.selected, Some(Item::Pin(index)) if index < self.symbol.pins.len())
+        matches!(self.core.selected, Some(Item::Pin(index)) if index < self.symbol.pins.len())
     }
     /// The gate a symbol split into gates draws what is added at `p` with: the
     /// one whose box (grown by 2.54 mm) holds it, else the nearest. `0` for a
@@ -1045,7 +976,7 @@ impl SymbolEditor {
             .map_or(0, |(_, gate)| gate)
     }
     fn remove_selected(&mut self) {
-        match self.selected.take() {
+        match self.core.selected.take() {
             Some(Item::Graphic(i)) if i < self.symbol.graphics.len() => {
                 self.symbol.graphics.remove(i);
                 if i < self.symbol.graphic_gates.len() {
@@ -1062,7 +993,7 @@ impl SymbolEditor {
     /// Asked before the general hit test: a handle sits on top of the pin's own
     /// body, and taking hold of one is what aims the pin rather than moving it.
     fn grab_at(&self, p: Pos2, screen: impl Fn(Point) -> Pos2) -> Option<Grab> {
-        let Some(Item::Pin(index)) = self.selected else {
+        let Some(Item::Pin(index)) = self.core.selected else {
             return None;
         };
         let pin = self.symbol.pins.get(index)?;
@@ -1085,13 +1016,13 @@ impl SymbolEditor {
                     .windows(2)
                     .any(|a| segment_distance(p, screen(a[0]), screen(a[1])) < 8.),
                 Graphic::Circle { center, radius } => {
-                    (p.distance(screen(*center)) - *radius as f32 * self.zoom).abs() < 8.
+                    (p.distance(screen(*center)) - *radius as f32 * self.core.zoom).abs() < 8.
                 }
                 Graphic::Text { at, text, size } => Rect::from_min_size(
                     screen(*at),
                     Vec2::new(
-                        text.len() as f32 * *size as f32 * self.zoom * 0.65,
-                        *size as f32 * self.zoom,
+                        text.len() as f32 * *size as f32 * self.core.zoom * 0.65,
+                        *size as f32 * self.core.zoom,
                     ),
                 )
                 .expand(5.)
@@ -1133,24 +1064,24 @@ impl SymbolEditor {
             // "Unit 3" of the LM358).
             // It also stands some 40 points over its gate, so it needs room above.
             let (captions, over) = if self.symbol.gate_count() > 1 { (140., 80.) } else { (0., 0.) };
-            self.zoom = crate::valid_zoom(((rect.width() - 70. - captions) / (max.x - min.x) as f32)
+            self.core.zoom = crate::valid_zoom(((rect.width() - 70. - captions) / (max.x - min.x) as f32)
                 .min((rect.height() - 70. - over) / (max.y - min.y) as f32)
-                .min(0.06), self.zoom);
-            self.pan =
-                -Vec2::new((min.x + max.x) as f32 / 2., (min.y + max.y) as f32 / 2.) * self.zoom;
+                .min(0.06), self.core.zoom);
+            self.core.pan =
+                -Vec2::new((min.x + max.x) as f32 / 2., (min.y + max.y) as f32 / 2.) * self.core.zoom;
             self.fit = false;
         }
         if response.dragged_by(PointerButton::Secondary)
             || response.dragged_by(PointerButton::Middle)
         {
-            self.pan += ui.input(|i| i.pointer.delta());
+            self.core.pan += ui.input(|i| i.pointer.delta());
         }
         if response.hovered() {
             let scroll = ui.input(|i| i.smooth_scroll_delta.y);
-            self.zoom = crate::scaled_zoom(self.zoom, (scroll * 0.002).exp());
+            self.core.zoom = crate::scaled_zoom(self.core.zoom, (scroll * 0.002).exp());
         }
-        let zoom = self.zoom;
-        let center = rect.center() + self.pan;
+        let zoom = self.core.zoom;
+        let center = rect.center() + self.core.pan;
         let screen = |p: Point| on_canvas(center, zoom, p);
         let world = |p: Pos2| {
             Point::new(
@@ -1169,9 +1100,9 @@ impl SymbolEditor {
                 // the pin every time the user reached for its end.
                 let grab = self.grab_at(p, screen);
                 if grab.is_none() {
-                    self.selected = self.hit(p, screen);
+                    self.core.selected = self.hit(p, screen);
                 }
-                self.drag = (grab.is_some() || self.selected.is_some()).then(|| Drag {
+                self.core.drag = (grab.is_some() || self.core.selected.is_some()).then(|| Drag {
                     before: self.symbol.clone(),
                     from: world(p),
                     grab: grab.unwrap_or(Grab::Move),
@@ -1180,12 +1111,12 @@ impl SymbolEditor {
                 self.start = Some(world(p));
             }
         }
-        if let (Some(drag), Some(p)) = (&self.drag, pointer) {
+        if let (Some(drag), Some(p)) = (&self.core.drag, pointer) {
             let (from, grab) = (drag.from, drag.grab);
             self.symbol = drag.before.clone();
             let q = world(p);
             let delta = Point::new(q.x - from.x, q.y - from.y);
-            match (grab, self.selected) {
+            match (grab, self.core.selected) {
                 (Grab::Move, Some(Item::Pin(i))) => {
                     let pin = &mut self.symbol.pins[i];
                     pin.at = pin.at.offset(delta);
@@ -1225,7 +1156,7 @@ impl SymbolEditor {
         // could double.
         let mut placed = false;
         if response.drag_stopped_by(PointerButton::Primary) {
-            if let Some(drag) = self.drag.take() {
+            if let Some(drag) = self.core.drag.take() {
                 self.record(drag.before);
             }
             if let Some(start) = self.start.take()
@@ -1243,17 +1174,17 @@ impl SymbolEditor {
                     self.add_item(world(p), world(p));
                 }
             } else if self.tool == DrawTool::Select {
-                self.selected = self.hit(p, screen);
+                self.core.selected = self.hit(p, screen);
             }
         }
         if response.secondary_clicked()
             && let Some(p) = pointer
         {
-            self.selected = self.hit(p, screen);
+            self.core.selected = self.hit(p, screen);
         }
         response.context_menu(|ui| {
             menu_ui(ui);
-            if self.selected.is_some() && ui.button("Delete item").clicked() {
+            if self.core.selected.is_some() && ui.button("Delete item").clicked() {
                 let before = self.symbol.clone();
                 self.remove_selected();
                 self.record(before);
@@ -1282,7 +1213,7 @@ impl SymbolEditor {
             Stroke::new(1., Color32::GRAY),
         );
         for (i, g) in self.symbol.graphics.iter().enumerate() {
-            let color = if self.selected == Some(Item::Graphic(i)) {
+            let color = if self.core.selected == Some(Item::Graphic(i)) {
                 ACCENT
             } else {
                 INK
@@ -1329,7 +1260,7 @@ impl SymbolEditor {
             }
         }
         for (i, p) in self.symbol.pins.iter().enumerate() {
-            let selected = self.selected == Some(Item::Pin(i));
+            let selected = self.core.selected == Some(Item::Pin(i));
             let color = if selected { ACCENT } else { WIRE };
             // A pin that is the connection point of nothing is marked at its
             // TIP, which is the end that would have been one.
@@ -1425,7 +1356,7 @@ impl SymbolEditor {
                     )
                 };
                 self.pin_length = length;
-                self.selected = Some(Item::Pin(self.symbol.pins.len()));
+                self.core.selected = Some(Item::Pin(self.symbol.pins.len()));
                 let gate = self.gate_at(a);
                 self.symbol.pins.push(Pin {
                     hidden: false,
@@ -1444,7 +1375,7 @@ impl SymbolEditor {
             DrawTool::Select => None,
         };
         if let Some(g) = graphic {
-            self.selected = Some(Item::Graphic(self.symbol.graphics.len()));
+            self.core.selected = Some(Item::Graphic(self.symbol.graphics.len()));
             // In a symbol split into gates, a new graphic is drawn with the gate
             // it was drawn over, so a sheet moves it with that gate.
             if !self.symbol.graphic_gates.is_empty() {
@@ -1530,10 +1461,10 @@ static SYMBOL_ACTIONS: &[Action<SymbolEditor>] = &[
     .enabled_when(|e| e.can_step_history(HistoryKey::Redo)),
     symbol_action("symbol.fit", "Fit", ActionGroup::Zoom, |e| e.fit = true).keys(&[key(Key::F)]),
     symbol_action("symbol.zoom_in", "Zoom +", ActionGroup::Zoom, |e| {
-        e.zoom = crate::scaled_zoom(e.zoom, 1.25)
+        e.core.zoom = crate::scaled_zoom(e.core.zoom, 1.25)
     }),
     symbol_action("symbol.zoom_out", "Zoom −", ActionGroup::Zoom, |e| {
-        e.zoom = crate::scaled_zoom(e.zoom, 1.0 / 1.25)
+        e.core.zoom = crate::scaled_zoom(e.core.zoom, 1.0 / 1.25)
     }),
     symbol_action(
         "symbol.delete",
@@ -1546,7 +1477,7 @@ static SYMBOL_ACTIONS: &[Action<SymbolEditor>] = &[
         },
     )
     .keys(&[key(Key::Delete), key(Key::Backspace)])
-    .enabled_when(|e| e.selected.is_some()),
+    .enabled_when(|e| e.core.selected.is_some()),
     symbol_action(
         "symbol.pin.rotate",
         "Rotate pin 90°",
@@ -1684,6 +1615,22 @@ impl InspectorHits {
         if seen.is_positive() && seen.height() * 2. >= rect.height() {
             self.rects.push((format!("inspector:{key}"), seen));
         }
+    }
+    /// Use the shared enum key contract, retaining the Inspector's clipping rule.
+    pub(crate) fn enum_dropdown<T: PartialEq + Clone>(
+        &mut self, ui: &mut egui::Ui, key: &str,
+        choices: &[(T, &str, &str)], current: &mut T,
+    ) -> egui::Response {
+        let mut hits = std::collections::HashMap::new();
+        let (_, response) = crate::widgets::enum_dropdown(
+            ui, key, choices, current, None, Some(&mut hits),
+        );
+        hits.remove(key);
+        let mut entries: Vec<_> = hits.into_iter().collect();
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        self.rects.extend(entries.into_iter().map(|(key, rect)| (format!("inspector:{key}"), rect)));
+        self.mark(key, &response);
+        response
     }
     /// The rects, if the Inspector was drawn in the canvas's pass `canvas` or
     /// the one before: the two panes are drawn in turn, and either may come

@@ -1,10 +1,11 @@
 //! Certified straight convex plane–plane network strips; other geometry marches.
+//! `BREP_ANALYTIC_NETWORK_CYLINDER` is ON by default since lane N's promotion
+//! (2026-10-28.
 use super::*;
 
 
 fn enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("BREP_ANALYTIC_NETWORK_CYLINDER").ok().as_deref() == Some("1"))
+    switch!("BREP_ANALYTIC_NETWORK_CYLINDER", true)
 }
 
 fn finite(point: Vec3) -> bool { point.x.is_finite() && point.y.is_finite() && point.z.is_finite() }
@@ -103,6 +104,28 @@ pub(in crate::blend) fn construct(
     constant: Option<f64>, overshoot: f64, ends: [f64;2],
 ) -> Option<CertifiedCylinder> {
     if !enabled() { return None; }
+    construct_impl(edge, first, second, constant, overshoot, ends, false)
+}
+
+pub(in crate::blend) fn chamfer_enabled() -> bool {
+    switch!("BREP_ANALYTIC_NETWORK_CHAMFER", true)
+}
+
+pub(in crate::blend) fn construct_chamfer(
+    edge: &EdgeRecord, first: &BlendMate, second: &BlendMate,
+    constant: Option<f64>, overshoot: f64, ends: [f64; 2],
+) -> Option<CertifiedCylinder> {
+    if !chamfer_enabled() { return None; }
+    construct_impl(edge, first, second, constant, overshoot, ends, true)
+}
+
+/// The same certified contact lines bound either a circular fillet section
+/// or a straight chamfer section. All carrier and overshoot certificates run
+/// before either construction; unsupported geometry retains the marcher.
+fn construct_impl(
+    edge: &EdgeRecord, first: &BlendMate, second: &BlendMate,
+    constant: Option<f64>, overshoot: f64, ends: [f64; 2], chamfer: bool,
+) -> Option<CertifiedCylinder> {
     let radius=constant?;
     if !(radius.is_finite() && radius>0.0 && overshoot.is_finite() && overshoot>=0.0)
         || first.rho.abs()!=radius || second.rho.abs()!=radius
@@ -159,13 +182,17 @@ pub(in crate::blend) fn construct(
     }
     let cr_pcurve=a.line_pcurve([p1,p1.add(shift)],radius,bar)?;
     let cs_pcurve=b.line_pcurve([p2,p2.add(shift)],radius,bar)?;
-    let section=NurbsCurve::new(2,vec![0.0,0.0,0.0,1.0,1.0,1.0],vec![
-        Vec4::from_point(p1,1.0),Vec4::from_point(apex,weight),Vec4::from_point(p2,1.0),
-    ]).ok()?;
+    let section = if chamfer {
+        crate::make_line(p1, p2).ok()?
+    } else {
+        NurbsCurve::new(2,vec![0.0,0.0,0.0,1.0,1.0,1.0],vec![
+            Vec4::from_point(p1,1.0),Vec4::from_point(apex,weight),Vec4::from_point(p2,1.0),
+        ]).ok()?
+    };
     let cylinder=crate::make_extrusion(&section,shift).ok()?;
     // The network uses u along the edge, v along the circular section.
-    let surface=NurbsSurface::new(1,2,cylinder.knots_v.clone(),cylinder.knots_u.clone(),
-        (0..2).map(|j| (0..3).map(|i| cylinder.control_points[i][j]).collect()).collect()).ok()?;
+    let surface=NurbsSurface::new(1,section.degree,cylinder.knots_v.clone(),cylinder.knots_u.clone(),
+        (0..2).map(|j| (0..section.control_points.len()).map(|i| cylinder.control_points[i][j]).collect()).collect()).ok()?;
     let cr=crate::make_line(p1,p1.add(shift)).ok()?;
     let cs=crate::make_line(p2,p2.add(shift)).ok()?;
     let center=crate::make_line(center_start,center_start.add(shift)).ok()?;
@@ -179,6 +206,6 @@ pub(in crate::blend) fn construct(
     }
     let rows=FittedRows {surface,cr,cs,cr_pcurve,cs_pcurve,u_domain:[0.0,1.0],center:Some(center),
         exact_extrusion:true,vertex_stations:Some([parameters[vertex_indices[0]],parameters[vertex_indices[1]]]),revolution_axis:None};
-    crate::blend::record_count("count.network.analytic_cylinder",1);
+    crate::blend::record_count(if chamfer { "count.network.analytic_chamfer_plane" } else { "count.network.analytic_cylinder" },1);
     Some(CertifiedCylinder {rows,stations,parameters,vertex_indices,station_ts})
 }

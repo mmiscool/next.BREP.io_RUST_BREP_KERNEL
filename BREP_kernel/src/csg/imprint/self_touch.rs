@@ -219,7 +219,7 @@ fn face_self_touches<'a>(
     if edges.len() < 2 {
         return Ok(Vec::new());
     }
-    let debug = std::env::var("BREP_DEBUG_SELF_TOUCH").is_ok();
+    let debug = env_read!("BREP_DEBUG_SELF_TOUCH").is_some();
     let scans = edges
         .iter()
         .filter(|edge| !edge.degenerate)
@@ -227,7 +227,7 @@ fn face_self_touches<'a>(
         .collect::<Result<Vec<_>, KernelRefusal>>()?;
     let memo = !debug
         && crate::reading_memo::memo_on()
-        && std::env::var("BREP_SELF_TOUCH_MEMO").as_deref() != Ok("0");
+        && env_read!("BREP_SELF_TOUCH_MEMO").as_deref() != Some("0");
     let key = memo.then(|| touch_key(edges, &scans, band));
     if let Some(key) = key {
         if let Some(found) = TOUCH_MEMO.with(|memo| memo.borrow().get(&key).cloned()) {
@@ -243,10 +243,33 @@ fn face_self_touches<'a>(
         .collect::<Result<Vec<_>, KernelRefusal>>()?;
     let mut splits = Vec::new();
     let mut found: Vec<(usize, f64)> = Vec::new();
+    // SPAN CULL (`BREP_SELF_TOUCH_SPAN_CULL`, default on, =0 restores;
+    // 2026-11-03): a pair is kept only when `closest_approach` reads it within
+    // `band`, and that reading is ATTAINED (a probe point's distance to its
+    // projection on the target), so never below the curves' true distance.
+    // When every knot-span box of one edge is apart from every span box of the
+    // other by more than `band` on some axis, the true distance exceeds the
+    // band and the pair cannot be kept: it is skipped unread. The whole-curve
+    // boxes above admit pairs whose spans never come near (the orca's 8 pairs
+    // at 8.4 ms each, citrus's 178 of 492; none of either within the band).
+    let span_cull = switch!(live "BREP_SELF_TOUCH_SPAN_CULL", true);
+    let mut spans: Vec<Option<Option<Vec<crate::spatial::Aabb>>>> = vec![None; scans.len()];
     for (index, first) in scans.iter().enumerate() {
         for (other, second) in scans.iter().enumerate().skip(index + 1) {
             if shares_a_vertex(first.edge, second.edge) || !boxes_overlap(first, second, band) {
                 continue;
+            }
+            if span_cull {
+                for at in [index, other] {
+                    if spans[at].is_none() {
+                        spans[at] = Some(crate::curve_curve_intersection::span_boxes(&scans[at].curve).ok().flatten());
+                    }
+                }
+                if let (Some(Some(a)), Some(Some(b))) = (&spans[index], &spans[other]) {
+                    if !a.iter().any(|p| b.iter().any(|q| p.intersects_upper(*q, band))) {
+                        continue;
+                    }
+                }
             }
             let refine_gate = (REFINE_GATE * (lengths[index] + lengths[other])).max(band);
             let (t, u, distance) = closest_approach(&first.curve, &second.curve, refine_gate)?;
@@ -371,4 +394,5 @@ impl ImprintBuilder<'_> {
         Ok(())
     }
 }
+
 

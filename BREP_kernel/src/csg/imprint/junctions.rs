@@ -111,17 +111,10 @@ pub(super) enum JunctionCombineMode {
 
 /// [`ImprintOptions::two_radius_junctions`] under `BREP_JUNCTION_COMBINE`.
 pub(super) fn junction_combine_mode(options: &ImprintOptions) -> JunctionCombineMode {
-    match std::env::var("BREP_JUNCTION_COMBINE").as_deref() {
-        Ok("0") | Ok("off") => JunctionCombineMode::Off,
-        Ok("check") => JunctionCombineMode::Check,
-        Ok(_) => JunctionCombineMode::On,
-        Err(_) => {
-            if options.two_radius_junctions {
-                JunctionCombineMode::On
-            } else {
-                JunctionCombineMode::Off
-            }
-        }
+    match mode_switch!(live "BREP_JUNCTION_COMBINE", options.two_radius_junctions) {
+        crate::env_read::Mode::Off => JunctionCombineMode::Off,
+        crate::env_read::Mode::Check => JunctionCombineMode::Check,
+        crate::env_read::Mode::On => JunctionCombineMode::On,
     }
 }
 
@@ -406,6 +399,16 @@ pub(super) fn canonicalize_imprint_junctions(
         .map(|face| (face.key(), face.face))
         .collect::<HashMap<_, _>>();
     let (mut incident_faces, mut incident_points) = junction_incidence(result)?;
+    let edge_curves: HashMap<(u8, u64), &EdgeRecord> = [(0u8, solid_a), (1u8, solid_b)]
+        .into_iter()
+        .flat_map(|(operand, solid)| solid.edges.iter().map(move |edge| ((operand, edge.id), edge)))
+        .collect();
+    let operand_vertices: Vec<(u8, Vec3)> = solid_a
+        .vertices
+        .iter()
+        .map(|vertex| (0u8, vertex.point))
+        .chain(solid_b.vertices.iter().map(|vertex| (1u8, vertex.point)))
+        .collect();
     // Residual-derived coincident-vertex merge (OCCT's ComputeTolReached3d idea).
     // Two imprint junctions that are the SAME intersection point — proven by the
     // whole segment between them lying on the UNION of their incident surfaces
@@ -424,10 +427,13 @@ pub(super) fn canonicalize_imprint_junctions(
         && merge_residual_coincident_vertices(
             result,
             &face_map,
+            &edge_curves,
+            &operand_vertices,
             charts,
             &incident_faces,
             tolerance,
             raw_extent,
+            evidence,
             emitted_pcurves,
         )?
     {
@@ -450,6 +456,13 @@ pub(super) fn canonicalize_imprint_junctions(
             combine,
             &mut anchored,
         )?
+    {
+        (incident_faces, incident_points) = junction_incidence(result)?;
+    }
+    // A piece end the builder minted within its vertex's evidence radius but
+    // off the vertex ends there now (see `consolidate_fuzzy_piece_ends`).
+    if std::env::var("BREP_RESIDUAL_MERGE_EDGE_PLACEMENT").as_deref() != Ok("0")
+        && consolidate_fuzzy_piece_ends(result, &face_map, &edge_curves, charts, tolerance, evidence, emitted_pcurves)?
     {
         (incident_faces, incident_points) = junction_incidence(result)?;
     }
@@ -682,6 +695,42 @@ fn junction_find(parent: &mut HashMap<u64, u64>, mut x: u64) -> u64 {
 /// e.g. a vendor-duplicated edge whose two copies sit ~2e-4 apart) is left for
 /// the downstream weld/heal chain, NOT force-merged here.
 ///
+/// POSITION (user bug follow-up 2026-11-02, F10's opposite cap). The joint
+/// Newton solution is under-determined along the very tangent the merge
+/// exists for: every point of the segment lies on every union surface, so
+/// the averaged projection settles wherever it started (the midpoint). An
+/// operand EDGE pins that direction. The group's position is therefore the
+/// member that splits the most operand edges (the crossing of two edges is
+/// fully determined, a point on one edge along it), and the joint Newton
+/// point only when no member splits an edge. The cap union's junction 8 was
+/// the crossing of edges 46 and 152 (both splits within 1e-10 of it) and the
+/// Newton point slid it 2.3e-3 along edge 152 toward four noise crossings of
+/// the tangent section with that edge, off edge 46 whose split stayed at the
+/// true crossing; the pieces already ending at junction 8 were never snapped
+/// either (`relocate_junctions` ran with `snap_moved = false`), so the
+/// fragmenter met curve ends 2.3e-3 from their vertex. Now every piece that
+/// references a moved representative is snapped to it, and an absorbed
+/// member's split on an edge the holder already splits is retracted, so the
+/// edge is not cut again beside the junction.
+///
+/// OPERAND-VERTEX GUARD (user bug follow-up 2026-11-02, the visor clip). Two
+/// members that sit on two DISTINCT vertices of the SAME operand are two
+/// junctions whatever the residual proof reads: that operand's own topology
+/// holds them apart (an edge of it longer than the weld runs between them),
+/// and merging them collapses that edge. The visor clip's fourth slab shares
+/// its front plane with the third's, whose front face the second slab's
+/// slanted wall had already cut 3.3e-4 from its end wall; the boundary copies
+/// of that 3.3e-4 strip's two verticals onto the new slab's face minted
+/// (14.49967, 14.99, z) and (14.5, 14.99, z) as distinct vertices, and this
+/// merge welded them (`sep=3.3e-4`, `band=1.0e-3` = 2·weld·extent: the
+/// strip's surfaces are three planes the midpoint lies within 1.7e-4 of).
+/// The copy of the slant junction collapsed onto the end-wall line, the strip
+/// of the new face went out with the In fragment, the old sliver lost the
+/// coincident-copy vote, and both verticals went one-use. The pinch fixture
+/// (`the_radius_gate_leaves_pinching_and_star_selections_alone`) spans two
+/// operand vertices too, but one PER operand — a rail end of each round —
+/// and keeps merging. Escape hatch `BREP_RESIDUAL_MERGE_OPERAND_GUARD=0`.
+///
 /// LIMITATION (why this is scoped, not general). A well-conditioned (transverse)
 /// double-mint separated by ≤ `band` is already welded by the existing assembler
 /// machinery, so the value this merge adds is confined to the ILL-CONDITIONED
@@ -693,16 +742,32 @@ fn junction_find(parent: &mut HashMap<u64, u64>, mut x: u64) -> u64 {
 /// The principled future bound is `sep ≤ band / sin θ` (θ the surface crossing
 /// angle); until that is plumbed, `sep_cap` is intentionally narrow and the
 /// escape hatch exists.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn merge_residual_coincident_vertices(
     result: &mut ImprintResultRecord,
     face_map: &HashMap<FaceKey, &FaceRecord>,
+    edge_curves: &HashMap<(u8, u64), &EdgeRecord>,
+    operand_vertices: &[(u8, Vec3)],
     charts: &FaceCharts<'_>,
     incident_faces: &HashMap<u64, HashSet<FaceKey>>,
     tolerance: f64,
     raw_extent: f64,
+    evidence: &JunctionEvidence,
     emitted_pcurves: &HashSet<(u64, FaceKey)>,
 ) -> Result<bool, KernelRefusal> {
     let (band, sep_cap) = residual_merge_bands(raw_extent, tolerance);
+    let weld = assembler_weld(tolerance);
+    let radius_of = |id: u64| evidence.radii.get(&id).copied().unwrap_or(0.0).max(weld);
+    // The operand vertex a junction sits on (within its evidence radius), the
+    // nearest when several do; see OPERAND-VERTEX GUARD on this function.
+    let operand_vertex_at = |point: Vec3, radius: f64| -> Option<(u8, Vec3)> {
+        operand_vertices
+            .iter()
+            .filter(|(_, vertex)| vertex.sub(point).length() <= radius)
+            .min_by(|a, b| a.1.sub(point).length().total_cmp(&b.1.sub(point).length()))
+            .copied()
+    };
+    let operand_guard = std::env::var("BREP_RESIDUAL_MERGE_OPERAND_GUARD").as_deref() != Ok("0");
 
     let verts: Vec<(u64, Vec3)> = result.vertices.iter().map(|v| (v.id, v.point)).collect();
     let mut parent: HashMap<u64, u64> = verts.iter().map(|(id, _)| (*id, *id)).collect();
@@ -746,6 +811,21 @@ pub(super) fn merge_residual_coincident_vertices(
                 continue;
             }
             let debug_junction = std::env::var("BREP_DEBUG_JUNCTION").is_ok();
+            if operand_guard {
+                if let (Some((operand_a, vertex_a)), Some((operand_b, vertex_b))) =
+                    (operand_vertex_at(p_a, radius_of(id_a)), operand_vertex_at(p_b, radius_of(id_b)))
+                {
+                    if operand_a == operand_b && vertex_a.sub(vertex_b).length() > weld {
+                        if debug_junction {
+                            eprintln!(
+                                "residual-merge v{id_a}/v{id_b} sep={sep:.4e}: REFUSED two distinct vertices of operand {operand_a} ({:.3e} apart)",
+                                vertex_a.sub(vertex_b).length()
+                            );
+                        }
+                        continue;
+                    }
+                }
+            }
             let mut union_keys: HashSet<FaceKey> = HashSet::default();
             for id in [id_a, id_b] {
                 if let Some(keys) = incident_faces.get(&id) {
@@ -839,8 +919,382 @@ pub(super) fn merge_residual_coincident_vertices(
     if !merged_any {
         return Ok(false);
     }
-    relocate_junctions(result, &mut parent, &merged_point, face_map, charts, emitted_pcurves, (4.0 * sep_cap).max(1e-3), false)?;
+    // Escape hatch for the 2026-11-02 repair (POSITION above): the joint
+    // point, unsnapped representatives and untouched splits of before.
+    if std::env::var("BREP_RESIDUAL_MERGE_EDGE_PLACEMENT").as_deref() == Ok("0") {
+        relocate_junctions(result, &mut parent, &merged_point, face_map, charts, emitted_pcurves, (4.0 * sep_cap).max(1e-3), false)?;
+        return Ok(true);
+    }
+    absorb_junctions_enclosed_by_merged_groups(result, face_map, incident_faces, &verts, &mut parent, band, sep_cap)?;
+    let retracted = place_merged_groups_on_operand_edges(result, edge_curves, operand_vertices, &verts, &mut parent, &mut merged_point, tolerance, band, evidence)?;
+    // Only a merged group's representative counts as moved: the pieces that
+    // reference it are snapped to the group's position, every other piece is
+    // left as the builder minted it.
+    let mut group_size: HashMap<u64, usize> = HashMap::default();
+    for &(id, _) in &verts {
+        *group_size.entry(junction_find(&mut parent, id)).or_default() += 1;
+    }
+    let moved: HashMap<u64, Vec3> = merged_point
+        .iter()
+        .filter(|(rep, _)| group_size.get(rep).is_some_and(|size| *size > 1))
+        .map(|(rep, point)| (*rep, *point))
+        .collect();
+    relocate_junctions(result, &mut parent, &moved, face_map, charts, emitted_pcurves, (4.0 * sep_cap).max(1e-3), true)?;
+    if retracted > 0 && std::env::var("BREP_DEBUG_JUNCTION").is_ok() {
+        eprintln!("[merge] retracted {retracted} edge split(s) of absorbed junctions");
+    }
     Ok(true)
+}
+
+/// Whether both ends of the segment `a`–`b` and its midpoint lie within
+/// `band` of every surface: the residual merge's identity proof.
+fn segment_on_surfaces(surfaces: &[&NurbsSurface], a: Vec3, b: Vec3, band: f64) -> Result<bool, KernelRefusal> {
+    for point in [a, b, a.add(b).scale(0.5)] {
+        for surface in surfaces {
+            if project_point_to_surface(surface, point).or_refuse(KernelStage::Intersect, "project_point_to_surface")?.distance > band {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(true)
+}
+
+/// A junction that is NOT in a merged group but whose every piece (two or
+/// more) leads into ONE merged group is enclosed by that group: its pieces
+/// now form a closed loop between one vertex and itself, geometry the merge
+/// created rather than found (the cap union's junction 18, 4.1e-3 along the
+/// tangent section from the edge crossing, kept piece 19 to the crossing and
+/// piece 21 to the first absorbed noise crossing; the fragmenter then kept
+/// four regions of 1e-11 to 1e-9 area between them). The micro-piece guard
+/// does not protect such a loop. The junction joins the group when it is
+/// within `sep_cap` of a member and the segment to that member passes the
+/// residual proof on the union of their incident surfaces; the loop's pieces
+/// then drop as spurs in `relocate_junctions`. Repeats until no junction
+/// qualifies, so a chain of such vertices folds in too.
+fn absorb_junctions_enclosed_by_merged_groups(
+    result: &ImprintResultRecord,
+    face_map: &HashMap<FaceKey, &FaceRecord>,
+    incident_faces: &HashMap<u64, HashSet<FaceKey>>,
+    verts: &[(u64, Vec3)],
+    parent: &mut HashMap<u64, u64>,
+    band: f64,
+    sep_cap: f64,
+) -> Result<(), KernelRefusal> {
+    let debug = std::env::var("BREP_DEBUG_JUNCTION").is_ok();
+    let empty = HashSet::default();
+    for _ in 0..verts.len() {
+        let mut absorbed_any = false;
+        let mut members: HashMap<u64, Vec<(u64, Vec3)>> = HashMap::default();
+        for &(id, point) in verts {
+            let rep = junction_find(parent, id);
+            members.entry(rep).or_default().push((id, point));
+        }
+        for &(id, point) in verts {
+            let own_rep = junction_find(parent, id);
+            if members.get(&own_rep).is_some_and(|group| group.len() > 1) {
+                continue;
+            }
+            let mut target: Option<u64> = None;
+            let mut pieces = 0usize;
+            for piece in &result.pieces {
+                let other = if piece.start_vertex_id == id {
+                    piece.end_vertex_id
+                } else if piece.end_vertex_id == id {
+                    piece.start_vertex_id
+                } else {
+                    continue;
+                };
+                pieces += 1;
+                let rep = junction_find(parent, other);
+                if target.is_some_and(|target| target != rep) {
+                    target = None;
+                    pieces = 0;
+                    break;
+                }
+                target = Some(rep);
+            }
+            let Some(rep) = target else {
+                continue;
+            };
+            if pieces < 2 || rep == id {
+                continue;
+            }
+            let Some(group) = members.get(&rep).filter(|group| group.len() > 1) else {
+                continue;
+            };
+            let own_keys = incident_faces.get(&id).unwrap_or(&empty);
+            let mut proven: Option<(u64, f64)> = None;
+            for &(member_id, member_point) in group {
+                let sep = member_point.sub(point).length();
+                if sep > sep_cap {
+                    continue;
+                }
+                let mut keys = own_keys.clone();
+                keys.extend(incident_faces.get(&member_id).unwrap_or(&empty).iter().copied());
+                let surfaces: Vec<&NurbsSurface> = keys.iter().filter_map(|key| face_map.get(key).map(|face| &face.surface)).collect();
+                if surfaces.is_empty() || !segment_on_surfaces(&surfaces, point, member_point, band)? {
+                    continue;
+                }
+                if proven.is_none_or(|(_, best)| sep < best) {
+                    proven = Some((member_id, sep));
+                }
+            }
+            let Some((member_id, sep)) = proven else {
+                continue;
+            };
+            if debug {
+                eprintln!("[merge] v{rep} <- v{id} enclosed: {pieces} pieces lead into the group, {sep:.3e} from member v{member_id}, band={band:.3e}");
+            }
+            parent.insert(own_rep, rep);
+            absorbed_any = true;
+        }
+        if !absorbed_any {
+            break;
+        }
+    }
+    Ok(())
+}
+
+/// A piece end minted within its vertex's own evidence radius but off the
+/// vertex ends AT the vertex. The builder's `vertex` hands a caller whose
+/// point lies within an existing vertex's merge radius that vertex's id but
+/// the caller's own point, so the piece is minted ending beside the vertex
+/// it names (the cap union's piece 38 ended 9.06e-5 from junction 31, whose
+/// radius was 1.33e-4, with edge 68 split at both points 3.8e-6 apart in
+/// parameter); the canonical polish then skips the vertex because its
+/// incident ends disagree, and the end is never closed. The assembler
+/// refused that union with one-use edges on the cap. The edit is bounded by
+/// the radius the builder already used to call the two points one junction,
+/// and the duplicate split of an operand edge within that radius is
+/// retracted, the one nearest the vertex surviving. Returns whether any
+/// piece end moved.
+fn consolidate_fuzzy_piece_ends(
+    result: &mut ImprintResultRecord,
+    face_map: &HashMap<FaceKey, &FaceRecord>,
+    edge_curves: &HashMap<(u8, u64), &EdgeRecord>,
+    charts: &FaceCharts<'_>,
+    tolerance: f64,
+    evidence: &JunctionEvidence,
+    emitted_pcurves: &HashSet<(u64, FaceKey)>,
+) -> Result<bool, KernelRefusal> {
+    let weld = assembler_weld(tolerance);
+    let radius_of = |id: u64| evidence.radii.get(&id).copied().unwrap_or(0.0).max(weld);
+    let position: HashMap<u64, Vec3> = result.vertices.iter().map(|vertex| (vertex.id, vertex.point)).collect();
+    let mut stale: HashMap<u64, Vec3> = HashMap::default();
+    for piece in &result.pieces {
+        let [t0, t1] = piece.curve.domain().or_refuse(KernelStage::Intersect, "domain")?;
+        for (parameter, id) in [(t0, piece.start_vertex_id), (t1, piece.end_vertex_id)] {
+            let Some(point) = position.get(&id) else {
+                continue;
+            };
+            let gap = piece.curve.evaluate(parameter).or_refuse(KernelStage::Intersect, "evaluate")?.sub(*point).length();
+            if gap > tolerance && gap <= radius_of(id) {
+                stale.insert(id, *point);
+            }
+        }
+    }
+    if stale.is_empty() {
+        return Ok(false);
+    }
+    if std::env::var("BREP_DEBUG_JUNCTION").is_ok() {
+        let mut ids: Vec<u64> = stale.keys().copied().collect();
+        ids.sort_unstable();
+        eprintln!("[consolidate] piece ends within their vertex's evidence radius snapped onto it: {ids:?}");
+    }
+    let mut parent: HashMap<u64, u64> = position.keys().map(|id| (*id, *id)).collect();
+    relocate_junctions(result, &mut parent, &stale, face_map, charts, emitted_pcurves, 0.0, true)?;
+    let mut retracted = 0usize;
+    for (id, point) in &stale {
+        let radius = radius_of(*id);
+        for record in &mut result.edge_splits {
+            let Some(edge) = edge_curves.get(&(record.operand, record.edge_id)) else {
+                continue;
+            };
+            let mut within: Vec<(f64, f64)> = Vec::new();
+            for &parameter in &record.parameters {
+                let distance = edge.curve.evaluate(parameter).or_refuse(KernelStage::Intersect, "evaluate")?.sub(*point).length();
+                if distance <= radius {
+                    within.push((distance, parameter));
+                }
+            }
+            if within.len() < 2 {
+                continue;
+            }
+            within.sort_by(|a, b| a.0.total_cmp(&b.0));
+            let keep = within[0].1;
+            let before = record.parameters.len();
+            record
+                .parameters
+                .retain(|&parameter| parameter == keep || !within.iter().any(|(_, other)| *other == parameter));
+            retracted += before - record.parameters.len();
+        }
+    }
+    if retracted > 0 && std::env::var("BREP_DEBUG_JUNCTION").is_ok() {
+        eprintln!("[consolidate] retracted {retracted} duplicate edge split(s) within the vertex radius");
+    }
+    Ok(true)
+}
+
+/// The operand edges a junction splits: every `(operand, edge)` with a split
+/// parameter whose point lies within the junction's evidence radius.
+fn split_edges_of(
+    split_points: &[((u8, u64), Vec3)],
+    point: Vec3,
+    radius: f64,
+) -> HashSet<(u8, u64)> {
+    split_points
+        .iter()
+        .filter(|(_, split)| split.sub(point).length() <= radius)
+        .map(|(key, _)| *key)
+        .collect()
+}
+
+/// Give every merged group the position its operand evidence pins (see the
+/// POSITION paragraph on [`merge_residual_coincident_vertices`]): a member on
+/// an operand VERTEX (within its evidence radius) holds the group at that
+/// vertex's exact point — the split operands of the idempotence tests carry
+/// every junction as a vertex and record no split for it, and fixture 28's
+/// intersect refused with one-use edges when such a group went 3e-4 to the
+/// joint point; else the member that splits the most operand edges; a group
+/// of face points keeps the joint Newton point already in `merged_point`.
+/// Then retract an absorbed member's split on an edge the holder splits too:
+/// the member's vertex is gone and the holder's split already cuts that edge
+/// at the junction. Returns the number of split parameters retracted.
+#[allow(clippy::too_many_arguments)]
+fn place_merged_groups_on_operand_edges(
+    result: &mut ImprintResultRecord,
+    edge_curves: &HashMap<(u8, u64), &EdgeRecord>,
+    operand_vertices: &[(u8, Vec3)],
+    verts: &[(u64, Vec3)],
+    parent: &mut HashMap<u64, u64>,
+    merged_point: &mut HashMap<u64, Vec3>,
+    tolerance: f64,
+    band: f64,
+    evidence: &JunctionEvidence,
+) -> Result<usize, KernelRefusal> {
+    let weld = assembler_weld(tolerance);
+    let radius_of = |id: u64| evidence.radii.get(&id).copied().unwrap_or(0.0).max(weld);
+    let mut split_points: Vec<((u8, u64), Vec3)> = Vec::new();
+    for record in &result.edge_splits {
+        let Some(edge) = edge_curves.get(&(record.operand, record.edge_id)) else {
+            continue;
+        };
+        for &parameter in &record.parameters {
+            let point = edge.curve.evaluate(parameter).or_refuse(KernelStage::Intersect, "evaluate")?;
+            split_points.push(((record.operand, record.edge_id), point));
+        }
+    }
+    let mut groups: HashMap<u64, Vec<(u64, Vec3)>> = HashMap::default();
+    for &(id, point) in verts {
+        let rep = junction_find(parent, id);
+        groups.entry(rep).or_default().push((id, point));
+    }
+    let mut groups: Vec<(u64, Vec<(u64, Vec3)>)> = groups.into_iter().collect();
+    groups.sort_by_key(|(rep, _)| *rep);
+    let debug = std::env::var("BREP_DEBUG_JUNCTION").is_ok();
+    // (edge, absorbed point, its radius): the splits to retract.
+    let mut retract: Vec<((u8, u64), Vec3, f64)> = Vec::new();
+    for (rep, members) in &groups {
+        if members.len() < 2 {
+            continue;
+        }
+        // (rank, id, position): ONE operand vertex outranks any count of
+        // edges. Two distinct operand vertices inside the group (the pinch
+        // of two r = 10.001 rounds on a 20-wide face: the first round's rail
+        // end and the cutter's, 1e-3 apart, `the_radius_gate_leaves_pinching_
+        // and_star_selections_alone`) pin nothing — dragging the cutter's
+        // rail end onto the other operand's vertex broke the tangent-curve
+        // contact that the joint point keeps — so the joint point stands.
+        let mut pins: Vec<(u64, Vec3)> = Vec::new();
+        for &(id, point) in members {
+            let radius = radius_of(id);
+            for &(_, vertex) in operand_vertices {
+                if vertex.sub(point).length() <= radius && !pins.iter().any(|(_, pin)| pin.sub(vertex).length() <= weld) {
+                    pins.push((id, vertex));
+                }
+            }
+        }
+        if pins.len() > 1 {
+            if debug {
+                eprintln!("[merge] group v{rep} ({} members) spans {} distinct operand vertices: the joint point stands", members.len(), pins.len());
+            }
+            continue;
+        }
+        // The vertex pins a group whose other members carry no operand-edge
+        // evidence of their own (fixture 28: a face point 3.9e-4 away) or sit
+        // within the band of it. A member that itself splits an operand edge
+        // farther away is a distinct crossing (the pinch: the cutter's rail
+        // crosses the top edge 2e-3 from the first round's vertex), and the
+        // vertex yields to the edge rule below, as before this pin.
+        let pin = pins.first().copied().filter(|&(_, vertex)| {
+            members.iter().all(|&(id, point)| {
+                point.sub(vertex).length() <= band.max(radius_of(id))
+                    || split_edges_of(&split_points, point, radius_of(id)).is_empty()
+            })
+        });
+        if pin.is_none() && !pins.is_empty() && debug {
+            eprintln!("[merge] group v{rep} ({} members): the operand vertex yields to a member's own edge evidence", members.len());
+        }
+        let mut holder: Option<(usize, u64, Vec3)> = pin.map(|(id, vertex)| (usize::MAX, id, vertex));
+        if holder.is_none() {
+            for &(id, point) in members {
+                let rank = split_edges_of(&split_points, point, radius_of(id)).len();
+                if rank == 0 {
+                    continue;
+                }
+                if holder.is_none_or(|(best, best_id, _)| rank > best || (rank == best && id < best_id)) {
+                    holder = Some((rank, id, point));
+                }
+            }
+        }
+        let Some((rank, holder_id, position)) = holder else {
+            continue;
+        };
+        if debug {
+            let joint = merged_point.get(rep).copied().unwrap_or(position);
+            eprintln!(
+                "[merge] group v{rep} ({} members) placed on v{holder_id}: {}, {:.3e} from the joint point",
+                members.len(),
+                if rank == usize::MAX { "an operand vertex".to_string() } else { format!("{rank} operand edge(s)") },
+                joint.sub(position).length()
+            );
+        }
+        merged_point.insert(*rep, position);
+        let holder_edges = split_edges_of(&split_points, position, radius_of(holder_id));
+        for &(id, point) in members {
+            let radius = radius_of(id);
+            if id == holder_id || point.sub(position).length() <= radius {
+                continue;
+            }
+            for key in split_edges_of(&split_points, point, radius) {
+                if holder_edges.contains(&key) {
+                    retract.push((key, point, radius));
+                }
+            }
+        }
+    }
+    let mut retracted = 0usize;
+    for (key, point, radius) in retract {
+        let Some(edge) = edge_curves.get(&key) else {
+            continue;
+        };
+        let Some(record) = result
+            .edge_splits
+            .iter_mut()
+            .find(|record| (record.operand, record.edge_id) == key)
+        else {
+            continue;
+        };
+        let before = record.parameters.len();
+        record.parameters.retain(|&parameter| {
+            edge.curve
+                .evaluate(parameter)
+                .map(|split| split.sub(point).length() > radius)
+                .unwrap_or(true)
+        });
+        retracted += before - record.parameters.len();
+    }
+    Ok(retracted)
 }
 
 /// Apply a set of junction merges and moves: every vertex takes its
@@ -849,10 +1303,12 @@ pub(super) fn merge_residual_coincident_vertices(
 /// repointed, their curve ends snapped and their pcurves rebuilt, and a
 /// piece whose two ends collapsed to one vertex and is shorter than
 /// `spur_limit` is dropped. With `snap_moved` a piece whose vertex kept its
-/// id but moved is snapped as well (the combine's anchors); the residual
-/// merge keeps its historical behaviour of leaving those pieces' ends where
-/// the march put them. Shared by the residual merge and the two-radius
-/// combine.
+/// id but moved is snapped as well (the combine's anchors, and since the
+/// 2026-11-02 cap-union repair the residual merge's representatives too: a
+/// curve end left where the march put it, 2.3e-3 from the vertex the piece
+/// names, is the inconsistency the fragmenter refused). A piece whose ends
+/// already sit on its vertices is left bit-identical. Shared by the residual
+/// merge and the two-radius combine.
 #[allow(clippy::too_many_arguments)]
 fn relocate_junctions(
     result: &mut ImprintResultRecord,
@@ -898,8 +1354,8 @@ fn relocate_junctions(
             .get(&piece.end_vertex_id)
             .copied()
             .unwrap_or(piece.end_vertex_id);
-        let moved = start_rep != piece.start_vertex_id
-            || end_rep != piece.end_vertex_id
+        let repointed = start_rep != piece.start_vertex_id || end_rep != piece.end_vertex_id;
+        let moved = repointed
             || (snap_moved && (merged_point.contains_key(&start_rep) || merged_point.contains_key(&end_rep)));
         piece.start_vertex_id = start_rep;
         piece.end_vertex_id = end_rep;
@@ -912,12 +1368,30 @@ fn relocate_junctions(
                 .ok_or_else(|| KernelRefusal::internal(KernelStage::Intersect, "imprint.junctions", format!("missing merged imprint vertex {end_rep}")))?;
             // Both ends collapsed to one vertex and the piece is short: it can no
             // longer bound a fragment — drop it (mirrors the creation-time guard
-            // in `process_curve`). A genuine long closed loop is preserved.
-            if start_rep == end_rep && curve_length_rough(&piece.curve)? < spur_limit {
+            // in `process_curve`). A genuine long closed loop is preserved, and
+            // a closed piece whose one vertex merely moved is not a spur.
+            if repointed && start_rep == end_rep && curve_length_rough(&piece.curve)? < spur_limit {
                 dropped_pieces.insert(piece.id);
                 continue;
             }
+            let [t0, t1] = piece.curve.domain().or_refuse(KernelStage::Intersect, "domain")?;
+            let start_gap = piece.curve.evaluate(t0).or_refuse(KernelStage::Intersect, "evaluate")?.sub(start).length();
+            let end_gap = piece.curve.evaluate(t1).or_refuse(KernelStage::Intersect, "evaluate")?.sub(end).length();
+            if !repointed && start_gap <= 1e-12 && end_gap <= 1e-12 {
+                kept_pieces.push(piece);
+                continue;
+            }
             piece.curve = snap_curve_ends(&piece.curve, start, end)?;
+            if std::env::var("BREP_DEBUG_JUNCTION").is_ok() {
+                let [t0, t1] = piece.curve.domain().or_refuse(KernelStage::Intersect, "domain")?;
+                let left_start = piece.curve.evaluate(t0).or_refuse(KernelStage::Intersect, "evaluate")?.sub(start).length();
+                let left_end = piece.curve.evaluate(t1).or_refuse(KernelStage::Intersect, "evaluate")?.sub(end).length();
+                eprintln!(
+                    "[relocate] piece {} v{start_rep}->v{end_rep} gaps {start_gap:.3e}/{end_gap:.3e} -> {left_start:.3e}/{left_end:.3e}{}",
+                    piece.id,
+                    if left_start > 1e-9 || left_end > 1e-9 { " NOT SNAPPED (beyond the snap cap)" } else { "" }
+                );
+            }
             for pcurve in &mut piece.pcurves {
                 let key = FaceKey {
                     operand: pcurve.operand,

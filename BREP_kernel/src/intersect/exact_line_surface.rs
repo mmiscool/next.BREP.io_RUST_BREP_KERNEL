@@ -25,6 +25,7 @@
 //! Nothing here reads a clock; the work is counted at the classifier
 //! (`classify.profile … exact_faces= fallback_faces=`).
 
+use crate::poly::real_roots;
 use crate::{AnalyticSurface, NurbsCurve, NurbsSurface, RevolutionFrame, Vec3};
 
 /// Relative bar under which a coefficient, a discriminant or a critical
@@ -74,6 +75,455 @@ pub(crate) fn exact_line_surface_seeds(
         .map(|s| k0 + s.clamp(0.0, 1.0) * (k1 - k0))
         .collect();
     seeds.sort_by(f64::total_cmp);
+    Some(seeds)
+}
+
+/// Lane O row 16 (2026-10-28): the closed-form Newton seeds of a NURBS curve
+/// of degree at most three against an affine PLANE carrier. The weighted
+/// signed distance f(t) = n·(w·C(t)) − (n·origin)·w(t) is a plain polynomial
+/// of the curve's degree on each knot span (the homogeneous numerator is
+/// polynomial), so it is read EXACTLY from degree + 1 samples per span and its
+/// real roots solved there. A leading coefficient under [`DEGENERATE`] of the
+/// span's largest is dropped (its other root lies ~1e9 spans away); a span
+/// lying in the plane, a double root (a grazing arc) or a non-finite reading
+/// declines the whole curve, and the general search answers. `tolerance`
+/// keeps a root up to ten tolerances past either end of the curve, clamped to
+/// that end, as the line lane does.
+pub(crate) fn exact_curve_plane_seeds(
+    curve: &NurbsCurve,
+    surface: &NurbsSurface,
+    tolerance: f64,
+) -> Option<Vec<f64>> {
+    let degree = curve.degree;
+    if !(1..=3).contains(&degree) {
+        return None;
+    }
+    let AnalyticSurface::Plane { origin, u_dir, v_dir, .. } = surface.analytic()? else { return None };
+    let normal = u_dir.cross(*v_dir);
+    let normal = normal.scale(1.0 / normal.length().max(f64::MIN_POSITIVE));
+    if !normal.length().is_finite() || !(normal.length() > 0.5) {
+        return None;
+    }
+    let offset = normal.dot(*origin);
+    let [d0, d1] = curve.domain().ok()?;
+    let mut breaks: Vec<f64> = curve.knots.iter().copied().filter(|&k| k >= d0 && k <= d1).collect();
+    breaks.dedup();
+    let reading = |t: f64| -> Option<f64> {
+        let h = curve.evaluate_homogeneous(t).ok()?;
+        let value = normal.x * h.x + normal.y * h.y + normal.z * h.z - offset * h.w;
+        value.is_finite().then_some(value)
+    };
+    let start = curve.evaluate(d0).ok()?;
+    let end = curve.evaluate(d1).ok()?;
+    let mut seeds = Vec::new();
+    for span in breaks.windows(2) {
+        let (k0, k1) = (span[0], span[1]);
+        if !(k1 > k0) {
+            continue;
+        }
+        // Samples at s = i / degree, then the power-basis coefficients in s.
+        let values = (0..=degree).map(|i| reading(k0 + (k1 - k0) * i as f64 / degree as f64)).collect::<Option<Vec<_>>>()?;
+        let mut coefficients = match degree {
+            1 => vec![values[0], values[1] - values[0]],
+            2 => {
+                // f(0) = a, f(1/2) = a + b/2 + c/4, f(1) = a + b + c.
+                let (f0, fh, f1) = (values[0], values[1], values[2]);
+                vec![f0, 4.0 * fh - 3.0 * f0 - f1, 2.0 * f1 + 2.0 * f0 - 4.0 * fh]
+            }
+            _ => {
+                // Samples at 0, 1/3, 2/3, 1 (Newton forward differences, h = 1/3).
+                let (f0, f1, f2, f3) = (values[0], values[1], values[2], values[3]);
+                let d1 = f1 - f0;
+                let d2 = f2 - 2.0 * f1 + f0;
+                let d3 = f3 - 3.0 * f2 + 3.0 * f1 - f0;
+                // f(s) = f0 + d1·x + d2·x(x−1)/2 + d3·x(x−1)(x−2)/6 with x = 3s.
+                let c3 = d3 * 27.0 / 6.0;
+                let c2 = (d2 / 2.0 - d3 / 2.0) * 9.0;
+                let c1 = (d1 - d2 / 2.0 + d3 / 3.0) * 3.0;
+                vec![f0, c1, c2, c3]
+            }
+        };
+        let largest = coefficients.iter().fold(0.0_f64, |m, c| m.max(c.abs()));
+        let scale = values.iter().fold(0.0_f64, |m, v| m.max(v.abs())).max(largest);
+        let weight_scale = curve.control_points.iter().fold(0.0_f64, |m, p| m.max(p.w.abs()));
+        if !(largest > DEGENERATE * weight_scale * (1.0 + start.length().max(end.length()))) {
+            // The span lies in the plane (or reads nothing): decline.
+            return None;
+        }
+        while coefficients.len() > 2 && coefficients.last().is_some_and(|c| c.abs() <= DEGENERATE * scale) {
+            coefficients.pop();
+        }
+        if coefficients.len() == 2 && coefficients[1].abs() <= DEGENERATE * scale {
+            // Constant and nonzero over the span: no root here.
+            continue;
+        }
+        let span_chord = curve.evaluate(k0).ok()?.sub(curve.evaluate(k1).ok()?).length().max(f64::MIN_POSITIVE);
+        let slack = (10.0 * tolerance / span_chord).max(0.0);
+        for root in real_roots(&coefficients)? {
+            if !(root.is_finite() && root >= -slack && root <= 1.0 + slack) {
+                continue;
+            }
+            seeds.push((k0 + root * (k1 - k0)).clamp(d0, d1));
+        }
+    }
+    seeds.sort_by(f64::total_cmp);
+    seeds.dedup_by(|a, b| (*a - *b).abs() <= 1e-12 * (1.0 + b.abs()));
+    Some(seeds)
+}
+
+/// A quadric carrier as its implicit equation: a sphere `|P − center| = radius`,
+/// or a surface of revolution whose radius is linear in the axial coordinate
+/// (`cone_roots`' ρ(h) = rho_at_h0 + slope·(h − h_reference); a cylinder has
+/// slope 0).
+enum Quadric<'a> {
+    Sphere { center: Vec3, radius: f64 },
+    Cone { frame: &'a RevolutionFrame, h_reference: f64, rho_at_h0: f64, slope: f64 },
+}
+
+/// The quadric behind an analytic carrier, or `None` for a plane (row 16's
+/// lane), a torus, an annulus or a revolution with a curved generatrix.
+fn quadric_of(analytic: &AnalyticSurface) -> Option<Quadric<'_>> {
+    match analytic {
+        AnalyticSurface::Sphere { frame, radius } => Some(Quadric::Sphere { center: frame.origin, radius: *radius }),
+        AnalyticSurface::RuledRevolution { frame, rho0, rho1, height } => {
+            (height.abs() > 0.0).then(|| Quadric::Cone { frame, h_reference: 0.0, rho_at_h0: *rho0, slope: (rho1 - rho0) / height })
+        }
+        AnalyticSurface::Revolution { frame, generatrix, .. } => {
+            let controls = &generatrix.control_points;
+            if generatrix.degree != 1 || controls.len() != 2 || controls[0].w != controls[1].w {
+                return None;
+            }
+            let meridian = |point: Vec3| -> Option<(f64, f64)> {
+                let offset = point.sub(frame.origin);
+                let axial = offset.dot(frame.axis);
+                let radial = offset.sub(frame.axis.scale(axial));
+                let rho = radial.dot(frame.x_axis);
+                let off_plane = radial.dot(frame.y_axis).abs();
+                (off_plane <= 1e-9 * (1.0 + rho.abs() + axial.abs())).then_some((rho, axial))
+            };
+            let (rho_a, h_a) = meridian(controls[0].point().ok()?)?;
+            let (rho_b, h_b) = meridian(controls[1].point().ok()?)?;
+            let span = ((rho_b - rho_a).powi(2) + (h_b - h_a).powi(2)).sqrt();
+            if !(span > 0.0) || (h_b - h_a).abs() <= DEGENERATE * span {
+                return None;
+            }
+            Some(Quadric::Cone { frame, h_reference: h_a, rho_at_h0: rho_a, slope: (rho_b - rho_a) / (h_b - h_a) })
+        }
+        _ => None,
+    }
+}
+
+/// The power-basis coefficients in s of the polynomial of degree n through
+/// `values` sampled at s = i / n, i = 0..=n (Newton forward differences).
+fn power_coefficients(values: &[f64]) -> Vec<f64> {
+    let n = values.len() - 1;
+    let mut differences = values.to_vec();
+    let mut leading = vec![values[0]];
+    for k in 1..=n {
+        for i in 0..=n - k {
+            differences[i] = differences[i + 1] - differences[i];
+        }
+        leading.push(differences[0]);
+    }
+    // f = Σ Δᵏf₀ · x(x − 1)…(x − k + 1) / k!, with x = n·s.
+    let mut in_x = vec![0.0; n + 1];
+    let mut falling = vec![1.0];
+    let mut factorial = 1.0;
+    for (k, delta) in leading.iter().enumerate() {
+        if k > 0 {
+            factorial *= k as f64;
+            let mut next = vec![0.0; falling.len() + 1];
+            for (j, c) in falling.iter().enumerate() {
+                next[j + 1] += c;
+                next[j] -= c * (k - 1) as f64;
+            }
+            falling = next;
+        }
+        for (j, c) in falling.iter().enumerate() {
+            in_x[j] += delta * c / factorial;
+        }
+    }
+    let mut power = 1.0;
+    for c in &mut in_x {
+        *c *= power;
+        power *= n as f64;
+    }
+    in_x
+}
+
+/// Lane O row 27 (2026-10-30): the closed-form Newton seeds of a NURBS curve
+/// of degree two, a rational arc included, against a QUADRIC carrier
+/// (a sphere, a cylinder or a cone; `quadric_of`). Row 16's reading one degree
+/// up: the quadric's equation in the curve's homogeneous point, F(w·C, w), is
+/// a plain polynomial of degree 2·degree on each knot span, so it is read
+/// EXACTLY from 2·degree + 1 samples per span and its real roots solved there
+/// (`real_roots`, degree ≤ 4). A span lying on the carrier, a double root (a
+/// grazing arc) or a non-finite reading declines the whole curve, and the
+/// general search answers; a span whose reading has no real root seeds
+/// nothing, which is how an arc that misses the carrier skips the general
+/// search's 32 starts. `tolerance` keeps a root up to ten tolerances past
+/// either end of a span, clamped to the curve, as the plane lane does.
+pub(crate) fn exact_curve_quadric_seeds(
+    curve: &NurbsCurve,
+    surface: &NurbsSurface,
+    tolerance: f64,
+) -> Option<Vec<f64>> {
+    // A straight edge is row 15's (`exact_line_surface_seeds`); where that
+    // lane declines a line, the general search answers.
+    if curve.degree != 2 {
+        return None;
+    }
+    curve_quadric_seeds(curve, quadric_of(surface.analytic()?)?, tolerance)
+}
+
+/// Lane O row 40: [`exact_curve_quadric_seeds`] against the sphere of `center`
+/// and `radius`, which a curve lying in a circle's plane crosses exactly where
+/// it crosses that circle.
+pub(crate) fn exact_curve_sphere_seeds(curve: &NurbsCurve, center: Vec3, radius: f64, tolerance: f64) -> Option<Vec<f64>> {
+    if curve.degree != 2 || !(radius > 0.0 && radius.is_finite()) {
+        return None;
+    }
+    curve_quadric_seeds(curve, Quadric::Sphere { center, radius }, tolerance)
+}
+
+fn curve_quadric_seeds(curve: &NurbsCurve, quadric: Quadric<'_>, tolerance: f64) -> Option<Vec<f64>> {
+    let degree = curve.degree;
+    let [d0, d1] = curve.domain().ok()?;
+    let mut breaks: Vec<f64> = curve.knots.iter().copied().filter(|&k| k >= d0 && k <= d1).collect();
+    breaks.dedup();
+    let reading = |t: f64| -> Option<f64> {
+        let h = curve.evaluate_homogeneous(t).ok()?;
+        let weighted = Vec3::new(h.x, h.y, h.z);
+        let value = match &quadric {
+            Quadric::Sphere { center, radius } => {
+                let q = weighted.sub(center.scale(h.w));
+                q.dot(q) - radius * radius * h.w * h.w
+            }
+            Quadric::Cone { frame, h_reference, rho_at_h0, slope } => {
+                let q = weighted.sub(frame.origin.scale(h.w));
+                let axial = q.dot(frame.axis);
+                let radial = q.sub(frame.axis.scale(axial));
+                let rho = h.w * rho_at_h0 + slope * (axial - h.w * h_reference);
+                radial.dot(radial) - rho * rho
+            }
+        };
+        value.is_finite().then_some(value)
+    };
+    // The size a reading of a point near the curve takes, for the decline bars.
+    let (origin, radius) = match &quadric {
+        Quadric::Sphere { center, radius } => (*center, radius.abs()),
+        Quadric::Cone { frame, rho_at_h0, .. } => (frame.origin, rho_at_h0.abs()),
+    };
+    let extent = curve.control_points.iter().filter_map(|p| p.point().ok()).fold(radius, |m, p| m.max(p.sub(origin).length()));
+    let weight_scale = curve.control_points.iter().fold(0.0_f64, |m, p| m.max(p.w.abs()));
+    let reference = (weight_scale * (1.0 + extent)).powi(2);
+    let mut seeds = Vec::new();
+    for span in breaks.windows(2) {
+        let (k0, k1) = (span[0], span[1]);
+        if !(k1 > k0) {
+            continue;
+        }
+        let samples = 2 * degree;
+        let values = (0..=samples).map(|i| reading(k0 + (k1 - k0) * i as f64 / samples as f64)).collect::<Option<Vec<_>>>()?;
+        let mut coefficients = power_coefficients(&values);
+        let largest = coefficients.iter().fold(0.0_f64, |m, c| m.max(c.abs()));
+        let scale = values.iter().fold(0.0_f64, |m, v| m.max(v.abs())).max(largest);
+        if !(largest > DEGENERATE * reference) {
+            // The span lies on the carrier (or reads nothing): decline.
+            return None;
+        }
+        while coefficients.len() > 2 && coefficients.last().is_some_and(|c| c.abs() <= DEGENERATE * scale) {
+            coefficients.pop();
+        }
+        if coefficients.len() == 2 && coefficients[1].abs() <= DEGENERATE * scale {
+            // Constant and nonzero over the span: no root here.
+            continue;
+        }
+        let span_chord = curve.evaluate(k0).ok()?.sub(curve.evaluate(k1).ok()?).length().max(f64::MIN_POSITIVE);
+        let slack = (10.0 * tolerance / span_chord).max(0.0);
+        for root in real_roots(&coefficients)? {
+            if !(root.is_finite() && root >= -slack && root <= 1.0 + slack) {
+                continue;
+            }
+            seeds.push((k0 + root * (k1 - k0)).clamp(d0, d1));
+        }
+        // A graze: the curve touches the carrier within the caller's
+        // tolerance without the reading crossing zero (a near-double root
+        // whose discriminant fell below zero), which the general search
+        // reports and the roots alone miss (lane O row 40 census, records 6
+        // and 7). Like row 28's line-conic seeds, the span's stationary
+        // points and its ends are seeded when the curve point lies within a
+        // hundred tolerances of the carrier. A stationary point the solver
+        // declines (a repeated one) leaves this span to its roots.
+        let derivative: Vec<f64> = coefficients.iter().enumerate().skip(1).map(|(i, c)| i as f64 * c).collect();
+        let stationary = if derivative.len() >= 2 { real_roots(&derivative).unwrap_or_default() } else { Vec::new() };
+        for candidate in stationary.into_iter().chain([0.0, 1.0]) {
+            if !(candidate.is_finite() && candidate >= -slack && candidate <= 1.0 + slack) {
+                continue;
+            }
+            let t = (k0 + candidate * (k1 - k0)).clamp(d0, d1);
+            let Ok(point) = curve.evaluate(t) else { continue };
+            let graze = match &quadric {
+                Quadric::Sphere { center, radius } => (point.sub(*center).length() - radius).abs(),
+                Quadric::Cone { frame, h_reference, rho_at_h0, slope } => {
+                    let q = point.sub(frame.origin);
+                    let axial = q.dot(frame.axis);
+                    let radial = q.sub(frame.axis.scale(axial)).length();
+                    let rho = rho_at_h0 + slope * (axial - h_reference);
+                    (radial - rho.abs()).abs()
+                }
+            };
+            if graze <= 100.0 * tolerance {
+                seeds.push(t);
+            }
+        }
+    }
+    seeds.sort_by(f64::total_cmp);
+    seeds.dedup_by(|a, b| (*a - *b).abs() <= 1e-12 * (1.0 + b.abs()));
+    Some(seeds)
+}
+
+/// Lane O row 28 (2026-10-30): the closed-form Newton seeds, as parameters of
+/// `conic` (a planar curve of degree two, a rational arc included), of its
+/// crossings with the straight segment `p0 → p1`. A point of the line lies in
+/// the plane through the line that contains the conic plane's normal n, whose
+/// own normal is m = n × (p1 − p0); so every crossing is a root of the
+/// weighted reading g(t) = m·(w·C(t)) − (m·p0)·w(t), a quadratic on each knot
+/// span read EXACTLY from three samples (row 16's plane reading). That plane
+/// also holds a crossing of a line that pierces the conic's plane, so the
+/// roots seed both a coplanar line and a transverse one.
+///
+/// Beside the roots, a point where the conic only GRAZES the line within the
+/// caller's tolerance must be seeded too, since the general search reports
+/// it: each span's stationary point of g, and each knot of the domain, whose
+/// in-plane distance |g| / w is within a hundred tolerances (the distance to
+/// the line in 3D is never smaller). The span quadratic's roots are solved in
+/// closed form, so a graze never declines the curve. Roots up to ten
+/// tolerances past a span's ends are kept and clamped to the curve, as the
+/// plane lane does.
+///
+/// Declines (`None`, the general search answers) for a curve that is not of
+/// degree two with positive finite weights, control points that are collinear
+/// or out of one plane by more than 1e-12 of their extent, a segment within a
+/// milliradian of the conic plane's normal (its trace in that plane is a
+/// point), a span lying on the reading's plane, or a non-finite reading.
+pub(crate) fn exact_line_conic_seeds(p0: Vec3, p1: Vec3, conic: &NurbsCurve, tolerance: f64) -> Option<Vec<f64>> {
+    if conic.degree != 2 || conic.control_points.len() < 3 {
+        return None;
+    }
+    if conic.control_points.iter().any(|p| !(p.w > 0.0 && p.w.is_finite())) {
+        return None;
+    }
+    let points = conic.control_points.iter().map(|p| p.point().ok()).collect::<Option<Vec<_>>>()?;
+    let base = points[0];
+    let extent = points.iter().fold(0.0_f64, |m, p| m.max(p.sub(base).length()));
+    if !(extent > 0.0 && extent.is_finite()) {
+        return None;
+    }
+    let mut normal = Vec3::new(0.0, 0.0, 0.0);
+    let mut area = 0.0_f64;
+    for i in 1..points.len() {
+        for j in i + 1..points.len() {
+            let cross = points[i].sub(base).cross(points[j].sub(base));
+            if cross.length() > area {
+                area = cross.length();
+                normal = cross;
+            }
+        }
+    }
+    if !(area > DEGENERATE * extent * extent) {
+        return None;
+    }
+    let normal = normal.scale(1.0 / area);
+    if points.iter().any(|p| normal.dot(p.sub(base)).abs() > 1e-12 * extent) {
+        return None;
+    }
+    let direction = p1.sub(p0);
+    let length = direction.length();
+    if !(length > 0.0 && length.is_finite()) {
+        return None;
+    }
+    let across = normal.cross(direction);
+    if !(across.length() > 1e-3_f64.sin() * length) {
+        return None;
+    }
+    let m = across.scale(1.0 / across.length());
+    let offset = m.dot(p0);
+    let reading = |t: f64| -> Option<(f64, f64)> {
+        let h = conic.evaluate_homogeneous(t).ok()?;
+        let value = m.x * h.x + m.y * h.y + m.z * h.z - offset * h.w;
+        (value.is_finite() && h.w > 0.0).then_some((value, h.w))
+    };
+    let band = 100.0 * tolerance;
+    let [d0, d1] = conic.domain().ok()?;
+    let mut breaks: Vec<f64> = conic.knots.iter().copied().filter(|&k| k >= d0 && k <= d1).collect();
+    breaks.dedup();
+    let weight_scale = conic.control_points.iter().fold(0.0_f64, |m, p| m.max(p.w));
+    let reach = points.iter().fold(0.0_f64, |m, p| m.max(p.sub(p0).length()));
+    let reference = weight_scale * (1.0 + reach);
+    let mut seeds = Vec::new();
+    for &knot in &breaks {
+        let (value, weight) = reading(knot)?;
+        if value.abs() <= band * weight {
+            seeds.push(knot);
+        }
+    }
+    for span in breaks.windows(2) {
+        let (k0, k1) = (span[0], span[1]);
+        if !(k1 > k0) {
+            continue;
+        }
+        let values = (0..=2).map(|i| reading(k0 + (k1 - k0) * i as f64 / 2.0).map(|(value, _)| value)).collect::<Option<Vec<_>>>()?;
+        let mut coefficients = power_coefficients(&values);
+        let largest = coefficients.iter().fold(0.0_f64, |m, c| m.max(c.abs()));
+        let scale = values.iter().fold(0.0_f64, |m, v| m.max(v.abs())).max(largest);
+        if !(largest > DEGENERATE * reference) {
+            // The span lies on the reading's plane (or reads nothing): decline.
+            return None;
+        }
+        let span_chord = conic.evaluate(k0).ok()?.sub(conic.evaluate(k1).ok()?).length().max(f64::MIN_POSITIVE);
+        let slack = (10.0 * tolerance / span_chord).max(0.0);
+        let inside = |root: f64| root.is_finite() && root >= -slack && root <= 1.0 + slack;
+        if coefficients[2] != 0.0 {
+            let stationary = -coefficients[1] / (2.0 * coefficients[2]);
+            if inside(stationary) {
+                let t = (k0 + stationary * (k1 - k0)).clamp(d0, d1);
+                let (value, weight) = reading(t)?;
+                if value.abs() <= band * weight {
+                    seeds.push(t);
+                }
+            }
+        }
+        while coefficients.len() > 2 && coefficients.last().is_some_and(|c| c.abs() <= DEGENERATE * scale) {
+            coefficients.pop();
+        }
+        if coefficients.len() == 2 && coefficients[1].abs() <= DEGENERATE * scale {
+            // Constant and nonzero over the span: no root here.
+            continue;
+        }
+        // The roots in closed form (`real_roots` would decline a double root
+        // anywhere on the real line, and each quarter span of a circle,
+        // extended, traces the whole circle). A double or missing root is a
+        // graze, which the stationary seed above covers.
+        let roots = if coefficients.len() == 2 {
+            vec![-coefficients[0] / coefficients[1]]
+        } else {
+            let (c0, c1, c2) = (coefficients[0], coefficients[1], coefficients[2]);
+            let discriminant = c1 * c1 - 4.0 * c2 * c0;
+            if !(discriminant >= 0.0) {
+                Vec::new()
+            } else {
+                crate::poly::solve_quadratic(c0, c1, c2)
+            }
+        };
+        for root in roots {
+            if inside(root) {
+                seeds.push((k0 + root * (k1 - k0)).clamp(d0, d1));
+            }
+        }
+    }
+    seeds.sort_by(f64::total_cmp);
+    seeds.dedup_by(|a, b| (*a - *b).abs() <= 1e-12 * (1.0 + b.abs()));
     Some(seeds)
 }
 
@@ -231,101 +681,4 @@ fn revolution_roots(p0: Vec3, d: Vec3, frame: &RevolutionFrame, generatrix: &Nur
     }
 }
 
-/// Every real root of the polynomial Σ coefficients[i]·sⁱ (degree ≤ 4), by
-/// bisection on the monotonic intervals between the roots of its derivative
-/// (found the same way), polished by Newton. `None` when the polynomial is
-/// degenerate: a leading coefficient within [`DEGENERATE`] of zero relative to
-/// the others, or a critical value within [`DEGENERATE`] of zero relative to
-/// the polynomial's terms there — a double or near-double root, where the
-/// sampled search's tangency reading must stand.
-fn real_roots(coefficients: &[f64]) -> Option<Vec<f64>> {
-    let mut coefficients: Vec<f64> = coefficients.to_vec();
-    if coefficients.iter().any(|c| !c.is_finite()) {
-        return None;
-    }
-    let largest = coefficients.iter().fold(0.0_f64, |m, c| m.max(c.abs()));
-    if !(largest > 0.0) {
-        return None;
-    }
-    let leading = *coefficients.last()?;
-    if leading.abs() <= DEGENERATE * largest {
-        return None;
-    }
-    while coefficients.len() > 1 && coefficients.last() == Some(&0.0) {
-        coefficients.pop();
-    }
-    let degree = coefficients.len() - 1;
-    if degree == 0 {
-        return Some(Vec::new());
-    }
-    let evaluate = |s: f64| coefficients.iter().rev().fold(0.0, |acc, c| acc * s + c);
-    let terms = |s: f64| coefficients.iter().enumerate().fold(0.0, |acc, (i, c)| acc + (c * s.powi(i as i32)).abs());
-    if degree == 1 {
-        return Some(vec![-coefficients[0] / coefficients[1]]);
-    }
-    // Cauchy's bound on the root magnitude.
-    let bound = 1.0 + coefficients[..degree].iter().map(|c| (c / leading).abs()).fold(0.0, f64::max);
-    let derivative: Vec<f64> = coefficients.iter().enumerate().skip(1).map(|(i, c)| c * i as f64).collect();
-    let mut critical = real_roots(&derivative)?;
-    critical.retain(|c| c.abs() <= bound);
-    critical.sort_by(f64::total_cmp);
-    let mut nodes = vec![-bound];
-    nodes.extend(critical.iter().copied());
-    nodes.push(bound);
-    // A critical value at zero is a double root: decline.
-    for &c in &critical {
-        if evaluate(c).abs() <= DEGENERATE * terms(c).max(largest * DEGENERATE) {
-            return None;
-        }
-    }
-    let mut roots = Vec::new();
-    for pair in nodes.windows(2) {
-        let (mut lo, mut hi) = (pair[0], pair[1]);
-        let (mut f_lo, f_hi) = (evaluate(lo), evaluate(hi));
-        if f_lo == 0.0 {
-            roots.push(lo);
-            continue;
-        }
-        if f_lo.signum() == f_hi.signum() {
-            continue;
-        }
-        for _ in 0..200 {
-            let mid = 0.5 * (lo + hi);
-            if mid <= lo || mid >= hi {
-                break;
-            }
-            let f_mid = evaluate(mid);
-            if f_mid == 0.0 {
-                lo = mid;
-                hi = mid;
-                break;
-            }
-            if f_mid.signum() == f_lo.signum() {
-                lo = mid;
-                f_lo = f_mid;
-            } else {
-                hi = mid;
-            }
-        }
-        let mut root = 0.5 * (lo + hi);
-        for _ in 0..3 {
-            let slope = derivative.iter().rev().fold(0.0, |acc, c| acc * root + c);
-            if slope == 0.0 {
-                break;
-            }
-            let next = root - evaluate(root) / slope;
-            if !next.is_finite() || next < pair[0] || next > pair[1] {
-                break;
-            }
-            root = next;
-        }
-        roots.push(root);
-    }
-    if let Some(&last) = nodes.last() {
-        if evaluate(last) == 0.0 {
-            roots.push(last);
-        }
-    }
-    Some(roots)
-}
 

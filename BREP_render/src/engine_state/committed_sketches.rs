@@ -297,6 +297,10 @@ impl EngineState {
 
         self.shown_sketch_ids = fed;
         self.dirty = true;
+        // A freshly synthesized sheet arrives with no face colours; re-derive
+        // the sketch's `color` attribute onto it here, since this rebuild also
+        // runs outside a history apply (sketch mode exit, show/hide).
+        self.sync_colors_from_metadata();
     }
 
     /// Whether the committed sketch `id`'s persistent overlay is shown (absent from

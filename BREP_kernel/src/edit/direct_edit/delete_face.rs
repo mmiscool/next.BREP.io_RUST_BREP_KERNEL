@@ -163,7 +163,11 @@ pub(super) fn delete_face_and_heal_impl(
             .map(|coedge| (coedge.edge_id, coedge.forward))
             .collect()
     };
-    if boundary.len() != 4 {
+    // A degenerate pole (an exact octant's, a runout's) is no side: a face
+    // whose other edges do not number four is refused by its real side count.
+    let degenerate = |edge_id: u64| solid.edges.iter().any(|edge| edge.id == edge_id && edge.degenerate);
+    let sides = boundary.iter().filter(|(edge_id, _)| !degenerate(*edge_id)).count();
+    if boundary.len() != 4 || (sides != boundary.len() && sides != 4) {
         return Err(KernelRefusal::unsupported(
             KernelStage::Classify,
             "side_count",
@@ -171,7 +175,7 @@ pub(super) fn delete_face_and_heal_impl(
                 "delete_face_and_heal: face {face_id} has {} boundary edges; only 4-sided \
                  transition faces (a single chamfer/fillet edge) are supported \
                  (deferred: multi-face gaps)",
-                boundary.len()
+                if sides != boundary.len() { sides } else { boundary.len() }
             ),
         ));
     }

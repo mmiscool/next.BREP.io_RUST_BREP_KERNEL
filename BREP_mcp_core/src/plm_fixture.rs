@@ -151,16 +151,39 @@ impl Answer {
     }
 }
 
-/// Where the `brep-plm` binary is: `BREP_PLM_BIN`, else the newer of the
-/// checkout's debug and release builds (`./build.sh test-mcp` builds debug,
-/// the same target `test-plm` keeps warm).
+/// Where the `brep-plm` binary is: `BREP_PLM_BIN`, else the newest debug or
+/// release build in a checkout `target/` found at run time (`./build.sh
+/// test-mcp` sets `BREP_PLM_BIN`; cargo tests run from a crate directory).
+///
+/// The search is resolved at run time, never from `env!("CARGO_MANIFEST_DIR")`:
+/// a compile-time source path is written into every binary that links this
+/// crate (the shipped brep-app among them), which leaks the build machine's
+/// paths and fails the PLM local bundle's private-path audit.
 pub fn server_binary() -> Result<PathBuf, String> {
     if let Some(bin) = std::env::var_os("BREP_PLM_BIN") {
         let bin = PathBuf::from(bin);
         return if bin.is_file() { Ok(bin) } else { Err(format!("BREP_PLM_BIN={} is not a file", bin.display())) };
     }
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let targets = [root.join("../target"), root.join("../BREP_plm/target")];
+    let mut targets: Vec<PathBuf> = Vec::new();
+    let mut push = |p: PathBuf| {
+        if p.is_dir() && !targets.contains(&p) {
+            targets.push(p);
+        }
+    };
+    // The working directory (a crate directory under `cargo test`, or the
+    // checkout root) and its parent: their `target/` and BREP_plm's own.
+    if let Ok(cwd) = std::env::current_dir() {
+        for dir in [Some(cwd.as_path()), cwd.parent()].into_iter().flatten() {
+            push(dir.join("target"));
+            push(dir.join("BREP_plm").join("target"));
+        }
+    }
+    // The `target/` directory the running executable was built into.
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(target) = exe.ancestors().find(|a| a.file_name().is_some_and(|n| n == "target")) {
+            push(target.to_path_buf());
+        }
+    }
     let name = if cfg!(windows) { "brep-plm.exe" } else { "brep-plm" };
     let modified = |p: &PathBuf| std::fs::metadata(p).and_then(|m| m.modified()).ok();
     targets
@@ -169,9 +192,10 @@ pub fn server_binary() -> Result<PathBuf, String> {
         .filter(|p| p.is_file())
         .max_by_key(modified)
         .ok_or_else(|| {
+            let searched: Vec<String> = targets.iter().map(|t| t.display().to_string()).collect();
             format!(
-                "no brep-plm binary under {} or {} — build it with `cargo build --manifest-path BREP_plm/Cargo.toml --bin brep-plm` or set BREP_PLM_BIN",
-                targets[0].display(), targets[1].display()
+                "no brep-plm binary under [{}] — build it with `cargo build --manifest-path BREP_plm/Cargo.toml --bin brep-plm` or set BREP_PLM_BIN",
+                searched.join(", ")
             )
         })
 }

@@ -92,6 +92,50 @@ pub struct InfoPanel {
     /// frame ([`Self::take_mcp_start`]) because the shell, not this window,
     /// owns the queue the server attaches to.
     mcp_start: bool,
+    #[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
+    mcp_preferences: Option<McpPreferences>,
+}
+
+/// Where the next launch keeps its MCP state (the persistence dropdown).
+#[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum McpPersistence {
+    Named,
+    Directory,
+    Ephemeral,
+}
+
+#[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
+impl McpPersistence {
+    /// `(value, hit id, label)` for [`crate::form::enum_dropdown`].
+    const CHOICES: [(Self, &'static str, &'static str); 3] = [
+        (Self::Named, "named", "Named instance"),
+        (Self::Directory, "directory", "Explicit directory"),
+        (Self::Ephemeral, "ephemeral", "Ephemeral"),
+    ];
+}
+
+#[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
+struct McpPreferences {
+    mode: McpPersistence,
+    instance: String,
+    path: String,
+    message: Option<Result<String, String>>,
+}
+
+#[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
+impl McpPreferences {
+    fn load() -> Self {
+        let loaded = crate::mcp::state_settings_path().and_then(|path| brep_mcp_core::launch_state::Settings::load(&path));
+        let error = loaded.as_ref().err().cloned();
+        let policy = loaded.ok().and_then(|s| s.desktop).unwrap_or_default();
+        Self {
+            mode: if policy.ephemeral { McpPersistence::Ephemeral } else if policy.state_dir.is_some() { McpPersistence::Directory } else { McpPersistence::Named },
+            instance: policy.instance.unwrap_or_else(|| "desktop".into()),
+            path: policy.state_dir.map(|p| p.to_string_lossy().into_owned()).unwrap_or_default(),
+            message: error.map(Err),
+        }
+    }
 }
 
 impl InfoPanel {
@@ -219,6 +263,58 @@ impl InfoPanel {
                 }
             }
         }
+        #[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
+        if !matches!(mcp, McpView::Unavailable) { self.mcp_persistence(ui); }
+    }
+
+    #[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
+    fn mcp_persistence(&mut self, ui: &mut egui::Ui) {
+        ui.separator();
+        ui.label("MCP state persistence");
+        match crate::mcp::state_configuration() {
+            Some(Ok(state)) => {
+                if let Some(path) = &state.state_dir {
+                    ui.label(format!("This launch: persistent ({:?})", state.source));
+                    if let Some(name) = &state.instance { ui.label(format!("Instance: {name}")); }
+                    ui.label(format!("Journal: {}", path.display()));
+                } else { ui.label(format!("This launch: ephemeral ({:?})", state.source)); }
+            }
+            Some(Err(error)) => { ui.colored_label(ui.visuals().error_fg_color, error); }
+            None => { ui.label("Launch configuration has not been initialized."); }
+        }
+        ui.label("Machine-local preference for the next launch. Command-line and environment overrides take precedence. Restart required after saving.");
+        if let Ok(path) = crate::mcp::state_settings_path() { ui.label(format!("Settings: {}", path.display())); }
+        let preferences = self.mcp_preferences.get_or_insert_with(McpPreferences::load);
+        crate::form::enum_dropdown(ui, "mcp:persistence", &McpPersistence::CHOICES, &mut preferences.mode, None, Some(&mut self.hits));
+        match preferences.mode {
+            McpPersistence::Named => {
+                ui.label("Instance name");
+                let response = ui.text_edit_singleline(&mut preferences.instance);
+                self.hits.insert("mcp:instance".into(), response.rect);
+            }
+            McpPersistence::Directory => {
+                ui.label("Journal directory");
+                let response = ui.text_edit_singleline(&mut preferences.path);
+                self.hits.insert("mcp:state-dir".into(), response.rect);
+            }
+            McpPersistence::Ephemeral => {}
+        }
+        let save = ui.button("Save MCP preference for next launch");
+        self.hits.insert("mcp:save-preference".into(), save.rect);
+        if save.clicked() {
+            let policy = brep_mcp_core::launch_state::Policy {
+                instance: (preferences.mode == McpPersistence::Named).then(|| preferences.instance.clone()),
+                state_dir: (preferences.mode == McpPersistence::Directory).then(|| preferences.path.clone().into()),
+                ephemeral: preferences.mode == McpPersistence::Ephemeral,
+            };
+            preferences.message = Some(crate::mcp::save_desktop_policy(policy).map(|()| "Saved. Restart the application to apply; launch overrides still take precedence.".into()));
+        }
+        if let Some(message) = &preferences.message {
+            match message {
+                Ok(message) => { ui.label(message); }
+                Err(error) => { ui.colored_label(ui.visuals().error_fg_color, error); }
+            }
+        }
     }
 
     /// The diagnostics grid, then the one button that puts the very same text a
@@ -326,6 +422,6 @@ pub static HIT_KEYS: &[HitKeyDoc] = &[
     // No command either: a server started from the agent's own tool call
     // would be the server that call came in on, and the copy goes to a
     // clipboard. The instructions are the console's, so a host has them.
-    HitKeyDoc { panel: "info", prefix: "mcp:", meaning: "the Connect an agent section: mcp:start starts the embedded MCP server (disabled while it runs or in a build without one), mcp:copy copies the agent instructions it then shows", command: None },
+    HitKeyDoc { panel: "info", prefix: "mcp:", meaning: "the Connect an agent section: mcp:start starts the embedded MCP server (disabled while it runs or in a build without one), mcp:copy copies the agent instructions; mcp:persistence is the next-launch state dropdown (mcp:persistence#named/#directory/#ephemeral while open), mcp:instance and mcp:state-dir edit the location, mcp:save-preference saves machine-local settings", command: None },
 ];
 

@@ -179,7 +179,7 @@ fn refuse_invalid_result(result: &BrepSolid, entry: &str) -> Result<(), KernelRe
 }
 
 /// Resolve a point within 1e-3 of a trimmed edge.
-fn resolve_edge_by_point(solid: &BrepSolid, point: Vec3) -> Result<u64, KernelRefusal> {
+pub(super) fn resolve_edge_by_point(solid: &BrepSolid, point: Vec3) -> Result<u64, KernelRefusal> {
     match crate::topology::nearest_edge(solid, point) {
         Some((edge_id, distance)) if distance <= 1e-3 => Ok(edge_id),
         Some((_, distance)) => Err(KernelRefusal::input(
@@ -201,8 +201,7 @@ fn resolve_edge_by_point(solid: &BrepSolid, point: Vec3) -> Result<u64, KernelRe
 /// (`CoedgeMemoScope`). On by default (promoted 2026-10-18 on the 98 + 144
 /// census); `BREP_FILLET_COEDGE_MEMO=0` (or `off`) opens none.
 pub(crate) fn fillet_coedge_memo_on() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| !matches!(std::env::var("BREP_FILLET_COEDGE_MEMO").as_deref(), Ok("0") | Ok("off")))
+    switch!("BREP_FILLET_COEDGE_MEMO", true)
 }
 
 
@@ -238,6 +237,70 @@ pub(crate) fn fillet_coedge_memo_on() -> bool {
 /// byte-identical to before). The whole `*_edges` family takes the same
 /// `edge_names` slot in the same position.
 pub fn fillet_edges(
+    solid: &BrepSolid,
+    edge_points: &[Vec3],
+    edge_names: Option<&[String]>,
+    radius: f64,
+    chamfer: bool,
+    name: Option<&str>,
+) -> Result<BrepSolid, KernelRefusal> {
+    // A selected closed rim with a corner at its one vertex, on a mate creased
+    // along its own seam, is blended on the body canonicalised for it — the
+    // mate split along a smooth meridian so the network's miter closes the
+    // crease — and the walls are merged back afterwards
+    // (`blend/creased_rim.rs`; `BREP_CREASED_RIM_SPLIT=0` turns it off). Every
+    // other selection takes the body as it came.
+    let prepared = if crate::blend::creased_rim::creased_rim_split_on() {
+        crate::blend::creased_rim::split_creased_rims(solid, edge_points, edge_names, &resolve_edge_by_point)?
+    } else {
+        None
+    };
+    match prepared {
+        Some(prepared) => {
+            let names = prepared.names.as_deref();
+            let built = fillet_edges_prepared(&prepared.solid, &prepared.points, names, radius, chamfer, name)?;
+            Ok(prepared.rejoin(built))
+        }
+        None => {
+            // A chamfer selection holding a MIXED STAR (one concave and two
+            // convex selected edges at a vertex, the convex two on one cap) is
+            // built in two phases (`fillet/chamfer_star.rs`;
+            // `BREP_CHAMFER_MIXED_STAR=0` turns it off); a phase that refuses
+            // hands the selection to the ordinary path below.
+            if chamfer && super::chamfer_star::chamfer_mixed_star_on() {
+                let build = |body: &BrepSolid, points: &[Vec3], names: Option<&[String]>| {
+                    fillet_edges_prepared(body, points, names, radius, true, name)
+                };
+                if let Some(built) = super::chamfer_star::chamfer_mixed_stars(solid, edge_points, edge_names, &build) {
+                    return Ok(built);
+                }
+            }
+            let ordinary = fillet_edges_prepared(solid, edge_points, edge_names, radius, chamfer, name);
+            // A closed rim written as a chain of edges along the halves of a
+            // split carrier, refused because only the closed-rim rollover
+            // follows its ball and that lane takes one closed edge, is blended
+            // on the body with those halves merged and the chain joined into
+            // one closed edge (`blend/split_rim.rs`; default off,
+            // `BREP_SPLIT_RIM_MERGE=1`). Only that refusal asks: a selection
+            // the ordinary path builds keeps its body and names.
+            match ordinary {
+                Err(refusal)
+                    if crate::blend::split_rim::split_rim_merge_on()
+                        && matches!(&refusal.class, crate::RefusalClass::UnsupportedGeometry { what } if what == super::analyze::TANGENT_ROLLOVER_ONLY_WHAT) =>
+                {
+                    match crate::blend::split_rim::merge_split_rims(solid, edge_points, edge_names, &resolve_edge_by_point) {
+                        Some(merged) => fillet_edges_prepared(&merged.solid, &merged.points, merged.names.as_deref(), radius, chamfer, name)
+                            .map_err(|_| refusal),
+                        None => Err(refusal),
+                    }
+                }
+                other => other,
+            }
+        }
+    }
+}
+
+fn fillet_edges_prepared(
     solid: &BrepSolid,
     edge_points: &[Vec3],
     edge_names: Option<&[String]>,
@@ -645,10 +708,19 @@ pub fn fillet_edges_reported(
     // this runs before the subset search rather than inside it.
     let entry = if chamfer { "chamfer_edges" } else { "fillet_edges" };
     let mut selected_ids = Vec::with_capacity(edge_points.len());
+    if crate::blend::blend_operation_outermost() {
+        super::analyze::clear_rollover_only();
+    }
     let selection_checks = crate::blend::BlendTimer::start("timing.selection_checks_ms");
+    let _boundaries = super::analyze::SupportBoundaryScope::open();
     for point in edge_points {
+        let resolve = crate::blend::BlendTimer::start("timing.selection_checks.resolve_ms");
         let edge_id = resolve_edge_by_point(solid, *point)?;
+        resolve.stop();
+        let concavity = crate::blend::BlendTimer::start("timing.selection_checks.concavity_ms");
         check_mixed_concavity(solid, edge_id, entry)?;
+        concavity.stop();
+        let _extent = crate::blend::BlendTimer::start("timing.selection_checks.extent_ms");
         // A lone fillet edge may take the clipped concave fill (lane F row 5).
         if edge_points.len() == 1 && !chamfer {
             check_support_extent_clipping(solid, edge_id, radius, entry)?;
@@ -657,6 +729,7 @@ pub fn fillet_edges_reported(
         }
         selected_ids.push(edge_id);
     }
+    drop(_boundaries);
     selection_checks.stop();
     // A corner where the selection mixes convexity — a convex edge dying into
     // the concave edges it meets — has no rolling-ball closure at all: the
@@ -843,7 +916,7 @@ pub fn fillet_edges_reported(
     // rims were re-blended ahead of the same failing component in each of the
     // (up to 372) subsets tried: 13 min 25 s for one refusal, 34 s with it.
     let mut memo = ComponentMemo::default();
-    let profile = std::env::var_os("BREP_PROFILE").is_some();
+    let profile = crate::profile::profile_enabled();
     let group_started = web_time::Instant::now();
     let group = fillet_edges_group_in(
         solid,
@@ -855,7 +928,7 @@ pub fn fillet_edges_reported(
         Some(&mut memo),
     );
     if profile {
-        eprintln!(
+        profile_line!(
             "blend.selection group edges={n} ok={} ms={:.3}",
             group.is_ok(),
             group_started.elapsed().as_secs_f64() * 1e3
@@ -940,7 +1013,7 @@ pub fn fillet_edges_reported(
                 Some(&mut memo),
             );
             if profile {
-                eprintln!(
+                profile_line!(
                     "blend.selection subset dropped={dropped:?} ok={} ms={:.3}",
                     subset.is_ok(),
                     subset_started.elapsed().as_secs_f64() * 1e3
@@ -980,8 +1053,7 @@ pub fn fillet_edges_reported(
 /// reader: 98 + 144 census 0 differ); `BREP_WALLS_MISSING_NEAREST=0` (or
 /// `off`) casts the ray at every station.
 pub(crate) fn walls_missing_nearest_on() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| !matches!(std::env::var("BREP_WALLS_MISSING_NEAREST").as_deref(), Ok("0") | Ok("off")))
+    switch!("BREP_WALLS_MISSING_NEAREST", true)
 }
 
 
@@ -1154,7 +1226,8 @@ pub(super) fn walls_missing_ties(
         // a carrier within ten bands) nor by its ray pass (a hit within ten
         // bands), so it is not asked. Anything the certificate declines is
         // classified as before.
-        let certified = station_clear_of_skin(result, station, band * 10.0, visible);
+        let certified = station_clear_of_skin(result, station, band * 10.0, visible)
+            || station_clear_of_trimmed_skin(result, station, band * 10.0, visible);
         let on = if certified {
             crate::blend::record_count("count.walls_missing.certified", 1);
             false
@@ -1318,6 +1391,150 @@ fn station_clear_of_skin(result: &BrepSolid, station: Vec3, on_band: f64, margin
         }
     }
     true
+}
+
+/// A tighter sufficient Not-On certificate. General carriers use subdivided
+/// positive-weight hulls. Analytic carriers retain the projector and trim
+/// band used by the nearest-face reader; an exterior foot also needs every
+/// exact boundary edge farther than the existing attribution margin.
+/// Any inconclusive read leaves the original nearest/ray query in charge.
+fn station_clear_of_trimmed_skin(result: &BrepSolid, point: Vec3, on_band: f64, margin: f64) -> bool {
+    let _timer = crate::blend::BlendTimer::start("timing.walls_missing.trimmed_bound_ms");
+    if !point.x.is_finite() || !point.y.is_finite() || !point.z.is_finite()
+        || !margin.is_finite() || !(margin > on_band && on_band > 0.0)
+    { return false; }
+    for face in result.shells.iter().flat_map(|shell| &shell.faces) {
+        let Ok(bounds) = crate::Aabb::from_surface_controls(&face.surface) else { return false; };
+        if !bounds.expanded(margin).contains(point) { continue; }
+        if face.surface.analytic().is_none() {
+            if general_carrier_clear(&face.surface, point, margin) { continue; }
+            return false;
+        }
+        // Within `margin`, these regular carriers have a unique nearest
+        // foot; every other stationary foot is farther than the margin.
+        // The sphere/torus medial sets and spindle/horn tori decline. Thus
+        // an exterior nearest foot can meet a trimmed region within the
+        // margin only by crossing a boundary edge inside that same ball.
+        match face.surface.analytic() {
+            Some(crate::AnalyticSurface::Plane { .. }) => {},
+            Some(crate::AnalyticSurface::Sphere { radius, .. }) if *radius > 4.0 * margin => {},
+            Some(crate::AnalyticSurface::Torus { major_radius, minor_radius, .. })
+                if *minor_radius > 4.0 * margin && *major_radius > *minor_radius + 4.0 * margin => {},
+            _ => return false,
+        }
+        let Ok(projection) = crate::project_point_to_surface(&face.surface, point) else { return false; };
+        if !projection.distance.is_finite() { return false; }
+        if projection.distance > margin { continue; }
+        let band = crate::classification::surface_uv_band(&face.surface, projection.u, projection.v, on_band);
+        let Ok(inside) = crate::parameter_point_in_face(face, crate::Vec2 { x: projection.u, y: projection.v }, band) else { return false; };
+        if inside != crate::PolygonClass::Outside { return false; }
+        let mut edges = 0;
+        for coedge in face.loops.iter().flat_map(|lp| &lp.coedges) {
+            let Some(edge) = result.edges.iter().find(|edge| edge.id == coedge.edge_id) else { return false; };
+            let Some(piece) = super::analyze::edge_piece(&edge.curve, edge.t0.min(edge.t1), edge.t0.max(edge.t1)) else { return false; };
+            let Ok(foot) = crate::project_point_to_curve(&piece, point) else { return false; };
+            if !foot.distance.is_finite() || foot.distance <= margin { return false; }
+            edges += 1;
+        }
+        if edges == 0 { return false; }
+    }
+    true
+}
+
+/// A sufficient clearance test for a general carrier, without finding its
+/// nearest point. Positive-weight Bezier patches lie inside their control
+/// hulls. Decompose both clamped knot vectors, then bisect only boxes still
+/// within `margin` of the query. Any unsupported net or exhausted work budget
+/// declines to the existing classifier; no approximate distance is accepted.
+fn general_carrier_clear(surface: &crate::NurbsSurface, point: Vec3, margin: f64) -> bool {
+    use crate::Vec4;
+    let rows = surface.control_points.len();
+    let columns = surface.control_points.first().map_or(0, Vec::len);
+    if rows == 0 || columns == 0 || rows.saturating_mul(columns) > 4096
+        || surface.degree_u > 16 || surface.degree_v > 16 || surface.control_points.iter().any(|row| row.len() != columns)
+        || !margin.is_finite() || margin <= 0.0
+        || !point.x.is_finite() || !point.y.is_finite() || !point.z.is_finite()
+    { return false; }
+    let mut scale = 1.0_f64;
+    for control in surface.control_points.iter().flatten() {
+        if !(control.w > 0.0) || !control.w.is_finite() { return false; }
+        let Ok(p) = control.point() else { return false; };
+        if !p.x.is_finite() || !p.y.is_finite() || !p.z.is_finite() { return false; }
+        scale = scale.max(p.x.abs()).max(p.y.abs()).max(p.z.abs());
+    }
+    // Leave a rounding cushion far below the caller's existing model margin.
+    // Unsupported scales decline rather than consume the classification band.
+    let roundoff = 256.0 * f64::EPSILON * scale * (surface.degree_u + 1) as f64 * (surface.degree_v + 1) as f64;
+    if roundoff >= margin * 0.01 { return false; }
+    let zero = Vec4 { x: 0.0, y: 0.0, z: 0.0, w: 0.0 };
+    let blend = |a: Vec4, b: Vec4, alpha: f64| a.scale(alpha).add(b.scale(1.0 - alpha));
+    let mut fibres = Vec::with_capacity(columns);
+    for column in 0..columns {
+        let controls: Vec<_> = surface.control_points.iter().map(|row| row[column]).collect();
+        let Some(spans) = crate::curve::bezier_decompose_raw(&surface.knots_u, &controls, surface.degree_u, zero, blend) else { return false; };
+        fibres.push(spans);
+    }
+    let mut budget = 256usize;
+    for u_span in 0..fibres[0].len() {
+        let mut across = Vec::with_capacity(surface.degree_u + 1);
+        for row in 0..=surface.degree_u {
+            let controls: Vec<_> = fibres.iter().map(|fibre| fibre[u_span][row]).collect();
+            let Some(spans) = crate::curve::bezier_decompose_raw(&surface.knots_v, &controls, surface.degree_v, zero, blend) else { return false; };
+            across.push(spans);
+        }
+        for v_span in 0..across[0].len() {
+            let net = across.iter().map(|row| row[v_span].clone()).collect();
+            if !bezier_box_clear(net, point, margin + roundoff, 0, &mut budget) { return false; }
+        }
+    }
+    true
+}
+
+fn bezier_box_clear(net: Vec<Vec<crate::Vec4>>, point: Vec3, margin: f64, depth: usize, budget: &mut usize) -> bool {
+    if *budget == 0 { return false; }
+    *budget -= 1;
+    let mut low = Vec3::new(f64::INFINITY, f64::INFINITY, f64::INFINITY);
+    let mut high = Vec3::new(f64::NEG_INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY);
+    for control in net.iter().flatten() {
+        if !(control.w > 0.0) || !control.w.is_finite() { return false; }
+        let Ok(p) = control.point() else { return false; };
+        if !p.x.is_finite() || !p.y.is_finite() || !p.z.is_finite() { return false; }
+        low.x = low.x.min(p.x); low.y = low.y.min(p.y); low.z = low.z.min(p.z);
+        high.x = high.x.max(p.x); high.y = high.y.max(p.y); high.z = high.z.max(p.z);
+    }
+    // One separating coordinate is enough, and avoids a rounded square root.
+    if point.x < low.x - margin || point.x > high.x + margin
+        || point.y < low.y - margin || point.y > high.y + margin
+        || point.z < low.z - margin || point.z > high.z + margin
+    { return true; }
+    if depth == 10 { return false; }
+    let rows = net.len();
+    let columns = net[0].len();
+    let mut left = net.clone();
+    let mut right = net.clone();
+    // Alternate directions: every child covers exactly half the parent's
+    // parameter rectangle; both must prove clearance.
+    if depth % 2 == 0 {
+        for column in 0..columns {
+            let mut work: Vec<_> = net.iter().map(|row| row[column]).collect();
+            for level in 1..rows {
+                for i in 0..rows - level { work[i] = work[i].scale(0.5).add(work[i + 1].scale(0.5)); }
+                left[level][column] = work[0];
+                right[rows - level - 1][column] = work[rows - level - 1];
+            }
+        }
+    } else {
+        for row in 0..rows {
+            let mut work = net[row].clone();
+            for level in 1..columns {
+                for i in 0..columns - level { work[i] = work[i].scale(0.5).add(work[i + 1].scale(0.5)); }
+                left[row][level] = work[0];
+                right[row][columns - level - 1] = work[columns - level - 1];
+            }
+        }
+    }
+    bezier_box_clear(left, point, margin, depth + 1, budget)
+        && bezier_box_clear(right, point, margin, depth + 1, budget)
 }
 
 /// The axial range `(h_low, h_high)` of a face's TRIMMED region on a
@@ -1835,7 +2052,7 @@ fn rounded_boss_composition(
 #[allow(clippy::too_many_arguments)]
 /// `BREP_BLEND_OPEN_PAD=0`/`off` is the escape hatch for [`open_pad_composition`].
 fn open_pad_on() -> bool {
-    !matches!(std::env::var("BREP_BLEND_OPEN_PAD").as_deref(), Ok("0") | Ok("off"))
+    switch!(live "BREP_BLEND_OPEN_PAD", true)
 }
 
 /// The OPEN-PAD composition (the 2026-10-17 "fillet takes way too long"
@@ -3165,6 +3382,14 @@ fn fillet_edges_group_lanes(
         }
     }
 
+    // An edge whose ball reaches its support only by rolling over a tangent
+    // neighbour (`analyze::rollover_only_refusal`): the composition's tool
+    // rides the mates' own carriers past the tangent edge and fills over air
+    // (lCount_409 at r 2: +1.096 against the quadrature's 1103.315046), so
+    // the reach refusal the unsigned check gave stands.
+    if let Some(refusal) = super::analyze::rollover_only_refusal(&selected_edge_ids) {
+        return Err(refusal);
+    }
     CUTTER_COMPOSITIONS.with(|count| count.set(count.get() + 1));
     crate::blend::record_count("count.cutter_fallback", 1);
     let _cutter = crate::blend::BlendTimer::start("timing.cutter_ms");
@@ -4724,5 +4949,6 @@ fn dump_loops_debug(label: &str, solid: &BrepSolid) {
         }
     }
 }
+
 
 

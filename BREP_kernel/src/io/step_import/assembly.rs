@@ -436,29 +436,7 @@ impl<'a> ProductScales<'a> {
 /// (`resolve_assembly`, through `transform_brep`'s orientation reversal), so the
 /// two lanes agree about what the file means.
 pub(super) fn transform_is_rigid(matrix: &Mat4) -> bool {
-    const TOLERANCE: f64 = 1e-9;
-    let column = |index: usize| [matrix[index], matrix[4 + index], matrix[8 + index]];
-    let (x, y, z) = (column(0), column(1), column(2));
-    let dot = |a: [f64; 3], b: [f64; 3]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
-    for (a, b, expected) in [
-        (x, x, 1.0),
-        (y, y, 1.0),
-        (z, z, 1.0),
-        (x, y, 0.0),
-        (x, z, 0.0),
-        (y, z, 0.0),
-    ] {
-        if (dot(a, b) - expected).abs() > TOLERANCE {
-            return false;
-        }
-    }
-    // det R, as the scalar triple product of the columns.
-    let cross = [
-        y[1] * z[2] - y[2] * z[1],
-        y[2] * z[0] - y[0] * z[2],
-        y[0] * z[1] - y[1] * z[0],
-    ];
-    (dot(x, cross) - 1.0).abs() <= TOLERANCE
+    crate::AffineTransform { elements: *matrix }.is_rigid(crate::RIGID_TOL)
 }
 
 /// The instance label of one structure edge: a mapped item's own name

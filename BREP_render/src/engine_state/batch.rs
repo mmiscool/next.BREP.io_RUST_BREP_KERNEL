@@ -152,8 +152,13 @@ fn prepare(
             .as_object()
             .ok_or_else(|| format!("features[{i}].params must be an object"))?;
         for key in object.keys() {
+            // Programmatic payloads a feature's form never shows but its
+            // builder reads: ACOMP's occurrence attributes, and IMPORT3D's
+            // `stepText` (the STEP document an import bakes in — undeclared
+            // so no form renders it, kernel `import3d::schema`).
             if params.get(key).is_none()
                 && !(super::components::is_acomp_feature_type(ty) && key == "occurrenceAttributes")
+                && !(ty == "IMPORT3D" && key == "stepText")
             {
                 return Err(format!("features[{i}].params.{key}: unknown field"));
             }
@@ -205,6 +210,7 @@ fn prepare(
                 return Err(format!("features[{i}].alias: duplicate alias {alias}"));
             }
         }
+        brep_kernel::feature_pipeline::validate_literal_feature_params(schema["type"].as_str().unwrap_or_default(), &params)?;
         features.push(json!({"type":schema["type"], "inputParams":params, "persistentData":item.get("persistent_data").or_else(|| item.get("persistentData")).cloned().unwrap_or(json!({}))}));
     }
     Ok(features)
@@ -267,6 +273,18 @@ fn plan(
     Ok((order, deps))
 }
 
+/// What [`EngineState::stage_feature_begin`] keeps until the run lands.
+#[derive(Debug, Clone)]
+pub(crate) struct StagedFeature {
+    id: String,
+    before: History,
+    metadata: crate::metadata::MetadataStore,
+    library: brep_kernel::PartsLibraryMap,
+    staged: History,
+    /// `History::edit_serial` right after the staged feature was appended.
+    edit_serial: u64,
+}
+
 fn failed(report: &Value) -> bool {
     report.get("error").is_some()
         || [
@@ -306,6 +324,121 @@ impl EngineState {
     /// and delta baseline. A transaction is one app command, so other commands
     /// cannot observe its intermediate recipes. Kernel operations are not
     /// preemptible inside a feature.
+    /// Stage ONE feature without waiting for it (an agent's `cad.*` write,
+    /// contract §5.1/§6): snapshot the recipe, metadata and parts library,
+    /// append the seeded, validated feature and hand its run to the runner,
+    /// then return. [`Self::stage_feature_poll`] finishes it on the frame the
+    /// run lands — committing it as one undo checkpoint, or restoring the
+    /// snapshot if it failed — so no frame waits for geometry. One stage at a
+    /// time per document; `item` is a batch item (`{type, params, …}`).
+    pub fn stage_feature_begin(&mut self, item: &Value) -> Result<String, String> {
+        if self.staged_feature.is_some() {
+            return Err("document_busy: a staged feature is still evaluating".into());
+        }
+        if self.run_pending() || self.queries_pending() || self.mesh_imports_pending() || self.topology_pending() {
+            return Err("wait for pending engine work before staging a feature".into());
+        }
+        if let Some(reason) = self.history.locked() {
+            return Err(format!("document is locked: {reason}"));
+        }
+        let before = self.history.clone();
+        let metadata = self.metadata.clone();
+        let library = brep_kernel::parts_library_map();
+        let mut staged = before.clone();
+        let mut aliases = BTreeMap::new();
+        let features = prepare(&self.feature_catalogue(), std::slice::from_ref(item), &mut staged, &mut aliases)?;
+        let feature = features.into_iter().next().ok_or("nothing to stage")?;
+        let id = feature["inputParams"]["id"].as_str().ok_or("the staged feature has no id")?.to_string();
+        let mut validation: Value = serde_json::from_str(&before.request_json()).map_err(|e| e.to_string())?;
+        validation["features"].as_array_mut().ok_or("document features missing")?.push(feature.clone());
+        serde_json::from_value::<HistoryRequest>(validation).map_err(|e| format!("stage validation: {e}"))?;
+        self.add_features(&[feature]);
+        // The user may keep editing while the run evaluates (the frame is
+        // not held): the serial after OUR write tells the finish whether
+        // anything else wrote the recipe meanwhile.
+        let edit_serial = self.history.edit_serial();
+        // Until it lands, the user's own edits to this document are refused
+        // (and said), not interleaved with the agent's.
+        self.history.set_busy(Some("an agent's change to this document is still evaluating".into()));
+        self.staged_feature = Some(StagedFeature { id: id.clone(), before, metadata, library, staged, edit_serial });
+        Ok(id)
+    }
+
+    /// Whether a feature is staged and its run has not been finished yet.
+    pub fn stage_feature_pending(&self) -> bool {
+        self.staged_feature.is_some()
+    }
+
+    /// Finish a staged feature once its run has landed: `None` while it is
+    /// still evaluating, else its row `{id, committed, status,
+    /// generatedSolids, error}`.
+    pub fn stage_feature_poll(&mut self) -> Option<Result<Value, String>> {
+        if self.staged_feature.is_none() || self.run_pending() {
+            return None;
+        }
+        let st = self.staged_feature.take()?;
+        self.history.set_busy(None);
+        // Say any refused user edit now: a restore below replaces the history
+        // that counted it.
+        if self.history.busy_refused() > self.busy_refused_seen {
+            self.push_notice("Not applied: an agent's change to this document was still evaluating. Try again.");
+        }
+        let report: Value = serde_json::from_str(&self.history_report_json()).unwrap_or(Value::Null);
+        let id = st.id.clone();
+        let names: Vec<String> = serde_json::from_value(report["featureOutputs"][&id].clone()).unwrap_or_default();
+        let errors: Vec<String> = report["featureErrors"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .filter(|e| e.starts_with(&format!("{id}:")))
+            .map(|e| e.chars().take(240).collect())
+            .collect();
+        let evaluated = report["featureTimings"].get(&id).is_some();
+        let failed = !errors.is_empty() || report["featureFulfilment"].get(&id).is_some() || report.get("error").is_some() || !evaluated;
+        // Did a user edit the recipe while it evaluated?
+        let interleaved = self.history.edit_serial() != st.edit_serial;
+        if failed && interleaved {
+            // Restoring the snapshot would throw the user's edit away: remove
+            // only the staged feature, and keep everything else as it is now.
+            if let Some(index) = self.history.index_of(&id) {
+                self.history.remove_feature(index);
+            }
+            self.rerun_history();
+            let why = if errors.is_empty() { "the feature did not evaluate".to_string() } else { errors.join("; ") };
+            self.busy_refused_seen = self.history.busy_refused();
+            return Some(Ok(json!({ "id": id, "committed": false, "status": "failed", "generatedSolids": [], "error": why, "rolledBack": true, "interleavedEdit": true })));
+        }
+        if failed {
+            // Restore the snapshot exactly; the display re-runs on its own.
+            self.history = st.before;
+            self.metadata = st.metadata;
+            brep_kernel::install_parts_library(&Default::default());
+            brep_kernel::install_parts_library(&st.library);
+            self.rerun_history();
+            let why = if errors.is_empty() { "the feature did not evaluate".to_string() } else { errors.join("; ") };
+            self.busy_refused_seen = self.history.busy_refused();
+            return Some(Ok(json!({ "id": id, "committed": false, "status": "failed", "generatedSolids": [], "error": why, "rolledBack": true })));
+        }
+        if interleaved {
+            // The user's own edits sit on the undo stack beside ours: leave the
+            // stack as it is rather than fold them into the agent's step.
+            self.history.retain_feature_allocations(&st.staged);
+            self.busy_refused_seen = self.history.busy_refused();
+            return Some(Ok(json!({ "id": id, "committed": true, "status": "evaluated", "generatedSolids": names, "rolledBack": false, "interleavedEdit": true })));
+        }
+        // One undo checkpoint for the staged write, as a batch commits.
+        let final_document = self.history.request_json();
+        self.history = st.before;
+        if let Err(e) = self.history.adopt_document_checkpointed(&final_document) {
+            return Some(Err(e));
+        }
+        self.history.retain_feature_allocations(&st.staged);
+        self.history.set_rollback(self.history.len().saturating_sub(1));
+        self.busy_refused_seen = self.history.busy_refused();
+        Some(Ok(json!({ "id": id, "committed": true, "status": "evaluated", "generatedSolids": names, "rolledBack": false })))
+    }
+
     fn finish_batch_run(&mut self) {
         while self.run_pending() {
             self.pump();

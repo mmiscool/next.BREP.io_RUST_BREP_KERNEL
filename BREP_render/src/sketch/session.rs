@@ -20,10 +20,9 @@ pub struct SketchSession {
 
     // --- interaction state ---------------------------------------------------
     /// Selected entities — a set of entity refs
-    /// (`{"kind":"point"|"geometry","id":<id>}`; see [`point_ref`]/[`geometry_ref`]).
-    pub selection: Vec<Value>,
-    /// The entity ref currently under the cursor, or `None`.
-    pub hovered: Option<Value>,
+    /// (`{"kind":"point"|"geometry","id":<id>}`; see [`point_ref`]/[`geometry_ref`])
+    /// — and the one under the cursor.
+    pub selection: RefSelection,
     /// The active drawing tool.
     pub tool: Option<String>,
     /// Persisted dimension label offsets.
@@ -40,6 +39,38 @@ pub struct SketchSession {
     pub solver_settings: solve::SketchSolverSettings,
 }
 
+/// A sketch session's selection set and hover — ONE implementation for the
+/// planar session and the 3D one ([`crate::sketch3d::Sketch3dSession`]):
+/// entity refs, matched through [`refs_equal`].
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RefSelection {
+    /// The selected entity refs, in selection order.
+    pub items: Vec<Value>,
+    /// The entity ref under the cursor, or `None`.
+    pub hovered: Option<Value>,
+}
+
+impl RefSelection {
+    /// Whether `entity_ref` is selected (matched via [`refs_equal`]).
+    pub fn is_selected(&self, entity_ref: &Value) -> bool {
+        self.items.iter().any(|r| refs_equal(r, entity_ref))
+    }
+
+    /// Remove `entity_ref` if selected, else add it.
+    pub fn toggle(&mut self, entity_ref: Value) {
+        if let Some(pos) = self.items.iter().position(|r| refs_equal(r, &entity_ref)) {
+            self.items.remove(pos);
+        } else {
+            self.items.push(entity_ref);
+        }
+    }
+
+    /// Select nothing (the hover is left alone).
+    pub fn clear(&mut self) {
+        self.items.clear();
+    }
+}
+
 impl SketchSession {
     /// Build a session from a (possibly unsolved) doc + plane, solving it once.
     pub fn new(doc: SketchDoc, plane: PlaneFrame) -> Result<Self, String> {
@@ -48,8 +79,7 @@ impl SketchSession {
             doc: solved,
             plane,
             diagnostics,
-            selection: Vec::new(),
-            hovered: None,
+            selection: RefSelection::default(),
             tool: None,
             dim_offsets: serde_json::Map::new(),
             colors: SketchColors::default(),
@@ -98,8 +128,8 @@ impl SketchSession {
             &self.plane,
             world_per_pixel,
             &self.colors,
-            self.hovered.as_ref(),
-            &self.selection,
+            self.selection.hovered.as_ref(),
+            &self.selection.items,
         )
     }
 
@@ -129,8 +159,8 @@ impl SketchSession {
             &self.dim_offsets,
             world_per_pixel,
             &self.colors,
-            self.hovered.as_ref(),
-            &self.selection,
+            self.selection.hovered.as_ref(),
+            &self.selection.items,
         )
     }
 
@@ -160,8 +190,8 @@ impl SketchSession {
             &self.plane,
             world_per_pixel,
             &self.colors,
-            self.hovered.as_ref(),
-            &self.selection,
+            self.selection.hovered.as_ref(),
+            &self.selection.items,
         )
     }
 
@@ -211,26 +241,22 @@ impl SketchSession {
 
     /// Whether `entity_ref` is in the selection set (matched via [`refs_equal`]).
     pub fn is_selected(&self, entity_ref: &Value) -> bool {
-        self.selection.iter().any(|r| refs_equal(r, entity_ref))
+        self.selection.is_selected(entity_ref)
     }
 
     /// Toggle `entity_ref` in the selection set: remove it if present, else add it.
     pub fn toggle_selection(&mut self, entity_ref: Value) {
-        if let Some(pos) = self.selection.iter().position(|r| refs_equal(r, &entity_ref)) {
-            self.selection.remove(pos);
-        } else {
-            self.selection.push(entity_ref);
-        }
+        self.selection.toggle(entity_ref)
     }
 
     /// Clear the selection set.
     pub fn clear_selection(&mut self) {
-        self.selection.clear();
+        self.selection.clear()
     }
 
     /// Set (or clear) the hovered entity ref.
     pub fn set_hover(&mut self, entity_ref: Option<Value>) {
-        self.hovered = entity_ref;
+        self.selection.hovered = entity_ref;
     }
 
     // --- S2 hit-testing ------------------------------------------------------
@@ -270,7 +296,21 @@ impl SketchSession {
                 best_geo = Some((dmin, &g.id));
             }
         }
-        best_geo.map(|(_, id)| geometry_ref(id))
+        if let Some((_, id)) = best_geo { return Some(geometry_ref(id)); }
+        // Glyph outlines pick their owning object, never a glyph handle/segment.
+        if !self.doc.geometries.iter().any(|g| g.geom_type == "text") { return None; }
+        let expanded = super::text::expanded(&self.doc).ok()?;
+        let mut best: Option<(f64, Value)> = None;
+        for g in expanded.geometries.iter().filter(|g| g.extra.contains_key("textOwner")) {
+            let poly = tessellate::geometry_polyline_uv(g, &expanded);
+            for seg in poly.windows(2) {
+                let distance = point_segment_distance((u,v),seg[0].into(),seg[1].into()).0;
+                if distance <= radius && best.as_ref().is_none_or(|(d,_)| distance < *d) {
+                    best = Some((distance, geometry_ref(&g.extra["textOwner"])));
+                }
+            }
+        }
+        best.map(|(_, id)|id)
     }
 
     /// The CONSTRAINT nearest to `(u, v)` within `radius` — a `constraint` entity ref
@@ -344,8 +384,9 @@ impl SketchSession {
     /// The point-set to DRAG for a hovered entity ref (`{"kind","id"}`) — the grab
     /// path grabs exactly what's highlighted rather than re-picking at egui's
     /// offset drag-start position. A `"point"` ref → that point iff it is MOVABLE;
-    /// a `"geometry"` ref → ALL of its (deduped) points when at least one is movable
-    /// (a rigid translate). Each entry is `(id, orig_x, orig_y, orig_fixed)`. `None`
+    /// a `"geometry"` ref → its movable (deduped) points. Free geometry
+    /// translates rigidly; locked endpoints stay anchored during the solve.
+    /// Each entry is `(id, orig_x, orig_y, orig_fixed)`. `None`
     /// for a locked point, a fully-locked geometry, or a stale/unknown ref (the
     /// caller then falls through to a camera gesture — it never drags something the
     /// user is not pointing at).
@@ -368,7 +409,6 @@ impl SketchSession {
                     .iter()
                     .find(|g| id_key(&g.id) == id_key(id))?;
                 let mut out: Vec<(Value, f64, f64, bool)> = Vec::new();
-                let mut any_movable = false;
                 for pid in &g.points {
                     // A closed polyline repeats its start id — dedupe so a point is
                     // pinned once.
@@ -376,11 +416,15 @@ impl SketchSession {
                         continue;
                     }
                     if let Some(p) = self.doc.point(pid) {
-                        any_movable |= self.diagnostics.point_movable(&p.id).unwrap_or(!p.fixed);
-                        out.push((p.id.clone(), p.x, p.y, p.fixed));
+                        // Ground constraints anchor the coordinates supplied to the
+                        // solver. Moving a locked endpoint here would re-ground it
+                        // at the drag target (including the sketch origin).
+                        if self.diagnostics.point_movable(&p.id).unwrap_or(!p.fixed) {
+                            out.push((p.id.clone(), p.x, p.y, p.fixed));
+                        }
                     }
                 }
-                (any_movable && !out.is_empty()).then_some(out)
+                (!out.is_empty()).then_some(out)
             }
             _ => None,
         }

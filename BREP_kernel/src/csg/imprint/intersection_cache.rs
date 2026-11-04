@@ -58,7 +58,7 @@ pub(super) fn intersect(
     curve: &NurbsCurve, surface: &NurbsSurface, tolerance: f64,
 ) -> Result<Vec<CurveSurfaceIntersection>, String> {
     if CACHES.with(|stack| stack.borrow().is_empty()) {
-        return crate::intersect_curve_surface(curve, surface, tolerance);
+        return solve(curve, surface, tolerance);
     }
     let key = key(curve, surface, tolerance);
     let hit = CACHES.with(|stack| {
@@ -70,10 +70,69 @@ pub(super) fn intersect(
         hit
     });
     if let Some(result) = hit { return Ok(result); }
-    let result = crate::intersect_curve_surface(curve, surface, tolerance)?;
+    let result = solve(curve, surface, tolerance)?;
     CACHES.with(|stack| {
         stack.borrow_mut().last_mut().unwrap().results.insert(key, result.clone());
     });
     Ok(result)
 }
+
+/// Lane O row 15 (2026-10-28), default on since batch 7 (`BREP_IMPRINT_EXACT_PIERCE=0`
+/// restores the general search; held back from batch 4 until row 26 made
+/// `offset_subtract_fixture`'s joint decision immune to last-bit pierce noise): an edge that
+/// is a straight segment against an analytic carrier takes the closed-form
+/// roots of `exact_line_surface` as its Newton seeds (the point classifier's
+/// exact ray lane, lane B row 1), instead of the general search's 32 sampled
+/// starts. The Newton, gap filter, duplicate guard and tangency reading are
+/// the general search's own; the lane declines (the general search answers)
+/// for a curved edge, an unrecognised carrier, a grazing or parallel segment.
+fn solve(curve: &NurbsCurve, surface: &NurbsSurface, tolerance: f64) -> Result<Vec<CurveSurfaceIntersection>, String> {
+    let result = solve_pierces(curve, surface, tolerance);
+    result
+}
+
+fn solve_pierces(curve: &NurbsCurve, surface: &NurbsSurface, tolerance: f64) -> Result<Vec<CurveSurfaceIntersection>, String> {
+    if exact_pierce_enabled() {
+        if let Some(seeds) = crate::exact_line_surface::exact_line_surface_seeds(curve, surface, tolerance) {
+            return crate::curve_surface_intersection::intersect_curve_surface_from_seeds(curve, surface, tolerance, seeds);
+        }
+    }
+    if plane_pierce_enabled() {
+        if let Some(seeds) = crate::exact_line_surface::exact_curve_plane_seeds(curve, surface, tolerance) {
+            return crate::curve_surface_intersection::intersect_curve_surface_from_seeds(curve, surface, tolerance, seeds);
+        }
+    }
+    if quadric_pierce_enabled() {
+        if let Some(seeds) = crate::exact_line_surface::exact_curve_quadric_seeds(curve, surface, tolerance) {
+            return crate::curve_surface_intersection::intersect_curve_surface_from_seeds(curve, surface, tolerance, seeds);
+        }
+    }
+    crate::intersect_curve_surface(curve, surface, tolerance)
+}
+
+/// Lane O row 27 (2026-10-30), default on since batch 8 (`BREP_IMPRINT_QUADRIC_PIERCE=0`
+/// restores the general search): an edge of degree two, a fillet's rational arc included, against a
+/// sphere, cylinder or cone carrier is seeded at the closed-form roots of the
+/// quadric's equation along it (`exact_curve_quadric_seeds`); same Newton and
+/// filters as rows 15 and 16. An arc that misses the carrier seeds nothing.
+pub(super) fn quadric_pierce_enabled() -> bool {
+    switch!("BREP_IMPRINT_QUADRIC_PIERCE", true)
+}
+
+
+/// Lane O row 16 (2026-10-28), default on since batch 7 (`BREP_IMPRINT_PLANE_PIERCE=0`
+/// restores the general search; held back with row 15 until row 26): any edge of
+/// degree at most three against an affine plane carrier is seeded at the
+/// closed-form roots of its weighted signed distance (`exact_curve_plane_seeds`),
+/// a fillet's rational arc included; same Newton and filters as row 15.
+pub(super) fn plane_pierce_enabled() -> bool {
+    switch!("BREP_IMPRINT_PLANE_PIERCE", true)
+}
+
+
+pub(super) fn exact_pierce_enabled() -> bool {
+    switch!("BREP_IMPRINT_EXACT_PIERCE", true)
+}
+
+
 

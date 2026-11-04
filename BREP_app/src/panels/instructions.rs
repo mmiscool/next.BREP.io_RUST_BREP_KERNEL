@@ -48,6 +48,28 @@ const ARROW_SIDES: [(&str, [f64; 3]); 6] = [
 /// The default distance an insertion arrow starts from, in model units.
 const ARROW_DISTANCE: f64 = 30.0;
 
+/// In a wrapped row, start a new line before a `label` + control pair that
+/// would not fit whole. egui wraps one widget at a time, and a ComboBox lays
+/// itself out in a child `Ui` that never wraps, so a pair that began near the
+/// end of a line put its combo past the pane edge ("Orientation: Portrai" at
+/// the 1280 dock door split — ui-polish-2026-10-28 row 1). Only breaks a line
+/// that already holds something: a pair wider than the whole pane still draws.
+fn keep_pair_together(ui: &mut egui::Ui, label: &str, control_w: f32) {
+    let font = egui::TextStyle::Body.resolve(ui.style());
+    let label_w = ui.ctx().fonts_mut(|f| f.layout_no_wrap(label.to_owned(), font, egui::Color32::PLACEHOLDER).size().x);
+    let needed = label_w + ui.spacing().item_spacing.x + control_w + 2.0 * ui.spacing().button_padding.x;
+    // `available_width` is the WHOLE row in a wrapping layout; what is left of
+    // this line is `available_rect_before_wrap` — capped at the clip, because a
+    // child that once overflowed has widened the `Ui`'s max_rect for good
+    // (egui expands it to include every child), and the pane's edge is what
+    // the user sees.
+    let edge = ui.max_rect().right().min(ui.clip_rect().right());
+    let remaining = (edge - ui.cursor().left()).max(0.0);
+    if needed > remaining && ui.cursor().left() > ui.max_rect().left() + 0.5 {
+        ui.end_row();
+    }
+}
+
 #[derive(Default)]
 pub struct InstructionsPanel {
     /// The assembly's studies with a published motion, read each frame
@@ -331,16 +353,19 @@ impl InstructionsPanel {
         ui.horizontal_wrapped(|ui| {
             ui.label("Print");
             let mut probe: HashMap<String, egui::Rect> = HashMap::new();
+            keep_pair_together(ui, "Steps a page:", 56.0);
             ui.label("Steps a page:");
             let mut per_page = template.steps_per_page;
             if crate::form::enum_dropdown(ui, "instructions:print:per_page", &per_page_choices, &mut per_page, Some(56.0), Some(&mut probe)).0 {
                 *change = Some(Change::Print(Box::new(move |block| block.template.steps_per_page = per_page)));
             }
+            keep_pair_together(ui, "Orientation:", 100.0);
             ui.label("Orientation:");
             let mut orientation = template.orientation;
             if crate::form::enum_dropdown(ui, "instructions:print:orientation", &orientation_choices, &mut orientation, Some(100.0), Some(&mut probe)).0 {
                 *change = Some(Change::Print(Box::new(move |block| block.template.orientation = orientation)));
             }
+            keep_pair_together(ui, "Paper:", 84.0);
             ui.label("Paper:");
             let mut paper = template.paper.clone();
             if crate::form::enum_dropdown(ui, "instructions:print:paper", &paper_choices, &mut paper, Some(84.0), Some(&mut probe)).0 {
@@ -767,15 +792,19 @@ impl InstructionsPanel {
                 ui.label(format!("Arrow {}", index + 1));
                 let side = ARROW_SIDES.iter().position(|(_, d)| same_direction(*d, arrow.direction));
                 let mut picked = side;
-                let combo = egui::ComboBox::from_id_salt(("instructions-arrow", index))
-                    .selected_text(side.map_or("custom", |i| ARROW_SIDES[i].0))
-                    .show_ui(ui, |ui| {
-                        for (i, (label, _)) in ARROW_SIDES.iter().enumerate() {
-                            let option = ui.selectable_value(&mut picked, Some(i), *label);
-                            self.hit(format!("instructions:menuitem:arrow:{index}:{i}"), option.rect);
-                        }
-                    });
-                self.hit(format!("instructions:arrow:{index}:side"), combo.response.rect);
+                // The six sides by index; a direction none of them matches
+                // (set through automation) shows as "custom", listed only then.
+                const SIDE_IDS: [&str; 6] = ["0", "1", "2", "3", "4", "5"];
+                let mut choices: Vec<(Option<usize>, &str, &str)> =
+                    ARROW_SIDES.iter().enumerate().map(|(i, (label, _))| (Some(i), SIDE_IDS[i], *label)).collect();
+                if side.is_none() {
+                    choices.push((None, "custom", "custom"));
+                }
+                let mut rects = HashMap::new();
+                crate::form::enum_dropdown(ui, &format!("instructions:arrow:{index}:side"), &choices, &mut picked, None, Some(&mut rects));
+                for (key, rect) in rects {
+                    self.hit(key, rect);
+                }
                 if picked != side {
                     if let Some(i) = picked {
                         let direction = ARROW_SIDES[i].1;
@@ -845,7 +874,17 @@ impl InstructionsPanel {
                 None => "None".to_string(),
             };
             let mut picked: Option<String> = None;
-            let combo = egui::ComboBox::from_id_salt("instructions-motion").selected_text(label).show_ui(ui, |ui| {
+            // As wide as the pane leaves (a remove button may follow), so the
+            // long "None published: …" reading truncates inside the pane
+            // instead of running off it (ui-polish-2026-10-28 row 1).
+            // Measured to the clip (a child that once overflowed widens the
+            // Ui's max_rect for good), and TRUNCATED: in a horizontal row a
+            // ComboBox inherits `Extend`, so without it the button grew to its
+            // 60-character reading (534 pt in a 383-pt pane) whatever width
+            // it was given.
+            let edge = ui.max_rect().right().min(ui.clip_rect().right());
+            let width = (edge - ui.cursor().left() - 36.0).clamp(120.0, 480.0);
+            let combo = egui::ComboBox::from_id_salt("instructions-motion").width(width).truncate().selected_text(label).show_ui(ui, |ui| {
                 for (index, motion) in self.published.iter().enumerate() {
                     let text = if motion.current { format!("{} ({} frames)", motion.name, motion.frames) } else { format!("{} (published before the assembly changed)", motion.name) };
                     let option = ui.add_enabled(motion.current, egui::Button::selectable(attached.as_deref() == Some(motion.study.as_str()), text));
@@ -1053,8 +1092,8 @@ pub static HIT_KEYS: &[HitKeyDoc] = &[
     HitKeyDoc { panel: "instructions", prefix: "instructions:add:", meaning: "a part of the selected step (by index) and its Unplan, To previous step, To next step and Split out buttons", command: Some("instructions_move_add") },
     HitKeyDoc { panel: "instructions", prefix: "instructions:tool:", meaning: "the selected step's tools (remove by index) and the Tool, Spec and Add tool fields", command: Some("instructions_update_step") },
     HitKeyDoc { panel: "instructions", prefix: "instructions:callout:", meaning: "the selected step's callouts (text and remove by index, and the part it points at: `<index>:occurrence` with `#activate` to pick a solid in the viewport, `#line0` the stored part and `#x0` to clear it) and the + Caution, + Note and + Check buttons", command: Some("instructions_update_step") },
-    HitKeyDoc { panel: "instructions", prefix: "instructions:arrow:", meaning: "the selected step's insertion arrows (side, distance and remove by index, and the part it moves: `<index>:occurrence` with `#activate` to pick one of the step's own solids in the viewport, `#line0` the part and `#x0` to remove the arrow) and + Arrow", command: Some("instructions_update_step") },
-    HitKeyDoc { panel: "instructions", prefix: "instructions:menuitem:arrow:", meaning: "an insertion arrow's side menu entries (arrow index, side index)", command: Some("instructions_update_step") },
+    HitKeyDoc { panel: "instructions", prefix: "instructions:arrow:", meaning: "the selected step's insertion arrows (side, distance and remove by index — `<index>:side` is a dropdown whose entries are `<index>:side#<side index>` while open — and the part it moves: `<index>:occurrence` with `#activate` to pick one of the step's own solids in the viewport, `#line0` the part and `#x0` to remove the arrow) and + Arrow", command: Some("instructions_update_step") },
     HitKeyDoc { panel: "instructions", prefix: "instructions:motion:", meaning: "the selected step's Motion row: the study menu (:study; a published study of the assembly plays in place of the insertion arrows) and remove (:remove)", command: Some("instructions_attach_motion") },
     HitKeyDoc { panel: "instructions", prefix: "instructions:menuitem:motion:", meaning: "the Motion menu's entries, by published study index (a stale one is greyed)", command: Some("instructions_attach_motion") },
 ];
+

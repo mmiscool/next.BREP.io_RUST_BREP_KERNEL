@@ -2,10 +2,17 @@
 //! expressions, and the run report. Every mutation returns at once with the
 //! engine's report; the host applies the idle contract (§6) before answering
 //! the tool call.
-use crate::automation::command::{parse_args, schema_of, Annotations, CommandSpec, Ctx, Empty, Handler, NoArgs, Outcome, Phase};
+use crate::automation::command::{app_command, parse_args, schema_of, CommandSpec, Ctx, NoArgs, Outcome};
 use crate::automation::cmd_document::parse;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StageArgs {
+    /// One batch item `{type, params, id?, persistent_data?}`, seeded and validated as `feature_add_many` seeds its items.
+    pub item: Value,
+}
 
 #[derive(Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -81,6 +88,17 @@ pub struct RollArgs {
 
 #[derive(Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
+pub struct GroupEndArgs {
+    /// The token `history_group_begin` answered.
+    pub token: u64,
+    /// Restore the document as it was when the group opened (the group's
+    /// edits are taken back and leave no undo step).
+    #[serde(default)]
+    pub rollback: bool,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct NextIdArgs {
     /// The id base, normally the feature's shortName (`E` → `E7`).
     pub base: String,
@@ -110,7 +128,172 @@ pub struct Report {
     pub history_len: usize,
 }
 
+/// Native batch replies have a legacy report, a preflight rejection, or an
+/// evaluated transaction. Keep this union at the root so MCP wrappers can
+/// extend the legacy branch without relocating local schema references.
+fn feature_add_many_result_schema() -> Value {
+    // OPEN objects (no `additionalProperties: false`), unlike `schema_dsl`.
+    fn open_object(properties: Value, required: &[&str]) -> Value {
+        json!({"type":"object","properties":properties,"required":required})
+    }
+    let strings = json!({"type":"array","items":{"type":"string"}});
+    let indices = json!({"type":"array","items":{"type":"integer","minimum":0}});
+    let string_map = json!({"type":"object","additionalProperties":{"type":"string"}});
+    let outputs = json!({"type":"object","additionalProperties":strings});
+    let mut legacy = schema_of::<Report>();
+    let mut defs = legacy.as_object_mut().unwrap().remove("$defs").unwrap_or(json!({}));
+    legacy.as_object_mut().unwrap().remove("$schema");
+    // Rejected input is echoed before native validation: alias/id need not
+    // have their successful string types (and missing values become null).
+    let identity = json!({
+        "position":{"type":"integer","minimum":0},"alias":{},"id":{},
+        "status":{"enum":["evaluated","failed","not_evaluated"]},"committed":{"type":"boolean"}
+    });
+    let mut item = identity.clone();
+    item.as_object_mut().unwrap().extend(json!({
+        "dependencies":indices,"dependencyFailures":indices,
+        "dependencyFailure":open_object(json!({"part":{"type":"string"}}), &["part"]),
+        "error":{"anyOf":[strings,open_object(json!({"category":{"type":"string"},"message":{"type":"string"},"path":{"type":"string"}}), &["category","message","path"])]},
+        "generatedSolids":strings,
+        "generatedReferences":{"type":"array","items":open_object(json!({"solid":{"type":"string"},"faces":strings,"edges":strings}), &["solid","faces","edges"])},
+        "diagnostic":open_object(json!({
+            "operation":{"type":"string"},"owningComponent":{"type":["string","null"]},
+            "operands":{"type":"object"},"affectedTopology":{},
+            "category":{"type":["string","null"]},"kernelClass":{},"detailId":{"type":"string"}
+        }), &["operation","owningComponent","operands","affectedTopology","category","kernelClass","detailId"])
+    }).as_object().unwrap().clone());
+    defs["BatchFeatureResult"] = open_object(item, &["position","alias","id","status","committed"]);
+    let items = json!({"type":"array","items":{"$ref":"#/$defs/BatchFeatureResult"}});
+    let mut part = identity.clone();
+    part["items"] = items.clone();
+    part["outputs"] = outputs.clone();
+    let parts = json!({"type":"array","items":open_object(part, &["position","alias","id","status","committed"])});
+    let mut constraint = identity.clone();
+    constraint["error"] = json!({"type":["string","null"]});
+    // Assembly diagnostics are engine/plugin report values, not a fixed DTO.
+    constraint["diagnostics"] = json!({"type":["object","null"]});
+    constraint["dependencyFailures"] = indices;
+    let constraints = json!({"type":"array","items":open_object(constraint, &["position","alias","id","status","committed","error","diagnostics","dependencyFailures"])});
+    let transaction = open_object(json!({
+        "validationAtomic":{"const":true},"geometryAtomic":{"type":"boolean"},
+        "idCountersRolledBack":{"type":"boolean"},"runtimeGenerationRolledBack":{"const":false}
+    }), &["validationAtomic","geometryAtomic","idCountersRolledBack","runtimeGenerationRolledBack"]);
+    let common = json!({
+        "success":{"type":"boolean"},"items":items,"partResults":parts,"constraintResults":constraints,
+        "aliases":string_map,"partAliases":{"type":"object","additionalProperties":string_map},"diagnosticsTool":{"const":"geometry_diagnostics"},
+        "rolledBack":{"type":"boolean"},"transaction":transaction
+    });
+    let required = ["success","items","partResults","constraintResults","aliases","partAliases","diagnosticsTool","rolledBack","transaction"];
+    let mut normal = common.clone();
+    normal["outputs"] = outputs;
+    normal["constraintStatuses"] = json!({"type":"array","items":{"type":"object"}});
+    normal["dof"] = json!({"type":["object","null"]});
+    let mut normal_required = required.to_vec();
+    normal_required.extend(["outputs","constraintStatuses","dof"]);
+    let mut failed_part = common;
+    failed_part["success"] = json!({"const":false});
+    failed_part["rolledBack"] = json!({"const":true});
+    let mut rejected_item = identity;
+    rejected_item["status"] = json!({"enum":["failed","not_evaluated"]});
+    rejected_item["committed"] = json!({"const":false});
+    let rejection = open_object(json!({
+        "success":{"const":false},"status":{"const":"rejected"},"modelChanged":{"const":false},
+        "errors":{"type":"array","items":open_object(json!({"path":{"type":"string"},"message":{"type":"string"}}), &["path","message"])},
+        "items":{"type":"array","items":open_object(rejected_item, &["position","alias","id","status","committed"])}
+    }), &["success","status","modelChanged","errors","items"]);
+    let mut early_failure = open_object(failed_part, &required);
+    // The early failed-part return omits these fields. Without this guard a
+    // malformed rolled-back normal result could match the weaker branch.
+    early_failure["not"] = json!({"anyOf":[
+        {"required":["outputs"]},{"required":["constraintStatuses"]},{"required":["dof"]}
+    ]});
+    json!({"type":"object","anyOf":[legacy,rejection,open_object(normal,&normal_required),early_failure],"$defs":defs})
+}
+
+// Stable history envelopes; document-authored JSON and native reports remain
+// extensible. Keep these factories together for batched contract validation.
+fn history_object(properties: Value) -> Value {
+    let required: Vec<String> = properties.as_object().unwrap().keys().cloned().collect();
+    json!({"type":"object","properties":properties,"required":required})
+}
+
+fn history_listing_result_schema() -> Value {
+    let feature = history_object(json!({
+        "index":{"type":"integer","minimum":0},"type":{"type":"string"},"id":{"type":"string"}
+    }));
+    history_object(json!({
+        "listing":history_object(json!({"step":{"type":"integer","minimum":0},"features":{"type":"array","items":feature}})),
+        "report":{},"step":{"type":"integer","minimum":0},
+        "model":history_object(json!({
+            "step":{"type":"integer","minimum":0},"solidCount":{"type":"integer","minimum":0},"totalTris":{"type":"integer","minimum":0},
+            "solids":{"type":"array","items":history_object(json!({
+                "name":{"type":"string"},"tris":{"type":"integer","minimum":0},
+                "min":{"type":"array","items":{"type":"number"},"minItems":3,"maxItems":3},
+                "max":{"type":"array","items":{"type":"number"},"minItems":3,"maxItems":3}
+            }))}
+        })),"idle":{"type":"boolean"},
+        "selectedFeature":{"type":["string","null"]},"can_undo":{"type":"boolean"},"can_redo":{"type":"boolean"}
+    }))
+}
+
+fn feature_params_result_schema() -> Value {
+    history_object(json!({
+        "id":{"type":"string"},"index":{"type":"integer","minimum":0},
+        "type":{"type":["string","null"]},"inputParams":{},"persistentData":{}
+    }))
+}
+
+fn feature_stage_result_schema() -> Value {
+    history_object(json!({"id":{"type":"string"},"staged":{"const":true}}))
+}
+
+fn feature_stage_poll_result_schema() -> Value {
+    let mut success = history_object(json!({
+        "id":{"type":"string"},"committed":{"const":true},"status":{"const":"evaluated"},
+        "generatedSolids":{"type":"array","items":{"type":"string"}},"rolledBack":{"const":false}
+    }));
+    success["properties"]["interleavedEdit"] = json!({"const":true});
+    let mut failure = history_object(json!({
+        "id":{"type":"string"},"committed":{"const":false},"status":{"const":"failed"},
+        "generatedSolids":{"type":"array","items":{"type":"string"},"maxItems":0},
+        "error":{"type":"string"},"rolledBack":{"const":true}
+    }));
+    failure["properties"]["interleavedEdit"] = json!({"const":true});
+    json!({"type":"object","anyOf":[
+        history_object(json!({"pending":{"const":true}})),success,failure
+    ]})
+}
+
+fn run_cancel_result_schema() -> Value {
+    history_object(json!({"cancelled":{"type":"boolean"}}))
+}
+fn history_group_begin_result_schema() -> Value {
+    history_object(json!({"token":{"type":"integer","minimum":0}}))
+}
+fn history_group_end_result_schema() -> Value {
+    history_object(json!({"rolledBack":{"type":"boolean"}}))
+}
+fn next_feature_id_result_schema() -> Value {
+    history_object(json!({"id":{"type":"string"}}))
+}
+fn expressions_get_result_schema() -> Value {
+    // parse() returns decoded JSON when source happens to be JSON, otherwise
+    // its original string. Configurator is copied from the authored document.
+    history_object(json!({"expressions":{},"configurator":{},
+        "variables":{"type":"array","items":history_object(json!({"name":{"type":"string"},"expr":{"type":"string"}}))}
+    }))
+}
+
 fn report(ctx: &Ctx<'_>, report: &str) -> Result<Outcome, String> {
+    if let Some(error) = parse(report).get("error").and_then(Value::as_str) {
+        // A refusal returned instead of the engine's stored evaluation report
+        // must not be replaced by a stale success during settling. Rebuild
+        // failures retain report.error (undo may already have applied).
+        let current = parse(&ctx.app.docs.engine().history_report_json());
+        if error.starts_with("invalid_arguments:") || current.get("error").and_then(Value::as_str) != Some(error) {
+            return Err(error.to_string());
+        }
+    }
     let engine = ctx.app.docs.engine();
     serde_json::to_value(Report { report: parse(report), step: engine.history_rollback(), history_len: engine.history_len() })
         .map(Outcome::Done)
@@ -133,6 +316,29 @@ fn feature_add(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
         v["id"] = json!(id);
     }
     Ok(out)
+}
+
+/// Stage one feature and return at once (`{id, staged: true}`): its run goes
+/// to the runner, and [`feature_stage_result`] finishes it — committed as one
+/// undo checkpoint, or restored exactly — on a later call. No frame waits for
+/// the geometry, and no host request is held open while it evaluates.
+fn feature_stage(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
+    let a: StageArgs = parse_args(args)?;
+    let id = ctx.app.docs.engine_mut().stage_feature_begin(&a.item)?;
+    Ok(Outcome::Done(json!({ "id": id, "staged": true })))
+}
+
+/// The staged feature's outcome: `{pending: true}` while its run is in
+/// flight, then its row `{id, committed, status, generatedSolids, error?,
+/// rolledBack}` (once; the stage is then over).
+fn feature_stage_result(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
+    let _: NoArgs = parse_args(args)?;
+    let engine = ctx.app.docs.engine_mut();
+    match engine.stage_feature_poll() {
+        Some(row) => row.map(Outcome::Done),
+        None if engine.stage_feature_pending() => Ok(Outcome::Done(json!({ "pending": true }))),
+        None => Err("no feature is staged on this document".into()),
+    }
 }
 
 fn feature_add_many(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
@@ -254,6 +460,8 @@ fn history_listing(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
         "selectedFeature": engine.selected_feature(),
         "can_undo": engine.can_undo(),
         "can_redo": engine.can_redo(),
+        "model": parse(&ctx.app.model_signature_json()),
+        "idle": crate::automation::cmd_frame::frame_info(ctx).idle,
     })))
 }
 
@@ -261,6 +469,17 @@ fn run_cancel(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
     let _: NoArgs = parse_args(args)?;
     let cancelled = ctx.app.docs.engine_mut().cancel_run();
     Ok(Outcome::Done(json!({ "cancelled": cancelled })))
+}
+
+fn history_group_begin(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
+    let _: NoArgs = parse_args(args)?;
+    Ok(Outcome::Done(json!({ "token": ctx.app.docs.engine_mut().history_group_begin() })))
+}
+
+fn history_group_end(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
+    let a: GroupEndArgs = parse_args(args)?;
+    let rolled_back = ctx.app.docs.engine_mut().history_group_end(a.token, a.rollback)?;
+    Ok(Outcome::Done(json!({ "rolledBack": rolled_back })))
 }
 
 fn next_feature_id(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
@@ -286,20 +505,24 @@ fn expressions_set(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
 }
 
 pub static COMMANDS: &[CommandSpec] = &[
-    CommandSpec { name: "geometry_diagnostics", group: "history", doc: "Full kernel diagnostics by detailId from structured batches or interference checks (retained after rollback). Use __report__ for the last batch rebuild report. A new batch replaces the diagnostic store.", phase: Phase::Read, annotations: Annotations::READ, args_schema: schema_of::<IdArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(geometry_diagnostics) },
-    CommandSpec { name: "feature_add", group: "history", doc: "Append a feature to the history and run it; the rollback moves to the new feature. Returns its index and id with the run report.", phase: Phase::Mutate, annotations: Annotations::MUTATE, args_schema: schema_of::<FeatureAddArgs>, result_schema: schema_of::<Report>, handler: Handler::App(feature_add) },
-    CommandSpec { name: "feature_add_many", group: "history", doc: "Append a feature batch. The legacy path uses one rebuild; structured batches support native parts, aliases, constraints, evaluated per-item results and optional geometry rollback.", phase: Phase::Mutate, annotations: Annotations::MUTATE, args_schema: schema_of::<FeatureAddManyArgs>, result_schema: schema_of::<Report>, handler: Handler::App(feature_add_many) },
-    CommandSpec { name: "feature_params", group: "history", doc: "A feature's type, index, inputParams and persistentData by id.", phase: Phase::Read, annotations: Annotations::READ, args_schema: schema_of::<IdArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(feature_params) },
-    CommandSpec { name: "feature_set_params", group: "history", doc: "Replace a feature's inputParams and rerun from it.", phase: Phase::Mutate, annotations: Annotations::MUTATE, args_schema: schema_of::<SetParamsArgs>, result_schema: schema_of::<Report>, handler: Handler::App(feature_set_params) },
-    CommandSpec { name: "feature_set_persistent", group: "history", doc: "Replace one key of a feature's persistentData (e.g. a sketch's `sketch` block) and rerun.", phase: Phase::Mutate, annotations: Annotations::MUTATE, args_schema: schema_of::<SetPersistentArgs>, result_schema: schema_of::<Report>, handler: Handler::App(feature_set_persistent) },
-    CommandSpec { name: "feature_delete", group: "history", doc: "Delete a feature by `id` or by history `index` (exactly one) and rerun; the rollback clamps to the new length. The index lane reaches a feature that carries no id.", phase: Phase::Mutate, annotations: Annotations::DESTRUCTIVE, args_schema: schema_of::<DeleteArgs>, result_schema: schema_of::<Report>, handler: Handler::App(feature_delete) },
-    CommandSpec { name: "feature_reorder", group: "history", doc: "Swap the feature at `index` with its neighbour (up = towards 0); the rollback moves to the target.", phase: Phase::Mutate, annotations: Annotations::MUTATE, args_schema: schema_of::<ReorderArgs>, result_schema: schema_of::<Report>, handler: Handler::App(feature_reorder) },
-    CommandSpec { name: "roll_to", group: "history", doc: "Execute the history up to and including feature `index`.", phase: Phase::Mutate, annotations: Annotations::MUTATE, args_schema: schema_of::<RollArgs>, result_schema: schema_of::<Report>, handler: Handler::App(roll_to) },
-    CommandSpec { name: "undo", group: "history", doc: "Undo the last history edit and rerun.", phase: Phase::Mutate, annotations: Annotations::MUTATE, args_schema: schema_of::<NoArgs>, result_schema: schema_of::<Report>, handler: Handler::App(undo) },
-    CommandSpec { name: "redo", group: "history", doc: "Redo the last undone history edit and rerun.", phase: Phase::Mutate, annotations: Annotations::MUTATE, args_schema: schema_of::<NoArgs>, result_schema: schema_of::<Report>, handler: Handler::App(redo) },
-    CommandSpec { name: "history_listing", group: "history", doc: "The feature list `{step, features:[{index,type,id}]}`, the last run report, the rollback step, the feature selected in the tree (`selectedFeature`, null when none) and undo/redo availability.", phase: Phase::Read, annotations: Annotations::READ, args_schema: schema_of::<NoArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(history_listing) },
-    CommandSpec { name: "run_cancel", group: "history", doc: "Cancel the in-flight history run, if any.", phase: Phase::Mutate, annotations: Annotations::MUTATE_NOWAIT, args_schema: schema_of::<NoArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(run_cancel) },
-    CommandSpec { name: "next_feature_id", group: "history", doc: "Reserve the next unique feature id for a base (the feature's shortName), the way the add palette does.", phase: Phase::Mutate, annotations: Annotations::MUTATE_NOWAIT, args_schema: schema_of::<NextIdArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(next_feature_id) },
-    CommandSpec { name: "expressions_get", group: "history", doc: "The Expressions panel script, the variables it defines, and the configurator values.", phase: Phase::Read, annotations: Annotations::READ, args_schema: schema_of::<NoArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(expressions_get) },
-    CommandSpec { name: "expressions_set", group: "history", doc: "Replace the Expressions script and rerun the history.", phase: Phase::Mutate, annotations: Annotations::MUTATE, args_schema: schema_of::<ExpressionsArgs>, result_schema: schema_of::<Report>, handler: Handler::App(expressions_set) },
+    app_command!("history", "geometry_diagnostics", "Full kernel diagnostics by detailId from structured batches or interference checks (retained after rollback). Use __report__ for the last batch rebuild report. A new batch replaces the diagnostic store.", IdArgs, geometry_diagnostics, Read, READ, super::diagnostic_output_schema::geometry_diagnostics_schema),
+    app_command!("history", "feature_add", "Append a feature to the history and run it; the rollback moves to the new feature. Returns its index and id with the run report.", FeatureAddArgs, feature_add, Mutate, MUTATE, schema_of::<Report>),
+    app_command!("history", "feature_stage", "Stage ONE feature (a `feature_add_many` item) without blocking: the recipe, metadata and parts library are snapshotted, the feature is appended and its run handed to the runner, and the reply `{id, staged: true}` comes at once. `feature_stage_result` finishes it. One staged feature per document at a time.", StageArgs, feature_stage, Mutate, MUTATE_NOWAIT, feature_stage_result_schema),
+    app_command!("history", "feature_stage_result", "The staged feature's outcome: `{pending: true}` while its run is in flight, then `{id, committed, status, generatedSolids, error?, rolledBack}` — committed as one undo step, or the snapshot restored exactly when it failed. Answered once; the stage then ends.", NoArgs, feature_stage_result, Read, MUTATE_NOWAIT, feature_stage_poll_result_schema),
+    app_command!("history", "feature_add_many", "Append a feature batch. The legacy path uses one rebuild; structured batches support native parts, aliases, constraints, evaluated per-item results and optional geometry rollback.", FeatureAddManyArgs, feature_add_many, Mutate, MUTATE, feature_add_many_result_schema),
+    app_command!("history", "feature_params", "A feature's type, index, inputParams and persistentData by id.", IdArgs, feature_params, Read, READ, feature_params_result_schema),
+    app_command!("history", "feature_set_params", "Replace a feature's inputParams and rerun from it.", SetParamsArgs, feature_set_params, Mutate, MUTATE, schema_of::<Report>),
+    app_command!("history", "feature_set_persistent", "Replace one key of a feature's persistentData (e.g. a sketch's `sketch` block) and rerun.", SetPersistentArgs, feature_set_persistent, Mutate, MUTATE, schema_of::<Report>),
+    app_command!("history", "feature_delete", "Delete a feature by `id` or by history `index` (exactly one) and rerun; the rollback clamps to the new length. The index lane reaches a feature that carries no id.", DeleteArgs, feature_delete, Mutate, DESTRUCTIVE, schema_of::<Report>),
+    app_command!("history", "feature_reorder", "Swap the feature at `index` with its neighbour (up = towards 0); the rollback moves to the target.", ReorderArgs, feature_reorder, Mutate, MUTATE, schema_of::<Report>),
+    app_command!("history", "roll_to", "Execute the history up to and including feature `index`.", RollArgs, roll_to, Mutate, MUTATE, schema_of::<Report>),
+    app_command!("history", "undo", "Undo the last history edit and rerun.", NoArgs, undo, Mutate, MUTATE, schema_of::<Report>),
+    app_command!("history", "redo", "Redo the last undone history edit and rerun.", NoArgs, redo, Mutate, MUTATE, schema_of::<Report>),
+    app_command!("history", "history_listing", "The feature list `{step, features:[{index,type,id}]}`, the last run report, the rollback step, the feature selected in the tree (`selectedFeature`, null when none) and undo/redo availability.", NoArgs, history_listing, Read, READ, history_listing_result_schema),
+    app_command!("history", "run_cancel", "Cancel the in-flight history run, if any.", NoArgs, run_cancel, Mutate, MUTATE_NOWAIT, run_cancel_result_schema),
+    app_command!("history", "history_group_begin", "Open an undo group on the document: every edit until `history_group_end` is ONE undo step (a script's run). Answers `{token}`. A group already open is replaced.", NoArgs, history_group_begin, Mutate, MUTATE_NOWAIT, history_group_begin_result_schema),
+    app_command!("history", "history_group_end", "Close the undo group `token`. With `rollback: true` the group's edits are taken back (the document as it was when the group opened, no undo step left) and the history re-runs. Answers `{rolledBack}`.", GroupEndArgs, history_group_end, Mutate, MUTATE_NOWAIT, history_group_end_result_schema),
+    app_command!("history", "next_feature_id", "Reserve the next unique feature id for a base (the feature's shortName), the way the add palette does.", NextIdArgs, next_feature_id, Mutate, MUTATE_NOWAIT, next_feature_id_result_schema),
+    app_command!("history", "expressions_get", "The Expressions panel script, the variables it defines, and the configurator values.", NoArgs, expressions_get, Read, READ, expressions_get_result_schema),
+    app_command!("history", "expressions_set", "Replace the Expressions script and rerun the history.", ExpressionsArgs, expressions_set, Mutate, MUTATE, schema_of::<Report>),
 ];

@@ -113,8 +113,8 @@ fn fold_boolean(
         let folded = crate::with_two_registered_solids(*handle, operand, |target, running| {
             crate::boolean_operation(target, running, operation, options)
         });
-        if std::env::var_os("BREP_PROFILE").is_some() {
-            eprintln!("mass.sign_fold boolean={} target={} genuinely_new={}", index + 1, name, crate::reading_memo::sign_new()-sign_before);
+        if crate::profile::profile_enabled() {
+            profile_line!("mass.sign_fold boolean={} target={} genuinely_new={}", index + 1, name, crate::reading_memo::sign_new()-sign_before);
         }
         let freeing = crate::boolean::profile::Scope::new("feature.intermediate_free");
         crate::free_registered_solid(operand);

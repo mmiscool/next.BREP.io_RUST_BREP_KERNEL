@@ -69,6 +69,47 @@ pub fn bake_document(document: &str) -> Result<Bake, String> {
     Ok(Bake { report, solids, thumbnail })
 }
 
+/// [`bake_document`] on a thread of its own, awaited: the pass (a task on
+/// the frame thread when automation runs it) waits for the build without
+/// building on the frame thread. The engine is made, run and dropped on that
+/// thread, so nothing that is not `Send` crosses; only the text goes in and
+/// the [`Bake`] (plain data) comes out.
+#[cfg(not(target_arch = "wasm32"))]
+async fn bake_document_off_thread(document: String) -> Result<Bake, String> {
+    use std::sync::{Arc, Mutex};
+    use std::task::{Poll, Waker};
+    type Slot = Arc<Mutex<(Option<Result<Bake, String>>, Option<Waker>)>>;
+    let slot: Slot = Arc::new(Mutex::new((None, None)));
+    let theirs = slot.clone();
+    std::thread::Builder::new()
+        .name("brep-bake".into())
+        .spawn(move || {
+            let bake = bake_document(&document);
+            let mut s = theirs.lock().unwrap();
+            s.0 = Some(bake);
+            if let Some(w) = s.1.take() {
+                w.wake();
+            }
+        })
+        .map_err(|e| format!("the bake thread did not start: {e}"))?;
+    std::future::poll_fn(move |cx| {
+        let mut s = slot.lock().unwrap();
+        match s.0.take() {
+            Some(bake) => Poll::Ready(bake),
+            None => {
+                s.1 = Some(cx.waker().clone());
+                Poll::Pending
+            }
+        }
+    })
+    .await
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn bake_document_off_thread(document: String) -> Result<Bake, String> {
+    bake_document(&document)
+}
+
 /// Whether `bake` is a document to keep, or why not, in sentences a person can
 /// act on. `number` and `revision` name the member in the sentence.
 pub fn verdict(number: &str, revision: &str, bake: &Bake) -> Result<(), String> {
@@ -171,13 +212,13 @@ pub async fn run_pass_with(client: &PlmClient, max_jobs: usize, renewal: Option<
 /// One claimed job, start to report.
 async fn bake_job(client: &PlmClient, job: BakeJob) -> Result<JobOutcome, PlmError> {
     let refusal = match client.get_document(&job.document_key).await {
-        Ok(Some(bytes)) if job.expected_hash.as_ref().is_some_and(|hash| *hash != super::thumbnail::content_hash(&String::from_utf8_lossy(&bytes))) => {
+        Ok(Some(bytes)) if job.expected_hash.as_ref().is_some_and(|hash| *hash != super::content_hash(String::from_utf8_lossy(&bytes).as_bytes())) => {
             "the model changed after Force resave was queued; retry it".into()
         }
         // Baked with every embedded PLM copy read from its revision (a parent's
         // copy is a cache): the check and the thumbnail are the current parts'.
         Ok(Some(bytes)) => match match std::str::from_utf8(&bytes) {
-            Ok(text) => bake_document(&super::cached_copies::with_current_copies(client, text).await),
+            Ok(text) => bake_document_off_thread(super::cached_copies::with_current_copies(client, text).await).await,
             Err(e) => Err(e.to_string()),
         } {
             Ok(bake) => match verdict(&job.number, &job.revision_label, &bake) {
@@ -207,7 +248,7 @@ async fn keep(client: &PlmClient, job: BakeJob, bytes: Vec<u8>, thumbnail: Optio
     };
     let bytes = serde_json::to_vec(&document).map_err(|e| PlmError::Malformed(e.to_string()))?;
     let path = format!("/api/bake/jobs/{}/result", super::identity::segment(&job.id));
-    let hash = super::thumbnail::content_hash(&String::from_utf8_lossy(&bytes));
+    let hash = super::content_hash(String::from_utf8_lossy(&bytes).as_bytes());
     match client.call("PUT", &path, Some(bytes)).await {
         Ok(_) => {
             if let Some(png) = thumbnail {
@@ -251,6 +292,30 @@ pub fn pass_blocking(url: &str, token: &str, max_jobs: usize) -> Result<Vec<JobO
         client.sign_in_with_token(token).await.map_err(|e| e.to_string())?;
         run_pass_with(&client, max_jobs, Some(&renewal)).await.map_err(|e| e.to_string())
     })
+}
+
+/// [`pass_blocking`] without the block: the pass runs as a task on the
+/// frame thread's local queue (`plm::native`, drained every frame) and its
+/// outcome lands in the returned slot. What the automation command runs, so
+/// the frame keeps drawing while the server answers — and while each job's
+/// document builds, which happens on a thread of its own
+/// (`bake_document_off_thread`).
+#[cfg(not(target_arch = "wasm32"))]
+pub fn pass_spawned(url: &str, token: &str, max_jobs: usize) -> std::sync::Arc<std::sync::Mutex<Option<Result<Vec<serde_json::Value>, String>>>> {
+    let slot = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let out = slot.clone();
+    let (url, token) = (url.to_string(), token.to_string());
+    super::native::spawn(async move {
+        let client = PlmClient::new(std::rc::Rc::new(super::transport::EhttpTransport::new(&url)));
+        let renewal = Renewal::new(&url, &token, RENEW_EVERY);
+        let result = async {
+            client.sign_in_with_token(&token).await.map_err(|e| e.to_string())?;
+            run_pass_with(&client, max_jobs, Some(&renewal)).await.map_err(|e| e.to_string())
+        }
+        .await;
+        *out.lock().unwrap() = Some(result.map(|outcomes| outcomes.iter().map(JobOutcome::to_json).collect()));
+    });
+    slot
 }
 
 /// How often a held job's lease is renewed: a third of the server's 15-minute

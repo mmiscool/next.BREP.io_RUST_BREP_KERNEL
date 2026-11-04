@@ -1814,13 +1814,9 @@ fn in_triangle(corners: &[Vec3; 3], normal: Vec3, hit: Vec3, bar: f64) -> bool {
     })
 }
 
-fn sub3(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
-    [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
-}
+use crate::geometry3d::sub3;
 
-fn dot3(a: [f64; 3], b: [f64; 3]) -> f64 {
-    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
-}
+use crate::geometry3d::dot3;
 
 /// Even-odd crossing count of a paper point against a set of polylines —
 /// the cut region of a section.

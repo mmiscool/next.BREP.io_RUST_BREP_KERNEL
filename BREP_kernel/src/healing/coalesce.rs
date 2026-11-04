@@ -6,23 +6,25 @@ use crate::{
 use crate::{KernelRefusal, KernelStage, OrRefuse};
 use rustc_hash::FxHashMap as HashMap;
 
-fn trimmed_curve(curve: &NurbsCurve, t0: f64, t1: f64) -> Result<NurbsCurve, KernelRefusal> {
+/// The chord length of `curve` over its domain, sampled at 64 equal
+/// parameter steps: the weight the continuation weld gives each piece when it
+/// places their join parameter.
+fn sampled_length(curve: &NurbsCurve) -> Result<f64, KernelRefusal> {
     let [start, end] = curve.domain().or_refuse(KernelStage::Sew, "domain")?;
-    // NurbsCurve::split refuses parameters within its ABSOLUTE knot
-    // tolerance (1e-9) of the domain ends; the skip epsilon must cover that
-    // or a near-edge trim parameter slips past the guard and errors.
-    let epsilon = (1e-9 * (end - start)).max(2e-9);
-    let mut result = curve.clone();
-    if t0 > start + epsilon && t0 < end - epsilon {
-        result = result.split(t0).or_refuse(KernelStage::Sew, "split")?.1;
+    const SAMPLES: usize = 64;
+    let mut length = 0.0;
+    let mut previous = curve.evaluate(start).or_refuse(KernelStage::Sew, "evaluate")?;
+    for index in 1..=SAMPLES {
+        let t = start + (end - start) * index as f64 / SAMPLES as f64;
+        let point = curve.evaluate(t).or_refuse(KernelStage::Sew, "evaluate")?;
+        length += point.sub(previous).length();
+        previous = point;
     }
-    let domain = result.domain().or_refuse(KernelStage::Sew, "domain")?;
-    if t1 < domain[1] - epsilon && t1 > domain[0] + epsilon {
-        result = result.split(t1).or_refuse(KernelStage::Sew, "split")?.0;
-    } else if std::env::var("BREP_DEBUG_SUBRANGE").is_ok() && t1 < domain[1] - epsilon {
-        eprintln!("abnormal subrange skip in coalesce trimmed_curve");
-    }
-    Ok(result)
+    Ok(length)
+}
+
+fn trimmed_curve(curve: &NurbsCurve, t0: f64, t1: f64) -> Result<NurbsCurve, KernelRefusal> {
+    crate::curve_helpers::trimmed_curve(curve, t0, t1, "coalesce trimmed_curve")
 }
 
 fn curvature_at(curve: &NurbsCurve, parameter: f64) -> Result<f64, KernelRefusal> {
@@ -548,7 +550,28 @@ fn merge_curve_continuation_edges_impl(
                         let domain = second_curve.domain().or_refuse(KernelStage::Sew, "domain")?;
                         domain[1] - domain[0]
                     };
-                    let split = first_span / (first_span + second_span);
+                    // The join parameter sits at the pieces' ARC-LENGTH
+                    // fraction, not at their parameter-span fraction: two
+                    // trimmed pieces each own a unit span, so the span ratio
+                    // put every join at 0.5 and gave the welded curve a speed
+                    // kink of the pieces' length ratio — the sheet-metal hinge
+                    // rim welded from a 1.1 mm and a 97.8 mm line read 1.1 mm
+                    // at t = 0.5, and the next boolean's pcurve for a piece of
+                    // it deviated 48.5 mm from the edge (lane O, 2026-10-28,
+                    // `reported_adjacent_flanges_build_sequentially_at_thin_stock`).
+                    // Two lines joined at their length fraction ARE the uniform
+                    // line; two arcs of one circle keep a uniform angular speed.
+                    // The concatenation stays exact whatever the join sits at.
+                    let split = {
+                        let first_length = sampled_length(&first_curve)?;
+                        let second_length = sampled_length(&second_curve)?;
+                        let total = first_length + second_length;
+                        if first_length > 0.0 && second_length > 0.0 && total.is_finite() {
+                            first_length / total
+                        } else {
+                            first_span / (first_span + second_span)
+                        }
+                    };
                     let curve = if let Some(curve) = concatenate_exact_curve_pieces(
                         &first_curve,
                         &second_curve,

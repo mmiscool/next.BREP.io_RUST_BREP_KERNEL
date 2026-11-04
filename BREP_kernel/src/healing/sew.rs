@@ -298,10 +298,7 @@ fn merge_connected_shells(solid: &mut BrepSolid) -> usize {
     let mut owner_of_edge = HashMap::<u64, usize>::default();
     let mut parent = (0..solid.shells.len()).collect::<Vec<_>>();
     fn root(parent: &mut [usize], index: usize) -> usize {
-        if parent[index] != index {
-            parent[index] = root(parent, parent[index]);
-        }
-        parent[index]
+        crate::union_find::find_root(parent, index)
     }
     for (shell_index, shell) in solid.shells.iter().enumerate() {
         for coedge in shell

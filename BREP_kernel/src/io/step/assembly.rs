@@ -252,37 +252,12 @@ fn rigid(matrix: &Mat4) -> Result<(), String> {
     if matrix.iter().any(|value| !value.is_finite()) {
         return Err("matrix is not finite".into());
     }
-    let column = |index: usize| {
-        [
-            matrix[index],
-            matrix[4 + index],
-            matrix[8 + index],
-        ]
-    };
-    let dot = |a: [f64; 3], b: [f64; 3]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
-    let (x, y, z) = (column(0), column(1), column(2));
-    const TOLERANCE: f64 = 1e-9;
-    for (a, b, expected) in [
-        (x, x, 1.0),
-        (y, y, 1.0),
-        (z, z, 1.0),
-        (x, y, 0.0),
-        (x, z, 0.0),
-        (y, z, 0.0),
-    ] {
-        if (dot(a, b) - expected).abs() > TOLERANCE {
-            return Err("matrix is not a rotation (mirrored or scaled)".into());
-        }
-    }
-    let cross = [
-        x[1] * y[2] - x[2] * y[1],
-        x[2] * y[0] - x[0] * y[2],
-        x[0] * y[1] - x[1] * y[0],
-    ];
-    if (dot(cross, z) - 1.0).abs() > TOLERANCE {
+    let transform = crate::AffineTransform { elements: *matrix };
+    if transform.is_rigid(crate::RIGID_TOL) { return Ok(()); }
+    if transform.determinant3() < 0.0 {
         return Err("matrix is left-handed (a mirrored instance)".into());
     }
-    Ok(())
+    Err("matrix is not a rotation (mirrored or scaled)".into())
 }
 
 /// The `AXIS2_PLACEMENT_3D` expressing a rigid placement's frame: the origin is

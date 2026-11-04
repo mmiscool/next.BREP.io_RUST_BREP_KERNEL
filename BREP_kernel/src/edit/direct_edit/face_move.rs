@@ -1078,9 +1078,7 @@ pub(super) fn corner_on_plane_and_ruled(
     } else {
         let discriminant = linear * linear - 4.0 * quad * constant;
         if discriminant >= 0.0 {
-            let root = discriminant.sqrt();
-            roots.push((-linear + root) / (2.0 * quad));
-            roots.push((-linear - root) / (2.0 * quad));
+            roots.extend(crate::poly::solve_quadratic(constant, linear, quad).into_iter().rev());
         }
     }
     let mut best: Option<(Vec3, f64)> = None;

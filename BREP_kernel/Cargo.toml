@@ -1,6 +1,6 @@
 [package]
 name = "BREP_kernel"
-version = "0.11.0"
+version = "0.12.0"
 edition = "2021"
 license-file = "LICENSE.md"
 description = "A boundary representation (BREP) geometry kernel for building CAD applications."
@@ -42,7 +42,7 @@ overflow-checks = false # no arithmetic overflow checks in hot paths
 [dependencies]
 # Robust single-region surface fitting for the Refit Faces edit (the same
 # RANSAC + least-squares pass the mesh import runs). A geometry leaf: no cycle.
-BREP_RANSAC = { version = "0.1.5", path = "../BREP_RANSAC" }
+BREP_RANSAC = { version = "0.2.0", path = "../BREP_RANSAC" }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 slotmap = "1"
@@ -53,6 +53,16 @@ spade = "=2.15.1"
 rayon = { version = "1", optional = true }
 wasm-bindgen-rayon = { version = "1", optional = true }
 
+[target.'cfg(target_family = "wasm")'.dependencies]
+# Optional wasm global allocator (feature `wasm-talc`); MIT, no_std.
+talc = { version = "5.1.1", optional = true }
+
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+# Optional native global allocator (feature `native-rusty-alloc`): rusty_alloc,
+# a pure-Rust mimalloc remake (MIT); the same API crate version the desktop app
+# already links through rusty_h264-common's default `global-alloc` feature.
+rusty_alloc-api = { version = "=2.2.6", optional = true }
+
 [features]
 # `parallel` turns the per-face tessellation loop into a rayon par_iter. It
 # works on native (rayon's own pool) and on wasm built with atomics. The
@@ -62,4 +72,12 @@ wasm-bindgen-rayon = { version = "1", optional = true }
 # COOP/COEP headers — see build:rust-kernel:threads).
 parallel = ["dep:rayon"]
 wasm-threads = ["parallel", "dep:wasm-bindgen-rayon"]
+# `wasm-talc` replaces Rust's default wasm allocator (dlmalloc) with talc on
+# single-threaded wasm builds. Native builds are unaffected.
+wasm-talc = ["dep:talc"]
+# `native-rusty-alloc` replaces the system allocator with rusty_alloc on native
+# builds (headless drivers, benches, servers). Never in a graph that already has
+# a global allocator, such as BREP_app's (rusty_h264-common installs this same
+# allocator there): Rust allows one per program.
+native-rusty-alloc = ["dep:rusty_alloc-api"]
 

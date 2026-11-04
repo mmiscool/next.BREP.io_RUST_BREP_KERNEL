@@ -2,7 +2,7 @@
 //! while the owning view is active. Never touches ACOMP transforms or the
 //! assembly solver; the base pose is the modeling pose at apply time.
 
-use super::{boolean_field, id_field, params, reference_field, schema_entry, PmiTypeDef};
+use super::{boolean_field, id_field, params, reference_field, schema_entry, target_solids, PmiTypeDef};
 use crate::feature_pipeline::pmi::resolve::{a3, solid_bbox};
 use crate::feature_pipeline::pmi::{PmiAnnotation, PmiContext, PmiGeometry, Resolved};
 use crate::feature_pipeline::SelectionProbe;
@@ -63,26 +63,7 @@ fn triple(value: Option<&serde_json::Value>, default: [f64; 3], env: &crate::fea
 }
 
 fn resolve(annotation: &PmiAnnotation, context: &PmiContext<'_>) -> Result<Resolved, String> {
-    let targets = annotation.references("targets");
-    if targets.is_empty() {
-        return Err("select at least one solid or component".into());
-    }
-    let mut solids: Vec<(String, u32)> = Vec::new();
-    for target in &targets {
-        if let Some(handle) = context.scene.resolve_solid(target) {
-            solids.push((target.clone(), handle));
-        } else if crate::is_component_reference(crate::split_component_namespace(target).1) {
-            let members = context.scene.occurrence_solids(target);
-            if members.is_empty() {
-                return Err(format!("component '{target}' has no solids"));
-            }
-            solids.extend(members);
-        } else {
-            return Err(format!("'{target}' is not a solid or component"));
-        }
-    }
-    let mut seen = std::collections::HashSet::new();
-    solids.retain(|(name, _)| seen.insert(name.clone()));
+    let solids = target_solids(&annotation.references("targets"), context)?;
     let mut low = Vec3::new(f64::INFINITY, f64::INFINITY, f64::INFINITY);
     let mut high = Vec3::new(f64::NEG_INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY);
     for (_, handle) in &solids {

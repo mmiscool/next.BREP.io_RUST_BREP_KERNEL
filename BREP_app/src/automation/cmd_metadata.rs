@@ -14,7 +14,7 @@
 //! Nothing here decides what an attribute means: these commands are the store's
 //! read/write surface, the same one `panels::info_windows` drives, so a colour
 //! an agent writes and a colour a person picks are the same edit.
-use crate::automation::command::{parse_args, schema_of, Annotations, CommandSpec, Ctx, Empty, Handler, NoArgs, Outcome, Phase};
+use crate::automation::command::{app_command, read_engine, parse_args, schema_of, CommandSpec, Ctx, NoArgs, Outcome};
 use crate::automation::cmd_document::parse;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -69,6 +69,23 @@ fn text_of(value: &Value) -> String {
     }
 }
 
+// MetadataStore serializes a nested BTreeMap of strings. This differs from
+// document/BOM attributes, which intentionally retain arbitrary JSON values.
+fn metadata_get_result_schema() -> Value {
+    json!({"type":"object","properties":{
+        "name":{"type":"string"},
+        "attributes":{"type":"object","additionalProperties":{"type":"string"}}
+    },"required":["name","attributes"],"additionalProperties":false})
+}
+fn metadata_all_result_schema() -> Value {
+    json!({"type":"object","properties":{
+        "metadata":{"type":"object","additionalProperties":{"type":"object","additionalProperties":{"type":"string"}}}
+    },"required":["metadata"],"additionalProperties":false})
+}
+fn metadata_remove_result_schema() -> Value {
+    json!({"type":"object","properties":{"removed":{"type":"boolean"}},"required":["removed"],"additionalProperties":false})
+}
+
 fn metadata_get(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
     let a: NameArgs = parse_args(args)?;
     let record = parse(&ctx.app.docs.engine().object_metadata_json(&a.name));
@@ -76,8 +93,7 @@ fn metadata_get(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
 }
 
 fn metadata_all(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
-    let _: NoArgs = parse_args(args)?;
-    Ok(Outcome::Done(json!({ "metadata": parse(&ctx.app.docs.engine().metadata_json()) })))
+    read_engine(ctx, args, |e| json!({ "metadata": e.metadata_value() }))
 }
 
 fn metadata_set(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
@@ -108,9 +124,9 @@ fn metadata_remove(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
 }
 
 pub static COMMANDS: &[CommandSpec] = &[
-    CommandSpec { name: "metadata_get", group: "metadata", doc: "One object's metadata record `{key: value}` (empty when it has none). Names come from `scene_entities`.", phase: Phase::Read, annotations: Annotations::READ, args_schema: schema_of::<NameArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(metadata_get) },
-    CommandSpec { name: "metadata_all", group: "metadata", doc: "The whole metadata store, `{name: {key: value}}` — what the document saves and reloads.", phase: Phase::Read, annotations: Annotations::READ, args_schema: schema_of::<NoArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(metadata_all) },
-    CommandSpec { name: "metadata_set", group: "metadata", doc: "Set one durable metadata attribute on a solid, face or edge. `color` (`#rrggbb`) shades it at once and survives rebuilds; `density` drives `mass_properties`; any other key is carried with the document.", phase: Phase::Mutate, annotations: Annotations::MUTATE_NOWAIT, args_schema: schema_of::<AttributeArgs>, result_schema: schema_of::<Written>, handler: Handler::App(metadata_set) },
-    CommandSpec { name: "metadata_set_many", group: "metadata", doc: "Set many metadata attributes in one call (colouring a whole model is one call, not one per solid). Refused whole if any item has an empty key.", phase: Phase::Mutate, annotations: Annotations::MUTATE_NOWAIT, args_schema: schema_of::<AttributeManyArgs>, result_schema: schema_of::<Written>, handler: Handler::App(metadata_set_many) },
-    CommandSpec { name: "metadata_remove", group: "metadata", doc: "Remove one metadata attribute; returns whether it existed. Removing `color` returns the object to the display's own colouring.", phase: Phase::Mutate, annotations: Annotations::MUTATE_NOWAIT, args_schema: schema_of::<RemoveArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(metadata_remove) },
+    app_command!("metadata", "metadata_get", "One object's metadata record `{key: value}` (empty when it has none). Names come from `scene_entities`.", NameArgs, metadata_get, Read, READ, metadata_get_result_schema),
+    app_command!("metadata", "metadata_all", "The whole metadata store, `{name: {key: value}}` — what the document saves and reloads.", NoArgs, metadata_all, Read, READ, metadata_all_result_schema),
+    app_command!("metadata", "metadata_set", "Set one durable metadata attribute on a solid, face or edge. `color` (`#rrggbb`) shades it at once and survives rebuilds; `density` drives `mass_properties`; any other key is carried with the document.", AttributeArgs, metadata_set, Mutate, MUTATE_NOWAIT, schema_of::<Written>),
+    app_command!("metadata", "metadata_set_many", "Set many metadata attributes in one call (colouring a whole model is one call, not one per solid). Refused whole if any item has an empty key.", AttributeManyArgs, metadata_set_many, Mutate, MUTATE_NOWAIT, schema_of::<Written>),
+    app_command!("metadata", "metadata_remove", "Remove one metadata attribute; returns whether it existed. Removing `color` returns the object to the display's own colouring.", RemoveArgs, metadata_remove, Mutate, MUTATE_NOWAIT, metadata_remove_result_schema),
 ];

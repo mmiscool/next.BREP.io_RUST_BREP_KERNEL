@@ -124,8 +124,7 @@ fn predict_station_uv(history: &[(f64, [f64; 4])], t: f64) -> Option<[f64; 4]> {
 /// start station, as before 2026-10-17; unset or anything else chains them
 /// (see the dense loop). Read once.
 fn dense_chain_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var("BREP_BLEND_DENSE_CHAIN").as_deref() != Ok("0"))
+    switch!("BREP_BLEND_DENSE_CHAIN", true)
 }
 
 /// [`march_open_stations_ending`], also solving each final interval's
@@ -138,19 +137,8 @@ fn dense_chain_enabled() -> bool {
 /// `set_exact_stripes_for_test` forces it on a test's own thread.
 const EXACT_STRIPES_DEFAULT: bool = false;
 
-thread_local! {
-    static EXACT_STRIPES_FOR_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
-}
-
 pub(in crate::blend) fn exact_stripes_on() -> bool {
-    if let Some(forced) = EXACT_STRIPES_FOR_TEST.with(|forced| forced.get()) {
-        return forced;
-    }
-    match std::env::var("BREP_BLEND_EXACT_STRIPES").as_deref() {
-        Ok("0") | Ok("off") => false,
-        Ok("1") | Ok("on") => true,
-        _ => EXACT_STRIPES_DEFAULT,
-    }
+    switch!(live "BREP_BLEND_EXACT_STRIPES", EXACT_STRIPES_DEFAULT)
 }
 
 
@@ -905,7 +893,7 @@ pub(in crate::blend) fn march_open_stations_core(
 
 
 fn assembly_normals_reuse_on() -> bool {
-    std::env::var("BREP_NETWORK_ASSEMBLY_NORMALS").map_or(true, |value| value != "0" && value != "off")
+    switch!(live "BREP_NETWORK_ASSEMBLY_NORMALS", true)
 }
 
 fn ts_first(ts: &[f64]) -> f64 {
@@ -2269,19 +2257,8 @@ const END_CONTINUATION_BAND: f64 = 1e-4;
 /// manifest OK with it on, the fillet suites green).
 const END_CONTINUATION_DEFAULT: bool = true;
 
-thread_local! {
-    static END_CONTINUATION_FOR_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
-}
-
 pub(crate) fn end_continuation_on() -> bool {
-    if let Some(forced) = END_CONTINUATION_FOR_TEST.with(|forced| forced.get()) {
-        return forced;
-    }
-    match std::env::var("BREP_BLEND_END_CONTINUATION").as_deref() {
-        Ok("0") | Ok("off") => false,
-        Ok("1") | Ok("on") => true,
-        _ => END_CONTINUATION_DEFAULT,
-    }
+    switch!(live "BREP_BLEND_END_CONTINUATION", END_CONTINUATION_DEFAULT)
 }
 
 
@@ -2555,12 +2532,55 @@ pub(in crate::blend) fn resolve_free_end(
             } else {
                 [false, false]
             };
+            // Row 1 of the 2026-10-26 refusal census (lCount_102, a chamfer
+            // ending on an earlier chamfer's PLANE): the transverse edge's
+            // ends are read off the rails at their boundary crossings, and
+            // a rail whose overshoot stations ran onto its mate's extension
+            // past the corner is fitted through the kink there — 2.2e-6 off
+            // its mate at the crossing, so the end point stood 9.9e-7 off the
+            // plane against the chart admission's 4e-7 band
+            // (`planar_chart::fit_planar_charts_to_trims`).  The boundary
+            // edge IS on the end face and on the mate, and the crossing's
+            // parameter on it is where the surgery puts the vertex, so where
+            // a rail end leaves a planar end face by more than that band the
+            // transverse edge ends at the boundary's point instead.  A rail
+            // end inside the band keeps the body it always built.
+            let end_points = if planar_end {
+                let band = consumed_band(solid);
+                let off_plane = |point: Vec3| -> Option<f64> {
+                    match end_record.surface.analytic() {
+                        Some(crate::AnalyticSurface::Plane { origin, u_dir, v_dir, .. }) => {
+                            let normal = u_dir.cross(*v_dir).normalized().ok()?;
+                            Some(point.sub(*origin).dot(normal).abs())
+                        }
+                        _ => None,
+                    }
+                };
+                let mut points = [None; 2];
+                for (slot, row, parameter, boundary, edge_parameter) in [
+                    (0usize, &rows.cr, cr_parameter, first_boundary, first_edge_parameter),
+                    (1, &rows.cs, cs_parameter, second_boundary, second_edge_parameter),
+                ] {
+                    let (Ok(on_row), Ok(on_boundary)) = (row.evaluate_extended(clamp01(parameter)), boundary.curve.evaluate_extended(edge_parameter)) else { continue };
+                    let (Some(row_off), Some(boundary_off)) = (off_plane(on_row), off_plane(on_boundary)) else { continue };
+                    if row_off > band && boundary_off <= band {
+                        if std::env::var("BREP_DEBUG_TRANSVERSE_FIT").is_ok() {
+                            eprintln!("transverse end {slot} pinned to boundary {}: rail end {row_off:.3e} off the planar end face (band {band:.3e}), boundary point {boundary_off:.3e}", boundary.id);
+                        }
+                        points[slot] = Some(on_boundary);
+                    }
+                }
+                points
+            } else {
+                [None; 2]
+            };
             transverse_curve_with_ends(
                 rows,
                 end_record,
                 clamp01(cr_parameter),
                 clamp01(cs_parameter),
                 exact_ends,
+                end_points,
                 transverse_ladder_on().then(|| shell_closure_bar(solid, first_face.id)),
             )?
         }
@@ -3899,7 +3919,7 @@ pub(in crate::blend) fn transverse_curve(
     cr_parameter: f64,
     cs_parameter: f64,
 ) -> Result<(NurbsCurve, NurbsCurve, NurbsCurve), KernelRefusal> {
-    transverse_curve_with_ends(rows, end_face, cr_parameter, cs_parameter, [false, false], None)
+    transverse_curve_with_ends(rows, end_face, cr_parameter, cs_parameter, [false, false], [None; 2], None)
 }
 
 /// [`transverse_curve`], with the z = 0 (cr) and z = 1 (cs) ends EXACT where
@@ -3915,6 +3935,7 @@ pub(in crate::blend) fn transverse_curve_with_ends(
     cr_parameter: f64,
     cs_parameter: f64,
     exact_ends: [bool; 2],
+    end_points: [Option<Vec3>; 2],
     shell_bar: Option<f64>,
 ) -> Result<(NurbsCurve, NurbsCurve, NurbsCurve), KernelRefusal> {
     // A LADDER on the section count (lane R2, 2026-10-18). The edge and its
@@ -3937,12 +3958,12 @@ pub(in crate::blend) fn transverse_curve_with_ends(
     const FIRST_SECTIONS: usize = 16;
     const MAX_SECTIONS: usize = 256;
     let Some(shell_bar) = shell_bar.filter(|_| transverse_ladder_on()) else {
-        return transverse_curve_sections(rows, end_face, cr_parameter, cs_parameter, exact_ends, FIRST_SECTIONS);
+        return transverse_curve_sections(rows, end_face, cr_parameter, cs_parameter, exact_ends, end_points, FIRST_SECTIONS);
     };
     let mut sections = FIRST_SECTIONS;
     let mut best: Option<((NurbsCurve, NurbsCurve, NurbsCurve), f64)> = None;
     loop {
-        let built = transverse_curve_sections(rows, end_face, cr_parameter, cs_parameter, exact_ends, sections)?;
+        let built = transverse_curve_sections(rows, end_face, cr_parameter, cs_parameter, exact_ends, end_points, sections)?;
         let (sliver, length) = transverse_sliver(rows, &built, 4 * sections);
         // An unreadable sliver is read as over the bar: the ladder climbs,
         // and keeps the first build if no rung reads.
@@ -3978,19 +3999,8 @@ pub(in crate::blend) fn transverse_curve_with_ends(
 /// a test's own thread.
 const TRANSVERSE_LADDER_DEFAULT: bool = true;
 
-thread_local! {
-    static TRANSVERSE_LADDER_FOR_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
-}
-
 pub(in crate::blend) fn transverse_ladder_on() -> bool {
-    if let Some(forced) = TRANSVERSE_LADDER_FOR_TEST.with(|forced| forced.get()) {
-        return forced;
-    }
-    match std::env::var("BREP_BLEND_TRANSVERSE_LADDER").as_deref() {
-        Ok("0") | Ok("off") => false,
-        Ok("1") | Ok("on") => true,
-        _ => TRANSVERSE_LADDER_DEFAULT,
-    }
+    switch!(live "BREP_BLEND_TRANSVERSE_LADDER", TRANSVERSE_LADDER_DEFAULT)
 }
 
 
@@ -4081,6 +4091,7 @@ fn transverse_curve_sections(
     cr_parameter: f64,
     cs_parameter: f64,
     exact_ends: [bool; 2],
+    end_points: [Option<Vec3>; 2],
     sections: usize,
 ) -> Result<(NurbsCurve, NurbsCurve, NurbsCurve), KernelRefusal> {
     let exact = exact_ends[0] || exact_ends[1];
@@ -4132,7 +4143,14 @@ fn transverse_curve_sections(
                 t -= distance / derivative;
             }
         }
-        let point = rows.surface.evaluate_extended(t, z).or_refuse(KernelStage::Refine, "evaluate_extended")?;
+        // An end the caller pinned: the boundary's own point where the
+        // rail's end stands off the end face (`resolve_free_end`).  The
+        // blend pcurve keeps the rail crossing's parameter.
+        let pinned = if section == 0 { end_points[0] } else if section == sections { end_points[1] } else { None };
+        let point = match pinned {
+            Some(point) => point,
+            None => rows.surface.evaluate_extended(t, z).or_refuse(KernelStage::Refine, "evaluate_extended")?,
+        };
         let projection = project(point, foot)?;
         points3.push(Vec4::from_point(point, 1.0));
         blend_uv.push(Vec4::from_point(Vec3::new(t, z, 0.0), 1.0));

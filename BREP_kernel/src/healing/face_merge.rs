@@ -745,19 +745,7 @@ fn coextrusion_pair(
 }
 
 fn trimmed_curve(curve: &NurbsCurve, t0: f64, t1: f64) -> Result<NurbsCurve, KernelRefusal> {
-    let [start, end] = curve.domain().or_refuse(KernelStage::Sew, "domain")?;
-    let epsilon = (1e-9 * (end - start)).max(2e-9);
-    let mut result = curve.clone();
-    if t0 > start + epsilon && t0 < end - epsilon {
-        result = result.split(t0).or_refuse(KernelStage::Sew, "split")?.1;
-    }
-    let domain = result.domain().or_refuse(KernelStage::Sew, "domain")?;
-    if t1 < domain[1] - epsilon && t1 > domain[0] + epsilon {
-        result = result.split(t1).or_refuse(KernelStage::Sew, "split")?.0;
-    } else if std::env::var("BREP_DEBUG_SUBRANGE").is_ok() && t1 < domain[1] - epsilon {
-        eprintln!("abnormal subrange skip in face_merge trimmed");
-    }
-    Ok(result)
+    crate::curve_helpers::trimmed_curve(curve, t0, t1, "face_merge trimmed")
 }
 
 /// The axial extent of `curve` about `support`'s axis, read off its control
@@ -933,7 +921,7 @@ impl SharedParameterSpace<'_> {
 }
 
 fn shared_trim_certificate_enabled() -> bool {
-    std::env::var("BREP_FACE_MERGE_TRIM_CERT").as_deref() != Ok("0")
+    switch!(live "BREP_FACE_MERGE_TRIM_CERT", true)
 }
 
 /// Prove closure of the complete boundary isocurves. Clamping makes these

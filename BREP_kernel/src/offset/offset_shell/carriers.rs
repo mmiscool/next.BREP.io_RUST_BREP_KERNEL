@@ -301,6 +301,13 @@ pub(super) struct CarvedSupport {
     pub(super) shielded_cusp: bool,
 }
 
+/// Lane O row 35a's switch, default on since batch 17 (`0`/`off` restores the scan): the carve certifies a
+/// circular cylinder's constant area factor instead of scanning it.
+fn cylinder_carve_cert_on() -> bool {
+    switch!("BREP_OFFSET_CYLINDER_CARVE_CERT", true)
+}
+
+
 pub(super) fn carve_folded_support(
     source: &BrepSolid,
     face: &FaceRecord,
@@ -331,6 +338,18 @@ fn carve_folded_support_impl(
     }
     if certified_sphere_offset_factor(face, distance)?.is_some_and(|factor| factor > COLLAPSE_FACTOR) {
         return Ok(None);
+    }
+    // Lane O row 35a (`BREP_OFFSET_CYLINDER_CARVE_CERT`, default off): a
+    // circular cylinder's offset area factor is the constant `(R ± d)/R`
+    // across the ruling direction (1 along it), so a factor above the collapse
+    // bar is the scan's `Certainty::Regular` everywhere, read without the scan.
+    if cylinder_carve_cert_on() {
+        if let Some((_, _, _, factor)) = crate::offset::cylinder_offset_factor(&face.surface, face.same_sense, distance)? {
+            if factor > COLLAPSE_FACTOR {
+                os_debug!("certified cylinder factor face {}: {factor:.12}", face.id);
+                return Ok(None);
+            }
+        }
     }
     let loops = face
         .loops
@@ -1145,6 +1164,18 @@ fn miter_distance_to_trimmed_face(
         if edge.degenerate {
             continue;
         }
+        // SEGMENT MITER (lane O row 13, 2026-10-28; on by default since the batch 4
+        // promotion, `BREP_OFFSET_SEGMENT_MITER=0` takes the projector): on a straight edge (non-rational degree 1, two
+        // equal-weight controls, linear in its parameter) the exact projection
+        // is a dot product, clamped to the curve's domain as the projector
+        // clamps it and then to [t0, t1] as below. Same reading to round-off;
+        // it is only compared with the skin band.
+        if segment_miter_enabled() {
+            if let Some(distance) = segment_edge_distance(&edge.curve, edge.t0, edge.t1, foot) {
+                tangential = tangential.min(distance);
+                continue;
+            }
+        }
         // The exact projection, not a sampled one: a sampled rim overstates how
         // far a foot lies past it, and that is the whole quantity here.
         let projection = crate::project_point_to_curve(&edge.curve, foot).or_refuse(KernelStage::Refine, "project_point_to_curve")?;
@@ -1160,6 +1191,34 @@ fn miter_distance_to_trimmed_face(
 /// How far `point` sits from its OWN retained face in the MITERED metric, less
 /// the offset distance: zero everywhere its face's offset skin runs, including
 /// the miter extension band past its own rim. A trace quantity.
+/// Distance from `point` to the window `[t0, t1]` of a straight edge curve
+/// (row 13): `None` for any other curve.
+fn segment_edge_distance(curve: &NurbsCurve, t0: f64, t1: f64, point: Vec3) -> Option<f64> {
+    if curve.degree != 1 || curve.control_points.len() != 2 || curve.knots.len() != 4 {
+        return None;
+    }
+    let [a, b] = [curve.control_points[0], curve.control_points[1]];
+    if !(a.w > 0.0) || a.w != b.w {
+        return None;
+    }
+    let (start, end) = (a.point().ok()?, b.point().ok()?);
+    let [k0, k1] = curve.domain().ok()?;
+    let direction = end.sub(start);
+    let length_squared = direction.dot(direction);
+    if !(length_squared > 0.0) || !(k1 > k0) {
+        return None;
+    }
+    let along = (point.sub(start).dot(direction) / length_squared).clamp(0.0, 1.0);
+    let parameter = (k0 + (k1 - k0) * along).clamp(t0.min(t1), t0.max(t1));
+    let nearest = start.add(direction.scale((parameter - k0) / (k1 - k0)));
+    Some(nearest.sub(point).length())
+}
+
+fn segment_miter_enabled() -> bool {
+    switch!("BREP_OFFSET_SEGMENT_MITER", true)
+}
+
+
 pub(super) fn own_miter_departure(
     point: Vec3,
     own_face_id: u64,
@@ -1256,8 +1315,12 @@ pub(super) fn coincident_offset_face(
         return Ok(None);
     };
     let target = distance.abs();
+    let bounded = coincident_bound_on();
     for (face, edges) in retained_faces {
         if face.id == own_face_id {
+            continue;
+        }
+        if bounded && foot_box_distance(face, edges, point).is_some_and(|reach| reach > beyond_band(target + tolerance, point)) {
             continue;
         }
         let (separation, Some(foot)) = nearest_on_trimmed_face(face, edges, point)? else {
@@ -1270,6 +1333,57 @@ pub(super) fn coincident_offset_face(
         }
     }
     Ok(None)
+}
+
+/// Lane O row 31 (2026-10-31, `BREP_OFFSET_COINCIDENT_BOUND`, default on since
+/// batch 12; `0`/`off` projects onto every face): [`coincident_offset_face`] skips a face whose every
+/// possible foot lies farther from the point than the band's far edge, before
+/// projecting onto it. The feet [`nearest_on_trimmed_face`] can return are a
+/// surface point (the projection, kept when it lands in the trim) or a sample
+/// of one of the face's edge curves; with positive weights each lies in the
+/// convex hull of its own control points, so in the box over the surface's and
+/// the edges' control points ([`foot_box_distance`]). Such a face can only
+/// fail the band test, so the first face that passes, and the result, are
+/// unchanged; the one difference is that a skipped face's projection, which
+/// could only have failed the test, can no longer refuse. The D1 bench case
+/// spent 0.44 ms a run in these reads.
+fn coincident_bound_on() -> bool {
+    switch!("BREP_OFFSET_COINCIDENT_BOUND", true)
+}
+
+
+/// The distance from `point` to the box over `face`'s surface control points
+/// and its non-degenerate edges' control points: no foot
+/// [`nearest_on_trimmed_face`] returns is nearer. `None` (no bound) for a
+/// non-positive or non-finite weight, or a non-finite coordinate.
+fn foot_box_distance(face: &FaceRecord, edges: &[&EdgeRecord], point: Vec3) -> Option<f64> {
+    let (mut low, mut high) = (Vec3::new(f64::INFINITY, f64::INFINITY, f64::INFINITY), Vec3::new(f64::NEG_INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY));
+    let surface_points = face.surface.control_points.iter().flatten();
+    let edge_points = edges.iter().filter(|edge| !edge.degenerate).flat_map(|edge| edge.curve.control_points.iter());
+    for control in surface_points.chain(edge_points) {
+        if !(control.w > 0.0 && control.w.is_finite()) {
+            return None;
+        }
+        let p = control.point().ok()?;
+        if !(p.x.is_finite() && p.y.is_finite() && p.z.is_finite()) {
+            return None;
+        }
+        low = Vec3::new(low.x.min(p.x), low.y.min(p.y), low.z.min(p.z));
+        high = Vec3::new(high.x.max(p.x), high.y.max(p.y), high.z.max(p.z));
+    }
+    if !(low.x <= high.x) {
+        return None;
+    }
+    let nearest = Vec3::new(point.x.clamp(low.x, high.x), point.y.clamp(low.y, high.y), point.z.clamp(low.z, high.z));
+    Some(point.sub(nearest).length())
+}
+
+/// `reach` widened past the rounding of the feet's evaluation and of the
+/// distances read from them, and past a projection kept on the trim within
+/// its 1e-9 parameter band (1e-6 relative to the reach and to the point's
+/// magnitude, far above each).
+fn beyond_band(reach: f64, point: Vec3) -> f64 {
+    reach * (1.0 + 1e-6) + 1e-6 * (1.0 + point.length())
 }
 
 /// How far `point` sits from its OWN retained face, less the offset distance:

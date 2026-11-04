@@ -76,7 +76,7 @@ pub fn pmi_view_schema() -> serde_json::Value {
                 "hint": "Solids or components the section leaves whole, such as shafts and fasteners"
             },
             "updateCamera": { "type": "button", "label": "Update camera from the viewport" },
-            "updateVisibility": { "type": "button", "label": "Update visibility from the scene" }
+            "hideSelected": { "type": "button", "label": "Hide the selected bodies in this view" }
         }
     })
 }
@@ -262,6 +262,11 @@ impl EngineState {
     /// The `__brepPmi` verifier global: the block, the report, the active
     /// view, the open annotation and the datum letters, as one object.
     pub fn pmi_state_json(&self) -> String {
+        self.pmi_state_value().to_string()
+    }
+
+    /// [`Self::pmi_state_json`] as a JSON value.
+    pub fn pmi_state_value(&self) -> serde_json::Value {
         let state = self.pmi_state();
         serde_json::json!({
             "views": state.views,
@@ -275,7 +280,6 @@ impl EngineState {
             "datums": state.datum_letters(),
             "report": self.pmi_report,
         })
-        .to_string()
     }
 
     // --- block writes --------------------------------------------------------
@@ -414,11 +418,24 @@ impl EngineState {
         Ok(())
     }
 
-    /// Re-capture a view's hidden set from the scene (the explicit Update
-    /// Visibility action).
-    pub fn pmi_update_view_visibility(&mut self, id: &str) -> Result<(), String> {
-        let hidden = self.hidden_solid_names();
-        self.pmi_set_view_display(id, &PmiViewPatch { hidden: Some(hidden), ..Default::default() })
+    /// Hide the selection in view `view_id` (the active view when `None`) as
+    /// a new **hide step** — a `hide` annotation naming the selected
+    /// components (whole placements, a part inside a sub-assembly by its
+    /// occurrence path, as an explode step names them) and any other
+    /// selected solids — tracked, listed, edited and undone like an explode
+    /// step. The step's form opens. Refused with nothing selected.
+    pub fn pmi_hide_selected(&mut self, view_id: Option<&str>) -> Result<String, String> {
+        let mut targets = self.selected_occurrences();
+        for solid in &self.emphasis.selected_solids {
+            if !targets.iter().any(|target| brep_kernel::entry_names_solid(target, solid)) {
+                targets.push(solid.clone());
+            }
+        }
+        if targets.is_empty() {
+            return Err("select the solids or components to hide".into());
+        }
+        let params = serde_json::json!({ "targets": targets }).to_string();
+        self.pmi_add_annotation(view_id, "hide", &params)
     }
 
     /// Patch a view's name / display state. The active view re-applies.
@@ -578,12 +595,12 @@ impl EngineState {
             view.display.hidden = hidden.clone();
         }
         if let Some(section) = &patch.section { view.display.section = section.clone(); }
-        let display = view.display.clone();
+        let view = view.clone();
         let block = if state.is_empty() { None } else { serde_json::to_value(&state).ok() };
         self.history.set_pmi_block(block, coalesce_key);
         self.rerun_history();
         if self.pmi_active_view.as_deref() == Some(id) {
-            self.apply_view_display(&display);
+            self.apply_view_display(&view);
         }
         Ok(())
     }
@@ -621,10 +638,15 @@ impl EngineState {
         self.refresh_pmi_overlay();
     }
 
-    fn apply_view_display(&mut self, display: &PmiDisplay) {
+    /// Apply a view's visibility and wireframe: a solid is hidden when the
+    /// view `hides` it — its captured baseline or one of its hide steps
+    /// (`PmiView::hides`, by name, so a step just added, edited, removed or
+    /// undone takes effect without waiting on a run).
+    fn apply_view_display(&mut self, view: &PmiView) {
+        let display = &view.display;
         let names: Vec<String> = self.scene.solids().iter().map(|s| s.name.clone()).collect();
         for name in names {
-            let hidden = display.hidden.contains(&name);
+            let hidden = view.hides(&name);
             if let Some(original) = self.pmi_explode_originals.get_mut(&name).filter(|original| original.visible == hidden) {
                 original.visible = !hidden;
                 self.pmi_unposed_visibility += 1;
@@ -680,7 +702,7 @@ impl EngineState {
             let _ = self.apply_camera_state_json(&json);
             self.controls_sync_after_camera_apply();
         }
-        self.apply_view_display(&view.display);
+        self.apply_view_display(&view);
         self.pmi_apply_explode();
         self.instructions_refresh_ghosts();
         if let Some(open) = &self.pmi_open_annotation {
@@ -869,12 +891,19 @@ impl EngineState {
         self.pmi_restore_explode();
         if let Some(active) = self.pmi_active_view.clone() {
             // A view that vanished (undo of its capture) deactivates.
-            let exists = self.pmi_state().find_view(&active).is_some();
-            if !exists {
-                self.pmi_active_view = None;
-                self.pmi_open_annotation = None;
-            } else {
-                self.pmi_apply_explode();
+            let view = self.pmi_state().find_view(&active).cloned();
+            match view {
+                None => {
+                    self.pmi_active_view = None;
+                    self.pmi_open_annotation = None;
+                }
+                Some(view) => {
+                    // The view's hide steps may have changed with this run
+                    // (added, edited, removed, suppressed, undone): the
+                    // displays take the view's visibility again, then its poses.
+                    self.apply_view_display(&view);
+                    self.pmi_apply_explode();
+                }
             }
         }
         self.instructions_refresh_ghosts();
@@ -1505,12 +1534,7 @@ fn pose_matrix(center: [f64; 3], translate: [f64; 3], rotate: &dyn Fn([f64; 3]) 
 }
 
 /// `a · b`, column-major 4×4.
-fn mat4_mul(a: &[f32; 16], b: &[f32; 16]) -> [f32; 16] {
-    std::array::from_fn(|k| {
-        let (col, row) = (k / 4, k % 4);
-        (0..4).map(|n| a[n * 4 + row] * b[col * 4 + n]).sum()
-    })
-}
+use crate::view::mat4_mul_column_major as mat4_mul;
 
 /// Put a posed display's geometry back to its original's, copying into the
 /// buffers it already holds: what a pose moves (positions, normals, edge

@@ -246,7 +246,7 @@ fn hole_loop_is_ccw(curves: &[NurbsCurve]) -> Result<bool, String> {
     for i in 0..points.len() {
         let a = points[i];
         let b = points[(i + 1) % points.len()];
-        area += a[0] * b[1] - b[0] * a[1];
+        area += crate::polygon::area_term(a, b);
     }
     Ok(area > 0.0)
 }

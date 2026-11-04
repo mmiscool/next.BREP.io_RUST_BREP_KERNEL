@@ -96,7 +96,7 @@ const MAX_PCURVE_POINTS: usize = 128;
 
 /// The offset family's own trace switch, the same `BREP_OS_DEBUG` the scan reads.
 fn debug_enabled() -> bool {
-    std::env::var("BREP_OS_DEBUG").is_ok_and(|value| !value.is_empty() && value != "0")
+    env_read!("BREP_OS_DEBUG").is_some_and(|value| !value.is_empty() && value != "0")
 }
 
 /// One traced branch of the fold locus, as a `(u, v)` polyline in the carrier's

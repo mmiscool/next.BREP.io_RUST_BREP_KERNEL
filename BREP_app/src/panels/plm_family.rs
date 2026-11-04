@@ -322,7 +322,7 @@ async fn load_info(client: &PlmClient, key: &str) -> Result<Info, String> {
         Vec::new()
     } else {
         let response = client
-            .call("GET", &format!("/api/categories/{}/schema", head.category), None)
+            .call("GET", &format!("/api/categories/{}/schema", crate::http::query_component(&head.category)), None)
             .await
             .map_err(|e| e.to_string())?;
         let schema: crate::panels::plm_parts::Schema =

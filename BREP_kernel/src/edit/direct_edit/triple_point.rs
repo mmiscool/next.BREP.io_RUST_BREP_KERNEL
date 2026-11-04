@@ -496,24 +496,16 @@ pub(super) fn solve_triple_point(
                 sigma_min: smallest_singular_value(&rows),
             });
         }
-        // Cramer's rule on J·δ = −f.
-        let rhs = Vec3::new(-signed[0], -signed[1], -signed[2]);
-        let replace = |column: usize| -> [Vec3; 3] {
-            let mut replaced = rows;
-            for (row, value) in replaced.iter_mut().zip([rhs.x, rhs.y, rhs.z]) {
-                match column {
-                    0 => row.x = value,
-                    1 => row.y = value,
-                    _ => row.z = value,
-                }
-            }
-            replaced
-        };
-        let step = Vec3::new(
-            determinant(&replace(0)) / det,
-            determinant(&replace(1)) / det,
-            determinant(&replace(2)) / det,
-        );
+        // Keep the determinant-based conditioning above; use the shared solve for J·δ = −f.
+        let solution = crate::fit::solve_small(
+            rows.map(|row| [row.x, row.y, row.z]),
+            signed.map(|value| -value),
+            3,
+        ).map_err(|_| TripleRefusal::Singular {
+            iteration,
+            sigma_min: smallest_singular_value(&rows),
+        })?;
+        let step = Vec3::new(solution[0], solution[1], solution[2]);
         point = point.add(step);
         last_step = step.length();
         let wandered = point.sub(seed).length();

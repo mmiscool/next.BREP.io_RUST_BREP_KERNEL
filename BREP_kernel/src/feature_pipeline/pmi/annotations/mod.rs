@@ -1,4 +1,4 @@
-//! The PMI annotation type table — ten types, each a module exposing its
+//! The PMI annotation type table — eleven types, each a module exposing its
 //! [`PmiTypeDef`] (`DEF`), its `schema()` and its resolver. The table is the
 //! third applicability family beside the feature catalogue and the assembly
 //! constraint types: an annotation predicate accepts plain AND component
@@ -9,6 +9,7 @@ pub mod angle;
 pub mod datum;
 pub mod explode;
 pub mod fcf;
+pub mod hide;
 pub mod hole_callout;
 pub mod leader;
 pub mod linear;
@@ -43,7 +44,7 @@ pub struct PmiTypeDef {
 }
 
 /// Panel / `+` dropdown order.
-pub const PMI_TYPES: [PmiTypeDef; 10] = [
+pub const PMI_TYPES: [PmiTypeDef; 11] = [
     linear::DEF,
     radial::DEF,
     angle::DEF,
@@ -54,6 +55,7 @@ pub const PMI_TYPES: [PmiTypeDef; 10] = [
     datum::DEF,
     fcf::DEF,
     explode::DEF,
+    hide::DEF,
 ];
 
 /// Look up a type by its canonical `type` string.
@@ -61,9 +63,36 @@ pub fn pmi_type(type_id: &str) -> Option<&'static PmiTypeDef> {
     PMI_TYPES.iter().find(|def| def.type_id == type_id)
 }
 
-/// The ten annotation schemas, table order.
+/// The eleven annotation schemas, table order.
 pub fn pmi_schema_catalogue() -> Value {
     Value::Array(PMI_TYPES.iter().map(|def| (def.schema)()).collect())
+}
+
+/// The solids a list of SOLID / COMPONENT references names, `(scene name,
+/// handle)`, each once: a solid by its name, a component (`ACOMP1`, or a
+/// nested `ACOMP1:ACOMP2`) by every solid it owns. What an explode step
+/// moves and a hide step hides.
+pub(super) fn target_solids(targets: &[String], context: &PmiContext<'_>) -> Result<Vec<(String, u32)>, String> {
+    if targets.is_empty() {
+        return Err("select at least one solid or component".into());
+    }
+    let mut solids: Vec<(String, u32)> = Vec::new();
+    for target in targets {
+        if let Some(handle) = context.scene.resolve_solid(target) {
+            solids.push((target.clone(), handle));
+        } else if crate::is_component_reference(crate::split_component_namespace(target).1) {
+            let members = context.scene.occurrence_solids(target);
+            if members.is_empty() {
+                return Err(format!("component '{target}' has no solids"));
+            }
+            solids.extend(members);
+        } else {
+            return Err(format!("'{target}' is not a solid or component"));
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    solids.retain(|(name, _)| seen.insert(name.clone()));
+    Ok(solids)
 }
 
 // --- shared schema-field builders --------------------------------------------

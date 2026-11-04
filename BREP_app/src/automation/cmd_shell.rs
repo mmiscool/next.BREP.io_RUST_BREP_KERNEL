@@ -5,7 +5,7 @@
 //! `hit_keys` records the command each button names, and a test refuses a
 //! toolbar button that names none. A widget an agent can only click is a widget
 //! it cannot use the moment something scrolls or covers the rect.
-use crate::automation::command::{parse_args, schema_of, Annotations, CommandSpec, Ctx, Empty, Handler, NoArgs, Outcome, Phase};
+use crate::automation::command::{app_command, parse_args, CommandSpec, Ctx, NoArgs, Outcome};
 use crate::automation::HELP_URL;
 use crate::panels::dock::PaneKind;
 use serde::Deserialize;
@@ -47,6 +47,42 @@ pub struct PickArgs {
 #[serde(deny_unknown_fields)]
 pub struct PickedArgs {
     pub tag: String,
+}
+
+// Shared envelopes follow the existing window/file-dialog producers.
+fn window_result_schema() -> Value {
+    json!({"type":"object","properties":{"open":{"type":"boolean"}},"required":["open"],"additionalProperties":false})
+}
+fn file_pick_result_schema() -> Value {
+    json!({"type":"object","properties":{"tag":{"type":"string"},"open":{"const":true}},
+        "required":["tag","open"],"additionalProperties":false})
+}
+fn file_picked_result_schema() -> Value {
+    json!({"type":"object","oneOf":[
+        {"type":"object","properties":{"picked":{"const":false},"picking":{"type":"boolean"}},
+         "required":["picked","picking"],"additionalProperties":false},
+        {"type":"object","properties":{"picked":{"const":true},"name":{"type":"string"},
+         "path":{"type":["string","null"]},"size":{"type":"integer","minimum":0},"text":{"type":["string","null"]}},
+         "required":["picked","name","path","size","text"],"additionalProperties":false}
+    ]})
+}
+fn help_open_result_schema() -> Value {
+    json!({"type":"object","properties":{"url":{"type":"string"}},"required":["url"],"additionalProperties":false})
+}
+fn diagnostics_result_schema() -> Value {
+    // Empty rows are omitted, notably the driver in browser builds.
+    let mut fields=serde_json::Map::new();
+    for name in ["Renderer","wgpu backend","Adapter","Device type","Driver","Max texture size","App version","Platform"] {
+        fields.insert(name.into(),json!({"type":"string"}));
+    }
+    json!({"type":"object","properties":fields,"additionalProperties":false})
+}
+fn describe_panes_result_schema() -> Value {
+    json!({"type":"object","properties":{"panes":{"type":"array","items":{"type":"string"}}},
+        "required":["panes"],"additionalProperties":false})
+}
+fn show_pane_result_schema() -> Value {
+    json!({"type":"object","properties":{"pane":{"type":"string"}},"required":["pane"],"additionalProperties":false})
 }
 
 fn file_pick(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
@@ -130,6 +166,23 @@ fn workbench_button(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
         return Err(format!("no workbench button `{}` (see describe_workbenches)", a.id));
     }
     Ok(Outcome::Done(json!({})))
+}
+
+fn describe_workbenches_result_schema() -> Value {
+    use super::plugin_output_schema::{action_schema, panels_schema, annotations_schema};
+    use super::schema_dsl::{array, closed_object_all};
+    let text=json!({"type":"string"});
+    let texts=array(text.clone());
+    let button=closed_object_all(json!({"id":text,"tooltip":text}));
+    let builtin=closed_object_all(json!({"id":text,"label":text,"buttons":array(button.clone()),"panels":texts}));
+    let owned=closed_object_all(json!({"id":text,"label":text,"featureTypes":texts,"actions":texts,"panels":texts}));
+    closed_object_all(json!({"active":text,"saved":text,
+        "pluginActions":array(action_schema()),"pluginPanels":panels_schema(),
+        "pluginAnnotations":annotations_schema(),
+        "workbenches":array(json!({"oneOf":[builtin,owned]})),
+        "sharedButtons":array(button),"activeButtons":texts,
+        "disabledButtons":array(closed_object_all(json!({"id":text,"reason":text})))
+    }))
 }
 
 fn describe_workbenches(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
@@ -228,16 +281,16 @@ fn show_pane(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
 }
 
 pub static COMMANDS: &[CommandSpec] = &[
-    CommandSpec { name: "file_pick", group: "shell", doc: "Open the file chooser for ANY file on this machine, on behalf of `tag` (what a panel's Add file… does). Natively it is the app's own explorer over the local files, even in a PLM session; drive it by its `pickfile:` hit keys. In the browser it is the page's file input. The chosen file is taken with `file_picked`.", phase: Phase::Mutate, annotations: Annotations::MUTATE_NOWAIT, args_schema: schema_of::<PickArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(file_pick) },
-    CommandSpec { name: "file_picked", group: "shell", doc: "Take the file the chooser delivered for `tag`, once: `{picked, name, path, size, text}` (`text` when it is UTF-8 and at most 4 KB), or `{picked: false, picking}` while the chooser is still open or after a cancel.", phase: Phase::Mutate, annotations: Annotations::MUTATE_NOWAIT, args_schema: schema_of::<PickedArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(file_picked) },
-    CommandSpec { name: "settings_window", group: "shell", doc: "Open or close the floating Settings window (the toolbar's gear). The settings themselves are read and written with `settings_get` / `settings_set`, no window needed.", phase: Phase::Mutate, annotations: Annotations::MUTATE_NOWAIT, args_schema: schema_of::<OpenArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(settings_window) },
-    CommandSpec { name: "part_properties_window", group: "shell", doc: "Open or close the floating Part Properties window (the toolbar's tag button), which edits the active document's own BOM attributes. The attributes themselves are read and written with `part_attributes_get` / `part_attribute_set`, no window needed.", phase: Phase::Mutate, annotations: Annotations::MUTATE_NOWAIT, args_schema: schema_of::<OpenArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(part_properties_window) },
-    CommandSpec { name: "help_open", group: "shell", doc: "Open the generated help site in a browser tab (the toolbar's Help button) and return its URL. Headless there is no browser, so the URL is the answer.", phase: Phase::Mutate, annotations: Annotations::MUTATE_NOWAIT, args_schema: schema_of::<NoArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(help_open) },
-    CommandSpec { name: "info_window", group: "shell", doc: "Open or close the floating Info window (the toolbar's \u{2139} button): the project + third-party licences, and this session's renderer diagnostics. Read the diagnostics themselves with `diagnostics`, no window needed.", phase: Phase::Mutate, annotations: Annotations::MUTATE_NOWAIT, args_schema: schema_of::<OpenArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(info_window) },
-    CommandSpec { name: "diagnostics", group: "shell", doc: "What this session is running on: the renderer actually in use (WebGPU or the WebGL2 fallback in a browser; Vulkan/Metal/Direct3D 12 natively), the adapter, the texture ceiling that bounds the viewport, the app version and the platform. Captured at startup from the adapter that is drawing, never re-probed \u{2014} the same rows the Info window shows and every problem report carries.", phase: Phase::Read, annotations: Annotations::READ, args_schema: schema_of::<NoArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(diagnostics) },
-    CommandSpec { name: "bug_report_open", group: "shell", doc: "Begin the in-app problem report (the toolbar's Submit Bug button): captures the current frame, then opens the description form.", phase: Phase::Mutate, annotations: Annotations::MUTATE_NOWAIT, args_schema: schema_of::<NoArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(bug_report_open) },
-    CommandSpec { name: "workbench_button", group: "shell", doc: "Press one of the active workbench's toolbar buttons by id — the same dispatch a click runs (flat pattern, add component, interference, parts library, capture PMI view; while a sheet is open, PMI's Back to 3D and the five sheet-dimension constructions; and while a sketch is being edited, the ten draw tools and Auto-constrain, which EVERY workbench carries). A button whose condition is not met right now is refused rather than run; `describe_workbenches` lists what is offered as `activeButtons`. An offered button that is DISABLED is refused with the reason (`describe_workbenches` `disabledButtons`), and a MENU button is refused with its entries, which are pressed by their own ids.", phase: Phase::Mutate, annotations: Annotations::MUTATE, args_schema: schema_of::<WorkbenchButtonArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(workbench_button) },
-    CommandSpec { name: "describe_workbenches", group: "shell", doc: "Every workbench with its label, its toolbar buttons and the panels it claims, plus which one is active. `buttons` is what that workbench DECLARES; `sharedButtons` is the list EVERY workbench's row also carries (the sketch draw tools), reported once because no workbench owns it. `activeButtons` is what the toolbar row is offering right NOW \u{2014} a button declared conditional on document state (Drawing's sheet buttons want an open sheet; the sketch tools want a sketch being edited) is listed under its workbench but absent from `activeButtons` until its condition holds. A MENU button's offered entries follow it in `activeButtons`; `disabledButtons` lists the offered buttons a press would refuse right now, each with the reason. Switch with `settings_set {patch:{workbench}}`.", phase: Phase::Read, annotations: Annotations::READ, args_schema: schema_of::<NoArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(describe_workbenches) },
-    CommandSpec { name: "describe_panes", group: "shell", doc: "Every dock pane name `show_pane` accepts.", phase: Phase::Read, annotations: Annotations::READ, args_schema: schema_of::<NoArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(describe_panes) },
-    CommandSpec { name: "show_pane", group: "shell", doc: "Bring a dock pane to the front (History, Scene, BOM, PMI, …) so its widgets are laid out and its hit-rects are publishable.", phase: Phase::Mutate, annotations: Annotations::MUTATE_NOWAIT, args_schema: schema_of::<PaneArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(show_pane) },
+    app_command!("shell", "file_pick", "Open the file chooser for ANY file on this machine, on behalf of `tag` (what a panel's Add file… does). Natively it is the app's own explorer over the local files, even in a PLM session; drive it by its `pickfile:` hit keys. In the browser it is the page's file input. The chosen file is taken with `file_picked`.", PickArgs, file_pick, Mutate, MUTATE_NOWAIT, file_pick_result_schema),
+    app_command!("shell", "file_picked", "Take the file the chooser delivered for `tag`, once: `{picked, name, path, size, text}` (`text` when it is UTF-8 and at most 4 KB), or `{picked: false, picking}` while the chooser is still open or after a cancel.", PickedArgs, file_picked, Mutate, MUTATE_NOWAIT, file_picked_result_schema),
+    app_command!("shell", "settings_window", "Open or close the floating Settings window (the toolbar's gear). The settings themselves are read and written with `settings_get` / `settings_set`, no window needed.", OpenArgs, settings_window, Mutate, MUTATE_NOWAIT, window_result_schema),
+    app_command!("shell", "part_properties_window", "Open or close the floating Part Properties window (the toolbar's tag button), which edits the active document's own BOM attributes. The attributes themselves are read and written with `part_attributes_get` / `part_attribute_set`, no window needed.", OpenArgs, part_properties_window, Mutate, MUTATE_NOWAIT, window_result_schema),
+    app_command!("shell", "help_open", "Open the generated help site in a browser tab (the toolbar's Help button) and return its URL. Headless there is no browser, so the URL is the answer.", NoArgs, help_open, Mutate, MUTATE_NOWAIT, help_open_result_schema),
+    app_command!("shell", "info_window", "Open or close the floating Info window (the toolbar's \u{2139} button): the project + third-party licences, and this session's renderer diagnostics. Read the diagnostics themselves with `diagnostics`, no window needed.", OpenArgs, info_window, Mutate, MUTATE_NOWAIT, window_result_schema),
+    app_command!("shell", "diagnostics", "What this session is running on: the renderer actually in use (WebGPU or the WebGL2 fallback in a browser; Vulkan/Metal/Direct3D 12 natively), the adapter, the texture ceiling that bounds the viewport, the app version and the platform. Captured at startup from the adapter that is drawing, never re-probed \u{2014} the same rows the Info window shows and every problem report carries.", NoArgs, diagnostics, Read, READ, diagnostics_result_schema),
+    app_command!("shell", "bug_report_open", "Begin the in-app problem report (the toolbar's Submit Bug button): captures the current frame, then opens the description form.", NoArgs, bug_report_open, Mutate, MUTATE_NOWAIT),
+    app_command!("shell", "workbench_button", "Press one of the active workbench's toolbar buttons by id — the same dispatch a click runs (flat pattern, add component, interference, parts library, capture PMI view; while a sheet is open, PMI's Back to 3D and the five sheet-dimension constructions; and while a sketch is being edited, the ten draw tools and Auto-constrain, which EVERY workbench carries). A button whose condition is not met right now is refused rather than run; `describe_workbenches` lists what is offered as `activeButtons`. An offered button that is DISABLED is refused with the reason (`describe_workbenches` `disabledButtons`), and a MENU button is refused with its entries, which are pressed by their own ids.", WorkbenchButtonArgs, workbench_button, Mutate, MUTATE),
+    app_command!("shell", "describe_workbenches", "Every workbench with its label, its toolbar buttons and the panels it claims, plus which one is active. `buttons` is what that workbench DECLARES; `sharedButtons` is the list EVERY workbench's row also carries (the sketch draw tools), reported once because no workbench owns it. `activeButtons` is what the toolbar row is offering right NOW \u{2014} a button declared conditional on document state (Drawing's sheet buttons want an open sheet; the sketch tools want a sketch being edited) is listed under its workbench but absent from `activeButtons` until its condition holds. A MENU button's offered entries follow it in `activeButtons`; `disabledButtons` lists the offered buttons a press would refuse right now, each with the reason. Switch with `settings_set {patch:{workbench}}`.", NoArgs, describe_workbenches, Read, READ, describe_workbenches_result_schema),
+    app_command!("shell", "describe_panes", "Every dock pane name `show_pane` accepts.", NoArgs, describe_panes, Read, READ, describe_panes_result_schema),
+    app_command!("shell", "show_pane", "Bring a dock pane to the front (History, Scene, BOM, PMI, …) so its widgets are laid out and its hit-rects are publishable.", PaneArgs, show_pane, Mutate, MUTATE_NOWAIT, show_pane_result_schema),
 ];

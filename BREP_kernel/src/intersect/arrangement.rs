@@ -12,6 +12,32 @@ pub struct Vec2 {
 }
 
 impl Vec2 {
+    /// Distance to a segment. `guard` is the caller's squared-length threshold.
+    #[inline]
+    pub fn distance_to_segment(self, start: Self, end: Self, guard: f64) -> f64 {
+        let segment = end.sub(start);
+        let length_squared = segment.dot(segment);
+        if length_squared <= guard {
+            return self.sub(start).length();
+        }
+        let parameter = (self.sub(start).dot(segment) / length_squared).clamp(0.0, 1.0);
+        self.sub(start.add(segment.scale(parameter))).length()
+    }
+
+    /// Squared distance, retaining the seed sweep's projection on zero-length segments.
+    #[inline]
+    pub fn distance_to_segment_squared(self, start: Self, end: Self) -> f64 {
+        let segment = end.sub(start);
+        let length_squared = segment.dot(segment);
+        let parameter = if length_squared > 0.0 {
+            (self.sub(start).dot(segment) / length_squared).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let residual = self.sub(start.add(segment.scale(parameter)));
+        residual.dot(residual)
+    }
+
     pub(crate) fn sub(self, other: Self) -> Self {
         Self {
             x: self.x - other.x,
@@ -202,50 +228,151 @@ pub fn segment_intersection(
     }
 }
 
-#[derive(Clone, Copy, PartialEq)]
-enum PolygonClass {
-    Inside,
-    Outside,
-    Boundary,
-}
+pub use crate::polygon::PolygonClass;
 
 fn point_segment_distance(point: Vec2, a: Vec2, b: Vec2) -> f64 {
-    let segment = b.sub(a);
-    let length_squared = segment.dot(segment);
-    if length_squared <= 1e-300 {
-        return point.distance(a);
-    }
-    let parameter = (point.sub(a).dot(segment) / length_squared).clamp(0.0, 1.0);
-    point.distance(Vec2 {
-        x: a.x + segment.x * parameter,
-        y: a.y + segment.y * parameter,
-    })
+    point.distance_to_segment(a, b, 1e-300)
 }
 
-fn point_in_polygon_class(point: Vec2, polygon: &[Vec2], tolerance: f64) -> PolygonClass {
-    for index in 0..polygon.len() {
-        if point_segment_distance(point, polygon[index], polygon[(index + 1) % polygon.len()])
-            <= tolerance
-        {
-            return PolygonClass::Boundary;
-        }
+/// The hole assignment's box rejection (2026-11-02): a point
+/// beyond a region polygon's vertex box by more than the classifier's
+/// tolerance plus a rounding pad is classified Outside without the O(n) test,
+/// and the full classifier would say the same. Its boundary band cannot fire
+/// (every computed segment distance exceeds the tolerance: the clamped foot
+/// lies in the box up to rounding the pad covers). Its form-K parity reads
+/// Outside: above or below the box no edge straddles the ray; to the right no
+/// crossing lies right of the point; to the left every straddling edge crosses
+/// right of it, and a closed loop has an even number of them. The hole loop
+/// was 60-70% of the arrangement's time on the package models (one negative
+/// cycle tested node by node against every positive region's polygon).
+/// Returns `[min_x, min_y, max_x, max_y, reach]`; `reach` is NaN (never
+/// reject) for an empty or non-finite polygon.
+fn polygon_reject_box(polygon: &[Vec2], tolerance: f64) -> [f64; 5] {
+    let mut bounds = [f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY];
+    let mut magnitude = 1.0f64;
+    for point in polygon {
+        bounds[0] = bounds[0].min(point.x);
+        bounds[1] = bounds[1].min(point.y);
+        bounds[2] = bounds[2].max(point.x);
+        bounds[3] = bounds[3].max(point.y);
+        magnitude = magnitude.max(point.x.abs()).max(point.y.abs());
     }
-    let mut inside = false;
-    for index in 0..polygon.len() {
-        let a = polygon[index];
-        let b = polygon[(index + 1) % polygon.len()];
-        if (a.y > point.y) != (b.y > point.y) {
-            let crossing = a.x + (point.y - a.y) / (b.y - a.y) * (b.x - a.x);
-            if crossing > point.x {
-                inside = !inside;
+    let finite = !polygon.is_empty() && bounds.iter().all(|value| value.is_finite()) && tolerance.is_finite() && tolerance >= 0.0;
+    let reach = if finite { tolerance * (1.0 + 1e-9) + 64.0 * f64::EPSILON * magnitude } else { f64::NAN };
+    [bounds[0], bounds[1], bounds[2], bounds[3], reach]
+}
+
+/// The classifier's boundary band, indexed (2026-11-02): a
+/// uniform grid over the polygon's vertex box whose cells list every edge whose
+/// box, widened by the tolerance plus a rounding pad, overlaps them. An edge
+/// whose computed distance to a point is within the tolerance has that point
+/// inside its widened box (the clamped foot lies in the edge's box up to
+/// rounding the pad covers), so the point's cell lists it; the band is an
+/// existence test, so testing the listed edges with the classifier's own
+/// distance gives the classifier's own answer. Parity is the original full
+/// scan. Why: a negative cycle that runs along a region's own boundary
+/// classifies Boundary at every node and goes on to the next, so the hole loop
+/// paid one full O(n) band scan per node.
+struct BoundaryBand {
+    origin: [f64; 2],
+    cell: [f64; 2],
+    side: usize,
+    reach: f64,
+    starts: Vec<u32>,
+    items: Vec<u32>,
+    usable: bool,
+}
+
+impl BoundaryBand {
+    fn new(polygon: &[Vec2], tolerance: f64) -> Self {
+        let reject = polygon_reject_box(polygon, tolerance);
+        let reach = reject[4];
+        let count = polygon.len();
+        let usable = reach.is_finite() && count >= 16 && count <= (1 << 24);
+        let side = if usable { ((count as f64).sqrt() as usize).clamp(4, 512) } else { 0 };
+        let origin = [reject[0] - reach, reject[1] - reach];
+        let extent = [(reject[2] + reach) - origin[0], (reject[3] + reach) - origin[1]];
+        let cell = [(extent[0] / side.max(1) as f64).max(f64::MIN_POSITIVE), (extent[1] / side.max(1) as f64).max(f64::MIN_POSITIVE)];
+        let mut band = Self { origin, cell, side, reach, starts: Vec::new(), items: Vec::new(), usable };
+        if !band.usable {
+            return band;
+        }
+        let mut counts = vec![0u32; side * side + 1];
+        let ranges: Vec<[usize; 4]> = (0..count)
+            .map(|index| {
+                let (a, b) = (polygon[index], polygon[(index + 1) % count]);
+                let pad = reach + 64.0 * f64::EPSILON * a.x.abs().max(a.y.abs()).max(b.x.abs()).max(b.y.abs());
+                [band.column(a.x.min(b.x) - pad), band.column(a.x.max(b.x) + pad), band.row(a.y.min(b.y) - pad), band.row(a.y.max(b.y) + pad)]
+            })
+            .collect();
+        for range in &ranges {
+            for y in range[2]..=range[3] {
+                for x in range[0]..=range[1] {
+                    counts[y * side + x + 1] += 1;
+                }
             }
         }
+        for index in 1..counts.len() {
+            counts[index] += counts[index - 1];
+        }
+        // Long edges cover many cells; past a budget the original scan is cheaper.
+        if counts[side * side] as usize > 64 * count + 4096 {
+            band.usable = false;
+            return band;
+        }
+        let mut cursor = counts.clone();
+        band.items = vec![0u32; counts[side * side] as usize];
+        for (edge, range) in ranges.iter().enumerate() {
+            for y in range[2]..=range[3] {
+                for x in range[0]..=range[1] {
+                    let slot = &mut cursor[y * side + x];
+                    band.items[*slot as usize] = edge as u32;
+                    *slot += 1;
+                }
+            }
+        }
+        band.starts = counts;
+        band
     }
-    if inside {
-        PolygonClass::Inside
-    } else {
-        PolygonClass::Outside
+    fn column(&self, x: f64) -> usize {
+        (((x - self.origin[0]) / self.cell[0]).floor().max(0.0) as usize).min(self.side - 1)
     }
+    fn row(&self, y: f64) -> usize {
+        (((y - self.origin[1]) / self.cell[1]).floor().max(0.0) as usize).min(self.side - 1)
+    }
+    fn classify(&self, point: Vec2, polygon: &[Vec2], tolerance: f64) -> PolygonClass {
+        if !self.usable || !point.x.is_finite() || !point.y.is_finite() {
+            return point_in_polygon_class(point, polygon, tolerance);
+        }
+        let cell = self.row(point.y) * self.side + self.column(point.x);
+        let count = polygon.len();
+        for &edge in &self.items[self.starts[cell] as usize..self.starts[cell + 1] as usize] {
+            let edge = edge as usize;
+            if point.distance_to_segment(polygon[edge], polygon[(edge + 1) % count], 1e-300) <= tolerance {
+                return PolygonClass::Boundary;
+            }
+        }
+        if crate::polygon::parity_inside([point.x, point.y], count, |i| [polygon[i].x, polygon[i].y]) {
+            PolygonClass::Inside
+        } else {
+            PolygonClass::Outside
+        }
+    }
+}
+
+fn outside_reject_box(point: Vec2, reject: &[f64; 5]) -> bool {
+    let reach = reject[4] + 64.0 * f64::EPSILON * point.x.abs().max(point.y.abs());
+    // NaN `reach` (or a NaN point) makes every comparison false: never reject.
+    point.x < reject[0] - reach || point.y < reject[1] - reach || point.x > reject[2] + reach || point.y > reject[3] + reach
+}
+
+fn hole_box_reject_enabled() -> bool {
+    switch!("BREP_ARRANGE_HOLE_BOX", true)
+}
+
+
+fn point_in_polygon_class(point: Vec2, polygon: &[Vec2], tolerance: f64) -> PolygonClass {
+    crate::polygon::classify(point, polygon, tolerance, 1e-300)
 }
 
 pub fn point_in_polygon(point: Vec2, polygon: &[Vec2], tolerance: f64) -> &'static str {
@@ -330,8 +457,74 @@ fn visit_segment_pairs(segments: &[Segment2], tolerance: f64, mut visit: impl Fn
         all_pairs(&mut visit);
         return;
     }
-    let tree = Bvh::build(&boxes);
+    let direction_tiers = direction_index_on();
+    // Row 29: the direction tiers' small-padding query is answered by a
+    // one-axis sweep instead of the tree, which is then not built (`None`
+    // from the sweep keeps the tree).
+    let small_padding = 2.0 * tolerance + 128.0 * f64::EPSILON / DIRECTION_SINE * scale;
+    let swept = if direction_tiers && arrange_sweep_on() { swept_pairs(&boxes, small_padding) } else { None };
+    let tree = swept.is_none().then(|| Bvh::build(&boxes));
     let mut candidates = Vec::new();
+    if direction_tiers {
+        // DIRECTION TIERS (lane O, 2026-10-28). The padding above is what a
+        // pair as near-parallel as the narrow phase admits (`sin θ` down to
+        // PARALLEL_THRESHOLD) can need, and on a face whose uv sit far from
+        // the origin it reaches across most of the arrangement: the filleted
+        // box's outward offset sends a 252-segment quarter-arc chain through
+        // here twice per attempt and the index visited nearly all 37 000
+        // pairs (0.7 ms a face). The same rounding model bounds a pair whose
+        // directions differ by `sin θ ≥ s` with the padding at `s` in place of
+        // the threshold. So every pair is visited under that small padding,
+        // and a pair whose directions lie within one bucket of each other
+        // (width `2s`, wrapping at π) — the only pairs that can be nearer
+        // parallel than `s` — under the full padding as before. Visit order
+        // and the narrow phase are unchanged; the visited set still contains
+        // every pair the full padding could accept.
+        let width = 2.0 * DIRECTION_SINE;
+        let bucket_count = ((std::f64::consts::PI / width).ceil() as usize).max(1);
+        let mut buckets: FxHashMap<usize, Vec<usize>> = FxHashMap::default();
+        let bucket_of: Vec<usize> = segments
+            .iter()
+            .map(|segment| {
+                let angle = (segment.b.y - segment.a.y).atan2(segment.b.x - segment.a.x).rem_euclid(std::f64::consts::PI);
+                ((angle / width) as usize).min(bucket_count - 1)
+            })
+            .collect();
+        for (index, bucket) in bucket_of.iter().enumerate() {
+            buckets.entry(*bucket).or_default().push(index);
+        }
+        let near = |a: &Aabb, b: &Aabb| {
+            a.minimum.x - padding <= b.maximum.x
+                && b.minimum.x - padding <= a.maximum.x
+                && a.minimum.y - padding <= b.maximum.y
+                && b.minimum.y - padding <= a.maximum.y
+        };
+        for (first, &bounds) in boxes.iter().enumerate() {
+            candidates.clear();
+            match (&swept, &tree) {
+                (Some(lists), _) => candidates.extend_from_slice(&lists[first]),
+                (None, Some(tree)) => tree.overlapping(bounds, small_padding, &mut candidates),
+                (None, None) => unreachable!("the tree is built whenever the sweep is not"),
+            }
+            let bucket = bucket_of[first];
+            for neighbour in [(bucket + bucket_count - 1) % bucket_count, bucket, (bucket + 1) % bucket_count] {
+                if let Some(members) = buckets.get(&neighbour) {
+                    candidates.extend(members.iter().copied().filter(|&second| second > first && near(&bounds, &boxes[second])));
+                }
+                if bucket_count < 3 {
+                    break;
+                }
+            }
+            candidates.retain(|&second| second > first);
+            candidates.sort_unstable();
+            candidates.dedup();
+            for &second in &candidates {
+                visit(first, second);
+            }
+        }
+        return;
+    }
+    let Some(tree) = tree else { unreachable!("the sweep runs only under the direction tiers") };
     for (first, &bounds) in boxes.iter().enumerate() {
         candidates.clear();
         tree.overlapping(bounds, padding, &mut candidates);
@@ -341,6 +534,85 @@ fn visit_segment_pairs(segments: &[Segment2], tolerance: f64, mut visit: impl Fn
             visit(first, second);
         }
     }
+}
+
+/// The direction sine above which [`visit_segment_pairs`] pads a pair with
+/// the small padding (see DIRECTION TIERS there).
+const DIRECTION_SINE: f64 = 1e-3;
+
+/// Lane O row 29 (2026-10-30, `BREP_ARRANGE_SWEEP`, default on since batch 12;
+/// `0`/`off` restores the tree): for each box `first`, every `second > first` whose box passes
+/// the tree's own leaf test `boxes[second].intersects(boxes[first], padding)`
+/// — the set [`Bvh::overlapping`] returns past `second > first`, since a node
+/// box contains its items' boxes — in ascending order. The candidates come
+/// from a sweep over the boxes sorted by their minimum on one axis, each
+/// scanning forward while the next minimum is within its maximum plus twice
+/// the padding: a pair the leaf test admits lies within the padding plus one
+/// rounding of either subtraction there, and the padding (at least
+/// 128 ε / DIRECTION_SINE of the largest coordinate) exceeds that rounding.
+///
+/// The axis is the one whose sweep windows (counted by binary search before
+/// any test runs) are fewer in total; when even those exceed 32 a box, the
+/// boxes overlap along both axes and `None` hands the query back to the tree,
+/// which prunes on both at once (a guard: of the D1, inward opposed and
+/// outward 3-adjacent shell cases probed, only D1 reaches the sweep, and
+/// never the fallback). D1's two 272-segment faces spent 0.38 ms a run
+/// building and querying the tree for 570 narrow-phase pairs that cost
+/// 0.04 ms.
+fn swept_pairs(boxes: &[Aabb], padding: f64) -> Option<Vec<Vec<usize>>> {
+    let reach = 2.0 * padding;
+    let low = |index: usize, axis: usize| if axis == 0 { boxes[index].minimum.x } else { boxes[index].minimum.y };
+    let high = |index: usize, axis: usize| if axis == 0 { boxes[index].maximum.x } else { boxes[index].maximum.y };
+    let mut best: Option<(usize, Vec<usize>, usize)> = None;
+    for axis in [0, 1] {
+        let mut order: Vec<usize> = (0..boxes.len()).collect();
+        order.sort_by(|&a, &b| low(a, axis).total_cmp(&low(b, axis)));
+        let lows: Vec<f64> = order.iter().map(|&index| low(index, axis)).collect();
+        let windows: usize = order
+            .iter()
+            .enumerate()
+            .map(|(position, &a)| {
+                let limit = high(a, axis) + reach;
+                lows.partition_point(|&value| value <= limit).saturating_sub(position + 1)
+            })
+            .sum();
+        if best.as_ref().is_none_or(|(least, _, _)| windows < *least) {
+            best = Some((windows, order, axis));
+        }
+    }
+    let (windows, order, axis) = best?;
+    if windows > 32 * boxes.len() {
+        return None;
+    }
+    let mut lists = vec![Vec::new(); boxes.len()];
+    for (position, &a) in order.iter().enumerate() {
+        let limit = high(a, axis) + reach;
+        for &b in &order[position + 1..] {
+            if low(b, axis) > limit {
+                break;
+            }
+            let (first, second) = if a < b { (a, b) } else { (b, a) };
+            if boxes[second].intersects(boxes[first], padding) {
+                lists[first].push(second);
+            }
+        }
+    }
+    for list in &mut lists {
+        list.sort_unstable();
+    }
+    Some(lists)
+}
+
+/// Row 29's switch ([`swept_pairs`]), read once.
+fn arrange_sweep_on() -> bool {
+    switch!("BREP_ARRANGE_SWEEP", true)
+}
+
+
+/// The direction tiers of [`visit_segment_pairs`], on unless
+/// `BREP_ARRANGE_DIRECTION_INDEX` is `0`/`off` (the A/B lever). Read once.
+fn direction_index_on() -> bool {
+    switch!("BREP_ARRANGE_DIRECTION_INDEX", true)
 }
 
 pub fn arrange_segments(
@@ -567,12 +839,28 @@ fn arrange_segments_impl(
             )
         })
         .collect();
+    let hole_boxes = hole_box_reject_enabled();
+    let boxes: Vec<[f64; 5]> = if hole_boxes {
+        regions.iter().map(|(_, polygon)| polygon_reject_box(polygon, tolerance)).collect()
+    } else {
+        Vec::new()
+    };
+    let mut bands: Vec<Option<BoundaryBand>> = (0..regions.len()).map(|_| None).collect();
     for cycle in negative {
-        for (region, polygon) in &mut regions {
+        for (region_index, (region, polygon)) in regions.iter_mut().enumerate() {
             let mut inside = false;
             let mut on_boundary = false;
             for node_index in &cycle.node_indices {
-                match point_in_polygon_class(nodes[*node_index].point, polygon, tolerance) {
+                let point = nodes[*node_index].point;
+                let class = if hole_boxes && outside_reject_box(point, &boxes[region_index]) {
+                    PolygonClass::Outside
+                } else if hole_boxes {
+                    let band = bands[region_index].get_or_insert_with(|| BoundaryBand::new(polygon, tolerance));
+                    band.classify(point, polygon, tolerance)
+                } else {
+                    point_in_polygon_class(point, polygon, tolerance)
+                };
+                match class {
                     PolygonClass::Boundary => {
                         on_boundary = true;
                         continue;

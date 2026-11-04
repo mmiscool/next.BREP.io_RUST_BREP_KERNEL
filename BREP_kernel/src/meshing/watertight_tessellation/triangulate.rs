@@ -7,6 +7,7 @@ mod earclip;
 mod interior;
 mod station_index;
 mod box_index;
+mod host_index;
 
 pub(in crate::watertight_tessellation) use chains::*;
 pub(in crate::watertight_tessellation) use bridge::*;

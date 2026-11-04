@@ -405,13 +405,5 @@ pub fn generate(
     Ok(out)
 }
 
-fn slerp(a: Point3, b: Point3, t: f64) -> Point3 {
-    let d = a.dot(b).clamp(-1.0, 1.0);
-    let theta = d.acos();
-    if theta < 1e-12 {
-        return a;
-    }
-    let s = theta.sin();
-    a.scale(((1.0 - t) * theta).sin() / s).add(b.scale((t * theta).sin() / s)).normalized().unwrap_or(b)
-}
+use crate::multiaxis::slerp;
 

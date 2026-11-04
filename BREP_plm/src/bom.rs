@@ -993,7 +993,10 @@ fn climb<'a>(
 // CSV
 // ===========================================================================
 
-fn cell(text: &str) -> String {
+/// One CSV cell: quoted (inner quotes doubled) when it holds a comma, a quote
+/// or a line break. The ONE quoting rule for every CSV the server writes (BOM,
+/// BOM layouts, the audit export, the backup's parts and files lists).
+pub(crate) fn csv_cell(text: &str) -> String {
     if text.contains([',', '"', '\n', '\r']) {
         format!("\"{}\"", text.replace('"', "\"\""))
     } else {
@@ -1058,11 +1061,11 @@ pub fn bom_csv_with(bom: &Bom, attachments: bool) -> String {
         if attachments {
             row.push(line.attachments.join("; "));
         }
-        out.push_str(&row.iter().map(|c| cell(c)).collect::<Vec<_>>().join(","));
+        out.push_str(&row.iter().map(|c| csv_cell(c)).collect::<Vec<_>>().join(","));
         out.push('\n');
     }
     for total in &bom.totals {
-        out.push_str(&format!("Total {},{}\n", cell(&total.currency), money(Some(total.total))));
+        out.push_str(&format!("Total {},{}\n", csv_cell(&total.currency), money(Some(total.total))));
     }
     if bom.unpriced > 0 {
         out.push_str(&format!("Unpriced lines,{}\n", bom.unpriced));

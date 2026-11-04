@@ -2155,6 +2155,77 @@ pub(super) fn regular_outward_sphere(face: &FaceRecord, distance: f64) -> Result
     Ok(factor.is_finite() && factor > COLLAPSE_FACTOR)
 }
 
+/// The cylinder certificate in [`outward_fold_the_carve_missed_with_certificate`],
+/// on unless `BREP_OFFSET_CYLINDER_FOLD_CERT` is `0`/`off`. Read once.
+fn cylinder_fold_certificate_on() -> bool {
+    switch!("BREP_OFFSET_CYLINDER_FOLD_CERT", true)
+}
+
+/// [`regular_outward_sphere`]'s twin for a CYLINDER — a full or partial
+/// revolution of a straight generatrix parallel to its axis, re-recognized
+/// from the current net. Its principal curvatures are `±1/r` around the axis
+/// and `0` along it, both constant over the whole support, so the offset is
+/// regular everywhere exactly when the circumferential factor
+/// `1 − distance · sign / r` clears `COLLAPSE_FACTOR` — the same expression
+/// the sphere certificate reads, for its one curved direction. The dense hunt
+/// below scans that constant field over the trim; this answers it once.
+/// Lane O, 2026-10-28: the filleted box's outward offset hunted its r = 1
+/// fillet for 1.6 ms per attempt (`D1_offset_filleted_box_out_half`). Every
+/// other carrier, and a cylinder at its collapse bar, takes the hunt.
+pub(super) fn regular_outward_cylinder(face: &FaceRecord, distance: f64) -> Result<bool, KernelRefusal> {
+    if !distance.is_finite() || distance >= 0.0 {
+        return Ok(false);
+    }
+    let Some(shape) = crate::analytic_surface::recognize(&face.surface) else { return Ok(false); };
+    let (frame, radius) = match &shape {
+        crate::AnalyticSurface::RuledRevolution { frame, rho0, rho1, .. } => {
+            let scale = rho0.abs().max(rho1.abs()).max(1.0);
+            if (rho0 - rho1).abs() > 1e-9 * scale {
+                return Ok(false);
+            }
+            (frame.clone(), 0.5 * (rho0 + rho1))
+        }
+        crate::AnalyticSurface::Revolution { frame, generatrix, .. } => {
+            if generatrix.degree != 1 || generatrix.control_points.len() != 2 {
+                return Ok(false);
+            }
+            let [first, second] = [generatrix.control_points[0], generatrix.control_points[1]];
+            if first.w <= 0.0 || (first.w - second.w).abs() > 1e-12 * first.w {
+                return Ok(false);
+            }
+            let (Ok(a), Ok(b)) = (first.point(), second.point()) else { return Ok(false); };
+            let radial = |point: Vec3| {
+                let offset = point.sub(frame.origin);
+                offset.sub(frame.axis.scale(offset.dot(frame.axis))).length()
+            };
+            let (ra, rb) = (radial(a), radial(b));
+            let scale = ra.max(rb).max(1.0);
+            if (ra - rb).abs() > 1e-9 * scale {
+                return Ok(false);
+            }
+            (frame.clone(), 0.5 * (ra + rb))
+        }
+        _ => return Ok(false),
+    };
+    if !radius.is_finite() || radius <= 0.0 {
+        return Ok(false);
+    }
+    let [u0, u1] = face.surface.domain_u().or_refuse(KernelStage::Refine, "domain_u")?;
+    let [v0, v1] = face.surface.domain_v().or_refuse(KernelStage::Refine, "domain_v")?;
+    let (u, v) = ((u0 + u1) * 0.5, (v0 + v1) * 0.5);
+    let point = face.surface.evaluate(u, v).or_refuse(KernelStage::Refine, "evaluate")?;
+    let offset = point.sub(frame.origin);
+    let radial = offset.sub(frame.axis.scale(offset.dot(frame.axis)));
+    let normal = face.surface.normal(u, v).or_refuse(KernelStage::Refine, "normal")?;
+    let sense = if face.same_sense { 1.0 } else { -1.0 };
+    let alignment = sense * normal.dot(radial) / radius;
+    if !alignment.is_finite() || alignment.abs() < 0.5 {
+        return Ok(false);
+    }
+    let factor = 1.0 - distance * alignment.signum() / radius;
+    Ok(factor.is_finite() && factor > COLLAPSE_FACTOR)
+}
+
 pub(super) fn outward_fold_the_carve_missed_with_certificate(
     face: &FaceRecord,
     distance: f64,
@@ -2165,6 +2236,9 @@ pub(super) fn outward_fold_the_carve_missed_with_certificate(
         return Ok(None);
     }
     if enabled && regular_outward_sphere(face, distance)? {
+        return Ok(None);
+    }
+    if enabled && cylinder_fold_certificate_on() && regular_outward_cylinder(face, distance)? {
         return Ok(None);
     }
     let region = TrimRegion::from_face(face)?;

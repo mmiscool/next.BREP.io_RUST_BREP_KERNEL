@@ -5,6 +5,8 @@ use serde::Serialize;
 pub struct StlReadResult {
     pub tri_count: u32,
     pub positions: Vec<f64>,
+    /// Encoding the bytes were read as (`"binary"` or `"ascii"` in JSON).
+    pub format: StlFormat,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -73,49 +75,335 @@ pub fn write_binary_stl(mesh: &Mesh, name: &str) -> Result<Vec<u8>, String> {
     Ok(output)
 }
 
-fn read_u32(data: &[u8], offset: usize) -> Result<u32, String> {
-    let bytes = data
-        .get(offset..offset + 4)
-        .ok_or_else(|| "read_binary_stl: truncated triangle count".to_string())?;
-    Ok(u32::from_le_bytes(bytes.try_into().unwrap()))
+/// Encoding detected while reading an STL.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StlFormat {
+    /// The 80-byte-header binary STL encoding.
+    Binary,
+    /// The line-oriented ASCII STL encoding.
+    Ascii,
 }
 
-fn read_f32(data: &[u8], offset: usize) -> Result<f32, String> {
-    let bytes = data
-        .get(offset..offset + 4)
-        .ok_or_else(|| "read_binary_stl: truncated triangle".to_string())?;
-    Ok(f32::from_le_bytes(bytes.try_into().unwrap()))
+impl std::fmt::Display for StlFormat {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Binary => "binary",
+            Self::Ascii => "ASCII",
+        })
+    }
 }
 
-/// Parse binary STL triangle positions for round-trip and import validation.
-pub fn read_binary_stl(data: &[u8]) -> Result<StlReadResult, String> {
-    if data.len() < 84 {
-        return Err("read_binary_stl: file is shorter than the STL header".into());
-    }
-    let triangle_count = read_u32(data, 80)?;
-    let expected = 84usize
-        .checked_add(50usize.saturating_mul(triangle_count as usize))
-        .ok_or_else(|| "read_binary_stl: file size overflow".to_string())?;
-    if data.len() < expected {
-        return Err(format!(
-            "read_binary_stl: expected {expected} bytes, received {}",
-            data.len()
-        ));
-    }
-    let mut positions = Vec::with_capacity(triangle_count as usize * 9);
-    let mut offset = 84;
-    for _ in 0..triangle_count {
-        offset += 12;
-        for _ in 0..9 {
-            positions.push(read_f32(data, offset)? as f64);
-            offset += 4;
+/// Why STL bytes are not a readable STL.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StlError {
+    /// The byte stream is neither a valid binary nor a valid ASCII STL.
+    InvalidFormat(String),
+    /// The STL ends before all declared data is present.
+    Truncated {
+        /// Total byte count required by the binary facet count.
+        expected: usize,
+        /// Actual byte count supplied.
+        actual: usize,
+    },
+    /// A numeric value or geometric facet is invalid.
+    InvalidGeometry(String),
+}
+
+impl std::fmt::Display for StlError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidFormat(message) => write!(f, "invalid STL format: {message}"),
+            Self::Truncated { expected, actual } => write!(
+                f,
+                "truncated binary STL: expected {expected} bytes, found {actual}"
+            ),
+            Self::InvalidGeometry(message) => write!(f, "invalid STL geometry: {message}"),
         }
-        offset += 2;
+    }
+}
+
+impl std::error::Error for StlError {}
+
+/// The facets of an STL in file order, before any welding.
+#[derive(Clone, Debug, PartialEq)]
+pub struct StlTriangles {
+    /// Encoding detected from the bytes.
+    pub format: StlFormat,
+    /// Each facet's three corners, in file order and winding.
+    pub triangles: Vec<[[f64; 3]; 3]>,
+}
+
+/// Parse binary or ASCII STL bytes into their facets.
+///
+/// Binary structure is checked before the leading `solid` token because
+/// binary STL headers are arbitrary and commonly begin with that word. A
+/// binary file must hold exactly the bytes its facet count declares; a file
+/// with no facets, or a facet normal or ASCII value that is not finite, is
+/// refused. Corner finiteness of binary facets is the caller's check.
+pub fn parse_stl_triangles(bytes: &[u8]) -> Result<StlTriangles, StlError> {
+    if bytes.is_empty() {
+        return Err(StlError::InvalidFormat("the input is empty".into()));
+    }
+
+    let binary_length = declared_binary_length(bytes);
+    let (format, triangles) = if binary_length == Some(bytes.len()) {
+        (StlFormat::Binary, parse_binary(bytes)?)
+    } else {
+        match parse_ascii(bytes) {
+            Ok(triangles) => (StlFormat::Ascii, triangles),
+            Err(ascii_error) => {
+                if let Some(expected) = binary_length {
+                    if expected > bytes.len() && looks_like_binary(bytes) {
+                        return Err(StlError::Truncated {
+                            expected,
+                            actual: bytes.len(),
+                        });
+                    }
+                }
+                return Err(ascii_error);
+            }
+        }
+    };
+    Ok(StlTriangles { format, triangles })
+}
+
+/// Read binary or ASCII STL bytes ([`parse_stl_triangles`]) as a flat
+/// triangle soup, refusing a corner that is not finite.
+pub fn read_stl(data: &[u8]) -> Result<StlReadResult, String> {
+    let parsed = parse_stl_triangles(data).map_err(|error| format!("read_stl: {error}"))?;
+    let mut positions = Vec::with_capacity(parsed.triangles.len() * 9);
+    for (facet, triangle) in parsed.triangles.iter().enumerate() {
+        if triangle.iter().flatten().any(|value| !value.is_finite()) {
+            return Err(format!(
+                "read_stl: {}",
+                StlError::InvalidGeometry(format!("facet {facet} has a non-finite vertex"))
+            ));
+        }
+        positions.extend(triangle.iter().flatten());
     }
     Ok(StlReadResult {
-        tri_count: triangle_count,
+        tri_count: parsed.triangles.len() as u32,
         positions,
+        format: parsed.format,
     })
+}
+
+fn declared_binary_length(bytes: &[u8]) -> Option<usize> {
+    let count_bytes: [u8; 4] = bytes.get(80..84)?.try_into().ok()?;
+    let count = u32::from_le_bytes(count_bytes) as usize;
+    84_usize.checked_add(count.checked_mul(50)?)
+}
+
+fn looks_like_binary(bytes: &[u8]) -> bool {
+    bytes
+        .iter()
+        .take(84)
+        .any(|&byte| !matches!(byte, b'\t' | b'\n' | b'\r' | 0x20..=0x7e))
+}
+
+fn parse_binary(bytes: &[u8]) -> Result<Vec<[[f64; 3]; 3]>, StlError> {
+    let expected = declared_binary_length(bytes)
+        .ok_or_else(|| StlError::InvalidFormat("binary header is incomplete".into()))?;
+    if expected != bytes.len() {
+        return Err(if expected > bytes.len() {
+            StlError::Truncated {
+                expected,
+                actual: bytes.len(),
+            }
+        } else {
+            StlError::InvalidFormat(format!(
+                "binary STL has {} unexpected trailing bytes",
+                bytes.len() - expected
+            ))
+        });
+    }
+    let count = (expected - 84) / 50;
+    if count == 0 {
+        return Err(StlError::InvalidGeometry(
+            "the STL contains no triangles".into(),
+        ));
+    }
+    let mut triangles = Vec::with_capacity(count);
+    for facet in 0..count {
+        let offset = 84 + facet * 50;
+        let normal = read_binary_vec3(bytes, offset)?;
+        if !normal.iter().all(|value| value.is_finite()) {
+            return Err(StlError::InvalidGeometry(format!(
+                "facet {facet} has a non-finite normal"
+            )));
+        }
+        triangles.push([
+            read_binary_vec3(bytes, offset + 12)?,
+            read_binary_vec3(bytes, offset + 24)?,
+            read_binary_vec3(bytes, offset + 36)?,
+        ]);
+    }
+    Ok(triangles)
+}
+
+fn read_binary_vec3(bytes: &[u8], offset: usize) -> Result<[f64; 3], StlError> {
+    let component = |start: usize| -> Result<f64, StlError> {
+        let raw: [u8; 4] = bytes
+            .get(start..start + 4)
+            .and_then(|slice| slice.try_into().ok())
+            .ok_or_else(|| StlError::InvalidFormat("binary vector is incomplete".into()))?;
+        Ok(f32::from_le_bytes(raw) as f64)
+    };
+    Ok([
+        component(offset)?,
+        component(offset + 4)?,
+        component(offset + 8)?,
+    ])
+}
+
+fn parse_ascii(bytes: &[u8]) -> Result<Vec<[[f64; 3]; 3]>, StlError> {
+    let text = std::str::from_utf8(bytes)
+        .map_err(|_| StlError::InvalidFormat("ASCII STL is not valid UTF-8".into()))?;
+    let lines: Vec<(usize, &str)> = text
+        .lines()
+        .enumerate()
+        .filter_map(|(index, line)| {
+            let trimmed = line.trim();
+            (!trimmed.is_empty()).then_some((index + 1, trimmed))
+        })
+        .collect();
+    let Some(&(first_line, first_raw)) = lines.first() else {
+        return Err(StlError::InvalidFormat("the input is empty".into()));
+    };
+    let first = first_raw.strip_prefix('\u{feff}').unwrap_or(first_raw);
+    if !first
+        .split_whitespace()
+        .next()
+        .is_some_and(|token| token.eq_ignore_ascii_case("solid"))
+    {
+        return Err(StlError::InvalidFormat(format!(
+            "line {first_line}: ASCII STL must begin with 'solid'"
+        )));
+    }
+
+    let mut cursor = 1;
+    let mut triangles = Vec::new();
+    while cursor < lines.len() {
+        let (line_number, line) = lines[cursor];
+        if line
+            .split_whitespace()
+            .next()
+            .is_some_and(|token| token.eq_ignore_ascii_case("endsolid"))
+        {
+            cursor += 1;
+            if cursor != lines.len() {
+                return Err(StlError::InvalidFormat(format!(
+                    "line {}: content follows 'endsolid'",
+                    lines[cursor].0
+                )));
+            }
+            break;
+        }
+        // parse_prefixed_vec3 refuses a non-finite value, the facet
+        // normal's included.
+        parse_prefixed_vec3(line_number, line, &["facet", "normal"])?;
+        cursor += 1;
+        expect_ascii_line(&lines, cursor, &["outer", "loop"])?;
+        cursor += 1;
+        let mut vertices = [[0.0; 3]; 3];
+        for vertex in &mut vertices {
+            let &(number, source) = lines
+                .get(cursor)
+                .ok_or_else(|| StlError::InvalidFormat("ASCII STL ends inside a facet".into()))?;
+            *vertex = parse_prefixed_vec3(number, source, &["vertex"])?;
+            cursor += 1;
+        }
+        expect_ascii_line(&lines, cursor, &["endloop"])?;
+        cursor += 1;
+        expect_ascii_line(&lines, cursor, &["endfacet"])?;
+        cursor += 1;
+        triangles.push(vertices);
+    }
+    if triangles.is_empty() {
+        return Err(StlError::InvalidGeometry(
+            "the STL contains no triangles".into(),
+        ));
+    }
+    Ok(triangles)
+}
+
+fn expect_ascii_line(
+    lines: &[(usize, &str)],
+    cursor: usize,
+    expected: &[&str],
+) -> Result<(), StlError> {
+    let &(number, source) = lines
+        .get(cursor)
+        .ok_or_else(|| StlError::InvalidFormat("ASCII STL ends inside a facet".into()))?;
+    let tokens: Vec<_> = source.split_whitespace().collect();
+    if tokens.len() == expected.len()
+        && tokens
+            .iter()
+            .zip(expected)
+            .all(|(actual, expected)| actual.eq_ignore_ascii_case(expected))
+    {
+        Ok(())
+    } else {
+        Err(StlError::InvalidFormat(format!(
+            "line {number}: expected '{}'",
+            expected.join(" ")
+        )))
+    }
+}
+
+fn parse_prefixed_vec3(
+    line_number: usize,
+    source: &str,
+    prefix: &[&str],
+) -> Result<[f64; 3], StlError> {
+    let tokens: Vec<_> = source.split_whitespace().collect();
+    if tokens.len() != prefix.len() + 3
+        || !tokens[..prefix.len()]
+            .iter()
+            .zip(prefix)
+            .all(|(actual, expected)| actual.eq_ignore_ascii_case(expected))
+    {
+        return Err(StlError::InvalidFormat(format!(
+            "line {line_number}: expected '{} x y z'",
+            prefix.join(" ")
+        )));
+    }
+    let mut values = [0.0; 3];
+    for (index, token) in tokens[prefix.len()..].iter().enumerate() {
+        values[index] = token.parse::<f64>().map_err(|_| {
+            StlError::InvalidFormat(format!("line {line_number}: '{token}' is not a number"))
+        })?;
+    }
+    if !values.iter().all(|value| value.is_finite()) {
+        return Err(StlError::InvalidGeometry(format!(
+            "line {line_number}: vector contains a non-finite value"
+        )));
+    }
+    Ok(values)
+}
+
+/// Write ASCII STL: `solid {name}`, one facet per `(normal, corners)` item,
+/// `endsolid {name}`. Values print with their own `Display`, so an `f32`
+/// source keeps its shortest `f32` text.
+pub fn write_ascii_stl<T, I>(name: &str, facets: I) -> String
+where
+    T: std::fmt::Display,
+    I: IntoIterator<Item = ([T; 3], [[T; 3]; 3])>,
+{
+    let mut out = format!("solid {name}\n");
+    for (normal, corners) in facets {
+        out.push_str(&format!(
+            "  facet normal {} {} {}\n    outer loop\n",
+            normal[0], normal[1], normal[2]
+        ));
+        for v in &corners {
+            out.push_str(&format!("      vertex {} {} {}\n", v[0], v[1], v[2]));
+        }
+        out.push_str("    endloop\n  endfacet\n");
+    }
+    out.push_str(&format!("endsolid {name}\n"));
+    out
 }
 
 /// Resolve one OBJ face-vertex reference (`v`, `v/vt`, `v//vn`, `v/vt/vn`)

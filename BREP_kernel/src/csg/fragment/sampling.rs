@@ -21,7 +21,7 @@ pub(super) fn subcurve_by_fraction(
     let domain = result.domain().or_refuse(KernelStage::Fragment, "domain")?;
     if second < domain[1] - epsilon && second > domain[0] + epsilon {
         result = result.split(second).or_refuse(KernelStage::Fragment, "split")?.0;
-    } else if std::env::var("BREP_DEBUG_SUBRANGE").is_ok() && second < domain[1] - epsilon {
+    } else if env_read!("BREP_DEBUG_SUBRANGE").is_some() && second < domain[1] - epsilon {
         eprintln!("abnormal subrange skip in fragment subcurve");
     }
     Ok(result)
@@ -62,6 +62,60 @@ pub(super) fn sample_chain(curve: &NurbsCurve) -> Result<Vec<Vec2>, KernelRefusa
             })
         })
         .collect()
+}
+
+/// A boundary chain's uniform sampling, DOUBLED until every chord's midpoint
+/// stays within `bound` of the pcurve, or `cap` samples are reached (hosted
+/// report 2026-11-02 "boolean fails", the shelf pin's foot cut): the pin's
+/// 0.01-wide cap ring is bounded by two concentric circles that
+/// [`sample_chain`] drew at 24 and 32 chords, sagging 0.02 and 0.0115 — more
+/// than the ring is wide — so the two polygons crossed each other all the way
+/// round and the arrangement that was to cut the ring in two at the foot's
+/// floor read one region. Uniform in parameter, so `refine_near_hints` can
+/// still take the result. Escape hatch `BREP_BOUNDARY_SAG_SAMPLING=0|off`
+/// restores the fixed count.
+pub(super) fn sample_boundary_chain(curve: &NurbsCurve, bound: f64, cap: usize) -> Result<Vec<Vec2>, KernelRefusal> {
+    let points = sample_chain(curve)?;
+    if !boundary_sag_sampling_enabled() || points.len() < 3 || !(bound > 0.0) || !bound.is_finite() {
+        return Ok(points);
+    }
+    let [start, end] = curve.domain().or_refuse(KernelStage::Fragment, "domain")?;
+    let mut count = points.len() - 1;
+    let mut points = points;
+    loop {
+        let mut worst = 0.0f64;
+        for index in 0..count {
+            let a = points[index];
+            let b = points[index + 1];
+            let parameter = start + (end - start) * (index as f64 + 0.5) / count as f64;
+            let mid = curve.evaluate(parameter).or_refuse(KernelStage::Fragment, "evaluate")?;
+            let mid = Vec2 { x: mid.x, y: mid.y };
+            let chord = b.sub(a);
+            let length = chord.length();
+            let sag = if length > 0.0 {
+                let t = mid.sub(a).dot(chord) / (length * length);
+                mid.sub(a.add(chord.scale(t.clamp(0.0, 1.0)))).length()
+            } else {
+                mid.sub(a).length()
+            };
+            worst = worst.max(sag);
+        }
+        if worst <= bound || count * 2 > cap {
+            return Ok(points);
+        }
+        count *= 2;
+        points = (0..=count)
+            .map(|index| {
+                let point = curve.evaluate(start + (end - start) * index as f64 / count as f64).or_refuse(KernelStage::Fragment, "evaluate")?;
+                Ok(Vec2 { x: point.x, y: point.y })
+            })
+            .collect::<Result<Vec<_>, KernelRefusal>>()?;
+    }
+}
+
+fn boundary_sag_sampling_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !matches!(std::env::var("BREP_BOUNDARY_SAG_SAMPLING").as_deref(), Ok("0") | Ok("off")))
 }
 
 /// Deterministic midpoint-bisection refinement of a cut chain's uniform
@@ -159,13 +213,7 @@ pub(super) fn sag_refine_chain(
 }
 
 pub(super) fn point_segment_distance(point: Vec2, start: Vec2, end: Vec2) -> f64 {
-    let direction = end.sub(start);
-    let length_squared = direction.dot(direction);
-    if length_squared <= 1e-30 {
-        return point.sub(start).length();
-    }
-    let fraction = (point.sub(start).dot(direction) / length_squared).clamp(0.0, 1.0);
-    point.sub(start.add(direction.scale(fraction))).length()
+    point.distance_to_segment(start, end, 1e-30)
 }
 
 /// BOUNDARY-CROSSING PARITY GUARD for sag-refined cut chains (t164, the

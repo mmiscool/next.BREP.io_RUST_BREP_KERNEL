@@ -173,10 +173,20 @@ impl Attachment {
 // The persisted block
 // ===========================================================================
 
+fn connections_or_null<'de, D>(deserializer: D) -> Result<Vec<WireHarnessConnection>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<Vec<WireHarnessConnection>>::deserialize(deserializer)?.unwrap_or_default())
+}
+
 /// The document's `wireHarness` block.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WireHarnessState {
-    #[serde(default)]
+    /// A `null` reads as no connections: the app once wrote `wireHarness:
+    /// {connections: null}` into boards without a harness (an occurrence
+    /// delete's retire, fixed 2026-10-31), and documents saved then must still run.
+    #[serde(default, deserialize_with = "connections_or_null")]
     pub connections: Vec<WireHarnessConnection>,
     /// Monotonic id counter (`wire-{n}`), never reused.
     #[serde(default, rename = "idCounter")]

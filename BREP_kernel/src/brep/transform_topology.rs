@@ -7,6 +7,33 @@ pub struct AffineTransform {
 }
 
 impl AffineTransform {
+    /// Whether this affine map is a finite, proper rigid placement.
+    pub fn is_rigid(&self, tolerance: f64) -> bool {
+        let m = &self.elements;
+        if !tolerance.is_finite() || tolerance < 0.0 || m.iter().any(|x| !x.is_finite()) {
+            return false;
+        }
+        if m[12].abs() > tolerance || m[13].abs() > tolerance || m[14].abs() > tolerance
+            || (m[15] - 1.0).abs() > tolerance {
+            return false;
+        }
+        let rows = [[m[0], m[1], m[2]], [m[4], m[5], m[6]], [m[8], m[9], m[10]]];
+        for i in 0..3 {
+            for j in i..3 {
+                let dot: f64 = (0..3).map(|k| rows[i][k] * rows[j][k]).sum();
+                let expected = if i == j { 1.0 } else { 0.0 };
+                if (dot - expected).abs() > tolerance { return false; }
+            }
+        }
+        (self.determinant3() - 1.0).abs() <= tolerance
+    }
+
+    /// Compose row-major transforms, applying `b` first.
+    pub fn compose(&self, b: &AffineTransform) -> Result<AffineTransform, String> {
+        // Iterator Sum starts at -0.0; the raw STEP loop starts at +0.0.
+        AffineTransform::new(multiply_elements_seeded(&self.elements, &b.elements, -0.0))
+    }
+
     pub fn new(elements: [f64; 16]) -> Result<Self, String> {
         if elements.iter().any(|value| !value.is_finite()) {
             return Err("AffineTransform: matrix must be finite".into());
@@ -25,7 +52,7 @@ impl AffineTransform {
     }
 
     /// Invert a rigid map as `[Rᵀ | −Rᵀ·t]`. The caller must verify rigidity.
-    pub(crate) fn rigid_inverse(&self) -> Result<Self, String> {
+    pub fn rigid_inverse(&self) -> Result<Self, String> {
         let m = &self.elements;
         let r = [[m[0], m[1], m[2]], [m[4], m[5], m[6]], [m[8], m[9], m[10]]];
         let t = [m[3], m[7], m[11]];
@@ -176,5 +203,24 @@ pub fn mirror_brep(
     ];
     let transform = AffineTransform::new(matrix)?;
     transform_brep(solid, transform, true)
+}
+
+
+pub(crate) fn multiply_elements(a: &[f64; 16], b: &[f64; 16]) -> [f64; 16] {
+    multiply_elements_seeded(a, b, 0.0)
+}
+
+fn multiply_elements_seeded(a: &[f64; 16], b: &[f64; 16], seed: f64) -> [f64; 16] {
+    let mut out = [0.0f64; 16];
+    for row in 0..4 {
+        for col in 0..4 {
+            let mut sum = seed;
+            for k in 0..4 {
+                sum += a[row * 4 + k] * b[k * 4 + col];
+            }
+            out[row * 4 + col] = sum;
+        }
+    }
+    out
 }
 

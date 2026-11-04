@@ -407,19 +407,7 @@ fn loop_polygon(face: &FaceRecord, loop_index: usize) -> Result<Vec<[f64; 2]>, K
 
 /// Even-odd parity of `point` against a uv polygon.
 fn polygon_contains(polygon: &[[f64; 2]], point: [f64; 2]) -> bool {
-    let mut inside = false;
-    let mut previous = polygon[polygon.len() - 1];
-    for current in polygon {
-        let straddles = (current[1] > point[1]) != (previous[1] > point[1]);
-        if straddles {
-            let t = (point[1] - current[1]) / (previous[1] - current[1]);
-            if point[0] < current[0] + t * (previous[0] - current[0]) {
-                inside = !inside;
-            }
-        }
-        previous = *current;
-    }
-    inside
+    crate::polygon::parity_inside(point, polygon.len(), |i| polygon[i])
 }
 
 /// The normalized position of `parameter` along an edge's own span.
@@ -1623,7 +1611,7 @@ fn interpolate_traced(
 
 /// `BREP_BLEND_EXACT_TRACE_ENDS=0` replays the free-end trim fit.
 fn exact_trace_ends_on() -> bool {
-    std::env::var("BREP_BLEND_EXACT_TRACE_ENDS").map_or(true, |value| value != "0")
+    switch!(live "BREP_BLEND_EXACT_TRACE_ENDS", true)
 }
 
 /// The unit tangent of blend ∩ obstacle at `point`, a point on both carriers:
@@ -2843,7 +2831,11 @@ pub(in crate::blend) fn restrict_closures(
         // The lattice's interior nodes (`uv_inside_face`'s own band), the
         // far ones answered by one query (`face_grid_classes`).
         let band_at = |uv: crate::Vec2| uv_band(face, uv.x, uv.y, policy.model);
-        for (uv, class) in crate::fillet::face_grid_classes(face, GRID, &band_at) {
+        let grid_timing = crate::blend::BlendTimer::start("timing.restriction.closure.convexity.grid_ms");
+        let classes: Vec<_> = crate::fillet::face_grid_classes(face, GRID, &band_at);
+        grid_timing.stop();
+        let probe_timing = crate::blend::BlendTimer::start("timing.restriction.closure.convexity.probes_ms");
+        for (uv, class) in classes {
             let (u, v) = (uv.x, uv.y);
             match class {
                 None | Some(Ok(crate::PolygonClass::Outside | crate::PolygonClass::Boundary)) => continue,
@@ -2864,6 +2856,7 @@ pub(in crate::blend) fn restrict_closures(
                 crate::PointClass::On => {}
             }
         }
+        probe_timing.stop();
         convexity_timing.stop();
         crate::classification::classify_profile_report("blend.restriction.closure");
         crate::classification::containment_profile_report("blend.restriction.closure");
@@ -2918,13 +2911,7 @@ fn marker_index(tagged: u64) -> Option<usize> {
 /// Signed area of a loop's uv polygon (shoelace over the sampled pcurves).
 fn loop_signed_area(face: &FaceRecord, loop_index: usize) -> Result<f64, KernelRefusal> {
     let polygon = loop_polygon(face, loop_index)?;
-    let mut area = 0.0;
-    for index in 0..polygon.len() {
-        let a = polygon[index];
-        let b = polygon[(index + 1) % polygon.len()];
-        area += a[0] * b[1] - b[0] * a[1];
-    }
-    Ok(0.5 * area)
+    Ok(0.5 * crate::polygon::twice_signed_area_2d(polygon.len(), |i| polygon[i]))
 }
 
 /// Carry out a void restriction.

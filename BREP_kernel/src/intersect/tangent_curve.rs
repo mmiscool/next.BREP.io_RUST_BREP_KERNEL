@@ -44,7 +44,7 @@ use crate::fit::solve_small;
 use crate::surface_surface_intersection::{SurfaceIntersectionCurve, SurfaceIntersectionOptions};
 use crate::{project_point_to_surface, NurbsSurface, Vec3};
 
-const EPSILON: f64 = 1e-12;
+const EPSILON: f64 = crate::tolerance::FP_FLOOR;
 
 /// Smallest `min|λ| / κ` of `H = II_a − II_b` at which the contact counts as
 /// an isolated node or point rather than EXTENDED along `H`'s null direction.
@@ -77,6 +77,31 @@ const TURN_SHRINK: f64 = 0.15;
 const NORMAL_TURN_BUDGET: f64 = 0.1;
 /// Reach floor of the trace in carrier extents, as the ordinary march's.
 const MARCH_REACH_EXTENTS: f64 = 4.0;
+
+/// A corrector clamp below this fraction of the parameter span, on a domain
+/// edge the trace STARTED on, is a GRAZING clamp — the contact curve runs
+/// ALONG that edge and round-off pushed the step a hair outside — not the
+/// trace reaching the edge. Measured on the sheet-metal hinge (a bend band
+/// tangent to its plate along the band's own angle-0 seam,
+/// `reported_adjacent_flanges_build_sequentially_at_thin_stock`, 2026-10-28):
+/// the grazing clamps read `4e-17` to `6e-9` of the span (the Gauss-Newton
+/// step is noisy along the degenerate direction), while the clamp at the
+/// hinge's real end read `2e-2` — one predictor step. Before this band every
+/// such clamp ended the trace at its first station, so the recorded contact
+/// was one march step long (extent / 100) and its inner end split the hinge
+/// rim mid-edge. Seventeen-fold above the worst grazing value, four decades
+/// under a real step at the minimum step size.
+///
+/// The edge condition keeps every other trace as it was, and so does the
+/// edge's shape: it must be an OPEN segment (the surface not closed in the
+/// other direction). A contact running along a closed boundary ring — the
+/// near-full-round fillet's cutter meets the rod's end plane along the
+/// cutter's own end circle, radius 3.8e-3
+/// (`a_near_full_round_never_returns_a_body_off_its_closed_form`) — IS that
+/// ring, the carrier's own edge; traced whole it is a closed section the
+/// tangent imprint declines, where the one-step stub it always was is minted
+/// and the body comes out at its closed form. The stub stays.
+const GRAZING_CLAMP: f64 = 1e-7;
 /// Distance gate (fraction of the carriers' extent) inside which a grid sample
 /// is a contact candidate at all.
 const CANDIDATE_GATE_FRACTION: f64 = 1e-2;
@@ -400,38 +425,16 @@ fn second_fundamental_form(
 }
 
 fn eigenvalues(matrix: [[f64; 2]; 2]) -> (f64, f64) {
-    let trace = matrix[0][0] + matrix[1][1];
-    let determinant = matrix[0][0] * matrix[1][1] - matrix[0][1] * matrix[1][0];
-    let discriminant = (trace * trace / 4.0 - determinant).max(0.0).sqrt();
-    (trace / 2.0 + discriminant, trace / 2.0 - discriminant)
+    crate::eigen2::eigenvalues(matrix)
 }
 
 fn spectral_norm(matrix: [[f64; 2]; 2]) -> f64 {
-    let (first, second) = eigenvalues(matrix);
-    first.abs().max(second.abs())
+    crate::eigen2::spectral_norm(matrix)
 }
 
 /// Unit eigenvector of a symmetric 2×2 matrix for the eigenvalue `lambda`.
 fn eigenvector(matrix: [[f64; 2]; 2], lambda: f64) -> [f64; 2] {
-    let candidates = [
-        [matrix[0][1], lambda - matrix[0][0]],
-        [lambda - matrix[1][1], matrix[0][1]],
-    ];
-    let mut best = [1.0, 0.0];
-    let mut best_length = 0.0;
-    for candidate in candidates {
-        let length = (candidate[0] * candidate[0] + candidate[1] * candidate[1]).sqrt();
-        if length > best_length {
-            best_length = length;
-            best = [candidate[0] / length, candidate[1] / length];
-        }
-    }
-    if best_length == 0.0 {
-        // The matrix is a multiple of the identity: every direction is an
-        // eigenvector, and none is a null direction unless the multiple is 0.
-        return [1.0, 0.0];
-    }
-    best
+    crate::eigen2::eigenvector(matrix, lambda)
 }
 
 /// The local structure of the contact at a station: the eigenvalues of
@@ -656,6 +659,7 @@ pub fn find_tangent_contact(
 /// a non-closed domain end is frozen there and the plane constraint is
 /// dropped — the boundary is then what pins the station along the curve — and
 /// the flag reports that the trace has reached a boundary.
+#[allow(clippy::too_many_arguments)]
 fn correct(
     first: &NurbsSurface,
     second: &NurbsSurface,
@@ -665,6 +669,7 @@ fn correct(
     predicted: Vec3,
     direction: Vec3,
     tolerance: f64,
+    on_edge: [bool; 4],
 ) -> Result<Option<(Station, bool)>, String> {
     let spans = [domain_a.spans()[0], domain_a.spans()[1], domain_b.spans()[0], domain_b.spans()[1]];
     let fit = |station: Station| Station {
@@ -726,8 +731,14 @@ fn correct(
                 _ => domain_b.fit(raw, false),
             };
             if clamped {
+                // The parameter is frozen on the domain edge either way; a
+                // clamp by round-off on an edge the trace started on is the
+                // curve running along it, anything else is the trace
+                // REACHING the edge (see `GRAZING_CLAMP`).
                 free[index] = false;
-                boundary = true;
+                if !on_edge[index] || (raw - fitted).abs() > GRAZING_CLAMP * spans[index] {
+                    boundary = true;
+                }
             }
             moved = moved.max((fitted - current.parameter(index)).abs() / spans[index]);
             next = next.with_parameter(index, fitted);
@@ -779,6 +790,28 @@ fn trace(
     let mut current = start;
     let mut direction = start_direction;
     let mut step_size = initial_step.min(maximum_step);
+    // The open domain edges the start station sits on (within the grazing
+    // band of their span): the segments a contact curve can run along. An
+    // edge of a surface closed in the other direction is a ring, not a
+    // segment, and a clamp onto it ends the trace as it always did.
+    let on_edge = {
+        let spans = [domain_a.spans()[0], domain_a.spans()[1], domain_b.spans()[0], domain_b.spans()[1]];
+        let ends = [
+            (domain_a.u0, domain_a.u1, domain_a.closed_u, domain_a.closed_v),
+            (domain_a.v0, domain_a.v1, domain_a.closed_v, domain_a.closed_u),
+            (domain_b.u0, domain_b.u1, domain_b.closed_u, domain_b.closed_v),
+            (domain_b.v0, domain_b.v1, domain_b.closed_v, domain_b.closed_u),
+        ];
+        let mut flags = [false; 4];
+        for index in 0..4 {
+            let (low, high, closed, edge_is_ring) = ends[index];
+            let value = start.parameter(index);
+            flags[index] = !closed
+                && !edge_is_ring
+                && ((value - low).abs() <= GRAZING_CLAMP * spans[index] || (value - high).abs() <= GRAZING_CLAMP * spans[index]);
+        }
+        flags
+    };
     if let Some(frame) = frame_at(first, second, start) {
         if let Some(difference) = height_difference(first, second, start, frame) {
             if let Some(ceiling) = normal_turn_ceiling(&difference) {
@@ -793,7 +826,7 @@ fn trace(
         while step_size >= minimum_step {
             let predicted = current.point.add(direction.scale(step_size));
             if let Some((corrected, boundary)) =
-                correct(first, second, domain_a, domain_b, current, predicted, direction, tolerance)?
+                correct(first, second, domain_a, domain_b, current, predicted, direction, tolerance, on_edge)?
             {
                 if corrected.point.sub(current.point).length() <= 2.5 * step_size {
                     accepted = Some((corrected, boundary));
@@ -936,6 +969,21 @@ pub fn trace_tangent_curve(
         tangents.extend(forward.tangents);
         (stations, tangents, false)
     };
+    // A trace that starts ON a domain end (the hinge's corner) hands back a
+    // boundary station a round-off jump from its start: drop any station
+    // within the tolerance of the one kept before it.
+    let mut kept_stations: Vec<Station> = Vec::with_capacity(stations.len());
+    let mut kept_tangents: Vec<Vec3> = Vec::with_capacity(tangents.len());
+    for (station, tangent) in stations.into_iter().zip(tangents) {
+        if let Some(last) = kept_stations.last() {
+            if station.point.sub(last.point).length() <= options.tolerance {
+                continue;
+            }
+        }
+        kept_stations.push(station);
+        kept_tangents.push(tangent);
+    }
+    let (stations, tangents) = (kept_stations, kept_tangents);
     if stations.len() < 2 {
         return Ok(None);
     }

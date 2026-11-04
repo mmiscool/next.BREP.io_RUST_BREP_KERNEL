@@ -24,6 +24,7 @@
 //! with a waker that repaints, as S7's panel does. Nothing here is constructed
 //! without a server.
 
+use crate::http::query_component;
 use crate::panels::plm_parts::Pending;
 use crate::plm::PlmFuture;
 use eframe::egui;
@@ -399,7 +400,7 @@ impl PlmReviewClient {
     }
 
     fn revision_path(part: &str, revision: &str, rest: &str) -> String {
-        format!("/api/parts/{}/revisions/{}{rest}", segment(part), segment(revision))
+        format!("/api/parts/{}/revisions/{}{rest}", query_component(part), query_component(revision))
     }
 }
 
@@ -408,7 +409,7 @@ impl PlmReview for PlmReviewClient {
         self.json("GET", Self::revision_path(part, revision, "/review"), None)
     }
     fn lock(&self, part: &str, revision: &str) -> PlmFuture<Lock> {
-        let view: PlmFuture<serde_json::Value> = self.json("GET", format!("/api/parts/{}", segment(part)), None);
+        let view: PlmFuture<serde_json::Value> = self.json("GET", format!("/api/parts/{}", query_component(part)), None);
         let revision = revision.to_string();
         Box::pin(async move {
             let view = view.await?;
@@ -436,30 +437,9 @@ impl PlmReview for PlmReviewClient {
 
 }
 
-/// A path segment, percent-encoded outside the unreserved set.
-fn segment(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    for byte in text.bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(byte as char),
-            other => out.push_str(&format!("%{other:02X}")),
-        }
-    }
-    out
-}
-
 /// `YYYY-MM-DD` (UTC) for unix seconds.
 pub fn date(unix: u64) -> String {
-    // Howard Hinnant's civil_from_days.
-    let z = (unix / 86_400) as i64 + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z.rem_euclid(146_097);
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = doy - (153 * mp + 2) / 5 + 1;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = yoe + era * 400 + i64::from(month <= 2);
+    let (year, month, day) = brep_render::sheets::frame::civil_from_days((unix / 86_400) as i64);
     format!("{year:04}-{month:02}-{day:02}")
 }
 

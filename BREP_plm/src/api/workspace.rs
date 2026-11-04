@@ -76,6 +76,12 @@ pub async fn folders_linking(
     Ok(Json(json!({ "folders": folders })))
 }
 
+/// Every folder the caller may read, linked anywhere or nowhere.
+pub async fn list_folders(State(db): State<Shared>, headers: HeaderMap) -> Result<Json<Value>, Error> {
+    let user = require_user(&db, &headers)?;
+    Ok(Json(json!({ "folders": db.workspace_folders(&user), "seq": seq(&db) })))
+}
+
 #[derive(Debug, Deserialize, Default)]
 pub struct NewFolder {
     #[serde(default)]
@@ -105,10 +111,26 @@ pub struct NewLink {
     #[serde(default)]
     pub name: String,
     /// A part id or number.
+    #[serde(default)]
     pub part: String,
     /// A revision id or label to pin to; empty follows the newest.
     #[serde(default)]
     pub revision: String,
+    /// Instead of a part: a folder (or a link to one) to link, the same
+    /// folder in each place.
+    #[serde(default)]
+    pub folder: String,
+    /// With `folder`: a user id or username whose Home gets the link, at
+    /// its top (the folder's owner only). Empty: the caller's `parent`.
+    #[serde(default)]
+    pub home: String,
+    /// Instead of a part or folder: a file (or a link to one).
+    #[serde(default)]
+    pub file: String,
+    /// Instead: an attachment, on the part `part` (and revision `revision`,
+    /// when it is a revision's).
+    #[serde(default)]
+    pub attachment: String,
 }
 
 pub async fn create_link(
@@ -119,10 +141,81 @@ pub async fn create_link(
     let user = require_user(&db, &headers)?;
     let made = blocking({
         let db = db.clone();
-        move || db.create_link(&user, &body.parent, &body.name, &body.part, &body.revision)
+        move || {
+            if !body.folder.trim().is_empty() {
+                db.link_folder(&user, &body.parent, &body.folder, &body.home)
+            } else if !body.file.trim().is_empty() {
+                db.link_file(&user, &body.parent, &body.file)
+            } else if !body.attachment.trim().is_empty() {
+                db.link_attachment(&user, &body.parent, &body.attachment, &body.part, &body.revision)
+            } else {
+                db.create_link(&user, &body.parent, &body.name, &body.part, &body.revision)
+            }
+        }
     })
     .await?;
     Ok(Json(json!({ "ok": true, "entry": made, "seq": seq(&db) })))
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct NewCopy {
+    #[serde(default)]
+    pub parent: String,
+    /// One of these: a folder, a file, an attachment (with `part` and
+    /// `revision` saying whose), or a part (with `revision`, which model).
+    #[serde(default)]
+    pub folder: String,
+    #[serde(default)]
+    pub file: String,
+    #[serde(default)]
+    pub attachment: String,
+    #[serde(default)]
+    pub part: String,
+    #[serde(default)]
+    pub revision: String,
+    /// For a part whose type takes a typed number: the copy's number.
+    #[serde(default)]
+    pub number: String,
+}
+
+/// Paste a new unique copy of a folder, file, attachment or part into a
+/// folder the caller owns (or their Home).
+pub async fn create_copy(
+    State(db): State<Shared>,
+    headers: HeaderMap,
+    Json(body): Json<NewCopy>,
+) -> Result<Json<Value>, Error> {
+    use crate::workspace::CopyOf;
+    let user = require_user(&db, &headers)?;
+    let answer = blocking({
+        let db = db.clone();
+        move || {
+            let what = if !body.folder.trim().is_empty() {
+                CopyOf::Folder(body.folder)
+            } else if !body.file.trim().is_empty() {
+                CopyOf::File(body.file)
+            } else if !body.attachment.trim().is_empty() {
+                CopyOf::Attachment { id: body.attachment, part: body.part, revision: body.revision }
+            } else if !body.part.trim().is_empty() {
+                let part = db.copy_part(&user, &body.parent, &body.part, &body.revision, &body.number)?;
+                return Ok(json!({ "part": part }));
+            } else {
+                return Err(Error::bad_request("name a folder, file, attachment or part to copy"));
+            };
+            db.paste_copy(&user, &body.parent, &what).map(|entry| json!({ "entry": entry }))
+        }
+    })
+    .await?;
+    let mut answer = answer;
+    answer["ok"] = json!(true);
+    answer["seq"] = json!(seq(&db));
+    Ok(Json(answer))
+}
+
+/// Every file the caller may read, linked anywhere or nowhere.
+pub async fn list_files(State(db): State<Shared>, headers: HeaderMap) -> Result<Json<Value>, Error> {
+    let user = require_user(&db, &headers)?;
+    Ok(Json(json!({ "files": db.workspace_files(&user), "seq": seq(&db) })))
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -211,13 +304,7 @@ pub async fn replace_file(
 ) -> Result<Json<Value>, Error> {
     let user = require_user(&db, &headers)?;
     // Refuse a caller who may not write before reading the bytes.
-    db.read(|state| {
-        let e = state.workspace.iter().find(|e| e.id == id).ok_or_else(|| Error::not_found("workspace entry"))?;
-        if e.owner != user.id {
-            return Err(Error::forbidden("only its owner changes a workspace"));
-        }
-        Ok(())
-    })?;
+    db.read(|state| crate::workspace::check_may_change(state, &user, &id))?;
     let expected = headers.get(axum::http::header::IF_MATCH).and_then(|v| v.to_str().ok()).map(|v| v.trim_matches('"').to_string());
     if expected.as_ref().is_some_and(|v| !crate::attach::is_sha256(v)) { return Err(Error::bad_request("If-Match must name the current file hash")); }
     let staged = super::attachments::receive_with_empty(&db, &headers, body, true).await?;

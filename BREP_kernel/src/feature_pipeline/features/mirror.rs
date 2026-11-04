@@ -54,6 +54,20 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, String> {
         ctx.id.clone()
     };
     for (source_name, handle) in &resolved {
+        let name = format!("{feature_id}:{source_name}:M");
+        // A mirrored sheet-metal part stays sheet metal, so flanges and unfolds
+        // work on the copy (report 20261028T220228Z-cc228ef6). The copy IS its
+        // reflected tree's evaluation, so later sheet-metal edits keep every
+        // name on the same face (a reflected fold edge runs the other way, so
+        // its bend's END caps trade names against a reflected solid).
+        if let Some(tree) = crate::feature_pipeline::sheet_metal::get_tree(*handle) {
+            if let Some(tree) = tree.mirrored(plane.point, plane.normal.normalized()?, &feature_id)? {
+                if let Ok(added) = crate::feature_pipeline::sheet_metal::register_folded(tree, &name) {
+                    result.added.push(added);
+                    continue;
+                }
+            }
+        }
         // Short registry borrow: reflect and hand back the owned mirrored solid.
         let mut mirrored = crate::with_registered_solid_str(*handle, |solid| {
             mirror_brep(solid, plane.point, plane.normal)
@@ -65,7 +79,6 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, String> {
         // contract). Without this the reflected edges kept the source's exact
         // names (`Box_NX|Box_NZ[0]`), so two solids shared edge names.
         common::namespace_copy_names(&mut mirrored, &feature_id);
-        let name = format!("{feature_id}:{source_name}:M");
         let face_names = common::collect_face_names(&mirrored);
         let edge_names = common::collect_edge_names(&mirrored);
         let new_handle = crate::register_solid_value(mirrored);

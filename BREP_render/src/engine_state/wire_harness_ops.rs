@@ -33,6 +33,11 @@ impl EngineState {
     /// The panel's verifier global: the block, the report, and the endpoint
     /// choices, as one JSON object.
     pub fn wire_harness_state_json(&self) -> String {
+        self.wire_harness_state_value().to_string()
+    }
+
+    /// [`Self::wire_harness_state_json`] as a JSON value.
+    pub fn wire_harness_state_value(&self) -> serde_json::Value {
         let state = self.wire_harness_state();
         serde_json::json!({
             "connections": state.connections,
@@ -40,7 +45,6 @@ impl EngineState {
             "cutMargin": state.cut_margin,
             "report": self.wire_harness_report,
         })
-        .to_string()
     }
 
     // --- mutations (checkpointed document edits + re-run) -------------------

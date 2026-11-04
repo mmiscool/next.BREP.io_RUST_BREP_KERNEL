@@ -39,7 +39,7 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, FeatureRefusal> {
     // collapsed-fillet reports both select `Box_PY|Box_PZ[0]`, which their own
     // r = 18 blend consumed, beside the live mouth edge.  Whether that partial
     // should refuse too is a contract question, not this feature's alone.
-    let Some(target) = selection.target else {
+    let Some(mut target) = selection.target else {
         if result.unresolved.is_empty() {
             return Ok(result);
         }
@@ -62,6 +62,24 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, FeatureRefusal> {
     // (tapered) fillet.
     let taper = common::optional_number(ctx, "radiusEnd")?
         .filter(|value| value.is_finite() && *value > 0.0 && (*value - radius).abs() > 1e-9);
+
+    // "Follow tangent": every edge picked AS AN EDGE grows to its whole G1
+    // tangent chain on the solid (a picked face keeps meaning its own
+    // boundary edges, unchanged), derived
+    // afresh on every run from the resolved references, so replay re-reads
+    // it by name and never stores it. A key the document does not carry
+    // reads as OFF: documents written before the option exist are unchanged;
+    // a new feature takes the schema's `true`.
+    let followed = if follow_tangent(ctx) { follow_tangent_chains(&mut target)? } else { Vec::new() };
+    if !followed.is_empty() {
+        let requested = common::reference_names(ctx.param("edges"));
+        let fulfilment = result.fulfilment.get_or_insert_with(|| crate::feature_pipeline::Fulfilment {
+            applied: requested.clone(),
+            requested,
+            ..Default::default()
+        });
+        fulfilment.followed = followed;
+    }
 
     // Names parallel the sampled edge points; the base also names corner patches.
     let blend_base = common::blend_face_base(&ctx.id);
@@ -112,6 +130,30 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, FeatureRefusal> {
     result.added.push(common::register_added(blended, &target.name));
     result.removed.push(target.name);
     Ok(result)
+}
+
+/// The `followTangent` input: only an explicit `true` turns it on.
+fn follow_tangent(ctx: &FeatureContext) -> bool {
+    ctx.param("followTangent").and_then(|value| value.as_bool()).unwrap_or(false)
+}
+
+/// Append the tangent-chain edges of `target`'s edge picks to it, keeping its
+/// points, names and ids parallel; returns the added edges' names. An edge a
+/// picked face already gathered is not added twice: the walk treats every
+/// selected edge as taken.
+fn follow_tangent_chains(target: &mut common::BlendTarget) -> Result<Vec<String>, FeatureRefusal> {
+    let expansion = crate::with_registered_solid_str(target.handle, |solid| {
+        common::tangent_chain_expansion(solid, &target.picked_edge_ids, &target.edge_ids)
+    })
+    .map_err(|error| KernelRefusal::internal(KernelStage::Collect, "tangent_chain", error))?;
+    let mut added = Vec::with_capacity(expansion.len());
+    for (id, point, name) in expansion {
+        target.edge_ids.push(id);
+        target.edge_points.push(point);
+        target.edge_names.push(name.clone());
+        added.push(name);
+    }
+    Ok(added)
 }
 
 /// The fallback for a selection that refused while ending inside a tangent
@@ -206,6 +248,12 @@ pub fn schema() -> serde_json::Value {
             "step": 0.1,
             "default_value": 0,
             "hint": "Optional end radius for a VARIABLE (tapered) fillet. 0 = constant radius. When > 0 and different from radius, each selected edge tapers from radius at its start to this value at its end (kernel-exact path; corners are not rounded in variable mode)."
+        },
+        "followTangent": {
+            "type": "boolean",
+            "default_value": true,
+            "label": "Follow tangent",
+            "hint": "Grow each selected edge to its whole tangent (G1) chain: pick one edge of a rounded rectangle and the fillet runs around the whole loop. A chain stops at a sharp corner and at a vertex where more than one edge continues it tangentially. The added edges are listed on the feature. New fillets start with it on; a fillet saved before the option existed reads as off."
         }
     }
 })

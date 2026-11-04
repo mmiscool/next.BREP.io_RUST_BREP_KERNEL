@@ -242,7 +242,7 @@ impl EngineState {
         // exploded view shown from the Assembly workbench draws its bodies and
         // trails without them (`exploded_ops`).
         let explode_chips = matches!(self.settings.workbench.as_str(), "pmi" | "all");
-        if !explode_chips && view.annotations.iter().all(|row| row.kind == "explode") {
+        if !explode_chips && view.annotations.iter().all(|row| matches!(row.kind.as_str(), "explode" | "hide")) {
             return Vec::new();
         }
         let text_size = self
@@ -255,10 +255,11 @@ impl EngineState {
         // An explode step draws NO label in the 3D view (owner 2026-10-26:
         // "I don't want to see the exploded labels at all"): its name lives
         // in the PMI tree and the Assembly workbench's step list, and while
-        // its form is open the transform gizmo stands on its parts.
+        // its form is open the transform gizmo stands on its parts. A hide
+        // step draws nothing either: its bodies are not there to label.
         view.annotations
             .iter()
-            .filter(|row| row.kind != "explode")
+            .filter(|row| !matches!(row.kind.as_str(), "explode" | "hide"))
             .map(|row| {
                 // A balloon whose target was hidden in the viewport AFTER
                 // the run (the view's hidden list not yet updated) is an

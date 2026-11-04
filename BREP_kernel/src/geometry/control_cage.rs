@@ -761,24 +761,11 @@ fn insert_knot_open(
             k = i;
         }
     }
-    let mut out = Vec::with_capacity(n + 1);
-    for i in 0..=n {
-        let value = if i + p <= k {
-            points[i]
-        } else if i <= k {
-            let denominator = knots[i + p] - knots[i];
-            let alpha = if denominator.abs() <= f64::EPSILON { 0.0 } else { (u - knots[i]) / denominator };
-            points[i].scale(alpha).add(points[i - 1].scale(1.0 - alpha))
-        } else {
-            points[i - 1]
-        };
-        out.push(value);
-    }
-    let mut new_knots = Vec::with_capacity(knots.len() + 1);
-    new_knots.extend_from_slice(&knots[..=k]);
-    new_knots.push(u);
-    new_knots.extend_from_slice(&knots[k + 1..]);
-    Ok((out, new_knots))
+    Ok(crate::curve::boehm_insert_raw(points, knots, degree, u, k,
+        |previous, current, numerator, denominator| {
+            let alpha = if denominator.abs() <= f64::EPSILON { 0.0 } else { numerator / denominator };
+            current.scale(alpha).add(previous.scale(1.0 - alpha))
+        }))
 }
 
 fn cyclic_distance(a: f64, b: f64, period: f64) -> f64 {

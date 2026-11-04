@@ -11,12 +11,12 @@ pub struct RevolutionStructure {
     pub sweep: f64,
 }
 
-pub(crate) fn circumcenter(a: Vec3, b: Vec3, c: Vec3) -> Option<Vec3> {
+pub fn circumcenter(a: Vec3, b: Vec3, c: Vec3) -> Option<Vec3> {
     let ab = b.sub(a);
     let ac = c.sub(a);
     let normal = ab.cross(ac);
     let normal_squared = normal.dot(normal);
-    if normal_squared <= 1e-30 {
+    if !normal_squared.is_finite() || normal_squared <= 1e-28 * ab.dot(ab) * ac.dot(ac) {
         return None;
     }
     let offset = normal
@@ -167,18 +167,26 @@ pub(super) fn intersect_coaxial_revolutions(
     if perpendicular.length() > 1e-9 * scale {
         return None;
     }
-    // Angular interval of `second` expressed in `first`'s frame.
+    // Angular interval of `second` expressed in `first`'s frame, its start
+    // brought into [0, τ) first. `atan2` lands in (-π, π], so an anti-aligned
+    // full-sweep `second` read as (start − τ, start) began as low as −3π and
+    // the ±τ shifts below reached only three quarters of it: the hosted
+    // 2026-11-02 "boolean fails" reports' revolve caps (axis down) against a
+    // bore cylinder (axis up) imprinted a 270° arc and the bore never
+    // pierced the cap.
     let b_start = b
         .frame
         .x_axis
         .dot(a.frame.y_axis)
         .atan2(b.frame.x_axis.dot(a.frame.x_axis));
+    let tau = std::f64::consts::TAU;
     let (b_lo, b_hi) = if alignment > 0.0 {
         (b_start, b_start + b.sweep)
     } else {
         (b_start - b.sweep, b_start)
     };
-    let tau = std::f64::consts::TAU;
+    let b_wrapped = b_lo.rem_euclid(tau);
+    let (b_lo, b_hi) = (b_wrapped, b_hi + (b_wrapped - b_lo));
     let mut intervals = Vec::new();
     for shift in [-tau, 0.0, tau] {
         let lo = (b_lo + shift).max(0.0);
@@ -187,6 +195,20 @@ pub(super) fn intersect_coaxial_revolutions(
             intervals.push((lo, hi));
         }
     }
+    // The pieces of one overlap that the wrap cut apart are one arc again,
+    // so a full turn comes back as the one closed circle it is.
+    intervals.sort_by(|x, y| x.0.total_cmp(&y.0));
+    let mut merged: Vec<(f64, f64)> = Vec::new();
+    for (lo, hi) in intervals {
+        if let Some(last) = merged.last_mut() {
+            if lo <= last.1 + 1e-9 {
+                last.1 = last.1.max(hi);
+                continue;
+            }
+        }
+        merged.push((lo, hi));
+    }
+    let intervals = merged;
     if intervals.is_empty() {
         return Some(Vec::new());
     }

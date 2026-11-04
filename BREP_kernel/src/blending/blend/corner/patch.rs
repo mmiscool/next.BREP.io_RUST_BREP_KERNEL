@@ -357,26 +357,21 @@ pub(in crate::blend) fn build_general_corner_patch(
 // bytes at 256 samples already and verifies the same rungs against fewer
 // midpoints). The octant's pole is a degenerate edge the caller must push
 // into the solid, hence the pair returned. Behind `BREP_BLEND_EXACT_OCTANT`
-// until its census: it moves the box pin's bytes.
+// (default on, see `exact_octant_on`); it moves the box pin's bytes, whose
+// fitted road the byte pins hold with `historical_corner_for_test`.
 // ----------------------------------------------------------------------
 
 /// `BREP_BLEND_EXACT_OCTANT=1`/`on` turns the exact octant on, `=0`/`off`
-/// off; `set_exact_octant_for_test` forces it on a test's own thread.
-const EXACT_OCTANT_DEFAULT: bool = false;
-
-thread_local! {
-    static EXACT_OCTANT_FOR_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
-}
+/// off; `set_exact_octant_for_test` forces it on a test's own thread. Default
+/// ON since lane O's promotion (2026-10-28): lane N fixed its two census
+/// regressions (a concave corner's sense, the delete-face readers' pole), and
+/// lane O taught thicken and the offset shell's joint lane to read a pole
+/// vertex that is also a corner of real edges; the pinched shells' edge-use
+/// reads skip a degenerate edge as `validate` does.
+const EXACT_OCTANT_DEFAULT: bool = true;
 
 pub(in crate::blend) fn exact_octant_on() -> bool {
-    if let Some(forced) = EXACT_OCTANT_FOR_TEST.with(|forced| forced.get()) {
-        return forced;
-    }
-    match std::env::var("BREP_BLEND_EXACT_OCTANT").as_deref() {
-        Ok("0") | Ok("off") => false,
-        Ok("1") | Ok("on") => true,
-        _ => EXACT_OCTANT_DEFAULT,
-    }
+    switch!(live "BREP_BLEND_EXACT_OCTANT", EXACT_OCTANT_DEFAULT)
 }
 
 
@@ -465,28 +460,43 @@ fn try_exact_octant(
         return Ok(None);
     }
     let (mut face, pole) = build_octant_face(center, m, radius, [t1, t2, t3], ideal, &triples, name, next_id)?;
-    // The octant walks T1 → T2 → T3 → T1; the patch must walk every arc
-    // against its fillet's use (the stored direction).  When the stored cycle
-    // runs the same way, walk the loop the other way round: the coedges in
-    // reverse order, each pcurve reversed.
+    // The octant walks T1 → T2 → T3 → T1, counter-clockwise in uv about the
+    // revolution's own normal, which points away from the centre: a loop the
+    // kernel reads as the face's outer loop only on a `same_sense` face, so
+    // the built face's normal is radially outward and it can close a CONVEX
+    // corner only. The patch must walk every arc against its fillet's use
+    // (the stored direction). When the stored cycle runs the octant's way, the
+    // loop is walked the other way round — the coedges in reverse order, each
+    // pcurve reversed — and is then clockwise in uv: the outer loop of a face
+    // whose `same_sense` is false, with its normal radially inward, which is a
+    // CONCAVE corner's patch (its ball sits in the air and the body's outward
+    // normal points into it). The stored cycle and the material side must
+    // agree; a corner where they do not is fitted instead. Until 2026-10-28
+    // the reversed loop was also flipped for `!outward`, which left a
+    // clockwise loop on a `same_sense` face: mass properties read that as a
+    // hole in the whole sphere, and every concave octant added one ball's
+    // volume (C5_wedge_nine_pick_runout +0.5236 at r 0.5; the rib-spine
+    // census row +1.047 for its two).
     let arcs_forward = face.loops[0].coedges.iter().filter(|coedge| coedge.edge_id != pole.id).map(|coedge| coedge.forward).collect::<Vec<bool>>();
-    if arcs_forward.iter().any(|&forward| forward) {
-        if !arcs_forward.iter().all(|&forward| forward) {
-            return Ok(None);
-        }
-        let mut reversed = Vec::with_capacity(face.loops[0].coedges.len());
+    let reversed = arcs_forward.iter().any(|&forward| forward);
+    if reversed && !arcs_forward.iter().all(|&forward| forward) {
+        return Ok(None);
+    }
+    if reversed == outward {
+        crate::blend::record_count("count.corner.octant_cycle_disagrees", 1);
+        return Ok(None);
+    }
+    if reversed {
+        let mut walked_back = Vec::with_capacity(face.loops[0].coedges.len());
         for coedge in face.loops[0].coedges.iter().rev() {
-            reversed.push(CoedgeRecord {
+            walked_back.push(CoedgeRecord {
                 id: coedge.id,
                 edge_id: coedge.edge_id,
                 forward: if coedge.edge_id == pole.id { true } else { !coedge.forward },
                 pcurve: coedge.pcurve.reversed().or_refuse(KernelStage::Fragment, "reversed")?,
             });
         }
-        face.loops[0].coedges = reversed;
-        face.same_sense = !face.same_sense;
-    }
-    if !outward {
+        face.loops[0].coedges = walked_back;
         face.same_sense = !face.same_sense;
     }
     Ok(Some((face, pole)))

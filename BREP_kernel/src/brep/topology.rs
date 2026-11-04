@@ -171,7 +171,7 @@ pub use seam::{
     analyze_doubly_periodic_seam_band, loop_seam_offsets, seam_band_uv_polygon, seam_band_uv_polygon_with,
 };
 pub(crate) use seam::doubly_periodic_has_only_collapsed_loops;
-pub(crate) use validate::{adaptive_coedge_error, coedge_error_floored, coedge_memo_enabled, exact_line_on_plane_error, CoedgeMemoScope};
+pub(crate) use validate::{adaptive_coedge_error, clear_coedge_readings, coedge_error_floored, coedge_memo_enabled, exact_iso_image_error, exact_line_on_plane_error, CoedgeMemoScope};
 pub use primitives::{make_box_brep, make_cylinder_brep, make_pyramid_brep};
 pub use kind::{topology_kind, BodyKind, KindReport, TopologyKind};
 

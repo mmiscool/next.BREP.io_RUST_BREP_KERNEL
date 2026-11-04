@@ -1258,23 +1258,10 @@ fn component_pose(document: &Value, transform: &Value) -> Result<Matrix, String>
     ])
 }
 fn multiply(a: Matrix, b: Matrix) -> Matrix {
-    let mut out = [0.; 16];
-    for r in 0..4 {
-        for c in 0..4 {
-            out[r * 4 + c] = (0..4).map(|k| a[r * 4 + k] * b[k * 4 + c]).sum();
-        }
-    }
-    out
+    brep_render::geometry3d::mat4_mul_row_major(&a, &b)
 }
 fn inverse_rigid(m: Matrix) -> Matrix {
-    let mut out = IDENTITY;
-    for r in 0..3 {
-        for c in 0..3 {
-            out[r * 4 + c] = m[c * 4 + r];
-        }
-        out[r * 4 + 3] = -(0..3).map(|k| m[k * 4 + r] * m[k * 4 + 3]).sum::<f64>();
-    }
-    out
+    brep_render::geometry3d::mat4_rigid_inverse(&m)
 }
 fn vector_at(m: Matrix, p: [f64; 3]) -> [f64; 3] {
     std::array::from_fn(|r| (0..3).map(|k| m[r * 4 + k] * p[k]).sum())

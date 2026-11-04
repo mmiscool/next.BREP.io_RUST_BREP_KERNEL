@@ -3,7 +3,7 @@
 //! document's class and stamps. The dialogs (member picker, template spin-out,
 //! hand-edit prompt) are driven by their hit keys; these are the doors with no
 //! pointer, and the read-back a script checks the files through.
-use crate::automation::command::{parse_args, schema_of, Annotations, CommandSpec, Ctx, Empty, Handler, NoArgs, Outcome, Phase};
+use crate::automation::command::{app_command, parse_args, schema_of, Annotations, CommandSpec, Ctx, Handler, NoArgs, Outcome, Phase};
 use crate::document_class::{self, DocumentClass};
 use crate::family_table::{self, FamilyTable};
 use crate::template::{self, TemplateInput};
@@ -107,15 +107,64 @@ fn family_generate(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
         return Err("the active document is not a family seed (.fbrep)".into());
     }
     let before = store.mutation_generation();
-    let report = file.generate_active_family(docs, store, a.save)?;
-    let after = store.mutation_generation();
-    Ok(Outcome::Done(json!({
-        "summary": report.summary(),
-        "rows": report.to_json(),
-        // Every write that landed moves the store's generation by one, so
-        // `writes` is the number of files Generate actually wrote.
-        "writes": after - before,
+    let answer = move |report: &family_table::GenerateReport, after: u64| {
+        Outcome::Done(json!({
+            "summary": report.summary(),
+            "rows": report.to_json(),
+            // Every write that landed moves the store's generation by one, so
+            // `writes` is the number of files Generate actually wrote.
+            "writes": after - before,
+        }))
+    };
+    let key = match file.begin_generate_active_family(docs, store, a.save)? {
+        Ok(report) => return Ok(answer(&report, store.mutation_generation())),
+        Err(key) => key,
+    };
+    plm_generate(key, answer)
+}
+
+/// The PLM half, frame by frame: wait for the family's save to reach the
+/// server, then run the server's Generate as a frame-thread task and answer
+/// when it does. Nothing here blocks a frame.
+#[cfg(not(target_arch = "wasm32"))]
+fn plm_generate(key: String, answer: impl Fn(&family_table::GenerateReport, u64) -> Outcome + Send + 'static) -> Result<Outcome, String> {
+    use std::sync::{Arc, Mutex};
+    let saved_by = web_time::Instant::now() + std::time::Duration::from_secs(60);
+    let answered_by = saved_by + std::time::Duration::from_secs(300);
+    let slot: Arc<Mutex<Option<Result<family_table::GenerateReport, String>>>> = Arc::new(Mutex::new(None));
+    let mut started = false;
+    Ok(Outcome::Poll(Box::new(move |ctx: &mut Ctx<'_>| {
+        let (file, docs, store) = ctx.app.file_docs_store();
+        if !started {
+            if store.pending_writes() > 0 {
+                return (web_time::Instant::now() > saved_by).then(|| Err("the family's save did not reach the server within 60 s".into()));
+            }
+            if let Some(error) = store.take_persistence_errors().into_iter().next() {
+                return Some(Err(format!("the family was not saved, so nothing was generated: {error}")));
+            }
+            let client = store.plm_client()?;
+            let json = docs.tab_engine().history_request_json();
+            let (key, out) = (key.clone(), slot.clone());
+            crate::plm::native::spawn(async move {
+                let result = crate::plm::family::generate(&client, &key, &json).await.map_err(|e| e.to_string());
+                *out.lock().unwrap() = Some(result);
+            });
+            started = true;
+        }
+        match slot.lock().unwrap().take() {
+            Some(Ok(report)) => {
+                let report = file.record_generate_report(report);
+                Some(Ok(answer(&report, store.mutation_generation())))
+            }
+            Some(Err(error)) => Some(Err(error)),
+            None => (web_time::Instant::now() > answered_by).then(|| Err("the PLM server did not answer Generate within 5 minutes".into())),
+        }
     })))
+}
+
+#[cfg(target_arch = "wasm32")]
+fn plm_generate(_key: String, _answer: impl Fn(&family_table::GenerateReport, u64) -> Outcome + Send + 'static) -> Result<Outcome, String> {
+    Err("in the browser, Generate a PLM family from the family table's Generate button".into())
 }
 
 fn family_table_get(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
@@ -256,17 +305,127 @@ fn store_remove(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
     Ok(Outcome::Done(json!({ "name": a.name, "existed": existed, "storeGeneration": store.mutation_generation() })))
 }
 
+// These schemas describe the successful native payload. The MCP adapter adds
+// frame/notices/settlement; the producers below remain the wire authority.
+fn result_object(properties: Value) -> Value {
+    let required: Vec<_> = properties.as_object().unwrap().keys().cloned().collect();
+    json!({"type":"object","properties":properties,"required":required})
+}
+
+fn count_schema() -> Value { json!({"type":"integer","minimum":0}) }
+fn class_schema() -> Value {
+    json!({"enum":DocumentClass::KNOWN.map(DocumentClass::slug)})
+}
+
+// Keep derived DTO references rooted in the enclosing result, not under a
+// property: JSON Schema's local $refs resolve from the document root.
+fn with_derived_property<T: schemars::JsonSchema>(mut result: Value, name: &str) -> Value {
+    let mut derived = schema_of::<T>();
+    let root = derived.as_object_mut().unwrap();
+    root.remove("$schema");
+    if let Some(defs) = root.remove("$defs") { result["$defs"] = defs; }
+    result["properties"][name] = derived;
+    result
+}
+
+fn doc_new_of_class_result_schema() -> Value {
+    result_object(json!({"index":count_schema(),"class":{"enum":DocumentClass::ALL.map(DocumentClass::slug)}}))
+}
+fn family_generate_result_schema() -> Value {
+    result_object(json!({"summary":{"type":"string"},"writes":count_schema(),"rows":{
+        "type":"array","items":result_object(json!({"partNumber":{"type":"string"},
+        "status":{"enum":["written","skipped","failed"]},"reason":{"type":["string","null"]}}))
+    }}))
+}
+fn family_table_get_result_schema() -> Value {
+    with_derived_property::<Option<FamilyTableSchema>>(result_object(json!({"class":class_schema(),"table":{}})), "table")
+}
+
+// The table's JSON Schema. The table type is the kernel's (`brep_kernel::family`,
+// shared with the PLM server), which derives no schema: these three describe
+// exactly what `serde_json::to_value(&FamilyTable)` emits, and
+// `the_family_table_schema_describes_the_table` pins both the schema text and a
+// round trip of a full table through them.
+#[derive(serde::Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+#[schemars(rename = "FamilyTable")]
+struct FamilyTableSchema {
+    columns: Vec<FamilyColumnSchema>,
+    rows: Vec<FamilyRowSchema>,
+}
+
+#[derive(serde::Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+#[schemars(rename = "FamilyColumn")]
+struct FamilyColumnSchema {
+    /// The expression name this column drives (e.g. `length`).
+    name: String,
+    /// Optional display label; empty = show `name`.
+    #[serde(default)]
+    label: String,
+}
+
+#[derive(serde::Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+#[schemars(rename = "FamilyRow")]
+struct FamilyRowSchema {
+    /// Typed by the user; the member's file name (`<partNumber>.nbrep`).
+    part_number: String,
+    /// Kept for the PLM; ignored on the file system.
+    #[serde(default)]
+    revision: String,
+    #[serde(default)]
+    description: String,
+    /// Column name -> expression source text for this row ("12", "m * 2").
+    #[serde(default)]
+    values: std::collections::BTreeMap<String, String>,
+}
+fn family_table_set_result_schema() -> Value {
+    result_object(json!({"rows":count_schema(),"columns":count_schema()}))
+}
+fn template_inputs_get_result_schema() -> Value {
+    with_derived_property::<Option<Vec<TemplateInput>>>(result_object(json!({"class":class_schema(),"inputs":{}})), "inputs")
+}
+fn template_inputs_set_result_schema() -> Value {
+    result_object(json!({"inputs":count_schema()}))
+}
+fn store_document_result_schema() -> Value {
+    let absent = result_object(json!({"name":{"type":"string"},"exists":{"const":false},"storeGeneration":count_schema()}));
+    let present = result_object(json!({
+        "name":{"type":"string"},"exists":{"const":true},"bytes":count_schema(),
+        "contentHash":{"type":"string"},"classByName":{"anyOf":[class_schema(),{"type":"null"}]},
+        "class":class_schema(),"expressions":{},"partAttributes":{},"familySource":{},"templateSource":{},
+        "hasFamilyTable":{"type":"boolean"},"hasTemplateInputs":{"type":"boolean"},"storeGeneration":count_schema()
+    }));
+    json!({"type":"object","oneOf":[absent,present]})
+}
+fn store_list_result_schema() -> Value {
+    result_object(json!({"backend":{"type":"string"},"names":{"type":"array","items":{"type":"string"}},"storeGeneration":count_schema()}))
+}
+fn store_read_result_schema() -> Value {
+    json!({"type":"object","oneOf":[
+        result_object(json!({"name":{"type":"string"},"exists":{"const":false}})),
+        result_object(json!({"name":{"type":"string"},"exists":{"const":true},"bytes":count_schema(),"text":{"type":"string"}}))
+    ]})
+}
+fn store_write_result_schema() -> Value {
+    result_object(json!({"name":{"type":"string"},"bytes":count_schema(),"lane":{"enum":["document","export"]},"storeGeneration":count_schema()}))
+}
+fn store_remove_result_schema() -> Value {
+    result_object(json!({"name":{"type":"string"},"existed":{"type":"boolean"},"storeGeneration":count_schema()}))
+}
+
 pub static COMMANDS: &[CommandSpec] = &[
-    CommandSpec { name: "doc_new_of_class", group: "document", doc: "Open a new document of a class — `normal` (a part), `family` (a family seed, `.fbrep`) or `template` (`.tbrep`) — as a tab and make it active: the toolbar's New menu. Parts start with a datum (D). The class is in the document before it has a file.", phase: Phase::Mutate, annotations: Annotations::MUTATE, args_schema: schema_of::<NewArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(doc_new_of_class) },
-    CommandSpec { name: "family_generate", group: "document", doc: "Generate the ACTIVE family seed (.fbrep): write every table row as `<part number>.nbrep` beside the family file, the family's model with the row's values baked into its expressions and a `familySource` stamp. An unchanged row is skipped; a row that cannot be written is reported and the rest still generate. Returns each row's outcome, a summary, and `writes` — how many files the store actually wrote. The same Generate the table editor's button runs. On a PLM store (the family is a `part/…/rev/…` revision) the SERVER writes each member as a part, from the family's saved revision: the app builds and bakes every member first and sends the ones that build, each row's revision column is the revision written, and the rows come back written, skipped (unchanged) or failed with the server's sentence. A family with unsaved changes is refused there unless `save: true`.", phase: Phase::Mutate, annotations: Annotations::MUTATE, args_schema: schema_of::<GenerateArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(family_generate) },
-    CommandSpec { name: "family_table_get", group: "document", doc: "The active document's class and its family table (`familyTable`; empty when it has none).", phase: Phase::Read, annotations: Annotations::READ, args_schema: schema_of::<NoArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(family_table_get) },
-    CommandSpec { name: "family_table_set", group: "document", doc: "Replace the active family seed's table as one undoable edit. Refused on a document that is not a family.", phase: Phase::Mutate, annotations: Annotations::MUTATE_NOWAIT, args_schema: schema_of::<TableArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(family_table_set) },
-    CommandSpec { name: "template_inputs_get", group: "document", doc: "The active document's class and its template input marks (`templateInputs`).", phase: Phase::Read, annotations: Annotations::READ, args_schema: schema_of::<NoArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(template_inputs_get) },
-    CommandSpec { name: "template_inputs_set", group: "document", doc: "Replace the active template's input marks as one undoable edit (what the Expressions pane's Template inputs grid edits). Refused on a document that is not a template.", phase: Phase::Mutate, annotations: Annotations::MUTATE_NOWAIT, args_schema: schema_of::<InputsArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(template_inputs_set) },
-    CommandSpec { name: "store_document", group: "document", doc: "Read one document back from the app's store: whether it exists, its class (by extension and by its own field), its expressions, part attributes, family or template stamp, a content hash, and the store's mutation generation (which every landed write moves by one).", phase: Phase::Read, annotations: Annotations::READ, args_schema: schema_of::<StoreArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(store_document) },
-    CommandSpec { name: "store_list", group: "document", doc: "The names of the documents in the app's store — what Open lists — with the store's label (a models folder natively, browser storage or a PLM server in the browser) and its mutation generation.", phase: Phase::Read, annotations: Annotations::READ, args_schema: schema_of::<NoArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(store_list) },
-    CommandSpec { name: "store_read", group: "document", doc: "One stored document's text by name (`exists: false` when there is none). This is the browser's `document_open` lane: the server reads the file, the page reads its store.", phase: Phase::Read, annotations: Annotations::READ, args_schema: schema_of::<StoreArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(store_read) },
-    CommandSpec { name: "store_write", group: "document", doc: "Write a file by name: a model extension (`.nbrep` / `.fbrep` / `.tbrep`) makes it a document of the store — refused if one exists unless `overwrite` — and any other name is handed to the user as a file (a browser download; the app's models folder natively), so an export never lands in Open as a part. `text` or `base64` carries the content. This is the browser's `document_save` / `document_export` lane.", phase: Phase::Mutate, annotations: Annotations::MUTATE_NOWAIT, args_schema: schema_of::<StoreWriteArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(store_write) },
-    CommandSpec { name: "store_remove", group: "document", doc: "Delete a stored document by name (`Ok` when it is already gone).", phase: Phase::Mutate, annotations: Annotations { read_only: false, destructive: true, idempotent: true, waits: false }, args_schema: schema_of::<StoreArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(store_remove) },
+    app_command!("document", "doc_new_of_class", "Open a new document of a class — `normal` (a part), `family` (a family seed, `.fbrep`) or `template` (`.tbrep`) — as a tab and make it active: the toolbar's New menu. Parts start with a datum (D). The class is in the document before it has a file.", NewArgs, doc_new_of_class, Mutate, MUTATE, doc_new_of_class_result_schema),
+    app_command!("document", "family_generate", "Generate the ACTIVE family seed (.fbrep): write every table row as `<part number>.nbrep` beside the family file, the family's model with the row's values baked into its expressions and a `familySource` stamp. An unchanged row is skipped; a row that cannot be written is reported and the rest still generate. Returns each row's outcome, a summary, and `writes` — how many files the store actually wrote. The same Generate the table editor's button runs. On a PLM store (the family is a `part/…/rev/…` revision) the SERVER writes each member as a part, from the family's saved revision: the app builds and bakes every member first and sends the ones that build, each row's revision column is the revision written, and the rows come back written, skipped (unchanged) or failed with the server's sentence. A family with unsaved changes is refused there unless `save: true`.", GenerateArgs, family_generate, Mutate, MUTATE, family_generate_result_schema),
+    app_command!("document", "family_table_get", "The active document's class and its family table (`familyTable`; empty when it has none).", NoArgs, family_table_get, Read, READ, family_table_get_result_schema),
+    app_command!("document", "family_table_set", "Replace the active family seed's table as one undoable edit. Refused on a document that is not a family.", TableArgs, family_table_set, Mutate, MUTATE_NOWAIT, family_table_set_result_schema),
+    app_command!("document", "template_inputs_get", "The active document's class and its template input marks (`templateInputs`).", NoArgs, template_inputs_get, Read, READ, template_inputs_get_result_schema),
+    app_command!("document", "template_inputs_set", "Replace the active template's input marks as one undoable edit (what the Expressions pane's Template inputs grid edits). Refused on a document that is not a template.", InputsArgs, template_inputs_set, Mutate, MUTATE_NOWAIT, template_inputs_set_result_schema),
+    app_command!("document", "store_document", "Read one document back from the app's store: whether it exists, its class (by extension and by its own field), its expressions, part attributes, family or template stamp, a content hash, and the store's mutation generation (which every landed write moves by one).", StoreArgs, store_document, Read, READ, store_document_result_schema),
+    app_command!("document", "store_list", "The names of the documents in the app's store — what Open lists — with the store's label (a models folder natively, browser storage or a PLM server in the browser) and its mutation generation.", NoArgs, store_list, Read, READ, store_list_result_schema),
+    app_command!("document", "store_read", "One stored document's text by name (`exists: false` when there is none). This is the browser's `document_open` lane: the server reads the file, the page reads its store.", StoreArgs, store_read, Read, READ, store_read_result_schema),
+    app_command!("document", "store_write", "Write a file by name: a model extension (`.nbrep` / `.fbrep` / `.tbrep`) makes it a document of the store — refused if one exists unless `overwrite` — and any other name is handed to the user as a file (a browser download; the app's models folder natively), so an export never lands in Open as a part. `text` or `base64` carries the content. This is the browser's `document_save` / `document_export` lane.", StoreWriteArgs, store_write, Mutate, MUTATE_NOWAIT, store_write_result_schema),
+    CommandSpec { name: "store_remove", group: "document", doc: "Delete a stored document by name (`Ok` when it is already gone).", phase: Phase::Mutate, annotations: Annotations { read_only: false, destructive: true, idempotent: true, waits: false }, args_schema: schema_of::<StoreArgs>, result_schema: store_remove_result_schema, handler: Handler::App(store_remove) },
 ];
 

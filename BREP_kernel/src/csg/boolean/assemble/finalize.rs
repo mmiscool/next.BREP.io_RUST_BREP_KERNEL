@@ -15,8 +15,8 @@ fn repair_edges_from_consistent_pcurves(
     let started = web_time::Instant::now();
     let work = repair_edges_from_consistent_pcurves_mode(solid, tolerance, enabled)?;
     if crate::imprint::profile_enabled() {
-        eprintln!("assemble.repair_trace.profile ms={:.3} edges={} samples={} skipped={}",
-            started.elapsed().as_secs_f64() * 1000.0, work.edges, work.samples, work.skipped);
+        profile_line!("assemble.repair_trace.profile ms={:.3} edges={} samples={} skipped={} exact={}",
+            started.elapsed().as_secs_f64() * 1000.0, work.edges, work.samples, work.skipped, work.exact);
     }
     Ok(())
 }
@@ -26,28 +26,61 @@ struct RepairTraceWork {
     edges: usize,
     samples: usize,
     skipped: usize,
+    /// Skips the closed-form line reading answered (row 10).
+    exact: usize,
 }
 
-// This is a total-evaluation certificate, not a geometric tolerance. On a
-// single-span degree-one unit-weight net, clamped Bernstein evaluation has a
-// nonzero homogeneous denominator everywhere. Malformed/other representations
-// retain the original eager trace and its refusal ordering. Inspect raw fields:
-// public control edits must not be hidden by a previously populated cache.
-fn total_unit_trace(surface: &crate::NurbsSurface, pcurve: &NurbsCurve) -> bool {
-    let knots = [0.0, 0.0, 1.0, 1.0];
-    // Stay away from the basis evaluator's zero-denominator floor and from
-    // overflow. This only limits eligibility; it changes no geometry or bar.
-    let domain = |k: &[f64]| k.len() == 4 && k.iter().all(|v| v.is_finite())
-        && k[0] == k[1] && k[2] == k[3]
-        && (1.0..=f64::MAX / 4.0).contains(&(k[2] - k[0]));
-    let finite_unit = |p: &crate::Vec4| p.w == 1.0
-        && p.x.is_finite() && p.y.is_finite() && p.z.is_finite();
-    surface.degree_u == 1 && surface.degree_v == 1
-        && domain(&surface.knots_u) && domain(&surface.knots_v)
-        && surface.control_points.len() == 2
-        && surface.control_points.iter().all(|row| row.len() == 2 && row.iter().all(&finite_unit))
-        && pcurve.degree == 1 && pcurve.knots == knots
-        && pcurve.control_points.len() == 2 && pcurve.control_points.iter().all(finite_unit)
+fn finalize_exact_lines_enabled() -> bool {
+    switch!("BREP_FINALIZE_EXACT_LINES", true)
+}
+
+
+/// Lane O row 37's switch, default on since batch 17 (`0`/`off` restores the sampler): the repair reads an
+/// iso-line coedge in closed form.
+fn finalize_exact_iso_enabled() -> bool {
+    switch!("BREP_FINALIZE_EXACT_ISO", true)
+}
+
+
+/// The existing iso bound on equivalent reversed representations. Only the
+/// temporary read is reversed; the stored edge and pcurve are never changed.
+/// A reversed pcurve covers the same point pairs in the opposite order. A
+/// reversed edge reflects its range and flips its traversal sense.
+/// `BREP_FINALIZE_REVERSED_ISO`; on by default since
+/// 2026-11-02 (lane O batch 21), `0`/`off` restores the unreversed read only.
+fn reversed_iso_image_error(
+    surface: &crate::NurbsSurface,
+    pcurve: &crate::NurbsCurve,
+    curve: &crate::NurbsCurve,
+    edge: &EdgeRecord,
+    forward: bool,
+) -> Option<f64> {
+    if curve.degree <= 1 || !switch!("BREP_FINALIZE_REVERSED_ISO", true) {
+        return None;
+    }
+    if surface.control_points.iter().flatten().chain(curve.control_points.iter()).chain(pcurve.control_points.iter())
+        .any(|p| !(1e-3..=1e3).contains(&p.w) || [p.x, p.y, p.z].iter().any(|x| !x.is_finite()))
+    {
+        return None;
+    }
+    let reversed_pcurve = pcurve.reversed().ok()?;
+    let bound = crate::topology::exact_iso_image_error(surface, &reversed_pcurve, curve, edge, !forward)
+        .or_else(|| {
+            let [start, end] = curve.domain().ok()?;
+            let reversed = curve.reversed().ok()?;
+            let mut reflected = edge.clone();
+            reflected.t0 = start + end - edge.t1;
+            reflected.t1 = start + end - edge.t0;
+            crate::topology::exact_iso_image_error(surface, pcurve, &reversed, &reflected, !forward)
+        })?;
+    // Leave ample headroom for the reversal's floating-point arithmetic.
+    // This is a conservative addition to the bound, never a relaxed bar.
+    let mut scale = 1.0f64;
+    for control in surface.control_points.iter().flatten().chain(curve.control_points.iter()) {
+        scale = scale.max(control.point().ok()?.length());
+    }
+    let padded = bound + 1e-12 * scale;
+    padded.is_finite().then_some(padded)
 }
 
 fn repair_edges_from_consistent_pcurves_mode(
@@ -126,19 +159,81 @@ fn repair_edges_from_consistent_pcurves_mode(
         let intended_traversal_start = traversal_end(previous);
         let intended_traversal_end = traversal_start(next);
         let [p0, p1] = first_coedge.pcurve.domain().or_refuse(KernelStage::Validate, "domain")?;
-        // Measure eligibility before manufacturing a repair trace only when
-        // every skipped evaluation is certified total. Reuse this identical
-        // reading below if a repair is actually needed; no station/bar changes.
-        let measured = if lazy && total_unit_trace(&first_face.surface, &first_coedge.pcurve) {
-            let error = adaptive_coedge_error(
+        // Measure eligibility before manufacturing a repair trace. Until
+        // 2026-10-28 the lazy read was taken only where every skipped
+        // evaluation was certified total (a bilinear carrier with a straight
+        // pcurve); on an offset shell's fitted carriers that left every edge
+        // on the eager path — 257 stations manufactured and thrown away per
+        // edge, 0.65–0.77 ms of the 1.1 ms finalize on the outward box shells
+        // (lane O). The adaptive reading evaluates the same pcurve and carrier
+        // the dense trace would, inside the same parameter window, and the
+        // eager path takes that same reading right after its trace, on the
+        // same bar, so every repair decision is unchanged. A reading that
+        // cannot be taken (an evaluation the carrier or pcurve refuses) falls
+        // back to the eager path, so the refusal is the one the trace raises,
+        // byte for byte. `BREP_OFFSET_LAZY_REPAIR_TRACE=0` restores the eager
+        // trace for every edge. The identical reading is reused below if a
+        // repair is needed; no station or bar changes.
+        // EXACT LINES (lane O row 10, 2026-10-28; on by default since its
+        // promotion, `BREP_FINALIZE_EXACT_LINES=0` restores the sampled reading):
+        // a straight edge on an affine 2×2 carrier has its
+        // true coedge error at an end, in closed form
+        // (`validate::exact_line_on_plane_error`, the reading `validate` itself
+        // takes). The sampled reading below never reads more than that plus
+        // interior rounding, so an edge the closed form puts within the
+        // repair bar is one the sampled reading skips too; it is skipped
+        // without the sample. Every other edge takes the path below unchanged.
+        if lazy && finalize_exact_lines_enabled() {
+            if let Some(error) = crate::topology::exact_line_on_plane_error(
+                &first_face.surface, &first_coedge.pcurve, &edge.curve, edge, first_coedge.forward,
+            ) {
+                if error <= repair_tolerance {
+                    work.skipped += 1;
+                    work.exact += 1;
+                    continue;
+                }
+            }
+        }
+        // EXACT ISO IMAGES (lane O row 37, `BREP_FINALIZE_EXACT_ISO`, default
+        // off): an edge whose pcurve is an iso-line of the carrier run at the
+        // edge's own parameter is bounded in closed form by the control
+        // differences of the carrier's iso-curve and the edge curve
+        // (`validate::exact_iso_image_error`). A true error bound, so an edge
+        // it puts within the repair bar is one the sampled reading skips too.
+        if lazy && finalize_exact_iso_enabled() {
+            if let Some(bound) = crate::topology::exact_iso_image_error(
+                &first_face.surface, &first_coedge.pcurve, &edge.curve, edge, first_coedge.forward,
+            ) {
+                if bound <= repair_tolerance {
+                    work.skipped += 1;
+                    work.exact += 1;
+                    continue;
+                }
+            }
+        }
+        if lazy && finalize_exact_iso_enabled() {
+            if let Some(bound) = reversed_iso_image_error(
+                &first_face.surface, &first_coedge.pcurve, &edge.curve, edge, first_coedge.forward,
+            ) {
+                if bound <= repair_tolerance {
+                    work.skipped += 1;
+                    work.exact += 1;
+                    continue;
+                }
+            }
+        }
+        let measured = if lazy {
+            match adaptive_coedge_error(
                 &first_face.surface, &first_coedge.pcurve, &edge.curve, edge,
                 first_coedge.forward, repair_tolerance,
-            ).or_refuse(KernelStage::Validate, "csg.boolean.assemble.finalize")?;
-            if error <= repair_tolerance {
-                work.skipped += 1;
-                continue;
+            ) {
+                Ok(error) if error <= repair_tolerance => {
+                    work.skipped += 1;
+                    continue;
+                }
+                Ok(error) => Some(error),
+                Err(_) => None,
             }
-            Some(error)
         } else {
             None
         };
@@ -167,7 +262,7 @@ fn repair_edges_from_consistent_pcurves_mode(
             continue;
         }
         let repair_debug =
-            std::env::var("BREP_OS_DEBUG").is_ok_and(|value| !value.is_empty() && value != "0");
+            env_read!("BREP_OS_DEBUG").is_some_and(|value| !value.is_empty() && value != "0");
         let second = &edge_uses[1];
         let second_face = faces[second.face];
         let second_coedge = &second_face.loops[second.loop_index].coedges[second.coedge];
@@ -456,18 +551,62 @@ pub(crate) fn apply_assembly_heal_chain(
     solid: &mut BrepSolid,
     tolerance: f64,
 ) -> Result<(), KernelRefusal> {
+    let mut clock = FinalizeClock::start();
     commit_nearby_edge_endpoints(solid, tolerance)?;
+    clock.lap("commit_endpoints");
     collapse_short_one_use_edges(solid, tolerance * 4.0)?;
+    clock.lap("collapse_short");
     sew_coincident_one_use_edges(solid, tolerance)?;
+    clock.lap("sew_coincident");
     repair_edges_from_consistent_pcurves(solid, tolerance)?;
+    clock.lap("repair_pcurves");
     Ok(())
+}
+
+/// Stage timing of the finalize path, one `assemble.finalize.profile` stderr
+/// line per call under `BREP_PROFILE` and no clock read without it. Added
+/// for lane O (2026-10-28): the filleted-box outward offset spent 7.3 of its
+/// 17 ms in `finalize_assembled_solid` with no split to read.
+struct FinalizeClock {
+    started: Option<web_time::Instant>,
+    laps: Vec<(&'static str, f64)>,
+}
+
+impl FinalizeClock {
+    fn start() -> Self {
+        Self { started: crate::imprint::profile_enabled().then(web_time::Instant::now), laps: Vec::new() }
+    }
+
+    fn lap(&mut self, stage: &'static str) {
+        if let Some(started) = &mut self.started {
+            let now = web_time::Instant::now();
+            self.laps.push((stage, (now - *started).as_secs_f64() * 1_000.0));
+            *started = now;
+        }
+    }
+}
+
+impl Drop for FinalizeClock {
+    fn drop(&mut self) {
+        if self.started.is_some() && !self.laps.is_empty() {
+            let line = self
+                .laps
+                .iter()
+                .map(|(stage, ms)| format!("{stage}={ms:.3}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            crate::imprint::profile_emit(format_args!("assemble.finalize.profile {line}"));
+        }
+    }
 }
 
 pub(crate) fn finalize_assembled_solid(
     mut solid: BrepSolid,
     tolerance: f64,
 ) -> Result<BrepSolid, KernelRefusal> {
+    let mut clock = FinalizeClock::start();
     apply_assembly_heal_chain(&mut solid, tolerance)?;
+    clock.lap("heal_chain");
     let mut use_counts = HashMap::<u64, usize>::default();
     for coedge in solid
         .shells
@@ -602,7 +741,7 @@ pub(crate) fn finalize_assembled_solid(
     // is the expected answer, not a symptom.
     solid.genus = numerator / 2;
     let repair_debug =
-        std::env::var("BREP_OS_DEBUG").is_ok_and(|value| !value.is_empty() && value != "0");
+        env_read!("BREP_OS_DEBUG").is_some_and(|value| !value.is_empty() && value != "0");
     if repair_debug {
         let pre_issues = solid.validate();
         eprintln!(
@@ -613,8 +752,11 @@ pub(crate) fn finalize_assembled_solid(
                 .collect::<Vec<_>>(),
         );
     }
+    clock.lap("euler");
     let solid = merge_curve_continuation_edges(&solid, tolerance).map_err(|refusal| KernelRefusal { stage: KernelStage::Validate, ..refusal })?;
+    clock.lap("merge_continuations");
     let issues = solid.validate();
+    clock.lap("validate");
     if !issues.is_empty() {
         let edge_by_id = solid
             .edges
@@ -664,6 +806,7 @@ pub(crate) fn finalize_assembled_solid(
     // integral's). The exact read cost 0.26 s on the shelled-box report's
     // 34-face shell, and the next feature reads the same faces again.
     let volume = crate::signed_volume_against(&solid, tolerance.powi(3)).or_refuse(KernelStage::Validate, "solid_signed_volume")?;
+    clock.lap("signed_volume");
     if volume <= tolerance.powi(3) {
         return Err(KernelRefusal::new(
             RefusalClass::NonPositiveVolume,
@@ -757,5 +900,6 @@ pub(in crate::boolean) fn repair_open_assembly_via_heal_chain(
     }
     Some(solid)
 }
+
 
 

@@ -1,3 +1,4 @@
+use crate::analytic_surface::curve_scale;
 use crate::analytic_surface::{circumcenter, AnalyticSurface};
 use crate::topology::{BrepSolid, CoedgeRecord, EdgeRecord, FaceRecord, VertexRecord};
 use crate::{make_arc, KernelTolerances, NurbsCurve, NurbsSurface, Vec3};
@@ -344,13 +345,7 @@ struct CircularArc {
     spans: usize,
 }
 
-fn curve_scale(curve: &NurbsCurve) -> f64 {
-    curve
-        .control_points
-        .iter()
-        .map(|p| (p.x.abs() / p.w).max(p.y.abs() / p.w).max(p.z.abs() / p.w))
-        .fold(0.0, f64::max)
-}
+
 
 /// Homogeneous-net equality to a scale-relative tolerance (the same
 /// reconstruction contract analytic_surface.rs uses): matching nets mean the

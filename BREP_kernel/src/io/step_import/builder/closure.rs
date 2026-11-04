@@ -121,8 +121,7 @@ impl ClosureNote {
 }
 
 fn guard_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var("BREP_IMPORT_CLOSURE_GUARD").map_or(true, |v| v != "0"))
+    switch!("BREP_IMPORT_CLOSURE_GUARD", true)
 }
 
 /// What the gate needs from the builder once the solid has been assembled

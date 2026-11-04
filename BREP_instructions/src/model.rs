@@ -38,6 +38,7 @@ pub const SERIAL_TRACKED_ATTRIBUTE: &str = "Serial_Tracked";
 /// The steps-per-page counts a template offers.
 pub const STEPS_PER_PAGE: [u8; 3] = [1, 2, 4];
 
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Instructions {
@@ -61,6 +62,7 @@ pub struct Instructions {
 }
 
 /// One revision of the target assembly.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Target {
@@ -80,6 +82,7 @@ pub struct Target {
     pub name: String,
 }
 
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum Orientation {
@@ -89,6 +92,7 @@ pub enum Orientation {
 }
 
 /// The printed page template, one per document.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Template {
@@ -106,6 +110,7 @@ impl Default for Template {
 }
 
 /// The cover and the lists before the steps.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FrontMatter {
@@ -141,6 +146,7 @@ struct ChapterV1 {
     steps: Vec<Step>,
 }
 
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Step {
@@ -179,6 +185,7 @@ pub struct Step {
 }
 
 /// Parts one step adds: one part, at one or more occurrences.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Add {
@@ -281,6 +288,7 @@ impl Step {
 
 /// A tool a step uses: a tools-library entry by id, with a snapshot of its
 /// name and spec so printed and offline copies need no server.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolUse {
@@ -294,6 +302,7 @@ pub struct ToolUse {
     pub unlinked: bool,
 }
 
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum TorqueSource {
@@ -303,6 +312,7 @@ pub enum TorqueSource {
     Override,
 }
 
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Torque {
@@ -338,6 +348,7 @@ impl Torque {
     }
 }
 
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum CalloutKind {
@@ -356,6 +367,7 @@ impl CalloutKind {
     }
 }
 
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Callout {
@@ -367,6 +379,7 @@ pub struct Callout {
     pub occurrence: Option<String>,
 }
 
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Arrow {
@@ -391,6 +404,7 @@ impl Arrow {
     }
 }
 
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Signoff {
@@ -404,6 +418,7 @@ impl Default for Signoff {
 }
 
 /// One occurrence in a re-target diff.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OccurrenceChange {
@@ -416,6 +431,7 @@ pub struct OccurrenceChange {
 
 /// A re-target waiting for approval: what changed between the two assembly
 /// revisions and the steps it touches.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Retarget {

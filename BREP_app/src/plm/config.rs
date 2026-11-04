@@ -168,6 +168,25 @@ pub fn write(dir: &Path, url: &str, token: Option<&str>) -> Result<(), String> {
     Ok(())
 }
 
+/// The Settings PLM tab's Server URL: [`write()`] `plm.json` exactly as
+/// `--plm-configure URL` does (the same validation: a malformed URL is refused
+/// and nothing is written) — except that a URL naming a DIFFERENT server than
+/// the one `plm.json` named first removes `plm-token`, because a token is never
+/// sent to a server it was not issued by. The comparison is on normalised URLs,
+/// so re-saving the same server (a trailing slash, spaces) keeps the sign-in.
+/// Returns the URL as written and whether a token was dropped.
+pub fn repoint(dir: &Path, url: &str) -> Result<(String, bool), String> {
+    let url = normalise_url(url)?;
+    let before = read_url_file(dir).ok().flatten().and_then(|old| normalise_url(&old).ok());
+    let token = dir.join(TOKEN_FILE);
+    let drop_token = before.as_deref() != Some(url.as_str()) && token.exists();
+    if drop_token {
+        std::fs::remove_file(&token).map_err(|e| format!("cannot remove {}: {e}", token.display()))?;
+    }
+    write(dir, &url, None)?;
+    Ok((url, drop_token))
+}
+
 /// Store only the token (S1's sign-in writes it after a password exchange).
 pub fn write_token(dir: &Path, token: &str) -> Result<(), String> {
     check_token(token.trim())?;
@@ -207,7 +226,9 @@ pub fn describe(config: Option<&PlmConfig>, dir: &Path) -> String {
     format!("url:   {} (from the {})\ntoken: {token}\n", config.url, config.url_source.describe())
 }
 
-fn url_origin(source: Source) -> String {
+/// The switch, variable or file a URL from `source` was named by, as the
+/// Settings PLM tab and the refusals say it.
+pub fn url_origin(source: Source) -> String {
     match source {
         Source::Flag => "--plm-url".into(),
         Source::Env => URL_ENV.into(),
@@ -293,30 +314,6 @@ fn read_token_file(path: &Path, strict_mode: bool) -> Result<Option<String>, Str
 }
 
 fn write_atomic(path: &Path, bytes: &[u8], secret: bool) -> Result<(), String> {
-    use std::io::Write;
-    let tmp = path.with_extension(format!("tmp{}", std::process::id()));
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    if secret {
-        use std::os::unix::fs::OpenOptionsExt;
-        // Created 0600, never chmod-ed down afterwards: there is no instant at
-        // which the token sits in a file another user could open.
-        options.mode(0o600);
-    }
-    #[cfg(not(unix))]
-    let _ = secret;
-    let result = options
-        .open(&tmp)
-        .and_then(|mut file| {
-            file.write_all(bytes)?;
-            file.sync_all()
-        })
-        .and_then(|()| std::fs::rename(&tmp, path));
-    if let Err(e) = result {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(format!("cannot write {}: {e}", path.display()));
-    }
-    Ok(())
+    crate::store::write_atomic(path, bytes, secret).map_err(|e| format!("cannot write {}: {e}", path.display()))
 }
 

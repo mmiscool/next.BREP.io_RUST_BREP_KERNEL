@@ -304,17 +304,11 @@ fn part_label(solid: &str) -> String {
     solid.rsplit(':').next().unwrap_or(solid).to_string()
 }
 
-fn sub(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
-    [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
-}
+use crate::geometry3d::sub3 as sub;
 
-fn dot(a: [f64; 3], b: [f64; 3]) -> f64 {
-    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
-}
+use crate::geometry3d::dot3 as dot;
 
-fn cross(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
-    [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]]
-}
+use crate::geometry3d::cross3 as cross;
 
 /// Distance from `p` to triangle `abc` (closest point on the triangle).
 fn distance_to_triangle(p: [f64; 3], a: [f64; 3], b: [f64; 3], c: [f64; 3]) -> f64 {

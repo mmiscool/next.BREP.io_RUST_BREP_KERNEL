@@ -1,6 +1,6 @@
 //! Frame-level commands: liveness and the per-frame facts every wait loop
 //! polls.
-use crate::automation::command::{parse_args, schema_of, Annotations, CommandSpec, Ctx, Empty, Handler, NoArgs, Outcome, Phase};
+use crate::automation::command::{app_command, parse_args, schema_of, CommandSpec, Ctx, NoArgs, Outcome};
 use serde::Serialize;
 use serde_json::Value;
 
@@ -123,6 +123,24 @@ fn plm_requests_in_flight() -> bool {
     }
 }
 
+fn ping_result_schema() -> Value {
+    serde_json::json!({"type":"object","properties":{},"additionalProperties":false})
+}
+
+fn describe_commands_result_schema() -> Value {
+    serde_json::json!({"type":"array","items":{
+        "type":"object","properties":{
+            "name":{"type":"string"},"group":{"type":"string"},"doc":{"type":"string"},
+            "phase":{"type":"string","enum":["input","mutate","read"]},
+            "annotations":{"type":"object","properties":{
+                "read_only":{"type":"boolean"},"destructive":{"type":"boolean"},
+                "idempotent":{"type":"boolean"},"waits":{"type":"boolean"}
+            },"required":["read_only","destructive","idempotent","waits"],"additionalProperties":false},
+            "argsSchema":{},"resultSchema":{}
+        },"required":["name","group","doc","phase","annotations","argsSchema","resultSchema"],"additionalProperties":false
+    }})
+}
+
 fn ping(_ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
     let _: NoArgs = parse_args(args)?;
     Ok(Outcome::Done(serde_json::json!({})))
@@ -139,7 +157,7 @@ fn describe_commands(_ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String>
 }
 
 pub static COMMANDS: &[CommandSpec] = &[
-    CommandSpec { name: "describe_commands", group: "frame", doc: "The app's command registry: every command with its group, doc, phase, annotations and derived argument/result schemas. A host generates its tool list from this.", phase: Phase::Read, annotations: Annotations::READ, args_schema: schema_of::<NoArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(describe_commands) },
-    CommandSpec { name: "ping", group: "frame", doc: "Liveness: replies from the next frame's read phase.", phase: Phase::Read, annotations: Annotations::READ, args_schema: schema_of::<NoArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(ping) },
-    CommandSpec { name: "frame_info", group: "frame", doc: "Frame counter, pixels-per-point, surface and viewport rects (egui points), pending runner work, run progress, history length and rollback step. `idle` is the wait condition for mutating tools.", phase: Phase::Read, annotations: Annotations::READ, args_schema: schema_of::<NoArgs>, result_schema: schema_of::<FrameInfo>, handler: Handler::App(frame_info_cmd) },
+    app_command!("frame", "describe_commands", "The app's command registry: every command with its group, doc, phase, annotations and derived argument/result schemas. A host generates its tool list from this.", NoArgs, describe_commands, Read, READ, describe_commands_result_schema),
+    app_command!("frame", "ping", "Liveness: replies from the next frame's read phase.", NoArgs, ping, Read, READ, ping_result_schema),
+    app_command!("frame", "frame_info", "Frame counter, pixels-per-point, surface and viewport rects (egui points), pending runner work, run progress, history length and rollback step. `idle` is the wait condition for mutating tools.", NoArgs, frame_info_cmd, Read, READ, schema_of::<FrameInfo>),
 ];

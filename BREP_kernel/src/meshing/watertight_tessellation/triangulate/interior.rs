@@ -305,6 +305,9 @@ pub(in crate::watertight_tessellation) fn seed_interior_grid(
         index.ring_encloses(uv)
     };
     tess_profile(|p| p.stations += (nu.saturating_sub(1) * nv.saturating_sub(1)) as u64);
+    let station_count = nu.saturating_sub(1).saturating_mul(nv.saturating_sub(1));
+    let mut hosts = super::host_index::HostIndex::new(vertices, triangles, [u0, u1, v0, v1], station_count);
+    let mut candidates = Vec::new();
     for iu in 1..nu {
         for iv in 1..nv {
             let uv = [
@@ -317,27 +320,30 @@ pub(in crate::watertight_tessellation) fn seed_interior_grid(
             // Containing triangle by strict barycentric sign test. Reverse
             // order: row-major grid points land in freshly split triangles,
             // so the newest entries are the likeliest hosts.
-            let mut host = None;
             tess_profile(|p| p.stations_placed += 1);
             let host_timer = stage_timer(Stage::Host);
             let mut visits = 0u64;
-            for (triangle_index, triangle) in triangles.iter().enumerate().rev() {
+            let indexed = hosts.candidates(uv, &mut candidates);
+            let mut contains = |triangle_index: usize| {
+                let triangle = &triangles[triangle_index];
                 visits += 1;
                 let a = vertices[triangle[0]].uv;
                 let b = vertices[triangle[1]].uv;
                 let c = vertices[triangle[2]].uv;
                 let total = triangle_area(a, b, c);
                 if total <= 1e-30 {
-                    continue;
+                    return false;
                 }
                 let w0 = triangle_area(uv, b, c) / total;
                 let w1 = triangle_area(uv, c, a) / total;
                 let w2 = triangle_area(uv, a, b) / total;
-                if w0 > 1e-6 && w1 > 1e-6 && w2 > 1e-6 {
-                    host = Some(triangle_index);
-                    break;
-                }
-            }
+                w0 > 1e-6 && w1 > 1e-6 && w2 > 1e-6
+            };
+            let host = if indexed {
+                candidates.iter().rev().copied().find(|&id| contains(id))
+            } else {
+                (0..triangles.len()).rev().find(|&id| contains(id))
+            };
             tess_profile(|p| p.host_visits += visits);
             drop(host_timer);
             let Some(host) = host else {
@@ -354,6 +360,9 @@ pub(in crate::watertight_tessellation) fn seed_interior_grid(
             triangles[host] = [a, b, index];
             triangles.push([b, c, index]);
             triangles.push([c, a, index]);
+            for id in [host, triangles.len() - 2, triangles.len() - 1] {
+                hosts.update(id, triangles[id], vertices);
+            }
         }
     }
     lawson_flips(vertices, triangles, boundary_pairs, scale);
@@ -375,6 +384,20 @@ pub(in crate::watertight_tessellation) fn refine_interior(
     periodic: bool,
 ) -> Result<(), String> {
     let _timer = stage_timer(Stage::Refine);
+    // The soundness scan's bounded mesh (`scan_mesh.rs`, default on): an
+    // analytic face refines until every triangle's closed-form deviation bound
+    // meets the chord. A face that does not meet it within the pass budget
+    // meshes from its seed with the display refinement below.
+    if let Some(bound) = crate::watertight_tessellation::scan_mesh::face_bound(face) {
+        let (seed_vertices, seed_triangles) = (vertices.clone(), triangles.clone());
+        if refine_interior_bounded(&bound, face, vertices, triangles, boundary_pairs, chord_tolerance, scale, periodic)? {
+            crate::watertight_tessellation::scan_mesh::count(true);
+            return Ok(());
+        }
+        crate::watertight_tessellation::scan_mesh::count(false);
+        *vertices = seed_vertices;
+        *triangles = seed_triangles;
+    }
     // The raw ear-clip output is a boundary fan; flips must reshape it
     // BEFORE the chord criterion runs, or fan diagonals trigger an
     // avalanche of unnecessary splits. UNGUARDED: nothing in an ear-clip fan is
@@ -552,6 +575,138 @@ pub(in crate::watertight_tessellation) fn refine_interior(
         );
     }
     Ok(())
+}
+
+/// Pass budget of the bounded scan refinement (twice the display's).
+const SCAN_REFINE_PASSES: usize = 2 * MAX_REFINE_PASSES;
+
+/// The soundness scan's refinement of an analytic face (`scan_mesh.rs`):
+/// unguarded Lawson flips of the ear-clip fan, then per pass every triangle's closed-form bound
+/// on its distance to the carrier; a triangle above the chord (plus the bound
+/// of its own unsplittable edges, which no interior split can lower) has its
+/// splittable edge of largest sag split at the surface point of the uv midpoint. True
+/// when a pass finds no such triangle: every triangle then meets that bound.
+#[allow(clippy::too_many_arguments)]
+fn refine_interior_bounded(
+    bound: &crate::watertight_tessellation::scan_mesh::FaceBound,
+    face: &FaceRecord,
+    vertices: &mut Vec<FaceVertex>,
+    triangles: &mut Vec<[usize; 3]>,
+    boundary_pairs: &HashSet<(usize, usize)>,
+    chord_tolerance: f64,
+    scale: [f64; 2],
+    periodic: bool,
+) -> Result<bool, String> {
+    use crate::watertight_tessellation::scan_mesh::{reaches_apex, triangle_bound};
+    if reaches_apex(bound, vertices.iter().map(|vertex| vertex.position), 4.0 * chord_tolerance) {
+        return Ok(false);
+    }
+    lawson_flips(vertices, triangles, boundary_pairs, scale);
+    let mut memo = FaceMemo::default();
+    for _ in 0..SCAN_REFINE_PASSES {
+        tess_profile(|p| p.refine_passes += 1);
+        let mut users: HashMap<(usize, usize), u32> = HashMap::with_capacity(triangles.len() * 2);
+        for triangle in triangles.iter() {
+            for corner in 0..3 {
+                let (a, b) = (triangle[corner], triangle[(corner + 1) % 3]);
+                *users.entry((a.min(b), a.max(b))).or_insert(0) += 1;
+            }
+        }
+        let splittable = |edge: &(usize, usize)| !boundary_pairs.contains(edge) && users.get(edge) == Some(&2);
+        let mut chosen: Vec<(usize, usize)> = Vec::new();
+        for triangle in triangles.iter() {
+            let corners = triangle.map(|index| vertices[index].position);
+            let Some(deviation) = triangle_bound(bound, corners) else {
+                return Ok(false);
+            };
+            if deviation <= chord_tolerance {
+                continue;
+            }
+            // Split the splittable edge with the largest own bound (its sag:
+            // a cylinder's ruling reads zero), the longer on a tie, then the
+            // smaller key.
+            let mut allowance = 0.0f64;
+            let mut longest: Option<((f64, f64), (usize, usize))> = None;
+            for corner in 0..3 {
+                let (a, b) = (triangle[corner], triangle[(corner + 1) % 3]);
+                let edge = (a.min(b), a.max(b));
+                let (pa, pb) = (vertices[a].position, vertices[b].position);
+                let Some(edge_bound) = triangle_bound(bound, [pa, pb, pb]) else {
+                    return Ok(false);
+                };
+                if splittable(&edge) {
+                    let rank = (edge_bound, pb.sub(pa).dot(pb.sub(pa)));
+                    if longest.map_or(true, |(best, best_edge)| rank > best || (rank == best && edge < best_edge)) {
+                        longest = Some((rank, edge));
+                    }
+                } else {
+                    allowance = allowance.max(edge_bound);
+                }
+            }
+            if deviation <= chord_tolerance + allowance {
+                continue;
+            }
+            if let Some((_, edge)) = longest {
+                chosen.push(edge);
+            }
+        }
+        if chosen.is_empty() {
+            return Ok(true);
+        }
+        // Sorted, so the midpoint indices (and the flips' cocircular
+        // tie-break) do not depend on hash order.
+        chosen.sort_unstable();
+        chosen.dedup();
+        let mut splits: HashMap<(usize, usize), usize> = HashMap::with_capacity(chosen.len());
+        for (a, b) in chosen {
+            let uv = [
+                (vertices[a].uv[0] + vertices[b].uv[0]) * 0.5,
+                (vertices[a].uv[1] + vertices[b].uv[1]) * 0.5,
+            ];
+            let position = memo.midpoint(face, vertices, a, b, periodic)?;
+            splits.insert((a, b), vertices.len());
+            vertices.push(FaceVertex { uv, position });
+            tess_profile(|p| p.splits += 1);
+        }
+        let mut next_triangles = Vec::with_capacity(triangles.len() + splits.len() * 2);
+        for triangle in triangles.iter() {
+            // As the display refinement: fan from a midpoint, never a corner.
+            let mut polygon: Vec<usize> = Vec::with_capacity(6);
+            let mut first_midpoint: Option<usize> = None;
+            for corner in 0..3 {
+                let (a, b) = (triangle[corner], triangle[(corner + 1) % 3]);
+                polygon.push(a);
+                if let Some(&middle) = splits.get(&(a.min(b), a.max(b))) {
+                    if first_midpoint.is_none() {
+                        first_midpoint = Some(polygon.len());
+                    }
+                    polygon.push(middle);
+                }
+            }
+            let start = first_midpoint.unwrap_or(0);
+            for offset in 1..polygon.len() - 1 {
+                next_triangles.push([
+                    polygon[start],
+                    polygon[(start + offset) % polygon.len()],
+                    polygon[(start + offset + 1) % polygon.len()],
+                ]);
+            }
+        }
+        *triangles = next_triangles;
+        // The display's chord-guarded flips: unguarded Delaunay flips in the
+        // parameter plane make a cylinder's long ruling-aligned triangles
+        // isotropic and multiply the splits. The guard only shapes the mesh;
+        // the next pass's bound check is what decides.
+        lawson_flips_guarded_with_memo(
+            vertices,
+            triangles,
+            boundary_pairs,
+            scale,
+            Some((face, chord_tolerance, periodic)),
+            &mut memo,
+        );
+    }
+    Ok(false)
 }
 
 /// True when the unit surface normal swings by at most [`ANGULAR_TOL`] between

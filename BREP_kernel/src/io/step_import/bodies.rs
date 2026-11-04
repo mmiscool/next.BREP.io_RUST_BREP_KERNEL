@@ -521,8 +521,7 @@ pub(super) fn mat4_identity() -> Mat4 {
 /// The determinant of an affine's 3x3 linear block: the signed volume scale,
 /// negative exactly for a reflection.
 pub(super) fn mat4_determinant3(m: &Mat4) -> f64 {
-    m[0] * (m[5] * m[10] - m[6] * m[9]) - m[1] * (m[4] * m[10] - m[6] * m[8])
-        + m[2] * (m[4] * m[9] - m[5] * m[8])
+    crate::AffineTransform { elements: *m }.determinant3()
 }
 
 /// The local→world matrix of an orthonormal placement frame: rotation columns

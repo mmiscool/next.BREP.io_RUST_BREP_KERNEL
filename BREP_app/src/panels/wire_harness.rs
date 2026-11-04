@@ -358,10 +358,9 @@ fn format_length(length: f64) -> String {
     brep_render::formatting::compact_decimal(length, 2)
 }
 
+/// A constant `#rrggbb` as a colour (black for a malformed one, as before).
 fn hex(text: &str) -> egui::Color32 {
-    let digits = text.trim_start_matches('#');
-    let byte = |at: usize| u8::from_str_radix(&digits[at..at + 2], 16).unwrap_or(0);
-    egui::Color32::from_rgb(byte(0), byte(2), byte(4))
+    crate::color::parse_hex_color(text).unwrap_or(egui::Color32::BLACK)
 }
 
 

@@ -20,7 +20,7 @@ thread_local! {
 }
 
 pub(super) fn enabled() -> bool {
-    !matches!(std::env::var("BREP_IMPRINT_PCURVE_CACHE").as_deref(), Ok("0") | Ok("off"))
+    switch!(live "BREP_IMPRINT_PCURVE_CACHE", true)
 }
 
 /// Separate nested operations, including error returns, never retain a cache
@@ -81,7 +81,7 @@ fn key(surface: &NurbsSurface, curve: &NurbsCurve) -> Vec<u64> {
     floats(&mut key, &curve.knots);
     controls(&mut key, &curve.control_points);
     // Other fit-policy switches are process OnceLocks; this one is dynamic.
-    key.push((std::env::var("BREP_SECTION_PCURVE_MARCH").as_deref() == Ok("0")) as u64);
+    key.push((env_read!("BREP_SECTION_PCURVE_MARCH").as_deref() == Some("0")) as u64);
     key
 }
 

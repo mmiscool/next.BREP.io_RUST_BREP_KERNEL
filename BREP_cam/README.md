@@ -32,4 +32,8 @@ cargo build --manifest-path BREP_cam/Cargo.toml
 ```
 
 The public package contains production sources, the manifest, README, and
-license. The runtime dependency is `serde`.
+license. The default runtime dependencies are `serde` and `serde_json`.
+
+Enable the optional `schema` feature to derive JSON Schemas for persisted CAM
+model types, including strategy parameters. The automation host uses these
+schemas to describe CAM state.

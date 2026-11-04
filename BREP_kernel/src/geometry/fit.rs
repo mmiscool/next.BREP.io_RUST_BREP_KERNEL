@@ -41,6 +41,89 @@ pub fn solve_dense(mut matrix: Vec<Vec<f64>>, mut rhs: Vec<f64>) -> Result<Vec<f
     Ok(result)
 }
 
+/// `solve_dense` for several right-hand sides that share one matrix, with the
+/// elimination leaving out the products that are exact no-ops. Bit for bit
+/// the answer `solve_dense(matrix.clone(), rhs[k])` gives for every `k`: the
+/// pivot search reads the same column, every row swap is the same, and each
+/// matrix entry and right-hand side value sees the same `-= factor * value`
+/// operations in the same order. The operations left out are
+/// `a -= factor * b` on a MATRIX entry with `factor == 0.0` or `b == 0.0`:
+/// `factor * b` is then `±0.0`, which leaves a nonzero `a` unchanged, and a
+/// zero entry is always `+0.0` (entries start at `+0.0` or a sum of basis
+/// values, `x - y` rounds to `+0.0` whenever the difference is zero, and
+/// `+0.0 - (±0.0) == +0.0`), so skipping gives the same bits. Right-hand side
+/// updates and the back substitution are never skipped: a coordinate can be
+/// `-0.0`, and `-0.0 - (-0.0)` is `+0.0`.
+///
+/// Why: a closed section's cyclic collocation matrix is banded with two
+/// corners, and `solve_dense` spends `n^3` on products with zero; at 300
+/// stations one interpolation took 5 ms and the imprint's section fits were
+/// 97% interpolation (2026-11-02).
+pub(crate) fn solve_dense_shared<const K: usize>(
+    mut matrix: Vec<Vec<f64>>,
+    mut rhs: [Vec<f64>; K],
+) -> Result<[Vec<f64>; K], String> {
+    let count = rhs.first().map_or(0, Vec::len);
+    if count == 0
+        || matrix.len() != count
+        || matrix.iter().any(|row| row.len() != count)
+        || rhs.iter().any(|side| side.len() != count)
+    {
+        return Err("solve_dense: matrix must be square and match RHS".into());
+    }
+    let scale = matrix
+        .iter()
+        .flatten()
+        .fold(0.0_f64, |maximum, value| maximum.max(value.abs()));
+    if scale == 0.0 {
+        return Err("solve_dense: singular matrix".into());
+    }
+    let mut pivot_row: Vec<(usize, f64)> = Vec::with_capacity(count);
+    for column in 0..count {
+        let pivot = (column..count)
+            .max_by(|&a, &b| matrix[a][column].abs().total_cmp(&matrix[b][column].abs()))
+            .unwrap();
+        if matrix[pivot][column].abs() <= 1e-13 * scale {
+            return Err("solve_dense: singular matrix".into());
+        }
+        matrix.swap(column, pivot);
+        for side in rhs.iter_mut() {
+            side.swap(column, pivot);
+        }
+        let diagonal = matrix[column][column];
+        pivot_row.clear();
+        pivot_row.extend(
+            (column + 1..count)
+                .map(|entry| (entry, matrix[column][entry]))
+                .filter(|&(_, value)| value != 0.0),
+        );
+        for row in column + 1..count {
+            let factor = matrix[row][column] / diagonal;
+            matrix[row][column] = 0.0;
+            if factor != 0.0 {
+                let target = &mut matrix[row];
+                for &(entry, value) in &pivot_row {
+                    target[entry] -= factor * value;
+                }
+            }
+            for side in rhs.iter_mut() {
+                let subtrahend = factor * side[column];
+                side[row] -= subtrahend;
+            }
+        }
+    }
+    let mut results: [Vec<f64>; K] = std::array::from_fn(|_| vec![0.0; count]);
+    for (side, result) in rhs.iter().zip(results.iter_mut()) {
+        for row in (0..count).rev() {
+            let remainder: f64 = (row + 1..count)
+                .map(|column| matrix[row][column] * result[column])
+                .sum();
+            result[row] = (side[row] - remainder) / matrix[row][row];
+        }
+    }
+    Ok(results)
+}
+
 /// `solve_dense` for fixed-size systems on the stack — identical pivoting and
 /// thresholds, no allocation. `count <= N` solves the leading `count`-sized
 /// block (for callers that shrink the system by fixing parameters).
@@ -1088,13 +1171,7 @@ fn station_parameters(points: &[Vec3], stations: &[usize]) -> Option<Vec<f64>> {
 }
 
 fn distance_to_segment(point: Vec3, from: Vec3, to: Vec3) -> f64 {
-    let direction = to.sub(from);
-    let length_squared = direction.length_squared();
-    if length_squared <= 0.0 {
-        return point.sub(from).length();
-    }
-    let fraction = (point.sub(from).dot(direction) / length_squared).clamp(0.0, 1.0);
-    point.sub(from.add(direction.scale(fraction))).length()
+    point.distance_to_segment(from, to, 0.0)
 }
 
 /// Distance from `point` to `curve`, minimized inside `[lower, upper]` from a
@@ -1268,6 +1345,7 @@ fn fit_station_set(
     local_interpolation: bool,
     degree: usize,
 ) -> Result<(NurbsCurve, Vec<usize>, Vec<f64>, f64, f64, f64), String> {
+    let split_started = crate::profile::profile_enabled().then(web_time::Instant::now);
     let parameters = station_parameters(points, &stations)
         .ok_or_else(|| "fit_polyline: degenerate polyline".to_string())?;
     let kept = stations.iter().map(|index| points[*index]).collect::<Vec<_>>();
@@ -1276,6 +1354,7 @@ fn fit_station_set(
     // the march's origin, not a feature of the curve.
     let closed = kept.len() > degree + 1
         && kept[0].sub(kept[kept.len() - 1]).length() <= 1e-12 * (1.0 + kept[0].length());
+    let params_done = split_started.map(|_| web_time::Instant::now());
     let curve = if local_interpolation {
         interpolate_curve_local(&kept, &parameters, 1.0)?
     } else if closed
@@ -1287,9 +1366,32 @@ fn fit_station_set(
     } else {
         interpolate_curve(&kept, degree.min(kept.len() - 1), &parameters)?
     };
+    let interp_done = split_started.map(|_| web_time::Instant::now());
     let (deviation, rms, between) =
         measure_polyline_fit(&curve, points, &stations, &parameters, arc)?;
+    if let (Some(a), Some(b), Some(c)) = (split_started, params_done, interp_done) {
+        STATION_SET_SPLIT.with(|cell| {
+            let mut cell = cell.borrow_mut();
+            cell.0 += 1;
+            cell.1 += stations.len() as u64;
+            cell.2 += points.len() as u64;
+            cell.3 += (b - a).as_secs_f64() * 1e3;
+            cell.4 += (c - b).as_secs_f64() * 1e3;
+            cell.5 += c.elapsed().as_secs_f64() * 1e3;
+        });
+    }
     Ok((curve, stations, parameters, deviation, rms, between))
+}
+
+// Fit-split instrumentation (2026-11-02): per `fit_station_set`
+// call, the station-parameter, interpolation and measurement time, read only
+// under BREP_PROFILE. Zero behaviour: timers only.
+thread_local! {
+    static STATION_SET_SPLIT: std::cell::RefCell<(u64, u64, u64, f64, f64, f64)> = const { std::cell::RefCell::new((0, 0, 0, 0.0, 0.0, 0.0)) };
+}
+/// (calls, stations, points, params_ms, interpolate_ms, measure_ms) since the last take.
+pub(crate) fn station_set_split_take() -> (u64, u64, u64, f64, f64, f64) {
+    STATION_SET_SPLIT.with(|cell| std::mem::take(&mut *cell.borrow_mut()))
 }
 
 /// Fit ONE rung at the given station budget and measure it — no refinement.
@@ -2293,27 +2395,7 @@ fn record_polyline_fit(report: &PolylineFitReport) {
 /// helper the periodic interpolation needs; `KnotVector` validation rightly
 /// rejects unclamped arrays, so this stays private to the fit module.
 fn raw_basis(knots: &[f64], degree: usize, span: usize, parameter: f64) -> Vec<f64> {
-    let mut basis = vec![0.0; degree + 1];
-    let mut left = vec![0.0; degree + 1];
-    let mut right = vec![0.0; degree + 1];
-    basis[0] = 1.0;
-    for j in 1..=degree {
-        left[j] = parameter - knots[span + 1 - j];
-        right[j] = knots[span + j] - parameter;
-        let mut saved = 0.0;
-        for r in 0..j {
-            let denominator = right[r + 1] + left[j - r];
-            let temp = if denominator.abs() > 0.0 {
-                basis[r] / denominator
-            } else {
-                0.0
-            };
-            basis[r] = saved + right[r + 1] * temp;
-            saved = left[j - r] * temp;
-        }
-        basis[j] = saved;
-    }
-    basis
+    crate::curve::basis_functions_raw(knots, degree, span, parameter, 0.0)
 }
 
 /// Boehm single-knot insertion on raw arrays (degree fixed by caller).
@@ -2326,24 +2408,13 @@ fn raw_insert_knot(knots: &mut Vec<f64>, controls: &mut Vec<Vec3>, degree: usize
         .rposition(|&knot| knot <= parameter + 1e-14)
         .unwrap()
         .min(controls.len() - 1);
-    let mut fresh = Vec::with_capacity(controls.len() + 1);
-    fresh.extend_from_slice(&controls[..=span - degree]);
-    for i in span - degree + 1..=span {
-        let denominator = knots[i + degree] - knots[i];
-        let alpha = if denominator.abs() > 0.0 {
-            (parameter - knots[i]) / denominator
-        } else {
-            0.0
-        };
-        fresh.push(
-            controls[i - 1]
-                .scale(1.0 - alpha)
-                .add(controls[i].scale(alpha)),
-        );
-    }
-    fresh.extend_from_slice(&controls[span..]);
+    let (fresh, fresh_knots) = crate::curve::boehm_insert_raw(controls, knots, degree, parameter, span,
+        |previous, current, numerator, denominator| {
+            let alpha = if denominator.abs() > 0.0 { numerator / denominator } else { 0.0 };
+            previous.scale(1.0 - alpha).add(current.scale(alpha))
+        });
     *controls = fresh;
-    knots.insert(span + 1, parameter);
+    *knots = fresh_knots;
 }
 
 /// EXACT closed (periodic) cubic interpolation. `points` are the S >= 4
@@ -2353,6 +2424,23 @@ fn raw_insert_knot(knots: &mut Vec<f64>, controls: &mut Vec<Vec3>, degree: usize
 /// periodic B-spline is re-expressed in CLAMPED form by Boehm-inserting the
 /// domain ends to full multiplicity — the representation every kernel
 /// consumer expects — so the seam is C² by construction, not by welding.
+/// Collocation: row i evaluates the degree-p basis at t_i; the span in the
+/// raw array is the one containing t_i (raw index i+p == u_i). Control
+/// j = span − degree + offset in unclamped indexing, i.e. cyclic control
+/// (i + offset − p) mod S.
+fn closed_collocation_matrix(raw_knots: &[f64], parameters: &[f64], degree: usize, station_count: usize) -> Vec<Vec<f64>> {
+    let mut matrix = vec![vec![0.0; station_count]; station_count];
+    for i in 0..station_count {
+        let span = i + degree;
+        let basis = raw_basis(raw_knots, degree, span, parameters[i]);
+        for (offset, value) in basis.iter().enumerate() {
+            let index = (i as i64 + offset as i64 - degree as i64).rem_euclid(station_count as i64) as usize;
+            matrix[i][index] += value;
+        }
+    }
+    matrix
+}
+
 pub fn interpolate_curve_closed(points: &[Vec3], parameters: &[f64]) -> Result<NurbsCurve, String> {
     interpolate_curve_closed_of_degree(points, parameters, 3)
 }
@@ -2391,28 +2479,17 @@ pub fn interpolate_curve_closed_of_degree(
         parameters[j.rem_euclid(s) as usize] + wrap as f64 * period
     };
     let raw_knots: Vec<f64> = (-(degree as i64)..=(station_count as i64 + degree as i64)).map(cyclic).collect();
-    // Collocation: row i evaluates the cubic basis at t_i; the span in the
-    // raw array is the one containing t_i (raw index i+p == u_i).
-    let mut matrix = vec![vec![0.0; station_count]; station_count];
-    for i in 0..station_count {
-        let span = i + degree;
-        let basis = raw_basis(&raw_knots, degree, span, parameters[i]);
-        for (offset, value) in basis.iter().enumerate() {
-            // Control j = span − degree + offset in unclamped indexing, i.e.
-            // cyclic control (i + offset − p) mod S.
-            let index = (i as i64 + offset as i64 - degree as i64).rem_euclid(station_count as i64) as usize;
-            matrix[i][index] += value;
-        }
-    }
-    let solve_axis = |axis: fn(Vec3) -> f64| {
-        solve_dense(
-            matrix.clone(),
-            points.iter().copied().map(axis).collect::<Vec<_>>(),
-        )
-    };
-    let xs = solve_axis(|point| point.x)?;
-    let ys = solve_axis(|point| point.y)?;
-    let zs = solve_axis(|point| point.z)?;
+    let matrix = closed_collocation_matrix(&raw_knots, parameters, degree, station_count);
+    // One elimination serves the three axes, bit for bit what three
+    // `solve_dense` calls on clones of the matrix gave (`solve_dense_shared`).
+    let [xs, ys, zs] = solve_dense_shared(
+        matrix,
+        [
+            points.iter().map(|point| point.x).collect::<Vec<_>>(),
+            points.iter().map(|point| point.y).collect::<Vec<_>>(),
+            points.iter().map(|point| point.z).collect::<Vec<_>>(),
+        ],
+    )?;
     let cyclic_controls: Vec<Vec3> = (0..station_count)
         .map(|index| Vec3::new(xs[index], ys[index], zs[index]))
         .collect();

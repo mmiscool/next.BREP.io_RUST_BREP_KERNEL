@@ -1,7 +1,7 @@
 use crate::Vec3;
 use serde::{Deserialize, Serialize};
 
-const EPS: f64 = 1e-12;
+const EPS: f64 = crate::tolerance::FP_FLOOR;
 
 /// Knot IDENTITY tolerance (parameter-space): two knot parameters within this
 /// absolute band are treated as the SAME knot for snapping — insert_knot,
@@ -276,25 +276,37 @@ pub(crate) fn basis_functions_into(
     basis: &mut [f64; MAX_STACK_ORDER],
 ) {
     debug_assert!(degree <= MAX_STACK_DEGREE);
-    let mut left = [0.0f64; MAX_STACK_ORDER];
-    let mut right = [0.0f64; MAX_STACK_ORDER];
-    basis[0] = 1.0;
-    for j in 1..=degree {
-        left[j] = parameter - knots[span + 1 - j];
-        right[j] = knots[span + j] - parameter;
-        let mut saved = 0.0;
-        for r in 0..j {
-            let denominator = right[r + 1] + left[j - r];
-            let temporary = if denominator.abs() <= EPS {
-                0.0
-            } else {
-                basis[r] / denominator
-            };
-            basis[r] = saved + right[r + 1] * temporary;
-            saved = left[j - r] * temporary;
-        }
-        basis[j] = saved;
+    // The degrees every carrier the kernel builds has (1..=5) run the same
+    // recurrence with the degree and the scratch size fixed at compile time:
+    // the same operations in the same order on the same operands, so the same
+    // bits, without the eight-wide scratch fill and runtime loop bounds that
+    // were a third of a sign reading's surface station (
+    // 2026-11-02). Higher degrees keep the eight-wide scratch.
+    match degree {
+        1 => basis_functions_scratch::<2>(knots, 1, span, parameter, basis),
+        2 => basis_functions_scratch::<3>(knots, 2, span, parameter, basis),
+        3 => basis_functions_scratch::<4>(knots, 3, span, parameter, basis),
+        4 => basis_functions_scratch::<5>(knots, 4, span, parameter, basis),
+        5 => basis_functions_scratch::<6>(knots, 5, span, parameter, basis),
+        _ => basis_functions_scratch::<MAX_STACK_ORDER>(knots, degree, span, parameter, basis),
     }
+}
+
+/// [`basis_functions_into`]'s body with `left`/`right` scratch of `ORDER`
+/// entries (`degree < ORDER`). The recurrence reads only entries `..=degree`
+/// of either, so the scratch width changes no value.
+#[inline(always)]
+fn basis_functions_scratch<const ORDER: usize>(
+    knots: &[f64],
+    degree: usize,
+    span: usize,
+    parameter: f64,
+    basis: &mut [f64; MAX_STACK_ORDER],
+) {
+    debug_assert!(degree < ORDER);
+    let mut left = [0.0f64; ORDER];
+    let mut right = [0.0f64; ORDER];
+    basis_functions_raw_into(knots, degree, span, parameter, EPS, basis, &mut left, &mut right);
 }
 
 /// Basis derivatives (The NURBS Book A2.3) into caller-provided stack rows.
@@ -312,11 +324,40 @@ pub(crate) fn basis_derivatives_into(
 ) {
     debug_assert!(degree <= MAX_STACK_DEGREE);
     debug_assert!(out.len() > derivative_count);
+    // Degrees 1..=5 with the degree and the scratch size fixed at compile
+    // time (see `basis_functions_into`): the same operations in the same
+    // order, so the same bits; `ndu`, `left`, `right` and `a` shrink from
+    // eight-wide to `degree + 1`-wide and the loop bounds fold.
+    match degree {
+        1 => basis_derivatives_scratch::<2>(knots, 1, span, parameter, derivative_count, out),
+        2 => basis_derivatives_scratch::<3>(knots, 2, span, parameter, derivative_count, out),
+        3 => basis_derivatives_scratch::<4>(knots, 3, span, parameter, derivative_count, out),
+        4 => basis_derivatives_scratch::<5>(knots, 4, span, parameter, derivative_count, out),
+        5 => basis_derivatives_scratch::<6>(knots, 5, span, parameter, derivative_count, out),
+        _ => basis_derivatives_scratch::<MAX_STACK_ORDER>(knots, degree, span, parameter, derivative_count, out),
+    }
+}
+
+/// [`basis_derivatives_into`]'s body (The NURBS Book A2.3) with every scratch
+/// array `ORDER` wide (`degree < ORDER`). The recurrence reads scratch entries
+/// `..=degree` only, and the per-order zero fill of `a[s2]` is kept (its
+/// unwritten entries are read as zero by the next order), so the width
+/// changes no value.
+#[inline(always)]
+fn basis_derivatives_scratch<const ORDER: usize>(
+    knots: &[f64],
+    degree: usize,
+    span: usize,
+    parameter: f64,
+    derivative_count: usize,
+    out: &mut [[f64; MAX_STACK_ORDER]],
+) {
+    debug_assert!(degree < ORDER);
     let p = degree;
     let n = derivative_count.min(p);
-    let mut ndu = [[0.0f64; MAX_STACK_ORDER]; MAX_STACK_ORDER];
-    let mut left = [0.0f64; MAX_STACK_ORDER];
-    let mut right = [0.0f64; MAX_STACK_ORDER];
+    let mut ndu = [[0.0f64; ORDER]; ORDER];
+    let mut left = [0.0f64; ORDER];
+    let mut right = [0.0f64; ORDER];
     ndu[0][0] = 1.0;
 
     for j in 1..=p {
@@ -339,13 +380,13 @@ pub(crate) fn basis_derivatives_into(
     for j in 0..=p {
         out[0][j] = ndu[j][p];
     }
-    let mut a = [[0.0f64; MAX_STACK_ORDER]; 2];
+    let mut a = [[0.0f64; ORDER]; 2];
     for r in 0..=p {
         let mut s1 = 0;
         let mut s2 = 1;
         a[0][0] = 1.0;
         for k in 1..=n {
-            a[s2] = [0.0; MAX_STACK_ORDER];
+            a[s2] = [0.0; ORDER];
             let mut value = 0.0;
             let rk = r as isize - k as isize;
             let pk = p - k;
@@ -422,27 +463,7 @@ impl KnotVector {
             basis_functions_into(&self.knots, self.degree, span, parameter, &mut basis);
             return basis[..=self.degree].to_vec();
         }
-        let mut basis = vec![0.0; self.degree + 1];
-        let mut left = vec![0.0; self.degree + 1];
-        let mut right = vec![0.0; self.degree + 1];
-        basis[0] = 1.0;
-        for j in 1..=self.degree {
-            left[j] = parameter - self.knots[span + 1 - j];
-            right[j] = self.knots[span + j] - parameter;
-            let mut saved = 0.0;
-            for r in 0..j {
-                let denominator = right[r + 1] + left[j - r];
-                let temporary = if denominator.abs() <= EPS {
-                    0.0
-                } else {
-                    basis[r] / denominator
-                };
-                basis[r] = saved + right[r + 1] * temporary;
-                saved = left[j - r] * temporary;
-            }
-            basis[j] = saved;
-        }
-        basis
+        basis_functions_raw(&self.knots, self.degree, span, parameter, EPS)
     }
 
     pub fn basis_derivatives(
@@ -740,6 +761,9 @@ impl NurbsCurve {
         parameter: f64,
         derivative_count: usize,
     ) -> Result<Vec<Vec3>, String> {
+        if derivative_count <= 2 && small_curve_derivatives_enabled() {
+            return Ok(self.derivatives_small(parameter, derivative_count)?[..=derivative_count].to_vec());
+        }
         self.ensure_valid()?;
         let parameter = knot_clamp(&self.knots, self.degree, parameter);
         let span = knot_find_span(&self.knots, self.degree, parameter);
@@ -1032,7 +1056,9 @@ impl NurbsCurve {
         };
         let mut homogeneous = [zero; 3];
         if self.degree <= MAX_STACK_DEGREE {
-            let mut rows = [[0.0f64; MAX_STACK_ORDER]; MAX_STACK_ORDER];
+            // Rows `..=calculated_count` (at most three) are the only ones
+            // written or read; the eight-row fill was pure cost.
+            let mut rows = [[0.0f64; MAX_STACK_ORDER]; 3];
             basis_derivatives_into(
                 &self.knots,
                 self.degree,
@@ -1455,3 +1481,130 @@ fn binomial(n: usize, k: usize) -> f64 {
 
 
 
+
+/// SMALL CURVE DERIVATIVES (lane O row 21, 2026-10-29; on by default since
+/// the batch 5 promotion, `BREP_CURVE_SMALL_DERIVATIVES=0` reads the heap): `NurbsCurve::derivatives`
+/// up to second order is read from the stack twin
+/// [`NurbsCurve::derivatives_small`] (one allocation for the result instead of
+/// two), and the hot callers — point-in-face's nearest-curve refinement, the
+/// imprint's parameter tolerance and its pierce tangents — read the twin
+/// directly. Same arithmetic, same bits.
+pub(crate) fn small_curve_derivatives_enabled() -> bool {
+    switch!("BREP_CURVE_SMALL_DERIVATIVES", true)
+}
+
+
+
+/// Piegl–Tiller A5.6 with caller-selected homogeneous arithmetic.
+pub(crate) fn bezier_decompose_raw<T: Copy>(knots: &[f64], points: &[T], degree: usize, zero: T, blend: impl Fn(T, T, f64) -> T) -> Option<Vec<Vec<T>>> {
+    let p = degree;
+    let n = points.len();
+    if p == 0 || n < p + 1 || knots.len() != n + p + 1 || knots.iter().any(|k| !k.is_finite()) || knots.windows(2).any(|w| w[1] < w[0]) {
+        return None;
+    }
+    let (a, b) = (knots[0], knots[knots.len() - 1]);
+    if !(b > a) || knots[..=p].iter().any(|k| *k != a) || knots[knots.len() - p - 1..].iter().any(|k| *k != b) {
+        return None;
+    }
+    let m = knots.len() - 1;
+    let (mut a, mut b) = (p, p + 1);
+    let mut spans = Vec::with_capacity(n);
+    let mut span: Vec<T> = points[..=p].to_vec();
+    let mut alphas = vec![0.; p];
+    while b < m {
+        let first = b;
+        while b < m && knots[b + 1] == knots[b] {
+            b += 1;
+        }
+        let mult = b - first + 1;
+        if b < m && mult > p {
+            return None;
+        }
+        let mut next = vec![zero; p + 1];
+        if mult < p {
+            let numer = knots[b] - knots[a];
+            for j in (mult + 1..=p).rev() {
+                alphas[j - mult - 1] = numer / (knots[a + j] - knots[a]);
+            }
+            let r = p - mult;
+            for j in 1..=r {
+                let s = mult + j;
+                for k in (s..=p).rev() {
+                    let alpha = alphas[k - s];
+                    span[k] = blend(span[k], span[k - 1], alpha);
+                }
+                if b < m {
+                    next[r - j] = span[p];
+                }
+            }
+        }
+        spans.push(span);
+        if b >= m {
+            break;
+        }
+        for i in p - mult..=p {
+            next[i] = points[b - p + i];
+        }
+        span = next;
+        a = b;
+        b += 1;
+    }
+    Some(spans)
+}
+
+/// Homogeneous Bezier spans; callers requiring a particular certificate arithmetic
+/// path may use `bezier_decompose_raw` or retain repeated insertion.
+pub(crate) fn bezier_decompose(curve: &NurbsCurve) -> Option<Vec<Vec<Vec4>>> {
+    bezier_decompose_raw(&curve.knots, &curve.control_points, curve.degree,
+        Vec4 { x: 0.0, y: 0.0, z: 0.0, w: 0.0 },
+        |a, b, alpha| a.scale(alpha).add(b.scale(1.0 - alpha)))
+}
+
+/// One raw Boehm insertion. Span selection and the denominator policy belong
+/// to the caller, as does the interpolation expression's operand order.
+pub(crate) fn boehm_insert_raw<T: Copy>(
+    points: &[T], knots: &[f64], degree: usize, parameter: f64, span: usize,
+    blend: impl Fn(T, T, f64, f64) -> T,
+) -> (Vec<T>, Vec<f64>) {
+    let mut out = Vec::with_capacity(points.len() + 1);
+    out.extend_from_slice(&points[..=span - degree]);
+    for i in span - degree + 1..=span {
+        out.push(blend(points[i - 1], points[i], parameter - knots[i], knots[i + degree] - knots[i]));
+    }
+    out.extend_from_slice(&points[span..]);
+    let mut fresh_knots = knots.to_vec();
+    fresh_knots.insert(span + 1, parameter);
+    (out, fresh_knots)
+}
+
+
+/// Heap basis for raw/unclamped knots or degrees beyond the stack specialization.
+pub(crate) fn basis_functions_raw(knots: &[f64], degree: usize, span: usize, parameter: f64, guard: f64) -> Vec<f64> {
+    let mut basis = vec![0.0; degree + 1];
+    let mut left = vec![0.0; degree + 1];
+    let mut right = vec![0.0; degree + 1];
+    basis_functions_raw_into(knots, degree, span, parameter, guard, &mut basis, &mut left, &mut right);
+    basis
+}
+
+#[inline]
+fn basis_functions_raw_into(knots: &[f64], degree: usize, span: usize, parameter: f64,
+    guard: f64, basis: &mut [f64], left: &mut [f64], right: &mut [f64]) {
+    basis[0] = 1.0;
+    for j in 1..=degree {
+        left[j] = parameter - knots[span + 1 - j];
+        right[j] = knots[span + j] - parameter;
+        let mut saved = 0.0;
+        for r in 0..j {
+            let denominator = right[r + 1] + left[j - r];
+            let temporary = if denominator.abs() <= guard {
+                0.0
+            } else {
+                basis[r] / denominator
+            };
+            basis[r] = saved + right[r + 1] * temporary;
+            saved = left[j - r] * temporary;
+        }
+        basis[j] = saved;
+    }
+}

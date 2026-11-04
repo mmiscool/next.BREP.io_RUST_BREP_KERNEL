@@ -21,6 +21,7 @@ pub struct Session {
     /// The platform clock's reading when the session started (`now_ms`).
     pub started_ms: f64,
     shots: AtomicU64,
+    shot_bytes: Mutex<usize>,
     recorder: Mutex<Recorder>,
 }
 
@@ -28,6 +29,7 @@ pub struct Session {
 struct Recorder {
     on: bool,
     steps: Vec<Value>,
+    bytes: usize,
 }
 
 #[derive(Serialize)]
@@ -52,7 +54,8 @@ impl Session {
             config,
             started_ms,
             shots: AtomicU64::new(0),
-            recorder: Mutex::new(Recorder { on: record, steps: Vec::new() }),
+            shot_bytes: Mutex::new(0),
+            recorder: Mutex::new(Recorder { on: record, steps: Vec::new(), bytes: 0 }),
         })
     }
 
@@ -71,7 +74,15 @@ impl Session {
     /// manifest, when the capture made one) to the platform, and answer with
     /// the number and where it went.
     pub fn keep_shot(&self, png: &[u8], manifest: Option<&Value>) -> Result<(u64, KeptShot), String> {
+        let mut bytes = self.shot_bytes.lock().unwrap();
+        let manifest_bytes = manifest.map(serde_json::to_vec_pretty).transpose().map_err(|e| e.to_string())?.map_or(0, |v| v.len());
+        let size = png.len().saturating_add(manifest_bytes);
+        if self.shots.load(Ordering::Relaxed) >= 4096 || bytes.saturating_add(size) > 256 << 20 {
+            return Err("session screenshot storage is full (4096 captures or 256 MiB); retained captures are preserved".into());
+        }
         let n = self.shots.fetch_add(1, Ordering::Relaxed) + 1;
+        // Reserve before writing: even a partial filesystem write consumes budget.
+        *bytes += size;
         let kept = self.host.platform.keep_shot(&self.dir, n, png, manifest)?;
         Ok((n, kept))
     }
@@ -82,8 +93,14 @@ impl Session {
             return;
         }
         let entry = json!({ "tool": tool, "args": args, "ok": ok, "digest": digest });
-        r.steps.push(entry.clone());
-        self.host.platform.append_log(&self.dir, &entry.to_string());
+        let line = entry.to_string();
+        if r.steps.len() >= 4096 || r.bytes + line.len() > 16 << 20 {
+            r.on = false;
+            return;
+        }
+        r.bytes += line.len();
+        r.steps.push(entry);
+        self.host.platform.append_log(&self.dir, &line);
     }
 
     pub fn set_recording(&self, on: bool) {

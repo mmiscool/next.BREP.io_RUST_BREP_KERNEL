@@ -23,6 +23,9 @@ drawing with them.
 | Hack | `Hack-Regular.ttf` (via `epaint_default_fonts`) | MIT (Source Foundry), over public-domain DejaVu and the Bitstream Vera License | `fonts/Hack-Regular.txt` in that crate |
 | emoji-icon-font | `emoji-icon-font.ttf` (via `epaint_default_fonts`) | MIT | `fonts/emoji-icon-font-mit-license.txt` in that crate |
 
+Sketch text in `BREP_render` also uses the bundled Ubuntu Light and Hack fonts
+to generate saved vector outlines, parsed by `ttf-parser` (MIT OR Apache-2.0).
+
 `epaint_default_fonts` declares its terms as
 `(MIT OR Apache-2.0) AND OFL-1.1 AND Ubuntu-font-1.0`. The `AND` is the part
 that matters: the OFL-1.1 and Ubuntu-font-1.0 obligations are **not** discharged

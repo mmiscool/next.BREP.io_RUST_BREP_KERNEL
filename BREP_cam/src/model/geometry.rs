@@ -7,6 +7,7 @@
 use serde::{Deserialize, Serialize};
 
 /// A point or vector in 3D. Serialized as a three-element array.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(from = "[f64; 3]", into = "[f64; 3]")]
 pub struct Point3 {
@@ -119,6 +120,7 @@ impl Point3 {
 }
 
 /// A point in 2D (sketch/region space). Serialized as `[x, y]`.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(from = "[f64; 2]", into = "[f64; 2]")]
 pub struct Point2 {
@@ -149,6 +151,7 @@ impl Point2 {
 }
 
 /// Axis-aligned bounding box. An empty box has `min > max` on every axis.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Bounds3 {
@@ -265,6 +268,7 @@ impl Bounds3 {
 /// [`RigidTransform::new`] (validated) or the named constructors. The setup's
 /// model-to-machine transform is the ONLY rigid transform CAM applies to
 /// geometry; display conversion back uses [`RigidTransform::inverse`].
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RigidTransform {

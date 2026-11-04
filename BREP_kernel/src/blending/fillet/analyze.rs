@@ -468,6 +468,84 @@ pub(crate) fn scan_dihedral(
     solid: &BrepSolid,
     edge_id: u64,
 ) -> Result<DihedralProfile, KernelRefusal> {
+    scan_dihedral_with(solid, edge_id, true)
+}
+
+fn scan_dihedral_sampled(solid: &BrepSolid, edge_id: u64) -> Result<DihedralProfile, KernelRefusal> {
+    scan_dihedral_with(solid, edge_id, false)
+}
+
+/// Is the dihedral angle along `curve` between `a` and `b` the same at every
+/// point, by construction? Two affine planes (degree 1 × 1, a 2 × 2 net of
+/// equal weights, no twist) along a straight edge; or an affine plane whose
+/// normal is a cylinder's axis and the cylinder (the recogniser's full or
+/// partial straight revolution), the edge rational quadratic spans of a
+/// circle about that axis in the plane.
+fn constant_dihedral(curve: &NurbsCurve, a: &FaceRecord, b: &FaceRecord) -> bool {
+    let affine_normal = |surface: &crate::NurbsSurface| -> Option<Vec3> {
+        if surface.degree_u != 1 || surface.degree_v != 1 || surface.control_points.len() != 2 || surface.control_points.iter().any(|row| row.len() != 2) {
+            return None;
+        }
+        let w = surface.control_points[0][0].w;
+        if !(w > 0.0) || surface.control_points.iter().flatten().any(|c| c.w != w) {
+            return None;
+        }
+        let corner = |i: usize, j: usize| surface.control_points[i][j].point().ok();
+        let (p00, p01, p10, p11) = (corner(0, 0)?, corner(0, 1)?, corner(1, 0)?, corner(1, 1)?);
+        let defect = p11.sub(p10).sub(p01.sub(p00));
+        if defect.x != 0.0 || defect.y != 0.0 || defect.z != 0.0 {
+            return None;
+        }
+        p10.sub(p00).cross(p01.sub(p00)).normalized().ok()
+    };
+    let straight = curve.degree == 1 && curve.control_points.len() == 2 && curve.control_points[0].w == curve.control_points[1].w && curve.control_points[0].w > 0.0;
+    let (na, nb) = (affine_normal(&a.surface), affine_normal(&b.surface));
+    if straight && na.is_some() && nb.is_some() {
+        return true;
+    }
+    let (plane, other) = match (na, nb) {
+        (Some(n), None) => (n, b),
+        (None, Some(n)) => (n, a),
+        _ => return false,
+    };
+    let Some(analytic) = other.surface.analytic() else { return false };
+    let Some(frame) = analytic.frame() else { return false };
+    let cylinder = match analytic {
+        crate::AnalyticSurface::RuledRevolution { rho0, rho1, .. } => (rho0 - rho1).abs() <= 1e-12 * rho0.abs().max(1.0),
+        crate::AnalyticSurface::Revolution { generatrix, .. } => generatrix.straight_segment(1e-12).is_some_and(|(p, q)| q.sub(p).cross(frame.axis).length() <= 1e-12 * q.sub(p).length().max(1.0)),
+        _ => false,
+    };
+    if !cylinder || plane.cross(frame.axis).length() > 1e-12 {
+        return false;
+    }
+    let controls = &curve.control_points;
+    if curve.degree != 2 || controls.len() < 3 || controls.len() % 2 == 0 {
+        return false;
+    }
+    let cylindrical = |c: &crate::Vec4| c.point().ok().map(|p| { let d = p.sub(frame.origin); let h = d.dot(frame.axis); (d.sub(frame.axis.scale(h)).length(), h) });
+    let Some((r0, h0)) = cylindrical(&controls[0]) else { return false };
+    let tol = 1e-12 * r0.max(h0.abs()).max(1.0);
+    (0..(controls.len() - 1) / 2).all(|span| {
+        let (start, apex, end) = (controls[2 * span], controls[2 * span + 1], controls[2 * span + 2]);
+        if !(start.w > 0.0 && apex.w > 0.0 && end.w > 0.0) {
+            return false;
+        }
+        let w = apex.w / (start.w * end.w).sqrt();
+        match (cylindrical(&start), cylindrical(&apex), cylindrical(&end)) {
+            (Some((ra, ha)), Some((rm, hm)), Some((rb, hb))) => {
+                w > 0.0 && w < 1.0 && (ra - r0).abs() <= tol && (rb - r0).abs() <= tol && (rm - r0 / w).abs() <= tol / w
+                    && (ha - h0).abs() <= tol && (hb - h0).abs() <= tol && (hm - h0).abs() <= tol
+            }
+            _ => false,
+        }
+    })
+}
+
+fn scan_dihedral_with(
+    solid: &BrepSolid,
+    edge_id: u64,
+    allow_constant: bool,
+) -> Result<DihedralProfile, KernelRefusal> {
     let (edge, faces) = edge_and_faces(solid, edge_id)?;
     if faces.len() != 2 {
         return Err(KernelRefusal::input(
@@ -538,6 +616,17 @@ pub(crate) fn scan_dihedral(
         flip_fraction: None,
     };
     let mut first_sense: Option<bool> = None;
+    // Lane N (2026-10-28): where the angle is the same at every station — a
+    // straight edge between two affine planes (constant normals, constant
+    // tangent), or a plane normal to a coaxial cylinder's axis along that
+    // cylinder's parallel circle (rotational symmetry) — one station reads
+    // the whole edge; the profile is that station's, counted as every
+    // station's. Anything else, or a station that will not read, scans.
+    let constant_angle = allow_constant && constant_dihedral(&edge.curve, faces[0], faces[1]);
+    let stations: Vec<usize> = if constant_angle { vec![SAMPLES / 2] } else { (0..SAMPLES).collect() };
+    if constant_angle {
+        crate::blend::record_count("count.scan_dihedral.constant", 1);
+    }
     // Stations sit at the midpoints of `SAMPLES` equal sub-spans, strictly
     // inside the edge. The two end points are not stations on purpose: on a
     // closed rim whose wall face is creased along its own seam (an extruded
@@ -548,7 +637,7 @@ pub(crate) fn scan_dihedral(
     // station read 270° on a rim that is 90° everywhere and named the edge
     // MIXED. The dihedral angle at a crease point is undefined, not mixed; the
     // scan reads the edge, not its ends.
-    for step in 0..SAMPLES {
+    for &step in &stations {
         let fraction = (step as f64 + 0.5) / SAMPLES as f64;
         let t = edge.t0 + span * fraction;
         let Ok(point) = edge.curve.evaluate(t) else {
@@ -607,6 +696,14 @@ pub(crate) fn scan_dihedral(
             }
         }
     }
+    if constant_angle {
+        if profile.samples == 1 {
+            profile.samples = SAMPLES;
+        } else {
+            // The one station did not read: scan the edge as before.
+            return scan_dihedral_sampled(solid, edge_id);
+        }
+    }
     // OCCT requires at least half its samples to have converged before it
     // trusts a `Mixed` verdict (`BRepOffset_Analyse.cxx:263-266`); the same
     // rule keeps a scan that mostly failed to evaluate from naming a class.
@@ -634,6 +731,10 @@ pub(super) fn check_mixed_concavity(
     edge_id: u64,
     entry: &str,
 ) -> Result<(), KernelRefusal> {
+    if revolution_dihedral_certified(solid, edge_id) {
+        crate::blend::record_count("count.selection.dihedral_revolution_certified", 1);
+        return Ok(());
+    }
     let Ok(profile) = scan_dihedral(solid, edge_id) else {
         return Ok(());
     };
@@ -659,12 +760,84 @@ pub(super) fn check_mixed_concavity(
     ))
 }
 
+/// An edge whose two faces are analytic carriers rotationally symmetric about
+/// ONE axis, with the interior angle clear of flat, cannot be MIXED, so
+/// [`check_mixed_concavity`] need not scan it (lane R 2026-10-28, the
+/// cylinder rims row: 0.13 ms of the two-rim fillet's 1.6 ms).
+///
+/// Why it is exact: the edge lies on both carriers, so it lies on their
+/// intersection, which for two surfaces of revolution about one axis is a set
+/// of parallels of that axis.  The whole configuration — both carriers, the
+/// edge, each face's outward sense — is carried into itself by every
+/// rotation about the axis, so the dihedral is the same number at every point
+/// of the edge, and one number cannot be both convex and concave.  A plane
+/// is symmetric about every axis along its normal; a sphere about every axis
+/// through its centre; a cylinder, cone, torus or general revolution about
+/// its own axis.  The axis and alignment bands are the exact revolution
+/// lane's (`blend/stations.rs::closed_revolution_axis`, 1e-7).
+///
+/// The margin: the scan's verdict at a constant angle within its angular band
+/// of flat is decided by floating noise, so the certificate stands down there
+/// — it requires the two outward normals at the edge's midpoint to be clear
+/// of parallel (|n₀ × n₁| > 1e-6, an angle 1e-6 rad from flat or from a knife
+/// edge, far outside the angular band the scan classifies against).  Two
+/// planes have no common axis of their own and are scanned as before.
+pub(super) fn revolution_dihedral_certified(solid: &BrepSolid, edge_id: u64) -> bool {
+    use crate::AnalyticSurface;
+    let Ok((edge, faces)) = edge_and_faces(solid, edge_id) else { return false };
+    let [first, second] = faces[..] else { return false };
+    let (Some(a), Some(b)) = (first.surface.analytic(), second.surface.analytic()) else { return false };
+    // The axis: the first carrier that has one of its own and is not a
+    // sphere; two spheres share the line through their centres.
+    let framed = |surface: &AnalyticSurface| !matches!(surface, AnalyticSurface::Plane { .. } | AnalyticSurface::Sphere { .. });
+    let axis = match (a, b) {
+        (AnalyticSurface::Sphere { frame: f, .. }, AnalyticSurface::Sphere { frame: g, .. }) => {
+            match g.origin.sub(f.origin).normalized() {
+                Ok(direction) => Some((f.origin, direction)),
+                // Concentric spheres: any axis through the centre.
+                Err(_) => Some((f.origin, Vec3::new(0.0, 0.0, 1.0))),
+            }
+        }
+        _ if framed(a) => a.frame().and_then(|frame| frame.axis.normalized().ok().map(|axis| (frame.origin, axis))),
+        _ if framed(b) => b.frame().and_then(|frame| frame.axis.normalized().ok().map(|axis| (frame.origin, axis))),
+        // A plane and a sphere: the line through the centre along the normal.
+        (AnalyticSurface::Plane { u_dir, v_dir, .. }, AnalyticSurface::Sphere { frame, .. })
+        | (AnalyticSurface::Sphere { frame, .. }, AnalyticSurface::Plane { u_dir, v_dir, .. }) => {
+            u_dir.cross(*v_dir).normalized().ok().map(|normal| (frame.origin, normal))
+        }
+        _ => None,
+    };
+    let Some((origin, axis)) = axis else { return false };
+    let symmetric = |surface: &AnalyticSurface| -> bool {
+        match surface {
+            AnalyticSurface::Plane { u_dir, v_dir, .. } => {
+                u_dir.cross(*v_dir).normalized().is_ok_and(|normal| normal.cross(axis).length() <= 1e-7)
+            }
+            AnalyticSurface::Sphere { frame, .. } => {
+                let offset = frame.origin.sub(origin);
+                let scale = origin.length().max(frame.origin.length()).max(1.0);
+                offset.sub(axis.scale(offset.dot(axis))).length() <= 1e-7 * scale
+            }
+            other => {
+                let Some(frame) = other.frame() else { return false };
+                let Ok(own) = frame.axis.normalized() else { return false };
+                let offset = frame.origin.sub(origin);
+                let scale = origin.length().max(frame.origin.length()).max(1.0);
+                own.cross(axis).length() <= 1e-7 && offset.sub(axis.scale(offset.dot(axis))).length() <= 1e-7 * scale
+            }
+        }
+    };
+    if !symmetric(a) || !symmetric(b) {
+        return false;
+    }
+    let Ok(middle) = edge.curve.evaluate(edge.t0 + 0.5 * (edge.t1 - edge.t0)) else { return false };
+    let (Ok((_, n0)), Ok((_, n1))) = (face_plane_normal(first, middle), face_plane_normal(second, middle)) else { return false };
+    n0.cross(n1).length() > 1e-6
+}
+
 /// Rodrigues rotation of `v` about the unit `axis` by `angle`.
 fn rotate_about(v: Vec3, axis: Vec3, angle: f64) -> Vec3 {
-    let (sin, cos) = angle.sin_cos();
-    v.scale(cos)
-        .add(axis.cross(v).scale(sin))
-        .add(axis.scale(axis.dot(v) * (1.0 - cos)))
+    v.rotate_about(axis, angle)
 }
 
 /// The faces joined to `face` across a boundary edge they meet TANGENTIALLY —
@@ -752,6 +925,39 @@ pub(crate) fn neighbour_carries_ball(
     neighbour: &FaceRecord,
     size: f64,
 ) -> bool {
+    neighbour_carries_ball_sided(solid, face, neighbour, size, None)
+}
+
+/// Lane N census row 5 (2026-10-28): `BREP_SIDED_BALL_NEIGHBOUR=1`/`on` reads
+/// the neighbour's curvature on the BALL's side; `=0`/`off` keeps the
+/// unsigned bound. ON by default since lane N's promotion (2026-10-28).
+const SIDED_BALL_NEIGHBOUR_DEFAULT: bool = true;
+
+pub(crate) fn sided_ball_neighbour_on() -> bool {
+    switch!(live "BREP_SIDED_BALL_NEIGHBOUR", SIDED_BALL_NEIGHBOUR_DEFAULT)
+}
+
+
+/// [`neighbour_carries_ball`] told which side of the material the ball is
+/// on: `Some(true)` OUTSIDE (a concave blend's ball, in the air), `Some(false)`
+/// INSIDE (a convex blend's). A ball fails to follow a surface only where the
+/// surface curves AROUND it tighter than its radius — the centre of
+/// curvature on the ball's side: a convex neighbour for a ball inside (the
+/// blended through-hole's far mouth), a concave one for a ball outside. A
+/// ball resting on a convex surface from outside, or on a concave one from
+/// inside, fits at any radius: the census's boss on a box with an existing
+/// round (lCount_407/408/409), whose concave base blend rolls onto a convex
+/// r 1 round from above. The curvatures are read against the neighbour's
+/// OUTWARD normal (convex negative, `principal_curvatures`' convention). With
+/// `None`, or the switch off, the unsigned bound as before.
+pub(crate) fn neighbour_carries_ball_sided(
+    solid: &BrepSolid,
+    face: &FaceRecord,
+    neighbour: &FaceRecord,
+    size: f64,
+    ball_outside: Option<bool>,
+) -> bool {
+    let ball_outside = ball_outside.filter(|_| sided_ball_neighbour_on());
     let limit = size * (1.0 + 1e-6);
     let mut stations = 0usize;
     for coedge in face.loops.iter().flat_map(|lp| &lp.coedges) {
@@ -780,7 +986,17 @@ pub(crate) fn neighbour_carries_ball(
             else {
                 return false;
             };
-            let tightest = kappa_min.abs().max(kappa_max.abs());
+            let tightest = match ball_outside {
+                None => kappa_min.abs().max(kappa_max.abs()),
+                Some(outside) => {
+                    // Against the outward normal; then the curvature that
+                    // wraps the ball: concave (positive) for a ball outside,
+                    // convex (negative) for one inside.
+                    let sign = if neighbour.same_sense { 1.0 } else { -1.0 };
+                    let wrap = if outside { 1.0 } else { -1.0 };
+                    (sign * wrap * kappa_min).max(sign * wrap * kappa_max).max(0.0)
+                }
+            };
             if tightest > 0.0 && 1.0 / tightest <= limit {
                 return false;
             }
@@ -917,11 +1133,97 @@ enum SupportExtent {
     ConcaveClip { face: u64, refusal: KernelRefusal },
 }
 
+/// The slug of [`rollover_only_refusal`]'s refusal (`UnsupportedGeometry`).
+pub(crate) const TANGENT_ROLLOVER_ONLY_WHAT: &str = "tangent_rollover_only";
+
+// The edges whose reach was met only through a tangent neighbour the SIDED
+// rule admits (`neighbour_carries_ball_sided`): a rollover lane can follow
+// that neighbour, no lane on the mates' own carriers can. Cleared at each
+// outermost blend operation's selection checks; read by the cutter fallback
+// (`rollover_only_refusal`).
+thread_local! {
+    static ROLLOVER_ONLY: std::cell::RefCell<Vec<(u64, KernelRefusal)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+pub(super) fn clear_rollover_only() {
+    ROLLOVER_ONLY.with(|cell| cell.borrow_mut().clear());
+}
+
+/// The reach refusal of a selected edge that only a rollover can build, if
+/// any of `edge_ids` is one: the lanes that ride the mates' own carriers
+/// (the exact cutter's tool) would build the pad on the mate's extension
+/// past the tangent edge, over air.
+pub(super) fn rollover_only_refusal(edge_ids: &[u64]) -> Option<KernelRefusal> {
+    ROLLOVER_ONLY.with(|cell| cell.borrow().iter().find(|(id, _)| edge_ids.contains(id)).map(|(_, refusal)| refusal.clone()))
+}
+
+// Lane N (2026-10-28): the support faces' sampled boundaries, per selection
+// check (`SupportBoundaryScope`, opened around the fillet entry's loop over
+// its selected edges on ONE solid; closed when it drops), keyed by face id,
+// size bits and the ball's side. `None` outside a scope: nothing is kept.
+thread_local! {
+    static SUPPORT_BOUNDARIES: std::cell::RefCell<Option<rustc_hash::FxHashMap<(u64, u64, Option<bool>), (Vec<Vec3>, Vec<u64>)>>> = const { std::cell::RefCell::new(None) };
+}
+
+pub(super) struct SupportBoundaryScope(Option<rustc_hash::FxHashMap<(u64, u64, Option<bool>), (Vec<Vec3>, Vec<u64>)>>);
+
+impl SupportBoundaryScope {
+    pub(super) fn open() -> Self {
+        SupportBoundaryScope(SUPPORT_BOUNDARIES.with(|cell| cell.replace(Some(Default::default()))))
+    }
+}
+
+impl Drop for SupportBoundaryScope {
+    fn drop(&mut self) {
+        let previous = self.0.take();
+        SUPPORT_BOUNDARIES.with(|cell| *cell.borrow_mut() = previous);
+    }
+}
+
 fn support_extent(
     solid: &BrepSolid,
     edge_id: u64,
     size: f64,
     entry: &str,
+) -> Result<SupportExtent, KernelRefusal> {
+    if !sided_ball_neighbour_on() {
+        return support_extent_pass(solid, edge_id, size, entry, false);
+    }
+    // The unsigned pass first: what it admits, every lane may build. What
+    // only the sided pass admits needs a rollover (lane N census row 5).
+    match support_extent_pass(solid, edge_id, size, entry, false) {
+        Ok(SupportExtent::Fits) => Ok(SupportExtent::Fits),
+        unsigned => match support_extent_pass(solid, edge_id, size, entry, true) {
+            Ok(SupportExtent::Fits) => {
+                if let Err(refusal) = &unsigned {
+                    let named = KernelRefusal::unsupported(
+                        KernelStage::Classify,
+                        TANGENT_ROLLOVER_ONLY_WHAT,
+                        format!(
+                            "{entry}: edge {edge_id}'s rolling ball reaches its supports only by rolling over a tangent \
+                             neighbour that curves AWAY from it (a ball on the far side of a surface's curvature fits at \
+                             any radius), and no lane that can follow it applies: the closed-rim rollover takes one \
+                             closed edge, and every other lane rides the mates' own carriers past the tangent edge, where \
+                             the blend would fill over air. On the mates alone: {}",
+                            refusal.message
+                        ),
+                    );
+                    ROLLOVER_ONLY.with(|cell| cell.borrow_mut().push((edge_id, named)));
+                    crate::blend::record_count("count.support_extent.rollover_only", 1);
+                }
+                Ok(SupportExtent::Fits)
+            }
+            _ => unsigned,
+        },
+    }
+}
+
+fn support_extent_pass(
+    solid: &BrepSolid,
+    edge_id: u64,
+    size: f64,
+    entry: &str,
+    sided: bool,
 ) -> Result<SupportExtent, KernelRefusal> {
     // Diagnostic (lane F, 2026-10-15).
     if std::env::var_os("BREP_NO_SUPPORT_EXTENT").is_some() {
@@ -1001,6 +1303,22 @@ fn support_extent(
                 .is_ok_and(|profile| profile.samples > 0 && profile.max_angle < std::f64::consts::PI - angular)
         })
     };
+    // Which side of the material the ball is on, read once and only when a
+    // tangent neighbour asks: a concave edge's ball is outside, a convex
+    // edge's inside, a mixed or unread one unknown.
+    let ball_side = std::cell::OnceCell::new();
+    let ball_outside = || -> Option<bool> {
+        if !sided {
+            return None;
+        }
+        *ball_side.get_or_init(|| {
+            scan_dihedral(solid, edge_id).ok().and_then(|profile| match (profile.any_convex, profile.any_concave) {
+                (false, true) => Some(true),
+                (true, false) => Some(false),
+                _ => None,
+            })
+        })
+    };
     let mut first_refusal: Option<KernelRefusal> = None;
     // Which support each overrun station ran off (bit 0 = first, 1 = second).
     let mut overrun_faces = [0u8; SAMPLES + 1];
@@ -1036,28 +1354,45 @@ fn support_extent(
         // through-hole is G1 with the wall and still no wall to lie on.
         let mut boundary: Vec<Vec3> = Vec::new();
         let mut boundary_edges = Vec::new();
-        let mut sample_face = |sampled: &FaceRecord, boundary: &mut Vec<Vec3>| {
-            for loop_record in &sampled.loops {
-                for coedge in &loop_record.coedges {
-                    let Some(border) = solid.edges.iter().find(|e| e.id == coedge.edge_id) else {
-                        continue;
-                    };
-                    boundary_edges.push(border);
-                    for step in 0..=SAMPLES {
-                        let t = border.t0 + (border.t1 - border.t0) * step as f64 / SAMPLES as f64;
-                        if let Ok(point) = border.curve.evaluate(t) {
-                            boundary.push(point);
+        // The face's sampled boundary and its admitted tangent neighbours'
+        // depend on the face, the size and the ball's side only: read once
+        // per selection check (`SupportBoundaryScope`) for every edge that
+        // has this face for a support.
+        let side = ball_outside();
+        let key = (face.id, size.to_bits(), side);
+        let cached = SUPPORT_BOUNDARIES.with(|cell| cell.borrow().as_ref().and_then(|map| map.get(&key).cloned()));
+        if let Some((points, edge_ids)) = cached {
+            boundary = points;
+            boundary_edges = edge_ids.iter().filter_map(|id| solid.edges.iter().find(|e| e.id == *id)).collect();
+        } else {
+            let mut sample_face = |sampled: &FaceRecord, boundary: &mut Vec<Vec3>| {
+                for loop_record in &sampled.loops {
+                    for coedge in &loop_record.coedges {
+                        let Some(border) = solid.edges.iter().find(|e| e.id == coedge.edge_id) else {
+                            continue;
+                        };
+                        boundary_edges.push(border);
+                        for step in 0..=SAMPLES {
+                            let t = border.t0 + (border.t1 - border.t0) * step as f64 / SAMPLES as f64;
+                            if let Ok(point) = border.curve.evaluate(t) {
+                                boundary.push(point);
+                            }
                         }
                     }
                 }
+            };
+            sample_face(face, &mut boundary);
+            for neighbour in tangent_neighbours(solid, face) {
+                if !neighbour_carries_ball_sided(solid, face, neighbour, size, side) {
+                    continue;
+                }
+                sample_face(neighbour, &mut boundary);
             }
-        };
-        sample_face(face, &mut boundary);
-        for neighbour in tangent_neighbours(solid, face) {
-            if !neighbour_carries_ball(solid, face, neighbour, size) {
-                continue;
-            }
-            sample_face(neighbour, &mut boundary);
+            SUPPORT_BOUNDARIES.with(|cell| {
+                if let Some(map) = cell.borrow_mut().as_mut() {
+                    map.insert(key, (boundary.clone(), boundary_edges.iter().map(|e| e.id).collect()));
+                }
+            });
         }
         if boundary.is_empty() {
             continue;
@@ -1243,8 +1578,7 @@ pub(super) fn concave_clip_outline(
 /// default (promoted 2026-10-18 on the 98 + 144 census);
 /// `BREP_INTERFERENCE_REVOLUTION_CERT=0` (or `off`) samples every body.
 pub(crate) fn interference_revolution_cert_on() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| !matches!(std::env::var("BREP_INTERFERENCE_REVOLUTION_CERT").as_deref(), Ok("0") | Ok("off")))
+    switch!("BREP_INTERFERENCE_REVOLUTION_CERT", true)
 }
 
 
@@ -1402,6 +1736,765 @@ fn revolution_interference_certificate(
     let on_band = |edge_id: u64| {
         result.shells.iter().flat_map(|shell| &shell.faces).filter(|face| banded.contains(&face.id)).any(|face| {
             face.loops.iter().flat_map(|l| &l.coedges).any(|coedge| coedge.edge_id == edge_id)
+        })
+    };
+    fresh_edges.iter().all(|&edge_id| on_band(edge_id)).then_some(true)
+}
+
+
+/// Lane N row 1 (2026-10-28): the interference certificate for bands that are
+/// not full-turn revolutions. `BREP_INTERFERENCE_BAND_CERT=1`/`on` turns it
+/// on, `=0`/`off` off; ON by default since lane N's promotion (2026-10-28).
+const BAND_CERT_DEFAULT: bool = true;
+
+pub(crate) fn interference_band_cert_on() -> bool {
+    switch!("BREP_INTERFERENCE_BAND_CERT", BAND_CERT_DEFAULT)
+}
+
+
+/// A convex region `A` a grown face lies in — a hull of points or a solid
+/// sector, in the same `FaceExtent` terms an original face's extent is
+/// read in — with a point of `int A`.
+///
+/// * A face on a FULL sphere carrier whose three non-degenerate edges meet
+///   at three points `Tᵢ = C + r·nᵢ` with mutually orthogonal `nᵢ` — a corner
+///   patch, fitted or the exact octant — lies in the cube spanned at `C` by
+///   `r·n₁, r·n₂, r·n₃` (its points are `C + r·u` with `u` in that octant), and
+///   the cube's centre is a point of its interior.
+/// * Any other face lies in the convex hull of its control net (positive
+///   weights), whose vertices are the net's points and whose interior holds
+///   the net's centroid when the net spans three dimensions.
+///
+/// * A carrier linear in neither direction that is a partial revolution —
+///   the network's exact torus rows — lies in its pie (`revolution_pie_region`).
+///
+/// `None` for a face no rule reads: a sphere patch that is not an
+/// orthogonal corner, a weight that is not positive, a flat net.
+fn band_region(face: &FaceRecord, result: &BrepSolid) -> Option<(FaceExtent, Vec3)> {
+    let surface = &face.surface;
+    if let Some(crate::AnalyticSurface::Sphere { frame, radius }) = surface.analytic() {
+        let centre = frame.origin;
+        let r = *radius;
+        if !(r > 0.0) {
+            return None;
+        }
+        let mut tangent_points: Vec<Vec3> = Vec::with_capacity(3);
+        for coedge in face.loops.iter().flat_map(|l| &l.coedges) {
+            let edge = result.edges.iter().find(|edge| edge.id == coedge.edge_id)?;
+            if edge.degenerate {
+                continue;
+            }
+            for t in [edge.t0, edge.t1] {
+                let point = edge.curve.evaluate(t).ok()?;
+                if !tangent_points.iter().any(|known| known.sub(point).length() <= 1e-9 * (1.0 + r)) {
+                    tangent_points.push(point);
+                }
+            }
+        }
+        if tangent_points.len() != 3 {
+            return None;
+        }
+        let mut normals = [Vec3::default(); 3];
+        for (k, point) in tangent_points.iter().enumerate() {
+            let radial = point.sub(centre);
+            if (radial.length() - r).abs() > 1e-9 * (1.0 + r) {
+                return None;
+            }
+            normals[k] = radial.scale(1.0 / r);
+        }
+        if (0..3).any(|i| ((i + 1)..3).any(|j| normals[i].dot(normals[j]).abs() > 1e-9)) {
+            return None;
+        }
+        let mut vertices = Vec::with_capacity(8);
+        for mask in 0..8u8 {
+            let mut vertex = centre;
+            for (k, normal) in normals.iter().enumerate() {
+                if mask & (1 << k) != 0 {
+                    vertex = vertex.add(normal.scale(r));
+                }
+            }
+            vertices.push(vertex);
+        }
+        let interior = centre.add(normals[0].add(normals[1]).add(normals[2]).scale(0.5 * r));
+        return Some((FaceExtent::Hull(vertices), interior));
+    }
+    // The face's own uv range, from its pcurves' nets (a pcurve lies in its
+    // net's hull), clamped to the domain.
+    let ([u0, u1], [v0, v1]) = (surface.domain_u().ok()?, surface.domain_v().ok()?);
+    let (mut u_lo, mut u_hi, mut v_lo, mut v_hi) = (f64::INFINITY, f64::NEG_INFINITY, f64::INFINITY, f64::NEG_INFINITY);
+    for coedge in face.loops.iter().flat_map(|l| &l.coedges) {
+        for control in &coedge.pcurve.control_points {
+            if !(control.w > 0.0) {
+                return None;
+            }
+            let (u, v) = (control.x / control.w, control.y / control.w);
+            if !u.is_finite() || !v.is_finite() {
+                return None;
+            }
+            u_lo = u_lo.min(u);
+            u_hi = u_hi.max(u);
+            v_lo = v_lo.min(v);
+            v_hi = v_hi.max(v);
+        }
+    }
+    if !(u_lo <= u_hi && v_lo <= v_hi) {
+        return None;
+    }
+    let (u_lo, u_hi, v_lo, v_hi) = (u_lo.max(u0), u_hi.min(u1), v_lo.max(v0), v_hi.min(v1));
+    // Along a direction the carrier is linear in (two rows, degree 1, the
+    // standard knots) the net is restricted to the face's own range: the row
+    // at fraction s is the homogeneous interpolation of the two, so the
+    // restricted net's hull holds the restricted carrier and the carrier's
+    // overshoot past the trims falls away (an exact extrusion band's rails
+    // run on past the corner arcs). The other direction keeps its net.
+    let mut net: Vec<Vec<crate::Vec4>> = surface.control_points.clone();
+    let linear_u = surface.degree_u == 1 && net.len() == 2 && surface.knots_u == [u0, u0, u1, u1] && u1 > u0;
+    let linear_v = surface.degree_v == 1 && net.first().is_some_and(|r| r.len() == 2) && surface.knots_v == [v0, v0, v1, v1] && v1 > v0;
+    // A carrier linear in neither direction that is a partial revolution — the
+    // network's exact torus rows — takes its pie; an extrusion band keeps its
+    // restricted net's hull, which is tighter than any pie round its arc.
+    if !linear_u && !linear_v {
+        if let Some(pie) = revolution_pie_region(face) {
+            return Some(pie);
+        }
+    }
+    let lerp = |a: crate::Vec4, b: crate::Vec4, s: f64| crate::Vec4 { x: a.x + (b.x - a.x) * s, y: a.y + (b.y - a.y) * s, z: a.z + (b.z - a.z) * s, w: a.w + (b.w - a.w) * s };
+    if linear_u {
+        let (s_lo, s_hi) = ((u_lo - u0) / (u1 - u0), (u_hi - u0) / (u1 - u0));
+        let (first, second) = (net[0].clone(), net[1].clone());
+        net = vec![
+            first.iter().zip(&second).map(|(a, b)| lerp(*a, *b, s_lo)).collect(),
+            first.iter().zip(&second).map(|(a, b)| lerp(*a, *b, s_hi)).collect(),
+        ];
+    }
+    if linear_v {
+        let (s_lo, s_hi) = ((v_lo - v0) / (v1 - v0), (v_hi - v0) / (v1 - v0));
+        for row in net.iter_mut() {
+            let (a, b) = (row[0], row[1]);
+            *row = vec![lerp(a, b, s_lo), lerp(a, b, s_hi)];
+        }
+    }
+    let mut vertices: Vec<Vec3> = Vec::with_capacity(net.len() * 2);
+    for control in net.iter().flatten() {
+        if !(control.w > 0.0) {
+            return None;
+        }
+        vertices.push(control.point().ok()?);
+    }
+    if vertices.len() < 4 {
+        return None;
+    }
+    // A large net stands in by its bounding box (`capped_hull`), whose centre
+    // is a point of its interior.
+    let vertices = capped_hull(vertices);
+    let centroid = vertices.iter().fold(Vec3::default(), |acc, v| acc.add(*v)).scale(1.0 / vertices.len() as f64);
+    let size = vertices.iter().fold(0f64, |m, v| m.max(v.sub(centroid).length())).max(1e-12);
+    // Three dimensions spanned: some vertex sits off the plane of three others.
+    let a = vertices[0];
+    let b = vertices.iter().copied().max_by(|p, q| p.sub(a).length().partial_cmp(&q.sub(a).length()).unwrap_or(std::cmp::Ordering::Equal))?;
+    let ab = b.sub(a);
+    if ab.length() <= 1e-9 * size {
+        return None;
+    }
+    let c = vertices.iter().copied().max_by(|p, q| ab.cross(p.sub(a)).length().partial_cmp(&ab.cross(q.sub(a)).length()).unwrap_or(std::cmp::Ordering::Equal))?;
+    let normal = ab.cross(c.sub(a));
+    if normal.length() <= 1e-9 * size * size {
+        return None;
+    }
+    let normal = normal.normalized().ok()?;
+    if vertices.iter().all(|v| v.sub(a).dot(normal).abs() <= 1e-9 * size) {
+        return None;
+    }
+    Some((FaceExtent::Hull(vertices), centroid))
+}
+
+/// The pie round a face whose carrier is a rational quadratic revolution
+/// in u — `2k + 1` rows, the even rows on parallel circles about one axis and
+/// the odd rows their spans' apexes — that the analytic recogniser does not
+/// read (the network's exact torus rows keep their carrier's knots): the
+/// pie `ρ ≤ ρ₁, z ∈ [z₀, z₁]` over the face's own angular range. The surface point at `(u, v)`
+/// is the section at `v` turned by `u`'s angle, the section lies in the
+/// meridian hull of the net's first row, so the face lies in the pie; the
+/// 3D net's apex rows (at `ρ / cos` of a half span) are not asked. The face's
+/// angular range is read off the surface at its pcurves' u extremes, as a
+/// sector extent's is; a range past a half turn is not convex and declines.
+/// The pie is the same solid sector an original cylinder face's extent is
+/// (`FaceExtent::Sector`), read by the same support function. The interior
+/// point sits at the pie's middle angle, radius and height.
+fn revolution_pie_region(face: &FaceRecord) -> Option<(FaceExtent, Vec3)> {
+    let surface = &face.surface;
+    let rows = &surface.control_points;
+    if surface.degree_u != 2 || rows.len() < 3 || rows.len() % 2 == 0 || rows.iter().any(|row| row.len() != rows[0].len()) || rows[0].len() < 2 {
+        return None;
+    }
+    let columns = rows[0].len();
+    let scale = rows.iter().flatten().filter_map(|c| c.point().ok()).fold(0f64, |m, q| m.max(q.x.abs()).max(q.y.abs()).max(q.z.abs())).max(1.0);
+    let tol = 1e-9 * scale;
+    // Every span of every column: the circle through its two end points with
+    // its apex, by the apex weight (cos of the half span relative to the
+    // ends'); all share one axis.
+    let mut axis: Option<(Vec3, Vec3)> = None; // (a point on it, unit direction)
+    for column in 0..columns {
+        for span in 0..(rows.len() - 1) / 2 {
+            let (a, apex, b) = (rows[2 * span][column], rows[2 * span + 1][column], rows[2 * span + 2][column]);
+            if !(a.w > 0.0 && apex.w > 0.0 && b.w > 0.0) {
+                return None;
+            }
+            // The span's weights may be projectively scaled (the exact torus
+            // rows carry their carrier's); the arc is unchanged, and the
+            // standard form's apex weight is the apex's over the ends' geometric
+            // mean.
+            let w = apex.w / (a.w * b.w).sqrt();
+            if !(w > 0.0 && w < 1.0) {
+                return None;
+            }
+            let (pa, pb, pm) = (a.point().ok()?, b.point().ok()?, apex.point().ok()?);
+            let mid = pa.add(pb).scale(0.5);
+            let centre = pm.add(mid.sub(pm).scale(1.0 / (1.0 - w * w)));
+            let normal = pa.sub(centre).cross(pb.sub(centre)).normalized().ok()?;
+            let radius = pa.sub(centre).length();
+            if (pb.sub(centre).length() - radius).abs() > tol || (pm.sub(centre).length() - radius / w).abs() > tol {
+                return None;
+            }
+            match axis {
+                None => axis = Some((centre, normal)),
+                Some((point, direction)) => {
+                    let off = centre.sub(point);
+                    if normal.cross(direction).length() > 1e-9 || off.sub(direction.scale(off.dot(direction))).length() > tol {
+                        return None;
+                    }
+                }
+            }
+        }
+    }
+    let (origin, axis) = axis?;
+    // The section: the first row's points in the meridian (ρ, z) plane.
+    let (mut rho_lo, mut rho_hi, mut z_lo, mut z_hi) = (f64::INFINITY, f64::NEG_INFINITY, f64::INFINITY, f64::NEG_INFINITY);
+    for control in &rows[0] {
+        let d = control.point().ok()?.sub(origin);
+        let z = d.dot(axis);
+        let rho = d.sub(axis.scale(z)).length();
+        rho_lo = rho_lo.min(rho);
+        rho_hi = rho_hi.max(rho);
+        z_lo = z_lo.min(z);
+        z_hi = z_hi.max(z);
+    }
+    if !(rho_hi > tol && z_hi >= z_lo) {
+        return None;
+    }
+    let x_axis = {
+        let d = rows[0][0].point().ok()?.sub(origin);
+        d.sub(axis.scale(d.dot(axis))).normalized().ok()?
+    };
+    let y_axis = axis.cross(x_axis);
+    // The face's angular range off the surface at its pcurves' u extremes.
+    let ([u0, u1], [v0, v1]) = (surface.domain_u().ok()?, surface.domain_v().ok()?);
+    let (mut u_lo, mut u_hi) = (f64::INFINITY, f64::NEG_INFINITY);
+    for coedge in face.loops.iter().flat_map(|l| &l.coedges) {
+        for control in &coedge.pcurve.control_points {
+            if !(control.w > 0.0) {
+                return None;
+            }
+            let u = control.x / control.w;
+            if !u.is_finite() {
+                return None;
+            }
+            u_lo = u_lo.min(u);
+            u_hi = u_hi.max(u);
+        }
+    }
+    let (u_lo, u_hi) = (u_lo.max(u0), u_hi.min(u1));
+    if !(u_hi > u_lo) {
+        return None;
+    }
+    let azimuth = |u: f64| -> Option<f64> {
+        let point = surface.evaluate(u, 0.5 * (v0 + v1)).ok()?;
+        let d = point.sub(origin);
+        let radial = d.sub(axis.scale(d.dot(axis)));
+        if radial.length() <= tol {
+            return None;
+        }
+        Some(radial.dot(y_axis).atan2(radial.dot(x_axis)))
+    };
+    let a = azimuth(u_lo)?;
+    let mut turn = azimuth(u_hi)? - a;
+    while turn <= 0.0 { turn += std::f64::consts::TAU; }
+    if turn > std::f64::consts::PI + 1e-12 {
+        return None;
+    }
+    let at = |angle: f64, rho: f64, z: f64| origin.add(x_axis.scale(rho * angle.cos())).add(y_axis.scale(rho * angle.sin())).add(axis.scale(z));
+    let interior = at(a + 0.5 * turn, 0.5 * (rho_lo.max(0.0) + rho_hi), 0.5 * (z_lo + z_hi));
+    Some((FaceExtent::Sector { origin, axis, x_axis, y_axis, radius: rho_hi, z: [z_lo, z_hi], theta: Some([a, a + turn]) }, interior))
+}
+
+/// A hull of more than `HULL_POINTS_CAP` points stands in for itself by its
+/// axis-aligned bounding box's eight corners: a convex SUPERSET, so a plane
+/// that clears the box clears the hull, and the separating-plane search stays
+/// bounded (it asks every plane through three points of each set). A fitted
+/// band's net holds hundreds of points (169 × 3 on C5's runout stripe).
+const HULL_POINTS_CAP: usize = 32;
+
+fn capped_hull(points: Vec<Vec3>) -> Vec<Vec3> {
+    if points.len() <= HULL_POINTS_CAP {
+        return points;
+    }
+    let (mut lo, mut hi) = (Vec3::new(f64::INFINITY, f64::INFINITY, f64::INFINITY), Vec3::new(f64::NEG_INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY));
+    for p in &points {
+        lo = Vec3::new(lo.x.min(p.x), lo.y.min(p.y), lo.z.min(p.z));
+        hi = Vec3::new(hi.x.max(p.x), hi.y.max(p.y), hi.z.max(p.z));
+    }
+    (0..8u8).map(|mask| Vec3::new(if mask & 1 == 0 { lo.x } else { hi.x }, if mask & 2 == 0 { lo.y } else { hi.y }, if mask & 4 == 0 { lo.z } else { hi.z })).collect()
+}
+
+/// The extent of an ORIGINAL face the certificate separates a band's
+/// polytope from: the whole plane of a planar face, the solid sector of a
+/// trimmed cylinder (its carrier's radius, the axial and angular range its
+/// loops' pcurve nets span — a pcurve lies in its net's hull — widened to the
+/// full disc past a half turn, where a sector stops being convex), or the
+/// control hull of anything else. Every reading is exact: nothing is sampled.
+enum FaceExtent {
+    Plane { normal: Vec3, offset: f64 },
+    Sector { origin: Vec3, axis: Vec3, x_axis: Vec3, y_axis: Vec3, radius: f64, z: [f64; 2], theta: Option<[f64; 2]> },
+    Hull(Vec<Vec3>),
+}
+
+fn face_extent(face: &FaceRecord) -> Option<FaceExtent> {
+    match face.surface.analytic() {
+        Some(crate::AnalyticSurface::Plane { origin, u_dir, v_dir, .. }) => {
+            let normal = u_dir.cross(*v_dir).normalized().ok()?;
+            Some(FaceExtent::Plane { normal, offset: origin.dot(normal) })
+        }
+        Some(crate::AnalyticSurface::RuledRevolution { frame, rho0, rho1, height, .. })
+            if (rho0 - rho1).abs() <= 1e-9 * rho0.abs().max(rho1.abs()).max(1.0) =>
+        {
+            // The solid of the larger radius holds the face either way; v is
+            // axial / height exactly.
+            let radius = rho0.max(*rho1);
+            if !(radius > 0.0) || !(*height > 0.0) {
+                return None;
+            }
+            let height = *height;
+            sector_extent(face, frame, radius, move |v| v * height, None)
+        }
+        Some(crate::AnalyticSurface::Revolution { frame, sweep, generatrix, .. }) => {
+            // A straight generatrix parallel to the axis: a cylinder sector
+            // (the stadium's semicylinder walls, extruded from a half-turn
+            // arc). The carrier's sweep is u's whole range; v runs the
+            // generatrix linearly over the surface's v domain.
+            if generatrix.degree != 1 || generatrix.control_points.len() != 2 || !(*sweep > 0.0) {
+                return None;
+            }
+            let ends = [generatrix.control_points[0], generatrix.control_points[1]];
+            if ends.iter().any(|c| c.w != 1.0) {
+                return None;
+            }
+            let (a, b) = (ends[0].point().ok()?, ends[1].point().ok()?);
+            let (da, db) = (a.sub(frame.origin), b.sub(frame.origin));
+            let (za, zb) = (da.dot(frame.axis), db.dot(frame.axis));
+            let (ra, rb) = (da.sub(frame.axis.scale(za)).length(), db.sub(frame.axis.scale(zb)).length());
+            if !(ra > 0.0) || (ra - rb).abs() > 1e-9 * ra.max(1.0) {
+                return None;
+            }
+            let [v0, v1] = face.surface.domain_v().ok()?;
+            if !(v1 > v0) {
+                return None;
+            }
+            sector_extent(face, frame, ra.max(rb), move |v| za + (zb - za) * (v - v0) / (v1 - v0), Some(*sweep))
+        }
+        _ => {
+            let mut hull = Vec::with_capacity(face.surface.control_points.len() * 2);
+            for control in face.surface.control_points.iter().flatten() {
+                if !(control.w > 0.0) {
+                    return None;
+                }
+                hull.push(control.point().ok()?);
+            }
+            Some(FaceExtent::Hull(capped_hull(hull)))
+        }
+    }
+}
+
+/// The solid sector of a cylinder face: its carrier's radius, the axial and
+/// angular range its loops' pcurve nets span (a pcurve lies in its net's
+/// hull), the angle read off the surface at the range's ends (u runs the
+/// right-hand way about the axis). `z_of` maps v to the axial coordinate;
+/// `sweep` is the carrier's own angular range when it is not a full turn.
+/// Past a half turn the sector stops being convex and the full disc stands
+/// in for it.
+fn sector_extent(face: &FaceRecord, frame: &crate::RevolutionFrame, radius: f64, z_of: impl Fn(f64) -> f64, sweep: Option<f64>) -> Option<FaceExtent> {
+    let [u0, u1] = face.surface.domain_u().ok()?;
+    let [v0, v1] = face.surface.domain_v().ok()?;
+    let (mut u_lo, mut u_hi, mut v_lo, mut v_hi) = (f64::INFINITY, f64::NEG_INFINITY, f64::INFINITY, f64::NEG_INFINITY);
+    for coedge in face.loops.iter().flat_map(|l| &l.coedges) {
+        for control in &coedge.pcurve.control_points {
+            if !(control.w > 0.0) {
+                return None;
+            }
+            let (u, v) = (control.x / control.w, control.y / control.w);
+            if !u.is_finite() || !v.is_finite() {
+                return None;
+            }
+            u_lo = u_lo.min(u);
+            u_hi = u_hi.max(u);
+            v_lo = v_lo.min(v);
+            v_hi = v_hi.max(v);
+        }
+    }
+    if !(u_lo <= u_hi && v_lo <= v_hi) {
+        return None;
+    }
+    let (u_lo, u_hi) = (u_lo.max(u0), u_hi.min(u1));
+    let (v_lo, v_hi) = (v_lo.max(v0), v_hi.min(v1));
+    let z = [z_of(v_lo).min(z_of(v_hi)), z_of(v_lo).max(z_of(v_hi))];
+    let whole = u_hi - u_lo >= (u1 - u0) * (1.0 - 1e-9);
+    let theta = if whole && sweep.is_none() {
+        None
+    } else {
+        let azimuth = |u: f64| -> Option<f64> {
+            let point = face.surface.evaluate(u, 0.5 * (v0 + v1)).ok()?;
+            let d = point.sub(frame.origin);
+            let radial = d.sub(frame.axis.scale(d.dot(frame.axis)));
+            if radial.length() <= 1e-12 * (1.0 + radius) {
+                return None;
+            }
+            Some(radial.dot(frame.y_axis).atan2(radial.dot(frame.x_axis)))
+        };
+        let a = azimuth(u_lo)?;
+        let b = azimuth(u_hi)?;
+        // The turn is b − a brought into (0, 2π] — the carrier's own sweep
+        // when the face spans its whole u range.
+        let mut turn = b - a;
+        while turn <= 0.0 { turn += std::f64::consts::TAU; }
+        if whole { turn = sweep?; }
+        if turn > std::f64::consts::PI { None } else { Some([a, a + turn]) }
+    };
+    Some(FaceExtent::Sector { origin: frame.origin, axis: frame.axis, x_axis: frame.x_axis, y_axis: frame.y_axis, radius, z, theta })
+}
+
+impl FaceExtent {
+    /// `[inf, sup]` of `n · p` over the extent (`n` unit).
+    fn support(&self, n: Vec3) -> [f64; 2] {
+        match self {
+            FaceExtent::Plane { normal, offset } => {
+                // Finite only along the plane's own normal.
+                let along = n.dot(*normal);
+                if (along.abs() - 1.0).abs() <= 1e-12 {
+                    [along * offset, along * offset]
+                } else {
+                    [f64::NEG_INFINITY, f64::INFINITY]
+                }
+            }
+            FaceExtent::Sector { origin, axis, x_axis, y_axis, radius, z, theta } => {
+                let base = n.dot(*origin);
+                let n_z = n.dot(*axis);
+                let axial = [(n_z * z[0]).min(n_z * z[1]), (n_z * z[0]).max(n_z * z[1])];
+                let radial = n.sub(axis.scale(n_z));
+                let m = radial.length();
+                let (cos_min, cos_max) = match theta {
+                    None => (-1.0, 1.0),
+                    Some([a, b]) => {
+                        if m <= 1e-15 {
+                            (0.0, 0.0)
+                        } else {
+                            let phi = radial.dot(*y_axis).atan2(radial.dot(*x_axis));
+                            let within = |angle: f64| {
+                                let mut d = angle - a;
+                                while d < 0.0 { d += std::f64::consts::TAU; }
+                                d <= b - a
+                            };
+                            let ends = [(a - phi).cos(), (b - phi).cos()];
+                            let max = if within(phi) { 1.0 } else { ends[0].max(ends[1]) };
+                            let min = if within(phi + std::f64::consts::PI) { -1.0 } else { ends[0].min(ends[1]) };
+                            (min, max)
+                        }
+                    }
+                };
+                // ρ runs over [0, R]: the solid sector.
+                let sup = (radius * m * cos_max).max(0.0);
+                let inf = (radius * m * cos_min).min(0.0);
+                [base + axial[0] + inf, base + axial[1] + sup]
+            }
+            FaceExtent::Hull(points) => points.iter().fold([f64::INFINITY, f64::NEG_INFINITY], |acc, p| {
+                let d = n.dot(*p);
+                [acc[0].min(d), acc[1].max(d)]
+            }),
+        }
+    }
+
+    /// Unit directions a separating plane between this extent and a
+    /// polytope could be normal to: the plane's normal; a sector's axis, its
+    /// end half-planes' normals, and the tangent-plane normal facing each
+    /// polytope vertex; nothing of a hull's own (the polytope's triples supply
+    /// the rest).
+    fn candidate_normals(&self, polytope: &[Vec3], into: &mut Vec<Vec3>) {
+        match self {
+            FaceExtent::Plane { normal, .. } => into.push(*normal),
+            FaceExtent::Sector { origin, axis, x_axis, y_axis, theta, .. } => {
+                into.push(*axis);
+                if let Some([a, b]) = theta {
+                    for angle in [*a, *b] {
+                        let radial = x_axis.scale(angle.cos()).add(y_axis.scale(angle.sin()));
+                        into.push(radial);
+                        into.push(axis.cross(radial));
+                    }
+                }
+                for vertex in polytope {
+                    let d = vertex.sub(*origin);
+                    let radial = d.sub(axis.scale(d.dot(*axis)));
+                    if let Ok(unit) = radial.normalized() {
+                        into.push(unit);
+                    }
+                }
+            }
+            FaceExtent::Hull(_) => {}
+        }
+    }
+}
+
+impl FaceExtent {
+    /// The points a separating plane could pass through, for the other
+    /// set's candidate normals: a hull's vertices, a sector's circumscribing
+    /// polytope (its axis points, arc ends and one apex per quarter turn, at
+    /// both heights), nothing of a plane's.
+    fn vertices(&self) -> Vec<Vec3> {
+        match self {
+            FaceExtent::Plane { .. } => Vec::new(),
+            FaceExtent::Hull(points) => points.clone(),
+            FaceExtent::Sector { origin, axis, x_axis, y_axis, radius, z, theta } => {
+                let at = |angle: f64, rho: f64, z: f64| origin.add(x_axis.scale(rho * angle.cos())).add(y_axis.scale(rho * angle.sin())).add(axis.scale(z));
+                let (a, turn) = match theta { Some([a, b]) => (*a, b - a), None => (0.0, std::f64::consts::TAU) };
+                let pieces = (turn / std::f64::consts::FRAC_PI_2).ceil().max(1.0) as usize;
+                let mut vertices = Vec::with_capacity(2 * (pieces + 3));
+                for z in *z {
+                    vertices.push(origin.add(axis.scale(z)));
+                    for piece in 0..pieces {
+                        let (alpha, beta) = (a + turn * piece as f64 / pieces as f64, a + turn * (piece + 1) as f64 / pieces as f64);
+                        vertices.push(at(alpha, *radius, z));
+                        vertices.push(at(0.5 * (alpha + beta), radius / (0.5 * (beta - alpha)).cos(), z));
+                    }
+                    vertices.push(at(a + turn, *radius, z));
+                }
+                vertices
+            }
+        }
+    }
+
+    /// An upper bound on the radial distance from `(origin, axis)` over the
+    /// set: a hull's farthest vertex, a coaxial sector's radius, any other
+    /// sector's circumscribing polytope's farthest vertex; a plane's is not
+    /// finite.
+    fn radial_bound(&self, origin: Vec3, axis: Vec3) -> f64 {
+        let radial = |p: Vec3| { let d = p.sub(origin); d.sub(axis.scale(d.dot(axis))).length() };
+        match self {
+            FaceExtent::Plane { .. } => f64::INFINITY,
+            FaceExtent::Hull(points) => points.iter().fold(0f64, |m, p| m.max(radial(*p))),
+            FaceExtent::Sector { origin: own, axis: own_axis, radius, .. } => {
+                let coaxial = own_axis.cross(axis).length() <= 1e-12 && radial(*own) <= 1e-12 * (1.0 + radius);
+                if coaxial { *radius } else { self.vertices().iter().fold(0f64, |m, p| m.max(radial(*p))) }
+            }
+        }
+    }
+}
+
+impl FaceExtent {
+    /// Is `point` in the closed set, within `tol`? A plane's set is the plane;
+    /// a sector's by its cylindrical coordinates; a hull's by every plane
+    /// through three of its points (its facets among them): a point on the
+    /// inner side of all of them, both orientations taken where the hull's
+    /// points straddle none, lies in the hull.
+    fn contains(&self, point: Vec3, tol: f64) -> bool {
+        match self {
+            FaceExtent::Plane { normal, offset } => (point.dot(*normal) - offset).abs() <= tol,
+            FaceExtent::Sector { origin, axis, x_axis, y_axis, radius, z, theta } => {
+                let d = point.sub(*origin);
+                let h = d.dot(*axis);
+                let radial = d.sub(axis.scale(h));
+                if h < z[0] - tol || h > z[1] + tol || radial.length() > radius + tol {
+                    return false;
+                }
+                match theta {
+                    None => true,
+                    Some([a, b]) => {
+                        if radial.length() <= tol {
+                            return true;
+                        }
+                        let mut angle = radial.dot(*y_axis).atan2(radial.dot(*x_axis));
+                        while angle < *a { angle += std::f64::consts::TAU; }
+                        while angle > *a + std::f64::consts::TAU { angle -= std::f64::consts::TAU; }
+                        // Inside the angular range, or within tol of one of its end half-planes.
+                        if angle <= *b {
+                            return true;
+                        }
+                        [*a, *b].iter().any(|&end| {
+                            let n = axis.cross(x_axis.scale(end.cos()).add(y_axis.scale(end.sin())));
+                            radial.dot(n).abs() <= tol && radial.dot(x_axis.scale(end.cos()).add(y_axis.scale(end.sin()))) >= -tol
+                        })
+                    }
+                }
+            }
+            FaceExtent::Hull(points) => {
+                let count = points.len();
+                for i in 0..count {
+                    for j in (i + 1)..count {
+                        for k in (j + 1)..count {
+                            let Ok(n) = points[j].sub(points[i]).cross(points[k].sub(points[i])).normalized() else { continue };
+                            let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
+                            for q in points {
+                                let d = n.dot(*q);
+                                lo = lo.min(d);
+                                hi = hi.max(d);
+                            }
+                            let d = n.dot(point);
+                            if d < lo - tol || d > hi + tol {
+                                return false;
+                            }
+                        }
+                    }
+                }
+                true
+            }
+        }
+    }
+}
+
+/// Does the original face's `extent` stay out of the band's open region
+/// `int A`, past `tol`? Two exact readings, either one enough:
+///
+/// * a cylinder face lies ON its carrier at radius `R`, so a region whose
+///   radial bound about that axis is at most `R + tol` has the face on its
+///   boundary at most (the stadium's torus band hugs the semicylinder wall
+///   it is tangent to along a rail);
+/// * some plane separates the two closed convex sets, which a finite family
+///   of normals is asked about: each set's own candidates, and the normals
+///   of every plane through three of the other set's vertices (a hull's
+///   facets are among them). Touching within `tol` is clear: the mates
+///   touch every band along its rails.
+fn extent_clear_of_region(extent: &FaceExtent, region: &FaceExtent, tol: f64) -> bool {
+    if let FaceExtent::Sector { origin, axis, radius, .. } = extent {
+        if region.radial_bound(*origin, *axis) <= radius + tol {
+            return true;
+        }
+    }
+    let (region_vertices, extent_vertices) = (region.vertices(), extent.vertices());
+    let mut normals: Vec<Vec3> = Vec::new();
+    extent.candidate_normals(&region_vertices, &mut normals);
+    region.candidate_normals(&extent_vertices, &mut normals);
+    for polytope in [&region_vertices, &extent_vertices] {
+        let count = polytope.len();
+        for i in 0..count {
+            for j in (i + 1)..count {
+                for k in (j + 1)..count {
+                    let n = polytope[j].sub(polytope[i]).cross(polytope[k].sub(polytope[i]));
+                    if let Ok(unit) = n.normalized() {
+                        normals.push(unit);
+                    }
+                }
+            }
+        }
+    }
+    normals.iter().any(|&n| {
+        let [lo, hi] = extent.support(n);
+        let [a_lo, a_hi] = region.support(n);
+        hi <= a_lo + tol || a_hi <= lo + tol
+    })
+}
+
+/// Does `curve` lie in `region` (within `tol`)? Its control points do, for a
+/// positive-weight curve lies in their hull and the region is convex; except
+/// that a SECTOR's own circles are read by their span ends: rational
+/// quadratic spans of a circle about the sector's axis (each span's ends at
+/// one radius and height, its apex at that radius over its standard weight)
+/// lie on that circle between their ends, the short way round, so ends inside
+/// a convex sector put the span inside it. The apex controls of such a span
+/// stand outside the circle and would decline every rail of a torus band.
+fn edge_in_region(curve: &crate::NurbsCurve, region: &FaceExtent, tol: f64) -> bool {
+    let Ok(controls) = curve.control_points.iter().map(|c| if c.w > 0.0 { c.point() } else { Err("weight".to_string()) }).collect::<Result<Vec<Vec3>, String>>() else {
+        return false;
+    };
+    if let FaceExtent::Sector { origin, axis, .. } = region {
+        let cylindrical = |p: Vec3| { let d = p.sub(*origin); let h = d.dot(*axis); (d.sub(axis.scale(h)).length(), h) };
+        let circle_spans = curve.degree == 2 && controls.len() >= 3 && controls.len() % 2 == 1 && (0..(controls.len() - 1) / 2).all(|span| {
+            let (a, m, b) = (curve.control_points[2 * span], curve.control_points[2 * span + 1], curve.control_points[2 * span + 2]);
+            let w = m.w / (a.w * b.w).sqrt();
+            if !(w > 0.0 && w < 1.0) {
+                return false;
+            }
+            let ((ra, ha), (rb, hb), (rm, hm)) = (cylindrical(controls[2 * span]), cylindrical(controls[2 * span + 2]), cylindrical(controls[2 * span + 1]));
+            (ra - rb).abs() <= tol && (ha - hb).abs() <= tol && (hm - ha).abs() <= tol && (rm - ra / w).abs() <= tol * (1.0 + 1.0 / w)
+        });
+        if circle_spans {
+            return controls.iter().step_by(2).all(|point| region.contains(*point, tol));
+        }
+    }
+    controls.iter().all(|point| region.contains(*point, tol))
+}
+
+/// The band certificate (lane N row 1, 2026-10-28), one region per grown
+/// face: a full-turn revolution band's meridian box (`revolution_band`, as
+/// before) or the band's region (`band_region`), whose interior must miss
+/// every face of the original — each cleared EXACTLY against its extent
+/// (`face_extent`), never by a sample. `int A` is connected and misses the
+/// original's boundary, so every point of `A` off that boundary shares the
+/// class of one interior point, and one classification per band decides
+/// what its edge and face samples would. `Some(true)` clear; `None` when any
+/// band has no region, any original face is not cleared, or an interior
+/// point reads forbidden or `On` (the samples run, as before); never
+/// `Some(false)`.
+fn band_interference_certificate(
+    original: &BrepSolid,
+    result: &BrepSolid,
+    grown: &[&FaceRecord],
+    fresh_edges: &[u64],
+    forbidden: PointClass,
+    classifier: &SolidClassifier,
+    tol: f64,
+) -> Option<bool> {
+    if grown.is_empty() {
+        return None;
+    }
+    let extents: Vec<FaceExtent> = original.shells.iter().flat_map(|shell| &shell.faces).map(face_extent).collect::<Option<Vec<_>>>()?;
+    let mut banded: Vec<(u64, FaceExtent)> = Vec::with_capacity(grown.len());
+    for face in grown {
+        let (interior, region) = match revolution_band(&face.surface) {
+            Some((origin, axis, bounds, interior)) if revolution_box_clear(original, origin, axis, bounds, tol) => {
+                // The meridian box as a full-turn sector, for the edges' containment below.
+                let radial = face.surface.control_points[0][0].point().ok()?.sub(origin);
+                let x_axis = radial.sub(axis.scale(radial.dot(axis))).normalized().ok()?;
+                (interior, FaceExtent::Sector { origin, axis, x_axis, y_axis: axis.cross(x_axis), radius: bounds[1], z: [bounds[2], bounds[3]], theta: None })
+            }
+            _ => {
+                let Some((region, interior)) = band_region(face, result) else {
+                    if std::env::var_os("BREP_DEBUG_NETWORK").is_some() {
+                        eprintln!("interference band certificate: grown face {} has no region ({})", face.id, face.surface.analytic().map_or("no analytic carrier", |a| a.kind_label()));
+                    }
+                    return None;
+                };
+                if let Some(extent) = extents.iter().find(|extent| !extent_clear_of_region(extent, &region, tol)) {
+                    crate::blend::record_count("count.interference.band_not_cleared", 1);
+                    if std::env::var_os("BREP_DEBUG_NETWORK").is_some() {
+                        let kind = |e: &FaceExtent| match e { FaceExtent::Plane { .. } => "plane", FaceExtent::Sector { .. } => "sector", FaceExtent::Hull(_) => "hull" };
+                        eprintln!("interference band certificate: grown face {} ({} region) not cleared of an original {} face", face.id, kind(&region), kind(extent));
+                    }
+                    return None;
+                }
+                (interior, region)
+            }
+        };
+        let class = classifier.classify(interior).ok()?.class;
+        if class == forbidden || class == PointClass::On {
+            return None;
+        }
+        banded.push((face.id, region));
+    }
+    // Every fresh edge bounds a band AND lies in that band's region: its
+    // control points in the convex region (positive weights put the curve in
+    // their hull), so its samples are points the region's one classification
+    // decides. An edge that does not lie in it (an inconsistent body) declines.
+    let on_band = |edge_id: u64| {
+        let Some(edge) = result.edges.iter().find(|edge| edge.id == edge_id) else { return false };
+        result.shells.iter().flat_map(|shell| &shell.faces).filter_map(|face| banded.iter().find(|(id, _)| *id == face.id).map(|(_, region)| (face, region))).any(|(face, region)| {
+            face.loops.iter().flat_map(|l| &l.coedges).any(|coedge| coedge.edge_id == edge_id)
+                && edge_in_region(&edge.curve, region, tol.max(1e-9))
         })
     };
     fresh_edges.iter().all(|&edge_id| on_band(edge_id)).then_some(true)
@@ -1643,6 +2736,25 @@ fn check_blend_interference_uncached(
             return Ok(());
         }
         crate::blend::record_count("count.interference.revolution_declined", 1);
+    }
+    // Lane N row 1: bands that are arc extrusions, partial revolutions or
+    // corner patches, each in a convex region every original face is cleared
+    // of exactly (`band_interference_certificate`); anything else samples.
+    if interference_band_cert_on() {
+        let cert_timing = crate::blend::BlendTimer::start("timing.interference.band_cert_ms");
+        let band = policy.pcurve_consistency.min(policy.intersection_fit) / 10.0;
+        let fresh_ids: Vec<u64> = fresh.iter().map(|edge| edge.id).collect();
+        let certified = SolidClassifier::new(original, policy.pcurve_consistency / 10.0)
+            .ok()
+            .and_then(|classifier| band_interference_certificate(original, result, &grown, &fresh_ids, forbidden, &classifier, band));
+        cert_timing.stop();
+        if certified == Some(true) {
+            crate::blend::record_count("count.interference.band_certified", 1);
+            edges_timing.stop();
+            crate::classification::classify_profile_report("blend.interference.edges");
+            return Ok(());
+        }
+        crate::blend::record_count("count.interference.band_declined", 1);
     }
     // Each sample's side is read off its nearest face where that read is
     // rigorous (`NearestFaceSide`), and cast as a ray otherwise: the same
@@ -1896,8 +3008,7 @@ pub(crate) fn face_grid_classes(
 /// `BREP_NEAREST_FACE_ANALYTIC_ONLY=1`: the road until 2026-10-17, on which
 /// a general (NURBS) face within reach of the point hands it back to the ray.
 fn nearest_face_analytic_only() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var("BREP_NEAREST_FACE_ANALYTIC_ONLY").as_deref() == Ok("1"))
+    switch!("BREP_NEAREST_FACE_ANALYTIC_ONLY", false)
 }
 
 /// The side of a solid's boundary a point is on, read from the point's
@@ -1938,8 +3049,7 @@ fn nearest_face_analytic_only() -> bool {
 /// 98 + 144 census 0 differ); `BREP_NEAREST_SIDE_EDGE_PIECE=0` (or `off`)
 /// restores the uncut read.
 pub(crate) fn nearest_side_edge_piece_on() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| !matches!(std::env::var("BREP_NEAREST_SIDE_EDGE_PIECE").as_deref(), Ok("0") | Ok("off")))
+    switch!("BREP_NEAREST_SIDE_EDGE_PIECE", true)
 }
 
 
@@ -2441,6 +3551,8 @@ pub(super) fn check_blend_wall_loops(result: &BrepSolid, entry: &str) -> Result<
     }
     Ok(())
 }
+
+
 
 
 

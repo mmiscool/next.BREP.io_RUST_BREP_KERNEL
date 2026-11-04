@@ -4,8 +4,8 @@ use crate::{
     Vec4, KNOT_IDENTITY_TOL,
 };
 
-const EPSILON: f64 = 1e-12;
-const LINEAR_TOLERANCE: f64 = 1e-7;
+const EPSILON: f64 = crate::tolerance::FP_FLOOR;
+const LINEAR_TOLERANCE: f64 = crate::tolerance::DEFAULT_MODEL;
 
 /// Coarse clocks only: no per-station timing overhead in a measured fit.
 struct PcurvePhaseClock {
@@ -16,13 +16,13 @@ struct PcurvePhaseClock {
 }
 impl PcurvePhaseClock {
     fn new(phase: &'static str, samples: usize, tracking: bool) -> Self {
-        Self { started: std::env::var_os("BREP_PROFILE").is_some().then(web_time::Instant::now), phase, samples, tracking }
+        Self { started: crate::profile::profile_enabled().then(web_time::Instant::now), phase, samples, tracking }
     }
 }
 impl Drop for PcurvePhaseClock {
     fn drop(&mut self) {
         if let Some(started) = self.started {
-            eprintln!("pcurve.phase_time phase={} initial_samples={} tracking={} ms={:.3}", self.phase, self.samples, self.tracking, started.elapsed().as_secs_f64()*1000.0);
+            crate::imprint::profile_emit(format_args!("pcurve.phase_time phase={} initial_samples={} tracking={} ms={:.3}", self.phase, self.samples, self.tracking, started.elapsed().as_secs_f64()*1000.0));
         }
     }
 }
@@ -100,13 +100,13 @@ fn section_extended_point(surface: &NurbsSurface, u: f64, v: f64, enabled: bool)
     surface.evaluate_extended(u,v)
 }
 
-/// One immutable sphere/section pair; nested fits own separate maps. Keys
+/// One immutable carrier/section pair; nested fits own separate maps. Keys
 /// preserve all parameter bits, and failed evaluations are never retained.
 struct PcurveSampleCache {
     surface: usize,
     curve: usize,
     curves: rustc_hash::FxHashMap<u64, Vec3>,
-    surfaces: rustc_hash::FxHashMap<(u64, u64, bool), Vec3>,
+    surfaces: rustc_hash::FxHashMap<(u64, u64, bool, bool), Vec3>,
     inversions: rustc_hash::FxHashMap<[u64; 3], ([f64; 2], f64)>,
     requests: [usize; 4],
     hits: [usize; 4],
@@ -115,23 +115,23 @@ struct PcurveSampleCache {
 thread_local! {
     static PCURVE_SAMPLES: std::cell::RefCell<Vec<Option<PcurveSampleCache>>> = const { std::cell::RefCell::new(Vec::new()) };
 }
-struct PcurveSampleScope;
-impl PcurveSampleScope {
-    fn open(surface: &NurbsSurface, curve: &NurbsCurve, enabled: bool) -> Self {
-        let cache = (enabled && matches!(surface.analytic(), Some(AnalyticSurface::Sphere { .. })))
+struct PcurveSampleScope<'a>(std::marker::PhantomData<(&'a NurbsSurface, &'a NurbsCurve)>);
+impl<'a> PcurveSampleScope<'a> {
+    fn open(surface: &'a NurbsSurface, curve: &'a NurbsCurve, enabled: bool) -> Self {
+        let cache = enabled
             .then(|| PcurveSampleCache { surface: surface as *const _ as usize,
                 curve: curve as *const _ as usize, curves: Default::default(),
                 surfaces: Default::default(), inversions: Default::default(), requests: [0; 4], hits: [0; 4], speeds: Default::default() });
         PCURVE_SAMPLES.with(|stack| stack.borrow_mut().push(cache));
-        Self
+        Self(std::marker::PhantomData)
     }
 }
-impl Drop for PcurveSampleScope {
+impl Drop for PcurveSampleScope<'_> {
     fn drop(&mut self) {
         PCURVE_SAMPLES.with(|stack| {
             if let Some(Some(cache)) = stack.borrow_mut().pop() {
-                if std::env::var_os("BREP_PROFILE").is_some() {
-                    eprintln!("pcurve.samples requests={:?} hits={:?} retained={:?}", cache.requests,
+                if crate::profile::profile_enabled() {
+                    profile_line!("pcurve.samples requests={:?} hits={:?} retained={:?}", cache.requests,
                         cache.hits, [cache.curves.len(), cache.surfaces.len(), cache.inversions.len(), cache.speeds.len()]);
                 }
             }
@@ -181,7 +181,10 @@ fn section_curve_point(curve: &NurbsCurve, parameter: f64) -> Result<Vec3, Strin
     Ok(point)
 }
 fn section_surface_point(surface: &NurbsSurface, u: f64, v: f64, extended: bool) -> Result<Vec3, String> {
-    let key = (u.to_bits(), v.to_bits(), extended);
+    // Extended evaluation has two arithmetic paths. Keep them separate even
+    // if a nested caller changes the stack-point policy within this scope.
+    let stack_point = PCURVE_STACK_POINT.with(|state| state.get());
+    let key = (u.to_bits(), v.to_bits(), extended, stack_point);
     let (active, hit) = PCURVE_SAMPLES.with(|stack| {
         let mut stack = stack.borrow_mut();
         let Some(Some(cache)) = stack.last_mut() else { return (false, None) };
@@ -192,7 +195,7 @@ fn section_surface_point(surface: &NurbsSurface, u: f64, v: f64, extended: bool)
         (true, hit)
     });
     if let Some(hit) = hit { return Ok(hit) }
-    let point = if extended { section_extended_point(surface, u, v, PCURVE_STACK_POINT.with(|state| state.get()))? } else { surface.evaluate(u, v)? };
+    let point = if extended { section_extended_point(surface, u, v, stack_point)? } else { surface.evaluate(u, v)? };
     if active { PCURVE_SAMPLES.with(|stack| {
         let mut stack = stack.borrow_mut();
         let cache = stack.last_mut().unwrap().as_mut().unwrap();
@@ -222,6 +225,7 @@ fn invert_checked(surface: &NurbsSurface, point: Vec3) -> Result<([f64; 2], f64)
 }
 
 fn invert_checked_uncached(surface: &NurbsSurface, point: Vec3) -> Result<([f64; 2], f64), String> {
+    let _lap = crate::projection_profile::Lap::enter(crate::projection_profile::LANE_INVERT_CHECKED, surface);
     if surface.is_affine()? {
         let ([u0, _], [v0, _]) = surface_domains(surface)?;
         let (origin, du, dv) = surface.deriv1(u0, v0)?;
@@ -253,29 +257,25 @@ fn invert_checked_uncached(surface: &NurbsSurface, point: Vec3) -> Result<([f64;
 /// arbitrary u there as before 2026-09-27. `BREP_PCURVE_CONE_APEX_U=0`
 /// restores the projector's u, for a same-binary A/B.
 fn cone_apex_u() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("BREP_PCURVE_CONE_APEX_U").is_none_or(|value| value != "0"))
+    switch!("BREP_PCURVE_CONE_APEX_U", true)
 }
 
 /// Whether a round with more candidates than the cap has room for keeps its
 /// WORST probes (`true`), or the first in span order as before 2026-09-27.
 /// `BREP_PCURVE_WORST_FIRST=0` restores span order, for a same-binary A/B.
 fn worst_first() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("BREP_PCURVE_WORST_FIRST").is_none_or(|value| value != "0"))
+    switch!("BREP_PCURVE_WORST_FIRST", true)
 }
 
 /// `BREP_PCURVE_C0_JOIN=0` builds one C2 interpolant through the stations as
 /// before 2026-10-03 (the C0 joins at the curve's corners off), for a
 /// same-binary A/B. Read once per process.
 fn c0_joins() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("BREP_PCURVE_C0_JOIN").is_none_or(|value| value != "0"))
+    switch!("BREP_PCURVE_C0_JOIN", true)
 }
 
 fn seeded_inserts() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("BREP_PCURVE_SEEDED_INSERTS").is_none_or(|value| value != "0"))
+    switch!("BREP_PCURVE_SEEDED_INSERTS", true)
 }
 
 /// [`invert_checked`] for a station inserted between two whose feet are known:
@@ -293,7 +293,7 @@ fn invert_near(
     seed: [f64; 2],
     neighbour_gap: f64,
 ) -> Result<([f64; 2], f64), String> {
-    if !seeded_inserts() || surface.is_affine()? || surface.analytic().is_some() {
+    if !seeded_inserts() || surface.is_affine()? || surface.analytic().is_some() || surface.affine_sphere().is_some() {
         return invert_checked(surface, point);
     }
     let seeded = project_point_to_surface_seeded(surface, point, seed[0], seed[1])?;
@@ -961,10 +961,52 @@ thread_local! {
 /// challenger's final read and the importer's keep read, each of which
 /// projected them again (`importTestWorking`, 2026-10-05: about 10k probes
 /// read 3-5 times on each of nine off-carrier refits, 3-5 s apiece).
+///
+/// Feet computed while [`defer_foot_inserts`] is on are appended to the
+/// `pending_*` lists instead of hashed, and folded into the maps at the first
+/// lookup that misses while it is off. A tracking pair that reads clean is
+/// never read again, so its 20-30k feet per read are never hashed (16% of
+/// the reader on the elephant, 2026-11-03); a candidate read or
+/// fit that follows sees every one of them. Deferral changes no answer: a
+/// lookup that misses recomputes the same pure function.
 struct FootMemo {
     surface: *const NurbsSurface,
     global: rustc_hash::FxHashMap<[u64; 3], Option<crate::SurfaceProjection>>,
     seeded: rustc_hash::FxHashMap<[u64; 5], Option<crate::SurfaceProjection>>,
+    pending_global: Vec<([u64; 3], Option<crate::SurfaceProjection>)>,
+    pending_seeded: Vec<([u64; 5], Option<crate::SurfaceProjection>)>,
+}
+
+impl FootMemo {
+    fn new(surface: *const NurbsSurface) -> Self {
+        Self { surface, global: Default::default(), seeded: Default::default(), pending_global: Vec::new(), pending_seeded: Vec::new() }
+    }
+
+    /// Fold the deferred feet into the maps (a later insert of the same key
+    /// would carry the same value, so the order of folding is immaterial).
+    fn fold_pending(&mut self) {
+        if !self.pending_global.is_empty() {
+            self.global.reserve(self.pending_global.len());
+            self.global.extend(self.pending_global.drain(..));
+        }
+        if !self.pending_seeded.is_empty() {
+            self.seeded.reserve(self.pending_seeded.len());
+            self.seeded.extend(self.pending_seeded.drain(..));
+        }
+    }
+}
+
+thread_local! {
+    static DEFER_FOOT_INSERTS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run `read` with new feet appended to the open memo's pending lists rather
+/// than hashed ([`FootMemo`]); restores the previous setting.
+pub(crate) fn defer_foot_inserts<T>(read: impl FnOnce() -> T) -> T {
+    let previous = DEFER_FOOT_INSERTS.with(|cell| cell.replace(true));
+    let result = read();
+    DEFER_FOOT_INSERTS.with(|cell| cell.set(previous));
+    result
 }
 
 /// Opens a [`FootMemo`] for `surface` on this thread until dropped. Opening
@@ -988,7 +1030,7 @@ impl<'a> FootMemoScope<'a> {
             if memo.as_ref().is_some_and(|open| std::ptr::eq(open.surface, key)) {
                 None
             } else {
-                Some(memo.replace(FootMemo { surface: key, global: Default::default(), seeded: Default::default() }))
+                Some(memo.replace(FootMemo::new(key)))
             }
         });
         Self { previous, _surface: std::marker::PhantomData, _thread_bound: std::marker::PhantomData }
@@ -1018,8 +1060,18 @@ fn memo_global_foot(surface: &NurbsSurface, point: Vec3) -> Option<crate::Surfac
         return project_point_to_surface(surface, point).ok();
     }
     let key = point_bits(point);
+    let deferring = DEFER_FOOT_INSERTS.with(|cell| cell.get());
     let hit = FOOT_MEMO.with(|memo| {
-        memo.borrow().as_ref().filter(|open| std::ptr::eq(open.surface, surface)).map(|open| open.global.get(&key).copied())
+        memo.borrow_mut().as_mut().filter(|open| std::ptr::eq(open.surface, surface)).map(|open| {
+            match open.global.get(&key).copied() {
+                Some(foot) => Some(foot),
+                None if !deferring && !open.pending_global.is_empty() => {
+                    open.fold_pending();
+                    open.global.get(&key).copied()
+                }
+                None => None,
+            }
+        })
     });
     match hit {
         Some(Some(foot)) => foot,
@@ -1027,7 +1079,11 @@ fn memo_global_foot(surface: &NurbsSurface, point: Vec3) -> Option<crate::Surfac
             let foot = project_point_to_surface(surface, point).ok();
             FOOT_MEMO.with(|memo| {
                 if let Some(open) = memo.borrow_mut().as_mut().filter(|open| std::ptr::eq(open.surface, surface)) {
-                    open.global.insert(key, foot);
+                    if deferring {
+                        open.pending_global.push((key, foot));
+                    } else {
+                        open.global.insert(key, foot);
+                    }
                 }
             });
             foot
@@ -1041,8 +1097,18 @@ fn memo_global_foot(surface: &NurbsSurface, point: Vec3) -> Option<crate::Surfac
 fn memo_seeded_foot(surface: &NurbsSurface, point: Vec3, seed_u: f64, seed_v: f64) -> Option<crate::SurfaceProjection> {
     let [x, y, z] = point_bits(point);
     let key = [x, y, z, seed_u.to_bits(), seed_v.to_bits()];
+    let deferring = DEFER_FOOT_INSERTS.with(|cell| cell.get());
     let hit = FOOT_MEMO.with(|memo| {
-        memo.borrow().as_ref().filter(|open| std::ptr::eq(open.surface, surface)).map(|open| open.seeded.get(&key).copied())
+        memo.borrow_mut().as_mut().filter(|open| std::ptr::eq(open.surface, surface)).map(|open| {
+            match open.seeded.get(&key).copied() {
+                Some(foot) => Some(foot),
+                None if !deferring && !open.pending_seeded.is_empty() => {
+                    open.fold_pending();
+                    open.seeded.get(&key).copied()
+                }
+                None => None,
+            }
+        })
     });
     match hit {
         Some(Some(foot)) => foot,
@@ -1050,7 +1116,11 @@ fn memo_seeded_foot(surface: &NurbsSurface, point: Vec3, seed_u: f64, seed_v: f6
             let foot = project_point_to_surface_seeded(surface, point, seed_u, seed_v).ok();
             FOOT_MEMO.with(|memo| {
                 if let Some(open) = memo.borrow_mut().as_mut().filter(|open| std::ptr::eq(open.surface, surface)) {
-                    open.seeded.insert(key, foot);
+                    if deferring {
+                        open.pending_seeded.push((key, foot));
+                    } else {
+                        open.seeded.insert(key, foot);
+                    }
                 }
             });
             foot
@@ -1116,7 +1186,7 @@ pub(crate) fn record_fit(report: &PcurveFitReport) {
     // Per-fit trace for the convergence probes (`trim_floor_sweep_probe` and
     // its offset-shell sibling): one line per fit with the whole report, the
     // way `BREP_DEBUG_PCURVE` traces an endpoint failure.
-    if std::env::var_os("BREP_DEBUG_PCURVE_FIT").is_some() {
+    if env_read!("BREP_DEBUG_PCURVE_FIT").is_some() {
         eprintln!("PCURVE-FIT {report:?}");
     }
     PCURVE_FIT_SCOPES.with(|scopes| {
@@ -1344,7 +1414,7 @@ fn judge_tracking_candidate_with_bounds(
     // returned span. They are a subset of the nineteen-point stencil, so its
     // maximum cannot fall below this already over-floor lower bound.
     if bounds && exit != PcurveFitExit::Converged && own > floor {
-        if std::env::var_os("BREP_PROFILE").is_some() { eprintln!("pcurve.reject_bound kind=quarter_residual"); }
+        if crate::profile::profile_enabled() { profile_line!("pcurve.reject_bound kind=quarter_residual"); }
         return (Ok(Some(own)), false);
     }
     let reading = if exit == PcurveFitExit::Converged && !standing_dense {
@@ -1423,7 +1493,7 @@ fn refine_pcurve(
 ) -> Result<Refinement, String> {
     // Trace only (`BREP_DEBUG_PCURVE_FIT`): reads values the passes already
     // computed and decides nothing.
-    let trace = std::env::var_os("BREP_DEBUG_PCURVE_FIT").is_some();
+    let trace = env_read!("BREP_DEBUG_PCURVE_FIT").is_some();
     let call = if trace {
         PCURVE_TRACK_CALL.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
     } else {
@@ -1608,8 +1678,7 @@ fn tracking_rungs<S>(
 /// off-carrier first pass: true unless `BREP_PCURVE_STANDOFF_TRACKING=0`
 /// (diagnostic A/B hatch, read once per process).
 fn standoff_tracking_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("BREP_PCURVE_STANDOFF_TRACKING").is_none_or(|value| value != "0"))
+    switch!("BREP_PCURVE_STANDOFF_TRACKING", true)
 }
 
 /// The tracking rungs for an edge curve that stands OFF its carrier by more
@@ -1854,7 +1923,7 @@ fn refine_pcurve_pass(
             // never adopts any budget exit; rebuilding and probing this
             // discarded candidate cannot affect its curve or report.
             if reject_budget && round == 3 && !truncated {
-                if std::env::var_os("BREP_PROFILE").is_some() { eprintln!("pcurve.reject_bound kind=fifth_round"); }
+                if crate::profile::profile_enabled() { profile_line!("pcurve.reject_bound kind=fifth_round"); }
                 return Err("pcurve tracking candidate requires a fifth round".into());
             }
             for (at, fraction, surface_parameter) in inserts.into_iter().rev() {
@@ -2000,6 +2069,109 @@ impl AffineInversion {
     }
 }
 
+fn sphere_iso_enabled() -> bool {
+    env_read!("BREP_PCURVE_SPHERE_ISO").is_none_or(|mode| mode != "0")
+}
+
+/// A complete native meridian with the same rational basis as the section.
+/// Equal positive weights and affinely identical knots make its image minus
+/// the section a convex combination of control-point differences. Thus their
+/// maximum norm bounds the whole curve, including the pole endpoints. This
+/// avoids fitting an arbitrary longitude at a pole into a meridian's interior.
+/// Every failed recognition retains the ordinary fitter and its diagnostics.
+fn sphere_iso_fit(surface: &NurbsSurface, curve: &NurbsCurve) -> Option<PcurveFit> {
+    // Native sphere recognition requires quadratic u. Avoid warming other
+    // carriers, and validate before recognition indexes a deserialized net.
+    if surface.degree_u != 2 { return None; }
+    let [t0, t1] = curve.domain().ok()?;
+    let [u0, u1] = surface.domain_u().ok()?;
+    let [v0, v1] = surface.domain_v().ok()?;
+    if !matches!(surface.analytic(), Some(AnalyticSurface::Sphere { .. })) { return None; }
+    let middle = curve.evaluate(t0 + (t1 - t0) * 0.5).ok()?;
+    let projected = project_point_to_surface(surface, middle).ok()?;
+    let mut candidates = vec![projected.u];
+    // Cardinal meridians can invert an ulp beside their native knot. A snap
+    // is only a candidate: the complete control-net bound below must hold.
+    for &knot in &surface.knots_u {
+        if (knot - projected.u).abs() <= 1e-12 && !candidates.contains(&knot) { candidates.push(knot); }
+    }
+    for u in candidates {
+        if !(u >= u0 && u <= u1) { continue; }
+        let iso = surface.iso_curve_u(u).ok()?;
+        if iso.degree != curve.degree || iso.knots.len() != curve.knots.len()
+            || iso.control_points.len() != curve.control_points.len() { continue; }
+        for reverse in [false, true] {
+            let n = iso.control_points.len();
+            // Rounded quotient equality alone does not prove equal bases.
+            // TwoDiff proves the subtractions exact; FMA then proves that
+            // each normalized knot times its span equals the exact offset.
+            // Conservative magnitude bounds keep all product residuals well
+            // above underflow. Unusual domains simply use the ordinary fit.
+            fn exact_difference(a: f64, b: f64) -> Option<f64> {
+                if !(a.is_finite() && b.is_finite()) || a.abs().max(b.abs()) > 1e100 { return None; }
+                let x = a - b;
+                let bv = a - x;
+                let av = x + bv;
+                let error = (a - av) + (bv - b);
+                (error == 0.).then_some(x)
+            }
+            fn exact_fraction(offset: f64, span: f64) -> Option<f64> {
+                if !(1e-100..=1e100).contains(&span) { return None; }
+                let ratio = offset / span;
+                if !(0.0..=1.0).contains(&ratio) || (ratio != 0. && ratio < 1e-100) { return None; }
+                (ratio.mul_add(span, -offset) == 0.).then_some(ratio)
+            }
+            let knots_match = (|| {
+                let section_span = exact_difference(t1, t0)?;
+                let native_span = exact_difference(v1, v0)?;
+                for (i, &knot) in curve.knots.iter().enumerate() {
+                    let section = exact_difference(knot, t0)?;
+                    let native = if reverse { exact_difference(v1, iso.knots[iso.knots.len() - 1 - i])? }
+                        else { exact_difference(iso.knots[i], v0)? };
+                    if exact_fraction(section, section_span)? != exact_fraction(native, native_span)? { return None; }
+                }
+                Some(())
+            })().is_some();
+            if !knots_match { continue; }
+            let mut bound = 0.0_f64;
+            let mut matches = true;
+            for (i, control) in curve.control_points.iter().enumerate() {
+                let native = &iso.control_points[if reverse { n - 1 - i } else { i }];
+                if !(control.w > 0.) || control.w != native.w { matches = false; break; }
+                let distance = control.point().ok()?.sub(native.point().ok()?).length();
+                if !distance.is_finite() { matches = false; break; }
+                bound = bound.max(distance);
+            }
+            if !matches || bound > PCURVE_REFINEMENT_TOLERANCE * 0.0625 { continue; }
+            let (start, end) = if reverse { (v1, v0) } else { (v0, v1) };
+            let pcurve = NurbsCurve::new(1, vec![0., 0., 1., 1.], vec![
+                Vec4::from_point(Vec3::new(u, start, 0.), 1.),
+                Vec4::from_point(Vec3::new(u, end, 0.), 1.),
+            ]).ok()?;
+            // Confirm the actual floating-point evaluation too, on the
+            // ordinary first pass's 24 intervals and quarter stations. The
+            // control-net proof covers between probes; these reads guard
+            // roundoff from differing surface/curve evaluation orders.
+            for i in 0..=96 {
+                let fraction = i as f64 / 96.;
+                let uv = pcurve.evaluate(fraction).ok()?;
+                let image = surface.evaluate(uv.x, uv.y).ok()?;
+                let on_curve = curve.evaluate(t0 + (t1 - t0) * fraction).ok()?;
+                let error = image.sub(on_curve).length();
+                if !error.is_finite() { matches = false; break; }
+                bound = bound.max(error);
+            }
+            if !matches || bound > PCURVE_REFINEMENT_TOLERANCE * 0.0625 { continue; }
+            return Some(PcurveFit { curve: pcurve, report: PcurveFitReport {
+                residual: bound, floor: PCURVE_REFINEMENT_TOLERANCE, samples: 2,
+                exit: PcurveFitExit::Converged, off_surface: bound, raised: false,
+                clamped_excursion: 0., clamped_distance: 0.,
+            } });
+        }
+    }
+    None
+}
+
 /// Build a parameter-space curve for a 3D curve lying on a surface, and say
 /// what the fit achieved.
 ///
@@ -2013,9 +2185,12 @@ pub fn fit_pcurve_on_surface(
     surface: &NurbsSurface,
     curve: &NurbsCurve,
 ) -> Result<PcurveFit, String> {
-    let mode = std::env::var("BREP_PCURVE_EVAL_CACHE").unwrap_or_default();
-    let bounds = std::env::var("BREP_PCURVE_REJECT_BOUNDS").unwrap_or_else(|_| "on".into());
-    let stack = std::env::var("BREP_PCURVE_STACK_POINT").unwrap_or_else(|_| "on".into());
+    if sphere_iso_enabled() {
+        if let Some(fit) = sphere_iso_fit(surface, curve) { return Ok(fit); }
+    }
+    let mode = env_read!("BREP_PCURVE_EVAL_CACHE").unwrap_or_default();
+    let bounds = env_read!("BREP_PCURVE_REJECT_BOUNDS").unwrap_or_else(|| "on".into());
+    let stack = env_read!("BREP_PCURVE_STACK_POINT").unwrap_or_else(|| "on".into());
     if mode == "check" || bounds == "check" || stack == "check" {
         let old = fit_pcurve_on_surface_cached(surface, curve, false, false, false)?;
         if matches!(surface.analytic(), Some(AnalyticSurface::Sphere { .. })) {
@@ -2044,7 +2219,11 @@ pub fn fit_pcurve_on_surface(
 
 fn fit_pcurve_on_surface_cached(surface: &NurbsSurface, curve: &NurbsCurve, enabled: bool, bounds: bool, stack: bool) -> Result<PcurveFit, String> {
     let _stack = PcurveStackPointScope::open(stack && matches!(surface.analytic(), Some(AnalyticSurface::Sphere { .. })));
-    let _samples = PcurveSampleScope::open(surface, curve, enabled);
+    // Non-sphere refinement repeats expensive global inversions and surface
+    // probes. Retain successful exact inputs for this immutable fit only.
+    // The older sphere-global experiment keeps its existing opt-in policy.
+    let _samples = PcurveSampleScope::open(surface, curve, enabled
+        || !matches!(surface.analytic(), Some(AnalyticSurface::Sphere { .. })));
     let _bounds = PcurveRejectScope::open(bounds && matches!(surface.analytic(), Some(AnalyticSurface::Sphere { .. })));
     let [t0, t1] = curve.domain()?;
     if surface.is_affine()? {
@@ -2180,17 +2359,17 @@ struct SectionFitClock {
 }
 impl SectionFitClock {
     fn new() -> Self {
-        Self { started: std::env::var_os("BREP_PROFILE").is_some().then(web_time::Instant::now),
+        Self { started: crate::profile::profile_enabled().then(web_time::Instant::now),
             global: std::time::Duration::ZERO, seeded: false }
     }
 }
 impl Drop for SectionFitClock {
     fn drop(&mut self) {
         if let Some(started) = self.started {
-            eprintln!("pcurve.section_time global={:.3} seeded={:.3} result={}",
+            crate::imprint::profile_emit(format_args!("pcurve.section_time global={:.3} seeded={:.3} result={}",
                 self.global.as_secs_f64() * 1000.0,
                 started.elapsed().saturating_sub(self.global).as_secs_f64() * 1000.0,
-                if self.seeded { "seeded" } else { "global" });
+                if self.seeded { "seeded" } else { "global" }));
         }
     }
 }
@@ -2230,6 +2409,9 @@ pub fn fit_pcurve_on_surface_marched(
     curve: &NurbsCurve,
 ) -> Result<PcurveFit, String> {
     fn run(surface: &NurbsSurface, curve: &NurbsCurve, eager: bool) -> Result<PcurveFit, String> {
+        // The global fallback owns a nested scope; it cannot populate or
+        // invalidate the marched fit's immutable carrier/curve entries.
+        let _samples = PcurveSampleScope::open(surface, curve, true);
         let mut clock = SectionFitClock::new();
         // The global builder owns only scoped sample caches. Its fit/report is
         // discarded on a successful seeded route; do that work on fallback only.
@@ -2245,7 +2427,7 @@ pub fn fit_pcurve_on_surface_marched(
         // curve domain. Preserve that error priority before the affine probe
         // when the unused global fit is deferred (both inputs may be invalid).
         if !eager { curve.domain()?; }
-        if std::env::var("BREP_SECTION_PCURVE_MARCH").as_deref() == Ok("0") || surface.is_affine()? {
+        if env_read!("BREP_SECTION_PCURVE_MARCH").as_deref() == Some("0") || surface.is_affine()? {
             return global.map_or_else(&mut fallback, Ok);
         }
         let [t0, t1] = curve.domain()?;
@@ -2474,8 +2656,7 @@ pub fn build_pcurve_on_surface_range(
 /// `BREP_DEBUG_STATION_FIT`: trace every station fit round by round, and the
 /// stations around the worst span of a fit off its bar. Read once per process.
 fn station_fit_tracing() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("BREP_DEBUG_STATION_FIT").is_some())
+    debug_flag!("BREP_DEBUG_STATION_FIT")
 }
 
 /// Narrowest span, as a fraction of the parameter range, that
@@ -3176,30 +3357,45 @@ pub(crate) fn common_station_read_with_excess(
     // the shared foot's distance, per probe) starts at -inf, so a read with no
     // probe is not finite and admits nothing.
     let mut read = ([0.0_f64, 0.0, f64::NEG_INFINITY], [0.0_f64, 0.0, f64::NEG_INFINITY]);
+    // Reading ONE curve against itself (`legacy` and `candidate` the same
+    // object, as a tracking read and a trigger's read are): the candidate's
+    // parameter, image and seeded projection are the reference's on identical
+    // inputs, so each is computed once (same results, same tie order).
+    let same = std::ptr::eq(legacy, candidate);
+    // On an affine-sphere carrier with no analytic kind, the global projector
+    // and the seeded one both return the ellipsoid's closed form whenever it
+    // answers (`projection::project_point_to_surface` and
+    // `project_point_to_surface_seeded`), whatever the seed: one closed form
+    // stands for all three feet (2026-11-03: two thirds of the
+    // elephant's tracking projections).
+    let ellipsoid = if same && surface.analytic().is_none() { surface.affine_sphere() } else { None };
     for &fraction in probes {
         let point = evaluate_edge(fraction)?;
-        let (old_uv, new_uv) = (legacy.evaluate(fraction)?, candidate.evaluate(fraction)?);
-        let (old_image, new_image) = (surface.evaluate_extended(old_uv.x, old_uv.y)?, surface.evaluate_extended(new_uv.x, new_uv.y)?);
+        let old_uv = legacy.evaluate(fraction)?;
+        let new_uv = if same { old_uv } else { candidate.evaluate(fraction)? };
+        let old_image = surface.evaluate_extended(old_uv.x, old_uv.y)?;
+        let new_image = if same { old_image } else { surface.evaluate_extended(new_uv.x, new_uv.y)? };
         if !(finite(point) && finite(old_image) && finite(new_image)) {
             return Err(format!("common station read: non-finite point at fraction {fraction}"));
         }
-        // Reading ONE curve against itself (`legacy` and `candidate` the same
-        // object, as a trigger's read is): the candidate-seeded projection is
-        // the reference-seeded one on identical inputs, so it is computed once
-        // (same result, same tie order).
-        let reference_foot = memo_seeded_foot(surface, point, old_uv.x, old_uv.y);
-        let candidate_foot = if std::ptr::eq(legacy, candidate) {
-            reference_foot
+        let closed_form = ellipsoid.and_then(|ellipsoid| ellipsoid.project(surface, point));
+        let foot = if let Some(foot) = closed_form {
+            common_foot(Some(foot), Some(foot), Some(foot), domain_u, domain_v)
         } else {
-            memo_seeded_foot(surface, point, new_uv.x, new_uv.y)
-        };
-        let foot = common_foot(
-            memo_global_foot(surface, point),
-            reference_foot,
-            candidate_foot,
-            domain_u,
-            domain_v,
-        )
+            let reference_foot = memo_seeded_foot(surface, point, old_uv.x, old_uv.y);
+            let candidate_foot = if same {
+                reference_foot
+            } else {
+                memo_seeded_foot(surface, point, new_uv.x, new_uv.y)
+            };
+            common_foot(
+                memo_global_foot(surface, point),
+                reference_foot,
+                candidate_foot,
+                domain_u,
+                domain_v,
+            )
+        }
         .ok_or_else(|| format!("common station read: no admitted foot at fraction {fraction}"))?;
         let values = [
             old_image.sub(foot.point).length(),
@@ -4164,4 +4360,5 @@ fn station_residual(
     }
     Ok(worst)
 }
+
 

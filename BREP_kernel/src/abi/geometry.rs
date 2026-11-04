@@ -162,10 +162,21 @@ pub(crate) fn javascript_error(error: String) -> JsValue {
     JsValue::from_str(&error)
 }
 
+/// Parse a JSON request crossing the wasm ABI; a malformed request is the
+/// serde error's text as the JavaScript error.
+pub(crate) fn json_in<'a, T: serde::Deserialize<'a>>(request_json: &'a str) -> Result<T, JsValue> {
+    serde_json::from_str(request_json).map_err(|error| javascript_error(error.to_string()))
+}
+
+/// Serialize a reply crossing the wasm ABI; a serialization failure is the
+/// serde error's text as the JavaScript error.
+pub(crate) fn json_out<T: ?Sized + serde::Serialize>(value: &T) -> Result<String, JsValue> {
+    serde_json::to_string(value).map_err(|error| javascript_error(error.to_string()))
+}
+
 #[wasm_bindgen]
 pub fn curve_evaluate_json(request_json: &str) -> Result<String, JsValue> {
-    let request: CurveEvaluationRequest =
-        serde_json::from_str(request_json).map_err(|error| javascript_error(error.to_string()))?;
+    let request: CurveEvaluationRequest = json_in(request_json)?;
     let curve = NurbsCurve::new(
         request.curve.degree,
         request.curve.knots,
@@ -177,70 +188,62 @@ pub fn curve_evaluate_json(request_json: &str) -> Result<String, JsValue> {
         .into_iter()
         .map(|parameter| curve.evaluate(parameter))
         .collect();
-    serde_json::to_string(&points.map_err(javascript_error)?)
-        .map_err(|error| javascript_error(error.to_string()))
+    json_out(&points.map_err(javascript_error)?)
 }
 
 #[wasm_bindgen]
 pub fn project_curve_json(request_json: &str) -> Result<String, JsValue> {
-    let request: CurveProjectionRequest =
-        serde_json::from_str(request_json).map_err(|error| javascript_error(error.to_string()))?;
+    let request: CurveProjectionRequest = json_in(request_json)?;
     let projection =
         project_point_to_curve(&request.curve, request.point).map_err(javascript_error)?;
-    serde_json::to_string(&projection).map_err(|error| javascript_error(error.to_string()))
+    json_out(&projection)
 }
 
 #[wasm_bindgen]
 pub fn project_surface_json(request_json: &str) -> Result<String, JsValue> {
-    let request: SurfaceProjectionRequest =
-        serde_json::from_str(request_json).map_err(|error| javascript_error(error.to_string()))?;
+    let request: SurfaceProjectionRequest = json_in(request_json)?;
     let projection =
         project_point_to_surface(&request.surface, request.point).map_err(javascript_error)?;
-    serde_json::to_string(&projection).map_err(|error| javascript_error(error.to_string()))
+    json_out(&projection)
 }
 
 #[wasm_bindgen]
 pub fn intersect_curve_surface_json(request_json: &str) -> Result<String, JsValue> {
-    let request: CurveSurfaceIntersectionRequest =
-        serde_json::from_str(request_json).map_err(|error| javascript_error(error.to_string()))?;
+    let request: CurveSurfaceIntersectionRequest = json_in(request_json)?;
     let intersections =
         intersect_curve_surface(&request.curve, &request.surface, request.tolerance)
             .map_err(javascript_error)?;
-    serde_json::to_string(&intersections).map_err(|error| javascript_error(error.to_string()))
+    json_out(&intersections)
 }
 
 #[wasm_bindgen]
 pub fn intersect_curves_json(request_json: &str) -> Result<String, JsValue> {
-    let request: CurveCurveIntersectionRequest =
-        serde_json::from_str(request_json).map_err(|error| javascript_error(error.to_string()))?;
+    let request: CurveCurveIntersectionRequest = json_in(request_json)?;
     let intersections = intersect_curves(&request.first, &request.second, request.tolerance)
         .map_err(javascript_error)?;
-    serde_json::to_string(&intersections).map_err(|error| javascript_error(error.to_string()))
+    json_out(&intersections)
 }
 
 #[wasm_bindgen]
 pub fn intersect_surfaces_json(request_json: &str) -> Result<String, JsValue> {
-    let request: SurfaceSurfaceIntersectionRequest =
-        serde_json::from_str(request_json).map_err(|error| javascript_error(error.to_string()))?;
+    let request: SurfaceSurfaceIntersectionRequest = json_in(request_json)?;
     let intersections = intersect_surfaces(&request.first, &request.second, &request.options)
         .map_err(javascript_error)?;
-    serde_json::to_string(&intersections).map_err(|error| javascript_error(error.to_string()))
+    json_out(&intersections)
 }
 
 #[wasm_bindgen]
 pub fn curve_derivatives_json(request_json: &str) -> Result<String, JsValue> {
-    let request: CurveDerivativeRequest =
-        serde_json::from_str(request_json).map_err(|error| javascript_error(error.to_string()))?;
+    let request: CurveDerivativeRequest = json_in(request_json)?;
     let curve = NurbsCurve::new(
         request.curve.degree,
         request.curve.knots,
         request.curve.control_points,
     )
     .map_err(javascript_error)?;
-    serde_json::to_string(
+    json_out(
         &curve
             .derivatives(request.parameter, request.derivative_count)
             .map_err(javascript_error)?,
     )
-    .map_err(|error| javascript_error(error.to_string()))
 }

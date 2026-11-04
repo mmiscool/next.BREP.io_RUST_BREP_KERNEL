@@ -6,8 +6,7 @@
 //! same document a person does. The annotation TYPES are not listed here —
 //! `pmi_catalogue` returns the kernel's own schema catalogue, which is what
 //! `pmi_add_annotation` takes.
-use crate::automation::command::{parse_args, schema_of, Annotations, CommandSpec, Ctx, Empty, Handler, NoArgs, Outcome, Phase};
-use crate::automation::cmd_document::parse;
+use crate::automation::command::{app_command, engine_call, read_engine, parse_args, schema_of, CommandSpec, Ctx, NoArgs, Outcome};
 use brep_render::engine_state::PmiViewPatch;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -46,7 +45,7 @@ pub struct ViewDisplayArgs {
     /// Show the view's model as wireframe.
     #[serde(default)]
     pub wireframe: Option<bool>,
-    /// The solid names hidden in this view.
+    /// The solid names hidden in this view at capture (its baseline; the view's `hide` steps add to it).
     #[serde(default)]
     pub hidden: Option<Vec<String>>,
 }
@@ -154,8 +153,7 @@ pub struct PmiAdded {
 }
 
 fn pmi_state(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
-    let _: NoArgs = parse_args(args)?;
-    Ok(Outcome::Done(parse(&ctx.app.docs.engine().pmi_state_json())))
+    read_engine(ctx, args, |e| e.pmi_state_value())
 }
 
 fn pmi_catalogue(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
@@ -171,9 +169,7 @@ fn pmi_capture_view(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
 }
 
 fn pmi_activate_view(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
-    let a: ViewIdArgs = parse_args(args)?;
-    ctx.app.docs.engine_mut().pmi_activate_view(&a.id)?;
-    Ok(Outcome::Done(json!({})))
+    engine_call(ctx, args, |e, a: ViewIdArgs| e.pmi_activate_view(&a.id))
 }
 
 fn pmi_deactivate_view(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
@@ -183,27 +179,15 @@ fn pmi_deactivate_view(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String
 }
 
 fn pmi_delete_view(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
-    let a: ViewIdArgs = parse_args(args)?;
-    ctx.app.docs.engine_mut().pmi_delete_view(&a.id)?;
-    Ok(Outcome::Done(json!({})))
+    engine_call(ctx, args, |e, a: ViewIdArgs| e.pmi_delete_view(&a.id))
 }
 
 fn pmi_rename_view(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
-    let a: RenameViewArgs = parse_args(args)?;
-    ctx.app.docs.engine_mut().pmi_rename_view(&a.id, &a.name)?;
-    Ok(Outcome::Done(json!({})))
+    engine_call(ctx, args, |e, a: RenameViewArgs| e.pmi_rename_view(&a.id, &a.name))
 }
 
 fn pmi_update_view_camera(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
-    let a: ViewIdArgs = parse_args(args)?;
-    ctx.app.docs.engine_mut().pmi_update_view_camera(&a.id)?;
-    Ok(Outcome::Done(json!({})))
-}
-
-fn pmi_update_view_visibility(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
-    let a: ViewIdArgs = parse_args(args)?;
-    ctx.app.docs.engine_mut().pmi_update_view_visibility(&a.id)?;
-    Ok(Outcome::Done(json!({})))
+    engine_call(ctx, args, |e, a: ViewIdArgs| e.pmi_update_view_camera(&a.id))
 }
 
 fn pmi_set_view_display(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
@@ -258,45 +242,36 @@ fn pmi_update_annotation(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, Stri
 }
 
 fn pmi_remove_annotation(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
-    let a: AnnotationIdArgs = parse_args(args)?;
-    ctx.app.docs.engine_mut().pmi_remove_annotation(&a.id)?;
-    Ok(Outcome::Done(json!({})))
+    engine_call(ctx, args, |e, a: AnnotationIdArgs| e.pmi_remove_annotation(&a.id))
 }
 
 fn pmi_set_annotation_enabled(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
-    let a: AnnotationEnabledArgs = parse_args(args)?;
-    ctx.app.docs.engine_mut().pmi_set_annotation_enabled(&a.id, a.enabled)?;
-    Ok(Outcome::Done(json!({})))
+    engine_call(ctx, args, |e, a: AnnotationEnabledArgs| e.pmi_set_annotation_enabled(&a.id, a.enabled))
 }
 
 fn pmi_move_annotation(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
-    let a: AnnotationMoveArgs = parse_args(args)?;
-    ctx.app.docs.engine_mut().pmi_move_annotation(&a.id, a.index)?;
-    Ok(Outcome::Done(json!({})))
+    engine_call(ctx, args, |e, a: AnnotationMoveArgs| e.pmi_move_annotation(&a.id, a.index))
 }
 
 fn pmi_move_annotation_to_view(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
-    let a: AnnotationToViewArgs = parse_args(args)?;
-    ctx.app.docs.engine_mut().pmi_move_annotation_to_view(&a.id, &a.view_id)?;
-    Ok(Outcome::Done(json!({})))
+    engine_call(ctx, args, |e, a: AnnotationToViewArgs| e.pmi_move_annotation_to_view(&a.id, &a.view_id))
 }
 
 pub static COMMANDS: &[CommandSpec] = &[
-    CommandSpec { name: "pmi_state", group: "pmi", doc: "The document's PMI block: every view with its annotations, the active view, the datum letters in use and the last run's PMI report.", phase: Phase::Read, annotations: Annotations::READ, args_schema: schema_of::<NoArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(pmi_state) },
-    CommandSpec { name: "pmi_catalogue", group: "pmi", doc: "Every PMI annotation type the kernel offers, with its parameter schema — the types `pmi_add_annotation` takes.", phase: Phase::Read, annotations: Annotations::READ, args_schema: schema_of::<NoArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(pmi_catalogue) },
-    CommandSpec { name: "pmi_capture_view", group: "pmi", doc: "Capture the CURRENT camera, visibility and display style as a new PMI view (point the camera first with `standard_view` / `camera_set`). Returns the view id.", phase: Phase::Mutate, annotations: Annotations::MUTATE, args_schema: schema_of::<CaptureViewArgs>, result_schema: schema_of::<PmiAdded>, handler: Handler::App(pmi_capture_view) },
-    CommandSpec { name: "pmi_activate_view", group: "pmi", doc: "Enter a PMI view: the camera, visibility and style become the view's, and new annotations land in it.", phase: Phase::Mutate, annotations: Annotations::MUTATE, args_schema: schema_of::<ViewIdArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(pmi_activate_view) },
-    CommandSpec { name: "pmi_deactivate_view", group: "pmi", doc: "Leave the active PMI view and restore the modeling camera and visibility.", phase: Phase::Mutate, annotations: Annotations::MUTATE, args_schema: schema_of::<NoArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(pmi_deactivate_view) },
-    CommandSpec { name: "pmi_delete_view", group: "pmi", doc: "Delete a PMI view and every annotation in it.", phase: Phase::Mutate, annotations: Annotations::DESTRUCTIVE, args_schema: schema_of::<ViewIdArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(pmi_delete_view) },
-    CommandSpec { name: "pmi_rename_view", group: "pmi", doc: "Rename a PMI view.", phase: Phase::Mutate, annotations: Annotations::MUTATE, args_schema: schema_of::<RenameViewArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(pmi_rename_view) },
-    CommandSpec { name: "pmi_update_view_camera", group: "pmi", doc: "Re-capture the live camera into a view (the panel's Update Camera).", phase: Phase::Mutate, annotations: Annotations::MUTATE, args_schema: schema_of::<ViewIdArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(pmi_update_view_camera) },
-    CommandSpec { name: "pmi_update_view_visibility", group: "pmi", doc: "Re-capture the live visibility set into a view (the panel's Update Visibility).", phase: Phase::Mutate, annotations: Annotations::MUTATE, args_schema: schema_of::<ViewIdArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(pmi_update_view_visibility) },
-    CommandSpec { name: "pmi_set_view_display", group: "pmi", doc: "Patch a view's name, annotation text size, wireframe flag or hidden-solid set; absent fields are unchanged.", phase: Phase::Mutate, annotations: Annotations::MUTATE, args_schema: schema_of::<ViewDisplayArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(pmi_set_view_display) },
-    CommandSpec { name: "pmi_set_view_section", group: "pmi", doc: "Set a view's section as its form's section rows do, as one undo step: on or off, the normal (View, X, Y, Z or Plane), the offset in mm, which side is kept, the face or plane a Plane section cuts on, the solids or components it leaves whole, and further planes (`planes`: a half or corner cut away; material is removed only where every plane removes it). Absent fields keep the section's current value.", phase: Phase::Mutate, annotations: Annotations::MUTATE, args_schema: schema_of::<ViewSectionArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(pmi_set_view_section) },
-    CommandSpec { name: "pmi_add_annotation", group: "pmi", doc: "Add an annotation to a view (the active one when `view_id` is absent) with the params its catalogue schema defines; every other key is seeded from the schema default. Returns the annotation id.", phase: Phase::Mutate, annotations: Annotations::MUTATE, args_schema: schema_of::<AddAnnotationArgs>, result_schema: schema_of::<PmiAdded>, handler: Handler::App(pmi_add_annotation) },
-    CommandSpec { name: "pmi_update_annotation", group: "pmi", doc: "Replace an annotation's params and re-bake the overlay.", phase: Phase::Mutate, annotations: Annotations::MUTATE, args_schema: schema_of::<UpdateAnnotationArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(pmi_update_annotation) },
-    CommandSpec { name: "pmi_remove_annotation", group: "pmi", doc: "Delete one annotation.", phase: Phase::Mutate, annotations: Annotations::DESTRUCTIVE, args_schema: schema_of::<AnnotationIdArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(pmi_remove_annotation) },
-    CommandSpec { name: "pmi_set_annotation_enabled", group: "pmi", doc: "Suppress or re-enable one annotation.", phase: Phase::Mutate, annotations: Annotations::MUTATE, args_schema: schema_of::<AnnotationEnabledArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(pmi_set_annotation_enabled) },
-    CommandSpec { name: "pmi_move_annotation", group: "pmi", doc: "Reorder an annotation within its view.", phase: Phase::Mutate, annotations: Annotations::MUTATE, args_schema: schema_of::<AnnotationMoveArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(pmi_move_annotation) },
-    CommandSpec { name: "pmi_move_annotation_to_view", group: "pmi", doc: "Move an annotation into another view.", phase: Phase::Mutate, annotations: Annotations::MUTATE, args_schema: schema_of::<AnnotationToViewArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(pmi_move_annotation_to_view) },
+    app_command!("pmi", "pmi_state", "The document's PMI block: every view with its annotations, the active view, the datum letters in use and the last run's PMI report.", NoArgs, pmi_state, Read, READ, super::pmi_output_schema::pmi_state_schema),
+    app_command!("pmi", "pmi_catalogue", "Every PMI annotation type the kernel offers, with its parameter schema — the types `pmi_add_annotation` takes.", NoArgs, pmi_catalogue, Read, READ, super::catalogue_output_schema::pmi_catalogue_schema),
+    app_command!("pmi", "pmi_capture_view", "Capture the CURRENT camera, visibility and display style as a new PMI view (point the camera first with `standard_view` / `camera_set`). Returns the view id.", CaptureViewArgs, pmi_capture_view, Mutate, MUTATE, schema_of::<PmiAdded>),
+    app_command!("pmi", "pmi_activate_view", "Enter a PMI view: the camera, visibility and style become the view's, and new annotations land in it.", ViewIdArgs, pmi_activate_view, Mutate, MUTATE),
+    app_command!("pmi", "pmi_deactivate_view", "Leave the active PMI view and restore the modeling camera and visibility.", NoArgs, pmi_deactivate_view, Mutate, MUTATE),
+    app_command!("pmi", "pmi_delete_view", "Delete a PMI view and every annotation in it.", ViewIdArgs, pmi_delete_view, Mutate, DESTRUCTIVE),
+    app_command!("pmi", "pmi_rename_view", "Rename a PMI view.", RenameViewArgs, pmi_rename_view, Mutate, MUTATE),
+    app_command!("pmi", "pmi_update_view_camera", "Re-capture the live camera into a view (the panel's Update Camera).", ViewIdArgs, pmi_update_view_camera, Mutate, MUTATE),
+    app_command!("pmi", "pmi_set_view_display", "Patch a view's name, annotation text size, wireframe flag or captured hidden-solid baseline (`hidden`; what a view hides is this list plus its `hide` steps — add those with `pmi_add_annotation` type `hide`); absent fields are unchanged.", ViewDisplayArgs, pmi_set_view_display, Mutate, MUTATE),
+    app_command!("pmi", "pmi_set_view_section", "Set a view's section as its form's section rows do, as one undo step: on or off, the normal (View, X, Y, Z or Plane), the offset in mm, which side is kept, the face or plane a Plane section cuts on, the solids or components it leaves whole, and further planes (`planes`: a half or corner cut away; material is removed only where every plane removes it). Absent fields keep the section's current value.", ViewSectionArgs, pmi_set_view_section, Mutate, MUTATE),
+    app_command!("pmi", "pmi_add_annotation", "Add an annotation to a view (the active one when `view_id` is absent) with the params its catalogue schema defines; every other key is seeded from the schema default. Returns the annotation id.", AddAnnotationArgs, pmi_add_annotation, Mutate, MUTATE, schema_of::<PmiAdded>),
+    app_command!("pmi", "pmi_update_annotation", "Replace an annotation's params and re-bake the overlay.", UpdateAnnotationArgs, pmi_update_annotation, Mutate, MUTATE),
+    app_command!("pmi", "pmi_remove_annotation", "Delete one annotation.", AnnotationIdArgs, pmi_remove_annotation, Mutate, DESTRUCTIVE),
+    app_command!("pmi", "pmi_set_annotation_enabled", "Suppress or re-enable one annotation.", AnnotationEnabledArgs, pmi_set_annotation_enabled, Mutate, MUTATE),
+    app_command!("pmi", "pmi_move_annotation", "Reorder an annotation within its view.", AnnotationMoveArgs, pmi_move_annotation, Mutate, MUTATE),
+    app_command!("pmi", "pmi_move_annotation_to_view", "Move an annotation into another view.", AnnotationToViewArgs, pmi_move_annotation_to_view, Mutate, MUTATE),
 ];

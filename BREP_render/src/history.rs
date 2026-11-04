@@ -134,6 +134,23 @@ pub struct History {
     refused: u64,
     /// Of those, the ones that were a USER's edit ([`Self::refused_user_edits`]).
     refused_user: u64,
+    /// Set while an agent's staged feature evaluates
+    /// (`EngineState::stage_feature_begin`): USER edits are refused — at
+    /// their checkpoint or [`Self::refuse_user`] — while the run's own
+    /// write-back still lands. Unlike [`Self::lock`] it never touches a
+    /// write-back. See [`Self::set_busy`].
+    busy: Option<String>,
+    /// A user edit was refused for `busy` this frame: its `document_mut`
+    /// reach lands on the scratch copy. Cleared at the top of every pump
+    /// ([`Self::begin_frame`]), before any run lands.
+    refuse_next: bool,
+    /// User edits refused for `busy`, counted since construction.
+    busy_refused: u64,
+    /// The open undo group ([`Self::group_begin`]): `(token, step)`, where
+    /// `step` is the undo step the group's first edit took. Every later edit
+    /// while it is still the newest step folds into it, so a script's run is
+    /// one undo step however many edits it made.
+    group: Option<(u64, Option<u64>)>,
 }
 
 /// Hands out every revision ticket in this process — see [`History::revision`].
@@ -155,6 +172,7 @@ impl Default for History {
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             last_edit_key: None,
+            group: None,
             feature_counter: 0,
             parts_library: std::rc::Rc::new(Value::Null),
             pin_port_hold: None,
@@ -163,6 +181,9 @@ impl Default for History {
             scratch: Value::Null,
             refused: 0,
             refused_user: 0,
+            busy: None,
+            refuse_next: false,
+            busy_refused: 0,
         }
     }
 }
@@ -291,7 +312,7 @@ impl History {
     /// solver fold or a pin settle — leaves [`Self::request_json`] exactly as
     /// it was. The revision does not move either, since nothing changed.
     fn document_mut(&mut self) -> &mut Value {
-        if self.lock.is_some() {
+        if self.lock.is_some() || self.refuse_next {
             self.refused += 1;
             self.scratch = self.document.clone();
             return &mut self.scratch;
@@ -353,13 +374,47 @@ impl History {
         false
     }
 
-    /// [`Self::refuse`] for a write only a user makes.
+    /// [`Self::refuse`] for a write only a user makes — refused, too, while
+    /// the history is [busy](Self::set_busy).
     fn refuse_user(&mut self) -> bool {
         let refused = self.refuse();
         if refused {
             self.refused_user += 1;
+            return true;
         }
-        refused
+        if self.busy.is_some() {
+            self.busy_refused += 1;
+            self.refuse_next = true;
+            return true;
+        }
+        false
+    }
+
+    /// Refuse USER edits while an agent's staged feature evaluates (`Some`),
+    /// or accept them again (`None`). A run's write-back is never refused
+    /// for this; a user's edit is, and counted ([`Self::busy_refused`]).
+    pub fn set_busy(&mut self, reason: Option<String>) {
+        self.busy = reason;
+        self.refuse_next = false;
+        if self.busy.is_some() {
+            self.break_coalescing();
+        }
+    }
+
+    /// Why user edits are being refused just now, if they are.
+    pub fn busy(&self) -> Option<&str> {
+        self.busy.as_deref()
+    }
+
+    /// User edits refused while busy, counted since construction.
+    pub fn busy_refused(&self) -> u64 {
+        self.busy_refused
+    }
+
+    /// The top of a frame's pump: a refused user edit's scratch redirect
+    /// ends here, before any run's write-back lands.
+    pub fn begin_frame(&mut self) {
+        self.refuse_next = false;
     }
 
     /// A monotonic counter of mutation opportunities on the document — the
@@ -736,11 +791,23 @@ impl History {
             self.refused_user += 1;
             return;
         }
+        // Busy (an agent's staged feature is evaluating): the user's edit is
+        // refused the same way, landing on the scratch copy.
+        if self.busy.is_some() {
+            self.busy_refused += 1;
+            self.refuse_next = true;
+            return;
+        }
         // Before the coalesce return: the second keystroke of a typing run is
         // an edit too.
         self.edit_serial = next_revision();
         if coalesce_key.is_some() && coalesce_key == self.last_edit_key.as_deref() {
             return;
+        }
+        if let Some((_, Some(step))) = self.group {
+            if self.undo_top() == Some(step) {
+                return;
+            }
         }
         self.undo_stack.push(self.snapshot());
         if self.undo_stack.len() > MAX_UNDO {
@@ -748,6 +815,40 @@ impl History {
         }
         self.redo_stack.clear();
         self.last_edit_key = coalesce_key.map(str::to_string);
+        if let Some((_, step)) = &mut self.group {
+            *step = self.undo_stack.last().map(|snapshot| snapshot.serial);
+        }
+    }
+
+    /// Open an undo group: every edit until [`Self::group_end`] is one undo
+    /// step. A group already open is replaced. The token names this group to
+    /// its end.
+    pub fn group_begin(&mut self) -> u64 {
+        let token = next_step();
+        self.group = Some((token, None));
+        self.last_edit_key = None;
+        token
+    }
+
+    /// Close group `token`. With `rollback`, take its step back as though its
+    /// edits had never been made ([`Self::retract`]), while that step is still
+    /// the newest; answers whether it did. A token that is not the open group
+    /// closes nothing.
+    pub fn group_end(&mut self, token: u64, rollback: bool) -> Result<bool, String> {
+        let Some((open, step)) = self.group else {
+            return Err("no undo group is open".into());
+        };
+        if open != token {
+            return Err("that undo group is not the open one".into());
+        }
+        self.group = None;
+        self.last_edit_key = None;
+        Ok(rollback && step.is_some_and(|step| self.retract(step)))
+    }
+
+    /// The open undo group's token, if any.
+    pub fn group_open(&self) -> Option<u64> {
+        self.group.map(|(token, _)| token)
     }
 
     /// Whether an undo step is available (for enabling the toolbar button).

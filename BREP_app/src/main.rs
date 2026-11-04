@@ -32,13 +32,22 @@ const USAGE: &str = "usage: brep-app [FILE] [--mcp] [--mcp-port PORT] [--session
        brep-app --install-file-associations | --uninstall-file-associations
        brep-app --plm-configure URL [--plm-token-file FILE] | --plm-forget | --plm-show | --plm-check
        brep-app --bake-worker [--plm-url URL] [--plm-token-file FILE] [--once | --poll SECS]
+       brep-app --provision-typescript | --typescript-status
 
   FILE                open this document in a tab at startup (what a file
                       association hands us on a double click): a part (.nbrep),
                       a family seed (.fbrep) or a template (.tbrep)
   --mcp               embed the MCP server: agents drive this window over http://127.0.0.1:PORT/mcp
+  --mcp-instance NAME named persistent MCP state (default desktop; also used by the editor)
+  --mcp-state-dir DIR explicit MCP journal directory
+  --mcp-ephemeral     disable MCP journal persistence for this launch
   --mcp-port PORT     the port to listen on (default 8765)
   --session-root DIR  where MCP sessions keep screenshots and call logs (default: the OS temp dir)
+  --provision-typescript
+                      install the pinned TypeScript compiler run_script checks
+                      TypeScript with, into the user-local prefix it discovers,
+                      using npm (BREP_NPM or PATH); downloads, then exits
+  --typescript-status report that compiler (discovery and launcher probe) and exit
   --kicad-library     open the KiCad importer instead of the CAD window: clone
                       KiCad's symbol, footprint and 3D-model libraries (git), or import
                       parts from the KiCad installed here, saving each as a document
@@ -78,6 +87,9 @@ const USAGE: &str = "usage: brep-app [FILE] [--mcp] [--mcp-port PORT] [--session
 struct Launch {
     mcp: bool,
     mcp_port: Option<u16>,
+    mcp_instance: Option<String>,
+    mcp_state_dir: Option<std::path::PathBuf>,
+    mcp_ephemeral: bool,
     session_root: Option<std::path::PathBuf>,
     help: bool,
     /// `--version`: print the app's version and exit.
@@ -112,6 +124,9 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Launch, String> 
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--mcp" => launch.mcp = true,
+            "--mcp-instance" => launch.mcp_instance = Some(args.next().ok_or("--mcp-instance needs a name")?),
+            "--mcp-state-dir" => launch.mcp_state_dir = Some(args.next().ok_or("--mcp-state-dir needs a directory")?.into()),
+            "--mcp-ephemeral" => launch.mcp_ephemeral = true,
             "--mcp-port" => {
                 let value = args.next().ok_or("--mcp-port needs a port number")?;
                 launch.mcp_port = Some(value.parse().map_err(|_| format!("--mcp-port: `{value}` is not a port number"))?);
@@ -142,6 +157,9 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Launch, String> 
             path if launch.open.is_none() => launch.open = Some(path.into()),
             extra => return Err(format!("only one document can be opened at a time (`{extra}` is the second)")),
         }
+    }
+    if usize::from(launch.mcp_instance.is_some()) + usize::from(launch.mcp_state_dir.is_some()) + usize::from(launch.mcp_ephemeral) > 1 {
+        return Err("give only one of --mcp-instance, --mcp-state-dir, --mcp-ephemeral".into());
     }
     if (launch.mcp_port.is_some() || launch.session_root.is_some()) && !launch.mcp {
         return Err("--mcp-port and --session-root need --mcp".into());
@@ -230,11 +248,31 @@ fn run_plm_command(command: &PlmCommand, flags: &brep_app::plm::config::Flags) -
 
 #[cfg(not(target_arch = "wasm32"))]
 fn main() -> eframe::Result<()> {
+    // Started as a code-mode worker (the app spawning itself for a script):
+    // run it, done — no window, no console.
+    #[cfg(feature = "mcp")]
+    if brep_mcp_core::cad::code::worker_entry() {
+        return Ok(());
+    }
     #[cfg(windows)]
     if std::env::args_os().len() > 1 {
         windows_console::attach_parent();
     }
     let _ = brep_app::logger::try_init();
+    // TypeScript provisioning for run_script: explicit, by a person, never a
+    // tool call. The same discovery and probe the MCP server advertises.
+    #[cfg(feature = "mcp")]
+    match std::env::args().nth(1).as_deref() {
+        Some("--provision-typescript") => std::process::exit(match brep_mcp_core::cad::code::provision_typescript() {
+            Ok(report) => { println!("{report}"); 0 }
+            Err(error) => { eprintln!("brep-app: TypeScript provisioning: {error}"); 1 }
+        }),
+        Some("--typescript-status") => std::process::exit(match brep_mcp_core::cad::code::typescript_status() {
+            Ok((node, tsc)) => { println!("TypeScript {} available: node {} runs {}", brep_mcp_core::cad::code::TSC_VERSION, node.display(), tsc.display()); 0 }
+            Err(error) => { eprintln!("brep-app: {}", error.message); 1 }
+        }),
+        _ => {}
+    }
     // The PLM bake worker (plan S10) takes its own flags and opens no window.
     if std::env::args().nth(1).as_deref() == Some("--bake-worker") {
         std::process::exit(brep_app::plm::bake::worker_main(std::env::args().skip(2)));
@@ -293,6 +331,18 @@ fn main() -> eframe::Result<()> {
         Err(e) => eprintln!("brep-app: PLM config: {e}; this session uses the file stores"),
     }
 
+    // The editor can create the embedded server before the HTTP listener is started.
+    // Freeze its identity before constructing any window, including plain launches.
+    #[cfg(feature = "mcp")]
+    if let Err(error) = brep_app::mcp::configure_state(&brep_mcp_core::launch_state::Policy {
+        instance: launch.mcp_instance.clone(),
+        state_dir: launch.mcp_state_dir.clone(),
+        ephemeral: launch.mcp_ephemeral,
+    }) {
+        eprintln!("brep-app: MCP state: {error}");
+        if launch.mcp { std::process::exit(1); }
+    }
+
     #[cfg(feature = "mcp")]
     let mcp = if launch.mcp {
         // Bind first: a port in use is a launch error, not a window without
@@ -314,7 +364,7 @@ fn main() -> eframe::Result<()> {
         None
     };
     #[cfg(not(feature = "mcp"))]
-    if launch.mcp {
+    if launch.mcp || launch.mcp_instance.is_some() || launch.mcp_state_dir.is_some() || launch.mcp_ephemeral {
         eprintln!("brep-app: this build has no MCP server (built without the `mcp` feature)");
         std::process::exit(1);
     }
@@ -327,15 +377,17 @@ fn main() -> eframe::Result<()> {
         // Toolbar controls wrap to the available width on native and web.
         ..Default::default()
     };
-    eframe::run_native(
+    // The desktop loop (not `eframe::run_native`): application commands
+    // dispatch without waiting for a frame, which a hidden window never gets.
+    brep_app::desktop_loop::run(
         "brep-app",
         native_options,
-        Box::new(move |cc| {
+        Box::new(move |cc, waker| {
             brep_app::fonts::install(&cc.egui_ctx);
             let plm_store = |store| brep_app::automation::AppOptions { store: Some(store), ..Default::default() };
             #[allow(unused_mut)]
             let mut app = match plm {
-                Ok(None) => brep_app::app::BrepApp::new(cc)?,
+                Ok(None) => brep_app::app::BrepApp::new(cc).map_err(|e| e.to_string())?,
                 // Hydrated before the first frame, as the browser hydrates
                 // IndexedDB before `WebRunner::start`: every read from here on
                 // is synchronous and assumes a complete mirror.
@@ -343,16 +395,22 @@ fn main() -> eframe::Result<()> {
                     let ctx = cc.egui_ctx.clone();
                     brep_app::plm::native::set_wake(move || ctx.request_repaint());
                     let store = brep_app::store::boot_native_store(brep_app::plm::config::app_config_dir(), config);
-                    brep_app::app::BrepApp::new_with(cc, plm_store(store))?
+                    brep_app::app::BrepApp::new_with(cc, plm_store(store)).map_err(|e| e.to_string())?
                 }
                 Err(e) => {
                     let store = brep_app::store::file_store_with_notice(
                         brep_app::plm::config::app_config_dir(),
                         format!("PLM config: {e}"),
                     );
-                    brep_app::app::BrepApp::new_with(cc, plm_store(store))?
+                    brep_app::app::BrepApp::new_with(cc, plm_store(store)).map_err(|e| e.to_string())?
                 }
             };
+            // The queue's waker is installed before anything can submit: the
+            // MCP server below attaches through the queue at once.
+            #[cfg(feature = "automation")]
+            app.automation().set_waker(waker);
+            #[cfg(not(feature = "automation"))]
+            let _ = waker;
             // A document named on the command line — or handed over by the file
             // association on a double click — opens before the first frame, so
             // the window never shows the seed document and then swap it.
@@ -367,9 +425,10 @@ fn main() -> eframe::Result<()> {
                 let adapter = app.diagnostics().adapter_line();
                 brep_app::mcp::start(app.automation().clone(), adapter, launch)?;
             }
-            Ok(Box::new(app) as Box<dyn eframe::App>)
+            Ok(app)
         }),
     )
+    .map_err(|e| eframe::Error::AppCreation(e.into()))
 }
 
 #[cfg(target_arch = "wasm32")]

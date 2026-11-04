@@ -2,8 +2,8 @@ use crate::curve::interior_knots;
 use crate::{NurbsCurve, NurbsSurface, Vec3, Vec4};
 use serde::Serialize;
 
-const EPSILON: f64 = 1e-12;
-const LINEAR_TOLERANCE: f64 = 1e-7;
+const EPSILON: f64 = crate::tolerance::FP_FLOOR;
+const LINEAR_TOLERANCE: f64 = crate::tolerance::DEFAULT_MODEL;
 const MAX_NEWTON_ITERATIONS: usize = 50;
 
 #[derive(Clone, Copy, Debug, Serialize)]
@@ -21,7 +21,7 @@ pub struct SurfaceProjection {
     pub distance: f64,
 }
 
-fn fit_parameter(value: f64, minimum: f64, maximum: f64, closed: bool) -> f64 {
+pub(crate) fn fit_parameter(value: f64, minimum: f64, maximum: f64, closed: bool) -> f64 {
     if closed {
         let period = maximum - minimum;
         (value - minimum).rem_euclid(period) + minimum
@@ -36,8 +36,7 @@ fn fit_parameter(value: f64, minimum: f64, maximum: f64, closed: bool) -> f64 {
 /// depend on it. Read once; the projector is called about a million times in
 /// one boolean.
 fn witness_rescue_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var("BREP_PROJECTION_WITNESS").as_deref() != Ok("0"))
+    switch!("BREP_PROJECTION_WITNESS", true)
 }
 
 /// Squared distance from `point` to the SEGMENT `a`-`b`.
@@ -46,14 +45,7 @@ fn witness_rescue_enabled() -> bool {
 /// approximates the curve, and this is how far that polyline passes from the
 /// query — the witness the rescue below reads.
 fn point_segment_distance_squared(point: Vec3, a: Vec3, b: Vec3) -> f64 {
-    let along = b.sub(a);
-    let length_squared = along.length_squared();
-    let fraction = if length_squared > 0.0 {
-        (point.sub(a).dot(along) / length_squared).clamp(0.0, 1.0)
-    } else {
-        0.0
-    };
-    a.add(along.scale(fraction)).sub(point).length_squared()
+    point.distance_to_segment_squared(a, b)
 }
 
 /// One Newton refinement of the foot parameter, seeded at `seed`.
@@ -74,51 +66,20 @@ fn curve_newton(
     best_u: &mut f64,
     best_distance_squared: &mut f64,
 ) -> Result<f64, String> {
-    let mut parameter = seed;
-    for _ in 0..MAX_NEWTON_ITERATIONS {
-        let derivatives = curve.derivatives_small(parameter, 2)?;
-        let residual = derivatives[0].sub(point);
-        let f = derivatives[1].dot(residual);
-        let derivative = derivatives[2].dot(residual) + derivatives[1].length_squared();
-        let distance_squared = residual.length_squared();
-        if distance_squared < *best_distance_squared {
-            *best_distance_squared = distance_squared;
-            *best_u = parameter;
-        }
-        let residual_length = distance_squared.sqrt();
-        let tangent_length = derivatives[1].length();
-        if residual_length <= LINEAR_TOLERANCE
-            || f.abs() <= EPSILON + 1e-10 * tangent_length * residual_length
-            || derivative.abs() <= EPSILON
-        {
-            break;
-        }
-        let mut step = -f / derivative;
-        let maximum_step = (end - start) / 4.0;
-        if step.abs() > maximum_step {
-            step = step.signum() * maximum_step;
-        }
-        // `fit_parameter` degenerates to exactly this `clamp` when `closed` is
-        // false, so an OPEN curve takes the same path it always did.
-        let next = fit_parameter(parameter + step, start, end, closed);
-        // The step ACTUALLY taken. Wrapping makes the raw difference jump by a
-        // whole period at the seam, so a 2e-16 step across it would read as a
-        // full revolution and never satisfy the convergence test; and a step
-        // that genuinely crosses the seam must not read as a stall.
-        let moved = if closed {
-            let period = end - start;
-            let raw = next - parameter;
-            raw - period * (raw / period).round()
-        } else {
-            next - parameter
-        };
-        if moved.abs() <= 1e-15 * (end - start) {
-            parameter = next;
-            break;
-        }
-        parameter = next;
+    let (last, nearest, squared) = curve_foot_newton_state(curve, point, seed, [start, end],
+        CurveFootPolicy {
+            domain: if closed { FootDomain::Wrap } else { FootDomain::Clamp },
+            iterations: MAX_NEWTON_ITERATIONS,
+            slope_guard: EPSILON,
+            step_limit: (end - start) / 4.0,
+            parameter_tolerance: 1e-15 * (end - start),
+            mode: FootMode::Witness,
+        })?;
+    if squared < *best_distance_squared {
+        *best_distance_squared = squared;
+        *best_u = nearest;
     }
-    Ok(parameter)
+    Ok(last)
 }
 
 /// The parameter in `[low, high]` nearest `point`, by golden-section search on
@@ -164,6 +125,59 @@ fn bracketed_nearest(curve: &NurbsCurve, point: Vec3, low: f64, high: f64) -> Re
 }
 
 pub fn project_point_to_curve(curve: &NurbsCurve, point: Vec3) -> Result<CurveProjection, String> {
+    if projection_memo_enabled() {
+        if let Some(key) = straight_projection_key(curve, point) {
+            if let Some(hit) = PROJECTION_MEMO.with(|memo| memo.borrow().get(&key).copied()) {
+                return Ok(hit);
+            }
+            let projection = project_point_to_curve_uncached(curve, point)?;
+            PROJECTION_MEMO.with(|memo| {
+                let mut memo = memo.borrow_mut();
+                if memo.len() >= PROJECTION_MEMO_ENTRIES {
+                    memo.clear();
+                }
+                memo.insert(key, projection);
+            });
+            return Ok(projection);
+        }
+    }
+    project_point_to_curve_uncached(curve, point)
+}
+
+/// PROJECTION MEMO (lane O row 22, 2026-10-29; on by default since the batch 6
+/// promotion, `BREP_PROJECTION_MEMO=0` projects every call). The projector is a pure function of the curve's net and the
+/// point. On the D2 outward shells every one of its 512 calls a shell call
+/// projects onto a straight two-point edge, and 209 of them repeat a call
+/// already made (the section's pierces, its ambiguity reads and the endpoint
+/// exchange re-project the same points; counted, cad-bot). A straight curve's
+/// whole net and the point make a 16-word key compared exactly, so a hit
+/// returns the very answer the projector computed.
+const PROJECTION_MEMO_ENTRIES: usize = 4096;
+
+thread_local! {
+    static PROJECTION_MEMO: std::cell::RefCell<rustc_hash::FxHashMap<[u64; 16], CurveProjection>> = Default::default();
+}
+
+fn straight_projection_key(curve: &NurbsCurve, point: Vec3) -> Option<[u64; 16]> {
+    if curve.degree != 1 || curve.control_points.len() != 2 || curve.knots.len() != 4 {
+        return None;
+    }
+    let [a, b] = [curve.control_points[0], curve.control_points[1]];
+    let k = &curve.knots;
+    Some([
+        1, k[0].to_bits(), k[1].to_bits(), k[2].to_bits(), k[3].to_bits(),
+        a.x.to_bits(), a.y.to_bits(), a.z.to_bits(), a.w.to_bits(),
+        b.x.to_bits(), b.y.to_bits(), b.z.to_bits(), b.w.to_bits(),
+        point.x.to_bits(), point.y.to_bits(), point.z.to_bits(),
+    ])
+}
+
+fn projection_memo_enabled() -> bool {
+    switch!("BREP_PROJECTION_MEMO", true)
+}
+
+
+fn project_point_to_curve_uncached(curve: &NurbsCurve, point: Vec3) -> Result<CurveProjection, String> {
     let [start, end] = curve.domain()?;
     let mut breaks = vec![start];
     breaks.extend(interior_knots(&curve.knots, curve.degree));
@@ -441,11 +455,17 @@ pub fn project_point_to_surface(
     surface: &NurbsSurface,
     point: Vec3,
 ) -> Result<SurfaceProjection, String> {
+    let _lap = crate::projection_profile::Lap::enter(crate::projection_profile::LANE_PROJECT, surface);
     // Recognized analytic carriers (plane / cylinder / cone / sphere /
     // torus) have exact closed-form projections in the surface's own
     // rational parameterization — skip grid seeding and Newton entirely.
     if let Some(analytic) = surface.analytic() {
         if let Some(projection) = analytic.project(surface, point) {
+            return Ok(projection);
+        }
+    }
+    if let Some(ellipsoid) = surface.affine_sphere() {
+        if let Some(projection) = ellipsoid.project(surface, point) {
             return Ok(projection);
         }
     }
@@ -467,6 +487,15 @@ pub fn project_point_to_surface_seeded(
     seed_u: f64,
     seed_v: f64,
 ) -> Result<SurfaceProjection, String> {
+    let _lap = crate::projection_profile::Lap::enter(crate::projection_profile::LANE_SEEDED, surface);
+    // An ellipsoid's foot is unique off its medial axis: the closed form IS
+    // the branch answer, as it is for the analytic carriers at the seeded
+    // entry (`project_point_to_surface_from_seed`).
+    if let Some(ellipsoid) = surface.affine_sphere() {
+        if let Some(projection) = ellipsoid.project(surface, point) {
+            return Ok(projection);
+        }
+    }
     let [u0, u1] = surface.domain_u()?;
     let [v0, v1] = surface.domain_v()?;
     let (closed_u, closed_v) = surface.closed_directions()?;
@@ -527,8 +556,14 @@ pub(crate) fn project_point_to_surface_from_seed(
     point: Vec3,
     seed: [f64; 2],
 ) -> Result<SurfaceProjection, String> {
+    let _lap = crate::projection_profile::Lap::enter(crate::projection_profile::LANE_FROM_SEED, surface);
     if let Some(analytic) = surface.analytic() {
         if let Some(projection) = analytic.project(surface, point) {
+            return Ok(projection);
+        }
+    }
+    if let Some(ellipsoid) = surface.affine_sphere() {
+        if let Some(projection) = ellipsoid.project(surface, point) {
             return Ok(projection);
         }
     }
@@ -569,8 +604,7 @@ fn seeded_answer_admitted(caller: &std::panic::Location<'_>) -> bool {
 }
 
 fn seed_audit_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("BREP_PROJECTION_AUDIT").is_some())
+    debug_flag!("BREP_PROJECTION_AUDIT")
 }
 
 /// One line per seeded answer whose foot is not the nearest point's: the call
@@ -892,8 +926,7 @@ fn nearest_seed_answer(
 /// so a population run can be repeated with and without the global stage from
 /// one binary. Read once.
 fn global_stage_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var("BREP_PROJECTION_GLOBAL").as_deref() != Ok("0"))
+    switch!("BREP_PROJECTION_GLOBAL", true)
 }
 
 /// `BREP_PROJECTION_GLOBAL_SITES=<a,b,…>`: the global stage's answer is kept
@@ -905,7 +938,14 @@ fn global_stage_enabled() -> bool {
 /// Whether a `BREP_PROJECTION_GLOBAL_SITES`/`_EXCEPT` filter is set, i.e.
 /// whether [`project_point_to_surface`]'s answer can depend on its call site.
 pub(crate) fn global_site_filter_active() -> bool {
-    std::env::var_os("BREP_PROJECTION_GLOBAL_SITES").is_some() || std::env::var_os("BREP_PROJECTION_GLOBAL_EXCEPT").is_some()
+    // Read once per process, like the site lists `global_answer_admitted`
+    // reads: the common reader asks this for every probe (two `getenv` calls,
+    // ~3.7% of the elephant's B12 prefix on the production sampler,
+    // 2026-11-02), and nothing sets these variables after start-up.
+    static ACTIVE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ACTIVE.get_or_init(|| {
+        std::env::var_os("BREP_PROJECTION_GLOBAL_SITES").is_some() || std::env::var_os("BREP_PROJECTION_GLOBAL_EXCEPT").is_some()
+    })
 }
 
 fn global_answer_admitted(caller: &std::panic::Location<'_>) -> bool {
@@ -1049,6 +1089,7 @@ pub(crate) fn project_point_to_surface_general(
     surface: &NurbsSurface,
     point: Vec3,
 ) -> Result<SurfaceProjection, String> {
+    let _lap = crate::projection_profile::Lap::enter(crate::projection_profile::LANE_GENERAL, surface);
     let [u0, u1] = surface.domain_u()?;
     let [v0, v1] = surface.domain_v()?;
     let (closed_u, closed_v) = surface.closed_directions()?;
@@ -1094,8 +1135,14 @@ pub(crate) fn project_point_to_surface_from_nearest_seed(
     surface: &NurbsSurface,
     point: Vec3,
 ) -> Result<SurfaceProjection, String> {
+    let _lap = crate::projection_profile::Lap::enter(crate::projection_profile::LANE_FROM_NEAREST_SEED, surface);
     if let Some(analytic) = surface.analytic() {
         if let Some(projection) = analytic.project(surface, point) {
+            return Ok(projection);
+        }
+    }
+    if let Some(ellipsoid) = surface.affine_sphere() {
+        if let Some(projection) = ellipsoid.project(surface, point) {
             return Ok(projection);
         }
     }
@@ -1904,3 +1951,133 @@ fn global_minimum(
     Ok(())
 }
 
+
+
+/// Domain handling for a local foot-point Newton walk.
+#[derive(Clone, Copy)]
+pub(crate) enum FootDomain {
+    Clamp,
+    Wrap,
+    Extended,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct CurveFootPolicy {
+    pub domain: FootDomain,
+    pub iterations: usize,
+    pub slope_guard: f64,
+    pub step_limit: f64,
+    pub parameter_tolerance: f64,
+    pub mode: FootMode,
+}
+
+/// Acceptance and convergence differ between a distance minimum and a stationary root.
+#[derive(Clone, Copy)]
+pub(crate) enum FootMode {
+    Monotone,
+    Witness,
+    Stationary { positive_slope: bool, relative_step: bool },
+    Backtracked,
+    Planar,
+}
+
+/// Local Newton foot. Seeding and enumeration of local minima belong to the caller.
+/// Returns the last parameter, best witnessed parameter, and squared distance.
+fn curve_foot_newton_state(
+    curve: &NurbsCurve,
+    point: Vec3,
+    seed: f64,
+    bracket: [f64; 2],
+    policy: CurveFootPolicy,
+) -> Result<(f64, f64, f64), String> {
+    let fit = |u| match policy.domain {
+        FootDomain::Clamp => fit_parameter(u, bracket[0], bracket[1], false),
+        FootDomain::Wrap => fit_parameter(u, bracket[0], bracket[1], true),
+        FootDomain::Extended => u,
+    };
+    let extended = matches!(policy.domain, FootDomain::Extended) || matches!(policy.mode, FootMode::Backtracked);
+    let planar = matches!(policy.mode, FootMode::Planar);
+    let project = |p: Vec3| if planar { Vec3::new(p.x, p.y, 0.0) } else { p };
+    let point = project(point);
+    let distance = |u| -> Result<f64, String> {
+        let p = if extended { curve.derivatives_extended(u, 0)?[0] } else { curve.evaluate(u)? };
+        Ok(project(p).sub(point).length())
+    };
+    let monotone = matches!(policy.mode, FootMode::Monotone | FootMode::Backtracked);
+    let witness = matches!(policy.mode, FootMode::Witness);
+    let mut u = if witness { seed } else { fit(seed) };
+    let mut nearest_u = seed;
+    let mut nearest_squared = f64::INFINITY;
+    let mut best = if monotone { distance(u)? } else { f64::INFINITY };
+    for _ in 0..policy.iterations {
+        let derivatives = if extended {
+            let values = curve.derivatives_extended(u, 2)?;
+            [values[0], values[1], values[2]]
+        } else if matches!(policy.mode, FootMode::Stationary { .. })
+            || (planar && !crate::curve::small_curve_derivatives_enabled()) {
+            let values = curve.derivatives(u, 2)?;
+            [values[0], values[1], values[2]]
+        } else {
+            curve.derivatives_small(u, 2)?
+        }.map(project);
+        let offset = derivatives[0].sub(point);
+        let numerator = offset.dot(derivatives[1]);
+        let denominator = derivatives[1].dot(derivatives[1]) + offset.dot(derivatives[2]);
+        if witness {
+            let squared = offset.length_squared();
+            if squared < nearest_squared {
+                nearest_u = u;
+                nearest_squared = squared;
+            }
+            let residual_length = squared.sqrt();
+            if residual_length <= LINEAR_TOLERANCE
+                || numerator.abs() <= EPSILON + 1e-10 * derivatives[1].length() * residual_length {
+                break;
+            }
+        }
+        let singular = if planar { denominator.abs() < policy.slope_guard }
+            else { denominator.abs() <= policy.slope_guard };
+        if singular || (matches!(policy.mode, FootMode::Stationary { positive_slope: true, .. }) && !(denominator > 0.0)) { break; }
+        let mut step = if matches!(policy.mode, FootMode::Backtracked) && !(denominator > 0.0) {
+            policy.step_limit.copysign(numerator)
+        } else {
+            (numerator / denominator).clamp(-policy.step_limit, policy.step_limit)
+        };
+        let mut next = fit(u - step);
+        let mut next_distance = if monotone { distance(next)? } else { f64::INFINITY };
+        if matches!(policy.mode, FootMode::Backtracked) {
+            for _ in 0..30 {
+                if next_distance < best { break; }
+                step *= 0.5;
+                next = fit(u - step);
+                next_distance = distance(next)?;
+            }
+            if !(next_distance < best) { break; }
+        } else if monotone && next_distance >= best { break; }
+        let moved = if planar || matches!(policy.domain, FootDomain::Extended) { step }
+            else if matches!(policy.domain, FootDomain::Wrap) {
+                let period = bracket[1] - bracket[0];
+                let raw = next - u;
+                raw - period * (raw / period).round()
+            } else { next - u };
+        let tolerance = if matches!(policy.mode, FootMode::Stationary { relative_step: true, .. }) {
+            policy.parameter_tolerance * (1.0 + u.abs())
+        } else { policy.parameter_tolerance };
+        let small = if planar || matches!(policy.mode, FootMode::Backtracked) { moved.abs() < tolerance }
+            else { moved.abs() <= tolerance };
+        if small && matches!(policy.mode, FootMode::Monotone) { break; }
+        u = next;
+        best = next_distance;
+        if small { break; }
+    }
+    if witness { return Ok((u, nearest_u, nearest_squared)); }
+    if !monotone { best = distance(u)?; }
+    Ok((u, u, best * best))
+}
+
+pub(crate) fn curve_foot_newton(
+    curve: &NurbsCurve, point: Vec3, seed: f64, bracket: [f64; 2], policy: CurveFootPolicy,
+) -> Result<(f64, f64), String> {
+    let (_, nearest, squared) = curve_foot_newton_state(curve, point, seed, bracket, policy)?;
+    Ok((nearest, squared))
+}

@@ -18,9 +18,7 @@ use super::*;
 /// oracles, not byte-identical (piece and vertex numbering is the single
 /// call's).
 fn one_call_imprint_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let enabled = *ON.get_or_init(|| !matches!(std::env::var("BREP_OFFSET_ONE_CALL_IMPRINT").as_deref(), Ok("0") | Ok("off")));
-    enabled
+    switch!("BREP_OFFSET_ONE_CALL_IMPRINT", true)
 }
 
 thread_local! {
@@ -180,6 +178,17 @@ pub fn offset_shell(
 
 /// The pipeline's one timed entry: `offset_shell` and `offset_solid` both run
 /// through it, so the `timing.*` split and the acceptance step are the same.
+/// Lane O row 38's switch, default on since batch 17 (`0`/`off` restores the fit): it asks the offset pipeline's
+/// imprints for the planar-iso lane's exact pcurves (`ImprintOptions::
+/// exact_iso_pcurves`, parity slice 1): a section the lane answers is an
+/// iso-curve of the ruled carrier and an affine image on the plane, so its
+/// pcurves are written down instead of fitted. Booleans keep their own
+/// default; `BREP_EXACT_ISO_PCURVES` still overrides every imprint.
+fn offset_exact_iso_pcurves_on() -> bool {
+    switch!("BREP_OFFSET_EXACT_ISO_PCURVES", true)
+}
+
+
 pub(super) fn offset_body(
     source: &BrepSolid,
     opening_face_ids: &[u64],
@@ -257,6 +266,14 @@ fn offset_shell_any_lane(
     // The revolved-wedge lane answers a SHELL question (the material between
     // a revolve and its grown image); the offset body takes the pipeline.
     if body == Body::Whole {
+        // Row 36 (`BREP_OFFSET_SPHERE_BODY`, default off): the offset body of a
+        // ball is the ball scaled about its centre (`sphere_body.rs`); it
+        // declines to the pipeline on anything else.
+        if opening_face_ids.is_empty() {
+            if let Some(result) = sphere_body::sphere_body(source, distance) {
+                return Ok(result);
+            }
+        }
         return imprint_attempts(source, opening_face_ids, distance, body);
     }
     // An outward shell of the one circular face of a partial revolve is planar
@@ -276,6 +293,12 @@ fn offset_shell_any_lane(
         Err(error) => {
             os_debug!("revolved wedge lane declined: could not read the source ({error})");
         }
+    }
+    // Row 32 (`BREP_OFFSET_PLANAR_SHELL`, default on; `=0` restores): an outward shell of a
+    // convex polyhedron in closed form (`planar_shell.rs`); it declines to the
+    // pipeline on anything else.
+    if let Some(result) = planar_shell::planar_shell(source, opening_face_ids, distance) {
+        return Ok(result);
     }
     imprint_attempts(source, opening_face_ids, distance, body)
 }
@@ -491,6 +514,9 @@ fn offset_shell_impl(
     // that read a retained face's TRIM — the apex-cap scan below is the one —
     // must read the carved trim, not the one the source still carries.
     let mut carved_supports = HashMap::<u64, FaceRecord>::default();
+    // Lane O item 705: (neighbour face, opening face, rim edge) of every
+    // tangent junction with a curved opening the neighbour cannot reach.
+    let mut tangent_rim_rounds: Vec<(u64, u64, u64)> = Vec::new();
     let mut shielded_cusps = HashSet::<u64>::default();
 
     for face_id in &retained {
@@ -603,7 +629,26 @@ fn offset_shell_impl(
                 if std::env::var("BREP_OFFSET_CURVED_REACH").as_deref() != Ok("0") {
                     curved_reach = curved_opening_reach_source(source, face, distance)?;
                 }
-                if curved_reach.is_none() {
+                // Lane O item 705 (`BREP_OFFSET_TANGENT_RIM_ROUND`, default off):
+                // a face that meets its curved opening TANGENTIALLY never
+                // reaches it — its skin runs parallel to the opening at
+                // exactly d — and the wall there is a round of radius d about
+                // the rim (`rim_round.rs`). Record the rim; the round carrier
+                // is emitted beside the apex caps, and this face's carrier is
+                // built as it is.
+                if curved_reach.is_none() && super::rim_round::tangent_rim_round_enabled() {
+                    for coedge in face.loops.iter().flat_map(|loop_record| &loop_record.coedges) {
+                        let Some((mate, mate_use)) = junction_mate(&source_faces, face, coedge.edge_id) else {
+                            continue;
+                        };
+                        if mate.id != opening || !uses_are_tangent(face, coedge, mate, mate_use)? {
+                            continue;
+                        }
+                        os_debug!("tangent rim round: source face {face_id} meets opening {opening} tangentially along edge {}", coedge.edge_id);
+                        tangent_rim_rounds.push((*face_id, opening, coedge.edge_id));
+                    }
+                }
+                if curved_reach.is_none() && !tangent_rim_rounds.iter().any(|(id, _, _)| id == face_id) {
                     return Err(KernelRefusal::unsupported(KernelStage::Refine, "offset_shell_curved_opening_short", format!(
                         "offset_shell: the offset skin of source face {face_id} stops {gap:.3e} short of \
                          curved opening face {opening}; only a planar opening's skin is grown to meet it"
@@ -878,6 +923,34 @@ fn offset_shell_impl(
                     source_face_id: carriers[index].source_face_id,
                     kind: OffsetFaceRole::Offset,
                 });
+            }
+        }
+    }
+    // Lane O item 705: the ROUND carriers about tangent opening rims, emitted
+    // as the apex caps are (an extra Offset carrier of the neighbour face) and
+    // handled by the same exemptions and coincident-edge splits for now.
+    if !tangent_rim_rounds.is_empty() {
+        let tolerance = 1e-7f64.max(crate::solid_scale(source) * 1e-9);
+        for (neighbour_id, opening_id, edge_id) in &tangent_rim_rounds {
+            let Some(neighbour_index) = carriers.iter().position(|carrier| carrier.source_face_id == *neighbour_id && matches!(carrier.kind, OffsetFaceRole::Offset)) else {
+                continue;
+            };
+            let Some(edge) = source.edges.iter().find(|edge| edge.id == *edge_id) else { continue };
+            let Some(opening_face) = source_by_id_lookup(&source_faces, *opening_id) else { continue };
+            match super::rim_round::circular_rim_round(edge, opening_face, distance, tolerance)? {
+                Some(round) => {
+                    os_debug!("tangent rim round: torus about edge {edge_id} (neighbour {neighbour_id}, opening {opening_id}) as carrier {}", carriers.len());
+                    apex_cap_sources.insert(neighbour_index);
+                    apex_cap_sources.insert(carriers.len());
+                    apex_cap_pairs.push((neighbour_index, carriers.len()));
+                    carriers.push(Carrier { solid: round, source_face_id: *neighbour_id, kind: OffsetFaceRole::Offset });
+                }
+                None => {
+                    return Err(KernelRefusal::unsupported(KernelStage::Refine, "offset_shell_tangent_rim_round", format!(
+                        "offset_shell: the round about the tangent rim (edge {edge_id}) between source face {neighbour_id} and \
+                         curved opening face {opening_id} is built only for a circular rim inside its own circle"
+                    )));
+                }
             }
         }
     }
@@ -1199,7 +1272,7 @@ fn offset_shell_impl(
         .collect::<Result<Vec<_>, _>>()?;
     let carrier_bounds = carrier_samples
         .iter()
-        .map(|samples| Bounds::from_points(samples))
+        .map(|samples| Bounds::from_nonempty_points(samples))
         .collect::<Option<Vec<_>>>()
         .ok_or_else(|| "offset_shell: carrier has no boundary samples".to_string()).or_refuse(KernelStage::Sew, "offset_shell_carrier_has_no_boundary_samples")?;
     let source_by_id = source_faces
@@ -1371,7 +1444,7 @@ fn offset_shell_impl(
                 os_debug!("pair ({first},{second}) skipped: smooth");
                 return false;
             }
-            if !carrier_bounds[first].intersects(carrier_bounds[second], pair_tolerance) {
+            if !carrier_bounds[first].intersects_upper(carrier_bounds[second], pair_tolerance) {
                 os_debug!("pair ({first},{second}) skipped: bounds");
                 return false;
             }
@@ -1454,7 +1527,7 @@ fn offset_shell_impl(
                 span_budget: None,
                 hermite_sections: false,
                 tangent_curve_lane: false,
-                exact_iso_pcurves: false,
+                exact_iso_pcurves: offset_exact_iso_pcurves_on(),
                 march_starts: false,
                 two_radius_junctions: false,
                 tangent_curve_imprint: false,
@@ -1519,7 +1592,7 @@ fn offset_shell_impl(
                     span_budget: None,
                     hermite_sections: false,
                     tangent_curve_lane: false,
-                    exact_iso_pcurves: false,
+                    exact_iso_pcurves: offset_exact_iso_pcurves_on(),
                     march_starts: false,
                     two_radius_junctions: false,
                     tangent_curve_imprint: false,
@@ -1603,7 +1676,7 @@ fn offset_shell_impl(
                         span_budget: None,
                         hermite_sections: false,
                         tangent_curve_lane: false,
-                        exact_iso_pcurves: false,
+                        exact_iso_pcurves: offset_exact_iso_pcurves_on(),
                         march_starts: false,
                         two_radius_junctions: false,
                         tangent_curve_imprint: false,
@@ -1813,7 +1886,7 @@ fn offset_shell_impl(
     }
     split_lap(8, &mut split_clock);
     if split_profile {
-        eprintln!(
+        profile_line!(
             "offset_shell.imprint_split skips={:.3} pair_build={:.3} pair_merge={:.3} standalone={:.3} wall_build={:.3} wall_merge={:.3} ring={:.3} smooth={:.3} filter={:.3}",
             split_ms[0], split_ms[1], split_ms[2], split_ms[3], split_ms[4], split_ms[5], split_ms[6], split_ms[7], split_ms[8],
         );

@@ -37,14 +37,19 @@ globalThis.Workbench = (() => {
     const value = {...old,...node,parent};
     homeState.nodes.set(node.key,value); return value;
   }
+  // A folder can be linked into several places, even of one tree. What is in
+  // a folder at the top of Home is keyed by its id (each entry is in one
+  // folder, and a folder is at the top once); below a folder linked deeper,
+  // or under All folders, by its path.
   function entryNode(entry, parent) {
-    const key=`e:${entry.id}`,old=homeState.nodes.get(key);
+    const via=homeState.nodes.get(parent)?.via;
+    const key=via?`${parent}/e:${entry.id}`:`e:${entry.id}`,old=homeState.nodes.get(key);
     const revision=entry.link?.pinned ? entry.link.revision_id : '';
     const reusable=old?.entry?.kind===entry.kind && old.part===entry.link?.part_id && old.revision===revision;
     return register({key,label:entry.name,kind:entry.kind === 'link' ? 'part' : entry.kind,entry,
-      part:entry.link?.part_id,revision,children:reusable ? old.children : null},parent);
+      part:entry.link?.part_id,revision,children:reusable ? old.children : null,via:Boolean(via||(entry.folder_id&&parent!=='root'))},parent);
   }
-  const canExpand = node => ['folder','part','revision','catalog'].includes(node.kind);
+  const canExpand = node => ['folder','part','revision','catalog','folders','files'].includes(node.kind);
   const movable = node => (Boolean(node.entry) || ['part','revision'].includes(node.kind));
   async function load(node, {refresh=false}={}) {
     if(pendingLoads.has(node.key))return pendingLoads.get(node.key);
@@ -61,7 +66,17 @@ globalThis.Workbench = (() => {
       const response=await treeRead(`/api/workspace/entries?${new URLSearchParams({parent:node.entry?.id || ''})}`);
       if(epoch!==homeState.epoch)return;
       children=response.entries.map(e=>entryNode(e,node.key));
-      if(node.key==='root')children.push(register({key:'catalog',label:'All parts',kind:'catalog',children:homeState.nodes.get('catalog')?.children ?? null},'root'));
+      if(node.key==='root')children.push(register({key:'folders',label:'All folders',kind:'folders',via:true,children:homeState.nodes.get('folders')?.children ?? null},'root'),register({key:'files',label:'All files',kind:'files',via:true,children:homeState.nodes.get('files')?.children ?? null},'root'),register({key:'catalog',label:'All parts',kind:'catalog',children:homeState.nodes.get('catalog')?.children ?? null},'root'));
+    } else if(node.kind === 'folders') {
+      // Folders are stored once, like parts: every one the user may read,
+      // linked anywhere or nowhere.
+      const response=await treeRead('/api/workspace/folders');
+      if(epoch!==homeState.epoch)return;
+      children=response.folders.map(e=>entryNode(e,node.key));
+    } else if(node.kind === 'files') {
+      const response=await treeRead('/api/workspace/files');
+      if(epoch!==homeState.epoch)return;
+      children=response.files.map(e=>entryNode(e,node.key));
     } else if(node.kind === 'catalog') {
       const page=await treeRead('/api/parts?limit=100');
       if(epoch!==homeState.epoch)return;
@@ -95,7 +110,7 @@ globalThis.Workbench = (() => {
     more: '<circle cx="5" cy="12" r="1"/><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/>',
   };
   function treeIcon(kind) {
-    const shape = kind === 'model' ? 'part' : kind === 'attachment' ? 'file' : kind;
+    const shape = kind === 'model' ? 'part' : kind === 'attachment' ? 'file' : kind === 'folders' || kind === 'files' ? 'folder' : kind;
     return `<svg class="tree-icon tree-icon-${shape}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${treeIcons[shape] || treeIcons.file}</svg>`;
   }
   function treeMarkup(node) {
@@ -154,7 +169,9 @@ globalThis.Workbench = (() => {
     hydration.catch(error=>{if(epoch===homeState.epoch)$('home-status').textContent=error.message;});
     if(folderId){await hydration;if(epoch!==homeState.epoch)return;}
     const previous=channels.home.node;
-    let selected=homeState.nodes.get(previous?.key)||(folderId?homeState.nodes.get(`e:${folderId}`):null)||root;
+    // A folder inside a linked folder is keyed by its path in this tree.
+    const placed=folderId?homeState.nodes.get(`e:${folderId}`)||[...homeState.nodes.values()].find(n=>n.entry?.id===folderId||n.entry?.folder_id===folderId):null;
+    let selected=homeState.nodes.get(previous?.key)||placed||root;
     // Refresh the selected item's ancestors before reading its metadata.
     // Other expanded branches continue independently in the background.
     const path=[];let ancestor=selected;
@@ -201,8 +218,13 @@ globalThis.Workbench = (() => {
     }
     try {
       if(node.kind==='folder') {
-        await load(node);if(serial!==channel.serial)return;
-        box(mode).innerHTML=folderHtml(node);
+        const [,people]=await Promise.all([load(node),node.entry?.owner===me.id?api('GET','/api/workspaces').then(r=>r.workspaces||[],()=>[]):[]]);
+        if(serial!==channel.serial)return;
+        box(mode).innerHTML=folderHtml(node,people);
+      } else if(node.kind==='files') {
+        box(mode).innerHTML='<h2>All files</h2><p>Every workspace file you may read, wherever it is linked — a file cut from a folder and not pasted yet is here. Right-click one to copy it.</p>';
+      } else if(node.kind==='folders') {
+        box(mode).innerHTML='<h2>All folders</h2><p>Every folder you may read, wherever it is linked. A folder is stored once, like a part: select one and choose Link into… to put it in a folder of yours, or drag it onto one.</p>';
       } else if(node.kind==='catalog') {
         box(mode).innerHTML='<h2>All parts</h2><p>Expand this collection to browse shared parts. Drag a part onto a Home folder to add a link, or select it and choose Add to folder.</p><a href="#/parts">Search all parts</a>';
       } else if(['part','revision','model'].includes(node.kind)) {
@@ -220,13 +242,17 @@ globalThis.Workbench = (() => {
       } else if(node.kind==='attachment') {
         const a=node.attachment;
         box(mode).innerHTML=`<h2>${escape(a.name)}</h2><p class="muted">${escape(node.scope)}</p>${pairs([['Kind',a.kind],['Size',fileSize(a.size)],['Type',a.media_type],['Note',a.note]])}<a class="button-link" href="${FileDocuments.route('attachment',a.id,node.part,node.revision)}">Open document</a> <a class="button-link" href="/api/attachments/${enc(a.id)}" download>Download attachment</a><p><a href="${partLink(node.part,node.revision,'attachments')}">Manage attachments</a></p>${['image/png','image/jpeg','image/webp','image/gif'].includes(a.media_type)?`<img class="detail-preview" src="/api/attachments/${enc(a.id)}?inline=true" alt="${escape(a.name)}">`:''}`;
+      } else if(node.kind==='file'&&node.entry.attachment) {
+        // A link to a part's attachment: read-only here, changed on its part.
+        const a=node.entry.attachment,f=node.entry.file||{};
+        box(mode).innerHTML=`<h2>${escape(node.label)}</h2><p class="muted">${a.missing?'This attachment is gone from its part.':`Attachment of ${escape(a.number)}${a.revision_label?` rev ${escape(a.revision_label)}`:''}`}</p>${pairs([['Kind',a.kind],['Size',f.size?fileSize(f.size):''],['Type',f.media_type]])}<div class="toolbar"><a class="button-link" href="/api/workspace/entries/${enc(node.entry.id)}/content" download>Download</a><a href="${partLink(a.part_id,a.revision_id,'attachments')}">Open on its part</a>${entryActions(node,false)}</div>`;
       } else if(node.kind==='file') {
         const answer=await api('GET',`/api/workspace/entries/${enc(node.entry.id)}/versions`);if(serial!==channel.serial)return;
         const versions=answer.versions || answer;
         box(mode).innerHTML=`<h2>${escape(node.label)}</h2>${pairs([['Version',node.entry.file?.version],['Size',fileSize(node.entry.file?.size || 0)]])}<div class="toolbar"><a class="button-link" href="${FileDocuments.route('workspace',node.entry.id)}">Open document</a> <a class="button-link" href="/api/workspace/entries/${enc(node.entry.id)}/content" download>Download</a>${entryActions(node)}</div><details><summary>File versions</summary><ul class="detail-files">${versions.slice().reverse().map(v=>`<li>Version ${v.version} · ${fileSize(v.size)} <a href="/api/workspace/entries/${enc(node.entry.id)}/content?version=${v.version}" download>Download</a>${!v.current?action('restore','Restore',`data-version="${v.version}"`):''}</li>`).join('')}</ul></details>${me.can_author?`<details><summary>Promote to attachment</summary><label>Part number<input data-promote-part></label><label>Revision (optional)<input data-promote-revision></label>${action('promote','Promote')}</details>`:''}`;
 
       }
-      if(['file','attachment'].includes(node.kind)) {
+      if(['file','attachment'].includes(node.kind)&&!node.entry?.attachment) {
         const hash=node.kind==='file'?FileDocuments.route('workspace',node.entry.id):FileDocuments.route('attachment',node.attachment.id,node.part,node.revision);
         const host=document.createElement('div');host.className='selection-document';box(mode).append(host);
         await FileDocuments.prepare(hash);
@@ -245,13 +271,28 @@ globalThis.Workbench = (() => {
       if(serial===channel.serial){box(mode).innerHTML=`<p class="error">${escape(error.message)}</p>`;reveal(mode,focus);}
     }
   }
-  function entryActions(node) {
+  // The folder itself (from All folders), not a link placing it somewhere.
+  const storedFolder = entry => entry?.kind==='folder' && entry.id===entry.folder_id;
+  function entryActions(node,rename=true) {
     if(!node.entry)return '';
-    return `${action('move','Move…')}${action('rename','Rename')}${action('delete',node.entry.kind==='link'?'Remove link':'Delete')}`;
+    const folder=node.entry.kind==='folder';
+    const remove=storedFolder(node.entry)?'':action('delete',node.entry.kind==='link'?'Remove link':folder?'Remove from here':'Delete');
+    const destroy=folder&&node.entry.owner===me.id?action('delete-folder','Delete folder'):'';
+    return `${storedFolder(node.entry)?'':action('move','Move…')}${folder?action('link-folder','Link into…'):''}${rename?action('rename','Rename'):''}${remove}${destroy}`;
   }
-  function folderHtml(node) {
-    const items=(node.children || []).filter(n=>n.kind!=='catalog');
-    return `<h2>${escape(node.label)}</h2><p>${items.length} items</p><div class="toolbar">${node.entry?`<a class="button-link" href="#/workspace/${enc(node.entry.id)}">Open folder tab</a>`:''}${homeState.moving?action('place',`${homeState.moving.entry?'Move':'Link'} ${escape(homeState.moving.label)} here`)+action('cancel-move','Cancel move'):''}${entryActions(node)}</div><details class="folder-tools"><summary>Add to this folder</summary><label>Folder name<input data-folder-name autocomplete="off"></label>${action('new-folder','Create folder')}<label>Part number<input data-link-part autocomplete="off"></label><label>Revision (optional)<input data-link-revision></label>${action('link','Add part link')}<label>Files<input data-folder-files type="file" multiple></label></details><p class="muted">Expand folders to explore their contents. Drop files or drag a workspace item onto a folder to organize it.</p>${items.length?`<ul class="detail-files">${items.map(n=>`<li><button class="link" data-select-tree="${escape(n.key)}">${escape(n.label)}</button><span class="muted">${escape(n.kind)}</span></li>`).join('')}</ul>`:'<p class="empty">This folder is empty.</p>'}`;
+  // A folder's own properties, not its contents (the tree shows those): its
+  // name and owner. A folder is stored once, like a part, and linked into
+  // any number of places and Homes; its name, owner and contents are the
+  // same in each. Its owner renames it, gives it a new owner (which moves
+  // nothing) and adds to it. Home itself is fixed.
+  function folderHtml(node,people=[]) {
+    const entry=node.entry,mine=!entry||entry.owner===me.id;
+    const owner=entry?entry.owner_name:me.username;
+    const fixed=!entry||!mine?' readonly':'';
+    const choices=people.filter(p=>p.username).map(p=>`<option value="${escape(p.username)}">${escape(p.display_name||p.username)}</option>`).join('');
+    return `<h2>${escape(node.label)}</h2>
+      <div class="folder-properties"><label>Name<input data-folder-rename autocomplete="off" value="${escape(entry?entry.name:node.label)}"${fixed}></label><label>Owner<input data-folder-owner autocomplete="off" list="folder-owner-choices" value="${escape(owner)}"${fixed}></label><datalist id="folder-owner-choices">${choices}</datalist>${entry&&mine?action('save-folder','Save'):''}</div>
+      <div class="toolbar">${entry?`<a class="button-link" href="#/workspace/${enc(entry.id)}">Open folder tab</a>`:''}${homeState.moving?action('place',`${homeState.moving.entry&&!homeState.linking?'Move':'Link'} ${escape(homeState.moving.label)} here`)+action('cancel-move','Cancel'):''}${entryActions(node,false)}</div>${mine?'':'<p class="muted">Only its owner renames this folder or adds to it.</p>'}<details class="folder-tools"${mine?'':' hidden'}><summary>Add to this folder</summary><label>Folder name<input data-folder-name autocomplete="off"></label>${action('new-folder','Create folder')}<label>Part number<input data-link-part autocomplete="off"></label><label>Revision (optional)<input data-link-revision></label>${action('link','Add part link')}<label>Files<input data-folder-files type="file" multiple></label></details>${entry&&mine?`<details class="folder-share"><summary>Add to a user's Home</summary><p class="muted">Links this same folder at the top of their Home. Nothing is copied.</p><label>User<input data-share-user autocomplete="off" list="folder-owner-choices"></label>${action('share-folder','Add to their Home')}</details>`:''}`;
   }
   function partHtml(mode,node,detail,rev) {
     const raw=detail.revisions.find(r=>r.id===rev.id);
@@ -264,12 +305,12 @@ globalThis.Workbench = (() => {
     if(me.can_author&&rev.lifecycle==='draft')primary+=action('submit','Request approval');
     if(me.can_checkin&&rev.editable&&!rev.locked_by)primary+=action('release','Release');
     if(me.can_author&&raw?.uses)primary+=action('checkin-all','Check in with its children');
-    return `<div class="detail-heading"><span data-model-preview>${thumb(['revision','model'].includes(node.kind)?rev.thumbnail?.url:detail.thumbnail_url,'lg')}</span><div><h2>${escape(detail.number)}</h2><p>${escape(detail.name)}</p></div></div><p>${escape(detail.description || '')}</p>
+    return `<div class="detail-heading" data-copy-kind="part" data-copy-part="${escape(detail.id)}" data-copy-revision="${escape(['revision','model'].includes(node.kind)?rev.id:'')}" data-copy-label="${escape(detail.number)}"><span data-model-preview>${thumb(['revision','model'].includes(node.kind)?rev.thumbnail?.url:detail.thumbnail_url,'lg')}</span><div><h2>${escape(detail.number)}</h2><p>${escape(detail.name)}</p></div></div><p>${escape(detail.description || '')}</p>
       <div class="revision-heading"><strong>Revision ${escape(rev.label)}</strong>${stateChip(rev.lifecycle)}</div>
       ${pairs([['Type',detail.part_type],['Category',detail.category_path || detail.category],['Contains 3D geometry',(raw?.has_geometry ?? detail.has_geometry) ? 'Yes' : 'No'],['Has thumbnail',(raw?.has_thumbnail ?? detail.has_thumbnail) ? 'Yes' : 'No'],['Checked out by',rev.locked_by || 'Not checked out'],...attributes])}
       <div class="toolbar">${openInCadButton(detail.id,rev.id,rev.editable?'Edit in CAD':'Open in CAD') || ''}${primary}</div>
       <section class="selection-review"><h3>Approval</h3><div data-review-content>Loading review…</div></section>
-      <section><h3>${['revision','model'].includes(node.kind)?'Revision':'Part'} attachments</h3>${attachments.length?`<ul class="detail-files">${attachments.map(a=>`<li>${FileDocuments.documentLink(a,detail.id,['revision','model'].includes(node.kind)?rev.id:'')}<small>${escape(a.kind)} · ${fileSize(a.size)}</small></li>`).join('')}</ul>`:'<p class="muted">No attachments.</p>'}<details><summary>Add an attachment</summary><label>Attach to<select data-attachment-scope><option value="part">Part</option>${rev.editable?`<option value="revision"${['revision','model'].includes(node.kind)?' selected':''}>Revision ${escape(rev.label)}</option>`:''}</select></label><label>File<input type="file" data-attachment-file${me.can_author?'':' disabled'}></label></details></section>
+      <section><h3>${['revision','model'].includes(node.kind)?'Revision':'Part'} attachments</h3>${attachments.length?`<ul class="detail-files">${attachments.map(a=>`<li data-copy-kind="attachment" data-copy-id="${escape(a.id)}" data-copy-part="${escape(detail.id)}" data-copy-revision="${escape(['revision','model'].includes(node.kind)?rev.id:'')}" data-copy-label="${escape(a.name)}">${FileDocuments.documentLink(a,detail.id,['revision','model'].includes(node.kind)?rev.id:'')}<small>${escape(a.kind)} · ${fileSize(a.size)}</small></li>`).join('')}</ul>`:'<p class="muted">No attachments.</p>'}<details><summary>Add an attachment</summary><label>Attach to<select data-attachment-scope><option value="part">Part</option>${rev.editable?`<option value="revision"${['revision','model'].includes(node.kind)?' selected':''}>Revision ${escape(rev.label)}</option>`:''}</select></label><label>File<input type="file" data-attachment-file${me.can_author?'':' disabled'}></label></details></section>
       <div class="toolbar">${action('bom','BOM structure')}${extra}${mode==='home'&&node.entry?.kind==='link'?action(node.entry.link.pinned?'follow':'pin',node.entry.link.pinned?'Follow newest':'Pin this revision'):''}<a href="${partLink(detail.id,rev.id,'summary')}">Full part details</a></div><div data-bom-content></div>
       <details><summary>More information</summary>${pairs([['Created',when(detail.created_at)]])}<p><a href="${partLink(detail.id,rev.id,'revisions')}">Manage revisions</a> · <a href="${partLink(detail.id,rev.id,'sourcing')}">Sourcing</a> · <a href="${partLink(detail.id,rev.id,'history')}">History</a></p></details>`;
   }
@@ -296,8 +337,14 @@ globalThis.Workbench = (() => {
     else if(channels[mode].node)await select(mode,channels[mode].node,false);
     await refreshInbox();
   }
-  async function moveTo(node,folder) {
+  async function moveTo(node,folder,link=false) {
     const parent=folder.entry?.id || '';
+    if((link||storedFolder(node.entry))&&node.entry?.kind==='folder') {
+      await api('POST','/api/workspace/links',{parent,folder:node.entry.folder_id||node.entry.id});
+      homeState.moving=null;homeState.linking=false;homeState.expanded.add(folder.key);
+      await home();$('home-status').textContent=`${node.label} linked into ${folder.label}.`;
+      return;
+    }
     if(node.entry) {
       if(node.entry.id===parent)throw new Error('A folder cannot be moved inside itself.');
       await api('PATCH',`/api/workspace/entries/${enc(node.entry.id)}`,{parent});
@@ -326,12 +373,31 @@ globalThis.Workbench = (() => {
     if(!node)return;
     const area=box(mode),name=button.dataset.detailAction;
     const base=detail&&rev?`/api/parts/${enc(detail.id)}/revisions/${enc(rev.id)}`:'';
-    if(name==='move'){homeState.moving=node;$('home-status').textContent=`Choose a destination folder, then select ${node.entry?'Move':'Link'} here.`;layout('home').classList.remove('detail-open');return;}
-    if(name==='cancel-move'){homeState.moving=null;await select(mode,node,false);return;}
-    if(name==='place'){if(homeState.moving)await moveTo(homeState.moving,node);return;}
+    if(name==='move'||name==='link-folder'){homeState.moving=node;homeState.linking=name==='link-folder';$('home-status').textContent=`Choose a destination folder, then select ${node.entry&&!homeState.linking?'Move':'Link'} here.`;layout('home').classList.remove('detail-open');return;}
+    if(name==='cancel-move'){homeState.moving=null;homeState.linking=false;await select(mode,node,false);return;}
+    if(name==='share-folder'){
+      const who=area.querySelector('[data-share-user]').value.trim();if(!who)throw new Error('Enter a user.');
+      await api('POST','/api/workspace/links',{folder:node.entry.folder_id||node.entry.id,home:who});
+      $('home-status').textContent=`${node.label} is now also in ${who}'s Home.`;
+      return;
+    }
+    if(name==='place'){if(homeState.moving)await moveTo(homeState.moving,node,homeState.linking);return;}
+    if(name==='save-folder') {
+      const fields={},value=area.querySelector('[data-folder-rename]').value.trim(),owner=area.querySelector('[data-folder-owner]').value.trim();
+      if(!value)throw new Error('Enter a folder name.');
+      if(value!==node.entry.name)fields.name=value;
+      if(!owner)throw new Error('Enter an owner.');
+      if(owner!==node.entry.owner_name)fields.owner=owner;
+      if(!Object.keys(fields).length)return;
+      await api('PATCH',`/api/workspace/entries/${enc(node.entry.id)}`,fields);
+      await refresh(mode);
+      $('home-status').textContent=`${value} saved${fields.owner?`; owner ${owner}`:''}.`;
+      return;
+    }
     if(name==='rename') {const value=prompt('New name',node.entry.name);if(!value?.trim())return;await api('PATCH',`/api/workspace/entries/${enc(node.entry.id)}`,{name:value.trim()});}
     else if(name==='pin'||name==='follow')await api('PATCH',`/api/workspace/entries/${enc(node.entry.id)}`,{revision:name==='pin'?rev.id:''});
-    else if(name==='delete'){if(!confirm(node.entry.kind==='link'?'Remove this workspace link? The part and revisions stay.':'Delete this workspace item and its contents?'))return;await api('DELETE',`/api/workspace/entries/${enc(node.entry.id)}?recursive=${node.entry.kind==='folder'}`);}
+    else if(name==='delete-folder'){if(!confirm(`Delete the folder "${node.label}" everywhere it is linked? The files and links in it go too; parts, and folders linked in it, stay.`))return;await api('DELETE',`/api/workspace/entries/${enc(node.entry.folder_id)}?recursive=true`);}
+    else if(name==='delete'){if(!confirm(node.entry.kind==='link'?'Remove this workspace link? The part and revisions stay.':node.entry.kind==='folder'?'Remove this folder from here? The folder and what is in it stay, in every other place it is linked and under All folders.':'Delete this file and every version of it?'))return;await api('DELETE',`/api/workspace/entries/${enc(node.entry.id)}?recursive=${node.entry.kind==='folder'}`);}
     else if(name==='new-folder'){const value=area.querySelector('[data-folder-name]').value.trim();if(!value)throw new Error('Enter a folder name.');await api('POST','/api/workspace/folders',{parent:node.entry?.id||'',name:value});homeState.expanded.add(node.key);}
     else if(name==='link'){const part=area.querySelector('[data-link-part]').value.trim();if(!part)throw new Error('Enter a part number.');await api('POST','/api/workspace/links',{parent:node.entry?.id||'',part,revision:area.querySelector('[data-link-revision]').value.trim()});homeState.expanded.add(node.key);}
     else if(name==='restore')await api('POST',`/api/workspace/entries/${enc(node.entry.id)}/versions/${button.dataset.version}/restore`);
@@ -422,7 +488,125 @@ globalThis.Workbench = (() => {
       if(visible&&channel.node?.part===detail.id)safe(()=>refresh(mode));
     }
   }
+  // -- Copy, Cut and Paste: the right-click menu ------------------------------
+  // Folders, files and parts are each stored once; a folder holds links. Copy
+  // puts an item on the clipboard; Cut does that and removes the link from
+  // its folder at once (the item itself stays, under All folders, All files
+  // or All parts). "Paste - Link" links it into a folder, "Paste - New Unique
+  // Copy" makes a new folder, file or part there.
+  let clipboard=null;
+  // What a tree node or a marked element would put on the clipboard.
+  function copyOf(node) {
+    const e=node?.entry;
+    if(e?.attachment)return {kind:'attachment',id:e.attachment.id,part:e.attachment.part_id,revision:e.attachment.revision_id,label:e.name};
+    if(e?.kind==='folder')return {kind:'folder',id:e.folder_id||e.id,label:e.name};
+    if(e?.kind==='file')return {kind:'file',id:e.file_id||e.id,label:e.name};
+    if(node?.kind==='attachment')return {kind:'attachment',id:node.attachment.id,part:node.part,revision:node.revision||'',label:node.attachment.name};
+    if(['part','revision','model'].includes(node?.kind)&&node.part){
+      const revision=node.kind==='part'?(node.entry?.link?.pinned?node.revision:''):node.revision;
+      return {kind:'part',part:node.part,revision:revision||'',label:node.label};
+    }
+    return null;
+  }
+  function copyOfElement(element) {
+    const d=element.dataset;
+    return {kind:d.copyKind,id:d.copyId||'',part:d.copyPart||'',revision:d.copyRevision||'',label:d.copyLabel||''};
+  }
+  // The folder a paste on `node` goes into: the folder itself, or the one
+  // holding the item.
+  function pasteTarget(node) {
+    if(!node)return null;
+    if(node.kind==='folder')return node;
+    const parent=homeState.nodes.get(node.parent);
+    return parent?.kind==='folder'?parent:null;
+  }
+  // A placed link can be cut out of its folder; a stored folder (All folders)
+  // or a part's own revision cannot.
+  const cuttable=node=>Boolean(node?.entry)&&!storedFolder(node.entry)&&!(node.entry.kind==='file'&&node.entry.id===node.entry.file_id);
+  async function paste(target,how) {
+    const item=clipboard;if(!item||!target)return;
+    const parent=target.entry?.id||'';
+    const body={parent};
+    if(item.kind==='folder')body.folder=item.id;
+    else if(item.kind==='file')body.file=item.id;
+    else if(item.kind==='attachment')Object.assign(body,{attachment:item.id,part:item.part,revision:item.revision});
+    else Object.assign(body,{part:item.part,revision:item.revision});
+    if(how==='link')await api('POST','/api/workspace/links',body);
+    else {
+      try{await api('POST','/api/workspace/copies',body);}
+      catch(error){
+        // A part type that takes a typed number asks for the copy's.
+        if(item.kind!=='part'||!/enter one|number/i.test(error.message))throw error;
+        const number=prompt(`${error.message}\n\nNumber for the new copy of ${item.label}:`);
+        if(!number?.trim())return;
+        await api('POST','/api/workspace/copies',{...body,number:number.trim()});
+      }
+    }
+    homeState.expanded.add(target.key);
+    await home();
+    $('home-status').textContent=`${item.label} ${how==='link'?'linked into':'copied into'} ${target.label}.`;
+  }
+  function closeMenu() {document.querySelector('.context-menu')?.remove();}
+  function openMenu(event,items) {
+    closeMenu();
+    if(!items.some(i=>i&&!i.disabled))return;
+    event.preventDefault();
+    const menu=document.createElement('div');
+    menu.className='context-menu';menu.setAttribute('role','menu');
+    menu.innerHTML=items.map((item,i)=>item?`<button type="button" role="menuitem" data-menu-index="${i}"${item.disabled?' disabled':''}>${escape(item.label)}</button>`:'<hr>').join('');
+    document.body.append(menu);
+    const {innerWidth:w,innerHeight:h}=window,box=menu.getBoundingClientRect();
+    menu.style.left=`${Math.max(4,Math.min(event.clientX,w-box.width-4))}px`;
+    menu.style.top=`${Math.max(4,Math.min(event.clientY,h-box.height-4))}px`;
+    menu.addEventListener('click',e=>{
+      const button=e.target.closest('[data-menu-index]');if(!button||button.disabled)return;
+      closeMenu();safe(()=>items[Number(button.dataset.menuIndex)].run());
+    });
+    menu.addEventListener('keydown',e=>{
+      const buttons=[...menu.querySelectorAll('button:not([disabled])')],at=buttons.indexOf(document.activeElement);
+      if(e.key==='Escape'){closeMenu();event.target.focus?.();}
+      else if(e.key==='ArrowDown'||e.key==='ArrowUp'){e.preventDefault();buttons[(at+(e.key==='ArrowDown'?1:buttons.length-1))%buttons.length]?.focus();}
+    });
+    menu.querySelector('button:not([disabled])')?.focus();
+  }
+  function menuItems({item,node,target}) {
+    const pasteLabel=clipboard?` ${clipboard.label}`:'';
+    return [
+      {label:'Copy',disabled:!item,run:()=>{clipboard=item;$('home-status').textContent=`Copied ${item.label}. Right-click a folder to paste it.`;}},
+      {label:'Cut',disabled:!item||!cuttable(node),run:async()=>{
+        await api('DELETE',`/api/workspace/entries/${enc(node.entry.id)}?recursive=false`);
+        clipboard=item;await home();
+        $('home-status').textContent=`Cut ${item.label} from its folder. Right-click a folder to paste it.`;
+      }},
+      null,
+      {label:`Paste - Link${pasteLabel}`,disabled:!clipboard||!target,run:()=>paste(target,'link')},
+      {label:`Paste - New Unique Copy${pasteLabel}`,disabled:!clipboard||!target,run:()=>paste(target,'copy')},
+    ];
+  }
+  function contextMenu(event) {
+    if(event.shiftKey)return; // The browser's own menu stays one key away.
+    const marked=event.target.closest('[data-copy-kind]');
+    const row=event.target.closest('#home-tree [data-tree-key]');
+    if(row){
+      const node=homeState.nodes.get(row.dataset.treeKey);
+      openMenu(event,menuItems({item:copyOf(node),node,target:pasteTarget(node)}));
+    } else if(marked){
+      openMenu(event,menuItems({item:copyOfElement(marked),node:null,target:null}));
+    } else if(event.target.closest('#home-detail')&&channels.home.node){
+      // The right-side pane stands for the item it shows.
+      const node=channels.home.node;
+      openMenu(event,menuItems({item:copyOf(node),node,target:pasteTarget(node)}));
+    }
+  }
+
   function init() {
+    document.addEventListener('contextmenu',contextMenu);
+    document.addEventListener('pointerdown',event=>{if(!event.target.closest('.context-menu'))closeMenu();});
+    window.addEventListener('blur',closeMenu);
+    window.addEventListener('resize',closeMenu);
+    // A wheel, not any scroll: a scroll the page makes itself (a row brought
+    // into view, a list refreshed) lands after the menu opens.
+    document.addEventListener('wheel',event=>{if(!event.target.closest('.context-menu'))closeMenu();},{passive:true});
     $('home-tree').addEventListener('click',event=>{
       const element=event.target.closest('[data-tree-key]');if(!element)return;
       const node=homeState.nodes.get(element.dataset.treeKey);if(!node)return;
@@ -491,11 +675,13 @@ globalThis.Workbench = (() => {
     }));
     for(const mode of Object.keys(channels)) {
       box(mode).addEventListener('click',event=>{
-        const tree=event.target.closest('[data-select-tree]');if(tree){safe(()=>select('home',homeState.nodes.get(tree.dataset.selectTree)));return;}
         const button=event.target.closest('[data-detail-action]');if(!button)return;
         if(channels[mode].busy)return;
         channels[mode].busy=true;button.disabled=true;
         safe(async()=>{try{await detailAction(mode,button);}finally{channels[mode].busy=false;button.disabled=false;}});
+      });
+      box(mode).addEventListener('keydown',event=>{
+        if(event.key==='Enter'&&event.target.closest('.folder-properties input'))box(mode).querySelector('[data-detail-action=save-folder]')?.click();
       });
       box(mode).addEventListener('change',event=>{
         const input=event.target,files=[...(input.files || [])];if(!files.length)return;

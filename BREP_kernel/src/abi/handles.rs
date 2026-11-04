@@ -41,8 +41,7 @@ pub(crate) fn solid_buffer(solid: &BrepSolid, metadata_json: String) -> Result<W
     let (data, names) = encode_solid(solid).map_err(javascript_error)?;
     Ok(WasmSolidBuffer {
         data,
-        names_json: serde_json::to_string(&names)
-            .map_err(|error| javascript_error(error.to_string()))?,
+        names_json: json_out(&names)?,
         metadata_json,
     })
 }
@@ -248,8 +247,7 @@ pub fn register_solid_buffer(data: &[f64], names_json: &str) -> Result<u32, JsVa
 /// Ingest a solid from JSON into the resident registry (arena + validate kept).
 #[wasm_bindgen]
 pub fn register_solid_json(solid_json: &str) -> Result<u32, JsValue> {
-    let solid: BrepSolid =
-        serde_json::from_str(solid_json).map_err(|error| javascript_error(error.to_string()))?;
+    let solid: BrepSolid = json_in(solid_json)?;
     let solid = validate_imported_solid(solid, "register_solid_json")?;
     Ok(register_solid_value(solid))
 }
@@ -341,7 +339,7 @@ pub fn mass_properties_handle(handle: u32) -> Result<String, JsValue> {
     with_registered_solid(handle, |solid| {
         let _caller = crate::mass_caller("abi.mass_properties");
         let properties = solid_mass_properties(solid).map_err(javascript_error)?;
-        serde_json::to_string(&properties).map_err(|error| javascript_error(error.to_string()))
+        json_out(&properties)
     })
 }
 
@@ -375,7 +373,7 @@ pub fn face_names_handle(handle: u32) -> Result<String, JsValue> {
                 map.push((face.id, face.name.clone()));
             }
         }
-        serde_json::to_string(&map).map_err(|error| javascript_error(error.to_string()))
+        json_out(&map)
     })
 }
 

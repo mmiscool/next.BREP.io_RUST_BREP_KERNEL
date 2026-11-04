@@ -174,7 +174,7 @@ pub fn tool_group(profile: &ToolProfile, tip: Point3, axis: Point3, to_model: &R
     const SHANK: [f32; 3] = [0.75, 0.75, 0.78];
     const HOLDER: [f32; 3] = [0.55, 0.58, 0.62];
     let a = axis.normalized().unwrap_or(Point3::Z);
-    let e1 = a.cross(if a.z.abs() < 0.9 { Point3::Z } else { Point3::X }).normalized().unwrap_or(Point3::X);
+    let e1 = brep_cam::geom::perpendicular(a);
     let e2 = a.cross(e1);
     let at = |radius: f64, height: f64, angle: f64| -> Point3 {
         to_model.apply_point(tip.add(a.scale(height)).add(e1.scale(radius * angle.cos())).add(e2.scale(radius * angle.sin())))
@@ -240,20 +240,18 @@ pub fn marks_group(marks: &[Marker], to_model: &RigidTransform) -> Value {
 
 /// ASCII STL of the stock mesh in MODEL coordinates.
 pub fn stock_stl(mesh: &StockMesh, to_model: &RigidTransform, name: &str) -> String {
-    let mut out = String::with_capacity(mesh.triangle_count() * 160 + 64);
-    out.push_str(&format!("solid {name}\n"));
-    for i in 0..mesh.triangle_count() {
-        let tri = mesh.triangle(i);
-        let nrm = to_model.apply_vector(tri[1].sub(tri[0]).cross(tri[2].sub(tri[0])).normalized().unwrap_or(Point3::Z));
-        out.push_str(&format!("  facet normal {} {} {}\n    outer loop\n", nrm.x, nrm.y, nrm.z));
-        for p in tri {
-            let q = to_model.apply_point(p);
-            out.push_str(&format!("      vertex {} {} {}\n", q.x, q.y, q.z));
-        }
-        out.push_str("    endloop\n  endfacet\n");
-    }
-    out.push_str(&format!("endsolid {name}\n"));
-    out
+    brep_kernel::write_ascii_stl(
+        name,
+        (0..mesh.triangle_count()).map(|i| {
+            let tri = mesh.triangle(i);
+            let nrm = to_model.apply_vector(tri[1].sub(tri[0]).cross(tri[2].sub(tri[0])).normalized().unwrap_or(Point3::Z));
+            let corners = tri.map(|p| {
+                let q = to_model.apply_point(p);
+                [q.x, q.y, q.z]
+            });
+            ([nrm.x, nrm.y, nrm.z], corners)
+        }),
+    )
 }
 
 /// The simulation's door to the background runner (lane C17b): the app's

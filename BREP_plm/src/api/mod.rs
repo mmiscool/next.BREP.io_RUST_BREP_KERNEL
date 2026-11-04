@@ -270,9 +270,10 @@ pub fn router(db: Shared) -> Router {
         // -- workspaces: each user's folders of links and files -------------
         .route("/api/workspaces", get(workspace::list_workspaces))
         .route("/api/workspace/entries", get(workspace::list_folder))
-        .route("/api/workspace/folders", post(workspace::create_folder))
+        .route("/api/workspace/folders", get(workspace::list_folders).post(workspace::create_folder))
         .route("/api/workspace/links", get(workspace::folders_linking).post(workspace::create_link))
-        .route("/api/workspace/files", post(workspace::create_file))
+        .route("/api/workspace/files", get(workspace::list_files).post(workspace::create_file))
+        .route("/api/workspace/copies", post(workspace::create_copy))
         .route(
             "/api/workspace/entries/:id",
             get(workspace::get_entry).patch(workspace::update_entry).delete(workspace::delete_entry),

@@ -46,7 +46,7 @@ pub(crate) struct CanonicalReport {
 /// Whether the import lanes canonicalise carriers: on unless
 /// `BREP_CANONICAL_CARRIERS=0` restores the verbatim import.
 pub(crate) fn canonical_carriers_enabled() -> bool {
-    std::env::var("BREP_CANONICAL_CARRIERS").as_deref() != Ok("0")
+    switch!(live "BREP_CANONICAL_CARRIERS", true)
 }
 
 const PLANE_TOLERANCE: f64 = 1e-9;

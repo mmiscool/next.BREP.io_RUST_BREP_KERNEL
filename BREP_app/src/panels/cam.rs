@@ -38,6 +38,15 @@ pub enum CamRequest {
 }
 
 /// The document's `cam` block, or why it cannot be read.
+/// The handle an operation row shows for its tool: the tool's NUMBER as the
+/// Tool Library row shows it ("T1"), not its record id ("T2") — the two read
+/// as different tools when the ids and the numbers drifted apart
+/// (ui-polish-2026-10-28 row 6). A tool the document no longer holds keeps
+/// its id, which is the honest reading of a dangling reference.
+fn tool_handle(doc: &CamDocument, tool: &brep_cam::model::ToolId) -> String {
+    doc.tools.iter().find(|t| &t.id == tool).map_or_else(|| tool.to_string(), |t| format!("T{}", t.number))
+}
+
 pub fn cam_document(state: &EngineState) -> Result<CamDocument, String> {
     cam_doc::load(state.history.cam_block())
 }
@@ -1065,7 +1074,7 @@ impl CamPanel {
                             for op in ops {
                                 let op_id = op.id.as_str();
                                 let status = cam_generate::status_of(state, &doc, op_id);
-                                let text = format!("{} {}  \u{00b7} {} \u{00b7} {}{}", status.mark(), op.name, op.strategy.kind_name(), op.tool, if op.enabled { "" } else { " \u{00b7} off" });
+                                let text = format!("{} {}  \u{00b7} {} \u{00b7} {}{}", status.mark(), op.name, op.strategy.kind_name(), tool_handle(&doc, &op.tool), if op.enabled { "" } else { " \u{00b7} off" });
                                 ui.horizontal(|ui| {
                                     let hover = match &status {
                                         cam_generate::OpStatus::Ok { motions, cutting_length } => format!("generated: {motions} motions, {cutting_length:.2} cutting"),

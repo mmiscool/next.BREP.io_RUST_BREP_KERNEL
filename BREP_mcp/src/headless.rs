@@ -4,7 +4,7 @@
 //! own envelope and reply types are converted at the boundary.
 use crate::annotate::{Annotated, Annotation};
 use brep_app::app::BrepApp;
-use brep_app::automation::command::{Envelope as AppEnvelope, Reply as AppReply};
+use brep_app::automation::command::Envelope as AppEnvelope;
 use brep_app::automation::AppOptions;
 use brep_mcp_core::host::{HostConfig, HostHandle, HostInfo, HostRequest, Reply};
 use egui_kittest::Harness;
@@ -28,6 +28,27 @@ pub struct HeadlessConfig {
     /// it finishes at all. Sixty seconds to match the other liveness guards in
     /// the UI-side suites.
     pub settle_limit: Duration,
+    /// The server's code mode: the app's JavaScript editor runs on it.
+    pub scripts: Option<brep_mcp_core::cad::LocalScripts>,
+}
+
+/// The editor's runner in a headless session: the serving `brep-mcp`'s own
+/// code mode, as an agent's `run_script` reaches it.
+struct EditorScripts(brep_mcp_core::cad::LocalScripts);
+
+impl brep_app::javascript::ScriptHost for EditorScripts {
+    fn ready(&self) -> Result<bool, String> {
+        self.0.ready()
+    }
+    fn run(&self, source: &str) -> Result<String, String> {
+        self.0.run(source)
+    }
+    fn result(&self, id: &str) -> Result<Option<serde_json::Value>, String> {
+        self.0.result(id)
+    }
+    fn halt(&self, id: &str) -> Result<(), String> {
+        self.0.halt(id)
+    }
 }
 
 impl Default for HeadlessConfig {
@@ -40,23 +61,14 @@ impl Default for HeadlessConfig {
             store_dir: std::env::temp_dir().join("brep-mcp-store"),
             max_steps: 600,
             settle_limit: Duration::from_secs(60),
+            scripts: None,
         }
     }
 }
 
 impl From<HostConfig> for HeadlessConfig {
     fn from(c: HostConfig) -> Self {
-        Self { width: c.width, height: c.height, ppp: c.ppp, seed: c.seed, store_dir: c.store_dir, ..Self::default() }
-    }
-}
-
-/// The app's reply in the server's shape: the same JSON, the blob beside it.
-fn convert(mut r: AppReply) -> Reply {
-    let blob = r.blob.take();
-    let (id, frame) = (r.id, r.frame);
-    match serde_json::to_value(&r).map_err(|e| e.to_string()).and_then(|v| Reply::from_app(v, blob)) {
-        Ok(reply) => reply,
-        Err(e) => Reply::err(id, frame, e),
+        Self { width: c.width, height: c.height, ppp: c.ppp, seed: c.seed, store_dir: c.store_dir, scripts: c.scripts, ..Self::default() }
     }
 }
 
@@ -87,6 +99,12 @@ fn take_panic() -> Option<String> {
 
 /// Spawn the host thread; returns once the app is built and its seed history
 /// has settled, or with the build error.
+/// `BREP_FRAME_TRACE=1`: report slow host steps and commands on stderr.
+fn trace_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("BREP_FRAME_TRACE").is_some_and(|v| v == "1"))
+}
+
 pub fn spawn(cfg: impl Into<HeadlessConfig>) -> Result<HostHandle, String> {
     let cfg: HeadlessConfig = cfg.into();
     install_panic_hook();
@@ -129,33 +147,47 @@ pub fn spawn(cfg: impl Into<HeadlessConfig>) -> Result<HostHandle, String> {
             }
             let _ = ready_tx.send(Ok(info));
 
-            while let Some(req) = rx.blocking_recv() {
+            // Commands are served CONCURRENTLY, as the desktop host serves
+            // them (a task per command): each is submitted to the app queue
+            // on arrival and answered on the frame its reply comes, so a
+            // command the queue is polling for seconds (`Outcome::Poll`)
+            // never holds a `frame_info` behind it. Frames step while any
+            // command is in flight; the thread blocks only when none is.
+            struct InFlight {
+                id: u64,
+                cmd: String,
+                rx: std::sync::mpsc::Receiver<brep_app::automation::command::Reply>,
+                reply: tokio::sync::oneshot::Sender<Reply>,
+                steps: u32,
+                started: Instant,
+            }
+            let mut inflight: Vec<InFlight> = Vec::new();
+            let mut stopping = false;
+            loop {
+                let req = if stopping {
+                    None
+                } else if inflight.is_empty() {
+                    match rx.blocking_recv() {
+                        Some(req) => Some(req),
+                        None => break,
+                    }
+                } else {
+                    match rx.try_recv() {
+                        Ok(req) => Some(req),
+                        Err(tokio::sync::mpsc::error::TryRecvError::Empty) => None,
+                        Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                            stopping = true;
+                            None
+                        }
+                    }
+                };
                 match req {
-                    HostRequest::Stop => break,
-                    HostRequest::Command { envelope, reply } => {
+                    Some(HostRequest::Stop) => stopping = true,
+                    Some(HostRequest::Command { envelope, reply }) => {
                         let id = envelope.id;
+                        let cmd = envelope.cmd.clone();
                         let rx_reply = queue.submit(AppEnvelope { id, cmd: envelope.cmd, args: envelope.args });
-                        let mut steps = 0u32;
-                        let result = loop {
-                            if let Ok(r) = rx_reply.try_recv() {
-                                break convert(r);
-                            }
-                            if queue.is_poisoned() {
-                                break Reply::err(id, queue.frame(), "session poisoned");
-                            }
-                            if steps >= cfg.max_steps {
-                                break Reply::err(id, queue.frame(), format!("no reply after {} frames", cfg.max_steps));
-                            }
-                            if let Err(why) = step(&mut harness, &queue, ppp) {
-                                queue.poison(why.clone());
-                                break Reply::err(id, queue.frame(), why);
-                            }
-                            steps += 1;
-                            if steps > 2 {
-                                std::thread::sleep(Duration::from_millis(2));
-                            }
-                        };
-                        let _ = reply.send(result);
+                        inflight.push(InFlight { id, cmd, rx: rx_reply, reply, steps: 0, started: Instant::now() });
                     }
                     // The DOCS ANNOTATION overlay (`crate::annotate`): set the
                     // caption and the ring, then draw one frame so the next
@@ -163,7 +195,7 @@ pub fn spawn(cfg: impl Into<HeadlessConfig>) -> Result<HostHandle, String> {
                     // The keys are checked HERE, against what the app is
                     // publishing right now, so a renamed control fails the
                     // walkthrough by name instead of dropping its highlight.
-                    HostRequest::Annotate { spec, reply } => {
+                    Some(HostRequest::Annotate { spec, reply }) => {
                         let result = (|| {
                             let note = Annotation::parse(&spec)?;
                             let missing = crate::annotate::unknown_keys(&note.highlight);
@@ -180,7 +212,7 @@ pub fn spawn(cfg: impl Into<HeadlessConfig>) -> Result<HostHandle, String> {
                         })();
                         let _ = reply.send(result);
                     }
-                    HostRequest::Screenshot { region, reply } => {
+                    Some(HostRequest::Screenshot { region, reply }) => {
                         let result = (|| {
                             step(&mut harness, &queue, ppp)?;
                             let image = harness.render().map_err(|e| format!("headless render: {e}"))?;
@@ -199,6 +231,57 @@ pub fn spawn(cfg: impl Into<HeadlessConfig>) -> Result<HostHandle, String> {
                         })();
                         let _ = reply.send(result);
                     }
+                    None => {}
+                }
+                if stopping && inflight.is_empty() {
+                    break;
+                }
+                // Answer what has replied (or failed) before stepping again.
+                let mut i = 0;
+                while i < inflight.len() {
+                    let f = &inflight[i];
+                    let done = if let Ok(r) = f.rx.try_recv() {
+                        Some(r.into_host())
+                    } else if queue.is_poisoned() {
+                        Some(Reply::err(f.id, queue.frame(), "session poisoned"))
+                    } else if f.steps >= cfg.max_steps && !queue.is_polling(f.id) {
+                        // A command the queue is POLLING has started work that
+                        // lands on later frames: it keeps its frames, bounded
+                        // by its own deadline.
+                        Some(Reply::err(f.id, queue.frame(), format!("no reply after {} frames", cfg.max_steps)))
+                    } else {
+                        None
+                    };
+                    match done {
+                        Some(result) => {
+                            let f = inflight.swap_remove(i);
+                            if trace_on() && f.started.elapsed() > Duration::from_millis(1000) {
+                                eprintln!("[frame-trace] headless command {} took {} ms over {} frame(s)", f.cmd, f.started.elapsed().as_millis(), f.steps);
+                            }
+                            let _ = f.reply.send(result);
+                        }
+                        None => i += 1,
+                    }
+                }
+                if inflight.is_empty() {
+                    continue;
+                }
+                let stepped = Instant::now();
+                if let Err(why) = step(&mut harness, &queue, ppp) {
+                    queue.poison(why.clone());
+                    for f in inflight.drain(..) {
+                        let _ = f.reply.send(Reply::err(f.id, queue.frame(), why.clone()));
+                    }
+                    continue;
+                }
+                if trace_on() && stepped.elapsed() > Duration::from_millis(250) {
+                    eprintln!("[frame-trace] headless step {} ms", stepped.elapsed().as_millis());
+                }
+                for f in &mut inflight {
+                    f.steps += 1;
+                }
+                if inflight.iter().all(|f| f.steps > 2) {
+                    std::thread::sleep(Duration::from_millis(2));
                 }
             }
         })
@@ -264,6 +347,7 @@ fn gpu_setup() -> Option<eframe::egui_wgpu::WgpuSetup> {
 fn build(cfg: &HeadlessConfig) -> Result<(App, HostInfo), String> {
     std::fs::create_dir_all(&cfg.store_dir).map_err(|e| format!("store dir {}: {e}", cfg.store_dir.display()))?;
     let store_dir = cfg.store_dir.clone();
+    let scripts = cfg.scripts.clone();
     let seed = cfg.seed;
     let adapter = Arc::new(Mutex::new(String::new()));
     let adapter_out = adapter.clone();
@@ -288,8 +372,11 @@ fn build(cfg: &HeadlessConfig) -> Result<(App, HostInfo), String> {
                 );
             }
             let store = brep_app::store::native_store_at(store_dir.clone());
-            let app = BrepApp::new_with(cc, AppOptions { store: Some(store), seed })
+            let mut app = BrepApp::new_with(cc, AppOptions { store: Some(store), seed })
                 .expect("BrepApp::new_with under kittest");
+            if let Some(scripts) = scripts.clone() {
+                app.set_script_host(Box::new(EditorScripts(scripts)));
+            }
             // The app's OWN diagnostics, not a second reading of the same
             // adapter: `HostInfo.adapter`, the `diagnostics` command and the
             // Info window must all name the same device (brep_app::diagnostics).

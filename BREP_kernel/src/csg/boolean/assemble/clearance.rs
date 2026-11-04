@@ -4,9 +4,9 @@
 //! nor a local closest-point solve can authorize clearance.
 //! The outward padding is engineering floating point, not interval arithmetic.
 
-use crate::{FaceRecord, NurbsCurve, NurbsSurface, Vec4};
+use crate::{FaceRecord, NurbsCurve, NurbsSurface, Vec3, Vec4};
 pub(super) fn motion_trace_enabled() -> bool {
-    std::env::var_os("BREP_JOINT_MOTION_TRACE").is_some()
+    debug_flag!(live "BREP_JOINT_MOTION_TRACE")
 }
 pub(super) fn trace_motion(value: serde_json::Value) {
     let Some(path) = std::env::var_os("BREP_JOINT_MOTION_TRACE") else {
@@ -191,15 +191,11 @@ fn trimmed_carrier_box(face: &FaceRecord) -> Result<NurbsSurface, String> {
     }
     Ok(sf)
 }
-#[derive(Clone, Copy)]
-struct Bounds {
-    lo: [f64; 3],
-    hi: [f64; 3],
-}
+use crate::spatial::Aabb as Bounds;
 fn bounds<'a>(points: impl Iterator<Item = &'a Vec4>) -> Option<Bounds> {
     let mut b = Bounds {
-        lo: [f64::INFINITY; 3],
-        hi: [f64::NEG_INFINITY; 3],
+        minimum: Vec3::new(f64::INFINITY, f64::INFINITY, f64::INFINITY),
+        maximum: Vec3::new(f64::NEG_INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY),
     };
     for p in points {
         if !p.w.is_finite() || p.w <= 0. {
@@ -209,8 +205,8 @@ fn bounds<'a>(points: impl Iterator<Item = &'a Vec4>) -> Option<Bounds> {
             if !x.is_finite() {
                 return None;
             }
-            b.lo[i] = b.lo[i].min(x);
-            b.hi[i] = b.hi[i].max(x);
+            b.minimum[i] = b.minimum[i].min(x);
+            b.maximum[i] = b.maximum[i].max(x);
         }
     }
     Some(b)
@@ -246,16 +242,16 @@ impl CarrierRegion {
             }
             Self::Native { surface, uv } => {
                 let mut axis = if along_u { 0 } else { 1 };
-                if uv.hi[axis] == uv.lo[axis] {
+                if uv.maximum[axis] == uv.minimum[axis] {
                     axis = 1 - axis;
                 }
-                let mid = uv.lo[axis] + (uv.hi[axis] - uv.lo[axis]) * 0.5;
-                if mid <= uv.lo[axis] || mid >= uv.hi[axis] {
+                let mid = uv.minimum[axis] + (uv.maximum[axis] - uv.minimum[axis]) * 0.5;
+                if mid <= uv.minimum[axis] || mid >= uv.maximum[axis] {
                     return None;
                 }
                 let (mut a, mut b) = (*uv, *uv);
-                a.hi[axis] = mid;
-                b.lo[axis] = mid;
+                a.maximum[axis] = mid;
+                b.minimum[axis] = mid;
                 Some((
                     Self::Native {
                         surface: surface.clone(),
@@ -279,8 +275,8 @@ fn carrier_region(face: &FaceRecord) -> Result<CarrierRegion, String> {
         Err(e) => return Err(e),
     }
     let mut uv = Bounds {
-        lo: [f64::INFINITY, f64::INFINITY, 0.0],
-        hi: [f64::NEG_INFINITY, f64::NEG_INFINITY, 0.0],
+        minimum: Vec3::new(f64::INFINITY, f64::INFINITY, 0.0),
+        maximum: Vec3::new(f64::NEG_INFINITY, f64::NEG_INFINITY, 0.0),
     };
     for h in face
         .loops
@@ -292,8 +288,8 @@ fn carrier_region(face: &FaceRecord) -> Result<CarrierRegion, String> {
             return Err("unsupported native trim hull".into());
         }
         for (i, x) in [h.x / h.w, h.y / h.w].into_iter().enumerate() {
-            uv.lo[i] = uv.lo[i].min(x);
-            uv.hi[i] = uv.hi[i].max(x);
+            uv.minimum[i] = uv.minimum[i].min(x);
+            uv.maximum[i] = uv.maximum[i].max(x);
         }
     }
     let closed = face.surface.closed_directions()?;
@@ -302,10 +298,10 @@ fn carrier_region(face: &FaceRecord) -> Result<CarrierRegion, String> {
         (1, closed.1, face.surface.domain_v()?),
     ] {
         if periodic {
-            uv.lo[axis] = domain[0];
-            uv.hi[axis] = domain[1];
+            uv.minimum[axis] = domain[0];
+            uv.maximum[axis] = domain[1];
         }
-        if !uv.lo[axis].is_finite() || !uv.hi[axis].is_finite() {
+        if !uv.minimum[axis].is_finite() || !uv.maximum[axis].is_finite() {
             return Err("nonfinite native trim hull".into());
         }
     }
@@ -322,8 +318,8 @@ fn carrier_region(face: &FaceRecord) -> Result<CarrierRegion, String> {
 fn merge(a: Bounds, b: Bounds) -> Bounds {
     let mut c = a;
     for i in 0..3 {
-        c.lo[i] = c.lo[i].min(b.lo[i]);
-        c.hi[i] = c.hi[i].max(b.hi[i]);
+        c.minimum[i] = c.minimum[i].min(b.minimum[i]);
+        c.maximum[i] = c.maximum[i].max(b.maximum[i]);
     }
     c
 }
@@ -331,8 +327,8 @@ fn separate(a: Bounds, b: Bounds) -> bool {
     (0..3).any(|i| {
         let pad = 256.
             * f64::EPSILON
-            * (1. + a.lo[i].abs().max(a.hi[i].abs()) + b.lo[i].abs().max(b.hi[i].abs()));
-        a.hi[i] + pad < b.lo[i] || b.hi[i] + pad < a.lo[i]
+            * (1. + a.minimum[i].abs().max(a.maximum[i].abs()) + b.minimum[i].abs().max(b.maximum[i].abs()));
+        a.maximum[i] + pad < b.minimum[i] || b.maximum[i] + pad < a.minimum[i]
     })
 }
 /// A proposed continuous, covering monotone parameter correspondence. Closest
@@ -967,8 +963,8 @@ fn partial_bounds(sf: &NurbsSurface) -> Option<([f64; 3], [f64; 3], [f64; 3])> {
 fn general_trim_image_bounds(surface: &NurbsSurface, uv: Bounds) -> Option<Bounds> {
     let (u, v) = (surface.domain_u().ok()?, surface.domain_v().ok()?);
     let closed = surface.closed_directions().ok()?;
-    if (closed.0 && (uv.lo[0] < u[0] || uv.hi[0] > u[1]))
-        || (closed.1 && (uv.lo[1] < v[0] || uv.hi[1] > v[1]))
+    if (closed.0 && (uv.minimum[0] < u[0] || uv.maximum[0] > u[1]))
+        || (closed.1 && (uv.minimum[1] < v[0] || uv.maximum[1] > v[1]))
     {
         return None;
     }
@@ -976,8 +972,8 @@ fn general_trim_image_bounds(surface: &NurbsSurface, uv: Bounds) -> Option<Bound
     // snapped or failed split keeps the wider positive hull.
     let mut local = surface.clone();
     for (axis, domain) in [(0, u), (1, v)] {
-        let lo = uv.lo[axis].clamp(domain[0], domain[1]);
-        let hi = uv.hi[axis].clamp(domain[0], domain[1]);
+        let lo = uv.minimum[axis].clamp(domain[0], domain[1]);
+        let hi = uv.maximum[axis].clamp(domain[0], domain[1]);
         if hi - lo <= 8.0 * crate::KNOT_IDENTITY_TOL {
             continue;
         }
@@ -1008,9 +1004,9 @@ fn general_trim_image_bounds(surface: &NurbsSurface, uv: Bounds) -> Option<Bound
             }
         }
     }
-    if uv.lo[0] >= u[0] && uv.hi[0] <= u[1] && uv.lo[1] >= v[0] && uv.hi[1] <= v[1] {
-        let wu = uv.hi[0] - uv.lo[0];
-        let wv = uv.hi[1] - uv.lo[1];
+    if uv.minimum[0] >= u[0] && uv.maximum[0] <= u[1] && uv.minimum[1] >= v[0] && uv.maximum[1] <= v[1] {
+        let wu = uv.maximum[0] - uv.minimum[0];
+        let wv = uv.maximum[1] - uv.minimum[1];
         let thin_u = wu <= 8.0 * crate::KNOT_IDENTITY_TOL;
         let thin_v = wv <= 8.0 * crate::KNOT_IDENTITY_TOL;
         if !thin_u && !thin_v {
@@ -1018,20 +1014,20 @@ fn general_trim_image_bounds(surface: &NurbsSurface, uv: Bounds) -> Option<Bound
         }
         let (du, dv, _) = partial_bounds(&local)?;
         let mut result = if thin_u && !thin_v {
-            let c = local.iso_curve_u((uv.lo[0] + uv.hi[0]) * 0.5).ok()?;
-            let cp = super::image::restricted_controls(&c, uv.lo[1], uv.hi[1])?;
+            let c = local.iso_curve_u((uv.minimum[0] + uv.maximum[0]) * 0.5).ok()?;
+            let cp = super::image::restricted_controls(&c, uv.minimum[1], uv.maximum[1])?;
             bounds(cp.iter())?
         } else if thin_v && !thin_u {
-            let c = local.iso_curve_v((uv.lo[1] + uv.hi[1]) * 0.5).ok()?;
-            let cp = super::image::restricted_controls(&c, uv.lo[0], uv.hi[0])?;
+            let c = local.iso_curve_v((uv.minimum[1] + uv.maximum[1]) * 0.5).ok()?;
+            let cp = super::image::restricted_controls(&c, uv.minimum[0], uv.maximum[0])?;
             bounds(cp.iter())?
         } else {
             let p = surface
-                .evaluate_extended((uv.lo[0] + uv.hi[0]) * 0.5, (uv.lo[1] + uv.hi[1]) * 0.5)
+                .evaluate_extended((uv.minimum[0] + uv.maximum[0]) * 0.5, (uv.minimum[1] + uv.maximum[1]) * 0.5)
                 .ok()?;
             Bounds {
-                lo: [p.x, p.y, p.z],
-                hi: [p.x, p.y, p.z],
+                minimum: Vec3::new(p.x, p.y, p.z),
+                maximum: Vec3::new(p.x, p.y, p.z),
             }
         };
         for i in 0..3 {
@@ -1041,19 +1037,19 @@ fn general_trim_image_bounds(surface: &NurbsSurface, uv: Bounds) -> Option<Bound
             if !r.is_finite() {
                 return None;
             }
-            result.lo[i] -= r;
-            result.hi[i] += r;
+            result.minimum[i] -= r;
+            result.maximum[i] += r;
         }
         return Some(result);
     }
     let (du, dv, duv) = partial_bounds(&local)?;
     let excursion = |lo: f64, hi: f64, d: [f64; 2]| (d[0] - lo).max(hi - d[1]).max(0.0);
-    let outu = excursion(uv.lo[0], uv.hi[0], u);
-    let outv = excursion(uv.lo[1], uv.hi[1], v);
+    let outu = excursion(uv.minimum[0], uv.maximum[0], u);
+    let outv = excursion(uv.minimum[1], uv.maximum[1], v);
     let mut anchors = uv;
     for (axis, domain) in [(0, u), (1, v)] {
-        anchors.lo[axis] = uv.lo[axis].clamp(domain[0], domain[1]);
-        anchors.hi[axis] = uv.hi[axis].clamp(domain[0], domain[1]);
+        anchors.minimum[axis] = uv.minimum[axis].clamp(domain[0], domain[1]);
+        anchors.maximum[axis] = uv.maximum[axis].clamp(domain[0], domain[1]);
     }
     let mut b = general_trim_image_bounds(surface, anchors)?;
     for i in 0..3 {
@@ -1061,9 +1057,9 @@ fn general_trim_image_bounds(surface: &NurbsSurface, uv: Bounds) -> Option<Bound
         if !radius.is_finite() {
             return None;
         }
-        let pad = 1024.0 * f64::EPSILON * (1.0 + b.lo[i].abs().max(b.hi[i].abs()) + radius);
-        b.lo[i] -= radius + pad;
-        b.hi[i] += radius + pad;
+        let pad = 1024.0 * f64::EPSILON * (1.0 + b.minimum[i].abs().max(b.maximum[i].abs()) + radius);
+        b.minimum[i] -= radius + pad;
+        b.maximum[i] += radius + pad;
     }
     Some(b)
 }
@@ -1092,8 +1088,8 @@ fn trim_image_bounds(surface: &NurbsSurface, uv: Bounds) -> Option<Bounds> {
             return None;
         }
         let mut corners = Vec::new();
-        for u in [uv.lo[0], uv.hi[0]] {
-            for v in [uv.lo[1], uv.hi[1]] {
+        for u in [uv.minimum[0], uv.maximum[0]] {
+            for v in [uv.minimum[1], uv.maximum[1]] {
                 corners.push(Vec4::from_point(surface.evaluate_extended(u, v).ok()?, 1.0));
             }
         }
@@ -1109,15 +1105,15 @@ fn trim_image_bounds(surface: &NurbsSurface, uv: Bounds) -> Option<Bounds> {
     let (du, dv) = (sf.domain_u().ok()?, sf.domain_v().ok()?);
     let closed = sf.closed_directions().ok()?;
     let linear_v = sf.control_points.iter().all(|r| r[0].w == r[1].w);
-    if (!closed.0 && (uv.lo[0] < du[0] || uv.hi[0] > du[1]))
-        || (!closed.1 && !linear_v && (uv.lo[1] < dv[0] || uv.hi[1] > dv[1]))
+    if (!closed.0 && (uv.minimum[0] < du[0] || uv.maximum[0] > du[1]))
+        || (!closed.1 && !linear_v && (uv.minimum[1] < dv[0] || uv.maximum[1] > dv[1]))
     {
         return None;
     }
-    let ur = if closed.0 && (uv.lo[0] < du[0] || uv.hi[0] > du[1]) {
+    let ur = if closed.0 && (uv.minimum[0] < du[0] || uv.maximum[0] > du[1]) {
         du
     } else {
-        [uv.lo[0].max(du[0]), uv.hi[0].min(du[1])]
+        [uv.minimum[0].max(du[0]), uv.maximum[0].min(du[1])]
     };
     let thin = ur[1] - ur[0] <= 8.0 * crate::KNOT_IDENTITY_TOL;
     if !thin && ur[0] > du[0] {
@@ -1134,7 +1130,7 @@ fn trim_image_bounds(surface: &NurbsSurface, uv: Bounds) -> Option<Bounds> {
             }
         }
     }
-    let vr = if closed.1 { dv } else { [uv.lo[1], uv.hi[1]] };
+    let vr = if closed.1 { dv } else { [uv.minimum[1], uv.maximum[1]] };
     let mut controls = Vec::new();
     for row in &sf.control_points {
         let mut corners = Vec::new();
@@ -1169,8 +1165,8 @@ fn trim_image_bounds(surface: &NurbsSurface, uv: Bounds) -> Option<Bounds> {
         let derivative = derivative_u_bound(&reboxed)?;
         for i in 0..3 {
             let error = derivative[i] * (ur[1] - ur[0]) * 0.5;
-            bound.lo[i] -= error;
-            bound.hi[i] += error;
+            bound.minimum[i] -= error;
+            bound.maximum[i] += error;
         }
         Some(bound)
     } else {

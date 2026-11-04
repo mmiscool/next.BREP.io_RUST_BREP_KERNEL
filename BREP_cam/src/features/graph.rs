@@ -49,7 +49,7 @@ pub struct FaceGraph {
 }
 
 fn key(p: Point3) -> (u64, u64, u64) {
-    (p.x.to_bits(), p.y.to_bits(), p.z.to_bits())
+    (crate::geom::canonical_bits(p.x), crate::geom::canonical_bits(p.y), crate::geom::canonical_bits(p.z))
 }
 
 impl FaceGraph {

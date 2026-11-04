@@ -232,6 +232,11 @@ pub fn child_guides(guides: &[bool], is_last: bool) -> Vec<bool> {
 /// The whole row is a click target: read [`NodeResponse::clicked`], which is the
 /// band and the label together. [`NodeResponse::label`] remains the reorder
 /// drag handle and the source of a text-keyed hover.
+/// The hover band's colour: egui's own hovered-widget fill, faint.
+pub(crate) fn hover_band_fill(visuals: &egui::Visuals) -> egui::Color32 {
+    visuals.widgets.hovered.weak_bg_fill.gamma_multiply(0.5)
+}
+
 pub fn node(
     ui: &mut egui::Ui,
     row: TreeRow,
@@ -402,6 +407,16 @@ pub fn node(
         },
     );
     let band = outer.response;
+    // A row under the pointer takes a faint band, so a long tree shows which
+    // row a click will land on before the click (ui-polish-2026-10-28 row 13).
+    // Painted into the selection band's own slot: no layout moves, and a
+    // selected row keeps its selection colour.
+    if !row.highlighted && !row.root && band.contains_pointer() && ui.ctx().dragged_id().is_none() {
+        ui.painter().set(
+            highlight,
+            egui::epaint::RectShape::filled(band.rect, 0.0, hover_band_fill(ui.visuals())),
+        );
+    }
     if row.highlighted && !row.root {
         ui.painter().set(
             highlight,

@@ -1,6 +1,6 @@
 //! Read the state registry and the hit-key registry; drain notices; dismiss
 //! toasts before a deterministic capture.
-use crate::automation::command::{parse_args, schema_of, Annotations, CommandSpec, Ctx, Empty, Handler, NoArgs, Notice, Outcome, Phase};
+use crate::automation::command::{app_command, parse_args, schema_of, CommandSpec, Ctx, NoArgs, Notice, Outcome};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::collections::BTreeMap;
@@ -66,6 +66,21 @@ fn state_list(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
     serde_json::to_value(StateList { entries }).map(Outcome::Done).map_err(|e| e.to_string())
 }
 
+// Publisher values may be arbitrary JSON or unparsed text. Runtime
+// state_schema supplies the optional schema for each requested name.
+fn state_get_result_schema() -> Value {
+    json!({"type":"object","additionalProperties":true,
+        "description":"Requested state names mapped to publisher JSON or raw text; consult state_schema for typed publishers."})
+}
+fn toasts_raise_result_schema() -> Value {
+    json!({"type":"object","properties":{"raised":{"type":"integer","minimum":0}},
+        "required":["raised"],"additionalProperties":false})
+}
+fn toasts_dismiss_result_schema() -> Value {
+    json!({"type":"object","properties":{"dismissed":{"type":"integer","minimum":0}},
+        "required":["dismissed"],"additionalProperties":false})
+}
+
 fn state_get(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
     let a: StateGetArgs = parse_args(args)?;
     let _ = ctx;
@@ -81,6 +96,16 @@ fn state_get(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
         }
     }
     Ok(Outcome::Done(Value::Object(out)))
+}
+
+// State names and examples are intentionally dynamic. Every named entry has
+// a stable envelope, including an explicit null schema for untyped publishers.
+fn state_schema_result_schema() -> Value {
+    json!({"type":"object","additionalProperties":{
+        "type":"object",
+        "properties":{"doc":{"type":"string"},"schema":{},"example":{}},
+        "required":["doc","schema","example"],"additionalProperties":false
+    }})
 }
 
 fn state_schema(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
@@ -108,6 +133,15 @@ fn hit_rects(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
     serde_json::to_value(HitRects { rects, ppp: ctx.egui.pixels_per_point(), frame: ctx.egui.cumulative_frame_nr() })
         .map(Outcome::Done)
         .map_err(|e| e.to_string())
+}
+
+fn hit_key_docs_result_schema() -> Value {
+    json!({"type":"object","properties":{"keys":{"type":"array","items":{
+        "type":"object","properties":{
+            "panel":{"type":"string"},"prefix":{"type":"string"},
+            "meaning":{"type":"string"},"command":{"type":["string","null"]}
+        },"required":["panel","prefix","meaning","command"],"additionalProperties":false
+    }}},"required":["keys"],"additionalProperties":false})
 }
 
 fn hit_key_docs(_ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
@@ -164,12 +198,12 @@ fn toasts_raise(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
 }
 
 pub static COMMANDS: &[CommandSpec] = &[
-    CommandSpec { name: "state_list", group: "state", doc: "Every state blob the app publishes this frame, with its doc line and whether a schema is known.", phase: Phase::Read, annotations: Annotations::READ, args_schema: schema_of::<NoArgs>, result_schema: schema_of::<StateList>, handler: Handler::App(state_list) },
-    CommandSpec { name: "state_get", group: "state", doc: "Read named state blobs, parsed as JSON, from this frame's layout.", phase: Phase::Read, annotations: Annotations::READ, args_schema: schema_of::<StateGetArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(state_get) },
-    CommandSpec { name: "state_schema", group: "state", doc: "The JSON Schema of named state blobs (where a blob is published from a typed value) and each one's current value as an example. Takes `names`, like `state_get`.", phase: Phase::Read, annotations: Annotations::READ, args_schema: schema_of::<StateSchemaArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(state_schema) },
-    CommandSpec { name: "hit_rects", group: "widgets", doc: "Every clickable widget the app published this frame as `panel/key` → [x, y, w, h] in egui points. `panel/panel:clip` is a pane's visible region; a rect outside it must be scrolled into view first.", phase: Phase::Read, annotations: Annotations::READ, args_schema: schema_of::<HitRectsArgs>, result_schema: schema_of::<HitRects>, handler: Handler::App(hit_rects) },
-    CommandSpec { name: "hit_key_docs", group: "widgets", doc: "The documented hit-key prefixes per panel: what each `panel/key` means.", phase: Phase::Read, annotations: Annotations::READ, args_schema: schema_of::<NoArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(hit_key_docs) },
-    CommandSpec { name: "notices", group: "state", doc: "Drain the notices (panics, logged errors, runner refusals, toasts) that arrived since the last drain.", phase: Phase::Read, annotations: Annotations::READ, args_schema: schema_of::<NoArgs>, result_schema: schema_of::<Notices>, handler: Handler::App(notices) },
-    CommandSpec { name: "toasts_raise", group: "state", doc: "Queue `texts` as engine notices, so each shows as a toast (and drains from `notices`) from the next frame, as a refusal's would — for checking the toast overlay itself: its cap, its coalescing of repeats, where its cards sit, and (`severity`: error, the default, warning or info) how each kind is drawn.", phase: Phase::Mutate, annotations: Annotations::MUTATE_NOWAIT, args_schema: schema_of::<ToastsRaiseArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(toasts_raise) },
-    CommandSpec { name: "toasts_dismiss", group: "state", doc: "Dismiss every toast so a capture is deterministic; their text stays in `notices`.", phase: Phase::Mutate, annotations: Annotations::MUTATE_NOWAIT, args_schema: schema_of::<NoArgs>, result_schema: schema_of::<Empty>, handler: Handler::App(toasts_dismiss) },
+    app_command!("state", "state_list", "Every state blob the app publishes this frame, with its doc line and whether a schema is known.", NoArgs, state_list, Read, READ, schema_of::<StateList>),
+    app_command!("state", "state_get", "Read named state blobs, parsed as JSON, from this frame's layout.", StateGetArgs, state_get, Read, READ, state_get_result_schema),
+    app_command!("state", "state_schema", "The JSON Schema of named state blobs (where a blob is published from a typed value) and each one's current value as an example. Takes `names`, like `state_get`.", StateSchemaArgs, state_schema, Read, READ, state_schema_result_schema),
+    app_command!("widgets", "hit_rects", "Every clickable widget the app published this frame as `panel/key` → [x, y, w, h] in egui points. `panel/panel:clip` is a pane's visible region; a rect outside it must be scrolled into view first.", HitRectsArgs, hit_rects, Read, READ, schema_of::<HitRects>),
+    app_command!("widgets", "hit_key_docs", "The documented hit-key prefixes per panel: what each `panel/key` means.", NoArgs, hit_key_docs, Read, READ, hit_key_docs_result_schema),
+    app_command!("state", "notices", "Drain the notices (panics, logged errors, runner refusals, toasts) that arrived since the last drain.", NoArgs, notices, Read, READ, schema_of::<Notices>),
+    app_command!("state", "toasts_raise", "Queue `texts` as engine notices, so each shows as a toast (and drains from `notices`) from the next frame, as a refusal's would — for checking the toast overlay itself: its cap, its coalescing of repeats, where its cards sit, and (`severity`: error, the default, warning or info) how each kind is drawn.", ToastsRaiseArgs, toasts_raise, Mutate, MUTATE_NOWAIT, toasts_raise_result_schema),
+    app_command!("state", "toasts_dismiss", "Dismiss every toast so a capture is deterministic; their text stays in `notices`.", NoArgs, toasts_dismiss, Mutate, MUTATE_NOWAIT, toasts_dismiss_result_schema),
 ];

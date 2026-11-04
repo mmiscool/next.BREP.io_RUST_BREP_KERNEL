@@ -21,7 +21,7 @@ fn curve_subrange(
     // errors with a parameter exactly at the new domain start.
     if second < domain[1] - epsilon && second > domain[0] + epsilon {
         result = result.split(second).or_refuse(KernelStage::Sew, "split")?.0;
-    } else if std::env::var("BREP_DEBUG_SUBRANGE").is_ok() && second < domain[1] - epsilon {
+    } else if env_read!("BREP_DEBUG_SUBRANGE").is_some() && second < domain[1] - epsilon {
         eprintln!("abnormal subrange skip in curve_subrange");
     }
     Ok(result)

@@ -489,6 +489,7 @@ pub(crate) struct BoardView {
     /// The Inspector's widgets, `inspector:<thing>`, where [`Editor::board_inspector`]
     /// last drew them, published with the canvas's hits ([`Editor::board_hits`]).
     inspector: InspectorHits,
+    toolbar_hits: InspectorHits,
     /// The canvas's right-click menu's entries, `menuitem:<entry>`, while it is open.
     menu: Vec<(String, Rect)>,
     /// The pass the canvas was last drawn in.
@@ -538,6 +539,7 @@ impl Default for BoardView {
             unrouted: 0,
             canvas: Rect::from_min_size(Pos2::ZERO, Vec2::new(800., 600.)),
             inspector: InspectorHits::default(),
+            toolbar_hits: InspectorHits::default(),
             menu: vec![],
             canvas_pass: 0,
             zone_draft: vec![],
@@ -1854,13 +1856,11 @@ impl Editor {
             let layers: Vec<&'static Action<Editor>> = crate::actions::actions()
                 .filter(|a| a.group == ActionGroup::Layer && a.offered(self))
                 .collect();
-            egui::ComboBox::from_id_salt("active-layer")
-                .selected_text(layer_name(layer, count))
-                .show_ui(ui, |ui| {
-                    for (l, action) in (0..).zip(&layers) {
-                        ui.selectable_value(&mut layer, l, action.caption(self));
-                    }
-                });
+            let labels: Vec<_> = layers.iter().map(|action| action.caption(self)).collect();
+            let choices: Vec<_> = layers.iter().zip(&labels).enumerate()
+                .map(|(l, (action, label))| (l as u8, action.id, label.as_str())).collect();
+            self.board_view.toolbar_hits.begin(ui.ctx());
+            self.board_view.toolbar_hits.enum_dropdown(ui, "active_layer", &choices, &mut layer);
             if layer != self.board_view.active_layer {
                 self.run_action(layers[usize::from(layer)].id);
             }
@@ -2204,14 +2204,11 @@ impl Editor {
         ui.horizontal(|ui| {
             ui.label("Layer");
             let mut layer = zone.layer;
-            let combo = egui::ComboBox::from_id_salt("zone_layer")
-                .selected_text(layer_name(layer, count))
-                .show_ui(ui, |ui| {
-                    for l in 0..count {
-                        ui.selectable_value(&mut layer, l, layer_name(l, count));
-                    }
-                });
-            self.board_view.inspector.mark("zone_layer", &combo.response);
+            let ids: Vec<_> = (0..count).map(|l| l.to_string()).collect();
+            let labels: Vec<_> = (0..count).map(|l| layer_name(l, count)).collect();
+            let choices: Vec<_> = ids.iter().zip(&labels).enumerate()
+                .map(|(l, (id, label))| (l as u8, id.as_str(), label.as_str())).collect();
+            self.board_view.inspector.enum_dropdown(ui, "zone_layer", &choices, &mut layer);
             if layer != zone.layer {
                 edit = Some(Box::new(move |z| z.layer = layer));
                 settle = true;
@@ -2499,36 +2496,13 @@ impl Editor {
         ui.add_enabled_ui(!self.routing(), |ui| {
             ui.horizontal(|ui| {
                 ui.label("Vias");
-                let combo = egui::ComboBox::from_id_salt("autoroute-vias")
-                    .selected_text(via_policy_name(policy))
-                    .show_ui(ui, |ui| {
-                        for (option, hint) in [
-                            (
-                                ViaPolicy::Avoid,
-                                "Route as Allow does, then reroute each net that has vias, keeping a route without them wherever one exists. Connects the same nets as Allow; takes longer.",
-                            ),
-                            (
-                                ViaPolicy::Allow,
-                                "Use a via whenever it makes the route noticeably shorter.",
-                            ),
-                            (
-                                ViaPolicy::Never,
-                                "Keep every connection on one layer. Connections that need a via stay unrouted.",
-                            ),
-                        ] {
-                            let choice = ui
-                                .selectable_value(&mut policy, option, via_policy_name(option))
-                                .on_hover_text(hint);
-                            self.board_view.inspector.mark(
-                                format!("vias:{}", key_word(via_policy_name(option).split(' ').next().unwrap_or(""))),
-                                &choice,
-                            );
-                        }
-                    });
-                let combo = combo
-                    .response
-                    .on_hover_text("How the autorouter uses vias. Saved with the board.");
-                self.board_view.inspector.mark("vias", &combo);
+                let choices = [
+                    (ViaPolicy::Avoid, "avoid", via_policy_name(ViaPolicy::Avoid)),
+                    (ViaPolicy::Allow, "allow", via_policy_name(ViaPolicy::Allow)),
+                    (ViaPolicy::Never, "never", via_policy_name(ViaPolicy::Never)),
+                ];
+                self.board_view.inspector.enum_dropdown(ui, "vias", &choices, &mut policy)
+                    .on_hover_text("How the autorouter uses vias. Saved with the board.\nAvoid: route as Allow, then reroute nets to remove vias wherever possible.\nAllow: use vias for noticeably shorter routes.\nNever: keep each connection on one layer; connections that need vias stay unrouted.");
             });
         });
         if policy != current {
@@ -2742,15 +2716,8 @@ impl Editor {
         ui.horizontal(|ui| {
             ui.label("Copper layers");
             let mut count = self.document.board.layer_count;
-            let combo = egui::ComboBox::from_id_salt("layer-count")
-                .selected_text(count.to_string())
-                .show_ui(ui, |ui| {
-                    for n in [1u8, 2, 4, 6] {
-                        let choice = ui.selectable_value(&mut count, n, n.to_string());
-                        self.board_view.inspector.mark(format!("copper_layers:{n}"), &choice);
-                    }
-                });
-            self.board_view.inspector.mark("copper_layers", &combo.response);
+            let choices = [(1u8, "1", "1"), (2, "2", "2"), (4, "4", "4"), (6, "6", "6")];
+            self.board_view.inspector.enum_dropdown(ui, "copper_layers", &choices, &mut count);
             if count != self.document.board.layer_count {
                 let mut draft = self.document.board.clone();
                 match draft.set_layer_count(count) {
@@ -3658,6 +3625,7 @@ impl Editor {
         }
         out.extend(view.menu.iter().cloned());
         out.extend(view.inspector.shown(view.canvas_pass));
+        out.extend(view.toolbar_hits.shown(view.canvas_pass));
         out
     }
     /// Whether a Select-tool press at `p` would start a drag.

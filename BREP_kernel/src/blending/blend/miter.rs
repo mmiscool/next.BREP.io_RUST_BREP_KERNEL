@@ -186,19 +186,8 @@ pub(super) fn is_miter_seam_fold(refusal: &KernelRefusal) -> bool {
 /// `set_miter_fold_for_test` forces it on a test's own thread.
 const MITER_FOLD_DEFAULT: bool = true;
 
-thread_local! {
-    static MITER_FOLD_FOR_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
-}
-
 pub(super) fn miter_fold_on() -> bool {
-    if let Some(forced) = MITER_FOLD_FOR_TEST.with(|forced| forced.get()) {
-        return forced;
-    }
-    match std::env::var("BREP_BLEND_MITER_FOLD").as_deref() {
-        Ok("0") | Ok("off") => false,
-        Ok("1") | Ok("on") => true,
-        _ => MITER_FOLD_DEFAULT,
-    }
+    switch!(live "BREP_BLEND_MITER_FOLD", MITER_FOLD_DEFAULT)
 }
 
 
@@ -208,19 +197,8 @@ pub(super) fn miter_fold_on() -> bool {
 /// `set_line_canal_for_test` forces it on a test's own thread.
 const LINE_CANAL_DEFAULT: bool = true;
 
-thread_local! {
-    static LINE_CANAL_FOR_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
-}
-
 pub(super) fn line_canal_on() -> bool {
-    if let Some(forced) = LINE_CANAL_FOR_TEST.with(|forced| forced.get()) {
-        return forced;
-    }
-    match std::env::var("BREP_BLEND_LINE_CANAL").as_deref() {
-        Ok("0") | Ok("off") => false,
-        Ok("1") | Ok("on") => true,
-        _ => LINE_CANAL_DEFAULT,
-    }
+    switch!(live "BREP_BLEND_LINE_CANAL", LINE_CANAL_DEFAULT)
 }
 
 
@@ -244,7 +222,76 @@ pub(super) fn canal_distance(center: &crate::NurbsCurve, point: Vec3) -> Result<
             }
         }
     }
-    Ok(crate::project_point_to_curve(center, point).or_refuse(KernelStage::Refine, "project_point_to_curve")?.distance)
+    let projected = crate::project_point_to_curve(center, point).or_refuse(KernelStage::Refine, "project_point_to_curve")?.distance;
+    if !global_canal_on() {
+        return Ok(projected);
+    }
+    Ok(projected.min(nearest_over_basins(center, point)?))
+}
+
+/// Lane R 2026-10-28 (`BREP_MITER_GLOBAL_CANAL=1`, default off): the canal
+/// distance as the least distance over EVERY basin of the centre row, not
+/// the one basin the curve projector's coarse sweep seeds.
+///
+/// (The two basins there were the creased-rim split's closed-curve pieces
+/// wrapping round the crease; with open pieces lCount_12 builds with this
+/// switch off. It stays as the projector-independent reading.) Here the row
+/// is sampled at 16 points per knot span, every local minimum of the sampled
+/// distance is refined by Newton on (C − p)·C′ = 0 inside its bracket, and
+/// the least is taken; `canal_distance` keeps the projector's answer when it
+/// is already the least.
+pub(super) fn global_canal_on() -> bool {
+    switch!("BREP_MITER_GLOBAL_CANAL", false)
+}
+
+
+
+/// The least distance from `point` to `curve` over every local minimum of its
+/// distance sampled at 16 points per knot span, each refined by Newton inside
+/// its bracket (see [`global_canal_on`]).
+fn nearest_over_basins(curve: &crate::NurbsCurve, point: Vec3) -> Result<f64, KernelRefusal> {
+    const PER_SPAN: usize = 16;
+    let [start, end] = curve.domain().or_refuse(KernelStage::Refine, "domain")?;
+    let mut breaks: Vec<f64> = vec![start];
+    for knot in &curve.knots {
+        if *knot > start && *knot < end && breaks.last().is_some_and(|last| knot > last) {
+            breaks.push(*knot);
+        }
+    }
+    breaks.push(end);
+    let mut samples: Vec<(f64, f64)> = Vec::with_capacity(breaks.len() * PER_SPAN);
+    for pair in breaks.windows(2) {
+        for index in 0..PER_SPAN {
+            let u = pair[0] + (pair[1] - pair[0]) * index as f64 / PER_SPAN as f64;
+            let distance = curve.evaluate(u).or_refuse(KernelStage::Refine, "evaluate")?.sub(point).length();
+            samples.push((u, distance));
+        }
+    }
+    let distance = curve.evaluate(end).or_refuse(KernelStage::Refine, "evaluate")?.sub(point).length();
+    samples.push((end, distance));
+    let mut best = samples.iter().map(|(_, d)| *d).fold(f64::INFINITY, f64::min);
+    for index in 0..samples.len() {
+        let here = samples[index].1;
+        let left = if index > 0 { samples[index - 1].1 } else { f64::INFINITY };
+        let right = if index + 1 < samples.len() { samples[index + 1].1 } else { f64::INFINITY };
+        if !(here <= left && here <= right) {
+            continue;
+        }
+        let low = samples[index.saturating_sub(1)].0;
+        let high = samples[(index + 1).min(samples.len() - 1)].0;
+        let (u, _) = crate::projection::curve_foot_newton(curve, point, samples[index].0, [low, high],
+            crate::projection::CurveFootPolicy {
+                domain: crate::projection::FootDomain::Clamp,
+                iterations: 30,
+                slope_guard: 0.0,
+                step_limit: f64::INFINITY,
+                parameter_tolerance: 1e-15,
+                mode: crate::projection::FootMode::Stationary { positive_slope: true, relative_step: true },
+            }).or_refuse(KernelStage::Refine, "curve_foot_newton")?;
+        let distance = curve.evaluate(u).or_refuse(KernelStage::Refine, "evaluate")?.sub(point).length();
+        best = best.min(distance);
+    }
+    Ok(best)
 }
 
 /// How far `point` stands off `surface` the way the marches here solve "on":

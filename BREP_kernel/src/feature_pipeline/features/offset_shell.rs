@@ -3,8 +3,9 @@
 //!
 //! Semantics:
 //!
-//! - `inputParams.faces` — a `reference_selection` (FACE names) naming the
-//!   OPENING faces to remove.
+//! - `inputParams.faces` — ONE `reference_selection` admitting FACE and SOLID
+//!   names (owner 2026-11-01): the faces are the OPENINGS to remove; a solid
+//!   names the body to shell.
 //! - `inputParams.distance` — the signed offset applied to the retained face
 //!   supports. POSITIVE = INWARD (the kernel's own
 //!   `open_top_box_offsets_to_exact_hollow_volume` proves +0.5 hollows a 4³ box
@@ -12,12 +13,18 @@
 //!   material and the opening walls are the opening planes extended by the
 //!   thickness — `outward_shell_open_top_box_has_exact_grown_wall_volume`);
 //!   the kernel op takes the signed value verbatim.
+//!   A solid alone builds the CLOSED hollow (outer shell plus inner void,
+//!   sharp joins; `offset_shell_closed`); with opening faces they must lie on
+//!   it. Two solids, faces on two solids, or faces off the named solid refuse
+//!   by name. Nothing picked is the panel's empty state: no shell, and a
+//!   `NothingSelected` fulfilment says so. A document saved with the former
+//!   separate `inputParams.solid` (2026-10-31) folds it into `faces` on read.
 //! - `inputParams.replaceOriginalSolid` — `!= false` (default true) removes the
 //!   source solid, leaving only the shell.
 //!
 //! Resolution (contract rule 1): every opening-face name resolves against the
-//! live scene-map by exact match. ALL-OR-NOTHING — a single miss (or faces
-//! spanning >1 solid, empty selection, or zero/non-finite distance) yields an
+//! live scene-map by exact match. ALL-OR-NOTHING — a single miss (or an
+//! empty selection, or a zero/non-finite distance) yields an
 //! empty result (with `unresolved` populated on a name miss) so the caller repairs +
 //! re-dispatches, matching the established soft no-op / throw-then-repair split. The
 //! kernel's "cannot produce a shell" refusal (every face selected) is likewise a
@@ -99,35 +106,97 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, FeatureRefusal> {
         _ => return Ok(result),
     };
 
-    let names = common::unique_reference_names(ctx.param("faces"));
+    // ONE reference field (owner 2026-11-01): `faces` admits FACE and SOLID
+    // names. Faces are the openings; a solid names the body to shell, which
+    // with no opening face asks for the CLOSED hollow (lane O row 34).
+    // Documents saved with the separate `solid` field (2026-10-31 to
+    // 2026-11-01) fold it in here.
+    let mut names = common::unique_reference_names(ctx.param("faces"));
+    if let Some(legacy) = common::first_reference_name(ctx.param("solid")) {
+        if !names.contains(&legacy) {
+            names.push(legacy);
+        }
+    }
     if names.is_empty() {
-        // No opening faces selected → the caller warns + no-ops.
+        // Nothing picked yet (the panel's empty state): no shell, and the
+        // result says so instead of reading as a plain success.
+        result.fulfilment = Some(crate::feature_pipeline::Fulfilment {
+            requested: Vec::new(),
+            applied: Vec::new(),
+            rejected: vec![crate::feature_pipeline::Rejected {
+                name: "faces".to_string(),
+                kind: crate::feature_pipeline::RejectedKind::NothingSelected,
+                reason: "names no opening face and no solid, so nothing was shelled".to_string(),
+            }],
+            extended: Vec::new(),
+            followed: Vec::new(),
+        });
         return Ok(result);
     }
-
-    // Resolve every opening face BY NAME against the live scene-map. ALL-OR-
-    // NOTHING: any miss records `unresolved` and produces no shell (a partial
-    // opening set is a different shell than requested).
+    // Resolve every name BY NAME against the live scene-map: an exact face
+    // name, then a solid name, then a one-face container (`resolve_face`'s
+    // fallback), so a solid is never read as a container of the same name.
+    // ALL-OR-NOTHING: any miss records `unresolved` and produces no shell (a
+    // partial opening set is a different shell than requested).
     let mut opening = Vec::new();
-    let mut handles = HashSet::new();
+    let mut face_handles = Vec::new();
+    let mut solids: Vec<(String, u32)> = Vec::new();
     for name in &names {
-        match ctx.scene.resolve_face(name) {
-            Some(face) => {
-                opening.push(face);
-                handles.insert(face.handle);
+        let exact_face = ctx.scene.faces.get(name).copied();
+        let solid = exact_face.is_none().then(|| ctx.scene.resolve_solid(name)).flatten();
+        if let Some(handle) = solid {
+            if !solids.iter().any(|(_, known)| *known == handle) {
+                solids.push((name.clone(), handle));
             }
-            None => result.unresolved.push(name.clone()),
+        } else if let Some(face) = exact_face.or_else(|| ctx.scene.resolve_face(name)) {
+            if !face_handles.contains(&face.handle) {
+                face_handles.push(face.handle);
+            }
+            opening.push(face);
+        } else {
+            result.unresolved.push(name.clone());
         }
     }
     if !result.unresolved.is_empty() {
         return Ok(result);
     }
-    // Faces must all belong to ONE solid (abort otherwise).
-    if handles.len() != 1 {
-        return Ok(result);
+    if solids.len() > 1 {
+        return Err(crate::KernelRefusal::input(
+            crate::KernelStage::Collect,
+            "offset_shell_two_solids",
+            format!(
+                "offset_shell: the selection names {} solids ({}); a shell is built from one solid",
+                solids.len(),
+                solids.iter().map(|(name, _)| format!("`{name}`")).collect::<Vec<_>>().join(", ")
+            ),
+        )
+        .into());
     }
-    let handle = *handles.iter().next().unwrap();
-    let opening_ids: Vec<u64> = opening.iter().map(|face| face.face_id).collect();
+    if face_handles.len() > 1 {
+        return Err(crate::KernelRefusal::input(
+            crate::KernelStage::Collect,
+            "offset_shell_faces_on_two_solids",
+            format!(
+                "offset_shell: the opening faces lie on {} different solids; pick openings on one solid",
+                face_handles.len()
+            ),
+        )
+        .into());
+    }
+    let handle = match (solids.first(), face_handles.first()) {
+        (Some((solid_name, named)), Some(on_faces)) if named != on_faces => {
+            return Err(crate::KernelRefusal::input(
+                crate::KernelStage::Collect,
+                "offset_shell_faces_off_solid",
+                format!("offset_shell: the opening faces are not on the named solid `{solid_name}`"),
+            )
+            .into())
+        }
+        (Some((_, named)), _) => *named,
+        (None, Some(on_faces)) => *on_faces,
+        (None, None) => unreachable!("every name resolved to a face or a solid"),
+    };
+    let opening_ids = opening.iter().map(|face| face.face_id).collect::<Vec<u64>>();
 
     // The target solid's scene name — the caller names the result `${targetSolid.name}_…`.
     let target_name = ctx
@@ -153,7 +222,11 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, FeatureRefusal> {
             .flat_map(|shell| &shell.faces)
             .filter_map(|face| face.name.as_ref().map(|name| (face.id, name.clone())))
             .collect();
-        let record = crate::offset_shell(solid, &opening_ids, distance);
+        let record = if opening_ids.is_empty() {
+            crate::offset_shell_closed(solid, distance)
+        } else {
+            crate::offset_shell(solid, &opening_ids, distance)
+        };
         Ok((source_names, record))
     })?;
     let record = match record {
@@ -277,12 +350,13 @@ pub fn schema() -> serde_json::Value {
         "faces": {
             "type": "reference_selection",
             "selectionFilter": [
-                "FACE"
+                "FACE",
+                "SOLID"
             ],
             "timestampDependency": "parentSolid",
             "multiple": true,
             "default_value": [],
-            "hint": "Pick one or more faces to remove as shell openings."
+            "hint": "Pick the faces to remove as shell openings, or a solid alone to shell it closed (a hollow with an inner void). Faces and their solid together shell that solid with those openings."
         },
         "replaceOriginalSolid": {
             "type": "boolean",

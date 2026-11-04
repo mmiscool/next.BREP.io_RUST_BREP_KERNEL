@@ -14,6 +14,18 @@
 
 pub mod extension;
 
+/// Reject known-invalid cylinder literals before a recipe mutation. Expressions
+/// remain evaluated by the feature, which applies the same radius rule.
+pub fn validate_literal_feature_params(feature_type: &str, params: &serde_json::Value) -> Result<(), String> {
+    if feature_type == "P.CY" {
+        if let Some(radius) = params.get("radius").and_then(|v| v.as_f64().or_else(|| v.as_str().and_then(|s| s.trim().parse::<f64>().ok()))) {
+            features::cylinder::validate_radius(radius)?;
+        }
+    }
+    Ok(())
+}
+
+
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use wasm_bindgen::prelude::*;
@@ -24,6 +36,9 @@ use crate::{KernelRefusal, NurbsCurve, Vec3};
 // entity-name namespacing at the component boundary. See component.rs.
 pub(crate) mod component;
 pub use component::ComponentRecord;
+// A family seed's table and its pure functions (rewrite, effective row,
+// fingerprints), shared by the CAD app and the PLM server. See family.rs.
+pub mod family;
 // The per-document parts library (assemblies): unique part payloads the ACOMP
 // instance feature references by name; kernel-resident, request-seeded,
 // GC'd at the end of every history run. See parts_library.rs.
@@ -106,6 +121,7 @@ pub use expression::Env;
 // persistence half of the per-loop face-naming scheme. See
 // `features/sketch/loop_ids.rs`.
 pub use features::sketch::assign_sketch_loop_ids;
+pub use features::sketch::text::expand_text as expand_sketch_text;
 
 // ===========================================================================
 // Descriptor — the serialized `{ type, inputParams, persistentData, timestamp }`
@@ -482,6 +498,7 @@ impl FeatureResult {
             applied,
             rejected,
             extended: Vec::new(),
+            followed: Vec::new(),
         });
     }
 
@@ -1341,6 +1358,12 @@ pub struct Fulfilment {
     /// (`common::open_tangent_chain_extension`). Their names, in walk order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub extended: Vec<String>,
+    /// Edges the fillet's "Follow tangent" option added to the selection:
+    /// the unselected edges on the selected edges' G1 tangent chains
+    /// (`common::tangent_chain_expansion`), in walk order. Reported so the
+    /// user sees what was filleted beyond the picks.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub followed: Vec<String>,
 }
 
 impl Fulfilment {
@@ -1361,6 +1384,15 @@ impl Fulfilment {
             let names: Vec<String> = self.extended.iter().map(|name| format!("`{name}`")).collect();
             notes.push(format!(
                 "the selection ends inside a tangent chain, so the fillet continued along it onto {}",
+                names.join(", ")
+            ));
+        }
+        if !self.followed.is_empty() {
+            let names: Vec<String> = self.followed.iter().map(|name| format!("`{name}`")).collect();
+            notes.push(format!(
+                "Follow tangent added {} tangent-chain edge{}: {}",
+                self.followed.len(),
+                if self.followed.len() == 1 { "" } else { "s" },
                 names.join(", ")
             ));
         }
@@ -1388,6 +1420,9 @@ pub struct Rejected {
 pub enum RejectedKind {
     /// The name resolves to no entity of the scene.
     Unresolved,
+    /// The feature was given nothing to act on (an Offset Shell with no
+    /// opening face and no solid): it did nothing, and says so.
+    NothingSelected,
 }
 
 /// What a feature's `build` hands back when it refuses. A feature that drives
@@ -1537,6 +1572,7 @@ pub(crate) fn execute_feature_with_later(
         "SM.F" => features::sheet_metal_flange::execute(&ctx),
         "SM.HEM" => features::sheet_metal_hem::execute(&ctx),
         "SM.CLOSED_CORNER" => features::sheet_metal_closed_corner::execute(&ctx),
+        "SM.MIRROR" => features::sheet_metal_mirror::execute(&ctx),
         "SM.FILLET" => features::sheet_metal_corner::execute_fillet(&ctx),
         "SM.CHAMFER" => features::sheet_metal_corner::execute_chamfer(&ctx),
         "SM.CUTOUT" => features::sheet_metal_cutout::execute(&ctx),

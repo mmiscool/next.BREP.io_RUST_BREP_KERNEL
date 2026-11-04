@@ -8,7 +8,9 @@
 //! workbench), **Explode** / **Collapse** (play the steps out or home) and a
 //! progress slider. A step row selects the step and arms the move gizmo on it
 //! (the same gizmo the PMI pane gives an open explode annotation); its trail
-//! box and delete and up / down buttons edit the PMI rows.
+//! box and delete and up / down buttons edit the PMI rows. **Hide selected**
+//! adds a HIDE step (a `hide` row: the selected components stay out of the
+//! view while it is shown), listed under the steps with its own delete.
 use crate::automation::hit_keys::HitKeyDoc;
 use brep_render::engine_state::EngineState;
 use eframe::egui;
@@ -29,6 +31,9 @@ pub static HIT_KEYS: &[HitKeyDoc] = &[
     HitKeyDoc { panel: "assemblyconstraints", prefix: "explode:trace:", meaning: "a step's trail box", command: Some("pmi_update_annotation") },
     HitKeyDoc { panel: "assemblyconstraints", prefix: "explode:up:", meaning: "move a step earlier", command: Some("pmi_move_annotation") },
     HitKeyDoc { panel: "assemblyconstraints", prefix: "explode:del:", meaning: "delete a step", command: Some("pmi_remove_annotation") },
+    HitKeyDoc { panel: "assemblyconstraints", prefix: "explode:hide", meaning: "add a hide step that keeps the selected components (or solids) out of the shown view", command: Some("pmi_add_annotation") },
+    HitKeyDoc { panel: "assemblyconstraints", prefix: "explode:hidden:", meaning: "a hide step's row: select it (explode:hidden:<id>)", command: None },
+    HitKeyDoc { panel: "assemblyconstraints", prefix: "explode:unhide:", meaning: "delete a hide step (explode:unhide:<id>)", command: Some("pmi_remove_annotation") },
 ];
 
 /// The section's own UI state.
@@ -61,6 +66,7 @@ const DEEP: usize = 8;
 enum Action {
     New,
     Add,
+    HideSelected,
     Show(String),
     Hide,
     Animate(bool),
@@ -183,6 +189,34 @@ impl ExplodedSection {
                             }
                         });
                     }
+                    // The view's hide steps: what it keeps out of sight, tracked
+                    // like its explode steps (added from the selection, listed,
+                    // deleted, undone), not steps of the playback.
+                    let hide = ui.add_enabled(!locked, egui::Button::new("Hide selected"));
+                    hits.insert("explode:hide".into(), hide.rect);
+                    if hide
+                        .on_hover_text("Keep the selected components out of this view, as a hide step. A part inside a sub-assembly: pick its row in the BOM")
+                        .clicked()
+                    {
+                        action = Some(Action::HideSelected);
+                    }
+                    for step in view.hides.iter() {
+                        ui.horizontal(|ui| {
+                            let row = ui.selectable_label(
+                                selected.as_deref() == Some(step.id.as_str()),
+                                format!("{}hidden: {}", if step.enabled { "" } else { "(off) " }, step.labels.join(", ")),
+                            );
+                            hits.insert(format!("explode:hidden:{}", step.id), row.rect);
+                            if row.on_hover_text("Select this hide step; its form edits what it hides").clicked() {
+                                action = Some(Action::Select(step.id.clone()));
+                            }
+                            let del = ui.add_enabled(!locked, egui::Button::new("✕").small());
+                            hits.insert(format!("explode:unhide:{}", step.id), del.rect);
+                            if del.on_hover_text("Delete this hide step: its parts show again").clicked() {
+                                action = Some(Action::Delete(step.id.clone()));
+                            }
+                        });
+                    }
                 }
                 if let Some(message) = &self.message {
                     ui.colored_label(ui.visuals().error_fg_color, message);
@@ -212,6 +246,7 @@ impl ExplodedSection {
         let result: Result<(), String> = match action {
             Action::New => state.assembly_auto_explode_deep(None, self.spread, if self.deep { DEEP } else { 1 }).map(|_| ()),
             Action::Add => state.exploded_add_step(&[]).map(|_| ()),
+            Action::HideSelected => state.pmi_hide_selected(None).map(|_| ()),
             Action::Show(id) => state.pmi_activate_view(&id),
             Action::Hide => {
                 state.pmi_deactivate_view();

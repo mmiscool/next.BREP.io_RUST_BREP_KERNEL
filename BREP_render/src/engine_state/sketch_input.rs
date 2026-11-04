@@ -103,7 +103,7 @@ impl EngineState {
     pub(super) fn set_sketch_hover(&mut self, new_hover: Option<serde_json::Value>) -> bool {
         let changed = match self.sketch_edit.as_ref() {
             Some(edit) => {
-                !crate::sketch::entity_ref_eq(edit.session.hovered.as_ref(), new_hover.as_ref())
+                !crate::sketch::entity_ref_eq(edit.session.selection.hovered.as_ref(), new_hover.as_ref())
             }
             None => false,
         };
@@ -196,7 +196,7 @@ impl EngineState {
         // point). Only an EMPTY hover (a press with no prior move) falls back to a
         // fresh positional pick.
         let points = self.sketch_edit.as_ref().and_then(|edit| {
-            match edit.session.hovered.as_ref() {
+            match edit.session.selection.hovered.as_ref() {
                 Some(entity_ref) => edit.session.drag_points_from_ref(entity_ref),
                 None => edit
                     .session
@@ -217,7 +217,10 @@ impl EngineState {
             // (S6a); `sketch_drag_to` never snapshots. A grab that moves nothing is
             // discarded in `sketch_drag_end`.
             edit.record_undo();
-            edit.drag = Some(SketchDrag { points, anchor: (u, v) });
+            let infer_on_drop = edit.session.selection.hovered.as_ref()
+                .and_then(|entity| entity.get("kind"))
+                .and_then(serde_json::Value::as_str) != Some("geometry");
+            edit.drag = Some(SketchDrag { points, anchor: (u, v), infer_on_drop });
         }
         true
     }
@@ -299,10 +302,10 @@ impl EngineState {
             // Drop-time inference (S6c): a SINGLE-point drop snaps to a coincident
             // point / point-on-line at the release position, mirroring the previous
             // coincident-on-drop / point-on-line-on-drop inference. A whole-
-            // geometry drag (multiple points) never infers — running it per
-            // endpoint could glue or collapse the curve in one solve.
+            // geometry drag never infers, even with only one movable endpoint:
+            // inference could glue or collapse the curve in one solve.
             let dragged_single = edit.drag.as_ref().and_then(|drag| {
-                (drag.points.len() == 1).then(|| drag.points[0].0.clone())
+                (drag.infer_on_drop && drag.points.len() == 1).then(|| drag.points[0].0.clone())
             });
             edit.drag = None;
             if let Some(point_id) = dragged_single {
@@ -338,7 +341,7 @@ impl EngineState {
     pub fn sketch_selection_count(&self) -> usize {
         self.sketch_edit
             .as_ref()
-            .map_or(0, |edit| edit.session.selection.len())
+            .map_or(0, |edit| edit.session.selection.items.len())
     }
 
     /// The number of selected CONSTRAINTS (refs whose `kind` is `"constraint"`; 0 when
@@ -347,7 +350,7 @@ impl EngineState {
     pub fn sketch_selected_constraint_count(&self) -> usize {
         self.sketch_edit.as_ref().map_or(0, |edit| {
             edit.session
-                .selection
+                .selection.items
                 .iter()
                 .filter(|r| r.get("kind").and_then(|v| v.as_str()) == Some("constraint"))
                 .count()
@@ -495,6 +498,11 @@ impl EngineState {
                 return;
             }
         }
+        if tool == "text" && !edit.pending.is_empty() {
+            if let Some(a) = edit.session.doc.point(&edit.pending[0]) {
+                if (u-a.x).abs() < 1e-5 || (v-a.y).abs() < 1e-5 { return; }
+            }
+        }
         // A draw tool is active → this click WILL mutate the doc (a point and/or a
         // geometry); snapshot for undo before it does (S6a).
         edit.record_undo();
@@ -516,7 +524,8 @@ impl EngineState {
                     edit.pending = vec![end];
                 }
             }
-            "rect" => {
+            "rect" | "text" => {
+                let radius = if tool == "text" { -1.0 } else { radius };
                 if edit.pending.is_empty() {
                     let a = doc.snap_or_add_point(u, v, radius);
                     edit.pending.push(a);
@@ -526,7 +535,12 @@ impl EngineState {
                         edit.pending.clear();
                         return;
                     };
-                    let (bx, by) = (u, v);
+                    let (ax, ay, bx, by) = if tool == "text" {
+                        (ax.min(u), ay.min(v), ax.max(u), ay.max(v))
+                    } else { (ax, ay, u, v) };
+                    if tool == "text" {
+                        if let Some(p) = doc.point_mut(&a_id) { p.x = ax; p.y = ay; }
+                    }
                     // Corners A=(ax,ay), (bx,ay), (bx,by), (ax,by) → 4 closed lines.
                     let b1 = doc.snap_or_add_point(bx, ay, radius);
                     let b2 = doc.snap_or_add_point(bx, by, radius);
@@ -541,6 +555,18 @@ impl EngineState {
                     // from the 8-DOF four-corner quad, leaving position (2) + rotation (1)
                     // + width + height = 5 DOF, so the sketch is neither over-constrained
                     // nor conflicting.
+                    if tool == "text" {
+                        let corners = vec![a_id.clone(), b1.clone(), b2.clone(), b3.clone()];
+                        let text_id = doc.next_geometry_id();
+                        for edge in doc.geometries.iter_mut().rev().take(4) {
+                            edge.extra.insert("construction".into(), serde_json::json!(true));
+                            edge.extra.insert("textFrame".into(), text_id.clone());
+                        }
+                        for id in &corners { if let Some(p) = doc.point_mut(id) { p.construction = true; } }
+                        doc.geometries.push(crate::sketch::text::object(text_id.clone(), corners, "Text", "Ubuntu Light").expect("bundled default font"));
+                        edit.session.selection.items = vec![crate::sketch::session::geometry_ref(&text_id)];
+                        edit.session.tool = None;
+                    }
                     push_rect_perpendicular_constraints(doc, [a_id, b1, b2, b3]);
                     edit.pending.clear();
                 }
@@ -1002,7 +1028,7 @@ impl EngineState {
         let Some(edit) = self.sketch_edit.as_mut() else {
             return false;
         };
-        if edit.session.selection.is_empty() {
+        if edit.session.selection.items.is_empty() {
             return false;
         }
         // A non-empty selection always removes something → snapshot for undo (S6a).
@@ -1013,7 +1039,7 @@ impl EngineState {
         let mut sel_geo: HashSet<String> = HashSet::new();
         let mut sel_pt: HashSet<String> = HashSet::new();
         let mut sel_constraint: HashSet<String> = HashSet::new();
-        for r in &edit.session.selection {
+        for r in &edit.session.selection.items {
             match (r.get("kind").and_then(|v| v.as_str()), r.get("id")) {
                 (Some("geometry"), Some(id)) => {
                     sel_geo.insert(id_key(id));
@@ -1037,6 +1063,15 @@ impl EngineState {
         sel_constraint.remove(&origin_key);
 
         let doc = &mut edit.session.doc;
+
+        let deleted_texts: HashSet<String> = doc.geometries.iter().filter(|g| g.geom_type == "text")
+            .filter(|g| sel_geo.contains(&id_key(&g.id)) || g.points.iter().any(|p| sel_pt.contains(&id_key(p))) || doc.geometries.iter().any(|edge| edge.extra.get("textFrame") == Some(&g.id) && sel_geo.contains(&id_key(&edge.id))))
+            .map(|g| id_key(&g.id)).collect();
+        for g in &doc.geometries {
+            if deleted_texts.contains(&id_key(&g.id)) || g.extra.get("textFrame").is_some_and(|id| deleted_texts.contains(&id_key(id))) {
+                sel_geo.insert(id_key(&g.id));
+            }
+        }
 
         // 2. Drop geometries that are selected OR reference any selected point (so a
         //    deleted vertex never leaves a geometry dangling).

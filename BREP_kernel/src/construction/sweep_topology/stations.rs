@@ -165,19 +165,11 @@ impl SweepStationReport {
     }
 }
 
-thread_local! {
-    /// The bite-proof STUB for this thread: `true` switches refinement off
-    /// without touching the process environment, so a lib test can pull it
-    /// while the rest of the module runs beside it.
-    static REFINEMENT_STUBBED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
 /// Whether refinement is switched off — by the environment
 /// (`BREP_SWEEP_STATION_REFINEMENT=0`, mirroring `BREP_SWEEP_BEND_GUARD`, the
 /// switch a probe or a whole-module run pulls) or by this thread's stub.
 pub(super) fn refinement_enabled() -> bool {
-    !REFINEMENT_STUBBED.with(|stub| stub.get())
-        && std::env::var("BREP_SWEEP_STATION_REFINEMENT").as_deref() != Ok("0")
+    switch!(live "BREP_SWEEP_STATION_REFINEMENT", true)
 }
 
 
@@ -266,25 +258,16 @@ pub(super) fn interpolant(points: &[Vec3], parameters: &[f64], closed: bool) -> 
 /// that does not improve is discarded.
 fn nearest_parameter(curve: &NurbsCurve, point: Vec3, guess: f64) -> Result<(f64, f64), String> {
     let [lo, hi] = curve.domain()?;
-    let mut u = guess.clamp(lo, hi);
-    let mut distance = curve.evaluate(u)?.sub(point).length();
-    for _ in 0..6 {
-        let derivatives = curve.derivatives_small(u, 2)?;
-        let offset = derivatives[0].sub(point);
-        let numerator = offset.dot(derivatives[1]);
-        let denominator = derivatives[1].dot(derivatives[1]) + offset.dot(derivatives[2]);
-        if denominator.abs() <= 1e-300 {
-            break;
-        }
-        let next = (u - numerator / denominator).clamp(lo, hi);
-        let next_distance = curve.evaluate(next)?.sub(point).length();
-        if next_distance >= distance || (next - u).abs() <= 1e-15 * hi.abs().max(1.0) {
-            break;
-        }
-        u = next;
-        distance = next_distance;
-    }
-    Ok((u, distance))
+    let (u, _) = crate::projection::curve_foot_newton(curve, point, guess, [lo, hi],
+        crate::projection::CurveFootPolicy {
+            domain: crate::projection::FootDomain::Clamp,
+            iterations: 6,
+            slope_guard: 1e-300,
+            step_limit: f64::INFINITY,
+            parameter_tolerance: 1e-15 * hi.abs().max(1.0),
+            mode: crate::projection::FootMode::Monotone,
+        })?;
+    Ok((u, curve.evaluate(u)?.sub(point).length()))
 }
 
 /// The true path piece under span `k`: its segment and parameter interval.
@@ -443,8 +426,7 @@ pub(super) fn section_reach(profile: &[NurbsCurve], origin: Vec3) -> f64 {
 
 /// Rodrigues about a unit axis.
 fn rotated(x: Vec3, axis: Vec3, angle: f64) -> Vec3 {
-    let (sin, cos) = angle.sin_cos();
-    x.scale(cos).add(axis.cross(x).scale(sin)).add(axis.scale(axis.dot(x) * (1.0 - cos)))
+    x.rotate_about(axis, angle)
 }
 
 /// The inputs [`station_report`] reads off a placed run.

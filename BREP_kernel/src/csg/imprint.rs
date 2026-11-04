@@ -18,61 +18,9 @@ use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use web_time::Instant;
 
-// Lane P3b row 3 (2026-10-26): the profile lines of one operation are
-// gathered in a thread-local buffer and written to stderr ONCE when the
-// outermost `ProfileSink` closes, instead of one unbuffered write per line
-// (the `bench-occ` comparator timed our driver with `BREP_PROFILE=1` until
-// row 5, and an outward box shell emitted ~435 lines). Line content is
-// unchanged; lines emitted outside any open sink go straight to stderr.
-thread_local! {
-    static PROFILE_SINK: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
-}
-#[doc(hidden)]
-pub(crate) fn profile_emit(args: std::fmt::Arguments<'_>) {
-    use std::fmt::Write;
-    PROFILE_SINK.with(|sink| {
-        let mut sink = sink.borrow_mut();
-        match sink.as_mut() {
-            Some(buffer) => {
-                let _ = buffer.write_fmt(args);
-                buffer.push('\n');
-            }
-            None => eprintln!("{args}"),
-        }
-    });
-}
-/// `eprintln!` for a `BREP_PROFILE` line: buffered while a [`ProfileSink`] is open.
-macro_rules! profile_line {
-    ($($arg:tt)*) => { $crate::imprint::profile_emit(format_args!($($arg)*)) };
-}
-/// Opens the operation's line buffer when `BREP_PROFILE` is set and no sink
-/// is open on this thread (a nested operation writes into its parent's);
-/// dropping the outermost sink writes the buffer in one call.
-pub(crate) struct ProfileSink;
-impl ProfileSink {
-    pub(crate) fn open() -> Option<Self> {
-        if !profile_enabled() {
-            return None;
-        }
-        PROFILE_SINK.with(|sink| {
-            let mut sink = sink.borrow_mut();
-            if sink.is_some() {
-                return None;
-            }
-            *sink = Some(String::with_capacity(16 * 1024));
-            Some(Self)
-        })
-    }
-}
-impl Drop for ProfileSink {
-    fn drop(&mut self) {
-        if let Some(buffer) = PROFILE_SINK.with(|sink| sink.borrow_mut().take()) {
-            if !buffer.is_empty() {
-                eprint!("{buffer}");
-            }
-        }
-    }
-}
+// The profile line buffer, `profile_line!` and `profile_enabled` live in
+// `crate::profile` (consolidation I8); these paths stay for their callers.
+pub(crate) use crate::profile::{profile_emit, profile_enabled, ProfileSink};
 
 /// Per-step wall-clock accumulators for `build_imprints`, printed to stderr
 /// when `BREP_PROFILE` is set. Native-only in practice (no env vars in wasm).
@@ -119,13 +67,7 @@ impl ImprintProfile {
     }
 
     fn lap(&self, started: &mut Option<Instant>) -> Duration {
-        if !self.enabled {
-            return Duration::ZERO;
-        }
-        let now = Instant::now();
-        let elapsed = started.map(|s| now - s).unwrap_or_default();
-        *started = Some(now);
-        elapsed
+        crate::profile::lap(self.enabled, started)
     }
 
     fn report(&self) {
@@ -166,6 +108,7 @@ impl ImprintProfile {
             self.exact_iso_sections,
             self.exact_iso_declined,
         );
+        driver::fit_split_report();
     }
 }
 
@@ -198,11 +141,6 @@ thread_local! {
         lies_whole: Duration::ZERO, lies_whole_calls: 0, lies_whole_hits: 0,
         lies_span: Duration::ZERO, lies_span_calls: 0, reuse_edges: 0,
     }) };
-}
-/// Whether `BREP_PROFILE` is set, read once per process (no test toggles it).
-pub(crate) fn profile_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("BREP_PROFILE").is_some())
 }
 pub(crate) fn imprint_split_add(update: impl FnOnce(&mut ImprintSplit)) {
     IMPRINT_SPLIT.with(|cell| { let mut split = cell.get(); update(&mut split); cell.set(split); });
@@ -333,11 +271,11 @@ fn default_tolerance() -> f64 {
 }
 
 fn default_tangent_curve_lane() -> bool {
-    std::env::var("BREP_TANGENT_CURVE_LANE").as_deref() != Ok("0")
+    switch!(live "BREP_TANGENT_CURVE_LANE", true)
 }
 
 fn default_tangent_curve_imprint() -> bool {
-    std::env::var("BREP_TANGENT_CURVE_IMPRINT").as_deref() != Ok("0")
+    switch!(live "BREP_TANGENT_CURVE_IMPRINT", true)
 }
 
 fn default_maximum_fit_points() -> usize {

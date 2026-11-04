@@ -81,6 +81,7 @@
 //! constructor will not do behind the caller's back).  Interior regularity is
 //! not checked: a network that folds builds a surface that folds.
 
+use crate::coons::homogeneous_distance;
 use crate::coons::compat::{self, CompatWork};
 use crate::coons::{corner_band, WEIGHT_CLOSURE_BAND};
 use crate::{
@@ -494,13 +495,7 @@ fn geometry(message: String) -> GordonRefusal {
 }
 
 /// Homogeneous distance between two control points.
-fn homogeneous_distance(first: Vec4, second: Vec4) -> f64 {
-    ((first.x - second.x).powi(2)
-        + (first.y - second.y).powi(2)
-        + (first.z - second.z).powi(2)
-        + (first.w - second.w).powi(2))
-    .sqrt()
-}
+
 
 /// Midpoint of two homogeneous points.  Exactly either one when they are
 /// equal: `(a + a) * 0.5 == a` in IEEE arithmetic.

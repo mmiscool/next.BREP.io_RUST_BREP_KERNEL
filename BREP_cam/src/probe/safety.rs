@@ -1,7 +1,7 @@
 //! Analytic capsule/triangle distances: no point-only clearance sampling.
 use crate::*;
-fn point_segment(p:Point3,a:Point3,b:Point3)->f64 {let d=b.sub(a);let q=d.length_squared();p.distance(if q==0. {a}else{a.add(d.scale((p.sub(a).dot(d)/q).clamp(0.,1.)))})}
-fn point_triangle(p:Point3,t:[Point3;3])->f64 {if t[1].sub(t[0]).cross(t[2].sub(t[0])).length_squared()<1e-24 {(0..3).map(|i|point_segment(p,t[i],t[(i+1)%3])).fold(f64::INFINITY,f64::min)}else{crate::verify::point_triangle_distance_squared(p,t[0],t[1],t[2]).max(0.).sqrt()}}
+use crate::geom::point_segment_distance as point_segment;
+fn point_triangle(p:Point3,t:[Point3;3])->f64 {if t[1].sub(t[0]).cross(t[2].sub(t[0])).length_squared()<1e-24 {(0..3).map(|i|point_segment(p,t[i],t[(i+1)%3])).fold(f64::INFINITY,f64::min)}else{crate::geom::point_triangle_distance_squared(p,t[0],t[1],t[2]).max(0.).sqrt()}}
 fn segments(a:Point3,b:Point3,c:Point3,d:Point3)->f64 {
     let u=b.sub(a);let v=d.sub(c);let w=a.sub(c);let aa=u.dot(u);let bb=u.dot(v);let cc=v.dot(v);let dd=u.dot(w);let ee=v.dot(w);let det=aa*cc-bb*bb;
     let mut best=point_segment(a,c,d).min(point_segment(b,c,d)).min(point_segment(c,a,b)).min(point_segment(d,a,b));

@@ -11,7 +11,7 @@ pub use extension::{
     ExtendRefusal, SurfaceSide, WeightSite, MAXIMUM_FOLD_ANGLE, MAXIMUM_GROWTH_RATIO,
 };
 
-const EPS: f64 = 1e-12;
+const EPS: f64 = crate::tolerance::FP_FLOOR;
 /// A generatrix control point that is neither ON the axis of revolution nor
 /// this fraction of the generatrix's own radial extent clear of it is a fuzzy
 /// pole, and `make_revolution` refuses it (see the comment at the check).
@@ -48,6 +48,11 @@ pub struct NurbsSurface {
     /// surface, and recomputed on demand after deserialization.
     #[serde(skip, default)]
     analytic: std::cell::OnceCell<Option<crate::AnalyticSurface>>,
+    /// Lazily recognized affine sphere (`geometry/affine_sphere.rs`), read
+    /// only under `BREP_AFFINE_SPHERE` and only when no analytic carrier was
+    /// recognized; an acceleration cache like `analytic`.
+    #[serde(skip, default)]
+    affine_sphere: std::cell::OnceCell<Option<crate::affine_sphere::AffineSphere>>,
     /// One-time validation cache (see `NurbsCurve::ensure_valid`).
     #[serde(skip, default)]
     validated: std::cell::Cell<bool>,
@@ -91,6 +96,7 @@ impl NurbsSurface {
             knots_v,
             control_points,
             analytic: std::cell::OnceCell::new(),
+            affine_sphere: std::cell::OnceCell::new(),
             validated: std::cell::Cell::new(false),
             closed_directions: std::cell::OnceCell::new(),
             projection_grid: std::cell::OnceCell::new(),
@@ -208,6 +214,20 @@ impl NurbsSurface {
             .as_ref()
     }
 
+    /// The recognized affine sphere (an ellipsoid), under `BREP_AFFINE_SPHERE`
+    /// and only when this net is not an analytic carrier; `None` otherwise.
+    pub(crate) fn affine_sphere(&self) -> Option<&crate::affine_sphere::AffineSphere> {
+        self.affine_sphere
+            .get_or_init(|| {
+                if !crate::affine_sphere::affine_sphere_enabled() || self.analytic().is_some() {
+                    None
+                } else {
+                    crate::affine_sphere::recognize(self)
+                }
+            })
+            .as_ref()
+    }
+
     /// The names of this surface's caches that hold a value, in declaration
     /// order. For the boolean's operand-state instrument
     /// (`BREP_DEBUG_OPERAND_STATE`), which reads which caches arrive warm.
@@ -215,6 +235,7 @@ impl NurbsSurface {
         let mut warm = Vec::new();
         let cells = [
             ("analytic", self.analytic.get().is_some()),
+            ("affine_sphere", self.affine_sphere.get().is_some()),
             ("validated", self.validated.get()),
             ("closed", self.closed_directions.get().is_some()),
             ("grid", self.projection_grid.get().is_some()),
@@ -238,6 +259,9 @@ impl NurbsSurface {
         let wants = |name: &str| names.iter().any(|&n| n == name || n == "all");
         if wants("analytic") {
             self.analytic = from.map(|f| f.analytic.clone()).unwrap_or_default();
+        }
+        if wants("affine_sphere") {
+            self.affine_sphere = from.map(|f| f.affine_sphere.clone()).unwrap_or_default();
         }
         if wants("validated") {
             self.validated = std::cell::Cell::new(from.is_some_and(|f| f.validated.get()));
@@ -267,6 +291,7 @@ impl NurbsSurface {
     }
 
     pub fn evaluate_homogeneous(&self, u: f64, v: f64) -> Result<Vec4, String> {
+        crate::projection_profile::count(crate::projection_profile::LANE_EVALUATE, self);
         self.ensure_valid()?;
         if self.degree_u > MAX_STACK_DEGREE || self.degree_v > MAX_STACK_DEGREE {
             return self.evaluate_homogeneous_heap(u, v);
@@ -376,7 +401,63 @@ impl NurbsSurface {
     /// outside.  Intersection and projection algorithms probe outside the
     /// domain, so this is a required capability of every surface.
     pub fn evaluate_extended(&self, u: f64, v: f64) -> Result<Vec3, String> {
+        if small_derivatives_enabled() {
+            return Ok(self.derivatives_extended_small(u, v, 0)?[0][0]);
+        }
         Ok(self.derivatives_extended(u, v, 0)?[0][0])
+    }
+
+    /// Allocation-free twin of [`Self::derivatives_extended`] for
+    /// `derivative_count <= 2` (lane O row 20): the same wrap, anchor and
+    /// bilinear extension, over [`Self::derivatives_small`], which is the
+    /// byte-faithful stack copy of [`Self::derivatives`]. Entries outside
+    /// `k + l <= derivative_count` stay `Vec3::default()`, as the Vec form
+    /// leaves them.
+    pub(crate) fn derivatives_extended_small(
+        &self,
+        u: f64,
+        v: f64,
+        derivative_count: usize,
+    ) -> Result<[[Vec3; 3]; 3], String> {
+        debug_assert!(derivative_count <= 2);
+        let [u0, u1] = self.domain_u()?;
+        let [v0, v1] = self.domain_v()?;
+        let (closed_u, closed_v) = self.closed_directions()?;
+        let mut uu = u;
+        let mut vv = v;
+        if closed_u && (u < u0 || u > u1) {
+            uu = u0 + (u - u0).rem_euclid(u1 - u0);
+        }
+        if closed_v && (v < v0 || v > v1) {
+            vv = v0 + (v - v0).rem_euclid(v1 - v0);
+        }
+        let du_out = if uu < u0 { uu - u0 } else if uu > u1 { uu - u1 } else { 0.0 };
+        let dv_out = if vv < v0 { vv - v0 } else if vv > v1 { vv - v1 } else { 0.0 };
+        if du_out == 0.0 && dv_out == 0.0 {
+            return self.derivatives_small(uu, vv, derivative_count);
+        }
+        let anchor_u = uu - du_out;
+        let anchor_v = vv - dv_out;
+        let base = self.derivatives_small(anchor_u, anchor_v, 2)?;
+        let mut result = [[Vec3::default(); 3]; 3];
+        result[0][0] = base[0][0]
+            .add(base[1][0].scale(du_out))
+            .add(base[0][1].scale(dv_out))
+            .add(base[1][1].scale(du_out * dv_out));
+        if derivative_count >= 1 {
+            result[1][0] = base[1][0].add(base[1][1].scale(dv_out));
+            result[0][1] = base[0][1].add(base[1][1].scale(du_out));
+            result[1][1] = base[1][1];
+        }
+        if derivative_count >= 2 {
+            if du_out == 0.0 {
+                result[2][0] = base[2][0];
+            }
+            if dv_out == 0.0 {
+                result[0][2] = base[0][2];
+            }
+        }
+        Ok(result)
     }
 
     /// Derivatives beyond the domain (§3.15).  The extension is C¹: first
@@ -389,6 +470,11 @@ impl NurbsSurface {
         v: f64,
         derivative_count: usize,
     ) -> Result<Vec<Vec<Vec3>>, String> {
+        if derivative_count <= 2 && small_derivatives_enabled() {
+            let small = self.derivatives_extended_small(u, v, derivative_count)?;
+            let order = derivative_count + 1;
+            return Ok((0..order).map(|k| (0..order).map(|l| small[k][l]).collect()).collect());
+        }
         let [u0, u1] = self.domain_u()?;
         let [v0, v1] = self.domain_v()?;
         let (closed_u, closed_v) = self.closed_directions()?;
@@ -452,6 +538,7 @@ impl NurbsSurface {
         v: f64,
         derivative_count: usize,
     ) -> Result<Vec<Vec<Vec3>>, String> {
+        crate::projection_profile::count(crate::projection_profile::LANE_DERIVATIVES, self);
         self.ensure_valid()?;
         let du = derivative_count.min(self.degree_u);
         let dv = derivative_count.min(self.degree_v);
@@ -469,6 +556,8 @@ impl NurbsSurface {
             let v = knot_clamp(&self.knots_v, self.degree_v, v);
             let span_u = knot_find_span(&self.knots_u, self.degree_u, u);
             let span_v = knot_find_span(&self.knots_v, self.degree_v, v);
+            // `derivative_count` reaches the degree here (blends ask for third
+            // partials), so the rows stay eight wide.
             let mut basis_u = [[0.0f64; MAX_STACK_ORDER]; MAX_STACK_ORDER];
             let mut basis_v = [[0.0f64; MAX_STACK_ORDER]; MAX_STACK_ORDER];
             basis_derivatives_into(
@@ -599,8 +688,11 @@ impl NurbsSurface {
             let v = knot_clamp(&self.knots_v, self.degree_v, v);
             let span_u = knot_find_span(&self.knots_u, self.degree_u, u);
             let span_v = knot_find_span(&self.knots_v, self.degree_v, v);
-            let mut basis_u = [[0.0f64; MAX_STACK_ORDER]; MAX_STACK_ORDER];
-            let mut basis_v = [[0.0f64; MAX_STACK_ORDER]; MAX_STACK_ORDER];
+            // Rows `..=du` / `..=dv` (at most three) are the only ones written
+            // or read; the eight-row fill was a measurable share of a sign
+            // reading's surface station (2026-11-02).
+            let mut basis_u = [[0.0f64; MAX_STACK_ORDER]; 3];
+            let mut basis_v = [[0.0f64; MAX_STACK_ORDER]; 3];
             basis_derivatives_into(
                 &self.knots_u,
                 self.degree_u,
@@ -825,14 +917,37 @@ impl NurbsSurface {
     /// Bit-identical to `derivatives(u, v, 1)` at `[0][0] / [1][0] / [0][1]`.
     #[inline]
     pub(crate) fn deriv1(&self, u: f64, v: f64) -> Result<(Vec3, Vec3, Vec3), String> {
-        let g = self.derivatives_small(u, v, 1)?;
-        Ok((g[0][0], g[1][0], g[0][1]))
+        // Degrees 1 and 2 in both directions (every carrier the kernel builds
+        // and the fitted patches it blends with) take the first-order twin
+        // with both degrees fixed at compile time; its arithmetic is
+        // `derivatives_small`'s to the bit (`deriv1_small_fixed`), and the
+        // mass sign reading's chord stations were a third `derivatives_small`
+        // self time after the basis recurrence (2026-11-02).
+        match (self.degree_u, self.degree_v) {
+            (1, 1) => self.deriv1_small_fixed::<1, 1>(u, v),
+            (2, 1) => self.deriv1_small_fixed::<2, 1>(u, v),
+            (1, 2) => self.deriv1_small_fixed::<1, 2>(u, v),
+            (2, 2) => self.deriv1_small_fixed::<2, 2>(u, v),
+            _ => {
+                let g = self.derivatives_small(u, v, 1)?;
+                Ok((g[0][0], g[1][0], g[0][1]))
+            }
+        }
     }
 
-    /// First-order rational recurrence with only its three live sums. The
-    /// control summation and dehomogenization keep derivatives_small's order.
-    /// Caller retains the existing wrapping, extension and refusal paths.
-    fn analytic_deriv1_small<const DEGREE_U: usize, const DEGREE_V: usize>(&self, u: f64, v: f64) -> Result<(Vec3, Vec3, Vec3), String> {
+    /// First-order rational recurrence with only its three live sums, for a
+    /// patch whose degrees are the const parameters. The clamp, span, basis
+    /// rows, control summation (row outer, column inner, scale then add from
+    /// the zero `Vec4`) and dehomogenization are `derivatives_small`'s in the
+    /// same order; the two recurrence steps written out here that
+    /// `derivatives_small` runs generically are exact no-ops at this order
+    /// (`binomial(1, 1)` is exactly `1.0`; the mixed term is the zero vector,
+    /// whose subtraction changes no bit). So the three results are the same
+    /// bits as `derivatives_small(u, v, 1)` at `[0][0]`, `[1][0]`, `[0][1]`
+    /// for ANY surface of these degrees, analytic or not
+    /// (`deriv1_degree_dispatch_tests`). Caller retains the existing
+    /// wrapping, extension and refusal paths.
+    fn deriv1_small_fixed<const DEGREE_U: usize, const DEGREE_V: usize>(&self, u: f64, v: f64) -> Result<(Vec3, Vec3, Vec3), String> {
         self.ensure_valid()?;
         let du = DEGREE_U.min(1);
         let dv = DEGREE_V.min(1);
@@ -910,10 +1025,10 @@ impl NurbsSurface {
                     | crate::AnalyticSurface::RuledRevolution { .. } | crate::AnalyticSurface::Sphere { .. }
                     | crate::AnalyticSurface::Torus { .. })) {
                 return match (self.degree_u, self.degree_v) {
-                    (1, 1) => self.analytic_deriv1_small::<1, 1>(uu, vv),
-                    (2, 1) => self.analytic_deriv1_small::<2, 1>(uu, vv),
-                    (1, 2) => self.analytic_deriv1_small::<1, 2>(uu, vv),
-                    (2, 2) => self.analytic_deriv1_small::<2, 2>(uu, vv),
+                    (1, 1) => self.deriv1_small_fixed::<1, 1>(uu, vv),
+                    (2, 1) => self.deriv1_small_fixed::<2, 1>(uu, vv),
+                    (1, 2) => self.deriv1_small_fixed::<1, 2>(uu, vv),
+                    (2, 2) => self.deriv1_small_fixed::<2, 2>(uu, vv),
                     _ => unreachable!(),
                 };
             }
@@ -1035,6 +1150,10 @@ impl NurbsSurface {
     }
 
     pub fn normal(&self, u: f64, v: f64) -> Result<Vec3, String> {
+        if small_derivatives_enabled() {
+            let derivatives = self.derivatives_small(u, v, 1)?;
+            return derivatives[1][0].cross(derivatives[0][1]).normalized();
+        }
         let derivatives = self.derivatives(u, v, 1)?;
         derivatives[1][0].cross(derivatives[0][1]).normalized()
     }
@@ -1046,7 +1165,12 @@ impl NurbsSurface {
     /// an offset's regularity factor 1 − d·κ vanishes exactly when an inward
     /// offset (d = −R) reaches the axis.
     pub fn principal_curvatures(&self, u: f64, v: f64) -> Result<(f64, f64), String> {
-        let derivatives = self.derivatives(u, v, 2)?;
+        let derivatives: [[Vec3; 3]; 3] = if small_derivatives_enabled() {
+            self.derivatives_small(u, v, 2)?
+        } else {
+            let heap = self.derivatives(u, v, 2)?;
+            [[heap[0][0], heap[0][1], heap[0][2]], [heap[1][0], heap[1][1], Vec3::default()], [heap[2][0], Vec3::default(), Vec3::default()]]
+        };
         let su = derivatives[1][0];
         let sv = derivatives[0][1];
         let cross = su.cross(sv);
@@ -1615,14 +1739,25 @@ fn normalized(parameters: &[f64]) -> Vec<f64> {
 
 
 
+
 fn analytic_deriv1_on() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("BREP_ANALYTIC_DERIV1").ok().as_deref() != Some("0"))
+    switch!("BREP_ANALYTIC_DERIV1", true)
 }
 
 
 /// Default-off until the evaluator's bitwise and complete-body gates qualify it.
 fn analytic_point_on() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("BREP_ANALYTIC_POINT").ok().as_deref() == Some("1"))
+    switch!("BREP_ANALYTIC_POINT", false)
 }
+
+/// SMALL DERIVATIVES (lane O row 20, 2026-10-29; on by default since the batch 5
+/// promotion, `BREP_SURFACE_SMALL_DERIVATIVES=0` reads the heap grid): `evaluate_extended`, `derivatives_extended` up to second order,
+/// `normal` and `principal_curvatures` read the stack twin
+/// [`NurbsSurface::derivatives_small`] instead of the heap grid. A third of the
+/// D2 outward shell's heap allocations were `NurbsSurface::derivatives` (a
+/// sampled-backtrace allocation census, cad-bot); the values are the same bits.
+pub(crate) fn small_derivatives_enabled() -> bool {
+    switch!("BREP_SURFACE_SMALL_DERIVATIVES", true)
+}
+
+

@@ -60,6 +60,7 @@ use serde_json::Value;
 /// exactly head-to-tail by [`weld_chain`].
 const JOIN_TOL: f64 = 1e-5;
 
+pub mod text;
 mod frame;
 mod geometry;
 mod chain;

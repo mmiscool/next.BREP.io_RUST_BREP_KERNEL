@@ -128,12 +128,8 @@ fn partition_faces_into_bodies(faces: &[FaceRecord], edges: &[EdgeRecord]) -> Ve
         .collect();
 
     let mut parent: Vec<usize> = (0..faces.len()).collect();
-    fn find(parent: &mut Vec<usize>, mut x: usize) -> usize {
-        while parent[x] != x {
-            parent[x] = parent[parent[x]];
-            x = parent[x];
-        }
-        x
+    fn find(parent: &mut Vec<usize>, x: usize) -> usize {
+        crate::union_find::find_root(parent, x)
     }
 
     // First face that referenced a given vertex; union subsequent faces to it.

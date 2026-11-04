@@ -2,11 +2,13 @@ use crate::{CamError,Point3,Tool,ToolKind};
 use serde::{Serialize,Deserialize};
 use std::f64::consts::TAU;
 
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Clone,Copy,Debug,PartialEq,Eq,Serialize,Deserialize)]
 pub enum InsertShape { C,D,V,T,W,R,S }
 
 /// ISO shape letter determines the included corner angle. For a round insert,
 /// edge_length means diameter and nose_radius must be half that diameter.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Clone,Debug,PartialEq,Serialize,Deserialize)]
 pub struct Insert {
     pub shape:InsertShape,
@@ -17,14 +19,18 @@ pub struct Insert {
     pub lead_angle_deg:f64,
     pub holder_angle_deg:f64,
 }
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Clone,Debug,PartialEq,Serialize,Deserialize)]
 pub struct Blade {pub width:f64,pub reach:f64,pub corner_radius:f64,pub holder_angle_deg:f64}
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Clone,Debug,PartialEq,Serialize,Deserialize)]
 pub struct ThreadInsert {pub pitch_min:f64,pub pitch_max:f64,pub angle_deg:f64,pub reach:f64,pub nose_radius:f64,pub holder_angle_deg:f64}
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Clone,Debug,PartialEq,Serialize,Deserialize)]
 pub struct BoringBar {pub diameter:f64,pub reach:f64,pub insert:Insert,pub insert_offset:Point3}
 
 /// Geometry supplement for the shared Tool; not a replacement Tool model.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Clone,Debug,PartialEq,Serialize,Deserialize)]
 #[serde(tag="kind",rename_all="camelCase")]
 pub enum TurningGeometry {Insert(Insert),Blade(Blade),Thread(ThreadInsert),BoringBar(BoringBar)}
@@ -33,6 +39,7 @@ pub enum TurningGeometry {Insert(Insert),Blade(Blade),Thread(ThreadInsert),Borin
 /// reference is its centre; blade reference is the middle of its cutting edge.
 /// `reference_to_tip` maps the reference to the selected cutting tip centre.
 /// Callers must translate by this offset when their toolpath uses that tip.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Clone,Debug,PartialEq,Serialize,Deserialize)]
 pub struct ToolEnvelope {
     pub vertices:Vec<Point3>,

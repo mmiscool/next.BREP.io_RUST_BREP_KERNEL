@@ -70,6 +70,11 @@ pub struct EngineState {
     interference_sequence: u64,
     illustration_snapshot: Option<illustration::IllustrationSnapshot>,
     geometry_diagnostics: std::collections::BTreeMap<String, serde_json::Value>,
+    /// A single feature staged by [`EngineState::stage_feature_begin`] whose
+    /// run has not landed yet (an agent's write; `batch.rs`).
+    staged_feature: Option<batch::StagedFeature>,
+    /// `History::busy_refused` already reported to the user.
+    busy_refused_seen: u64,
     /// The build report (`{featureErrors, unresolved, displayErrors}`) of the
     /// last history run, so the UI can show it without re-running.
     history_report: String,
@@ -96,6 +101,10 @@ pub struct EngineState {
     /// otherwise. The picked-name list here is the SINGLE source of truth while
     /// active (the UI reads it back; the viewport appends to it on a pick).
     pub ref_select: Option<RefSelectState>,
+    /// A finished REPLACE REPAIR pick `(mate, old ref, picked name)` waiting
+    /// for the replace dialog, which owns the remap (nested components
+    /// included) — see [`RefSelectTarget::ReplaceRepair`].
+    pub(crate) replace_repair_pick: Option<(String, String, String)>,
     /// Which entity KINDS a plain viewport click may select (the selection
     /// filter, mirroring the earlier `SelectionFilter.allowedSelectionTypes`). `select_top_at`
     /// consults it via `pick_filtered`; see the appended `SelectionFilter` impl
@@ -676,6 +685,13 @@ pub enum RefSelectTarget {
     /// names, as the components that hold them, through
     /// `simulation_refs::simulation_commit_refs`; nothing rolls.
     Simulation,
+    /// A REPLACE COMPONENT repair: a held mate's broken reference, re-aimed
+    /// at ONE face or edge picked in the view. `feature_id` is the mate id
+    /// and `path` is `[old reference]`. Finish commits nothing itself: it
+    /// hands `(mate, old ref, pick)` to the replace dialog
+    /// ([`EngineState::take_replace_repair_pick`]), whose repair also
+    /// reaches mates inside nested assemblies; nothing rolls.
+    ReplaceRepair,
 }
 
 /// Which occurrence field of a step a pick fills ([`RefSelectTarget::Instructions`]).
@@ -755,6 +771,7 @@ impl Default for EngineState {
             settings_generation: 1,
             dirty: true,
             ref_select: None,
+            replace_repair_pick: None,
             selection_filter: SelectionFilter::default(),
             transform_gizmo: TransformArm::default(),
             component_move: ComponentMoveArm::default(),
@@ -819,6 +836,8 @@ impl Default for EngineState {
             interference_sequence: 0,
             illustration_snapshot: None,
             geometry_diagnostics: Default::default(),
+            staged_feature: None,
+            busy_refused_seen: 0,
             run_generation: 0,
             applied_generation: 0,
             run_progress: None,

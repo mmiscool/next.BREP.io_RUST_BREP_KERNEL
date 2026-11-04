@@ -159,6 +159,7 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, String> {
         holes: Vec::new(),
         hole_bends: Vec::new(),
         outline_curves: Default::default(),
+        end_cuts: Vec::new(),
     };
     let last = flat_lens.len() - 1;
     let mut node = make_flat(last, flat_lens[last]);
@@ -173,6 +174,7 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, String> {
             inside_radius,
             k_factor,
             child: Box::new(node),
+            reliefs: Vec::new(),
         });
         node = flat;
     }
@@ -183,6 +185,7 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, String> {
         default_inside_radius: bend_radius,
         default_k_factor: k_factor,
         root_transform,
+        name_suffixes: Vec::new(),
     };
 
     let added = sheet_metal::register_folded(tree, &ctx.id)?;
@@ -394,17 +397,7 @@ fn classify_segment(
 
 /// Circumcenter of three 2D points (`None` when collinear).
 fn circumcenter(a: [f64; 2], b: [f64; 2], c: [f64; 2]) -> Option<[f64; 2]> {
-    let d = 2.0 * (a[0] * (b[1] - c[1]) + b[0] * (c[1] - a[1]) + c[0] * (a[1] - b[1]));
-    if d.abs() <= 1e-12 {
-        return None;
-    }
-    let aa = a[0] * a[0] + a[1] * a[1];
-    let bb = b[0] * b[0] + b[1] * b[1];
-    let cc = c[0] * c[0] + c[1] * c[1];
-    Some([
-        (aa * (b[1] - c[1]) + bb * (c[1] - a[1]) + cc * (a[1] - b[1])) / d,
-        (aa * (c[0] - b[0]) + bb * (a[0] - c[0]) + cc * (b[0] - a[0])) / d,
-    ])
+    crate::circumcenter_2d(a, b, c)
 }
 
 /// Merge consecutive straight elements that continue within [`TURN_TOL`] into

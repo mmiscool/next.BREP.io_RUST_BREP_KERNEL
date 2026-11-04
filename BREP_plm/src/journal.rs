@@ -119,8 +119,14 @@ impl<T: Keyed + Clone> Journaled<T> {
     }
 
     /// Close the change, keeping its edits; what it touched.
+    ///
+    /// In list order (removed records last), so new records are stored in
+    /// the order they were made: a reopened store lists them as this one does.
     pub fn commit(&mut self) -> Vec<Touched<T>> {
-        self.journal.take().unwrap_or_default().into_iter().map(|(key, before)| Touched { key, before }).collect()
+        let mut touched: Vec<Touched<T>> =
+            self.journal.take().unwrap_or_default().into_iter().map(|(key, before)| Touched { key, before }).collect();
+        touched.sort_by_key(|t| self.index.get(&t.key).copied().unwrap_or(usize::MAX));
+        touched
     }
 
     /// Close the change, putting every touched record back as it was.

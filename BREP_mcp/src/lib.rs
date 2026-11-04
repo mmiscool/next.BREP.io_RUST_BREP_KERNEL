@@ -8,7 +8,7 @@
 //! with, and the `brep-mcp` binary (`serve`, `schema`, `test`, `shot`,
 //! `render-mesh`).
 pub use brep_mcp_core::{
-    generate, host, http, image, plm_fixture, render_mesh, runner, schema, script, server, session, tools, validate,
+    generate, host, http, image, plm_fixture, program, render_mesh, runner, schema, script, server, session, tools, validate,
 };
 
 pub mod annotate;
@@ -18,3 +18,6 @@ pub mod headless;
 pub fn headless_backend() -> host::Backend {
     host::Backend::Spawn { name: "headless", spawn: std::sync::Arc::new(|cfg| headless::spawn(cfg)) }
 }
+
+/// Static application command metadata; discovery does not create a GPU.
+pub fn command_descriptions() -> serde_json::Value { brep_app::automation::command::describe() }

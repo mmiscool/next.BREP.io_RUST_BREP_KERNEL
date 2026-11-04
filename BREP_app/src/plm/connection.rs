@@ -51,6 +51,27 @@ pub struct Session {
     pub keep: Keep,
 }
 
+/// Where this session's PLM server URL is kept, for the Settings PLM tab's
+/// Server URL field ([`crate::store::ModelStore::plm_url_setting`]).
+#[derive(Clone, Debug, PartialEq)]
+pub struct UrlSetting {
+    /// The config directory whose `plm.json` the field writes.
+    pub dir: std::path::PathBuf,
+    /// The URL this session uses (or, not connected, would use): `None` when
+    /// nothing names one.
+    pub url: Option<String>,
+    /// Where `url` came from: `plm.json`, `BREP_PLM_URL` or `--plm-url`.
+    pub source: Option<super::config::Source>,
+}
+
+/// A Server URL the field saved: the URL as written, and whether this
+/// machine's sign-in for the server it replaced was dropped.
+#[derive(Clone, Debug, PartialEq)]
+pub struct UrlSaved {
+    pub url: String,
+    pub token_dropped: bool,
+}
+
 /// The URL and user in the label `super::backend::compose` gives a PLM
 /// store (`PLM <url> as <user>`), or `None` for any other store.
 pub fn parse_label(label: &str) -> Option<(String, String)> {

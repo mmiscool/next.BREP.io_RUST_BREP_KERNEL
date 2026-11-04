@@ -150,8 +150,34 @@ pub(crate) fn outer_accumulate(matrix: &mut [[f64; 3]; 3], value: Vec3, weight: 
     }
 }
 
+/// How [`jacobi_eigen_symmetric3`] turns a pivot pair with equal diagonals
+/// (`tau` = ±0, where `(1 + tau²)` gives `t = ±1`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JacobiZeroTurn {
+    /// `t = tau.signum()`: `-0.0` (equal diagonals, negative off-diagonal)
+    /// turns by `-1`. The RANSAC fits' convention.
+    Signed,
+    /// `t = +1` at either zero. The kernel carrier fits' and the
+    /// reconstruction copies' convention (`theta >= 0` / `theta == 0`).
+    Positive,
+}
+
 /// Dependency-free Jacobi eigensolver for real symmetric 3x3 matrices.
-pub(crate) fn eigen_symmetric3(mut a: [[f64; 3]; 3]) -> ([f64; 3], [Vec3; 3]) {
+///
+/// Classic Jacobi (largest off-diagonal first, at most 64 rotations, stop at
+/// `1e-15 * max|a|`). Returns the eigenvalues in ascending order and, for
+/// each, its eigenvector as `[x, y, z]`: the accumulated rotation's column,
+/// unit to rounding but NOT renormalised. The one eigensolver behind the
+/// RANSAC fits (`eigen_symmetric3` renormalises it), the kernel's mesh
+/// segmentation carrier fits and the reconstruction plane/axis reads.
+///
+/// `zero_turn` names the one place the former copies differed: a rotation
+/// whose pivot pair has equal diagonals (`tau` = ±0). Every other `tau`
+/// gives the same turn bit for bit under either convention.
+pub fn jacobi_eigen_symmetric3(
+    mut a: [[f64; 3]; 3],
+    zero_turn: JacobiZeroTurn,
+) -> ([f64; 3], [[f64; 3]; 3]) {
     let mut v = [[0.0; 3]; 3];
     for (i, row) in v.iter_mut().enumerate() {
         row[i] = 1.0;
@@ -173,7 +199,11 @@ pub(crate) fn eigen_symmetric3(mut a: [[f64; 3]; 3]) -> ([f64; 3], [Vec3; 3]) {
             break;
         }
         let tau = (a[q][q] - a[p][p]) / (2.0 * a[p][q]);
-        let t = tau.signum() / (tau.abs() + (1.0 + tau * tau).sqrt());
+        let t = if tau == 0.0 && zero_turn == JacobiZeroTurn::Positive {
+            1.0
+        } else {
+            tau.signum() / (tau.abs() + (1.0 + tau * tau).sqrt())
+        };
         let c = 1.0 / (1.0 + t * t).sqrt();
         let s = t * c;
         let apq = a[p][q];
@@ -197,12 +227,94 @@ pub(crate) fn eigen_symmetric3(mut a: [[f64; 3]; 3]) -> ([f64; 3], [Vec3; 3]) {
     let mut order = [0, 1, 2];
     order.sort_by(|&i, &j| a[i][i].total_cmp(&a[j][j]));
     let values = order.map(|i| a[i][i]);
-    let vectors = order.map(|i| {
-        Vec3::new(v[0][i], v[1][i], v[2][i])
-            .normalized()
-            .unwrap_or(Vec3::ZERO)
-    });
+    let vectors = order.map(|i| [v[0][i], v[1][i], v[2][i]]);
     (values, vectors)
+}
+
+/// [`jacobi_eigen_symmetric3`] with each eigenvector renormalised.
+pub(crate) fn eigen_symmetric3(a: [[f64; 3]; 3]) -> ([f64; 3], [Vec3; 3]) {
+    let (values, vectors) = jacobi_eigen_symmetric3(a, JacobiZeroTurn::Signed);
+    let vectors = vectors.map(|[x, y, z]| Vec3::new(x, y, z).normalized().unwrap_or(Vec3::ZERO));
+    (values, vectors)
+}
+
+/// Iteration and acceptance policy of [`refine_cone`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ConeRefinePolicy {
+    /// Gauss-Newton steps taken at most.
+    pub steps: usize,
+    /// Stop once a step's norm falls below this (`0.0`: always take `steps`).
+    pub stop_below: f64,
+    /// A point at most this far from the axis takes no part in a step.
+    pub min_radius: f64,
+    /// Clamp the half angle into `(1e-6, pi/2 - 1e-6)` after every step;
+    /// `false` leaves it to the caller's own range test.
+    pub clamp_angle: bool,
+}
+
+/// Gauss-Newton refinement of a cone over a point slice: apex, unit axis
+/// into the nappe, and half angle, with the six parameters apex (3), two
+/// axis tilts along an orthonormal frame of the axis, and the angle. The
+/// residual of a point is `rho cos(a) - h sin(a)` (h along the axis, rho
+/// from it). Each step solves the normal equations with `solve_linear`.
+/// `None` when the axis cannot be normalised, a step is singular, or the
+/// result is not finite.
+pub fn refine_cone(
+    points: &[[f64; 3]],
+    apex: [f64; 3],
+    axis: [f64; 3],
+    half_angle: f64,
+    policy: ConeRefinePolicy,
+) -> Option<([f64; 3], [f64; 3], f64)> {
+    let mut apex = Vec3::new(apex[0], apex[1], apex[2]);
+    let mut axis = Vec3::new(axis[0], axis[1], axis[2]).normalized()?;
+    let mut half_angle = half_angle;
+    for _ in 0..policy.steps {
+        let (e1, e2) = axis.orthonormal_basis()?;
+        let (sin_a, cos_a) = half_angle.sin_cos();
+        let mut ata = vec![vec![0.0_f64; 6]; 6];
+        let mut atb = vec![0.0_f64; 6];
+        for p in points {
+            let d = Vec3::new(p[0], p[1], p[2]) - apex;
+            let h = d.dot(axis);
+            let radial = d - axis * h;
+            let rho = radial.length();
+            if rho <= policy.min_radius {
+                continue;
+            }
+            let w = radial / rho;
+            let residual = rho * cos_a - h * sin_a;
+            let j_apex = axis * sin_a - w * cos_a;
+            let c_tilt = -((h / rho) * cos_a + sin_a);
+            let row = [
+                j_apex.x,
+                j_apex.y,
+                j_apex.z,
+                c_tilt * d.dot(e1),
+                c_tilt * d.dot(e2),
+                -rho * sin_a - h * cos_a,
+            ];
+            for i in 0..6 {
+                for j in 0..6 {
+                    ata[i][j] += row[i] * row[j];
+                }
+                atb[i] -= row[i] * residual;
+            }
+        }
+        let step = solve_linear(ata, atb)?;
+        apex = apex + Vec3::new(step[0], step[1], step[2]);
+        axis = (axis + e1 * step[3] + e2 * step[4]).normalized()?;
+        half_angle += step[5];
+        if policy.clamp_angle {
+            half_angle = half_angle.clamp(1e-6, std::f64::consts::FRAC_PI_2 - 1e-6);
+        }
+        let step_size = step.iter().map(|s| s * s).sum::<f64>().sqrt();
+        if step_size < policy.stop_below {
+            break;
+        }
+    }
+    (apex.is_finite() && axis.is_finite() && half_angle.is_finite())
+        .then_some(([apex.x, apex.y, apex.z], [axis.x, axis.y, axis.z], half_angle))
 }
 
 pub(crate) fn solve_linear(mut a: Vec<Vec<f64>>, mut b: Vec<f64>) -> Option<Vec<f64>> {
@@ -240,18 +352,21 @@ pub(crate) fn solve_linear(mut a: Vec<Vec<f64>>, mut b: Vec<f64>) -> Option<Vec<
     b.iter().all(|x| x.is_finite()).then_some(b)
 }
 
-pub(crate) fn least_squares(
-    rows: &[Vec<f64>],
+/// Rows may be `Vec<f64>` or fixed arrays (`[f64; 3]` saves the hot torus and
+/// circle initializers one allocation per sample); the arithmetic is the same.
+pub(crate) fn least_squares<R: AsRef<[f64]>>(
+    rows: &[R],
     rhs: &[f64],
     regularization: f64,
 ) -> Option<Vec<f64>> {
-    let n = rows.first()?.len();
-    if rows.len() != rhs.len() || rows.iter().any(|r| r.len() != n) {
+    let n = rows.first()?.as_ref().len();
+    if rows.len() != rhs.len() || rows.iter().any(|r| r.as_ref().len() != n) {
         return None;
     }
     let mut ata = vec![vec![0.0; n]; n];
     let mut atb = vec![0.0; n];
     for (row, &value) in rows.iter().zip(rhs) {
+        let row = row.as_ref();
         for i in 0..n {
             atb[i] += row[i] * value;
             for j in 0..n {
@@ -271,27 +386,28 @@ pub(crate) fn least_squares(
 /// intended for small parameter counts whose observation matrix can be badly
 /// conditioned but still has observable full rank, such as tangent planes on
 /// a narrowly trimmed cone.
-pub(crate) fn least_squares_qr(
-    rows: &[Vec<f64>],
+pub(crate) fn least_squares_qr<R: AsRef<[f64]>>(
+    rows: &[R],
     rhs: &[f64],
     relative_rank_min: f64,
 ) -> Option<Vec<f64>> {
-    let parameter_count = rows.first()?.len();
+    let parameter_count = rows.first()?.as_ref().len();
     if parameter_count == 0
         || rows.len() < parameter_count
         || rows.len() != rhs.len()
         || !relative_rank_min.is_finite()
         || relative_rank_min < 0.0
-        || rows
-            .iter()
-            .any(|row| row.len() != parameter_count || row.iter().any(|value| !value.is_finite()))
+        || rows.iter().any(|row| {
+            let row = row.as_ref();
+            row.len() != parameter_count || row.iter().any(|value| !value.is_finite())
+        })
         || rhs.iter().any(|value| !value.is_finite())
     {
         return None;
     }
 
     let mut columns: Vec<Vec<f64>> = (0..parameter_count)
-        .map(|column| rows.iter().map(|row| row[column]).collect())
+        .map(|column| rows.iter().map(|row| row.as_ref()[column]).collect())
         .collect();
     let mut residual_rhs = rhs.to_vec();
     let mut permutation: Vec<usize> = (0..parameter_count).collect();

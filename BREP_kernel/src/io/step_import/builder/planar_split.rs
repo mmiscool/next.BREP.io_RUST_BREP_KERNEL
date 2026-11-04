@@ -290,7 +290,7 @@ pub(in crate::step_import) fn ear_clip(polygon: &[[f64; 2]]) -> Option<Vec<[usiz
         .map(|index| {
             let a = polygon[index];
             let b = polygon[(index + 1) % count];
-            a[0] * b[1] - b[0] * a[1]
+            crate::polygon::area_term(a, b)
         })
         .sum();
     if signed_area == 0.0 {

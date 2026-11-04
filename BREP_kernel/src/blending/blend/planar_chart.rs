@@ -353,7 +353,7 @@ pub(crate) fn fit_planar_charts_to_trims(
 /// It also switches `transverse_curve`'s exact ends at EXTEND landings
 /// (`edge/support.rs`), the other half of the same repair.
 pub(in crate::blend) fn ruled_chart_on() -> bool {
-    !matches!(std::env::var("BREP_BLEND_RULED_CHART").as_deref(), Ok("0") | Ok("off"))
+    switch!(live "BREP_BLEND_RULED_CHART", true)
 }
 
 /// Samples per coedge when measuring whether its pcurve follows its edge.

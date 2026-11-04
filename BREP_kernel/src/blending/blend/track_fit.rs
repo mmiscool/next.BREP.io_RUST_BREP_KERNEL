@@ -153,6 +153,13 @@ pub(in crate::blend) fn project_track(
 /// a 1e-7 floor (measured 2026-09-17 on the revolution × NURBS rim: the ladder
 /// stalled at 1.6e-7–3.1e-7 however dense). An analytic carrier's projection is
 /// closed-form and exact, so it is returned as it is.
+///
+/// Read the same tangent extension as `carrier_point`: at an open boundary
+/// the seeded projector can return either an in-domain or an extrapolated
+/// parameter. Clamped derivatives and an in-domain-only step used to leave
+/// those two seeds at different feet (the shell-column flush join differed
+/// by 2.045e-7), falsely reporting a branch change. The local step bound still
+/// prevents this refinement from seeking a distant branch.
 fn polish(surface: &NurbsSurface, point: Vec3, uv: [f64; 2]) -> Result<[f64; 2], KernelRefusal> {
     if surface.analytic().is_some() {
         return Ok(uv);
@@ -160,18 +167,16 @@ fn polish(surface: &NurbsSurface, point: Vec3, uv: [f64; 2]) -> Result<[f64; 2],
     let [u0, u1] = surface.domain_u().or_refuse(KernelStage::Refine, "domain")?;
     let [v0, v1] = surface.domain_v().or_refuse(KernelStage::Refine, "domain")?;
     let (closed_u, closed_v) = surface.closed_directions().or_refuse(KernelStage::Refine, "closed_directions")?;
-    let inside = |value: f64, low: f64, high: f64, closed: bool| -> Option<f64> {
-        if value >= low && value <= high {
-            Some(value)
-        } else if closed {
-            Some(low + (value - low).rem_euclid(high - low))
+    let wrap = |value: f64, low: f64, high: f64, closed: bool| {
+        if closed && (value < low || value > high) {
+            low + (value - low).rem_euclid(high - low)
         } else {
-            None
+            value
         }
     };
     let mut current = uv;
     for _ in 0..8 {
-        let d = surface.derivatives_small(current[0], current[1], 2).or_refuse(KernelStage::Refine, "derivatives")?;
+        let d = surface.derivatives_extended_small(current[0], current[1], 2).or_refuse(KernelStage::Refine, "derivatives")?;
         let residual = d[0][0].sub(point);
         let (su, sv) = (d[1][0], d[0][1]);
         let (f, g) = (su.dot(residual), sv.dot(residual));
@@ -188,13 +193,10 @@ fn polish(surface: &NurbsSurface, point: Vec3, uv: [f64; 2]) -> Result<[f64; 2],
         if !(du.abs() <= 1e-3 * (u1 - u0) && dv.abs() <= 1e-3 * (v1 - v0)) {
             break;
         }
-        let (Some(u), Some(v)) = (
-            inside(current[0] + du, u0, u1, closed_u),
-            inside(current[1] + dv, v0, v1, closed_v),
-        ) else {
-            break;
-        };
-        current = [u, v];
+        current = [
+            wrap(current[0] + du, u0, u1, closed_u),
+            wrap(current[1] + dv, v0, v1, closed_v),
+        ];
         if du.abs() <= 1e-15 * (u1 - u0) && dv.abs() <= 1e-15 * (v1 - v0) {
             break;
         }
@@ -433,19 +435,8 @@ pub(in crate::blend) fn line_multiplicity(degree: usize) -> usize {
 /// `set_c1_knot_lines_for_test` forces either way on a test's thread.
 const C1_KNOT_LINES_DEFAULT: bool = false;
 
-thread_local! {
-    static C1_KNOT_LINES_FOR_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
-}
-
 pub(crate) fn c1_knot_lines_on() -> bool {
-    if let Some(forced) = C1_KNOT_LINES_FOR_TEST.with(|forced| forced.get()) {
-        return forced;
-    }
-    match std::env::var("BREP_BLEND_TRACK_C1_KNOT_LINES").as_deref() {
-        Ok("0") => false,
-        Ok("1") => true,
-        _ => C1_KNOT_LINES_DEFAULT,
-    }
+    switch!(live "BREP_BLEND_TRACK_C1_KNOT_LINES", C1_KNOT_LINES_DEFAULT)
 }
 
 
@@ -720,6 +711,10 @@ pub(in crate::blend) fn rung_checks(
 #[derive(Default)]
 struct CheckCache {
     points: std::collections::HashMap<[u64; 5], Vec3>,
+    // The previous verdict's intervals, in track order. A monotone merge
+    // reuses unchanged bounds/seed feet without hashing each sample or block.
+    // Entries absent from a later track may be discarded: a miss recomputes.
+    stencils: Vec<([u64; 6], [Vec3; LOCAL_STENCIL - 1])>,
     analytic_readings: u64,
     hits: u64,
 }
@@ -727,13 +722,14 @@ struct CheckCache {
 impl Drop for CheckCache {
     fn drop(&mut self) {
         crate::blend::record_count("count.track.check_cache_hits", self.hits);
+        crate::blend::record_count("count.track.stencil_cache_intervals", self.stencils.len() as u64);
         crate::blend::record_count("count.track.analytic_check_points_reused", self.analytic_readings);
     }
 }
 
 fn analytic_check_reuse_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("BREP_TRACK_ANALYTIC_CHECK_REUSE").ok().as_deref() == Some("1"))
+    *ON.get_or_init(|| std::env::var("BREP_TRACK_ANALYTIC_CHECK_REUSE").ok().as_deref() != Some("0"))
 }
 
 /// The carrier point of the curve's own foot at `fraction`, sought from
@@ -745,12 +741,25 @@ fn check_point(
     seeds: [[f64; 2]; 2],
     cache: &mut Option<&mut CheckCache>,
 ) -> Result<Vec3, KernelRefusal> {
+    check_point_with_storage(surface, at, fraction, seeds, cache, true)
+}
+
+fn check_point_with_storage(
+    surface: &NurbsSurface,
+    at: &dyn Fn(f64) -> Result<Vec3, String>,
+    fraction: f64,
+    seeds: [[f64; 2]; 2],
+    cache: &mut Option<&mut CheckCache>,
+    store: bool,
+) -> Result<Vec3, KernelRefusal> {
     let key = [fraction.to_bits(), seeds[0][0].to_bits(), seeds[0][1].to_bits(), seeds[1][0].to_bits(), seeds[1][1].to_bits()];
     if let Some(cache) = cache.as_mut() {
-        if let Some(known) = cache.points.get(&key) {
-            let known = *known;
-            cache.hits += 1;
-            return Ok(known);
+        if store {
+            if let Some(known) = cache.points.get(&key) {
+                let known = *known;
+                cache.hits += 1;
+                return Ok(known);
+            }
         }
     }
     let reuse = analytic_check_reuse_on();
@@ -766,7 +775,7 @@ fn check_point(
         None => surface.evaluate(u, v).or_refuse(KernelStage::Refine, "evaluate")?,
     };
     if let Some(cache) = cache.as_mut() {
-        cache.points.insert(key, point);
+        if store { cache.points.insert(key, point); }
         if retained.is_some() {
             cache.analytic_readings += 1;
         }
@@ -1307,6 +1316,45 @@ pub(in crate::blend) fn read_shipped_pcurve(
     read_shipped_pcurve_memo(surface, rail, pcurve, d0, d1, &mut FootMemo::transient())
 }
 
+// The caller has validated both domains. These short-loop specializations
+// retain the general evaluator's basis recurrence and control summation order.
+fn small_carrier_homogeneous<const DU: usize, const DV: usize>(surface: &NurbsSurface, u: f64, v: f64) -> Vec4 {
+    fn basis<const D: usize>(knots: &[f64], span: usize, parameter: f64) -> [f64; 3] {
+        let mut values = [0.0; 3];
+        let mut left = [0.0; 3];
+        let mut right = [0.0; 3];
+        values[0] = 1.0;
+        for j in 1..=D {
+            left[j] = parameter - knots[span + 1 - j];
+            right[j] = knots[span + j] - parameter;
+            let mut saved = 0.0;
+            for r in 0..j {
+                let denominator = right[r + 1] + left[j - r];
+                let temporary = if denominator.abs() <= crate::tolerance::FP_FLOOR { 0.0 } else { values[r] / denominator };
+                values[r] = saved + right[r + 1] * temporary;
+                saved = left[j - r] * temporary;
+            }
+            values[j] = saved;
+        }
+        values
+    }
+    let u = crate::curve::knot_clamp(&surface.knots_u, DU, u);
+    let v = crate::curve::knot_clamp(&surface.knots_v, DV, v);
+    let span_u = crate::curve::knot_find_span(&surface.knots_u, DU, u);
+    let span_v = crate::curve::knot_find_span(&surface.knots_v, DV, v);
+    let basis_u = basis::<DU>(&surface.knots_u, span_u, u);
+    let basis_v = basis::<DV>(&surface.knots_v, span_v, v);
+    let mut point = Vec4 { x: 0.0, y: 0.0, z: 0.0, w: 0.0 };
+    for (i, value_u) in basis_u[..=DU].iter().enumerate() {
+        let row = &surface.control_points[span_u - DU + i];
+        for (j, value_v) in basis_v[..=DV].iter().enumerate() {
+            point = point.add(row[span_v - DV + j].scale(value_u * value_v));
+        }
+    }
+    point
+}
+
+
 /// The carrier's point at `(u, v)` as `evaluate_extended` reads it, without
 /// the derivative engine. Inside the domain the extended evaluator returns
 /// `derivatives(u, v, 0)[0][0]`: the basis derivative table (A2.3) for zero
@@ -1326,7 +1374,13 @@ pub(in crate::blend) fn carrier_point(surface: &NurbsSurface, u: f64, v: f64) ->
     let [u0, u1] = surface.domain_u()?;
     let [v0, v1] = surface.domain_v()?;
     if u >= u0 && u <= u1 && v >= v0 && v <= v1 {
-        let homogeneous = surface.evaluate_homogeneous(u, v)?;
+        let homogeneous = match (surface.degree_u, surface.degree_v) {
+            (1, 1) => small_carrier_homogeneous::<1, 1>(surface, u, v),
+            (1, 2) => small_carrier_homogeneous::<1, 2>(surface, u, v),
+            (2, 1) => small_carrier_homogeneous::<2, 1>(surface, u, v),
+            (2, 2) => small_carrier_homogeneous::<2, 2>(surface, u, v),
+            _ => surface.evaluate_homogeneous(u, v)?,
+        };
         let weight = homogeneous.w;
         // The derivative engine's bar (`NurbsSurface::derivatives`, EPS).
         if weight.abs() <= 1e-12 {
@@ -1374,6 +1428,12 @@ impl FootMemo {
     /// A memo that stores no foot (see `transient`).
     pub(in crate::blend) fn transient() -> Self {
         FootMemo { feet: Default::default(), transient: true }
+    }
+
+    /// A replacement curve gets fresh feet, but a one-shot caller still has
+    /// no later reader to share them with. Preserve its storage policy.
+    pub(in crate::blend) fn empty_like(&self) -> Self {
+        FootMemo { feet: Default::default(), transient: self.transient }
     }
 
     /// How many feet are stored.
@@ -1605,6 +1665,12 @@ fn stencil_verdict_cached(
     mut cache: Option<&mut CheckCache>,
 ) -> Result<(f64, Vec<usize>, Option<WorstCheck>, Vec<(f64, f64, f64, f64)>), KernelRefusal> {
     let timer = crate::blend::BlendTimer::start("timing.track.stencil_ms");
+    let interval_cache = cache.is_some();
+    let previous_stencils = if interval_cache {
+        cache.as_mut().map(|c| std::mem::take(&mut c.stencils)).unwrap_or_default()
+    } else { Vec::new() };
+    let mut previous_index = 0;
+    let mut next_stencils = if interval_cache { Vec::with_capacity(track.fractions.len().saturating_sub(1)) } else { Vec::new() };
     // Opt-in attribution only: clock reads are excluded from normal profiling.
     let profile_image = crate::blend::timing::enabled()
         && std::env::var("BREP_PROFILE_TRACK_IMAGE").ok().as_deref() == Some("1");
@@ -1618,11 +1684,31 @@ fn stencil_verdict_cached(
     let mut worst: Option<(f64, WorstCheck)> = None;
     for index in 0..track.fractions.len() - 1 {
         let (low, high) = (track.fractions[index], track.fractions[index + 1]);
+        let seeds = [track.feet[index], track.feet[index + 1]];
+        let key = [low.to_bits(), high.to_bits(), seeds[0][0].to_bits(), seeds[0][1].to_bits(), seeds[1][0].to_bits(), seeds[1][1].to_bits()];
+        // Track fractions are strictly increasing. Their nonnegative IEEE
+        // bits have the same order, but compare decoded values to keep signed
+        // zero's ordering harmless. Full key equality still requires bits.
+        while previous_index < previous_stencils.len()
+            && f64::from_bits(previous_stencils[previous_index].0[0]) < low {
+            previous_index += 1;
+        }
+        let known = previous_stencils.get(previous_index)
+            .filter(|(previous, _)| *previous == key).map(|(_, points)| points);
+        let mut stencil = [Vec3::default(); LOCAL_STENCIL - 1];
         let mut distances = Vec::with_capacity(LOCAL_STENCIL - 1);
         let mut interval_worst = (0.0_f64, 0.5 * (low + high));
         for j in 1..LOCAL_STENCIL {
             let fraction = low + (high - low) * j as f64 / LOCAL_STENCIL as f64;
-            let on_carrier = check_point(surface, at, fraction, [track.feet[index], track.feet[index + 1]], &mut cache)?;
+            let on_carrier = match &known {
+                Some(points) => {
+                    if let Some(cache) = cache.as_mut() { cache.hits += 1; }
+                    points[j - 1]
+                }
+                None => check_point_with_storage(surface, at, fraction, seeds, &mut cache,
+                    !interval_cache || j == LOCAL_STENCIL / 2)?,
+            };
+            stencil[j - 1] = on_carrier;
             let uv = curve.evaluate(fraction).or_refuse(KernelStage::Refine, "evaluate")?;
             let image_started = profile_image.then(web_time::Instant::now);
             let image = pcurve_image(surface, uv.x, uv.y).or_refuse(KernelStage::Refine, "evaluate")?;
@@ -1639,9 +1725,13 @@ fn stencil_verdict_cached(
             }
             distances.push(distance);
         }
+        if interval_cache { next_stencils.push((key, stencil)); }
         let (miss, _) = classify_checks(&distances, tolerance)?;
         per_interval.push(miss);
         located.push((miss, interval_worst.1, low, high));
+    }
+    if interval_cache {
+        if let Some(cache) = cache.as_mut() { cache.stencils = next_stencils; }
     }
     let (miss, over) = classify_checks(&per_interval, tolerance)?;
     if profile_image {
@@ -2290,4 +2380,6 @@ fn interpolate_with_tangents(
 fn inserted_at(fractions: &[f64], fraction: f64) -> bool {
     fractions.iter().any(|known| (known - fraction).abs() <= 1e-15)
 }
+
+
 

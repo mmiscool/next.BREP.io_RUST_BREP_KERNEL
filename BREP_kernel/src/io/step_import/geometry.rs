@@ -702,13 +702,7 @@ fn revolution_profile_azimuth(profile: &NurbsCurve, frame: &Frame) -> f64 {
 /// Rotate a point `angle` radians about the line (`axis_point`, unit `axis`),
 /// right-hand rule (Rodrigues' rotation).
 fn rotate_point_about_axis(point: Vec3, axis_point: Vec3, axis: Vec3, angle: f64) -> Vec3 {
-    let v = point.sub(axis_point);
-    let (sin, cos) = angle.sin_cos();
-    let rotated = v
-        .scale(cos)
-        .add(axis.cross(v).scale(sin))
-        .add(axis.scale(axis.dot(v) * (1.0 - cos)));
-    axis_point.add(rotated)
+    axis_point.add(point.sub(axis_point).rotate_about(axis, angle))
 }
 
 /// Rotate every control point of a curve about the axis line, preserving
