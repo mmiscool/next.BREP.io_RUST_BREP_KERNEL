@@ -95,6 +95,24 @@ pub(super) fn integrate_trimmed_multi_with(
     kinds: &[Integrand],
     allow_winding: bool,
 ) -> Result<Vec<f64>, String> {
+    // `BREP_MASS_ISO_RECT_TRIMMED` (default on, `=0` off): a face whose one loop is
+    // an iso-rectangle of its carrier (pole sides included) is read on the
+    // untrimmed sweep's rules over that rectangle, as the sign reading
+    // already does, instead of by chord polygons and the cell quadtree.
+    // brep-bench tangent/half-balls-overlapping: the kept quarter sphere,
+    // [0.25, 0.75] x [0.5, 1] with its pole side stored over the whole
+    // period, read 78.541228 on the trimmed route against πR² = 78.539816.
+    // Only on a face that keeps its carrier's orientation: the recognizer
+    // accepts counter-clockwise loops, and on a reversed face
+    // (`same_sense = false`) a counter-clockwise loop bounds the COMPLEMENT
+    // of the rectangle (`spherical_hole_measures_the_complement_in_both_face_
+    // orientations`). `BREP_MASS_ISO_RECT=0` keeps it off with the sign
+    // reading's own route.
+    if super::polygons::pole_side_clip_on() && face.same_sense && super::measures::iso_rectangle_route_on() {
+        if let Some(rectangle) = iso_rectangle_trim(face)? {
+            return integrate_iso_rectangle_multi(face, rectangle, kinds);
+        }
+    }
     let ku = crate::KnotVector::new(face.surface.knots_u.clone(), face.surface.degree_u)?;
     let kv = crate::KnotVector::new(face.surface.knots_v.clone(), face.surface.degree_v)?;
     let [u0, u1] = ku.domain();
@@ -406,6 +424,7 @@ pub(super) fn integrate_trimmed_polys(
         p.base_cells += stack.len() as u64;
         p.base_clip_ms += super::profile::elapsed_ms(base_clip_started);
     });
+    let memo_before = super::cell_memo::counts();
     let cells_started = super::profile::profile_started();
     while let Some((cell, depth, clipped)) = stack.pop() {
         let cell_area = (cell[1] - cell[0]) * (cell[3] - cell[2]);
@@ -536,6 +555,10 @@ pub(super) fn integrate_trimmed_polys(
         mass_profile(|p| p.leaf_ms += super::profile::elapsed_ms(leaf_started));
     }
     mass_profile(|p| p.cells_ms += super::profile::elapsed_ms(cells_started));
+    if crate::profile::profile_enabled() {
+        let after = super::cell_memo::counts();
+        eprintln!("mass.cell_memo hits={} misses={}", after.0 - memo_before.0, after.1 - memo_before.1);
+    }
     let corr_started = super::profile::profile_started();
     curved_boundary_correction(face, polygons, extended, domain, orientation, &station, &mut totals)?;
     mass_profile(|p| p.corr_ms += super::profile::elapsed_ms(corr_started));

@@ -493,9 +493,32 @@ fn component_update(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
     Ok(Outcome::Done(json!({ "outdated": outdated, "missing": missing, "refreshed": refreshed })))
 }
 
+/// A part's attributes with its mass reading, or `None` while a measurement
+/// is still in flight (the command then polls until it lands).
+fn part_mass_reply(engine: &mut brep_render::engine_state::EngineState, part: &str) -> Option<Value> {
+    let report = engine.part_mass(part);
+    if report.status == brep_render::engine_state::part_mass::MassStatus::Pending {
+        return None;
+    }
+    Some(json!({
+        "attributes": engine.part_attributes(part),
+        "record": engine.part_bom_record_cached(part).0,
+        "massProperties": report.to_json(),
+    }))
+}
+
 fn bom_part_attributes(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
     let a: PartNameArgs = parse_args(args)?;
-    Ok(Outcome::Done(json!({ "attributes": ctx.app.docs.engine().part_attributes(&a.part_name) })))
+    if let Some(reply) = part_mass_reply(ctx.app.docs.engine_mut(), &a.part_name) {
+        return Ok(Outcome::Done(reply));
+    }
+    let handle = ctx.app.docs.active().handle().to_string();
+    Ok(Outcome::Poll(Box::new(move |ctx: &mut Ctx<'_>| {
+        let Some(engine) = ctx.app.docs.engine_of_handle_mut(&handle) else {
+            return Some(Err("document_unknown: the document closed while it was being measured".into()));
+        };
+        part_mass_reply(engine, &a.part_name).map(|reply| Ok(Outcome::Done(reply)))
+    })))
 }
 
 fn bom_set_part_attribute(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
@@ -514,10 +537,10 @@ fn bom_set_occurrence_attribute(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcom
 pub static COMMANDS: &[CommandSpec] = &[
     app_command!("assembly", "assembly_state", "The assembly: component instances, constraints, per-constraint solve statuses and the remaining degrees of freedom. `hasAssembly` is false for a document with no components.", NoArgs, assembly_state, Read, READ, super::assembly_output_schema::state),
     app_command!("assembly", "assembly_constraint_catalogue", "Every mate constraint the kernel offers, with its parameter schema — the types `assembly_add_constraint` takes.", NoArgs, assembly_constraint_catalogue, Read, READ, super::assembly_output_schema::catalogue),
-    app_command!("assembly", "assembly_add_constraint", "Add a mate constraint and (when auto-solve is on) re-solve. Returns the minted constraint id.", AddConstraintArgs, assembly_add_constraint, Mutate, MUTATE, schema_of::<ConstraintAdded>),
+    app_command!("assembly", "assembly_add_constraint", "Add a mate constraint and (when auto-solve is on) re-solve. Returns the minted constraint id. There is no `fixed` constraint: a part is fixed by its own setting (`component_set_fixed`), and `type: fixed` is refused naming it.", AddConstraintArgs, assembly_add_constraint, Mutate, MUTATE, schema_of::<ConstraintAdded>),
     app_command!("assembly", "assembly_update_constraint", "Replace a constraint's inputParams and re-solve.", UpdateConstraintArgs, assembly_update_constraint, Mutate, MUTATE),
     app_command!("assembly", "assembly_remove_constraint", "Delete a constraint and re-solve.", ConstraintIdArgs, assembly_remove_constraint, Mutate, DESTRUCTIVE, super::assembly_output_schema::mutation_empty),
-    app_command!("assembly", "assembly_set_constraint_enabled", "Suppress or re-enable one constraint and re-solve.", ConstraintEnabledArgs, assembly_set_constraint_enabled, Mutate, MUTATE, super::assembly_output_schema::mutation_empty),
+    app_command!("assembly", "assembly_set_constraint_enabled", "Disable or re-enable one constraint and re-solve.", ConstraintEnabledArgs, assembly_set_constraint_enabled, Mutate, MUTATE, super::assembly_output_schema::mutation_empty),
     app_command!("assembly", "assembly_move_constraint", "Move a constraint to a new position in the list and re-solve (solve order is list order).", ConstraintMoveArgs, assembly_move_constraint, Mutate, MUTATE, super::assembly_output_schema::mutation_empty),
     app_command!("assembly", "assembly_solve", "Run the constraint solver now (the manual Solve the panel offers when auto-solve is off) and return the statuses and remaining DOF.", NoArgs, assembly_solve, Mutate, MUTATE, super::assembly_output_schema::solve),
     app_command!("assembly", "assembly_parts_library", "The document's parts-library entry names — what `component_insert` places.", NoArgs, assembly_parts_library, Read, READ, super::assembly_output_schema::parts),
@@ -528,15 +551,15 @@ pub static COMMANDS: &[CommandSpec] = &[
     app_command!("assembly", "assembly_replace_delete", "Delete a mate a replace is holding, at any depth: a top-level id (`CONC1`) or a sub-assembly's mate by its occurrence path (`ACOMP1:CONC1`, which edits that sub-assembly's definition). One undo step.", ConstraintIdArgs, assembly_replace_delete, Mutate, MUTATE, super::assembly_output_schema::replace_unresolved),
     app_command!("assembly", "assembly_replace_accept", "Accept the PRE-TICKED suggestions (the entity whose geometry is the old one's) of the given held mates, or of every held mate at every depth, as one undo step.", ReplaceAcceptArgs, assembly_replace_accept, Mutate, MUTATE, super::assembly_output_schema::replace_accept),
     app_command!("assembly", "component_info", "One component instance with authored expressions, requested and solver-adjusted evaluated placement matrices, frame/units, evaluation status, attributes and member names. Numeric legacy fields describe evaluated geometry; failed or pending placement is null.", ComponentIdArgs, component_info, Read, READ, super::assembly_output_schema::component),
-    app_command!("assembly", "component_set_fixed", "Ground or unground a component (its ACOMP `isFixed`) and re-run.", ComponentFixedArgs, component_set_fixed, Mutate, MUTATE),
+    app_command!("assembly", "component_set_fixed", "Fix or unfix a component: its ONE fixed setting (the ACOMP `isFixed`; for a part inside a flexible sub-assembly, `ACOMP1:ACOMP2`, the instance's `flexibleFixed`), one undo step, and re-run. The components list, the BOM row menu and the context bar's Fix/Unfix all make this same change.", ComponentFixedArgs, component_set_fixed, Mutate, MUTATE),
     app_command!("assembly", "component_select", "Select exactly these component instances (their member solids) — the selection a constraint's reference pick reads.", ComponentSelectArgs, component_select, Mutate, MUTATE_NOWAIT, super::assembly_output_schema::selected),
     app_command!("assembly", "interference_check", "Check component pairs with an explicit pair budget and revision-bound continuation; clearance_mm adds a near-miss gap check (nearMisses, minDistance). Only allClear=true establishes complete clearance; zero-volume contact candidates remain unverified without a distance witness.", InterferenceArgs, interference_check, Read, READ, super::assembly_output_schema::interference),
     app_command!("assembly", "assembly_inferable_types", "The constraint types automatic inference can produce, each with what placement it reads as that constraint — the rows the Auto Constraints dialog lists.", NoArgs, assembly_inferable_types, Read, READ, super::assembly_output_schema::inferable_types),
     app_command!("assembly", "assembly_infer_constraints", "Read the components' current placement as constraints WITHOUT creating any: the candidates (type, elements, the measurement each was read from) plus what was skipped. The look-before-you-leap half of Auto Constraints — an imported STEP assembly is fully posed and completely unconstrained, and this says what would hold it there.", InferConstraintsArgs, assembly_infer_constraints, Read, READ, super::assembly_output_schema::scan),
     app_command!("assembly", "assembly_apply_inferred_constraints", "Create every constraint `assembly_infer_constraints` accepts and solve the batch as ONE undo step. Pairs that already carry a constraint are left alone, so running it twice creates nothing the second time.", InferConstraintsArgs, assembly_apply_inferred_constraints, Mutate, MUTATE, super::assembly_output_schema::apply),
     app_command!("assembly", "component_update", "Check the parts library against the saved source documents: how many entries are outdated and which have no source. `run: true` refreshes the outdated ones and re-runs (the Constraints header's Update components button); entries with no source are skipped, never fatal.", UpdateComponentsArgs, component_update, Mutate, MUTATE, super::assembly_output_schema::updated),
-    app_command!("assembly", "bom_part_attributes", "One parts-library entry's BOM attributes (the `part.` columns).", PartNameArgs, bom_part_attributes, Read, READ, super::assembly_output_schema::attributes),
-    app_command!("assembly", "bom_set_part_attribute", "Write one BOM attribute on a PART — shared by every occurrence of it. `null` removes the key.", PartAttributeArgs, bom_set_part_attribute, Mutate, MUTATE),
+    app_command!("assembly", "bom_part_attributes", "One parts-library entry's BOM attributes (the `part.` columns): `attributes` as stored, `record` as the BOM shows it (with Mass in kg and Volume in mm³ computed from the part's geometry and its Density in g/cm³ — typed, or the Material's built-in one), and `massProperties`, the reading behind it with `massStatus` and a `massNote` when there is no number. Waits for the measurement.", PartNameArgs, bom_part_attributes, Read, READ, super::assembly_output_schema::part_attributes),
+    app_command!("assembly", "bom_set_part_attribute", "Write one BOM attribute on a PART — shared by every occurrence of it. `null` removes the key. Material and Density (g/cm³) drive the part's computed mass; Volume is never written, and Mass only for a part with no geometry.", PartAttributeArgs, bom_set_part_attribute, Mutate, MUTATE),
     app_command!("assembly", "bom_occurrence_attributes", "One component occurrence's BOM attributes (the `occurrence.` columns).", ComponentIdArgs, bom_occurrence_attributes, Read, READ, super::assembly_output_schema::attributes),
-    app_command!("assembly", "bom_set_occurrence_attribute", "Write one BOM attribute across component OCCURRENCES — one undo step however many ids. `null` removes the key.", OccurrenceAttributeArgs, bom_set_occurrence_attribute, Mutate, MUTATE),
+    app_command!("assembly", "bom_set_occurrence_attribute", "Write one BOM attribute across component OCCURRENCES — one undo step however many ids. `null` removes the key. Mass, Material, Density and Volume describe the PART and are refused here.", OccurrenceAttributeArgs, bom_set_occurrence_attribute, Mutate, MUTATE),
 ];

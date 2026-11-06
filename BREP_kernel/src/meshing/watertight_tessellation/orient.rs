@@ -29,7 +29,9 @@ pub fn tessellate_brep_watertight(solid: &BrepSolid, chord_tolerance: f64) -> Re
     // some faces (CW-in-uv seam bands / folded patches) or whole shells wound
     // inward; this pass repairs both at the mesh level. Positions are never
     // touched, so watertightness is preserved (validated below).
-    orient_mesh_coherently(&mut mesh, chord_tolerance, &face_shell_signs)?;
+    let one_shell_faces: Option<Vec<&FaceRecord>> =
+        (solid.shells.len() == 1).then(|| solid.shells[0].faces.iter().collect());
+    orient_mesh_coherently_with(&mut mesh, chord_tolerance, &face_shell_signs, one_shell_faces.as_deref())?;
     let validation_timer = stage_timer(Stage::Validation);
     mesh.validate()?;
     drop(validation_timer);
@@ -89,6 +91,25 @@ pub(crate) fn orient_mesh_coherently(
     mesh: &mut Mesh,
     chord: f64,
     face_shell_signs: &[i8],
+) -> Result<(), String> {
+    orient_mesh_coherently_with(mesh, chord, face_shell_signs, None)
+}
+
+/// [`orient_mesh_coherently`], given the faces of a ONE-shell solid. Where
+/// that shell meshes into more than one closed component, each component's
+/// target sign is read from the B-rep volume of its own faces instead of
+/// being taken as outward: a hollow ball thickened from a whole sphere
+/// (brep-bench thicken/sphere-skin) is one B-rep shell whose two skins are
+/// joined only by zero-area pole walls, and its void skin was meshed facing
+/// outward (mesh volume 1427.4, the two balls added, against the body's
+/// 381.2). A component is re-signed only when the magnitude of its faces'
+/// B-rep volume matches its own mesh volume to 2%, so a fragment of an open
+/// or gapped mesh keeps the outward convention it had.
+pub(crate) fn orient_mesh_coherently_with(
+    mesh: &mut Mesh,
+    chord: f64,
+    face_shell_signs: &[i8],
+    one_shell_faces: Option<&[&FaceRecord]>,
 ) -> Result<(), String> {
     let tri_count = mesh.indices.len() / 3;
     if tri_count == 0 {
@@ -378,6 +399,29 @@ pub(crate) fn orient_mesh_coherently(
                     "orient_mesh_coherently: one welded component spans oppositely oriented shells"
                         .into(),
                 );
+            }
+        }
+    }
+    if let Some(faces) = one_shell_faces.filter(|_| shell_vol.len() > 1) {
+        let mut faces_of_root: HashMap<u32, Vec<usize>> = HashMap::default();
+        for t in 0..tri_count {
+            let root = root_of[comp_of[t] as usize];
+            let face = mesh.face_ids[t] as usize;
+            let list = faces_of_root.entry(root).or_default();
+            if !list.contains(&face) {
+                list.push(face);
+            }
+        }
+        for (root, face_indices) in &faces_of_root {
+            let mut brep_volume = 0.0;
+            for &index in face_indices {
+                let Some(face) = faces.get(index) else { continue };
+                brep_volume += crate::mass_properties::face_volume_contribution(face)?;
+            }
+            let mesh_volume = shell_vol.get(root).copied().unwrap_or(0.0);
+            let scale = brep_volume.abs().max(mesh_volume.abs());
+            if scale > 0.0 && (brep_volume.abs() - mesh_volume.abs()).abs() <= 0.02 * scale {
+                shell_target.insert(*root, if brep_volume < 0.0 { -1 } else { 1 });
             }
         }
     }

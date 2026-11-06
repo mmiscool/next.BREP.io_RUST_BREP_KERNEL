@@ -1184,6 +1184,54 @@ fn convert_component(
                 let hybrid_attempt = hybrid_attempt.and_then(|output| {
                     if hybrid_roundtrip_fallback_enabled() {
                         if let Err(error) = solid_round_trips(&output.solid) {
+                            // Promotion 14's switch first: the rebuild
+                            // without it.
+                            let joined = crate::hybrid_region_brep::hybrid_plane_cylinder_brep_before_promotion_14(
+                                source_positions,
+                                source_indices,
+                                &segmentation_options(source_positions, options),
+                            );
+                            if let Ok(Some(joined)) = joined {
+                                if solid_round_trips(&joined.solid).is_ok() {
+                                    return Ok(joined);
+                                }
+                            }
+                            // Then promotion 13's switches: the rebuild
+                            // without them (and promotion 14's).
+                            let latest = crate::hybrid_region_brep::hybrid_plane_cylinder_brep_before_promotion_13(
+                                source_positions,
+                                source_indices,
+                                &segmentation_options(source_positions, options),
+                            );
+                            if let Ok(Some(latest)) = latest {
+                                if solid_round_trips(&latest.solid).is_ok() {
+                                    return Ok(latest);
+                                }
+                            }
+                            // Then promotion 12's switch: the rebuild
+                            // without it (and promotion 13's).
+                            let newest = crate::hybrid_region_brep::hybrid_plane_cylinder_brep_before_promotion_12(
+                                source_positions,
+                                source_indices,
+                                &segmentation_options(source_positions, options),
+                            );
+                            if let Ok(Some(newest)) = newest {
+                                if solid_round_trips(&newest.solid).is_ok() {
+                                    return Ok(newest);
+                                }
+                            }
+                            // Then promotion 11's switches: the rebuild
+                            // without them (and promotion 12's).
+                            let first = crate::hybrid_region_brep::hybrid_plane_cylinder_brep_before_promotion_11(
+                                source_positions,
+                                source_indices,
+                                &segmentation_options(source_positions, options),
+                            );
+                            if let Ok(Some(first)) = first {
+                                if solid_round_trips(&first.solid).is_ok() {
+                                    return Ok(first);
+                                }
+                            }
                             // Promotion 9's switches can move a line onto a
                             // ring vertex past the import's bar (census record
                             // occt_frustum_s10_d0.05_jitter-0.1); the rebuild
@@ -1199,7 +1247,8 @@ fn convert_component(
                                 }
                             }
                             // Then without promotion 10's switches, keeping
-                            // promotion 9's, and then without either.
+                            // promotion 9's, and then without either (each
+                            // without promotion 11's too).
                             for with_promotion_9 in [true, false] {
                                 let further = crate::hybrid_region_brep::hybrid_plane_cylinder_brep_before_promotion_10(
                                     source_positions,

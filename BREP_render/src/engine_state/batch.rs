@@ -157,7 +157,8 @@ fn prepare(
             // `stepText` (the STEP document an import bakes in — undeclared
             // so no form renders it, kernel `import3d::schema`).
             if params.get(key).is_none()
-                && !(super::components::is_acomp_feature_type(ty) && key == "occurrenceAttributes")
+                && !(super::components::is_acomp_feature_type(ty)
+                    && (key == "occurrenceAttributes" || key == super::bom::OCCURRENCE_ATTRIBUTES))
                 && !(ty == "IMPORT3D" && key == "stepText")
             {
                 return Err(format!("features[{i}].params.{key}: unknown field"));
@@ -188,18 +189,31 @@ fn prepare(
             if !object.contains_key("isFixed") {
                 params.as_object_mut().unwrap().remove("isFixed");
             }
+            // Occurrence attributes live in the ACOMP's `bom` record — the
+            // one the BOM reads. A params-level `occurrenceAttributes` (the
+            // key this path once wrote) is folded into it.
+            let record = super::bom::OCCURRENCE_ATTRIBUTES;
+            if let Some(legacy) = params.as_object_mut().and_then(|p| p.remove("occurrenceAttributes")) {
+                merge(&mut params[record], &legacy);
+            }
             if let Some(attributes) = item.get("attributes") {
                 if !attributes.is_object() {
                     return Err(format!("features[{i}].attributes must be an object"));
                 }
-                merge(&mut params["occurrenceAttributes"], attributes);
+                merge(&mut params[record], attributes);
+            }
+            if let Some(key) = params[record].as_object().and_then(|object| {
+                object.keys().find(|key| super::part_mass::PART_ONLY_KEYS.contains(&key.as_str())).cloned()
+            }) {
+                return Err(format!(
+                    "features[{i}].attributes.{key}: {key} is an attribute of the PART, not of one occurrence — put it in the part's partAttributes (or use `material`)"
+                ));
             }
             if let Some(name) = item.get("display_name") {
-                params["occurrenceAttributes"]["Name"] = name.clone();
+                params[record]["Name"] = name.clone();
             }
-            if let Some(material) = item.get("material") {
-                params["occurrenceAttributes"]["Material"] = material.clone();
-            }
+            // `material` is a PART attribute: `author_batch` writes it onto
+            // the placed part's own document, never onto this occurrence.
         }
         if let Some(alias) = item.get("alias") {
             let alias = alias
@@ -346,6 +360,9 @@ impl EngineState {
         let library = brep_kernel::parts_library_map();
         let mut staged = before.clone();
         let mut aliases = BTreeMap::new();
+        if item.get("material").is_some() {
+            return Err("material is a PART attribute: set it with bom_set_part_attribute, or in a feature_add_many part's document".into());
+        }
         let features = prepare(&self.feature_catalogue(), std::slice::from_ref(item), &mut staged, &mut aliases)?;
         let feature = features.into_iter().next().ok_or("nothing to stage")?;
         let id = feature["inputParams"]["id"].as_str().ok_or("the staged feature has no id")?.to_string();
@@ -531,6 +548,37 @@ impl EngineState {
             }
         }
         let mut features = prepare(&self.feature_catalogue(), items, &mut staged, &mut aliases)?;
+        // `material` on a component names the PART's material: it goes onto
+        // the part's own `partAttributes`. Only a part this batch defines can
+        // take it here (an existing library part is edited through
+        // `bom_set_part_attribute`, which also writes the kernel store), and
+        // two components of one part must agree.
+        let mut materials: BTreeMap<String, Value> = BTreeMap::new();
+        for (i, item) in items.iter().enumerate() {
+            let Some(material) = item.get("material") else { continue };
+            let part = features[i]["inputParams"]["partName"].as_str().unwrap_or_default();
+            let part = part.strip_prefix('@').unwrap_or(part).to_string();
+            if !part_work.iter().any(|(alias, _)| *alias == part) {
+                return Err(format!(
+                    "features[{i}].material: Material is an attribute of the PART '{part}', not of this occurrence — set it with bom_set_part_attribute (only a part defined in this batch's `parts` takes it here)"
+                ));
+            }
+            if let Some(previous) = materials.insert(part.clone(), material.clone()) {
+                if previous != *material {
+                    return Err(format!(
+                        "features[{i}].material: part '{part}' is given two materials ({previous} and {material}); a material belongs to the part, so its components must agree"
+                    ));
+                }
+            }
+        }
+        for (part, material) in materials {
+            for (alias, doc) in part_work.iter_mut() {
+                if *alias == part {
+                    doc[super::bom::PART_ATTRIBUTES]["Material"] = material.clone();
+                    document["partsLibrary"][alias.as_str()]["document"] = doc.clone();
+                }
+            }
+        }
         let (order, deps) = plan(items, &features, &aliases)?;
         document["featureCounter"] = serde_json::from_str::<Value>(&staged.request_json())
             .unwrap_or_default()["featureCounter"]
@@ -554,6 +602,9 @@ impl EngineState {
                 let ty = constraint["type"]
                     .as_str()
                     .ok_or("constraint type is required")?;
+                if ty == "fixed" {
+                    return Err(format!("constraints[{i}].type: {}", brep_kernel::FIXED_IS_NOT_A_CONSTRAINT));
+                }
                 let entry = catalogue
                     .as_array()
                     .and_then(|a| a.iter().find(|e| e["type"].as_str() == Some(ty)))

@@ -58,6 +58,40 @@ impl EngineState {
         self.mesh_preview_results.pop_front()
     }
 
+    /// The next phase of a preview import (its parsed mesh, then its regions),
+    /// posted before the preview's final reply.
+    pub fn take_mesh_preview_phase(&mut self) -> Option<crate::runner::MeshImportPhaseReply> {
+        self.mesh_preview_phases.pop_front()
+    }
+
+    /// Refit one region of a preview import on the runner (inline when the
+    /// runner cannot: a region is a small mesh). The reply comes back through
+    /// [`Self::take_region_fit`].
+    pub fn submit_region_fit(&mut self, job: crate::runner::RegionFitJob) {
+        if !self.runner.submit_region_fit(job.clone()) {
+            self.region_fit_results.push_back(crate::runner::region_fit_reply(job));
+        }
+        self.pump();
+    }
+
+    pub fn take_region_fit(&mut self) -> Option<crate::runner::RegionFitReply> {
+        self.region_fit_results.pop_front()
+    }
+
+    /// Apply an interactive import's region choices on the runner (inline
+    /// when the runner cannot). The reply comes back through
+    /// [`Self::take_apply_region_choices`].
+    pub fn submit_apply_region_choices(&mut self, job: crate::runner::ApplyRegionChoicesJob) {
+        if !self.runner.submit_apply_region_choices(job.clone()) {
+            self.apply_choices_results.push_back(crate::runner::apply_region_choices_reply(job));
+        }
+        self.pump();
+    }
+
+    pub fn take_apply_region_choices(&mut self) -> Option<crate::runner::ApplyRegionChoicesReply> {
+        self.apply_choices_results.pop_front()
+    }
+
     fn submit_mesh_reconstruction(
         &mut self,
         format: crate::runner::MeshImportFormat,
@@ -71,8 +105,9 @@ impl EngineState {
         let id = self.next_mesh_import_id;
         self.next_mesh_import_id = self.next_mesh_import_id.wrapping_add(1);
         self.pending_mesh_imports.insert(id, destination);
+        let phases = destination == MeshImportDestination::Preview;
         self.runner.submit_mesh_import(crate::runner::MeshImportRequest {
-            id, format, bytes, options,
+            id, format, bytes, options, phases,
         });
         self.pump();
         Ok(id)

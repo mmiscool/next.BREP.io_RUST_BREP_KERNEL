@@ -3098,7 +3098,16 @@ pub fn sweep_profile_helix(
 
     // --- 4. Drive the existing sweep core; its (or the loft's) failures
     //        propagate with helix context prepended.
-    let stations = ((turns * 32.0).ceil() as usize).clamp(32, 1024);
+    // `BREP_HELIX_DENSE_STATIONS` (default ON since the 2026-11-05
+    // promotion; `=0` restores 32) skins the tube at 64 stations a turn
+    // instead of 32. At 32 the skinning error is the tube's
+    // largest: brep-bench sweep/helical-pipe (r 1 on R 10, pitch 5, three
+    // turns) reads its volume 4.3e-6 and its area 3.2e-6 under the closed
+    // form πr²L, 2πrL; at 64 they read 3.9e-7 and 3.2e-7 (48: 8.8e-7), and
+    // swept/ball-thread-groove 2.6e-7 and 2.7e-7. The path fit (64 samples a
+    // turn) is already ~2e-8 of R and is unchanged.
+    let per_turn = if switch!("BREP_HELIX_DENSE_STATIONS", true) { 64.0 } else { 32.0 };
+    let stations = ((turns * per_turn).ceil() as usize).clamp(32, 1024);
     // The helix builder places the profile ON the fitted helix (the coil's
     // section is drawn once and carried round), which is `Transplant` by
     // construction — the radius comes from the helix argument, not the profile's

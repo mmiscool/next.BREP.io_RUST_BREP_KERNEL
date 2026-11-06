@@ -489,15 +489,33 @@ pub(crate) fn split_creased_rims(
     let mut appended = 0usize;
     for (index, edge_id) in selected.iter().enumerate() {
         let Some((_, sub)) = pieces.iter().find(|(original, _)| original == edge_id) else { continue };
+        let piece_midpoint = |id: u64| -> Result<Vec3, KernelRefusal> {
+            let edge = result
+                .edges
+                .iter()
+                .find(|edge| edge.id == id)
+                .ok_or_else(|| KernelRefusal::internal(KernelStage::Sew, "creased_rim_piece", "creased rim: a piece vanished"))?;
+            edge.curve.evaluate(0.5 * (edge.t0 + edge.t1)).or_refuse(KernelStage::Refine, "evaluate")
+        };
         let on = resolve(&result, edge_points[index])?;
-        let other = if on == sub[0] { sub[1] } else if on == sub[1] { sub[0] } else { continue };
-        let edge = result
-            .edges
-            .iter()
-            .find(|edge| edge.id == other)
-            .ok_or_else(|| KernelRefusal::internal(KernelStage::Sew, "creased_rim_piece", "creased rim: a piece vanished"))?;
-        let midpoint = edge.curve.evaluate(0.5 * (edge.t0 + edge.t1)).or_refuse(KernelStage::Refine, "evaluate")?;
-        points.push(midpoint);
+        let other = if on == sub[0] {
+            sub[1]
+        } else if on == sub[1] {
+            sub[0]
+        } else if !crate::blend::network::tilted_horn_on() {
+            // Before the tilted horn (`BREP_TILTED_HORN`, default off) the
+            // split rim could not close at the crease anyway: keep declining.
+            continue;
+        } else {
+            // The caller's point sits ON the split: an edge's midpoint is the
+            // meridian crossing whenever its pcurve runs evenly across the
+            // periodic domain, and the nearest edge there is the new chord,
+            // not either piece. The selection is the rim, so both pieces are
+            // selected by their own midpoints (2026-11-05).
+            points[index] = piece_midpoint(sub[0])?;
+            sub[1]
+        };
+        points.push(piece_midpoint(other)?);
         if let Some(names) = names.as_mut() {
             let name = names.get(index).cloned().unwrap_or_default();
             names.push(name);

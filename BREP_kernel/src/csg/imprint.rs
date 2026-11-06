@@ -556,8 +556,13 @@ mod sections;
 mod tangent_contact;
 #[path = "imprint/driver.rs"]
 mod driver;
+#[path = "imprint/work_profile.rs"]
+pub(crate) mod work_profile;
+#[path = "imprint/reuse_profile.rs"]
+pub(crate) mod reuse_profile;
 #[path = "imprint/hermite.rs"]
 mod hermite;
+pub(crate) use hermite::{carried_uv_enabled, carried_uv_min_stations};
 
 #[path = "imprint/gate_census.rs"]
 mod gate_census;

@@ -31,7 +31,8 @@ struct Session {
     /// mutation solves (later solves overwrite per id); replaced wholesale by
     /// the next history run.
     pose_updates: BTreeMap<String, serde_json::Value>,
-    /// Component id → grounded write-back (`inputParams.isFixed`).
+    /// Component id → grounded write-back from a migrated legacy Fixed row
+    /// (`inputParams.isFixed`; an occurrence path `A:B` → `flexibleFixed[B]` on `A`).
     fixed_updates: BTreeMap<String, bool>,
     /// The last solve's report (`ok` + diagnostics, or `error`).
     report: serde_json::Value,
@@ -365,6 +366,20 @@ pub fn assembly_apply_document_impl(document_json: &str) -> Result<String, Strin
                 if let Some(&fixed) = session.fixed_updates.get(&id) {
                     params.insert("isFixed".into(), serde_json::Value::Bool(fixed));
                 }
+                // A migrated Fixed row on a flexible instance's occurrence
+                // (`ACOMP1:ACOMP2`) is that instance's `flexibleFixed[ACOMP2]`.
+                for (key, &fixed) in session.fixed_updates.range(prefix.clone()..) {
+                    let Some(path) = key.strip_prefix(&prefix) else { break };
+                    let overrides = params
+                        .entry("flexibleFixed")
+                        .or_insert_with(|| serde_json::Value::Object(Default::default()));
+                    if !overrides.is_object() {
+                        *overrides = serde_json::Value::Object(Default::default());
+                    }
+                    if let Some(overrides) = overrides.as_object_mut() {
+                        overrides.insert(path.to_string(), serde_json::Value::Bool(fixed));
+                    }
+                }
             }
         }
         Ok(())
@@ -458,10 +473,6 @@ fn overlay_row(entry: &ConstraintEntry, scene: &SceneMap, env: &Env) -> serde_js
     // inferred (center's `[width pair, tab]`) — via the mapper on a THROWAWAY
     // clone (the mapper maintains the orientation-preference cache; an
     // overlay read must not mutate persisted state).
-    // `fixed` has no mapper (it grounds a body; nothing to measure).
-    if entry.constraint_type == "fixed" {
-        return row;
-    }
     let mut scratch = entry.clone();
     if let Ok(mapped) = mapping::map_constraint(&mut scratch, &resolved, env) {
         if let Some((value, unit)) = mapped.measured {
@@ -612,6 +623,9 @@ pub fn assembly_add_constraint_json(
 }
 
 pub fn assembly_add_constraint_impl(constraint_type: &str, params_json: &str) -> Result<String, String> {
+    if constraint_type == "fixed" {
+        return Err(super::FIXED_IS_NOT_A_CONSTRAINT.to_string());
+    }
     let def = constraints::constraint_type(constraint_type)
         .ok_or_else(|| format!("Unknown constraint type: {constraint_type}"))?;
     let mut params: serde_json::Value = serde_json::from_str(params_json)

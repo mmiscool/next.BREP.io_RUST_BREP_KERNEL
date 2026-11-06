@@ -681,6 +681,9 @@ pub struct FamilyTableEditor {
     plm: crate::panels::plm_family::PlmFamily,
     /// Whether the family has unsaved edits, as the shell said this frame.
     dirty: bool,
+    /// The grid's focus id as last drawn, so the shell's Delete key can tell
+    /// the grid owns it ([`Self::owns_delete_key`]).
+    grid_id: Option<egui::Id>,
 }
 
 impl Default for FamilyTableEditor {
@@ -712,7 +715,16 @@ impl FamilyTableEditor {
             runs_replied: 0,
             plm: Default::default(),
             dirty: false,
+            grid_id: None,
         }
+    }
+
+    /// Whether Delete / Backspace belong to the grid now (a selected cell with
+    /// the grid focused, or a cell being edited): the shell's delete-selection
+    /// key then leaves them to `Self::keys`, which clears the cell.
+    pub fn owns_delete_key(&self, ctx: &egui::Context) -> bool {
+        self.edit.is_some()
+            || (self.selected.is_some() && self.grid_id.is_some_and(|id| ctx.memory(|m| m.has_focus(id))))
     }
 
     /// Whether the shell should save the family now: the PLM pane's Save and
@@ -1179,6 +1191,7 @@ impl FamilyTableEditor {
         change: &mut Option<Change>,
     ) {
         let grid_id = ui.make_persistent_id("family-grid");
+        self.grid_id = Some(grid_id);
         let columns = column_count(table);
         let row_h = ui.spacing().interact_size.y + 4.0;
         let font = egui::TextStyle::Body.resolve(ui.style());

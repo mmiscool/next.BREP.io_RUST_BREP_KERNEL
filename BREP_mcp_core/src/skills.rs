@@ -10,6 +10,7 @@ pub const SKILLS: &[Skill] = &[
     Skill { name: "edit-assembly", description: "Edit BREP assembly components and constraints while preserving work-part context and component identity.", text: include_str!("skills/edit-assembly/SKILL.md") },
     Skill { name: "repair-feature", description: "Diagnose and repair a refused BREP feature using its actual schema, geometry references and refusal details.", text: include_str!("skills/repair-feature/SKILL.md") },
     Skill { name: "export-model", description: "Validate a BREP model and export it to an authorized format and destination.", text: include_str!("skills/export-model/SKILL.md") },
+    Skill { name: "design-part", description: "Design a BREP part or assembly well: modelling order, expressions, stable references, checkpoints, and what the kernel refuses with the workaround for each.", text: include_str!("skills/design-part/SKILL.md") },
 ];
 impl Skill {
     pub fn uri(&self) -> String { format!("skill://{}/SKILL.md", self.name) }

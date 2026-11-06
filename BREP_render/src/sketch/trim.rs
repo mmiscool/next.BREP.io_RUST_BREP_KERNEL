@@ -616,9 +616,71 @@ fn ensure_point_on_arc(doc: &mut SketchDoc, arc_geo: &SketchGeometry, point_id: 
     add_constraint_if_missing(doc, "⇌", vec![center.clone(), rim, center, point_id.clone()])
 }
 
+/// Pin `point_id` onto a crossing BÉZIER/spline. The solver has no point-on-spline
+/// row, so the only junction it can hold is a coincidence with one of the spline's
+/// ANCHORS (indices `3k`): a cut that is an endpoint touch of the spline (the
+/// `endpoint_snap` hit, `other_param` 0 or `seg_count`) is made coincident `≡`
+/// with that end anchor without a distance test (the touch was already accepted
+/// within the target's sampling tolerance); any other crossing that lands on an
+/// anchor (by parameter or distance) is made coincident with it. A mid-span
+/// crossing is left free — splitting the user's spline there would change a curve
+/// they did not click.
+fn ensure_point_on_bezier(
+    doc: &mut SketchDoc,
+    bezier_geo: &SketchGeometry,
+    point_id: &Value,
+    inter: &Intersection,
+) -> bool {
+    let ids = &bezier_geo.points;
+    let seg_count = ids.len().saturating_sub(1) / 3;
+    if seg_count < 1 {
+        return false;
+    }
+    let anchor_at = |k: usize| ids.get(k * 3).cloned();
+    let anchor = if inter.endpoint_snap {
+        match inter.other_param {
+            Some(op) if op <= 0.5 * seg_count as f64 => anchor_at(0),
+            Some(_) => anchor_at(seg_count),
+            None => None,
+        }
+    } else {
+        let p = match doc.point(point_id) {
+            Some(p) => (p.x, p.y),
+            None => return false,
+        };
+        let mut chord = 0.0;
+        for k in 0..seg_count {
+            if let (Some(a), Some(b)) = (
+                anchor_at(k).and_then(|id| doc.point(&id).map(|q| (q.x, q.y))),
+                anchor_at(k + 1).and_then(|id| doc.point(&id).map(|q| (q.x, q.y))),
+            ) {
+                chord += (b.0 - a.0).hypot(b.1 - a.1);
+            }
+        }
+        let eps_dist = (chord * 1e-3).clamp(1e-5, 1e-2);
+        let eps_param = 1e-3;
+        let by_param = inter.other_param.and_then(|op| {
+            let k = op.round();
+            ((op - k).abs() <= eps_param && k >= 0.0 && k <= seg_count as f64).then(|| k as usize)
+        });
+        let by_dist = (0..=seg_count).find(|&k| {
+            anchor_at(k)
+                .and_then(|id| doc.point(&id).map(|q| (q.x - p.0).hypot(q.y - p.1) <= eps_dist))
+                .unwrap_or(false)
+        });
+        by_param.or(by_dist).and_then(anchor_at)
+    };
+    match anchor {
+        Some(anchor) if id_key(&anchor) != id_key(point_id) => {
+            add_constraint_if_missing(doc, "≡", vec![anchor, point_id.clone()])
+        }
+        _ => false,
+    }
+}
+
 /// Pin a cut `point_id` onto the CROSSING geometry named by `inter` (a port of
 /// `#applyTrimIntersectionConstraint`): point-on-line for a line crosser,
-/// point-on-arc for an arc/circle crosser.
+/// point-on-arc for an arc/circle crosser, anchor coincidence for a spline.
 fn apply_trim_intersection_constraint(doc: &mut SketchDoc, point_id: &Value, inter: &Intersection) {
     let other = match doc.geometry(&inter.other_geo_id) {
         Some(g) => g.clone(),
@@ -630,6 +692,9 @@ fn apply_trim_intersection_constraint(doc: &mut SketchDoc, point_id: &Value, int
         }
         "arc" | "circle" => {
             ensure_point_on_arc(doc, &other, point_id);
+        }
+        "bezier" | "spline" => {
+            ensure_point_on_bezier(doc, &other, point_id, inter);
         }
         _ => {}
     }
@@ -1008,6 +1073,23 @@ fn trim_bezier(doc: &mut SketchDoc, geo: &SketchGeometry, bounds: &Bounds, targe
     if next_seg < total_segs {
         keep_ranges.push((next_seg, total_segs));
     }
+    // The cut anchors (the split mid-anchors at each boundary) — pinned onto the
+    // crossing geometry below, exactly as the line/arc trims pin their cut points.
+    // Anchor indices are stable across the splits: each later split splices AFTER
+    // the earlier boundary's anchor.
+    let cut_anchors: Vec<(Value, Intersection)> = {
+        let pts = match doc.geometry(&geo_id) {
+            Some(g) => g.points.clone(),
+            None => return false,
+        };
+        boundaries
+            .iter()
+            .filter_map(|b| {
+                let inter = if b.kind == 0 { prev_int.as_ref()? } else { next_int.as_ref()? };
+                Some((pts.get(b.anchor_index?)?.clone(), inter.clone()))
+            })
+            .collect()
+    };
     let construction = geo.construction();
     let mut added = false;
     for (a, b) in keep_ranges {
@@ -1031,6 +1113,9 @@ fn trim_bezier(doc: &mut SketchDoc, geo: &SketchGeometry, bounds: &Bounds, targe
     }
     if added {
         remove_geometry(doc, &geo_id);
+        for (anchor, inter) in &cut_anchors {
+            apply_trim_intersection_constraint(doc, anchor, inter);
+        }
     }
     added
 }

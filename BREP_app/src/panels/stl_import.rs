@@ -32,6 +32,8 @@ pub struct StlImportPreview {
     error: Option<String>,
     scene_changed: bool,
     hits: BTreeMap<String, [f32; 4]>,
+    /// The interactive phases: the mesh at once, its regions, per-region refits.
+    pub regions: crate::panels::stl_import_regions::RegionView,
 }
 
 impl StlImportPreview {
@@ -56,6 +58,7 @@ impl StlImportPreview {
             error: None,
             scene_changed: true,
             hits: BTreeMap::new(),
+            regions: Default::default(),
         };
         preview.rebuild();
         preview
@@ -67,12 +70,43 @@ impl StlImportPreview {
 
     pub fn ready(&self) -> bool {
         !self.busy()
+            && !self.regions.applying()
             && self.error.is_none()
             && self
                 .result
                 .as_ref()
                 .is_some_and(|(revision, _)| *revision == self.revision)
-            && !self.engine.scene.solids().is_empty()
+            && self.result_solids() > 0
+    }
+
+    /// The reconstructed bodies on screen (the region view's display body is
+    /// not one).
+    fn result_solids(&self) -> usize {
+        self.engine
+            .scene
+            .solids()
+            .iter()
+            .filter(|solid| solid.name != crate::panels::stl_import_regions::REGION_SOLID)
+            .count()
+    }
+
+    /// Faces of the reconstructed bodies on screen (what the STEP imports as:
+    /// the importer splits an off-plane polygon face into planar triangles, so
+    /// this can exceed the file's ADVANCED_FACE count).
+    pub(crate) fn body_faces(&self) -> usize {
+        self.engine
+            .scene
+            .solids()
+            .iter()
+            .filter(|solid| solid.name != crate::panels::stl_import_regions::REGION_SOLID)
+            .map(|solid| solid.faces.len())
+            .sum()
+    }
+
+    /// Whether the displayed result is the reconstruction of the mesh the
+    /// region view shows (Update has not been pressed since).
+    fn built(&self) -> bool {
+        self.pending.is_none() && self.result.is_some() && self.result_solids() > 0
     }
 
     pub fn step_text(&self) -> Option<&str> {
@@ -101,6 +135,7 @@ impl StlImportPreview {
             return;
         }
         self.error = None;
+        self.regions.restart();
         match self.engine.reconstruct_mesh_preview(
             self.format,
             self.bytes.clone(),
@@ -111,8 +146,50 @@ impl StlImportPreview {
         }
     }
 
-    fn pump(&mut self) {
+    /// Send "Apply chosen fits" to the runner with the built STEP.
+    pub(crate) fn submit_region_choices(&mut self) {
+        if !self.built() {
+            return;
+        }
+        let Some((_, output)) = self.result.as_ref() else { return };
+        if let Some(job) = self.regions.take_apply_job(&output.step_text) {
+            self.engine.submit_apply_region_choices(job);
+        }
+    }
+
+    pub(crate) fn pump(&mut self) {
         self.engine.pump();
+        // The phases come before the final reply: the mesh, then its regions.
+        while let Some(phase) = self.engine.take_mesh_preview_phase() {
+            if self.pending.is_some_and(|(id, _)| id == phase.id)
+                && self.regions.take_phase(phase.phase, &mut self.engine)
+            {
+                self.scene_changed = true;
+            }
+        }
+        self.regions.pump(&mut self.engine);
+        // The chosen regions came back as NURBS faces: the preview shows that
+        // body and Accept imports its STEP (the history replays it).
+        if let Some(text) = self.regions.take_new_step() {
+            if let Some((_, output)) = self.result.as_mut().filter(|_| self.pending.is_none()) {
+                if text != output.step_text {
+                    let document = serde_json::json!({
+                        "features": [{"type": "IMPORT3D", "inputParams": {"id": "IMPORT3D1", "stepText": text}}],
+                        "featureCounter": 1
+                    });
+                    match self.engine.load_model_and_fit(&document.to_string()) {
+                        Ok(_) => {
+                            // The face tally the dialog shows counts the
+                            // file it will accept.
+                            output.report.exported_advanced_faces = text.matches("ADVANCED_FACE(").count();
+                            output.step_text = text;
+                            self.scene_changed = true;
+                        }
+                        Err(error) => self.error = Some(error),
+                    }
+                }
+            }
+        }
         while let Some(reply) = self.engine.take_mesh_preview() {
             let Some((id, revision)) = self.pending else {
                 continue;
@@ -123,6 +200,7 @@ impl StlImportPreview {
             self.pending = None;
             match reply.result {
                 Ok(output) => {
+                    self.regions.apply_result(&output.report);
                     let document = serde_json::json!({
                         "features": [{"type": "IMPORT3D", "inputParams": {
                             "id": "IMPORT3D1", "stepText": output.step_text
@@ -141,7 +219,7 @@ impl StlImportPreview {
         }
         if !self.busy()
             && self.result.is_some()
-            && self.engine.scene.solids().is_empty()
+            && self.result_solids() == 0
             && self.error.is_none()
         {
             self.error = Some("The reconstructed BREP could not be displayed. Adjust the settings and update the preview.".into());
@@ -171,12 +249,29 @@ impl StlImportPreview {
                     action = self.controls(ui);
                 });
             });
+        // The interactive phases in a panel of their own on the right, so
+        // the region form is in view the moment a region is picked.
+        let built = self.built();
+        let reconstructing = self.busy();
+        egui::containers::panel::Panel::right("stl-preview-regions")
+            .resizable(true)
+            .default_size(340.0)
+            .size_range(280.0..=520.0)
+            .show(ui, |ui| {
+                egui::ScrollArea::vertical().id_salt("stl-preview-regions-scroll").show(ui, |ui| {
+                    self.regions.controls(ui, &mut self.engine, built, reconstructing, &mut self.hits);
+                });
+            });
+        self.submit_region_choices();
+        if self.regions.sync(&mut self.engine, built) {
+            self.scene_changed = true;
+        }
         if self.scene_changed {
             viewport.forget_document();
             self.scene_changed = false;
         }
         viewport.show(ui, &mut self.engine);
-        if self.busy() {
+        if self.busy() || self.regions.busy() {
             ui.ctx().request_repaint();
         }
         if ui
@@ -313,9 +408,14 @@ impl StlImportPreview {
                 .or(report.faceted_faces_after_merge)
                 .unwrap_or(0);
             if facets > 0 {
+                let applied = self.regions.applied_faces();
                 ui.colored_label(
                     ui.visuals().warn_fg_color,
-                    format!("{facets} faces remain faceted"),
+                    if applied > 0 {
+                        format!("{facets} faces remained faceted as built; {applied} region(s) since rebuilt as NURBS faces")
+                    } else {
+                        format!("{facets} faces remain faceted")
+                    },
                 );
             }
             ui.weak(format!(
@@ -365,12 +465,17 @@ impl StlImportPreview {
         serde_json::json!({"name": self.name, "format": format_label(self.format),
             "ready": self.ready(), "busy": self.busy(),
             "revision": self.revision, "previewRevision": self.result.as_ref().map(|(r, _)| r),
-            "error": self.error, "options": self.options, "solidCount": self.engine.scene.solids().len(),
+            "error": self.error, "options": self.options, "solidCount": self.result_solids(),
             "faces": self.result.as_ref().map(|(_, r)| r.report.exported_advanced_faces),
+            "bodyFaces": self.body_faces(),
             "cylindricalSurfaces": surfaces("CYLINDRICAL_SURFACE("),
             "conicalSurfaces": surfaces("CONICAL_SURFACE("),
             "sphericalSurfaces": surfaces("SPHERICAL_SURFACE(")
         }).to_string()
+    }
+    /// The interactive phases (`__brepImportRegions`).
+    pub fn regions_json(&self) -> String {
+        self.regions.state_json(self.built()).to_string()
     }
     pub fn hits_json(&self) -> String {
         serde_json::to_string(&self.hits).unwrap()
@@ -426,4 +531,9 @@ pub static HIT_KEYS: &[HitKeyDoc] = &[
     HitKeyDoc { panel: "importpreview", prefix: "strict", meaning: "require fully analytic surfaces", command: None },
     HitKeyDoc { panel: "importpreview", prefix: "autoWeld", meaning: "automatic vertex welding", command: None },
     HitKeyDoc { panel: "importpreview", prefix: "field:", meaning: "a tolerance field (field:distance, field:relative, field:normal, field:feature, field:fit, field:brepNormal)", command: None },
+    HitKeyDoc { panel: "importpreview", prefix: "view", meaning: "what the viewport shows: view#regions (one colour per region), view#fit (what each region fits as), view#result (the reconstructed BREP)", command: None },
+    HitKeyDoc { panel: "importpreview", prefix: "regionsFaceted", meaning: "list only the regions left as triangles", command: None },
+    HitKeyDoc { panel: "importpreview", prefix: "regionsApply", meaning: "Apply chosen fits: rebuild the regions chosen with Use this NURBS fit as one NURBS face each, in the body Accept imports", command: None },
+    HitKeyDoc { panel: "importpreview", prefix: "regionrow:", meaning: "a region's row, by region id: select it (as a click on its face does)", command: None },
+    HitKeyDoc { panel: "importpreview", prefix: "regionform:", meaning: "the selected region's form: regionform:field:kind (Fit as, with #<kind label> entries), regionform:field:tolerance, regionform:field:normalAngle, regionform:field:retry (Retry fit), regionform:field:useFit (Use this NURBS fit / Do not use this fit, after an in-tolerance NURBS refit of a region left as triangles), regionform:form:return (Close)", command: None },
 ];

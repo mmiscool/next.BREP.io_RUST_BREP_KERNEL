@@ -148,7 +148,7 @@ impl EngineState {
 
     /// Add a clip of `kind` to `study` (the active one when `None`; a study
     /// is started when there is none), on `target` or the natural default:
-    /// `suppress` the first constraint, `camera` through every PMI view (or
+    /// `disable` (alias `suppress`) the first constraint, `camera` through every PMI view (or
     /// the one named), `visibility` or `transparency` (1 → 0.3) of the
     /// selected occurrences or the first component, `section` of the first
     /// PMI view with a section, `explode` of the first exploded view. The
@@ -156,12 +156,14 @@ impl EngineState {
     pub fn simulation_add_clip(&mut self, study: Option<&str>, kind: &str, target: Option<&str>) -> Result<(String, String), String> {
         use brep_simulation::ClipBody;
         let body = match kind {
-            "suppress" => {
+            // "Disable a mate": `suppress` is the stored kind (file format) and
+            // stays accepted; `disable` is the user-facing word.
+            "disable" | "suppress" => {
                 let ids = self.simulation_constraint_ids();
                 let constraint = match target {
                     Some(id) if ids.iter().any(|c| c == id) => id.to_string(),
                     Some(id) => return Err(format!("'{id}' is not a constraint of this assembly")),
-                    None => ids.first().cloned().ok_or("add a mate first: a suppress clip switches one off")?,
+                    None => ids.first().cloned().ok_or("add a mate first: a Disable a mate clip switches one off")?,
                 };
                 ClipBody::Suppress { constraint }
             }
@@ -221,7 +223,7 @@ impl EngineState {
                 };
                 ClipBody::Section { view, sweep: None }
             }
-            other => return Err(format!("no clip kind '{other}': suppress, camera, visibility, transparency, section or explode")),
+            other => return Err(format!("no clip kind '{other}': disable (or suppress), camera, visibility, transparency, section or explode")),
         };
         self.simulation_edit(None, |block| {
             let study_id = match study {

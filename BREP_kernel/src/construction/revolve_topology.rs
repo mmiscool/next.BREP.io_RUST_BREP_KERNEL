@@ -67,6 +67,11 @@ struct RevolveProfile {
     curves: Vec<NurbsCurve>,
     points: Vec<Vec3>,
     axis_points: Vec<bool>,
+    /// The axis points that lay ON the axis before the snap above (to 1e-12
+    /// of the profile's size): only these may be built as a pinch. A point
+    /// snapped from off the axis is a generatrix the revolve cannot hold that
+    /// close, and stays refused.
+    exact_axis_points: Vec<bool>,
     axis_curves: Vec<bool>,
     /// For each entry of `curves`, true when it is a straight segment lying
     /// (within tolerance) in a plane PERPENDICULAR to the axis — a radial
@@ -334,6 +339,13 @@ fn prepare_profile(
         .iter()
         .map(|point| radial_distance(*point) <= TOLERANCE * 100.0)
         .collect();
+    let profile_size = points
+        .iter()
+        .fold(1.0f64, |size, point| size.max(point.sub(axis_point).length()));
+    let exact_axis_points: Vec<bool> = points
+        .iter()
+        .map(|point| radial_distance(*point) <= 1e-12 * profile_size)
+        .collect();
     if axis_points.iter().any(|flag| *flag) {
         let snapped: Vec<Vec3> = points
             .iter()
@@ -412,6 +424,7 @@ fn prepare_profile(
         curves,
         points,
         axis_points,
+        exact_axis_points,
         axis_curves,
         radial_curves,
         radial,
@@ -658,7 +671,7 @@ fn revolve_full(
         })
         .collect::<Result<_, String>>()?;
     timing.lap("surface");
-    let vertices: Vec<VertexRecord> = profile
+    let mut vertices: Vec<VertexRecord> = profile
         .points
         .iter()
         .enumerate()
@@ -670,11 +683,46 @@ fn revolve_full(
     let mut counter = 100_u64;
     let mut edges = Vec::new();
     let mut circle_ids = Vec::with_capacity(count);
+    // The pole a face ENDS on: its own junction's, except at a PINCH — an
+    // axis point with a revolved face on both sides (a horn torus's disc
+    // touching the axis) — where the two fans meet only at the point. One
+    // vertex and pole edge for both makes V-E+F-H odd and the body is
+    // refused; the face ending there gets its own vertex and pole edge at the
+    // same point, which is the manifold body (brep-bench geometry/horn-torus,
+    // chamfer/cylinder-rim-to-point). A profile without a pinch is unchanged.
+    let mut end_circle_ids = Vec::with_capacity(count);
+    let mut end_vertex_ids: Vec<u64> = (0..count).map(|index| index as u64 + 1).collect();
+    let mut next_vertex_id = count as u64 + 1;
     for index in 0..count {
         let curve = junction_curve(index, &surfaces, &profile.points)?;
         let [start, end] = curve.domain()?;
         let id = next_id(&mut counter);
         circle_ids.push(id);
+        let previous = (index + count - 1) % count;
+        let pinch = profile.axis_points[index]
+            && profile.exact_axis_points[index]
+            && !profile.axis_curves[index]
+            && !profile.axis_curves[previous];
+        if pinch {
+            next_vertex_id += 1;
+            let vertex_id = next_vertex_id;
+            vertices.push(VertexRecord { id: vertex_id, point: profile.points[index] });
+            let end_id = next_id(&mut counter);
+            edges.push(EdgeRecord {
+                id: end_id,
+                curve: curve.clone(),
+                t0: start,
+                t1: end,
+                start_vertex_id: vertex_id,
+                end_vertex_id: vertex_id,
+                degenerate: true,
+                name: None,
+            });
+            end_circle_ids.push(end_id);
+            end_vertex_ids[index] = vertex_id;
+        } else {
+            end_circle_ids.push(id);
+        }
         edges.push(EdgeRecord {
             id,
             curve,
@@ -701,7 +749,7 @@ fn revolve_full(
             t0: start,
             t1: end,
             start_vertex_id: index as u64 + 1,
-            end_vertex_id: ((index + 1) % count) as u64 + 1,
+            end_vertex_id: end_vertex_ids[(index + 1) % count],
             degenerate: false,
             name: None,
         });
@@ -720,7 +768,7 @@ fn revolve_full(
             },
             CoedgeRecord {
                 id: next_id(&mut counter),
-                edge_id: circle_ids[(index + 1) % count],
+                edge_id: end_circle_ids[(index + 1) % count],
                 forward: false,
                 pcurve: parameter_line(1.0, end, 0.0, end)?,
             },

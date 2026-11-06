@@ -78,6 +78,12 @@ pub use constraints::{
 // the Euler decomposition (and its gimbal-lock branch).
 pub use mapping::transform_to_pose_params;
 
+/// The refusal for a `fixed` constraint (kernel ABI, app command, batch):
+/// Fixed is the component instance's own setting, never a constraint.
+pub const FIXED_IS_NOT_A_CONSTRAINT: &str = "Fixed is not a constraint: a part is fixed by its own Fixed setting \
+(the component's `isFixed`). Use component_set_fixed (Fix/Unfix on the component's row or menu), or give the \
+component `isFixed: true` in its params";
+
 // ===========================================================================
 // ===========================================================================
 

@@ -701,7 +701,9 @@ pub fn chain_from_names(names: &[String]) -> Option<ChainRef> {
     if names.is_empty() {
         return None;
     }
-    let profile = |n: &str| n.strip_suffix(":PROFILE").or_else(|| n.strip_suffix(":FACE")).filter(|s| !s.is_empty()).map(str::to_string);
+    // A name carrying a sketch alias (`:PROFILE` / `:FACE`, the kernel's one
+    // sketch-name rule) is a whole sketch profile; a bare name is a curve.
+    let profile = |n: &str| brep_render::brep_kernel::feature_pipeline::sketch_alias_base(n).map(str::to_string);
     if names.len() == 1 {
         if let Some(sketch) = profile(names[0]) {
             return Some(ChainRef { source: ChainSource::SketchProfile { sketch, regions: Vec::new() }, closed: true, ..Default::default() });

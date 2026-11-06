@@ -5,6 +5,9 @@ use std::cell::RefCell;
 
 #[derive(Default)]
 struct FitCache {
+    trace: Option<super::reuse_profile::Trace<Vec<u64>>>,
+    rollover: bool,
+    limit: usize,
     fits: HashMap<Vec<u64>, crate::PcurveFit>,
     requests: usize,
     hits: usize,
@@ -30,10 +33,18 @@ pub(super) struct FitCacheScope {
 }
 impl FitCacheScope {
     pub(super) fn open(enabled: bool) -> Self {
+        Self::open_limit(enabled, switch!("BREP_IMPRINT_PCURVE_CACHE_ROLLOVER", false),
+            if crate::pcurve::larger_working_set() { 512 } else { 256 })
+    }
+    pub(super) fn open_config(enabled: bool, rollover: bool) -> Self {
+        Self::open_limit(enabled, rollover, 256)
+    }
+    pub(super) fn open_limit(enabled: bool, rollover: bool, limit: usize) -> Self {
         let depth = CACHES.with(|stack| {
+        let _wall = crate::wall_profile::Scope::enter(crate::wall_profile::LOOKUP);
             let mut stack = stack.borrow_mut();
             let depth = stack.len();
-            stack.push(enabled.then(FitCache::default));
+            stack.push(enabled.then(|| FitCache { rollover, limit, trace: super::reuse_profile::Trace::open("fit", || serde_json::json!({"lifetime":"imprint","limit":limit})), ..FitCache::default() }));
             depth
         });
         Self { depth }
@@ -42,6 +53,7 @@ impl FitCacheScope {
 impl Drop for FitCacheScope {
     fn drop(&mut self) {
         CACHES.with(|stack| {
+        let _wall = crate::wall_profile::Scope::enter(crate::wall_profile::LOOKUP);
             let mut stack = stack.borrow_mut();
             debug_assert_eq!(stack.len(), self.depth + 1);
             if let Some(Some(cache)) = stack.pop() {
@@ -60,6 +72,7 @@ impl Drop for FitCacheScope {
 /// Lengths delimit every field; equality includes every IEEE bit, including
 /// signed zero. Recognition labels and pointer identity cannot alias a net.
 fn key(surface: &NurbsSurface, curve: &NurbsCurve) -> Vec<u64> {
+    let _wall = crate::wall_profile::Scope::enter(crate::wall_profile::LOOKUP);
     fn floats(key: &mut Vec<u64>, values: &[f64]) {
         key.push(values.len() as u64);
         key.extend(values.iter().map(|v| v.to_bits()));
@@ -85,7 +98,9 @@ fn key(surface: &NurbsSurface, curve: &NurbsCurve) -> Vec<u64> {
     key
 }
 
+#[track_caller]
 pub(super) fn cached_build_pcurve(surface: &NurbsSurface, curve: &NurbsCurve) -> Result<NurbsCurve, String> {
+    let caller = std::panic::Location::caller();
     let active = CACHES.with(|stack| stack.borrow().last().is_some_and(Option::is_some));
     if !active {
         return crate::build_pcurve_on_surface_marched(surface, curve);
@@ -101,23 +116,41 @@ pub(super) fn cached_build_pcurve(surface: &NurbsSurface, curve: &NurbsCurve) ->
     let key = key(surface, curve);
     let key_time = lap();
     let hit = CACHES.with(|stack| {
+        let _wall = crate::wall_profile::Scope::enter(crate::wall_profile::LOOKUP);
         let mut stack = stack.borrow_mut();
         let cache = stack.last_mut().unwrap().as_mut().unwrap();
         cache.requests += 1;
         let hit = cache.fits.get(&key).cloned();
-        if hit.is_some() { cache.hits += 1; } else { cache.evaluations += 1; }
+        if hit.is_some() { if let Some(trace) = &mut cache.trace { trace.access(&key, caller, true, true); } cache.hits += 1; } else { cache.evaluations += 1; }
         hit
     });
     let lookup_time = lap();
     let fit = match hit {
         Some(fit) => fit,
         None => {
-            let fit = crate::fit_pcurve_on_surface_marched(surface, curve)?;
+            let result = crate::fit_pcurve_on_surface_marched(surface, curve);
+            let fit = match result {
+                Ok(fit) => fit,
+                Err(error) => {
+                    CACHES.with(|stack| {
+        let _wall = crate::wall_profile::Scope::enter(crate::wall_profile::LOOKUP); if let Some(trace) = &mut stack.borrow_mut().last_mut().unwrap().as_mut().unwrap().trace {
+                        trace.access(&key, caller, false, false);
+                    } });
+                    return Err(error);
+                }
+            };
             CACHES.with(|stack| {
+        let _wall = crate::wall_profile::Scope::enter(crate::wall_profile::LOOKUP);
                 let mut stack = stack.borrow_mut();
                 let cache = stack.last_mut().unwrap().as_mut().unwrap();
-                // Bound retained memory; a full cache keeps evaluating misses.
-                if cache.fits.len() < 256 { cache.fits.insert(key, fit.clone()); }
+                if let Some(trace) = &mut cache.trace { trace.access(&key, caller, false, true); }
+                // Keep the selected entry bound (256 normally, 512 in the
+                // measured working-set experiment). The experimental replacement
+                // policy admits recent fits after saturation instead of
+                // recomputing every later miss, including its immediate reuse.
+                // Eviction changes no fit or report: a miss recomputes both.
+                if cache.rollover && cache.fits.len() >= cache.limit { cache.fits.clear(); }
+                if cache.fits.len() < cache.limit { cache.fits.insert(key, fit.clone()); }
             });
             fit
         }
@@ -127,6 +160,7 @@ pub(super) fn cached_build_pcurve(surface: &NurbsSurface, curve: &NurbsCurve) ->
     let replay_time = lap();
     if profiling {
         CACHES.with(|stack| {
+        let _wall = crate::wall_profile::Scope::enter(crate::wall_profile::LOOKUP);
             let mut stack = stack.borrow_mut();
             let cache = stack.last_mut().unwrap().as_mut().unwrap();
             cache.key_time += key_time;

@@ -383,9 +383,49 @@ pub fn point_in_polygon(point: Vec2, polygon: &[Vec2], tolerance: f64) -> &'stat
     }
 }
 
+// Arrangement decisions read endpoints and topology, never parent tags. Keep
+// the immutable source segment borrowed until a retained cycle needs an owned
+// output. The eager arm preserves the original allocation path for A/B.
+struct PieceInput<'a> {
+    a: Vec2,
+    b: Vec2,
+    parent: std::borrow::Cow<'a, Segment2>,
+}
+impl PieceInput<'_> {
+    fn materialize(&self, forward: bool) -> CycleUse {
+        CycleUse { piece: ArrangementPiece { a: self.a, b: self.b, parent: self.parent.as_ref().clone() }, forward }
+    }
+}
+
+#[derive(Clone)]
+enum CycleUses {
+    Eager(Vec<CycleUse>),
+    Deferred(Vec<usize>),
+}
+impl CycleUses {
+    fn push(&mut self, half: usize, pieces: &[PieceInput<'_>]) {
+        match self {
+            Self::Eager(uses) => uses.push(pieces[half >> 1].materialize(half % 2 == 0)),
+            Self::Deferred(halves) => halves.push(half),
+        }
+    }
+    fn into_uses(self, pieces: &[PieceInput<'_>]) -> Vec<CycleUse> {
+        match self {
+            Self::Eager(uses) => uses,
+            Self::Deferred(halves) => halves.into_iter().map(|h| pieces[h >> 1].materialize(h % 2 == 0)).collect(),
+        }
+    }
+    fn copy_uses(&self, pieces: &[PieceInput<'_>]) -> Vec<CycleUse> {
+        match self {
+            Self::Eager(uses) => uses.clone(),
+            Self::Deferred(halves) => halves.iter().map(|&h| pieces[h >> 1].materialize(h % 2 == 0)).collect(),
+        }
+    }
+}
+
 #[derive(Clone)]
 struct Cycle {
-    uses: Vec<CycleUse>,
+    uses: CycleUses,
     area: f64,
     node_indices: Vec<usize>,
 }
@@ -628,6 +668,7 @@ fn arrange_segments_impl(
     indexed: bool,
     indexed_nodes: bool,
 ) -> Result<Vec<ArrangementRegion>, String> {
+    let defer_tags = switch!("BREP_ARRANGE_DEFER_TAGS", true);
     let mut cuts = vec![Vec::<f64>::new(); segments.len()];
     let mut intersect_pair = |first: usize, second: usize| {
         let Some([first_parameter, second_parameter]) = segment_intersection(
@@ -682,10 +723,10 @@ fn arrange_segments_impl(
             if a.distance(b) <= tolerance {
                 continue;
             }
-            pieces.push(ArrangementPiece {
+            pieces.push(PieceInput {
                 a,
                 b,
-                parent: segment.clone(),
+                parent: if defer_tags { std::borrow::Cow::Borrowed(segment) } else { std::borrow::Cow::Owned(segment.clone()) },
             });
         }
     }
@@ -773,18 +814,14 @@ fn arrange_segments_impl(
             if visited.contains(&start) {
                 continue;
             }
-            let mut uses = Vec::new();
+            let mut uses = if defer_tags { CycleUses::Deferred(Vec::new()) } else { CycleUses::Eager(Vec::new()) };
             let mut node_indices = Vec::new();
             let mut area = 0.0;
             let mut half_edge = start;
             let mut guard = 0;
             loop {
                 visited.insert(half_edge);
-                let piece_index = half_edge >> 1;
-                uses.push(CycleUse {
-                    piece: pieces[piece_index].clone(),
-                    forward: half_edge % 2 == 0,
-                });
+                uses.push(half_edge, &pieces);
                 let tail_index = half_tail(half_edge);
                 let head_index = half_head(half_edge);
                 let tail = nodes[tail_index].point;
@@ -830,7 +867,7 @@ fn arrange_segments_impl(
                 .collect();
             (
                 ArrangementRegion {
-                    outer: cycle.uses,
+                    outer: cycle.uses.into_uses(&pieces),
                     holes: Vec::new(),
                     area: cycle.area,
                     outer_area: cycle.area,
@@ -881,11 +918,17 @@ fn arrange_segments_impl(
                 continue;
             }
             if inside {
-                region.holes.push(cycle.uses.clone());
+                region.holes.push(cycle.uses.copy_uses(&pieces));
                 region.area += cycle.area;
                 break;
             }
         }
+    }
+    if crate::profile::profile_enabled() {
+        let holes: usize = regions.iter().flat_map(|(r, _)| r.holes.iter()).map(Vec::len).sum();
+        let returned: usize = holes + regions.iter().map(|(r, _)| r.outer.len()).sum::<usize>();
+        let clones = if defer_tags { returned } else { pieces.len() + visited.len() + holes };
+        crate::imprint::profile_emit(format_args!("arrange.tags segments={} pieces={} walked={} returned={returned} parent_clones={clones} deferred={defer_tags}", segments.len(), pieces.len(), visited.len()));
     }
     Ok(regions.into_iter().map(|(region, _)| region).collect())
 }

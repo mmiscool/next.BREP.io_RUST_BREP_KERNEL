@@ -2007,9 +2007,20 @@ fn coplanar_pair(
         .cross(b[0][1])
         .normalized()
         .or_refuse(KernelStage::Intersect, "normalized")?;
+    let band = (tolerance * 10.0).max(COINCIDENCE_DISTANCE_FLOOR);
+    // Planes 4.5e-5 rad apart pass the angular gate; a pair that crosses
+    // inside the patches is two planes however near the origins stand
+    // (`crate::pair_classification::planar_patches_straddle`).
+    if normal_a.dot(normal_b).abs() >= 1.0 - 1e-9
+        && crate::pair_classification::plane_pair_straddle_enabled()
+        && crate::pair_classification::planar_patches_straddle(
+            first, a[0][0], normal_a, second, b[0][0], normal_b, band,
+        )
+    {
+        return Ok(false);
+    }
     Ok(normal_a.dot(normal_b).abs() >= 1.0 - 1e-9
-        && b[0][0].sub(a[0][0]).dot(normal_a).abs()
-            <= (tolerance * 10.0).max(COINCIDENCE_DISTANCE_FLOOR))
+        && b[0][0].sub(a[0][0]).dot(normal_a).abs() <= band)
 }
 
 pub(super) fn cosurface_pair(

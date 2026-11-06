@@ -452,10 +452,8 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, FeatureRefusal> {
     let base = if from_face {
         profile_base_name(&tag, &profile_name)
     } else {
-        let sketch_id = profile_name
-            .strip_suffix(":PROFILE")
-            .unwrap_or(&profile_name);
-        profile_base_name(&tag, &format!("{sketch_id}:PROFILE"))
+        // `profile_name` is already the canonical sketch id.
+        profile_base_name(&tag, &format!("{profile_name}:PROFILE"))
     };
 
     // Per-loop cap names keyed off each region's STABLE loop identity, with the

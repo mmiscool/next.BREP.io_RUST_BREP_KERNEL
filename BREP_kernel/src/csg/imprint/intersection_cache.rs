@@ -34,6 +34,7 @@ impl Drop for Scope {
 // operands, and restricted carriers differ from their parent faces. Surface
 // identity also separates objects with distinct lazy projection caches.
 fn key(curve: &NurbsCurve, surface: &NurbsSurface, tolerance: f64) -> Vec<u64> {
+    let _wall = crate::wall_profile::Scope::enter(crate::wall_profile::LOOKUP);
     fn floats(key: &mut Vec<u64>, values: &[f64]) {
         key.push(values.len() as u64);
         key.extend(values.iter().map(|v| v.to_bits()));
@@ -62,6 +63,7 @@ pub(super) fn intersect(
     }
     let key = key(curve, surface, tolerance);
     let hit = CACHES.with(|stack| {
+        let _wall = crate::wall_profile::Scope::enter(crate::wall_profile::LOOKUP);
         let mut stack = stack.borrow_mut();
         let cache = stack.last_mut().unwrap();
         cache.requests += 1;
@@ -72,6 +74,7 @@ pub(super) fn intersect(
     if let Some(result) = hit { return Ok(result); }
     let result = solve(curve, surface, tolerance)?;
     CACHES.with(|stack| {
+        let _wall = crate::wall_profile::Scope::enter(crate::wall_profile::LOOKUP);
         stack.borrow_mut().last_mut().unwrap().results.insert(key, result.clone());
     });
     Ok(result)

@@ -309,6 +309,14 @@ impl EngineState {
         !self.hidden_sketches.contains(id)
     }
 
+    /// Whether `name` is a committed sketch (shown as an `is_sketch` sheet, or
+    /// hidden through `hidden_sketches`): its visibility is the sketch's, never
+    /// the sheet solid's own flag.
+    pub(crate) fn is_committed_sketch_name(&self, name: &str) -> bool {
+        self.scene.solid(name).is_some_and(|solid| solid.is_sketch)
+            || (self.hidden_sketches.contains(name) && self.committed_sketch_ids().iter().any(|id| id == name))
+    }
+
     /// Show/hide the committed sketch `id`'s persistent overlay (the Scene-tree
     /// checkbox). Toggles `hidden_sketches`, rebuilds the committed overlays (so the
     /// group is fed or cleared immediately), and marks dirty.

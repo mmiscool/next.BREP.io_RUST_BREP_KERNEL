@@ -239,6 +239,56 @@ impl EngineState {
         self.dirty = true;
     }
 
+    /// Delete exactly ONE entity BY ref — a list row's ✕ (owner bug 2026-11-04). The
+    /// row ✕ used to select the row and run [`sketch_delete_selection`](Self::sketch_delete_selection),
+    /// but under the `ClickToggles` multi-select setting a plain select does not
+    /// replace the selection, so the ✕ deleted everything selected (or, on an
+    /// already-selected row, toggled it OFF and deleted the rest). This deletes
+    /// only the clicked entity (with the usual dependent cleanup) and keeps the
+    /// rest of the selection where its entities survive. Returns whether
+    /// something was deleted.
+    pub fn sketch_delete_entity(&mut self, kind: &str, id: serde_json::Value) -> bool {
+        use crate::sketch::doc::id_key;
+        let target = serde_json::json!({ "kind": kind, "id": id });
+        let same = |r: &serde_json::Value| {
+            r.get("kind") == target.get("kind")
+                && r.get("id").map(id_key) == target.get("id").map(id_key)
+        };
+        let Some(edit) = self.sketch_edit.as_mut() else {
+            return false;
+        };
+        let kept: Vec<serde_json::Value> =
+            edit.session.selection.items.iter().filter(|r| !same(r)).cloned().collect();
+        edit.session.clear_selection();
+        edit.session.toggle_selection(target);
+        let deleted = self.sketch_delete_selection();
+        if let Some(edit) = self.sketch_edit.as_mut() {
+            let doc = &edit.session.doc;
+            let alive = |r: &serde_json::Value| {
+                let Some(id) = r.get("id") else { return false };
+                match r.get("kind").and_then(|k| k.as_str()) {
+                    Some("geometry") => doc.geometry(id).is_some(),
+                    Some("point") => doc.point(id).is_some(),
+                    Some("constraint") => doc
+                        .constraints
+                        .iter()
+                        .any(|c| c.raw.get("id").map(id_key) == Some(id_key(id))),
+                    _ => false,
+                }
+            };
+            let restore: Vec<serde_json::Value> = kept.into_iter().filter(|r| alive(r)).collect();
+            if !deleted {
+                edit.session.clear_selection();
+            }
+            for r in restore {
+                edit.session.toggle_selection(r);
+            }
+        }
+        self.refresh_sketch_overlay();
+        self.dirty = true;
+        deleted
+    }
+
     /// Hover an entity BY ref from a list row (list→canvas highlight). Sets the
     /// one-frame guard so the viewport — which draws after the panel and would
     /// otherwise clear the hover because the pointer is off the viewport — keeps it.

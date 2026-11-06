@@ -167,6 +167,14 @@ fn runner_tools(cx: &Arc<Cx>) -> Vec<ToolSpec> {
                 Ok(ToolOutput::json(answer))
             })
         }),
+        runner_tool("resource_read", "test-mcp: {uri} read as a client's `resources/read` reads a static resource (a skill://… SKILL.md, brep://schema/…); answers {uri, mimeType, text}.", cx, |cx, args| {
+            Box::pin(async move {
+                let uri = args["uri"].as_str().ok_or("`resource_read` needs {uri}")?.to_string();
+                let spec = cx.state.resources.read().await.get(&uri).cloned().ok_or_else(|| format!("no resource `{uri}`"))?;
+                let text = (spec.read)()?;
+                Ok(ToolOutput::json(json!({ "uri": uri, "mimeType": spec.mime, "text": text })))
+            })
+        }),
         runner_tool("session_restart", "test-mcp: the session's own `session_restart` (stop the app, build it again on the same store).", cx, |cx, args| {
             Box::pin(async move {
                 let spec = cx.state.tools.read().await.specs.iter().find(|t| t.name == "session_restart" && t.group == "session").cloned();

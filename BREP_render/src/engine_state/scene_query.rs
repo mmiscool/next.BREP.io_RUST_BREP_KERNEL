@@ -33,9 +33,20 @@ impl EngineState {
     pub fn apply_settings_json(&mut self, json: &str) -> Result<(), String> {
         let prev_lod = self.settings.lod_factor;
         let prev_override_model_colors = self.settings.override_model_colors;
+        let prev_wireframe = self.settings.wireframe;
         self.settings.apply_json(json)?;
         self.settings_generation = self.settings_generation.wrapping_add(1);
         self.dirty = true;
+        // While a PMI view is active the wireframe on screen is that view's:
+        // toggling it is an edit of the view (one undo step), so leaving and
+        // re-entering the view keeps it, and the modeling setting comes back
+        // on exit.
+        if self.settings.wireframe != prev_wireframe {
+            if let Some(view) = self.pmi_active_view.clone() {
+                let patch = super::PmiViewPatch { wireframe: Some(self.settings.wireframe), ..Default::default() };
+                let _ = self.pmi_set_view_display(&view, &patch);
+            }
+        }
         // "Override model colors" is resolved when colours are derived, not when
         // they are drawn, so flipping it has to re-derive. Guarded on an actual
         // change: this apply path also runs on every unrelated settings edit.
@@ -142,7 +153,51 @@ impl EngineState {
         Ok(())
     }
 
+    /// Show or hide the scene object `name`. A committed SKETCH has one
+    /// visibility, `hidden_sketches` (the Scene checkbox's): its sheet solid's
+    /// own flag is rebuilt away by every refresh, so a sketch name goes through
+    /// [`Self::set_sketch_visible`] whichever path asked (context-bar Hide,
+    /// MCP `set_visible`, a Scene "all" toggle). False for an unknown name.
+    ///
+    /// While a PMI view is active, hiding or showing a solid is an edit of
+    /// that view's hide steps (`Self::pmi_record_visibility`), never a
+    /// live-only change the next exit or re-entry would lose.
     pub fn set_visible(&mut self, name: &str, visible: bool) -> bool {
+        self.set_visible_many(&[name.to_string()], visible) > 0
+    }
+
+    /// [`Self::set_visible`] for several names at once — a BOM row or a
+    /// component standing for many solids — so an active view records ONE
+    /// hide step (one undo) for them all. How many names were known.
+    pub fn set_visible_many(&mut self, names: &[String], visible: bool) -> usize {
+        let mut known = 0usize;
+        let mut solids: Vec<String> = Vec::new();
+        for name in names {
+            if self.is_committed_sketch_name(name) {
+                if self.sketch_visible(name) != visible {
+                    self.set_sketch_visible(name, visible);
+                }
+                known += 1;
+            } else if self.scene.solid(name).is_some() {
+                known += 1;
+                solids.push(name.clone());
+            }
+        }
+        if solids.is_empty() {
+            return known;
+        }
+        if let Some(view) = self.pmi_active_view.clone() {
+            self.pmi_record_visibility(&view, &solids, visible);
+            return known;
+        }
+        for name in &solids {
+            self.set_solid_visible_live(name, visible);
+        }
+        known
+    }
+
+    /// The modeling (no active view) half of [`Self::set_visible_many`].
+    fn set_solid_visible_live(&mut self, name: &str, visible: bool) -> bool {
         let ok = self.scene.set_visible(name, visible);
         if ok {
             // A derived BOARD body is dropped by every run's scene reconcile

@@ -132,10 +132,7 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, FeatureRefusal> {
     // (`SceneMap::apply` ignores a removed name it doesn't hold). A FACE profile
     // has nothing to consume — the source solid stays resident.
     if !from_face && common::consume_profile_sketch(ctx) {
-        let sketch_name = name
-            .strip_suffix(":PROFILE")
-            .unwrap_or(&name)
-            .to_string();
+        let sketch_name = name.clone();
         if !result.removed.contains(&sketch_name) {
             result.removed.push(sketch_name);
         }
@@ -174,8 +171,8 @@ fn build_straight(
     let cap_base = if from_face {
         format!("{tag}{name}")
     } else {
-        let sketch_base = name.strip_suffix(":PROFILE").unwrap_or(name);
-        format!("{tag}{sketch_base}:PROFILE")
+        // `name` is already the canonical sketch id (`normalize_profile_alias`).
+        format!("{tag}{name}:PROFILE")
     };
 
     // Per-loop cap names keyed off each region's STABLE loop identity, with the
@@ -336,8 +333,8 @@ fn build_drafted(
     let cap_base = if from_face {
         format!("{tag}{name}")
     } else {
-        let sketch_base = name.strip_suffix(":PROFILE").unwrap_or(name);
-        format!("{tag}{sketch_base}:PROFILE")
+        // `name` is already the canonical sketch id (`normalize_profile_alias`).
+        format!("{tag}{name}:PROFILE")
     };
     // The straight path's per-loop cap names, unchanged by draft (the 2026-08-18
     // decision: naming must not move when `draftAngle` toggles) and keyed per

@@ -379,7 +379,7 @@ fn main() -> eframe::Result<()> {
     };
     // The desktop loop (not `eframe::run_native`): application commands
     // dispatch without waiting for a frame, which a hidden window never gets.
-    brep_app::desktop_loop::run(
+    let result = brep_app::desktop_loop::run(
         "brep-app",
         native_options,
         Box::new(move |cc, waker| {
@@ -417,6 +417,8 @@ fn main() -> eframe::Result<()> {
             if let Some(path) = launch.open.as_deref() {
                 app.open_path_from_command_line(path);
             }
+            app.start_update_check(&cc.egui_ctx);
+            app.start_report_followup(&cc.egui_ctx);
             #[cfg(feature = "mcp")]
             if let Some(launch) = mcp {
                 // The app's own diagnostics, not a second reading of the same
@@ -428,7 +430,10 @@ fn main() -> eframe::Result<()> {
             Ok(app)
         }),
     )
-    .map_err(|e| eframe::Error::AppCreation(e.into()))
+    .map_err(|e| eframe::Error::AppCreation(e.into()));
+    // An update installed from the notice: start it once this window is gone.
+    brep_app::update::relaunch_if_installed();
+    result
 }
 
 #[cfg(target_arch = "wasm32")]

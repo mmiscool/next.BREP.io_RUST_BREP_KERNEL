@@ -58,12 +58,27 @@ pub struct Notices {
 
 fn state_list(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
     let _: NoArgs = parse_args(args)?;
-    let _ = ctx;
-    let entries = crate::automation::registry::lock()
-        .iter()
-        .map(|(name, p)| StateEntry { name: name.to_string(), doc: p.doc.to_string(), typed: p.schema.is_some(), bytes: p.json.len() })
-        .collect();
-    serde_json::to_value(StateList { entries }).map(Outcome::Done).map_err(|e| e.to_string())
+    // The plain-state blobs come from their producers (always listed, never
+    // stale); the layout blobs are whatever the last drawn pass published.
+    let mut entries: BTreeMap<String, StateEntry> = BTreeMap::new();
+    for (name, doc) in crate::automation::state_blobs::STATE_BLOBS {
+        let bytes = ctx.app.state_blob_json(name, ctx.egui).map_or(0, |json| json.len());
+        entries.insert(name.to_string(), StateEntry { name: name.to_string(), doc: doc.to_string(), typed: false, bytes });
+    }
+    for (name, p) in crate::automation::registry::lock().iter() {
+        entries.entry(name.to_string()).or_insert_with(|| StateEntry { name: name.to_string(), doc: p.doc.to_string(), typed: p.schema.is_some(), bytes: p.json.len() });
+    }
+    serde_json::to_value(StateList { entries: entries.into_values().collect() }).map(Outcome::Done).map_err(|e| e.to_string())
+}
+
+/// A blob's current text: from its producer for a plain-state blob (built now,
+/// so no frame is needed), else from the registry (the last drawn pass).
+fn blob_text(ctx: &mut Ctx<'_>, name: &str) -> Option<(String, &'static str, Option<Value>)> {
+    if let Some(json) = ctx.app.state_blob_json(name, ctx.egui) {
+        return Some((json, crate::automation::state_blobs::doc(name), None));
+    }
+    let reg = crate::automation::registry::lock();
+    reg.get(name).map(|p| (p.json.clone(), p.doc, p.schema.clone()))
 }
 
 // Publisher values may be arbitrary JSON or unparsed text. Runtime
@@ -83,13 +98,11 @@ fn toasts_dismiss_result_schema() -> Value {
 
 fn state_get(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
     let a: StateGetArgs = parse_args(args)?;
-    let _ = ctx;
     let mut out = Map::new();
-    let reg = crate::automation::registry::lock();
     for name in a.names {
-        match reg.get(&name) {
-            Some(p) => {
-                let v = serde_json::from_str::<Value>(&p.json).unwrap_or_else(|_| Value::String(p.json.clone()));
+        match blob_text(ctx, &name) {
+            Some((json, _, _)) => {
+                let v = serde_json::from_str::<Value>(&json).unwrap_or(Value::String(json));
                 out.insert(name, v);
             }
             None => return Err(format!("no state blob `{name}` (see state_list)")),
@@ -110,17 +123,15 @@ fn state_schema_result_schema() -> Value {
 
 fn state_schema(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
     let a: StateSchemaArgs = parse_args(args)?;
-    let _ = ctx;
-    let reg = crate::automation::registry::lock();
     let mut out = Map::new();
     for name in a.names {
-        let p = reg.get(&name).ok_or_else(|| format!("no state blob `{name}` (see state_list)"))?;
+        let (json, doc, schema) = blob_text(ctx, &name).ok_or_else(|| format!("no state blob `{name}` (see state_list)"))?;
         out.insert(
             name,
             json!({
-                "doc": p.doc,
-                "schema": p.schema.clone(),
-                "example": serde_json::from_str::<Value>(&p.json).unwrap_or(Value::Null),
+                "doc": doc,
+                "schema": schema,
+                "example": serde_json::from_str::<Value>(&json).unwrap_or(Value::Null),
             }),
         );
     }
@@ -198,8 +209,8 @@ fn toasts_raise(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
 }
 
 pub static COMMANDS: &[CommandSpec] = &[
-    app_command!("state", "state_list", "Every state blob the app publishes this frame, with its doc line and whether a schema is known.", NoArgs, state_list, Read, READ, schema_of::<StateList>),
-    app_command!("state", "state_get", "Read named state blobs, parsed as JSON, from this frame's layout.", StateGetArgs, state_get, Read, READ, state_get_result_schema),
+    app_command!("state", "state_list", "Every state blob: the plain-state blobs (built from the app now) and the layout blobs the last drawn pass published, with each doc line and whether a schema is known.", NoArgs, state_list, Read, READ, schema_of::<StateList>),
+    app_command!("state", "state_get", "Read named state blobs, parsed as JSON: a plain-state blob is built from the app now, a layout blob (widget rects, the viewport rect, focus, the dock) comes from the current layout.", StateGetArgs, state_get, Read, READ, state_get_result_schema),
     app_command!("state", "state_schema", "The JSON Schema of named state blobs (where a blob is published from a typed value) and each one's current value as an example. Takes `names`, like `state_get`.", StateSchemaArgs, state_schema, Read, READ, state_schema_result_schema),
     app_command!("widgets", "hit_rects", "Every clickable widget the app published this frame as `panel/key` → [x, y, w, h] in egui points. `panel/panel:clip` is a pane's visible region; a rect outside it must be scrolled into view first.", HitRectsArgs, hit_rects, Read, READ, schema_of::<HitRects>),
     app_command!("widgets", "hit_key_docs", "The documented hit-key prefixes per panel: what each `panel/key` means.", NoArgs, hit_key_docs, Read, READ, hit_key_docs_result_schema),

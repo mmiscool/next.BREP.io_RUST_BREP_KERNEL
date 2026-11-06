@@ -132,6 +132,12 @@ impl PartPropertiesPanel {
         // under the dialog, and a cached copy would show — and then write back —
         // the previous document's values.
         let stored = state.document_part_attributes();
+        // Mass and Volume are COMPUTED from this document's geometry and the
+        // density it names; a document with no geometry types its Mass.
+        let report = state.document_mass();
+        let derived = brep_render::engine_state::part_mass::MassStatus::Override != report.status
+            && report.solid_count > 0;
+        let shown = state.document_bom_record();
         // Through `effective_text`, exactly as the BOM table reads its columns:
         // the stored setting is EMPTY until the user configures it, and the
         // shipped default is what the table is ordered by. Reading the raw
@@ -164,11 +170,12 @@ impl PartPropertiesPanel {
                                 ui.available_width().max(80.0),
                                 ui.spacing().interact_size.y,
                             );
+                            let (kind, value) = field_view(field, &stored, &shown, &report, derived);
                             let (committed, rect) = column_tree::value_editor(
                                 ui,
                                 egui::Id::new(("part-properties", document, &field.field)),
-                                &field.kind(),
-                                stored.get(&field.field),
+                                &kind,
+                                value.as_ref(),
                                 size,
                             );
                             self.hits.insert(format!("field:{}", field.field), rect);
@@ -181,16 +188,44 @@ impl PartPropertiesPanel {
             });
 
         for (key, value) in edits {
-            // A refusal here is a programming error (an empty key), not
-            // something the user can produce from a drawn row, so it has no
-            // banner: the field list never yields one.
-            let _ = state.set_document_part_attribute(&key, value);
+            if let Err(error) = state.set_document_part_attribute(&key, value) {
+                state.push_notice(format!("Part Properties: {error}"));
+            }
         }
     }
 
     /// The published widget hit-rects (egui points) for the automation layer.
     pub fn hits_json(&self) -> String {
         crate::automation::hit_rects::hits_json(&self.hits)
+    }
+}
+
+/// How one field is drawn: its editor kind and the value it shows. `Mass`
+/// and `Volume` show the COMPUTED reading with its unit, read-only — except
+/// a document with no geometry, whose Mass is typed (in kg). `Density`
+/// shows the Material's built-in density when none is typed.
+fn field_view(
+    field: &bom_columns::BomColumn,
+    stored: &Value,
+    shown: &Value,
+    report: &brep_render::engine_state::part_mass::MassReport,
+    derived: bool,
+) -> (column_tree::CellKind, Option<Value>) {
+    use brep_render::engine_state::part_mass::{format_derived, MASS_KEY, VOLUME_KEY, DENSITY_KEY};
+    match field.field.as_str() {
+        MASS_KEY if !derived => (
+            column_tree::CellKind::Numeric { step: 0.01 },
+            stored.get(MASS_KEY).cloned(),
+        ),
+        MASS_KEY | VOLUME_KEY => {
+            let text = shown
+                .get(&field.field)
+                .and_then(|value| format_derived(&field.field, value))
+                .or_else(|| report.status.note().filter(|_| field.field == MASS_KEY));
+            (column_tree::CellKind::ReadOnly, text.map(Value::String))
+        }
+        DENSITY_KEY => (field.kind(), shown.get(DENSITY_KEY).cloned()),
+        _ => (field.kind(), stored.get(&field.field).cloned()),
     }
 }
 

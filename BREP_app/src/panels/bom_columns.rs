@@ -116,6 +116,17 @@ pub const MF_QTY_KEY: &str = "occurrence.MF_QTY";
 /// the OPEN document's annotations, which are the assembly's own.
 pub const PMI_KEY: &str = "part.PMI";
 
+/// `part.Mass` and `part.Volume` are DERIVED from the part's geometry and the
+/// density the PART carries (`brep_render::engine_state::part_mass`), read
+/// only. A part with no geometry types its Mass in its own Properties.
+pub const MASS_KEY: &str = "part.Mass";
+pub const VOLUME_KEY: &str = "part.Volume";
+
+/// Whether a column is derived (never edited in the table).
+pub fn is_derived(key: &str) -> bool {
+    [QUANTITY_KEY, PMI_KEY, MF_QTY_KEY, MASS_KEY, VOLUME_KEY].contains(&key)
+}
+
 /// Which store a BOM column's value lives in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Scope {
@@ -161,7 +172,7 @@ impl BomColumn {
     /// The editor kind — from the catalogue when the field is built in, plain
     /// text for a user-added one.
     pub fn kind(&self) -> CellKind {
-        if self.key() == QUANTITY_KEY || self.key() == PMI_KEY || self.key() == MF_QTY_KEY {
+        if is_derived(&self.key()) {
             return CellKind::ReadOnly;
         }
         catalogue()
@@ -211,8 +222,12 @@ pub fn catalogue() -> Vec<CatalogueEntry> {
             choice(&["EA", "MM", "M", "IN", "FT", "KG", "G", "LB", "L", "ML"]),
         ),
         part("Material", CellKind::Text),
+        // g/cm³; blank = the Material's built-in density.
+        part("Density", CellKind::Numeric { step: 0.01 }),
         part("Finish", CellKind::Text),
-        part("Mass", CellKind::Numeric { step: 0.01 }),
+        // Derived — see `MASS_KEY` / `VOLUME_KEY`.
+        part("Mass", CellKind::ReadOnly),
+        part("Volume", CellKind::ReadOnly),
         // Derived — see `PMI_KEY`.
         part("PMI", CellKind::ReadOnly),
         part("Manufacturer", CellKind::Text),
@@ -275,8 +290,10 @@ pub fn default_text() -> String {
         "part.Make_Buy",
         "part.Unit_of_Measure",
         "part.Material",
+        "part.Density",
         "part.Finish",
         "part.Mass",
+        "part.Volume",
         "part.PMI",
         "part.Lifecycle_State",
         "occurrence.Reference_Designator",
@@ -454,6 +471,18 @@ pub fn parse(text: &str) -> ParsedColumns {
             out.preserved.push(raw.trim_end().to_string());
             continue;
         }
+        // Mass properties describe the PART: an occurrence column for one is
+        // read as the part's, and the line says so.
+        let scope = if scope == Scope::Occurrence
+            && brep_render::engine_state::part_mass::PART_ONLY_KEYS.contains(&field)
+        {
+            out.problems.push(format!(
+                "line {number}: {field} is an attribute of the part — shown as '{PART_PREFIX}.{field}'"
+            ));
+            Scope::Part
+        } else {
+            scope
+        };
         let column = BomColumn {
             scope,
             field: field.to_string(),

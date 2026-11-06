@@ -81,11 +81,12 @@ pub fn blend_smooth_chain_if_closed(
 /// radius, the chamfer flag, the bar and three switches, never the rest of the
 /// solid; the key is exactly those, bit for bit. Only the `chain_ladder_top`
 /// refusal is kept, and a hit returns that refusal unchanged. With
-/// `BREP_CHAIN_LADDER_SIGNED_KEY=1` (default off) the mates' loops leave the
-/// key and the segments' signed radii, the only reading of those loops the
-/// ladder makes, take their place. `BREP_CHAIN_LADDER_MEMO=0` turns the memo
-/// off; `=verify` recomputes every hit and panics unless the recomputed answer
-/// is the cached refusal, byte for byte.
+/// `BREP_CHAIN_LADDER_SIGNED_KEY` (default on since the promotion 2026-11-05;
+/// `=0` off) the mates' loops leave the key and the segments' signed radii, the
+/// only reading of those loops the ladder makes, take their place.
+/// `BREP_CHAIN_LADDER_MEMO=0` turns the memo off; `=verify` recomputes every
+/// hit and panics unless the recomputed answer is the cached refusal, byte for
+/// byte.
 fn blend_closed_smooth_chain(
     solid: &BrepSolid,
     segments: &[ChainSegment<'_>],
@@ -103,7 +104,8 @@ fn blend_closed_smooth_chain(
         return blend_closed_smooth_chain_unmemoized(solid, segments, radius, chamfer, name);
     }
     let bar = crate::KernelTolerances::for_solid(solid, 1e-7).intersection_fit;
-    // Lane F (2026-10-31, `BREP_CHAIN_LADDER_SIGNED_KEY=1`, default off):
+    // Lane F (2026-10-31, `BREP_CHAIN_LADDER_SIGNED_KEY`, default on since the
+    // promotion 2026-11-05):
     // up to its verdict the ladder reads the mates' loops ONLY through the
     // segments' signed radii (`signed_radii`, the march's and the dense
     // contacts' one into-face probe, called with exactly these arguments);
@@ -132,6 +134,14 @@ fn blend_closed_smooth_chain(
     };
     let key = ladder_memo_key(segments, radius, chamfer, bar, signed.as_deref());
     let cached = LADDER_MEMO.with(|memo| memo.borrow().iter().find(|(stored, _)| *stored == key).map(|(_, refusal)| refusal.clone()));
+    crate::blend::carve::carve_trace(format_args!(
+        "blend chain ladder memo: {} for segments {:?}",
+        if cached.is_some() { "hit" } else { "miss" },
+        segments
+            .iter()
+            .map(|segment| (segment.edge.id, segment.forward, segment.first.face.id, segment.second.face.id))
+            .collect::<Vec<_>>()
+    ));
     if let (Some(refusal), false) = (&cached, verify) {
         crate::blend::record_count("count.chain_ladder_memo.hit", 1);
         return Err(refusal.clone());
@@ -158,10 +168,17 @@ fn blend_closed_smooth_chain(
 }
 
 /// Whether the ladder memo keys a chain's mates by the segments' signed radii
-/// instead of their whole loops (lane F 2026-10-31): OFF unless
-/// `BREP_CHAIN_LADDER_SIGNED_KEY=1` (or `on`).
+/// instead of their whole loops (lane F 2026-10-31): ON unless
+/// `BREP_CHAIN_LADDER_SIGNED_KEY=0` (or `off`); promoted 2026-11-05.
 fn chain_ladder_signed_key_on() -> bool {
-    switch!("BREP_CHAIN_LADDER_SIGNED_KEY", false)
+    switch!("BREP_CHAIN_LADDER_SIGNED_KEY", true)
+}
+
+/// Whether the ladder memo keys a closed chain from its smallest edge id rather
+/// than from its seed (2026-11-05): ON unless `BREP_CHAIN_LADDER_ROTATION_KEY=0`
+/// (or `off`); promoted 2026-11-05.
+fn chain_ladder_rotation_key_on() -> bool {
+    switch!("BREP_CHAIN_LADDER_ROTATION_KEY", true)
 }
 
 /// How many topped-out ladders the memo keeps (oldest dropped first).
@@ -215,7 +232,18 @@ fn ladder_memo_key(segments: &[ChainSegment<'_>], radius: f64, chamfer: bool, ba
         segments.len() as u64,
         signed.is_some() as u64,
     ];
-    for (index, segment) in segments.iter().enumerate() {
+    // (2026-11-05, `BREP_CHAIN_LADDER_ROTATION_KEY`): a closed chain seeded at
+    // another of its edges is the same cycle read from a different start.
+    // Orientation and mate order are kept as read: a chain walked the other
+    // way keys differently and misses.
+    let start = if chain_ladder_rotation_key_on() {
+        key.push(1);
+        segments.iter().enumerate().min_by_key(|(_, segment)| segment.edge.id).map_or(0, |(index, _)| index)
+    } else {
+        0
+    };
+    for index in (0..segments.len()).map(|offset| (start + offset) % segments.len()) {
+        let segment = &segments[index];
         if let Some((rho1, rho2)) = signed.and_then(|signs| signs.get(index)) {
             key.extend([rho1.to_bits(), rho2.to_bits()]);
         }

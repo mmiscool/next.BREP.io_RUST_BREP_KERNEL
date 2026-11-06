@@ -32,11 +32,7 @@ pub(super) fn schema() -> serde_json::Value {
         "id": id_field(),
         "elements": elements_field(&["FACE", "EDGE"], 2, 2,
             "Select two axis-bearing elements (cylindrical/conical face, circular edge) to make concentric"),
-        "reverse": {
-            "type": "boolean",
-            "default_value": false,
-            "hint": "Flip the captured axis-sense preference"
-        },
+        "facing": super::super::mapping::facing_field("Aligned: the two directions point the same way; Opposed: they point opposite ways. Unset, a new constraint takes the facing it is placed with"),
     }))
 }
 
@@ -45,7 +41,6 @@ pub(in crate::feature_pipeline::assembly) fn map(
     a: &ResolvedElement,
     b: &ResolvedElement,
 ) -> Result<MappedConstraint, ConstraintFailure> {
-    let reverse = entry.flag("reverse");
     let (wa, _) = require_direction(a)?;
     let (wb, _) = require_direction(b)?;
     if matches!(a.world, SelectionGeometry::Plane { .. })
@@ -55,7 +50,7 @@ pub(in crate::feature_pipeline::assembly) fn map(
             "concentric needs two axis-bearing selections (cylindrical/conical face or circular edge)",
         ));
     }
-    let align = effective_align(entry, wa, wb, reverse);
+    let align = effective_align(entry, wa, wb, "reverse");
     let gap = line_line_distance(
         a.world.representative_point(), wa,
         b.world.representative_point(), wb,

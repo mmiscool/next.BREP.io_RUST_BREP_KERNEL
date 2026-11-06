@@ -18,7 +18,7 @@ use std::rc::Rc;
 
 use brep_render::brep_kernel::HistoryRequest;
 use brep_render::runner::{
-    CamJob, CamProgress, CamReply, CamSimJob, CamSimProgress, CamSimReply, Command, HistoryRunner, MeasureQuery, MeasureReply, MeshImportReply, MeshImportRequest, Reply,
+    CamJob, CamProgress, CamReply, CamSimJob, CamSimProgress, CamSimReply, Command, HistoryRunner, MeasureQuery, MeasureReply, MeshImportPhaseReply, MeshImportReply, MeshImportRequest, RegionFitJob, RegionFitReply, ApplyRegionChoicesJob, ApplyRegionChoicesReply, Reply,
     RunProgress, RunReply, SheetLinesReply, SheetLinesRequest, StepProbeReply, StepProbeRequest,
     TopologyReply, TopologyRequest, PluginActionRequest, PluginActionReply, PluginInstallRequest, PluginInstallReply,
 };
@@ -45,6 +45,10 @@ pub struct WorkerRunner {
     query_buf: VecDeque<MeasureReply>,
     /// Completed RANSAC reconstruction replies awaiting the engine pump.
     mesh_import_buf: VecDeque<MeshImportReply>,
+    /// Phases of interactive imports, and region refits, awaiting the pump.
+    mesh_phase_buf: VecDeque<MeshImportPhaseReply>,
+    region_fit_buf: VecDeque<RegionFitReply>,
+    apply_choices_buf: VecDeque<ApplyRegionChoicesReply>,
     /// Answered STEP structure probes awaiting the engine pump.
     step_probe_buf: VecDeque<StepProbeReply>,
     /// Answered topology requests awaiting the engine pump.
@@ -107,6 +111,9 @@ impl WorkerRunner {
             run_buf: VecDeque::new(),
             query_buf: VecDeque::new(),
             mesh_import_buf: VecDeque::new(),
+            mesh_phase_buf: VecDeque::new(),
+            region_fit_buf: VecDeque::new(),
+            apply_choices_buf: VecDeque::new(),
             step_probe_buf: VecDeque::new(),
             topology_buf: VecDeque::new(),
             sheet_lines_buf: VecDeque::new(),
@@ -169,6 +176,9 @@ impl WorkerRunner {
                 }
                 Reply::Query(query) => self.query_buf.push_back(query),
                 Reply::MeshImport(reply) => self.mesh_import_buf.push_back(reply),
+                Reply::MeshImportPhase(reply) => self.mesh_phase_buf.push_back(reply),
+                Reply::RegionFit(reply) => self.region_fit_buf.push_back(reply),
+                Reply::ApplyRegionChoices(reply) => self.apply_choices_buf.push_back(reply),
                 Reply::StepProbe(reply) => self.step_probe_buf.push_back(reply),
                 Reply::Topology(reply) => self.topology_buf.push_back(reply),
                 Reply::SheetLines(reply) => self.sheet_lines_buf.push_back(reply),
@@ -326,6 +336,29 @@ impl HistoryRunner for WorkerRunner {
         self.mesh_import_buf.pop_front()
     }
 
+    fn poll_mesh_import_phase(&mut self) -> Option<MeshImportPhaseReply> {
+        self.drain();
+        self.mesh_phase_buf.pop_front()
+    }
+
+    fn submit_region_fit(&mut self, job: RegionFitJob) -> bool {
+        self.post(&Command::RegionFit(job)).is_ok()
+    }
+
+    fn poll_region_fit(&mut self) -> Option<RegionFitReply> {
+        self.drain();
+        self.region_fit_buf.pop_front()
+    }
+
+    fn submit_apply_region_choices(&mut self, job: ApplyRegionChoicesJob) -> bool {
+        self.post(&Command::ApplyRegionChoices(job)).is_ok()
+    }
+
+    fn poll_apply_region_choices(&mut self) -> Option<ApplyRegionChoicesReply> {
+        self.drain();
+        self.apply_choices_buf.pop_front()
+    }
+
     fn submit_step_probe(&mut self, request: StepProbeRequest) {
         let _ = self.post(&Command::StepProbe(request));
     }
@@ -430,6 +463,9 @@ impl HistoryRunner for WorkerRunner {
         self.run_buf.clear();
         self.query_buf.clear();
         self.mesh_import_buf.clear();
+        self.mesh_phase_buf.clear();
+        self.region_fit_buf.clear();
+        self.apply_choices_buf.clear();
         self.step_probe_buf.clear();
         self.topology_buf.clear();
         self.sheet_lines_buf.clear();
@@ -458,6 +494,9 @@ impl HistoryRunner for WorkerRunner {
         self.run_buf.clear();
         self.query_buf.clear();
         self.mesh_import_buf.clear();
+        self.mesh_phase_buf.clear();
+        self.region_fit_buf.clear();
+        self.apply_choices_buf.clear();
         self.step_probe_buf.clear();
         self.topology_buf.clear();
         self.sheet_lines_buf.clear();

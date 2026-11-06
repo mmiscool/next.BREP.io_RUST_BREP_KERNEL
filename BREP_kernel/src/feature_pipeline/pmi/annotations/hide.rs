@@ -41,7 +41,32 @@ fn schema() -> serde_json::Value {
 }
 
 fn resolve(annotation: &PmiAnnotation, context: &PmiContext<'_>) -> Result<Resolved, String> {
-    let solids = target_solids(&annotation.references("targets"), context)?;
+    // A view's baseline step (the solids hidden at capture) skips a name
+    // that no longer resolves, as the captured list always did; an author's
+    // step names what it hides, so a stale target is its error.
+    let solids = if annotation.is_baseline_hide() {
+        let mut solids: Vec<(String, u32)> = Vec::new();
+        for target in annotation.references("targets") {
+            for solid in target_solids(std::slice::from_ref(&target), context).unwrap_or_default() {
+                if !solids.iter().any(|(name, _)| *name == solid.0) {
+                    solids.push(solid);
+                }
+            }
+        }
+        solids
+    } else {
+        target_solids(&annotation.references("targets"), context)?
+    };
+    if solids.is_empty() {
+        return Ok(Resolved {
+            text: "Hide (nothing present)".into(),
+            value: None,
+            unit: "",
+            references: Vec::new(),
+            geometry: PmiGeometry::Hide { solids: Vec::new() },
+            default_label: [0.0; 3],
+        });
+    }
     let mut low = Vec3::new(f64::INFINITY, f64::INFINITY, f64::INFINITY);
     let mut high = Vec3::new(f64::NEG_INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY);
     for (_, handle) in &solids {

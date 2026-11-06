@@ -18,9 +18,9 @@ geometry consumer never compiles `wgpu` / `eframe`.
 
 ```toml
 [dependencies]
-BREP = "0.12"                                     # kernel only (headless)
-BREP = { version = "0.12", features = ["render"] } # + the wgpu render engine
-BREP = { version = "0.12", features = ["full"] }  # app + render + gizmos
+BREP = "0.13"                                     # kernel only (headless)
+BREP = { version = "0.13", features = ["render"] } # + the wgpu render engine
+BREP = { version = "0.13", features = ["full"] }  # app + render + gizmos
 ```
 
 Additional features: `reconstruction` (opt-in recognition integration), `full`

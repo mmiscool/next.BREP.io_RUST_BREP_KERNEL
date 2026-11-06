@@ -1,6 +1,6 @@
 [package]
 name = "BREP_kernel"
-version = "0.12.0"
+version = "0.13.0"
 edition = "2021"
 license-file = "LICENSE.md"
 description = "A boundary representation (BREP) geometry kernel for building CAD applications."
@@ -64,6 +64,8 @@ talc = { version = "5.1.1", optional = true }
 rusty_alloc-api = { version = "=2.2.6", optional = true }
 
 [features]
+# Diagnostic wall-time partition; ordinary builds compile the hooks away.
+profile-wall = []
 # `parallel` turns the per-face tessellation loop into a rayon par_iter. It
 # works on native (rayon's own pool) and on wasm built with atomics. The
 # DEFAULT build enables neither feature, so the shipped wasm is byte-identical

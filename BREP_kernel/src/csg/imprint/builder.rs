@@ -83,6 +83,13 @@ struct PendingSplit<'a> {
     point: Vec3,
 }
 
+/// Whether the pierce recovery projects each pierce onto the section once
+/// and reuses the reading (2026-11-05): ON unless
+/// `BREP_PIERCE_PROJECTION_CACHE=0`.
+pub(super) fn pierce_projection_cache_enabled() -> bool {
+    switch!("BREP_PIERCE_PROJECTION_CACHE", true)
+}
+
 pub(super) fn hull_cull_enabled() -> bool {
     switch!("BREP_IMPRINT_HULL_CULL", true)
 }
@@ -223,6 +230,10 @@ fn pcurve_images_apart(
         apart[2] = apart[2].max(image_b.sub(on_curve).length());
     }
     Ok((apart, worst_t))
+}
+
+fn pole_split_enabled() -> bool {
+    crate::switch!("BREP_SECTION_POLE_SPLIT", true)
 }
 
 impl<'a> ImprintBuilder<'a> {
@@ -538,6 +549,7 @@ impl<'a> ImprintBuilder<'a> {
         refine: bool,
         exact_pcurves: Option<[NurbsCurve; 2]>,
     ) -> Result<(), KernelRefusal> {
+        super::work_profile::add(|c| c.sections += 1);
         let profile = profile_enabled();
         let began = profile.then(Instant::now);
         let mut split_parameters = Vec::new();
@@ -617,6 +629,33 @@ impl<'a> ImprintBuilder<'a> {
             };
             for edge in face_edges(face, &self.edges)? {
                 if edge.degenerate {
+                    // POLE SPLIT (2026-11-06;
+                    // `BREP_SECTION_POLE_SPLIT`, default on, `=0` off). A section through
+                    // a face's pole meets no edge there that has length: the
+                    // pole is a degenerate edge, which no crossing or pierce
+                    // reads. Two balls meeting through a pole of each
+                    // (brep-bench `singular/balls-meeting-through-a-pole`): the
+                    // exact circle starts at the first ball's pole and passes
+                    // the second's at t = 0.5, so the whole circle stayed one
+                    // piece, its midpoint read Boundary on the second ball and
+                    // the piece was never attached there; the second ball was
+                    // kept whole. Splitting the section at the pole gives each
+                    // half an end on the pole row and a regular midpoint.
+                    if pole_split_enabled() {
+                        let pole = edge.curve.evaluate(edge.t0).or_refuse(KernelStage::Intersect, "evaluate")?;
+                        let projection = project_point_to_curve(&curve, pole)
+                            .or_refuse(KernelStage::Intersect, "project_point_to_curve")?;
+                        if projection.distance <= overlap_limit
+                            && projection.u > whole_start + 1e-7
+                            && projection.u < whole_end - 1e-7
+                            && !near_curve_end(pole)
+                            && !split_parameters
+                                .iter()
+                                .any(|value: &f64| (*value - projection.u).abs() <= 1e-6)
+                        {
+                            split_parameters.push(projection.u);
+                        }
+                    }
                     continue;
                 }
                 // Propagate failures: a swallowed error here silently drops
@@ -878,12 +917,34 @@ impl<'a> ImprintBuilder<'a> {
                     imprint_split_add(|split| split.recover_pierces += pierces.len() as u64);
                 }
                 if refine {
-                    for pierce in &pierces {
+                    // PIERCE PROJECTION CACHE (2026-11-05): the projector is
+                    // a pure function of the section and the point, and the
+                    // ambiguity read below projects every pierce within
+                    // `4e-3 * scale` of each pierce again. An edge that runs
+                    // along the other carrier yields a dense cluster of
+                    // pierces and the read went quadratic in projections (12
+                    // s a boolean). Each pierce's projection is computed
+                    // where it was first computed and reused after, so every
+                    // reading is the one the projector returned. Escape
+                    // hatch BREP_PIERCE_PROJECTION_CACHE=0.
+                    let cache_projections = pierce_projection_cache_enabled();
+                    let mut raw_projections: Vec<Option<crate::CurveProjection>> = vec![None; pierces.len()];
+                    let mut project_pierce = |index: usize| -> Result<crate::CurveProjection, KernelRefusal> {
+                        if let Some(projection) = raw_projections[index] {
+                            return Ok(projection);
+                        }
+                        let projection = project_point_to_curve(&curve, pierces[index].point).or_refuse(KernelStage::Intersect, "project_point_to_curve")?;
+                        if cache_projections {
+                            raw_projections[index] = Some(projection);
+                        }
+                        Ok(projection)
+                    };
+                    for (pierce_index, pierce) in pierces.iter().enumerate() {
                         if pierce.t < edge.t0 - 1e-9 || pierce.t > edge.t1 + 1e-9 {
                             continue;
                         }
                         let scale = 1.0 + pierce.point.length();
-                        let mut projection = project_point_to_curve(&curve, pierce.point).or_refuse(KernelStage::Intersect, "project_point_to_curve")?;
+                        let mut projection = project_pierce(pierce_index)?;
                         if projection.distance > 2e-3 * scale {
                             // `project_point_to_curve`'s per-knot-span seed grid
                             // (4..deg+2 samples/span) + Newton can settle in the
@@ -966,13 +1027,12 @@ impl<'a> ImprintBuilder<'a> {
                         // Escape hatch BREP_PIERCE_DISTINCT_ON_SECTION=0.
                         let on_section = assembler_weld(self.tolerance);
                         let mut ambiguous = false;
-                        for other_pierce in &pierces {
+                        for (other_index, other_pierce) in pierces.iter().enumerate() {
                             let apart = other_pierce.point.sub(pierce.point).length();
-                            if std::ptr::eq(pierce, other_pierce) || apart > 4e-3 * scale {
+                            if other_index == pierce_index || apart > 4e-3 * scale {
                                 continue;
                             }
-                            let other_projection =
-                                project_point_to_curve(&curve, other_pierce.point).or_refuse(KernelStage::Intersect, "project_point_to_curve")?;
+                            let other_projection = project_pierce(other_index)?;
                             if distinct_pierces_on_section
                                 && projection.distance <= on_section
                                 && other_projection.distance <= on_section
@@ -1564,6 +1624,7 @@ impl<'a> ImprintBuilder<'a> {
                 self.by_face.entry(face.key()).or_default().push(id);
             }
             minted_ends.push((t0, t1, start, end, start_radius, end_radius));
+            super::work_profile::add(|c| c.minted_pieces += 1);
             self.pieces.push(ImprintPieceRecord {
                 id,
                 curve: snapped,

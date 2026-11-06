@@ -452,8 +452,13 @@ fn redo(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
 
 fn history_listing(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
     let _: NoArgs = parse_args(args)?;
+    Ok(Outcome::Done(listing_json(ctx)))
+}
+
+/// What `history_listing` answers (also the body of a `settle` reply).
+pub(crate) fn listing_json(ctx: &Ctx<'_>) -> Value {
     let engine = ctx.app.docs.engine();
-    Ok(Outcome::Done(json!({
+    json!({
         "listing": parse(&engine.history_listing_json()),
         "report": parse(&engine.history_report_json()),
         "step": engine.history_rollback(),
@@ -462,7 +467,7 @@ fn history_listing(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
         "can_redo": engine.can_redo(),
         "model": parse(&ctx.app.model_signature_json()),
         "idle": crate::automation::cmd_frame::frame_info(ctx).idle,
-    })))
+    })
 }
 
 fn run_cancel(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {

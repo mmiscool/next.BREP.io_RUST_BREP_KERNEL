@@ -25,9 +25,9 @@ use std::time::Duration;
 pub const DEFAULT_PORT: u16 = 8765;
 
 /// How long one command may wait for the window to answer. A submit wakes the
-/// desktop loop, which dispatches document-level commands without a frame
-/// (`desktop_loop`); frame-bound commands (input, captures, layout) answer on
-/// the next drawn frame. This bounds a hung app or a window never drawn.
+/// desktop loop, which dispatches app-state commands at once and runs an egui
+/// pass itself for input, layout reads and captures (`desktop_loop`), so no
+/// command waits for the window to be drawn. This bounds a hung app.
 const REPLY_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// The ports the Info window's **Start MCP server** button tries, in order:

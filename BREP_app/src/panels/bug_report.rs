@@ -120,7 +120,11 @@ pub struct BugReportPanel {
     /// the user was reading about.
     diagnostics: String,
     /// The in-flight POST reply channel (drained each frame).
-    response_rx: Option<Receiver<Result<(), String>>>,
+    /// `Ok` carries the new report's id when the server's reply names one.
+    response_rx: Option<Receiver<Result<Option<String>, String>>>,
+    /// A report just submitted: `(id, summary)`, for the app to remember
+    /// (`crate::report_followup`). Taken by [`Self::take_submitted`].
+    submitted: Option<(String, String)>,
     /// Per-frame widget rects for the headed verifier (wasm only).
     hits: std::collections::HashMap<String, egui::Rect>,
     /// How the description's scroll area stood on the last drawn frame, for the
@@ -153,6 +157,7 @@ impl BugReportPanel {
             model_json: String::new(),
             diagnostics: String::new(),
             response_rx: None,
+            submitted: None,
             hits: std::collections::HashMap::new(),
             description_scroll: DescriptionScroll::default(),
         }
@@ -485,8 +490,9 @@ impl BugReportPanel {
         let Ok(result) = rx.try_recv() else { return };
         self.response_rx = None;
         match result {
-            Ok(()) => {
+            Ok(id) => {
                 state.push_notice("Bug report submitted — thank you!".to_string());
+                self.submitted = id.map(|id| (id, crate::report_followup::summary_of(&self.description)));
                 self.reset();
             }
             Err(e) => {
@@ -524,7 +530,7 @@ impl BugReportPanel {
         let ctx = ctx.clone();
         ehttp::fetch(req, move |result| {
             let out = match result {
-                Ok(resp) if resp.ok => Ok(()),
+                Ok(resp) if resp.ok => Ok(crate::report_followup::id_of_reply(&resp.bytes)),
                 Ok(resp) => Err(format!("HTTP {} {}", resp.status, resp.status_text)),
                 Err(err) => Err(err),
             };
@@ -532,6 +538,11 @@ impl BugReportPanel {
             ctx.request_repaint();
         });
         self.response_rx = Some(rx);
+    }
+
+    /// The report submitted since the last call: `(id, summary)`.
+    pub fn take_submitted(&mut self) -> Option<(String, String)> {
+        self.submitted.take()
     }
 
     /// Back to idle, dropping the screenshot + preview texture.

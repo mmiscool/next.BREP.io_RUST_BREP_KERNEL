@@ -79,7 +79,9 @@ const DELETE_RED: egui::Color32 = egui::Color32::from_rgb(0xd8, 0x54, 0x4f);
 /// One constraint row's per-frame snapshot (owned, so the draw loop can defer
 /// `&mut state` mutations — the shared panel pattern).
 /// The constraint menu's entries (a row's right-click menu and a viewport
-/// chip's): Flip, Edit, Suppress / Enable, Delete.
+/// chip's): Flip, Edit, Disable / Enable, Delete. (The `suppress` id is the
+/// historical hit key; the user-facing word is Disable: "Suppress" is reserved
+/// for a pattern instance that makes no geometry.)
 pub(crate) const ACT_FLIP: &str = "flip";
 pub(crate) const ACT_EDIT: &str = "edit";
 pub(crate) const ACT_SUPPRESS: &str = "suppress";
@@ -94,7 +96,7 @@ pub(crate) fn constraint_actions(type_id: &str, enabled: bool) -> Vec<RowAction>
         None => flip,
     };
     let toggle = if enabled {
-        RowAction::new(ACT_SUPPRESS, "Suppress").tooltip("Switch this constraint off without deleting it")
+        RowAction::new(ACT_SUPPRESS, "Disable").tooltip("Switch this constraint off without deleting it")
     } else {
         RowAction::new(ACT_ENABLE, "Enable").tooltip("Switch this constraint back on")
     };
@@ -140,7 +142,6 @@ const FLIP_GLYPH: &str = "\u{21C5}";
 /// `flip_rule` decides the rest: a Distance to a line refuses on the click).
 fn flip_refusal(type_id: &str) -> Option<&'static str> {
     match type_id {
-        "fixed" => Some("A fixed component has nothing to flip"),
         "coincident" => Some("Coincident elements have one solution"),
         "symmetric" => Some("A symmetric pair has one solution"),
         _ => None,
@@ -781,11 +782,11 @@ impl AssemblyConstraintsPanel {
                 // A named conflict offers to suppress this member; the
                 // suggested one (the most recently added) says so.
                 if row.status == "conflict" {
-                    let text = if row.suppress_suggested { "Suppress \u{2605}" } else { "Suppress" };
+                    let text = if row.suppress_suggested { "Disable \u{2605}" } else { "Disable" };
                     let hover = if row.suppress_suggested {
-                        "Suppress this constraint to resolve the conflict (suggested: it is the most recently added)"
+                        "Disable this constraint to resolve the conflict (suggested: it is the most recently added)"
                     } else {
-                        "Suppress this constraint to resolve the conflict"
+                        "Disable this constraint to resolve the conflict"
                     };
                     let suppress = ui.add(egui::Button::new(egui::RichText::new(text).small())).on_hover_text(hover);
                     suppress_rect = suppress.rect;
@@ -1127,7 +1128,7 @@ fn dof_summary(dof: &Value) -> String {
             let ids: Vec<&str> = ids.iter().filter_map(Value::as_str).collect();
             let suggested = dof.get("suggestSuppress").and_then(Value::as_str).unwrap_or("");
             return format!(
-                "Conflict: {} cannot all hold. Suppress one to solve (suggested: {suggested}).",
+                "Conflict: {} cannot all hold. Disable one to solve (suggested: {suggested}).",
                 ids.join(", ")
             );
         }
@@ -1244,7 +1245,7 @@ pub static HIT_KEYS: &[HitKeyDoc] = &[
     HitKeyDoc { panel: "assemblyconstraints", prefix: "acon:box:", meaning: "a constraint's enable box", command: Some("assembly_set_constraint_enabled") },
     HitKeyDoc { panel: "assemblyconstraints", prefix: "acon:menuitem:", meaning: "one entry of a constraint row's OPEN right-click menu (acon:menuitem:<id>:<flip|edit|suppress|enable|delete>), published only while the menu is up; the same entries and dispatch as the viewport chip's menu (constraintmenu/menuitem:)", command: None },
     HitKeyDoc { panel: "assemblyconstraints", prefix: "acon:flip:", meaning: "flip a constraint to its other solution (acon:flip:<id>): the other side, facing the other way, turning the other way; one undo step. Disabled, with the reason, for a type with one solution (Fixed, Coincident, Symmetric)", command: None },
-    HitKeyDoc { panel: "assemblyconstraints", prefix: "acon:suppress:", meaning: "suppress a member of a named conflict (acon:suppress:<id>; the suggested one is the most recently added)", command: Some("assembly_set_constraint_enabled") },
+    HitKeyDoc { panel: "assemblyconstraints", prefix: "acon:suppress:", meaning: "Disable a member of a named conflict (acon:suppress:<id>; the suggested one is the most recently added)", command: Some("assembly_set_constraint_enabled") },
     HitKeyDoc { panel: "assemblyconstraints", prefix: "acon:panel:clip", meaning: "the visible region of the pane", command: None },
     HitKeyDoc { panel: "assemblyconstraints", prefix: "acon:", meaning: "a constraint form control", command: Some("assembly_update_constraint") },
 ];

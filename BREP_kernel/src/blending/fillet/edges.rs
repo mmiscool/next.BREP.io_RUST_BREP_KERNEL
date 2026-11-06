@@ -279,19 +279,48 @@ pub fn fillet_edges(
             // A closed rim written as a chain of edges along the halves of a
             // split carrier, refused because only the closed-rim rollover
             // follows its ball and that lane takes one closed edge, is blended
-            // on the body with those halves merged and the chain joined into
-            // one closed edge (`blend/split_rim.rs`; default off,
-            // `BREP_SPLIT_RIM_MERGE=1`). Only that refusal asks: a selection
+            // on the body with those halves merged and the chain joined into one
+            // closed edge (`blend/split_rim.rs`; default on,
+            // `BREP_SPLIT_RIM_MERGE=0` off). Only that refusal asks: a selection
             // the ordinary path builds keeps its body and names.
-            match ordinary {
+            let answered = match ordinary {
                 Err(refusal)
                     if crate::blend::split_rim::split_rim_merge_on()
                         && matches!(&refusal.class, crate::RefusalClass::UnsupportedGeometry { what } if what == super::analyze::TANGENT_ROLLOVER_ONLY_WHAT) =>
                 {
                     match crate::blend::split_rim::merge_split_rims(solid, edge_points, edge_names, &resolve_edge_by_point) {
+                        // The merged attempt's own reason is appended: the
+                        // first refusal names the lane that is missing, the
+                        // second why the canonical body did not answer either
+                        // (lane F's open item).
                         Some(merged) => fillet_edges_prepared(&merged.solid, &merged.points, merged.names.as_deref(), radius, chamfer, name)
-                            .map_err(|_| refusal),
+                            .map_err(|merged_refusal| {
+                                refusal.with_message(|message| {
+                                    format!("{message} The rim merged into one closed edge refused too: {}", merged_refusal.message)
+                                })
+                            }),
                         None => Err(refusal),
+                    }
+                }
+                other => other,
+            };
+            // A sheet's edge that runs out at the free boundary has no face
+            // across its end: each such end is closed by a temporary planar
+            // face, the body blended, and the faces removed again
+            // (`blend/sheet_ends.rs`; default on, `BREP_SHEET_FREE_END=0` off).
+            // Only a refused sheet selection asks; the refusal stands unless
+            // the reopened sheet validates.
+            match answered {
+                Err(refusal) if solid.kind == crate::BodyKind::Sheet && crate::blend::sheet_ends::sheet_free_end_on() => {
+                    let edge_ids = edge_points.iter().map(|point| resolve_edge_by_point(solid, *point)).collect::<Result<Vec<_>, _>>();
+                    let Ok(edge_ids) = edge_ids else { return Err(refusal) };
+                    let Some(closed) = crate::blend::sheet_ends::close_free_ends(solid, &edge_ids) else { return Err(refusal) };
+                    let count = crate::blend::sheet_ends::temporary_faces(&closed);
+                    match fillet_edges_prepared(&closed, edge_points, edge_names, radius, chamfer, name) {
+                        Ok(built) => crate::blend::sheet_ends::open_free_ends(built, count).ok_or(refusal),
+                        Err(closed_refusal) => Err(refusal.with_message(|message| {
+                            format!("{message} The sheet with its free ends closed refused too: {}", closed_refusal.message)
+                        })),
                     }
                 }
                 other => other,

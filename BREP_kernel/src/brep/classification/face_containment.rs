@@ -2209,6 +2209,7 @@ fn point_in_face_scanned(
     tolerance: f64,
     scan: ChordScan,
 ) -> Result<PolygonClass, String> {
+    let _wall = crate::wall_profile::Scope::enter(crate::wall_profile::CLASSIFY);
     let prepared = prepared_face(face);
     let mut from = 0;
     loop {

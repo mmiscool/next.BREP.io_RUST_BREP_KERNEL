@@ -22,7 +22,7 @@ pub(super) fn pmi_state_schema() -> Value {
     defs["SectionPlane"] = closed_object_required(json!({"axis":text,"offset":number,"flip":boolean,"normal":v3}), &["axis","offset","flip"]);
     defs["Section"] = closed_object_required(json!({"axis":text,"offset":number,"flip":boolean,"origin":v3,"normal":v3,
         "plane":text,"exclude":strings,"planes":array(reference("SectionPlane"))}), &["axis","offset","flip"]);
-    defs["Display"] = closed_object_required(json!({"textSizePt":number,"wireframe":boolean,"hidden":strings,"section":reference("Section")}), &["textSizePt","wireframe","hidden"]);
+    defs["Display"] = closed_object_required(json!({"textSizePt":number,"wireframe":boolean,"section":reference("Section")}), &["textSizePt","wireframe"]);
     defs["PluginReplay"] = closed_object_required(json!({"version":{"type":"integer","minimum":0,"maximum":4294967295u64},
         "fingerprint":{},"dependencies":{"type":"object","additionalProperties":true},"inputData":{},"outputData":{}}),
         &["version","fingerprint","dependencies","inputData","outputData"]);

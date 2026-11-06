@@ -33,8 +33,6 @@ pub(super) fn raw_wheel_delta_y(ctx: &egui::Context) -> f32 {
 /// enough to reach on purpose. It only BINDS if a theme drives `tooltip_delay`
 /// below it; at the stock 0.5 s the style's value is what applies.
 const DWELL_FLOOR_SECS: f64 = 0.25;
-/// The info line an instance's component menu opens with (never chosen).
-const PATTERN_INFO: &str = "pattern-info";
 
 /// How long a hover highlight must stand before a plain click opens the PICK
 /// LIST instead of selecting it: egui's OWN `interaction.tooltip_delay` (0.5 s by
@@ -337,13 +335,8 @@ impl Viewport {
         if draw_mode && response.secondary_clicked() {
             state.sketch3d_tool_cancel();
         }
-        let delete = !ui.ctx().text_edit_focused()
-            && ui
-                .ctx()
-                .input(|i| i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace));
-        if delete {
-            state.sketch3d_delete_selection();
-        }
+        // Delete / Backspace: the shell's one delete-selection command
+        // (`crate::delete_selection`, run from `handle_shortcuts`).
         if response.drag_started() {
             if let Some(pos) = response.interact_pointer_pos() {
                 let (lx, ly) = local(pos);
@@ -463,18 +456,9 @@ impl Viewport {
             state.sketch_tool_cancel();
         }
 
-        // Delete / Backspace removes the current sketch selection (S3b) — geometries +
-        // points + constraints + orphan cleanup, driven by the engine. Gated on sketch
-        // mode AND on no egui TEXT edit being focused, so a Backspace typed into an open
-        // dimension value editor edits the number rather than deleting the selection
-        // (same guard `handle_shortcuts` uses for the global keys).
-        let delete = !ui.ctx().text_edit_focused()
-            && ui
-                .ctx()
-                .input(|i| i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace));
-        if delete {
-            state.sketch_delete_selection();
-        }
+        // Delete / Backspace removes the current sketch selection (S3b) through the
+        // shell's one delete-selection command (`crate::delete_selection`, run from
+        // `handle_shortcuts` behind its text-edit guard).
 
         if response.drag_started() {
             if let Some(pos) = response.interact_pointer_pos() {
@@ -691,70 +675,38 @@ impl Viewport {
         state: &mut EngineState,
         request: Option<(String, egui::Pos2)>,
     ) {
-        use crate::panels::component_actions::{run_component_action, ComponentAction};
+        use crate::panels::component_actions::{component_menu, run_component_actions, ComponentAction, MenuSubject};
         self.component_menu_hits.clear();
         let mut chosen: Option<(String, ComponentAction)> = None;
         if let Some((id, pos)) = self.component_menu.clone() {
-            // A Pattern Component instance has no feature of its own: its menu
-            // says whose copy it is and acts on the SEED, offering what makes
-            // sense from a copy (open the part, replace it; the seed's own
-            // Move / Fix / Delete stay on the seed).
+            // THE shared component menu (the context bar's and the BOM row's
+            // too). A Pattern Component instance's says whose copy it is and
+            // acts on the SEED.
             let instance = brep_render::brep_kernel::pattern_component_instance(&id);
             let seed = instance.as_ref().map_or(id.clone(), |(_, seed, _)| seed.clone());
-            match state.component_info(&seed) {
-                Some(info) => {
-                    let mut actions: Vec<crate::column_tree::RowAction> = ComponentAction::ALL
-                        .into_iter()
-                        .filter(|action| {
-                            instance.is_none() || matches!(action, ComponentAction::OpenPart | ComponentAction::Replace)
-                        })
-                        .map(|action| {
-                            let entry = crate::column_tree::RowAction::new(action.id(), action.label(info.fixed))
-                                .tooltip(action.tooltip());
-                            match action {
-                                ComponentAction::Move if info.fixed => {
-                                    entry.disabled("This component is fixed \u{2014} unfix it before moving it")
-                                }
-                                ComponentAction::Delete => entry.separator_above().destructive(),
-                                _ => entry,
-                            }
-                        })
-                        .collect();
-                    if let Some((pattern, seed, n)) = &instance {
-                        let line = format!("Instance {n} of {pattern}: follows {seed}");
-                        actions.insert(
-                            0,
-                            crate::column_tree::RowAction::new(PATTERN_INFO, &line)
-                                .disabled("A pattern copy: these act on its seed, and every copy follows"),
-                        );
-                    }
-                    let hits = &mut self.component_menu_hits;
-                    let (action, still_open) = crate::column_tree::action_menu(
-                        ctx,
-                        egui::LayerId::new(egui::Order::Foreground, egui::Id::new("brep-component-menu-layer")),
-                        egui::Id::new("brep-component-menu"),
-                        pos,
-                        &actions,
-                        |entry, rect| {
-                            hits.insert(format!("menuitem:{id}:{}", entry.id), rect);
-                        },
-                    );
-                    if !still_open {
-                        self.component_menu = None;
-                    }
-                    chosen = action.and_then(|action| ComponentAction::from_id(&action)).map(|action| (id, action));
+            if state.component_info(&seed).is_some() {
+                let actions = component_menu(&MenuSubject::of(state, std::slice::from_ref(&id)));
+                let hits = &mut self.component_menu_hits;
+                let (action, still_open) = crate::column_tree::action_menu(
+                    ctx,
+                    egui::LayerId::new(egui::Order::Foreground, egui::Id::new("brep-component-menu-layer")),
+                    egui::Id::new("brep-component-menu"),
+                    pos,
+                    &actions,
+                    |entry, rect| {
+                        hits.insert(format!("menuitem:{id}:{}", entry.id), rect);
+                    },
+                );
+                if !still_open {
+                    self.component_menu = None;
                 }
-                None => self.component_menu = None,
+                chosen = action.and_then(|action| ComponentAction::from_id(&action)).map(|action| (id, action));
+            } else {
+                self.component_menu = None;
             }
         }
         if let Some((id, action)) = chosen {
-            // On an instance, Replace keeps the instance id (the chooser opens
-            // on the seed and says why); everything else acts on the seed.
-            let target = match brep_render::brep_kernel::pattern_component_instance(&id) {
-                Some((_, seed, _)) if action != ComponentAction::Replace => seed,
-                _ => id,
-            };
-            if let Some(request) = run_component_action(state, action, &target) {
+            if let Some(request) = run_component_actions(state, action, &[id]) {
                 self.component_request = Some(request);
             }
         }

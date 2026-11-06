@@ -1280,15 +1280,15 @@ pub fn first_reference_name(value: Option<&serde_json::Value>) -> Option<String>
     value.and_then(one)
 }
 
-/// Normalize a PROFILE reference name: a committed sketch is shown as a render-side
-/// display SHEET whose planar face is PICKED as `{sketch}:FACE`, but the kernel run
-/// never materializes that sheet — the pick actually names the sketch's PROFILE. So
-/// strip a trailing `:FACE` to the sketch base, and every profile-consumer's resolve
-/// + cap-naming + sketch-consume then uses the canonical id. Resident SOLID faces are
-/// `{solid}|{face}[n]` and never end in `:FACE`, so real faces pass through untouched.
-/// Apply ONLY to `profile` fields (never to `path`/`axis`).
+/// Normalize a PROFILE reference name to the canonical sketch id by THE
+/// sketch-name rule ([`crate::feature_pipeline::sketch_alias_base`]): a committed
+/// sketch is picked as `{sketch}:FACE` (its render-side display sheet, which the
+/// kernel run never materializes) or stored as `{sketch}:PROFILE`; both name the
+/// profile stored under `{sketch}`, and every profile consumer's resolve +
+/// cap-naming + sketch-consume then uses that id. Resident SOLID faces are
+/// `{solid}|{face}[n]` and end in neither suffix, so real faces pass through.
 pub fn normalize_profile_alias(name: String) -> String {
-    match name.strip_suffix(":FACE") {
+    match crate::feature_pipeline::sketch_alias_base(&name) {
         Some(base) => base.to_string(),
         None => name,
     }
@@ -1346,10 +1346,7 @@ pub fn consume_sketch(ctx: &FeatureContext, reference_name: &str, result: &mut F
 /// switch. Non-sheet-metal profile consumers keep the `consumeProfileSketch`
 /// gate via `consume_sketch` above.
 pub fn consume_sketch_always(reference_name: &str, result: &mut FeatureResult) {
-    let base = reference_name
-        .strip_suffix(":PROFILE")
-        .unwrap_or(reference_name)
-        .to_string();
+    let base = crate::feature_pipeline::canonical_sketch_name(reference_name).to_string();
     if !result.removed.contains(&base) {
         result.removed.push(base);
     }
@@ -1653,8 +1650,8 @@ pub fn sketch_plane_frame(ctx: &FeatureContext, names: &[String]) -> Option<Fram
 
 /// The base name a sketch-consuming feature should REMOVE for a reference: the
 /// owning SKETCH for a sketch-geometry pick (`{sketchId}:G{gid}` whose owner
-/// published a frame), else the raw reference name (`consume_sketch_always` strips
-/// `:PROFILE` itself; non-sketch names are harmless display no-ops).
+/// published a frame), else the raw reference name (`consume_sketch_always` applies
+/// the sketch-name rule itself; non-sketch names are harmless display no-ops).
 ///
 /// A viewport pick on a sketch's drawn SEGMENT stores `{sketchId}:G{gid}`, so
 /// without this the consume would echo a name no display knows and the consumed

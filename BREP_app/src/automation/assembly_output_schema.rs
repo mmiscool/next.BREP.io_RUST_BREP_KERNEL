@@ -52,12 +52,22 @@ fn scan_report() -> Value {
 
 pub(super) fn scan() -> Value { envelope(scan_report()) }
 
+/// The legacy Fixed rows a run turned into their components' Fixed setting
+/// (`migratedFixed`, present only on the run that migrated them).
+fn migrated_fixed() -> Value {
+    array(closed_object_required(
+        json!({"id":text(),"element":{"type":["string","null"]},"component":{"type":["string","null"]},"enabled":boolean()}),
+        &["id","element","component","enabled"],
+    ))
+}
+
 fn solve_report() -> Value {
     let axis = closed_object_required(json!({"point":vector(3),"direction":vector(3)}), &["point","direction"]);
     let freedom = closed_object_required(json!({"rotations":count(),"translations":count(),"axes":array(axis),"slides":array(vector(3))}), &["rotations","translations","axes","slides"]);
-    let solved = closed_object_required(json!({"ok":{"const":true},"mates":count(),"strategy":text(),"iterations":count(),"maxResidual":{"type":"number"},"dof":count(),"rank":count(),"redundant":count(),"status":text(),"bodies":array(text()),"bodyFreedom":{"type":"object","additionalProperties":freedom},"movedComponents":array(text()),"movedSolids":array(closed_object_required(json!({"name":text(),"handle":count()}), &["name","handle"]))}), &["ok","mates","strategy","iterations","maxResidual","dof","rank","redundant","status","bodies","bodyFreedom","movedComponents","movedSolids"]);
-    let empty = closed_object_required(json!({"ok":{"const":true},"mates":{"const":0}}), &["ok","mates"]);
+    let solved = closed_object_required(json!({"ok":{"const":true},"mates":count(),"strategy":text(),"iterations":count(),"maxResidual":{"type":"number"},"dof":count(),"rank":count(),"redundant":count(),"status":text(),"bodies":array(text()),"bodyFreedom":{"type":"object","additionalProperties":freedom},"movedComponents":array(text()),"movedSolids":array(closed_object_required(json!({"name":text(),"handle":count()}), &["name","handle"])),"migratedFixed":migrated_fixed()}), &["ok","mates","strategy","iterations","maxResidual","dof","rank","redundant","status","bodies","bodyFreedom","movedComponents","movedSolids"]);
+    let empty = closed_object_required(json!({"ok":{"const":true},"mates":{"const":0},"migratedFixed":migrated_fixed()}), &["ok","mates"]);
     let mut failed = refusal();
+    failed["properties"]["migratedFixed"] = migrated_fixed();
     failed["properties"]["nonConvergent"] = text();
     failed["properties"]["conflict"] = array(text());
     failed["properties"]["suggestSuppress"] = text();
@@ -149,12 +159,12 @@ fn dof() -> Value {
         "maxResidual":number(),"dof":count(),"rank":count(),"redundant":count(),"status":text(),
         "bodies":strings(),"bodyFreedom":{"type":"object","additionalProperties":freedom},
         "movedComponents":strings(),"movedSolids":array(fields(json!({"name":text(),"handle":count()}))),
-        "nestedConstraints":nested}), &["ok","mates"]);
+        "nestedConstraints":nested,"migratedFixed":migrated_fixed()}), &["ok","mates"]);
     // With no mapped mates, only ok/mates is emitted. Solver diagnostics are
     // present after a solve; nested constraints are independently optional.
     success["description"] = json!("Empty-mate or solved report; diagnostic fields are absent before a mapped solve.");
     let failure = closed_object_required(json!({"ok":{"const":false},"error":text(),"nonConvergent":text(),
-        "conflict":strings(),"suggestSuppress":text(),"nestedConstraints":nested}), &["ok","error"]);
+        "conflict":strings(),"suggestSuppress":text(),"nestedConstraints":nested,"migratedFixed":migrated_fixed()}), &["ok","error"]);
     json!({"oneOf":[{"type":"null"},success,failure]})
 }
 
@@ -166,6 +176,24 @@ pub(super) fn state() -> Value {
 pub(super) fn solve() -> Value { fields(json!({"statuses":statuses(),"dof":dof()})) }
 pub(super) fn selected() -> Value { fields(json!({"selected":strings()})) }
 pub(super) fn attributes() -> Value { fields(json!({"attributes":arbitrary_attributes()})) }
+/// A part's mass reading (`brep_render::engine_state::part_mass::MassReport`).
+pub(super) fn mass_properties() -> Value {
+    fields(json!({
+        "volumeMm3":null_or(number()),"massKg":null_or(number()),"densityGcm3":null_or(number()),
+        "densitySource":null_or(json!({"enum":["solid","part","material"]})),"solidCount":count(),
+        "massStatus":{"enum":["computed","override","pending","no-density","no-geometry","failed"]},
+        "massNote":null_or(text())
+    }))
+}
+/// A part's stored attributes, the record the BOM shows (stored + derived
+/// Mass/Volume/Density) and the mass reading behind it.
+pub(super) fn part_attributes() -> Value {
+    fields(json!({
+        "attributes":arbitrary_attributes(),
+        "record":{"type":"object","additionalProperties":true,"description":"The attributes with the derived mass properties folded in: Mass (kg) and Volume (mm³) computed from the part's geometry and density, Density (g/cm³) resolved from the Material when none is typed."},
+        "massProperties":mass_properties()
+    }))
+}
 pub(super) fn updated() -> Value { fields(json!({"outdated":count(),"missing":strings(),"refreshed":count()})) }
 pub(super) fn component() -> Value {
     let matrix = json!({"type":"array","items":{"type":"number"},"minItems":16,"maxItems":16});

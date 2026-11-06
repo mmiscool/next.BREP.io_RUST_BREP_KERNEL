@@ -685,7 +685,12 @@ fn cam_generate_reply(job: CamJob, post: &mut dyn FnMut(Reply) -> bool) -> CamRe
 }
 
 pub use brep_reconstruction::stl_conversion::{
-    ConversionPolicy, StlConversionOptions, StlConversionOutput,
+    ConversionBackend, ConversionPolicy, HybridDemotion, StlConversionOptions, StlConversionOutput,
+    StlConversionReport,
+};
+pub use brep_reconstruction::import_session::{
+    FitAttempt, FitKind, ImportRegion, ImportRegions, NurbsFaceChoice, NurbsFaceOutcome, NurbsFit, RegionFit,
+    RegionFitRequest, RegionKind, UNASSIGNED as UNASSIGNED_REGION,
 };
 
 /// Mesh encoding accepted by the off-thread reconstruction channel.
@@ -706,6 +711,81 @@ pub struct MeshImportRequest {
     pub format: MeshImportFormat,
     pub bytes: Vec<u8>,
     pub options: StlConversionOptions,
+    /// Stream the interactive import's phases ([`Reply::MeshImportPhase`])
+    /// before the final reply: the parsed mesh, then its regions. The final
+    /// reply is the same with or without them.
+    #[serde(default)]
+    pub phases: bool,
+}
+
+/// One phase of an interactive mesh import, posted from inside the
+/// reconstruction before its [`MeshImportReply`].
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub enum MeshImportPhase {
+    /// The parsed, welded triangle soup the reconstruction reads.
+    Mesh { positions: Vec<f64>, indices: Vec<u32> },
+    /// The regions the builder starts from, per source triangle.
+    Regions(brep_reconstruction::import_session::ImportRegions),
+    /// The regions could not be read (the reconstruction still runs).
+    RegionsFailed(String),
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct MeshImportPhaseReply {
+    pub id: u64,
+    pub phase: MeshImportPhase,
+}
+
+/// Refit one region of an interactive import. The caller sends the region's
+/// own triangles (a small mesh), so the runner keeps no import state.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct RegionFitJob {
+    pub id: u64,
+    pub positions: Vec<f64>,
+    pub indices: Vec<u32>,
+    pub request: brep_reconstruction::import_session::RegionFitRequest,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct RegionFitReply {
+    pub id: u64,
+    pub fit: brep_reconstruction::import_session::RegionFit,
+}
+
+/// Run a region refit wherever the runner runs.
+pub fn region_fit_reply(job: RegionFitJob) -> RegionFitReply {
+    RegionFitReply {
+        id: job.id,
+        fit: brep_reconstruction::import_session::fit_region(&job.positions, &job.indices, &job.request),
+    }
+}
+
+/// Rebuild an interactive import's chosen regions as NURBS faces: the
+/// conversion's STEP, the welded mesh the regions index, and one choice per
+/// region (`brep_reconstruction::import_session::apply_region_choices`).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ApplyRegionChoicesJob {
+    pub id: u64,
+    pub step_text: String,
+    pub positions: Vec<f64>,
+    pub indices: Vec<u32>,
+    pub choices: Vec<NurbsFaceChoice>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ApplyRegionChoicesReply {
+    pub id: u64,
+    /// The new STEP (unchanged when no choice applied) and one outcome per
+    /// choice, in order.
+    pub result: Result<(String, Vec<NurbsFaceOutcome>), String>,
+}
+
+/// Apply region choices wherever the runner runs.
+pub fn apply_region_choices_reply(job: ApplyRegionChoicesJob) -> ApplyRegionChoicesReply {
+    ApplyRegionChoicesReply {
+        id: job.id,
+        result: brep_reconstruction::import_session::apply_region_choices(&job.step_text, &job.positions, &job.indices, &job.choices),
+    }
 }
 
 /// Completed off-thread reconstruction. Success carries validated STEP and
@@ -800,6 +880,29 @@ pub trait HistoryRunner {
     fn submit_mesh_import(&mut self, request: MeshImportRequest);
     /// Non-blocking: the next completed mesh reconstruction, if any.
     fn poll_mesh_import(&mut self) -> Option<MeshImportReply>;
+    /// Non-blocking: the next phase of an interactive mesh import
+    /// ([`MeshImportRequest::phases`]). The default posts none.
+    fn poll_mesh_import_phase(&mut self) -> Option<MeshImportPhaseReply> {
+        None
+    }
+    /// Submit a region refit; `false` when this runner cannot run one (the
+    /// caller then fits on its own thread — a region is small).
+    fn submit_region_fit(&mut self, _job: RegionFitJob) -> bool {
+        false
+    }
+    /// Non-blocking: the next completed region refit, if any.
+    fn poll_region_fit(&mut self) -> Option<RegionFitReply> {
+        None
+    }
+    /// Submit region choices to apply; `false` when this runner cannot (the
+    /// caller then applies them on its own thread).
+    fn submit_apply_region_choices(&mut self, _job: ApplyRegionChoicesJob) -> bool {
+        false
+    }
+    /// Non-blocking: the next applied region choices, if any.
+    fn poll_apply_region_choices(&mut self) -> Option<ApplyRegionChoicesReply> {
+        None
+    }
     /// Submit a STEP product-structure probe (see [`StepProbeRequest`]).
     fn submit_step_probe(&mut self, request: StepProbeRequest);
     /// Non-blocking: the next completed STEP probe, if any.
@@ -1041,6 +1144,9 @@ pub struct InlineRunner {
     /// thread runner's query buffer, so the object-info path resolves same-call.
     query_pending: std::collections::VecDeque<MeasureReply>,
     mesh_import_pending: std::collections::VecDeque<MeshImportReply>,
+    mesh_phase_pending: std::collections::VecDeque<MeshImportPhaseReply>,
+    region_fit_pending: std::collections::VecDeque<RegionFitReply>,
+    apply_choices_pending: std::collections::VecDeque<ApplyRegionChoicesReply>,
     step_probe_pending: std::collections::VecDeque<StepProbeReply>,
     topology_pending: std::collections::VecDeque<TopologyReply>,
     sheet_lines_pending: std::collections::VecDeque<SheetLinesReply>,
@@ -1055,6 +1161,9 @@ impl InlineRunner {
             pending: std::collections::VecDeque::new(),
             query_pending: std::collections::VecDeque::new(),
             mesh_import_pending: std::collections::VecDeque::new(),
+            mesh_phase_pending: std::collections::VecDeque::new(),
+            region_fit_pending: std::collections::VecDeque::new(),
+            apply_choices_pending: std::collections::VecDeque::new(),
             step_probe_pending: std::collections::VecDeque::new(),
             topology_pending: std::collections::VecDeque::new(),
             sheet_lines_pending: std::collections::VecDeque::new(),
@@ -1129,12 +1238,38 @@ impl HistoryRunner for InlineRunner {
     }
 
     fn submit_mesh_import(&mut self, request: MeshImportRequest) {
-        self.mesh_import_pending
-            .push_back(reconstruct_mesh(request));
+        let phases = &mut self.mesh_phase_pending;
+        let reply = reconstruct_mesh_phased(request, &mut |phase| {
+            phases.push_back(phase);
+            true
+        });
+        self.mesh_import_pending.push_back(reply);
     }
 
     fn poll_mesh_import(&mut self) -> Option<MeshImportReply> {
         self.mesh_import_pending.pop_front()
+    }
+
+    fn poll_mesh_import_phase(&mut self) -> Option<MeshImportPhaseReply> {
+        self.mesh_phase_pending.pop_front()
+    }
+
+    fn submit_region_fit(&mut self, job: RegionFitJob) -> bool {
+        self.region_fit_pending.push_back(region_fit_reply(job));
+        true
+    }
+
+    fn poll_region_fit(&mut self) -> Option<RegionFitReply> {
+        self.region_fit_pending.pop_front()
+    }
+
+    fn submit_apply_region_choices(&mut self, job: ApplyRegionChoicesJob) -> bool {
+        self.apply_choices_pending.push_back(apply_region_choices_reply(job));
+        true
+    }
+
+    fn poll_apply_region_choices(&mut self) -> Option<ApplyRegionChoicesReply> {
+        self.apply_choices_pending.pop_front()
     }
 
     fn submit_step_probe(&mut self, request: StepProbeRequest) {
@@ -1219,6 +1354,8 @@ pub enum Command {
     },
     Query(MeasureQuery),
     MeshImport(MeshImportRequest),
+    RegionFit(RegionFitJob),
+    ApplyRegionChoices(ApplyRegionChoicesJob),
     StepProbe(StepProbeRequest),
     Topology(TopologyRequest),
     SheetLines(SheetLinesRequest),
@@ -1241,6 +1378,10 @@ pub enum Reply {
     Run(RunReply),
     Query(MeasureReply),
     MeshImport(MeshImportReply),
+    /// A phase of an interactive mesh import, posted before its `MeshImport`.
+    MeshImportPhase(MeshImportPhaseReply),
+    RegionFit(RegionFitReply),
+    ApplyRegionChoices(ApplyRegionChoicesReply),
     StepProbe(StepProbeReply),
     Topology(TopologyReply),
     SheetLines(SheetLinesReply),
@@ -1275,7 +1416,21 @@ fn probe_step(request: StepProbeRequest) -> StepProbeReply {
     }
 }
 
+/// The import without its phase stream (every runner posts the phased one;
+/// the runner's tests read the reply alone).
+#[cfg_attr(not(test), allow(dead_code))]
 fn reconstruct_mesh(request: MeshImportRequest) -> MeshImportReply {
+    reconstruct_mesh_phased(request, &mut |_| true)
+}
+
+/// [`reconstruct_mesh`], posting each phase of an interactive import to
+/// `phase` as it completes when the request asks for them.
+fn reconstruct_mesh_phased(
+    request: MeshImportRequest,
+    phase: &mut dyn FnMut(MeshImportPhaseReply) -> bool,
+) -> MeshImportReply {
+    let id = request.id;
+    let phases = request.phases;
     let result = (|| {
         use brep_reconstruction::stl_conversion::{
             binary_stl_coordinate_precision_tolerance, convert_stl_mesh_to_step_with_colors,
@@ -1381,6 +1536,28 @@ fn reconstruct_mesh(request: MeshImportRequest) -> MeshImportReply {
         let mut options = request.options;
         options.coordinate_precision_tolerance = options.coordinate_precision_tolerance
             .max(coordinate_precision_tolerance);
+        if phases {
+            // `false` back from a post: nobody is listening any more (a
+            // cancelled preview on the native thread) — stop here.
+            let listening = phase(MeshImportPhaseReply {
+                id,
+                phase: MeshImportPhase::Mesh { positions: positions.clone(), indices: indices.clone() },
+            });
+            if !listening {
+                return Err("cancelled".to_string());
+            }
+            let regions = brep_reconstruction::import_session::analyze_regions(&positions, &indices, &options);
+            let listening = phase(MeshImportPhaseReply {
+                id,
+                phase: match regions {
+                    Ok(regions) => MeshImportPhase::Regions(regions),
+                    Err(error) => MeshImportPhase::RegionsFailed(error),
+                },
+            });
+            if !listening {
+                return Err("cancelled".to_string());
+            }
+        }
         convert_stl_mesh_to_step_with_colors(
             &mesh,
             &positions,
@@ -1398,10 +1575,7 @@ fn reconstruct_mesh(request: MeshImportRequest) -> MeshImportReply {
         })
         .map_err(|error| format!("RANSAC reconstruction failed: {error}"))
     })();
-    MeshImportReply {
-        id: request.id,
-        result,
-    }
+    MeshImportReply { id, result }
 }
 
 /// Give each body the name of the 3MF object its first source triangle came
@@ -1541,7 +1715,11 @@ pub fn process_command(
             let result = measure_json(runner, &query);
             Some(Reply::Query(MeasureReply { id: query.id, result }))
         }
-        Command::MeshImport(request) => Some(Reply::MeshImport(reconstruct_mesh(request))),
+        Command::MeshImport(request) => Some(Reply::MeshImport(reconstruct_mesh_phased(request, &mut |phase| {
+            progress(Reply::MeshImportPhase(phase))
+        }))),
+        Command::RegionFit(job) => Some(Reply::RegionFit(region_fit_reply(job))),
+        Command::ApplyRegionChoices(job) => Some(Reply::ApplyRegionChoices(apply_region_choices_reply(job))),
         Command::StepProbe(request) => Some(Reply::StepProbe(probe_step(request))),
         Command::Topology(request) => Some(Reply::Topology(topology_reply(request))),
         Command::SheetLines(request) => Some(Reply::SheetLines(sheet_lines_reply(request))),
@@ -1577,6 +1755,28 @@ pub fn process_command(
 /// then pop the matching one. The `SceneRunner` (and thus the kernel's resident
 /// registry it warms) lives ENTIRELY on the thread — it is never shared — so the
 /// only cross-thread traffic is the `Send` command/reply payloads.
+/// Called after the runner thread posts a reply or a progress report, from
+/// that thread: the app's event loop wakes and collects it at once instead of
+/// at its next timed check (`set_reply_waker`). Process-wide, like the
+/// thread's other plumbing; none installed is a no-op.
+#[cfg(not(target_arch = "wasm32"))]
+static REPLY_WAKER: std::sync::RwLock<Option<std::sync::Arc<dyn Fn() + Send + Sync>>> = std::sync::RwLock::new(None);
+
+/// Install (or with `None` remove) the hook a runner thread calls after each
+/// reply it posts. The desktop event loop installs its own waker here.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn set_reply_waker(waker: Option<std::sync::Arc<dyn Fn() + Send + Sync>>) {
+    *REPLY_WAKER.write().unwrap_or_else(|p| p.into_inner()) = waker;
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn wake_main() {
+    let waker = REPLY_WAKER.read().unwrap_or_else(|p| p.into_inner()).clone();
+    if let Some(waker) = waker {
+        waker();
+    }
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 pub struct ThreadRunner {
     /// Main → thread. `Option` so [`Drop`] can take + drop it, ending the thread's
@@ -1591,6 +1791,9 @@ pub struct ThreadRunner {
     /// Demuxed completed measurement replies awaiting `poll_query`.
     query_buf: std::collections::VecDeque<MeasureReply>,
     mesh_import_buf: std::collections::VecDeque<MeshImportReply>,
+    mesh_phase_buf: std::collections::VecDeque<MeshImportPhaseReply>,
+    region_fit_buf: std::collections::VecDeque<RegionFitReply>,
+    apply_choices_buf: std::collections::VecDeque<ApplyRegionChoicesReply>,
     step_probe_buf: std::collections::VecDeque<StepProbeReply>,
     topology_buf: std::collections::VecDeque<TopologyReply>,
     sheet_lines_buf: std::collections::VecDeque<SheetLinesReply>,
@@ -1646,6 +1849,9 @@ impl ThreadRunner {
             run_buf: std::collections::VecDeque::new(),
             query_buf: std::collections::VecDeque::new(),
             mesh_import_buf: std::collections::VecDeque::new(),
+            mesh_phase_buf: std::collections::VecDeque::new(),
+            region_fit_buf: std::collections::VecDeque::new(),
+            apply_choices_buf: std::collections::VecDeque::new(),
             step_probe_buf: std::collections::VecDeque::new(),
             topology_buf: std::collections::VecDeque::new(),
             sheet_lines_buf: std::collections::VecDeque::new(),
@@ -1684,6 +1890,9 @@ impl ThreadRunner {
             Reply::Run(run) => self.run_buf.push_back(run),
             Reply::Query(query) => self.query_buf.push_back(query),
             Reply::MeshImport(reply) => self.mesh_import_buf.push_back(reply),
+            Reply::MeshImportPhase(reply) => self.mesh_phase_buf.push_back(reply),
+            Reply::RegionFit(reply) => self.region_fit_buf.push_back(reply),
+            Reply::ApplyRegionChoices(reply) => self.apply_choices_buf.push_back(reply),
             Reply::StepProbe(reply) => self.step_probe_buf.push_back(reply),
             Reply::Topology(reply) => self.topology_buf.push_back(reply),
             Reply::SheetLines(reply) => self.sheet_lines_buf.push_back(reply),
@@ -1780,7 +1989,11 @@ fn thread_main(
             let mut progress = |reply: Reply| {
                 // A lost receiver means the main side abandoned this thread:
                 // stop at this boundary rather than finishing for nobody.
-                reply_tx.send(reply).is_ok()
+                let sent = reply_tx.send(reply).is_ok();
+                if sent {
+                    wake_main();
+                }
+                sent
                     && !stop.load(std::sync::atomic::Ordering::Relaxed)
                     && !(is_cam && cam_cancel.load(std::sync::atomic::Ordering::SeqCst))
                     && !(is_sim && cam_sim_cancel.load(std::sync::atomic::Ordering::SeqCst))
@@ -1789,6 +2002,7 @@ fn thread_main(
                 if reply_tx.send(reply).is_err() {
                     return; // The reply receiver is gone — the main side went away.
                 }
+                wake_main();
             }
         }
     }
@@ -1899,6 +2113,35 @@ impl HistoryRunner for ThreadRunner {
     fn poll_mesh_import(&mut self) -> Option<MeshImportReply> {
         self.drain();
         self.mesh_import_buf.pop_front()
+    }
+
+    fn poll_mesh_import_phase(&mut self) -> Option<MeshImportPhaseReply> {
+        self.drain();
+        self.mesh_phase_buf.pop_front()
+    }
+
+    fn submit_region_fit(&mut self, job: RegionFitJob) -> bool {
+        match &self.tx {
+            Some(tx) => tx.send(Command::RegionFit(job)).is_ok(),
+            None => false,
+        }
+    }
+
+    fn poll_region_fit(&mut self) -> Option<RegionFitReply> {
+        self.drain();
+        self.region_fit_buf.pop_front()
+    }
+
+    fn submit_apply_region_choices(&mut self, job: ApplyRegionChoicesJob) -> bool {
+        match &self.tx {
+            Some(tx) => tx.send(Command::ApplyRegionChoices(job)).is_ok(),
+            None => false,
+        }
+    }
+
+    fn poll_apply_region_choices(&mut self) -> Option<ApplyRegionChoicesReply> {
+        self.drain();
+        self.apply_choices_buf.pop_front()
     }
 
     fn submit_step_probe(&mut self, request: StepProbeRequest) {
@@ -2040,6 +2283,9 @@ impl HistoryRunner for ThreadRunner {
         self.run_buf.clear();
         self.query_buf.clear();
         self.mesh_import_buf.clear();
+        self.mesh_phase_buf.clear();
+        self.region_fit_buf.clear();
+        self.apply_choices_buf.clear();
         self.step_probe_buf.clear();
         self.topology_buf.clear();
         self.sheet_lines_buf.clear();

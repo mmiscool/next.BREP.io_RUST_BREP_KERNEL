@@ -9,6 +9,7 @@ fn argument_names(name: &str) -> &'static [&'static str] {
         "recover-execution" => &["executionId", "key"],
         "edit-assembly" => &["document", "component"],
         "export-model" => &["document", "format", "destination"],
+        "design-part" => &["document"],
         _ => &[],
     }
 }

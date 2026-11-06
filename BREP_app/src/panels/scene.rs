@@ -358,9 +358,8 @@ impl ScenePanel {
                 state.set_visible(&name, v);
             }
             Some(Action::SetAllVisible(v)) => {
-                for s in &solids {
-                    state.set_visible(&s.name, v);
-                }
+                let names: Vec<String> = solids.iter().map(|s| s.name.clone()).collect();
+                state.set_visible_many(&names, v);
             }
             Some(Action::SetEntityVisible(name, kind, index, v)) => {
                 state.set_entity_visible(&name, kind, index, v);

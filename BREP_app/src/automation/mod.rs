@@ -20,6 +20,7 @@
 pub mod hit_keys;
 pub(crate) mod hit_rects;
 pub mod registry;
+pub mod state_blobs;
 
 /// Where the toolbar's Help button points: the generated help site `brep-docs`
 /// writes next to the served page. Declared here — outside the `automation`

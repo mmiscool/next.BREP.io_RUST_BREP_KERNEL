@@ -5,7 +5,7 @@ use crate::{KernelRefusal, KernelStage, OrRefuse};
 use crate::{NurbsCurve, Vec3};
 use rustc_hash::FxHashMap as HashMap;
 
-fn subcurve_by_fraction(
+pub(crate) fn subcurve_by_fraction(
     curve: &NurbsCurve,
     start_fraction: f64,
     end_fraction: f64,

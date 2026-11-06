@@ -450,15 +450,16 @@ impl EngineState {
     /// as-is, so a second click toggles the same items back.
     pub fn hide_selected(&mut self) -> usize {
         let mut toggled = 0usize;
+        // Whole solids toggle in two batches (shown ones hide, hidden ones
+        // show), so an active PMI view records one hide step for them.
+        let (mut hide, mut show): (Vec<String>, Vec<String>) = (Vec::new(), Vec::new());
         for target in self.selection_hide_targets() {
             match target {
                 HideTarget::Solid(name) => {
-                    let visible = match self.scene.solid(&name) {
-                        Some(s) => s.visible,
+                    match self.scene.solid(&name) {
+                        Some(s) if s.visible => hide.push(name),
+                        Some(_) => show.push(name),
                         None => continue,
-                    };
-                    if self.set_visible(&name, !visible) {
-                        toggled += 1;
                     }
                 }
                 HideTarget::Entity { solid, kind, index } => {
@@ -472,6 +473,8 @@ impl EngineState {
                 }
             }
         }
+        toggled += self.set_visible_many(&hide, false);
+        toggled += self.set_visible_many(&show, true);
         toggled
     }
 }

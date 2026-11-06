@@ -372,6 +372,24 @@ fn surface_newton(
     closed_u: bool,
     closed_v: bool,
 ) -> Result<NewtonResult, String> {
+    surface_newton_impl(surface, point, seed_u, seed_v, domains, closed_u, closed_v,
+        switch!("BREP_PROJECTION_LAZY_DERIVATIVES", false))
+}
+
+/// Most seeded verification queries are already on the carrier. Row zero
+/// uses the same basis and rational arithmetic at counts zero and two; read
+/// it first, preserving the best-point and distance exit, and compute the
+/// remaining derivatives only when Newton actually needs to take a step.
+fn surface_newton_impl(
+    surface: &NurbsSurface,
+    point: Vec3,
+    seed_u: f64,
+    seed_v: f64,
+    domains: [f64; 4],
+    closed_u: bool,
+    closed_v: bool,
+    lazy: bool,
+) -> Result<NewtonResult, String> {
     let [u0, u1, v0, v1] = domains;
     let mut u = seed_u;
     let mut v = seed_v;
@@ -382,8 +400,9 @@ fn surface_newton(
         distance_squared: surface.evaluate(u, v)?.sub(point).length_squared(),
         converged,
     };
-    for _ in 0..MAX_NEWTON_ITERATIONS {
-        let derivatives = surface.derivatives_small(u, v, 2)?;
+    for iteration in 0..MAX_NEWTON_ITERATIONS {
+        crate::imprint::work_profile::add(|c| c.newton_iterations += 1);
+        let derivatives = surface.derivatives_small(u, v, if lazy { 0 } else { 2 })?;
         let residual = derivatives[0][0].sub(point);
         let distance_squared = residual.length_squared();
         if distance_squared < best.distance_squared {
@@ -391,13 +410,15 @@ fn surface_newton(
             best.v = v;
             best.distance_squared = distance_squared;
         }
-        let f = derivatives[1][0].dot(residual);
-        let g = derivatives[0][1].dot(residual);
         let residual_length = distance_squared.sqrt();
         if residual_length <= LINEAR_TOLERANCE {
+            crate::imprint::work_profile::add(|c| { c.newton_unused += 1; c.newton_unused_first += u64::from(iteration == 0); });
             converged = true;
             break;
         }
+        let derivatives = if lazy { surface.derivatives_small(u, v, 2)? } else { derivatives };
+        let f = derivatives[1][0].dot(residual);
+        let g = derivatives[0][1].dot(residual);
         let tangent_u_length = derivatives[1][0].length();
         let tangent_v_length = derivatives[0][1].length();
         let cosine_u = if tangent_u_length * residual_length <= EPSILON {
@@ -455,6 +476,7 @@ pub fn project_point_to_surface(
     surface: &NurbsSurface,
     point: Vec3,
 ) -> Result<SurfaceProjection, String> {
+    crate::imprint::work_profile::add(|c| c.projection_global += 1);
     let _lap = crate::projection_profile::Lap::enter(crate::projection_profile::LANE_PROJECT, surface);
     // Recognized analytic carriers (plane / cylinder / cone / sphere /
     // torus) have exact closed-form projections in the surface's own
@@ -487,6 +509,8 @@ pub fn project_point_to_surface_seeded(
     seed_u: f64,
     seed_v: f64,
 ) -> Result<SurfaceProjection, String> {
+    crate::imprint::work_profile::add(|c| c.projection_seeded += 1);
+    let _wall = crate::wall_profile::Scope::enter(crate::wall_profile::SEEDED);
     let _lap = crate::projection_profile::Lap::enter(crate::projection_profile::LANE_SEEDED, surface);
     // An ellipsoid's foot is unique off its medial axis: the closed form IS
     // the branch answer, as it is for the analytic carriers at the seeded
@@ -556,6 +580,8 @@ pub(crate) fn project_point_to_surface_from_seed(
     point: Vec3,
     seed: [f64; 2],
 ) -> Result<SurfaceProjection, String> {
+    crate::imprint::work_profile::add(|c| c.projection_from_seed += 1);
+    let _wall = crate::wall_profile::Scope::enter(crate::wall_profile::SEEDED);
     let _lap = crate::projection_profile::Lap::enter(crate::projection_profile::LANE_FROM_SEED, surface);
     if let Some(analytic) = surface.analytic() {
         if let Some(projection) = analytic.project(surface, point) {

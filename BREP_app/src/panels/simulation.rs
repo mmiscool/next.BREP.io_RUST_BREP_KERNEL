@@ -103,7 +103,7 @@ enum Change {
 }
 
 /// The clip kinds `+ Clip` offers (the ones playback applies).
-const CLIP_KINDS: [(&str, &str); 6] = [("suppress", "Suppress a mate"), ("visibility", "Hide parts"), ("transparency", "Fade parts"), ("camera", "Camera path"), ("section", "Section"), ("explode", "Exploded view")];
+const CLIP_KINDS: [(&str, &str); 6] = [("suppress", "Disable a mate"), ("visibility", "Hide parts"), ("transparency", "Fade parts"), ("camera", "Camera path"), ("section", "Section"), ("explode", "Exploded view")];
 
 impl SimulationPanel {
     pub fn new() -> Self {
@@ -346,7 +346,7 @@ impl SimulationPanel {
     fn clips(&mut self, ui: &mut egui::Ui, study: &Study, change: &mut Option<Change>) {
         ui.strong("Clips");
         if study.clips.is_empty() {
-            ui.weak("None: + Clip suppresses a mate, hides or fades parts, moves the camera, cuts a section or plays an exploded view over a span.");
+            ui.weak("None: + Clip disables a mate, hides or fades parts, moves the camera, cuts a section or plays an exploded view over a span.");
         }
         for clip in &study.clips {
             let key = format!("simulation:clip:{}", clip.id);
@@ -712,7 +712,7 @@ impl SimulationPanel {
 /// A clip row's label: its kind and the span's reading of what it acts on.
 fn clip_label(clip: &Clip) -> String {
     match &clip.body {
-        ClipBody::Suppress { constraint } => format!("Suppress {constraint}"),
+        ClipBody::Suppress { constraint } => format!("Disable {constraint}"),
         ClipBody::Camera { views } => format!("Camera ({})", crate::panels::count(views.len(), "view", "views")),
         ClipBody::Visibility { occurrences } => format!("Hide ({})", crate::panels::count(occurrences.len(), "part", "parts")),
         ClipBody::Transparency { occurrences, .. } => format!("Transparency ({})", crate::panels::count(occurrences.len(), "part", "parts")),
@@ -752,7 +752,7 @@ pub static HIT_KEYS: &[HitKeyDoc] = &[
     HitKeyDoc { panel: "simulation", prefix: "simulation:motor:", meaning: "a motor's row, by motor id: its label (the mate and the drive; click opens the motor's form) and remove", command: Some("simulation_update") },
     HitKeyDoc { panel: "simulation", prefix: "simulation:add_motor", meaning: "+ Motor: a motor on the first distance or angle mate, the whole study long; its form opens", command: Some("simulation_add_motor") },
     HitKeyDoc { panel: "simulation", prefix: "simulation:clip:", meaning: "a clip's row, by clip id: its label (click opens the clip's form) and remove", command: Some("simulation_update") },
-    HitKeyDoc { panel: "simulation", prefix: "simulation:add_clip", meaning: "+ Clip: the menu of clip kinds (suppress, visibility, transparency, camera, section, explode), each added over the whole study on its natural target; its form opens", command: Some("simulation_add_clip") },
+    HitKeyDoc { panel: "simulation", prefix: "simulation:add_clip", meaning: "+ Clip: the menu of clip kinds (suppress = Disable a mate, visibility, transparency, camera, section, explode), each added over the whole study on its natural target; its form opens", command: Some("simulation_add_clip") },
     HitKeyDoc { panel: "simulation", prefix: "simulation:menuitem:clip_kind:", meaning: "+ Clip's entries, by kind", command: Some("simulation_add_clip") },
     HitKeyDoc { panel: "simulation", prefix: "simulation:item:", meaning: "the open motor's or clip's form (the app's schema-driven dialog): form:feature (the title), form:return (back to the rows), field:<key> (a motor: constraint, from, to, mode, speed, shape, start, end, accel; a clip: from, to, and by kind constraint | occurrences | opacityFrom, opacityTo | view1..view4 | view, sweepEnabled, sweepFrom, sweepTo | view, collapse), field:<key>#<variant> (an open option menu's entries), field:occurrences#activate (Select, or Done while the pick runs), #line<i> and #x<i> (a picked part and its remove)", command: Some("simulation_update") },
     HitKeyDoc { panel: "simulation", prefix: "simulation:publish", meaning: "Publish (or Publish again): bake the study to the end and write its motion into the assembly's simulation block, for a manufacturing-instructions step to attach", command: Some("simulation_publish") },

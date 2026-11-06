@@ -136,7 +136,7 @@ is `BREP_kernel`, the Rust library is the idiomatic lowercase `brep_kernel`:
 
 ```toml
 [dependencies]
-brep_kernel = { package = "BREP_kernel", version = "0.12" }
+brep_kernel = { package = "BREP_kernel", version = "0.13" }
 ```
 
 ```rust

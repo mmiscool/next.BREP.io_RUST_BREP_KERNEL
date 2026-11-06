@@ -618,17 +618,17 @@ fn splice(backward: Trace, forward: Trace) -> Spliced {
     }
 }
 
-/// The public curve; tangents and the deviation ride along only when the
-/// march measured them (`measured`) and a tangent exists at every station.
+/// Preserve complete tangents for UV reuse without asking the marcher to
+/// measure or change its spans. Deviation remains absent unless measured.
 fn curve_from(all: Spliced, closed: bool, measured: bool) -> SurfaceIntersectionCurve {
-    let complete = measured && all.tangents.len() == all.points.len();
+    let complete = all.tangents.len() == all.points.len();
     SurfaceIntersectionCurve {
         points: all.points.iter().map(|point| point.point).collect(),
         params_a: all.points.iter().map(|point| [point.ua, point.va]).collect(),
         params_b: all.points.iter().map(|point| [point.ub, point.vb]).collect(),
         closed,
-        tangents: complete.then_some(all.tangents),
-        span_deviation: complete.then_some(all.deviation),
+        tangents: (complete && (measured || (crate::imprint::carried_uv_enabled() && all.points.len() >= crate::imprint::carried_uv_min_stations()))).then_some(all.tangents),
+        span_deviation: (complete && measured).then_some(all.deviation),
         tangent: false,
     }
 }
@@ -1014,7 +1014,7 @@ pub struct SurfaceIntersectionCurve {
     pub params_b: Vec<[f64; 2]>,
     pub closed: bool,
     /// The section's unit tangent at each station, along the curve's
-    /// direction; present only when the march ran with a
+    /// direction; retained for trace-UV reuse or when the march ran with a
     /// [`SurfaceIntersectionOptions::span_budget`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tangents: Option<Vec<Vec3>>,
@@ -1123,6 +1123,84 @@ impl Default for SurfaceIntersectionOptions {
     }
 }
 
+/// A station used only to construct an emitted section. Refinement preserves
+/// every supplied station; it never replaces the topology-bearing trace.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct EmissionSample {
+    pub point: Vec3,
+    pub uv_a: [f64; 2],
+    pub uv_b: [f64; 2],
+    pub tangent: Vec3,
+}
+
+/// Subdivide smooth spans locally until their joint 3D/UV Hermites pass the
+/// existing span check. Failure is a conservative request for the fit route.
+/// No seed search, branch tracing, clipping, station motion or topology edit.
+pub(crate) fn refine_emission_samples(
+    first_surface: &NurbsSurface,
+    second_surface: &NurbsSurface,
+    samples: &[EmissionSample],
+    budget: f64,
+) -> Result<Option<Vec<EmissionSample>>, String> {
+    if samples.len() < 2 || !(budget > 0.0 && budget.is_finite()) { return Ok(None); }
+    let first = surface_info(first_surface)?;
+    let second = surface_info(second_surface)?;
+    let point = |s: EmissionSample| IntersectionPoint {
+        point: s.point, ua: s.uv_a[0], va: s.uv_a[1], ub: s.uv_b[0], vb: s.uv_b[1],
+    };
+    // Fixed endpoints must themselves meet the emission floor. Refining an
+    // interior cannot repair an inaccurate endpoint without moving topology.
+    for s in samples {
+        if !(first_surface.evaluate(s.uv_a[0], s.uv_a[1])?.sub(s.point).length() <= budget)
+            || !(second_surface.evaluate(s.uv_b[0], s.uv_b[1])?.sub(s.point).length() <= budget)
+        { return Ok(None); }
+    }
+    let mut pending: Vec<_> = samples.windows(2).rev().map(|p| (p[0], p[1], 0usize)).collect();
+    let mut out = vec![samples[0]];
+    let mut inserted = 0;
+    while let Some((a, b, depth)) = pending.pop() {
+        let pa = point(a);
+        let pb = point(b);
+        if span_deviation(first, second, pa, a.tangent, pb, b.tangent)? <= budget {
+            out.push(b);
+            continue;
+        }
+        let chord_vector = b.point.sub(a.point);
+        let chord = chord_vector.length();
+        if depth >= 8 || inserted >= 4096 || chord <= 4.0 * crate::KNOT_IDENTITY_TOL
+            || crossing_at(first, second, pa) < 0.05 || crossing_at(first, second, pb) < 0.05
+            || a.tangent.dot(b.tangent) < 0.5
+            || a.tangent.dot(chord_vector) <= 0.5 * chord || b.tangent.dot(chord_vector) <= 0.5 * chord
+        { return Ok(None); }
+        let ha = ParameterHermite::new(first, a.uv_a, a.tangent, b.uv_a, b.tangent, chord)?;
+        let hb = ParameterHermite::new(second, a.uv_b, a.tangent, b.uv_b, b.tangent, chord)?;
+        let ua = ha.at(0.5);
+        let ub = hb.at(0.5);
+        let predicted = hermite_at(a.point, a.tangent.scale(chord), b.point, b.tangent.scale(chord), 0.5);
+        let direction = a.tangent.add(b.tangent).normalized()?;
+        let seed = IntersectionPoint {
+            point: predicted,
+            ua: fit(ua[0], first.u0, first.u1, first.closed_u),
+            va: fit(ua[1], first.v0, first.v1, first.closed_v),
+            ub: fit(ub[0], second.u0, second.u1, second.closed_u),
+            vb: fit(ub[1], second.v0, second.v1, second.closed_v),
+        };
+        let Some((mid, boundary)) = correct(first, second, seed, predicted, direction, budget * 0.1)? else { return Ok(None); };
+        let along = mid.point.sub(a.point).dot(chord_vector) / (chord * chord);
+        if boundary || mid.point.sub(predicted).length() > 0.25 * chord
+            || !(0.2..=0.8).contains(&along) || crossing_at(first, second, mid) < 0.05
+        { return Ok(None); }
+        let Some(mut tangent) = tangent_at(first, second, mid)? else { return Ok(None); };
+        if tangent.dot(direction) < 0.0 { tangent = tangent.scale(-1.0); }
+        if tangent.dot(a.tangent) < 0.5 || tangent.dot(b.tangent) < 0.5 { return Ok(None); }
+        let m = EmissionSample { point: mid.point, uv_a: [mid.ua, mid.va], uv_b: [mid.ub, mid.vb], tangent };
+        inserted += 1;
+        pending.push((m, b, depth + 1));
+        pending.push((a, m, depth + 1));
+    }
+    Ok(Some(out))
+}
+
 /// Refine `seed` onto the intersection of `first_surface` and `second_surface`:
 /// the closest point on each carrier seeds the same Newton the march uses
 /// ([`refine_point`]), so the answer is an INTERSECTION point at the march's own
@@ -1165,6 +1243,7 @@ pub fn intersect_surfaces(
     second_surface: &NurbsSurface,
     options: &SurfaceIntersectionOptions,
 ) -> Result<Vec<SurfaceIntersectionCurve>, String> {
+    let _wall = crate::wall_profile::Scope::enter(crate::wall_profile::MARCH);
     let _lap = crate::projection_profile::Lap::enter_pair(first_surface, second_surface);
     let first_box = Bounds::from_surface_controls(first_surface)?;
     let second_box = Bounds::from_surface_controls(second_surface)?;
@@ -1377,6 +1456,7 @@ pub fn intersect_surfaces_supplemental(
     second_surface: &NurbsSurface,
     options: &SurfaceIntersectionOptions,
 ) -> Result<Vec<SurfaceIntersectionCurve>, String> {
+    let _wall = crate::wall_profile::Scope::enter(crate::wall_profile::MARCH);
     let first_box = Bounds::from_surface_controls(first_surface)?;
     let second_box = Bounds::from_surface_controls(second_surface)?;
     if !first_box.intersects(second_box, options.tolerance * 10.0) {

@@ -234,6 +234,17 @@ pub(super) fn interior_points_in_polygons_indexed(
 ) -> Vec<Vec2> {
     let scale = area.abs().sqrt();
     let mut seen: Vec<(Vec2, f64)> = Vec::new();
+    let select = switch!("BREP_FRAGMENT_INTERIOR_SELECT", true)
+        && scale.is_finite() && scale <= 1e100
+        && outer_polygon.iter().chain(hole_polygons.iter().flatten())
+            .all(|p| p.x.is_finite() && p.y.is_finite() && p.x.abs().max(p.y.abs()) <= 1e100);
+    // Candidate, exact clearance if already read, and distance to its own
+    // generating edge. The last is an upper bound on the minimum over ALL
+    // boundary edges, using the same point/segment expression as the index.
+    let mut pending: Vec<(Vec2, Option<f64>, f64)> = Vec::new();
+    let mut finite = true;
+    let mut queries = 0usize;
+    let mut pruned = 0usize;
     let mut best = None;
     let mut best_clearance = -1.0;
     let edges = |polygon: &[Vec2]| -> Vec<(Vec2, Vec2)> {
@@ -251,6 +262,16 @@ pub(super) fn interior_points_in_polygons_indexed(
         .map(|hole| if parity { PolygonParityIndex::new(hole) } else { None }).collect();
     let inside_outer = |point: Vec2| outer_parity.as_ref().map_or_else(|| point_in_polygon(point, outer_polygon), |index| index.contains(point));
     let inside_hole = |hole: usize, point: Vec2| hole_parity[hole].as_ref().map_or_else(|| point_in_polygon(point, &hole_polygons[hole]), |index| index.contains(point));
+    let distance = |candidate: Vec2| match &index {
+        Some(index) => index.distance(candidate),
+        None => {
+            let mut clearance = f64::INFINITY;
+            for cycle in std::iter::once(&outer_edges).chain(hole_edges.iter()) {
+                for (a, b) in cycle { clearance = clearance.min(point_segment_distance(candidate, *a, *b)); }
+            }
+            clearance
+        }
+    };
     for factor in [0.25, 0.1, 0.05, 0.01, 0.002, 4e-4] {
         let epsilon = scale * factor;
         for &(a, b) in &outer_edges {
@@ -271,17 +292,20 @@ pub(super) fn interior_points_in_polygons_indexed(
             {
                 continue;
             }
-            let clearance = match &index {
-                Some(index) => index.distance(candidate),
-                None => {
-                    let mut clearance = f64::INFINITY;
-                    for cycle in std::iter::once(&outer_edges).chain(hole_edges.iter()) {
-                        for (a, b) in cycle { clearance = clearance.min(point_segment_distance(candidate, *a, *b)); }
-                    }
-                    clearance
-                }
-            };
-            seen.push((candidate, clearance));
+            let upper = if select { point_segment_distance(candidate, a, b) } else { f64::INFINITY };
+            if select && upper.is_finite() && upper <= best_clearance {
+                pending.push((candidate, None, upper));
+                pruned += 1;
+                continue;
+            }
+            let clearance = distance(candidate);
+            queries += 1;
+            if select {
+                finite &= clearance.is_finite();
+                pending.push((candidate, Some(clearance), upper));
+            } else {
+                seen.push((candidate, clearance));
+            }
             if clearance > best_clearance {
                 best = Some(candidate);
                 best_clearance = clearance;
@@ -296,6 +320,36 @@ pub(super) fn interior_points_in_polygons_indexed(
     };
     let mut picked = vec![primary];
     let separation = (scale * 0.05).max(1e-12);
+    // Repeated maxima among separated candidates yield the stable sort's
+    // same sequence. A strict improvement preserves insertion order at ties.
+    // Read a deferred clearance only if its bound can beat the current winner.
+    if select && finite {
+        while picked.len() < count {
+            let mut next = None;
+            let mut clearance = f64::NEG_INFINITY;
+            for (candidate, cached, upper) in &mut pending {
+                if (upper.is_finite() && *upper <= clearance)
+                    || !picked.iter().all(|existing| existing.sub(*candidate).length() >= separation)
+                { continue; }
+                let value = *cached.get_or_insert_with(|| { queries += 1; distance(*candidate) });
+                if value > clearance {
+                    next = Some(*candidate);
+                    clearance = value;
+                }
+            }
+            let Some(candidate) = next else { break };
+            picked.push(candidate);
+        }
+        if crate::profile::profile_enabled() {
+            crate::imprint::profile_emit(format_args!("fragment.interior_select candidates={} queries={queries} primary_pruned={pruned} wanted={count}", pending.len()));
+        }
+        return picked;
+    }
+    if select {
+        // Preserve the original partial_cmp behavior on non-finite readings.
+        seen = pending.into_iter().map(|(point, value, _)|
+            (point, value.unwrap_or_else(|| distance(point)))).collect();
+    }
     seen.sort_by(|left, right| {
         right
             .1

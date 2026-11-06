@@ -320,8 +320,8 @@ impl PinnedInfoWindow {
 
         ui.add_space(6.0);
         ui.weak(
-            "Hint: `density` (mass per mm\u{00b3}) drives a solid's weight; `color` \
-             (#RRGGBB) drives how it is shaded.",
+            "Hint: `density` (g/cm\u{00b3}) overrides the part's density for this body; \
+             `color` (#RRGGBB) drives how it is shaded.",
         );
     }
 }
@@ -464,8 +464,8 @@ fn info_tab(ui: &mut egui::Ui, state: &mut EngineState, name: &str) {
                     grid_row(ui, "Volume (mm\u{00b3})", num(getf(&info, "volume")));
                     grid_row(ui, "Surface area (mm\u{00b2})", num(getf(&info, "surfaceArea")));
                     grid_row(ui, "Edge length total (mm)", num(getf(&info, "edgeLengthTotal")));
-                    grid_row(ui, "Density (mass/mm\u{00b3})", num(getf(&info, "density")));
-                    grid_row(ui, "Weight (mass)", num(getf(&info, "weight")));
+                    grid_row(ui, "Density (g/cm\u{00b3})", density_str(&info));
+                    grid_row(ui, "Mass", mass_str(&info));
                 }
                 "face" => {
                     grid_row(ui, "Solid", getstr(&info, "solid"));
@@ -487,7 +487,34 @@ fn info_tab(ui: &mut egui::Ui, state: &mut EngineState, name: &str) {
         });
 
     ui.add_space(6.0);
-    ui.weak("Read-only. Set `density` on the Metadata tab to drive a solid's weight.");
+    ui.weak("Read-only. Mass is the volume times the PART's density: set the part's Material or Density in its Properties (a `density` on the Metadata tab overrides it for this body).");
+}
+
+/// The density row: the number and where it came from.
+fn density_str(info: &Value) -> String {
+    match info.get("density").and_then(Value::as_f64) {
+        Some(density) => {
+            let source = match info.get("densitySource").and_then(Value::as_str) {
+                Some("solid") => "this body",
+                Some("material") => "part material",
+                _ => "part",
+            };
+            format!("{} ({source})", num(density))
+        }
+        None => "\u{2014}".to_string(),
+    }
+}
+
+/// The mass row: kg/g with its unit, or why there is none.
+fn mass_str(info: &Value) -> String {
+    match info.get("mass").and_then(Value::as_f64) {
+        Some(kg) => brep_render::engine_state::part_mass::format_mass_kg(kg),
+        None => info
+            .get("massNote")
+            .and_then(Value::as_str)
+            .unwrap_or("\u{2014}")
+            .to_string(),
+    }
 }
 
 /// The carrier's dimensions the measurement carried, each row only when its

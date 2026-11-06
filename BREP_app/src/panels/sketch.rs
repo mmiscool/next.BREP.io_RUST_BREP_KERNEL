@@ -561,8 +561,8 @@ fn entity_section(
     }
     // Delete last so it can't invalidate the rows we are still iterating this frame.
     if let Some(id) = to_delete {
-        state.sketch_select_entity(kind, id, false);
-        state.sketch_delete_selection();
+        // Only the clicked row — never the rest of a multi-selection.
+        state.sketch_delete_entity(kind, id);
     }
 }
 

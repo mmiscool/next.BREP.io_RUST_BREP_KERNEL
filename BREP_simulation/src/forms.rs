@@ -192,7 +192,7 @@ pub fn clip_kind(clip: &Clip) -> &'static str {
 /// The clip form's title word.
 pub fn clip_title(clip: &Clip) -> &'static str {
     match clip.body {
-        ClipBody::Suppress { .. } => "Suppress a mate",
+        ClipBody::Suppress { .. } => "Disable a mate",
         ClipBody::Camera { .. } => "Camera path",
         ClipBody::Visibility { .. } => "Hide parts",
         ClipBody::Transparency { .. } => "Fade parts",
@@ -217,7 +217,7 @@ pub fn clip_schema(clip: &Clip, choices: &FormChoices) -> Value {
     });
     match &clip.body {
         ClipBody::Suppress { constraint } => {
-            fields.insert("constraint".into(), json!({ "type": "options", "label": "Mate", "options": options(choices.constraints.iter().cloned(), Some(constraint)), "hint": "Off (suppressed) inside the span" }));
+            fields.insert("constraint".into(), json!({ "type": "options", "label": "Mate", "options": options(choices.constraints.iter().cloned(), Some(constraint)), "hint": "Off (disabled) inside the span" }));
         }
         ClipBody::Camera { views } => {
             for slot in 0..CAMERA_VIEW_SLOTS {

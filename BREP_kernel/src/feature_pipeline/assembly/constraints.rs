@@ -1,9 +1,10 @@
-//! The fourteen assembly-constraint definitions — ONE MODULE PER CONSTRAINT, the
+//! The assembly-constraint definitions — ONE MODULE PER CONSTRAINT, the
 //! feature-module pattern: each `constraints/<type>.rs` owns everything about its
 //! type — its [`ConstraintTypeDef`] row (names, element count range, duplicate
 //! family, the `applicable` selection-context predicate), its schema entry, and (for
-//! the mate-mapped types) its `map` function. `fixed` has no `map` — grounding is
-//! handled by [`super::lifecycle`] before body building.
+//! the mate-mapped types) its `map` function. There is no Fixed constraint: a part
+//! is fixed by its own instance setting (ACOMP `isFixed`), and a legacy `fixed` row
+//! in an old document is migrated into that setting by [`super::lifecycle`].
 
 use crate::feature_pipeline::SelectionProbe;
 
@@ -13,7 +14,6 @@ pub(crate) mod center;
 pub(crate) mod coincident;
 pub(crate) mod concentric;
 pub(crate) mod distance;
-pub(crate) mod fixed;
 pub(crate) mod parallel;
 pub(crate) mod path;
 pub(crate) mod gear;
@@ -44,8 +44,8 @@ pub struct ConstraintTypeDef {
     /// Plain label for messages ("Duplicate … conflicts with Distance
     /// constraint DIST4.").
     pub label: &'static str,
-    /// The accepted `elements` count range, inclusive: fixed takes exactly 1,
-    /// the pairing types exactly 2, center 3 or 4 (two width faces plus a one-
+    /// The accepted `elements` count range, inclusive: the pairing types
+    /// exactly 2, center 3 or 4 (two width faces plus a one-
     /// or two-element tab). The lifecycle marks a count outside the range
     /// `incomplete`; the schema's `minSelections`/`maxSelections` mirror it.
     pub min_elements: usize,
@@ -64,8 +64,7 @@ pub struct ConstraintTypeDef {
 }
 
 /// Spec §4 table order — also the panel's `+` dropdown order.
-pub const CONSTRAINT_TYPES: [ConstraintTypeDef; 17] = [
-    fixed::DEF,
+pub const CONSTRAINT_TYPES: [ConstraintTypeDef; 16] = [
     coincident::DEF,
     touch_align::DEF,
     parallel::DEF,
@@ -174,7 +173,6 @@ pub fn constraint_type(type_id: &str) -> Option<&'static ConstraintTypeDef> {
 /// (the dialog engine's established convention).
 pub fn constraint_schema_catalogue() -> serde_json::Value {
     serde_json::Value::Array(vec![
-        fixed::schema(),
         coincident::schema(),
         touch_align::schema(),
         parallel::schema(),
@@ -266,7 +264,12 @@ pub fn flip_rule(constraint_type: &str, params: &serde_json::Value, geoms: &[&st
         serde_json::json!({ "minimum": -max, "maximum": -min })
     };
     match constraint_type {
-        "touch_align" | "parallel" | "concentric" | "center" => Ok((toggle("reverse"), "turn")),
+        // The explicit facing (`mapping::effective_align`): Flip picks the
+        // other one.
+        "touch_align" | "parallel" | "concentric" | "center" => {
+            let opposed = params.get("facing").and_then(serde_json::Value::as_str) == Some("opposed");
+            Ok((serde_json::json!({ "facing": if opposed { "aligned" } else { "opposed" } }), "turn"))
+        }
         "gear" | "rack_pinion" | "screw" => Ok((toggle("reverse"), "none")),
         "path" | "slot" => Ok((toggle("reverse"), "none")),
         "cam" => Ok((toggle("flip"), "turn")),
@@ -289,7 +292,6 @@ pub fn flip_rule(constraint_type: &str, params: &serde_json::Value, geoms: &[&st
         }
         "tangent" => Ok((serde_json::json!({}), "mirror")),
         "perpendicular" => Ok((serde_json::json!({}), "turn-about-reference")),
-        "fixed" => Err("a fixed component has nothing to flip".into()),
         "symmetric" => Err("a symmetric pair has one solution".into()),
         "coincident" => Err("coincident elements have one solution".into()),
         other => Err(format!("'{other}' has no flip")),

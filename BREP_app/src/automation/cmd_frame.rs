@@ -1,7 +1,7 @@
 //! Frame-level commands: liveness and the per-frame facts every wait loop
 //! polls.
 use crate::automation::command::{app_command, parse_args, schema_of, CommandSpec, Ctx, NoArgs, Outcome};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 #[derive(Serialize, schemars::JsonSchema)]
@@ -156,8 +156,123 @@ fn describe_commands(_ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String>
     Ok(Outcome::Done(crate::automation::command::describe()))
 }
 
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SettleArgs {
+    /// How many consecutive checks after the first idle one must also find
+    /// the app idle (work a command started can begin a moment after it
+    /// answered). Default 2.
+    #[serde(default = "default_settle")]
+    pub settle: u32,
+    /// Give up after this long (milliseconds). Default 60000.
+    #[serde(default = "default_settle_timeout")]
+    pub timeout_ms: u64,
+    /// Settle THIS document (a `doc:` handle), background tab or not, so
+    /// another tab's work neither delays nor hides its own. Default: the
+    /// visible document.
+    #[serde(default)]
+    pub document: Option<String>,
+}
+
+fn default_settle() -> u32 {
+    2
+}
+
+fn default_settle_timeout() -> u64 {
+    60_000
+}
+
+fn settle_result_schema() -> Value {
+    serde_json::json!({"type":"object","properties":{
+        "info":{"type":"object","description":"frame_info at the settled check"},
+        "frame":{"type":"integer","minimum":0},
+        "step":{"type":"integer","minimum":0},
+        "listing":{},"report":{},"model":{}
+    },"required":["info","frame","step","listing","report","model"],"additionalProperties":false})
+}
+
+/// The flags of `pending` that are set, comma-separated: what a timeout was
+/// still waiting for.
+fn pending_names(pending: &PendingWork) -> String {
+    let flags = [
+        ("run", pending.run),
+        ("queries", pending.queries),
+        ("mesh_imports", pending.mesh_imports),
+        ("step_probes", pending.step_probes),
+        ("topology", pending.topology),
+        ("projection", pending.projection),
+        ("store_writes", pending.store_writes),
+        ("plm_requests", pending.plm_requests),
+    ];
+    let names: Vec<&str> = flags.iter().filter(|(_, set)| *set).map(|(name, _)| *name).collect();
+    if names.is_empty() { "nothing, but the app had not been idle long enough".to_string() } else { names.join(", ") }
+}
+
+/// Answer once the app has been idle (`frame_info`'s `idle`) for `settle`
+/// further checks, with the settled history listing, report and model: the
+/// wait every mutating tool ends with, done where the work is. The queue
+/// checks it whenever the app services its work (a drawn frame, or the
+/// desktop loop's service step, which the finishing work wakes), so the
+/// host neither polls nor sleeps.
+fn settle(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
+    let a: SettleArgs = parse_args(args)?;
+    let deadline = web_time::Instant::now() + std::time::Duration::from_millis(a.timeout_ms);
+    let mut seen = 0u32;
+    let document = a.document.clone();
+    let check = move |ctx: &mut Ctx<'_>| -> Option<Result<Outcome, String>> {
+        // Route to the named document for the check, as a context routes an
+        // engine-only command (`automation::queue::ENGINE_ONLY`).
+        let route = match &document {
+            Some(handle) => match ctx.app.docs.index_of_handle(handle) {
+                Some(index) => Some(ctx.app.docs.route_begin(index)),
+                None => return Some(Err("document_unknown: no open document has that handle (closed, or never opened)".into())),
+            },
+            None => None,
+        };
+        let info = frame_info(ctx);
+        let listing = (info.idle && seen + 1 > a.settle).then(|| crate::automation::cmd_history::listing_json(ctx));
+        if let Some(visible) = route {
+            ctx.app.docs.route_end(visible);
+        }
+        if info.poisoned {
+            return Some(Err("session poisoned".into()));
+        }
+        if info.idle {
+            seen += 1;
+            if let Some(listing) = listing {
+                let body = serde_json::json!({
+                    "frame": info.frame,
+                    "step": listing["step"],
+                    "listing": listing["listing"],
+                    "report": listing["report"],
+                    "model": listing["model"],
+                    "info": info,
+                });
+                return Some(Ok(Outcome::Done(body)));
+            }
+        } else {
+            seen = 0;
+            if web_time::Instant::now() >= deadline {
+                let progress = serde_json::to_value(&info.progress).unwrap_or(Value::Null);
+                return Some(Err(format!(
+                    "timeout after {} ms; still pending: {}; run progress: {progress}",
+                    a.timeout_ms,
+                    pending_names(&info.pending)
+                )));
+            }
+        }
+        None
+    };
+    // The first check is the queue's poll right after this dispatch; each
+    // later one comes from a later service step or frame, so `settle`
+    // counts checks spread over time, never one instant counted twice.
+    let _ = ctx;
+    Ok(Outcome::Poll(Box::new(check)))
+}
+
 pub static COMMANDS: &[CommandSpec] = &[
     app_command!("frame", "describe_commands", "The app's command registry: every command with its group, doc, phase, annotations and derived argument/result schemas. A host generates its tool list from this.", NoArgs, describe_commands, Read, READ, describe_commands_result_schema),
-    app_command!("frame", "ping", "Liveness: replies from the next frame's read phase.", NoArgs, ping, Read, READ, ping_result_schema),
+    app_command!("frame", "ping", "Liveness, and one frame: replies from the next pass's read phase (a drawn frame, or on an undrawn desktop window a pass the app runs itself). The composite tools step the app with it (`wait_frames`, `wait_state`, a dwell).", NoArgs, ping, Read, READ, ping_result_schema),
+    app_command!("frame", "settle", "Wait, in the app, until it has been idle (`frame_info`'s `idle`) for `settle` further checks, then answer with the frame info and the settled history listing, report and model. The wait every mutating tool ends with; no polling.", SettleArgs, settle, Read, READ, settle_result_schema),
     app_command!("frame", "frame_info", "Frame counter, pixels-per-point, surface and viewport rects (egui points), pending runner work, run progress, history length and rollback step. `idle` is the wait condition for mutating tools.", NoArgs, frame_info_cmd, Read, READ, schema_of::<FrameInfo>),
 ];

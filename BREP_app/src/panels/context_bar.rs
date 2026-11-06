@@ -249,7 +249,9 @@ impl ContextBarPanel {
         self.shown_actions.push("clear".into());
         // Hide + Info act on selected GEOMETRY — with only a constraint
         // selected they would be no-ops, so they are not offered.
-        if has_geometry {
+        // A single component's own menu (below) carries its Hide/Show, Info
+        // and Edit feature: the standard ones would repeat them.
+        if has_geometry && component_target.is_none() {
             items.push(ActionItem::new("action:hide", "\u{1f441} Hide", "Hide/Show selection"));
             items.push(ActionItem::new(
                 "action:info",
@@ -269,7 +271,21 @@ impl ContextBarPanel {
             ));
             self.shown_actions.push("delete-constraint".into());
         }
-        if let Some(item) = edit_owning_item(&sel) {
+        // A feature selected from its tree row: Delete it (the row ✕), the
+        // same command the Delete key runs ([`crate::delete_selection`]).
+        let feature_target = match crate::delete_selection::model_target(state) {
+            Some(crate::delete_selection::DeleteTarget::Feature(id)) => Some(id),
+            _ => None,
+        };
+        if let Some(id) = &feature_target {
+            items.push(ActionItem::new(
+                "action:delete-feature",
+                "\u{2715} Delete feature",
+                format!("Delete feature {id} (Delete key; one undo step)"),
+            ));
+            self.shown_actions.push("delete-feature".into());
+        }
+        if let Some(item) = edit_owning_item(&sel).filter(|_| component_target.is_none()) {
             items.push(item);
             self.shown_actions.push("edit-owning".into());
         }
@@ -303,15 +319,17 @@ impl ContextBarPanel {
             }
         }
         // Component actions: shown INSTEAD of the feature offers when the
-        // selection is exactly one component's member solid(s).
-        if let Some((target, fixed)) = &component_target {
-            for action in ComponentAction::ALL {
-                items.push(ActionItem::new(
-                    format!("component:{}", action.id()),
-                    action.label(*fixed),
-                    action.tooltip(),
-                ));
-                self.shown_component_actions.push(action.id().to_string());
+        // selection is exactly one component's member solid(s). THE shared
+        // component menu, the viewport right-click's and the BOM row's too:
+        // same entries, availability and reasons.
+        if let Some((target, _)) = &component_target {
+            let subject = super::component_actions::MenuSubject::of(state, std::slice::from_ref(target));
+            for entry in super::component_actions::component_menu(&subject) {
+                items.push(
+                    ActionItem::new(format!("component:{}", entry.id), entry.label, entry.tooltip)
+                        .enabled(entry.enabled),
+                );
+                self.shown_component_actions.push(entry.id);
             }
             self.shown_component_target = Some(target.clone());
             self.shown_component_targets = vec![target.clone()];
@@ -333,7 +351,12 @@ impl ContextBarPanel {
         }
         // A prompt, not a block: when the targets include FIXED components,
         // offer to unfix them and move them with the rest (one undo step).
-        let unfix_targets = unfix_move_targets(state, &self.shown_component_targets);
+        // (A single component's menu has its own Unfix and Move.)
+        let unfix_targets = if component_target.is_some() {
+            Vec::new()
+        } else {
+            unfix_move_targets(state, &self.shown_component_targets)
+        };
         if !unfix_targets.is_empty() {
             items.push(ActionItem::new(
                 format!("component:{UNFIX_MOVE}"),
@@ -421,8 +444,18 @@ impl ContextBarPanel {
             }
             Some("action:delete-constraint") => {
                 if let Some(cid) = &constraint_target {
-                    let _ = state.assembly_remove_constraint(cid);
-                    state.constraint_deselect();
+                    let target = crate::delete_selection::DeleteTarget::Constraint(cid.clone());
+                    if let Err(error) = crate::delete_selection::apply_engine(state, &target) {
+                        state.push_notice(error);
+                    }
+                }
+            }
+            Some("action:delete-feature") => {
+                if let Some(id) = &feature_target {
+                    let target = crate::delete_selection::DeleteTarget::Feature(id.clone());
+                    if let Err(error) = crate::delete_selection::apply_engine(state, &target) {
+                        state.push_notice(error);
+                    }
                 }
             }
             Some("action:hide") => {
@@ -471,6 +504,13 @@ impl ContextBarPanel {
                 if let Some((target, _)) = &component_target {
                     if let Some(action) = ComponentAction::from_id(&key["component:".len()..]) {
                         outcome.component = run_component_action(state, action, target);
+                    }
+                    // The shared menu's Info and Edit feature report the way
+                    // the bar's own did.
+                    match outcome.component.take() {
+                        Some(ComponentActionRequest::Info { targets }) => outcome.info_targets = targets,
+                        Some(ComponentActionRequest::EditFeature { feature_id }) => outcome.focus = Some(feature_id),
+                        other => outcome.component = other,
                     }
                 } else if key == "component:move" && !move_targets.is_empty() {
                     state.component_move_group_toggle(&move_targets);
@@ -1021,6 +1061,18 @@ pub(crate) fn prefill_from_selection(state: &EngineState, type_code: &str, param
 /// / Fix / Delete buttons — assembly UI — out of the Modeling context bar; the
 /// feature FENCE (`suppress_features`) is intentionally NOT gated, since the
 /// kernel rejects component references in every workbench.
+/// The one component the bar's component actions (and the Delete key, via
+/// [`crate::delete_selection`]) target for the current selection: the bar's
+/// own rule, with a Pattern Component instance excluded (its actions are the
+/// pattern's). A small shared hook so the Delete key and the bar never disagree.
+pub(crate) fn component_action_target_of(state: &EngineState) -> Option<String> {
+    let sel = Selection::read(state);
+    let comp = component_selection(&sel, state);
+    component_action_target(&comp, &state.settings.workbench, &crate::workbench::ButtonState::of(state))
+        .filter(|id| brep_kernel::pattern_component_instance(id).is_none())
+        .map(str::to_string)
+}
+
 fn component_action_target<'a>(
     comp: &'a ComponentSelection,
     workbench: &str,
@@ -1285,6 +1337,7 @@ pub static HIT_KEYS: &[HitKeyDoc] = &[
     HitKeyDoc { panel: "context", prefix: "action:clear", meaning: "clear the selection", command: Some("select_clear") },
     HitKeyDoc { panel: "context", prefix: "action:hide", meaning: "hide or show the selected geometry", command: Some("set_visible") },
     HitKeyDoc { panel: "context", prefix: "action:info", meaning: "open one pinned Info window per selected entity (mass properties, topology, metadata)", command: None },
+    HitKeyDoc { panel: "context", prefix: "action:delete-feature", meaning: "delete the feature selected from its history-tree row (the Delete key's command)", command: Some("selection_delete") },
     HitKeyDoc { panel: "context", prefix: "action:delete-constraint", meaning: "delete the assembly constraint whose viewport label is selected", command: Some("assembly_remove_constraint") },
     HitKeyDoc { panel: "context", prefix: "action:suppress-instance", meaning: "suppress the selected pattern instance (a part Pattern copy makes no geometry; a Pattern Component instance places nothing)", command: None },
     HitKeyDoc { panel: "context", prefix: "action:select-seed", meaning: "select the seed component a Pattern Component instance follows", command: None },

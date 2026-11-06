@@ -45,9 +45,51 @@ pub async fn current(slot: &SessionSlot) -> Result<Arc<Session>, String> {
     slot.read().await.clone().ok_or_else(|| "no live session: run_script starts one".to_string())
 }
 
-/// Poll `frame_info` until the runner is idle plus `settle` frames, or the
-/// timeout. Returns the last frame_info.
+/// The longest one `settle` call waits: a host bounds how long a single
+/// command may take (the desktop window's reply timeout), so a longer wait is
+/// several calls.
+const SETTLE_CHUNK_MS: u64 = 60_000;
+
+/// Wait in the app (`settle`) until it is idle plus `settle` checks, or the
+/// timeout. Returns the settled reply (`info`: the last frame_info, plus the
+/// history listing, report and model), or `None` from a host that has no
+/// `settle` command.
+async fn settle_in_app(session: &Session, timeout_ms: u64, settle: u32) -> Result<Option<Value>, String> {
+    let platform = &session.host.platform;
+    let start = platform.now_ms();
+    loop {
+        let elapsed = (platform.now_ms() - start).max(0.0) as u64;
+        let left = timeout_ms.saturating_sub(elapsed);
+        let chunk = left.clamp(1, SETTLE_CHUNK_MS);
+        let reply = session.host.call("settle", json!({ "settle": settle, "timeout_ms": chunk })).await?;
+        if reply.ok {
+            return Ok(Some(reply.result.unwrap_or(Value::Null)));
+        }
+        let error = reply.error.unwrap_or_else(|| "command failed".into());
+        if error.starts_with("unknown command") {
+            return Ok(None);
+        }
+        if let Some(rest) = error.strip_prefix(&format!("timeout after {chunk} ms")) {
+            if chunk < left {
+                continue;
+            }
+            return Err(format!("timeout after {timeout_ms} ms{rest}"));
+        }
+        return Err(error);
+    }
+}
+
+/// Wait until the runner is idle plus `settle` checks, or the timeout.
+/// Returns the last frame_info.
 pub async fn wait_idle(session: &Session, timeout_ms: u64, settle: u32) -> Result<Value, String> {
+    if let Some(settled) = settle_in_app(session, timeout_ms, settle).await? {
+        return Ok(settled["info"].clone());
+    }
+    poll_idle(session, timeout_ms, settle).await
+}
+
+/// [`wait_idle`] for a host without `settle`: poll `frame_info`.
+async fn poll_idle(session: &Session, timeout_ms: u64, settle: u32) -> Result<Value, String> {
     let platform = &session.host.platform;
     let start = platform.now_ms();
     let mut idle_seen = 0u32;
@@ -96,11 +138,21 @@ fn pending_names(pending: &Value) -> String {
 
 /// The report every waiting tool appends: listing, report, step, model summary.
 pub async fn after_wait(session: &Session, timeout_ms: u64) -> Result<Value, String> {
+    // One call: the app answers when it has settled, with the listing.
+    if let Some(settled) = settle_in_app(session, timeout_ms, 2).await? {
+        return Ok(json!({
+            "frame": settled["frame"],
+            "step": settled["step"],
+            "listing": settled["listing"],
+            "report": settled["report"],
+            "model": settled["model"],
+        }));
+    }
     let start = session.host.platform.now_ms();
     loop {
         let elapsed = (session.host.platform.now_ms() - start).max(0.0) as u64;
         if elapsed >= timeout_ms { return Err("deadline_exceeded: the completed history snapshot did not settle".into()); }
-        wait_idle(session, timeout_ms - elapsed, 2).await?;
+        poll_idle(session, timeout_ms - elapsed, 2).await?;
         let snapshot = session.host.call_ok("history_listing", json!({})).await?;
         let listing = snapshot.result.unwrap_or(Value::Null);
         if listing["idle"] == false { continue; }

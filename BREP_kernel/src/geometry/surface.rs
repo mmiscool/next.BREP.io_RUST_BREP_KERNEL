@@ -290,7 +290,10 @@ impl NurbsSurface {
         ))
     }
 
+    #[cfg_attr(feature = "profile-wall", track_caller)]
     pub fn evaluate_homogeneous(&self, u: f64, v: f64) -> Result<Vec4, String> {
+        let _reader = crate::reader_profile::Point::open(crate::reader_profile::SURFACE, std::panic::Location::caller());
+    let _wall = crate::wall_profile::Scope::enter(crate::wall_profile::POINT);
         crate::projection_profile::count(crate::projection_profile::LANE_EVALUATE, self);
         self.ensure_valid()?;
         if self.degree_u > MAX_STACK_DEGREE || self.degree_v > MAX_STACK_DEGREE {
@@ -318,6 +321,7 @@ impl NurbsSurface {
         let mut basis_v = [0.0f64; MAX_STACK_ORDER];
         basis_functions_into(&self.knots_u, self.degree_u, span_u, u, &mut basis_u);
         basis_functions_into(&self.knots_v, self.degree_v, span_v, v, &mut basis_v);
+        let _reader_part = crate::reader_profile::Part::open(crate::reader_profile::ACCUMULATE);
         let mut point = Vec4 {
             x: 0.0,
             y: 0.0,
@@ -338,6 +342,7 @@ impl NurbsSurface {
     /// this is not a trigonometric replacement of the rational parameterization.
     fn analytic_point_small<const DU: usize, const DV: usize>(&self, u: f64, v: f64, span_u: usize, span_v: usize) -> Vec4 {
         fn basis<const D: usize>(knots: &[f64], span: usize, parameter: f64) -> [f64; 3] {
+        let _reader_part = crate::reader_profile::Part::open(crate::reader_profile::BASIS);
             let mut values = [0.0; 3];
             let mut left = [0.0; 3];
             let mut right = [0.0; 3];
@@ -358,6 +363,7 @@ impl NurbsSurface {
         }
         let basis_u = basis::<DU>(&self.knots_u, span_u, u);
         let basis_v = basis::<DV>(&self.knots_v, span_v, v);
+        let _reader_part = crate::reader_profile::Part::open(crate::reader_profile::ACCUMULATE);
         let mut point = Vec4 { x: 0.0, y: 0.0, z: 0.0, w: 0.0 };
         for (i, value_u) in basis_u[..=DU].iter().enumerate() {
             let row = &self.control_points[span_u - DU + i];
@@ -376,6 +382,7 @@ impl NurbsSurface {
         let span_v = knot_v.find_span(v);
         let basis_u = knot_u.basis_functions(span_u, u);
         let basis_v = knot_v.basis_functions(span_v, v);
+        let _reader_part = crate::reader_profile::Part::open(crate::reader_profile::ACCUMULATE);
         let mut point = Vec4 {
             x: 0.0,
             y: 0.0,
@@ -391,7 +398,10 @@ impl NurbsSurface {
         Ok(point)
     }
 
+    #[cfg_attr(feature = "profile-wall", track_caller)]
     pub fn evaluate(&self, u: f64, v: f64) -> Result<Vec3, String> {
+        let _reader = crate::reader_profile::Point::open(crate::reader_profile::SURFACE, std::panic::Location::caller());
+    let _wall = crate::wall_profile::Scope::enter(crate::wall_profile::POINT);
         self.evaluate_homogeneous(u, v)?.point()
     }
 
@@ -400,7 +410,10 @@ impl NurbsSurface {
     /// plane, with the bilinear corner form when both parameters are
     /// outside.  Intersection and projection algorithms probe outside the
     /// domain, so this is a required capability of every surface.
+    #[cfg_attr(feature = "profile-wall", track_caller)]
     pub fn evaluate_extended(&self, u: f64, v: f64) -> Result<Vec3, String> {
+        let _reader = crate::reader_profile::Point::open(crate::reader_profile::SURFACE, std::panic::Location::caller());
+    let _wall = crate::wall_profile::Scope::enter(crate::wall_profile::POINT);
         if small_derivatives_enabled() {
             return Ok(self.derivatives_extended_small(u, v, 0)?[0][0]);
         }
@@ -576,6 +589,7 @@ impl NurbsSurface {
                 dv,
                 &mut basis_v[..=dv],
             );
+            let _reader_part = crate::reader_profile::Part::open(crate::reader_profile::ACCUMULATE);
             for k in 0..=du {
                 for l in 0..=dv {
                     if k + l > derivative_count {
@@ -602,6 +616,7 @@ impl NurbsSurface {
             let span_v = knot_v.find_span(v);
             let basis_u = knot_u.basis_derivatives(span_u, u, du);
             let basis_v = knot_v.basis_derivatives(span_v, v, dv);
+            let _reader_part = crate::reader_profile::Part::open(crate::reader_profile::ACCUMULATE);
             for k in 0..=du {
                 for l in 0..=dv {
                     if k + l > derivative_count {
@@ -671,6 +686,23 @@ impl NurbsSurface {
         v: f64,
         derivative_count: usize,
     ) -> Result<[[Vec3; 3]; 3], String> {
+        // Row zero of the derivative basis has the value recurrence's exact
+        // arithmetic. Keep its row-major sum and reciprocal multiplication,
+        // but avoid the derivative scratch grids for a point-only request.
+        // The experimental analytic evaluator is a separate policy: retain
+        // the original derivative path whenever that policy is enabled.
+        if derivative_count == 0 && switch!("BREP_SURFACE_POINT_ONLY", false)
+            && u.is_finite() && v.is_finite()
+            && self.degree_u <= MAX_STACK_DEGREE && self.degree_v <= MAX_STACK_DEGREE
+            && !analytic_point_on() {
+            let point = self.evaluate_homogeneous(u, v)?;
+            if point.w.abs() <= EPS {
+                return Err("NurbsSurface: zero evaluated weight".into());
+            }
+            let mut result = [[Vec3::default(); 3]; 3];
+            result[0][0] = Vec3::new(point.x, point.y, point.z).scale(1.0 / point.w);
+            return Ok(result);
+        }
         debug_assert!(derivative_count <= 2);
         self.ensure_valid()?;
         let du = derivative_count.min(self.degree_u);
@@ -709,6 +741,7 @@ impl NurbsSurface {
                 dv,
                 &mut basis_v[..=dv],
             );
+            let _reader_part = crate::reader_profile::Part::open(crate::reader_profile::ACCUMULATE);
             for k in 0..=du {
                 for l in 0..=dv {
                     if k + l > derivative_count {
@@ -735,6 +768,7 @@ impl NurbsSurface {
             let span_v = knot_v.find_span(v);
             let basis_u = knot_u.basis_derivatives(span_u, u, du);
             let basis_v = knot_v.basis_derivatives(span_v, v, dv);
+            let _reader_part = crate::reader_profile::Part::open(crate::reader_profile::ACCUMULATE);
             for k in 0..=du {
                 for l in 0..=dv {
                     if k + l > derivative_count {
@@ -1759,5 +1793,6 @@ fn analytic_point_on() -> bool {
 pub(crate) fn small_derivatives_enabled() -> bool {
     switch!("BREP_SURFACE_SMALL_DERIVATIVES", true)
 }
+
 
 

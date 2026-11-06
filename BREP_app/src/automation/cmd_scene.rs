@@ -255,6 +255,24 @@ fn select_clear(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
     Ok(Outcome::Done(json!({ "changed": changed })))
 }
 
+/// THE delete-selection command (`crate::delete_selection`): what the Delete
+/// key and the context bar's Delete entries run.
+fn selection_delete(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
+    let _: NoArgs = parse_args(args)?;
+    match crate::delete_selection::delete_selection(&mut ctx.app.docs)? {
+        Some(target) => Ok(Outcome::Done(json!({ "deleted": true, "kind": target.kind(), "id": target.id() }))),
+        None => Ok(Outcome::Done(json!({ "deleted": false, "kind": null, "id": null }))),
+    }
+}
+
+fn selection_delete_result_schema() -> Value {
+    json!({"type":"object","properties":{
+        "deleted":{"type":"boolean"},
+        "kind":{"type":["string","null"],"enum":["sketch","sketch3d","ecad","sheetObject","pmiAnnotation","constraint","component","feature",null]},
+        "id":{"type":["string","null"]}
+    },"required":["deleted","kind","id"],"additionalProperties":false})
+}
+
 fn selection(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
     read_engine(ctx, args, |e| json!({ "selection": e.selection_value() }))
 }
@@ -448,7 +466,7 @@ fn candidate_is(candidate: &Value, kind: &str, name: &str, owner: &str) -> bool 
 fn locate(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
     let a: LocateArgs = parse_args(args)?;
     let view = ctx.app.viewport.last_rect().ok_or("the 3D viewport was not drawn last frame")?;
-    let engine = ctx.app.docs.engine();
+    let engine = ctx.app.viewport_engine();
     let (world, owner) = anchor_point(&engine.scene, &a.kind, &a.name)?;
     let projected = engine.world_to_screen_json(&json!([world]).to_string())?;
     let pts: Vec<[f64; 4]> = serde_json::from_str(&projected).map_err(|e| format!("projection parse: {e}"))?;
@@ -537,6 +555,7 @@ pub static COMMANDS: &[CommandSpec] = &[
     app_command!("scene", "select", "Replace the selection with one named entity: kind solid | face | edge | datum.", SelectArgs, select, Mutate, MUTATE_NOWAIT, selection_result_schema),
     app_command!("scene", "selection_set", "Replace the WHOLE selection with these named entities — the write twin of `selection`, and the way to put a multi-entity selection back (`select` takes one name). Vertices have no names and are not restored.", SelectionSetArgs, selection_set, Mutate, MUTATE_NOWAIT, selection_result_schema),
     app_command!("scene", "select_clear", "Clear the selection.", NoArgs, select_clear, Mutate, MUTATE_NOWAIT, selection_clear_result_schema),
+    app_command!("scene", "selection_delete", "Delete what is selected, exactly as the Delete key does: the open sketch's or 3D sketch's selection, the eCAD editor's, the open sheet's held object, the selected PMI annotation, else the label-selected assembly constraint, the one selected component, or the feature selected from its history-tree row. Each goes through that object's own row Delete (one undo step). `deleted: false` when nothing is deletable.", NoArgs, selection_delete, Mutate, DESTRUCTIVE, selection_delete_result_schema),
     app_command!("scene", "selection", "The current selection `{solids, faces, edges, datums, vertices}`.", NoArgs, selection, Read, READ, selection_result_schema),
     app_command!("scene", "set_visible", "Show or hide a scene entity by name.", VisibleArgs, set_visible, Mutate, MUTATE_NOWAIT),
     app_command!("scene", "locate", "Where an entity is on the surface, in egui points: a face's triangle centroid, an edge's ARC-LENGTH midpoint, a vertex (by topoId), a solid's bbox centre — projected through the camera. A committed SKETCH is reached as `kind: \"solid\"` under its feature id; one with no mesh (an open chain, a points-only hole placement, a Helix) anchors on the midpoint of its longest edge, or on its first point. `under` is the ranked candidate list a DWELL there would open, filtered the way the viewport filters it; `rank` is this entity's place in that list. What a REGULAR click takes is `takes` — the nearest admitted candidate by depth, which is also what the hover highlight lights — and `reaches` says whether that is this entity; `occluded_by` is what the click would take instead. (A reference field's picker is unchanged and still takes the list's top candidate, so `takes` is that while one is open.) The list resolves a part to its OWNING SOLID where the filter admits only solids, so a face of a cylinder ranks 0 when the cylinder does. The bridge from a reference name to a pointer click, which `click_entity` and `drag_entity` spend.", LocateArgs, locate, Read, READ, locate_result_schema),

@@ -94,6 +94,34 @@ async fn fence(session: &Session, id: &str, expected: &str) -> Result<Value, Api
 async fn settle(run: &Run<'_>, id: &str) -> Result<(), ApiError> {
     let platform = &run.session.host.platform;
     let start = platform.now_ms();
+    // The app waits itself (`settle`, routed to this document), woken by the
+    // work as it finishes; a host without it is polled below. One call waits
+    // at most a minute (a host bounds a single command), so a long
+    // evaluation is several.
+    loop {
+        let left = WAIT_MS.saturating_sub((platform.now_ms() - start).max(0.0) as u64);
+        let chunk = left.clamp(1, 60_000);
+        let r = run.session.host.call("settle", json!({ "settle": 2, "timeout_ms": chunk, "document": id }))
+            .await
+            .map_err(|e| ApiError::new("host_stopped", "evaluation", wire::sanitize(&e)).effects(Effects::unknown()))?;
+        if r.ok {
+            return Ok(());
+        }
+        let error = r.error.unwrap_or_default();
+        if error.starts_with("unknown command") {
+            break;
+        }
+        if error.starts_with("session poisoned") {
+            return Err(ApiError::new("internal_error", "evaluation", "the app session is poisoned").effects(Effects::unknown()));
+        }
+        if error.starts_with("timeout after") {
+            if chunk < left {
+                continue;
+            }
+            return Err(ApiError::new("evaluation_failed", "evaluation", "the document's evaluation did not settle within 15 minutes").effects(Effects::unknown()));
+        }
+        return Err(ApiError::from_app(&error, "evaluation"));
+    }
     let mut quiet = 0;
     loop {
         let info = call(&run.session, "frame_info", json!({ "context": context_json(id, "0") }), "evaluation").await?;

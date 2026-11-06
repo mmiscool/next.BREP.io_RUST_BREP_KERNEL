@@ -22,7 +22,7 @@ use eframe::egui;
 use serde_json::Value;
 use std::collections::HashMap;
 
-/// The grounded-component glyph (matches the kernel's Fixed-constraint glyph).
+/// The grounded-component glyph: a component's Fixed setting, everywhere it is shown.
 pub(crate) const FIXED_GLYPH: &str = "\u{23DA}"; // ⏚ earth ground
 
 /// The outdated-vs-source badge glyph (`↻` — "refresh me").

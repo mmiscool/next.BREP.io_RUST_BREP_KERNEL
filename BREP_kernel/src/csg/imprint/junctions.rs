@@ -1104,6 +1104,7 @@ fn consolidate_fuzzy_piece_ends(
     let mut parent: HashMap<u64, u64> = position.keys().map(|id| (*id, *id)).collect();
     relocate_junctions(result, &mut parent, &stale, face_map, charts, emitted_pcurves, 0.0, true)?;
     let mut retracted = 0usize;
+    let chains = SplitChains::new(edge_curves)?;
     for (id, point) in &stale {
         let radius = radius_of(*id);
         for record in &mut result.edge_splits {
@@ -1117,15 +1118,26 @@ fn consolidate_fuzzy_piece_ends(
                     within.push((distance, parameter));
                 }
             }
-            if within.len() < 2 {
+            // An end of this edge where its other half continues it is a
+            // split already made (`SplitChains`): within the radius it is one
+            // of the duplicates, and it is the one that cannot be retracted.
+            let joint = chains
+                .joint_ends
+                .get(&(record.operand, record.edge_id))
+                .into_iter()
+                .flatten()
+                .map(|end| end.sub(*point).length())
+                .filter(|distance| *distance <= radius)
+                .min_by(|a, b| a.total_cmp(b));
+            if within.len() + usize::from(joint.is_some()) < 2 {
                 continue;
             }
             within.sort_by(|a, b| a.0.total_cmp(&b.0));
-            let keep = within[0].1;
+            let keep = if joint.is_some() { None } else { Some(within[0].1) };
             let before = record.parameters.len();
             record
                 .parameters
-                .retain(|&parameter| parameter == keep || !within.iter().any(|(_, other)| *other == parameter));
+                .retain(|&parameter| Some(parameter) == keep || !within.iter().any(|(_, other)| *other == parameter));
             retracted += before - record.parameters.len();
         }
     }
@@ -1133,6 +1145,86 @@ fn consolidate_fuzzy_piece_ends(
         eprintln!("[consolidate] retracted {retracted} duplicate edge split(s) within the vertex radius");
     }
     Ok(true)
+}
+
+/// Whether two curves are one curve bit for bit (degree, knots, controls).
+pub(super) fn same_curve_bits(a: &NurbsCurve, b: &NurbsCurve) -> bool {
+    a.degree == b.degree
+        && a.knots.len() == b.knots.len()
+        && a.control_points.len() == b.control_points.len()
+        && a.knots.iter().zip(&b.knots).all(|(x, y)| x.to_bits() == y.to_bits())
+        && a.control_points.iter().zip(&b.control_points).all(|(x, y)| {
+            x.x.to_bits() == y.x.to_bits() && x.y.to_bits() == y.y.to_bits() && x.z.to_bits() == y.z.to_bits() && x.w.to_bits() == y.w.to_bits()
+        })
+}
+
+/// The operand edges that are HALVES OF ONE EDGE: a vertex put on an edge
+/// (`apply_edge_splits`) leaves two edges carrying the parent's curve bit for
+/// bit over adjoining windows. Such a vertex is no corner of the operand; it
+/// is a split the imprint would otherwise record itself, and the junction
+/// rules below must read it as one (a boolean on its own split operands reads
+/// as on its operands, `boolean_split_operands`). Fixture 31's union on its
+/// split operands: the crossing of model edge 16 and pad edge 3 was already a
+/// vertex of both, so it "split" no edge, ranked below the tangent landing
+/// 9.06e-5 away that split one half, and the merged junction left the
+/// crossing (TangentNodeSingularity where the operands' own union builds).
+struct SplitChains {
+    /// Every edge's chain: the smallest edge id of the chain it belongs to.
+    chain_of: HashMap<(u8, u64), (u8, u64)>,
+    /// `(chain, point)` of every vertex interior to a chain.
+    joints: Vec<((u8, u64), Vec3)>,
+    /// The joints at each edge's own ends.
+    joint_ends: HashMap<(u8, u64), Vec<Vec3>>,
+}
+
+impl SplitChains {
+    fn new(edge_curves: &HashMap<(u8, u64), &EdgeRecord>) -> Result<Self, KernelRefusal> {
+        let mut keys: Vec<(u8, u64)> = edge_curves.keys().copied().filter(|key| !edge_curves[key].degenerate).collect();
+        // By operand, then by window start, so halves of one curve meet in order.
+        keys.sort_by(|a, b| a.0.cmp(&b.0).then(edge_curves[a].t0.total_cmp(&edge_curves[b].t0)).then(a.1.cmp(&b.1)));
+        let mut chains = SplitChains { chain_of: HashMap::default(), joints: Vec::new(), joint_ends: HashMap::default() };
+        // The chains still open, by (operand, bits of the window end reached):
+        // (chain, last edge of the chain so far).
+        let mut open: HashMap<(u8, u64), Vec<((u8, u64), (u8, u64))>> = HashMap::default();
+        for key in keys {
+            let edge = edge_curves[&key];
+            let continued = open.get_mut(&(key.0, edge.t0.to_bits())).and_then(|waiting| {
+                let index = waiting.iter().position(|(_, last)| same_curve_bits(&edge_curves[last].curve, &edge.curve))?;
+                Some(waiting.swap_remove(index))
+            });
+            let chain = match continued {
+                Some((chain, last)) => {
+                    let point = edge.curve.evaluate(edge.t0).or_refuse(KernelStage::Intersect, "evaluate")?;
+                    chains.joints.push((chain, point));
+                    chains.joint_ends.entry(last).or_default().push(point);
+                    chains.joint_ends.entry(key).or_default().push(point);
+                    chain
+                }
+                None => key,
+            };
+            chains.chain_of.insert(key, chain);
+            open.entry((key.0, edge.t1.to_bits())).or_default().push((chain, key));
+        }
+        // A chain is named by its smallest edge id, whichever half came first.
+        let mut smallest: HashMap<(u8, u64), (u8, u64)> = HashMap::default();
+        for (key, chain) in &chains.chain_of {
+            let entry = smallest.entry(*chain).or_insert(*key);
+            if key.1 < entry.1 {
+                *entry = *key;
+            }
+        }
+        for chain in chains.chain_of.values_mut() {
+            *chain = smallest[chain];
+        }
+        for (chain, _) in &mut chains.joints {
+            *chain = smallest[chain];
+        }
+        Ok(chains)
+    }
+
+    fn chain(&self, key: (u8, u64)) -> (u8, u64) {
+        self.chain_of.get(&key).copied().unwrap_or(key)
+    }
 }
 
 /// The operand edges a junction splits: every `(operand, edge)` with a split
@@ -1174,14 +1266,21 @@ fn place_merged_groups_on_operand_edges(
 ) -> Result<usize, KernelRefusal> {
     let weld = assembler_weld(tolerance);
     let radius_of = |id: u64| evidence.radii.get(&id).copied().unwrap_or(0.0).max(weld);
-    let mut split_points: Vec<((u8, u64), Vec3)> = Vec::new();
+    // Splits are read per CHAIN (`SplitChains`): the halves of an edge that
+    // already carries a vertex are one edge, and that vertex is a split of
+    // it. `own_splits` keeps each recorded split under the edge that holds
+    // its parameter, for the retraction.
+    let chains = SplitChains::new(edge_curves)?;
+    let mut split_points: Vec<((u8, u64), Vec3)> = chains.joints.clone();
+    let mut own_splits: Vec<((u8, u64), Vec3)> = Vec::new();
     for record in &result.edge_splits {
         let Some(edge) = edge_curves.get(&(record.operand, record.edge_id)) else {
             continue;
         };
         for &parameter in &record.parameters {
             let point = edge.curve.evaluate(parameter).or_refuse(KernelStage::Intersect, "evaluate")?;
-            split_points.push(((record.operand, record.edge_id), point));
+            split_points.push((chains.chain((record.operand, record.edge_id)), point));
+            own_splits.push(((record.operand, record.edge_id), point));
         }
     }
     let mut groups: HashMap<u64, Vec<(u64, Vec3)>> = HashMap::default();
@@ -1266,8 +1365,8 @@ fn place_merged_groups_on_operand_edges(
             if id == holder_id || point.sub(position).length() <= radius {
                 continue;
             }
-            for key in split_edges_of(&split_points, point, radius) {
-                if holder_edges.contains(&key) {
+            for key in split_edges_of(&own_splits, point, radius) {
+                if holder_edges.contains(&chains.chain(key)) {
                     retract.push((key, point, radius));
                 }
             }

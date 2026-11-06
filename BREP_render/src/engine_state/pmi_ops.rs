@@ -312,16 +312,19 @@ impl EngineState {
 
     /// The names of the solids currently hidden in the scene.
     fn hidden_solid_names(&self) -> Vec<String> {
+        // A committed sketch's visibility is its own (`hidden_sketches`),
+        // never a view's: a sketch name is no solid a hide step resolves.
         self.scene
             .solids()
             .iter()
-            .filter(|solid| !solid.visible)
+            .filter(|solid| !solid.visible && !solid.is_sketch)
             .map(|solid| solid.name.clone())
             .collect()
     }
 
-    /// Capture a view: the current camera, hidden objects and wireframe
-    /// setting, named `name` (or `View N`). The new view becomes active.
+    /// Capture a view: the current camera, hidden objects (its baseline hide
+    /// step) and wireframe setting, named `name` (or `View N`). The new view
+    /// becomes active.
     pub fn pmi_capture_view(&mut self, name: Option<&str>) -> String {
         let mut state = self.pmi_state();
         let id = state.next_id("VIEW");
@@ -342,14 +345,10 @@ impl EngineState {
             id: id.clone(),
             name,
             camera: Some(self.snapshot_camera()),
-            display: PmiDisplay {
-                text_size_pt: 12.0,
-                wireframe: self.settings.wireframe,
-                hidden: self.hidden_solid_names(),
-                section: None,
-            },
+            display: PmiDisplay::new(12.0, self.settings.wireframe, None),
             annotations: Vec::new(),
         });
+        state.set_view_baseline(&id, &self.hidden_solid_names());
         self.write_pmi_state(state);
         let _ = self.pmi_activate_view(&id);
         id
@@ -591,11 +590,12 @@ impl EngineState {
         if let Some(wireframe) = patch.wireframe {
             view.display.wireframe = wireframe;
         }
-        if let Some(hidden) = &patch.hidden {
-            view.display.hidden = hidden.clone();
-        }
         if let Some(section) = &patch.section { view.display.section = section.clone(); }
-        let view = view.clone();
+        if let Some(hidden) = &patch.hidden {
+            let solids = self.view_hideable_names();
+            state.set_view_hidden(id, hidden, &solids);
+        }
+        let view = state.find_view(id).expect("patched above").clone();
         let block = if state.is_empty() { None } else { serde_json::to_value(&state).ok() };
         self.history.set_pmi_block(block, coalesce_key);
         self.rerun_history();
@@ -603,6 +603,43 @@ impl EngineState {
             self.apply_view_display(&view);
         }
         Ok(())
+    }
+
+    /// The scene's solid names a view's hide step can name (committed
+    /// sketches excluded: their visibility is `hidden_sketches`).
+    fn view_hideable_names(&self) -> Vec<String> {
+        self.scene.solids().iter().filter(|solid| !solid.is_sketch).map(|solid| solid.name.clone()).collect()
+    }
+
+    /// **A viewport hide or show while a view is active is an edit of that
+    /// view** (one undo step): hiding adds a hide step naming what was not
+    /// hidden yet, showing drops the names from its hide steps (a hidden
+    /// component keeps its other solids hidden). The view then re-applies,
+    /// so leaving and re-entering it shows the same thing, and its sheets,
+    /// 3D PDF and report agree. Names that are no scene solid are ignored.
+    /// False when nothing changed.
+    pub(crate) fn pmi_record_visibility(&mut self, view_id: &str, names: &[String], visible: bool) -> bool {
+        let solids = self.view_hideable_names();
+        let names: Vec<String> = names.iter().filter(|name| solids.contains(name)).cloned().collect();
+        if names.is_empty() {
+            return false;
+        }
+        let mut state = self.pmi_state();
+        let changed = if visible {
+            state.show_in_view(view_id, &names, &solids)
+        } else {
+            state.hide_in_view(view_id, &names).is_some()
+        };
+        if !changed {
+            return false;
+        }
+        let Some(view) = state.find_view(view_id).cloned() else { return false };
+        self.write_pmi_state(state);
+        if self.pmi_active_view.as_deref() == Some(view_id) {
+            self.apply_view_display(&view);
+            self.refresh_pmi_overlay();
+        }
+        true
     }
 
     /// Remember the modeling state: what is on screen while NO view is

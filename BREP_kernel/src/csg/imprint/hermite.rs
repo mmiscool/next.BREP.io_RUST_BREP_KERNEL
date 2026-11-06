@@ -10,11 +10,47 @@
 //! stations have no tangents, or whose chords degenerate is left to the quintic
 //! fit and the pcurve march.
 //!
-//! Behind `ImprintOptions::hermite_sections` / `BREP_HERMITE_SECTIONS`; off by
-//! default, so the default lane is byte for byte the fit's.
+//! The legacy `ImprintOptions::hermite_sections` / `BREP_HERMITE_SECTIONS`
+//! experiment remains off by default. The carried-UV switches independently
+//! select production emission, retaining fitting for ineligible sections.
 
 use super::*;
 use crate::SurfaceIntersectionCurve;
+
+/// Trace-carried UV sections at the pcurve accuracy floor. This is independent
+/// of the older, looser-budget Hermite experiment. Disable both UV switches
+/// to retain fitting; reuse never changes the march budget.
+pub(crate) fn carried_uv_enabled() -> bool {
+    switch!("BREP_MARCH_UV_SECTIONS", true) || emission_refine_enabled()
+}
+
+/// Refine only the emission samples after clipping, never the original march.
+fn emission_refine_enabled() -> bool {
+    switch!("BREP_MARCH_UV_REFINE", true)
+}
+
+/// Decide eligibility before retaining metadata or entering the large emitter.
+pub(crate) fn carried_uv_min_stations() -> usize {
+    if emission_refine_enabled() { 32 } else { 2 }
+}
+
+/// Refinement is qualified only where at most one chart direction closes.
+/// On doubly closed carriers the emitted representation can leave a downstream
+/// folding-wall interval unreadable. Preserve fitting there until that chart
+/// family is qualified; check original carriers before march-window cropping.
+pub(super) fn refinement_carriers_eligible(first: &NurbsSurface, second: &NurbsSurface) -> bool {
+    !emission_refine_enabled() || [first, second].iter().all(|surface| {
+        matches!(surface.closed_directions(), Ok((u, v)) if !(u && v))
+    })
+}
+
+pub(super) fn carried_uv_emission_budget(requested: Option<f64>, fit_budget: f64) -> Option<f64> {
+    if carried_uv_enabled() {
+        Some(requested.unwrap_or(fit_budget).min(crate::pcurve::PCURVE_REFINEMENT_TOLERANCE * 0.1))
+    } else {
+        requested
+    }
+}
 
 /// One run station with everything the Hermite needs.
 #[derive(Clone, Copy, Debug)]
@@ -47,6 +83,7 @@ pub(super) enum HermiteDecline {
     DegenerateChord,
     Unprojectable,
     OverBudget,
+    NotAmortized,
 }
 
 fn key(point: Vec3) -> [u64; 3] {
@@ -159,6 +196,13 @@ pub(super) fn hermite_section(
     if run.len() < 2 || tangents.len() != branch.points.len() {
         return Ok(Err(if run.len() < 2 { HermiteDecline::TooShort } else { HermiteDecline::NoTangents }));
     }
+    // Local correction and repeated carrier checks have a setup cost. Short
+    // runs already fit cheaply; leave them on that route before allocating a
+    // station map or projecting inserted endpoints. This is a work threshold,
+    // not an accuracy tolerance, and never alters the topology-bearing trace.
+    if run.len() < carried_uv_min_stations() {
+        return Ok(Err(HermiteDecline::NotAmortized));
+    }
     let by_point: HashMap<[u64; 3], usize> = branch.points.iter().enumerate().map(|(i, p)| (key(*p), i)).collect();
     let (closed_a, closed_b) = (first.closed_directions()?, second.closed_directions()?);
     let (ua, va, ub, vb) = (first.domain_u()?, first.domain_v()?, second.domain_u()?, second.domain_v()?);
@@ -211,17 +255,49 @@ pub(super) fn hermite_section(
             _ => deduped.push(station),
         }
     }
-    let stations = deduped;
+    let stations = if emission_refine_enabled() {
+        use crate::surface_surface_intersection::{EmissionSample, refine_emission_samples};
+        let samples: Vec<_> = deduped.iter().map(|s| EmissionSample {
+            point: s.point, uv_a: s.uv_a, uv_b: s.uv_b, tangent: s.tangent,
+        }).collect();
+        let Some(refined) = refine_emission_samples(first, second, &samples, budget).ok().flatten() else {
+            return Ok(Err(HermiteDecline::OverBudget));
+        };
+        if profile_enabled() {
+            profile_line!("imprint.emission_refine input={} output={}", samples.len(), refined.len());
+        }
+        // Dense input traces already fit cheaply. Reparameterizing them can
+        // also perturb subsequent blends without buying the expensive pcurve
+        // bypass. Require at least one added station per input span on average
+        // before replacing the fit route. Keep the original accuracy floor.
+        if refined.len() < samples.len().saturating_mul(2).saturating_sub(1) {
+            return Ok(Err(HermiteDecline::NotAmortized));
+        }
+        refined.into_iter().map(|s| Station {
+            point: s.point, uv_a: s.uv_a, uv_b: s.uv_b, tangent: s.tangent, marched: false,
+        }).collect()
+    } else {
+        deduped
+    };
     if stations.len() < 2 {
         return Ok(Err(HermiteDecline::TooShort));
     }
     // Chords, and the parameter sequences unwrapped along the run.
     let mut chords = Vec::with_capacity(stations.len() - 1);
+    let mut knot = 0.0;
     for pair in stations.windows(2) {
         let chord = pair[1].point.sub(pair[0].point).length();
         if !(chord.is_finite() && chord > 1e-12) {
             return Ok(Err(HermiteDecline::DegenerateChord));
         }
+        let next = knot + chord;
+        // The curve readers snap knots within this existing identity band.
+        // Do not emit distinct spans they would subsequently read as one.
+        // Keep the original fit route, without changing any march station.
+        if carried_uv_enabled() && next - knot <= crate::KNOT_IDENTITY_TOL {
+            return Ok(Err(HermiteDecline::DegenerateChord));
+        }
+        knot = next;
         chords.push(chord);
     }
     let mut uv_a: Vec<[f64; 2]> = Vec::with_capacity(stations.len());
@@ -250,11 +326,13 @@ pub(super) fn hermite_section(
         velocity_a.push(da);
         velocity_b.push(db);
     }
-    // Every span with an inserted end was never tested by the march: the
+    // The carried-UV lane checks every emitted span, including spans between
+    // old stations that clipping may have made nonadjacent. In the older lane,
+    // every span with an inserted end was never tested by the march: the
     // span test, as the march runs it, on the Hermites about to be emitted.
-    let mut deviation = branch.span_deviation.unwrap_or(0.0);
+    let mut deviation = if emission_refine_enabled() { 0.0 } else { branch.span_deviation.unwrap_or(0.0) };
     for i in 0..stations.len() - 1 {
-        if stations[i].marched && stations[i + 1].marched {
+        if !carried_uv_enabled() && stations[i].marched && stations[i + 1].marched {
             continue;
         }
         let h = chords[i];
@@ -325,3 +403,4 @@ pub(super) fn piece_pcurve_on_chart(pcurve: &NurbsCurve, chart: &NurbsSurface, s
     }
     NurbsCurve::new(pcurve.degree, pcurve.knots.clone(), controls)
 }
+

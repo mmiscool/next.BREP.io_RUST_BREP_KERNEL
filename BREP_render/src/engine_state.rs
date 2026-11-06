@@ -457,6 +457,11 @@ pub struct EngineState {
     /// Off-thread mesh reconstructions awaiting a runner reply.
     pub(crate) pending_mesh_imports: std::collections::HashMap<u64, MeshImportDestination>,
     pub(crate) mesh_preview_results: std::collections::VecDeque<crate::runner::MeshImportReply>,
+    /// Phases of preview imports (interactive import), oldest first.
+    pub(crate) mesh_preview_phases: std::collections::VecDeque<crate::runner::MeshImportPhaseReply>,
+    /// Completed region refits, oldest first.
+    pub(crate) region_fit_results: std::collections::VecDeque<crate::runner::RegionFitReply>,
+    pub(crate) apply_choices_results: std::collections::VecDeque<crate::runner::ApplyRegionChoicesReply>,
     /// Monotonic id for pairing mesh import replies with submissions.
     pub(crate) next_mesh_import_id: u64,
     /// Topology requests in flight (see [`crate::runner::TopologyRequest`]).
@@ -856,6 +861,9 @@ impl Default for EngineState {
             next_query_id: 0,
             pending_mesh_imports: std::collections::HashMap::new(),
             mesh_preview_results: std::collections::VecDeque::new(),
+            mesh_preview_phases: std::collections::VecDeque::new(),
+            region_fit_results: std::collections::VecDeque::new(),
+            apply_choices_results: std::collections::VecDeque::new(),
             next_mesh_import_id: 0,
             pending_topology: std::collections::HashSet::new(),
             topology_asked: std::collections::HashSet::new(),
@@ -950,6 +958,10 @@ pub mod replace_component;
 /// main-side parts library + live component projection, serialized as CSV /
 /// JSON for the file dialog's Export modal.
 mod bom;
+/// Mass properties of a part: computed from its geometry and the density the
+/// PART carries (never per occurrence), and the load-time migration of old
+/// occurrence-stored Mass/Material onto the part.
+pub mod part_mass;
 /// Camera & view commands (zoom-to-fit, resize, pointer/wheel ingestion,
 /// projection, standard views, camera state/matrices, world→screen) plus the
 /// widget-overlay feeds (datums/overlay/dimensions/transform JSON), the

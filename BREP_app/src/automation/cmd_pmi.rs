@@ -45,7 +45,7 @@ pub struct ViewDisplayArgs {
     /// Show the view's model as wireframe.
     #[serde(default)]
     pub wireframe: Option<bool>,
-    /// The solid names hidden in this view at capture (its baseline; the view's `hide` steps add to it).
+    /// Make the view hide exactly these solids: what it hides beyond them is dropped from its `hide` steps, and what it does not hide yet joins its baseline hide step (`inputParams.baseline: true`).
     #[serde(default)]
     pub hidden: Option<Vec<String>>,
 }
@@ -266,12 +266,12 @@ pub static COMMANDS: &[CommandSpec] = &[
     app_command!("pmi", "pmi_delete_view", "Delete a PMI view and every annotation in it.", ViewIdArgs, pmi_delete_view, Mutate, DESTRUCTIVE),
     app_command!("pmi", "pmi_rename_view", "Rename a PMI view.", RenameViewArgs, pmi_rename_view, Mutate, MUTATE),
     app_command!("pmi", "pmi_update_view_camera", "Re-capture the live camera into a view (the panel's Update Camera).", ViewIdArgs, pmi_update_view_camera, Mutate, MUTATE),
-    app_command!("pmi", "pmi_set_view_display", "Patch a view's name, annotation text size, wireframe flag or captured hidden-solid baseline (`hidden`; what a view hides is this list plus its `hide` steps — add those with `pmi_add_annotation` type `hide`); absent fields are unchanged.", ViewDisplayArgs, pmi_set_view_display, Mutate, MUTATE),
+    app_command!("pmi", "pmi_set_view_display", "Patch a view's name, annotation text size, wireframe flag or hidden solids (`hidden`: the exact set the view hides, written as edits of its `hide` steps — what a view hides is only ever its hide steps, the solids hidden at capture being its baseline step; while a view is active, `set_visible` and the wireframe setting edit it the same way); absent fields are unchanged.", ViewDisplayArgs, pmi_set_view_display, Mutate, MUTATE),
     app_command!("pmi", "pmi_set_view_section", "Set a view's section as its form's section rows do, as one undo step: on or off, the normal (View, X, Y, Z or Plane), the offset in mm, which side is kept, the face or plane a Plane section cuts on, the solids or components it leaves whole, and further planes (`planes`: a half or corner cut away; material is removed only where every plane removes it). Absent fields keep the section's current value.", ViewSectionArgs, pmi_set_view_section, Mutate, MUTATE),
     app_command!("pmi", "pmi_add_annotation", "Add an annotation to a view (the active one when `view_id` is absent) with the params its catalogue schema defines; every other key is seeded from the schema default. Returns the annotation id.", AddAnnotationArgs, pmi_add_annotation, Mutate, MUTATE, schema_of::<PmiAdded>),
     app_command!("pmi", "pmi_update_annotation", "Replace an annotation's params and re-bake the overlay.", UpdateAnnotationArgs, pmi_update_annotation, Mutate, MUTATE),
     app_command!("pmi", "pmi_remove_annotation", "Delete one annotation.", AnnotationIdArgs, pmi_remove_annotation, Mutate, DESTRUCTIVE),
-    app_command!("pmi", "pmi_set_annotation_enabled", "Suppress or re-enable one annotation.", AnnotationEnabledArgs, pmi_set_annotation_enabled, Mutate, MUTATE),
+    app_command!("pmi", "pmi_set_annotation_enabled", "Disable or re-enable one annotation.", AnnotationEnabledArgs, pmi_set_annotation_enabled, Mutate, MUTATE),
     app_command!("pmi", "pmi_move_annotation", "Reorder an annotation within its view.", AnnotationMoveArgs, pmi_move_annotation, Mutate, MUTATE),
     app_command!("pmi", "pmi_move_annotation_to_view", "Move an annotation into another view.", AnnotationToViewArgs, pmi_move_annotation_to_view, Mutate, MUTATE),
 ];

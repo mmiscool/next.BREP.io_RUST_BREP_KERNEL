@@ -340,6 +340,10 @@ impl EngineState {
         let context = self.sheet_frame_context();
         self.request_sheet_topology(&sheet);
         self.pump_sheet_lines();
+        // A BOM table showing a part's mass or volume needs its measurement;
+        // while one is in flight the drawing is re-projected on the next call
+        // so the number replaces the blank once it lands.
+        let mass_pending = self.measure_sheet_bom_parts(&sheet);
         let key = self.sheet_cache_key(id, &context);
         if self.sheet_cache.as_ref().is_none_or(|cache| cache.key != key || cache.reproject) {
             let pmi = self.pmi_state();
@@ -371,7 +375,7 @@ impl EngineState {
             // the answer; an incomplete one may have drawn that placement
             // before it landed, so the next call re-projects over it.
             let landed = self.sheet_cache_key(id, &context);
-            let reproject = !complete && landed != key;
+            let reproject = (!complete && landed != key) || mass_pending;
             let key = landed;
             self.sheet_cache = Some(SheetCache { key, drawing, drawing_json, complete, reproject });
         }
@@ -826,6 +830,7 @@ impl EngineState {
             "part.Part_Number".to_owned(),
             "part.Description".to_owned(),
             "part.Material".to_owned(),
+            "part.Mass".to_owned(),
         ]);
         for component in &self.assembly_components {
             for (scope, attrs) in [
@@ -840,6 +845,23 @@ impl EngineState {
         columns.into_iter().collect()
     }
 
+    /// Ask for the measurements a sheet's BOM table needs (when it shows
+    /// `part.Mass` or `part.Volume`); `true` while any is still in flight.
+    fn measure_sheet_bom_parts(&mut self, sheet: &Sheet) -> bool {
+        let Some(table) = &sheet.bom_table else {
+            return false;
+        };
+        if !table.columns.iter().any(|c| c == "part.Mass" || c == "part.Volume") {
+            return false;
+        }
+        let parts: Vec<String> =
+            self.assembly_components.iter().map(|c| c.part_name.clone()).collect();
+        self.measure_parts(parts.iter().map(String::as_str));
+        parts.iter().any(|part| {
+            self.part_mass_cached(part).status == super::part_mass::MassStatus::Pending
+        })
+    }
+
     fn draw_sheet_bom(&self, sheet: &Sheet, drawing: &mut SheetDrawing) {
         let Some(table) = &sheet.bom_table else {
             return;
@@ -849,9 +871,11 @@ impl EngineState {
         let occurrences = self.occurrence_attributes_all();
         let mut parts = std::collections::HashMap::new();
         for component in &self.assembly_components {
+            // The part's record WITH its derived mass properties — the BOM
+            // panel's, export's and MCP's one source.
             let part = parts
                 .entry(component.part_name.clone())
-                .or_insert_with(|| self.part_attributes(&component.part_name));
+                .or_insert_with(|| self.part_bom_record_cached(&component.part_name).0);
             let occurrence = occurrences.get(&component.id).unwrap_or(&Value::Null);
             let cells: Vec<String> = table
                 .columns
@@ -872,6 +896,11 @@ impl EngineState {
                     } else {
                         &part[key]
                     };
+                    if scope == "part" {
+                        if let Some(text) = super::part_mass::format_derived(key, value) {
+                            return text;
+                        }
+                    }
                     match value {
                         Value::Null => String::new(),
                         Value::String(s) => s.clone(),

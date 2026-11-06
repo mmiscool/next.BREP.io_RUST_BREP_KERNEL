@@ -605,6 +605,9 @@ pub(crate) enum TrimRefitRollback {
     /// its budget): nothing certifies the transaction did not worsen it, and
     /// an unchanged "unmeasured" is not evidence.
     VectorAreaUnmeasured,
+    /// A trim refit on a whole edge could not be cut back onto the halves
+    /// the operand carries it as ([`UnsplitView`]).
+    HalvesUnreadable,
 }
 
 /// What happened to one coedge the detection read as off its contract (or
@@ -792,7 +795,324 @@ pub(crate) fn refit_inherited_trims(
     if std::env::var_os("BREP_DEBUG_TRIM_REFIT_OFF").is_some() {
         return Ok(TrimRefitReport::default());
     }
-    refit_inherited_trims_with(solid, policy, |before, after| trim_refit_gate(before, after, policy))
+    // An operand that carries an edge as halves (a vertex put on it by an
+    // earlier imprint) is read as the operand with that edge whole: see
+    // [`UnsplitView`]. `BREP_TRIM_REFIT_UNSPLIT=0` reads the solid as it
+    // stands (the behaviour before the 2026-11-05 promotion).
+    let view = if unsplit_view_enabled() { UnsplitView::of(solid) } else { None };
+    let Some(view) = view else {
+        return refit_inherited_trims_with(solid, policy, |before, after| trim_refit_gate(before, after, policy));
+    };
+    let mut whole = view.whole.clone();
+    let mut admitted: Option<BrepSolid> = None;
+    let report = {
+        let halves: &BrepSolid = solid;
+        refit_inherited_trims_with(&mut whole, policy, |before, after| {
+            // The transaction is judged on the operand as it is carried: the
+            // new whole trims cut back onto the halves.
+            let Some(candidate) = view.cut_back(halves, before, after) else {
+                return Some(TrimRefitRollback::HalvesUnreadable);
+            };
+            let verdict = trim_refit_gate(halves, &candidate, policy);
+            if verdict.is_none() {
+                admitted = Some(candidate);
+            }
+            verdict
+        })?
+    };
+    if let Some(candidate) = admitted {
+        *solid = candidate;
+    }
+    Ok(report)
+}
+
+/// `BREP_TRIM_REFIT_UNSPLIT`: read split halves through [`UnsplitView`].
+/// Default on since 2026-11-05, promoted together with
+/// `BREP_TRIM_REFIT_GATE_ERROR_BAR` (owner decision, tier P): either alone
+/// leaves a boolean reading differently on its own split operands (fixture
+/// 21 without this one, fixture 26's union without the other). `=0` restores
+/// the earlier reading.
+fn unsplit_view_enabled() -> bool {
+    switch!("BREP_TRIM_REFIT_UNSPLIT", true)
+}
+
+/// `BREP_TRIM_REFIT_GATE_ERROR_BAR`: the whole-transaction gate reads a
+/// worsening against the closure scans' own error bars (see
+/// [`trim_refit_gate_with_budget`]). Default on since 2026-11-05, promoted
+/// together with `BREP_TRIM_REFIT_UNSPLIT`; `=0` restores the gate that rolls
+/// back on any increase.
+fn gate_error_bar_enabled() -> bool {
+    switch!("BREP_TRIM_REFIT_GATE_ERROR_BAR", true)
+}
+
+/// The operand with every edge it carries as HALVES read whole again.
+///
+/// `apply_edge_splits` puts a vertex on an edge by leaving two edges that
+/// carry the parent's curve bit for bit over adjoining windows, and cuts each
+/// use's trim at the same fraction by knot insertion. Such a vertex is no
+/// feature of the operand, and the refit must not decide on it: a boolean
+/// reads its own split operands as it reads its operands
+/// (`boolean_split_operands`). Read half by half it did decide on it. The
+/// fixed-endpoint guard in [`refit_one`] (`OldEndWrong`) asks a trim's ends to
+/// be on the edge already, and an end made INSIDE an imported trim that
+/// tracks its edge poorly is not: fixture 21's planar trims miss by up to
+/// 3.3e-4 inside, so 39 halves declined, the other 18 trims were a different
+/// transaction from the 29 the unsplit operand proposes, and where the 29
+/// roll back (the shell's closure residual would grow 1.85e-3 -> 7.44e-3) the
+/// 18 were admitted. Split and unsplit booleans then differed by 0.02-0.12 of
+/// volume, beyond the drift bar, on three operations.
+///
+/// The view holds the solid with each such chain as ONE edge and each run of
+/// its uses as ONE coedge whose trim is the halves' trims joined at their
+/// shared knots (the inverse of the cut, with a full-multiplicity knot left
+/// at each joint). The refit reads the view; an admitted whole trim is cut
+/// back onto the halves by the fractions `apply_edge_splits` uses, so the
+/// halves get the trims they would have had if the refit had come first.
+/// Nothing is built for a solid with no such chain, or when any run cannot
+/// be joined exactly: the solid is then read as it stands.
+///
+/// DEFAULT OFF. The view makes the split operand PROPOSE what the unsplit
+/// operand proposes (fixture 21: the same 29 trims bit for bit, the same
+/// rollback, all four operations Same). It cannot make the gate's verdict
+/// the same where that verdict is rounding: fixture 26's unsplit operand
+/// rolls back a two-trim transaction on a closure residual that moves
+/// 8.7502e-11 -> 8.7546e-11, and the same two trims on the halves read
+/// 8.9750e-11 -> 3.6706e-11 and are admitted (union Moves, where the
+/// half-by-half read declined them `OldEndWrong` and agreed by accident).
+/// Both switches together are the complete repair; the gate half changes
+/// which transactions an ordinary operand admits, which is why neither is on.
+struct UnsplitView {
+    whole: BrepSolid,
+    /// Per (shell, face, loop): for each coedge of the view's loop, the
+    /// solid's coedges it stands for as (index, start fraction, end fraction)
+    /// of the view's trim, in loop order. One row for an untouched coedge.
+    runs: HashMap<(usize, usize, usize), Vec<Vec<(usize, f64, f64)>>>,
+}
+
+impl UnsplitView {
+    fn of(solid: &BrepSolid) -> Option<Self> {
+        // Cheap first: a half's window starts where another edge's ends.
+        let mut starts: HashMap<u64, Vec<usize>> = HashMap::default();
+        for (index, edge) in solid.edges.iter().enumerate() {
+            if !edge.degenerate {
+                starts.entry(edge.t0.to_bits()).or_default().push(index);
+            }
+        }
+        let same_curve = |a: &crate::NurbsCurve, b: &crate::NurbsCurve| {
+            a.degree == b.degree
+                && a.knots.len() == b.knots.len()
+                && a.control_points.len() == b.control_points.len()
+                && a.knots.iter().zip(&b.knots).all(|(x, y)| x.to_bits() == y.to_bits())
+                && a.control_points.iter().zip(&b.control_points).all(|(x, y)| {
+                    x.x.to_bits() == y.x.to_bits() && x.y.to_bits() == y.y.to_bits() && x.z.to_bits() == y.z.to_bits() && x.w.to_bits() == y.w.to_bits()
+                })
+        };
+        // next[a] = b: edge b continues edge a's curve from a's end vertex.
+        let mut next: HashMap<u64, u64> = HashMap::default();
+        let mut continued: rustc_hash::FxHashSet<u64> = rustc_hash::FxHashSet::default();
+        for edge in solid.edges.iter().filter(|edge| !edge.degenerate && edge.t1 > edge.t0) {
+            let Some(candidates) = starts.get(&edge.t1.to_bits()) else { continue };
+            let mut found = candidates
+                .iter()
+                .map(|&index| &solid.edges[index])
+                .filter(|other| other.id != edge.id && other.start_vertex_id == edge.end_vertex_id && same_curve(&other.curve, &edge.curve));
+            if let (Some(other), None) = (found.next(), found.next()) {
+                if continued.insert(other.id) {
+                    next.insert(edge.id, other.id);
+                }
+            }
+        }
+        if next.is_empty() {
+            return None;
+        }
+        // A link stands only if EVERY use of both halves runs through it: the
+        // two coedges consecutive in their loop, in the edge's sense.
+        let linked = |first: &crate::topology::CoedgeRecord, second: &crate::topology::CoedgeRecord, next: &HashMap<u64, u64>| -> Option<(u64, u64)> {
+            if first.forward != second.forward {
+                return None;
+            }
+            let (from, to) = if first.forward { (first.edge_id, second.edge_id) } else { (second.edge_id, first.edge_id) };
+            (next.get(&from) == Some(&to)).then_some((from, to))
+        };
+        let mut uses: HashMap<u64, usize> = HashMap::default();
+        let mut runs_through: HashMap<(u64, u64), usize> = HashMap::default();
+        let mut broken: rustc_hash::FxHashSet<(u64, u64)> = rustc_hash::FxHashSet::default();
+        for lp in solid.shells.iter().flat_map(|shell| &shell.faces).flat_map(|face| &face.loops) {
+            let count = lp.coedges.len();
+            let mut links_here = Vec::new();
+            for (index, coedge) in lp.coedges.iter().enumerate() {
+                *uses.entry(coedge.edge_id).or_default() += 1;
+                if count >= 2 {
+                    if let Some(link) = linked(coedge, &lp.coedges[(index + 1) % count], &next) {
+                        *runs_through.entry(link).or_default() += 1;
+                        links_here.push(link);
+                    }
+                }
+            }
+            // A loop that is one unbroken ring of halves has no end to hold.
+            if count >= 2 && links_here.len() == count {
+                broken.extend(links_here);
+            }
+        }
+        next.retain(|from, to| {
+            let through = runs_through.get(&(*from, *to)).copied().unwrap_or(0);
+            !broken.contains(&(*from, *to)) && through > 0 && uses.get(from) == Some(&through) && uses.get(to) == Some(&through)
+        });
+        if next.is_empty() {
+            return None;
+        }
+        let edges: HashMap<u64, &crate::topology::EdgeRecord> = solid.edges.iter().map(|edge| (edge.id, edge)).collect();
+        let heads: Vec<u64> = {
+            let tails: rustc_hash::FxHashSet<u64> = next.values().copied().collect();
+            next.keys().copied().filter(|id| !tails.contains(id)).collect()
+        };
+        // chain head -> (window end, end vertex); every later half -> its head.
+        let mut merged: HashMap<u64, (f64, u64)> = HashMap::default();
+        let mut head_of: HashMap<u64, u64> = HashMap::default();
+        for head in heads {
+            let mut last = head;
+            while let Some(&following) = next.get(&last) {
+                head_of.insert(following, head);
+                last = following;
+            }
+            let last = edges.get(&last)?;
+            merged.insert(head, (last.t1, last.end_vertex_id));
+        }
+        let mut whole = solid.clone();
+        whole.edges.retain(|edge| !head_of.contains_key(&edge.id));
+        for edge in &mut whole.edges {
+            if let Some(&(t1, end_vertex_id)) = merged.get(&edge.id) {
+                edge.t1 = t1;
+                edge.end_vertex_id = end_vertex_id;
+            }
+        }
+        let window = |head: u64| -> Option<(f64, f64)> { Some((edges.get(&head)?.t0, merged.get(&head)?.0)) };
+        let mut runs = HashMap::default();
+        for (shell_index, shell) in solid.shells.iter().enumerate() {
+            for (face_index, face) in shell.faces.iter().enumerate() {
+                for (loop_index, lp) in face.loops.iter().enumerate() {
+                    let count = lp.coedges.len();
+                    if !lp.coedges.iter().any(|coedge| head_of.contains_key(&coedge.edge_id) || merged.contains_key(&coedge.edge_id)) {
+                        continue;
+                    }
+                    // Start where no run is under way.
+                    let start = (0..count).find(|&index| linked(&lp.coedges[(index + count - 1) % count], &lp.coedges[index], &next).is_none())?;
+                    let mut rebuilt: Vec<crate::topology::CoedgeRecord> = Vec::new();
+                    let mut rows: Vec<Vec<(usize, f64, f64)>> = Vec::new();
+                    let mut offset = 0;
+                    while offset < count {
+                        let first = (start + offset) % count;
+                        let mut members = vec![first];
+                        while members.len() + offset < count {
+                            let last = *members.last()?;
+                            let following = (last + 1) % count;
+                            if linked(&lp.coedges[last], &lp.coedges[following], &next).is_none() {
+                                break;
+                            }
+                            members.push(following);
+                        }
+                        offset += members.len();
+                        let coedge = &lp.coedges[first];
+                        if members.len() == 1 {
+                            rebuilt.push(coedge.clone());
+                            rows.push(vec![(first, 0.0, 1.0)]);
+                            continue;
+                        }
+                        let head = if coedge.forward { coedge.edge_id } else { *head_of.get(&coedge.edge_id)? };
+                        let (t0, t1) = window(head)?;
+                        let span = t1 - t0;
+                        let mut row = Vec::new();
+                        for &member in &members {
+                            let piece = edges.get(&lp.coedges[member].edge_id)?;
+                            // The fractions `apply_edge_splits` cut at.
+                            row.push(if coedge.forward {
+                                (member, (piece.t0 - t0) / span, (piece.t1 - t0) / span)
+                            } else {
+                                (member, (t1 - piece.t1) / span, (t1 - piece.t0) / span)
+                            });
+                        }
+                        let trims: Vec<&crate::NurbsCurve> = members.iter().map(|&member| &lp.coedges[member].pcurve).collect();
+                        rebuilt.push(crate::topology::CoedgeRecord {
+                            id: coedge.id,
+                            edge_id: head,
+                            forward: coedge.forward,
+                            pcurve: join_cut_trims(&trims)?,
+                        });
+                        rows.push(row);
+                    }
+                    whole.shells[shell_index].faces[face_index].loops[loop_index].coedges = rebuilt;
+                    runs.insert((shell_index, face_index, loop_index), rows);
+                }
+            }
+        }
+        Some(UnsplitView { whole, runs })
+    }
+
+    /// `halves` with every trim that differs between `before` and `after`
+    /// (two states of the view) written back: as it is for an untouched
+    /// coedge, cut at the halves' fractions for a run. `None` if a cut fails.
+    fn cut_back(&self, halves: &BrepSolid, before: &BrepSolid, after: &BrepSolid) -> Option<BrepSolid> {
+        let mut result = halves.clone();
+        for (shell_index, shell) in after.shells.iter().enumerate() {
+            for (face_index, face) in shell.faces.iter().enumerate() {
+                for (loop_index, lp) in face.loops.iter().enumerate() {
+                    let rows = self.runs.get(&(shell_index, face_index, loop_index));
+                    let old_loop = &before.shells.get(shell_index)?.faces.get(face_index)?.loops.get(loop_index)?;
+                    let target = &mut result.shells.get_mut(shell_index)?.faces.get_mut(face_index)?.loops.get_mut(loop_index)?.coedges;
+                    for (index, coedge) in lp.coedges.iter().enumerate() {
+                        if pcurve_bits(&coedge.pcurve) == pcurve_bits(&old_loop.coedges.get(index)?.pcurve) {
+                            continue;
+                        }
+                        match rows.map(|rows| rows.get(index)) {
+                            None => target.get_mut(index)?.pcurve = coedge.pcurve.clone(),
+                            Some(row) => {
+                                let row = row?;
+                                if let [(member, _, _)] = row.as_slice() {
+                                    target.get_mut(*member)?.pcurve = coedge.pcurve.clone();
+                                    continue;
+                                }
+                                for &(member, start, end) in row {
+                                    target.get_mut(member)?.pcurve = crate::edge_split::subcurve_by_fraction(&coedge.pcurve, start, end).ok()?;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Some(result)
+    }
+}
+
+/// The trims `apply_edge_splits` cut from one trim, joined again: each piece
+/// starts at the knot the last ends on, so the join is the pieces' controls
+/// in order with the shared end control once, and a knot of full multiplicity
+/// left at each joint. `None` unless every joint is exact (equal degree, the
+/// same end knot bit for bit on clamped ends, the same end control).
+fn join_cut_trims(pieces: &[&crate::NurbsCurve]) -> Option<crate::NurbsCurve> {
+    let (first, rest) = pieces.split_first()?;
+    let degree = first.degree;
+    let mut knots = first.knots.clone();
+    let mut controls = first.control_points.clone();
+    for piece in rest {
+        let count = knots.len();
+        if piece.degree != degree || count < 2 * (degree + 1) || piece.knots.len() < 2 * (degree + 1) {
+            return None;
+        }
+        let joint = knots[count - 1].to_bits();
+        if !knots[count - 1 - degree..].iter().all(|knot| knot.to_bits() == joint) || !piece.knots[..=degree].iter().all(|knot| knot.to_bits() == joint) {
+            return None;
+        }
+        let (end, start) = (*controls.last()?, *piece.control_points.first()?);
+        let scale = 1.0f64.max(end.x.abs()).max(end.y.abs()).max(end.w.abs());
+        if [(end.x, start.x), (end.y, start.y), (end.z, start.z), (end.w, start.w)].iter().any(|(a, b)| !((a - b).abs() <= 1e-12 * scale)) {
+            return None;
+        }
+        knots.pop();
+        knots.extend_from_slice(&piece.knots[degree + 1..]);
+        controls.extend_from_slice(&piece.control_points[1..]);
+    }
+    crate::NurbsCurve::new(degree, knots, controls).ok()
 }
 
 /// [`refit_inherited_trims`] with the whole-transaction gate supplied, so a
@@ -1628,9 +1948,44 @@ fn trim_refit_gate_with_budget(
     let summary = |report: crate::VectorAreaReport| -> (Vec<(u64, crate::ClosureReading)>, Vec<String>) {
         (report.shells.iter().map(|shell| (shell.shell, shell.reading())).collect(), report.unreadable)
     };
-    let (shells_before, unreadable_before) = summary(crate::soundness::shell_vector_areas_with_budget(before, span_budget));
-    let (shells_after, unreadable_after) = summary(crate::soundness::shell_vector_areas_with_budget(after, span_budget));
-    let verdict = vector_areas_not_worse((&shells_before, &unreadable_before), (&shells_after, &unreadable_after));
+    let (report_before, report_after) =
+        (crate::soundness::shell_vector_areas_with_budget(before, span_budget), crate::soundness::shell_vector_areas_with_budget(after, span_budget));
+    let errors = |report: &crate::VectorAreaReport| -> HashMap<u64, f64> { report.shells.iter().map(|shell| (shell.shell, shell.quadrature_error)).collect() };
+    let (errors_before, errors_after) = (errors(&report_before), errors(&report_after));
+    let (shells_before, unreadable_before) = summary(report_before);
+    let (shells_after, unreadable_after) = summary(report_after);
+    let mut verdict = vector_areas_not_worse((&shells_before, &unreadable_before), (&shells_after, &unreadable_after));
+    // `BREP_TRIM_REFIT_GATE_ERROR_BAR` (default on): a residual that reads
+    // larger by no more than the two scans' own quadrature error bars
+    // (`ShellVectorArea::quadrature_error`: "a residual is a measurement only
+    // while it is far above this") is not a MEASURED worsening. Every other
+    // rule stands: the same verdict function reads the rows again with those
+    // shells' residuals held at their old value. Without this the verdict on
+    // a shell that closes to rounding either way is the sign of rounding
+    // (fixture 26: 8.7502e-11 -> 8.7546e-11 rolls back, bar 7.4e-4), and no
+    // two representations of one operand need agree on it.
+    if verdict == Some(TrimRefitRollback::VectorAreaWorsened) && gate_error_bar_enabled() {
+        use crate::ClosureReading::{Measured, Open};
+        let within: Vec<(u64, crate::ClosureReading)> = shells_after
+            .iter()
+            .map(|(shell, reading)| {
+                let slack = errors_before.get(shell).copied().unwrap_or(0.0) + errors_after.get(shell).copied().unwrap_or(0.0);
+                let old = shells_before.iter().find(|(candidate, _)| candidate == shell).map(|(_, old)| *old);
+                let held = match (old, *reading) {
+                    (Some(Measured { residual: old, .. }), Measured { residual, bar, spans, at_depth_limit }) if residual > old && residual <= old + slack => {
+                        Measured { residual: old, bar, spans, at_depth_limit }
+                    }
+                    (Some(Open { residual: old, .. }), Open { residual, faces }) if residual > old && residual <= old + slack => Open { residual: old, faces },
+                    _ => *reading,
+                };
+                (*shell, held)
+            })
+            .collect();
+        verdict = vector_areas_not_worse((&shells_before, &unreadable_before), (&within, &unreadable_after));
+        if trim_refit_tracing().is_some() {
+            eprintln!("TRIM-REFIT-GATE error bars before {errors_before:?} after {errors_after:?}: read again -> {verdict:?}");
+        }
+    }
     if trim_refit_tracing().is_some() {
         // Debug only: the raw scans the vector-area verdict was read from, so
         // a rollback names its row. Decides nothing.

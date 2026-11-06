@@ -28,7 +28,26 @@ struct BomRow {
     source_key: String,
     quantity: usize,
     #[serde(flatten, skip_serializing_if = "Option::is_none")]
+    mass: Option<MassFields>,
+    #[serde(flatten, skip_serializing_if = "Option::is_none")]
     wire: Option<WireFields>,
+}
+
+/// A part row's material and mass properties, all read off the PART
+/// (`part_mass`): `null` where there is no number (no density, no geometry,
+/// a measurement still pending). Mass in kg, volume in mm³, density g/cm³;
+/// `totalMassKg` is `quantity × massKg`.
+#[derive(serde::Serialize)]
+struct MassFields {
+    material: Option<String>,
+    #[serde(rename = "densityGcm3")]
+    density_g_cm3: Option<f64>,
+    #[serde(rename = "volumeMm3")]
+    volume_mm3: Option<f64>,
+    #[serde(rename = "massKg")]
+    mass_kg: Option<f64>,
+    #[serde(rename = "totalMassKg")]
+    total_mass_kg: Option<f64>,
 }
 
 /// A wire row's own fields. `mfQty` is `null` — never absent, never stale —
@@ -44,7 +63,8 @@ struct WireFields {
 
 /// The CSV header: the part columns, then the wire columns (blank on a part
 /// row). One header for every document, so a reader never guesses the shape.
-const BOM_CSV_HEADER: &str = "partName,sourceKey,quantity,connectionId,mfQty,status\n";
+const BOM_CSV_HEADER: &str =
+    "partName,sourceKey,quantity,material,densityGcm3,volumeMm3,massKg,totalMassKg,connectionId,mfQty,status\n";
 
 /// Quote a CSV field only when it needs it (comma / quote / CR / LF),
 /// doubling embedded quotes — minimal RFC-4180 so a part name or store path
@@ -91,19 +111,36 @@ impl EngineState {
                                 .to_string(),
                             part_name,
                             quantity,
+                            mass: None,
                             wire: None,
                         }
                     })
                     // The kernel GCs zero-instance entries at the end of every
                     // run; the filter keeps the export honest mid-mutation
                     // regardless.
-                    .filter(|row| row.quantity > 0),
+                    .filter(|row| row.quantity > 0)
+                    .collect::<Vec<_>>(),
             );
+            for row in &mut rows {
+                let attributes = self.part_attributes(&row.part_name);
+                let report = self.part_mass(&row.part_name);
+                row.mass = Some(MassFields {
+                    material: attributes
+                        .get("Material")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                    density_g_cm3: report.density_g_cm3,
+                    volume_mm3: report.volume_mm3,
+                    mass_kg: report.mass_kg,
+                    total_mass_kg: report.mass_kg.map(|mass| mass * row.quantity as f64),
+                });
+            }
         }
         rows.extend(wires.into_iter().map(|line| BomRow {
             part_name: line.stock_part_number,
             source_key: String::new(),
             quantity: 1,
+            mass: None,
             wire: Some(WireFields {
                 connection_id: line.connection_id,
                 mf_qty: line.mf_qty,
@@ -127,11 +164,29 @@ impl EngineState {
                 ),
                 None => (String::new(), String::new(), String::new()),
             };
+            let number = |value: Option<f64>, places: usize| {
+                value.map(|v| format!("{v:.places$}")).unwrap_or_default()
+            };
+            let (material, density, volume, mass, total) = match &row.mass {
+                Some(fields) => (
+                    csv_field(fields.material.as_deref().unwrap_or_default()),
+                    fields.density_g_cm3.map(|d| d.to_string()).unwrap_or_default(),
+                    number(fields.volume_mm3, 3),
+                    number(fields.mass_kg, 6),
+                    number(fields.total_mass_kg, 6),
+                ),
+                None => Default::default(),
+            };
             out.push_str(&format!(
-                "{},{},{},{},{},{}\n",
+                "{},{},{},{},{},{},{},{},{},{},{}\n",
                 csv_field(&row.part_name),
                 csv_field(&row.source_key),
                 row.quantity,
+                material,
+                density,
+                volume,
+                mass,
+                total,
                 connection,
                 mf_qty,
                 status
@@ -282,6 +337,7 @@ impl EngineState {
         if key.is_empty() {
             return Err("part attribute: empty key".to_string());
         }
+        self.check_part_attribute_write(key, &value, self.part_has_geometry(part_name))?;
         let mut block = self.history.parts_library().clone();
         let entry = block
             .get_mut(part_name)
@@ -344,6 +400,7 @@ impl EngineState {
         if key.is_empty() {
             return Err("part attribute: empty key".to_string());
         }
+        self.check_part_attribute_write(key, &value, self.document_has_geometry())?;
         // Rebuild the record through the SHARED writer by handing it an owner
         // shaped like the document, so create / clear / drop-empty behave
         // identically on both doors rather than being written twice.
@@ -417,6 +474,11 @@ impl EngineState {
     ) -> Result<(), String> {
         if key.is_empty() {
             return Err("occurrence attribute: empty key".to_string());
+        }
+        if super::part_mass::PART_ONLY_KEYS.contains(&key) {
+            return Err(format!(
+                "{key} is an attribute of the PART, not of one occurrence: set it on the part (its Properties, or the BOM's part.{key} column)"
+            ));
         }
         let mut edits: Vec<(String, Value)> = Vec::with_capacity(component_ids.len());
         for id in component_ids {

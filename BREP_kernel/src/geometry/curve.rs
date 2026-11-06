@@ -324,6 +324,17 @@ pub(crate) fn basis_derivatives_into(
 ) {
     debug_assert!(degree <= MAX_STACK_DEGREE);
     debug_assert!(out.len() > derivative_count);
+    // The degree is already fixed below, but A2.3's inner k loop still
+    // receives a runtime derivative count. Fix the common counts too,
+    // without changing the recurrence or the higher-order fallback.
+    if switch!("BREP_BASIS_DERIVATIVE_COUNT_FIXED", true) {
+        match derivative_count {
+            0 => return basis_derivatives_count_fixed::<0>(knots, degree, span, parameter, out),
+            1 => return basis_derivatives_count_fixed::<1>(knots, degree, span, parameter, out),
+            2 => return basis_derivatives_count_fixed::<2>(knots, degree, span, parameter, out),
+            _ => {}
+        }
+    }
     // Degrees 1..=5 with the degree and the scratch size fixed at compile
     // time (see `basis_functions_into`): the same operations in the same
     // order, so the same bits; `ndu`, `left`, `right` and `a` shrink from
@@ -335,6 +346,21 @@ pub(crate) fn basis_derivatives_into(
         4 => basis_derivatives_scratch::<5>(knots, 4, span, parameter, derivative_count, out),
         5 => basis_derivatives_scratch::<6>(knots, 5, span, parameter, derivative_count, out),
         _ => basis_derivatives_scratch::<MAX_STACK_ORDER>(knots, degree, span, parameter, derivative_count, out),
+    }
+}
+
+#[inline(always)]
+fn basis_derivatives_count_fixed<const COUNT: usize>(
+    knots: &[f64], degree: usize, span: usize, parameter: f64,
+    out: &mut [[f64; MAX_STACK_ORDER]],
+) {
+    match degree {
+        1 => basis_derivatives_scratch::<2>(knots, 1, span, parameter, COUNT, out),
+        2 => basis_derivatives_scratch::<3>(knots, 2, span, parameter, COUNT, out),
+        3 => basis_derivatives_scratch::<4>(knots, 3, span, parameter, COUNT, out),
+        4 => basis_derivatives_scratch::<5>(knots, 4, span, parameter, COUNT, out),
+        5 => basis_derivatives_scratch::<6>(knots, 5, span, parameter, COUNT, out),
+        _ => basis_derivatives_scratch::<MAX_STACK_ORDER>(knots, degree, span, parameter, COUNT, out),
     }
 }
 
@@ -352,6 +378,7 @@ fn basis_derivatives_scratch<const ORDER: usize>(
     derivative_count: usize,
     out: &mut [[f64; MAX_STACK_ORDER]],
 ) {
+        let _reader_part = crate::reader_profile::Part::open(crate::reader_profile::BASIS);
     debug_assert!(degree < ORDER);
     let p = degree;
     let n = derivative_count.min(p);
@@ -458,6 +485,7 @@ impl KnotVector {
     }
 
     pub fn basis_functions(&self, span: usize, parameter: f64) -> Vec<f64> {
+        let _reader_part = crate::reader_profile::Part::open(crate::reader_profile::BASIS);
         if self.degree <= MAX_STACK_DEGREE {
             let mut basis = [0.0f64; MAX_STACK_ORDER];
             basis_functions_into(&self.knots, self.degree, span, parameter, &mut basis);
@@ -472,6 +500,7 @@ impl KnotVector {
         parameter: f64,
         derivative_count: usize,
     ) -> Vec<Vec<f64>> {
+        let _reader_part = crate::reader_profile::Part::open(crate::reader_profile::BASIS);
         if self.degree <= MAX_STACK_DEGREE && derivative_count <= MAX_STACK_DEGREE {
             let mut rows = [[0.0f64; MAX_STACK_ORDER]; MAX_STACK_ORDER];
             basis_derivatives_into(
@@ -635,7 +664,10 @@ impl NurbsCurve {
         Ok(knot_domain(&self.knots, self.degree))
     }
 
+    #[cfg_attr(feature = "profile-wall", track_caller)]
     pub fn evaluate_homogeneous(&self, parameter: f64) -> Result<Vec4, String> {
+        let _reader = crate::reader_profile::Point::open(crate::reader_profile::CURVE, std::panic::Location::caller());
+    let _wall = crate::wall_profile::Scope::enter(crate::wall_profile::POINT);
         self.ensure_valid()?;
         let span = knot_find_span(&self.knots, self.degree, parameter);
         let parameter = knot_clamp(&self.knots, self.degree, parameter);
@@ -648,12 +680,14 @@ impl NurbsCurve {
         if self.degree <= MAX_STACK_DEGREE {
             let mut basis = [0.0f64; MAX_STACK_ORDER];
             basis_functions_into(&self.knots, self.degree, span, parameter, &mut basis);
+            let _reader_part = crate::reader_profile::Part::open(crate::reader_profile::ACCUMULATE);
             for (index, value) in basis[..=self.degree].iter().enumerate() {
                 point = point.add(self.control_points[span - self.degree + index].scale(*value));
             }
         } else {
             let knot_vector = self.knot_vector()?;
             let basis = knot_vector.basis_functions(span, parameter);
+            let _reader_part = crate::reader_profile::Part::open(crate::reader_profile::ACCUMULATE);
             for (index, value) in basis.iter().enumerate() {
                 point = point.add(self.control_points[span - self.degree + index].scale(*value));
             }
@@ -661,7 +695,10 @@ impl NurbsCurve {
         Ok(point)
     }
 
+    #[cfg_attr(feature = "profile-wall", track_caller)]
     pub fn evaluate(&self, parameter: f64) -> Result<Vec3, String> {
+        let _reader = crate::reader_profile::Point::open(crate::reader_profile::CURVE, std::panic::Location::caller());
+    let _wall = crate::wall_profile::Scope::enter(crate::wall_profile::POINT);
         self.evaluate_homogeneous(parameter)?.point()
     }
 
@@ -718,7 +755,10 @@ impl NurbsCurve {
     /// out-of-domain queries because intersection and projection
     /// algorithms probe there.  Closed curves wrap the parameter
     /// cyclically; open curves extend linearly along the end tangent.
+    #[cfg_attr(feature = "profile-wall", track_caller)]
     pub fn evaluate_extended(&self, parameter: f64) -> Result<Vec3, String> {
+        let _reader = crate::reader_profile::Point::open(crate::reader_profile::CURVE, std::panic::Location::caller());
+    let _wall = crate::wall_profile::Scope::enter(crate::wall_profile::POINT);
         Ok(self.derivatives_extended(parameter, 0)?[0])
     }
 
@@ -779,6 +819,7 @@ impl NurbsCurve {
                 calculated_count,
                 &mut rows[..=calculated_count],
             );
+            let _reader_part = crate::reader_profile::Part::open(crate::reader_profile::ACCUMULATE);
             for row in rows.iter().take(calculated_count + 1) {
                 let mut point = Vec4 {
                     x: 0.0,
@@ -795,6 +836,7 @@ impl NurbsCurve {
         } else {
             let knot_vector = self.knot_vector()?;
             let basis = knot_vector.basis_derivatives(span, parameter, calculated_count);
+            let _reader_part = crate::reader_profile::Part::open(crate::reader_profile::ACCUMULATE);
             for row in basis.iter().take(calculated_count + 1) {
                 let mut point = Vec4 {
                     x: 0.0,
@@ -1067,6 +1109,7 @@ impl NurbsCurve {
                 calculated_count,
                 &mut rows[..=calculated_count],
             );
+            let _reader_part = crate::reader_profile::Part::open(crate::reader_profile::ACCUMULATE);
             for (k, row) in rows.iter().take(calculated_count + 1).enumerate() {
                 let mut point = zero;
                 for (index, value) in row.iter().enumerate().take(self.degree + 1) {
@@ -1078,6 +1121,7 @@ impl NurbsCurve {
         } else {
             let knot_vector = self.knot_vector()?;
             let basis = knot_vector.basis_derivatives(span, parameter, calculated_count);
+            let _reader_part = crate::reader_profile::Part::open(crate::reader_profile::ACCUMULATE);
             for (k, row) in basis.iter().take(calculated_count + 1).enumerate() {
                 let mut point = zero;
                 for (index, value) in row.iter().enumerate().take(self.degree + 1) {
@@ -1588,8 +1632,9 @@ pub(crate) fn basis_functions_raw(knots: &[f64], degree: usize, span: usize, par
 }
 
 #[inline]
-fn basis_functions_raw_into(knots: &[f64], degree: usize, span: usize, parameter: f64,
+pub(crate) fn basis_functions_raw_into(knots: &[f64], degree: usize, span: usize, parameter: f64,
     guard: f64, basis: &mut [f64], left: &mut [f64], right: &mut [f64]) {
+        let _reader_part = crate::reader_profile::Part::open(crate::reader_profile::BASIS);
     basis[0] = 1.0;
     for j in 1..=degree {
         left[j] = parameter - knots[span + 1 - j];

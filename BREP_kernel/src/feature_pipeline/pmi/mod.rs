@@ -9,12 +9,12 @@
 //! on the history request, round-tripped through the saved document and
 //! ABSENT on every document without PMI (so those files re-serialize
 //! byte-identically). A **view** is a named camera snapshot plus display
-//! state (text size, wireframe, the object names hidden at capture) plus an
+//! state (text size, wireframe, section; what it hides is its hide steps) plus an
 //! ordered list of annotations; a saved view maps to an AP242
 //! `DRAUGHTING_MODEL` + `CAMERA_MODEL_D3` on export and is the unit a future
-//! drawing sheet places. What a view hides is the union of that captured
-//! baseline and its **hide steps** (`hide` annotations naming solids /
-//! components, tracked like explode steps): [`PmiView::hides`] is the one
+//! drawing sheet places. What a view hides is its **hide steps** (`hide`
+//! annotations naming solids / components, tracked like explode steps; the
+//! solids hidden at capture are its baseline step): [`PmiView::hides`] is the one
 //! rule every consumer reads, and the report lists the outcome per view.
 //!
 //! An **annotation** is `{ type, enabled, inputParams, labelWorld? }`: its
@@ -88,8 +88,12 @@ pub use annotations::{pmi_schema_catalogue, pmi_type, PmiTypeDef, PMI_TYPES};
 // The persisted block
 // ===========================================================================
 
-/// The document's `pmi` block.
+/// The document's `pmi` block. Loading it folds every view's legacy
+/// `display.hidden` list into that view's baseline hide step (see
+/// [`PmiDisplay`]), so every reader — the run, the parts library, STEP
+/// export, plugins, the 3D PDF — sees one representation.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(from = "PmiStateWire")]
 pub struct PmiState {
     #[serde(default)]
     pub views: Vec<PmiView>,
@@ -97,6 +101,36 @@ pub struct PmiState {
     /// never reused, re-seeded from the largest numeric suffix on load.
     #[serde(default, rename = "idCounter")]
     pub id_counter: u64,
+}
+
+/// [`PmiState`] as stored, before the legacy hidden lists are folded in.
+#[derive(Deserialize)]
+struct PmiStateWire {
+    #[serde(default)]
+    views: Vec<PmiView>,
+    #[serde(default, rename = "idCounter")]
+    id_counter: u64,
+}
+
+impl From<PmiStateWire> for PmiState {
+    fn from(wire: PmiStateWire) -> Self {
+        let mut state = PmiState { views: wire.views, id_counter: wire.id_counter };
+        for index in 0..state.views.len() {
+            let legacy = std::mem::take(&mut state.views[index].display.legacy_hidden);
+            if legacy.is_empty() {
+                continue;
+            }
+            let mut names = state.views[index].baseline_hidden();
+            for name in legacy {
+                if !names.contains(&name) {
+                    names.push(name);
+                }
+            }
+            let id = state.views[index].id.clone();
+            state.set_view_baseline(&id, &names);
+        }
+        state
+    }
 }
 
 /// A PMI view: a camera snapshot, display state and the annotations it owns.
@@ -170,14 +204,21 @@ pub struct PmiDisplay {
     pub text_size_pt: f64,
     #[serde(default)]
     pub wireframe: bool,
-    /// Scene object NAMES hidden in this view at capture (the baseline the
-    /// instructions wizard also writes); a name that no longer exists is
-    /// ignored. The view's `hide` annotations add to it: read
-    /// [`PmiView::hides`], never this list alone.
-    #[serde(default)]
-    pub hidden: Vec<String>,
+    /// The pre-2026-11-05 captured baseline (`display.hidden`), read and never
+    /// written: loading a [`PmiState`] folds it into the view's baseline
+    /// **hide step** ([`PmiAnnotation::is_baseline_hide`]), so what a view
+    /// hides has one representation, its hide steps ([`PmiView::hides`]).
+    #[serde(default, rename = "hidden", skip_serializing)]
+    legacy_hidden: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub section: Option<PmiSection>,
+}
+
+impl PmiDisplay {
+    /// A view's display state: what it hides lives in its hide steps.
+    pub fn new(text_size_pt: f64, wireframe: bool, section: Option<PmiSection>) -> Self {
+        Self { text_size_pt, wireframe, legacy_hidden: Vec::new(), section }
+    }
 }
 
 /// A display-only half-space through `origin` plus an offset along the normal.
@@ -348,16 +389,57 @@ impl PmiView {
     }
 }
 
+/// The `hide` step param marking a view's **baseline** step: the solids
+/// hidden when the view was captured (or a generated instructions step's
+/// not-yet-placed parts, or a pre-2026-11-05 `display.hidden` list). A name
+/// in it that no longer exists is skipped, not an error.
+pub const HIDE_BASELINE_PARAM: &str = "baseline";
+
+/// The id a view's baseline hide step is given: `HID-{view id}`, unique (one
+/// baseline per view) and derived, so making one never advances the
+/// document's id counter and every id minted after it stays what it was.
+pub fn baseline_hide_id(view_id: &str) -> String {
+    format!("{}-{view_id}", annotations::hide::DEF.short_name)
+}
+
+impl PmiAnnotation {
+    /// A `hide` step `id` naming `targets`; `baseline` marks the view's
+    /// captured baseline ([`HIDE_BASELINE_PARAM`]).
+    pub fn hide_step(id: &str, targets: &[String], baseline: bool) -> Self {
+        let mut params = serde_json::json!({ "id": id, "targets": targets });
+        if baseline {
+            params[HIDE_BASELINE_PARAM] = Value::Bool(true);
+        }
+        Self {
+            kind: annotations::hide::DEF.type_id.to_string(),
+            enabled: true,
+            params,
+            persistent_data: Value::Null,
+            plugin_replay: None,
+            label_world: None,
+        }
+    }
+
+    /// Whether this is a view's baseline hide step.
+    pub fn is_baseline_hide(&self) -> bool {
+        self.kind == annotations::hide::DEF.type_id && self.flag(HIDE_BASELINE_PARAM)
+    }
+}
+
 impl PmiView {
-    /// Whether this view hides the solid named `solid`: it is in the
-    /// captured baseline (`display.hidden`), or an ENABLED hide step names it
-    /// or a component it belongs to ([`entry_names_solid`]). Names only, no
-    /// run needed: the viewport applies it the moment a step is added,
-    /// edited, removed or undone, and the sheets, the 3D PDF and the
-    /// instructions pictures read the same answer.
+    /// Whether this view hides the solid named `solid`: an ENABLED hide step
+    /// (its baseline among them) names it or a component it belongs to
+    /// ([`entry_names_solid`]). Names only, no run needed: the viewport
+    /// applies it the moment a step is added, edited, removed or undone, and
+    /// the sheets, the 3D PDF and the instructions pictures read the same
+    /// answer.
     pub fn hides(&self, solid: &str) -> bool {
-        self.display.hidden.iter().any(|name| name == solid)
-            || self.hide_targets().any(|entry| entry_names_solid(entry, solid))
+        self.hide_targets().any(|entry| entry_names_solid(entry, solid))
+    }
+
+    /// The targets of the view's baseline hide step(s), in order.
+    pub fn baseline_hidden(&self) -> Vec<String> {
+        self.annotations.iter().filter(|a| a.is_baseline_hide()).flat_map(|a| a.references("targets")).collect()
     }
 
     /// Every target of the view's enabled hide steps, in step order.
@@ -384,7 +466,7 @@ impl Default for PmiDisplay {
         Self {
             text_size_pt: default_text_size(),
             wireframe: false,
-            hidden: Vec::new(),
+            legacy_hidden: Vec::new(),
             section: None,
         }
     }
@@ -501,6 +583,113 @@ impl PmiAnnotation {
 }
 
 impl PmiState {
+    /// Replace view `view_id`'s baseline hide step with one naming `names`
+    /// (none when empty), keeping the old step's id and place. False when
+    /// nothing changed or there is no such view.
+    pub fn set_view_baseline(&mut self, view_id: &str, names: &[String]) -> bool {
+        let Some(view) = self.find_view(view_id) else { return false };
+        if view.baseline_hidden() == names && view.annotations.iter().filter(|a| a.is_baseline_hide()).count() <= 1 {
+            return false;
+        }
+        let at = view.annotations.iter().position(PmiAnnotation::is_baseline_hide);
+        let kept_id = at.map(|at| view.annotations[at].id().to_string()).filter(|id| !id.is_empty());
+        let id = kept_id.unwrap_or_else(|| baseline_hide_id(view_id));
+        let view = self.find_view_mut(view_id).expect("found above");
+        view.annotations.retain(|a| !a.is_baseline_hide());
+        if !names.is_empty() {
+            let step = PmiAnnotation::hide_step(&id, names, true);
+            let at = at.unwrap_or(view.annotations.len()).min(view.annotations.len());
+            view.annotations.insert(at, step);
+        }
+        true
+    }
+
+    /// Hide `names` in view `view_id` as a new hide step (the viewport's
+    /// hide while the view is active): only the names the view does not hide
+    /// yet. The new step's id, or `None` when nothing new is hidden.
+    pub fn hide_in_view(&mut self, view_id: &str, names: &[String]) -> Option<String> {
+        let view = self.find_view(view_id)?;
+        let mut targets: Vec<String> = Vec::new();
+        for name in names {
+            if !view.hides(name) && !targets.contains(name) {
+                targets.push(name.clone());
+            }
+        }
+        if targets.is_empty() {
+            return None;
+        }
+        let id = self.next_id(annotations::hide::DEF.short_name);
+        self.find_view_mut(view_id)?.annotations.push(PmiAnnotation::hide_step(&id, &targets, false));
+        Some(id)
+    }
+
+    /// Show `names` in view `view_id` (the viewport's show while the view is
+    /// active): every enabled hide step drops them; a step target naming a
+    /// whole component one of them belongs to becomes that component's other
+    /// solids (from `solids`, the scene's names); a step left with no target
+    /// goes. True when a step changed.
+    pub fn show_in_view(&mut self, view_id: &str, names: &[String], solids: &[String]) -> bool {
+        let Some(view) = self.find_view_mut(view_id) else { return false };
+        let shown = |solid: &str| names.iter().any(|name| name == solid);
+        let mut changed = false;
+        let mut emptied: Vec<usize> = Vec::new();
+        for (index, annotation) in view.annotations.iter_mut().enumerate() {
+            if !annotation.enabled || annotation.kind != annotations::hide::DEF.type_id {
+                continue;
+            }
+            let targets = annotation.references("targets");
+            if !targets.iter().any(|entry| names.iter().any(|name| entry_names_solid(entry, name))) {
+                continue;
+            }
+            let mut kept: Vec<String> = Vec::new();
+            for entry in targets {
+                if !names.iter().any(|name| entry_names_solid(&entry, name)) {
+                    kept.push(entry);
+                    continue;
+                }
+                for solid in solids.iter().filter(|solid| entry_names_solid(&entry, solid) && !shown(solid)) {
+                    if !kept.contains(solid) {
+                        kept.push(solid.clone());
+                    }
+                }
+            }
+            changed = true;
+            if kept.is_empty() {
+                emptied.push(index);
+            } else {
+                annotation.params["targets"] = serde_json::json!(kept);
+            }
+        }
+        for index in emptied.into_iter().rev() {
+            view.annotations.remove(index);
+        }
+        changed
+    }
+
+    /// Make view `view_id` hide exactly `names` among `solids` (MCP
+    /// `pmi_set_view_display`'s `hidden`): what it hides beyond them is shown
+    /// ([`Self::show_in_view`]), and what it does not hide yet joins its
+    /// baseline step. True when a step changed.
+    pub fn set_view_hidden(&mut self, view_id: &str, names: &[String], solids: &[String]) -> bool {
+        let Some(view) = self.find_view(view_id) else { return false };
+        let extra: Vec<String> = solids.iter().filter(|solid| view.hides(solid) && !names.contains(solid)).cloned().collect();
+        let mut changed = !extra.is_empty() && self.show_in_view(view_id, &extra, solids);
+        let view = self.find_view(view_id).expect("found above");
+        let mut baseline = view.baseline_hidden();
+        let missing: Vec<String> = names.iter().filter(|name| !view.hides(name)).cloned().collect();
+        if !missing.is_empty() {
+            if view.annotations.iter().any(|step| step.is_baseline_hide() && !step.enabled) {
+                // A disabled baseline is not hiding its targets. Keep that
+                // authored state and add only the explicitly requested hides.
+                changed |= self.hide_in_view(view_id, &missing).is_some();
+            } else {
+                baseline.extend(missing);
+                changed |= self.set_view_baseline(view_id, &baseline);
+            }
+        }
+        changed
+    }
+
     /// Mint the next id with `prefix` (`VIEW` → `VIEW3`). The counter is
     /// re-seeded first from the largest numeric suffix already in the block,
     /// so an edited or merged document never hands out a colliding id.

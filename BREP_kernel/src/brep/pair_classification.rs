@@ -83,6 +83,47 @@ fn planar_support(surface: &NurbsSurface, tolerance: f64) -> Result<Option<(Vec3
 
 
 
+/// PLANE PAIR STRADDLE (2026-11-06; `BREP_PLANE_PAIR_STRADDLE`,
+/// default on, `=0` restores the parallel reading). Two planes within the angular tolerance of parallel are
+/// still two planes when one crosses the other inside the patches: the
+/// hair-turned cube (brep-bench `tangent/cube-turned-a-hair`, 0.001 deg =
+/// 1.7e-5 rad) has side pairs whose `|n x n'|` reads 1.7e-5 <= 1e-4 and whose
+/// midpoints stand 7.6e-10 apart, so the parallel branch called them
+/// Cosurface, while their corners stand +-8.7e-5 off each other's plane. A
+/// pair is read as crossing when some control point of either patch stands
+/// more than `band` on each side of the other's plane (a degree-1 patch lies
+/// in its control hull, so the crossing line passes through it). A pair
+/// within the band on one side keeps the parallel reading.
+pub(crate) fn plane_pair_straddle_enabled() -> bool {
+    crate::switch!("BREP_PLANE_PAIR_STRADDLE", true)
+}
+
+/// Whether the planar patches `first` (through `first_origin`, normal
+/// `first_normal`) and `second` (likewise) cross each other by more than
+/// `band` on both sides: see [`plane_pair_straddle_enabled`].
+pub(crate) fn planar_patches_straddle(
+    first: &NurbsSurface,
+    first_origin: Vec3,
+    first_normal: Vec3,
+    second: &NurbsSurface,
+    second_origin: Vec3,
+    second_normal: Vec3,
+    band: f64,
+) -> bool {
+    let straddles = |surface: &NurbsSurface, origin: Vec3, normal: Vec3| {
+        let mut below = false;
+        let mut above = false;
+        for control in surface.control_points.iter().flatten() {
+            let Ok(point) = control.point() else { return false };
+            let distance = point.sub(origin).dot(normal);
+            below |= distance < -band;
+            above |= distance > band;
+        }
+        below && above
+    };
+    straddles(second, first_origin, first_normal) || straddles(first, second_origin, second_normal)
+}
+
 fn surface_samples(surface: &NurbsSurface) -> Result<Vec<(f64, f64, Vec3)>, String> {
     let u = surface.domain_u()?;
     let v = surface.domain_v()?;
@@ -166,6 +207,7 @@ pub fn classify_surface_pair(
     model_tolerance: f64,
     angular_tolerance: f64,
 ) -> Result<SurfacePairClassification, String> {
+    let _wall = crate::wall_profile::Scope::enter(crate::wall_profile::CLASSIFY);
     let first_data = SurfaceClassifyData::build(first, model_tolerance)?;
     let second_data = SurfaceClassifyData::build(second, model_tolerance)?;
     classify_surface_pair_cached(
@@ -188,6 +230,7 @@ pub fn classify_surface_pair_cached(
     model_tolerance: f64,
     angular_tolerance: f64,
 ) -> Result<SurfacePairClassification, String> {
+    let _wall = crate::wall_profile::Scope::enter(crate::wall_profile::CLASSIFY);
     let first_bounds = first_data.bounds;
     let second_bounds = second_data.bounds;
     let hull_separation = first_bounds.separation(second_bounds);
@@ -213,7 +256,10 @@ pub fn classify_surface_pair_cached(
         (first_data.planar, second_data.planar)
     {
         let normal_cross = first_normal.cross(second_normal).length();
-        if normal_cross <= angular_tolerance {
+        let crossing = normal_cross <= angular_tolerance
+            && plane_pair_straddle_enabled()
+            && planar_patches_straddle(first, first_origin, first_normal, second, second_origin, second_normal, contact);
+        if normal_cross <= angular_tolerance && !crossing {
             let separation = second_origin.sub(first_origin).dot(first_normal).abs();
             return Ok(SurfacePairClassification {
                 relation: if separation <= contact {

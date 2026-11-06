@@ -64,8 +64,9 @@ pub fn document_signature(doc_json: &str) -> String {
 /// sub-assembly moves as one body, its parts never move on their own). The
 /// state is the instance's own `flexibleFixed[rest]`, else the grounding of
 /// the definition that places it (an explicit `isFixed`, else the first
-/// component, else a Fixed constraint's target), as `assembly::flexible`
-/// decides it.
+/// component, else a legacy Fixed row that definition still carries — an
+/// embedded copy keeps it until the part is saved again), as
+/// `assembly::flexible` decides it.
 pub fn nested_fixed_state(top_params: &Value, rest: &str, document: &Value) -> Result<bool, String> {
     let acomp = |document: &'_ Value, id: &str| -> Option<Value> {
         document["features"].as_array()?.iter().find(|f| {
@@ -243,6 +244,29 @@ impl EngineState {
         };
         self.assembly_components = sync.components.clone();
         let state = sync.state.clone();
+        // Legacy Fixed rows this run turned into the instance setting (the
+        // kernel lifecycle's migration): say so once — the fold below drops
+        // them from the document, so the next run carries none.
+        let migrated: Vec<String> = sync.dof["migratedFixed"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|row| {
+                let id = row["id"].as_str().unwrap_or("Fixed");
+                match row["component"].as_str() {
+                    Some(component) => format!(
+                        "Fixed constraint {id} is now {component}'s Fixed setting: a part is fixed on its own row, not by a constraint"
+                    ),
+                    None => format!(
+                        "Fixed constraint {id} was removed: it fixed nothing ({}); fix a part on its own row",
+                        if row["enabled"] == false { "it was disabled".to_string() } else { format!("'{}' names no component", row["element"].as_str().unwrap_or("")) }
+                    ),
+                }
+            })
+            .collect();
+        for notice in migrated {
+            self.push_notice(notice);
+        }
         self.fold_assembly_state(state, false);
     }
 
@@ -420,6 +444,9 @@ impl EngineState {
         constraint_type: &str,
         params_json: &str,
     ) -> Result<String, String> {
+        if constraint_type == "fixed" {
+            return Err(brep_kernel::FIXED_IS_NOT_A_CONSTRAINT.to_string());
+        }
         self.ensure_assembly_session();
         let reply =
             brep_kernel::assembly_add_constraint_impl(constraint_type, params_json)?;
@@ -708,20 +735,33 @@ impl EngineState {
             self.update_feature_params(top, &params.to_string())?;
             return Ok(());
         }
-        let index = self
-            .history
-            .index_of(component_id)
-            .ok_or_else(|| format!("no component feature '{component_id}'"))?;
-        let mut params = self
-            .history
-            .feature_params(index)
-            .unwrap_or_else(|| serde_json::json!({}));
-        if let Some(map) = params.as_object_mut() {
+        self.set_components_fixed(&[component_id.to_string()], fixed)
+    }
+
+    /// Fix/Unfix several top-level components at once (a packed BOM row's
+    /// placements): every owning ACOMP's `inputParams.isFixed`, ONE undo step,
+    /// one re-run. The same write [`Self::set_component_fixed`] makes for one.
+    pub fn set_components_fixed(&mut self, component_ids: &[String], fixed: bool) -> Result<(), String> {
+        let mut edits = Vec::with_capacity(component_ids.len());
+        for component_id in component_ids {
+            if component_id.contains(':') {
+                return Err(format!("'{component_id}' is a nested occurrence: fix or unfix it on its own"));
+            }
+            let index = self
+                .history
+                .index_of(component_id)
+                .ok_or_else(|| format!("no component feature '{component_id}'"))?;
+            let mut params = self
+                .history
+                .feature_params(index)
+                .unwrap_or_else(|| serde_json::json!({}));
+            let Some(map) = params.as_object_mut() else {
+                return Err(format!("component '{component_id}': malformed inputParams"));
+            };
             map.insert("isFixed".into(), Value::Bool(fixed));
-        } else {
-            return Err(format!("component '{component_id}': malformed inputParams"));
+            edits.push((component_id.clone(), params));
         }
-        self.update_feature_params(component_id, &params.to_string())?;
+        self.update_many_feature_params(&edits)?;
         Ok(())
     }
 

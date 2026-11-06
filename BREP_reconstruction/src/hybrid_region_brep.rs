@@ -41,6 +41,9 @@ struct CylinderCarrier {
     /// [`HybridSwitches::pair_section_bar`], carried so every crossing test
     /// on this carrier agrees.
     pair_section_bar: bool,
+    /// [`HybridSwitches::noisy_crossing`], carried so the section plane
+    /// choice and the chain walks on this carrier agree.
+    noisy_crossing: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -226,6 +229,9 @@ pub(crate) struct HybridBrepStats {
     pub(crate) split_over_budget_regions: usize,
     pub(crate) split_budget_hit_regions: usize,
     pub(crate) split_band_declined_regions: usize,
+    /// [`HybridSwitches::retry_join_walls`]: groups of walls and gathered
+    /// regions the retry could join.
+    pub(crate) split_joinable_walls: usize,
     /// [`HybridSwitches::gather_cone_strips`]: runs of cone strips gathered.
     pub(crate) gathered_cone_runs: usize,
     /// [`HybridSwitches::revolve_ends_first`]: line ends moved onto a vertex
@@ -286,8 +292,9 @@ pub(crate) fn hybrid_plane_cylinder_brep(
 }
 
 /// [`hybrid_plane_cylinder_brep`] without promotion 9's switches
-/// (`gather_cone_strips`, `revolve_ends_first`): the STL conversion's second
-/// try when the first rebuilt solid fails its STEP round trip.
+/// (`gather_cone_strips`, `revolve_ends_first`), nor promotion 11's: the STL
+/// conversion's next try when the first rebuilt solid fails its STEP round
+/// trip.
 pub(crate) fn hybrid_plane_cylinder_brep_before_promotion_9(
     positions: &[f64],
     indices: Option<&[u32]>,
@@ -297,13 +304,13 @@ pub(crate) fn hybrid_plane_cylinder_brep_before_promotion_9(
     if !switches.gather_cone_strips && !switches.revolve_ends_first {
         return Ok(None);
     }
-    let without = HybridSwitches { gather_cone_strips: false, revolve_ends_first: false, ..switches };
+    let without = without_promotion_11(HybridSwitches { gather_cone_strips: false, revolve_ends_first: false, ..switches });
     hybrid_plane_cylinder_brep_retry(positions, indices, options, without, None).map(Some)
 }
 
 /// [`hybrid_plane_cylinder_brep`] without promotion 10's switches
 /// (`split_noise_bar`, `split_merge_refit`, `join_lone_freeform`,
-/// `assemble_cone_bore`), and with `with_promotion_9` false without
+/// `assemble_cone_bore`) nor promotion 11's, and with `with_promotion_9` false without
 /// promotion 9's too: the STL conversion's further tries when the rebuilt
 /// solid fails its STEP round trip.
 pub(crate) fn hybrid_plane_cylinder_brep_before_promotion_10(
@@ -316,18 +323,124 @@ pub(crate) fn hybrid_plane_cylinder_brep_before_promotion_10(
     if !(switches.split_noise_bar || switches.split_merge_refit || switches.join_lone_freeform || switches.assemble_cone_bore) {
         return Ok(None);
     }
-    let mut without = HybridSwitches {
+    let mut without = without_promotion_11(HybridSwitches {
         split_noise_bar: false,
         split_merge_refit: false,
         join_lone_freeform: false,
         assemble_cone_bore: false,
         ..switches
-    };
+    });
     if !with_promotion_9 {
         without.gather_cone_strips = false;
         without.revolve_ends_first = false;
     }
     hybrid_plane_cylinder_brep_retry(positions, indices, options, without, None).map(Some)
+}
+
+/// `switches` with promotion 11's switches (2026-11-04) off: `bore_strips`,
+/// `whole_freeform_strays`, `gather_wide_ladder`, `noisy_cap_tilt`,
+/// `retry_jittered_walls`, `retry_wall_chips`, `retry_chip_join`, and every
+/// later promotion's with them (listed here by hand before promotion 14, it
+/// kept `retry_join_walls` on, and the tries built on it ran the joined-wall
+/// rebuild).
+pub(crate) fn without_promotion_11(switches: HybridSwitches) -> HybridSwitches {
+    without_promotion_12(HybridSwitches {
+        bore_strips: false,
+        whole_freeform_strays: false,
+        gather_wide_ladder: false,
+        noisy_cap_tilt: false,
+        retry_jittered_walls: false,
+        retry_wall_chips: false,
+        retry_chip_join: false,
+        ..switches
+    })
+}
+
+/// [`hybrid_plane_cylinder_brep`] without promotion 11's switches
+/// ([`without_promotion_11`]): the STL conversion's first further try when
+/// the rebuilt solid fails its STEP round trip.
+pub(crate) fn hybrid_plane_cylinder_brep_before_promotion_11(
+    positions: &[f64],
+    indices: Option<&[u32]>,
+    options: &SegmentOptions,
+) -> Result<Option<HybridBrepOutput>, String> {
+    let switches = HybridSwitches::from_env();
+    if !(switches.bore_strips
+        || switches.whole_freeform_strays
+        || switches.gather_wide_ladder
+        || switches.noisy_cap_tilt
+        || switches.retry_jittered_walls
+        || switches.retry_wall_chips
+        || switches.retry_chip_join)
+    {
+        return Ok(None);
+    }
+    let without = without_promotion_11(switches);
+    hybrid_plane_cylinder_brep_retry(positions, indices, options, without, None).map(Some)
+}
+
+/// `switches` with promotion 12's switch (2026-11-04) off:
+/// `retry_lone_carrier`, and promotion 13's with it.
+pub(crate) fn without_promotion_12(switches: HybridSwitches) -> HybridSwitches {
+    without_promotion_13(HybridSwitches { retry_lone_carrier: false, ..switches })
+}
+
+/// [`hybrid_plane_cylinder_brep`] without promotion 12's switch
+/// ([`without_promotion_12`]): the STL conversion's first further try when
+/// the rebuilt solid fails its STEP round trip.
+pub(crate) fn hybrid_plane_cylinder_brep_before_promotion_12(
+    positions: &[f64],
+    indices: Option<&[u32]>,
+    options: &SegmentOptions,
+) -> Result<Option<HybridBrepOutput>, String> {
+    let switches = HybridSwitches::from_env();
+    if !switches.retry_lone_carrier {
+        return Ok(None);
+    }
+    hybrid_plane_cylinder_brep_retry(positions, indices, options, without_promotion_12(switches), None).map(Some)
+}
+
+/// `switches` with promotion 13's switches (2026-11-04) off:
+/// `absorb_freeform_sector`, `retry_budget_walls` and `band_cylinders`, and
+/// promotion 14's with them.
+pub(crate) fn without_promotion_13(switches: HybridSwitches) -> HybridSwitches {
+    without_promotion_14(HybridSwitches { absorb_freeform_sector: false, retry_budget_walls: false, band_cylinders: false, ..switches })
+}
+
+/// `switches` with promotion 14's switch (2026-11-04) off:
+/// `retry_join_walls`.
+pub(crate) fn without_promotion_14(switches: HybridSwitches) -> HybridSwitches {
+    HybridSwitches { retry_join_walls: false, ..switches }
+}
+
+/// [`hybrid_plane_cylinder_brep`] without promotion 14's switch
+/// ([`without_promotion_14`]): the STL conversion's first further try when
+/// the rebuilt solid fails its STEP round trip.
+pub(crate) fn hybrid_plane_cylinder_brep_before_promotion_14(
+    positions: &[f64],
+    indices: Option<&[u32]>,
+    options: &SegmentOptions,
+) -> Result<Option<HybridBrepOutput>, String> {
+    let switches = HybridSwitches::from_env();
+    if !switches.retry_join_walls {
+        return Ok(None);
+    }
+    hybrid_plane_cylinder_brep_retry(positions, indices, options, without_promotion_14(switches), None).map(Some)
+}
+
+/// [`hybrid_plane_cylinder_brep`] without promotion 13's switches
+/// ([`without_promotion_13`]): the STL conversion's next try when the
+/// rebuilt solid fails its STEP round trip.
+pub(crate) fn hybrid_plane_cylinder_brep_before_promotion_13(
+    positions: &[f64],
+    indices: Option<&[u32]>,
+    options: &SegmentOptions,
+) -> Result<Option<HybridBrepOutput>, String> {
+    let switches = HybridSwitches::from_env();
+    if !(switches.absorb_freeform_sector || switches.retry_budget_walls || switches.band_cylinders) {
+        return Ok(None);
+    }
+    hybrid_plane_cylinder_brep_retry(positions, indices, options, without_promotion_13(switches), None).map(Some)
 }
 
 /// Localized failures demote one region per attempt; past this many, the
@@ -404,6 +517,26 @@ fn split_freeform_enabled() -> bool {
 /// its old path. Promoted ON 2026-10-31 as an eleventh set (owner):
 /// `cone_seam_bar` and `join_split_runs` (census pair `p10on` against
 /// `p10off` in the promotion 10 hand-off); each `=0` restores its old path.
+/// Promoted ON 2026-11-04: `bore_strips`, `whole_freeform_strays`,
+/// `gather_wide_ladder`, `noisy_cap_tilt`, `retry_jittered_walls`,
+/// `retry_wall_chips` and `retry_chip_join` (census pair `b192all` against
+/// `b192def`: degraded 0.55 -> 0.43 % faceted, 21 rows fewer and none more
+/// by the attribution); each `=0` restores its old path, and the STL
+/// conversion's round-trip fallback tries the rebuild without them first.
+/// Promoted ON 2026-11-04 as promotion 12: `retry_lone_carrier` (census pair
+/// `b200lone` against `b200def`: 2 rows fewer, none more, no volume flag);
+/// `=0` restores its old path, and the round-trip fallback tries the
+/// rebuild without it first.
+/// Promoted ON 2026-11-04 as promotion 13: `absorb_freeform_sector`,
+/// `retry_budget_walls` and `band_cylinders` (census pair `b214all` against
+/// `b214def`: 5 rows fewer, none more, no volume flag); each `=0` restores
+/// its old path, and the round-trip fallback tries the rebuild without them
+/// first.
+/// Promoted ON 2026-11-04 as promotion 14: `retry_join_walls` (census pair
+/// `b216join` against `b216def`: 5 rows fewer, none more, one volume flag on
+/// occt_crossed_cylinders_s1_d0.05_jitter-1.0, whose band cylinders hold
+/// radii 0.998 and 1.002 of 1.0); `=0` restores its old path, and the
+/// round-trip fallback tries the rebuild without it first.
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct HybridSwitches {
     /// Row 2a: the cap-fragment absorb runs on every noisy mesh, not only
@@ -811,7 +944,8 @@ pub(crate) struct HybridSwitches {
     /// strips, the bore's other 63 sat in the countersink's region in pieces
     /// of 2-12 between them, the bore was refused under its 16-triangle
     /// piece floor, and the region stayed faceted (957 triangles).
-    /// BREP_HYBRID_BORE_STRIPS=1 (default off).
+    /// BREP_HYBRID_BORE_STRIPS=0 restores the old path (promoted ON
+    /// 2026-11-04).
     pub(crate) bore_strips: bool,
     /// A cone and the bore beneath it are assembled across the regions the
     /// segmenter and the split left them in. The freeform split's lone cone
@@ -837,7 +971,8 @@ pub(crate) struct HybridSwitches {
     /// "spheres", 1-triangle planes, freeform pieces) off the torus's one
     /// freeform region of 3 285, 6.9 % of the mesh against row 10's 1 %,
     /// and the row was faceted (3 503 triangles).
-    /// BREP_HYBRID_WHOLE_FREEFORM_STRAYS=1 (default off).
+    /// BREP_HYBRID_WHOLE_FREEFORM_STRAYS=0 restores the old path (promoted
+    /// ON 2026-11-04).
     pub(crate) whole_freeform_strays: bool,
     /// The first freeform split pass whose carriers' fits hold less than
     /// 19 in 20 of the region proposes once more with its cylinder fits of
@@ -880,6 +1015,167 @@ pub(crate) struct HybridSwitches {
     /// BREP_HYBRID_SPLIT_NOISE_BAR=0 restores the old path (promoted ON
     /// 2026-11-03).
     pub(crate) split_noise_bar: bool,
+    /// With [`HybridSwitches::split_noise_bar`]: a gathered dust region's
+    /// noise-bar ladder goes on to twelve and twenty-four bars. On census
+    /// record kernel_cylinder_s10_d0.1_jitter-1.0 the vertices lie up to the
+    /// record's chord bar off their faces, about 26 split bars, and at six
+    /// bars no fit held more than 43 of the 124 gathered triangles.
+    /// BREP_HYBRID_GATHER_WIDE_LADDER=0 restores the old path (promoted ON
+    /// 2026-11-04).
+    pub(crate) gather_wide_ladder: bool,
+    /// A cap plane counts as square to its cylinder's axis when the shift
+    /// its tilt makes around the rim (radius times the sine) stays within
+    /// the exact-topology bar, up to [`NOISY_CAP_TILT`], besides the fixed
+    /// sine of 0.01. On census record kernel_cylinder_s10_d0.1_jitter-1.0
+    /// the split's caps lie 0.018 off the wall's axis (a rim shift of 0.36
+    /// against a bar of 2.2) and the wall was demoted at both
+    /// (`plane_neighbour_edge`). BREP_HYBRID_NOISY_CAP_TILT=0 restores the
+    /// old path (promoted ON 2026-11-04).
+    pub(crate) noisy_cap_tilt: bool,
+    /// With [`HybridSwitches::gather_wide_ladder`]: after the split, on a
+    /// body read as jittered, the freeform walls it declined are split once
+    /// more, drawn on the wide ladder alone and with the dust touching them
+    /// gathered, at bars of the body's diagonal. On census record
+    /// kernel_frustum_s1_d0.1_jitter-1.0 the cone wall is one freeform region
+    /// and the caps chips; at six bars the passes proposed a cylinder and
+    /// two cones holding too little of it and the body stayed facets.
+    /// BREP_HYBRID_RETRY_JITTERED_WALLS=0 restores the old path (promoted ON
+    /// 2026-11-04).
+    pub(crate) retry_jittered_walls: bool,
+    /// With [`HybridSwitches::retry_jittered_walls`]: a gathered region the
+    /// retry declines gives the wall pieces beside it the triangles their
+    /// carriers hold at their bars (centroid too), which stay with them, and
+    /// is drawn once more, kept only as one carrier. On census record
+    /// occt_frustum_s10_d0.1_jitter-1.0 the dust gather joined the wall chips
+    /// that reach the rim with the caps', the caps were declined and the
+    /// chips left demoted the cone. BREP_HYBRID_RETRY_WALL_CHIPS=0 restores the
+    /// old path (promoted ON 2026-11-04).
+    pub(crate) retry_wall_chips: bool,
+    /// With [`HybridSwitches::retry_wall_chips`]: after the retry a region
+    /// under eight triangles it did not write joins a piece beside it that
+    /// it wrote when the piece's carrier holds every vertex and centroid of
+    /// it at the piece's bar, or at twice the bar when that piece alone
+    /// encloses it (an enclosed chip can be no face of its own). On census
+    /// record kernel_frustum_s10_d0.1_jitter-1.0 two cap chips and a plane
+    /// chip whose plane passes through the cone's apex were left as facets
+    /// and the builder failed its cone/plane chain ("exact cone/plane conic
+    /// is empty"). BREP_HYBRID_RETRY_CHIP_JOIN=0 restores the old path
+    /// (promoted ON 2026-11-04).
+    pub(crate) retry_chip_join: bool,
+    /// With [`HybridSwitches::retry_jittered_walls`]: a retried wall's
+    /// proposal of several carriers is the one of them that holds 19 in 20
+    /// of the wall alone within the assignment slack. The proposal ranks
+    /// cylinders before cones, so on census record
+    /// occt_pointed_cone_s10_d0.1_jitter-1.0 two false cylinders took 73 of
+    /// the cone's triangles and the builder demoted the wall (378 faceted).
+    /// BREP_HYBRID_RETRY_LONE_CARRIER=0 restores the old path (promoted ON
+    /// 2026-11-04).
+    pub(crate) retry_lone_carrier: bool,
+    /// Under [`HybridSwitches::absorb_revolve`]: a freeform fragment joins
+    /// an edge-adjacent revolve host twice its size (not eight times), by
+    /// the same vertex bar and facing gate. A freeform region has no carrier
+    /// that is evidence against the host. On census record
+    /// kernel_frustum_s1_d0.02_jitter-1.0 the wall is a cone of 190 and a
+    /// freeform sector of 42 beside it; left apart, the builder demoted the
+    /// cone ("cylinder arc chain crosses the chosen seam") and the wall was
+    /// faceted. BREP_HYBRID_ABSORB_FREEFORM_SECTOR=0 restores the old
+    /// path (promoted ON 2026-11-04).
+    pub(crate) absorb_freeform_sector: bool,
+    /// With [`HybridSwitches::retry_jittered_walls`]: the retry runs when
+    /// the first call left a region over its attempt budget, not only when
+    /// it declined one. On census record
+    /// occt_crossed_cylinders_s10_d0.02_jitter-1.0 the crossing walls are
+    /// one freeform region of 387 whose cone stage exhausted its 2 048
+    /// attempts; counted as over budget and not declined, it was never
+    /// drawn on the wide ladder and stayed facets.
+    /// BREP_HYBRID_RETRY_BUDGET_WALLS=0 restores the old path (promoted ON
+    /// 2026-11-04).
+    pub(crate) retry_budget_walls: bool,
+    /// With [`HybridSwitches::retry_jittered_walls`]: a retried wall's
+    /// plane/cylinder draw also takes a cylinder for each of its normal
+    /// bands, fitted from the triangles' centroids and normals and refitted
+    /// over what it holds. On census record
+    /// occt_crossed_cylinders_s10_d0.02_jitter-1.0 the recognizer's seeds
+    /// lie on the coarse wall's long strips and its fits held at most 63 of
+    /// 387 at 24 bars. BREP_HYBRID_BAND_CYLINDERS=0 restores the old path
+    /// (promoted ON 2026-11-04).
+    pub(crate) band_cylinders: bool,
+    /// With [`HybridSwitches::retry_jittered_walls`]: on the retry of a
+    /// jittered body the declined walls and the gathered regions that share
+    /// edges are joined into one region before the draw. On census record
+    /// occt_crossed_cylinders_s1_d0.05_jitter-1.0 the crossing is walls of
+    /// 107 and 125 and a gathered region of 304; no cylinder's normal band
+    /// reached 64 triangles of any one of them. Only as a second rebuild,
+    /// made when the first left facets and its retry had such a group, and
+    /// kept when it leaves none: joined on every jittered body, a frustum's
+    /// or pointed cone's wall took its gathered caps and five census rows
+    /// went to facets (occt_frustum_s1_d0.1_jitter-1.0 0 -> 420).
+    /// BREP_HYBRID_RETRY_JOIN_WALLS=0 restores the old path (promoted ON
+    /// 2026-11-04).
+    pub(crate) retry_join_walls: bool,
+    /// Set for the second rebuild [`HybridSwitches::retry_join_walls`]
+    /// makes (read from no variable): the retry joins the walls.
+    pub(crate) join_walls_pass: bool,
+    /// Two cylinders of one radius crossing on a coarse jittered body
+    /// (census records kernel_crossed_cylinders_s10_d0.1_jitter-1.0 and
+    /// -0.3: 17 % of the wall facets tilt past 60 degrees). In the split, on
+    /// a gathered region: a triangle tilted past the normal gate joins the
+    /// carrier that holds it within the bar and two of its three edge
+    /// neighbours; the region takes the declined walls beside it that its
+    /// carriers hold; islands go within two bars; carriers are refitted on
+    /// vertices alone; and the two cylinders are cut into their four faces
+    /// at the mesh edges on the section planes, which `join_wall_pieces`
+    /// then keeps apart. In the builder: a crossing chain takes the section
+    /// plane it is nearer, and a ring or ellipse walk may step back by what
+    /// the walls' deviation allows ([`noisy_parameter_walk`]).
+    /// On census record kernel_crossed_cylinders_s1_d0.1_jitter-1.0 the
+    /// draw fitted one of the four caps, each fanned from one rim vertex,
+    /// and a wall split earlier cut one arm in two. So, on a gathered
+    /// region again: each end of a cylinder carrier is given the plane of
+    /// the triangles no cylinder holds there, unless a drawn plane holds as
+    /// many; a piece already written on a second fit of one of the region's
+    /// cylinders is claimed; and a refit is taken within two bars. In the
+    /// builder a crossing chain's bar on its ellipse allows for its offset
+    /// from the section plane. The labelling of the strays at a tangent
+    /// point, when its search over singles and pairs ends with a stray cut
+    /// off, goes on with triples
+    /// (kernel_crossed_cylinders_s1_d0.05_jitter-1.0). A chain between two
+    /// planes that is not a line demotes the smaller plane to its facets,
+    /// and the triangles a section cut leaves in its gathered region join
+    /// the cut faces beside them (kernel_crossed_cylinders_s10_d0.05_jitter-1.0).
+    /// A gathered region's cap drawn as a plane whose vertices all lie on
+    /// one circle gives its wall, the cylinder on that circle; when such a
+    /// wall is chosen the caps are snapped square to their walls and each
+    /// triangle is owned by its centroid as well as its vertices
+    /// (occt_crossed_cylinders_s{10,1}_d0.1_jitter-1.0). In any other
+    /// gathered region, a triangle that two or more carriers hold by its
+    /// vertices goes to the one nearest its centroid as well, so a cap's
+    /// fan slivers stay on the cap
+    /// (kernel_pointed_cone_s10_d0.05_jitter-1.0,
+    /// kernel_stepped_shaft_s10_d0.1_jitter-1.0); when that one is a cone,
+    /// a holder whose normal agrees clearly better takes it
+    /// (kernel_pointed_cone_s10_d0.1_jitter-1.0). A cylinder across two
+    /// parallel cylinders of a gathered region is dropped, and a cylinder's
+    /// end caps are looked for among the triangles no cylinder parallel to
+    /// it holds (occt_stepped_shaft_s10_d0.1_jitter-1.0). A region the
+    /// normal bands decline climbs the wide noise-bar ladder
+    /// (kernel_sphere_s{1,10}_d0.1_jitter-1.0). The joined-wall rebuild is
+    /// kept when it leaves at most one in twenty of the facets
+    /// (occt_countersunk_hole_s10_d0.05_jitter-1.0).
+    /// BREP_HYBRID_NOISY_CROSSING=1 opts in.
+    pub(crate) noisy_crossing: bool,
+}
+
+/// [`HybridSwitches::noisy_cap_tilt`]: the largest sine a noisy cap may
+/// tilt off its cylinder's axis (two degrees).
+const NOISY_CAP_TILT: f64 = 0.035;
+
+/// Whether a plane of `normal` is square to `cylinder`'s axis: within a sine
+/// of 0.01, or, under [`HybridSwitches::noisy_cap_tilt`], within
+/// [`NOISY_CAP_TILT`] with the rim shift `radius * sine` within `tolerance`.
+fn square_to_axis(normal: Vec3, cylinder: CylinderCarrier, tolerance: f64, noisy: bool) -> bool {
+    let sine = normal.cross(cylinder.axis).length();
+    sine <= 0.01 || (noisy && sine <= NOISY_CAP_TILT && cylinder.radius * sine <= tolerance)
 }
 
 /// [`HybridSwitches::crease_walls`]: the largest non-cylinder region the
@@ -902,9 +1198,8 @@ impl HybridSwitches {
     }
 
     /// The switches the variables `lookup` returns select: a promoted row
-    /// is on unless its variable is exactly "0", an opt-in row
-    /// (`bore_strips`, `assemble_cone_bore`, `whole_freeform_strays`) only
-    /// when it is exactly "1".
+    /// is on unless its variable is exactly "0", an opt-in row only when it
+    /// is exactly "1" (`noisy_crossing`).
     fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Self {
         let promoted = |name: &str| lookup(name).as_deref() != Some("0");
         let opted_in = |name: &str| lookup(name).as_deref() == Some("1");
@@ -945,12 +1240,24 @@ impl HybridSwitches {
             revolve_ends_first: promoted("BREP_HYBRID_REVOLVE_ENDS_FIRST"),
             cone_seam_bar: promoted("BREP_HYBRID_CONE_SEAM_BAR"),
             join_split_runs: promoted("BREP_HYBRID_JOIN_SPLIT_RUNS"),
-            bore_strips: opted_in("BREP_HYBRID_BORE_STRIPS"),
+            bore_strips: promoted("BREP_HYBRID_BORE_STRIPS"),
             assemble_cone_bore: promoted("BREP_HYBRID_ASSEMBLE_CONE_BORE"),
-            whole_freeform_strays: opted_in("BREP_HYBRID_WHOLE_FREEFORM_STRAYS"),
+            whole_freeform_strays: promoted("BREP_HYBRID_WHOLE_FREEFORM_STRAYS"),
             split_merge_refit: promoted("BREP_HYBRID_SPLIT_MERGE_REFIT"),
             join_lone_freeform: promoted("BREP_HYBRID_JOIN_LONE_FREEFORM"),
             split_noise_bar: promoted("BREP_HYBRID_SPLIT_NOISE_BAR"),
+            gather_wide_ladder: promoted("BREP_HYBRID_GATHER_WIDE_LADDER"),
+            noisy_cap_tilt: promoted("BREP_HYBRID_NOISY_CAP_TILT"),
+            retry_jittered_walls: promoted("BREP_HYBRID_RETRY_JITTERED_WALLS"),
+            retry_wall_chips: promoted("BREP_HYBRID_RETRY_WALL_CHIPS"),
+            retry_chip_join: promoted("BREP_HYBRID_RETRY_CHIP_JOIN"),
+            retry_lone_carrier: promoted("BREP_HYBRID_RETRY_LONE_CARRIER"),
+            absorb_freeform_sector: promoted("BREP_HYBRID_ABSORB_FREEFORM_SECTOR"),
+            retry_budget_walls: promoted("BREP_HYBRID_RETRY_BUDGET_WALLS"),
+            band_cylinders: promoted("BREP_HYBRID_BAND_CYLINDERS"),
+            retry_join_walls: promoted("BREP_HYBRID_RETRY_JOIN_WALLS"),
+            join_walls_pass: false,
+            noisy_crossing: opted_in("BREP_HYBRID_NOISY_CROSSING"),
         }
     }
 }
@@ -967,18 +1274,18 @@ fn segment_for_hybrid_measured(
     options: &SegmentOptions,
     switches: HybridSwitches,
     forbid: &Forbidden,
-) -> Result<(MeshSegmentation, crate::hybrid_freeform_split::SplitReport, BTreeMap<u32, Vec<usize>>, Option<CutMesh>), String> {
+) -> Result<HybridSegmented, String> {
     let mut segmentation = segment_mesh_faces(positions, indices, options)?;
     crate::hybrid_recovery::recover(positions, indices, options, &mut segmentation);
     // Lane J row 7, promoted ON: a freeform region that holds several
     // carriers is split into them (crossing cylinder walls under vertex
     // noise). BREP_HYBRID_SPLIT_FREEFORM=0 restores the unsplit region.
-    let mut split = if split_freeform_enabled() {
+    let split_once = |segmentation: &mut MeshSegmentation, retry_walls: bool| {
         crate::hybrid_freeform_split::split(
             positions,
             indices,
             options,
-            &mut segmentation,
+            segmentation,
             switches.split_lone_cone,
             switches.split_cone_bore,
             switches.split_probe_crease,
@@ -987,7 +1294,31 @@ fn segment_for_hybrid_measured(
             switches.assemble_cone_bore,
             switches.split_merge_refit,
             switches.split_noise_bar,
+            switches.gather_wide_ladder,
+            retry_walls,
+            switches.retry_wall_chips,
+            switches.retry_chip_join,
+            switches.retry_lone_carrier,
+            switches.band_cylinders,
+            switches.join_walls_pass,
+            switches.noisy_crossing,
         )
+    };
+    let mut split = if split_freeform_enabled() {
+        let mut first = split_once(&mut segmentation, false);
+        // [`HybridSwitches::retry_jittered_walls`]: the walls the split
+        // declined, once more.
+        // [`HybridSwitches::retry_budget_walls`]: and the walls whose
+        // passes ran out of attempts.
+        let budget = switches.retry_budget_walls && first.budget_hit_regions > 0;
+        if switches.retry_jittered_walls && (first.declined_regions > 0 || budget) {
+            let retry = split_once(&mut segmentation, true);
+            first.noise = first.noise.max(retry.noise);
+            first.split_regions += retry.split_regions;
+            first.joinable_walls += retry.joinable_walls;
+            first.crossing_faces.extend(retry.crossing_faces);
+        }
+        first
     } else {
         Default::default()
     };
@@ -1063,6 +1394,7 @@ fn segment_for_hybrid_measured(
             &chord,
             &forbid.hosts,
             switches.absorb_share,
+            switches.absorb_freeform_sector,
         );
     }
     let cut = if switches.crease_cut {
@@ -1076,7 +1408,8 @@ fn segment_for_hybrid_measured(
         None
     };
     if switches.join_wall_pieces {
-        join_wall_pieces(&mut segmentation, cut.as_ref().map_or(indices, |cut| cut.indices.as_slice()), tolerance);
+        let (positions, indices) = cut.as_ref().map_or((positions, indices), |cut| (cut.positions.as_slice(), cut.indices.as_slice()));
+        join_wall_pieces(&mut segmentation, positions, indices, tolerance, &split.crossing_faces);
     }
     if switches.split_revolve_pieces {
         split_revolve_pieces(&mut segmentation, cut.as_ref().map_or(indices, |cut| cut.indices.as_slice()));
@@ -1096,6 +1429,7 @@ fn segment_for_hybrid_measured(
 /// The mesh [`HybridSwitches::crease_cut`] leaves: a cut triangle keeps its
 /// index for its first piece and appends the others, each naming its source
 /// triangle in `parent`.
+#[derive(Clone)]
 pub(crate) struct CutMesh {
     positions: Vec<f64>,
     indices: Vec<u32>,
@@ -1471,6 +1805,10 @@ fn revolve_carrier_distance(carrier: &RegionCarrier, p: Vec3) -> f64 {
 /// A vertex in `chord` ([`HybridSwitches::absorb_chord`]) takes no part in
 /// the vertex bar. Returns the triangles each host that took fragments ends
 /// up holding.
+/// [`HybridSwitches::absorb_freeform_sector`]: a freeform fragment joins a
+/// revolve host holding at least this many times its triangles.
+const FREEFORM_SECTOR_HOST_RATIO: usize = 2;
+
 fn absorb_revolve_fragments(
     segmentation: &mut MeshSegmentation,
     vertices: &[Vec3],
@@ -1482,6 +1820,7 @@ fn absorb_revolve_fragments(
     chord: &BTreeMap<u32, Vec<(u32, u32)>>,
     forbid: &BTreeSet<u32>,
     share: bool,
+    freeform_sector: bool,
 ) -> BTreeMap<u32, Vec<usize>> {
     let triangle_count = segmentation.triangle_region_ids.len();
     if indices.len() != triangle_count * 3 {
@@ -1533,7 +1872,12 @@ fn absorb_revolve_fragments(
                     continue;
                 }
                 let size = members.get(&host).map_or(0, Vec::len);
-                if size < 8 * triangles.len() {
+                // [`HybridSwitches::absorb_freeform_sector`]: a freeform
+                // fragment (no carrier of its own) joins a host twice its
+                // size.
+                let sector = freeform_sector
+                    && matches!(segmentation.regions.get(fragment as usize).map(|r| &r.carrier), Some(RegionCarrier::Freeform));
+                if size < if sector { FREEFORM_SECTOR_HOST_RATIO } else { 8 } * triangles.len() {
                     continue;
                 }
                 let bar = accepted_radial_bar(tolerance, region.max_deviation);
@@ -1689,11 +2033,55 @@ fn revolve_triangle_fit(
 /// [`HybridSwitches::join_wall_pieces`]: union edge-adjacent cylinder
 /// regions that are pieces of one wall into the largest of them (its
 /// carrier, the largest deviation, the summed area).
-fn join_wall_pieces(segmentation: &mut MeshSegmentation, indices: &[u32], tolerance: f64) {
+///
+/// Under [`HybridSwitches::noisy_crossing`] two pieces, one of them a face
+/// the split cut at a crossing (`crossing_faces`), on either side of
+/// another cylinder region crossing their wall (one radius within the
+/// bar, axes meeting within it) are two faces and are not joined: the
+/// union's walls meet only at the tangent points, where a coarse jittered
+/// body's pieces share edges (census record
+/// kernel_crossed_cylinders_s10_d0.1_jitter-1.0).
+fn join_wall_pieces(segmentation: &mut MeshSegmentation, positions: &[f64], indices: &[u32], tolerance: f64, crossing_faces: &BTreeSet<u32>) {
+    let crossing_sides = !crossing_faces.is_empty();
     let triangle_count = segmentation.triangle_region_ids.len();
     if indices.len() != triangle_count * 3 {
         return;
     }
+    let mut centroid_sum = HashMap::<u32, (Vec3, usize)>::new();
+    if crossing_sides {
+        for (t, corners) in indices.chunks_exact(3).enumerate() {
+            let p = |v: u32| Vec3::new(positions[3 * v as usize], positions[3 * v as usize + 1], positions[3 * v as usize + 2]);
+            let c = p(corners[0]).add(p(corners[1])).add(p(corners[2])).scale(1.0 / 3.0);
+            let entry = centroid_sum.entry(segmentation.triangle_region_ids[t]).or_insert((Vec3::new(0.0, 0.0, 0.0), 0));
+            entry.0 = entry.0.add(c);
+            entry.1 += 1;
+        }
+    }
+    let crossers: Vec<CylinderCarrier> = if crossing_sides {
+        segmentation.regions.iter().filter(|r| r.triangle_count > 0).filter_map(|r| carrier_cylinder(r, true).ok().flatten()).collect()
+    } else {
+        Vec::new()
+    };
+    let across = |first: CylinderCarrier, a: u32, b: u32| {
+        let (Some(&(sa, na)), Some(&(sb, nb))) = (centroid_sum.get(&a), centroid_sum.get(&b)) else { return false };
+        let (ca, cb) = (sa.scale(1.0 / na as f64), sb.scale(1.0 / nb as f64));
+        crossers.iter().any(|other| {
+            if first.axis.cross(other.axis).length() <= 0.1 || (first.radius - other.radius).abs() > tolerance {
+                return false;
+            }
+            let (a1, a2) = (first.axis, other.axis);
+            let w0 = first.origin.sub(other.origin);
+            let (bb, d, e) = (a1.dot(a2), a1.dot(w0), a2.dot(w0));
+            let denominator = 1.0 - bb * bb;
+            let p1 = first.origin.add(a1.scale((bb * e - d) / denominator));
+            let p2 = other.origin.add(a2.scale((e - bb * d) / denominator));
+            if p1.sub(p2).length() > tolerance {
+                return false;
+            }
+            let center = p1.add(p2).scale(0.5);
+            (ca.sub(center).dot(a1) >= 0.0) != (cb.sub(center).dot(a1) >= 0.0)
+        })
+    };
     let mut edges = HashMap::<(u32, u32), Vec<u32>>::new();
     for (t, corners) in indices.chunks_exact(3).enumerate() {
         for k in 0..3 {
@@ -1722,6 +2110,9 @@ fn join_wall_pieces(segmentation: &mut MeshSegmentation, indices: &[u32], tolera
     for (a, b) in pairs {
         let (Some(first), Some(second)) = (cylinder_of(a), cylinder_of(b)) else { continue };
         if !same_cylinder_wall(first, second, tolerance) {
+            continue;
+        }
+        if (crossing_faces.contains(&a) || crossing_faces.contains(&b)) && across(first, a, b) {
             continue;
         }
         let (ra, rb) = (root(&group, a), root(&group, b));
@@ -2337,7 +2728,7 @@ fn split_revolve_pieces(segmentation: &mut MeshSegmentation, indices: &[u32]) {
 
 /// The least-squares plane through `points`: their centroid and the
 /// smallest-variance direction of their covariance (Jacobi), unoriented.
-fn least_squares_plane(points: &[Vec3]) -> Option<(Vec3, Vec3)> {
+pub(crate) fn least_squares_plane(points: &[Vec3]) -> Option<(Vec3, Vec3)> {
     if points.is_empty() {
         return None;
     }
@@ -3026,6 +3417,40 @@ pub(crate) fn hybrid_plane_cylinder_brep_retry(
     switches: HybridSwitches,
     injected_failure: Option<u32>,
 ) -> Result<HybridBrepOutput, String> {
+    let best = hybrid_plane_cylinder_brep_retry_once(positions, indices, options, switches, injected_failure)?;
+    // [`HybridSwitches::retry_join_walls`]: a rebuild that left facets
+    // where the retry could join walls is made again with them joined, and
+    // that one is kept when it leaves none (kept whenever it left fewer by
+    // the builder's count, three kernel_crossed_cylinders rows wrote false
+    // plane strips and the census attribution read 40-45 more faceted
+    // triangles on each).
+    // Under `noisy_crossing` it is kept too when it leaves at most one in
+    // twenty of the facets: on census record
+    // occt_countersunk_hole_s10_d0.05_jitter-1.0 the first rebuild demotes
+    // the bore on a ten-triangle stray of the bottom cap, and the cone with
+    // it (306 faceted); the joined one leaves a two-triangle side wall (2).
+    if switches.retry_join_walls && !switches.join_walls_pass && best.stats.faceted_triangles > 0 && best.stats.split_joinable_walls > 0 {
+        let joined = HybridSwitches { join_walls_pass: true, ..switches };
+        if let Ok(output) = hybrid_plane_cylinder_brep_retry_once(positions, indices, options, joined, injected_failure) {
+            if std::env::var("BREP_DEBUG_HYBRID").is_ok() {
+                eprintln!("[hybrid] joined-wall rebuild: {} -> {} faceted", best.stats.faceted_triangles, output.stats.faceted_triangles);
+            }
+            if output.stats.faceted_triangles == 0 || (switches.noisy_crossing && output.stats.faceted_triangles * 20 <= best.stats.faceted_triangles) {
+                return Ok(output);
+            }
+        }
+    }
+    Ok(best)
+}
+
+/// One [`hybrid_plane_cylinder_brep_retry`] rebuild with `switches` as given.
+fn hybrid_plane_cylinder_brep_retry_once(
+    positions: &[f64],
+    indices: Option<&[u32]>,
+    options: &SegmentOptions,
+    switches: HybridSwitches,
+    injected_failure: Option<u32>,
+) -> Result<HybridBrepOutput, String> {
     let (mut best, mut demoted_hosts) =
         rebuild_with_forbidden_hosts(positions, indices, options, switches, injected_failure, &Forbidden::default())?;
     if !(switches.absorb_revolve && switches.absorb_retry) {
@@ -3089,7 +3514,25 @@ fn rebuild_with_forbidden_hosts(
     injected_failure: Option<u32>,
     forbid: &Forbidden,
 ) -> Result<(HybridBrepOutput, Forbidden), String> {
-    let mut rebuilt = hybrid_brep_with_forbidden_hosts(positions, indices, options, switches, injected_failure, forbid);
+    // The segmentation never reads [`HybridSwitches::cone_seam`] (only the
+    // builder's cone surfaces do), so the rebuild without the seam reuses it;
+    // on a segmentation with no cone region that rebuild is this one again
+    // and is skipped. Census record kernel_crossed_cylinders_s10_d0.05_jitter-1.0
+    // failed whole ("non-cylinder chain is not a line") and paid the split
+    // and build once more for the same failure (about 5 of its 23 s).
+    let indices_owned;
+    let index_buffer: &[u32] = match indices {
+        Some(value) => value,
+        None => {
+            indices_owned = (0..positions.len() as u32 / 3).collect::<Vec<_>>();
+            &indices_owned
+        }
+    };
+    let segmented = segment_for_hybrid_measured(positions, index_buffer, options, switches, forbid);
+    let has_cone = segmented
+        .as_ref()
+        .is_ok_and(|(segmentation, ..)| segmentation.regions.iter().any(|r| matches!(r.carrier, RegionCarrier::Cone { .. })));
+    let mut rebuilt = hybrid_brep_from_segmentation(positions, index_buffer, options, switches, injected_failure, segmented.clone());
     let without_seam = HybridSwitches { cone_seam: false, ..switches };
     let without_slivers = HybridSwitches { absorb_curved_slivers: false, ..without_seam };
     // [`HybridSwitches::split_noise_bar`]: a rebuild that still fails is
@@ -3101,14 +3544,27 @@ fn rebuild_with_forbidden_hosts(
     // faceted repair, 477 -> 496.
     let without_noise_bar = HybridSwitches { split_noise_bar: false, ..switches };
     let without_all = HybridSwitches { split_noise_bar: false, ..without_slivers };
-    for (fallback, applies) in [
-        (without_seam, switches.cone_seam),
-        (without_slivers, switches.absorb_curved_slivers),
-        (without_noise_bar, switches.split_noise_bar),
-        (without_all, switches.split_noise_bar && (switches.cone_seam || switches.absorb_curved_slivers)),
+    for (name, fallback, applies) in [
+        ("without the cone seam", without_seam, switches.cone_seam),
+        ("without curved slivers", without_slivers, switches.absorb_curved_slivers),
+        ("without the noise bar", without_noise_bar, switches.split_noise_bar),
+        ("without all three", without_all, switches.split_noise_bar && (switches.cone_seam || switches.absorb_curved_slivers)),
     ] {
         if rebuilt.is_err() && applies {
-            rebuilt = hybrid_brep_with_forbidden_hosts(positions, indices, options, fallback, injected_failure, forbid);
+            let seam_only = name == "without the cone seam";
+            if std::env::var("BREP_DEBUG_HYBRID").is_ok() {
+                if let Err(message) = &rebuilt {
+                    let skipped = if seam_only && !has_cone { " (no cone: skipped)" } else { "" };
+                    eprintln!("[hybrid] rebuild failed whole ({message}); again {name}{skipped}");
+                }
+            }
+            rebuilt = if !seam_only {
+                hybrid_brep_with_forbidden_hosts(positions, indices, options, fallback, injected_failure, forbid)
+            } else if has_cone {
+                hybrid_brep_from_segmentation(positions, index_buffer, options, fallback, injected_failure, segmented.clone())
+            } else {
+                continue;
+            };
         }
     }
     // [`HybridSwitches::gather_cone_strips`]: a rebuild that gathered a cone
@@ -3134,6 +3590,9 @@ fn rebuild_with_forbidden_hosts(
                 .any(|demotion| demotion.message.as_deref().is_some_and(|m| m.contains("exact curves disagree")))
         });
         if blamed {
+            if std::env::var("BREP_DEBUG_HYBRID").is_ok() {
+                eprintln!("[hybrid] rebuild again without revolve ends first");
+            }
             let without = HybridSwitches { revolve_ends_first: false, ..switches };
             let plain = rebuild_with_forbidden_hosts(positions, indices, options, without, injected_failure, forbid);
             rebuilt = match (rebuilt, plain) {
@@ -3149,6 +3608,9 @@ fn rebuild_with_forbidden_hosts(
         .as_ref()
         .map_or(true, |(output, _)| output.stats.gathered_cone_runs > 0 && output.stats.faceted_triangles > 0);
     if switches.gather_cone_strips && gathered {
+        if std::env::var("BREP_DEBUG_HYBRID").is_ok() {
+            eprintln!("[hybrid] rebuild again without the cone-strip gather");
+        }
         let without = HybridSwitches { gather_cone_strips: false, ..switches };
         let plain = rebuild_with_forbidden_hosts(positions, indices, options, without, injected_failure, forbid);
         rebuilt = match (rebuilt, plain) {
@@ -3172,10 +3634,9 @@ fn hybrid_brep_with_forbidden_hosts(
     indices: Option<&[u32]>,
     options: &SegmentOptions,
     switches: HybridSwitches,
-    mut injected_failure: Option<u32>,
+    injected_failure: Option<u32>,
     forbid: &Forbidden,
 ) -> Result<(HybridBrepOutput, Forbidden), String> {
-    // The segmentation does not depend on the demotions; run it once.
     let owned_indices;
     let index_buffer: &[u32] = match indices {
         Some(value) => value,
@@ -3184,8 +3645,26 @@ fn hybrid_brep_with_forbidden_hosts(
             &owned_indices
         }
     };
-    let (mut segmentation, split, absorbed, cut) =
-        segment_for_hybrid_measured(positions, index_buffer, options, switches, forbid)?;
+    let segmented = segment_for_hybrid_measured(positions, index_buffer, options, switches, forbid);
+    hybrid_brep_from_segmentation(positions, index_buffer, options, switches, injected_failure, segmented)
+}
+
+
+/// What [`segment_for_hybrid_measured`] returns.
+type HybridSegmented =
+    (MeshSegmentation, crate::hybrid_freeform_split::SplitReport, BTreeMap<u32, Vec<usize>>, Option<CutMesh>);
+
+/// [`hybrid_brep_with_forbidden_hosts`] on a segmentation already made.
+fn hybrid_brep_from_segmentation(
+    positions: &[f64],
+    index_buffer: &[u32],
+    options: &SegmentOptions,
+    switches: HybridSwitches,
+    mut injected_failure: Option<u32>,
+    segmented: Result<HybridSegmented, String>,
+) -> Result<(HybridBrepOutput, Forbidden), String> {
+    // The segmentation does not depend on the demotions; run it once.
+    let (mut segmentation, split, absorbed, cut) = segmented?;
     // [`HybridSwitches::crease_cut`]: build on the cut mesh.
     let (positions, index_buffer, parent) = match &cut {
         Some(cut) => (cut.positions.as_slice(), cut.indices.as_slice(), Some(cut.parent.as_slice())),
@@ -3199,6 +3678,7 @@ fn hybrid_brep_with_forbidden_hosts(
         output.stats.split_over_budget_regions = split.over_budget_regions;
         output.stats.split_budget_hit_regions = split.budget_hit_regions;
         output.stats.split_band_declined_regions = split.band_declined_regions;
+        output.stats.split_joinable_walls = split.joinable_walls;
         output.stats.gathered_cone_runs = split.gathered_cone_runs;
         output
     };
@@ -3535,6 +4015,7 @@ fn hybrid_plane_cylinder_brep_once(
         &chains,
         &vertices,
         tolerance,
+        switches.noisy_cap_tilt,
     )
     .map_err(|(region, message)| HybridBuildFailure::Region {
         original: local_to_original[&region],
@@ -3758,6 +4239,25 @@ fn hybrid_plane_cylinder_brep_once(
         ) {
             Ok(built) => built,
             Err(message) => {
+                // [`HybridSwitches::noisy_crossing`]: a chain between two
+                // planes that is not a line demotes the smaller plane to its
+                // facets instead of failing the whole body: two dust pieces
+                // of a jittered crossing wall read as planes and shared a
+                // bent chain (census record
+                // kernel_crossed_cylinders_s10_d0.05_jitter-1.0).
+                // A facet component made from a plane demoted before has no
+                // original region and is never demoted again.
+                let bent_planes = (switches.noisy_crossing
+                    && planes.contains_key(&chain.adjacent.0)
+                    && planes.contains_key(&chain.adjacent.1))
+                .then(|| {
+                    let size = |region: u32| local.triangle_regions.iter().filter(|&&r| r == region).count();
+                    [chain.adjacent.0, chain.adjacent.1]
+                        .into_iter()
+                        .filter(|region| local_to_original.contains_key(region))
+                        .min_by_key(|&region| (size(region), region))
+                })
+                .flatten();
                 let local = [chain.adjacent.0, chain.adjacent.1]
                     .into_iter()
                     .find(|region| spheres.contains_key(region) || tori.contains_key(region))
@@ -3789,12 +4289,26 @@ fn hybrid_plane_cylinder_brep_once(
                         })
                         .map(|region| (region, DemotionCause::ChainEdgeVertexPlacer))
                 });
+                let local = local.or_else(|| bent_planes.map(|region| (region, DemotionCause::PlaneNeighbourEdge)));
                 if let Some((local, cause)) = local {
                     return Err(HybridBuildFailure::Region {
                         original: local_to_original[&local],
                         message,
                         cause,
                     });
+                }
+                if std::env::var("BREP_DEBUG_HYBRID").is_ok() {
+                    let describe = |region: u32| {
+                        let kind = if planes.contains_key(&region) { "plane" } else { "unresolved" };
+                        format!("{region} {kind} (original {})", local_to_original.get(&region).copied().unwrap_or(u32::MAX))
+                    };
+                    eprintln!(
+                        "[hybrid] chain {chain_index} fails whole: {} / {}, {} points, closed={}",
+                        describe(chain.adjacent.0),
+                        describe(chain.adjacent.1),
+                        chain.vertices.len(),
+                        chain.closed
+                    );
                 }
                 return Err(HybridBuildFailure::Global(message));
             }
@@ -4094,6 +4608,7 @@ fn carrier_cylinder(region: &MeshRegion, pair_section_bar: bool) -> Result<Optio
         sense,
         deviation: region.max_deviation.max(0.0),
         pair_section_bar,
+        noisy_crossing: false,
     }))
 }
 
@@ -4442,6 +4957,16 @@ fn cylinder_pair_section_normal(
         return None;
     }
     let plane_bar = cylinder_pair_section_bar(first, second, tolerance);
+    if first.noisy_crossing || second.noisy_crossing {
+        // [`HybridSwitches::noisy_crossing`]: at a noise bar both planes can
+        // hold a whole chain (census record
+        // kernel_crossed_cylinders_s10_d0.1_jitter-1.0: a plane bar of 19.9
+        // on walls of radius 10); the chain's plane is the one it is nearer.
+        let worst = |normal: Vec3| points.iter().map(|point| point.sub(center).dot(normal).abs()).fold(0.0_f64, f64::max);
+        let (w0, w1) = (worst(normals[0]), worst(normals[1]));
+        let (normal, w) = if w0 <= w1 { (normals[0], w0) } else { (normals[1], w1) };
+        return (w <= plane_bar).then_some((center, normal));
+    }
     normals
         .into_iter()
         .find(|normal| {
@@ -4456,11 +4981,11 @@ fn cylinder_pair_section_normal(
 /// cylinder's axis within 0.01 and within the radial bar of the wall about
 /// the axis squared to that plane (through the same origin), as
 /// `snap_cylinder_axes` leaves it.
-fn cap_ring_supported(cylinder: CylinderCarrier, plane: PlaneInfo, a: Vec3, b: Vec3, tolerance: f64) -> bool {
+fn cap_ring_supported(cylinder: CylinderCarrier, plane: PlaneInfo, a: Vec3, b: Vec3, tolerance: f64, noisy: bool) -> bool {
     let Ok(normal) = plane.normal.normalized() else {
         return false;
     };
-    if normal.cross(cylinder.axis).length() > 0.01 {
+    if !square_to_axis(normal, cylinder, tolerance, noisy) {
         return false;
     }
     let snapped = CylinderCarrier {
@@ -4480,6 +5005,7 @@ fn cylinder_plane_edge_supported(
     a: Vec3,
     b: Vec3,
     tolerance: f64,
+    noisy: bool,
 ) -> bool {
     let Ok(normal) = plane.normal.normalized() else {
         return false;
@@ -4505,7 +5031,7 @@ fn cylinder_plane_edge_supported(
     let on_ring = (station(cylinder, a) - station(cylinder, b)).abs() <= tolerance * 4.0;
     // A constant-station circle lies in the neighboring plane only when that
     // plane is perpendicular to the cylinder axis.
-    on_ring && normal.cross(cylinder.axis).length() <= 0.01
+    on_ring && square_to_axis(normal, cylinder, tolerance, noisy)
 }
 
 fn cone_station(cone: ConeCarrier, point: Vec3) -> f64 {
@@ -4706,7 +5232,7 @@ fn local_regions(
             original_planes.insert(region.id, PlaneInfo { origin, normal });
         }
         if let Some(cylinder) = carrier_cylinder(region, switches.pair_section_bar)? {
-            original_cylinders.insert(region.id, cylinder);
+            original_cylinders.insert(region.id, CylinderCarrier { noisy_crossing: switches.noisy_crossing, ..cylinder });
             if !forced_demotions.contains_key(&region.id) {
                 retained.insert(region.id);
             }
@@ -4979,10 +5505,10 @@ fn local_regions(
                 if let Some((plane, cause)) = neighbor_plane {
                     let supported = match own {
                         Revolve::Cylinder(cylinder) => {
-                            cylinder_plane_edge_supported(cylinder, plane, vertices[a], vertices[b], tolerance)
+                            cylinder_plane_edge_supported(cylinder, plane, vertices[a], vertices[b], tolerance, switches.noisy_cap_tilt)
                                 || (cause == DemotionCause::PlaneNeighbourEdge
                                     && closed_pairs.contains(&(candidate.min(neighbor), candidate.max(neighbor)))
-                                    && cap_ring_supported(cylinder, plane, vertices[a], vertices[b], tolerance))
+                                    && cap_ring_supported(cylinder, plane, vertices[a], vertices[b], tolerance, switches.noisy_cap_tilt))
                         }
                         Revolve::Cone(cone) => cone_plane_edge_supported(
                             cone,
@@ -5109,6 +5635,9 @@ fn local_regions(
     let mut next = 0_u32;
     for region in regions {
         match region.carrier {
+            // [`HybridSwitches::noisy_crossing`]: a plane the builder
+            // demoted (a bent chain with another plane) goes to its facets.
+            RegionCarrier::Plane { .. } if switches.noisy_crossing && forced_demotions.contains_key(&region.id) => {}
             RegionCarrier::Plane { origin, normal } => {
                 original_to_local.insert(region.id, next);
                 local_to_original.insert(next, region.id);
@@ -5307,6 +5836,7 @@ fn local_regions(
         split_over_budget_regions: 0,
         split_budget_hit_regions: 0,
         split_band_declined_regions: 0,
+        split_joinable_walls: 0,
         gathered_cone_runs: 0,
         moved_line_ends: 0,
         whole_carrier_scan: Default::default(),
@@ -5888,6 +6418,7 @@ fn snap_cylinder_axes(
     chains: &[Chain],
     vertices: &[Vec3],
     tolerance: f64,
+    noisy: bool,
 ) -> Result<(), (u32, String)> {
     let mut snapped = HashMap::<u32, Vec<Vec3>>::new();
     for (&region, cylinder) in cylinders.iter() {
@@ -5903,7 +6434,7 @@ fn snap_cylinder_axes(
             let Some(plane) = planes.get(&neighbor) else {
                 continue;
             };
-            if plane.normal.cross(cylinder.axis).length() > 0.01 {
+            if !square_to_axis(plane.normal, *cylinder, tolerance, noisy) {
                 continue;
             }
             let points = chain_points(chain, vertices);
@@ -7466,7 +7997,14 @@ fn cylinder_pair_section_edge(
             angles[index] += TAU;
         }
     }
-    if !monotone_parameter_walk(&angles, 1.0e-5) {
+    // [`HybridSwitches::noisy_crossing`]: see [`noisy_parameter_walk`].
+    let walks = if first.carrier.noisy_crossing || second.carrier.noisy_crossing {
+        let backstep = 2.0 * accepted_radial_bar(0.0, first.carrier.deviation.max(second.carrier.deviation)) / radius;
+        noisy_parameter_walk(&angles, 1.0e-5, backstep)
+    } else {
+        monotone_parameter_walk(&angles, 1.0e-5)
+    };
+    if !walks {
         return Err(format!(
             "hybrid BREP: cylinder/cylinder chain {chain_index} backtracks along its ellipse"
         ));
@@ -7499,10 +8037,26 @@ fn cylinder_pair_section_edge(
         .collect::<Vec<_>>();
     let curve = NurbsCurve::new(unit.degree, unit.knots.clone(), controls)?;
     let domain = curve.domain()?;
-    let bar = accepted_radial_bar(
-        tolerance,
-        first.carrier.deviation.max(second.carrier.deviation),
-    );
+    let deviation = first.carrier.deviation.max(second.carrier.deviation);
+    let bar = accepted_radial_bar(tolerance, deviation);
+    // [`HybridSwitches::noisy_crossing`]: a source point within the walls'
+    // deviation of a wall and `off` of the section plane lies within
+    // (deviation + off) / |n . a| of their ellipse, n the plane's normal
+    // and a the wall's axis (the sine of the least angle the plane meets
+    // the wall at; sqrt 2 for square axes). Twice the deviation is under
+    // that where the chain sits off its plane (census record
+    // kernel_crossed_cylinders_s1_d0.1_jitter-1.0: 0.188 against 0.183).
+    let bar = if first.carrier.noisy_crossing || second.carrier.noisy_crossing {
+        let off = points.iter().map(|point| point.sub(center).dot(normal).abs()).fold(0.0_f64, f64::max);
+        let meets = normal.dot(first.carrier.axis.normalized()?).abs().min(normal.dot(second.carrier.axis.normalized()?).abs());
+        if meets > 1.0e-6 {
+            bar.max((deviation + off) / meets)
+        } else {
+            bar
+        }
+    } else {
+        bar
+    };
     for &point in points {
         let distance = project_point_to_curve(&curve, point)?.distance;
         if distance > bar {
@@ -7641,6 +8195,19 @@ fn unwrap(values: &mut [f64]) {
             values[index] += 1.0;
         }
     }
+}
+
+/// [`monotone_parameter_walk`] on a noisy wall: the walk still has to get
+/// somewhere (net progress past `tolerance`), and a step may run back by
+/// `backstep`, what two neighbouring vertices each displaced along the
+/// curve by the wall's radial bar can swap.
+fn noisy_parameter_walk(values: &[f64], tolerance: f64, backstep: f64) -> bool {
+    let net = values.last().unwrap() - values[0];
+    if net.abs() <= tolerance {
+        return false;
+    }
+    let backstep = backstep.max(tolerance);
+    values.windows(2).all(|pair| (pair[1] - pair[0]) * net.signum() >= -backstep)
 }
 
 fn monotone_parameter_walk(values: &[f64], tolerance: f64) -> bool {
@@ -7963,6 +8530,17 @@ fn build_chain_edge(
         for (uv, u) in coordinates.iter_mut().zip(&us) {
             uv[0] = *u;
         }
+        // [`HybridSwitches::noisy_crossing`]: see [`noisy_parameter_walk`].
+        let walk_slack = match info {
+            RevolveInfoRef::Cylinder(cylinder) if cylinder.carrier.noisy_crossing => {
+                Some(2.0 * accepted_radial_bar(0.0, cylinder.carrier.deviation) / (TAU * cylinder.carrier.radius))
+            }
+            _ => None,
+        };
+        let walks = |us: &[f64]| match walk_slack {
+            Some(backstep) => noisy_parameter_walk(us, 1.0e-5, backstep),
+            None => monotone_parameter_walk(us, 1.0e-5),
+        };
         let tilted_plane = match info {
             RevolveInfoRef::Sphere(sphere) if chain.closed && station_spread > tolerance => {
                 [chain.adjacent.0, chain.adjacent.1]
@@ -8002,13 +8580,13 @@ fn build_chain_edge(
             if station_error > tolerance
                 || radius_error > info.radial_bar(tolerance)
                 || (sweep.abs() - 1.0).abs() > 0.02
-                || !monotone_parameter_walk(&ring_us, 1.0e-5)
+                || !walks(&ring_us)
             {
                 return Err(format!(
                     "hybrid BREP: closed chain {chain_index} (region {region}, adjacent {:?}) is not a revolve ring: station spread {station_spread:.3e}, radial error {radius_error:.3e} (bar {:.3e}), sweep {sweep:.6}, monotone {}",
                     chain.adjacent,
                     info.radial_bar(tolerance),
-                    monotone_parameter_walk(&ring_us, 1.0e-5)
+                    walks(&ring_us)
                 ));
             }
             let v = coordinates.iter().map(|uv| uv[1]).sum::<f64>() / coordinates.len() as f64;
@@ -8025,7 +8603,7 @@ fn build_chain_edge(
                 }),
             )
         } else if station_error <= tolerance && radius_error <= info.radial_bar(tolerance) {
-            if !monotone_parameter_walk(&us, 1.0e-5) {
+            if !walks(&us) {
                 return Err(format!(
                     "hybrid BREP: cylinder arc chain {chain_index} backtracks"
                 ));
@@ -8204,9 +8782,13 @@ fn build_chain_edge(
             let branches = intersect_analytic_pair(&plane_surface, &cone.surface, tolerance)
                 .filter(|branches| !branches.is_empty())
                 .unwrap_or_else(|| {
-                    exact_local_cone_plane_conic(cone, *plane, &points, tolerance)
-                        .into_iter()
-                        .collect()
+                    let local = exact_local_cone_plane_conic(cone, *plane, &points, tolerance);
+                    if let Err(why) = &local {
+                        if std::env::var("BREP_DEBUG_HYBRID").is_ok() {
+                            eprintln!("[hybrid] cone/plane chain {chain_index}: no exact section; local conic: {why}; {} points", points.len());
+                        }
+                    }
+                    local.into_iter().collect()
                 });
             let mut candidates = branches
                 .into_iter()

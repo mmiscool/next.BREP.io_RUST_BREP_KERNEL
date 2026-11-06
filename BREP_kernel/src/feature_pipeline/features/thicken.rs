@@ -9,6 +9,15 @@
 //!   side of the band.
 //! - `inputParams.distance` — the signed thickness along the face normal; NaN / 0
 //!   is a soft no-op.
+//! - A committed SKETCH is picked as `{sketch}:FACE` — its render-side display
+//!   sheet, a name the kernel run never materializes (see
+//!   `SKETCH_REFERENCE_ALIASES`). A selection that resolves to no resident face
+//!   but to a sketch PROFILE (bare id, `:FACE` or `:PROFILE` spelling) thickens
+//!   that profile: every region's planar sheet grown along the sketch normal is
+//!   exactly the one-sided prism of its outer loop minus its holes, built by the
+//!   extrude kernel, the regions unioned into one solid. The sketch is consumed
+//!   (its display dropped) as extrude consumes it, unless
+//!   `consumeProfileSketch: false`.
 //!
 //! Kernel path: the dedicated §5.9 sheet thickener
 //! [`crate::thicken_trimmed_sheet`], fed the face's actual trim loops (the offset
@@ -51,10 +60,16 @@ pub fn execute(ctx: &FeatureContext) -> FeatureResult {
 
     let selections = common::unique_reference_names(ctx.param("face"));
     // Resolve BY NAME; a miss is a structured `unresolved` entry (rule 1), skipped.
-    let mut faces: Vec<(String, crate::feature_pipeline::FaceRef)> = Vec::new();
+    // A resident face wins; a name that is no face but a sketch profile (the
+    // `{sketch}:FACE` display pick) thickens the profile's planar regions.
+    let mut faces: Vec<(String, Source)> = Vec::new();
     for name in &selections {
-        match ctx.scene.resolve_face(name) {
-            Some(face) => faces.push((name.clone(), face)),
+        if let Some(face) = ctx.scene.resolve_face(name) {
+            faces.push((name.clone(), Source::Face(face)));
+            continue;
+        }
+        match ctx.scene.resolve_profile_named(name) {
+            Some((base, profile)) => faces.push((name.clone(), Source::Profile(base.to_string(), profile))),
             None => result.unresolved.push(name.clone()),
         }
     }
@@ -89,8 +104,15 @@ pub fn execute(ctx: &FeatureContext) -> FeatureResult {
         } else {
             feature_id.clone()
         };
-        match thicken_face(face.handle, face.face_id, distance) {
+        let built = match face {
+            Source::Face(face) => thicken_face(face.handle, face.face_id, distance),
+            Source::Profile(_, profile) => thicken_profile(profile, distance, &ctx.id).map(|solid| vec![solid]),
+        };
+        match built {
             Ok(bodies) => {
+                if let Source::Profile(base, _) = face {
+                    common::consume_sketch(ctx, base, &mut result);
+                }
                 // ONE face can thicken into more than one body: a fold BAND
                 // across its trim is dropped and the regular piece on either
                 // side of the band is its own slab, sharing no edge with the
@@ -139,6 +161,53 @@ pub fn execute(ctx: &FeatureContext) -> FeatureResult {
         };
     }
     result
+}
+
+/// One resolved selection: a resident solid face, or a sketch profile (by its
+/// canonical base name) picked through the sketch's display sheet.
+enum Source<'a> {
+    Face(crate::feature_pipeline::FaceRef),
+    Profile(String, &'a crate::feature_pipeline::SketchProfile),
+}
+
+/// Thicken a sketch PROFILE: its planar regions grown `distance` along the
+/// sketch normal (`z_axis`, the display sheet's normal). For a plane the slab
+/// between the sheet and its offset IS the one-sided prism, so each region is
+/// its outer loop extruded with its holes cut as through prisms — the extrude
+/// feature's straight path with no back distance — and the regions are unioned.
+fn thicken_profile(
+    profile: &crate::feature_pipeline::SketchProfile,
+    distance: f64,
+    id: &str,
+) -> Result<BrepSolid, crate::KernelRefusal> {
+    use crate::OrRefuse;
+    let direction = profile.z_axis;
+    let mut region_solids = Vec::with_capacity(profile.regions.len());
+    for region in &profile.regions {
+        let outer = region
+            .first()
+            .ok_or_else(|| "thicken: sketch profile region has no outer loop".to_string())
+            .or_refuse(crate::KernelStage::Collect, "thicken_profile_outer")?;
+        let mut solid = crate::extrude_profile_brep(&outer.curves, direction, distance)?;
+        for (loop_index, hole) in region.iter().enumerate().skip(1) {
+            solid = common::subtract_hole_prism(
+                "thicken",
+                solid,
+                &hole.curves,
+                direction,
+                distance,
+                id,
+                &common::hole_key(hole, loop_index),
+            )
+            .or_refuse(crate::KernelStage::Sew, "thicken_profile_hole")?;
+        }
+        region_solids.push(solid);
+    }
+    if region_solids.is_empty() {
+        return Err("thicken: sketch profile has no closed region".to_string())
+            .or_refuse(crate::KernelStage::Collect, "thicken_profile_empty");
+    }
+    common::union_region_solids(region_solids).or_refuse(crate::KernelStage::Sew, "thicken_profile_union")
 }
 
 /// Token sanitization: disallowed characters collapse to

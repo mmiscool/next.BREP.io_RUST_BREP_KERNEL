@@ -15,7 +15,7 @@ use std::collections::HashMap;
 pub struct WorkbenchToolbarOutcome {
     /// A feature button click — the feature TYPE CODE to add (`"E"`, `"ACOMP"`).
     pub feature: Option<String>,
-    /// A constraint button click — the constraint type id to add (`"fixed"`).
+    /// A constraint button click — the constraint type id to add (`"parallel"`).
     pub constraint: Option<String>,
     /// An annotation button click — the PMI annotation type to add (`"linear"`).
     pub annotation: Option<String>,

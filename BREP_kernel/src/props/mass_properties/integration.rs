@@ -222,14 +222,95 @@ pub(super) fn integrate_cell_scaled(
     // own weights ask for (`rule`); a polynomial one keeps ONE base-order
     // block over the whole cell.
     let (u_panels, v_panels) = rules.panels(&face.surface, cell)?;
+    let area_slot = if area_adaptive_on() {
+        kinds.iter().position(|kind| matches!(kind, Integrand::Area))
+    } else {
+        None
+    };
+    let before = area_slot.map(|slot| totals[slot]);
     let mut stations = 0;
     for u_panel in &u_panels {
         for v_panel in &v_panels {
-            integrate_block(face, *u_panel, *v_panel, scale, kinds, totals)?;
+            integrate_block(face, *u_panel, *v_panel, scale, kinds, totals, rules.station_identity)?;
             stations += u_panel.order * v_panel.order;
         }
     }
+    if let (Some(slot), Some(before)) = (area_slot, before) {
+        // The area integrand |S_u × S_v| is a square root: no fixed-order
+        // rule reads it exactly, polynomial carrier or not, so the cell's
+        // AREA alone is re-read adaptively and every other integrand keeps
+        // the reading above bit for bit.
+        let coarse = (totals[slot] - before) / scale;
+        totals[slot] = before + scale * adaptive_cell_area(face, cell, coarse, rules, AREA_ADAPTIVE_DEPTH, &mut stations)?;
+    }
     Ok(stations)
+}
+
+/// `BREP_MASS_AREA_ADAPTIVE` (default on) re-reads each cell's AREA by quadrant
+/// refinement until a cell and its four quadrants agree to
+/// [`AREA_ADAPTIVE_TOLERANCE`] of the cell's own area. Default ON since the
+/// 2026-11-05 promotion (owner: accuracy beats speed); `=0` restores one
+/// fixed-rule reading per cell for every integrand.
+///
+/// brep-bench 2026-11-05: one 8-point block per knot cell read the degree-15
+/// Bézier dome's patch (`geometry/high-degree-bezier-dome`) 2.3e-5 small and
+/// the twisted sweep's degree 1×3 blade faces (`loft/twisted-thin-blade`)
+/// 1.7e-5 large, while their volumes were exact to round-off; refined, they
+/// read 1.6e-9 and 1.4e-7 of the closed forms.
+pub(super) fn area_adaptive_on() -> bool {
+    switch!("BREP_MASS_AREA_ADAPTIVE", true)
+}
+
+/// How many times a cell may be quartered while its area is re-read.
+const AREA_ADAPTIVE_DEPTH: usize = 6;
+
+/// Relative agreement between a cell's area and the sum of its quadrants'
+/// that ends the refinement: a few hundred ulps of the cell's own area.
+const AREA_ADAPTIVE_TOLERANCE: f64 = 1e-11;
+
+/// The area over `cell` (unscaled), given the reading `coarse` of the whole
+/// cell: the four quadrants are read on their own panels, and any quadrant
+/// whose own refinement still moves is quartered again, to `depth` levels.
+fn adaptive_cell_area(
+    face: &FaceRecord,
+    cell: [f64; 4],
+    coarse: f64,
+    rules: &mut rule::SurfaceRules,
+    depth: usize,
+    stations: &mut usize,
+) -> Result<f64, String> {
+    if depth == 0 {
+        return Ok(coarse);
+    }
+    let [u_lo, u_hi, v_lo, v_hi] = cell;
+    let (u_mid, v_mid) = (0.5 * (u_lo + u_hi), 0.5 * (v_lo + v_hi));
+    let quadrants = [
+        [u_lo, u_mid, v_lo, v_mid],
+        [u_mid, u_hi, v_lo, v_mid],
+        [u_lo, u_mid, v_mid, v_hi],
+        [u_mid, u_hi, v_mid, v_hi],
+    ];
+    let mut readings = [0.0f64; 4];
+    for (index, quadrant) in quadrants.iter().enumerate() {
+        let (u_panels, v_panels) = rules.panels(&face.surface, *quadrant)?;
+        let mut area = [0.0f64];
+        for u_panel in &u_panels {
+            for v_panel in &v_panels {
+                integrate_block(face, *u_panel, *v_panel, 1.0, &[Integrand::Area], &mut area, rules.station_identity)?;
+                *stations += u_panel.order * v_panel.order;
+            }
+        }
+        readings[index] = area[0];
+    }
+    let fine: f64 = readings.iter().sum();
+    if (fine - coarse).abs() <= AREA_ADAPTIVE_TOLERANCE * fine.abs() {
+        return Ok(fine);
+    }
+    let mut total = 0.0;
+    for (index, quadrant) in quadrants.iter().enumerate() {
+        total += adaptive_cell_area(face, *quadrant, readings[index], rules, depth - 1, stations)?;
+    }
+    Ok(total)
 }
 
 /// One tensor Gauss block: every station of `u_panel × v_panel`, every kind.
@@ -240,6 +321,7 @@ fn integrate_block(
     scale: f64,
     kinds: &[Integrand],
     totals: &mut [f64],
+    station_identity: Option<[u64; 2]>,
 ) -> Result<(), String> {
     let half_u = (u_panel.hi - u_panel.lo) * 0.5;
     let middle_u = (u_panel.hi + u_panel.lo) * 0.5;
@@ -261,9 +343,7 @@ fn integrate_block(
             u_stations[index] = middle_u + half_u * GAUSS_X[index];
             v_stations[index] = middle_v + half_v * GAUSS_X[index];
         }
-        return face
-            .surface
-            .deriv1_tensor_each(&u_stations, &v_stations, |i, j, point, su, sv| {
+        return super::cell_memo::each(&face.surface, station_identity, &u_stations, &v_stations, |i, j, point, su, sv| {
                 let weighted_normal = su.cross(sv).scale(sign);
                 for (slot, kind) in kinds.iter().enumerate() {
                     totals[slot] += scale
@@ -304,7 +384,8 @@ fn integrate_block(
         for index in 0..v_x.len() {
             v_stations[index] = middle_v + half_v * v_x[index];
         }
-        return face.surface.deriv1_tensor_each(
+        return super::cell_memo::each(
+            &face.surface, station_identity,
             &u_stations[..u_x.len()],
             &v_stations[..v_x.len()],
             |i, j, point, su, sv| {

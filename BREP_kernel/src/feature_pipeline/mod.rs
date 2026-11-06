@@ -1005,17 +1005,19 @@ impl SceneMap {
         }
     }
 
-    /// Resolve a profile reference name to the sketch profile it names. Tries the
-    /// exact name first, then the name with a trailing `:PROFILE` stripped — a
-    /// sketch is selectable both by its group name (`{id}`) and by its profile
-    /// face name (`{id}:PROFILE`); both must resolve to
-    /// the one profile stored under `{id}`.
+    /// Resolve a profile reference name to the sketch profile it names, by THE
+    /// sketch-name rule ([`sketch_alias_lookup`]): `{id}`, `{id}:PROFILE` and the
+    /// display-sheet pick `{id}:FACE` all resolve to the one profile stored
+    /// under `{id}`.
     pub fn resolve_profile(&self, name: &str) -> Option<&SketchProfile> {
-        if let Some(profile) = self.profiles.get(name) {
-            return Some(profile);
-        }
-        name.strip_suffix(":PROFILE")
-            .and_then(|base| self.profiles.get(base))
+        self.resolve_profile_named(name).map(|(_, profile)| profile)
+    }
+
+    /// [`Self::resolve_profile`] with the CANONICAL name the profile is stored
+    /// under — what a consumer names caps by and consumes. One call, so the
+    /// resolution and the canonical name can never disagree.
+    pub fn resolve_profile_named<'a>(&'a self, name: &str) -> Option<(&'a str, &'a SketchProfile)> {
+        sketch_alias_lookup(&self.profiles, name)
     }
 
     /// Resolve a named plane frame (exact match), for sketch/plane resolution.
@@ -1028,14 +1030,10 @@ impl SceneMap {
         self.axes.get(name).copied()
     }
 
-    /// Resolve a named path chain (exact match; also strips a trailing `:PROFILE`),
+    /// Resolve a named path chain by THE sketch-name rule ([`sketch_alias_lookup`]),
     /// for sweep/path_sweep/rib trajectories.
     pub fn resolve_path(&self, name: &str) -> Option<&Vec<NurbsCurve>> {
-        if let Some(path) = self.paths.get(name) {
-            return Some(path);
-        }
-        name.strip_suffix(":PROFILE")
-            .and_then(|base| self.paths.get(base))
+        sketch_alias_lookup(&self.paths, name).map(|(_, value)| value)
     }
 
     /// The per-segment SOURCE NAMES of a named path chain, resolved exactly as
@@ -1043,22 +1041,14 @@ impl SceneMap {
     /// answer for the same entry). `None` when the publisher named no segments —
     /// the caller then falls back to naming by the reference itself.
     pub fn resolve_path_segment_names(&self, name: &str) -> Option<&Vec<Option<String>>> {
-        if let Some(names) = self.path_segment_names.get(name) {
-            return Some(names);
-        }
-        name.strip_suffix(":PROFILE")
-            .and_then(|base| self.path_segment_names.get(base))
+        sketch_alias_lookup(&self.path_segment_names, name).map(|(_, value)| value)
     }
 
     /// The per-segment SCREW AXES of a named path chain, resolved exactly as
     /// [`SceneMap::resolve_path`] resolves the chain itself. `None` when the
     /// publisher recorded none — every segment is then an ordinary curve.
     pub fn resolve_path_segment_axes(&self, name: &str) -> Option<&Vec<Option<Axis>>> {
-        if let Some(axes) = self.path_segment_axes.get(name) {
-            return Some(axes);
-        }
-        name.strip_suffix(":PROFILE")
-            .and_then(|base| self.path_segment_axes.get(base))
+        sketch_alias_lookup(&self.path_segment_axes, name).map(|(_, value)| value)
     }
 
     /// Resolve a named world point (exact match), for hole/placement centers.
@@ -1701,6 +1691,7 @@ pub fn clear_history_cache() {
     parts_library::clear_rebuilt_memo();
     // The per-coedge reading memo the boolean's operand preparation keeps.
     crate::reading_memo::clear();
+    crate::mass_properties::clear_cell_memo();
     // The per-face mesh fragments the soundness scan and the display share.
     crate::watertight_tessellation::clear_face_memo();
     crate::soundness::pair_memo::clear();
@@ -1815,7 +1806,34 @@ fn hash_evaluated(value: &serde_json::Value, env: &Env, hasher: &mut impl std::h
 ///
 /// Field-blind on purpose: a false-dirty from an unrelated string that happens to
 /// end this way is harmless, a missed edge is stale geometry.
-const SKETCH_REFERENCE_ALIASES: [&str; 2] = [":PROFILE", ":FACE"];
+pub const SKETCH_REFERENCE_ALIASES: [&str; 2] = [":PROFILE", ":FACE"];
+
+/// THE sketch-name rule, the one every profile/path consumer, the dirty
+/// tracker (`scan_consumed`), the render gizmo and the CAM chain use: `name`
+/// with ONE trailing [`SKETCH_REFERENCE_ALIASES`] suffix stripped, or `None`
+/// when it carries none (or nothing would remain). Resident solid faces are
+/// `{solid}|{face}[n]` and end in neither suffix.
+pub fn sketch_alias_base(name: &str) -> Option<&str> {
+    SKETCH_REFERENCE_ALIASES
+        .iter()
+        .find_map(|alias| name.strip_suffix(alias))
+        .filter(|base| !base.is_empty())
+}
+
+/// The canonical sketch id `name` spells: [`sketch_alias_base`], or `name`
+/// itself when it carries no alias.
+pub fn canonical_sketch_name(name: &str) -> &str {
+    sketch_alias_base(name).unwrap_or(name)
+}
+
+/// Look `name` up by the sketch-name rule: the EXACT key first (a real name
+/// that happens to end in an alias suffix is never rewritten), then its
+/// [`sketch_alias_base`]. Returns the stored key with the value.
+pub fn sketch_alias_lookup<'a, V>(map: &'a HashMap<String, V>, name: &str) -> Option<(&'a str, &'a V)> {
+    map.get_key_value(name)
+        .or_else(|| sketch_alias_base(name).and_then(|base| map.get_key_value(base)))
+        .map(|(key, value)| (key.as_str(), value))
+}
 
 /// Collect every string in the descriptor (inputParams + persistentData,
 /// recursively) that EXACT-matches a name available earlier in the history
@@ -1888,14 +1906,8 @@ fn scan_consumed(
                 // its consumers (changed = {"S1"}, consumed = {"S1:PROFILE"},
                 // no overlap). EXACT match wins first, so a real produced name
                 // that happens to end in an alias suffix is never rewritten.
-                if available.contains_key(trimmed) {
-                    out.insert(trimmed.to_string());
-                } else if let Some(base) = SKETCH_REFERENCE_ALIASES
-                    .iter()
-                    .find_map(|alias| trimmed.strip_suffix(alias))
-                    .filter(|base| available.contains_key(*base))
-                {
-                    out.insert(base.to_string());
+                if let Some((name, _)) = sketch_alias_lookup(available, trimmed) {
+                    out.insert(name.to_string());
                 }
             }
             serde_json::Value::Array(items) => {

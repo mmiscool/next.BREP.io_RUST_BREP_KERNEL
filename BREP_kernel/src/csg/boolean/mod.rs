@@ -2218,6 +2218,7 @@ fn boolean_pipeline(
     options: &BooleanOptions,
     tangent_nodes: &mut Vec<Vec3>,
 ) -> Result<(KernelOutcome<BrepSolid>, Option<HashSet<u64>>), KernelRefusal> {
+    let _work = crate::imprint::work_profile::Scope::open("boolean");
     let replaced_operands = operand_state::replace_operands(first, second, operation, options);
     let (first, second) = match &replaced_operands {
         Some((first, second)) => (first, second),

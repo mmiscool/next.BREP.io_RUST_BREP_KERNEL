@@ -8,7 +8,7 @@
 //!
 //! | tab centre | mates | DOF removed |
 //! |---|---|---|
-//! | plane | `coincident_plane_plane` (mid-plane ↔ tab plane, captured facing, `reverse` flips) | 3 |
+//! | plane | `coincident_plane_plane` (mid-plane ↔ tab plane, its explicit `facing`) | 3 |
 //! | line (cylindrical/conical face, straight edge) | `perpendicular` (line ⊥ mid-plane normal) + `coincident_point_plane` | 2 |
 //! | point (vertex, circular edge / sphere centre) | `coincident_point_plane` | 1 |
 //!
@@ -22,9 +22,9 @@
 //! measure's sign and the facing cache are stable under reorders.
 //!
 //! Every mid-geometry takes its direction from the pair's lexicographically
-//! first ref (its "lead") for the same reason: [`effective_align`] keys the
-//! `preferredOppose` cache on the ORDER-INDEPENDENT pair signature, so the
-//! direction it captured must not flip when the user reorders the picks.
+//! first ref (its "lead") for the same reason: the facing [`effective_align`]
+//! captures (and the one an old document's order-independent `preferredOppose`
+//! cache stored) must not flip when the user reorders the picks.
 //!
 //! A width split across two components (centring C between a face of A and a
 //! face of B) is NOT supported: a mate plane lives in one body's frame, and no
@@ -66,11 +66,7 @@ pub(super) fn schema() -> serde_json::Value {
         "id": id_field(),
         "elements": elements_field(&["FACE", "EDGE", "VERTEX"], 3, 4,
             "Two parallel planar faces on one component (the width) and, on another component, one element or two like elements to centre between them (the tab)"),
-        "reverse": {
-            "type": "boolean",
-            "default_value": false,
-            "hint": "Flip the captured facing preference (planar tab)"
-        },
+        "facing": super::super::mapping::facing_field("Planar tab: Aligned or Opposed to the width's mid-plane. Unset, a new constraint takes the facing it is placed with"),
     }))
 }
 
@@ -333,11 +329,10 @@ pub(in crate::feature_pipeline::assembly) fn map(
     let offset = mid_world.height(centre_world.anchor());
     let (w, t) = (width.lead(), tab.lead());
     let mates = match (centre_world, centre_local) {
-        // Planar tab: mid-plane and tab plane coplanar, with the captured
-        // facing preference (`reverse` flips it) — the touch-align shape.
+        // Planar tab: mid-plane and tab plane coplanar, with its `facing`
+        // — the touch-align shape.
         (Centre::Plane(plane_world), Centre::Plane(plane_local)) => {
-            let reverse = entry.flag("reverse");
-            let align = effective_align(entry, mid_world.normal, plane_world.normal, reverse);
+            let align = effective_align(entry, mid_world.normal, plane_world.normal, "reverse");
             vec![mate(w, t, MateKind::CoincidentPlanePlane {
                 plane_a: mid_local.mate(),
                 plane_b: plane_local.mate(),

@@ -25,9 +25,15 @@ pub struct LifecycleOutcome {
     /// Component id → the solved `inputParams.transform` JSON (the generic
     /// pose write-back for the owning ACOMP feature).
     pub pose_updates: BTreeMap<String, serde_json::Value>,
-    /// Component id → grounded flag write-back (`inputParams.isFixed`), from
-    /// Fixed constraints.
+    /// Component id → grounded flag write-back, from a legacy Fixed
+    /// constraint migrated this run ([`migrate_fixed_constraints`]): a
+    /// top-level id folds into its ACOMP's `inputParams.isFixed`, an occurrence
+    /// path (`ACOMP1:ACOMP2`) into `flexibleFixed[ACOMP2]` on `ACOMP1`.
     pub fixed_updates: BTreeMap<String, bool>,
+    /// One row per legacy Fixed constraint this run took out of the state
+    /// (`{id, element, component, enabled}`; `component` null when it named
+    /// nothing): the app says what became of each, once.
+    pub migrated_fixed: Vec<serde_json::Value>,
     /// Scene solids whose geometry MOVED in the write-back (`(name, handle)`)
     /// — the display lane must re-tessellate these even when their producing
     /// feature replayed clean this run.
@@ -48,7 +54,7 @@ impl LifecycleOutcome {
 /// Which lane a constraint landed in after validate+map.
 enum Lane {
     /// Terminal status already written (disabled/unknown/duplicate/failure/
-    /// fixed-type/both-fixed).
+    /// both-fixed).
     Settled,
     /// Mapped into the solve: indexes into the global mate list.
     Solved {
@@ -67,9 +73,49 @@ pub fn run_constraints(
     scene: &mut SceneMap,
     env: &Env,
 ) -> LifecycleOutcome {
-    let outcome = solve_state(state, scene, env);
+    let mut outcome = solve_state(state, scene, env);
     super::flexible::collect(state, scene);
+    if let (false, Some(report)) = (outcome.migrated_fixed.is_empty(), outcome.report.as_object_mut()) {
+        report.insert("migratedFixed".into(), serde_json::json!(outcome.migrated_fixed));
+    }
     outcome
+}
+
+/// MIGRATION: Fixed is not a constraint. A part is fixed by its own instance
+/// setting (`isFixed`, or `flexibleFixed[path]` for a part inside a flexible
+/// sub-assembly) and nothing else. A document saved with `fixed` rows loads
+/// with each row turned into that setting: an enabled row grounds what it
+/// names exactly as it used to (the same resolve, so no part moves) and writes
+/// the instance setting back through `fixed_updates`; every `fixed` row then
+/// leaves the state, so the folded document no longer carries it. A disabled
+/// row, or one naming nothing, grounded nothing before and is dropped.
+///
+/// Runs after [`super::flexible::expand`] (an occurrence path resolves to the
+/// occurrence) and before the per-entry pass, so lanes stay index-aligned.
+/// Rows a flexible child lends never get here: `flexible::lend` reads a
+/// child's legacy rows as its grounding instead.
+fn migrate_fixed_constraints(state: &mut AssemblyState, scene: &mut SceneMap, outcome: &mut LifecycleOutcome) {
+    let (legacy, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut state.constraints)
+        .into_iter()
+        .partition(|entry| entry.constraint_type == "fixed");
+    state.constraints = kept;
+    for entry in legacy {
+        let elements = entry.elements();
+        let component = match (entry.enabled, elements.as_slice()) {
+            (true, [element]) => mapping::resolve_element(scene, element).ok().map(|resolved| resolved.component),
+            _ => None,
+        };
+        if let Some(component) = &component {
+            scene.set_component_fixed(component, true);
+            outcome.fixed_updates.insert(component.clone(), true);
+        }
+        outcome.migrated_fixed.push(serde_json::json!({
+            "id": entry.id(),
+            "element": elements.first(),
+            "component": component,
+            "enabled": entry.enabled,
+        }));
+    }
 }
 
 fn solve_state(
@@ -319,7 +365,7 @@ fn solve_state(
                             entry.set_status(
                                 "conflict",
                                 format!(
-                                    "Conflicts with {}: these constraints cannot all hold. Suppress one to solve (suggested: {newest_id}).",
+                                    "Conflicts with {}: these constraints cannot all hold. Disable one to solve (suggested: {newest_id}).",
                                     others.join(", ")
                                 ),
                                 false,
@@ -762,20 +808,9 @@ fn prepare(
     let mut mate_sides: Vec<(String, String, Option<String>)> = Vec::new();
     let mut bodies: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
 
-    // Fixed constraints ground components FIRST, so every later fixed-flag
-    // read (body building, both-fixed checks) sees them.
-    for entry in &state.constraints {
-        if entry.enabled && entry.constraint_type == "fixed" {
-            let elements = entry.elements();
-            if elements.len() != 1 {
-                continue; // marked incomplete in the main pass below
-            }
-            if let Ok(resolved) = mapping::resolve_element(scene, &elements[0]) {
-                scene.set_component_fixed(&resolved.component, true);
-                outcome.fixed_updates.insert(resolved.component, true);
-            } // a resolve failure writes its status in the main pass
-        }
-    }
+    // Legacy Fixed rows become the instance setting FIRST, so every later
+    // fixed-flag read (body building, both-fixed checks) sees them.
+    migrate_fixed_constraints(state, scene, outcome);
 
     // --- Per-entry validate + resolve + map --------------------------------
     for index in 0..state.constraints.len() {
@@ -849,23 +884,6 @@ fn prepare(
                 lanes.push(Lane::Settled);
                 continue;
             }
-        }
-
-        // Fixed: grounded above — settle the status.
-        if entry.constraint_type == "fixed" {
-            let entry = &mut state.constraints[index];
-            match mapping::resolve_element(scene, &elements[0]) {
-                Ok(resolved) => {
-                    entry.set_status(
-                        "satisfied",
-                        format!("Component {} is fixed.", resolved.component),
-                        true,
-                    );
-                }
-                Err(failure) => entry.set_status(failure.status, failure.message, false),
-            }
-            lanes.push(Lane::Settled);
-            continue;
         }
 
         // Resolve every element; typed failures settle the constraint.

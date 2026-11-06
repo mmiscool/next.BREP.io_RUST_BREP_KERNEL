@@ -79,13 +79,12 @@
 
 use crate::automation::hit_keys::HitKeyDoc;
 use crate::column_tree::{self, CellEdit, ColumnLayout, ColumnTreeSpec, RowAction, RowNode};
-use crate::panels::component_actions::{
-    run_component_action, ComponentAction, ComponentActionRequest,
-};
+use crate::panels::component_actions::{run_component_actions, ComponentAction, ComponentActionRequest};
 use crate::panels::assembly_components::{self, ChainNode, ComponentRow};
 use crate::panels::update_components::UpdateComponents;
 use crate::panels::bom_columns::{
-    self, ParsedColumns, Scope, FLAGS_KEY, ITEM_KEY, MF_QTY_KEY, PMI_KEY, QUANTITY_KEY, VISIBLE_KEY,
+    self, ParsedColumns, Scope, FLAGS_KEY, ITEM_KEY, MASS_KEY, MF_QTY_KEY, PMI_KEY, QUANTITY_KEY,
+    VISIBLE_KEY, VOLUME_KEY,
 };
 use crate::store::ModelStore;
 use brep_render::engine_state::{EngineState, WireBomLine, WireLengthState};
@@ -100,7 +99,6 @@ pub(crate) mod nested;
 /// COMPONENT vocabulary and the context bar draws a button per member of it,
 /// so a document-navigation entry does not belong in there. The assembly
 /// structure tree keeps this action locally for the same reason.
-const EDIT_FEATURE: &str = "edit-feature";
 
 /// What a BOM frame hands back to the shell.
 #[derive(Default)]
@@ -185,6 +183,10 @@ pub struct BomPanel {
     work_path: Option<String>,
     /// The nested lines as last built, and what they were built from.
     nested_cache: NestedCache,
+    /// This frame's part records with their mass readings, by part name —
+    /// computed once in `show` and read by every row, the total and the
+    /// published listing (empty outside a `show`: `row_for` then computes).
+    mass_records: HashMap<String, (Value, brep_render::engine_state::part_mass::MassReport)>,
 }
 
 /// The nested lines of the last build, by group, and what they read. On l500
@@ -269,6 +271,7 @@ impl BomPanel {
             nested: HashMap::new(),
             work_path: None,
             nested_cache: NestedCache::default(),
+            mass_records: HashMap::new(),
         }
     }
 
@@ -441,6 +444,17 @@ impl BomPanel {
         ui.add_space(2.0);
 
         // --- the tree ---------------------------------------------------------
+        // Mass and volume are measured off the part's geometry: ask for what
+        // is missing (a threaded runner answers on a later frame and the
+        // cell reads "measuring" until then).
+        state.measure_parts(groups.iter().map(|group| group.part_name.as_str()));
+        self.mass_records.clear();
+        for group in &groups {
+            if !self.mass_records.contains_key(&group.part_name) {
+                let record = state.part_bom_record_cached(&group.part_name);
+                self.mass_records.insert(group.part_name.clone(), record);
+            }
+        }
         let mut rows: Vec<RowNode> = groups
             .iter()
             .map(|group| {
@@ -517,6 +531,16 @@ impl BomPanel {
                 row.children = std::mem::take(children);
             }
         }
+        // A nested line's mass is its own part's, measured live — the
+        // nested cache is keyed by revision, not by measurements landing.
+        if self.parsed.columns.iter().any(|c| c.key() == MASS_KEY || c.key() == VOLUME_KEY) {
+            let chains: Vec<String> =
+                self.nested.values().filter_map(|line| line.paths.first().cloned()).collect();
+            for chain in &chains {
+                let _ = state.chain_mass(chain);
+            }
+            nested_mass_cells(&mut rows, &self.nested, state);
+        }
         rows.extend(wires.iter().map(wire_row));
         let mut specs = bom_columns::column_specs(&self.parsed);
         if self.plm_mode {for spec in &mut specs {if let Some(field)=self.configuration.field(&spec.key){spec.label=if field.unit.is_empty(){field.name.clone()}else{format!("{} ({})",field.name,field.unit)};spec.kind=field.cell_kind();}}}
@@ -525,6 +549,19 @@ impl BomPanel {
             QUANTITY_KEY.to_string(),
             Value::from(occurrences.len() as u64),
         );
+        // The assembly's TOTAL: Σ quantity × part mass, shown only when every
+        // part has a number (a partial sum would read as the total).
+        let mut total = Some(0.0);
+        for group in &groups {
+            let mass = self.mass_records.get(&group.part_name).and_then(|(_, report)| report.mass_kg);
+            total = total.zip(mass).map(|(sum, kg)| sum + kg * group.ids.len() as f64);
+        }
+        if let Some(total) = total.filter(|_| !groups.is_empty()) {
+            root_cells.insert(
+                MASS_KEY.to_string(),
+                Value::String(brep_render::engine_state::part_mass::format_mass_kg(total)),
+            );
+        }
         let spec = ColumnTreeSpec {
             id: "bom",
             columns: &specs,
@@ -603,64 +640,29 @@ impl BomPanel {
                 }
             }
         }
-        // The row menu. Engine-mutating actions run in the SHARED dispatcher
-        // (one truth, one undo lane, the same one the structure tree's buttons
-        // and the context bar use); the two document-level flows come back as
-        // a request for the shell.
+        // The row menu: THE shared component menu (`component_actions`), run
+        // through its one dispatcher on the placements the row stands for (a
+        // nested line's occurrence paths, a packed row's every placement);
+        // the document-level flows come back as a request for the shell.
         let mut acted = false;
         for click in &out.actions {
-            if click.action == nested::SAVE_PART_AS {
-                if let Some(path) = self.nested.get(&click.row_id).and_then(|line| line.paths.first().cloned()) {
-                    // A nested line: the shell's part flow resolves the path.
-                    outcome.component = Some(ComponentActionRequest::OpenPart { component_id: path });
-                    acted = true;
-                    continue;
-                }
-            }
-            if matches!(click.action.as_str(), nested::MAKE_WORK_PART | nested::OPEN_NEW_TAB) {
-                let path = match self.nested.get(&click.row_id) {
-                    Some(line) => line.paths.first().cloned(),
-                    None => groups
-                        .iter()
-                        .find(|group| group.key == click.row_id)
-                        .and_then(|group| group.ids.first().cloned()),
-                };
-                if let Some(component_path) = path {
-                    outcome.component = Some(ComponentActionRequest::WorkPart {
-                        component_path,
-                        in_place: click.action == nested::MAKE_WORK_PART,
-                    });
-                }
+            if click.action == "update-components" {
+                outcome.update_components = true;
                 acted = true;
                 continue;
             }
-            // A nested line's Fix/Float acts on its own occurrence path.
-            if click.action == ComponentAction::ToggleFixed.id() {
-                if let Some(path) = self.nested.get(&click.row_id).and_then(|line| line.paths.first().cloned()) {
-                    outcome.component = run_component_action(state, ComponentAction::ToggleFixed, &path);
-                    acted = true;
-                    continue;
-                }
-            }
-            let Some(group) = groups.iter().find(|group| group.key == click.row_id) else {
-                continue;
+            let ids: Vec<String> = match self.nested.get(&click.row_id) {
+                Some(line) => line.paths.clone(),
+                None => match groups.iter().find(|group| group.key == click.row_id) {
+                    Some(group) => group.ids.clone(),
+                    None => continue,
+                },
             };
-            let Some(first) = group.ids.first() else {
-                continue;
-            };
+            let Some(action) = ComponentAction::from_id(&click.action) else { continue };
             acted = true;
-            if click.action == nested::SAVE_PART_AS {
-                // The shell's part flow: a file-less part offers its new file.
-                outcome.component = Some(ComponentActionRequest::OpenPart { component_id: first.clone() });
-            } else if click.action == "update-components" {
-                outcome.update_components = true;
-            } else if click.action == EDIT_FEATURE {
-                if let Some(index) = state.history.index_of(first) {
-                    state.roll_to(index);
-                }
-                outcome.focus = Some(first.clone());
-            } else if let Some(action) = ComponentAction::from_id(&click.action) {
-                outcome.component = run_component_action(state, action, first);
+            match run_component_actions(state, action, &ids) {
+                Some(ComponentActionRequest::EditFeature { feature_id }) => outcome.focus = Some(feature_id),
+                request => outcome.component = request,
             }
         }
         if let Some(edited) = margin_commit {
@@ -683,9 +685,8 @@ impl BomPanel {
                     // through to every member solid the row stands for.
                     let visible = edit.value.as_bool().unwrap_or(true);
                     if let Some(group) = groups.iter().find(|g| g.key == edit.row_id) {
-                        for solid in &group.solids {
-                            state.set_visible(solid, visible);
-                        }
+                        // One call: an active PMI view records one hide step.
+                        state.set_visible_many(&group.solids, visible);
                     }
                 } else if self.work_path.is_some()
                     && edit.column.starts_with("part.")
@@ -716,6 +717,9 @@ impl BomPanel {
                         "partName": group.part_name,
                         "ids": group.ids,
                         "quantity": group.ids.len(),
+                        // The PART's mass reading (kg, mm³, g/cm³): the same
+                        // one the cells, the export and the MCP readers show.
+                        "mass": self.mass_records.get(&group.part_name).map(|(_, report)| report.to_json()),
                         // The PLM's part number, revision and lifecycle for a
                         // component placed from a PLM revision (null otherwise).
                         "plm": plm_entry(state, store, &group.part_name).map(|e| serde_json::json!({
@@ -724,7 +728,7 @@ impl BomPanel {
                     })
                 })
                 .collect();
-            crate::automation::registry::publish("__brepBom", "BOM groups {key, partName, ids, quantity}", &Value::Array(listing).to_string());
+            crate::automation::registry::publish("__brepBom", "BOM groups {key, partName, ids, quantity, mass}", &Value::Array(listing).to_string());
             let cache = &mut self.nested_cache;
             let current = cache.tree.as_ref().is_some_and(|(builds, top, work, _)| {
                 *builds == cache.builds
@@ -874,7 +878,13 @@ impl BomPanel {
             cells.insert(PMI_KEY.to_string(), Value::from(pmi as u64));
         }
 
-        let part_attributes = state.part_attributes(&group.part_name);
+        // The part's record WITH its derived mass properties (computed from
+        // the part's geometry and density — never an occurrence's).
+        let (part_attributes, mass) = self
+            .mass_records
+            .get(&group.part_name)
+            .cloned()
+            .unwrap_or_else(|| state.part_bom_record_cached(&group.part_name));
         for column in &self.parsed.columns {
             let key = column.key();
             if key == QUANTITY_KEY || key == PMI_KEY || key == MF_QTY_KEY {
@@ -903,6 +913,18 @@ impl BomPanel {
                 Scope::Part => &part_attributes,
                 Scope::Occurrence => &group.attributes,
             };
+            if key == MASS_KEY || key == VOLUME_KEY {
+                let text = source
+                    .get(&column.field)
+                    .and_then(|value| {
+                        brep_render::engine_state::part_mass::format_derived(&column.field, value)
+                    })
+                    .or_else(|| mass.status.note().filter(|_| key == MASS_KEY));
+                if let Some(text) = text {
+                    cells.insert(key, Value::String(text));
+                }
+                continue;
+            }
             if let Some(value) = source.get(&column.field) {
                 cells.insert(key, value.clone());
             }
@@ -941,9 +963,7 @@ impl BomPanel {
                 .filter(|s| line.paths.iter().any(|p| s.name.starts_with(&format!("{p}:"))))
                 .map(|s| s.name.clone())
                 .collect();
-            for solid in members {
-                state.set_visible(&solid, visible);
-            }
+            state.set_visible_many(&members, visible);
             return;
         }
         let Some(column) = self.parsed.columns.iter().find(|c| c.key() == edit.column).cloned() else {
@@ -1145,85 +1165,77 @@ impl BomPanel {
     }
 }
 
-/// The row menu for one group: "Edit feature" (this panel's own) then the
-/// SHARED component actions in bar order, each refused-with-a-reason where this
-/// row cannot honour it.
+/// The row menu for one group: THE shared component menu
+/// ([`component_actions::component_menu`]) for the placements the row stands
+/// for — the same entries, availability and reasons the context bar and the
+/// viewport's right-click menu show. A packed row standing for several
+/// placements refuses the per-instance entries (Move, Delete: acting on "the
+/// first" of four is a trap) and keeps Fix/Unfix live across the row, one undo
+/// step (owner 2026-11-05).
 ///
-/// The per-INSTANCE actions (Move, Fix/Unfix, Delete) are refused on a PACKED
-/// row that rolls up more than one placement: acting on "the first" of four is
-/// a trap, and fanning Delete or Fix out across the group would be N undo steps
-/// where every other BOM edit is one. The part-level flows (Edit in place, Open
-/// Part) mean the same thing for every placement, so they stay live; and
-/// "Edit feature" only rolls the history, which is what the ✎ button it
-/// replaced always did.
+/// Built from the facts the row already has (the shared projection's fixed
+/// flags, the row's visibility): never `component_info`, which walks every
+/// scene solid with a history scan each, once per row per frame.
 fn actions_for(state: &EngineState, group: &Group) -> Vec<RowAction> {
     if group.ids.is_empty() {
         return Vec::new();
     }
-    // The row's own grounded flag — the kernel record's, rolled up across the
-    // group (see `Group::fixed`). For the single-placement row it IS the
-    // placement's flag; for a packed row it only words the (disabled) toggle.
-    // Not `component_info(first)`: that walks every scene solid with a history
-    // scan each, and this runs once per row per frame.
-    let fixed = group.fixed;
-    let rolled_up = group.ids.len() > 1;
-    let unpack = |verb: &str| {
-        format!(
-            "{} placements on this row — switch to Unpacked to {verb} one",
-            group.ids.len()
-        )
-    };
+    let components = state.assembly_components();
+    let fixed = group
+        .ids
+        .iter()
+        .map(|id| {
+            components
+                .iter()
+                .find(|component| &component.id == id)
+                .map(|component| component.fixed)
+                .ok_or_else(|| format!("'{id}' is not an assembly component"))
+        })
+        .collect();
     // An embedded-only part (no `sourceKey`) has no document to open.
-    let embedded = !state
-        .part_source(&group.part_name)
-        .is_some_and(|(key, _)| !key.is_empty());
-
-    let mut actions = vec![
-        RowAction::new(nested::MAKE_WORK_PART, "Make Work Part")
-            .tooltip("Edit this part here, in the context of the assembly (double click)"),
-        RowAction::new(nested::OPEN_NEW_TAB, "Open in new tab")
-            .tooltip("Edit this part in a tab of its own; the assembly updates as you edit"),
-    ];
-    if embedded {
-        actions.push(
-            RowAction::new(nested::SAVE_PART_AS, "Save part as\u{2026}")
-                .tooltip("This part has no file of its own: save it to a new part file you name"),
-        );
-    }
-    actions.extend([
-        RowAction::new(EDIT_FEATURE, "\u{270E} Edit feature")
-            .tooltip("Roll to this component's feature and open it in the history")
-            .separator_above(),
-    ]);
-    // The row already leads with Make Work Part (and its new-tab twin).
-    for action in ComponentAction::ALL.into_iter().filter(|action| *action != ComponentAction::WorkPart) {
-        let entry = RowAction::new(action.id(), action.label(fixed)).tooltip(action.tooltip());
-        let entry = match action {
-            ComponentAction::Move if fixed => {
-                entry.disabled("This component is fixed — unfix it before moving it")
-            }
-            ComponentAction::Move if rolled_up => entry.disabled(unpack("move")),
-            ComponentAction::MoveCopy if rolled_up => entry.disabled(unpack("copy")),
-            ComponentAction::ToggleFixed if rolled_up => entry.disabled(unpack("fix or unfix")),
-            ComponentAction::Delete if rolled_up => entry.disabled(unpack("delete")),
-            ComponentAction::OpenPart if embedded => {
-                entry.disabled("This part is embedded in the assembly — it has no source document")
-            }
-            _ => entry,
-        };
-        actions.push(match action {
-            // The destructive tail, fenced off from the rest.
-            ComponentAction::Delete => entry.separator_above().destructive(),
-            _ => entry,
-        });
-    }
-    actions
+    let embedded = !state.part_source(&group.part_name).is_some_and(|(key, _)| !key.is_empty());
+    crate::panels::component_actions::component_menu(&crate::panels::component_actions::MenuSubject {
+        ids: group.ids.clone(),
+        embedded,
+        fixed,
+        visible: group.visible,
+    })
 }
 
 /// A wire line's row id: `wire:` and the harness connection id, so it can
 /// never collide with a component group (`pack:…`) or an ACOMP id.
 fn wire_row_key(line: &WireBomLine) -> String {
     format!("wire:{}", line.id)
+}
+
+/// Fill every NESTED line's `part.Mass` / `part.Volume` cell from its
+/// occurrence chain's live mass (see [`EngineState::chain_mass_cached`]).
+fn nested_mass_cells(
+    rows: &mut [RowNode],
+    lines: &HashMap<String, nested::NestedLine>,
+    state: &EngineState,
+) {
+    for row in rows {
+        if let Some(chain) = lines.get(&row.id).and_then(|line| line.paths.first()) {
+            let report = state.chain_mass_cached(chain);
+            row.cells.remove(MASS_KEY);
+            row.cells.remove(VOLUME_KEY);
+            let mass = report
+                .mass_kg
+                .map(brep_render::engine_state::part_mass::format_mass_kg)
+                .or_else(|| report.status.note());
+            if let Some(text) = mass {
+                row.cells.insert(MASS_KEY.to_string(), Value::String(text));
+            }
+            if let Some(volume) = report.volume_mm3 {
+                row.cells.insert(
+                    VOLUME_KEY.to_string(),
+                    Value::String(brep_render::engine_state::part_mass::format_volume_mm3(volume)),
+                );
+            }
+        }
+        nested_mass_cells(&mut row.children, lines, state);
+    }
 }
 
 /// One harness wire as its own BOM line (see the module doc's "Wire lines").

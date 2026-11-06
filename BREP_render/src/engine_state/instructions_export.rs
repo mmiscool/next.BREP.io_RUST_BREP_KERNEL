@@ -209,9 +209,11 @@ impl EngineState {
             drawing.highlighted = std::mem::take(&mut drawing.edges);
             return Some(drawing);
         }
+        // The same view with what earlier steps placed hidden too (a
+        // transient hide step on a copy, never stored).
         let mut added_only = view.clone();
-        let extra: Vec<String> = placed.iter().filter(|name| !added_only.display.hidden.contains(name)).cloned().collect();
-        added_only.display.hidden.extend(extra);
+        let extra: Vec<String> = placed.iter().filter(|name| !added_only.hides(name)).cloned().collect();
+        added_only.annotations.push(brep_kernel::PmiAnnotation::hide_step("HID-placed", &extra, true));
         let alone = project_view_through(&model, &placement(position, scale), Some(&added_only), report, None, None, mode);
         if pending.get() { return None; }
         if !alone.error.is_empty() { return Some(alone); }

@@ -84,6 +84,12 @@ pub enum ExportFormat {
     /// version "E"): every part and every net with its pins, under the
     /// Connectivity panel's net names.
     KicadNetlist,
+    /// The assembly's BOM as CSV — the File ▸ Export BOM file: one row per
+    /// part with its quantity, material, density (g/cm³), volume (mm³), mass
+    /// and total mass (kg), all read off the PART, then the harness wires.
+    BomCsv,
+    /// The same BOM as a JSON array.
+    BomJson,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -205,6 +211,47 @@ pub struct Exported {
     /// The CSV formats: data rows, not counting the header.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rows: Option<usize>,
+    /// `bom_csv` / `bom_json`: every row READ BACK from the text written —
+    /// the JSON array as is, or each CSV line as `{header: field}` (strings,
+    /// as the file has them). Absent for every other format.
+    #[serde(rename = "bomRows", skip_serializing_if = "Option::is_none")]
+    pub bom_rows: Option<Vec<Value>>,
+}
+
+/// A BOM export's rows read back from its text (see `Exported::bom_rows`).
+fn bom_read_back(format: &str, text: &str) -> Option<Vec<Value>> {
+    if format == "bom_json" {
+        return serde_json::from_str(text).ok();
+    }
+    // Minimal RFC-4180: quoted fields with doubled quotes, as the writer quotes.
+    fn fields(line: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut field = String::new();
+        let mut quoted = false;
+        let mut chars = line.chars().peekable();
+        while let Some(c) = chars.next() {
+            match c {
+                '"' if quoted && chars.peek() == Some(&'"') => {
+                    field.push('"');
+                    chars.next();
+                }
+                '"' => quoted = !quoted,
+                ',' if !quoted => out.push(std::mem::take(&mut field)),
+                other => field.push(other),
+            }
+        }
+        out.push(field);
+        out
+    }
+    let mut lines = text.lines();
+    let header = fields(lines.next()?);
+    Some(
+        lines
+            .map(|line| {
+                Value::Object(header.iter().cloned().zip(fields(line).into_iter().map(Value::String)).collect())
+            })
+            .collect(),
+    )
 }
 
 /// One file of a fabrication zip, from the archive's central directory.
@@ -346,10 +393,32 @@ fn doc_json(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
     Ok(Outcome::Done(json!({ "document": parse(&text), "bytes": text.len() })))
 }
 
+/// The open document's own attributes with its mass reading, or `None`
+/// while a measurement is still in flight.
+fn document_mass_reply(engine: &mut brep_render::engine_state::EngineState) -> Option<Value> {
+    let report = engine.document_mass();
+    if report.status == brep_render::engine_state::part_mass::MassStatus::Pending {
+        return None;
+    }
+    Some(json!({
+        "attributes": engine.document_part_attributes(),
+        "record": engine.document_bom_record(),
+        "massProperties": report.to_json(),
+    }))
+}
+
 fn part_attributes_get(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
     let _: NoArgs = parse_args(args)?;
-    let attributes = ctx.app.docs.engine().document_part_attributes();
-    Ok(Outcome::Done(json!({ "attributes": attributes })))
+    if let Some(reply) = document_mass_reply(ctx.app.docs.engine_mut()) {
+        return Ok(Outcome::Done(reply));
+    }
+    let handle = ctx.app.docs.active().handle().to_string();
+    Ok(Outcome::Poll(Box::new(move |ctx: &mut Ctx<'_>| {
+        let Some(engine) = ctx.app.docs.engine_of_handle_mut(&handle) else {
+            return Some(Err("document_unknown: the document closed while it was being measured".into()));
+        };
+        document_mass_reply(engine).map(|reply| Ok(Outcome::Done(reply)))
+    })))
 }
 
 fn part_attribute_set(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
@@ -440,6 +509,7 @@ fn doc_export(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
                 }),
                 warnings: Some(bundle.warnings),
                 rows: None,
+                bom_rows: None,
             };
             return serde_json::to_value(exported).map(Outcome::Done).map_err(|e| e.to_string());
         }
@@ -464,10 +534,29 @@ fn doc_export(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
             read_back: None,
             warnings: None,
             rows: None,
+            bom_rows: None,
         };
         return serde_json::to_value(exported).map(Outcome::Done).map_err(|e| e.to_string());
     }
     let engine = ctx.app.docs.engine_mut();
+    // A BOM's masses are measured off the parts' geometry: wait for them.
+    if matches!(a.format, ExportFormat::BomCsv | ExportFormat::BomJson) && engine.bom_mass_pending() {
+        let handle = ctx.app.docs.active().handle().to_string();
+        return Ok(Outcome::Poll(Box::new(move |ctx: &mut Ctx<'_>| {
+            let Some(engine) = ctx.app.docs.engine_of_handle_mut(&handle) else {
+                return Some(Err("document_unknown: the document closed while its BOM was being measured".into()));
+            };
+            if engine.bom_mass_pending() {
+                return None;
+            }
+            let format = if matches!(a.format, ExportFormat::BomCsv) { "bom_csv" } else { "bom_json" };
+            let text = match a.format {
+                ExportFormat::BomCsv => engine.export_bom_csv(),
+                _ => engine.export_bom_json(),
+            };
+            Some(text.map(|text| bom_exported(format, text)))
+        })));
+    }
     let (format, text) = match a.format {
         ExportFormat::Brep => ("brep", engine.history_request_json()),
         ExportFormat::Step => ("step", engine.export_step_text_selected(&document_name, a.solids.as_deref())?),
@@ -486,6 +575,8 @@ fn doc_export(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
         ExportFormat::EcadBomCsv => {
             ("ecad_bom_csv", crate::panels::fabrication_export::csv(engine, crate::panels::fabrication_export::Output::Bom)?)
         }
+        ExportFormat::BomCsv => ("bom_csv", engine.export_bom_csv()?),
+        ExportFormat::BomJson => ("bom_json", engine.export_bom_json()?),
         ExportFormat::KicadNetlist => {
             ("kicad_netlist", crate::panels::fabrication_export::text(engine, crate::panels::fabrication_export::Output::Netlist, &document_name)?)
         }
@@ -496,7 +587,16 @@ fn doc_export(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
     let bytes = text.len();
     let texts = (format == "sheet_svg").then(|| brep_render::sheets::svg::text_strings(&text));
     let rows = format.ends_with("_csv").then(|| text.lines().count().saturating_sub(1));
-    serde_json::to_value(Exported { format: format.into(), text, bytes, base64: None, pages: None, texts, model3d: None, files: None, read_back: None, warnings: None, rows }).map(Outcome::Done).map_err(|e| e.to_string())
+    let bom_rows = bom_read_back(format, &text);
+    serde_json::to_value(Exported { format: format.into(), text, bytes, base64: None, pages: None, texts, model3d: None, files: None, read_back: None, warnings: None, rows, bom_rows }).map(Outcome::Done).map_err(|e| e.to_string())
+}
+
+/// A BOM export answered after its measurements landed (see `doc_export`).
+fn bom_exported(format: &str, text: String) -> Outcome {
+    let rows = format.ends_with("_csv").then(|| text.lines().count().saturating_sub(1));
+    let bom_rows = bom_read_back(format, &text);
+    let exported = Exported { format: format.into(), bytes: text.len(), text, base64: None, pages: None, texts: None, model3d: None, files: None, read_back: None, warnings: None, bom_rows, rows };
+    Outcome::Done(serde_json::to_value(exported).unwrap_or(Value::Null))
 }
 
 fn docs_list(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
@@ -576,9 +676,9 @@ pub static COMMANDS: &[CommandSpec] = &[
     app_command!("document", "doc_load", "Open a `.nbrep` document (passed as text) in a new tab, run its history and fit the camera. Returns the run report.", LoadArgs, doc_load, Mutate, MUTATE, doc_load_result_schema),
     app_command!("document", "doc_json", "The active document as `.nbrep` (the history request with metadata).", NoArgs, doc_json, Read, READ, doc_json_result_schema),
     app_command!("document", "doc_import", "Append an Import 3D Model feature from STEP / IGES text or STL / OBJ / 3MF bytes (base64). STL, OBJ and 3MF go through mesh reconstruction on the runner; a 3MF is read to the 3MF core specification and its build instances are flattened first.", ImportArgs, doc_import, Mutate, MUTATE, doc_import_result_schema),
-    app_command!("document", "doc_export", "Export the active document: brep (native JSON), step, stl, obj, iges, the sheet-metal flat pattern as dxf / svg, or the open drawing sheet as sheet_svg, all as `text`; glb (binary glTF 2.0 of the display mesh), 3mf (a 3MF package of the display mesh: one object per body, the document's colours as base materials) and EVERY drawing sheet as sheet_pdf (one PDF, a page per sheet in sheet order, with the count in `pages`) and the same set with the live 3D model as sheet_pdf_3d (PDF 1.7: a 3D box over every placement marked `threeD` and a last page given over to the model, read back in `model3d`) as `base64`. The two sheet formats also answer `texts`: every text string the file shows, read back from the bytes written. For a document whose PCB board has parts: fabrication (one zip of Gerber X2 layers, Excellon drills, the pick-and-place and parts-BOM CSVs and a README) as `base64`, with its `files` read back from the archive's directory, `readBack` (top/bottom copper flashes, plated/unplated drill hits, the outline's size in mm and the CSVs' row counts, counted from the files) and `warnings`; and the CSVs alone as pick_place_csv (JLCPCB CPL columns) and ecad_bom_csv (JLCPCB BOM columns), as `text` with their data `rows`. For a document whose PCB schematic has parts: kicad_netlist, its KiCad netlist (`.net`, export version \"E\": the parts and every net with its pins, under the Connectivity panel's net names) as `text`.", ExportArgs, doc_export, Read, READ, schema_of::<Exported>),
-    app_command!("document", "part_attributes_get", "The active document's own BOM part attributes (`partAttributes`) — the record the toolbar's Part Properties dialog edits, and the one an assembly's BOM reads off this part.", NoArgs, part_attributes_get, Read, READ, document_attributes_result_schema),
-    app_command!("document", "part_attribute_set", "Write ONE of the active document's own BOM part attributes (Part_Number, Material, Mass, or any custom field); a null or empty value removes it. One undo step per field.", PartAttributeArgs, part_attribute_set, Mutate, MUTATE, document_attributes_result_schema),
+    app_command!("document", "doc_export", "Export the active document: brep (native JSON), step, stl, obj, iges, the sheet-metal flat pattern as dxf / svg, or the open drawing sheet as sheet_svg, all as `text`; glb (binary glTF 2.0 of the display mesh), 3mf (a 3MF package of the display mesh: one object per body, the document's colours as base materials) and EVERY drawing sheet as sheet_pdf (one PDF, a page per sheet in sheet order, with the count in `pages`) and the same set with the live 3D model as sheet_pdf_3d (PDF 1.7: a 3D box over every placement marked `threeD` and a last page given over to the model, read back in `model3d`) as `base64`. The two sheet formats also answer `texts`: every text string the file shows, read back from the bytes written. For a document whose PCB board has parts: fabrication (one zip of Gerber X2 layers, Excellon drills, the pick-and-place and parts-BOM CSVs and a README) as `base64`, with its `files` read back from the archive's directory, `readBack` (top/bottom copper flashes, plated/unplated drill hits, the outline's size in mm and the CSVs' row counts, counted from the files) and `warnings`; and the CSVs alone as pick_place_csv (JLCPCB CPL columns) and ecad_bom_csv (JLCPCB BOM columns), as `text` with their data `rows`. For a document with components or harness wires: bom_csv / bom_json, the assembly BOM the File menu exports (part rows carry material, densityGcm3, volumeMm3, massKg and totalMassKg read off each PART; waits for the measurements). For a document whose PCB schematic has parts: kicad_netlist, its KiCad netlist (`.net`, export version \"E\": the parts and every net with its pins, under the Connectivity panel's net names) as `text`.", ExportArgs, doc_export, Read, READ, schema_of::<Exported>),
+    app_command!("document", "part_attributes_get", "The active document's own BOM part attributes (`partAttributes`) — the record the toolbar's Part Properties dialog edits, and the one an assembly's BOM reads off this part — with `record` (Mass in kg and Volume in mm³ computed from the document's geometry and density, Density in g/cm³ resolved from the Material when none is typed) and `massProperties`, the reading behind it. Waits for the measurement.", NoArgs, part_attributes_get, Read, READ, super::assembly_output_schema::part_attributes),
+    app_command!("document", "part_attribute_set", "Write ONE of the active document's own BOM part attributes (Part_Number, Material, Density in g/cm³, or any custom field); a null or empty value removes it. One undo step per field. Mass is computed from the geometry and refused while there is any; Volume is never written.", PartAttributeArgs, part_attribute_set, Mutate, MUTATE, document_attributes_result_schema),
     app_command!("document", "docs_list", "The open document tabs and which is active. Each tab's `id` and `revision` are the document context any command accepts at the root of its arguments, `context: {documentId: id, expectedRevision: revision}`: checked right before the command runs, it must name the visible document (else `document_not_active`; a tab with a Work part edited in place answers `document_busy`), a write's `expectedRevision` must be the current revision (else `revision_conflict`), and an object result answers with `context: {documentId, expectedRevision}` as it stands after the command. Errors begin with that stable code. A geometry run the command starts moves the revision again when it lands.", NoArgs, docs_list, Read, READ, schema_of::<Tabs>),
     app_command!("document", "doc_activate", "Make the tab at `index` the active document.", IndexArgs, doc_activate, Mutate, MUTATE_NOWAIT, schema_of::<Tabs>),
     app_command!("document", "doc_close", "Close the tab at `index`, or the document whose handle is `id` wherever its tab is; refuses a dirty document unless `discard` is true.", CloseArgs, doc_close, Mutate, DESTRUCTIVE, schema_of::<Tabs>),

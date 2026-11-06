@@ -665,6 +665,15 @@ pub(super) fn iso_rectangle_trim(face: &FaceRecord) -> Result<Option<[f64; 4]>, 
     Ok(found.ok())
 }
 
+/// `BREP_MASS_ISO_RECT_TRIMMED` (default on since the brep-bench promotion;
+/// `=0` restores the old reading): the pole-side clip in
+/// [`iso_rectangle_trim_impl`], and the trimmed integrator reading an
+/// iso-rectangle face on the untrimmed sweep's rules
+/// (`trimmed::integrate_trimmed_multi_with`).
+pub(super) fn pole_side_clip_on() -> bool {
+    switch!("BREP_MASS_ISO_RECT_TRIMMED", true)
+}
+
 fn iso_rectangle_trim_impl(face: &FaceRecord) -> Result<Result<[f64; 4], &'static str>, String> {
     if face.loops.len() != 1 {
         return Ok(Err("not one loop"));
@@ -722,6 +731,35 @@ fn iso_rectangle_trim_impl(face: &FaceRecord) -> Result<Result<[f64; 4], &'stati
         segments.push(([first.x, first.y], [last.x, last.y]));
     }
     let along_u = |segment: &([f64; 2], [f64; 2])| (segment.1[1] - segment.0[1]).abs() <= eps_v;
+    // `BREP_MASS_ISO_RECT_TRIMMED` (default on): a pcurve along u at a level
+    // where the carrier collapses to one point (a sphere's pole) is a
+    // degenerate edge whose u range says nothing about the trim. Boolean
+    // assembly can store it over the whole period (u 1 -> 0) on a face that
+    // spans only part of it, so it does not meet its neighbours and the face
+    // left this route for the trimmed one, which read brep-bench
+    // tangent/half-balls-overlapping's kept quarter sphere (iso-rectangle
+    // [0.25, 0.75] x [0.5, 1]) 1.8e-5 large. Clipped to run from the previous
+    // pcurve's end to the next one's start, it is the rectangle's pole side.
+    if pole_side_clip_on() {
+        for index in 0..4 {
+            let segment = segments[index];
+            if !along_u(&segment) {
+                continue;
+            }
+            let level = segment.0[1];
+            let probe = |u: f64| face.surface.evaluate(u, level);
+            let (a, b, c) = (probe(u0)?, probe(0.5 * (u0 + u1))?, probe(u1)?);
+            let scale = a.length().max(1.0) * 1e-12;
+            if a.sub(b).length() > scale || a.sub(c).length() > scale {
+                continue;
+            }
+            let previous = segments[(index + 3) % 4].1;
+            let next = segments[(index + 1) % 4].0;
+            if (previous[1] - level).abs() <= eps_v && (next[1] - level).abs() <= eps_v {
+                segments[index] = ([previous[0], level], [next[0], level]);
+            }
+        }
+    }
     for index in 0..4 {
         let (_, to) = segments[index];
         let (from, _) = segments[(index + 1) % 4];

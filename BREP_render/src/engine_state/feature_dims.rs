@@ -417,15 +417,11 @@ impl EngineState {
         profile_param: Option<&serde_json::Value>,
     ) -> Option<&brep_kernel::SketchProfile> {
         let name = first_reference_name(profile_param)?;
-        // A committed sketch is surfaced as a render display sheet aliased
-        // `{sketch}:FACE`, and profile consumers may reference the `{sketch}:PROFILE`
-        // form; both alias the base sketch id the run report keys `sketch_profiles`
-        // by. Strip either so the extrude/revolve gizmo resolves the same profile the
-        // kernel does (mirrors `common::normalize_profile_alias` / `resolve_profile`).
-        let base = name
-            .strip_suffix(":FACE")
-            .or_else(|| name.strip_suffix(":PROFILE"))
-            .unwrap_or(&name);
+        // `{sketch}:FACE` (the display-sheet pick) and `{sketch}:PROFILE` alias the
+        // base sketch id the run report keys `sketch_profiles` by: the kernel's ONE
+        // sketch-name rule, so the extrude/revolve gizmo resolves the profile the
+        // kernel does.
+        let base = brep_kernel::feature_pipeline::canonical_sketch_name(&name);
         self.sketch_profiles
             .iter()
             .find(|(id, _)| id == &name || id == base)

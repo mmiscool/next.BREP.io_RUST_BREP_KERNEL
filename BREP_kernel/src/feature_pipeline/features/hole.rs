@@ -124,11 +124,7 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, String> {
     // `common::normalize_profile_alias`), so stripping them collides with nothing.
     let picked = common::first_reference_name(ctx.param("face"))
         .ok_or("hole: requires a sketch selection (`face` names the placement sketch)")?;
-    let aliased = common::normalize_profile_alias(picked);
-    let sketch_name = aliased
-        .strip_suffix(":PROFILE")
-        .map(str::to_string)
-        .unwrap_or(aliased);
+    let sketch_name = common::normalize_profile_alias(picked);
     let frame = ctx.scene.resolve_frame(&sketch_name).ok_or_else(|| {
         format!("hole: placement sketch '{sketch_name}' not found (no resolved sketch frame in the scene)")
     })?;

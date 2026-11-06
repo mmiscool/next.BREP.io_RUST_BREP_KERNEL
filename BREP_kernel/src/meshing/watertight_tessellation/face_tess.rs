@@ -851,6 +851,7 @@ pub(super) fn tessellate_face_watertight(
         }
     }
     tess_profile(|p| p.cdt_used += u64::from(used_cdt));
+    let mut seed_fixed_point = false;
     if used_cdt {
         // The CDT gave a Delaunay boundary triangulation. Seed its interior on
         // the same curvature grid the ear-clip path uses: reaching that density
@@ -872,7 +873,7 @@ pub(super) fn tessellate_face_watertight(
             } else {
                 [u0, u1, v0, v1]
             };
-            seed_interior_grid(
+            seed_fixed_point = seed_interior_grid(
                 face,
                 &mut vertices,
                 &mut triangles,
@@ -892,6 +893,7 @@ pub(super) fn tessellate_face_watertight(
             interior_tolerance,
             scale,
             periodic_interior,
+            seed_fixed_point,
         )?;
     } else if periodic_interior {
         // A single-period periodic cover (the cross-seam torus band) is seeded
@@ -900,7 +902,7 @@ pub(super) fn tessellate_face_watertight(
         // assumes a single period there.
         if single_period_cover {
             let region = region_uv_box(&vertices);
-            seed_interior_grid(
+            seed_fixed_point = seed_interior_grid(
                 face,
                 &mut vertices,
                 &mut triangles,
@@ -920,9 +922,10 @@ pub(super) fn tessellate_face_watertight(
             interior_tolerance,
             scale,
             true,
+            seed_fixed_point,
         )?;
     } else if !skip_interior {
-        seed_interior_grid(
+        seed_fixed_point = seed_interior_grid(
             face,
             &mut vertices,
             &mut triangles,
@@ -941,6 +944,7 @@ pub(super) fn tessellate_face_watertight(
             interior_tolerance,
             scale,
             false,
+            seed_fixed_point,
         )?;
     }
     if let Some((outer, holes)) = planar_trim {

@@ -28,17 +28,23 @@
 //! edge. Anything else (the merge declines, the pieces stay apart, the merged
 //! body refuses too) keeps the ordinary path's refusal unchanged.
 //!
-//! Default OFF (lane F, 2026-10-31): `BREP_SPLIT_RIM_MERGE=1` (or `on`) turns
-//! it on, and `with_split_rim_merge_for_test` forces either on a test's
-//! thread.
+//! Naming: the merged rim is ONE selection, so its blend face and pieces are
+//! named after the FIRST selected edge (`SuiteOperation:BLEND:<first>`, then
+//! `_1`, `_2` ..); a later history that names another piece's wall by its own
+//! edge does not resolve. When the merged body refuses too, the refusal keeps
+//! the ordinary path's text and appends the merged attempt's reason.
+//!
+//! Default ON since the promotion 2026-11-05, (lane F, 2026-10-31, behind a switch
+//! until then): `BREP_SPLIT_RIM_MERGE=0` (or `off`) turns it off, and
+//! `with_split_rim_merge_for_test` forces either on a test's thread.
 
 use crate::topology::BrepSolid;
 use crate::{KernelRefusal, Vec3};
 
-/// Whether the split-rim canonicalisation runs: OFF unless
-/// `BREP_SPLIT_RIM_MERGE=1` (or `on`), or a test's forced value.
+/// Whether the split-rim canonicalisation runs: ON unless
+/// `BREP_SPLIT_RIM_MERGE=0` (or `off`), or a test's forced value.
 pub(crate) fn split_rim_merge_on() -> bool {
-    switch!("BREP_SPLIT_RIM_MERGE", false)
+    switch!("BREP_SPLIT_RIM_MERGE", true)
 }
 
 

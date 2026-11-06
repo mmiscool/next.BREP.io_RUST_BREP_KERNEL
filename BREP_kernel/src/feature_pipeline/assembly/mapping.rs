@@ -1,7 +1,7 @@
 //! Constraint → mate mapping SHARED MACHINERY: selection-ref resolution
 //! against the scene's component registry, the [`map_constraint`] dispatch,
-//! orientation-preference handling (`preferredOppose` XOR
-//! reverse/opposeNormals), first-solve initialization, and the rigid-pose math
+//! the explicit mate facing (`facing`: aligned / opposed, see
+//! [`effective_align`]), first-solve initialization, and the rigid-pose math
 //! shared with the write-back lane. The PER-TYPE `map` functions live with
 //! their constraints ([`super::constraints`], one module per type).
 //!
@@ -323,9 +323,8 @@ pub(super) struct MappedConstraint {
 /// Map one validated, resolved constraint onto kernel mates. `resolved` is
 /// the entry's elements in entry order (the lifecycle has already checked the
 /// count against the type's range). `persistent` is the entry's live
-/// `persistentData` — the orientation-preference cache (`preferredOppose`) is
-/// captured/re-captured here immediately (it is a resolve-time cache, not a
-/// solve result).
+/// `persistentData`; an unset `facing` is captured into `inputParams` here
+/// ([`effective_align`]).
 pub(super) fn map_constraint(
     entry: &mut ConstraintEntry,
     resolved: &[ResolvedElement],
@@ -349,7 +348,10 @@ pub(super) fn map_constraint(
         }
     }
     match entry.constraint_type.as_str() {
-        "coincident" => pair().and_then(|(a, b)| super::constraints::coincident::map(a, b)),
+        "coincident" => {
+            let (a, b) = pair()?;
+            super::constraints::coincident::map_entry(entry, a, b)
+        }
         "touch_align" => {
             let (a, b) = pair()?;
             super::constraints::touch_align::map(entry, a, b)
@@ -473,18 +475,30 @@ pub(super) fn pair_signature(elements: &[String]) -> String {
     pair.join("\n")
 }
 
-/// `preferredOppose` orientation preference: captured from the CURRENT world
-/// directions on first resolve (so the initial solve preserves the assembled
-/// facing), re-captured when the selection signature changes, and XOR'd with
-/// the `reverse`/`opposeNormals` toggle into the mate's align sense.
+/// The mate's facing: the constraint's own `facing` param (`aligned` /
+/// `opposed`, a dropdown in its form; Flip toggles it). Nothing hidden decides
+/// it (owner 2026-11-05).
+///
+/// A constraint with no `facing` yet — a new one, or one saved before it
+/// existed — takes the facing it is assembled with: the old rule, the
+/// `preferredOppose` cache (or, without one, the current directions) XOR its
+/// `legacy` toggle (`reverse` / `opposeNormals`), so no part moves. That
+/// facing is then WRITTEN into `facing` and the hidden pieces are dropped:
+/// from the first solve on, the form shows what the mate holds.
 pub(super) fn effective_align(
     entry: &mut ConstraintEntry,
     dir_a: Vec3,
     dir_b: Vec3,
-    reverse: bool,
+    legacy: &str,
 ) -> MateAlign {
-    let signature = pair_signature(&entry.elements());
     let dot = dir_a.dot(dir_b);
+    entry.set_persistent("lastOrientationDot", serde_json::json!(dot));
+    match entry.input_params.get(FACING).and_then(|value| value.as_str()) {
+        Some(OPPOSED) => return MateAlign::AntiAligned,
+        Some(_) => return MateAlign::Aligned,
+        None => {}
+    }
+    let signature = pair_signature(&entry.elements());
     let cached = entry
         .persistent("preferredOpposeSignature")
         .and_then(|value| value.as_str())
@@ -492,24 +506,35 @@ pub(super) fn effective_align(
         .unwrap_or(false)
         .then(|| entry.persistent("preferredOppose").and_then(|v| v.as_bool()))
         .flatten();
-    let oppose = cached.unwrap_or_else(|| {
-        let oppose = dot < 0.0;
-        entry.set_persistent("preferredOppose", serde_json::Value::Bool(oppose));
-        entry.set_persistent(
-            "preferredOpposeSignature",
-            serde_json::Value::String(signature),
-        );
-        oppose
-    });
-    entry.set_persistent(
-        "lastOrientationDot",
-        serde_json::json!(dot),
-    );
-    if oppose != reverse {
+    let opposed = cached.unwrap_or(dot < 0.0) != entry.flag(legacy);
+    if let Some(params) = entry.input_params.as_object_mut() {
+        params.remove(legacy);
+        params.insert(FACING.into(), serde_json::json!(if opposed { OPPOSED } else { ALIGNED }));
+    }
+    entry.remove_persistent("preferredOppose");
+    entry.remove_persistent("preferredOpposeSignature");
+    if opposed {
         MateAlign::AntiAligned
     } else {
         MateAlign::Aligned
     }
+}
+
+/// The facing param and its two values.
+pub(super) const FACING: &str = "facing";
+pub(super) const ALIGNED: &str = "aligned";
+pub(super) const OPPOSED: &str = "opposed";
+
+/// The `facing` schema field: a dropdown of the two facings; unset (null)
+/// on a new constraint, which takes the facing it is assembled with.
+pub(super) fn facing_field(hint: &str) -> serde_json::Value {
+    serde_json::json!({
+        "type": "options",
+        "options": [ALIGNED, OPPOSED],
+        "default_value": null,
+        "label": "Facing",
+        "hint": hint,
+    })
 }
 
 

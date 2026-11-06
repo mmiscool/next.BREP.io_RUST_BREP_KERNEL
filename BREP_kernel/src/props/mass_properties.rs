@@ -162,6 +162,9 @@ pub use profile::{mass_caller, MassCaller};
 #[path = "mass_properties/identity.rs"]
 mod identity;
 
+#[path = "mass_properties/cell_memo.rs"]
+mod cell_memo;
+pub(crate) use cell_memo::clear as clear_cell_memo;
 #[path = "mass_properties/integration.rs"]
 mod integration;
 #[path = "mass_properties/measures.rs"]

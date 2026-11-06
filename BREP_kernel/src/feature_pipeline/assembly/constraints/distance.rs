@@ -54,11 +54,7 @@ pub(super) fn schema() -> serde_json::Value {
             "default_value": 0,
             "hint": "Signed target: offset along the base face's outward normal (negative = the opposite side); pairings without a face use the magnitude. A new constraint given no value adopts the current separation"
         },
-        "opposeNormals": {
-            "type": "boolean",
-            "default_value": false,
-            "hint": "Face-face mode: flip the second face's normal before alignment"
-        },
+        "facing": super::super::mapping::facing_field("Face-face: Aligned or Opposed normals. Unset, a new constraint takes the facing it is placed with"),
     });
     for (key, field) in limit_fields("mm", 0.1, 10.0) {
         params[key] = field;
@@ -110,8 +106,7 @@ pub(in crate::feature_pipeline::assembly) fn map(
         (Side::Plane, Side::Plane) => {
             let (wa, _) = require_direction(a)?;
             let (wb, _) = require_direction(b)?;
-            let oppose = entry.flag("opposeNormals");
-            let align = effective_align(entry, wa, wb, oppose);
+            let align = effective_align(entry, wa, wb, "opposeNormals");
             let separation = b
                 .world
                 .representative_point()

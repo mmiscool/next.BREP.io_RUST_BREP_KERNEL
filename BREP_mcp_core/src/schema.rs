@@ -90,7 +90,10 @@ pub fn to_json_schema(entry: &Value) -> Value {
     json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "title": id.long_name,
-        "description": format!("inputParams of the {} feature (type `{}`)", id.long_name, id.feature_type),
+        "description": match design_hint(&id.feature_type) {
+            Some(hint) => format!("inputParams of the {} feature (type `{}`). {hint}", id.long_name, id.feature_type),
+            None => format!("inputParams of the {} feature (type `{}`)", id.long_name, id.feature_type),
+        },
         "type": "object",
         "properties": Value::Object(properties),
         "additionalProperties": false,
@@ -101,6 +104,27 @@ pub fn to_json_schema(entry: &Value) -> Value {
             "displayBuilder": id.display_builder,
         },
         "x-unmapped": unmapped,
+    })
+}
+
+/// One line for a feature whose common misuse the kernel refuses or silently
+/// ignores; the full list is the `design-part` skill. Read by a model that
+/// looks the feature up (`feature_schema`, `brep://schema/features/{type}`).
+pub fn design_hint(feature_type: &str) -> Option<&'static str> {
+    Some(match feature_type {
+        "E" => "distanceBack defaults to 10 (two-sided): set it, usually 0; the profile needs a closed loop.",
+        "R" => "Keep the profile on one side of the axis (an edge on the axis is allowed); the axis is `<sketch>:G<line id>` or an edge.",
+        "S" => "Segments join only by sharing point ids; loops may nest but never cross; sketch on a planar face or datum plane.",
+        "H" => "`face` names a sketch: every non-construction point drills one hole; set boolean.targets to the solid.",
+        "F" => "Fillet last; pick edges from scene_entities, never guessed; a radius above a neighbouring face's size or curvature is refused.",
+        "CH" => "Edges of one solid only; pick them from scene_entities; distance 0 does nothing.",
+        "O.S" => "Positive distance shells inward; run it before curved cuts and rim fillets; too thick for the part is refused.",
+        "B" => "Tools must overlap the target by a real amount; touching or tangent operands are refused or do nothing.",
+        "PATTERN" => "Copies solids, not features; circular `count and pitch` takes totalAngleDeg as the angle between copies.",
+        "M" => "Adds a separate mirrored solid and keeps the source; union them with a Boolean when they are one part.",
+        "SW" => "orientationMode translate takes straight paths only; use pathAlign or SWP for curved or closed paths.",
+        "LOFT" => "Every section needs the same number of segments and loops.",
+        _ => return None,
     })
 }
 

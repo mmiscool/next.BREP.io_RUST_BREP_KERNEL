@@ -84,6 +84,7 @@ fn assemble_fragments_impl(
     touched_passes: bool,
     declared_kind: crate::BodyKind,
 ) -> Result<(BrepSolid, Option<AssemblyScope>), KernelRefusal> {
+    let _wall = crate::wall_profile::Stage::open("assembly");
     if selected.is_empty() {
         return Err(KernelRefusal::new(
             RefusalClass::ConservativeEmptyOverlap,

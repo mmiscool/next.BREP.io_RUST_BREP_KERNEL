@@ -156,7 +156,11 @@ All application functions run inside scripts; only run_script, script_result, sc
 Use document identities and expected revisions when editing; await writes sequentially and inspect the result before saving. \
 Supply a unique retry key for each program and reuse it after a lost response. Scripts may have partial effects; halting a script does not undo changes or cancel accepted CAD operations. \
 The local credential grants application and file access. Coordinates are egui points, origin top-left. \
-Return compact summaries and artifact references; use screenshot for inline images.";
+Return compact summaries and artifact references; use screenshot for inline images. \
+Before building or substantially editing a part or assembly, load skill://design-part/SKILL.md (resources/read). \
+Design rules: one document per part, joined by assembly components and constraints that leave only the intended freedom; drive editable sizes from expressions; \
+sketch true arcs and splines, use Hole features for fastener holes and Pattern for repeats; fillets and chamfers go last; check featureErrors, solid count and volume after every feature. \
+Author drawings, PDFs and instruction viewers only with the application's own functions, inspecting every exported page; say so when they cannot do what was asked.";
 
 /// Everything the handler shares across requests: the tool and resource sets
 /// (rebuilt from the registries whenever a session starts or stops), the
@@ -637,7 +641,7 @@ impl ServerHandler for BrepServer {
             let task_form = task_mode && crate::cad::inputs::supports_task_form(&context);
             let progress = crate::progress::waits(&request.name, &args);
             let operation = crate::cad::inputs::with_task_form_support(task_form, (spec.handler)(args));
-            match crate::progress::waiting(&context, progress, operation).await {
+            match crate::progress::waiting(&context, progress, &self.state.slot, operation).await {
                 Ok(out) => {
                     if task_mode && out.json["value"]["running"] == true {
                         let id = out.json["value"]["status"]["executionId"].as_str().ok_or_else(|| McpError::internal_error("missing execution id", None))?;

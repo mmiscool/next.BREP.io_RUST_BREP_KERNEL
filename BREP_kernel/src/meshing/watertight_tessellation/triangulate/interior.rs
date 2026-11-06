@@ -98,7 +98,7 @@ pub(in crate::watertight_tessellation) fn seed_interior_grid(
     // from the host-triangle search below (the CDT covers exactly the trimmed
     // region, so "lands in a triangle" IS "inside the trim").
     boundary: BoundaryForm,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     let _timer = stage_timer(Stage::Seed);
     let [u0, u1, v0, v1] = domains;
     let [su, sv] = scale;
@@ -211,7 +211,7 @@ pub(in crate::watertight_tessellation) fn seed_interior_grid(
         p.seed_grid_v += nv as u64;
     });
     if nu <= 1 || nv <= 1 {
-        return Ok(());
+        return Ok(false);
     }
     // Station budget. Skipping the seed entirely when the chord-driven grid
     // exceeded it (the old behavior) was catastrophic at fine tolerances: the
@@ -365,8 +365,17 @@ pub(in crate::watertight_tessellation) fn seed_interior_grid(
             }
         }
     }
-    lawson_flips(vertices, triangles, boundary_pairs, scale);
-    Ok(())
+    Ok(lawson_flips(vertices, triangles, boundary_pairs, scale))
+}
+
+// The caller passes the seed's convergence only while its vertices, triangles,
+// boundary pairs and metric are unchanged. A round-budget exit is false and
+// must retry. Bounded refinement restores exactly this seed before fallback,
+// so the same certificate applies there; no modified mesh inherits it.
+fn report_seed_reuse(triangles: usize) {
+    if crate::profile::profile_enabled() {
+        crate::imprint::profile_emit(format_args!("tess.seed_fixed_point triangles={triangles}"));
+    }
 }
 
 pub(in crate::watertight_tessellation) fn refine_interior(
@@ -382,7 +391,9 @@ pub(in crate::watertight_tessellation) fn refine_interior(
     // cyclic wrap of the closed direction) so positions land on the real
     // surface. Every non-periodic face passes `false` (bit-identical path).
     periodic: bool,
+    seed_fixed_point: bool,
 ) -> Result<(), String> {
+    let seed_fixed_point = seed_fixed_point && switch!("BREP_TESS_SEED_FIXED_POINT", true);
     let _timer = stage_timer(Stage::Refine);
     // The soundness scan's bounded mesh (`scan_mesh.rs`, default on): an
     // analytic face refines until every triangle's closed-form deviation bound
@@ -390,7 +401,7 @@ pub(in crate::watertight_tessellation) fn refine_interior(
     // meshes from its seed with the display refinement below.
     if let Some(bound) = crate::watertight_tessellation::scan_mesh::face_bound(face) {
         let (seed_vertices, seed_triangles) = (vertices.clone(), triangles.clone());
-        if refine_interior_bounded(&bound, face, vertices, triangles, boundary_pairs, chord_tolerance, scale, periodic)? {
+        if refine_interior_bounded(&bound, face, vertices, triangles, boundary_pairs, chord_tolerance, scale, periodic, seed_fixed_point)? {
             crate::watertight_tessellation::scan_mesh::count(true);
             return Ok(());
         }
@@ -404,7 +415,8 @@ pub(in crate::watertight_tessellation) fn refine_interior(
     // within the chord tolerance yet, so the accuracy guard has nothing to
     // protect here — and this is the largest candidate set the flipper ever
     // sees, so paying two surface evaluations per candidate is pure cost.
-    let mut converged = lawson_flips(vertices, triangles, boundary_pairs, scale);
+    let mut converged = seed_fixed_point || lawson_flips(vertices, triangles, boundary_pairs, scale);
+    if seed_fixed_point { report_seed_reuse(triangles.len()); }
     // Midpoint and normal readings shared across the passes and with the
     // guarded flipper; vertices never move once placed.
     let mut memo = FaceMemo::default();
@@ -596,12 +608,17 @@ fn refine_interior_bounded(
     chord_tolerance: f64,
     scale: [f64; 2],
     periodic: bool,
+    seed_fixed_point: bool,
 ) -> Result<bool, String> {
     use crate::watertight_tessellation::scan_mesh::{reaches_apex, triangle_bound};
     if reaches_apex(bound, vertices.iter().map(|vertex| vertex.position), 4.0 * chord_tolerance) {
         return Ok(false);
     }
-    lawson_flips(vertices, triangles, boundary_pairs, scale);
+    if seed_fixed_point {
+        report_seed_reuse(triangles.len());
+    } else {
+        lawson_flips(vertices, triangles, boundary_pairs, scale);
+    }
     let mut memo = FaceMemo::default();
     for _ in 0..SCAN_REFINE_PASSES {
         tess_profile(|p| p.refine_passes += 1);

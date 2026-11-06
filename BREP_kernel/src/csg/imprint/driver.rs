@@ -1441,7 +1441,9 @@ fn build_imprints_with_carrier_seeds(
     // predicate admits are processed ([`build_carrier_imprints_within`]).
     self_pairs: Option<&dyn Fn(usize, usize) -> bool>,
 ) -> Result<ImprintResultRecord, KernelRefusal> {
+    let _wall = crate::wall_profile::Stage::open("imprint");
     let _profile_sink = ProfileSink::open();
+    let _work = super::work_profile::Scope::open("imprint");
     let classify_before = crate::pair_classification::classify_reads();
     let setup_started = profile_enabled().then(Instant::now);
     let windows_before = window_reads();
@@ -1470,14 +1472,20 @@ fn build_imprints_with_carrier_seeds(
         exact_pcurve_check: false,
         next_id: 1,
     };
-    let hermite_lane = hermite_sections(options);
+    let requested_hermite_lane = hermite_sections(options);
+    let hermite_lane = requested_hermite_lane || super::hermite::carried_uv_enabled();
+    let hermite_min_stations = if hermite_lane { super::hermite::carried_uv_min_stations() } else { 2 };
     let exact_iso = exact_iso_pcurves(options);
     let (ordered_starts, consume_starts, tree_seeds) = march_starts(options, carrier_tree_seeds);
     builder.exact_pcurve_check = exact_iso == ExactIsoPcurves::Check;
     // The Hermite lane needs the march's span test; with no budget asked for
     // it carries the one the catalogue names, the pair's `intersection_fit`.
     let march_span_budget = span_budget(options, builder.scale)
-        .or_else(|| hermite_lane.then(|| crate::KernelTolerances::for_scale(builder.scale, options.tolerance).intersection_fit));
+        .or_else(|| requested_hermite_lane.then(|| crate::KernelTolerances::for_scale(builder.scale, options.tolerance).intersection_fit));
+    // UV reuse must never request a different trace. Its stricter emission
+    // check is applied after clipping; an unqualified run keeps the fit route.
+    let emission_budget = super::hermite::carried_uv_emission_budget(march_span_budget,
+        crate::KernelTolerances::for_scale(builder.scale, options.tolerance).intersection_fit);
     let mut first_faces = faces(solid_a, 0);
     let mut second_faces = faces(solid_b, 1);
     // Per-face trim-window carriers, computed once: tighter BVH bounds, and
@@ -1584,6 +1592,7 @@ fn build_imprints_with_carrier_seeds(
     let mut tangent_imprint_candidates: Vec<(usize, Vec<Vec3>, TaggedFace<'_>, TaggedFace<'_>)> = Vec::new();
     let mut cosurface_pairs: Vec<(FaceKey, FaceKey)> = Vec::new();
     let mut deferred_boundary_spans = Vec::new();
+    let mut work_pairs = super::work_profile::Pairs::new(first_faces.len() * second_faces.len());
     let mut paired = Vec::new();
     for (first_index, first) in first_faces.iter().enumerate() {
         let first = *first;
@@ -1614,6 +1623,7 @@ fn build_imprints_with_carrier_seeds(
             }
             let second = second_faces[second_index];
             profile.pairs += 1;
+            let _work_pair = super::work_profile::Pair::open(&mut work_pairs, first.face, second.face);
             // Set when this pair's section passes through an isolated TANGENT
             // NODE inside both trims (see the classification below). The march
             // is attempted anyway — that is the whole point — but a marcher
@@ -1885,7 +1895,7 @@ fn build_imprints_with_carrier_seeds(
                     .as_ref()
                     .map(|window| &window.surface)
                     .unwrap_or(&second.face.surface);
-                let supplemental = intersect_surfaces_supplemental(
+                let supplemental = super::work_profile::supplemental(
                     first_march,
                     second_march,
                     &SurfaceIntersectionOptions {
@@ -2042,6 +2052,9 @@ fn build_imprints_with_carrier_seeds(
                 .as_ref()
                 .map(|window| &window.surface)
                 .unwrap_or(&second.face.surface);
+            let pair_hermite_lane = hermite_lane && super::hermite::refinement_carriers_eligible(
+                &first.face.surface, &second.face.surface,
+            );
             let mut seed_points = Vec::new();
             // Smallest |edge_tangent · surface_normal| over accepted seeds — the
             // local grazing measure at the trim crossings (near 0 = the edge
@@ -2206,7 +2219,7 @@ fn build_imprints_with_carrier_seeds(
                     first.face.id, second.face.id, pair_classification.relation
                 );
             }
-            let marched = intersect_surfaces(
+            let marched = super::work_profile::trace(
                 first_march,
                 second_march,
                 &SurfaceIntersectionOptions {
@@ -2283,7 +2296,7 @@ fn build_imprints_with_carrier_seeds(
                 // `intersect_surfaces_supplemental` swallows it for exactly this
                 // reason) must NOT convert that graceful empty into a hard error.
                 // On Err, keep the (empty) forward result and carry on.
-                let swapped = intersect_surfaces(
+                let swapped = super::work_profile::trace(
                     second_march,
                     first_march,
                     &SurfaceIntersectionOptions {
@@ -2350,7 +2363,7 @@ fn build_imprints_with_carrier_seeds(
                 && pair_classification.relation == SurfacePairRelation::Candidate
                 && std::env::var("BREP_MARCH_SWAP_CLIP_RESCUE").as_deref() != Ok("0")
             {
-                let swapped = intersect_surfaces(
+                let swapped = super::work_profile::trace(
                     second_march,
                     first_march,
                     &SurfaceIntersectionOptions {
@@ -2476,7 +2489,12 @@ fn build_imprints_with_carrier_seeds(
                     let Some(edge) = face_edge_lists[&owner.key()].iter().find(|edge| edge.id == edge_id) else {
                         continue;
                     };
-                    let crosses = edge_crosses_carrier(edge, t, other_march, options.tolerance)?;
+                    let crosses = edge_crosses_carrier(edge, &face_edge_lists[&owner.key()], t, other_march, options.tolerance)?;
+                    // The two halves of a split edge report one pierce at
+                    // their shared vertex: it is one section point, once.
+                    if crosses && inside.iter().any(|(seen, ..)| seen.sub(point).length() <= options.tolerance) {
+                        continue;
+                    }
                     let contained = crosses && inside_both_trims(point, first, second)?;
                     if debug_pairs && crosses {
                         eprintln!(
@@ -2504,7 +2522,7 @@ fn build_imprints_with_carrier_seeds(
                 if !inside.is_empty() && std::env::var("BREP_GRAZING_SEED_MARCH").as_deref() != Ok("0") {
                     let bound = (options.tolerance / (2.0 * builder.scale.max(options.tolerance))).sqrt();
                     let pierces: Vec<Vec3> = inside.iter().map(|(point, _, _, _)| *point).collect();
-                    let rescued = intersect_surfaces(
+                    let rescued = super::work_profile::trace(
                         first_march,
                         second_march,
                         &SurfaceIntersectionOptions {
@@ -2781,8 +2799,8 @@ fn build_imprints_with_carrier_seeds(
                         // is the march's own cubic Hermite with its two parameter
                         // Hermites, and the fit lane below is skipped.
                         let hermite_started = profile.enabled.then(Instant::now);
-                        let hermite: Option<Result<super::hermite::HermiteSection, super::hermite::HermiteDecline>> = if hermite_lane {
-                            Some(match march_span_budget {
+                        let hermite: Option<Result<super::hermite::HermiteSection, super::hermite::HermiteDecline>> = if pair_hermite_lane && end + 1 - start >= hermite_min_stations {
+                            Some(match emission_budget {
                                 Some(budget) => super::hermite::hermite_section(&run[start..=end], &branch, first_march, second_march, budget)
                                     .or_refuse(KernelStage::Intersect, "csg.imprint.driver.hermite")?,
                                 None => Err(super::hermite::HermiteDecline::NoTangents),
@@ -2795,6 +2813,7 @@ fn build_imprints_with_carrier_seeds(
                         }
                         let (section_curve, exact_pcurves) = match hermite {
                             Some(Ok(emitted)) => {
+                                super::work_profile::add(|c| { c.carried_uv_curves += 2; c.carried_uv_stations += 2 * emitted.stations as u64; });
                                 profile.hermite_runs += 1;
                                 span_census(|| {
                                     format!(
@@ -3013,6 +3032,8 @@ fn build_imprints_with_carrier_seeds(
     if let Some(scope) = pairs_fits {
         profile.pairs_fits = scope.close().fits;
     }
+    super::work_profile::faces(first_faces.iter().chain(&second_faces)
+        .map(|face| (face.face, builder.by_face.contains_key(&face.key()))));
     profile.report();
     let hull_culls = super::builder::take_hull_culls();
     if profile.enabled && super::builder::hull_cull_enabled() {
@@ -3454,7 +3475,17 @@ fn report_graze_contacts(
 /// (one hundredth of the edge's live window): a crossing changes sign with
 /// both readings clear of the tolerance; a lies-on edge reads zero on both
 /// sides and a kiss reads one sign on both. A hit at the edge's end has no
-/// far side and is not a crossing. The signed distance is read against the
+/// far side and is not a crossing, UNLESS the face's boundary continues the
+/// same curve there: `siblings` are the face's edges, and one that carries
+/// this edge's curve bit for bit over the adjoining parameter window is the
+/// other half of an edge a vertex was put on (`apply_edge_splits` keeps the
+/// parent curve and narrows the window). The live window is then the whole
+/// chain's, so the step and both readings are the ones the unsplit edge
+/// gave. Fixture 31's union on its own split operands: pad edge 2 pierces
+/// the model's blend at 0.0525 rad inside both trims, the imprint had put a
+/// vertex at that very pierce, both halves then read "at the end", the
+/// sub-gate march never started and the section it imprints on the unsplit
+/// operands was missing (4 open edges). The signed distance is read against the
 /// carrier itself (projection), never against the tangent plane at the hit,
 /// where a curve lying ON a curved carrier would read a same-signed sagitta
 /// on both sides that outweighs a grazing crossing's first-order departure.
@@ -3463,26 +3494,28 @@ fn report_graze_contacts(
 /// the lower torus half at t = 0.0037 of its rim circle).
 fn edge_crosses_carrier(
     edge: &EdgeRecord,
+    siblings: &[&EdgeRecord],
     t: f64,
     carrier: &NurbsSurface,
     tolerance: f64,
 ) -> Result<bool, KernelRefusal> {
-    let window = edge.t1 - edge.t0;
-    if !(window > 0.0) {
+    if !(edge.t1 - edge.t0 > 0.0) {
         return Ok(false);
     }
+    let (t0, t1) = same_curve_chain_window(edge, siblings);
+    let window = t1 - t0;
     let delta = window * 1e-2;
     let (mut before, mut after) = (t - delta, t + delta);
-    if before < edge.t0 || after > edge.t1 {
-        let start = edge.curve.evaluate(edge.t0).or_refuse(KernelStage::Intersect, "evaluate")?;
-        let end = edge.curve.evaluate(edge.t1).or_refuse(KernelStage::Intersect, "evaluate")?;
+    if before < t0 || after > t1 {
+        let start = edge.curve.evaluate(t0).or_refuse(KernelStage::Intersect, "evaluate")?;
+        let end = edge.curve.evaluate(t1).or_refuse(KernelStage::Intersect, "evaluate")?;
         if start.sub(end).length() > tolerance {
             return Ok(false);
         }
-        if before < edge.t0 {
+        if before < t0 {
             before += window;
         }
-        if after > edge.t1 {
+        if after > t1 {
             after -= window;
         }
     }
@@ -3498,6 +3531,31 @@ fn edge_crosses_carrier(
     }
     let clear = tolerance * 10.0;
     Ok(readings[0] * readings[1] < 0.0 && readings[0].abs() > clear && readings[1].abs() > clear)
+}
+
+/// The parameter window of the chain of `siblings` that continue `edge`'s own
+/// curve: edges with a bit-identical curve whose windows adjoin end to start.
+/// `edge`'s own window when nothing continues it.
+fn same_curve_chain_window(edge: &EdgeRecord, siblings: &[&EdgeRecord]) -> (f64, f64) {
+    let same_curve = |other: &EdgeRecord| other.id != edge.id && !other.degenerate && same_curve_bits(&other.curve, &edge.curve);
+    let halves: Vec<&&EdgeRecord> = siblings.iter().filter(|other| same_curve(other)).collect();
+    let (mut t0, mut t1) = (edge.t0, edge.t1);
+    for _ in 0..halves.len() {
+        let mut grew = false;
+        for other in &halves {
+            if other.t1 == t0 && other.t0 < t0 {
+                t0 = other.t0;
+                grew = true;
+            } else if other.t0 == t1 && other.t1 > t1 {
+                t1 = other.t1;
+                grew = true;
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
+    (t0, t1)
 }
 
 

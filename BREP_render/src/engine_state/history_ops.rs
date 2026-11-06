@@ -158,6 +158,19 @@ impl EngineState {
         if self.history.take_ports_followed() {
             self.rerun_history();
         }
+        // Phases arrive before their import's final reply; only a preview
+        // asks for them.
+        while let Some(phase) = self.runner.poll_mesh_import_phase() {
+            if self.pending_mesh_imports.get(&phase.id) == Some(&MeshImportDestination::Preview) {
+                self.mesh_preview_phases.push_back(phase);
+            }
+        }
+        while let Some(reply) = self.runner.poll_region_fit() {
+            self.region_fit_results.push_back(reply);
+        }
+        while let Some(reply) = self.runner.poll_apply_region_choices() {
+            self.apply_choices_results.push_back(reply);
+        }
         while let Some(reply) = self.runner.poll_mesh_import() {
             // A document switch clears this set. Ignore any older reconstruction
             // reply that was already running when its Reset crossed the queue.
@@ -580,9 +593,11 @@ impl EngineState {
         for (id, pose) in assembly_poses {
             self.fold_assembly_pose(&id, pose);
         }
+        // A legacy Fixed row migrated by the run: the instance setting it
+        // became (`isFixed`, or `flexibleFixed[path]` on the flexible instance
+        // that lends an occurrence `ACOMP1:ACOMP2`).
         for (id, fixed) in assembly_fixed {
-            self.history
-                .fold_param_no_undo(&id, "isFixed", serde_json::Value::Bool(fixed));
+            self.fold_assembly_fixed(&id, fixed);
         }
 
         // Adopt the run's eager provenance (SOLID last-writer) + entity origin
@@ -970,6 +985,11 @@ impl EngineState {
         // script that never enters sketch mode. See the kernel's
         // `features/sketch/loop_ids`.
         stamp_sketch_loop_ids(&mut document);
+        // Mass / Material / Density are PART attributes: an older document
+        // that stored them on occurrences has them lifted onto the part here,
+        // before the library is installed, and the move is reported once.
+        let migration_notices =
+            super::part_mass::migrate_occurrence_part_attributes(&mut document);
         // SEED this thread's kernel parts library from the document's block.
         // The per-run request no longer carries the block (see
         // `History::parts_library`), so this explicit install is the ONE door
@@ -985,6 +1005,9 @@ impl EngineState {
         brep_kernel::install_parts_library(&library);
         self.history = History::from_request_json(&document.to_string())?;
         self.document_thumbnail.replace(thumbnail.map(|image| (self.history.edit_serial(), image)));
+        for notice in migration_notices {
+            self.push_notice(notice);
+        }
         Ok(self.rerun_history())
     }
 
@@ -1709,6 +1732,22 @@ impl EngineState {
     /// pose into its ACOMP `transform` (unless expressions drive it); a
     /// flexible sub-assembly occurrence's (`ACOMP1:ACOMP2`, part-local) into
     /// its instance's `flexiblePoses`, never the child document.
+    pub(crate) fn fold_assembly_fixed(&mut self, id: &str, fixed: bool) {
+        let Some((owner, path)) = id.split_once(':') else {
+            self.history.fold_param_no_undo(id, "isFixed", serde_json::Value::Bool(fixed));
+            return;
+        };
+        let Some(index) = self.history.index_of(owner) else { return };
+        let mut overrides = self
+            .history
+            .feature_params(index)
+            .and_then(|params| params.get("flexibleFixed").cloned())
+            .filter(serde_json::Value::is_object)
+            .unwrap_or_else(|| serde_json::json!({}));
+        overrides[path] = serde_json::Value::Bool(fixed);
+        self.history.fold_param_no_undo(owner, "flexibleFixed", overrides);
+    }
+
     pub(crate) fn fold_assembly_pose(&mut self, id: &str, pose: serde_json::Value) {
         if let Some((owner, path)) = id.split_once(':') {
             let Some(index) = self.history.index_of(owner) else { return };

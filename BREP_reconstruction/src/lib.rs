@@ -7,6 +7,7 @@ pub use hybrid_region_brep::segment_for_hybrid;
 mod numerical;
 
 pub mod brep;
+pub mod import_session;
 pub mod step_validation;
 pub mod stl;
 pub mod stl_conversion;

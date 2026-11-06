@@ -33,6 +33,7 @@ pub(super) mod rollover;
 mod rollover_surgery;
 pub(crate) mod runout;
 pub(crate) mod split_rim;
+pub(crate) mod sheet_ends;
 mod stations;
 mod rows;
 mod track_fit;

@@ -71,10 +71,26 @@ static TALC: talc::wasm::WasmDynamicTalc = talc::wasm::new_wasm_dynamic_allocato
 
 // The native global allocator, when the `native-rusty-alloc` feature asks for it.
 #[cfg(all(feature = "native-rusty-alloc", not(target_family = "wasm")))]
+#[cfg(not(feature = "profile-wall"))]
 #[global_allocator]
 static RUSTY_ALLOC: rusty_alloc_api::RustyAlloc = rusty_alloc_api::RustyAlloc;
 
+#[cfg(all(feature = "native-rusty-alloc", not(target_family = "wasm"), feature = "profile-wall"))]
+#[global_allocator]
+static RUSTY_ALLOC: wall_profile::Allocator<rusty_alloc_api::RustyAlloc> = wall_profile::Allocator(rusty_alloc_api::RustyAlloc);
+
 mod profile;
+#[cfg(feature = "profile-wall")]
+mod wall_profile;
+#[cfg(not(feature = "profile-wall"))]
+#[path = "wall_profile_off.rs"]
+mod wall_profile;
+#[cfg(feature = "profile-wall")]
+mod reader_profile;
+#[cfg(not(feature = "profile-wall"))]
+#[path = "reader_profile_off.rs"]
+mod reader_profile;
+
 
 /// Switch reading for the kernel's dependants ([`switch!`],
 /// [`debug_flag!`], [`mode_switch!`]); not a stable interface.
@@ -198,8 +214,8 @@ pub use solid_codec::{decode_solid, encode_solid, SolidNames, SOLID_CODEC_VERSIO
 #[path = "brep/topology.rs"]
 mod topology;
 pub use topology::{
-    make_box_brep, make_cylinder_brep, make_pyramid_brep, topology_kind, BodyKind, BrepSolid, CellRecord,
-    FaceRecord, IssueKind, KindReport, TopologyKind, ValidationReport,
+    make_box_brep, make_cylinder_brep, make_pyramid_brep, topology_kind, BodyKind, BrepSolid, CellRecord, CoedgeRecord,
+    FaceRecord, IssueKind, KindReport, LoopRecord, TopologyKind, ValidationReport,
 };
 #[path = "brep/soundness.rs"]
 mod soundness;
@@ -344,7 +360,7 @@ pub use feature_pipeline::pmi::{
     balloon_head as pmi_balloon_head, clamp_text_size, format_dimension, format_number,
     nearest_point_on_edge, nearest_point_on_solid, pmi_schema_catalogue, pmi_type,
     nearest_displayed_point, nearest_displayed_point_on_edge, pose_apply as pmi_pose_apply, pose_unapply as pmi_pose_unapply,
-    resolve_state as pmi_resolve_state, entry_names_solid, BalloonAnchor, BalloonAnchorMode, FcfFrame, HalfSpace as PmiHalfSpace, HeadScope as PmiHeadScope, PmiAnnotation,
+    resolve_state as pmi_resolve_state, entry_names_solid, baseline_hide_id, BalloonAnchor, BalloonAnchorMode, FcfFrame, HalfSpace as PmiHalfSpace, HeadScope as PmiHeadScope, PmiAnnotation,
     PmiAnnotationReport, PmiCamera, PmiDisplay, PmiGeometry, PmiPlane, PmiPose, PmiProjection, PmiReport,
     PmiState, PmiStatus, PmiTypeDef, PmiView, PmiViewReport, SolidPoses as PmiSolidPoses, ToleranceBlock, ToleranceMode, PMI_TYPES,
 };
@@ -419,7 +435,7 @@ pub use feature_pipeline::feature_schema_catalogue;
 pub use feature_pipeline::feature_hidden_params;
 // Selection-context applicability: the context bar's per-feature/-constraint
 // show/no-show predicates, plus the constraint type table they pair with.
-pub use feature_pipeline::assembly::{constraint_type, ConstraintTypeDef, CONSTRAINT_TYPES};
+pub use feature_pipeline::assembly::{constraint_type, ConstraintTypeDef, CONSTRAINT_TYPES, FIXED_IS_NOT_A_CONSTRAINT};
 pub use feature_pipeline::{feature_context_applicable, SelectionProbe};
 // The pipeline expression evaluator (the history's `expressions` + `configurator`
 // variable sheet), so a native UI (brep-render's engine-native sketcher) can
@@ -768,7 +784,7 @@ pub use assembly_resolve::{
 #[path = "edit/direct_edit.rs"]
 mod direct_edit;
 pub use direct_edit::{
-    delete_face_and_heal, delete_faces_and_heal, move_faces, offset_freeform_face,
+    delete_face_and_heal, delete_faces_and_heal, draft_faces, draft_faces_parted, move_faces, offset_freeform_face,
     offset_revolution_face, offset_ruled_face, offset_sphere_face, offset_torus_face,
     recut_moved_planes, recut_moved_planes_rigid, resolve_face_by_point, rotate_faces,
     route_reading, RouteReading,

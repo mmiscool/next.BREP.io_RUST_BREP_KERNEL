@@ -418,6 +418,53 @@ impl EngineState {
     ///
     /// [`HistoryRunner`]: crate::runner::HistoryRunner
     pub fn object_info_json(&mut self, name: &str) -> String {
+        let raw = self.object_info_raw_json(name);
+        self.with_part_mass(name, raw)
+    }
+
+    /// A SOLID's info carries the mass the part's density gives it (see
+    /// `engine_state::part_mass`): `density` (g/cm³, `null` when none
+    /// resolves), `densitySource` (`solid` | `part` | `material`), `mass` (kg)
+    /// and, with no number, `massNote` saying why. The runner's unit-density
+    /// `weight` is not reported: the BOM and this window read ONE density.
+    fn with_part_mass(&self, name: &str, raw: String) -> String {
+        let Ok(mut info) = serde_json::from_str::<Value>(&raw) else {
+            return raw;
+        };
+        if info.get("ok").and_then(Value::as_bool) != Some(true)
+            || info.get("kind").and_then(Value::as_str) != Some("solid")
+        {
+            return raw;
+        }
+        let volume = info.get("volume").and_then(Value::as_f64);
+        let resolved = self.solid_density(name);
+        if let Some(object) = info.as_object_mut() {
+            object.remove("weight");
+            object.insert(
+                "density".into(),
+                resolved.map(|(density, _)| Value::from(density)).unwrap_or(Value::Null),
+            );
+            object.insert(
+                "densitySource".into(),
+                resolved
+                    .map(|(_, source)| Value::from(source.as_str()))
+                    .unwrap_or(Value::Null),
+            );
+            let mass = volume.zip(resolved).map(|(v, (d, _))| v * d * 1e-6);
+            object.insert("mass".into(), mass.map(Value::from).unwrap_or(Value::Null));
+            if mass.is_none() {
+                object.insert(
+                    "massNote".into(),
+                    Value::from("no density: set the part's Material or Density"),
+                );
+            }
+        }
+        info.to_string()
+    }
+
+    /// [`Self::object_info_json`] without the part-density fold: the runner's
+    /// measurement as cached.
+    pub(crate) fn object_info_raw_json(&mut self, name: &str) -> String {
         let Some((kind, owner)) = self.resolve_object(name) else {
             // A construction datum/plane carries no resident geometry (no volume /
             // area / length), so it never resolves as a solid/face/edge. Return a

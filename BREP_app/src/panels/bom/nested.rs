@@ -17,18 +17,9 @@ use super::{FLAGS_KEY, ITEM_KEY, QUANTITY_KEY, VISIBLE_KEY};
 use crate::column_tree::{RowAction, RowNode};
 use crate::panels::assembly_components::{is_acomp_segment, ChainNode};
 use crate::panels::bom_columns::{BomColumn, Scope};
-use crate::panels::component_actions::ComponentAction;
 use brep_render::engine_state::EngineState;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
-
-/// Row menu: make this occurrence the Work part, in place.
-pub(crate) const MAKE_WORK_PART: &str = "make-work-part";
-/// Row menu: edit this occurrence's part in a tab of its own.
-pub(crate) const OPEN_NEW_TAB: &str = "open-new-tab";
-/// A file-less part's "Save part as…": its new part file, named by the user
-/// (`FileDialog::edit_component_part`).
-pub(crate) const SAVE_PART_AS: &str = "save-part-as";
 
 /// What a nested line edits through.
 #[derive(Clone, Debug, PartialEq)]
@@ -320,25 +311,16 @@ pub(crate) fn rows(
                 }
             }
             let selected = is_selected(ctx, &child_paths);
-            let mut actions = vec![
-                RowAction::new(MAKE_WORK_PART, "Make Work Part")
-                    .tooltip("Edit this part here, in the context of the assembly (double click)"),
-                RowAction::new(OPEN_NEW_TAB, "Open in new tab")
-                    .tooltip("Edit this part in a tab of its own; the assembly updates as you edit"),
-            ];
-            if child_source.as_deref().is_none_or(str::is_empty) {
-                actions.push(
-                    RowAction::new(SAVE_PART_AS, "Save part as\u{2026}")
-                        .tooltip("This part has no file of its own: save it to a new part file you name"),
-                );
-            }
-            let toggle = ComponentAction::ToggleFixed;
-            let entry = RowAction::new(toggle.id(), toggle.label(fixed)).tooltip(toggle.tooltip()).separator_above();
-            actions.push(match fixed_states.as_slice() {
-                [Ok(_)] => entry,
-                [Err(reason)] => entry.disabled(reason.clone()),
-                many => entry.disabled(format!("{} placements on this row — switch to Unpacked to fix or unfix one", many.len())),
-            });
+            // THE shared component menu, for the occurrence paths this line
+            // stands for (its part's file is its sub-assembly's library's).
+            let actions = crate::panels::component_actions::component_menu(
+                &crate::panels::component_actions::MenuSubject {
+                    ids: child_paths.clone(),
+                    embedded: child_source.as_deref().is_none_or(str::is_empty),
+                    fixed: fixed_states.clone(),
+                    visible,
+                },
+            );
             let children = rows(
                 ctx,
                 &id,

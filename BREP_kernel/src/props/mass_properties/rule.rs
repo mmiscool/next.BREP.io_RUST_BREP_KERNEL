@@ -547,6 +547,7 @@ pub(super) fn surface_panels(
 /// property of the knot cell, so they are cached against it — the panels
 /// themselves still come from the caller's own sub-range.
 pub(super) struct SurfaceRules {
+    pub(super) station_identity: Option<[u64; 2]>,
     u_breaks: Vec<f64>,
     v_breaks: Vec<f64>,
     /// `None` until the cell has been read; `(u roots, v roots)` after.
@@ -557,7 +558,7 @@ impl SurfaceRules {
     pub(super) fn new(surface: &NurbsSurface) -> Result<Self, String> {
         let (u_breaks, v_breaks) = super::surface_breaks(surface)?;
         let cells = vec![None; u_breaks.len().saturating_sub(1) * v_breaks.len().saturating_sub(1)];
-        Ok(Self { u_breaks, v_breaks, cells })
+        Ok(Self { u_breaks, v_breaks, cells, station_identity: super::cell_memo::identity(surface) })
     }
 
     /// Which knot span of `breaks` holds `parameter` (the last one when it

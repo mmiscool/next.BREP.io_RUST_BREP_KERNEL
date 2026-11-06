@@ -9,15 +9,17 @@
 //!
 //! A desktop window is not always drawn: a Wayland compositor sends no frame
 //! callbacks to a window on a hidden workspace, and winit then withholds
-//! `RedrawRequested` indefinitely. So document-level commands do not wait for
-//! a frame. A submit calls the [waker](AutomationQueue::set_waker), which
-//! wakes the desktop event loop independently of egui's repaint bookkeeping,
-//! and the loop dispatches the queue's frame-free head with
-//! [`drain_frameless`](AutomationQueue::drain_frameless) (`desktop_loop`).
-//! Input that drives egui (pointer and keyboard events), captures and
-//! layout-registry commands need a frame ([`frameless`], [`FRAME_BOUND`]):
-//! they and every command queued after them wait for one, which keeps the
-//! queue's order. A read-only input command (`pointer_state`) does not.
+//! `RedrawRequested` indefinitely. So no command waits for one. A submit calls
+//! the [waker](AutomationQueue::set_waker), which wakes the desktop event
+//! loop independently of egui's repaint bookkeeping, and the loop dispatches
+//! the queue's head with [`drain_frameless`](AutomationQueue::drain_frameless)
+//! (`desktop_loop`). What a command needs first is its [`Need`]: app state
+//! (dispatched at once), a current layout (dispatched at once while the last
+//! pass is current, else after one), or a pass of its own (input egui must
+//! apply, a capture of what a pass draws). For the last two the loop runs an
+//! egui pass itself, on demand, without presenting it
+//! ([`needs_pass`](AutomationQueue::needs_pass)); the pass drains the queue
+//! exactly as a drawn frame does, so the queue's order is kept.
 use crate::automation::command::{lookup, Ctx, Envelope, Handler, Notice, NoticeKind, Outcome, Phase, Reply};
 use crate::automation::pointer::Pointer;
 use std::collections::VecDeque;
@@ -73,6 +75,37 @@ struct Inner {
     /// The document the last drawn frame showed: `(handle, committed revision)`
     /// ([`AutomationQueue::publish_view`]), which a capture landing now is of.
     view: Option<(String, u64)>,
+    /// When the last pass (drawn or on demand) published its layout.
+    layout_at: Option<web_time::Instant>,
+    /// Something may have changed the layout since that pass: a command that
+    /// writes, work that finished, a resize.
+    layout_dirty: bool,
+    /// The pass now running applied input: what the input changed is laid
+    /// out by the pass after it (egui draws once more after input), so this
+    /// pass's layout is not the current one for long.
+    input_this_pass: bool,
+}
+
+impl Inner {
+    /// The last pass's layout still stands ([`Need::Layout`]).
+    fn layout_current(&self) -> bool {
+        !self.layout_dirty && self.layout_at.is_some_and(|at| at.elapsed() < LAYOUT_FRESH)
+    }
+
+    /// What the queue's head needs, if there is one.
+    fn front_need(&self) -> Option<Need> {
+        let p = self.pending.front()?;
+        Some(lookup(&p.envelope.cmd).map_or(Need::State, |spec| need(spec, &p.envelope.args)))
+    }
+
+    /// The head can be dispatched now, without a pass.
+    fn front_dispatchable(&self) -> bool {
+        match self.front_need() {
+            Some(Need::State) => true,
+            Some(Need::Layout) => self.layout_current(),
+            _ => false,
+        }
+    }
 }
 
 /// Most notices kept. The app pushes one per toast whether or not a host is
@@ -103,34 +136,55 @@ impl Inner {
 /// Wakes the thread that owns the app when work is queued.
 pub type Waker = Arc<dyn Fn() + Send + Sync>;
 
-/// Commands that need a drawn frame, beyond every `Phase::Input` command:
-/// captures (the image IS a frame), the layout registry and hit rectangles
-/// (published while the panels draw), the dock's rendered panes, and frame
-/// timing. [`AutomationQueue::drain_frameless`] stops at the first of these,
-/// so they, and everything queued after them, keep their in-frame order.
-pub const FRAME_BOUND: &[&str] = &[
-    "screenshot",
-    "illustration_presentation",
-    "state_list",
-    "state_get",
-    "state_schema",
-    "hit_rects",
-    "hit_key_docs",
-    "describe_panes",
-    "perf_stats",
-    "perf_spin",
-    "perf_reset",
-];
+/// What a command needs before it can be dispatched outside a drawn pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Need {
+    /// Nothing: it reads or writes app state, which a pass has no part in.
+    State,
+    /// A current layout: what only a pass publishes (widget rects, the
+    /// viewport rect, focus, the dock's rendered panes). Dispatched at once
+    /// while the last pass is current ([`LAYOUT_FRESH`], nothing changed
+    /// since), else after one.
+    Layout,
+    /// A pass of its own: input egui must apply in a pass, or a capture of
+    /// what a pass draws.
+    Pass,
+}
 
-/// Whether a command can be dispatched without a frame: an app command not
-/// [`FRAME_BOUND`], or a read-only input command (`pointer_state`, which
-/// `session_info` issues). A read-only input command emits no events and only
-/// reads the virtual pointer; every input queued before it has already been
-/// applied to that pointer, so answering it at the head keeps queue order.
-pub fn frameless(spec: &crate::automation::command::CommandSpec) -> bool {
+/// App commands that need a pass of their own: the captures (the image IS a
+/// pass), the presentation loan a capture series runs under, and `ping`, which
+/// answers from the next pass (the composite tools step the app with it).
+pub const PASS_BOUND: &[&str] = &["screenshot", "illustration_presentation", "ping"];
+
+/// App commands that read the layout a pass publishes. `state_get` and
+/// `state_schema` are here only for a name that is not a plain-state blob
+/// (`automation::state_blobs`): those are built from the app at dispatch.
+pub const LAYOUT_BOUND: &[&str] = &["hit_rects", "state_list", "state_get", "state_schema", "locate", "pick"];
+
+/// How long the last pass's layout stands for a layout read when nothing has
+/// changed since: one frame at 60 Hz, the age a drawn window's layout has.
+/// Older than that, time alone may have moved it (a toast expiring, the
+/// working indicator appearing), so the read gets a pass of its own.
+pub const LAYOUT_FRESH: std::time::Duration = std::time::Duration::from_millis(16);
+
+/// What `spec` called with `args` needs ([`Need`]).
+pub fn need(spec: &crate::automation::command::CommandSpec, args: &serde_json::Value) -> Need {
     match spec.handler {
-        Handler::App(_) => spec.phase != Phase::Input && !FRAME_BOUND.contains(&spec.name),
-        Handler::Input(_) => spec.phase == Phase::Input && spec.annotations.read_only,
+        // A read-only input command (`pointer_state`, which `session_info`
+        // issues) emits no events and only reads the virtual pointer; every
+        // input queued before it has already been applied to that pointer.
+        Handler::Input(_) if spec.phase == Phase::Input && spec.annotations.read_only => Need::State,
+        Handler::Input(_) => Need::Pass,
+        Handler::App(_) if spec.phase == Phase::Input || PASS_BOUND.contains(&spec.name) => Need::Pass,
+        Handler::App(_) if matches!(spec.name, "state_get" | "state_schema") => {
+            let names = args.get("names").and_then(serde_json::Value::as_array);
+            let state = names.is_some_and(|names| {
+                names.iter().all(|n| n.as_str().is_some_and(crate::automation::state_blobs::is_state_blob))
+            });
+            if state { Need::State } else { Need::Layout }
+        }
+        Handler::App(_) if LAYOUT_BOUND.contains(&spec.name) => Need::Layout,
+        Handler::App(_) => Need::State,
     }
 }
 
@@ -219,11 +273,31 @@ impl AutomationQueue {
     }
 
     /// Whether [`drain_frameless`](Self::drain_frameless) has anything to do:
-    /// a frame-free command at the head of the queue, or polled work.
+    /// a head it can dispatch without a pass, or polled work.
     pub fn has_frameless_work(&self) -> bool {
         let inner = self.inner.lock().unwrap();
-        !inner.polling.is_empty()
-            || inner.pending.front().is_some_and(|p| lookup(&p.envelope.cmd).is_some_and(frameless))
+        !inner.polling.is_empty() || inner.front_dispatchable()
+    }
+
+    /// Whether the queue's head waits for a pass: input, a capture, or a
+    /// layout read with no current layout. The desktop loop runs one on demand.
+    pub fn needs_pass(&self) -> bool {
+        let inner = self.inner.lock().unwrap();
+        inner.front_need().is_some() && !inner.front_dispatchable()
+    }
+
+    /// The layout may have changed outside a command (a resize, finished
+    /// background work): the next layout read gets a pass.
+    pub fn mark_layout_dirty(&self) {
+        self.inner.lock().unwrap().layout_dirty = true;
+    }
+
+    /// A pass (drawn or on demand) has just published its layout and answered
+    /// its reads (`BrepApp::drain_reads`).
+    pub fn note_pass(&self) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.layout_at = Some(web_time::Instant::now());
+        inner.layout_dirty = std::mem::take(&mut inner.input_this_pass);
     }
 
     /// Record something the session should know about — a toast the user would
@@ -372,6 +446,7 @@ impl AutomationQueue {
             ctx.input_mut(|i| i.pointer = egui::PointerState::default());
         }
         raw.modifiers = inner.pointer.modifiers.egui();
+        inner.input_this_pass = !events.is_empty();
         raw.events.extend(events);
     }
 
@@ -400,18 +475,20 @@ impl AutomationQueue {
         }
     }
 
-    /// Dispatch without a frame (the desktop loop's service step): the
-    /// queue's head, in FIFO order, up to the first command that needs a
-    /// frame ([`frameless`]); then one poll of the work they started. Returns
-    /// whether polled work is still outstanding. Runs on the app's thread, so
-    /// mutations stay sequential with the UI's own writers.
+    /// Dispatch without a pass (the desktop loop's service step): the
+    /// queue's head, in FIFO order, up to the first command that needs a pass
+    /// ([`needs_pass`](Self::needs_pass), which the loop then runs); then one
+    /// poll of the work they started. Returns whether polled work is still
+    /// outstanding. Runs on the app's thread, so mutations stay sequential
+    /// with the UI's own writers.
     pub fn drain_frameless(&self, ctx: &mut Ctx<'_>) -> bool {
         let frame = self.frame();
         loop {
             let next = {
                 let mut inner = self.inner.lock().unwrap();
+                let ready = inner.front_dispatchable();
                 match inner.pending.front().and_then(|p| lookup(&p.envelope.cmd)) {
-                    Some(spec) if frameless(spec) => {
+                    Some(spec) if ready => {
                         let p = inner.pending.pop_front().expect("front exists");
                         if let Handler::Input(f) = &spec.handler {
                             // A read-only input command: answered here, as the
@@ -447,6 +524,11 @@ impl AutomationQueue {
         if p.expired(frame) { return; }
         let spec = lookup(&p.envelope.cmd).expect("checked at submit");
         let Handler::App(f) = &spec.handler else { return };
+        if !spec.annotations.read_only {
+            // What it writes may move the layout: the next layout read waits
+            // for a pass.
+            self.mark_layout_dirty();
+        }
         // A document context is checked HERE, on the frame thread, right
         // before the handler: the only point atomic with the UI's own
         // writers. It is stripped from the handler's arguments.
@@ -492,6 +574,8 @@ impl AutomationQueue {
                     self.inner.lock().unwrap().polling.push(entry);
                 }
                 Some(result) => {
+                    // Finished work may have changed what a pass would show.
+                    self.mark_layout_dirty();
                     let result = match &entry.bound {
                         Some(handle) => tag_context(&ctx.app.docs, handle, result),
                         None => result,
@@ -511,6 +595,17 @@ impl AutomationQueue {
         let mut inner = self.inner.lock().unwrap();
         if inner.view.as_ref().is_none_or(|(h, r)| h != handle || *r != revision) {
             inner.view = Some((handle.to_string(), revision));
+        }
+    }
+
+    /// Answer every capture still waiting for its image with `error` (an
+    /// on-demand pass could not draw it).
+    pub fn fail_captures(&self, error: &str) {
+        let mut inner = self.inner.lock().unwrap();
+        let frame = inner.frame;
+        for a in std::mem::take(&mut inner.awaiting) {
+            let notices = inner.reply_notices();
+            let _ = a.pending.reply.send(Reply::err(a.pending.envelope.id, frame, error.to_string(), notices));
         }
     }
 

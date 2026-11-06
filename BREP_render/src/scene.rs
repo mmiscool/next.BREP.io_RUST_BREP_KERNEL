@@ -241,6 +241,31 @@ impl RenderScene {
         true
     }
 
+    /// Set the per-FACE colour overrides of solid `name`, face `i` taking
+    /// `colors[i]` (faces past the slice are left alone), bumping the solid's
+    /// revision only when one changed. Returns false if the solid is unknown.
+    /// A display-only body (the mesh import's region view) colours its faces
+    /// through this.
+    pub fn set_face_colors(&mut self, name: &str, colors: &[Option<[f32; 3]>]) -> bool {
+        let Some(slot) = self.index.get(name).copied() else {
+            return false;
+        };
+        let solid = &mut self.solids[slot];
+        let mut changed = false;
+        for (face, &color) in solid.faces.iter_mut().zip(colors) {
+            if face.color_override != color {
+                face.color_override = color;
+                changed = true;
+            }
+        }
+        if changed {
+            solid.revision = next_revision();
+            solid.shape_revision = 0;
+            solid.pose = None;
+        }
+        true
+    }
+
     /// Re-derive every solid's and face's base colour from the name-keyed
     /// metadata store — the ONE seam through which the durable `color`
     /// attribute reaches the display.

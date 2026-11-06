@@ -74,7 +74,10 @@ impl Drop for PcurveStackPointScope {
 /// while avoiding both the derivative grids and their allocation. Other
 /// degrees and open-direction extension keep the original API. Periodic
 /// wrap retains the original parameter arithmetic before value evaluation.
+#[cfg_attr(feature = "profile-wall", track_caller)]
 fn section_extended_point(surface: &NurbsSurface, u: f64, v: f64, enabled: bool) -> Result<Vec3, String> {
+        let _reader = crate::reader_profile::Point::open(crate::reader_profile::SURFACE, std::panic::Location::caller());
+    let _wall = crate::wall_profile::Scope::enter(crate::wall_profile::POINT);
     if enabled && u.is_finite() && v.is_finite()
         && surface.degree_u <= crate::curve::MAX_STACK_DEGREE
         && surface.degree_v <= crate::curve::MAX_STACK_DEGREE {
@@ -103,6 +106,10 @@ fn section_extended_point(surface: &NurbsSurface, u: f64, v: f64, enabled: bool)
 /// One immutable carrier/section pair; nested fits own separate maps. Keys
 /// preserve all parameter bits, and failed evaluations are never retained.
 struct PcurveSampleCache {
+    curve_trace: Option<crate::imprint::reuse_profile::Trace<u64>>,
+    surface_trace: Option<crate::imprint::reuse_profile::Trace<(u64, u64, bool, bool)>>,
+    rollover: bool,
+    point_limit: usize,
     surface: usize,
     curve: usize,
     curves: rustc_hash::FxHashMap<u64, Vec3>,
@@ -118,8 +125,18 @@ thread_local! {
 struct PcurveSampleScope<'a>(std::marker::PhantomData<(&'a NurbsSurface, &'a NurbsCurve)>);
 impl<'a> PcurveSampleScope<'a> {
     fn open(surface: &'a NurbsSurface, curve: &'a NurbsCurve, enabled: bool) -> Self {
+        Self::open_limit(surface, curve, enabled, switch!("BREP_PCURVE_SAMPLE_ROLLOVER", false),
+            if larger_working_set() { 65536 } else { PCURVE_SAMPLE_CACHE_LIMIT })
+    }
+    fn open_config(surface: &'a NurbsSurface, curve: &'a NurbsCurve, enabled: bool, rollover: bool) -> Self {
+        Self::open_limit(surface, curve, enabled, rollover, PCURVE_SAMPLE_CACHE_LIMIT)
+    }
+    fn open_limit(surface: &'a NurbsSurface, curve: &'a NurbsCurve, enabled: bool, rollover: bool, point_limit: usize) -> Self {
         let cache = enabled
-            .then(|| PcurveSampleCache { surface: surface as *const _ as usize,
+            .then(|| PcurveSampleCache {
+                curve_trace: crate::imprint::reuse_profile::Trace::open("curve", || serde_json::json!({"curve":curve,"identity":curve as *const _ as usize,"limit":point_limit})),
+                surface_trace: crate::imprint::reuse_profile::Trace::open("surface", || serde_json::json!({"surface":surface,"identity":surface as *const _ as usize,"curve":curve,"limit":point_limit})),
+                rollover, point_limit, surface: surface as *const _ as usize,
                 curve: curve as *const _ as usize, curves: Default::default(),
                 surfaces: Default::default(), inversions: Default::default(), requests: [0; 4], hits: [0; 4], speeds: Default::default() });
         PCURVE_SAMPLES.with(|stack| stack.borrow_mut().push(cache));
@@ -129,6 +146,7 @@ impl<'a> PcurveSampleScope<'a> {
 impl Drop for PcurveSampleScope<'_> {
     fn drop(&mut self) {
         PCURVE_SAMPLES.with(|stack| {
+        let _wall = crate::wall_profile::Scope::enter(crate::wall_profile::LOOKUP);
             if let Some(Some(cache)) = stack.borrow_mut().pop() {
                 if crate::profile::profile_enabled() {
                     profile_line!("pcurve.samples requests={:?} hits={:?} retained={:?}", cache.requests,
@@ -139,9 +157,28 @@ impl Drop for PcurveSampleScope<'_> {
     }
 }
 const PCURVE_SAMPLE_CACHE_LIMIT: usize = 16384;
+
+/// Exact reuse distances put the measured fit/point working sets above the
+/// old ceilings. This experiment retains the first entries under larger,
+/// fixed limits; it never evicts useful early stations or changes a reader.
+pub(crate) fn larger_working_set() -> bool {
+    switch!("BREP_PCURVE_WORKING_SET", false)
+}
+
+/// The old policy retains only the first stations of a fit, even when later
+/// verification passes repeatedly visit a different working set. Rollover
+/// preserves the bound and every exact-bit key; evicted values are evaluated
+/// by the original reader. Apply only to the two maps observed to saturate.
+fn retain_sample<K: std::hash::Hash + Eq, V>(
+    map: &mut rustc_hash::FxHashMap<K, V>, key: K, value: V, rollover: bool, limit: usize,
+) {
+    if rollover && map.len() >= limit { map.clear(); }
+    if map.len() < limit { map.insert(key, value); }
+}
 fn section_u_speed(surface: &NurbsSurface, u: f64, v: f64) -> Result<f64, String> {
     let key = (u.to_bits(), v.to_bits());
     let (active, hit) = PCURVE_SAMPLES.with(|stack| {
+        let _wall = crate::wall_profile::Scope::enter(crate::wall_profile::LOOKUP);
         let mut stack = stack.borrow_mut();
         let Some(Some(cache)) = stack.last_mut() else { return (false, None) };
         if cache.surface != surface as *const _ as usize { return (false, None) }
@@ -153,6 +190,7 @@ fn section_u_speed(surface: &NurbsSurface, u: f64, v: f64) -> Result<f64, String
     if let Some(hit) = hit { return Ok(hit) }
     let speed = surface.deriv1(u, v)?.1.length();
     if active { PCURVE_SAMPLES.with(|stack| {
+        let _wall = crate::wall_profile::Scope::enter(crate::wall_profile::LOOKUP);
         let mut stack = stack.borrow_mut();
         let cache = stack.last_mut().unwrap().as_mut().unwrap();
         if cache.speeds.len() < PCURVE_SAMPLE_CACHE_LIMIT { cache.speeds.insert(key, speed); }
@@ -160,52 +198,85 @@ fn section_u_speed(surface: &NurbsSurface, u: f64, v: f64) -> Result<f64, String
     Ok(speed)
 }
 
+#[track_caller]
 fn section_curve_point(curve: &NurbsCurve, parameter: f64) -> Result<Vec3, String> {
+    let caller = std::panic::Location::caller();
     let key = parameter.to_bits();
     let (active, hit) = PCURVE_SAMPLES.with(|stack| {
+        let _wall = crate::wall_profile::Scope::enter(crate::wall_profile::LOOKUP);
         let mut stack = stack.borrow_mut();
         let Some(Some(cache)) = stack.last_mut() else { return (false, None) };
         if cache.curve != curve as *const _ as usize { return (false, None) }
         cache.requests[0] += 1;
         let hit = cache.curves.get(&key).copied();
         cache.hits[0] += usize::from(hit.is_some());
+        if hit.is_some() { if let Some(trace) = &mut cache.curve_trace { trace.access(&key, caller, true, true); } }
         (true, hit)
     });
     if let Some(hit) = hit { return Ok(hit) }
-    let point = curve.evaluate(parameter)?;
+    let result = curve.evaluate(parameter);
+    let point = match result {
+        Ok(point) => point,
+        Err(error) => {
+            if active { PCURVE_SAMPLES.with(|stack| {
+        let _wall = crate::wall_profile::Scope::enter(crate::wall_profile::LOOKUP); if let Some(trace) = &mut stack.borrow_mut().last_mut().unwrap().as_mut().unwrap().curve_trace {
+                trace.access(&key, caller, false, false);
+            } }); }
+            return Err(error);
+        }
+    };
     if active { PCURVE_SAMPLES.with(|stack| {
+        let _wall = crate::wall_profile::Scope::enter(crate::wall_profile::LOOKUP);
         let mut stack = stack.borrow_mut();
         let cache = stack.last_mut().unwrap().as_mut().unwrap();
-        if cache.curves.len() < PCURVE_SAMPLE_CACHE_LIMIT { cache.curves.insert(key, point); }
+        if let Some(trace) = &mut cache.curve_trace { trace.access(&key, caller, false, true); }
+        retain_sample(&mut cache.curves, key, point, cache.rollover, cache.point_limit);
     }); }
     Ok(point)
 }
+#[track_caller]
 fn section_surface_point(surface: &NurbsSurface, u: f64, v: f64, extended: bool) -> Result<Vec3, String> {
+    let caller = std::panic::Location::caller();
     // Extended evaluation has two arithmetic paths. Keep them separate even
     // if a nested caller changes the stack-point policy within this scope.
     let stack_point = PCURVE_STACK_POINT.with(|state| state.get());
     let key = (u.to_bits(), v.to_bits(), extended, stack_point);
     let (active, hit) = PCURVE_SAMPLES.with(|stack| {
+        let _wall = crate::wall_profile::Scope::enter(crate::wall_profile::LOOKUP);
         let mut stack = stack.borrow_mut();
         let Some(Some(cache)) = stack.last_mut() else { return (false, None) };
         if cache.surface != surface as *const _ as usize { return (false, None) }
         cache.requests[1] += 1;
         let hit = cache.surfaces.get(&key).copied();
         cache.hits[1] += usize::from(hit.is_some());
+        if hit.is_some() { if let Some(trace) = &mut cache.surface_trace { trace.access(&key, caller, true, true); } }
         (true, hit)
     });
     if let Some(hit) = hit { return Ok(hit) }
-    let point = if extended { section_extended_point(surface, u, v, stack_point)? } else { surface.evaluate(u, v)? };
+    let result = if extended { section_extended_point(surface, u, v, stack_point) } else { surface.evaluate(u, v) };
+    let point = match result {
+        Ok(point) => point,
+        Err(error) => {
+            if active { PCURVE_SAMPLES.with(|stack| {
+        let _wall = crate::wall_profile::Scope::enter(crate::wall_profile::LOOKUP); if let Some(trace) = &mut stack.borrow_mut().last_mut().unwrap().as_mut().unwrap().surface_trace {
+                trace.access(&key, caller, false, false);
+            } }); }
+            return Err(error);
+        }
+    };
     if active { PCURVE_SAMPLES.with(|stack| {
+        let _wall = crate::wall_profile::Scope::enter(crate::wall_profile::LOOKUP);
         let mut stack = stack.borrow_mut();
         let cache = stack.last_mut().unwrap().as_mut().unwrap();
-        if cache.surfaces.len() < PCURVE_SAMPLE_CACHE_LIMIT { cache.surfaces.insert(key, point); }
+        if let Some(trace) = &mut cache.surface_trace { trace.access(&key, caller, false, true); }
+        retain_sample(&mut cache.surfaces, key, point, cache.rollover, cache.point_limit);
     }); }
     Ok(point)
 }
 fn invert_checked(surface: &NurbsSurface, point: Vec3) -> Result<([f64; 2], f64), String> {
     let key = [point.x.to_bits(), point.y.to_bits(), point.z.to_bits()];
     let (active, hit) = PCURVE_SAMPLES.with(|stack| {
+        let _wall = crate::wall_profile::Scope::enter(crate::wall_profile::LOOKUP);
         let mut stack = stack.borrow_mut();
         let Some(Some(cache)) = stack.last_mut() else { return (false, None) };
         if cache.surface != surface as *const _ as usize { return (false, None) }
@@ -217,6 +288,7 @@ fn invert_checked(surface: &NurbsSurface, point: Vec3) -> Result<([f64; 2], f64)
     if let Some(hit) = hit { return Ok(hit) }
     let projection = invert_checked_uncached(surface, point)?;
     if active { PCURVE_SAMPLES.with(|stack| {
+        let _wall = crate::wall_profile::Scope::enter(crate::wall_profile::LOOKUP);
         let mut stack = stack.borrow_mut();
         let cache = stack.last_mut().unwrap().as_mut().unwrap();
         if cache.inversions.len() < PCURVE_SAMPLE_CACHE_LIMIT { cache.inversions.insert(key, projection); }
@@ -1026,6 +1098,7 @@ impl<'a> FootMemoScope<'a> {
     pub(crate) fn open(surface: &'a NurbsSurface) -> Self {
         let key = surface as *const NurbsSurface;
         let previous = FOOT_MEMO.with(|memo| {
+        let _wall = crate::wall_profile::Scope::enter(crate::wall_profile::LOOKUP);
             let mut memo = memo.borrow_mut();
             if memo.as_ref().is_some_and(|open| std::ptr::eq(open.surface, key)) {
                 None
@@ -1062,6 +1135,7 @@ fn memo_global_foot(surface: &NurbsSurface, point: Vec3) -> Option<crate::Surfac
     let key = point_bits(point);
     let deferring = DEFER_FOOT_INSERTS.with(|cell| cell.get());
     let hit = FOOT_MEMO.with(|memo| {
+        let _wall = crate::wall_profile::Scope::enter(crate::wall_profile::LOOKUP);
         memo.borrow_mut().as_mut().filter(|open| std::ptr::eq(open.surface, surface)).map(|open| {
             match open.global.get(&key).copied() {
                 Some(foot) => Some(foot),
@@ -1078,6 +1152,7 @@ fn memo_global_foot(surface: &NurbsSurface, point: Vec3) -> Option<crate::Surfac
         Some(None) => {
             let foot = project_point_to_surface(surface, point).ok();
             FOOT_MEMO.with(|memo| {
+        let _wall = crate::wall_profile::Scope::enter(crate::wall_profile::LOOKUP);
                 if let Some(open) = memo.borrow_mut().as_mut().filter(|open| std::ptr::eq(open.surface, surface)) {
                     if deferring {
                         open.pending_global.push((key, foot));
@@ -1099,6 +1174,7 @@ fn memo_seeded_foot(surface: &NurbsSurface, point: Vec3, seed_u: f64, seed_v: f6
     let key = [x, y, z, seed_u.to_bits(), seed_v.to_bits()];
     let deferring = DEFER_FOOT_INSERTS.with(|cell| cell.get());
     let hit = FOOT_MEMO.with(|memo| {
+        let _wall = crate::wall_profile::Scope::enter(crate::wall_profile::LOOKUP);
         memo.borrow_mut().as_mut().filter(|open| std::ptr::eq(open.surface, surface)).map(|open| {
             match open.seeded.get(&key).copied() {
                 Some(foot) => Some(foot),
@@ -1115,6 +1191,7 @@ fn memo_seeded_foot(surface: &NurbsSurface, point: Vec3, seed_u: f64, seed_v: f6
         Some(None) => {
             let foot = project_point_to_surface_seeded(surface, point, seed_u, seed_v).ok();
             FOOT_MEMO.with(|memo| {
+        let _wall = crate::wall_profile::Scope::enter(crate::wall_profile::LOOKUP);
                 if let Some(open) = memo.borrow_mut().as_mut().filter(|open| std::ptr::eq(open.surface, surface)) {
                     if deferring {
                         open.pending_seeded.push((key, foot));
@@ -1183,6 +1260,7 @@ impl Drop for PcurveFitScope {
 }
 
 pub(crate) fn record_fit(report: &PcurveFitReport) {
+    crate::imprint::work_profile::add(|c| { c.fit_reports += 1; c.fit_samples += report.samples as u64; c.fit_raised += u64::from(report.raised); });
     // Per-fit trace for the convergence probes (`trim_floor_sweep_probe` and
     // its offset-shell sibling): one line per fit with the whole report, the
     // way `BREP_DEBUG_PCURVE` traces an endpoint failure.
@@ -1222,6 +1300,90 @@ fn probe_residual(
 /// its own read.
 const TRACKING_ACCEPTANCE_POINTS: usize = 16;
 
+/// Streaming batch over one immutable curve. Initialization is lazy so an empty
+/// probe grid does not validate a curve that the scalar path never reads.
+/// Span and basis scratch survive successive reads; equal clamped parameters
+/// reuse their basis. No grid is reordered and no point is read ahead.
+struct ProbeCurveReader<'a> {
+    curve: &'a NurbsCurve,
+    enabled: bool,
+    domain: Option<[f64; 2]>,
+    span: Option<usize>,
+    previous: Option<u64>,
+    basis: [f64; crate::curve::MAX_STACK_ORDER],
+    left: [f64; crate::curve::MAX_STACK_ORDER],
+    right: [f64; crate::curve::MAX_STACK_ORDER],
+}
+impl<'a> ProbeCurveReader<'a> {
+    fn new(curve: &'a NurbsCurve, enabled: bool) -> Self {
+        Self { curve, enabled, domain: None, span: None, previous: None,
+            basis: [0.0; crate::curve::MAX_STACK_ORDER],
+            left: [0.0; crate::curve::MAX_STACK_ORDER], right: [0.0; crate::curve::MAX_STACK_ORDER] }
+    }
+    #[cfg_attr(feature = "profile-wall", track_caller)]
+    fn evaluate(&mut self, parameter: f64) -> Result<Vec3, String> {
+        let _reader = crate::reader_profile::Point::open(crate::reader_profile::PCURVE, std::panic::Location::caller());
+        if !self.enabled || self.curve.degree > crate::curve::MAX_STACK_DEGREE || !parameter.is_finite() {
+            return self.curve.evaluate(parameter);
+        }
+        let _wall = crate::wall_profile::Scope::enter(crate::wall_profile::POINT);
+        let [start, end] = match self.domain {
+            Some(domain) => domain,
+            None => {
+                let domain = self.curve.domain()?;
+                // Import validation tolerates tiny descending knot differences;
+                // only genuinely ordered vectors may use a forward span walk.
+                if self.curve.knots.windows(2).any(|w| w[1] < w[0]) {
+                    self.enabled = false;
+                    return self.curve.evaluate(parameter);
+                }
+                self.domain = Some(domain); domain
+            }
+        };
+        let parameter = parameter.clamp(start, end);
+        if self.previous != Some(parameter.to_bits()) {
+            let knots = &self.curve.knots;
+            let degree = self.curve.degree;
+            let span = match self.span {
+                Some(mut span) if parameter > start && parameter < end && parameter >= knots[span] => {
+                    while parameter >= knots[span + 1] { span += 1; }
+                    span
+                }
+                _ => crate::curve::knot_find_span(knots, degree, parameter),
+            };
+            // Use the scalar recurrence verbatim, including its parameter-
+            // dependent subtraction/addition order in the denominator. A
+            // precomputed knot difference would change rounding.
+            match degree {
+                1 => self.fill_basis::<1>(span, parameter),
+                2 => self.fill_basis::<2>(span, parameter),
+                3 => self.fill_basis::<3>(span, parameter),
+                4 => self.fill_basis::<4>(span, parameter),
+                5 => self.fill_basis::<5>(span, parameter),
+                6 => self.fill_basis::<6>(span, parameter),
+                7 => self.fill_basis::<7>(span, parameter),
+                _ => self.fill_basis::<0>(span, parameter),
+            }
+            self.span = Some(span);
+            self.previous = Some(parameter.to_bits());
+        }
+        let span = self.span.unwrap();
+        let _reader_part = crate::reader_profile::Part::open(crate::reader_profile::ACCUMULATE);
+        let mut point = Vec4 { x: 0.0, y: 0.0, z: 0.0, w: 0.0 };
+        for (index, value) in self.basis[..=self.curve.degree].iter().enumerate() {
+            point = point.add(self.curve.control_points[span - self.curve.degree + index].scale(*value));
+        }
+        point.point()
+    }
+    #[inline(always)]
+    fn fill_basis<const DEGREE: usize>(&mut self, span: usize, parameter: f64) {
+        crate::curve::basis_functions_raw_into(&self.curve.knots, DEGREE, span, parameter,
+            EPSILON, &mut self.basis, &mut self.left, &mut self.right);
+    }
+}
+
+fn probe_batch_enabled() -> bool { switch!("BREP_PCURVE_PROBE_BATCH", false) }
+
 /// The same-parameter image-vs-edge distance of `pcurve` at `locals` (span
 /// fractions) inside every span of `parameters`: the largest, or an error if
 /// any is not finite.
@@ -1233,11 +1395,13 @@ fn probe_residual_at(
     [t0, t1]: [f64; 2],
     locals: &[f64],
 ) -> Result<f64, String> {
+    crate::imprint::work_profile::add(|c| { c.pcurve_probe_passes += 1; c.pcurve_probe_samples += (parameters.len().saturating_sub(1) * locals.len()) as u64; });
     let mut worst = 0.0_f64;
+    let mut reader = ProbeCurveReader::new(pcurve, probe_batch_enabled());
     for span in parameters.windows(2) {
         for &local in locals {
             let fraction = span[0] + (span[1] - span[0]) * local;
-            let parameter = pcurve.evaluate(fraction)?;
+            let parameter = reader.evaluate(fraction)?;
             let on_surface =
                 section_surface_point(surface, parameter.x, parameter.y, true)?;
             let on_curve = section_curve_point(curve, t0 + (t1 - t0) * fraction)?;
@@ -1302,9 +1466,11 @@ struct NativeRead {
 }
 
 fn native_read(surface: &NurbsSurface, curve: &NurbsCurve, pcurve: &NurbsCurve, [t0, t1]: [f64; 2], fractions: &[f64]) -> Result<NativeRead, String> {
+    crate::imprint::work_profile::add(|c| { c.pcurve_native_passes += 1; c.pcurve_native_samples += fractions.len() as u64; });
     let mut read = NativeRead { tracking: 0.0, deviation: 0.0, standoff: 0.0 };
+    let mut reader = ProbeCurveReader::new(pcurve, probe_batch_enabled());
     for &fraction in fractions {
-        let parameter = pcurve.evaluate(fraction)?;
+        let parameter = reader.evaluate(fraction)?;
         let image = section_surface_point(surface, parameter.x, parameter.y, true)?;
         let on_curve = section_curve_point(curve, t0 + (t1 - t0) * fraction)?;
         let foot = crate::projection::project_point_to_surface_from_seed(surface, on_curve, [parameter.x, parameter.y])?;
@@ -1832,6 +1998,7 @@ fn refine_pcurve_pass(
         let mut exit = PcurveFitExit::RoundBudget;
         let mut residual = None;
         for round in 0..4 {
+            crate::imprint::work_profile::add(|c| c.refinement_rounds += 1);
             if parameters.len() >= max_samples {
                 exit = PcurveFitExit::SampleCeiling;
                 break;
@@ -1840,6 +2007,7 @@ fn refine_pcurve_pass(
             let mut round_max = 0.0_f64;
             let mut truncated = false;
             let mut skipped_narrow = false;
+            let mut reader = ProbeCurveReader::new(pcurve, probe_batch_enabled());
             for index in 0..parameters.len() - 1 {
                 if parameters.len() + inserts.len() >= max_samples {
                     truncated = true;
@@ -1860,7 +2028,7 @@ fn refine_pcurve_pass(
                         break;
                     }
                     let fraction = start + (end - start) * local_fraction;
-                    let parameter = pcurve.evaluate(fraction)?;
+                    let parameter = reader.evaluate(fraction)?;
                     let on_surface =
                         section_surface_point(surface, parameter.x, parameter.y, true)?;
                     let on_curve = section_curve_point(curve, t0 + (t1 - t0) * fraction)?;
@@ -2162,6 +2330,7 @@ fn sphere_iso_fit(surface: &NurbsSurface, curve: &NurbsCurve) -> Option<PcurveFi
                 bound = bound.max(error);
             }
             if !matches || bound > PCURVE_REFINEMENT_TOLERANCE * 0.0625 { continue; }
+            crate::imprint::work_profile::constructed("analytic_certified", 0, pcurve.control_points.len());
             return Some(PcurveFit { curve: pcurve, report: PcurveFitReport {
                 residual: bound, floor: PCURVE_REFINEMENT_TOLERANCE, samples: 2,
                 exit: PcurveFitExit::Converged, off_surface: bound, raised: false,
@@ -2185,6 +2354,8 @@ pub fn fit_pcurve_on_surface(
     surface: &NurbsSurface,
     curve: &NurbsCurve,
 ) -> Result<PcurveFit, String> {
+    let _wall = crate::wall_profile::Scope::enter(crate::wall_profile::FIT);
+    crate::imprint::work_profile::add(|c| c.fit_calls += 1);
     if sphere_iso_enabled() {
         if let Some(fit) = sphere_iso_fit(surface, curve) { return Ok(fit); }
     }
@@ -2231,6 +2402,7 @@ fn fit_pcurve_on_surface_cached(surface: &NurbsSurface, curve: &NurbsCurve, enab
             return Err("build_pcurve_on_surface: singular affine parameterization".into());
         };
         let pcurve = inversion.image_of(curve)?;
+        crate::imprint::work_profile::constructed("affine", 0, pcurve.control_points.len());
         return Ok(PcurveFit {
             report: PcurveFitReport {
                 residual: 0.0,
@@ -2323,6 +2495,7 @@ fn fit_pcurve_on_surface_cached(surface: &NurbsSurface, curve: &NurbsCurve, enab
             ))
         },
     )?;
+    crate::imprint::work_profile::constructed("projected_global", parameters.len(), pcurve.control_points.len());
     Ok(PcurveFit {
         curve: pcurve,
         report: PcurveFitReport {
@@ -2408,6 +2581,8 @@ pub fn fit_pcurve_on_surface_marched(
     surface: &NurbsSurface,
     curve: &NurbsCurve,
 ) -> Result<PcurveFit, String> {
+    let _wall = crate::wall_profile::Scope::enter(crate::wall_profile::FIT);
+    crate::imprint::work_profile::add(|c| c.fit_calls += 1);
     fn run(surface: &NurbsSurface, curve: &NurbsCurve, eager: bool) -> Result<PcurveFit, String> {
         // The global fallback owns a nested scope; it cannot populate or
         // invalidate the marched fit's immutable carrier/curve entries.
@@ -2540,6 +2715,7 @@ pub fn fit_pcurve_on_surface_marched(
             },
         )?;
         clock.seeded = true;
+        crate::imprint::work_profile::constructed("projected_seeded", parameters.len(), pcurve.control_points.len());
         Ok(PcurveFit {
             curve: pcurve,
             report: PcurveFitReport {
@@ -2627,6 +2803,8 @@ pub fn fit_pcurve_on_surface_range(
     forward: bool,
     tolerance: f64,
 ) -> Result<PcurveFit, String> {
+    let _wall = crate::wall_profile::Scope::enter(crate::wall_profile::FIT);
+    crate::imprint::work_profile::add(|c| c.fit_calls += 1);
     if let Some(exact) =
         affine_pcurve_on_range(surface, curve, edge_start, edge_end, forward, tolerance)?
     {
@@ -2858,6 +3036,7 @@ fn affine_pcurve_on_range(
         }
     }
     let samples = pcurve.control_points.len();
+    crate::imprint::work_profile::constructed("affine_range", 0, pcurve.control_points.len());
     Ok(Some(PcurveFit {
         curve: pcurve,
         report: PcurveFitReport {
@@ -3108,6 +3287,8 @@ pub fn fit_pcurve_on_surface_range_dense(
     refinement_rounds: usize,
     parameter_cap: usize,
 ) -> Result<PcurveFit, String> {
+    let _wall = crate::wall_profile::Scope::enter(crate::wall_profile::FIT);
+    crate::imprint::work_profile::add(|c| c.fit_calls += 1);
     if !(edge_start.is_finite() && edge_end.is_finite() && edge_start < edge_end) {
         return Err("build_pcurve_on_surface_range: invalid edge interval".into());
     }
@@ -3799,6 +3980,8 @@ pub fn fit_pcurve_on_surface_stations(
     refinement_rounds: usize,
     parameter_cap: usize,
 ) -> Result<PcurveFit, String> {
+    let _wall = crate::wall_profile::Scope::enter(crate::wall_profile::FIT);
+    crate::imprint::work_profile::add(|c| c.fit_calls += 1);
     fit_station_pcurve(
         surface, stations, breaks, &[], tolerance.max(PCURVE_REFINEMENT_TOLERANCE),
         base_samples, refinement_rounds, parameter_cap, SPAN_FLOOR,
@@ -4288,6 +4471,7 @@ fn fit_station_pcurve_mode(
             rounds = RAISED_ROUNDS;
             continue;
         }
+        crate::imprint::work_profile::constructed("station_fit", parameters.len(), pcurve.control_points.len());
         return Ok(PcurveFit {
             curve: pcurve,
             report: PcurveFitReport {

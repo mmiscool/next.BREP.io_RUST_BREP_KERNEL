@@ -317,6 +317,7 @@ impl<'a> SolidClassifier<'a> {
     }
 
     pub fn classify(&self, point: Vec3) -> Result<PointClassification, String> {
+    let _wall = crate::wall_profile::Scope::enter(crate::wall_profile::CLASSIFY);
         classify_profile(|p| p.classify_calls += 1);
         let tolerance = self.tolerance;
         if !self.bounds.expanded(tolerance).contains(point) {
@@ -616,6 +617,7 @@ pub fn classify_point(
     solid: &BrepSolid,
     tolerance: f64,
 ) -> Result<PointClassification, String> {
+    let _wall = crate::wall_profile::Scope::enter(crate::wall_profile::CLASSIFY);
     classify_profile_begin();
     let result = SolidClassifier::new(solid, tolerance)?.classify(point);
     classify_profile_report("classify_point");

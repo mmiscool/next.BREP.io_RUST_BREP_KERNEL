@@ -316,6 +316,13 @@ pub struct BrepApp {
     /// makes its tab unsaved), `2` the recovery blob written again.
     close_stage: u8,
     recovery: crate::recovery::RecoveryPanel,
+    /// The desktop update check and its notice. Inert until the desktop
+    /// binary's `main` starts it, so a harness or a test never checks.
+    #[cfg(not(target_arch = "wasm32"))]
+    updater: crate::update::Updater,
+    /// The reports this user submitted, checked for resolution
+    /// (`crate::report_followup`). Inert until the entry point starts it.
+    report_followup: crate::report_followup::ReportFollowup,
 
     /// The UI zoom scale CURRENTLY applied to the egui context. Tracks
     /// `settings.ui_scale` but is only synced to it while the pointer is up, so
@@ -575,6 +582,16 @@ impl BrepApp {
         self.stl_import.is_some()
     }
 
+    /// The engine the 3D viewport is drawing: the mesh import preview's own
+    /// while it is open (it replaces the shell), else the active document's.
+    /// What a pointer script's `locate` must project through.
+    pub fn viewport_engine(&self) -> &EngineState {
+        match &self.stl_import {
+            Some(preview) => &preview.engine,
+            None => self.docs.engine(),
+        }
+    }
+
     pub fn new(cc: &eframe::CreationContext<'_>) -> Result<Self, String> {
         Self::new_with(cc, crate::automation::AppOptions::default())
     }
@@ -758,6 +775,9 @@ impl BrepApp {
             closed: false,
             close_stage: 0,
             recovery,
+            #[cfg(not(target_arch = "wasm32"))]
+            updater: crate::update::Updater::inert(),
+            report_followup: crate::report_followup::ReportFollowup::new(),
             applied_ui_scale,
             #[cfg(feature = "automation")]
             automation: {
@@ -766,6 +786,20 @@ impl BrepApp {
                 q
             },
         })
+    }
+
+    /// Start the desktop update check (`crate::update`). Called by the
+    /// desktop binary's `main` only.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn start_update_check(&mut self, ctx: &egui::Context) {
+        self.updater = crate::update::Updater::start(ctx);
+    }
+
+    /// Remember submitted problem reports and check them for resolution
+    /// (`crate::report_followup`). Called by the desktop `main` and the web
+    /// entry point only.
+    pub fn start_report_followup(&mut self, ctx: &egui::Context) {
+        self.report_followup.start(ctx);
     }
 
     /// Arm a measured camera spin: `frames` pointer steps of `step` logical px
@@ -881,6 +915,13 @@ impl BrepApp {
             let tab = sketching_3d && keys_free && i.consume_key(Modifiers::NONE, Key::Tab);
             (redo, undo, esc, tab)
         });
+        // Delete / Backspace: THE delete-selection command
+        // (`crate::delete_selection`), whatever the selection is — sketch,
+        // 3D sketch, eCAD, sheet object, PMI annotation, constraint, component
+        // or feature — before the sketch modes return below.
+        if keys_free {
+            self.delete_selection_key(ctx);
+        }
         // The 3D sketch editor: the same per-session undo routing as the
         // planar one; Esc drops the armed tool's pending clicks first and the
         // tool itself second.
@@ -927,17 +968,6 @@ impl BrepApp {
         }
         if undo {
             self.docs.engine_mut().undo();
-        }
-        if let Some(target) = ecad_target {
-            if keys_free && !self.docs.engine().ref_select_active() {
-                let delete = ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Delete)
-                    || i.consume_key(Modifiers::NONE, Key::Backspace));
-                if delete {
-                    self.docs.active_mut().ecad.selection_key(target, true);
-                }
-            }
-        } else {
-            self.delete_selected_annotation(ctx);
         }
         if esc {
             // An open pick-list popup owns the first Escape: close it WITHOUT
@@ -1009,34 +1039,21 @@ impl BrepApp {
         }
     }
 
-    /// DELETE (or Backspace) removes the selected object of the OPEN drawing
-    /// sheet — a placed view, a sheet dimension or an ordinate set, picked on
-    /// the paper or in the Sheets tree — or, with no sheet open, the selected
-    /// PMI annotation while the PMI workbench is up. Either goes through the
-    /// destructive entry of the object's own row menu, so the key and the menu
-    /// do the same thing (and it is one undo step, like the menu's).
-    ///
-    /// The key is consumed only when there IS something to delete. Never a
-    /// SHEET or a PMI VIEW: each takes everything placed on it with it, and
-    /// both stay behind their menus' Delete. Nothing while a reference pick is
-    /// up — deleting the object whose references are being picked would
-    /// strand the picker. (Called after the text-edit and sketch-mode returns,
-    /// so a Backspace typed into a field, or a sketch's own Delete, never gets
-    /// here.)
-    fn delete_selected_annotation(&mut self, ctx: &egui::Context) {
+    /// DELETE (or Backspace) runs THE delete-selection command
+    /// ([`crate::delete_selection`]) on whatever is selected: the same call as
+    /// that object's row ✕ / menu Delete, so the key and the menu do the same
+    /// thing (one undo step, no extra confirmation). The key is consumed only
+    /// when there IS something to delete, and left to the family-table grid
+    /// when it owns the keyboard. Never a SHEET, PMI VIEW or study: each takes
+    /// everything placed on it with it and stays behind its menu's Delete.
+    /// Called after the text-edit / modal / popup guards, so a Backspace typed
+    /// into a field never gets here.
+    fn delete_selection_key(&mut self, ctx: &egui::Context) {
         use egui::{Key, Modifiers};
-        let engine = self.docs.engine();
-        if engine.ref_select_active() {
+        if self.family_table.owns_delete_key(ctx) {
             return;
         }
-        let target = if engine.sheet_open().is_some() {
-            engine.sheet_selected_object().map(|id| (true, id.to_string()))
-        } else if engine.pmi_workbench_entered() {
-            engine.pmi_selected_annotation().map(|id| (false, id.to_string()))
-        } else {
-            None
-        };
-        let Some((on_sheet, id)) = target else {
+        let Some(target) = crate::delete_selection::target(&self.docs) else {
             return;
         };
         let pressed = ctx.input_mut(|i| {
@@ -1045,14 +1062,8 @@ impl BrepApp {
         if !pressed {
             return;
         }
-        let engine = self.docs.engine_mut();
-        let result = if on_sheet {
-            crate::panels::sheets::delete_held_object(engine, &id)
-        } else {
-            crate::panels::pmi::delete_annotation(engine, &id)
-        };
-        if let Err(error) = result {
-            engine.push_notice(format!("{}: {error}", if on_sheet { "Sheets" } else { "PMI" }));
+        if let Err(error) = crate::delete_selection::apply(&mut self.docs, &target) {
+            self.docs.engine_mut().push_notice(format!("Delete: {error}"));
         }
     }
 
@@ -1072,6 +1083,35 @@ impl BrepApp {
     /// Open the Replace summary alone, for mates an earlier replace holds.
     pub(crate) fn review_replace(&mut self) {
         self.replace_dialog.review();
+    }
+
+    /// A component menu's document-level flow (`component_actions`): every
+    /// menu — the context bar, the viewport's right-click, the BOM row — hands
+    /// its request here, so each flow has one implementation.
+    fn run_component_request(&mut self, request: ComponentActionRequest, compact: bool) {
+        match request {
+            ComponentActionRequest::SavePartAs { component_id } => self.edit_part(&component_id),
+            ComponentActionRequest::Replace { component_id } => self.open_replace(&component_id),
+            ComponentActionRequest::WorkPart { component_path, in_place } => {
+                let mode = if in_place {
+                    crate::document::work_part::WorkPartMode::InPlace
+                } else {
+                    crate::document::work_part::WorkPartMode::NewTab
+                };
+                if let Err(error) = self.docs.begin_work_part_as(&component_path, mode) {
+                    self.docs.engine_mut().push_notice(format!("Work part: {error}"));
+                }
+            }
+            ComponentActionRequest::Info { targets } => {
+                self.info_windows.open_for(&targets, self.viewport.last_rect());
+            }
+            ComponentActionRequest::EditFeature { feature_id } => {
+                self.history.focus_feature(feature_id);
+                if compact {
+                    self.dock.show_pane(PaneKind::History);
+                }
+            }
+        }
     }
 
     fn edit_part(&mut self, component_id: &str) {
@@ -1126,6 +1166,7 @@ impl BrepApp {
         if crate::automation::registry::enabled() {
             let _publish_span = crate::perf::span(crate::perf::Phase::Publish);
             crate::automation::registry::publish("__brepImportPreview", "STL/OBJ import preview state (tolerances, counts, accept readiness); null when no preview is open", &preview.state_json());
+            crate::automation::registry::publish("__brepImportRegions", "interactive mesh import: phase, region list (proposed kind, status, residual, refits), selected region and its form; null when no preview is open", &preview.regions_json());
             crate::automation::registry::publish("__brepImportPreviewHit", "import preview dialog widget rects", &preview.hits_json());
             crate::automation::registry::publish("__brepCamera", "camera state: kind, eye, target, up, near/far, projection block, worldPerPixel", &preview.engine.camera_state_json());
             crate::automation::registry::publish("__brepPpp", "pixels per point of the surface", &format!("{}", ui.ctx().pixels_per_point()));
@@ -1171,6 +1212,9 @@ impl BrepApp {
         // frame is of it.
         let view = self.docs.view();
         queue.publish_view(view.handle(), view.committed_revision());
+        // This pass's layout is the current one for a layout read that comes
+        // before anything changes it (`automation::queue::Need::Layout`).
+        queue.note_pass();
     }
 
     /// Every notice raised since the last gather — the engine's, storage
@@ -1239,6 +1283,10 @@ impl BrepApp {
         let polled = queue.drain_frameless(&mut crate::automation::command::Ctx { app: self, egui: ctx });
         let running = self.docs.pump_all();
         let raised = self.gather_notices();
+        if polled || running || !raised.is_empty() {
+            // Work in flight or landing moves what a pass would show.
+            queue.mark_layout_dirty();
+        }
         if !raised.is_empty() {
             let now = ctx.input(|i| i.time);
             self.toasts.extend(raised, now);
@@ -1284,6 +1332,135 @@ impl BrepApp {
         // same key with an entirely different parts library.
         self.update_components.invalidate();
         self.viewport.forget_document();
+    }
+
+    /// Publish every plain-state blob ([`state_blobs::STATE_BLOBS`]) from its
+    /// producer. The frame calls this; `state_get` asks
+    /// [`state_blob_json`](Self::state_blob_json) itself, so a read of one of
+    /// these never waits for a frame.
+    ///
+    /// [`state_blobs::STATE_BLOBS`]: crate::automation::state_blobs::STATE_BLOBS
+    fn publish_state_blobs(&mut self, ctx: &egui::Context) {
+        for (name, doc) in crate::automation::state_blobs::STATE_BLOBS {
+            if let Some(json) = self.state_blob_json(name, ctx) {
+                crate::automation::registry::publish(name, doc, &json);
+            }
+        }
+    }
+
+    /// One plain-state blob by name, built from the app's data now. `None`
+    /// for a name that is not one of [`STATE_BLOBS`] (a layout blob, which
+    /// only a drawn pass publishes).
+    ///
+    /// [`STATE_BLOBS`]: crate::automation::state_blobs::STATE_BLOBS
+    pub fn state_blob_json(&mut self, name: &str, ctx: &egui::Context) -> Option<String> {
+        let engine = self.docs.engine();
+        Some(match name {
+            // The import preview draws its own engine while it is open.
+            "__brepCamera" => match &self.stl_import {
+                Some(preview) => preview.engine.camera_state_json(),
+                None => engine.camera_state_json(),
+            },
+            "__brepImportPreview" => self.stl_import.as_ref().map_or_else(|| "null".to_string(), |p| p.state_json()),
+            "__brepImportRegions" => self.stl_import.as_ref().map_or_else(|| "null".to_string(), |p| p.regions_json()),
+            "__brepPpp" => format!("{}", ctx.pixels_per_point()),
+            "__brepSettings" => engine.settings_json(),
+            "__brepSolidColors" => engine.solid_color_overrides_json(),
+            "__brepHistory" => engine.history_listing_json(),
+            "__brepGizmo" => engine.gizmo_state_json(),
+            "__brepFile" => self.file.file_state_json(&self.docs, self.model_store.as_ref()),
+            "__brepModel" => self.model_signature_json(),
+            "__brepReport" => engine.history_report_json(),
+            // The in-flight run: whether one is pending, the feature the runner
+            // says it is executing, and the feature a cancelled run was stuck on.
+            "__brepRun" => serde_json::json!({
+                "pending": engine.run_pending(),
+                "progress": engine.run_progress().map(|p| serde_json::json!({
+                    "generation": p.generation,
+                    "index": p.index,
+                    "total": p.total,
+                    "featureId": p.feature_id,
+                    "featureType": p.feature_type,
+                })),
+                "cancelled": engine.cancelled_run(),
+            })
+            .to_string(),
+            "__brepBusy" => self.busy.state_json(),
+            "__brepExpr" => serde_json::json!({
+                "expressions": engine.expressions_json(),
+                "variables": serde_json::from_str::<serde_json::Value>(&engine.expression_variables_json())
+                    .unwrap_or(serde_json::Value::Null),
+                "configurator": serde_json::from_str::<serde_json::Value>(&engine.configurator_json())
+                    .unwrap_or(serde_json::Value::Null),
+            })
+            .to_string(),
+            "__brepPlmDoc" => self.plm.state_json(&self.docs),
+            // The queued toast texts — the only trace of a refusal the app shows
+            // as a transient card (e.g. a constraint the strip could not add).
+            "__brepNotices" => self.toasts.texts_json(),
+            "__brepToasts" => self.toasts.state_json(),
+            "__brepBug" => self.bug_report.state_json(),
+            "__brepDiagnostics" => self.diagnostics.json().to_string(),
+            // Where the last ~120 frames' milliseconds went. `__brepDiagnostics`
+            // says WHICH renderer is drawing; this says what it costs, in the
+            // same split the Info window's Performance rows show.
+            "__brepPerf" => crate::perf::json(),
+            "__brepWireHarness" => engine.wire_harness_state_json(),
+            "__brepCam" => {
+                self.cam.refresh_geometry(self.docs.engine());
+                crate::panels::cam::cam_state_json(self.docs.engine(), &self.cam)
+            }
+            "__brepInstructions" => self.instructions.state_json(),
+            "__brepInstructionsPlayer" => self.instructions_player.state_json(engine),
+            "__brepSimulation" => crate::panels::simulation::state_json(engine, &self.simulation),
+            "__brepCamSim" => self.cam.sim.state_json().to_string(),
+            "__brepPorts" => engine.ports_state_json(),
+            "__brepQualify" => self.qualify.state_json(),
+            "__brepFamily" => self.family_table.state_json(),
+            "__brepPmi" => engine.pmi_state_json(),
+            "__brepSheets" => self.docs.engine_mut().sheet_state_json(),
+            // The workbench logical state (resolved current id + available
+            // ids); the dropdown's rects ride in `__brepToolbar`.
+            "__brepWorkbench" => crate::workbench::workbench_state_scoped(engine).to_string(),
+            "__brepSelection" => engine.selection_json(),
+            "__brepInfoWindows" => self.info_windows.published_json(self.docs.engine_mut()),
+            "__brepInterference" => self.interference.state_json_in(engine),
+            "__brepAutoConstraints" => self.auto_constraints.state_json(),
+            "__brepStepParts" => self.step_parts.state_json(),
+            "__brepSelectionFilter" => engine.selection_filter_json(),
+            "__brepFilterButton" => self.selection.button_json(),
+            "__brepContext" => self.context_bar.state_json(),
+            "__brepPickBar" => self.pick_bar.state_json(),
+            "__brepDocuments" => document_tabs::state_json(&self.docs),
+            "__brepRecovery" => self.recovery.state_json(),
+            "__brepClosing" => self.closing_json(),
+            "__brepComponentMove" => engine.component_move_json(),
+            "__brepSketch" => self.sketch.published_json(engine),
+            "__brepSketch3d" => self.sketch3d.published_json(engine),
+            "__brepWireframe" => format!("{}", engine.settings.wireframe),
+            // The pick's `subject` and `path` name the FORM FIELD it runs in
+            // (`<panel>/field:<path>#activate` is that field's button, Done
+            // while the pick runs); `inForm` is false for the card-based
+            // picks, whose controls are `modebar/refsel:*`.
+            "__brepRefSelect" => {
+                let field = engine.ref_select_field();
+                serde_json::json!({
+                    "active": engine.ref_select_active(),
+                    "prompt": engine.ref_select_prompt(),
+                    "names": engine.ref_select_names(),
+                    "subject": field.as_ref().map(|f| f.subject.clone()),
+                    "path": field.as_ref().map(|f| f.path.join(".")),
+                    "multiple": field.as_ref().map(|f| f.multiple),
+                    "picks": field.as_ref().map(|f| f.picks),
+                    "inForm": engine.ref_select_in_form(),
+                    "ghostsLit": engine.ref_select_ghosts_lit(),
+                })
+                .to_string()
+            }
+            "__brepStep" => format!("{}", engine.history_rollback()),
+            "__brepParams" => self.params_blob().to_string(),
+            _ => return None,
+        })
     }
 
     /// A signature of the CURRENT rendered model (rolled-to step) — solid count,
@@ -1930,7 +2107,9 @@ impl eframe::App for BrepApp {
         }
         if crate::automation::registry::enabled() {
             let _publish_span = crate::perf::span(crate::perf::Phase::Publish);
-            crate::automation::registry::publish("__brepImportPreview", "STL/OBJ import preview state (tolerances, counts, accept readiness); null when no preview is open", "null");
+            for name in ["__brepImportPreview", "__brepImportRegions"] {
+                crate::automation::registry::publish(name, crate::automation::state_blobs::doc(name), "null");
+            }
         }
 
         // The tab strip's dirty dots, refreshed once per frame (cheap — see
@@ -2549,24 +2728,8 @@ impl eframe::App for BrepApp {
                     self.docs.engine_mut().push_notice(format!("Work part: {error}"));
                 }
             }
-            match outcome.component_request.or_else(|| self.viewport.take_component_request()) {
-                Some(ComponentActionRequest::OpenPart { component_id }) => {
-                    self.edit_part(&component_id);
-                }
-                Some(ComponentActionRequest::Replace { component_id }) => {
-                    self.open_replace(&component_id);
-                }
-                Some(ComponentActionRequest::WorkPart { component_path, in_place }) => {
-                    let mode = if in_place {
-                        crate::document::work_part::WorkPartMode::InPlace
-                    } else {
-                        crate::document::work_part::WorkPartMode::NewTab
-                    };
-                    if let Err(error) = self.docs.begin_work_part_as(&component_path, mode) {
-                        self.docs.engine_mut().push_notice(format!("Work part: {error}"));
-                    }
-                }
-                None => {}
+            if let Some(request) = outcome.component_request.or_else(|| self.viewport.take_component_request()) {
+                self.run_component_request(request, compact);
             }
         }
 
@@ -2602,6 +2765,12 @@ impl eframe::App for BrepApp {
             }
         }
 
+        // --- desktop update notice: an installed update closes the app through
+        // the close path below, which keeps unsaved work for recovery.
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.updater.show(&ctx) {
+            self.close_asked = true;
+        }
         self.close_when_written(&ctx);
 
         if let Some((format, name, bytes)) = self.file.take_stl_import() {
@@ -2614,6 +2783,10 @@ impl eframe::App for BrepApp {
         // NOTHING during capture, so the screenshot it requested never contains
         // this dialog.
         self.bug_report.show(&ctx, self.docs.engine_mut());
+        if let Some((id, summary)) = self.bug_report.take_submitted() {
+            self.report_followup.record(id, summary);
+        }
+        self.report_followup.tick(&ctx, self.docs.engine_mut());
         self.sketch.show_text_dialog(&ctx, self.docs.engine_mut());
 
         // --- Info: the licences + this session's diagnostics + the MCP start
@@ -2785,24 +2958,8 @@ impl eframe::App for BrepApp {
             }
             // Component document-level flows (the engine-mutating component
             // actions already ran inside the bar).
-            match component_request {
-                Some(ComponentActionRequest::OpenPart { component_id }) => {
-                    self.edit_part(&component_id);
-                }
-                Some(ComponentActionRequest::Replace { component_id }) => {
-                    self.open_replace(&component_id);
-                }
-                Some(ComponentActionRequest::WorkPart { component_path, in_place }) => {
-                    let mode = if in_place {
-                        crate::document::work_part::WorkPartMode::InPlace
-                    } else {
-                        crate::document::work_part::WorkPartMode::NewTab
-                    };
-                    if let Err(error) = self.docs.begin_work_part_as(&component_path, mode) {
-                        self.docs.engine_mut().push_notice(format!("Work part: {error}"));
-                    }
-                }
-                None => {}
+            if let Some(request) = component_request {
+                self.run_component_request(request, false);
             }
         }
 
@@ -2863,7 +3020,9 @@ impl eframe::App for BrepApp {
         // the hit-rects are for THIS frame's layout. Off unless a host enabled it.
         if crate::automation::registry::enabled() {
             let _publish_span = crate::perf::span(crate::perf::Phase::Publish);
-            let ppp = ui.ctx().pixels_per_point();
+            // Every blob that is plain app state, from the one producer
+            // `state_get` also asks at dispatch time (`state_blob_json`).
+            self.publish_state_blobs(&ctx);
             // Keyboard focus, for a driver typing into a widget by its rect: the
             // frame counter says a click has been drawn, `rect` is the widget
             // egui gave the focus to (null while nothing has it). A typed
@@ -2878,52 +3037,11 @@ impl eframe::App for BrepApp {
                 "rect": focused.map(|r| [r.min.x, r.min.y, r.width(), r.height()]),
                 "text": text,
             }).to_string());
-            crate::automation::registry::publish("__brepCamera", "camera state: kind, eye, target, up, near/far, projection block, worldPerPixel", &self.docs.engine().camera_state_json());
-            crate::automation::registry::publish("__brepSettings", "render and UI settings", &self.docs.engine().settings_json());
-            crate::automation::registry::publish("__brepSolidColors", "per-solid colour overrides", &self.docs.engine().solid_color_overrides_json());
-            crate::automation::registry::publish("__brepHistory", "history listing {step, features:[{index,type,id}]}", &self.docs.engine().history_listing_json());
-            crate::automation::registry::publish("__brepGizmo", "transform gizmo state", &self.docs.engine().gizmo_state_json());
-            crate::automation::registry::publish("__brepFile", "file dialog state (mode, entries, current name)",
-                &self.file.file_state_json(&self.docs, self.model_store.as_ref()),
-            );
             crate::automation::registry::publish("__brepFileHit", "file dialog widget rects", &self.file.hits_json());
-            crate::automation::registry::publish("__brepModel", "model signature: solid count, triangle count, per-solid bounds (change detection)", &self.model_signature_json());
-            crate::automation::registry::publish("__brepReport", "last run report {featureErrors, featureNotes, featureFulfilment, featureRefusals (only when a feature failed with a typed refusal), featureApproximations (only when a successful feature carries a measured approximation: feature id → [{code, body, measured, bar, volume_bound, edges, message, summary}]), unresolved, displayErrors, featureTimings, featureOutputs}", &self.docs.engine().history_report_json());
-            // The in-flight run: whether one is pending, the feature the runner
-            // says it is executing, and the feature a cancelled run was stuck on.
-            crate::automation::registry::publish("__brepRun", "in-flight run {pending, progress:{generation,index,total,featureId,featureType}|null, cancelled}",
-                &serde_json::json!({
-                    "pending": self.docs.engine().run_pending(),
-                    "progress": self.docs.engine().run_progress().map(|p| serde_json::json!({
-                        "generation": p.generation,
-                        "index": p.index,
-                        "total": p.total,
-                        "featureId": p.feature_id,
-                        "featureType": p.feature_type,
-                    })),
-                    "cancelled": self.docs.engine().cancelled_run(),
-                })
-                .to_string(),
-            );
-            crate::automation::registry::publish("__brepBusy", "the status bar's working indicator {shown, activities:[{kind, label, document, cancellable, elapsed}]} — everything in flight, most important first; shown once work has lasted 0.2 s", &self.busy.state_json());
             crate::automation::registry::publish("__brepStatusHit", "status bar widget rects: busy, busy:more, busy:cancel (present only while the working indicator shows)", &self.busy.hits_json());
             crate::automation::registry::publish("__brepHit", "history panel widget rects: step:i edit:i del:i box:i add:menu form:* field:* panel:clip", &self.history.hits_json());
             crate::automation::registry::publish("__brepPaletteHit", "add-feature palette widget rects in screen points: input top item:type display display#mode (empty while closed)", &self.history.palette_hits_json());
             crate::automation::registry::publish("__brepExprHit", "expressions panel widget rects", &self.expressions.hits_json());
-            crate::automation::registry::publish("__brepExpr", "expressions script, its variables and the configurator",
-                &serde_json::json!({
-                    "expressions": self.docs.engine().expressions_json(),
-                    "variables": serde_json::from_str::<serde_json::Value>(
-                        &self.docs.engine().expression_variables_json()
-                    )
-                    .unwrap_or(serde_json::Value::Null),
-                    "configurator": serde_json::from_str::<serde_json::Value>(
-                        &self.docs.engine().configurator_json()
-                    )
-                    .unwrap_or(serde_json::Value::Null),
-                })
-                .to_string(),
-            );
             crate::automation::registry::publish("__brepToolbar", "toolbar rects: shared File menu file:* and workbench:item:<id>; Ribbon tabs/overflow ribbon:* and Home creation wbtb:*; command keys undo redo fit projection wireframe show:* help info bug workbench:btn:<id>. Classic wraps its controls; Ribbon compacts Large commands before whole-group overflow. Keys appear when their widgets are rendered; menu entries appear while open", &self.toolbar.hits_json());
             // The workbench actions strip's button rects (`wbtb:feature:<type>` /
             // `wbtb:constraint:<type>` / `wbtb:annotation:<type>`); an empty map
@@ -2933,18 +3051,7 @@ impl eframe::App for BrepApp {
             // `plm/section:<id>` and `plm/<section>:<widget>`, and the active
             // document's access and revision.
             crate::automation::registry::publish("__brepPlmHit", "PLM pane rects: section:lifecycle, lifecycle:revision:<label>, lifecycle:verb:check-out, save:<yes|no|remember>, web:<summary|revisions|attachments|structure|history|parts|workspace|reviews>", &self.plm.hits_json());
-            crate::automation::registry::publish("__brepPlmDoc", "the active document on the PLM: {access:{editable, reason}, plmDocument, revision:{id,label,lifecycle,lockedBy,lockedByMe}, busy, message, offered:[verb key], files:{staged:{name,mediaType,kind,size,target}, revision:[name], part:[name], problem, notice, status, busy}}; null with no PLM session", &self.plm.state_json(&self.docs));
-            // The queued toast texts — the only trace of a refusal the app shows
-            // as a transient card (e.g. a constraint the strip could not add).
-            crate::automation::registry::publish("__brepNotices", "queued toast texts", &self.toasts.texts_json());
-            crate::automation::registry::publish("__brepToasts", "toast cards {cards: [{text, severity (error|warning|info), count, shown, superseded}], shown, folded}", &self.toasts.state_json());
             crate::automation::registry::publish("__brepToastsHit", "toast card rects (toast:<i> top to bottom, toast:more)", &self.toasts.hits_json());
-            crate::automation::registry::publish("__brepBug", "bug report panel state", &self.bug_report.state_json());
-            crate::automation::registry::publish("__brepDiagnostics", "what this session is running on: renderer, adapter, texture ceiling, version, platform", &self.diagnostics.json().to_string());
-            // Where the last ~120 frames' milliseconds went. `__brepDiagnostics`
-            // says WHICH renderer is drawing; this says what it costs, in the
-            // same split the Info window's Performance rows show.
-            crate::automation::registry::publish("__brepPerf", "rolling per-frame timings in ms {frames, window, dt, ui, publish, sync, fit, overlays, draw} each {avg,p95,max}; staleFrames: frames whose render inputs changed without a render (automation check, never reset)", &crate::perf::json());
             crate::automation::registry::publish("__brepBugHit", "bug report panel widget rects", &self.bug_report.hits_json());
             // The JavaScript editor window: its outer rect against the surface
             // it may fill, and its widget rects (`javascript/panel:clip`,
@@ -2953,36 +3060,26 @@ impl eframe::App for BrepApp {
             crate::automation::registry::publish("__brepJavascriptHit", "JavaScript editor window widget rects (panel:clip, run, cancel, save, open, export, help, example, source, output); empty while the window is closed", &self.javascript.hits_json());
             // The wire harness: the document's connections + the last run's
             // routing report (engine truth), and the panel's widget rects.
-            crate::automation::registry::publish("__brepWireHarness", "wire harness connections and the last routing report", &self.docs.engine().wire_harness_state_json());
             crate::automation::registry::publish("__brepWireHarnessHit", "wire harness panel widget rects", &self.wire_harness.hits_json());
             // The CAM block (setups with their operations, tools, operations,
             // NC programs) plus the pane's selection and last notice, and the
             // pane's rects (`cam:*`).
             self.cam.refresh_geometry(self.docs.engine());
-            crate::automation::registry::publish("__brepCam", "CAM state {setups: [{id, name, operations: [op id], record}], tools, operations, ncPrograms, idCounter, strategies, orientations, frames: {id: {origin, xAxis, zAxis, frameError, stock}}, selected, open, notice, error}", &crate::panels::cam::cam_state_json(self.docs.engine(), &self.cam));
             crate::automation::registry::publish("__brepCamHit", "CAM pane widget rects (cam:*)", &self.cam.hits_json());
-            crate::automation::registry::publish("__brepInstructions", "Instructions pane state {selected: the step selected in the pane, notice, error}", &self.instructions.state_json());
             crate::automation::registry::publish("__brepInstructionsHit", "Instructions pane widget rects (instructions:*)", &self.instructions.hits_json());
-            crate::automation::registry::publish("__brepInstructionsPlayer", "Player pane state {mode: shop|customer, step: the step shown, insertion: how far its parts have come home (null once they are), pending: a move waits for the next frame, checked: {step: [part index]}, serials: {occurrence: serial}, signed: [step], error}", &self.instructions_player.state_json(self.docs.engine()));
             crate::automation::registry::publish("__brepInstructionsPlayerHit", "Player pane widget rects (player:*)", &self.instructions_player.hits_json());
-            crate::automation::registry::publish("__brepSimulation", "Simulation state {available: the document is an assembly a study can drive, block: the simulation block or null, mates: [{id, kind: distance|angle, value, enabled}] a motor can drive, pane: {notice, error}}", &crate::panels::simulation::state_json(self.docs.engine(), &self.simulation));
             crate::automation::registry::publish("__brepSimulationHit", "Simulation pane widget rects (simulation:*)", &self.simulation.hits_json());
-            crate::automation::registry::publish("__brepCamSim", "CAM simulation player state {loaded, speed, stopAtCollision, cell, showDeviation, notice, error, session: {setup, multiAxis, playing, motion, fraction, time, totalSeconds, progress, motions, completed, applied, caughtUp, removedVolume, stockVolume, unsupported, operation, operations, marks, collisionMotions, deviation, stockVersion}}", &self.cam.sim.state_json().to_string());
             // The part's declared connection points (the `ports` block) and the
             // ports tail's report, beside the Qualify panel's own selection and
             // its rects (`qualify:*`).
-            crate::automation::registry::publish("__brepPorts", "the part's declared connection points (the `ports` block) and the ports tail's report of the last run", &self.docs.engine().ports_state_json());
-            crate::automation::registry::publish("__brepQualify", "Qualify panel state {selected: the connection-point address it has selected}", &self.qualify.state_json());
             crate::automation::registry::publish("__brepQualifyHit", "Qualify panel widget rects (qualify:*)", &self.qualify.hits_json());
             // The family table as the Family table pane last read it, its
             // problems, selection and the last Generate report; and its rects.
-            crate::automation::registry::publish("__brepFamily", "Family table pane state {table, expressions, notColumns, selected, editing, problems, columnProblems, values, generateCalls, report, status, preview: {row, partNumber, applied, showing, message, featureErrors} or null, runsReplied}", &self.family_table.state_json());
             crate::automation::registry::publish("__brepFamilyHit", "Family table pane widget rects (family:*)", &self.family_table.hits_json());
             // The PMI block + report + active view / open annotation, and the
             // PMI panel's rects (`pmi:capture`, `pmi:add`, `pmi:add:<type>`,
             // `pmi:row:<id>`, `pmi:cell:<id>:<column>`, `pmi:menu:<id>`, the
             // form's `pmi:` keys).
-            crate::automation::registry::publish("__brepPmi", "PMI block, report, active view, open annotation or view dialog, and the selected annotation or view", &self.docs.engine().pmi_state_json());
             crate::automation::registry::publish("__brepPluginsHit", "Declarative plugin panel action controls", &self.plugins.panel_hits_json());
             crate::automation::registry::publish("__brepPmiHit", "PMI panel widget rects (pmi:*)", &self.pmi.hits_json());
             // The `sheets` block, which sheet the viewport draws, and the OPEN
@@ -2990,37 +3087,18 @@ impl eframe::App for BrepApp {
             // the annotations that passed the parallel rule, in millimetres.
             // The panel's rects (`sheets:add`, `sheets:place:<view>`,
             // `sheets:row:<id>`, the form's `sheets:` keys) ride beside it.
-            crate::automation::registry::publish("__brepSheets", "drawing sheets, the open sheet and its projection, the open and the selected sheet object", &self.docs.engine_mut().sheet_state_json());
             crate::automation::registry::publish("__brepSheetsHit", "Sheets panel widget rects (sheets:*)", &self.sheets.hits_json());
-            // The workbench logical state (resolved current id + available ids) so
-            // the verifier can drive the dropdown and confirm the active workbench.
-            // Hit-rects for the dropdown ride in `__brepToolbar` (self.toolbar.hits).
-            crate::automation::registry::publish("__brepWorkbench", "active workbench id and the available ids",
-                &crate::workbench::workbench_state_scoped(self.docs.engine()).to_string(),
-            );
-            crate::automation::registry::publish("__brepSelection", "selection {solids, faces, edges, datums, vertices}; the name arrays are in pick order, oldest first", &self.docs.engine().selection_json());
-            crate::automation::registry::publish("__brepInfoWindows", "open info windows (mass properties, topology, metadata)",
-                &self.info_windows.published_json(self.docs.engine_mut()),
-            );
             crate::automation::registry::publish("__brepInfoWindowsHit", "info window widget rects", &self.info_windows.hits_json());
-            crate::automation::registry::publish("__brepInterference", "interference check state", &self.interference.state_json_in(self.docs.engine()));
             crate::automation::registry::publish("__brepInterferenceHit", "interference panel widget rects", &self.interference.hits_json());
-            crate::automation::registry::publish("__brepAutoConstraints", "auto-constraint inference state", &self.auto_constraints.state_json());
             crate::automation::registry::publish("__brepAutoConstraintsHit", "auto-constraints widget rects", &self.auto_constraints.hits_json());
-            crate::automation::registry::publish("__brepStepParts", "STEP parts library panel state", &self.step_parts.state_json());
             crate::automation::registry::publish("__brepStepPartsHit", "STEP parts library widget rects", &self.step_parts.hits_json());
-            crate::automation::registry::publish("__brepSelectionFilter", "which entity kinds a viewport click may pick", &self.docs.engine().selection_filter_json());
-            crate::automation::registry::publish("__brepFilterButton", "the status bar's compact selection filter {shown, label}: whether the filter is one button (touch or a narrow bar) and its caption", &self.selection.button_json());
             crate::automation::registry::publish("__brepSelectionHit", "selection bar widget rects (filter:kind, clear, hide)", &self.selection.hits_json());
-            crate::automation::registry::publish("__brepContext", "context action bar state (offers for the selection)", &self.context_bar.state_json());
             crate::automation::registry::publish("__brepContextHit", "context action bar widget rects", &self.context_bar.hits_json());
-            crate::automation::registry::publish("__brepPickBar", "the focused pick bar {shown, label, count}: a touch or narrow window's picker while a dialog's reference field picks, all other chrome hidden", &self.pick_bar.state_json());
             crate::automation::registry::publish("__brepPickBarHit", "focused pick bar widget rects (bar, finish, cancel, x<i>)", &self.pick_bar.hits_json());
             crate::automation::registry::publish("__brepModeBarHit", "mode bar widget rects (refsel:*, Sketch:*)", &self.mode_bar.hits_json());
             // The DOCUMENT TABS: the open models, which one is active, and the
             // strip's per-tab hit-rects, so an e2e script can switch and close
             // documents the way a user does.
-            crate::automation::registry::publish("__brepDocuments", "open document tabs {active, tabs:[{title,name,dirty}]}", &document_tabs::state_json(&self.docs));
             crate::automation::registry::publish(
                 "__brepDocumentsHit",
                 "document tab strip widget rects",
@@ -3029,11 +3107,7 @@ impl eframe::App for BrepApp {
                 ),
             );
             // The boot-time recovery prompt: its entries and its two buttons.
-            crate::automation::registry::publish("__brepRecovery", "boot-time recovery prompt entries", &self.recovery.state_json());
-            crate::automation::registry::publish("__brepClosing", "closing the app: {closing, closed, pending}: a close waits for the store's writes to land, unsaved work written for recovery first", &self.closing_json());
             crate::automation::registry::publish("__brepRecoveryHit", "recovery prompt widget rects", &self.recovery.hits_json());
-            crate::automation::registry::publish("__brepComponentMove", "assembly component move state", &self.docs.engine().component_move_json());
-            crate::automation::registry::publish("__brepSketch", "sketch mode state (session, tool, selection, constraints)", &self.sketch.published_json(self.docs.engine()));
             #[cfg(target_arch = "wasm32")]
             crate::automation::registry::publish("__brepMobileDock", "compact dock drawer controls", &self.dock.mobile_state_json());
             #[cfg(target_arch = "wasm32")]
@@ -3043,32 +3117,8 @@ impl eframe::App for BrepApp {
             }).to_string());
             crate::automation::registry::publish("__brepSketchHit", "sketch-mode overlay widget rects: the SKETCH ACTIONS card (constraint:glyph fix construction cleanup delete) \u{2014} empty out of sketch mode. The draw tools are NOT here: they are workbench buttons in the toolbar row (toolbar/workbench:btn:sketch.tool.* and sketch.autoconstrain)", &self.sketch.hits_json(self.docs.engine()));
             crate::automation::registry::publish("__brepSketchListHit", "sketch entity-list widget rects: section:* geometry:id point:id constraint:id del:kind:id panel:clip (empty out of sketch mode)", &self.sketch.list_hits_json(self.docs.engine()));
-            crate::automation::registry::publish("__brepSketch3d", "3D sketch mode state: {sketch3dMode, featureId, dof, status, conflicting, tool, workPlane, workPlaneAnchor, pointCount, geometryCount, constraintCount, pendingLen, selection, applicableConstraints, dimensions, externalRefs, lastHit, canUndo, canRedo, entities}", &self.sketch3d.published_json(self.docs.engine()));
             crate::automation::registry::publish("__brepSketch3dHit", "3D sketch-mode overlay widget rects: the 3D SKETCH ACTIONS card (constraint:type fix construction delete) \u{2014} empty out of 3D sketch mode. The draw tools and the working-plane radio are workbench buttons in the toolbar row (toolbar/workbench:btn:sketch3d.tool.* and sketch3d.plane.*)", &self.sketch3d.hits_json(self.docs.engine()));
             crate::automation::registry::publish("__brepSketch3dListHit", "3D sketch entity-list widget rects: section:* geometry:id point:id constraint:id del:kind:id reference:name unlink:name panel:clip (empty out of 3D sketch mode)", &self.sketch3d.list_hits_json(self.docs.engine()));
-            crate::automation::registry::publish("__brepWireframe", "wireframe toggle", &format!("{}", self.docs.engine().settings.wireframe));
-            // The pick's `subject` and `path` name the FORM FIELD it runs in
-            // (`<panel>/field:<path>#activate` is that field's button, Done
-            // while the pick runs); `inForm` is false for the card-based
-            // picks, whose controls are `modebar/refsel:*`.
-            crate::automation::registry::publish("__brepRefSelect", "reference-selection pick {active, prompt, names, subject, path, multiple, picks, inForm}",
-                &{
-                    let engine = self.docs.engine();
-                    let field = engine.ref_select_field();
-                    serde_json::json!({
-                        "active": engine.ref_select_active(),
-                        "prompt": engine.ref_select_prompt(),
-                        "names": engine.ref_select_names(),
-                        "subject": field.as_ref().map(|f| f.subject.clone()),
-                        "path": field.as_ref().map(|f| f.path.join(".")),
-                        "multiple": field.as_ref().map(|f| f.multiple),
-                        "picks": field.as_ref().map(|f| f.picks),
-                        "inForm": engine.ref_select_in_form(),
-                        "ghostsLit": engine.ref_select_ghosts_lit(),
-                    })
-                }
-                .to_string(),
-            );
             // Viewport origin + projected probe points (viewport-local logical
             // px) so the verifier can click precise spots ON the Box and ON the
             // Pin during ref-select mode. Index 0 is a Box top-corner clear of the
@@ -3091,9 +3141,6 @@ impl eframe::App for BrepApp {
                     )
                     .unwrap_or_else(|_| "[]".to_string()),
             );
-            crate::automation::registry::publish("__brepPpp", "pixels per point of the surface", &format!("{ppp}"));
-            crate::automation::registry::publish("__brepStep", "the rolled-to feature index", &format!("{}", self.docs.engine().history_rollback()));
-            crate::automation::registry::publish("__brepParams", "inputParams of the rolled-to feature", self.params_blob());
         }
 
         // The viewport renders only a dirty engine. A panel drawn after it this

@@ -112,6 +112,7 @@ pub mod settings;
 pub mod sheets;
 pub mod step_parts;
 pub mod stl_import;
+pub mod stl_import_regions;
 pub mod toasts;
 pub mod toolbar;
 pub mod toolbar_button;

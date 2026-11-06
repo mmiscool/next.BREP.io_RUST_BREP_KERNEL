@@ -31,10 +31,16 @@ pub mod logger;
 /// The embedded MCP server (`brep-app --mcp`); native builds with `mcp`.
 #[cfg(all(not(target_arch = "wasm32"), feature = "mcp"))]
 pub mod mcp;
+/// What the Delete key / Delete command removes for the current selection (every target).
+pub mod delete_selection;
 /// The desktop event loop: eframe's winit application plus application-command
 /// dispatch that does not wait for a frame (a hidden Wayland window gets none).
 #[cfg(not(target_arch = "wasm32"))]
 pub mod desktop_loop;
+/// One egui pass drawn into an offscreen texture: the desktop loop's captures
+/// while the window is not being drawn.
+#[cfg(not(target_arch = "wasm32"))]
+pub mod offscreen;
 pub mod offsite;
 pub mod palette;
 pub mod panels;
@@ -45,6 +51,8 @@ pub mod perf;
 /// with no server configured.
 pub mod plm;
 pub mod recovery;
+/// The problem reports this user submitted, and the notice when one is resolved.
+pub mod report_followup;
 /// Scripts in the CAD app: the CAD host for the PLM's interpreter core (S11).
 #[cfg(feature = "scripting")]
 pub mod scripting;
@@ -53,6 +61,9 @@ pub mod simulation_export;
 pub mod store;
 /// A template's input marks and its spin-out (`.tbrep`).
 pub mod template;
+/// The desktop app's signed updates from next.brep.io (offered, never silent).
+#[cfg(not(target_arch = "wasm32"))]
+pub mod update;
 pub mod viewport;
 /// The browser's tool surface (WebMCP): the MCP server's tool set, served by
 /// the page as the tools it registers with `document.modelContext`, answered
@@ -111,7 +122,8 @@ mod web {
                 Box::new(|cc| {
                     crate::fonts::install(&cc.egui_ctx);
                     crate::app::BrepApp::new(cc)
-                        .map(|app| {
+                        .map(|mut app| {
+                            app.start_report_followup(&cc.egui_ctx);
                             // The page's tool surface (WebMCP) answers through
                             // the app's own automation queue: hand it over
                             // here, where the app first exists.

@@ -793,6 +793,11 @@ fn thicken_one_region(
         // no wall, and on each cap it stays as a degenerate coedge so the
         // parameter loop still closes. Lane O 2026-10-28; before this the two
         // ends read as coincident junctions and the sheet was refused. ----
+        // A SEAMED sheet (a revolved cap, its pole the shared end of the two
+        // seam meridians) keeps the path it had before: both pole ends are
+        // seam junctions there, so the merge below would weld the pole to
+        // itself and drop its vertex (brep-bench thicken/spherical-cap, a pass
+        // at 0.11.0, refused "edge 9 references missing end vertex 5").
         let pole_band = 1e-9 * sheet_scale.max(1.0);
         let mut pole = vec![false; count];
         for (index, curve) in loop_curves.iter().enumerate() {
@@ -802,7 +807,8 @@ fn thicken_one_region(
                 let uv = curve.evaluate(q0 + (q1 - q0) * fraction).or_refuse(KernelStage::Refine, "evaluate")?;
                 images.push(surface.evaluate(uv.x, uv.y).or_refuse(KernelStage::Refine, "evaluate")?);
             }
-            pole[index] = images.iter().all(|point| point.sub(images[0]).length() <= pole_band);
+            pole[index] = seam.is_none()
+                && images.iter().all(|point| point.sub(images[0]).length() <= pole_band);
         }
         if pole.iter().all(|is_pole| *is_pole) {
             return Err(KernelRefusal::input(KernelStage::Collect, "thicken_degenerate_boundary", "thickenSheet: sheet boundary is degenerate (every boundary curve is a pole)"));

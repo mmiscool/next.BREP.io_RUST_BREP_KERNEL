@@ -33,11 +33,7 @@ pub(super) fn schema() -> serde_json::Value {
         "id": id_field(),
         "elements": elements_field(&["FACE", "EDGE", "VERTEX"], 2, 2,
             "Select two like elements to touch/align"),
-        "reverse": {
-            "type": "boolean",
-            "default_value": false,
-            "hint": "Flip the captured facing preference"
-        },
+        "facing": super::super::mapping::facing_field("Aligned: the two elements point the same way; Opposed: they face each other. Unset, a new constraint takes the facing it is placed with"),
     }))
 }
 
@@ -46,13 +42,12 @@ pub(in crate::feature_pipeline::assembly) fn map(
     a: &ResolvedElement,
     b: &ResolvedElement,
 ) -> Result<MappedConstraint, ConstraintFailure> {
-    let reverse = entry.flag("reverse");
     match (&a.world, &b.world) {
         (SelectionGeometry::Plane { origin: oa, normal: na },
          SelectionGeometry::Plane { origin: ob, .. }) => {
             let (wa, _) = require_direction(a)?;
             let (wb, _) = require_direction(b)?;
-            let align = effective_align(entry, wa, wb, reverse);
+            let align = effective_align(entry, wa, wb, "reverse");
             let separation = ob.sub(*oa).dot(*na);
             Ok(MappedConstraint {
                 mates: vec![mate(a, b, MateKind::CoincidentPlanePlane {
@@ -75,7 +70,7 @@ pub(in crate::feature_pipeline::assembly) fn map(
         {
             let (wa, _) = require_direction(a)?;
             let (wb, _) = require_direction(b)?;
-            let align = effective_align(entry, wa, wb, reverse);
+            let align = effective_align(entry, wa, wb, "reverse");
             let gap = line_line_distance(
                 a.world.representative_point(), wa,
                 b.world.representative_point(), wb,

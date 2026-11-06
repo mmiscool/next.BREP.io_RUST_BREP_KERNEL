@@ -101,7 +101,7 @@ const SPLIT_MAX_REFINEMENT_ITERATIONS: usize = 40;
 const MAX_SPLIT_TRIANGLES: usize = 32_768;
 
 /// What the split did, for the conversion report.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub(super) struct SplitReport {
     /// Largest vertex deviation from a carrier the split wrote (zero when it
     /// wrote none): the noise the mesh carries.
@@ -121,6 +121,14 @@ pub(super) struct SplitReport {
     pub(super) budget_hit_regions: usize,
     /// Freeform regions the normal-band pre-test declined before recognition.
     pub(super) band_declined_regions: usize,
+    /// On the retry of a jittered body, the groups of declined walls and
+    /// gathered regions sharing edges that `join_walls` joins (counted
+    /// whether or not it is on).
+    pub(super) joinable_walls: usize,
+    /// Under `noisy_crossing`, the regions written for the faces of crossing
+    /// cylinders cut apart at their crossing: `join_wall_pieces` keeps the
+    /// two faces of one cylinder apart.
+    pub(super) crossing_faces: std::collections::BTreeSet<u32>,
 }
 
 /// Regions below this size beside a split region are slivers it may absorb.
@@ -148,6 +156,14 @@ pub(super) fn split(
     lone_share: bool,
     merge_refit: bool,
     noise_bar: bool,
+    wide_ladder: bool,
+    retry_walls: bool,
+    wall_chips: bool,
+    chip_join: bool,
+    retry_lone: bool,
+    band_cylinders: bool,
+    join_walls: bool,
+    noisy_crossing: bool,
 ) -> SplitReport {
     let mut report = SplitReport::default();
     if indices.len() != segmentation.triangle_region_ids.len() * 3 {
@@ -194,7 +210,29 @@ pub(super) fn split(
     // stayed facets with the wall, 120 -> 145 faceted.
     let mut gather_undo: Vec<(u32, Vec<(usize, u32)>, Vec<(usize, usize)>, (usize, RegionCarrier))> = Vec::new();
     let mut split_done = std::collections::HashSet::<u32>::new();
-    if noise_bar && merge_refit && !segmentation.regions.iter().any(candidate) {
+    // `retry_walls` (a second call under
+    // [`crate::hybrid_region_brep::HybridSwitches::retry_jittered_walls`],
+    // with the wide ladder): the freeform regions that still reach the split
+    // after the first call are walls it declined. On a body read as jittered
+    // (below) each is drawn again on the wide ladder alone, as a gathered
+    // region is, and the dust touching it is gathered (census record
+    // kernel_frustum_s1_d0.1_jitter-1.0: the wall is one freeform region and
+    // the caps chips; at six bars the passes proposed a cylinder and two
+    // cones holding too little of it and the region was declined). Drawn so
+    // on the first call, before the later passes had their turn, 27 census
+    // rows the first call rebuilds went to facets (batch 78, dropped).
+    let mut jittered_walls = std::collections::HashSet::<u32>::new();
+    // Under `retry_walls`, a jittered body's diagonal: its gathered regions
+    // and walls are fitted at bars of this diagonal, not their own (the
+    // jitter is the body's: the top cap of census record
+    // kernel_frustum_s10_d0.1_jitter-1.0 is 20 across against the body's 75,
+    // and at 24 of its own bars a plane held 20 of its 25 triangles).
+    let mut body_diagonal: Option<f64> = None;
+    let has_candidate = segmentation.regions.iter().any(candidate);
+    if retry_walls && !(noise_bar && merge_refit && wide_ladder && has_candidate) {
+        return report;
+    }
+    if noise_bar && merge_refit && (!has_candidate || retry_walls) {
         // On a body no region of which, of any kind, reaches the floor, the
         // dust is every region: a coarse jittered wall's two-triangle
         // facets read as planes, cylinders and tori to the segmenter
@@ -243,7 +281,18 @@ pub(super) fn split(
             planes.iter().all(|r| r.max_deviation > GATHER_NOISY_PLANE * mesh_diagonal)
         };
         let all_dust = jittered || !segmentation.regions.iter().any(|r| r.triangle_count >= MIN_SPLIT_TRIANGLES);
+        if has_candidate && jittered {
+            jittered_walls.extend(segmentation.regions.iter().filter(|r| candidate(r)).map(|r| r.id));
+        }
+        if retry_walls && jittered {
+            body_diagonal = Some(mesh_diagonal);
+        }
         if debug {
+            let mut chip_devs: Vec<f64> = segmentation.regions.iter().filter(|r| matches!(r.carrier, RegionCarrier::Plane { .. }) && r.triangle_count >= 2 && r.triangle_count < MIN_SPLIT_TRIANGLES).map(|r| r.max_deviation).collect();
+            chip_devs.sort_by(f64::total_cmp);
+            if !chip_devs.is_empty() {
+                eprintln!("[split] dust gather: {} plane chips, deviation median {:.3e} upper quartile {:.3e} max {:.3e}", chip_devs.len(), chip_devs[chip_devs.len() / 2], chip_devs[chip_devs.len() * 3 / 4], chip_devs[chip_devs.len() - 1]);
+            }
             let read: Vec<(usize, f64)> = planes.iter().map(|r| (r.triangle_count, r.max_deviation / mesh_diagonal)).collect();
             eprintln!("[split] dust gather: jittered {jittered} all dust {all_dust}, planes of 16 (triangles, deviation / diagonal) {read:?}");
         }
@@ -251,7 +300,10 @@ pub(super) fn split(
             .regions
             .iter()
             .map(|r| {
-                (all_dust || matches!(r.carrier, RegionCarrier::Freeform)) && r.triangle_count > 0 && r.triangle_count < MIN_SPLIT_TRIANGLES
+                (!has_candidate || jittered)
+                    && (all_dust || matches!(r.carrier, RegionCarrier::Freeform))
+                    && r.triangle_count > 0
+                    && r.triangle_count < MIN_SPLIT_TRIANGLES
             })
             .collect();
         let mut parent: Vec<usize> = (0..segmentation.regions.len()).collect();
@@ -281,6 +333,18 @@ pub(super) fn split(
             }
         }
         for members in groups.values() {
+            // On the retry only the dust touching a declined wall.
+            if retry_walls {
+                let ids: std::collections::HashSet<u32> = members.iter().map(|&i| segmentation.regions[i].id).collect();
+                let touches = edges.values().any(|tris| {
+                    let [t0, t1] = tris[..] else { return false };
+                    let (a, b) = (segmentation.triangle_region_ids[t0], segmentation.triangle_region_ids[t1]);
+                    (ids.contains(&a) && jittered_walls.contains(&b)) || (ids.contains(&b) && jittered_walls.contains(&a))
+                });
+                if !touches {
+                    continue;
+                }
+            }
             let total: usize = members.iter().map(|&i| segmentation.regions[i].triangle_count).sum();
             // On a jittered body a gather as small as a cap is kept (a
             // jittered frustum's two caps gather apart, 30-40 triangles each,
@@ -325,6 +389,104 @@ pub(super) fn split(
                 eprintln!("[split] gathered {} dust regions into region {host_id} ({total} tris)", members.len());
             }
         }
+        // Under `join_walls` (the second rebuild
+        // [`crate::hybrid_region_brep::HybridSwitches::retry_join_walls`]
+        // makes): on the retry of a jittered body the declined walls and the
+        // gathered regions that share edges are one region, drawn as both a
+        // wall and a gathered region. The groups are counted either way. On census record
+        // occt_crossed_cylinders_s1_d0.05_jitter-1.0 the crossing is two
+        // freeform walls of 107 and 125 and a gathered region of 304 beside
+        // them; each cylinder's normal band held under 64 triangles of
+        // either wall, and the band draw wrote neither.
+        if retry_walls && jittered {
+            let pieces: Vec<u32> = segmentation
+                .regions
+                .iter()
+                .filter(|r| r.triangle_count > 0 && (jittered_walls.contains(&r.id) || gathered.contains(&r.id)))
+                .map(|r| r.id)
+                .collect();
+            let mut parent: std::collections::HashMap<u32, u32> = pieces.iter().map(|&id| (id, id)).collect();
+            fn root(parent: &mut std::collections::HashMap<u32, u32>, mut id: u32) -> u32 {
+                while parent[&id] != id {
+                    let up = parent[&parent[&id]];
+                    parent.insert(id, up);
+                    id = up;
+                }
+                id
+            }
+            for tris in edges.values() {
+                if let [t0, t1] = tris[..] {
+                    let (a, b) = (segmentation.triangle_region_ids[t0], segmentation.triangle_region_ids[t1]);
+                    if a != b && parent.contains_key(&a) && parent.contains_key(&b) {
+                        let (ra, rb) = (root(&mut parent, a), root(&mut parent, b));
+                        if ra != rb {
+                            parent.insert(ra, rb);
+                        }
+                    }
+                }
+            }
+            let mut components = std::collections::BTreeMap::<u32, Vec<u32>>::new();
+            for &id in &pieces {
+                let r = root(&mut parent, id);
+                components.entry(r).or_default().push(id);
+            }
+            for members in components.values() {
+                if members.len() < 2 || !members.iter().any(|id| jittered_walls.contains(id)) {
+                    continue;
+                }
+                report.joinable_walls += 1;
+                if !join_walls {
+                    continue;
+                }
+                let host_id = *members.iter().max_by_key(|&&id| segmentation.regions[id as usize].triangle_count).unwrap();
+                let host = host_id as usize;
+                let total: usize = members.iter().map(|&id| segmentation.regions[id as usize].triangle_count).sum();
+                // One undo for the joined region: each gathered member's own
+                // (its dust back to where it came from), each wall's
+                // triangles back to the wall.
+                let mut undo_ids = Vec::new();
+                let mut undo_counts = Vec::new();
+                let mut host_carrier = segmentation.regions[host].carrier.clone();
+                for &id in members {
+                    if let Some(at) = gather_undo.iter().position(|(h, ..)| *h == id) {
+                        let (_, ids, counts, (_, carrier)) = gather_undo.remove(at);
+                        if id == host_id {
+                            host_carrier = carrier;
+                        }
+                        let own: std::collections::HashSet<usize> = ids.iter().map(|&(t, _)| t).collect();
+                        undo_ids.extend(ids);
+                        // The host's own triangles were never relabelled.
+                        undo_ids.extend(segmentation.triangle_region_ids.iter().enumerate().filter(|&(t, &r)| r == id && !own.contains(&t)).map(|(t, &r)| (t, r)));
+                        undo_counts.extend(counts);
+                    } else {
+                        undo_ids.extend(segmentation.triangle_region_ids.iter().enumerate().filter(|&(_, &r)| r == id).map(|(t, &r)| (t, r)));
+                        undo_counts.push((id as usize, segmentation.regions[id as usize].triangle_count));
+                    }
+                }
+                for &id in members {
+                    if id == host_id {
+                        continue;
+                    }
+                    for r in segmentation.triangle_region_ids.iter_mut() {
+                        if *r == id {
+                            *r = host_id;
+                        }
+                    }
+                    segmentation.regions[id as usize].triangle_count = 0;
+                    jittered_walls.remove(&id);
+                    gathered.remove(&id);
+                }
+                segmentation.regions[host].triangle_count = total;
+                segmentation.regions[host].carrier = RegionCarrier::Freeform;
+                jittered_walls.insert(host_id);
+                gathered.insert(host_id);
+                gather_undo.push((host_id, undo_ids, undo_counts, (host, host_carrier)));
+                changed = true;
+                if debug {
+                    eprintln!("[split] joined walls and gathered regions {members:?} into region {host_id} ({total} tris)");
+                }
+            }
+        }
     }
     if !segmentation.regions.iter().any(candidate) && gathered.is_empty() {
         if changed {
@@ -332,8 +494,42 @@ pub(super) fn split(
         }
         return report;
     }
-    for region in segmentation.regions.clone() {
+    // On the retry the walls go first, and the pieces they are written as
+    // (region id, carrier, bar) take the wall chips a gathered region holds
+    // (below).
+    let mut order = segmentation.regions.clone();
+    if retry_walls {
+        order.sort_by_key(|r| !jittered_walls.contains(&r.id));
+    }
+    let mut wall_pieces: Vec<(u32, crate::AnalyticSurface, f64)> = Vec::new();
+    // Every piece the retry writes (region id, carrier, bar), for the chips
+    // after the loop.
+    let mut retry_pieces: Vec<(u32, crate::AnalyticSurface, f64)> = Vec::new();
+    // Every piece this split wrote, with its carrier.
+    let mut written = std::collections::HashMap::<u32, crate::AnalyticSurface>::new();
+    // Under `wall_chips` ([`crate::hybrid_region_brep::HybridSwitches::retry_wall_chips`])
+    // a gathered region the retry's first pass declined is drawn once more
+    // (pass 1), after it gives the walls their chips (below).
+    let first_len = order.len();
+    let mut queue: Vec<(u8, MeshRegion)> = order.into_iter().map(|r| (0, r)).collect();
+    let mut next = 0;
+    let mut requeued = false;
+    loop {
+        if next == first_len && retry_walls && wall_chips && !requeued {
+            requeued = true;
+            let again: Vec<MeshRegion> = queue[..first_len]
+                .iter()
+                .filter(|(_, r)| gathered.contains(&r.id) && !split_done.contains(&r.id))
+                .map(|(_, r)| r.clone())
+                .collect();
+            queue.extend(again.into_iter().map(|r| (1, r)));
+        }
+        let Some((pass, region)) = queue.get(next).cloned() else { break };
+        next += 1;
         if !candidate(&region) && !gathered.contains(&region.id) {
+            continue;
+        }
+        if retry_walls && !jittered_walls.contains(&region.id) && !gathered.contains(&region.id) {
             continue;
         }
         let ids: Vec<usize> = segmentation
@@ -342,6 +538,64 @@ pub(super) fn split(
             .enumerate()
             .filter_map(|(t, &r)| (r == region.id).then_some(t))
             .collect();
+        // On the retry a gathered region the first pass declined gives a
+        // split wall's piece the triangles beside it that its carrier holds
+        // at its bar, centroid too (repeated while any moves), and is drawn
+        // again: the dust gather joins the wall chips that reach the rim
+        // with the cap's (census record occt_frustum_s10_d0.1_jitter-1.0, and
+        // kernel_frustum_s10_d0.1_jitter-1.0: the top cap's 25 gathered
+        // triangles held 20 at 24 bars, the five others wall chips at
+        // z 41-50); the cap was declined and the chips left demoted the
+        // wall. A cap triangle fanned from its rim has its centroid inside
+        // the wall, off it. Given before the first draw, the gathered
+        // countersink of 290 triangles of census record
+        // occt_countersunk_hole_s10_d0.005_jitter-1.0 gave 30 and took a
+        // plane 0.87 off its cone, where declined it was assembled later
+        // (0 -> 773 faceted).
+        let ids = if pass == 1 && !wall_pieces.is_empty() {
+            let mut ids = ids;
+            let point = |v: u32| {
+                let at = v as usize * 3;
+                crate::Vec3::new(positions[at], positions[at + 1], positions[at + 2])
+            };
+            let mut handed = 0usize;
+            loop {
+                let before = ids.len();
+                let region_ids = &mut segmentation.triangle_region_ids;
+                ids.retain(|&t| {
+                    let p = [0, 1, 2].map(|c| point(indices[3 * t + c]));
+                    let centroid = (p[0] + p[1] + p[2]) * (1.0 / 3.0);
+                    for c in 0..3 {
+                        let (a, b) = (indices[3 * t + c], indices[3 * t + (c + 1) % 3]);
+                        for &n in &edges[&(a.min(b), a.max(b))] {
+                            let r = region_ids[n];
+                            if let Some((piece, surface, bar)) = wall_pieces.iter().find(|(piece, _, _)| *piece == r) {
+                                if p.iter().all(|&q| surface.signed_distance(q).abs() <= *bar) && surface.signed_distance(centroid).abs() <= *bar {
+                                    region_ids[t] = *piece;
+                                    return false;
+                                }
+                            }
+                        }
+                    }
+                    true
+                });
+                handed += before - ids.len();
+                if ids.len() == before {
+                    break;
+                }
+            }
+            if debug && handed > 0 {
+                eprintln!("[split] gathered region {} gives {handed} triangles to the walls beside it", region.id);
+            }
+            if handed == 0 {
+                continue;
+            }
+            ids
+        } else if pass == 1 {
+            continue;
+        } else {
+            ids
+        };
         // A region the segmenter already bordered with curved strips of its
         // own, too large to absorb as slivers, is left as it is: the builder
         // demotes every cylinder/cylinder edge that is neither a shared
@@ -445,6 +699,10 @@ pub(super) fn split(
             }
         }
         let diagonal = (0..3).map(|a| (high[a] - low[a]).powi(2)).sum::<f64>().sqrt();
+        let diagonal = match body_diagonal {
+            Some(body) if gathered.contains(&region.id) || jittered_walls.contains(&region.id) => diagonal.max(body),
+            _ => diagonal,
+        };
         let mut recognition = RecognitionOptions::default();
         recognition.distance_tolerance = options.fit_tolerance * diagonal;
         recognition.relative_tolerance = 0.0;
@@ -498,6 +756,9 @@ pub(super) fn split(
         // fits of one wall refitted as one; that proposal waits here and the
         // region takes it only when the passes as they are decline it.
         let mut merged_fallback: Option<(Vec<(crate::AnalyticSurface, usize)>, Vec<crate::CylinderSurface>)> = None;
+        // Under `noisy_crossing`, the walls this region's draws read off its
+        // caps ([`rim_cylinder`]).
+        let mut rim_surfaces: Vec<crate::AnalyticSurface> = Vec::new();
         // Set, to its bar in split bars, when `merged_fallback` is the
         // noise-bar pass's proposal.
         let mut noise_fallback: Option<f64> = None;
@@ -527,7 +788,7 @@ pub(super) fn split(
                 // The strips belong to the stage that found them.
                 bore_bridges.clear();
                 let kinds = if cones { &SPLIT_KINDS[..] } else { &SPLIT_KINDS[..2] };
-                let started = std::time::Instant::now();
+                let started = web_time::Instant::now();
                 let cap = match (cones, cone_budget) {
                     (true, true) => SPLIT_CONE_STAGE_BUDGET_ATTEMPTS,
                     (true, false) => SPLIT_CONE_STAGE_MAX_ATTEMPTS,
@@ -706,7 +967,27 @@ pub(super) fn split(
         // The passes may have spent their budget on the region (the gated
         // pass exhausts it drawing nothing on this record); a proposal
         // taken below clears that.
-        for &noise_bars in &NOISE_BAR_LADDER {
+        // Under `wide_ladder` a gathered region climbs to twelve and
+        // twenty-four bars too (GATHERED_WIDE_LADDER): on a body jittered by
+        // its whole chord bar the vertices lie up to ~26 split bars off
+        // their faces, and at six bars the draws hold pieces of 6-43
+        // triangles (census record kernel_cylinder_s10_d0.1_jitter-1.0).
+        // On the retry a declined wall's proposals, which the first call
+        // declined, give way to the wide ladder.
+        // Under `noisy_crossing` a band-declined region climbs it too: on
+        // census record kernel_sphere_s1_d0.1_jitter-1.0 the sphere region's
+        // bands cover 0.71 of it, and a sphere through all its vertices holds
+        // 57 of 168 at six bars and 156 at twelve.
+        if jittered_walls.contains(&region.id) {
+            if debug {
+                eprintln!("[split] region {} is a declined jittered wall, drawn on the wide ladder", region.id);
+            }
+            chosen = None;
+            merged_fallback = None;
+        }
+        let ladder: &[f64] =
+            if wide_ladder && (gathered.contains(&region.id) || jittered_walls.contains(&region.id) || (noisy_crossing && band_declined)) { &GATHERED_WIDE_LADDER } else { &NOISE_BAR_LADDER };
+        for &noise_bars in ladder {
             if !(noise_bar && merge_refit && chosen.is_none()) {
                 break;
             }
@@ -761,7 +1042,7 @@ pub(super) fn split(
                 let mut wide = recognition.clone();
                 wide.probe_crease_gate = false;
                 wide.distance_tolerance = noise_bars * tolerance;
-                let started = std::time::Instant::now();
+                let started = web_time::Instant::now();
                 // Cones too: a jittered frustum wall (census record
                 // kernel_frustum_s1_d0.1_jitter-0.1, 524 faceted) is one cone
                 // 1.4 bars off its vertices that no pass at the bar holds.
@@ -955,6 +1236,146 @@ pub(super) fn split(
                     let count = |held: &Vec<bool>| held.iter().filter(|&&h| h).count();
                     let is_cone = |s: &crate::AnalyticSurface| matches!(s, crate::AnalyticSurface::Cone(_));
                     held_by.sort_by(|a, b| is_cone(&a.0).cmp(&is_cone(&b.0)).then(count(&b.1).cmp(&count(&a.1))));
+                    // Under `wide_ladder` two cylinders of a gathered region
+                    // that are one wall fitted twice (axes within
+                    // GATHERED_TWIN_TILT_DEG, axis lines and radii within two
+                    // bars) are refitted as one over what both hold: at
+                    // twelve bars census record kernel_cylinder_s10_d0.1_jitter-1.0's
+                    // wall came as two such cylinders holding 37 and 36,
+                    // 0.6 degrees and 1.4 apart, its pieces cut in 2-30, and
+                    // the region was declined.
+                    if wide_ladder && gathered.contains(&region.id) {
+                        let mut merged_any = true;
+                        while merged_any {
+                            merged_any = false;
+                            'pairs: for a in 0..held_by.len() {
+                                for b in a + 1..held_by.len() {
+                                    let (crate::AnalyticSurface::Cylinder(first), crate::AnalyticSurface::Cylinder(second)) = (held_by[a].0, held_by[b].0) else { continue };
+                                    let d = second.axis_origin - first.axis_origin;
+                                    let apart = (d - first.axis * d.dot(first.axis)).length();
+                                    if first.axis.dot(second.axis).abs() < GATHERED_TWIN_TILT_DEG.to_radians().cos() || apart > 2.0 * bar || (first.radius - second.radius).abs() > 2.0 * bar {
+                                        continue;
+                                    }
+                                    let union: Vec<usize> = (0..ids.len()).filter(|&i| held_by[a].1[i] || held_by[b].1[i]).collect();
+                                    let mut wide = recognition.clone();
+                                    wide.probe_crease_gate = false;
+                                    wide.distance_tolerance = bar;
+                                    let hint = crate::SurfaceHint::InitialGuess { surface: held_by[a].0, trust: crate::MetadataTrust::InitialGuess };
+                                    let Ok(fit) = crate::reconstruct_surface(&mesh, &union, &hint, &wide) else { continue };
+                                    let crate::AnalyticSurface::Cylinder(_) = fit.surface else { continue };
+                                    let held: Vec<bool> = (0..ids.len()).map(|i| holds(&fit.surface, ids[i], positions, indices, bar, gathered_gate)).collect();
+                                    if count(&held) < union.len() * 19 / 20 {
+                                        continue;
+                                    }
+                                    if debug {
+                                        eprintln!("[split] twin cylinders holding {} and {} refitted as one holding {} at {noise_bars} bars", count(&held_by[a].1), count(&held_by[b].1), count(&held));
+                                    }
+                                    held_by[a] = (fit.surface, held);
+                                    held_by.remove(b);
+                                    merged_any = true;
+                                    break 'pairs;
+                                }
+                            }
+                        }
+                        held_by.sort_by(|a, b| is_cone(&a.0).cmp(&is_cone(&b.0)).then(count(&b.1).cmp(&count(&a.1))));
+                    }
+                    // Under `band_cylinders` ([`crate::hybrid_region_brep::HybridSwitches::band_cylinders`])
+                    // a retried wall's plane/cylinder draw takes the
+                    // cylinders its normal bands give too ([`normal_band_cylinders`]),
+                    // each refitted over what it holds at the bar: on census
+                    // record occt_crossed_cylinders_s10_d0.02_jitter-1.0 the
+                    // recognizer's seeds lie on one or two of the coarse
+                    // wall's long strips, and its fits held at most 63 of the
+                    // 387 at 24 bars.
+                    if band_cylinders && retry_walls && jittered_walls.contains(&region.id) && kinds.len() == 2 {
+                        for start in normal_band_cylinders(&ids, positions, indices, BAND_HALF_WIDTH_DEG.to_radians().sin(), bar) {
+                            let start = crate::AnalyticSurface::Cylinder(start);
+                            let first: Vec<usize> = (0..ids.len()).filter(|&i| holds(&start, ids[i], positions, indices, bar, gathered_gate)).collect();
+                            if first.len() < MIN_SPLIT_TRIANGLES {
+                                continue;
+                            }
+                            let mut wide = recognition.clone();
+                            wide.probe_crease_gate = false;
+                            wide.distance_tolerance = bar;
+                            let hint = crate::SurfaceHint::InitialGuess { surface: start, trust: crate::MetadataTrust::InitialGuess };
+                            let surface = match crate::reconstruct_surface(&mesh, &first, &hint, &wide) {
+                                Ok(fit) if matches!(fit.surface, crate::AnalyticSurface::Cylinder(_)) => fit.surface,
+                                _ => start,
+                            };
+                            let held: Vec<bool> = (0..ids.len()).map(|i| holds(&surface, ids[i], positions, indices, bar, gathered_gate)).collect();
+                            if debug {
+                                eprintln!("[split] band cylinder holds {} of {} at {noise_bars} bars (start {}): {:?}", count(&held), ids.len(), first.len(), surface);
+                            }
+                            if !held_by.iter().any(|(s, _)| same_cylinder(s, &surface, bar)) {
+                                held_by.push((surface, held));
+                            }
+                        }
+                        held_by.sort_by(|a, b| is_cone(&a.0).cmp(&is_cone(&b.0)).then(count(&b.1).cmp(&count(&a.1))));
+                    }
+                    // Under `noisy_crossing` a gathered region's end caps give
+                    // their walls: a plane of the draw whose triangles' vertices
+                    // all lie within the bar of one circle in it ([`rim_cylinder`])
+                    // is a cap, and the cylinder on that circle along the plane's
+                    // normal is its wall. On census record
+                    // occt_crossed_cylinders_s10_d0.1_jitter-1.0 the wall is long
+                    // slivers spanning it, every cylinder the recognizer drew from
+                    // them held 6-104 of 536 at 24 bars, and the four caps held 40
+                    // each; their rim circles fit radius 9.93-10.06 against the
+                    // record's 10.
+                    if noisy_crossing && gathered.contains(&region.id) && kinds.len() == 2 {
+                        let caps: Vec<(crate::PlaneSurface, Vec<bool>)> = held_by
+                            .iter()
+                            .filter_map(|(s, held)| if let crate::AnalyticSurface::Plane(p) = s { Some((*p, held.clone())) } else { None })
+                            .filter(|(_, held)| count(held) >= GATHERED_CARRIER_TRIANGLES)
+                            .collect();
+                        for (plane, cap_held) in caps {
+                            let mut rim: Vec<crate::Vec3> = Vec::new();
+                            let mut seen = std::collections::BTreeSet::new();
+                            for i in (0..ids.len()).filter(|&i| cap_held[i]) {
+                                for c in 0..3 {
+                                    let v = indices[3 * ids[i] + c] as usize;
+                                    if seen.insert(v) {
+                                        rim.push(crate::Vec3::new(positions[3 * v], positions[3 * v + 1], positions[3 * v + 2]));
+                                    }
+                                }
+                            }
+                            let Some(start) = rim_cylinder(&plane, &rim, bar).filter(|w| w.radius <= diagonal) else { continue };
+                            // Refitted over what it holds, twice: the cap's
+                            // normal leans with its jittered disc (on census
+                            // record occt_crossed_cylinders_s1_d0.1_jitter-1.0
+                            // the two caps of one arm gave walls 3.6 degrees
+                            // apart, and the arm came as two cylinders).
+                            let mut surface = crate::AnalyticSurface::Cylinder(start);
+                            let mut held: Vec<bool> = (0..ids.len()).map(|i| holds(&surface, ids[i], positions, indices, bar, gathered_gate)).collect();
+                            for _ in 0..2 {
+                                let selection: Vec<usize> = (0..ids.len()).filter(|&i| held[i]).collect();
+                                let mut wide = recognition.clone();
+                                wide.probe_crease_gate = false;
+                                wide.distance_tolerance = bar;
+                                let hint = crate::SurfaceHint::InitialGuess { surface, trust: crate::MetadataTrust::InitialGuess };
+                                let Ok(fit) = crate::reconstruct_surface(&mesh, &selection, &hint, &wide) else { break };
+                                let crate::AnalyticSurface::Cylinder(refit) = fit.surface else { break };
+                                if refit.radius > diagonal {
+                                    break;
+                                }
+                                let refit_held: Vec<bool> = (0..ids.len()).map(|i| holds(&fit.surface, ids[i], positions, indices, bar, gathered_gate)).collect();
+                                if count(&refit_held) < count(&held) {
+                                    break;
+                                }
+                                (surface, held) = (fit.surface, refit_held);
+                            }
+                            let crate::AnalyticSurface::Cylinder(wall) = surface else { continue };
+                            if held_by.iter().any(|(s, _)| same_cylinder(s, &surface, bar)) {
+                                continue;
+                            }
+                            if debug {
+                                eprintln!("[split] rim cylinder of a cap holding {} ({} rim vertices) holds {} of {} at {noise_bars} bars: {:?}", count(&cap_held), rim.len(), count(&held), ids.len(), wall);
+                            }
+                            rim_surfaces.push(surface);
+                            held_by.push((surface, held));
+                        }
+                        held_by.sort_by(|a, b| is_cone(&a.0).cmp(&is_cone(&b.0)).then(count(&b.1).cmp(&count(&a.1))));
+                    }
                     let mut merged: Vec<(crate::AnalyticSurface, usize)> = Vec::new();
                     let mut taken = vec![false; ids.len()];
                     // A cylinder under the carrier floor that is coaxial with
@@ -1198,6 +1619,30 @@ pub(super) fn split(
                     let held_all = |merged: &Vec<(crate::AnalyticSurface, usize)>, bars: f64| {
                         ids.iter().filter(|&&t| merged.iter().any(|(s, _)| holds(s, t, positions, indices, bars * tolerance, gathered_gate))).count()
                     };
+                    // Under `retry_lone` ([`crate::hybrid_region_brep::HybridSwitches::retry_lone_carrier`])
+                    // a retried wall's proposal of several carriers is the
+                    // one of them that holds 19 in 20 of the wall alone
+                    // within the assignment slack (the lone proposal's test
+                    // below): the proposal ranks cylinders before cones, so
+                    // two false cylinders on census record
+                    // occt_pointed_cone_s10_d0.1_jitter-1.0 (supports 79 and
+                    // 64) took the triangles of the cone that holds 337 of
+                    // the 356, and the builder demoted the wall whole.
+                    if retry_lone && retry_walls && jittered_walls.contains(&region.id) && merged.len() >= 2 {
+                        let slack = noise_bars * NOISE_ASSIGN_SLACK_BARS;
+                        let alone = merged
+                            .iter()
+                            .map(|carrier| (*carrier, held_all(&vec![*carrier], slack)))
+                            .filter(|&(_, held)| held * 20 >= ids.len() * 19)
+                            .max_by_key(|&(_, held)| held);
+                        if let Some((carrier, held)) = alone {
+                            if debug {
+                                eprintln!("[split] retried wall {}: carrier {:?} alone holds {held} of {}", region.id, carrier.0, ids.len());
+                            }
+                            merged = vec![carrier];
+                            walls.retain(|w| carrier.0 == crate::AnalyticSurface::Cylinder(*w));
+                        }
+                    }
                     // A band-declined region is one surface (its normals
                     // cover no band, so no wall meets another in it): only
                     // the carrier holding most of it is a proposal (census
@@ -1282,6 +1727,23 @@ pub(super) fn split(
             }
             continue;
         };
+        // Under `noisy_crossing`, whether a wall read off a cap is among the
+        // chosen carriers: only then are the caps snapped square to their
+        // walls and the triangles measured at their centroids (below), so a
+        // region the recognizer's own draw holds is left as it was.
+        let rim_drawn = noisy_crossing && gathered.contains(&region.id) && carriers.iter().any(|(s, _)| rim_surfaces.contains(s));
+        // The second pass redraws a cap the wall's rim chips spoiled: one
+        // face. A proposal of more is left declined (the gathered countersink
+        // of census record occt_countersunk_hole_s10_d0.005_jitter-1.0 took
+        // four carriers, a plane 0.87 off its cone among them, where left
+        // declined it was assembled later).
+        if pass == 1 && carriers.len() != 1 {
+            if debug {
+                eprintln!("[split] region {} redrawn takes {} carriers, left declined", region.id, carriers.len());
+            }
+            report.declined_regions += 1;
+            continue;
+        }
         // A region on the merged proposal is assigned at the bar the walls
         // were refitted at (read before the crossing snap below moves the
         // carriers).
@@ -1343,6 +1805,132 @@ pub(super) fn split(
         // facet normals are no evidence); the region holds no cap.
         let noise_region = noise_region.is_some();
         let cos_gate = if gathered.contains(&region.id) { GATHERED_NORMAL_GATE_DEG.to_radians().cos() } else if noise_region { -1.0 } else { cos_gate };
+        // Under `noisy_crossing`
+        // ([`crate::hybrid_region_brep::HybridSwitches::noisy_crossing`]): on a
+        // gathered region each end of a cylinder carrier is given its cap.
+        // The triangles no cylinder holds within the bar and the gate, with
+        // every vertex within two bars of the end station and of the
+        // cylinder's radius, are fitted with their least-squares plane, and
+        // it joins the proposal when it holds [`GATHERED_CARRIER_TRIANGLES`]
+        // of them within the bar, more than any drawn plane it doubles (one
+        // within [`GATHERED_FLAT_DEG`] of it and two bars of its origin,
+        // over the cylinder's disc), which is then dropped. A
+        // cap fanned from one rim vertex draws as a cone at that vertex, or
+        // as a plane leaning on a few of its slivers, and the vote below
+        // then walks the rest of the fan onto the wall (census record
+        // kernel_crossed_cylinders_s1_d0.1_jitter-1.0: of four caps of 30
+        // the draw held 23 of one, and the proposal held 1806 of 1902, one
+        // under 19 in 20).
+        if noisy_crossing && gathered.contains(&region.id) {
+            let corner = |v: u32| {
+                let at = v as usize * 3;
+                crate::Vec3::new(positions[at], positions[at + 1], positions[at + 2])
+            };
+            let corners = |t: usize| [0, 1, 2].map(|c| corner(indices[3 * t + c]));
+            let flat = GATHERED_FLAT_DEG.to_radians().cos();
+            // A cylinder across two parallel cylinders of the region (a
+            // stepped stack) is a false one chording between the step and
+            // the cap beyond it (census record
+            // occt_stepped_shaft_s10_d0.1_jitter-1.0: radius 15.8 across a
+            // shaft of radii 10 and 20); it is dropped.
+            let axes: Vec<crate::Vec3> = carriers.iter().filter_map(|(s, _)| if let crate::AnalyticSurface::Cylinder(k) = s { Some(k.axis) } else { None }).collect();
+            let across_a_stack = |a: crate::Vec3| {
+                let square: Vec<crate::Vec3> = axes.iter().copied().filter(|b| a.dot(*b).abs() <= (1.0 - flat * flat).sqrt()).collect();
+                square.iter().enumerate().any(|(i, b)| square[i + 1..].iter().any(|c| b.dot(*c).abs() >= flat))
+            };
+            carriers.retain(|(s, _)| !matches!(s, crate::AnalyticSurface::Cylinder(k) if across_a_stack(k.axis)));
+            // The loose triangles at an end of cylinder `k` are those no
+            // cylinder parallel to `k` holds: a cylinder across `k` (a false
+            // one chording between a step and the cap beyond it, census
+            // record occt_stepped_shaft_s10_d0.1_jitter-1.0) does not hide
+            // `k`'s cap.
+            let loose_for = |k: &crate::CylinderSurface| -> Vec<usize> {
+                ids.iter()
+                    .copied()
+                    .filter(|&t| {
+                        let p = corners(t);
+                        let centroid = (p[0] + p[1] + p[2]) * (1.0 / 3.0);
+                        let facing = (p[1] - p[0]).cross(p[2] - p[0]).normalized();
+                        !carriers.iter().any(|(s, _)| {
+                            matches!(s, crate::AnalyticSurface::Cylinder(other) if other.axis.dot(k.axis).abs() >= flat)
+                                && p.iter().all(|&q| s.signed_distance(q).abs() <= tolerance)
+                                && s.normal_at(centroid).zip(facing).is_some_and(|(n, m)| n.dot(m).abs() >= cos_gate)
+                        })
+                    })
+                    .collect()
+            };
+            let doubles = |cap: &crate::PlaneSurface, k: &crate::CylinderSurface, drawn: &crate::PlaneSurface| {
+                let d = drawn.origin - k.axis_origin;
+                cap.normal.dot(drawn.normal).abs() >= flat
+                    && (drawn.origin - cap.origin).dot(cap.normal).abs() <= 2.0 * tolerance
+                    && (d - k.axis * d.dot(k.axis)).length() <= k.radius + 2.0 * tolerance
+            };
+            let mut caps: Vec<(crate::PlaneSurface, crate::CylinderSurface, usize)> = Vec::new();
+            for (surface, _) in &carriers {
+                let crate::AnalyticSurface::Cylinder(k) = surface else { continue };
+                let loose = loose_for(k);
+                let station = |q: crate::Vec3| (q - k.axis_origin).dot(k.axis);
+                let radial = |q: crate::Vec3| {
+                    let d = q - k.axis_origin;
+                    (d - k.axis * d.dot(k.axis)).length()
+                };
+                let (mut low, mut high) = (f64::INFINITY, f64::NEG_INFINITY);
+                for &t in &ids {
+                    for q in corners(t) {
+                        if (radial(q) - k.radius).abs() <= tolerance {
+                            low = low.min(station(q));
+                            high = high.max(station(q));
+                        }
+                    }
+                }
+                for (end, out) in [(low, -1.0), (high, 1.0)] {
+                    if !end.is_finite() {
+                        continue;
+                    }
+                    let run: Vec<usize> = loose
+                        .iter()
+                        .copied()
+                        .filter(|&t| corners(t).iter().all(|&q| (station(q) - end).abs() <= 2.0 * tolerance && radial(q) <= k.radius + 2.0 * tolerance))
+                        .collect();
+                    if run.len() < GATHERED_CARRIER_TRIANGLES {
+                        continue;
+                    }
+                    let mut seen = std::collections::BTreeSet::<u32>::new();
+                    for &t in &run {
+                        seen.extend((0..3).map(|c| indices[3 * t + c]));
+                    }
+                    let cloud: Vec<brep_kernel::Vec3> = seen
+                        .into_iter()
+                        .map(|v| {
+                            let q = corner(v);
+                            brep_kernel::Vec3::new(q.x, q.y, q.z)
+                        })
+                        .collect();
+                    let Some((origin, normal)) = crate::hybrid_region_brep::least_squares_plane(&cloud) else { continue };
+                    let (origin, normal) = (crate::Vec3::new(origin.x, origin.y, origin.z), crate::Vec3::new(normal.x, normal.y, normal.z));
+                    let normal = if normal.dot(k.axis) * out >= 0.0 { normal } else { normal * -1.0 };
+                    let cap = crate::PlaneSurface { origin, normal };
+                    let holds = |plane: &crate::PlaneSurface| run.iter().filter(|&&t| corners(t).iter().all(|&q| (q - plane.origin).dot(plane.normal).abs() <= tolerance)).count();
+                    let held = holds(&cap);
+                    let drawn = carriers
+                        .iter()
+                        .filter_map(|(s, _)| if let crate::AnalyticSurface::Plane(drawn) = s { doubles(&cap, k, drawn).then(|| holds(drawn)) } else { None })
+                        .max();
+                    if debug {
+                        eprintln!("[split] region {} end {end:.3} of a cylinder: plane holds {held} of {} loose triangles, a drawn plane {drawn:?}", region.id, run.len());
+                    }
+                    if held < GATHERED_CARRIER_TRIANGLES || drawn.is_some_and(|drawn| drawn >= held) {
+                        continue;
+                    }
+                    caps.push((cap, *k, held));
+                }
+            }
+            carriers.retain(|(s, _)| {
+                let crate::AnalyticSurface::Plane(drawn) = s else { return true };
+                !caps.iter().any(|(cap, k, _)| doubles(cap, k, drawn))
+            });
+            carriers.extend(caps.into_iter().map(|(cap, _, held)| (crate::AnalyticSurface::Plane(cap), held)));
+        }
         // Every region triangle goes to the carrier holding all its vertices
         // closest (within the acceptance bar), its normal within the region
         // grower's dihedral gate; 19 in 20 must, or the region is left as it
@@ -1375,18 +1963,51 @@ pub(super) fn split(
             let p2 = second.axis_origin + a2 * ((e - bb * d) / denominator);
             ((p1 - p2).length() <= tolerance).then_some(((p1 + p2) * 0.5, a1, a2))
         };
+        // Under `noisy_crossing` a triangle of a gathered region whose walls
+        // were read off its caps (`rim_drawn`) is measured at
+        // its centroid as well as its vertices: a cap fanned from its rim has
+        // every vertex on its wall too, and the jitter tilts its slivers past
+        // the gate, so the nearer by vertices was noise (census record
+        // occt_crossed_cylinders_s1_d0.1_jitter-1.0: a cap of 40 cut into
+        // pieces of 13 and 8 by the wall). Its centroid lies inside the rim,
+        // and a wall sliver's lies off the cap.
+        let centroid_too = rim_drawn;
+        // In any other gathered region under `noisy_crossing` the centroid
+        // only ranks: a triangle two carriers hold by its vertices goes to
+        // the one nearer its centroid too, and none is dropped for it (a
+        // pointed cone's base fanned from its rim gave 4 slivers to the
+        // cone; census record kernel_pointed_cone_s10_d0.05_jitter-1.0).
+        let centroid_ranks = noisy_crossing && gathered.contains(&region.id) && !rim_drawn;
         let fit_within = |p: [crate::Vec3; 3], cos_gate: f64, tolerance: f64| -> Option<(f64, usize)> {
             let normal = (p[1] - p[0]).cross(p[2] - p[0]).normalized()?;
             let centroid = (p[0] + p[1] + p[2]) * (1.0 / 3.0);
             let mut held: Vec<(f64, usize)> = Vec::new();
             for (c, (surface, _)) in carriers.iter().enumerate() {
                 let worst = p.iter().map(|&q| surface.signed_distance(q).abs()).fold(0.0_f64, f64::max);
+                let worst = if centroid_too { worst.max(surface.signed_distance(centroid).abs()) } else { worst };
                 if worst > tolerance || !surface.normal_at(centroid).is_some_and(|n| n.dot(normal).abs() >= cos_gate) {
                     continue;
                 }
                 held.push((worst, c));
             }
+            if centroid_ranks && held.len() >= 2 {
+                for h in held.iter_mut() {
+                    h.0 = h.0.max(carriers[h.1].0.signed_distance(centroid).abs());
+                }
+            }
             held.sort_by(|a, b| a.0.total_cmp(&b.0));
+            // Beside a cone's base the distances cannot tell the base's
+            // slivers from the cone's own triangles at the noise bar, but
+            // their normals can: a holder whose normal agrees by more than
+            // `NORMAL_RANK_MARGIN` better takes the triangle from a nearest
+            // cone (census record kernel_pointed_cone_s10_d0.1_jitter-1.0:
+            // 3 base triangles of 30 on the cone).
+            if centroid_ranks && held.len() >= 2 && matches!(carriers[held[0].1].0, crate::AnalyticSurface::Cone(_)) {
+                let agree = |c: usize| carriers[c].0.normal_at(centroid).map_or(0.0, |n| n.dot(normal).abs());
+                if let Some(best) = (1..held.len()).find(|&i| agree(held[i].1) > agree(held[0].1) + NORMAL_RANK_MARGIN) {
+                    held.swap(0, best);
+                }
+            }
             if let [(_, a), (_, b), ..] = held[..] {
                 if let Some((center, a1, a2)) = crossing(a, b) {
                     let d = centroid - center;
@@ -1422,7 +2043,72 @@ pub(super) fn split(
         if debug && !strip_triangles.is_empty() {
             eprintln!("[split] region {} absorbs strips {:?}", region.id, strip_triangles.iter().map(|(r, tris)| (*r, tris.len())).collect::<Vec<_>>());
         }
-        let ids: Vec<usize> = ids.iter().copied().chain(strip_triangles.iter().flat_map(|(_, tris)| tris.iter().copied())).collect();
+        // Under `noisy_crossing` a gathered region whose carriers are drawn
+        // takes the declined walls and the retry's pieces beside it that
+        // they hold, 19 triangles in 20 within the bar: drawn apart, a
+        // crossing's wall is a second fit of the gathered region's own
+        // cylinder, and the builder demotes the edge between the two (census
+        // record kernel_crossed_cylinders_s10_d0.1_jitter-1.0: a band
+        // cylinder of radius 9.88 beside the gathered region's 10.07 on one
+        // axis). Joined before the draw (`join_walls`) the walls' strips
+        // drew false planes there.
+        let mut claimed_walls = Vec::<(u32, Vec<usize>)>::new();
+        if noisy_crossing && gathered.contains(&region.id) {
+            // A piece already written on a second fit of one of the
+            // region's cylinders (axes within [`MERGE_REFIT_TILT_DEG`], the
+            // piece's axis within the bar of the carrier's, radii within
+            // the bar) is claimed too, held within the assignment slack as
+            // strips are: on census record
+            // kernel_crossed_cylinders_s1_d0.1_jitter-1.0 a 142-triangle
+            // wall, split before the gathered region was drawn, cut one arm
+            // of the crossing into pieces of 212 and 123.
+            let twin = |r: u32| {
+                let Some(crate::AnalyticSurface::Cylinder(piece)) = written.get(&r) else { return false };
+                carriers.iter().any(|(c, _)| {
+                    let crate::AnalyticSurface::Cylinder(k) = c else { return false };
+                    let d = piece.axis_origin - k.axis_origin;
+                    k.axis.dot(piece.axis).abs() >= MERGE_REFIT_TILT_DEG.to_radians().cos()
+                        && (d - k.axis * d.dot(k.axis)).length() <= tolerance
+                        && (k.radius - piece.radius).abs() <= tolerance
+                })
+            };
+            let mut beside = std::collections::BTreeSet::<u32>::new();
+            for &t in &ids {
+                for c in 0..3 {
+                    let (a, b) = (indices[3 * t + c], indices[3 * t + (c + 1) % 3]);
+                    for &n in &edges[&(a.min(b), a.max(b))] {
+                        let r = segmentation.triangle_region_ids[n];
+                        if r != region.id
+                            && !strips.contains(&r)
+                            && ((jittered_walls.contains(&r) && !split_done.contains(&r)) || retry_pieces.iter().any(|(piece, ..)| *piece == r) || twin(r))
+                        {
+                            beside.insert(r);
+                        }
+                    }
+                }
+            }
+            for r in beside {
+                let tris: Vec<usize> = segmentation.triangle_region_ids.iter().enumerate().filter_map(|(t, &s)| (s == r).then_some(t)).collect();
+                let within = if twin(r) { strip_bar } else { tolerance };
+                let held = tris.iter().filter(|&&t| carriers.iter().any(|(s, _)| points(t).iter().all(|&q| s.signed_distance(q).abs() <= within))).count();
+                if debug && twin(r) {
+                    eprintln!("[split] region {} carriers hold {held} of {} of the piece {r} on its own cylinder", region.id, tris.len());
+                }
+                if held * 20 >= tris.len() * 19 {
+                    strips.insert(r);
+                    claimed_walls.push((r, tris));
+                }
+            }
+            if debug && !claimed_walls.is_empty() {
+                eprintln!("[split] region {} claims the walls beside it {:?}", region.id, claimed_walls.iter().map(|(r, tris)| (*r, tris.len())).collect::<Vec<_>>());
+            }
+        }
+        let ids: Vec<usize> = ids
+            .iter()
+            .copied()
+            .chain(strip_triangles.iter().flat_map(|(_, tris)| tris.iter().copied()))
+            .chain(claimed_walls.iter().flat_map(|(_, tris)| tris.iter().copied()))
+            .collect();
         let on_strips: std::collections::HashSet<usize> = strip_triangles.iter().flat_map(|(_, tris)| tris.iter().copied()).collect();
         let mut owner: Vec<(usize, usize)> = ids
             .iter()
@@ -1468,6 +2154,52 @@ pub(super) fn split(
                     }
                     owner.push((t, c));
                 }
+            }
+        }
+        // Under `noisy_crossing`
+        // ([`crate::hybrid_region_brep::HybridSwitches::noisy_crossing`]): on a
+        // gathered region a triangle no carrier holds within the normal gate
+        // but one holds within the bar goes to it when two of its three
+        // edges border triangles that carrier was given (repeated while any
+        // moves; each round reads the last one's assignment). A jittered
+        // wall triangle tilted past the gate sits among its wall's; a cap
+        // triangle fanned from its rim borders the wall on one edge at most.
+        if noisy_crossing && gathered.contains(&region.id) {
+            let mut given: std::collections::HashMap<usize, usize> = owner.iter().copied().collect();
+            let mut voted = 0usize;
+            loop {
+                let mut moved = Vec::new();
+                for &t in &ids {
+                    if given.contains_key(&t) {
+                        continue;
+                    }
+                    let mut votes = vec![0usize; carriers.len()];
+                    for c in 0..3 {
+                        let (a, b) = (indices[3 * t + c], indices[3 * t + (c + 1) % 3]);
+                        for &n in &edges[&(a.min(b), a.max(b))] {
+                            if n != t {
+                                if let Some(&k) = given.get(&n) {
+                                    votes[k] += 1;
+                                }
+                            }
+                        }
+                    }
+                    let p = points(t);
+                    if let Some(k) = (0..carriers.len()).find(|&k| votes[k] >= 2 && p.iter().all(|&q| carriers[k].0.signed_distance(q).abs() <= tolerance)) {
+                        moved.push((t, k));
+                    }
+                }
+                if moved.is_empty() {
+                    break;
+                }
+                voted += moved.len();
+                for (t, k) in moved {
+                    given.insert(t, k);
+                    owner.push((t, k));
+                }
+            }
+            if debug && voted > 0 {
+                eprintln!("[split] region {} voted {voted} gate-tilted triangles onto the carriers beside them", region.id);
             }
         }
         let assigned = owner.len();
@@ -1638,6 +2370,9 @@ pub(super) fn split(
         // inside the other's wall. An island under the sliver size goes to
         // the carrier its neighbours hold when that carrier holds it too.
         let mut carrier_of: std::collections::HashMap<usize, usize> = owner.iter().copied().collect();
+        // Under `noisy_crossing` a gathered region's island goes within two
+        // bars: its triangles lean as far as the jitter tilts them.
+        let island_bar = if noisy_crossing && gathered.contains(&region.id) { 2.0 * tolerance } else { tolerance };
         for _ in 0..8 {
             let mut moved = false;
             let mut seen = std::collections::HashSet::<usize>::new();
@@ -1672,7 +2407,7 @@ pub(super) fn split(
                 }
                 let (&other, _) = around.iter().next().unwrap();
                 let surface = carriers[other].0;
-                if island.iter().all(|&t| points(t).iter().all(|&q| surface.signed_distance(q).abs() <= tolerance)) {
+                if island.iter().all(|&t| points(t).iter().all(|&q| surface.signed_distance(q).abs() <= island_bar)) {
                     for &t in &island {
                         carrier_of.insert(t, other);
                     }
@@ -1710,6 +2445,21 @@ pub(super) fn split(
             // At the assignment slack: the strips and slivers the carrier
             // holds lie up to that far off it.
             wide.distance_tolerance = strip_bar;
+            // Under `noisy_crossing` a gathered region's carrier is refitted
+            // on its vertices alone: the jitter turns a coarse body's facet
+            // normals up to 170 degrees off (census record
+            // kernel_crossed_cylinders_s10_d0.1_jitter-1.0), and the refit
+            // read that as a misfit and kept the draw's axis.
+            // It is taken within two bars: the least-squares cylinder of
+            // triangles held within the slack of the draw sits past the
+            // slack of a few of them (census record
+            // kernel_crossed_cylinders_s1_d0.1_jitter-1.0: 0.157 against
+            // 0.150 over 948 triangles), and the draw's axis, kept, lay
+            // 0.035 off and let the section cut below leak.
+            if noisy_crossing && gathered.contains(&region.id) {
+                wide.normal_tolerance = std::f64::consts::PI;
+                wide.distance_tolerance = 2.0 * tolerance;
+            }
             let refits: Vec<Option<crate::AnalyticSurface>> = (0..carriers.len())
                 .map(|c| {
                     let members: Vec<usize> = owner.iter().filter(|o| o.1 == c).map(|o| o.0).collect();
@@ -1840,11 +2590,416 @@ pub(super) fn split(
                 }
             }
         }
+        // Under `noisy_crossing` a gathered region's end cap is snapped
+        // square to its wall: a plane whose normal is within
+        // GATHERED_CONE_SNAP_DEG of a cylinder's axis, centred within the
+        // cylinder's radius of that axis, takes the axis as its normal
+        // through its own origin. The wall's axis is fitted over the whole
+        // wall, the cap's normal over a disc of a few dozen jittered
+        // triangles (census record occt_crossed_cylinders_s10_d0.1_jitter-1.0:
+        // the cap at x = -30 refitted 2.8 degrees off its wall's axis, and
+        // the builder refused the rim as not square to the axis and demoted
+        // the wall). Only on a region whose walls were read off its caps.
+        if rim_drawn {
+            let walls: Vec<crate::CylinderSurface> =
+                carriers.iter().filter_map(|(s, _)| if let crate::AnalyticSurface::Cylinder(c) = s { Some(*c) } else { None }).collect();
+            for (surface, _) in carriers.iter_mut() {
+                let crate::AnalyticSurface::Plane(plane) = surface else { continue };
+                let Some(normal) = plane.normal.normalized() else { continue };
+                let square = walls
+                    .iter()
+                    .filter(|wall| normal.dot(wall.axis).abs() >= GATHERED_CONE_SNAP_DEG.to_radians().cos())
+                    .filter(|wall| {
+                        let d = plane.origin - wall.axis_origin;
+                        (d - wall.axis * d.dot(wall.axis)).length() <= wall.radius
+                    })
+                    .max_by(|a, b| normal.dot(a.axis).abs().total_cmp(&normal.dot(b.axis).abs()));
+                if let Some(wall) = square {
+                    let axis = if normal.dot(wall.axis) >= 0.0 { wall.axis } else { wall.axis * -1.0 };
+                    if debug {
+                        eprintln!("[split]   cap snapped square to its wall: normal {:?} -> {:?}", normal, axis);
+                    }
+                    plane.normal = axis;
+                }
+            }
+        }
         // One region per edge-connected piece of each carrier, as the
         // segmenter itself leaves them: the walls of crossing cylinders are
         // cut into pieces that touch only at the tangent points, and one
         // region spanning two pieces makes their seam one closed loop that
         // the builder cannot split at those points.
+        // Under `noisy_crossing` a gathered region's crossing cylinders (one
+        // radius within the bar, axes meeting within it) are cut at the
+        // crossing as well: each wall of the union runs along its own axis
+        // away from the crossing point, one face on either side, and the
+        // two touch only at the tangent points. On a coarse jittered body
+        // the triangles there share edges across, and the one piece of
+        // each cylinder made one closed chain with the other that the
+        // builder refused as no revolve ring (census record
+        // kernel_crossed_cylinders_s10_d0.1_jitter-1.0). `side` is each
+        // cut triangle's side of the crossing along its own carrier's axis.
+        let mut side = std::collections::HashMap::<usize, bool>::new();
+        let mut cross_of = std::collections::HashMap::<usize, (usize, crate::Vec3)>::new();
+        if noisy_crossing && gathered.contains(&region.id) {
+            for c in 0..carriers.len() {
+                let crate::AnalyticSurface::Cylinder(own) = carriers[c].0 else { continue };
+                let across = carriers.iter().enumerate().find_map(|(k, (s, _))| {
+                    let crate::AnalyticSurface::Cylinder(other) = *s else { return None };
+                    if k == c || (own.radius - other.radius).abs() > tolerance || own.axis.cross(other.axis).length() <= 0.1 {
+                        return None;
+                    }
+                    let (a1, a2) = (own.axis, other.axis);
+                    let w0 = own.axis_origin - other.axis_origin;
+                    let (bb, d, e) = (a1.dot(a2), a1.dot(w0), a2.dot(w0));
+                    let denominator = 1.0 - bb * bb;
+                    let p1 = own.axis_origin + a1 * ((bb * e - d) / denominator);
+                    let p2 = other.axis_origin + a2 * ((e - bb * d) / denominator);
+                    ((p1 - p2).length() <= tolerance).then_some((k, (p1 + p2) * 0.5))
+                });
+                let Some((k, center)) = across else { continue };
+                cross_of.insert(c, (k, center));
+            }
+        }
+        // The faces of two crossing cylinders meet along the section
+        // ellipses, and near the tangent points they are long slivers whose
+        // centroids say nothing about their face. The faces are cut at the
+        // mesh edges lying on a section plane (both ends within four noise
+        // bars of one, and within eight of both walls) and flood-filled; the
+        // few triangles the cut leaves alone at the tangent points take the
+        // faces, jointly, that leave no edge between one cylinder's two
+        // faces and none of them cut off from its face (census record
+        // kernel_crossed_cylinders_s10_d0.1_jitter-1.0: the true faces' fan
+        // at a tangent vertex spans 44 along the axis).
+        if noisy_crossing {
+            let mut pairs: Vec<(usize, usize, crate::Vec3)> =
+                cross_of.iter().filter(|(&c, &(k, _))| c < k).map(|(&c, &(k, center))| (c, k, center)).collect();
+            pairs.sort_by_key(|p| (p.0, p.1));
+            let vertex = |v: u32| {
+                let at = v as usize * 3;
+                crate::Vec3::new(positions[at], positions[at + 1], positions[at + 2])
+            };
+            let tri_edges = |t: usize| -> [(u32, u32); 3] {
+                let e = |k: usize| {
+                    let (a, b) = (indices[3 * t + k], indices[3 * t + (k + 1) % 3]);
+                    (a.min(b), a.max(b))
+                };
+                [e(0), e(1), e(2)]
+            };
+            for (c, k, center) in pairs {
+                let (crate::AnalyticSurface::Cylinder(first), crate::AnalyticSurface::Cylinder(second)) = (carriers[c].0, carriers[k].0) else { continue };
+                let (Some(n1), Some(n2)) = ((first.axis + second.axis).normalized(), (first.axis - second.axis).normalized()) else { continue };
+                let bar = 4.0 * NOISE_BAR_FIT_BARS * one_bar;
+                let on_cut = |v: u32| {
+                    let q = vertex(v);
+                    (q - center).dot(n1).abs().min((q - center).dot(n2).abs()) <= bar
+                        && carriers[c].0.signed_distance(q).abs() <= 2.0 * bar
+                        && carriers[k].0.signed_distance(q).abs() <= 2.0 * bar
+                };
+                let mut members: Vec<usize> = carrier_of.iter().filter(|(_, &o)| o == c || o == k).map(|(&t, _)| t).collect();
+                members.sort_unstable();
+                let member_set: std::collections::HashSet<usize> = members.iter().copied().collect();
+                let mut comp_of = std::collections::HashMap::<usize, usize>::new();
+                let mut comps: Vec<Vec<usize>> = Vec::new();
+                for &start in &members {
+                    if comp_of.contains_key(&start) {
+                        continue;
+                    }
+                    let id = comps.len();
+                    comp_of.insert(start, id);
+                    let mut comp = vec![start];
+                    let mut at = 0;
+                    while at < comp.len() {
+                        let t = comp[at];
+                        at += 1;
+                        for e in tri_edges(t) {
+                            if on_cut(e.0) && on_cut(e.1) {
+                                continue;
+                            }
+                            for &n in &edges[&e] {
+                                if member_set.contains(&n) && !comp_of.contains_key(&n) {
+                                    comp_of.insert(n, id);
+                                    comp.push(n);
+                                }
+                            }
+                        }
+                    }
+                    comps.push(comp);
+                }
+                let big: Vec<usize> = (0..comps.len()).filter(|&i| comps[i].len() >= SLIVER_TRIANGLES).collect();
+                let carrier_of_comp = |i: usize| {
+                    let on_c = comps[i].iter().filter(|t| carrier_of[t] == c).count();
+                    if 2 * on_c >= comps[i].len() { c } else { k }
+                };
+                let big_carrier: std::collections::HashMap<usize, usize> = big.iter().map(|&i| (i, carrier_of_comp(i))).collect();
+                if big_carrier.values().filter(|&&o| o == c).count() != 2 || big_carrier.values().filter(|&&o| o == k).count() != 2 {
+                    if debug {
+                        let sizes: Vec<(usize, usize)> = big.iter().map(|&i| (big_carrier[&i], comps[i].len())).collect();
+                        eprintln!("[split]   crossing {c}/{k}: section cut at {bar:.3e} gives faces {sizes:?}, not two per cylinder; no cut");
+                    }
+                    continue;
+                }
+                let mut label = std::collections::HashMap::<usize, usize>::new();
+                for &i in &big {
+                    for &t in &comps[i] {
+                        label.insert(t, i);
+                    }
+                }
+                let mut fan_of = std::collections::HashMap::<u32, std::collections::BTreeSet<usize>>::new();
+                for &i in &big {
+                    for &t in &comps[i] {
+                        for j in 0..3 {
+                            fan_of.entry(indices[3 * t + j]).or_default().insert(i);
+                        }
+                    }
+                }
+                let mut strays: Vec<usize> = (0..comps.len()).filter(|&i| comps[i].len() < SLIVER_TRIANGLES).flat_map(|i| comps[i].iter().copied()).collect();
+                strays.sort_unstable();
+                // A first guess: the face sharing the most edges, else the most vertices.
+                for _ in 0..4 {
+                    for &t in &strays {
+                        let mut votes = std::collections::BTreeMap::<usize, usize>::new();
+                        for e in tri_edges(t) {
+                            for &n in &edges[&e] {
+                                if n != t {
+                                    if let Some(&i) = label.get(&n) {
+                                        *votes.entry(i).or_default() += 1;
+                                    }
+                                }
+                            }
+                        }
+                        if votes.is_empty() {
+                            for j in 0..3 {
+                                for &i in fan_of.get(&indices[3 * t + j]).into_iter().flatten() {
+                                    *votes.entry(i).or_default() += 1;
+                                }
+                            }
+                        }
+                        if let Some((&i, _)) = votes.iter().max_by(|a, b| a.1.cmp(b.1).then(b.0.cmp(a.0))) {
+                            label.insert(t, i);
+                        }
+                    }
+                }
+                let stray_set: std::collections::HashSet<usize> = strays.iter().copied().collect();
+                if debug {
+                    let sizes: Vec<usize> = big.iter().map(|&i| comps[i].len()).collect();
+                    eprintln!("[split]   crossing {c}/{k}: section cut bar {bar:.3e}, {} members, faces {sizes:?}, {} strays in {} components", members.len(), strays.len(), comps.len() - big.len());
+                }
+                if strays.iter().any(|t| !label.contains_key(t)) {
+                    continue;
+                }
+                // Clusters of strays sharing a vertex.
+                let mut by_vertex = std::collections::HashMap::<u32, Vec<usize>>::new();
+                for &t in &strays {
+                    for j in 0..3 {
+                        by_vertex.entry(indices[3 * t + j]).or_default().push(t);
+                    }
+                }
+                let mut clustered = std::collections::HashSet::<usize>::new();
+                let mut clusters: Vec<Vec<usize>> = Vec::new();
+                for &start in &strays {
+                    if !clustered.insert(start) {
+                        continue;
+                    }
+                    let mut cluster = vec![start];
+                    let mut at = 0;
+                    while at < cluster.len() {
+                        let t = cluster[at];
+                        at += 1;
+                        for j in 0..3 {
+                            for &n in &by_vertex[&indices[3 * t + j]] {
+                                if clustered.insert(n) {
+                                    cluster.push(n);
+                                }
+                            }
+                        }
+                    }
+                    cluster.sort_unstable();
+                    clusters.push(cluster);
+                }
+                let score = |cluster: &[usize], label: &std::collections::HashMap<usize, usize>| -> (usize, usize, i64) {
+                    let mut crossing = 0;
+                    let mut sharing = 0i64;
+                    for &t in cluster {
+                        let own = label[&t];
+                        for e in tri_edges(t) {
+                            for &n in &edges[&e] {
+                                if let Some(&o) = label.get(&n) {
+                                    if n != t && o != own && big_carrier[&o] == big_carrier[&own] {
+                                        crossing += 1;
+                                    }
+                                }
+                            }
+                        }
+                        for j in 0..3 {
+                            if fan_of.get(&indices[3 * t + j]).is_some_and(|s| s.contains(&own)) {
+                                sharing += 1;
+                            }
+                        }
+                    }
+                    let mut cut_off = 0;
+                    for &t in cluster {
+                        let own = label[&t];
+                        let mut stack = vec![t];
+                        let mut seen = std::collections::HashSet::from([t]);
+                        let mut reached = false;
+                        'walk: while let Some(u) = stack.pop() {
+                            for e in tri_edges(u) {
+                                for &n in &edges[&e] {
+                                    if seen.contains(&n) || label.get(&n) != Some(&own) {
+                                        continue;
+                                    }
+                                    if !stray_set.contains(&n) {
+                                        reached = true;
+                                        break 'walk;
+                                    }
+                                    seen.insert(n);
+                                    stack.push(n);
+                                }
+                            }
+                        }
+                        if !reached {
+                            cut_off += 1;
+                        }
+                    }
+                    (crossing, cut_off, -sharing)
+                };
+                for cluster in &clusters {
+                    let before = score(cluster, &label);
+                    if cluster.len() <= 10 {
+                        let mut best: Option<((usize, usize, i64), Vec<usize>)> = None;
+                        let mut choice = vec![0usize; cluster.len()];
+                        loop {
+                            for (j, &t) in cluster.iter().enumerate() {
+                                label.insert(t, big[choice[j]]);
+                            }
+                            let s = score(cluster, &label);
+                            if best.as_ref().map_or(true, |(b, _)| s < *b) {
+                                best = Some((s, choice.clone()));
+                            }
+                            let mut j = 0;
+                            while j < choice.len() {
+                                choice[j] += 1;
+                                if choice[j] < big.len() {
+                                    break;
+                                }
+                                choice[j] = 0;
+                                j += 1;
+                            }
+                            if j == choice.len() {
+                                break;
+                            }
+                        }
+                        let (s, choice) = best.expect("at least one labelling");
+                        for (j, &t) in cluster.iter().enumerate() {
+                            label.insert(t, big[choice[j]]);
+                        }
+                        if debug {
+                            eprintln!("[split]   crossing {c}/{k}: {} triangles at a tangent point labelled jointly, score {before:?} -> {s:?}", cluster.len());
+                        }
+                    } else {
+                        let mut current = before;
+                        let mut moves: Vec<Vec<usize>> = cluster.iter().map(|&t| vec![t]).collect();
+                        for (a, &t) in cluster.iter().enumerate() {
+                            for &u in &cluster[a + 1..] {
+                                if (0..3).any(|x| (0..3).any(|y| indices[3 * t + x] == indices[3 * u + y])) {
+                                    moves.push(vec![t, u]);
+                                }
+                            }
+                        }
+                        // Each move takes the first labelling of its triangles
+                        // that lowers the score, over and over while any does.
+                        let search = |moves: &[Vec<usize>], label: &mut std::collections::HashMap<usize, usize>, current: &mut (usize, usize, i64)| {
+                            for _ in 0..64 {
+                                let mut improved = false;
+                                for m in moves {
+                                    let saved: Vec<usize> = m.iter().map(|t| label[t]).collect();
+                                    let combos = big.len().pow(m.len() as u32);
+                                    for code in 0..combos {
+                                        let mut x = code;
+                                        for &t in m {
+                                            label.insert(t, big[x % big.len()]);
+                                            x /= big.len();
+                                        }
+                                        let s = score(cluster, label);
+                                        if s < *current {
+                                            *current = s;
+                                            improved = true;
+                                            break;
+                                        }
+                                        if code + 1 == combos {
+                                            for (&t, &o) in m.iter().zip(&saved) {
+                                                label.insert(t, o);
+                                            }
+                                        }
+                                    }
+                                }
+                                if !improved {
+                                    break;
+                                }
+                            }
+                        };
+                        search(&moves, &mut label, &mut current);
+                        // A search that ends with a same-carrier cross-face
+                        // edge or a stray cut off goes on with triples of
+                        // strays chained by shared vertices as well: on census
+                        // record kernel_crossed_cylinders_s1_d0.05_jitter-1.0
+                        // the singles and pairs left one triangle of a
+                        // 12-triangle cluster cut off, score (0, 1, -16),
+                        // where a triple reaches (0, 0, -14), and that piece
+                        // of one declined the whole region.
+                        if current.0 > 0 || current.1 > 0 {
+                            let touch = |t: usize, u: usize| (0..3).any(|x| (0..3).any(|y| indices[3 * t + x] == indices[3 * u + y]));
+                            for (a, &t) in cluster.iter().enumerate() {
+                                for (b, &u) in cluster.iter().enumerate().skip(a + 1) {
+                                    for &v in &cluster[b + 1..] {
+                                        if touch(t, u) as u8 + touch(u, v) as u8 + touch(t, v) as u8 >= 2 {
+                                            moves.push(vec![t, u, v]);
+                                        }
+                                    }
+                                }
+                            }
+                            let stalled = current;
+                            search(&moves, &mut label, &mut current);
+                            if debug {
+                                eprintln!("[split]   crossing {c}/{k}: the search goes on with triples, score {stalled:?} -> {current:?}");
+                            }
+                        }
+                        if debug {
+                            eprintln!("[split]   crossing {c}/{k}: {} triangles at a tangent point labelled by local search, score {before:?} -> {current:?}", cluster.len());
+                        }
+                    }
+                }
+                // Each face takes its carrier, and its side of the crossing along that carrier's axis.
+                let mut face_side = std::collections::HashMap::<usize, bool>::new();
+                for &i in &big {
+                    let o = big_carrier[&i];
+                    let crate::AnalyticSurface::Cylinder(cyl) = carriers[o].0 else { continue };
+                    let mut sum = 0.0;
+                    for &t in &comps[i] {
+                        let p = points(t);
+                        sum += ((p[0] + p[1] + p[2]) * (1.0 / 3.0) - center).dot(cyl.axis);
+                    }
+                    face_side.insert(i, sum >= 0.0);
+                }
+                if [c, k].iter().any(|&o| big.iter().filter(|i| big_carrier[i] == o).map(|i| face_side[i]).collect::<std::collections::BTreeSet<bool>>().len() != 2) {
+                    if debug {
+                        eprintln!("[split]   crossing {c}/{k}: a cylinder's two faces lie on one side; no cut");
+                    }
+                    continue;
+                }
+                for (&t, &i) in &label {
+                    carrier_of.insert(t, big_carrier[&i]);
+                    side.insert(t, face_side[&i]);
+                }
+                if debug {
+                    let sizes: Vec<(usize, usize)> = big.iter().map(|&i| (big_carrier[&i], label.values().filter(|&&j| j == i).count())).collect();
+                    eprintln!("[split]   crossing {c}/{k}: section cut faces {sizes:?}, {} strays", strays.len());
+                }
+            }
+        }
+        for entry in &mut owner {
+            entry.1 = carrier_of[&entry.0];
+        }
         let mut pieces: Vec<(usize, Vec<usize>)> = Vec::new();
         let mut placed = std::collections::HashSet::<usize>::new();
         for &(start, c) in &owner {
@@ -1859,7 +3014,7 @@ pub(super) fn split(
                 for k in 0..3 {
                     let (a, b) = (indices[3 * t + k], indices[3 * t + (k + 1) % 3]);
                     for &n in &edges[&(a.min(b), a.max(b))] {
-                        if carrier_of.get(&n) == Some(&c) && placed.insert(n) {
+                        if carrier_of.get(&n) == Some(&c) && side.get(&n) == side.get(&t) && placed.insert(n) {
                             piece.push(n);
                         }
                     }
@@ -1994,6 +3149,16 @@ pub(super) fn split(
             for &t in &members {
                 segmentation.triangle_region_ids[t] = id;
             }
+            if members.first().is_some_and(|t| side.contains_key(t)) {
+                report.crossing_faces.insert(id);
+            }
+            if retry_walls && wall_chips && jittered_walls.contains(&region.id) {
+                wall_pieces.push((id, *surface, tolerance));
+            }
+            if retry_walls && wall_chips {
+                retry_pieces.push((id, *surface, tolerance));
+            }
+            written.insert(id, *surface);
             report.noise = report.noise.max(max_deviation);
         }
         report.split_regions += 1;
@@ -2009,6 +3174,54 @@ pub(super) fn split(
         // carrier of the countersink held them, and left in the gathered
         // region they were built as eight facets.
         if split_done.contains(&host_id) {
+            // Under `noisy_crossing` a triangle the section cut left in the
+            // gathered region joins the cut face it shares the most edges
+            // with, over and over while any does, rather than going back:
+            // on census record kernel_crossed_cylinders_s10_d0.05_jitter-1.0
+            // four went back as a plane at a tangent point and demoted the
+            // cylinder beside them.
+            if noisy_crossing && !report.crossing_faces.is_empty() {
+                let mut left: Vec<usize> = undo_ids
+                    .iter()
+                    .map(|&(t, _)| t)
+                    .filter(|&t| segmentation.triangle_region_ids[t] == host_id)
+                    .collect();
+                if !left.is_empty() && left.len() <= 64 {
+                    let corners = |t: usize| [indices[3 * t], indices[3 * t + 1], indices[3 * t + 2]];
+                    let triangle_count = segmentation.triangle_region_ids.len();
+                    loop {
+                        let mut moved = false;
+                        for &t in &left {
+                            if segmentation.triangle_region_ids[t] != host_id {
+                                continue;
+                            }
+                            let own = corners(t);
+                            let mut votes = std::collections::BTreeMap::<u32, usize>::new();
+                            for u in 0..triangle_count {
+                                let face = segmentation.triangle_region_ids[u];
+                                if u == t || !report.crossing_faces.contains(&face) {
+                                    continue;
+                                }
+                                let shared = corners(u).iter().filter(|v| own.contains(v)).count();
+                                if shared == 2 {
+                                    *votes.entry(face).or_default() += 1;
+                                }
+                            }
+                            if let Some((&face, _)) = votes.iter().max_by_key(|(&face, &n)| (n, std::cmp::Reverse(face))) {
+                                segmentation.triangle_region_ids[t] = face;
+                                moved = true;
+                            }
+                        }
+                        if !moved {
+                            break;
+                        }
+                    }
+                    left.retain(|&t| segmentation.triangle_region_ids[t] == host_id);
+                    if debug {
+                        eprintln!("[split] gathered region {host_id}: the cut faces take back what the section cut left, {} left", left.len());
+                    }
+                }
+            }
             let mut returned = 0;
             for (t, r) in undo_ids {
                 if r != host_id && segmentation.triangle_region_ids[t] == host_id {
@@ -2023,6 +3236,13 @@ pub(super) fn split(
         }
         segmentation.regions[host].carrier = carrier;
         for (t, r) in undo_ids {
+            // What a redrawn gathered region gave a wall's piece stays
+            // there: its wall chips (census record
+            // occt_frustum_s10_d0.1_jitter-1.0 gave 42 and was declined
+            // again; the wall rebuilt without them beside it).
+            if retry_walls && wall_chips && segmentation.triangle_region_ids[t] != host_id {
+                continue;
+            }
             segmentation.triangle_region_ids[t] = r;
         }
         for (i, count) in undo_counts {
@@ -2030,6 +3250,92 @@ pub(super) fn split(
         }
         if debug {
             eprintln!("[split] gather into region {host_id} declined, undone");
+        }
+    }
+    // Under `chip_join` ([`crate::hybrid_region_brep::HybridSwitches::retry_chip_join`],
+    // with `wall_chips`), after the retry a chip (a region of any carrier
+    // under SLIVER_TRIANGLES the retry did not write) beside a piece the
+    // retry wrote joins it when the
+    // piece's carrier holds every vertex and centroid of the chip at the
+    // piece's bar (repeated while any joins): on census record
+    // kernel_frustum_s10_d0.1_jitter-1.0 two 2-triangle freeform chips and a
+    // 1-triangle plane chip of the top cap, bordering the cone too, were
+    // enclosed by no piece and left as facets, and the builder failed a
+    // cone/plane chain on them (the plane chip's plane passes through the
+    // cone's apex).
+    if retry_walls && wall_chips && chip_join && !retry_pieces.is_empty() {
+        let point = |v: u32| {
+            let at = v as usize * 3;
+            crate::Vec3::new(positions[at], positions[at + 1], positions[at + 2])
+        };
+        let mut joined = 0usize;
+        loop {
+            let mut counts = vec![0usize; segmentation.regions.len()];
+            for &r in &segmentation.triangle_region_ids {
+                if let Some(count) = counts.get_mut(r as usize) {
+                    *count += 1;
+                }
+            }
+            let mut moved = false;
+            for chip in segmentation.regions.iter().filter(|r| !retry_pieces.iter().any(|(piece, _, _)| *piece == r.id)) {
+                let count = counts.get(chip.id as usize).copied().unwrap_or(0);
+                if count == 0 || count >= SLIVER_TRIANGLES {
+                    continue;
+                }
+                let tris: Vec<usize> = (0..segmentation.triangle_region_ids.len()).filter(|&t| segmentation.triangle_region_ids[t] == chip.id).collect();
+                let mut neighbours = std::collections::BTreeSet::<u32>::new();
+                for &t in &tris {
+                    for c in 0..3 {
+                        let (a, b) = (indices[3 * t + c], indices[3 * t + (c + 1) % 3]);
+                        for &n in &edges[&(a.min(b), a.max(b))] {
+                            neighbours.insert(segmentation.triangle_region_ids[n]);
+                        }
+                    }
+                }
+                let holds_chip = |surface: &crate::AnalyticSurface, bar: f64| {
+                    tris.iter().all(|&t| {
+                        let p = [0, 1, 2].map(|c| point(indices[3 * t + c]));
+                        let centroid = (p[0] + p[1] + p[2]) * (1.0 / 3.0);
+                        p.iter().all(|&q| surface.signed_distance(q).abs() <= bar) && surface.signed_distance(centroid).abs() <= bar
+                    })
+                };
+                // A chip one piece encloses can be no face of its own: it
+                // joins within twice the piece's bar, the builder's own bar
+                // (twice the split's noise; chip 28 of the record above, 1.8
+                // off the cone at a bar of 0.92).
+                let others: Vec<u32> = neighbours.iter().copied().filter(|&n| n != chip.id).collect();
+                let enclosed = |piece: u32| others == [piece];
+                if let Some((piece, _, _)) = retry_pieces.iter().find(|(piece, surface, bar)| {
+                    neighbours.contains(piece) && (holds_chip(surface, *bar) || (enclosed(*piece) && holds_chip(surface, 2.0 * *bar)))
+                }) {
+                    for &t in &tris {
+                        segmentation.triangle_region_ids[t] = *piece;
+                    }
+                    joined += tris.len();
+                    moved = true;
+                    changed = true;
+                } else if debug {
+                    let worst: Vec<String> = retry_pieces
+                        .iter()
+                        .filter(|(piece, _, _)| neighbours.contains(piece))
+                        .map(|(piece, surface, bar)| {
+                            let d = tris.iter().flat_map(|&t| {
+                                let p = [0, 1, 2].map(|c| point(indices[3 * t + c]));
+                                let centroid = (p[0] + p[1] + p[2]) * (1.0 / 3.0);
+                                [p[0], p[1], p[2], centroid]
+                            }).map(|q| surface.signed_distance(q).abs()).fold(0.0_f64, f64::max);
+                            format!("piece {piece} worst {d:.3e} bar {bar:.3e}")
+                        })
+                        .collect();
+                    eprintln!("[split] retry chip {} of {} not joined: neighbours {neighbours:?}, {worst:?}", chip.id, tris.len());
+                }
+            }
+            if !moved {
+                break;
+            }
+        }
+        if debug && joined > 0 {
+            eprintln!("[split] retry chips: {joined} triangles join the pieces beside them");
         }
     }
     if changed {
@@ -2301,6 +3607,13 @@ const NOISE_BAR_FIT_BARS: f64 = 3.0;
 /// kernel_crossed_cylinders_s1_d0.1_jitter-0.3, 1 833 faceted, whose 3-bar
 /// proposal held 1 268 of 1 433 and was declined).
 const NOISE_BAR_LADDER: [f64; 2] = [NOISE_BAR_FIT_BARS, 2.0 * NOISE_BAR_FIT_BARS];
+/// [`crate::hybrid_region_brep::HybridSwitches::gather_wide_ladder`]: the
+/// noise-bar ladder of a gathered dust region, past [`NOISE_BAR_LADDER`].
+const GATHERED_WIDE_LADDER: [f64; 4] = [NOISE_BAR_FIT_BARS, 2.0 * NOISE_BAR_FIT_BARS, 4.0 * NOISE_BAR_FIT_BARS, 8.0 * NOISE_BAR_FIT_BARS];
+/// [`crate::hybrid_region_brep::HybridSwitches::gather_wide_ladder`]: two
+/// cylinders of a gathered region whose axes lie within this many degrees
+/// (and whose axis lines and radii lie within two bars) are one wall.
+const GATHERED_TWIN_TILT_DEG: f64 = 2.0;
 /// [`HybridSwitches::split_noise_bar`]: in a region the noise-bar pass
 /// proposes, a neighbouring region under this many triangles is a sliver
 /// (the grower walls off runs of up to 25 jittered triangles on the record
@@ -2667,6 +3980,67 @@ fn same_cone(a: &crate::AnalyticSurface, b: &crate::AnalyticSurface, tolerance: 
         && (a.apex - b.apex).length() <= tolerance
 }
 
+/// The fewest vertices [`rim_cylinder`] fits a cap's circle to.
+const RIM_MIN_VERTICES: usize = 8;
+/// Under `noisy_crossing`, how much better (in |cos|) another vertex holder's
+/// normal must agree with a triangle's than the nearest holder's to take it.
+const NORMAL_RANK_MARGIN: f64 = 0.2;
+
+/// Under `noisy_crossing`, the wall of an end cap: the least-squares circle
+/// (in the plane) through `rim`, the vertices of the triangles the cap
+/// holds, and the cylinder on it along the plane's normal. None unless
+/// every vertex lies within `bar` of the circle (a cap whose triangles all
+/// fan from its rim, as an OpenCASCADE or kernel disc does), so a plane
+/// with vertices inside its outline gives no wall.
+fn rim_cylinder(plane: &crate::PlaneSurface, rim: &[crate::Vec3], bar: f64) -> Option<crate::CylinderSurface> {
+    if rim.len() < RIM_MIN_VERTICES {
+        return None;
+    }
+    let normal = plane.normal.normalized()?;
+    let helper = if normal.x.abs() < 0.9 { crate::Vec3::new(1.0, 0.0, 0.0) } else { crate::Vec3::new(0.0, 1.0, 0.0) };
+    let e1 = normal.cross(helper).normalized()?;
+    let e2 = normal.cross(e1);
+    // Kasa fit: 2 u cu + 2 v cv + k = u^2 + v^2, by the normal equations.
+    let (mut m, mut rhs) = ([[0.0_f64; 3]; 3], [0.0_f64; 3]);
+    for &q in rim {
+        let d = q - plane.origin;
+        let row = [2.0 * d.dot(e1), 2.0 * d.dot(e2), 1.0];
+        let b = d.dot(e1).powi(2) + d.dot(e2).powi(2);
+        for r in 0..3 {
+            for c in 0..3 {
+                m[r][c] += row[r] * row[c];
+            }
+            rhs[r] += row[r] * b;
+        }
+    }
+    let det3 = |a: [[f64; 3]; 3]| {
+        a[0][0] * (a[1][1] * a[2][2] - a[1][2] * a[2][1]) - a[0][1] * (a[1][0] * a[2][2] - a[1][2] * a[2][0]) + a[0][2] * (a[1][0] * a[2][1] - a[1][1] * a[2][0])
+    };
+    let det = det3(m);
+    if !det.is_finite() || det.abs() < 1e-300 {
+        return None;
+    }
+    let solve = |k: usize| {
+        let mut a = m;
+        for r in 0..3 {
+            a[r][k] = rhs[r];
+        }
+        det3(a) / det
+    };
+    let (cu, cv, k) = (solve(0), solve(1), solve(2));
+    let radius_squared = k + cu * cu + cv * cv;
+    if !(radius_squared.is_finite() && radius_squared > 0.0) {
+        return None;
+    }
+    let radius = radius_squared.sqrt();
+    let centre = plane.origin + e1 * cu + e2 * cv;
+    let on_rim = rim.iter().all(|&q| {
+        let d = q - centre;
+        ((d - normal * d.dot(normal)).length() - radius).abs() <= bar
+    });
+    (on_rim && radius > bar).then_some(crate::CylinderSurface { axis_origin: centre, axis: normal, radius })
+}
+
 fn same_cylinder(a: &crate::AnalyticSurface, b: &crate::AnalyticSurface, tolerance: f64) -> bool {
     let (crate::AnalyticSurface::Cylinder(a), crate::AnalyticSurface::Cylinder(b)) = (a, b) else {
         return false;
@@ -2692,7 +4066,7 @@ fn compare_budget(
 ) {
     let kinds = if cones { &SPLIT_KINDS[..] } else { &SPLIT_KINDS[..2] };
     let triangles = ids.len();
-    let started = std::time::Instant::now();
+    let started = web_time::Instant::now();
     let unbounded = recognize_surfaces_with_attempt_budget(mesh, recognition, usize::MAX, kinds);
     let old_seconds = started.elapsed().as_secs_f64();
     for (arm, result) in [("old", &unbounded), ("new", budgeted)] {
@@ -2745,7 +4119,7 @@ fn compare_budget(
     if std::env::var("BREP_SPLIT_PHASES").is_ok() {
         let mut timed = recognition.clone();
         timed.collect_phase_timings = true;
-        let started = std::time::Instant::now();
+        let started = web_time::Instant::now();
         let cap = if cones { SPLIT_CONE_STAGE_MAX_ATTEMPTS } else { SPLIT_MAX_ATTEMPTS };
         if let Ok((result, work)) = recognize_surfaces_with_attempt_budget(mesh, &timed, cap, kinds) {
             let mut sums = [0.0_f64; 6];
@@ -2777,6 +4151,150 @@ fn compare_budget(
             );
         }
     }
+}
+
+/// [`crate::hybrid_region_brep::HybridSwitches::band_cylinders`]: a
+/// cylinder for each normal band [`normal_band_coverage`] finds holding at
+/// least [`MIN_SPLIT_TRIANGLES`] triangles not an earlier band's. A wall
+/// triangle at centroid `c` with unit normal `n` (both projected across the
+/// band's axis) puts the axis at `c - r n`; the axis point and `r` are the
+/// least-squares solution over the band, solved again three times over the
+/// triangles within `max(bar, three times the median residual)` of it (the
+/// crossing wall's triangles facing along both walls' common normal join
+/// the first band and are trimmed).
+fn normal_band_cylinders(ids: &[usize], positions: &[f64], indices: &[u32], sin_band: f64, bar: f64) -> Vec<crate::CylinderSurface> {
+    let point = |v: u32| {
+        let at = v as usize * 3;
+        crate::Vec3::new(positions[at], positions[at + 1], positions[at + 2])
+    };
+    let faces: Vec<(crate::Vec3, crate::Vec3)> = ids
+        .iter()
+        .filter_map(|&t| {
+            let [a, b, c] = [0, 1, 2].map(|k| point(indices[3 * t + k]));
+            let normal = (b - a).cross(c - a).normalized()?;
+            Some(((a + b + c) * (1.0 / 3.0), normal))
+        })
+        .collect();
+    if faces.len() < MIN_SPLIT_TRIANGLES {
+        return Vec::new();
+    }
+    let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+    let mut next = |n: usize| {
+        state = state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+        ((state >> 33) as usize) % n
+    };
+    let mut axes = Vec::new();
+    for _ in 0..256 {
+        let (a, b) = (faces[next(faces.len())].1, faces[next(faces.len())].1);
+        if a.cross(b).length() > 0.2 {
+            if let Some(axis) = a.cross(b).normalized() {
+                axes.push(axis);
+            }
+        }
+    }
+    let mut covered = vec![false; faces.len()];
+    let mut cylinders = Vec::new();
+    for _ in 0..4 {
+        let band = |axis: &crate::Vec3, covered: &[bool]| (0..faces.len()).filter(|&i| !covered[i] && faces[i].1.dot(*axis).abs() <= sin_band).collect::<Vec<_>>();
+        let Some(mut axis) = axes.iter().max_by_key(|axis| band(axis, &covered).len()).copied() else { break };
+        // The axis is refined to the direction the band's normals are most
+        // nearly square to (the least eigenvector of their scatter, by power
+        // iteration on its complement), the band taken again about it: a
+        // cross product of two jittered normals is degrees off.
+        for _ in 0..2 {
+            let members = band(&axis, &covered);
+            let mut m = [[0.0_f64; 3]; 3];
+            for &i in &members {
+                let n = faces[i].1;
+                let n = [n.x, n.y, n.z];
+                for j in 0..3 {
+                    for k in 0..3 {
+                        m[j][k] += n[j] * n[k];
+                    }
+                }
+            }
+            let trace = m[0][0] + m[1][1] + m[2][2];
+            let mut w = [axis.x, axis.y, axis.z];
+            for _ in 0..64 {
+                let next: Vec<f64> = (0..3).map(|j| trace * w[j] - (0..3).map(|k| m[j][k] * w[k]).sum::<f64>()).collect();
+                let Some(n) = crate::Vec3::new(next[0], next[1], next[2]).normalized() else { break };
+                w = [n.x, n.y, n.z];
+            }
+            axis = crate::Vec3::new(w[0], w[1], w[2]);
+        }
+        let members = band(&axis, &covered);
+        if members.len() < MIN_SPLIT_TRIANGLES {
+            break;
+        }
+        for &i in &members {
+            covered[i] = true;
+        }
+        // A basis across the axis.
+        let seed = if axis.x.abs() < 0.9 { crate::Vec3::new(1.0, 0.0, 0.0) } else { crate::Vec3::new(0.0, 1.0, 0.0) };
+        let Some(u) = axis.cross(seed).normalized() else { continue };
+        let v = axis.cross(u);
+        let across = |p: crate::Vec3| (p.dot(u), p.dot(v));
+        let mut used = members.clone();
+        let mut solution: Option<(f64, f64, f64)> = None;
+        for _ in 0..4 {
+            // Unknowns (x, y, r): x + r n_u = c_u, y + r n_v = c_v.
+            let (mut ata, mut atb) = ([[0.0_f64; 3]; 3], [0.0_f64; 3]);
+            for &i in &used {
+                let (c, n) = (across(faces[i].0), across(faces[i].1));
+                for (row, rhs) in [([1.0, 0.0, n.0], c.0), ([0.0, 1.0, n.1], c.1)] {
+                    for j in 0..3 {
+                        for k in 0..3 {
+                            ata[j][k] += row[j] * row[k];
+                        }
+                        atb[j] += row[j] * rhs;
+                    }
+                }
+            }
+            let Some(x) = solve3(ata, atb) else { break };
+            solution = Some((x[0], x[1], x[2]));
+            let residual = |i: usize| {
+                let (c, n) = (across(faces[i].0), across(faces[i].1));
+                (c.0 - x[2] * n.0 - x[0]).hypot(c.1 - x[2] * n.1 - x[1])
+            };
+            let mut residuals: Vec<f64> = members.iter().map(|&i| residual(i)).collect();
+            residuals.sort_by(f64::total_cmp);
+            let gate = bar.max(3.0 * residuals[residuals.len() / 2]);
+            let kept: Vec<usize> = members.iter().copied().filter(|&i| residual(i) <= gate).collect();
+            if kept.len() < MIN_SPLIT_TRIANGLES || kept == used {
+                break;
+            }
+            used = kept;
+        }
+        if std::env::var("BREP_DEBUG_SPLIT").is_ok() {
+            eprintln!("[split]   normal band axis {axis:?}: {} triangles, {} used, solution {solution:?}", members.len(), used.len());
+        }
+        if let Some((x, y, r)) = solution {
+            if r.abs() > bar {
+                cylinders.push(crate::CylinderSurface { axis_origin: u * x + v * y, axis, radius: r.abs() });
+            }
+        }
+    }
+    cylinders
+}
+
+/// The solution of a 3 x 3 system by Cramer's rule, `None` when singular.
+fn solve3(a: [[f64; 3]; 3], b: [f64; 3]) -> Option<[f64; 3]> {
+    let det = |m: [[f64; 3]; 3]| {
+        m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1]) - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0]) + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0])
+    };
+    let d = det(a);
+    if d.abs() < 1.0e-300 || !d.is_finite() {
+        return None;
+    }
+    let mut x = [0.0; 3];
+    for k in 0..3 {
+        let mut m = a;
+        for j in 0..3 {
+            m[j][k] = b[j];
+        }
+        x[k] = det(m) / d;
+    }
+    Some(x)
 }
 
 /// Share of the triangles whose normals lie within a band of half-width

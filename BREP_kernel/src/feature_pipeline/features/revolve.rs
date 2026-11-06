@@ -182,7 +182,7 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, FeatureRefusal> {
     }
     // A FACE profile has no sketch to consume — the source solid stays resident.
     if !from_face && consume_profile_sketch(ctx) {
-        let sketch_name = name.strip_suffix(":PROFILE").unwrap_or(&name).to_string();
+        let sketch_name = name.clone();
         if !result.removed.contains(&sketch_name) {
             result.removed.push(sketch_name);
         }

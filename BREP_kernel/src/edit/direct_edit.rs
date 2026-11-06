@@ -142,6 +142,9 @@ mod face_move_carrier;
 mod face_move_recut;
 #[path = "direct_edit/face_rotate.rs"]
 mod face_rotate;
+#[path = "direct_edit/face_draft.rs"]
+mod face_draft;
+pub use face_draft::{draft_faces, draft_faces_parted};
 #[path = "direct_edit/face_offset.rs"]
 mod face_offset;
 #[path = "direct_edit/face_offset_sphere.rs"]

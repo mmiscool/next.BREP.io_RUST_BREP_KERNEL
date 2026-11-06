@@ -744,6 +744,15 @@ impl SceneRunner {
                     component.transform = pose_params_to_transform(pose);
                 }
             }
+            // Same for a grounded flag the tail wrote (a legacy Fixed row the
+            // lifecycle migrated into the instance setting): the record was
+            // captured before it, and the projection must not show the part
+            // free until some later run.
+            for (id, fixed) in &assembly_fixed {
+                if let Some(component) = components.get_mut(id) {
+                    component.fixed = *fixed;
+                }
+            }
             let parse = |json: String| {
                 serde_json::from_str::<serde_json::Value>(&json).unwrap_or(serde_json::Value::Null)
             };

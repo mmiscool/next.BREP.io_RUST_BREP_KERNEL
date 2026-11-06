@@ -536,9 +536,21 @@ impl EngineState {
             let mut annotations: Vec<PmiAnnotation> = existing
                 .as_ref()
                 .map(|view| {
-                    view.annotations.iter().filter(|a| !(a.kind == "balloon" && a.params.get("occurrence").is_some())).cloned().collect()
+                    view.annotations
+                        .iter()
+                        .filter(|a| !(a.kind == "balloon" && a.params.get("occurrence").is_some()) && !a.is_baseline_hide())
+                        .cloned()
+                        .collect()
                 })
                 .unwrap_or_default();
+            // The parts not placed yet are the view's baseline hide step,
+            // made again from the step after its balloons (its id kept); the
+            // author's own hide steps stay.
+            let baseline_id = existing
+                .as_ref()
+                .and_then(|view| view.annotations.iter().find(|a| a.is_baseline_hide()))
+                .map(|a| a.id().to_string())
+                .filter(|id| !id.is_empty());
             let view_id = match &existing {
                 Some(view) => view.id.clone(),
                 None => state.next_id("VIEW"),
@@ -556,15 +568,11 @@ impl EngineState {
                     label_world: None,
                 });
             }
-            let display = PmiDisplay {
-                hidden: presentation.hidden,
-                ..existing.as_ref().map(|view| view.display.clone()).unwrap_or(PmiDisplay {
-                    text_size_pt: 12.0,
-                    wireframe: false,
-                    hidden: Vec::new(),
-                    section: None,
-                })
-            };
+            if !presentation.hidden.is_empty() {
+                let id = baseline_id.unwrap_or_else(|| brep_kernel::baseline_hide_id(&view_id));
+                annotations.push(PmiAnnotation::hide_step(&id, &presentation.hidden, true));
+            }
+            let display = existing.as_ref().map(|view| view.display.clone()).unwrap_or_else(|| PmiDisplay::new(12.0, false, None));
             let view = PmiView {
                 id: view_id.clone(),
                 name: format!("Step {number} · {}", step.title),

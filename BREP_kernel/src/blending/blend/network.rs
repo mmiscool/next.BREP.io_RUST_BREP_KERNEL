@@ -3046,6 +3046,10 @@ fn blend_star_network_building(
         /// and its ball centre at the stop.
         ends: Vec<(usize, EdgeRecord, u64, Vec3, Vec3)>,
         name: Option<String>,
+        /// A near-tangent crease whose stop sections are not exact meridians
+        /// (`tilted_horn_on`): closed by the ruled patch between the two
+        /// sections, not the torus.
+        tilted: bool,
     }
     let mut pending_horns: Vec<PendingHorn> = Vec::new();
     stars_miters_timing.stop();
@@ -3109,6 +3113,21 @@ fn blend_star_network_building(
             )));
         }
         let axis = tangent_away_from(sharp, *vertex_id)?;
+        // (`BREP_TILTED_HORN`, default off): the stripes' two ball centres
+        // pivot about the concave edge by the crease angle. When that angle
+        // is small (a near-tangent crease), a section a little off the
+        // meridian is admitted and the closure is the ruled patch between the
+        // two stop sections, accepted only where its every sampled point
+        // stands on the pivoting ball to the fit tolerance (below, at the
+        // sewing).
+        let pivot = {
+            let radial = |center: Vec3| center.sub(ends[0].3).normalized().ok();
+            match (radial(ends[0].5), radial(ends[1].5)) {
+                (Some(a), Some(b)) => a.dot(b).clamp(-1.0, 1.0).acos(),
+                _ => f64::INFINITY,
+            }
+        };
+        let mut tilted = false;
         for (index, u_stop, _, _, cap_point, center) in &ends {
             // The section at the stop must be a meridian of the torus about
             // the concave edge: its plane (normal = the stripe's direction
@@ -3128,10 +3147,18 @@ fn blend_star_network_building(
                 )
             }).or_refuse(KernelStage::Refine, "map_err")?;
             let radial = center.sub(pole);
+            let on_pivot = (radial.length() - radius).abs() <= 1e-6 * (1.0 + radius)
+                && radial.dot(axis).abs() <= 1e-6 * (1.0 + radius);
             if direction.dot(axis).abs() > 1e-6
-                || (radial.length() - radius).abs() > 1e-6 * (1.0 + radius)
-                || radial.dot(axis).abs() > 1e-6 * (1.0 + radius)
+                && on_pivot
+                && tilted_horn_on()
+                && pivot <= TILTED_HORN_MAX_PIVOT
+                && direction.dot(axis).abs() <= TILTED_HORN_MAX_TILT
             {
+                tilted = true;
+                continue;
+            }
+            if direction.dot(axis).abs() > 1e-6 || !on_pivot {
                 return Err(KernelRefusal::unsupported(KernelStage::Refine, "horn_torus_tilt", format!(
                     "blend network: edge {}'s section at vertex {vertex_id} is not a meridian \
                      of the horn torus about the concave edge (tilted class) — not in this lane",
@@ -3224,6 +3251,7 @@ fn blend_star_network_building(
             axis,
             ends: committed,
             name: corner_name(stripe_indices),
+            tilted,
         });
     }
 
@@ -4228,7 +4256,14 @@ fn blend_star_network_building(
             <[_; 2]>::try_from(horn.ends).map_err(|_| KernelRefusal::internal(KernelStage::Refine, "horn_ends", "blend network: a horn needs two ends"))?;
         // The cap arc: the torus's tangency with the cap, a circle of one
         // radius about the re-entrant vertex from one cap point to the other.
-        let cap_arc = corner_section_arc(corner_point, radius, cap_point_a, cap_point_b)?;
+        // Tilted: the ball's contact with the cap runs only the pivot's
+        // length (radius x crease angle); its chord stands on the cap to the
+        // cap's curvature over that length, read by the pcurve's projection.
+        let cap_arc = if horn.tilted {
+            crate::make_line(cap_point_a, cap_point_b).or_refuse(KernelStage::Refine, "make_line")?
+        } else {
+            corner_section_arc(corner_point, radius, cap_point_a, cap_point_b)?
+        };
         let cap_domain = cap_arc.domain().or_refuse(KernelStage::Refine, "domain")?;
         let cap_arc_id = take_id();
         result.edges.push(EdgeRecord {
@@ -4257,7 +4292,24 @@ fn blend_star_network_building(
                 )
             })
         };
-        let (rail_a, rail_b) = (horn_rail(index_a).or_refuse(KernelStage::Refine, "horn_rail")?, horn_rail(index_b).or_refuse(KernelStage::Refine, "horn_rail")?);
+        let (rail_a, mut rail_b) = (horn_rail(index_a).or_refuse(KernelStage::Refine, "horn_rail")?, horn_rail(index_b).or_refuse(KernelStage::Refine, "horn_rail")?);
+        // Tilted (a creased mate's seam vertex): the corner is also the
+        // cap's own periodic seam, and the ball's stop sits off that seam
+        // by the support's slope, so one cap rail runs PAST the seam before
+        // its stop. That rail is split where its pcurve crosses the seam
+        // and the seam edge is trimmed there; the piece past it is carried
+        // onto the seam's other side.
+        if horn.tilted {
+            for rail in [rail_a, rail_b] {
+                if let Some(piece) = split_rail_at_cap_seam(&mut result, horn.cap_face, rail, horn.vertex, &mut take_id)? {
+                    if rail == rail_b {
+                        rail_b = piece;
+                    } else {
+                        return Err(KernelRefusal::unsupported(KernelStage::Sew, "tilted_horn_seam", "blend network: the tilted horn's leading cap rail crosses the cap's seam; not built"));
+                    }
+                }
+            }
+        }
         {
             let cap_face = result
                 .shells
@@ -4344,7 +4396,11 @@ fn blend_star_network_building(
         } else {
             corner_section_arc(center_a, radius, horn.pole, cap_point_a)?
         };
-        let surface = crate::make_revolution(horn.pole, revolve_axis, &generatrix, sweep).or_refuse(KernelStage::Refine, "make_revolution")?;
+        let surface = if horn.tilted {
+            tilted_horn_patch(&generatrix, &corner_section_arc(center_b, radius, horn.pole, cap_point_b)?, center_a, center_b, radius, solid)?
+        } else {
+            crate::make_revolution(horn.pole, revolve_axis, &generatrix, sweep).or_refuse(KernelStage::Refine, "make_revolution")?
+        };
         // Sanity: the far meridian lands on the second stripe's cap point.
         let far = surface.evaluate(1.0, 1.0).or_refuse(KernelStage::Refine, "evaluate")?;
         if far.sub(cap_point_b).length() > 1e-6 * (1.0 + radius) {
@@ -5856,6 +5912,208 @@ pub(super) fn edge_is_convex(edge: &EdgeRecord, first: &BlendMate, second: &Blen
 /// radius-`radius` arc about `center` running the short way from `from` to
 /// `to`.  This is simultaneously the stripe's end section and one side of the
 /// spherical corner patch, which is why the two meet exactly.
+/// Whether a re-entrant corner whose stop sections sit a little off the
+/// meridians of the horn torus (a near-tangent crease) is closed by the ruled
+/// patch between them (2026-11-05): OFF unless
+/// `BREP_TILTED_HORN=1` (or `on`).
+pub(in crate::blend) fn tilted_horn_on() -> bool {
+    switch!("BREP_TILTED_HORN", false)
+}
+
+/// The largest pivot of the ball about the concave edge (the crease angle,
+/// radians) the tilted closure admits: a near-tangent crease only.
+const TILTED_HORN_MAX_PIVOT: f64 = 0.02;
+
+/// The largest |stripe direction . concave edge| the tilted closure admits.
+const TILTED_HORN_MAX_TILT: f64 = 0.02;
+
+/// The ruled patch between two stop sections of one pivoting ball: u = 0 is
+/// `a`, u = 1 is `b`, v runs pole -> cap on both. Accepted only when every
+/// sampled point stands on the ball whose centre runs from `center_a` to
+/// `center_b`, to the solid's `intersection_fit`; otherwise refused by name.
+fn tilted_horn_patch(
+    a: &NurbsCurve,
+    b: &NurbsCurve,
+    center_a: Vec3,
+    center_b: Vec3,
+    radius: f64,
+    solid: &BrepSolid,
+) -> Result<crate::NurbsSurface, KernelRefusal> {
+    if a.degree != b.degree || a.knots != b.knots || a.control_points.len() != b.control_points.len() {
+        return Err(KernelRefusal::unsupported(KernelStage::Refine, "tilted_horn_sections", "blend network: the tilted horn's two stop sections are not alike (different arc spans)"));
+    }
+    let [v0, v1] = a.domain().or_refuse(KernelStage::Refine, "domain")?;
+    let knots_v: Vec<f64> = a.knots.iter().map(|knot| (knot - v0) / (v1 - v0)).collect();
+    let surface = crate::NurbsSurface::new(1, a.degree, vec![0.0, 0.0, 1.0, 1.0], knots_v, vec![a.control_points.clone(), b.control_points.clone()])
+        .or_refuse(KernelStage::Refine, "tilted_horn_surface")?;
+    let bar = crate::KernelTolerances::for_solid(solid, 1e-7).intersection_fit;
+    let mut worst: f64 = 0.0;
+    for i in 0..=8 {
+        let u = i as f64 / 8.0;
+        let center = center_a.scale(1.0 - u).add(center_b.scale(u));
+        for j in 0..=16 {
+            let v = j as f64 / 16.0;
+            let point = surface.evaluate(u, v).or_refuse(KernelStage::Refine, "evaluate")?;
+            worst = worst.max((point.sub(center).length() - radius).abs());
+        }
+    }
+    if std::env::var("BREP_DEBUG_NETWORK").is_ok() {
+        eprintln!("tilted horn: ruled closure {worst:.3e} off the pivoting ball (bar {bar:.3e})");
+    }
+    if worst > bar {
+        return Err(KernelRefusal::unsupported(KernelStage::Refine, "tilted_horn_off_ball", format!(
+            "blend network: the tilted horn's ruled closure stands {worst:.3e} off the pivoting ball, over the fit tolerance {bar:.3e}"
+        )));
+    }
+    Ok(surface)
+}
+
+/// Split cap rail `rail` where its pcurve on the periodic cap `cap_face`
+/// leaves the cap's domain across the seam that meets `corner`, and trim that
+/// seam edge to the split point. Returns the piece past the seam (now the
+/// rail's end at the corner side), or `None` when the cap has no seam at the
+/// corner or the rail does not cross it.
+fn split_rail_at_cap_seam(
+    result: &mut BrepSolid,
+    cap_face: u64,
+    rail: u64,
+    corner: u64,
+    take_id: &mut dyn FnMut() -> u64,
+) -> Result<Option<u64>, KernelRefusal> {
+    let internal = |what: &'static str, message: &str| KernelRefusal::internal(KernelStage::Sew, what, message.to_string());
+    let face = result.shells.iter().flat_map(|shell| &shell.faces).find(|face| face.id == cap_face)
+        .ok_or_else(|| internal("tilted_cap", "blend network: the tilted horn's cap is missing"))?;
+    // The seam: an edge this face's loop uses twice, incident to the corner.
+    let Some((loop_index, seam_id)) = face.loops.iter().enumerate().find_map(|(index, loop_record)| {
+        loop_record.coedges.iter().find(|coedge| {
+            loop_record.coedges.iter().filter(|other| other.edge_id == coedge.edge_id).count() == 2
+                && result.edges.iter().find(|edge| edge.id == coedge.edge_id)
+                    .is_some_and(|edge| edge.start_vertex_id == corner || edge.end_vertex_id == corner)
+        }).map(|coedge| (index, coedge.edge_id))
+    }) else {
+        return Ok(None);
+    };
+    let [u0, u1] = face.surface.domain_u().or_refuse(KernelStage::Refine, "domain_u")?;
+    let period = u1 - u0;
+    let Some(position) = face.loops[loop_index].coedges.iter().position(|coedge| coedge.edge_id == rail) else {
+        return Ok(None);
+    };
+    let coedge = face.loops[loop_index].coedges[position].clone();
+    let [q0, q1] = coedge.pcurve.domain().or_refuse(KernelStage::Refine, "domain")?;
+    let u_at = |q: f64| coedge.pcurve.evaluate(q).map(|point| point.x);
+    let (start_u, end_u) = (u_at(q0).or_refuse(KernelStage::Refine, "evaluate")?, u_at(q1).or_refuse(KernelStage::Refine, "evaluate")?);
+    let slack = 1e-9 * period;
+    let crosses_at_end = end_u > u1 + slack || end_u < u0 - slack;
+    let bound = if end_u > u1 + slack { u1 } else if end_u < u0 - slack { u0 } else if start_u > u1 + slack { u1 } else if start_u < u0 - slack { u0 } else { return Ok(None) };
+    // Bisect the pcurve for the crossing u = bound.
+    let (mut lo, mut hi) = (q0, q1);
+    let side = |q: f64| -> Result<bool, KernelRefusal> { Ok(u_at(q).or_refuse(KernelStage::Refine, "evaluate")? <= bound) };
+    let low_side = side(lo)?;
+    if side(hi)? == low_side {
+        return Ok(None);
+    }
+    for _ in 0..200 {
+        let mid = 0.5 * (lo + hi);
+        if side(mid)? == low_side { lo = mid } else { hi = mid }
+        if hi - lo <= 1e-15 * (1.0 + (q1 - q0).abs()) { break }
+    }
+    let q_split = 0.5 * (lo + hi);
+    let fraction = (q_split - q0) / (q1 - q0);
+    let edge = result.edges.iter().find(|edge| edge.id == rail).cloned()
+        .ok_or_else(|| internal("tilted_rail", "blend network: the tilted horn's cap rail is missing"))?;
+    // The rail's coedge on the cap runs with the edge (it was sewn forward or
+    // reversed; the fraction follows the traversal).
+    let t_split = if coedge.forward { edge.t0 + (edge.t1 - edge.t0) * fraction } else { edge.t1 - (edge.t1 - edge.t0) * fraction };
+    let point = edge.curve.evaluate(t_split).or_refuse(KernelStage::Refine, "evaluate")?;
+    let seam = result.edges.iter().find(|edge| edge.id == seam_id).cloned()
+        .ok_or_else(|| internal("tilted_seam", "blend network: the cap's seam is missing"))?;
+    let on_seam = crate::project_point_to_curve(&seam.curve, point).or_refuse(KernelStage::Refine, "project_point_to_curve")?;
+    let band = crate::KernelTolerances::for_solid(result, 1e-7).pcurve_consistency;
+    if on_seam.distance > band.max(1e-9) * 10.0 {
+        return Err(KernelRefusal::unsupported(KernelStage::Sew, "tilted_horn_seam", format!(
+            "blend network: the cap rail crosses the cap's seam {:.3e} off the seam edge", on_seam.distance)));
+    }
+    let split_vertex = take_id();
+    result.vertices.push(VertexRecord { id: split_vertex, point });
+    super::edge::trim_edge_at(result, seam_id, on_seam.u, corner, split_vertex)?;
+    // The two rail pieces: `near` keeps the traversal's first part on the
+    // cap's own side, `past` is carried across the seam by one period.
+    let (curve_low, curve_high) = edge.curve.split(t_split).or_refuse(KernelStage::Refine, "split")?;
+    let (low_id, high_id) = (take_id(), take_id());
+    result.edges.retain(|record| record.id != rail);
+    result.edges.push(EdgeRecord { id: low_id, curve: curve_low, t0: edge.t0, t1: t_split, start_vertex_id: edge.start_vertex_id, end_vertex_id: split_vertex, degenerate: false, name: edge.name.clone() });
+    result.edges.push(EdgeRecord { id: high_id, curve: curve_high, t0: t_split, t1: edge.t1, start_vertex_id: split_vertex, end_vertex_id: edge.end_vertex_id, degenerate: false, name: edge.name.clone() });
+    // Every coedge of the rail becomes two, in traversal order; on the cap the
+    // part past the seam is shifted by one period.
+    for shell in &mut result.shells {
+        for face in &mut shell.faces {
+            let is_cap = face.id == cap_face;
+            for loop_record in &mut face.loops {
+                let Some(at) = loop_record.coedges.iter().position(|coedge| coedge.edge_id == rail) else { continue };
+                let old = loop_record.coedges.remove(at);
+                let [p0, p1] = old.pcurve.domain().or_refuse(KernelStage::Refine, "domain")?;
+                let p_split = p0 + (p1 - p0) * fraction_of(&edge, t_split, old.forward);
+                let (first, second) = old.pcurve.split(p_split).or_refuse(KernelStage::Refine, "split")?;
+                // Traversal order: forward walks low then high.
+                let (first_edge, second_edge) = if old.forward { (low_id, high_id) } else { (high_id, low_id) };
+                let mut pieces = [(first_edge, first, false), (second_edge, second, false)];
+                if is_cap {
+                    // The piece whose u lies outside the domain is carried
+                    // back inside by one period.
+                    for (_, pcurve, shifted) in pieces.iter_mut() {
+                        let [r0, r1] = pcurve.domain().or_refuse(KernelStage::Refine, "domain")?;
+                        let mid = pcurve.evaluate(0.5 * (r0 + r1)).or_refuse(KernelStage::Refine, "evaluate")?.x;
+                        let shift = if mid > u1 { -period } else if mid < u0 { period } else { 0.0 };
+                        if shift != 0.0 {
+                            for control in pcurve.control_points.iter_mut() {
+                                control.x += shift * control.w;
+                            }
+                            *shifted = true;
+                        }
+                    }
+                    if pieces[0].2 == pieces[1].2 {
+                        return Err(internal("tilted_seam_piece", "blend network: the split cap rail does not straddle the seam"));
+                    }
+                }
+                let forward = old.forward;
+                let mut make = |(edge_id, pcurve, shifted): (u64, NurbsCurve, bool)| (CoedgeRecord { id: take_id(), edge_id, forward, pcurve }, shifted);
+                let [a, b] = pieces;
+                let (a, b) = (make(a), make(b));
+                if is_cap {
+                    // On the cap the two pieces are no longer neighbours: the
+                    // near piece keeps the rail's slot (beside one seam use),
+                    // the past piece goes beside the seam's other use.
+                    let (near, past, past_first) = if a.1 { (b.0, a.0, true) } else { (a.0, b.0, false) };
+                    loop_record.coedges.insert(at, near);
+                    let count = loop_record.coedges.len();
+                    let neighbour = if past_first { (at + count - 1) % count } else { (at + 1) % count };
+                    let uses: Vec<usize> = (0..count).filter(|index| loop_record.coedges[*index].edge_id == seam_id).collect();
+                    if uses.len() != 2 || !uses.contains(&neighbour) {
+                        return Err(internal("tilted_seam_use", "blend network: the split cap rail is not beside the cap's seam"));
+                    }
+                    let other = if uses[0] == neighbour { uses[1] } else { uses[0] };
+                    // Past-first: the past piece walks INTO the seam's other
+                    // use's start; otherwise it leaves that use's end.
+                    loop_record.coedges.insert(if past_first { other } else { other + 1 }, past);
+                } else {
+                    loop_record.coedges.insert(at, a.0);
+                    loop_record.coedges.insert(at + 1, b.0);
+                }
+            }
+        }
+    }
+    // The cap coedge's traversal: forward walks low then high; the past
+    // piece is the end that left the domain.
+    let (first_edge, second_edge) = if coedge.forward { (low_id, high_id) } else { (high_id, low_id) };
+    Ok(Some(if crosses_at_end { second_edge } else { first_edge }))
+}
+
+/// The traversal fraction of edge parameter `t` along a coedge of `edge`.
+fn fraction_of(edge: &EdgeRecord, t: f64, forward: bool) -> f64 {
+    let f = (t - edge.t0) / (edge.t1 - edge.t0);
+    if forward { f } else { 1.0 - f }
+}
+
 fn corner_section_arc(
     center: Vec3,
     radius: f64,
