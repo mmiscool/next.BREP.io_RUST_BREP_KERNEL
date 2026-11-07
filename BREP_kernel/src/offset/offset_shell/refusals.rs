@@ -12,12 +12,23 @@
 //! the sharp-side lane's `UnsupportedGeometry { what:
 //! "offset_shell_sharp_side_continuation" }` and the certainty step's
 //! `UnsupportedGeometry { what: "offset_shell_regularity_uncertain" }` and
-//! `{ what: "offset_shell_fold_between_samples" }`, which no feature branch
-//! matches.
+//! `{ what: "offset_shell_fold_between_samples" }`, the selection's
+//! `UnsupportedGeometry { what: "offset_shell_tangent_offsets" }` (two offsets
+//! touch tangentially: the cavity pinches to a line) and the assembly's
+//! `UnsupportedGeometry { what: "offset_shell_sealed_hollow" }` (a cavity skin
+//! with no path to the opening, refused when the assembly fails), which no
+//! feature branch matches — the last two so a refusal naming its cause never
+//! takes the reorder advice.
 
 use crate::{KernelRefusal, KernelStage};
 
 pub(super) const NO_RETAINED_FACE: &str = "offset_shell_no_retained_face";
+/// Two offsets touch tangentially, so the cavity would pinch to a line
+/// (`BREP_OFFSET_TANGENT_TOUCH`).
+pub(super) const TANGENT_OFFSETS: &str = "offset_shell_tangent_offsets";
+/// A cavity skin is sealed off from the opening and the assembly failed
+/// (`BREP_OFFSET_SEALED_HOLLOW`).
+pub(super) const SEALED_HOLLOW: &str = "offset_shell_sealed_hollow";
 pub(super) const UNWELDED_CURVED_RIM: &str = "offset_shell_unwelded_curved_rim";
 pub(super) const EMPTY_SHELL: &str = "offset_shell_empty_shell";
 /// The sharp-side lane could not continue a curved carrier past its sharp

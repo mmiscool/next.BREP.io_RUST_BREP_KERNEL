@@ -892,7 +892,7 @@ impl FamilyTableEditor {
         self.hits.clear();
         self.dirty = dirty;
         self.plm.sync(store.plm_client(), identity);
-        if let Some(report) = self.plm.poll(dirty, store.pending_writes(), || state.history_request_json()) {
+        if let Some(report) = self.plm.poll(dirty, store.pending_saves(), || state.history_request_json()) {
             self.status.clear();
             self.report = Some(ReportView::of(&report));
         }
@@ -911,8 +911,9 @@ impl FamilyTableEditor {
                     if self.plm.active() {
                         return None;
                     }
+                    // A stat, not a read: whether the member file is there.
                     family_table::member_identity(identity, &row.part_number)
-                        .map(|path| store.read(&path).is_some())
+                        .map(|path| store.residency(&path) != crate::store::Residency::Absent)
                 })
                 .collect();
             self.members = (Some(key), exists);

@@ -105,6 +105,50 @@ pub fn spawn(task: impl Future<Output = ()> + 'static) {
     }
 }
 
+/// A task [`spawn_abortable`] started, for its owner to drop it unfinished.
+pub struct Abort(std::rc::Rc<RefCell<AbortState>>);
+
+#[derive(Default)]
+struct AbortState {
+    aborted: bool,
+    waker: Option<Waker>,
+}
+
+impl Abort {
+    /// Drop the task now: its future is dropped (as [`block_on_for`] drops one
+    /// at its limit) and it leaves the queue, so [`pending`] no longer counts
+    /// it. A request it had in flight still finishes on its own thread; its
+    /// answer goes nowhere. Not to be called from inside a spawned task.
+    pub fn abort(&self) {
+        let waker = {
+            let mut state = self.0.borrow_mut();
+            state.aborted = true;
+            state.waker.take()
+        };
+        if let Some(waker) = waker {
+            waker.wake();
+            run_pending();
+        }
+    }
+}
+
+/// [`spawn`], keeping a handle to drop the task before it finishes: a wait
+/// the frame bounds itself (a live PLM connect) cannot hold a queue slot, and
+/// the settle that counts the queue, forever.
+pub fn spawn_abortable(task: impl Future<Output = ()> + 'static) -> Abort {
+    let state = std::rc::Rc::new(RefCell::new(AbortState::default()));
+    let mine = state.clone();
+    let mut task: LocalTask = Box::pin(task);
+    spawn(std::future::poll_fn(move |cx| {
+        if mine.borrow().aborted {
+            return Poll::Ready(());
+        }
+        mine.borrow_mut().waker = Some(cx.waker().clone());
+        task.as_mut().poll(cx)
+    }));
+    Abort(state)
+}
+
 fn poll_once(task: &mut LocalTask, waker: &Arc<TaskWaker>) -> Poll<()> {
     let waker_handle = Waker::from(waker.clone());
     let mut cx = Context::from_waker(&waker_handle);

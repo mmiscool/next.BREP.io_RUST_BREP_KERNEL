@@ -857,6 +857,11 @@ pub fn search_candidates(
         .collect()
 }
 
+/// How long the chooser trusts a store listing (or a document it found
+/// missing) it read at one store generation: a file copied in outside the
+/// app shows within this, without a re-read on every keystroke or frame.
+const SEARCH_LISTING_TTL: f64 = 1.0;
+
 /// What replacing `component_id` with `candidate` will do, BEFORE it is done.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Preview {
@@ -955,6 +960,14 @@ pub struct ReplaceDialog {
     searched: String,
     /// The chosen candidate's preview and picture, for the key it was made for.
     preview: Option<(String, Preview, Option<egui::TextureHandle>)>,
+    /// When a preview found no document it could load (missing, unreadable,
+    /// not JSON): the store generation and time it looked. It looks again
+    /// only once the store changed or a second passed, not every frame.
+    preview_missing: Option<(u64, f64)>,
+    /// Every part the store lists for the search, read once per store
+    /// generation (at most once a second for changes made outside the app),
+    /// not on every keystroke: `(target, document, generation, time)`.
+    searchable: Option<((String, Option<String>, u64, f64), Vec<Candidate>)>,
     /// What a Pattern Component makes of this replace (see [`pattern_line`]).
     pattern: Option<String>,
     status: String,
@@ -1147,7 +1160,21 @@ impl ReplaceDialog {
         // Typing searches every part the store lists (no Browse click).
         if self.filter.trim() != self.searched {
             self.searched = self.filter.trim().to_string();
-            self.candidates = search_candidates(engine, store, &target, &self.searched, self.document.as_deref());
+            self.candidates = if self.searched.is_empty() {
+                candidates(engine, store, &target, false, self.document.as_deref())
+            } else {
+                let now = ui.input(|i| i.time);
+                let generation = store.mutation_generation();
+                let fresh = self.searchable.as_ref().is_some_and(|((t, d, g, at), _)| {
+                    *t == target && *d == self.document && *g == generation && now - at < SEARCH_LISTING_TTL
+                });
+                if !fresh {
+                    let all = candidates(engine, store, &target, true, self.document.as_deref());
+                    self.searchable = Some(((target.clone(), self.document.clone(), generation, now), all));
+                }
+                let all = self.searchable.as_ref().map(|(_, all)| all.as_slice()).unwrap_or_default();
+                all.iter().filter(|candidate| candidate_matches(store, candidate, &self.searched)).cloned().collect()
+            };
             self.chosen = None;
         }
         let filter = self.filter.trim().to_lowercase();
@@ -1199,7 +1226,19 @@ impl ReplaceDialog {
         // to the mates.
         if let Some(index) = self.chosen {
             let key = self.candidates[index].key();
-            if self.preview.as_ref().is_none_or(|(k, p, _)| *k != key || p.document.is_none()) {
+            let now = ui.input(|i| i.time);
+            let generation = store.mutation_generation();
+            // A document still loading is looked for every frame (the store
+            // answers from memory); one that is not there, again only once
+            // the store changed or a second passed.
+            let settled_missing = self
+                .preview_missing
+                .is_some_and(|(g, at)| g == generation && now - at < SEARCH_LISTING_TTL);
+            if self.preview.as_ref().is_none_or(|(k, p, _)| *k != key || (p.document.is_none() && !settled_missing)) {
+                let loading = match &self.candidates[index].source {
+                    ReplaceSource::Stored(name) => store.residency(name) == crate::store::Residency::OnDisk,
+                    ReplaceSource::Library(_) => false,
+                };
                 self.preview = preview(engine, store, &target, &self.candidates[index]).map(|preview| {
                     let picture = preview
                         .document
@@ -1208,6 +1247,10 @@ impl ReplaceDialog {
                         .map(|image| ui.ctx().load_texture(format!("replace-preview:{key}"), image, egui::TextureOptions::LINEAR));
                     (key, preview, picture)
                 });
+                self.preview_missing = match &self.preview {
+                    Some((_, preview, _)) if preview.document.is_none() && !loading => Some((generation, now)),
+                    _ => None,
+                };
             }
             if let Some((_, preview, picture)) = &self.preview {
                 ui.horizontal(|ui| {

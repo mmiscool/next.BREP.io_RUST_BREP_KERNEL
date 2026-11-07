@@ -42,6 +42,20 @@ use sphere_atlas::*;
 use pole_patch::*;
 use rectangle::*;
 
+/// `BREP_TESS_PINCH_CUSP` (default on, `=0` restores): the watertight mesher meets a face whose
+/// boundary points touch at zero angle (a cusp) or a shell pinched to a point (
+/// brep-bench tangent/midsphere-common and tangent/viviani-cut). Three parts:
+/// - [`edge_sampling`]: a sphere chart plane an edge only TOUCHES at a sample (its
+///   function is rounding noise there) is not crossed beside that sample, and a span
+///   whose chord and midpoint are under 1e-6(1 + |p|) is not split (a hook at the
+///   end of a tangent-touch edge);
+/// - [`orient`]: two faces that emit the same triangle (the tip of a sliver between
+///   two surfaces tangent at a pinch, spanned by the same three shared samples) are a
+///   zero-thickness slab, and both copies are dropped before orientation.
+pub(crate) fn pinch_cusp_enabled() -> bool {
+    crate::switch!("BREP_TESS_PINCH_CUSP", true)
+}
+
 pub use face_tess::triangulate_planar_region;
 pub use orient::tessellate_brep_watertight;
 pub use face_memo::clear as clear_face_memo;

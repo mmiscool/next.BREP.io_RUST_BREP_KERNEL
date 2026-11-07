@@ -113,6 +113,73 @@ pub fn sweep_profile_twisted(
     .map_err(|error| error.with_message(|error| format!("sweep_profile_twisted: {error}")))
 }
 
+/// Twisted path sweep with a SCALING LAW: [`sweep_profile_twisted`], with the
+/// section also scaled about its anchor origin (the profile's centroid, which
+/// the sweep lands on the path) linearly in the same sampled arc-length
+/// fraction as the twist, from 1 at the start to `end_scale` at the end.
+///
+/// So a square drawn at the foot of a straight path, swept with `twist_angle`
+/// and `end_scale`, is the column whose section at fraction `f` of the way is
+/// that square scaled by `1 + (end_scale − 1)·f` and turned by `twist_angle·f`:
+/// its corners run along conical spirals and each wall is the twisted RULED
+/// surface its side sweeps. Like every station sweep the wall is lofted through
+/// sampled sections, at TWICE the twisted builder's station density (32 per
+/// quarter turn, floored at 64, so at most 8 turns under the 1024 cap): the
+/// tapering column of the brep-bench case (half a turn, a third the size at
+/// the top) read 1.2e-7 relative in volume at 32 stations and holds 1e-7 with
+/// margin at 64, the Δφ⁴ law of the cubic interpolation.
+///
+/// With `end_scale == 1.0` it places the same sections [`sweep_profile_twisted`]
+/// does (each axis multiplied by exactly 1). A non-positive
+/// or non-finite scale is refused, and so is every twist the twisted sweep
+/// refuses.
+pub fn sweep_profile_twisted_scaled(
+    profile: &[NurbsCurve],
+    path: &NurbsCurve,
+    twist_angle: f64,
+    end_scale: f64,
+    name: Option<&str>,
+) -> Result<BrepSolid, KernelRefusal> {
+    use std::f64::consts::{FRAC_PI_2, TAU};
+
+    if !twist_angle.is_finite() {
+        return Err(KernelRefusal::input(
+            KernelStage::Collect,
+            "twist_finite",
+            "sweep_profile_twisted_scaled: twist angle must be finite",
+        ));
+    }
+    const MAX_TURNS: f64 = 8.0;
+    if twist_angle.abs() > MAX_TURNS * TAU {
+        return Err(KernelRefusal::unsupported(
+            KernelStage::Collect,
+            "twist_cap",
+            format!(
+                "sweep_profile_twisted_scaled: twist of {:.3} turns exceeds the {MAX_TURNS}-turn \
+                 limit the 1024-station cap can resolve at 32 stations per quarter turn; \
+                 split the sweep or reduce the twist",
+                twist_angle.abs() / TAU
+            ),
+        ));
+    }
+    let quarter_turns = (twist_angle.abs() / FRAC_PI_2).ceil() as usize;
+    let stations = (quarter_turns * 32).clamp(64, 1024).max(path_turning_stations(path));
+    sweep_profile_along_path_stations_scaled(
+        profile,
+        path,
+        name,
+        stations,
+        twist_angle,
+        None,
+        SectionPlacement::Transplant,
+        SWEEP_DEFAULT_TOLERANCE,
+        true,
+        Some(end_scale),
+    )
+    .map(|swept| swept.solid)
+    .map_err(|error| error.with_message(|error| format!("sweep_profile_twisted_scaled: {error}")))
+}
+
 /// The station budget of a single-curve path sweep, from how far the path's
 /// TANGENT turns: 8 stations per quarter turn of tangent — the 32 per turn
 /// [`sweep_profile_helix`] lofts a coil with — floored at the original 32 and
@@ -654,6 +721,35 @@ fn sweep_profile_along_path_stations(
     tolerance: f64,
     measure_report: bool,
 ) -> Result<SweptChain, KernelRefusal> {
+    sweep_profile_along_path_stations_scaled(
+        profile,
+        path,
+        name,
+        stations,
+        twist_angle,
+        anchor,
+        placement_mode,
+        tolerance,
+        measure_report,
+        None,
+    )
+}
+
+/// [`sweep_profile_along_path_stations`] with a scaling law: `end_scale` is the
+/// section's scale at the path's end (see [`StationRun::end_scale`]).
+#[allow(clippy::too_many_arguments)]
+fn sweep_profile_along_path_stations_scaled(
+    profile: &[NurbsCurve],
+    path: &NurbsCurve,
+    name: Option<&str>,
+    stations: usize,
+    twist_angle: f64,
+    anchor: Option<ProfileAnchor>,
+    placement_mode: SectionPlacement,
+    tolerance: f64,
+    measure_report: bool,
+    end_scale: Option<f64>,
+) -> Result<SweptChain, KernelRefusal> {
     // Loft carries no face names; the app stamps them onto the emitted face
     // order.  Accept `name` for ABI symmetry with the other builders.
     let _ = name;
@@ -707,6 +803,7 @@ fn sweep_profile_along_path_stations(
             budget,
             tolerance,
             measure_report,
+            end_scale,
         },
     )
 }
@@ -1058,6 +1155,7 @@ fn sweep_profile_along_chain_stations(
             budget,
             tolerance,
             measure_report,
+            end_scale: None,
         },
     )
 }
@@ -2301,6 +2399,11 @@ struct StationRun<'a> {
     budget: StationBudget,
     tolerance: f64,
     measure_report: bool,
+    /// The section's SCALE at the far end, laid down linearly in sampled arc
+    /// length from 1 at the start (an OPEN `Transplant` run only; see
+    /// [`sweep_profile_twisted_scaled`]). `None` for every other builder, which
+    /// leaves the placement bit-identical to the unscaled one.
+    end_scale: Option<f64>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2359,6 +2462,51 @@ fn sweep_sections_through_samples(
         Some(cumulative)
     } else {
         None
+    };
+
+    // --- 2c. Scaling law (`StationRun::end_scale`): the section's scale at each
+    //         station, linear in the same sampled ARC-LENGTH fraction the twist
+    //         uses, from 1 at the start to `end_scale` at the end. Only an OPEN
+    //         `Transplant` run takes one: a ring has no end to scale towards, and
+    //         `Rigid` carries the profile where it stands, about no centre a
+    //         scale could be taken about. `None` leaves every axis untouched.
+    let station_scales: Option<Vec<f64>> = match run.end_scale {
+        None => None,
+        Some(end_scale) => {
+            if !end_scale.is_finite() || end_scale <= 0.0 {
+                return Err(KernelRefusal::input(
+                    KernelStage::Collect,
+                    "end_scale",
+                    format!("sweepSolid: the end scale must be finite and positive, got {end_scale}"),
+                ));
+            }
+            if closure.is_ring() || placement_mode == SectionPlacement::Rigid {
+                return Err(KernelRefusal::unsupported(
+                    KernelStage::Collect,
+                    "end_scale_mode",
+                    "sweepSolid: a scaling law needs an open path and a section placed square to it",
+                ));
+            }
+            let mut cumulative = vec![0.0; stations];
+            let mut total = 0.0;
+            for index in 1..stations {
+                total += points[index].sub(points[index - 1]).length();
+                cumulative[index] = total;
+            }
+            if total <= tolerance {
+                return Err(KernelRefusal::input(
+                    KernelStage::Collect,
+                    "path_length",
+                    "sweepSolid: path has zero length; cannot distribute the scale",
+                ));
+            }
+            Some(
+                cumulative
+                    .iter()
+                    .map(|length| 1.0 + (end_scale - 1.0) * (length / total))
+                    .collect(),
+            )
+        }
     };
 
     // --- 3. The station frames.
@@ -2501,6 +2649,13 @@ fn sweep_sections_through_samples(
                 )
             }
             None => (r_axes[station], s_axes[station]),
+        };
+        // A scaling law scales the placed axes (TRANSPLANT only, refused above
+        // otherwise), so `place` scales the profile about its anchor origin and
+        // the tight-bend guard below reads the SCALED section's reach.
+        let (ri, si) = match &station_scales {
+            Some(scales) => (ri.scale(scales[station]), si.scale(scales[station])),
+            None => (ri, si),
         };
         placed_axes.push((ri, si));
         let tk = tangents[station];

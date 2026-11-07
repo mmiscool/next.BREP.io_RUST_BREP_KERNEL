@@ -319,7 +319,16 @@ impl Executions {
         // holding the same lock used by cancellation and terminal completion.
         let execution = state.execs.get(id).ok_or("execution no longer active")?;
         if execution.terminal() || execution.cancel.load(Ordering::Relaxed) { return Err("execution stopped before call admission".into()); }
-        state.journal.as_mut().unwrap().start_call(id, call_id, method)?;
+        let intent = state.journal.as_mut().unwrap().start_call(id, call_id, method)?;
+        // The intent's sync runs with the lock released: another execution's
+        // admission, call or status read does not wait on this disk write.
+        drop(state);
+        if let Err(error) = intent.sync() {
+            if let Some(journal) = self.state.lock().unwrap().journal.as_mut() {
+                journal.poison();
+            }
+            return Err(error);
+        }
         Ok(true)
     }
 

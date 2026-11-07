@@ -76,6 +76,10 @@ pub struct SettingsPanel {
     /// `group:<name>` / …), published to JS for the headed verifier. Rebuilt every
     /// frame, so it holds only the ACTIVE tab's widgets.
     hits: HashMap<String, egui::Rect>,
+    /// The Display tree moved the settings while a pointer button was down (a
+    /// slider drag): the engine has them, the store gets them once on release
+    /// rather than on every frame of the drag.
+    settings_unwritten: bool,
     /// Which tab is shown. Defaults to `Display`, the tab the window has always
     /// opened on.
     tab: Tab,
@@ -106,6 +110,9 @@ pub struct SettingsPanel {
     /// Set by the app every frame: why this session cannot switch to the PLM
     /// live (open named or dirty documents), or `None` when it can.
     pub reconnect_blocker: Option<String>,
+    /// Set by the app every frame: a Connect now is on its way (the tab's
+    /// actions wait for it).
+    pub reconnecting: bool,
     /// Connect now was pressed: the config root the app switches to.
     reconnect_request: Option<std::path::PathBuf>,
     /// The live session's sign-in was refused by the server (revoked,
@@ -159,6 +166,7 @@ impl SettingsPanel {
         Self {
             open: false,
             hits: HashMap::new(),
+            settings_unwritten: false,
             tab: Tab::Display,
             display_collapsed: false,
             closed_groups: HashSet::new(),
@@ -168,6 +176,7 @@ impl SettingsPanel {
             url_buf: None,
             url_outcome: None,
             reconnect_blocker: None,
+            reconnecting: false,
             reconnect_request: None,
             signed_out: None,
         }
@@ -320,6 +329,7 @@ impl SettingsPanel {
             "tab": true, "status": status, "url": url, "username": username, "reason": reason,
             "busy": plm.busy(), "outcome": outcome, "failed": failed,
             "connectable": plm.connectable(), "reconnectBlocker": self.reconnect_blocker,
+            "connecting": self.reconnecting,
             "linking": plm.linking(),
             "linkCode": plm.link.as_ref().map(|l| l.code.clone()),
             "linkUrl": plm.link.as_ref().map(|l| l.url.clone()),
@@ -512,7 +522,7 @@ impl SettingsPanel {
         }
 
         let native = matches!(plm.keep(), Keep::Files(_));
-        let idle = !plm.busy();
+        let idle = !plm.busy() && !self.reconnecting;
         if native {
             browser_sign_in(ui, plm, hits, idle);
             ui.separator();
@@ -574,6 +584,12 @@ impl SettingsPanel {
             let connect =
                 ui.add_enabled(idle && blocked.is_none(), egui::Button::new("Connect now"));
             hits.insert("plm:connect".into(), connect.rect);
+            if self.reconnecting {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label("Connecting to the PLM…");
+                });
+            }
             if let Some(why) = &blocked {
                 ui.label(egui::RichText::new(why).color(PROBLEM_AMBER));
             }
@@ -835,12 +851,19 @@ impl SettingsPanel {
         // the PLM made each one a request: with the window open the store was
         // never idle. Comparing through the engine's own serialisation makes a
         // no-op edit a no-op whichever widget claims otherwise.
+        //
+        // A drag (a slider) moves them on every frame it lasts: the engine
+        // follows each frame, the store is written once, on release.
         if changed {
             let json = settings_json.to_string();
             let _ = state.apply_settings_json(&json);
             if state.settings_json() != before {
-                let _ = store.write(SETTINGS_KEY, &json);
+                self.settings_unwritten = true;
             }
+        }
+        if self.settings_unwritten && !ui.ctx().input(|i| i.pointer.any_down()) {
+            let _ = store.write(SETTINGS_KEY, &state.settings_json());
+            self.settings_unwritten = false;
         }
 
         // Reset to defaults — only while the display root is OPEN, matching the

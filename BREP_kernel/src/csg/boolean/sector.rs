@@ -65,6 +65,15 @@ const COINCIDENT_ANGLE_SIN: f64 = 1.745_329_243_133_368e-4;
 /// sin 10°: binormal pairs closer than this to the other carrier's tangent
 /// plane are read on the step-off ladder.
 const TANGENT_BAND_SIN: f64 = 0.173_648_177_666_930_33;
+/// The least `side` an exact section's reading takes as a crossing under
+/// `BREP_SECTOR_EXACT_SIDE`: far above the round-off of two unit normals on a
+/// section that lies on both carriers, far below any crossing a model draws.
+const EXACT_SIDE_FLOOR: f64 = 1e-9;
+
+/// `BREP_SECTOR_EXACT_SIDE` (default off): see EXACT SIDE in [`sample`].
+fn exact_side_enabled() -> bool {
+    crate::switch!("BREP_SECTOR_EXACT_SIDE", false)
+}
 /// Most step-off readings before the ladder gives up.
 const LADDER_STEPS: usize = 20;
 /// Growth of the step-off distance per ladder step after the first two.
@@ -263,6 +272,24 @@ fn sample(
     };
     let side = binormal.dot(other_in_plane);
     if side.abs() >= TANGENT_BAND_SIN {
+        return Ok(Sample::Class(if side > 0.0 { PointClass::Out } else { PointClass::In }, 0));
+    }
+    // EXACT SIDE (`BREP_SECTOR_EXACT_SIDE`, default off): on a section that
+    // lies on the other carrier to round-off (an analytic lane's exact curve),
+    // a small crossing angle is still a crossing, and `side` reads its sign.
+    // The fragment's normal is orthogonal to its binormal, so `side` is the
+    // binormal against the two normals' true difference; an error in the
+    // section tangent changes it only relatively. A crossing of 0.05° reads
+    // sin 8.7e-4 there, while the ladder below cannot see it: two balls of
+    // radius 5 whose centres are 9.999999 apart meet in a lens 1e-6 thick,
+    // the cap never parts from the other ball by the band, and the ladder
+    // stepped past the far rim and read Out (thin-lens: no boundary faces).
+    // A tangent pair's exact section reads `side` at round-off and still
+    // takes the ladder; a fitted section sits off the carrier and does too.
+    if exact_side_enabled()
+        && side.abs() >= EXACT_SIDE_FLOOR
+        && point.sub(projection.point).length() <= 1e-12 * (1.0 + point.length())
+    {
         return Ok(Sample::Class(if side > 0.0 { PointClass::Out } else { PointClass::In }, 0));
     }
     // Tangent carriers: step off the section along the binormal, on the

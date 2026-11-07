@@ -284,7 +284,8 @@ pub fn media_type(file_name: &str) -> &'static str {
 /// written, flushed to disk, then renamed over `path`; on any failure the
 /// temporary is removed and `path` is untouched. `secret` creates the
 /// temporary owner-only (0600 on unix) from the first byte. The app's one
-/// atomic write: model saves, exports and the PLM config/token (I4).
+/// atomic write: model saves, exports, the PLM config/token (I4), and the
+/// reserved application files the write-behind lane lands off the UI thread.
 #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 pub(crate) fn write_atomic(path: &std::path::Path, bytes: &[u8], secret: bool) -> std::io::Result<()> {
     use std::io::Write;
@@ -567,16 +568,29 @@ pub trait ModelStore {
         None
     }
 
-    /// Writes handed to a WRITE-BEHIND backend that have not settled yet — the
-    /// status bar's working indicator reports them ("Saving to browser
-    /// storage"). Always 0 on a backend that writes synchronously.
+    /// Writes handed to a WRITE-BEHIND backend that have not settled yet,
+    /// the desktop's own state files included: the close path and exit wait
+    /// for all of them. Always 0 on a backend that writes synchronously.
     fn pending_writes(&self) -> usize {
         0
     }
 
+    /// The part of [`Self::pending_writes`] the status bar's working
+    /// indicator names as saving ("Saving to browser storage"): documents and
+    /// state on their way to a backend. The desktop's own settings, layout,
+    /// recents and recovery files written behind are not a save the user
+    /// would recognise, and are left out. Also what a flow waiting for its
+    /// save to reach the server (Generate, a PLM follow) counts.
+    fn pending_saves(&self) -> usize {
+        self.pending_writes()
+    }
+
     /// [`Self::pending_writes`], leaving out the writes of the documents
-    /// stored under `names`: what `settle` on one document waits for while
-    /// other tabs save. A store that cannot tell its writes apart counts all.
+    /// stored under `names`: what `settle` (MCP `store_writes`) on one
+    /// document waits for while other tabs save. A store that cannot tell its
+    /// writes apart counts all. The desktop's write-behind state files are
+    /// never counted here: everything in the process reads them through the
+    /// lane, so no settled state depends on their fsync.
     fn pending_writes_except(&self, names: &[&str]) -> usize {
         let _ = names;
         self.pending_writes()
@@ -777,7 +791,7 @@ pub fn file_store_with_notice(root: std::path::PathBuf, reason: String) -> Box<d
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-pub use native_boot::{boot_native_store, check_native_plm, NativeFileBackend, BOOT_TIMEOUT};
+pub use native_boot::{boot_native_store, check_native_plm, start_native_boot, NativeFileBackend, PendingBoot, BOOT_TIMEOUT};
 
 pub fn default_model_store() -> Box<dyn ModelStore> {
     #[cfg(not(target_arch = "wasm32"))]
@@ -815,6 +829,15 @@ pub(crate) fn wake_ui() {
     web_model::wake_frame_loop();
     #[cfg(not(target_arch = "wasm32"))]
     crate::plm::native::request_wake();
+}
+
+/// Desktop: block until the reserved application files written behind
+/// (`@settings`, `@dock_layout`, `@recovery`, ...) are on disk, or `limit`
+/// passed; `true` when every write queued before the call has landed. Called once the window has closed,
+/// and by tests that read those files from disk. Never from the frame.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn flush_writes(limit: std::time::Duration) -> bool {
+    native_model::write_behind::flush(limit)
 }
 
 /// Run a background task (a PLM request, a store write, a thumbnail upload) and
@@ -882,8 +905,10 @@ mod native_boot {
     /// session. It is the PLM session's LOCAL key space (D1: the local-first
     /// copy of `@recovery`), handed to the PLM client to compose.
     ///
-    /// Every call is synchronous file I/O answered with a resolved future, so
-    /// it lands writes of one key in call order by itself.
+    /// Every call is answered with a resolved future. Documents are written
+    /// synchronously; the reserved keys are handed to the file store's
+    /// write-behind lane, which keeps the newest value per file and lands
+    /// writes of one key in call order, so `orders_writes_per_key` holds.
     pub struct NativeFileBackend {
         files: FileModelStore,
     }
@@ -963,7 +988,19 @@ mod native_boot {
     /// frame. A PLM never makes the app fail to start.
     pub fn boot_native_store(root: PathBuf, config: PlmConfig) -> Box<dyn ModelStore> {
         let (url, source) = (config.url.clone(), config.url_source);
-        match boot_with(&root, config, plm_connect, BOOT_TIMEOUT) {
+        let booted = boot_with(&root, config, plm_connect, BOOT_TIMEOUT);
+        boot_outcome(root, url, source, booted)
+    }
+
+    /// What a boot ends in: the PLM session, or the file stores at `root`
+    /// saying why on the first frame.
+    fn boot_outcome(
+        root: PathBuf,
+        url: String,
+        source: crate::plm::config::Source,
+        booted: Result<NativeMirrorStore, String>,
+    ) -> Box<dyn ModelStore> {
+        match booted {
             Ok(store) => Box::new(store),
             Err(reason) => {
                 let reason = format!("PLM at {url}: {reason}");
@@ -975,6 +1012,89 @@ mod native_boot {
                 )
             }
         }
+    }
+
+    /// [`boot_native_store`] without blocking the frame (the PLM tab's
+    /// Connect now): the sign-in and the index load run on the frame loop's
+    /// executor, each phase bounded by [`BOOT_TIMEOUT`] as at start, and the
+    /// frame takes the store from [`PendingBoot::poll`] once the boot ends.
+    pub fn start_native_boot(root: PathBuf, config: PlmConfig) -> PendingBoot {
+        start_boot_with(root, config, plm_connect, BOOT_TIMEOUT)
+    }
+
+    /// A boot [`start_native_boot`] began, still on its way.
+    pub struct PendingBoot {
+        state: Rc<std::cell::RefCell<BootState>>,
+        task: crate::plm::native::Abort,
+        root: PathBuf,
+        url: String,
+        source: crate::plm::config::Source,
+        timeout: std::time::Duration,
+    }
+
+    struct BootState {
+        /// When the phase now waiting (sign-in, then the index) began.
+        phase_since: std::time::Instant,
+        booted: Option<Result<NativeMirrorStore, String>>,
+    }
+
+    impl PendingBoot {
+        /// The store once the boot has ended, as [`boot_native_store`] would
+        /// have returned it (a refusal or a phase past its limit gives the file
+        /// stores saying why); `None` while it is still waiting. A phase past
+        /// its limit drops the boot's task.
+        pub fn poll(&mut self) -> Option<Box<dyn ModelStore>> {
+            let finished = self.state.borrow_mut().booted.take();
+            let booted = match finished {
+                Some(booted) => booted,
+                None if self.state.borrow().phase_since.elapsed() > self.timeout => {
+                    self.task.abort();
+                    Err(format!("no answer within {} s", self.timeout.as_secs()))
+                }
+                None => return None,
+            };
+            Some(boot_outcome(self.root.clone(), self.url.clone(), self.source, booted))
+        }
+    }
+
+    /// [`start_native_boot`] with the connector and the time limit passed in.
+    pub(super) fn start_boot_with(
+        root: PathBuf,
+        config: PlmConfig,
+        connect: impl FnOnce(PlmConfig, Rc<dyn StoreBackend>) -> PlmFuture<Rc<dyn StoreBackend>>,
+        timeout: std::time::Duration,
+    ) -> PendingBoot {
+        let (url, source) = (config.url.clone(), config.url_source);
+        let (files, local) = boot_parts(&root, &config);
+        let state = Rc::new(std::cell::RefCell::new(BootState { phase_since: std::time::Instant::now(), booted: None }));
+        let theirs = state.clone();
+        let connecting = connect(config, local);
+        let task = crate::plm::native::spawn_abortable(async move {
+            let booted = async {
+                let backend = connecting.await?;
+                theirs.borrow_mut().phase_since = std::time::Instant::now();
+                let entries = backend.load_index().await.map_err(|e| format!("the store index would not load ({e})"))?;
+                Ok::<_, String>(mirror_of(backend, entries, files))
+            }
+            .await;
+            theirs.borrow_mut().booted = Some(booted);
+        });
+        PendingBoot { state, task, root, url, source, timeout }
+    }
+
+    /// The two stores every boot starts from: the session's real-file lane and
+    /// the local backend the PLM connector keeps this machine's keys in.
+    fn boot_parts(root: &Path, config: &PlmConfig) -> (FileModelStore, Rc<dyn StoreBackend>) {
+        let files = FileModelStore::rooted_at(root.to_path_buf()).with_plm_launch(config.url.clone(), config.url_source);
+        let local: Rc<dyn StoreBackend> = Rc::new(NativeFileBackend::rooted_at(root.to_path_buf()));
+        (files, local)
+    }
+
+    /// The PLM session store around a connected backend and its index.
+    fn mirror_of(backend: Rc<dyn StoreBackend>, entries: Vec<(String, super::mirror_store::Entry)>, files: FileModelStore) -> NativeMirrorStore {
+        let wake: Rc<dyn Fn()> = Rc::new(crate::plm::native::request_wake);
+        let core = MirrorStore::from_index(backend, entries, Some(wake));
+        NativeMirrorStore { core, files }
     }
 
     /// `brep-app --plm-check`: the boot's own sign-in and version check, and
@@ -996,8 +1116,7 @@ mod native_boot {
     ) -> Result<NativeMirrorStore, String> {
         use crate::plm::native::block_on_for;
         let late = || format!("no answer within {} s", timeout.as_secs());
-        let files = FileModelStore::rooted_at(root.to_path_buf()).with_plm_launch(config.url.clone(), config.url_source);
-        let local: Rc<dyn StoreBackend> = Rc::new(NativeFileBackend::rooted_at(root.to_path_buf()));
+        let (files, local) = boot_parts(root, &config);
         let backend = block_on_for(connect(config, local), timeout).ok_or_else(late)??;
         // The index, not the documents: a catalog of thousands of parts must
         // not load at boot or stream into memory behind the first frame.
@@ -1005,9 +1124,7 @@ mod native_boot {
         let entries = block_on_for(backend.load_index(), timeout)
             .ok_or_else(late)?
             .map_err(|e| format!("the store index would not load ({e})"))?;
-        let wake: Rc<dyn Fn()> = Rc::new(crate::plm::native::request_wake);
-        let core = MirrorStore::from_index(backend, entries, Some(wake));
-        Ok(NativeMirrorStore { core, files })
+        Ok(mirror_of(backend, entries, files))
     }
 
     /// The native PLM session store: the mirror (every CRUD and explorer
@@ -1073,7 +1190,11 @@ mod native_boot {
         // itself (`BrepApp::ui`'s first line), not here: a store call behind an
         // early return would stall it.
         fn take_persistence_errors(&self) -> Vec<String> {
-            self.core.take_persistence_errors()
+            let mut errors = self.core.take_persistence_errors();
+            // This machine's local files (`@recovery`, `@plm_import`, ...)
+            // are written behind by the file lane; their failures land here.
+            errors.extend(super::native_model::write_behind::take_errors(self.files.root()));
+            errors
         }
         fn take_failed_writes(&self) -> Vec<String> {
             self.core.take_failed_writes()
@@ -1101,6 +1222,11 @@ mod native_boot {
             self.files.save_plm_url(url)
         }
         fn pending_writes(&self) -> usize {
+            // The server's writes, plus the local files still being written
+            // behind (the close path must wait for `@recovery` too).
+            self.core.pending_writes() + super::native_model::write_behind::count(self.files.root())
+        }
+        fn pending_saves(&self) -> usize {
             self.core.pending_writes()
         }
         fn pending_writes_except(&self, names: &[&str]) -> usize {
@@ -1326,6 +1452,279 @@ mod native_model {
         Some(Session { status, keep: Keep::Files(root.to_path_buf()) })
     }
 
+    /// The write-behind lane for the reserved application files (settings,
+    /// dock layout, recovery blob, recents, ...): `FileModelStore::write`
+    /// hands the bytes here and returns, and a writer thread per directory
+    /// (started on demand, gone once that directory is drained) does the
+    /// atomic write and its fsync. On a disk shared with builds one fsync has
+    /// measured seconds, and a settings slider writes on every frame of its
+    /// drag, so this work does not belong in the frame.
+    ///
+    /// Process-wide and keyed by the resolved PATH, not per store: a PLM
+    /// session holds two `FileModelStore`s over the same root (its file lane
+    /// and the local backend), and each must see the other's pending writes.
+    ///
+    /// * Latest value wins per path: a write over a pending one replaces it,
+    ///   so a burst lands as at most two disk writes (the one in flight, then
+    ///   the newest). Writes of one path therefore still land in call order.
+    /// * An entry stays readable until its write LANDS: the writer copies it
+    ///   out with its sequence number and removes it afterwards only if no
+    ///   newer value arrived meanwhile. A read never falls through to the old
+    ///   file while the new one is being written.
+    /// * The lock is never held across file I/O.
+    /// * A failed write is reported through
+    ///   [`ModelStore::take_persistence_errors`]; the entry is dropped, so
+    ///   reads go back to what is on disk.
+    pub(crate) mod write_behind {
+        use std::collections::HashMap;
+        use std::path::{Path, PathBuf};
+        use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
+        use std::time::{Duration, Instant};
+
+        #[derive(Clone)]
+        enum Op {
+            Put(Arc<str>),
+            Remove,
+        }
+
+        struct Entry {
+            op: Op,
+            seq: u64,
+            /// Copied out by the writer and being written now.
+            taken: bool,
+        }
+
+        #[derive(Default)]
+        struct State {
+            pending: HashMap<PathBuf, Entry>,
+            next_seq: u64,
+            /// Failed writes with the file each was for: a store drains only
+            /// the failures under its own root.
+            errors: Vec<(PathBuf, String)>,
+            /// Directories with a writer thread running. Each directory has
+            /// its own writer, so one app's fsyncs never queue behind another
+            /// store's (a test binary or an MCP host runs many apps in one
+            /// process); a file always maps to the same directory, so the
+            /// writes to it keep their order. A writer exits once its
+            /// directory has nothing left.
+            writers: std::collections::HashSet<PathBuf>,
+            /// The last text read from each reserved file, with the size and
+            /// modification time it had: a frame that reads `@recent_documents`
+            /// or `@pinned` pays one stat, not an open and a read. Dropped for
+            /// a path when the lane writes it.
+            read_cache: HashMap<PathBuf, (u64, std::time::SystemTime, String)>,
+        }
+
+        struct Lane {
+            state: Mutex<State>,
+            /// Signalled on new work and on every landed write.
+            changed: Condvar,
+        }
+
+        fn lane() -> &'static Lane {
+            static LANE: OnceLock<Lane> = OnceLock::new();
+            LANE.get_or_init(|| Lane { state: Mutex::new(State::default()), changed: Condvar::new() })
+        }
+
+        fn lock() -> MutexGuard<'static, State> {
+            lane().state.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+        }
+
+        fn enqueue(path: PathBuf, op: Op) {
+            let mut state = lock();
+            state.next_seq += 1;
+            let seq = state.next_seq;
+            let dir = directory(&path);
+            state.pending.insert(path, Entry { op, seq, taken: false });
+            if !state.writers.contains(&dir) {
+                let for_writer = dir.clone();
+                let spawned =
+                    std::thread::Builder::new().name("brep-store-writer".into()).spawn(move || writer(for_writer));
+                match spawned {
+                    Ok(_) => {
+                        state.writers.insert(dir);
+                    }
+                    Err(e) => {
+                        // No thread: write here, as the store always did.
+                        drop(state);
+                        log::warn!("store writer thread did not start ({e}); writing on the caller");
+                        while write_one(&dir) {}
+                        return;
+                    }
+                }
+            }
+            drop(state);
+            lane().changed.notify_all();
+        }
+
+        /// Queue `contents` for `path`.
+        pub(crate) fn put(path: PathBuf, contents: &str) {
+            enqueue(path, Op::Put(Arc::from(contents)));
+        }
+
+        /// Queue the removal of `path` (a missing file is not an error).
+        pub(crate) fn remove(path: PathBuf) {
+            enqueue(path, Op::Remove);
+        }
+
+        /// What a pending write says `path` holds: `Some(Some(text))` for a
+        /// pending write, `Some(None)` for a pending removal, `None` when
+        /// nothing is pending and the disk is the answer.
+        pub(crate) fn pending(path: &Path) -> Option<Option<String>> {
+            lock().pending.get(path).map(|entry| match &entry.op {
+                Op::Put(text) => Some(text.to_string()),
+                Op::Remove => None,
+            })
+        }
+
+        /// What `path` holds: a pending write's value, else the file (served
+        /// from the read cache while its size and modification time match).
+        pub(crate) fn read(path: &Path) -> Option<String> {
+            if let Some(pending) = pending(path) {
+                return pending;
+            }
+            let Ok(meta) = std::fs::metadata(path) else {
+                lock().read_cache.remove(path);
+                return None;
+            };
+            let stamp = meta.modified().ok().map(|modified| (meta.len(), modified));
+            if let Some((len, modified)) = stamp {
+                if let Some((cached_len, cached_modified, text)) = lock().read_cache.get(path) {
+                    if *cached_len == len && *cached_modified == modified {
+                        return Some(text.clone());
+                    }
+                }
+            }
+            let text = std::fs::read_to_string(path).ok()?;
+            if let Some((len, modified)) = stamp {
+                let mut state = lock();
+                // A write queued meanwhile is newer than what was just read.
+                if !state.pending.contains_key(path) {
+                    state.read_cache.insert(path.to_path_buf(), (len, modified, text.clone()));
+                }
+            }
+            Some(text)
+        }
+
+        /// Whether `path` has a pending write (not a removal).
+        pub(crate) fn pending_put(path: &Path) -> Option<bool> {
+            lock().pending.get(path).map(|entry| matches!(entry.op, Op::Put(_)))
+        }
+
+        /// Writes still pending for files under `root`: a store counts its
+        /// own, never another store's (the lane is process-wide).
+        pub(crate) fn count(root: &Path) -> usize {
+            lock().pending.keys().filter(|path| path.starts_with(root)).count()
+        }
+
+        /// Failed writes under `root` since the last drain, oldest first.
+        pub(crate) fn take_errors(root: &Path) -> Vec<String> {
+            let mut state = lock();
+            let (mine, others) = std::mem::take(&mut state.errors).into_iter().partition(|(path, _)| path.starts_with(root));
+            state.errors = others;
+            mine.into_iter().map(|(_, error)| error).collect()
+        }
+
+        /// Block until every write queued before this call has landed (or
+        /// was replaced by a newer one) or `limit` passed; `true` when they
+        /// have. Writes queued meanwhile are not waited for, so a test binary's
+        /// other tests writing all along cannot starve it. For process exit
+        /// and tests — never the frame.
+        pub(crate) fn flush(limit: Duration) -> bool {
+            let deadline = Instant::now() + limit;
+            let mut state = lock();
+            let upto = state.next_seq;
+            while state.pending.values().any(|entry| entry.seq <= upto) {
+                let now = Instant::now();
+                if now >= deadline {
+                    // Exit and tests only: name what did not land, and
+                    // whether its write is in flight (a stalled fsync) or
+                    // still queued.
+                    for (path, entry) in state.pending.iter().filter(|(_, entry)| entry.seq <= upto) {
+                        let at = if entry.taken { "being written" } else { "queued" };
+                        eprintln!("write-behind: {} not landed after {limit:?} ({at})", path.display());
+                    }
+                    return false;
+                }
+                state = match lane().changed.wait_timeout(state, deadline - now) {
+                    Ok((state, _)) => state,
+                    Err(poisoned) => poisoned.into_inner().0,
+                };
+            }
+            true
+        }
+
+        /// The directory whose writer lands `path`.
+        fn directory(path: &Path) -> PathBuf {
+            path.parent().map(Path::to_path_buf).unwrap_or_default()
+        }
+
+        /// Land `dir`'s writes, oldest first, then exit. The exit is decided
+        /// under the lock an enqueue takes, so a write queued for `dir` either
+        /// is seen here or starts a new writer.
+        fn writer(dir: PathBuf) {
+            loop {
+                if !write_one(&dir) {
+                    let mut state = lock();
+                    let more = state.pending.iter().any(|(path, entry)| !entry.taken && directory(path) == dir);
+                    if !more {
+                        state.writers.remove(&dir);
+                        return;
+                    }
+                }
+            }
+        }
+
+        /// Write `dir`'s oldest untaken entry; `false` when there was none.
+        fn write_one(dir: &Path) -> bool {
+            let job = {
+                let mut state = lock();
+                let Some((path, entry)) = state
+                    .pending
+                    .iter_mut()
+                    .filter(|(path, entry)| !entry.taken && directory(path) == dir)
+                    .min_by_key(|(_, entry)| entry.seq)
+                else {
+                    return false;
+                };
+                entry.taken = true;
+                (path.clone(), entry.op.clone(), entry.seq)
+            };
+            let (path, op, seq) = job;
+            let result = match &op {
+                Op::Put(text) => {
+                    let parent = path.parent().filter(|parent| !parent.as_os_str().is_empty());
+                    parent
+                        .map_or(Ok(()), std::fs::create_dir_all)
+                        .and_then(|()| super::super::write_atomic(&path, text.as_bytes(), false))
+                        .map_err(|e| format!("write {}: {e}", path.display()))
+                }
+                Op::Remove => match std::fs::remove_file(&path) {
+                    Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                        Err(format!("remove {}: {e}", path.display()))
+                    }
+                    _ => Ok(()),
+                },
+            };
+            {
+                let mut state = lock();
+                if state.pending.get(&path).is_some_and(|entry| entry.seq == seq) {
+                    state.pending.remove(&path);
+                }
+                state.read_cache.remove(&path);
+                if let Err(error) = result {
+                    log::warn!("{error}");
+                    state.errors.push((path.clone(), error));
+                }
+            }
+            lane().changed.notify_all();
+            // The frame loop shows a "Saving" activity while writes are
+            // pending; ask for the frame that clears it.
+            crate::plm::native::request_wake();
+            true
+        }
+    }
+
     pub struct FileModelStore {
         app_dir: PathBuf,
         dir: PathBuf,
@@ -1342,7 +1741,51 @@ mod native_model {
         /// Where `plm`'s URL came from: `plm.json`, unless the launch named
         /// it by switch or variable ([`Self::with_plm_launch`]).
         plm_source: Cell<crate::plm::config::Source>,
+        /// The explorer's last listing (see [`Listing`]).
+        listing: RefCell<Option<Listing>>,
+        /// The models folder's document names [`ModelStore::list`] last read.
+        names: RefCell<Option<Names>>,
     }
+
+    /// The document names `list` read, and what they were taken under. The
+    /// File state blob asks for them on every frame; without this each frame
+    /// did a `read_dir`. A name list changes only when a file is created,
+    /// deleted or renamed, which moves the folder's own modification time,
+    /// so it is reused while that time and this store's mutation generation
+    /// match, never when taken within [`RACY_WINDOW`] of that time, and for at
+    /// most [`LISTING_TTL`].
+    struct Names {
+        dir_modified: Option<std::time::SystemTime>,
+        generation: u64,
+        taken: std::time::Instant,
+        racy: bool,
+        names: Vec<String>,
+    }
+
+    /// One directory listing the explorer drew, and what it was taken under.
+    /// The explorer asks for its folder on every frame it is open; without
+    /// this each frame did a `read_dir` and three stats per entry. Reused
+    /// while the folder, the extensions, the folder's own modification time
+    /// (a file created, deleted or renamed in it) and this store's mutation
+    /// generation all match, and for at most [`LISTING_TTL`] — a file
+    /// rewritten in place by another program changes no folder time, so its
+    /// size and date are re-read within that.
+    struct Listing {
+        dir: PathBuf,
+        extensions: Vec<String>,
+        dir_modified: Option<std::time::SystemTime>,
+        generation: u64,
+        taken: std::time::Instant,
+        /// Taken within [`RACY_WINDOW`] of the folder's modification time (or
+        /// with none known): a change in the same clock tick would leave that
+        /// time unmoved, so the listing is never reused (git's racy-clean rule).
+        racy: bool,
+        entries: Vec<BrowserEntry>,
+    }
+
+    const LISTING_TTL: std::time::Duration = std::time::Duration::from_secs(1);
+    /// File times come from a coarse clock (a few ms on Linux).
+    const RACY_WINDOW: std::time::Duration = std::time::Duration::from_millis(100);
 
     impl FileModelStore {
         pub fn new() -> Self {
@@ -1357,6 +1800,8 @@ mod native_model {
                 notices: RefCell::new(Vec::new()),
                 plm: RefCell::new(plm),
                 plm_source: Cell::new(crate::plm::config::Source::File),
+                listing: RefCell::new(None),
+                names: RefCell::new(None),
             }
         }
 
@@ -1376,6 +1821,8 @@ mod native_model {
                 notices: RefCell::new(Vec::new()),
                 plm: RefCell::new(None),
                 plm_source: Cell::new(crate::plm::config::Source::File),
+                listing: RefCell::new(None),
+                names: RefCell::new(None),
             }
         }
 
@@ -1396,6 +1843,8 @@ mod native_model {
                 notices: RefCell::new(Vec::new()),
                 plm: RefCell::new(plm),
                 plm_source: Cell::new(crate::plm::config::Source::File),
+                listing: RefCell::new(None),
+                names: RefCell::new(None),
             }
         }
 
@@ -1448,21 +1897,36 @@ mod native_model {
         }
 
         fn resolve_in(app_dir: &Path, dir: &Path, name: &str) -> PathBuf {
-            match name {
-                SETTINGS_KEY => return app_dir.join("settings.json"),
-                FEATURE_PALETTE_DISPLAY_KEY => return app_dir.join("feature_palette_display.json"),
-                DOCK_LAYOUT_KEY => return app_dir.join("dock_layout.json"),
-                PINNED_KEY => return app_dir.join("pinned.json"),
-                RECOVERY_KEY => return app_dir.join("recovery.json"),
-                KICAD_LIBRARY_KEY => return app_dir.join("kicad_library.json"),
-                crate::panels::cam_library::CAM_TOOL_LIBRARY_KEY => return app_dir.join("cam_tools.json"),
-                super::RECENT_DOCUMENTS_KEY => return app_dir.join("recent_documents.json"),
-                super::RECENT_THUMBNAILS_KEY => return app_dir.join("recent_thumbnails.json"),
-                PLM_IMPORT_KEY => return app_dir.join("plm_import.json"),
-                super::PLUGINS_KEY => return app_dir.join("plugins.json"),
-                super::JAVASCRIPT_DRAFT_KEY => return app_dir.join("javascript_draft.js"),
-                _ => {}
+            if let Some(path) = Self::reserved_path(app_dir, name) {
+                return path;
             }
+            Self::document_path(dir, name)
+        }
+
+        /// The file a RESERVED application name (`@settings`, `@dock_layout`,
+        /// `@recovery`, ...) lives in, or `None` for a document name. These
+        /// are the writes that go through the write-behind lane
+        /// ([`write_behind`]): the UI's own state, never a user's Save.
+        fn reserved_path(app_dir: &Path, name: &str) -> Option<PathBuf> {
+            let file = match name {
+                SETTINGS_KEY => "settings.json",
+                FEATURE_PALETTE_DISPLAY_KEY => "feature_palette_display.json",
+                DOCK_LAYOUT_KEY => "dock_layout.json",
+                PINNED_KEY => "pinned.json",
+                RECOVERY_KEY => "recovery.json",
+                KICAD_LIBRARY_KEY => "kicad_library.json",
+                crate::panels::cam_library::CAM_TOOL_LIBRARY_KEY => "cam_tools.json",
+                super::RECENT_DOCUMENTS_KEY => "recent_documents.json",
+                super::RECENT_THUMBNAILS_KEY => "recent_thumbnails.json",
+                PLM_IMPORT_KEY => "plm_import.json",
+                super::PLUGINS_KEY => "plugins.json",
+                super::JAVASCRIPT_DRAFT_KEY => "javascript_draft.js",
+                _ => return None,
+            };
+            Some(app_dir.join(file))
+        }
+
+        fn document_path(dir: &Path, name: &str) -> PathBuf {
             if name.contains('/') || name.contains('\\') {
                 return PathBuf::from(name);
             }
@@ -1521,10 +1985,32 @@ mod native_model {
             Some(self)
         }
 
-        // Writes are synchronous here, so nothing fails after `write` returned;
-        // the only thing this lane ever carries is a boot notice.
+        // Documents are written synchronously, so a Save's failure is its
+        // `Err`. The reserved application files go through the write-behind
+        // lane, whose failures arrive here after `write` returned; so does the
+        // boot notice.
         fn take_persistence_errors(&self) -> Vec<String> {
-            std::mem::take(&mut *self.notices.borrow_mut())
+            let mut errors = std::mem::take(&mut *self.notices.borrow_mut());
+            errors.extend(write_behind::take_errors(&self.app_dir));
+            errors
+        }
+
+        /// The reserved application files under this store's root still being
+        /// written (the close path waits on this before quitting).
+        fn pending_writes(&self) -> usize {
+            write_behind::count(&self.app_dir)
+        }
+
+        /// Only the application's own files are written behind here.
+        fn pending_saves(&self) -> usize {
+            0
+        }
+
+        /// Settle never waits on a state file's fsync: documents are
+        /// written before `write` returns, and the state files are read
+        /// through the lane, pending values first.
+        fn pending_writes_except(&self, _names: &[&str]) -> usize {
+            0
         }
 
         fn plm_session(&self) -> Option<crate::plm::connection::Session> {
@@ -1556,6 +2042,17 @@ mod native_model {
         }
 
         fn list(&self) -> Vec<String> {
+            let dir_modified = std::fs::metadata(&self.dir).and_then(|meta| meta.modified()).ok();
+            let generation = self.mutations.get();
+            if let Some(cached) = self.names.borrow().as_ref() {
+                if !cached.racy
+                    && cached.dir_modified == dir_modified
+                    && cached.generation == generation
+                    && cached.taken.elapsed() < LISTING_TTL
+                {
+                    return cached.names.clone();
+                }
+            }
             let mut names: Vec<String> = std::fs::read_dir(&self.dir)
                 .into_iter()
                 .flatten()
@@ -1568,19 +2065,40 @@ mod native_model {
                 })
                 .collect();
             names.sort();
+            *self.names.borrow_mut() = Some(Names {
+                racy: dir_modified.is_none_or(|modified| {
+                    std::time::SystemTime::now().duration_since(modified).map_or(true, |age| age < RACY_WINDOW)
+                }),
+                dir_modified,
+                generation,
+                taken: std::time::Instant::now(),
+                names: names.clone(),
+            });
             names
         }
 
         fn read(&self, name: &str) -> Option<String> {
+            if let Some(path) = Self::reserved_path(&self.app_dir, name) {
+                return write_behind::read(&path);
+            }
             std::fs::read_to_string(self.resolve(name)).ok()
         }
 
         // A stat, not a read: an assembly's Save asks this of every part it places.
         fn residency(&self, name: &str) -> Residency {
-            if self.resolve(name).is_file() { Residency::Resident } else { Residency::Absent }
+            let path = self.resolve(name);
+            let present = write_behind::pending_put(&path).unwrap_or_else(|| path.is_file());
+            if present { Residency::Resident } else { Residency::Absent }
         }
 
         fn write(&self, name: &str, contents: &str) -> Result<(), String> {
+            // The UI's own state (settings, layout, recovery, recents) is
+            // written behind: the frame never waits on its fsync.
+            if let Some(path) = Self::reserved_path(&self.app_dir, name) {
+                write_behind::put(path, contents);
+                self.bump();
+                return Ok(());
+            }
             let path = self.resolve(name);
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent).map_err(|e| format!("create models dir: {e}"))?;
@@ -1595,6 +2113,14 @@ mod native_model {
         }
 
         fn remove(&self, name: &str) -> Result<(), String> {
+            if let Some(path) = Self::reserved_path(&self.app_dir, name) {
+                // A delete that finds nothing changes nothing (see below).
+                if write_behind::pending_put(&path).unwrap_or_else(|| path.is_file()) {
+                    write_behind::remove(path);
+                    self.bump();
+                }
+                return Ok(());
+            }
             match std::fs::remove_file(self.resolve(name)) {
                 // A delete that found nothing changed nothing, so it does not
                 // count: the generation tracks CONTENT, not calls.
@@ -1623,7 +2149,21 @@ mod native_model {
         }
 
         fn browser_entries(&self, extensions: &[&str]) -> Vec<BrowserEntry> {
-            let mut entries: Vec<BrowserEntry> = std::fs::read_dir(&*self.browser_dir.borrow())
+            let dir = self.browser_dir.borrow().clone();
+            let dir_modified = std::fs::metadata(&dir).and_then(|meta| meta.modified()).ok();
+            let generation = self.mutations.get();
+            if let Some(listing) = self.listing.borrow().as_ref() {
+                if !listing.racy
+                    && listing.dir == dir
+                    && listing.extensions.iter().map(String::as_str).eq(extensions.iter().copied())
+                    && listing.dir_modified == dir_modified
+                    && listing.generation == generation
+                    && listing.taken.elapsed() < LISTING_TTL
+                {
+                    return listing.entries.clone();
+                }
+            }
+            let mut entries: Vec<BrowserEntry> = std::fs::read_dir(&dir)
                 .into_iter()
                 .flatten()
                 .flatten()
@@ -1653,6 +2193,17 @@ mod native_model {
                 b.is_dir
                     .cmp(&a.is_dir)
                     .then_with(|| a.name.to_ascii_lowercase().cmp(&b.name.to_ascii_lowercase()))
+            });
+            *self.listing.borrow_mut() = Some(Listing {
+                dir,
+                extensions: extensions.iter().map(|extension| extension.to_string()).collect(),
+                racy: dir_modified.is_none_or(|modified| {
+                    std::time::SystemTime::now().duration_since(modified).map_or(true, |age| age < RACY_WINDOW)
+                }),
+                dir_modified,
+                generation,
+                taken: std::time::Instant::now(),
+                entries: entries.clone(),
             });
             entries
         }

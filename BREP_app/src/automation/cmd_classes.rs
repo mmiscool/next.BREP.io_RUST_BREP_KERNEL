@@ -136,7 +136,7 @@ fn plm_generate(key: String, answer: impl Fn(&family_table::GenerateReport, u64)
     Ok(Outcome::Poll(Box::new(move |ctx: &mut Ctx<'_>| {
         let (file, docs, store) = ctx.app.file_docs_store();
         if !started {
-            if store.pending_writes() > 0 {
+            if store.pending_saves() > 0 {
                 return (web_time::Instant::now() > saved_by).then(|| Err("the family's save did not reach the server within 60 s".into()));
             }
             if let Some(error) = store.take_persistence_errors().into_iter().next() {

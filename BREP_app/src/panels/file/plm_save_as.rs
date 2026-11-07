@@ -107,6 +107,12 @@ impl SaveAs {
             "stripsFamilyStamp": self.strip_stamp,
         })
     }
+
+    /// The copy is still on its way to the PLM: this dialog polls its own
+    /// future, so nothing on the native executor shows it.
+    pub(super) fn saving(&self) -> bool {
+        self.saving.is_some()
+    }
 }
 
 /// Save the captured session copy, retaining checkout for subsequent Save.

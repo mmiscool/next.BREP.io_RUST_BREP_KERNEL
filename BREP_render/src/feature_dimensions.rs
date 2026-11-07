@@ -166,9 +166,10 @@ pub struct ResolvedRefs {
     /// Plane (`P`): the resolved plane frame's unit NORMAL (its z-axis) — the axis
     /// the signed offset dim runs along.
     pub plane_normal: Option<[f64; 3]>,
-    /// Plane (`P`): a small world length for the offset dim's handle stub when the
-    /// offset is ~0 (a zero-length leader can't be dragged). Screen-constant so the
-    /// handle is a consistent size; ignored once the offset is non-zero.
+    /// Plane (`P`) and Extrude (`E`): a small world length for a linear dim's
+    /// handle stub when its value is ~0 (a zero-length leader can't be dragged).
+    /// Screen-constant so the handle is a consistent size; ignored once the value
+    /// is non-zero.
     pub plane_dim_length: Option<f64>,
 }
 
@@ -326,15 +327,21 @@ fn build_extrude(params: &Value, resolved: &ResolvedRefs) -> Vec<FeatureDimAnnot
     let normal = normalize_or(normal, [0.0, 0.0, 1.0]);
     let distance = resolve_number(params, "distance");
     let back = resolve_number(params, "distanceBack");
+    // A leg at ~0 (a one-sided extrude's other side) would collapse to a
+    // zero-length leader, which the drag ignores: its arrow could not be pulled
+    // out. Give it the Plane dim's screen-constant stub along its own direction
+    // instead; the value (and its label) stays 0 and the drag maps 1:1 there.
+    let leg = |value: f64| if value.abs() > 1e-6 { value } else { resolved.plane_dim_length.unwrap_or(0.0) };
+    let (forward_len, back_len) = (leg(distance), leg(back));
     let forward = [
-        center[0] + normal[0] * distance,
-        center[1] + normal[1] * distance,
-        center[2] + normal[2] * distance,
+        center[0] + normal[0] * forward_len,
+        center[1] + normal[1] * forward_len,
+        center[2] + normal[2] * forward_len,
     ];
     let backward = [
-        center[0] - normal[0] * back,
-        center[1] - normal[1] * back,
-        center[2] - normal[2] * back,
+        center[0] - normal[0] * back_len,
+        center[1] - normal[1] * back_len,
+        center[2] - normal[2] * back_len,
     ];
     vec![
         FeatureDimAnnotation::linear("distance", center, forward, distance, "D"),

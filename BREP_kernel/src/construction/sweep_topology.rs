@@ -43,7 +43,8 @@ pub use sweep::{
     sweep_profile_along_chain, sweep_profile_along_chain_reported,
     sweep_profile_along_chain_with_stations, sweep_profile_along_chain_with_stations_reported,
     sweep_profile_along_path, sweep_profile_along_path_anchored,
-    sweep_profile_helix, sweep_profile_twisted, sweep_profile_twisted_anchored, BendStation,
+    sweep_profile_helix, sweep_profile_twisted, sweep_profile_twisted_anchored,
+    sweep_profile_twisted_scaled, BendStation,
     ProfileAnchor, SectionPlacement, SweepClosure, SweptChain, SWEEP_TIGHT_BEND_REFUSAL,
 };
 pub use stations::{

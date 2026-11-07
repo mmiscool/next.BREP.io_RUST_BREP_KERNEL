@@ -22,6 +22,9 @@ pub fn tessellate_brep_watertight(solid: &BrepSolid, chord_tolerance: f64) -> Re
     // no odd-use edges) only makes sense on the complete mesh.
     let profile = crate::watertight_tessellation::profile::begin();
     let mut mesh = tessellate_brep_watertight_face_stride(solid, chord_tolerance, 1, 0)?;
+    if pinch_cusp_enabled() {
+        drop_coincident_face_triangles(&mut mesh);
+    }
     // Final orientation pass over the COMPLETE mesh: make every shared edge
     // coherent and match each component to its source shell's material-side
     // orientation. Faces are emitted
@@ -37,6 +40,63 @@ pub fn tessellate_brep_watertight(solid: &BrepSolid, chord_tolerance: f64) -> Re
     drop(validation_timer);
     crate::watertight_tessellation::profile::end(profile, chord_tolerance, mesh.indices.len() / 3);
     Ok(mesh)
+}
+
+/// PINCH (`BREP_TESS_PINCH_CUSP`): drop every pair of triangles that two DIFFERENT
+/// faces emitted on the same three positions. At a pinch (brep-bench viviani-cut: a
+/// ball bored by a cylinder tangent inside it) two faces bound a sliver whose
+/// thickness falls off quadratically into the node; each face clips its corner ear
+/// (node, a, b) from the same three shared edge samples, so the mesh holds that
+/// triangle twice and the chord a-b four times. The pair is a zero-thickness slab:
+/// removing both copies removes two uses of each of its three edges, one in each
+/// direction for a coherent pair, so every other edge keeps its uses and the chord
+/// a-b is left once each way between the two faces' next triangles. Positions are
+/// compared by their bits, which is what the shared edge samples guarantee.
+pub(super) fn drop_coincident_face_triangles(mesh: &mut Mesh) {
+    let key = |i: u32| {
+        let i = 3 * i as usize;
+        [mesh.positions[i].to_bits(), mesh.positions[i + 1].to_bits(), mesh.positions[i + 2].to_bits()]
+    };
+    let mut seen: FxHashMap<[[u64; 3]; 3], Vec<usize>> = FxHashMap::default();
+    let triangles = mesh.indices.len() / 3;
+    for t in 0..triangles {
+        let mut corners = [key(mesh.indices[3 * t]), key(mesh.indices[3 * t + 1]), key(mesh.indices[3 * t + 2])];
+        corners.sort_unstable();
+        if corners[0] == corners[1] || corners[1] == corners[2] {
+            continue;
+        }
+        seen.entry(corners).or_default().push(t);
+    }
+    let mut drop = vec![false; triangles];
+    let mut any = false;
+    for owners in seen.values().filter(|owners| owners.len() >= 2) {
+        // Pair copies across faces; a copy left without a partner from another
+        // face stays.
+        let mut open: Vec<usize> = Vec::new();
+        for &t in owners {
+            if let Some(slot) = open.iter().position(|&other| mesh.face_ids[other] != mesh.face_ids[t]) {
+                let other = open.swap_remove(slot);
+                drop[other] = true;
+                drop[t] = true;
+                any = true;
+            } else {
+                open.push(t);
+            }
+        }
+    }
+    if !any {
+        return;
+    }
+    let mut indices = Vec::with_capacity(mesh.indices.len());
+    let mut face_ids = Vec::with_capacity(mesh.face_ids.len());
+    for t in 0..triangles {
+        if !drop[t] {
+            indices.extend_from_slice(&mesh.indices[3 * t..3 * t + 3]);
+            face_ids.push(mesh.face_ids[t]);
+        }
+    }
+    mesh.indices = indices;
+    mesh.face_ids = face_ids;
 }
 
 /// Geometric normal of triangle `t` in its CURRENT winding (`(b-a)×(c-a)`),

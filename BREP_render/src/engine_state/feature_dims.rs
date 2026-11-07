@@ -358,6 +358,8 @@ impl EngineState {
                     refs.profile_center = Some(center);
                     refs.profile_normal = Some(normal);
                 }
+                // Screen-constant handle stub for a leg at 0 (~48 px), as for "P".
+                refs.plane_dim_length = Some(self.camera.world_per_pixel() * 48.0);
             }
             "R" => {
                 if let Some((center, normal)) = self.lookup_profile_plane(params.get("profile")) {
@@ -605,14 +607,24 @@ impl EngineState {
     }
 
     /// Finalize a dimension drag with a fresh run of the committed parameters.
-    /// Abandon background preview work first so releasing the arrow does not wait
-    /// behind an expensive intermediate value. The final run forces this feature
-    /// and its consumers to rebuild, rather than replaying the cached handle.
+    /// The final run forces this feature and its consumers to rebuild, rather
+    /// than replaying the cached handle.
+    ///
+    /// It does NOT cancel the preview still in flight. Both background runners
+    /// already keep one run in flight and coalesce the rest to the newest (the
+    /// browser worker parks it, latest wins; the native thread skips a Run
+    /// followed by another), so at most one intermediate of this same feature,
+    /// at a nearby value, finishes ahead of the final run, on a warm cache.
+    /// Cancelling instead terminated the browser worker on nearly every release
+    /// (a preview is almost always pending when the finger lifts): the final
+    /// value then waited for a new worker to instantiate the wasm module,
+    /// receive the parts library and rebuild the WHOLE history cold, which on a
+    /// phone took long enough that users re-opened the feature to see it.
+    /// User-invoked cancel (`cancel_run`) remains the way out of a slow run.
     pub fn feature_dimension_release(&mut self, feature_id: &str) {
         if self.history.index_of(feature_id).is_none() {
             return;
         }
-        self.cancel_run_with_notice(false);
         self.rerun_history_forcing(Some(feature_id));
     }
 

@@ -1,11 +1,22 @@
 //! Bounded durable execution evidence. Admission is synced before returning.
 //! This primitive does not launch workers or automatically replay mutations.
+//!
+//! Durability per frame: an admission and a terminal outcome are synced
+//! before their call returns. A host call's intent ([`Journal::start_call`])
+//! is synced before dispatch, by the caller, through the [`IntentSync`] it is
+//! handed, so the sync runs after the caller has released whatever lock
+//! guards the journal. A host call's completion is an observation and is not
+//! synced on its own: it reaches the disk with the next synced frame (the
+//! next intent or the outcome). Lost to a power cut, it reads back as an
+//! unacknowledged call, the conservative answer. One sync per host call, not
+//! two.
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap};
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::Path;
+use std::sync::Arc;
 
 const MAX_RECORD: usize = 1 << 20;
 const MAX_BYTES: u64 = 128 << 20;
@@ -89,6 +100,9 @@ struct Frame {
 
 pub struct Journal {
     file: File, // the exclusive OS lock lives as long as this file
+    /// A second handle on the same file, for syncs made outside the lock
+    /// that guards this journal ([`IntentSync`]).
+    syncer: Arc<File>,
     bytes: u64,
     poisoned: bool,
     records: HashMap<String, Record>,
@@ -123,7 +137,8 @@ impl Journal {
         File::open(directory).and_then(|f| f.sync_all()).map_err(|e| e.to_string())?;
         let bytes = file.metadata().map_err(|e| e.to_string())?.len();
         if bytes > MAX_BYTES { return Err("execution journal exceeds its storage budget".into()); }
-        let mut journal = Self { file, bytes, poisoned: false, records: HashMap::new(), bindings: HashMap::new() };
+        let syncer = Arc::new(file.try_clone().map_err(|e| e.to_string())?);
+        let mut journal = Self { file, syncer, bytes, poisoned: false, records: HashMap::new(), bindings: HashMap::new() };
         let mut reader = BufReader::new(journal.file.try_clone().map_err(|e| e.to_string())?);
         reader.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
         loop {
@@ -166,21 +181,33 @@ impl Journal {
     }
 
     pub fn admit(&mut self, admission: Admission) -> Result<(), String> {
-        self.append(Entry::Admit { admission })
+        self.append(Entry::Admit { admission }, Durability::Synced)
     }
 
     pub fn finish(&mut self, execution_id: &str, outcome: Value) -> Result<(), String> {
-        self.append(Entry::Finish { execution_id: execution_id.into(), outcome })
+        self.append(Entry::Finish { execution_id: execution_id.into(), outcome }, Durability::Synced)
     }
 
-    /// Sync intent before dispatch; rejection means the caller must not dispatch.
-    pub fn start_call(&mut self, execution_id: &str, call_id: u64, method: &str) -> Result<(), String> {
-        self.append(Entry::CallStarted { execution_id: execution_id.into(), call_id, method: method.into() })
+    /// Record intent before dispatch; rejection means the caller must not
+    /// dispatch. The frame is written, not yet synced: the caller syncs it
+    /// with the returned [`IntentSync`] (outside its lock) and must not
+    /// dispatch unless that succeeds, and [`Self::poison`] the journal if it
+    /// fails.
+    pub fn start_call(&mut self, execution_id: &str, call_id: u64, method: &str) -> Result<IntentSync, String> {
+        self.append(Entry::CallStarted { execution_id: execution_id.into(), call_id, method: method.into() }, Durability::Caller)?;
+        Ok(IntentSync(self.syncer.clone()))
     }
 
-    /// A reply is an observation, not proof of downstream transaction completion.
+    /// A reply is an observation, not proof of downstream transaction
+    /// completion. Written, not synced: the next synced frame carries it.
     pub fn finish_call(&mut self, execution_id: &str, call_id: u64, completion: CallCompletion) -> Result<(), String> {
-        self.append(Entry::CallFinished { execution_id: execution_id.into(), call_id, completion })
+        self.append(Entry::CallFinished { execution_id: execution_id.into(), call_id, completion }, Durability::Deferred)
+    }
+
+    /// A sync made through an [`IntentSync`] failed: what reached the disk is
+    /// unknown, so no further frame is accepted.
+    pub fn poison(&mut self) {
+        self.poisoned = true;
     }
 
     fn validate(&self, entry: &Entry) -> Result<(), String> {
@@ -228,7 +255,7 @@ impl Journal {
         Ok(())
     }
 
-    fn append(&mut self, entry: Entry) -> Result<(), String> {
+    fn append(&mut self, entry: Entry, durability: Durability) -> Result<(), String> {
         if self.poisoned { return Err("execution journal unavailable after a write failure; reconciliation required".into()); }
         self.validate(&entry)?;
         let payload = serde_json::to_value(&entry).map_err(|e| e.to_string())?;
@@ -252,7 +279,13 @@ impl Journal {
         if self.bytes + bytes.len() as u64 + unfinished * MAX_RECORD as u64 + pending * CALL_COMPLETION_RESERVE > MAX_BYTES {
             return Err("execution journal has no unreserved outcome capacity".into());
         }
-        if let Err(e) = self.file.write_all(&bytes).and_then(|()| self.file.sync_all()) {
+        // `sync_data`: an append moves the length, which it syncs; the
+        // timestamps it skips are not evidence.
+        let written = self.file.write_all(&bytes).and_then(|()| match durability {
+            Durability::Synced => self.file.sync_data(),
+            Durability::Caller | Durability::Deferred => Ok(()),
+        });
+        if let Err(e) = written {
             self.poisoned = true;
             return Err(format!("execution journal write failed; reconciliation required: {e}"));
         }
@@ -275,6 +308,31 @@ impl Journal {
             }
             Entry::Finish { execution_id, outcome } => self.records.get_mut(&execution_id).unwrap().outcome = Some(outcome),
         }
+    }
+}
+
+/// When an appended frame reaches stable storage.
+#[derive(Clone, Copy)]
+enum Durability {
+    /// Before `append` returns (admission, terminal outcome).
+    Synced,
+    /// By the caller, through an [`IntentSync`] (host-call intent).
+    Caller,
+    /// With the next synced frame (host-call completion).
+    Deferred,
+}
+
+/// The sync a host call's intent still owes before the call may dispatch.
+/// It holds its own handle on the journal file, so it is made after the
+/// caller has released the lock that guards the journal: one call's disk
+/// wait does not hold up another execution, or a status read.
+#[must_use = "the intent is not durable until it is synced; do not dispatch without it"]
+pub struct IntentSync(Arc<File>);
+
+impl IntentSync {
+    /// Make the intent (and every completion written before it) durable.
+    pub fn sync(self) -> Result<(), String> {
+        self.0.sync_data().map_err(|e| format!("execution journal write failed; reconciliation required: {e}"))
     }
 }
 

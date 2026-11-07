@@ -470,6 +470,108 @@ pub(super) fn split_vertices_shared_across_shells(
     added
 }
 
+/// `BREP_PINCH_VERTEX_FANS` (default on; `=0` restores the genus refusal on a
+/// pinched shell): see [`split_pinched_vertices_by_fan`]. Promoted once the
+/// watertight tessellation meshes a pinch edge-manifold (mesher
+/// `BREP_TESS_PINCH_CUSP`): viviani-cut reads its closed form and its mesh closes.
+pub(super) fn pinch_vertex_fans_enabled() -> bool {
+    switch!("BREP_PINCH_VERTEX_FANS", true)
+}
+
+/// A vertex where ONE shell touches itself (the ball bored by Viviani's
+/// cylinder: two slivers meeting at the tangent node) carries two or more
+/// separate fans of faces: walking corner to corner around it never gets from
+/// one to the other. Counted once, it knocks the Euler characteristic off by
+/// one per extra fan and the genus reads non-integral. Each fan past the first
+/// gets its own copy of the vertex, as two shells touching at a point get one
+/// each ([`split_vertices_shared_across_shells`]), so the count reads the
+/// surface the solid has. A fan is a class of edge ends at the vertex, joined
+/// by each face corner there (the end of one coedge and the start of the next)
+/// and by a degenerate edge's two ends. Returns the copies added.
+pub(super) fn split_pinched_vertices_by_fan(
+    vertices: &mut Vec<VertexRecord>,
+    edges: &mut [EdgeRecord],
+    shells: &[ShellRecord],
+    next_vertex_id: &mut u64,
+) -> usize {
+    let index_of: HashMap<u64, usize> = edges.iter().enumerate().map(|(index, edge)| (edge.id, index)).collect();
+    // An edge end: (edge index, true for its start).
+    type End = (usize, bool);
+    let vertex_of = |edges: &[EdgeRecord], end: End| if end.1 { edges[end.0].start_vertex_id } else { edges[end.0].end_vertex_id };
+    let mut parent: HashMap<End, End> = HashMap::default();
+    fn find(parent: &mut HashMap<End, End>, end: End) -> End {
+        let mut root = end;
+        while let Some(&next) = parent.get(&root) {
+            if next == root {
+                break;
+            }
+            root = next;
+        }
+        parent.insert(end, root);
+        root
+    }
+    let mut union = |parent: &mut HashMap<End, End>, a: End, b: End| {
+        let (ra, rb) = (find(parent, a), find(parent, b));
+        if ra != rb {
+            parent.insert(ra.max(rb), ra.min(rb));
+        }
+    };
+    for (index, edge) in edges.iter().enumerate() {
+        parent.entry((index, true)).or_insert((index, true));
+        parent.entry((index, false)).or_insert((index, false));
+        if edge.degenerate {
+            union(&mut parent, (index, true), (index, false));
+        }
+    }
+    for loop_record in shells.iter().flat_map(|shell| &shell.faces).flat_map(|face| &face.loops) {
+        let count = loop_record.coedges.len();
+        for at in 0..count {
+            let (here, next) = (&loop_record.coedges[at], &loop_record.coedges[(at + 1) % count]);
+            let (Some(&a), Some(&b)) = (index_of.get(&here.edge_id), index_of.get(&next.edge_id)) else {
+                continue;
+            };
+            // The coedge's end, then the next coedge's start.
+            let end_of_here: End = (a, !here.forward);
+            let start_of_next: End = (b, next.forward);
+            if vertex_of(edges, end_of_here) == vertex_of(edges, start_of_next) {
+                union(&mut parent, end_of_here, start_of_next);
+            }
+        }
+    }
+    // vertex → its fans (root → the ends in it), in a stable order.
+    let mut fans: std::collections::BTreeMap<u64, std::collections::BTreeMap<End, Vec<End>>> = Default::default();
+    for index in 0..edges.len() {
+        for start in [true, false] {
+            let end = (index, start);
+            let root = find(&mut parent, end);
+            fans.entry(vertex_of(edges, end)).or_default().entry(root).or_default().push(end);
+        }
+    }
+    let mut added = 0usize;
+    for (vertex_id, groups) in fans {
+        if groups.len() < 2 {
+            continue;
+        }
+        let Some(point) = vertices.iter().find(|vertex| vertex.id == vertex_id).map(|vertex| vertex.point) else {
+            continue;
+        };
+        for (_, ends) in groups.into_iter().skip(1) {
+            let copy = *next_vertex_id;
+            *next_vertex_id += 1;
+            vertices.push(VertexRecord { id: copy, point });
+            for (index, start) in ends {
+                if start {
+                    edges[index].start_vertex_id = copy;
+                } else {
+                    edges[index].end_vertex_id = copy;
+                }
+            }
+            added += 1;
+        }
+    }
+    added
+}
+
 /// Re-point every edge endpoint from `loser` to `survivor`, clamp curve
 /// domain-end endpoints that drifted (by less than `band`) onto the surviving
 /// vertex, and drop the losing vertex record.  Shared by the tangency

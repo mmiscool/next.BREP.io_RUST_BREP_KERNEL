@@ -143,6 +143,16 @@ fn edge_fractions_with_guard(
             fractions = thinned;
         }
     }
+    // HOOK (`BREP_TESS_PINCH_CUSP`): a span whose chord is shorter than a
+    // micron-relative floor is not split. An edge cut at a tangent touch can carry
+    // a hook a few 1e-8 long at its end (brep-bench midsphere-common: the curve
+    // runs 2.3e-8 back from its vertex and turns): its tangent flips there, the
+    // angular test bisects into the turn until `MAX_EDGE_SPANS` stops it, and the
+    // 500 samples left within 1e-8 of the vertex weld together in f32 and make
+    // every sphere chart refuse its constraints. Both the chord and the midpoint
+    // must be under the floor, so a span is left whole only where the curve under
+    // it is that small.
+    let hook_floor = pinch_cusp_enabled();
     loop {
         let mut refined = Vec::with_capacity(fractions.len() * 2);
         let mut split_any = false;
@@ -153,6 +163,14 @@ fn edge_fractions_with_guard(
                 let curve_mid = evaluate(middle)?;
                 let a = evaluate(pair[0])?;
                 let b = evaluate(pair[1])?;
+                // The midpoint is measured too: a closed edge's first span has a
+                // zero chord and a whole curve under it.
+                if hook_floor
+                    && b.sub(a).length().max(curve_mid.sub(a).length())
+                        < 1e-6 * (1.0 + a.length().max(b.length()))
+                {
+                    continue;
+                }
                 let mut chord_sags = deflection_to_chord(curve_mid, a, b) > chord_tolerance;
                 // Angular (curvature) criterion: split when the edge's 3D-curve
                 // unit tangent rotates more than `EDGE_ANGULAR_TOL` across the
@@ -263,6 +281,17 @@ fn chart_crossing_fractions(
                     continue;
                 }
                 if low_value.abs().max(high_value.abs()) <= significant {
+                    continue;
+                }
+                // TOUCH (`BREP_TESS_PINCH_CUSP`): a bracket whose end sample already
+                // lies on the plane is not a crossing beside it. A curve TANGENT to
+                // the plane there (a cube face's inscribed circle at the edge
+                // midpoint the ball touches: |x| - |y| ~ -s^2) reads rounding noise
+                // of either sign at that sample, and bisecting the noise put a
+                // "crossing" 1e-8 along the curve, 1e-7 from the vertex: a sliver
+                // span every sphere chart refused. The sample itself is the
+                // boundary point, as `arc_chart_crossings` reads it.
+                if pinch_cusp_enabled() && low_value.abs().min(high_value.abs()) <= significant {
                     continue;
                 }
                 // 60 bisections exhaust the f64 mantissa over any bracket.

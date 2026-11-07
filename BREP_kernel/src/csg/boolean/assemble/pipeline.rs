@@ -524,6 +524,23 @@ fn assemble_fragments_impl(
             }
         }
     }
+    if (numerator < 0 || numerator % 2 != 0) && super::refusal_welds::pinch_vertex_fans_enabled() {
+        // PINCH VERTICES: a shell that touches itself at a point counts that
+        // point once per fan (`split_pinched_vertices_by_fan`).
+        let split = super::refusal_welds::split_pinched_vertices_by_fan(
+            &mut assembler.vertices,
+            &mut assembler.edges,
+            &shells,
+            &mut assembler.next_vertex_id,
+        );
+        if split > 0 {
+            let euler = assembler.vertices.len() as i64 - edge_count + face_count - hole_count;
+            numerator = shells.len() as i64 * 2 - euler;
+            if std::env::var("BREP_DEBUG_BOOL").is_ok() {
+                eprintln!("boolean assembly split {split} pinch vertex fan(s) (numerator now {numerator})");
+            }
+        }
+    }
     if numerator < 0 || numerator % 2 != 0 {
         // Roadmap T4.4: before REFUSING a closed assembly whose one-use edges
         // (open boundaries from intersection-endpoint drift) knock the genus
@@ -1034,7 +1051,16 @@ fn assemble_fragments_impl(
                     genus: 0,
                     kind: crate::BodyKind::Solid,
                 };
-                Some(solid_signed_volume_for_sign(&subset, bar).or_refuse(KernelStage::Sew, "solid_signed_volume")?)
+                let subset_volume = solid_signed_volume_for_sign(&subset, bar).or_refuse(KernelStage::Sew, "solid_signed_volume")?;
+                // VOID SHELLS (`BREP_SIGN_CHECK_VOID_SHELLS`): when every touched
+                // shell bounds a void (a post grown up into a hollow dome's cavity
+                // touches only the cavity), the subset reads negative by design;
+                // the sign that matters is the whole solid's.
+                if subset_volume <= bar && sign_check_void_shells_enabled() {
+                    Some(solid_signed_volume_for_sign(&solid, bar).or_refuse(KernelStage::Sew, "solid_signed_volume")?)
+                } else {
+                    Some(subset_volume)
+                }
             }
         }
         None => Some(solid_signed_volume_for_sign(&solid, bar).or_refuse(KernelStage::Sew, "solid_signed_volume")?),
@@ -1053,6 +1079,13 @@ fn assemble_fragments_impl(
         ));
     }
     Ok((solid, scope))
+}
+
+/// `BREP_SIGN_CHECK_VOID_SHELLS` (default on; `=0` restores reading the touched
+/// shells alone): the assembly's sign check reads the whole solid when its
+/// touched shells alone read non-positive, as a set of void shells does.
+fn sign_check_void_shells_enabled() -> bool {
+    switch!("BREP_SIGN_CHECK_VOID_SHELLS", true)
 }
 
 /// `BREP_FRAGMENT_CANONICAL_ORDER` (lane X, fillet-bore-notch): the assembler

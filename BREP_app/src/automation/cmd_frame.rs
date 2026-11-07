@@ -82,7 +82,12 @@ fn frame_info_except(ctx: &Ctx<'_>, others: &[&str]) -> FrameInfo {
         topology: engine.topology_pending(),
         projection: engine.sheet_lines_pending() || ctx.app.instructions_pdf_pending(),
         store_writes: ctx.app.model_store().pending_writes_except(others) > 0 || store_mirror_in_flight(),
-        plm_requests: plm_requests_in_flight(others) || ctx.app.plm.busy() || ctx.app.toolbar.inbox().busy(),
+        plm_requests: plm_requests_in_flight(others)
+            || plm_connect_in_flight(ctx)
+            // Counted whichever document it saves: waiting on it longer is safe,
+            // returning mid-save reads `saving: true` (plm-member-edit).
+            || ctx.app.plm_save_as_pending()
+            || ctx.app.plm.busy() || ctx.app.toolbar.inbox().busy(),
     };
     let idle = !(pending.run
         || pending.queries
@@ -117,6 +122,20 @@ fn frame_info_except(ctx: &Ctx<'_>, others: &[&str]) -> FrameInfo {
 /// `@recovery`'s background mirror (the PLM backend) is still sending.
 fn store_mirror_in_flight() -> bool {
     crate::plm::backend::mirror_in_flight()
+}
+
+/// The PLM tab's Connect now is on its way: from the click until the frame
+/// has switched stores (or said why not), which outlasts its executor task.
+fn plm_connect_in_flight(ctx: &Ctx<'_>) -> bool {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        ctx.app.reconnecting()
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = ctx;
+        false
+    }
 }
 
 /// Anything unfinished on the native PLM executor that is not the work of

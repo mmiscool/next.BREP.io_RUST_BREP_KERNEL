@@ -148,6 +148,12 @@ fn forced_direct_refusal() -> Option<KernelRefusal> {
     None
 }
 
+/// `BREP_OFFSET_EVERY_SKIN_PIECE` (default on; `=0` keeps the seed's one
+/// piece): see EVERY SKIN PIECE in the offset selection.
+fn every_skin_piece_enabled() -> bool {
+    crate::switch!("BREP_OFFSET_EVERY_SKIN_PIECE", true)
+}
+
 pub fn offset_shell(
     source: &BrepSolid,
     opening_face_ids: &[u64],
@@ -451,6 +457,8 @@ pub(super) fn cause_in_front(
 fn refusal_names_its_cause(error: &str) -> bool {
     [
         " coincide near ",
+        " touch tangentially near ",
+        "is sealed off from the opening",
         "cannot tell whether",
         "omitting the shadowed offsets of source faces",
         "no retained face keeps any offset skin",
@@ -1830,7 +1838,7 @@ fn offset_shell_impl(
             let end = piece.curve.evaluate(piece.t1);
             if let (Ok(start), Ok(mid), Ok(end)) = (start, mid, end) {
                 os_debug!(
-                    "piece[{}] ({:.4},{:.4},{:.4})..({:.4},{:.4},{:.4})..({:.4},{:.4},{:.4})",
+                    "piece[{}] ({:.4},{:.4},{:.4})..({:.4},{:.4},{:.4})..({:.4},{:.4},{:.4}) on {:?}",
                     piece.id,
                     start.x,
                     start.y,
@@ -1841,7 +1849,16 @@ fn offset_shell_impl(
                     end.x,
                     end.y,
                     end.z,
+                    piece.support_faces,
                 );
+                for pcurve in &piece.pcurves {
+                    let uv = |t: f64| pcurve.pcurve.evaluate(t).map(|p| (p.x, p.y)).unwrap_or((f64::NAN, f64::NAN));
+                    let [a, b] = pcurve.pcurve.domain().unwrap_or([0.0, 1.0]);
+                    os_debug!(
+                        "  pcurve operand={} face={} uv {:?}..{:?}..{:?}",
+                        pcurve.operand, pcurve.face_id, uv(a), uv(0.5 * (a + b)), uv(b),
+                    );
+                }
             }
         }
     }
@@ -2213,6 +2230,37 @@ fn offset_shell_impl(
                         // its sliver cavity's named refusal below; taking the
                         // thin construction there would fill a real cavity.
                         Some((face, separation)) if separation <= distance.abs() + tolerance * 10.0 => {
+                            // A coincidence the fragment's other interior
+                            // points do not share is a tangent TOUCH: the
+                            // cavity pinches to a line there, and dropping the
+                            // fragment as a sheet would discard real skin.
+                            if tangent_touch_on() {
+                                if let Some((farther, far)) = tangent_touch(
+                                    fragment,
+                                    face,
+                                    &retained_faces_with_edges,
+                                    distance,
+                                    offset_skin_tolerance,
+                                )? {
+                                    return Err(KernelRefusal::unsupported(KernelStage::Select, refusals::TANGENT_OFFSETS, format!(
+                                        "offset_shell: the offsets of source faces {} and {face} touch tangentially near \
+                                         ({:.4}, {:.4}, {:.4}) — the material between those faces is exactly twice the \
+                                         shell distance thick along that touch (separation {separation:.6} against {:.6}) \
+                                         and thicker beside it (the offset reads {far:.4} from face {face} at ({:.4}, {:.4}, {:.4})), so the cavity would \
+                                         pinch to a line there; a cavity pinched to a line is not supported — use a \
+                                         shell distance a little below {:.4}",
+                                        carrier.source_face_id,
+                                        fragment.test_point.x,
+                                        fragment.test_point.y,
+                                        fragment.test_point.z,
+                                        distance.abs(),
+                                        farther.x,
+                                        farther.y,
+                                        farther.z,
+                                        distance.abs(),
+                                    )));
+                                }
+                            }
                             SkinReading::Shadowed { face, separation }
                         }
                         _ => SkinReading::On,
@@ -2536,6 +2584,43 @@ fn offset_shell_impl(
                         })
                     {
                         region_skins.push(fragment);
+                    }
+                }
+            }
+            // EVERY SKIN PIECE (`BREP_OFFSET_EVERY_SKIN_PIECE`, default on):
+            // one source region's offset skin can come out in several pieces
+            // when another offset cuts it (the drilled block's bore skin,
+            // radius 4, runs into the wall skin x = 19 and parts it at
+            // y = 10 ± √15/2) or the carrier's seam parts it (the bore skin
+            // itself, at its seam). The seed answers one piece; every
+            // classified fragment already reads on the skin, inside the source
+            // and short of the openings, so all of them are the skin, as for
+            // the extended walls below. Left out, the pieces the seed missed
+            // left their outlines one-use (shell/hole-skin-merging-wall).
+            // Only where the seed could not choose: an inward shell whose every
+            // on-skin fragment touches the source (`viable` empty), so the
+            // largest stood in for the region; an outward shell's fragments and
+            // a seeded choice keep the seed's answer. And only a piece whose
+            // test point lies the distance from its OWN trimmed face: "on the
+            // skin" says no retained face is nearer, which a point inside the
+            // offset body also reads (the cylinder's offset past a reflex
+            // junction, inside the box's offset wall: 0.139 from the trimmed
+            // cylinder against 0.1, reflex_junction_under_a_filleted_top).
+            if every_skin_piece_enabled()
+                && distance > 0.0
+                && viable.is_empty()
+                && skin_filter_active
+                && inward_extended_walls.is_empty()
+                && classified.len() > region_skins.len()
+            {
+                for fragment in &classified {
+                    if region_skins.iter().any(|other: &FaceFragmentRecord| other.test_point.sub(fragment.test_point).length() <= 1e-12) {
+                        continue;
+                    }
+                    let departure = own_offset_departure(fragment.test_point, carrier.source_face_id, &retained_faces_with_edges, distance);
+                    os_debug!("  select[{index}] every skin piece: test point ({:.4},{:.4},{:.4}) departs its own face's offset by {departure:?}", fragment.test_point.x, fragment.test_point.y, fragment.test_point.z);
+                    if departure.is_some_and(|departure| departure.abs() <= offset_skin_tolerance) {
+                        region_skins.push(fragment.clone());
                     }
                 }
             }
@@ -2929,6 +3014,21 @@ fn offset_shell_impl(
             .collect::<Vec<_>>(),
     );
     let chosen_walls = manifold_walls;
+    // A part of the selected cavity skin with no path to an opening wall is a
+    // SEALED hollow; named only if the assembly then refuses.
+    let sealed = if sealed_hollow_on() && body == Body::Shell {
+        sealed_skins(&chosen_offsets, &chosen_walls, &assembly_sources, &imprint, |fragment| {
+            carriers[fragment.operand as usize].source_face_id
+        })?
+    } else {
+        Vec::new()
+    };
+    if !sealed.is_empty() {
+        os_debug!(
+            "sealed skins: {:?}",
+            sealed.iter().map(|skin| (&skin.sources, skin.centre, skin.edge_middles.len())).collect::<Vec<_>>()
+        );
+    }
 
     profile::lap(&mut clock, profile::SELECT);
     let stage_clock = web_time::Instant::now();
@@ -3129,12 +3229,41 @@ fn offset_shell_impl(
     // with destroyed face provenance.
     // A shell the rim band lane recognized but could not close fails here as it
     // always did; the refusal now carries the lane's reason.
-    let mut solid = profile::detail("finalize_assembled_solid", || finalize_assembled_solid(solid, assembly_tolerance)).map_err(|error| {
+    let finalized = profile::detail("finalize_assembled_solid", || finalize_assembled_solid(solid, assembly_tolerance)).map_err(|error| {
         match &rim_band.decline {
             Some(reason) => error.with_message(|message| format!("{message}; offset_shell: {reason}")),
             None => error,
         }
-    })?;
+    });
+    let mut solid = match finalized {
+        Ok(solid) => solid,
+        Err(error) => {
+            if let Some((index, own, other, thickness)) = sealing_distance(
+                &sealed,
+                source,
+                &retained_faces_with_edges,
+                distance,
+                offset_skin_tolerance,
+            )? {
+                let skin = &sealed[index];
+                let bounding = skin.sources.iter().map(u64::to_string).collect::<Vec<_>>().join(", ");
+                return Err(KernelRefusal::unsupported(KernelStage::Sew, refusals::SEALED_HOLLOW, format!(
+                    "offset_shell: at this distance the cavity splits — a hollow bounded by the offsets of \
+                     source faces {bounding} near ({:.4}, {:.4}, {:.4}) is sealed off from the opening, and a \
+                     sealed hollow could not be assembled here. It is closed off where the offsets of source \
+                     faces {own} and {other} cross, which they do from {:.4} up ({thickness:.4} of material \
+                     between them); below {:.4} it opens into the rest of the cavity, so use a shell distance \
+                     below that",
+                    skin.centre.x,
+                    skin.centre.y,
+                    skin.centre.z,
+                    0.5 * thickness,
+                    0.5 * thickness,
+                )));
+            }
+            return Err(error);
+        }
+    };
     profile::detail("reconstruct_analytic_shell", || crate::offset_retrim::reconstruct_analytic_shell(&mut solid))?;
     if rim_bands + pair_rims > 0 || !inward_extended_walls.is_empty() {
         // Rim welds and extended reflex walls join independently-oriented skins;

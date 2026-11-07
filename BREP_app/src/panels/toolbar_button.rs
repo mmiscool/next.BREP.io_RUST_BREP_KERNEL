@@ -296,9 +296,14 @@ pub fn select(
                 .iter()
                 .find(|(_, id, _)| *id == current)
                 .expect("selected workbench must be registered");
-            let response =
+            let phone = crate::viewport::touch::enabled(ui.ctx())
+                && ui.ctx().content_rect().width() < crate::viewport::touch::NARROW_WIDTH;
+            let response = if phone {
+                button(ui, glyph, &format!("{label} — Switch workbench"))
+            } else {
                 switcher_row_ui(ui, label, glyph, header_width, false, Some(SELECT_CHEVRON))
-                    .on_hover_text("Switch workbench");
+                    .on_hover_text("Switch workbench")
+            };
             egui::Popup::menu(&response).width(width).show(|ui| {
                 let height = (ui.ctx().content_rect().height() - 80.0).max(80.0);
                 ui.set_max_height(height);

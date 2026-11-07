@@ -1021,6 +1021,12 @@ impl FileDialog {
         self.instructions_pdf.is_some()
     }
 
+    /// A PLM Save As is writing its copy. The dialog polls that future itself,
+    /// outside the PLM executor, so automation waits ask here instead.
+    pub fn plm_save_as_pending(&self) -> bool {
+        self.plm_save_as.as_ref().is_some_and(|state| state.saving())
+    }
+
     /// The monotonic successful-save counter — the shell feeds it to the
     /// update-components checker as half its staleness key.
     pub fn save_generation(&self) -> u64 {

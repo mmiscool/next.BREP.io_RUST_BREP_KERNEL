@@ -1468,6 +1468,7 @@ fn build_imprints_with_carrier_seeds(
         by_face: HashMap::default(),
         edge_splits: HashMap::default(),
         marched_pieces: HashSet::default(),
+        exact_section: false,
         emitted_pcurves: HashSet::default(),
         exact_pcurve_check: false,
         next_id: 1,
@@ -1834,8 +1835,9 @@ fn build_imprints_with_carrier_seeds(
                     }
                 }
                 let lane_fits = profile.enabled.then(crate::PcurveFitScope::open);
+                builder.exact_section = true;
                 for curve in curves {
-                    builder.process_curve(
+                    let processed = builder.process_curve(
                         curve,
                         first,
                         second,
@@ -1843,8 +1845,13 @@ fn build_imprints_with_carrier_seeds(
                         &[first, second],
                         true,
                         None,
-                    )?;
+                    );
+                    if processed.is_err() {
+                        builder.exact_section = false;
+                    }
+                    processed?;
                 }
+                builder.exact_section = false;
                 if let Some(scope) = lane_fits {
                     profile.exact_lane_fits += scope.close().fits;
                 }
@@ -3583,7 +3590,6 @@ fn same_curve_chain_window(edge: &EdgeRecord, siblings: &[&EdgeRecord]) -> (f64,
     }
     (t0, t1)
 }
-
 
 /// `BREP_IMPRINT_LIES_ON_SEED_SKIP=0` runs the seed solve on an edge that lies
 /// on the other carrier as before (see the seed loop); unset or anything else

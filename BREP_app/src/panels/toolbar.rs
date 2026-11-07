@@ -197,6 +197,11 @@ impl ToolbarPanel {
         let mut outcome = ToolbarOutcome::default();
         let mut target = None;
         egui::containers::panel::Panel::top("brep-mobile-toolbar").resizable(false).show(ui, |ui| {
+            if ui.ctx().content_rect().width() < crate::viewport::touch::NARROW_WIDTH {
+                // Fit the phone controls on one row, retaining 44-point touch targets.
+                ui.spacing_mut().button_padding.x = 12.0;
+                ui.spacing_mut().item_spacing.x = 2.0;
+            }
             ui.horizontal_wrapped(|ui| {
                 self.workbench_switcher(ui, state, store);
                 let file = super::file::file_menu(ui, state, store, settings_open, properties_open, &mut self.hits);

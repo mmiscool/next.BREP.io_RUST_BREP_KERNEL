@@ -250,6 +250,11 @@ pub struct BrepApp {
     /// native and once applied.
     pending_boot_load: Option<std::sync::mpsc::Receiver<Result<String, String>>>,
 
+    /// The PLM tab's Connect now, on its way: the sign-in and index load run on
+    /// the frame loop's executor and the frame switches stores when they end.
+    #[cfg(not(target_arch = "wasm32"))]
+    reconnecting: Option<crate::store::PendingBoot>,
+
     /// "Open in CAD" from the PLM's page: the `?open=part/…/rev/…` this page
     /// was started with (wasm only), driven once a frame until it settles.
     plm_launch: Option<crate::panels::plm_launch::Launch>,
@@ -290,6 +295,9 @@ pub struct BrepApp {
     /// (`EngineState::history_revision`), so this cannot go stale without the
     /// borrow checker having let a mutation past the door that bumps it.
     params_blob: (u64, usize, u64, String),
+    /// Plain-state blobs rebuilt only when their whole input changed (see
+    /// [`StateBlobCache`]).
+    state_blob_cache: StateBlobCache,
 
     /// A measured camera spin in flight (`perf_spin`): the orbit drag the app
     /// drives ITSELF, one pointer step per frame, so the frames run back to back.
@@ -491,20 +499,50 @@ impl BrepApp {
         }
     }
 
-    /// Switch this session to the PLM configured at `root`, live (S1's named
-    /// limit): the native boot S2 runs at start, then everything the app read
-    /// from the store when it was built is read again from the new one. Only
-    /// while [`Self::reconnect_blocker`] is `None`. A refused boot changes
-    /// nothing and says why.
+    /// Start switching this session to the PLM configured at `root`, live
+    /// (S1's named limit): the native boot S2 runs at start, without blocking
+    /// the frame; [`Self::finish_reconnect`] takes the store when it ends.
+    /// Only while [`Self::reconnect_blocker`] is `None`.
     #[cfg(not(target_arch = "wasm32"))]
-    pub(crate) fn reconnect_plm(&mut self, root: std::path::PathBuf) -> Result<String, String> {
-        use crate::plm::connection::Status;
+    pub(crate) fn start_reconnect(&mut self, root: std::path::PathBuf) -> Result<(), String> {
+        if self.reconnecting.is_some() {
+            return Err("already connecting".into());
+        }
         if let Some(why) = self.reconnect_blocker() {
             return Err(why);
         }
         let config = crate::plm::config::resolve(&root, &|_| None, &Default::default())?
             .ok_or_else(|| format!("no PLM is configured in {}", root.display()))?;
-        let store = crate::store::boot_native_store(root, config);
+        self.reconnecting = Some(crate::store::start_native_boot(root, config));
+        Ok(())
+    }
+
+    /// A Connect now is on its way (settle waits for it).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn reconnecting(&self) -> bool {
+        self.reconnecting.is_some()
+    }
+
+    /// The Connect now under way, once its boot has ended: switch stores (or
+    /// say why not) and tell the PLM tab.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn poll_reconnect(&mut self) {
+        let Some(store) = self.reconnecting.as_mut().and_then(crate::store::PendingBoot::poll) else { return };
+        self.reconnecting = None;
+        let outcome = self.finish_reconnect(store);
+        self.settings.reconnected(outcome);
+    }
+
+    /// Switch this session to `store`, the boot a Connect now started: then
+    /// everything the app read from the store when it was built is read again
+    /// from the new one. A refused boot, or a session that took a named or
+    /// dirty document meanwhile, changes nothing and says why.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn finish_reconnect(&mut self, store: Box<dyn ModelStore>) -> Result<String, String> {
+        use crate::plm::connection::Status;
+        if let Some(why) = self.reconnect_blocker() {
+            return Err(why);
+        }
         let Some(Status::Connected { url, username }) = store.plm_session().map(|s| s.status) else {
             let why = store.take_persistence_errors().join("; ");
             return Err(if why.is_empty() { "the PLM did not take this session".into() } else { why });
@@ -542,6 +580,11 @@ impl BrepApp {
     /// Keep automation waits active until the File dialog has delivered the PDF.
     pub(crate) fn instructions_pdf_pending(&self) -> bool {
         self.file.instructions_pdf_pending()
+    }
+
+    /// Keep automation waits active until a PLM Save As has landed or failed.
+    pub(crate) fn plm_save_as_pending(&self) -> bool {
+        self.file.plm_save_as_pending()
     }
 
     /// The file dialog, the documents and the store together — for the
@@ -764,12 +807,15 @@ impl BrepApp {
             dock,
             first_run_framed: false,
             pending_boot_load,
+            #[cfg(not(target_arch = "wasm32"))]
+            reconnecting: None,
             plm_launch,
             active_document,
             active_tab: active_document,
             sheets_pane_shown: false,
             document_tab_hits: Vec::new(),
             params_blob: (u64::MAX, usize::MAX, u64::MAX, String::new()),
+            state_blob_cache: StateBlobCache::default(),
             #[cfg(feature = "automation")]
             spin: None,
             autosave: crate::recovery::Autosave::new(),
@@ -1136,14 +1182,25 @@ impl BrepApp {
         if self.pending_boot_load.is_some() {
             activities.push(Activity::new("boot", "boot", "Loading document"));
         }
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.reconnecting.is_some() {
+            activities.push(Activity::new("plmConnect", "plmConnect", "Connecting to the PLM"));
+        }
         activities.extend(self.step_parts.busy_activities());
         activities.extend(self.file.busy_activities());
-        // A write-behind store (the browser's IndexedDB) still settling saves.
-        let saving = self.model_store.pending_writes();
+        // A write-behind store still settling saves: the browser's IndexedDB
+        // or a PLM server (not the desktop's own settings/layout files).
+        let saving = self.model_store.pending_saves();
         if saving > 0 {
+            #[cfg(target_arch = "wasm32")]
             let label = match saving {
                 1 => "Saving to browser storage".to_string(),
                 n => format!("Saving to browser storage ({n} writes)"),
+            };
+            #[cfg(not(target_arch = "wasm32"))]
+            let label = match saving {
+                1 => "Saving".to_string(),
+                n => format!("Saving ({n} writes)"),
             };
             activities.push(Activity::new("storeWrite", "storeWrite", label));
         }
@@ -1371,12 +1428,31 @@ impl BrepApp {
             "__brepImportPreview" => self.stl_import.as_ref().map_or_else(|| "null".to_string(), |p| p.state_json()),
             "__brepImportRegions" => self.stl_import.as_ref().map_or_else(|| "null".to_string(), |p| p.regions_json()),
             "__brepPpp" => format!("{}", ctx.pixels_per_point()),
-            "__brepSettings" => engine.settings_json(),
+            // Keyed on the settings themselves and the projection, the only
+            // inputs `settings_json` reads.
+            "__brepSettings" => {
+                let orthographic = matches!(engine.camera.projection, brep_render::view::Projection::Orthographic { .. });
+                let key = (engine.settings.clone(), orthographic);
+                StateBlobCache::keyed(&mut self.state_blob_cache.settings, key, || engine.settings_json())
+            }
             "__brepSolidColors" => engine.solid_color_overrides_json(),
             "__brepHistory" => engine.history_listing_json(),
             "__brepGizmo" => engine.gizmo_state_json(),
             "__brepFile" => self.file.file_state_json(&self.docs, self.model_store.as_ref()),
-            "__brepModel" => self.model_signature_json(),
+            // Keyed on exactly what the signature reports (rollback step, each
+            // solid's name, triangle count and bounds), so building the key
+            // skips only the JSON, never a change.
+            "__brepModel" => {
+                let key = model_signature_key(engine);
+                match StateBlobCache::hit(&self.state_blob_cache.model, &key) {
+                    Some(json) => json,
+                    None => {
+                        let json = self.model_signature_json();
+                        self.state_blob_cache.model = Some((key, json.clone()));
+                        json
+                    }
+                }
+            }
             "__brepReport" => engine.history_report_json(),
             // The in-flight run: whether one is pending, the feature the runner
             // says it is executing, and the feature a cancelled run was stuck on.
@@ -1428,7 +1504,13 @@ impl BrepApp {
             "__brepSheets" => self.docs.engine_mut().sheet_state_json(),
             // The workbench logical state (resolved current id + available
             // ids); the dropdown's rects ride in `__brepToolbar`.
-            "__brepWorkbench" => crate::workbench::workbench_state_scoped(engine).to_string(),
+            "__brepWorkbench" => {
+                // Its inputs: the stored workbench and the plugins' workbenches.
+                let key = (engine.settings.workbench.clone(), engine.plugin_workbenches());
+                StateBlobCache::keyed(&mut self.state_blob_cache.workbench, key, || {
+                    crate::workbench::workbench_state_scoped(engine).to_string()
+                })
+            }
             "__brepSelection" => engine.selection_json(),
             "__brepInfoWindows" => self.info_windows.published_json(self.docs.engine_mut()),
             "__brepInterference" => self.interference.state_json_in(engine),
@@ -2853,7 +2935,7 @@ impl eframe::App for BrepApp {
         // over the shell. Idempotent when closed. Replaces the old sidebar section.
         // This preview runs every frame, including when Settings is closed.
         // Exact dirty checks serialize the whole assembly; use the tab's cached
-        // marker here. reconnect_plm still checks the exact saved bytes before
+        // marker here. finish_reconnect still checks the exact saved bytes before
         // switching stores, including metadata edits the marker may not see.
         self.settings.reconnect_blocker =
             self.reconnect_blocker_with(crate::document::Document::dirty_marker);
@@ -2883,8 +2965,18 @@ impl eframe::App for BrepApp {
         // The PLM tab's Connect now: switch this session to the PLM live.
         #[cfg(not(target_arch = "wasm32"))]
         if let Some(root) = self.settings.take_reconnect_request() {
-            let outcome = self.reconnect_plm(root);
-            self.settings.reconnected(outcome);
+            if let Err(why) = self.start_reconnect(root) {
+                self.settings.reconnected(Err(why));
+            }
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.poll_reconnect();
+            self.settings.reconnecting = self.reconnecting.is_some();
+            if self.reconnecting.is_some() {
+                // The phase limit is checked here: wake for it on a quiet frame.
+                ctx.request_repaint_after(std::time::Duration::from_millis(250));
+            }
         }
 
         // --- Part Properties: the active document's own BOM attribute record,
@@ -3273,4 +3365,47 @@ pub(crate) fn seed_history_json() -> String {
         ]
     })
     .to_string()
+}
+
+/// Plain-state blobs whose whole input is cheap to compare: each is rebuilt
+/// only when that input changed, not on every frame the registry publishes
+/// (the browser build publishes for every page, as its WebMCP host attaches at
+/// boot). A key holds EVERY input its producer reads, so a cached blob is
+/// never stale; a blob whose inputs have no such key is built every frame.
+#[derive(Default)]
+struct StateBlobCache {
+    settings: Option<((brep_render::style::RenderSettings, bool), String)>,
+    workbench: Option<((String, serde_json::Value), String)>,
+    model: Option<(ModelSignatureKey, String)>,
+}
+
+/// `(rollback step, [(name, triangles, bbox min, bbox max)])`.
+type ModelSignatureKey = (usize, Vec<(String, usize, [f64; 3], [f64; 3])>);
+
+impl StateBlobCache {
+    /// The cached blob when its key is `key`.
+    fn hit<K: PartialEq>(slot: &Option<(K, String)>, key: &K) -> Option<String> {
+        slot.as_ref().filter(|(cached, _)| cached == key).map(|(_, json)| json.clone())
+    }
+
+    /// The blob for `key`: the cached one, else `build`'s, kept under `key`.
+    fn keyed<K: PartialEq>(slot: &mut Option<(K, String)>, key: K, build: impl FnOnce() -> String) -> String {
+        if let Some(json) = Self::hit(slot, &key) {
+            return json;
+        }
+        let json = build();
+        *slot = Some((key, json.clone()));
+        json
+    }
+}
+
+/// Everything `BrepApp::model_signature_json` reports, as a comparable key.
+fn model_signature_key(engine: &EngineState) -> ModelSignatureKey {
+    let solids = engine
+        .scene
+        .solids()
+        .iter()
+        .map(|s| (s.name.clone(), s.mesh.indices.len() / 3, s.bbox.min, s.bbox.max))
+        .collect();
+    (engine.history_rollback(), solids)
 }

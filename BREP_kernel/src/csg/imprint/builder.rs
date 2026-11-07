@@ -158,6 +158,11 @@ pub(super) struct ImprintBuilder<'a> {
     /// an exact analytic ring's origin split is the coalescer's exact-band
     /// closure, and dissolving it moved an offset shell's corners (see there).
     pub(super) marched_pieces: HashSet<u64>,
+    /// Set by the driver around an EXACT section's `process_curve` (an
+    /// analytic lane's line, circle or ellipse): with
+    /// `BREP_EXACT_TANGENT_TOUCH`, its tangential hits on an edge it touches in
+    /// passing are junctions, not grazes. See TANGENT TOUCH in `process_curve`.
+    pub(super) exact_section: bool,
     /// `(piece id, face)` of every pcurve the Hermite lane EMITTED rather
     /// than fitted: the junction passes move its ends instead of re-marching
     /// it, and the coincident merge re-keys it to the keeper.
@@ -474,6 +479,32 @@ impl<'a> ImprintBuilder<'a> {
             self.add_edge_split(operand, edge, parameter)?;
         }
         Ok(())
+    }
+
+    /// Whether a section point classified `Boundary` on an open offset sheet
+    /// truly rides that sheet, rather than projecting onto its rim from off
+    /// the patch. A rational conic carrier (a quarter-arc fillet's offset)
+    /// continues around its whole circle past its domain, so the march can
+    /// trace the full closed section; the far half then projects, clamped,
+    /// onto the patch's rim and reads `Boundary`. Measured on the 2026-11-06
+    /// offset-shell report (a box with four r5 fillets on one
+    /// face, shelled 0.1 through the opposite face): the tilted bottom
+    /// plane's section with the NX|NY fillet's offset kept its far half,
+    /// 4.9 off the fillet, as a one-sided cut on the bottom sheet, which
+    /// left three one-use edges and an open loop. A riding section lies on
+    /// the sheet to its fit contract (`intersection_fit`, 20 × tolerance =
+    /// 2e-6 there); the band is the wider of the march's own default seed
+    /// gate (`intersect_surfaces`: 100 × tolerance) and 1e-4 of the part
+    /// (3.5e-3 there), so a fitted curve's fallback noise stays inside it
+    /// while a section wrapped around a conic (5 to 7 off there) does not.
+    /// `BREP_IMPRINT_RECOVER_ON_SHEET=0` restores the unchecked recovery.
+    fn rides_sheet_surface(&self, face: TaggedFace<'_>, point: Vec3) -> Result<bool, KernelRefusal> {
+        if !switch!("BREP_IMPRINT_RECOVER_ON_SHEET", true) {
+            return Ok(true);
+        }
+        let projection = project_point_to_surface(&face.face.surface, point)
+            .or_refuse(KernelStage::Intersect, "project_point_to_surface")?;
+        Ok(projection.distance <= (self.tolerance * 100.0).max(self.scale * 1e-4))
     }
 
     fn face_has_seam_at(&self, face: TaggedFace<'_>, point: Vec3) -> Result<bool, KernelRefusal> {
@@ -881,7 +912,40 @@ impl<'a> ImprintBuilder<'a> {
                         None => curve.evaluate(curve_parameter).or_refuse(KernelStage::Intersect, "evaluate")?,
                     };
                     let ends_on = !interior && near_curve_end(junction_point);
-                    if hit.tangential && refine && !ends_on {
+                    // TANGENT TOUCH (`BREP_EXACT_TANGENT_TOUCH`, default on): an
+                    // EXACT section (an analytic lane's circle) that touches an
+                    // edge in passing touches it at a true point: the plane's
+                    // circle of a ball inscribed in a cube's edges touches each
+                    // side of its square at the side's midpoint, where the
+                    // neighbouring face's circle touches it too. Skipping the hit
+                    // leaves the circle one piece whose midpoint reads On the
+                    // boundary, so it is dropped (midsphere-common refused and was
+                    // answered by perturbation). The touch is kept as a junction
+                    // only where the curve and the edge meet to round-off.
+                    let exact_touch = hit.tangential
+                        && self.exact_section
+                        && interior
+                        && exact_tangent_touch_enabled()
+                        && edge.curve.evaluate(edge_parameter).ok().is_some_and(|on_edge| {
+                            on_edge.sub(junction_point).length() <= 1e-9 * (1.0 + junction_point.length())
+                        })
+                        // A TOUCH parts from the edge on either side (a circle
+                        // leaves its tangent line as κδ²/2); a coincident span
+                        // does not, and the curve/curve solve reports spurious
+                        // "tangential" hits all along one (a split bore's rim
+                        // arc read on its own circle at t = s = 0.1875, 0.3125,
+                        // 0.4375), which must not become junctions.
+                        && {
+                            let step = 1e-3 * (end - start);
+                            let band = 1e-7 * (1.0 + junction_point.length());
+                            [curve_parameter - step, curve_parameter + step].iter().any(|&beside| {
+                                let beside = beside.clamp(start, end);
+                                curve.evaluate(beside).ok().and_then(|point| {
+                                    project_point_to_curve(&edge.curve, point).ok().map(|foot| foot.distance > band)
+                                }).unwrap_or(false)
+                            })
+                        };
+                    if hit.tangential && refine && !ends_on && !exact_touch {
                         continue;
                     }
                     if let Some(junction) = fuzzy_junction {
@@ -1447,7 +1511,8 @@ impl<'a> ImprintBuilder<'a> {
                             && target_faces.len() == 2
                             && !self.pieces.iter().any(|piece| {
                                 piece.support_faces == [first.key(), second.key()]
-                            });
+                            })
+                            && self.rides_sheet_surface(*face, midpoint)?;
                         if !recover {
                             invalid_boundary = true;
                             break;
@@ -1672,3 +1737,11 @@ impl<'a> ImprintBuilder<'a> {
     }
 }
 
+
+/// `BREP_EXACT_TANGENT_TOUCH` (default on; `=0` restores skipping every
+/// tangential hit): see TANGENT TOUCH in [`ImprintBuilder::process_curve`].
+/// Promoted once the watertight tessellation meshes a face whose arcs meet at
+/// zero angle: midsphere-common's exact body meshes closed.
+fn exact_tangent_touch_enabled() -> bool {
+    crate::switch!("BREP_EXACT_TANGENT_TOUCH", true)
+}

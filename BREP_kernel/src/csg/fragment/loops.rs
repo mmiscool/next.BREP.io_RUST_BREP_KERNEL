@@ -510,6 +510,12 @@ fn loop_view_enabled() -> bool {
     switch!("BREP_FRAGMENT_LOOP_VIEW", true)
 }
 
+/// `BREP_FRAGMENT_CLOSED_PARTIAL` (default on; `=0` restores the refusal):
+/// see CLOSED PARTIAL in the loop builder.
+fn closed_partial_enabled() -> bool {
+    switch!("BREP_FRAGMENT_CLOSED_PARTIAL", true)
+}
+
 
 fn build_loop_uses<U: LoopUse>(
     mut uses: Vec<U>,
@@ -674,6 +680,87 @@ fn build_loop_uses<U: LoopUse>(
                     });
                     index = run_end_index;
                     continue;
+                }
+            }
+            // CLOSED PARTIAL (`BREP_FRAGMENT_CLOSED_PARTIAL`, default on): a
+            // CLOSED chain another chain of the face crosses is used in arcs,
+            // one per region it bounds: a one-call imprint mints sections of
+            // several members on one carrier, and they cross one another (the
+            // shelled block's bore skin, the circle of radius 4 on the floor's
+            // offset plane, crosses the wall skin's cut x = 19; the lens beyond
+            // the cut used the arc backward and the face refused). The arc is
+            // the carrier between the run's ends, in the run's direction; a run
+            // over the chain's own start is cut there into two coedges, and the
+            // regions on its two sides both cut it there.
+            if chain_closed && !complete && closed_partial_enabled() {
+                let (carrier_pcurve, carrier_curve, lift) = match &chain.source {
+                    ChainSource::Boundary { coedge, curve } => (&coedge.pcurve, curve, Vec2 { x: 0.0, y: 0.0 }),
+                    ChainSource::Cut { pcurve, curve, lift, .. } => (pcurve, curve, *lift),
+                };
+                let (from, to) = (run_start.sub(lift), run_end.sub(lift));
+                let first = project_point_to_curve(carrier_pcurve, Vec3::new(from.x, from.y, 0.0)).or_refuse(KernelStage::Fragment, "project_point_to_curve")?;
+                let last = project_point_to_curve(carrier_pcurve, Vec3::new(to.x, to.y, 0.0)).or_refuse(KernelStage::Fragment, "project_point_to_curve")?;
+                let [p0, p1] = carrier_pcurve.domain().or_refuse(KernelStage::Fragment, "domain")?;
+                let span = p1 - p0;
+                let band = epsilon * 20.0;
+                if span > 1e-12 && first.distance <= band && last.distance <= band {
+                    let (f_start, f_end) = ((first.u - p0) / span, (last.u - p0) / span);
+                    let forward = run[0].forward();
+                    // The arcs in the run's direction, each as (low, high).
+                    let arcs: Vec<(f64, f64)> = match (forward, f_end > f_start) {
+                        (true, true) => vec![(f_start, f_end)],
+                        (true, false) => vec![(f_start, 1.0), (0.0, f_end)],
+                        (false, false) => vec![(f_end, f_start)],
+                        (false, true) => vec![(0.0, f_start), (f_end, 1.0)],
+                    };
+                    let mut built = Vec::new();
+                    // The run's own ends, where the arrangement crossed the
+                    // other chains: every neighbour (the crossing chain's
+                    // partial run, the other face's edge) ends there, so the
+                    // arc does too. A fraction is the run end projected onto
+                    // the carrier, a chord's sag (~1e-5) off it.
+                    let (low_end, high_end) = if forward { (from, to) } else { (to, from) };
+                    let arc_count = arcs.len();
+                    for (arc_index, (low, high)) in arcs.into_iter().enumerate() {
+                        if high - low <= 1e-12 {
+                            continue;
+                        }
+                        let mut edge_curve = subcurve_by_fraction(carrier_curve, low, high)?;
+                        let mut pcurve = subcurve_by_fraction(carrier_pcurve, low, high)?;
+                        // Which of this arc's ends are run ends (not the seam).
+                        let snap_low = if forward { arc_index == 0 } else { arc_index + 1 == arc_count };
+                        let snap_high = if forward { arc_index + 1 == arc_count } else { arc_index == 0 };
+                        for (snap, uv, at_start) in [(snap_low, low_end, true), (snap_high, high_end, false)] {
+                            if !snap {
+                                continue;
+                            }
+                            let point = surface.evaluate(uv.x, uv.y).or_refuse(KernelStage::Fragment, "evaluate")?;
+                            for (curve, target) in [(&mut edge_curve, point), (&mut pcurve, Vec3::new(uv.x, uv.y, 0.0))] {
+                                let index = if at_start { 0 } else { curve.control_points.len() - 1 };
+                                let weight = curve.control_points[index].w;
+                                curve.control_points[index] = crate::Vec4::from_point(target, weight);
+                            }
+                        }
+                        let [t0, t1] = edge_curve.domain().or_refuse(KernelStage::Fragment, "domain")?;
+                        let start = edge_curve.evaluate(t0).or_refuse(KernelStage::Fragment, "evaluate")?;
+                        let end = edge_curve.evaluate(t1).or_refuse(KernelStage::Fragment, "evaluate")?;
+                        built.push(FragmentCoedge {
+                            source: FragmentEdgeSource::Derived { curve: edge_curve, t0, t1, start, end },
+                            forward,
+                            pcurve: if forward { pcurve } else { pcurve.reversed().or_refuse(KernelStage::Fragment, "reversed")? },
+                        });
+                    }
+                    if !forward {
+                        built.reverse();
+                    }
+                    if !built.is_empty() {
+                        if env_read!("BREP_DEBUG_FRAG").is_some() {
+                            eprintln!("closed partial: chain {chain_id} arc f={f_start:.9}..{f_end:.9} forward={forward} as {} coedge(s)", built.len());
+                        }
+                        coedges.extend(built);
+                        index = run_end_index;
+                        continue;
+                    }
                 }
             }
             // A run that departs from and returns to the SAME point along an

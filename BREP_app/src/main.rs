@@ -431,6 +431,12 @@ fn main() -> eframe::Result<()> {
         }),
     )
     .map_err(|e| eframe::Error::AppCreation(e.into()));
+    // The UI's own state (settings, layout, the recovery blob) is written
+    // behind the frame; land what is still queued before the process ends.
+    // The close path already waited for it, so this is normally instant.
+    if !brep_app::store::flush_writes(std::time::Duration::from_secs(10)) {
+        eprintln!("brep-app: some settings were still being written at exit");
+    }
     // An update installed from the notice: start it once this window is gone.
     brep_app::update::relaunch_if_installed();
     result

@@ -49,7 +49,8 @@ pub struct Activity {
     /// `run:<document id>`.
     pub key: String,
     /// The KIND of work, for automation: `run`, `query`, `topology`,
-    /// `meshImport`, `stepProbe`, `sheetLines`, `download`, `search`, `boot`, `kicadRead`, `storeWrite`.
+    /// `meshImport`, `stepProbe`, `sheetLines`, `download`, `search`, `boot`, `kicadRead`, `storeWrite`,
+    /// `plmConnect`.
     pub kind: &'static str,
     /// What the user reads, e.g. `Rebuilding model — P.S16 (2/2)`.
     pub label: String,

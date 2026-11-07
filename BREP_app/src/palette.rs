@@ -338,7 +338,11 @@ impl Palette {
                 } else {
                     all.to_vec()
                 };
-                let (changed, _) = crate::form::enum_dropdown(ui, "display", &choices, &mut self.display, None, Some(&mut self.hits));
+                let (changed, response) = crate::form::enum_dropdown(ui, "display", &choices, &mut self.display, None, Some(&mut self.hits));
+                // Keep the dropdown above its modal when the modal is raised on a tap.
+                ctx.set_sublayer(response.layer_id, egui::LayerId::new(
+                    egui::Order::Foreground, egui::Popup::default_response_id(&response),
+                ));
                 if changed {
                     self.display_changed = true;
                     // A phone's chooser must not pop its keyboard open.

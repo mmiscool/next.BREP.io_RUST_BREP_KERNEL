@@ -416,7 +416,7 @@ impl PlmHost {
             // The store's held index rows (the BOM's PLM columns): exactly the
             // revisions the feed named, the whole index only when stale.
             store.refresh_plm_index(&moved.keys, moved.stale);
-            self.tab_follow.moved(&client, docs, &moved.keys, moved.stale, store.pending_writes() > 0);
+            self.tab_follow.moved(&client, docs, &moved.keys, moved.stale, store.pending_saves() > 0);
             self.cached.moved(docs, &moved.keys, moved.stale);
             self.followed = true;
         }
@@ -669,7 +669,7 @@ impl PlmHost {
             }
         }
         self.repoint.sync(client, docs, waker);
-        let writing = store.pending_writes() > 0;
+        let writing = store.pending_saves() > 0;
         self.cached.sync(client, store, docs, waker, writing);
         self.superseded.sync(client, store, docs, waker);
         for (id, update) in std::mem::take(&mut self.superseded_asked) {

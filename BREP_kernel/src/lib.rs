@@ -238,6 +238,11 @@ mod analytic_topology;
 pub use analytic_topology::{
     make_cone_brep, make_sphere_brep, make_sphere_brep_framed, make_torus_brep,
 };
+#[path = "construction/solid_sweep.rs"]
+mod solid_sweep;
+pub use solid_sweep::{
+    sweep_solid_within, OutlinePiece, ScrewStep, SolidMotion, SweepClip, SweptTool, SOLID_SWEEP_REFUSAL,
+};
 #[path = "construction/sweep_topology.rs"]
 mod sweep_topology;
 pub(crate) use sweep_topology::is_sweep_tight_bend;
@@ -254,7 +259,8 @@ pub use sweep_topology::{
     sweep_profile_along_path,
     sweep_profile_along_path_anchored,
     sweep_profile_helix,
-    sweep_profile_twisted, sweep_profile_twisted_anchored, ProfileAnchor, SectionPlacement,
+    sweep_profile_twisted, sweep_profile_twisted_anchored, sweep_profile_twisted_scaled,
+    ProfileAnchor, SectionPlacement,
     StationBudget, SweepStationReport, SweptChain, SWEEP_DEFAULT_TOLERANCE, SWEEP_MAX_STATIONS,
     SWEEP_REFINEMENT_ROUNDS,
 };

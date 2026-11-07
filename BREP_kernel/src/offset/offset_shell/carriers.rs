@@ -1335,6 +1335,261 @@ pub(super) fn coincident_offset_face(
     Ok(None)
 }
 
+/// `BREP_OFFSET_TANGENT_TOUCH` (default on; `=0` restores): a coincidence that
+/// [`coincident_offset_face`] reads at a fragment's test point but that the
+/// fragment's other interior points do not share is a TANGENT TOUCH, not a
+/// sheet: refuse it by name rather than drop the fragment as shadowed.
+pub(super) fn tangent_touch_on() -> bool {
+    switch!("BREP_OFFSET_TANGENT_TOUCH", true)
+}
+
+
+/// Where `other`'s offset coincidence with a fragment is only a TOUCH: one of
+/// the fragment's extra interior points lies farther than `distance +
+/// tolerance` from `other`, and none lies nearer than `distance − tolerance`
+/// (that would be a crossing, which the shadow rules own). Returns that
+/// farther point and its separation.
+///
+/// Cause (user report, 2026-11-07): a box less a Ø12 bore whose −X
+/// wall beside the bore is 4.0 thick, shelled inward by exactly 2.0. The −X
+/// offset plane x = 2 touches the bore's offset cylinder r = 8 along one line;
+/// the plane's single fragment had its test point within the skin band of that
+/// line, read "coincident", and was dropped whole as a thin-wall sheet. The
+/// −X skin went missing and the shell refused as an open assembly whose cause
+/// named a different pair of faces. The coincidence construction is exact only
+/// where the two offsets are one sheet; at a touch the cavity pinches to a
+/// line, which no manifold shell carries.
+pub(super) fn tangent_touch(
+    fragment: &FaceFragmentRecord,
+    other_face_id: u64,
+    retained_faces: &[(&FaceRecord, Vec<&EdgeRecord>)],
+    distance: f64,
+    tolerance: f64,
+) -> Result<Option<(Vec3, f64)>, KernelRefusal> {
+    let Some((face, edges)) = retained_faces.iter().find(|(face, _)| face.id == other_face_id) else {
+        return Ok(None);
+    };
+    let target = distance.abs();
+    let mut farther = None;
+    for &point in &fragment.extra_test_points {
+        let (separation, _) = nearest_on_trimmed_face(face, edges, point)?;
+        if !separation.is_finite() || separation < target - tolerance {
+            return Ok(None);
+        }
+        if separation > target + tolerance && farther.is_none_or(|(_, best): (Vec3, f64)| separation > best) {
+            farther = Some((point, separation));
+        }
+    }
+    Ok(farther)
+}
+
+/// `BREP_OFFSET_SEALED_HOLLOW` (default on; `=0` restores): an assembly that
+/// fails while part of the cavity skin has no path to the opening is refused
+/// as a SEALED HOLLOW, naming the faces around it and the distance below
+/// which the cavity stays one, rather than as the first crossing found with
+/// the open-curved-rim class (whose feature message advises reordering the
+/// history, which cannot help).
+///
+/// Cause (user report follow-up, 2026-11-07): the reported box less a
+/// Ø12 bore, shelled inward through +X by 2.5. The −X and top walls beside
+/// the bore are 4.0 thick, so past 2.0 their offsets cross the bore's offset
+/// and cut the corner pockets beside the bore off the cavity. The pockets'
+/// skins did not close (23 one-use edges, S = 3), and the refusal named the
+/// tilted bottom against the bore — a pair that crosses at every distance
+/// above ~0.4, including 1.99, which builds — and the feature added the
+/// reorder advice.
+pub(super) fn sealed_hollow_on() -> bool {
+    switch!("BREP_OFFSET_SEALED_HOLLOW", true)
+}
+
+
+/// One part of the selected cavity skin that no chain of shared edges or
+/// edge ends links to an opening wall.
+pub(super) struct SealedSkin {
+    /// The source faces whose offsets bound it, ascending.
+    pub(super) sources: Vec<u64>,
+    /// The mean of its fragments' test points.
+    pub(super) centre: Vec3,
+    /// The middle of each edge of its fragments' loops, with the source face
+    /// whose offset that fragment lies on.
+    pub(super) edge_middles: Vec<(u64, Vec3)>,
+}
+
+/// The parts of the selected cavity skin (`offsets`, kept skin fragments)
+/// that touch no selected WALL fragment through any chain of shared edge
+/// segments or shared edge ends: hollows sealed off from the opening. Read
+/// before assembly, on the fragments the selection kept, so a weld the
+/// assembly later fails cannot split a part off. Sharing an edge end joins
+/// more than sharing a segment, so a part counted sealed touches the rest of
+/// the skin nowhere at all. Empty when there is no wall to reach.
+pub(super) fn sealed_skins(
+    offsets: &[FaceFragmentRecord],
+    walls: &[FaceFragmentRecord],
+    solids: &HashMap<u8, &BrepSolid>,
+    imprint: &ImprintResultRecord,
+    source_face_of: impl Fn(&FaceFragmentRecord) -> u64,
+) -> Result<Vec<SealedSkin>, KernelRefusal> {
+    if walls.is_empty() || offsets.is_empty() {
+        return Ok(Vec::new());
+    }
+    let fragments = offsets.iter().chain(walls).collect::<Vec<_>>();
+    let mut parent = (0..fragments.len()).collect::<Vec<_>>();
+    fn root(parent: &mut [usize], mut index: usize) -> usize {
+        while parent[index] != index {
+            parent[index] = parent[parent[index]];
+            index = parent[index];
+        }
+        index
+    }
+    let mut first = HashMap::<[i64; 9], usize>::default();
+    for (index, fragment) in fragments.iter().enumerate() {
+        for coedge in fragment.loops.iter().flat_map(|loop_record| &loop_record.coedges) {
+            let key = fragment_edge_segment_key(&coedge.source, solids, imprint)?;
+            let start = [key[0], key[1], key[2], 0, 0, 0, 0, 0, i64::MIN];
+            let end = [key[6], key[7], key[8], 0, 0, 0, 0, 0, i64::MIN];
+            for shared in [key, start, end] {
+                let other = *first.entry(shared).or_insert(index);
+                let (a, b) = (root(&mut parent, index), root(&mut parent, other));
+                parent[a] = b;
+            }
+        }
+    }
+    let mut open = HashSet::<usize>::default();
+    for index in offsets.len()..fragments.len() {
+        open.insert(root(&mut parent, index));
+    }
+    let mut sealed = std::collections::BTreeMap::<usize, (Vec<u64>, Vec3, usize, Vec<(u64, Vec3)>)>::new();
+    for (index, fragment) in offsets.iter().enumerate() {
+        let group = root(&mut parent, index);
+        if open.contains(&group) {
+            continue;
+        }
+        let entry = sealed.entry(group).or_insert_with(|| (Vec::new(), Vec3::default(), 0, Vec::new()));
+        entry.0.push(source_face_of(fragment));
+        entry.1 = entry.1.add(fragment.test_point);
+        entry.2 += 1;
+        let own = source_face_of(fragment);
+        for coedge in fragment.loops.iter().flat_map(|loop_record| &loop_record.coedges) {
+            let geometry = fragment_edge_geometry(&coedge.source, solids, imprint)?;
+            let middle = geometry
+                .curve
+                .evaluate(0.5 * (geometry.t0 + geometry.t1))
+                .or_refuse(KernelStage::Select, "evaluate")?;
+            entry.3.push((own, middle));
+        }
+    }
+    Ok(sealed
+        .into_values()
+        .map(|(mut sources, sum, count, edge_middles)| {
+            sources.sort_unstable();
+            sources.dedup();
+            SealedSkin { sources, centre: sum.scale(1.0 / count as f64), edge_middles }
+        })
+        .collect())
+}
+
+/// The thinnest wall of material between retained faces `own` and `other`
+/// near `seed`: their nearest pair of points by alternating projection from
+/// `seed`, as `(thickness, midpoint)`. `None` when a projection has no foot.
+fn thinnest_wall_near(
+    own: (&FaceRecord, &[&EdgeRecord]),
+    other: (&FaceRecord, &[&EdgeRecord]),
+    seed: Vec3,
+) -> Result<Option<(f64, Vec3)>, KernelRefusal> {
+    let Some(mut near) = nearest_on_trimmed_face(own.0, own.1, seed)?.1 else {
+        return Ok(None);
+    };
+    let mut far = None;
+    for _ in 0..64 {
+        let Some(next_far) = nearest_on_trimmed_face(other.0, other.1, near)?.1 else {
+            break;
+        };
+        let Some(next_near) = nearest_on_trimmed_face(own.0, own.1, next_far)?.1 else {
+            break;
+        };
+        let settled = next_near.sub(near).length() <= 1e-10 * (1.0 + near.length());
+        near = next_near;
+        far = Some(next_far);
+        if settled {
+            break;
+        }
+    }
+    Ok(far.map(|far| (far.sub(near).length(), near.add(far).scale(0.5))))
+}
+
+/// The distance below which a sealed hollow's channel to the rest of the
+/// cavity reopens, as `(skin index, face, face, thickness)`.
+///
+/// A sealed skin is bounded by SECTIONS where two offsets meet: an edge of a
+/// skin fragment on face A's offset that also lies at the offset distance
+/// from retained face B (within `tolerance`) is on the A × B section. A
+/// crossing of two offsets exists from half the thinnest wall of material
+/// between their source faces up (that wall read near the edge, its midpoint
+/// inside `source`); a junction of adjacent faces reads no wall and bounds at
+/// every distance. The hollow is sealed only once ALL its bounding crossings
+/// exist, so it seals at the LARGEST of their half-walls. Of the sealed
+/// skins, the one that sealed LAST names the distance: the nearest one below
+/// this at which the cavity's split changes. `None` when no skin has a
+/// bounding crossing that reads a wall.
+pub(super) fn sealing_distance(
+    skins: &[SealedSkin],
+    source: &BrepSolid,
+    retained_faces: &[(&FaceRecord, Vec<&EdgeRecord>)],
+    distance: f64,
+    tolerance: f64,
+) -> Result<Option<(usize, u64, u64, f64)>, KernelRefusal> {
+    let target = distance.abs();
+    let limit = 2.0 * (target - tolerance);
+    let retained = |id: u64| {
+        retained_faces
+            .iter()
+            .find(|(face, _)| face.id == id)
+            .map(|(face, edges)| (*face, edges.as_slice()))
+    };
+    let mut best: Option<(usize, u64, u64, f64)> = None;
+    for (index, skin) in skins.iter().enumerate() {
+        let mut seals: Option<(u64, u64, f64)> = None;
+        let mut read = HashSet::<(u64, u64)>::default();
+        for &(own_id, middle) in &skin.edge_middles {
+            let Some(own) = retained(own_id) else {
+                continue;
+            };
+            for (other, other_edges) in retained_faces {
+                if other.id == own_id || read.contains(&(own_id, other.id)) {
+                    continue;
+                }
+                let (separation, _) = nearest_on_trimmed_face(other, other_edges, middle)?;
+                if !separation.is_finite() || (separation - target).abs() > tolerance {
+                    continue;
+                }
+                let Some((thickness, wall_middle)) = thinnest_wall_near(own, (other, other_edges), middle)? else {
+                    continue;
+                };
+                os_debug!("sealing: skin {index} faces ({own_id},{}) wall {thickness:.6} at {wall_middle:?}", other.id);
+                read.insert((own_id, other.id));
+                if thickness <= tolerance || thickness >= limit {
+                    continue;
+                }
+                if seals.is_some_and(|(_, _, held)| held >= thickness) {
+                    continue;
+                }
+                let class = crate::classify_point(wall_middle, source, tolerance * 1e-3)
+                    .or_refuse(KernelStage::Select, "classify_point")?
+                    .class;
+                if class == crate::PointClass::In {
+                    seals = Some((own_id, other.id, thickness));
+                }
+            }
+        }
+        if let Some((own, other, thickness)) = seals {
+            if best.is_none_or(|(_, _, _, held)| thickness > held) {
+                best = Some((index, own, other, thickness));
+            }
+        }
+    }
+    Ok(best)
+}
+
 /// Lane O row 31 (2026-10-31, `BREP_OFFSET_COINCIDENT_BOUND`, default on since
 /// batch 12; `0`/`off` projects onto every face): [`coincident_offset_face`] skips a face whose every
 /// possible foot lies farther from the point than the band's far edge, before

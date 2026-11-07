@@ -172,6 +172,14 @@ pub(super) fn tessellate_spherical_face_watertight(
         return decline(face_id, "no seed: the region could not be classified");
     }
 
+    // SMALL CAP (`BREP_SPHERE_ATLAS_SMALL_CAP`): the material lies in a cap the trim
+    // bounds, so refinement outside it only builds triangles step 7 throws away.
+    let material_cap = if small_cap_enabled() {
+        small_material_cap(&atlas, &boundary, &region, chord_tolerance)
+    } else {
+        None
+    };
+
     // 2. Cut every trim segment at the chart boundaries.  Pieces come back
     //    already assigned to one chart each; a crossing point is a function of
     //    the segment alone, so the two charts sharing it agree exactly.
@@ -336,6 +344,7 @@ pub(super) fn tessellate_spherical_face_watertight(
             &chains[chart],
             &mut vertices,
             chord_tolerance,
+            material_cap,
         )?
         else {
             return decline(face_id, &format!("chart {chart} could not be triangulated"));
@@ -404,6 +413,58 @@ pub(super) fn tessellate_spherical_face_watertight(
         mesh.face_ids.push(face_id);
     }
     Ok(!mesh.indices.is_empty())
+}
+
+/// `BREP_SPHERE_ATLAS_SMALL_CAP` (default on, `=0` restores): see [`small_material_cap`].
+fn small_cap_enabled() -> bool {
+    crate::switch!("BREP_SPHERE_ATLAS_SMALL_CAP", true)
+}
+
+/// The cap (unit axis, cosine of its half-angle) that holds all of this face's
+/// material, when the trim is small: every boundary point lies within 60 degrees of
+/// the axis (the mean of their directions) and the antipode of the axis is not
+/// material. Outside a cap smaller than a hemisphere the sphere is one connected
+/// piece, so a trim inside the cap leaves everything outside it on the antipode's
+/// side; if the antipode is not material, nothing outside the cap is. The cap is
+/// widened by two interior grid steps.
+///
+/// brep-bench tangent/thin-lens: each cap of the lens is 0.0045 across on a ball of
+/// radius 5, and refining the whole ball at the runner's chord built 2 991 298
+/// triangles to keep 3 542 (80 s a tessellation). Refinement only adds interior
+/// points, and a constrained triangulation does not see past the trim, so the
+/// triangles inside the trim are the ones it built before.
+fn small_material_cap(
+    atlas: &SphereAtlas,
+    boundary: &[(Vec3, Vec3)],
+    region: &SphericalRegion,
+    chord_tolerance: f64,
+) -> Option<(Vec3, f64)> {
+    if boundary.is_empty() || region.is_whole_sphere() {
+        return None;
+    }
+    let directions: Vec<Vec3> = boundary
+        .iter()
+        .filter_map(|(start, _)| start.sub(atlas.centre).normalized().ok())
+        .collect();
+    let axis = directions
+        .iter()
+        .fold(Vec3::new(0.0, 0.0, 0.0), |sum, direction| sum.add(*direction))
+        .normalized()
+        .ok()?;
+    let lowest = directions
+        .iter()
+        .map(|direction| direction.dot(axis))
+        .fold(1.0f64, f64::min);
+    if !(lowest > 0.5) {
+        return None;
+    }
+    if region.contains(atlas.centre, atlas.centre.sub(axis.scale(atlas.radius))) {
+        return None;
+    }
+    let step = std::f64::consts::FRAC_PI_2
+        / crate::sphere_chart::chart_grid_divisions(atlas.radius, chord_tolerance) as f64;
+    let angle = (lowest.clamp(-1.0, 1.0).acos() + 2.0 * step).min(std::f64::consts::FRAC_PI_2);
+    Some((axis, angle.cos()))
 }
 
 fn ordered(a: usize, b: usize) -> (usize, usize) {
@@ -517,6 +578,7 @@ fn mesh_chart(
     chains: &[ChartChain],
     vertices: &mut AtlasVertices,
     chord_tolerance: f64,
+    material_cap: Option<(Vec3, f64)>,
 ) -> Result<Option<Vec<[usize; 3]>>, String> {
     use spade::{ConstrainedDelaunayTriangulation, Point2, Triangulation};
     let refuse = |why: &str, points: &[([f64; 2], usize)], ring: usize| -> Option<Vec<[usize; 3]>> {
@@ -681,6 +743,15 @@ fn mesh_chart(
             ];
             if triangle_sag(atlas, corners) <= chord_tolerance {
                 continue;
+            }
+            if let Some((axis, cosine)) = material_cap {
+                let direction = corners[0]
+                    .add(corners[1])
+                    .add(corners[2])
+                    .sub(atlas.centre.scale(3.0));
+                if direction.dot(axis) < cosine * direction.length() {
+                    continue;
+                }
             }
             let centre = [
                 (uv[0][0] + uv[1][0] + uv[2][0]) / 3.0,
